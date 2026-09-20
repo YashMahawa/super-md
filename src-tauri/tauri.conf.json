@@ -1,0 +1,44 @@
+{
+  "$schema": "https://schema.tauri.app/config/2",
+  "productName": "Super MD",
+  "version": "0.1.0",
+  "identifier": "dev.supermd.studio",
+  "build": {
+    "beforeDevCommand": "npm run dev",
+    "devUrl": "http://localhost:1420",
+    "beforeBuildCommand": "npm run build",
+    "frontendDist": "../dist"
+  },
+  "app": {
+    "windows": [
+      {
+        "title": "Super MD",
+        "width": 1440,
+        "height": 900,
+        "minWidth": 760,
+        "minHeight": 520,
+        "decorations": true,
+        "transparent": false
+      }
+    ],
+    "security": {
+      "csp": "default-src 'self' customprotocol: asset:; img-src 'self' asset: http://asset.localhost blob: data: file:; style-src 'self' 'unsafe-inline'; script-src 'self' 'wasm-unsafe-eval'; font-src 'self' data:;"
+    }
+  },
+  "bundle": {
+    "active": true,
+    "targets": ["appimage", "deb", "rpm"],
+    "icon": [
+      "icons/32x32.png",
+      "icons/128x128.png",
+      "icons/128x128@2x.png",
+      "icons/icon.png"
+    ],
+    "category": "Productivity",
+    "shortDescription": "Interactive Markdown studio",
+    "longDescription": "Distraction-free Markdown and Super Markdown authoring with semantic PDF export.",
+    "fileAssociations": [
+      { "ext": ["smd", "md", "markdown"], "name": "Markdown document", "role": "Editor" }
+    ]
+  }
+}

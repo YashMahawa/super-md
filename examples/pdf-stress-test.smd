@@ -1,0 +1,36 @@
+---
+title: Super MD PDF Stress Test
+author: Automated verification
+---
+
+# Dense technical layout
+
+> [!WARNING] Boundary condition
+> This callout contains **formatted content**, $x^2+y^2=r^2$, and a sentence long enough to wrap across several lines without leaving the printable region.
+
+The following expression exercises matrices, fractions, limits, radicals, and a long aligned derivation:
+
+$$
+\begin{aligned}
+\mathcal{L}(\theta) &= \sum_{i=1}^{n}\log\left(1+\exp\left(-y_i\left(\theta_0+\sum_{j=1}^{p}\theta_jx_{ij}\right)\right)\right)+\lambda\lVert\theta\rVert_2^2,\\
+\nabla_\theta\mathcal{L} &= -\sum_{i=1}^{n}\frac{y_i\mathbf{x}_i}{1+\exp(y_i\theta^T\mathbf{x}_i)}+2\lambda\theta.
+\end{aligned}
+$$
+
+| Experiment | Dataset | Samples | Features | Optimizer | Learning rate | Regularization | Accuracy | F1 score |
+|---|---|---:|---:|---|---:|---:|---:|---:|
+| Very long experiment label that must wrap safely | Safety-critical ambiguous images | 120000 | 4096 | AdamW with cosine decay | 0.000125 | 0.03125 | 98.42% | 97.91% |
+| Baseline | Held-out distribution shift | 54000 | 4096 | SGD with momentum | 0.001 | 0.0001 | 92.07% | 90.55% |
+
+```rust
+pub fn stable_softmax(values: &[f64]) -> Vec<f64> {
+    let max = values.iter().copied().fold(f64::NEG_INFINITY, f64::max);
+    let exp: Vec<_> = values.iter().map(|value| (value - max).exp()).collect();
+    let sum: f64 = exp.iter().sum();
+    exp.into_iter().map(|value| value / sum).collect()
+}
+```
+
+## Unicode
+
+English · हिन्दी · বাংলা · 日本語 · Ελληνικά · العربية · emoji ✓ ⚠ → ∞
