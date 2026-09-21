@@ -95,9 +95,10 @@ export default function App() {
   const flash = (message: string) => { setNotice(message); window.setTimeout(() => setNotice(""), 2800); };
   const applyDocument = (doc: DocumentData) => { setContent(doc.content); setPath(doc.path); setDirty(false); };
   const open = useCallback(async () => {
+    if (dirty && !window.confirm("Discard unsaved changes and open another document?")) return;
     const doc = await invoke<DocumentData | null>("open_document");
     if (doc) applyDocument(doc);
-  }, []);
+  }, [dirty]);
   const save = useCallback(async (saveAs = false) => {
     const saved = await invoke<string | null>("save_document", { request: { path: saveAs ? null : path, content } });
     if (saved) { setPath(saved); setDirty(false); flash("Saved"); }
@@ -113,8 +114,15 @@ export default function App() {
     invoke<any>("load_caelestia_theme").then(setCaelestia).catch(() => undefined);
     invoke<DocumentData | null>("startup_document").then((doc) => doc && applyDocument(doc)).catch(() => undefined);
     invoke<string | null>("detect_python").then((detected) => {
-      if (!python && detected) { setPython(detected); localStorage.setItem("python", detected); }
-    });
+      setPython((current) => {
+        if (current || !detected) return current;
+        localStorage.setItem("python", detected);
+        return detected;
+      });
+    }).catch(() => undefined);
+  }, []);
+
+  useEffect(() => {
     const handler = (event: KeyboardEvent) => {
       if (event.key === "F11") { event.preventDefault(); toggleFullscreen(); }
       if ((event.ctrlKey || event.metaKey) && event.key.toLowerCase() === "s") { event.preventDefault(); save(event.shiftKey); }
@@ -122,7 +130,7 @@ export default function App() {
     };
     window.addEventListener("keydown", handler);
     return () => window.removeEventListener("keydown", handler);
-  }, [open, python, save, toggleFullscreen]);
+  }, [open, save, toggleFullscreen]);
 
   useEffect(() => {
     localStorage.setItem("theme.normal", normalTheme);
