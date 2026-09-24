@@ -1,6 +1,6 @@
 [package]
 name = "super-md"
-version = "0.1.1"
+version = "0.1.2"
 description = "A distraction-free, interactive Markdown studio"
 authors = ["Super MD contributors"]
 license = "MIT"
@@ -24,6 +24,7 @@ anyhow = "1"
 base64 = "0.22"
 dirs = "6"
 meval = "0.2"
+percent-encoding = "2"
 rfd = "0.15"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"

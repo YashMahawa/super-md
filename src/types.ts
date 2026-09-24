@@ -11,6 +11,7 @@ export interface ExportOptions {
   margin: number;
   fontSize: number;
   lineHeight: number;
+  fontFamily: string;
   output?: string;
 }
 

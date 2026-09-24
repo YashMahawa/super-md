@@ -1,5 +1,6 @@
 use anyhow::{bail, Context, Result};
 use base64::{engine::general_purpose::STANDARD, Engine};
+use percent_encoding::percent_decode_str;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::{
@@ -31,6 +32,7 @@ struct ExportOptions {
     margin: f32,
     font_size: f32,
     line_height: f32,
+    font_family: String,
     output: Option<String>,
 }
 
@@ -41,6 +43,7 @@ impl Default for ExportOptions {
             margin: 18.0,
             font_size: 10.5,
             line_height: 1.35,
+            font_family: "New Computer Modern".into(),
             output: None,
         }
     }
@@ -101,8 +104,8 @@ fn read_document_at(path: String) -> Result<Document, String> {
 }
 
 fn read_document(path: PathBuf) -> Result<Document> {
-    let content = fs::read_to_string(&path)
-        .with_context(|| format!("Could not read {}", path.display()))?;
+    let content =
+        fs::read_to_string(&path).with_context(|| format!("Could not read {}", path.display()))?;
     Ok(Document {
         path: path.to_string_lossy().into_owned(),
         content,
@@ -145,10 +148,15 @@ fn startup_document(path: tauri::State<'_, Option<String>>) -> Result<Option<Doc
 
 #[tauri::command]
 fn load_asset(document_path: String, source: String) -> Result<String, String> {
-    if source.starts_with("data:") || source.starts_with("http://") || source.starts_with("https://") {
+    if source.starts_with("data:")
+        || source.starts_with("http://")
+        || source.starts_with("https://")
+    {
         return Ok(source);
     }
-    let source_path = Path::new(&source);
+    let encoded_path = source.split(['?', '#']).next().unwrap_or(&source);
+    let decoded_path = percent_decode_str(encoded_path).decode_utf8_lossy();
+    let source_path = Path::new(decoded_path.as_ref());
     let path = if source_path.is_absolute() {
         source_path.to_path_buf()
     } else {
@@ -158,7 +166,13 @@ fn load_asset(document_path: String, source: String) -> Result<String, String> {
             .join(source_path)
     };
     let bytes = fs::read(&path).map_err(display_error)?;
-    let mime = match path.extension().and_then(|value| value.to_str()).unwrap_or("").to_ascii_lowercase().as_str() {
+    let mime = match path
+        .extension()
+        .and_then(|value| value.to_str())
+        .unwrap_or("")
+        .to_ascii_lowercase()
+        .as_str()
+    {
         "svg" => "image/svg+xml",
         "jpg" | "jpeg" => "image/jpeg",
         "gif" => "image/gif",
@@ -214,7 +228,11 @@ fn run_python_inner(python: &str, code: &str) -> Result<PythonResult> {
 }
 
 #[tauri::command]
-fn export_pdf(path: Option<String>, content: String, options: ExportOptions) -> Result<Option<String>, String> {
+fn export_pdf(
+    path: Option<String>,
+    content: String,
+    options: ExportOptions,
+) -> Result<Option<String>, String> {
     let suggested = path
         .as_deref()
         .map(Path::new)
@@ -238,8 +256,14 @@ fn export_pdf(path: Option<String>, content: String, options: ExportOptions) -> 
     Ok(Some(output.to_string_lossy().into_owned()))
 }
 
-fn export_pdf_inner(source: Option<&Path>, content: &str, output: &Path, options: &ExportOptions) -> Result<()> {
-    let pandoc = which::which("pandoc").context("Pandoc was not found. Install pandoc 3 or newer.")?;
+fn export_pdf_inner(
+    source: Option<&Path>,
+    content: &str,
+    output: &Path,
+    options: &ExportOptions,
+) -> Result<()> {
+    let pandoc =
+        which::which("pandoc").context("Pandoc was not found. Install pandoc 3 or newer.")?;
     which::which("typst").context("Typst was not found. Install typst 0.13 or newer.")?;
     let directory = tempfile::tempdir()?;
     let input = directory.path().join("document.md");
@@ -251,11 +275,21 @@ fn export_pdf_inner(source: Option<&Path>, content: &str, output: &Path, options
     let margin = format!("{}mm", options.margin.clamp(4.0, 60.0));
     let font_size = format!("{}pt", options.font_size.clamp(7.0, 24.0));
     let line_height = options.line_height.clamp(0.9, 2.2).to_string();
+    let font_family = match options.font_family.as_str() {
+        "New Computer Modern"
+        | "Libertinus Serif"
+        | "Noto Sans"
+        | "DejaVu Serif"
+        | "Arial"
+        | "Georgia"
+        | "Times New Roman" => options.font_family.as_str(),
+        _ => bail!("Unsupported PDF font"),
+    };
     fs::write(
         &metadata,
         format!(
-            "papersize: {}\nfontsize: {}\nlinestretch: {}\nmargin:\n  top: {}\n  right: {}\n  bottom: {}\n  left: {}\n",
-            options.page_size.to_ascii_lowercase(), font_size, line_height, margin, margin, margin, margin
+            "papersize: {}\nmainfont: '{}'\nfontsize: {}\nlinestretch: {}\nmargin:\n  top: {}\n  right: {}\n  bottom: {}\n  left: {}\n",
+            options.page_size.to_ascii_lowercase(), font_family, font_size, line_height, margin, margin, margin, margin
         ),
     )?;
     let resource = source
@@ -269,7 +303,10 @@ fn export_pdf_inner(source: Option<&Path>, content: &str, output: &Path, options
         .arg("--pdf-engine=typst")
         .arg("--standalone")
         .arg("--syntax-highlighting=zenburn")
-        .arg(format!("--resource-path={}", resource_paths.to_string_lossy()))
+        .arg(format!(
+            "--resource-path={}",
+            resource_paths.to_string_lossy()
+        ))
         .arg(format!("--include-in-header={}", header.display()))
         .arg(format!("--metadata-file={}", metadata.display()))
         .arg("--output")
@@ -287,7 +324,11 @@ fn normalize_super_markdown(input: &str) -> String {
     for line in input.lines() {
         if let Some(rest) = line.strip_prefix(":::callout") {
             let mut pieces = rest.trim().splitn(2, char::is_whitespace);
-            let kind = pieces.next().filter(|v| !v.is_empty()).unwrap_or("note").to_uppercase();
+            let kind = pieces
+                .next()
+                .filter(|v| !v.is_empty())
+                .unwrap_or("note")
+                .to_uppercase();
             let title = pieces.next().unwrap_or(&kind).trim_matches('"').to_string();
             callout = Some((kind, title, Vec::new()));
         } else if line.trim() == ":::" && callout.is_some() {
@@ -342,9 +383,15 @@ fn render_export_markdown(input: &str, directory: &Path) -> Result<String> {
                 chart_index += 1;
                 let filename = format!("supermd-chart-{chart_index}.svg");
                 fs::write(directory.join(&filename), svg).map_err(serde::de::Error::custom)?;
-                Ok((spec.title.unwrap_or_else(|| "Interactive chart".into()), filename))
+                Ok((
+                    spec.title.unwrap_or_else(|| "Interactive chart".into()),
+                    filename,
+                ))
             }) {
-                Ok((title, filename)) => output.push_str(&format!("![{}]({filename}){{ width=100% }}\n\n", title.replace(']', ""))),
+                Ok((title, filename)) => output.push_str(&format!(
+                    "![{}]({filename}){{ width=100% }}\n\n",
+                    title.replace(']', "")
+                )),
                 Err(_) => output.push_str(&format!("```json\n{source}\n```\n")),
             }
         } else if let Some(lines) = chart.as_mut() {
@@ -366,7 +413,12 @@ fn render_chart_svg(spec: &ChartSpec) -> Result<String> {
     let bottom = 58.0;
     let x_min = spec.x.as_ref().and_then(|axis| axis.min).unwrap_or(-10.0);
     let x_max = spec.x.as_ref().and_then(|axis| axis.max).unwrap_or(10.0);
-    let steps = spec.x.as_ref().and_then(|axis| axis.steps).unwrap_or(200).clamp(8, 1500);
+    let steps = spec
+        .x
+        .as_ref()
+        .and_then(|axis| axis.steps)
+        .unwrap_or(200)
+        .clamp(8, 1500);
     let mut context = meval::Context::new();
     for slider in &spec.sliders {
         context.var(&slider.name, slider.value);
@@ -377,7 +429,11 @@ fn render_chart_svg(spec: &ChartSpec) -> Result<String> {
             all_series.push(points.clone());
             continue;
         }
-        let expression = series.expression.as_deref().unwrap_or("0").replace("Math.", "");
+        let expression = series
+            .expression
+            .as_deref()
+            .unwrap_or("0")
+            .replace("Math.", "");
         let parsed = meval::Expr::from_str(&expression)
             .with_context(|| format!("Invalid chart expression: {expression}"))?;
         let mut points = Vec::with_capacity(steps + 1);
@@ -394,28 +450,85 @@ fn render_chart_svg(spec: &ChartSpec) -> Result<String> {
     let y_values: Vec<f64> = all_series.iter().flatten().map(|point| point[1]).collect();
     let auto_min = y_values.iter().copied().fold(f64::INFINITY, f64::min);
     let auto_max = y_values.iter().copied().fold(f64::NEG_INFINITY, f64::max);
-    let y_min = spec.y.as_ref().and_then(|axis| axis.min).unwrap_or(auto_min.min(-1.0));
-    let y_max = spec.y.as_ref().and_then(|axis| axis.max).unwrap_or(auto_max.max(1.0));
-    let px = |x: f64| left + (x - x_min) / (x_max - x_min).max(f64::EPSILON) * (width - left - right);
-    let py = |y: f64| top + (1.0 - (y - y_min) / (y_max - y_min).max(f64::EPSILON)) * (height - top - bottom);
+    let y_min = spec
+        .y
+        .as_ref()
+        .and_then(|axis| axis.min)
+        .unwrap_or(auto_min.min(-1.0));
+    let y_max = spec
+        .y
+        .as_ref()
+        .and_then(|axis| axis.max)
+        .unwrap_or(auto_max.max(1.0));
+    let px =
+        |x: f64| left + (x - x_min) / (x_max - x_min).max(f64::EPSILON) * (width - left - right);
+    let py = |y: f64| {
+        top + (1.0 - (y - y_min) / (y_max - y_min).max(f64::EPSILON)) * (height - top - bottom)
+    };
     let colors = ["#6750a4", "#006a6a", "#b3261e", "#7d5700", "#3f6374"];
-    let mut svg = format!(r##"<svg xmlns="http://www.w3.org/2000/svg" width="{width}" height="{height}" viewBox="0 0 {width} {height}"><rect width="100%" height="100%" rx="16" fill="#faf7fc"/><g stroke="#c9c3cc" stroke-width="1">"##);
-    if y_min <= 0.0 && y_max >= 0.0 { svg.push_str(&format!(r#"<line x1="{left}" y1="{}" x2="{}" y2="{}"/>"#, py(0.0), width-right, py(0.0))); }
-    if x_min <= 0.0 && x_max >= 0.0 { svg.push_str(&format!(r#"<line x1="{}" y1="{top}" x2="{}" y2="{}"/>"#, px(0.0), px(0.0), height-bottom)); }
+    let mut svg = format!(
+        r##"<svg xmlns="http://www.w3.org/2000/svg" width="{width}" height="{height}" viewBox="0 0 {width} {height}"><rect width="100%" height="100%" rx="16" fill="#faf7fc"/><g stroke="#c9c3cc" stroke-width="1">"##
+    );
+    if y_min <= 0.0 && y_max >= 0.0 {
+        svg.push_str(&format!(
+            r#"<line x1="{left}" y1="{}" x2="{}" y2="{}"/>"#,
+            py(0.0),
+            width - right,
+            py(0.0)
+        ));
+    }
+    if x_min <= 0.0 && x_max >= 0.0 {
+        svg.push_str(&format!(
+            r#"<line x1="{}" y1="{top}" x2="{}" y2="{}"/>"#,
+            px(0.0),
+            px(0.0),
+            height - bottom
+        ));
+    }
     svg.push_str("</g>");
     for (index, points) in all_series.iter().enumerate() {
-        let color = spec.series[index].color.as_deref().unwrap_or(colors[index % colors.len()]);
-        let encoded = points.iter().map(|point| format!("{:.2},{:.2}", px(point[0]), py(point[1]))).collect::<Vec<_>>().join(" ");
-        svg.push_str(&format!(r#"<polyline fill="none" stroke="{}" stroke-width="3.5" points="{}"/>"#, xml_escape(color), encoded));
+        let color = spec.series[index]
+            .color
+            .as_deref()
+            .unwrap_or(colors[index % colors.len()]);
+        let encoded = points
+            .iter()
+            .map(|point| format!("{:.2},{:.2}", px(point[0]), py(point[1])))
+            .collect::<Vec<_>>()
+            .join(" ");
+        svg.push_str(&format!(
+            r#"<polyline fill="none" stroke="{}" stroke-width="3.5" points="{}"/>"#,
+            xml_escape(color),
+            encoded
+        ));
     }
-    let x_label = spec.x.as_ref().and_then(|axis| axis.label.as_deref()).unwrap_or("x");
-    let y_label = spec.y.as_ref().and_then(|axis| axis.label.as_deref()).unwrap_or("y");
+    let x_label = spec
+        .x
+        .as_ref()
+        .and_then(|axis| axis.label.as_deref())
+        .unwrap_or("x");
+    let y_label = spec
+        .y
+        .as_ref()
+        .and_then(|axis| axis.label.as_deref())
+        .unwrap_or("y");
     svg.push_str(&format!(r##"<g fill="#49454f" font-family="sans-serif" font-size="15"><text x="{left}" y="{}">{}: {:.2} … {:.2}</text><text x="12" y="22">{}: {:.2} … {:.2}</text>"##, height-15.0, xml_escape(x_label), x_min, x_max, xml_escape(y_label), y_min, y_max));
     let mut legend_x = left;
     for (index, series) in spec.series.iter().enumerate() {
-        let label = series.name.as_deref().or(series.expression.as_deref()).unwrap_or("series");
-        let color = series.color.as_deref().unwrap_or(colors[index % colors.len()]);
-        svg.push_str(&format!(r#"<text x="{legend_x}" y="22" fill="{}">● {}</text>"#, xml_escape(color), xml_escape(label)));
+        let label = series
+            .name
+            .as_deref()
+            .or(series.expression.as_deref())
+            .unwrap_or("series");
+        let color = series
+            .color
+            .as_deref()
+            .unwrap_or(colors[index % colors.len()]);
+        svg.push_str(&format!(
+            r#"<text x="{legend_x}" y="22" fill="{}">● {}</text>"#,
+            xml_escape(color),
+            xml_escape(label)
+        ));
         legend_x += 150.0;
     }
     svg.push_str("</g></svg>");
@@ -423,7 +536,11 @@ fn render_chart_svg(spec: &ChartSpec) -> Result<String> {
 }
 
 fn xml_escape(value: &str) -> String {
-    value.replace('&', "&amp;").replace('<', "&lt;").replace('>', "&gt;").replace('"', "&quot;")
+    value
+        .replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+        .replace('"', "&quot;")
 }
 
 fn display_error(error: impl std::fmt::Display) -> String {
@@ -431,7 +548,7 @@ fn display_error(error: impl std::fmt::Display) -> String {
 }
 
 fn print_help() {
-    println!("Super MD\n\nUSAGE:\n  super-md                     Open the desktop app\n  super-md <file.smd>          Open a document\n  super-md export <input> [-o output.pdf] [--page-size A4] [--margin 18]\n  super-md doctor              Check optional runtimes");
+    println!("Super MD\n\nUSAGE:\n  super-md                     Open the desktop app\n  super-md <file.smd>          Open a document\n  super-md export <input> [-o output.pdf] [--page-size A4] [--margin 18] [--font 'New Computer Modern']\n  super-md doctor              Check optional runtimes");
 }
 
 fn run_cli(arguments: &[String]) -> Result<bool> {
@@ -464,15 +581,22 @@ fn run_cli(arguments: &[String]) -> Result<bool> {
                 match arguments[index].as_str() {
                     "-o" | "--output" => {
                         index += 1;
-                        options.output = Some(arguments.get(index).context("Missing output path")?.clone());
+                        options.output =
+                            Some(arguments.get(index).context("Missing output path")?.clone());
                     }
                     "--page-size" => {
                         index += 1;
-                        options.page_size = arguments.get(index).context("Missing page size")?.clone();
+                        options.page_size =
+                            arguments.get(index).context("Missing page size")?.clone();
                     }
                     "--margin" => {
                         index += 1;
                         options.margin = arguments.get(index).context("Missing margin")?.parse()?;
+                    }
+                    "--font" => {
+                        index += 1;
+                        options.font_family =
+                            arguments.get(index).context("Missing font name")?.clone();
                     }
                     unknown => bail!("Unknown export option: {unknown}"),
                 }
@@ -527,5 +651,23 @@ mod tests {
         let result = normalize_super_markdown(":::callout warning Careful\nDo not blink.\n:::");
         assert!(result.contains("> **Careful**"));
         assert!(result.contains("> Do not blink."));
+    }
+
+    #[test]
+    fn loads_relative_image_with_encoded_spaces() {
+        let directory = tempfile::tempdir().unwrap();
+        let images = directory.path().join("DM Images");
+        fs::create_dir(&images).unwrap();
+        fs::write(images.join("diagram.png"), b"image bytes").unwrap();
+        let document = directory.path().join("DM Morning Notes.md");
+        let result = load_asset(
+            document.to_string_lossy().into_owned(),
+            "DM%20Images/diagram.png".into(),
+        )
+        .unwrap();
+        assert_eq!(
+            result,
+            format!("data:image/png;base64,{}", STANDARD.encode(b"image bytes"))
+        );
     }
 }

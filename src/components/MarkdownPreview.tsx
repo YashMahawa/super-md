@@ -17,10 +17,10 @@ function textOf(value: ReactNode): string {
   return "";
 }
 
-function normalizeCallouts(markdown: string): string {
+export function normalizeCallouts(markdown: string): string {
   const portable = markdown
     .replace(/^---\n[\s\S]*?\n---\n/, "")
-    .replace(/!\[\[([^\]|]+)(?:\|([^\]]+))?\]\]/g, (_all, path, label) => `![${label ?? path}](${path})`)
+    .replace(/!\[\[([^\]|]+)(?:\|([^\]]+))?\]\]/g, (_all, path, label) => `![${label ?? path}](${encodeURI(path)})`)
     .replace(/\[\[([^\]|]+)(?:\|([^\]]+))?\]\]/g, (_all, target, label) => `[${label ?? target}](${target.endsWith(".md") ? target : `${target}.md`})`);
   const lines = portable.split("\n");
   const output: string[] = [];
@@ -39,27 +39,41 @@ function normalizeCallouts(markdown: string): string {
   return output.join("\n");
 }
 
-function remarkCallouts() {
+export function remarkCallouts() {
   return (tree: unknown) => visit(tree as never, "blockquote", (node: any) => {
     const paragraph = node.children?.[0];
     const first = paragraph?.children?.[0];
     if (first?.type !== "text") return;
-    const match = first.value.match(/^\[!(\w+)\][+-]?\s*(.*)$/);
+    const match = first.value.match(/^\[!([\w-]+)\]([+-]?)[ \t]*([^\n]*)/i);
     if (!match) return;
     const type = match[1].toLowerCase();
-    const title = match[2] || type[0].toUpperCase() + type.slice(1);
-    first.value = "";
-    node.data = { hName: "aside", hProperties: { className: `callout callout-${type}`, "data-callout-title": title } };
+    const title = match[3].trim() || type[0].toUpperCase() + type.slice(1);
+    first.value = first.value.slice(match[0].length).replace(/^\n/, "");
+    if (!first.value) paragraph.children.shift();
+    if (paragraph.children.length === 0) node.children.shift();
+    node.children.unshift({
+      type: "paragraph",
+      data: { hProperties: { className: "callout-title" } },
+      children: [{ type: "text", value: title }]
+    });
+    node.data = { hName: "aside", hProperties: { className: `callout callout-${type}`, "data-callout-type": type } };
   });
 }
 
 function AssetImage({ src = "", alt = "", documentPath }: { src?: string; alt?: string; documentPath: string | null }) {
-  const [resolved, setResolved] = useState(src);
+  const remote = /^(data:|https?:|blob:)/.test(src);
+  const [resolved, setResolved] = useState(remote ? src : "");
+  const [failed, setFailed] = useState(false);
   useEffect(() => {
-    if (!documentPath || /^(data:|https?:|blob:)/.test(src)) { setResolved(src); return; }
-    invoke<string>("load_asset", { documentPath, source: src }).then(setResolved).catch(() => setResolved(src));
-  }, [documentPath, src]);
-  return <img src={resolved} alt={alt} loading="lazy" />;
+    setFailed(false);
+    if (remote) { setResolved(src); return; }
+    setResolved("");
+    if (!documentPath) { setFailed(true); return; }
+    invoke<string>("load_asset", { documentPath, source: src }).then(setResolved).catch(() => setFailed(true));
+  }, [documentPath, remote, src]);
+  if (failed) return <span className="image-error" role="img" aria-label={alt || "Image unavailable"}>Image unavailable: {alt || src}</span>;
+  if (!resolved) return <span className="image-loading" role="status">Loading image…</span>;
+  return <img src={resolved} alt={alt} loading="lazy" onError={() => setFailed(true)} />;
 }
 
 interface Props {
