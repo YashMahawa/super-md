@@ -12,7 +12,10 @@ Super MD is a fast, distraction-free Markdown studio for Linux, macOS, and Windo
 - CodeMirror multicursor editing, search and replace, undo history, and keyboard navigation
 - Split, editor, reader, focus, and true F11 fullscreen modes
 - Separate normal/fullscreen themes: Caelestia dynamic, Material light, Material dark, and pure black
+- First-run welcome setup for theme, reading font, and expressive motion; the motion switch honours OS reduced-motion settings
+- Preview-only pinch and Ctrl/⌘ zoom, plus a resizable split workspace; app chrome keeps its size
 - Separate reading and PDF fonts, plus adjustable type size, line spacing, and reading width
+- Untitled draft recovery; local images resolve relative to the document, while remote images load only after consent
 - Semantic PDF export through Pandoc + Typst; the preview DOM is never printed
 - One binary for GUI and CLI export
 
@@ -38,7 +41,7 @@ Create native packages for the current OS:
 npm run package
 ```
 
-Pull requests and `main` pushes run frontend and Rust tests on Linux, macOS, and Windows. Release tags create draft GitHub releases with AppImage/Debian/RPM, macOS DMGs for Apple Silicon and Intel, and Windows NSIS installers. macOS builds are ad-hoc signed, not notarized; Windows builds are not code-signed. On Arch-based build hosts, linuxdeploy may need `NO_STRIP=1` because its bundled strip utility predates RELR sections.
+Pull requests and `main` pushes run frontend and Rust tests on Linux, macOS, and Windows. Release tags create draft GitHub releases with AppImage/Debian/RPM, macOS DMGs for Apple Silicon and Intel, and Windows NSIS installers. macOS builds are ad-hoc signed, not notarized; Windows builds are not code-signed. The AppImage job runs on Ubuntu: Arch's `linuxdeploy` GTK plugin assumes Debian-style `/usr/lib/gdk-pixbuf-2.0` and cannot package an AppImage locally without a compatible build container.
 
 ## CLI
 
@@ -60,6 +63,7 @@ PDF export requires `pandoc` and `typst` on `PATH`. Additional PDF font choices 
 | `Ctrl+Shift+S` | Save as |
 | `Ctrl+O` | Open |
 | `Ctrl+F` | Search/replace panel |
+| `Ctrl/⌘++`, `Ctrl/⌘+-`, `Ctrl/⌘+0` | Zoom preview in/out/reset |
 | `F11` | Pure fullscreen |
 | `Alt+click` | Add cursor |
 | `Ctrl+Alt+↑/↓` | Add cursor above/below |
@@ -68,7 +72,7 @@ See [FORMAT.md](FORMAT.md) for the `.smd` extensions.
 
 ## Design references
 
-The product direction borrows proven ideas—not code—from MarkText’s distraction-free authoring, Zettlr’s publication workflow, and Quarto’s executable technical documents. Super MD’s differentiators are a vault-free file model, a lightweight native shell, Caelestia palette integration, and a non-DOM Typst PDF pipeline.
+The product direction borrows proven ideas—not code—from MarkText’s distraction-free authoring, Zettlr’s publication workflow, Quarto’s executable technical documents, and MetroList’s restrained spring-driven Material Expressive motion. Super MD’s differentiators are a vault-free file model, a lightweight native shell, Caelestia palette integration, and a non-DOM Typst PDF pipeline.
 
 ## License
 

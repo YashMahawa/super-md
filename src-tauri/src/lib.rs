@@ -146,25 +146,69 @@ fn startup_document(path: tauri::State<'_, Option<String>>) -> Result<Option<Doc
         .map_err(display_error)
 }
 
+fn draft_path() -> Result<PathBuf, String> {
+    let directory = dirs::data_local_dir()
+        .ok_or_else(|| "Could not locate application data directory".to_string())?
+        .join("super-md");
+    fs::create_dir_all(&directory).map_err(display_error)?;
+    Ok(directory.join("untitled-draft.smd"))
+}
+
+#[tauri::command]
+fn save_draft(content: String) -> Result<(), String> {
+    let target = draft_path()?;
+    let temporary = target.with_extension("smd.tmp");
+    fs::write(&temporary, content).map_err(display_error)?;
+    fs::rename(temporary, target).map_err(display_error)
+}
+
+#[tauri::command]
+fn load_draft() -> Result<Option<String>, String> {
+    let target = draft_path()?;
+    if !target.exists() {
+        return Ok(None);
+    }
+    fs::read_to_string(target).map(Some).map_err(display_error)
+}
+
+#[tauri::command]
+fn clear_draft() -> Result<(), String> {
+    let target = draft_path()?;
+    if target.exists() {
+        fs::remove_file(target).map_err(display_error)?;
+    }
+    Ok(())
+}
+
 #[tauri::command]
 fn load_asset(document_path: String, source: String) -> Result<String, String> {
-    if source.starts_with("data:")
-        || source.starts_with("http://")
-        || source.starts_with("https://")
-    {
-        return Ok(source);
+    if document_path.trim().is_empty() {
+        return Err("Save the document before loading relative images".into());
     }
     let encoded_path = source.split(['?', '#']).next().unwrap_or(&source);
     let decoded_path = percent_decode_str(encoded_path).decode_utf8_lossy();
-    let source_path = Path::new(decoded_path.as_ref());
+    let source_path = if let Some(file_url) = decoded_path.strip_prefix("file://") {
+        Path::new(file_url)
+    } else {
+        Path::new(decoded_path.as_ref())
+    };
+    let root = Path::new(&document_path)
+        .parent()
+        .ok_or_else(|| "Document has no parent directory".to_string())?
+        .canonicalize()
+        .map_err(display_error)?;
     let path = if source_path.is_absolute() {
         source_path.to_path_buf()
     } else {
-        Path::new(&document_path)
-            .parent()
-            .unwrap_or_else(|| Path::new("."))
-            .join(source_path)
+        root.join(source_path)
     };
+    let path = path.canonicalize().map_err(display_error)?;
+    if !path.starts_with(&root) || !path.is_file() {
+        return Err("Image must be inside the document's folder".into());
+    }
+    if fs::metadata(&path).map_err(display_error)?.len() > 25 * 1024 * 1024 {
+        return Err("Image is larger than 25 MB".into());
+    }
     let bytes = fs::read(&path).map_err(display_error)?;
     let mime = match path
         .extension()
@@ -631,6 +675,9 @@ pub fn run() -> Result<()> {
             save_document,
             load_caelestia_theme,
             startup_document,
+            save_draft,
+            load_draft,
+            clear_draft,
             load_asset,
             choose_python,
             detect_python,
@@ -669,5 +716,24 @@ mod tests {
             result,
             format!("data:image/png;base64,{}", STANDARD.encode(b"image bytes"))
         );
+    }
+
+    #[test]
+    fn rejects_images_outside_document_folder() {
+        let directory = tempfile::tempdir().unwrap();
+        let notes = directory.path().join("notes");
+        fs::create_dir(&notes).unwrap();
+        fs::write(directory.path().join("private.png"), b"not an image").unwrap();
+        let document = notes.join("note.md").to_string_lossy().into_owned();
+        assert!(load_asset(document.clone(), "../private.png".into()).is_err());
+        assert!(load_asset(
+            document,
+            directory
+                .path()
+                .join("private.png")
+                .to_string_lossy()
+                .into_owned()
+        )
+        .is_err());
     }
 }

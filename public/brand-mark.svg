@@ -1,0 +1,20 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512" role="img" aria-label="Super MD">
+  <defs>
+    <linearGradient id="surface" x1="0" y1="0" x2="1" y2="1">
+      <stop stop-color="#7057d8"/>
+      <stop offset="1" stop-color="#3c7fc6"/>
+    </linearGradient>
+    <linearGradient id="plot" x1="0" y1="0" x2="1" y2="0">
+      <stop stop-color="#27b5c5"/>
+      <stop offset="1" stop-color="#16a883"/>
+    </linearGradient>
+  </defs>
+  <rect x="24" y="24" width="464" height="464" rx="130" fill="url(#surface)"/>
+  <path d="M133 103h180l80 80v212c0 21-17 38-38 38H133c-21 0-38-17-38-38V141c0-21 17-38 38-38Z" fill="#f9f8ff"/>
+  <path d="M313 103v57c0 13 10 23 23 23h57" fill="#d8d4ff"/>
+  <path d="M313 103v57c0 13 10 23 23 23h57" fill="none" stroke="#a8a2e9" stroke-width="7" stroke-linejoin="round"/>
+  <path d="M146 211h113M146 244h75" stroke="#a59bcc" stroke-width="15" stroke-linecap="round"/>
+  <path d="M145 345h45l31-59 45 101 41-79h58" fill="none" stroke="url(#plot)" stroke-width="20" stroke-linecap="round" stroke-linejoin="round"/>
+  <circle cx="145" cy="345" r="10" fill="#27b5c5"/>
+  <circle cx="365" cy="308" r="10" fill="#16a883"/>
+</svg>

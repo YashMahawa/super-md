@@ -57,8 +57,14 @@ export default function Editor({ value, onChange, dark, focusMode }: Props) {
 
   useEffect(() => {
     const instance = view.current;
-    if (!instance || instance.state.doc.toString() === value) return;
-    instance.dispatch({ changes: { from: 0, to: instance.state.doc.length, insert: value } });
+    if (!instance) return;
+    const previous = instance.state.doc.toString();
+    if (previous === value) return;
+    let from = 0;
+    while (from < previous.length && from < value.length && previous[from] === value[from]) from++;
+    let oldEnd = previous.length, newEnd = value.length;
+    while (oldEnd > from && newEnd > from && previous[oldEnd - 1] === value[newEnd - 1]) { oldEnd--; newEnd--; }
+    instance.dispatch({ changes: { from, to: oldEnd, insert: value.slice(from, newEnd) } });
   }, [value]);
 
   useEffect(() => {

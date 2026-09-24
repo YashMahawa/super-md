@@ -60,20 +60,33 @@ export function remarkCallouts() {
   });
 }
 
-function AssetImage({ src = "", alt = "", documentPath }: { src?: string; alt?: string; documentPath: string | null }) {
-  const remote = /^(data:|https?:|blob:)/.test(src);
-  const [resolved, setResolved] = useState(remote ? src : "");
-  const [failed, setFailed] = useState(false);
+function AssetImage({ src = "", alt = "", documentPath, trustedImageHosts, onTrustImageHost }: { src?: string; alt?: string; documentPath: string | null; trustedImageHosts: string[]; onTrustImageHost?: (host: string) => void }) {
+  const isRemote = /^https?:\/\//i.test(src);
+  const embedded = /^(data:|blob:)/i.test(src);
+  let host = "";
+  if (isRemote) {
+    try { host = new URL(src).host; }
+    catch { host = "invalid address"; }
+  }
+  const [allowOnce, setAllowOnce] = useState(false);
+  const [resolved, setResolved] = useState(embedded ? src : "");
+  const [error, setError] = useState("");
   useEffect(() => {
-    setFailed(false);
-    if (remote) { setResolved(src); return; }
+    let active = true;
+    setError("");
+    setAllowOnce(false);
+    if (isRemote || embedded) { setResolved(src); return; }
     setResolved("");
-    if (!documentPath) { setFailed(true); return; }
-    invoke<string>("load_asset", { documentPath, source: src }).then(setResolved).catch(() => setFailed(true));
-  }, [documentPath, remote, src]);
-  if (failed) return <span className="image-error" role="img" aria-label={alt || "Image unavailable"}>Image unavailable: {alt || src}</span>;
+    if (!documentPath) { setError("Save this document to resolve relative images."); return; }
+    invoke<string>("load_asset", { documentPath, source: src })
+      .then((value) => { if (active) setResolved(value); })
+      .catch((reason) => { if (active) setError(String(reason)); });
+    return () => { active = false; };
+  }, [documentPath, embedded, isRemote, src]);
+  if (isRemote && !allowOnce && !trustedImageHosts.includes(host)) return <span className="remote-image-card" role="group" aria-label={`Remote image from ${host}`}><span><strong>{alt || "Remote image"}</strong><small>{host} · blocked until you choose to load it</small></span><span className="remote-image-actions"><button onClick={() => setAllowOnce(true)}>Load image</button><button onClick={() => onTrustImageHost?.(host)}>Trust domain</button></span></span>;
+  if (error) return <span className="image-error" role="img" aria-label={alt || "Image unavailable"}>Image unavailable: {alt || src}<small>{error}</small></span>;
   if (!resolved) return <span className="image-loading" role="status">Loading image…</span>;
-  return <img src={resolved} alt={alt} loading="lazy" onError={() => setFailed(true)} />;
+  return <img src={resolved} alt={alt} loading="lazy" onError={() => setError("The image could not be decoded or loaded.")} />;
 }
 
 interface Props {
@@ -81,9 +94,11 @@ interface Props {
   documentPath: string | null;
   python: string;
   dark: boolean;
+  trustedImageHosts?: string[];
+  onTrustImageHost?: (host: string) => void;
 }
 
-export default function MarkdownPreview({ markdown, documentPath, python, dark }: Props) {
+export default function MarkdownPreview({ markdown, documentPath, python, dark, trustedImageHosts = [], onTrustImageHost }: Props) {
   const normalized = normalizeCallouts(markdown);
   return (
     <article className="markdown-body">
@@ -91,7 +106,7 @@ export default function MarkdownPreview({ markdown, documentPath, python, dark }
         remarkPlugins={[remarkGfm, remarkMath, remarkCallouts]}
         rehypePlugins={[rehypeKatex, rehypeHighlight]}
         components={{
-          img: ({ src, alt }) => <AssetImage src={src} alt={alt} documentPath={documentPath} />,
+          img: ({ src, alt }) => <AssetImage src={src} alt={alt} documentPath={documentPath} trustedImageHosts={trustedImageHosts} onTrustImageHost={onTrustImageHost} />,
           a: ({ href, children }) => <a href={href} target="_blank" rel="noreferrer">{children}</a>,
           pre: ({ children }) => {
             const child = Children.only(children) as React.ReactElement<{ className?: string; children?: ReactNode }>;
