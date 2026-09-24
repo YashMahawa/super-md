@@ -146,25 +146,40 @@ fn startup_document(path: tauri::State<'_, Option<String>>) -> Result<Option<Doc
         .map_err(display_error)
 }
 
-fn draft_path() -> Result<PathBuf, String> {
+fn draft_filename(label: &str) -> Result<String, String> {
+    if !label
+        .chars()
+        .all(|ch| ch.is_ascii_alphanumeric() || ch == '-')
+    {
+        return Err("Invalid window label".into());
+    }
+    Ok(if label == "main" {
+        "untitled-draft.smd".to_string()
+    } else {
+        format!("untitled-draft-{label}.smd")
+    })
+}
+
+fn draft_path(label: &str) -> Result<PathBuf, String> {
+    let filename = draft_filename(label)?;
     let directory = dirs::data_local_dir()
         .ok_or_else(|| "Could not locate application data directory".to_string())?
         .join("super-md");
     fs::create_dir_all(&directory).map_err(display_error)?;
-    Ok(directory.join("untitled-draft.smd"))
+    Ok(directory.join(filename))
 }
 
 #[tauri::command]
-fn save_draft(content: String) -> Result<(), String> {
-    let target = draft_path()?;
+fn save_draft(window: tauri::Window, content: String) -> Result<(), String> {
+    let target = draft_path(window.label())?;
     let temporary = target.with_extension("smd.tmp");
     fs::write(&temporary, content).map_err(display_error)?;
     fs::rename(temporary, target).map_err(display_error)
 }
 
 #[tauri::command]
-fn load_draft() -> Result<Option<String>, String> {
-    let target = draft_path()?;
+fn load_draft(window: tauri::Window) -> Result<Option<String>, String> {
+    let target = draft_path(window.label())?;
     if !target.exists() {
         return Ok(None);
     }
@@ -172,12 +187,41 @@ fn load_draft() -> Result<Option<String>, String> {
 }
 
 #[tauri::command]
-fn clear_draft() -> Result<(), String> {
-    let target = draft_path()?;
+fn clear_draft(window: tauri::Window) -> Result<(), String> {
+    let target = draft_path(window.label())?;
     if target.exists() {
         fs::remove_file(target).map_err(display_error)?;
     }
     Ok(())
+}
+
+#[tauri::command]
+fn list_draft_windows() -> Result<Vec<String>, String> {
+    let main = draft_path("main")?;
+    let directory = main
+        .parent()
+        .ok_or_else(|| "Draft directory missing".to_string())?;
+    let mut labels = Vec::new();
+    for entry in fs::read_dir(directory).map_err(display_error)? {
+        let entry = entry.map_err(display_error)?;
+        let name = entry.file_name().to_string_lossy().into_owned();
+        if let Some(label) = name
+            .strip_prefix("untitled-draft-")
+            .and_then(|value| value.strip_suffix(".smd"))
+        {
+            if label.starts_with("document-")
+                && label
+                    .chars()
+                    .all(|ch| ch.is_ascii_alphanumeric() || ch == '-')
+            {
+                labels.push(label.to_string());
+            }
+        }
+    }
+    labels.sort();
+    labels.reverse();
+    labels.truncate(24);
+    Ok(labels)
 }
 
 #[tauri::command]
@@ -678,6 +722,7 @@ pub fn run() -> Result<()> {
             save_draft,
             load_draft,
             clear_draft,
+            list_draft_windows,
             load_asset,
             choose_python,
             detect_python,
@@ -735,5 +780,15 @@ mod tests {
                 .into_owned()
         )
         .is_err());
+    }
+
+    #[test]
+    fn keeps_window_drafts_isolated_and_names_safe() {
+        assert_eq!(draft_filename("main").unwrap(), "untitled-draft.smd");
+        assert_eq!(
+            draft_filename("document-123").unwrap(),
+            "untitled-draft-document-123.smd"
+        );
+        assert!(draft_filename("../outside").is_err());
     }
 }

@@ -41,7 +41,7 @@ export default function Editor({ value, onChange, dark, focusMode }: Props) {
         ...(dark ? [oneDark] : []),
         EditorView.theme({
           "&": { height: "100%", background: "transparent" },
-          ".cm-scroller": { fontFamily: "var(--mono)", fontSize: "var(--editor-size)", lineHeight: "var(--editor-leading)", padding: focusMode ? "12vh 0 38vh" : "20px 0 45vh" },
+          ".cm-scroller": { fontFamily: "var(--mono)", fontSize: "calc(var(--editor-size) * var(--workspace-scale, 1))", lineHeight: "var(--editor-leading)", padding: focusMode ? "12vh 0 38vh" : "20px 0 45vh" },
           ".cm-content": { maxWidth: focusMode ? "820px" : "none", margin: focusMode ? "0 auto" : "0", padding: "0 28px" },
           ".cm-gutters": { background: "transparent", border: "0", color: "var(--muted)" },
           ".cm-activeLine, .cm-activeLineGutter": { background: "color-mix(in srgb, var(--primary) 8%, transparent)" },

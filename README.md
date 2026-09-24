@@ -13,7 +13,8 @@ Super MD is a fast, distraction-free Markdown studio for Linux, macOS, and Windo
 - Split, editor, reader, focus, and true F11 fullscreen modes
 - Separate normal/fullscreen themes: Caelestia dynamic, Material light, Material dark, and pure black
 - First-run welcome setup for theme, reading font, and expressive motion; the motion switch honours OS reduced-motion settings
-- Preview-only pinch and Ctrl/⌘ zoom, plus a resizable split workspace; app chrome keeps its size
+- Independent normal/fullscreen workspace zoom: pinch or Ctrl/⌘ zooms editor and preview content while toolbars keep their size; long lines reflow instead of clipping
+- Frame-paced split resizing, drag-and-drop document opening, and independent document windows (`Ctrl/⌘+Shift+N`)
 - Separate reading and PDF fonts, plus adjustable type size, line spacing, and reading width
 - Untitled draft recovery; local images resolve relative to the document, while remote images load only after consent
 - Semantic PDF export through Pandoc + Typst; the preview DOM is never printed
@@ -63,7 +64,8 @@ PDF export requires `pandoc` and `typst` on `PATH`. Additional PDF font choices 
 | `Ctrl+Shift+S` | Save as |
 | `Ctrl+O` | Open |
 | `Ctrl+F` | Search/replace panel |
-| `Ctrl/⌘++`, `Ctrl/⌘+-`, `Ctrl/⌘+0` | Zoom preview in/out/reset |
+| `Ctrl/⌘++`, `Ctrl/⌘+-`, `Ctrl/⌘+0` | Zoom workspace in/out/reset |
+| `Ctrl/⌘+Shift+N` | New document window |
 | `F11` | Pure fullscreen |
 | `Alt+click` | Add cursor |
 | `Ctrl+Alt+↑/↓` | Add cursor above/below |

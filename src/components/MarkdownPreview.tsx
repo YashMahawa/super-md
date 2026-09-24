@@ -1,4 +1,4 @@
-import { Children, isValidElement, useEffect, useState, type ReactNode } from "react";
+import { Children, isValidElement, memo, useEffect, useState, type ReactNode } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
@@ -98,7 +98,7 @@ interface Props {
   onTrustImageHost?: (host: string) => void;
 }
 
-export default function MarkdownPreview({ markdown, documentPath, python, dark, trustedImageHosts = [], onTrustImageHost }: Props) {
+function MarkdownPreview({ markdown, documentPath, python, dark, trustedImageHosts = [], onTrustImageHost }: Props) {
   const normalized = normalizeCallouts(markdown);
   return (
     <article className="markdown-body">
@@ -122,3 +122,5 @@ export default function MarkdownPreview({ markdown, documentPath, python, dark, 
     </article>
   );
 }
+
+export default memo(MarkdownPreview);

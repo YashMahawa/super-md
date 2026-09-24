@@ -1,1 +1,1 @@
-{"default":{"identifier":"default","description":"Default desktop capability","local":true,"windows":["main"],"permissions":["core:default","core:window:allow-set-fullscreen","core:window:allow-is-fullscreen"]}}
+{"default":{"identifier":"default","description":"Default desktop capability","local":true,"windows":["main","document-*"],"permissions":["core:default","core:window:allow-set-fullscreen","core:window:allow-is-fullscreen","core:window:allow-create","core:webview:allow-create-webview-window"]}}

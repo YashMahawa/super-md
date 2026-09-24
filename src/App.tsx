@@ -1,13 +1,14 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { getCurrentWindow } from "@tauri-apps/api/window";
+import { WebviewWindow } from "@tauri-apps/api/webviewWindow";
 import { AnimatePresence, motion, MotionConfig, useReducedMotion } from "motion/react";
-import { ArrowsOut, BookOpen, ChartLine, Code, Columns, Crosshair, FilePdf, FloppyDisk, FolderOpen, Function as FunctionIcon, GearSix, MagnifyingGlass, Minus, Note, PencilSimple, Plus, TextB, TextHTwo, TextItalic, X } from "@phosphor-icons/react";
+import { ArrowsOut, BookOpen, Browsers, ChartLine, Code, Columns, Crosshair, FilePdf, FloppyDisk, FolderOpen, Function as FunctionIcon, GearSix, MagnifyingGlass, Minus, Note, PencilSimple, Plus, TextB, TextHTwo, TextItalic, X } from "@phosphor-icons/react";
 import Editor from "./components/Editor";
 import MarkdownPreview from "./components/MarkdownPreview";
 import WelcomeSetup from "./components/WelcomeSetup";
 import type { DocumentData, ExportOptions, ThemeMode, ViewMode } from "./types";
-import { clampPreviewZoom, zoomShortcut } from "./zoom";
+import { clampPreviewZoom, previewLayoutWidth, zoomShortcut } from "./zoom";
 
 const welcome = `# Super MD
 
@@ -102,7 +103,7 @@ function firstRunSetup(): boolean {
 }
 
 export default function App() {
-  const [content, setContent] = useState(welcome);
+  const [content, setContent] = useState(() => new URLSearchParams(window.location.search).has("window") ? "" : welcome);
   const [path, setPath] = useState<string | null>(null);
   const [dirty, setDirty] = useState(false);
   const [view, setView] = useState<ViewMode>("split");
@@ -121,26 +122,52 @@ export default function App() {
   const [readerSize, setReaderSize] = useState(() => storedNumber("reader.size", 17));
   const [readerWidth, setReaderWidth] = useState(() => storedNumber("reader.width", 880));
   const [readerFont, setReaderFont] = useState(() => localStorage.getItem("reader.font") || "sans");
-  const [previewZoom, setPreviewZoom] = useState(() => clampPreviewZoom(storedNumber("preview.zoom", 100)));
+  const [normalZoom, setNormalZoom] = useState(() => clampPreviewZoom(storedNumber("workspace.zoom.normal", 100)));
+  const [fullscreenZoom, setFullscreenZoom] = useState(() => clampPreviewZoom(storedNumber("workspace.zoom.fullscreen", 100)));
   const [previewViewportWidth, setPreviewViewportWidth] = useState(900);
   const [splitPercent, setSplitPercent] = useState(() => Math.max(25, Math.min(75, storedNumber("workspace.split", 50))));
   const [resizing, setResizing] = useState(false);
+  const [windowResizing, setWindowResizing] = useState(false);
+  const [draggingFile, setDraggingFile] = useState(false);
   const workspaceRef = useRef<HTMLElement>(null);
+  const resizeFrame = useRef<number | null>(null);
+  const pendingSplit = useRef(splitPercent);
   const readingScrollRef = useRef<HTMLDivElement>(null);
-  const gestureStartZoom = useRef(previewZoom);
-  const gestureInPreview = useRef(false);
+  const gestureStartZoom = useRef(100);
+  const gestureInWorkspace = useRef(false);
+  const pinchStartDistance = useRef(0);
+  const zoomRef = useRef(100);
   const [autosave, setAutosave] = useState(() => localStorage.getItem("autosave") === "true");
   const [reduceMotion, setReduceMotion] = useState(() => localStorage.getItem("reduceMotion") === "true");
   const [trustedImageHosts, setTrustedImageHosts] = useState(storedImageHosts);
+  const [draftWindows, setDraftWindows] = useState<string[]>([]);
   const [showWelcome, setShowWelcome] = useState(firstRunSetup);
   const systemReduceMotion = useReducedMotion();
   const motionEnabled = !reduceMotion && !systemReduceMotion;
   const activeTheme = fullscreen ? fullscreenTheme : normalTheme;
   const dark = activeTheme === "dark" || activeTheme === "black" || (activeTheme === "caelestia" && caelestia?.mode !== "light");
-  const zoomBy = useCallback((step: number) => setPreviewZoom((current) => clampPreviewZoom(current + step)), []);
+  const workspaceZoom = fullscreen ? fullscreenZoom : normalZoom;
+  zoomRef.current = workspaceZoom;
+  const setZoom = useCallback((updater: number | ((current: number) => number)) => {
+    const apply = (current: number) => clampPreviewZoom(typeof updater === "number" ? updater : updater(current));
+    if (fullscreen) setFullscreenZoom(apply);
+    else setNormalZoom(apply);
+  }, [fullscreen]);
+  const zoomBy = useCallback((step: number) => setZoom((current) => current + step), [setZoom]);
+  const trustImageHost = useCallback((host: string) => setTrustedImageHosts((current) => current.includes(host) ? current : [...current, host]), []);
 
-  useEffect(() => { localStorage.setItem("preview.zoom", String(previewZoom)); }, [previewZoom]);
-  useEffect(() => { localStorage.setItem("workspace.split", String(splitPercent)); }, [splitPercent]);
+  useEffect(() => {
+    const timer = window.setTimeout(() => localStorage.setItem("workspace.zoom.normal", String(normalZoom)), 180);
+    return () => window.clearTimeout(timer);
+  }, [normalZoom]);
+  useEffect(() => {
+    const timer = window.setTimeout(() => localStorage.setItem("workspace.zoom.fullscreen", String(fullscreenZoom)), 180);
+    return () => window.clearTimeout(timer);
+  }, [fullscreenZoom]);
+  useEffect(() => {
+    const timer = window.setTimeout(() => localStorage.setItem("workspace.split", String(splitPercent)), 180);
+    return () => window.clearTimeout(timer);
+  }, [splitPercent]);
   useEffect(() => { localStorage.setItem("images.trustedHosts", JSON.stringify(trustedImageHosts)); }, [trustedImageHosts]);
   useEffect(() => {
     const node = readingScrollRef.current;
@@ -153,41 +180,68 @@ export default function App() {
   }, [view]);
 
   useEffect(() => {
-    const inPreview = (target: EventTarget | null) => target instanceof Element && !!target.closest(".reading-scroll");
+    const inWorkspace = (target: EventTarget | null, x?: number, y?: number) =>
+      (target instanceof Element && !!target.closest(".workspace")) ||
+      (typeof x === "number" && typeof y === "number" && !!document.elementFromPoint(x, y)?.closest(".workspace"));
     const onWheel = (event: WheelEvent) => {
       if (!event.ctrlKey && !event.metaKey) return;
       event.preventDefault();
-      if (inPreview(event.target)) setPreviewZoom((current) => clampPreviewZoom(current * Math.exp(-event.deltaY * .0016)));
+      if (inWorkspace(event.target, event.clientX, event.clientY)) setZoom((current) => current * Math.exp(-event.deltaY * .0016));
     };
     const onGestureStart = (event: Event) => {
       event.preventDefault();
-      gestureInPreview.current = inPreview(event.target);
-      gestureStartZoom.current = previewZoom;
+      const gesture = event as Event & { clientX?: number; clientY?: number };
+      gestureInWorkspace.current = inWorkspace(event.target, gesture.clientX, gesture.clientY);
+      gestureStartZoom.current = zoomRef.current;
     };
     const onGestureChange = (event: Event) => {
       event.preventDefault();
-      if (gestureInPreview.current) setPreviewZoom(clampPreviewZoom(gestureStartZoom.current * (event as Event & { scale: number }).scale));
+      if (gestureInWorkspace.current) setZoom(gestureStartZoom.current * (event as Event & { scale: number }).scale);
     };
-    const onGestureEnd = (event: Event) => { event.preventDefault(); gestureInPreview.current = false; };
+    const onGestureEnd = (event: Event) => { event.preventDefault(); gestureInWorkspace.current = false; };
+    const distance = (touches: TouchList) => Math.hypot(touches[0].clientX - touches[1].clientX, touches[0].clientY - touches[1].clientY);
+    const onTouchStart = (event: TouchEvent) => {
+      if (event.touches.length !== 2) return;
+      gestureInWorkspace.current = inWorkspace(event.target, event.touches[0].clientX, event.touches[0].clientY);
+      pinchStartDistance.current = distance(event.touches);
+      gestureStartZoom.current = zoomRef.current;
+    };
+    const onTouchMove = (event: TouchEvent) => {
+      if (event.touches.length !== 2 || !gestureInWorkspace.current) return;
+      event.preventDefault();
+      if (pinchStartDistance.current > 0) setZoom(gestureStartZoom.current * distance(event.touches) / pinchStartDistance.current);
+    };
+    const onTouchEnd = (event: TouchEvent) => { if (event.touches.length < 2) gestureInWorkspace.current = false; };
     document.addEventListener("wheel", onWheel, { passive: false, capture: true });
-    document.addEventListener("gesturestart", onGestureStart, { passive: false });
-    document.addEventListener("gesturechange", onGestureChange, { passive: false });
-    document.addEventListener("gestureend", onGestureEnd, { passive: false });
+    document.addEventListener("gesturestart", onGestureStart, { passive: false, capture: true });
+    document.addEventListener("gesturechange", onGestureChange, { passive: false, capture: true });
+    document.addEventListener("gestureend", onGestureEnd, { passive: false, capture: true });
+    document.addEventListener("touchstart", onTouchStart, { passive: true, capture: true });
+    document.addEventListener("touchmove", onTouchMove, { passive: false, capture: true });
+    document.addEventListener("touchend", onTouchEnd, { passive: true, capture: true });
     return () => {
       document.removeEventListener("wheel", onWheel, true);
-      document.removeEventListener("gesturestart", onGestureStart);
-      document.removeEventListener("gesturechange", onGestureChange);
-      document.removeEventListener("gestureend", onGestureEnd);
+      document.removeEventListener("gesturestart", onGestureStart, true);
+      document.removeEventListener("gesturechange", onGestureChange, true);
+      document.removeEventListener("gestureend", onGestureEnd, true);
+      document.removeEventListener("touchstart", onTouchStart, true);
+      document.removeEventListener("touchmove", onTouchMove, true);
+      document.removeEventListener("touchend", onTouchEnd, true);
     };
-  }, [previewZoom]);
+  }, [setZoom]);
 
   const onResizePointerDown = (event: React.PointerEvent<HTMLDivElement>) => { event.currentTarget.setPointerCapture(event.pointerId); setResizing(true); };
   const onResizePointerMove = (event: React.PointerEvent<HTMLDivElement>) => {
     if (!resizing || !workspaceRef.current) return;
     const bounds = workspaceRef.current.getBoundingClientRect();
-    setSplitPercent(Math.max(25, Math.min(75, Math.round(((event.clientX - bounds.left) / bounds.width) * 100))));
+    pendingSplit.current = Math.max(25, Math.min(75, Math.round(((event.clientX - bounds.left) / bounds.width) * 100)));
+    if (resizeFrame.current === null) resizeFrame.current = window.requestAnimationFrame(() => { setSplitPercent(pendingSplit.current); resizeFrame.current = null; });
   };
-  const onResizePointerUp = (event: React.PointerEvent<HTMLDivElement>) => { if (event.currentTarget.hasPointerCapture(event.pointerId)) event.currentTarget.releasePointerCapture(event.pointerId); setResizing(false); };
+  const onResizePointerUp = (event: React.PointerEvent<HTMLDivElement>) => {
+    if (event.currentTarget.hasPointerCapture(event.pointerId)) event.currentTarget.releasePointerCapture(event.pointerId);
+    if (resizeFrame.current !== null) { window.cancelAnimationFrame(resizeFrame.current); resizeFrame.current = null; setSplitPercent(pendingSplit.current); }
+    setResizing(false);
+  };
 
   const flash = (message: string) => { setNotice(message); window.setTimeout(() => setNotice(""), 2800); };
   const applyDocument = (doc: DocumentData) => { setContent(doc.content); setPath(doc.path); setDirty(false); invoke("clear_draft").catch(() => undefined); };
@@ -218,11 +272,25 @@ export default function App() {
     setFullscreen(next);
   }, []);
 
+  const openNewWindow = useCallback((recoverLabel?: string) => {
+    if (!("__TAURI_INTERNALS__" in window)) { flash("New windows are available in the desktop app"); return; }
+    const label = recoverLabel ?? `document-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`;
+    const child = new WebviewWindow(label, { url: `index.html?window=${recoverLabel ? "recover" : "new"}`, title: recoverLabel ? "Super MD — Recovered draft" : "Super MD — New window", width: 1180, height: 800, minWidth: 760, minHeight: 520, zoomHotkeysEnabled: false });
+    child.once("tauri://error", (event) => flash(`Could not open window: ${event.payload}`));
+  }, []);
+
   useEffect(() => {
     invoke<any>("load_caelestia_theme").then(setCaelestia).catch(() => undefined);
-    invoke<DocumentData | null>("startup_document").then(async (doc) => {
+    const query = new URLSearchParams(window.location.search);
+    if (query.get("window") === "new") { setContent(""); setPath(null); setDirty(false); }
+    else if (query.get("window") === "recover") {
+      invoke<string | null>("load_draft").then((draft) => { if (draft) { setContent(draft); setPath(null); setDirty(true); } }).catch(() => undefined);
+    }
+    else (query.has("document")
+      ? invoke<DocumentData>("read_document_at", { path: query.get("document") })
+      : invoke<DocumentData | null>("startup_document")).then(async (doc) => {
       if (doc) applyDocument(doc);
-      else {
+      else if (!query.has("document")) {
         const draft = await invoke<string | null>("load_draft");
         if (draft) { setContent(draft); setPath(null); setDirty(true); }
       }
@@ -237,17 +305,62 @@ export default function App() {
   }, []);
 
   useEffect(() => {
+    if (showSettings) invoke<string[]>("list_draft_windows").then(setDraftWindows).catch(() => setDraftWindows([]));
+  }, [showSettings]);
+
+  useEffect(() => {
+    if (!("__TAURI_INTERNALS__" in window)) return;
+    const nativeWindow = getCurrentWindow();
+    let unlisten: (() => void) | undefined;
+    let resizeTimer = 0;
+    nativeWindow.isFullscreen().then(setFullscreen).catch(() => undefined);
+    nativeWindow.onResized(() => {
+      setWindowResizing(true);
+      window.clearTimeout(resizeTimer);
+      resizeTimer = window.setTimeout(() => setWindowResizing(false), 160);
+      nativeWindow.isFullscreen().then(setFullscreen).catch(() => undefined);
+    }).then((stop) => { unlisten = stop; });
+    return () => { unlisten?.(); window.clearTimeout(resizeTimer); };
+  }, []);
+
+  useEffect(() => {
+    if (!("__TAURI_INTERNALS__" in window)) return;
+    let unlisten: (() => void) | undefined;
+    getCurrentWindow().onDragDropEvent(async ({ payload }) => {
+      if (payload.type === "over") { setDraggingFile(true); return; }
+      setDraggingFile(false);
+      if (payload.type !== "drop") return;
+      const candidate = payload.paths.find((name) => /\.(smd|md|markdown)$/i.test(name));
+      if (!candidate) { flash("Drop a .smd or Markdown document"); return; }
+      if (dirty && !window.confirm("Discard unsaved changes and open the dropped document?")) return;
+      try { applyDocument(await invoke<DocumentData>("read_document_at", { path: candidate })); }
+      catch (error) { flash(`Could not open dropped file: ${error}`); }
+    }).then((stop) => { unlisten = stop; });
+    return () => unlisten?.();
+  }, [dirty]);
+
+  useEffect(() => {
+    if (!("__TAURI_INTERNALS__" in window)) return;
+    let unlisten: (() => void) | undefined;
+    getCurrentWindow().onCloseRequested((event) => {
+      if (dirty && !window.confirm("This window has unsaved changes. Close it anyway?")) event.preventDefault();
+    }).then((stop) => { unlisten = stop; });
+    return () => unlisten?.();
+  }, [dirty]);
+
+  useEffect(() => {
     const handler = (event: KeyboardEvent) => {
       if (event.key === "F11") { event.preventDefault(); toggleFullscreen(); }
       if ((event.ctrlKey || event.metaKey) && event.key.toLowerCase() === "s") { event.preventDefault(); save(event.shiftKey); }
       if ((event.ctrlKey || event.metaKey) && event.key.toLowerCase() === "o") { event.preventDefault(); open(); }
-      if ((event.ctrlKey || event.metaKey) && event.key.toLowerCase() === "n") { event.preventDefault(); newDocument(); }
+      if ((event.ctrlKey || event.metaKey) && event.shiftKey && event.key.toLowerCase() === "n") { event.preventDefault(); openNewWindow(); }
+      else if ((event.ctrlKey || event.metaKey) && event.key.toLowerCase() === "n") { event.preventDefault(); newDocument(); }
       const zoom = zoomShortcut(event);
-      if (zoom) { event.preventDefault(); if (zoom === "reset") setPreviewZoom(100); else zoomBy(zoom === "in" ? 10 : -10); }
+      if (zoom) { event.preventDefault(); if (zoom === "reset") setZoom(100); else zoomBy(zoom === "in" ? 10 : -10); }
     };
     window.addEventListener("keydown", handler);
     return () => window.removeEventListener("keydown", handler);
-  }, [newDocument, open, save, toggleFullscreen, zoomBy]);
+  }, [newDocument, open, openNewWindow, save, setZoom, toggleFullscreen, zoomBy]);
 
   useEffect(() => {
     localStorage.setItem("theme.normal", normalTheme);
@@ -324,6 +437,7 @@ export default function App() {
         <div className="brand"><span className="brand-mark"><img src="/brand-mark.svg" alt="" /></span><span className="document-identity"><strong title={title}>{title}</strong><small title={location}>{location}</small></span><span className={`save-state ${dirty ? "is-dirty" : ""}`}>{dirty ? "Unsaved" : path ? "Saved" : "Draft"}</span></div>
         <nav className="file-actions" aria-label="File actions">
           <button className="toolbar-button icon-only" onClick={newDocument} title="New · Ctrl+N" aria-label="New document"><Plus size={19} /></button>
+          <button className="toolbar-button icon-only" onClick={() => openNewWindow()} title="New window · Ctrl+Shift+N" aria-label="New window"><Browsers size={19} /></button>
           <button className="toolbar-button" onClick={open} title="Open · Ctrl+O"><FolderOpen size={19} /><span>Open</span></button>
           <button className="toolbar-button" onClick={() => save(false)} title="Save · Ctrl+S"><FloppyDisk size={19} /><span>Save</span></button>
           <button className="toolbar-button icon-only" onClick={() => window.dispatchEvent(new Event("supermd-find"))} title="Find and replace · Ctrl+F" aria-label="Find and replace"><MagnifyingGlass size={19} /></button>
@@ -351,11 +465,11 @@ export default function App() {
         <button className="format-text-button" onClick={() => format("\n```smd-chart\n{\n  \"title\": \"Interactive graph\",\n  \"x\": { \"min\": -6.28, \"max\": 6.28 },\n  \"series\": [{ \"expression\": \"a * Math.sin(x)\" }],\n  \"sliders\": [{ \"name\": \"a\", \"min\": 0, \"max\": 3, \"step\": 0.1, \"value\": 1 }]\n}\n```\n", "", true)} title="Insert interactive graph"><ChartLine size={18} /><span>Graph</span></button>
         <span className="format-hint">Alt+click adds a cursor</span>
       </div>}
-      {fullscreen && <div className="fullscreen-hint">F11 to leave fullscreen</div>}
-      <main className="workspace" ref={workspaceRef} data-resizing={resizing} style={{ "--split-left": `${splitPercent}fr`, "--split-right": `${100 - splitPercent}fr` } as React.CSSProperties}>
-        {view !== "reader" && <motion.section layout="position" initial={false} transition={motionEnabled && !resizing ? spring.surface : { duration: 0 }} className="editor-pane" aria-label="Markdown source"><div className="pane-head"><span><PencilSimple size={15} /> Markdown</span><small>{lineCount} lines</small></div><Editor value={content} onChange={(value) => { setContent(value); setDirty(true); }} dark={dark} focusMode={focusMode} /></motion.section>}
+      {fullscreen && <div className="fullscreen-controls" aria-label="Fullscreen controls"><button onClick={() => zoomBy(-10)} title="Zoom out"><Minus size={16} /></button><button onClick={() => setZoom(100)} title="Reset workspace zoom">{workspaceZoom}%</button><button onClick={() => zoomBy(10)} title="Zoom in"><Plus size={16} /></button><span /><button onClick={toggleFullscreen} title="Leave fullscreen · F11"><ArrowsOut size={17} /></button></div>}
+      <main className="workspace" ref={workspaceRef} data-resizing={resizing || windowResizing} data-dragging-file={draggingFile} style={{ "--split-left": `${splitPercent}fr`, "--split-right": `${100 - splitPercent}fr`, "--workspace-scale": workspaceZoom / 100 } as React.CSSProperties}>
+        {view !== "reader" && <motion.section layout="position" initial={false} transition={motionEnabled && !resizing && !windowResizing ? spring.surface : { duration: 0 }} className="editor-pane" aria-label="Markdown source"><div className="pane-head"><span><PencilSimple size={15} /> Markdown</span>{view === "editor" ? <span className="zoom-controls" aria-label="Workspace zoom"><button onClick={() => zoomBy(-10)} aria-label="Zoom out"><Minus size={14} /></button><button className="zoom-value" onClick={() => setZoom(100)} aria-label={`Reset zoom, currently ${workspaceZoom}%`}>{workspaceZoom}%</button><button onClick={() => zoomBy(10)} aria-label="Zoom in"><Plus size={14} /></button></span> : <small>{lineCount} lines</small>}</div><Editor value={content} onChange={(value) => { setContent(value); setDirty(true); }} dark={dark} focusMode={focusMode} /></motion.section>}
         {view === "split" && <div className="pane-resizer" role="separator" aria-label="Resize editor and preview" aria-orientation="vertical" aria-valuemin={25} aria-valuemax={75} aria-valuenow={splitPercent} tabIndex={0} onPointerDown={onResizePointerDown} onPointerMove={onResizePointerMove} onPointerUp={onResizePointerUp} onLostPointerCapture={() => setResizing(false)} onDoubleClick={() => setSplitPercent(50)} onKeyDown={(event) => { if (event.key === "ArrowLeft" || event.key === "ArrowRight") { event.preventDefault(); setSplitPercent((current) => Math.max(25, Math.min(75, current + (event.key === "ArrowRight" ? 5 : -5)))); } }}><span /></div>}
-        {view !== "editor" && <motion.section layout="position" initial={false} transition={motionEnabled && !resizing ? spring.surface : { duration: 0 }} className="preview-pane" aria-label="Reading preview"><div className="pane-head"><span><BookOpen size={15} /> Preview</span><div className="preview-tools"><small>{wordCount} words</small><span className="zoom-controls" aria-label="Preview zoom"><button onClick={() => zoomBy(-10)} title="Zoom out · Ctrl+-" aria-label="Zoom out"><Minus size={14} /></button><button className="zoom-value" onClick={() => setPreviewZoom(100)} title="Reset zoom · Ctrl+0" aria-label={`Reset zoom, currently ${previewZoom}%`}>{previewZoom}%</button><button onClick={() => zoomBy(10)} title="Zoom in · Ctrl++" aria-label="Zoom in"><Plus size={14} /></button></span></div></div><div className="reading-scroll" ref={readingScrollRef}><div className="preview-page" style={{ width: Math.min(readerWidth, Math.max(220, previewViewportWidth - (previewViewportWidth < 760 ? 40 : 92))), zoom: previewZoom / 100 }}><MarkdownPreview markdown={content} documentPath={path} python={python} dark={dark} trustedImageHosts={trustedImageHosts} onTrustImageHost={(host) => setTrustedImageHosts((current) => current.includes(host) ? current : [...current, host])} /></div></div></motion.section>}
+        {view !== "editor" && <motion.section layout="position" initial={false} transition={motionEnabled && !resizing && !windowResizing ? spring.surface : { duration: 0 }} className="preview-pane" aria-label="Reading preview"><div className="pane-head"><span><BookOpen size={15} /> Preview</span><div className="preview-tools"><small>{wordCount} words</small><span className="zoom-controls" aria-label="Workspace zoom"><button onClick={() => zoomBy(-10)} title="Zoom out · Ctrl+-" aria-label="Zoom out"><Minus size={14} /></button><button className="zoom-value" onClick={() => setZoom(100)} title="Reset zoom · Ctrl+0" aria-label={`Reset zoom, currently ${workspaceZoom}%`}>{workspaceZoom}%</button><button onClick={() => zoomBy(10)} title="Zoom in · Ctrl++" aria-label="Zoom in"><Plus size={14} /></button></span></div></div><div className="reading-scroll" ref={readingScrollRef}><div className="preview-page" style={{ width: previewLayoutWidth(previewViewportWidth, readerWidth, workspaceZoom), zoom: workspaceZoom / 100 }}><MarkdownPreview markdown={content} documentPath={path} python={python} dark={dark} trustedImageHosts={trustedImageHosts} onTrustImageHost={trustImageHost} /></div></div></motion.section>}
       </main>
       <AnimatePresence>{notice && <motion.div key="notice" className="snackbar" initial={motionEnabled ? { opacity: 0, y: 18, x: "-50%", scale: .94 } : false} animate={{ opacity: 1, y: 0, x: "-50%", scale: 1 }} exit={motionEnabled ? { opacity: 0, y: 12, x: "-50%", scale: .96 } : { opacity: 0 }} transition={motionEnabled ? spring.surface : { duration: 0 }}>{notice}</motion.div>}</AnimatePresence>
       <AnimatePresence>{showSettings && <motion.div key="settings" className="scrim" initial={motionEnabled ? { opacity: 0 } : false} animate={{ opacity: 1 }} exit={{ opacity: 0 }} transition={{ duration: motionEnabled ? .24 : 0 }} onMouseDown={() => setShowSettings(false)}><motion.aside className="sheet" initial={motionEnabled ? { opacity: 0, y: 40, scale: .9, borderRadius: 44 } : false} animate={{ opacity: 1, y: 0, scale: 1, borderRadius: 28 }} exit={motionEnabled ? { opacity: 0, y: 18, scale: .96 } : { opacity: 0 }} transition={motionEnabled ? spring.sheet : { duration: 0 }} onMouseDown={(event) => event.stopPropagation()}>
@@ -370,10 +484,13 @@ export default function App() {
           <label>Editor spacing ({editorLeading.toFixed(2)})<input type="range" min="1.2" max="2.2" step="0.05" value={editorLeading} onChange={(event) => setEditorLeading(Number(event.target.value))} /></label>
           <label>Reading size ({readerSize}px)<input type="range" min="13" max="26" step="1" value={readerSize} onChange={(event) => setReaderSize(Number(event.target.value))} /></label>
           <label>Reading width ({readerWidth}px)<input type="range" min="560" max="1200" step="20" value={readerWidth} onChange={(event) => setReaderWidth(Number(event.target.value))} /></label>
+          <label>Window zoom ({normalZoom}%)<input type="range" min="60" max="240" step="10" value={normalZoom} onChange={(event) => setNormalZoom(Number(event.target.value))} /></label>
+          <label>Fullscreen zoom ({fullscreenZoom}%)<input type="range" min="60" max="240" step="10" value={fullscreenZoom} onChange={(event) => setFullscreenZoom(Number(event.target.value))} /></label>
         </div>
         <h3>Behaviour</h3>
         <label className="switch-row"><span><strong>Autosave</strong><small>Save 1.2 seconds after edits to an existing file</small></span><input type="checkbox" checked={autosave} onChange={(event) => setAutosave(event.target.checked)} /></label>
         <label className="switch-row"><span><strong>Expressive motion</strong><small>{systemReduceMotion ? "Disabled by your system reduced-motion preference" : "Spring transitions, shape-shifting controls, and fluid sheets"}</small></span><input type="checkbox" checked={motionEnabled} disabled={Boolean(systemReduceMotion)} onChange={(event) => setReduceMotion(!event.target.checked)} /></label>
+        {draftWindows.length > 0 && <div className="draft-recovery"><strong>Recover another window</strong><small>Untitled notes from previously closed windows</small><div>{draftWindows.map((label) => <button key={label} onClick={() => openNewWindow(label)}>Open draft {label.slice(-8)}</button>)}</div></div>}
         {trustedImageHosts.length > 0 && <div className="trusted-domains"><span>Trusted image domains: {trustedImageHosts.join(", ")}</span><button onClick={() => setTrustedImageHosts([])}>Clear</button></div>}
         <p className="help">Alt+click adds cursors. Ctrl+Alt+↑/↓ adds cursors by line. Ctrl+F opens search and replace.</p>
       </motion.aside></motion.div>}</AnimatePresence>
