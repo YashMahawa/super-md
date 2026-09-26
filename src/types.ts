@@ -1,4 +1,4 @@
-export type ThemeMode = "caelestia" | "light" | "dark" | "black";
+export type ThemeMode = "system" | "light" | "dark" | "black";
 export type ViewMode = "split" | "live" | "editor" | "reader";
 
 export interface DocumentData {

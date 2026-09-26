@@ -25,6 +25,19 @@ afterEach(() => {
 });
 
 describe("workspace zoom modes", () => {
+  it("migrates the old system theme preference without exposing a system brand in settings", async () => {
+    localStorage.setItem("setup.complete", "true");
+    localStorage.setItem("theme.normal", "caelestia");
+    const host = document.createElement("div");
+    document.body.append(host);
+    root = createRoot(host);
+    await act(async () => { root?.render(<App />); });
+    await act(async () => { (host.querySelector('button[aria-label="Settings"]') as HTMLButtonElement).click(); });
+    expect((host.querySelector(".sheet select") as HTMLSelectElement).value).toBe("system");
+    expect(localStorage.getItem("theme.normal")).toBe("system");
+    expect(host.textContent).not.toContain("Caelestia");
+  });
+
   it("keeps top chrome fixed and restores normal zoom after fullscreen", async () => {
     localStorage.setItem("setup.complete", "true");
     const host = document.createElement("div");

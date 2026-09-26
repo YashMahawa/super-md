@@ -11,7 +11,7 @@ Super MD is a fast, distraction-free Markdown studio for Linux, macOS, and Windo
 - Local Python/venv execution and Matplotlib SVG output (only on an explicit **Run** click)
 - CodeMirror multicursor editing, search and replace, undo history, and keyboard navigation
 - Recoverable document tabs, Live block editing, split, source, reader, focus, and true F11 fullscreen modes
-- Separate normal/fullscreen themes: Caelestia dynamic, Material light, Material dark, and pure black
+- Separate normal/fullscreen themes: system colors, Material light, Material dark, and pure black
 - First-run welcome setup for theme, reading font, and expressive motion; the motion switch honours OS reduced-motion settings
 - Independent normal/fullscreen workspace zoom: pinch or Ctrl/⌘ zooms editor and preview content while toolbars keep their size; long lines reflow instead of clipping
 - Frame-paced split resizing, drag-and-drop document opening, and independent document windows (`Ctrl/⌘+Shift+N`)
@@ -44,17 +44,19 @@ npm run package
 
 Pull requests and `main` pushes run frontend and Rust tests on Linux, macOS, and Windows. Release tags create draft GitHub releases with AppImage/Debian/RPM, macOS DMGs for Apple Silicon and Intel, and Windows NSIS installers. macOS builds are ad-hoc signed, not notarized; Windows builds are not code-signed. The AppImage job runs on Ubuntu: Arch's `linuxdeploy` GTK plugin assumes Debian-style `/usr/lib/gdk-pixbuf-2.0` and cannot package an AppImage locally without a compatible build container.
 
-## Android preview
+## Native Android work in progress
 
-The Android build uses the same lightweight Tauri/Rust core with the system WebView. It has single-pane Live, Source, and Read modes at every window width. The toolbar and reading surface reflow as a tablet or foldable changes size, with safe-area and keyboard-resize handling. Pinching over the document changes document zoom, not toolbar size. CI produces an ARM64 debug APK artifact for each push and pull request.
+The new `android-native/` project uses Kotlin and Jetpack Compose, not Tauri or a WebView shell. Android 12+ can use the phone's dynamic Material colors, and Android 13+ launchers can tint its monochrome adaptive icon. It has Live, Source, and Read modes on phones, an additional resizable Split mode on wide screens, system-inset-aware fullscreen, recoverable tabs, search and replace, and a native Canvas-based PDF exporter with A4/Letter, margin, and text-scale choices. Relative image paths work after granting access to the note's containing folder; the `.md`/`.smd` text is not rewritten. CI builds a debug APK from this project.
 
-To build locally, install the Android SDK, NDK 27.1.12297006, JDK 17, and the Rust `aarch64-linux-android` target. Check that no old Gradle or Kotlin build is running before starting a new one. The checked-in Gradle configuration limits the heap to 1.5 GiB, two workers, and in-process Kotlin compilation:
+To build locally, install the Android SDK platform 36 and JDK 17. The Gradle settings limit memory to 1.5 GiB, two workers, and in-process Kotlin compilation. Stop any older Gradle build before starting another:
 
 ```bash
-NDK_HOME="$ANDROID_HOME/ndk/27.1.12297006" CARGO_BUILD_JOBS=2 npm run tauri -- android build --debug --apk --target aarch64 --ci
+cd android-native
+./gradlew --stop
+./gradlew :app:assembleDebug --max-workers=2 --no-daemon
 ```
 
-This is a preview, not feature parity with desktop: desktop Pandoc/Typst PDF export and local Python/Matplotlib execution are unavailable on Android. File picking and saving use Android's document picker and still need device validation; local relative images from picker-backed documents also need further work. The APK is debug-signed and is not a Play Store release.
+This rewrite is **not yet desktop feature parity**. The native PDF renderer does not yet typeset LaTeX equations; it refuses such exports with an explicit error rather than silently emitting broken math. Complete Markdown inline formatting, executable Python/Matplotlib cells, and physical phone/foldable QA are also pending. The desktop Pandoc/Typst exporter remains the high-fidelity path for technical notes until these gaps close. The APK is debug-signed, not a Play Store release.
 
 ## CLI
 
@@ -90,7 +92,7 @@ See [FORMAT.md](FORMAT.md) for the `.smd` extensions.
 
 ## Design references
 
-The product direction borrows proven ideas—not code—from MarkText’s distraction-free authoring, Zettlr’s publication workflow, Quarto’s executable technical documents, and MetroList’s restrained spring-driven Material Expressive motion. Super MD’s differentiators are a vault-free file model, a lightweight native shell, Caelestia palette integration, and a non-DOM Typst PDF pipeline.
+The product direction borrows proven ideas—not code—from MarkText’s distraction-free authoring, Zettlr’s publication workflow, Quarto’s executable technical documents, and MetroList’s restrained spring-driven Material Expressive motion. Super MD’s differentiators are a vault-free file model, a lightweight native shell, system palette integration on supported desktops, and a non-DOM Typst PDF pipeline.
 
 ## License
 

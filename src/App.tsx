@@ -81,7 +81,9 @@ const spring = {
 };
 
 function storedTheme(key: string, fallback: ThemeMode): ThemeMode {
-  return (localStorage.getItem(key) as ThemeMode) || fallback;
+  const value = localStorage.getItem(key);
+  if (value === "caelestia") return "system";
+  return value === "system" || value === "light" || value === "dark" || value === "black" ? value : fallback;
 }
 
 function storedNumber(key: string, fallback: number): number {
@@ -108,7 +110,8 @@ function firstRunSetup(): boolean {
 }
 
 const android = /Android/i.test(navigator.userAgent);
-const compactViewport = () => android || (typeof window.matchMedia === "function" && window.matchMedia("(max-width: 760px)").matches);
+const androidAppearance = () => (window as Window & { SuperMdAndroid?: { colors(): string; setImmersive(enabled: boolean): void } }).SuperMdAndroid;
+const compactViewport = () => typeof window.matchMedia === "function" && window.matchMedia("(max-width: 760px)").matches;
 const pickerCancelled = (error: unknown) => /cancelled|canceled/i.test(String(error));
 
 export default function App() {
@@ -126,9 +129,10 @@ export default function App() {
   const [view, setView] = useState<ViewMode>(() => compactViewport() ? "live" : "split");
   const [focusMode, setFocusMode] = useState(false);
   const [fullscreen, setFullscreen] = useState(false);
-  const [normalTheme, setNormalTheme] = useState<ThemeMode>(() => storedTheme("theme.normal", "caelestia"));
+  const [normalTheme, setNormalTheme] = useState<ThemeMode>(() => storedTheme("theme.normal", "system"));
   const [fullscreenTheme, setFullscreenTheme] = useState<ThemeMode>(() => storedTheme("theme.fullscreen", "black"));
-  const [caelestia, setCaelestia] = useState<any>(null);
+  const [systemPalette, setSystemPalette] = useState<any>(null);
+  const [systemDark, setSystemDark] = useState(() => window.matchMedia?.("(prefers-color-scheme: dark)").matches ?? true);
   const [python, setPython] = useState(() => localStorage.getItem("python") || "");
   const [showSettings, setShowSettings] = useState(false);
   const [showExport, setShowExport] = useState(false);
@@ -164,7 +168,7 @@ export default function App() {
   const systemReduceMotion = useReducedMotion();
   const motionEnabled = !reduceMotion && !systemReduceMotion;
   const activeTheme = fullscreen ? fullscreenTheme : normalTheme;
-  const dark = activeTheme === "dark" || activeTheme === "black" || (activeTheme === "caelestia" && caelestia?.mode !== "light");
+  const dark = activeTheme === "dark" || activeTheme === "black" || (activeTheme === "system" && (systemPalette?.mode ? systemPalette.mode !== "light" : systemDark));
   const workspaceZoom = fullscreen ? fullscreenZoom : normalZoom;
   zoomRef.current = workspaceZoom;
   const setZoom = useCallback((updater: number | ((current: number) => number)) => {
@@ -305,11 +309,17 @@ export default function App() {
     finally { savingRef.current.delete(tab.id); }
   }, []);
   const toggleFullscreen = useCallback(async () => {
+    if (android && androidAppearance()) {
+      const next = !fullscreen;
+      androidAppearance()?.setImmersive(next);
+      setFullscreen(next);
+      return;
+    }
     const window = getCurrentWindow();
     const next = !(await window.isFullscreen());
     await window.setFullscreen(next);
     setFullscreen(next);
-  }, []);
+  }, [fullscreen]);
 
   const openNewWindow = useCallback((recoverLabel?: string) => {
     if (!("__TAURI_INTERNALS__" in window)) { flash("New windows are available in the desktop app"); return; }
@@ -319,7 +329,28 @@ export default function App() {
   }, []);
 
   useEffect(() => {
-    invoke<any>("load_caelestia_theme").then(setCaelestia).catch(() => undefined);
+    if (typeof window.matchMedia !== "function") return;
+    const media = window.matchMedia("(prefers-color-scheme: dark)");
+    const update = () => setSystemDark(media.matches);
+    media.addEventListener("change", update);
+    return () => media.removeEventListener("change", update);
+  }, []);
+
+  useEffect(() => {
+    const refreshSystemColors = () => {
+      if (android) {
+        try { const next = JSON.parse(androidAppearance()?.colors() ?? "null"); setSystemPalette((current: unknown) => JSON.stringify(current) === JSON.stringify(next) ? current : next); }
+        catch { /* Dynamic colors are unavailable on this Android version. */ }
+        return;
+      }
+      invoke<any>("load_system_theme").then((next) => setSystemPalette((current: unknown) => JSON.stringify(current) === JSON.stringify(next) ? current : next)).catch(() => undefined);
+    };
+    refreshSystemColors();
+    const systemColorTimer = window.setInterval(refreshSystemColors, 5000);
+    return () => window.clearInterval(systemColorTimer);
+  }, []);
+
+  useEffect(() => {
     const query = new URLSearchParams(window.location.search);
     const hadSession = localStorage.getItem(sessionKey) !== null;
     if (query.get("window") === "recover" || (!hadSession && query.get("window") !== "new")) {
@@ -347,11 +378,11 @@ export default function App() {
   }, [documents, sessionKey]);
 
   useEffect(() => {
-    if (showSettings) invoke<string[]>("list_draft_windows").then(setDraftWindows).catch(() => setDraftWindows([]));
+    if (showSettings) invoke<string[]>("list_draft_windows").then((value) => setDraftWindows(Array.isArray(value) ? value : [])).catch(() => setDraftWindows([]));
   }, [showSettings]);
 
   useEffect(() => {
-    if (!("__TAURI_INTERNALS__" in window)) return;
+    if (android || !("__TAURI_INTERNALS__" in window)) return;
     const nativeWindow = getCurrentWindow();
     let unlisten: (() => void) | undefined;
     let resizeTimer = 0;
@@ -443,10 +474,10 @@ export default function App() {
 
   useEffect(() => {
     const root = document.documentElement;
-    root.dataset.theme = activeTheme;
+    root.dataset.theme = activeTheme === "system" && !systemPalette?.colours ? (systemDark ? "dark" : "light") : activeTheme;
     root.dataset.fullscreen = String(fullscreen);
-    if (activeTheme === "caelestia" && caelestia?.colours) {
-      const color = (name: string, fallback: string) => `#${caelestia.colours[name] ?? fallback}`;
+    if (activeTheme === "system" && systemPalette?.colours) {
+      const color = (name: string, fallback: string) => `#${systemPalette.colours[name] ?? fallback}`;
       root.style.setProperty("--primary", color("primary", "6750a4"));
       root.style.setProperty("--on-primary", color("onPrimary", "ffffff"));
       root.style.setProperty("--surface", color("surface", "141218"));
@@ -456,7 +487,7 @@ export default function App() {
       root.style.setProperty("--muted", color("onSurfaceVariant", "cac4d0"));
       root.style.setProperty("--outline", color("outlineVariant", "49454f"));
     } else ["--primary", "--on-primary", "--surface", "--surface-low", "--surface-high", "--text", "--muted", "--outline"].forEach((name) => root.style.removeProperty(name));
-  }, [activeTheme, caelestia, fullscreen]);
+  }, [activeTheme, systemPalette, fullscreen, systemDark]);
 
   const title = tabTitle(activeTab);
   const location = useMemo(() => path ? path.split(/[\\/]/).slice(0, -1).join("/") : "New document", [path]);
@@ -528,8 +559,8 @@ export default function App() {
       <AnimatePresence>{notice && <motion.div key="notice" className="snackbar" initial={motionEnabled ? { opacity: 0, y: 18, x: "-50%", scale: .94 } : false} animate={{ opacity: 1, y: 0, x: "-50%", scale: 1 }} exit={motionEnabled ? { opacity: 0, y: 12, x: "-50%", scale: .96 } : { opacity: 0 }} transition={motionEnabled ? spring.surface : { duration: 0 }}>{notice}</motion.div>}</AnimatePresence>
       <AnimatePresence>{showSettings && <motion.div key="settings" className="scrim" initial={motionEnabled ? { opacity: 0 } : false} animate={{ opacity: 1 }} exit={{ opacity: 0 }} transition={{ duration: motionEnabled ? .24 : 0 }} onMouseDown={() => setShowSettings(false)}><motion.aside className="sheet" initial={motionEnabled ? { opacity: 0, y: 40, scale: .9, borderRadius: 44 } : false} animate={{ opacity: 1, y: 0, scale: 1, borderRadius: 28 }} exit={motionEnabled ? { opacity: 0, y: 18, scale: .96 } : { opacity: 0 }} transition={motionEnabled ? spring.sheet : { duration: 0 }} onMouseDown={(event) => event.stopPropagation()}>
         <div className="sheet-title"><h2>Appearance & runtime</h2><button onClick={() => setShowSettings(false)} aria-label="Close settings"><X size={20} /></button></div>
-        <label>Normal theme<select value={normalTheme} onChange={(event) => setNormalTheme(event.target.value as ThemeMode)}><option value="caelestia">Caelestia dynamic</option><option value="light">Material light</option><option value="dark">Material dark</option><option value="black">Pure black</option></select></label>
-        <label>Fullscreen theme<select value={fullscreenTheme} onChange={(event) => setFullscreenTheme(event.target.value as ThemeMode)}><option value="caelestia">Caelestia dynamic</option><option value="light">Material light</option><option value="dark">Material dark</option><option value="black">Pure black</option></select></label>
+        <label>Normal theme<select value={normalTheme} onChange={(event) => setNormalTheme(event.target.value as ThemeMode)}><option value="system">System colors</option><option value="light">Material light</option><option value="dark">Material dark</option><option value="black">Pure black</option></select></label>
+        <label>Fullscreen theme<select value={fullscreenTheme} onChange={(event) => setFullscreenTheme(event.target.value as ThemeMode)}><option value="system">System colors</option><option value="light">Material light</option><option value="dark">Material dark</option><option value="black">Pure black</option></select></label>
         {!android && <label>Python interpreter<div className="path-field"><input value={python} onChange={(event) => { setPython(event.target.value); localStorage.setItem("python", event.target.value); }} /><button onClick={choosePython}>Choose</button></div></label>}
         {android && <p className="help">Python execution and semantic PDF export require the desktop backend. Charts, math, callouts, and live reading work on this device.</p>}
         <h3>Typography</h3>

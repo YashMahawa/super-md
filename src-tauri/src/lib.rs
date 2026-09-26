@@ -147,7 +147,7 @@ fn save_document(_request: SaveRequest) -> Result<Option<String>, String> {
 }
 
 #[tauri::command]
-fn load_caelestia_theme() -> Option<Value> {
+fn load_system_theme() -> Option<Value> {
     let state = dirs::state_dir()?.join("caelestia/scheme.json");
     serde_json::from_str(&fs::read_to_string(state).ok()?).ok()
 }
@@ -745,7 +745,7 @@ pub fn run() -> Result<()> {
             open_document,
             read_document_at,
             save_document,
-            load_caelestia_theme,
+            load_system_theme,
             startup_document,
             save_draft,
             load_draft,

@@ -31,19 +31,15 @@ jobs:
       - run: npm run build
       - run: npm test
 
-  android-preview:
+  android-native:
     runs-on: ubuntu-22.04
     steps:
       - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
-        with:
-          node-version: 22
-          cache: npm
       - uses: actions/setup-java@v4
         with:
           distribution: temurin
           java-version: 17
-      - name: Install Android SDK and NDK
+      - name: Install Android SDK
         run: |
           SDK_MANAGER="$(command -v sdkmanager || true)"
           if [ -z "$SDK_MANAGER" ]; then
@@ -52,21 +48,11 @@ jobs:
             done
           fi
           if [ -z "$SDK_MANAGER" ]; then echo "Android SDK manager not found" >&2; exit 1; fi
-          "$SDK_MANAGER" --install "platforms;android-36" "build-tools;36.0.0" "ndk;27.1.12297006"
-      - name: Configure NDK
-        run: echo "NDK_HOME=$ANDROID_HOME/ndk/27.1.12297006" >> "$GITHUB_ENV"
-      - uses: dtolnay/rust-toolchain@stable
-        with:
-          targets: aarch64-linux-android
-      - uses: swatinem/rust-cache@v2
-        with:
-          workspaces: ./src-tauri -> target
-      - run: npm ci
-      - name: Build Android preview APK
-        run: npm run tauri -- android build --debug --apk --target aarch64 --ci
-        env:
-          CARGO_BUILD_JOBS: 2
+          "$SDK_MANAGER" --install "platforms;android-36" "build-tools;36.0.0"
+      - name: Build native Android APK
+        working-directory: android-native
+        run: ./gradlew :app:testDebugUnitTest :app:assembleDebug --max-workers=2 --no-daemon --console=plain
       - uses: actions/upload-artifact@v4
         with:
-          name: super-md-android-arm64-preview
-          path: src-tauri/gen/android/app/build/outputs/apk/universal/debug/app-universal-debug.apk
+          name: super-md-android-native-debug
+          path: android-native/app/build/outputs/apk/debug/app-debug.apk
