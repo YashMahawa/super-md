@@ -46,6 +46,8 @@ dependencies {
     implementation("androidx.activity:activity-compose:1.11.0")
     implementation("androidx.core:core-ktx:1.17.0")
     implementation("androidx.documentfile:documentfile:1.1.0")
+    implementation("androidx.window:window:1.5.0")
+    implementation("androidx.lifecycle:lifecycle-runtime-ktx:2.9.4")
     testImplementation("junit:junit:4.13.2")
     testImplementation("org.json:json:20240303")
     debugImplementation("androidx.compose.ui:ui-tooling")
