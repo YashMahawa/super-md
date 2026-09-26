@@ -43,9 +43,16 @@ jobs:
         with:
           distribution: temurin
           java-version: 17
-      - uses: android-actions/setup-android@v3
       - name: Install Android SDK and NDK
-        run: sdkmanager --install "platforms;android-36" "build-tools;36.0.0" "ndk;27.1.12297006"
+        run: |
+          SDK_MANAGER="$(command -v sdkmanager || true)"
+          if [ -z "$SDK_MANAGER" ]; then
+            for candidate in "$ANDROID_HOME"/cmdline-tools/*/bin/sdkmanager; do
+              if [ -x "$candidate" ]; then SDK_MANAGER="$candidate"; break; fi
+            done
+          fi
+          if [ -z "$SDK_MANAGER" ]; then echo "Android SDK manager not found" >&2; exit 1; fi
+          "$SDK_MANAGER" --install "platforms;android-36" "build-tools;36.0.0" "ndk;27.1.12297006"
       - name: Configure NDK
         run: echo "NDK_HOME=$ANDROID_HOME/ndk/27.1.12297006" >> "$GITHUB_ENV"
       - uses: dtolnay/rust-toolchain@stable
