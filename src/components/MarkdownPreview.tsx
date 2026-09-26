@@ -1,4 +1,4 @@
-import { Children, isValidElement, memo, useEffect, useState, type ReactNode } from "react";
+import { Children, isValidElement, lazy, memo, Suspense, useEffect, useState, type ReactNode } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
@@ -7,8 +7,9 @@ import rehypeKatex from "rehype-katex";
 import rehypeHighlight from "rehype-highlight";
 import { visit } from "unist-util-visit";
 import InteractiveChart from "./InteractiveChart";
-import MermaidDiagram from "./MermaidDiagram";
 import PythonCell from "./PythonCell";
+
+const MermaidDiagram = lazy(() => import("./MermaidDiagram"));
 
 function textOf(value: ReactNode): string {
   if (typeof value === "string" || typeof value === "number") return String(value);
@@ -113,7 +114,7 @@ function MarkdownPreview({ markdown, documentPath, python, dark, trustedImageHos
             const language = child.props.className?.match(/language-([\w-]+)/)?.[1];
             const source = textOf(child.props.children).replace(/\n$/, "");
             if (language === "smd-chart") return <InteractiveChart source={source} />;
-            if (language === "mermaid") return <MermaidDiagram source={source} dark={dark} />;
+            if (language === "mermaid") return <Suspense fallback={<span className="image-loading" role="status">Loading diagram…</span>}><MermaidDiagram source={source} dark={dark} /></Suspense>;
             if (language === "python" || language === "py") return <PythonCell source={source} python={python} />;
             return <pre>{children}</pre>;
           }

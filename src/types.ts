@@ -1,5 +1,5 @@
 export type ThemeMode = "caelestia" | "light" | "dark" | "black";
-export type ViewMode = "split" | "editor" | "reader";
+export type ViewMode = "split" | "live" | "editor" | "reader";
 
 export interface DocumentData {
   path: string;

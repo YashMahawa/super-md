@@ -2,6 +2,7 @@ import { AnimatePresence, motion } from "motion/react";
 import { useState } from "react";
 import { ArrowLeft, ArrowRight, BookOpen, FilePdf, FolderOpen, Sparkle } from "@phosphor-icons/react";
 import type { ThemeMode } from "../types";
+import BrandMark from "./BrandMark";
 
 interface Props {
   theme: ThemeMode;
@@ -25,7 +26,7 @@ export default function WelcomeSetup({ theme, onTheme, readerFont, onReaderFont,
   const Icon = item.icon;
   return <div className="welcome-scrim" role="dialog" aria-modal="true" aria-label="Welcome to Super MD">
     <div className="welcome-card">
-      <div className="welcome-art"><img src="/brand-mark.svg" alt="Super MD" /><div className="welcome-orbit orbit-one" /><div className="welcome-orbit orbit-two" /></div>
+      <div className="welcome-art"><BrandMark /><div className="welcome-orbit orbit-one" /><div className="welcome-orbit orbit-two" /></div>
       <div className="welcome-body">
         <div className="welcome-progress" aria-label={`Setup step ${page + 1} of 3`}>{pages.map((_, index) => <span key={index} className={index === page ? "active" : ""} />)}</div>
         <AnimatePresence mode="wait"><motion.div key={page} initial={{ opacity: 0, y: 12, scale: .98 }} animate={{ opacity: 1, y: 0, scale: 1 }} exit={{ opacity: 0, y: -9, scale: .98 }} transition={{ type: "spring", stiffness: 360, damping: 31 }}>

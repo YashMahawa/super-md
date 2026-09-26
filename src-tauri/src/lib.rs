@@ -90,12 +90,19 @@ struct ChartSlider {
     value: f64,
 }
 
+#[cfg(not(target_os = "android"))]
 #[tauri::command]
 fn open_document() -> Result<Option<Document>, String> {
     let path = rfd::FileDialog::new()
         .add_filter("Super Markdown", &["smd", "md", "markdown"])
         .pick_file();
     path.map(read_document).transpose().map_err(display_error)
+}
+
+#[cfg(target_os = "android")]
+#[tauri::command]
+fn open_document() -> Result<Option<Document>, String> {
+    Err("Use Android's document picker".into())
 }
 
 #[tauri::command]
@@ -112,6 +119,7 @@ fn read_document(path: PathBuf) -> Result<Document> {
     })
 }
 
+#[cfg(not(target_os = "android"))]
 #[tauri::command]
 fn save_document(request: SaveRequest) -> Result<Option<String>, String> {
     let path = match request.path {
@@ -130,6 +138,12 @@ fn save_document(request: SaveRequest) -> Result<Option<String>, String> {
         .with_context(|| format!("Could not save {}", path.display()))
         .map_err(display_error)?;
     Ok(Some(path.to_string_lossy().into_owned()))
+}
+
+#[cfg(target_os = "android")]
+#[tauri::command]
+fn save_document(_request: SaveRequest) -> Result<Option<String>, String> {
+    Err("Use Android's document picker".into())
 }
 
 #[tauri::command]
@@ -270,6 +284,7 @@ fn load_asset(document_path: String, source: String) -> Result<String, String> {
     Ok(format!("data:{mime};base64,{}", STANDARD.encode(bytes)))
 }
 
+#[cfg(not(target_os = "android"))]
 #[tauri::command]
 fn choose_python() -> Option<String> {
     rfd::FileDialog::new()
@@ -277,6 +292,10 @@ fn choose_python() -> Option<String> {
         .pick_file()
         .map(|path| path.to_string_lossy().into_owned())
 }
+
+#[cfg(target_os = "android")]
+#[tauri::command]
+fn choose_python() -> Option<String> { None }
 
 #[tauri::command]
 fn detect_python() -> Option<String> {
@@ -315,6 +334,7 @@ fn run_python_inner(python: &str, code: &str) -> Result<PythonResult> {
     serde_json::from_slice(&output.stdout).context("Python runner returned invalid output")
 }
 
+#[cfg(not(target_os = "android"))]
 #[tauri::command]
 fn export_pdf(
     path: Option<String>,
@@ -342,6 +362,12 @@ fn export_pdf(
     export_pdf_inner(path.as_deref().map(Path::new), &content, &output, &options)
         .map_err(display_error)?;
     Ok(Some(output.to_string_lossy().into_owned()))
+}
+
+#[cfg(target_os = "android")]
+#[tauri::command]
+fn export_pdf(_path: Option<String>, _content: String, _options: ExportOptions) -> Result<Option<String>, String> {
+    Err("On-device semantic PDF export is not available yet".into())
 }
 
 fn export_pdf_inner(
@@ -712,6 +738,8 @@ pub fn run() -> Result<()> {
     }
     let startup_path = arguments.first().cloned();
     tauri::Builder::default()
+        .plugin(tauri_plugin_dialog::init())
+        .plugin(tauri_plugin_fs::init())
         .manage(startup_path)
         .invoke_handler(tauri::generate_handler![
             open_document,
@@ -732,6 +760,12 @@ pub fn run() -> Result<()> {
         .run(tauri::generate_context!())
         .context("Tauri failed")?;
     Ok(())
+}
+
+#[cfg(mobile)]
+#[tauri::mobile_entry_point]
+pub fn mobile_main() {
+    run().expect("Super MD mobile startup failed");
 }
 
 #[cfg(test)]

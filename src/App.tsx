@@ -1,12 +1,17 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
+import { open as pickMobileDocument, save as chooseMobileDocument } from "@tauri-apps/plugin-dialog";
+import { readTextFile, writeTextFile } from "@tauri-apps/plugin-fs";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 import { WebviewWindow } from "@tauri-apps/api/webviewWindow";
 import { AnimatePresence, motion, MotionConfig, useReducedMotion } from "motion/react";
-import { ArrowsOut, BookOpen, Browsers, ChartLine, Code, Columns, Crosshair, FilePdf, FloppyDisk, FolderOpen, Function as FunctionIcon, GearSix, MagnifyingGlass, Minus, Note, PencilSimple, Plus, TextB, TextHTwo, TextItalic, X } from "@phosphor-icons/react";
+import { ArrowsOut, BookOpen, Browsers, ChartLine, Code, Columns, Crosshair, FilePdf, FloppyDisk, FolderOpen, Function as FunctionIcon, GearSix, MagnifyingGlass, Minus, Note, PencilSimple, Plus, Sparkle, TextB, TextHTwo, TextItalic, X } from "@phosphor-icons/react";
 import Editor from "./components/Editor";
+import BrandMark from "./components/BrandMark";
+import LiveEditor from "./components/LiveEditor";
 import MarkdownPreview from "./components/MarkdownPreview";
 import WelcomeSetup from "./components/WelcomeSetup";
+import { addTab, closeTab, editTab, initialWorkspace, isDirty, markTabSaved, openTab, readWorkspace, restoreClosedTab, tabTitle, type DocumentWorkspace } from "./documentTabs";
 import type { DocumentData, ExportOptions, ThemeMode, ViewMode } from "./types";
 import { clampPreviewZoom, previewLayoutWidth, zoomShortcut } from "./zoom";
 
@@ -102,11 +107,23 @@ function firstRunSetup(): boolean {
   return true;
 }
 
+const android = /Android/i.test(navigator.userAgent);
+const compactViewport = () => android || (typeof window.matchMedia === "function" && window.matchMedia("(max-width: 760px)").matches);
+const pickerCancelled = (error: unknown) => /cancelled|canceled/i.test(String(error));
+
 export default function App() {
-  const [content, setContent] = useState(() => new URLSearchParams(window.location.search).has("window") ? "" : welcome);
-  const [path, setPath] = useState<string | null>(null);
-  const [dirty, setDirty] = useState(false);
-  const [view, setView] = useState<ViewMode>("split");
+  const windowLabel = useMemo(() => "__TAURI_INTERNALS__" in window ? getCurrentWindow().label : "browser", []);
+  const sessionKey = `workspace.tabs.${windowLabel}`;
+  const [documents, setDocuments] = useState<DocumentWorkspace>(() => readWorkspace(localStorage, sessionKey,
+    new URLSearchParams(window.location.search).has("window") ? initialWorkspace() : initialWorkspace(welcome, "Welcome.smd")));
+  const documentsRef = useRef(documents);
+  documentsRef.current = documents;
+  const activeTab = documents.tabs.find((tab) => tab.id === documents.activeId) ?? documents.tabs[0];
+  const content = activeTab.content;
+  const path = activeTab.path;
+  const dirty = isDirty(activeTab);
+  const [mobileUi, setMobileUi] = useState(compactViewport);
+  const [view, setView] = useState<ViewMode>(() => compactViewport() ? "live" : "split");
   const [focusMode, setFocusMode] = useState(false);
   const [fullscreen, setFullscreen] = useState(false);
   const [normalTheme, setNormalTheme] = useState<ThemeMode>(() => storedTheme("theme.normal", "caelestia"));
@@ -130,6 +147,8 @@ export default function App() {
   const [windowResizing, setWindowResizing] = useState(false);
   const [draggingFile, setDraggingFile] = useState(false);
   const workspaceRef = useRef<HTMLElement>(null);
+  const savingRef = useRef(new Set<string>());
+  const openingRef = useRef(false);
   const resizeFrame = useRef<number | null>(null);
   const pendingSplit = useRef(splitPercent);
   const readingScrollRef = useRef<HTMLDivElement>(null);
@@ -155,6 +174,18 @@ export default function App() {
   }, [fullscreen]);
   const zoomBy = useCallback((step: number) => setZoom((current) => current + step), [setZoom]);
   const trustImageHost = useCallback((host: string) => setTrustedImageHosts((current) => current.includes(host) ? current : [...current, host]), []);
+  useEffect(() => {
+    if (typeof window.matchMedia !== "function") return;
+    const query = window.matchMedia("(max-width: 760px)");
+    const onChange = () => { setMobileUi(android || query.matches); if (android || query.matches) setView((current) => current === "split" ? "live" : current); };
+    query.addEventListener("change", onChange);
+    return () => query.removeEventListener("change", onChange);
+  }, []);
+
+  useEffect(() => {
+    if (android) document.documentElement.dataset.platform = "android";
+    return () => { if (android) delete document.documentElement.dataset.platform; };
+  }, []);
 
   useEffect(() => {
     const timer = window.setTimeout(() => localStorage.setItem("workspace.zoom.normal", String(normalZoom)), 180);
@@ -244,27 +275,35 @@ export default function App() {
   };
 
   const flash = (message: string) => { setNotice(message); window.setTimeout(() => setNotice(""), 2800); };
-  const applyDocument = (doc: DocumentData) => { setContent(doc.content); setPath(doc.path); setDirty(false); invoke("clear_draft").catch(() => undefined); };
-  const newDocument = useCallback(() => {
-    if (dirty && !window.confirm("Discard unsaved changes and create a new document?")) return;
-    setContent("");
-    setPath(null);
-    setDirty(false);
-    invoke("clear_draft").catch(() => undefined);
-  }, [dirty]);
+  const applyDocument = useCallback((doc: DocumentData) => setDocuments((current) => openTab(current, doc)), []);
+  const newDocument = useCallback(() => setDocuments((current) => addTab(current)), []);
   const open = useCallback(async () => {
-    if (dirty && !window.confirm("Discard unsaved changes and open another document?")) return;
+    if (openingRef.current) return;
+    openingRef.current = true;
     try {
-      const doc = await invoke<DocumentData | null>("open_document");
+      const doc = android ? await (async () => {
+        const selected = await pickMobileDocument({ multiple: false, directory: false, filters: [{ name: "Markdown", extensions: ["md", "markdown", "smd"] }] });
+        return typeof selected === "string" ? { path: selected, content: await readTextFile(selected) } : null;
+      })() : await invoke<DocumentData | null>("open_document");
       if (doc) applyDocument(doc);
-    } catch (error) { flash(`Could not open: ${error}`); }
-  }, [dirty]);
+    } catch (error) { if (!pickerCancelled(error)) flash(`Could not open: ${error}`); }
+    finally { openingRef.current = false; }
+  }, [applyDocument]);
   const save = useCallback(async (saveAs = false) => {
+    const tab = documentsRef.current.tabs.find((item) => item.id === documentsRef.current.activeId);
+    if (!tab || savingRef.current.has(tab.id)) return;
+    savingRef.current.add(tab.id);
     try {
-      const saved = await invoke<string | null>("save_document", { request: { path: saveAs ? null : path, content } });
-      if (saved) { setPath(saved); setDirty(false); invoke("clear_draft").catch(() => undefined); flash("Saved"); }
-    } catch (error) { flash(`Could not save: ${error}`); }
-  }, [content, path]);
+      const saved = android ? await (async () => {
+        const target = saveAs || !tab.path ? await chooseMobileDocument({ defaultPath: tabTitle(tab), filters: [{ name: "Markdown", extensions: ["smd", "md"] }] }) : tab.path;
+        if (!target) return null;
+        await writeTextFile(target, tab.content);
+        return target;
+      })() : await invoke<string | null>("save_document", { request: { path: saveAs ? null : tab.path, content: tab.content } });
+      if (saved) { setDocuments((current) => markTabSaved(current, tab.id, saved, tab.content)); flash("Saved"); }
+    } catch (error) { if (!pickerCancelled(error)) flash(`Could not save: ${error}`); }
+    finally { savingRef.current.delete(tab.id); }
+  }, []);
   const toggleFullscreen = useCallback(async () => {
     const window = getCurrentWindow();
     const next = !(await window.isFullscreen());
@@ -282,19 +321,17 @@ export default function App() {
   useEffect(() => {
     invoke<any>("load_caelestia_theme").then(setCaelestia).catch(() => undefined);
     const query = new URLSearchParams(window.location.search);
-    if (query.get("window") === "new") { setContent(""); setPath(null); setDirty(false); }
-    else if (query.get("window") === "recover") {
-      invoke<string | null>("load_draft").then((draft) => { if (draft) { setContent(draft); setPath(null); setDirty(true); } }).catch(() => undefined);
+    const hadSession = localStorage.getItem(sessionKey) !== null;
+    if (query.get("window") === "recover" || (!hadSession && query.get("window") !== "new")) {
+      invoke<string | null>("load_draft").then((draft) => {
+        if (draft) setDocuments((current) => {
+          const next = addTab(current);
+          return editTab(next, next.activeId, draft);
+        });
+      }).catch(() => undefined);
     }
-    else (query.has("document")
-      ? invoke<DocumentData>("read_document_at", { path: query.get("document") })
-      : invoke<DocumentData | null>("startup_document")).then(async (doc) => {
-      if (doc) applyDocument(doc);
-      else if (!query.has("document")) {
-        const draft = await invoke<string | null>("load_draft");
-        if (draft) { setContent(draft); setPath(null); setDirty(true); }
-      }
-    }).catch(() => undefined);
+    if (query.has("document")) invoke<DocumentData>("read_document_at", { path: query.get("document") }).then(applyDocument).catch(() => undefined);
+    else if (!hadSession && !query.has("window")) invoke<DocumentData | null>("startup_document").then((doc) => { if (doc) applyDocument(doc); }).catch(() => undefined);
     invoke<string | null>("detect_python").then((detected) => {
       setPython((current) => {
         if (current || !detected) return current;
@@ -302,7 +339,12 @@ export default function App() {
         return detected;
       });
     }).catch(() => undefined);
-  }, []);
+  }, [applyDocument, sessionKey]);
+
+  useEffect(() => {
+    try { localStorage.setItem(sessionKey, JSON.stringify(documents)); }
+    catch { flash("Session recovery is full; save large notes to files"); }
+  }, [documents, sessionKey]);
 
   useEffect(() => {
     if (showSettings) invoke<string[]>("list_draft_windows").then(setDraftWindows).catch(() => setDraftWindows([]));
@@ -332,21 +374,20 @@ export default function App() {
       if (payload.type !== "drop") return;
       const candidate = payload.paths.find((name) => /\.(smd|md|markdown)$/i.test(name));
       if (!candidate) { flash("Drop a .smd or Markdown document"); return; }
-      if (dirty && !window.confirm("Discard unsaved changes and open the dropped document?")) return;
       try { applyDocument(await invoke<DocumentData>("read_document_at", { path: candidate })); }
       catch (error) { flash(`Could not open dropped file: ${error}`); }
     }).then((stop) => { unlisten = stop; });
     return () => unlisten?.();
-  }, [dirty]);
+  }, [applyDocument]);
 
   useEffect(() => {
-    if (!("__TAURI_INTERNALS__" in window)) return;
-    let unlisten: (() => void) | undefined;
-    getCurrentWindow().onCloseRequested((event) => {
-      if (dirty && !window.confirm("This window has unsaved changes. Close it anyway?")) event.preventDefault();
-    }).then((stop) => { unlisten = stop; });
-    return () => unlisten?.();
-  }, [dirty]);
+    const flush = () => {
+      try { localStorage.setItem(sessionKey, JSON.stringify(documentsRef.current)); }
+      catch { /* The regular persistence effect already displays the error. */ }
+    };
+    window.addEventListener("beforeunload", flush);
+    return () => window.removeEventListener("beforeunload", flush);
+  }, [sessionKey]);
 
   useEffect(() => {
     const handler = (event: KeyboardEvent) => {
@@ -355,6 +396,16 @@ export default function App() {
       if ((event.ctrlKey || event.metaKey) && event.key.toLowerCase() === "o") { event.preventDefault(); open(); }
       if ((event.ctrlKey || event.metaKey) && event.shiftKey && event.key.toLowerCase() === "n") { event.preventDefault(); openNewWindow(); }
       else if ((event.ctrlKey || event.metaKey) && event.key.toLowerCase() === "n") { event.preventDefault(); newDocument(); }
+      if ((event.ctrlKey || event.metaKey) && event.key.toLowerCase() === "w") { event.preventDefault(); setDocuments((current) => closeTab(current, current.activeId)); }
+      if ((event.ctrlKey || event.metaKey) && event.shiftKey && event.key.toLowerCase() === "t") { event.preventDefault(); setDocuments(restoreClosedTab); }
+      if ((event.ctrlKey || event.metaKey) && event.key === "Tab") {
+        event.preventDefault();
+        setDocuments((current) => {
+          const index = current.tabs.findIndex((tab) => tab.id === current.activeId);
+          const next = (index + (event.shiftKey ? current.tabs.length - 1 : 1)) % current.tabs.length;
+          return { ...current, activeId: current.tabs[next].id };
+        });
+      }
       const zoom = zoomShortcut(event);
       if (zoom) { event.preventDefault(); if (zoom === "reset") setZoom(100); else zoomBy(zoom === "in" ? 10 : -10); }
     };
@@ -391,12 +442,6 @@ export default function App() {
   }, [autosave, content, dirty, path, save]);
 
   useEffect(() => {
-    if (!dirty || path) return;
-    const timer = window.setTimeout(() => invoke("save_draft", { content }).catch(() => undefined), 800);
-    return () => window.clearTimeout(timer);
-  }, [content, dirty, path]);
-
-  useEffect(() => {
     const root = document.documentElement;
     root.dataset.theme = activeTheme;
     root.dataset.fullscreen = String(fullscreen);
@@ -413,7 +458,7 @@ export default function App() {
     } else ["--primary", "--on-primary", "--surface", "--surface-low", "--surface-high", "--text", "--muted", "--outline"].forEach((name) => root.style.removeProperty(name));
   }, [activeTheme, caelestia, fullscreen]);
 
-  const title = useMemo(() => path?.split(/[\\/]/).pop() ?? "Untitled.smd", [path]);
+  const title = tabTitle(activeTab);
   const location = useMemo(() => path ? path.split(/[\\/]/).slice(0, -1).join("/") : "New document", [path]);
   const lineCount = useMemo(() => content.split("\n").length, [content]);
   const wordCount = useMemo(() => content.trim() ? content.trim().split(/\s+/).length : 0, [content]);
@@ -434,7 +479,7 @@ export default function App() {
     <MotionConfig reducedMotion={motionEnabled ? "never" : "always"}>
     <div className={`app view-${view} ${focusMode ? "focus-mode" : ""}`}>
       {!fullscreen && <header className="topbar">
-        <div className="brand"><span className="brand-mark"><img src="/brand-mark.svg" alt="" /></span><span className="document-identity"><strong title={title}>{title}</strong><small title={location}>{location}</small></span><span className={`save-state ${dirty ? "is-dirty" : ""}`}>{dirty ? "Unsaved" : path ? "Saved" : "Draft"}</span></div>
+        <div className="brand"><span className="brand-mark"><BrandMark /></span><span className="document-identity"><strong title={title}>{title}</strong><small title={location}>{location}</small></span><span className={`save-state ${dirty ? "is-dirty" : ""}`}>{dirty ? "Recoverable edit" : path ? "Saved" : "Draft"}</span></div>
         <nav className="file-actions" aria-label="File actions">
           <button className="toolbar-button icon-only" onClick={newDocument} title="New · Ctrl+N" aria-label="New document"><Plus size={19} /></button>
           <button className="toolbar-button icon-only" onClick={() => openNewWindow()} title="New window · Ctrl+Shift+N" aria-label="New window"><Browsers size={19} /></button>
@@ -444,15 +489,23 @@ export default function App() {
         </nav>
         <nav className="right-actions" aria-label="View and export">
           <div className="segmented" aria-label="View mode">
-            {(["editor", "split", "reader"] as ViewMode[]).map((mode) => <button key={mode} className={view === mode ? "active" : ""} onClick={() => setView(mode)} title={`${mode[0].toUpperCase()}${mode.slice(1)} view`} aria-label={`${mode} view`} aria-pressed={view === mode}>{view === mode && <motion.i className="segment-indicator" layoutId="view-indicator" transition={motionEnabled ? spring.selector : { duration: 0 }} />}{mode === "editor" ? <PencilSimple size={17} /> : mode === "split" ? <Columns size={17} /> : <BookOpen size={17} />}<span>{mode}</span></button>)}
+            {(mobileUi ? ["live", "editor", "reader"] : ["editor", "live", "split", "reader"] as ViewMode[]).map((mode) => <button key={mode} className={view === mode ? "active" : ""} onClick={() => setView(mode as ViewMode)} title={`${mode[0].toUpperCase()}${mode.slice(1)} view`} aria-label={`${mode} view`} aria-pressed={view === mode}>{view === mode && <motion.i className="segment-indicator" layoutId="view-indicator" transition={motionEnabled ? spring.selector : { duration: 0 }} />}{mode === "editor" ? <PencilSimple size={17} /> : mode === "split" ? <Columns size={17} /> : mode === "live" ? <Sparkle size={17} /> : <BookOpen size={17} />}<span>{mode === "editor" && mobileUi ? "Source" : mode === "reader" && mobileUi ? "Read" : mode}</span></button>)}
           </div>
           <button className={`toolbar-button icon-only ${focusMode ? "active" : ""}`} onClick={() => setFocusMode((value) => !value)} title="Focus mode" aria-label="Focus mode" aria-pressed={focusMode}><Crosshair size={19} /></button>
           <button className="toolbar-button icon-only" onClick={toggleFullscreen} title="Fullscreen · F11" aria-label="Fullscreen"><ArrowsOut size={19} /></button>
           <button className="toolbar-button icon-only" onClick={() => setShowSettings(true)} title="Settings" aria-label="Settings"><GearSix size={19} /></button>
-          <button className="export-action" onClick={() => setShowExport(true)}><FilePdf size={19} weight="bold" /><span>Export PDF</span></button>
+          <button className="export-action" onClick={() => android ? flash("Semantic PDF export currently requires desktop Pandoc + Typst") : setShowExport(true)} title={android ? "PDF export is currently desktop-only" : "Export PDF"}><FilePdf size={19} weight="bold" /><span>Export PDF</span></button>
         </nav>
       </header>}
-      {!fullscreen && view !== "reader" && <div className="formatbar" aria-label="Formatting tools">
+      {!fullscreen && <div className="tab-strip" role="tablist" aria-label="Open documents">
+        <div className="tab-scroll">{documents.tabs.map((tab) => <div key={tab.id} className={`document-tab ${tab.id === documents.activeId ? "selected" : ""}`} role="presentation">
+          <button role="tab" aria-selected={tab.id === documents.activeId} title={tab.path ?? tab.name} onClick={() => setDocuments((current) => ({ ...current, activeId: tab.id }))} onAuxClick={(event) => { if (event.button === 1) setDocuments((current) => closeTab(current, tab.id)); }}><span className={`tab-dot ${isDirty(tab) ? "dirty" : ""}`} /><span className="tab-name">{tabTitle(tab)}</span></button>
+          <button className="tab-close" onClick={() => setDocuments((current) => closeTab(current, tab.id))} title={`Close ${tabTitle(tab)}`} aria-label={`Close ${tabTitle(tab)}`}><X size={14} /></button>
+        </div>)}</div>
+        <button className="tab-add" onClick={newDocument} title="New tab · Ctrl+N" aria-label="New tab"><Plus size={17} /></button>
+        {documents.recentlyClosed.length > 0 && <button className="tab-reopen" onClick={() => setDocuments(restoreClosedTab)} title="Reopen closed tab · Ctrl+Shift+T">Reopen</button>}
+      </div>}
+      {!fullscreen && view === "editor" && <div className="formatbar" aria-label="Formatting tools">
         <span className="format-label">Insert</span>
         <button onClick={() => format("## ", "", true)} title="Heading 2" aria-label="Heading 2"><TextHTwo size={18} /></button>
         <button onClick={() => format("**") } title="Bold" aria-label="Bold"><TextB size={18} /></button>
@@ -467,16 +520,18 @@ export default function App() {
       </div>}
       {fullscreen && <div className="fullscreen-controls" aria-label="Fullscreen controls"><button onClick={() => zoomBy(-10)} title="Zoom out"><Minus size={16} /></button><button onClick={() => setZoom(100)} title="Reset workspace zoom">{workspaceZoom}%</button><button onClick={() => zoomBy(10)} title="Zoom in"><Plus size={16} /></button><span /><button onClick={toggleFullscreen} title="Leave fullscreen · F11"><ArrowsOut size={17} /></button></div>}
       <main className="workspace" ref={workspaceRef} data-resizing={resizing || windowResizing} data-dragging-file={draggingFile} style={{ "--split-left": `${splitPercent}fr`, "--split-right": `${100 - splitPercent}fr`, "--workspace-scale": workspaceZoom / 100 } as React.CSSProperties}>
-        {view !== "reader" && <motion.section layout="position" initial={false} transition={motionEnabled && !resizing && !windowResizing ? spring.surface : { duration: 0 }} className="editor-pane" aria-label="Markdown source"><div className="pane-head"><span><PencilSimple size={15} /> Markdown</span>{view === "editor" ? <span className="zoom-controls" aria-label="Workspace zoom"><button onClick={() => zoomBy(-10)} aria-label="Zoom out"><Minus size={14} /></button><button className="zoom-value" onClick={() => setZoom(100)} aria-label={`Reset zoom, currently ${workspaceZoom}%`}>{workspaceZoom}%</button><button onClick={() => zoomBy(10)} aria-label="Zoom in"><Plus size={14} /></button></span> : <small>{lineCount} lines</small>}</div><Editor value={content} onChange={(value) => { setContent(value); setDirty(true); }} dark={dark} focusMode={focusMode} /></motion.section>}
+        {(view === "editor" || view === "split") && <motion.section layout="position" initial={false} transition={motionEnabled && !resizing && !windowResizing ? spring.surface : { duration: 0 }} className="editor-pane" aria-label="Markdown source"><div className="pane-head"><span><PencilSimple size={15} /> Markdown</span>{view === "editor" ? <span className="zoom-controls" aria-label="Workspace zoom"><button onClick={() => zoomBy(-10)} aria-label="Zoom out"><Minus size={14} /></button><button className="zoom-value" onClick={() => setZoom(100)} aria-label={`Reset zoom, currently ${workspaceZoom}%`}>{workspaceZoom}%</button><button onClick={() => zoomBy(10)} aria-label="Zoom in"><Plus size={14} /></button></span> : <small>{lineCount} lines</small>}</div><Editor key={activeTab.id} value={content} onChange={(value) => setDocuments((current) => editTab(current, activeTab.id, value))} dark={dark} focusMode={focusMode} /></motion.section>}
         {view === "split" && <div className="pane-resizer" role="separator" aria-label="Resize editor and preview" aria-orientation="vertical" aria-valuemin={25} aria-valuemax={75} aria-valuenow={splitPercent} tabIndex={0} onPointerDown={onResizePointerDown} onPointerMove={onResizePointerMove} onPointerUp={onResizePointerUp} onLostPointerCapture={() => setResizing(false)} onDoubleClick={() => setSplitPercent(50)} onKeyDown={(event) => { if (event.key === "ArrowLeft" || event.key === "ArrowRight") { event.preventDefault(); setSplitPercent((current) => Math.max(25, Math.min(75, current + (event.key === "ArrowRight" ? 5 : -5)))); } }}><span /></div>}
-        {view !== "editor" && <motion.section layout="position" initial={false} transition={motionEnabled && !resizing && !windowResizing ? spring.surface : { duration: 0 }} className="preview-pane" aria-label="Reading preview"><div className="pane-head"><span><BookOpen size={15} /> Preview</span><div className="preview-tools"><small>{wordCount} words</small><span className="zoom-controls" aria-label="Workspace zoom"><button onClick={() => zoomBy(-10)} title="Zoom out · Ctrl+-" aria-label="Zoom out"><Minus size={14} /></button><button className="zoom-value" onClick={() => setZoom(100)} title="Reset zoom · Ctrl+0" aria-label={`Reset zoom, currently ${workspaceZoom}%`}>{workspaceZoom}%</button><button onClick={() => zoomBy(10)} title="Zoom in · Ctrl++" aria-label="Zoom in"><Plus size={14} /></button></span></div></div><div className="reading-scroll" ref={readingScrollRef}><div className="preview-page" style={{ width: previewLayoutWidth(previewViewportWidth, readerWidth, workspaceZoom), zoom: workspaceZoom / 100 }}><MarkdownPreview markdown={content} documentPath={path} python={python} dark={dark} trustedImageHosts={trustedImageHosts} onTrustImageHost={trustImageHost} /></div></div></motion.section>}
+        {(view === "reader" || view === "split") && <motion.section layout="position" initial={false} transition={motionEnabled && !resizing && !windowResizing ? spring.surface : { duration: 0 }} className="preview-pane" aria-label="Reading preview"><div className="pane-head"><span><BookOpen size={15} /> Preview</span><div className="preview-tools"><small>{wordCount} words</small><span className="zoom-controls" aria-label="Workspace zoom"><button onClick={() => zoomBy(-10)} title="Zoom out · Ctrl+-" aria-label="Zoom out"><Minus size={14} /></button><button className="zoom-value" onClick={() => setZoom(100)} title="Reset zoom · Ctrl+0" aria-label={`Reset zoom, currently ${workspaceZoom}%`}>{workspaceZoom}%</button><button onClick={() => zoomBy(10)} title="Zoom in · Ctrl++" aria-label="Zoom in"><Plus size={14} /></button></span></div></div><div className="reading-scroll" ref={readingScrollRef}><div className="preview-page" style={{ width: previewLayoutWidth(previewViewportWidth, readerWidth, workspaceZoom), zoom: workspaceZoom / 100 }}><MarkdownPreview markdown={content} documentPath={path} python={python} dark={dark} trustedImageHosts={trustedImageHosts} onTrustImageHost={trustImageHost} /></div></div></motion.section>}
+        {view === "live" && <motion.section layout="position" initial={false} transition={motionEnabled && !windowResizing ? spring.surface : { duration: 0 }} className="live-pane" aria-label="Live Markdown"><div className="pane-head"><span><Sparkle size={15} /> Live preview</span><small>Tap a pencil to edit a block</small></div><div className="reading-scroll"><LiveEditor key={activeTab.id} markdown={content} onChange={(value) => setDocuments((current) => editTab(current, activeTab.id, value))} documentPath={path} python={python} dark={dark} trustedImageHosts={trustedImageHosts} onTrustImageHost={trustImageHost} /></div></motion.section>}
       </main>
       <AnimatePresence>{notice && <motion.div key="notice" className="snackbar" initial={motionEnabled ? { opacity: 0, y: 18, x: "-50%", scale: .94 } : false} animate={{ opacity: 1, y: 0, x: "-50%", scale: 1 }} exit={motionEnabled ? { opacity: 0, y: 12, x: "-50%", scale: .96 } : { opacity: 0 }} transition={motionEnabled ? spring.surface : { duration: 0 }}>{notice}</motion.div>}</AnimatePresence>
       <AnimatePresence>{showSettings && <motion.div key="settings" className="scrim" initial={motionEnabled ? { opacity: 0 } : false} animate={{ opacity: 1 }} exit={{ opacity: 0 }} transition={{ duration: motionEnabled ? .24 : 0 }} onMouseDown={() => setShowSettings(false)}><motion.aside className="sheet" initial={motionEnabled ? { opacity: 0, y: 40, scale: .9, borderRadius: 44 } : false} animate={{ opacity: 1, y: 0, scale: 1, borderRadius: 28 }} exit={motionEnabled ? { opacity: 0, y: 18, scale: .96 } : { opacity: 0 }} transition={motionEnabled ? spring.sheet : { duration: 0 }} onMouseDown={(event) => event.stopPropagation()}>
         <div className="sheet-title"><h2>Appearance & runtime</h2><button onClick={() => setShowSettings(false)} aria-label="Close settings"><X size={20} /></button></div>
         <label>Normal theme<select value={normalTheme} onChange={(event) => setNormalTheme(event.target.value as ThemeMode)}><option value="caelestia">Caelestia dynamic</option><option value="light">Material light</option><option value="dark">Material dark</option><option value="black">Pure black</option></select></label>
         <label>Fullscreen theme<select value={fullscreenTheme} onChange={(event) => setFullscreenTheme(event.target.value as ThemeMode)}><option value="caelestia">Caelestia dynamic</option><option value="light">Material light</option><option value="dark">Material dark</option><option value="black">Pure black</option></select></label>
-        <label>Python interpreter<div className="path-field"><input value={python} onChange={(event) => { setPython(event.target.value); localStorage.setItem("python", event.target.value); }} /><button onClick={choosePython}>Choose</button></div></label>
+        {!android && <label>Python interpreter<div className="path-field"><input value={python} onChange={(event) => { setPython(event.target.value); localStorage.setItem("python", event.target.value); }} /><button onClick={choosePython}>Choose</button></div></label>}
+        {android && <p className="help">Python execution and semantic PDF export require the desktop backend. Charts, math, callouts, and live reading work on this device.</p>}
         <h3>Typography</h3>
         <label>Reading font<select value={readerFont} onChange={(event) => setReaderFont(event.target.value)}>{readerFonts.map((font) => <option key={font.value} value={font.value}>{font.label}</option>)}</select></label>
         <div className="form-grid">
