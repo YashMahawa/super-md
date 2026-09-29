@@ -105,15 +105,8 @@ import androidx.compose.ui.unit.sp
 import androidx.core.view.WindowCompat
 import androidx.core.view.WindowInsetsCompat
 import androidx.core.view.WindowInsetsControllerCompat
-import androidx.lifecycle.Lifecycle
-import androidx.lifecycle.lifecycleScope
-import androidx.lifecycle.repeatOnLifecycle
-import androidx.window.layout.FoldingFeature
-import androidx.window.layout.WindowInfoTracker
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
-import kotlinx.coroutines.flow.collect
-import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import org.json.JSONArray
 import org.json.JSONObject
@@ -134,7 +127,6 @@ class MainActivity : ComponentActivity() {
     private var motionEnabled by mutableStateOf(true)
     private var readerScale by mutableFloatStateOf(1f)
     private var splitFraction by mutableFloatStateOf(.5f)
-    private var separatingFold by mutableStateOf<FoldingFeature?>(null)
     private var showSettings by mutableStateOf(false)
     private var showSearch by mutableStateOf(false)
     private var showPdf by mutableStateOf(false)
@@ -200,14 +192,6 @@ class MainActivity : ComponentActivity() {
         motionEnabled = prefs.getBoolean("motion", true)
         restoreNotes()
         intent?.data?.let(::openFromIntent)
-        lifecycleScope.launch {
-            repeatOnLifecycle(Lifecycle.State.STARTED) {
-                WindowInfoTracker.getOrCreate(this@MainActivity).windowLayoutInfo(this@MainActivity).collect { layout ->
-                    separatingFold = layout.displayFeatures.filterIsInstance<FoldingFeature>()
-                        .firstOrNull { it.isSeparating || it.state == FoldingFeature.State.HALF_OPENED }
-                }
-            }
-        }
         setContent { SuperMdApp() }
     }
 
@@ -438,37 +422,20 @@ class MainActivity : ComponentActivity() {
                         val panes: @Composable (ReadingMode) -> Unit = { shownMode ->
                             if (shownMode == ReadingMode.SPLIT && !compact) {
                                 val widthPx = with(LocalDensity.current) { viewportWidth.toPx() }
-                                val fold = separatingFold
-                                if (fold?.orientation == FoldingFeature.Orientation.HORIZONTAL) {
-                                    val hingeHeight = with(LocalDensity.current) { fold.bounds.height().toDp() }.coerceAtLeast(20.dp)
-                                    Column(Modifier.fillMaxSize().padding(12.dp)) {
-                                        Surface(Modifier.weight(1f).fillMaxWidth(), shape = RoundedCornerShape(20.dp), color = MaterialTheme.colorScheme.surface) {
-                                            SourcePane(active.content, ::updateContent)
-                                        }
-                                        Spacer(Modifier.height(hingeHeight))
-                                        Surface(Modifier.weight(1f).fillMaxWidth(), shape = RoundedCornerShape(20.dp), color = MaterialTheme.colorScheme.surface) {
-                                            PreviewPane(active.content, active.imageFolder, false, readerScale, { readerScale = it }, { editBlock = it }, ::chooseImageFolder)
-                                        }
+                                Row(Modifier.fillMaxSize().padding(12.dp)) {
+                                    Surface(Modifier.weight(splitFraction).fillMaxHeight(), shape = RoundedCornerShape(20.dp), color = MaterialTheme.colorScheme.surface) {
+                                        SourcePane(active.content, ::updateContent)
                                     }
-                                } else {
-                                    val hinged = fold?.orientation == FoldingFeature.Orientation.VERTICAL
-                                    val paneFraction = if (hinged) (fold!!.bounds.centerX() / widthPx).coerceIn(.28f, .72f) else splitFraction
-                                    val gutter = if (hinged) with(LocalDensity.current) { fold!!.bounds.width().toDp() }.coerceAtLeast(20.dp) else 20.dp
-                                    Row(Modifier.fillMaxSize().padding(12.dp)) {
-                                        Surface(Modifier.weight(paneFraction).fillMaxHeight(), shape = RoundedCornerShape(20.dp), color = MaterialTheme.colorScheme.surface) {
-                                            SourcePane(active.content, ::updateContent)
+                                    Box(Modifier.width(20.dp).fillMaxHeight().pointerInput(widthPx) {
+                                        detectDragGestures { change, drag ->
+                                            change.consume()
+                                            splitFraction = (splitFraction + drag.x / widthPx).coerceIn(.28f, .72f)
                                         }
-                                        Box(Modifier.width(gutter).fillMaxHeight().then(if (hinged) Modifier else Modifier.pointerInput(widthPx) {
-                                            detectDragGestures { change, drag ->
-                                                change.consume()
-                                                splitFraction = (splitFraction + drag.x / widthPx).coerceIn(.28f, .72f)
-                                            }
-                                        }), contentAlignment = Alignment.Center) {
-                                            if (!hinged) Box(Modifier.width(4.dp).height(52.dp).clip(RoundedCornerShape(8.dp)).background(MaterialTheme.colorScheme.outlineVariant))
-                                        }
-                                        Surface(Modifier.weight(1f - paneFraction).fillMaxHeight(), shape = RoundedCornerShape(20.dp), color = MaterialTheme.colorScheme.surface) {
-                                            PreviewPane(active.content, active.imageFolder, false, readerScale, { readerScale = it }, { editBlock = it }, ::chooseImageFolder)
-                                        }
+                                    }, contentAlignment = Alignment.Center) {
+                                        Box(Modifier.width(4.dp).height(52.dp).clip(RoundedCornerShape(8.dp)).background(MaterialTheme.colorScheme.outlineVariant))
+                                    }
+                                    Surface(Modifier.weight(1f - splitFraction).fillMaxHeight(), shape = RoundedCornerShape(20.dp), color = MaterialTheme.colorScheme.surface) {
+                                        PreviewPane(active.content, active.imageFolder, false, readerScale, { readerScale = it }, { editBlock = it }, ::chooseImageFolder)
                                     }
                                 }
                             } else {
