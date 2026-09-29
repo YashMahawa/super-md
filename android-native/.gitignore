@@ -1,6 +1,0 @@
-.gradle/
-.kotlin/
-build/
-app/build/
-local.properties
-*.iml
