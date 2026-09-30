@@ -116,7 +116,7 @@ function MarkdownPreview({ markdown, documentPath, python, dark, trustedImageHos
             const source = textOf(child.props.children).replace(/\n$/, "");
             if (language === "smd-chart") return <InteractiveChart source={source} />;
             if (language === "mermaid") return <Suspense fallback={<span className="image-loading" role="status">Loading diagram…</span>}><MermaidDiagram source={source} dark={dark} /></Suspense>;
-            if (language === "python" || language === "py") return <PythonCell source={source} python={python} />;
+            if (language === "python" || language === "py") return <PythonCell source={source} python={python} highlighted={child.props.children} />;
             return <pre>{children}</pre>;
           }
         }}

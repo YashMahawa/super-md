@@ -37,6 +37,7 @@ test("Android shares math, callouts, graphs and portable PDF preparation", async
   // Python source has no highlight.js wrapper; it must remain legible against
   // the fixed dark code surface even when the document uses a light theme.
   await expect(page.locator(".python-cell > pre code")).toHaveCSS("color", "rgb(238, 237, 244)");
+  await expect(page.locator(".python-cell .hljs-string")).toContainText("local-python-ok");
   await expect(page.locator(".mermaid svg")).toBeVisible(); await page.locator("input[type=range]").fill("1.98");
   await page.getByRole("button", { name: "Run" }).click(); await expect(page.locator(".cell-output")).toContainText("local-python-ok");
   await page.evaluate(() => window.supermdExport?.({ pageSize: "a4", margin: 18, fontSize: 11, fontFamily: "Libertinus Serif", lineHeight: 1.35, pageNumbers: false }));

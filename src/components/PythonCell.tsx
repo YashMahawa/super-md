@@ -1,9 +1,9 @@
-import { useRef, useState } from "react";
+import { useRef, useState, type ReactNode } from "react";
 import { invoke } from "../nativeBridge";
 import { pythonResults, remember } from "../renderedOutputs";
 import type { PythonResult } from "../types";
 
-export default function PythonCell({ source, python }: { source: string; python: string }) {
+export default function PythonCell({ source, python, highlighted }: { source: string; python: string; highlighted?: ReactNode }) {
   const [result, setResult] = useState<PythonResult | null>(() => pythonResults.get(source) || null);
   const [running, setRunning] = useState(false);
   const executedSource = useRef(pythonResults.has(source) ? source : "");
@@ -26,7 +26,7 @@ export default function PythonCell({ source, python }: { source: string; python:
   return (
     <div className="python-cell">
       <div className="cell-toolbar"><span>Python {stale && <small className="stale-badge">Output from earlier code</small>}</span><button onClick={run} disabled={running || !python}>{running ? "Running…" : stale ? "Run updated code" : "Run"}</button></div>
-      <pre><code className="language-python">{source}</code></pre>
+      <pre><code className="language-python">{highlighted ?? source}</code></pre>
       {result && <div className={`cell-output ${result.ok ? "" : "failed"} ${stale ? "stale" : ""}`}>
         {result.stdout && <pre>{result.stdout}</pre>}
         {result.stderr && <pre>{result.stderr}</pre>}

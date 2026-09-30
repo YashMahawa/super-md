@@ -40,3 +40,13 @@ describe("image references", () => {
       .toBe("![DM Images/proof-method-guide.png](DM%20Images/proof-method-guide.png)");
   });
 });
+
+describe("executable Python cells", () => {
+  it("preserves syntax highlighting without changing the executable source", () => {
+    const html = renderToStaticMarkup(<MarkdownPreview markdown={"```python\nimport numpy as np\nprint('hello')\n```"} documentPath={null} python="python3" dark={false} />);
+    expect(html).toContain('class="hljs-keyword"');
+    expect(html).toContain('class="hljs-string"');
+    expect(html).toContain('class="python-cell"');
+    expect(html).toContain("Run");
+  });
+});
