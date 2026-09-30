@@ -7,7 +7,7 @@ browser tests, the ARM64 release build and Android emulator instrumentation.
 
 ## Desktop and shared renderer
 
-- 18 frontend unit tests; V8 coverage generated (informational, no invented gate).
+- 19 frontend unit tests; V8 coverage generated (informational, no invented gate).
 - Two Playwright workflows: tabs/history/recovery/sidebar, and the Android reader's
   equations/callouts/graphs/diagram/Python-result PDF preparation using mock IPC.
 - Seven real native typesetter tests: equations, callouts, embedded SVG, page-number
@@ -59,7 +59,8 @@ browser tests, the ARM64 release build and Android emulator instrumentation.
   logical line rather than assuming a single text event.
 - Unhighlighted Python source inherited dark document text on a dark code surface
   in light mode. Code surfaces now specify a readable foreground; a browser check
-  prevents that contrast regression.
+  prevents that contrast regression. Python cells also retain the renderer's
+  already-computed syntax spans, without re-tokenizing code or changing execution.
 
 ## Remaining verification boundaries
 
