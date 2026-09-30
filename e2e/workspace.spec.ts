@@ -34,6 +34,9 @@ test("Android shares math, callouts, graphs and portable PDF preparation", async
   const chart = JSON.stringify({ x: { min: -3, max: 3 }, series: [{ expression: "a * sin(x)" }], sliders: [{ name: "a", min: 0, max: 3, value: 1 }] });
   await page.evaluate((content) => window.supermdLoad?.({ id: "note", content, path: null, mode: "reader", dark: false, fullscreen: false, colors: {}, font: "sans", size: 17, zoom: 100 }), `> [!TIP] Learn\n> Work through the equation.\n\n$$\\begin{pmatrix}1&2\\\\3&4\\end{pmatrix}$$\n\n\`\`\`smd-chart\n${chart}\n\`\`\`\n\n\`\`\`mermaid\nflowchart LR\n  Read --> Understand\n\`\`\`\n\n\`\`\`python\nprint('local-python-ok')\n\`\`\``);
   await expect(page.locator(".callout-tip")).toBeVisible(); await expect(page.locator(".katex-error")).toHaveCount(0); await expect(page.locator(".katex")).toHaveCount(1);
+  // Python source has no highlight.js wrapper; it must remain legible against
+  // the fixed dark code surface even when the document uses a light theme.
+  await expect(page.locator(".python-cell > pre code")).toHaveCSS("color", "rgb(238, 237, 244)");
   await expect(page.locator(".mermaid svg")).toBeVisible(); await page.locator("input[type=range]").fill("1.98");
   await page.getByRole("button", { name: "Run" }).click(); await expect(page.locator(".cell-output")).toContainText("local-python-ok");
   await page.evaluate(() => window.supermdExport?.({ pageSize: "a4", margin: 18, fontSize: 11, fontFamily: "Libertinus Serif", lineHeight: 1.35, pageNumbers: false }));

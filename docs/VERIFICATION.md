@@ -1,7 +1,9 @@
 # Verification — 2026-09-30
 
 Keep native and browser-mocked evidence separate. These checks were run locally;
-GitHub CI results and physical-phone performance are not implied by them.
+Physical-phone performance is not implied by emulator or CI results.
+GitHub run `36675303204` passed all seven checks, including macOS/Windows/Linux,
+browser tests, the ARM64 release build and Android emulator instrumentation.
 
 ## Desktop and shared renderer
 
@@ -32,6 +34,14 @@ GitHub CI results and physical-phone performance are not implied by them.
 - Phone portrait/landscape and a 960 × 1280 dp tablet-width configuration were checked.
   Phone landscape retains Live/Source/Read; the tablet displays working Split panes.
   Actual foldable hinge hardware and physical touch latency remain untested.
+- The optimized, non-debuggable x86_64 release variant was also exercised directly
+  through its UI, not through the in-process debug instrumentation harness. Local
+  Matplotlib ran successfully; the real Android destination picker saved a PDF with
+  equations, table, slider graph, Mermaid and the executed Python figure. Turning
+  page numbers off in the native settings sheet produced an unnumbered PDF.
+  The additional white-box release harness was not usable: it referenced library
+  classes stripped from the production app. No broad keep rules or disabled
+  optimization were added to make that harness pass.
 
 ## Bugs found during these checks
 
@@ -47,6 +57,9 @@ GitHub CI results and physical-phone performance are not implied by them.
   explicitly permits only base64 image URLs in image sources.
 - A callout marker can span multiple Markdown parser events. Match the whole first
   logical line rather than assuming a single text event.
+- Unhighlighted Python source inherited dark document text on a dark code surface
+  in light mode. Code surfaces now specify a readable foreground; a browser check
+  prevents that contrast regression.
 
 ## Remaining verification boundaries
 

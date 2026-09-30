@@ -169,7 +169,7 @@ button:disabled { opacity: .5; cursor: default; }
 .markdown-body table { width: 100%; display: block; overflow-x: auto; border-collapse: collapse; margin: 1.4em 0; }
 .markdown-body th, .markdown-body td { padding: 9px 12px; border: 1px solid var(--outline); text-align: left; min-width: 90px; }
 .markdown-body th { background: var(--surface-high); }
-.markdown-body pre { max-width: 100%; overflow: auto; padding: 18px; border-radius: 12px; background: #17151b; border: 1px solid var(--outline); font: .9em/1.6 var(--mono); }
+.markdown-body pre { max-width: 100%; overflow: auto; padding: 18px; border-radius: 12px; background: #17151b; color: #eeedf4; border: 1px solid var(--outline); font: .9em/1.6 var(--mono); }
 .markdown-body :not(pre) > code { background: var(--surface-high); border-radius: 5px; padding: .16em .38em; font-family: var(--mono); font-size: .9em; }
 .katex-display { max-width: 100%; overflow-x: auto; overflow-y: hidden; padding: .6em .1em; }
 .callout { --callout-accent: var(--primary); display: flow-root; position: relative; margin: 1.55em 0; padding: 12px 20px 13px 22px; border: 1px solid color-mix(in srgb, var(--callout-accent) 36%, var(--outline)); border-radius: 14px; background: color-mix(in srgb, var(--callout-accent) 8%, var(--surface)); }
