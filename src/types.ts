@@ -1,4 +1,4 @@
-export type ThemeMode = "caelestia" | "light" | "dark" | "black";
+export type ThemeMode = "system" | "light" | "dark" | "black";
 export type ViewMode = "split" | "live" | "editor" | "reader";
 
 export interface DocumentData {
@@ -12,6 +12,7 @@ export interface ExportOptions {
   fontSize: number;
   lineHeight: number;
   fontFamily: string;
+  pageNumbers: boolean;
   output?: string;
 }
 
@@ -37,7 +38,7 @@ export interface ChartSpec {
     label?: string;
     min: number;
     max: number;
-    step: number;
+    step?: number;
     value: number;
   }>;
 }

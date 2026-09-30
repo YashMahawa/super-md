@@ -33,6 +33,8 @@ struct ExportOptions {
     font_size: f32,
     line_height: f32,
     font_family: String,
+    #[serde(default = "default_page_numbers")]
+    page_numbers: bool,
     output: Option<String>,
 }
 
@@ -43,11 +45,37 @@ impl Default for ExportOptions {
             margin: 18.0,
             font_size: 10.5,
             line_height: 1.35,
-            font_family: "New Computer Modern".into(),
+            font_family: "Libertinus Serif".into(),
+            page_numbers: true,
             output: None,
         }
     }
 }
+
+fn default_page_numbers() -> bool { true }
+
+#[cfg(not(target_os = "android"))]
+#[tauri::command]
+async fn export_portable_pdf(path: Option<String>, content: String, assets: std::collections::HashMap<String, String>, options: ExportOptions) -> Result<Option<String>, String> {
+    let suggested = path.as_deref().and_then(|p| Path::new(p).file_stem()).and_then(|s| s.to_str()).map(|s| format!("{s}.pdf")).unwrap_or("notes.pdf".into());
+    let output = match options.output.clone() {
+        Some(path) => PathBuf::from(path),
+        None => match rfd::AsyncFileDialog::new().add_filter("PDF document", &["pdf"]).set_file_name(suggested).save_file().await {
+            Some(file) => file.path().to_path_buf(), None => return Ok(None),
+        }
+    };
+    tauri::async_runtime::spawn_blocking(move || {
+        let options = smd_core::PdfOptions { page_size: options.page_size, margin: options.margin, font_size: options.font_size, line_height: options.line_height, font_family: options.font_family, page_numbers: options.page_numbers };
+        let assets = assets.into_iter().map(|(name, b64)| STANDARD.decode(b64).map(|bytes| (name, bytes))).collect::<Result<std::collections::HashMap<_,_>,_>>().map_err(display_error)?;
+        let bytes = smd_core::export(&content, &options, &assets).map_err(display_error)?;
+        atomic_write(&output, &bytes).map_err(display_error)?;
+        Ok(Some(output.to_string_lossy().into_owned()))
+    }).await.map_err(display_error)?
+}
+
+#[cfg(target_os = "android")]
+#[tauri::command]
+async fn export_portable_pdf(_path: Option<String>, _content: String, _assets: std::collections::HashMap<String,String>, _options: ExportOptions) -> Result<Option<String>, String> { Err("Use the native Android release".into()) }
 
 #[derive(Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -134,7 +162,7 @@ fn save_document(request: SaveRequest) -> Result<Option<String>, String> {
             None => return Ok(None),
         },
     };
-    fs::write(&path, request.content)
+    atomic_write(&path, request.content.as_bytes())
         .with_context(|| format!("Could not save {}", path.display()))
         .map_err(display_error)?;
     Ok(Some(path.to_string_lossy().into_owned()))
@@ -147,10 +175,54 @@ fn save_document(_request: SaveRequest) -> Result<Option<String>, String> {
 }
 
 #[tauri::command]
-fn load_caelestia_theme() -> Option<Value> {
+fn load_system_theme() -> Option<Value> {
     let state = dirs::state_dir()?.join("caelestia/scheme.json");
     serde_json::from_str(&fs::read_to_string(state).ok()?).ok()
 }
+
+fn atomic_write(path: &Path, bytes: &[u8]) -> Result<()> {
+    let parent = path.parent().filter(|p| !p.as_os_str().is_empty()).unwrap_or(Path::new("."));
+    let mut temporary = tempfile::NamedTempFile::new_in(parent)?;
+    if let Ok(metadata) = fs::metadata(path) { temporary.as_file().set_permissions(metadata.permissions())?; }
+    temporary.write_all(bytes)?;
+    temporary.as_file().sync_all()?;
+    temporary.persist(path).map_err(|error| error.error)?;
+    Ok(())
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct DirectoryEntry { name: String, path: String, directory: bool }
+
+#[tauri::command]
+fn read_directory_children(root: String, path: String) -> Result<Vec<DirectoryEntry>, String> {
+    let root = PathBuf::from(root).canonicalize().map_err(display_error)?;
+    let path = PathBuf::from(path).canonicalize().map_err(display_error)?;
+    if !path.starts_with(&root) { return Err("Folder is outside the selected workspace".into()); }
+    let mut entries = Vec::new();
+    for entry in fs::read_dir(path).map_err(display_error)? {
+        let entry = entry.map_err(display_error)?;
+        let name = entry.file_name().to_string_lossy().into_owned();
+        if name.starts_with('.') || ["node_modules", "target", "build", "dist"].contains(&name.as_str()) { continue; }
+        let kind = entry.file_type().map_err(display_error)?;
+        if kind.is_symlink() { continue; }
+        if kind.is_dir() || name.rsplit('.').next().is_some_and(|v| ["md", "smd", "markdown"].contains(&v.to_ascii_lowercase().as_str())) {
+            entries.push(DirectoryEntry { name, path: entry.path().to_string_lossy().into_owned(), directory: kind.is_dir() });
+        }
+    }
+    entries.sort_by(|a,b| b.directory.cmp(&a.directory).then_with(|| a.name.to_lowercase().cmp(&b.name.to_lowercase())));
+    Ok(entries)
+}
+
+#[cfg(not(target_os = "android"))]
+#[tauri::command]
+fn open_workspace_folder() -> Option<String> {
+    rfd::FileDialog::new().set_title("Open any folder").pick_folder().map(|p| p.to_string_lossy().into_owned())
+}
+
+#[cfg(target_os = "android")]
+#[tauri::command]
+fn open_workspace_folder() -> Option<String> { None }
 
 #[tauri::command]
 fn startup_document(path: tauri::State<'_, Option<String>>) -> Result<Option<Document>, String> {
@@ -376,59 +448,24 @@ fn export_pdf_inner(
     output: &Path,
     options: &ExportOptions,
 ) -> Result<()> {
-    let pandoc =
-        which::which("pandoc").context("Pandoc was not found. Install pandoc 3 or newer.")?;
-    which::which("typst").context("Typst was not found. Install typst 0.13 or newer.")?;
     let directory = tempfile::tempdir()?;
-    let input = directory.path().join("document.md");
-    let header = directory.path().join("supermd.typ");
-    let metadata = directory.path().join("export.yaml");
-    fs::write(&input, render_export_markdown(content, directory.path())?)?;
-    fs::write(&header, include_str!("supermd.typ"))?;
-
-    let margin = format!("{}mm", options.margin.clamp(4.0, 60.0));
-    let font_size = format!("{}pt", options.font_size.clamp(7.0, 24.0));
-    let line_height = options.line_height.clamp(0.9, 2.2).to_string();
-    let font_family = match options.font_family.as_str() {
-        "New Computer Modern"
-        | "Libertinus Serif"
-        | "Noto Sans"
-        | "DejaVu Serif"
-        | "Arial"
-        | "Georgia"
-        | "Times New Roman" => options.font_family.as_str(),
-        _ => bail!("Unsupported PDF font"),
-    };
-    fs::write(
-        &metadata,
-        format!(
-            "papersize: {}\nmainfont: '{}'\nfontsize: {}\nlinestretch: {}\nmargin:\n  top: {}\n  right: {}\n  bottom: {}\n  left: {}\n",
-            options.page_size.to_ascii_lowercase(), font_family, font_size, line_height, margin, margin, margin, margin
-        ),
-    )?;
-    let resource = source
-        .and_then(Path::parent)
-        .unwrap_or_else(|| Path::new("."));
-    let resource_paths = std::env::join_paths([resource, directory.path()])
-        .context("Could not build resource search path")?;
-    let status = Command::new(pandoc)
-        .arg(&input)
-        .arg("--from=markdown+tex_math_dollars+fenced_divs+pipe_tables+task_lists+strikeout")
-        .arg("--pdf-engine=typst")
-        .arg("--standalone")
-        .arg("--syntax-highlighting=zenburn")
-        .arg(format!(
-            "--resource-path={}",
-            resource_paths.to_string_lossy()
-        ))
-        .arg(format!("--include-in-header={}", header.display()))
-        .arg(format!("--metadata-file={}", metadata.display()))
-        .arg("--output")
-        .arg(output)
-        .status()?;
-    if !status.success() {
-        bail!("Pandoc/Typst export failed with status {status}");
+    let prepared = render_export_markdown(content, directory.path())?;
+    let mut assets = std::collections::HashMap::new();
+    for image in smd_core::image_sources(&prepared) {
+        let bytes = if image.starts_with("data:") {
+            STANDARD.decode(image.split_once(',').context("Invalid embedded image")?.1)?
+        } else {
+            if image.starts_with("http:") || image.starts_with("https:") { bail!("Download remote image {image} into the document's folder for offline export"); }
+            let decoded = percent_decode_str(&image).decode_utf8()?.to_string();
+            let local = directory.path().join(&decoded);
+            let image_path = if local.is_file() { local } else { source.and_then(Path::parent).unwrap_or(Path::new(".")).join(decoded) };
+            if fs::metadata(&image_path)?.len() > 25 * 1024 * 1024 { bail!("Image exceeds 25 MB: {image}"); }
+            fs::read(image_path)?
+        };
+        assets.insert(image, bytes);
     }
+    let options = smd_core::PdfOptions { page_size: options.page_size.to_lowercase(), margin: options.margin, font_size: options.font_size, line_height: options.line_height, font_family: options.font_family.clone(), page_numbers: options.page_numbers };
+    atomic_write(output, &smd_core::export(&prepared, &options, &assets)?)?;
     Ok(())
 }
 
@@ -483,7 +520,7 @@ fn normalize_super_markdown(input: &str) -> String {
 }
 
 fn render_export_markdown(input: &str, directory: &Path) -> Result<String> {
-    let normalized = normalize_super_markdown(input);
+    let normalized = smd_core::normalize_callouts(input);
     let mut output = String::new();
     let mut chart = None::<Vec<String>>;
     let mut chart_index = 0;
@@ -503,10 +540,10 @@ fn render_export_markdown(input: &str, directory: &Path) -> Result<String> {
                 ))
             }) {
                 Ok((title, filename)) => output.push_str(&format!(
-                    "![{}]({filename}){{ width=100% }}\n\n",
+                    "![{}]({filename})\n\n",
                     title.replace(']', "")
                 )),
-                Err(_) => output.push_str(&format!("```json\n{source}\n```\n")),
+                Err(error) => return Err(anyhow::anyhow!("Cannot export interactive chart: {error}")),
             }
         } else if let Some(lines) = chart.as_mut() {
             lines.push(line.to_string());
@@ -658,11 +695,11 @@ fn xml_escape(value: &str) -> String {
 }
 
 fn display_error(error: impl std::fmt::Display) -> String {
-    error.to_string()
+    format!("{error:#}")
 }
 
 fn print_help() {
-    println!("Super MD\n\nUSAGE:\n  super-md                     Open the desktop app\n  super-md <file.smd>          Open a document\n  super-md export <input> [-o output.pdf] [--page-size A4] [--margin 18] [--font 'New Computer Modern']\n  super-md doctor              Check optional runtimes");
+    println!("Super MD\n\nUSAGE:\n  super-md                     Open the desktop app\n  super-md <file.smd>          Open a document\n  super-md export <input> [-o output.pdf] [--page-size A4] [--margin 18] [--font 'Libertinus Serif'] [--font-size 10.5] [--line-height 1.35] [--no-page-numbers]\n  super-md doctor              Check optional runtimes\n\nPDF typesetting is embedded; Pandoc and Typst executables are not required.");
 }
 
 fn run_cli(arguments: &[String]) -> Result<bool> {
@@ -679,7 +716,8 @@ fn run_cli(arguments: &[String]) -> Result<bool> {
             Ok(true)
         }
         "doctor" => {
-            for command in ["pandoc", "typst", "python3"] {
+            println!("✓ PDF: embedded Typst + MiTeX, available offline");
+            for command in ["python3"] {
                 match which::which(command) {
                     Ok(path) => println!("✓ {command}: {}", path.display()),
                     Err(_) => println!("✗ {command}: not found"),
@@ -698,6 +736,10 @@ fn run_cli(arguments: &[String]) -> Result<bool> {
                         options.output =
                             Some(arguments.get(index).context("Missing output path")?.clone());
                     }
+                    "--no-page-numbers" => options.page_numbers = false,
+                    "--page-numbers" => options.page_numbers = true,
+                    "--font-size" => { index += 1; options.font_size = arguments.get(index).context("Missing font size")?.parse()?; }
+                    "--line-height" => { index += 1; options.line_height = arguments.get(index).context("Missing line height")?.parse()?; }
                     "--page-size" => {
                         index += 1;
                         options.page_size =
@@ -745,7 +787,9 @@ pub fn run() -> Result<()> {
             open_document,
             read_document_at,
             save_document,
-            load_caelestia_theme,
+            load_system_theme,
+            open_workspace_folder,
+            read_directory_children,
             startup_document,
             save_draft,
             load_draft,
@@ -755,7 +799,8 @@ pub fn run() -> Result<()> {
             choose_python,
             detect_python,
             run_python,
-            export_pdf
+            export_pdf,
+            export_portable_pdf
         ])
         .run(tauri::generate_context!())
         .context("Tauri failed")?;

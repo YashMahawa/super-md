@@ -1,97 +1,86 @@
 # Super MD
 
-Super MD is a fast, distraction-free Markdown studio for Linux, macOS, and Windows. It uses a small Rust/Tauri shell and the system webview—no Electron and no vault. `.smd` files are plain UTF-8 Markdown with optional portable extensions for interactive charts and executable Python cells.
+A vault-free Markdown study workspace. `.smd` is ordinary UTF-8 Markdown with opt-in interactive chart and Python blocks. Existing `.md` and Obsidian-style callouts work too.
 
-## What works
+## Platforms and architecture
 
-- Markdown and Obsidian-flavoured Markdown (`.md`, `.markdown`, `.smd`)
-- KaTeX math, GFM tables/tasks, code highlighting, relative images, Mermaid diagrams
-- Obsidian callouts and the friendlier `:::callout type Title` syntax
-- Native interactive SVG charts with sliders
-- Local Python/venv execution and Matplotlib SVG output (only on an explicit **Run** click)
-- CodeMirror multicursor editing, search and replace, undo history, and keyboard navigation
-- Recoverable document tabs, Live block editing, split, source, reader, focus, and true F11 fullscreen modes
-- Separate normal/fullscreen themes: Caelestia dynamic, Material light, Material dark, and pure black
-- First-run welcome setup for theme, reading font, and expressive motion; the motion switch honours OS reduced-motion settings
-- Independent normal/fullscreen workspace zoom: pinch or Ctrl/⌘ zooms editor and preview content while toolbars keep their size; long lines reflow instead of clipping
-- Frame-paced split resizing, drag-and-drop document opening, and independent document windows (`Ctrl/⌘+Shift+N`)
-- Separate reading and PDF fonts, plus adjustable type size, line spacing, and reading width
-- Untitled draft and recently closed tab recovery; local images resolve relative to the document on desktop, while remote images load only after consent
-- Semantic PDF export through Pandoc + Typst; the preview DOM is never printed
-- One binary for GUI and CLI export
+- Desktop: Rust/Tauri, the system WebView, React, TypeScript and CodeMirror. No Electron runtime. Linux, macOS and Windows build jobs are included.
+- Android: native Kotlin/Jetpack Compose Material 3 Expressive controls around the shared document renderer in the Android system WebView. Not a Tauri Android shell. Android 8+; current release targets ARM64.
+- PDF: an embedded Rust Typst + MiTeX engine shared by desktop and Android. No browser print layout, external executable, network connection or Python service is required for PDF typesetting.
+- Android Python: bundled Python 3.13, NumPy and Matplotlib in a separate app-owned worker process. Desktop Python uses the interpreter or virtual environment you choose.
 
-## Development
+## Study and authoring
 
-Requirements: Node 20+, Rust stable, Pandoc 3+, and Typst. Linux builds additionally require WebKitGTK 4.1 and GTK 3 development packages. Python and Matplotlib are optional.
+Recoverable tabs, arbitrary-folder browsing, hideable desktop sidebar, Live / Source / Read modes, and Split mode on desktops and Android windows at least 720 dp wide and 600 dp tall. Phones retain three single-pane modes in landscape too. Desktop provides independent document windows and drag-and-drop opening. Android persists drafts across process recreation and uses the system document picker for saving and folder permissions.
 
-```bash
-npm install
+KaTeX equations, GFM tables/tasks, highlighted code, Mermaid, relative images, callouts, SVG charts with sliders, and explicitly executed Matplotlib cells share one document renderer. Python is **never** automatically executed when opening a note or exporting. Only run code you trust; a worker process is not a security sandbox. Android executions time out after 115 seconds.
+
+System dynamic colors, light/dark/pure-black themes, separate fullscreen appearance, reading fonts and sizes, independent normal/fullscreen content zoom, and an animation switch are available. Android uses dynamic color on Android 12+ and a monochrome adaptive launcher icon on supporting launchers. Phone reading surfaces respect cutouts while their background extends edge-to-edge. Wider Android windows offer split view and separating vertical hinge spacing.
+
+PDF settings include A4/A5/Letter/Legal, margins, font, type size, line spacing, and page numbers on/off. Fonts are bundled so Android does not silently depend on desktop fonts. Tables wrap and paginate with repeated headers; wide equations fit their available width. GUI export includes Mermaid SVGs, the current chart slider values, and figures from cells you've run. PDFs contain static graph snapshots, not interactive sliders.
+
+Relative Android images require access to the containing folder through **Open any folder**. Android cannot derive arbitrary sibling-file permission from a single-file picker grant. Remote images require consent for viewing; for offline PDF export save them beside your note. Unsupported LaTeX constructs produce a visible export error rather than a silently incomplete PDF. KaTeX and MiTeX are not a full TeX distribution.
+
+## Development and tests
+
+Node 20+, Rust stable, and desktop system dependencies are required. Linux needs GTK 3 and WebKitGTK 4.1 development packages. No Pandoc/Typst installation is needed.
+
+```sh
+npm ci
 npm run desktop
-```
-
-Build the frontend and test the Rust core:
-
-```bash
 npm run build
-cd src-tauri && cargo test
-```
-
-Create native packages for the current OS:
-
-```bash
+npm test
+npm run test:pdf
+npx playwright install chromium
+npm run test:browser
 npm run package
 ```
 
-Pull requests and `main` pushes run frontend and Rust tests on Linux, macOS, and Windows. Release tags create draft GitHub releases with AppImage/Debian/RPM, macOS DMGs for Apple Silicon and Intel, and Windows NSIS installers. macOS builds are ad-hoc signed, not notarized; Windows builds are not code-signed. The AppImage job runs on Ubuntu: Arch's `linuxdeploy` GTK plugin assumes Debian-style `/usr/lib/gdk-pixbuf-2.0` and cannot package an AppImage locally without a compatible build container.
+For Android install JDK 17, SDK platform 37, build tools 36, NDK 27.1.12297006, a host Python 3.13, and `rustup target add aarch64-linux-android`. The project script locks concurrent builds, allows the available CPU cores, limits concurrent Cargo jobs to four and Gradle workers to two, and caps the Gradle heap at 1536 MB. Set `SUPERMD_BUILD_CPUS` to restrict CPU affinity when desired.
 
-## Android preview
-
-The Android build uses the same lightweight Tauri/Rust core with the system WebView. It has single-pane Live, Source, and Read modes at every window width. The toolbar and reading surface reflow as a tablet or foldable changes size, with safe-area and keyboard-resize handling. Pinching over the document changes document zoom, not toolbar size. CI produces an ARM64 debug APK artifact for each push and pull request.
-
-To build locally, install the Android SDK, NDK 27.1.12297006, JDK 17, and the Rust `aarch64-linux-android` target. Check that no old Gradle or Kotlin build is running before starting a new one. The checked-in Gradle configuration limits the heap to 1.5 GiB, two workers, and in-process Kotlin compilation:
-
-```bash
-NDK_HOME="$ANDROID_HOME/ndk/27.1.12297006" CARGO_BUILD_JOBS=2 npm run tauri -- android build --debug --apk --target aarch64 --ci
+```sh
+export ANDROID_HOME=/path/to/android-sdk
+export SUPERMD_BUILD_PYTHON=/path/to/python3.13
+# Optional distribution signing: SUPERMD_KEYSTORE, SUPERMD_STORE_PASSWORD,
+# SUPERMD_KEY_ALIAS and SUPERMD_KEY_PASSWORD. Never commit a keystore.
+npm run android:release
 ```
 
-This is a preview, not feature parity with desktop: desktop Pandoc/Typst PDF export and local Python/Matplotlib execution are unavailable on Android. File picking and saving use Android's document picker and still need device validation; local relative images from picker-backed documents also need further work. The APK is debug-signed and is not a Play Store release.
+Output: `android/app/build/outputs/apk/release/`. Without signing variables the release artifact is unsigned. Local upgrade builds can use the existing installation's certificate; that is not a production signing policy. CI never publishes a debug APK. CI release artifacts require your distribution signing secrets for installability. macOS desktop packages are ad-hoc signed, not notarized; Windows packages are not code-signed.
 
 ## CLI
 
-The packaged `super-md` binary doubles as the CLI:
-
-```bash
+```sh
 super-md notes.smd
-super-md export notes.smd -o notes.pdf --page-size A4 --margin 18 --font "New Computer Modern"
+super-md export notes.smd -o notes.pdf --page-size A4 --margin 18 \
+  --font 'Libertinus Serif' --font-size 10.5 --line-height 1.35 --no-page-numbers
 super-md doctor
 ```
 
-PDF export requires `pandoc` and `typst` on `PATH`. Additional PDF font choices use fonts installed on the host operating system; the default is New Computer Modern. PDFs are compiled by a real document toolchain rather than screenshots or browser print CSS.
+CLI export supports Markdown, math, tables, callouts, local images and static `smd-chart` snapshots using their declared default values. Use GUI export for Mermaid and already-executed Python results; CLI never runs code implicitly. Invalid chart/math/image input fails explicitly instead of producing an apparently successful incomplete PDF.
 
-## Shortcuts
+## Desktop shortcuts
 
 | Shortcut | Action |
 |---|---|
-| `Ctrl+S` | Save |
-| `Ctrl+N` | New tab |
-| `Ctrl+W` | Close tab (recoverable) |
-| `Ctrl+Shift+T` | Reopen closed tab |
-| `Ctrl+Tab` | Next tab |
-| `Ctrl+Shift+S` | Save as |
-| `Ctrl+O` | Open |
-| `Ctrl+F` | Search/replace panel |
-| `Ctrl/⌘++`, `Ctrl/⌘+-`, `Ctrl/⌘+0` | Zoom workspace in/out/reset |
-| `Ctrl/⌘+Shift+N` | New document window |
-| `F11` | Pure fullscreen |
-| `Alt+click` | Add cursor |
-| `Ctrl+Alt+↑/↓` | Add cursor above/below |
+| Ctrl/⌘+N | New tab |
+| Ctrl/⌘+W | Close tab, recoverable |
+| Ctrl/⌘+Shift+T | Reopen closed tab |
+| Ctrl/⌘+Tab | Next tab |
+| Ctrl/⌘+O / S / Shift+S | Open / Save / Save as |
+| Ctrl/⌘+Shift+O | Open folder |
+| Ctrl/⌘+B | Toggle folder sidebar |
+| Ctrl/⌘+F | Search and replace |
+| Ctrl/⌘++ / − / 0 | Content zoom / reset |
+| Ctrl/⌘+Shift+N | New window |
+| Ctrl/⌘+Shift+W | Close window, preserving drafts |
+| F11 | Fullscreen study |
+| Alt+click / Ctrl+Alt+↑ or ↓ | Additional cursors |
 
-See [FORMAT.md](FORMAT.md) for the `.smd` extensions.
+See [FORMAT.md](FORMAT.md) for examples and [docs/INSIGHTS-REVIEW.md](docs/INSIGHTS-REVIEW.md) for the reviewed Jules solutions.
 
-## Design references
+## Attribution
 
-The product direction borrows proven ideas—not code—from MarkText’s distraction-free authoring, Zettlr’s publication workflow, Quarto’s executable technical documents, and MetroList’s restrained spring-driven Material Expressive motion. Super MD’s differentiators are a vault-free file model, a lightweight native shell, Caelestia palette integration, and a non-DOM Typst PDF pipeline.
+MetroList's Kotlin/Compose approach inspired the native interaction direction; no GPL code was copied. The taste guide informed restrained color, consistent typography and purposeful motion, not replacing a dense editor with a website layout. MiTeX's MIT-licensed Typst compatibility definitions are vendored under `smd-core/src/mitex` at commit `985d8e725922ceb70ae5459c50c4cb3d733a0ed1`. Noto Sans is bundled under its SIL Open Font License. Other fonts and library licenses remain with their packages.
 
-## License
-
-MIT
+MIT.

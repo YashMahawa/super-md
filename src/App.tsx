@@ -5,12 +5,14 @@ import { readTextFile, writeTextFile } from "@tauri-apps/plugin-fs";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 import { WebviewWindow } from "@tauri-apps/api/webviewWindow";
 import { AnimatePresence, motion, MotionConfig, useReducedMotion } from "motion/react";
-import { ArrowsOut, BookOpen, Browsers, ChartLine, Code, Columns, Crosshair, FilePdf, FloppyDisk, FolderOpen, Function as FunctionIcon, GearSix, MagnifyingGlass, Minus, Note, PencilSimple, Plus, Sparkle, TextB, TextHTwo, TextItalic, X } from "@phosphor-icons/react";
+import { ArrowsOut, BookOpen, Browsers, ChartLine, Code, Columns, Crosshair, FilePdf, FloppyDisk, FolderOpen, Function as FunctionIcon, GearSix, MagnifyingGlass, Minus, Note, SidebarSimple, PencilSimple, Plus, Sparkle, TextB, TextHTwo, TextItalic, X } from "@phosphor-icons/react";
 import Editor from "./components/Editor";
 import BrandMark from "./components/BrandMark";
 import LiveEditor from "./components/LiveEditor";
 import MarkdownPreview from "./components/MarkdownPreview";
 import WelcomeSetup from "./components/WelcomeSetup";
+import FolderPanel from "./components/FolderPanel";
+import { preparePdf } from "./preparePdf";
 import { addTab, closeTab, editTab, initialWorkspace, isDirty, markTabSaved, openTab, readWorkspace, restoreClosedTab, tabTitle, type DocumentWorkspace } from "./documentTabs";
 import type { DocumentData, ExportOptions, ThemeMode, ViewMode } from "./types";
 import { clampPreviewZoom, previewLayoutWidth, zoomShortcut } from "./zoom";
@@ -32,7 +34,7 @@ $$
 
 | Feature | Super MD |
 |:--|:--|
-| PDF layout | Pandoc + Typst |
+| PDF layout | Embedded Typst typesetter |
 | Interactive plots | Native slider blocks |
 | Python | Your chosen venv |
 
@@ -67,13 +69,13 @@ plt.grid(alpha=.2)
 \`\`\`
 `;
 
-const defaultExport: ExportOptions = { pageSize: "a4", margin: 18, fontSize: 10.5, lineHeight: 1.35, fontFamily: "New Computer Modern" };
+const defaultExport: ExportOptions = { pageSize: "a4", margin: 18, fontSize: 10.5, lineHeight: 1.35, fontFamily: "Libertinus Serif", pageNumbers: true };
 const readerFonts = [
   { value: "sans", label: "Noto Sans · clean" },
   { value: "humanist", label: "Manrope · expressive" },
   { value: "serif", label: "System serif · book" },
 ];
-const pdfFonts = ["New Computer Modern", "Libertinus Serif", "Noto Sans", "DejaVu Serif", "Arial", "Georgia", "Times New Roman"];
+const pdfFonts = ["Libertinus Serif", "New Computer Modern", "Noto Sans", "DejaVu Sans Mono"];
 const spring = {
   selector: { type: "spring" as const, stiffness: 580, damping: 29, mass: 0.75 },
   sheet: { type: "spring" as const, stiffness: 340, damping: 28, mass: 0.9 },
@@ -81,7 +83,8 @@ const spring = {
 };
 
 function storedTheme(key: string, fallback: ThemeMode): ThemeMode {
-  return (localStorage.getItem(key) as ThemeMode) || fallback;
+  const value = localStorage.getItem(key);
+  return value === "caelestia" ? "system" : ["system", "light", "dark", "black"].includes(value || "") ? value as ThemeMode : fallback;
 }
 
 function storedNumber(key: string, fallback: number): number {
@@ -108,7 +111,7 @@ function firstRunSetup(): boolean {
 }
 
 const android = /Android/i.test(navigator.userAgent);
-const compactViewport = () => android || (typeof window.matchMedia === "function" && window.matchMedia("(max-width: 760px)").matches);
+const compactViewport = () => (typeof window.matchMedia === "function" && window.matchMedia("(max-width: 760px)").matches);
 const pickerCancelled = (error: unknown) => /cancelled|canceled/i.test(String(error));
 
 export default function App() {
@@ -126,13 +129,22 @@ export default function App() {
   const [view, setView] = useState<ViewMode>(() => compactViewport() ? "live" : "split");
   const [focusMode, setFocusMode] = useState(false);
   const [fullscreen, setFullscreen] = useState(false);
-  const [normalTheme, setNormalTheme] = useState<ThemeMode>(() => storedTheme("theme.normal", "caelestia"));
+  const [normalTheme, setNormalTheme] = useState<ThemeMode>(() => storedTheme("theme.normal", "system"));
   const [fullscreenTheme, setFullscreenTheme] = useState<ThemeMode>(() => storedTheme("theme.fullscreen", "black"));
   const [caelestia, setCaelestia] = useState<any>(null);
   const [python, setPython] = useState(() => localStorage.getItem("python") || "");
   const [showSettings, setShowSettings] = useState(false);
   const [showExport, setShowExport] = useState(false);
-  const [exportOptions, setExportOptions] = useState(defaultExport);
+  const [exportOptions, setExportOptions] = useState<ExportOptions>(() => { try { return { ...defaultExport, ...JSON.parse(localStorage.getItem("pdf.options") || "{}") }; } catch { return defaultExport; } });
+  const [exporting, setExporting] = useState(false);
+  const [exportError, setExportError] = useState("");
+  const [folderRoot, setFolderRoot] = useState<string | null>(() => localStorage.getItem("folder.root"));
+  const [folderVisible, setFolderVisible] = useState(() => localStorage.getItem("folder.visible") === "true");
+  const [folderWidth, setFolderWidth] = useState(() => Math.max(180, Math.min(420, storedNumber("folder.width", 248))));
+  const folderDrag = useRef(false);
+  const closing = useRef(false);
+  useEffect(() => { localStorage.setItem("pdf.options", JSON.stringify(exportOptions)); }, [exportOptions]);
+  useEffect(() => { localStorage.setItem("folder.visible", String(folderVisible)); localStorage.setItem("folder.width", String(folderWidth)); }, [folderVisible, folderWidth]);
   const [notice, setNotice] = useState("");
   const [editorSize, setEditorSize] = useState(() => storedNumber("editor.size", 14));
   const [editorLeading, setEditorLeading] = useState(() => storedNumber("editor.leading", 1.7));
@@ -164,7 +176,7 @@ export default function App() {
   const systemReduceMotion = useReducedMotion();
   const motionEnabled = !reduceMotion && !systemReduceMotion;
   const activeTheme = fullscreen ? fullscreenTheme : normalTheme;
-  const dark = activeTheme === "dark" || activeTheme === "black" || (activeTheme === "caelestia" && caelestia?.mode !== "light");
+  const dark = activeTheme === "dark" || activeTheme === "black" || (activeTheme === "system" && (caelestia?.mode ? caelestia.mode !== "light" : window.matchMedia?.("(prefers-color-scheme: dark)").matches ?? true));
   const workspaceZoom = fullscreen ? fullscreenZoom : normalZoom;
   zoomRef.current = workspaceZoom;
   const setZoom = useCallback((updater: number | ((current: number) => number)) => {
@@ -177,7 +189,7 @@ export default function App() {
   useEffect(() => {
     if (typeof window.matchMedia !== "function") return;
     const query = window.matchMedia("(max-width: 760px)");
-    const onChange = () => { setMobileUi(android || query.matches); if (android || query.matches) setView((current) => current === "split" ? "live" : current); };
+    const onChange = () => { setMobileUi(query.matches); if (query.matches) setView((current) => current === "split" ? "live" : current); };
     query.addEventListener("change", onChange);
     return () => query.removeEventListener("change", onChange);
   }, []);
@@ -276,6 +288,26 @@ export default function App() {
 
   const flash = (message: string) => { setNotice(message); window.setTimeout(() => setNotice(""), 2800); };
   const applyDocument = useCallback((doc: DocumentData) => setDocuments((current) => openTab(current, doc)), []);
+  const chooseFolder = useCallback(async () => {
+    try { const root = await invoke<string | null>("open_workspace_folder"); if (root) { setFolderRoot(root); setFolderVisible(true); localStorage.setItem("folder.root", root); } }
+    catch (error) { flash(`Could not open folder: ${error}`); }
+  }, []);
+  const openFolderFile = useCallback(async (path: string) => { try { applyDocument(await invoke<DocumentData>("read_document_at", { path })); } catch (error) { flash(String(error)); } }, [applyDocument]);
+  const closeWindow = useCallback(async () => {
+    if (closing.current || !("__TAURI_INTERNALS__" in window)) return;
+    closing.current = true;
+    try {
+      // Drafts are recovered next launch; no cancel/close loop or data discard.
+      localStorage.setItem(sessionKey, JSON.stringify(documentsRef.current));
+      await getCurrentWindow().destroy();
+    } catch (error) { closing.current = false; flash(`Window could not close: ${error}. Save your note first.`); }
+  }, [sessionKey]);
+  useEffect(() => {
+    if (!("__TAURI_INTERNALS__" in window)) return;
+    let disposed = false; let stop: (() => void) | undefined;
+    getCurrentWindow().onCloseRequested((event) => { event.preventDefault(); void closeWindow(); }).then((unlisten) => { if (disposed) unlisten(); else stop = unlisten; });
+    return () => { disposed = true; stop?.(); };
+  }, [closeWindow]);
   const newDocument = useCallback(() => setDocuments((current) => addTab(current)), []);
   const open = useCallback(async () => {
     if (openingRef.current) return;
@@ -319,7 +351,9 @@ export default function App() {
   }, []);
 
   useEffect(() => {
-    invoke<any>("load_caelestia_theme").then(setCaelestia).catch(() => undefined);
+    const syncTheme = () => invoke<any>("load_system_theme").then(setCaelestia).catch(() => undefined);
+    void syncTheme();
+    const themeTimer = window.setInterval(syncTheme, 30_000);
     const query = new URLSearchParams(window.location.search);
     const hadSession = localStorage.getItem(sessionKey) !== null;
     if (query.get("window") === "recover" || (!hadSession && query.get("window") !== "new")) {
@@ -339,6 +373,7 @@ export default function App() {
         return detected;
       });
     }).catch(() => undefined);
+    return () => window.clearInterval(themeTimer);
   }, [applyDocument, sessionKey]);
 
   useEffect(() => {
@@ -393,10 +428,11 @@ export default function App() {
     const handler = (event: KeyboardEvent) => {
       if (event.key === "F11") { event.preventDefault(); toggleFullscreen(); }
       if ((event.ctrlKey || event.metaKey) && event.key.toLowerCase() === "s") { event.preventDefault(); save(event.shiftKey); }
-      if ((event.ctrlKey || event.metaKey) && event.key.toLowerCase() === "o") { event.preventDefault(); open(); }
+      if ((event.ctrlKey || event.metaKey) && event.key.toLowerCase() === "o") { event.preventDefault(); event.shiftKey ? chooseFolder() : open(); }
+      if ((event.ctrlKey || event.metaKey) && event.key.toLowerCase() === "b") { event.preventDefault(); setFolderVisible((visible) => !visible); }
       if ((event.ctrlKey || event.metaKey) && event.shiftKey && event.key.toLowerCase() === "n") { event.preventDefault(); openNewWindow(); }
       else if ((event.ctrlKey || event.metaKey) && event.key.toLowerCase() === "n") { event.preventDefault(); newDocument(); }
-      if ((event.ctrlKey || event.metaKey) && event.key.toLowerCase() === "w") { event.preventDefault(); setDocuments((current) => closeTab(current, current.activeId)); }
+      if ((event.ctrlKey || event.metaKey) && event.key.toLowerCase() === "w") { event.preventDefault(); event.shiftKey ? closeWindow() : setDocuments((current) => closeTab(current, current.activeId)); }
       if ((event.ctrlKey || event.metaKey) && event.shiftKey && event.key.toLowerCase() === "t") { event.preventDefault(); setDocuments(restoreClosedTab); }
       if ((event.ctrlKey || event.metaKey) && event.key === "Tab") {
         event.preventDefault();
@@ -411,7 +447,7 @@ export default function App() {
     };
     window.addEventListener("keydown", handler);
     return () => window.removeEventListener("keydown", handler);
-  }, [newDocument, open, openNewWindow, save, setZoom, toggleFullscreen, zoomBy]);
+  }, [newDocument, open, openNewWindow, save, setZoom, toggleFullscreen, zoomBy, chooseFolder, closeWindow]);
 
   useEffect(() => {
     localStorage.setItem("theme.normal", normalTheme);
@@ -443,9 +479,9 @@ export default function App() {
 
   useEffect(() => {
     const root = document.documentElement;
-    root.dataset.theme = activeTheme;
+    root.dataset.theme = activeTheme === "system" ? (caelestia?.mode ?? (typeof matchMedia === "function" && matchMedia("(prefers-color-scheme: dark)").matches ? "dark" : "light")) : activeTheme;
     root.dataset.fullscreen = String(fullscreen);
-    if (activeTheme === "caelestia" && caelestia?.colours) {
+    if (activeTheme === "system" && caelestia?.colours) {
       const color = (name: string, fallback: string) => `#${caelestia.colours[name] ?? fallback}`;
       root.style.setProperty("--primary", color("primary", "6750a4"));
       root.style.setProperty("--on-primary", color("onPrimary", "ffffff"));
@@ -467,10 +503,14 @@ export default function App() {
     if (selected) { setPython(selected); localStorage.setItem("python", selected); }
   };
   const exportPdf = async () => {
+    if (exporting) return;
+    setExporting(true); setExportError("");
     try {
-      const output = await invoke<string | null>("export_pdf", { path, content, options: exportOptions });
+      const prepared = await preparePdf(content, path);
+      const output = await invoke<string | null>("export_portable_pdf", { path, ...prepared, options: exportOptions });
       if (output) { flash(`Exported ${output}`); setShowExport(false); }
-    } catch (error) { flash(`Export failed: ${error}`); }
+    } catch (error) { setExportError(String(error)); }
+    finally { setExporting(false); }
   };
   const format = (prefix: string, suffix?: string, block = false) =>
     window.dispatchEvent(new CustomEvent("supermd-format", { detail: { prefix, suffix, block } }));
@@ -481,9 +521,11 @@ export default function App() {
       {!fullscreen && <header className="topbar">
         <div className="brand"><span className="brand-mark"><BrandMark /></span><span className="document-identity"><strong title={title}>{title}</strong><small title={location}>{location}</small></span><span className={`save-state ${dirty ? "is-dirty" : ""}`}>{dirty ? "Recoverable edit" : path ? "Saved" : "Draft"}</span></div>
         <nav className="file-actions" aria-label="File actions">
+          <button className={`toolbar-button icon-only ${folderVisible ? "active" : ""}`} onClick={() => setFolderVisible((value) => !value)} title="Files · Ctrl+B" aria-label="Toggle folder sidebar"><SidebarSimple size={19} /></button>
           <button className="toolbar-button icon-only" onClick={newDocument} title="New · Ctrl+N" aria-label="New document"><Plus size={19} /></button>
           <button className="toolbar-button icon-only" onClick={() => openNewWindow()} title="New window · Ctrl+Shift+N" aria-label="New window"><Browsers size={19} /></button>
           <button className="toolbar-button" onClick={open} title="Open · Ctrl+O"><FolderOpen size={19} /><span>Open</span></button>
+          <button className="toolbar-button icon-only" onClick={chooseFolder} title="Open folder · Ctrl+Shift+O" aria-label="Open folder"><FolderOpen size={19} weight="fill" /></button>
           <button className="toolbar-button" onClick={() => save(false)} title="Save · Ctrl+S"><FloppyDisk size={19} /><span>Save</span></button>
           <button className="toolbar-button icon-only" onClick={() => window.dispatchEvent(new Event("supermd-find"))} title="Find and replace · Ctrl+F" aria-label="Find and replace"><MagnifyingGlass size={19} /></button>
         </nav>
@@ -518,18 +560,20 @@ export default function App() {
         <button className="format-text-button" onClick={() => format("\n```smd-chart\n{\n  \"title\": \"Interactive graph\",\n  \"x\": { \"min\": -6.28, \"max\": 6.28 },\n  \"series\": [{ \"expression\": \"a * Math.sin(x)\" }],\n  \"sliders\": [{ \"name\": \"a\", \"min\": 0, \"max\": 3, \"step\": 0.1, \"value\": 1 }]\n}\n```\n", "", true)} title="Insert interactive graph"><ChartLine size={18} /><span>Graph</span></button>
         <span className="format-hint">Alt+click adds a cursor</span>
       </div>}
-      {fullscreen && <div className="fullscreen-controls" aria-label="Fullscreen controls"><button onClick={() => zoomBy(-10)} title="Zoom out"><Minus size={16} /></button><button onClick={() => setZoom(100)} title="Reset workspace zoom">{workspaceZoom}%</button><button onClick={() => zoomBy(10)} title="Zoom in"><Plus size={16} /></button><span /><button onClick={toggleFullscreen} title="Leave fullscreen · F11"><ArrowsOut size={17} /></button></div>}
+      {fullscreen && <div className="fullscreen-controls" aria-label="Fullscreen controls"><button onClick={() => zoomBy(-10)} title="Zoom out"><Minus size={16} /></button><button onClick={() => setZoom(100)} title="Reset workspace zoom">{Math.round(workspaceZoom)}%</button><button onClick={() => zoomBy(10)} title="Zoom in"><Plus size={16} /></button><span /><button onClick={toggleFullscreen} title="Leave fullscreen · F11"><ArrowsOut size={17} /></button></div>}
+      <div className="work-area" style={{ "--folder-width": `${folderWidth}px` } as React.CSSProperties}>
+      {folderVisible && !fullscreen && <><FolderPanel root={folderRoot} activePath={path} onChoose={chooseFolder} onHide={() => setFolderVisible(false)} onOpen={openFolderFile} /><div className="folder-resizer" role="separator" aria-label="Resize folder sidebar" aria-orientation="vertical" tabIndex={0} onPointerDown={(e) => { folderDrag.current = true; e.currentTarget.setPointerCapture(e.pointerId); }} onPointerMove={(e) => { if (folderDrag.current) setFolderWidth(Math.max(180, Math.min(420, e.clientX))); }} onPointerUp={() => { folderDrag.current = false; }} onLostPointerCapture={() => { folderDrag.current = false; }} onKeyDown={(e) => { if (e.key === "ArrowLeft" || e.key === "ArrowRight") { e.preventDefault(); setFolderWidth((w) => Math.max(180, Math.min(420, w + (e.key === "ArrowRight" ? 10 : -10)))); } }} /></>}
       <main className="workspace" ref={workspaceRef} data-resizing={resizing || windowResizing} data-dragging-file={draggingFile} style={{ "--split-left": `${splitPercent}fr`, "--split-right": `${100 - splitPercent}fr`, "--workspace-scale": workspaceZoom / 100 } as React.CSSProperties}>
-        {(view === "editor" || view === "split") && <motion.section layout="position" initial={false} transition={motionEnabled && !resizing && !windowResizing ? spring.surface : { duration: 0 }} className="editor-pane" aria-label="Markdown source"><div className="pane-head"><span><PencilSimple size={15} /> Markdown</span>{view === "editor" ? <span className="zoom-controls" aria-label="Workspace zoom"><button onClick={() => zoomBy(-10)} aria-label="Zoom out"><Minus size={14} /></button><button className="zoom-value" onClick={() => setZoom(100)} aria-label={`Reset zoom, currently ${workspaceZoom}%`}>{workspaceZoom}%</button><button onClick={() => zoomBy(10)} aria-label="Zoom in"><Plus size={14} /></button></span> : <small>{lineCount} lines</small>}</div><Editor key={activeTab.id} value={content} onChange={(value) => setDocuments((current) => editTab(current, activeTab.id, value))} dark={dark} focusMode={focusMode} /></motion.section>}
+        {(view === "editor" || view === "split") && <motion.section layout={false} initial={false} transition={motionEnabled && !resizing && !windowResizing ? spring.surface : { duration: 0 }} className="editor-pane" aria-label="Markdown source"><div className="pane-head"><span><PencilSimple size={15} /> Markdown</span>{view === "editor" ? <span className="zoom-controls" aria-label="Workspace zoom"><button onClick={() => zoomBy(-10)} aria-label="Zoom out"><Minus size={14} /></button><button className="zoom-value" onClick={() => setZoom(100)} aria-label={`Reset zoom, currently ${Math.round(workspaceZoom)}%`}>{Math.round(workspaceZoom)}%</button><button onClick={() => zoomBy(10)} aria-label="Zoom in"><Plus size={14} /></button></span> : <small>{lineCount} lines</small>}</div><Editor key={activeTab.id} sessionId={activeTab.id} value={content} onChange={(value) => setDocuments((current) => editTab(current, activeTab.id, value))} dark={dark} focusMode={focusMode} /></motion.section>}
         {view === "split" && <div className="pane-resizer" role="separator" aria-label="Resize editor and preview" aria-orientation="vertical" aria-valuemin={25} aria-valuemax={75} aria-valuenow={splitPercent} tabIndex={0} onPointerDown={onResizePointerDown} onPointerMove={onResizePointerMove} onPointerUp={onResizePointerUp} onLostPointerCapture={() => setResizing(false)} onDoubleClick={() => setSplitPercent(50)} onKeyDown={(event) => { if (event.key === "ArrowLeft" || event.key === "ArrowRight") { event.preventDefault(); setSplitPercent((current) => Math.max(25, Math.min(75, current + (event.key === "ArrowRight" ? 5 : -5)))); } }}><span /></div>}
-        {(view === "reader" || view === "split") && <motion.section layout="position" initial={false} transition={motionEnabled && !resizing && !windowResizing ? spring.surface : { duration: 0 }} className="preview-pane" aria-label="Reading preview"><div className="pane-head"><span><BookOpen size={15} /> Preview</span><div className="preview-tools"><small>{wordCount} words</small><span className="zoom-controls" aria-label="Workspace zoom"><button onClick={() => zoomBy(-10)} title="Zoom out · Ctrl+-" aria-label="Zoom out"><Minus size={14} /></button><button className="zoom-value" onClick={() => setZoom(100)} title="Reset zoom · Ctrl+0" aria-label={`Reset zoom, currently ${workspaceZoom}%`}>{workspaceZoom}%</button><button onClick={() => zoomBy(10)} title="Zoom in · Ctrl++" aria-label="Zoom in"><Plus size={14} /></button></span></div></div><div className="reading-scroll" ref={readingScrollRef}><div className="preview-page" style={{ width: previewLayoutWidth(previewViewportWidth, readerWidth, workspaceZoom), zoom: workspaceZoom / 100 }}><MarkdownPreview markdown={content} documentPath={path} python={python} dark={dark} trustedImageHosts={trustedImageHosts} onTrustImageHost={trustImageHost} /></div></div></motion.section>}
-        {view === "live" && <motion.section layout="position" initial={false} transition={motionEnabled && !windowResizing ? spring.surface : { duration: 0 }} className="live-pane" aria-label="Live Markdown"><div className="pane-head"><span><Sparkle size={15} /> Live preview</span><small>Tap a pencil to edit a block</small></div><div className="reading-scroll"><LiveEditor key={activeTab.id} markdown={content} onChange={(value) => setDocuments((current) => editTab(current, activeTab.id, value))} documentPath={path} python={python} dark={dark} trustedImageHosts={trustedImageHosts} onTrustImageHost={trustImageHost} /></div></motion.section>}
-      </main>
+        {(view === "reader" || view === "split") && <motion.section layout={false} initial={false} transition={motionEnabled && !resizing && !windowResizing ? spring.surface : { duration: 0 }} className="preview-pane" aria-label="Reading preview"><div className="pane-head"><span><BookOpen size={15} /> Preview</span><div className="preview-tools"><small>{wordCount} words</small><span className="zoom-controls" aria-label="Workspace zoom"><button onClick={() => zoomBy(-10)} title="Zoom out · Ctrl+-" aria-label="Zoom out"><Minus size={14} /></button><button className="zoom-value" onClick={() => setZoom(100)} title="Reset zoom · Ctrl+0" aria-label={`Reset zoom, currently ${Math.round(workspaceZoom)}%`}>{Math.round(workspaceZoom)}%</button><button onClick={() => zoomBy(10)} title="Zoom in · Ctrl++" aria-label="Zoom in"><Plus size={14} /></button></span></div></div><div className="reading-scroll" ref={readingScrollRef}><div className="preview-page" style={{ width: previewLayoutWidth(previewViewportWidth, readerWidth, workspaceZoom), zoom: workspaceZoom / 100 }}><MarkdownPreview markdown={content} documentPath={path} python={python} dark={dark} trustedImageHosts={trustedImageHosts} onTrustImageHost={trustImageHost} /></div></div></motion.section>}
+        {view === "live" && <motion.section layout={false} initial={false} transition={motionEnabled && !windowResizing ? spring.surface : { duration: 0 }} className="live-pane" aria-label="Live Markdown"><div className="pane-head"><span><Sparkle size={15} /> Live preview</span><small>Tap a pencil to edit a block</small></div><div className="reading-scroll"><LiveEditor key={activeTab.id} markdown={content} onChange={(value) => setDocuments((current) => editTab(current, activeTab.id, value))} documentPath={path} python={python} dark={dark} trustedImageHosts={trustedImageHosts} onTrustImageHost={trustImageHost} /></div></motion.section>}
+      </main></div>
       <AnimatePresence>{notice && <motion.div key="notice" className="snackbar" initial={motionEnabled ? { opacity: 0, y: 18, x: "-50%", scale: .94 } : false} animate={{ opacity: 1, y: 0, x: "-50%", scale: 1 }} exit={motionEnabled ? { opacity: 0, y: 12, x: "-50%", scale: .96 } : { opacity: 0 }} transition={motionEnabled ? spring.surface : { duration: 0 }}>{notice}</motion.div>}</AnimatePresence>
       <AnimatePresence>{showSettings && <motion.div key="settings" className="scrim" initial={motionEnabled ? { opacity: 0 } : false} animate={{ opacity: 1 }} exit={{ opacity: 0 }} transition={{ duration: motionEnabled ? .24 : 0 }} onMouseDown={() => setShowSettings(false)}><motion.aside className="sheet" initial={motionEnabled ? { opacity: 0, y: 40, scale: .9, borderRadius: 44 } : false} animate={{ opacity: 1, y: 0, scale: 1, borderRadius: 28 }} exit={motionEnabled ? { opacity: 0, y: 18, scale: .96 } : { opacity: 0 }} transition={motionEnabled ? spring.sheet : { duration: 0 }} onMouseDown={(event) => event.stopPropagation()}>
         <div className="sheet-title"><h2>Appearance & runtime</h2><button onClick={() => setShowSettings(false)} aria-label="Close settings"><X size={20} /></button></div>
-        <label>Normal theme<select value={normalTheme} onChange={(event) => setNormalTheme(event.target.value as ThemeMode)}><option value="caelestia">Caelestia dynamic</option><option value="light">Material light</option><option value="dark">Material dark</option><option value="black">Pure black</option></select></label>
-        <label>Fullscreen theme<select value={fullscreenTheme} onChange={(event) => setFullscreenTheme(event.target.value as ThemeMode)}><option value="caelestia">Caelestia dynamic</option><option value="light">Material light</option><option value="dark">Material dark</option><option value="black">Pure black</option></select></label>
+        <label>Normal theme<select value={normalTheme} onChange={(event) => setNormalTheme(event.target.value as ThemeMode)}><option value="system">System dynamic</option><option value="light">Material light</option><option value="dark">Material dark</option><option value="black">Pure black</option></select></label>
+        <label>Fullscreen theme<select value={fullscreenTheme} onChange={(event) => setFullscreenTheme(event.target.value as ThemeMode)}><option value="system">System dynamic</option><option value="light">Material light</option><option value="dark">Material dark</option><option value="black">Pure black</option></select></label>
         {!android && <label>Python interpreter<div className="path-field"><input value={python} onChange={(event) => { setPython(event.target.value); localStorage.setItem("python", event.target.value); }} /><button onClick={choosePython}>Choose</button></div></label>}
         {android && <p className="help">Python execution and semantic PDF export require the desktop backend. Charts, math, callouts, and live reading work on this device.</p>}
         <h3>Typography</h3>
@@ -551,7 +595,7 @@ export default function App() {
       </motion.aside></motion.div>}</AnimatePresence>
       <AnimatePresence>{showExport && <motion.div key="export" className="scrim" initial={motionEnabled ? { opacity: 0 } : false} animate={{ opacity: 1 }} exit={{ opacity: 0 }} transition={{ duration: motionEnabled ? .24 : 0 }} onMouseDown={() => setShowExport(false)}><motion.aside className="sheet export-sheet" initial={motionEnabled ? { opacity: 0, y: 40, scale: .9, borderRadius: 44 } : false} animate={{ opacity: 1, y: 0, scale: 1, borderRadius: 28 }} exit={motionEnabled ? { opacity: 0, y: 18, scale: .96 } : { opacity: 0 }} transition={motionEnabled ? spring.sheet : { duration: 0 }} onMouseDown={(event) => event.stopPropagation()}>
         <div className="sheet-title"><h2>Semantic PDF export</h2><button onClick={() => setShowExport(false)} aria-label="Close export settings"><X size={20} /></button></div>
-        <p className="help">Pandoc parses the document; Typst performs real pagination and typesetting. The preview DOM is not printed.</p>
+        <p className="help">The embedded Typst engine paginates text, tables and vector equations. Charts use your current slider values. Run Python cells first to include their figures. The preview DOM is not printed.</p>
         <div className="form-grid">
           <label>Document font<select value={exportOptions.fontFamily} onChange={(event) => setExportOptions({ ...exportOptions, fontFamily: event.target.value })}>{pdfFonts.map((font) => <option key={font} value={font}>{font}</option>)}</select></label>
           <label>Page size<select value={exportOptions.pageSize} onChange={(event) => setExportOptions({ ...exportOptions, pageSize: event.target.value as ExportOptions["pageSize"] })}><option value="a4">A4</option><option value="a5">A5</option><option value="letter">US Letter</option><option value="legal">US Legal</option></select></label>
@@ -559,7 +603,9 @@ export default function App() {
           <label>Font size (pt)<input type="number" min="7" max="24" step="0.5" value={exportOptions.fontSize} onChange={(event) => setExportOptions({ ...exportOptions, fontSize: Number(event.target.value) })} /></label>
           <label>Line height<input type="number" min="0.9" max="2.2" step="0.05" value={exportOptions.lineHeight} onChange={(event) => setExportOptions({ ...exportOptions, lineHeight: Number(event.target.value) })} /></label>
         </div>
-        <button className="primary-action" onClick={exportPdf}>Choose destination & export</button>
+        <label className="switch-row"><span><strong>Page numbers</strong><small>Include page numbers in the PDF footer</small></span><input type="checkbox" checked={exportOptions.pageNumbers} onChange={(e) => setExportOptions({ ...exportOptions, pageNumbers: e.target.checked })} /></label>
+        {exportError && <pre className="export-error" role="alert">{exportError}</pre>}
+        <button className="primary-action" onClick={exportPdf} disabled={exporting}>{exporting ? "Typesetting…" : "Choose destination & export"}</button>
       </motion.aside></motion.div>}</AnimatePresence>
       {showWelcome && <WelcomeSetup theme={normalTheme} onTheme={setNormalTheme} readerFont={readerFont} onReaderFont={setReaderFont} motionEnabled={motionEnabled} onMotion={(enabled) => setReduceMotion(!enabled)} onFinish={(openFile) => { localStorage.setItem("setup.complete", "true"); localStorage.removeItem("setup.started"); setShowWelcome(false); if (openFile) window.setTimeout(() => open(), 100); }} />}
     </div>

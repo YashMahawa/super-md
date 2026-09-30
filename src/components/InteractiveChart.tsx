@@ -1,6 +1,7 @@
 import { useEffect, useMemo, useState } from "react";
 import type { ChartSpec } from "../types";
 import { compileMathExpression } from "../mathExpression";
+import { chartValues, remember } from "../renderedOutputs";
 
 const palette = ["#6750a4", "#006a6a", "#b3261e", "#7d5700", "#3f6374"];
 
@@ -10,7 +11,7 @@ export default function InteractiveChart({ source }: { source: string }) {
     catch (error) { return { spec: null, error: String(error) }; }
   }, [source]);
   const [values, setValues] = useState<Record<string, number>>(() =>
-    Object.fromEntries((parsed.spec?.sliders ?? []).map((slider) => [slider.name, slider.value]))
+    chartValues.get(source) ?? Object.fromEntries((parsed.spec?.sliders ?? []).map((slider) => [slider.name, slider.value]))
   );
   const sliderSchema = JSON.stringify((parsed.spec?.sliders ?? []).map((slider) => [slider.name, slider.value]));
   useEffect(() => {
@@ -63,8 +64,8 @@ export default function InteractiveChart({ source }: { source: string }) {
         {(spec.sliders ?? []).map((slider) => (
           <label key={slider.name}>
             <span>{slider.label ?? slider.name}: <strong>{effectiveValues[slider.name]}</strong></span>
-            <input type="range" min={slider.min} max={slider.max} step={slider.step} value={effectiveValues[slider.name]}
-              onChange={(event) => setValues((current) => ({ ...current, [slider.name]: Number(event.target.value) }))} />
+            <input type="range" min={slider.min} max={slider.max} step={slider.step && slider.step > 0 ? slider.step : (slider.max - slider.min) / 100 || .01} value={effectiveValues[slider.name]}
+              onChange={(event) => setValues((current) => { const next = { ...current, [slider.name]: Number(event.target.value) }; remember(chartValues, source, next); return next; })} />
           </label>
         ))}
       </div>

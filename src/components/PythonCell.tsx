@@ -1,11 +1,12 @@
 import { useRef, useState } from "react";
-import { invoke } from "@tauri-apps/api/core";
+import { invoke } from "../nativeBridge";
+import { pythonResults, remember } from "../renderedOutputs";
 import type { PythonResult } from "../types";
 
 export default function PythonCell({ source, python }: { source: string; python: string }) {
-  const [result, setResult] = useState<PythonResult | null>(null);
+  const [result, setResult] = useState<PythonResult | null>(() => pythonResults.get(source) || null);
   const [running, setRunning] = useState(false);
-  const executedSource = useRef("");
+  const executedSource = useRef(pythonResults.has(source) ? source : "");
   const runId = useRef(0);
   const run = async () => {
     const currentRun = ++runId.current;
@@ -13,9 +14,12 @@ export default function PythonCell({ source, python }: { source: string; python:
     setRunning(true);
     try {
       const output = await invoke<PythonResult>("run_python", { python, code: currentSource });
+      remember(pythonResults, currentSource, output);
       if (currentRun === runId.current) { executedSource.current = currentSource; setResult(output); }
     } catch (error) {
-      if (currentRun === runId.current) { executedSource.current = currentSource; setResult({ stdout: "", stderr: String(error), images: [], ok: false }); }
+      const failure = { stdout: "", stderr: String(error), images: [], ok: false };
+      remember(pythonResults, currentSource, failure);
+      if (currentRun === runId.current) { executedSource.current = currentSource; setResult(failure); }
     } finally { if (currentRun === runId.current) setRunning(false); }
   };
   const stale = Boolean(result && executedSource.current !== source);

@@ -1,0 +1,35 @@
+# A clear place to think
+
+> [!TIP] Work through the idea
+> First try it, then explain why it works. Equations and images should survive PDF export.
+
+Inline $e^{i\pi}+1=0$ and a display equation:
+
+$$
+\begin{pmatrix}1&2\\3&4\end{pmatrix}\qquad\int_0^1 x^2\,dx=\frac13
+$$
+
+![Super MD](brand-mark-fixed.svg)
+
+| Topic | Formula | Meaning |
+|---|---|---|
+| Gaussian | $e^{-x^2}$ | A smooth bell-shaped curve. |
+| Circle | $\pi r^2$ | Area enclosed by a circle. |
+
+```smd-chart
+{"title":"Explore a sine wave","x":{"min":-6.28,"max":6.28},"series":[{"expression":"a * sin(x)"}],"sliders":[{"name":"a","label":"Amplitude","min":0.1,"max":3,"step":0.05,"value":1}]}
+```
+
+```mermaid
+flowchart LR
+  Read --> Explore --> Understand
+```
+
+```python
+import numpy as np
+import matplotlib.pyplot as plt
+x = np.linspace(-4, 4, 200)
+plt.plot(x, np.exp(-x*x), color="#42669e")
+plt.title("Gaussian")
+plt.grid(alpha=.2)
+```

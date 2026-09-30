@@ -14,6 +14,13 @@ let root: Root | null = null;
 afterEach(() => { if (root) { act(() => root?.unmount()); root = null; } document.body.innerHTML = ""; loadAsset.mockClear(); });
 
 describe("local image preview", () => {
+  it("keeps embedded image data without permitting active links", async () => {
+    const host = document.createElement("div"); document.body.append(host); root = createRoot(host);
+    await act(async () => { root?.render(<MarkdownPreview markdown="![Embedded](data:image/png;base64,iVBORw0KGgo=)\n\n[unsafe](javascript:alert%281%29)" documentPath={null} python="" dark />); });
+    expect(host.querySelector("img")?.getAttribute("src")).toBe("data:image/png;base64,iVBORw0KGgo=");
+    expect(host.querySelector("a")?.getAttribute("href")).not.toContain("javascript:");
+    expect(loadAsset).not.toHaveBeenCalled();
+  });
   it("loads encoded-space paths through the native command and paints the image", async () => {
     const host = document.createElement("div");
     document.body.append(host);

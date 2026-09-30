@@ -51,7 +51,7 @@ jobs:
         with:
           tagName: v__VERSION__
           releaseName: Super MD v__VERSION__
-          releaseBody: Desktop packages for Linux, macOS, and Windows. PDF export requires Pandoc and Typst.
+          releaseBody: Desktop packages for Linux, macOS, and Windows. Offline PDF typesetting is embedded; no Pandoc or Typst installation is needed.
           releaseDraft: true
           prerelease: false
           args: ${{ matrix.args }}

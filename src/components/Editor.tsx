@@ -1,5 +1,5 @@
 import { useEffect, useRef } from "react";
-import { EditorState } from "@codemirror/state";
+import { Compartment, EditorSelection, EditorState } from "@codemirror/state";
 import { EditorView, keymap, lineNumbers, highlightActiveLine, drawSelection } from "@codemirror/view";
 import { defaultKeymap, history, historyKeymap, indentWithTab } from "@codemirror/commands";
 import { markdown, markdownLanguage } from "@codemirror/lang-markdown";
@@ -8,21 +8,36 @@ import { searchKeymap, highlightSelectionMatches, openSearchPanel } from "@codem
 import { oneDark } from "@codemirror/theme-one-dark";
 
 interface Props {
+  sessionId?: string;
   value: string;
   onChange: (value: string) => void;
   dark: boolean;
   focusMode: boolean;
 }
 
-export default function Editor({ value, onChange, dark, focusMode }: Props) {
+const sessions = new Map<string, { state: EditorState; top: number; appearance: Compartment }>();
+const callbacks = new Map<string, (value: string) => void>();
+export default function Editor({ sessionId = "default", value, onChange, dark, focusMode }: Props) {
   const host = useRef<HTMLDivElement>(null);
   const view = useRef<EditorView | null>(null);
   const changeHandler = useRef(onChange);
   changeHandler.current = onChange;
+  callbacks.set(sessionId, onChange);
+  const appearance = useRef(new Compartment());
+  const editorTheme = () => [ ...(dark ? [oneDark] : []), EditorView.theme({
+    "&": { height: "100%", background: "transparent" },
+    ".cm-scroller": { fontFamily: "var(--mono)", fontSize: "calc(var(--editor-size) * var(--workspace-scale, 1))", lineHeight: "var(--editor-leading)", padding: focusMode ? "12vh 0 38vh" : "20px 0 45vh" },
+    ".cm-content": { maxWidth: focusMode ? "820px" : "none", margin: focusMode ? "0 auto" : "0", padding: "0 28px" },
+    ".cm-gutters": { background: "transparent", border: "0", color: "var(--muted)" },
+    ".cm-activeLine, .cm-activeLineGutter": { background: "color-mix(in srgb, var(--primary) 8%, transparent)" },
+    ".cm-selectionBackground": { background: "color-mix(in srgb, var(--primary) 30%, transparent) !important" }
+  }) ];
 
   useEffect(() => {
     if (!host.current) return;
-    const state = EditorState.create({
+    const cached = sessions.get(sessionId);
+    if (cached) appearance.current = cached.appearance;
+    const state = cached?.state.doc.toString() === value ? cached.state : EditorState.create({
       doc: value,
       extensions: [
         lineNumbers(),
@@ -36,24 +51,20 @@ export default function Editor({ value, onChange, dark, focusMode }: Props) {
         EditorState.allowMultipleSelections.of(true),
         EditorView.lineWrapping,
         EditorView.updateListener.of((update) => {
-          if (update.docChanged) changeHandler.current(update.state.doc.toString());
+          if (update.docChanged) callbacks.get(sessionId)?.(update.state.doc.toString());
         }),
-        ...(dark ? [oneDark] : []),
-        EditorView.theme({
-          "&": { height: "100%", background: "transparent" },
-          ".cm-scroller": { fontFamily: "var(--mono)", fontSize: "calc(var(--editor-size) * var(--workspace-scale, 1))", lineHeight: "var(--editor-leading)", padding: focusMode ? "12vh 0 38vh" : "20px 0 45vh" },
-          ".cm-content": { maxWidth: focusMode ? "820px" : "none", margin: focusMode ? "0 auto" : "0", padding: "0 28px" },
-          ".cm-gutters": { background: "transparent", border: "0", color: "var(--muted)" },
-          ".cm-activeLine, .cm-activeLineGutter": { background: "color-mix(in srgb, var(--primary) 8%, transparent)" },
-          ".cm-selectionBackground": { background: "color-mix(in srgb, var(--primary) 30%, transparent) !important" }
-        })
+        appearance.current.of(editorTheme())
       ]
     });
     view.current = new EditorView({ state, parent: host.current });
-    return () => view.current?.destroy();
-    // Recreate only when presentation-affecting editor configuration changes.
+    if (cached) view.current.scrollDOM.scrollTop = cached.top;
+    return () => {
+      if (view.current) { sessions.set(sessionId, { state: view.current.state, top: view.current.scrollDOM.scrollTop, appearance: appearance.current }); if (sessions.size > 40) { const first = sessions.keys().next().value!; sessions.delete(first); callbacks.delete(first); } view.current.destroy(); }
+    };
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [dark, focusMode]);
+  }, [sessionId]);
+
+  useEffect(() => { view.current?.dispatch({ effects: appearance.current.reconfigure(editorTheme()) }); }, [dark, focusMode]);
 
   useEffect(() => {
     const instance = view.current;
@@ -89,7 +100,13 @@ export default function Editor({ value, onChange, dark, focusMode }: Props) {
         to: range.to,
         insert: `${detail.prefix}${instance.state.sliceDoc(range.from, range.to)}${suffix}`
       }));
-      instance.dispatch({ changes });
+      const mapped = instance.state.changes(changes);
+      const ranges = instance.state.selection.ranges.map((range) => {
+        const start = mapped.mapPos(range.from, -1) + detail.prefix.length;
+        const end = start + range.to - range.from;
+        return range.anchor > range.head ? EditorSelection.range(end, start) : EditorSelection.range(start, end);
+      });
+      instance.dispatch({ changes: mapped, selection: EditorSelection.create(ranges, instance.state.selection.mainIndex), userEvent: "input.format" });
       instance.focus();
     };
     window.addEventListener("supermd-format", format);

@@ -1,0 +1,9 @@
+.gradle/
+.kotlin/
+**/build/
+local.properties
+app/src/main/assets/web/
+app/src/main/jniLibs/
+*.jks
+*.keystore
+.build.lock

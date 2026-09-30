@@ -1,0 +1,98 @@
+package dev.supermd.studio
+
+import android.view.View
+import android.view.ViewGroup
+import android.webkit.WebView
+import androidx.compose.ui.test.*
+import androidx.compose.ui.test.junit4.createAndroidComposeRule
+import org.junit.Assert.*
+import org.junit.Rule
+import org.junit.Test
+import java.util.concurrent.atomic.AtomicReference
+
+class StudioUiTest {
+    @get:Rule val compose = createAndroidComposeRule<MainActivity>()
+    private fun web(view: View): WebView? = if (view is WebView) view else if (view is ViewGroup) (0 until view.childCount).firstNotNullOfOrNull { web(view.getChildAt(it)) } else null
+    private fun javascriptUntil(script: String, accepted: (String) -> Boolean): String {
+        val result = AtomicReference("")
+        compose.waitUntil(60_000) {
+            compose.activity.runOnUiThread { web(compose.activity.window.decorView)?.evaluateJavascript(script) { result.set(it) } }
+            accepted(result.get())
+        }
+        return result.get()
+    }
+    @Test fun realReaderAndNativeControlsAreConnected() {
+        repeat(2) { if (compose.onAllNodesWithText("Continue").fetchSemanticsNodes().isNotEmpty()) compose.onNodeWithText("Continue").performClick() }
+        compose.onAllNodesWithText("Explore the sample").fetchSemanticsNodes().firstOrNull()?.let { compose.onNodeWithText("Explore the sample").performClick() }
+        compose.onNodeWithText("Read", useUnmergedTree = true).performClick()
+        val result = javascriptUntil("({math:document.querySelectorAll('.katex').length,callouts:document.querySelectorAll('.callout-tip').length,graphs:document.querySelectorAll('.interactive-chart svg').length,errors:document.querySelectorAll('.katex-error').length})") { it.contains("\"callouts\":1") && it.contains("\"graphs\":1") }
+        javascriptUntil("document.querySelector('#root').getBoundingClientRect().height") { (it.toDoubleOrNull() ?: 0.0) > 100 }
+        assertTrue(result.contains("\"errors\":0"))
+        // Exercise the real JS bridge, Python worker, shared preparation and JNI
+        // typesetter together. Only the system destination picker is replaced
+        // with a private file URI; all document/export code remains production.
+        javascriptUntil("(() => { const b = document.querySelector('.python-cell button'); if (b && b.textContent.includes('Run')) b.click(); return !!document.querySelector('.cell-output img'); })()") { it == "true" }
+        val exported = java.io.File(compose.activity.cacheDir, "reader-export-test.pdf")
+        exported.delete()
+        val model = androidx.lifecycle.ViewModelProvider(compose.activity)[StudioViewModel::class.java]
+        compose.activity.runOnUiThread { model.zoom(100f) }
+        javascriptUntil("getComputedStyle(document.documentElement).getPropertyValue('--workspace-scale')") { it == "\"1\"" }
+        javascriptUntil("(() => { if (window.pinchTestDone) return true; if (window.pinchTestStarted) return false; window.pinchTestStarted=true; const target=document.querySelector('.android-reading'); const touches=(x) => [new Touch({identifier:1,target,clientX:60,clientY:140}),new Touch({identifier:2,target,clientX:x,clientY:140})]; target.dispatchEvent(new TouchEvent('touchstart',{bubbles:true,touches:touches(160)})); target.dispatchEvent(new TouchEvent('touchmove',{bubbles:true,cancelable:true,touches:touches(240)})); requestAnimationFrame(() => requestAnimationFrame(() => { target.dispatchEvent(new TouchEvent('touchend',{bubbles:true,touches:[]})); window.pinchTestDone=true; })); return false; })()") { it == "true" }
+        javascriptUntil("getComputedStyle(document.documentElement).getPropertyValue('--workspace-scale')") { (it.trim('"').toFloatOrNull() ?: 0f) > 1.1f }
+        javascriptUntil("(() => { const native = window.SuperMD; window.SuperMD = { post: (id, command, raw) => { if (command === 'export_pdf_native') window.capturedPdfMarkdown = JSON.parse(raw).content; native.post(id, command, raw); } }; return true; })()") { it == "true" }
+        compose.activity.runOnUiThread {
+            model.outputUri = android.net.Uri.fromFile(exported)
+            model.busy(true)
+            web(compose.activity.window.decorView)?.evaluateJavascript("window.supermdExport?.(${StudioState().pdf})", null)
+        }
+        compose.waitUntil(60_000) { exported.isFile && exported.length() > 1000 && !model.state.value.busy }
+        val captured = javascriptUntil("window.capturedPdfMarkdown") { it.startsWith("\"") }
+        val markdown = org.json.JSONArray("[$captured]").getString(0)
+        java.io.File(compose.activity.cacheDir, "reader-export-input.md").writeText(markdown)
+        assertTrue(markdown.contains("\n\n## Local Matplotlib\n"))
+        assertNull(model.state.value.error)
+        android.graphics.pdf.PdfRenderer(android.os.ParcelFileDescriptor.open(exported, android.os.ParcelFileDescriptor.MODE_READ_ONLY)).use { assertTrue(it.pageCount > 0) }
+        compose.runOnIdle { model.zoom(100f) }
+        javascriptUntil("getComputedStyle(document.documentElement).getPropertyValue('--workspace-scale')") { it == "\"1\"" }
+        val screenshot = androidx.test.platform.app.InstrumentationRegistry.getInstrumentation().uiAutomation.takeScreenshot()!!
+        java.io.File(compose.activity.cacheDir, "reader-ui-test.png").outputStream().use { screenshot.compress(android.graphics.Bitmap.CompressFormat.PNG, 100, it) }
+        val painted = mutableSetOf<Int>()
+        val readerTop = AtomicReference(0)
+        compose.runOnIdle { val view = web(compose.activity.window.decorView)!!; val xy = IntArray(2); view.getLocationOnScreen(xy); readerTop.set(xy[1]) }
+        for (y in readerTop.get() + 30 until screenshot.height - 100 step 12) for (x in 40 until screenshot.width - 40 step 8) painted.add(screenshot.getPixel(x, y))
+        assertTrue("Reader must actually paint, not just expose semantic nodes", painted.size > 40)
+        val more = compose.onNodeWithContentDescription("More actions").fetchSemanticsNode().boundsInRoot.center
+        val nativeIcon = screenshot.getPixel(more.x.toInt(), more.y.toInt())
+        val paletteIcon = android.graphics.Color.parseColor(org.json.JSONArray("[${javascriptUntil("getComputedStyle(document.documentElement).getPropertyValue('--muted')") { it.startsWith("\"#") }}]").getString(0))
+        assertTrue("Reader must not overpaint the native toolbar", kotlin.math.abs(android.graphics.Color.red(nativeIcon) - android.graphics.Color.red(paletteIcon)) < 15 && kotlin.math.abs(android.graphics.Color.green(nativeIcon) - android.graphics.Color.green(paletteIcon)) < 15 && kotlin.math.abs(android.graphics.Color.blue(nativeIcon) - android.graphics.Color.blue(paletteIcon)) < 15)
+        val normalScale = javascriptUntil("getComputedStyle(document.documentElement).getPropertyValue('--workspace-scale')") { it.isNotBlank() && it != "null" && it != "\"\"" }
+        compose.onNodeWithContentDescription("More actions").performClick()
+        compose.onNodeWithText("Fullscreen study").performClick()
+        compose.onNodeWithContentDescription("Zoom in").performClick()
+        javascriptUntil("getComputedStyle(document.documentElement).getPropertyValue('--workspace-scale')") { it != normalScale && it != "null" }
+        compose.onNodeWithContentDescription("Exit fullscreen").performClick()
+        javascriptUntil("getComputedStyle(document.documentElement).getPropertyValue('--workspace-scale')") { it == normalScale }
+        compose.onNodeWithContentDescription("New tab").performClick()
+        compose.onNodeWithContentDescription("Close Untitled.smd").performClick()
+        compose.onNodeWithContentDescription("More actions").performClick()
+        compose.onNodeWithText("Reopen closed tab").performClick()
+        compose.onNodeWithContentDescription("Close Untitled.smd").assertExists()
+        compose.onNodeWithContentDescription("Close Untitled.smd").performClick()
+        if (compose.activity.resources.configuration.smallestScreenWidthDp < 600) {
+            compose.runOnIdle { compose.activity.requestedOrientation = android.content.pm.ActivityInfo.SCREEN_ORIENTATION_LANDSCAPE }
+            compose.waitUntil(10_000) { compose.activity.resources.configuration.orientation == android.content.res.Configuration.ORIENTATION_LANDSCAPE }
+            compose.onNodeWithText("Split", useUnmergedTree = true).assertDoesNotExist()
+            compose.onNodeWithText("Source", useUnmergedTree = true).assertExists()
+            javascriptUntil("innerWidth > innerHeight && document.querySelector('#root').getBoundingClientRect().height > 50") { it == "true" }
+            compose.runOnIdle { compose.activity.requestedOrientation = android.content.pm.ActivityInfo.SCREEN_ORIENTATION_PORTRAIT }
+            compose.waitUntil(10_000) { compose.activity.resources.configuration.orientation == android.content.res.Configuration.ORIENTATION_PORTRAIT }
+        } else {
+            compose.onNodeWithText("Split", useUnmergedTree = true).performClick()
+            javascriptUntil("document.querySelectorAll('.mode-split > section').length") { it == "2" }
+            javascriptUntil("document.querySelector('.android-source').getBoundingClientRect().right <= document.querySelector('.android-reading').getBoundingClientRect().left") { it == "true" }
+            compose.onNodeWithText("Read", useUnmergedTree = true).performClick()
+        }
+        compose.onNodeWithContentDescription("Export PDF").performClick()
+        compose.onNodeWithText("Page numbers").assertExists()
+    }
+}

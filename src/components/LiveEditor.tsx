@@ -40,11 +40,11 @@ interface Props {
   documentPath: string | null;
   python: string;
   dark: boolean;
-  trustedImageHosts: string[];
-  onTrustImageHost: (host: string) => void;
+  trustedImageHosts?: string[];
+  onTrustImageHost?: (host: string) => void;
 }
 
-export default function LiveEditor({ markdown, onChange, documentPath, python, dark, trustedImageHosts, onTrustImageHost }: Props) {
+export default function LiveEditor({ markdown, onChange, documentPath, python, dark, trustedImageHosts = [], onTrustImageHost }: Props) {
   const [editing, setEditing] = useState<{ prefix: string; text: string; suffix: string } | null>(null);
   const renderBlock = (block: SourceBlock, index: number, base = 0) => <section className="live-block" key={`${base + block.start}-${index}`}>
     <button className="live-edit-button" title="Edit this block" aria-label={`Edit block ${index + 1}`} onClick={() => setEditing({ prefix: markdown.slice(0, base + block.start), text: block.text, suffix: markdown.slice(base + block.end) })}><PencilSimple size={15} /></button>

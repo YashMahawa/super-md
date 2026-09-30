@@ -18,7 +18,7 @@ jobs:
         if: matrix.platform == 'ubuntu-22.04'
         run: |
           sudo apt-get update
-          sudo apt-get install -y libwebkit2gtk-4.1-dev libappindicator3-dev librsvg2-dev patchelf xdg-utils
+          sudo apt-get install -y libwebkit2gtk-4.1-dev libappindicator3-dev librsvg2-dev patchelf xdg-utils poppler-utils
       - uses: actions/setup-node@v4
         with:
           node-version: 22
@@ -30,8 +30,32 @@ jobs:
       - run: npm ci
       - run: npm run build
       - run: npm test
+      - run: npm run test:pdf
 
-  android-preview:
+  browser:
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci
+      - run: npx playwright install --with-deps chromium
+      - run: npm run test:coverage
+      - run: npm run test:browser
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: frontend-coverage
+          path: coverage/
+      - uses: actions/upload-artifact@v4
+        if: failure()
+        with:
+          name: browser-test-report
+          path: playwright-report/
+
+  android-release:
     runs-on: ubuntu-22.04
     steps:
       - uses: actions/checkout@v4
@@ -43,30 +67,105 @@ jobs:
         with:
           distribution: temurin
           java-version: 17
-      - name: Install Android SDK and NDK
-        run: |
-          SDK_MANAGER="$(command -v sdkmanager || true)"
-          if [ -z "$SDK_MANAGER" ]; then
-            for candidate in "$ANDROID_HOME"/cmdline-tools/*/bin/sdkmanager; do
-              if [ -x "$candidate" ]; then SDK_MANAGER="$candidate"; break; fi
-            done
-          fi
-          if [ -z "$SDK_MANAGER" ]; then echo "Android SDK manager not found" >&2; exit 1; fi
-          "$SDK_MANAGER" --install "platforms;android-36" "build-tools;36.0.0" "ndk;27.1.12297006"
-      - name: Configure NDK
-        run: echo "NDK_HOME=$ANDROID_HOME/ndk/27.1.12297006" >> "$GITHUB_ENV"
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.13'
+      - uses: android-actions/setup-android@v3
+      - run: sdkmanager "platforms;android-37" "build-tools;36.0.0" "ndk;27.1.12297006"
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: aarch64-linux-android
       - uses: swatinem/rust-cache@v2
         with:
-          workspaces: ./src-tauri -> target
+          workspaces: ./smd-core -> target
       - run: npm ci
-      - name: Build Android preview APK
-        run: npm run tauri -- android build --debug --apk --target aarch64 --ci
+      - name: Configure optional distribution signing
         env:
-          CARGO_BUILD_JOBS: 2
+          KEYSTORE_BASE64: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}
+        run: |
+          if [ -n "$KEYSTORE_BASE64" ]; then
+            printf '%s' "$KEYSTORE_BASE64" | base64 --decode > "$RUNNER_TEMP/supermd-distribution.jks"
+            echo "SUPERMD_KEYSTORE=$RUNNER_TEMP/supermd-distribution.jks" >> "$GITHUB_ENV"
+          fi
+          echo "SUPERMD_BUILD_PYTHON=$(command -v python)" >> "$GITHUB_ENV"
+          echo "SUPERMD_BUILD_CPUS=$(awk '/Cpus_allowed_list/ {print $2}' /proc/self/status)" >> "$GITHUB_ENV"
+      - name: Build and validate release variant (never debug distribution)
+        run: npm run android:release
+        env:
+          SUPERMD_STORE_PASSWORD: ${{ secrets.ANDROID_STORE_PASSWORD }}
+          SUPERMD_KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
+          SUPERMD_KEY_PASSWORD: ${{ secrets.ANDROID_KEY_PASSWORD }}
       - uses: actions/upload-artifact@v4
         with:
-          name: super-md-android-arm64-preview
-          path: src-tauri/gen/android/app/build/outputs/apk/universal/debug/app-universal-debug.apk
+          name: super-md-android-arm64-release
+          path: android/app/build/outputs/apk/release/*.apk
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: android-test-reports
+          path: |
+            android/app/build/reports/tests/
+            android/app/build/reports/lint-results-release.html
+
+  android-device-tests:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    env:
+      CARGO_BUILD_JOBS: 2
+      SUPERMD_ABIS: x86_64
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 17
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.13'
+      - uses: android-actions/setup-android@v3
+      - run: sdkmanager "platforms;android-37" "build-tools;36.0.0" "ndk;27.1.12297006"
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-linux-android
+      - uses: swatinem/rust-cache@v2
+        with:
+          workspaces: ./smd-core -> target
+      - run: npm ci
+      - run: npm run build
+      - name: Build the real JNI engine and offline reader for instrumentation
+        run: |
+          export NDK_BIN="$ANDROID_HOME/ndk/27.1.12297006/toolchains/llvm/prebuilt/linux-x86_64/bin"
+          export CARGO_TARGET_X86_64_LINUX_ANDROID_LINKER="$NDK_BIN/x86_64-linux-android26-clang"
+          export CC_x86_64_linux_android="$CARGO_TARGET_X86_64_LINUX_ANDROID_LINKER"
+          export AR_x86_64_linux_android="$NDK_BIN/llvm-ar"
+          cargo rustc --locked --release --target x86_64-linux-android --manifest-path smd-core/Cargo.toml --lib -- -C link-arg=-Wl,-z,max-page-size=16384
+          mkdir -p android/app/src/main/jniLibs/x86_64 android/app/src/main/assets/web
+          cp smd-core/target/x86_64-linux-android/release/libsmd_core.so android/app/src/main/jniLibs/x86_64/
+          cp -a dist/. android/app/src/main/assets/web/
+          echo "SUPERMD_BUILD_PYTHON=$(command -v python)" >> "$GITHUB_ENV"
+      - name: Enable emulator acceleration
+        run: |
+          echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' | sudo tee /etc/udev/rules.d/99-kvm4all.rules
+          sudo udevadm control --reload-rules
+          sudo udevadm trigger --name-match=kvm
+      - uses: reactivecircus/android-emulator-runner@v2
+        with:
+          api-level: 36
+          target: google_apis
+          arch: x86_64
+          profile: pixel_2
+          disable-animations: true
+          emulator-options: -no-window -gpu swangle -feature -Vulkan -no-snapshot -noaudio -no-boot-anim -memory 2048 -cores 2
+          script: android/gradlew -p android --no-daemon --max-workers=2 :app:connectedDebugAndroidTest
+      # Debug is an internal test harness only, never a distributed APK.
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: android-instrumentation-results
+          path: |
+            android/app/build/reports/androidTests/
+            android/app/build/outputs/androidTest-results/

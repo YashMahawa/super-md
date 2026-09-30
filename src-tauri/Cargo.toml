@@ -1,12 +1,12 @@
 [package]
 name = "super-md"
-version = "0.1.4"
+version = "0.2.0"
 description = "A distraction-free, interactive Markdown studio"
 authors = ["Super MD contributors"]
 license = "MIT"
 repository = ""
 edition = "2021"
-rust-version = "1.77.2"
+rust-version = "1.92"
 
 [lib]
 name = "super_md_lib"
@@ -18,6 +18,9 @@ path = "src/main.rs"
 
 [build-dependencies]
 tauri-build = { version = "2", features = [] }
+
+[features]
+custom-protocol = ["tauri/custom-protocol"]
 
 [dependencies]
 anyhow = "1"
@@ -32,13 +35,17 @@ tauri-plugin-dialog = "2"
 tauri-plugin-fs = "2"
 tempfile = "3"
 which = "8"
+smd-core = { path = "../smd-core" }
+
+[profile.dev]
+debug = 0
 
 [target.'cfg(not(target_os = "android"))'.dependencies]
 rfd = "0.15"
 
 [profile.release]
-codegen-units = 1
-lto = true
+codegen-units = 8
+lto = "thin"
 opt-level = "s"
 panic = "abort"
 strip = true

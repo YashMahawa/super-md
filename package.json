@@ -1,7 +1,7 @@
 {
   "name": "super-md",
   "private": true,
-  "version": "0.1.4",
+  "version": "0.2.0",
   "type": "module",
   "scripts": {
     "dev": "vite",
@@ -9,7 +9,11 @@
     "tauri": "tauri",
     "desktop": "tauri dev",
     "package": "tauri build",
-    "test": "vitest run && cd src-tauri && cargo test"
+    "test": "vitest run && cd src-tauri && cargo test",
+    "test:browser": "playwright test",
+    "test:coverage": "vitest run --coverage",
+    "test:pdf": "cargo test --manifest-path smd-core/Cargo.toml",
+    "android:release": "scripts/build-android.sh"
   },
   "dependencies": {
     "@codemirror/commands": "^6.8.1",
@@ -35,14 +39,19 @@
     "rehype-katex": "^7.0.1",
     "remark-gfm": "^4.0.1",
     "remark-math": "^6.0.0",
+    "remark-parse": "^11.0.0",
+    "remark-stringify": "^11.0.0",
+    "unified": "^11.0.5",
     "unist-util-visit": "^5.0.0"
   },
   "devDependencies": {
+    "@playwright/test": "^1.63.0",
     "@tauri-apps/cli": "^2.8.4",
     "@types/katex": "^0.16.7",
     "@types/react": "^19.1.10",
     "@types/react-dom": "^19.1.7",
     "@vitejs/plugin-react": "^4.3.4",
+    "@vitest/coverage-v8": "^3.2.7",
     "jsdom": "^26.1.0",
     "typescript": "~5.9.2",
     "vite": "^6.1.0",

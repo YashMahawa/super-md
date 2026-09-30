@@ -1,0 +1,3 @@
+-keep class dev.supermd.studio.PdfEngine { *; }
+-keepclassmembers class * { @android.webkit.JavascriptInterface <methods>; }
+-keep class dev.supermd.studio.ReaderBridge { *; }

@@ -17,4 +17,8 @@ describe("safe chart expressions", () => {
     expect(compileMathExpression("pow(x, 2) + sqrt(9)")({ x: 4 })).toBe(19);
     expect(Number.isNaN(compileMathExpression("unknown + 1")({}))).toBe(true);
   });
+  it("rejects pathological recursion before parsing", () => {
+    expect(() => compileMathExpression("(".repeat(3000) + "x" + ")".repeat(3000))).toThrow();
+    expect(() => compileMathExpression("1+".repeat(300) + "1")).toThrow();
+  });
 });

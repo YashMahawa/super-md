@@ -4,5 +4,5 @@
   "description": "Default desktop capability",
   "platforms": ["linux", "macOS", "windows"],
   "windows": ["main", "document-*"],
-  "permissions": ["core:default", "core:window:allow-set-fullscreen", "core:window:allow-is-fullscreen", "core:window:allow-create", "core:webview:allow-create-webview-window"]
+  "permissions": ["core:default", "core:window:allow-close", "core:window:allow-destroy", "core:window:allow-set-fullscreen", "core:window:allow-is-fullscreen", "core:window:allow-create", "core:webview:allow-create-webview-window"]
 }

@@ -41,7 +41,24 @@
 html, body, #root { width: 100%; height: 100%; margin: 0; overflow: hidden; }
 button, input, select { font: inherit; }
 button { color: inherit; }
-.app { height: 100%; display: grid; grid-template-rows: auto auto auto minmax(0, 1fr); background: var(--surface-low); transition: background-color .3s var(--standard); }
+.app { height: 100%; display: flex; flex-direction: column; background: var(--surface-low); transition: background-color .3s var(--standard); }
+.app > .topbar, .app > .tab-strip, .app > .formatbar { flex-shrink: 0; }
+.work-area { display: flex; flex: 1; min-height: 0; min-width: 0; }
+.work-area > .workspace { flex: 1; min-width: 0; }
+.folder-panel { width: var(--folder-width, 248px); flex-shrink: 0; display: flex; flex-direction: column; min-height: 0; background: var(--surface); border-right: 1px solid var(--edge); }
+.folder-panel { overflow: hidden; }
+.folder-panel header { display: flex; align-items: center; gap: 6px; padding: 12px; }
+.folder-panel header strong { flex: 1; overflow: hidden; text-overflow: ellipsis; font-size: .8rem; }
+.folder-panel header button { padding: 7px; }
+.folder-panel input { margin: 0 12px 10px; min-width: 0; background: var(--surface-low); color: var(--text); border: 1px solid var(--outline); border-radius: 10px; padding: 9px; font-size: .78rem; }
+.folder-tree { flex: 1; overflow: auto; padding: 0 8px 14px; scrollbar-width: thin; }
+.folder-entry { display: flex; align-items: center; gap: 7px; width: 100%; text-align: left; padding: 8px; font-size: .78rem; }
+.folder-entry span { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.folder-entry svg { flex-shrink: 0; }
+.folder-empty { padding: 12px; font-size: .8rem; color: var(--muted); }
+.folder-resizer { width: 5px; flex-shrink: 0; cursor: col-resize; touch-action: none; }
+.folder-resizer:hover { background: var(--primary); }
+.export-error { white-space: pre-wrap; max-height: 200px; overflow: auto; font-size: .78rem; color: var(--error); }
 :root[data-platform="android"] .app { height: 100dvh; padding: env(safe-area-inset-top, 0px) env(safe-area-inset-right, 0px) env(safe-area-inset-bottom, 0px) env(safe-area-inset-left, 0px); }
 :root[data-platform="android"] .workspace { padding: clamp(6px, 1.5vw, 18px); }
 :root[data-platform="android"] .live-edit-button { opacity: .82; }
@@ -99,7 +116,7 @@ button:disabled { opacity: .5; cursor: default; }
 .format-label { margin-right: 11px; color: var(--muted); font-size: .71rem; font-weight: 800; }
 .format-divider { height: 20px; margin: 0 7px; border-left: 1px solid var(--outline); }
 .format-hint { margin-left: auto; color: var(--muted); font-size: .76rem; }
-.workspace { position: relative; min-height: 0; display: grid; grid-template-columns: minmax(0, var(--split-left, 50fr)) 12px minmax(0, var(--split-right, 50fr)); gap: 4px; padding: 12px; background: radial-gradient(ellipse at 48% -24%, color-mix(in srgb, var(--primary) 5%, transparent), transparent 54%); transition: grid-template-columns .38s var(--standard); }
+.workspace { position: relative; min-height: 0; display: grid; grid-template-columns: minmax(0, var(--split-left, 50fr)) 12px minmax(0, var(--split-right, 50fr)); gap: 4px; padding: 12px; background: var(--surface-low); transition: grid-template-columns .38s var(--standard); }
 .workspace[data-resizing="true"] { transition: none; cursor: col-resize; user-select: none; }
 .workspace[data-dragging-file="true"]::after { content: "Drop to open Markdown"; position: absolute; z-index: 6; inset: 12px; display: grid; place-items: center; border: 2px dashed var(--primary); border-radius: 22px; color: var(--primary); background: color-mix(in srgb, var(--surface) 92%, transparent); font-size: 1.12rem; font-weight: 760; pointer-events: none; }
 .view-editor .workspace, .view-reader .workspace, .view-live .workspace { grid-template-columns: minmax(0, 1fr); }

@@ -1,6 +1,6 @@
 import { Children, isValidElement, lazy, memo, Suspense, useEffect, useState, type ReactNode } from "react";
-import { invoke } from "@tauri-apps/api/core";
-import ReactMarkdown from "react-markdown";
+import { invoke } from "../nativeBridge";
+import ReactMarkdown, { defaultUrlTransform } from "react-markdown";
 import remarkGfm from "remark-gfm";
 import remarkMath from "remark-math";
 import rehypeKatex from "rehype-katex";
@@ -104,6 +104,7 @@ function MarkdownPreview({ markdown, documentPath, python, dark, trustedImageHos
   return (
     <article className="markdown-body">
       <ReactMarkdown
+        urlTransform={(url, key, node) => node.tagName === "img" && key === "src" && /^data:image\/(?:png|jpeg|gif|webp|avif|svg\+xml);base64,/i.test(url) ? url : defaultUrlTransform(url)}
         remarkPlugins={[remarkGfm, remarkMath, remarkCallouts]}
         rehypePlugins={[rehypeKatex, rehypeHighlight]}
         components={{

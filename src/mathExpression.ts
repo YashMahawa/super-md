@@ -10,6 +10,7 @@ const functions: Record<string, (...values: number[]) => number> = {
 const tokenPattern = /\s*(?:(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][+-]?\d+)?|[A-Za-z_][A-Za-z_0-9]*|\*\*|[()+*/^%,-])/y;
 
 export function compileMathExpression(source: string): Evaluator {
+  if (source.length > 4096) throw new Error("Chart expression is too long (maximum 4096 characters)");
   const normalized = source.replace(/\bMath\.(PI|E|[A-Za-z_][A-Za-z_0-9]*)/g, (_match, name: string) => name === "PI" ? "pi" : name === "E" ? "e" : name);
   const tokens: string[] = [];
   let offset = 0;
@@ -21,6 +22,7 @@ export function compileMathExpression(source: string): Evaluator {
       throw new Error(`Unsupported chart expression near ${normalized.slice(offset, offset + 14)}`);
     }
     tokens.push(match[0].trim());
+    if (tokens.length > 512) throw new Error("Chart expression is too complex (maximum 512 tokens)");
     offset = tokenPattern.lastIndex;
   }
   let index = 0;
