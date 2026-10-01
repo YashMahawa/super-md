@@ -9,6 +9,13 @@ on:
         description: Existing stable version tag to publish
         required: true
         type: string
+      publish_only:
+        description: Recover publication using a completed, tag-matched build
+        type: boolean
+        default: false
+      build_run_id:
+        description: Successful platform-build run for publish-only recovery
+        type: string
 
 permissions:
   contents: write
@@ -21,6 +28,7 @@ concurrency:
 env:
   RELEASE_TAG: ${{ inputs.tag || github.ref_name }}
   GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+  GH_REPO: ${{ github.repository }}
 
 jobs:
   prepare:
@@ -29,6 +37,7 @@ jobs:
     outputs:
       release_id: ${{ steps.draft.outputs.release_id }}
       version: ${{ steps.version.outputs.version }}
+      reuse_packages: ${{ steps.reuse.outputs.reuse_packages }}
     steps:
       - uses: actions/checkout@v4
         with:
@@ -40,6 +49,38 @@ jobs:
         id: version
         run: echo "version=$(node scripts/release-guards.mjs versions "$RELEASE_TAG")" >> "$GITHUB_OUTPUT"
       - run: node --test scripts/release-guards.test.mjs
+      - name: Require proven platform builds for publication recovery
+        if: inputs.publish_only
+        id: reuse
+        env:
+          BUILD_RUN_ID: ${{ inputs.build_run_id }}
+        run: |
+          node --input-type=module <<'NODE'
+          import { execFileSync } from 'node:child_process';
+          import { appendFileSync } from 'node:fs';
+          const id = process.env.BUILD_RUN_ID;
+          if (!/^[1-9][0-9]*$/.test(id || '')) throw Error('Recovery requires a platform-build run ID');
+          const api = path => JSON.parse(execFileSync('gh', ['api', path], { encoding: 'utf8' }));
+          const base = `repos/${process.env.GITHUB_REPOSITORY}/actions/runs/${id}`;
+          const run = api(base);
+          const sha = execFileSync('git', ['rev-parse', 'HEAD'], { encoding: 'utf8' }).trim();
+          if (run.head_sha !== sha || run.head_branch !== process.env.RELEASE_TAG || run.event !== 'push' || run.path !== '.github/workflows/release.yml' || run.status !== 'completed') throw Error('Build run must match this exact tagged source and release workflow');
+          const response = api(`${base}/jobs?per_page=100`);
+          if (response.total_count !== response.jobs.length) throw Error('Incomplete build evidence');
+          const required = [
+            'android',
+            'desktop (ubuntu-22.04, --bundles appimage,deb,rpm)',
+            'desktop (windows-latest, --bundles nsis)',
+            'desktop (macos-latest, --target aarch64-apple-darwin --bundles dmg)',
+            'desktop (macos-latest, --target x86_64-apple-darwin --bundles dmg)',
+          ];
+          for (const name of required) {
+            const jobs = response.jobs.filter(job => job.name === name);
+            if (jobs.length !== 1 || jobs[0].status !== 'completed' || jobs[0].conclusion !== 'success') throw Error(`Missing successful build: ${name}`);
+          }
+          appendFileSync(process.env.GITHUB_OUTPUT, 'reuse_packages=true\n');
+          console.log(`Verified all five build jobs on tagged source ${sha}`);
+          NODE
       - name: Require successful CI on this exact commit
         run: |
           node --input-type=module <<'NODE'
@@ -70,6 +111,7 @@ jobs:
 
   desktop:
     needs: prepare
+    if: needs.prepare.outputs.reuse_packages != 'true'
     strategy:
       fail-fast: false
       matrix:
@@ -195,6 +237,7 @@ jobs:
 
   publish:
     needs: [prepare, desktop, android]
+    if: ${{ always() && needs.prepare.result == 'success' && needs.android.result == 'success' && (needs.desktop.result == 'success' || (needs.desktop.result == 'skipped' && needs.prepare.outputs.reuse_packages == 'true')) }}
     runs-on: ubuntu-22.04
     steps:
       - uses: actions/checkout@v4
