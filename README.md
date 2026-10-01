@@ -48,7 +48,9 @@ export SUPERMD_BUILD_PYTHON=/path/to/python3.13
 npm run android:release
 ```
 
-Output: `android/app/build/outputs/apk/release/`. Without signing variables the release artifact is unsigned. Local upgrade builds can use the existing installation's certificate; that is not a production signing policy. CI never publishes a debug APK. CI release artifacts require your distribution signing secrets for installability. macOS desktop packages are ad-hoc signed, not notarized; Windows packages are not code-signed.
+Output: `android/app/build/outputs/apk/release/`. Without signing variables the build artifact is unsigned and must not be distributed. CI publication requires either the distribution signing secrets or a locally signed release APK attached to the draft. It verifies the upgrade certificate, non-debuggable variant, 16-KB alignment and clean tagged source before publishing. macOS desktop packages are ad-hoc signed, not notarized; Windows packages are not code-signed.
+
+Desktop controls use official [Material Web](https://github.com/material-components/material-web) sliders/switches and the MIT-licensed [Banegasn Material 3 button](https://github.com/Banegasn/components). Material Web implements Material 3, not the Android Expressive motion system; desktop spring transitions remain a separate app layer. Android uses native Compose Material 3 Expressive. Bundled UI-library licenses are in `public/third-party-ui-licenses.txt`.
 
 ## CLI
 
