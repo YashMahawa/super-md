@@ -11,19 +11,30 @@
 - Six desktop Rust unit tests plus two real executable CLI tests pass. A single
   FMD reopens and exports its vector image and equation without companion files.
   `pack` output is tested after removing the original loose image fixture.
-- Five native Android emulator tests pass, including the real diagonal touch
+- Six native Android emulator tests pass, including the real diagonal touch
   path through Compose/WebView and menu-based drawer opening/dismissal, pinch,
   fullscreen zoom restoration, bundled Matplotlib, and JNI PDF/FMD export.
   FMD streaming decode rejects traversal paths; attachment bytes remain outside
   the editor and workspace snapshot. Android System UI initially put an ANR
   dialog over the screenshots during cold boot; after clearing that emulator
-  dialog, the unchanged painting assertions and all five tests passed.
+  dialog, the unchanged painting assertions passed. The new large-string FMD
+  regression test failed before the counter fix and passes afterward with all
+  six tests. It crosses reader buffer boundaries using escaped Unicode Markdown
+  and a larger embedded SVG.
 - The optimized non-debuggable x86_64 release opens with the three-step setup
   and icon-free Live rendering. Through the actual UI it downloaded a public PNG
   from Google's CDN, inserted a short Markdown reference, and exported a real FMD
   through Android's system destination picker. The resulting file contains one
   embedded image and no base64 in its Markdown. This smoke check caught a missing
-  custom FMD MIME type in the Open picker; the type is now included.
+  custom FMD MIME type in the Open picker; the type is now included. Reopening
+  also exposed a lexical counter capture: stream bytes incremented the asset
+  counter. Distinct counters fix the real-file failure, without disabling R8.
+  The fixed optimized release reopened the same FMD through the system picker,
+  displayed its embedded PNG without a companion-folder grant, and reran local
+  Matplotlib. Actual GUI export produced a two-page PDF containing equations,
+  callout, table, chart, Mermaid, the Python figure and embedded PNG. Both PDF
+  pages were rasterized and visually inspected; extracted text retains diagram
+  labels and equations. Source mode contains Markdown, not the FMD envelope.
 - Linux 0.3.0 opened its production window with isolated test recovery storage;
   its CLI packed and exported a single-file FMD containing math, callouts, a table
   and SVG. The installed binary was updated, preserving the previous executable

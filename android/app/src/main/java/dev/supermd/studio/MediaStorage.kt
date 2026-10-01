@@ -67,11 +67,13 @@ class MediaStorage(private val context: Context) {
     fun openFmd(input: InputStream): Opened {
         val directory = UUID.randomUUID().toString(); val root = File(bundles, directory).apply { mkdirs() }
         try {
-            var format = ""; var version = 0; var markdown: String? = null; var total = 0L; var count = 0
+            var format = ""; var version = 0; var markdown: String? = null; var total = 0L; var assetCount = 0
             val bounded = object : java.io.FilterInputStream(input) {
-                var count = 0L
-                override fun read(): Int { val value = super.read(); if (value >= 0) require(++count <= 120_000_000) { "FMD exceeds 120 MB" }; return value }
-                override fun read(buffer: ByteArray, offset: Int, length: Int): Int { val size = super.read(buffer, offset, length); if (size > 0) { count += size; require(count <= 120_000_000) { "FMD exceeds 120 MB" } }; return size }
+                // Keep this distinct from assetCount: lexical capture must never
+                // turn bytes consumed into the number of embedded images.
+                var bytesRead = 0L
+                override fun read(): Int { val value = super.read(); if (value >= 0) require(++this.bytesRead <= 120_000_000) { "FMD exceeds 120 MB" }; return value }
+                override fun read(buffer: ByteArray, offset: Int, length: Int): Int { val size = super.read(buffer, offset, length); if (size > 0) { this.bytesRead += size; require(this.bytesRead <= 120_000_000) { "FMD exceeds 120 MB" } }; return size }
             }
             // Limit individual JSON tokens while streaming, before JsonReader
             // allocates an attacker-sized string on a mobile heap.
@@ -92,15 +94,15 @@ class MediaStorage(private val context: Context) {
                 while (reader.hasNext()) when(reader.nextName()) {
                     "format" -> format = reader.nextString()
                     "version" -> version = reader.nextInt()
-                    "markdown" -> { markdown = reader.nextString(); require(markdown!!.toByteArray().size <= 20_000_000) }
+                    "markdown" -> { markdown = reader.nextString(); require(markdown!!.toByteArray().size <= 20_000_000) { "FMD Markdown exceeds 20 MB" } }
                     "assets" -> { reader.beginObject(); while(reader.hasNext()) {
-                        val source = reader.nextName(); require(validKey(source)); require(++count <= 512)
-                        val (type, bytes) = decode(reader.nextString()); require(mime(source) == type) { "Image extension does not match its type" }; total += bytes.size; require(total <= 75_000_000)
+                        val source = reader.nextName(); require(validKey(source)) { "Invalid FMD asset name" }; require(++assetCount <= 512) { "FMD contains more than 512 images" }
+                        val (type, bytes) = decode(reader.nextString()); require(mime(source) == type) { "Image extension does not match its type" }; total += bytes.size; require(total <= 75_000_000) { "FMD assets exceed 75 MB" }
                         File(root, source.substringAfter('/')).writeBytes(bytes)
                     }; reader.endObject() }
                     else -> error("Unknown portable-file field")
                 }
-                reader.endObject(); require(reader.peek() == android.util.JsonToken.END_DOCUMENT)
+                reader.endObject(); require(reader.peek() == android.util.JsonToken.END_DOCUMENT) { "Unexpected data after the FMD envelope" }
             }
             require(format == "supermd-fmd" && version == 1 && markdown != null) { "Unsupported FMD file" }
             return Opened(markdown!!, directory)

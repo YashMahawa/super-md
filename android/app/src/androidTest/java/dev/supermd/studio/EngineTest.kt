@@ -12,6 +12,15 @@ import java.io.File
 
 @RunWith(AndroidJUnit4::class)
 class EngineTest {
+    @Test fun largePortableStringsCrossReaderBufferBoundaries() {
+        val app = ApplicationProvider.getApplicationContext<android.app.Application>(); val media = MediaStorage(app)
+        val markdown = sample + "\n\n" + "Unicode λ and escaped quotes \"remain editable\".\n".repeat(200)
+        val vector = "<svg xmlns='http://www.w3.org/2000/svg' width='200' height='100'>" + "<path d='M0 90L200 10' stroke='blue'/>".repeat(300) + "</svg>"
+        val data = "data:image/svg+xml;base64," + android.util.Base64.encodeToString(vector.toByteArray(), android.util.Base64.NO_WRAP)
+        val output = java.io.ByteArrayOutputStream(); media.writeFmd(output, markdown, JSONObject().put("assets/image-long.svg", data))
+        val opened = media.openFmd(output.toByteArray().inputStream()); assertEquals(markdown, opened.markdown)
+        assertEquals(data, media.data(media.local("assets/image-long.svg", opened.directory)!!))
+    }
     @Test fun portableImagesStayOutsideSourceAndExportOffline() = runBlocking {
         val app = ApplicationProvider.getApplicationContext<android.app.Application>()
         val media = MediaStorage(app)
