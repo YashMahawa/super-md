@@ -61,7 +61,12 @@ jobs:
           else
             gh release create "$RELEASE_TAG" --verify-tag --draft --title "Super MD $RELEASE_TAG" --notes-file RELEASE_NOTES.md
           fi
-          echo "release_id=$(gh api "repos/$GITHUB_REPOSITORY/releases/tags/$RELEASE_TAG" --jq .id)" >> "$GITHUB_OUTPUT"
+          release_id="$(gh release view "$RELEASE_TAG" --json databaseId --jq .databaseId)"
+          if [[ ! "$release_id" =~ ^[1-9][0-9]*$ ]]; then
+            echo 'Draft release lookup did not return a valid identifier' >&2
+            exit 1
+          fi
+          echo "release_id=$release_id" >> "$GITHUB_OUTPUT"
 
   desktop:
     needs: prepare
@@ -200,7 +205,7 @@ jobs:
           node-version: 22
       - name: Require complete installers and create package checksums
         run: |
-          gh api "repos/$GITHUB_REPOSITORY/releases/tags/$RELEASE_TAG" --jq .assets > "$RUNNER_TEMP/assets.json"
+          gh release view "$RELEASE_TAG" --json assets --jq .assets > "$RUNNER_TEMP/assets.json"
           node scripts/release-guards.mjs assets "$RELEASE_TAG" "$RUNNER_TEMP/assets.json"
           mkdir "$RUNNER_TEMP/packages"
           gh release download "$RELEASE_TAG" --dir "$RUNNER_TEMP/packages"
