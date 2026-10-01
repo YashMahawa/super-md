@@ -29,6 +29,7 @@ import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.verticalScroll
+import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.rounded.ArrowBack
 import androidx.compose.material.icons.automirrored.rounded.MenuBook
@@ -45,6 +46,7 @@ import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
+import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.viewinterop.AndroidView
 import androidx.core.view.WindowCompat
@@ -98,6 +100,7 @@ private object NoMotionScheme : MotionScheme {
     val snackbar = remember { SnackbarHostState() }
     var settings by remember { mutableStateOf(false) }
     var exporting by remember { mutableStateOf(false) }
+    var zoomEditing by remember { mutableStateOf(false) }
     var menu by remember { mutableStateOf(false) }
     var web by remember { mutableStateOf<WebView?>(null) }
     var readerReady by remember { mutableStateOf(false) }
@@ -179,14 +182,14 @@ private object NoMotionScheme : MotionScheme {
                     Column {
                         TopAppBar(title = { Column { Text(state.active.name, maxLines = 1, overflow = TextOverflow.Ellipsis, style = MaterialTheme.typography.titleMedium); Text(if (state.active.dirty) "Draft recovered automatically" else if (state.active.uri != null) "Saved" else "Local draft", style = MaterialTheme.typography.labelSmall, color = palette.onSurfaceVariant) } }, navigationIcon = { IconButton(onClick = { scope.launch { drawer.open() }; state.folder?.let { if (state.files.isEmpty()) model.listFolder(android.net.Uri.parse(it), "") } }) { Icon(Icons.Rounded.Menu, "Open files") } }, actions = {
                             IconButton(onClick = saveAction) { Icon(Icons.Rounded.Save, "Save note") }
-                            IconButton(onClick = { exporting = true }, enabled = readerReady && !state.busy) { Icon(Icons.Rounded.PictureAsPdf, "Export PDF") }
+                            IconButton(onClick = { exporting = true }, enabled = readerReady && !state.busy) { Icon(Icons.Rounded.IosShare, "Export") }
                             Box { IconButton(onClick = { menu = true }) { Icon(Icons.Rounded.MoreVert, "More actions") }; DropdownMenu(expanded = menu, onDismissRequest = { menu = false }) {
                                 DropdownMenuItem(text = { Text("Open note") }, onClick = { menu = false; open.launch(arrayOf("text/*", "application/octet-stream", "application/vnd.supermd.fmd")) }, leadingIcon = { Icon(Icons.Rounded.FolderOpen, null) })
                                 DropdownMenuItem(text = { Text("New tab") }, onClick = { menu = false; model.newNote() }, leadingIcon = { Icon(Icons.Rounded.Add, null) })
                                 DropdownMenuItem(text = { Text("Reopen closed tab") }, onClick = { menu = false; model.reopen() })
                                 DropdownMenuItem(text = { Text("Save as Markdown") }, onClick = { menu = false; save.launch(if (state.active.name.endsWith(".fmd", true)) state.active.name.substringBeforeLast('.') + ".md" else state.active.name) })
                                 DropdownMenuItem(text = { Text("Insert image or link") }, onClick = { menu = false; web?.evaluateJavascript("window.supermdMedia?.()", null) }, leadingIcon = { Icon(Icons.Rounded.Image, null) })
-                                DropdownMenuItem(text = { Text("Export portable .fmd") }, onClick = { menu = false; portable.launch(state.active.name.substringBeforeLast('.') + ".fmd") })
+                                DropdownMenuItem(text = { Text("Zoom · ${state.zoom.toInt()}%") }, onClick = { menu = false; zoomEditing = true }, leadingIcon = { Icon(Icons.Rounded.ZoomIn, null) })
                                 DropdownMenuItem(text = { Text("Find and replace") }, onClick = { menu = false; model.mode("editor"); web?.postDelayed({ web?.evaluateJavascript("window.supermdFind?.()", null) }, 200) }, leadingIcon = { Icon(Icons.Rounded.Search, null) })
                                 DropdownMenuItem(text = { Text("Fullscreen study") }, onClick = { menu = false; model.fullscreen(true) }, leadingIcon = { Icon(Icons.Rounded.Fullscreen, null) })
                                 DropdownMenuItem(text = { Text("Settings") }, onClick = { menu = false; settings = true }, leadingIcon = { Icon(Icons.Rounded.Settings, null) })
@@ -238,7 +241,7 @@ private object NoMotionScheme : MotionScheme {
                             }
                         })
                     } }, modifier = Modifier.fillMaxSize().clipToBounds(), onRelease = { readerReady = false; web?.removeJavascriptInterface("SuperMD"); web?.destroy(); it.removeAllViews(); web = null })
-                    if (state.fullscreen) Surface(shape = RoundedCornerShape(24.dp), color = palette.surfaceContainer.copy(alpha = .94f), modifier = Modifier.align(Alignment.TopEnd).safeDrawingPadding().padding(8.dp)) { Row(verticalAlignment = Alignment.CenterVertically) { IconButton(onClick = { model.zoom(state.zoom - 10) }) { Icon(Icons.Rounded.Remove, "Zoom out") }; TextButton(onClick = { model.zoom(100f) }) { Text("${state.zoom.toInt()}%") }; IconButton(onClick = { model.zoom(state.zoom + 10) }) { Icon(Icons.Rounded.Add, "Zoom in") }; IconButton(onClick = { model.fullscreen(false) }) { Icon(Icons.Rounded.FullscreenExit, "Exit fullscreen") } } }
+                    if (state.fullscreen) Surface(shape = RoundedCornerShape(24.dp), color = palette.surfaceContainer.copy(alpha = .94f), modifier = Modifier.align(Alignment.TopEnd).safeDrawingPadding().padding(8.dp)) { Row(verticalAlignment = Alignment.CenterVertically) { IconButton(onClick = { model.zoom(state.zoom - 10) }) { Icon(Icons.Rounded.Remove, "Zoom out") }; TextButton(onClick = { zoomEditing = true }) { Text("${state.zoom.toInt()}%") }; IconButton(onClick = { model.zoom(state.zoom + 10) }) { Icon(Icons.Rounded.Add, "Zoom in") }; IconButton(onClick = { model.fullscreen(false) }) { Icon(Icons.Rounded.FullscreenExit, "Exit fullscreen") } } }
                     SnackbarHost(snackbar, Modifier.align(Alignment.BottomCenter).safeDrawingPadding())
                     if (state.busy) Surface(color = palette.surface.copy(alpha = .9f), modifier = Modifier.fillMaxSize()) { Column(Modifier.fillMaxSize(), verticalArrangement = Arrangement.Center, horizontalAlignment = Alignment.CenterHorizontally) { CircularProgressIndicator(); Spacer(Modifier.height(16.dp)); Text("Preparing your document…") } }
                 }
@@ -246,7 +249,8 @@ private object NoMotionScheme : MotionScheme {
         }
     }
     if (settings) ModalBottomSheet(onDismissRequest = { settings = false }) { Settings(state, model) }
-    if (exporting) ModalBottomSheet(onDismissRequest = { exporting = false }) { PdfSettings(state.pdf, model::pdf) { exporting = false; pdf.launch(state.active.name.substringBeforeLast('.') + ".pdf") } }
+    if (exporting) ModalBottomSheet(onDismissRequest = { exporting = false }) { ExportSettings(state.pdf, model::pdf) { format -> exporting = false; if (format == "fmd") portable.launch(state.active.name.substringBeforeLast('.') + ".fmd") else pdf.launch(state.active.name.substringBeforeLast('.') + ".pdf") } }
+    if (zoomEditing) ZoomDialog(state.zoom, { zoomEditing = false }) { model.zoom(it); zoomEditing = false }
     state.error?.let { AlertDialog(onDismissRequest = model::dismissError, title = { Text("Couldn't finish") }, text = { Text(it, Modifier.heightIn(max = 360.dp).verticalScroll(rememberScrollState())) }, confirmButton = { TextButton(onClick = model::dismissError) { Text("OK") } }) }
     if (!state.welcomed) WelcomeSetup(state, model) { model.welcomeDone(); open.launch(arrayOf("text/*", "application/octet-stream", "application/vnd.supermd.fmd")) }
 }
@@ -278,7 +282,7 @@ private fun hex(color: Color) = "#%06x".format(color.toArgb() and 0xffffff)
         Choice("Fullscreen appearance", state.fullscreenTheme, listOf("system" to "System", "light" to "Light", "dark" to "Dark", "black" to "Pure black")) { model.appearance(fullTheme = it) }
         Choice("Reading font", state.font, listOf("sans" to "Sans", "serif" to "Serif", "mono" to "Mono")) { model.appearance(font = it) }
         Text("Text size · ${state.size.toInt()}", style = MaterialTheme.typography.titleSmall, modifier = Modifier.padding(top = 16.dp))
-        Slider(value = state.size, onValueChange = { model.appearance(size = it) }, valueRange = 13f..28f)
+        StudySlider(value = state.size, onCommit = { model.appearance(size = it) }, valueRange = 13f..28f)
         Row(verticalAlignment = Alignment.CenterVertically) { Column(Modifier.weight(1f)) { Text("Expressive motion", style = MaterialTheme.typography.titleMedium); Text("Spring transitions and responsive controls", style = MaterialTheme.typography.bodySmall) }; Switch(checked = state.motion, onCheckedChange = { model.appearance(motion = it) }) }
         Text("Dynamic color follows your wallpaper on Android 12+. The monochrome icon follows your launcher's themed-icon setting.", style = MaterialTheme.typography.bodySmall, modifier = Modifier.padding(top = 16.dp))
         Spacer(Modifier.height(32.dp))
@@ -290,18 +294,45 @@ private fun hex(color: Color) = "#%06x".format(color.toArgb() and 0xffffff)
     Row(Modifier.horizontalScroll(rememberScrollState()), horizontalArrangement = Arrangement.spacedBy(6.dp)) { choices.forEach { (key, name) -> FilterChip(selected = value == key, onClick = { change(key) }, label = { Text(name) }) } }
 }
 
-@Composable private fun PdfSettings(raw: String, onChange: (String) -> Unit, export: () -> Unit) {
+@Composable private fun StudySlider(value: Float, valueRange: ClosedFloatingPointRange<Float>, onCommit: (Float) -> Unit) {
+    val slider = rememberSliderState(value = value, trackRange = valueRange)
+    LaunchedEffect(value) { slider.value = value }
+    // Material's gesture state handles every drag frame locally. Persisting
+    // preferences and updating the document bridge happen once on release.
+    Slider(state = slider, onValueChange = { slider.value = it }, onValueChangeFinished = { onCommit(slider.value) })
+}
+
+@Composable private fun ExportSettings(raw: String, onChange: (String) -> Unit, export: (String) -> Unit) {
+    var format by rememberSaveable { mutableStateOf("pdf") }
     var options by remember(raw) { mutableStateOf(JSONObject(raw)) }
     fun update(key: String, value: Any) { options = JSONObject(options.toString()).put(key, value); onChange(options.toString()) }
     Column(Modifier.fillMaxWidth().verticalScroll(rememberScrollState()).padding(24.dp)) {
-        Text("Export a typeset PDF", style = MaterialTheme.typography.headlineSmall)
-        Text("Local vector math and plots. Real pagination—not a printout of the screen.", style = MaterialTheme.typography.bodyMedium, modifier = Modifier.padding(vertical = 12.dp))
+        Text("Export your note", style = MaterialTheme.typography.headlineSmall)
+        SingleChoiceSegmentedButtonRow(Modifier.fillMaxWidth().padding(vertical = 16.dp)) {
+            listOf("pdf" to "PDF document", "fmd" to "Portable FMD").forEachIndexed { index, (key, label) -> SegmentedButton(selected = format == key, onClick = { format = key }, shape = SegmentedButtonDefaults.itemShape(index, 2)) { Text(label) } }
+        }
+        if (format == "pdf") {
+        Text("Vector equations, plots and real pagination. Typeset locally on this device.", style = MaterialTheme.typography.bodyMedium, modifier = Modifier.padding(bottom = 12.dp))
         Choice("Paper", options.optString("pageSize", "a4"), listOf("a4" to "A4", "a5" to "A5", "letter" to "Letter", "legal" to "Legal")) { update("pageSize", it) }
         Choice("Document font", options.optString("fontFamily", "Libertinus Serif"), listOf("Libertinus Serif" to "Serif", "Noto Sans" to "Sans", "New Computer Modern" to "Book", "DejaVu Sans Mono" to "Mono")) { update("fontFamily", it) }
-        Text("Margins · ${options.optDouble("margin",18.0).toInt()} mm", Modifier.padding(top = 16.dp)); Slider(value = options.optDouble("margin",18.0).toFloat(), onValueChange = { update("margin", it.toInt()) }, valueRange = 4f..40f)
-        Text("Font size · ${"%.1f".format(options.optDouble("fontSize",10.5))} pt"); Slider(value = options.optDouble("fontSize",10.5).toFloat(), onValueChange = { update("fontSize", (it * 2).toInt() / 2.0) }, valueRange = 7f..24f)
-        Text("Line spacing · ${"%.2f".format(options.optDouble("lineHeight",1.35))}"); Slider(value = options.optDouble("lineHeight",1.35).toFloat(), onValueChange = { update("lineHeight", it.toDouble()) }, valueRange = .9f..2.2f)
+        Text("Margins · ${options.optDouble("margin",18.0).toInt()} mm", Modifier.padding(top = 16.dp)); StudySlider(value = options.optDouble("margin",18.0).toFloat(), onCommit = { update("margin", it.toInt()) }, valueRange = 4f..60f)
+        Text("Font size · ${"%.1f".format(options.optDouble("fontSize",10.5))} pt"); StudySlider(value = options.optDouble("fontSize",10.5).toFloat(), onCommit = { update("fontSize", (it * 2).toInt() / 2.0) }, valueRange = 7f..24f)
+        Text("Line spacing · ${"%.2f".format(options.optDouble("lineHeight",1.35))}"); StudySlider(value = options.optDouble("lineHeight",1.35).toFloat(), onCommit = { update("lineHeight", it.toDouble()) }, valueRange = .9f..2.2f)
         Row(verticalAlignment = Alignment.CenterVertically) { Text("Page numbers", Modifier.weight(1f), style = MaterialTheme.typography.titleMedium); Switch(checked = options.optBoolean("pageNumbers",true), onCheckedChange = { update("pageNumbers", it) }) }
-        Button(onClick = export, modifier = Modifier.fillMaxWidth().padding(top = 20.dp, bottom = 28.dp)) { Icon(Icons.Rounded.PictureAsPdf, null); Text("Choose destination & export", Modifier.padding(start = 8.dp)) }
+        } else {
+            Text("Your Markdown and images in one editable file.", style = MaterialTheme.typography.titleMedium)
+            Text("Reopen it in Super MD to edit, drop in images, or select an image to replace or remove it. Source mode shows Markdown, never image bytes.", style = MaterialTheme.typography.bodyMedium, modifier = Modifier.padding(top = 12.dp))
+        }
+        Button(onClick = { export(format) }, shapes = ButtonDefaults.shapes(), modifier = Modifier.fillMaxWidth().padding(top = 20.dp, bottom = 28.dp)) { Icon(Icons.Rounded.IosShare, null); Text("Choose destination & export", Modifier.padding(start = 8.dp)) }
     }
+}
+
+@Composable private fun ZoomDialog(value: Float, dismiss: () -> Unit, apply: (Float) -> Unit) {
+    var draft by rememberSaveable { mutableStateOf(value.toInt().toString()) }
+    val parsed = draft.trim().removeSuffix("%").toFloatOrNull()
+    val valid = parsed != null && parsed.isFinite() && parsed in 60f..240f
+    AlertDialog(onDismissRequest = dismiss, title = { Text("Content zoom") }, text = { Column {
+        OutlinedTextField(value = draft, onValueChange = { draft = it }, label = { Text("Zoom percentage") }, suffix = { Text("%") }, singleLine = true, keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Decimal), isError = !valid, supportingText = { Text("60% to 240%. Toolbars stay the same size.") })
+        TextButton(onClick = { draft = "100" }) { Text("Reset to 100%") }
+    } }, confirmButton = { TextButton(onClick = { parsed?.let(apply) }, enabled = valid) { Text("Apply") } }, dismissButton = { TextButton(onClick = dismiss) { Text("Cancel") } })
 }

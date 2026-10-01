@@ -101,7 +101,10 @@ class StudioUiTest {
             javascriptUntil("document.querySelector('.android-source').getBoundingClientRect().right <= document.querySelector('.android-reading').getBoundingClientRect().left") { it == "true" }
             compose.onNodeWithText("Read", useUnmergedTree = true).performClick()
         }
-        compose.onNodeWithContentDescription("Export PDF").performClick()
+        compose.onNodeWithContentDescription("Export").performClick()
         compose.onNodeWithText("Page numbers").assertExists()
+        compose.onNodeWithText("Portable FMD", useUnmergedTree = true).performClick()
+        compose.onNodeWithText("Your Markdown and images in one editable file.").assertExists()
+        compose.onNodeWithText("Page numbers").assertDoesNotExist()
     }
 }

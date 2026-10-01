@@ -35,17 +35,17 @@ describe("workspace zoom modes", () => {
     const workspace = host.querySelector(".workspace")!;
     const topbar = host.querySelector(".topbar")!;
     await act(async () => { workspace.dispatchEvent(new WheelEvent("wheel", { ctrlKey: true, deltaY: -90, bubbles: true, cancelable: true })); });
-    expect(host.querySelector(".zoom-value")?.textContent).toBe("115%");
+    expect(host.querySelector<HTMLInputElement>('.zoom-entry input')?.value).toBe("115");
     expect(topbar.getAttribute("style")).toBeNull();
 
     await act(async () => { window.dispatchEvent(new KeyboardEvent("keydown", { key: "F11", bubbles: true })); });
     expect(document.documentElement.dataset.fullscreen).toBe("true");
-    expect(host.querySelector(".fullscreen-controls")?.textContent).toContain("100%");
+    expect(host.querySelector<HTMLInputElement>('.fullscreen-controls input')?.value).toBe("100");
     await act(async () => { window.dispatchEvent(new KeyboardEvent("keydown", { key: "+", code: "Equal", ctrlKey: true, bubbles: true, cancelable: true })); });
-    expect(host.querySelector(".fullscreen-controls")?.textContent).toContain("110%");
+    expect(host.querySelector<HTMLInputElement>('.fullscreen-controls input')?.value).toBe("110");
 
     await act(async () => { window.dispatchEvent(new KeyboardEvent("keydown", { key: "F11", bubbles: true })); });
     expect(document.documentElement.dataset.fullscreen).toBe("false");
-    expect(host.querySelector(".zoom-value")?.textContent).toBe("115%");
+    expect(host.querySelector<HTMLInputElement>('.zoom-entry input')?.value).toBe("115");
   });
 });

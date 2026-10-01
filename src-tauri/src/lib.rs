@@ -124,11 +124,12 @@ struct ChartSlider {
 
 #[cfg(not(target_os = "android"))]
 #[tauri::command]
-fn open_document() -> Result<Option<Document>, String> {
-    let path = rfd::FileDialog::new()
+async fn open_document() -> Result<Option<Document>, String> {
+    let path = rfd::AsyncFileDialog::new()
         .add_filter("Super Markdown", &["smd", "md", "markdown", "fmd"])
-        .pick_file();
-    path.map(read_document).transpose().map_err(display_error)
+        .pick_file().await;
+    tauri::async_runtime::spawn_blocking(move || path.map(|file| read_document(file.path().to_path_buf())).transpose().map_err(display_error))
+        .await.map_err(|e| e.to_string())?
 }
 
 #[cfg(target_os = "android")]
@@ -154,19 +155,25 @@ fn read_document(path: PathBuf) -> Result<Document> {
 
 #[cfg(not(target_os = "android"))]
 #[tauri::command]
-fn save_document(request: SaveRequest) -> Result<Option<String>, String> {
-    let path = match request.path {
+async fn save_document(request: SaveRequest) -> Result<Option<String>, String> {
+    let path = match request.path.clone() {
         Some(path) => PathBuf::from(path),
-        None => match rfd::FileDialog::new()
+        None => match rfd::AsyncFileDialog::new()
             .add_filter("Super Markdown", &["smd"])
             .add_filter("Markdown", &["md"])
             .set_file_name("notes.smd")
-            .save_file()
+            .save_file().await
         {
-            Some(path) => path,
+            Some(path) => path.path().to_path_buf(),
             None => return Ok(None),
         },
     };
+    tauri::async_runtime::spawn_blocking(move || save_document_inner(request, path))
+        .await.map_err(|e| e.to_string())?
+}
+
+#[cfg(not(target_os = "android"))]
+fn save_document_inner(request: SaveRequest, path: PathBuf) -> Result<Option<String>, String> {
     let portable = path.extension().is_some_and(|e| e.eq_ignore_ascii_case("fmd"));
     let content = if portable {
         let mut assets = request.assets;
@@ -225,7 +232,10 @@ fn atomic_write(path: &Path, bytes: &[u8]) -> Result<()> {
 struct DirectoryEntry { name: String, path: String, directory: bool }
 
 #[tauri::command]
-fn read_directory_children(root: String, path: String) -> Result<Vec<DirectoryEntry>, String> {
+async fn read_directory_children(root: String, path: String) -> Result<Vec<DirectoryEntry>, String> {
+    tauri::async_runtime::spawn_blocking(move || read_directory_children_inner(root, path)).await.map_err(|e| e.to_string())?
+}
+fn read_directory_children_inner(root: String, path: String) -> Result<Vec<DirectoryEntry>, String> {
     let root = PathBuf::from(root).canonicalize().map_err(display_error)?;
     let path = PathBuf::from(path).canonicalize().map_err(display_error)?;
     if !path.starts_with(&root) { return Err("Folder is outside the selected workspace".into()); }
@@ -246,8 +256,8 @@ fn read_directory_children(root: String, path: String) -> Result<Vec<DirectoryEn
 
 #[cfg(not(target_os = "android"))]
 #[tauri::command]
-fn open_workspace_folder() -> Option<String> {
-    rfd::FileDialog::new().set_title("Open any folder").pick_folder().map(|p| p.to_string_lossy().into_owned())
+async fn open_workspace_folder() -> Option<String> {
+    rfd::AsyncFileDialog::new().set_title("Open any folder").pick_folder().await.map(|p| p.path().to_string_lossy().into_owned())
 }
 
 #[cfg(target_os = "android")]
@@ -255,11 +265,10 @@ fn open_workspace_folder() -> Option<String> {
 fn open_workspace_folder() -> Option<String> { None }
 
 #[tauri::command]
-fn startup_document(path: tauri::State<'_, Option<String>>) -> Result<Option<Document>, String> {
-    path.as_ref()
-        .map(|value| read_document(PathBuf::from(value)))
-        .transpose()
-        .map_err(display_error)
+async fn startup_document(path: tauri::State<'_, Option<String>>) -> Result<Option<Document>, String> {
+    let path = path.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || path.map(|value| read_document(PathBuf::from(value))).transpose().map_err(display_error))
+        .await.map_err(|e| e.to_string())?
 }
 
 fn draft_filename(label: &str) -> Result<String, String> {
@@ -405,11 +414,11 @@ fn load_asset_inner(document_path: String, source: String) -> Result<String, Str
 
 #[cfg(not(target_os = "android"))]
 #[tauri::command]
-fn choose_python() -> Option<String> {
-    rfd::FileDialog::new()
+async fn choose_python() -> Option<String> {
+    rfd::AsyncFileDialog::new()
         .set_title("Choose Python interpreter")
-        .pick_file()
-        .map(|path| path.to_string_lossy().into_owned())
+        .pick_file().await
+        .map(|path| path.path().to_string_lossy().into_owned())
 }
 
 #[cfg(target_os = "android")]
@@ -425,8 +434,9 @@ fn detect_python() -> Option<String> {
 }
 
 #[tauri::command]
-fn run_python(python: String, code: String) -> Result<PythonResult, String> {
-    run_python_inner(&python, &code).map_err(display_error)
+async fn run_python(python: String, code: String) -> Result<PythonResult, String> {
+    tauri::async_runtime::spawn_blocking(move || run_python_inner(&python, &code).map_err(display_error))
+        .await.map_err(|e| e.to_string())?
 }
 
 fn run_python_inner(python: &str, code: &str) -> Result<PythonResult> {
@@ -455,7 +465,7 @@ fn run_python_inner(python: &str, code: &str) -> Result<PythonResult> {
 
 #[cfg(not(target_os = "android"))]
 #[tauri::command]
-fn export_pdf(
+async fn export_pdf(
     path: Option<String>,
     content: String,
     options: ExportOptions,
@@ -469,18 +479,19 @@ fn export_pdf(
         .unwrap_or_else(|| "notes.pdf".into());
     let output = match options.output.clone() {
         Some(output) => PathBuf::from(output),
-        None => match rfd::FileDialog::new()
+        None => match rfd::AsyncFileDialog::new()
             .add_filter("PDF document", &["pdf"])
             .set_file_name(&suggested)
-            .save_file()
+            .save_file().await
         {
-            Some(path) => path,
+            Some(path) => path.path().to_path_buf(),
             None => return Ok(None),
         },
     };
-    export_pdf_inner(path.as_deref().map(Path::new), &content, &output, &options)
-        .map_err(display_error)?;
-    Ok(Some(output.to_string_lossy().into_owned()))
+    tauri::async_runtime::spawn_blocking(move || {
+        export_pdf_inner(path.as_deref().map(Path::new), &content, &output, &options).map_err(display_error)?;
+        Ok(Some(output.to_string_lossy().into_owned()))
+    }).await.map_err(|e| e.to_string())?
 }
 
 #[cfg(target_os = "android")]

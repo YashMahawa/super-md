@@ -9,6 +9,7 @@ import { visit } from "unist-util-visit";
 import InteractiveChart from "./InteractiveChart";
 import PythonCell from "./PythonCell";
 import SvgDiagram from "./SvgDiagram";
+import { remarkObsidianMath } from "../obsidianMath";
 
 const MermaidDiagram = lazy(() => import("./MermaidDiagram"));
 
@@ -73,6 +74,7 @@ function AssetImage({ src = "", alt = "", documentPath, trustedImageHosts, onTru
   const [allowOnce, setAllowOnce] = useState(false);
   const [resolved, setResolved] = useState(embedded ? src : "");
   const [error, setError] = useState("");
+  const [selected, setSelected] = useState(false);
   useEffect(() => {
     let active = true;
     setError("");
@@ -88,7 +90,10 @@ function AssetImage({ src = "", alt = "", documentPath, trustedImageHosts, onTru
   if (isRemote && !allowOnce && !trustedImageHosts.includes(host)) return <span className="remote-image-card" role="group" aria-label={`Remote image from ${host}`}><span><strong>{alt || "Remote image"}</strong><small>{host} · blocked until you choose to load it</small></span><span className="remote-image-actions"><button onClick={() => setAllowOnce(true)}>Load image</button><button onClick={() => onTrustImageHost?.(host)}>Trust domain</button></span></span>;
   if (error) return <span className="image-error" role="img" aria-label={alt || "Image unavailable"}>Image unavailable: {alt || src}<small>{error}</small></span>;
   if (!resolved) return <span className="image-loading" role="status">Loading image…</span>;
-  return <img src={resolved} alt={alt} loading="lazy" onError={() => setError("The image could not be decoded or loaded.")} />;
+  return <span className={`note-image ${selected ? "is-selected" : ""}`} data-note-image-source={src} tabIndex={0} aria-label={`Image controls: ${alt || "Image"}`} onFocus={() => setSelected(true)} onBlur={(event) => { if (!event.currentTarget.contains(event.relatedTarget)) setSelected(false); }} onClick={(event) => { event.stopPropagation(); setSelected(true); event.currentTarget.focus(); }} onKeyDown={(event) => { if (event.key === "Escape") { setSelected(false); event.stopPropagation(); } }}>
+    <img src={resolved} alt={alt} loading="lazy" onError={() => setError("The image could not be decoded or loaded.")} />
+    {selected && <span className="image-edit-tools" role="toolbar" aria-label="Selected image"><button onClick={(event) => { event.stopPropagation(); window.dispatchEvent(new CustomEvent("supermd-image-edit", { detail: { action: "replace", image: event.currentTarget.closest("[data-note-image-source]") } })); }}>Replace</button><button onClick={(event) => { event.stopPropagation(); window.dispatchEvent(new CustomEvent("supermd-image-edit", { detail: { action: "remove", image: event.currentTarget.closest("[data-note-image-source]") } })); }}>Remove</button></span>}
+  </span>;
 }
 
 interface Props {
@@ -106,7 +111,7 @@ function MarkdownPreview({ markdown, documentPath, python, dark, trustedImageHos
     <article className="markdown-body">
       <ReactMarkdown
         urlTransform={(url, key, node) => node.tagName === "img" && key === "src" && /^data:image\/(?:png|jpeg|gif|webp|avif|svg\+xml);base64,/i.test(url) ? url : defaultUrlTransform(url)}
-        remarkPlugins={[remarkGfm, remarkMath, remarkCallouts]}
+        remarkPlugins={[remarkGfm, remarkMath, remarkObsidianMath, remarkCallouts]}
         rehypePlugins={[rehypeKatex, rehypeHighlight]}
         components={{
           img: ({ src, alt }) => <AssetImage src={src} alt={alt} documentPath={documentPath} trustedImageHosts={trustedImageHosts} onTrustImageHost={onTrustImageHost} />,

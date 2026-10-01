@@ -124,7 +124,13 @@ impl<'a> Renderer<'a> {
                         },
                         Tag::TableHead => { out.push_str("table.header("); out.push_str(&self.render(Some(close))?); out.push_str("),\n"); },
                         Tag::TableRow => out.push_str(&self.render(Some(close))?),
-                        Tag::TableCell => { out.push_str("[#show math.equation: it => smd-fit(it)\n"); out.push_str(&self.render(Some(close))?); out.push_str("],\n"); },
+                        Tag::TableCell => {
+                            // Fit only over-wide equations. A layout wrapper on
+                            // *each* inline equation creates block-level breaks
+                            // and inflates mixed prose/math cells unnecessarily.
+                            out.push_str("[#layout(cell => { show math.equation: it => { let w = measure(it).width; if w > cell.width { let factor = cell.width / w; scale(x: factor * 100%, y: factor * 100%, reflow: true, it) } else { it } }; [");
+                            out.push_str(&self.render(Some(close))?); out.push_str("] })],\n");
+                        },
                         Tag::FootnoteDefinition(name) => { let body = self.render(Some(close))?; self.footnotes.insert(name.to_string(), body); },
                         Tag::BlockQuote(_) => {
                             // CommonMark may split literal brackets into several
@@ -180,7 +186,10 @@ pub fn source(markdown: &str, options: &PdfOptions, assets: &HashMap<String, Vec
     renderer.footnotes = definitions.footnotes;
     let body = renderer.render(None)?;
     let template = if options.page_numbers { include_str!("document.typ").to_string() } else { include_str!("document.typ").lines().filter(|line| !line.starts_with("#set page(footer:")).collect::<Vec<_>>().join("\n") };
-    Ok(format!("#import \"/mitex/standard.typ\": scope as smd-math-scope\n#set page(paper: {}, margin: {}mm)\n#set text(font: ({}, \"Libertinus Serif\", \"New Computer Modern\"), size: {}pt)\n#set par(leading: {}em)\n{template}\n{body}", string(&options.page_size), options.margin, string(&options.font_family), options.font_size, options.line_height - 0.7))
+    // MiTeX's bundled conversion spec still emits Typst's former `sect`
+    // intersection name. Typst 0.15 calls it `inter`. Scope aliases preserve
+    // equations without rewriting user TeX or changing the section symbol.
+    Ok(format!("#import \"/mitex/standard.typ\": scope as mitex-scope\n#let smd-math-scope = mitex-scope + (sect: sym.inter,)\n#set page(paper: {}, margin: {}mm)\n#set text(font: ({}, \"Libertinus Serif\", \"New Computer Modern\"), size: {}pt)\n#set par(leading: {}em)\n{template}\n{body}", string(&options.page_size), options.margin, string(&options.font_family), options.font_size, options.line_height - 0.7))
 }
 
 pub fn export(markdown: &str, options: &PdfOptions, assets: &HashMap<String, Vec<u8>>) -> Result<Vec<u8>> {
@@ -239,6 +248,25 @@ pub extern "system" fn Java_dev_supermd_studio_PdfEngine_export(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn obsidian_probability_equations_export_with_following_content() {
+        let md = r"$$\boxed{\begin{aligned}
+P(A\cup B\cup C)=&P(A)+P(B)+P(C)\\
+&-P(A\cap B)-P(A\cap C)-P(B\cap C)\\
+&+P(A\cap B\cap C).
+\end{aligned}}$$
+
+## AFTER-EQUATION
+
+> [!TIP] TIP-AFTER-EQUATION
+> $P(A\cap B) \le \min(P(A),P(B))$
+";
+        let bytes = export(md, &PdfOptions::default(), &HashMap::new()).unwrap();
+        assert!(bytes.starts_with(b"%PDF-"));
+        let rendered = source(md, &PdfOptions::default(), &HashMap::new()).unwrap();
+        assert!(rendered.contains("#text(\"AFTER-EQUATION\")"));
+        assert!(rendered.contains("#text(\"TIP-AFTER-EQUATION\")"));
+    }
     #[test]
     fn callouts_match_split_bracket_events() {
         for md in ["> [!TIP] Learn\n> Try it first.\n", "> \\[!TIP] Learn\n> Try it first.\n"] {

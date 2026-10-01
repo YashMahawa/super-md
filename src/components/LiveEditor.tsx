@@ -1,5 +1,6 @@
-import { useEffect, useState } from "react";
+import { useEffect, useMemo, useState } from "react";
 import MarkdownPreview from "./MarkdownPreview";
+const noTrustedHosts: string[] = [];
 
 export interface SourceBlock { start: number; end: number; text: string }
 
@@ -21,7 +22,8 @@ export function splitMarkdownBlocks(markdown: string): SourceBlock[] {
     } else if (!fence) {
       if (/^:::callout\b/.test(trimmed)) callout = true;
       else if (trimmed === ":::") callout = false;
-      if (trimmed === "$$") math = !math;
+      if (math && trimmed.endsWith("$$")) math = false;
+      else if (trimmed.startsWith("$$") && !trimmed.slice(2).includes("$$")) math = true;
     }
     offset += line.length;
     if (!trimmed && !fence && !callout && !math && offset > start) {
@@ -43,10 +45,13 @@ interface Props {
   onTrustImageHost?: (host: string) => void;
 }
 
-export default function LiveEditor({ markdown, onChange, documentPath, python, dark, trustedImageHosts = [], onTrustImageHost }: Props) {
+export default function LiveEditor({ markdown, onChange, documentPath, python, dark, trustedImageHosts = noTrustedHosts, onTrustImageHost }: Props) {
   const [editing, setEditing] = useState<{ prefix: string; text: string; suffix: string } | null>(null);
+  const blocks = useMemo(() => splitMarkdownBlocks(markdown), [markdown]);
+  const before = useMemo(() => editing ? splitMarkdownBlocks(editing.prefix).filter((block) => block.text.trim()) : [], [editing?.prefix]);
+  const after = useMemo(() => editing ? splitMarkdownBlocks(editing.suffix).filter((block) => block.text.trim()) : [], [editing?.suffix]);
   useEffect(() => { if (editing && markdown !== editing.prefix + editing.text + editing.suffix) setEditing(null); }, [markdown, editing]);
-  const renderBlock = (block: SourceBlock, index: number, base = 0) => <section className="live-block" data-source-end={base + block.end} key={`${base + block.start}-${index}`} tabIndex={0} role="group" aria-label={`Editable block ${index + 1}`} onClick={(event) => {
+  const renderBlock = (block: SourceBlock, index: number, base = 0) => <section className="live-block" data-source-start={base + block.start} data-source-end={base + block.end} key={`${base + block.start}-${index}`} tabIndex={0} role="group" aria-label={`Editable block ${index + 1}`} onClick={(event) => {
     if ((event.target as Element).closest("a,button,input,select,textarea,.interactive-chart") || window.getSelection()?.toString()) return;
     setEditing({ prefix: markdown.slice(0, base + block.start), text: block.text, suffix: markdown.slice(base + block.end) });
   }} onKeyDown={(event) => {
@@ -55,8 +60,6 @@ export default function LiveEditor({ markdown, onChange, documentPath, python, d
     <MarkdownPreview markdown={block.text} documentPath={documentPath} python={python} dark={dark} trustedImageHosts={trustedImageHosts} onTrustImageHost={onTrustImageHost} />
   </section>;
   if (editing) {
-    const before = splitMarkdownBlocks(editing.prefix).filter((block) => block.text.trim());
-    const after = splitMarkdownBlocks(editing.suffix).filter((block) => block.text.trim());
     return <div className="live-document">
       {before.map((block, index) => renderBlock(block, index))}
       <div className="live-active-block"><textarea autoFocus data-source-start={editing.prefix.length} spellCheck={false} value={editing.text} style={{ minHeight: Math.max(120, editing.text.split("\n").length * 27 + 32) }} onChange={(event) => {
@@ -67,5 +70,5 @@ export default function LiveEditor({ markdown, onChange, documentPath, python, d
       {after.map((block, index) => renderBlock(block, index, editing.prefix.length + editing.text.length))}
     </div>;
   }
-  return <div className="live-document">{splitMarkdownBlocks(markdown).map((block, index) => renderBlock(block, index))}</div>;
+  return <div className="live-document">{blocks.map((block, index) => renderBlock(block, index))}</div>;
 }

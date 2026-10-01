@@ -33,6 +33,7 @@ jobs:
           workspaces: ./src-tauri -> target
       - run: npm ci
       - run: npm run build
+      - run: node --test scripts/release-guards.test.mjs
       - run: npm test
       - run: npm run test:pdf
 

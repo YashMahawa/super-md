@@ -1,15 +1,70 @@
-name: Desktop releases
+name: Publish releases
 
 on:
   push:
     tags: ["v*"]
   workflow_dispatch:
+    inputs:
+      tag:
+        description: Existing stable version tag to publish
+        required: true
+        type: string
 
 permissions:
   contents: write
+  actions: read
+
+concurrency:
+  group: release-${{ inputs.tag || github.ref_name }}
+  cancel-in-progress: false
+
+env:
+  RELEASE_TAG: ${{ inputs.tag || github.ref_name }}
+  GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
 jobs:
-  release:
+  prepare:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 20
+    outputs:
+      release_id: ${{ steps.draft.outputs.release_id }}
+      version: ${{ steps.version.outputs.version }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ env.RELEASE_TAG }}
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - name: Validate tag and all application versions
+        id: version
+        run: echo "version=$(node scripts/release-guards.mjs versions "$RELEASE_TAG")" >> "$GITHUB_OUTPUT"
+      - run: node --test scripts/release-guards.test.mjs
+      - name: Require successful CI on this exact commit
+        run: |
+          node --input-type=module <<'NODE'
+          import { execFileSync } from 'node:child_process';
+          const sha = execFileSync('git', ['rev-parse', 'HEAD'], {encoding:'utf8'}).trim();
+          for (let attempt = 0; attempt < 45; attempt++) {
+            const runs = JSON.parse(execFileSync('gh', ['run','list','--repo',process.env.GITHUB_REPOSITORY,'--workflow','ci.yml','--commit',sha,'--json','status,conclusion'],{encoding:'utf8'}));
+            if (runs.some(run => run.status === 'completed' && run.conclusion === 'success')) process.exit(0);
+            if (runs.some(run => run.status === 'completed' && run.conclusion !== 'success')) throw Error('CI failed on the release commit');
+            await new Promise(resolve => setTimeout(resolve, 20000));
+          }
+          throw Error('No successful CI run found for the release commit');
+          NODE
+      - name: Create or reuse a protected draft
+        id: draft
+        run: |
+          if gh release view "$RELEASE_TAG" --json isDraft > "$RUNNER_TEMP/release.json"; then
+            node -e 'if (!JSON.parse(require("fs").readFileSync(process.argv[1])).isDraft) throw Error("Refusing to alter an already published release")' "$RUNNER_TEMP/release.json"
+          else
+            gh release create "$RELEASE_TAG" --verify-tag --draft --title "Super MD $RELEASE_TAG" --notes-file RELEASE_NOTES.md
+          fi
+          echo "release_id=$(gh api "repos/$GITHUB_REPOSITORY/releases/tags/$RELEASE_TAG" --jq .id)" >> "$GITHUB_OUTPUT"
+
+  desktop:
+    needs: prepare
     strategy:
       fail-fast: false
       matrix:
@@ -25,6 +80,8 @@ jobs:
     runs-on: ${{ matrix.platform }}
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ env.RELEASE_TAG }}
       - name: Install Linux build dependencies
         if: matrix.platform == 'ubuntu-22.04'
         run: |
@@ -49,9 +106,111 @@ jobs:
           NO_STRIP: "1"
           APPLE_SIGNING_IDENTITY: "-"
         with:
-          tagName: v__VERSION__
-          releaseName: Super MD v__VERSION__
-          releaseBody: Desktop packages for Linux, macOS, and Windows. Offline PDF typesetting is embedded; no Pandoc or Typst installation is needed.
+          releaseId: ${{ needs.prepare.outputs.release_id }}
+          tagName: ${{ env.RELEASE_TAG }}
+          releaseName: Super MD ${{ env.RELEASE_TAG }}
           releaseDraft: true
           prerelease: false
           args: ${{ matrix.args }}
+
+  android:
+    needs: prepare
+    runs-on: ubuntu-22.04
+    timeout-minutes: 45
+    env:
+      ANDROID_CERT_SHA256: ${{ vars.ANDROID_CERT_SHA256 }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ env.RELEASE_TAG }}
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 17
+      - uses: android-actions/setup-android@v4
+        with:
+          log-accepted-android-sdk-licenses: false
+      - run: sdkmanager "build-tools;36.0.0"
+      - name: Select safe signing route
+        id: signing
+        env:
+          KEYSTORE_BASE64: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}
+        run: |
+          if [ -n "$KEYSTORE_BASE64" ]; then
+            printf '%s' "$KEYSTORE_BASE64" | base64 --decode > "$RUNNER_TEMP/supermd-distribution.jks"
+            echo "SUPERMD_KEYSTORE=$RUNNER_TEMP/supermd-distribution.jks" >> "$GITHUB_ENV"
+            echo 'build=true' >> "$GITHUB_OUTPUT"
+          else
+            echo 'build=false' >> "$GITHUB_OUTPUT"
+            echo 'No CI signing secret: requiring the locally signed release APK in this draft.'
+          fi
+      - uses: actions/setup-python@v5
+        if: steps.signing.outputs.build == 'true'
+        with:
+          python-version: '3.13'
+      - uses: dtolnay/rust-toolchain@stable
+        if: steps.signing.outputs.build == 'true'
+        with:
+          targets: aarch64-linux-android
+      - uses: swatinem/rust-cache@v2
+        if: steps.signing.outputs.build == 'true'
+        with:
+          workspaces: ./smd-core -> target
+      - name: Build signed release variant
+        if: steps.signing.outputs.build == 'true'
+        env:
+          SUPERMD_STORE_PASSWORD: ${{ secrets.ANDROID_STORE_PASSWORD }}
+          SUPERMD_KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
+          SUPERMD_KEY_PASSWORD: ${{ secrets.ANDROID_KEY_PASSWORD }}
+        run: |
+          sdkmanager "platforms;android-37.0" "ndk;27.1.12297006"
+          export SUPERMD_BUILD_PYTHON="$(command -v python)"
+          npm ci
+          npm run android:release
+          cp android/app/build/outputs/apk/release/app-release.apk "$RUNNER_TEMP/Super-MD-${{ needs.prepare.outputs.version }}-arm64-release.apk"
+      - name: Require locally signed APK when CI signing is not configured
+        if: steps.signing.outputs.build != 'true'
+        run: |
+          apk_name="Super-MD-${{ needs.prepare.outputs.version }}-arm64-release.apk"
+          found=false
+          for attempt in $(seq 1 40); do
+            if gh release download "$RELEASE_TAG" --pattern "$apk_name" --dir "$RUNNER_TEMP" --clobber; then found=true; break; fi
+            sleep 15
+          done
+          if [ "$found" != true ]; then echo 'Missing signed release APK. Draft stays unpublished.' >&2; exit 1; fi
+      - name: Verify signing, variant, alignment and tagged source identity
+        run: bash scripts/verify-release-apk.sh "$RUNNER_TEMP/Super-MD-${{ needs.prepare.outputs.version }}-arm64-release.apk" "${{ needs.prepare.outputs.version }}" "$(git rev-parse HEAD)"
+      - name: Attach verified APK to draft
+        if: steps.signing.outputs.build == 'true'
+        run: gh release upload "$RELEASE_TAG" "$RUNNER_TEMP/Super-MD-${{ needs.prepare.outputs.version }}-arm64-release.apk" --clobber
+
+  publish:
+    needs: [prepare, desktop, android]
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ env.RELEASE_TAG }}
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - name: Require complete installers and create package checksums
+        run: |
+          gh api "repos/$GITHUB_REPOSITORY/releases/tags/$RELEASE_TAG" --jq .assets > "$RUNNER_TEMP/assets.json"
+          node scripts/release-guards.mjs assets "$RELEASE_TAG" "$RUNNER_TEMP/assets.json"
+          mkdir "$RUNNER_TEMP/packages"
+          gh release download "$RELEASE_TAG" --dir "$RUNNER_TEMP/packages"
+          cd "$RUNNER_TEMP/packages"
+          for package in *; do
+            if [ "$package" != SHA256SUMS ]; then sha256sum "$package"; fi
+          done > "$RUNNER_TEMP/SHA256SUMS"
+          gh release upload "$RELEASE_TAG" "$RUNNER_TEMP/SHA256SUMS" --clobber
+      - name: Publish only after all verified builds succeed
+        run: |
+          gh release edit "$RELEASE_TAG" --draft=false --latest --notes-file RELEASE_NOTES.md
+          gh release view "$RELEASE_TAG" --json isDraft,url,assets > "$RUNNER_TEMP/public.json"
+          node -e 'const release=JSON.parse(require("fs").readFileSync(process.argv[1])); if(release.isDraft || !release.assets.some(a=>a.name==="SHA256SUMS")) throw Error("Publication verification failed"); console.log(release.url)' "$RUNNER_TEMP/public.json"

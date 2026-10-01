@@ -12,6 +12,14 @@ import java.io.File
 
 @RunWith(AndroidJUnit4::class)
 class EngineTest {
+    @Test fun obsidianSameLineProbabilityMathExportsOnDevice() {
+        val app = ApplicationProvider.getApplicationContext<android.app.Application>()
+        val md = "${'$'}${'$'}\\boxed{\\begin{aligned}\nP(A\\cup B)=&P(A)+P(B)\\\\\n&-P(A\\cap B).\n\\end{aligned}}${'$'}${'$'}\n\n## After the equation\n\n> [!TIP] Still present\n> ${'$'}P(A\\cap B)\\le1${'$'}\n"
+        val assets = File(app.cacheDir, "probability-assets").apply { mkdirs() }
+        val pdf = File(app.cacheDir, "probability.pdf")
+        assertEquals("", PdfEngine.export(md, StudioState().pdf, assets.absolutePath, pdf.absolutePath))
+        PdfRenderer(ParcelFileDescriptor.open(pdf, ParcelFileDescriptor.MODE_READ_ONLY)).use { assertTrue(it.pageCount > 0) }
+    }
     @Test fun largePortableStringsCrossReaderBufferBoundaries() {
         val app = ApplicationProvider.getApplicationContext<android.app.Application>(); val media = MediaStorage(app)
         val markdown = sample + "\n\n" + "Unicode λ and escaped quotes \"remain editable\".\n".repeat(200)

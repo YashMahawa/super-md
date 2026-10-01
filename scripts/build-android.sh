@@ -17,6 +17,12 @@ nice -n 10 taskset -c "$build_cpus" cargo rustc --locked --release --target aarc
 mkdir -p android/app/src/main/jniLibs/arm64-v8a android/app/src/main/assets/web
 cp smd-core/target/aarch64-linux-android/release/libsmd_core.so android/app/src/main/jniLibs/arm64-v8a/
 rsync -a --delete dist/ android/app/src/main/assets/web/
+node --input-type=module <<'NODE'
+import { writeFileSync, readFileSync } from 'node:fs';
+import { execFileSync } from 'node:child_process';
+const git = (...args) => execFileSync('git', args, { encoding: 'utf8' }).trim();
+writeFileSync('android/app/src/main/assets/web/build-info.json', JSON.stringify({ version: JSON.parse(readFileSync('package.json')).version, commit: git('rev-parse', 'HEAD'), dirty: git('status', '--porcelain').length > 0 }));
+NODE
 cd android
 ./gradlew --stop
 nice -n 10 taskset -c "$build_cpus" ./gradlew --no-daemon --max-workers=2 :app:testDebugUnitTest :app:lintRelease :app:assembleRelease

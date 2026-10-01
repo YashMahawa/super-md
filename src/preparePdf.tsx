@@ -11,12 +11,13 @@ import { invoke } from "./nativeBridge";
 import { renderMermaid } from "./mermaidRenderer";
 import { pythonResults } from "./renderedOutputs";
 import { svgImage } from "./svgImage";
+import { remarkObsidianMath } from "./obsidianMath";
 
 function data(blob: Blob): Promise<string> {
   return new Promise((resolve, reject) => { const reader = new FileReader(); reader.onload = () => resolve(String(reader.result)); reader.onerror = () => reject(reader.error); reader.readAsDataURL(blob); });
 }
 export async function preparePdf(markdown: string, documentPath: string | null) {
-  const processor = unified().use(remarkParse).use(remarkGfm).use(remarkMath).use(remarkStringify);
+  const processor = unified().use(remarkParse).use(remarkGfm).use(remarkMath).use(remarkObsidianMath).use(remarkStringify);
   const tree = processor.parse(normalizeCallouts(markdown));
   const work: Promise<void>[] = []; const assets: Record<string, string> = {}; let count = 0;
   const add = (url: string, name: string) => { assets[name] = url.slice(url.indexOf(",") + 1); return name; };

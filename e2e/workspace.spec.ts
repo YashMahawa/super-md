@@ -1,5 +1,5 @@
 import { expect, test } from "@playwright/test";
-import { mkdir, writeFile } from "node:fs/promises";
+import { mkdir, readFile, writeFile } from "node:fs/promises";
 import { dirname, join } from "node:path";
 
 test.beforeEach(async ({ page }) => { await page.addInitScript(() => localStorage.setItem("setup.complete", "true")); });
@@ -80,6 +80,14 @@ test("click-to-edit, media drops, titled links and portable source work together
   await page.evaluate((content) => window.supermdLoad?.({ id: "media-note", content, path: "media-note", mode: "reader", dark: false, fullscreen: false, colors: {}, font: "sans", size: 17, zoom: 100 }), current);
   await page.evaluate(() => { const transfer = new DataTransfer(); transfer.items.add(new File(['<svg xmlns="http://www.w3.org/2000/svg" width="40" height="40"><path d="M0 0L40 40" stroke="red"/></svg>'], "Dropped.svg", { type: "image/svg+xml" })); document.querySelector('.android-reading')!.dispatchEvent(new DragEvent("drop", { dataTransfer: transfer, bubbles: true, cancelable: true })); });
   await expect(page.getByRole("img", { name: "Dropped.svg" })).toBeVisible();
+  // Contextual tools only appear on selection; removal is reversible and
+  // changes editable Markdown rather than an opaque portable envelope.
+  await expect(page.getByRole("button", { name: "Remove", exact: true })).toHaveCount(0);
+  await page.getByRole("img", { name: "Dropped.svg" }).click();
+  await page.getByRole("button", { name: "Remove", exact: true }).click();
+  await expect(page.getByRole("img", { name: "Dropped.svg" })).toHaveCount(0);
+  await page.getByRole("button", { name: "Undo", exact: true }).click();
+  await expect(page.getByRole("img", { name: "Dropped.svg" })).toBeVisible();
   await page.evaluate(() => window.supermdPortable?.(false));
   await expect.poll(() => calls.some((call) => call.command === "export_fmd_native")).toBeTruthy();
   const bundle = calls.find((call) => call.command === "export_fmd_native")!.args;
@@ -90,4 +98,74 @@ test("click-to-edit, media drops, titled links and portable source work together
   const pdf = calls.find((call) => call.command === "export_pdf_native")!.args;
   expect(Object.keys(pdf.assets)).toHaveLength(3); expect(pdf.content).not.toContain("```svg");
   await page.screenshot({ path: test.info().outputPath("media-and-vectors.png") });
+});
+
+test("editable zoom and one export chooser work at desktop widths", async ({ page }) => {
+  await page.setViewportSize({ width: 1024, height: 768 }); await page.goto("/");
+  const zoom = page.getByRole("textbox", { name: "Zoom percentage", exact: true });
+  await zoom.fill("175"); await zoom.press("Enter"); await expect(zoom).toHaveValue("175");
+  const chromeHeight = await page.locator(".topbar").evaluate((node) => node.getBoundingClientRect().height);
+  await page.keyboard.press("F11");
+  await expect(page.locator(".fullscreen-controls input")).toHaveValue("100");
+  await page.locator(".fullscreen-controls input").fill("210"); await page.locator(".fullscreen-controls input").press("Enter");
+  await page.keyboard.press("F11"); await expect(zoom).toHaveValue("175");
+  expect(await page.locator(".topbar").evaluate((node) => node.getBoundingClientRect().height)).toBe(chromeHeight);
+  await page.getByRole("button", { name: "Export", exact: true }).click();
+  await expect(page.getByRole("heading", { name: "Export your note" })).toBeVisible();
+  await page.getByRole("button", { name: "Portable FMD", exact: true }).click();
+  await expect(page.getByText("One editable file", { exact: false })).toBeVisible();
+  await expect(page.getByLabel("Page numbers", { exact: true })).toHaveCount(0);
+  await page.getByRole("button", { name: "PDF document", exact: true }).click();
+  await expect(page.getByLabel("Page numbers", { exact: true })).toBeVisible();
+  await expect.poll(async () => page.locator('.export-format-indicator').evaluate((node) => Math.abs(node.getBoundingClientRect().left - node.parentElement!.querySelector('button')!.getBoundingClientRect().left))).toBeLessThan(4);
+  await page.screenshot({ path: test.info().outputPath("desktop-export.png") });
+  await page.getByRole("button", { name: "Close export settings" }).click();
+  await page.getByRole("button", { name: "Settings", exact: true }).click();
+  await expect(page.getByRole("slider", { name: "Reading size", exact: true })).toBeVisible();
+  await page.getByRole("slider", { name: "Reading size", exact: true }).focus(); await page.keyboard.press("ArrowRight");
+  await expect(page.getByText("Reading size (18px)", { exact: true })).toBeVisible();
+  await page.getByRole("switch", { name: "Expressive motion", exact: true }).click();
+  await expect(page.locator("html")).toHaveAttribute("data-reduce-motion", "true");
+  await expect(page.locator("smd-expressive-button.export-action")).toHaveAttribute("motion-off", "");
+  await expect(page.locator("smd-slider").first()).toHaveAttribute("motion-off", "");
+  expect(await page.getByRole("switch", { name: "Autosave", exact: true }).evaluate((node) => getComputedStyle(node).transitionDuration)).toBe("0s");
+  await page.screenshot({ path: test.info().outputPath("desktop-material-settings.png") });
+});
+
+test("Obsidian multiline display math preserves the full study document", async ({ page }) => {
+  const markdown = process.env.SUPERMD_OBSIDIAN_NOTE ? await readFile(process.env.SUPERMD_OBSIDIAN_NOTE, "utf8") : String.raw`# Probability
+
+$$\boxed{\begin{aligned}
+P(A\cup B)=&P(A)+P(B)\\
+&-P(A\cap B).
+\end{aligned}}$$
+
+**Proof:** Preserved explanation.
+
+> [!TIP] Learn
+> $$P(A\cap B)\le1$$
+
+## The rest of the document
+
+| Formula | Meaning |
+|---|---|
+| $P(A\cap B)$ | Both events |
+`;
+  const calls: Array<{ command: string; args: any }> = [];
+  await page.exposeFunction("bridgePost", (id: string, command: string, raw: string) => {
+    calls.push({ command, args: JSON.parse(raw) }); void page.evaluate((id) => window.supermdReply?.(id, true, null), id);
+  });
+  await page.addInitScript(() => { window.SuperMD = { post: (id, command, args) => (window as any).bridgePost(id, command, args) }; });
+  await page.goto('/android-reader.html');
+  const expectedHeadings = (markdown.match(/^#{1,6}\s/gm) || []).length;
+  for (const mode of ["reader", "live"] as const) {
+    await page.evaluate(({ content, mode }) => window.supermdLoad?.({ id: "math-note", content, mode, path: null, dark: false, fullscreen: false, colors: {}, font: "sans", size: 17, zoom: 100 }), { content: markdown, mode });
+    await expect(page.locator('.katex-display').first()).toBeVisible();
+    await expect(page.locator('.katex-error')).toHaveCount(0);
+    await expect(page.locator('.markdown-body h1,.markdown-body h2,.markdown-body h3,.markdown-body h4,.markdown-body h5,.markdown-body h6')).toHaveCount(expectedHeadings);
+    expect(await page.locator('.katex').count()).toBeGreaterThan(2);
+  }
+  await page.evaluate(() => window.supermdExport?.({ pageSize: "a4", margin: 18, fontSize: 11, fontFamily: "Libertinus Serif", lineHeight: 1.35, pageNumbers: false }));
+  await expect.poll(() => calls.some((call) => call.command === 'export_pdf_native')).toBeTruthy();
+  expect(calls.find((call) => call.command === 'export_failed')).toBeUndefined();
 });

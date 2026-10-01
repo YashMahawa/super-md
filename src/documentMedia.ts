@@ -4,12 +4,28 @@ import remarkGfm from "remark-gfm";
 import remarkMath from "remark-math";
 import { visit } from "unist-util-visit";
 import { invoke } from "./nativeBridge";
+import { remarkObsidianMath } from "./obsidianMath";
 
 export interface ImportedImage { source: string; alt: string }
 export interface LinkDetails { url: string; title: string; thumbnail?: string }
 export const attachmentSource = (source: string) => /^assets\/(?:import|image)-[a-zA-Z0-9-]+\.(?:png|jpg|jpeg|svg|gif|webp|avif)$/.test(source);
 export const markdownLabel = (value: string) => value.replace(/[\\[\]]/g, "\\$&").replace(/[\r\n]+/g, " ");
 export const imageMarkdown = (image: ImportedImage) => `![${markdownLabel(image.alt)}](<${image.source.replace(/>/g, "%3E")}>)`;
+export interface ImageRange { from: number; to: number; source: string }
+export function imageRanges(markdown: string): ImageRange[] {
+  const tree = unified().use(remarkParse).use(remarkGfm).use(remarkMath).use(remarkObsidianMath).parse(markdown);
+  const definitions = new Map<string, string>(); const result: ImageRange[] = [];
+  visit(tree, "definition", (node: any) => { definitions.set(node.identifier, node.url); });
+  visit(tree, (node: any) => {
+    const source = node.type === "image" ? node.url : node.type === "imageReference" ? definitions.get(node.identifier) : undefined;
+    if (source && node.position) result.push({ source, from: node.position.start.offset, to: node.position.end.offset });
+    if (node.type === "text" && node.position) {
+      const raw = markdown.slice(node.position.start.offset, node.position.end.offset);
+      for (const match of raw.matchAll(/!\[\[([^\]|]+)(?:\|([^\]]+))?\]\]/g)) result.push({ source: encodeURI(match[1]), from: node.position.start.offset + match.index!, to: node.position.start.offset + match.index! + match[0].length });
+    }
+  });
+  return result.sort((a, b) => a.from - b.from);
+}
 export function youtubeUrl(raw: string): string | null {
   try { const url = new URL(raw); let id = "";
     if (url.hostname === "youtu.be") id = url.pathname.slice(1).split('/')[0];
@@ -47,7 +63,7 @@ export async function importImageFiles(files: File[]): Promise<ImportedImage[]> 
 // FMD keeps interactive source blocks intact. Only image URLs are rewritten;
 // their bytes live in the envelope, never in the displayed Markdown editor.
 export async function prepareFmd(markdown: string, documentPath: string | null) {
-  const processor = unified().use(remarkParse).use(remarkGfm).use(remarkMath);
+  const processor = unified().use(remarkParse).use(remarkGfm).use(remarkMath).use(remarkObsidianMath);
   const tree = processor.parse(markdown);
   const assets: Record<string, string> = {}; const work: Promise<void>[] = [];
   const shared = new Map<string, Promise<string>>();

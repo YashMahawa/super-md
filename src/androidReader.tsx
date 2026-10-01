@@ -22,10 +22,10 @@ function Reader() {
   const [state, setState] = useState<ReaderState | null>(null);
   const [zoom, setZoom] = useState(100);
   const reference = useRef(state); reference.current = state;
-  const zoomReference = useRef(zoom); zoomReference.current = zoom;
+  const zoomReference = useRef(zoom);
   const pendingChange = useRef(0);
   useEffect(() => {
-    window.supermdLoad = (next) => { setState(next); setZoom(next.zoom); };
+    window.supermdLoad = (next) => { setState(next); zoomReference.current = next.zoom; setZoom(next.zoom); };
     window.supermdFind = () => window.dispatchEvent(new Event("supermd-find"));
     window.supermdPortable = async (save) => {
       const current = reference.current; if (!current) return;
@@ -49,13 +49,18 @@ function Reader() {
     Object.entries(state.colors).forEach(([key, value]) => root.style.setProperty(`--${key}`, value));
   }, [state, zoom]);
   useEffect(() => {
-    let startDistance = 0, startZoom = 100, pinching = false;
+    let startDistance = 0, startZoom = 100, pinching = false, frame = 0;
     const distance = (touches: TouchList) => Math.hypot(touches[0].clientX - touches[1].clientX, touches[0].clientY - touches[1].clientY);
     const start = (event: TouchEvent) => { if (event.touches.length === 2 && !(event.target as Element).closest("input")) { startDistance = distance(event.touches); startZoom = zoomReference.current; pinching = true; } };
-    const move = (event: TouchEvent) => { if (event.touches.length === 2 && pinching && startDistance > 0) { event.preventDefault(); setZoom(clampPreviewZoom(startZoom * distance(event.touches) / startDistance)); } };
-    const end = () => { if (pinching) { pinching = false; void invoke("zoom_changed", { zoom: zoomReference.current }); } };
-    document.addEventListener("touchstart", start, { passive: true }); document.addEventListener("touchmove", move, { passive: false }); document.addEventListener("touchend", end);
-    return () => { document.removeEventListener("touchstart", start); document.removeEventListener("touchmove", move); document.removeEventListener("touchend", end); };
+    const move = (event: TouchEvent) => { if (event.touches.length === 2 && pinching && startDistance > 0) {
+      event.preventDefault(); zoomReference.current = clampPreviewZoom(startZoom * distance(event.touches) / startDistance);
+      // Coalesce input to one visual update per frame. Parsing Markdown and
+      // crossing the native bridge are deliberately excluded from pinch frames.
+      if (!frame) frame = requestAnimationFrame(() => { frame = 0; document.documentElement.style.setProperty("--workspace-scale", String(zoomReference.current / 100)); });
+    } };
+    const end = (event: TouchEvent) => { if (pinching && event.touches.length < 2) { pinching = false; setZoom(zoomReference.current); void invoke("zoom_changed", { zoom: zoomReference.current }); } };
+    document.addEventListener("touchstart", start, { passive: true }); document.addEventListener("touchmove", move, { passive: false }); document.addEventListener("touchend", end); document.addEventListener("touchcancel", end);
+    return () => { cancelAnimationFrame(frame); document.removeEventListener("touchstart", start); document.removeEventListener("touchmove", move); document.removeEventListener("touchend", end); document.removeEventListener("touchcancel", end); };
   }, []);
   if (!state) return <div className="reader-loading">Opening your workspace…</div>;
   const update = (content: string) => {

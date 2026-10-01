@@ -2,11 +2,17 @@
 import { describe, expect, it, vi } from "vitest";
 const { native } = vi.hoisted(() => ({ native: vi.fn() }));
 vi.mock("./nativeBridge", () => ({ invoke: native }));
-import { imageMarkdown, linkDetails, prepareFmd, youtubeUrl } from "./documentMedia";
+import { imageMarkdown, imageRanges, linkDetails, prepareFmd, youtubeUrl } from "./documentMedia";
 import { readRecent, rememberFile } from "./recentFiles";
 import { svgImage } from "./svgImage";
 
 describe("portable media", () => {
+  it("finds distinct editable image ranges after Obsidian math, excluding code", () => {
+    const md = '$$\\begin{aligned}\na&=b\\\\\n\\end{aligned}$$\n\n![First](a.png)\n\n![Second](a.png)\n\n![Reference][p]\n\n[p]: proof.svg\n\n![[diagram.svg|Diagram]]\n\n```md\n![Literal](a.png)\n```';
+    const ranges = imageRanges(md);
+    expect(ranges.map((range) => md.slice(range.from, range.to))).toEqual(["![First](a.png)", "![Second](a.png)", "![Reference][p]", "![[diagram.svg|Diagram]]"]);
+    expect(ranges.map((range) => range.source)).toEqual(["a.png", "a.png", "proof.svg", "diagram.svg"]);
+  });
   it("preserves source, callouts, frontmatter and interactive code without exposing bytes", async () => {
     native.mockResolvedValue("data:image/svg+xml;base64,PHN2Zy8+");
     const md = '---\ntitle: Keep me\n---\n\n> [!TIP] Learn\n> Keep this.\n\n![Proof](images/proof.svg)\n\n![Again](images/proof.svg)\n\n```mermaid\nA --> B\n```\n\n```python\nprint("![Not an attachment](fake.png)")\n```';
