@@ -1,4 +1,4 @@
-Community Material 3 button — Copyright (c) 2025 Nicolas Banegas
+Community Material 3 button and icon button — Copyright (c) 2025 Nicolas Banegas
 MIT License
 
 Copyright (c) 2025 Nicolas Banegas

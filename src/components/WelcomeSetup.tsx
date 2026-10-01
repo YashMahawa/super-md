@@ -3,6 +3,7 @@ import { useEffect, useRef, useState } from "react";
 import { ArrowLeft, ArrowRight, BookOpen, FilePdf, FolderOpen, Sparkle } from "@phosphor-icons/react";
 import type { ThemeMode } from "../types";
 import BrandMark from "./BrandMark";
+import { MaterialSelect, MaterialSwitch, materialThemes } from "./MaterialControls";
 
 interface Props {
   theme: ThemeMode;
@@ -23,13 +24,13 @@ const pages = [
 export default function WelcomeSetup({ theme, onTheme, readerFont, onReaderFont, motionEnabled, onMotion, onFinish }: Props) {
   const [page, setPage] = useState(0);
   const card = useRef<HTMLDivElement>(null);
-  useEffect(() => { const timer = window.setTimeout(() => card.current?.querySelector<HTMLElement>("button:not(:disabled), select, input")?.focus(), 100); return () => window.clearTimeout(timer); }, [page]);
+  useEffect(() => { const timer = window.setTimeout(() => card.current?.querySelector<HTMLElement>("button:not(:disabled), smd-select, smd-switch, input")?.focus(), 100); return () => window.clearTimeout(timer); }, [page]);
   const item = pages[page];
   const Icon = item.icon;
   return <div className="welcome-scrim" role="dialog" aria-modal="true" aria-label="Welcome to Super MD">
     <div className="welcome-card" ref={card} onKeyDown={(event) => {
       if (event.key !== "Tab") return;
-      const controls = Array.from(card.current?.querySelectorAll<HTMLElement>("button:not(:disabled), select, input") ?? []);
+      const controls = Array.from(card.current?.querySelectorAll<HTMLElement>("button:not(:disabled), smd-select, smd-switch, input") ?? []);
       const first = controls[0], last = controls[controls.length - 1];
       if (event.shiftKey && document.activeElement === first) { event.preventDefault(); last?.focus(); }
       if (!event.shiftKey && document.activeElement === last) { event.preventDefault(); first?.focus(); }
@@ -37,11 +38,11 @@ export default function WelcomeSetup({ theme, onTheme, readerFont, onReaderFont,
       <div className="welcome-art"><BrandMark /><div className="welcome-orbit orbit-one" /><div className="welcome-orbit orbit-two" /></div>
       <div className="welcome-body">
         <div className="welcome-progress" aria-label={`Setup step ${page + 1} of 3`}>{pages.map((_, index) => <span key={index} className={index === page ? "active" : ""} />)}</div>
-        <AnimatePresence mode="wait"><motion.div key={page} initial={{ opacity: 0, y: 12, scale: .98 }} animate={{ opacity: 1, y: 0, scale: 1 }} exit={{ opacity: 0, y: -9, scale: .98 }} transition={{ type: "spring", stiffness: 360, damping: 31 }}>
+        <AnimatePresence mode="wait"><motion.div key={page} initial={motionEnabled ? { opacity: 0, y: 12, scale: .98 } : false} animate={{ opacity: 1, y: 0, scale: 1 }} exit={motionEnabled ? { opacity: 0, y: -9, scale: .98 } : { opacity: 0 }} transition={motionEnabled ? { type: "spring", stiffness: 360, damping: 31 } : { duration: 0 }}>
           <div className="welcome-kicker"><Icon size={17} weight="fill" /> {item.eyebrow}</div>
           <h1>{item.title}</h1><p>{item.description}</p>
           {page === 0 && <div className="welcome-feature-grid"><span>Math & code</span><span>Interactive charts</span><span>Callout boxes</span><span>Real PDF layout</span></div>}
-          {page === 1 && <div className="welcome-customize"><label>App theme<select value={theme} onChange={(event) => onTheme(event.target.value as ThemeMode)}><option value="system">System dynamic</option><option value="light">Material light</option><option value="dark">Material dark</option><option value="black">Pure black</option></select></label><label>Reading font<select value={readerFont} onChange={(event) => onReaderFont(event.target.value)}><option value="sans">Noto Sans · clean</option><option value="humanist">Manrope · expressive</option><option value="serif">System serif · book</option></select></label><label className="welcome-switch"><span>Smooth expressive motion</span><input type="checkbox" checked={motionEnabled} onChange={(event) => onMotion(event.target.checked)} /></label></div>}
+          {page === 1 && <div className="welcome-customize"><MaterialSelect label="App theme" motion={motionEnabled} value={theme} options={materialThemes} onChange={value => onTheme(value as ThemeMode)} /><MaterialSelect label="Reading font" motion={motionEnabled} value={readerFont} options={[{ value: "sans", label: "Noto Sans · clean" }, { value: "humanist", label: "Manrope · expressive" }, { value: "serif", label: "System serif · book" }]} onChange={onReaderFont} /><label className="welcome-switch"><span>Smooth expressive motion</span><MaterialSwitch label="Smooth expressive motion" motion={motionEnabled} checked={motionEnabled} onChange={onMotion} /></label></div>}
           {page === 2 && <div className="welcome-choices"><button onClick={() => onFinish(true)}><FolderOpen size={20} /> Open a note</button><button onClick={() => onFinish(false)}><BookOpen size={20} /> Explore the sample</button></div>}
         </motion.div></AnimatePresence>
         <div className="welcome-footer"><button className="welcome-back" onClick={() => setPage((value) => Math.max(0, value - 1))} disabled={page === 0}><ArrowLeft size={18} /> Back</button>{page < pages.length - 1 && <button className="welcome-next" onClick={() => setPage((value) => value + 1)}>Continue <ArrowRight size={18} /></button>}</div>

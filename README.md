@@ -50,7 +50,7 @@ npm run android:release
 
 Output: `android/app/build/outputs/apk/release/`. Without signing variables the build artifact is unsigned and must not be distributed. CI publication requires either the distribution signing secrets or a locally signed release APK attached to the draft. It verifies the upgrade certificate, non-debuggable variant, 16-KB alignment and clean tagged source before publishing. macOS desktop packages are ad-hoc signed, not notarized; Windows packages are not code-signed.
 
-Desktop controls use official [Material Web](https://github.com/material-components/material-web) sliders/switches and the MIT-licensed [Banegasn Material 3 button](https://github.com/Banegasn/components). Material Web implements Material 3, not the Android Expressive motion system; desktop spring transitions remain a separate app layer. Android uses native Compose Material 3 Expressive. Bundled UI-library licenses are in `public/third-party-ui-licenses.txt`.
+Desktop controls use official [Material Web](https://github.com/material-components/material-web) filled menus, sliders and switches, plus MIT-licensed [Banegasn Material 3 buttons and icon buttons](https://github.com/Banegasn/components). Sliders are styled with current AndroidX dimensions. Material Web itself implements Material 3, not the Android Expressive motion system; desktop spring transitions and icon-shape morphs remain an app layer. Android uses native Compose Material 3 Expressive. Bundled UI-library licenses are in `public/third-party-ui-licenses.txt`.
 
 ## CLI
 

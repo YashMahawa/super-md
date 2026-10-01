@@ -17,8 +17,11 @@
 ## Layout and responsiveness
 
 - Editable content-zoom percentages, with separate normal/fullscreen zoom.
-- Official Material sliders and switches on desktop, community Expressive
-  buttons, unified theme tokens and reduced-motion support.
+- Material filled menus throughout Settings, export and welcome setup; no native
+  browser dropdowns. Official sliders use the current AndroidX handle/track
+  dimensions. Community Expressive buttons and icon controls share theme tokens
+  and reduced-motion support; tonal toolbars and clean rounded reading surfaces
+  replace the dense outlined-panel treatment.
 - Native Android Material 3 Expressive controls, wallpaper-derived colours,
   themed launcher icon and immersive study mode.
 - Android's closed file drawer no longer steals scrolling and pinch gestures.

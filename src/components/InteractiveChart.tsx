@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useState, type CSSProperties } from "react";
 import type { ChartSpec } from "../types";
 import { compileMathExpression } from "../mathExpression";
 import { chartValues, remember } from "../renderedOutputs";
@@ -64,7 +64,7 @@ export default function InteractiveChart({ source }: { source: string }) {
         {(spec.sliders ?? []).map((slider) => (
           <label key={slider.name}>
             <span>{slider.label ?? slider.name}: <strong>{effectiveValues[slider.name]}</strong></span>
-            <input type="range" min={slider.min} max={slider.max} step={slider.step && slider.step > 0 ? slider.step : (slider.max - slider.min) / 100 || .01} value={effectiveValues[slider.name]}
+            <input type="range" min={slider.min} max={slider.max} step={slider.step && slider.step > 0 ? slider.step : (slider.max - slider.min) / 100 || .01} value={effectiveValues[slider.name]} style={{ "--chart-progress": `${Math.max(0, Math.min(100, 100 * (effectiveValues[slider.name] - slider.min) / (slider.max - slider.min || 1)))}%` } as CSSProperties}
               onChange={(event) => setValues((current) => { const next = { ...current, [slider.name]: Number(event.target.value) }; remember(chartValues, source, next); return next; })} />
           </label>
         ))}

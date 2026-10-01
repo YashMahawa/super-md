@@ -20,7 +20,7 @@ import MediaTools, { type InsertionPoint } from "./components/MediaTools";
 import { imageMarkdown, prepareFmd, type ImportedImage } from "./documentMedia";
 import { recordRecent } from "./recentFiles";
 import ZoomInput from "./components/ZoomInput";
-import { MaterialButton, MaterialSlider, MaterialSwitch } from "./components/MaterialControls";
+import { MaterialButton, MaterialIconButton, MaterialSelect, MaterialSlider, MaterialSwitch, materialThemes } from "./components/MaterialControls";
 
 const welcome = `# Super MD
 
@@ -152,7 +152,7 @@ export default function App() {
       const sheet = document.querySelector<HTMLElement>('.sheet'); if (!sheet) return;
       if (event.key === "Escape" && !exporting) { event.preventDefault(); setShowSettings(false); setShowExport(false); }
       if (event.key === "Tab") {
-        const controls = Array.from(sheet.querySelectorAll<HTMLElement>('button:not(:disabled),input:not(:disabled),select:not(:disabled),smd-slider,smd-switch:not([disabled]),smd-expressive-button:not([disabled])')).filter((node) => node.getClientRects().length > 0);
+        const controls = Array.from(sheet.querySelectorAll<HTMLElement>('button:not(:disabled),input:not(:disabled),smd-select:not([disabled]),smd-slider,smd-switch:not([disabled]),smd-expressive-button:not([disabled])')).filter((node) => node.getClientRects().length > 0);
         const first = controls[0], last = controls.at(-1);
         if (event.shiftKey && document.activeElement === first) { event.preventDefault(); last?.focus(); }
         else if (!event.shiftKey && document.activeElement === last) { event.preventDefault(); first?.focus(); }
@@ -571,22 +571,22 @@ export default function App() {
       {!fullscreen && <header className="topbar">
         <div className="brand"><span className="brand-mark"><BrandMark /></span><span className="document-identity"><strong title={title}>{title}</strong><small title={location}>{location}</small></span><span className={`save-state ${dirty ? "is-dirty" : ""}`}>{dirty ? "Recoverable edit" : path ? "Saved" : "Draft"}</span></div>
         <nav className="file-actions" aria-label="File actions">
-          <button className={`toolbar-button icon-only ${folderVisible ? "active" : ""}`} onClick={() => setFolderVisible((value) => !value)} title="Files · Ctrl+B" aria-label="Toggle folder sidebar"><SidebarSimple size={19} /></button>
-          <button className="toolbar-button icon-only" onClick={newDocument} title="New · Ctrl+N" aria-label="New document"><Plus size={19} /></button>
-          <button className="toolbar-button icon-only" onClick={() => openNewWindow()} title="New window · Ctrl+Shift+N" aria-label="New window"><Browsers size={19} /></button>
-          <button className="toolbar-button" onClick={open} title="Open · Ctrl+O"><FolderOpen size={19} /><span>Open</span></button>
-          <button className="toolbar-button icon-only" onClick={chooseFolder} title="Open folder · Ctrl+Shift+O" aria-label="Open folder"><FolderOpen size={19} weight="fill" /></button>
-          <button className="toolbar-button" onClick={() => save(false)} title="Save · Ctrl+S"><FloppyDisk size={19} /><span>Save</span></button>
-          <button className="toolbar-button icon-only" onClick={() => window.dispatchEvent(new Event("supermd-find"))} title="Find and replace · Ctrl+F" aria-label="Find and replace"><MagnifyingGlass size={19} /></button>
-          <button className="toolbar-button" onClick={() => window.supermdMedia?.()} aria-label="Insert image or link">Insert</button>
+          <MaterialIconButton motion={motionEnabled} selected={folderVisible} onClick={() => setFolderVisible((value) => !value)} title="Files · Ctrl+B" label="Toggle folder sidebar"><SidebarSimple size={20} /></MaterialIconButton>
+          <MaterialIconButton motion={motionEnabled} onClick={newDocument} title="New · Ctrl+N" label="New document"><Plus size={20} /></MaterialIconButton>
+          <MaterialIconButton motion={motionEnabled} onClick={() => openNewWindow()} title="New window · Ctrl+Shift+N" label="New window"><Browsers size={20} /></MaterialIconButton>
+          <MaterialButton motion={motionEnabled} variant="text" onClick={open} label="Open"><FolderOpen size={19} /><span>Open</span></MaterialButton>
+          <MaterialIconButton motion={motionEnabled} onClick={chooseFolder} title="Open folder · Ctrl+Shift+O" label="Open folder"><FolderOpen size={20} weight="fill" /></MaterialIconButton>
+          <MaterialButton motion={motionEnabled} variant="text" onClick={() => save(false)} label="Save"><FloppyDisk size={19} /><span>Save</span></MaterialButton>
+          <MaterialIconButton motion={motionEnabled} onClick={() => window.dispatchEvent(new Event("supermd-find"))} title="Find and replace · Ctrl+F" label="Find and replace"><MagnifyingGlass size={20} /></MaterialIconButton>
+          <MaterialButton motion={motionEnabled} variant="text" onClick={() => window.supermdMedia?.()} label="Insert image or link">Insert</MaterialButton>
         </nav>
         <nav className="right-actions" aria-label="View and export">
           <div className="segmented" aria-label="View mode">
             {(mobileUi ? ["live", "editor", "reader"] : ["editor", "live", "split", "reader"] as ViewMode[]).map((mode) => <button key={mode} className={view === mode ? "active" : ""} onClick={() => setView(mode as ViewMode)} title={`${mode[0].toUpperCase()}${mode.slice(1)} view`} aria-label={`${mode} view`} aria-pressed={view === mode}>{view === mode && <motion.i className="segment-indicator" layoutId="view-indicator" transition={motionEnabled ? spring.selector : { duration: 0 }} />}{mode === "editor" ? <PencilSimple size={17} /> : mode === "split" ? <Columns size={17} /> : mode === "live" ? <Sparkle size={17} /> : <BookOpen size={17} />}<span>{mode === "editor" && mobileUi ? "Source" : mode === "reader" && mobileUi ? "Read" : mode}</span></button>)}
           </div>
-          <button className={`toolbar-button icon-only ${focusMode ? "active" : ""}`} onClick={() => setFocusMode((value) => !value)} title="Focus mode" aria-label="Focus mode" aria-pressed={focusMode}><Crosshair size={19} /></button>
-          <button className="toolbar-button icon-only" onClick={toggleFullscreen} title="Fullscreen · F11" aria-label="Fullscreen"><ArrowsOut size={19} /></button>
-          <button className="toolbar-button icon-only" onClick={() => setShowSettings(true)} title="Settings" aria-label="Settings"><GearSix size={19} /></button>
+          <MaterialIconButton motion={motionEnabled} selected={focusMode} onClick={() => setFocusMode((value) => !value)} title="Focus mode" label="Focus mode"><Crosshair size={20} /></MaterialIconButton>
+          <MaterialIconButton motion={motionEnabled} onClick={toggleFullscreen} title="Fullscreen · F11" label="Fullscreen"><ArrowsOut size={20} /></MaterialIconButton>
+          <MaterialIconButton motion={motionEnabled} onClick={() => setShowSettings(true)} title="Settings" label="Settings"><GearSix size={20} /></MaterialIconButton>
           <MaterialButton className="export-action" motion={motionEnabled} onClick={() => setShowExport(true)} label="Export"><FilePdf size={19} weight="bold" /><span>Export</span></MaterialButton>
         </nav>
       </header>}
@@ -623,12 +623,12 @@ export default function App() {
       <AnimatePresence>{notice && <motion.div key="notice" className="snackbar" initial={motionEnabled ? { opacity: 0, y: 18, x: "-50%", scale: .94 } : false} animate={{ opacity: 1, y: 0, x: "-50%", scale: 1 }} exit={motionEnabled ? { opacity: 0, y: 12, x: "-50%", scale: .96 } : { opacity: 0 }} transition={motionEnabled ? spring.surface : { duration: 0 }}>{notice}</motion.div>}</AnimatePresence>
       <AnimatePresence>{showSettings && <motion.div key="settings" className="scrim" initial={motionEnabled ? { opacity: 0 } : false} animate={{ opacity: 1 }} exit={{ opacity: 0 }} transition={{ duration: motionEnabled ? .24 : 0 }} onMouseDown={() => setShowSettings(false)}><motion.aside className="sheet" role="dialog" aria-modal="true" aria-label="Settings" initial={motionEnabled ? { opacity: 0, y: 40, scale: .9, borderRadius: 44 } : false} animate={{ opacity: 1, y: 0, scale: 1, borderRadius: 28 }} exit={motionEnabled ? { opacity: 0, y: 18, scale: .96 } : { opacity: 0 }} transition={motionEnabled ? spring.sheet : { duration: 0 }} onMouseDown={(event) => event.stopPropagation()}>
         <div className="sheet-title"><h2>Appearance & runtime</h2><button onClick={() => setShowSettings(false)} aria-label="Close settings"><X size={20} /></button></div>
-        <label>Normal theme<select value={normalTheme} onChange={(event) => setNormalTheme(event.target.value as ThemeMode)}><option value="system">System dynamic</option><option value="light">Material light</option><option value="dark">Material dark</option><option value="black">Pure black</option></select></label>
-        <label>Fullscreen theme<select value={fullscreenTheme} onChange={(event) => setFullscreenTheme(event.target.value as ThemeMode)}><option value="system">System dynamic</option><option value="light">Material light</option><option value="dark">Material dark</option><option value="black">Pure black</option></select></label>
+        <MaterialSelect label="Normal theme" motion={motionEnabled} value={normalTheme} options={materialThemes} onChange={(value) => setNormalTheme(value as ThemeMode)} />
+        <MaterialSelect label="Fullscreen theme" motion={motionEnabled} value={fullscreenTheme} options={materialThemes} onChange={(value) => setFullscreenTheme(value as ThemeMode)} />
         {!android && <label>Python interpreter<div className="path-field"><input value={python} onChange={(event) => { setPython(event.target.value); localStorage.setItem("python", event.target.value); }} /><button onClick={choosePython}>Choose</button></div></label>}
         {android && <p className="help">PDF export and Python cells run locally on Android. Run cells before export to include their figures.</p>}
         <h3>Typography</h3>
-        <label>Reading font<select value={readerFont} onChange={(event) => setReaderFont(event.target.value)}>{readerFonts.map((font) => <option key={font.value} value={font.value}>{font.label}</option>)}</select></label>
+        <MaterialSelect label="Reading font" motion={motionEnabled} value={readerFont} options={readerFonts} onChange={setReaderFont} />
         <div className="form-grid">
           <label>Editor size ({editorSize}px)<MaterialSlider motion={motionEnabled} label="Editor size" min={11} max={22} step={1} value={editorSize} onChange={setEditorSize} /></label>
           <label>Editor spacing ({editorLeading.toFixed(2)})<MaterialSlider motion={motionEnabled} label="Editor spacing" min={1.2} max={2.2} step={0.05} value={editorLeading} onChange={setEditorLeading} /></label>
@@ -649,8 +649,8 @@ export default function App() {
         <div className="segmented export-formats" aria-label="Export format"><motion.i className="export-format-indicator" animate={{ x: exportFormat === "fmd" ? "100%" : "0%" }} transition={motionEnabled ? spring.selector : { duration: 0 }} />{(["pdf", "fmd"] as const).map((format) => <button key={format} aria-pressed={exportFormat === format} className={exportFormat === format ? "active" : ""} disabled={exporting} onClick={() => { setExportFormat(format); setExportError(""); }}><span>{format === "pdf" ? "PDF document" : "Portable FMD"}</span></button>)}</div>
         <p className="help">{exportFormat === "pdf" ? "The embedded Typst engine paginates text, tables and vector equations. Charts use your current slider values. Run Python cells first to include their figures. The preview DOM is not printed." : "One editable file with your Markdown and images together. Reopen it in Super MD to edit, drop in images, or select an image to replace or remove it. Image data stays out of Source mode."}</p>
         {exportFormat === "pdf" && <><div className="form-grid">
-          <label>Document font<select value={exportOptions.fontFamily} onChange={(event) => setExportOptions({ ...exportOptions, fontFamily: event.target.value })}>{pdfFonts.map((font) => <option key={font} value={font}>{font}</option>)}</select></label>
-          <label>Page size<select value={exportOptions.pageSize} onChange={(event) => setExportOptions({ ...exportOptions, pageSize: event.target.value as ExportOptions["pageSize"] })}><option value="a4">A4</option><option value="a5">A5</option><option value="letter">US Letter</option><option value="legal">US Legal</option></select></label>
+          <MaterialSelect label="Document font" motion={motionEnabled} value={exportOptions.fontFamily} options={pdfFonts.map(font => ({ value: font, label: font }))} onChange={(value) => setExportOptions({ ...exportOptions, fontFamily: value })} />
+          <MaterialSelect label="Page size" motion={motionEnabled} value={exportOptions.pageSize} options={[{ value: "a4", label: "A4" }, { value: "a5", label: "A5" }, { value: "letter", label: "US Letter" }, { value: "legal", label: "US Legal" }]} onChange={(value) => setExportOptions({ ...exportOptions, pageSize: value as ExportOptions["pageSize"] })} />
           <label>Margin (mm)<input type="number" min="4" max="60" value={exportOptions.margin} onChange={(event) => setExportOptions({ ...exportOptions, margin: Number(event.target.value) })} /></label>
           <label>Font size (pt)<input type="number" min="7" max="24" step="0.5" value={exportOptions.fontSize} onChange={(event) => setExportOptions({ ...exportOptions, fontSize: Number(event.target.value) })} /></label>
           <label>Line height<input type="number" min="0.9" max="2.2" step="0.05" value={exportOptions.lineHeight} onChange={(event) => setExportOptions({ ...exportOptions, lineHeight: Number(event.target.value) })} /></label>

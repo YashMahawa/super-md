@@ -169,3 +169,36 @@ P(A\cup B)=&P(A)+P(B)\\
   await expect.poll(() => calls.some((call) => call.command === 'export_pdf_native')).toBeTruthy();
   expect(calls.find((call) => call.command === 'export_failed')).toBeUndefined();
 });
+
+test("Material menus, expressive toolbar and fractional-scale surfaces", async ({ browser }) => {
+  const context = await browser.newContext({ viewport: { width: 1280, height: 900 }, deviceScaleFactor: 1.25 });
+  const page = await context.newPage();
+  await page.addInitScript(() => localStorage.setItem("setup.complete", "true"));
+  await page.goto("http://127.0.0.1:1420/");
+  await expect(page.locator("select")).toHaveCount(0);
+  await expect(page.locator(".preview-pane")).toHaveCSS("border-top-width", "0px");
+  await page.getByRole("button", { name: "Settings", exact: true }).click();
+  const theme = page.getByRole("combobox", { name: "Normal theme", exact: true });
+  await theme.click(); await expect(page.getByRole("option", { name: "Material dark", exact: true })).toBeVisible();
+  await page.getByRole("option", { name: "Material dark", exact: true }).click();
+  await expect(page.locator("html")).toHaveAttribute("data-theme", "dark");
+  await page.getByRole("combobox", { name: "Reading font", exact: true }).click();
+  await page.getByRole("option", { name: "Manrope · expressive", exact: true }).click();
+  await page.evaluate(() => { (window as any).testMenuOpened = false; document.querySelector('smd-select')!.addEventListener('opened', () => { (window as any).testMenuOpened = true; }, { once: true }); });
+  await theme.click(); await expect.poll(() => page.evaluate(() => (window as any).testMenuOpened)).toBe(true);
+  await page.screenshot({ path: test.info().outputPath("material-menu-125percent.png") });
+  await page.keyboard.press("Escape");
+  await expect(page.getByRole("dialog", { name: "Settings", exact: true })).toBeVisible();
+  await page.getByRole("button", { name: "Close settings", exact: true }).click();
+  await page.getByRole("button", { name: "Export", exact: true }).click();
+  await page.getByRole("combobox", { name: "Page size", exact: true }).click();
+  await page.getByRole("option", { name: "US Letter", exact: true }).click();
+  await expect(page.locator('smd-select').filter({ has: page.getByRole("combobox", { name: "Page size", exact: true }) })).toHaveJSProperty("value", "letter");
+  await page.getByRole("button", { name: "Close export settings", exact: true }).click();
+  await expect(page.getByRole("dialog")).toHaveCount(0);
+  await page.setViewportSize({ width: 1024, height: 768 });
+  expect(await page.locator(".topbar").evaluate(node => node.scrollWidth <= node.clientWidth)).toBe(true);
+  expect(await page.locator(".brand").evaluate(node => node.getBoundingClientRect().width)).toBeGreaterThan(150);
+  await page.screenshot({ path: test.info().outputPath("expressive-workspace-125percent.png") });
+  await context.close();
+});

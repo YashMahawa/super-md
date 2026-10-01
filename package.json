@@ -17,6 +17,7 @@
   },
   "dependencies": {
     "@banegasn/m3-button": "2.2.5",
+    "@banegasn/m3-icon-button": "1.0.2",
     "@codemirror/commands": "^6.8.1",
     "@codemirror/lang-markdown": "^6.3.3",
     "@codemirror/language": "^6.11.2",
