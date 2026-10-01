@@ -181,7 +181,7 @@ private object NoMotionScheme : MotionScheme {
                             IconButton(onClick = saveAction) { Icon(Icons.Rounded.Save, "Save note") }
                             IconButton(onClick = { exporting = true }, enabled = readerReady && !state.busy) { Icon(Icons.Rounded.PictureAsPdf, "Export PDF") }
                             Box { IconButton(onClick = { menu = true }) { Icon(Icons.Rounded.MoreVert, "More actions") }; DropdownMenu(expanded = menu, onDismissRequest = { menu = false }) {
-                                DropdownMenuItem(text = { Text("Open note") }, onClick = { menu = false; open.launch(arrayOf("text/*", "application/octet-stream")) }, leadingIcon = { Icon(Icons.Rounded.FolderOpen, null) })
+                                DropdownMenuItem(text = { Text("Open note") }, onClick = { menu = false; open.launch(arrayOf("text/*", "application/octet-stream", "application/vnd.supermd.fmd")) }, leadingIcon = { Icon(Icons.Rounded.FolderOpen, null) })
                                 DropdownMenuItem(text = { Text("New tab") }, onClick = { menu = false; model.newNote() }, leadingIcon = { Icon(Icons.Rounded.Add, null) })
                                 DropdownMenuItem(text = { Text("Reopen closed tab") }, onClick = { menu = false; model.reopen() })
                                 DropdownMenuItem(text = { Text("Save as Markdown") }, onClick = { menu = false; save.launch(if (state.active.name.endsWith(".fmd", true)) state.active.name.substringBeforeLast('.') + ".md" else state.active.name) })
@@ -248,7 +248,7 @@ private object NoMotionScheme : MotionScheme {
     if (settings) ModalBottomSheet(onDismissRequest = { settings = false }) { Settings(state, model) }
     if (exporting) ModalBottomSheet(onDismissRequest = { exporting = false }) { PdfSettings(state.pdf, model::pdf) { exporting = false; pdf.launch(state.active.name.substringBeforeLast('.') + ".pdf") } }
     state.error?.let { AlertDialog(onDismissRequest = model::dismissError, title = { Text("Couldn't finish") }, text = { Text(it, Modifier.heightIn(max = 360.dp).verticalScroll(rememberScrollState())) }, confirmButton = { TextButton(onClick = model::dismissError) { Text("OK") } }) }
-    if (!state.welcomed) WelcomeSetup(state, model) { model.welcomeDone(); open.launch(arrayOf("text/*", "application/octet-stream")) }
+    if (!state.welcomed) WelcomeSetup(state, model) { model.welcomeDone(); open.launch(arrayOf("text/*", "application/octet-stream", "application/vnd.supermd.fmd")) }
 }
 
 @Composable private fun WelcomeSetup(state: StudioState, model: StudioViewModel, open: () -> Unit) {

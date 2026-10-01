@@ -111,7 +111,12 @@ class MediaStorage(private val context: Context) {
         // Validate everything before the destination stream is written.
         var total = 0L
         assets.keys().forEach { source -> require(validKey(source)); val (type, bytes) = decode(assets.getString(source)); require(mime(source) == type) { "Image extension does not match its type" }; total += bytes.size; require(total <= 75_000_000) }
-        JsonWriter(output.writer()).use { writer ->
+        val bounded = object : java.io.FilterOutputStream(output) {
+            var bytes = 0L
+            override fun write(value: Int) { require(++bytes <= 120_000_000) { "FMD exceeds 120 MB" }; out.write(value) }
+            override fun write(buffer: ByteArray, offset: Int, length: Int) { require(bytes + length <= 120_000_000) { "FMD exceeds 120 MB" }; out.write(buffer, offset, length); bytes += length }
+        }
+        JsonWriter(bounded.writer()).use { writer ->
             writer.beginObject().name("format").value("supermd-fmd").name("version").value(1).name("markdown").value(markdown).name("assets").beginObject()
             assets.keys().forEach { source -> writer.name(source).value(assets.getString(source)) }
             writer.endObject().endObject()

@@ -19,8 +19,16 @@
   dialog over the screenshots during cold boot; after clearing that emulator
   dialog, the unchanged painting assertions and all five tests passed.
 - The optimized non-debuggable x86_64 release opens with the three-step setup
-  and icon-free Live rendering. ARM64 distribution and final release smoke checks
-  are recorded after their build below; this is not physical-phone testing.
+  and icon-free Live rendering. Through the actual UI it downloaded a public PNG
+  from Google's CDN, inserted a short Markdown reference, and exported a real FMD
+  through Android's system destination picker. The resulting file contains one
+  embedded image and no base64 in its Markdown. This smoke check caught a missing
+  custom FMD MIME type in the Open picker; the type is now included.
+- Linux 0.3.0 opened its production window with isolated test recovery storage;
+  its CLI packed and exported a single-file FMD containing math, callouts, a table
+  and SVG. The installed binary was updated, preserving the previous executable
+  as `super-md.working-backup-20261001`. ARM64 release packaging is optimized,
+  non-debuggable, signed with the existing upgrade certificate and 16 KB aligned.
 - Native cross-app drag permission handling is implemented using Android's URI
   grant API. Actual drag behavior from each gallery/files/browser app and physical
   phone gesture latency remain user-device checks, not inferred from DOM drops.
