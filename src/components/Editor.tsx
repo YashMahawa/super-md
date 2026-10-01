@@ -85,6 +85,12 @@ export default function Editor({ sessionId = "default", value, onChange, dark, f
   }, []);
 
   useEffect(() => {
+    const point = (event: Event) => { const instance = view.current; if (instance) (event as CustomEvent).detail.point = { from: instance.state.selection.main.from, to: instance.state.selection.main.to }; };
+    window.addEventListener("supermd-insertion-point", point);
+    return () => window.removeEventListener("supermd-insertion-point", point);
+  }, []);
+
+  useEffect(() => {
     const format = (event: Event) => {
       const instance = view.current;
       if (!instance) return;

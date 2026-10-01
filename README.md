@@ -11,7 +11,7 @@ A vault-free Markdown study workspace. `.smd` is ordinary UTF-8 Markdown with op
 
 ## Study and authoring
 
-Recoverable tabs, arbitrary-folder browsing, hideable desktop sidebar, Live / Source / Read modes, and Split mode on desktops and Android windows at least 720 dp wide and 600 dp tall. Phones retain three single-pane modes in landscape too. Desktop provides independent document windows and drag-and-drop opening. Android persists drafts across process recreation and uses the system document picker for saving and folder permissions.
+Recoverable tabs, recent-file history, arbitrary-folder browsing, hideable desktop sidebar, Live / Source / Read modes, and Split mode on desktops and Android windows at least 720 dp wide and 600 dp tall. Phones retain three single-pane modes in landscape too. Click a Live block to edit it—no per-block edit buttons. Desktop provides independent document windows and drag-and-drop opening. Android persists drafts across process recreation and uses the system document picker for saving and folder permissions. The Android files drawer opens deliberately through its menu button, leaving document scroll and pinch gestures uninterrupted.
 
 KaTeX equations, GFM tables/tasks, highlighted code, Mermaid, relative images, callouts, SVG charts with sliders, and explicitly executed Matplotlib cells share one document renderer. Python is **never** automatically executed when opening a note or exporting. Only run code you trust; a worker process is not a security sandbox. Android executions time out after 115 seconds.
 
@@ -19,7 +19,9 @@ System dynamic colors, light/dark/pure-black themes, separate fullscreen appeara
 
 PDF settings include A4/A5/Letter/Legal, margins, font, type size, line spacing, and page numbers on/off. Fonts are bundled so Android does not silently depend on desktop fonts. Tables wrap and paginate with repeated headers; wide equations fit their available width. GUI export includes Mermaid SVGs, the current chart slider values, and figures from cells you've run. PDFs contain static graph snapshots, not interactive sliders.
 
-Relative Android images require access to the containing folder through **Open any folder**. Android cannot derive arbitrary sibling-file permission from a single-file picker grant. Remote images require consent for viewing; for offline PDF export save them beside your note. Unsupported LaTeX constructs produce a visible export error rather than a silently incomplete PDF. KaTeX and MiTeX are not a full TeX distribution.
+Images can be dropped, pasted, chosen from a picker or inserted from a public HTTPS URL. Android supports cross-app image drops when the source app provides Android URI grants (especially useful in tablet split screen). Pasted web links offer a readable website/video title and an optional YouTube thumbnail. Offline PDF export includes downloaded images, Mermaid and fenced SVG diagrams; GIF/WebP/AVIF images are converted to a static PNG frame. Remote images require consent for viewing and an explicit PDF/FMD export fetches any still-remote images.
+
+Export **portable `.fmd`** to package Markdown and images into one editable, shareable file without binary data in the Source editor. Ordinary Markdown still uses companion assets. Relative Android images require access to the containing folder through **Open any folder**; Android cannot derive arbitrary sibling-file permission from a single-file picker grant. FMD images need no companion-folder permission. See [FORMAT.md](FORMAT.md) for the format and size bounds. Unsupported LaTeX constructs produce a visible export error rather than a silently incomplete PDF. KaTeX and MiTeX are not a full TeX distribution.
 
 ## Development and tests
 
@@ -55,9 +57,11 @@ super-md notes.smd
 super-md export notes.smd -o notes.pdf --page-size A4 --margin 18 \
   --font 'Libertinus Serif' --font-size 10.5 --line-height 1.35 --no-page-numbers
 super-md doctor
+super-md pack notes.md -o notes.fmd
+super-md export notes.fmd -o notes.pdf --no-page-numbers
 ```
 
-CLI export supports Markdown, math, tables, callouts, local images and static `smd-chart` snapshots using their declared default values. Use GUI export for Mermaid and already-executed Python results; CLI never runs code implicitly. Invalid chart/math/image input fails explicitly instead of producing an apparently successful incomplete PDF.
+CLI export supports Markdown/FMD, math, tables, callouts, local/embedded images and static `smd-chart` snapshots using their declared default values. `pack` embeds local images into one FMD while preserving other source; use GUI portable export to download remote images. Use GUI PDF export for Mermaid, fenced SVG and already-executed Python results; CLI never runs code implicitly. Invalid chart/math/image input fails explicitly instead of producing an apparently successful incomplete PDF.
 
 ## Desktop shortcuts
 

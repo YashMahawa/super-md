@@ -1,5 +1,4 @@
-import { useState } from "react";
-import { PencilSimple } from "@phosphor-icons/react";
+import { useEffect, useState } from "react";
 import MarkdownPreview from "./MarkdownPreview";
 
 export interface SourceBlock { start: number; end: number; text: string }
@@ -46,8 +45,13 @@ interface Props {
 
 export default function LiveEditor({ markdown, onChange, documentPath, python, dark, trustedImageHosts = [], onTrustImageHost }: Props) {
   const [editing, setEditing] = useState<{ prefix: string; text: string; suffix: string } | null>(null);
-  const renderBlock = (block: SourceBlock, index: number, base = 0) => <section className="live-block" key={`${base + block.start}-${index}`}>
-    <button className="live-edit-button" title="Edit this block" aria-label={`Edit block ${index + 1}`} onClick={() => setEditing({ prefix: markdown.slice(0, base + block.start), text: block.text, suffix: markdown.slice(base + block.end) })}><PencilSimple size={15} /></button>
+  useEffect(() => { if (editing && markdown !== editing.prefix + editing.text + editing.suffix) setEditing(null); }, [markdown, editing]);
+  const renderBlock = (block: SourceBlock, index: number, base = 0) => <section className="live-block" data-source-end={base + block.end} key={`${base + block.start}-${index}`} tabIndex={0} role="group" aria-label={`Editable block ${index + 1}`} onClick={(event) => {
+    if ((event.target as Element).closest("a,button,input,select,textarea,.interactive-chart") || window.getSelection()?.toString()) return;
+    setEditing({ prefix: markdown.slice(0, base + block.start), text: block.text, suffix: markdown.slice(base + block.end) });
+  }} onKeyDown={(event) => {
+    if (event.target === event.currentTarget && (event.key === "Enter" || event.key === "F2")) { event.preventDefault(); setEditing({ prefix: markdown.slice(0, base + block.start), text: block.text, suffix: markdown.slice(base + block.end) }); }
+  }}>
     <MarkdownPreview markdown={block.text} documentPath={documentPath} python={python} dark={dark} trustedImageHosts={trustedImageHosts} onTrustImageHost={onTrustImageHost} />
   </section>;
   if (editing) {
@@ -55,7 +59,7 @@ export default function LiveEditor({ markdown, onChange, documentPath, python, d
     const after = splitMarkdownBlocks(editing.suffix).filter((block) => block.text.trim());
     return <div className="live-document">
       {before.map((block, index) => renderBlock(block, index))}
-      <div className="live-active-block"><textarea autoFocus spellCheck={false} value={editing.text} style={{ minHeight: Math.max(120, editing.text.split("\n").length * 27 + 32) }} onChange={(event) => {
+      <div className="live-active-block"><textarea autoFocus data-source-start={editing.prefix.length} spellCheck={false} value={editing.text} style={{ minHeight: Math.max(120, editing.text.split("\n").length * 27 + 32) }} onChange={(event) => {
         const text = event.target.value;
         setEditing({ ...editing, text });
         onChange(editing.prefix + text + editing.suffix);

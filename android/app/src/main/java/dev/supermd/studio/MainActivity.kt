@@ -103,6 +103,13 @@ private object NoMotionScheme : MotionScheme {
     var readerReady by remember { mutableStateOf(false) }
     var folderRelative by remember { mutableStateOf("") }
     var hinge by remember { mutableStateOf<FoldingFeature?>(null) }
+    val recent by model.recent.collectAsStateWithLifecycle()
+    var imageCallback by remember { mutableStateOf<android.webkit.ValueCallback<Array<android.net.Uri>>?>(null) }
+    var imageNote by remember { mutableStateOf("") }
+    val imagePicker = rememberLauncherForActivityResult(ActivityResultContracts.OpenMultipleDocuments()) { uris ->
+        imageCallback?.onReceiveValue(null); imageCallback = null
+        if (uris.isNotEmpty()) model.importDropped(uris, imageNote) { images -> images?.let { web?.evaluateJavascript("window.supermdInsertImages?.($it)", null) } }
+    }
     LaunchedEffect(activity) { WindowInfoTracker.getOrCreate(activity).windowLayoutInfo(activity).collect { info -> hinge = info.displayFeatures.filterIsInstance<FoldingFeature>().firstOrNull { it.isSeparating && it.orientation == FoldingFeature.Orientation.VERTICAL } } }
     val open = rememberLauncherForActivityResult(ActivityResultContracts.OpenDocument()) { it?.let(model::open) }
     val save = rememberLauncherForActivityResult(ActivityResultContracts.CreateDocument("text/markdown")) { it?.let { uri -> model.save(uri) } }
@@ -110,7 +117,11 @@ private object NoMotionScheme : MotionScheme {
     val pdf = rememberLauncherForActivityResult(ActivityResultContracts.CreateDocument("application/pdf")) { uri ->
         if (uri != null) { model.outputUri = uri; model.busy(true); web?.evaluateJavascript("window.supermdExport?.(${state.pdf})", null) ?: model.fail("The reader is not ready. Open the note again.") }
     }
-    val saveAction: () -> Unit = { if (state.active.uri == null) save.launch(state.active.name) else model.save(); Unit }
+    val portable = rememberLauncherForActivityResult(ActivityResultContracts.CreateDocument("application/vnd.supermd.fmd")) { uri ->
+        if (uri != null) { model.portableOutput = uri; model.busy(true); web?.evaluateJavascript("window.supermdPortable?.(false)", null) ?: model.fail("The reader is not ready") }
+    }
+    DisposableEffect(portable, state.active.name) { model.requestPortable = { portable.launch(state.active.name.substringBeforeLast('.') + ".fmd") }; onDispose { model.requestPortable = null } }
+    val saveAction: () -> Unit = { if (state.active.uri == null) save.launch(state.active.name) else if (state.active.name.endsWith(".fmd", true)) { model.busy(true); web?.evaluateJavascript("window.supermdPortable?.(true)", null) ?: model.fail("The reader is not ready") } else model.save(); Unit }
     LaunchedEffect(state.message) { state.message?.let { snackbar.showSnackbar(it); model.dismissMessage() } }
     LaunchedEffect(state.fullscreen, dark) {
         WindowCompat.getInsetsController(activity.window, activity.window.decorView).apply { isAppearanceLightStatusBars = !dark; isAppearanceLightNavigationBars = !dark; systemBarsBehavior = WindowInsetsControllerCompat.BEHAVIOR_SHOW_TRANSIENT_BARS_BY_SWIPE; if (state.fullscreen) hide(WindowInsetsCompat.Type.systemBars()) else show(WindowInsetsCompat.Type.systemBars()) }
@@ -131,14 +142,17 @@ private object NoMotionScheme : MotionScheme {
         LaunchedEffect(readerReady, state.active, actualMode, state.zoom, dark, state.fullscreen, state.font, state.size, tokens, hinge, cutoutTop, cutoutLeft, cutoutRight, motion) {
             if (readerReady) {
                 val note = state.active
-                val payload = JSONObject().put("id", note.id).put("content", note.content).put("path", note.uri ?: JSONObject.NULL).put("mode", actualMode).put("dark", dark).put("fullscreen", state.fullscreen).put("font", state.font).put("size", state.size).put("colors", tokens).put("zoom", state.zoom).put("motion", motion)
+                val payload = JSONObject().put("id", note.id).put("content", note.content).put("path", note.uri ?: note.id).put("mode", actualMode).put("dark", dark).put("fullscreen", state.fullscreen).put("font", state.font).put("size", state.size).put("colors", tokens).put("zoom", state.zoom).put("motion", motion)
                 web?.evaluateJavascript("window.supermdLoad?.($payload)", null)
                 web?.evaluateJavascript("document.documentElement.style.setProperty('--cutout-top','${if (state.fullscreen) cutoutTop else 0f}px');document.documentElement.style.setProperty('--cutout-left','${if (state.fullscreen) cutoutLeft else 0f}px');document.documentElement.style.setProperty('--cutout-right','${if (state.fullscreen) cutoutRight else 0f}px')", null)
                 val hingeGap = if (hinge != null && actualMode == "split") hinge!!.bounds.width() / density.density else 0f
                 web?.evaluateJavascript("document.querySelector('.android-document')?.style.setProperty('gap','${hingeGap}px')", null)
             }
         }
-        ModalNavigationDrawer(drawerState = drawer, gesturesEnabled = !state.fullscreen, drawerContent = {
+        // Closed-drawer drag recognition steals diagonal scrolls and pinch
+        // gestures from WebView. Opening is deliberate (menu button); dragging
+        // still dismisses an already-open drawer.
+        ModalNavigationDrawer(drawerState = drawer, gesturesEnabled = drawer.isOpen && !state.fullscreen, drawerContent = {
             ModalDrawerSheet(modifier = Modifier.widthIn(max = 340.dp)) {
                 Column(Modifier.fillMaxHeight().safeDrawingPadding().padding(horizontal = 16.dp)) {
                     Text("Your files", style = MaterialTheme.typography.headlineSmall, modifier = Modifier.padding(vertical = 20.dp))
@@ -146,6 +160,11 @@ private object NoMotionScheme : MotionScheme {
                     Text("No vault. No hidden metadata.", style = MaterialTheme.typography.bodySmall, color = palette.onSurfaceVariant, modifier = Modifier.padding(vertical = 12.dp))
                     if (folderRelative.isNotEmpty()) TextButton(onClick = { folderRelative = ""; state.folder?.let { model.listFolder(android.net.Uri.parse(it), "") } }) { Icon(Icons.AutoMirrored.Rounded.ArrowBack, null); Text("Folder root") }
                     Column(Modifier.weight(1f).verticalScroll(rememberScrollState())) {
+                        if (recent.isNotEmpty()) {
+                            Row(verticalAlignment = Alignment.CenterVertically) { Text("Recent files", style = MaterialTheme.typography.titleSmall, modifier = Modifier.weight(1f)); TextButton(onClick = model::clearRecent) { Text("Clear") } }
+                            recent.take(12).forEach { note -> ListItem(headlineContent = { Text(note.name, maxLines = 1, overflow = TextOverflow.Ellipsis) }, leadingContent = { Icon(Icons.Rounded.History, null) }, modifier = Modifier.clickable { model.open(android.net.Uri.parse(note.uri), note.relative); scope.launch { drawer.close() } }) }
+                            HorizontalDivider(Modifier.padding(vertical = 8.dp))
+                        }
                         state.files.forEach { entry ->
                             val activate = { if (entry.directory) { folderRelative = entry.relative; model.listFolder(android.net.Uri.parse(entry.uri), entry.relative) } else { model.open(android.net.Uri.parse(entry.uri), entry.relative); scope.launch { drawer.close() } }; Unit }
                             ListItem(headlineContent = { Text(entry.name, maxLines = 1, overflow = TextOverflow.Ellipsis) }, leadingContent = { Icon(if (entry.directory) Icons.Rounded.Folder else Icons.Rounded.Description, null) }, modifier = Modifier.fillMaxWidth().clickable(onClick = activate), trailingContent = { Icon(if (entry.directory) Icons.Rounded.ChevronRight else Icons.AutoMirrored.Rounded.MenuBook, null) })
@@ -165,7 +184,9 @@ private object NoMotionScheme : MotionScheme {
                                 DropdownMenuItem(text = { Text("Open note") }, onClick = { menu = false; open.launch(arrayOf("text/*", "application/octet-stream")) }, leadingIcon = { Icon(Icons.Rounded.FolderOpen, null) })
                                 DropdownMenuItem(text = { Text("New tab") }, onClick = { menu = false; model.newNote() }, leadingIcon = { Icon(Icons.Rounded.Add, null) })
                                 DropdownMenuItem(text = { Text("Reopen closed tab") }, onClick = { menu = false; model.reopen() })
-                                DropdownMenuItem(text = { Text("Save as") }, onClick = { menu = false; save.launch(state.active.name) })
+                                DropdownMenuItem(text = { Text("Save as Markdown") }, onClick = { menu = false; save.launch(if (state.active.name.endsWith(".fmd", true)) state.active.name.substringBeforeLast('.') + ".md" else state.active.name) })
+                                DropdownMenuItem(text = { Text("Insert image or link") }, onClick = { menu = false; web?.evaluateJavascript("window.supermdMedia?.()", null) }, leadingIcon = { Icon(Icons.Rounded.Image, null) })
+                                DropdownMenuItem(text = { Text("Export portable .fmd") }, onClick = { menu = false; portable.launch(state.active.name.substringBeforeLast('.') + ".fmd") })
                                 DropdownMenuItem(text = { Text("Find and replace") }, onClick = { menu = false; model.mode("editor"); web?.postDelayed({ web?.evaluateJavascript("window.supermdFind?.()", null) }, 200) }, leadingIcon = { Icon(Icons.Rounded.Search, null) })
                                 DropdownMenuItem(text = { Text("Fullscreen study") }, onClick = { menu = false; model.fullscreen(true) }, leadingIcon = { Icon(Icons.Rounded.Fullscreen, null) })
                                 DropdownMenuItem(text = { Text("Settings") }, onClick = { menu = false; settings = true }, leadingIcon = { Icon(Icons.Rounded.Settings, null) })
@@ -192,6 +213,29 @@ private object NoMotionScheme : MotionScheme {
                             web = this
                             setBackgroundColor(AndroidColor.TRANSPARENT)
                             configureReader(this, model, scope) { readerReady = true }
+                            webChromeClient = object : android.webkit.WebChromeClient() {
+                                override fun onShowFileChooser(view: WebView, callback: android.webkit.ValueCallback<Array<android.net.Uri>>, parameters: FileChooserParams): Boolean {
+                                    imageCallback?.onReceiveValue(null); imageCallback = callback; imageNote = model.state.value.active.id
+                                    imagePicker.launch(arrayOf("image/*")); return true
+                                }
+                            }
+                            setOnDragListener { _, event ->
+                                when(event.action) {
+                                    android.view.DragEvent.ACTION_DRAG_STARTED -> event.clipDescription?.let { it.hasMimeType("image/*") || it.hasMimeType("application/octet-stream") || it.hasMimeType("text/uri-list") } == true
+                                    android.view.DragEvent.ACTION_DROP -> {
+                                        val permissions = activity.requestDragAndDropPermissions(event)
+                                        val clip = event.clipData
+                                        val uris = (0 until (clip?.itemCount ?: 0)).mapNotNull { clip!!.getItemAt(it).uri }
+                                        if (uris.isNotEmpty()) {
+                                            val id = model.state.value.active.id
+                                            evaluateJavascript("window.supermdCaptureInsertion?.()", null)
+                                            model.importDropped(uris, id) { images -> permissions?.release(); images?.let { evaluateJavascript("window.supermdInsertImages?.($it)", null) } }
+                                        } else permissions?.release()
+                                        true
+                                    }
+                                    else -> true
+                                }
+                            }
                         })
                     } }, modifier = Modifier.fillMaxSize().clipToBounds(), onRelease = { readerReady = false; web?.removeJavascriptInterface("SuperMD"); web?.destroy(); it.removeAllViews(); web = null })
                     if (state.fullscreen) Surface(shape = RoundedCornerShape(24.dp), color = palette.surfaceContainer.copy(alpha = .94f), modifier = Modifier.align(Alignment.TopEnd).safeDrawingPadding().padding(8.dp)) { Row(verticalAlignment = Alignment.CenterVertically) { IconButton(onClick = { model.zoom(state.zoom - 10) }) { Icon(Icons.Rounded.Remove, "Zoom out") }; TextButton(onClick = { model.zoom(100f) }) { Text("${state.zoom.toInt()}%") }; IconButton(onClick = { model.zoom(state.zoom + 10) }) { Icon(Icons.Rounded.Add, "Zoom in") }; IconButton(onClick = { model.fullscreen(false) }) { Icon(Icons.Rounded.FullscreenExit, "Exit fullscreen") } } }

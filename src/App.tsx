@@ -16,6 +16,9 @@ import { preparePdf } from "./preparePdf";
 import { addTab, closeTab, editTab, initialWorkspace, isDirty, markTabSaved, openTab, readWorkspace, restoreClosedTab, tabTitle, type DocumentWorkspace } from "./documentTabs";
 import type { DocumentData, ExportOptions, ThemeMode, ViewMode } from "./types";
 import { clampPreviewZoom, previewLayoutWidth, zoomShortcut } from "./zoom";
+import MediaTools, { type InsertionPoint } from "./components/MediaTools";
+import { imageMarkdown, prepareFmd, type ImportedImage } from "./documentMedia";
+import { recordRecent } from "./recentFiles";
 
 const welcome = `# Super MD
 
@@ -287,7 +290,7 @@ export default function App() {
   };
 
   const flash = (message: string) => { setNotice(message); window.setTimeout(() => setNotice(""), 2800); };
-  const applyDocument = useCallback((doc: DocumentData) => setDocuments((current) => openTab(current, doc)), []);
+  const applyDocument = useCallback((doc: DocumentData) => { setDocuments((current) => openTab(current, doc)); recordRecent(doc.path); }, []);
   const chooseFolder = useCallback(async () => {
     try { const root = await invoke<string | null>("open_workspace_folder"); if (root) { setFolderRoot(root); setFolderVisible(true); localStorage.setItem("folder.root", root); } }
     catch (error) { flash(`Could not open folder: ${error}`); }
@@ -309,6 +312,9 @@ export default function App() {
     return () => { disposed = true; stop?.(); };
   }, [closeWindow]);
   const newDocument = useCallback(() => setDocuments((current) => addTab(current)), []);
+  const insertMedia = useCallback((text: string, point?: InsertionPoint) => {
+    setDocuments((current) => { const tab = current.tabs.find((t) => t.id === current.activeId)!; const from = Math.max(0, Math.min(point?.from ?? tab.content.length, tab.content.length)); const to = Math.max(from, Math.min(point?.to ?? from, tab.content.length)); return editTab(current, tab.id, tab.content.slice(0, from) + text + tab.content.slice(to)); });
+  }, []);
   const open = useCallback(async () => {
     if (openingRef.current) return;
     openingRef.current = true;
@@ -326,13 +332,14 @@ export default function App() {
     if (!tab || savingRef.current.has(tab.id)) return;
     savingRef.current.add(tab.id);
     try {
+      const prepared = /\.fmd$/i.test(tab.path || "") && !saveAs ? await prepareFmd(tab.content, tab.path) : { content: tab.content, assets: {} };
       const saved = android ? await (async () => {
         const target = saveAs || !tab.path ? await chooseMobileDocument({ defaultPath: tabTitle(tab), filters: [{ name: "Markdown", extensions: ["smd", "md"] }] }) : tab.path;
         if (!target) return null;
         await writeTextFile(target, tab.content);
         return target;
-      })() : await invoke<string | null>("save_document", { request: { path: saveAs ? null : tab.path, content: tab.content } });
-      if (saved) { setDocuments((current) => markTabSaved(current, tab.id, saved, tab.content)); flash("Saved"); }
+      })() : await invoke<string | null>("save_document", { request: { path: saveAs ? null : tab.path, content: prepared.content, assets: prepared.assets, sourcePath: tab.path } });
+      if (saved) { setDocuments((current) => markTabSaved(current.tabs.find((t) => t.id === tab.id)?.content === tab.content ? editTab(current, tab.id, prepared.content) : current, tab.id, saved, prepared.content)); recordRecent(saved); flash("Saved"); }
     } catch (error) { if (!pickerCancelled(error)) flash(`Could not save: ${error}`); }
     finally { savingRef.current.delete(tab.id); }
   }, []);
@@ -407,13 +414,15 @@ export default function App() {
       if (payload.type === "over") { setDraggingFile(true); return; }
       setDraggingFile(false);
       if (payload.type !== "drop") return;
-      const candidate = payload.paths.find((name) => /\.(smd|md|markdown)$/i.test(name));
-      if (!candidate) { flash("Drop a .smd or Markdown document"); return; }
+      const images = payload.paths.filter((name) => /\.(png|jpe?g|svg|gif|webp|avif)$/i.test(name));
+      if (images.length) { const id = documentsRef.current.activeId; try { const imported = await invoke<ImportedImage[]>("import_image_paths", { paths: images }); setDocuments((current) => { const tab = current.tabs.find((tab) => tab.id === id); return tab ? editTab(current, id, tab.content + "\n\n" + imported.map(imageMarkdown).join("\n\n") + "\n") : current; }); } catch (e) { flash(String(e)); } return; }
+      const candidate = payload.paths.find((name) => /\.(smd|md|markdown|fmd)$/i.test(name));
+      if (!candidate) { flash("Drop an image, .fmd, .smd or Markdown document"); return; }
       try { applyDocument(await invoke<DocumentData>("read_document_at", { path: candidate })); }
       catch (error) { flash(`Could not open dropped file: ${error}`); }
     }).then((stop) => { unlisten = stop; });
     return () => unlisten?.();
-  }, [applyDocument]);
+  }, [applyDocument, insertMedia]);
 
   useEffect(() => {
     const flush = () => {
@@ -528,6 +537,7 @@ export default function App() {
           <button className="toolbar-button icon-only" onClick={chooseFolder} title="Open folder · Ctrl+Shift+O" aria-label="Open folder"><FolderOpen size={19} weight="fill" /></button>
           <button className="toolbar-button" onClick={() => save(false)} title="Save · Ctrl+S"><FloppyDisk size={19} /><span>Save</span></button>
           <button className="toolbar-button icon-only" onClick={() => window.dispatchEvent(new Event("supermd-find"))} title="Find and replace · Ctrl+F" aria-label="Find and replace"><MagnifyingGlass size={19} /></button>
+          <button className="toolbar-button" onClick={() => window.supermdMedia?.()} aria-label="Insert image or link">Insert</button>
         </nav>
         <nav className="right-actions" aria-label="View and export">
           <div className="segmented" aria-label="View mode">
@@ -608,6 +618,7 @@ export default function App() {
         <button className="primary-action" onClick={exportPdf} disabled={exporting}>{exporting ? "Typesetting…" : "Choose destination & export"}</button>
       </motion.aside></motion.div>}</AnimatePresence>
       {showWelcome && <WelcomeSetup theme={normalTheme} onTheme={setNormalTheme} readerFont={readerFont} onReaderFont={setReaderFont} motionEnabled={motionEnabled} onMotion={(enabled) => setReduceMotion(!enabled)} onFinish={(openFile) => { localStorage.setItem("setup.complete", "true"); localStorage.removeItem("setup.started"); setShowWelcome(false); if (openFile) window.setTimeout(() => open(), 100); }} />}
+      <MediaTools key={activeTab.id} documentId={activeTab.id} content={content} documentPath={path} onInsert={insertMedia} onNotice={flash} />
     </div>
     </MotionConfig>
   );

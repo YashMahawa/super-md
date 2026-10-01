@@ -22,7 +22,8 @@ import org.json.JSONObject
 import java.io.File
 import java.util.UUID
 
-data class Note(val id: String = UUID.randomUUID().toString(), val name: String = "Untitled.smd", val uri: String? = null, val content: String = "", val saved: String = "", val relative: String? = null) { val dirty get() = content != saved }
+data class Note(val id: String = UUID.randomUUID().toString(), val name: String = "Untitled.smd", val uri: String? = null, val content: String = "", val saved: String = "", val relative: String? = null, val assetDirectory: String? = null) { val dirty get() = content != saved }
+data class RecentNote(val name: String, val uri: String, val relative: String? = null)
 data class FileEntry(val name: String, val uri: String, val directory: Boolean, val relative: String)
 data class StudioState(val tabs: List<Note> = listOf(Note(name = "Welcome.smd", content = sample, saved = sample)), val closedTabs: List<Note> = emptyList(), val activeId: String = "", val mode: String = "live", val fullscreen: Boolean = false, val normalZoom: Float = 100f, val fullscreenZoom: Float = 100f, val theme: String = "system", val fullscreenTheme: String = "black", val motion: Boolean = true, val font: String = "sans", val size: Float = 17f, val folder: String? = null, val files: List<FileEntry> = emptyList(), val busy: Boolean = false, val message: String? = null, val error: String? = null, val welcomed: Boolean = false, val pdf: String = "{\"pageSize\":\"a4\",\"margin\":18,\"fontSize\":10.5,\"lineHeight\":1.35,\"fontFamily\":\"Libertinus Serif\",\"pageNumbers\":true}") {
     val active get() = tabs.find { it.id == activeId } ?: tabs.first()
@@ -72,6 +73,16 @@ plt.grid(alpha=.2)
 
 class StudioViewModel(app: Application) : AndroidViewModel(app) {
     private val prefs = app.getSharedPreferences("studio", 0)
+    val media = MediaStorage(app)
+    private val recentMutable = MutableStateFlow(runCatching { val list = JSONArray(prefs.getString("recent", "[]")); (0 until minOf(list.length(), 24)).map { i -> val n = list.getJSONObject(i); RecentNote(n.getString("name"), n.getString("uri"), n.optString("relative").takeIf { it.isNotBlank() }) } }.getOrDefault(emptyList()))
+    val recent = recentMutable.asStateFlow()
+    var requestPortable: (() -> Unit)? = null
+    private fun remember(note: Note) {
+        val uri = note.uri ?: return
+        recentMutable.value = (listOf(RecentNote(note.name, uri, note.relative)) + recentMutable.value.filter { it.uri != uri }).take(24)
+        prefs.edit().putString("recent", JSONArray().apply { recentMutable.value.forEach { put(JSONObject().put("name", it.name).put("uri", it.uri).put("relative", it.relative ?: "")) } }.toString()).apply()
+    }
+    fun clearRecent() { recentMutable.value = emptyList(); prefs.edit().remove("recent").apply() }
     private val snapshot = File(app.filesDir, "workspace.json")
     private val mutable = MutableStateFlow(restore())
     val state = mutable.asStateFlow()
@@ -85,9 +96,9 @@ class StudioViewModel(app: Application) : AndroidViewModel(app) {
         try {
             if (snapshot.isFile && snapshot.length() < 30_000_000) {
                 val json = JSONObject(snapshot.readText()); val list = json.getJSONArray("tabs")
-                val notes = (0 until list.length()).map { i -> val n = list.getJSONObject(i); Note(n.getString("id"), n.getString("name"), n.optString("uri").takeIf { it.isNotBlank() }, n.getString("content"), n.getString("saved"), n.optString("relative").takeIf { it.isNotBlank() }) }
+                val notes = (0 until list.length()).map { i -> val n = list.getJSONObject(i); Note(n.getString("id"), n.getString("name"), n.optString("uri").takeIf { it.isNotBlank() }, n.getString("content"), n.getString("saved"), n.optString("relative").takeIf { it.isNotBlank() }, n.optString("assetDirectory").takeIf { it.isNotBlank() }) }
                 val closed = json.optJSONArray("closed") ?: JSONArray()
-                val closedNotes = (0 until closed.length()).map { i -> val n = closed.getJSONObject(i); Note(n.getString("id"), n.getString("name"), n.optString("uri").takeIf { it.isNotBlank() }, n.getString("content"), n.getString("saved"), n.optString("relative").takeIf { it.isNotBlank() }) }
+                val closedNotes = (0 until closed.length()).map { i -> val n = closed.getJSONObject(i); Note(n.getString("id"), n.getString("name"), n.optString("uri").takeIf { it.isNotBlank() }, n.getString("content"), n.getString("saved"), n.optString("relative").takeIf { it.isNotBlank() }, n.optString("assetDirectory").takeIf { it.isNotBlank() }) }
                 if (notes.isNotEmpty()) s = s.copy(tabs = notes, closedTabs = closedNotes.take(12), activeId = json.optString("active"), mode = json.optString("mode", "live"), normalZoom = json.optDouble("normalZoom", 100.0).toFloat(), fullscreenZoom = json.optDouble("fullscreenZoom", 100.0).toFloat())
             }
         } catch (_: Exception) { s = s.copy(error = "The recovery snapshot could not be read. Your original files are untouched.") }
@@ -96,8 +107,8 @@ class StudioViewModel(app: Application) : AndroidViewModel(app) {
     private fun schedulePersist() { persistJob?.cancel(); val current = mutable.value; persistJob = viewModelScope.launch(Dispatchers.IO) { delay(200); persist(current) } }
     @Synchronized private fun persist(s: StudioState) {
         try {
-            val tabs = JSONArray(); s.tabs.forEach { tabs.put(JSONObject().put("id", it.id).put("name", it.name).put("uri", it.uri ?: "").put("content", it.content).put("saved", it.saved).put("relative", it.relative ?: "")) }
-            val closed = JSONArray(); s.closedTabs.forEach { closed.put(JSONObject().put("id", it.id).put("name", it.name).put("uri", it.uri ?: "").put("content", it.content).put("saved", it.saved).put("relative", it.relative ?: "")) }
+            val tabs = JSONArray(); s.tabs.forEach { tabs.put(JSONObject().put("id", it.id).put("name", it.name).put("uri", it.uri ?: "").put("content", it.content).put("saved", it.saved).put("relative", it.relative ?: "").put("assetDirectory", it.assetDirectory ?: "")) }
+            val closed = JSONArray(); s.closedTabs.forEach { closed.put(JSONObject().put("id", it.id).put("name", it.name).put("uri", it.uri ?: "").put("content", it.content).put("saved", it.saved).put("relative", it.relative ?: "").put("assetDirectory", it.assetDirectory ?: "")) }
             val temporary = File(snapshot.parentFile, "workspace.tmp"); temporary.outputStream().use { stream -> stream.write(JSONObject().put("active", s.active.id).put("tabs", tabs).put("closed", closed).put("mode", s.mode).put("normalZoom", s.normalZoom).put("fullscreenZoom", s.fullscreenZoom).toString().toByteArray()); stream.fd.sync() }
             if (!temporary.renameTo(snapshot)) error("Could not replace recovery snapshot")
             prefs.edit().putString("theme", s.theme).putString("fullTheme", s.fullscreenTheme).putBoolean("motion", s.motion).putString("font", s.font).putFloat("size", s.size).putString("folder", s.folder).putString("pdf", s.pdf).putBoolean("welcomed", s.welcomed).apply()
@@ -128,18 +139,27 @@ class StudioViewModel(app: Application) : AndroidViewModel(app) {
                 val existing = mutable.value.tabs.find { it.uri == uri.toString() }; if (existing != null) return@withContext existing
                 try { resolver.takePersistableUriPermission(uri, Intent.FLAG_GRANT_READ_URI_PERMISSION or Intent.FLAG_GRANT_WRITE_URI_PERMISSION) } catch (_: SecurityException) { }
                 val name = DocumentFile.fromSingleUri(getApplication(), uri)?.name ?: "Note.md"
-                val content = resolver.openInputStream(uri)?.use { stream -> readLimited(stream, 20_000_000).toString(Charsets.UTF_8) } ?: error("Document permission is unavailable; choose it again")
-                Note(name = name, uri = uri.toString(), content = content, saved = content, relative = relative)
+                resolver.openInputStream(uri)?.use { stream ->
+                    if (name.endsWith(".fmd", true)) { val opened = media.openFmd(stream); Note(name = name, uri = uri.toString(), content = opened.markdown, saved = opened.markdown, relative = relative, assetDirectory = opened.directory) }
+                    else { val content = readLimited(stream, 20_000_000).toString(Charsets.UTF_8); Note(name = name, uri = uri.toString(), content = content, saved = content, relative = relative) }
+                } ?: error("Document permission is unavailable; choose it again")
             }
             change { s -> val existing = s.tabs.find { it.uri == note.uri }; s.copy(tabs = if (existing != null) s.tabs else s.tabs + note, activeId = existing?.id ?: note.id) }
+            remember(note)
         } catch (error: Exception) { fail("Could not open note: ${error.message}") }
     }
     fun save(uri: Uri? = null) = viewModelScope.launch {
         val note = mutable.value.active; val target = uri ?: note.uri?.let(Uri::parse) ?: return@launch
         busy(true)
         try {
-            withContext(Dispatchers.IO) { resolver.openOutputStream(target, "wt")?.use { it.write(note.content.toByteArray()) } ?: error("Writing permission is unavailable; use Save as") }
+            withContext(Dispatchers.IO) {
+                val name = DocumentFile.fromSingleUri(getApplication(), target)?.name ?: note.name
+                require(!name.endsWith(".fmd", true)) { "Use portable save for an FMD file" }
+                copyAttachments(note, target)
+                resolver.openOutputStream(target, "wt")?.use { it.write(note.content.toByteArray()) } ?: error("Writing permission is unavailable; use Save as")
+            }
             change { s -> s.copy(busy = false, tabs = s.tabs.map { if (it.id == note.id) it.copy(uri = target.toString(), name = DocumentFile.fromSingleUri(getApplication(), target)?.name ?: note.name, saved = note.content) else it }, message = "Saved") }
+            mutable.value.tabs.find { it.id == note.id }?.let(::remember)
         } catch (error: Exception) { fail("Could not save note: ${error.message}") }
     }
     fun setFolder(uri: Uri) = viewModelScope.launch {
@@ -153,18 +173,24 @@ class StudioViewModel(app: Application) : AndroidViewModel(app) {
             val entries = withContext(Dispatchers.IO) {
                 var folder = DocumentFile.fromTreeUri(getApplication(), Uri.parse(mutable.value.folder ?: uri.toString())) ?: error("Choose the folder again to restore access")
                 relative.split('/').filter { it.isNotEmpty() }.forEach { part -> folder = folder.findFile(part) ?: error("Folder disappeared") }
-                folder.listFiles().mapNotNull { f -> val name = f.name ?: return@mapNotNull null; if (name.startsWith('.')) return@mapNotNull null; if (f.isDirectory || name.substringAfterLast('.').lowercase() in listOf("md", "smd", "markdown")) FileEntry(name, f.uri.toString(), f.isDirectory, (if (relative.isEmpty()) "" else "$relative/") + name) else null }.sortedWith(compareByDescending<FileEntry> { it.directory }.thenBy { it.name.lowercase() })
+                folder.listFiles().mapNotNull { f -> val name = f.name ?: return@mapNotNull null; if (name.startsWith('.')) return@mapNotNull null; if (f.isDirectory || name.substringAfterLast('.').lowercase() in listOf("md", "smd", "markdown", "fmd")) FileEntry(name, f.uri.toString(), f.isDirectory, (if (relative.isEmpty()) "" else "$relative/") + name) else null }.sortedWith(compareByDescending<FileEntry> { it.directory }.thenBy { it.name.lowercase() })
             }
             mutable.value = mutable.value.copy(files = entries)
         } catch (error: Exception) { fail("Could not list folder: ${error.message}") }
     }
     suspend fun asset(document: String, source: String): String = withContext(Dispatchers.IO) {
-        val note = mutable.value.tabs.find { it.uri == document } ?: error("The image's document is no longer open")
-        val folderUri = mutable.value.folder?.let(Uri::parse) ?: error("Open the note's containing folder to grant access to relative images")
+        val note = mutable.value.tabs.find { it.uri == document || it.id == document } ?: error("The image's document is no longer open")
+        media.local(source, note.assetDirectory)?.let { return@withContext media.data(it) }
+        val documentId = runCatching { DocumentsContract.getDocumentId(Uri.parse(document)) }.getOrDefault("")
+        // A recently reopened note may belong to a different previously granted
+        // folder. Prefer its matching tree grant, not the currently browsed tree.
+        val folderUri = resolver.persistedUriPermissions.filter { it.isReadPermission && DocumentsContract.isTreeUri(it.uri) && it.uri.authority == Uri.parse(document).authority }.mapNotNull { permission ->
+            val root = runCatching { DocumentsContract.getTreeDocumentId(permission.uri) }.getOrNull() ?: return@mapNotNull null
+            if (documentId.startsWith("$root/") || root.endsWith(':') && documentId.startsWith(root)) root to permission.uri else null
+        }.maxByOrNull { it.first.length }?.second ?: mutable.value.folder?.let(Uri::parse) ?: error("Open the note's containing folder to grant access to relative images")
         var file = DocumentFile.fromTreeUri(getApplication(), folderUri) ?: error("Restore folder access by opening it again")
         val rootId = DocumentsContract.getTreeDocumentId(folderUri)
-        val documentId = runCatching { DocumentsContract.getDocumentId(Uri.parse(document)) }.getOrDefault("")
-        val relative = note.relative ?: documentId.takeIf { it.startsWith("$rootId/") }?.removePrefix("$rootId/") ?: documentId.takeIf { it.startsWith(rootId) }?.removePrefix(rootId)?.trimStart('/')
+        val relative = documentId.takeIf { it.startsWith("$rootId/") }?.removePrefix("$rootId/") ?: documentId.takeIf { rootId.endsWith(':') && it.startsWith(rootId) }?.removePrefix(rootId)?.trimStart('/') ?: note.relative
         val parent = relative?.substringBeforeLast('/', "") ?: ""
         val parts = (if (parent.isEmpty()) "" else "$parent/") + Uri.decode(source)
         val stack = ArrayDeque<String>()
@@ -213,6 +239,54 @@ class StudioViewModel(app: Application) : AndroidViewModel(app) {
             pythonMutex.unlock()
         }
     }
+    private fun copyAttachments(note: Note, destination: Uri) {
+        val sources = JSONArray(PdfEngine.imageSources(note.content))
+        val local = (0 until sources.length()).map { sources.getString(it) }.distinct().mapNotNull { source -> media.local(source, note.assetDirectory)?.let { source to it } }
+        if (local.isEmpty()) return
+        val tree = mutable.value.folder?.let(Uri::parse) ?: error("Images need a containing folder permission. Open that folder, or export a single portable .fmd file instead.")
+        val rootId = DocumentsContract.getTreeDocumentId(tree)
+        val targetId = DocumentsContract.getDocumentId(destination)
+        require(targetId.startsWith("$rootId/")) { "Open the destination folder, or export a portable .fmd file to include images." }
+        val parent = targetId.removePrefix("$rootId/").substringBeforeLast('/', "")
+        var directory = DocumentFile.fromTreeUri(getApplication(), tree) ?: error("Restore folder permission")
+        parent.split('/').filter { it.isNotEmpty() }.forEach { directory = directory.findFile(it) ?: error("Destination folder disappeared") }
+        val assets = directory.findFile("assets") ?: directory.createDirectory("assets") ?: error("Cannot create image folder")
+        require(assets.isDirectory)
+        local.forEach { (source, file) ->
+            val name = source.substringAfter('/')
+            val existing = assets.findFile(name)
+            if (existing != null) {
+                val bytes = resolver.openInputStream(existing.uri)?.use { readLimited(it, 25_000_000) }
+                require(bytes != null && bytes.contentEquals(file.readBytes())) { "A different image already exists at assets/$name; use FMD export instead." }
+            } else {
+                val type = media.data(file).substringAfter("data:").substringBefore(';')
+                val target = assets.createFile(type, name) ?: error("Cannot create image $name")
+                resolver.openOutputStream(target.uri, "wt")?.use { output -> file.inputStream().use { it.copyTo(output) } } ?: error("Cannot write image")
+            }
+        }
+    }
+    var portableOutput: Uri? = null
+    suspend fun writePortable(id: String, content: String, assets: JSONObject, save: Boolean, originalContent: String) = withContext(Dispatchers.IO) {
+        val note = mutable.value.tabs.find { it.id == id } ?: error("The note is no longer open")
+        val target = if (save) note.uri?.let(Uri::parse) else portableOutput
+        require(target != null) { "Choose a portable file destination" }
+        val staged = File(getApplication<Application>().cacheDir, "fmd-${UUID.randomUUID()}.tmp")
+        try {
+            staged.outputStream().use { media.writeFmd(it, content, assets) }
+            // Extract assets independently so a saved draft can immediately resolve
+            // new portable references without carrying binary data in its state.
+            val opened = if (save) staged.inputStream().use(media::openFmd) else null
+            resolver.openOutputStream(target, "wt")?.use { output -> staged.inputStream().use { it.copyTo(output) } } ?: error("Cannot write portable file")
+            withContext(Dispatchers.Main) {
+                if (save) { change { s -> s.copy(tabs = s.tabs.map { if (it.id == id) it.copy(content = if (it.content == originalContent) content else it.content, saved = content, assetDirectory = opened!!.directory) else it }, busy = false, message = "Portable note saved") }; mutable.value.tabs.find { it.id == id }?.let(::remember) }
+                else { portableOutput = null; mutable.value = mutable.value.copy(busy = false, message = "Portable .fmd exported") }
+            }
+        } finally { staged.delete() }
+    }
+    fun importDropped(uris: List<Uri>, id: String, result: (JSONArray?) -> Unit) = viewModelScope.launch {
+        try { val images = withContext(Dispatchers.IO) { media.importUris(uris) }; if (mutable.value.active.id == id) result(images) else { val insertion = (0 until images.length()).joinToString("\n\n") { i -> val image = images.getJSONObject(i); "![${image.getString("alt").replace("[", "\\[").replace("]", "\\]")}](<${image.getString("source")}>)" }; val note = mutable.value.tabs.find { it.id == id }; if (note != null) edit(id, note.content + "\n\n" + insertion + "\n"); result(null) } }
+        catch (error: Exception) { fail("Could not insert image: ${error.message}"); result(null) }
+    }
     suspend fun export(content: String, options: String, assets: JSONObject) = withContext(Dispatchers.IO) {
         val target = outputUri ?: error("Choose a PDF destination first")
         val staging = File(getApplication<Application>().cacheDir, "pdf-${UUID.randomUUID()}").apply { mkdirs() }
@@ -227,12 +301,8 @@ class StudioViewModel(app: Application) : AndroidViewModel(app) {
         } finally { staging.deleteRecursively() }
     }
 }
-private fun readLimited(input: java.io.InputStream, limit: Int): ByteArray {
-    val output = java.io.ByteArrayOutputStream(); val buffer = ByteArray(8192)
-    while (true) { val count = input.read(buffer); if (count < 0) break; if (output.size() + count > limit) error("File exceeds the ${limit / 1_000_000} MB limit"); output.write(buffer, 0, count) }
-    return output.toByteArray()
-}
 object PdfEngine {
     init { System.loadLibrary("smd_core") }
     @JvmStatic external fun export(markdown: String, options: String, assets: String, output: String): String
+    @JvmStatic external fun imageSources(markdown: String): String
 }

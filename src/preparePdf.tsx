@@ -10,6 +10,7 @@ import { normalizeCallouts } from "./components/MarkdownPreview";
 import { invoke } from "./nativeBridge";
 import { renderMermaid } from "./mermaidRenderer";
 import { pythonResults } from "./renderedOutputs";
+import { svgImage } from "./svgImage";
 
 function data(blob: Blob): Promise<string> {
   return new Promise((resolve, reject) => { const reader = new FileReader(); reader.onload = () => resolve(String(reader.result)); reader.onerror = () => reject(reader.error); reader.readAsDataURL(blob); });
@@ -20,20 +21,23 @@ export async function preparePdf(markdown: string, documentPath: string | null) 
   const work: Promise<void>[] = []; const assets: Record<string, string> = {}; let count = 0;
   const add = (url: string, name: string) => { assets[name] = url.slice(url.indexOf(",") + 1); return name; };
   visit(tree, (node: any) => {
-    const exportCell = node.type === "code" && ["mermaid", "smd-chart", "python", "py"].includes(node.lang);
+    const exportCell = node.type === "code" && ["mermaid", "svg", "smd-chart", "python", "py"].includes(node.lang);
     if (node.type === "image") work.push((async () => {
       let url: string = node.url;
       if (!/^data:/i.test(url)) {
-        if (/^https?:/i.test(url)) throw new Error(`Remote image ${url}: download it into the note's folder before exporting offline.`);
-        if (!documentPath) throw new Error(`Save your note before exporting relative image ${url}.`);
-        url = await invoke<string>("load_asset", { documentPath, source: url });
+        if (/^https?:/i.test(url)) url = (await invoke<{ body: string }>("fetch_resource", { url, image: true })).body;
+        else {
+          if (!documentPath && !/^assets\/import-[\w-]+\./.test(url)) throw new Error(`Save your note before exporting relative image ${url}.`);
+          url = await invoke<string>("load_asset", { documentPath: documentPath || "", source: url });
+        }
       }
+      if (!/^data:image\/(?:svg\+xml|png|jpeg);base64,/i.test(url)) url = await rasterImage(url);
       const extension = url.startsWith("data:image/svg") ? "svg" : url.startsWith("data:image/jpeg") ? "jpg" : "png";
       node.url = add(url, `asset-${++count}.${extension}`);
     })());
     if (exportCell) work.push((async () => {
-      if (node.lang === "mermaid" || node.lang === "smd-chart") {
-        const svg = node.lang === "mermaid" ? await renderMermaid(node.value) : (() => {
+      if (["mermaid", "smd-chart", "svg"].includes(node.lang)) {
+        const svg = node.lang === "svg" ? svgImage(node.value) : node.lang === "mermaid" ? await renderMermaid(node.value) : (() => {
           const html = renderToStaticMarkup(<InteractiveChart source={node.value} />);
           const parsed = new DOMParser().parseFromString(html, "text/html");
           const warning = parsed.querySelector(".chart-warning, .render-error");
@@ -75,4 +79,14 @@ export async function preparePdf(markdown: string, documentPath: string | null) 
   // its opening bracket; restore only explicit blockquote callout prefixes.
   const content = processor.stringify(tree).replace(/^([\t ]*>[\t ]*)\\(\[![\w-]+\][+-]?)/gm, "$1$2");
   return { content, assets };
+}
+
+async function rasterImage(url: string): Promise<string> {
+  if (!/^data:image\/(?:gif|webp|avif);base64,/i.test(url)) throw new Error("Unsupported PDF image type.");
+  const image = new Image();
+  await new Promise<void>((resolve, reject) => { image.onload = () => resolve(); image.onerror = () => reject(new Error("This image could not be decoded for PDF export.")); image.src = url; });
+  if (image.naturalWidth * image.naturalHeight > 20_000_000) throw new Error("This image exceeds the 20-megapixel PDF conversion limit.");
+  const canvas = document.createElement("canvas"); canvas.width = image.naturalWidth; canvas.height = image.naturalHeight;
+  canvas.getContext("2d")!.drawImage(image, 0, 0);
+  return canvas.toDataURL("image/png");
 }

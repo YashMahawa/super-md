@@ -12,6 +12,28 @@ import java.io.File
 
 @RunWith(AndroidJUnit4::class)
 class EngineTest {
+    @Test fun portableImagesStayOutsideSourceAndExportOffline() = runBlocking {
+        val app = ApplicationProvider.getApplicationContext<android.app.Application>()
+        val media = MediaStorage(app)
+        val vector = "<svg xmlns='http://www.w3.org/2000/svg' width='120' height='60'><path d='M0 55L120 5' stroke='blue'/></svg>"
+        val data = "data:image/svg+xml;base64," + android.util.Base64.encodeToString(vector.toByteArray(), android.util.Base64.NO_WRAP)
+        val imported = media.importJson(org.json.JSONArray().put(JSONObject().put("name", "Proof.svg").put("data", data))).getJSONObject(0)
+        val source = imported.getString("source")
+        val markdown = "# Portable note\n\n![Proof](<$source>)\n\n${'$'}${'$'}\\int_0^1 x^2dx=\\frac13${'$'}${'$'}\n\n```python\nprint('never execute implicitly')\n```"
+        val file = File(app.cacheDir, "portable-test.fmd")
+        file.outputStream().use { media.writeFmd(it, markdown, JSONObject().put(source, data)) }
+        val opened = file.inputStream().use(media::openFmd)
+        assertEquals(markdown, opened.markdown); assertFalse(opened.markdown.contains("base64"))
+        assertEquals(data, media.data(media.local(source, opened.directory)!!))
+        val images = org.json.JSONArray(PdfEngine.imageSources(markdown)); assertEquals(1, images.length()); assertEquals(source, images.getString(0))
+        val assets = File(app.cacheDir, "portable-test-assets").apply { mkdirs() }
+        File(assets, "proof.svg").writeText(vector)
+        val pdf = File(app.cacheDir, "portable-test.pdf")
+        assertEquals("", PdfEngine.export(markdown.replace(source, "proof.svg"), StudioState().pdf, assets.absolutePath, pdf.absolutePath))
+        PdfRenderer(ParcelFileDescriptor.open(pdf, ParcelFileDescriptor.MODE_READ_ONLY)).use { assertTrue(it.pageCount > 0) }
+        val unsafe = """{"format":"supermd-fmd","version":1,"markdown":"note","assets":{"assets/../bad.svg":"$data"}}"""
+        assertTrue(runCatching { media.openFmd(unsafe.byteInputStream()) }.isFailure)
+    }
     @Test fun latexTablesAndLocalMatplotlibExportOffline() = runBlocking {
         val app = ApplicationProvider.getApplicationContext<android.app.Application>()
         val model = StudioViewModel(app)

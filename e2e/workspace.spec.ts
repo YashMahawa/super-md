@@ -54,3 +54,40 @@ test("Android shares math, callouts, graphs and portable PDF preparation", async
     const svg = Buffer.from(asset, "base64").toString(); expect(svg).toContain("<svg"); expect(svg).not.toContain("<foreignObject");
   }
 });
+
+test("click-to-edit, media drops, titled links and portable source work together", async ({ page }) => {
+  const calls: Array<{ command: string; args: any }> = []; const assets = new Map<string, string>(); let sequence = 0;
+  await page.exposeFunction("bridgePost", (id: string, command: string, raw: string) => {
+    const args = JSON.parse(raw); calls.push({ command, args });
+    let result: any = true;
+    if (command === "import_images") result = args.images.map((image: any) => { const source = `assets/import-test-${++sequence}.${image.data.startsWith("data:image/svg") ? "svg" : "jpg"}`; assets.set(source, image.data); return { source, alt: image.name }; });
+    if (command === "load_asset") result = assets.get(args.source);
+    if (command === "fetch_resource") result = { body: args.image ? "data:image/svg+xml;base64," + Buffer.from('<svg xmlns="http://www.w3.org/2000/svg" width="100" height="50"><rect width="100" height="50" fill="blue"/></svg>').toString("base64") : JSON.stringify({ title: "Understanding Fourier series", thumbnail_url: "https://i.ytimg.com/vi/dQw4w9WgXcQ/hqdefault.jpg" }) };
+    void page.evaluate(({ id, result }) => window.supermdReply?.(id, result, null), { id, result });
+  });
+  await page.addInitScript(() => { window.SuperMD = { post: (id, command, args) => (window as any).bridgePost(id, command, args) }; });
+  await page.goto("/android-reader.html");
+  await page.evaluate(() => window.supermdLoad?.({ id: "media-note", content: '# Study notes\n\n```svg\n<svg xmlns="http://www.w3.org/2000/svg" width="100" height="50"><circle cx="50" cy="25" r="20" fill="blue"/></svg>\n```', path: "media-note", mode: "live", dark: false, fullscreen: false, colors: {}, font: "sans", size: 17, zoom: 100 }));
+  await expect(page.locator(".live-edit-button")).toHaveCount(0); await expect(page.locator(".svg-diagram")).toBeVisible();
+  await page.getByRole("heading", { name: "Study notes" }).click(); await expect(page.getByRole("textbox", { name: "Edit Markdown block" })).toContainText("# Study notes");
+  await page.evaluate(() => { const editor = document.querySelector('textarea')!; const clipboard = new DataTransfer(); clipboard.setData("text/plain", "https://youtu.be/dQw4w9WgXcQ"); editor.dispatchEvent(new ClipboardEvent("paste", { clipboardData: clipboard, bubbles: true, cancelable: true })); });
+  await expect(page.getByRole("dialog", { name: "Insert image or link" })).toBeVisible(); await expect(page.getByLabel("Link title")).toHaveValue("Understanding Fourier series");
+  await page.getByLabel("Include the video thumbnail").check(); await page.getByRole("button", { name: "Insert link", exact: true }).click();
+  await expect(page.getByRole("dialog")).toHaveCount(0);
+  await expect.poll(() => calls.filter((call) => call.command === "document_changed").at(-1)?.args.content).toContain("[Understanding Fourier series](<https://youtu.be/dQw4w9WgXcQ>)");
+  // Live textarea exits on blur; switch explicitly to reading for DOM file drop.
+  const current = calls.filter((call) => call.command === "document_changed").at(-1)!.args.content;
+  await page.evaluate((content) => window.supermdLoad?.({ id: "media-note", content, path: "media-note", mode: "reader", dark: false, fullscreen: false, colors: {}, font: "sans", size: 17, zoom: 100 }), current);
+  await page.evaluate(() => { const transfer = new DataTransfer(); transfer.items.add(new File(['<svg xmlns="http://www.w3.org/2000/svg" width="40" height="40"><path d="M0 0L40 40" stroke="red"/></svg>'], "Dropped.svg", { type: "image/svg+xml" })); document.querySelector('.android-reading')!.dispatchEvent(new DragEvent("drop", { dataTransfer: transfer, bubbles: true, cancelable: true })); });
+  await expect(page.getByRole("img", { name: "Dropped.svg" })).toBeVisible();
+  await page.evaluate(() => window.supermdPortable?.(false));
+  await expect.poll(() => calls.some((call) => call.command === "export_fmd_native")).toBeTruthy();
+  const bundle = calls.find((call) => call.command === "export_fmd_native")!.args;
+  expect(Object.keys(bundle.assets)).toHaveLength(2); expect(bundle.content).not.toContain("base64"); expect(bundle.content).toContain("```svg");
+  await page.evaluate(() => window.supermdExport?.({ pageSize: "a4", margin: 18, fontSize: 11, fontFamily: "Libertinus Serif", lineHeight: 1.35, pageNumbers: false }));
+  await expect.poll(() => calls.some((call) => call.command === "export_pdf_native")).toBeTruthy();
+  expect(calls.find((call) => call.command === "export_failed")).toBeUndefined();
+  const pdf = calls.find((call) => call.command === "export_pdf_native")!.args;
+  expect(Object.keys(pdf.assets)).toHaveLength(3); expect(pdf.content).not.toContain("```svg");
+  await page.screenshot({ path: test.info().outputPath("media-and-vectors.png") });
+});

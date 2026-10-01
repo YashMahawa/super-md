@@ -1,6 +1,6 @@
 [package]
 name = "super-md"
-version = "0.2.0"
+version = "0.3.0"
 description = "A distraction-free, interactive Markdown studio"
 authors = ["Super MD contributors"]
 license = "MIT"
@@ -34,6 +34,7 @@ tauri = { version = "2", features = [] }
 tauri-plugin-dialog = "2"
 tauri-plugin-fs = "2"
 tempfile = "3"
+reqwest = { version = "0.12", default-features = false, features = ["blocking", "rustls-tls"] }
 which = "8"
 smd-core = { path = "../smd-core" }
 

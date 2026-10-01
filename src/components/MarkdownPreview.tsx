@@ -8,6 +8,7 @@ import rehypeHighlight from "rehype-highlight";
 import { visit } from "unist-util-visit";
 import InteractiveChart from "./InteractiveChart";
 import PythonCell from "./PythonCell";
+import SvgDiagram from "./SvgDiagram";
 
 const MermaidDiagram = lazy(() => import("./MermaidDiagram"));
 
@@ -78,8 +79,8 @@ function AssetImage({ src = "", alt = "", documentPath, trustedImageHosts, onTru
     setAllowOnce(false);
     if (isRemote || embedded) { setResolved(src); return; }
     setResolved("");
-    if (!documentPath) { setError("Save this document to resolve relative images."); return; }
-    invoke<string>("load_asset", { documentPath, source: src })
+    if (!documentPath && !/^assets\/import-[\w-]+\./.test(src)) { setError("Save this document to resolve relative images."); return; }
+    invoke<string>("load_asset", { documentPath: documentPath || "", source: src })
       .then((value) => { if (active) setResolved(value); })
       .catch((reason) => { if (active) setError(String(reason)); });
     return () => { active = false; };
@@ -115,6 +116,7 @@ function MarkdownPreview({ markdown, documentPath, python, dark, trustedImageHos
             const language = child.props.className?.match(/language-([\w-]+)/)?.[1];
             const source = textOf(child.props.children).replace(/\n$/, "");
             if (language === "smd-chart") return <InteractiveChart source={source} />;
+            if (language === "svg") return <SvgDiagram source={source} />;
             if (language === "mermaid") return <Suspense fallback={<span className="image-loading" role="status">Loading diagram…</span>}><MermaidDiagram source={source} dark={dark} /></Suspense>;
             if (language === "python" || language === "py") return <PythonCell source={source} python={python} highlighted={child.props.children} />;
             return <pre>{children}</pre>;

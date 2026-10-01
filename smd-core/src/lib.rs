@@ -1,4 +1,5 @@
 //! The same local typesetter is used by desktop and Android. No browser print layout.
+pub mod portable;
 use anyhow::{bail, Result};
 use pulldown_cmark::{CodeBlockKind, Event, Options, Parser, Tag, TagEnd};
 use serde::{Deserialize, Serialize};
@@ -201,6 +202,15 @@ pub fn export(markdown: &str, options: &PdfOptions, assets: &HashMap<String, Vec
         .build();
     let document = engine.compile().output.map_err(|errors| anyhow::anyhow!("PDF typesetting failed: {errors:?}"))?;
     typst_pdf::pdf(&document, &Default::default()).map(|v| v.to_vec()).map_err(|e| anyhow::anyhow!("PDF encoding failed: {e:?}"))
+}
+
+#[cfg(target_os = "android")]
+#[no_mangle]
+pub extern "system" fn Java_dev_supermd_studio_PdfEngine_imageSources(
+    mut env: jni::JNIEnv, _class: jni::objects::JClass, markdown: jni::objects::JString,
+) -> jni::sys::jstring {
+    let markdown: String = env.get_string(&markdown).expect("Markdown string").into();
+    env.new_string(serde_json::to_string(&image_sources(&markdown)).unwrap()).unwrap().into_raw()
 }
 
 #[cfg(target_os = "android")]

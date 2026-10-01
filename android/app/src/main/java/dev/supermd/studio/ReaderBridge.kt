@@ -27,6 +27,10 @@ class ReaderBridge(private val web: WebView, private val model: StudioViewModel,
                     "document_changed" -> { model.edit(args.getString("id"), args.getString("content")); true }
                     "zoom_changed" -> { model.zoom(args.getDouble("zoom").toFloat()); true }
                     "load_asset" -> model.asset(args.getString("documentPath"), args.getString("source"))
+                    "import_images" -> withContext(Dispatchers.IO) { model.media.importJson(args.getJSONArray("images")) }
+                    "fetch_resource" -> withContext(Dispatchers.IO) { JSONObject().put("body", model.media.fetch(args.getString("url"), args.optBoolean("image"))) }
+                    "request_fmd_export" -> { model.requestPortable?.invoke() ?: error("The file picker is not ready"); true }
+                    "export_fmd_native" -> { model.writePortable(args.getString("id"), args.getString("content"), args.getJSONObject("assets"), args.optBoolean("save"), args.getString("originalContent")); true }
                     "run_python" -> model.python(args.getString("code"))
                     "export_pdf_native" -> { model.export(args.getString("content"), args.getJSONObject("options").toString(), args.getJSONObject("assets")); true }
                     "export_failed" -> { model.fail(args.getString("error")); true }

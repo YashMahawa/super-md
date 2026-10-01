@@ -1,4 +1,5 @@
 use anyhow::{bail, Context, Result};
+mod media;
 use base64::{engine::general_purpose::STANDARD, Engine};
 use percent_encoding::percent_decode_str;
 use serde::{Deserialize, Serialize};
@@ -23,6 +24,9 @@ struct Document {
 struct SaveRequest {
     path: Option<String>,
     content: String,
+    #[serde(default)]
+    assets: std::collections::BTreeMap<String, String>,
+    source_path: Option<String>,
 }
 
 #[derive(Deserialize, Clone)]
@@ -122,7 +126,7 @@ struct ChartSlider {
 #[tauri::command]
 fn open_document() -> Result<Option<Document>, String> {
     let path = rfd::FileDialog::new()
-        .add_filter("Super Markdown", &["smd", "md", "markdown"])
+        .add_filter("Super Markdown", &["smd", "md", "markdown", "fmd"])
         .pick_file();
     path.map(read_document).transpose().map_err(display_error)
 }
@@ -134,13 +138,14 @@ fn open_document() -> Result<Option<Document>, String> {
 }
 
 #[tauri::command]
-fn read_document_at(path: String) -> Result<Document, String> {
-    read_document(PathBuf::from(path)).map_err(display_error)
+async fn read_document_at(path: String) -> Result<Document, String> {
+    tauri::async_runtime::spawn_blocking(move || read_document(PathBuf::from(path))).await.map_err(display_error)?.map_err(display_error)
 }
 
 fn read_document(path: PathBuf) -> Result<Document> {
-    let content =
-        fs::read_to_string(&path).with_context(|| format!("Could not read {}", path.display()))?;
+    let limit = if path.extension().is_some_and(|e| e.eq_ignore_ascii_case("fmd")) { smd_core::portable::MAX_FILE } else { 20_000_000 };
+    if fs::metadata(&path)?.len() > limit as u64 { bail!("Document exceeds its size limit"); }
+    let content = if path.extension().is_some_and(|e| e.eq_ignore_ascii_case("fmd")) { fs::read_to_string(media::portable_cache(&path)?.join("markdown"))? } else { fs::read_to_string(&path).with_context(|| format!("Could not read {}", path.display()))? };
     Ok(Document {
         path: path.to_string_lossy().into_owned(),
         content,
@@ -162,7 +167,32 @@ fn save_document(request: SaveRequest) -> Result<Option<String>, String> {
             None => return Ok(None),
         },
     };
-    atomic_write(&path, request.content.as_bytes())
+    let portable = path.extension().is_some_and(|e| e.eq_ignore_ascii_case("fmd"));
+    let content = if portable {
+        let mut assets = request.assets;
+        for source in smd_core::image_sources(&request.content) {
+            if !smd_core::portable::asset_name(&source) { return Err("Use Export portable .fmd to embed this note's image references".into()); }
+            if !assets.contains_key(&source) { let data = load_asset_inner(request.source_path.clone().unwrap_or_default(), source.clone())?; assets.insert(source, data); }
+        }
+        smd_core::portable::PortableDocument::new(request.content, assets).encode().map_err(display_error)?
+    } else {
+        // Imported attachments become ordinary companion files on Markdown save.
+        // FMD is the opt-in single-file alternative, not hidden vault metadata.
+        for source in smd_core::image_sources(&request.content) {
+            if smd_core::portable::asset_name(&source) {
+                let dest = path.parent().unwrap_or(Path::new(".")).join(&source);
+                // Ordinary companion assets which already exist need no copy.
+                if dest.is_file() && !source.starts_with("assets/import-") && !request.source_path.as_deref().is_some_and(|p| p.to_ascii_lowercase().ends_with(".fmd")) { continue; }
+                let data = load_asset_inner(request.source_path.clone().unwrap_or_default(), source)?;
+                let bytes = smd_core::portable::image_bytes(&data).map_err(display_error)?.1;
+                if dest.is_file() { if fs::read(&dest).map_err(display_error)? == bytes { continue; } return Err(format!("Different image already exists at {}; export FMD instead", dest.display())); }
+                fs::create_dir_all(dest.parent().unwrap()).map_err(display_error)?;
+                atomic_write(&dest, &bytes).map_err(display_error)?;
+            }
+        }
+        request.content
+    };
+    atomic_write(&path, content.as_bytes())
         .with_context(|| format!("Could not save {}", path.display()))
         .map_err(display_error)?;
     Ok(Some(path.to_string_lossy().into_owned()))
@@ -206,7 +236,7 @@ fn read_directory_children(root: String, path: String) -> Result<Vec<DirectoryEn
         if name.starts_with('.') || ["node_modules", "target", "build", "dist"].contains(&name.as_str()) { continue; }
         let kind = entry.file_type().map_err(display_error)?;
         if kind.is_symlink() { continue; }
-        if kind.is_dir() || name.rsplit('.').next().is_some_and(|v| ["md", "smd", "markdown"].contains(&v.to_ascii_lowercase().as_str())) {
+        if kind.is_dir() || name.rsplit('.').next().is_some_and(|v| ["md", "smd", "markdown", "fmd"].contains(&v.to_ascii_lowercase().as_str())) {
             entries.push(DirectoryEntry { name, path: entry.path().to_string_lossy().into_owned(), directory: kind.is_dir() });
         }
     }
@@ -311,7 +341,24 @@ fn list_draft_windows() -> Result<Vec<String>, String> {
 }
 
 #[tauri::command]
-fn load_asset(document_path: String, source: String) -> Result<String, String> {
+async fn load_asset(document_path: String, source: String) -> Result<String, String> {
+    tauri::async_runtime::spawn_blocking(move || load_asset_inner(document_path, source)).await.map_err(display_error)?
+}
+fn load_asset_inner(document_path: String, source: String) -> Result<String, String> {
+    if smd_core::portable::asset_name(&source) {
+        if Path::new(&document_path).extension().is_some_and(|e| e.eq_ignore_ascii_case("fmd")) {
+            let cache = media::portable_cache(Path::new(&document_path)).map_err(display_error)?;
+            let file = cache.join(source.trim_start_matches("assets/"));
+            if file.is_file() { let kind = media::mime(file.extension().and_then(|s| s.to_str()).unwrap_or("")).ok_or("Unsupported embedded image")?; return Ok(format!("data:{kind};base64,{}", STANDARD.encode(fs::read(file).map_err(display_error)?))); }
+        }
+        if source.starts_with("assets/import-") {
+            let cached = media::attachment_directory().map_err(display_error)?.join(source.strip_prefix("assets/").unwrap());
+            if cached.is_file() {
+                let kind = media::mime(cached.extension().and_then(|s| s.to_str()).unwrap_or("")).ok_or("Unsupported attachment")?;
+                return Ok(format!("data:{kind};base64,{}", STANDARD.encode(fs::read(cached).map_err(display_error)?)));
+            }
+        }
+    }
     if document_path.trim().is_empty() {
         return Err("Save the document before loading relative images".into());
     }
@@ -456,11 +503,16 @@ fn export_pdf_inner(
             STANDARD.decode(image.split_once(',').context("Invalid embedded image")?.1)?
         } else {
             if image.starts_with("http:") || image.starts_with("https:") { bail!("Download remote image {image} into the document's folder for offline export"); }
+            if (smd_core::portable::asset_name(&image) && source.is_some_and(|p| p.extension().is_some_and(|e| e.eq_ignore_ascii_case("fmd")))) || image.starts_with("assets/import-") {
+                let data = load_asset_inner(source.map(|p| p.to_string_lossy().into_owned()).unwrap_or_default(), image.clone()).map_err(anyhow::Error::msg)?;
+                smd_core::portable::image_bytes(&data)?.1
+            } else {
             let decoded = percent_decode_str(&image).decode_utf8()?.to_string();
             let local = directory.path().join(&decoded);
             let image_path = if local.is_file() { local } else { source.and_then(Path::parent).unwrap_or(Path::new(".")).join(decoded) };
             if fs::metadata(&image_path)?.len() > 25 * 1024 * 1024 { bail!("Image exceeds 25 MB: {image}"); }
             fs::read(image_path)?
+            }
         };
         assets.insert(image, bytes);
     }
@@ -699,6 +751,7 @@ fn display_error(error: impl std::fmt::Display) -> String {
 }
 
 fn print_help() {
+    println!("PORTABLE FILES:\n  super-md pack <input.md> [-o output.fmd]\n  super-md export <input.fmd> [-o output.pdf]\n");
     println!("Super MD\n\nUSAGE:\n  super-md                     Open the desktop app\n  super-md <file.smd>          Open a document\n  super-md export <input> [-o output.pdf] [--page-size A4] [--margin 18] [--font 'Libertinus Serif'] [--font-size 10.5] [--line-height 1.35] [--no-page-numbers]\n  super-md doctor              Check optional runtimes\n\nPDF typesetting is embedded; Pandoc and Typst executables are not required.");
 }
 
@@ -724,6 +777,19 @@ fn run_cli(arguments: &[String]) -> Result<bool> {
                 }
             }
             Ok(true)
+        }
+        "pack" => {
+            let input = arguments.get(1).context("Missing input file")?;
+            let input = PathBuf::from(input);
+            let output = match arguments.get(2).map(String::as_str) { None => input.with_extension("fmd"), Some("-o" | "--output") if arguments.len() == 4 => PathBuf::from(&arguments[3]), _ => bail!("Usage: super-md pack <input> [-o output.fmd]") };
+            if output == input { bail!("Choose a different destination to preserve the original document"); }
+            let content = read_document(input.clone())?.content;
+            let bundle = smd_core::portable::pack(&content, |source| {
+                if source.starts_with("https:") || source.starts_with("http:") { bail!("Download remote images first, or use the app's portable export"); }
+                load_asset_inner(input.to_string_lossy().into_owned(), source.to_string()).map_err(anyhow::Error::msg)
+            })?;
+            atomic_write(&output, bundle.encode()?.as_bytes())?;
+            println!("{}", output.display()); Ok(true)
         }
         "export" => {
             let input = arguments.get(1).context("Missing input file")?;
@@ -759,7 +825,7 @@ fn run_cli(arguments: &[String]) -> Result<bool> {
                 index += 1;
             }
             let input_path = PathBuf::from(input);
-            let content = fs::read_to_string(&input_path)?;
+            let content = read_document(input_path.clone())?.content;
             let output = options
                 .output
                 .clone()
@@ -801,6 +867,7 @@ pub fn run() -> Result<()> {
             run_python,
             export_pdf,
             export_portable_pdf
+            ,media::import_images, media::import_image_paths, media::fetch_resource, media::export_fmd
         ])
         .run(tauri::generate_context!())
         .context("Tauri failed")?;
@@ -823,6 +890,19 @@ mod tests {
         assert!(result.contains("> **Careful**"));
         assert!(result.contains("> Do not blink."));
     }
+    #[test]
+    fn portable_file_reopens_and_exports_vectors_without_companion_assets() {
+        let folder = tempfile::tempdir().unwrap(); let path = folder.path().join("proof.fmd");
+        let vector = "<svg xmlns='http://www.w3.org/2000/svg' width='120' height='60'><path d='M0 55L120 5' stroke='blue'/></svg>";
+        let markdown = "# Portable proof\n\n$$\\int_0^1 x^2 dx = \\frac13$$\n\n![Vector](assets/proof.svg)\n";
+        let doc = smd_core::portable::PortableDocument::new(markdown.into(), std::collections::BTreeMap::from([("assets/proof.svg".into(), format!("data:image/svg+xml;base64,{}", STANDARD.encode(vector)))]));
+        fs::write(&path, doc.encode().unwrap()).unwrap();
+        assert_eq!(read_document(path.clone()).unwrap().content, markdown);
+        assert_eq!(load_asset_inner(path.to_string_lossy().into_owned(), "assets/proof.svg".into()).unwrap(), doc.assets["assets/proof.svg"]);
+        let output = folder.path().join("proof.pdf"); export_pdf_inner(Some(&path), markdown, &output, &ExportOptions::default()).unwrap();
+        assert!(fs::read(output).unwrap().starts_with(b"%PDF-"));
+        assert!(!folder.path().join("assets").exists());
+    }
 
     #[test]
     fn loads_relative_image_with_encoded_spaces() {
@@ -831,7 +911,7 @@ mod tests {
         fs::create_dir(&images).unwrap();
         fs::write(images.join("diagram.png"), b"image bytes").unwrap();
         let document = directory.path().join("DM Morning Notes.md");
-        let result = load_asset(
+        let result = load_asset_inner(
             document.to_string_lossy().into_owned(),
             "DM%20Images/diagram.png".into(),
         )
@@ -849,8 +929,8 @@ mod tests {
         fs::create_dir(&notes).unwrap();
         fs::write(directory.path().join("private.png"), b"not an image").unwrap();
         let document = notes.join("note.md").to_string_lossy().into_owned();
-        assert!(load_asset(document.clone(), "../private.png".into()).is_err());
-        assert!(load_asset(
+        assert!(load_asset_inner(document.clone(), "../private.png".into()).is_err());
+        assert!(load_asset_inner(
             document,
             directory
                 .path()

@@ -1,7 +1,7 @@
 {
   "$schema": "https://schema.tauri.app/config/2",
   "productName": "Super MD",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "identifier": "dev.supermd.studio",
   "build": {
     "beforeDevCommand": "npm run dev",
@@ -41,7 +41,8 @@
     "shortDescription": "Interactive Markdown studio",
     "longDescription": "Distraction-free Markdown and Super Markdown authoring with semantic PDF export.",
     "fileAssociations": [
-      { "ext": ["smd", "md", "markdown"], "name": "Markdown document", "role": "Editor" }
+      { "ext": ["smd", "md", "markdown"], "name": "Markdown document", "role": "Editor" },
+      { "ext": ["fmd"], "name": "Portable Super MD document", "mimeType": "application/vnd.supermd.fmd", "role": "Editor" }
     ]
   }
 }

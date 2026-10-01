@@ -1,4 +1,31 @@
-# Verification — 2026-09-30
+# Verification
+
+## Media and FMD update — 2026-10-01
+
+- 26 frontend unit tests pass. New tests cover icon-free click-to-edit, safe SVG
+  diagrams, YouTube/website title parsing, recent-file ordering, and preserving
+  frontmatter/callouts/code while embedding both inline and reference images.
+- Three browser workflows pass. The new workflow exercises clipboard link
+  insertion, optional video thumbnails, a DOM image-file drop, FMD preparation
+  without base64 in Source, and SVG/image PDF preparation through mocked IPC.
+- Six desktop Rust unit tests plus two real executable CLI tests pass. A single
+  FMD reopens and exports its vector image and equation without companion files.
+  `pack` output is tested after removing the original loose image fixture.
+- Five native Android emulator tests pass, including the real diagonal touch
+  path through Compose/WebView and menu-based drawer opening/dismissal, pinch,
+  fullscreen zoom restoration, bundled Matplotlib, and JNI PDF/FMD export.
+  FMD streaming decode rejects traversal paths; attachment bytes remain outside
+  the editor and workspace snapshot. Android System UI initially put an ANR
+  dialog over the screenshots during cold boot; after clearing that emulator
+  dialog, the unchanged painting assertions and all five tests passed.
+- The optimized non-debuggable x86_64 release opens with the three-step setup
+  and icon-free Live rendering. ARM64 distribution and final release smoke checks
+  are recorded after their build below; this is not physical-phone testing.
+- Native cross-app drag permission handling is implemented using Android's URI
+  grant API. Actual drag behavior from each gallery/files/browser app and physical
+  phone gesture latency remain user-device checks, not inferred from DOM drops.
+
+## Previous release — 2026-09-30
 
 Keep native and browser-mocked evidence separate. These checks were run locally;
 Physical-phone performance is not implied by emulator or CI results.

@@ -28,6 +28,15 @@ class StudioUiTest {
         val result = javascriptUntil("({math:document.querySelectorAll('.katex').length,callouts:document.querySelectorAll('.callout-tip').length,graphs:document.querySelectorAll('.interactive-chart svg').length,errors:document.querySelectorAll('.katex-error').length})") { it.contains("\"callouts\":1") && it.contains("\"graphs\":1") }
         javascriptUntil("document.querySelector('#root').getBoundingClientRect().height") { (it.toDoubleOrNull() ?: 0.0) > 100 }
         assertTrue(result.contains("\"errors\":0"))
+        // Inject a real diagonal drag through Compose/native touch dispatch, not
+        // just a DOM event. Document scrolling must never open the drawer.
+        compose.onRoot().performTouchInput { swipe(androidx.compose.ui.geometry.Offset(30f, height * .82f), androidx.compose.ui.geometry.Offset(170f, height * .40f), 600) }
+        compose.onNodeWithText("Your files").assertIsNotDisplayed()
+        compose.onNodeWithContentDescription("Open files").performClick()
+        compose.onNodeWithText("Your files").assertIsDisplayed()
+        compose.runOnIdle { compose.activity.onBackPressedDispatcher.onBackPressed() }
+        compose.onNodeWithText("Your files").assertIsNotDisplayed()
+        javascriptUntil("(() => { document.querySelector('.android-reading').scrollTop=0; return true; })()") { it == "true" }
         // Exercise the real JS bridge, Python worker, shared preparation and JNI
         // typesetter together. Only the system destination picker is replaced
         // with a private file URI; all document/export code remains production.

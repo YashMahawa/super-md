@@ -13,9 +13,11 @@ import { invoke } from "./nativeBridge";
 import { preparePdf } from "./preparePdf";
 import type { ExportOptions } from "./types";
 import { clampPreviewZoom } from "./zoom";
+import MediaTools from "./components/MediaTools";
+import { prepareFmd } from "./documentMedia";
 
 interface ReaderState { id: string; content: string; path: string | null; mode: "live" | "editor" | "reader" | "split"; dark: boolean; fullscreen: boolean; font: string; size: number; colors: Record<string, string>; zoom: number; motion?: boolean }
-declare global { interface Window { supermdLoad?: (state: ReaderState) => void; supermdExport?: (options: ExportOptions) => void; supermdFind?: () => void } }
+declare global { interface Window { supermdLoad?: (state: ReaderState) => void; supermdExport?: (options: ExportOptions) => void; supermdFind?: () => void; supermdPortable?: (save: boolean) => void } }
 function Reader() {
   const [state, setState] = useState<ReaderState | null>(null);
   const [zoom, setZoom] = useState(100);
@@ -25,13 +27,18 @@ function Reader() {
   useEffect(() => {
     window.supermdLoad = (next) => { setState(next); setZoom(next.zoom); };
     window.supermdFind = () => window.dispatchEvent(new Event("supermd-find"));
+    window.supermdPortable = async (save) => {
+      const current = reference.current; if (!current) return;
+      try { const prepared = await prepareFmd(current.content, current.path); await invoke("export_fmd_native", { ...prepared, originalContent: current.content, id: current.id, save }); }
+      catch (error) { await invoke("export_failed", { error: String(error) }); }
+    };
     window.supermdExport = async (options) => {
       const current = reference.current; if (!current) return;
       try { const prepared = await preparePdf(current.content, current.path); await invoke("export_pdf_native", { ...prepared, options }); }
       catch (error) { await invoke("export_failed", { error: String(error) }); }
     };
     void invoke("reader_ready");
-    return () => { delete window.supermdLoad; delete window.supermdExport; };
+    return () => { delete window.supermdLoad; delete window.supermdExport; delete window.supermdPortable; };
   }, []);
   useEffect(() => {
     if (!state) return;
@@ -59,6 +66,7 @@ function Reader() {
     void invoke("document_changed", { id: next.id, content });
   };
   return <div className={`android-document mode-${state.mode}`}>
+    <MediaTools key={state.id} documentId={state.id} content={state.content} documentPath={state.path} onInsert={(text, point) => { const content = reference.current!.content; const from = Math.min(point?.from ?? content.length, content.length); const to = Math.max(from, Math.min(point?.to ?? from, content.length)); update(content.slice(0, from) + text + content.slice(to)); }} onNotice={(error) => { void invoke("export_failed", { error }); }} />
     {(state.mode === "editor" || state.mode === "split") && <section className="android-source"><Editor key={state.id} sessionId={state.id} value={state.content} onChange={update} dark={state.dark} focusMode={state.fullscreen} /></section>}
     {state.mode === "live" && <section className="android-reading"><LiveEditor key={state.id} markdown={state.content} onChange={update} documentPath={state.path} python="embedded" dark={state.dark} /></section>}
     {(state.mode === "reader" || state.mode === "split") && <section className="android-reading"><MarkdownPreview markdown={state.content} documentPath={state.path} python="embedded" dark={state.dark} /></section>}
