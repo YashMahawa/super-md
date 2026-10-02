@@ -211,6 +211,14 @@ test("plot pinch and trackpad zoom are independent of document text and export t
   const content=`# Plots\n\n\`\`\`smd-chart\n${line}\n\`\`\`\n\n\`\`\`smd-chart\n${surface}\n\`\`\``;
   await page.evaluate(content=>window.supermdLoad?.({id:"plot-zoom",content,path:null,mode:"reader",dark:false,fullscreen:false,colors:{},font:"sans",size:18,zoom:100}),content);
   const plots=page.locator(".interactive-chart"); await expect(plots).toHaveCount(2);
+  await page.setViewportSize({width:420,height:900});
+  await expect.poll(()=>plots.first().locator("svg").evaluate(svg=>{
+    const box=(svg as SVGSVGElement).viewBox.baseVal,rect=svg.getBoundingClientRect();return rect.width/box.width;
+  })).toBeGreaterThan(.9);
+  expect(await plots.first().locator("svg").evaluate(svg=>{
+    const label=svg.querySelector("text")!,rect=svg.getBoundingClientRect();return Number.parseFloat(getComputedStyle(label).fontSize)*rect.width/(svg as SVGSVGElement).viewBox.baseVal.width;
+  })).toBeGreaterThan(11);
+  await page.setViewportSize({width:1280,height:900});
   for (let index=0;index<2;index++) {
     await plots.nth(index).locator("svg").evaluate(target=> {
       const touches=(x:number)=>[new Touch({identifier:1,target,clientX:60,clientY:140}),new Touch({identifier:2,target,clientX:x,clientY:140})];

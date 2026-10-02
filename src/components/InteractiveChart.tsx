@@ -17,6 +17,12 @@ export default function InteractiveChart({source,dark=false}:{source:string;dark
   const [values,setValues] = useState<Record<string,number>>(initial);
   const [grid,setGrid] = useState(()=>chartGrids.get(source)??true);
   const [point,setPoint] = useState<{x:number;y:number}|null>(null);
+  const [viewport,setViewport] = useState(760);
+  useEffect(()=>{
+    const svg=plot.host.current?.querySelector("svg");if(!svg || typeof ResizeObserver==="undefined")return;
+    const observer=new ResizeObserver(entries=>{const next=Math.round(entries[0].contentRect.width);if(next>0)setViewport(next);});
+    observer.observe(svg);return()=>observer.disconnect();
+  },[source,parsed.spec?.mode]);
   useEffect(()=>setValues(initial()),[source]);
   const effectiveValues = useMemo(()=>Object.fromEntries((parsed.spec?.sliders||[]).map(slider=>[slider.name,Math.max(slider.min,Math.min(slider.max,Number.isFinite(values[slider.name])?values[slider.name]:slider.value))])),[parsed,values]);
   const compiled = useMemo(()=>(parsed.spec?.series||[]).map(series=>series.expression?compileMathExpression(series.expression):null),[parsed]);
@@ -44,20 +50,22 @@ export default function InteractiveChart({source,dark=false}:{source:string;dark
   if(!spec || !geometry) return <div className="render-error" role="status">Invalid smd-chart: {parsed.error}</div>;
   const {xMin,xMax,yMin,yMax,allY,visibleSeries}=geometry;
   const colors=spec.series.map((series,i)=>series.color||(dark?darkPalette:palette)[i%palette.length]);
-  const width=760,height=360,left=56,top=24,right=20,bottom=46;
+  // SVG units follow the displayed width so tick labels remain actual reading
+  // size on phones. SSR/PDF preparation retains a deterministic 760px canvas.
+  const width=Math.max(280,viewport),height=Math.max(240,Math.min(360,width*.5)),left=70,top=24,right=20,bottom=46;
   const clamp=(value:number,low:number,high:number)=>Math.max(low,Math.min(high,value));
   const px=(x:number)=>clamp(left+(x-xMin)/(xMax-xMin)*(width-left-right),-1e6,1e6);
   const py=(y:number)=>clamp(top+(1-(y-yMin)/(yMax-yMin))*(height-top-bottom),-1e6,1e6);
   if(spec.mode!=="surface3d" && (!(xMax>xMin) || !Number.isFinite(xMax-xMin) || !Number.isFinite(yMax-yMin))) return <div className="render-error">Chart limits are outside a usable numeric range. Specify finite axis limits.</div>;
-  return <figure ref={plot.host} className="interactive-chart" data-independent-zoom data-plot-zoom={plot.zoom}>
+  return <figure ref={plot.host} className="interactive-chart" data-independent-zoom data-plot-zoom={plot.zoom} style={{"--surface-label-size":`${Math.min(36,13*760/Math.max(280,viewport))}px`} as CSSProperties}>
     {spec.title && <figcaption>{spec.title}</figcaption>}
     <div className="chart-toolbar"><button aria-pressed={grid} onClick={()=>{remember(chartGrids,source,!grid);setGrid(!grid);}}>Grid</button><output className="chart-coordinate" aria-live="off">{spec.mode!=="surface3d" && point ? `(${axisNumber(point.x)}, ${axisNumber(point.y)})` : ""}</output></div>
     {spec.mode==="surface3d" ? <SurfaceChart key={source} source={source} spec={spec} values={effectiveValues} colors={colors} zoom={plot.zoom} center={plot.center} grid={grid}/> : <>
-      <svg viewBox={`0 0 ${width} ${height}`} role="img" aria-label={spec.title||"Interactive graph"} onPointerMove={event=>{ const rect=event.currentTarget.getBoundingClientRect(), x=(event.clientX-rect.left)/rect.width*width,y=(event.clientY-rect.top)/rect.height*height;if(x>=left && x<=width-right && y>=top && y<=height-bottom) setPoint({x:xMin+(x-left)/(width-left-right)*(xMax-xMin),y:yMax-(y-top)/(height-top-bottom)*(yMax-yMin)});else setPoint(null); }} onPointerLeave={event=>{if(event.pointerType==="mouse")setPoint(null);}} onPointerDown={event=>{const rect=event.currentTarget.getBoundingClientRect();const x=(event.clientX-rect.left)/rect.width*width,y=(event.clientY-rect.top)/rect.height*height;if(x>=left && x<=width-right && y>=top && y<=height-bottom)setPoint({x:xMin+(x-left)/(width-left-right)*(xMax-xMin),y:yMax-(y-top)/(height-top-bottom)*(yMax-yMin)});}}>
+      <svg viewBox={`0 0 ${width} ${height}`} data-plot-left={left} role="img" aria-label={spec.title||"Interactive graph"} onPointerMove={event=>{ const rect=event.currentTarget.getBoundingClientRect(), x=(event.clientX-rect.left)/rect.width*width,y=(event.clientY-rect.top)/rect.height*height;if(x>=left && x<=width-right && y>=top && y<=height-bottom) setPoint({x:xMin+(x-left)/(width-left-right)*(xMax-xMin),y:yMax-(y-top)/(height-top-bottom)*(yMax-yMin)});else setPoint(null); }} onPointerLeave={event=>{if(event.pointerType==="mouse")setPoint(null);}} onPointerDown={event=>{const rect=event.currentTarget.getBoundingClientRect();const x=(event.clientX-rect.left)/rect.width*width,y=(event.clientY-rect.top)/rect.height*height;if(x>=left && x<=width-right && y>=top && y<=height-bottom)setPoint({x:xMin+(x-left)/(width-left-right)*(xMax-xMin),y:yMax-(y-top)/(height-top-bottom)*(yMax-yMin)});}}>
         <defs><clipPath id={clipId}><rect x={left} y={top} width={width-left-right} height={height-top-bottom}/></clipPath></defs>
         <line className="chart-axis" x1={left} x2={width-right} y1={clamp(py(0),top,height-bottom)} y2={clamp(py(0),top,height-bottom)}/>
         <line className="chart-axis" x1={clamp(px(0),left,width-right)} x2={clamp(px(0),left,width-right)} y1={top} y2={height-bottom}/>
-        {axisTicks(xMin,xMax).map(x=><g key={`x${x}`}>{grid && <line className="chart-grid" x1={px(x)} x2={px(x)} y1={top} y2={height-bottom}/>}<text x={px(x)} y={height-bottom+20} textAnchor="middle">{axisNumber(x)}</text></g>)}
+        {axisTicks(xMin,xMax,Math.max(2,Math.min(8,Math.floor((width-left-right)/90)))).map(x=><g key={`x${x}`}>{grid && <line className="chart-grid" x1={px(x)} x2={px(x)} y1={top} y2={height-bottom}/>}<text x={px(x)} y={height-bottom+20} textAnchor="middle">{axisNumber(x)}</text></g>)}
         {axisTicks(yMin,yMax,4).map(y=><g key={`y${y}`}>{grid && <line className="chart-grid" x1={left} x2={width-right} y1={py(y)} y2={py(y)}/>}<text x={left-10} y={py(y)+4} textAnchor="end">{axisNumber(y)}</text></g>)}
         <text x={width-right} y={height-8} textAnchor="end">{spec.x?.label||"x"}</text><text x={left} y={16}>{spec.y?.label||"y"}</text>
         <g clipPath={`url(#${clipId})`}>{visibleSeries.flatMap((points,index)=>lineSegments(points,yMax-yMin).map((segment,j)=><polyline key={`${index}-${j}`} fill="none" stroke={colors[index]} strokeWidth="2.5" points={segment.map(([x,y])=>`${px(x).toFixed(2)},${py(y).toFixed(2)}`).join(" ")}/>) )}{point && <circle cx={px(point.x)} cy={py(point.y)} r={4} fill="var(--primary)"/>}</g>

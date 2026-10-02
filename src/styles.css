@@ -291,6 +291,7 @@ md-filled-button.primary-action, smd-expressive-button.primary-action { display:
 .interactive-chart figcaption { font-weight: 750; font-size: 1.08em; margin: 0 4px 10px; }
 .interactive-chart svg { width: 100%; height: auto; background: var(--surface-low); border-radius: 12px; }
 .interactive-chart svg text { fill: var(--muted); font-size: 13px; }
+.interactive-chart svg.surface-chart text { font-size:var(--surface-label-size,13px); }
 .chart-axis { stroke: var(--outline); stroke-width: 1.2; }
 .chart-controls { display: grid; grid-template-columns: repeat(auto-fit, minmax(210px, 1fr)); gap: 12px; padding: 14px 4px 4px; }
 .chart-controls label { display: grid; gap: 5px; }

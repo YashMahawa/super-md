@@ -17,7 +17,8 @@ export function useChartZoom(source: string) {
     // Match the line plot's padded data rectangle, rather than its axis labels.
     const surface = svg?.classList.contains("surface-chart");
     const x=(point.x-rect.left)/rect.width, y=(point.y-rect.top)/rect.height;
-    return {x:Math.max(0,Math.min(1,surface ? x : (x-56/760)/(684/760))),y:Math.max(0,Math.min(1,surface ? y : (y-24/360)/(290/360)))};
+    const width=svg?.viewBox.baseVal.width||760,height=svg?.viewBox.baseVal.height||360,left=Number(svg?.getAttribute("data-plot-left")||56);
+    return {x:Math.max(0,Math.min(1,surface ? x : (x-left/width)/((width-left-20)/width))),y:Math.max(0,Math.min(1,surface ? y : (y-24/height)/((height-70)/height)))};
   };
   const change = (requested: number, focus:Point={x:.5,y:.5}) => {
     const next = Math.max(.05, Math.min(64, Number.isFinite(requested) ? requested : 1));
