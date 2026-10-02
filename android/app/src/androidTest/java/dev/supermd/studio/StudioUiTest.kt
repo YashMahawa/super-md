@@ -161,10 +161,17 @@ class StudioUiTest {
         compose.onNodeWithContentDescription("Exit fullscreen").performClick()
         javascriptUntil("getComputedStyle(document.documentElement).getPropertyValue('--workspace-scale')") { it == normalScale }
         compose.onNodeWithContentDescription("New tab").performClick()
+        val emptyId = model.state.value.active.id
+        compose.onNodeWithContentDescription("Close Untitled.md").performClick()
+        compose.runOnIdle { assertFalse("Empty unnamed notes must be discarded", model.state.value.closedTabs.any { it.id == emptyId }) }
+        compose.onNodeWithContentDescription("New tab").performClick()
+        compose.runOnIdle { model.edit(model.state.value.active.id, "# Recoverable draft") }
+        javascriptUntil("document.querySelector('.android-reading')?.textContent || document.querySelector('.live-document')?.textContent") { it.contains("Recoverable draft") }
         compose.onNodeWithContentDescription("Close Untitled.md").performClick()
         compose.onNodeWithContentDescription("More actions").performClick()
         compose.onNodeWithText("Reopen closed tab").performClick()
         compose.onNodeWithContentDescription("Close Untitled.md").assertExists()
+        compose.runOnIdle { assertEquals("# Recoverable draft", model.state.value.active.content) }
         compose.onNodeWithContentDescription("Close Untitled.md").performClick()
         if (compose.activity.resources.configuration.smallestScreenWidthDp < 600) {
             compose.runOnIdle { compose.activity.requestedOrientation = android.content.pm.ActivityInfo.SCREEN_ORIENTATION_LANDSCAPE }
