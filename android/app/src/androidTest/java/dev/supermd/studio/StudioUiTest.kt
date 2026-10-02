@@ -83,8 +83,13 @@ class StudioUiTest {
         val model = androidx.lifecycle.ViewModelProvider(compose.activity)[StudioViewModel::class.java]
         val result = AtomicReference<android.content.Intent>()
         compose.runOnIdle { model.shareReady = { result.set(it) } }
-        compose.onNodeWithText("Prepare & share").performClick()
-        compose.waitUntil(60_000) { result.get() != null }
+        // The primary action stays visible below the scrolling options on
+        // compact displays; a semantics-only click must not hide that bug.
+        compose.onNodeWithText("Prepare & share").assertIsDisplayed().performClick()
+        compose.waitUntil(60_000) {
+            assertNull("Share failed: ${model.state.value.error}", model.state.value.error)
+            result.get() != null
+        }
         val intent = result.get()
         assertEquals(android.content.Intent.ACTION_SEND, intent.action)
         assertEquals("application/pdf", intent.type)

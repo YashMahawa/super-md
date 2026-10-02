@@ -10,12 +10,15 @@
   changes, independent plot/text zoom and full-document Obsidian math parsing.
 - The native desktop's real presented-pixel smoke check passed for the heavier
   fullscreen icon, tint, menus/gutters, narrow layout and actual typeset PDF.
-  Further final-bundle checks are required before release.
-- Android window isolation, long-press tab gestures and restricted PDF share
-  URIs have new instrumentation tests. Their compilation passed locally;
-  executing these new tests on the emulator is still a release gate, not inferred
-  from browser tests. The first lint pass caught an indentation error; it was
-  corrected rather than suppressed. Existing actual-painting assertions remain.
+  The clean installed bundle passed those same checks and the native PDF engine.
+- Android window isolation, long-press tab gestures and serialized Python runs
+  across two windows passed emulator instrumentation. The new restricted PDF
+  Share test initially exposed an offscreen action in the half-open long form.
+  Export/Share now open fully with a fixed visible action and scrolling options;
+  the actual tap, embedded PDF export, read-only content URI and PDF signature
+  checks pass locally. The complete final-SHA CI suite remains a release gate.
+  Existing actual-painting assertions remain, and lint errors were corrected
+  rather than suppressed.
 - Physical phone/foldable hardware and macOS/Windows native drag ergonomics
   remain separate user-device checks. See `PLATFORM-PARITY.md` for explicit
   platform-adapter differences; do not claim blanket 100% parity.

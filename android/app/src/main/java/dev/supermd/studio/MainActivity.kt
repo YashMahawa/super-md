@@ -287,7 +287,8 @@ private object NoMotionScheme : MotionScheme {
             Settings(state, model)
         } }
     }
-    if (exporting) ModalBottomSheet(onDismissRequest = { exporting = false }) { ExportSettings(state.pdf, model::pdf, state.active.portable, sharing) { format ->
+    // Long forms must not strand their primary action below a half-open sheet.
+    if (exporting) ModalBottomSheet(onDismissRequest = { exporting = false }, sheetState = rememberModalBottomSheetState(skipPartiallyExpanded = true)) { ExportSettings(state.pdf, model::pdf, state.active.portable, sharing) { format ->
         exporting = false
         if (sharing) {
             if (model.prepareShare(format)) when (format) { "pdf" -> web?.evaluateJavascript("window.supermdExport?.(${state.pdf})", null) ?: model.fail("The reader is not ready"); "smd" -> web?.evaluateJavascript("window.supermdPortable?.(false)", null) ?: model.fail("The reader is not ready"); "md" -> web?.evaluateJavascript("window.supermdExportMarkdown?.()", null) ?: model.fail("The reader is not ready") }
@@ -380,22 +381,29 @@ private fun hex(color: Color) = "#%06x".format(color.toArgb() and 0xffffff)
     var format by rememberSaveable { mutableStateOf("pdf") }
     var options by remember(raw) { mutableStateOf(JSONObject(raw)) }
     fun update(key: String, value: Any) { options = JSONObject(options.toString()).put(key, value); onChange(options.toString()) }
-    Column(Modifier.fillMaxWidth().verticalScroll(rememberScrollState()).padding(24.dp)) {
-        Text(if (sharing) "Share your note" else "Export your note", style = MaterialTheme.typography.headlineSmall)
-        val formats = if (sharing) listOf("pdf" to "PDF", "md" to "Markdown", "smd" to "Portable SMD") else listOf("pdf" to "PDF document", "smd" to "Portable SMD")
-        if (!portableSource || sharing) SingleChoiceSegmentedButtonRow(Modifier.fillMaxWidth().padding(vertical = 16.dp)) {
-            formats.forEachIndexed { index, (key, label) -> SegmentedButton(selected = format == key, onClick = { format = key }, shape = SegmentedButtonDefaults.itemShape(index, formats.size)) { Text(label) } }
+    Box(Modifier.fillMaxWidth(), contentAlignment = Alignment.TopCenter) {
+        Column(Modifier.widthIn(max = 640.dp).fillMaxWidth()) {
+            Column(Modifier.weight(1f, fill = false).fillMaxWidth().verticalScroll(rememberScrollState()).padding(horizontal = 24.dp)) {
+                Text(if (sharing) "Share your note" else "Export your note", style = MaterialTheme.typography.headlineSmall)
+                val formats = if (sharing) listOf("pdf" to "PDF", "md" to "Markdown", "smd" to "Portable SMD") else listOf("pdf" to "PDF document", "smd" to "Portable SMD")
+                if (!portableSource || sharing) SingleChoiceSegmentedButtonRow(Modifier.fillMaxWidth().padding(vertical = 16.dp)) {
+                    formats.forEachIndexed { index, (key, label) -> SegmentedButton(selected = format == key, onClick = { format = key }, shape = SegmentedButtonDefaults.itemShape(index, formats.size)) { Text(label) } }
+                }
+                if (format == "pdf") {
+                    Text("Vector equations, plots and real pagination. Typeset locally on this device.", style = MaterialTheme.typography.bodyMedium, modifier = Modifier.padding(bottom = 12.dp))
+                    PdfOptions(options, ::update)
+                } else if (format == "md") {
+                    Text("Editable Markdown text. For a single file that also includes images, choose Portable SMD.", style = MaterialTheme.typography.bodyMedium)
+                } else {
+                    Text("Your Markdown and images in one editable file.", style = MaterialTheme.typography.titleMedium)
+                    Text("Reopen it in Super MD to edit, drop in images, or select an image to replace or remove it. Source mode shows Markdown, never image bytes.", style = MaterialTheme.typography.bodyMedium, modifier = Modifier.padding(top = 12.dp))
+                }
+            }
+            Button(onClick = { export(format) }, shapes = ButtonDefaults.shapes(), modifier = Modifier.fillMaxWidth().padding(horizontal = 24.dp, vertical = 16.dp)) {
+                Icon(painterResource(if (sharing) R.drawable.symbol_share else R.drawable.symbol_export), null)
+                Text(if (sharing) "Prepare & share" else "Choose destination & export", Modifier.padding(start = 8.dp))
+            }
         }
-        if (format == "pdf") {
-        Text("Vector equations, plots and real pagination. Typeset locally on this device.", style = MaterialTheme.typography.bodyMedium, modifier = Modifier.padding(bottom = 12.dp))
-        PdfOptions(options, ::update)
-        } else if (format == "md") {
-            Text("Editable Markdown text. For a single file that also includes images, choose Portable SMD.", style = MaterialTheme.typography.bodyMedium)
-        } else {
-            Text("Your Markdown and images in one editable file.", style = MaterialTheme.typography.titleMedium)
-            Text("Reopen it in Super MD to edit, drop in images, or select an image to replace or remove it. Source mode shows Markdown, never image bytes.", style = MaterialTheme.typography.bodyMedium, modifier = Modifier.padding(top = 12.dp))
-        }
-        Button(onClick = { export(format) }, shapes = ButtonDefaults.shapes(), modifier = Modifier.fillMaxWidth().padding(top = 20.dp, bottom = 28.dp)) { Icon(if (sharing) Icons.Rounded.Share else Icons.Rounded.IosShare, null); Text(if (sharing) "Prepare & share" else "Choose destination & export", Modifier.padding(start = 8.dp)) }
     }
 }
 
