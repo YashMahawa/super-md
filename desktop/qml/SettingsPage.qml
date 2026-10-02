@@ -40,11 +40,17 @@ Pane {
                 Label { text: "Reading"; font.pixelSize: 22; font.weight: Font.DemiBold; Layout.topMargin: 12 }
                 Label { text: "Reading font" }
                 ChoiceField { objectName: "readingFontChoice"; viewportItem: settingsScroll.contentItem; Accessible.name: "Reading font"; Layout.fillWidth: true; model: studio.fonts; editable: true; currentIndex: model.indexOf(viewState.settings.font); onActivated: page.save("font", currentText); onAccepted: page.save("font", editText) }
+                ActionButton { text:"Import font…";glyph:"Plus";onClicked:studio.chooseFont() }
+                Label { text:"TTF and OTF fonts stay private to the app and also appear in PDF export and sharing."; Layout.fillWidth:true;wrapMode:Text.WordWrap;color:viewState.colors.muted }
                 Label { text: "Text size: " + Math.round(viewState.settings.size) + " px" }
                 ExpressiveSlider { Layout.fillWidth: true; from: 12; to: 32; stepSize: 1; value: viewState.settings.size; onMoved: page.save("size", value) }
-                Switch { text: "Use full available reading width"; checked: viewState.settings.width === 0; onToggled: page.save("width", checked ? 0 : 1600) }
-                Label { visible: viewState.settings.width !== 0; text: "Maximum width: " + viewState.settings.width + " px" }
-                ExpressiveSlider { visible: viewState.settings.width !== 0; Layout.fillWidth: true; from: 600; to: 4000; stepSize: 50; value: viewState.settings.width || 1600; onMoved: page.save("width", value) }
+                Label { text: "Reading width: " + Math.round(viewState.settings.widthPercent) + "%" }
+                ExpressiveSlider { Layout.fillWidth: true; from: 50; to: 100; stepSize: 1; value: viewState.settings.widthPercent; onMoved: page.save("widthPercent", value) }
+                Label { text: "Adapts to this window and fullscreen, without a fixed pixel limit."; Layout.fillWidth: true; wrapMode: Text.WordWrap; color: viewState.colors.muted }
+                Label { text: "Vertical spacing: " + viewState.settings.lineHeight.toFixed(2) }
+                ExpressiveSlider { Layout.fillWidth: true; from: 1.15; to: 2.2; stepSize: .05; value: viewState.settings.lineHeight; onMoved: page.save("lineHeight", value) }
+                Switch { text: "Autosave existing notes"; checked: viewState.settings.autosave; onToggled: page.save("autosave", checked) }
+                Label { text: "New notes stay recoverable until you choose a file. Empty untitled notes are discarded."; Layout.fillWidth: true; wrapMode: Text.WordWrap; color: viewState.colors.muted }
                 Label { text: "Python"; font.pixelSize: 22; font.weight: Font.DemiBold; Layout.topMargin: 12 }
                 Label { text: "Interpreter or virtual environment Python executable" }
                 TextField { Layout.fillWidth: true; text: viewState.settings.python; selectByMouse: true; onEditingFinished: page.save("python", text) }

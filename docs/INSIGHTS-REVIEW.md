@@ -20,3 +20,22 @@ Read 68 insight titles from the Super MD Jules workspace and fetched the expande
 Also bounded expression size/token count to prevent recursion abuse. Rejected unrelated wellness, mood and engagement features; they would distract from study and enlarge the application. A native handwritten Markdown parser was rejected because the previous attempt lost equations and interactive features. The implementation instead uses native Android controls and the tested shared renderer, plus a shared native typesetter.
 
 This review is not proof of on-phone performance. Host and emulator results are recorded separately; physical-phone testing remains user-controlled.
+
+## Refresh — 2026-10-03
+
+Refreshed the workspace's insight list and all 187 available assessment titles through Jules CLI v0.6.2. Read the expanded solution specs for the following relevant proposals before choosing changes:
+
+| Assessment | Decision |
+|---|---|
+| `3172e75a-67a7-56ed-ad8c-b6e88238e5e3` | Added real binary integration tests for read, inspect, assets, extract, pack, export, export-json, doctor and errors. Agent output remains binary-free by default. |
+| `153c173d-a804-52d4-832a-b45f614353ff` | Added bridge lifecycle tests and immediate timer cleanup when transport posting throws. |
+| `19887a7b-1d7d-57b5-9761-063f84cd9160` | Isolated custom code-block render failures; source changes remount the boundary. Tested Mermaid queue recovery and container cleanup. |
+| `db993afe-e0d0-5588-9006-53568d7393e8` | Added maintained DOMPurify SVG sanitization after strict Mermaid rendering, shared with PDF preparation. |
+| `f5a97a28-741c-5c11-9a80-db618b440b9f` | Did not replace Mermaid SVGs with images: that would lose selectable text and existing export/navigation behavior. Used the preceding sanitizer instead. |
+| `fc28483f-07ee-5a72-b98d-c164ab5af20d` | Moved the remaining manual-save SAF display-name query off Android's UI thread. |
+| `539226d8-cd91-5b79-8cca-054b734745b4` | Default autosave with serialized captured-content writes and external-edit protection. Empty unnamed notes are discarded. |
+| `0916b1af-bbf5-5497-8394-3d4a91410c3b` | Kept the actual shared-session architecture rather than introducing speculative per-process watchers. Writes are serialized across windows; autosave detects changed source. |
+| `ccecdb2f-227d-5b63-94fa-4d0e58406877` | Retained bounded expression evaluation and finite projection coordinates; surface sampling is capped and cached, not rerun for every hover. |
+| `5385171f-bc01-5f99-aa6c-236eb964f0d1` | Applied tonal chrome/document separation and warmer, richer light surfaces without adding unrelated mood/engagement features. |
+
+These proposals supplement the native painting, PDF and full workflow checks; they do not establish physical-device smoothness by themselves.

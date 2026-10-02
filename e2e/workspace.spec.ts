@@ -3,6 +3,58 @@ import { mkdir, readFile, writeFile } from "node:fs/promises";
 import { dirname, join } from "node:path";
 
 test.beforeEach(async ({ page }) => { await page.addInitScript(() => localStorage.setItem("setup.complete", "true")); });
+test("reading search highlights every match without switching mode and escapes cleanly",async({page})=>{
+  await page.addInitScript(()=>{window.SuperMD={post:()=>{}};});
+  await page.goto("/android-reader.html");
+  await page.evaluate(()=>window.supermdLoad?.({id:"search",content:"# Find notes\n\nA **probability** result.\n\n> [!QUESTION]- Hidden probability\n> Another probability result.\n\n## Last probability",path:null,mode:"reader",dark:false,fullscreen:false,colors:{},font:"sans",size:18,zoom:100}));
+  await expect(page.locator("h1")).toBeVisible();
+  await page.evaluate(()=>window.supermdFind?.());
+  await page.getByRole("searchbox",{name:"Find in note"}).fill("probability");
+  await expect(page.locator(".reading-search output")).toContainText("/ 4");
+  expect(await page.evaluate(()=>CSS.highlights.get("smd-search")?.size)).toBe(4);
+  await expect(page.locator(".cm-editor")).toHaveCount(0);
+  await page.getByRole("button",{name:"Next",exact:true}).click();
+  await expect(page.locator(".reading-search output")).toContainText("1 / 4");
+  await page.keyboard.press("Escape");
+  await expect(page.getByRole("search")).toHaveCount(0);
+  expect(await page.evaluate(()=>CSS.highlights.has("smd-search"))).toBe(false);
+});
+test("native document sizing stays percentage based and Live edit exits on outside click",async({page})=>{
+  await page.setViewportSize({width:1440,height:900});
+  await page.addInitScript(()=>{window.SuperMD={post:()=>{}};});
+  await page.goto("/android-reader.html");
+  await page.evaluate(()=>window.supermdLoad?.({id:"width",content:"# A focused note\n\nReadable content.",path:null,mode:"live",dark:false,fullscreen:false,colors:{},font:"sans",size:18,widthPercent:80,lineHeight:1.8,zoom:100}));
+  const text=page.locator(".markdown-body").first();
+  await expect(text).toHaveCSS("line-height","32.4px");
+  const ratio=()=>text.evaluate(node=>node.getBoundingClientRect().width/node.closest(".android-reading")!.getBoundingClientRect().width);
+  expect(await ratio()).toBeCloseTo(.8,1);
+  await page.setViewportSize({width:1000,height:700});expect(await ratio()).toBeCloseTo(.8,1);
+  await page.getByRole("heading").click();await expect(page.locator("textarea")).toHaveCount(0);
+  await page.getByRole("heading").dblclick();await expect(page.getByLabel("Edit Markdown block")).toBeVisible();
+  await page.locator(".android-reading").click({position:{x:5,y:500}});await expect(page.getByLabel("Edit Markdown block")).toHaveCount(0);
+});
+test("repair dialog uses bounded checkboxes and image zoom is focal with its own Material slider",async({page})=>{
+  const image="data:image/svg+xml;base64,"+Buffer.from('<svg xmlns="http://www.w3.org/2000/svg" width="800" height="400"><rect width="800" height="400" fill="teal"/></svg>').toString("base64");
+  await page.exposeFunction("imageBridge",(id:string,command:string)=>void page.evaluate(({id,result})=>window.supermdReply?.(id,result,null),{id,result:command==="load_asset"?image:true}));
+  await page.addInitScript(()=>{window.SuperMD={post:(id,command)=>(window as any).imageBridge(id,command)};});
+  await page.goto("/android-reader.html");
+  await page.evaluate(()=>window.supermdLoad?.({id:"repair-image",content:String.raw`# Repair\n\n\(x^2\)\n\n![Proof](assets/proof.svg)`.replaceAll("\\n","\n"),path:"repair-image",mode:"reader",dark:false,fullscreen:true,colors:{},font:"sans",size:18,zoom:100}));
+  await expect(page.locator(".markdown-body img")).toBeVisible();
+  await page.evaluate(()=>window.supermdRepairMath?.());
+  const panel=page.getByRole("dialog",{name:"Review LaTeX repairs"});await expect(panel).toBeVisible();
+  const box=await panel.getByRole("checkbox").first().boundingBox();expect(box!.width).toBeLessThanOrEqual(24);expect(box!.height).toBeLessThanOrEqual(24);
+  expect((await panel.boundingBox())!.width).toBeLessThanOrEqual(740);
+  await page.keyboard.press("Escape");await expect(panel).toHaveCount(0);
+  await page.locator(".markdown-body img").click();
+  const viewer=page.getByRole("dialog",{name:"Image viewer"});await expect(viewer).toBeVisible();
+  await expect(viewer.getByRole("slider",{name:"Image zoom"})).toBeVisible();
+  const img=viewer.locator("img"),before=(await img.boundingBox())!,focus={x:before.x+before.width*.3,y:before.y+before.height*.35};
+  await page.mouse.move(focus.x,focus.y);await page.mouse.wheel(0,-200);
+  await expect(viewer.locator("output")).not.toHaveText("100%");
+  const after=(await img.boundingBox())!;
+  expect(after.x+after.width*.3).toBeCloseTo(focus.x,0);expect(after.y+after.height*.35).toBeCloseTo(focus.y,0);
+  await page.keyboard.press("Escape");await expect(viewer).toHaveCount(0);
+});
 test("moving a Source tab preserves its undo history and caret in another document window", async ({ page, context }) => {
   let transfer: any;
   await page.exposeFunction("captureMove", (_id:string, command:string, raw:string) => { if (command === "document_flushed") transfer = JSON.parse(raw); });
@@ -179,14 +231,15 @@ test("plot pinch and trackpad zoom are independent of document text and export t
   const snapshots=Object.values(exported.assets).map(asset=>Buffer.from(asset as string,"base64").toString());
   expect(snapshots.some(svg=>svg.includes("Plot zoom: 180%"))).toBe(true);
   expect(snapshots.some(svg=>svg.includes("clip-path=\"url(#surface-") && svg.includes('height="440"'))).toBe(true);
-  await plots.first().getByRole("button",{name:"Reset zoom",exact:true}).click();
-  await expect(plots.first()).toHaveAttribute("data-plot-zoom","1");
+  await expect(plots.first().getByRole("button",{name:"Reset zoom",exact:true})).toHaveCount(0);
+  await expect(plots.first().getByRole("slider",{name:"Plot zoom"})).toHaveCount(0);
   await expect(plots.nth(1)).toHaveAttribute("data-plot-zoom","1.8");
   // A previously focused chart must not also zoom when the pointer is over another.
-  await plots.nth(1).getByRole("slider",{name:"Plot zoom"}).focus();
+  await plots.nth(1).locator("svg").focus();
   await plots.first().locator("svg").hover();
+  const before=Number(await plots.first().getAttribute("data-plot-zoom"));
   await page.evaluate(()=>window.dispatchEvent(new CustomEvent("supermd-chart-native-zoom",{detail:2,cancelable:true})));
-  await expect(plots.first()).toHaveAttribute("data-plot-zoom","2");
+  await expect.poll(()=>plots.first().getAttribute("data-plot-zoom").then(Number)).toBeCloseTo(before*2);
   await expect(plots.nth(1)).toHaveAttribute("data-plot-zoom","1.8");
 });
 
@@ -204,7 +257,8 @@ test("click-to-edit, media drops, titled links and portable source work together
   await page.goto("/android-reader.html");
   await page.evaluate(() => window.supermdLoad?.({ id: "media-note", content: '# Study notes\n\n```svg\n<svg xmlns="http://www.w3.org/2000/svg" width="100" height="50"><circle cx="50" cy="25" r="20" fill="blue"/></svg>\n```', path: "media-note", mode: "live", dark: false, fullscreen: false, colors: {}, font: "sans", size: 17, zoom: 100 }));
   await expect(page.locator(".live-edit-button")).toHaveCount(0); await expect(page.locator(".svg-diagram")).toBeVisible();
-  await page.getByRole("heading", { name: "Study notes" }).click(); await expect(page.getByRole("textbox", { name: "Edit Markdown block" })).toContainText("# Study notes");
+  await page.getByRole("heading", { name: "Study notes" }).click(); await expect(page.getByRole("textbox", { name: "Edit Markdown block" })).toHaveCount(0);
+  await page.getByRole("heading", { name: "Study notes" }).dblclick(); await expect(page.getByRole("textbox", { name: "Edit Markdown block" })).toContainText("# Study notes");
   await page.evaluate(() => { const editor = document.querySelector('textarea')!; const clipboard = new DataTransfer(); clipboard.setData("text/plain", "https://youtu.be/dQw4w9WgXcQ"); editor.dispatchEvent(new ClipboardEvent("paste", { clipboardData: clipboard, bubbles: true, cancelable: true })); });
   await expect(page.getByRole("dialog", { name: "Insert image or link" })).toBeVisible(); await expect(page.getByLabel("Link title")).toHaveValue("Understanding Fourier series");
   await page.getByLabel("Include the video thumbnail").check(); await page.getByRole("button", { name: "Insert link", exact: true }).click();

@@ -22,6 +22,14 @@ runtime download is involved. The Apache-2.0 license ships on both platforms.
 - Content zoom, independent plot/image zoom, links and PDF heading navigation.
 - PDF paper size, margins, font, size, line spacing and optional page numbers.
   Settings, Export and Share expose the same PDF configuration.
+- Percentage-based reading width (80% by default) and adjustable vertical spacing.
+- Private TTF/OTF imports for reading and PDF export; bundled Manrope, Roboto,
+  Noto Sans, Noto Serif and JetBrains Mono are shared by both platforms.
+- Double-click Live block editing, outside-click/Escape exit, Read/Live search
+  with all-match highlighting, Markdown/LaTeX copying and code Copy controls.
+- Autosave for existing notes, conflict checks against externally changed files,
+  empty-untitled disposal, rename, undo and redo. Android document providers may
+  not support atomic replacement; staged writes and separate recovery reduce risk.
 
 ## Windows and tabs
 
@@ -31,6 +39,8 @@ window" command. Escape cancels a drag. Transfers flush the latest edit before
 changing ownership, preserve embedded assets and bounded Source undo/caret and
 plot view state, and leave the original note untouched if the target closes or
 is busy. Transient view metadata is not added to Markdown/SMD or recovery files.
+The drag has a native note-preview image. Moving the final tab into another
+window retires the empty source window.
 
 Android: hold a tab, then drag to reorder it. TalkBack also exposes move-left and
 move-right actions. Normal horizontal swipes still scroll the tab row. "New

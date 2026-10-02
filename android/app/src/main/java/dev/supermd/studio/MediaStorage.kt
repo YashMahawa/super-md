@@ -124,6 +124,22 @@ class MediaStorage(private val context: Context) {
             writer.endObject().endObject()
         }
     }
+    fun portableMarkdown(input: InputStream): String {
+        // Our envelope puts source before assets. Never load image bytes merely
+        // to check whether a portable note's source changed externally.
+        val bounded=object:java.io.FilterInputStream(input){var consumed=0L;override fun read():Int {val value=super.read();if(value>=0)require(++consumed<=20_000_000);return value};override fun read(buffer:ByteArray,offset:Int,length:Int):Int {val size=super.read(buffer,offset,length);if(size>0){consumed+=size;require(consumed<=20_000_000)};return size}}
+        JsonReader(bounded.reader().buffered()).use {reader->
+            reader.beginObject()
+            while(reader.hasNext()){val name=reader.nextName();if(name=="markdown"){val source=reader.nextString();require(source.toByteArray().size<=20_000_000);return source}else reader.skipValue()}
+        }
+        error("Portable source is unavailable")
+    }
+    fun writeLocalPortable(output: java.io.OutputStream, markdown: String, directory: String?) {
+        val sources=JSONArray(PdfEngine.imageSources(markdown))
+        val files=(0 until sources.length()).map {sources.getString(it)}.distinct().filter {it.startsWith("assets/")}.map {source->source to (local(source,directory) ?: error("Save manually to resolve a new image: $source"))}
+        require(files.size<=512 && files.sumOf {it.second.length()}<=75_000_000 && markdown.toByteArray().size<=20_000_000)
+        JsonWriter(output.writer()).use {writer->writer.beginObject().name("format").value("supermd-smd").name("version").value(1).name("markdown").value(markdown).name("assets").beginObject();files.forEach {(source,file)->writer.name(source).value(data(file))};writer.endObject().endObject()}
+    }
     fun fetch(address: String, image: Boolean): String {
         var url = URL(address)
         repeat(5) {

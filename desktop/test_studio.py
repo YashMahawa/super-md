@@ -129,6 +129,34 @@ class StudioTest(unittest.TestCase):
         studio.setFullscreen(False)
         self.assertEqual(json.loads(studio.snapshot)["zoom"],130)
 
+    def test_empty_untitled_is_not_recovered_or_prompted(self):
+        self.studio.newNote()
+        self.studio._current()["content"] = " \n\t"
+        self.studio._recover(); self.flush()
+        self.assertEqual(json.loads((self.studio.data / "recovery.json").read_text()), [])
+        self.assertTrue(self.studio.requestWindowClose())
+
+    def test_autosave_commits_existing_note_and_pauses_for_external_edits(self):
+        studio=self.studio
+        path=studio.data / "autosave.md"
+        path.write_text("original",encoding="utf-8")
+        studio._current().update(path=str(path),content="first edit",saved="original")
+        studio._autosave()
+        deadline=time.monotonic()+3
+        while studio.saving and time.monotonic()<deadline:
+            self.app.processEvents();time.sleep(.005)
+        self.assertEqual(path.read_text(),"first edit")
+        self.assertEqual(studio._current()["saved"],"first edit")
+        path.write_text("external edit",encoding="utf-8")
+        studio._current()["content"]="second edit"
+        studio._autosave()
+        deadline=time.monotonic()+3
+        while studio.saving and time.monotonic()<deadline:
+            self.app.processEvents();time.sleep(.005)
+        self.assertEqual(path.read_text(),"external edit")
+        self.assertEqual(studio._current()["content"],"second edit")
+        self.assertIn("changed",studio.message)
+
     def test_reorder_keeps_active_note_and_portable_assets(self):
         studio = self.studio
         studio.newNote(); studio.newNote()

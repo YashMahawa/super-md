@@ -48,6 +48,7 @@ export async function preparePdf(markdown: string, documentPath: string | null) 
           if (!graph) throw new Error(`Chart cannot export: ${parsed.body.textContent}`);
           graph.setAttribute("xmlns", "http://www.w3.org/2000/svg");
           graph.querySelectorAll(".chart-axis").forEach((axis) => axis.setAttribute("stroke", "#667085"));
+          graph.querySelectorAll(".chart-grid").forEach((axis) => axis.setAttribute("stroke", "#d5dbe5"));
           graph.querySelectorAll("text").forEach((text) => { text.setAttribute("fill", "#20252d"); text.setAttribute("font-size", "14"); });
           const title = parsed.querySelector("figcaption")?.textContent;
           if(title) chartTitles.set(node,title);

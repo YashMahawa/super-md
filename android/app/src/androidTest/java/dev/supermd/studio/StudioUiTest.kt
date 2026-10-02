@@ -119,7 +119,7 @@ class StudioUiTest {
         // Exercise the real JS bridge, Python worker, shared preparation and JNI
         // typesetter together. Only the system destination picker is replaced
         // with a private file URI; all document/export code remains production.
-        javascriptUntil("(() => { const b = document.querySelector('.python-cell button'); if (b && b.textContent.includes('Run')) b.click(); return !!document.querySelector('.cell-output img'); })()") { it == "true" }
+        javascriptUntil("(() => { const b = [...document.querySelectorAll('.python-cell button')].find(button => button.textContent.includes('Run')); if (b) b.click(); return !!document.querySelector('.cell-output img'); })()") { it == "true" }
         val exported = java.io.File(compose.activity.cacheDir, "reader-export-test.pdf")
         exported.delete()
         val model = androidx.lifecycle.ViewModelProvider(compose.activity)[StudioViewModel::class.java]

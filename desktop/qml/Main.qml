@@ -46,19 +46,23 @@ ApplicationWindow {
         function onSaveRequested(name) { saveDialog.selectedFile = studio.defaultSaveLocation(name); saveDialog.open() }
         function onExportRequested(format) { outputFormat = format; exportDialog.open() }
         function onFolderPickerRequested() { folderDialog.open() }
+        function onFontPickerRequested() { fontDialog.open() }
         function onReaderLoad(payload) { reader.runJavaScript("window.supermdLoad?.(" + payload + ")") }
         function onReaderCall(script) { reader.runJavaScript(script) }
     }
     Shortcut { sequences: [StandardKey.New]; onActivated: studio.newNote() }
+    FileDialog { id:fontDialog;title:"Import a font";fileMode:FileDialog.OpenFile;nameFilters:["Fonts (*.ttf *.otf)"];onAccepted:studio.importFont(selectedFile.toString()) }
     Shortcut { sequences: [StandardKey.Open]; onActivated: openDialog.open() }
     Shortcut { sequences: [StandardKey.Save]; onActivated: studio.saveSafely() }
-    Shortcut { sequences: [StandardKey.Find]; onActivated: { studio.setMode("editor"); studio.command("find") } }
+    Shortcut { sequences: [StandardKey.Undo]; enabled: !settingsOpen && !viewState.readerOverlay && !exportDialog.visible; onActivated: studio.command("undo") }
+    Shortcut { sequences: [StandardKey.Redo]; enabled: !settingsOpen && !viewState.readerOverlay && !exportDialog.visible; onActivated: studio.command("redo") }
+    Shortcut { sequences: [StandardKey.Find]; onActivated: studio.command("find") }
     Shortcut { sequences: [StandardKey.Close]; onActivated: studio.closeTabSafely(viewState.active) }
     Shortcut { sequence: "Ctrl+Shift+N"; onActivated: studio.command("window") }
     Shortcut { sequence: "Ctrl+,"; onActivated: settingsOpen = !settingsOpen }
     Shortcut { sequence: "F11"; onActivated: windowModes.setFullscreen(!windowModes.fullscreen) }
     Shortcut { sequence: "Escape"; enabled: settingsOpen; onActivated: settingsOpen = false }
-    Shortcut { sequence: "Escape"; enabled: windowModes.fullscreen && !settingsOpen; onActivated: windowModes.setFullscreen(false) }
+    Shortcut { sequence: "Escape"; enabled: windowModes.fullscreen && !settingsOpen && !viewState.readerOverlay; onActivated: reader.runJavaScript("window.supermdDismiss?.() || false", function(dismissed) { if (!dismissed) windowModes.setFullscreen(false) }) }
     // Qt's chrome never scales. Keyboard/pinch zoom is routed to the content pane.
     Shortcut { sequence: "Ctrl++"; onActivated: reader.runJavaScript("window.supermdZoomBy?.(1.1)") }
     Shortcut { sequence: "Ctrl+="; onActivated: reader.runJavaScript("window.supermdZoomBy?.(1.1)") }
@@ -71,6 +75,7 @@ ApplicationWindow {
         Pane {
             width: parent.width
             padding: 12
+            background: Rectangle { color: viewState.colors["surface-low"] }
             RowLayout {
                 anchors.fill: parent
                 spacing: 8
@@ -80,7 +85,7 @@ ApplicationWindow {
                 ActionButton { text: "Open note"; glyph: "File"; onClicked: openDialog.open() }
                 ActionButton { glyph: "FloppyDisk"; ToolTip.text: "Save note"; onClicked: studio.saveSafely(); enabled: !viewState.busy }
                 Item { Layout.fillWidth: true }
-                ActionButton { glyph: "MagnifyingGlass"; ToolTip.text: "Find and replace"; onClicked: { studio.setMode("editor"); studio.command("find") } }
+                ActionButton { glyph: "MagnifyingGlass"; ToolTip.text: "Find in note (Ctrl+F)"; onClicked: studio.command("find") }
                 ActionButton { glyph: "Image"; ToolTip.text: "Insert image or link"; onClicked: studio.command("insert") }
                 ActionButton { glyph: "Bug"; ToolTip.text: "Fix LaTeX"; onClicked: studio.command("repair") }
                 ActionButton { glyph: "ShareNetwork"; ToolTip.text: "Share note"; onClicked: window.showExport(true) }
@@ -92,6 +97,7 @@ ApplicationWindow {
             width: parent.width
             viewState: window.viewState
         }
+        Rectangle { width: parent.width; height: 1; color: viewState.colors.outline; opacity: .55 }
     }
     SplitView {
         anchors.fill: parent
@@ -149,10 +155,13 @@ ApplicationWindow {
             ColumnLayout {
                 anchors.fill: parent
                 spacing: 0
-                RowLayout {
+                Pane {
                     visible: !viewState.fullscreen
                     Layout.fillWidth: true
-                    Layout.margins: 12
+                    padding: 12
+                    background: Rectangle { color: viewState.colors["surface-low"]; Rectangle { anchors.bottom: parent.bottom; width: parent.width; height: 1; color: viewState.colors.outline; opacity: .4 } }
+                    RowLayout {
+                    anchors.fill: parent
                     ModeGroup { choices: window.width < 1000 ? [{key:"live",label:"Live"},{key:"editor",label:"Source"},{key:"reader",label:"Read"}] : [{key:"live",label:"Live"},{key:"editor",label:"Source"},{key:"reader",label:"Read"},{key:"split",label:"Split"}]; selected: viewState.mode; onChosen: key => studio.setMode(key) }
                     Item { Layout.fillWidth: true }
                     ExpressiveSlider { visible: window.width >= 1000; Layout.preferredWidth: 140; from: 60; to: 240; value: viewState.zoom; onMoved: studio.setZoom(value); Accessible.name: "Content zoom" }
@@ -175,6 +184,7 @@ ApplicationWindow {
                         Accessible.name: "Zoom percentage"
                     }
                     ActionButton { objectName: "fullscreenButton"; glyph: "Fullscreen"; icon.width: 24; icon.height: 24; compact: true; tonal: true; ToolTip.text: "Fullscreen (F11 · Esc to exit)"; onClicked: windowModes.setFullscreen(true) }
+                    }
                 }
                 WebEngineView {
                     id: reader
@@ -210,7 +220,7 @@ ApplicationWindow {
                     }
                 }
             }
-            ActionButton { visible: viewState.fullscreen; glyph: "FullscreenExit"; icon.width: 24; icon.height: 24; compact: true; tonal: true; ToolTip.text: "Exit fullscreen (Esc · F11)"; anchors.right: parent.right; anchors.top: parent.top; anchors.margins: 12; onClicked: windowModes.setFullscreen(false) }
+            ActionButton { visible: viewState.fullscreen && !viewState.readerOverlay; glyph: "FullscreenExit"; icon.width: 24; icon.height: 24; compact: true; tonal: true; ToolTip.text: "Exit fullscreen (Esc · F11)"; anchors.right: parent.right; anchors.top: parent.top; anchors.margins: 12; onClicked: windowModes.setFullscreen(false) }
         }
     }
     Dialog {

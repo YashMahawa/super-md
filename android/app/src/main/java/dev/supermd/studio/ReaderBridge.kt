@@ -26,6 +26,8 @@ class ReaderBridge(private val web: WebView, private val model: StudioViewModel,
                     "reader_ready" -> { ready(); true }
                     "document_changed" -> { model.edit(args.getString("id"), args.getString("content")); true }
                     "zoom_changed" -> { model.zoom(args.getDouble("zoom").toFloat()); true }
+                    "reader_overlay_changed" -> { model.overlay(args.optBoolean("open")); true }
+                    "load_font" -> withContext(Dispatchers.IO) {model.fonts.reader(args.getString("family"))}
                     "load_asset" -> model.asset(args.getString("documentPath"), args.getString("source"))
                     "import_images" -> withContext(Dispatchers.IO) { model.media.importJson(args.getJSONArray("images")) }
                     "fetch_resource" -> withContext(Dispatchers.IO) { JSONObject().put("body", model.media.fetch(args.getString("url"), args.optBoolean("image"))) }

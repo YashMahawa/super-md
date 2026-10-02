@@ -20,6 +20,10 @@ export function invoke<T>(command: string, args: Record<string, unknown> = {}): 
     const timeout = command === "export_pdf_native" ? 180_000 : command === "run_python" ? 120_000 : 60_000;
     const timer = window.setTimeout(() => { pending.delete(id); reject(new Error(`${command} timed out`)); }, timeout);
     pending.set(id, { resolve, reject, timer });
-    window.SuperMD!.post(id, command, JSON.stringify(args));
+    try { window.SuperMD!.post(id, command, JSON.stringify(args)); }
+    catch (error) {
+      pending.delete(id); window.clearTimeout(timer);
+      reject(error instanceof Error ? error : new Error(String(error)));
+    }
   });
 }

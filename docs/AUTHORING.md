@@ -147,17 +147,19 @@ series (not arbitrary 3D scenes or scripts):
 ```
 ````
 
-The 3D grid defaults to 20 steps and is capped at 40. Orbit and tilt have sliders;
-mouse drag rotates. Touch rotation is explicitly enabled so ordinary scrolling
-doesn't become a graph gesture. Rotation is frame-coalesced; it does not re-evaluate
-the mathematical grid. The current camera and parameter values are remembered
+The 3D mesh defaults to 20 steps and is capped at 32. Mouse drag or arrow keys
+rotate; one-finger gestures scroll the note. Rotation is frame-coalesced and
+expressions are sampled over the visible world domain. The camera, grid toggle,
+zoom, focal center and parameter values are remembered
 within the app session and used for the static vector PDF snapshot. A PDF cannot
 retain sliders or a draggable camera.
 
-Pinch or Ctrl/Meta + trackpad wheel over a plot changes only that plot's zoom
-(50–800%), not the note's text size. The Plot zoom slider and Reset zoom provide
-keyboard-accessible alternatives. Zoom is session state and is included in PDF
-snapshots; it does not modify the Markdown or re-evaluate the mathematical grid.
+Pinch, Ctrl/Meta + trackpad wheel, or left-mouse-button + wheel over a plot changes
+only that plot's zoom (5–6400%), not the note's text size. Zoom is focal: the point
+under the pointer stays in place. Expressions are sampled beyond their initial
+domain when zooming out; explicit point sets remain finite data. Grid can be
+toggled and hover/tap shows coordinates. Zoom and grid state are included in PDF
+snapshots, without adding presentation settings to Markdown.
 
 Expressions accept `x`, `y` (surfaces), named slider variables, `pi`, `e`,
 parentheses, `+ - * / % ^ **` and functions `sin cos tan asin acos atan sqrt abs

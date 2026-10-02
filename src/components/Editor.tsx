@@ -1,10 +1,10 @@
 import { useEffect, useRef, useState } from "react";
 import { Compartment, EditorSelection, EditorState } from "@codemirror/state";
 import { EditorView, keymap, lineNumbers, highlightActiveLine, drawSelection } from "@codemirror/view";
-import { defaultKeymap, history, historyField, historyKeymap, indentWithTab } from "@codemirror/commands";
+import { defaultKeymap, history, historyField, historyKeymap, indentWithTab, undo, redo } from "@codemirror/commands";
 import { markdown, markdownLanguage } from "@codemirror/lang-markdown";
 import { syntaxHighlighting, defaultHighlightStyle, foldGutter, foldKeymap } from "@codemirror/language";
-import { searchKeymap, highlightSelectionMatches, openSearchPanel } from "@codemirror/search";
+import { search, searchKeymap, highlightSelectionMatches, openSearchPanel } from "@codemirror/search";
 import { oneDarkHighlightStyle } from "@codemirror/theme-one-dark";
 
 interface Props {
@@ -19,6 +19,7 @@ const sessions = new Map<string, { state: EditorState; top: number; appearance: 
 const callbacks = new Map<string, (value: string) => void>();
 const statusHandlers = new Map<string, (state: EditorState) => void>();
 const visibleEditors = new Map<string, EditorView>();
+export function editorHistory(id:string,direction:"undo"|"redo"):boolean {const view=visibleEditors.get(id);return !!view && (direction==="undo"?undo(view):redo(view));}
 export interface PortableEditorSession { state: unknown; top: number; wrapped: boolean }
 const incomingSessions = new Map<string, PortableEditorSession>();
 export function exportEditorSession(id: string): PortableEditorSession | undefined {
@@ -82,6 +83,7 @@ export default function Editor({ sessionId = "default", value, onChange, dark, f
         drawSelection(),
         highlightActiveLine(),
         highlightSelectionMatches(),
+        search({top:true}),
         markdown({ base: markdownLanguage }),
         syntaxHighlighting(defaultHighlightStyle, { fallback: true }),
         keymap.of([...defaultKeymap, ...historyKeymap, ...searchKeymap, ...foldKeymap, indentWithTab]),

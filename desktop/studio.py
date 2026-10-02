@@ -21,10 +21,11 @@ from PySide6.QtCore import QObject, Property, Signal, Slot, QStandardPaths, QTim
 from PySide6.QtGui import QDesktopServices, QFontDatabase, QGuiApplication, QCursor
 from documents import atomic_write, bundle, image_data, materialize_assets, open_note, MIMES, MAX_IMAGE
 from theme import detect_system_dark, read_system_palette, system_palette_paths, tokens
+from fonts import FontStore
 
 ROOT = Path(sys._MEIPASS)/"resources" if getattr(sys,"frozen",False) else Path(__file__).resolve().parent.parent
 DEFAULT_PDF = {"pageSize": "a4", "margin": 18, "fontSize": 10.5, "lineHeight": 1.35, "fontFamily": "Noto Sans", "pageNumbers": True}
-DEFAULTS = {"theme": "system", "fullTheme": "black", "motion": True, "font": "Manrope", "size": 18, "width": 0, "normalZoom": 100, "fullZoom": 100, "python": (shutil.which("python3") or shutil.which("python") or "") if getattr(sys,"frozen",False) else sys.executable, "pdf": DEFAULT_PDF, "welcomed": False}
+DEFAULTS = {"theme": "system", "fullTheme": "black", "motion": True, "font": "Manrope", "size": 18, "width": 0, "widthPercent":80, "lineHeight":1.65, "autosave":True, "normalZoom": 100, "fullZoom": 100, "python": (shutil.which("python3") or shutil.which("python") or "") if getattr(sys,"frozen",False) else sys.executable, "pdf": DEFAULT_PDF, "welcomed": False}
 SAMPLE = """# A place to think\n\nWrite in Markdown. Read without distractions.\n\n> [!tip] Start with your notes\n> Open any note or folder. No vault, no import process.\n\n## Learn by exploring\n\n$$E = mc^2$$\n\n> [!answer]- Why does this matter?\n> Tap the heading to reveal an answer, then hide it to test yourself.\n\n```smd-chart\n{\"title\":\"A changing wave\",\"series\":[{\"name\":\"Sine\",\"expression\":\"sin(a*x)\",\"color\":\"#386a57\"},{\"name\":\"Cosine\",\"expression\":\"cos(a*x)\",\"color\":\"#bc6750\"}],\"sliders\":[{\"name\":\"a\",\"min\":0.2,\"max\":3,\"value\":1}]}\n```\n\n## Explore in three dimensions\n\n```smd-chart\n{\"mode\":\"surface3d\",\"title\":\"Bowl and saddle\",\"x\":{\"min\":-2,\"max\":2,\"steps\":20},\"y\":{\"min\":-2,\"max\":2},\"series\":[{\"name\":\"Bowl\",\"expression\":\"a*(x^2+y^2)\",\"color\":\"#39aa7a\"},{\"name\":\"Saddle\",\"expression\":\"x^2-y^2\",\"color\":\"#ad8be3\"}],\"sliders\":[{\"name\":\"a\",\"min\":0.1,\"max\":2,\"value\":1}]}\n```\n\n[Back to exploring](#learn-by-exploring)\n"""
 
 def local_path(value: str) -> Path:
@@ -38,6 +39,7 @@ class Session(QObject):
         super().__init__()
         self.data = Path(tempfile.mkdtemp(prefix="supermd-test-")) if isolated else Path(QStandardPaths.writableLocation(QStandardPaths.AppDataLocation))/"qt-studio"
         self.data.mkdir(parents=True,exist_ok=True)
+        self.font_store = FontStore(self.data)
         self.writes = concurrent.futures.ThreadPoolExecutor(max_workers=1,thread_name_prefix="supermd-save")
         self.settings = copy.deepcopy(DEFAULTS)
         self.recent = []
@@ -71,6 +73,7 @@ class Studio(QObject):
     detachedWindowRequested = Signal(str, str)
     exportRequested = Signal(str)
     folderPickerRequested = Signal()
+    fontPickerRequested = Signal()
     flushFailed = Signal(bool)
 
     def __init__(self, isolated: bool = False, session: Session | None = None):
@@ -95,6 +98,7 @@ class Studio(QObject):
         self.expanded: set[str] = set()
         self.mode = "live"
         self.fullscreen = False
+        self.reader_overlay = False
         self.busy = 0
         self.message = ""
         self.ready = False
@@ -131,6 +135,10 @@ class Studio(QObject):
         self.recovery_timer = QTimer(self)
         self.recovery_timer.setSingleShot(True)
         self.recovery_timer.timeout.connect(self._recover)
+        self.autosave_timer = QTimer(self)
+        self.autosave_timer.setSingleShot(True)
+        self.autosave_timer.timeout.connect(self._autosave)
+        self.saving = set()
         self.tabs = [{**tab,"id":uuid.uuid4().hex} for tab in self.session.initial_recovery]
         self.session.initial_recovery = []
         self.session.drafts[self.window_id] = [dict(t) for t in self.tabs]
@@ -157,7 +165,7 @@ class Studio(QObject):
         if load and self.ready:
             tab = self._current()
             colors = self._colors()
-            self.readerLoad.emit(json.dumps({"id": tab["id"], "content": tab["content"], "path": tab["path"] or tab["id"], "mode": self.mode, "dark": self._dark(), "fullscreen": self.fullscreen, "font": self.settings["font"], "size": self.settings["size"], "width": self.settings["width"], "zoom": self.settings["fullZoom" if self.fullscreen else "normalZoom"], "motion": self.settings["motion"], "python": self.settings["python"], "colors": colors, "viewState": tab.pop("viewState", None)}))
+            self.readerLoad.emit(json.dumps({"id": tab["id"], "content": tab["content"], "path": tab["path"] or tab["id"], "mode": self.mode, "dark": self._dark(), "fullscreen": self.fullscreen, "font": self.settings["font"], "size": self.settings["size"], "widthPercent": self.settings["widthPercent"], "lineHeight":self.settings["lineHeight"], "zoom": self.settings["fullZoom" if self.fullscreen else "normalZoom"], "motion": self.settings["motion"], "python": self.settings["python"], "colors": colors, "viewState": tab.pop("viewState", None)}))
 
     def _dark(self):
         theme = self.settings["fullTheme" if self.fullscreen else "theme"]
@@ -206,6 +214,7 @@ class Studio(QObject):
         self.theme_timer.stop()
         self.theme_debounce.stop()
         self.recovery_timer.stop()
+        self.autosave_timer.stop()
         self.flush_timer.stop()
         self._recover()
         self.retired = True
@@ -217,13 +226,13 @@ class Studio(QObject):
     @Property(str, notify=changed)
     def snapshot(self):
         tab = self._current()
-        return json.dumps({"tabs": [{"id": t["id"], "name": t["name"], "dirty": t["content"] != t["saved"]} for t in self.tabs], "active": self.active, "name": tab["name"], "portable": tab["portable"], "folder": self.folder, "files": self.files, "recent": self.recent, "settings": self.settings, "mode": self.mode, "fullscreen": self.fullscreen, "dark": self._dark(), "zoom": self.settings["fullZoom" if self.fullscreen else "normalZoom"], "busy": self.busy > 0, "message": self.message, "colors": self._colors()})
+        return json.dumps({"tabs": [{"id": t["id"], "name": t["name"], "dirty": t["content"] != t["saved"]} for t in self.tabs], "active": self.active, "name": tab["name"], "portable": tab["portable"], "folder": self.folder, "files": self.files, "recent": self.recent, "settings": self.settings, "mode": self.mode, "fullscreen": self.fullscreen, "readerOverlay": self.reader_overlay, "dark": self._dark(), "zoom": self.settings["fullZoom" if self.fullscreen else "normalZoom"], "busy": self.busy > 0, "message": self.message, "colors": self._colors()})
 
     @Property(str, constant=True)
     def windowId(self): return self.window_id
 
     def _can_move(self):
-        return not (self.retired or self.busy or self.pending_close or self.pending_save_as or self.pending_export or self.flush_operation)
+        return not (self.retired or self.busy or self.saving or self.pending_close or self.pending_save_as or self.pending_export or self.flush_operation)
 
     @Slot(str, str, result=bool)
     def canReceiveTab(self, source_id, tab_id):
@@ -252,18 +261,25 @@ class Studio(QObject):
         self.tabs.remove(note)
         target.tabs.insert(max(0, min(len(target.tabs), index)), note)
         target.active = tab_id
-        if not self.tabs: self.tabs.append(self._note("Untitled.md"))
+        emptied = not self.tabs
+        if emptied: self.tabs.append(self._note("Untitled.md"))
         if self.active == tab_id: self.active = self.tabs[min(old, len(self.tabs)-1)]["id"]
         # Update both owners before writing one recovery snapshot: never duplicate
         # or temporarily lose a dirty note in the durable recovery stream.
-        self.session.drafts[self.window_id] = [copy.deepcopy({key: value for key, value in t.items() if key != "viewState"}) for t in self.tabs if t["content"] != t["saved"]]
+        self.session.drafts[self.window_id] = [copy.deepcopy({key: value for key, value in t.items() if key != "viewState"}) for t in self.tabs if t["content"] != t["saved"] and (t["path"] or t["content"].strip())]
         target._recover()
         self._emit(); target._emit()
+        if emptied: QTimer.singleShot(0, self.allowClose.emit)
         return True
 
     @Slot(str)
     def detachTab(self, tab_id):
         if self._can_move() and any(t["id"] == tab_id for t in self.tabs): self._flush("detach_tab", tab_id)
+
+    @Slot(str,result=str)
+    def tabPreview(self,id):
+        note=next((t for t in self.tabs if t["id"]==id),None)
+        return note["content"][:900] if note else ""
 
     @Slot(str, int)
     def finishTabDrag(self, tab_id, action):
@@ -280,10 +296,23 @@ class Studio(QObject):
                 if 0 <= point.x() <= strip.width() and 0 <= point.y() <= strip.height(): return
         self.detachTab(tab_id)
 
-    @Property("QStringList", constant=True)
+    @Property("QStringList", notify=changed)
     def fonts(self):
-        preferred = ["Manrope", "Noto Sans", "Noto Serif", "DejaVu Sans", "DejaVu Serif", "JetBrains Mono", "Libertinus Serif"]
+        preferred = ["Manrope", "Roboto", "Noto Sans", "Noto Serif", "JetBrains Mono", "Libertinus Serif", "New Computer Modern", "DejaVu Sans Mono"]
         return preferred + sorted(set(QFontDatabase.families()) - set(preferred))
+
+    @Slot()
+    def chooseFont(self): self.fontPickerRequested.emit()
+
+    @Slot(str)
+    def importFont(self,value):
+        try:
+            family=self.session.font_store.import_file(local_path(value))
+            self.settings["font"] = family
+            self.message = "Imported " + family + " for reading and PDF export"
+            self._preferences(); self._emit()
+        except (OSError,ValueError) as error:
+            self.message = str(error); self._emit(False)
 
     @Property(str,notify=changed)
     def brand(self):
@@ -322,7 +351,7 @@ class Studio(QObject):
 
     def _recover(self):
         # Snapshot only unsaved tabs. Asset bytes stay in recovery, never in displayed source.
-        self.session.drafts[self.window_id] = [copy.deepcopy({key: value for key, value in t.items() if key != "viewState"}) for t in self.tabs if t["content"] != t["saved"]]
+        self.session.drafts[self.window_id] = [copy.deepcopy({key: value for key, value in t.items() if key != "viewState"}) for t in self.tabs if t["content"] != t["saved"] and (t["path"] or t["content"].strip() or t["assets"])]
         payload = json.dumps([tab for tabs in self.session.drafts.values() for tab in tabs]).encode()
         self._submit(lambda: atomic_write(self.data / "recovery.json", payload), lambda *_: None, False,self.writes)
 
@@ -471,12 +500,14 @@ class Studio(QObject):
         except ValueError:
             return
         if key in ("theme","fullTheme") and value not in ("system","light","dark","black"): return
-        if key in ("motion","welcomed") and not isinstance(value,bool): return
+        if key in ("motion","welcomed","autosave") and not isinstance(value,bool): return
         if key in ("font","python") and (not isinstance(value,str) or not value.strip() or len(value)>2048): return
-        if key in ("size","width","normalZoom","fullZoom") and (not isinstance(value,(int,float)) or not math.isfinite(value)): return
+        if key in ("size","width","widthPercent","lineHeight","normalZoom","fullZoom") and (not isinstance(value,(int,float)) or isinstance(value,bool) or not math.isfinite(value)): return
         if key == "pdf" and (not isinstance(value,dict) or set(value) != set(DEFAULT_PDF)): return
         if key == "size": value = max(12, min(32, float(value)))
         if key == "width": value = max(0, min(5000, int(value)))
+        if key == "widthPercent": value = max(50,min(100,float(value)))
+        if key == "lineHeight": value = max(1.15,min(2.2,float(value)))
         self.settings[key] = value
         self._preferences()
         self._emit()
@@ -545,22 +576,62 @@ class Studio(QObject):
         else:
             self._save_text(self._current(), path)
 
-    def _save_text(self, tab, path):
+    def _save_text(self, tab, path, automatic=False):
         id, content, assets = tab["id"], tab["content"], dict(tab["assets"])
+        expected, original_path = tab["saved"], tab["path"]
+        portable = tab["portable"] and str(path) == original_path
+        if id in self.saving: return
+        self.saving.add(id)
         def finished(_, error):
+            self.saving.discard(id)
             if error: return
             target = next((t for t in self.tabs if t["id"] == id), None)
             if target:
-                target.update(path=str(path), name=path.name, saved=content, portable=False)
-            self.message = "Saved"
+                target.update(path=str(path), name=path.name, saved=content, portable=portable)
+                if automatic and target["content"] != content: self.autosave_timer.start(900)
+            self.message = "Autosaved" if automatic else "Saved"
             self._recover()
             self._emit()
             if self.pending_close:
                 self._finish_close()
         def write():
-            materialize_assets(path.parent,assets)
-            atomic_write(path,content.encode())
-        self._submit(write, finished,executor=self.writes)
+            if automatic and (not path.exists() or open_note(path)[0] != expected):
+                raise ValueError("Autosave paused: this file changed outside Super MD. Your edits remain in draft recovery; use Save as to keep both versions.")
+            if portable: atomic_write(path,json.dumps(bundle(content,assets),ensure_ascii=False).encode())
+            else:
+                materialize_assets(path.parent,assets)
+                atomic_write(path,content.encode())
+        self._submit(write, finished,busy=not automatic,executor=self.writes)
+
+    def _autosave(self):
+        if not self.settings["autosave"]: return
+        for tab in self.tabs:
+            if tab["path"] and tab["content"] != tab["saved"] and tab["id"] not in self.saving:
+                self._save_text(tab,Path(tab["path"]),automatic=True)
+
+    @Slot(str, str)
+    def renameNote(self, id, name):
+        tab = next((t for t in self.tabs if t["id"] == id),None)
+        if not tab or id in self.saving: return
+        name = name.strip()
+        if not name or name in (".","..") or any(c in name for c in '/\\\x00'):
+            self.message = "Choose a filename without path separators."; self._emit(False); return
+        suffix = Path(tab["name"]).suffix or ".md"
+        if not Path(name).suffix: name += suffix
+        if Path(name).suffix.lower() != suffix.lower():
+            self.message = "Rename keeps the note format. Use Export to change formats."; self._emit(False); return
+        if not tab["path"]: tab["name"] = name; self._recover(); self._emit(False); return
+        before = Path(tab["path"]); after = before.with_name(name)
+        if before == after: return
+        def work():
+            if after.exists(): raise ValueError("A file with that name already exists.")
+            before.rename(after)
+        def finished(_,error):
+            if error: return
+            tab.update(path=str(after),name=name)
+            self.recent = [str(after) if p == str(before) else p for p in self.recent]
+            self._preferences(); self._recover(); self._emit(); self._load_tree()
+        self._submit(work,finished,executor=self.writes)
 
     @Slot(str,result=str)
     def defaultSaveLocation(self,name):
@@ -572,7 +643,7 @@ class Studio(QObject):
         tab = next((t for t in self.tabs if t["id"] == id), None)
         if not tab:
             return
-        if tab["content"] != tab["saved"]:
+        if tab["content"] != tab["saved"] and (tab["path"] or tab["content"].strip() or tab["assets"]):
             self.pending_close = id
             self.selectTab(id)
             self.closeRequested.emit(tab["name"])
@@ -591,7 +662,7 @@ class Studio(QObject):
 
     @Slot(result=bool)
     def requestWindowClose(self):
-        dirty = next((t for t in self.tabs if t["content"] != t["saved"]), None)
+        dirty = next((t for t in self.tabs if t["content"] != t["saved"] and (t["path"] or t["content"].strip() or t["assets"])), None)
         if dirty:
             self.pending_close = "window"
             self.selectTab(dirty["id"])
@@ -627,7 +698,7 @@ class Studio(QObject):
 
     @Slot(str)
     def command(self, action):
-        calls = {"find": "window.supermdFind?.()", "insert": "window.supermdMedia?.()", "repair": "window.supermdRepairMath?.()"}
+        calls = {"find": "window.supermdFind?.()", "insert": "window.supermdMedia?.()", "repair": "window.supermdRepairMath?.()", "undo":"window.supermdHistory?.('undo')", "redo":"window.supermdHistory?.('redo')"}
         if action in calls: self.readerCall.emit(calls[action])
         elif action == "window": self.newWindowRequested.emit()
 
@@ -637,6 +708,7 @@ class Studio(QObject):
             args = json.loads(raw)
             tab = self._current()
             if command == "reader_ready": self.ready = True; self._emit(); self.replied.emit(id,"true",""); return
+            if command == "reader_overlay_changed": self.reader_overlay = bool(args.get("open")); self._emit(False); self.replied.emit(id,"true",""); return
             if command == "document_flushed":
                 operation = args.get("operation")
                 if operation != self.flush_operation or operation is None:
@@ -656,6 +728,7 @@ class Studio(QObject):
                 target = next((t for t in self.tabs if t["id"] == args["id"]), None)
                 if target: target["content"] = args["content"]
                 self.recovery_timer.start(800)
+                self.autosave_timer.start(900)
                 self._emit(False)
                 self.replied.emit(id,"true",""); return
             if command == "zoom_changed":
@@ -674,6 +747,7 @@ class Studio(QObject):
             python = self.settings["python"]
             def work():
                 if command == "load_asset": return self._asset(captured,args["source"])
+                if command == "load_font": return self.session.font_store.reader(args["family"])
                 if command == "fetch_resource": return self._fetch(args)
                 if command == "import_images":
                     results = []
@@ -695,6 +769,7 @@ class Studio(QObject):
                     return {"path":str(target)}
                 if command == "export_pdf_native":
                     engine = self._engine()
+                    args["assets"].update(self.session.font_store.pdf_assets(args["options"]["fontFamily"]))
                     result = subprocess.run([str(engine),"export-json",output], input=json.dumps(args), text=True, capture_output=True, timeout=120)
                     if result.returncode: raise ValueError(result.stderr.strip() or "PDF export failed")
                     return {"path":output}

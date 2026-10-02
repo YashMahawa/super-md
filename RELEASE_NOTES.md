@@ -1,4 +1,45 @@
-# Super MD 0.4.0
+# Super MD 0.4.1
+
+## Reading and editing polish
+
+- Richer accent-tinted light surfaces and separated tonal toolbar/mode bars on
+  desktop and Android. Dark/pure-black and reduced-motion settings are preserved.
+- Default 80% document width, adjustable in percentages rather than fixed pixels,
+  plus independent vertical spacing. Document zoom changes text and reading
+  width and preserves the focal word instead of jumping to another paragraph.
+- Live blocks now require a double-click to edit. Click outside or press Esc to
+  finish. Read/Live search highlights all matches, supports Next/Previous and
+  exposes a clear Close action without switching to Source mode.
+- Copy rendered text with the original math delimiters; ordinary code and Python
+  blocks have separate Copy buttons. Undo/redo works in reading and source flows.
+- Compact, bounded Fix LaTeX review cards replace oversized checkboxes. Broken
+  diagrams are isolated to their own block; Mermaid SVG output is sanitized.
+
+## Images, plots, fonts and files
+
+- Image viewer controls no longer overlap the native fullscreen exit. Its
+  Material slider stays at the bottom; pointer/two-finger zoom follows the focal
+  point and images pan independently from text.
+- Charts zoom at the pointer/touch focal point, resample expressions over the
+  visible domain and offer grid/coordinate inspection. Removed redundant plot
+  zoom/reset/rotation controls and hover bouncing. Three-dimensional surfaces
+  use colored meshes with gesture/keyboard camera control and bounded sampling.
+- Import TTF/OTF fonts on desktop and Android. Private imported fonts and the
+  expanded bundled font selection are available to reading and native PDF export.
+- Eleven paper sizes, with correctly cased labels, plus font, margins, spacing
+  and page-number controls in both Export and Share.
+- Default autosave for existing notes, external-edit protection and serialized
+  writes across windows. Empty unnamed notes are discarded; rename is accessible
+  from the tab actions. Portable SMD keeps assets outside the source editor.
+- Tab tear-off now carries a rendered window preview. Closing the last moved
+  tab removes the empty original desktop window; drag reordering remains native.
+
+This update adds real CLI process tests, bridge timeout/error tests, Qt drag
+preview painting checks and Android native PDF/font instrumentation. Physical
+phone testing was not performed. The previous release remains available for
+rollback.
+
+## Included application capabilities
 
 Normal desktop window management is restored; study fullscreen now remembers
 whether the window was maximized instead of resetting its size on exit.
@@ -42,11 +83,11 @@ the entire renderer is browser-free.
 keeping asset payloads out of the Source editor. Older text `.smd` and portable
 `.fmd` files remain readable. New exports use `.smd`.
 
-- Collapsible answers/callouts and long code blocks; click a Live block to edit.
+- Collapsible answers/callouts and long code blocks; double-click a Live block to edit.
 - Reviewable, conservative Fix LaTeX suggestions instead of rewriting notes silently.
 - Internal heading links, local/SVG images, Mermaid and explicit Matplotlib cells.
-- Bounded two-dimensional plots and multi-color three-dimensional wireframe
-  surfaces with parameter sliders, camera controls and finite-value checks.
+- Bounded two-dimensional plots and multi-color three-dimensional mesh
+  surfaces with parameter sliders, gesture camera controls and finite-value checks.
 - AI-ready authoring guide and binary-safe CLI read/inspect/assets/extract/pack commands.
 
 ## PDF and Android

@@ -7,6 +7,7 @@ os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 from PySide6.QtCore import QUrl, QMimeData, QPoint, QPointF, Qt, QEvent
 from PySide6.QtGui import QGuiApplication, QDragEnterEvent, QDragMoveEvent, QDropEvent
 from PySide6.QtQml import QQmlEngine, QQmlComponent
+from PySide6.QtQuick import QQuickItem
 from PySide6.QtTest import QTest
 from studio import Session
 from test_studio import QuietStudio
@@ -67,3 +68,25 @@ ApplicationWindow {
         original = list(self.studio.tabs)
         self.assertFalse(self.drop({"window": "foreign", "tab": "not-open"}))
         self.assertEqual(self.studio.tabs, original)
+
+    def test_drag_hint_is_a_real_rendered_card(self):
+        # Repeater delegates belong to a visual tree, not necessarily the
+        # window's QObject ownership tree.
+        items = [self.window.contentItem()]
+        preview = None
+        while items:
+            item = items.pop()
+            if item.objectName() == "tabDragPreview":
+                preview = item
+                break
+            items.extend(item.childItems())
+        self.assertIsNotNone(preview)
+        result = preview.grabToImage()
+        for _ in range(40):
+            if not result.image().isNull(): break
+            QTest.qWait(25)
+        image = result.image()
+        self.assertFalse(image.isNull())
+        self.assertEqual((image.width(), image.height()), (320, 190))
+        colors = {image.pixelColor(x, y).rgba() for x in range(0, 320, 8) for y in range(0, 190, 8)}
+        self.assertGreater(len(colors), 3, "The tab tear-off preview must contain painted text and a card, not an empty image")

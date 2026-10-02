@@ -42,14 +42,42 @@ ScrollView {
                 DragHandler {
                     target: null
                     onActiveChanged: {
-                        if (active) tab.grabToImage(function(result) {
+                        if (active) preview.grabToImage(function(result) {
                             if (dragHandler.active) { tab.Drag.imageSource = result.url; tab.Drag.active = true }
                         })
                     }
                     id: dragHandler
                 }
+                Rectangle {
+                    id:preview
+                    objectName:"tabDragPreview"
+                    // A native drag image can leave the window; an in-window
+                    // tooltip cannot. Render offscreen without moving/focusing chrome.
+                    x:-1000;y:-1000;width:320;height:190;radius:18;antialiasing:true
+                    color:strip.viewState.colors.surface;border.width:1;border.color:strip.viewState.colors.primary
+                    Column {
+                        anchors.fill:parent;anchors.margins:16;spacing:10
+                        Label {text:tab.modelData.name;font.weight:Font.DemiBold;width:parent.width;elide:Text.ElideRight}
+                        Label {text:"Release outside tabs to open a window";font.pixelSize:11;color:strip.viewState.colors.muted}
+                        Label {text:studio.tabPreview(tab.modelData.id);textFormat:Text.PlainText;width:parent.width;height:105;clip:true;wrapMode:Text.WordWrap;font.pixelSize:12;color:strip.viewState.colors.text}
+                    }
+                }
                 TapHandler { acceptedButtons: Qt.RightButton; onTapped: tabMenu.popup() }
-                Menu { id: tabMenu; MenuItem { text: "Move to new window"; onTriggered: studio.detachTab(tab.modelData.id) } }
+                Menu {
+                    id: tabMenu
+                    MenuItem { text: "Rename note"; onTriggered: { renameField.text=tab.modelData.name;renameDialog.open() } }
+                    MenuItem { text: "Undo"; enabled: tab.modelData.id===strip.viewState.active; onTriggered:studio.command("undo") }
+                    MenuItem { text: "Redo"; enabled: tab.modelData.id===strip.viewState.active; onTriggered:studio.command("redo") }
+                    MenuSeparator {}
+                    MenuItem { text: "Move to new window"; onTriggered: studio.detachTab(tab.modelData.id) }
+                }
+                Dialog {
+                    id: renameDialog; title:"Rename note"; modal:true; width:360; standardButtons:Dialog.Ok|Dialog.Cancel
+                    anchors.centerIn:Overlay.overlay
+                    TextField { id:renameField; width:parent.width; selectByMouse:true; Accessible.name:"Note name"; Component.onCompleted:selectAll() }
+                    onOpened: {renameField.forceActiveFocus();renameField.selectAll()}
+                    onAccepted:studio.renameNote(tab.modelData.id,renameField.text)
+                }
                 RowLayout {
                     anchors.fill: parent
                     spacing: 0

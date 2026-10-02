@@ -1,7 +1,7 @@
 {
   "name": "super-md",
   "private": true,
-  "version": "0.4.0",
+  "version": "0.4.1",
   "author": "Yash Mahawar",
   "license": "MIT",
   "type": "module",
@@ -36,6 +36,7 @@
     "@tauri-apps/api": "^2.8.0",
     "@tauri-apps/plugin-dialog": "^2.7.3",
     "@tauri-apps/plugin-fs": "^2.5.2",
+    "dompurify": "^3.4.16",
     "katex": "^0.16.22",
     "lit": "^3.3.3",
     "mermaid": "^11.10.0",

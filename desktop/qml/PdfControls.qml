@@ -16,12 +16,12 @@ ColumnLayout {
     ColumnLayout {
         Layout.fillWidth: true; spacing: 4
         Label { text: "Page size" }
-        ChoiceField { viewportItem: controls.viewportItem; Accessible.name: "PDF page size"; Layout.fillWidth: true; model: ["a4", "a5", "letter", "legal"]; currentIndex: model.indexOf(controls.options.pageSize); onActivated: controls.update("pageSize", currentText) }
+        ChoiceField { viewportItem: controls.viewportItem; Accessible.name: "PDF page size"; Layout.fillWidth: true; property var keys:["a3","a4","a5","a6","iso-b4","iso-b5","iso-b6","letter","legal","tabloid","executive"]; model: ["A3", "A4", "A5", "A6", "B4 (ISO)", "B5 (ISO)", "B6 (ISO)", "Letter", "Legal", "Tabloid", "Executive"]; currentIndex: keys.indexOf(controls.options.pageSize); onActivated: controls.update("pageSize", keys[currentIndex]) }
     }
     ColumnLayout {
         Layout.fillWidth: true; spacing: 4
         Label { text: "Document font" }
-        ChoiceField { viewportItem: controls.viewportItem; Accessible.name: "PDF font"; Layout.fillWidth: true; model: ["Noto Sans", "Libertinus Serif", "New Computer Modern", "DejaVu Sans Mono"]; currentIndex: model.indexOf(controls.options.fontFamily); onActivated: controls.update("fontFamily", currentText) }
+        ChoiceField { viewportItem: controls.viewportItem; Accessible.name: "PDF font"; Layout.fillWidth: true; model: studio.fonts; currentIndex: model.indexOf(controls.options.fontFamily); onActivated: controls.update("fontFamily", currentText) }
     }
     ColumnLayout {
         Layout.fillWidth: true; spacing: 4

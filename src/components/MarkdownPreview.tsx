@@ -11,6 +11,9 @@ import PythonCell from "./PythonCell";
 import SvgDiagram from "./SvgDiagram";
 import { remarkObsidianMath } from "../obsidianMath";
 import { headingSlug, navigateHeading, remarkHeadingIds } from "../documentNavigation";
+import { selectedMarkdown } from "../copySource";
+import CopyCode from "./CopyCode";
+import CodeBlockBoundary from "./CodeBlockBoundary";
 
 const MermaidDiagram = lazy(() => import("./MermaidDiagram"));
 
@@ -121,7 +124,7 @@ interface Props {
 function MarkdownPreview({ markdown, documentPath, python, dark, trustedImageHosts = [], onTrustImageHost }: Props) {
   const normalized = normalizeCallouts(markdown);
   return (
-    <article className="markdown-body">
+    <article className="markdown-body" onCopy={event=>{const source=selectedMarkdown(window.getSelection());if(source!==null){event.clipboardData.setData("text/plain",source);event.preventDefault();}}}>
       <ReactMarkdown
         urlTransform={(url, key, node) => node.tagName === "img" && key === "src" && /^data:image\/(?:png|jpeg|gif|webp|avif|svg\+xml);base64,/i.test(url) ? url : defaultUrlTransform(url)}
         remarkPlugins={[remarkGfm, remarkMath, remarkObsidianMath, remarkCallouts, remarkHeadingIds]}
@@ -133,11 +136,12 @@ function MarkdownPreview({ markdown, documentPath, python, dark, trustedImageHos
             const child = Children.only(children) as React.ReactElement<{ className?: string; children?: ReactNode }>;
             const language = child.props.className?.match(/language-([\w-]+)/)?.[1];
             const source = textOf(child.props.children).replace(/\n$/, "");
-            if (language === "smd-chart") return <InteractiveChart source={source} dark={dark} />;
-            if (language === "svg") return <SvgDiagram source={source} />;
-            if (language === "mermaid") return <Suspense fallback={<span className="image-loading" role="status">Loading diagram…</span>}><MermaidDiagram source={source} dark={dark} /></Suspense>;
-            if (language === "python" || language === "py") return <PythonCell source={source} python={python} highlighted={child.props.children} />;
-            return <details className="code-disclosure" open={source.split("\n").length <= 12}><summary>{language || "Code"} <span>{source.split("\n").length} lines</span></summary><pre>{children}</pre></details>;
+            const protectedBlock = (block: ReactNode) => <CodeBlockBoundary key={`${language}:${source}`} source={source}>{block}</CodeBlockBoundary>;
+            if (language === "smd-chart") return protectedBlock(<InteractiveChart source={source} dark={dark} />);
+            if (language === "svg") return protectedBlock(<SvgDiagram source={source} />);
+            if (language === "mermaid") return protectedBlock(<Suspense fallback={<span className="image-loading" role="status">Loading diagram…</span>}><MermaidDiagram source={source} dark={dark} /></Suspense>);
+            if (language === "python" || language === "py") return protectedBlock(<PythonCell source={source} python={python} highlighted={child.props.children} />);
+            return <div className="code-container"><CopyCode source={source}/><details className="code-disclosure" open={source.split("\n").length <= 12}><summary>{language || "Code"} <span>{source.split("\n").length} lines</span></summary><pre>{children}</pre></details></div>;
           }
         }}
       >{normalized}</ReactMarkdown>

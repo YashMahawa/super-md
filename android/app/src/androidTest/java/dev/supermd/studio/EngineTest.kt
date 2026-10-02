@@ -13,6 +13,25 @@ import java.io.File
 
 @RunWith(AndroidJUnit4::class)
 class EngineTest {
+    @Test fun selectablePapersAndPrivateFontsExportOnDevice() {
+        val app=ApplicationProvider.getApplicationContext<android.app.Application>()
+        val font=File(app.cacheDir,"import-Manrope.ttf")
+        app.assets.open("web/fonts/Manrope.ttf").use { input->font.outputStream().use {input.copyTo(it)} }
+        assertTrue(PdfEngine.fontFamilies(font.absolutePath).contains("Manrope"))
+        val library=FontLibrary(app)
+        val family=library.import(android.net.Uri.fromFile(font))
+        assertEquals("Manrope",family)
+        assertTrue(library.reader(family).getString("data").startsWith("data:font/ttf;base64,"))
+        val assets=File(app.cacheDir,"papers-fonts-${java.util.UUID.randomUUID()}").apply {mkdirs()}
+        library.addPdfFonts(family,assets)
+        assertEquals(1,assets.listFiles()!!.size)
+        for(paper in listOf("a3","a4","a5","a6","iso-b4","iso-b5","iso-b6","letter","legal","tabloid","executive")) {
+            val options=JSONObject(StudioState().pdf).put("pageSize",paper).put("fontFamily",family).put("pageNumbers",false)
+            val pdf=File(app.cacheDir,"paper-$paper.pdf")
+            assertEquals(paper,"",PdfEngine.export("# Reading font\n\nText and ${'$'}\\frac13${'$'}.",options.toString(),assets.absolutePath,pdf.absolutePath))
+            PdfRenderer(ParcelFileDescriptor.open(pdf,ParcelFileDescriptor.MODE_READ_ONLY)).use {renderer->assertTrue(renderer.pageCount>0);renderer.openPage(0).use {page->assertTrue(page.width>0 && page.height>0)} }
+        }
+    }
     @Test fun pythonRequestsFromTwoWindowsDoNotKillEachOther() = runBlocking {
         val app = ApplicationProvider.getApplicationContext<android.app.Application>()
         val first = StudioViewModel(app, java.util.UUID.randomUUID().toString())

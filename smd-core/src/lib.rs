@@ -23,7 +23,7 @@ impl Default for PdfOptions {
 }
 impl PdfOptions {
     pub fn validate(&self) -> Result<()> {
-        if !["a4", "a5", "letter", "legal"].contains(&self.page_size.as_str()) { bail!("Unsupported page size"); }
+        if !["a3", "a4", "a5", "a6", "iso-b4", "iso-b5", "iso-b6", "letter", "legal", "tabloid", "executive"].contains(&self.page_size.as_str()) { bail!("Unsupported page size"); }
         for (name, value, min, max) in [("margin", self.margin, 4., 60.), ("font size", self.font_size, 7., 24.), ("line height", self.line_height, 0.9, 2.2)] {
             if !value.is_finite() || value < min || value > max { bail!("Invalid {name}: expected {min} to {max}"); }
         }
@@ -209,10 +209,11 @@ pub fn source(markdown: &str, options: &PdfOptions, assets: &HashMap<String, Vec
     renderer.footnotes = definitions.footnotes;
     let body = renderer.render(None)?;
     let template = if options.page_numbers { include_str!("document.typ").to_string() } else { include_str!("document.typ").lines().filter(|line| !line.starts_with("#set page(footer:")).collect::<Vec<_>>().join("\n") };
+    let paper=match options.page_size.as_str() {"letter"=>"us-letter","legal"=>"us-legal","tabloid"=>"us-tabloid","executive"=>"us-executive",other=>other};
     // MiTeX's bundled conversion spec still emits Typst's former `sect`
     // intersection name. Typst 0.15 calls it `inter`. Scope aliases preserve
     // equations without rewriting user TeX or changing the section symbol.
-    Ok(format!("#import \"/mitex/standard.typ\": scope as mitex-scope\n#let smd-math-scope = mitex-scope + (sect: sym.inter,)\n#set page(paper: {}, margin: {}mm)\n#set text(font: ({}, \"Libertinus Serif\", \"New Computer Modern\"), size: {}pt)\n#set par(leading: {}em)\n{template}\n{body}", string(&options.page_size), options.margin, string(&options.font_family), options.font_size, options.line_height - 0.7))
+    Ok(format!("#import \"/mitex/standard.typ\": scope as mitex-scope\n#let smd-math-scope = mitex-scope + (sect: sym.inter,)\n#set page(paper: {}, margin: {}mm)\n#set text(font: ({}, \"Libertinus Serif\", \"New Computer Modern\"), size: {}pt)\n#set par(leading: {}em)\n{template}\n{body}", string(paper), options.margin, string(&options.font_family), options.font_size, options.line_height - 0.7))
 }
 
 pub fn export(markdown: &str, options: &PdfOptions, assets: &HashMap<String, Vec<u8>>) -> Result<Vec<u8>> {
@@ -224,8 +225,12 @@ pub fn export(markdown: &str, options: &PdfOptions, assets: &HashMap<String, Vec
             include_bytes!("../fonts/NotoSans-Bold.ttf").as_slice(),
             include_bytes!("../fonts/NotoSans-Italic.ttf").as_slice(),
             include_bytes!("../fonts/NotoSans-BoldItalic.ttf").as_slice(),
-        ])
-        .search_fonts_with(TypstKitFontOptions::default().include_system_fonts(false).include_embedded_fonts(true))
+            include_bytes!("../fonts/Manrope.ttf").as_slice(),
+            include_bytes!("../fonts/Roboto.ttf").as_slice(),
+            include_bytes!("../fonts/NotoSerif.ttf").as_slice(),
+            include_bytes!("../fonts/JetBrainsMono.ttf").as_slice(),
+        ].into_iter().chain(assets.iter().filter(|(name,_)| name.starts_with("__font_") && (name.ends_with(".ttf") || name.ends_with(".otf"))).map(|(_,bytes)| bytes.as_slice())))
+        .search_fonts_with(TypstKitFontOptions::default().include_system_fonts(!cfg!(target_os="android")).include_embedded_fonts(true))
         .with_static_file_resolver(assets.iter().map(|(k,v)| (k.as_str(), v.as_slice())))
         .with_static_source_file_resolver([
             ("mitex/standard.typ", include_str!("mitex/standard.typ")),
@@ -234,6 +239,20 @@ pub fn export(markdown: &str, options: &PdfOptions, assets: &HashMap<String, Vec
         .build();
     let document = engine.compile().output.map_err(|errors| anyhow::anyhow!("PDF typesetting failed: {errors:?}"))?;
     typst_pdf::pdf(&document, &Default::default()).map(|v| v.to_vec()).map_err(|e| anyhow::anyhow!("PDF encoding failed: {e:?}"))
+}
+
+#[cfg(target_os = "android")]
+#[no_mangle]
+pub extern "system" fn Java_dev_supermd_studio_PdfEngine_fontFamilies(
+    mut env: jni::JNIEnv, _class: jni::objects::JClass, path: jni::objects::JString,
+) -> jni::sys::jstring {
+    let result = (|| -> Result<Vec<String>> {
+        let path: String = env.get_string(&path)?.into();
+        if std::fs::metadata(&path)?.len()>20_000_000 { bail!("Font exceeds 20 MB"); }
+        let bytes=typst::foundations::Bytes::new(std::fs::read(path)?);
+        Ok(typst::text::Font::iter(bytes).map(|font| font.info().family.clone()).collect())
+    })();
+    env.new_string(serde_json::to_string(&result.unwrap_or_default()).unwrap()).unwrap().into_raw()
 }
 
 #[cfg(target_os = "android")]
@@ -271,6 +290,20 @@ pub extern "system" fn Java_dev_supermd_studio_PdfEngine_export(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn every_selectable_paper_and_bundled_reading_font_typesets() {
+        let papers=["a3","a4","a5","a6","iso-b4","iso-b5","iso-b6","letter","legal","tabloid","executive"];
+        let fonts=["Manrope","Roboto","Noto Serif","JetBrains Mono"];
+        for (i,paper) in papers.iter().enumerate() {
+            let options=PdfOptions {page_size:paper.to_string(),font_family:fonts[i%fonts.len()].into(),..PdfOptions::default()};
+            let pdf=export("# Paper and font\n\nReadable text with $\\int_0^1 x^2 dx=\\frac13$.",&options,&HashMap::new()).unwrap_or_else(|e|panic!("{paper}: {e:#}"));
+            assert!(pdf.starts_with(b"%PDF-"));
+        }
+        let options=PdfOptions {font_family:"DejaVu Sans".into(),..PdfOptions::default()};
+        // A supplied font is usable even when platform font discovery is disabled.
+        let assets=HashMap::from([("__font_imported.ttf".into(),include_bytes!("../fonts/Manrope.ttf").to_vec())]);
+        assert!(export("An imported font asset.",&options,&assets).unwrap().starts_with(b"%PDF-"));
+    }
     #[test]
     fn obsidian_probability_equations_export_with_following_content() {
         let md = r"$$\boxed{\begin{aligned}

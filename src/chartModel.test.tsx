@@ -16,7 +16,11 @@ it("renders bounded multi-color 3D surfaces as vector paths for the same PDF pre
   const source=JSON.stringify({mode:"surface3d",series:[{name:"Bowl",expression:"a*(x^2+y^2)",color:"#006a6a"},{name:"Saddle",expression:"x^2-y^2",color:"#6750a4"}],sliders:[{name:"a",min:.1,max:2,value:1}],x:{min:-2,max:2,steps:16},y:{min:-2,max:2}});
   const rendered=renderToStaticMarkup(<InteractiveChart source={source}/>);
   expect(rendered).toContain("surface-chart");
-  expect(rendered).toContain("3D orbit");
+  expect(rendered).toContain("Arrow keys rotate");
+  expect(rendered).toContain("polygon");
+  expect(rendered).not.toContain("Touch rotation");
+  expect(rendered).not.toContain("Reset view");
+  expect(rendered).not.toContain("Plot zoom");
   expect(rendered).toContain("#006a6a");
   expect(rendered).toContain("#6750a4");
   expect(rendered).not.toContain("NaN");

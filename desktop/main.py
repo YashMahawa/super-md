@@ -61,7 +61,7 @@ def main():
     QGuiApplication.setOrganizationName("SuperMD")
     QGuiApplication.setDesktopFileName("dev.supermd.studio-test" if args.test_state else "dev.supermd.studio")
     app = StudioApplication(sys.argv)
-    for file in (ROOT / "smd-core" / "fonts").glob("NotoSans-*.ttf"):
+    for file in (ROOT / "smd-core" / "fonts").glob("*.ttf"):
         QFontDatabase.addApplicationFont(str(file))
     app.setFont(QFont("Noto Sans",11))
     app.setWindowIcon(QIcon(str(ROOT / "public" / "brand-mark-fixed.svg")))
@@ -86,9 +86,8 @@ def main():
         destination.mode = source.mode
         welcome, active = destination.tabs, destination.active
         destination.tabs = []
-        last = len(source.tabs) == 1
         if source._move_tab(destination, tab_id, 0):
-            if last: QTimer.singleShot(0, source.allowClose.emit)
+            pass  # _move_tab also retires an empty source on cross-window drops.
         else:
             destination.tabs, destination.active = welcome, active
             QTimer.singleShot(0, destination.allowClose.emit)

@@ -7,7 +7,7 @@ export interface DocumentData {
 }
 
 export interface ExportOptions {
-  pageSize: "a4" | "a5" | "letter" | "legal";
+  pageSize: "a3" | "a4" | "a5" | "a6" | "iso-b4" | "iso-b5" | "iso-b6" | "letter" | "legal" | "tabloid" | "executive";
   margin: number;
   fontSize: number;
   lineHeight: number;

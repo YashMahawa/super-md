@@ -1,3 +1,11 @@
+import DOMPurify from "dompurify";
+
+export function sanitizeDiagram(svg: string): string {
+  return DOMPurify.sanitize(svg, {
+    USE_PROFILES: { svg: true, svgFilters: true },
+    FORBID_TAGS: ["script", "foreignObject"],
+  });
+}
 let queue = Promise.resolve();
 let serial = 0;
 export function renderMermaid(source: string, dark = false): Promise<string> {
@@ -8,7 +16,7 @@ export function renderMermaid(source: string, dark = false): Promise<string> {
     document.body.appendChild(container);
     try {
       mermaid.initialize({ startOnLoad: false, theme: dark ? "dark" : "neutral", securityLevel: "strict", htmlLabels: false, flowchart: { htmlLabels: false }, fontFamily: "Arial, sans-serif" });
-      return (await mermaid.render(`smd-diagram-${++serial}`, source, container)).svg;
+      return sanitizeDiagram((await mermaid.render(`smd-diagram-${++serial}`, source, container)).svg);
     } finally { container.remove(); }
   };
   const result = queue.then(render); queue = result.then(() => undefined, () => undefined);

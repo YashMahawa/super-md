@@ -1,4 +1,12 @@
 :root { background: var(--surface); }
+@font-face {font-family:"Manrope";src:url("/fonts/Manrope.ttf");font-weight:200 800;font-display:swap;}
+@font-face {font-family:"Roboto";src:url("/fonts/Roboto.ttf");font-weight:100 900;font-display:swap;}
+@font-face {font-family:"Noto Serif";src:url("/fonts/NotoSerif.ttf");font-weight:100 900;font-display:swap;}
+@font-face {font-family:"JetBrains Mono";src:url("/fonts/JetBrainsMono.ttf");font-weight:100 800;font-display:swap;}
+@font-face {font-family:"Noto Sans";src:url("/fonts/NotoSans-Regular.ttf");font-weight:400;font-display:swap;}
+@font-face {font-family:"Noto Sans";src:url("/fonts/NotoSans-Bold.ttf");font-weight:700;font-display:swap;}
+@font-face {font-family:"Noto Sans";src:url("/fonts/NotoSans-Italic.ttf");font-style:italic;font-weight:400;font-display:swap;}
+@font-face {font-family:"Noto Sans";src:url("/fonts/NotoSans-BoldItalic.ttf");font-style:italic;font-weight:700;font-display:swap;}
 :root[data-motion="off"] *, :root[data-motion="off"] { transition: none !important; animation: none !important; scroll-behavior: auto !important; }
 .android-document { height: 100%; display: flex; min-width: 0; }
 .android-source, .android-reading { flex: 1; min-width: 0; height: 100%; overflow: auto; overscroll-behavior: contain; }
@@ -6,7 +14,7 @@
 .mode-split .android-source { border-right: 1px solid var(--outline); }
 .android-reading .markdown-body { width: calc(100% - 32px); max-width: var(--reading-max-width, none); font-size: calc(var(--reader-size) * var(--workspace-scale)); padding: 22px 0 40vh; }
 .android-reading .live-document { width: calc(100% - 32px); max-width: var(--reading-max-width, none); padding: 24px 0 40vh; }
-.android-reading .live-block .markdown-body { width: 100%; padding: 0; }
+.android-reading .live-block .markdown-body { width: 100%; max-width: none; padding: 0; }
 .android-reading .markdown-body h1 { font-size: 2em; }
 .android-reading .markdown-body h2 { font-size: 1.5em; }
 .reader-loading { display: grid; height: 100%; place-content: center; color: var(--muted); }

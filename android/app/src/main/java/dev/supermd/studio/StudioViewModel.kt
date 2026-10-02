@@ -17,15 +17,21 @@ import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
 import org.json.JSONArray
 import org.json.JSONObject
 import java.io.File
 import java.util.UUID
 
+// SAF documents can be shared by independent Android activities. Serialize
+// comparison, staging, write and saved-state updates across those windows.
+private val documentWrites = Mutex()
+
 data class Note(val id: String = UUID.randomUUID().toString(), val name: String = "Untitled.md", val uri: String? = null, val content: String = "", val saved: String = "", val relative: String? = null, val assetDirectory: String? = null) { val dirty get() = content != saved; val portable get() = assetDirectory != null }
 data class RecentNote(val name: String, val uri: String, val relative: String? = null)
 data class FileEntry(val name: String, val uri: String, val directory: Boolean, val relative: String)
-data class StudioState(val tabs: List<Note> = listOf(Note(name = "Welcome.md", content = sample, saved = sample)), val closedTabs: List<Note> = emptyList(), val activeId: String = "", val mode: String = "live", val fullscreen: Boolean = false, val normalZoom: Float = 100f, val fullscreenZoom: Float = 100f, val theme: String = "system", val fullscreenTheme: String = "black", val motion: Boolean = true, val font: String = "sans", val size: Float = 17f, val folder: String? = null, val files: List<FileEntry> = emptyList(), val busy: Boolean = false, val message: String? = null, val error: String? = null, val welcomed: Boolean = false, val pdf: String = "{\"pageSize\":\"a4\",\"margin\":18,\"fontSize\":10.5,\"lineHeight\":1.35,\"fontFamily\":\"Libertinus Serif\",\"pageNumbers\":true}") {
+data class StudioState(val widthPercent: Float = 80f, val lineHeight: Float = 1.65f, val autosave: Boolean = true, val customFonts: List<String> = emptyList(), val readerOverlay: Boolean = false, val tabs: List<Note> = listOf(Note(name = "Welcome.md", content = sample, saved = sample)), val closedTabs: List<Note> = emptyList(), val activeId: String = "", val mode: String = "live", val fullscreen: Boolean = false, val normalZoom: Float = 100f, val fullscreenZoom: Float = 100f, val theme: String = "system", val fullscreenTheme: String = "black", val motion: Boolean = true, val font: String = "sans", val size: Float = 17f, val folder: String? = null, val files: List<FileEntry> = emptyList(), val busy: Boolean = false, val message: String? = null, val error: String? = null, val welcomed: Boolean = false, val pdf: String = "{\"pageSize\":\"a4\",\"margin\":18,\"fontSize\":10.5,\"lineHeight\":1.35,\"fontFamily\":\"Libertinus Serif\",\"pageNumbers\":true}") {
     val active get() = tabs.find { it.id == activeId } ?: tabs.first()
     val zoom get() = if (fullscreen) fullscreenZoom else normalZoom
 }
@@ -84,6 +90,7 @@ class StudioViewModel(app: Application, val workspaceKey: String = "main") : And
     private val prefs = app.getSharedPreferences("studio", 0)
     private val windowPrefs = app.getSharedPreferences("studio-window-$workspaceKey", 0)
     val media = MediaStorage(app)
+    val fonts = FontLibrary(app)
     private val recentMutable = MutableStateFlow(runCatching { val list = JSONArray(prefs.getString("recent", "[]")); (0 until minOf(list.length(), 24)).map { i -> val n = list.getJSONObject(i); RecentNote(n.getString("name"), n.getString("uri"), n.optString("relative").takeIf { it.isNotBlank() }) } }.getOrDefault(emptyList()))
     val recent = recentMutable.asStateFlow()
     var requestPortable: (() -> Unit)? = null
@@ -97,14 +104,51 @@ class StudioViewModel(app: Application, val workspaceKey: String = "main") : And
     private val mutable = MutableStateFlow(restore())
     private val preferencesChanged = android.content.SharedPreferences.OnSharedPreferenceChangeListener { _, key ->
         if (key == "recent") recentMutable.value = runCatching { val list = JSONArray(prefs.getString("recent", "[]")); (0 until minOf(list.length(), 24)).map { i -> val n = list.getJSONObject(i); RecentNote(n.getString("name"), n.getString("uri"), n.optString("relative").takeIf { it.isNotBlank() }) } }.getOrDefault(emptyList())
-        if (key in setOf("theme", "fullTheme", "motion", "font", "size", "pdf", "welcomed")) {
+        if (key in setOf("theme", "fullTheme", "motion", "font", "size", "pdf", "welcomed", "widthPercent", "lineHeight", "autosave", "fonts")) {
             mutable.value = mutable.value.copy(theme = prefs.getString("theme", "system")!!, fullscreenTheme = prefs.getString("fullTheme", "black")!!, motion = prefs.getBoolean("motion", true), font = prefs.getString("font", "sans")!!, size = prefs.getFloat("size", 17f), pdf = prefs.getString("pdf", null) ?: StudioState().pdf, welcomed = prefs.getBoolean("welcomed", false))
+                .copy(widthPercent = prefs.getFloat("widthPercent",80f),lineHeight = prefs.getFloat("lineHeight",1.65f),autosave = prefs.getBoolean("autosave",true),customFonts = fonts.families)
         }
     }
     init { prefs.registerOnSharedPreferenceChangeListener(preferencesChanged) }
     override fun onCleared() { prefs.unregisterOnSharedPreferenceChangeListener(preferencesChanged); super.onCleared() }
     val state = mutable.asStateFlow()
     private var persistJob: Job? = null
+    private var autosaveJob: Job? = null
+    private val autosavePending = mutableSetOf<String>()
+    private fun scheduleAutosave(id: String) {
+        if (!mutable.value.autosave) return
+        autosavePending.add(id)
+        if (autosaveJob?.isActive == true) return
+        autosaveJob = viewModelScope.launch {
+            while (autosavePending.isNotEmpty()) {
+                delay(900)
+                val next=autosavePending.first();autosavePending.remove(next)
+                val note=mutable.value.tabs.find { it.id==next && it.uri!=null && it.dirty } ?: continue
+                if (!mutable.value.autosave) continue
+                try {
+                    // Do not cancel an in-flight write when another keystroke or
+                    // window transition arrives. Recovery remains an independent stream.
+                    withContext(kotlinx.coroutines.NonCancellable) {
+                        documentWrites.withLock {
+                        withContext(Dispatchers.IO) {
+                            val target=Uri.parse(note.uri)
+                            val previous=resolver.openInputStream(target)?.use { if(note.portable) media.portableMarkdown(it) else readLimited(it,20_000_000).toString(Charsets.UTF_8).removePrefix("\uFEFF") } ?: error("Writing permission is unavailable")
+                            require(previous==note.saved) {"This file changed outside Super MD. Use Save as to keep both versions; your draft is safe."}
+                            val staged=File(getApplication<Application>().cacheDir,"autosave-${UUID.randomUUID()}.tmp")
+                            try {
+                                staged.outputStream().use { if(note.portable) media.writeLocalPortable(it,note.content,note.assetDirectory) else it.write(note.content.toByteArray()) }
+                                if (!note.portable) copyAttachments(note,target)
+                                resolver.openOutputStream(target,"wt")?.use { staged.inputStream().use { input->input.copyTo(it) } } ?: error("Cannot write this document")
+                            } finally {staged.delete()}
+                        }
+                        change { s->s.copy(tabs=s.tabs.map { if(it.id==note.id)it.copy(saved=note.content) else it }) }
+                        if(mutable.value.tabs.any {it.id==note.id && it.dirty})autosavePending.add(note.id)
+                        }
+                    }
+                } catch(error:Exception) {fail("Autosave paused: ${error.message}")}
+            }
+        }
+    }
     var outputUri: Uri? = null
     var shareReady: ((Intent) -> Unit)? = null
     private var shareFile: File? = null
@@ -142,6 +186,7 @@ class StudioViewModel(app: Application, val workspaceKey: String = "main") : And
     private fun change(block: (StudioState) -> StudioState) { mutable.value = block(mutable.value); schedulePersist() }
     private fun restore(): StudioState {
         var s = StudioState(theme = prefs.getString("theme", "system")!!, fullscreenTheme = prefs.getString("fullTheme", "black")!!, motion = prefs.getBoolean("motion", true), welcomed = prefs.getBoolean("welcomed", false), font = prefs.getString("font", "sans")!!, size = prefs.getFloat("size", 17f), folder = windowPrefs.getString("folder", if (workspaceKey == "main" && !windowPrefs.getBoolean("folderMigrated", false)) prefs.getString("folder", null) else null), pdf = prefs.getString("pdf", null) ?: StudioState().pdf)
+        s = s.copy(widthPercent = prefs.getFloat("widthPercent",80f),lineHeight = prefs.getFloat("lineHeight",1.65f),autosave = prefs.getBoolean("autosave",true),customFonts = fonts.families)
         try {
             if (snapshot.isFile && snapshot.length() < 30_000_000) {
                 val json = JSONObject(snapshot.readText()); val list = json.getJSONArray("tabs")
@@ -164,13 +209,13 @@ class StudioViewModel(app: Application, val workspaceKey: String = "main") : And
         } catch (error: Exception) { viewModelScope.launch { mutable.value = mutable.value.copy(error = "Draft recovery could not save: ${error.message}. Please save your note to a file.") } }
     }
     fun flush() { persistJob?.cancel(); val current = mutable.value; viewModelScope.launch(Dispatchers.IO) { persist(current) } }
-    fun edit(id: String, content: String) = change { s -> s.copy(tabs = s.tabs.map { if (it.id == id) it.copy(content = content) else it }) }
+    fun edit(id: String, content: String) { change { s -> s.copy(tabs = s.tabs.map { if (it.id == id) it.copy(content = content) else it }) }; scheduleAutosave(id) }
     fun newNote() { val note = Note(); change { it.copy(tabs = it.tabs + note, activeId = note.id) } }
     fun select(id: String) = change { it.copy(activeId = id) }
     fun reorder(id: String, index: Int) = change { it.copy(tabs = reorderedNotes(it.tabs, id, index)) }
     fun close(id: String) {
         val note = mutable.value.tabs.find { it.id == id } ?: return
-        change { val remaining = it.tabs.filter { n -> n.id != id }; val next = remaining.ifEmpty { listOf(Note()) }; it.copy(tabs = next, closedTabs = (listOf(note) + it.closedTabs).take(12), activeId = if (it.active.id == id) next.first().id else it.activeId, message = "Tab closed. Reopen from the menu to recover edits.") }
+        change { val remaining = it.tabs.filter { n -> n.id != id }; val next = remaining.ifEmpty { listOf(Note()) }; val empty = note.uri == null && note.content.isBlank(); it.copy(tabs = next, closedTabs = (if (empty) it.closedTabs else listOf(note) + it.closedTabs).take(12), activeId = if (it.active.id == id) next.first().id else it.activeId, message = if (empty) "Empty tab discarded" else "Tab closed. Reopen from the menu to recover edits.") }
     }
     fun reopen() { val note = mutable.value.closedTabs.firstOrNull() ?: return; change { it.copy(tabs = it.tabs + note, closedTabs = it.closedTabs.drop(1), activeId = note.id) } }
     fun mode(value: String) = change { it.copy(mode = value) }
@@ -181,6 +226,29 @@ class StudioViewModel(app: Application, val workspaceKey: String = "main") : And
         prefs.edit().apply { theme?.let { putString("theme", it) }; fullTheme?.let { putString("fullTheme", it) }; motion?.let { putBoolean("motion", it) }; font?.let { putString("font", it) }; size?.let { putFloat("size", it) } }.apply()
     }
     fun pdf(value: String) { change { it.copy(pdf = value) }; prefs.edit().putString("pdf", value).apply() }
+    fun reading(widthPercent: Float? = null, lineHeight: Float? = null, autosave: Boolean? = null) {
+        val width=widthPercent?.takeIf { it.isFinite() }?.coerceIn(50f,100f)
+        val leading=lineHeight?.takeIf { it.isFinite() }?.coerceIn(1.15f,2.2f)
+        change { it.copy(widthPercent=width ?: it.widthPercent,lineHeight=leading ?: it.lineHeight,autosave=autosave ?: it.autosave) }
+        prefs.edit().apply { width?.let { putFloat("widthPercent",it) };leading?.let { putFloat("lineHeight",it) };autosave?.let { putBoolean("autosave",it) } }.apply()
+    }
+    fun overlay(open: Boolean) { mutable.value=mutable.value.copy(readerOverlay=open) }
+    fun importFont(uri: Uri) = viewModelScope.launch {
+        try { val family=withContext(Dispatchers.IO) {fonts.import(uri)};appearance(font=family);prefs.edit().putLong("fonts",System.currentTimeMillis()).apply();mutable.value=mutable.value.copy(customFonts=fonts.families,message="Imported $family for reading and PDF export") }
+        catch(error: Exception) {fail("Could not import font: ${error.message}")}
+    }
+    fun rename(id: String, requested: String) = viewModelScope.launch {
+        val note=mutable.value.tabs.find {it.id==id} ?: return@launch
+        try {
+            var name=requested.trim();require(name.isNotBlank() && name !in listOf(".","..") && !name.any {it=='/' || it=='\\' || it=='\u0000'}) {"Choose a filename without path separators"}
+            val extension=note.name.substringAfterLast('.',"md")
+            if(!name.contains('.'))name+=".$extension"
+            require(name.substringAfterLast('.').equals(extension,true)) {"Rename keeps the note format. Use Export to change formats."}
+            val uri=note.uri?.let {withContext(Dispatchers.IO) {DocumentsContract.renameDocument(resolver,Uri.parse(it),name)?.toString() ?: error("This provider does not support renaming. Use Save as instead.")}}
+            change {s->s.copy(tabs=s.tabs.map {if(it.id==id)it.copy(name=name,uri=uri,relative=it.relative?.let {r->r.substringBeforeLast('/',"").let {parent->if(parent.isEmpty())name else "$parent/$name"}}) else it})}
+            mutable.value.tabs.find {it.id==id}?.let(::remember)
+        } catch(error:Exception){fail("Could not rename note: ${error.message}")}
+    }
     fun welcomeDone() { change { it.copy(welcomed = true) }; prefs.edit().putBoolean("welcomed", true).apply() }
     fun dismissMessage() { mutable.value = mutable.value.copy(message = null) }
     fun dismissError() { mutable.value = mutable.value.copy(error = null) }
@@ -210,14 +278,16 @@ class StudioViewModel(app: Application, val workspaceKey: String = "main") : And
         val note = mutable.value.active; val target = uri ?: note.uri?.let(Uri::parse) ?: return@launch
         busy(true)
         try {
-            withContext(Dispatchers.IO) {
-                val name = DocumentFile.fromSingleUri(getApplication(), target)?.name ?: note.name
+            documentWrites.withLock {
+            val savedName = withContext(Dispatchers.IO) {
                 require(!note.portable || uri != null) { "Use portable save for this SMD file" }
                 copyAttachments(note, target)
                 resolver.openOutputStream(target, "wt")?.use { it.write(note.content.toByteArray()) } ?: error("Writing permission is unavailable; use Save as")
+                DocumentFile.fromSingleUri(getApplication(), target)?.name ?: note.name
             }
-            change { s -> s.copy(busy = false, tabs = s.tabs.map { if (it.id == note.id) it.copy(uri = target.toString(), name = DocumentFile.fromSingleUri(getApplication(), target)?.name ?: note.name, saved = note.content, assetDirectory = null) else it }, message = "Saved") }
+            change { s -> s.copy(busy = false, tabs = s.tabs.map { if (it.id == note.id) it.copy(uri = target.toString(), name = savedName, saved = note.content, assetDirectory = null) else it }, message = "Saved") }
             mutable.value.tabs.find { it.id == note.id }?.let(::remember)
+            }
         } catch (error: Exception) { fail("Could not save note: ${error.message}") }
     }
     fun setFolder(uri: Uri) = viewModelScope.launch {
@@ -329,7 +399,7 @@ class StudioViewModel(app: Application, val workspaceKey: String = "main") : And
         }
     }
     var portableOutput: Uri? = null
-    suspend fun writePortable(id: String, content: String, assets: JSONObject, save: Boolean, originalContent: String) = withContext(Dispatchers.IO) {
+    suspend fun writePortable(id: String, content: String, assets: JSONObject, save: Boolean, originalContent: String) = withContext(Dispatchers.IO) { documentWrites.withLock {
         val note = mutable.value.tabs.find { it.id == id } ?: error("The note is no longer open")
         val target = if (save) note.uri?.let(Uri::parse) else portableOutput
         require(target != null) { "Choose a portable file destination" }
@@ -345,6 +415,7 @@ class StudioViewModel(app: Application, val workspaceKey: String = "main") : And
                 else { portableOutput = null; if (!finishShare(target)) mutable.value = mutable.value.copy(busy = false, message = "Portable .smd exported") }
             }
         } finally { staged.delete() }
+        }
     }
     fun importDropped(uris: List<Uri>, id: String, result: (JSONArray?) -> Unit) = viewModelScope.launch {
         try { val images = withContext(Dispatchers.IO) { media.importUris(uris) }; if (mutable.value.active.id == id) result(images) else { val insertion = (0 until images.length()).joinToString("\n\n") { i -> val image = images.getJSONObject(i); "![${image.getString("alt").replace("[", "\\[").replace("]", "\\]")}](<${image.getString("source")}>)" }; val note = mutable.value.tabs.find { it.id == id }; if (note != null) edit(id, note.content + "\n\n" + insertion + "\n"); result(null) } }
@@ -356,6 +427,7 @@ class StudioViewModel(app: Application, val workspaceKey: String = "main") : And
         try {
             val assetDir = File(staging, "assets").apply { mkdirs() }
             assets.keys().forEach { key -> require(Regex("[a-zA-Z0-9_.-]+").matches(key)); File(assetDir, key).writeBytes(Base64.decode(assets.getString(key), Base64.DEFAULT)) }
+            fonts.addPdfFonts(JSONObject(options).optString("fontFamily"),assetDir)
             val output = File(staging, "document.pdf")
             val error = PdfEngine.export(content, options, assetDir.absolutePath, output.absolutePath)
             if (error.isNotEmpty()) error(error)
@@ -368,4 +440,5 @@ object PdfEngine {
     init { System.loadLibrary("smd_core") }
     @JvmStatic external fun export(markdown: String, options: String, assets: String, output: String): String
     @JvmStatic external fun imageSources(markdown: String): String
+    @JvmStatic external fun fontFamilies(path: String): String
 }
