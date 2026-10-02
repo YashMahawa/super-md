@@ -17,7 +17,8 @@ export function invoke<T>(command: string, args: Record<string, unknown> = {}): 
   if (!window.SuperMD) return tauriInvoke<T>(command, args);
   return new Promise((resolve, reject) => {
     const id = String(++sequence);
-    const timer = window.setTimeout(() => { pending.delete(id); reject(new Error(`${command} timed out`)); }, command === "run_python" ? 120_000 : 60_000);
+    const timeout = command === "export_pdf_native" ? 180_000 : command === "run_python" ? 120_000 : 60_000;
+    const timer = window.setTimeout(() => { pending.delete(id); reject(new Error(`${command} timed out`)); }, timeout);
     pending.set(id, { resolve, reject, timer });
     window.SuperMD!.post(id, command, JSON.stringify(args));
   });

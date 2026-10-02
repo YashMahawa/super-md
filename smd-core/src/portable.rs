@@ -1,4 +1,5 @@
-//! FMD v1: a bounded, UTF-8 JSON envelope. Editors expose only `markdown`.
+//! Portable SMD v1: a bounded UTF-8 JSON envelope. Editors expose only `markdown`.
+//! The former FMD envelope remains readable, without silently renaming user files.
 use anyhow::{bail, Result};
 use base64::{engine::general_purpose::STANDARD, Engine};
 use serde::{Deserialize, Serialize};
@@ -30,9 +31,9 @@ pub fn image_bytes(data: &str) -> Result<(&str, Vec<u8>)> {
     Ok((mime, bytes))
 }
 impl PortableDocument {
-    pub fn new(markdown: String, assets: BTreeMap<String, String>) -> Self { Self { format: "supermd-fmd".into(), version: 1, markdown, assets } }
+    pub fn new(markdown: String, assets: BTreeMap<String, String>) -> Self { Self { format: "supermd-smd".into(), version: 1, markdown, assets } }
     pub fn validate(&self) -> Result<()> {
-        if self.format != "supermd-fmd" || self.version != 1 { bail!("Unsupported FMD format/version"); }
+        if !["supermd-smd", "supermd-fmd"].contains(&self.format.as_str()) || self.version != 1 { bail!("Unsupported portable SMD format/version"); }
         if self.markdown.len() > 20_000_000 || self.assets.len() > 512 { bail!("FMD document is too large"); }
         let mut total = 0;
         for (name, data) in &self.assets {

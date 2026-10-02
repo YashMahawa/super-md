@@ -2496,6 +2496,7 @@ dependencies = [
  "base64 0.22.1",
  "jni",
  "mitex",
+ "percent-encoding",
  "pulldown-cmark",
  "serde",
  "serde_json",

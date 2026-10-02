@@ -1,0 +1,12 @@
+[Desktop Entry]
+Type=Application
+Name=Super MD
+Comment=Interactive Markdown studio with native Qt controls and typeset PDF export
+Exec=super-md %f
+TryExec=super-md
+Icon=super-md
+Terminal=false
+Categories=Utility;TextEditor;
+MimeType=text/markdown;text/x-markdown;text/x-supermarkdown;application/vnd.supermd.smd;application/vnd.supermd.fmd;
+StartupNotify=true
+StartupWMClass=dev.supermd.studio

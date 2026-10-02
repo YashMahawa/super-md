@@ -1,0 +1,671 @@
+"""Native Qt state/file management. Expensive work runs outside the UI thread."""
+from __future__ import annotations
+import base64
+import concurrent.futures
+import copy
+import json
+import ipaddress
+import math
+import mimetypes
+import os
+import shutil
+import socket
+import subprocess
+import sys
+import tempfile
+import urllib.parse
+import urllib.request
+import uuid
+from pathlib import Path
+from PySide6.QtCore import QObject, Property, Signal, Slot, QStandardPaths, QTimer, QUrl, QFileSystemWatcher, QProcess
+from PySide6.QtGui import QDesktopServices, QFontDatabase, QGuiApplication
+from documents import atomic_write, bundle, image_data, materialize_assets, open_note, MIMES, MAX_IMAGE
+from theme import detect_system_dark, read_system_palette, system_palette_paths, tokens
+
+ROOT = Path(sys._MEIPASS)/"resources" if getattr(sys,"frozen",False) else Path(__file__).resolve().parent.parent
+DEFAULT_PDF = {"pageSize": "a4", "margin": 18, "fontSize": 10.5, "lineHeight": 1.35, "fontFamily": "Noto Sans", "pageNumbers": True}
+DEFAULTS = {"theme": "system", "fullTheme": "black", "motion": True, "font": "Manrope", "size": 18, "width": 0, "normalZoom": 100, "fullZoom": 100, "python": (shutil.which("python3") or shutil.which("python") or "") if getattr(sys,"frozen",False) else sys.executable, "pdf": DEFAULT_PDF, "welcomed": False}
+SAMPLE = """# A place to think\n\nWrite in Markdown. Read without distractions.\n\n> [!tip] Start with your notes\n> Open any note or folder. No vault, no import process.\n\n## Learn by exploring\n\n$$E = mc^2$$\n\n> [!answer]- Why does this matter?\n> Tap the heading to reveal an answer, then hide it to test yourself.\n\n```smd-chart\n{\"title\":\"A changing wave\",\"series\":[{\"name\":\"Sine\",\"expression\":\"sin(a*x)\",\"color\":\"#386a57\"},{\"name\":\"Cosine\",\"expression\":\"cos(a*x)\",\"color\":\"#bc6750\"}],\"sliders\":[{\"name\":\"a\",\"min\":0.2,\"max\":3,\"value\":1}]}\n```\n\n## Explore in three dimensions\n\n```smd-chart\n{\"mode\":\"surface3d\",\"title\":\"Bowl and saddle\",\"x\":{\"min\":-2,\"max\":2,\"steps\":20},\"y\":{\"min\":-2,\"max\":2},\"series\":[{\"name\":\"Bowl\",\"expression\":\"a*(x^2+y^2)\",\"color\":\"#39aa7a\"},{\"name\":\"Saddle\",\"expression\":\"x^2-y^2\",\"color\":\"#ad8be3\"}],\"sliders\":[{\"name\":\"a\",\"min\":0.1,\"max\":2,\"value\":1}]}\n```\n\n[Back to exploring](#learn-by-exploring)\n"""
+
+def local_path(value: str) -> Path:
+    url = QUrl(value)
+    return Path(url.toLocalFile() if url.isLocalFile() else value).expanduser().resolve()
+
+class Session(QObject):
+    """One ordered persistence stream for every native window in the application."""
+    changed = Signal()
+    def __init__(self,isolated=False):
+        super().__init__()
+        self.data = Path(tempfile.mkdtemp(prefix="supermd-test-")) if isolated else Path(QStandardPaths.writableLocation(QStandardPaths.AppDataLocation))/"qt-studio"
+        self.data.mkdir(parents=True,exist_ok=True)
+        self.writes = concurrent.futures.ThreadPoolExecutor(max_workers=1,thread_name_prefix="supermd-save")
+        self.settings = copy.deepcopy(DEFAULTS)
+        self.recent = []
+        self.drafts = {}
+        self.initial_recovery = []
+        try:
+            stored = json.loads((self.data/"settings.json").read_text())
+            self.settings.update({k:v for k,v in stored["settings"].items() if k in DEFAULTS})
+            self.recent = [p for p in stored.get("recent",[]) if isinstance(p,str)][:30]
+        except (OSError,ValueError,KeyError,TypeError,AttributeError): pass
+        try:
+            recovered = json.loads((self.data/"recovery.json").read_text())
+            for tab in recovered:
+                if not isinstance(tab,dict) or any(not isinstance(tab.get(key),str) for key in ("name","content","path","saved")):
+                    raise ValueError("Invalid draft recovery")
+                bundle(tab["content"],tab.get("assets",{}))
+                self.initial_recovery.append(tab)
+        except (OSError,ValueError,TypeError): pass
+
+class Studio(QObject):
+    changed = Signal()
+    readerLoad = Signal(str)
+    readerCall = Signal(str)
+    replied = Signal(str, str, str)
+    completed = Signal(object)
+    saveRequested = Signal(str)
+    closeRequested = Signal(str)
+    allowClose = Signal()
+    newWindowRequested = Signal()
+    exportRequested = Signal(str)
+    flushFailed = Signal(bool)
+
+    def __init__(self, isolated: bool = False, session: Session | None = None):
+        super().__init__()
+        self.setObjectName("studio")
+        self._brand_svg = (ROOT/"public/brand-mark-fixed.svg").read_text()
+        self.pool = concurrent.futures.ThreadPoolExecutor(max_workers=3, thread_name_prefix="supermd")
+        self.session = session or Session(isolated)
+        self.session.changed.connect(lambda:self._emit())
+        self.writes = self.session.writes
+        self.window_id = uuid.uuid4().hex
+        self.completed.connect(self._complete)
+        self.data = self.session.data
+        self.settings = self.session.settings
+        self.tabs: list[dict] = []
+        self.active = ""
+        self.folder = ""
+        self.files: list[dict] = []
+        self.expanded: set[str] = set()
+        self.mode = "live"
+        self.fullscreen = False
+        self.busy = 0
+        self.message = ""
+        self.ready = False
+        self.system_dark = None
+        self.system_mode, self.system_colors = read_system_palette()
+        self._theme_result = None
+        self._theme_running = False
+        self._theme_pending = False
+        self.theme_debounce = QTimer(self)
+        self.theme_debounce.setSingleShot(True)
+        self.theme_debounce.timeout.connect(self._refresh_theme)
+        QGuiApplication.styleHints().colorSchemeChanged.connect(self._schedule_theme)
+        self.palette_watcher = QFileSystemWatcher(self)
+        self.palette_watcher.fileChanged.connect(self._palette_changed)
+        self.palette_watcher.directoryChanged.connect(self._palette_changed)
+        self._watch_palette()
+        self.system_preferences = QProcess(self)
+        if sys.platform.startswith("linux") and shutil.which("gsettings"):
+            self.system_preferences.readyReadStandardOutput.connect(self._system_setting_changed)
+            self.system_preferences.start("gsettings",["monitor","org.gnome.desktop.interface"])
+        self.theme_timer = QTimer(self)
+        # Live notifications handle ordinary changes; this is only a fallback for
+        # environments without portal/Qt preference events. No four-second spawning.
+        self.theme_timer.setInterval(60000)
+        self.theme_timer.timeout.connect(self._refresh_theme)
+        self.theme_timer.start()
+        self.pending_close = ""
+        self.pending_export = ""
+        self.pending_save_as = ""
+        self.flush_operation = None
+        self.flush_timer = QTimer(self)
+        self.flush_timer.setSingleShot(True)
+        self.flush_timer.timeout.connect(lambda:self.flushFailed.emit(bool(self.flush_operation and self.flush_operation["action"] == "close_window")))
+        self.recovery_timer = QTimer(self)
+        self.recovery_timer.setSingleShot(True)
+        self.recovery_timer.timeout.connect(self._recover)
+        self.tabs = [{**tab,"id":uuid.uuid4().hex} for tab in self.session.initial_recovery]
+        self.session.initial_recovery = []
+        self.session.drafts[self.window_id] = [dict(t) for t in self.tabs]
+        if not self.tabs:
+            self.tabs.append(self._note("Welcome.md", SAMPLE, saved=SAMPLE))
+        self.active = self.tabs[0]["id"]
+        self._refresh_theme()
+
+    @property
+    def recent(self): return self.session.recent
+
+    @recent.setter
+    def recent(self,value): self.session.recent = value
+
+    def _note(self, name: str, content: str = "", path: str = "", saved: str = "", assets: dict | None = None, portable: bool = False):
+        return {"id": uuid.uuid4().hex, "name": name, "content": content, "path": path, "saved": saved, "assets": assets or {}, "portable": portable}
+
+    def _current(self):
+        return next(t for t in self.tabs if t["id"] == self.active)
+
+    def _emit(self, load=True):
+        self.changed.emit()
+        if load and self.ready:
+            tab = self._current()
+            colors = self._colors()
+            self.readerLoad.emit(json.dumps({"id": tab["id"], "content": tab["content"], "path": tab["path"] or tab["id"], "mode": self.mode, "dark": self._dark(), "fullscreen": self.fullscreen, "font": self.settings["font"], "size": self.settings["size"], "width": self.settings["width"], "zoom": self.settings["fullZoom" if self.fullscreen else "normalZoom"], "motion": self.settings["motion"], "python": self.settings["python"], "colors": colors}))
+
+    def _dark(self):
+        theme = self.settings["fullTheme" if self.fullscreen else "theme"]
+        return tokens(theme,self.system_dark,self.system_colors,self.system_mode)[0]
+
+    def _colors(self):
+        return tokens(self.settings["fullTheme" if self.fullscreen else "theme"],self.system_dark,self.system_colors,self.system_mode)[1]
+
+    def _schedule_theme(self,*_):
+        self.theme_debounce.start(150)
+
+    def _watch_palette(self):
+        watched = set(self.palette_watcher.files()+self.palette_watcher.directories())
+        for path in system_palette_paths():
+            for target in (path,path.parent):
+                if target.exists() and str(target) not in watched:
+                    self.palette_watcher.addPath(str(target))
+
+    def _palette_changed(self,*_):
+        self._watch_palette()  # Atomic file replacement invalidates the old watch.
+        self._schedule_theme()
+
+    def _system_setting_changed(self):
+        self.system_preferences.readAllStandardOutput()
+        self._schedule_theme()
+
+    def _refresh_theme(self):
+        if self._theme_running:
+            self._theme_pending = True
+            return
+        self._theme_running = True
+        scheme = QGuiApplication.styleHints().colorScheme().name
+        def finished(result,error):
+            self._theme_running = False
+            if not error and result != self._theme_result:
+                self._theme_result = result
+                self.system_dark,(self.system_mode,self.system_colors) = result
+                self._emit()
+            if self._theme_pending:
+                self._theme_pending = False
+                self._schedule_theme()
+        self._submit(lambda:(detect_system_dark(scheme),read_system_palette()),finished,False)
+
+    def stop(self):
+        self.theme_timer.stop()
+        self.theme_debounce.stop()
+        self.recovery_timer.stop()
+        self.flush_timer.stop()
+        self._recover()
+        if self.system_preferences.state() != QProcess.NotRunning:
+            self.system_preferences.terminate()
+            self.system_preferences.waitForFinished(300)
+
+    @Property(str, notify=changed)
+    def snapshot(self):
+        tab = self._current()
+        return json.dumps({"tabs": [{"id": t["id"], "name": t["name"], "dirty": t["content"] != t["saved"]} for t in self.tabs], "active": self.active, "name": tab["name"], "portable": tab["portable"], "folder": self.folder, "files": self.files, "recent": self.recent, "settings": self.settings, "mode": self.mode, "fullscreen": self.fullscreen, "dark": self._dark(), "zoom": self.settings["fullZoom" if self.fullscreen else "normalZoom"], "busy": self.busy > 0, "message": self.message, "colors": self._colors()})
+
+    @Property("QStringList", constant=True)
+    def fonts(self):
+        preferred = ["Manrope", "Noto Sans", "Noto Serif", "DejaVu Sans", "DejaVu Serif", "JetBrains Mono", "Libertinus Serif"]
+        return preferred + sorted(set(QFontDatabase.families()) - set(preferred))
+
+    @Property(str,notify=changed)
+    def brand(self):
+        svg = self._brand_svg
+        colors = self._colors()
+        svg = svg.replace("#d8e3ff",colors["primary-container"]).replace("#244779",colors["on-primary-container"])
+        return "data:image/svg+xml;base64,"+base64.b64encode(svg.encode()).decode()
+
+    def _submit(self, action, done, busy=True, executor=None):
+        if busy:
+            self.busy += 1
+            self._emit(False)
+        future = (executor or self.pool).submit(action)
+        def completed(f):
+            try:
+                self.completed.emit((done, f.result(), None, busy))
+            except Exception as error:
+                self.completed.emit((done, None, str(error), busy))
+        future.add_done_callback(completed)
+
+    @Slot(object)
+    def _complete(self, result):
+        done, value, error, busy = result
+        if busy:
+            self.busy -= 1
+        if error:
+            self.message = error
+            self.pending_close = ""
+        done(value, error)
+        self._emit(False)
+
+    def _preferences(self):
+        data = json.dumps({"settings": self.settings, "recent": self.recent}).encode()
+        self._submit(lambda: atomic_write(self.data / "settings.json", data), lambda *_: None, False,self.writes)
+        self.session.changed.emit()
+
+    def _recover(self):
+        # Snapshot only unsaved tabs. Asset bytes stay in recovery, never in displayed source.
+        self.session.drafts[self.window_id] = [copy.deepcopy(t) for t in self.tabs if t["content"] != t["saved"]]
+        payload = json.dumps([tab for tabs in self.session.drafts.values() for tab in tabs]).encode()
+        self._submit(lambda: atomic_write(self.data / "recovery.json", payload), lambda *_: None, False,self.writes)
+
+    @Slot(str)
+    def openNote(self, value):
+        path = local_path(value)
+        found = next((t for t in self.tabs if t["path"] == str(path)), None)
+        if found:
+            self.selectTab(found["id"])
+            return
+        def finished(result, error):
+            if error:
+                return
+            content, assets, portable = result
+            note = self._note(path.name, content, str(path), content, assets, portable)
+            self.tabs.append(note)
+            self.active = note["id"]
+            self.recent = [str(path)] + [p for p in self.recent if p != str(path)][:29]
+            self._preferences()
+            self._emit()
+        self._submit(lambda: open_note(path), finished)
+
+    @Slot()
+    def newNote(self):
+        note = self._note("Untitled.md")
+        self.tabs.append(note)
+        self.active = note["id"]
+        self._emit()
+
+    @Slot(str)
+    def selectTab(self, id):
+        if any(t["id"] == id for t in self.tabs):
+            self.active = id
+            self._emit()
+
+    @Slot(str)
+    def openFolder(self, value):
+        self.folder = str(local_path(value))
+        self.expanded = {self.folder}
+        self._load_tree()
+
+    def _load_tree(self):
+        folder, expanded = self.folder, set(self.expanded)
+        def scan():
+            entries = []
+            def visit(path, depth):
+                try:
+                    children = sorted(Path(path).iterdir(), key=lambda p: (not p.is_dir(), p.name.lower()))
+                except OSError:
+                    return
+                for child in children:
+                    if len(entries) >= 3000:
+                        return
+                    if child.name.startswith(".") or child.is_symlink():
+                        continue
+                    directory = child.is_dir()
+                    if directory or child.suffix.lower() in (".md", ".smd", ".fmd", ".markdown"):
+                        entries.append({"name": child.name, "path": str(child), "directory": directory, "depth": depth, "expanded": str(child) in expanded})
+                        if directory and str(child) in expanded:
+                            visit(child, depth + 1)
+            visit(folder, 0)
+            return entries
+        def finished(result, error):
+            if not error and folder == self.folder:
+                self.files = result
+        self._submit(scan, finished, False)
+
+    @Slot(str)
+    def toggleDirectory(self, path):
+        self.expanded.symmetric_difference_update({path})
+        self._load_tree()
+
+    @Slot()
+    def closeFolder(self):
+        self.folder = ""
+        self.files = []
+        self.expanded.clear()
+        self._emit(False)
+
+    @Slot(str)
+    def setMode(self, mode):
+        if mode in ("live", "reader", "editor", "split"):
+            self.mode = mode
+            self._emit()
+
+    @Slot(bool)
+    def setFullscreen(self, value):
+        self.fullscreen = value
+        self._emit()
+
+    @Slot(float)
+    def setZoom(self, value):
+        self.settings["fullZoom" if self.fullscreen else "normalZoom"] = max(60, min(240, round(value)))
+        self._emit()
+
+    @Slot(str, str)
+    def setting(self, key, encoded):
+        if key not in DEFAULTS:
+            return
+        try:
+            value = json.loads(encoded)
+        except ValueError:
+            return
+        if key in ("theme","fullTheme") and value not in ("system","light","dark","black"): return
+        if key in ("motion","welcomed") and not isinstance(value,bool): return
+        if key in ("font","python") and (not isinstance(value,str) or not value.strip() or len(value)>2048): return
+        if key in ("size","width","normalZoom","fullZoom") and (not isinstance(value,(int,float)) or not math.isfinite(value)): return
+        if key == "pdf" and (not isinstance(value,dict) or set(value) != set(DEFAULT_PDF)): return
+        if key == "size": value = max(12, min(32, float(value)))
+        if key == "width": value = max(0, min(5000, int(value)))
+        self.settings[key] = value
+        self._preferences()
+        self._emit()
+
+    @Slot()
+    def save(self):
+        tab = self._current()
+        if not tab["path"]:
+            self.saveRequested.emit(tab["name"])
+        elif tab["portable"]:
+            self.readerCall.emit("window.supermdPortable?.(true)")
+        else:
+            self._save_text(tab, Path(tab["path"]))
+
+    def _after_flush(self,operation):
+        if operation["action"] == "save": self.save()
+        elif operation["action"] == "close_tab": self.closeTab(operation["target"])
+        elif operation["action"] == "close_window" and self.requestWindowClose():
+            self._recover()
+            QTimer.singleShot(0,self.allowClose.emit)
+
+    def _flush(self,action,target=""):
+        operation = {"action":action,"target":target,"token":uuid.uuid4().hex}
+        if not self.ready:
+            self._after_flush(operation)
+            return
+        if self.flush_operation: return
+        self.flush_operation = operation
+        self.flush_timer.start(5000)
+        self.readerCall.emit(f"window.supermdFlush?.({json.dumps(operation)})")
+
+    @Slot()
+    def saveSafely(self): self._flush("save")
+
+    @Slot(str)
+    def closeTabSafely(self,id): self._flush("close_tab",id)
+
+    @Slot()
+    def closeWindowSafely(self): self._flush("close_window")
+
+    @Slot(str)
+    def resolveFlush(self,choice):
+        operation,self.flush_operation = self.flush_operation,None
+        self.flush_timer.stop()
+        if not operation: return
+        if choice == "retry": self._flush(operation["action"],operation["target"])
+        elif choice == "recover_close" and operation["action"] == "close_window":
+            # Explicit emergency action: preserve the latest received drafts, not
+            # a silent discard or a claim we can recover an unresponsive renderer.
+            self._recover()
+            self.allowClose.emit()
+
+    @Slot(str)
+    def saveAs(self, value):
+        path = local_path(value)
+        if path.suffix.lower() == ".smd":
+            self.pending_export = str(path)
+            self.pending_save_as = str(path)
+            self.readerCall.emit("window.supermdPortable?.(false)")
+        else:
+            self._save_text(self._current(), path)
+
+    def _save_text(self, tab, path):
+        id, content, assets = tab["id"], tab["content"], dict(tab["assets"])
+        def finished(_, error):
+            if error: return
+            target = next((t for t in self.tabs if t["id"] == id), None)
+            if target:
+                target.update(path=str(path), name=path.name, saved=content, portable=False)
+            self.message = "Saved"
+            self._recover()
+            self._emit()
+            if self.pending_close:
+                self._finish_close()
+        def write():
+            materialize_assets(path.parent,assets)
+            atomic_write(path,content.encode())
+        self._submit(write, finished,executor=self.writes)
+
+    @Slot(str,result=str)
+    def defaultSaveLocation(self,name):
+        directory = QStandardPaths.writableLocation(QStandardPaths.DocumentsLocation) or str(Path.home())
+        return QUrl.fromLocalFile(str(Path(directory)/Path(name).name)).toString()
+
+    @Slot(str)
+    def closeTab(self, id):
+        tab = next((t for t in self.tabs if t["id"] == id), None)
+        if not tab:
+            return
+        if tab["content"] != tab["saved"]:
+            self.pending_close = id
+            self.selectTab(id)
+            self.closeRequested.emit(tab["name"])
+        else:
+            self._remove_tab(id)
+
+    def _remove_tab(self, id):
+        index = next(i for i,t in enumerate(self.tabs) if t["id"] == id)
+        self.tabs.pop(index)
+        if not self.tabs:
+            self.tabs.append(self._note("Untitled.md"))
+        if self.active == id:
+            self.active = self.tabs[min(index, len(self.tabs)-1)]["id"]
+        self._recover()
+        self._emit()
+
+    @Slot(result=bool)
+    def requestWindowClose(self):
+        dirty = next((t for t in self.tabs if t["content"] != t["saved"]), None)
+        if dirty:
+            self.pending_close = "window"
+            self.selectTab(dirty["id"])
+            self.closeRequested.emit(dirty["name"])
+            return False
+        return True
+
+    @Slot(str)
+    def resolveClose(self, choice):
+        if choice == "cancel": self.pending_close = ""; return
+        if choice == "save": self.save(); return
+        if choice == "discard":
+            self._current()["saved"] = self._current()["content"]
+            self._finish_close()
+
+    def _finish_close(self):
+        action = self.pending_close
+        self.pending_close = ""
+        if action == "window":
+            if self.requestWindowClose():
+                self._recover()
+                self.allowClose.emit()
+        elif action:
+            self.closeTab(action)
+
+    @Slot(str, str)
+    def exportTo(self, value, format):
+        self.pending_save_as = ""
+        self.pending_export = str(local_path(value))
+        if format == "smd": self.readerCall.emit("window.supermdPortable?.(false)")
+        else: self.readerCall.emit(f"window.supermdExport?.({json.dumps(self.settings['pdf'])})")
+
+    @Slot(str)
+    def command(self, action):
+        calls = {"find": "window.supermdFind?.()", "insert": "window.supermdMedia?.()", "repair": "window.supermdRepairMath?.()"}
+        if action in calls: self.readerCall.emit(calls[action])
+        elif action == "window": self.newWindowRequested.emit()
+
+    @Slot(str, str, str)
+    def post(self, id, command, raw):
+        try:
+            args = json.loads(raw)
+            tab = self._current()
+            if command == "reader_ready": self.ready = True; self._emit(); self.replied.emit(id,"true",""); return
+            if command == "document_flushed":
+                operation = args.get("operation")
+                if operation != self.flush_operation or operation is None:
+                    self.replied.emit(id,"true",""); return
+                target = next((t for t in self.tabs if t["id"] == args["id"]),None)
+                if target: target["content"] = args["content"]
+                self.flush_timer.stop()
+                self.flush_operation = None
+                self._recover()
+                self._after_flush(operation)
+                self.replied.emit(id,"true",""); return
+            if command == "document_changed":
+                target = next((t for t in self.tabs if t["id"] == args["id"]), None)
+                if target: target["content"] = args["content"]
+                self.recovery_timer.start(800)
+                self._emit(False)
+                self.replied.emit(id,"true",""); return
+            if command == "zoom_changed":
+                self.settings["fullZoom" if self.fullscreen else "normalZoom"] = max(60,min(240,args["zoom"]))
+                self._emit(False); self.replied.emit(id,"true",""); return
+            if command == "export_failed": self.message = args["error"]; self._emit(False); self.replied.emit(id,"true",""); return
+            if command == "request_fmd_export": self.exportRequested.emit("smd"); self.replied.emit(id,"true",""); return
+            reference = args.get("id") or args.get("documentPath")
+            if reference:
+                tab = next((t for t in self.tabs if reference in (t["id"],t["path"])),None)
+                if tab is None: raise ValueError("The note for this operation is no longer open")
+            captured = dict(tab)
+            captured["assets"] = dict(tab["assets"])
+            output = self.pending_export
+            save_as = self.pending_save_as
+            python = self.settings["python"]
+            def work():
+                if command == "load_asset": return self._asset(captured,args["source"])
+                if command == "fetch_resource": return self._fetch(args)
+                if command == "import_images":
+                    results = []
+                    for image in args["images"]:
+                        mime, _ = image_data(image["data"])
+                        extension = next(k for k,v in MIMES.items() if v == mime)
+                        name = f"assets/import-{uuid.uuid4().hex}.{extension}"
+                        captured["assets"][name] = image["data"]
+                        results.append({"source":name,"alt":Path(image["name"]).stem})
+                    return results
+                if command == "run_python": return self._python(python, args["code"])
+                if command == "export_fmd_native":
+                    target = Path(captured["path"]) if args.get("save") else Path(output)
+                    atomic_write(target,json.dumps(bundle(args["content"],args["assets"]),ensure_ascii=False).encode())
+                    return {"path":str(target)}
+                if command == "export_pdf_native":
+                    engine = self._engine()
+                    result = subprocess.run([str(engine),"export-json",output], input=json.dumps(args), text=True, capture_output=True, timeout=120)
+                    if result.returncode: raise ValueError(result.stderr.strip() or "PDF export failed")
+                    return {"path":output}
+                raise ValueError(f"Unsupported command: {command}")
+            def finished(result,error):
+                if error: self.replied.emit(id,"null",error); return
+                target = next((t for t in self.tabs if t["id"] == captured["id"]),None)
+                if command == "import_images" and target: target["assets"].update(captured["assets"])
+                if command == "export_fmd_native" and args.get("save") and target:
+                    target.update(saved=args["originalContent"], assets=args["assets"])
+                    if target["content"] == args["originalContent"]: target["content"] = target["saved"] = args["content"]
+                    self._recover()
+                    if self.pending_close: self._finish_close()
+                elif command == "export_fmd_native" and save_as and target:
+                    if target["content"] == args["originalContent"]:
+                        target.update(path=save_as,name=Path(save_as).name,content=args["content"],saved=args["content"],assets=args["assets"],portable=True)
+                        self._recover()
+                        self._emit()
+                        if self.pending_close: self._finish_close()
+                    self.pending_save_as = ""
+                if command.startswith("export_"): self.message = f"Exported {Path(result['path']).name}"
+                self.replied.emit(id,json.dumps(result),"")
+            self._submit(work,finished,command in ("run_python","export_fmd_native","export_pdf_native"),self.writes if command == "export_fmd_native" else None)
+        except Exception as error:
+            self.replied.emit(id,"null",str(error))
+
+    def _asset(self, tab, source):
+        if source in tab["assets"]: return tab["assets"][source]
+        if not tab["path"]: raise ValueError("Save this note to resolve relative images")
+        root = Path(tab["path"]).parent.resolve()
+        path = (root / urllib.parse.unquote(source)).resolve()
+        if not path.is_relative_to(root): raise ValueError("Image is outside the note folder")
+        if path.stat().st_size > MAX_IMAGE: raise ValueError("Image exceeds 25 MB")
+        mime = MIMES.get(path.suffix[1:].lower())
+        if not mime: raise ValueError("Unsupported image type")
+        return f"data:{mime};base64,{base64.b64encode(path.read_bytes()).decode()}"
+
+    def _fetch(self, args):
+        url = args["url"]
+        self._public_url(url)
+        owner = self
+        class PublicRedirect(urllib.request.HTTPRedirectHandler):
+            def redirect_request(self,request,fp,code,msg,headers,newurl):
+                owner._public_url(newurl)
+                return super().redirect_request(request,fp,code,msg,headers,newurl)
+        opener = urllib.request.build_opener(PublicRedirect())
+        request = urllib.request.Request(url,headers={"User-Agent":"SuperMD/Qt"})
+        with opener.open(request,timeout=20) as response:
+            data = response.read((MAX_IMAGE if args.get("image") else 2_000_000)+1)
+            if len(data) > (MAX_IMAGE if args.get("image") else 2_000_000): raise ValueError("Resource is too large")
+            if args.get("image"):
+                mime = response.headers.get_content_type()
+                if mime not in MIMES.values(): raise ValueError("URL did not return a supported image")
+                return {"body":f"data:{mime};base64,{base64.b64encode(data).decode()}"}
+            return {"body":data.decode("utf-8",errors="replace")}
+
+    @staticmethod
+    def _public_url(url):
+        parsed = urllib.parse.urlparse(url)
+        if parsed.scheme not in ("http","https") or not parsed.hostname or parsed.username or parsed.password:
+            raise ValueError("Use a public web URL")
+        addresses = socket.getaddrinfo(parsed.hostname,parsed.port or (443 if parsed.scheme=="https" else 80),type=socket.SOCK_STREAM)
+        if not addresses or any(not ipaddress.ip_address(address[4][0]).is_global for address in addresses):
+            raise ValueError("Private, local and reserved network addresses are not allowed")
+
+    def _engine(self):
+        executable = "smd-engine.exe" if sys.platform == "win32" else "smd-engine"
+        candidates = [ROOT / "desktop" / executable, ROOT / "smd-core" / "target" / "release" / executable, ROOT / "smd-core" / "target" / "debug" / executable]
+        for path in candidates:
+            if path.is_file(): return path
+        raise ValueError("Native PDF engine is not installed. Build smd-core's smd-engine binary.")
+
+    def _python(self, executable, code):
+        if len(code) > 200_000: raise ValueError("Python cell exceeds 200 KB")
+        # Explicit Run only. Python is trusted local code, not a sandbox.
+        wrapper = """import sys,json,io,base64,contextlib,traceback
+payload=json.load(sys.stdin)
+out=io.StringIO(); err=io.StringIO(); images=[]; ok=True
+try:
+ import matplotlib
+ matplotlib.use('Agg')
+ import matplotlib.pyplot as plt
+ with contextlib.redirect_stdout(out),contextlib.redirect_stderr(err):
+  exec(compile(payload['code'],'<Super MD cell>','exec'),{'__name__':'__main__'})
+ for number in plt.get_fignums()[:16]:
+  data=io.BytesIO(); plt.figure(number).savefig(data,format='svg',bbox_inches='tight')
+  images.append('data:image/svg+xml;base64,'+base64.b64encode(data.getvalue()).decode())
+ plt.close('all')
+except BaseException:
+ ok=False; traceback.print_exc(file=err)
+print(json.dumps({'stdout':out.getvalue()[:200000],'stderr':err.getvalue()[:200000],'images':images,'ok':ok}))
+"""
+        if not executable:
+            raise ValueError("Choose a system Python or virtual environment in Settings first.")
+        environment = os.environ.copy()
+        if getattr(sys,"frozen",False) and sys.platform.startswith("linux"):
+            # An external interpreter must not load our embedded Python/Qt libraries.
+            if "LD_LIBRARY_PATH_ORIG" in environment:
+                environment["LD_LIBRARY_PATH"] = environment["LD_LIBRARY_PATH_ORIG"]
+            else:
+                environment.pop("LD_LIBRARY_PATH",None)
+        process = subprocess.run([executable,"-c",wrapper],input=json.dumps({"code":code}),text=True,capture_output=True,timeout=90,env=environment)
+        if process.returncode: raise ValueError(process.stderr[:2000])
+        return json.loads(process.stdout)

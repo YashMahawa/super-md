@@ -120,11 +120,11 @@ private object NoMotionScheme : MotionScheme {
     val pdf = rememberLauncherForActivityResult(ActivityResultContracts.CreateDocument("application/pdf")) { uri ->
         if (uri != null) { model.outputUri = uri; model.busy(true); web?.evaluateJavascript("window.supermdExport?.(${state.pdf})", null) ?: model.fail("The reader is not ready. Open the note again.") }
     }
-    val portable = rememberLauncherForActivityResult(ActivityResultContracts.CreateDocument("application/vnd.supermd.fmd")) { uri ->
+    val portable = rememberLauncherForActivityResult(ActivityResultContracts.CreateDocument("application/vnd.supermd.smd")) { uri ->
         if (uri != null) { model.portableOutput = uri; model.busy(true); web?.evaluateJavascript("window.supermdPortable?.(false)", null) ?: model.fail("The reader is not ready") }
     }
-    DisposableEffect(portable, state.active.name) { model.requestPortable = { portable.launch(state.active.name.substringBeforeLast('.') + ".fmd") }; onDispose { model.requestPortable = null } }
-    val saveAction: () -> Unit = { if (state.active.uri == null) save.launch(state.active.name) else if (state.active.name.endsWith(".fmd", true)) { model.busy(true); web?.evaluateJavascript("window.supermdPortable?.(true)", null) ?: model.fail("The reader is not ready") } else model.save(); Unit }
+    DisposableEffect(portable, state.active.name) { model.requestPortable = { portable.launch(state.active.name.substringBeforeLast('.') + ".smd") }; onDispose { model.requestPortable = null } }
+    val saveAction: () -> Unit = { if (state.active.uri == null) save.launch(state.active.name.substringBeforeLast('.') + ".md") else if (state.active.portable) { model.busy(true); web?.evaluateJavascript("window.supermdPortable?.(true)", null) ?: model.fail("The reader is not ready") } else model.save(); Unit }
     LaunchedEffect(state.message) { state.message?.let { snackbar.showSnackbar(it); model.dismissMessage() } }
     LaunchedEffect(state.fullscreen, dark) {
         WindowCompat.getInsetsController(activity.window, activity.window.decorView).apply { isAppearanceLightStatusBars = !dark; isAppearanceLightNavigationBars = !dark; systemBarsBehavior = WindowInsetsControllerCompat.BEHAVIOR_SHOW_TRANSIENT_BARS_BY_SWIPE; if (state.fullscreen) hide(WindowInsetsCompat.Type.systemBars()) else show(WindowInsetsCompat.Type.systemBars()) }
@@ -159,7 +159,9 @@ private object NoMotionScheme : MotionScheme {
             ModalDrawerSheet(modifier = Modifier.widthIn(max = 340.dp)) {
                 Column(Modifier.fillMaxHeight().safeDrawingPadding().padding(horizontal = 16.dp)) {
                     Text("Your files", style = MaterialTheme.typography.headlineSmall, modifier = Modifier.padding(vertical = 20.dp))
-                    FilledTonalButton(onClick = { folder.launch(state.folder?.let(android.net.Uri::parse)) }, modifier = Modifier.fillMaxWidth()) { Icon(Icons.Rounded.FolderOpen, null); Spacer(Modifier.width(8.dp)); Text("Open any folder") }
+                    Button(onClick = { open.launch(arrayOf("text/*", "application/octet-stream", "application/vnd.supermd.smd", "application/vnd.supermd.fmd")); scope.launch { drawer.close() } }, shapes = ButtonDefaults.shapes(), modifier = Modifier.fillMaxWidth()) { Icon(Icons.Rounded.Description, null); Spacer(Modifier.width(8.dp)); Text("Open note") }
+                    FilledTonalButton(onClick = { folder.launch(state.folder?.let(android.net.Uri::parse)) }, modifier = Modifier.fillMaxWidth()) { Icon(Icons.Rounded.FolderOpen, null); Spacer(Modifier.width(8.dp)); Text("Open folder") }
+                    if (state.folder != null) TextButton(onClick = { folderRelative = ""; model.closeFolder() }) { Icon(Icons.Rounded.Close, null); Text("Close folder", Modifier.padding(start = 8.dp)) }
                     Text("No vault. No hidden metadata.", style = MaterialTheme.typography.bodySmall, color = palette.onSurfaceVariant, modifier = Modifier.padding(vertical = 12.dp))
                     if (folderRelative.isNotEmpty()) TextButton(onClick = { folderRelative = ""; state.folder?.let { model.listFolder(android.net.Uri.parse(it), "") } }) { Icon(Icons.AutoMirrored.Rounded.ArrowBack, null); Text("Folder root") }
                     Column(Modifier.weight(1f).verticalScroll(rememberScrollState())) {
@@ -184,11 +186,12 @@ private object NoMotionScheme : MotionScheme {
                             IconButton(onClick = saveAction) { Icon(Icons.Rounded.Save, "Save note") }
                             IconButton(onClick = { exporting = true }, enabled = readerReady && !state.busy) { Icon(Icons.Rounded.IosShare, "Export") }
                             Box { IconButton(onClick = { menu = true }) { Icon(Icons.Rounded.MoreVert, "More actions") }; DropdownMenu(expanded = menu, onDismissRequest = { menu = false }) {
-                                DropdownMenuItem(text = { Text("Open note") }, onClick = { menu = false; open.launch(arrayOf("text/*", "application/octet-stream", "application/vnd.supermd.fmd")) }, leadingIcon = { Icon(Icons.Rounded.FolderOpen, null) })
+                                DropdownMenuItem(text = { Text("Open note") }, onClick = { menu = false; open.launch(arrayOf("text/*", "application/octet-stream", "application/vnd.supermd.smd", "application/vnd.supermd.fmd")) }, leadingIcon = { Icon(Icons.Rounded.FolderOpen, null) })
                                 DropdownMenuItem(text = { Text("New tab") }, onClick = { menu = false; model.newNote() }, leadingIcon = { Icon(Icons.Rounded.Add, null) })
                                 DropdownMenuItem(text = { Text("Reopen closed tab") }, onClick = { menu = false; model.reopen() })
-                                DropdownMenuItem(text = { Text("Save as Markdown") }, onClick = { menu = false; save.launch(if (state.active.name.endsWith(".fmd", true)) state.active.name.substringBeforeLast('.') + ".md" else state.active.name) })
+                                DropdownMenuItem(text = { Text("Save as Markdown") }, onClick = { menu = false; save.launch(state.active.name.substringBeforeLast('.') + ".md") })
                                 DropdownMenuItem(text = { Text("Insert image or link") }, onClick = { menu = false; web?.evaluateJavascript("window.supermdMedia?.()", null) }, leadingIcon = { Icon(Icons.Rounded.Image, null) })
+                                DropdownMenuItem(text = { Text("Fix LaTeX") }, onClick = { menu = false; web?.evaluateJavascript("window.supermdRepairMath?.()", null) })
                                 DropdownMenuItem(text = { Text("Zoom · ${state.zoom.toInt()}%") }, onClick = { menu = false; zoomEditing = true }, leadingIcon = { Icon(Icons.Rounded.ZoomIn, null) })
                                 DropdownMenuItem(text = { Text("Find and replace") }, onClick = { menu = false; model.mode("editor"); web?.postDelayed({ web?.evaluateJavascript("window.supermdFind?.()", null) }, 200) }, leadingIcon = { Icon(Icons.Rounded.Search, null) })
                                 DropdownMenuItem(text = { Text("Fullscreen study") }, onClick = { menu = false; model.fullscreen(true) }, leadingIcon = { Icon(Icons.Rounded.Fullscreen, null) })
@@ -248,11 +251,17 @@ private object NoMotionScheme : MotionScheme {
             }
         }
     }
-    if (settings) ModalBottomSheet(onDismissRequest = { settings = false }) { Settings(state, model) }
-    if (exporting) ModalBottomSheet(onDismissRequest = { exporting = false }) { ExportSettings(state.pdf, model::pdf) { format -> exporting = false; if (format == "fmd") portable.launch(state.active.name.substringBeforeLast('.') + ".fmd") else pdf.launch(state.active.name.substringBeforeLast('.') + ".pdf") } }
+    if (settings) {
+        BackHandler { settings = false }
+        Surface(Modifier.fillMaxSize(), color = palette.surface) { Column(Modifier.fillMaxSize().safeDrawingPadding()) {
+            TopAppBar(title = { Text("Settings") }, navigationIcon = { IconButton(onClick = { settings = false }) { Icon(Icons.AutoMirrored.Rounded.ArrowBack, "Back") } })
+            Settings(state, model)
+        } }
+    }
+    if (exporting) ModalBottomSheet(onDismissRequest = { exporting = false }) { ExportSettings(state.pdf, model::pdf, state.active.portable) { format -> exporting = false; if (format == "smd") portable.launch(state.active.name.substringBeforeLast('.') + ".smd") else pdf.launch(state.active.name.substringBeforeLast('.') + ".pdf") } }
     if (zoomEditing) ZoomDialog(state.zoom, { zoomEditing = false }) { model.zoom(it); zoomEditing = false }
     state.error?.let { AlertDialog(onDismissRequest = model::dismissError, title = { Text("Couldn't finish") }, text = { Text(it, Modifier.heightIn(max = 360.dp).verticalScroll(rememberScrollState())) }, confirmButton = { TextButton(onClick = model::dismissError) { Text("OK") } }) }
-    if (!state.welcomed) WelcomeSetup(state, model) { model.welcomeDone(); open.launch(arrayOf("text/*", "application/octet-stream", "application/vnd.supermd.fmd")) }
+    if (!state.welcomed) WelcomeSetup(state, model) { model.welcomeDone(); open.launch(arrayOf("text/*", "application/octet-stream", "application/vnd.supermd.smd", "application/vnd.supermd.fmd")) }
 }
 
 @Composable private fun WelcomeSetup(state: StudioState, model: StudioViewModel, open: () -> Unit) {
@@ -280,7 +289,7 @@ private fun hex(color: Color) = "#%06x".format(color.toArgb() and 0xffffff)
         Spacer(Modifier.height(20.dp))
         Choice("Appearance", state.theme, listOf("system" to "System", "light" to "Light", "dark" to "Dark", "black" to "Pure black")) { model.appearance(theme = it) }
         Choice("Fullscreen appearance", state.fullscreenTheme, listOf("system" to "System", "light" to "Light", "dark" to "Dark", "black" to "Pure black")) { model.appearance(fullTheme = it) }
-        Choice("Reading font", state.font, listOf("sans" to "Sans", "serif" to "Serif", "mono" to "Mono")) { model.appearance(font = it) }
+        Choice("Reading font", state.font, listOf("sans" to "Manrope", "roboto" to "Roboto", "serif" to "Noto Serif", "mono" to "JetBrains Mono", "system" to "System")) { model.appearance(font = it) }
         Text("Text size · ${state.size.toInt()}", style = MaterialTheme.typography.titleSmall, modifier = Modifier.padding(top = 16.dp))
         StudySlider(value = state.size, onCommit = { model.appearance(size = it) }, valueRange = 13f..28f)
         Row(verticalAlignment = Alignment.CenterVertically) { Column(Modifier.weight(1f)) { Text("Expressive motion", style = MaterialTheme.typography.titleMedium); Text("Spring transitions and responsive controls", style = MaterialTheme.typography.bodySmall) }; Switch(checked = state.motion, onCheckedChange = { model.appearance(motion = it) }) }
@@ -302,14 +311,14 @@ private fun hex(color: Color) = "#%06x".format(color.toArgb() and 0xffffff)
     Slider(state = slider, onValueChange = { slider.value = it }, onValueChangeFinished = { onCommit(slider.value) })
 }
 
-@Composable private fun ExportSettings(raw: String, onChange: (String) -> Unit, export: (String) -> Unit) {
+@Composable private fun ExportSettings(raw: String, onChange: (String) -> Unit, portableSource: Boolean = false, export: (String) -> Unit) {
     var format by rememberSaveable { mutableStateOf("pdf") }
     var options by remember(raw) { mutableStateOf(JSONObject(raw)) }
     fun update(key: String, value: Any) { options = JSONObject(options.toString()).put(key, value); onChange(options.toString()) }
     Column(Modifier.fillMaxWidth().verticalScroll(rememberScrollState()).padding(24.dp)) {
         Text("Export your note", style = MaterialTheme.typography.headlineSmall)
-        SingleChoiceSegmentedButtonRow(Modifier.fillMaxWidth().padding(vertical = 16.dp)) {
-            listOf("pdf" to "PDF document", "fmd" to "Portable FMD").forEachIndexed { index, (key, label) -> SegmentedButton(selected = format == key, onClick = { format = key }, shape = SegmentedButtonDefaults.itemShape(index, 2)) { Text(label) } }
+        if (!portableSource) SingleChoiceSegmentedButtonRow(Modifier.fillMaxWidth().padding(vertical = 16.dp)) {
+            listOf("pdf" to "PDF document", "smd" to "Portable SMD").forEachIndexed { index, (key, label) -> SegmentedButton(selected = format == key, onClick = { format = key }, shape = SegmentedButtonDefaults.itemShape(index, 2)) { Text(label) } }
         }
         if (format == "pdf") {
         Text("Vector equations, plots and real pagination. Typeset locally on this device.", style = MaterialTheme.typography.bodyMedium, modifier = Modifier.padding(bottom = 12.dp))

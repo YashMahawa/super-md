@@ -3,7 +3,7 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import { act } from "react";
 import { createRoot, type Root } from "react-dom/client";
 
-const { loadAsset } = vi.hoisted(() => ({ loadAsset: vi.fn(async (_command: string, _args: unknown) => "data:image/png;base64,iVBORw0KGgo=") }));
+const { loadAsset } = vi.hoisted(() => ({ loadAsset: vi.fn(async (command: string, _args: unknown) => command === "fetch_resource" ? {body:"data:image/png;base64,iVBORw0KGgo="} : "data:image/png;base64,iVBORw0KGgo=") }));
 vi.mock("@tauri-apps/api/core", () => ({ invoke: loadAsset }));
 import MarkdownPreview from "./MarkdownPreview";
 
@@ -29,6 +29,15 @@ describe("local image preview", () => {
       root?.render(<MarkdownPreview markdown="![Proof](DM%20Images/proof-method-guide.png)" documentPath="/notes/DM Morning Notes.md" python="" dark />);
     });
     expect(loadAsset).toHaveBeenCalledWith("load_asset", { documentPath: "/notes/DM Morning Notes.md", source: "DM%20Images/proof-method-guide.png" });
+    expect(host.querySelector("img")?.getAttribute("src")).toMatch(/^data:image\/png;base64,/);
+  });
+  it("does not request remote pictures until consent, then paints native-fetched data",async()=>{
+    const host = document.createElement("div"); document.body.append(host); root = createRoot(host);
+    await act(async()=>root?.render(<MarkdownPreview markdown="![Remote](https://example.org/picture.png)" documentPath={null} python="" dark/>));
+    expect(loadAsset).not.toHaveBeenCalled();
+    expect(host.querySelector("img")).toBeNull();
+    await act(async()=>host.querySelector("button")!.dispatchEvent(new MouseEvent("click",{bubbles:true})));
+    expect(loadAsset).toHaveBeenCalledWith("fetch_resource",{url:"https://example.org/picture.png",image:true});
     expect(host.querySelector("img")?.getAttribute("src")).toMatch(/^data:image\/png;base64,/);
   });
 });

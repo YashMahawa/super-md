@@ -21,4 +21,10 @@ describe("safe chart expressions", () => {
     expect(() => compileMathExpression("(".repeat(3000) + "x" + ")".repeat(3000))).toThrow();
     expect(() => compileMathExpression("1+".repeat(300) + "1")).toThrow();
   });
+  it("uses mathematical unary/exponent precedence and negative exponents",()=>{
+    expect(compileMathExpression("-x^2")({x:3})).toBe(-9);
+    expect(compileMathExpression("(-x)^2")({x:3})).toBe(9);
+    expect(compileMathExpression("2^-2")({})).toBe(.25);
+    expect(compileMathExpression("2^3^2")({})).toBe(512);
+  });
 });

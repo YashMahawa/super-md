@@ -11,3 +11,9 @@ vite.config.d.ts
 playwright-report/
 test-results/
 coverage/
+desktop/.venv/
+desktop/build/
+desktop/dist/
+desktop/build-info.json
+__pycache__/
+*.pyc

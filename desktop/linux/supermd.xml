@@ -1,0 +1,13 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<mime-info xmlns="http://www.freedesktop.org/standards/shared-mime-info">
+  <mime-type type="application/vnd.supermd.smd">
+    <comment>Portable Super MD note</comment>
+    <glob pattern="*.smd" weight="80"/>
+    <icon name="super-md"/>
+  </mime-type>
+  <mime-type type="application/vnd.supermd.fmd">
+    <comment>Legacy portable Super MD note</comment>
+    <glob pattern="*.fmd" weight="80"/>
+    <icon name="super-md"/>
+  </mime-type>
+</mime-info>

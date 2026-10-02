@@ -1,5 +1,6 @@
 import { useEffect, useRef, useState } from "react";
 import { imageMarkdown, imageRanges, importImageFiles, importImageUrl, linkDetails, markdownLabel, type ImportedImage, type LinkDetails } from "../documentMedia";
+import { invoke } from "../nativeBridge";
 
 export interface InsertionPoint { from: number; to: number }
 function insertionPoint(): InsertionPoint | undefined {
@@ -15,6 +16,8 @@ declare global { interface Window { supermdInsertImages?: (images: ImportedImage
 export default function MediaTools({ documentId, content, documentPath, onInsert, onNotice }: { documentId: string; content: string; documentPath: string | null; onInsert: (text: string, point?: InsertionPoint) => void; onNotice: (message: string) => void }) {
   const [open, setOpen] = useState(false); const [url, setUrl] = useState(""); const [imageMode, setImageMode] = useState(false);
   const [details, setDetails] = useState<LinkDetails | null>(null); const [thumbnail, setThumbnail] = useState(false);
+  const [thumbnailPreview,setThumbnailPreview] = useState("");
+  const [thumbnailError,setThumbnailError] = useState("");
   const [busy, setBusy] = useState(false); const [fetching, setFetching] = useState(false); const [error, setError] = useState("");
   const [replacement, setReplacement] = useState(false);
   const [removed, setRemoved] = useState<{ from: number; text: string; expected: string } | null>(null);
@@ -74,6 +77,16 @@ export default function MediaTools({ documentId, content, documentPath, onInsert
     const timer = setTimeout(() => { void linkDetails(url).then((info) => { if (active) setDetails(info); }).catch((e) => { if (active) { setDetails({ url, title: new URL(url).hostname }); setError(`Title unavailable; you can still insert the link. ${e}`); } }).finally(() => { if (active) setFetching(false); }); }, 300);
     return () => { active = false; clearTimeout(timer); };
   }, [open, url, imageMode]);
+  useEffect(()=> {
+    let active = true;
+    setThumbnailPreview(""); setThumbnailError("");
+    if (open && !imageMode && thumbnail && details?.thumbnail) {
+      void invoke<{body:string}>("fetch_resource",{url:details.thumbnail,image:true})
+        .then(result=>{if(active) setThumbnailPreview(result.body);})
+        .catch(reason=>{if(active) setThumbnailError(String(reason));});
+    }
+    return ()=>{active=false;};
+  },[open,imageMode,thumbnail,details?.thumbnail]);
   const insert = async () => {
     setBusy(true); setError(""); const point = target.current;
     try {
@@ -98,6 +111,7 @@ export default function MediaTools({ documentId, content, documentPath, onInsert
     {fetching && <small role="status">Finding the link title…</small>}
     {!imageMode && details && <label>Link title<input value={details.title} onChange={(e) => setDetails({ ...details, title: e.target.value })} /></label>}
     {!imageMode && details?.thumbnail && <label className="media-check"><input type="checkbox" checked={thumbnail} onChange={(e) => setThumbnail(e.target.checked)} />Include the video thumbnail</label>}
+    {!imageMode && thumbnail && details?.thumbnail && (thumbnailPreview ? <img className="link-thumbnail-preview" src={thumbnailPreview} alt={`Thumbnail preview: ${details.title}`} /> : <small role="status">{thumbnailError ? `Thumbnail preview unavailable: ${thumbnailError}` : "Loading thumbnail preview…"}</small>)}
     <small>Titles are fetched only when you paste or enter a web link here. Images are downloaded on insertion, so PDF and portable-file export can work offline.</small>
     {error && <p role="alert">{error}</p>}
     <footer><button disabled={busy || !/^https?:\/\/\S+$/.test(url)} className="primary-action" onClick={insert}>{busy ? "Preparing…" : replacement ? "Replace image" : imageMode ? "Insert image" : "Insert link"}</button></footer>

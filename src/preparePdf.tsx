@@ -20,6 +20,7 @@ export async function preparePdf(markdown: string, documentPath: string | null) 
   const processor = unified().use(remarkParse).use(remarkGfm).use(remarkMath).use(remarkObsidianMath).use(remarkStringify);
   const tree = processor.parse(normalizeCallouts(markdown));
   const work: Promise<void>[] = []; const assets: Record<string, string> = {}; let count = 0;
+  const chartTitles = new Map<any,string>();
   const add = (url: string, name: string) => { assets[name] = url.slice(url.indexOf(",") + 1); return name; };
   visit(tree, (node: any) => {
     const exportCell = node.type === "code" && ["mermaid", "svg", "smd-chart", "python", "py"].includes(node.lang);
@@ -48,6 +49,29 @@ export async function preparePdf(markdown: string, documentPath: string | null) 
           graph.setAttribute("xmlns", "http://www.w3.org/2000/svg");
           graph.querySelectorAll(".chart-axis").forEach((axis) => axis.setAttribute("stroke", "#667085"));
           graph.querySelectorAll("text").forEach((text) => { text.setAttribute("fill", "#20252d"); text.setAttribute("font-size", "14"); });
+          const title = parsed.querySelector("figcaption")?.textContent;
+          if(title) chartTitles.set(node,title);
+          // The interactive HTML legend/controls aren't inside the plot SVG.
+          // Preserve their labels and selected values in the vector snapshot.
+          const box=(graph.getAttribute("viewBox")||"").split(/\s+/).map(Number);
+          if(box.length!==4 || !box.every(Number.isFinite)) throw new Error("Invalid chart viewport");
+          let cursor=box[3]+20;
+          const svgText=(text:string,x:number,y:number)=>{
+            const element=parsed.createElementNS("http://www.w3.org/2000/svg","text");
+            element.setAttribute("x",String(x));element.setAttribute("y",String(y));element.setAttribute("fill","#20252d");element.setAttribute("font-size","14");element.textContent=text;graph.append(element);
+          };
+          const wrap=(text:string)=>text.match(/.{1,85}(?:\s|$)|.{1,85}/g)||[text];
+          for(const item of parsed.querySelectorAll(".chart-legend > span")) {
+            const label=(item.textContent||"").replace(/^\s*●\s*/,"").trim();
+            const color=item.querySelector("i")?.getAttribute("style")?.match(/color:\s*(#[a-f\d]{6})/i)?.[1]||"#6750a4";
+            const key=parsed.createElementNS("http://www.w3.org/2000/svg","line");
+            for(const [name,value] of Object.entries({x1:"20",x2:"36",y1:String(cursor-5),y2:String(cursor-5),stroke:color,"stroke-width":"3"})) key.setAttribute(name,value);
+            graph.append(key);
+            for(const line of wrap(label)) {svgText(line.trim(),44,cursor);cursor+=18;}
+          }
+          const selected=Array.from(parsed.querySelectorAll(".chart-controls label")).map(label=>(label.textContent||"").trim()).join(" · ");
+          if(selected) for(const line of wrap(selected)) {svgText(line.trim(),20,cursor+4);cursor+=18;}
+          graph.setAttribute("viewBox",`${box[0]} ${box[1]} ${box[2]} ${cursor+10}`);
           return new XMLSerializer().serializeToString(graph);
         })();
         const url = await data(new Blob([svg], { type: "image/svg+xml" }));
@@ -76,6 +100,11 @@ export async function preparePdf(markdown: string, documentPath: string | null) 
     if (exportCell) return SKIP;
   });
   await Promise.all(work);
+  // Insert title paragraphs after all asynchronous replacements settle; parser
+  // offsets and concurrent diagram jobs never race over parent array indices.
+  visit(tree,(parent:any)=>{
+    if(Array.isArray(parent.children)) parent.children=parent.children.flatMap((child:any)=>chartTitles.has(child)?[{type:"paragraph",children:[{type:"strong",children:[{type:"text",value:chartTitles.get(child)}]}]},child]:[child]);
+  });
   // The marker is an extension, not a normal bracketed link. Stringify escapes
   // its opening bracket; restore only explicit blockquote callout prefixes.
   const content = processor.stringify(tree).replace(/^([\t ]*>[\t ]*)\\(\[![\w-]+\][+-]?)/gm, "$1$2");

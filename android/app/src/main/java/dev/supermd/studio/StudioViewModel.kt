@@ -22,10 +22,10 @@ import org.json.JSONObject
 import java.io.File
 import java.util.UUID
 
-data class Note(val id: String = UUID.randomUUID().toString(), val name: String = "Untitled.smd", val uri: String? = null, val content: String = "", val saved: String = "", val relative: String? = null, val assetDirectory: String? = null) { val dirty get() = content != saved }
+data class Note(val id: String = UUID.randomUUID().toString(), val name: String = "Untitled.md", val uri: String? = null, val content: String = "", val saved: String = "", val relative: String? = null, val assetDirectory: String? = null) { val dirty get() = content != saved; val portable get() = assetDirectory != null }
 data class RecentNote(val name: String, val uri: String, val relative: String? = null)
 data class FileEntry(val name: String, val uri: String, val directory: Boolean, val relative: String)
-data class StudioState(val tabs: List<Note> = listOf(Note(name = "Welcome.smd", content = sample, saved = sample)), val closedTabs: List<Note> = emptyList(), val activeId: String = "", val mode: String = "live", val fullscreen: Boolean = false, val normalZoom: Float = 100f, val fullscreenZoom: Float = 100f, val theme: String = "system", val fullscreenTheme: String = "black", val motion: Boolean = true, val font: String = "sans", val size: Float = 17f, val folder: String? = null, val files: List<FileEntry> = emptyList(), val busy: Boolean = false, val message: String? = null, val error: String? = null, val welcomed: Boolean = false, val pdf: String = "{\"pageSize\":\"a4\",\"margin\":18,\"fontSize\":10.5,\"lineHeight\":1.35,\"fontFamily\":\"Libertinus Serif\",\"pageNumbers\":true}") {
+data class StudioState(val tabs: List<Note> = listOf(Note(name = "Welcome.md", content = sample, saved = sample)), val closedTabs: List<Note> = emptyList(), val activeId: String = "", val mode: String = "live", val fullscreen: Boolean = false, val normalZoom: Float = 100f, val fullscreenZoom: Float = 100f, val theme: String = "system", val fullscreenTheme: String = "black", val motion: Boolean = true, val font: String = "sans", val size: Float = 17f, val folder: String? = null, val files: List<FileEntry> = emptyList(), val busy: Boolean = false, val message: String? = null, val error: String? = null, val welcomed: Boolean = false, val pdf: String = "{\"pageSize\":\"a4\",\"margin\":18,\"fontSize\":10.5,\"lineHeight\":1.35,\"fontFamily\":\"Libertinus Serif\",\"pageNumbers\":true}") {
     val active get() = tabs.find { it.id == activeId } ?: tabs.first()
     val zoom get() = if (fullscreen) fullscreenZoom else normalZoom
 }
@@ -140,8 +140,13 @@ class StudioViewModel(app: Application) : AndroidViewModel(app) {
                 try { resolver.takePersistableUriPermission(uri, Intent.FLAG_GRANT_READ_URI_PERMISSION or Intent.FLAG_GRANT_WRITE_URI_PERMISSION) } catch (_: SecurityException) { }
                 val name = DocumentFile.fromSingleUri(getApplication(), uri)?.name ?: "Note.md"
                 resolver.openInputStream(uri)?.use { stream ->
-                    if (name.endsWith(".fmd", true)) { val opened = media.openFmd(stream); Note(name = name, uri = uri.toString(), content = opened.markdown, saved = opened.markdown, relative = relative, assetDirectory = opened.directory) }
-                    else { val content = readLimited(stream, 20_000_000).toString(Charsets.UTF_8); Note(name = name, uri = uri.toString(), content = content, saved = content, relative = relative) }
+                    val buffered = stream.buffered()
+                    buffered.mark(4096)
+                    val prefix = ByteArray(2048); val count = buffered.read(prefix); buffered.reset()
+                    val header = if (count > 0) String(prefix, 0, count, Charsets.UTF_8).trimStart('\uFEFF', ' ', '\n', '\r', '\t') else ""
+                    val portable = name.endsWith(".fmd", true) || name.endsWith(".smd", true) && header.startsWith('{') && Regex("\"format\"\\s*:\\s*\"supermd-(smd|fmd)\"").containsMatchIn(header)
+                    if (portable) { val opened = media.openFmd(buffered); Note(name = name, uri = uri.toString(), content = opened.markdown, saved = opened.markdown, relative = relative, assetDirectory = opened.directory) }
+                    else { val content = readLimited(buffered, 20_000_000).toString(Charsets.UTF_8); Note(name = name, uri = uri.toString(), content = content, saved = content, relative = relative) }
                 } ?: error("Document permission is unavailable; choose it again")
             }
             change { s -> val existing = s.tabs.find { it.uri == note.uri }; s.copy(tabs = if (existing != null) s.tabs else s.tabs + note, activeId = existing?.id ?: note.id) }
@@ -154,11 +159,11 @@ class StudioViewModel(app: Application) : AndroidViewModel(app) {
         try {
             withContext(Dispatchers.IO) {
                 val name = DocumentFile.fromSingleUri(getApplication(), target)?.name ?: note.name
-                require(!name.endsWith(".fmd", true)) { "Use portable save for an FMD file" }
+                require(!note.portable || uri != null) { "Use portable save for this SMD file" }
                 copyAttachments(note, target)
                 resolver.openOutputStream(target, "wt")?.use { it.write(note.content.toByteArray()) } ?: error("Writing permission is unavailable; use Save as")
             }
-            change { s -> s.copy(busy = false, tabs = s.tabs.map { if (it.id == note.id) it.copy(uri = target.toString(), name = DocumentFile.fromSingleUri(getApplication(), target)?.name ?: note.name, saved = note.content) else it }, message = "Saved") }
+            change { s -> s.copy(busy = false, tabs = s.tabs.map { if (it.id == note.id) it.copy(uri = target.toString(), name = DocumentFile.fromSingleUri(getApplication(), target)?.name ?: note.name, saved = note.content, assetDirectory = null) else it }, message = "Saved") }
             mutable.value.tabs.find { it.id == note.id }?.let(::remember)
         } catch (error: Exception) { fail("Could not save note: ${error.message}") }
     }
@@ -168,6 +173,7 @@ class StudioViewModel(app: Application) : AndroidViewModel(app) {
             change { it.copy(folder = uri.toString()) }; listFolder(uri, "")
         } catch (error: Exception) { fail("Could not open folder: ${error.message}") }
     }
+    fun closeFolder() = change { it.copy(folder = null, files = emptyList()) }
     fun listFolder(uri: Uri, relative: String) = viewModelScope.launch {
         try {
             val entries = withContext(Dispatchers.IO) {
@@ -279,7 +285,7 @@ class StudioViewModel(app: Application) : AndroidViewModel(app) {
             resolver.openOutputStream(target, "wt")?.use { output -> staged.inputStream().use { it.copyTo(output) } } ?: error("Cannot write portable file")
             withContext(Dispatchers.Main) {
                 if (save) { change { s -> s.copy(tabs = s.tabs.map { if (it.id == id) it.copy(content = if (it.content == originalContent) content else it.content, saved = content, assetDirectory = opened!!.directory) else it }, busy = false, message = "Portable note saved") }; mutable.value.tabs.find { it.id == id }?.let(::remember) }
-                else { portableOutput = null; mutable.value = mutable.value.copy(busy = false, message = "Portable .fmd exported") }
+                else { portableOutput = null; mutable.value = mutable.value.copy(busy = false, message = "Portable .smd exported") }
             }
         } finally { staged.delete() }
     }

@@ -7,5 +7,5 @@ export default defineConfig({
   clearScreen: false,
   server: { port: 1420, strictPort: true },
   envPrefix: ["VITE_", "TAURI_"]
-  ,build: { rollupOptions: { input: { app: "index.html", reader: "android-reader.html" } } }
+  ,build: { rollupOptions: { input: { app: "index.html", reader: "android-reader.html", qtReader: "qt-reader.html" } } }
 });

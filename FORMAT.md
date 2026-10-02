@@ -1,6 +1,11 @@
-# Super Markdown (`.smd`) format
+# Super Markdown features and compatibility
 
-`.smd` is Markdown, not a binary container. Any text editor can open it and any Markdown tool can render the standard parts. Super MD adds fenced blocks that degrade to readable code blocks elsewhere.
+In version 0.4.0, `.md` is plain Markdown and `.smd` is a portable container
+holding Markdown and images. Old text `.smd` and portable `.fmd` files remain
+readable. New portable files use `"format":"supermd-smd"`; their source editor
+shows Markdown only. The complete current guide is
+[docs/AUTHORING.md](docs/AUTHORING.md). The Markdown features below work in
+plain `.md` and inside portable `.smd` alike.
 
 ## Callouts
 

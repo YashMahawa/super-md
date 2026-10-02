@@ -52,7 +52,7 @@ export default function LiveEditor({ markdown, onChange, documentPath, python, d
   const after = useMemo(() => editing ? splitMarkdownBlocks(editing.suffix).filter((block) => block.text.trim()) : [], [editing?.suffix]);
   useEffect(() => { if (editing && markdown !== editing.prefix + editing.text + editing.suffix) setEditing(null); }, [markdown, editing]);
   const renderBlock = (block: SourceBlock, index: number, base = 0) => <section className="live-block" data-source-start={base + block.start} data-source-end={base + block.end} key={`${base + block.start}-${index}`} tabIndex={0} role="group" aria-label={`Editable block ${index + 1}`} onClick={(event) => {
-    if ((event.target as Element).closest("a,button,input,select,textarea,.interactive-chart") || window.getSelection()?.toString()) return;
+    if ((event.target as Element).closest("a,button,input,select,textarea,summary,.interactive-chart") || window.getSelection()?.toString()) return;
     setEditing({ prefix: markdown.slice(0, base + block.start), text: block.text, suffix: markdown.slice(base + block.end) });
   }} onKeyDown={(event) => {
     if (event.target === event.currentTarget && (event.key === "Enter" || event.key === "F2")) { event.preventDefault(); setEditing({ prefix: markdown.slice(0, base + block.start), text: block.text, suffix: markdown.slice(base + block.end) }); }

@@ -26,7 +26,7 @@ export default function PythonCell({ source, python, highlighted }: { source: st
   return (
     <div className="python-cell">
       <div className="cell-toolbar"><span>Python {stale && <small className="stale-badge">Output from earlier code</small>}</span><button onClick={run} disabled={running || !python}>{running ? "Running…" : stale ? "Run updated code" : "Run"}</button></div>
-      <pre><code className="language-python">{highlighted ?? source}</code></pre>
+      <details className="code-disclosure" open={source.split("\n").length <= 12}><summary>Python source <span>{source.split("\n").length} lines</span></summary><pre><code className="language-python">{highlighted ?? source}</code></pre></details>
       {result && <div className={`cell-output ${result.ok ? "" : "failed"} ${stale ? "stale" : ""}`}>
         {result.stdout && <pre>{result.stdout}</pre>}
         {result.stderr && <pre>{result.stderr}</pre>}

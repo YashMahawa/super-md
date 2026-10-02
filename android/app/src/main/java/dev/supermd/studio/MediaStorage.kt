@@ -104,7 +104,7 @@ class MediaStorage(private val context: Context) {
                 }
                 reader.endObject(); require(reader.peek() == android.util.JsonToken.END_DOCUMENT) { "Unexpected data after the FMD envelope" }
             }
-            require(format == "supermd-fmd" && version == 1 && markdown != null) { "Unsupported FMD file" }
+            require(format in listOf("supermd-smd", "supermd-fmd") && version == 1 && markdown != null) { "Unsupported portable SMD file" }
             return Opened(markdown!!, directory)
         } catch (error: Exception) { root.deleteRecursively(); throw error }
     }
@@ -119,7 +119,7 @@ class MediaStorage(private val context: Context) {
             override fun write(buffer: ByteArray, offset: Int, length: Int) { require(bytes + length <= 120_000_000) { "FMD exceeds 120 MB" }; out.write(buffer, offset, length); bytes += length }
         }
         JsonWriter(bounded.writer()).use { writer ->
-            writer.beginObject().name("format").value("supermd-fmd").name("version").value(1).name("markdown").value(markdown).name("assets").beginObject()
+            writer.beginObject().name("format").value("supermd-smd").name("version").value(1).name("markdown").value(markdown).name("assets").beginObject()
             assets.keys().forEach { source -> writer.name(source).value(assets.getString(source)) }
             writer.endObject().endObject()
         }

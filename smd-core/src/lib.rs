@@ -61,6 +61,13 @@ struct Renderer<'a> {
     events: std::iter::Peekable<std::vec::IntoIter<Event<'a>>>,
     assets: &'a HashMap<String, Vec<u8>>,
     footnotes: HashMap<String, String>,
+    headings: HashMap<String, usize>,
+    heading_counts: HashMap<String, usize>,
+}
+fn heading_slug(value: &str) -> String {
+    let value = value.to_lowercase().chars().filter(|c| c.is_alphanumeric() || c.is_whitespace() || *c == '-' || *c == '_').collect::<String>();
+    let slug = value.trim().chars().map(|c| if c.is_whitespace() { '-' } else { c }).collect::<String>();
+    if slug.is_empty() { "section".into() } else { slug }
 }
 impl<'a> Renderer<'a> {
     fn render(&mut self, end: Option<TagEnd>) -> Result<String> {
@@ -152,16 +159,25 @@ impl<'a> Renderer<'a> {
                             out.push_str(&format!("\n#block(width: 100%, breakable: true, fill: rgb(\"#f1f4f8\"), stroke: (left: 2pt + rgb(\"{accent}\")), inset: 10pt, radius: 4pt)[{body}]\n\n"));
                         },
                         _ => {
+                            let heading = if matches!(tag, Tag::Heading { .. }) {
+                                let plain = self.events.clone().take_while(|e| !matches!(e, Event::End(TagEnd::Heading(_)))).filter_map(|e| match e { Event::Text(v) | Event::Code(v) | Event::InlineMath(v) => Some(v.to_string()), _ => None }).collect::<String>();
+                                let slug = heading_slug(&plain); let count = self.heading_counts.entry(slug.clone()).or_default();
+                                let id = if *count == 0 { slug } else { format!("{slug}-{count}") }; *count += 1; Some(id)
+                            } else { None };
                             let body = self.render(Some(close))?;
                             match tag {
                                 Tag::Paragraph => out.push_str(&format!("{body}\n\n")),
-                                Tag::Heading { level, .. } => out.push_str(&format!("\n#heading(level: {})[{body}]\n\n", level as u8)),
+                                Tag::Heading { level, .. } => out.push_str(&format!("\n#heading(level: {})[{body}] <smd-{}>\n\n", level as u8, heading.unwrap())),
                                 Tag::Emphasis => out.push_str(&format!("#emph[{body}]")),
                                 Tag::Strong => out.push_str(&format!("#strong[{body}]")),
                                 Tag::Strikethrough => out.push_str(&format!("#strike[{body}]")),
                                 Tag::List(start) => out.push_str(&if let Some(start) = start { format!("\n#enum(start: {start}, {body})\n") } else { format!("\n#list({body})\n") }),
                                 Tag::Item => out.push_str(&format!("[{body}],\n")),
-                                Tag::Link { dest_url, .. } => out.push_str(&if dest_url.starts_with("https:") || dest_url.starts_with("http:") || dest_url.starts_with("mailto:") { format!("#link({})[{body}]", string(&dest_url)) } else { body }),
+                                Tag::Link { dest_url, .. } => out.push_str(&if let Some(fragment) = dest_url.strip_prefix('#') {
+                                    let decoded = percent_encoding::percent_decode_str(fragment).decode_utf8_lossy();
+                                    let slug = heading_slug(&decoded);
+                                    if self.headings.contains_key(&slug) { format!("#link(label({}))[{body}]", string(&format!("smd-{slug}"))) } else { body }
+                                } else if dest_url.starts_with("https:") || dest_url.starts_with("http:") || dest_url.starts_with("mailto:") { format!("#link({})[{body}]", string(&dest_url)) } else { body }),
                                 _ => out.push_str(&body),
                             }
                         }
@@ -177,9 +193,16 @@ pub fn source(markdown: &str, options: &PdfOptions, assets: &HashMap<String, Vec
     options.validate()?;
     let normalized = normalize_callouts(markdown);
     let events = Parser::new_ext(&normalized, Options::ENABLE_TABLES | Options::ENABLE_STRIKETHROUGH | Options::ENABLE_TASKLISTS | Options::ENABLE_MATH | Options::ENABLE_FOOTNOTES).collect::<Vec<_>>();
-    let mut renderer = Renderer { events: events.into_iter().peekable(), assets, footnotes: HashMap::new() };
+    let mut headings = HashMap::new(); let mut current = None::<String>;
+    for event in &events { match event {
+        Event::Start(Tag::Heading { .. }) => current = Some(String::new()),
+        Event::Text(v) | Event::Code(v) | Event::InlineMath(v) => { if let Some(text) = &mut current { text.push_str(v); } },
+        Event::End(TagEnd::Heading(_)) => { if let Some(text) = current.take() { let slug = heading_slug(&text); let count = headings.get(&slug).copied().unwrap_or(0); if count > 0 { headings.insert(format!("{slug}-{count}"), 1); } headings.insert(slug, count + 1); } },
+        _ => {}
+    } }
+    let mut renderer = Renderer { events: events.into_iter().peekable(), assets, footnotes: HashMap::new(), headings, heading_counts: HashMap::new() };
     // References normally precede definitions, so collect definitions first.
-    let mut definitions = Renderer { events: renderer.events.clone(), assets, footnotes: HashMap::new() };
+    let mut definitions = Renderer { events: renderer.events.clone(), assets, footnotes: HashMap::new(), headings: renderer.headings.clone(), heading_counts: HashMap::new() };
     while let Some(event) = definitions.events.next() {
         if let Event::Start(Tag::FootnoteDefinition(name)) = event { let value = definitions.render(Some(TagEnd::FootnoteDefinition))?; definitions.footnotes.insert(name.to_string(), value); }
     }

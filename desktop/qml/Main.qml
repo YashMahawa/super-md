@@ -1,0 +1,328 @@
+import QtQuick
+import QtQuick.Controls
+import QtQuick.Controls.Material
+import QtQuick.Layouts
+import QtQuick.Dialogs
+import QtWebEngine
+import QtWebChannel
+
+ApplicationWindow {
+    id: window
+    width: 1320
+    height: 880
+    minimumWidth: 760
+    minimumHeight: 520
+    visible: false
+    title: viewState.name + " - Super MD"
+    property var viewState: JSON.parse(studio.snapshot)
+    property bool sidebar: true
+    property bool settingsOpen: false
+    property bool closingAllowed: false
+    property string outputFormat: "pdf"
+    property bool sharing: false
+    function runDocumentScript(script) { reader.runJavaScript(script) }
+    Material.theme: viewState.dark ? Material.Dark : Material.Light
+    Material.primary: viewState.colors.primary
+    Material.accent: viewState.colors.primary
+    Material.background: viewState.colors.surface
+    Material.foreground: viewState.colors["on-surface"]
+    color: viewState.colors.surface
+    font.family: "Noto Sans"
+    onClosing: function(close) { close.accepted = closingAllowed; if (!closingAllowed) studio.closeWindowSafely() }
+
+    Connections {
+        target: studio
+        function onAllowClose() { closingAllowed = true; window.close() }
+        function onFlushFailed(canClose) { flushDialog.canClose = canClose; flushDialog.open() }
+        function onCloseRequested(name) { closeDialog.title = "Save changes to " + name + "?"; closeDialog.open() }
+        function onSaveRequested(name) { saveDialog.selectedFile = studio.defaultSaveLocation(name); saveDialog.open() }
+        function onExportRequested(format) { outputFormat = format; exportDialog.open() }
+        function onReaderLoad(payload) { reader.runJavaScript("window.supermdLoad?.(" + payload + ")") }
+        function onReaderCall(script) { reader.runJavaScript(script) }
+    }
+    Shortcut { sequences: [StandardKey.New]; onActivated: studio.newNote() }
+    Shortcut { sequences: [StandardKey.Open]; onActivated: openDialog.open() }
+    Shortcut { sequences: [StandardKey.Save]; onActivated: studio.saveSafely() }
+    Shortcut { sequences: [StandardKey.Find]; onActivated: { studio.setMode("editor"); studio.command("find") } }
+    Shortcut { sequences: [StandardKey.Close]; onActivated: studio.closeTabSafely(viewState.active) }
+    Shortcut { sequence: "Ctrl+Shift+N"; onActivated: studio.command("window") }
+    Shortcut { sequence: "Ctrl+,"; onActivated: settingsOpen = !settingsOpen }
+    Shortcut { sequence: "F11"; onActivated: { studio.setFullscreen(!viewState.fullscreen); window.visibility = viewState.fullscreen ? Window.FullScreen : Window.Windowed } }
+    Shortcut { sequence: "Escape"; enabled: settingsOpen; onActivated: settingsOpen = false }
+    // Qt's chrome never scales. Keyboard/pinch zoom is routed to the content pane.
+    Shortcut { sequence: "Ctrl++"; onActivated: reader.runJavaScript("window.supermdZoomBy?.(1.1)") }
+    Shortcut { sequence: "Ctrl+="; onActivated: reader.runJavaScript("window.supermdZoomBy?.(1.1)") }
+    Shortcut { sequence: "Ctrl+-"; onActivated: reader.runJavaScript("window.supermdZoomBy?.(1/1.1)") }
+    Shortcut { sequence: "Ctrl+0"; onActivated: reader.runJavaScript("window.supermdResetZoom?.()") }
+
+    header: Column {
+        visible: !viewState.fullscreen && viewState.settings.welcomed
+        width: parent.width
+        Pane {
+            width: parent.width
+            padding: 12
+            RowLayout {
+                anchors.fill: parent
+                spacing: 8
+                Image { source: studio.brand; sourceSize.width: 32; sourceSize.height: 32; Layout.preferredWidth: 32; Layout.preferredHeight: 32; Layout.rightMargin: 8 }
+                ActionButton { glyph: "SidebarSimple"; onClicked: sidebar = !sidebar; ToolTip.text: "Show or hide files" }
+                ActionButton { text: window.width < 1000 ? "" : "New note"; glyph: "Plus"; ToolTip.text: "New note"; onClicked: studio.newNote() }
+                ActionButton { text: "Open note"; glyph: "File"; onClicked: openDialog.open() }
+                ActionButton { glyph: "FloppyDisk"; ToolTip.text: "Save note"; onClicked: studio.saveSafely(); enabled: !viewState.busy }
+                Item { Layout.fillWidth: true }
+                ActionButton { glyph: "MagnifyingGlass"; ToolTip.text: "Find and replace"; onClicked: { studio.setMode("editor"); studio.command("find") } }
+                ActionButton { glyph: "Image"; ToolTip.text: "Insert image or link"; onClicked: studio.command("insert") }
+                ActionButton { glyph: "MathOperations"; ToolTip.text: "Fix LaTeX"; onClicked: studio.command("repair") }
+                ActionButton { glyph: "ShareNetwork"; ToolTip.text: "Share note"; onClicked: { sharing = true; exportDialog.open() } }
+                ActionButton { text: "Export"; glyph: "Export"; prominent: true; enabled: !viewState.busy; onClicked: { sharing = false; exportDialog.open() } }
+                ActionButton { glyph: "GearSix"; ToolTip.text: "Settings"; onClicked: settingsOpen = !settingsOpen }
+            }
+        }
+        ScrollView {
+            width: parent.width
+            height: 48
+            contentHeight: 44
+            ScrollBar.vertical.policy: ScrollBar.AlwaysOff
+            Row {
+                spacing: 4
+                leftPadding: 16
+                Repeater {
+                    model: viewState.tabs
+                    delegate: Rectangle {
+                        required property var modelData
+                        width: Math.min(260, label.implicitWidth + 64)
+                        height: 40
+                        radius: 18
+                        antialiasing: true
+                        color: modelData.id === viewState.active ? viewState.colors["surface-high"] : viewState.colors.surface
+                        RowLayout {
+                            anchors.fill: parent
+                            spacing: 0
+                            ActionButton { id: label; compact: true; text: (modelData.dirty ? "• " : "") + modelData.name; Layout.fillWidth: true; onClicked: studio.selectTab(modelData.id) }
+                            ActionButton { glyph: "X"; compact: true; implicitWidth: 36; Accessible.name: "Close " + modelData.name; ToolTip.text: "Close " + modelData.name; onClicked: studio.closeTabSafely(modelData.id) }
+                        }
+                    }
+                }
+                ActionButton { text: "New tab"; compact: true; onClicked: studio.newNote() }
+            }
+        }
+    }
+    SplitView {
+        anchors.fill: parent
+        orientation: Qt.Horizontal
+        handle: Rectangle { implicitWidth: 6; color: SplitHandle.pressed ? window.Material.primary : "transparent" }
+        Pane {
+            visible: sidebar && !viewState.fullscreen
+            SplitView.preferredWidth: 260
+            SplitView.minimumWidth: 200
+            SplitView.maximumWidth: 500
+            padding: 16
+            ColumnLayout {
+                anchors.fill: parent
+                spacing: 12
+                Label { text: "Your files"; font.pixelSize: 22; font.weight: Font.DemiBold }
+                ActionButton { text: "Open folder"; glyph: "FolderOpen"; tonal: true; Layout.fillWidth: true; onClicked: folderDialog.open() }
+                RowLayout {
+                    visible: !!viewState.folder
+                    Layout.fillWidth: true
+                    Label { text: viewState.folder.split("/").pop(); Layout.fillWidth: true; elide: Text.ElideMiddle }
+                    ToolButton { text: "×"; Accessible.name: "Close folder"; ToolTip.text: "Close folder (notes stay open)"; ToolTip.visible: hovered; onClicked: studio.closeFolder() }
+                }
+                TextField { id: filter; visible: !!viewState.folder; Layout.fillWidth: true; placeholderText: "Filter files"; selectByMouse: true }
+                ListView {
+                    Layout.fillWidth: true
+                    Layout.fillHeight: true
+                    clip: true
+                    model: viewState.files
+                    delegate: ItemDelegate {
+                        required property var modelData
+                        width: ListView.view.width
+                        height: visible ? 42 : 0
+                        visible: !filter.text || modelData.directory || modelData.name.toLowerCase().includes(filter.text.toLowerCase())
+                        leftPadding: 8 + modelData.depth * 16
+                        text: (modelData.directory ? (modelData.expanded ? "▾ " : "▸ ") : "") + modelData.name
+                        onClicked: modelData.directory ? studio.toggleDirectory(modelData.path) : studio.openNote(modelData.path)
+                    }
+                    ScrollBar.vertical: ScrollBar { }
+                }
+                Label { text: "Recent notes"; font.weight: Font.DemiBold }
+                ListView {
+                    Layout.fillWidth: true
+                    Layout.preferredHeight: Math.min(240, viewState.recent.length * 40)
+                    clip: true
+                    model: viewState.recent
+                    delegate: ItemDelegate { required property string modelData; width: ListView.view.width; height: 40; text: modelData.split("/").pop(); onClicked: studio.openNote(modelData); ToolTip.visible: hovered; ToolTip.text: modelData }
+                }
+                Label { visible: !viewState.folder && !viewState.recent.length; text: "Open any folder for quick access. Your notes stay ordinary files."; wrapMode: Text.WordWrap; Layout.fillWidth: true; color: viewState.colors.muted }
+                ActionButton { text: "New window"; Layout.fillWidth: true; onClicked: studio.command("window") }
+            }
+        }
+        Item {
+            SplitView.fillWidth: true
+            ColumnLayout {
+                anchors.fill: parent
+                spacing: 0
+                RowLayout {
+                    visible: !viewState.fullscreen
+                    Layout.fillWidth: true
+                    Layout.margins: 12
+                    ModeGroup { choices: window.width < 1000 ? [{key:"live",label:"Live"},{key:"editor",label:"Source"},{key:"reader",label:"Read"}] : [{key:"live",label:"Live"},{key:"editor",label:"Source"},{key:"reader",label:"Read"},{key:"split",label:"Split"}]; selected: viewState.mode; onChosen: key => studio.setMode(key) }
+                    Item { Layout.fillWidth: true }
+                    ExpressiveSlider { Layout.preferredWidth: window.width < 1000 ? 80 : 140; from: 60; to: 240; value: viewState.zoom; onMoved: studio.setZoom(value); Accessible.name: "Content zoom" }
+                    TextField {
+                        objectName: "zoomPercentage"
+                        Layout.preferredWidth: 76
+                        Layout.preferredHeight: 36
+                        Layout.alignment: Qt.AlignVCenter
+                        text: Math.round(viewState.zoom).toString() + "%"
+                        font.family: "Noto Sans"
+                        font.pixelSize: 13
+                        horizontalAlignment: Text.AlignHCenter
+                        verticalAlignment: Text.AlignVCenter
+                        selectByMouse: true
+                        color: viewState.colors.text
+                        padding: 6
+                        validator: RegularExpressionValidator { regularExpression: /[0-9]{1,3}%?/ }
+                        onEditingFinished: { const value = Number(text.replace("%","")); if (value >= 60 && value <= 240) studio.setZoom(value); else text = Math.round(viewState.zoom) + "%" }
+                        background: Rectangle { radius: 12; antialiasing: true; color: viewState.colors["surface-high"]; border.width: parent.activeFocus ? 2 : 0; border.color: viewState.colors.primary }
+                        Accessible.name: "Zoom percentage"
+                    }
+                    ActionButton { glyph: "ArrowsOut"; compact: true; ToolTip.text: "Fullscreen study"; onClicked: { studio.setFullscreen(true); window.showFullScreen() } }
+                }
+                WebEngineView {
+                    id: reader
+                    objectName: "documentReader"
+                    Layout.fillWidth: true
+                    Layout.fillHeight: true
+                    backgroundColor: window.color
+                    webChannel: WebChannel { id: documentChannel; Component.onCompleted: registerObject("studio", studio) }
+                    settings.localContentCanAccessRemoteUrls: false
+                    settings.localContentCanAccessFileUrls: true
+                    settings.javascriptCanOpenWindows: false
+                    settings.fullScreenSupportEnabled: false
+                    Component.onCompleted: {
+                        const script = WebEngine.script()
+                        script.injectionPoint = WebEngineScript.DocumentCreation
+                        script.worldId = WebEngineScript.MainWorld
+                        script.sourceCode = channelScript
+                        userScripts.insert(script)
+                        url = readerUrl
+                    }
+                    onZoomFactorChanged: {
+                        if (Math.abs(zoomFactor - 1) > .001) {
+                            const factor = zoomFactor
+                            zoomFactor = 1
+                            runJavaScript("window.supermdZoomBy?.(" + factor + ")")
+                        }
+                    }
+                    onNavigationRequested: function(request) {
+                        if (request.url.toString().split("#")[0] !== readerUrl.toString()) {
+                            request.reject()
+                            if (request.url.toString().startsWith("https://") || request.url.toString().startsWith("http://")) Qt.openUrlExternally(request.url)
+                        }
+                    }
+                }
+            }
+            ActionButton { visible: viewState.fullscreen; text: "Exit fullscreen"; anchors.right: parent.right; anchors.top: parent.top; anchors.margins: 12; onClicked: { studio.setFullscreen(false); window.showNormal() } }
+        }
+    }
+    Dialog {
+        id: settingsDialog
+        visible: settingsOpen
+        modal: true
+        anchors.centerIn: parent
+        width: Math.min(640, window.width - 48)
+        height: Math.min(780, window.height - 64)
+        padding: 0
+        background: Rectangle { color: viewState.colors.surface; radius: 28; antialiasing: true }
+        Overlay.modal: Rectangle { color: "#66000000" }
+        enter: Transition { NumberAnimation { property: "opacity"; from: 0; to: 1; duration: viewState.settings.motion ? 160 : 0 } }
+        exit: Transition { NumberAnimation { property: "opacity"; from: 1; to: 0; duration: viewState.settings.motion ? 100 : 0 } }
+        onClosed: settingsOpen = false
+        SettingsPage { viewState: window.viewState; anchors.fill: parent; onBack: settingsOpen = false }
+    }
+    footer: Pane {
+        visible: !viewState.fullscreen
+        padding: 6
+        RowLayout { anchors.fill: parent; Label { text: viewState.busy ? "Preparing document…" : viewState.message || "Local files. Automatic draft recovery."; elide: Text.ElideRight; Layout.fillWidth: true; color: viewState.colors.muted; font.pixelSize: 12 } BusyIndicator { running: viewState.busy; implicitHeight: 20; implicitWidth: 20 } }
+    }
+    FileDialog { id: openDialog; title: "Open note"; nameFilters: ["Notes (*.md *.smd *.fmd *.markdown)", "All files (*)"]; onAccepted: studio.openNote(selectedFile.toString()) }
+    FolderDialog { id: folderDialog; title: "Open folder"; onAccepted: studio.openFolder(selectedFolder.toString()) }
+    FileDialog { id: saveDialog; title: "Save note"; fileMode: FileDialog.SaveFile; nameFilters: ["Markdown (*.md)", "Portable Super MD (*.smd)"]; onAccepted: studio.saveAs(selectedFile.toString()); onRejected: studio.resolveClose("cancel") }
+    FileDialog { id: destination; title: "Export note"; fileMode: FileDialog.SaveFile; nameFilters: outputFormat === "pdf" ? ["PDF (*.pdf)"] : ["Portable Super MD (*.smd)"]; onAccepted: studio.exportTo(selectedFile.toString(), outputFormat) }
+    Dialog {
+        id: exportDialog
+        title: sharing ? "Share note" : "Export note"
+        modal: true
+        anchors.centerIn: parent
+        width: 460
+        standardButtons: Dialog.Cancel
+        ColumnLayout {
+            width: parent.width
+            spacing: 18
+            Label { text: sharing ? "Choose a format. Sharing availability depends on your desktop." : "PDF preserves the layout. Portable SMD includes editable Markdown and images."; wrapMode: Text.WordWrap; Layout.fillWidth: true }
+            ChoiceField { Layout.fillWidth: true; model: viewState.portable && !sharing ? ["PDF"] : ["PDF", "Portable SMD"]; onActivated: outputFormat = currentIndex === 0 ? "pdf" : "smd" }
+            Label { visible: outputFormat === "pdf"; text: "PDF defaults can be changed in Settings, including page numbers."; wrapMode: Text.WordWrap; Layout.fillWidth: true; opacity: .7 }
+            ActionButton { text: sharing ? "Prepare share copy" : "Choose destination"; prominent: true; Layout.fillWidth: true; onClicked: { exportDialog.close(); destination.open() } }
+        }
+        onOpened: outputFormat = "pdf"
+    }
+    Dialog {
+        id: closeDialog
+        modal: true
+        anchors.centerIn: parent
+        width: 440
+        closePolicy: Popup.NoAutoClose
+        ColumnLayout {
+            width: parent.width
+            spacing: 20
+            Label { text: "Save your changes before closing. Cancelling keeps the note open."; Layout.fillWidth: true; wrapMode: Text.WordWrap }
+            RowLayout {
+                ActionButton { text: "Cancel"; onClicked: { closeDialog.close(); studio.resolveClose("cancel") } }
+                ActionButton { text: "Discard"; onClicked: { closeDialog.close(); studio.resolveClose("discard") } }
+                ActionButton { text: "Save"; prominent: true; onClicked: { closeDialog.close(); studio.resolveClose("save") } }
+            }
+        }
+    }
+    Dialog {
+        id: flushDialog
+        property bool canClose: false
+        title: "The document reader is busy"
+        modal: true
+        anchors.centerIn: parent
+        width: Math.min(480,window.width-48)
+        closePolicy: Popup.NoAutoClose
+        ColumnLayout {
+            width: parent.width
+            spacing: 20
+            Label { text: "Retry to synchronize your latest edits. Closing with recovery keeps the last received drafts, but edits still inside the unresponsive reader may be lost."; wrapMode: Text.WordWrap; Layout.fillWidth: true }
+            RowLayout {
+                ActionButton { text: "Cancel"; onClicked: { flushDialog.close(); studio.resolveFlush("cancel") } }
+                ActionButton { visible: flushDialog.canClose; text: "Close with recovery"; onClicked: { flushDialog.close(); studio.resolveFlush("recover_close") } }
+                ActionButton { text: "Retry"; prominent: true; onClicked: { flushDialog.close(); studio.resolveFlush("retry") } }
+            }
+        }
+    }
+    // A dedicated welcome surface rather than a stack of modal setup steps.
+    Pane {
+        visible: !viewState.settings.welcomed
+        anchors.fill: parent
+        padding: 40
+        background: Rectangle { color: window.color }
+        ColumnLayout {
+            anchors.centerIn: parent
+            width: Math.min(600, parent.width - 40)
+            spacing: 24
+            Image { source: studio.brand; sourceSize.width: 64; sourceSize.height: 64; Layout.preferredWidth: 64; Layout.preferredHeight: 64 }
+            Label { text: "Your notes. More room to think."; font.pixelSize: 32; font.weight: Font.DemiBold; Layout.fillWidth: true; wrapMode: Text.WordWrap }
+            Label { text: "Open a Markdown note, or keep images together in a portable .smd. No vault or import process."; Layout.fillWidth: true; wrapMode: Text.WordWrap; font.pixelSize: 17; opacity: .8 }
+            ModeGroup { Layout.fillWidth: true; choices: [{key:"system",label:"System"},{key:"light",label:"Light"},{key:"dark",label:"Dark"},{key:"black",label:"Pure black"}]; selected: viewState.settings.theme; onChosen: key => studio.setting("theme", JSON.stringify(key)) }
+            Switch { text: "Expressive motion"; checked: viewState.settings.motion; onToggled: studio.setting("motion", JSON.stringify(checked)) }
+            RowLayout {
+                ActionButton { text: "Open note"; prominent: true; onClicked: { studio.setting("welcomed", "true"); openDialog.open() } }
+                ActionButton { text: "Explore a sample"; onClicked: studio.setting("welcomed", "true") }
+            }
+            Label { text: "PDFs are typeset locally. Python runs only when you choose Run."; Layout.fillWidth: true; wrapMode: Text.WordWrap; opacity: .7 }
+        }
+    }
+}

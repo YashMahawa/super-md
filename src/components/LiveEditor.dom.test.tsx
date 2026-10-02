@@ -14,3 +14,12 @@ it("has no edit icons and edits clicked content, not links", async () => {
   expect(host.querySelector("textarea")?.value).toContain("# Clear notes");
   act(() => root.unmount()); host.remove();
 });
+it("keeps answer and code disclosure headings interactive in Live mode", async () => {
+  const host = document.createElement("div"); document.body.append(host); const root = createRoot(host);
+  await act(async () => root.render(<LiveEditor markdown={'> [!answer]- Reveal answer\n> Hidden answer\n\n```python\nprint(42)\n```'} documentPath={null} dark python="" onChange={vi.fn()} />));
+  const headings = host.querySelectorAll("summary");
+  expect(headings.length).toBeGreaterThanOrEqual(2);
+  for (const summary of headings) act(() => summary.dispatchEvent(new MouseEvent("click",{bubbles:true,cancelable:true})));
+  expect(host.querySelector("textarea")).toBeNull();
+  act(() => root.unmount()); host.remove();
+});

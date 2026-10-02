@@ -10,6 +10,7 @@ import InteractiveChart from "./InteractiveChart";
 import PythonCell from "./PythonCell";
 import SvgDiagram from "./SvgDiagram";
 import { remarkObsidianMath } from "../obsidianMath";
+import { headingSlug, navigateHeading, remarkHeadingIds } from "../documentNavigation";
 
 const MermaidDiagram = lazy(() => import("./MermaidDiagram"));
 
@@ -24,6 +25,7 @@ export function normalizeCallouts(markdown: string): string {
   const portable = markdown
     .replace(/^---\n[\s\S]*?\n---\n/, "")
     .replace(/!\[\[([^\]|]+)(?:\|([^\]]+))?\]\]/g, (_all, path, label) => `![${label ?? path}](${encodeURI(path)})`)
+    .replace(/\[\[(#[\s\S]*?)\]\]/g, (_all, value: string) => { const [target, label] = value.split("|"); return `[${label || target.slice(1)}](#${headingSlug(target.slice(1))})`; })
     .replace(/\[\[([^\]|]+)(?:\|([^\]]+))?\]\]/g, (_all, target, label) => `[${label ?? target}](${target.endsWith(".md") ? target : `${target}.md`})`);
   const lines = portable.split("\n");
   const output: string[] = [];
@@ -54,12 +56,13 @@ export function remarkCallouts() {
     first.value = first.value.slice(match[0].length).replace(/^\n/, "");
     if (!first.value) paragraph.children.shift();
     if (paragraph.children.length === 0) node.children.shift();
+    const collapsible = Boolean(match[2]) || type === "answer" || type === "solution";
     node.children.unshift({
       type: "paragraph",
-      data: { hProperties: { className: "callout-title" } },
+      data: { hName: collapsible ? "summary" : "p", hProperties: { className: "callout-title" } },
       children: [{ type: "text", value: title }]
     });
-    node.data = { hName: "aside", hProperties: { className: `callout callout-${type}`, "data-callout-type": type } };
+    node.data = { hName: collapsible ? "details" : "aside", hProperties: { ...(collapsible ? {open:match[2] === "+"} : {}), className: `callout callout-${type}`, "data-callout-type": type } };
   });
 }
 
@@ -75,19 +78,29 @@ function AssetImage({ src = "", alt = "", documentPath, trustedImageHosts, onTru
   const [resolved, setResolved] = useState(embedded ? src : "");
   const [error, setError] = useState("");
   const [selected, setSelected] = useState(false);
+  const allowed = allowOnce || trustedImageHosts.includes(host);
+  useEffect(() => { setAllowOnce(false); }, [src]);
   useEffect(() => {
     let active = true;
     setError("");
-    setAllowOnce(false);
-    if (isRemote || embedded) { setResolved(src); return; }
+    if (embedded) { setResolved(src); return; }
     setResolved("");
+    if (isRemote) {
+      if (!allowed) return;
+      // Explicit consent routes through the bounded native fetcher, not a raw
+      // remote request from a local WebEngine page. This also works offline after insertion.
+      invoke<{body:string}>("fetch_resource",{url:src,image:true})
+        .then(value=>{if(active) setResolved(value.body);})
+        .catch(reason=>{if(active) setError(String(reason));});
+      return ()=>{active=false;};
+    }
     if (!documentPath && !/^assets\/import-[\w-]+\./.test(src)) { setError("Save this document to resolve relative images."); return; }
     invoke<string>("load_asset", { documentPath: documentPath || "", source: src })
       .then((value) => { if (active) setResolved(value); })
       .catch((reason) => { if (active) setError(String(reason)); });
     return () => { active = false; };
-  }, [documentPath, embedded, isRemote, src]);
-  if (isRemote && !allowOnce && !trustedImageHosts.includes(host)) return <span className="remote-image-card" role="group" aria-label={`Remote image from ${host}`}><span><strong>{alt || "Remote image"}</strong><small>{host} · blocked until you choose to load it</small></span><span className="remote-image-actions"><button onClick={() => setAllowOnce(true)}>Load image</button><button onClick={() => onTrustImageHost?.(host)}>Trust domain</button></span></span>;
+  }, [documentPath, embedded, isRemote, src, allowed]);
+  if (isRemote && !allowed) return <span className="remote-image-card" role="group" aria-label={`Remote image from ${host}`}><span><strong>{alt || "Remote image"}</strong><small>{host} · blocked until you choose to load it</small></span><span className="remote-image-actions"><button onClick={() => setAllowOnce(true)}>Load image</button>{onTrustImageHost && <button onClick={() => onTrustImageHost(host)}>Trust domain</button>}</span></span>;
   if (error) return <span className="image-error" role="img" aria-label={alt || "Image unavailable"}>Image unavailable: {alt || src}<small>{error}</small></span>;
   if (!resolved) return <span className="image-loading" role="status">Loading image…</span>;
   return <span className={`note-image ${selected ? "is-selected" : ""}`} data-note-image-source={src} tabIndex={0} aria-label={`Image controls: ${alt || "Image"}`} onFocus={() => setSelected(true)} onBlur={(event) => { if (!event.currentTarget.contains(event.relatedTarget)) setSelected(false); }} onClick={(event) => { event.stopPropagation(); setSelected(true); event.currentTarget.focus(); }} onKeyDown={(event) => { if (event.key === "Escape") { setSelected(false); event.stopPropagation(); } }}>
@@ -111,20 +124,20 @@ function MarkdownPreview({ markdown, documentPath, python, dark, trustedImageHos
     <article className="markdown-body">
       <ReactMarkdown
         urlTransform={(url, key, node) => node.tagName === "img" && key === "src" && /^data:image\/(?:png|jpeg|gif|webp|avif|svg\+xml);base64,/i.test(url) ? url : defaultUrlTransform(url)}
-        remarkPlugins={[remarkGfm, remarkMath, remarkObsidianMath, remarkCallouts]}
+        remarkPlugins={[remarkGfm, remarkMath, remarkObsidianMath, remarkCallouts, remarkHeadingIds]}
         rehypePlugins={[rehypeKatex, rehypeHighlight]}
         components={{
           img: ({ src, alt }) => <AssetImage src={src} alt={alt} documentPath={documentPath} trustedImageHosts={trustedImageHosts} onTrustImageHost={onTrustImageHost} />,
-          a: ({ href, children }) => <a href={href} target="_blank" rel="noreferrer">{children}</a>,
+          a: ({ href, children }) => <a href={href} target={href?.startsWith("#") ? undefined : "_blank"} rel="noreferrer" onClick={event => { if (navigateHeading(event.currentTarget)) { event.preventDefault(); event.stopPropagation(); } }}>{children}</a>,
           pre: ({ children }) => {
             const child = Children.only(children) as React.ReactElement<{ className?: string; children?: ReactNode }>;
             const language = child.props.className?.match(/language-([\w-]+)/)?.[1];
             const source = textOf(child.props.children).replace(/\n$/, "");
-            if (language === "smd-chart") return <InteractiveChart source={source} />;
+            if (language === "smd-chart") return <InteractiveChart source={source} dark={dark} />;
             if (language === "svg") return <SvgDiagram source={source} />;
             if (language === "mermaid") return <Suspense fallback={<span className="image-loading" role="status">Loading diagram…</span>}><MermaidDiagram source={source} dark={dark} /></Suspense>;
             if (language === "python" || language === "py") return <PythonCell source={source} python={python} highlighted={child.props.children} />;
-            return <pre>{children}</pre>;
+            return <details className="code-disclosure" open={source.split("\n").length <= 12}><summary>{language || "Code"} <span>{source.split("\n").length} lines</span></summary><pre>{children}</pre></details>;
           }
         }}
       >{normalized}</ReactMarkdown>

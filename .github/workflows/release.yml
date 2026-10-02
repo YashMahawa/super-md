@@ -33,7 +33,7 @@ env:
 jobs:
   prepare:
     runs-on: ubuntu-22.04
-    timeout-minutes: 20
+    timeout-minutes: 50
     outputs:
       release_id: ${{ steps.draft.outputs.release_id }}
       version: ${{ steps.version.outputs.version }}
@@ -69,10 +69,10 @@ jobs:
           if (response.total_count !== response.jobs.length) throw Error('Incomplete build evidence');
           const required = [
             'android',
-            'desktop (ubuntu-22.04, --bundles appimage,deb,rpm)',
-            'desktop (windows-latest, --bundles nsis)',
-            'desktop (macos-latest, --target aarch64-apple-darwin --bundles dmg)',
-            'desktop (macos-latest, --target x86_64-apple-darwin --bundles dmg)',
+            'desktop (ubuntu-22.04, linux)',
+            'desktop (windows-latest, windows)',
+            'desktop (macos-15, macos-arm64)',
+            'desktop (macos-15-intel, macos-x64)',
           ];
           for (const name of required) {
             const jobs = response.jobs.filter(job => job.name === name);
@@ -86,7 +86,7 @@ jobs:
           node --input-type=module <<'NODE'
           import { execFileSync } from 'node:child_process';
           const sha = execFileSync('git', ['rev-parse', 'HEAD'], {encoding:'utf8'}).trim();
-          for (let attempt = 0; attempt < 45; attempt++) {
+          for (let attempt = 0; attempt < 120; attempt++) {
             const runs = JSON.parse(execFileSync('gh', ['run','list','--repo',process.env.GITHUB_REPOSITORY,'--workflow','ci.yml','--commit',sha,'--json','status,conclusion'],{encoding:'utf8'}));
             if (runs.some(run => run.status === 'completed' && run.conclusion === 'success')) process.exit(0);
             if (runs.some(run => run.status === 'completed' && run.conclusion !== 'success')) throw Error('CI failed on the release commit');
@@ -117,13 +117,13 @@ jobs:
       matrix:
         include:
           - platform: ubuntu-22.04
-            args: --bundles appimage,deb,rpm
+            package: linux
           - platform: windows-latest
-            args: --bundles nsis
-          - platform: macos-latest
-            args: --target aarch64-apple-darwin --bundles dmg
-          - platform: macos-latest
-            args: --target x86_64-apple-darwin --bundles dmg
+            package: windows
+          - platform: macos-15
+            package: macos-arm64
+          - platform: macos-15-intel
+            package: macos-x64
     runs-on: ${{ matrix.platform }}
     steps:
       - uses: actions/checkout@v4
@@ -133,32 +133,48 @@ jobs:
         if: matrix.platform == 'ubuntu-22.04'
         run: |
           sudo apt-get update
-          sudo apt-get install -y libwebkit2gtk-4.1-dev libappindicator3-dev librsvg2-dev patchelf xdg-utils
+          sudo apt-get install -y libnss3 libasound2 libxcb-cursor0 libxkbcommon-x11-0 libegl1 libgl1 libfuse2 squashfs-tools rpm ruby-dev build-essential
+          sudo gem install fpm --no-document
+          curl -fL https://github.com/AppImage/appimagetool/releases/download/1.9.1/appimagetool-x86_64.AppImage -o "$RUNNER_TEMP/appimagetool"
+          echo "ed4ce84f0d9caff66f50bcca6ff6f35aae54ce8135408b3fa33abfc3cb384eb0  $RUNNER_TEMP/appimagetool" | sha256sum -c -
+          chmod +x "$RUNNER_TEMP/appimagetool"
+          echo "APPIMAGETOOL=$RUNNER_TEMP/appimagetool" >> "$GITHUB_ENV"
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.13'
+      - run: python -m pip install -r desktop/requirements-build.txt
+      - name: Install Windows installer compiler
+        if: runner.os == 'Windows'
+        shell: bash
+        run: echo 'C:\Program Files (x86)\NSIS' >> "$GITHUB_PATH"
       - uses: actions/setup-node@v4
         with:
           node-version: 22
           cache: npm
       - uses: dtolnay/rust-toolchain@stable
-        with:
-          targets: ${{ matrix.platform == 'macos-latest' && 'aarch64-apple-darwin,x86_64-apple-darwin' || '' }}
       - uses: swatinem/rust-cache@v2
         with:
-          workspaces: ./src-tauri -> target
+          workspaces: ./smd-core -> target
       - run: npm ci
       - run: npm run build
-      - run: npm test
-      - uses: tauri-apps/tauri-action@v1
+      - run: npx vitest run
+      - run: python -m unittest discover -s desktop -p "test_*.py"
         env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          NO_STRIP: "1"
-          APPLE_SIGNING_IDENTITY: "-"
-        with:
-          releaseId: ${{ needs.prepare.outputs.release_id }}
-          tagName: ${{ env.RELEASE_TAG }}
-          releaseName: Super MD ${{ env.RELEASE_TAG }}
-          releaseDraft: true
-          prerelease: false
-          args: ${{ matrix.args }}
+          QT_QPA_PLATFORM: offscreen
+      - run: cargo test --locked --manifest-path smd-core/Cargo.toml
+      - run: cargo build --locked --release --manifest-path smd-core/Cargo.toml --bin smd-engine
+      - run: python desktop/package.py
+      - name: Verify packaged runtime before uploading
+        shell: bash
+        run: |
+          if [ "$RUNNER_OS" = Windows ]; then
+            desktop/dist/super-md/super-md.exe --version
+            desktop/dist/super-md/_internal/resources/desktop/smd-engine.exe doctor
+          else
+            desktop/dist/super-md/super-md --version
+            desktop/dist/super-md/_internal/resources/desktop/smd-engine doctor
+          fi
+          gh release upload "$RELEASE_TAG" desktop/dist/packages/* --clobber
 
   android:
     needs: prepare

@@ -1,55 +1,58 @@
-# Super MD 0.3.0
+# Super MD 0.4.0
 
-## Reading, editing and portability
+## Native desktop controls
 
-- Click a Live block to edit it, without repeated pencil icons.
-- Insert or drop images, including SVG, from files or web addresses. Paste a
-  YouTube link to insert its title, optionally with its thumbnail.
-- Select an image to replace or remove it, with Undo for removal.
-- Open recent files or any ordinary folder. Tabs and recoverable drafts remain
-  independent of vaults and databases.
-- One Export action offers PDF or portable FMD. FMD stores Markdown and images
-  in one editable file; Source mode never displays the image payloads.
-- Obsidian display equations with TeX on the opening/closing dollar lines render
-  without consuming later paragraphs, headings or callouts. Original files are
-  not rewritten to accommodate the parser.
+The desktop window now uses Qt Quick / QML instead of a Tauri host: native tabs,
+file navigation, dialogs, Material-themed controls, settings, sliders and
+expressive press/shape motion. System, light, dark and pure-black color roles
+are contrast checked. Motion can be disabled. The document/editor pane still
+uses Qt WebEngine with the shared Markdown renderer; this is not a claim that
+the entire renderer is browser-free.
 
-## Layout and responsiveness
+- Clear Open note / Open folder actions, hideable sidebar and Close folder.
+- Safe save-before-close handling with a final editor snapshot, ordered recovery
+  writes and a single application process coordinating multiple native windows.
+- Independent normal/fullscreen document zoom, slider and editable percentage.
+- Compact desktop settings dialog, system font choices and aligned, scrollable
+  dropdowns that stay within the settings viewport.
+- Click images for independent zoom/pan, without changing document text zoom.
+- Remote image and video-thumbnail previews use the native consent-gated loader.
 
-- Editable content-zoom percentages, with separate normal/fullscreen zoom.
-- Material filled menus throughout Settings, export and welcome setup; no native
-  browser dropdowns. Official sliders use the current AndroidX handle/track
-  dimensions. Community Expressive buttons and icon controls share theme tokens
-  and reduced-motion support; tonal toolbars and clean rounded reading surfaces
-  replace the dense outlined-panel treatment.
-- Native Android Material 3 Expressive controls, wallpaper-derived colours,
-  themed launcher icon and immersive study mode.
-- Android's closed file drawer no longer steals scrolling and pinch gestures.
-  Phones use Live, Source or Read; sufficiently large tablets also offer Split.
-- Pinch updates are coalesced to display frames. Desktop file dialogs, document
-  I/O, Python and PDF work do not block the window event thread.
+## Notes and interactive learning
 
-## PDF export
+`.md` is plain Markdown. Portable `.smd` stores text and images together while
+keeping asset payloads out of the Source editor. Older text `.smd` and portable
+`.fmd` files remain readable. New exports use `.smd`.
 
-- Shared offline Typst/MiTeX typesetting on desktop and Android. No browser/DOM
-  printing and no external Pandoc or Typst installation.
-- Vector LaTeX, SVG, Mermaid, current interactive-graph values and manually run
-  local Matplotlib figures. Python never runs automatically.
-- Breakable tables with repeated headers, fitted wide equations and multi-page
-  code blocks. Inline math remains inline inside table cells.
-- Page size, font, margins, type size, spacing and optional page numbers.
+- Collapsible answers/callouts and long code blocks; click a Live block to edit.
+- Reviewable, conservative Fix LaTeX suggestions instead of rewriting notes silently.
+- Internal heading links, local/SVG images, Mermaid and explicit Matplotlib cells.
+- Bounded two-dimensional plots and multi-color three-dimensional wireframe
+  surfaces with parameter sliders, camera controls and finite-value checks.
+- AI-ready authoring guide and binary-safe CLI read/inspect/assets/extract/pack commands.
 
-## Downloads
+## PDF and Android
 
-The release includes an optimized, non-debuggable arm64 Android APK plus Linux
-AppImage/DEB/RPM, Windows x64 installer and macOS Apple Silicon/Intel DMGs.
-SHA256SUMS covers the uploaded packages. Desktop installers are not yet
-commercially code-signed/notarized; OS security prompts may appear.
+The embedded Rust/Typst/MiTeX engine typesets PDF offline on desktop and Android;
+it does not print the DOM. Export includes math, images, Mermaid, static graph
+snapshots and figures from Python cells you explicitly ran. Tables and long
+code paginate; wide equations fit; page numbers can be disabled.
 
-The APK preserves the existing sideload upgrade certificate. This is not a Play
-Store signing-key migration. Android requires version 8.0 or later.
+Android retains its native Kotlin/Compose Material 3 Expressive UI, with clearer
+file actions, dedicated settings, more reading fonts, portable-format
+compatibility and the shared image/graph/repair improvements. The APK is an
+optimized, non-debuggable arm64 release and preserves the existing upgrade
+certificate. No on-device phone testing was performed for this update.
 
-Interactive documents remain interactive in Super MD; PDF is a static snapshot.
-Python cells must be run explicitly before their figures are included in PDF.
-The CLI supports offline typesetting and FMD packing; use the app for preparing
-Mermaid and executable Python blocks.
+## Downloads and limitations
+
+Linux AppImage/DEB/RPM, Windows x64 installer, macOS Apple Silicon/Intel DMGs and
+the signed Android release APK are included with SHA256 checksums. Desktop
+packages are not commercially code-signed/notarized; security prompts may appear.
+Linux installers are built on Ubuntu 22.04 for modern compatible distributions.
+
+PDFs are static snapshots. Python is trusted local code, never auto-executed or
+sandboxed. Desktop Share currently prepares an exported copy, rather than
+opening a universal OS share sheet. Headless CLI export does not execute Python
+or render Mermaid; use the app to prepare those outputs. Full TeX packages and
+arbitrary interactive 3D scenes are not supported.

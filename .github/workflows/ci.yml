@@ -22,7 +22,15 @@ jobs:
         if: matrix.platform == 'ubuntu-22.04'
         run: |
           sudo apt-get update
-          sudo apt-get install -y libwebkit2gtk-4.1-dev libappindicator3-dev librsvg2-dev patchelf xdg-utils poppler-utils
+          sudo apt-get install -y libnss3 libasound2 libxcb-cursor0 libxkbcommon-x11-0 libegl1 libgl1 xdg-utils poppler-utils
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.13'
+      - run: python -m pip install -r desktop/requirements-build.txt
+      - name: Test native state, file safety, themes and actual Qt menu geometry
+        run: python -m unittest discover -s desktop -p "test_*.py"
+        env:
+          QT_QPA_PLATFORM: offscreen
       - uses: actions/setup-node@v4
         with:
           node-version: 22
@@ -30,12 +38,24 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - uses: swatinem/rust-cache@v2
         with:
-          workspaces: ./src-tauri -> target
+          workspaces: ./smd-core -> target
       - run: npm ci
       - run: npm run build
       - run: node --test scripts/release-guards.test.mjs
-      - run: npm test
+      - run: npx vitest run
       - run: npm run test:pdf
+      - run: cargo build --locked --release --manifest-path smd-core/Cargo.toml --bin smd-engine
+      - run: python desktop/package.py --bundle-only
+      - name: Check packaged runtime identity and native PDF engine
+        shell: bash
+        run: |
+          if [ "$RUNNER_OS" = Windows ]; then
+            desktop/dist/super-md/super-md.exe --version
+            desktop/dist/super-md/_internal/resources/desktop/smd-engine.exe doctor
+          else
+            desktop/dist/super-md/super-md --version
+            desktop/dist/super-md/_internal/resources/desktop/smd-engine doctor
+          fi
 
   browser:
     runs-on: ubuntu-22.04

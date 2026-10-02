@@ -54,19 +54,19 @@ export function compileMathExpression(source: string): Evaluator {
   const parseUnary = (): Evaluator => {
     if (peek() === "+") { take(); return parseUnary(); }
     if (peek() === "-") { take(); const value = parseUnary(); return (variables) => -value(variables); }
-    return parsePrimary();
+    return parsePower();
   };
   const parsePower = (): Evaluator => {
-    const left = parseUnary();
-    if (peek() === "^" || peek() === "**") { take(); const right = parsePower(); return (variables) => left(variables) ** right(variables); }
+    const left = parsePrimary();
+    if (peek() === "^" || peek() === "**") { take(); const right = parseUnary(); return (variables) => left(variables) ** right(variables); }
     return left;
   };
   const parseMultiplicative = (): Evaluator => {
-    let left = parsePower();
+    let left = parseUnary();
     while (peek() === "*" || peek() === "/" || peek() === "%") {
       const operator = take();
       const previous = left;
-      const right = parsePower();
+      const right = parseUnary();
       left = (variables) => operator === "*" ? previous(variables) * right(variables) : operator === "/" ? previous(variables) / right(variables) : previous(variables) % right(variables);
     }
     return left;

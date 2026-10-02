@@ -24,9 +24,11 @@ export interface PythonResult {
 }
 
 export interface ChartSpec {
+  mode?: "line" | "surface3d";
   title?: string;
   x?: { min: number; max: number; steps?: number; label?: string };
   y?: { min?: number; max?: number; label?: string };
+  z?: { min?: number; max?: number; label?: string };
   series: Array<{
     name?: string;
     expression?: string;

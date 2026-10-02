@@ -1,10 +1,10 @@
 # Super MD
 
-A vault-free Markdown study workspace. `.smd` is ordinary UTF-8 Markdown with opt-in interactive chart and Python blocks. Existing `.md` and Obsidian-style callouts work too.
+A vault-free Markdown study workspace. `.md` is ordinary UTF-8 Markdown with opt-in interactive chart and Python blocks. Portable `.smd` bundles Markdown and images without exposing asset payloads in the editor. Old text `.smd`, portable `.fmd` and Obsidian-style callouts remain readable.
 
 ## Platforms and architecture
 
-- Desktop: Rust/Tauri, the system WebView, React, TypeScript and CodeMirror. No Electron runtime. Linux, macOS and Windows build jobs are included.
+- Desktop: Python/PySide6, Qt Quick/QML native controls and a Qt WebEngine document pane with React, TypeScript and CodeMirror. No Tauri or Electron desktop host. Linux, macOS and Windows build jobs are included.
 - Android: native Kotlin/Jetpack Compose Material 3 Expressive controls around the shared document renderer in the Android system WebView. Not a Tauri Android shell. Android 8+; current release targets ARM64.
 - PDF: an embedded Rust Typst + MiTeX engine shared by desktop and Android. No browser print layout, external executable, network connection or Python service is required for PDF typesetting.
 - Android Python: bundled Python 3.13, NumPy and Matplotlib in a separate app-owned worker process. Desktop Python uses the interpreter or virtual environment you choose.
@@ -21,21 +21,23 @@ PDF settings include A4/A5/Letter/Legal, margins, font, type size, line spacing,
 
 Images can be dropped, pasted, chosen from a picker or inserted from a public HTTPS URL. Android supports cross-app image drops when the source app provides Android URI grants (especially useful in tablet split screen). Pasted web links offer a readable website/video title and an optional YouTube thumbnail. Offline PDF export includes downloaded images, Mermaid and fenced SVG diagrams; GIF/WebP/AVIF images are converted to a static PNG frame. Remote images require consent for viewing and an explicit PDF/FMD export fetches any still-remote images.
 
-Export **portable `.fmd`** to package Markdown and images into one editable, shareable file without binary data in the Source editor. Ordinary Markdown still uses companion assets. Relative Android images require access to the containing folder through **Open any folder**; Android cannot derive arbitrary sibling-file permission from a single-file picker grant. FMD images need no companion-folder permission. See [FORMAT.md](FORMAT.md) for the format and size bounds. Unsupported LaTeX constructs produce a visible export error rather than a silently incomplete PDF. KaTeX and MiTeX are not a full TeX distribution.
+Export **portable `.smd`** to package Markdown and images into one editable, shareable file without binary data in the Source editor. Ordinary Markdown still uses companion assets. Relative Android images require access to the containing folder through **Open folder**; Android cannot derive arbitrary sibling-file permission from a single-file picker grant. Portable images need no companion-folder permission. See [docs/AUTHORING.md](docs/AUTHORING.md) for the current format, features, AI examples and bounds. Unsupported LaTeX constructs produce a visible export error rather than a silently incomplete PDF. KaTeX and MiTeX are not a full TeX distribution.
 
 ## Development and tests
 
-Node 20+, Rust stable, and desktop system dependencies are required. Linux needs GTK 3 and WebKitGTK 4.1 development packages. No Pandoc/Typst installation is needed.
+Node 20+, Rust stable and Python 3.13 are required. Install the pinned desktop requirements into a virtual environment. Linux needs ordinary Qt display/audio/NSS runtime libraries, not WebKitGTK development packages. No Pandoc/Typst installation is needed.
 
 ```sh
 npm ci
-npm run desktop
+python -m venv desktop/.venv
+desktop/.venv/bin/python -m pip install -r desktop/requirements-build.txt
 npm run build
-npm test
+npx vitest run
+desktop/.venv/bin/python -m unittest discover -s desktop -p 'test_*.py'
 npm run test:pdf
-npx playwright install chromium
-npm run test:browser
-npm run package
+cargo build --locked --release --manifest-path smd-core/Cargo.toml --bin smd-engine
+desktop/.venv/bin/python desktop/main.py
+desktop/.venv/bin/python desktop/package.py --bundle-only
 ```
 
 For Android install JDK 17, SDK platform 37, build tools 36, NDK 27.1.12297006, a host Python 3.13, and `rustup target add aarch64-linux-android`. The project script locks concurrent builds, allows the available CPU cores, limits concurrent Cargo jobs to four and Gradle workers to two, and caps the Gradle heap at 1536 MB. Set `SUPERMD_BUILD_CPUS` to restrict CPU affinity when desired.
@@ -50,20 +52,21 @@ npm run android:release
 
 Output: `android/app/build/outputs/apk/release/`. Without signing variables the build artifact is unsigned and must not be distributed. CI publication requires either the distribution signing secrets or a locally signed release APK attached to the draft. It verifies the upgrade certificate, non-debuggable variant, 16-KB alignment and clean tagged source before publishing. macOS desktop packages are ad-hoc signed, not notarized; Windows packages are not code-signed.
 
-Desktop controls use official [Material Web](https://github.com/material-components/material-web) filled menus, sliders and switches, plus MIT-licensed [Banegasn Material 3 buttons and icon buttons](https://github.com/Banegasn/components). Sliders are styled with current AndroidX dimensions. Material Web itself implements Material 3, not the Android Expressive motion system; desktop spring transitions and icon-shape morphs remain an app layer. Android uses native Compose Material 3 Expressive. Bundled UI-library licenses are in `public/third-party-ui-licenses.txt`.
+Desktop controls are independently skinned native Qt Quick Controls, using Google's Material Color Utilities for paired semantic colors. Expressive shape/press motion, grouped controls and sliders are app-level implementations, not a claim that stock Qt implements the complete Expressive specification. Android uses native Compose Material 3 Expressive. The document pane retains Material Web components where appropriate. Redistribution notices are in `desktop/NOTICE.md` and `public/third-party-ui-licenses.txt`.
 
 ## CLI
 
 ```sh
-super-md notes.smd
-super-md export notes.smd -o notes.pdf --page-size A4 --margin 18 \
-  --font 'Libertinus Serif' --font-size 10.5 --line-height 1.35 --no-page-numbers
+super-md notes.md
 super-md doctor
-super-md pack notes.md -o notes.fmd
-super-md export notes.fmd -o notes.pdf --no-page-numbers
+smd-engine read notes.smd --limit 16000
+smd-engine inspect notes.smd
+smd-engine assets notes.smd
+smd-engine pack notes.md notes.smd
+smd-engine export notes.smd notes.pdf
 ```
 
-CLI export supports Markdown/FMD, math, tables, callouts, local/embedded images and static `smd-chart` snapshots using their declared default values. `pack` embeds local images into one FMD while preserving other source; use GUI portable export to download remote images. Use GUI PDF export for Mermaid, fenced SVG and already-executed Python results; CLI never runs code implicitly. Invalid chart/math/image input fails explicitly instead of producing an apparently successful incomplete PDF.
+The binary-safe CLI reads only Markdown by default; images are listed separately and can be extracted to a file. Headless export supports math, tables, callouts and local/embedded images. Use GUI export for prepared graphs, Mermaid, fenced SVG and already-executed Python results; CLI never runs code implicitly. `export-json` accepts prepared text/assets/PDF options over stdin, keeping binary content out of stdout. See [docs/AUTHORING.md](docs/AUTHORING.md) for details.
 
 ## Desktop shortcuts
 
