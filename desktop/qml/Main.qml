@@ -82,7 +82,7 @@ ApplicationWindow {
                 Item { Layout.fillWidth: true }
                 ActionButton { glyph: "MagnifyingGlass"; ToolTip.text: "Find and replace"; onClicked: { studio.setMode("editor"); studio.command("find") } }
                 ActionButton { glyph: "Image"; ToolTip.text: "Insert image or link"; onClicked: studio.command("insert") }
-                ActionButton { glyph: "MathOperations"; ToolTip.text: "Fix LaTeX"; onClicked: studio.command("repair") }
+                ActionButton { glyph: "Bug"; ToolTip.text: "Fix LaTeX"; onClicked: studio.command("repair") }
                 ActionButton { glyph: "ShareNetwork"; ToolTip.text: "Share note"; onClicked: window.showExport(true) }
                 ActionButton { text: "Export"; glyph: "Export"; prominent: true; enabled: !viewState.busy; onClicked: window.showExport(false) }
                 ActionButton { glyph: "GearSix"; ToolTip.text: "Settings"; onClicked: settingsOpen = !settingsOpen }

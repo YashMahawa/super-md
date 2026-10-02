@@ -5,7 +5,7 @@ const commit = "737e3324305806514d7909874fa1818ae1808232";
 const names = {SidebarSimple:"side_navigation", Plus:"add", File:"description",
   FolderOpen:"folder_open", FloppyDisk:"save", MagnifyingGlass:"search",
   Image:"image", GearSix:"settings", Export:"ios_share", ShareNetwork:"share",
-  ArrowsOut:"open_in_full", X:"close", MathOperations:"calculate",
+  ArrowsOut:"open_in_full", X:"close", Bug:"bug_report",
   CaretDown:"expand_more", Check:"check", Fullscreen:"fullscreen", FullscreenExit:"fullscreen_exit"};
 mkdirSync("desktop/icons",{recursive:true});
 for (const [name, symbol] of Object.entries(names)) {

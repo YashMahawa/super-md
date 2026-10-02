@@ -72,7 +72,7 @@ class StudioTest(unittest.TestCase):
         deadline = time.monotonic() + 3
         while not studio.files and time.monotonic() < deadline:
             self.app.processEvents(); time.sleep(.005)
-        self.assertEqual(studio.folder, str(folder))
+        self.assertEqual(studio.folder, str(folder.resolve()))
         self.assertEqual([entry["name"] for entry in studio.files], ["Algebra.md"])
         self.assertEqual([t["id"] for t in studio.tabs], ids)
         self.assertEqual(studio._current()["content"], "Unsaved draft")
@@ -90,7 +90,7 @@ class StudioTest(unittest.TestCase):
         path.write_text("# Open me", encoding="utf-8")
         self.studio.openPath(str(path))
         self.await_idle()
-        self.assertEqual(self.studio._current()["path"], str(path))
+        self.assertEqual(self.studio._current()["path"], str(path.resolve()))
         self.assertEqual(self.studio._current()["content"], "# Open me")
 
     def test_save_then_close_commits_the_file_before_closing(self):
