@@ -5,7 +5,7 @@ import unittest
 from pathlib import Path
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
-from PySide6.QtCore import QUrl, QMetaObject, Q_ARG, QEvent
+from PySide6.QtCore import QUrl, QMetaObject, Q_ARG, QEvent, Qt
 from PySide6.QtGui import QGuiApplication
 from PySide6.QtQml import QQmlEngine, QQmlComponent
 from PySide6.QtTest import QTest
@@ -29,6 +29,8 @@ ApplicationWindow {
     property bool studying: modes.fullscreen
     function study(enabled) { modes.setFullscreen(enabled) }
     WindowModes { id: modes; host: testWindow }
+    Shortcut { sequence: "F11"; onActivated: modes.setFullscreen(!modes.fullscreen) }
+    Shortcut { sequence: "Escape"; enabled: modes.fullscreen; onActivated: modes.setFullscreen(false) }
 }
 ''', QUrl.fromLocalFile(str(Path(__file__).parent / "qml/window-mode-test.qml")))
         self.assertFalse(self.component.isError(), str(self.component.errors()))
@@ -77,3 +79,14 @@ ApplicationWindow {
         self.window.showNormal()
         QTest.qWait(30)
         self.assertFalse(self.window.property("studying"))
+
+    def test_keyboard_fullscreen_and_escape(self):
+        self.window.requestActivate()
+        QTest.qWait(50)
+        QTest.keyClick(self.window, Qt.Key.Key_F11)
+        QTest.qWait(50)
+        self.assertTrue(self.window.property("studying"))
+        QTest.keyClick(self.window, Qt.Key.Key_Escape)
+        QTest.qWait(50)
+        self.assertFalse(self.window.property("studying"))
+        self.expect_visibility(self.window.Visibility.Windowed)

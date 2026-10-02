@@ -154,6 +154,11 @@ the mathematical grid. The current camera and parameter values are remembered
 within the app session and used for the static vector PDF snapshot. A PDF cannot
 retain sliders or a draggable camera.
 
+Pinch or Ctrl/Meta + trackpad wheel over a plot changes only that plot's zoom
+(50–800%), not the note's text size. The Plot zoom slider and Reset zoom provide
+keyboard-accessible alternatives. Zoom is session state and is included in PDF
+snapshots; it does not modify the Markdown or re-evaluate the mathematical grid.
+
 Expressions accept `x`, `y` (surfaces), named slider variables, `pi`, `e`,
 parentheses, `+ - * / % ^ **` and functions `sin cos tan asin acos atan sqrt abs
 exp log log10 floor ceil round min max pow`. `log` is natural logarithm. Explicit

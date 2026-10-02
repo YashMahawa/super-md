@@ -1,4 +1,5 @@
 // Native Qt owns all chrome. Only the document/editor is shared with Android.
+document.documentElement.dataset.host = "qt";
 type QtStudio = { post: (id: string, command: string, args: string) => void; replied: { connect: (callback: (id: string, result: string, error: string) => void) => void } };
 declare global {
   interface Window {

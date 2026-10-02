@@ -4,13 +4,27 @@ import os
 import sys
 import subprocess
 from pathlib import Path
-from PySide6.QtCore import QFile, QIODevice, QUrl, QTimer, QMetaObject, Q_ARG, QObject, QEvent
+from PySide6.QtCore import QFile, QIODevice, QUrl, QTimer, QMetaObject, Q_ARG, QObject, QEvent, Signal
 from PySide6.QtGui import QGuiApplication, QIcon, QFont, QFontDatabase
 from PySide6.QtQml import QQmlApplicationEngine
 from PySide6.QtQuickControls2 import QQuickStyle
 from PySide6.QtWebEngineQuick import QtWebEngineQuick
 from studio import Session, Studio, ROOT
 from instance import InstanceBroker
+
+class StudioApplication(QGuiApplication):
+    openRequested = Signal(str)
+
+    def event(self, event):
+        # Native macOS open events target the application. Do not install a
+        # Python global event filter over Qt Quick/WebEngine's internal objects:
+        # PySide's wrapper creation can itself send events and recurse.
+        if event.type() == QEvent.Type.FileOpen:
+            path = event.file() or (event.url().toLocalFile() if event.url().isLocalFile() else "")
+            if path:
+                self.openRequested.emit(path)
+                return True
+        return super().event(event)
 
 def main():
     if len(sys.argv) > 1 and sys.argv[1] in ("read", "inspect", "assets", "extract", "pack", "export", "export-json", "doctor"):
@@ -37,15 +51,19 @@ def main():
     if args.visual_smoke:
         args.smoke = True
         args.test_state = True
+    if sys.platform.startswith("linux"):
+        # Let Qt use the desktop's portal chooser (including its Wayland parent
+        # handle), not a toolkit-built file/folder browser. The plugin is bundled.
+        os.environ["QT_QPA_PLATFORMTHEME"] = "xdgdesktopportal"
     QQuickStyle.setStyle("Material")
     QtWebEngineQuick.initialize()
-    app = QGuiApplication(sys.argv)
+    QGuiApplication.setApplicationName("super-md-qt" if args.test_state else "super-md")
+    QGuiApplication.setOrganizationName("SuperMD")
+    QGuiApplication.setDesktopFileName("dev.supermd.studio-test" if args.test_state else "dev.supermd.studio")
+    app = StudioApplication(sys.argv)
     for file in (ROOT / "smd-core" / "fonts").glob("NotoSans-*.ttf"):
         QFontDatabase.addApplicationFont(str(file))
     app.setFont(QFont("Noto Sans",11))
-    app.setApplicationName("super-md-qt" if args.test_state else "super-md")
-    app.setOrganizationName("SuperMD")
-    app.setDesktopFileName("dev.supermd.studio-test" if args.test_state else "dev.supermd.studio")
     app.setWindowIcon(QIcon(str(ROOT / "public" / "brand-mark-fixed.svg")))
     broker = None if args.test_state else InstanceBroker(app)
     if broker and not broker.claim_or_forward(args.note):
@@ -91,6 +109,10 @@ def main():
                     valid = all(value in studio.message for value in ('"headings":1','"math":1','"charts":2','"surfaces":1','"answers":1'))
                     zoom = window.findChild(QObject,"zoomPercentage")
                     valid = valid and zoom is not None and zoom.property("height") == 36
+                    fullscreen = window.findChild(QObject,"fullscreenButton")
+                    valid = valid and fullscreen is not None and fullscreen.property("text") == "" and fullscreen.property("availableHeight") >= 24
+                    if fullscreen:
+                        print(f"FULLSCREEN ICON: availableHeight={fullscreen.property('availableHeight')} padding={fullscreen.property('topPadding')}/{fullscreen.property('bottomPadding')}",flush=True)
                     if not valid or not args.visual_smoke:
                         app.exit(0 if valid else 2)
                 else:
@@ -117,9 +139,15 @@ def main():
                 QTimer.singleShot(14500,dropdown)
                 def capture_dropdown():
                     popup = window.findChild(QObject,"readingFontChoicePopup")
+                    scroll = window.findChild(QObject,"settingsScroll")
+                    choice = window.findChild(QObject,"readingFontChoice")
                     capture("font-dropdown")
                     if popup is None or not popup.property("visible"):
                         print("DROPDOWN SMOKE FAILED: menu is not visible",flush=True)
+                        app.exit(2)
+                        return
+                    if scroll.property("width") - choice.property("width") < 24:
+                        print("SCROLL GUTTER SMOKE FAILED: settings controls overlap the scrollbar",flush=True)
                         app.exit(2)
                         return
                     print(f"DROPDOWN SMOKE: y={popup.property('y')} height={popup.property('height')}",flush=True)
@@ -127,9 +155,10 @@ def main():
                 QTimer.singleShot(16000,lambda:studio.setting("theme",'"dark"'))
                 QTimer.singleShot(17000,lambda:capture("dark-settings"))
                 def narrow():
-                    window.setProperty("settingsOpen",False)
+                    changed = window.setProperty("settingsOpen",False)
                     window.setWidth(800)
                     studio.setting("theme",'"black"')
+                    print(f"NARROW SMOKE: settingsChanged={changed} settingsOpen={window.property('settingsOpen')} theme={studio.settings['theme']}",flush=True)
                 QTimer.singleShot(17500,narrow)
                 QTimer.singleShot(19000,lambda:capture("black-narrow"))
                 def surface_view():
@@ -145,9 +174,21 @@ def main():
                     dialog = window.findChild(QObject,"settingsDialog")
                     capture("source")
                     if window.property("settingsOpen") or dialog.property("visible"):
-                        print("SOURCE SMOKE FAILED: settings did not close",flush=True)
+                        print(f"SOURCE SMOKE FAILED: settingsOpen={window.property('settingsOpen')} dialogVisible={dialog.property('visible')} theme={studio.settings['theme']}",flush=True)
                         app.exit(2)
                 QTimer.singleShot(25500,source_capture)
+                QTimer.singleShot(26000,lambda:QMetaObject.invokeMethod(window,"showExport",Q_ARG("QVariant",False)))
+                def export_capture(name):
+                    capture(name)
+                    panel = window.findChild(QObject,"exportPdfControls")
+                    numbers = panel.findChild(QObject,"pdfPageNumbers") if panel else None
+                    if panel is None or not panel.property("visible") or panel.property("width") < 200 or numbers is None or not numbers.property("visible"):
+                        print(f"PDF OPTIONS SMOKE FAILED: panel={panel} numbers={numbers}",flush=True)
+                        app.exit(2)
+                QTimer.singleShot(27500,lambda:export_capture("export-options"))
+                QTimer.singleShot(28000,lambda:QMetaObject.invokeMethod(window,"hideExport"))
+                QTimer.singleShot(29000,lambda:QMetaObject.invokeMethod(window,"showExport",Q_ARG("QVariant",True)))
+                QTimer.singleShot(30500,lambda:export_capture("share-options"))
                 def pdf_result():
                     if studio.message == "Exported native-render.pdf" and report.exists() and report.stat().st_size>10000:
                         print(f"PDF SMOKE PASSED: {report}",flush=True)
@@ -155,12 +196,13 @@ def main():
                     else:
                         print(f"PDF SMOKE FAILED: {studio.message}",flush=True)
                         app.exit(2)
-                QTimer.singleShot(28000,pdf_result)
+                QTimer.singleShot(32000,pdf_result)
         if note:
-            studio.openNote(str(note))
+            studio.openPath(str(note))
     create_window(args.note)
     if broker:
         broker.requested.connect(lambda note: create_window(note or None))
+    app.openRequested.connect(create_window)
     if args.quit_after:
         QTimer.singleShot(args.quit_after, app.quit)
     status = app.exec()

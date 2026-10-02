@@ -41,6 +41,7 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clipToBounds
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.lerp
 import androidx.compose.ui.graphics.toArgb
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.LocalDensity
@@ -77,7 +78,8 @@ class MainActivity : ComponentActivity() {
     val theme = if (state.fullscreen) state.fullscreenTheme else state.theme
     val dark = theme == "dark" || theme == "black" || (theme == "system" && systemDark)
     val context = LocalContext.current
-    var colors = when { Build.VERSION.SDK_INT >= 31 -> if (dark) dynamicDarkColorScheme(context) else dynamicLightColorScheme(context); dark -> darkColorScheme(primary = Color(0xffb2c8ff), secondary = Color(0xffbcc6dc)); else -> lightColorScheme(primary = Color(0xff42669e), secondary = Color(0xff56647c)) }
+    var colors = when { Build.VERSION.SDK_INT >= 31 -> if (dark) dynamicDarkColorScheme(context) else dynamicLightColorScheme(context); dark -> darkColorScheme(primary = Color(0xffb2c8ff), secondary = Color(0xffbcc6dc)); else -> lightColorScheme(primary = Color(0xff42669e), onPrimary = Color.White, primaryContainer = Color(0xffd7e3ff), onPrimaryContainer = Color(0xff162c4c), secondary = Color(0xff56647c), surface = Color(0xfff7f9fd), background = Color(0xfff7f9fd), surfaceContainerLow = Color(0xfff0f3fa), surfaceContainerHigh = Color(0xffe5ebf5)) }
+    if (!dark) colors = colors.copy(surface = lerp(colors.surface, colors.primaryContainer, .12f), background = lerp(colors.background, colors.primaryContainer, .12f), surfaceContainerLow = lerp(colors.surfaceContainerLow, colors.primaryContainer, .08f), onSurface = lerp(colors.onSurface, colors.surface, .14f), outlineVariant = lerp(colors.outlineVariant, colors.surface, .45f))
     if (theme == "black") colors = colors.copy(background = Color.Black, surface = Color.Black, surfaceContainer = Color(0xff101217), surfaceContainerLow = Color(0xff080a0d))
     val systemMotion = remember { android.provider.Settings.Global.getFloat(context.contentResolver, android.provider.Settings.Global.ANIMATOR_DURATION_SCALE, 1f) != 0f }
     MaterialExpressiveTheme(colorScheme = colors, motionScheme = if (state.motion && systemMotion) MotionScheme.expressive() else NoMotionScheme) {

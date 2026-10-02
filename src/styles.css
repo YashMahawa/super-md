@@ -304,6 +304,9 @@ md-filled-button.primary-action, smd-expressive-button.primary-action { display:
 .chart-controls input[type="range"]:focus-visible { outline: 2px solid var(--primary); outline-offset: 3px; border-radius: 12px; }
 .chart-view-actions { display:flex; flex-wrap:wrap; align-items:center; gap:8px; margin:8px 0 16px; }
 .chart-view-actions button { background:var(--surface-high); padding:10px 16px; }
+.chart-view-actions label { display:flex; align-items:center; gap:12px; font-size:13px; }
+.chart-view-actions label input { width:120px; accent-color:var(--primary); }
+.chart-view-actions output { min-width:44px; font-size:13px; font-variant-numeric:tabular-nums; }
 .chart-view-actions button[aria-pressed="true"] { background:var(--primary); color:var(--on-primary); }
 .chart-view-actions small { color:var(--muted); line-height:1.5; }
 .chart-legend { color:var(--text); }

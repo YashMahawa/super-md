@@ -20,11 +20,15 @@ Pane {
         }
         ScrollView {
             id: settingsScroll
+            objectName: "settingsScroll"
             Layout.fillWidth: true
             Layout.fillHeight: true
             contentWidth: availableWidth
+            rightPadding: 24
+            ScrollBar.horizontal.policy: ScrollBar.AlwaysOff
+            ScrollBar.vertical: ExpressiveScrollBar { parent: settingsScroll; x: settingsScroll.width - width; y: 0; height: settingsScroll.height }
             ColumnLayout {
-                width: parent.width
+                width: settingsScroll.availableWidth
                 spacing: 16
                 Label { text: "Appearance"; font.pixelSize: 22; font.weight: Font.DemiBold }
                 Label { text: "System follows your desktop colors. Fullscreen can have a different theme."; wrapMode: Text.WordWrap; Layout.fillWidth: true; color: viewState.colors.muted }
@@ -46,15 +50,7 @@ Pane {
                 TextField { Layout.fillWidth: true; text: viewState.settings.python; selectByMouse: true; onEditingFinished: page.save("python", text) }
                 Label { text: "Code runs only when you press Run. Use a Python environment with matplotlib installed. Local Python code is not sandboxed."; Layout.fillWidth: true; wrapMode: Text.WordWrap; color: viewState.colors.muted }
                 Label { text: "PDF defaults"; font.pixelSize: 22; font.weight: Font.DemiBold; Layout.topMargin: 12 }
-                Label { text: "Page size" }
-                ChoiceField { viewportItem: settingsScroll.contentItem; Accessible.name: "PDF page size"; Layout.fillWidth: true; model: ["a4", "a5", "letter", "legal"]; currentIndex: model.indexOf(viewState.settings.pdf.pageSize); onActivated: { const options = Object.assign({}, viewState.settings.pdf); options.pageSize = currentText; page.save("pdf", options) } }
-                Label { text: "PDF font" }
-                ChoiceField { viewportItem: settingsScroll.contentItem; Accessible.name: "PDF font"; Layout.fillWidth: true; model: ["Noto Sans", "Libertinus Serif", "New Computer Modern", "DejaVu Sans Mono"]; currentIndex: model.indexOf(viewState.settings.pdf.fontFamily); onActivated: { const options = Object.assign({}, viewState.settings.pdf); options.fontFamily = currentText; page.save("pdf", options) } }
-                Label { text: "Margins: " + Math.round(viewState.settings.pdf.margin) + " mm" }
-                ExpressiveSlider { Layout.fillWidth: true; from: 4; to: 60; stepSize: 1; value: viewState.settings.pdf.margin; onMoved: { const options = Object.assign({}, viewState.settings.pdf); options.margin = value; page.save("pdf", options) } }
-                Label { text: "PDF text: " + viewState.settings.pdf.fontSize + " pt" }
-                ExpressiveSlider { Layout.fillWidth: true; from: 7; to: 24; stepSize: .5; value: viewState.settings.pdf.fontSize; onMoved: { const options = Object.assign({}, viewState.settings.pdf); options.fontSize = value; page.save("pdf", options) } }
-                Switch { text: "Page numbers"; checked: viewState.settings.pdf.pageNumbers; onToggled: { const options = Object.assign({}, viewState.settings.pdf); options.pageNumbers = checked; page.save("pdf", options) } }
+                PdfControls { Layout.fillWidth: true; viewportItem: settingsScroll.contentItem; options: viewState.settings.pdf; onEdited: options => page.save("pdf", options) }
                 Item { height: 24 }
             }
         }

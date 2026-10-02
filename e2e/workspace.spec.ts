@@ -40,7 +40,7 @@ test("Android shares math, callouts, graphs and portable PDF preparation", async
   await expect(page.locator(".python-cell pre code")).toBeVisible();
   await expect(page.locator(".python-cell pre code")).toHaveCSS("color", "rgb(238, 237, 244)");
   await expect(page.locator(".python-cell .hljs-string")).toContainText("local-python-ok");
-  await expect(page.locator(".mermaid svg")).toBeVisible(); await page.locator("input[type=range]").fill("1.98");
+  await expect(page.locator(".mermaid svg")).toBeVisible(); await page.locator(".chart-controls input[type=range]").fill("1.98");
   await page.getByRole("button", { name: "Run" }).click(); await expect(page.locator(".cell-output")).toContainText("local-python-ok");
   await page.evaluate(() => window.supermdExport?.({ pageSize: "a4", margin: 18, fontSize: 11, fontFamily: "Libertinus Serif", lineHeight: 1.35, pageNumbers: false }));
   expect(requests.find((item) => item.command === "export_failed")).toBeUndefined();
@@ -81,7 +81,58 @@ test("Source mode preserves wrapping, caret status, code folds and undo across v
   await expect(page.locator(".cm-content")).toHaveCSS("white-space","pre");
   await page.locator(".cm-content").click(); await page.keyboard.press("Control+z");
   await expect(page.locator(".cm-content")).not.toContainText("Saved selection");
+  // The syntax palette must not override Material/system editor surfaces.
+  await page.evaluate(content => window.supermdLoad?.({id:"source-ui-test",content,path:null,mode:"editor",dark:true,fullscreen:false,colors:{surface:"#170e09",text:"#ffe8d9"},font:"sans",size:18,zoom:100}),content);
+  await expect(page.locator(".cm-editor")).toHaveCSS("background-color","rgb(23, 14, 9)");
+  await expect(page.locator(".cm-gutters")).toHaveCSS("background-color","rgb(23, 14, 9)");
+  await page.evaluate(content => window.supermdLoad?.({id:"source-ui-test",content,path:null,mode:"editor",dark:false,fullscreen:false,colors:{surface:"#fff8f5",text:"#201a17"},font:"sans",size:18,zoom:100}),content);
+  await expect(page.locator(".cm-editor")).toHaveCSS("background-color","rgb(255, 248, 245)");
+  await expect(page.getByRole("button", {name:"Wrap lines"})).toHaveAttribute("aria-pressed","false");
   await page.screenshot({path:test.info().outputPath("source-workspace.png")});
+});
+
+test("plot pinch and trackpad zoom are independent of document text and export the selected view", async ({page}) => {
+  const requests: Array<{command:string;args:any}> = [];
+  await page.exposeFunction("bridgePost", (id:string,command:string,raw:string) => {
+    requests.push({command,args:JSON.parse(raw)});
+    void page.evaluate(id=>window.supermdReply?.(id,true,null),id);
+  });
+  await page.addInitScript(()=> { window.SuperMD={post:(id,command,args)=>(window as any).bridgePost(id,command,args)}; });
+  await page.goto("/android-reader.html");
+  const line=JSON.stringify({title:"Line plot",series:[{expression:"sin(x)"}]});
+  const surface=JSON.stringify({mode:"surface3d",title:"Surface plot",series:[{expression:"x^2+y^2"}],x:{min:-2,max:2,steps:12},y:{min:-2,max:2}});
+  const content=`# Plots\n\n\`\`\`smd-chart\n${line}\n\`\`\`\n\n\`\`\`smd-chart\n${surface}\n\`\`\``;
+  await page.evaluate(content=>window.supermdLoad?.({id:"plot-zoom",content,path:null,mode:"reader",dark:false,fullscreen:false,colors:{},font:"sans",size:18,zoom:100}),content);
+  const plots=page.locator(".interactive-chart"); await expect(plots).toHaveCount(2);
+  for (let index=0;index<2;index++) {
+    await plots.nth(index).locator("svg").evaluate(target=> {
+      const touches=(x:number)=>[new Touch({identifier:1,target,clientX:60,clientY:140}),new Touch({identifier:2,target,clientX:x,clientY:140})];
+      target.dispatchEvent(new TouchEvent("touchstart",{bubbles:true,cancelable:true,touches:touches(160)}));
+      target.dispatchEvent(new TouchEvent("touchmove",{bubbles:true,cancelable:true,touches:touches(240)}));
+      target.dispatchEvent(new TouchEvent("touchend",{bubbles:true,touches:[]}));
+    });
+    await expect(plots.nth(index)).toHaveAttribute("data-plot-zoom","1.8");
+    expect(await page.evaluate(()=>getComputedStyle(document.documentElement).getPropertyValue("--workspace-scale"))).toBe("1");
+  }
+  await plots.first().locator("svg").dispatchEvent("wheel",{ctrlKey:true,deltaY:-120});
+  await expect.poll(()=>plots.first().getAttribute("data-plot-zoom").then(Number)).toBeGreaterThan(1.8);
+  expect(requests.some(request=>request.command==="zoom_changed")).toBe(false);
+  await page.evaluate(()=>window.supermdExport?.({pageSize:"a4",margin:18,fontSize:11,fontFamily:"Noto Sans",lineHeight:1.35,pageNumbers:false}));
+  await expect.poll(()=>requests.some(request=>request.command==="export_pdf_native")).toBeTruthy();
+  const exported=requests.find(request=>request.command==="export_pdf_native")!.args;
+  expect(Object.keys(exported.assets)).toHaveLength(2);
+  const snapshots=Object.values(exported.assets).map(asset=>Buffer.from(asset as string,"base64").toString());
+  expect(snapshots.some(svg=>svg.includes("Plot zoom: 180%"))).toBe(true);
+  expect(snapshots.some(svg=>svg.includes("clip-path=\"url(#surface-") && svg.includes('height="440"'))).toBe(true);
+  await plots.first().getByRole("button",{name:"Reset zoom",exact:true}).click();
+  await expect(plots.first()).toHaveAttribute("data-plot-zoom","1");
+  await expect(plots.nth(1)).toHaveAttribute("data-plot-zoom","1.8");
+  // A previously focused chart must not also zoom when the pointer is over another.
+  await plots.nth(1).getByRole("slider",{name:"Plot zoom"}).focus();
+  await plots.first().locator("svg").hover();
+  await page.evaluate(()=>window.dispatchEvent(new CustomEvent("supermd-chart-native-zoom",{detail:2,cancelable:true})));
+  await expect(plots.first()).toHaveAttribute("data-plot-zoom","2");
+  await expect(plots.nth(1)).toHaveAttribute("data-plot-zoom","1.8");
 });
 
 test("click-to-edit, media drops, titled links and portable source work together", async ({ page }) => {

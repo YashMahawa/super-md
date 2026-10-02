@@ -23,6 +23,10 @@ Section "Super MD" main
   WriteRegStr HKCU "Software\Classes\.smd\OpenWithProgids" "SuperMD.Note" ""
   WriteRegStr HKCU "Software\Classes\.fmd\OpenWithProgids" "SuperMD.Note" ""
   WriteRegStr HKCU "Software\Classes\.md\OpenWithProgids" "SuperMD.Note" ""
+  WriteRegStr HKCU "Software\Classes\Directory\shell\SuperMD.OpenFolder" "" "Open folder with Super MD"
+  WriteRegStr HKCU "Software\Classes\Directory\shell\SuperMD.OpenFolder\command" "" '$\"$INSTDIR\super-md.exe$\" $\"%1$\"'
+  WriteRegStr HKCU "Software\Classes\Directory\Background\shell\SuperMD.OpenFolder" "" "Open folder with Super MD"
+  WriteRegStr HKCU "Software\Classes\Directory\Background\shell\SuperMD.OpenFolder\command" "" '$\"$INSTDIR\super-md.exe$\" $\"%V$\"'
   WriteRegStr HKCU "Software\Microsoft\Windows\CurrentVersion\Uninstall\SuperMD" "DisplayName" "Super MD"
   WriteRegStr HKCU "Software\Microsoft\Windows\CurrentVersion\Uninstall\SuperMD" "DisplayVersion" "${VERSION}"
   WriteRegStr HKCU "Software\Microsoft\Windows\CurrentVersion\Uninstall\SuperMD" "UninstallString" '$\"$INSTDIR\Uninstall.exe$\"'
@@ -35,6 +39,8 @@ Section "Uninstall"
   DeleteRegValue HKCU "Software\Classes\.md\OpenWithProgids" "SuperMD.Note"
   DeleteRegKey HKCU "Software\Classes\SuperMD.Note"
   DeleteRegKey HKCU "Software\Classes\Applications\super-md.exe"
+  DeleteRegKey HKCU "Software\Classes\Directory\shell\SuperMD.OpenFolder"
+  DeleteRegKey HKCU "Software\Classes\Directory\Background\shell\SuperMD.OpenFolder"
   RMDir /r "$INSTDIR\_internal"
   Delete "$INSTDIR\super-md.exe"
   Delete "$INSTDIR\Uninstall.exe"

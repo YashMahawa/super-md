@@ -44,4 +44,5 @@ if sys.platform == "darwin":
             "CFBundleShortVersionString": version, "CFBundleVersion": version,
             "NSHighResolutionCapable": True,
             "CFBundleDocumentTypes": [{"CFBundleTypeName": "Super MD note", "CFBundleTypeRole": "Editor",
-                                      "CFBundleTypeExtensions": ["md", "markdown", "smd", "fmd"]}]})
+                                      "CFBundleTypeExtensions": ["md", "markdown", "smd", "fmd"]},
+                                     {"CFBundleTypeName": "Folder", "CFBundleTypeRole": "Viewer", "LSItemContentTypes": ["public.folder"]}]})

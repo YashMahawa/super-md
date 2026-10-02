@@ -69,7 +69,8 @@ export async function preparePdf(markdown: string, documentPath: string | null) 
             graph.append(key);
             for(const line of wrap(label)) {svgText(line.trim(),44,cursor);cursor+=18;}
           }
-          const selected=Array.from(parsed.querySelectorAll(".chart-controls label")).map(label=>(label.textContent||"").trim()).join(" · ");
+          const plotZoom=Number(parsed.querySelector(".interactive-chart")?.getAttribute("data-plot-zoom")||1);
+          const selected=[...Array.from(parsed.querySelectorAll(".chart-controls label")).map(label=>(label.textContent||"").trim()),`Plot zoom: ${Math.round(plotZoom*100)}%`].join(" · ");
           if(selected) for(const line of wrap(selected)) {svgText(line.trim(),20,cursor+4);cursor+=18;}
           graph.setAttribute("viewBox",`${box[0]} ${box[1]} ${box[2]} ${cursor+10}`);
           return new XMLSerializer().serializeToString(graph);

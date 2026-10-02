@@ -2,7 +2,7 @@
 import hashlib
 import json
 from pathlib import Path
-from PySide6.QtCore import QObject, Signal, QLockFile, QStandardPaths, QTimer
+from PySide6.QtCore import QObject, Signal, QLockFile, QStandardPaths, QTimer, QUrl
 from PySide6.QtNetwork import QLocalServer, QLocalSocket
 
 
@@ -31,7 +31,9 @@ class InstanceBroker(QObject):
         socket.connectToServer(self.name)
         if not socket.waitForConnected(2000):
             raise RuntimeError("Super MD is starting or busy. Please try opening the note again.")
-        socket.write(json.dumps({"note": str(Path(note).resolve()) if note else ""}).encode() + b"\n")
+        url = QUrl(note or "")
+        local = url.toLocalFile() if url.isLocalFile() else note
+        socket.write(json.dumps({"note": str(Path(local).resolve()) if local else ""}).encode() + b"\n")
         socket.waitForBytesWritten(1000)
         if not socket.waitForReadyRead(2000) or bytes(socket.readAll()) != b"ok\n":
             raise RuntimeError("The existing Super MD process did not acknowledge the new window")

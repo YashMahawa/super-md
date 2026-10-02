@@ -70,7 +70,7 @@ ComboBox {
         height: 24
         rotation: control.popup.visible ? 180 : 0
         // Qt's IconLabel handles SVG tinting without rasterizing at a fixed display scale.
-        ToolButton { anchors.fill: parent; focusPolicy: Qt.NoFocus; padding: 0; icon.source: "../icons/CaretDown.svg"; icon.color: control.colors.text; icon.width: 20; icon.height: 20; background: null; onClicked: control.popup.visible ? control.popup.close() : control.revealChoices() }
+        ToolButton { anchors.fill: parent; focusPolicy: Qt.NoFocus; padding: 0; icon.source: "../icons/CaretDown.svg"; icon.color: control.colors.text; icon.width: 24; icon.height: 24; background: null; onClicked: control.popup.visible ? control.popup.close() : control.revealChoices() }
         Behavior on rotation { enabled: control.motion; NumberAnimation { duration: 160; easing.type: Easing.OutCubic } }
     }
     background: Rectangle {

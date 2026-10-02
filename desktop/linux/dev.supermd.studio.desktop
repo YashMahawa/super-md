@@ -7,6 +7,6 @@ TryExec=super-md
 Icon=super-md
 Terminal=false
 Categories=Utility;TextEditor;
-MimeType=text/markdown;text/x-markdown;text/x-supermarkdown;application/vnd.supermd.smd;application/vnd.supermd.fmd;
+MimeType=text/markdown;text/x-markdown;text/x-supermarkdown;application/vnd.supermd.smd;application/vnd.supermd.fmd;inode/directory;
 StartupNotify=true
 StartupWMClass=dev.supermd.studio

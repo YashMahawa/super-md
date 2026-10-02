@@ -68,6 +68,7 @@ class Studio(QObject):
     allowClose = Signal()
     newWindowRequested = Signal()
     exportRequested = Signal(str)
+    folderPickerRequested = Signal()
     flushFailed = Signal(bool)
 
     def __init__(self, isolated: bool = False, session: Session | None = None):
@@ -256,8 +257,43 @@ class Studio(QObject):
         self._submit(lambda: atomic_write(self.data / "recovery.json", payload), lambda *_: None, False,self.writes)
 
     @Slot(str)
+    def openPath(self, value):
+        path = local_path(value)
+        if path.is_dir():
+            self.openFolder(str(path))
+        else:
+            self.openNote(str(path))
+
+    @Slot()
+    def chooseFolder(self):
+        if not sys.platform.startswith("linux"):
+            self.folderPickerRequested.emit()
+            return
+        if getattr(self, "_folder_check", None) is not None:
+            return
+        from PySide6.QtDBus import QDBusConnection, QDBusMessage, QDBusPendingCallWatcher, QDBusVariant
+        message = QDBusMessage.createMethodCall("org.freedesktop.portal.Desktop", "/org/freedesktop/portal/desktop", "org.freedesktop.DBus.Properties", "Get")
+        message.setArguments(["org.freedesktop.portal.FileChooser", "version"])
+        self._folder_check = watcher = QDBusPendingCallWatcher(QDBusConnection.sessionBus().asyncCall(message, 3000), self)
+        def finished(call):
+            reply = call.reply()
+            values = reply.arguments()
+            version = values[0].variant() if values and isinstance(values[0], QDBusVariant) else (values[0] if values else 0)
+            self._folder_check = None
+            call.deleteLater()
+            if reply.type() == QDBusMessage.MessageType.ReplyMessage and isinstance(version, int) and version >= 3:
+                self.folderPickerRequested.emit()
+            else:
+                self.message = "The system folder picker is unavailable. Enable an XDG desktop portal file chooser, or open a folder with Super MD from your file manager."
+                self._emit(False)
+        watcher.finished.connect(finished)
+
+    @Slot(str)
     def openNote(self, value):
         path = local_path(value)
+        if path.is_dir():
+            self.openFolder(str(path))
+            return
         found = next((t for t in self.tabs if t["path"] == str(path)), None)
         if found:
             self.selectTab(found["id"])
@@ -269,6 +305,7 @@ class Studio(QObject):
             note = self._note(path.name, content, str(path), content, assets, portable)
             self.tabs.append(note)
             self.active = note["id"]
+            self.settings["welcomed"] = True
             self.recent = [str(path)] + [p for p in self.recent if p != str(path)][:29]
             self._preferences()
             self._emit()
@@ -289,8 +326,16 @@ class Studio(QObject):
 
     @Slot(str)
     def openFolder(self, value):
-        self.folder = str(local_path(value))
+        path = local_path(value)
+        if not path.is_dir():
+            self.message = "Choose an existing local folder."
+            self._emit(False)
+            return
+        self.folder = str(path)
+        self.settings["welcomed"] = True
         self.expanded = {self.folder}
+        self._preferences()
+        self._emit(False)
         self._load_tree()
 
     def _load_tree(self):

@@ -5,6 +5,7 @@ import unittest
 from pathlib import Path
 os.environ.setdefault("QT_QPA_PLATFORM","offscreen")
 from PySide6.QtGui import QGuiApplication
+from PySide6.QtCore import QUrl
 from studio import Session, Studio
 
 class QuietStudio(Studio):
@@ -59,6 +60,38 @@ class StudioTest(unittest.TestCase):
         studio.resolveClose("discard")
         self.assertEqual(closed,[True])
         self.assertTrue(studio.requestWindowClose())
+
+    def test_open_with_folder_routes_to_sidebar_without_discarding_notes(self):
+        studio = self.studio
+        folder = studio.data / "Notes with spaces Ω"
+        folder.mkdir()
+        (folder / "Algebra.md").write_text("# Algebra")
+        ids = [t["id"] for t in studio.tabs]
+        studio._current()["content"] = "Unsaved draft"
+        studio.openPath(QUrl.fromLocalFile(str(folder)).toString())
+        deadline = time.monotonic() + 3
+        while not studio.files and time.monotonic() < deadline:
+            self.app.processEvents(); time.sleep(.005)
+        self.assertEqual(studio.folder, str(folder))
+        self.assertEqual([entry["name"] for entry in studio.files], ["Algebra.md"])
+        self.assertEqual([t["id"] for t in studio.tabs], ids)
+        self.assertEqual(studio._current()["content"], "Unsaved draft")
+        self.assertTrue(studio.settings["welcomed"])
+
+    def test_invalid_folder_does_not_clear_the_existing_folder(self):
+        studio = self.studio
+        studio.folder = str(studio.data)
+        studio.openFolder(str(studio.data / "missing"))
+        self.assertEqual(studio.folder, str(studio.data))
+        self.assertIn("existing local folder", studio.message)
+
+    def test_open_with_note_still_opens_markdown(self):
+        path = self.studio.data / "A note.md"
+        path.write_text("# Open me", encoding="utf-8")
+        self.studio.openPath(str(path))
+        self.await_idle()
+        self.assertEqual(self.studio._current()["path"], str(path))
+        self.assertEqual(self.studio._current()["content"], "# Open me")
 
     def test_save_then_close_commits_the_file_before_closing(self):
         studio = self.studio

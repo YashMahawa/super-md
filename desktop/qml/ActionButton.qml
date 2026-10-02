@@ -19,9 +19,13 @@ Button {
     bottomInset: 0
     leftPadding: text.length ? 16 : 10
     rightPadding: text.length ? 16 : 10
+    // Stock Material padding assumes a 48px button. Preserve the icon's actual
+    // size inside our compact 36px controls instead of shrinking it to ~8px.
+    topPadding: compact ? 6 : 10
+    bottomPadding: compact ? 6 : 10
     icon.source: glyph ? "../icons/" + glyph + ".svg" : ""
-    icon.width: 20
-    icon.height: 20
+    icon.width: 24
+    icon.height: 24
     icon.color: Material.foreground
     Accessible.name: ToolTip.text || text
     Material.roundedScale: Material.FullScale

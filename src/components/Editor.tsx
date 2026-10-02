@@ -5,7 +5,7 @@ import { defaultKeymap, history, historyKeymap, indentWithTab } from "@codemirro
 import { markdown, markdownLanguage } from "@codemirror/lang-markdown";
 import { syntaxHighlighting, defaultHighlightStyle, foldGutter, foldKeymap } from "@codemirror/language";
 import { searchKeymap, highlightSelectionMatches, openSearchPanel } from "@codemirror/search";
-import { oneDark } from "@codemirror/theme-one-dark";
+import { oneDarkHighlightStyle } from "@codemirror/theme-one-dark";
 
 interface Props {
   sessionId?: string;
@@ -36,7 +36,7 @@ export default function Editor({ sessionId = "default", value, onChange, dark, f
     if (position.current) position.current.textContent = `Ln ${line.number}, Col ${main.head - line.from + 1}${state.selection.ranges.length > 1 ? ` · ${state.selection.ranges.length} cursors` : selected ? ` · ${selected} selected` : ""}`;
   };
   statusHandlers.set(sessionId, describeSelection);
-  const editorTheme = () => [ ...(dark ? [oneDark] : []), EditorView.theme({
+  const editorTheme = () => [ ...(dark ? [syntaxHighlighting(oneDarkHighlightStyle)] : []), EditorView.theme({
     "&": { height: "100%", background: "var(--surface)", color: "var(--text)" },
     ".cm-scroller": { fontFamily: "var(--mono)", fontSize: "calc(var(--editor-size) * var(--workspace-scale, 1))", lineHeight: "var(--editor-leading)", padding: focusMode ? "8vh 0 36vh" : "24px 0 38vh", scrollbarWidth: "thin", scrollbarColor: "var(--outline) transparent" },
     ".cm-content": { maxWidth: focusMode ? "var(--reading-max-width, none)" : "none", margin: focusMode ? "0 auto" : "0", padding: "0 24px", caretColor: "var(--primary)" },
@@ -49,7 +49,7 @@ export default function Editor({ sessionId = "default", value, onChange, dark, f
     ".cm-selectionBackground": { background: "color-mix(in srgb, var(--primary) 25%, transparent) !important" },
     ".cm-foldGutter .cm-gutterElement": { cursor: "pointer", color: "var(--muted)" },
     ".cm-foldPlaceholder": { background: "var(--surface-high)", color: "var(--text)", border: "none", borderRadius: "6px", padding: "0 8px" }
-  }) ];
+  }, { dark }) ];
 
   useEffect(() => {
     if (!host.current) return;

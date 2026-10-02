@@ -20,3 +20,9 @@ The package contains the license files supplied with the redistributed wheels
 and the existing third-party UI notices. NumPy wheel licenses are retained by
 the PyInstaller NumPy hook. The QML controls are independently implemented;
 desktop-shell reference code is not included.
+
+The SVG toolbar/navigation icons in desktop/icons are unmodified Google Material
+Symbols Rounded, weight 600 (Apache-2.0), downloaded from google/material-design-icons commit
+737e3324305806514d7909874fa1818ae1808232. Their license is bundled in
+licenses/qt/Material-Symbols-Apache-2.0.txt.
+Source: https://github.com/google/material-design-icons/tree/737e3324305806514d7909874fa1818ae1808232/symbols/web

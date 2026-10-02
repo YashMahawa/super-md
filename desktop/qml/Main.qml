@@ -27,6 +27,8 @@ ApplicationWindow {
         onFullscreenChanged: studio.setFullscreen(fullscreen)
     }
     function runDocumentScript(script) { reader.runJavaScript(script) }
+    function showExport(share) { sharing = share; exportDialog.open() }
+    function hideExport() { exportDialog.close() }
     Material.theme: viewState.dark ? Material.Dark : Material.Light
     Material.primary: viewState.colors.primary
     Material.accent: viewState.colors.primary
@@ -43,6 +45,7 @@ ApplicationWindow {
         function onCloseRequested(name) { closeDialog.title = "Save changes to " + name + "?"; closeDialog.open() }
         function onSaveRequested(name) { saveDialog.selectedFile = studio.defaultSaveLocation(name); saveDialog.open() }
         function onExportRequested(format) { outputFormat = format; exportDialog.open() }
+        function onFolderPickerRequested() { folderDialog.open() }
         function onReaderLoad(payload) { reader.runJavaScript("window.supermdLoad?.(" + payload + ")") }
         function onReaderCall(script) { reader.runJavaScript(script) }
     }
@@ -55,6 +58,7 @@ ApplicationWindow {
     Shortcut { sequence: "Ctrl+,"; onActivated: settingsOpen = !settingsOpen }
     Shortcut { sequence: "F11"; onActivated: windowModes.setFullscreen(!windowModes.fullscreen) }
     Shortcut { sequence: "Escape"; enabled: settingsOpen; onActivated: settingsOpen = false }
+    Shortcut { sequence: "Escape"; enabled: windowModes.fullscreen && !settingsOpen; onActivated: windowModes.setFullscreen(false) }
     // Qt's chrome never scales. Keyboard/pinch zoom is routed to the content pane.
     Shortcut { sequence: "Ctrl++"; onActivated: reader.runJavaScript("window.supermdZoomBy?.(1.1)") }
     Shortcut { sequence: "Ctrl+="; onActivated: reader.runJavaScript("window.supermdZoomBy?.(1.1)") }
@@ -79,8 +83,8 @@ ApplicationWindow {
                 ActionButton { glyph: "MagnifyingGlass"; ToolTip.text: "Find and replace"; onClicked: { studio.setMode("editor"); studio.command("find") } }
                 ActionButton { glyph: "Image"; ToolTip.text: "Insert image or link"; onClicked: studio.command("insert") }
                 ActionButton { glyph: "MathOperations"; ToolTip.text: "Fix LaTeX"; onClicked: studio.command("repair") }
-                ActionButton { glyph: "ShareNetwork"; ToolTip.text: "Share note"; onClicked: { sharing = true; exportDialog.open() } }
-                ActionButton { text: "Export"; glyph: "Export"; prominent: true; enabled: !viewState.busy; onClicked: { sharing = false; exportDialog.open() } }
+                ActionButton { glyph: "ShareNetwork"; ToolTip.text: "Share note"; onClicked: window.showExport(true) }
+                ActionButton { text: "Export"; glyph: "Export"; prominent: true; enabled: !viewState.busy; onClicked: window.showExport(false) }
                 ActionButton { glyph: "GearSix"; ToolTip.text: "Settings"; onClicked: settingsOpen = !settingsOpen }
             }
         }
@@ -127,7 +131,7 @@ ApplicationWindow {
                 anchors.fill: parent
                 spacing: 12
                 Label { text: "Your files"; font.pixelSize: 22; font.weight: Font.DemiBold }
-                ActionButton { text: "Open folder"; glyph: "FolderOpen"; tonal: true; Layout.fillWidth: true; onClicked: folderDialog.open() }
+                ActionButton { text: "Open folder"; glyph: "FolderOpen"; tonal: true; Layout.fillWidth: true; onClicked: studio.chooseFolder() }
                 RowLayout {
                     visible: !!viewState.folder
                     Layout.fillWidth: true
@@ -174,7 +178,7 @@ ApplicationWindow {
                     Layout.margins: 12
                     ModeGroup { choices: window.width < 1000 ? [{key:"live",label:"Live"},{key:"editor",label:"Source"},{key:"reader",label:"Read"}] : [{key:"live",label:"Live"},{key:"editor",label:"Source"},{key:"reader",label:"Read"},{key:"split",label:"Split"}]; selected: viewState.mode; onChosen: key => studio.setMode(key) }
                     Item { Layout.fillWidth: true }
-                    ExpressiveSlider { Layout.preferredWidth: window.width < 1000 ? 80 : 140; from: 60; to: 240; value: viewState.zoom; onMoved: studio.setZoom(value); Accessible.name: "Content zoom" }
+                    ExpressiveSlider { visible: window.width >= 1000; Layout.preferredWidth: 140; from: 60; to: 240; value: viewState.zoom; onMoved: studio.setZoom(value); Accessible.name: "Content zoom" }
                     TextField {
                         objectName: "zoomPercentage"
                         Layout.preferredWidth: 76
@@ -193,7 +197,7 @@ ApplicationWindow {
                         background: Rectangle { radius: 12; antialiasing: true; color: viewState.colors["surface-high"]; border.width: parent.activeFocus ? 2 : 0; border.color: viewState.colors.primary }
                         Accessible.name: "Zoom percentage"
                     }
-                    ActionButton { glyph: "ArrowsOut"; compact: true; ToolTip.text: "Fullscreen study"; onClicked: windowModes.setFullscreen(true) }
+                    ActionButton { objectName: "fullscreenButton"; glyph: "Fullscreen"; icon.width: 24; icon.height: 24; compact: true; tonal: true; ToolTip.text: "Fullscreen (F11 · Esc to exit)"; onClicked: windowModes.setFullscreen(true) }
                 }
                 WebEngineView {
                     id: reader
@@ -218,7 +222,7 @@ ApplicationWindow {
                         if (Math.abs(zoomFactor - 1) > .001) {
                             const factor = zoomFactor
                             zoomFactor = 1
-                            runJavaScript("window.supermdZoomBy?.(" + factor + ")")
+                            runJavaScript("if (window.dispatchEvent(new CustomEvent('supermd-chart-native-zoom',{detail:" + factor + ",cancelable:true}))) window.supermdZoomBy?.(" + factor + ")")
                         }
                     }
                     onNavigationRequested: function(request) {
@@ -229,7 +233,7 @@ ApplicationWindow {
                     }
                 }
             }
-            ActionButton { visible: viewState.fullscreen; text: "Exit fullscreen"; anchors.right: parent.right; anchors.top: parent.top; anchors.margins: 12; onClicked: windowModes.setFullscreen(false) }
+            ActionButton { visible: viewState.fullscreen; glyph: "FullscreenExit"; icon.width: 24; icon.height: 24; compact: true; tonal: true; ToolTip.text: "Exit fullscreen (Esc · F11)"; anchors.right: parent.right; anchors.top: parent.top; anchors.margins: 12; onClicked: windowModes.setFullscreen(false) }
         }
     }
     Dialog {
@@ -258,20 +262,41 @@ ApplicationWindow {
     FileDialog { id: destination; title: "Export note"; fileMode: FileDialog.SaveFile; nameFilters: outputFormat === "pdf" ? ["PDF (*.pdf)"] : ["Portable Super MD (*.smd)"]; onAccepted: studio.exportTo(selectedFile.toString(), outputFormat) }
     Dialog {
         id: exportDialog
+        objectName: "exportDialog"
         title: sharing ? "Share note" : "Export note"
         modal: true
         anchors.centerIn: parent
-        width: 460
+        width: Math.min(560, window.width - 48)
+        height: Math.min(760, window.height - 64)
         standardButtons: Dialog.Cancel
+        background: Rectangle { color: viewState.colors.surface; radius: 28; antialiasing: true }
+        Overlay.modal: Rectangle { color: "#66000000" }
         ColumnLayout {
-            width: parent.width
-            spacing: 18
+            anchors.fill: parent
+            spacing: 16
             Label { text: sharing ? "Choose a format. Sharing availability depends on your desktop." : "PDF preserves the layout. Portable SMD includes editable Markdown and images."; wrapMode: Text.WordWrap; Layout.fillWidth: true }
-            ChoiceField { Layout.fillWidth: true; model: viewState.portable && !sharing ? ["PDF"] : ["PDF", "Portable SMD"]; onActivated: outputFormat = currentIndex === 0 ? "pdf" : "smd" }
-            Label { visible: outputFormat === "pdf"; text: "PDF defaults can be changed in Settings, including page numbers."; wrapMode: Text.WordWrap; Layout.fillWidth: true; opacity: .7 }
+            ChoiceField { Layout.fillWidth: true; visible: model.length > 1; model: viewState.portable && !sharing ? ["PDF"] : ["PDF", "Portable SMD"]; currentIndex: outputFormat === "pdf" ? 0 : 1; onActivated: outputFormat = currentIndex === 0 ? "pdf" : "smd" }
+            ScrollView {
+                id: exportScroll
+                Layout.fillWidth: true
+                Layout.fillHeight: true
+                contentWidth: availableWidth
+                rightPadding: 24
+                ScrollBar.horizontal.policy: ScrollBar.AlwaysOff
+                ScrollBar.vertical: ExpressiveScrollBar { parent: exportScroll; x: exportScroll.width - width; y: 0; height: exportScroll.height }
+                ColumnLayout {
+                    width: exportScroll.availableWidth
+                    PdfControls { objectName: "exportPdfControls"; visible: outputFormat === "pdf"; Layout.fillWidth: true; viewportItem: exportScroll.contentItem; options: viewState.settings.pdf; onEdited: options => studio.setting("pdf", JSON.stringify(options)) }
+                    Label { visible: outputFormat !== "pdf"; Layout.fillWidth: true; wrapMode: Text.WordWrap; text: "A portable .smd keeps the editable Markdown and images together. Source mode never shows embedded image bytes." }
+                }
+            }
             ActionButton { text: sharing ? "Prepare share copy" : "Choose destination"; prominent: true; Layout.fillWidth: true; onClicked: { exportDialog.close(); destination.open() } }
         }
-        onOpened: outputFormat = "pdf"
+        onOpened: {
+            outputFormat = "pdf"
+            forceActiveFocus()
+            Qt.callLater(() => exportScroll.contentItem.contentY = 0)
+        }
     }
     Dialog {
         id: closeDialog

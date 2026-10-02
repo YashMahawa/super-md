@@ -13,15 +13,24 @@ uses Qt WebEngine with the shared Markdown renderer; this is not a claim that
 the entire renderer is browser-free.
 
 - Clear Open note / Open folder actions, hideable sidebar and Close folder.
+- System-native folder selection and file-manager folder opening without changing
+  the system's default file manager. Properly sized Google Material fullscreen
+  SVG buttons with hover tooltips, F11 and Esc.
+- Soft tinted light surfaces, a fallback app accent, and PDF controls available
+  directly in both Export and Share, including line spacing and page numbers.
 - Safe save-before-close handling with a final editor snapshot, ordered recovery
   writes and a single application process coordinating multiple native windows.
 - Independent normal/fullscreen document zoom, slider and editable percentage.
 - Compact desktop settings dialog, system font choices and aligned, scrollable
   dropdowns that stay within the settings viewport.
+- Larger weight-600 Material SVG toolbar icons and rounded scrollbars with a
+  dedicated gutter, so settings controls never sit underneath the thumb.
 - Click images for independent zoom/pan, without changing document text zoom.
 - Remote image and video-thumbnail previews use the native consent-gated loader.
 - Source mode has a theme-paired editing surface, clearer caret/gutter,
   collapsible code regions, caret position and persistent line-wrap controls.
+- Pinch/trackpad zoom over 2D/3D plots affects the plot alone; ordinary swipes
+  still scroll the note. PDF snapshots keep the selected plot zoom.
 
 ## Notes and interactive learning
 
