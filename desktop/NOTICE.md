@@ -1,5 +1,9 @@
 # Super MD desktop distribution notices
 
+Super MD's original code: Copyright (c) 2026 Yash Mahawar and Super MD
+contributors. Licensed under the MIT License, included in this package.
+The following third-party components retain their own notices and licenses.
+
 The desktop package uses unmodified PySide6 / Qt 6.11.2 dynamically linked
 libraries, Python, NumPy, Material Color Utilities and the bundled Rust/Typst
 PDF engine. Qt is available under LGPLv3/GPLv3 and commercial terms; this

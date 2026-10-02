@@ -42,6 +42,7 @@ if sys.platform == "darwin":
     app = BUNDLE(collection, name="Super MD.app", icon=str(root / "src-tauri/icons/icon.icns"),
         bundle_identifier="dev.supermd.studio", info_plist={
             "CFBundleShortVersionString": version, "CFBundleVersion": version,
+            "NSHumanReadableCopyright": "Copyright © 2026 Yash Mahawar and Super MD contributors. MIT License.",
             "NSHighResolutionCapable": True,
             "CFBundleDocumentTypes": [{"CFBundleTypeName": "Super MD note", "CFBundleTypeRole": "Editor",
                                       "CFBundleTypeExtensions": ["md", "markdown", "smd", "fmd"]},

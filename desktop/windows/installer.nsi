@@ -29,6 +29,7 @@ Section "Super MD" main
   WriteRegStr HKCU "Software\Classes\Directory\Background\shell\SuperMD.OpenFolder\command" "" '$\"$INSTDIR\super-md.exe$\" $\"%V$\"'
   WriteRegStr HKCU "Software\Microsoft\Windows\CurrentVersion\Uninstall\SuperMD" "DisplayName" "Super MD"
   WriteRegStr HKCU "Software\Microsoft\Windows\CurrentVersion\Uninstall\SuperMD" "DisplayVersion" "${VERSION}"
+  WriteRegStr HKCU "Software\Microsoft\Windows\CurrentVersion\Uninstall\SuperMD" "Publisher" "Yash Mahawar"
   WriteRegStr HKCU "Software\Microsoft\Windows\CurrentVersion\Uninstall\SuperMD" "UninstallString" '$\"$INSTDIR\Uninstall.exe$\"'
 SectionEnd
 Section "Uninstall"

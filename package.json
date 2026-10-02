@@ -2,10 +2,12 @@
   "name": "super-md",
   "private": true,
   "version": "0.4.0",
+  "author": "Yash Mahawar",
+  "license": "MIT",
   "type": "module",
   "scripts": {
     "dev": "vite",
-    "build": "tsc -b && vite build",
+    "build": "tsc -b && vite build && node scripts/bundle-license.mjs",
     "tauri": "tauri",
     "desktop": "python desktop/main.py",
     "package": "python desktop/package.py",

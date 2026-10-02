@@ -68,7 +68,7 @@ def installers(version):
             (deb / "usr/bin").mkdir(parents=True, exist_ok=True)
             (deb / "usr/bin/super-md").symlink_to("/opt/super-md/super-md")
             (deb / "DEBIAN").mkdir()
-            (deb / "DEBIAN/control").write_text(f"Package: super-md\nVersion: {version}\nArchitecture: amd64\nMaintainer: Super MD <YashMahawa@users.noreply.github.com>\nDepends: libc6 (>= 2.35), libnss3, libasound2, libxcb1, libxkbcommon0, libegl1, libgl1, libdbus-1-3\nSection: editors\nPriority: optional\nDescription: Native Qt Markdown studio with typeset PDF export\n")
+            (deb / "DEBIAN/control").write_text(f"Package: super-md\nVersion: {version}\nArchitecture: amd64\nMaintainer: Yash Mahawar <YashMahawa@users.noreply.github.com>\nDepends: libc6 (>= 2.35), libnss3, libasound2, libxcb1, libxkbcommon0, libegl1, libgl1, libdbus-1-3\nSection: editors\nPriority: optional\nDescription: Native Qt Markdown studio with typeset PDF export\n")
             for hook in ("postinst", "postrm"):
                 shutil.copy2(ROOT / "desktop/linux/mime-refresh.sh", deb / "DEBIAN" / hook)
                 (deb / "DEBIAN" / hook).chmod(0o755)

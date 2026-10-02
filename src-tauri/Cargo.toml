@@ -2,9 +2,9 @@
 name = "super-md"
 version = "0.4.0"
 description = "A distraction-free, interactive Markdown studio"
-authors = ["Super MD contributors"]
+authors = ["Yash Mahawar", "Super MD contributors"]
 license = "MIT"
-repository = ""
+repository = "https://github.com/YashMahawa/super-md"
 edition = "2021"
 rust-version = "1.92"
 

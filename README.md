@@ -92,4 +92,11 @@ See [FORMAT.md](FORMAT.md) for examples and [docs/INSIGHTS-REVIEW.md](docs/INSIG
 
 MetroList's Kotlin/Compose approach inspired the native interaction direction; no GPL code was copied. The taste guide informed restrained color, consistent typography and purposeful motion, not replacing a dense editor with a website layout. MiTeX's MIT-licensed Typst compatibility definitions are vendored under `smd-core/src/mitex` at commit `985d8e725922ceb70ae5459c50c4cb3d733a0ed1`. Noto Sans is bundled under its SIL Open Font License. Other fonts and library licenses remain with their packages.
 
-MIT.
+## License and copyright
+
+Copyright © 2026 Yash Mahawar and Super MD contributors.
+
+Super MD's original code is open source under the [MIT License](LICENSE).
+Bundled third-party libraries, fonts, and icons retain their own copyright
+notices and licenses; see [desktop distribution notices](desktop/NOTICE.md)
+and [third-party UI licenses](public/third-party-ui-licenses.txt).
