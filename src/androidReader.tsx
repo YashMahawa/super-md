@@ -61,6 +61,7 @@ function Reader() {
     if (!state) return;
     const root = document.documentElement; root.dataset.theme = state.dark ? "dark" : "light"; root.dataset.motion = state.motion === false ? "off" : "on";
     root.style.setProperty("--reader-size", `${state.size}px`);
+    root.style.setProperty("--editor-size", `${Math.max(12, Math.min(24, state.size - 2))}px`);
     const fonts: Record<string,string> = {sans:"'Manrope Variable', sans-serif",serif:"'Noto Serif Variable', Georgia, serif",mono:"'JetBrains Mono Variable', monospace",Manrope:"'Manrope Variable',sans-serif","JetBrains Mono":"'JetBrains Mono Variable',monospace","Noto Sans":"'Noto Sans',sans-serif","Noto Serif":"'Noto Serif Variable',serif",Roboto:"'Roboto Variable',sans-serif",roboto:"'Roboto Variable',sans-serif",noto:"'Noto Sans',sans-serif",system:"system-ui,sans-serif"};
     root.style.setProperty("--reader-font",fonts[state.font] || `${JSON.stringify(state.font)}, sans-serif`);
     root.style.setProperty("--reader-width",state.width ? `${state.width}px` : "100%");

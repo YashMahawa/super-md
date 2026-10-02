@@ -31,6 +31,10 @@ ComboBox {
     onVisibleChanged: { if (!visible) popup.close() }
     onEnabledChanged: { if (!enabled) popup.close() }
     Connections {
+        target: control.Window.window
+        function onVisibleChanged() { if (!control.Window.window.visible) control.popup.close() }
+    }
+    Connections {
         target: control.viewportItem
         ignoreUnknownSignals: true
         function onContentYChanged() { if (control.popup.visible) control.positionChoices() }

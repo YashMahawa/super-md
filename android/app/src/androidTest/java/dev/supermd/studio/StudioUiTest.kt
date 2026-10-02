@@ -82,11 +82,11 @@ class StudioUiTest {
         compose.onNodeWithContentDescription("Exit fullscreen").performClick()
         javascriptUntil("getComputedStyle(document.documentElement).getPropertyValue('--workspace-scale')") { it == normalScale }
         compose.onNodeWithContentDescription("New tab").performClick()
-        compose.onNodeWithContentDescription("Close Untitled.smd").performClick()
+        compose.onNodeWithContentDescription("Close Untitled.md").performClick()
         compose.onNodeWithContentDescription("More actions").performClick()
         compose.onNodeWithText("Reopen closed tab").performClick()
-        compose.onNodeWithContentDescription("Close Untitled.smd").assertExists()
-        compose.onNodeWithContentDescription("Close Untitled.smd").performClick()
+        compose.onNodeWithContentDescription("Close Untitled.md").assertExists()
+        compose.onNodeWithContentDescription("Close Untitled.md").performClick()
         if (compose.activity.resources.configuration.smallestScreenWidthDp < 600) {
             compose.runOnIdle { compose.activity.requestedOrientation = android.content.pm.ActivityInfo.SCREEN_ORIENTATION_LANDSCAPE }
             compose.waitUntil(10_000) { compose.activity.resources.configuration.orientation == android.content.res.Configuration.ORIENTATION_LANDSCAPE }

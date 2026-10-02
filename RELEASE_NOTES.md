@@ -17,6 +17,8 @@ the entire renderer is browser-free.
   dropdowns that stay within the settings viewport.
 - Click images for independent zoom/pan, without changing document text zoom.
 - Remote image and video-thumbnail previews use the native consent-gated loader.
+- Source mode has a theme-paired editing surface, clearer caret/gutter,
+  collapsible code regions, caret position and persistent line-wrap controls.
 
 ## Notes and interactive learning
 

@@ -42,7 +42,7 @@ class DocumentsTest(unittest.TestCase):
             changed = "data:image/svg+xml;base64,"+base64.b64encode(b"<svg>other</svg>").decode()
             with self.assertRaises(ValueError): materialize_assets(root,{"assets/plot.svg":changed})
             self.assertEqual((root/"assets/plot.svg").read_bytes(),b"<svg/>")
-    @unittest.skipUnless(hasattr(os,"fchmod"),"Unix permissions")
+    @unittest.skipUnless(os.name == "posix" and hasattr(os,"fchmod"),"Unix permission bits do not apply to Windows ACLs")
     def test_atomic_save_preserves_file_permissions(self):
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory)/"note.md"

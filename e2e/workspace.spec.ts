@@ -36,7 +36,9 @@ test("Android shares math, callouts, graphs and portable PDF preparation", async
   await expect(page.locator(".callout-tip")).toBeVisible(); await expect(page.locator(".katex-error")).toHaveCount(0); await expect(page.locator(".katex")).toHaveCount(1);
   // Python source has no highlight.js wrapper; it must remain legible against
   // the fixed dark code surface even when the document uses a light theme.
-  await expect(page.locator(".python-cell > pre code")).toHaveCSS("color", "rgb(238, 237, 244)");
+  if (!await page.locator(".python-cell details").evaluate(node => (node as HTMLDetailsElement).open)) await page.locator(".python-cell summary").click();
+  await expect(page.locator(".python-cell pre code")).toBeVisible();
+  await expect(page.locator(".python-cell pre code")).toHaveCSS("color", "rgb(238, 237, 244)");
   await expect(page.locator(".python-cell .hljs-string")).toContainText("local-python-ok");
   await expect(page.locator(".mermaid svg")).toBeVisible(); await page.locator("input[type=range]").fill("1.98");
   await page.getByRole("button", { name: "Run" }).click(); await expect(page.locator(".cell-output")).toContainText("local-python-ok");
@@ -53,6 +55,33 @@ test("Android shares math, callouts, graphs and portable PDF preparation", async
   for (const asset of Object.values(prepared.assets) as string[]) {
     const svg = Buffer.from(asset, "base64").toString(); expect(svg).toContain("<svg"); expect(svg).not.toContain("<foreignObject");
   }
+});
+
+test("Source mode preserves wrapping, caret status, code folds and undo across view changes", async ({ page }) => {
+  await page.setViewportSize({width: 1120, height: 780});
+  await page.addInitScript(() => { window.SuperMD = { post: (id, command, args) => { if (command === "document_changed") (window as any).lastChangedSource = JSON.parse(args).content; queueMicrotask(() => window.supermdReply?.(id, true, null)); } }; });
+  await page.goto("/android-reader.html");
+  const content = "# Source workspace\n\n```python\n" + Array.from({length: 20}, (_, i) => `print('line ${i}')`).join("\n") + "\n```\n";
+  await page.evaluate(content => window.supermdLoad?.({id:"source-ui-test",content,path:null,mode:"editor",dark:true,fullscreen:false,colors:{},font:"sans",size:18,zoom:100}),content);
+  await expect(page.locator(".source-editor-status")).toBeVisible();
+  await expect(page.getByRole("button", {name:"Wrap lines"})).toHaveAttribute("aria-pressed","true");
+  await page.getByRole("button", {name:"Wrap lines"}).click();
+  await expect(page.locator(".cm-content")).toHaveCSS("white-space","pre");
+  await expect(page.locator(".cm-foldGutter")).toBeVisible();
+  await page.locator(".cm-content").click();
+  await page.keyboard.press("Control+End"); await page.keyboard.type("Saved selection");
+  await expect(page.locator(".source-position")).toContainText("Ln 25");
+  await expect(page.locator(".cm-content")).toContainText("Saved selection");
+  // Keep the current edited source while switching to Read and back.
+  const edited = await page.evaluate(() => (window as any).lastChangedSource as string);
+  await page.evaluate(content => window.supermdLoad?.({id:"source-ui-test",content,path:null,mode:"reader",dark:true,fullscreen:false,colors:{},font:"sans",size:18,zoom:100}),edited);
+  await expect(page.locator(".source-editor-status")).toHaveCount(0);
+  await page.evaluate(content => window.supermdLoad?.({id:"source-ui-test",content,path:null,mode:"editor",dark:true,fullscreen:false,colors:{},font:"sans",size:18,zoom:100}),edited);
+  await expect(page.getByRole("button", {name:"Wrap lines"})).toHaveAttribute("aria-pressed","false");
+  await expect(page.locator(".cm-content")).toHaveCSS("white-space","pre");
+  await page.locator(".cm-content").click(); await page.keyboard.press("Control+z");
+  await expect(page.locator(".cm-content")).not.toContainText("Saved selection");
+  await page.screenshot({path:test.info().outputPath("source-workspace.png")});
 });
 
 test("click-to-edit, media drops, titled links and portable source work together", async ({ page }) => {

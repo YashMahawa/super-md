@@ -140,6 +140,8 @@ def main():
                 QTimer.singleShot(21500,lambda:capture("3d-surface"))
                 report = studio.data/"native-render.pdf"
                 QTimer.singleShot(22000,lambda:studio.exportTo(str(report),"pdf"))
+                QTimer.singleShot(24000,lambda:studio.setMode("editor"))
+                QTimer.singleShot(25500,lambda:capture("source"))
                 def pdf_result():
                     if studio.message == "Exported native-render.pdf" and report.exists() and report.stat().st_size>10000:
                         print(f"PDF SMOKE PASSED: {report}",flush=True)
