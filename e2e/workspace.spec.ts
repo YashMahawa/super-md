@@ -3,6 +3,61 @@ import { mkdir, readFile, writeFile } from "node:fs/promises";
 import { dirname, join } from "node:path";
 
 test.beforeEach(async ({ page }) => { await page.addInitScript(() => localStorage.setItem("setup.complete", "true")); });
+test("moving a Source tab preserves its undo history and caret in another document window", async ({ page, context }) => {
+  let transfer: any;
+  await page.exposeFunction("captureMove", (_id:string, command:string, raw:string) => { if (command === "document_flushed") transfer = JSON.parse(raw); });
+  await page.addInitScript(() => { window.SuperMD = {post: (id, command, raw) => (window as any).captureMove(id, command, raw)}; });
+  await page.goto("/android-reader.html");
+  const note = {id:"moving",content:"# Draft\n\n",path:null,mode:"editor" as const,dark:false,fullscreen:false,colors:{},font:"sans",size:17,zoom:100};
+  await page.evaluate(note => window.supermdLoad?.(note), note);
+  const source = page.locator(".cm-content"); await expect(source).toBeVisible();
+  await source.click(); await page.keyboard.press("Control+End");
+  await page.keyboard.type("preserve this edit");
+  await page.evaluate(() => window.supermdFlush?.({action:"detach_tab",target:"moving",token:"transfer"}));
+  await expect.poll(() => transfer?.viewState?.editor).toBeTruthy();
+  const destination = await context.newPage();
+  await destination.addInitScript(() => { window.SuperMD = {post: () => {}}; });
+  await destination.goto("/android-reader.html");
+  await destination.evaluate(note => window.supermdLoad?.(note), {...note,content:transfer.content,viewState:transfer.viewState});
+  await expect(destination.locator(".cm-content")).toContainText("preserve this edit");
+  await expect(destination.getByLabel("Source editor status")).toContainText("Ln 3, Col 19");
+  await destination.locator(".cm-content").click(); await destination.keyboard.press("Control+z");
+  await expect(destination.locator(".cm-content")).not.toContainText("preserve this edit");
+  await destination.close();
+});
+test("desktop reading and Source scroll indicators hide without collapsing their gutter", async ({ page }) => {
+  await page.addInitScript(() => { window.SuperMD = { post: () => {} }; });
+  await page.goto("/android-reader.html");
+  await page.evaluate(async () => {
+    document.documentElement.dataset.host = "qt";
+    // @ts-expect-error Vite serves this test-only source import directly.
+    const { installScrollIndicators } = await import("/src/scrollIndicators.ts");
+    installScrollIndicators();
+  });
+  const content = Array.from({length: 100}, (_, i) => `## Section ${i}\n\nSome readable text.`).join("\n\n");
+  await page.evaluate(content => window.supermdLoad?.({id:"scroll",content,path:null,mode:"reader",dark:false,fullscreen:false,colors:{},font:"sans",size:17,zoom:100}), content);
+  const reader = page.locator(".android-reading");
+  await expect(reader).toBeVisible();
+  await page.evaluate(content => window.supermdLoad?.({id:"scroll",content,path:null,mode:"reader",dark:false,fullscreen:false,colors:{},font:"serif",size:24,zoom:140}), content);
+  await expect.poll(() => reader.evaluate(node => node.scrollTop)).toBe(0);
+  await expect.poll(() => page.locator("h2").first().evaluate(node => node.getBoundingClientRect().top - node.closest(".android-reading")!.getBoundingClientRect().top)).toBeGreaterThanOrEqual(0);
+  const width = await reader.evaluate(node => node.clientWidth);
+  await reader.evaluate(node => { node.scrollTop = 300; });
+  await expect(reader).toHaveClass(/scroll-indicator-active/);
+  await expect(reader).not.toHaveClass(/scroll-indicator-active/, {timeout: 2000});
+  expect(await reader.evaluate(node => node.clientWidth)).toBe(width);
+  const rect = (await reader.boundingBox())!;
+  await page.mouse.move(rect.x + rect.width - 20, rect.y + 100);
+  await expect(reader).toHaveClass(/scroll-indicator-hover/);
+  await page.mouse.move(rect.x + 100, rect.y + 100);
+  await expect(reader).not.toHaveClass(/scroll-indicator-hover/);
+  await page.evaluate(content => window.supermdLoad?.({id:"scroll",content,path:null,mode:"editor",dark:false,fullscreen:false,colors:{},font:"sans",size:17,zoom:100}), content);
+  const source = page.locator(".cm-scroller");
+  await expect(source).toBeVisible();
+  await source.evaluate(node => { node.scrollTop = 300; });
+  await expect(source).toHaveClass(/scroll-indicator-active/);
+  await expect(source).not.toHaveClass(/scroll-indicator-active/, {timeout:2000});
+});
 test("tabs, undo, sidebar and layout survive view changes", async ({ page }) => {
   await page.setViewportSize({ width: 1440, height: 900 }); await page.goto("/");
   await expect(page.getByRole("tab", { name: "Welcome.smd" })).toBeVisible();

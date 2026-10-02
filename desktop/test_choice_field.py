@@ -17,7 +17,7 @@ class Palette(QObject):
     def snapshot(self):
         return json.dumps({"settings": {"motion": False}, "colors": {
             "text": "#201a17", "primary": "#8c4b2b", "surface": "#fff8f5", "surface-high": "#f6e6de",
-            "surface-low": "#fff1eb", "outline": "#88756b",
+            "surface-low": "#fff1eb", "outline": "#88756b", "muted": "#786a62",
             "primary-container": "#ffdbca", "on-primary-container": "#351000"}})
 
 

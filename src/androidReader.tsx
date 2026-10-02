@@ -8,7 +8,8 @@ import "katex/dist/katex.min.css";
 import "highlight.js/styles/github-dark.css";
 import "./styles.css";
 import "./androidReader.css";
-import Editor from "./components/Editor";
+import Editor, { exportEditorSession, importEditorSession, type PortableEditorSession } from "./components/Editor";
+import { exportRenderedViews, importRenderedViews } from "./renderedOutputs";
 import LiveEditor from "./components/LiveEditor";
 import MarkdownPreview from "./components/MarkdownPreview";
 import { invoke } from "./nativeBridge";
@@ -24,8 +25,9 @@ const DocumentPreview = memo(MarkdownPreview);
 const LiveDocument = memo(LiveEditor);
 const SourceEditor = memo(Editor);
 
-interface ReaderState { id: string; content: string; path: string | null; mode: "live" | "editor" | "reader" | "split"; dark: boolean; fullscreen: boolean; font: string; size: number; width?: number; colors: Record<string, string>; zoom: number; motion?: boolean; python?: string }
-declare global { interface Window { supermdLoad?: (state: ReaderState) => void; supermdExport?: (options: ExportOptions) => void; supermdFind?: () => void; supermdPortable?: (save: boolean) => void; supermdZoomBy?: (factor:number)=>void; supermdResetZoom?: ()=>void; supermdRepairMath?: ()=>void; supermdFlush?: (operation:Record<string,string>)=>void } }
+interface NoteView { editor?: PortableEditorSession; top?: number; rendered?: ReturnType<typeof exportRenderedViews> }
+interface ReaderState { id: string; content: string; path: string | null; mode: "live" | "editor" | "reader" | "split"; dark: boolean; fullscreen: boolean; font: string; size: number; width?: number; colors: Record<string, string>; zoom: number; motion?: boolean; python?: string; viewState?: NoteView }
+declare global { interface Window { supermdLoad?: (state: ReaderState) => void; supermdExport?: (options: ExportOptions) => void; supermdExportMarkdown?: () => void; supermdFind?: () => void; supermdPortable?: (save: boolean) => void; supermdZoomBy?: (factor:number)=>void; supermdResetZoom?: ()=>void; supermdRepairMath?: ()=>void; supermdFlush?: (operation:Record<string,string>)=>void } }
 function Reader() {
   const [state, setState] = useState<ReaderState | null>(null);
   const [zoom, setZoom] = useState(100);
@@ -35,14 +37,35 @@ function Reader() {
   const reference = useRef(state); reference.current = state;
   const zoomReference = useRef(zoom);
   const pendingChange = useRef(0);
+  const noteViews = useRef(new Map<string, NoteView>());
   const anchors = () => Array.from(document.querySelectorAll<HTMLElement>(".android-reading,.cm-scroller")).map(captureScrollAnchor);
   const anchored = (update:()=>void) => { const restore = anchors(); update(); requestAnimationFrame(()=>restore.forEach(callback=>callback())); };
   useEffect(() => {
-    window.supermdLoad = (next) => { const old = reference.current; const load = () => { setState(next); zoomReference.current = next.zoom; setZoom(next.zoom); }; if (old?.id === next.id && old.mode === next.mode) anchored(load); else load(); };
+    window.supermdLoad = (next) => {
+      const old = reference.current;
+      if (old && old.id !== next.id) {
+        noteViews.current.set(old.id, {top: document.querySelector<HTMLElement>(".android-reading")?.scrollTop ?? 0});
+        if (noteViews.current.size > 40) noteViews.current.delete(noteViews.current.keys().next().value!);
+      }
+      if (next.viewState && old?.id !== next.id) {
+        importEditorSession(next.id, next.viewState.editor);
+        importRenderedViews(next.content, next.viewState.rendered);
+        noteViews.current.set(next.id, next.viewState);
+      }
+      const load = () => { setState(next); zoomReference.current = next.zoom; setZoom(next.zoom); };
+      if (old?.id === next.id && old.mode === next.mode) anchored(load); else load();
+    };
     window.supermdZoomBy = (factor) => { if (document.querySelector(".image-viewer")) { window.dispatchEvent(new CustomEvent("supermd-image-zoom",{detail:factor})); return; } anchored(()=> { zoomReference.current = clampPreviewZoom(zoomReference.current*factor); document.documentElement.style.setProperty("--workspace-scale",String(zoomReference.current/100)); setZoom(zoomReference.current); }); void invoke("zoom_changed",{zoom:zoomReference.current}); };
     window.supermdResetZoom = () => { if (document.querySelector(".image-viewer")) { window.dispatchEvent(new Event("supermd-image-reset")); return; } window.supermdZoomBy?.(100/zoomReference.current); };
     window.supermdRepairMath = () => setRepairing(true);
-    window.supermdFlush = operation => { const current = reference.current; if(current) void invoke("document_flushed",{id:current.id,content:current.content,operation}); };
+    window.supermdFlush = operation => {
+      const current = reference.current; if (!current) return;
+      let id = current.id;
+      if (operation.action === "move_tab") { try { id = JSON.parse(operation.target).tab; } catch { return; } }
+      else if (operation.action === "detach_tab") id = operation.target;
+      const view = operation.action === "move_tab" || operation.action === "detach_tab" ? {editor:exportEditorSession(id), ...(id === current.id ? {top:document.querySelector<HTMLElement>(".android-reading")?.scrollTop ?? 0,rendered:exportRenderedViews(current.content)} : noteViews.current.get(id))} : undefined;
+      void invoke("document_flushed",{id:current.id,content:current.content,operation,viewId:id,viewState:view});
+    };
     window.supermdFind = () => requestAnimationFrame(()=>window.dispatchEvent(new Event("supermd-find")));
     window.supermdPortable = async (save) => {
       const current = reference.current; if (!current) return;
@@ -54,8 +77,13 @@ function Reader() {
       try { const prepared = await preparePdf(current.content, current.path); await invoke("export_pdf_native", { ...prepared, options, id: current.id }); }
       catch (error) { await invoke("export_failed", { error: String(error) }); }
     };
+    window.supermdExportMarkdown = async () => {
+      const current = reference.current; if (!current) return;
+      try { await invoke("export_markdown_native", {id: current.id, content: current.content}); }
+      catch (error) { await invoke("export_failed", {error: String(error)}); }
+    };
     void invoke("reader_ready");
-    return () => { delete window.supermdLoad; delete window.supermdExport; delete window.supermdPortable; delete window.supermdZoomBy; delete window.supermdResetZoom; delete window.supermdRepairMath; delete window.supermdFlush; };
+    return () => { delete window.supermdLoad; delete window.supermdExport; delete window.supermdExportMarkdown; delete window.supermdPortable; delete window.supermdZoomBy; delete window.supermdResetZoom; delete window.supermdRepairMath; delete window.supermdFlush; };
   }, []);
   useLayoutEffect(() => {
     if (!state) return;
@@ -69,6 +97,14 @@ function Reader() {
     root.style.setProperty("--workspace-scale", String(zoom / 100));
     Object.entries(state.colors).forEach(([key, value]) => root.style.setProperty(`--${key}`, value));
   }, [state, zoom]);
+  useLayoutEffect(() => {
+    if (!state) return;
+    const top = noteViews.current.get(state.id)?.top;
+    if (typeof top === "number" && Number.isFinite(top)) {
+      const host = document.querySelector<HTMLElement>(".android-reading");
+      if (host) host.scrollTop = Math.max(0, top);
+    }
+  }, [state?.id, state?.mode]);
   useEffect(() => {
     let startDistance = 0, startZoom = 100, pinching = false, frame = 0;
     const distance = (touches: TouchList) => Math.hypot(touches[0].clientX - touches[1].clientX, touches[0].clientY - touches[1].clientY);

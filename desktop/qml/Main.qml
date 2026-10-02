@@ -88,33 +88,9 @@ ApplicationWindow {
                 ActionButton { glyph: "GearSix"; ToolTip.text: "Settings"; onClicked: settingsOpen = !settingsOpen }
             }
         }
-        ScrollView {
+        TabStrip {
             width: parent.width
-            height: 48
-            contentHeight: 44
-            ScrollBar.vertical.policy: ScrollBar.AlwaysOff
-            Row {
-                spacing: 4
-                leftPadding: 16
-                Repeater {
-                    model: viewState.tabs
-                    delegate: Rectangle {
-                        required property var modelData
-                        width: Math.min(260, label.implicitWidth + 64)
-                        height: 40
-                        radius: 18
-                        antialiasing: true
-                        color: modelData.id === viewState.active ? viewState.colors["surface-high"] : viewState.colors.surface
-                        RowLayout {
-                            anchors.fill: parent
-                            spacing: 0
-                            ActionButton { id: label; compact: true; text: (modelData.dirty ? "• " : "") + modelData.name; Layout.fillWidth: true; onClicked: studio.selectTab(modelData.id) }
-                            ActionButton { glyph: "X"; compact: true; implicitWidth: 36; Accessible.name: "Close " + modelData.name; ToolTip.text: "Close " + modelData.name; onClicked: studio.closeTabSafely(modelData.id) }
-                        }
-                    }
-                }
-                ActionButton { text: "New tab"; compact: true; onClicked: studio.newNote() }
-            }
+            viewState: window.viewState
         }
     }
     SplitView {
@@ -146,14 +122,14 @@ ApplicationWindow {
                     model: viewState.files
                     delegate: ItemDelegate {
                         required property var modelData
-                        width: ListView.view.width
+                        width: ListView.view.width - 20
                         height: visible ? 42 : 0
                         visible: !filter.text || modelData.directory || modelData.name.toLowerCase().includes(filter.text.toLowerCase())
                         leftPadding: 8 + modelData.depth * 16
                         text: (modelData.directory ? (modelData.expanded ? "▾ " : "▸ ") : "") + modelData.name
                         onClicked: modelData.directory ? studio.toggleDirectory(modelData.path) : studio.openNote(modelData.path)
                     }
-                    ScrollBar.vertical: ScrollBar { }
+                    ScrollBar.vertical: ExpressiveScrollBar { }
                 }
                 Label { text: "Recent notes"; font.weight: Font.DemiBold }
                 ListView {
@@ -161,7 +137,8 @@ ApplicationWindow {
                     Layout.preferredHeight: Math.min(240, viewState.recent.length * 40)
                     clip: true
                     model: viewState.recent
-                    delegate: ItemDelegate { required property string modelData; width: ListView.view.width; height: 40; text: modelData.split("/").pop(); onClicked: studio.openNote(modelData); ToolTip.visible: hovered; ToolTip.text: modelData }
+                    delegate: ItemDelegate { required property string modelData; width: ListView.view.width - 20; height: 40; text: modelData.split("/").pop(); onClicked: studio.openNote(modelData); ToolTip.visible: hovered; ToolTip.text: modelData }
+                    ScrollBar.vertical: ExpressiveScrollBar { }
                 }
                 Label { visible: !viewState.folder && !viewState.recent.length; text: "Open any folder for quick access. Your notes stay ordinary files."; wrapMode: Text.WordWrap; Layout.fillWidth: true; color: viewState.colors.muted }
                 ActionButton { text: "New window"; Layout.fillWidth: true; onClicked: studio.command("window") }
@@ -259,7 +236,7 @@ ApplicationWindow {
     FileDialog { id: openDialog; title: "Open note"; nameFilters: ["Notes (*.md *.smd *.fmd *.markdown)", "All files (*)"]; onAccepted: studio.openNote(selectedFile.toString()) }
     FolderDialog { id: folderDialog; title: "Open folder"; onAccepted: studio.openFolder(selectedFolder.toString()) }
     FileDialog { id: saveDialog; title: "Save note"; fileMode: FileDialog.SaveFile; nameFilters: ["Markdown (*.md)", "Portable Super MD (*.smd)"]; onAccepted: studio.saveAs(selectedFile.toString()); onRejected: studio.resolveClose("cancel") }
-    FileDialog { id: destination; title: "Export note"; fileMode: FileDialog.SaveFile; nameFilters: outputFormat === "pdf" ? ["PDF (*.pdf)"] : ["Portable Super MD (*.smd)"]; onAccepted: studio.exportTo(selectedFile.toString(), outputFormat) }
+    FileDialog { id: destination; title: "Export note"; fileMode: FileDialog.SaveFile; nameFilters: outputFormat === "pdf" ? ["PDF (*.pdf)"] : outputFormat === "md" ? ["Markdown (*.md)"] : ["Portable Super MD (*.smd)"]; onAccepted: studio.exportTo(selectedFile.toString(), outputFormat) }
     Dialog {
         id: exportDialog
         objectName: "exportDialog"
@@ -275,7 +252,7 @@ ApplicationWindow {
             anchors.fill: parent
             spacing: 16
             Label { text: sharing ? "Choose a format. Sharing availability depends on your desktop." : "PDF preserves the layout. Portable SMD includes editable Markdown and images."; wrapMode: Text.WordWrap; Layout.fillWidth: true }
-            ChoiceField { Layout.fillWidth: true; visible: model.length > 1; model: viewState.portable && !sharing ? ["PDF"] : ["PDF", "Portable SMD"]; currentIndex: outputFormat === "pdf" ? 0 : 1; onActivated: outputFormat = currentIndex === 0 ? "pdf" : "smd" }
+            ChoiceField { Layout.fillWidth: true; visible: model.length > 1; model: sharing ? ["PDF", "Portable SMD", "Markdown"] : viewState.portable ? ["PDF"] : ["PDF", "Portable SMD"]; currentIndex: outputFormat === "pdf" ? 0 : outputFormat === "smd" ? 1 : 2; onActivated: outputFormat = currentIndex === 0 ? "pdf" : currentIndex === 1 ? "smd" : "md" }
             ScrollView {
                 id: exportScroll
                 Layout.fillWidth: true
@@ -287,7 +264,7 @@ ApplicationWindow {
                 ColumnLayout {
                     width: exportScroll.availableWidth
                     PdfControls { objectName: "exportPdfControls"; visible: outputFormat === "pdf"; Layout.fillWidth: true; viewportItem: exportScroll.contentItem; options: viewState.settings.pdf; onEdited: options => studio.setting("pdf", JSON.stringify(options)) }
-                    Label { visible: outputFormat !== "pdf"; Layout.fillWidth: true; wrapMode: Text.WordWrap; text: "A portable .smd keeps the editable Markdown and images together. Source mode never shows embedded image bytes." }
+                    Label { visible: outputFormat !== "pdf"; Layout.fillWidth: true; wrapMode: Text.WordWrap; text: outputFormat === "md" ? "Editable Markdown text. Choose portable SMD to include images in one file." : "A portable .smd keeps the editable Markdown and images together. Source mode never shows embedded image bytes." }
                 }
             }
             ActionButton { text: sharing ? "Prepare share copy" : "Choose destination"; prominent: true; Layout.fillWidth: true; onClicked: { exportDialog.close(); destination.open() } }

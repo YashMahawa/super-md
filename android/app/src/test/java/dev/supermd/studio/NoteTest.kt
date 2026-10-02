@@ -2,6 +2,16 @@ package dev.supermd.studio
 import org.junit.Assert.*
 import org.junit.Test
 class NoteTest {
+    @Test fun reorderingKeepsDraftAndEmbeddedImagesOnTheSameNote() {
+        val a = Note(name = "a.md")
+        val b = Note(name = "b.smd", content = "![image](smd-asset:x)", assetDirectory = "assets/b", saved = "older")
+        val notes = reorderedNotes(listOf(a, b), b.id, 0)
+        assertSame(b, notes.first())
+        assertTrue(notes.first().dirty)
+        assertEquals("assets/b", notes.first().assetDirectory)
+        assertEquals(listOf(a, b), reorderedNotes(listOf(a, b), "missing", 0))
+        assertEquals(listOf(a, b), reorderedNotes(listOf(a, b), b.id, -1))
+    }
     @Test fun savedRevisionDoesNotHideNewerEdits() {
         val note = Note(content = "newer mathematics: α + β", saved = "older")
         assertTrue(note.dirty)

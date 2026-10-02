@@ -71,8 +71,15 @@ plt.grid(alpha=.2)
 ```
 """.trimIndent()
 
-class StudioViewModel(app: Application) : AndroidViewModel(app) {
+fun reorderedNotes(notes: List<Note>, id: String, index: Int): List<Note> {
+    val source = notes.indexOfFirst { it.id == id }
+    if (source < 0 || index !in notes.indices || source == index) return notes
+    return notes.toMutableList().apply { add(index, removeAt(source)) }
+}
+
+class StudioViewModel(app: Application, val workspaceKey: String = "main") : AndroidViewModel(app) {
     private val prefs = app.getSharedPreferences("studio", 0)
+    private val windowPrefs = app.getSharedPreferences("studio-window-$workspaceKey", 0)
     val media = MediaStorage(app)
     private val recentMutable = MutableStateFlow(runCatching { val list = JSONArray(prefs.getString("recent", "[]")); (0 until minOf(list.length(), 24)).map { i -> val n = list.getJSONObject(i); RecentNote(n.getString("name"), n.getString("uri"), n.optString("relative").takeIf { it.isNotBlank() }) } }.getOrDefault(emptyList()))
     val recent = recentMutable.asStateFlow()
@@ -83,16 +90,56 @@ class StudioViewModel(app: Application) : AndroidViewModel(app) {
         prefs.edit().putString("recent", JSONArray().apply { recentMutable.value.forEach { put(JSONObject().put("name", it.name).put("uri", it.uri).put("relative", it.relative ?: "")) } }.toString()).apply()
     }
     fun clearRecent() { recentMutable.value = emptyList(); prefs.edit().remove("recent").apply() }
-    private val snapshot = File(app.filesDir, "workspace.json")
+    private val snapshot = if (workspaceKey == "main") File(app.filesDir, "workspace.json") else File(app.filesDir, "workspaces/$workspaceKey.json").also { it.parentFile!!.mkdirs() }
     private val mutable = MutableStateFlow(restore())
+    private val preferencesChanged = android.content.SharedPreferences.OnSharedPreferenceChangeListener { _, key ->
+        if (key == "recent") recentMutable.value = runCatching { val list = JSONArray(prefs.getString("recent", "[]")); (0 until minOf(list.length(), 24)).map { i -> val n = list.getJSONObject(i); RecentNote(n.getString("name"), n.getString("uri"), n.optString("relative").takeIf { it.isNotBlank() }) } }.getOrDefault(emptyList())
+        if (key in setOf("theme", "fullTheme", "motion", "font", "size", "pdf", "welcomed")) {
+            mutable.value = mutable.value.copy(theme = prefs.getString("theme", "system")!!, fullscreenTheme = prefs.getString("fullTheme", "black")!!, motion = prefs.getBoolean("motion", true), font = prefs.getString("font", "sans")!!, size = prefs.getFloat("size", 17f), pdf = prefs.getString("pdf", null) ?: StudioState().pdf, welcomed = prefs.getBoolean("welcomed", false))
+        }
+    }
+    init { prefs.registerOnSharedPreferenceChangeListener(preferencesChanged) }
+    override fun onCleared() { prefs.unregisterOnSharedPreferenceChangeListener(preferencesChanged); super.onCleared() }
     val state = mutable.asStateFlow()
     private var persistJob: Job? = null
     private val pythonMutex = kotlinx.coroutines.sync.Mutex()
     var outputUri: Uri? = null
+    var shareReady: ((Intent) -> Unit)? = null
+    private var shareFile: File? = null
+    fun prepareShare(format: String): Boolean {
+        if (mutable.value.busy || format !in listOf("pdf", "smd", "md")) return false
+        val folder = File(getApplication<Application>().cacheDir, "share/${UUID.randomUUID()}").apply { mkdirs() }
+        val stem = mutable.value.active.name.substringBeforeLast('.').replace(Regex("[^\\p{L}\\p{N} _.-]"), "_").take(100).ifBlank { "Note" }
+        val file = File(folder, "$stem.$format")
+        shareFile = file
+        busy(true)
+        when (format) {
+            "pdf" -> outputUri = Uri.fromFile(file)
+            "smd" -> portableOutput = Uri.fromFile(file)
+        }
+        return true
+    }
+    suspend fun shareMarkdown(content: String) {
+        val file = shareFile?.takeIf { it.extension == "md" } ?: error("Choose Markdown in Share first")
+        withContext(Dispatchers.IO) { file.writeText(content) }
+        finishShare(Uri.fromFile(file))
+    }
+    private fun finishShare(target: Uri): Boolean {
+        val file = shareFile ?: return false
+        if (target != Uri.fromFile(file)) return false
+        val app = getApplication<Application>()
+        val uri = androidx.core.content.FileProvider.getUriForFile(app, "${app.packageName}.share", file)
+        val mime = when (file.extension) { "pdf" -> "application/pdf"; "smd" -> "application/vnd.supermd.smd"; else -> "text/markdown" }
+        val send = Intent(Intent.ACTION_SEND).setType(mime).putExtra(Intent.EXTRA_STREAM, uri).addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION).apply { clipData = android.content.ClipData.newUri(app.contentResolver, file.name, uri) }
+        shareFile = null
+        mutable.value = mutable.value.copy(busy = false, message = "Share copy ready")
+        shareReady?.invoke(send) ?: error("The share screen is no longer open. Your copy is still in the app cache.")
+        return true
+    }
     private val resolver get() = getApplication<Application>().contentResolver
     private fun change(block: (StudioState) -> StudioState) { mutable.value = block(mutable.value); schedulePersist() }
     private fun restore(): StudioState {
-        var s = StudioState(theme = prefs.getString("theme", "system")!!, fullscreenTheme = prefs.getString("fullTheme", "black")!!, motion = prefs.getBoolean("motion", true), welcomed = prefs.getBoolean("welcomed", false), font = prefs.getString("font", "sans")!!, size = prefs.getFloat("size", 17f), folder = prefs.getString("folder", null), pdf = prefs.getString("pdf", null) ?: StudioState().pdf)
+        var s = StudioState(theme = prefs.getString("theme", "system")!!, fullscreenTheme = prefs.getString("fullTheme", "black")!!, motion = prefs.getBoolean("motion", true), welcomed = prefs.getBoolean("welcomed", false), font = prefs.getString("font", "sans")!!, size = prefs.getFloat("size", 17f), folder = windowPrefs.getString("folder", if (workspaceKey == "main" && !windowPrefs.getBoolean("folderMigrated", false)) prefs.getString("folder", null) else null), pdf = prefs.getString("pdf", null) ?: StudioState().pdf)
         try {
             if (snapshot.isFile && snapshot.length() < 30_000_000) {
                 val json = JSONObject(snapshot.readText()); val list = json.getJSONArray("tabs")
@@ -109,15 +156,16 @@ class StudioViewModel(app: Application) : AndroidViewModel(app) {
         try {
             val tabs = JSONArray(); s.tabs.forEach { tabs.put(JSONObject().put("id", it.id).put("name", it.name).put("uri", it.uri ?: "").put("content", it.content).put("saved", it.saved).put("relative", it.relative ?: "").put("assetDirectory", it.assetDirectory ?: "")) }
             val closed = JSONArray(); s.closedTabs.forEach { closed.put(JSONObject().put("id", it.id).put("name", it.name).put("uri", it.uri ?: "").put("content", it.content).put("saved", it.saved).put("relative", it.relative ?: "").put("assetDirectory", it.assetDirectory ?: "")) }
-            val temporary = File(snapshot.parentFile, "workspace.tmp"); temporary.outputStream().use { stream -> stream.write(JSONObject().put("active", s.active.id).put("tabs", tabs).put("closed", closed).put("mode", s.mode).put("normalZoom", s.normalZoom).put("fullscreenZoom", s.fullscreenZoom).toString().toByteArray()); stream.fd.sync() }
+            val temporary = File(snapshot.parentFile, snapshot.name + ".tmp"); temporary.outputStream().use { stream -> stream.write(JSONObject().put("active", s.active.id).put("tabs", tabs).put("closed", closed).put("mode", s.mode).put("normalZoom", s.normalZoom).put("fullscreenZoom", s.fullscreenZoom).toString().toByteArray()); stream.fd.sync() }
             if (!temporary.renameTo(snapshot)) error("Could not replace recovery snapshot")
-            prefs.edit().putString("theme", s.theme).putString("fullTheme", s.fullscreenTheme).putBoolean("motion", s.motion).putString("font", s.font).putFloat("size", s.size).putString("folder", s.folder).putString("pdf", s.pdf).putBoolean("welcomed", s.welcomed).apply()
+            windowPrefs.edit().putBoolean("folderMigrated", true).putString("folder", s.folder).apply()
         } catch (error: Exception) { viewModelScope.launch { mutable.value = mutable.value.copy(error = "Draft recovery could not save: ${error.message}. Please save your note to a file.") } }
     }
     fun flush() { persistJob?.cancel(); val current = mutable.value; viewModelScope.launch(Dispatchers.IO) { persist(current) } }
     fun edit(id: String, content: String) = change { s -> s.copy(tabs = s.tabs.map { if (it.id == id) it.copy(content = content) else it }) }
     fun newNote() { val note = Note(); change { it.copy(tabs = it.tabs + note, activeId = note.id) } }
     fun select(id: String) = change { it.copy(activeId = id) }
+    fun reorder(id: String, index: Int) = change { it.copy(tabs = reorderedNotes(it.tabs, id, index)) }
     fun close(id: String) {
         val note = mutable.value.tabs.find { it.id == id } ?: return
         change { val remaining = it.tabs.filter { n -> n.id != id }; val next = remaining.ifEmpty { listOf(Note()) }; it.copy(tabs = next, closedTabs = (listOf(note) + it.closedTabs).take(12), activeId = if (it.active.id == id) next.first().id else it.activeId, message = "Tab closed. Reopen from the menu to recover edits.") }
@@ -126,12 +174,15 @@ class StudioViewModel(app: Application) : AndroidViewModel(app) {
     fun mode(value: String) = change { it.copy(mode = value) }
     fun fullscreen(value: Boolean) = change { it.copy(fullscreen = value) }
     fun zoom(value: Float) = change { s -> if (s.fullscreen) s.copy(fullscreenZoom = value.coerceIn(60f, 240f)) else s.copy(normalZoom = value.coerceIn(60f, 240f)) }
-    fun appearance(theme: String? = null, fullTheme: String? = null, motion: Boolean? = null, font: String? = null, size: Float? = null) = change { it.copy(theme = theme ?: it.theme, fullscreenTheme = fullTheme ?: it.fullscreenTheme, motion = motion ?: it.motion, font = font ?: it.font, size = size ?: it.size) }
-    fun pdf(value: String) = change { it.copy(pdf = value) }
-    fun welcomeDone() = change { it.copy(welcomed = true) }
+    fun appearance(theme: String? = null, fullTheme: String? = null, motion: Boolean? = null, font: String? = null, size: Float? = null) {
+        change { it.copy(theme = theme ?: it.theme, fullscreenTheme = fullTheme ?: it.fullscreenTheme, motion = motion ?: it.motion, font = font ?: it.font, size = size ?: it.size) }
+        prefs.edit().apply { theme?.let { putString("theme", it) }; fullTheme?.let { putString("fullTheme", it) }; motion?.let { putBoolean("motion", it) }; font?.let { putString("font", it) }; size?.let { putFloat("size", it) } }.apply()
+    }
+    fun pdf(value: String) { change { it.copy(pdf = value) }; prefs.edit().putString("pdf", value).apply() }
+    fun welcomeDone() { change { it.copy(welcomed = true) }; prefs.edit().putBoolean("welcomed", true).apply() }
     fun dismissMessage() { mutable.value = mutable.value.copy(message = null) }
     fun dismissError() { mutable.value = mutable.value.copy(error = null) }
-    fun fail(message: String) { mutable.value = mutable.value.copy(busy = false, error = message) }
+    fun fail(message: String) { shareFile = null; mutable.value = mutable.value.copy(busy = false, error = message) }
     fun busy(value: Boolean) { mutable.value = mutable.value.copy(busy = value) }
     fun open(uri: Uri, relative: String? = null) = viewModelScope.launch {
         try {
@@ -249,7 +300,7 @@ class StudioViewModel(app: Application) : AndroidViewModel(app) {
         val sources = JSONArray(PdfEngine.imageSources(note.content))
         val local = (0 until sources.length()).map { sources.getString(it) }.distinct().mapNotNull { source -> media.local(source, note.assetDirectory)?.let { source to it } }
         if (local.isEmpty()) return
-        val tree = mutable.value.folder?.let(Uri::parse) ?: error("Images need a containing folder permission. Open that folder, or export a single portable .fmd file instead.")
+        val tree = mutable.value.folder?.let(Uri::parse) ?: error("Images need a containing folder permission. Open that folder, or export a single portable .smd file instead.")
         val rootId = DocumentsContract.getTreeDocumentId(tree)
         val targetId = DocumentsContract.getDocumentId(destination)
         require(targetId.startsWith("$rootId/")) { "Open the destination folder, or export a portable .fmd file to include images." }
@@ -285,7 +336,7 @@ class StudioViewModel(app: Application) : AndroidViewModel(app) {
             resolver.openOutputStream(target, "wt")?.use { output -> staged.inputStream().use { it.copyTo(output) } } ?: error("Cannot write portable file")
             withContext(Dispatchers.Main) {
                 if (save) { change { s -> s.copy(tabs = s.tabs.map { if (it.id == id) it.copy(content = if (it.content == originalContent) content else it.content, saved = content, assetDirectory = opened!!.directory) else it }, busy = false, message = "Portable note saved") }; mutable.value.tabs.find { it.id == id }?.let(::remember) }
-                else { portableOutput = null; mutable.value = mutable.value.copy(busy = false, message = "Portable .smd exported") }
+                else { portableOutput = null; if (!finishShare(target)) mutable.value = mutable.value.copy(busy = false, message = "Portable .smd exported") }
             }
         } finally { staged.delete() }
     }
@@ -303,7 +354,7 @@ class StudioViewModel(app: Application) : AndroidViewModel(app) {
             val error = PdfEngine.export(content, options, assetDir.absolutePath, output.absolutePath)
             if (error.isNotEmpty()) error(error)
             resolver.openOutputStream(target, "wt")?.use { stream -> output.inputStream().use { it.copyTo(stream) } } ?: error("Cannot write PDF destination")
-            withContext(Dispatchers.Main) { mutable.value = mutable.value.copy(busy = false, message = "PDF exported"); outputUri = null }
+            withContext(Dispatchers.Main) { if (!finishShare(target)) mutable.value = mutable.value.copy(busy = false, message = "PDF exported"); outputUri = null }
         } finally { staging.deleteRecursively() }
     }
 }

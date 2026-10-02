@@ -11,6 +11,10 @@ ScrollBar {
     padding: 4
     minimumSize: .08
     policy: ScrollBar.AsNeeded
+    hoverEnabled: true
+    // Opacity, not visibility/width: the gutter and pointer hit area stay stable.
+    opacity: active || hovered || pressed ? 1 : 0
+    Behavior on opacity { enabled: control.motion; NumberAnimation { duration: control.active || control.hovered || control.pressed ? 100 : 240 } }
     contentItem: Rectangle {
         implicitWidth: 8
         implicitHeight: 8

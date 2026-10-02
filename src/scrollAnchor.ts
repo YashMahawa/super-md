@@ -10,6 +10,9 @@ export function captureScrollAnchor(root: HTMLElement): () => void {
   const scroll = root.scrollTop, max = Math.max(1,root.scrollHeight-root.clientHeight);
   return () => {
     if (!root.isConnected) return;
+    // At the start of a note, stay at its start. Anchoring a paragraph farther
+    // down while fonts/reflow change would otherwise crop the title above it.
+    if (scroll <= 1) { root.scrollTop = 0; return; }
     const next = useRange && range?.startContainer.isConnected ? range.getBoundingClientRect().top : block?.isConnected ? block.getBoundingClientRect().top : undefined;
     if (top !== undefined && next !== undefined) root.scrollTop += next-top;
     else root.scrollTop = scroll/max * Math.max(0,root.scrollHeight-root.clientHeight);

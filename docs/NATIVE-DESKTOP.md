@@ -76,6 +76,14 @@ Windows installs an Open folder with Super MD context-menu action. macOS handles
 native file-open events and declares folder support to Launch Services.
 Reference: https://flatpak.github.io/xdg-desktop-portal/docs/doc-org.freedesktop.portal.FileChooser.html
 
+Tabs use native drag-and-drop for reorder, cross-window moves and detaching.
+Window ownership is transferred only after the renderer's final edit snapshot;
+Source undo/caret and bounded plot view metadata travel with the note. Shared
+recovery has one owner per dirty note. Closed windows release their QML engine.
+Rounded scroll indicators keep a fixed gutter and reveal only during scrolling
+or gutter hover. See `docs/PLATFORM-PARITY.md` for Android interactions and the
+remaining OS-adapter differences.
+
 Remaining work includes complete OS sharing adapters and wider
 interactive-feature regression coverage. The current
 feature/agent format guide is `docs/AUTHORING.md`. Keep the

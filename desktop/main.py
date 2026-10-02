@@ -74,6 +74,24 @@ def main():
     channel_script = bytes(channel.readAll()).decode()
     engines, studios = [], []
     session = Session(args.test_state)
+    def detach_window(source_id, tab_id):
+        source = session.windows.get(source_id)
+        if not source or not source._can_move(): return
+        try:
+            destination = create_window()
+        except Exception as error:
+            source.message = f"Could not create a window: {error}"
+            source._emit(False)
+            return
+        destination.mode = source.mode
+        welcome, active = destination.tabs, destination.active
+        destination.tabs = []
+        last = len(source.tabs) == 1
+        if source._move_tab(destination, tab_id, 0):
+            if last: QTimer.singleShot(0, source.allowClose.emit)
+        else:
+            destination.tabs, destination.active = welcome, active
+            QTimer.singleShot(0, destination.allowClose.emit)
     def create_window(note=None):
         engine = QQmlApplicationEngine()
         studio = Studio(args.test_state,session)
@@ -81,15 +99,26 @@ def main():
             studio.settings["welcomed"] = True
             studio.mode = "reader"
         studio.newWindowRequested.connect(create_window)
+        studio.detachedWindowRequested.connect(detach_window)
         engine.rootContext().setContextProperty("studio", studio)
         engine.rootContext().setContextProperty("readerUrl", QUrl.fromLocalFile(str(ROOT / "dist" / "qt-reader.html")))
         engine.rootContext().setContextProperty("channelScript", channel_script)
         engine.rootContext().setContextProperty("brandUrl", QUrl.fromLocalFile(str(ROOT / "public" / "brand-mark-fixed.svg")))
         engine.load(QUrl.fromLocalFile(str(ROOT / "desktop" / "qml" / "Main.qml")))
         if not engine.rootObjects():
+            studio.stop()
+            studio.pool.shutdown(wait=False, cancel_futures=True)
+            engine.deleteLater()
             raise RuntimeError("Native QML window could not be loaded")
         # The user's laptop screen is preferred without changing active desktop focus.
         window = engine.rootObjects()[0]
+        studio.host_window = window
+        def retire_window():
+            if not window.isVisible() and not studio.retired:
+                studio.stop()
+                if engine in engines: engines.remove(engine)
+                engine.deleteLater()
+        window.visibleChanged.connect(lambda: QTimer.singleShot(0, retire_window))
         laptop = next((s for s in app.screens() if s.name().startswith(("eDP", "LVDS"))), None)
         if laptop:
             window.setScreen(laptop)
@@ -199,6 +228,7 @@ def main():
                 QTimer.singleShot(32000,pdf_result)
         if note:
             studio.openPath(str(note))
+        return studio
     create_window(args.note)
     if broker:
         broker.requested.connect(lambda note: create_window(note or None))

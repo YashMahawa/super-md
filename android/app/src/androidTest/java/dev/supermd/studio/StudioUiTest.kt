@@ -3,6 +3,8 @@ package dev.supermd.studio
 import android.view.View
 import android.view.ViewGroup
 import android.webkit.WebView
+import androidx.activity.compose.setContent
+import androidx.compose.runtime.mutableStateOf
 import androidx.compose.ui.test.*
 import androidx.compose.ui.test.junit4.createAndroidComposeRule
 import org.junit.Assert.*
@@ -20,6 +22,78 @@ class StudioUiTest {
             accepted(result.get())
         }
         return result.get()
+    }
+    private fun welcome() {
+        repeat(2) { if (compose.onAllNodesWithText("Continue").fetchSemanticsNodes().isNotEmpty()) compose.onNodeWithText("Continue").performClick() }
+        compose.onAllNodesWithText("Explore the sample").fetchSemanticsNodes().firstOrNull()?.let { compose.onNodeWithText("Explore the sample").performClick() }
+    }
+    @Test fun longPressReordersNativeTabsAndKeepsTheActiveDraft() {
+        val first = Note(name = "First.md", content = "First unsaved draft")
+        val second = Note(name = "Second.smd", content = "Second unsaved draft", assetDirectory = "images")
+        val notes = mutableStateOf(listOf(first, second))
+        compose.runOnIdle {
+            compose.activity.setContent { androidx.compose.material3.MaterialTheme {
+                NoteTabs(notes.value, second.id, true, {}, {}, { id, index -> notes.value = reorderedNotes(notes.value, id, index) }, {})
+            } }
+        }
+        compose.waitForIdle()
+        val start = compose.onNodeWithText("• Second.smd").fetchSemanticsNode().boundsInRoot.center
+        val end = compose.onNodeWithText("• First.md").fetchSemanticsNode().boundsInRoot.center
+        compose.onRoot().performTouchInput {
+            down(start); advanceEventTime(650); moveTo(start); moveTo(end, delayMillis = 350); up()
+        }
+        compose.waitUntil(5000) { notes.value.first().id == second.id }
+        assertSame(second, notes.value.first())
+        assertEquals("Second unsaved draft", notes.value.first().content)
+        assertEquals("images", notes.value.first().assetDirectory)
+    }
+    @Test fun newWindowHasIndependentTaskAndDraftRecovery() {
+        welcome()
+        val first = androidx.lifecycle.ViewModelProvider(compose.activity)[StudioViewModel::class.java]
+        val initial = first.state.value.active.id
+        val original = first.state.value.active.content
+        compose.runOnIdle { first.edit(initial, "First window remains intact"); compose.activity.newWindow() }
+        var other: MainActivity? = null
+        compose.waitUntil(10_000) {
+            androidx.test.platform.app.InstrumentationRegistry.getInstrumentation().runOnMainSync {
+                other = androidx.test.runner.lifecycle.ActivityLifecycleMonitorRegistry.getInstance().getActivitiesInStage(androidx.test.runner.lifecycle.Stage.RESUMED).filterIsInstance<MainActivity>().firstOrNull { it !== compose.activity }
+            }
+            other != null
+        }
+        val second = androidx.lifecycle.ViewModelProvider(other!!)[StudioViewModel::class.java]
+        assertNotEquals(compose.activity.taskId, other!!.taskId)
+        assertNotEquals(first.workspaceKey, second.workspaceKey)
+        androidx.test.platform.app.InstrumentationRegistry.getInstrumentation().runOnMainSync {
+            second.edit(second.state.value.active.id, "Second window draft")
+            first.flush(); second.flush()
+        }
+        val files = compose.activity.filesDir
+        val recovery = java.io.File(files, "workspaces/${second.workspaceKey}.json")
+        compose.waitUntil(5000) { recovery.isFile && recovery.readText().contains("Second window draft") && java.io.File(files, "workspace.json").readText().contains("First window remains intact") }
+        assertEquals("First window remains intact", first.state.value.active.content)
+        assertEquals("Second window draft", second.state.value.active.content)
+        androidx.test.platform.app.InstrumentationRegistry.getInstrumentation().runOnMainSync { first.edit(initial, original); other!!.finishAndRemoveTask() }
+    }
+    @Test fun shareUsesTheSamePdfOptionsAndARestrictedSystemUri() {
+        welcome()
+        compose.onNodeWithContentDescription("More actions").performClick()
+        compose.onNodeWithText("Share note").performClick()
+        compose.onNodeWithText("Share your note").assertIsDisplayed()
+        compose.onNodeWithText("Page numbers").assertExists()
+        val model = androidx.lifecycle.ViewModelProvider(compose.activity)[StudioViewModel::class.java]
+        val result = AtomicReference<android.content.Intent>()
+        compose.runOnIdle { model.shareReady = { result.set(it) } }
+        compose.onNodeWithText("Prepare & share").performClick()
+        compose.waitUntil(60_000) { result.get() != null }
+        val intent = result.get()
+        assertEquals(android.content.Intent.ACTION_SEND, intent.action)
+        assertEquals("application/pdf", intent.type)
+        val uri = intent.getParcelableExtra<android.net.Uri>(android.content.Intent.EXTRA_STREAM)!!
+        assertEquals("content", uri.scheme)
+        assertEquals("dev.supermd.studio.share", uri.authority)
+        assertTrue(intent.flags and android.content.Intent.FLAG_GRANT_READ_URI_PERMISSION != 0)
+        compose.activity.contentResolver.openInputStream(uri)!!.use { input -> assertEquals("%PDF", String(ByteArray(4).also { input.read(it) })) }
+        assertNull(model.state.value.error)
     }
     @Test fun realReaderAndNativeControlsAreConnected() {
         repeat(2) { if (compose.onAllNodesWithText("Continue").fetchSemanticsNodes().isNotEmpty()) compose.onNodeWithText("Continue").performClick() }

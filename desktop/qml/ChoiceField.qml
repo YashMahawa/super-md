@@ -84,7 +84,7 @@ ComboBox {
     delegate: ItemDelegate {
         required property var modelData
         required property int index
-        width: control.popup.availableWidth
+        width: Math.max(0, choicesList.width - 20)
         height: 44
         text: modelData.toString()
         font: control.font
@@ -112,7 +112,7 @@ ComboBox {
             model: control.popup.visible ? control.delegateModel : null
             currentIndex: control.highlightedIndex
             highlightMoveDuration: control.motion ? 120 : 0
-            ScrollBar.vertical: ScrollBar { policy: ScrollBar.AsNeeded }
+            ScrollBar.vertical: ExpressiveScrollBar { }
         }
         background: Item {
             // Mask covered form text at the rounded corners as well. Without

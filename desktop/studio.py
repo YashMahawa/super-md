@@ -17,8 +17,8 @@ import urllib.parse
 import urllib.request
 import uuid
 from pathlib import Path
-from PySide6.QtCore import QObject, Property, Signal, Slot, QStandardPaths, QTimer, QUrl, QFileSystemWatcher, QProcess
-from PySide6.QtGui import QDesktopServices, QFontDatabase, QGuiApplication
+from PySide6.QtCore import QObject, Property, Signal, Slot, QStandardPaths, QTimer, QUrl, QFileSystemWatcher, QProcess, Qt, QPointF
+from PySide6.QtGui import QDesktopServices, QFontDatabase, QGuiApplication, QCursor
 from documents import atomic_write, bundle, image_data, materialize_assets, open_note, MIMES, MAX_IMAGE
 from theme import detect_system_dark, read_system_palette, system_palette_paths, tokens
 
@@ -42,6 +42,7 @@ class Session(QObject):
         self.settings = copy.deepcopy(DEFAULTS)
         self.recent = []
         self.drafts = {}
+        self.windows = {}
         self.initial_recovery = []
         try:
             stored = json.loads((self.data/"settings.json").read_text())
@@ -67,6 +68,7 @@ class Studio(QObject):
     closeRequested = Signal(str)
     allowClose = Signal()
     newWindowRequested = Signal()
+    detachedWindowRequested = Signal(str, str)
     exportRequested = Signal(str)
     folderPickerRequested = Signal()
     flushFailed = Signal(bool)
@@ -80,6 +82,9 @@ class Studio(QObject):
         self.session.changed.connect(lambda:self._emit())
         self.writes = self.session.writes
         self.window_id = uuid.uuid4().hex
+        self.session.windows[self.window_id] = self
+        self.host_window = None
+        self.retired = False
         self.completed.connect(self._complete)
         self.data = self.session.data
         self.settings = self.session.settings
@@ -147,11 +152,12 @@ class Studio(QObject):
         return next(t for t in self.tabs if t["id"] == self.active)
 
     def _emit(self, load=True):
+        if self.retired: return
         self.changed.emit()
         if load and self.ready:
             tab = self._current()
             colors = self._colors()
-            self.readerLoad.emit(json.dumps({"id": tab["id"], "content": tab["content"], "path": tab["path"] or tab["id"], "mode": self.mode, "dark": self._dark(), "fullscreen": self.fullscreen, "font": self.settings["font"], "size": self.settings["size"], "width": self.settings["width"], "zoom": self.settings["fullZoom" if self.fullscreen else "normalZoom"], "motion": self.settings["motion"], "python": self.settings["python"], "colors": colors}))
+            self.readerLoad.emit(json.dumps({"id": tab["id"], "content": tab["content"], "path": tab["path"] or tab["id"], "mode": self.mode, "dark": self._dark(), "fullscreen": self.fullscreen, "font": self.settings["font"], "size": self.settings["size"], "width": self.settings["width"], "zoom": self.settings["fullZoom" if self.fullscreen else "normalZoom"], "motion": self.settings["motion"], "python": self.settings["python"], "colors": colors, "viewState": tab.pop("viewState", None)}))
 
     def _dark(self):
         theme = self.settings["fullTheme" if self.fullscreen else "theme"]
@@ -196,11 +202,14 @@ class Studio(QObject):
         self._submit(lambda:(detect_system_dark(scheme),read_system_palette()),finished,False)
 
     def stop(self):
+        if self.retired: return
         self.theme_timer.stop()
         self.theme_debounce.stop()
         self.recovery_timer.stop()
         self.flush_timer.stop()
         self._recover()
+        self.retired = True
+        self.session.windows.pop(self.window_id, None)
         if self.system_preferences.state() != QProcess.NotRunning:
             self.system_preferences.terminate()
             self.system_preferences.waitForFinished(300)
@@ -209,6 +218,67 @@ class Studio(QObject):
     def snapshot(self):
         tab = self._current()
         return json.dumps({"tabs": [{"id": t["id"], "name": t["name"], "dirty": t["content"] != t["saved"]} for t in self.tabs], "active": self.active, "name": tab["name"], "portable": tab["portable"], "folder": self.folder, "files": self.files, "recent": self.recent, "settings": self.settings, "mode": self.mode, "fullscreen": self.fullscreen, "dark": self._dark(), "zoom": self.settings["fullZoom" if self.fullscreen else "normalZoom"], "busy": self.busy > 0, "message": self.message, "colors": self._colors()})
+
+    @Property(str, constant=True)
+    def windowId(self): return self.window_id
+
+    def _can_move(self):
+        return not (self.retired or self.busy or self.pending_close or self.pending_save_as or self.pending_export or self.flush_operation)
+
+    @Slot(str, str, result=bool)
+    def canReceiveTab(self, source_id, tab_id):
+        source = self.session.windows.get(source_id)
+        return bool(source and source._can_move() and self._can_move() and any(t["id"] == tab_id for t in source.tabs))
+
+    @Slot(str, str, int)
+    def receiveTab(self, source_id, tab_id, index):
+        if not self.canReceiveTab(source_id, tab_id): return
+        source = self.session.windows[source_id]
+        if source is self:
+            old = next(i for i, t in enumerate(self.tabs) if t["id"] == tab_id)
+            note = self.tabs.pop(old)
+            self.tabs.insert(max(0, min(len(self.tabs), index - (1 if old < index else 0))), note)
+            self._recover(); self._emit(False)
+        else:
+            source._flush("move_tab", json.dumps({"window": self.window_id, "tab": tab_id, "index": index}))
+
+    def _move_tab(self, target, tab_id, index):
+        # Keep the exact note object, including unsaved content and portable assets.
+        # Only remove it after the destination is alive and can accept ownership.
+        if target is self or not self._can_move() or not target._can_move(): return False
+        note = next((t for t in self.tabs if t["id"] == tab_id), None)
+        if not note: return False
+        old = self.tabs.index(note)
+        self.tabs.remove(note)
+        target.tabs.insert(max(0, min(len(target.tabs), index)), note)
+        target.active = tab_id
+        if not self.tabs: self.tabs.append(self._note("Untitled.md"))
+        if self.active == tab_id: self.active = self.tabs[min(old, len(self.tabs)-1)]["id"]
+        # Update both owners before writing one recovery snapshot: never duplicate
+        # or temporarily lose a dirty note in the durable recovery stream.
+        self.session.drafts[self.window_id] = [copy.deepcopy({key: value for key, value in t.items() if key != "viewState"}) for t in self.tabs if t["content"] != t["saved"]]
+        target._recover()
+        self._emit(); target._emit()
+        return True
+
+    @Slot(str)
+    def detachTab(self, tab_id):
+        if self._can_move() and any(t["id"] == tab_id for t in self.tabs): self._flush("detach_tab", tab_id)
+
+    @Slot(str, int)
+    def finishTabDrag(self, tab_id, action):
+        if action != int(Qt.DropAction.IgnoreAction.value): return
+        # Escape cancels QDrag while the button is still held; never detach then.
+        if QGuiApplication.mouseButtons() & Qt.MouseButton.LeftButton: return
+        cursor = QCursor.pos()
+        for backend in self.session.windows.values():
+            host = backend.host_window
+            if not host or not host.isVisible(): continue
+            strip = host.findChild(QObject, "tabStrip")
+            if strip:
+                point = strip.mapFromGlobal(QPointF(cursor))
+                if 0 <= point.x() <= strip.width() and 0 <= point.y() <= strip.height(): return
+        self.detachTab(tab_id)
 
     @Property("QStringList", constant=True)
     def fonts(self):
@@ -252,7 +322,7 @@ class Studio(QObject):
 
     def _recover(self):
         # Snapshot only unsaved tabs. Asset bytes stay in recovery, never in displayed source.
-        self.session.drafts[self.window_id] = [copy.deepcopy(t) for t in self.tabs if t["content"] != t["saved"]]
+        self.session.drafts[self.window_id] = [copy.deepcopy({key: value for key, value in t.items() if key != "viewState"}) for t in self.tabs if t["content"] != t["saved"]]
         payload = json.dumps([tab for tabs in self.session.drafts.values() for tab in tabs]).encode()
         self._submit(lambda: atomic_write(self.data / "recovery.json", payload), lambda *_: None, False,self.writes)
 
@@ -423,6 +493,12 @@ class Studio(QObject):
 
     def _after_flush(self,operation):
         if operation["action"] == "save": self.save()
+        elif operation["action"] == "move_tab":
+            request = json.loads(operation["target"])
+            target = self.session.windows.get(request["window"])
+            if target: self._move_tab(target, request["tab"], request["index"])
+        elif operation["action"] == "detach_tab":
+            if self._can_move(): self.detachedWindowRequested.emit(self.window_id, operation["target"])
         elif operation["action"] == "close_tab": self.closeTab(operation["target"])
         elif operation["action"] == "close_window" and self.requestWindowClose():
             self._recover()
@@ -545,7 +621,8 @@ class Studio(QObject):
     def exportTo(self, value, format):
         self.pending_save_as = ""
         self.pending_export = str(local_path(value))
-        if format == "smd": self.readerCall.emit("window.supermdPortable?.(false)")
+        if format == "md": self.readerCall.emit("window.supermdExportMarkdown?.()")
+        elif format == "smd": self.readerCall.emit("window.supermdPortable?.(false)")
         else: self.readerCall.emit(f"window.supermdExport?.({json.dumps(self.settings['pdf'])})")
 
     @Slot(str)
@@ -566,6 +643,10 @@ class Studio(QObject):
                     self.replied.emit(id,"true",""); return
                 target = next((t for t in self.tabs if t["id"] == args["id"]),None)
                 if target: target["content"] = args["content"]
+                if operation["action"] in ("move_tab", "detach_tab"):
+                    view_tab = next((t for t in self.tabs if t["id"] == args.get("viewId")), None)
+                    view = args.get("viewState")
+                    if view_tab and isinstance(view, dict) and len(json.dumps(view)) <= 12_000_000: view_tab["viewState"] = view
                 self.flush_timer.stop()
                 self.flush_operation = None
                 self._recover()
@@ -580,7 +661,7 @@ class Studio(QObject):
             if command == "zoom_changed":
                 self.settings["fullZoom" if self.fullscreen else "normalZoom"] = max(60,min(240,args["zoom"]))
                 self._emit(False); self.replied.emit(id,"true",""); return
-            if command == "export_failed": self.message = args["error"]; self._emit(False); self.replied.emit(id,"true",""); return
+            if command == "export_failed": self.pending_export = self.pending_save_as = ""; self.message = args["error"]; self._emit(False); self.replied.emit(id,"true",""); return
             if command == "request_fmd_export": self.exportRequested.emit("smd"); self.replied.emit(id,"true",""); return
             reference = args.get("id") or args.get("documentPath")
             if reference:
@@ -604,6 +685,10 @@ class Studio(QObject):
                         results.append({"source":name,"alt":Path(image["name"]).stem})
                     return results
                 if command == "run_python": return self._python(python, args["code"])
+                if command == "export_markdown_native":
+                    if not output or not isinstance(args["content"], str) or len(args["content"].encode()) > 20_000_000: raise ValueError("Choose a Markdown destination for a note under 20 MB")
+                    atomic_write(Path(output), args["content"].encode())
+                    return {"path": output}
                 if command == "export_fmd_native":
                     target = Path(captured["path"]) if args.get("save") else Path(output)
                     atomic_write(target,json.dumps(bundle(args["content"],args["assets"]),ensure_ascii=False).encode())
@@ -615,6 +700,8 @@ class Studio(QObject):
                     return {"path":output}
                 raise ValueError(f"Unsupported command: {command}")
             def finished(result,error):
+                if command.startswith("export_") and self.pending_export == output: self.pending_export = ""
+                if error and self.pending_save_as == save_as: self.pending_save_as = ""
                 if error: self.replied.emit(id,"null",error); return
                 target = next((t for t in self.tabs if t["id"] == captured["id"]),None)
                 if command == "import_images" and target: target["assets"].update(captured["assets"])
@@ -632,7 +719,7 @@ class Studio(QObject):
                     self.pending_save_as = ""
                 if command.startswith("export_"): self.message = f"Exported {Path(result['path']).name}"
                 self.replied.emit(id,json.dumps(result),"")
-            self._submit(work,finished,command in ("run_python","export_fmd_native","export_pdf_native"),self.writes if command == "export_fmd_native" else None)
+            self._submit(work,finished,command in ("run_python","export_fmd_native","export_pdf_native","export_markdown_native"),self.writes if command in ("export_fmd_native", "export_markdown_native") else None)
         except Exception as error:
             self.replied.emit(id,"null",str(error))
 

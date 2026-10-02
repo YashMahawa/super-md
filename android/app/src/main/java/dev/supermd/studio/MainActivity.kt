@@ -4,6 +4,7 @@ package dev.supermd.studio
 import android.graphics.Color as AndroidColor
 import android.os.Build
 import android.os.Bundle
+import android.content.Intent
 import android.view.WindowManager
 import android.view.ViewGroup
 import android.widget.FrameLayout
@@ -45,6 +46,7 @@ import androidx.compose.ui.graphics.lerp
 import androidx.compose.ui.graphics.toArgb
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.LocalDensity
+import androidx.compose.ui.res.painterResource
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.text.input.KeyboardType
@@ -61,15 +63,33 @@ import kotlinx.coroutines.launch
 import org.json.JSONObject
 
 class MainActivity : ComponentActivity() {
-    private val model: StudioViewModel by viewModels()
+    private var workspaceKey = "main"
+    private val model: StudioViewModel by viewModels { object : androidx.lifecycle.ViewModelProvider.Factory {
+        @Suppress("UNCHECKED_CAST")
+        override fun <T : androidx.lifecycle.ViewModel> create(modelClass: Class<T>): T = StudioViewModel(application, workspaceKey) as T
+    } }
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+        workspaceKey = (savedInstanceState?.getString("workspace") ?: intent.getStringExtra("workspace") ?: "main").takeIf { it == "main" || runCatching { java.util.UUID.fromString(it) }.isSuccess } ?: "main"
         enableEdgeToEdge()
         if (Build.VERSION.SDK_INT >= 28) window.attributes = window.attributes.apply { layoutInDisplayCutoutMode = if (Build.VERSION.SDK_INT >= 30) WindowManager.LayoutParams.LAYOUT_IN_DISPLAY_CUTOUT_MODE_ALWAYS else WindowManager.LayoutParams.LAYOUT_IN_DISPLAY_CUTOUT_MODE_SHORT_EDGES }
         setContent { Studio(model, this) }
         intent?.data?.let { uri -> model.open(uri) }
     }
     override fun onStop() { model.flush(); super.onStop() }
+    override fun dispatchKeyEvent(event: android.view.KeyEvent): Boolean {
+        if (event.action == android.view.KeyEvent.ACTION_DOWN && event.repeatCount == 0) {
+            if (event.keyCode == android.view.KeyEvent.KEYCODE_F11) { model.fullscreen(!model.state.value.fullscreen); return true }
+            if (event.keyCode == android.view.KeyEvent.KEYCODE_ESCAPE && model.state.value.fullscreen) { model.fullscreen(false); return true }
+            if (event.isCtrlPressed && event.keyCode == android.view.KeyEvent.KEYCODE_N) { if (event.isShiftPressed) newWindow() else model.newNote(); return true }
+        }
+        return super.dispatchKeyEvent(event)
+    }
+    override fun onSaveInstanceState(outState: Bundle) { outState.putString("workspace", workspaceKey); super.onSaveInstanceState(outState) }
+    fun newWindow() {
+        model.flush()
+        startActivity(Intent(this, MainActivity::class.java).putExtra("workspace", java.util.UUID.randomUUID().toString()).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_MULTIPLE_TASK or Intent.FLAG_ACTIVITY_LAUNCH_ADJACENT))
+    }
 }
 
 @Composable private fun Studio(model: StudioViewModel, activity: MainActivity) {
@@ -79,7 +99,7 @@ class MainActivity : ComponentActivity() {
     val dark = theme == "dark" || theme == "black" || (theme == "system" && systemDark)
     val context = LocalContext.current
     var colors = when { Build.VERSION.SDK_INT >= 31 -> if (dark) dynamicDarkColorScheme(context) else dynamicLightColorScheme(context); dark -> darkColorScheme(primary = Color(0xffb2c8ff), secondary = Color(0xffbcc6dc)); else -> lightColorScheme(primary = Color(0xff42669e), onPrimary = Color.White, primaryContainer = Color(0xffd7e3ff), onPrimaryContainer = Color(0xff162c4c), secondary = Color(0xff56647c), surface = Color(0xfff7f9fd), background = Color(0xfff7f9fd), surfaceContainerLow = Color(0xfff0f3fa), surfaceContainerHigh = Color(0xffe5ebf5)) }
-    if (!dark) colors = colors.copy(surface = lerp(colors.surface, colors.primaryContainer, .12f), background = lerp(colors.background, colors.primaryContainer, .12f), surfaceContainerLow = lerp(colors.surfaceContainerLow, colors.primaryContainer, .08f), onSurface = lerp(colors.onSurface, colors.surface, .14f), outlineVariant = lerp(colors.outlineVariant, colors.surface, .45f))
+    if (!dark) colors = colors.copy(surface = lerp(colors.surface, colors.primaryContainer, .40f), background = lerp(colors.background, colors.primaryContainer, .40f), surfaceContainerLow = lerp(colors.surfaceContainerLow, colors.primaryContainer, .28f), onSurface = lerp(colors.onSurface, colors.surface, .14f), outlineVariant = lerp(colors.outlineVariant, colors.surface, .45f))
     if (theme == "black") colors = colors.copy(background = Color.Black, surface = Color.Black, surfaceContainer = Color(0xff101217), surfaceContainerLow = Color(0xff080a0d))
     val systemMotion = remember { android.provider.Settings.Global.getFloat(context.contentResolver, android.provider.Settings.Global.ANIMATOR_DURATION_SCALE, 1f) != 0f }
     MaterialExpressiveTheme(colorScheme = colors, motionScheme = if (state.motion && systemMotion) MotionScheme.expressive() else NoMotionScheme) {
@@ -102,6 +122,7 @@ private object NoMotionScheme : MotionScheme {
     val snackbar = remember { SnackbarHostState() }
     var settings by remember { mutableStateOf(false) }
     var exporting by remember { mutableStateOf(false) }
+    var sharing by remember { mutableStateOf(false) }
     var zoomEditing by remember { mutableStateOf(false) }
     var menu by remember { mutableStateOf(false) }
     var web by remember { mutableStateOf<WebView?>(null) }
@@ -111,6 +132,10 @@ private object NoMotionScheme : MotionScheme {
     val recent by model.recent.collectAsStateWithLifecycle()
     var imageCallback by remember { mutableStateOf<android.webkit.ValueCallback<Array<android.net.Uri>>?>(null) }
     var imageNote by remember { mutableStateOf("") }
+    DisposableEffect(model, activity) {
+        model.shareReady = { activity.startActivity(Intent.createChooser(it, "Share note")) }
+        onDispose { model.shareReady = null }
+    }
     val imagePicker = rememberLauncherForActivityResult(ActivityResultContracts.OpenMultipleDocuments()) { uris ->
         imageCallback?.onReceiveValue(null); imageCallback = null
         if (uris.isNotEmpty()) model.importDropped(uris, imageNote) { images -> images?.let { web?.evaluateJavascript("window.supermdInsertImages?.($it)", null) } }
@@ -142,7 +167,8 @@ private object NoMotionScheme : MotionScheme {
     BoxWithConstraints(Modifier.fillMaxSize().background(palette.surface)) {
         // A phone in landscape is wide but still short. Keep its three single
         // pane modes; offer split only when both dimensions have tablet room.
-        val wide = maxWidth >= 720.dp && maxHeight >= 600.dp
+        val displayIsLarge = if (Build.VERSION.SDK_INT >= 30) activity.windowManager.maximumWindowMetrics.bounds.let { minOf(it.width(), it.height()) / density.density >= 600f } else activity.resources.configuration.smallestScreenWidthDp >= 600
+        val wide = displayIsLarge && maxWidth >= 720.dp && maxHeight >= 400.dp
         val actualMode = if (!wide && state.mode == "split") "live" else state.mode
         LaunchedEffect(readerReady, state.active, actualMode, state.zoom, dark, state.fullscreen, state.font, state.size, tokens, hinge, cutoutTop, cutoutLeft, cutoutRight, motion) {
             if (readerReady) {
@@ -185,25 +211,24 @@ private object NoMotionScheme : MotionScheme {
                 AnimatedVisibility(!state.fullscreen, enter = expandVertically(animationSpec = if (motion) spring(dampingRatio = .85f, stiffness = 500f) else tween(0)), exit = shrinkVertically(animationSpec = tween(if (motion) 180 else 0))) {
                     Column {
                         TopAppBar(title = { Column { Text(state.active.name, maxLines = 1, overflow = TextOverflow.Ellipsis, style = MaterialTheme.typography.titleMedium); Text(if (state.active.dirty) "Draft recovered automatically" else if (state.active.uri != null) "Saved" else "Local draft", style = MaterialTheme.typography.labelSmall, color = palette.onSurfaceVariant) } }, navigationIcon = { IconButton(onClick = { scope.launch { drawer.open() }; state.folder?.let { if (state.files.isEmpty()) model.listFolder(android.net.Uri.parse(it), "") } }) { Icon(Icons.Rounded.Menu, "Open files") } }, actions = {
-                            IconButton(onClick = saveAction) { Icon(Icons.Rounded.Save, "Save note") }
-                            IconButton(onClick = { exporting = true }, enabled = readerReady && !state.busy) { Icon(Icons.Rounded.IosShare, "Export") }
+                            IconButton(onClick = saveAction) { Icon(painterResource(R.drawable.symbol_save), "Save note") }
+                            IconButton(onClick = { sharing = false; exporting = true }, enabled = readerReady && !state.busy) { Icon(painterResource(R.drawable.symbol_export), "Export") }
                             Box { IconButton(onClick = { menu = true }) { Icon(Icons.Rounded.MoreVert, "More actions") }; DropdownMenu(expanded = menu, onDismissRequest = { menu = false }) {
-                                DropdownMenuItem(text = { Text("Open note") }, onClick = { menu = false; open.launch(arrayOf("text/*", "application/octet-stream", "application/vnd.supermd.smd", "application/vnd.supermd.fmd")) }, leadingIcon = { Icon(Icons.Rounded.FolderOpen, null) })
-                                DropdownMenuItem(text = { Text("New tab") }, onClick = { menu = false; model.newNote() }, leadingIcon = { Icon(Icons.Rounded.Add, null) })
+                                DropdownMenuItem(text = { Text("Open note") }, onClick = { menu = false; open.launch(arrayOf("text/*", "application/octet-stream", "application/vnd.supermd.smd", "application/vnd.supermd.fmd")) }, leadingIcon = { Icon(painterResource(R.drawable.symbol_file), null) })
+                                DropdownMenuItem(text = { Text("New tab") }, onClick = { menu = false; model.newNote() }, leadingIcon = { Icon(painterResource(R.drawable.symbol_add), null) })
+                                DropdownMenuItem(text = { Text("New window") }, onClick = { menu = false; activity.newWindow() }, leadingIcon = { Icon(painterResource(R.drawable.symbol_open_window), null) })
+                                DropdownMenuItem(text = { Text("Share note") }, enabled = readerReady && !state.busy, onClick = { menu = false; sharing = true; exporting = true }, leadingIcon = { Icon(painterResource(R.drawable.symbol_share), null) })
                                 DropdownMenuItem(text = { Text("Reopen closed tab") }, onClick = { menu = false; model.reopen() })
                                 DropdownMenuItem(text = { Text("Save as Markdown") }, onClick = { menu = false; save.launch(state.active.name.substringBeforeLast('.') + ".md") })
-                                DropdownMenuItem(text = { Text("Insert image or link") }, onClick = { menu = false; web?.evaluateJavascript("window.supermdMedia?.()", null) }, leadingIcon = { Icon(Icons.Rounded.Image, null) })
-                                DropdownMenuItem(text = { Text("Fix LaTeX") }, onClick = { menu = false; web?.evaluateJavascript("window.supermdRepairMath?.()", null) })
+                                DropdownMenuItem(text = { Text("Insert image or link") }, onClick = { menu = false; web?.evaluateJavascript("window.supermdMedia?.()", null) }, leadingIcon = { Icon(painterResource(R.drawable.symbol_image), null) })
+                                DropdownMenuItem(text = { Text("Fix LaTeX") }, onClick = { menu = false; web?.evaluateJavascript("window.supermdRepairMath?.()", null) }, leadingIcon = { Icon(painterResource(R.drawable.symbol_bug), null) })
                                 DropdownMenuItem(text = { Text("Zoom · ${state.zoom.toInt()}%") }, onClick = { menu = false; zoomEditing = true }, leadingIcon = { Icon(Icons.Rounded.ZoomIn, null) })
-                                DropdownMenuItem(text = { Text("Find and replace") }, onClick = { menu = false; model.mode("editor"); web?.postDelayed({ web?.evaluateJavascript("window.supermdFind?.()", null) }, 200) }, leadingIcon = { Icon(Icons.Rounded.Search, null) })
-                                DropdownMenuItem(text = { Text("Fullscreen study") }, onClick = { menu = false; model.fullscreen(true) }, leadingIcon = { Icon(Icons.Rounded.Fullscreen, null) })
-                                DropdownMenuItem(text = { Text("Settings") }, onClick = { menu = false; settings = true }, leadingIcon = { Icon(Icons.Rounded.Settings, null) })
+                                DropdownMenuItem(text = { Text("Find and replace") }, onClick = { menu = false; model.mode("editor"); web?.postDelayed({ web?.evaluateJavascript("window.supermdFind?.()", null) }, 200) }, leadingIcon = { Icon(painterResource(R.drawable.symbol_search), null) })
+                                DropdownMenuItem(text = { Text("Fullscreen study") }, onClick = { menu = false; model.fullscreen(true) }, leadingIcon = { Icon(painterResource(R.drawable.symbol_fullscreen), null) })
+                                DropdownMenuItem(text = { Text("Settings") }, onClick = { menu = false; settings = true }, leadingIcon = { Icon(painterResource(R.drawable.symbol_settings), null) })
                             } }
                         })
-                        Row(Modifier.fillMaxWidth().horizontalScroll(rememberScrollState()).padding(horizontal = 12.dp, vertical = 4.dp), verticalAlignment = Alignment.CenterVertically) {
-                            state.tabs.forEach { note -> Surface(color = if (state.active.id == note.id) palette.secondaryContainer else palette.surface, shape = RoundedCornerShape(18.dp), modifier = Modifier.padding(end = 4.dp)) { Row(verticalAlignment = Alignment.CenterVertically) { TextButton(onClick = { model.select(note.id) }, contentPadding = PaddingValues(start = 12.dp, end = 4.dp)) { Text((if (note.dirty) "• " else "") + note.name, maxLines = 1) }; IconButton(onClick = { model.close(note.id) }, modifier = Modifier.size(36.dp)) { Icon(Icons.Rounded.Close, "Close ${note.name}", Modifier.size(16.dp)) } } } }
-                            IconButton(onClick = model::newNote) { Icon(Icons.Rounded.Add, "New tab") }
-                        }
+                        NoteTabs(state.tabs, state.active.id, motion, model::select, model::close, model::reorder, model::newNote)
                         val modes = if (wide) listOf("live", "editor", "reader", "split") else listOf("live", "editor", "reader")
                         SingleChoiceSegmentedButtonRow(Modifier.fillMaxWidth().padding(horizontal = if (wide) 32.dp else 16.dp, vertical = 8.dp)) { modes.forEachIndexed { index, mode -> SegmentedButton(selected = actualMode == mode, onClick = { model.mode(mode) }, shape = SegmentedButtonDefaults.itemShape(index, modes.size)) { Text(when(mode) { "editor" -> "Source"; "reader" -> "Read"; "split" -> "Split"; else -> "Live" }) } } }
                     }
@@ -260,7 +285,12 @@ private object NoMotionScheme : MotionScheme {
             Settings(state, model)
         } }
     }
-    if (exporting) ModalBottomSheet(onDismissRequest = { exporting = false }) { ExportSettings(state.pdf, model::pdf, state.active.portable) { format -> exporting = false; if (format == "smd") portable.launch(state.active.name.substringBeforeLast('.') + ".smd") else pdf.launch(state.active.name.substringBeforeLast('.') + ".pdf") } }
+    if (exporting) ModalBottomSheet(onDismissRequest = { exporting = false }) { ExportSettings(state.pdf, model::pdf, state.active.portable, sharing) { format ->
+        exporting = false
+        if (sharing) {
+            if (model.prepareShare(format)) when (format) { "pdf" -> web?.evaluateJavascript("window.supermdExport?.(${state.pdf})", null) ?: model.fail("The reader is not ready"); "smd" -> web?.evaluateJavascript("window.supermdPortable?.(false)", null) ?: model.fail("The reader is not ready"); "md" -> web?.evaluateJavascript("window.supermdExportMarkdown?.()", null) ?: model.fail("The reader is not ready") }
+        } else if (format == "smd") portable.launch(state.active.name.substringBeforeLast('.') + ".smd") else pdf.launch(state.active.name.substringBeforeLast('.') + ".pdf")
+    } }
     if (zoomEditing) ZoomDialog(state.zoom, { zoomEditing = false }) { model.zoom(it); zoomEditing = false }
     state.error?.let { AlertDialog(onDismissRequest = model::dismissError, title = { Text("Couldn't finish") }, text = { Text(it, Modifier.heightIn(max = 360.dp).verticalScroll(rememberScrollState())) }, confirmButton = { TextButton(onClick = model::dismissError) { Text("OK") } }) }
     if (!state.welcomed) WelcomeSetup(state, model) { model.welcomeDone(); open.launch(arrayOf("text/*", "application/octet-stream", "application/vnd.supermd.smd", "application/vnd.supermd.fmd")) }
@@ -286,17 +316,39 @@ private object NoMotionScheme : MotionScheme {
 private fun hex(color: Color) = "#%06x".format(color.toArgb() and 0xffffff)
 
 @Composable private fun Settings(state: StudioState, model: StudioViewModel) {
-    Column(Modifier.fillMaxWidth().verticalScroll(rememberScrollState()).padding(24.dp)) {
-        Text("Make room for thought", style = MaterialTheme.typography.headlineSmall)
-        Spacer(Modifier.height(20.dp))
-        Choice("Appearance", state.theme, listOf("system" to "System", "light" to "Light", "dark" to "Dark", "black" to "Pure black")) { model.appearance(theme = it) }
-        Choice("Fullscreen appearance", state.fullscreenTheme, listOf("system" to "System", "light" to "Light", "dark" to "Dark", "black" to "Pure black")) { model.appearance(fullTheme = it) }
-        Choice("Reading font", state.font, listOf("sans" to "Manrope", "roboto" to "Roboto", "serif" to "Noto Serif", "mono" to "JetBrains Mono", "system" to "System")) { model.appearance(font = it) }
-        Text("Text size · ${state.size.toInt()}", style = MaterialTheme.typography.titleSmall, modifier = Modifier.padding(top = 16.dp))
-        StudySlider(value = state.size, onCommit = { model.appearance(size = it) }, valueRange = 13f..28f)
-        Row(verticalAlignment = Alignment.CenterVertically) { Column(Modifier.weight(1f)) { Text("Expressive motion", style = MaterialTheme.typography.titleMedium); Text("Spring transitions and responsive controls", style = MaterialTheme.typography.bodySmall) }; Switch(checked = state.motion, onCheckedChange = { model.appearance(motion = it) }) }
-        Text("Dynamic color follows your wallpaper on Android 12+. The monochrome icon follows your launcher's themed-icon setting.", style = MaterialTheme.typography.bodySmall, modifier = Modifier.padding(top = 16.dp))
-        Spacer(Modifier.height(32.dp))
+    Column(Modifier.fillMaxWidth().verticalScroll(rememberScrollState()), horizontalAlignment = Alignment.CenterHorizontally) {
+        Column(Modifier.widthIn(max = 760.dp).fillMaxWidth().padding(16.dp), verticalArrangement = Arrangement.spacedBy(16.dp)) {
+            SettingsSection("Appearance") {
+                Text("System follows your wallpaper colors. Fullscreen can have a different theme.", style = MaterialTheme.typography.bodyMedium, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                Choice("Workspace theme", state.theme, listOf("system" to "System", "light" to "Light", "dark" to "Dark", "black" to "Pure black")) { model.appearance(theme = it) }
+                Choice("Fullscreen theme", state.fullscreenTheme, listOf("system" to "System", "light" to "Light", "dark" to "Dark", "black" to "Pure black")) { model.appearance(fullTheme = it) }
+                Row(verticalAlignment = Alignment.CenterVertically) { Column(Modifier.weight(1f)) { Text("Expressive motion", style = MaterialTheme.typography.titleMedium); Text("Spring transitions and responsive controls", style = MaterialTheme.typography.bodySmall) }; Switch(checked = state.motion, onCheckedChange = { model.appearance(motion = it) }) }
+            }
+            SettingsSection("Reading") {
+                Choice("Reading font", state.font, listOf("sans" to "Manrope", "roboto" to "Roboto", "noto" to "Noto Sans", "serif" to "Noto Serif", "mono" to "JetBrains Mono", "system" to "System")) { model.appearance(font = it) }
+                Text("Text size · ${state.size.toInt()} px", style = MaterialTheme.typography.titleSmall, modifier = Modifier.padding(top = 16.dp))
+                StudySlider(value = state.size, onCommit = { model.appearance(size = it) }, valueRange = 12f..32f)
+                Text("Reading uses the available window width. Pinch text, images and plots independently.", style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+            }
+            SettingsSection("PDF defaults") {
+                val options = remember(state.pdf) { JSONObject(state.pdf) }
+                PdfOptions(options) { key, value -> model.pdf(JSONObject(state.pdf).put(key, value).toString()) }
+            }
+            SettingsSection("Python & windows") {
+                Text("NumPy and Matplotlib run locally in a separate worker. Code runs only when you press Run; never automatically on open or export.", style = MaterialTheme.typography.bodyMedium)
+                Text("New window opens an independent workspace. Your device controls split-screen and desktop window placement. Hold and drag a tab to reorder it.", style = MaterialTheme.typography.bodyMedium)
+                Text("The monochrome icon follows your launcher's themed-icon setting.", style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+            }
+        }
+    }
+}
+
+@Composable private fun SettingsSection(title: String, content: @Composable ColumnScope.() -> Unit) {
+    Surface(shape = RoundedCornerShape(28.dp), color = MaterialTheme.colorScheme.surfaceContainerLow) {
+        Column(Modifier.fillMaxWidth().padding(20.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
+            Text(title, style = MaterialTheme.typography.titleLarge)
+            content()
+        }
     }
 }
 
@@ -313,28 +365,35 @@ private fun hex(color: Color) = "#%06x".format(color.toArgb() and 0xffffff)
     Slider(state = slider, onValueChange = { slider.value = it }, onValueChangeFinished = { onCommit(slider.value) })
 }
 
-@Composable private fun ExportSettings(raw: String, onChange: (String) -> Unit, portableSource: Boolean = false, export: (String) -> Unit) {
+@Composable private fun PdfOptions(options: JSONObject, update: (String, Any) -> Unit) {
+    Choice("Paper", options.optString("pageSize", "a4"), listOf("a4" to "A4", "a5" to "A5", "letter" to "Letter", "legal" to "Legal")) { update("pageSize", it) }
+    Choice("Document font", options.optString("fontFamily", "Libertinus Serif"), listOf("Libertinus Serif" to "Serif", "Noto Sans" to "Sans", "New Computer Modern" to "Book", "DejaVu Sans Mono" to "Mono")) { update("fontFamily", it) }
+    Text("Margins · ${options.optDouble("margin",18.0).toInt()} mm", Modifier.padding(top = 16.dp)); StudySlider(value = options.optDouble("margin",18.0).toFloat(), onCommit = { update("margin", it.toInt()) }, valueRange = 4f..60f)
+    Text("Font size · ${"%.1f".format(options.optDouble("fontSize",10.5))} pt"); StudySlider(value = options.optDouble("fontSize",10.5).toFloat(), onCommit = { update("fontSize", (it * 2).toInt() / 2.0) }, valueRange = 7f..24f)
+    Text("Line spacing · ${"%.2f".format(options.optDouble("lineHeight",1.35))}"); StudySlider(value = options.optDouble("lineHeight",1.35).toFloat(), onCommit = { update("lineHeight", it.toDouble()) }, valueRange = .9f..2.2f)
+    Row(verticalAlignment = Alignment.CenterVertically) { Text("Page numbers", Modifier.weight(1f), style = MaterialTheme.typography.titleMedium); Switch(checked = options.optBoolean("pageNumbers",true), onCheckedChange = { update("pageNumbers", it) }) }
+}
+
+@Composable private fun ExportSettings(raw: String, onChange: (String) -> Unit, portableSource: Boolean = false, sharing: Boolean = false, export: (String) -> Unit) {
     var format by rememberSaveable { mutableStateOf("pdf") }
     var options by remember(raw) { mutableStateOf(JSONObject(raw)) }
     fun update(key: String, value: Any) { options = JSONObject(options.toString()).put(key, value); onChange(options.toString()) }
     Column(Modifier.fillMaxWidth().verticalScroll(rememberScrollState()).padding(24.dp)) {
-        Text("Export your note", style = MaterialTheme.typography.headlineSmall)
-        if (!portableSource) SingleChoiceSegmentedButtonRow(Modifier.fillMaxWidth().padding(vertical = 16.dp)) {
-            listOf("pdf" to "PDF document", "smd" to "Portable SMD").forEachIndexed { index, (key, label) -> SegmentedButton(selected = format == key, onClick = { format = key }, shape = SegmentedButtonDefaults.itemShape(index, 2)) { Text(label) } }
+        Text(if (sharing) "Share your note" else "Export your note", style = MaterialTheme.typography.headlineSmall)
+        val formats = if (sharing) listOf("pdf" to "PDF", "md" to "Markdown", "smd" to "Portable SMD") else listOf("pdf" to "PDF document", "smd" to "Portable SMD")
+        if (!portableSource || sharing) SingleChoiceSegmentedButtonRow(Modifier.fillMaxWidth().padding(vertical = 16.dp)) {
+            formats.forEachIndexed { index, (key, label) -> SegmentedButton(selected = format == key, onClick = { format = key }, shape = SegmentedButtonDefaults.itemShape(index, formats.size)) { Text(label) } }
         }
         if (format == "pdf") {
         Text("Vector equations, plots and real pagination. Typeset locally on this device.", style = MaterialTheme.typography.bodyMedium, modifier = Modifier.padding(bottom = 12.dp))
-        Choice("Paper", options.optString("pageSize", "a4"), listOf("a4" to "A4", "a5" to "A5", "letter" to "Letter", "legal" to "Legal")) { update("pageSize", it) }
-        Choice("Document font", options.optString("fontFamily", "Libertinus Serif"), listOf("Libertinus Serif" to "Serif", "Noto Sans" to "Sans", "New Computer Modern" to "Book", "DejaVu Sans Mono" to "Mono")) { update("fontFamily", it) }
-        Text("Margins · ${options.optDouble("margin",18.0).toInt()} mm", Modifier.padding(top = 16.dp)); StudySlider(value = options.optDouble("margin",18.0).toFloat(), onCommit = { update("margin", it.toInt()) }, valueRange = 4f..60f)
-        Text("Font size · ${"%.1f".format(options.optDouble("fontSize",10.5))} pt"); StudySlider(value = options.optDouble("fontSize",10.5).toFloat(), onCommit = { update("fontSize", (it * 2).toInt() / 2.0) }, valueRange = 7f..24f)
-        Text("Line spacing · ${"%.2f".format(options.optDouble("lineHeight",1.35))}"); StudySlider(value = options.optDouble("lineHeight",1.35).toFloat(), onCommit = { update("lineHeight", it.toDouble()) }, valueRange = .9f..2.2f)
-        Row(verticalAlignment = Alignment.CenterVertically) { Text("Page numbers", Modifier.weight(1f), style = MaterialTheme.typography.titleMedium); Switch(checked = options.optBoolean("pageNumbers",true), onCheckedChange = { update("pageNumbers", it) }) }
+        PdfOptions(options, ::update)
+        } else if (format == "md") {
+            Text("Editable Markdown text. For a single file that also includes images, choose Portable SMD.", style = MaterialTheme.typography.bodyMedium)
         } else {
             Text("Your Markdown and images in one editable file.", style = MaterialTheme.typography.titleMedium)
             Text("Reopen it in Super MD to edit, drop in images, or select an image to replace or remove it. Source mode shows Markdown, never image bytes.", style = MaterialTheme.typography.bodyMedium, modifier = Modifier.padding(top = 12.dp))
         }
-        Button(onClick = { export(format) }, shapes = ButtonDefaults.shapes(), modifier = Modifier.fillMaxWidth().padding(top = 20.dp, bottom = 28.dp)) { Icon(Icons.Rounded.IosShare, null); Text("Choose destination & export", Modifier.padding(start = 8.dp)) }
+        Button(onClick = { export(format) }, shapes = ButtonDefaults.shapes(), modifier = Modifier.fillMaxWidth().padding(top = 20.dp, bottom = 28.dp)) { Icon(if (sharing) Icons.Rounded.Share else Icons.Rounded.IosShare, null); Text(if (sharing) "Prepare & share" else "Choose destination & export", Modifier.padding(start = 8.dp)) }
     }
 }
 

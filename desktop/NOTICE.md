@@ -26,3 +26,6 @@ Symbols Rounded, weight 600 (Apache-2.0), downloaded from google/material-design
 737e3324305806514d7909874fa1818ae1808232. Their license is bundled in
 licenses/qt/Material-Symbols-Apache-2.0.txt.
 Source: https://github.com/google/material-design-icons/tree/737e3324305806514d7909874fa1818ae1808232/symbols/web
+
+Android uses the same path geometry converted to VectorDrawable XML with a
+viewBox translation. Its distribution includes the same Apache-2.0 license.

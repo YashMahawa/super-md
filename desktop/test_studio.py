@@ -129,6 +129,68 @@ class StudioTest(unittest.TestCase):
         studio.setFullscreen(False)
         self.assertEqual(json.loads(studio.snapshot)["zoom"],130)
 
+    def test_reorder_keeps_active_note_and_portable_assets(self):
+        studio = self.studio
+        studio.newNote(); studio.newNote()
+        note = studio._current()
+        note.update(content="![image](smd-asset:x)", assets={"x": "image bytes"}, portable=True)
+        studio.receiveTab(studio.window_id, note["id"], 0)
+        self.assertIs(studio.tabs[0], note)
+        self.assertEqual(studio.active, note["id"])
+        self.assertEqual(note["assets"], {"x": "image bytes"})
+
+    def test_window_transfer_flushes_latest_text_and_recovers_exactly_once(self):
+        source, target = self.studio, self.window()
+        note = source._current()
+        note.update(assets={"image": "bytes"}, portable=True)
+        source.ready = True
+        target.receiveTab(source.window_id, note["id"], 0)
+        self.assertIn(note, source.tabs)
+        operation = dict(source.flush_operation)
+        source.post("flush", "document_flushed", json.dumps({"id": note["id"], "content": "last keystroke", "operation": operation}))
+        self.assertNotIn(note, source.tabs)
+        self.assertIs(target.tabs[0], note)
+        self.assertEqual(target.active, note["id"])
+        self.assertEqual(note["content"], "last keystroke")
+        self.assertEqual(note["assets"], {"image": "bytes"})
+        self.flush()
+        recovered = json.loads((source.data / "recovery.json").read_text())
+        self.assertEqual([t["content"] for t in recovered], ["last keystroke"])
+
+    def test_closed_or_busy_destination_cannot_lose_the_source_tab(self):
+        source, target = self.studio, self.window()
+        source.ready = True
+        note = source._current()
+        target.receiveTab(source.window_id, note["id"], 0)
+        operation = dict(source.flush_operation)
+        target.stop()
+        source.post("flush", "document_flushed", json.dumps({"id": note["id"], "content": "keep me", "operation": operation}))
+        self.assertIn(note, source.tabs)
+        third = self.window(); third.busy = 1
+        third.receiveTab(source.window_id, note["id"], 0)
+        self.assertIn(note, source.tabs)
+        self.assertIsNone(source.flush_operation)
+
+    def test_detach_is_a_flush_then_request_not_a_destructive_close(self):
+        studio = self.studio
+        studio.ready = True
+        requests = []
+        studio.detachedWindowRequested.connect(lambda window, tab: requests.append((window, tab)))
+        studio.detachTab(studio.active)
+        operation = dict(studio.flush_operation)
+        studio.post("flush", "document_flushed", json.dumps({"id": studio.active, "content": "unsaved", "operation": operation}))
+        self.assertEqual(requests, [(studio.window_id, studio.active)])
+        self.assertEqual(studio._current()["content"], "unsaved")
+
+    def test_share_markdown_uses_the_final_reader_snapshot_and_releases_tab_moves(self):
+        path = self.studio.data / "shared.md"
+        self.studio.exportTo(str(path), "md")
+        self.assertFalse(self.studio._can_move())
+        self.studio.post("export", "export_markdown_native", json.dumps({"id": self.studio.active, "content": "the final edit"}))
+        self.await_idle()
+        self.assertEqual(path.read_text(), "the final edit")
+        self.assertTrue(self.studio._can_move())
+
     def test_settings_sync_and_invalid_themes_cannot_corrupt_the_ui(self):
         second = self.window()
         self.studio.setting("theme",'"light"')

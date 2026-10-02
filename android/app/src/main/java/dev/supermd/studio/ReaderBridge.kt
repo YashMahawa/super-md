@@ -33,13 +33,14 @@ class ReaderBridge(private val web: WebView, private val model: StudioViewModel,
                     "export_fmd_native" -> { model.writePortable(args.getString("id"), args.getString("content"), args.getJSONObject("assets"), args.optBoolean("save"), args.getString("originalContent")); true }
                     "run_python" -> model.python(args.getString("code"))
                     "export_pdf_native" -> { model.export(args.getString("content"), args.getJSONObject("options").toString(), args.getJSONObject("assets")); true }
+                    "export_markdown_native" -> { model.shareMarkdown(args.getString("content")); true }
                     "export_failed" -> { model.fail(args.getString("error")); true }
                     else -> error("Unknown document command")
                 }
                 val encoded = when(output) { null -> "null"; is JSONObject -> output.toString(); is String -> JSONObject.quote(output); else -> output.toString() }
                 web.post { web.evaluateJavascript("window.supermdReply?.(${JSONObject.quote(id)},$encoded,null)", null) }
             } catch (error: Exception) {
-                if (command == "export_pdf_native") model.fail("PDF export failed: ${error.message}")
+                if (command in listOf("export_pdf_native", "export_fmd_native", "export_markdown_native")) model.fail("Export failed: ${error.message}")
                 web.post { web.evaluateJavascript("window.supermdReply?.(${JSONObject.quote(id)},null,${JSONObject.quote(error.message ?: "Operation failed")})", null) }
             }
         } }

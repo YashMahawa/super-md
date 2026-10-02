@@ -1,7 +1,7 @@
 import { useEffect, useRef, useState } from "react";
 import { Compartment, EditorSelection, EditorState } from "@codemirror/state";
 import { EditorView, keymap, lineNumbers, highlightActiveLine, drawSelection } from "@codemirror/view";
-import { defaultKeymap, history, historyKeymap, indentWithTab } from "@codemirror/commands";
+import { defaultKeymap, history, historyField, historyKeymap, indentWithTab } from "@codemirror/commands";
 import { markdown, markdownLanguage } from "@codemirror/lang-markdown";
 import { syntaxHighlighting, defaultHighlightStyle, foldGutter, foldKeymap } from "@codemirror/language";
 import { searchKeymap, highlightSelectionMatches, openSearchPanel } from "@codemirror/search";
@@ -18,6 +18,22 @@ interface Props {
 const sessions = new Map<string, { state: EditorState; top: number; appearance: Compartment; wrapping: Compartment; wrapped: boolean }>();
 const callbacks = new Map<string, (value: string) => void>();
 const statusHandlers = new Map<string, (state: EditorState) => void>();
+const visibleEditors = new Map<string, EditorView>();
+export interface PortableEditorSession { state: unknown; top: number; wrapped: boolean }
+const incomingSessions = new Map<string, PortableEditorSession>();
+export function exportEditorSession(id: string): PortableEditorSession | undefined {
+  const view = visibleEditors.get(id), cached = sessions.get(id);
+  const state = view?.state || cached?.state;
+  if (!state) return;
+  const result = {state: state.toJSON({history: historyField}), top: view?.scrollDOM.scrollTop ?? cached?.top ?? 0, wrapped: view?.lineWrapping ?? cached?.wrapped ?? true};
+  // View metadata is transient, bounded and never part of portable Markdown.
+  if (JSON.stringify(result).length <= 2_000_000) return result;
+}
+export function importEditorSession(id: string, data: PortableEditorSession | undefined) {
+  if (!data || typeof data.top !== "number" || !Number.isFinite(data.top) || typeof data.wrapped !== "boolean") return;
+  incomingSessions.set(id, data); sessions.delete(id);
+  if (incomingSessions.size > 40) incomingSessions.delete(incomingSessions.keys().next().value!);
+}
 export default function Editor({ sessionId = "default", value, onChange, dark, focusMode }: Props) {
   const host = useRef<HTMLDivElement>(null);
   const view = useRef<EditorView | null>(null);
@@ -54,8 +70,10 @@ export default function Editor({ sessionId = "default", value, onChange, dark, f
   useEffect(() => {
     if (!host.current) return;
     const cached = sessions.get(sessionId);
+    const incoming = incomingSessions.get(sessionId); incomingSessions.delete(sessionId);
+    if (incoming) setWrap(incoming.wrapped);
     if (cached) { appearance.current = cached.appearance; wrapping.current = cached.wrapping; setWrap(cached.wrapped); }
-    const state = cached?.state.doc.toString() === value ? cached.state : EditorState.create({
+    const config = {
       doc: value,
       extensions: [
         lineNumbers(),
@@ -75,11 +93,21 @@ export default function Editor({ sessionId = "default", value, onChange, dark, f
         }),
         appearance.current.of(editorTheme())
       ]
-    });
+    };
+    let state = cached?.state.doc.toString() === value ? cached.state : EditorState.create(config);
+    if (incoming) {
+      try {
+        const restored = EditorState.fromJSON(incoming.state, config, {history: historyField});
+        if (restored.doc.toString() === value) state = restored;
+      } catch { /* Invalid/oversized optional view state must not block the note. */ }
+    }
     view.current = new EditorView({ state, parent: host.current });
+    visibleEditors.set(sessionId, view.current);
     describeSelection(view.current.state);
     if (cached) view.current.scrollDOM.scrollTop = cached.top;
+    if (incoming) view.current.scrollDOM.scrollTop = Math.max(0, incoming.top);
     return () => {
+      visibleEditors.delete(sessionId);
       if (view.current) { sessions.set(sessionId, { state: view.current.state, top: view.current.scrollDOM.scrollTop, appearance: appearance.current, wrapping: wrapping.current, wrapped: wrapReference.current }); if (sessions.size > 40) { const first = sessions.keys().next().value!; sessions.delete(first); callbacks.delete(first); statusHandlers.delete(first); } view.current.destroy(); }
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps

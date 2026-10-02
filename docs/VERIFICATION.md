@@ -1,5 +1,25 @@
 # Verification
 
+## Native tabs and aligned Android design — 2026-10-02
+
+- 37 real Python/Qt tests pass, including native DropArea events, stable
+  auto-hiding scrollbar hit areas, portable draft ownership, stale/busy/closed
+  destinations, final edit flushing and recovery exactly once after transfer.
+- 40 frontend unit tests and 10 browser workflows pass. Browser tests include
+  cross-window Source undo/caret serialization, gutter visibility without width
+  changes, independent plot/text zoom and full-document Obsidian math parsing.
+- The native desktop's real presented-pixel smoke check passed for the heavier
+  fullscreen icon, tint, menus/gutters, narrow layout and actual typeset PDF.
+  Further final-bundle checks are required before release.
+- Android window isolation, long-press tab gestures and restricted PDF share
+  URIs have new instrumentation tests. Their compilation passed locally;
+  executing these new tests on the emulator is still a release gate, not inferred
+  from browser tests. The first lint pass caught an indentation error; it was
+  corrected rather than suppressed. Existing actual-painting assertions remain.
+- Physical phone/foldable hardware and macOS/Windows native drag ergonomics
+  remain separate user-device checks. See `PLATFORM-PARITY.md` for explicit
+  platform-adapter differences; do not claim blanket 100% parity.
+
 ## Media and FMD update — 2026-10-01
 
 - 26 frontend unit tests pass. New tests cover icon-free click-to-edit, safe SVG

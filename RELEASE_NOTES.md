@@ -24,7 +24,11 @@ the entire renderer is browser-free.
 - Compact desktop settings dialog, system font choices and aligned, scrollable
   dropdowns that stay within the settings viewport.
 - Larger weight-600 Material SVG toolbar icons and rounded scrollbars with a
-  dedicated gutter, so settings controls never sit underneath the thumb.
+  dedicated gutter, so settings controls never sit underneath the thumb. Scroll
+  indicators hide while idle and reveal during scrolling or gutter hover.
+- Native tab drag-to-reorder, movement between windows and detach-to-new-window,
+  with safe draft/asset ownership and bounded Source undo/caret transfer.
+- Stronger accent-tinted light paper, without replacing dark/pure-black themes.
 - Click images for independent zoom/pan, without changing document text zoom.
 - Remote image and video-thumbnail previews use the native consent-gated loader.
 - Source mode has a theme-paired editing surface, clearer caret/gutter,
@@ -52,9 +56,15 @@ it does not print the DOM. Export includes math, images, Mermaid, static graph
 snapshots and figures from Python cells you explicitly ran. Tables and long
 code paginate; wide equations fit; page numbers can be disabled.
 
-Android retains its native Kotlin/Compose Material 3 Expressive UI, with clearer
-file actions, dedicated settings, more reading fonts, portable-format
-compatibility and the shared image/graph/repair improvements. The APK is an
+Android uses the same weight-600 Material symbol paths and tinted surface
+hierarchy as desktop, with grouped settings and shared PDF configuration in
+Settings, Export and Share. Hold and drag tabs to reorder; TalkBack has move
+actions too. New window creates an independent Android task and recovery file,
+with split/desktop placement controlled by the device. Tablet/foldable layouts
+adapt to the current window; phone landscape retains single-pane modes.
+Android's system share sheet supports PDF, Markdown and portable SMD using
+restricted read-only content URIs. Markdown sharing is text-only; SMD carries
+images. Cross-window Android tab dragging is intentionally omitted. The APK is an
 optimized, non-debuggable arm64 release and preserves the existing upgrade
 certificate. No on-device phone testing was performed for this update.
 
