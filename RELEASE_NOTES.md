@@ -1,5 +1,8 @@
 # Super MD 0.4.0
 
+Normal desktop window management is restored; study fullscreen now remembers
+whether the window was maximized instead of resetting its size on exit.
+
 ## Native desktop controls
 
 The desktop window now uses Qt Quick / QML instead of a Tauri host: native tabs,

@@ -44,6 +44,8 @@ def installers(version):
             stage = Path(temporary)
             appdir = stage / "SuperMD.AppDir"
             shutil.copytree(OUTPUT / "super-md", appdir / "usr/lib/super-md", symlinks=True)
+            (appdir / "usr/bin").mkdir(parents=True)
+            (appdir / "usr/bin/super-md").symlink_to("../lib/super-md/super-md")
             for source, target in [("desktop/linux/dev.supermd.studio.desktop", "dev.supermd.studio.desktop"),
                                    ("desktop/linux/AppRun", "AppRun"),
                                    ("public/brand-mark-fixed.svg", "super-md.svg")]:

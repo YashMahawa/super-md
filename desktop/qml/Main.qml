@@ -20,6 +20,11 @@ ApplicationWindow {
     property bool closingAllowed: false
     property string outputFormat: "pdf"
     property bool sharing: false
+    WindowModes {
+        id: windowModes
+        host: window
+        onFullscreenChanged: studio.setFullscreen(fullscreen)
+    }
     function runDocumentScript(script) { reader.runJavaScript(script) }
     Material.theme: viewState.dark ? Material.Dark : Material.Light
     Material.primary: viewState.colors.primary
@@ -47,7 +52,7 @@ ApplicationWindow {
     Shortcut { sequences: [StandardKey.Close]; onActivated: studio.closeTabSafely(viewState.active) }
     Shortcut { sequence: "Ctrl+Shift+N"; onActivated: studio.command("window") }
     Shortcut { sequence: "Ctrl+,"; onActivated: settingsOpen = !settingsOpen }
-    Shortcut { sequence: "F11"; onActivated: { studio.setFullscreen(!viewState.fullscreen); window.visibility = viewState.fullscreen ? Window.FullScreen : Window.Windowed } }
+    Shortcut { sequence: "F11"; onActivated: windowModes.setFullscreen(!windowModes.fullscreen) }
     Shortcut { sequence: "Escape"; enabled: settingsOpen; onActivated: settingsOpen = false }
     // Qt's chrome never scales. Keyboard/pinch zoom is routed to the content pane.
     Shortcut { sequence: "Ctrl++"; onActivated: reader.runJavaScript("window.supermdZoomBy?.(1.1)") }
@@ -187,7 +192,7 @@ ApplicationWindow {
                         background: Rectangle { radius: 12; antialiasing: true; color: viewState.colors["surface-high"]; border.width: parent.activeFocus ? 2 : 0; border.color: viewState.colors.primary }
                         Accessible.name: "Zoom percentage"
                     }
-                    ActionButton { glyph: "ArrowsOut"; compact: true; ToolTip.text: "Fullscreen study"; onClicked: { studio.setFullscreen(true); window.showFullScreen() } }
+                    ActionButton { glyph: "ArrowsOut"; compact: true; ToolTip.text: "Fullscreen study"; onClicked: windowModes.setFullscreen(true) }
                 }
                 WebEngineView {
                     id: reader
@@ -223,7 +228,7 @@ ApplicationWindow {
                     }
                 }
             }
-            ActionButton { visible: viewState.fullscreen; text: "Exit fullscreen"; anchors.right: parent.right; anchors.top: parent.top; anchors.margins: 12; onClicked: { studio.setFullscreen(false); window.showNormal() } }
+            ActionButton { visible: viewState.fullscreen; text: "Exit fullscreen"; anchors.right: parent.right; anchors.top: parent.top; anchors.margins: 12; onClicked: windowModes.setFullscreen(false) }
         }
     }
     Dialog {
