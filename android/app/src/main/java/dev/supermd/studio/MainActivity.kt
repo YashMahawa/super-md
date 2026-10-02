@@ -77,14 +77,15 @@ class MainActivity : ComponentActivity() {
         intent?.data?.let { uri -> model.open(uri) }
     }
     override fun onStop() { model.flush(); super.onStop() }
-    override fun dispatchKeyEvent(event: android.view.KeyEvent): Boolean {
+    fun handleShortcut(event: android.view.KeyEvent): Boolean {
         if (event.action == android.view.KeyEvent.ACTION_DOWN && event.repeatCount == 0) {
             if (event.keyCode == android.view.KeyEvent.KEYCODE_F11) { model.fullscreen(!model.state.value.fullscreen); return true }
             if (event.keyCode == android.view.KeyEvent.KEYCODE_ESCAPE && model.state.value.fullscreen) { model.fullscreen(false); return true }
             if (event.isCtrlPressed && event.keyCode == android.view.KeyEvent.KEYCODE_N) { if (event.isShiftPressed) newWindow() else model.newNote(); return true }
         }
-        return super.dispatchKeyEvent(event)
+        return false
     }
+    override fun onKeyDown(keyCode: Int, event: android.view.KeyEvent): Boolean = handleShortcut(event) || super.onKeyDown(keyCode, event)
     override fun onSaveInstanceState(outState: Bundle) { outState.putString("workspace", workspaceKey); super.onSaveInstanceState(outState) }
     fun newWindow() {
         model.flush()
@@ -244,6 +245,7 @@ private object NoMotionScheme : MotionScheme {
                             // WebView's accelerated drawing to the reading pane.
                             layoutParams = FrameLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT)
                             web = this
+                            setOnKeyListener { _, _, event -> activity.handleShortcut(event) }
                             setBackgroundColor(AndroidColor.TRANSPARENT)
                             configureReader(this, model, scope) { readerReady = true }
                             webChromeClient = object : android.webkit.WebChromeClient() {

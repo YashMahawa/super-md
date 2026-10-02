@@ -4,6 +4,7 @@ import android.os.ParcelFileDescriptor
 import androidx.test.core.app.ApplicationProvider
 import androidx.test.ext.junit.runners.AndroidJUnit4
 import kotlinx.coroutines.runBlocking
+import kotlinx.coroutines.async
 import org.json.JSONObject
 import org.junit.Assert.*
 import org.junit.Test
@@ -12,6 +13,15 @@ import java.io.File
 
 @RunWith(AndroidJUnit4::class)
 class EngineTest {
+    @Test fun pythonRequestsFromTwoWindowsDoNotKillEachOther() = runBlocking {
+        val app = ApplicationProvider.getApplicationContext<android.app.Application>()
+        val first = StudioViewModel(app, java.util.UUID.randomUUID().toString())
+        val second = StudioViewModel(app, java.util.UUID.randomUUID().toString())
+        val a = async { first.python("import time\ntime.sleep(.3)\nprint('first-window')") }
+        val b = async { second.python("print('second-window')") }
+        assertTrue(a.await().getString("stdout").contains("first-window"))
+        assertTrue(b.await().getString("stdout").contains("second-window"))
+    }
     @Test fun obsidianSameLineProbabilityMathExportsOnDevice() {
         val app = ApplicationProvider.getApplicationContext<android.app.Application>()
         val md = "${'$'}${'$'}\\boxed{\\begin{aligned}\nP(A\\cup B)=&P(A)+P(B)\\\\\n&-P(A\\cap B).\n\\end{aligned}}${'$'}${'$'}\n\n## After the equation\n\n> [!TIP] Still present\n> ${'$'}P(A\\cap B)\\le1${'$'}\n"

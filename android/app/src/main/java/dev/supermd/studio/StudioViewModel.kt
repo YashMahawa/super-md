@@ -76,6 +76,9 @@ fun reorderedNotes(notes: List<Note>, id: String, index: Int): List<Note> {
     if (source < 0 || index !in notes.indices || source == index) return notes
     return notes.toMutableList().apply { add(index, removeAt(source)) }
 }
+// All windows share one killable Python worker. A per-window lock would allow
+// one cell's cleanup/timeout to kill another window's in-flight execution.
+private val pythonExecution = kotlinx.coroutines.sync.Mutex()
 
 class StudioViewModel(app: Application, val workspaceKey: String = "main") : AndroidViewModel(app) {
     private val prefs = app.getSharedPreferences("studio", 0)
@@ -102,7 +105,6 @@ class StudioViewModel(app: Application, val workspaceKey: String = "main") : And
     override fun onCleared() { prefs.unregisterOnSharedPreferenceChangeListener(preferencesChanged); super.onCleared() }
     val state = mutable.asStateFlow()
     private var persistJob: Job? = null
-    private val pythonMutex = kotlinx.coroutines.sync.Mutex()
     var outputUri: Uri? = null
     var shareReady: ((Intent) -> Unit)? = null
     private var shareFile: File? = null
@@ -258,7 +260,7 @@ class StudioViewModel(app: Application, val workspaceKey: String = "main") : And
         "data:$mime;base64," + Base64.encodeToString(bytes, Base64.NO_WRAP)
     }
     suspend fun python(code: String): JSONObject = withContext(Dispatchers.IO) {
-        pythonMutex.lock()
+        pythonExecution.lock()
         val app = getApplication<Application>()
         val token = UUID.randomUUID().toString()
         val input = File(app.cacheDir, "python-$token.py")
@@ -289,11 +291,15 @@ class StudioViewModel(app: Application, val workspaceKey: String = "main") : And
                 }
             }
         } finally {
-            // Terminate only this app's worker, including when code loops forever.
-            runCatching { remote?.send(android.os.Message.obtain(null, 2)) }
-            connection?.let { runCatching { app.unbindService(it) } }
-            input.delete(); output.delete()
-            pythonMutex.unlock()
+            kotlinx.coroutines.withContext(kotlinx.coroutines.NonCancellable) {
+                // Release worker resources before another window can bind. Even
+                // cancellation must complete this barrier and unlock the queue.
+                runCatching { remote?.send(android.os.Message.obtain(null, 2)) }
+                remote?.binder?.let { binder -> kotlinx.coroutines.withTimeoutOrNull(2000) { while (binder.isBinderAlive) kotlinx.coroutines.delay(10) } }
+                connection?.let { runCatching { app.unbindService(it) } }
+                input.delete(); output.delete()
+                pythonExecution.unlock()
+            }
         }
     }
     private fun copyAttachments(note: Note, destination: Uri) {
