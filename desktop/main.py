@@ -141,7 +141,13 @@ def main():
                 report = studio.data/"native-render.pdf"
                 QTimer.singleShot(22000,lambda:studio.exportTo(str(report),"pdf"))
                 QTimer.singleShot(24000,lambda:studio.setMode("editor"))
-                QTimer.singleShot(25500,lambda:capture("source"))
+                def source_capture():
+                    dialog = window.findChild(QObject,"settingsDialog")
+                    capture("source")
+                    if window.property("settingsOpen") or dialog.property("visible"):
+                        print("SOURCE SMOKE FAILED: settings did not close",flush=True)
+                        app.exit(2)
+                QTimer.singleShot(25500,source_capture)
                 def pdf_result():
                     if studio.message == "Exported native-render.pdf" and report.exists() and report.stat().st_size>10000:
                         print(f"PDF SMOKE PASSED: {report}",flush=True)

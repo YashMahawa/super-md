@@ -103,7 +103,7 @@ class StudioUiTest {
         }
         compose.onNodeWithContentDescription("Export").performClick()
         compose.onNodeWithText("Page numbers").assertExists()
-        compose.onNodeWithText("Portable FMD", useUnmergedTree = true).performClick()
+        compose.onNodeWithText("Portable SMD", useUnmergedTree = true).performClick()
         compose.onNodeWithText("Your Markdown and images in one editable file.").assertExists()
         compose.onNodeWithText("Page numbers").assertDoesNotExist()
     }

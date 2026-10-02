@@ -17,6 +17,7 @@ ApplicationWindow {
     property var viewState: JSON.parse(studio.snapshot)
     property bool sidebar: true
     property bool settingsOpen: false
+    onSettingsOpenChanged: settingsOpen ? settingsDialog.open() : settingsDialog.close()
     property bool closingAllowed: false
     property string outputFormat: "pdf"
     property bool sharing: false
@@ -233,7 +234,7 @@ ApplicationWindow {
     }
     Dialog {
         id: settingsDialog
-        visible: settingsOpen
+        objectName: "settingsDialog"
         modal: true
         anchors.centerIn: parent
         width: Math.min(640, window.width - 48)
