@@ -1,4 +1,26 @@
-# Super MD 0.4.12
+# Super MD 0.4.13
+
+- Android reading chrome and system bars hide together, without floating buttons.
+  Tap or scroll upward to reveal controls; landscape uses the cutout region.
+- Fullscreen preserves magnification and reading width, even during a pinch.
+  Gestures cancel pending heading alignment so links cannot pull zoom backward.
+- Python cells use one source panel with Copy and Run in its toolbar.
+- Optional offline English spelling and basic grammar checks in Settings on
+  Android and desktop. Checks skip code, links and math; explicit corrections are
+  undoable. Grammar covers repeated words and a/an, not comprehensive grammar.
+- Interactive 3D graphs are removed; Matplotlib 3D figures remain supported in
+  notes, portable files and PDF. Retired interactive blocks preserve their source
+  and export as code instead of preventing PDF export.
+- Improved MD/TXT/SMD/legacy FMD Open-with registration, no Save as Markdown for
+  portable notes, a Material rename icon, a diagonal brush-S icon and expressive
+  workspace loading. Removed the desktop sidebar icon animation.
+- First use of offline writing checks no longer reloads a development workspace.
+
+Android downloads are signed, optimized release APKs for Android 8+ ARM64 devices.
+Settings checks are opt-in and English-only. Emulator verification does not imply
+physical testing of every handset. See docs/RELEASE-NOTES-0.4.13.md for details.
+
+## Previous release (0.4.12)
 
 - Desktop tabs and their icon-only “+” share a vertical centre. The top New note
   button and logo are removed; Open folder has a direct icon and the sidebar
