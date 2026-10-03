@@ -2,7 +2,7 @@
 
 ## Reader, installer and memory maintenance — 2026-10-03
 
-- 74 frontend tests and all 16 browser workflows passed locally, including stable
+- 74 frontend tests and all 17 browser workflows passed locally, including stable
   wrapping/focal magnification, distinct 3D drag vs two-finger pan, slider-free
   image viewing, checkbox source preservation and bounded derived image caches.
 - 44 native Qt tests passed, including zoom-only bridge messages, remembered
@@ -17,6 +17,13 @@
 - Memory changes bound optional caches; they are not claims of a measured battery
   improvement or whole-document virtualization. Current visible Python output is
   retained separately so cache eviction cannot omit visible figures from PDF.
+- A local headless Chromium profile of 1,000 equations / 103,006 DOM nodes used
+  about 73 MiB JS heap. The 30-step zoom median fell from 222 ms to approximately
+  25 ms after isolating Source font scaling and removing per-frame React/root-CSS
+  work. These are local measurements, not physical phone or battery benchmarks.
+- The compressed, multi-signed candidate installed twice and launched on the API
+  36 emulator (upgrade preserved). Its app-process PSS was about 95 MiB for the
+  welcome screen; the separate WebView process is not included in this number.
 
 ## Native tabs and aligned Android design — 2026-10-02
 

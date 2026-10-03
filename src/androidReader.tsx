@@ -36,13 +36,12 @@ declare global { interface Window {supermdDismiss?:()=>boolean;supermdSetZoom?:(
 declare global { interface Window { supermdLoad?: (state: ReaderState) => void; supermdExport?: (options: ExportOptions) => void; supermdExportMarkdown?: () => void; supermdFind?: () => void; supermdPortable?: (save: boolean) => void; supermdZoomBy?: (factor:number,focus?:Point)=>void; supermdResetZoom?: ()=>void; supermdRepairMath?: ()=>void; supermdFlush?: (operation:Record<string,string>)=>void } }
 function Reader() {
   const [state, setState] = useState<ReaderState | null>(null);
-  const [zoom, setZoom] = useState(100);
   const [repairing, setRepairing] = useState(false);
   const [searching,setSearching] = useState(false);
   const [trustedHosts,setTrustedHosts] = useState<string[]>([]);
   const trustHost = useCallback((host:string)=>setTrustedHosts(current=>current.includes(host)?current:[...current,host]),[]);
   const reference = useRef(state); reference.current = state;
-  const zoomReference = useRef(zoom);
+  const zoomReference = useRef(100);
   const pendingChange = useRef(0);
   const noteViews = useRef(new Map<string, NoteView>());
   const histories=useRef(new Map<string,NoteHistory>());
@@ -50,7 +49,7 @@ function Reader() {
   const loadedFonts=useRef(new Map<string,Promise<FontFace>>());
   const cursor=useRef<Point|undefined>(undefined);
   const anchors = (focus?:Point) => Array.from(document.querySelectorAll<HTMLElement>(".android-reading,.cm-scroller")).filter(root=>{const r=root.getBoundingClientRect();return !focus || focus.x>=r.left&&focus.x<=r.right&&focus.y>=r.top&&focus.y<=r.bottom;}).map(root=>captureScrollAnchor(root,focus));
-  const applyZoomStyle=(focus?:Point,previousFocus=focus)=>{document.documentElement.style.setProperty("--workspace-scale",String(zoomReference.current/100));document.querySelectorAll<HTMLElement>(".android-reading").forEach(root=>applyDocumentZoom(root,zoomReference.current,reference.current?.widthPercent??80,focus,previousFocus));};
+  const applyZoomStyle=(focus?:Point,previousFocus=focus)=>{document.querySelector<HTMLElement>(".android-source")?.style.setProperty("--workspace-scale",String(zoomReference.current/100));document.querySelectorAll<HTMLElement>(".android-reading").forEach(root=>applyDocumentZoom(root,zoomReference.current,reference.current?.widthPercent??80,focus,previousFocus));};
   const anchored = (update:()=>void) => { const restore = anchors(); update(); requestAnimationFrame(()=>restore.forEach(callback=>callback())); };
   useEffect(() => {
     window.supermdDismiss=()=>{const element=document.querySelector(".image-viewer,.math-repair-panel,.reading-search,.cm-search,.live-active-block textarea");if(!element)return false;const target=element.matches("textarea")?element:document.activeElement||document;target.dispatchEvent(new KeyboardEvent("keydown",{key:"Escape",bubbles:true,cancelable:true}));if(element.matches("textarea"))(element as HTMLElement).blur();return true;};
@@ -67,7 +66,7 @@ function Reader() {
         if(history && [history.undo,history.redo].every(list=>Array.isArray(list)&&list.length<=60&&list.every(text=>typeof text==="string")&&list.reduce((size,text)=>size+text.length,0)<=2_000_000))histories.current.set(next.id,{undo:[...history.undo],redo:[...history.redo],last:0});
         noteViews.current.set(next.id, next.viewState);
       }
-      const load = () => { setState(next); zoomReference.current = next.zoom; setZoom(next.zoom); };
+      const load = () => { setState(next); zoomReference.current = next.zoom; };
       if (old?.id === next.id && old.mode === next.mode) anchored(load); else load();
     };
     window.supermdHistory=direction=>{
@@ -77,8 +76,8 @@ function Reader() {
       else {const history=histories.current.get(current.id);if(history){const from=history[direction],to=history[direction==="undo"?"redo":"undo"],next=from.pop();if(next!==undefined){to.push(current.content);history.last=0;update(next);}}}
       replaying.current=false;
     };
-    window.supermdZoomBy = (factor,focus=cursor.current) => { if (document.querySelector(".image-viewer")) { window.dispatchEvent(new CustomEvent("supermd-image-zoom",{detail:{factor,point:focus}})); return; } zoomReference.current=clampPreviewZoom(zoomReference.current*factor);applyZoomStyle(focus);setZoom(zoomReference.current);void invoke("zoom_changed",{zoom:zoomReference.current}); };
-    window.supermdSetZoom=value=>{const next=clampPreviewZoom(value);if(Math.abs(next-zoomReference.current)<.01)return;zoomReference.current=next;applyZoomStyle();setZoom(next);};
+    window.supermdZoomBy = (factor,focus=cursor.current) => { if (document.querySelector(".image-viewer")) { window.dispatchEvent(new CustomEvent("supermd-image-zoom",{detail:{factor,point:focus}})); return; } zoomReference.current=clampPreviewZoom(zoomReference.current*factor);applyZoomStyle(focus);void invoke("zoom_changed",{zoom:zoomReference.current}); };
+    window.supermdSetZoom=value=>{const next=clampPreviewZoom(value);if(Math.abs(next-zoomReference.current)<.01)return;zoomReference.current=next;applyZoomStyle();};
     window.supermdHeading=(id,offset)=>{if(reference.current?.mode==="editor"){window.dispatchEvent(new CustomEvent("supermd-goto-offset",{detail:offset??0}));return;}const root=document.querySelector(".android-reading");if(root)navigateToHeading(root,id);};
     window.supermdResetZoom = () => { if (document.querySelector(".image-viewer")) { window.dispatchEvent(new Event("supermd-image-reset")); return; } window.supermdZoomBy?.(100/zoomReference.current); };
     window.supermdRepairMath = () => setRepairing(true);
@@ -127,10 +126,9 @@ function Reader() {
     root.style.setProperty("--reader-width",`${state.widthPercent??80}%`);
     root.style.setProperty("--reading-max-width",`${state.widthPercent??80}%`);
     root.style.setProperty("--reader-leading",String(state.lineHeight??1.65));
-    root.style.setProperty("--workspace-scale", String(zoom / 100));
     Object.entries(state.colors).forEach(([key, value]) => root.style.setProperty(`--${key}`, value));
     applyZoomStyle();
-  }, [state, zoom]);
+  }, [state]);
   useEffect(()=>{const root=document.querySelector<HTMLElement>(".android-reading");if(!root || typeof ResizeObserver==="undefined")return;let frame=0;const observer=new ResizeObserver(()=>{if(!frame)frame=requestAnimationFrame(()=>{frame=0;applyZoomStyle();});});observer.observe(root);const page=root.querySelector(".document-page");if(page)observer.observe(page);return()=>{observer.disconnect();cancelAnimationFrame(frame);};},[state?.id,state?.mode]);
   useEffect(()=>{
     if(!state || ["sans","serif","mono","noto","roboto","system","Manrope","Roboto","Noto Sans","Noto Serif","JetBrains Mono"].includes(state.font) || !window.SuperMD || typeof FontFace==="undefined")return;
@@ -188,7 +186,7 @@ function Reader() {
       // crossing the native bridge are deliberately excluded from pinch frames.
       if (!frame) frame = requestAnimationFrame(() => { frame = 0; applyZoomStyle(focus,previousFocus);previousFocus=focus; });
     } };
-    const end = (event: TouchEvent) => { if (pinching && event.touches.length < 2) { pinching = false; setZoom(zoomReference.current); void invoke("zoom_changed", { zoom: zoomReference.current }); } };
+    const end = (event: TouchEvent) => { if (pinching && event.touches.length < 2) { pinching = false; void invoke("zoom_changed", { zoom: zoomReference.current }); } };
     document.addEventListener("touchstart", start, { passive: true }); document.addEventListener("touchmove", move, { passive: false }); document.addEventListener("touchend", end); document.addEventListener("touchcancel", end);
     const wheel = (event:WheelEvent) => { if ((event.ctrlKey || event.metaKey || mouseHeld || event.buttons&1) && !(event.target as Element).closest("[data-independent-zoom]")) { event.preventDefault(); window.supermdZoomBy?.(Math.exp(-event.deltaY*.002),{x:event.clientX,y:event.clientY}); } };
     document.addEventListener("wheel",wheel,{passive:false});

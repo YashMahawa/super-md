@@ -209,23 +209,23 @@ private object NoMotionScheme : MotionScheme {
                     if (state.folder != null) TextButton(onClick = { folderRelative = ""; model.closeFolder() }) { Icon(Icons.Rounded.Close, null); Text("Close folder", Modifier.padding(start = 8.dp)) }
                     Text("No vault. No hidden metadata.", style = MaterialTheme.typography.bodySmall, color = palette.onSurfaceVariant, modifier = Modifier.padding(vertical = 12.dp))
                     if (folderRelative.isNotEmpty()) TextButton(onClick = { folderRelative = ""; state.folder?.let { model.listFolder(android.net.Uri.parse(it), "") } }) { Icon(Icons.AutoMirrored.Rounded.ArrowBack, null); Text("Folder root") }
-                    Column(Modifier.weight(1f).verticalScroll(rememberScrollState())) {
+                    LazyColumn(Modifier.weight(1f)) {
                         if (headings.isNotEmpty()) {
-                            Text("Contents", style = MaterialTheme.typography.titleSmall, modifier = Modifier.padding(vertical = 12.dp))
-                            headings.forEach { heading ->
+                            item {Text("Contents", style = MaterialTheme.typography.titleSmall, modifier = Modifier.padding(vertical = 12.dp))}
+                            items(headings, key = {"heading:${it.id}"}) { heading ->
                                 ListItem(headlineContent = { Text(heading.title, maxLines = 2, overflow = TextOverflow.Ellipsis) }, modifier = Modifier.padding(start = ((heading.level - 1) * 10).dp).clickable {
                                     web?.evaluateJavascript("window.supermdHeading?.(${JSONObject.quote(heading.id)},${heading.offset})", null)
                                     scope.launch { drawer.close() }
                                 })
                             }
-                            HorizontalDivider(Modifier.padding(vertical = 8.dp))
+                            item {HorizontalDivider(Modifier.padding(vertical = 8.dp))}
                         }
                         if (recent.isNotEmpty()) {
-                            Row(verticalAlignment = Alignment.CenterVertically) { Text("Recent files", style = MaterialTheme.typography.titleSmall, modifier = Modifier.weight(1f)); TextButton(onClick = model::clearRecent) { Text("Clear") } }
-                            recent.take(12).forEach { note -> ListItem(headlineContent = { Text(note.name, maxLines = 1, overflow = TextOverflow.Ellipsis) }, leadingContent = { Icon(Icons.Rounded.History, null) }, modifier = Modifier.clickable { model.open(android.net.Uri.parse(note.uri), note.relative); scope.launch { drawer.close() } }) }
-                            HorizontalDivider(Modifier.padding(vertical = 8.dp))
+                            item {Row(verticalAlignment = Alignment.CenterVertically) { Text("Recent files", style = MaterialTheme.typography.titleSmall, modifier = Modifier.weight(1f)); TextButton(onClick = model::clearRecent) { Text("Clear") } }}
+                            items(recent.take(12), key={"recent:${it.uri}:${it.relative}"}) { note -> ListItem(headlineContent = { Text(note.name, maxLines = 1, overflow = TextOverflow.Ellipsis) }, leadingContent = { Icon(Icons.Rounded.History, null) }, modifier = Modifier.clickable { model.open(android.net.Uri.parse(note.uri), note.relative); scope.launch { drawer.close() } }) }
+                            item {HorizontalDivider(Modifier.padding(vertical = 8.dp))}
                         }
-                        state.files.forEach { entry ->
+                        items(state.files, key={"file:${it.uri}:${it.relative}"}) { entry ->
                             val activate = { if (entry.directory) { folderRelative = entry.relative; model.listFolder(android.net.Uri.parse(entry.uri), entry.relative) } else { model.open(android.net.Uri.parse(entry.uri), entry.relative); scope.launch { drawer.close() } }; Unit }
                             ListItem(headlineContent = { Text(entry.name, maxLines = 1, overflow = TextOverflow.Ellipsis) }, leadingContent = { Icon(if (entry.directory) Icons.Rounded.Folder else Icons.Rounded.Description, null) }, modifier = Modifier.fillMaxWidth().clickable(onClick = activate), trailingContent = { Icon(if (entry.directory) Icons.Rounded.ChevronRight else Icons.AutoMirrored.Rounded.MenuBook, null) })
                         }

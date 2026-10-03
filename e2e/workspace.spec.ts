@@ -22,6 +22,17 @@ test("document magnifies like a PDF without changing wraps and keeps a focal poi
   await page.evaluate(focus=>window.supermdZoomBy?.(.5,focus),focus);
   await expect(body).toHaveAttribute("data-scale","1");
 });
+test("large-note zoom leaves document-wide styles and all formulas unchanged",async({page})=>{
+  await page.addInitScript(()=>{window.SuperMD={post:()=>{}};});await page.goto('/android-reader.html');
+  const content='# Mathematics\n\n'+Array.from({length:250},(_,i)=>`Section ${i}: $x_${i}=\\frac{a+b}{c+d}$\n\n$$\\int_0^1 x^2 dx=\\frac13$$\n\n`).join('');
+  await page.evaluate(content=>window.supermdLoad?.({id:'large-zoom',content,path:null,mode:'reader',dark:false,fullscreen:false,colors:{},font:'Manrope',size:18,zoom:100}),content);
+  await expect(page.locator('.katex')).toHaveCount(500);
+  const before=await page.evaluate(()=>document.documentElement.getAttribute('style'));
+  await page.evaluate(async()=>{for(let i=0;i<15;i++){window.supermdSetZoom?.(100+i*5);await new Promise(requestAnimationFrame);}});
+  expect(await page.evaluate(()=>document.documentElement.getAttribute('style'))).toBe(before);
+  await expect(page.locator('.katex')).toHaveCount(500);
+  await expect(page.locator('.document-page')).toHaveAttribute('data-scale','1.7');
+});
 test("graph canvas drags and two-finger moves pan while 3D pinch never tilts",async({page})=>{
   await page.addInitScript(()=>{window.SuperMD={post:()=>{}};});await page.goto("/android-reader.html");
   const graph=(mode:string)=>JSON.stringify({mode,series:[{expression:mode==="surface3d"?"x^2+y^2":"sin(x)"}],x:{min:-2,max:2,steps:12},y:{min:-2,max:2},sliders:[{name:"a",min:0,max:2,value:1}]});
@@ -42,17 +53,17 @@ test("graph canvas drags and two-finger moves pan while 3D pinch never tilts",as
       target.dispatchEvent(new TouchEvent("touchmove",{bubbles:true,cancelable:true,touches:touches(25,200)}));
       target.dispatchEvent(new TouchEvent("touchend",{bubbles:true,touches:[]}));
     });
-    await expect(plot).toHaveAttribute("data-plot-zoom","2");
+    await expect.poll(()=>plot.getAttribute("data-plot-zoom").then(Number)).toBeCloseTo(2,6);
     expect(Number(await plot.getAttribute("data-center-x"))).not.toBe(prior);
     if(mode==="surface3d"){await expect(svg).toHaveAttribute("data-elevation",elevation!);await expect(svg).toHaveAttribute("data-azimuth",azimuth!);}
     const panBefore=Number(await plot.getAttribute("data-center-x"));
     await svg.evaluate(node=>{const r=node.getBoundingClientRect();window.supermdNativeWheel?.(30,10,{x:r.left+r.width/2,y:r.top+r.height/2},false);});
     await expect.poll(()=>plot.getAttribute("data-center-x").then(Number)).toBeGreaterThan(panBefore);
-    await expect(plot).toHaveAttribute("data-plot-zoom","2");
-    await svg.dispatchEvent("wheel",{deltaY:120,deltaMode:1});await expect(plot).toHaveAttribute("data-plot-zoom","2");
+    await expect.poll(()=>plot.getAttribute("data-plot-zoom").then(Number)).toBeCloseTo(2,6);
+    await svg.dispatchEvent("wheel",{deltaY:120,deltaMode:1});await expect.poll(()=>plot.getAttribute("data-plot-zoom").then(Number)).toBeCloseTo(2,6);
     // Magnifying the controls belongs to the page, not the plot camera.
     await plot.locator(".chart-legend").dispatchEvent("wheel",{ctrlKey:true,deltaY:-120,bubbles:true});
-    await expect(page.locator(".document-page")).not.toHaveAttribute("data-scale","1");await expect(plot).toHaveAttribute("data-plot-zoom","2");
+    await expect(page.locator(".document-page")).not.toHaveAttribute("data-scale","1");await expect.poll(()=>plot.getAttribute("data-plot-zoom").then(Number)).toBeCloseTo(2,6);
   }
 });
 test("shared repair applies on Android/Qt and button history can undo and redo it",async({page})=>{

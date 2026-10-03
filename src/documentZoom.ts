@@ -11,9 +11,9 @@ export function applyDocumentZoom(root:HTMLElement, zoom:number, widthPercent:nu
   const width=Math.max(240,(root.clientWidth-32)*widthPercent/100);
   // A compositor transform keeps KaTeX/layout out of each pinch frame. CSS
   // zoom invalidates layout throughout a long document even with fixed wraps.
-  page.style.width=`${width}px`;page.style.transform=`scale(${next})`;page.dataset.scale=String(next);
+  const left=Math.max(16,(root.clientWidth-width*next)/2);
+  page.style.width=`${width}px`;page.style.marginLeft="0px";page.style.transform=`translateX(${left}px) scale(${next})`;page.dataset.scale=String(next);
   const space=page.parentElement!;space.style.width=`${Math.max(root.clientWidth,width*next+32)}px`;
-  page.style.marginLeft=`${Math.max(16,(root.clientWidth-width*next)/2)}px`;
   space.style.height=`${page.offsetHeight*next}px`;
   const after=page.getBoundingClientRect();
   root.scrollLeft+=after.left+point.x*next-target.x;

@@ -1,4 +1,4 @@
-# Super MD 0.4.3
+# Super MD 0.4.4
 
 ## This release
 
@@ -12,6 +12,8 @@
 - Page zoom sends tiny native deltas and uses compositor scaling; wrapping stays
   stable. Mouse dragging pans reading pages; 3D mouse dragging rotates while
   two-finger movement pans without tilting the camera.
+- Zoom no longer updates document-wide CSS variables or re-renders the reader on
+  each frame. Native Android file/contents rows are created lazily as needed.
 - The image viewer uses the available window area without a redundant zoom slider.
 - Styled auto-hiding equation scrollbars, editable task checkboxes and visited-link
   styling. Compact valid math fences are left untouched by repair suggestions.

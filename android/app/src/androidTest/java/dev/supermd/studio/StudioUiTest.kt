@@ -196,9 +196,10 @@ class StudioUiTest {
         exported.delete()
         val model = androidx.lifecycle.ViewModelProvider(compose.activity)[StudioViewModel::class.java]
         compose.activity.runOnUiThread { model.zoom(100f) }
-        javascriptUntil("getComputedStyle(document.documentElement).getPropertyValue('--workspace-scale')") { it == "\"1\"" }
+        javascriptUntil("document.querySelector('.document-page')?.dataset.scale") { it == "\"1\"" }
         javascriptUntil("(() => { if (window.pinchTestDone) return true; if (window.pinchTestStarted) return false; window.pinchTestStarted=true; const target=document.querySelector('.android-reading'); const touches=(x) => [new Touch({identifier:1,target,clientX:60,clientY:140}),new Touch({identifier:2,target,clientX:x,clientY:140})]; target.dispatchEvent(new TouchEvent('touchstart',{bubbles:true,touches:touches(160)})); target.dispatchEvent(new TouchEvent('touchmove',{bubbles:true,cancelable:true,touches:touches(240)})); requestAnimationFrame(() => requestAnimationFrame(() => { target.dispatchEvent(new TouchEvent('touchend',{bubbles:true,touches:[]})); window.pinchTestDone=true; })); return false; })()") { it == "true" }
-        javascriptUntil("getComputedStyle(document.documentElement).getPropertyValue('--workspace-scale')") { (it.trim('"').toFloatOrNull() ?: 0f) > 1.1f }
+        javascriptUntil("document.querySelector('.document-page')?.dataset.scale") { (it.trim('"').toFloatOrNull() ?: 0f) > 1.1f }
+        javascriptUntil("getComputedStyle(document.documentElement).getPropertyValue('--workspace-scale')") { it == "\"1\"" }
         javascriptUntil("(() => { const native = window.SuperMD; window.SuperMD = { post: (id, command, raw) => { if (command === 'export_pdf_native') window.capturedPdfMarkdown = JSON.parse(raw).content; native.post(id, command, raw); } }; return true; })()") { it == "true" }
         compose.activity.runOnUiThread {
             model.outputUri = android.net.Uri.fromFile(exported)
@@ -213,7 +214,7 @@ class StudioUiTest {
         assertNull(model.state.value.error)
         android.graphics.pdf.PdfRenderer(android.os.ParcelFileDescriptor.open(exported, android.os.ParcelFileDescriptor.MODE_READ_ONLY)).use { assertTrue(it.pageCount > 0) }
         compose.runOnIdle { model.zoom(100f) }
-        javascriptUntil("getComputedStyle(document.documentElement).getPropertyValue('--workspace-scale')") { it == "\"1\"" }
+        javascriptUntil("document.querySelector('.document-page')?.dataset.scale") { it == "\"1\"" }
         val screenshot = androidx.test.platform.app.InstrumentationRegistry.getInstrumentation().uiAutomation.takeScreenshot()!!
         java.io.File(compose.activity.cacheDir, "reader-ui-test.png").outputStream().use { screenshot.compress(android.graphics.Bitmap.CompressFormat.PNG, 100, it) }
         val painted = mutableSetOf<Int>()
@@ -225,13 +226,13 @@ class StudioUiTest {
         val nativeIcon = screenshot.getPixel(more.x.toInt(), more.y.toInt())
         val paletteIcon = android.graphics.Color.parseColor(org.json.JSONArray("[${javascriptUntil("getComputedStyle(document.documentElement).getPropertyValue('--muted')") { it.startsWith("\"#") }}]").getString(0))
         assertTrue("Reader must not overpaint the native toolbar", kotlin.math.abs(android.graphics.Color.red(nativeIcon) - android.graphics.Color.red(paletteIcon)) < 15 && kotlin.math.abs(android.graphics.Color.green(nativeIcon) - android.graphics.Color.green(paletteIcon)) < 15 && kotlin.math.abs(android.graphics.Color.blue(nativeIcon) - android.graphics.Color.blue(paletteIcon)) < 15)
-        val normalScale = javascriptUntil("getComputedStyle(document.documentElement).getPropertyValue('--workspace-scale')") { it.isNotBlank() && it != "null" && it != "\"\"" }
+        val normalScale = javascriptUntil("document.querySelector('.document-page')?.dataset.scale") { it.isNotBlank() && it != "null" && it != "\"\"" }
         compose.onNodeWithContentDescription("More actions").performClick()
         compose.onNodeWithText("Fullscreen study").performClick()
         compose.onNodeWithContentDescription("Zoom in").performClick()
-        javascriptUntil("getComputedStyle(document.documentElement).getPropertyValue('--workspace-scale')") { it != normalScale && it != "null" }
+        javascriptUntil("document.querySelector('.document-page')?.dataset.scale") { it != normalScale && it != "null" }
         compose.onNodeWithContentDescription("Exit fullscreen").performClick()
-        javascriptUntil("getComputedStyle(document.documentElement).getPropertyValue('--workspace-scale')") { it == normalScale }
+        javascriptUntil("document.querySelector('.document-page')?.dataset.scale") { it == normalScale }
         compose.onNodeWithContentDescription("New tab").performClick()
         val emptyId = model.state.value.active.id
         compose.onNodeWithContentDescription("Close Untitled.md").performClick()
@@ -239,12 +240,13 @@ class StudioUiTest {
         compose.onNodeWithContentDescription("New tab").performClick()
         compose.runOnIdle { model.edit(model.state.value.active.id, "# Recoverable draft") }
         javascriptUntil("document.querySelector('.android-reading')?.textContent || document.querySelector('.live-document')?.textContent") { it.contains("Recoverable draft") }
-        compose.onNodeWithContentDescription("Close Untitled.md").performClick()
+        compose.waitUntil(10_000) { model.state.value.active.name == "Recoverable draft.md" }
+        compose.onNodeWithContentDescription("Close Recoverable draft.md").performClick()
         compose.onNodeWithContentDescription("More actions").performClick()
         compose.onNodeWithText("Reopen closed tab").performClick()
-        compose.onNodeWithContentDescription("Close Untitled.md").assertExists()
+        compose.onNodeWithContentDescription("Close Recoverable draft.md").assertExists()
         compose.runOnIdle { assertEquals("# Recoverable draft", model.state.value.active.content) }
-        compose.onNodeWithContentDescription("Close Untitled.md").performClick()
+        compose.onNodeWithContentDescription("Close Recoverable draft.md").performClick()
         if (compose.activity.resources.configuration.smallestScreenWidthDp < 600) {
             compose.runOnIdle { compose.activity.requestedOrientation = android.content.pm.ActivityInfo.SCREEN_ORIENTATION_LANDSCAPE }
             compose.waitUntil(10_000) { compose.activity.resources.configuration.orientation == android.content.res.Configuration.ORIENTATION_LANDSCAPE }
