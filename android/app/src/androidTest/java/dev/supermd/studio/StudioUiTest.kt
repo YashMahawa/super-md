@@ -322,6 +322,10 @@ class StudioUiTest {
         compose.onNodeWithContentDescription("Show contents").assertDoesNotExist()
         compose.onNodeWithContentDescription("Fullscreen study").performClick()
         javascriptUntil("document.documentElement.dataset.fullscreen") { it == "\"true\"" }
+        // Earlier tests/repeated runs deliberately persist fullscreen zoom.
+        // Start below the upper limit so this check can require a real increase.
+        compose.runOnIdle { model.zoom(100f) }
+        javascriptUntil("document.querySelector('.document-page')?.dataset.scale") { it == "\"1\"" }
         val fullBaseline=javascriptUntil("document.querySelector('.document-page')?.dataset.scale") {(it.trim('"').toFloatOrNull() ?: 0f)>0}.trim('"').toFloat()
         val contentsBounds=compose.onNodeWithContentDescription("Show contents").fetchSemanticsNode().boundsInRoot
         val exitBounds=compose.onNodeWithContentDescription("Exit fullscreen").fetchSemanticsNode().boundsInRoot
