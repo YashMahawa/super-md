@@ -1,5 +1,34 @@
 # Verification
 
+## Immersive reading and writing assistance — 0.4.13
+
+- 95 frontend unit tests, all 32 browser workflows and 62 Qt/Python checks pass
+  locally. Browser checks cover offline spelling/grammar, exact Markdown offsets,
+  undoable corrections, code/math exclusions, one-container Python cells and
+  fullscreen entry before a pending zoom acknowledgement. The 500-equation SSR
+  assertion remains intact with a 15-second budget for slower Intel CI runners.
+- Native Qt presented-pixel smoke checks pass for captions, the searchable font
+  picker, single Python source container and PDF export. The loading indicator
+  has painted-phase and reduced-motion tests. Sidebar icon animation is removed.
+- Interactive 3D graphs and camera controls are removed from the shared reader.
+  Retired blocks leave their source unchanged and export as source rather than
+  preventing the rest of a PDF from exporting. A real desktop Python worker
+  generated a Matplotlib 3D SVG and the native typesetter exported it successfully.
+- Writing assistance is optional and English-only. Hunspell-compatible spelling
+  and repeated-word/a-an grammar checks run in a lazy, idle-evicted worker on
+  bounded prose. No note text is uploaded and no corrections are automatic.
+- Android instrumentation covers tap/scroll chrome visibility, hidden status
+  bars, full-width landscape reading, unchanged fullscreen magnification,
+  opaque-provider and extension Open-with routes, real offline writing checks
+  and Matplotlib 3D execution through PDF export. API 35/36 exact-source CI and
+  signed APK/platform installer verification remain publication gates; these
+  are emulator checks, not a Vivo hardware performance claim.
+- All 24 tests pass locally on the Android 15/API 35 emulator using its older
+  Chromium 124 WebView, including the real writing worker and 3D Matplotlib PDF.
+- The new brush-S SVG supplies fixed, theme-adaptive and Android monochrome
+  launcher variants. Rename uses Google's pinned Material edit-square symbol.
+  No laptop power action or forced closure of user windows is performed.
+
 ## Aligned chrome, native captions and stable zoom — 0.4.12
 
 - 90 frontend unit tests, 30 browser workflows and 60 Qt/Python checks pass

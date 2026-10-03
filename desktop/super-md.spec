@@ -45,5 +45,5 @@ if sys.platform == "darwin":
             "NSHumanReadableCopyright": "Copyright © 2026 Yash Mahawar and Super MD contributors. MIT License.",
             "NSHighResolutionCapable": True,
             "CFBundleDocumentTypes": [{"CFBundleTypeName": "Super MD note", "CFBundleTypeRole": "Editor",
-                                      "CFBundleTypeExtensions": ["md", "markdown", "smd", "fmd"]},
+                                      "CFBundleTypeExtensions": ["md", "markdown", "smd", "fmd", "txt"], "LSHandlerRank": "Alternate"},
                                      {"CFBundleTypeName": "Folder", "CFBundleTypeRole": "Viewer", "LSItemContentTypes": ["public.folder"]}]})

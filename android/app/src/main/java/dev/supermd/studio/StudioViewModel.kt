@@ -32,7 +32,7 @@ data class Note(val id: String = UUID.randomUUID().toString(), val name: String 
 data class RecentNote(val name: String, val uri: String, val relative: String? = null)
 data class FileEntry(val name: String, val uri: String, val directory: Boolean, val relative: String)
 data class OutlineHeading(val id: String, val title: String, val level: Int, val offset: Int)
-data class StudioState(val accent: String = "system", val widthPercent: Float = 80f, val lineHeight: Float = 1.65f, val autosave: Boolean = true, val customFonts: List<String> = emptyList(), val readerOverlay: Boolean = false, val zoomCommand: Long = 0, val tabs: List<Note> = listOf(Note(name = "Welcome.md", content = sample, saved = sample)), val closedTabs: List<Note> = emptyList(), val activeId: String = "", val mode: String = "live", val fullscreen: Boolean = false, val normalZoom: Float = 100f, val fullscreenZoom: Float = 100f, val theme: String = "system", val fullscreenTheme: String = "black", val motion: Boolean = true, val font: String = "Manrope", val size: Float = 15f, val folder: String? = null, val files: List<FileEntry> = emptyList(), val busy: Boolean = false, val message: String? = null, val error: String? = null, val welcomed: Boolean = false, val pdf: String = "{\"pageSize\":\"a4\",\"margin\":18,\"fontSize\":10.0,\"lineHeight\":1.45,\"fontFamily\":\"Manrope\",\"pageNumbers\":true}") {
+data class StudioState(val spellCheck:Boolean = false, val grammarCheck:Boolean = false, val accent: String = "system", val widthPercent: Float = 80f, val lineHeight: Float = 1.65f, val autosave: Boolean = true, val customFonts: List<String> = emptyList(), val readerOverlay: Boolean = false, val zoomCommand: Long = 0, val tabs: List<Note> = listOf(Note(name = "Welcome.md", content = sample, saved = sample)), val closedTabs: List<Note> = emptyList(), val activeId: String = "", val mode: String = "live", val fullscreen: Boolean = false, val normalZoom: Float = 100f, val fullscreenZoom: Float = 100f, val theme: String = "system", val fullscreenTheme: String = "black", val motion: Boolean = true, val font: String = "Manrope", val size: Float = 15f, val folder: String? = null, val files: List<FileEntry> = emptyList(), val busy: Boolean = false, val message: String? = null, val error: String? = null, val welcomed: Boolean = false, val pdf: String = "{\"pageSize\":\"a4\",\"margin\":18,\"fontSize\":10.0,\"lineHeight\":1.45,\"fontFamily\":\"Manrope\",\"pageNumbers\":true}") {
     val active get() = tabs.find { it.id == activeId } ?: tabs.first()
     val zoom get() = if (fullscreen) fullscreenZoom else normalZoom
 }
@@ -106,9 +106,9 @@ class StudioViewModel(app: Application, val workspaceKey: String = "main") : And
     private val mutable = MutableStateFlow(restore())
     private val preferencesChanged = android.content.SharedPreferences.OnSharedPreferenceChangeListener { _, key ->
         if (key == "recent") recentMutable.value = runCatching { val list = JSONArray(prefs.getString("recent", "[]")); (0 until minOf(list.length(), 24)).map { i -> val n = list.getJSONObject(i); RecentNote(n.getString("name"), n.getString("uri"), n.optString("relative").takeIf { it.isNotBlank() }) } }.getOrDefault(emptyList())
-        if (key in setOf("accent", "theme", "fullTheme", "motion", "font", "size", "pdf", "welcomed", "widthPercent", "lineHeight", "autosave", "fonts")) {
+        if (key in setOf("accent", "theme", "fullTheme", "motion", "font", "size", "pdf", "welcomed", "widthPercent", "lineHeight", "autosave", "fonts", "spellCheck", "grammarCheck")) {
             mutable.value = mutable.value.copy(theme = prefs.getString("theme", "system")!!, fullscreenTheme = prefs.getString("fullTheme", "black")!!, motion = prefs.getBoolean("motion", true), font = prefs.getString("font", "Manrope")!!, size = prefs.getFloat("size", 15f), pdf = prefs.getString("pdf", null) ?: StudioState().pdf, welcomed = prefs.getBoolean("welcomed", false))
-                .copy(accent = prefs.getString("accent","system")!!, widthPercent = prefs.getFloat("widthPercent",80f),lineHeight = prefs.getFloat("lineHeight",1.65f),autosave = prefs.getBoolean("autosave",true),customFonts = fonts.families)
+                .copy(spellCheck=prefs.getBoolean("spellCheck",false),grammarCheck=prefs.getBoolean("grammarCheck",false),accent = prefs.getString("accent","system")!!, widthPercent = prefs.getFloat("widthPercent",80f),lineHeight = prefs.getFloat("lineHeight",1.65f),autosave = prefs.getBoolean("autosave",true),customFonts = fonts.families)
         }
     }
     private var observedUri:String?=null
@@ -214,7 +214,7 @@ class StudioViewModel(app: Application, val workspaceKey: String = "main") : And
     private fun change(block: (StudioState) -> StudioState) { mutable.value = block(mutable.value);observeActive(); schedulePersist() }
     private fun restore(): StudioState {
         var s = StudioState(theme = prefs.getString("theme", "system")!!, fullscreenTheme = prefs.getString("fullTheme", "black")!!, motion = prefs.getBoolean("motion", true), welcomed = prefs.getBoolean("welcomed", false), font = prefs.getString("font", "Manrope")!!, size = prefs.getFloat("size", 15f), folder = windowPrefs.getString("folder", if (workspaceKey == "main" && !windowPrefs.getBoolean("folderMigrated", false)) prefs.getString("folder", null) else null), pdf = prefs.getString("pdf", null) ?: StudioState().pdf)
-        s = s.copy(accent = prefs.getString("accent","system")!!, widthPercent = prefs.getFloat("widthPercent",80f),lineHeight = prefs.getFloat("lineHeight",1.65f),autosave = prefs.getBoolean("autosave",true),customFonts = fonts.families)
+        s = s.copy(spellCheck=prefs.getBoolean("spellCheck",false),grammarCheck=prefs.getBoolean("grammarCheck",false),accent = prefs.getString("accent","system")!!, widthPercent = prefs.getFloat("widthPercent",80f),lineHeight = prefs.getFloat("lineHeight",1.65f),autosave = prefs.getBoolean("autosave",true),customFonts = fonts.families)
         try {
             if (snapshot.isFile) s=snapshot.bufferedReader().use {NoteRecovery.read(it,s)}
         } catch (_: Exception) { s = s.copy(error = "The recovery snapshot could not be read. Your original files are untouched.") }
@@ -253,7 +253,11 @@ class StudioViewModel(app: Application, val workspaceKey: String = "main") : And
     }
     fun reopen() { val note = mutable.value.closedTabs.firstOrNull() ?: return; change { it.copy(tabs = it.tabs + note, closedTabs = it.closedTabs.drop(1), activeId = note.id) } }
     fun mode(value: String) = change { it.copy(mode = value) }
-    fun fullscreen(value: Boolean) = change { it.copy(fullscreen = value) }
+    fun fullscreen(value: Boolean) = change { s ->
+        if (value == s.fullscreen) s else s.copy(fullscreen = value,
+            // Fullscreen is a chrome change, not a request to load an old scale.
+            fullscreenZoom = if (value) s.normalZoom else s.fullscreenZoom)
+    }
     // Reader gestures are acknowledgements, not a second command back to WebView.
     // Only an explicit native control/shortcut advances the command generation.
     fun zoom(value: Float) = change { s -> if (s.fullscreen) s.copy(fullscreenZoom = value.coerceIn(40f, 300f), zoomCommand = s.zoomCommand + 1) else s.copy(normalZoom = value.coerceIn(40f, 300f), zoomCommand = s.zoomCommand + 1) }
@@ -274,6 +278,10 @@ class StudioViewModel(app: Application, val workspaceKey: String = "main") : And
         val leading=lineHeight?.takeIf { it.isFinite() }?.coerceIn(1.15f,2.2f)
         change { it.copy(widthPercent=width ?: it.widthPercent,lineHeight=leading ?: it.lineHeight,autosave=autosave ?: it.autosave) }
         prefs.edit().apply { width?.let { putFloat("widthPercent",it) };leading?.let { putFloat("lineHeight",it) };autosave?.let { putBoolean("autosave",it) } }.apply()
+    }
+    fun writing(spellCheck:Boolean?=null,grammarCheck:Boolean?=null) {
+        change {it.copy(spellCheck=spellCheck?:it.spellCheck,grammarCheck=grammarCheck?:it.grammarCheck)}
+        prefs.edit().apply {spellCheck?.let {putBoolean("spellCheck",it)};grammarCheck?.let {putBoolean("grammarCheck",it)}}.apply()
     }
     fun overlay(open: Boolean, image: Boolean = false) { mutable.value=mutable.value.copy(readerOverlay=open); imageMutable.value=image }
     fun importFont(uri: Uri) = viewModelScope.launch {

@@ -143,19 +143,19 @@ class StudioUiTest {
         javascriptUntil("window.getSelection()?.toString()"){it=="\"Bravo\""}
         javascriptUntil("(()=>{window.getSelection()?.removeAllRanges();document.querySelector('a[href=\"#chapter-599\"]')?.click();const h=document.querySelector('h2#chapter-599');if(!h)return false;const host=document.querySelector('.android-reading');return Math.abs(h.getBoundingClientRect().top-host.getBoundingClientRect().top-16)<3;})()"){it=="true"}
     }
-    @Test fun graphNativeTwoFingerPanAndPinchDoesNotRotateOrZoomTheNote() {
+    @Test fun graphNativeTwoFingerPanAndPinchDoesNotZoomTheNote() {
         welcome()
         val model=androidx.lifecycle.ViewModelProvider(compose.activity)[StudioViewModel::class.java]
         temporaryNoteState = model.state.value
-        val content="""# A surface
+        val content="""# A graph
 
 ```smd-chart
-{"mode":"surface3d","series":[{"expression":"x^2+y^2"}],"x":{"min":-2,"max":2,"steps":12},"y":{"min":-2,"max":2}}
+{"series":[{"expression":"sin(x)"}],"x":{"min":-2,"max":2,"steps":12},"y":{"min":-2,"max":2}}
 ```
 """
         compose.runOnIdle {model.edit(model.state.value.active.id,content);model.mode("reader");model.zoom(100f)}
-        javascriptUntil("document.querySelector('.surface-chart')?.getAttribute('data-elevation')") {it=="\"28\""}
-        val raw=javascriptUntil("JSON.stringify((()=>{const s=document.querySelector('.surface-chart');s.scrollIntoView({block:'center',behavior:'instant'});const r=s.getBoundingClientRect();return {x:r.left+r.width*.5,y:r.top+r.height*.5,d:devicePixelRatio};})())") {it.contains("\\\"d\\\"")}
+        javascriptUntil("document.querySelectorAll('.interactive-chart svg').length") {it=="1"}
+        val raw=javascriptUntil("JSON.stringify((()=>{const s=document.querySelector('.interactive-chart svg');s.scrollIntoView({block:'center',behavior:'instant'});const r=s.getBoundingClientRect();return {x:r.left+r.width*.5,y:r.top+r.height*.5,d:devicePixelRatio};})())") {it.contains("\\\"d\\\"")}
         val rect=org.json.JSONObject(org.json.JSONArray("[$raw]").getString(0))
         val native=AtomicReference(IntArray(2))
         compose.runOnIdle {val xy=IntArray(2);web(compose.activity.window.decorView)!!.getLocationOnScreen(xy);native.set(xy)}
@@ -168,9 +168,53 @@ class StudioUiTest {
             moveTo(0,androidx.compose.ui.geometry.Offset(x-35*density,y+10*density));moveTo(1,androidx.compose.ui.geometry.Offset(x+55*density,y+10*density));advanceEventTime(50);up(0);up(1)
         }
         javascriptUntil("Number(document.querySelector('.interactive-chart')?.dataset.plotZoom)") {(it.toDoubleOrNull()?:0.0)>1.3}
-        assertEquals("\"28\"",javascriptUntil("document.querySelector('.surface-chart').dataset.elevation"){it=="\"28\""})
-        assertEquals("\"35\"",javascriptUntil("document.querySelector('.surface-chart').dataset.azimuth"){it=="\"35\""})
+        assertTrue(javascriptUntil("Number(document.querySelector('.interactive-chart').dataset.centerX)"){it.toDoubleOrNull()!=null}.toDouble()!=0.0)
         assertEquals("\"1\"",javascriptUntil("document.querySelector('.document-page').dataset.scale"){it=="\"1\""})
+    }
+    @Test fun matplotlib3DFiguresStillRenderAndExportToPdf() {
+        welcome()
+        val model=androidx.lifecycle.ViewModelProvider(compose.activity)[StudioViewModel::class.java]
+        temporaryNoteState=model.state.value
+        val content="""# Matplotlib 3D
+
+```python
+import numpy as np
+import matplotlib.pyplot as plt
+x, y = np.meshgrid(np.linspace(-2, 2, 12), np.linspace(-2, 2, 12))
+fig = plt.figure()
+ax = fig.add_subplot(111, projection="3d")
+ax.plot_surface(x, y, x*x + y*y, cmap="viridis")
+ax.set_title("Matplotlib 3D figure")
+```
+"""
+        compose.runOnIdle {model.edit(model.state.value.active.id,content);model.mode("reader");model.zoom(100f)}
+        javascriptUntil("(() => { const b = [...document.querySelectorAll('.python-cell button')].find(button => button.textContent.includes('Run')); if (b && !b.disabled) b.click(); return !!document.querySelector('.cell-output img'); })()") {it=="true"}
+        javascriptUntil("document.querySelector('.cell-output img')?.naturalWidth") {(it.toIntOrNull()?:0)>100}
+        assertEquals("0",javascriptUntil("document.querySelectorAll('.surface-chart').length"){it=="0"})
+        val exported=java.io.File(compose.activity.cacheDir,"matplotlib-3d-test.pdf")
+        exported.delete()
+        compose.runOnIdle {
+            model.outputUri=android.net.Uri.fromFile(exported)
+            model.busy(true)
+            web(compose.activity.window.decorView)?.evaluateJavascript("window.supermdExport?.(${StudioState().pdf})",null)
+        }
+        compose.waitUntil(60_000) {exported.isFile && exported.length()>1000 && !model.state.value.busy}
+        assertNull(model.state.value.error)
+        assertTrue(exported.inputStream().use {input->ByteArray(4).also {input.read(it)}.contentEquals("%PDF".toByteArray())})
+        val renderer=android.graphics.pdf.PdfRenderer(android.os.ParcelFileDescriptor.open(exported,android.os.ParcelFileDescriptor.MODE_READ_ONLY))
+        renderer.use {assertTrue(it.pageCount>0)}
+    }
+    @Test fun offlineWritingChecksWorkInsideTheRealAndroidWebView() {
+        welcome()
+        val model=androidx.lifecycle.ViewModelProvider(compose.activity)[StudioViewModel::class.java]
+        temporaryNoteState=model.state.value
+        val previousSpell=model.state.value.spellCheck;val previousGrammar=model.state.value.grammarCheck
+        try {
+            compose.runOnIdle {model.writing(spellCheck=true,grammarCheck=true);model.edit(model.state.value.active.id,"# Writing\n\nThis sentnce has a apple and the the word.\n\n```python\nsentnce = 'a apple the the'\n```");model.mode("editor")}
+            javascriptUntil("document.querySelectorAll('.cm-lintRange-info').length") {it=="3"}
+            compose.runOnIdle {model.writing(spellCheck=false,grammarCheck=false)}
+            javascriptUntil("document.querySelectorAll('.cm-lintRange-info').length") {it=="0"}
+        } finally {compose.runOnIdle {model.writing(spellCheck=previousSpell,grammarCheck=previousGrammar)}}
     }
     @Test fun visibleHistoryButtonsUndoAndRedoAReviewedMathRepair() {
         welcome()
@@ -273,10 +317,10 @@ class StudioUiTest {
         compose.onRoot().performTouchInput { swipe(androidx.compose.ui.geometry.Offset(30f, height * .82f), androidx.compose.ui.geometry.Offset(170f, height * .40f), 600) }
         compose.onNodeWithText("Your files").assertIsNotDisplayed()
         // WebView's post-gesture JS callback is asynchronous to Compose's idler.
-        compose.waitUntil(5000) {compose.onAllNodesWithContentDescription("Show contents").fetchSemanticsNodes().isNotEmpty()}
-        compose.onNodeWithContentDescription("Show contents").performClick()
-        compose.onAllNodesWithText("Contents",useUnmergedTree=true).filterToOne(hasAnyAncestor(isDialog())).assertIsDisplayed()
-        compose.onNodeWithText("Close").performClick()
+        compose.waitUntil(5000) {compose.onAllNodesWithContentDescription("Open files").fetchSemanticsNodes().isEmpty()}
+        compose.onNodeWithContentDescription("Show contents").assertDoesNotExist()
+        compose.onNodeWithContentDescription("Fullscreen study").assertDoesNotExist()
+        compose.waitUntil(5000) {androidx.core.view.ViewCompat.getRootWindowInsets(compose.activity.window.decorView)?.isVisible(androidx.core.view.WindowInsetsCompat.Type.statusBars())==false}
         // Reveal controls with an upward document traversal, not the removed
         // down-arrow overlay. The viewport must not resize during the gesture.
         compose.onRoot().performTouchInput { swipe(androidx.compose.ui.geometry.Offset(width*.65f,height*.45f),androidx.compose.ui.geometry.Offset(width*.65f,height*.75f),500) }
@@ -328,6 +372,12 @@ class StudioUiTest {
         compose.onNodeWithContentDescription("Show contents").assertDoesNotExist()
         compose.onNodeWithContentDescription("Fullscreen study").performClick()
         javascriptUntil("document.documentElement.dataset.fullscreen") { it == "\"true\"" }
+        javascriptUntil("document.querySelector('.document-page')?.dataset.scale") { it == normalScale }
+        compose.waitUntil(5000) {compose.onAllNodesWithContentDescription("Exit fullscreen").fetchSemanticsNodes().isEmpty()}
+        // A native upward traversal reveals a compact toolbar, never floating
+        // circles which remain over the document while chrome is hidden.
+        compose.onRoot().performTouchInput { swipe(androidx.compose.ui.geometry.Offset(width*.75f,height*.45f),androidx.compose.ui.geometry.Offset(width*.75f,height*.75f),500) }
+        compose.waitUntil(5000) {compose.onAllNodesWithContentDescription("Exit fullscreen").fetchSemanticsNodes().isNotEmpty()}
         // Earlier tests/repeated runs deliberately persist fullscreen zoom.
         // Start below the upper limit so this check can require a real increase.
         compose.runOnIdle { model.zoom(100f) }
@@ -377,5 +427,55 @@ class StudioUiTest {
         compose.onNodeWithText("Portable SMD", useUnmergedTree = true).performClick()
         compose.onNodeWithText("Your Markdown and images in one editable file.").assertExists()
         compose.onNodeWithText("Page numbers").assertDoesNotExist()
+    }
+    @Test fun openWithRegistrationCoversOpaqueProvidersAndAllNoteExtensions() {
+        val manager=compose.activity.packageManager
+        fun registered(uri:String,mime:String?) {
+            val intent=android.content.Intent(android.content.Intent.ACTION_VIEW).apply {
+                setDataAndType(android.net.Uri.parse(uri),mime)
+                addCategory(android.content.Intent.CATEGORY_DEFAULT)
+            }
+            assertTrue("Super MD must resolve $uri ($mime)",manager.queryIntentActivities(intent,android.content.pm.PackageManager.MATCH_DEFAULT_ONLY).any {it.activityInfo.packageName==compose.activity.packageName})
+        }
+        for(mime in listOf("text/plain","text/markdown","text/x-markdown","application/vnd.supermd.smd","application/vnd.supermd.fmd","application/octet-stream"))registered("content://com.android.providers.downloads.documents/document/123",mime)
+        for(extension in listOf("md","txt","smd","fmd"))registered("file:///storage/emulated/0/Download/Study.$extension",null)
+    }
+    @Test fun readingTapImmersionAndFullscreenPreserveWidthInLandscape() {
+        welcome()
+        val model=androidx.lifecycle.ViewModelProvider(compose.activity)[StudioViewModel::class.java]
+        temporaryNoteState=model.state.value
+        compose.runOnIdle {
+            model.edit(model.state.value.active.id,"# Immersive reading\n\n"+("A paragraph to scroll and read comfortably. ".repeat(12)+"\n\n").repeat(80))
+            model.mode("reader");model.zoom(170f)
+            compose.activity.requestedOrientation=android.content.pm.ActivityInfo.SCREEN_ORIENTATION_LANDSCAPE
+        }
+        try {
+            compose.waitUntil(10000) {compose.activity.resources.configuration.orientation==android.content.res.Configuration.ORIENTATION_LANDSCAPE}
+            javascriptUntil("document.querySelector('.document-page')?.dataset.scale") {it=="\"1.7\""}
+            javascriptUntil("window.getSelection()?.removeAllRanges();true") {it=="true"}
+            val width=javascriptUntil("getComputedStyle(document.querySelector('.document-page')).width") {it.contains("px")}
+            // A margin tap has no text/link/edit action and toggles reading UI.
+            compose.onRoot().performTouchInput {click(androidx.compose.ui.geometry.Offset(this.width*.98f,height*.60f))}
+            compose.waitUntil(5000) {compose.onAllNodesWithContentDescription("Open files").fetchSemanticsNodes().isEmpty()}
+            compose.onNodeWithContentDescription("Fullscreen study").assertDoesNotExist()
+            compose.waitUntil(5000) {androidx.core.view.ViewCompat.getRootWindowInsets(compose.activity.window.decorView)?.isVisible(androidx.core.view.WindowInsetsCompat.Type.statusBars())==false}
+            val nativeWidth=AtomicReference(0)
+            compose.runOnIdle {nativeWidth.set(web(compose.activity.window.decorView)!!.width)}
+            assertEquals("Landscape document must extend into the cutout region",compose.activity.window.decorView.width,nativeWidth.get())
+            compose.onRoot().performTouchInput {click(androidx.compose.ui.geometry.Offset(this.width*.98f,height*.60f))}
+            compose.waitUntil(5000) {compose.onAllNodesWithContentDescription("Open files").fetchSemanticsNodes().isNotEmpty()}
+            compose.onNodeWithContentDescription("Fullscreen study").performClick()
+            javascriptUntil("document.documentElement.dataset.fullscreen") {it=="\"true\""}
+            javascriptUntil("document.querySelector('.document-page')?.dataset.scale") {it=="\"1.7\""}
+            assertEquals(width,javascriptUntil("getComputedStyle(document.querySelector('.document-page')).width") {it.contains("px")})
+            compose.waitUntil(5000) {compose.onAllNodesWithContentDescription("Exit fullscreen").fetchSemanticsNodes().isEmpty()}
+            compose.onRoot().performTouchInput {click(androidx.compose.ui.geometry.Offset(this.width*.98f,height*.60f))}
+            compose.waitUntil(5000) {compose.onAllNodesWithContentDescription("Exit fullscreen").fetchSemanticsNodes().isNotEmpty()}
+            compose.onNodeWithContentDescription("Show contents").assertIsDisplayed()
+            compose.onNodeWithContentDescription("Exit fullscreen").performClick()
+        } finally {
+            compose.runOnIdle {model.fullscreen(false);compose.activity.requestedOrientation=android.content.pm.ActivityInfo.SCREEN_ORIENTATION_PORTRAIT}
+            compose.waitUntil(10000) {compose.activity.resources.configuration.orientation==android.content.res.Configuration.ORIENTATION_PORTRAIT}
+        }
     }
 }

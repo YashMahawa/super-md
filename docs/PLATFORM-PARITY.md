@@ -13,12 +13,17 @@ runtime download is involved. The Apache-2.0 license ships on both platforms.
 ## Common interactions
 
 - Ordinary Markdown files and portable SMD files, with legacy FMD read support.
+- Optional offline English spelling and basic grammar suggestions in Source and
+  Live editing. Grammar covers repeated words and a/an, not comprehensive language
+  understanding. Code, links and math are excluded. Checks run in a lazy worker
+  over bounded text; no note text is uploaded or automatically rewritten.
 - Live, Source and Read; Split when the window has sufficient tablet space.
 - Independent workspace/fullscreen themes, system accent, tinted light paper,
   dark and pure black; motion can be disabled.
 - Tabs, draft recovery, open/close folder, recent files, image drops and removal.
-- Equations, callouts, collapsible answers/code, Mermaid, SVG, interactive 2D/3D
-  plots and local NumPy/Matplotlib execution after explicit Run.
+- Equations, callouts, collapsible answers/code, Mermaid, SVG, interactive 2D
+  plots and local NumPy/Matplotlib execution after explicit Run, including 3D
+  Matplotlib figures. Interactive 3D charts have been removed.
 - Content zoom, independent plot/image zoom, links and PDF heading navigation.
 - PDF paper size, margins, font, size, line spacing, optional page numbers and
   optional light Material paper. Export and Share remember the same configuration;

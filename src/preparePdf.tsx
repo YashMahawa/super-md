@@ -38,6 +38,11 @@ export async function preparePdf(markdown: string, documentPath: string | null) 
       node.url = add(url, `asset-${++count}.${extension}`);
     });
     if (exportCell) work.push(async () => {
+      if(node.lang==="smd-chart") {
+        // Retired interactive 3D content remains editable and exportable as
+        // source. Never turn it into executable Python or block the whole PDF.
+        try {if(JSON.parse(node.value)?.mode==="surface3d"){node.lang="json";return;}} catch { /* Normal chart validation below reports malformed input. */ }
+      }
       if (["mermaid", "smd-chart", "svg"].includes(node.lang)) {
         const svg = node.lang === "svg" ? svgImage(node.value) : node.lang === "mermaid" ? await renderMermaid(node.value) : (() => {
           const html = renderToStaticMarkup(<InteractiveChart source={node.value} />);

@@ -48,6 +48,19 @@ class StudioTest(unittest.TestCase):
         self.session.writes.shutdown(wait=True)
         self.app.processEvents()
 
+    def test_writing_preferences_are_boolean_persistent_and_forwarded_to_reader(self):
+        self.studio.setting("spellCheck","true")
+        self.studio.setting("grammarCheck","true")
+        self.studio.setting("spellCheck",'"not a boolean"')
+        self.assertTrue(self.studio.settings["spellCheck"])
+        self.assertTrue(self.studio.settings["grammarCheck"])
+        restored=self.window()
+        self.assertTrue(restored.settings["spellCheck"])
+        self.assertTrue(restored.settings["grammarCheck"])
+        messages=[];restored.readerLoad.connect(messages.append);restored.ready=True;restored._emit()
+        payload=json.loads(messages[-1])
+        self.assertTrue(payload["spellCheck"]);self.assertTrue(payload["grammarCheck"])
+
     def test_cancel_then_discard_closes_once_without_prompt_loop(self):
         studio = self.studio
         studio.newNote()
@@ -144,7 +157,10 @@ class StudioTest(unittest.TestCase):
         self.assertEqual([t["id"] for t in studio.tabs],ids)
         self.assertEqual(studio.folder,"")
         studio.setZoom(130)
-        studio.setFullscreen(True); studio.setZoom(210)
+        studio.settings["fullZoom"]=70
+        studio.setFullscreen(True)
+        self.assertEqual(json.loads(studio.snapshot)["zoom"],130)
+        studio.setZoom(210)
         studio.setFullscreen(False)
         self.assertEqual(json.loads(studio.snapshot)["zoom"],130)
 

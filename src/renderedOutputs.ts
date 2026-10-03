@@ -4,7 +4,6 @@ export const chartValues = new Map<string, Record<string, number>>();
 export const chartZooms = new Map<string, number>();
 export const chartCenters = new Map<string, {x:number;y:number}>();
 export const chartGrids = new Map<string, boolean>();
-export const chartViews = new Map<string, {azimuth:number;elevation:number}>();
 export const pythonResults = new Map<string, PythonResult>();
 const storedPython=new Set<string>();
 let storedCharacters=0;
@@ -38,8 +37,8 @@ export function remember<T>(map: Map<string, T>, key: string, value: T) {
     let bytes=[...pythonResults].reduce((n,[source,result])=>n+cost(source,result),0);
     for(const [source,result] of pythonResults){if(bytes<=16_000_000 && pythonResults.size<=60)break;pythonResults.delete(source);bytes-=cost(source,result);}
   } else {
-    // Camera/slider metadata is small. Retain many graph states without keeping
-    // their meshes, so scrolling through a large note doesn't reset its graphs.
+    // Slider metadata is small. Retain graph states without keeping rendered
+    // geometry, so scrolling through a large note doesn't reset its graphs.
     let bytes=[...map].reduce((size,[source,data])=>size+2*(source.length+JSON.stringify(data).length),0);
     for(const [source,data] of map){if(bytes<=4_000_000&&map.size<=5000)break;map.delete(source);bytes-=2*(source.length+JSON.stringify(data).length);}
   }
@@ -47,7 +46,7 @@ export function remember<T>(map: Map<string, T>, key: string, value: T) {
 
 export function exportRenderedViews(content: string) {
   const selected = <T,>(map: Map<string, T>) => [...map].filter(([key]) => content.includes(key));
-  const result = {values:selected(chartValues), zooms:selected(chartZooms), centers:selected(chartCenters), grids:selected(chartGrids), views:selected(chartViews), python:selected(pythonResults)};
+  const result = {values:selected(chartValues), zooms:selected(chartZooms), centers:selected(chartCenters), grids:selected(chartGrids), python:selected(pythonResults)};
   // Avoid carrying huge derived images through the UI bridge. This is optional
   // runtime state, not source/assets, and never executes Python on restore.
   if (JSON.stringify(result).length > 8_000_000) result.python = [];
@@ -64,6 +63,5 @@ export function importRenderedViews(content: string, data: ReturnType<typeof exp
   restore(chartZooms, data.zooms, value => finite(value) && value >= .05 && value <= 64);
   restore(chartCenters, data.centers, value => !!value && finite(value.x) && finite(value.y));
   restore(chartGrids, data.grids, value => typeof value === "boolean");
-  restore(chartViews, data.views, value => !!value && finite(value.azimuth) && finite(value.elevation));
   restore(pythonResults, data.python, value => !!value && typeof value.ok === "boolean" && typeof value.stdout === "string" && typeof value.stderr === "string" && Array.isArray(value.images) && value.images.length <= 20 && value.images.every(image => typeof image === "string" && /^data:image\/(png|jpeg|svg\+xml);base64,/.test(image)));
 }

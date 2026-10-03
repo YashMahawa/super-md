@@ -4,6 +4,8 @@ import WindowedBlock from "./WindowedBlock";
 import {documentOutline,headingSlug} from "../documentNavigation";
 import {selectedMarkdown} from '../copySource';
 import type {ClipboardEvent} from 'react';
+import type {WritingOptions} from '../proofreading';
+import WritingSuggestions from './WritingSuggestions';
 const noTrustedHosts: string[] = [];
 
 export interface SourceBlock { start: number; end: number; text: string }
@@ -39,7 +41,7 @@ export function splitMarkdownBlocks(markdown: string): SourceBlock[] {
   return blocks.length ? blocks : [{ start: 0, end: 0, text: "" }];
 }
 
-interface Props {
+interface Props extends WritingOptions {
   markdown: string;
   onChange: (value: string) => void;
   documentPath: string | null;
@@ -49,7 +51,7 @@ interface Props {
   onTrustImageHost?: (host: string) => void;
 }
 
-export default function LiveEditor({ markdown, onChange, documentPath, python, dark, trustedImageHosts = noTrustedHosts, onTrustImageHost }: Props) {
+export default function LiveEditor({ markdown, onChange, documentPath, python, dark, trustedImageHosts = noTrustedHosts, onTrustImageHost,spellCheck=false,grammarCheck=false }: Props) {
   const [editing, setEditing] = useState<{ prefix: string; text: string; suffix: string } | null>(null);
   const blocks = useMemo(() => splitMarkdownBlocks(markdown), [markdown]);
   const large=markdown.length>80_000;
@@ -80,7 +82,7 @@ export default function LiveEditor({ markdown, onChange, documentPath, python, d
         const text = event.target.value;
         setEditing({ ...editing, text });
         onChange(editing.prefix + text + editing.suffix);
-      }} onKeyDown={event => { if (event.key === "Escape") { event.preventDefault(); event.stopPropagation(); setEditing(null); } }} onBlur={() => setEditing(null)} aria-label="Edit Markdown block" /></div>
+      }} onKeyDown={event => { if (event.key === "Escape") { event.preventDefault(); event.stopPropagation(); setEditing(null); } }} onBlur={event => {if(!event.relatedTarget || !event.currentTarget.parentElement?.contains(event.relatedTarget))setEditing(null);}} aria-label="Edit Markdown block" /><WritingSuggestions text={editing.text} spellCheck={spellCheck} grammarCheck={grammarCheck} onChange={text=>{setEditing({...editing,text});onChange(editing.prefix+text+editing.suffix);}} /></div>
       {after.map((block, index) => renderBlock(block, index, editing.prefix.length + editing.text.length))}
     </div>;
   }

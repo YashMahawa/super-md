@@ -6,7 +6,7 @@ const names = {SidebarSimple:"side_navigation", Plus:"add", File:"description",
   FolderOpen:"folder_open", FloppyDisk:"save", MagnifyingGlass:"search",
   Image:"image", GearSix:"settings", Export:"ios_share", ShareNetwork:"share",
   ArrowsOut:"open_in_full", X:"close", Bug:"bug_report", Undo:"undo", Redo:"redo",
-  CaretDown:"expand_more", Check:"check", Contents:"toc", Fullscreen:"fullscreen", FullscreenExit:"fullscreen_exit",
+  CaretDown:"expand_more", Check:"check", Contents:"toc", Fullscreen:"fullscreen", FullscreenExit:"fullscreen_exit", Rename:"edit_square",
   CalloutTip:"lightbulb",CalloutWarning:"warning",CalloutInfo:"info",CalloutError:"error",CalloutSuccess:"check_circle",CalloutQuestion:"help",CalloutAnswer:"chat",CalloutExample:"science",CalloutQuote:"format_quote"};
 mkdirSync("desktop/icons",{recursive:true});
 mkdirSync("public/icons",{recursive:true});

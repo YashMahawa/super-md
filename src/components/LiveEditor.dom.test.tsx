@@ -18,11 +18,14 @@ it("has no edit icons; single clicks select and double clicks edit, not links", 
   expect(host.querySelector("textarea")).toBeNull();
   act(() => root.unmount()); host.remove();
 });
-it("keeps answer and code disclosure headings interactive in Live mode", async () => {
+it("keeps answer disclosure interactive and Python source in one box", async () => {
   const host = document.createElement("div"); document.body.append(host); const root = createRoot(host);
   await act(async () => root.render(<LiveEditor markdown={'> [!answer]- Reveal answer\n> Hidden answer\n\n```python\nprint(42)\n```'} documentPath={null} dark python="" onChange={vi.fn()} />));
   const headings = host.querySelectorAll("summary");
-  expect(headings.length).toBeGreaterThanOrEqual(2);
+  expect(headings.length).toBe(1);
+  expect(host.querySelector('.python-cell details')).toBeNull();
+  expect(host.querySelectorAll('.python-cell .python-source')).toHaveLength(1);
+  expect(host.querySelector('.python-cell .cell-toolbar')?.textContent).toContain('Run');
   for (const summary of headings) act(() => summary.dispatchEvent(new MouseEvent("click",{bubbles:true,cancelable:true})));
   expect(host.querySelector("textarea")).toBeNull();
   act(() => root.unmount()); host.remove();

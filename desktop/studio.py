@@ -28,8 +28,8 @@ import updates
 ROOT = Path(sys._MEIPASS)/"resources" if getattr(sys,"frozen",False) else Path(__file__).resolve().parent.parent
 DEFAULT_PDF = {"pageSize": "a4", "margin": 18, "fontSize": 10, "lineHeight": 1.45, "paragraphSpacing": 1.2, "fontFamily": "Manrope", "pageNumbers": True, "themed": False}
 DEFAULTS = {"theme": "system", "fullTheme": "black", "motion": True, "font": "Manrope", "size": 18, "width": 0, "widthPercent":80, "lineHeight":1.65, "autosave":True, "normalZoom": 100, "fullZoom": 100, "python": (shutil.which("python3") or shutil.which("python") or "") if getattr(sys,"frozen",False) else sys.executable, "pdf": DEFAULT_PDF, "welcomed": False}
-DEFAULTS.update(readingMode="live", newNoteLocation="", accent="system", checkUpdates=True, autoUpdate=False)
-SAMPLE = """# A place to think\n\nWrite in Markdown. Read without distractions.\n\n> [!tip] Start with your notes\n> Open any note or folder. No vault, no import process.\n\n## Learn by exploring\n\n$$E = mc^2$$\n\n> [!answer]- Why does this matter?\n> Tap the heading to reveal an answer, then hide it to test yourself.\n\n```smd-chart\n{\"title\":\"A changing wave\",\"series\":[{\"name\":\"Sine\",\"expression\":\"sin(a*x)\",\"color\":\"#386a57\"},{\"name\":\"Cosine\",\"expression\":\"cos(a*x)\",\"color\":\"#bc6750\"}],\"sliders\":[{\"name\":\"a\",\"min\":0.2,\"max\":3,\"value\":1}]}\n```\n\n## Explore in three dimensions\n\n```smd-chart\n{\"mode\":\"surface3d\",\"title\":\"Bowl and saddle\",\"x\":{\"min\":-2,\"max\":2,\"steps\":20},\"y\":{\"min\":-2,\"max\":2},\"series\":[{\"name\":\"Bowl\",\"expression\":\"a*(x^2+y^2)\",\"color\":\"#39aa7a\"},{\"name\":\"Saddle\",\"expression\":\"x^2-y^2\",\"color\":\"#ad8be3\"}],\"sliders\":[{\"name\":\"a\",\"min\":0.1,\"max\":2,\"value\":1}]}\n```\n\n[Back to exploring](#learn-by-exploring)\n"""
+DEFAULTS.update(spellCheck=False, grammarCheck=False, readingMode="live", newNoteLocation="", accent="system", checkUpdates=True, autoUpdate=False)
+SAMPLE = """# A place to think\n\nWrite in Markdown. Read without distractions.\n\n> [!tip] Start with your notes\n> Open any note or folder. No vault, no import process.\n\n## Learn by exploring\n\n$$E = mc^2$$\n\n> [!answer]- Why does this matter?\n> Tap the heading to reveal an answer, then hide it to test yourself.\n\n```smd-chart\n{\"title\":\"A changing wave\",\"series\":[{\"name\":\"Sine\",\"expression\":\"sin(a*x)\",\"color\":\"#386a57\"},{\"name\":\"Cosine\",\"expression\":\"cos(a*x)\",\"color\":\"#bc6750\"}],\"sliders\":[{\"name\":\"a\",\"min\":0.2,\"max\":3,\"value\":1}]}\n```\n\n## Matplotlib in three dimensions\n\nRun a Python cell to generate a 3D figure, then save it in your note or PDF.\n\n```python\nimport numpy as np\nimport matplotlib.pyplot as plt\nx, y = np.meshgrid(np.linspace(-2, 2, 32), np.linspace(-2, 2, 32))\nfig = plt.figure()\nax = fig.add_subplot(111, projection=\"3d\")\nax.plot_surface(x, y, x*x + y*y, cmap=\"viridis\")\n```\n\n[Back to exploring](#learn-by-exploring)\n"""
 
 def local_path(value: str) -> Path:
     url = QUrl(value)
@@ -191,7 +191,7 @@ class Studio(QObject):
         if load and self.ready:
             tab = self._current()
             colors = self._colors()
-            self.readerLoad.emit(json.dumps({"id": tab["id"], "content": tab["content"], "path": tab["path"] or tab["id"], "mode": self.mode, "dark": self._dark(), "fullscreen": self.fullscreen, "font": self.settings["font"], "size": self.settings["size"], "widthPercent": self.settings["widthPercent"], "lineHeight":self.settings["lineHeight"], "zoom": self.settings["fullZoom" if self.fullscreen else "normalZoom"], "motion": self.settings["motion"], "python": self.settings["python"], "colors": colors, "viewState": tab.pop("viewState", None)}))
+            self.readerLoad.emit(json.dumps({"id": tab["id"], "content": tab["content"], "path": tab["path"] or tab["id"], "mode": self.mode, "dark": self._dark(), "fullscreen": self.fullscreen, "font": self.settings["font"], "size": self.settings["size"], "widthPercent": self.settings["widthPercent"], "lineHeight":self.settings["lineHeight"], "spellCheck":self.settings["spellCheck"], "grammarCheck":self.settings["grammarCheck"], "zoom": self.settings["fullZoom" if self.fullscreen else "normalZoom"], "motion": self.settings["motion"], "python": self.settings["python"], "colors": colors, "viewState": tab.pop("viewState", None)}))
 
     def _dark(self):
         theme = self.settings["fullTheme" if self.fullscreen else "theme"]
@@ -293,7 +293,7 @@ class Studio(QObject):
     @Property(str, notify=changed)
     def snapshot(self):
         tab = self._current()
-        return json.dumps({"tabs": [{"id": t["id"], "name": t["name"], "path": t["path"], "dirty": t["content"] != t["saved"]} for t in self.tabs], "active": self.active, "name": tab["name"], "outline": tab.get("outline", []), "portable": tab["portable"], "folder": self.folder, "files": self.files, "recent": self.recent, "settings": self.settings, "mode": self.mode, "fullscreen": self.fullscreen, "readerOverlay": self.reader_overlay, "imageOverlay": self.image_overlay, "dark": self._dark(), "zoom": self.settings["fullZoom" if self.fullscreen else "normalZoom"], "busy": self.busy > 0, "message": self.message, "colors": self._colors()})
+        return json.dumps({"tabs": [{"id": t["id"], "name": t["name"], "path": t["path"], "dirty": t["content"] != t["saved"]} for t in self.tabs], "active": self.active, "name": tab["name"], "outline": tab.get("outline", []), "portable": tab["portable"], "folder": self.folder, "files": self.files, "recent": self.recent, "settings": self.settings, "mode": self.mode, "fullscreen": self.fullscreen, "readerOverlay": self.reader_overlay, "imageOverlay": self.image_overlay, "readerReady": self.ready, "dark": self._dark(), "zoom": self.settings["fullZoom" if self.fullscreen else "normalZoom"], "busy": self.busy > 0, "message": self.message, "colors": self._colors()})
 
     @Property(str, constant=True)
     def windowId(self): return self.window_id
@@ -617,7 +617,7 @@ class Studio(QObject):
                     if child.name.startswith(".") or child.is_symlink():
                         continue
                     directory = child.is_dir()
-                    if directory or child.suffix.lower() in (".md", ".smd", ".fmd", ".markdown"):
+                    if directory or child.suffix.lower() in (".md", ".smd", ".fmd", ".markdown", ".txt"):
                         entries.append({"name": child.name, "path": str(child), "directory": directory, "depth": depth, "expanded": str(child) in expanded})
                         if directory and str(child) in expanded:
                             visit(child, depth + 1)
@@ -653,6 +653,10 @@ class Studio(QObject):
 
     @Slot(bool)
     def setFullscreen(self, value):
+        if value == self.fullscreen:
+            return
+        if value:
+            self.settings["fullZoom"] = self.settings["normalZoom"]
         self.fullscreen = value
         self._emit()
 
@@ -678,7 +682,7 @@ class Studio(QObject):
             return
         if key in ("theme","fullTheme") and value not in ("system","light","dark","black"): return
         if key=="accent" and value not in ("system","blue","green","violet","rose","amber"):return
-        if key in ("motion","welcomed","autosave","checkUpdates","autoUpdate") and not isinstance(value,bool): return
+        if key in ("motion","welcomed","autosave","checkUpdates","autoUpdate","spellCheck","grammarCheck") and not isinstance(value,bool): return
         if key in ("font","python") and (not isinstance(value,str) or not value.strip() or len(value)>2048): return
         if key in ("size","width","widthPercent","lineHeight","normalZoom","fullZoom") and (not isinstance(value,(int,float)) or isinstance(value,bool) or not math.isfinite(value)): return
         if key == "pdf" and (not isinstance(value,dict) or set(value) != set(DEFAULT_PDF)): return

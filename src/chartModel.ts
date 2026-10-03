@@ -7,10 +7,11 @@ export function parseChartSpec(source:string):ChartSpec {
   if(source.length>500_000) throw new Error("Chart JSON exceeds 500 KB");
   const value:unknown = JSON.parse(source);
   if(!object(value)) throw new Error("Chart must be a JSON object");
-  if(value.mode !== undefined && value.mode !== "line" && value.mode !== "surface3d") throw new Error("Chart mode must be line or surface3d");
+  if(value.mode === "surface3d") throw new Error("Interactive 3D graphs are no longer supported. Use a Python/Matplotlib cell for 3D figures; the original source is unchanged.");
+  if(value.mode !== undefined && value.mode !== "line") throw new Error("Chart mode must be line");
   if(value.title !== undefined && (typeof value.title !== "string" || value.title.length>500)) throw new Error("Chart title must be text (up to 500 characters)");
-  if(!Array.isArray(value.series) || !value.series.length || value.series.length>(value.mode === "surface3d" ? 4 : 16)) throw new Error("Use 1–16 line series, or 1–4 surfaces");
-  for(const axisName of ["x","y","z"]) {
+  if(!Array.isArray(value.series) || !value.series.length || value.series.length>16) throw new Error("Use 1–16 line series");
+  for(const axisName of ["x","y"]) {
     const axis = value[axisName];
     if(axis === undefined) continue;
     if(!object(axis)) throw new Error(`${axisName} axis must be an object`);
@@ -24,7 +25,6 @@ export function parseChartSpec(source:string):ChartSpec {
     if(series.name !== undefined && (typeof series.name !== "string" || series.name.length>300)) throw new Error("Series name must be short text");
     if(series.color !== undefined && (typeof series.color !== "string" || !/^#[\da-f]{6}$/i.test(series.color))) throw new Error("Series colors use #RRGGBB");
     if(series.points !== undefined) {
-      if(value.mode === "surface3d") throw new Error("3D surfaces use expressions in x and y, not 2D points");
       if(!Array.isArray(series.points) || series.points.length>10000 || !series.points.every(point=>Array.isArray(point) && point.length===2 && point.every(finite))) throw new Error("Points must be finite [x,y] pairs (up to 10000 per series)");
     } else {
       if(typeof series.expression !== "string") throw new Error("Each series needs an expression or points");

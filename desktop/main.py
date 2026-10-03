@@ -141,7 +141,7 @@ def main():
                 if studio.message.startswith("SMOKE:"):
                     print(studio.message,flush=True)
                     window.grabWindow().save("/tmp/supermd-qt-smoke.png")
-                    valid = all(value in studio.message for value in ('"headings":1','"math":1','"charts":2','"surfaces":1','"answers":1'))
+                    valid = all(value in studio.message for value in ('"headings":1','"math":1','"charts":1','"surfaces":0','"answers":1'))
                     zoom = window.findChild(QObject,"zoomPercentage")
                     valid = valid and zoom is not None and zoom.property("height") == 36
                     fullscreen = window.findChild(QObject,"fullscreenButton")
@@ -214,12 +214,12 @@ def main():
                     if popup is not None and popup.property("visible"):
                         print("FONT POPUP SMOKE FAILED: picker outlived Settings",flush=True);app.exit(2)
                 QTimer.singleShot(19500,verify_nested_popup_closed)
-                def surface_view():
+                def matplotlib_view():
                     window.setWidth(1320)
                     studio.setting("theme",'"system"')
-                    QTimer.singleShot(500,lambda:QMetaObject.invokeMethod(window,"runDocumentScript",Q_ARG("QVariant","document.querySelector('.surface-chart')?.scrollIntoView({block:'center',behavior:'instant'})")))
-                QTimer.singleShot(20000,surface_view)
-                QTimer.singleShot(21500,lambda:capture("3d-surface"))
+                    QTimer.singleShot(500,lambda:QMetaObject.invokeMethod(window,"runDocumentScript",Q_ARG("QVariant","document.querySelector('.python-cell')?.scrollIntoView({block:'center',behavior:'instant'})")))
+                QTimer.singleShot(20000,matplotlib_view)
+                QTimer.singleShot(21500,lambda:capture("matplotlib-code"))
                 report = studio.data/"native-render.pdf"
                 QTimer.singleShot(22000,lambda:studio.exportTo(str(report),"pdf"))
                 QTimer.singleShot(24000,lambda:studio.setMode("editor"))

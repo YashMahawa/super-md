@@ -1,4 +1,27 @@
 import { expect, test } from "@playwright/test";
+test("offline writing assistance checks prose only and keeps corrections undoable",async({page})=>{
+  await page.addInitScript(()=>{window.SuperMD={post:()=>{}};});await page.goto("/android-reader.html");
+  await page.waitForFunction(()=>typeof window.supermdLoad==='function');
+  const content="# Writing\n\nThis sentnce has a apple and the the word.\n\n```python\nsentnce = 'a apple the the'\n```\n\n$\\text{sentnce a apple}$";
+  const state={id:"proofing",content,path:null,mode:"editor" as const,dark:false,fullscreen:false,colors:{},font:"Manrope",size:18,zoom:100,spellCheck:true,grammarCheck:true};
+  await page.evaluate(state=>window.supermdLoad?.(state),state);
+  await expect(page.locator('.cm-lintRange-info')).toHaveCount(3,{timeout:15_000});
+  await page.evaluate(state=>window.supermdLoad?.({...state,spellCheck:false,grammarCheck:false}),state);
+  await expect(page.locator('.cm-lintRange-info')).toHaveCount(0);
+  await page.evaluate(state=>window.supermdLoad?.({...state,mode:"live"}),state);
+  await page.getByText("This sentnce has a apple and the the word.",{exact:true}).dblclick();
+  const suggestions=page.getByRole('complementary',{name:'Writing suggestions'});
+  await expect(suggestions).toBeVisible({timeout:15_000});
+  await suggestions.getByRole('button',{name:'sentence',exact:true}).click();
+  await expect(page.getByRole('textbox',{name:'Edit Markdown block'})).toHaveValue(/This sentence/);
+  await page.getByRole('textbox',{name:'Edit Markdown block'}).press('Escape');
+  await page.evaluate(()=>window.supermdHistory?.('undo'));
+  await expect(page.getByText('This sentnce has a apple and the the word.',{exact:true})).toBeVisible();
+  await page.evaluate(()=>window.supermdHistory?.('redo'));
+  await expect(page.getByText('This sentence has a apple and the the word.',{exact:true})).toBeVisible();
+  await expect(page.locator('.python-cell details')).toHaveCount(0);
+  await expect(page.locator('.python-cell .python-source')).toHaveCount(1);
+});
 test("Source search covers virtualized lines, matches case and replaces literal Markdown",async({page})=>{
   await page.addInitScript(()=>{window.SuperMD={post:()=>{}};});await page.goto("/android-reader.html");
   const content="# Search\n\nNeedle\n\n"+"A long offscreen paragraph.\n\n".repeat(500)+"NEEDLE\n";
@@ -67,18 +90,16 @@ test("large-note zoom leaves document-wide styles and all formulas unchanged",as
   await expect(page.locator('.katex')).toHaveCount(500);
   await expect(page.locator('.document-page')).toHaveAttribute('data-scale','1.7');
 });
-test("graph canvas drags and two-finger moves pan while 3D pinch never tilts",async({page})=>{
+test("2D graph canvas drags and two-finger moves pan without zooming the note",async({page})=>{
   await page.addInitScript(()=>{window.SuperMD={post:()=>{}};});await page.goto("/android-reader.html");
-  const graph=(mode:string)=>JSON.stringify({mode,series:[{expression:mode==="surface3d"?"x^2+y^2":"sin(x)"}],x:{min:-2,max:2,steps:12},y:{min:-2,max:2},sliders:[{name:"a",min:0,max:2,value:1}]});
-  for(const mode of ["line","surface3d"]){
+  const graph=(mode:string)=>JSON.stringify({mode,series:[{expression:"sin(x)"}],x:{min:-2,max:2,steps:12},y:{min:-2,max:2},sliders:[{name:"a",min:0,max:2,value:1}]});
+  for(const mode of ["line"]){
     await page.evaluate(content=>window.supermdLoad?.({id:content,content,path:null,mode:"reader",dark:false,fullscreen:false,colors:{},font:"Manrope",size:18,zoom:100}),"```smd-chart\n"+graph(mode)+"\n```");
     const plot=page.locator(".interactive-chart"),svg=plot.locator("svg");await expect(svg).toBeVisible();
     const rect=(await svg.boundingBox())!,x=rect.x+rect.width*.5,y=rect.y+rect.height*.5;
     const initial=Number(await plot.getAttribute("data-center-x"));
     await page.mouse.move(x,y);await page.mouse.down();await page.mouse.move(x+60,y+25,{steps:4});await page.mouse.up();
-    if(mode==="line") await expect.poll(()=>plot.getAttribute("data-center-x").then(Number)).toBeLessThan(initial);
-    else { await expect.poll(()=>svg.getAttribute("data-azimuth").then(Number)).not.toBe(35); expect(Number(await plot.getAttribute("data-center-x"))).toBe(initial); }
-    const elevation=await svg.getAttribute("data-elevation"),azimuth=await svg.getAttribute("data-azimuth");
+    await expect.poll(()=>plot.getAttribute("data-center-x").then(Number)).toBeLessThan(initial);
     const prior=Number(await plot.getAttribute("data-center-x"));
     await svg.evaluate(target=>{
       const r=target.getBoundingClientRect(),touches=(dx:number,span:number)=>[new Touch({identifier:1,target,clientX:r.left+70+dx,clientY:r.top+100}),new Touch({identifier:2,target,clientX:r.left+70+dx+span,clientY:r.top+100})];
@@ -89,7 +110,6 @@ test("graph canvas drags and two-finger moves pan while 3D pinch never tilts",as
     });
     await expect.poll(()=>plot.getAttribute("data-plot-zoom").then(Number)).toBeCloseTo(2,6);
     expect(Number(await plot.getAttribute("data-center-x"))).not.toBe(prior);
-    if(mode==="surface3d"){await expect(svg).toHaveAttribute("data-elevation",elevation!);await expect(svg).toHaveAttribute("data-azimuth",azimuth!);}
     const panBefore=Number(await plot.getAttribute("data-center-x"));
     await svg.evaluate(node=>{const r=node.getBoundingClientRect();window.supermdNativeWheel?.(30,10,{x:r.left+r.width/2,y:r.top+r.height/2},false);});
     await expect.poll(()=>plot.getAttribute("data-center-x").then(Number)).toBeGreaterThan(panBefore);
@@ -255,7 +275,7 @@ test("Android shares math, callouts, graphs and portable PDF preparation", async
   await expect(page.locator(".callout-tip")).toBeVisible(); await expect(page.locator(".katex-error")).toHaveCount(0); await expect(page.locator(".katex")).toHaveCount(1);
   // Python source has no highlight.js wrapper; it must remain legible against
   // the fixed dark code surface even when the document uses a light theme.
-  if (!await page.locator(".python-cell details").evaluate(node => (node as HTMLDetailsElement).open)) await page.locator(".python-cell summary").click();
+  await expect(page.locator(".python-cell details")).toHaveCount(0);
   await expect(page.locator(".python-cell pre code")).toBeVisible();
   await expect(page.locator(".python-cell pre code")).toHaveCSS("color", "rgb(238, 237, 244)");
   await expect(page.locator(".python-cell .hljs-string")).toContainText("local-python-ok");
@@ -319,8 +339,8 @@ test("plot pinch and trackpad zoom are independent of document text and export t
   await page.addInitScript(()=> { window.SuperMD={post:(id,command,args)=>(window as any).bridgePost(id,command,args)}; });
   await page.goto("/android-reader.html");
   const line=JSON.stringify({title:"Line plot",series:[{expression:"sin(x)"}]});
-  const surface=JSON.stringify({mode:"surface3d",title:"Surface plot",series:[{expression:"x^2+y^2"}],x:{min:-2,max:2,steps:12},y:{min:-2,max:2}});
-  const content=`# Plots\n\n\`\`\`smd-chart\n${line}\n\`\`\`\n\n\`\`\`smd-chart\n${surface}\n\`\`\``;
+  const cosine=JSON.stringify({title:"Cosine plot",series:[{expression:"cos(x)"}],x:{min:-2,max:2,steps:12},y:{min:-2,max:2}});
+  const content=`# Plots\n\n\`\`\`smd-chart\n${line}\n\`\`\`\n\n\`\`\`smd-chart\n${cosine}\n\`\`\``;
   await page.evaluate(content=>window.supermdLoad?.({id:"plot-zoom",content,path:null,mode:"reader",dark:false,fullscreen:false,colors:{},font:"sans",size:18,zoom:100}),content);
   const plots=page.locator(".interactive-chart"); await expect(plots).toHaveCount(2);
   await page.setViewportSize({width:420,height:900});
@@ -350,7 +370,7 @@ test("plot pinch and trackpad zoom are independent of document text and export t
   expect(Object.keys(exported.assets)).toHaveLength(2);
   const snapshots=Object.values(exported.assets).map(asset=>Buffer.from(asset as string,"base64").toString());
   expect(snapshots.some(svg=>svg.includes("Plot zoom: 180%"))).toBe(true);
-  expect(snapshots.some(svg=>svg.includes("clip-path=\"url(#surface-") && svg.includes('height="440"'))).toBe(true);
+  expect(snapshots.some(svg=>svg.includes("Cosine plot") && svg.includes("<polyline") && svg.includes("clip-path"))).toBe(true);
   await expect(plots.first().getByRole("button",{name:"Reset zoom",exact:true})).toHaveCount(0);
   await expect(plots.first().getByRole("slider",{name:"Plot zoom"})).toHaveCount(0);
   await expect(plots.nth(1)).toHaveAttribute("data-plot-zoom","1.8");
@@ -415,7 +435,7 @@ test("editable zoom and one export chooser work at desktop widths", async ({ pag
   await zoom.fill("175"); await zoom.press("Enter"); await expect(zoom).toHaveValue("175");
   const chromeHeight = await page.locator(".topbar").evaluate((node) => node.getBoundingClientRect().height);
   await page.keyboard.press("F11");
-  await expect(page.locator(".fullscreen-controls input")).toHaveValue("100");
+  await expect(page.locator(".fullscreen-controls input")).toHaveValue("175");
   await page.locator(".fullscreen-controls input").fill("210"); await page.locator(".fullscreen-controls input").press("Enter");
   await page.keyboard.press("F11"); await expect(zoom).toHaveValue("175");
   expect(await page.locator(".topbar").evaluate((node) => node.getBoundingClientRect().height)).toBe(chromeHeight);

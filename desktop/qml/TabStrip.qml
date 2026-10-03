@@ -70,7 +70,7 @@ ScrollView {
                 TapHandler { acceptedButtons: Qt.RightButton; onTapped: tabMenu.popup() }
                 Menu {
                     id: tabMenu
-                    MenuItem { text: "Rename note"; onTriggered: { renameField.text=tab.modelData.name;renameDialog.open() } }
+                    MenuItem { text: "Rename note"; icon.source: "../icons/Rename.svg"; icon.color: JSON.parse(studio.snapshot).colors.text; onTriggered: { renameField.text=tab.modelData.name;renameDialog.open() } }
                     MenuItem { text: "Undo"; enabled: tab.modelData.id===strip.viewState.active; onTriggered:studio.command("undo") }
                     MenuItem { text: "Redo"; enabled: tab.modelData.id===strip.viewState.active; onTriggered:studio.command("redo") }
                     MenuSeparator {}

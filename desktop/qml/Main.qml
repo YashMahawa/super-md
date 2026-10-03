@@ -278,6 +278,16 @@ ApplicationWindow {
                 onContentsRequested: contentsPopup.open()
                 onExitRequested: windowModes.setFullscreen(false)
             }
+            Rectangle {
+                anchors.fill: parent
+                visible: !viewState.readerReady
+                color: viewState.colors.surface
+                Column {
+                    anchors.centerIn: parent; spacing: 16
+                    ExpressiveLoading { anchors.horizontalCenter: parent.horizontalCenter }
+                    Label { text: "Opening your workspace"; color: viewState.colors.muted }
+                }
+            }
         }
     }
     Popup {
@@ -315,12 +325,12 @@ ApplicationWindow {
     footer: Pane {
         visible: !viewState.fullscreen && !viewState.imageOverlay
         padding: 6
-        RowLayout { anchors.fill: parent; Label { text: viewState.busy ? "Preparing document…" : viewState.message || "Local files. Automatic draft recovery."; elide: Text.ElideRight; Layout.fillWidth: true; color: viewState.colors.muted; font.pixelSize: 12 } BusyIndicator { running: viewState.busy; implicitHeight: 20; implicitWidth: 20 } }
+        RowLayout { anchors.fill: parent; Label { text: viewState.busy ? "Preparing document…" : viewState.message || "Local files. Automatic draft recovery."; elide: Text.ElideRight; Layout.fillWidth: true; color: viewState.colors.muted; font.pixelSize: 12 } ExpressiveLoading { running: viewState.busy; implicitHeight: 24; implicitWidth: 24 } }
     }
-    FileDialog { id: openDialog; title: "Open note"; nameFilters: ["Notes (*.md *.smd *.fmd *.markdown)", "All files (*)"]; onAccepted: studio.openNote(selectedFile.toString()) }
+    FileDialog { id: openDialog; title: "Open note"; nameFilters: ["Notes (*.md *.smd *.fmd *.markdown *.txt)", "All files (*)"]; onAccepted: studio.openNote(selectedFile.toString()) }
     FolderDialog { id: folderDialog; title: "Open folder"; onAccepted: studio.openFolder(selectedFolder.toString()) }
     FolderDialog { id: noteFolderDialog; title: "Default location for new notes"; onAccepted: studio.setNoteLocation(selectedFolder.toString()) }
-    FileDialog { id: saveDialog; title: "Save note"; fileMode: FileDialog.SaveFile; nameFilters: ["Markdown (*.md)", "Portable Super MD (*.smd)"]; onAccepted: studio.saveAs(selectedFile.toString()); onRejected: studio.resolveClose("cancel") }
+    FileDialog { id: saveDialog; title: "Save note"; fileMode: FileDialog.SaveFile; nameFilters: viewState.portable ? ["Portable Super MD (*.smd)"] : ["Markdown (*.md)", "Portable Super MD (*.smd)"]; onAccepted: studio.saveAs(selectedFile.toString()); onRejected: studio.resolveClose("cancel") }
     FileDialog { id: destination; title: "Export note"; fileMode: FileDialog.SaveFile; nameFilters: outputFormat === "pdf" ? ["PDF (*.pdf)"] : outputFormat === "md" ? ["Markdown (*.md)"] : ["Portable Super MD (*.smd)"]; onAccepted: studio.exportTo(selectedFile.toString(), outputFormat) }
     Dialog {
         id: exportDialog

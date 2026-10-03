@@ -127,32 +127,27 @@ up to 16 series, 16 sliders and 1,000 sampling steps; JSON is bounded to 500 KB.
 Missing/undefined function samples break a curve instead of joining across a gap.
 Use explicit y limits near poles/asymptotes. Colors are `#RRGGBB`.
 
-Three-dimensional **wireframe surfaces** use two coordinates and up to four
-series (not arbitrary 3D scenes or scripts):
+Python cells use a single source container with Copy and Run in its toolbar.
+Long Python source scrolls within that container; there is no nested source box.
+
+Interactive charts are two-dimensional. For **3D figures**, use a Python cell
+with Matplotlib; its generated SVG remains supported in notes, portable SMD
+files and PDF exports. Run is explicit: opening a note never executes code.
 
 ````md
-```smd-chart
-{
-  "mode": "surface3d",
-  "title": "Bowl and saddle",
-  "x": { "min": -2, "max": 2, "steps": 20 },
-  "y": { "min": -2, "max": 2 },
-  "z": { "label": "Height" },
-  "series": [
-    { "name": "Bowl", "expression": "a*(x^2+y^2)", "color": "#006a6a" },
-    { "name": "Saddle", "expression": "x^2-y^2", "color": "#6750a4" }
-  ],
-  "sliders": [{ "name": "a", "min": 0.1, "max": 2, "value": 1 }]
-}
+```python
+import numpy as np
+import matplotlib.pyplot as plt
+x, y = np.meshgrid(np.linspace(-2, 2, 32), np.linspace(-2, 2, 32))
+fig = plt.figure()
+ax = fig.add_subplot(111, projection="3d")
+ax.plot_surface(x, y, x*x + y*y, cmap="viridis")
 ```
 ````
 
-The 3D mesh defaults to 20 steps and is capped at 32. Mouse drag or arrow keys
-rotate; one-finger gestures scroll the note. Rotation is frame-coalesced and
-expressions are sampled over the visible world domain. The camera, grid toggle,
-zoom, focal center and parameter values are remembered
-within the app session and used for the static vector PDF snapshot. A PDF cannot
-retain sliders or a draggable camera.
+The retired `surface3d` chart mode shows a compatibility notice without changing
+the source. It is not silently converted or executed. Replace those blocks with
+Matplotlib cells when you want a 3D figure.
 
 Pinch, Ctrl/Meta + trackpad wheel, or left-mouse-button + wheel over a plot changes
 only that plot's zoom (5–6400%), not the note's text size. Zoom is focal: the point
@@ -161,7 +156,7 @@ domain when zooming out; explicit point sets remain finite data. Grid can be
 toggled and hover/tap shows coordinates. Zoom and grid state are included in PDF
 snapshots, without adding presentation settings to Markdown.
 
-Expressions accept `x`, `y` (surfaces), named slider variables, `pi`, `e`,
+Expressions accept `x`, named slider variables, `pi`, `e`,
 parentheses, `+ - * / % ^ **` and functions `sin cos tan asin acos atan sqrt abs
 exp log log10 floor ceil round min max pow`. `log` is natural logarithm. Explicit
 multiplication is required: `2*x`, not `2x`. `-x^2` means `-(x^2)`; `2^-2` is

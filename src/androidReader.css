@@ -10,7 +10,7 @@
 :root[data-motion="off"] *, :root[data-motion="off"] { transition: none !important; animation: none !important; scroll-behavior: auto !important; }
 .android-document { height: 100%; display: flex; min-width: 0; }
 .android-source, .android-reading { flex: 1; min-width: 0; height: 100%; overflow: auto; overscroll-behavior: contain; }
-.android-reading { padding: var(--cutout-top, 0px) var(--cutout-right, 0px) 0 var(--cutout-left, 0px); }
+.android-reading { padding: 0; }
 .mode-split .android-source { border-right: 1px solid var(--outline); }
 .document-page-space { min-width:100%; overflow-anchor:none; }
 .document-page { margin:0; width:80%; transform-origin:top left; contain:layout style; -webkit-text-size-adjust:none; text-size-adjust:none; }
@@ -28,7 +28,10 @@
 .android-reading .live-block .markdown-body { width: 100%; max-width: none; padding: 0; }
 .android-reading .markdown-body h1 { font-size: 2em; }
 .android-reading .markdown-body h2 { font-size: 1.5em; }
-.reader-loading { display: grid; height: 100%; place-content: center; color: var(--muted); }
+.reader-loading { display: grid; height: 100%; place-content: center; justify-items:center; gap:16px; color: var(--muted); }
+.expressive-loading-shape { width:44px; height:44px; background:var(--primary); border-radius:42% 18% 42% 18%; animation:expressive-loading-shape 2.1s cubic-bezier(.4,0,.2,1) infinite; }
+@keyframes expressive-loading-shape { 0%,100% {transform:rotate(0deg);border-radius:42% 18% 42% 18%;} 33% {transform:rotate(120deg);border-radius:25% 42% 25% 42%;} 66% {transform:rotate(240deg);border-radius:45% 25% 45% 25%;} }
+@media(prefers-reduced-motion:reduce) { .expressive-loading-shape {animation:none;} }
 .android-reading .interactive-chart input[type=range] { min-height: 48px; }
 .android-reading .cm-editor { min-height: 100%; }
 @media (min-width: 840px) { .android-reading .markdown-body { padding-top: 28px; } }

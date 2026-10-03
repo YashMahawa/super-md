@@ -11,7 +11,6 @@ can scroll horizontally. Native chrome stays fixed. Source mode scales editor te
 | Graph canvas | Left drag / two-finger movement | Pan camera |
 | Graph canvas | Pinch / Ctrl-wheel / held-left-button wheel | Focal graph zoom |
 | Graph controls/title | Pinch / Ctrl-wheel | Document zoom, not camera zoom |
-| 3D canvas | Shift-drag / arrow keys | Rotate camera |
 | Image viewer | Drag / two-finger movement | Pan image |
 | Image viewer | Pinch / Ctrl-wheel / mouse wheel | Focal image zoom |
 

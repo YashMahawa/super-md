@@ -11,7 +11,7 @@ from test_studio import QuietStudio
 class SidebarToggleTest(unittest.TestCase):
     @classmethod
     def setUpClass(cls):cls.app=QGuiApplication.instance() or QGuiApplication(["Sidebar motion tests"])
-    def test_icon_morphs_and_respects_motion_preference(self):
+    def test_static_icon_toggles_without_motion(self):
         studio=QuietStudio(True);engine=QQmlEngine();engine.rootContext().setContextProperty("studio",studio)
         component=QQmlComponent(engine);component.setData(b'''import QtQuick
 import QtQuick.Controls
@@ -21,11 +21,14 @@ ApplicationWindow { width: 240; height: 120; visible: true
         self.assertFalse(component.isError(),str(component.errors()));window=component.create();self.assertIsNotNone(window)
         try:
             QTest.qWait(30);button=window.findChild(QObject,"sidebarToggle")
-            self.assertIsNotNone(button);button.clicked.emit();QTest.qWait(55)
-            self.assertGreater(button.property("expansion"),0);self.assertLess(button.property("expansion"),1)
-            QTest.qWait(220);self.assertEqual(button.property("expansion"),0)
+            self.assertIsNotNone(button)
+            self.assertEqual(button.property("glyph"),"SidebarSimple")
+            self.assertFalse(button.property("motion"));self.assertEqual(button.property("scale"),1)
+            button.clicked.emit();QTest.qWait(20)
+            self.assertFalse(button.property("expanded"));self.assertEqual(button.property("scale"),1)
+            self.assertEqual(button.property("glyph"),"SidebarSimple")
             studio.settings["motion"]=False;studio._emit(False);button.clicked.emit();QTest.qWait(20)
-            self.assertEqual(button.property("expansion"),1)
+            self.assertTrue(button.property("expanded"));self.assertFalse(button.property("motion"))
         finally:
             window.close();window.deleteLater();self.app.sendPostedEvents(None,QEvent.Type.DeferredDelete)
             engine.deleteLater();self.app.sendPostedEvents(None,QEvent.Type.DeferredDelete)

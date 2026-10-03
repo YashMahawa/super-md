@@ -6,6 +6,11 @@ import { remarkObsidianMath } from "./obsidianMath";
 import {revealWindowed} from "./windowedSearch";
 import {applyDocumentZoom,invalidateDocumentZoom} from './documentZoom';
 const jumps=new WeakMap<Element,object>();
+/** A user's zoom/pan wins over the settling frames of a preceding link jump. */
+export function cancelHeadingNavigation(root:Element|null):void {
+  if(!root)return;
+  jumps.delete(root);delete (root as HTMLElement).dataset.navigating;
+}
 
 export interface OutlineEntry {id:string;title:string;level:number;offset:number}
 export function documentOutline(markdown:string):OutlineEntry[] {

@@ -2,7 +2,6 @@ import { useEffect, useId, useMemo, useRef, useState, type CSSProperties } from 
 import { compileMathExpression } from "../mathExpression";
 import { parseChartSpec, lineSegments } from "../chartModel";
 import { chartValues, chartGrids, remember } from "../renderedOutputs";
-import SurfaceChart from "./SurfaceChart";
 import { useChartZoom } from "../useChartZoom";
 import { axisNumber, axisTicks } from "../focalZoom";
 import GraphProbe from "./GraphProbe";
@@ -28,7 +27,7 @@ export default function InteractiveChart({source,dark=false}:{source:string;dark
   const effectiveValues = useMemo(()=>Object.fromEntries((parsed.spec?.sliders||[]).map(slider=>[slider.name,Math.max(slider.min,Math.min(slider.max,Number.isFinite(values[slider.name])?values[slider.name]:slider.value))])),[parsed,values]);
   const compiled = useMemo(()=>(parsed.spec?.series||[]).map(series=>series.expression?compileMathExpression(series.expression):null),[parsed]);
   const rawSeries = useMemo(()=>{
-    const spec=parsed.spec;if(!spec || spec.mode==="surface3d") return [];
+    const spec=parsed.spec;if(!spec) return [];
     const low=spec.x?.min??(spec.x?.max!==undefined?spec.x.max-20:-10),high=spec.x?.max??low+20,steps=spec.x?.steps??160;
     return spec.series.map((series,index)=>series.points||Array.from({length:steps+1},(_,i)=>{
       const x=low+i*(high-low)/steps;
@@ -45,7 +44,7 @@ export default function InteractiveChart({source,dark=false}:{source:string;dark
   const upper=spec.y?.max??(allY.length?Math.max(...allY,1):1),baseYMax=upper>baseYMin?upper:baseYMin+2;
   const yMid=(baseYMin+baseYMax)/2+plot.center.y*(baseYMax-baseYMin),yHalf=(baseYMax-baseYMin)/(2*plot.zoom),yMin=yMid-yHalf,yMax=yMid+yHalf;
   // Expressions follow the visible domain. Explicit point sets remain finite data.
-  const visibleSeries=spec.mode==="surface3d" ? [] : spec.series.map((series,index)=>series.points || Array.from({length:Math.max(240,spec.x?.steps??160)+1},(_,i)=>{ const x=xMin+i*(xMax-xMin)/Math.max(240,spec.x?.steps??160);return [x,compiled[index]!({...effectiveValues,x})] as [number,number]; }));
+  const visibleSeries=spec.series.map((series,index)=>series.points || Array.from({length:Math.max(240,spec.x?.steps??160)+1},(_,i)=>{ const x=xMin+i*(xMax-xMin)/Math.max(240,spec.x?.steps??160);return [x,compiled[index]!({...effectiveValues,x})] as [number,number]; }));
   return {xMin,xMax,yMin,yMax,allY,visibleSeries};
   },[spec,rawSeries,compiled,effectiveValues,plot.zoom,plot.center]);
   if(!spec || !geometry) return <div className="render-error" role="status">Invalid smd-chart: {parsed.error}</div>;
@@ -57,11 +56,11 @@ export default function InteractiveChart({source,dark=false}:{source:string;dark
   const clamp=(value:number,low:number,high:number)=>Math.max(low,Math.min(high,value));
   const px=(x:number)=>clamp(left+(x-xMin)/(xMax-xMin)*(width-left-right),-1e6,1e6);
   const py=(y:number)=>clamp(top+(1-(y-yMin)/(yMax-yMin))*(height-top-bottom),-1e6,1e6);
-  if(spec.mode!=="surface3d" && (!(xMax>xMin) || !Number.isFinite(xMax-xMin) || !Number.isFinite(yMax-yMin))) return <div className="render-error">Chart limits are outside a usable numeric range. Specify finite axis limits.</div>;
-  return <figure ref={plot.host} className="interactive-chart" data-plot-zoom={plot.zoom} data-center-x={plot.center.x} data-center-y={plot.center.y} style={{"--surface-label-size":`${Math.min(36,13*760/Math.max(280,viewport))}px`} as CSSProperties}>
+  if(!(xMax>xMin) || !Number.isFinite(xMax-xMin) || !Number.isFinite(yMax-yMin)) return <div className="render-error">Chart limits are outside a usable numeric range. Specify finite axis limits.</div>;
+  return <figure ref={plot.host} className="interactive-chart" data-plot-zoom={plot.zoom} data-center-x={plot.center.x} data-center-y={plot.center.y}>
     {spec.title && <figcaption>{spec.title}</figcaption>}
     <div className="chart-toolbar"><button aria-pressed={grid} onClick={()=>{remember(chartGrids,source,!grid);setGrid(!grid);}}>Grid</button></div>
-    {spec.mode==="surface3d" ? <SurfaceChart key={source} source={source} spec={spec} values={effectiveValues} colors={colors} zoom={plot.zoom} center={plot.center} grid={grid}/> : <><div data-independent-zoom>
+    <div data-independent-zoom>
       <svg ref={svgRef} viewBox={`0 0 ${width} ${height}`} data-plot-left={left} role="img" aria-label={spec.title||"Interactive graph"}>
         <defs><clipPath id={clipId}><rect x={left} y={top} width={width-left-right} height={height-top-bottom}/></clipPath></defs>
         <line className="chart-axis" x1={left} x2={width-right} y1={clamp(py(0),top,height-bottom)} y2={clamp(py(0),top,height-bottom)}/>
@@ -73,7 +72,6 @@ export default function InteractiveChart({source,dark=false}:{source:string;dark
         <GraphProbe svg={svgRef} locate={(x,y)=>x>=left&&x<=width-right&&y>=top&&y<=height-bottom?{x,y,coordinates:[xMin+(x-left)/(width-left-right)*(xMax-xMin),yMax-(y-top)/(height-top-bottom)*(yMax-yMin)]}:null}/>
       </svg></div>
       {!allY.length && <div className="chart-warning" role="status">No finite samples. Check the expression and variable names.</div>}
-    </>}
     <div className="chart-controls">{(spec.sliders||[]).map(slider=><label key={slider.name}><span>{slider.label||slider.name}: <strong>{Number(effectiveValues[slider.name].toPrecision(5))}</strong></span><input type="range" min={slider.min} max={slider.max} step={slider.step??(slider.max-slider.min)/100} value={effectiveValues[slider.name]} style={{"--chart-progress":`${100*(effectiveValues[slider.name]-slider.min)/(slider.max-slider.min)}%`} as CSSProperties} onChange={event=>setValues(current=>{const next={...current,[slider.name]:Number(event.target.value)};remember(chartValues,source,next);return next;})}/></label>)}</div>
     <div className="chart-legend">{spec.series.map((series,index)=><span key={index}><i aria-hidden="true" style={{color:colors[index]}}/> {series.name||series.expression||`Series ${index+1}`}</span>)}</div>
   </figure>;

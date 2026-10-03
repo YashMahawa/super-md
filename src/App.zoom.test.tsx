@@ -40,9 +40,9 @@ describe("workspace zoom modes", () => {
 
     await act(async () => { window.dispatchEvent(new KeyboardEvent("keydown", { key: "F11", bubbles: true })); });
     expect(document.documentElement.dataset.fullscreen).toBe("true");
-    expect(host.querySelector<HTMLInputElement>('.fullscreen-controls input')?.value).toBe("100");
+    expect(host.querySelector<HTMLInputElement>('.fullscreen-controls input')?.value).toBe("115");
     await act(async () => { window.dispatchEvent(new KeyboardEvent("keydown", { key: "+", code: "Equal", ctrlKey: true, bubbles: true, cancelable: true })); });
-    expect(host.querySelector<HTMLInputElement>('.fullscreen-controls input')?.value).toBe("110");
+    expect(host.querySelector<HTMLInputElement>('.fullscreen-controls input')?.value).toBe("125");
 
     await act(async () => { window.dispatchEvent(new KeyboardEvent("keydown", { key: "F11", bubbles: true })); });
     expect(document.documentElement.dataset.fullscreen).toBe("false");

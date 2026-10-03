@@ -309,7 +309,6 @@ md-filled-button.primary-action, smd-expressive-button.primary-action { display:
 .interactive-chart figcaption { font-weight: 750; font-size: 1.08em; margin: 0 4px 10px; }
 .interactive-chart svg { width: 100%; height: auto; background: var(--surface-low); border-radius: 12px; }
 .interactive-chart svg text { fill: var(--muted); font-size: 13px; }
-.interactive-chart svg.surface-chart text { font-size:var(--surface-label-size,13px); }
 .chart-axis { stroke: var(--outline); stroke-width: 1.2; }
 .chart-controls { display: grid; grid-template-columns: repeat(auto-fit, minmax(210px, 1fr)); gap: 12px; padding: 14px 4px 4px; }
 .chart-controls label { display: grid; gap: 5px; }
@@ -336,6 +335,16 @@ md-filled-button.primary-action, smd-expressive-button.primary-action { display:
 .render-error { padding: 15px; border: 1px solid var(--error); border-radius: 10px; color: var(--error); white-space: pre-wrap; }
 .python-cell { margin: 1.5em 0; border: 1px solid var(--outline); border-radius: 14px; overflow: hidden; background: var(--surface); }
 .python-cell pre { margin: 0; border: 0; border-radius: 0; }
+.python-cell .python-source { max-height: 28em; overflow: auto; }
+.python-cell .cell-toolbar .code-copy { position: static; margin-left: auto; margin-right: 8px; background: transparent; color: var(--text); }
+.writing-suggestions { padding: 12px 16px; background: var(--surface-high); border-top: 1px solid var(--outline); font: 14px/1.5 var(--md-ref-typeface-plain); }
+.writing-suggestions header { display: flex; justify-content: space-between; gap: 12px; font-weight: 650; }
+.writing-suggestions small { color: var(--muted); font-weight: 400; }
+.writing-suggestions > div { display: flex; align-items: center; flex-wrap: wrap; gap: 8px; padding-top: 8px; }
+.writing-suggestions > div > span { margin-right: auto; }
+.writing-suggestions button { padding: 5px 12px; background: var(--md-sys-color-primary-container); color: var(--md-sys-color-on-primary-container); border: 1px solid var(--outline); border-radius: 12px; }
+.cm-tooltip-lint { background: var(--surface-high) !important; color: var(--text) !important; border: 1px solid var(--outline) !important; border-radius: 12px; padding: 8px; max-width: min(360px,80vw); }
+.cm-lintPoint-info, .cm-lintRange-info { text-decoration: underline wavy var(--primary); text-underline-offset: 4px; }
 .cell-toolbar { height: 42px; padding: 0 8px 0 16px; display: flex; align-items: center; justify-content: space-between; color: var(--muted); background: var(--surface-high); font-size: .85em; font-weight: 700; }
 .cell-toolbar button { padding: 6px 14px; background: var(--primary); color: var(--on-primary); }
 .cell-output { padding: 14px; border-top: 1px solid var(--outline); }

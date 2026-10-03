@@ -364,6 +364,7 @@ export default function App() {
     finally { savingRef.current.delete(tab.id); }
   }, []);
   const toggleFullscreen = useCallback(async () => {
+    if(!fullscreen) setFullscreenZoom(normalZoom);
     if (!("__TAURI_INTERNALS__" in window)) {
       const next = !fullscreen;
       if (document.fullscreenEnabled) {
@@ -377,7 +378,7 @@ export default function App() {
       const next = !(await nativeWindow.isFullscreen());
       await nativeWindow.setFullscreen(next); setFullscreen(next);
     } catch (error) { flash(`Fullscreen could not change: ${error}`); }
-  }, [fullscreen]);
+  }, [fullscreen,normalZoom]);
   useEffect(() => {
     if ("__TAURI_INTERNALS__" in window) return;
     const changed = () => setFullscreen(Boolean(document.fullscreenElement));

@@ -21,8 +21,8 @@ import androidx.compose.animation.core.spring
 import androidx.compose.animation.core.tween
 import androidx.compose.animation.core.FiniteAnimationSpec
 import androidx.compose.animation.core.snap
-import androidx.compose.animation.expandVertically
-import androidx.compose.animation.shrinkVertically
+import androidx.compose.animation.fadeIn
+import androidx.compose.animation.fadeOut
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.horizontalScroll
@@ -164,13 +164,13 @@ private object NoMotionScheme : MotionScheme {
     var renaming by remember {mutableStateOf(false)}
     var contentsShown by remember {mutableStateOf(false)}
     var sidebarSection by rememberSaveable {mutableStateOf("folder")}
-    var chromeAwake by remember {mutableStateOf(true)}
     var readingChromeVisible by remember {mutableStateOf(true)}
-    LaunchedEffect(state.active.id, state.mode, settings) { readingChromeVisible = true }
-    val hideChromeJob=remember {arrayOfNulls<kotlinx.coroutines.Job>(1)}
-    fun wakeChrome(){chromeAwake=true;hideChromeJob[0]?.cancel();hideChromeJob[0]=scope.launch{delay(2200);chromeAwake=false}}
-    LaunchedEffect(state.fullscreen){wakeChrome()}
-    DisposableEffect(Unit){onDispose{hideChromeJob[0]?.cancel()}}
+    LaunchedEffect(state.active.id, state.mode, settings) { if (!state.fullscreen) readingChromeVisible = true }
+    LaunchedEffect(state.fullscreen) { if (state.fullscreen) readingChromeVisible = false }
+    // A delayed single tap allows Live's double tap to enter editing without
+    // hiding chrome or resizing the viewport in the middle of that action.
+    val chromeTapJob=remember {arrayOfNulls<kotlinx.coroutines.Job>(1)}
+    DisposableEffect(Unit){onDispose{chromeTapJob[0]?.cancel()}}
     var web by remember { mutableStateOf<WebView?>(null) }
     DisposableEffect(activity, web) {
         activity.dismissDocument = { web?.evaluateJavascript("window.supermdDismiss?.() || false") { dismissed -> if (dismissed != "true") model.fullscreen(false) } ?: model.fullscreen(false) }
@@ -206,16 +206,13 @@ private object NoMotionScheme : MotionScheme {
     DisposableEffect(portable, state.active.name) { model.requestPortable = { portable.launch(state.active.name.substringBeforeLast('.') + ".smd") }; onDispose { model.requestPortable = null } }
     val saveAction: () -> Unit = { if (state.active.uri == null) save.launch(state.active.name.substringBeforeLast('.') + ".md") else if (state.active.portable) { model.busy(true); web?.evaluateJavascript("window.supermdPortable?.(true)", null) ?: model.fail("The reader is not ready") } else model.save(); Unit }
     LaunchedEffect(state.message) { state.message?.let { snackbar.showSnackbar(it); model.dismissMessage() } }
-    LaunchedEffect(state.fullscreen, dark) {
-        WindowCompat.getInsetsController(activity.window, activity.window.decorView).apply { isAppearanceLightStatusBars = !dark; isAppearanceLightNavigationBars = !dark; systemBarsBehavior = WindowInsetsControllerCompat.BEHAVIOR_SHOW_TRANSIENT_BARS_BY_SWIPE; if (state.fullscreen) hide(WindowInsetsCompat.Type.systemBars()) else show(WindowInsetsCompat.Type.systemBars()) }
+    val immersive = (state.fullscreen || !readingChromeVisible) && !settings
+    LaunchedEffect(immersive, dark) {
+        WindowCompat.getInsetsController(activity.window, activity.window.decorView).apply { isAppearanceLightStatusBars = !dark; isAppearanceLightNavigationBars = !dark; systemBarsBehavior = WindowInsetsControllerCompat.BEHAVIOR_SHOW_TRANSIENT_BARS_BY_SWIPE; if (immersive) hide(WindowInsetsCompat.Type.systemBars()) else show(WindowInsetsCompat.Type.systemBars()) }
     }
     BackHandler(state.fullscreen || drawer.isOpen || state.readerOverlay) { if (drawer.isOpen) scope.launch { drawer.close() } else web?.evaluateJavascript("window.supermdDismiss?.() || false") {dismissed->if(dismissed!="true")model.fullscreen(false)} }
     val palette = MaterialTheme.colorScheme
-    val cutout = WindowInsets.displayCutout
     val density = LocalDensity.current
-    val cutoutTop = cutout.getTop(density) / density.density
-    val cutoutLeft = cutout.getLeft(density, androidx.compose.ui.unit.LayoutDirection.Ltr) / density.density
-    val cutoutRight = cutout.getRight(density, androidx.compose.ui.unit.LayoutDirection.Ltr) / density.density
     val tokens = remember(palette) { JSONObject().put("primary", hex(palette.primary)).put("on-primary", hex(palette.onPrimary)).put("surface", hex(palette.surface)).put("surface-low", hex(palette.surfaceContainerLow)).put("surface-high", hex(palette.surfaceContainerHigh)).put("text", hex(palette.onSurface)).put("muted", hex(palette.onSurfaceVariant)).put("outline", hex(palette.outlineVariant)) }
     BoxWithConstraints(Modifier.fillMaxSize().background(palette.surface)) {
         // A phone in landscape is wide but still short. Keep its three single
@@ -223,12 +220,11 @@ private object NoMotionScheme : MotionScheme {
         val displayIsLarge = if (Build.VERSION.SDK_INT >= 30) activity.windowManager.maximumWindowMetrics.bounds.let { minOf(it.width(), it.height()) / density.density >= 600f } else activity.resources.configuration.smallestScreenWidthDp >= 600
         val wide = displayIsLarge && maxWidth >= 720.dp && maxHeight >= 400.dp
         val actualMode = if (!wide && state.mode == "split") "live" else state.mode
-        LaunchedEffect(readerReady, state.active, actualMode, dark, state.fullscreen, state.font, state.size, state.widthPercent,state.lineHeight,tokens, hinge, cutoutTop, cutoutLeft, cutoutRight, motion) {
+        LaunchedEffect(readerReady, state.active, actualMode, dark, state.fullscreen, state.font, state.size, state.widthPercent,state.lineHeight,state.spellCheck,state.grammarCheck,tokens, hinge, motion) {
             if (readerReady) {
                 val note = state.active
-                val payload = JSONObject().put("id", note.id).put("content", note.content).put("path", note.uri ?: note.id).put("mode", actualMode).put("dark", dark).put("fullscreen", state.fullscreen).put("font", state.font).put("size", state.size).put("widthPercent",state.widthPercent).put("lineHeight",state.lineHeight).put("colors", tokens).put("zoom", state.zoom).put("motion", motion)
+                val payload = JSONObject().put("id", note.id).put("content", note.content).put("path", note.uri ?: note.id).put("mode", actualMode).put("dark", dark).put("fullscreen", state.fullscreen).put("font", state.font).put("size", state.size).put("widthPercent",state.widthPercent).put("lineHeight",state.lineHeight).put("spellCheck",state.spellCheck).put("grammarCheck",state.grammarCheck).put("colors", tokens).put("zoom", state.zoom).put("motion", motion)
                 web?.evaluateJavascript("document.documentElement.dataset.platform='android';window.supermdLoad?.($payload)", null)
-                web?.evaluateJavascript("document.documentElement.style.setProperty('--cutout-top','${if (state.fullscreen) cutoutTop else 0f}px');document.documentElement.style.setProperty('--cutout-left','${if (state.fullscreen) cutoutLeft else 0f}px');document.documentElement.style.setProperty('--cutout-right','${if (state.fullscreen) cutoutRight else 0f}px')", null)
                 val hingeGap = if (hinge != null && actualMode == "split") hinge!!.bounds.width() / density.density else 0f
                 web?.evaluateJavascript("document.querySelector('.android-document')?.style.setProperty('gap','${hingeGap}px')", null)
             }
@@ -279,26 +275,26 @@ private object NoMotionScheme : MotionScheme {
             }
         }) {
             Column(Modifier.fillMaxSize().imePadding()) {
-                AnimatedVisibility(!state.fullscreen && !imageOverlay && readingChromeVisible, enter = expandVertically(animationSpec = if (motion) spring(dampingRatio = .85f, stiffness = 500f) else tween(0)), exit = shrinkVertically(animationSpec = tween(if (motion) 180 else 0))) {
+                AnimatedVisibility(!imageOverlay && readingChromeVisible, enter = fadeIn(tween(if (motion) 120 else 0)), exit = fadeOut(tween(if (motion) 100 else 0))) {
                     Column(Modifier.background(palette.surfaceContainerLow)) {
-                        TopAppBar(colors = TopAppBarDefaults.topAppBarColors(containerColor = palette.surfaceContainerLow), title = { Column { Text(state.active.name, maxLines = 1, overflow = TextOverflow.Ellipsis, style = MaterialTheme.typography.titleMedium); Text(if (state.active.dirty) "Draft recovered automatically" else if (state.active.uri != null) "Saved" else "Local draft", style = MaterialTheme.typography.labelSmall, color = palette.onSurfaceVariant) } }, navigationIcon = { IconButton(onClick = { scope.launch { drawer.open() }; state.folder?.let { if (state.files.isEmpty()) model.listFolder(android.net.Uri.parse(it), "") } }) { Icon(Icons.Rounded.Menu, "Open files") } }, actions = {
+                        TopAppBar(colors = TopAppBarDefaults.topAppBarColors(containerColor = palette.surfaceContainerLow), title = { Column { Text(state.active.name, maxLines = 1, overflow = TextOverflow.Ellipsis, style = MaterialTheme.typography.titleMedium); Text(if (state.active.dirty) "Draft recovered automatically" else if (state.active.uri != null) "Saved" else "Local draft", style = MaterialTheme.typography.labelSmall, color = palette.onSurfaceVariant) } }, navigationIcon = { IconButton(onClick = { if (state.fullscreen) contentsShown=true else { scope.launch { drawer.open() }; state.folder?.let { if (state.files.isEmpty()) model.listFolder(android.net.Uri.parse(it), "") } } }) { Icon(painterResource(if(state.fullscreen) R.drawable.symbol_contents else R.drawable.symbol_sidebar), if(state.fullscreen) "Show contents" else "Open files") } }, actions = {
                             IconButton(onClick = saveAction) { Icon(painterResource(R.drawable.symbol_save), "Save note") }
                             IconButton(onClick = { sharing = false; exporting = true }, enabled = readerReady && !state.busy) { Icon(painterResource(R.drawable.symbol_export), "Export") }
-                            StudyIcon("Fullscreen study", R.drawable.symbol_fullscreen) { model.fullscreen(true) }
+                            StudyIcon(if(state.fullscreen) "Exit fullscreen" else "Fullscreen study", if(state.fullscreen) R.drawable.symbol_fullscreen_exit else R.drawable.symbol_fullscreen) { model.fullscreen(!state.fullscreen) }
                             Box { IconButton(onClick = { menu = true }) { Icon(Icons.Rounded.MoreVert, "More actions") }; DropdownMenu(expanded = menu, onDismissRequest = { menu = false }) {
                                 DropdownMenuItem(text = { Text("New window") }, onClick = { menu = false; activity.newWindow() }, leadingIcon = { Icon(painterResource(R.drawable.symbol_open_window), null) })
                                 DropdownMenuItem(text = { Text("Share note") }, enabled = readerReady && !state.busy, onClick = { menu = false; sharing = true; exporting = true }, leadingIcon = { Icon(painterResource(R.drawable.symbol_share), null) })
-                                DropdownMenuItem(text = { Text("Save as Markdown") }, onClick = { menu = false; save.launch(state.active.name.substringBeforeLast('.') + ".md") })
+                                if(!state.active.portable) DropdownMenuItem(text = { Text("Save as Markdown") }, onClick = { menu = false; save.launch(state.active.name.substringBeforeLast('.') + ".md") })
                                 DropdownMenuItem(text = { Text("Insert image or link") }, onClick = { menu = false; web?.evaluateJavascript("window.supermdMedia?.()", null) }, leadingIcon = { Icon(painterResource(R.drawable.symbol_image), null) })
                                 DropdownMenuItem(text = { Text("Fix LaTeX") }, onClick = { menu = false; web?.evaluateJavascript("window.supermdRepairMath?.()", null) }, leadingIcon = { Icon(painterResource(R.drawable.symbol_bug), null) })
                                 DropdownMenuItem(text = { Text("Find in note") }, onClick = { menu = false; web?.evaluateJavascript("window.supermdFind?.()", null) }, leadingIcon = { Icon(painterResource(R.drawable.symbol_search), null) })
-                                DropdownMenuItem(text = {Text("Rename note")},onClick = {menu=false;renaming=true})
+                                DropdownMenuItem(text = {Text("Rename note")},onClick = {menu=false;renaming=true},leadingIcon={Icon(painterResource(R.drawable.symbol_rename),null)})
                                 DropdownMenuItem(text = { Text("Settings") }, onClick = { menu = false; settings = true }, leadingIcon = { Icon(painterResource(R.drawable.symbol_settings), null) })
                             } }
                         })
-                        NoteTabs(state.tabs, state.active.id, motion, model::select, model::close, model::reorder, model::newNote)
+                        if(!state.fullscreen) NoteTabs(state.tabs, state.active.id, motion, model::select, model::close, model::reorder, model::newNote)
                         val modes = if (wide) listOf("live", "editor", "reader", "split") else listOf("live", "editor", "reader")
-                        Row(Modifier.fillMaxWidth().padding(horizontal = if (wide) 24.dp else 8.dp, vertical = 8.dp),verticalAlignment=Alignment.CenterVertically) {
+                        if(!state.fullscreen) Row(Modifier.fillMaxWidth().padding(horizontal = if (wide) 24.dp else 8.dp, vertical = 8.dp),verticalAlignment=Alignment.CenterVertically) {
                             SingleChoiceSegmentedButtonRow(Modifier.weight(1f)) { modes.forEachIndexed { index, mode -> SegmentedButton(selected = actualMode == mode, onClick = { model.mode(mode) }, colors = SegmentedButtonDefaults.colors(activeContainerColor = palette.primary, activeContentColor = palette.onPrimary), shape = SegmentedButtonDefaults.itemShape(index, modes.size)) { Text(when(mode) { "editor" -> "Source"; "reader" -> "Read"; "split" -> "Split"; else -> "Live" }) } } }
                             IconButton(onClick={web?.evaluateJavascript("window.supermdHistory?.('undo')",null)},enabled=readerReady){Icon(Icons.Rounded.Undo,"Undo (Ctrl+Z)")}
                             IconButton(onClick={web?.evaluateJavascript("window.supermdHistory?.('redo')",null)},enabled=readerReady){Icon(Icons.Rounded.Redo,"Redo (Ctrl+Y)")}
@@ -306,7 +302,9 @@ private object NoMotionScheme : MotionScheme {
                         HorizontalDivider(color = palette.outlineVariant.copy(alpha = .55f))
                     }
                 }
-                Box(Modifier.weight(1f).fillMaxWidth().windowInsetsPadding(if (state.fullscreen) WindowInsets(0) else WindowInsets.safeDrawing.only(WindowInsetsSides.Horizontal + WindowInsetsSides.Bottom))) {
+                // The reading surface is edge-to-edge in BOTH chrome states.
+                // Only controls receive safe insets, not the document width.
+                Box(Modifier.weight(1f).fillMaxWidth()) {
                     AndroidView(factory = { context -> FrameLayout(context).apply {
                         layoutParams = ViewGroup.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT)
                         clipChildren = true
@@ -321,22 +319,27 @@ private object NoMotionScheme : MotionScheme {
                             setBackgroundColor(AndroidColor.TRANSPARENT)
                             configureReader(this, model, scope) { readerReady = true }
                             var touchY=0f
+                            var downX=0f
+                            var downY=0f
+                            var downTime=0L
+                            var moved=false
                             var multiTouch=false
                             var chromeIntent:Boolean?=null
                             var gestureEpoch=0L
                             var gestureActive=false
                             setOnTouchListener {_,event->
-                                wakeChrome()
                                 if(event.actionMasked==android.view.MotionEvent.ACTION_DOWN) {
+                                    chromeTapJob[0]?.cancel()
                                     gestureEpoch++
                                     gestureActive=true
                                     touchY=event.rawY
+                                    downX=event.x;downY=event.y;downTime=event.eventTime;moved=false
                                     multiTouch=false
                                     chromeIntent=null
-                                    if(event.y < 48 * density.density) readingChromeVisible=true
                                 }
                                 if(event.actionMasked==android.view.MotionEvent.ACTION_POINTER_DOWN) {multiTouch=true;chromeIntent=null}
                                 if(event.actionMasked==android.view.MotionEvent.ACTION_MOVE && !multiTouch && event.pointerCount==1 && model.state.value.mode in listOf("live","reader") && !model.state.value.readerOverlay) {
+                                    if(kotlin.math.hypot(event.x-downX,event.y-downY)>8*density.density)moved=true
                                     val travel=event.rawY-touchY
                                     if(kotlin.math.abs(travel)>36*density.density){chromeIntent=travel>0;touchY=event.rawY}
                                 }
@@ -345,12 +348,21 @@ private object NoMotionScheme : MotionScheme {
                                 if(event.actionMasked==android.view.MotionEvent.ACTION_UP && !multiTouch) {
                                     gestureActive=false
                                     val completedEpoch=gestureEpoch
-                                    chromeIntent?.let { show -> evaluateJavascript("!!document.querySelector('.live-active-block textarea:focus')") { editing -> if(editing!="true" && !gestureActive && completedEpoch==gestureEpoch)readingChromeVisible=show } }
+                                    val show=chromeIntent
+                                    val tap=!moved && event.eventTime-downTime<350 && model.state.value.mode in listOf("live","reader") && !model.state.value.readerOverlay
+                                    if(show!=null || tap) {
+                                        val x=event.x/density.density;val y=event.y/density.density
+                                        chromeTapJob[0]=scope.launch {
+                                            if(tap)delay(260)
+                                            evaluateJavascript("(() => { const e=document.elementFromPoint($x,$y); return !!document.querySelector('.live-active-block textarea:focus') || !!window.getSelection()?.toString() || ${if(tap) "!!e?.closest('a,button,input,textarea,summary,img,.note-image,[data-independent-zoom],.interactive-chart,.media-dialog,.reading-search,.math-repair-panel')" else "false"}; })()") { interacting ->
+                                                if(interacting!="true" && !gestureActive && completedEpoch==gestureEpoch)readingChromeVisible=show ?: !readingChromeVisible
+                                            }
+                                        }
+                                    }
                                 }
                                 if(event.actionMasked==android.view.MotionEvent.ACTION_UP || event.actionMasked==android.view.MotionEvent.ACTION_CANCEL)gestureActive=false
                                 false
                             }
-                            setOnGenericMotionListener {_,_->wakeChrome();false}
                             webChromeClient = object : android.webkit.WebChromeClient() {
                                 override fun onShowFileChooser(view: WebView, callback: android.webkit.ValueCallback<Array<android.net.Uri>>, parameters: FileChooserParams): Boolean {
                                     imageCallback?.onReceiveValue(null); imageCallback = callback; imageNote = model.state.value.active.id
@@ -376,14 +388,6 @@ private object NoMotionScheme : MotionScheme {
                             }
                         })
                     } }, modifier = Modifier.fillMaxSize().clipToBounds(), onRelease = { readerReady = false; web?.removeJavascriptInterface("SuperMD"); web?.destroy(); it.removeAllViews(); web = null })
-                    if (state.fullscreen && !state.readerOverlay && chromeAwake) {
-                        Surface(shape=RoundedCornerShape(24.dp),color=palette.surfaceContainerHigh,modifier=Modifier.align(Alignment.TopStart).safeDrawingPadding().padding(8.dp)) {IconButton(onClick={contentsShown=true;wakeChrome()}){Icon(painterResource(R.drawable.symbol_contents),"Show contents")}}
-                        Surface(shape=RoundedCornerShape(24.dp),color=palette.surfaceContainerHigh,modifier=Modifier.align(Alignment.TopEnd).safeDrawingPadding().padding(8.dp)) {IconButton(onClick={model.fullscreen(false)}){Icon(painterResource(R.drawable.symbol_fullscreen_exit),"Exit fullscreen")}}
-                    }
-                    if(!state.fullscreen && !readingChromeVisible && !state.readerOverlay && chromeAwake) {
-                        Surface(shape=RoundedCornerShape(24.dp),color=palette.surfaceContainerHigh,modifier=Modifier.align(Alignment.TopStart).padding(8.dp)) {IconButton(onClick={contentsShown=true;wakeChrome()}){Icon(painterResource(R.drawable.symbol_contents),"Show contents")}}
-                        Surface(shape=RoundedCornerShape(24.dp),color=palette.surfaceContainerHigh,modifier=Modifier.align(Alignment.TopEnd).padding(8.dp)) {StudyIcon("Fullscreen study",R.drawable.symbol_fullscreen){model.fullscreen(true)}}
-                    }
                     SnackbarHost(snackbar, Modifier.align(Alignment.BottomCenter).safeDrawingPadding())
                     if (state.busy || !readerReady) Surface(color = palette.surface.copy(alpha = .96f), modifier = Modifier.fillMaxSize()) { Column(Modifier.fillMaxSize(), verticalArrangement = Arrangement.Center, horizontalAlignment = Alignment.CenterHorizontally) { if(motion) LoadingIndicator() else Icon(Icons.Rounded.Description,null,Modifier.size(48.dp),tint=palette.primary); Spacer(Modifier.height(16.dp)); Text(if(state.busy) "Preparing your document…" else "Opening your workspace…") } }
                 }
@@ -470,6 +474,11 @@ private class NoteDestination(mime: String, private val preferred: () -> String)
                 Row(verticalAlignment=Alignment.CenterVertically){Text("Autosave existing notes",Modifier.weight(1f));Switch(checked=state.autosave,onCheckedChange={model.reading(autosave=it)})}
                 Text("New note location",style=MaterialTheme.typography.titleSmall)
                 FilledTonalButton(onClick=chooseNoteLocation,modifier=Modifier.fillMaxWidth()){Icon(Icons.Rounded.FolderOpen,null);Text(if(noteLocation.isBlank())"Downloads" else android.net.Uri.decode(noteLocation.substringAfterLast('/')),Modifier.padding(start=8.dp),maxLines=1,overflow=TextOverflow.Ellipsis)}
+            }
+            SettingsSection("Writing assistance") {
+                Row(verticalAlignment=Alignment.CenterVertically){Text("Spell check",Modifier.weight(1f));Switch(checked=state.spellCheck,onCheckedChange={model.writing(spellCheck=it)})}
+                Row(verticalAlignment=Alignment.CenterVertically){Text("Grammar check",Modifier.weight(1f));Switch(checked=state.grammarCheck,onCheckedChange={model.writing(grammarCheck=it)})}
+                Text("Offline English suggestions in Source and Live editing. Grammar checks repeated words and a/an. Code, links and LaTeX are excluded; no text is uploaded or automatically replaced.",style=MaterialTheme.typography.bodySmall,color=MaterialTheme.colorScheme.onSurfaceVariant)
             }
             SettingsSection("Python & windows") {
                 Text("NumPy and Matplotlib run locally in a separate worker. Code runs only when you press Run; never automatically on open or export.", style = MaterialTheme.typography.bodyMedium)

@@ -1,4 +1,17 @@
 import {test,expect} from '@playwright/test';
+test('fullscreen entry keeps the presented zoom and wrapping even before its native acknowledgement',async({page})=>{
+  await page.addInitScript(()=>{window.SuperMD={post:(id)=>window.supermdReply?.(id,true,null)};});await page.goto('/android-reader.html');
+  const content='# Same page\n\n'+('A readable long paragraph. '.repeat(20)+'\n\n').repeat(100);
+  await page.evaluate(content=>window.supermdLoad?.({id:'fullscreen-width',content,path:null,mode:'reader',dark:false,fullscreen:false,colors:{},font:'Manrope',size:15,zoom:130,widthPercent:80}),content);
+  await expect(page.locator('.document-page')).toHaveAttribute('data-scale','1.3');
+  const width=await page.locator('.document-page').evaluate(el=>getComputedStyle(el).width);
+  await page.evaluate(content=>{
+    window.supermdZoomBy?.(1.2,{x:400,y:300});
+    window.supermdLoad?.({id:'fullscreen-width',content,path:null,mode:'reader',dark:false,fullscreen:true,colors:{},font:'Manrope',size:15,zoom:70,widthPercent:80});
+  },content);
+  await expect(page.locator('.document-page')).toHaveAttribute('data-scale','1.56');
+  expect(await page.locator('.document-page').evaluate(el=>getComputedStyle(el).width)).toBe(width);
+});
 test('heading links land at the distant heading, not a partially scrolled magnified page',async({page})=>{
   await page.addInitScript(()=>{window.SuperMD={post:()=>{}};});await page.goto('/android-reader.html');
   const content='[Go to distant chapter](#chapter-599)\n\n'+Array.from({length:600},(_,i)=>`## Chapter ${i}\n\n${'Readable note with **formatting** and $E=mc^2$. '.repeat(8)}\n\n`).join('');

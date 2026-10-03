@@ -16,10 +16,9 @@ export function useChartZoom(source: string) {
     const svg = host.current?.querySelector("svg"), rect=svg?.getBoundingClientRect();
     if (!rect) return {x:.5,y:.5};
     // Match the line plot's padded data rectangle, rather than its axis labels.
-    const surface = svg?.classList.contains("surface-chart");
     const x=(point.x-rect.left)/rect.width, y=(point.y-rect.top)/rect.height;
     const width=svg?.viewBox.baseVal.width||760,height=svg?.viewBox.baseVal.height||360,left=Number(svg?.getAttribute("data-plot-left")||56);
-    return {x:Math.max(0,Math.min(1,surface ? x : (x-left/width)/((width-left-20)/width))),y:Math.max(0,Math.min(1,surface ? y : (y-24/height)/((height-70)/height)))};
+    return {x:Math.max(0,Math.min(1,(x-left/width)/((width-left-20)/width))),y:Math.max(0,Math.min(1,(y-24/height)/((height-70)/height)))};
   };
   const change = (requested: number, focus:Point={x:.5,y:.5}) => {
     const next = Math.max(.05, Math.min(64, Number.isFinite(requested) ? requested : 1));
@@ -34,15 +33,15 @@ export function useChartZoom(source: string) {
     let distance = 0, frame = 0, pending = value.current, focus={x:.5,y:.5}, held=false;
     let midpoint:Point|null=null, drag:Point|null=null,panFrame=0;
     const pan = (dx:number,dy:number)=>{
-      const rect=element.getBoundingClientRect(), surface=element.classList.contains("surface-chart");
+      const rect=element.getBoundingClientRect();
       const width=element.viewBox.baseVal.width||760,height=element.viewBox.baseVal.height||360;
-      const w=rect.width*(surface?1:(width-Number(element.getAttribute("data-plot-left")||70)-20)/width);
-      const h=rect.height*(surface?1:(height-70)/height);
+      const w=rect.width*(width-Number(element.getAttribute("data-plot-left")||70)-20)/width;
+      const h=rect.height*(height-70)/height;
       const next={x:centerRef.current.x-dx/(w*value.current),y:centerRef.current.y+dy/(h*value.current)};
       centerRef.current=next;remember(chartCenters,source,next);
       if(!panFrame)panFrame=requestAnimationFrame(()=>{panFrame=0;setCenter(centerRef.current);});
     };
-    const press = (event:PointerEvent)=>{if(event.pointerType==="mouse" && event.button===0){held=true;if(!element.classList.contains("surface-chart")){drag={x:event.clientX,y:event.clientY};element.setPointerCapture(event.pointerId);event.preventDefault();}}};
+    const press = (event:PointerEvent)=>{if(event.pointerType==="mouse" && event.button===0){held=true;drag={x:event.clientX,y:event.clientY};element.setPointerCapture(event.pointerId);event.preventDefault();}};
     const release = ()=>{held=false;drag=null;};
     const span = (touches: TouchList) => Math.hypot(touches[0].clientX - touches[1].clientX, touches[0].clientY - touches[1].clientY);
     const update = (next: number, point: Point) => {

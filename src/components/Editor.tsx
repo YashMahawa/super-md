@@ -3,11 +3,13 @@ import { Compartment, EditorSelection, EditorState,Transaction } from "@codemirr
 import { EditorView, keymap, lineNumbers, highlightActiveLine, drawSelection } from "@codemirror/view";
 import { defaultKeymap, history, historyField, historyKeymap, indentWithTab, undo, redo } from "@codemirror/commands";
 import { markdown, markdownLanguage } from "@codemirror/lang-markdown";
-import { syntaxHighlighting, defaultHighlightStyle, foldGutter, foldKeymap } from "@codemirror/language";
+import { syntaxHighlighting, defaultHighlightStyle, foldGutter, foldKeymap, syntaxTree } from "@codemirror/language";
+import {linter,type Diagnostic} from "@codemirror/lint";
+import {checkWriting,type WritingOptions} from "../proofreading";
 import { search, searchKeymap, highlightSelectionMatches, openSearchPanel, SearchQuery, setSearchQuery } from "@codemirror/search";
 import { oneDarkHighlightStyle } from "@codemirror/theme-one-dark";
 
-interface Props {
+interface Props extends WritingOptions {
   sessionId?: string;
   value: string;
   onChange: (value: string) => void;
@@ -15,7 +17,7 @@ interface Props {
   focusMode: boolean;
 }
 
-const sessions = new Map<string, { state: EditorState; top: number; appearance: Compartment; wrapping: Compartment; wrapped: boolean }>();
+const sessions = new Map<string, { state: EditorState; top: number; appearance: Compartment; wrapping: Compartment; proofing:Compartment; wrapped: boolean }>();
 function trimEditorSessions() {
   // Bound retained undo trees across tabs by text volume, not only tab count.
   // The native model still owns every note; evicting a view cannot lose text.
@@ -65,7 +67,7 @@ export function importEditorSession(id: string, data: PortableEditorSession | un
   incomingWeights.set(id,size);let retained=[...incomingWeights.values()].reduce((n,size)=>n+size,0);
   while(incomingSessions.size>40||retained>4_000_000){const first=incomingSessions.keys().next().value!;incomingSessions.delete(first);retained-=incomingWeights.get(first)||0;incomingWeights.delete(first);}
 }
-export default function Editor({ sessionId = "default", value, onChange, dark, focusMode }: Props) {
+export default function Editor({ sessionId = "default", value, onChange, dark, focusMode,spellCheck=false,grammarCheck=false }: Props) {
   const host = useRef<HTMLDivElement>(null);
   const view = useRef<EditorView | null>(null);
   const changeHandler = useRef(onChange);
@@ -73,6 +75,15 @@ export default function Editor({ sessionId = "default", value, onChange, dark, f
   callbacks.set(sessionId, onChange);
   const appearance = useRef(new Compartment());
   const wrapping = useRef(new Compartment());
+  const proofing=useRef(new Compartment());
+  const writingExtension=()=>!spellCheck&&!grammarCheck?[]:linter(async editor=>{
+    const from=editor.state.doc.lineAt(Math.max(0,editor.viewport.from-500)).from;
+    const to=Math.min(editor.state.doc.length,from+12_000,editor.viewport.to+500);
+    const blocked:Array<[number,number]>=[];
+    syntaxTree(editor.state).iterate({from,to,enter(node){if(["FencedCode","CodeBlock","InlineCode","HTMLBlock","HTMLTag","Link","Image","URL"].includes(node.name)){blocked.push([Math.max(0,node.from-from),node.to-from]);return false;}}});
+    const issues=await checkWriting(editor.state.sliceDoc(from,to),{spellCheck,grammarCheck},blocked);
+    return issues.map(issue=>({from:from+issue.from,to:from+issue.to,severity:"info",source:issue.kind==="spelling"?"Spelling":"Grammar",message:issue.message,actions:issue.replacements.map(replacement=>({name:`Use “${replacement}”`,apply(view,start,end){view.dispatch({changes:{from:start,to:end,insert:replacement}});}}))} satisfies Diagnostic));
+  },{delay:600,needsRefresh:update=>update.viewportChanged});
   const [wrap, setWrap] = useState(true);
   const wrapReference = useRef(wrap); wrapReference.current = wrap;
   const position = useRef<HTMLSpanElement>(null);
@@ -103,7 +114,7 @@ export default function Editor({ sessionId = "default", value, onChange, dark, f
     const cached = sessions.get(sessionId);
     const incoming = incomingSessions.get(sessionId); incomingSessions.delete(sessionId);incomingWeights.delete(sessionId);
     if (incoming) setWrap(incoming.wrapped);
-    if (cached) { appearance.current = cached.appearance; wrapping.current = cached.wrapping; setWrap(cached.wrapped); }
+    if (cached) { appearance.current = cached.appearance; wrapping.current = cached.wrapping;proofing.current=cached.proofing; setWrap(cached.wrapped); }
     const config = {
       doc: value,
       extensions: [
@@ -119,6 +130,7 @@ export default function Editor({ sessionId = "default", value, onChange, dark, f
         keymap.of([...defaultKeymap, ...historyKeymap, ...searchKeymap, ...foldKeymap, indentWithTab]),
         EditorState.allowMultipleSelections.of(true),
         wrapping.current.of(EditorView.lineWrapping),
+        proofing.current.of(writingExtension()),
         EditorView.updateListener.of((update) => {
           if (update.docChanged) callbacks.get(sessionId)?.(update.state.doc.toString());
           if (update.docChanged || update.selectionSet) statusHandlers.get(sessionId)?.(update.state);
@@ -140,13 +152,14 @@ export default function Editor({ sessionId = "default", value, onChange, dark, f
     if (incoming) view.current.scrollDOM.scrollTop = Math.max(0, incoming.top);
     return () => {
       visibleEditors.delete(sessionId);
-      if (view.current) { sessions.delete(sessionId); sessions.set(sessionId, { state: view.current.state, top: view.current.scrollDOM.scrollTop, appearance: appearance.current, wrapping: wrapping.current, wrapped: wrapReference.current }); trimEditorSessions(); view.current.destroy(); }
+      if (view.current) { sessions.delete(sessionId); sessions.set(sessionId, { state: view.current.state, top: view.current.scrollDOM.scrollTop, appearance: appearance.current, wrapping: wrapping.current,proofing:proofing.current, wrapped: wrapReference.current }); trimEditorSessions(); view.current.destroy(); }
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [sessionId]);
 
   useEffect(() => { view.current?.dispatch({ effects: appearance.current.reconfigure(editorTheme()) }); }, [dark, focusMode]);
   useEffect(() => { view.current?.dispatch({ effects: wrapping.current.reconfigure(wrap ? EditorView.lineWrapping : []) }); }, [wrap]);
+  useEffect(()=>{view.current?.dispatch({effects:proofing.current.reconfigure(writingExtension())});},[spellCheck,grammarCheck,sessionId]);
 
   useEffect(() => {
     const instance = view.current;

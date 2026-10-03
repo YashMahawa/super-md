@@ -50,7 +50,7 @@ describe("executable Python cells", () => {
       const html=renderToStaticMarkup(<MarkdownPreview markdown={markdown} documentPath={null} python="" dark={false}/>);
       expect(html.match(/class="katex"/g)).toHaveLength(500);expect(html).toContain('Chapter 499');expect(html).not.toContain('data-windowed-block');
     } finally {Object.assign(globalThis,{IntersectionObserver:previous});}
-  });
+  }, 15_000); // 500 complete KaTeX trees on the shared Intel macOS runner.
   it("preserves syntax highlighting without changing the executable source", () => {
     const html = renderToStaticMarkup(<MarkdownPreview markdown={"```python\nimport numpy as np\nprint('hello')\n```"} documentPath={null} python="python3" dark={false} />);
     expect(html).toContain('class="hljs-keyword"');
