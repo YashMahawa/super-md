@@ -1,5 +1,23 @@
 # Verification
 
+## Reader, installer and memory maintenance — 2026-10-03
+
+- 74 frontend tests and all 16 browser workflows passed locally, including stable
+  wrapping/focal magnification, distinct 3D drag vs two-finger pan, slider-free
+  image viewing, checkbox source preservation and bounded derived image caches.
+- 44 native Qt tests passed, including zoom-only bridge messages, remembered
+  reading mode, heading-derived names and sidebar outline data.
+- 12 native typesetter tests passed. The unchanged local SNS note reproduced the
+  old inner-product failure and now exports a 17-page PDF. Its repair suggestions
+  were separately checked: zero changes to the original valid document.
+- The prior public ARM64 release installed and launched in the API 36 emulator.
+  Its GitHub size/hash matched the local APK. This does not reproduce or verify
+  the Vivo Android 15 installer failure. The new packaging follows the smaller
+  compressed, multi-signature route used in CaptivePortalAutoLogin.
+- Memory changes bound optional caches; they are not claims of a measured battery
+  improvement or whole-document virtualization. Current visible Python output is
+  retained separately so cache eviction cannot omit visible figures from PDF.
+
 ## Native tabs and aligned Android design — 2026-10-02
 
 - 37 real Python/Qt tests pass, including native DropArea events, stable

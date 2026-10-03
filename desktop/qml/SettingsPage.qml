@@ -39,7 +39,7 @@ Pane {
                 Switch { text: "Expressive motion"; checked: viewState.settings.motion; onToggled: page.save("motion", checked) }
                 Label { text: "Reading"; font.pixelSize: 22; font.weight: Font.DemiBold; Layout.topMargin: 12 }
                 Label { text: "Reading font" }
-                ChoiceField { objectName: "readingFontChoice"; viewportItem: settingsScroll.contentItem; Accessible.name: "Reading font"; Layout.fillWidth: true; model: studio.fonts; editable: true; currentIndex: model.indexOf(viewState.settings.font); onActivated: page.save("font", currentText); onAccepted: page.save("font", editText) }
+                FontField { objectName: "readingFontChoice"; viewportItem: settingsScroll.contentItem; Accessible.name: "Reading font"; Layout.fillWidth: true; families: studio.fonts; value: viewState.settings.font; onChosen: family => page.save("font", family) }
                 ActionButton { text:"Import font…";glyph:"Plus";onClicked:studio.chooseFont() }
                 Label { text:"TTF and OTF fonts stay private to the app and also appear in PDF export and sharing."; Layout.fillWidth:true;wrapMode:Text.WordWrap;color:viewState.colors.muted }
                 Label { text: "Text size: " + Math.round(viewState.settings.size) + " px" }
@@ -50,13 +50,13 @@ Pane {
                 Label { text: "Vertical spacing: " + viewState.settings.lineHeight.toFixed(2) }
                 ExpressiveSlider { Layout.fillWidth: true; from: 1.15; to: 2.2; stepSize: .05; value: viewState.settings.lineHeight; onMoved: page.save("lineHeight", value) }
                 Switch { text: "Autosave existing notes"; checked: viewState.settings.autosave; onToggled: page.save("autosave", checked) }
+                Label { text: "New note location"; font.weight: Font.DemiBold }
+                ActionButton { Layout.fillWidth: true; text: viewState.settings.newNoteLocation || "Downloads"; glyph: "FolderOpen"; tonal: true; onClicked: studio.chooseNoteLocation(); ToolTip.text: viewState.settings.newNoteLocation || "Downloads" }
                 Label { text: "New notes stay recoverable until you choose a file. Empty untitled notes are discarded."; Layout.fillWidth: true; wrapMode: Text.WordWrap; color: viewState.colors.muted }
                 Label { text: "Python"; font.pixelSize: 22; font.weight: Font.DemiBold; Layout.topMargin: 12 }
                 Label { text: "Interpreter or virtual environment Python executable" }
                 TextField { Layout.fillWidth: true; text: viewState.settings.python; selectByMouse: true; onEditingFinished: page.save("python", text) }
                 Label { text: "Code runs only when you press Run. Use a Python environment with matplotlib installed. Local Python code is not sandboxed."; Layout.fillWidth: true; wrapMode: Text.WordWrap; color: viewState.colors.muted }
-                Label { text: "PDF defaults"; font.pixelSize: 22; font.weight: Font.DemiBold; Layout.topMargin: 12 }
-                PdfControls { Layout.fillWidth: true; viewportItem: settingsScroll.contentItem; options: viewState.settings.pdf; onEdited: options => page.save("pdf", options) }
                 Item { height: 24 }
             }
         }

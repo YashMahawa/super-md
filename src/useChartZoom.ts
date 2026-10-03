@@ -42,7 +42,7 @@ export function useChartZoom(source: string) {
       centerRef.current=next;remember(chartCenters,source,next);
       if(!panFrame)panFrame=requestAnimationFrame(()=>{panFrame=0;setCenter(centerRef.current);});
     };
-    const press = (event:PointerEvent)=>{if(event.pointerType==="mouse" && event.button===0 && !event.shiftKey){held=true;drag={x:event.clientX,y:event.clientY};element.setPointerCapture(event.pointerId);event.preventDefault();}};
+    const press = (event:PointerEvent)=>{if(event.pointerType==="mouse" && event.button===0){held=true;if(!element.classList.contains("surface-chart")){drag={x:event.clientX,y:event.clientY};element.setPointerCapture(event.pointerId);event.preventDefault();}}};
     const release = ()=>{held=false;drag=null;};
     const span = (touches: TouchList) => Math.hypot(touches[0].clientX - touches[1].clientX, touches[0].clientY - touches[1].clientY);
     const update = (next: number, point: Point) => {

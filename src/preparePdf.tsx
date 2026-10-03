@@ -9,7 +9,7 @@ import InteractiveChart from "./components/InteractiveChart";
 import { normalizeCallouts } from "./components/MarkdownPreview";
 import { invoke } from "./nativeBridge";
 import { renderMermaid } from "./mermaidRenderer";
-import { pythonResults } from "./renderedOutputs";
+import { pythonOutput } from "./renderedOutputs";
 import { svgImage } from "./svgImage";
 import { remarkObsidianMath } from "./obsidianMath";
 
@@ -84,7 +84,7 @@ export async function preparePdf(markdown: string, documentPath: string | null) 
         node.children = [{ type: "image", url: add(url, `diagram-${++count}.svg`), alt: "Diagram" }];
         delete node.value; delete node.lang; delete node.meta;
       } else {
-        const output = pythonResults.get(node.value);
+        const output = pythonOutput(node.value);
         if (output && !output.ok) throw new Error(`Python cell failed; fix it before exporting:\n${output.stderr}`);
         if (output?.ok) {
           // Keep source code and output together: export should not erase code

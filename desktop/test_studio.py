@@ -228,6 +228,24 @@ class StudioTest(unittest.TestCase):
         self.assertEqual(second.settings["theme"],"light")
         self.assertEqual(second.settings["size"],18)
 
+    def test_zoom_sends_a_delta_not_the_document_and_remembers_mode(self):
+        self.studio.ready = True
+        loads, calls = [], []
+        self.studio.readerLoad.connect(loads.append)
+        self.studio.readerCall.connect(calls.append)
+        self.studio.setZoom(175)
+        self.assertEqual(loads, [])
+        self.assertEqual(calls, ["window.supermdSetZoom?.(175)"])
+        self.studio.setMode("reader")
+        self.assertEqual(self.window().mode, "reader")
+
+    def test_outline_names_untitled_notes_and_sets_export_filename(self):
+        self.studio.newNote()
+        self.studio.post("outline", "document_outline", json.dumps({"id": self.studio.active, "headings": [{"id":"energy", "title":"Energy / work", "level":1,"offset":0}]}))
+        self.assertEqual(self.studio._current()["name"], "Energy  work.md")
+        self.assertTrue(QUrl(self.studio.defaultExportLocation("pdf")).toLocalFile().endswith("Energy  work.pdf"))
+        self.assertEqual(json.loads(self.studio.snapshot)["outline"][0]["id"], "energy")
+
     def test_close_waits_for_final_editor_snapshot(self):
         studio = self.studio
         studio.ready = True

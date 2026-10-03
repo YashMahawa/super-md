@@ -218,7 +218,7 @@ md-filled-button.primary-action, smd-expressive-button.primary-action { display:
 .image-viewer header strong { flex: 1; }
 .image-viewer button { min-height: 40px; padding: 8px 16px; background: var(--surface-high); border-radius: 999px; }
 .image-viewer-canvas { display: grid; place-items: center; overflow: hidden; touch-action: none; cursor: grab; user-select: none; }
-.image-viewer-canvas img { max-width: 90%; max-height: 75vh; object-fit: contain; pointer-events: none; }
+.image-viewer-canvas img { width:100%;height:100%;max-width:none;max-height:none;min-width:0;min-height:0;object-fit:contain;pointer-events:none; }
 .image-viewer footer label { display: flex; align-items: center; gap: 12px; }
 .live-document { width: min(var(--reader-width), calc(100% - 64px)); margin: 0 auto; padding: 42px 0 28vh; }
 .live-block { position: relative; min-height: 25px; border-radius: 12px; }
@@ -256,6 +256,8 @@ md-filled-button.primary-action, smd-expressive-button.primary-action { display:
 .markdown-body p { margin: .95em 0; }
 .markdown-body blockquote:not(.callout) { margin: 1.4em 0; padding: .2em 1.1em; border-left: 3px solid var(--outline); color: var(--muted); }
 .markdown-body a { color: var(--primary); text-underline-offset: 3px; }
+.markdown-body a:visited,.markdown-body a[data-visited="true"] { color:color-mix(in srgb,var(--primary) 55%,var(--text)); }
+.markdown-body input[type="checkbox"] { accent-color:var(--primary);width:1.1em;height:1.1em;vertical-align:middle;cursor:pointer; }
 .markdown-body img { max-width: 100%; height: auto; border-radius: 12px; display: block; margin: 1.5em auto; border: 1px solid var(--outline); }
 .image-loading, .image-error { display: block; margin: 1.4em 0; padding: 18px 20px; border-radius: 12px; background: var(--surface-low); color: var(--muted); font-size: .82em; }
 .image-error { border: 1px solid var(--error); color: var(--error); }
@@ -271,6 +273,13 @@ md-filled-button.primary-action, smd-expressive-button.primary-action { display:
 .markdown-body pre { max-width: 100%; overflow: auto; padding: 18px; border-radius: 12px; background: #17151b; color: #eeedf4; border: 1px solid var(--outline); font: .9em/1.6 var(--mono); }
 .markdown-body :not(pre) > code { background: var(--surface-high); border-radius: 5px; padding: .16em .38em; font-family: var(--mono); font-size: .9em; }
 .katex-display { max-width: 100%; overflow-x: auto; overflow-y: hidden; padding: .6em .1em; }
+.katex-display { scrollbar-width:thin;scrollbar-color:transparent transparent; }
+.katex-display:hover,.katex-display.scroll-indicator-active { scrollbar-color:color-mix(in srgb,var(--primary) 60%,transparent) transparent; }
+.katex-display::-webkit-scrollbar { height:10px; }
+.katex-display::-webkit-scrollbar-track { background:transparent; }
+.katex-display::-webkit-scrollbar-thumb { border:2px solid transparent;border-radius:12px;background:transparent;background-clip:padding-box; }
+.katex-display:hover::-webkit-scrollbar-thumb,.katex-display.scroll-indicator-active::-webkit-scrollbar-thumb { background-color:color-mix(in srgb,var(--primary) 60%,transparent); }
+.android-reading.is-panning { cursor:grabbing;user-select:none; }
 .callout { --callout-accent: var(--primary); display: flow-root; position: relative; margin: 1.55em 0; padding: 12px 20px 13px 22px; border: 1px solid color-mix(in srgb, var(--callout-accent) 36%, var(--outline)); border-radius: 14px; background: color-mix(in srgb, var(--callout-accent) 8%, var(--surface)); }
 .callout::before { content: ""; position: absolute; left: 0; top: 12px; bottom: 12px; width: 4px; border-radius: 0 4px 4px 0; background: var(--callout-accent); }
 .callout-title { margin: .25em 0 .55em !important; color: var(--callout-accent); font-size: .89em; font-weight: 820; letter-spacing: -.01em; }

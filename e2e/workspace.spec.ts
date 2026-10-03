@@ -31,7 +31,9 @@ test("graph canvas drags and two-finger moves pan while 3D pinch never tilts",as
     const rect=(await svg.boundingBox())!,x=rect.x+rect.width*.5,y=rect.y+rect.height*.5;
     const initial=Number(await plot.getAttribute("data-center-x"));
     await page.mouse.move(x,y);await page.mouse.down();await page.mouse.move(x+60,y+25,{steps:4});await page.mouse.up();
-    await expect.poll(()=>plot.getAttribute("data-center-x").then(Number)).toBeLessThan(initial);
+    if(mode==="line") await expect.poll(()=>plot.getAttribute("data-center-x").then(Number)).toBeLessThan(initial);
+    else { await expect.poll(()=>svg.getAttribute("data-azimuth").then(Number)).not.toBe(35); expect(Number(await plot.getAttribute("data-center-x"))).toBe(initial); }
+    const elevation=await svg.getAttribute("data-elevation"),azimuth=await svg.getAttribute("data-azimuth");
     const prior=Number(await plot.getAttribute("data-center-x"));
     await svg.evaluate(target=>{
       const r=target.getBoundingClientRect(),touches=(dx:number,span:number)=>[new Touch({identifier:1,target,clientX:r.left+70+dx,clientY:r.top+100}),new Touch({identifier:2,target,clientX:r.left+70+dx+span,clientY:r.top+100})];
@@ -42,7 +44,7 @@ test("graph canvas drags and two-finger moves pan while 3D pinch never tilts",as
     });
     await expect(plot).toHaveAttribute("data-plot-zoom","2");
     expect(Number(await plot.getAttribute("data-center-x"))).not.toBe(prior);
-    if(mode==="surface3d"){await expect(svg).toHaveAttribute("data-elevation","28");await expect(svg).toHaveAttribute("data-azimuth","35");}
+    if(mode==="surface3d"){await expect(svg).toHaveAttribute("data-elevation",elevation!);await expect(svg).toHaveAttribute("data-azimuth",azimuth!);}
     const panBefore=Number(await plot.getAttribute("data-center-x"));
     await svg.evaluate(node=>{const r=node.getBoundingClientRect();window.supermdNativeWheel?.(30,10,{x:r.left+r.width/2,y:r.top+r.height/2},false);});
     await expect.poll(()=>plot.getAttribute("data-center-x").then(Number)).toBeGreaterThan(panBefore);
@@ -98,7 +100,7 @@ test("native document sizing stays percentage based and Live edit exits on outsi
   await page.getByRole("heading").dblclick();await expect(page.getByLabel("Edit Markdown block")).toBeVisible();
   await page.locator(".android-reading").click({position:{x:5,y:500}});await expect(page.getByLabel("Edit Markdown block")).toHaveCount(0);
 });
-test("repair dialog uses bounded checkboxes and image zoom is focal with its own Material slider",async({page})=>{
+test("repair dialog uses bounded checkboxes and image viewer zoom is focal without a redundant slider",async({page})=>{
   const image="data:image/svg+xml;base64,"+Buffer.from('<svg xmlns="http://www.w3.org/2000/svg" width="800" height="400"><rect width="800" height="400" fill="teal"/></svg>').toString("base64");
   await page.exposeFunction("imageBridge",(id:string,command:string)=>void page.evaluate(({id,result})=>window.supermdReply?.(id,result,null),{id,result:command==="load_asset"?image:true}));
   await page.addInitScript(()=>{window.SuperMD={post:(id,command)=>(window as any).imageBridge(id,command)};});
@@ -112,7 +114,7 @@ test("repair dialog uses bounded checkboxes and image zoom is focal with its own
   await page.keyboard.press("Escape");await expect(panel).toHaveCount(0);
   await page.locator(".markdown-body img").click();
   const viewer=page.getByRole("dialog",{name:"Image viewer"});await expect(viewer).toBeVisible();
-  await expect(viewer.getByRole("slider",{name:"Image zoom"})).toBeVisible();
+  await expect(viewer.getByRole("slider",{name:"Image zoom"})).toHaveCount(0);
   const img=viewer.locator("img"),before=(await img.boundingBox())!,focus={x:before.x+before.width*.3,y:before.y+before.height*.35};
   await page.mouse.move(focus.x,focus.y);await page.mouse.wheel(0,-200);
   await expect(viewer.locator("output")).not.toHaveText("100%");

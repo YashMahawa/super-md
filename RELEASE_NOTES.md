@@ -1,4 +1,28 @@
-# Super MD 0.4.2
+# Super MD 0.4.3
+
+## This release
+
+- Smaller compressed Android release APK with explicit v1/v2/v3 signatures,
+  preserving the upgrade certificate. Android 15 and 16 instrumentation gates.
+- Selected modes use the primary color with a contrasting label, not a near-white
+  highlight. Searchable native font pickers keep typing separate from selection.
+- Optional light Material PDF theme (off by default), only in Export/Share.
+- Generated sidebar contents, heading-based untitled names, suggested export
+  filenames, and a configurable new-note picker location (Downloads by default).
+- Page zoom sends tiny native deltas and uses compositor scaling; wrapping stays
+  stable. Mouse dragging pans reading pages; 3D mouse dragging rotates while
+  two-finger movement pans without tilting the camera.
+- The image viewer uses the available window area without a redundant zoom slider.
+- Styled auto-hiding equation scrollbars, editable task checkboxes and visited-link
+  styling. Compact valid math fences are left untouched by repair suggestions.
+- Fixed the MiTeX/Typst inner-product symbol mismatch behind the SNS PDF error.
+- Bounded inactive editor histories, imported reader fonts and derived Matplotlib
+  image caches. Visible Python figures remain available to PDF export.
+
+The Vivo-specific installer error still requires a device check. Emulator and
+automated results are not a claim of physical-phone verification.
+
+## Previously included improvements (0.4.2)
 
 ## This release
 

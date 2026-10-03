@@ -13,6 +13,8 @@ export interface ExportOptions {
   lineHeight: number;
   fontFamily: string;
   pageNumbers: boolean;
+  themed?: boolean;
+  themeAccent?: string;
   output?: string;
 }
 

@@ -179,6 +179,19 @@ def main():
                         app.exit(2)
                         return
                     print(f"DROPDOWN SMOKE: y={popup.property('y')} height={popup.property('height')}",flush=True)
+                    query = popup.findChild(QObject,"fontSearch")
+                    results = popup.findChild(QObject,"fontResults")
+                    if query is None or results is None:
+                        print("FONT SEARCH SMOKE FAILED: missing search controls",flush=True);app.exit(2);return
+                    query.setProperty("text","JetBrains")
+                    def verify_search():
+                        model = results.property("model")
+                        names = model.toVariant() if hasattr(model,"toVariant") else model
+                        if not names or any("jetbrains" not in str(name).lower() for name in names) or choice.property("value") != "Manrope":
+                            print(f"FONT SEARCH SMOKE FAILED: results={names}, value={choice.property('value')}",flush=True);app.exit(2);return
+                        print(f"FONT SEARCH SMOKE PASSED: {len(names)} filtered families, unchanged selection",flush=True)
+                        capture("font-search")
+                    QTimer.singleShot(100,verify_search)
                 QTimer.singleShot(15500,capture_dropdown)
                 QTimer.singleShot(16000,lambda:studio.setting("theme",'"dark"'))
                 QTimer.singleShot(17000,lambda:capture("dark-settings"))

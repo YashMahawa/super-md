@@ -24,8 +24,9 @@ from theme import detect_system_dark, read_system_palette, system_palette_paths,
 from fonts import FontStore
 
 ROOT = Path(sys._MEIPASS)/"resources" if getattr(sys,"frozen",False) else Path(__file__).resolve().parent.parent
-DEFAULT_PDF = {"pageSize": "a4", "margin": 18, "fontSize": 10.5, "lineHeight": 1.35, "fontFamily": "Manrope", "pageNumbers": True}
+DEFAULT_PDF = {"pageSize": "a4", "margin": 18, "fontSize": 10.5, "lineHeight": 1.35, "fontFamily": "Manrope", "pageNumbers": True, "themed": False}
 DEFAULTS = {"theme": "system", "fullTheme": "black", "motion": True, "font": "Manrope", "size": 18, "width": 0, "widthPercent":80, "lineHeight":1.65, "autosave":True, "normalZoom": 100, "fullZoom": 100, "python": (shutil.which("python3") or shutil.which("python") or "") if getattr(sys,"frozen",False) else sys.executable, "pdf": DEFAULT_PDF, "welcomed": False}
+DEFAULTS.update(readingMode="live", newNoteLocation="")
 SAMPLE = """# A place to think\n\nWrite in Markdown. Read without distractions.\n\n> [!tip] Start with your notes\n> Open any note or folder. No vault, no import process.\n\n## Learn by exploring\n\n$$E = mc^2$$\n\n> [!answer]- Why does this matter?\n> Tap the heading to reveal an answer, then hide it to test yourself.\n\n```smd-chart\n{\"title\":\"A changing wave\",\"series\":[{\"name\":\"Sine\",\"expression\":\"sin(a*x)\",\"color\":\"#386a57\"},{\"name\":\"Cosine\",\"expression\":\"cos(a*x)\",\"color\":\"#bc6750\"}],\"sliders\":[{\"name\":\"a\",\"min\":0.2,\"max\":3,\"value\":1}]}\n```\n\n## Explore in three dimensions\n\n```smd-chart\n{\"mode\":\"surface3d\",\"title\":\"Bowl and saddle\",\"x\":{\"min\":-2,\"max\":2,\"steps\":20},\"y\":{\"min\":-2,\"max\":2},\"series\":[{\"name\":\"Bowl\",\"expression\":\"a*(x^2+y^2)\",\"color\":\"#39aa7a\"},{\"name\":\"Saddle\",\"expression\":\"x^2-y^2\",\"color\":\"#ad8be3\"}],\"sliders\":[{\"name\":\"a\",\"min\":0.1,\"max\":2,\"value\":1}]}\n```\n\n[Back to exploring](#learn-by-exploring)\n"""
 
 def local_path(value: str) -> Path:
@@ -49,6 +50,7 @@ class Session(QObject):
         try:
             stored = json.loads((self.data/"settings.json").read_text())
             self.settings.update({k:v for k,v in stored["settings"].items() if k in DEFAULTS})
+            self.settings["pdf"] = {**DEFAULT_PDF, **self.settings.get("pdf", {})}
             self.recent = [p for p in stored.get("recent",[]) if isinstance(p,str)][:30]
         except (OSError,ValueError,KeyError,TypeError,AttributeError): pass
         try:
@@ -74,6 +76,7 @@ class Studio(QObject):
     exportRequested = Signal(str)
     folderPickerRequested = Signal()
     fontPickerRequested = Signal()
+    noteLocationPickerRequested = Signal()
     flushFailed = Signal(bool)
 
     def __init__(self, isolated: bool = False, session: Session | None = None):
@@ -96,9 +99,10 @@ class Studio(QObject):
         self.folder = ""
         self.files: list[dict] = []
         self.expanded: set[str] = set()
-        self.mode = "live"
+        self.mode = self.settings.get("readingMode", "live")
         self.fullscreen = False
         self.reader_overlay = False
+        self.image_overlay = False
         self.busy = 0
         self.message = ""
         self.ready = False
@@ -138,6 +142,9 @@ class Studio(QObject):
         self.autosave_timer = QTimer(self)
         self.autosave_timer.setSingleShot(True)
         self.autosave_timer.timeout.connect(self._autosave)
+        self.preference_timer = QTimer(self)
+        self.preference_timer.setSingleShot(True)
+        self.preference_timer.timeout.connect(self._preferences)
         self.saving = set()
         self.tabs = [{**tab,"id":uuid.uuid4().hex} for tab in self.session.initial_recovery]
         self.session.initial_recovery = []
@@ -211,6 +218,7 @@ class Studio(QObject):
 
     def stop(self):
         if self.retired: return
+        self.preference_timer.stop()
         self.theme_timer.stop()
         self.theme_debounce.stop()
         self.recovery_timer.stop()
@@ -226,7 +234,7 @@ class Studio(QObject):
     @Property(str, notify=changed)
     def snapshot(self):
         tab = self._current()
-        return json.dumps({"tabs": [{"id": t["id"], "name": t["name"], "dirty": t["content"] != t["saved"]} for t in self.tabs], "active": self.active, "name": tab["name"], "portable": tab["portable"], "folder": self.folder, "files": self.files, "recent": self.recent, "settings": self.settings, "mode": self.mode, "fullscreen": self.fullscreen, "readerOverlay": self.reader_overlay, "dark": self._dark(), "zoom": self.settings["fullZoom" if self.fullscreen else "normalZoom"], "busy": self.busy > 0, "message": self.message, "colors": self._colors()})
+        return json.dumps({"tabs": [{"id": t["id"], "name": t["name"], "path": t["path"], "dirty": t["content"] != t["saved"]} for t in self.tabs], "active": self.active, "name": tab["name"], "outline": tab.get("outline", []), "portable": tab["portable"], "folder": self.folder, "files": self.files, "recent": self.recent, "settings": self.settings, "mode": self.mode, "fullscreen": self.fullscreen, "readerOverlay": self.reader_overlay, "imageOverlay": self.image_overlay, "dark": self._dark(), "zoom": self.settings["fullZoom" if self.fullscreen else "normalZoom"], "busy": self.busy > 0, "message": self.message, "colors": self._colors()})
 
     @Property(str, constant=True)
     def windowId(self): return self.window_id
@@ -284,6 +292,12 @@ class Studio(QObject):
     @Slot(str, int)
     def finishTabDrag(self, tab_id, action):
         if action != int(Qt.DropAction.IgnoreAction.value): return
+        # QDrag's nested event loop can finish before Wayland delivers the
+        # release to Qt's button-state cache. Wait for that delivery before
+        # distinguishing an outside drop from Escape while still held.
+        QTimer.singleShot(150, lambda:self._finish_tab_drag(tab_id))
+
+    def _finish_tab_drag(self, tab_id):
         # Escape cancels QDrag while the button is still held; never detach then.
         if QGuiApplication.mouseButtons() & Qt.MouseButton.LeftButton: return
         cursor = QCursor.pos()
@@ -303,6 +317,16 @@ class Studio(QObject):
 
     @Slot()
     def chooseFont(self): self.fontPickerRequested.emit()
+
+    @Slot()
+    def chooseNoteLocation(self): self.noteLocationPickerRequested.emit()
+
+    @Slot(str)
+    def setNoteLocation(self, value):
+        directory = local_path(value)
+        if directory.is_dir():
+            self.settings["newNoteLocation"] = str(directory)
+            self._preferences(); self._emit(False)
 
     @Slot(str)
     def importFont(self,value):
@@ -345,6 +369,7 @@ class Studio(QObject):
         self._emit(False)
 
     def _preferences(self):
+        if self.retired or getattr(self.writes, "_shutdown", False): return
         data = json.dumps({"settings": self.settings, "recent": self.recent}).encode()
         self._submit(lambda: atomic_write(self.data / "settings.json", data), lambda *_: None, False,self.writes)
         self.session.changed.emit()
@@ -479,6 +504,8 @@ class Studio(QObject):
     def setMode(self, mode):
         if mode in ("live", "reader", "editor", "split"):
             self.mode = mode
+            self.settings["readingMode"] = mode
+            self.preference_timer.start(500)
             self._emit()
 
     @Slot(bool)
@@ -488,8 +515,15 @@ class Studio(QObject):
 
     @Slot(float)
     def setZoom(self, value):
-        self.settings["fullZoom" if self.fullscreen else "normalZoom"] = max(60, min(240, round(value)))
-        self._emit()
+        zoom = max(60, min(240, round(value)))
+        self.settings["fullZoom" if self.fullscreen else "normalZoom"] = zoom
+        self.readerCall.emit(f"window.supermdSetZoom?.({zoom})")
+        self.preference_timer.start(500)
+        self._emit(False)
+
+    @Slot(str, int)
+    def navigateHeading(self, heading, offset):
+        self.readerCall.emit(f"window.supermdHeading?.({json.dumps(heading)}, {offset})")
 
     @Slot(str, str)
     def setting(self, key, encoded):
@@ -635,8 +669,12 @@ class Studio(QObject):
 
     @Slot(str,result=str)
     def defaultSaveLocation(self,name):
-        directory = QStandardPaths.writableLocation(QStandardPaths.DocumentsLocation) or str(Path.home())
+        directory = self.settings.get("newNoteLocation") or QStandardPaths.writableLocation(QStandardPaths.DownloadLocation) or str(Path.home())
         return QUrl.fromLocalFile(str(Path(directory)/Path(name).name)).toString()
+
+    @Slot(str, result=str)
+    def defaultExportLocation(self, format):
+        return self.defaultSaveLocation(Path(self._current()["name"]).stem + "." + format)
 
     @Slot(str)
     def closeTab(self, id):
@@ -708,7 +746,18 @@ class Studio(QObject):
             args = json.loads(raw)
             tab = self._current()
             if command == "reader_ready": self.ready = True; self._emit(); self.replied.emit(id,"true",""); return
-            if command == "reader_overlay_changed": self.reader_overlay = bool(args.get("open")); self._emit(False); self.replied.emit(id,"true",""); return
+            if command == "reader_overlay_changed": self.reader_overlay = bool(args.get("open")); self.image_overlay = bool(args.get("image")); self._emit(False); self.replied.emit(id,"true",""); return
+            if command == "document_outline":
+                target = next((t for t in self.tabs if t["id"] == args.get("id")), None)
+                headings = args.get("headings", [])
+                if not isinstance(headings, list) or len(headings) > 2000: raise ValueError("Invalid outline")
+                if target:
+                    target["outline"] = headings
+                    if not target["path"] and target["name"].startswith("Untitled") and headings:
+                        title = str(headings[0].get("title", "")).strip()
+                        title = "".join(c for c in title if c not in '/\\:*?"<>|' and ord(c) >= 32).strip(". ")[:120]
+                        if title: target["name"] = title + (".smd" if target["portable"] else ".md")
+                self._emit(False); self.replied.emit(id,"true",""); return
             if command == "document_flushed":
                 operation = args.get("operation")
                 if operation != self.flush_operation or operation is None:
@@ -733,6 +782,7 @@ class Studio(QObject):
                 self.replied.emit(id,"true",""); return
             if command == "zoom_changed":
                 self.settings["fullZoom" if self.fullscreen else "normalZoom"] = max(60,min(240,args["zoom"]))
+                self.preference_timer.start(500)
                 self._emit(False); self.replied.emit(id,"true",""); return
             if command == "export_failed": self.pending_export = self.pending_save_as = ""; self.message = args["error"]; self._emit(False); self.replied.emit(id,"true",""); return
             if command == "request_fmd_export": self.exportRequested.emit("smd"); self.replied.emit(id,"true",""); return

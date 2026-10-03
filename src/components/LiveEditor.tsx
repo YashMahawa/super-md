@@ -58,7 +58,7 @@ export default function LiveEditor({ markdown, onChange, documentPath, python, d
   }} onKeyDown={(event) => {
     if (event.target === event.currentTarget && (event.key === "Enter" || event.key === "F2")) { event.preventDefault(); setEditing({ prefix: markdown.slice(0, base + block.start), text: block.text, suffix: markdown.slice(base + block.end) }); }
   }}>
-    <MarkdownPreview markdown={block.text} documentPath={documentPath} python={python} dark={dark} trustedImageHosts={trustedImageHosts} onTrustImageHost={onTrustImageHost} />
+    <MarkdownPreview markdown={block.text} onChange={text=>onChange(markdown.slice(0,base+block.start)+text+markdown.slice(base+block.end))} documentPath={documentPath} python={python} dark={dark} trustedImageHosts={trustedImageHosts} onTrustImageHost={onTrustImageHost} />
   </section>;
   if (editing) {
     return <div className="live-document">

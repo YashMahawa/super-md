@@ -1,4 +1,17 @@
 import { visit } from "unist-util-visit";
+import { unified } from "unified";
+import remarkParse from "remark-parse";
+import remarkMath from "remark-math";
+import { remarkObsidianMath } from "./obsidianMath";
+
+export interface OutlineEntry {id:string;title:string;level:number;offset:number}
+export function documentOutline(markdown:string):OutlineEntry[] {
+  const front=markdown.match(/^---\r?\n[\s\S]*?\r?\n---\r?\n/)?.[0].length||0;
+  const tree=unified().use(remarkParse).use(remarkMath).use(remarkObsidianMath).parse(markdown.slice(front));
+  const result:OutlineEntry[]=[],counts=new Map<string,number>();
+  visit(tree,"heading",(node:any)=>{const title=headingText(node),slug=headingSlug(title),count=counts.get(slug)||0;counts.set(slug,count+1);if(result.length<2000)result.push({id:slug+(count?`-${count}`:""),title,level:node.depth,offset:front+(node.position?.start.offset||0)});});
+  return result;
+}
 
 export function headingSlug(text: string): string {
   return text.normalize("NFKC").toLowerCase().replace(/<[^>]+>/g, "").replace(/[^\p{L}\p{N}\s_-]/gu, "").trim().replace(/\s/g, "-") || "section";
@@ -21,6 +34,9 @@ export function navigateHeading(link: HTMLAnchorElement): boolean {
   let target = href.slice(1); try { target = decodeURIComponent(target); } catch { /* literal fragment */ }
   const root = link.closest(".reading-scroll,.live-pane,.android-reading") || link.closest(".markdown-body")?.parentElement;
   if (!root) return false;
+  return navigateToHeading(root,target);
+}
+export function navigateToHeading(root:Element,target:string):boolean {
   const headings = Array.from(root.querySelectorAll<HTMLElement>("[data-heading-key]"));
   const counts = new Map<string, number>();
   for (const heading of headings) { const key = heading.dataset.headingKey!, count = counts.get(key) || 0; counts.set(key, count + 1); heading.id = key + (count ? `-${count}` : ""); }

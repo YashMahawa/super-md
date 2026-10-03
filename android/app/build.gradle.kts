@@ -2,11 +2,14 @@ plugins { id("com.android.application"); id("org.jetbrains.kotlin.plugin.compose
 android {
     namespace = "dev.supermd.studio"
     compileSdk { version = release(37) }
-    defaultConfig { applicationId = "dev.supermd.studio"; minSdk = 26; targetSdk = 36; versionCode = 1009; versionName = "0.4.2"; ndk { abiFilters += (System.getenv("SUPERMD_ABIS") ?: "arm64-v8a").split(',') }; testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner" }
+    defaultConfig { applicationId = "dev.supermd.studio"; minSdk = 26; targetSdk = 36; versionCode = 1010; versionName = "0.4.3"; ndk { abiFilters += (System.getenv("SUPERMD_ABIS") ?: "arm64-v8a").split(',') }; testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner" }
     buildFeatures { compose = true; buildConfig = true }
     compileOptions { sourceCompatibility = JavaVersion.VERSION_17; targetCompatibility = JavaVersion.VERSION_17 }
     signingConfigs {
         create("distribution") {
+            enableV1Signing = true
+            enableV2Signing = true
+            enableV3Signing = true
             val path = System.getenv("SUPERMD_KEYSTORE")
             if (path != null) { storeFile = file(path); storePassword = System.getenv("SUPERMD_STORE_PASSWORD"); keyAlias = System.getenv("SUPERMD_KEY_ALIAS"); keyPassword = System.getenv("SUPERMD_KEY_PASSWORD") }
         }
@@ -14,7 +17,9 @@ android {
     buildTypes {
         release { isMinifyEnabled = true; isShrinkResources = true; proguardFiles(getDefaultProguardFile("proguard-android-optimize.txt"), "proguard-rules.pro"); signingConfig = if (System.getenv("SUPERMD_KEYSTORE") != null) signingConfigs.getByName("distribution") else null }
     }
-    packaging { jniLibs { useLegacyPackaging = false }; resources { excludes += "/META-INF/{AL2.0,LGPL2.1}" } }
+    // Compress native libraries for the normal download. Keep aligned ELF files;
+    // Android extracts them at installation, rather than inflating APK size.
+    packaging { jniLibs { useLegacyPackaging = true }; resources { excludes += "/META-INF/{AL2.0,LGPL2.1}" } }
 }
 kotlin { jvmToolchain(17) }
 chaquopy { defaultConfig { version = "3.13"; System.getenv("SUPERMD_BUILD_PYTHON")?.let { buildPython(it) }; pip { install("numpy"); install("matplotlib==3.8.4") } } }

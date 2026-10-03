@@ -30,12 +30,12 @@ Button {
     Accessible.name: ToolTip.text || text
     Material.roundedScale: Material.FullScale
     Material.background: prominent ? Material.primary : JSON.parse(studio.snapshot).colors["surface-high"]
-    Material.foreground: prominent ? colors["on-primary"] : highlighted ? colors["on-primary-container"] : colors.text
+    Material.foreground: prominent || highlighted ? colors["on-primary"] : colors.text
     Material.elevation: 0
     background: Rectangle {
         antialiasing: true
         radius: control.down ? 10 : control.highlighted ? 14 : height / 2
-        color: control.prominent ? control.colors.primary : control.highlighted ? control.colors["primary-container"] : control.tonal ? control.colors["surface-high"] : "transparent"
+        color: control.prominent || control.highlighted ? control.colors.primary : control.tonal ? control.colors["surface-high"] : "transparent"
         border.width: control.visualFocus ? 2 : control.tonal ? 1 : 0
         border.color: control.visualFocus ? control.colors.primary : control.colors.outline
         Behavior on radius { enabled: control.motion; NumberAnimation { duration: 140; easing.type: Easing.OutCubic } }

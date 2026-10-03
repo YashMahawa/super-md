@@ -44,6 +44,7 @@ ApplicationWindow {
         function onFlushFailed(canClose) { flushDialog.canClose = canClose; flushDialog.open() }
         function onCloseRequested(name) { closeDialog.title = "Save changes to " + name + "?"; closeDialog.open() }
         function onSaveRequested(name) { saveDialog.selectedFile = studio.defaultSaveLocation(name); saveDialog.open() }
+        function onNoteLocationPickerRequested() { noteFolderDialog.open() }
         function onExportRequested(format) { outputFormat = format; exportDialog.open() }
         function onFolderPickerRequested() { folderDialog.open() }
         function onFontPickerRequested() { fontDialog.open() }
@@ -70,7 +71,7 @@ ApplicationWindow {
     Shortcut { sequence: "Ctrl+0"; onActivated: reader.runJavaScript("window.supermdResetZoom?.()") }
 
     header: Column {
-        visible: !viewState.fullscreen && viewState.settings.welcomed
+        visible: !viewState.fullscreen && !viewState.imageOverlay && viewState.settings.welcomed
         width: parent.width
         Pane {
             width: parent.width
@@ -106,7 +107,7 @@ ApplicationWindow {
         orientation: Qt.Horizontal
         handle: Rectangle { implicitWidth: 6; color: window.viewState.colors["surface-low"]; Rectangle { anchors.horizontalCenter: parent.horizontalCenter; width: SplitHandle.pressed || SplitHandle.hovered ? 3 : 1; height: parent.height; color: SplitHandle.pressed || SplitHandle.hovered ? window.Material.primary : window.viewState.colors.outline } }
         Pane {
-            visible: sidebar && !viewState.fullscreen
+            visible: sidebar && !viewState.fullscreen && !viewState.imageOverlay
             SplitView.preferredWidth: 260
             SplitView.minimumWidth: 200
             SplitView.maximumWidth: 500
@@ -141,6 +142,25 @@ ApplicationWindow {
                     ScrollBar.vertical: ExpressiveScrollBar { }
                 }
                 Rectangle { Layout.fillWidth: true; height: 1; color: viewState.colors.outline }
+                Label { visible: !!viewState.outline?.length; text: "Contents"; font.weight: Font.DemiBold }
+                ListView {
+                    visible: !!viewState.outline?.length
+                    Layout.fillWidth: true
+                    Layout.preferredHeight: Math.min(260, (viewState.outline?.length || 0) * 38)
+                    clip: true
+                    model: viewState.outline || []
+                    delegate: ItemDelegate {
+                        required property var modelData
+                        width: ListView.view.width - 16
+                        height: 38
+                        leftPadding: 8 + Math.max(0, modelData.level - 1) * 12
+                        text: modelData.title
+                        onClicked: studio.navigateHeading(modelData.id, modelData.offset)
+                        ToolTip.visible: hovered
+                        ToolTip.text: modelData.title
+                    }
+                    ScrollBar.vertical: ExpressiveScrollBar { }
+                }
                 Label { text: "Recent notes"; font.weight: Font.DemiBold; color: viewState.colors.text }
                 ListView {
                     Layout.fillWidth: true
@@ -161,7 +181,7 @@ ApplicationWindow {
                 anchors.fill: parent
                 spacing: 0
                 Pane {
-                    visible: !viewState.fullscreen
+                    visible: !viewState.fullscreen && !viewState.imageOverlay
                     Layout.fillWidth: true
                     padding: 12
                     background: Rectangle { color: viewState.colors["surface-low"]; Rectangle { anchors.bottom: parent.bottom; width: parent.width; height: 1; color: viewState.colors.outline; opacity: .4 } }
@@ -257,12 +277,13 @@ ApplicationWindow {
         SettingsPage { viewState: window.viewState; anchors.fill: parent; onBack: settingsOpen = false }
     }
     footer: Pane {
-        visible: !viewState.fullscreen
+        visible: !viewState.fullscreen && !viewState.imageOverlay
         padding: 6
         RowLayout { anchors.fill: parent; Label { text: viewState.busy ? "Preparing document…" : viewState.message || "Local files. Automatic draft recovery."; elide: Text.ElideRight; Layout.fillWidth: true; color: viewState.colors.muted; font.pixelSize: 12 } BusyIndicator { running: viewState.busy; implicitHeight: 20; implicitWidth: 20 } }
     }
     FileDialog { id: openDialog; title: "Open note"; nameFilters: ["Notes (*.md *.smd *.fmd *.markdown)", "All files (*)"]; onAccepted: studio.openNote(selectedFile.toString()) }
     FolderDialog { id: folderDialog; title: "Open folder"; onAccepted: studio.openFolder(selectedFolder.toString()) }
+    FolderDialog { id: noteFolderDialog; title: "Default location for new notes"; onAccepted: studio.setNoteLocation(selectedFolder.toString()) }
     FileDialog { id: saveDialog; title: "Save note"; fileMode: FileDialog.SaveFile; nameFilters: ["Markdown (*.md)", "Portable Super MD (*.smd)"]; onAccepted: studio.saveAs(selectedFile.toString()); onRejected: studio.resolveClose("cancel") }
     FileDialog { id: destination; title: "Export note"; fileMode: FileDialog.SaveFile; nameFilters: outputFormat === "pdf" ? ["PDF (*.pdf)"] : outputFormat === "md" ? ["Markdown (*.md)"] : ["Portable Super MD (*.smd)"]; onAccepted: studio.exportTo(selectedFile.toString(), outputFormat) }
     Dialog {
@@ -295,7 +316,7 @@ ApplicationWindow {
                     Label { visible: outputFormat !== "pdf"; Layout.fillWidth: true; wrapMode: Text.WordWrap; text: outputFormat === "md" ? "Editable Markdown text. Choose portable SMD to include images in one file." : "A portable .smd keeps the editable Markdown and images together. Source mode never shows embedded image bytes." }
                 }
             }
-            ActionButton { text: sharing ? "Prepare share copy" : "Choose destination"; prominent: true; Layout.fillWidth: true; onClicked: { exportDialog.close(); destination.open() } }
+            ActionButton { text: sharing ? "Prepare share copy" : "Choose destination"; prominent: true; Layout.fillWidth: true; onClicked: { exportDialog.close(); destination.selectedFile = studio.defaultExportLocation(outputFormat); destination.open() } }
         }
         onOpened: {
             outputFormat = "pdf"

@@ -1,6 +1,6 @@
-import { useRef, useState, type ReactNode } from "react";
+import { useEffect, useRef, useState, type ReactNode } from "react";
 import { invoke } from "../nativeBridge";
-import { pythonResults, remember } from "../renderedOutputs";
+import { pythonResults, remember, retainVisiblePython } from "../renderedOutputs";
 import type { PythonResult } from "../types";
 import CopyCode from "./CopyCode";
 
@@ -9,6 +9,7 @@ export default function PythonCell({ source, python, highlighted }: { source: st
   const [running, setRunning] = useState(false);
   const executedSource = useRef(pythonResults.has(source) ? source : "");
   const runId = useRef(0);
+  useEffect(()=>result?retainVisiblePython(executedSource.current,result):undefined,[result]);
   const run = async () => {
     const currentRun = ++runId.current;
     const currentSource = source;

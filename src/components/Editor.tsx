@@ -16,6 +16,16 @@ interface Props {
 }
 
 const sessions = new Map<string, { state: EditorState; top: number; appearance: Compartment; wrapping: Compartment; wrapped: boolean }>();
+function trimEditorSessions() {
+  // Bound retained undo trees across tabs by text volume, not only tab count.
+  // The native model still owns every note; evicting a view cannot lose text.
+  let retained = [...sessions.values()].reduce((size, entry) => size + entry.state.doc.length, 0);
+  for (const [id, entry] of sessions) {
+    if (sessions.size <= 12 && retained <= 4_000_000) break;
+    sessions.delete(id); retained -= entry.state.doc.length;
+    callbacks.delete(id); statusHandlers.delete(id);
+  }
+}
 const callbacks = new Map<string, (value: string) => void>();
 const statusHandlers = new Map<string, (state: EditorState) => void>();
 const visibleEditors = new Map<string, EditorView>();
@@ -79,7 +89,7 @@ export default function Editor({ sessionId = "default", value, onChange, dark, f
       extensions: [
         lineNumbers(),
         foldGutter(),
-        history(),
+        history({ minDepth: 30 }),
         drawSelection(),
         highlightActiveLine(),
         highlightSelectionMatches(),
@@ -110,7 +120,7 @@ export default function Editor({ sessionId = "default", value, onChange, dark, f
     if (incoming) view.current.scrollDOM.scrollTop = Math.max(0, incoming.top);
     return () => {
       visibleEditors.delete(sessionId);
-      if (view.current) { sessions.set(sessionId, { state: view.current.state, top: view.current.scrollDOM.scrollTop, appearance: appearance.current, wrapping: wrapping.current, wrapped: wrapReference.current }); if (sessions.size > 40) { const first = sessions.keys().next().value!; sessions.delete(first); callbacks.delete(first); statusHandlers.delete(first); } view.current.destroy(); }
+      if (view.current) { sessions.delete(sessionId); sessions.set(sessionId, { state: view.current.state, top: view.current.scrollDOM.scrollTop, appearance: appearance.current, wrapping: wrapping.current, wrapped: wrapReference.current }); trimEditorSessions(); view.current.destroy(); }
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [sessionId]);
@@ -132,8 +142,16 @@ export default function Editor({ sessionId = "default", value, onChange, dark, f
 
   useEffect(() => {
     const open = () => view.current && openSearchPanel(view.current);
+    const navigate = (event: Event) => {
+      const editor = view.current;
+      if (!editor) return;
+      const offset = Math.max(0, Math.min(editor.state.doc.length, Number((event as CustomEvent).detail) || 0));
+      editor.dispatch({ selection: { anchor: offset }, effects: EditorView.scrollIntoView(offset, { y: "start" }) });
+      editor.focus();
+    };
     window.addEventListener("supermd-find", open);
-    return () => window.removeEventListener("supermd-find", open);
+    window.addEventListener("supermd-goto-offset", navigate);
+    return () => { window.removeEventListener("supermd-find", open); window.removeEventListener("supermd-goto-offset", navigate); };
   }, []);
 
   useEffect(() => {

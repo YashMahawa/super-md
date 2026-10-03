@@ -14,6 +14,16 @@ let root: Root | null = null;
 afterEach(() => { if (root) { act(() => root?.unmount()); root = null; } document.body.innerHTML = ""; loadAsset.mockClear(); });
 
 describe("local image preview", () => {
+  it("toggles a task marker without changing frontmatter, code or neighboring source",async()=>{
+    const host=document.createElement('div');document.body.append(host);root=createRoot(host);
+    const markdown='---\ntitle: Tasks\n---\n# Tasks\n\n- [ ] Read $E=mc^2$ 😊\n- [x] Done\n\n```md\n- [ ] Literal example\n```';
+    const change=vi.fn();
+    await act(async()=>root?.render(<MarkdownPreview markdown={markdown} onChange={change} documentPath={null} python="" dark/>));
+    const boxes=host.querySelectorAll<HTMLInputElement>('input[type=checkbox]');
+    expect(boxes).toHaveLength(2);expect(boxes[0].disabled).toBe(false);
+    await act(async()=>boxes[0].click());
+    expect(change).toHaveBeenCalledWith(markdown.replace('- [ ] Read','- [x] Read'));
+  });
   it("keeps embedded image data without permitting active links", async () => {
     const host = document.createElement("div"); document.body.append(host); root = createRoot(host);
     await act(async () => { root?.render(<MarkdownPreview markdown="![Embedded](data:image/png;base64,iVBORw0KGgo=)\n\n[unsafe](javascript:alert%281%29)" documentPath={null} python="" dark />); });

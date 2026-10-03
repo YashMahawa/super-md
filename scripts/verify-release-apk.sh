@@ -8,6 +8,11 @@ expected_certificate="${ANDROID_CERT_SHA256:?Set the existing upgrade certificat
 "$sdk_tools/zipalign" -c -P 16 4 "$apk_path"
 apk_signatures="$("$sdk_tools/apksigner" verify --print-certs "$apk_path")"
 actual_certificate="$(printf '%s\n' "$apk_signatures" | sed -n 's/^Signer #1 certificate SHA-256 digest: //p')"
+for signature_range in 'v1:23:23' 'v2:26:27' 'v3:28:36'; do
+  IFS=: read -r scheme minimum maximum <<< "$signature_range"
+  verification="$("$sdk_tools/apksigner" verify --verbose --min-sdk-version "$minimum" --max-sdk-version "$maximum" "$apk_path")"
+  if ! printf '%s\n' "$verification" | rg -q "Verified using $scheme scheme .*: true"; then echo "Missing $scheme signature" >&2; exit 1; fi
+done
 if [ "${actual_certificate,,}" != "${expected_certificate,,}" ]; then echo 'APK upgrade certificate mismatch' >&2; exit 1; fi
 apk_badging="$("$sdk_tools/aapt" dump badging "$apk_path")"
 if [[ "$apk_badging" == *application-debuggable* ]]; then echo 'Refusing a debuggable APK' >&2; exit 1; fi

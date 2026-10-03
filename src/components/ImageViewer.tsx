@@ -1,7 +1,6 @@
 import { useEffect, useRef, useState } from "react";
 import { zoomTranslation, type Point } from "../focalZoom";
 import { setReaderOverlay } from "../readerOverlays";
-import { MaterialSlider } from "./MaterialControls";
 import { wheelIntent } from "../wheelIntent";
 
 export default function ImageViewer() {
@@ -65,6 +64,6 @@ export default function ImageViewer() {
     }} onPointerUp={event => pointers.current.delete(event.pointerId)} onPointerCancel={event => pointers.current.delete(event.pointerId)}>
       <img draggable={false} src={image.src} alt={image.alt} style={{ transform: `translate(${pan.x}px,${pan.y}px) scale(${zoom/100})` }} />
     </div>
-    <footer><div className="image-zoom-control"><span>Zoom</span><MaterialSlider label="Image zoom" min={25} max={800} value={zoom} onChange={scale} motion={document.documentElement.dataset.motion !== "off"}/><output>{Math.round(zoom)}%</output></div><button onClick={fit}>Fit image</button>{image.owner && <><button onClick={() => edit("replace")}>Replace</button><button onClick={() => edit("remove")}>Remove</button></>}</footer>
+    <footer><output aria-label="Image zoom">{Math.round(zoom)}%</output>{image.owner && <><button onClick={() => edit("replace")}>Replace</button><button onClick={() => edit("remove")}>Remove</button></>}</footer>
   </section>;
 }

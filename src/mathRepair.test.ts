@@ -21,6 +21,16 @@ it("will not apply a repair to changed text",()=>{
   const source = String.raw`\(x\)`;
   expect(applyMathRepairs("other",suggestMathRepairs(source))).toBe("other");
 });
+it("leaves valid compact Obsidian formulas and inner products untouched",()=>{
+  const source=String.raw`$$\langle x, y \rangle = \frac{1}{T_0} \int_0^{T_0} x(t)y(t) dt = 0$$
+
+> [!tip] Even and odd
+> $$\mathbf{x_e(t) = \frac{x(t)+x(-t)}{2}}$$
+
+- $$x(t)\xrightarrow{\text{Shift}}x(t-b)$$`;
+  expect(suggestMathRepairs(source)).toEqual([]);
+  expect(applyMathRepairs(source,suggestMathRepairs(source))).toBe(source);
+});
 it.each([
   [String.raw`$ x^2 $`,"$x^2$"],
   [String.raw`$ x + y $`,"$x + y$"],

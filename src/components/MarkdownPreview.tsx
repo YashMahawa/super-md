@@ -1,4 +1,6 @@
-import { Children, isValidElement, lazy, memo, Suspense, useEffect, useState, type ReactNode } from "react";
+import { Children, isValidElement, lazy, memo, Suspense, useEffect, useMemo, useState, type ReactNode } from "react";
+import {unified} from "unified";
+import remarkParse from "remark-parse";
 import { invoke } from "../nativeBridge";
 import ReactMarkdown, { defaultUrlTransform } from "react-markdown";
 import remarkGfm from "remark-gfm";
@@ -16,6 +18,9 @@ import CopyCode from "./CopyCode";
 import CodeBlockBoundary from "./CodeBlockBoundary";
 
 const MermaidDiagram = lazy(() => import("./MermaidDiagram"));
+function remarkTaskPositions() {
+  return (tree:unknown)=>{let index=0;visit(tree as never,'listItem',(node:any)=>{if(typeof node.checked==='boolean')node.data={...node.data,hProperties:{...node.data?.hProperties,'data-task-index':index++}};});};
+}
 
 function textOf(value: ReactNode): string {
   if (typeof value === "string" || typeof value === "number") return String(value);
@@ -119,19 +124,30 @@ interface Props {
   dark: boolean;
   trustedImageHosts?: string[];
   onTrustImageHost?: (host: string) => void;
+  onChange?: (markdown:string)=>void;
 }
 
-function MarkdownPreview({ markdown, documentPath, python, dark, trustedImageHosts = [], onTrustImageHost }: Props) {
+function MarkdownPreview({ markdown, documentPath, python, dark, trustedImageHosts = [], onTrustImageHost, onChange }: Props) {
   const normalized = normalizeCallouts(markdown);
+  const tasks=useMemo(()=>{
+    if(!onChange || !/\[[ xX]\]/.test(markdown))return [];
+    const prefix=markdown.match(/^---\r?\n[\s\S]*?\r?\n---\r?\n/)?.[0].length||0;
+    const tree=unified().use(remarkParse).use(remarkGfm).use(remarkMath).parse(markdown.slice(prefix));
+    const offsets:number[]=[];
+    visit(tree,'listItem',(node:any)=>{if(typeof node.checked!=='boolean')return;const start=prefix+node.position.start.offset;const marker=markdown.slice(start,node.position.end.offset+prefix).match(/^\s*(?:[-+*]|\d+[.)])\s+\[([ xX])\]/);if(marker)offsets.push(start+marker[0].lastIndexOf('[')+1);});
+    return offsets;
+  },[markdown,onChange]);
   return (
     <article className="markdown-body" onCopy={event=>{const source=selectedMarkdown(window.getSelection());if(source!==null){event.clipboardData.setData("text/plain",source);event.preventDefault();}}}>
       <ReactMarkdown
         urlTransform={(url, key, node) => node.tagName === "img" && key === "src" && /^data:image\/(?:png|jpeg|gif|webp|avif|svg\+xml);base64,/i.test(url) ? url : defaultUrlTransform(url)}
-        remarkPlugins={[remarkGfm, remarkMath, remarkObsidianMath, remarkCallouts, remarkHeadingIds]}
+        remarkPlugins={[remarkGfm, remarkMath, remarkObsidianMath, remarkCallouts, remarkHeadingIds, remarkTaskPositions]}
         rehypePlugins={[rehypeKatex, rehypeHighlight]}
         components={{
+          input: ({node: _node,...props}) => <input {...props} disabled={!onChange} onChange={()=>{}} />,
+          li: ({node,children}) => <li className={Array.isArray(node?.properties.className)?node.properties.className.join(' '):undefined} onChange={event=>{const index=Number(node?.properties['data-task-index']);const offset=tasks[index];if(offset===undefined || !onChange || !(event.target instanceof HTMLInputElement))return;onChange(markdown.slice(0,offset)+(event.target.checked?'x':' ')+markdown.slice(offset+1));}}>{children}</li>,
           img: ({ src, alt }) => <AssetImage src={src} alt={alt} documentPath={documentPath} trustedImageHosts={trustedImageHosts} onTrustImageHost={onTrustImageHost} />,
-          a: ({ href, children }) => <a href={href} target={href?.startsWith("#") ? undefined : "_blank"} rel="noreferrer" onClick={event => { if (navigateHeading(event.currentTarget)) { event.preventDefault(); event.stopPropagation(); } }}>{children}</a>,
+          a: ({ href, children }) => <a href={href} target={href?.startsWith("#") ? undefined : "_blank"} rel="noreferrer" onClick={event => { if (navigateHeading(event.currentTarget)) { event.preventDefault(); event.stopPropagation(); } else event.currentTarget.dataset.visited='true'; }}>{children}</a>,
           pre: ({ children }) => {
             const child = Children.only(children) as React.ReactElement<{ className?: string; children?: ReactNode }>;
             const language = child.props.className?.match(/language-([\w-]+)/)?.[1];

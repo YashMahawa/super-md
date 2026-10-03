@@ -72,6 +72,9 @@ export function suggestMathRepairs(markdown: string): MathRepair[] {
   const dollarBlocks:Array<[number,number]>=[];
   for(const match of markdown.matchAll(/(?<![\\$])\$\$([\s\S]{1,12000}?)\$\$(?!\$)/g)){
     const from=match.index,to=from+match[0].length;dollarBlocks.push([from,to]);
+    // Compact Obsidian display equations are valid. Cosmetic fence rewrites
+    // are not repairs and can change Markdown list/blockquote structure.
+    if(valid(match[1]))continue;
     if(!strong(match[1])||/\n\s*#/.test(match[1]))continue;
     const body=repair(match[1]);if(body!==null)add(from,to,wrap(body,true),"Normalize display fences and formula syntax",true);
   }

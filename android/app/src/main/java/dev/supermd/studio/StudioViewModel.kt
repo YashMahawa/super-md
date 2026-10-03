@@ -31,6 +31,7 @@ private val documentWrites = Mutex()
 data class Note(val id: String = UUID.randomUUID().toString(), val name: String = "Untitled.md", val uri: String? = null, val content: String = "", val saved: String = "", val relative: String? = null, val assetDirectory: String? = null) { val dirty get() = content != saved; val portable get() = assetDirectory != null }
 data class RecentNote(val name: String, val uri: String, val relative: String? = null)
 data class FileEntry(val name: String, val uri: String, val directory: Boolean, val relative: String)
+data class OutlineHeading(val id: String, val title: String, val level: Int, val offset: Int)
 data class StudioState(val widthPercent: Float = 80f, val lineHeight: Float = 1.65f, val autosave: Boolean = true, val customFonts: List<String> = emptyList(), val readerOverlay: Boolean = false, val tabs: List<Note> = listOf(Note(name = "Welcome.md", content = sample, saved = sample)), val closedTabs: List<Note> = emptyList(), val activeId: String = "", val mode: String = "live", val fullscreen: Boolean = false, val normalZoom: Float = 100f, val fullscreenZoom: Float = 100f, val theme: String = "system", val fullscreenTheme: String = "black", val motion: Boolean = true, val font: String = "Manrope", val size: Float = 17f, val folder: String? = null, val files: List<FileEntry> = emptyList(), val busy: Boolean = false, val message: String? = null, val error: String? = null, val welcomed: Boolean = false, val pdf: String = "{\"pageSize\":\"a4\",\"margin\":18,\"fontSize\":10.5,\"lineHeight\":1.35,\"fontFamily\":\"Manrope\",\"pageNumbers\":true}") {
     val active get() = tabs.find { it.id == activeId } ?: tabs.first()
     val zoom get() = if (fullscreen) fullscreenZoom else normalZoom
@@ -112,6 +113,22 @@ class StudioViewModel(app: Application, val workspaceKey: String = "main") : And
     init { prefs.registerOnSharedPreferenceChangeListener(preferencesChanged) }
     override fun onCleared() { prefs.unregisterOnSharedPreferenceChangeListener(preferencesChanged); super.onCleared() }
     val state = mutable.asStateFlow()
+    private val outlineMutable = MutableStateFlow<List<OutlineHeading>>(emptyList())
+    val headings = outlineMutable.asStateFlow()
+    private val imageMutable = MutableStateFlow(false)
+    val imageOverlay = imageMutable.asStateFlow()
+    fun outline(id: String, entries: JSONArray) {
+        if (id != mutable.value.active.id) return
+        outlineMutable.value = (0 until minOf(entries.length(), 2000)).map { index ->
+            val entry = entries.getJSONObject(index)
+            OutlineHeading(entry.getString("id"), entry.getString("title"), entry.getInt("level").coerceIn(1,6), entry.getInt("offset").coerceAtLeast(0))
+        }
+        val note = mutable.value.active
+        if (note.uri == null && note.name.startsWith("Untitled") && outlineMutable.value.isNotEmpty()) {
+            val title = outlineMutable.value.first().title.filter { it.code >= 32 && it !in "/\\:*?\"<>|" }.trim().trim('.').take(120)
+            if (title.isNotEmpty()) change { s -> s.copy(tabs = s.tabs.map { if (it.id == id) it.copy(name = title + if (it.portable) ".smd" else ".md") else it }) }
+        }
+    }
     private var persistJob: Job? = null
     private var autosaveJob: Job? = null
     private val autosavePending = mutableSetOf<String>()
@@ -226,13 +243,18 @@ class StudioViewModel(app: Application, val workspaceKey: String = "main") : And
         prefs.edit().apply { theme?.let { putString("theme", it) }; fullTheme?.let { putString("fullTheme", it) }; motion?.let { putBoolean("motion", it) }; font?.let { putString("font", it) }; size?.let { putFloat("size", it) } }.apply()
     }
     fun pdf(value: String) { change { it.copy(pdf = value) }; prefs.edit().putString("pdf", value).apply() }
+    fun noteLocation(): String = prefs.getString("newNoteLocation", "") ?: ""
+    fun noteLocation(uri: Uri) {
+        getApplication<Application>().contentResolver.takePersistableUriPermission(uri, Intent.FLAG_GRANT_READ_URI_PERMISSION or Intent.FLAG_GRANT_WRITE_URI_PERMISSION)
+        prefs.edit().putString("newNoteLocation", uri.toString()).apply()
+    }
     fun reading(widthPercent: Float? = null, lineHeight: Float? = null, autosave: Boolean? = null) {
         val width=widthPercent?.takeIf { it.isFinite() }?.coerceIn(50f,100f)
         val leading=lineHeight?.takeIf { it.isFinite() }?.coerceIn(1.15f,2.2f)
         change { it.copy(widthPercent=width ?: it.widthPercent,lineHeight=leading ?: it.lineHeight,autosave=autosave ?: it.autosave) }
         prefs.edit().apply { width?.let { putFloat("widthPercent",it) };leading?.let { putFloat("lineHeight",it) };autosave?.let { putBoolean("autosave",it) } }.apply()
     }
-    fun overlay(open: Boolean) { mutable.value=mutable.value.copy(readerOverlay=open) }
+    fun overlay(open: Boolean, image: Boolean = false) { mutable.value=mutable.value.copy(readerOverlay=open); imageMutable.value=image }
     fun importFont(uri: Uri) = viewModelScope.launch {
         try { val family=withContext(Dispatchers.IO) {fonts.import(uri)};appearance(font=family);prefs.edit().putLong("fonts",System.currentTimeMillis()).apply();mutable.value=mutable.value.copy(customFonts=fonts.families,message="Imported $family for reading and PDF export") }
         catch(error: Exception) {fail("Could not import font: ${error.message}")}

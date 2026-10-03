@@ -5,8 +5,19 @@ export const chartCenters = new Map<string, {x:number;y:number}>();
 export const chartGrids = new Map<string, boolean>();
 export const chartViews = new Map<string, {azimuth:number;elevation:number}>();
 export const pythonResults = new Map<string, PythonResult>();
+const visiblePython = new Set<{source:string;result:PythonResult}>();
+export function retainVisiblePython(source:string,result:PythonResult){const record={source,result};visiblePython.add(record);return()=>{visiblePython.delete(record);};}
+export function pythonOutput(source:string):PythonResult|undefined {for(const entry of visiblePython)if(entry.source===source)return entry.result;return pythonResults.get(source);}
 export function remember<T>(map: Map<string, T>, key: string, value: T) {
-  map.set(key, value); if (map.size > 60) map.delete(map.keys().next().value!);
+  map.delete(key);map.set(key, value);
+  if (map === pythonResults) {
+    // Images dominate retained memory. Sixty base64 figures can otherwise
+    // retain gigabytes after their tabs have closed. Current visible results
+    // stay owned by PythonCell; this cap only evicts optional redisplay cache.
+    const cost=(source:string,result:PythonResult)=>2*(source.length+result.stdout.length+result.stderr.length+result.images.reduce((n,image)=>n+image.length,0));
+    let bytes=[...pythonResults].reduce((n,[source,result])=>n+cost(source,result),0);
+    for(const [source,result] of pythonResults){if(bytes<=16_000_000 && pythonResults.size<=12)break;pythonResults.delete(source);bytes-=cost(source,result);}
+  } else if (map.size > 60) map.delete(map.keys().next().value!);
 }
 
 export function exportRenderedViews(content: string) {

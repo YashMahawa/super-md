@@ -15,10 +15,12 @@ pub struct PdfOptions {
     pub line_height: f32,
     pub font_family: String,
     pub page_numbers: bool,
+    pub themed: bool,
+    pub theme_accent: String,
 }
 impl Default for PdfOptions {
     fn default() -> Self {
-        Self { page_size: "a4".into(), margin: 18., font_size: 10.5, line_height: 1.35, font_family: "Libertinus Serif".into(), page_numbers: true }
+        Self { page_size: "a4".into(), margin: 18., font_size: 10.5, line_height: 1.35, font_family: "Libertinus Serif".into(), page_numbers: true, themed: false, theme_accent: "#386a57".into() }
     }
 }
 impl PdfOptions {
@@ -28,12 +30,42 @@ impl PdfOptions {
             if !value.is_finite() || value < min || value > max { bail!("Invalid {name}: expected {min} to {max}"); }
         }
         if self.font_family.len() > 120 { bail!("Font name is too long"); }
+        if self.theme_accent.len() != 7 || !self.theme_accent.starts_with('#') || !self.theme_accent[1..].chars().all(|c| c.is_ascii_hexdigit()) { bail!("Invalid PDF theme accent"); }
         Ok(())
     }
 }
 
 fn string(value: &str) -> String { serde_json::to_string(value).unwrap() }
 fn text(value: &str) -> String { format!("#text({})", string(value)) }
+
+/// MiTeX 0.2 predates Typst's angle-bracket rename. Rewrite generated
+/// identifiers only, never quoted TeX text (or the user's Markdown).
+fn compatible_math(value: &str) -> String {
+    let mut output = String::new();
+    let mut quoted = false;
+    let mut escaped = false;
+    let mut token = String::new();
+    let flush = |token: &mut String, output: &mut String| {
+        let replacement = match token.as_str() {
+            "angle.l" => "chevron.l", "angle.r" => "chevron.r",
+            "angle.l.double" => "chevron.l.double", "angle.r.double" => "chevron.r.double",
+            other => other,
+        };
+        output.push_str(replacement); token.clear();
+    };
+    for ch in value.chars() {
+        if quoted {
+            output.push(ch);
+            if ch == '"' && !escaped { quoted = false; }
+            escaped = ch == '\\' && !escaped;
+        } else if ch == '"' {
+            flush(&mut token, &mut output); output.push(ch); quoted = true;
+        } else if ch.is_ascii_alphanumeric() || ch == '.' || ch == '_' {
+            token.push(ch);
+        } else { flush(&mut token, &mut output); output.push(ch); }
+    }
+    flush(&mut token, &mut output); output
+}
 
 pub fn image_sources(markdown: &str) -> Vec<String> {
     Parser::new_ext(markdown, Options::all()).filter_map(|event| match event { Event::Start(Tag::Image { dest_url, .. }) => Some(dest_url.to_string()), _ => None }).collect()
@@ -81,7 +113,7 @@ impl<'a> Renderer<'a> {
                 Event::InlineMath(ref value) | Event::DisplayMath(ref value) => {
                     let display = matches!(&event, Event::DisplayMath(_));
                     let math = mitex::convert_math(&value, None).map_err(|e| anyhow::anyhow!("LaTeX conversion failed for {value}: {e}"))?;
-                    let expression = format!("#eval({}, scope: smd-math-scope)", string(&format!("${math}$")));
+                    let expression = format!("#eval({}, scope: smd-math-scope)", string(&format!("${}$", compatible_math(&math))));
                     out.push_str(&if display { format!("\n#smd-fit(math.equation(block: true, [{expression}]))\n\n") } else { expression });
                 },
                 Event::SoftBreak => out.push(' '),
@@ -100,7 +132,7 @@ impl<'a> Renderer<'a> {
                             if ["mermaid", "smd-chart"].contains(&lang.as_str()) { bail!("Export preparation did not render a {lang} block"); }
                             // Individual lines fit the available width while the
                             // enclosing block stays breakable across pages.
-                            out.push_str("\n#block(width: 100%, breakable: true, fill: rgb(\"#f4f6f8\"), inset: 8pt)[\n");
+                            out.push_str("\n#block(width: 100%, breakable: true, fill: smd-code-fill, inset: 8pt)[\n");
                             // Each fit is a block-level layout. Adding a separate
                             // linebreak after it creates empty paragraphs and
                             // wastes most of a page on short snippets.
@@ -126,7 +158,7 @@ impl<'a> Renderer<'a> {
                                 }
                             }
                             let widths = lengths.iter().zip(&counts).map(|(len, count)| format!("{:.2}fr,", ((*len as f64 / (*count).max(1) as f64).max(8.)).sqrt().min(12.))).collect::<String>();
-                            out.push_str(&format!("\n#table(columns: ({widths}), inset: 6pt, stroke: .4pt + rgb(\"#d6dde5\"),\n"));
+                            out.push_str(&format!("\n#table(columns: ({widths}), inset: 6pt, stroke: .4pt + smd-line,\n"));
                             out.push_str(&self.render(Some(close))?); out.push_str(")\n\n");
                         },
                         Tag::TableHead => { out.push_str("table.header("); out.push_str(&self.render(Some(close))?); out.push_str("),\n"); },
@@ -156,7 +188,7 @@ impl<'a> Renderer<'a> {
                                 let accent = match kind.as_str() { "tip" | "success" => "#14735b", "warning" | "caution" => "#946200", "danger" | "error" => "#b3261e", _ => "#315d99" };
                                 (format!("#text(weight: \"bold\", fill: rgb(\"{accent}\"))[{}]\n\n{body}", text(&title)), accent)
                             } else { (self.render(Some(close))?, "#315d99") };
-                            out.push_str(&format!("\n#block(width: 100%, breakable: true, fill: rgb(\"#f1f4f8\"), stroke: (left: 2pt + rgb(\"{accent}\")), inset: 10pt, radius: 4pt)[{body}]\n\n"));
+                            out.push_str(&format!("\n#block(width: 100%, breakable: true, fill: smd-callout-fill, stroke: (left: 2pt + rgb(\"{accent}\")), inset: 10pt, radius: 4pt)[{body}]\n\n"));
                         },
                         _ => {
                             let heading = if matches!(tag, Tag::Heading { .. }) {
@@ -213,7 +245,10 @@ pub fn source(markdown: &str, options: &PdfOptions, assets: &HashMap<String, Vec
     // MiTeX's bundled conversion spec still emits Typst's former `sect`
     // intersection name. Typst 0.15 calls it `inter`. Scope aliases preserve
     // equations without rewriting user TeX or changing the section symbol.
-    Ok(format!("#import \"/mitex/standard.typ\": scope as mitex-scope\n#let smd-math-scope = mitex-scope + (sect: sym.inter,)\n#set page(paper: {}, margin: {}mm)\n#set text(font: ({}, \"Libertinus Serif\", \"New Computer Modern\"), size: {}pt)\n#set par(leading: {}em)\n{template}\n{body}", string(paper), options.margin, string(&options.font_family), options.font_size, options.line_height - 0.7))
+    let accent = &options.theme_accent;
+    let themed = if options.themed { "true" } else { "false" };
+    let palette = format!("#let smd-themed = {themed}\n#let smd-accent = rgb({})\n#let smd-paper = if smd-themed {{ color.mix((white, 89%), (smd-accent, 11%)) }} else {{ white }}\n#let smd-code-fill = if smd-themed {{ color.mix((white, 79%), (smd-accent, 21%)) }} else {{ rgb(\"#f4f6f8\") }}\n#let smd-callout-fill = if smd-themed {{ color.mix((white, 84%), (smd-accent, 16%)) }} else {{ rgb(\"#f1f4f8\") }}\n#let smd-line = if smd-themed {{ color.mix((white, 55%), (smd-accent, 45%)) }} else {{ rgb(\"#d6dde5\") }}\n#let smd-link = if smd-themed {{ color.mix((rgb(\"#20252d\"), 45%), (smd-accent, 55%)) }} else {{ rgb(\"#315d99\") }}\n", string(accent));
+    Ok(format!("#import \"/mitex/standard.typ\": scope as mitex-scope\n#let smd-math-scope = mitex-scope + (sect: sym.inter,)\n{palette}#set page(paper: {}, margin: {}mm, fill: smd-paper)\n#set text(font: ({}, \"Libertinus Serif\", \"New Computer Modern\"), size: {}pt)\n#set par(leading: {}em)\n{template}\n{body}", string(paper), options.margin, string(&options.font_family), options.font_size, options.line_height - 0.7))
 }
 
 pub fn export(markdown: &str, options: &PdfOptions, assets: &HashMap<String, Vec<u8>>) -> Result<Vec<u8>> {
@@ -290,6 +325,17 @@ pub extern "system" fn Java_dev_supermd_studio_PdfEngine_export(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn inner_products_remain_compatible_with_typst_symbols() {
+        assert_eq!(compatible_math("angle.l x angle.r \"angle.l\""), "chevron.l x chevron.r \"angle.l\"");
+        let md = r"# Inner product
+
+$$\langle x, y \rangle = \frac{1}{T_0} \int_0^{T_0} x(t)y(t)dt=0$$";
+        for themed in [false, true] {
+            let options = PdfOptions { themed, theme_accent: "#9a461a".into(), ..PdfOptions::default() };
+            assert!(export(md, &options, &HashMap::new()).unwrap().starts_with(b"%PDF-"));
+        }
+    }
     #[test]
     fn every_selectable_paper_and_bundled_reading_font_typesets() {
         let papers=["a3","a4","a5","a6","iso-b4","iso-b5","iso-b6","letter","legal","tabloid","executive"];

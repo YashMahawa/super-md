@@ -2,7 +2,7 @@
  * Event delegation also covers Source/Live editors created after mode changes.
  * This updates classes only, never React state or the native bridge per frame. */
 export function installScrollIndicators() {
-  const selector = ".android-reading,.cm-scroller";
+  const selector = ".android-reading,.cm-scroller,.katex-display";
   const timers = new Map<HTMLElement, number>();
   let hovered: HTMLElement | null = null;
   const hover = (next: HTMLElement | null) => {
