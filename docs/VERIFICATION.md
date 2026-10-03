@@ -1,8 +1,8 @@
 # Verification
 
-## Aligned chrome, native captions and stable zoom — 0.4.11
+## Aligned chrome, native captions and stable zoom — 0.4.12
 
-- 89 frontend unit tests, 30 browser workflows and 60 Qt/Python checks pass
+- 90 frontend unit tests, 30 browser workflows and 60 Qt/Python checks pass
   locally. Coverage includes stale zoom snapshots, 40–300% limits, bounded Live
   editor scrolling, lazy-content extent changes without selection-scale resets,
   tab centering, native pinch coordinate mapping and motion-disabled sidebar
@@ -12,7 +12,10 @@
   new-tab action. Font popups close with Settings. Existing native PDF checks
   remain enabled. macOS/Windows caption integration is not a physical-device
   visual check; their exact-source CI/package jobs remain required.
-- All 20 local Android API 36 instrumentation tests pass, including real
+- All 20 local Android API 35 instrumentation tests pass with the compatibility
+  path; the earlier modern-renderer candidate also passed all 20 API 36 tests.
+  The same final-source CI suites on both APIs remain publication gates.
+  Coverage includes real
   LaTeX/Matplotlib/PDF export, painted UI, large-note selection and headings.
   Checks cover deduplicated actions and gesture acknowledgements
   that do not issue another native zoom command. A separate presented-pixel test
@@ -20,6 +23,12 @@
   native plus icon. Manual schemes replace every Material role; JVM contrast
   tests and release lint remain enabled. These are emulator checks, not a Vivo
   hardware performance or installer claim.
+- The API 35 image's Chromium 124 reported a zoomed word rectangle at the wrong
+  visual location. Keeping compositor scaling on engines without `currentCSSZoom`
+  fixes the real native long-press test (exactly “Bravo”) and the 600-chapter link
+  jump, without lowering or bypassing either assertion. Modern engines retain
+  layout zoom at rest. See Chromium's standardized-zoom changes in
+  <https://developer.chrome.com/release-notes/128#standardized-css-zoom-property>.
 - Local builds are serialized and resource-limited. The previous installation
   and running user windows are preserved; no laptop power action is performed.
   Publication still requires exact-commit CI, signed release APK verification,

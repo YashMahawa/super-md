@@ -1,4 +1,4 @@
-# Super MD 0.4.11
+# Super MD 0.4.12
 
 - Desktop tabs and their icon-only “+” share a vertical centre. The top New note
   button and logo are removed; Open folder has a direct icon and the sidebar
@@ -13,6 +13,9 @@
   chrome waits for a single-finger gesture to end before resizing the reader;
   two-finger gestures and Live editors retain their viewport while interacting.
   A stale reveal/hide callback cannot resize the reader during a newer gesture.
+- Older WebViews retain composited scaling when standardized CSS zoom geometry
+  is unavailable. Text selection and heading positions then use the same visual
+  coordinates, without requiring a WebView update or changing modern selection.
 - Manual Android accents replace the full Material color scheme, not only primary
   roles. Icon foregrounds inherit a proper Surface content color; system-wallpaper
   secondary/surface roles no longer leak into manually chosen dark palettes.

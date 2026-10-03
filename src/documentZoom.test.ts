@@ -14,6 +14,7 @@ it('settles selection to layout zoom without changing the focal scale',()=>{
   const root=document.createElement('section'),space=document.createElement('div'),page=document.createElement('div');page.className='document-page';root.append(space);space.append(page);
   page.getBoundingClientRect=()=>({left:0,top:0} as DOMRect);root.getBoundingClientRect=()=>({left:0,top:0,width:1000,height:800} as DOMRect);
   Object.defineProperty(root,'clientWidth',{value:1000});Object.defineProperty(page,'offsetHeight',{value:10000});
+  Object.defineProperty(page,'currentCSSZoom',{get:()=>Number(page.style.zoom)||1});
   applyDocumentZoom(root,160,80);settleDocumentZoom(root);
   expect(page.style.zoom).toBe('1.6');expect(page.dataset.selectionScale).toBe('1.6');expect(page.style.transform).not.toContain('scale');
   applyDocumentZoom(root,180,80);expect(page.style.zoom).toBe('1');expect(page.dataset.selectionScale).toBeUndefined();expect(page.dataset.scale).toBe('1.8');
@@ -22,7 +23,16 @@ it('lazy content height updates never replay zoom or write the user scroll posit
   const root=document.createElement('section'),space=document.createElement('div'),page=document.createElement('div');page.className='document-page';root.append(space);space.append(page);
   page.getBoundingClientRect=()=>({left:0,top:0} as DOMRect);root.getBoundingClientRect=()=>({left:0,top:0,width:1000,height:800} as DOMRect);
   Object.defineProperty(root,'clientWidth',{value:1000});let height=10000;Object.defineProperty(page,'offsetHeight',{get:()=>height});
+  Object.defineProperty(page,'currentCSSZoom',{get:()=>Number(page.style.zoom)||1});
   applyDocumentZoom(root,175,80);settleDocumentZoom(root);root.scrollTop=700;
   height=12000;expect(refreshDocumentExtent(root)).toBe(true);
   expect(root.scrollTop).toBe(700);expect(page.style.zoom).toBe('1.75');expect(page.dataset.selectionScale).toBe('1.75');expect(space.style.height).toBe('21000px');
+});
+it('legacy zoom geometry keeps transformed visual and native hit-test coordinates aligned',()=>{
+  const root=document.createElement('section'),space=document.createElement('div'),page=document.createElement('div');page.className='document-page';root.append(space);space.append(page);
+  page.getBoundingClientRect=()=>({left:0,top:0} as DOMRect);root.getBoundingClientRect=()=>({left:0,top:0,width:1000,height:800} as DOMRect);
+  Object.defineProperty(root,'clientWidth',{value:1000});Object.defineProperty(page,'offsetHeight',{value:10000});
+  applyDocumentZoom(root,175,80);root.scrollTop=500;settleDocumentZoom(root);
+  expect(page.style.zoom).toBe('1');expect(page.style.transform).toBe('translateX(16px) scale(1.75)');expect(page.dataset.selectionModel).toBe('transform');expect(root.scrollTop).toBe(500);
+  refreshDocumentExtent(root);expect(page.dataset.selectionScale).toBe('1.75');expect(root.scrollTop).toBe(500);
 });

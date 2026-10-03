@@ -14,14 +14,18 @@ export function refreshDocumentExtent(root:HTMLElement):boolean {
   measured.originX+=bounds.left-measured.bounds.left;measured.originY+=bounds.top-measured.bounds.top;measured.bounds=bounds;
   return true;
 }
-/** WebView's native selection handles need an untransformed scale at rest.
- * Pinching remains composited; layout zoom is committed once the gesture ends. */
+/** Modern WebView selection handles need layout zoom at rest. Older Chromium
+ * uses pre-standard CSS zoom geometry, which disagrees with hit testing. Keep
+ * its compositor scale instead. Detect the standardized API, not OS/version.
+ * https://developer.chrome.com/release-notes/128#standardized_css_zoom_property */
 export function settleDocumentZoom(root:HTMLElement):void {
   const measured=geometry.get(root);if(!measured)return;
   const {page}=measured,scale=Number(page.dataset.scale)||1;
-  page.style.zoom=String(scale);
-  page.style.transform=`translateX(${measured.left/scale}px)`;
+  const standardized='currentCSSZoom' in page;
+  page.style.zoom=standardized?String(scale):'1';
+  page.style.transform=standardized?`translateX(${measured.left/scale}px)`:`translateX(${measured.left}px) scale(${scale})`;
   page.dataset.selectionScale=String(scale);
+  page.dataset.selectionModel=standardized?'layout':'transform';
 }
 /** Layout at the user's base reading width, then magnify the whole page. Font,
  * math, tables and wrapping stay in the same relative positions as in a PDF. */
@@ -44,6 +48,7 @@ export function applyDocumentZoom(root:HTMLElement, zoom:number, widthPercent:nu
   const left=Math.max(16,(viewport-width*next)/2);
   if(page.style.zoom && page.style.zoom!=="1")page.style.zoom="1";
   delete page.dataset.selectionScale;
+  delete page.dataset.selectionModel;
   if(width!==measured.width){page.style.width=`${width}px`;page.style.marginLeft="0px";measured.width=width;measured.height=page.offsetHeight;}
   page.style.transform=`translateX(${left}px) scale(${next})`;page.dataset.scale=String(next);page.dataset.zoomLeft=String(left);measured.left=left;
   space.style.width=`${Math.max(viewport,width*next+32)}px`;
