@@ -204,7 +204,7 @@ function Reader() {
       while(history.undo.length>60 || history.undo.reduce((size,text)=>size+text.length,0)>2_000_000)history.undo.shift();
       histories.current.delete(previous.id);histories.current.set(previous.id,history);
       let retained=[...histories.current.values()].reduce((size,h)=>size+[...h.undo,...h.redo].reduce((n,text)=>n+text.length,0),0);
-      for(const [id,cached] of histories.current){if(histories.current.size<=12&&retained<=4_000_000)break;if(id===previous.id)continue;histories.current.delete(id);retained-=[...cached.undo,...cached.redo].reduce((n,text)=>n+text.length,0);}
+      for(const [id,cached] of histories.current){if(histories.current.size<=40&&retained<=4_000_000)break;if(id===previous.id)continue;histories.current.delete(id);retained-=[...cached.undo,...cached.redo].reduce((n,text)=>n+text.length,0);}
     }
     const next = { ...reference.current!, content }; setState(next); reference.current = next;
     // The bridge receives every edit immediately, so closing/rotating cannot lose

@@ -7,7 +7,7 @@
   image viewing, checkbox source preservation and bounded derived image caches.
 - 44 native Qt tests passed, including zoom-only bridge messages, remembered
   reading mode, heading-derived names and sidebar outline data.
-- 12 native typesetter tests passed. The unchanged local SNS note reproduced the
+- 13 native typesetter tests passed. The unchanged local SNS note reproduced the
   old inner-product failure and now exports a 17-page PDF. Its repair suggestions
   were separately checked: zero changes to the original valid document.
 - The prior public ARM64 release installed and launched in the API 36 emulator.

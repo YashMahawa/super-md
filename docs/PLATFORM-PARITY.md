@@ -20,8 +20,9 @@ runtime download is involved. The Apache-2.0 license ships on both platforms.
 - Equations, callouts, collapsible answers/code, Mermaid, SVG, interactive 2D/3D
   plots and local NumPy/Matplotlib execution after explicit Run.
 - Content zoom, independent plot/image zoom, links and PDF heading navigation.
-- PDF paper size, margins, font, size, line spacing and optional page numbers.
-  Settings, Export and Share expose the same PDF configuration.
+- PDF paper size, margins, font, size, line spacing, optional page numbers and
+  optional light Material paper. Export and Share remember the same configuration;
+  PDF options are not duplicated in the general Settings page.
 - Percentage-based reading width (80% by default) and adjustable vertical spacing.
 - Private TTF/OTF imports for reading and PDF export; bundled Manrope, Roboto,
   Noto Sans, Noto Serif and JetBrains Mono are shared by both platforms.

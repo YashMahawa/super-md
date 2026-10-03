@@ -21,7 +21,7 @@ function trimEditorSessions() {
   // The native model still owns every note; evicting a view cannot lose text.
   let retained = [...sessions.values()].reduce((size, entry) => size + entry.state.doc.length, 0);
   for (const [id, entry] of sessions) {
-    if (sessions.size <= 12 && retained <= 4_000_000) break;
+    if (sessions.size <= 40 && retained <= 4_000_000) break;
     sessions.delete(id); retained -= entry.state.doc.length;
     callbacks.delete(id); statusHandlers.delete(id);
   }

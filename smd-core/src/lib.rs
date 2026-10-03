@@ -264,6 +264,7 @@ pub fn export(markdown: &str, options: &PdfOptions, assets: &HashMap<String, Vec
             include_bytes!("../fonts/Roboto.ttf").as_slice(),
             include_bytes!("../fonts/NotoSerif.ttf").as_slice(),
             include_bytes!("../fonts/JetBrainsMono.ttf").as_slice(),
+            include_bytes!("../fonts/NotoEmoji.ttf").as_slice(),
         ].into_iter().chain(assets.iter().filter(|(name,_)| name.starts_with("__font_") && (name.ends_with(".ttf") || name.ends_with(".otf"))).map(|(_,bytes)| bytes.as_slice())))
         .search_fonts_with(TypstKitFontOptions::default().include_system_fonts(!cfg!(target_os="android")).include_embedded_fonts(true))
         .with_static_file_resolver(assets.iter().map(|(k,v)| (k.as_str(), v.as_slice())))
@@ -325,6 +326,13 @@ pub extern "system" fn Java_dev_supermd_studio_PdfEngine_export(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn emoji_font_is_available_without_system_fonts() {
+        let bytes = typst::foundations::Bytes::new(include_bytes!("../fonts/NotoEmoji.ttf").as_slice());
+        let font = typst::text::Font::iter(bytes).next().expect("Bundled emoji font");
+        assert_eq!(font.info().family, "Noto Emoji");
+        assert!(export("# Tasks 😊\n\n- [x] Complete ✅\n- [ ] Study 📚", &PdfOptions::default(), &HashMap::new()).unwrap().starts_with(b"%PDF-"));
+    }
     #[test]
     fn inner_products_remain_compatible_with_typst_symbols() {
         assert_eq!(compatible_math("angle.l x angle.r \"angle.l\""), "chevron.l x chevron.r \"angle.l\"");

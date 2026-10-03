@@ -16,7 +16,7 @@ export function remember<T>(map: Map<string, T>, key: string, value: T) {
     // stay owned by PythonCell; this cap only evicts optional redisplay cache.
     const cost=(source:string,result:PythonResult)=>2*(source.length+result.stdout.length+result.stderr.length+result.images.reduce((n,image)=>n+image.length,0));
     let bytes=[...pythonResults].reduce((n,[source,result])=>n+cost(source,result),0);
-    for(const [source,result] of pythonResults){if(bytes<=16_000_000 && pythonResults.size<=12)break;pythonResults.delete(source);bytes-=cost(source,result);}
+    for(const [source,result] of pythonResults){if(bytes<=16_000_000 && pythonResults.size<=60)break;pythonResults.delete(source);bytes-=cost(source,result);}
   } else if (map.size > 60) map.delete(map.keys().next().value!);
 }
 

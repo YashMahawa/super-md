@@ -18,6 +18,7 @@
 - Fixed the MiTeX/Typst inner-product symbol mismatch behind the SNS PDF error.
 - Bounded inactive editor histories, imported reader fonts and derived Matplotlib
   image caches. Visible Python figures remain available to PDF export.
+- Bundled Noto Emoji provides PDF glyph fallback without requiring system fonts.
 
 The Vivo-specific installer error still requires a device check. Emulator and
 automated results are not a claim of physical-phone verification.
