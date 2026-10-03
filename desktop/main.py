@@ -12,6 +12,7 @@ from PySide6.QtQuickControls2 import QQuickStyle
 from PySide6.QtWebEngineQuick import QtWebEngineQuick
 from studio import Session, Studio, ROOT
 from instance import InstanceBroker
+from reader_gestures import ReaderGestures
 
 class StudioApplication(QApplication):
     openRequested = Signal(str)
@@ -113,6 +114,11 @@ def main():
         # The user's laptop screen is preferred without changing active desktop focus.
         window = engine.rootObjects()[0]
         studio.host_window = window
+        reader = window.findChild(QObject, "documentReader")
+        if reader is not None:
+            # Filter this window only, never the application's global QObject
+            # stream (PySide wrapper creation can recursively generate events).
+            studio.reader_gestures = ReaderGestures(window, reader, studio.readerCall.emit)
         def retire_window():
             if not window.isVisible() and not studio.retired:
                 studio.stop()
@@ -203,6 +209,11 @@ def main():
                     print(f"NARROW SMOKE: settingsChanged={changed} settingsOpen={window.property('settingsOpen')} theme={studio.settings['theme']}",flush=True)
                 QTimer.singleShot(17500,narrow)
                 QTimer.singleShot(19000,lambda:capture("black-narrow"))
+                def verify_nested_popup_closed():
+                    popup=window.findChild(QObject,"readingFontChoicePopup")
+                    if popup is not None and popup.property("visible"):
+                        print("FONT POPUP SMOKE FAILED: picker outlived Settings",flush=True);app.exit(2)
+                QTimer.singleShot(19500,verify_nested_popup_closed)
                 def surface_view():
                     window.setWidth(1320)
                     studio.setting("theme",'"system"')

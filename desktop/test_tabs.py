@@ -90,3 +90,18 @@ ApplicationWindow {
         self.assertEqual((image.width(), image.height()), (320, 190))
         colors = {image.pixelColor(x, y).rgba() for x in range(0, 320, 8) for y in range(0, 190, 8)}
         self.assertGreater(len(colors), 3, "The tab tear-off preview must contain painted text and a card, not an empty image")
+
+    def test_tabs_and_plus_share_the_strip_vertical_center(self):
+        items = [self.window.contentItem()]
+        tabs, plus = [], None
+        while items:
+            item = items.pop()
+            if item.objectName() == "noteTab": tabs.append(item)
+            if item.objectName() == "newTabButton": plus = item
+            items.extend(item.childItems())
+        self.assertEqual(len(tabs), len(self.studio.tabs))
+        self.assertIsNotNone(plus)
+        self.assertEqual(plus.property("text"), "")
+        self.assertEqual(plus.property("glyph"), "Plus")
+        for item in [*tabs, plus]:
+            self.assertAlmostEqual(item.y() + item.height() / 2, 24, delta=.5)

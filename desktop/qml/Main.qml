@@ -13,6 +13,7 @@ ApplicationWindow {
     minimumWidth: 760
     minimumHeight: 520
     visible: false
+    flags: Qt.platform.os === "osx" || Qt.platform.os === "windows" ? Qt.Window | Qt.ExpandedClientAreaHint | Qt.NoTitleBarBackgroundHint : Qt.Window
     title: viewState.name + " - Super MD"
     property var viewState: JSON.parse(studio.snapshot)
     property bool sidebar: true
@@ -83,6 +84,7 @@ ApplicationWindow {
     header: Column {
         visible: !viewState.fullscreen && !viewState.imageOverlay && viewState.settings.welcomed
         width: parent.width
+        Rectangle { width: parent.width; height: window.SafeArea.margins.top; color: viewState.colors["surface-low"] }
         Pane {
             width: parent.width
             padding: 12
@@ -90,20 +92,29 @@ ApplicationWindow {
             RowLayout {
                 anchors.fill: parent
                 spacing: 8
-                Image { source: studio.brand; sourceSize.width: 32; sourceSize.height: 32; Layout.preferredWidth: 32; Layout.preferredHeight: 32; Layout.rightMargin: 8 }
-                ActionButton { glyph: "SidebarSimple"; onClicked: sidebar = !sidebar; ToolTip.text: "Show or hide files" }
-                ActionButton { text: window.width < 1000 ? "" : "New note"; glyph: "Plus"; ToolTip.text: "New note"; onClicked: studio.newNote() }
-                ActionButton { text: "Open note"; glyph: "File"; onClicked: openDialog.open() }
+                SidebarToggle { expanded: sidebar; onClicked: sidebar = !sidebar }
+                ActionButton { glyph: "FolderOpen"; ToolTip.text: "Open folder"; Accessible.name: "Open folder"; onClicked: studio.chooseFolder() }
+                ActionButton { text: window.width < 1060 ? "" : "Open note"; glyph: "File"; ToolTip.text: "Open note (Ctrl+O)"; onClicked: openDialog.open() }
                 ActionButton { glyph: "FloppyDisk"; ToolTip.text: "Save note"; onClicked: studio.saveSafely(); enabled: !viewState.busy }
                 ActionButton { glyph: "Undo"; ToolTip.text: "Undo (Ctrl+Z)"; onClicked: studio.command("undo") }
                 ActionButton { glyph: "Redo"; ToolTip.text: "Redo (Ctrl+Y)"; onClicked: studio.command("redo") }
                 Item { Layout.fillWidth: true }
                 ActionButton { glyph: "MagnifyingGlass"; ToolTip.text: "Find in note (Ctrl+F)"; onClicked: studio.command("find") }
-                ActionButton { glyph: "Image"; ToolTip.text: "Insert image or link"; onClicked: studio.command("insert") }
-                ActionButton { glyph: "Bug"; ToolTip.text: "Fix LaTeX"; onClicked: studio.command("repair") }
-                ActionButton { glyph: "ShareNetwork"; ToolTip.text: "Share note"; onClicked: window.showExport(true) }
-                ActionButton { text: "Export"; glyph: "Export"; prominent: true; enabled: !viewState.busy; onClicked: window.showExport(false) }
+                ActionButton { visible: window.width >= 1060; glyph: "Image"; ToolTip.text: "Insert image or link"; onClicked: studio.command("insert") }
+                ActionButton { visible: window.width >= 1060; glyph: "Bug"; ToolTip.text: "Fix LaTeX"; onClicked: studio.command("repair") }
+                ActionButton { visible: window.width >= 1060; glyph: "ShareNetwork"; ToolTip.text: "Share note"; onClicked: window.showExport(true) }
+                ActionButton {
+                    visible: window.width < 1060; glyph: "More"; ToolTip.text: "More note actions"; onClicked: noteActions.popup()
+                    Menu {
+                        id: noteActions
+                        MenuItem { text: "Insert image or link"; onTriggered: studio.command("insert") }
+                        MenuItem { text: "Fix LaTeX"; onTriggered: studio.command("repair") }
+                        MenuItem { text: "Share note"; onTriggered: window.showExport(true) }
+                    }
+                }
+                ActionButton { text: window.width < 1060 ? "" : "Export"; glyph: "Export"; ToolTip.text: "Export note"; prominent: true; enabled: !viewState.busy; onClicked: window.showExport(false) }
                 ActionButton { glyph: "GearSix"; ToolTip.text: "Settings"; onClicked: settingsOpen = !settingsOpen }
+                WindowControls { visible: studio.captionlessDesktop; host: window; colors: viewState.colors; Layout.preferredWidth: 124; Layout.preferredHeight: 36; Layout.alignment: Qt.AlignVCenter; onCloseRequested: studio.closeWindowSafely() }
             }
         }
         TabStrip {
@@ -185,7 +196,7 @@ ApplicationWindow {
                     anchors.fill: parent
                     ModeGroup { choices: window.width < 1000 ? [{key:"live",label:"Live"},{key:"editor",label:"Source"},{key:"reader",label:"Read"}] : [{key:"live",label:"Live"},{key:"editor",label:"Source"},{key:"reader",label:"Read"},{key:"split",label:"Split"}]; selected: viewState.mode; onChosen: key => studio.setMode(key) }
                     Item { Layout.fillWidth: true }
-                    ExpressiveSlider { visible: window.width >= 1000; Layout.preferredWidth: 140; from: 60; to: 240; value: viewState.zoom; onMoved: studio.setZoom(value); Accessible.name: "Content zoom" }
+                    ExpressiveSlider { visible: window.width >= 1000; Layout.preferredWidth: 140; from: 40; to: 300; value: viewState.zoom; onMoved: studio.setZoom(value); Accessible.name: "Content zoom" }
                     TextField {
                         objectName: "zoomPercentage"
                         Layout.preferredWidth: 76
@@ -200,7 +211,7 @@ ApplicationWindow {
                         color: viewState.colors.text
                         padding: 6
                         validator: RegularExpressionValidator { regularExpression: /[0-9]{1,3}%?/ }
-                        onEditingFinished: { const value = Number(text.replace("%","")); if (value >= 60 && value <= 240) studio.setZoom(value); else text = Math.round(viewState.zoom) + "%" }
+                        onEditingFinished: { const value = Number(text.replace("%","")); if (value >= 40 && value <= 300) studio.setZoom(value); else text = Math.round(viewState.zoom) + "%" }
                         background: Rectangle { radius: 12; antialiasing: true; color: viewState.colors["surface-high"]; border.width: parent.activeFocus ? 2 : 0; border.color: viewState.colors.primary }
                         Accessible.name: "Zoom percentage"
                     }
@@ -225,7 +236,13 @@ ApplicationWindow {
                             // Qt retains the device's pixel deltas. DOM wheel
                             // events lose that distinction, so route touchpad
                             // movement without guessing from notch magnitude.
-                            if ((event.pixelDelta.x || event.pixelDelta.y) && !(event.modifiers & (Qt.ControlModifier | Qt.MetaModifier))) {
+                            if (event.modifiers & (Qt.ControlModifier | Qt.MetaModifier)) {
+                                // Consume before Chromium applies browser zoom:
+                                // resetting zoomFactor afterward flashes a stale scale.
+                                event.accepted = true
+                                const dy = event.pixelDelta.y || event.angleDelta.y
+                                reader.runJavaScript("window.supermdNativeWheel?.(0," + (-dy) + "," + JSON.stringify({x:event.x,y:event.y}) + ",true)")
+                            } else if (event.pixelDelta.x || event.pixelDelta.y) {
                                 event.accepted = true
                                 reader.runJavaScript("window.supermdNativeWheel?.(" + (-event.pixelDelta.x) + "," + (-event.pixelDelta.y) + "," + JSON.stringify({x:event.x,y:event.y}) + "," + !!(event.buttons & Qt.LeftButton) + ")")
                             } else event.accepted = false

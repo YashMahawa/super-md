@@ -3,8 +3,8 @@ import { clampPreviewZoom, previewLayoutWidth, zoomShortcut } from "./zoom";
 
 describe("preview zoom", () => {
   it("clamps zoom into a readable range", () => {
-    expect(clampPreviewZoom(12)).toBe(60);
-    expect(clampPreviewZoom(500)).toBe(240);
+    expect(clampPreviewZoom(12)).toBe(40);
+    expect(clampPreviewZoom(500)).toBe(300);
     expect(clampPreviewZoom(Number.NaN)).toBe(100);
   });
 

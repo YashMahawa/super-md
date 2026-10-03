@@ -1,5 +1,5 @@
-export const MIN_PREVIEW_ZOOM = 60;
-export const MAX_PREVIEW_ZOOM = 240;
+export const MIN_PREVIEW_ZOOM = 40;
+export const MAX_PREVIEW_ZOOM = 300;
 
 export function clampPreviewZoom(value: number): number {
   if (!Number.isFinite(value)) return 100;

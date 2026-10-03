@@ -76,7 +76,7 @@ export default function LiveEditor({ markdown, onChange, documentPath, python, d
   if (editing) {
     return <div className="live-document" onCopy={copy}>
       {before.map((block, index) => renderBlock(block, index))}
-      <div className="live-active-block"><textarea autoFocus data-source-start={editing.prefix.length} spellCheck={false} value={editing.text} style={{ minHeight: Math.max(120, editing.text.split("\n").length * 27 + 32) }} onChange={(event) => {
+      <div className="live-active-block"><textarea autoFocus data-source-start={editing.prefix.length} spellCheck={false} value={editing.text} style={{ height: Math.max(120, editing.text.split("\n").length * 27 + 32) }} onChange={(event) => {
         const text = event.target.value;
         setEditing({ ...editing, text });
         onChange(editing.prefix + text + editing.suffix);

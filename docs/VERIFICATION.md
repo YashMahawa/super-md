@@ -1,5 +1,28 @@
 # Verification
 
+## Aligned chrome, native captions and stable zoom — 0.4.10
+
+- 89 frontend unit tests, 30 browser workflows and 60 Qt/Python checks pass
+  locally. Coverage includes stale zoom snapshots, 40–300% limits, bounded Live
+  editor scrolling, lazy-content extent changes without selection-scale resets,
+  tab centering, native pinch coordinate mapping and motion-disabled sidebar
+  toggling. Caption tests require actual painted glyph pixels, not just geometry.
+- Native desktop presented-pixel smoke checks show visible Linux caption icons
+  in the same toolbar in light and dark modes, centered tabs and an icon-only
+  new-tab action. Font popups close with Settings. Existing native PDF checks
+  remain enabled. macOS/Windows caption integration is not a physical-device
+  visual check; their exact-source CI/package jobs remain required.
+- Android API 36 checks cover deduplicated actions and gesture acknowledgements
+  that do not issue another native zoom command. A separate presented-pixel test
+  verifies the chosen dark-blue palette reaches the reader and paints a visible
+  native plus icon. Manual schemes replace every Material role; JVM contrast
+  tests and release lint remain enabled. These are emulator checks, not a Vivo
+  hardware performance or installer claim.
+- Local builds are serialized and resource-limited. The previous installation
+  and running user windows are preserved; no laptop power action is performed.
+  Publication still requires exact-commit CI, signed release APK verification,
+  all desktop installers and public asset checks.
+
 ## Android comfort, selection, navigation and updates — 2026-10-03
 
 - 88 frontend unit tests and all 27 browser workflows pass locally, including

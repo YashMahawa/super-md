@@ -1,6 +1,26 @@
-# Super MD 0.4.9
+# Super MD 0.4.10
 
-- Unicode draft recovery, imported-font records and settings explicitly use UTF-8 even on Windows machines with a legacy system encoding.
+- Desktop tabs and their icon-only “+” share a vertical centre. The top New note
+  button and logo are removed; Open folder has a direct icon and the sidebar
+  button morphs when toggled, respecting disabled motion.
+- Linux captionless desktops get visible, themed minimize/maximize/close controls
+  in the existing toolbar. macOS/Windows retain real native caption buttons, with
+  a tinted expanded caption and a reserved safe area; no frameless-window hack.
+- Zoom is 40–300%. Native snapshots no longer overwrite newer reader gestures;
+  Android gesture acknowledgements are not echoed as fresh zoom commands. Desktop
+  Ctrl-wheel/native pinch is intercepted before browser zoom can flash a stale scale.
+- Lazy content extent updates no longer replay zoom during scrolling. Android
+  chrome waits for a single-finger gesture to end before resizing the reader;
+  two-finger gestures and Live editors retain their viewport while interacting.
+- Manual Android accents replace the full Material color scheme, not only primary
+  roles. Icon foregrounds inherit a proper Surface content color; system-wallpaper
+  secondary/surface roles no longer leak into manually chosen dark palettes.
+- Android keeps new note only beside the tabs, simplifies its overflow/drawer,
+  replaces the collapsed-chrome down arrow with Contents, removes the green accent
+  choice and uses rounded, selected-aware recent-note rows. Multiwindow remains
+  available in More actions and keyboard tab shortcuts remain supported.
+- Long Live editor boxes scroll internally, and desktop font search closes when
+  Settings closes. All previous Unicode recovery, PDF, asset and update fixes remain.
 
 ## This release
 

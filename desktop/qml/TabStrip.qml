@@ -8,7 +8,7 @@ ScrollView {
     objectName: "tabStrip"
     required property var viewState
     height: 48
-    contentHeight: 44
+    contentHeight: 48
     ScrollBar.vertical.policy: ScrollBar.AlwaysOff
     ScrollBar.horizontal: ExpressiveScrollBar { implicitHeight: 8; padding: 1 }
     function receive(drop, index) {
@@ -21,6 +21,7 @@ ScrollView {
         } catch (error) { /* Foreign or stale drag: leave every note untouched. */ }
     }
     Row {
+        height: strip.height
         spacing: 4
         leftPadding: 16
         Repeater {
@@ -31,6 +32,8 @@ ScrollView {
                 required property int index
                 width: Math.min(260, label.implicitWidth + 64)
                 height: 40
+                y: (strip.height - height) / 2
+                objectName: "noteTab"
                 radius: 18
                 antialiasing: true
                 color: modelData.id === strip.viewState.active ? strip.viewState.colors["surface-high"] : strip.viewState.colors.surface
@@ -99,7 +102,12 @@ ScrollView {
             }
         }
         ActionButton {
-            text: "New tab"; compact: true; onClicked: studio.newNote()
+            objectName: "newTabButton"
+            glyph: "Plus"; compact: true; implicitWidth: 40; implicitHeight: 40
+            y: (strip.height - height) / 2
+            Accessible.name: "New tab"
+            ToolTip.text: "New tab (Ctrl+T)"
+            onClicked: studio.newNote()
             DropArea { anchors.fill: parent; keys: ["application/x-supermd-tab"]; onDropped: function(drop) { strip.receive(drop, strip.viewState.tabs.length) } }
         }
     }

@@ -5,6 +5,14 @@ import androidx.compose.ui.graphics.luminance
 import org.junit.Assert.*
 import org.junit.Test
 class StudyPaletteTest {
+    @Test fun manualAccentsReplaceEveryOemRoleInBothModes() {
+        for(dark in listOf(false,true)) for(name in listOf("blue","violet","rose","amber")) {
+            val first=accentColors(lightColorScheme(primary=Color.Red,secondary=Color.Green),name,dark)
+            val second=accentColors(lightColorScheme(primary=Color.Yellow,secondary=Color.Magenta),name,dark)
+            assertEquals(first.toString(),second.toString())
+            for(pair in listOf(first.onPrimary to first.primary,first.onSecondary to first.secondary,first.onTertiary to first.tertiary,first.onPrimaryContainer to first.primaryContainer,first.onSecondaryContainer to first.secondaryContainer,first.onTertiaryContainer to first.tertiaryContainer,first.onSurface to first.surface,first.onSurface to first.surfaceContainerHigh)) assertTrue("$name dark=$dark contrast",contrast(pair.first,pair.second)>=4.5f)
+        }
+    }
     @Test fun darkOemContainerCannotMakeLightReadingDark() {
         val colors=studyLightColors(lightColorScheme(primary=Color(0xff42669e),primaryContainer=Color(0xff15283b)))
         assertTrue(colors.surface.luminance() > .6f)

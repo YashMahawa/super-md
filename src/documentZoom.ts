@@ -2,6 +2,18 @@ import type { Point } from "./focalZoom";
 type Geometry={page:HTMLElement;space:HTMLElement;width:number;height:number;viewport:number;bounds:DOMRect;originX:number;originY:number;left:number};
 const geometry=new WeakMap<HTMLElement,Geometry>();
 export function invalidateDocumentZoom(root:HTMLElement):void {geometry.delete(root);}
+/** Lazy math/images can change page height while the user scrolls. Update the
+ * extent only: reapplying zoom here would repeatedly unset selection zoom and
+ * write scrollTop, fighting touchpad momentum and native selection handles. */
+export function refreshDocumentExtent(root:HTMLElement):boolean {
+  const measured=geometry.get(root);if(!measured || measured.viewport!==root.clientWidth)return false;
+  const height=measured.page.offsetHeight;
+  if(height!==measured.height){measured.height=height;measured.space.style.height=`${height*(Number(measured.page.dataset.scale)||1)}px`;}
+  const bounds=root.getBoundingClientRect();
+  // Native chrome may change the viewport's origin without changing its width.
+  measured.originX+=bounds.left-measured.bounds.left;measured.originY+=bounds.top-measured.bounds.top;measured.bounds=bounds;
+  return true;
+}
 /** WebView's native selection handles need an untransformed scale at rest.
  * Pinching remains composited; layout zoom is committed once the gesture ends. */
 export function settleDocumentZoom(root:HTMLElement):void {

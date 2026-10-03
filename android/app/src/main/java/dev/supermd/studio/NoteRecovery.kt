@@ -53,8 +53,8 @@ internal object NoteRecovery {
             "closed"->state=state.copy(closedTabs=notes().take(12))
             "active"->state=state.copy(activeId=json.nextString())
             "mode"->{val mode=json.nextString();if(mode in listOf("live","editor","reader","split"))state=state.copy(mode=mode)}
-            "normalZoom"->state=state.copy(normalZoom=json.nextDouble().toFloat().coerceIn(60f,240f))
-            "fullscreenZoom"->state=state.copy(fullscreenZoom=json.nextDouble().toFloat().coerceIn(60f,240f))
+            "normalZoom"->state=state.copy(normalZoom=json.nextDouble().toFloat().coerceIn(40f,300f))
+            "fullscreenZoom"->state=state.copy(fullscreenZoom=json.nextDouble().toFloat().coerceIn(40f,300f))
             else->json.skipValue()
         }
         json.endObject();state

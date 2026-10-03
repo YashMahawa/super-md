@@ -7,6 +7,8 @@ import androidx.activity.compose.setContent
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.ui.test.*
 import androidx.compose.ui.test.junit4.createAndroidComposeRule
+import androidx.compose.ui.graphics.asAndroidBitmap
+import androidx.compose.ui.graphics.toArgb
 import org.junit.Assert.*
 import org.junit.After
 import org.junit.Rule
@@ -57,6 +59,48 @@ class StudioUiTest {
     private fun welcome() {
         repeat(2) { if (compose.onAllNodesWithText("Continue").fetchSemanticsNodes().isNotEmpty()) compose.onNodeWithText("Continue").performClick() }
         compose.onAllNodesWithText("Explore the sample").fetchSemanticsNodes().firstOrNull()?.let { compose.onNodeWithText("Explore the sample").performClick() }
+    }
+    @Test fun manualDarkAccentPaintsNativeIconsAndReaderWithoutOemColorLeaks() {
+        welcome()
+        val model=androidx.lifecycle.ViewModelProvider(compose.activity)[StudioViewModel::class.java]
+        val before=model.state.value
+        try {
+            compose.runOnIdle {model.appearance(accent="blue",theme="dark")}
+            val colors=manualAccent("blue",true)
+            val primary="#"+Integer.toHexString(colors.primary.toArgb()).substring(2)
+            javascriptUntil("getComputedStyle(document.documentElement).getPropertyValue('--primary').trim()") {it.trim('"')==primary}
+            compose.waitForIdle()
+            val icon=compose.onNodeWithContentDescription("New tab").captureToImage().asAndroidBitmap()
+            val allowed=listOf(colors.onSurface,colors.onSurfaceVariant).map {it.toArgb() and 0xffffff}
+            var visible=0
+            for(y in 0 until icon.height)for(x in 0 until icon.width){if(icon.getPixel(x,y) and 0xffffff in allowed)visible++}
+            assertTrue("The native plus must paint a high-contrast manual-scheme foreground, not the default black ambient",visible>5)
+            java.io.File(compose.activity.getExternalFilesDir(null),"manual-blue-dark.png").outputStream().use {compose.onRoot().captureToImage().asAndroidBitmap().compress(android.graphics.Bitmap.CompressFormat.PNG,100,it)}
+        } finally {compose.runOnIdle {model.appearance(accent=before.accent,theme=before.theme)}}
+    }
+    @Test fun nativeMenuIsDeduplicatedAndReaderZoomIsNotEchoedAsANewCommand() {
+        welcome()
+        val model=androidx.lifecycle.ViewModelProvider(compose.activity)[StudioViewModel::class.java]
+        compose.onAllNodesWithContentDescription("New tab").assertCountEquals(1)
+        compose.onNodeWithContentDescription("More actions").performClick()
+        compose.onNodeWithText("Open note").assertIsNotDisplayed() // closed drawer, not an overflow item
+        for(removed in listOf("New tab","New note","Reopen closed tab"))compose.onAllNodesWithText(removed).assertCountEquals(0)
+        compose.onNodeWithText("New window").assertExists()
+        androidx.test.platform.app.InstrumentationRegistry.getInstrumentation().sendKeyDownUpSync(android.view.KeyEvent.KEYCODE_BACK)
+        compose.waitForIdle()
+        compose.onNodeWithContentDescription("Open files").performClick()
+        compose.onAllNodesWithText("New window").assertCountEquals(0)
+        compose.onAllNodesWithText("New note").assertCountEquals(0)
+        compose.runOnIdle {compose.activity.onBackPressedDispatcher.onBackPressed()}
+        temporaryNoteState=model.state.value
+        compose.runOnIdle {model.mode("reader");model.zoom(100f)}
+        javascriptUntil("document.querySelector('.document-page')?.dataset.scale") {it=="\"1\""}
+        val command=model.state.value.zoomCommand
+        javascriptUntil("(()=>{if(window.zoomFeedbackStarted)return window.zoomFeedbackDone||false;window.zoomFeedbackStarted=true;let count=0;function tick(){window.supermdZoomBy?.(1.035,{x:180,y:220});if(++count<24)setTimeout(tick,45);else window.zoomFeedbackDone=true;}tick();return false;})()") {it=="true"}
+        val expected=Math.pow(1.035,24.0).toFloat()
+        javascriptUntil("document.querySelector('.document-page')?.dataset.scale") {kotlin.math.abs((it.trim('"').toFloatOrNull()?:0f)-expected)<.01f}
+        compose.waitUntil(5000){kotlin.math.abs(model.state.value.zoom/100f-expected)<.01f}
+        compose.runOnIdle {assertEquals("A reader acknowledgement must not echo a native zoom command",command,model.state.value.zoomCommand)}
     }
     @Test fun largeNoteKeepsOffscreenMathUnmountedAndHeadingSearchAvailable() {
         welcome()
@@ -225,7 +269,12 @@ class StudioUiTest {
         // just a DOM event. Document scrolling must never open the drawer.
         compose.onRoot().performTouchInput { swipe(androidx.compose.ui.geometry.Offset(30f, height * .82f), androidx.compose.ui.geometry.Offset(170f, height * .40f), 600) }
         compose.onNodeWithText("Your files").assertIsNotDisplayed()
-        compose.onNodeWithContentDescription("Show reading controls").performClick()
+        compose.onNodeWithContentDescription("Show contents").performClick()
+        compose.onAllNodesWithText("Contents",useUnmergedTree=true).filterToOne(hasAnyAncestor(isDialog())).assertIsDisplayed()
+        compose.onNodeWithText("Close").performClick()
+        // Reveal controls with an upward document traversal, not the removed
+        // down-arrow overlay. The viewport must not resize during the gesture.
+        compose.onRoot().performTouchInput { swipe(androidx.compose.ui.geometry.Offset(width*.65f,height*.45f),androidx.compose.ui.geometry.Offset(width*.65f,height*.75f),500) }
         compose.onNodeWithContentDescription("Open files").performClick()
         compose.onNodeWithText("Your files").assertIsDisplayed()
         compose.runOnIdle { compose.activity.onBackPressedDispatcher.onBackPressed() }
@@ -292,8 +341,10 @@ class StudioUiTest {
         javascriptUntil("document.querySelector('.android-reading')?.textContent || document.querySelector('.live-document')?.textContent") { it.contains("Recoverable draft") }
         compose.waitUntil(10_000) { model.state.value.active.name == "Recoverable draft.md" }
         compose.onNodeWithContentDescription("Close Recoverable draft.md").performClick()
-        compose.onNodeWithContentDescription("More actions").performClick()
-        compose.onNodeWithText("Reopen closed tab").performClick()
+        compose.runOnIdle {
+            val down=android.view.KeyEvent(0,0,android.view.KeyEvent.ACTION_DOWN,android.view.KeyEvent.KEYCODE_T,0,android.view.KeyEvent.META_CTRL_ON or android.view.KeyEvent.META_SHIFT_ON)
+            assertTrue(compose.activity.handleShortcut(down))
+        }
         compose.onNodeWithContentDescription("Close Recoverable draft.md").assertExists()
         compose.runOnIdle { assertEquals("# Recoverable draft", model.state.value.active.content) }
         compose.onNodeWithContentDescription("Close Recoverable draft.md").performClick()

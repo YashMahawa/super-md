@@ -34,3 +34,40 @@ test('native two-finger deltas pan the magnified page in both directions without
   await expect(page.locator('.document-page')).toHaveAttribute('data-scale','2');
   expect(await root.evaluate(el=>el.scrollLeft)).toBeLessThan(before.left+120);
 });
+test('queued native snapshots cannot rewind an in-progress zoom, and both limits apply',async({page})=>{
+  await page.addInitScript(()=>{window.SuperMD={post:(id)=>window.supermdReply?.(id,true,null)};});await page.goto('/android-reader.html');
+  await page.evaluate(()=>window.supermdLoad?.({id:'feedback',content:'# Feedback\n\n'+('A substantial readable paragraph. '.repeat(20)+'\n\n').repeat(100),path:null,mode:'reader',dark:false,fullscreen:false,colors:{},font:'Manrope',size:15,zoom:100}));
+  await expect(page.locator('.document-page')).toHaveAttribute('data-scale','1');
+  await page.evaluate(async()=>{
+    for(let i=0;i<12;i++){
+      window.supermdZoomBy?.(1.06,{x:400,y:300});
+      window.supermdLoad?.({id:'feedback',content:'# Feedback\n\n'+('A substantial readable paragraph. '.repeat(20)+'\n\n').repeat(100),path:null,mode:'reader',dark:false,fullscreen:false,colors:{primary:i%2?'#446699':'#336688'},font:'Manrope',size:15,zoom:100});
+      await new Promise<void>(resolve=>requestAnimationFrame(()=>resolve()));
+    }
+  });
+  await expect.poll(()=>page.locator('.document-page').evaluate(el=>Number((el as HTMLElement).dataset.scale))).toBeCloseTo(1.06**12,3);
+  await page.evaluate(()=>window.supermdSetZoom?.(10));await expect(page.locator('.document-page')).toHaveAttribute('data-scale','0.4');
+  await page.evaluate(()=>window.supermdSetZoom?.(400));await expect(page.locator('.document-page')).toHaveAttribute('data-scale','3');
+});
+test('live code editing scrolls inside its bounded box without zooming the document',async({page})=>{
+  await page.addInitScript(()=>{window.SuperMD={post:(id)=>window.supermdReply?.(id,true,null)};});await page.goto('/android-reader.html');
+  await page.evaluate(()=>window.supermdLoad?.({id:'live-scroll',content:'# Long editable example\n\n```python\n'+Array.from({length:300},(_,i)=>`print(${i})`).join('\n')+'\n```\n',path:null,mode:'live',dark:false,fullscreen:false,colors:{},font:'Manrope',size:15,zoom:100}));
+  await page.getByRole('group',{name:'Editable block 2'}).focus();await page.keyboard.press('Enter');
+  const input=page.getByRole('textbox',{name:'Edit Markdown block'});await expect(input).toBeVisible();
+  const box=await input.boundingBox();expect(box).not.toBeNull();expect(box!.height).toBeLessThan(500);
+  await page.evaluate(({x,y})=>window.supermdNativeWheel?.(0,300,{x,y},true),{x:box!.x+40,y:box!.y+40});
+  await expect.poll(()=>input.evaluate(el=>el.scrollTop)).toBeGreaterThan(200);
+  await expect(page.locator('.document-page')).toHaveAttribute('data-scale','1');
+});
+test('settled selection scale stays stable while scrolling lazy content',async({page})=>{
+  await page.addInitScript(()=>{window.SuperMD={post:(id)=>window.supermdReply?.(id,true,null)};});await page.goto('/android-reader.html');
+  await page.evaluate(()=>{document.documentElement.dataset.platform='android';window.supermdLoad?.({id:'scroll-stability',content:Array.from({length:600},(_,i)=>`## Heading ${i}\n\n${'Readable **paragraph** with $x^2$. '.repeat(12)}\n\n`).join(''),path:null,mode:'reader',dark:false,fullscreen:false,colors:{},font:'Manrope',size:15,zoom:175});});
+  await expect(page.locator('.document-page')).toHaveAttribute('data-selection-scale','1.75');
+  const samples=await page.evaluate(async()=>{
+    const root=document.querySelector<HTMLElement>('.android-reading')!,page=document.querySelector<HTMLElement>('.document-page')!;const samples:Array<{top:number;zoom:string}>=[];
+    for(let i=0;i<24;i++){root.scrollBy(0,90);await new Promise<void>(resolve=>requestAnimationFrame(()=>requestAnimationFrame(()=>resolve())));samples.push({top:root.scrollTop,zoom:page.style.zoom});}
+    return samples;
+  });
+  for(let i=1;i<samples.length;i++)expect(samples[i].top).toBeGreaterThanOrEqual(samples[i-1].top-1);
+  expect(samples.every(sample=>sample.zoom==='1.75')).toBe(true);
+});

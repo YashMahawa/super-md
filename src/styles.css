@@ -227,7 +227,7 @@ md-filled-button.primary-action, smd-expressive-button.primary-action { display:
 .live-block .markdown-body > :last-child { margin-bottom: .85em; }
 .live-block:focus-visible { outline: 2px solid var(--primary); outline-offset: 4px; }
 .live-active-block { margin: 0 0 16px; padding: 8px; border: 1px solid color-mix(in srgb, var(--primary) 55%, var(--outline)); border-radius: 14px; background: var(--surface-low); box-shadow: 0 0 0 3px color-mix(in srgb, var(--primary) 10%, transparent); }
-.live-active-block textarea { display: block; width: 100%; resize: vertical; padding: 10px 12px; border: 0; outline: none; background: transparent; color: var(--text); font: calc(var(--editor-size) * var(--workspace-scale, 1))/var(--editor-leading) var(--mono); overflow: hidden; }
+.live-active-block textarea { display: block; width: 100%; min-height: 120px; max-height: min(55dvh, 480px); resize: vertical; padding: 10px 12px; border: 0; outline: none; background: transparent; color: var(--text); font: calc(var(--editor-size) * var(--workspace-scale, 1))/var(--editor-leading) var(--mono); overflow: auto; overscroll-behavior: contain; touch-action: pan-y; }
 .preview-page { margin: 0 auto; transform-origin: top center; }
 .preview-page .markdown-body { width: 100%; margin: 0; }
 .editor-host { width: 100%; height: 100%; min-height: 0; }

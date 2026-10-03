@@ -11,6 +11,12 @@ ActionButton {
     property Item viewportItem: null
     signal chosen(string family)
     function revealChoices() { picker.open() }
+    onVisibleChanged: { if (!visible) picker.close() }
+    onEnabledChanged: { if (!enabled) picker.close() }
+    Connections {
+        target: field.Window.window
+        function onVisibleChanged() { if (!field.Window.window.visible) picker.close() }
+    }
     text: value
     glyph: "CaretDown"
     tonal: true

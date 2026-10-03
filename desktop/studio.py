@@ -432,6 +432,11 @@ class Studio(QObject):
         preferred = ["Manrope", "Roboto", "Noto Sans", "Noto Serif", "JetBrains Mono", "Libertinus Serif", "New Computer Modern", "DejaVu Sans Mono"]
         return preferred + sorted(set(QFontDatabase.families()) - set(preferred))
 
+    @Property(bool, constant=True)
+    def captionlessDesktop(self):
+        desktop = os.environ.get("XDG_CURRENT_DESKTOP", "").lower()
+        return sys.platform.startswith("linux") and any(name in desktop for name in ("hyprland", "sway", "river", "niri"))
+
     @Slot()
     def chooseFont(self): self.fontPickerRequested.emit()
 
@@ -653,7 +658,7 @@ class Studio(QObject):
 
     @Slot(float)
     def setZoom(self, value):
-        zoom = max(60, min(240, round(value)))
+        zoom = max(40, min(300, round(value)))
         self.settings["fullZoom" if self.fullscreen else "normalZoom"] = zoom
         self.readerCall.emit(f"window.supermdSetZoom?.({zoom})")
         self.preference_timer.start(500)
@@ -924,7 +929,7 @@ class Studio(QObject):
                 self._emit(False)
                 self.replied.emit(id,"true",""); return
             if command == "zoom_changed":
-                self.settings["fullZoom" if self.fullscreen else "normalZoom"] = max(60,min(240,args["zoom"]))
+                self.settings["fullZoom" if args.get("fullscreen", self.fullscreen) else "normalZoom"] = max(40,min(300,args["zoom"]))
                 self.preference_timer.start(500)
                 self._emit(False); self.replied.emit(id,"true",""); return
             if command == "export_failed": self.pending_export = self.pending_save_as = ""; self.message = args["error"]; self._emit(False); self.replied.emit(id,"true",""); return

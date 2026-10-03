@@ -121,12 +121,14 @@ class MainActivity : ComponentActivity() {
         var base = when { Build.VERSION.SDK_INT >= 31 -> if (dark) dynamicDarkColorScheme(context) else dynamicLightColorScheme(context); dark -> darkColorScheme(primary = Color(0xffb2c8ff), secondary = Color(0xffbcc6dc)); else -> lightColorScheme(primary = Color(0xff42669e), onPrimary = Color.White, primaryContainer = Color(0xffd7e3ff), onPrimaryContainer = Color(0xff162c4c), secondary = Color(0xff56647c), surface = Color(0xfff7f9fd), background = Color(0xfff7f9fd), surfaceContainerLow = Color(0xfff0f3fa), surfaceContainerHigh = Color(0xffe5ebf5)) }
         base=accentColors(base,state.accent,dark)
         if (!dark) base = studyLightColors(base)
-        if (theme == "black") base = base.copy(primary=Color(0xffdedede),onPrimary=Color(0xff1a1a1a),primaryContainer=Color(0xff343434),onPrimaryContainer=Color(0xfff0f0f0),background=Color.Black,surface=Color.Black,surfaceContainer=Color(0xff171717),surfaceContainerLow=Color(0xff101010),surfaceContainerHigh=Color(0xff242424))
+        if (theme == "black") base = manualAccent("neutral",true).copy(primary=Color(0xffdedede),onPrimary=Color(0xff1a1a1a),primaryContainer=Color(0xff343434),onPrimaryContainer=Color(0xfff0f0f0),background=Color.Black,surface=Color.Black,surfaceContainer=Color(0xff171717),surfaceContainerLow=Color(0xff101010),surfaceContainerHigh=Color(0xff242424))
         base
     }
     val systemMotion = remember { android.provider.Settings.Global.getFloat(context.contentResolver, android.provider.Settings.Global.ANIMATOR_DURATION_SCALE, 1f) != 0f }
     MaterialExpressiveTheme(colorScheme = colors, motionScheme = if (state.motion && systemMotion) MotionScheme.expressive() else NoMotionScheme) {
-        StudioContent(model, state, activity, dark, state.motion && systemMotion)
+        Surface(Modifier.fillMaxSize(), color = colors.surface, contentColor = colors.onSurface) {
+            StudioContent(model, state, activity, dark, state.motion && systemMotion)
+        }
     }
 }
 
@@ -158,7 +160,6 @@ private object NoMotionScheme : MotionScheme {
     }
     var exporting by remember { mutableStateOf(false) }
     var sharing by remember { mutableStateOf(false) }
-    var zoomEditing by remember { mutableStateOf(false) }
     var menu by remember { mutableStateOf(false) }
     var renaming by remember {mutableStateOf(false)}
     var contentsShown by remember {mutableStateOf(false)}
@@ -232,7 +233,7 @@ private object NoMotionScheme : MotionScheme {
                 web?.evaluateJavascript("document.querySelector('.android-document')?.style.setProperty('gap','${hingeGap}px')", null)
             }
         }
-        LaunchedEffect(readerReady, state.zoom) {
+        LaunchedEffect(readerReady, state.zoomCommand) {
             if (readerReady) web?.evaluateJavascript("window.supermdSetZoom?.(${state.zoom})", null)
         }
         val headings by model.headings.collectAsStateWithLifecycle()
@@ -261,11 +262,19 @@ private object NoMotionScheme : MotionScheme {
                     HorizontalDivider(Modifier.padding(vertical=8.dp))
                     if(recent.isNotEmpty()) {
                         Row(verticalAlignment=Alignment.CenterVertically){Text("Recent notes",Modifier.weight(1f),style=MaterialTheme.typography.titleSmall);TextButton(onClick=model::clearRecent){Text("Clear")}}
-                        LazyColumn(Modifier.heightIn(max=180.dp)){items(recent.take(12),key={it.uri}){note->ListItem(headlineContent={Text(note.name,maxLines=1,overflow=TextOverflow.Ellipsis)},modifier=Modifier.clickable{model.open(android.net.Uri.parse(note.uri),note.relative);scope.launch{drawer.close()}})}}
+                        LazyColumn(Modifier.heightIn(max=200.dp),verticalArrangement=Arrangement.spacedBy(6.dp),contentPadding=PaddingValues(bottom=12.dp)) {
+                            items(recent.take(12),key={it.uri}) { note ->
+                                val selected=state.active.uri==note.uri
+                                Surface(onClick={model.open(android.net.Uri.parse(note.uri),note.relative);scope.launch{drawer.close()}},shape=RoundedCornerShape(16.dp),color=if(selected)palette.secondaryContainer else palette.surfaceContainerLow,contentColor=if(selected)palette.onSecondaryContainer else palette.onSurface) {
+                                    Row(Modifier.fillMaxWidth().padding(horizontal=14.dp,vertical=14.dp),verticalAlignment=Alignment.CenterVertically,horizontalArrangement=Arrangement.spacedBy(12.dp)) {
+                                        Icon(painterResource(R.drawable.symbol_file),null,Modifier.size(24.dp))
+                                        Text(note.name,Modifier.weight(1f),maxLines=2,overflow=TextOverflow.Ellipsis,style=MaterialTheme.typography.bodyMedium)
+                                        if(selected)Icon(Icons.Rounded.Check,"Current note",Modifier.size(20.dp))
+                                    }
+                                }
+                            }
+                        }
                     }
-                    HorizontalDivider(Modifier.padding(vertical=8.dp))
-                    OutlinedButton(onClick=activity::newWindow,modifier=Modifier.fillMaxWidth()){Icon(painterResource(R.drawable.symbol_open_window),null);Text("New window",Modifier.padding(start=8.dp))}
-                    FilledTonalButton(onClick = { model.newNote(); scope.launch { drawer.close() } }, modifier = Modifier.fillMaxWidth().padding(bottom = 16.dp)) { Icon(Icons.Rounded.Add, null); Text("New note", Modifier.padding(start = 8.dp)) }
                 }
             }
         }) {
@@ -277,15 +286,11 @@ private object NoMotionScheme : MotionScheme {
                             IconButton(onClick = { sharing = false; exporting = true }, enabled = readerReady && !state.busy) { Icon(painterResource(R.drawable.symbol_export), "Export") }
                             StudyIcon("Fullscreen study", R.drawable.symbol_fullscreen) { model.fullscreen(true) }
                             Box { IconButton(onClick = { menu = true }) { Icon(Icons.Rounded.MoreVert, "More actions") }; DropdownMenu(expanded = menu, onDismissRequest = { menu = false }) {
-                                DropdownMenuItem(text = { Text("Open note") }, onClick = { menu = false; open.launch(arrayOf("text/*", "application/octet-stream", "application/vnd.supermd.smd", "application/vnd.supermd.fmd")) }, leadingIcon = { Icon(painterResource(R.drawable.symbol_file), null) })
-                                DropdownMenuItem(text = { Text("New tab") }, onClick = { menu = false; model.newNote() }, leadingIcon = { Icon(painterResource(R.drawable.symbol_add), null) })
                                 DropdownMenuItem(text = { Text("New window") }, onClick = { menu = false; activity.newWindow() }, leadingIcon = { Icon(painterResource(R.drawable.symbol_open_window), null) })
                                 DropdownMenuItem(text = { Text("Share note") }, enabled = readerReady && !state.busy, onClick = { menu = false; sharing = true; exporting = true }, leadingIcon = { Icon(painterResource(R.drawable.symbol_share), null) })
-                                DropdownMenuItem(text = { Text("Reopen closed tab") }, onClick = { menu = false; model.reopen() })
                                 DropdownMenuItem(text = { Text("Save as Markdown") }, onClick = { menu = false; save.launch(state.active.name.substringBeforeLast('.') + ".md") })
                                 DropdownMenuItem(text = { Text("Insert image or link") }, onClick = { menu = false; web?.evaluateJavascript("window.supermdMedia?.()", null) }, leadingIcon = { Icon(painterResource(R.drawable.symbol_image), null) })
                                 DropdownMenuItem(text = { Text("Fix LaTeX") }, onClick = { menu = false; web?.evaluateJavascript("window.supermdRepairMath?.()", null) }, leadingIcon = { Icon(painterResource(R.drawable.symbol_bug), null) })
-                                DropdownMenuItem(text = { Text("Zoom · ${state.zoom.toInt()}%") }, onClick = { menu = false; zoomEditing = true }, leadingIcon = { Icon(Icons.Rounded.ZoomIn, null) })
                                 DropdownMenuItem(text = { Text("Find in note") }, onClick = { menu = false; web?.evaluateJavascript("window.supermdFind?.()", null) }, leadingIcon = { Icon(painterResource(R.drawable.symbol_search), null) })
                                 DropdownMenuItem(text = {Text("Rename note")},onClick = {menu=false;renaming=true})
                                 DropdownMenuItem(text = { Text("Settings") }, onClick = { menu = false; settings = true }, leadingIcon = { Icon(painterResource(R.drawable.symbol_settings), null) })
@@ -316,15 +321,25 @@ private object NoMotionScheme : MotionScheme {
                             setBackgroundColor(AndroidColor.TRANSPARENT)
                             configureReader(this, model, scope) { readerReady = true }
                             var touchY=0f
+                            var multiTouch=false
+                            var chromeIntent:Boolean?=null
                             setOnTouchListener {_,event->
                                 wakeChrome()
                                 if(event.actionMasked==android.view.MotionEvent.ACTION_DOWN) {
                                     touchY=event.rawY
+                                    multiTouch=false
+                                    chromeIntent=null
                                     if(event.y < 48 * density.density) readingChromeVisible=true
                                 }
-                                if(event.actionMasked==android.view.MotionEvent.ACTION_MOVE && event.pointerCount==1 && model.state.value.mode in listOf("live","reader") && !model.state.value.readerOverlay) {
+                                if(event.actionMasked==android.view.MotionEvent.ACTION_POINTER_DOWN) {multiTouch=true;chromeIntent=null}
+                                if(event.actionMasked==android.view.MotionEvent.ACTION_MOVE && !multiTouch && event.pointerCount==1 && model.state.value.mode in listOf("live","reader") && !model.state.value.readerOverlay) {
                                     val travel=event.rawY-touchY
-                                    if(kotlin.math.abs(travel)>36*density.density){readingChromeVisible=travel>0;touchY=event.rawY}
+                                    if(kotlin.math.abs(travel)>36*density.density){chromeIntent=travel>0;touchY=event.rawY}
+                                }
+                                // Never resize the viewport under an active
+                                // gesture, selection handle or live editor.
+                                if(event.actionMasked==android.view.MotionEvent.ACTION_UP && !multiTouch) {
+                                    chromeIntent?.let { show -> evaluateJavascript("!!document.querySelector('.live-active-block textarea:focus')") { editing -> if(editing!="true")readingChromeVisible=show } }
                                 }
                                 false
                             }
@@ -359,7 +374,7 @@ private object NoMotionScheme : MotionScheme {
                         Surface(shape=RoundedCornerShape(24.dp),color=palette.surfaceContainerHigh,modifier=Modifier.align(Alignment.TopEnd).safeDrawingPadding().padding(8.dp)) {IconButton(onClick={model.fullscreen(false)}){Icon(painterResource(R.drawable.symbol_fullscreen_exit),"Exit fullscreen")}}
                     }
                     if(!state.fullscreen && !readingChromeVisible && !state.readerOverlay && chromeAwake) {
-                        Surface(shape=RoundedCornerShape(24.dp),color=palette.surfaceContainerHigh,modifier=Modifier.align(Alignment.TopStart).padding(8.dp)) {IconButton(onClick={readingChromeVisible=true}){Icon(Icons.Rounded.ExpandMore,"Show reading controls")}}
+                        Surface(shape=RoundedCornerShape(24.dp),color=palette.surfaceContainerHigh,modifier=Modifier.align(Alignment.TopStart).padding(8.dp)) {IconButton(onClick={contentsShown=true;wakeChrome()}){Icon(painterResource(R.drawable.symbol_contents),"Show contents")}}
                         Surface(shape=RoundedCornerShape(24.dp),color=palette.surfaceContainerHigh,modifier=Modifier.align(Alignment.TopEnd).padding(8.dp)) {StudyIcon("Fullscreen study",R.drawable.symbol_fullscreen){model.fullscreen(true)}}
                     }
                     SnackbarHost(snackbar, Modifier.align(Alignment.BottomCenter).safeDrawingPadding())
@@ -386,7 +401,6 @@ private object NoMotionScheme : MotionScheme {
             if (model.prepareShare(format)) when (format) { "pdf" -> web?.evaluateJavascript("window.supermdExport?.(${state.pdf})", null) ?: model.fail("The reader is not ready"); "smd" -> web?.evaluateJavascript("window.supermdPortable?.(false)", null) ?: model.fail("The reader is not ready"); "md" -> web?.evaluateJavascript("window.supermdExportMarkdown?.()", null) ?: model.fail("The reader is not ready") }
         } else if (format == "smd") portable.launch(state.active.name.substringBeforeLast('.') + ".smd") else pdf.launch(state.active.name.substringBeforeLast('.') + ".pdf")
     } }
-    if (zoomEditing) ZoomDialog(state.zoom, { zoomEditing = false }) { model.zoom(it); zoomEditing = false }
     state.error?.let { AlertDialog(onDismissRequest = model::dismissError, title = { Text("Couldn't finish") }, text = { Text(it, Modifier.heightIn(max = 360.dp).verticalScroll(rememberScrollState())) }, confirmButton = { TextButton(onClick = model::dismissError) { Text("OK") } }) }
     if (!state.welcomed) WelcomeSetup(state, model) { model.welcomeDone(); open.launch(arrayOf("text/*", "application/octet-stream", "application/vnd.supermd.smd", "application/vnd.supermd.fmd")) }
 }
@@ -433,7 +447,7 @@ private class NoteDestination(mime: String, private val preferred: () -> String)
                 Text("System follows your wallpaper colors. Fullscreen can have a different theme.", style = MaterialTheme.typography.bodyMedium, color = MaterialTheme.colorScheme.onSurfaceVariant)
                 Choice("Workspace theme", state.theme, listOf("system" to "System", "light" to "Light", "dark" to "Dark", "black" to "Pure black")) { model.appearance(theme = it) }
                 Choice("Fullscreen theme", state.fullscreenTheme, listOf("system" to "System", "light" to "Light", "dark" to "Dark", "black" to "Pure black")) { model.appearance(fullTheme = it) }
-                Choice("Theme color",state.accent,listOf("system" to "System","blue" to "Blue","green" to "Green","violet" to "Violet","rose" to "Rose","amber" to "Amber")){model.appearance(accent=it)}
+                Choice("Theme color",state.accent,listOf("system" to "System","blue" to "Blue","violet" to "Violet","rose" to "Rose","amber" to "Amber")){model.appearance(accent=it)}
                 Row(verticalAlignment = Alignment.CenterVertically) { Column(Modifier.weight(1f)) { Text("Expressive motion", style = MaterialTheme.typography.titleMedium); Text("Spring transitions and responsive controls", style = MaterialTheme.typography.bodySmall) }; Switch(checked = state.motion, onCheckedChange = { model.appearance(motion = it) }) }
             }
             SettingsSection("Reading") {
@@ -556,14 +570,4 @@ private class NoteDestination(mime: String, private val preferred: () -> String)
             }
         }
     }
-}
-
-@Composable private fun ZoomDialog(value: Float, dismiss: () -> Unit, apply: (Float) -> Unit) {
-    var draft by rememberSaveable { mutableStateOf(value.toInt().toString()) }
-    val parsed = draft.trim().removeSuffix("%").toFloatOrNull()
-    val valid = parsed != null && parsed.isFinite() && parsed in 60f..240f
-    AlertDialog(onDismissRequest = dismiss, title = { Text("Content zoom") }, text = { Column {
-        OutlinedTextField(value = draft, onValueChange = { draft = it }, label = { Text("Zoom percentage") }, suffix = { Text("%") }, singleLine = true, keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Decimal), isError = !valid, supportingText = { Text("60% to 240%. Toolbars stay the same size.") })
-        TextButton(onClick = { draft = "100" }) { Text("Reset to 100%") }
-    } }, confirmButton = { TextButton(onClick = { parsed?.let(apply) }, enabled = valid) { Text("Apply") } }, dismissButton = { TextButton(onClick = dismiss) { Text("Cancel") } })
 }

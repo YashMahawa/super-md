@@ -32,7 +32,7 @@ data class Note(val id: String = UUID.randomUUID().toString(), val name: String 
 data class RecentNote(val name: String, val uri: String, val relative: String? = null)
 data class FileEntry(val name: String, val uri: String, val directory: Boolean, val relative: String)
 data class OutlineHeading(val id: String, val title: String, val level: Int, val offset: Int)
-data class StudioState(val accent: String = "system", val widthPercent: Float = 80f, val lineHeight: Float = 1.65f, val autosave: Boolean = true, val customFonts: List<String> = emptyList(), val readerOverlay: Boolean = false, val tabs: List<Note> = listOf(Note(name = "Welcome.md", content = sample, saved = sample)), val closedTabs: List<Note> = emptyList(), val activeId: String = "", val mode: String = "live", val fullscreen: Boolean = false, val normalZoom: Float = 100f, val fullscreenZoom: Float = 100f, val theme: String = "system", val fullscreenTheme: String = "black", val motion: Boolean = true, val font: String = "Manrope", val size: Float = 15f, val folder: String? = null, val files: List<FileEntry> = emptyList(), val busy: Boolean = false, val message: String? = null, val error: String? = null, val welcomed: Boolean = false, val pdf: String = "{\"pageSize\":\"a4\",\"margin\":18,\"fontSize\":10.0,\"lineHeight\":1.45,\"fontFamily\":\"Manrope\",\"pageNumbers\":true}") {
+data class StudioState(val accent: String = "system", val widthPercent: Float = 80f, val lineHeight: Float = 1.65f, val autosave: Boolean = true, val customFonts: List<String> = emptyList(), val readerOverlay: Boolean = false, val zoomCommand: Long = 0, val tabs: List<Note> = listOf(Note(name = "Welcome.md", content = sample, saved = sample)), val closedTabs: List<Note> = emptyList(), val activeId: String = "", val mode: String = "live", val fullscreen: Boolean = false, val normalZoom: Float = 100f, val fullscreenZoom: Float = 100f, val theme: String = "system", val fullscreenTheme: String = "black", val motion: Boolean = true, val font: String = "Manrope", val size: Float = 15f, val folder: String? = null, val files: List<FileEntry> = emptyList(), val busy: Boolean = false, val message: String? = null, val error: String? = null, val welcomed: Boolean = false, val pdf: String = "{\"pageSize\":\"a4\",\"margin\":18,\"fontSize\":10.0,\"lineHeight\":1.45,\"fontFamily\":\"Manrope\",\"pageNumbers\":true}") {
     val active get() = tabs.find { it.id == activeId } ?: tabs.first()
     val zoom get() = if (fullscreen) fullscreenZoom else normalZoom
 }
@@ -254,7 +254,10 @@ class StudioViewModel(app: Application, val workspaceKey: String = "main") : And
     fun reopen() { val note = mutable.value.closedTabs.firstOrNull() ?: return; change { it.copy(tabs = it.tabs + note, closedTabs = it.closedTabs.drop(1), activeId = note.id) } }
     fun mode(value: String) = change { it.copy(mode = value) }
     fun fullscreen(value: Boolean) = change { it.copy(fullscreen = value) }
-    fun zoom(value: Float) = change { s -> if (s.fullscreen) s.copy(fullscreenZoom = value.coerceIn(60f, 240f)) else s.copy(normalZoom = value.coerceIn(60f, 240f)) }
+    // Reader gestures are acknowledgements, not a second command back to WebView.
+    // Only an explicit native control/shortcut advances the command generation.
+    fun zoom(value: Float) = change { s -> if (s.fullscreen) s.copy(fullscreenZoom = value.coerceIn(40f, 300f), zoomCommand = s.zoomCommand + 1) else s.copy(normalZoom = value.coerceIn(40f, 300f), zoomCommand = s.zoomCommand + 1) }
+    fun readerZoom(value: Float, fullscreen: Boolean) = change { s -> if (fullscreen) s.copy(fullscreenZoom = value.coerceIn(40f, 300f)) else s.copy(normalZoom = value.coerceIn(40f, 300f)) }
     fun appearance(accent: String? = null, theme: String? = null, fullTheme: String? = null, motion: Boolean? = null, font: String? = null, size: Float? = null) {
         if(size!=null && (!size.isFinite() || size !in 6f..32f))return
         change { it.copy(accent = accent ?: it.accent, theme = theme ?: it.theme, fullscreenTheme = fullTheme ?: it.fullscreenTheme, motion = motion ?: it.motion, font = font ?: it.font, size = size ?: it.size) }

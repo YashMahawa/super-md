@@ -24,7 +24,7 @@ import MathRepairPanel from "./components/MathRepairPanel";
 import { captureScrollAnchor } from "./scrollAnchor";
 import ReadingSearch from "./components/ReadingSearch";
 import type { Point } from "./focalZoom";
-import { applyDocumentZoom,invalidateDocumentZoom,settleDocumentZoom } from "./documentZoom";
+import { applyDocumentZoom,invalidateDocumentZoom,settleDocumentZoom,refreshDocumentExtent } from "./documentZoom";
 import { documentOutline, navigateToHeading } from "./documentNavigation";
 import {recordHistory,replayHistory,historySize,validHistory,type NoteHistory} from './noteHistory';
 import {cachedEditorHistory} from './components/Editor';
@@ -67,7 +67,7 @@ function Reader() {
         const root=document.querySelector<HTMLElement>(".android-reading");
         modeOffset.current=old.mode==="editor"?(editorReadingOffset(old.id)??0):root?readingOffset(root):0;
       }
-      if(old&&Object.keys(next).every(key=>key==="viewState"||key==="colors"?key==="viewState"?!next.viewState:JSON.stringify(old.colors)===JSON.stringify(next.colors):(old as any)[key]===(next as any)[key]))return;
+      if(old&&Object.keys(next).every(key=>key==="zoom"&&old.fullscreen===next.fullscreen?true:key==="viewState"||key==="colors"?key==="viewState"?!next.viewState:JSON.stringify(old.colors)===JSON.stringify(next.colors):(old as any)[key]===(next as any)[key]))return;
       if (old && old.id !== next.id) {
         noteViews.current.set(old.id, {top: document.querySelector<HTMLElement>(".android-reading")?.scrollTop ?? 0});
         if (noteViews.current.size > 40) noteViews.current.delete(noteViews.current.keys().next().value!);
@@ -80,7 +80,12 @@ function Reader() {
         trimHistories(next.id);
         noteViews.current.set(next.id, {top:next.viewState.top});
       }
-      const loaded={...next,viewState:undefined};
+      // Native snapshots may have been queued before the latest pinch frame.
+      // Within one workspace mode the reader owns its gesture scale; explicit
+      // native zoom controls use supermdSetZoom instead of echoing a snapshot.
+      const sameViewport=old && old.fullscreen===next.fullscreen;
+      const loaded={...next,zoom:sameViewport?zoomReference.current:clampPreviewZoom(next.zoom),viewState:undefined};
+      if(old && !sameViewport){window.clearTimeout(zoomTimer.current);cancelAnimationFrame(zoomFrame.current);zoomFrame.current=0;}
       const load = () => { reference.current=loaded;setState(loaded); zoomReference.current = loaded.zoom; };
       if (old?.id === next.id && old.mode === next.mode) anchored(load); else load();
     };
@@ -93,13 +98,15 @@ function Reader() {
       else {const cached=cachedEditorHistory(current.id,direction,current.content);if(cached!==undefined)update(cached);}
       replaying.current=false;
     };
-    window.supermdZoomBy = (factor,focus=cursor.current) => { if (document.querySelector(".image-viewer")) { window.dispatchEvent(new CustomEvent("supermd-image-zoom",{detail:{factor,point:focus}})); return; } zoomReference.current=clampPreviewZoom(zoomReference.current*factor);zoomFocus.current=focus;if(!zoomFrame.current)zoomFrame.current=requestAnimationFrame(()=>{zoomFrame.current=0;applyZoomStyle(zoomFocus.current);settleSelection();});window.clearTimeout(zoomTimer.current);zoomTimer.current=window.setTimeout(()=>void invoke("zoom_changed",{zoom:zoomReference.current}),160); };
+    window.supermdZoomBy = (factor,focus=cursor.current) => { if (document.querySelector(".image-viewer")) { window.dispatchEvent(new CustomEvent("supermd-image-zoom",{detail:{factor,point:focus}})); return; } zoomReference.current=clampPreviewZoom(zoomReference.current*factor);zoomFocus.current=focus;if(!zoomFrame.current)zoomFrame.current=requestAnimationFrame(()=>{zoomFrame.current=0;applyZoomStyle(zoomFocus.current);settleSelection();});window.clearTimeout(zoomTimer.current);const fullscreen=reference.current?.fullscreen;zoomTimer.current=window.setTimeout(()=>void invoke("zoom_changed",{zoom:zoomReference.current,fullscreen}),160); };
     window.supermdSetZoom=value=>{const next=clampPreviewZoom(value);if(Math.abs(next-zoomReference.current)<.01)return;zoomReference.current=next;applyZoomStyle();settleSelection();};
     window.supermdHeading=(id,offset)=>{if(reference.current?.mode==="editor"){window.dispatchEvent(new CustomEvent("supermd-goto-offset",{detail:offset??0}));return;}const root=document.querySelector(".android-reading");if(root)navigateToHeading(root,id);};
     window.supermdResetZoom = () => { if (document.querySelector(".image-viewer")) { window.dispatchEvent(new Event("supermd-image-reset")); return; } window.supermdZoomBy?.(100/zoomReference.current); };
     window.supermdRepairMath = () => setRepairing(true);
     window.supermdNativeWheel=(dx,dy,point,held)=>{
       const target=document.elementFromPoint(point.x,point.y),canvas=target?.closest(".interactive-chart svg,.image-viewer-canvas");
+      const editor=target?.closest<HTMLTextAreaElement>('textarea');
+      if(editor){editor.scrollBy({left:dx,top:dy,behavior:"instant"});return;}
       if(held){if(canvas?.matches("svg"))canvas.dispatchEvent(new WheelEvent("wheel",{bubbles:true,cancelable:true,ctrlKey:true,deltaY:dy,clientX:point.x,clientY:point.y}));else window.supermdZoomBy?.(Math.exp(-dy*.002),point);return;}
       if(canvas){canvas.dispatchEvent(new CustomEvent("supermd-canvas-pan",{detail:{dx,dy},cancelable:true}));return;}
       const scroller=target?.closest<HTMLElement>(".android-reading,.cm-scroller,.image-viewer-canvas,.math-repair-list,.media-dialog") || document.querySelector<HTMLElement>('.android-reading');
@@ -146,10 +153,10 @@ function Reader() {
     Object.entries(state.colors).forEach(([key, value]) => root.style.setProperty(`--${key}`, value));
     document.querySelectorAll<HTMLElement>('.android-reading').forEach(invalidateDocumentZoom);applyZoomStyle();settleSelection();
   }, [state]);
-  useEffect(()=>{const root=document.querySelector<HTMLElement>(".android-reading");if(!root || typeof ResizeObserver==="undefined")return;let frame=0;const page=root.querySelector<HTMLElement>(".document-page");const observer=new ResizeObserver(()=>{invalidateDocumentZoom(root);if(!frame)frame=requestAnimationFrame(()=>{frame=0;
+  useEffect(()=>{const root=document.querySelector<HTMLElement>(".android-reading");if(!root || typeof ResizeObserver==="undefined")return;let frame=0;const page=root.querySelector<HTMLElement>(".document-page");const observer=new ResizeObserver(()=>{if(!frame)frame=requestAnimationFrame(()=>{frame=0;
     // A scheduled gesture owns its focal point. A resize callback must not
     // consume the pending scale at the default center before that frame runs.
-    if(Math.abs(Number(page?.dataset.scale)*100-zoomReference.current)<.01){applyZoomStyle();settleSelection();}
+    if(Math.abs(Number(page?.dataset.scale)*100-zoomReference.current)<.01 && !refreshDocumentExtent(root)){invalidateDocumentZoom(root);applyZoomStyle();settleSelection();}
   });});observer.observe(root);if(page)observer.observe(page);return()=>{observer.disconnect();cancelAnimationFrame(frame);};},[state?.id,state?.mode]);
   useEffect(()=>{
     if(!state || ["sans","serif","mono","noto","roboto","system","Manrope","Roboto","Noto Sans","Noto Serif","JetBrains Mono"].includes(state.font) || !window.SuperMD || typeof FontFace==="undefined")return;
@@ -206,7 +213,7 @@ function Reader() {
     document.addEventListener("pointermove",track);document.addEventListener("pointerdown",down);document.addEventListener("pointerup",up);window.addEventListener("blur",up);
     document.addEventListener("pointermove",pan);document.addEventListener("pointercancel",up);
     const distance = (touches: TouchList) => Math.hypot(touches[0].clientX - touches[1].clientX, touches[0].clientY - touches[1].clientY);
-    const start = (event: TouchEvent) => { if (event.touches.length === 2 && !(event.target as Element).closest("input,[data-independent-zoom]")) { startDistance = distance(event.touches); startZoom = zoomReference.current; pinching = true;previousFocus={x:(event.touches[0].clientX+event.touches[1].clientX)/2,y:(event.touches[0].clientY+event.touches[1].clientY)/2}; } };
+    const start = (event: TouchEvent) => { if (event.touches.length === 2 && !(event.target as Element).closest("input,textarea,[data-independent-zoom]")) { window.clearTimeout(settleTimer.current);startDistance = distance(event.touches); startZoom = zoomReference.current; pinching = true;previousFocus={x:(event.touches[0].clientX+event.touches[1].clientX)/2,y:(event.touches[0].clientY+event.touches[1].clientY)/2}; } };
     const move = (event: TouchEvent) => { if (event.touches.length === 2 && pinching && startDistance > 0) {
       event.preventDefault(); zoomReference.current = clampPreviewZoom(startZoom * distance(event.touches) / startDistance);
       focus={x:(event.touches[0].clientX+event.touches[1].clientX)/2,y:(event.touches[0].clientY+event.touches[1].clientY)/2};
@@ -214,9 +221,9 @@ function Reader() {
       // crossing the native bridge are deliberately excluded from pinch frames.
       if (!frame) frame = requestAnimationFrame(() => { frame = 0; applyZoomStyle(focus,previousFocus);previousFocus=focus; });
     } };
-    const end = (event: TouchEvent) => { if (pinching && event.touches.length < 2) { pinching = false;settleSelection(); void invoke("zoom_changed", { zoom: zoomReference.current }); } };
+    const end = (event: TouchEvent) => { if (pinching && event.touches.length < 2) { pinching = false;if(frame){cancelAnimationFrame(frame);frame=0;applyZoomStyle(focus,previousFocus);previousFocus=focus;}settleSelection(); void invoke("zoom_changed", { zoom: zoomReference.current,fullscreen:reference.current?.fullscreen }); } };
     document.addEventListener("touchstart", start, { passive: true }); document.addEventListener("touchmove", move, { passive: false }); document.addEventListener("touchend", end); document.addEventListener("touchcancel", end);
-    const wheel = (event:WheelEvent) => { if ((event.ctrlKey || event.metaKey || mouseHeld || event.buttons&1) && !(event.target as Element).closest("[data-independent-zoom]")) { event.preventDefault(); window.supermdZoomBy?.(Math.exp(-event.deltaY*.002),{x:event.clientX,y:event.clientY}); } };
+    const wheel = (event:WheelEvent) => { if ((event.ctrlKey || event.metaKey || mouseHeld || event.buttons&1) && !(event.target as Element).closest("textarea,input,[data-independent-zoom]")) { event.preventDefault(); window.supermdZoomBy?.(Math.exp(-event.deltaY*.002),{x:event.clientX,y:event.clientY}); } };
     document.addEventListener("wheel",wheel,{passive:false});
     return () => { document.removeEventListener("pointermove",pan);document.removeEventListener("pointercancel",up);document.removeEventListener("pointermove",track);document.removeEventListener("pointerdown",down);document.removeEventListener("pointerup",up);window.removeEventListener("blur",up);cancelAnimationFrame(frame); document.removeEventListener("wheel",wheel); document.removeEventListener("touchstart", start); document.removeEventListener("touchmove", move); document.removeEventListener("touchend", end); document.removeEventListener("touchcancel", end); };
   }, []);
