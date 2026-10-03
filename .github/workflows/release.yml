@@ -68,7 +68,8 @@ jobs:
           const response = api(`${base}/jobs?per_page=100`);
           if (response.total_count !== response.jobs.length) throw Error('Incomplete build evidence');
           const required = [
-            'android',
+            // Android is always re-verified below, including recovery runs.
+            // Only reuse desktop installers; never reuse an APK verification.
             'desktop (ubuntu-22.04, linux)',
             'desktop (windows-latest, windows)',
             'desktop (macos-15, macos-arm64)',
@@ -203,6 +204,10 @@ jobs:
         with:
           log-accepted-android-sdk-licenses: false
       - run: sdkmanager "build-tools;36.0.0"
+      - name: Install APK verifier dependency (including existing stable tags)
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ripgrep
       - name: Select safe signing route
         id: signing
         env:

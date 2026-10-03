@@ -11,7 +11,7 @@ actual_certificate="$(printf '%s\n' "$apk_signatures" | sed -n 's/^Signer #1 cer
 for signature_range in 'v1:23:23' 'v2:26:27' 'v3:28:36'; do
   IFS=: read -r scheme minimum maximum <<< "$signature_range"
   verification="$("$sdk_tools/apksigner" verify --verbose --min-sdk-version "$minimum" --max-sdk-version "$maximum" "$apk_path")"
-  if ! printf '%s\n' "$verification" | rg -q "Verified using $scheme scheme .*: true"; then echo "Missing $scheme signature" >&2; exit 1; fi
+  if ! printf '%s\n' "$verification" | grep -Eq "Verified using $scheme scheme .*: true"; then echo "Missing $scheme signature" >&2; exit 1; fi
 done
 if [ "${actual_certificate,,}" != "${expected_certificate,,}" ]; then echo 'APK upgrade certificate mismatch' >&2; exit 1; fi
 apk_badging="$("$sdk_tools/aapt" dump badging "$apk_path")"
