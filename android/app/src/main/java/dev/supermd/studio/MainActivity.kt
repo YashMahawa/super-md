@@ -143,7 +143,19 @@ private object NoMotionScheme : MotionScheme {
     val scope = rememberCoroutineScope()
     val drawer = rememberDrawerState(DrawerValue.Closed)
     val snackbar = remember { SnackbarHostState() }
-    var settings by remember { mutableStateOf(false) }
+    var settings by remember { mutableStateOf(activity.intent.getBooleanExtra("showUpdates",false)) }
+    val update by model.updates.state.collectAsStateWithLifecycle()
+    val notificationPermission=rememberLauncherForActivityResult(ActivityResultContracts.RequestPermission()){granted->if(granted)model.updates.notifyAvailable()}
+    LaunchedEffect(update.version) {
+        if(update.version!=null) {
+            scope.launch{snackbar.showSnackbar("Super MD ${update.version} is available. See Settings → About & updates.")}
+            val permissionPrefs=activity.getSharedPreferences("studio-updates",0)
+            if(Build.VERSION.SDK_INT>=33 && !permissionPrefs.getBoolean("notificationAsked",false)) {
+                permissionPrefs.edit().putBoolean("notificationAsked",true).apply()
+                notificationPermission.launch(android.Manifest.permission.POST_NOTIFICATIONS)
+            }
+        }
+    }
     var exporting by remember { mutableStateOf(false) }
     var sharing by remember { mutableStateOf(false) }
     var zoomEditing by remember { mutableStateOf(false) }
@@ -152,6 +164,8 @@ private object NoMotionScheme : MotionScheme {
     var contentsShown by remember {mutableStateOf(false)}
     var sidebarSection by rememberSaveable {mutableStateOf("folder")}
     var chromeAwake by remember {mutableStateOf(true)}
+    var readingChromeVisible by remember {mutableStateOf(true)}
+    LaunchedEffect(state.active.id, state.mode, settings) { readingChromeVisible = true }
     val hideChromeJob=remember {arrayOfNulls<kotlinx.coroutines.Job>(1)}
     fun wakeChrome(){chromeAwake=true;hideChromeJob[0]?.cancel();hideChromeJob[0]=scope.launch{delay(2200);chromeAwake=false}}
     LaunchedEffect(state.fullscreen){wakeChrome()}
@@ -212,7 +226,7 @@ private object NoMotionScheme : MotionScheme {
             if (readerReady) {
                 val note = state.active
                 val payload = JSONObject().put("id", note.id).put("content", note.content).put("path", note.uri ?: note.id).put("mode", actualMode).put("dark", dark).put("fullscreen", state.fullscreen).put("font", state.font).put("size", state.size).put("widthPercent",state.widthPercent).put("lineHeight",state.lineHeight).put("colors", tokens).put("zoom", state.zoom).put("motion", motion)
-                web?.evaluateJavascript("window.supermdLoad?.($payload)", null)
+                web?.evaluateJavascript("document.documentElement.dataset.platform='android';window.supermdLoad?.($payload)", null)
                 web?.evaluateJavascript("document.documentElement.style.setProperty('--cutout-top','${if (state.fullscreen) cutoutTop else 0f}px');document.documentElement.style.setProperty('--cutout-left','${if (state.fullscreen) cutoutLeft else 0f}px');document.documentElement.style.setProperty('--cutout-right','${if (state.fullscreen) cutoutRight else 0f}px')", null)
                 val hingeGap = if (hinge != null && actualMode == "split") hinge!!.bounds.width() / density.density else 0f
                 web?.evaluateJavascript("document.querySelector('.android-document')?.style.setProperty('gap','${hingeGap}px')", null)
@@ -256,11 +270,12 @@ private object NoMotionScheme : MotionScheme {
             }
         }) {
             Column(Modifier.fillMaxSize().imePadding()) {
-                AnimatedVisibility(!state.fullscreen && !imageOverlay, enter = expandVertically(animationSpec = if (motion) spring(dampingRatio = .85f, stiffness = 500f) else tween(0)), exit = shrinkVertically(animationSpec = tween(if (motion) 180 else 0))) {
+                AnimatedVisibility(!state.fullscreen && !imageOverlay && readingChromeVisible, enter = expandVertically(animationSpec = if (motion) spring(dampingRatio = .85f, stiffness = 500f) else tween(0)), exit = shrinkVertically(animationSpec = tween(if (motion) 180 else 0))) {
                     Column(Modifier.background(palette.surfaceContainerLow)) {
                         TopAppBar(colors = TopAppBarDefaults.topAppBarColors(containerColor = palette.surfaceContainerLow), title = { Column { Text(state.active.name, maxLines = 1, overflow = TextOverflow.Ellipsis, style = MaterialTheme.typography.titleMedium); Text(if (state.active.dirty) "Draft recovered automatically" else if (state.active.uri != null) "Saved" else "Local draft", style = MaterialTheme.typography.labelSmall, color = palette.onSurfaceVariant) } }, navigationIcon = { IconButton(onClick = { scope.launch { drawer.open() }; state.folder?.let { if (state.files.isEmpty()) model.listFolder(android.net.Uri.parse(it), "") } }) { Icon(Icons.Rounded.Menu, "Open files") } }, actions = {
                             IconButton(onClick = saveAction) { Icon(painterResource(R.drawable.symbol_save), "Save note") }
                             IconButton(onClick = { sharing = false; exporting = true }, enabled = readerReady && !state.busy) { Icon(painterResource(R.drawable.symbol_export), "Export") }
+                            StudyIcon("Fullscreen study", R.drawable.symbol_fullscreen) { model.fullscreen(true) }
                             Box { IconButton(onClick = { menu = true }) { Icon(Icons.Rounded.MoreVert, "More actions") }; DropdownMenu(expanded = menu, onDismissRequest = { menu = false }) {
                                 DropdownMenuItem(text = { Text("Open note") }, onClick = { menu = false; open.launch(arrayOf("text/*", "application/octet-stream", "application/vnd.supermd.smd", "application/vnd.supermd.fmd")) }, leadingIcon = { Icon(painterResource(R.drawable.symbol_file), null) })
                                 DropdownMenuItem(text = { Text("New tab") }, onClick = { menu = false; model.newNote() }, leadingIcon = { Icon(painterResource(R.drawable.symbol_add), null) })
@@ -272,10 +287,7 @@ private object NoMotionScheme : MotionScheme {
                                 DropdownMenuItem(text = { Text("Fix LaTeX") }, onClick = { menu = false; web?.evaluateJavascript("window.supermdRepairMath?.()", null) }, leadingIcon = { Icon(painterResource(R.drawable.symbol_bug), null) })
                                 DropdownMenuItem(text = { Text("Zoom · ${state.zoom.toInt()}%") }, onClick = { menu = false; zoomEditing = true }, leadingIcon = { Icon(Icons.Rounded.ZoomIn, null) })
                                 DropdownMenuItem(text = { Text("Find in note") }, onClick = { menu = false; web?.evaluateJavascript("window.supermdFind?.()", null) }, leadingIcon = { Icon(painterResource(R.drawable.symbol_search), null) })
-                                DropdownMenuItem(text = {Text("Undo (Ctrl+Z)")},leadingIcon = {Icon(Icons.Rounded.Undo,null)},onClick = {menu=false;web?.evaluateJavascript("window.supermdHistory?.('undo')",null)})
-                                DropdownMenuItem(text = {Text("Redo (Ctrl+Y)")},leadingIcon = {Icon(Icons.Rounded.Redo,null)},onClick = {menu=false;web?.evaluateJavascript("window.supermdHistory?.('redo')",null)})
                                 DropdownMenuItem(text = {Text("Rename note")},onClick = {menu=false;renaming=true})
-                                DropdownMenuItem(text = { Text("Fullscreen study") }, onClick = { menu = false; model.fullscreen(true) }, leadingIcon = { Icon(painterResource(R.drawable.symbol_fullscreen), null) })
                                 DropdownMenuItem(text = { Text("Settings") }, onClick = { menu = false; settings = true }, leadingIcon = { Icon(painterResource(R.drawable.symbol_settings), null) })
                             } }
                         })
@@ -303,7 +315,19 @@ private object NoMotionScheme : MotionScheme {
                             setOnKeyListener { _, _, event -> activity.handleShortcut(event) }
                             setBackgroundColor(AndroidColor.TRANSPARENT)
                             configureReader(this, model, scope) { readerReady = true }
-                            setOnTouchListener {_,_->wakeChrome();false}
+                            var touchY=0f
+                            setOnTouchListener {_,event->
+                                wakeChrome()
+                                if(event.actionMasked==android.view.MotionEvent.ACTION_DOWN) {
+                                    touchY=event.rawY
+                                    if(event.y < 48 * density.density) readingChromeVisible=true
+                                }
+                                if(event.actionMasked==android.view.MotionEvent.ACTION_MOVE && event.pointerCount==1 && model.state.value.mode in listOf("live","reader") && !model.state.value.readerOverlay) {
+                                    val travel=event.rawY-touchY
+                                    if(kotlin.math.abs(travel)>36*density.density){readingChromeVisible=travel>0;touchY=event.rawY}
+                                }
+                                false
+                            }
                             setOnGenericMotionListener {_,_->wakeChrome();false}
                             webChromeClient = object : android.webkit.WebChromeClient() {
                                 override fun onShowFileChooser(view: WebView, callback: android.webkit.ValueCallback<Array<android.net.Uri>>, parameters: FileChooserParams): Boolean {
@@ -334,8 +358,12 @@ private object NoMotionScheme : MotionScheme {
                         Surface(shape=RoundedCornerShape(24.dp),color=palette.surfaceContainerHigh,modifier=Modifier.align(Alignment.TopStart).safeDrawingPadding().padding(8.dp)) {IconButton(onClick={contentsShown=true;wakeChrome()}){Icon(painterResource(R.drawable.symbol_contents),"Show contents")}}
                         Surface(shape=RoundedCornerShape(24.dp),color=palette.surfaceContainerHigh,modifier=Modifier.align(Alignment.TopEnd).safeDrawingPadding().padding(8.dp)) {IconButton(onClick={model.fullscreen(false)}){Icon(painterResource(R.drawable.symbol_fullscreen_exit),"Exit fullscreen")}}
                     }
+                    if(!state.fullscreen && !readingChromeVisible && !state.readerOverlay && chromeAwake) {
+                        Surface(shape=RoundedCornerShape(24.dp),color=palette.surfaceContainerHigh,modifier=Modifier.align(Alignment.TopStart).padding(8.dp)) {IconButton(onClick={readingChromeVisible=true}){Icon(Icons.Rounded.ExpandMore,"Show reading controls")}}
+                        Surface(shape=RoundedCornerShape(24.dp),color=palette.surfaceContainerHigh,modifier=Modifier.align(Alignment.TopEnd).padding(8.dp)) {StudyIcon("Fullscreen study",R.drawable.symbol_fullscreen){model.fullscreen(true)}}
+                    }
                     SnackbarHost(snackbar, Modifier.align(Alignment.BottomCenter).safeDrawingPadding())
-                    if (state.busy) Surface(color = palette.surface.copy(alpha = .9f), modifier = Modifier.fillMaxSize()) { Column(Modifier.fillMaxSize(), verticalArrangement = Arrangement.Center, horizontalAlignment = Alignment.CenterHorizontally) { CircularProgressIndicator(); Spacer(Modifier.height(16.dp)); Text("Preparing your document…") } }
+                    if (state.busy || !readerReady) Surface(color = palette.surface.copy(alpha = .96f), modifier = Modifier.fillMaxSize()) { Column(Modifier.fillMaxSize(), verticalArrangement = Arrangement.Center, horizontalAlignment = Alignment.CenterHorizontally) { if(motion) LoadingIndicator() else Icon(Icons.Rounded.Description,null,Modifier.size(48.dp),tint=palette.primary); Spacer(Modifier.height(16.dp)); Text(if(state.busy) "Preparing your document…" else "Opening your workspace…") } }
                 }
             }
         }
@@ -344,7 +372,7 @@ private object NoMotionScheme : MotionScheme {
         BackHandler { settings = false }
         Surface(Modifier.fillMaxSize(), color = palette.surface) { Column(Modifier.fillMaxSize().safeDrawingPadding()) {
             TopAppBar(title = { Text("Settings") }, navigationIcon = { IconButton(onClick = { settings = false }) { Icon(Icons.AutoMirrored.Rounded.ArrowBack, "Back") } })
-            Settings(state, model, noteLocation, {noteFolder.launch(noteLocation.takeIf{it.isNotBlank()}?.let(android.net.Uri::parse))}) {fontPicker.launch(arrayOf("font/ttf","font/otf","application/x-font-ttf","application/vnd.ms-opentype","application/octet-stream"))}
+            Settings(state, model, activity, noteLocation, {noteFolder.launch(noteLocation.takeIf{it.isNotBlank()}?.let(android.net.Uri::parse))}) {fontPicker.launch(arrayOf("font/ttf","font/otf","application/x-font-ttf","application/vnd.ms-opentype","application/octet-stream"))}
         } }
     }
     // Long forms must not strand their primary action below a half-open sheet.
@@ -380,6 +408,11 @@ private object NoMotionScheme : MotionScheme {
         dismissButton = { if (step > 0) TextButton(onClick = { if (step == 2) open() else step-- }) { Text(if (step == 2) "Open a note" else "Back") } })
 }
 
+@Composable private fun StudyIcon(label:String, resource:Int, action:()->Unit) {
+    TooltipBox(positionProvider=TooltipDefaults.rememberTooltipPositionProvider(),tooltip={PlainTooltip{Text(label)}},state=rememberTooltipState()) {
+        IconButton(onClick=action) {Icon(painterResource(resource),label,Modifier.size(24.dp))}
+    }
+}
 private fun hex(color: Color) = "#%06x".format(color.toArgb() and 0xffffff)
 private class NoteDestination(mime: String, private val preferred: () -> String): ActivityResultContracts.CreateDocument(mime) {
     override fun createIntent(context: android.content.Context, input: String): Intent {
@@ -391,7 +424,9 @@ private class NoteDestination(mime: String, private val preferred: () -> String)
     }
 }
 
-@Composable private fun Settings(state: StudioState, model: StudioViewModel, noteLocation: String, chooseNoteLocation: ()->Unit, importFont: ()->Unit) {
+@Composable private fun Settings(state: StudioState, model: StudioViewModel, activity:MainActivity, noteLocation: String, chooseNoteLocation: ()->Unit, importFont: ()->Unit) {
+    val update by model.updates.state.collectAsStateWithLifecycle()
+    val scope=rememberCoroutineScope()
     Column(Modifier.fillMaxWidth().verticalScroll(rememberScrollState()), horizontalAlignment = Alignment.CenterHorizontally) {
         Column(Modifier.widthIn(max = 760.dp).fillMaxWidth().padding(16.dp), verticalArrangement = Arrangement.spacedBy(16.dp)) {
             SettingsSection("Appearance") {
@@ -405,7 +440,7 @@ private class NoteDestination(mime: String, private val preferred: () -> String)
                 FontChoice("Reading font", if(state.font=="sans") "Manrope" else state.font, listOf("Manrope" to "Manrope", "roboto" to "Roboto", "noto" to "Noto Sans", "serif" to "Noto Serif", "mono" to "JetBrains Mono", "system" to "System")+state.customFonts.map {it to it}) { model.appearance(font = it) }
                 FilledTonalButton(onClick=importFont){Text("Import font…")}
                 Text("Text size · ${state.size.toInt()} px", style = MaterialTheme.typography.titleSmall, modifier = Modifier.padding(top = 16.dp))
-                StudySlider(value = state.size, onCommit = { model.appearance(size = it) }, valueRange = 12f..32f)
+                StudySlider(value = state.size, onCommit = { model.appearance(size = it) }, valueRange = 6f..32f)
                 Text("Reading width · ${state.widthPercent.toInt()}%",style=MaterialTheme.typography.titleSmall)
                 StudySlider(value=state.widthPercent,onCommit={model.reading(widthPercent=it)},valueRange=50f..100f)
                 Text("Vertical spacing · ${"%.2f".format(state.lineHeight)}",style=MaterialTheme.typography.titleSmall)
@@ -419,6 +454,17 @@ private class NoteDestination(mime: String, private val preferred: () -> String)
                 Text("NumPy and Matplotlib run locally in a separate worker. Code runs only when you press Run; never automatically on open or export.", style = MaterialTheme.typography.bodyMedium)
                 Text("New window opens an independent workspace. Your device controls split-screen and desktop window placement. Hold and drag a tab to reorder it.", style = MaterialTheme.typography.bodyMedium)
                 Text("The monochrome icon follows your launcher's themed-icon setting.", style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+            }
+            SettingsSection("About & updates") {
+                Text("Super MD ${BuildConfig.VERSION_NAME}",style=MaterialTheme.typography.titleMedium)
+                Text("© Yash Mahawar · MIT License",style=MaterialTheme.typography.bodySmall)
+                Row(verticalAlignment=Alignment.CenterVertically){Text("Check for updates on opening",Modifier.weight(1f));Switch(update.checkOnOpen,{model.updates.preference(checkOnOpen=it)})}
+                Row(verticalAlignment=Alignment.CenterVertically){Text("Automatically download updates",Modifier.weight(1f));Switch(update.automatic,{model.updates.preference(automatic=it)})}
+                Text("Only published release APKs. Downloads are checked against the release checksum and this app's signing certificate. Android asks for approval before installation.",color=MaterialTheme.colorScheme.onSurfaceVariant)
+                if(update.status.isNotBlank())Text(update.status)
+                FilledTonalButton(onClick={scope.launch{model.updates.check()}},enabled=!update.checking){Text("Check for updates")}
+                if(update.version!=null)Button(onClick={if(update.ready)runCatching{model.updates.install(activity)}.onFailure{model.fail(it.message ?: "Could not open installer")} else scope.launch{model.updates.download()}},enabled=!update.checking){Text(if(update.ready)"Install update" else "Download update")}
+                TextButton(onClick={activity.startActivity(Intent(android.provider.Settings.ACTION_APP_NOTIFICATION_SETTINGS).putExtra(android.provider.Settings.EXTRA_APP_PACKAGE,activity.packageName))}){Text("Update notification permissions")}
             }
         }
     }
@@ -474,8 +520,9 @@ private class NoteDestination(mime: String, private val preferred: () -> String)
     Choice("Paper", options.optString("pageSize", "a4"), listOf("a3" to "A3","a4" to "A4", "a5" to "A5","a6" to "A6","iso-b4" to "B4 (ISO)","iso-b5" to "B5 (ISO)","iso-b6" to "B6 (ISO)", "letter" to "Letter", "legal" to "Legal","tabloid" to "Tabloid","executive" to "Executive")) { update("pageSize", it) }
     FontChoice("Document font", options.optString("fontFamily", "Manrope"), (listOf("Manrope","Roboto","Noto Sans","Noto Serif","JetBrains Mono","Libertinus Serif","New Computer Modern","DejaVu Sans Mono")+fonts).distinct().map {it to it}) { update("fontFamily", it) }
     Text("Margins · ${options.optDouble("margin",18.0).toInt()} mm", Modifier.padding(top = 16.dp)); StudySlider(value = options.optDouble("margin",18.0).toFloat(), onCommit = { update("margin", it.toInt()) }, valueRange = 4f..60f)
-    Text("Font size · ${"%.1f".format(options.optDouble("fontSize",10.5))} pt"); StudySlider(value = options.optDouble("fontSize",10.5).toFloat(), onCommit = { update("fontSize", (it * 2).toInt() / 2.0) }, valueRange = 7f..24f)
-    Text("Line spacing · ${"%.2f".format(options.optDouble("lineHeight",1.35))}"); StudySlider(value = options.optDouble("lineHeight",1.35).toFloat(), onCommit = { update("lineHeight", it.toDouble()) }, valueRange = .9f..2.2f)
+    Text("Font size · ${"%.1f".format(options.optDouble("fontSize",10.0))} pt"); StudySlider(value = options.optDouble("fontSize",10.0).toFloat(), onCommit = { update("fontSize", (it * 2).toInt() / 2.0) }, valueRange = 5f..24f)
+    Text("Line spacing · ${"%.2f".format(options.optDouble("lineHeight",1.45))}"); StudySlider(value = options.optDouble("lineHeight",1.45).toFloat(), onCommit = { update("lineHeight", it.toDouble()) }, valueRange = .9f..2.2f)
+    Text("Paragraph spacing · ${"%.1f".format(options.optDouble("paragraphSpacing",1.2))}"); StudySlider(value = options.optDouble("paragraphSpacing",1.2).toFloat(), onCommit = { update("paragraphSpacing", it.toDouble()) }, valueRange = 0f..3f)
     Row(verticalAlignment = Alignment.CenterVertically) { Text("Page numbers", Modifier.weight(1f), style = MaterialTheme.typography.titleMedium); Switch(checked = options.optBoolean("pageNumbers",true), onCheckedChange = { update("pageNumbers", it) }) }
     Row(verticalAlignment = Alignment.CenterVertically) {Text("Light Material theme", Modifier.weight(1f)); Switch(checked = options.optBoolean("themed",false), onCheckedChange = {update("themed", it)})}
     Text("Off uses plain paper. On uses your accent with light surfaces, even in dark mode.", style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)

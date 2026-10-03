@@ -4,6 +4,8 @@ import remarkParse from "remark-parse";
 import remarkMath from "remark-math";
 import { remarkObsidianMath } from "./obsidianMath";
 import {revealWindowed} from "./windowedSearch";
+import {applyDocumentZoom,invalidateDocumentZoom} from './documentZoom';
+const jumps=new WeakMap<Element,object>();
 
 export interface OutlineEntry {id:string;title:string;level:number;offset:number}
 export function documentOutline(markdown:string):OutlineEntry[] {
@@ -43,9 +45,25 @@ export function navigateToHeading(root:Element,target:string):boolean {
   if(!root.querySelector('[data-windowed-block]'))for (const heading of headings) { const key = heading.dataset.headingKey!, count = counts.get(key) || 0; counts.set(key, count + 1); heading.id = key + (count ? `-${count}` : ""); }
   const heading = headings.find(node => node.id === target) || headings.find(node => node.id === headingSlug(target));
   if (!heading) return true; // Broken local links must not escape into a browser.
+  const token={};jumps.set(root,token);
+  const host=root as HTMLElement;host.dataset.navigating='true';
   revealWindowed(heading);
-  heading.scrollIntoView({ block: "start", behavior: document.documentElement.dataset.motion === "off" ? "instant" : "smooth" });
-  heading.tabIndex = -1; heading.focus({ preventScroll: true });
-  if(heading.closest('[data-windowed-block]'))requestAnimationFrame(()=>requestAnimationFrame(()=>{const mounted=Array.from(root.querySelectorAll<HTMLElement>('[data-heading-key]')).find(node=>node.id===target);mounted?.scrollIntoView({block:'start',behavior:'instant'});}));
+  // Native scrollIntoView can clamp against the old magnified spacer, or move
+  // a WebView ancestor rather than its reading pane. Lazy blocks also change
+  // height after the first frame. Resolve and align within this scroller only.
+  const align=(frames:number)=>{
+    if(jumps.get(root)!==token || !host.isConnected)return;
+    const mounted=Array.from(root.querySelectorAll<HTMLElement>('[data-heading-key]')).find(node=>node.id===heading.id) || heading;
+    revealWindowed(mounted);
+    const page=host.querySelector<HTMLElement>('.document-page');
+    if(page){invalidateDocumentZoom(host);applyDocumentZoom(host,Number(page.dataset.scale)*100||100,Number.parseFloat(document.documentElement.style.getPropertyValue('--reading-max-width'))||80);}
+    host.scrollTop+=mounted.getBoundingClientRect().top-host.getBoundingClientRect().top-16;
+    mounted.tabIndex=-1;mounted.focus({preventScroll:true});
+    if(frames>0)requestAnimationFrame(()=>align(frames-1));
+    else delete host.dataset.navigating;
+  };
+  align(0);
+  host.dataset.navigating='true';
+  requestAnimationFrame(()=>align(5));
   return true;
 }

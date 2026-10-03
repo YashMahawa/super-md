@@ -23,11 +23,12 @@ from documents import atomic_write, atomic_json, bundle, image_data, materialize
 from theme import detect_system_dark, read_system_palette, system_palette_paths, tokens
 from fonts import FontStore
 from python_outputs import PythonOutputs
+import updates
 
 ROOT = Path(sys._MEIPASS)/"resources" if getattr(sys,"frozen",False) else Path(__file__).resolve().parent.parent
-DEFAULT_PDF = {"pageSize": "a4", "margin": 18, "fontSize": 10.5, "lineHeight": 1.35, "fontFamily": "Manrope", "pageNumbers": True, "themed": False}
+DEFAULT_PDF = {"pageSize": "a4", "margin": 18, "fontSize": 10, "lineHeight": 1.45, "paragraphSpacing": 1.2, "fontFamily": "Manrope", "pageNumbers": True, "themed": False}
 DEFAULTS = {"theme": "system", "fullTheme": "black", "motion": True, "font": "Manrope", "size": 18, "width": 0, "widthPercent":80, "lineHeight":1.65, "autosave":True, "normalZoom": 100, "fullZoom": 100, "python": (shutil.which("python3") or shutil.which("python") or "") if getattr(sys,"frozen",False) else sys.executable, "pdf": DEFAULT_PDF, "welcomed": False}
-DEFAULTS.update(readingMode="live", newNoteLocation="", accent="system")
+DEFAULTS.update(readingMode="live", newNoteLocation="", accent="system", checkUpdates=True, autoUpdate=False)
 SAMPLE = """# A place to think\n\nWrite in Markdown. Read without distractions.\n\n> [!tip] Start with your notes\n> Open any note or folder. No vault, no import process.\n\n## Learn by exploring\n\n$$E = mc^2$$\n\n> [!answer]- Why does this matter?\n> Tap the heading to reveal an answer, then hide it to test yourself.\n\n```smd-chart\n{\"title\":\"A changing wave\",\"series\":[{\"name\":\"Sine\",\"expression\":\"sin(a*x)\",\"color\":\"#386a57\"},{\"name\":\"Cosine\",\"expression\":\"cos(a*x)\",\"color\":\"#bc6750\"}],\"sliders\":[{\"name\":\"a\",\"min\":0.2,\"max\":3,\"value\":1}]}\n```\n\n## Explore in three dimensions\n\n```smd-chart\n{\"mode\":\"surface3d\",\"title\":\"Bowl and saddle\",\"x\":{\"min\":-2,\"max\":2,\"steps\":20},\"y\":{\"min\":-2,\"max\":2},\"series\":[{\"name\":\"Bowl\",\"expression\":\"a*(x^2+y^2)\",\"color\":\"#39aa7a\"},{\"name\":\"Saddle\",\"expression\":\"x^2-y^2\",\"color\":\"#ad8be3\"}],\"sliders\":[{\"name\":\"a\",\"min\":0.1,\"max\":2,\"value\":1}]}\n```\n\n[Back to exploring](#learn-by-exploring)\n"""
 
 def local_path(value: str) -> Path:
@@ -96,6 +97,11 @@ class Studio(QObject):
         self.completed.connect(self._complete)
         self.data = self.session.data
         self.settings = self.session.settings
+        self.update_status=""
+        self.update_info=None
+        self.update_path=""
+        self.update_running=False
+        if not isolated and len(self.session.windows)==1:QTimer.singleShot(6000,lambda:self.checkUpdates(True) if self.settings.get("checkUpdates") and not self.retired else None)
         self.tabs: list[dict] = []
         self.closed_tabs: list[dict] = []
         self.note_watcher = QFileSystemWatcher(self)
@@ -291,6 +297,64 @@ class Studio(QObject):
 
     @Property(str, constant=True)
     def windowId(self): return self.window_id
+
+    @Property(str,constant=True)
+    def appVersion(self):
+        metadata=ROOT/"desktop/build-info.json" if getattr(sys,"frozen",False) else ROOT/"package.json"
+        return json.loads(metadata.read_text())["version"]
+
+    @Property(str,notify=changed)
+    def updateStatus(self):return self.update_status
+
+    @Property(bool,notify=changed)
+    def updateAvailable(self):return self.update_info is not None
+
+    @Property(bool,notify=changed)
+    def updateReady(self):return bool(self.update_path)
+
+    @Slot()
+    def downloadUpdate(self):
+        if self.update_running or not self.update_info:return
+        self.update_running=True;self.update_status="Downloading and verifying update…";self._emit(False)
+        info=dict(self.update_info)
+        def done(path,error):
+            self.update_running=False
+            if error:self.update_status="Update download failed: "+error;return
+            self.update_path=path;self.update_status="Verified update ready. Save your work, then open the installer."
+        self._submit(lambda:updates.download(info,self.data/"updates"),done,False)
+
+    @Slot()
+    @Slot(bool)
+    def checkUpdates(self,automatic=False):
+        if self.update_running:return
+        self.update_running=True;self.update_status="Checking published releases…";self._emit(False)
+        def done(info,error):
+            self.update_running=False
+            if error:self.update_status="Couldn't check updates. Your notes still work offline.";return
+            if not info or not self.update_info or info["version"]!=self.update_info["version"]:self.update_path=""
+            self.update_info=info
+            if not info:self.update_status="You're on the latest published version.";return
+            self.update_status="Super MD "+info["version"]+" is available."
+            self.message=self.update_status
+            if automatic:
+                try:
+                    from PySide6.QtWidgets import QApplication, QSystemTrayIcon
+                    from PySide6.QtGui import QIcon
+                    if isinstance(QGuiApplication.instance(),QApplication) and QSystemTrayIcon.isSystemTrayAvailable():
+                        self.update_tray=QSystemTrayIcon(QIcon(str(ROOT/"public/brand-mark-fixed.svg")),self)
+                        self.update_tray.setToolTip("Super MD updates");self.update_tray.show();self.update_tray.showMessage("Super MD update",self.update_status)
+                except RuntimeError:pass
+            if self.settings.get("autoUpdate"):self.downloadUpdate()
+        self._submit(lambda:updates.release_info(updates.bounded_json(updates.API),self.appVersion),done,False)
+
+    @Slot()
+    def installUpdate(self):
+        if not self.update_path:return
+        # Never terminate windows, discard recovery, or overwrite package-managed
+        # installations. The OS installer (or parallel AppImage) owns activation.
+        if self.update_path.endswith('.AppImage'):
+            QProcess.startDetached(self.update_path,[])
+        else:QDesktopServices.openUrl(QUrl.fromLocalFile(self.update_path))
 
     def _can_move(self):
         return not (self.retired or self.busy or self.saving or self.pending_close or self.pending_save_as or self.pending_export or self.flush_operation)
@@ -609,11 +673,11 @@ class Studio(QObject):
             return
         if key in ("theme","fullTheme") and value not in ("system","light","dark","black"): return
         if key=="accent" and value not in ("system","blue","green","violet","rose","amber"):return
-        if key in ("motion","welcomed","autosave") and not isinstance(value,bool): return
+        if key in ("motion","welcomed","autosave","checkUpdates","autoUpdate") and not isinstance(value,bool): return
         if key in ("font","python") and (not isinstance(value,str) or not value.strip() or len(value)>2048): return
         if key in ("size","width","widthPercent","lineHeight","normalZoom","fullZoom") and (not isinstance(value,(int,float)) or isinstance(value,bool) or not math.isfinite(value)): return
         if key == "pdf" and (not isinstance(value,dict) or set(value) != set(DEFAULT_PDF)): return
-        if key == "size": value = max(12, min(32, float(value)))
+        if key == "size": value = max(6, min(32, float(value)))
         if key == "width": value = max(0, min(5000, int(value)))
         if key == "widthPercent": value = max(50,min(100,float(value)))
         if key == "lineHeight": value = max(1.15,min(2.2,float(value)))

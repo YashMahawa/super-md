@@ -46,7 +46,7 @@ Pane {
                 ActionButton { text:"Import font…";glyph:"Plus";onClicked:studio.chooseFont() }
                 Label { text:"TTF and OTF fonts stay private to the app and also appear in PDF export and sharing."; Layout.fillWidth:true;wrapMode:Text.WordWrap;color:viewState.colors.muted }
                 Label { text: "Text size: " + Math.round(viewState.settings.size) + " px" }
-                ExpressiveSlider { Layout.fillWidth: true; from: 12; to: 32; stepSize: 1; value: viewState.settings.size; onMoved: page.save("size", value) }
+                ExpressiveSlider { Layout.fillWidth: true; from: 6; to: 32; stepSize: 1; value: viewState.settings.size; onMoved: page.save("size", value) }
                 Label { text: "Reading width: " + Math.round(viewState.settings.widthPercent) + "%" }
                 ExpressiveSlider { Layout.fillWidth: true; from: 50; to: 100; stepSize: 1; value: viewState.settings.widthPercent; onMoved: page.save("widthPercent", value) }
                 Label { text: "Adapts to this window and fullscreen, without a fixed pixel limit."; Layout.fillWidth: true; wrapMode: Text.WordWrap; color: viewState.colors.muted }
@@ -60,6 +60,16 @@ Pane {
                 Label { text: "Interpreter or virtual environment Python executable" }
                 TextField { Layout.fillWidth: true; text: viewState.settings.python; selectByMouse: true; onEditingFinished: page.save("python", text) }
                 Label { text: "Code runs only when you press Run. Use a Python environment with matplotlib installed. Local Python code is not sandboxed."; Layout.fillWidth: true; wrapMode: Text.WordWrap; color: viewState.colors.muted }
+                Label { text: "About & updates"; font.pixelSize: 22; font.weight: Font.DemiBold; Layout.topMargin: 12 }
+                Label { text: "Super MD " + studio.appVersion + " · © Yash Mahawar · MIT License"; Layout.fillWidth: true; wrapMode: Text.WordWrap }
+                Switch { text: "Check for updates on opening"; checked: viewState.settings.checkUpdates; onToggled: page.save("checkUpdates", checked) }
+                Switch { text: "Automatically download updates"; checked: viewState.settings.autoUpdate; onToggled: page.save("autoUpdate", checked) }
+                Label { text: "Downloads are verified. Installation is your choice; running windows and notes are never replaced. Linux downloads a portable AppImage; package-managed installs can use the release packages."; Layout.fillWidth: true; wrapMode: Text.WordWrap; color: viewState.colors.muted }
+                Label { text: studio.updateStatus; visible: text.length > 0; Layout.fillWidth: true; wrapMode: Text.WordWrap }
+                RowLayout {
+                    ActionButton { text: "Check for updates"; tonal: true; onClicked: studio.checkUpdates() }
+                    ActionButton { text: studio.updateReady ? "Open installer" : "Download update"; visible: studio.updateAvailable; prominent: true; onClicked: studio.updateReady ? studio.installUpdate() : studio.downloadUpdate() }
+                }
                 Item { height: 24 }
             }
         }

@@ -13,7 +13,7 @@
 .android-reading { padding: var(--cutout-top, 0px) var(--cutout-right, 0px) 0 var(--cutout-left, 0px); }
 .mode-split .android-source { border-right: 1px solid var(--outline); }
 .document-page-space { min-width:100%; overflow-anchor:none; }
-.document-page { margin:0; width:80%; transform-origin:top left; contain:layout style; }
+.document-page { margin:0; width:80%; transform-origin:top left; contain:layout style; -webkit-text-size-adjust:none; text-size-adjust:none; }
 .windowed-md-block { display:flow-root;overflow-anchor:none; }
 /* Keep a saved intrinsic size as blocks leave the viewport. Layout/paint of
    off-screen KaTeX trees is skipped while source/anchors stay searchable. */

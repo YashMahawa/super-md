@@ -6,13 +6,14 @@ import subprocess
 from pathlib import Path
 from PySide6.QtCore import QFile, QIODevice, QUrl, QTimer, QMetaObject, Q_ARG, QObject, QEvent, Signal
 from PySide6.QtGui import QGuiApplication, QIcon, QFont, QFontDatabase
+from PySide6.QtWidgets import QApplication
 from PySide6.QtQml import QQmlApplicationEngine
 from PySide6.QtQuickControls2 import QQuickStyle
 from PySide6.QtWebEngineQuick import QtWebEngineQuick
 from studio import Session, Studio, ROOT
 from instance import InstanceBroker
 
-class StudioApplication(QGuiApplication):
+class StudioApplication(QApplication):
     openRequested = Signal(str)
 
     def event(self, event):

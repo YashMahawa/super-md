@@ -164,9 +164,11 @@ jobs:
       - run: npm ci
       - run: npm run build
       - run: npx vitest run
-      - run: python -m unittest discover -s desktop -p "test_*.py"
+      - run: python desktop/run_tests.py
+        timeout-minutes: 8
         env:
           QT_QPA_PLATFORM: offscreen
+          QT_QUICK_BACKEND: software
       - run: cargo test --locked --manifest-path smd-core/Cargo.toml
       - run: cargo build --locked --release --manifest-path smd-core/Cargo.toml --bin smd-engine
       - run: python desktop/package.py

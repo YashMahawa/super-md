@@ -44,8 +44,12 @@ class StudioUiTest {
     private fun web(view: View): WebView? = if (view is WebView) view else if (view is ViewGroup) (0 until view.childCount).firstNotNullOfOrNull { web(view.getChildAt(it)) } else null
     private fun javascriptUntil(script: String, accepted: (String) -> Boolean): String {
         val result = AtomicReference("")
+        val inFlight=java.util.concurrent.atomic.AtomicBoolean(false)
         compose.waitUntil(60_000) {
-            compose.activity.runOnUiThread { web(compose.activity.window.decorView)?.evaluateJavascript(script) { result.set(it) } }
+            // Mutating checks (dismiss, click, navigate) must never enqueue a
+            // second evaluation before observing the first successful reply.
+            if(accepted(result.get()))return@waitUntil true
+            if(inFlight.compareAndSet(false,true))compose.activity.runOnUiThread { val reader=web(compose.activity.window.decorView);if(reader==null)inFlight.set(false) else reader.evaluateJavascript(script) { result.set(it);inFlight.set(false) } }
             accepted(result.get())
         }
         return result.get()
@@ -71,6 +75,26 @@ class StudioUiTest {
         javascriptUntil("document.querySelector('.reading-search output')?.textContent") {it=="\"0 / 1\""}
         javascriptUntil("(()=>{const b=document.querySelector('button[aria-label=\"Next match\"]');if(b&&!b.disabled)b.click();return document.querySelector('.reading-search output')?.textContent;})()") {it=="\"1 / 1\""}
         javascriptUntil("window.supermdDismiss?.()") {it=="true"}
+    }
+    @Test fun nativeSelectionAndHeadingLinksUseMagnifiedPageCoordinates() {
+        welcome()
+        val model=androidx.lifecycle.ViewModelProvider(compose.activity)[StudioViewModel::class.java]
+        temporaryNoteState=model.state.value
+        val content="# Selection\n\nAlpha Bravo Charlie Delta\n\n[Go to distant chapter](#chapter-599)\n\n"+(0 until 600).joinToString("\n"){"## Chapter $it\n\n${"Readable study paragraph. ".repeat(8)}\n"}
+        compose.runOnIdle{model.edit(model.state.value.active.id,content);model.mode("reader");model.zoom(175f)}
+        javascriptUntil("document.querySelector('.document-page')?.dataset.selectionScale"){it=="\"1.75\""}
+        val raw=javascriptUntil("(()=>{const el=document.querySelector('.markdown-body p');if(!el)return null;const r=document.createRange();r.setStart(el.firstChild,6);r.setEnd(el.firstChild,11);const b=r.getBoundingClientRect();const caret=document.caretRangeFromPoint(b.left+b.width/2,b.top+b.height/2);return {x:b.left+b.width/2,y:b.top+b.height/2,width:innerWidth,word:caret?.startContainer.textContent,offset:caret?.startOffset};})()"){it.contains("Alpha Bravo Charlie Delta")}
+        val point=org.json.JSONObject(raw)
+        assertTrue(point.getInt("offset") in 6..11)
+        val nativePoint=AtomicReference(androidx.compose.ui.geometry.Offset.Zero)
+        compose.runOnIdle {val reader=web(compose.activity.window.decorView)!!;val xy=IntArray(2);reader.getLocationOnScreen(xy);val scale=reader.width.toFloat()/point.getDouble("width").toFloat();nativePoint.set(androidx.compose.ui.geometry.Offset(xy[0]+point.getDouble("x").toFloat()*scale,xy[1]+point.getDouble("y").toFloat()*scale))}
+        val instrument=androidx.test.platform.app.InstrumentationRegistry.getInstrumentation()
+        val time=android.os.SystemClock.uptimeMillis();val position=nativePoint.get()
+        instrument.sendPointerSync(android.view.MotionEvent.obtain(time,time,android.view.MotionEvent.ACTION_DOWN,position.x,position.y,0))
+        android.os.SystemClock.sleep(750)
+        instrument.sendPointerSync(android.view.MotionEvent.obtain(time,android.os.SystemClock.uptimeMillis(),android.view.MotionEvent.ACTION_UP,position.x,position.y,0))
+        javascriptUntil("window.getSelection()?.toString()"){it=="\"Bravo\""}
+        javascriptUntil("(()=>{window.getSelection()?.removeAllRanges();document.querySelector('a[href=\"#chapter-599\"]')?.click();const h=document.querySelector('h2#chapter-599');if(!h)return false;const host=document.querySelector('.android-reading');return Math.abs(h.getBoundingClientRect().top-host.getBoundingClientRect().top-16)<3;})()"){it=="true"}
     }
     @Test fun graphNativeTwoFingerPanAndPinchDoesNotRotateOrZoomTheNote() {
         welcome()
@@ -201,6 +225,7 @@ class StudioUiTest {
         // just a DOM event. Document scrolling must never open the drawer.
         compose.onRoot().performTouchInput { swipe(androidx.compose.ui.geometry.Offset(30f, height * .82f), androidx.compose.ui.geometry.Offset(170f, height * .40f), 600) }
         compose.onNodeWithText("Your files").assertIsNotDisplayed()
+        compose.onNodeWithContentDescription("Show reading controls").performClick()
         compose.onNodeWithContentDescription("Open files").performClick()
         compose.onNodeWithText("Your files").assertIsDisplayed()
         compose.runOnIdle { compose.activity.onBackPressedDispatcher.onBackPressed() }
@@ -246,16 +271,16 @@ class StudioUiTest {
         assertTrue("Reader must not overpaint the native toolbar", kotlin.math.abs(android.graphics.Color.red(nativeIcon) - android.graphics.Color.red(paletteIcon)) < 15 && kotlin.math.abs(android.graphics.Color.green(nativeIcon) - android.graphics.Color.green(paletteIcon)) < 15 && kotlin.math.abs(android.graphics.Color.blue(nativeIcon) - android.graphics.Color.blue(paletteIcon)) < 15)
         val normalScale = javascriptUntil("document.querySelector('.document-page')?.dataset.scale") { it.isNotBlank() && it != "null" && it != "\"\"" }
         compose.onNodeWithContentDescription("Show contents").assertDoesNotExist()
-        compose.onNodeWithContentDescription("More actions").performClick()
-        compose.onNodeWithText("Fullscreen study").performClick()
+        compose.onNodeWithContentDescription("Fullscreen study").performClick()
         javascriptUntil("document.documentElement.dataset.fullscreen") { it == "\"true\"" }
+        val fullBaseline=javascriptUntil("document.querySelector('.document-page')?.dataset.scale") {(it.trim('"').toFloatOrNull() ?: 0f)>0}.trim('"').toFloat()
         val contentsBounds=compose.onNodeWithContentDescription("Show contents").fetchSemanticsNode().boundsInRoot
         val exitBounds=compose.onNodeWithContentDescription("Exit fullscreen").fetchSemanticsNode().boundsInRoot
         assertTrue("Contents belongs at the left, separate from fullscreen exit",contentsBounds.right<exitBounds.left)
         // Fullscreen intentionally has no zoom buttons. Exercise the same
         // focal pinch path as normal reading instead of restoring stale UI.
         javascriptUntil("(() => { if (window.fullPinchDone) return true; if (window.fullPinchStarted) return false; window.fullPinchStarted=true; const target=document.querySelector('.android-reading'); const touches=(x) => [new Touch({identifier:1,target,clientX:60,clientY:140}),new Touch({identifier:2,target,clientX:x,clientY:140})]; target.dispatchEvent(new TouchEvent('touchstart',{bubbles:true,touches:touches(160)})); target.dispatchEvent(new TouchEvent('touchmove',{bubbles:true,cancelable:true,touches:touches(240)})); requestAnimationFrame(() => requestAnimationFrame(() => { target.dispatchEvent(new TouchEvent('touchend',{bubbles:true,touches:[]})); window.fullPinchDone=true; })); return false; })()") { it == "true" }
-        javascriptUntil("document.querySelector('.document-page')?.dataset.scale") { it != normalScale && it != "null" }
+        javascriptUntil("document.querySelector('.document-page')?.dataset.scale") { (it.trim('"').toFloatOrNull() ?: 0f)>fullBaseline*1.1f }
         compose.onNodeWithContentDescription("Exit fullscreen").performClick()
         javascriptUntil("document.querySelector('.document-page')?.dataset.scale") { it == normalScale }
         compose.onNodeWithContentDescription("New tab").performClick()

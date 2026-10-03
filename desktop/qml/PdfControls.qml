@@ -31,13 +31,15 @@ ColumnLayout {
     ColumnLayout {
         Layout.fillWidth: true; spacing: 4
         Label { text: "Text size: " + textSlider.value.toFixed(1) + " pt" }
-        ExpressiveSlider { id: textSlider; Layout.fillWidth: true; Layout.preferredHeight: 36; from: 7; to: 24; stepSize: .5; value: controls.options.fontSize; Accessible.name: "PDF text size"; onMoved: if (!pressed) controls.update("fontSize", value); onPressedChanged: if (!pressed) controls.update("fontSize", value) }
+        ExpressiveSlider { id: textSlider; Layout.fillWidth: true; Layout.preferredHeight: 36; from: 5; to: 24; stepSize: .5; value: controls.options.fontSize; Accessible.name: "PDF text size"; onMoved: if (!pressed) controls.update("fontSize", value); onPressedChanged: if (!pressed) controls.update("fontSize", value) }
     }
     ColumnLayout {
         Layout.fillWidth: true; spacing: 4
         Label { text: "Line spacing: " + spacingSlider.value.toFixed(2) }
         ExpressiveSlider { id: spacingSlider; Layout.fillWidth: true; Layout.preferredHeight: 36; from: .9; to: 2.2; stepSize: .05; value: controls.options.lineHeight; Accessible.name: "PDF line spacing"; onMoved: if (!pressed) controls.update("lineHeight", value); onPressedChanged: if (!pressed) controls.update("lineHeight", value) }
     }
+    Label { text: "Paragraph spacing: " + paragraphSlider.value.toFixed(2) }
+    ExpressiveSlider { id: paragraphSlider; Layout.fillWidth: true; from: 0; to: 3; stepSize: .1; value: controls.options.paragraphSpacing ?? 1.2; Accessible.name: "PDF paragraph spacing"; onMoved: if (!pressed) controls.update("paragraphSpacing", value); onPressedChanged: if (!pressed) controls.update("paragraphSpacing", value) }
     Switch { objectName: "pdfPageNumbers"; text: "Page numbers"; checked: controls.options.pageNumbers; onToggled: controls.update("pageNumbers", checked) }
     Switch { objectName: "pdfThemed"; text: "Light Material theme"; checked: controls.options.themed === true; onToggled: controls.update("themed", checked) }
     Label { text: "Off uses plain paper. On uses your accent with light surfaces, even in dark mode."; wrapMode: Text.WordWrap; Layout.fillWidth: true; color: JSON.parse(studio.snapshot).colors.muted }

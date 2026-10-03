@@ -1,5 +1,25 @@
 # Verification
 
+## Android comfort, selection, navigation and updates — 2026-10-03
+
+- 88 frontend unit tests and all 27 browser workflows pass locally, including
+  distant links at 200%, selection hit testing at 175%, two-axis native panning,
+  Source undo across modes and complete offscreen Python output export.
+- 55 Qt/Python tests pass, including streamed download size/hash checks and
+  rejection of drafts, prereleases, malformed versions and untrusted asset URLs.
+  Software-rendered native tests retain the same geometry/color assertions.
+- 16 Rust typesetter tests and two real CLI process tests pass, including 6 pt
+  PDF text, explicit paragraph spacing, multipage tables and full math.
+- 18 local Android API 36 instrumentation tests pass. The new test injects a
+  native long press into the magnified WebView and requires exactly “Bravo”,
+  then follows a link across 600 chapters and checks its final alignment. JVM
+  tests and release lint pass. This is not a physical Vivo installer check.
+- Native desktop presented-pixel smoke tests pass for fonts, menus, fullscreen
+  icon size, theme controls, resizing and PDF. Update UI is included in settings;
+  update parser/checksum tests use offline fixtures, not a forced new release.
+- API 35/36 CI and all installers still gate publication. No running user window
+  is replaced, no unsigned/debug APK is distributed, and no power action occurs.
+
 ## Windowed large notes and memory maintenance — 2026-10-03
 
 - Reproducible 2,000-formula headless-browser comparison: DOM nodes 217,003 to

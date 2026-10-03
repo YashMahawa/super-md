@@ -13,6 +13,7 @@ pub struct PdfOptions {
     pub margin: f32,
     pub font_size: f32,
     pub line_height: f32,
+    pub paragraph_spacing: f32,
     pub font_family: String,
     pub page_numbers: bool,
     pub themed: bool,
@@ -20,13 +21,13 @@ pub struct PdfOptions {
 }
 impl Default for PdfOptions {
     fn default() -> Self {
-        Self { page_size: "a4".into(), margin: 18., font_size: 10.5, line_height: 1.35, font_family: "Libertinus Serif".into(), page_numbers: true, themed: false, theme_accent: "#386a57".into() }
+        Self { page_size: "a4".into(), margin: 18., font_size: 10., line_height: 1.45, paragraph_spacing: 1.2, font_family: "Libertinus Serif".into(), page_numbers: true, themed: false, theme_accent: "#386a57".into() }
     }
 }
 impl PdfOptions {
     pub fn validate(&self) -> Result<()> {
         if !["a3", "a4", "a5", "a6", "iso-b4", "iso-b5", "iso-b6", "letter", "legal", "tabloid", "executive"].contains(&self.page_size.as_str()) { bail!("Unsupported page size"); }
-        for (name, value, min, max) in [("margin", self.margin, 4., 60.), ("font size", self.font_size, 7., 24.), ("line height", self.line_height, 0.9, 2.2)] {
+        for (name, value, min, max) in [("margin", self.margin, 4., 60.), ("font size", self.font_size, 5., 24.), ("line height", self.line_height, 0.9, 2.2), ("paragraph spacing", self.paragraph_spacing, 0., 3.)] {
             if !value.is_finite() || value < min || value > max { bail!("Invalid {name}: expected {min} to {max}"); }
         }
         if self.font_family.len() > 120 { bail!("Font name is too long"); }
@@ -287,7 +288,7 @@ pub fn source(markdown: &str, options: &PdfOptions, assets: &HashMap<String, Vec
 #let smd-line = if smd-themed {{ color.mix((white, 55%), (smd-accent, 45%)) }} else {{ rgb("#d6d6d6") }}
 #let smd-link = if smd-themed {{ color.mix((rgb("#202020"), 45%), (smd-accent, 55%)) }} else {{ rgb("#315d99") }}
 "##, string(accent));
-    Ok(format!("#import \"/mitex/standard.typ\": scope as mitex-scope\n#let smd-math-scope = mitex-scope + (sect: sym.inter,)\n{palette}#set page(paper: {}, margin: {}mm, fill: smd-paper)\n#set text(font: ({}, \"Libertinus Serif\", \"New Computer Modern\"), size: {}pt)\n#set par(leading: {}em)\n{template}\n{body}", string(paper), options.margin, string(&options.font_family), options.font_size, options.line_height - 0.7))
+    Ok(format!("#import \"/mitex/standard.typ\": scope as mitex-scope\n#let smd-math-scope = mitex-scope + (sect: sym.inter,)\n{palette}#set page(paper: {}, margin: {}mm, fill: smd-paper)\n#set text(font: ({}, \"Libertinus Serif\", \"New Computer Modern\"), size: {}pt)\n#set par(leading: {}em, spacing: {}em)\n{template}\n{body}", string(paper), options.margin, string(&options.font_family), options.font_size, options.line_height - 0.7, options.paragraph_spacing))
 }
 
 pub fn export(markdown: &str, options: &PdfOptions, assets: &HashMap<String, Vec<u8>>) -> Result<Vec<u8>> {
@@ -390,6 +391,15 @@ mod tests {
         assert_eq!(widths.split(',').filter(|part|!part.is_empty()).count(),2);
         assert!(output.contains("smd-header-fill"));
         assert!(export(md,&PdfOptions::default(),&HashMap::new()).unwrap().starts_with(b"%PDF-"));
+    }
+    #[test]
+    fn compact_fonts_and_paragraph_spacing_are_validated_and_typeset() {
+        let options=PdfOptions{font_size:6.,line_height:1.45,paragraph_spacing:1.2,..PdfOptions::default()};
+        let md="# Compact\n\nFirst paragraph.\n\nSecond paragraph with $x^2$.";
+        let text=source(md,&options,&HashMap::new()).unwrap();
+        assert!(text.contains("spacing: 1.2em"));
+        assert!(export(md,&options,&HashMap::new()).unwrap().starts_with(b"%PDF-"));
+        let invalid=PdfOptions{paragraph_spacing:f32::NAN,..options};assert!(invalid.validate().is_err());
     }
     #[test]
     fn plain_pdf_keeps_semantic_callouts_not_wallpaper_accent() {

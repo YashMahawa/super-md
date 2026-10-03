@@ -30,6 +30,10 @@ class StudyPaletteTest {
                 assertTrue(contrast(colors.onSurfaceVariant,bg)>=4.5f)
             }
             assertEquals("Manrope",StudioState().font)
+            assertEquals(15f,StudioState().size)
+            assertTrue(contrast(colors.onPrimary,colors.primary)>=4.5f)
+            assertTrue(contrast(colors.onSecondaryContainer,colors.secondaryContainer)>=4.5f)
+            assertTrue(contrast(colors.onTertiaryContainer,colors.tertiaryContainer)>=4.5f)
             assertTrue(StudioState().pdf.contains("Manrope"))
         }
     }

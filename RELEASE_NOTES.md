@@ -2,6 +2,25 @@
 
 ## This release
 
+- Android reading starts at 15 px for new users; reading sizes down to 6 px and
+  PDF sizes down to 5 pt are available. PDF defaults use 10 pt text, slightly
+  more line spacing and explicit paragraph spacing, adjustable in Export/Share.
+  Existing preferences are retained.
+- Android light surfaces and tonal controls have contrast-checked foregrounds.
+  Reading chrome hides on downward swipes and returns on upward swipes or the
+  overlay control. Fullscreen has a direct icon with a long-press tooltip, duplicate
+  menu Undo/Redo actions are removed, and loading uses Material 3 Expressive's
+  morphing indicator (static when motion is disabled).
+- Android commits compositor zoom to layout zoom while idle so native text
+  selection handles and hit testing agree with the magnified page. Distant heading
+  links align inside the reader and are rechecked as offscreen blocks mount.
+- Settings show the installed version, manual update checks, startup checks and
+  optional automatic downloads. Only published releases from the official repo
+  are used; downloads require exact checksums and sizes. Android also checks
+  package ID, non-debuggable status, newer version code and the existing signing
+  certificate before opening the system installer. No silent Android install or
+  forced closing of desktop windows. Linux downloads a portable AppImage; system
+  package installs can use DEB/RPM release assets.
 - Large notes release offscreen rendered blocks: expanded math, highlighted code,
   image components and interactive plots are mounted near the viewport instead
   of retaining the entire rendered document. Full-note text search, heading
