@@ -1,6 +1,6 @@
 # Verification
 
-## Aligned chrome, native captions and stable zoom — 0.4.10
+## Aligned chrome, native captions and stable zoom — 0.4.11
 
 - 89 frontend unit tests, 30 browser workflows and 60 Qt/Python checks pass
   locally. Coverage includes stale zoom snapshots, 40–300% limits, bounded Live
@@ -12,7 +12,9 @@
   new-tab action. Font popups close with Settings. Existing native PDF checks
   remain enabled. macOS/Windows caption integration is not a physical-device
   visual check; their exact-source CI/package jobs remain required.
-- Android API 36 checks cover deduplicated actions and gesture acknowledgements
+- All 20 local Android API 36 instrumentation tests pass, including real
+  LaTeX/Matplotlib/PDF export, painted UI, large-note selection and headings.
+  Checks cover deduplicated actions and gesture acknowledgements
   that do not issue another native zoom command. A separate presented-pixel test
   verifies the chosen dark-blue palette reaches the reader and paints a visible
   native plus icon. Manual schemes replace every Material role; JVM contrast

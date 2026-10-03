@@ -323,9 +323,13 @@ private object NoMotionScheme : MotionScheme {
                             var touchY=0f
                             var multiTouch=false
                             var chromeIntent:Boolean?=null
+                            var gestureEpoch=0L
+                            var gestureActive=false
                             setOnTouchListener {_,event->
                                 wakeChrome()
                                 if(event.actionMasked==android.view.MotionEvent.ACTION_DOWN) {
+                                    gestureEpoch++
+                                    gestureActive=true
                                     touchY=event.rawY
                                     multiTouch=false
                                     chromeIntent=null
@@ -339,8 +343,11 @@ private object NoMotionScheme : MotionScheme {
                                 // Never resize the viewport under an active
                                 // gesture, selection handle or live editor.
                                 if(event.actionMasked==android.view.MotionEvent.ACTION_UP && !multiTouch) {
-                                    chromeIntent?.let { show -> evaluateJavascript("!!document.querySelector('.live-active-block textarea:focus')") { editing -> if(editing!="true")readingChromeVisible=show } }
+                                    gestureActive=false
+                                    val completedEpoch=gestureEpoch
+                                    chromeIntent?.let { show -> evaluateJavascript("!!document.querySelector('.live-active-block textarea:focus')") { editing -> if(editing!="true" && !gestureActive && completedEpoch==gestureEpoch)readingChromeVisible=show } }
                                 }
+                                if(event.actionMasked==android.view.MotionEvent.ACTION_UP || event.actionMasked==android.view.MotionEvent.ACTION_CANCEL)gestureActive=false
                                 false
                             }
                             setOnGenericMotionListener {_,_->wakeChrome();false}

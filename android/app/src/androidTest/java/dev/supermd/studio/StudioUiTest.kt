@@ -127,6 +127,9 @@ class StudioUiTest {
         val content="# Selection\n\nAlpha Bravo Charlie Delta\n\n[Go to distant chapter](#chapter-599)\n\n"+(0 until 600).joinToString("\n"){"## Chapter $it\n\n${"Readable study paragraph. ".repeat(8)}\n"}
         compose.runOnIdle{model.edit(model.state.value.active.id,content);model.mode("reader");model.zoom(175f)}
         javascriptUntil("document.querySelector('.document-page')?.dataset.selectionScale"){it=="\"1.75\""}
+        // Focal zoom deliberately preserves the previous viewport location.
+        // Wait for the fixture, then bring the measured word onto the screen.
+        javascriptUntil("(()=>{const p=document.querySelector('.markdown-body p');if(!p?.textContent.includes('Alpha Bravo Charlie Delta'))return false;document.querySelector('.android-reading').scrollTop=0;const r=p.getBoundingClientRect();return r.top>=0&&r.bottom<innerHeight;})()") {it=="true"}
         val raw=javascriptUntil("(()=>{const el=document.querySelector('.markdown-body p');if(!el)return null;const r=document.createRange();r.setStart(el.firstChild,6);r.setEnd(el.firstChild,11);const b=r.getBoundingClientRect();const caret=document.caretRangeFromPoint(b.left+b.width/2,b.top+b.height/2);return {x:b.left+b.width/2,y:b.top+b.height/2,width:innerWidth,word:caret?.startContainer.textContent,offset:caret?.startOffset};})()"){it.contains("Alpha Bravo Charlie Delta")}
         val point=org.json.JSONObject(raw)
         assertTrue(point.getInt("offset") in 6..11)
@@ -269,12 +272,15 @@ class StudioUiTest {
         // just a DOM event. Document scrolling must never open the drawer.
         compose.onRoot().performTouchInput { swipe(androidx.compose.ui.geometry.Offset(30f, height * .82f), androidx.compose.ui.geometry.Offset(170f, height * .40f), 600) }
         compose.onNodeWithText("Your files").assertIsNotDisplayed()
+        // WebView's post-gesture JS callback is asynchronous to Compose's idler.
+        compose.waitUntil(5000) {compose.onAllNodesWithContentDescription("Show contents").fetchSemanticsNodes().isNotEmpty()}
         compose.onNodeWithContentDescription("Show contents").performClick()
         compose.onAllNodesWithText("Contents",useUnmergedTree=true).filterToOne(hasAnyAncestor(isDialog())).assertIsDisplayed()
         compose.onNodeWithText("Close").performClick()
         // Reveal controls with an upward document traversal, not the removed
         // down-arrow overlay. The viewport must not resize during the gesture.
         compose.onRoot().performTouchInput { swipe(androidx.compose.ui.geometry.Offset(width*.65f,height*.45f),androidx.compose.ui.geometry.Offset(width*.65f,height*.75f),500) }
+        compose.waitUntil(5000) {compose.onAllNodesWithContentDescription("Open files").fetchSemanticsNodes().isNotEmpty()}
         compose.onNodeWithContentDescription("Open files").performClick()
         compose.onNodeWithText("Your files").assertIsDisplayed()
         compose.runOnIdle { compose.activity.onBackPressedDispatcher.onBackPressed() }
