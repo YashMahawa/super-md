@@ -453,9 +453,16 @@ ax.set_title("Matplotlib 3D figure")
             compose.waitUntil(10000) {compose.activity.resources.configuration.orientation==android.content.res.Configuration.ORIENTATION_LANDSCAPE}
             javascriptUntil("document.querySelector('.document-page')?.dataset.scale") {it=="\"1.7\""}
             javascriptUntil("window.getSelection()?.removeAllRanges();true") {it=="true"}
-            val width=javascriptUntil("getComputedStyle(document.querySelector('.document-page')).width") {it.contains("px")}
-            val textWidth=javascriptUntil("getComputedStyle(document.querySelector('.markdown-body')).width") {it.contains("px")}
+            // Layout zoom can serialize the same width with 0.002 px rounding
+            // differences. Compare actual CSS-pixel layout widths instead.
+            val width=javascriptUntil("document.querySelector('.document-page').clientWidth") {it.toIntOrNull()!=null}
+            val textWidth=javascriptUntil("document.querySelector('.markdown-body').clientWidth") {it.toIntOrNull()!=null}
             val viewport=javascriptUntil("JSON.stringify([innerWidth,innerHeight])") {it.contains(",")}
+            println("Overlay before start alignment: "+javascriptUntil("JSON.stringify({top:document.querySelector('h1').getBoundingClientRect().top,scroll:document.querySelector('.android-reading').scrollTop,inset:getComputedStyle(document.documentElement).getPropertyValue('--native-chrome-inset')})") {it.contains("inset")})
+            // Orientation/mode restoration may correctly retain a reading
+            // anchor below the title. Test title clearance at the note's start,
+            // not while intentionally scrolled into the document.
+            javascriptUntil("document.querySelector('.android-reading').scrollTop=0;true") {it=="true"}
             javascriptUntil("document.querySelector('h1').getBoundingClientRect().top>=parseFloat(getComputedStyle(document.documentElement).getPropertyValue('--native-chrome-inset'))") {it=="true"}
             // A margin tap has no text/link/edit action and toggles reading UI.
             compose.onRoot().performTouchInput {click(androidx.compose.ui.geometry.Offset(this.width*.98f,height*.60f))}
@@ -471,8 +478,8 @@ ax.set_title("Matplotlib 3D figure")
             compose.onNodeWithContentDescription("Fullscreen study").performClick()
             javascriptUntil("document.documentElement.dataset.fullscreen") {it=="\"true\""}
             javascriptUntil("document.querySelector('.document-page')?.dataset.scale") {it=="\"1.7\""}
-            assertEquals(width,javascriptUntil("getComputedStyle(document.querySelector('.document-page')).width") {it.contains("px")})
-            assertEquals("The actual text column, not just its outer page, must retain its width",textWidth,javascriptUntil("getComputedStyle(document.querySelector('.markdown-body')).width") {it.contains("px")})
+            assertEquals(width,javascriptUntil("document.querySelector('.document-page').clientWidth") {it.toIntOrNull()!=null})
+            assertEquals("The actual text column, not just its outer page, must retain its width",textWidth,javascriptUntil("document.querySelector('.markdown-body').clientWidth") {it.toIntOrNull()!=null})
             assertEquals("Fullscreen must not resize the reading viewport",viewport,javascriptUntil("JSON.stringify([innerWidth,innerHeight])") {it.contains(",")})
             compose.waitUntil(5000) {compose.onAllNodesWithContentDescription("Exit fullscreen").fetchSemanticsNodes().isEmpty()}
             compose.onRoot().performTouchInput {click(androidx.compose.ui.geometry.Offset(this.width*.98f,height*.60f))}

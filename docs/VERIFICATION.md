@@ -17,6 +17,10 @@
   column width and title clearance in addition to existing zoom, cutout, LaTeX,
   Python, spelling and PDF checks. API 35/36 exact-source CI remains required;
   emulator results do not imply testing every handset.
+- Title clearance is checked explicitly at the note's start after orientation
+  restoration. Width assertions use actual CSS-pixel layout widths: modern
+  layout zoom can serialize identical widths with 0.002 px decimal differences.
+  Viewport dimensions, text-column width and overlay bounds remain exact checks.
 - Builds remain serialized and resource-limited. Working installed versions,
   user windows and documents are preserved; no laptop power action is performed.
 
