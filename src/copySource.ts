@@ -3,7 +3,8 @@
 export function selectedMarkdown(selection: Selection | null): string | null {
   if (!selection?.rangeCount || selection.isCollapsed) return null;
   const range=selection.getRangeAt(0).cloneRange();
-  if (!range.startContainer.parentElement?.closest(".markdown-body") || !range.endContainer.parentElement?.closest(".markdown-body")) return null;
+  const elementAt=(node:Node)=>node instanceof Element?node:node.parentElement;
+  if (!elementAt(range.startContainer)?.closest(".markdown-body") || !elementAt(range.endContainer)?.closest(".markdown-body")) return null;
   const mathAt=(node:Node)=>node.parentElement?.closest(".katex-display") || node.parentElement?.closest(".katex");
   const start=mathAt(range.startContainer), end=mathAt(range.endContainer);
   if(start)range.setStartBefore(start);if(end)range.setEndAfter(end);
@@ -12,9 +13,19 @@ export function selectedMarkdown(selection: Selection | null): string | null {
     if(!(node instanceof Element))return Array.from(node.childNodes).map(serialize).join("");
     if(node.matches("button,.image-edit-tools,.katex-mathml"))return "";
     if(node.matches(".katex-display,.katex")){const tex=node.querySelector('annotation[encoding="application/x-tex"]')?.textContent;if(tex)return node.matches(".katex-display")?`\n$$\n${tex}\n$$\n`:`$${tex}$`;}
+    if(node.tagName==="TABLE"){
+      const rows=Array.from(node.querySelectorAll("tr")).filter(row=>row.closest("table")===node).map(row=>Array.from(row.children).filter(cell=>/^(TH|TD)$/.test(cell.tagName)).map(cell=>Array.from(cell.childNodes).map(serialize).join("").trim().replace(/\n+/g,"<br>").replace(/(?<!\\)\|/g,"\\|")));
+      if(!rows.length)return "";
+      const columns=Math.max(...rows.map(row=>row.length));
+      const line=(cells:string[])=>`| ${Array.from({length:columns},(_,i)=>cells[i]||"").join(" | ")} |`;
+      return `\n${line(rows[0])}\n${line(Array(columns).fill("---"))}\n${rows.slice(1).map(line).join("\n")}\n\n`;
+    }
     const content=Array.from(node.childNodes).map(serialize).join("");
     switch(node.tagName.toLowerCase()){
       case "br":return "\n";
+      case "hr":return "\n---\n\n";
+      case "blockquote":return `${content.trim().split("\n").map(line=>`> ${line}`).join("\n")}\n\n`;
+      case "input":return node.getAttribute("type")==="checkbox"?`[${(node as HTMLInputElement).checked?"x":" "}] `:"";
       case "strong":case "b":return `**${content}**`;
       case "em":case "i":return `*${content}*`;
       case "a":return `[${content}](${node.getAttribute("href")||""})`;

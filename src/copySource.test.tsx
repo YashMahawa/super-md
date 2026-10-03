@@ -14,3 +14,8 @@ it("finds phrases across bold spans and every occurrence in a reading document",
   expect(readingMatches(host,"clear idea").map(r=>r.toString())).toEqual(["clear idea","clear idea"]);
   expect(readingMatches(host,"absent")).toEqual([]);
 });
+it("preserves table structure, quotes, separators and checkboxes when copying",()=>{
+  const host=document.createElement("article");host.className="markdown-body";host.innerHTML='<table><thead><tr><th>Model</th><th>Value</th></tr></thead><tbody><tr><td><strong>Coin</strong></td><td>Heads | tails</td></tr></tbody></table><blockquote><p>A quoted note</p></blockquote><hr><ul><li><input type="checkbox" checked>Complete</li></ul>';document.body.append(host);
+  const range=document.createRange();range.selectNodeContents(host);const selection=window.getSelection()!;selection.removeAllRanges();selection.addRange(range);
+  expect(selectedMarkdown(selection)).toBe('| Model | Value |\n| --- | --- |\n| **Coin** | Heads \\| tails |\n\n> A quoted note\n\n\n---\n\n- [x] Complete');selection.removeAllRanges();host.remove();
+});

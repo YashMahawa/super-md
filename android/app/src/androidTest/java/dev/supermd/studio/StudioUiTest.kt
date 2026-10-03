@@ -229,7 +229,9 @@ class StudioUiTest {
         val normalScale = javascriptUntil("document.querySelector('.document-page')?.dataset.scale") { it.isNotBlank() && it != "null" && it != "\"\"" }
         compose.onNodeWithContentDescription("More actions").performClick()
         compose.onNodeWithText("Fullscreen study").performClick()
-        compose.onNodeWithContentDescription("Zoom in").performClick()
+        // Fullscreen intentionally has no zoom buttons. Exercise the same
+        // focal pinch path as normal reading instead of restoring stale UI.
+        javascriptUntil("(() => { if (window.fullPinchDone) return true; if (window.fullPinchStarted) return false; window.fullPinchStarted=true; const target=document.querySelector('.android-reading'); const touches=(x) => [new Touch({identifier:1,target,clientX:60,clientY:140}),new Touch({identifier:2,target,clientX:x,clientY:140})]; target.dispatchEvent(new TouchEvent('touchstart',{bubbles:true,touches:touches(160)})); target.dispatchEvent(new TouchEvent('touchmove',{bubbles:true,cancelable:true,touches:touches(240)})); requestAnimationFrame(() => requestAnimationFrame(() => { target.dispatchEvent(new TouchEvent('touchend',{bubbles:true,touches:[]})); window.fullPinchDone=true; })); return false; })()") { it == "true" }
         javascriptUntil("document.querySelector('.document-page')?.dataset.scale") { it != normalScale && it != "null" }
         compose.onNodeWithContentDescription("Exit fullscreen").performClick()
         javascriptUntil("document.querySelector('.document-page')?.dataset.scale") { it == normalScale }

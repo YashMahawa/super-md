@@ -1,6 +1,11 @@
-# Super MD 0.4.7
+# Super MD 0.4.8
 
 ## This release
+
+- Android device tests exercise fullscreen pinch zoom rather than a removed
+  toolbar button, retaining real painted-pixel and PDF verification.
+- Copying rendered tables, blockquotes, separators and checkboxes retains
+  Markdown structure rather than flattening it into unformatted text.
 
 - PDF, portable SMD and Save dialogs preserve spaces, Unicode and literal percent
   signs in filenames. Typed file URLs prevent double-encoding at the Qt boundary.
