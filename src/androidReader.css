@@ -12,8 +12,11 @@
 .android-source, .android-reading { flex: 1; min-width: 0; height: 100%; overflow: auto; overscroll-behavior: contain; }
 .android-reading { padding: var(--cutout-top, 0px) var(--cutout-right, 0px) 0 var(--cutout-left, 0px); }
 .mode-split .android-source { border-right: 1px solid var(--outline); }
-.android-reading .markdown-body { width: calc(100% - 32px); max-width: var(--reading-max-width, none); font-size: calc(var(--reader-size) * var(--workspace-scale)); padding: 22px 0 40vh; }
-.android-reading .live-document { width: calc(100% - 32px); max-width: var(--reading-max-width, none); padding: 24px 0 40vh; }
+.document-page-space { min-width:100%; overflow-anchor:none; }
+.document-page { margin:0 auto; width:80%; }
+.android-reading .markdown-body { width:100%; max-width:none; font-size:var(--reader-size); padding:22px 0 40vh; }
+.android-reading .live-document { width:100%; max-width:none; padding:24px 0 40vh; }
+.android-reading .live-block .markdown-body, .android-reading .live-active-block textarea { font-size:var(--reader-size); }
 .android-reading .live-block .markdown-body { width: 100%; max-width: none; padding: 0; }
 .android-reading .markdown-body h1 { font-size: 2em; }
 .android-reading .markdown-body h2 { font-size: 1.5em; }

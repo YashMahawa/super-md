@@ -63,7 +63,7 @@ def main():
     app = StudioApplication(sys.argv)
     for file in (ROOT / "smd-core" / "fonts").glob("*.ttf"):
         QFontDatabase.addApplicationFont(str(file))
-    app.setFont(QFont("Noto Sans",11))
+    app.setFont(QFont("Manrope",11))
     app.setWindowIcon(QIcon(str(ROOT / "public" / "brand-mark-fixed.svg")))
     broker = None if args.test_state else InstanceBroker(app)
     if broker and not broker.claim_or_forward(args.note):

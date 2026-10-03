@@ -3,6 +3,68 @@ import { mkdir, readFile, writeFile } from "node:fs/promises";
 import { dirname, join } from "node:path";
 
 test.beforeEach(async ({ page }) => { await page.addInitScript(() => localStorage.setItem("setup.complete", "true")); });
+test("document magnifies like a PDF without changing wraps and keeps a focal point",async({page})=>{
+  await page.setViewportSize({width:1200,height:900});
+  await page.addInitScript(()=>{window.SuperMD={post:()=>{}};});await page.goto("/android-reader.html");
+  const content="# A page\n\n"+Array.from({length:30},(_,i)=>`Paragraph ${i}. A long formula $E=mc^2$ and a sentence whose wrapping must remain stable during zoom. `.repeat(3)).join("\n\n");
+  await page.evaluate(content=>window.supermdLoad?.({id:"page",content,path:null,mode:"reader",dark:false,fullscreen:false,colors:{},font:"Manrope",size:18,widthPercent:80,zoom:100}),content);
+  const reader=page.locator(".android-reading"),body=page.locator(".document-page");
+  await reader.evaluate(node=>node.scrollTop=600);
+  const p=page.locator(".markdown-body p").nth(2),before=(await p.boundingBox())!,height=await p.evaluate(node=>(node as HTMLElement).offsetHeight);
+  const focus={x:before.x+before.width*.4,y:before.y+before.height*.4};
+  await page.evaluate(focus=>window.supermdZoomBy?.(2,focus),focus);
+  const after=(await p.boundingBox())!;
+  expect(after.width/before.width).toBeCloseTo(2,1);expect(after.height/before.height).toBeCloseTo(2,1);
+  expect(await p.evaluate(node=>(node as HTMLElement).offsetHeight)).toBe(height);
+  expect(after.x+after.width*.4).toBeCloseTo(focus.x,0);expect(after.y+after.height*.4).toBeCloseTo(focus.y,0);
+  await expect(body).toHaveAttribute("data-scale","2");
+  expect(await reader.evaluate(node=>node.scrollWidth>node.clientWidth)).toBe(true);
+  await page.evaluate(focus=>window.supermdZoomBy?.(.5,focus),focus);
+  await expect(body).toHaveAttribute("data-scale","1");
+});
+test("graph canvas drags and two-finger moves pan while 3D pinch never tilts",async({page})=>{
+  await page.addInitScript(()=>{window.SuperMD={post:()=>{}};});await page.goto("/android-reader.html");
+  const graph=(mode:string)=>JSON.stringify({mode,series:[{expression:mode==="surface3d"?"x^2+y^2":"sin(x)"}],x:{min:-2,max:2,steps:12},y:{min:-2,max:2},sliders:[{name:"a",min:0,max:2,value:1}]});
+  for(const mode of ["line","surface3d"]){
+    await page.evaluate(content=>window.supermdLoad?.({id:content,content,path:null,mode:"reader",dark:false,fullscreen:false,colors:{},font:"Manrope",size:18,zoom:100}),"```smd-chart\n"+graph(mode)+"\n```");
+    const plot=page.locator(".interactive-chart"),svg=plot.locator("svg");await expect(svg).toBeVisible();
+    const rect=(await svg.boundingBox())!,x=rect.x+rect.width*.5,y=rect.y+rect.height*.5;
+    const initial=Number(await plot.getAttribute("data-center-x"));
+    await page.mouse.move(x,y);await page.mouse.down();await page.mouse.move(x+60,y+25,{steps:4});await page.mouse.up();
+    await expect.poll(()=>plot.getAttribute("data-center-x").then(Number)).toBeLessThan(initial);
+    const prior=Number(await plot.getAttribute("data-center-x"));
+    await svg.evaluate(target=>{
+      const r=target.getBoundingClientRect(),touches=(dx:number,span:number)=>[new Touch({identifier:1,target,clientX:r.left+70+dx,clientY:r.top+100}),new Touch({identifier:2,target,clientX:r.left+70+dx+span,clientY:r.top+100})];
+      target.dispatchEvent(new TouchEvent("touchstart",{bubbles:true,cancelable:true,touches:touches(0,100)}));
+      target.dispatchEvent(new TouchEvent("touchmove",{bubbles:true,cancelable:true,touches:touches(25,100)}));
+      target.dispatchEvent(new TouchEvent("touchmove",{bubbles:true,cancelable:true,touches:touches(25,200)}));
+      target.dispatchEvent(new TouchEvent("touchend",{bubbles:true,touches:[]}));
+    });
+    await expect(plot).toHaveAttribute("data-plot-zoom","2");
+    expect(Number(await plot.getAttribute("data-center-x"))).not.toBe(prior);
+    if(mode==="surface3d"){await expect(svg).toHaveAttribute("data-elevation","28");await expect(svg).toHaveAttribute("data-azimuth","35");}
+    const panBefore=Number(await plot.getAttribute("data-center-x"));
+    await svg.evaluate(node=>{const r=node.getBoundingClientRect();window.supermdNativeWheel?.(30,10,{x:r.left+r.width/2,y:r.top+r.height/2},false);});
+    await expect.poll(()=>plot.getAttribute("data-center-x").then(Number)).toBeGreaterThan(panBefore);
+    await expect(plot).toHaveAttribute("data-plot-zoom","2");
+    await svg.dispatchEvent("wheel",{deltaY:120,deltaMode:1});await expect(plot).toHaveAttribute("data-plot-zoom","2");
+    // Magnifying the controls belongs to the page, not the plot camera.
+    await plot.locator(".chart-legend").dispatchEvent("wheel",{ctrlKey:true,deltaY:-120,bubbles:true});
+    await expect(page.locator(".document-page")).not.toHaveAttribute("data-scale","1");await expect(plot).toHaveAttribute("data-plot-zoom","2");
+  }
+});
+test("shared repair applies on Android/Qt and button history can undo and redo it",async({page})=>{
+  await page.addInitScript(()=>{window.SuperMD={post:()=>{}};});await page.goto("/android-reader.html");
+  const content=String.raw`# Formula\n\nGiven \frac{a}{b} = c, continue.\n\n$ \sqrt{x} $\n\nE=mc^2`.replaceAll("\\n","\n");
+  await page.evaluate(content=>window.supermdLoad?.({id:"repair",content,path:null,mode:"reader",dark:false,fullscreen:false,colors:{},font:"Manrope",size:18,zoom:100}),content);
+  await page.evaluate(()=>window.supermdRepairMath?.());await page.getByRole("button",{name:/Apply 3 repairs/}).click();
+  await expect(page.locator(".katex")).toHaveCount(3);await expect(page.locator(".katex-error")).toHaveCount(0);
+  // These are the exact functions called by native toolbar buttons.
+  await page.evaluate(()=>window.supermdHistory?.("undo"));await expect(page.locator(".katex")).toHaveCount(1);
+  await page.evaluate(()=>window.supermdHistory?.("redo"));await expect(page.locator(".katex")).toHaveCount(3);
+  await page.keyboard.press("Control+z");await expect(page.locator(".katex")).toHaveCount(1);
+  await page.keyboard.press("Control+y");await expect(page.locator(".katex")).toHaveCount(3);
+});
 test("reading search highlights every match without switching mode and escapes cleanly",async({page})=>{
   await page.addInitScript(()=>{window.SuperMD={post:()=>{}};});
   await page.goto("/android-reader.html");

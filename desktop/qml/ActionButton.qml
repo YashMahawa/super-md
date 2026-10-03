@@ -10,7 +10,7 @@ Button {
     property bool tonal: false
     property var colors: JSON.parse(studio.snapshot).colors
     property bool motion: JSON.parse(studio.snapshot).settings.motion
-    font.family: "Noto Sans"
+    font.family: "Manrope"
     font.pixelSize: 14
     font.weight: Font.Medium
     implicitHeight: compact ? 36 : 44
@@ -36,8 +36,8 @@ Button {
         antialiasing: true
         radius: control.down ? 10 : control.highlighted ? 14 : height / 2
         color: control.prominent ? control.colors.primary : control.highlighted ? control.colors["primary-container"] : control.tonal ? control.colors["surface-high"] : "transparent"
-        border.width: control.visualFocus ? 2 : 0
-        border.color: control.colors.primary
+        border.width: control.visualFocus ? 2 : control.tonal ? 1 : 0
+        border.color: control.visualFocus ? control.colors.primary : control.colors.outline
         Behavior on radius { enabled: control.motion; NumberAnimation { duration: 140; easing.type: Easing.OutCubic } }
         Rectangle { anchors.fill: parent; radius: parent.radius; antialiasing: true; color: control.Material.foreground; opacity: control.down ? .12 : control.hovered ? .08 : 0; Behavior on opacity { enabled: control.motion; NumberAnimation { duration: 120 } } }
     }

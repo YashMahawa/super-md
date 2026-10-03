@@ -2,6 +2,7 @@ import { useEffect, useRef, useState } from "react";
 import { zoomTranslation, type Point } from "../focalZoom";
 import { setReaderOverlay } from "../readerOverlays";
 import { MaterialSlider } from "./MaterialControls";
+import { wheelIntent } from "../wheelIntent";
 
 export default function ImageViewer() {
   const [image, setImage] = useState<{ src: string; alt: string; owner: HTMLElement | null } | null>(null);
@@ -40,12 +41,14 @@ export default function ImageViewer() {
     };
     const native = (event: Event) => { const detail = (event as CustomEvent<number | {factor:number;point?:Point}>).detail; scale(zoomRef.current * (typeof detail === "number" ? detail : detail.factor), typeof detail === "number" ? undefined : detail.point); };
     const reset = fit;
-    const wheel = (event: WheelEvent) => { event.preventDefault(); event.stopPropagation(); scale(zoomRef.current*Math.exp(-event.deltaY*.002),{x:event.clientX,y:event.clientY}); };
+    const wheel = (event: WheelEvent) => { event.preventDefault(); event.stopPropagation(); if(wheelIntent(event)==="pan")translate({x:panRef.current.x-event.deltaX,y:panRef.current.y-event.deltaY});else scale(zoomRef.current*Math.exp(-event.deltaY*.002),{x:event.clientX,y:event.clientY}); };
     const surface = canvas.current;
+    const nativePan=(event:Event)=>{const {dx,dy}=(event as CustomEvent<{dx:number;dy:number}>).detail;event.preventDefault();translate({x:panRef.current.x-dx,y:panRef.current.y-dy});};
+    surface?.addEventListener("supermd-canvas-pan",nativePan);
     surface?.addEventListener("wheel",wheel,{passive:false});
     document.addEventListener("keydown", key, true); window.addEventListener("supermd-image-zoom", native);
     window.addEventListener("supermd-image-reset",reset);
-    return () => { surface?.removeEventListener("wheel",wheel); window.removeEventListener("supermd-image-reset",reset); document.removeEventListener("keydown", key, true); window.removeEventListener("supermd-image-zoom", native); previous?.focus({ preventScroll: true }); pointers.current.clear(); };
+    return () => { surface?.removeEventListener("supermd-canvas-pan",nativePan);surface?.removeEventListener("wheel",wheel); window.removeEventListener("supermd-image-reset",reset); document.removeEventListener("keydown", key, true); window.removeEventListener("supermd-image-zoom", native); previous?.focus({ preventScroll: true }); pointers.current.clear(); };
   }, [image]);
   if (!image) return null;
   const edit = (action: string) => { if (image.owner) window.dispatchEvent(new CustomEvent("supermd-image-edit", { detail: { action, image: image.owner } })); setImage(null); };

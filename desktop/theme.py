@@ -78,11 +78,11 @@ def tokens(mode,system_dark,system_colors=None,system_mode=None):
     if not dark:
         # A tinted paper hierarchy, not a stark white sheet over dark outlines.
         # Keep the actual system accent when available; otherwise use app blue.
-        result["surface"] = blend(result["surface"], result["primary-container"], .68)
-        result["surface-low"] = blend(result["surface-low"], result["primary-container"], .48)
-        result["surface-high"] = blend(result["surface-high"], result["primary-container"], .58)
-        result["text"] = blend(result["text"], result["surface"], .14)
-        result["outline"] = blend(result["outline"], result["surface"], .45)
+        result["surface"] = blend(blend(result["surface"], result["primary-container"], .9),result["primary"],.035)
+        result["surface-low"] = blend(blend(result["surface-low"], result["primary-container"], .75),result["primary"],.07)
+        result["surface-high"] = blend(blend(result["surface-high"], result["primary-container"], .7),result["primary"],.16)
+        result["text"] = blend(result["text"], result["surface"], .08)
+        result["outline"] = blend(result["outline"], result["text"], .24)
     if any(get_contrast_ratio(result["primary"],result[background]) < 4.5 for background in ("surface","surface-low","surface-high")):
         result["primary"] = scheme["primary"]
         result["on-primary"] = scheme["on_primary"]

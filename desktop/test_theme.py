@@ -10,8 +10,11 @@ class ThemeTest(unittest.TestCase):
         self.assertNotEqual(colors["surface"], "#ffffff")
         self.assertNotEqual(colors["surface"], generated("#386aaf",False)["surface"])
         self.assertNotEqual(colors["surface"], colors["surface-high"])
+        # Controls and sidebar must not melt into the tinted reading paper.
+        self.assertGreater(get_contrast_ratio(colors["surface"],colors["surface-high"]),1.15)
+        self.assertGreater(get_contrast_ratio(colors["surface"],colors["outline"]),1.8)
         self.assertGreaterEqual(get_contrast_ratio(colors["text"], colors["surface"]), 4.5)
-        self.assertLess(get_contrast_ratio(colors["text"], colors["surface"]), 14)
+        self.assertLess(get_contrast_ratio(colors["text"], colors["surface"]), 15)
     def test_unknown_qt_is_not_assumed_light(self):
         with patch("theme.subprocess.run") as run, patch("theme.sys.platform", "linux"):
             run.return_value.returncode = 0

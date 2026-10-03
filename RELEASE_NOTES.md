@@ -1,4 +1,32 @@
-# Super MD 0.4.1
+# Super MD 0.4.2
+
+## This release
+
+- Actual page magnification in Read/Live, without changing line wrapping. Math,
+  images and tables scale together; focal zoom and two-finger translation keep
+  the same area in view. Native toolbar/tab/sidebar sizes remain unchanged.
+- Gestures target the graph canvas, not its title, sliders or surrounding card.
+  Drag and two-finger movement pan both 2D and 3D plots. Pinch magnifies without
+  tilting the 3D camera. Shift-drag and arrow keys remain available for rotation.
+- Qt routes native touchpad pixel deltas separately from ordinary mouse wheel
+  notches. Browser-only hosts use a documented wheel-delta fallback. Image viewers
+  support independent two-finger pan and focal zoom as well.
+- Deeper accent-tinted light paper with stronger control surfaces, outlined tonal
+  actions, a visible sidebar divider and separated recent-note/window actions.
+  Text contrast is checked instead of letting controls disappear into the paper.
+- Manrope defaults for new reading/PDF preferences. Existing choices are retained.
+- Visible Undo/Redo controls on desktop and Android, plus Ctrl+Z/Ctrl+Y shortcuts.
+- Shared, reviewable LaTeX repairs validate candidates with KaTeX: missing dollar
+  signs, padded delimiters, alternate/mismatched enclosing, copied escaped math
+  dollars, unfinished display fences, align/equation environments and limited
+  missing-brace repairs. No invented fraction arguments, automatic source rewrite,
+  arbitrary macros, or changes to code, links, HTML and currency.
+
+Expanded tests cover unchanged wraps/focal zoom, real Android two-finger graph
+gestures, native history buttons, camera invariance and repaired formula rendering.
+Physical phone testing was not performed; the previous releases remain available.
+
+## Previously included improvements (0.4.1)
 
 ## Reading and editing polish
 

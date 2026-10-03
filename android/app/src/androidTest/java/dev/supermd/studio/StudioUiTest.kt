@@ -27,6 +27,49 @@ class StudioUiTest {
         repeat(2) { if (compose.onAllNodesWithText("Continue").fetchSemanticsNodes().isNotEmpty()) compose.onNodeWithText("Continue").performClick() }
         compose.onAllNodesWithText("Explore the sample").fetchSemanticsNodes().firstOrNull()?.let { compose.onNodeWithText("Explore the sample").performClick() }
     }
+    @Test fun graphNativeTwoFingerPanAndPinchDoesNotRotateOrZoomTheNote() {
+        welcome()
+        val model=androidx.lifecycle.ViewModelProvider(compose.activity)[StudioViewModel::class.java]
+        val content="""# A surface
+
+```smd-chart
+{"mode":"surface3d","series":[{"expression":"x^2+y^2"}],"x":{"min":-2,"max":2,"steps":12},"y":{"min":-2,"max":2}}
+```
+"""
+        compose.runOnIdle {model.edit(model.state.value.active.id,content);model.mode("reader");model.zoom(100f)}
+        javascriptUntil("document.querySelector('.surface-chart')?.getAttribute('data-elevation')") {it=="\"28\""}
+        val raw=javascriptUntil("JSON.stringify((()=>{const s=document.querySelector('.surface-chart');s.scrollIntoView({block:'center',behavior:'instant'});const r=s.getBoundingClientRect();return {x:r.left+r.width*.5,y:r.top+r.height*.5,d:devicePixelRatio};})())") {it.contains("\\\"d\\\"")}
+        val rect=org.json.JSONObject(org.json.JSONArray("[$raw]").getString(0))
+        val native=AtomicReference(IntArray(2))
+        compose.runOnIdle {val xy=IntArray(2);web(compose.activity.window.decorView)!!.getLocationOnScreen(xy);native.set(xy)}
+        val density=rect.getDouble("d").toFloat()
+        val x=native.get()[0]+rect.getDouble("x").toFloat()*density
+        val y=native.get()[1]+rect.getDouble("y").toFloat()*density
+        compose.onRoot().performTouchInput {
+            down(0,androidx.compose.ui.geometry.Offset(x-25*density,y));down(1,androidx.compose.ui.geometry.Offset(x+25*density,y));advanceEventTime(50)
+            moveTo(0,androidx.compose.ui.geometry.Offset(x-15*density,y+10*density));moveTo(1,androidx.compose.ui.geometry.Offset(x+35*density,y+10*density));advanceEventTime(50)
+            moveTo(0,androidx.compose.ui.geometry.Offset(x-35*density,y+10*density));moveTo(1,androidx.compose.ui.geometry.Offset(x+55*density,y+10*density));advanceEventTime(50);up(0);up(1)
+        }
+        javascriptUntil("Number(document.querySelector('.interactive-chart')?.dataset.plotZoom)") {(it.toDoubleOrNull()?:0.0)>1.3}
+        assertEquals("\"28\"",javascriptUntil("document.querySelector('.surface-chart').dataset.elevation"){it=="\"28\""})
+        assertEquals("\"35\"",javascriptUntil("document.querySelector('.surface-chart').dataset.azimuth"){it=="\"35\""})
+        assertEquals("\"1\"",javascriptUntil("document.querySelector('.document-page').dataset.scale"){it=="\"1\""})
+    }
+    @Test fun visibleHistoryButtonsUndoAndRedoAReviewedMathRepair() {
+        welcome()
+        val model=androidx.lifecycle.ViewModelProvider(compose.activity)[StudioViewModel::class.java]
+        val original="Given \\frac{a}{b} = c, continue."
+        compose.runOnIdle {model.edit(model.state.value.active.id,original);model.mode("reader")}
+        javascriptUntil("document.querySelector('.markdown-body')?.textContent") {it.contains("Given")}
+        compose.onNodeWithContentDescription("More actions").performClick();compose.onNodeWithText("Fix LaTeX").performClick()
+        javascriptUntil("(()=>{const b=document.querySelector('.math-repair-panel footer button');if(b&&!b.disabled)b.click();return document.querySelectorAll('.katex').length;})()") {it=="1"}
+        compose.onNodeWithContentDescription("Undo (Ctrl+Z)").assertIsDisplayed().performClick()
+        javascriptUntil("document.querySelectorAll('.katex').length") {it=="0"}
+        compose.runOnIdle {assertEquals(original,model.state.value.active.content)}
+        compose.onNodeWithContentDescription("Redo (Ctrl+Y)").assertIsDisplayed().performClick()
+        javascriptUntil("document.querySelectorAll('.katex').length") {it=="1"}
+        compose.runOnIdle {assertTrue(model.state.value.active.content.contains("$\\frac{a}{b} = c$"))}
+    }
     @Test fun longPressReordersNativeTabsAndKeepsTheActiveDraft() {
         val first = Note(name = "First.md", content = "First unsaved draft")
         val second = Note(name = "Second.smd", content = "Second unsaved draft", assetDirectory = "images")

@@ -35,7 +35,7 @@ ApplicationWindow {
     Material.background: viewState.colors.surface
     Material.foreground: viewState.colors["on-surface"]
     color: viewState.colors.surface
-    font.family: "Noto Sans"
+    font.family: "Manrope"
     onClosing: function(close) { close.accepted = closingAllowed; if (!closingAllowed) studio.closeWindowSafely() }
 
     Connections {
@@ -84,6 +84,8 @@ ApplicationWindow {
                 ActionButton { text: window.width < 1000 ? "" : "New note"; glyph: "Plus"; ToolTip.text: "New note"; onClicked: studio.newNote() }
                 ActionButton { text: "Open note"; glyph: "File"; onClicked: openDialog.open() }
                 ActionButton { glyph: "FloppyDisk"; ToolTip.text: "Save note"; onClicked: studio.saveSafely(); enabled: !viewState.busy }
+                ActionButton { glyph: "Undo"; ToolTip.text: "Undo (Ctrl+Z)"; onClicked: studio.command("undo") }
+                ActionButton { glyph: "Redo"; ToolTip.text: "Redo (Ctrl+Y)"; onClicked: studio.command("redo") }
                 Item { Layout.fillWidth: true }
                 ActionButton { glyph: "MagnifyingGlass"; ToolTip.text: "Find in note (Ctrl+F)"; onClicked: studio.command("find") }
                 ActionButton { glyph: "Image"; ToolTip.text: "Insert image or link"; onClicked: studio.command("insert") }
@@ -102,13 +104,14 @@ ApplicationWindow {
     SplitView {
         anchors.fill: parent
         orientation: Qt.Horizontal
-        handle: Rectangle { implicitWidth: 6; color: SplitHandle.pressed ? window.Material.primary : "transparent" }
+        handle: Rectangle { implicitWidth: 6; color: window.viewState.colors["surface-low"]; Rectangle { anchors.horizontalCenter: parent.horizontalCenter; width: SplitHandle.pressed || SplitHandle.hovered ? 3 : 1; height: parent.height; color: SplitHandle.pressed || SplitHandle.hovered ? window.Material.primary : window.viewState.colors.outline } }
         Pane {
             visible: sidebar && !viewState.fullscreen
             SplitView.preferredWidth: 260
             SplitView.minimumWidth: 200
             SplitView.maximumWidth: 500
             padding: 16
+            background: Rectangle { color: window.viewState.colors["surface-low"] }
             ColumnLayout {
                 anchors.fill: parent
                 spacing: 12
@@ -137,7 +140,8 @@ ApplicationWindow {
                     }
                     ScrollBar.vertical: ExpressiveScrollBar { }
                 }
-                Label { text: "Recent notes"; font.weight: Font.DemiBold }
+                Rectangle { Layout.fillWidth: true; height: 1; color: viewState.colors.outline }
+                Label { text: "Recent notes"; font.weight: Font.DemiBold; color: viewState.colors.text }
                 ListView {
                     Layout.fillWidth: true
                     Layout.preferredHeight: Math.min(240, viewState.recent.length * 40)
@@ -147,7 +151,8 @@ ApplicationWindow {
                     ScrollBar.vertical: ExpressiveScrollBar { }
                 }
                 Label { visible: !viewState.folder && !viewState.recent.length; text: "Open any folder for quick access. Your notes stay ordinary files."; wrapMode: Text.WordWrap; Layout.fillWidth: true; color: viewState.colors.muted }
-                ActionButton { text: "New window"; Layout.fillWidth: true; onClicked: studio.command("window") }
+                Rectangle { Layout.fillWidth: true; height: 1; color: viewState.colors.outline }
+                ActionButton { text: "New window"; tonal: true; Layout.fillWidth: true; onClicked: studio.command("window") }
             }
         }
         Item {
@@ -197,6 +202,19 @@ ApplicationWindow {
                     settings.localContentCanAccessFileUrls: true
                     settings.javascriptCanOpenWindows: false
                     settings.fullScreenSupportEnabled: false
+                    WheelHandler {
+                        target: null
+                        acceptedDevices: PointerDevice.Mouse | PointerDevice.TouchPad
+                        onWheel: function(event) {
+                            // Qt retains the device's pixel deltas. DOM wheel
+                            // events lose that distinction, so route touchpad
+                            // movement without guessing from notch magnitude.
+                            if ((event.pixelDelta.x || event.pixelDelta.y) && !(event.modifiers & (Qt.ControlModifier | Qt.MetaModifier))) {
+                                event.accepted = true
+                                reader.runJavaScript("window.supermdNativeWheel?.(" + (-event.pixelDelta.x) + "," + (-event.pixelDelta.y) + "," + JSON.stringify({x:event.x,y:event.y}) + "," + !!(event.buttons & Qt.LeftButton) + ")")
+                            } else event.accepted = false
+                        }
+                    }
                     Component.onCompleted: {
                         const script = WebEngine.script()
                         script.injectionPoint = WebEngineScript.DocumentCreation
