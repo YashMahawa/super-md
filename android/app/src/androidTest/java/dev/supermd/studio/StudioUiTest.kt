@@ -8,12 +8,28 @@ import androidx.compose.runtime.mutableStateOf
 import androidx.compose.ui.test.*
 import androidx.compose.ui.test.junit4.createAndroidComposeRule
 import org.junit.Assert.*
+import org.junit.After
 import org.junit.Rule
 import org.junit.Test
 import java.util.concurrent.atomic.AtomicReference
 
 class StudioUiTest {
     @get:Rule val compose = createAndroidComposeRule<MainActivity>()
+    private var temporaryNoteState: StudioState? = null
+    @After fun restoreTemporaryNoteAndRecovery() {
+        val before = temporaryNoteState ?: return
+        val model = androidx.lifecycle.ViewModelProvider(compose.activity)[StudioViewModel::class.java]
+        // The real app persists recovery between instrumentation methods. A
+        // temporary gesture/repair fixture must not replace the welcome note
+        // used by the existing end-to-end rendering/Python/PDF checks.
+        compose.runOnIdle {
+            model.edit(before.active.id, before.active.content)
+            model.mode(before.mode)
+            model.zoom(before.normalZoom)
+            model.flush()
+            assertEquals(before.active.content, model.state.value.active.content)
+        }
+    }
     private fun web(view: View): WebView? = if (view is WebView) view else if (view is ViewGroup) (0 until view.childCount).firstNotNullOfOrNull { web(view.getChildAt(it)) } else null
     private fun javascriptUntil(script: String, accepted: (String) -> Boolean): String {
         val result = AtomicReference("")
@@ -30,6 +46,7 @@ class StudioUiTest {
     @Test fun graphNativeTwoFingerPanAndPinchDoesNotRotateOrZoomTheNote() {
         welcome()
         val model=androidx.lifecycle.ViewModelProvider(compose.activity)[StudioViewModel::class.java]
+        temporaryNoteState = model.state.value
         val content="""# A surface
 
 ```smd-chart
@@ -58,6 +75,7 @@ class StudioUiTest {
     @Test fun visibleHistoryButtonsUndoAndRedoAReviewedMathRepair() {
         welcome()
         val model=androidx.lifecycle.ViewModelProvider(compose.activity)[StudioViewModel::class.java]
+        temporaryNoteState = model.state.value
         val original="Given \\frac{a}{b} = c, continue."
         compose.runOnIdle {model.edit(model.state.value.active.id,original);model.mode("reader")}
         javascriptUntil("document.querySelector('.markdown-body')?.textContent") {it.contains("Given")}
