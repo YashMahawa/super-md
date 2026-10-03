@@ -24,13 +24,14 @@ import MathRepairPanel from "./components/MathRepairPanel";
 import { captureScrollAnchor } from "./scrollAnchor";
 import ReadingSearch from "./components/ReadingSearch";
 import type { Point } from "./focalZoom";
-import { applyDocumentZoom } from "./documentZoom";
+import { applyDocumentZoom,invalidateDocumentZoom } from "./documentZoom";
 import { documentOutline, navigateToHeading } from "./documentNavigation";
+import {recordHistory,replayHistory,historySize,validHistory,type NoteHistory} from './noteHistory';
+import {cachedEditorHistory} from './components/Editor';
 const DocumentPreview = memo(MarkdownPreview);
 const LiveDocument = memo(LiveEditor);
 const SourceEditor = memo(Editor);
 
-type NoteHistory = {undo:string[];redo:string[];last:number};
 interface NoteView { editor?: PortableEditorSession; history?:NoteHistory; top?: number; rendered?: ReturnType<typeof exportRenderedViews> }
 interface ReaderState { id: string; content: string; path: string | null; mode: "live" | "editor" | "reader" | "split"; dark: boolean; fullscreen: boolean; font: string; size: number; width?: number; widthPercent?:number; lineHeight?:number; colors: Record<string, string>; zoom: number; motion?: boolean; python?: string; viewState?: NoteView }
 declare global { interface Window {supermdDismiss?:()=>boolean;supermdSetZoom?:(zoom:number)=>void;supermdHeading?:(id:string,offset?:number)=>void;supermdHistory?:(direction:"undo"|"redo")=>void;supermdNativeWheel?:(dx:number,dy:number,point:Point,held:boolean)=>void;} }
@@ -46,9 +47,11 @@ function Reader() {
   const pendingChange = useRef(0);
   const noteViews = useRef(new Map<string, NoteView>());
   const histories=useRef(new Map<string,NoteHistory>());
+  const trimHistories=(active:string)=>{let retained=[...histories.current.values()].reduce((size,h)=>size+historySize(h),0);for(const [id,cached] of histories.current){if(histories.current.size<=40&&retained<=4_000_000)break;if(id===active)continue;histories.current.delete(id);retained-=historySize(cached);}};
   const replaying=useRef(false);
   const loadedFonts=useRef(new Map<string,Promise<FontFace>>());
   const cursor=useRef<Point|undefined>(undefined);
+  const zoomFrame=useRef(0),zoomTimer=useRef(0),zoomFocus=useRef<Point|undefined>(undefined);
   const modeOffset=useRef<number|null>(null);
   const anchors = (focus?:Point) => Array.from(document.querySelectorAll<HTMLElement>(".android-reading,.cm-scroller")).filter(root=>{const r=root.getBoundingClientRect();return !focus || focus.x>=r.left&&focus.x<=r.right&&focus.y>=r.top&&focus.y<=r.bottom;}).map(root=>captureScrollAnchor(root,focus));
   const applyZoomStyle=(focus?:Point,previousFocus=focus)=>{document.querySelector<HTMLElement>(".android-source")?.style.setProperty("--workspace-scale",String(zoomReference.current/100));document.querySelectorAll<HTMLElement>(".android-reading").forEach(root=>applyDocumentZoom(root,zoomReference.current,reference.current?.widthPercent??80,focus,previousFocus));};
@@ -57,6 +60,7 @@ function Reader() {
     window.supermdDismiss=()=>{const element=document.querySelector(".image-viewer,.math-repair-panel,.reading-search,.cm-search,.live-active-block textarea");if(!element)return false;const target=element.matches("textarea")?element:document.activeElement||document;target.dispatchEvent(new KeyboardEvent("keydown",{key:"Escape",bubbles:true,cancelable:true}));if(element.matches("textarea"))(element as HTMLElement).blur();return true;};
     window.supermdLoad = (next) => {
       const old = reference.current;
+      if(old&&(old.id!==next.id||old.mode!==next.mode)){const history=histories.current.get(next.id);if(history)history.last=0;}
       if(old&&old.id===next.id&&old.mode!==next.mode){
         const root=document.querySelector<HTMLElement>(".android-reading");
         modeOffset.current=old.mode==="editor"?(editorReadingOffset(old.id)??0):root?readingOffset(root):0;
@@ -70,20 +74,24 @@ function Reader() {
         importEditorSession(next.id, next.viewState.editor);
         importRenderedViews(next.content, next.viewState.rendered);
         const history=next.viewState.history;
-        if(history && [history.undo,history.redo].every(list=>Array.isArray(list)&&list.length<=60&&list.every(text=>typeof text==="string")&&list.reduce((size,text)=>size+text.length,0)<=2_000_000))histories.current.set(next.id,{undo:[...history.undo],redo:[...history.redo],last:0});
-        noteViews.current.set(next.id, next.viewState);
+        if(validHistory(history))histories.current.set(next.id,{undo:structuredClone(history.undo),redo:structuredClone(history.redo),last:0});
+        trimHistories(next.id);
+        noteViews.current.set(next.id, {top:next.viewState.top});
       }
-      const load = () => { reference.current=next;setState(next); zoomReference.current = next.zoom; };
+      const loaded={...next,viewState:undefined};
+      const load = () => { reference.current=loaded;setState(loaded); zoomReference.current = loaded.zoom; };
       if (old?.id === next.id && old.mode === next.mode) anchored(load); else load();
     };
     window.supermdHistory=direction=>{
       const current=reference.current;if(!current)return;
       replaying.current=true;
-      if(current.mode==="editor" || current.mode==="split") editorHistory(current.id,direction);
-      else {const history=histories.current.get(current.id);if(history){const from=history[direction],to=history[direction==="undo"?"redo":"undo"],next=from.pop();if(next!==undefined){to.push(current.content);history.last=0;update(next);}}}
+      const history=histories.current.get(current.id);const next=history?replayHistory(history,current.content,direction):undefined;
+      if(next!==undefined)update(next);
+      else if(current.mode==="editor"||current.mode==="split")editorHistory(current.id,direction);
+      else {const cached=cachedEditorHistory(current.id,direction,current.content);if(cached!==undefined)update(cached);}
       replaying.current=false;
     };
-    window.supermdZoomBy = (factor,focus=cursor.current) => { if (document.querySelector(".image-viewer")) { window.dispatchEvent(new CustomEvent("supermd-image-zoom",{detail:{factor,point:focus}})); return; } zoomReference.current=clampPreviewZoom(zoomReference.current*factor);applyZoomStyle(focus);void invoke("zoom_changed",{zoom:zoomReference.current}); };
+    window.supermdZoomBy = (factor,focus=cursor.current) => { if (document.querySelector(".image-viewer")) { window.dispatchEvent(new CustomEvent("supermd-image-zoom",{detail:{factor,point:focus}})); return; } zoomReference.current=clampPreviewZoom(zoomReference.current*factor);zoomFocus.current=focus;if(!zoomFrame.current)zoomFrame.current=requestAnimationFrame(()=>{zoomFrame.current=0;applyZoomStyle(zoomFocus.current);});window.clearTimeout(zoomTimer.current);zoomTimer.current=window.setTimeout(()=>void invoke("zoom_changed",{zoom:zoomReference.current}),160); };
     window.supermdSetZoom=value=>{const next=clampPreviewZoom(value);if(Math.abs(next-zoomReference.current)<.01)return;zoomReference.current=next;applyZoomStyle();};
     window.supermdHeading=(id,offset)=>{if(reference.current?.mode==="editor"){window.dispatchEvent(new CustomEvent("supermd-goto-offset",{detail:offset??0}));return;}const root=document.querySelector(".android-reading");if(root)navigateToHeading(root,id);};
     window.supermdResetZoom = () => { if (document.querySelector(".image-viewer")) { window.dispatchEvent(new Event("supermd-image-reset")); return; } window.supermdZoomBy?.(100/zoomReference.current); };
@@ -120,12 +128,12 @@ function Reader() {
       catch (error) { await invoke("export_failed", {error: String(error)}); }
     };
     void invoke("reader_ready");
-    return () => { delete window.supermdLoad; delete window.supermdExport; delete window.supermdExportMarkdown; delete window.supermdPortable; delete window.supermdZoomBy; delete window.supermdResetZoom; delete window.supermdRepairMath; delete window.supermdFlush; delete window.supermdSetZoom; delete window.supermdHeading; };
+    return () => { cancelAnimationFrame(zoomFrame.current);window.clearTimeout(zoomTimer.current);delete window.supermdLoad; delete window.supermdExport; delete window.supermdExportMarkdown; delete window.supermdPortable; delete window.supermdZoomBy; delete window.supermdResetZoom; delete window.supermdRepairMath; delete window.supermdFlush; delete window.supermdSetZoom; delete window.supermdHeading; };
   }, []);
   useEffect(()=>{if(state)void invoke("document_outline",{id:state.id,headings:documentOutline(state.content)}).catch(()=>{});},[state?.id,state?.content]);
   useLayoutEffect(() => {
     if (!state) return;
-    const root = document.documentElement; root.dataset.theme = state.dark ? "dark" : "light"; root.dataset.motion = state.motion === false ? "off" : "on";
+    const root = document.documentElement; root.dataset.theme = state.dark ? "dark" : "light"; root.dataset.motion = state.motion === false ? "off" : "on";root.dataset.fullscreen=String(state.fullscreen);
     root.style.setProperty("--reader-size", `${state.size}px`);
     root.style.setProperty("--editor-size", `${Math.max(12, Math.min(24, state.size - 2))}px`);
     const fonts: Record<string,string> = {sans:"Manrope,'Manrope Variable', sans-serif",serif:"'Noto Serif','Noto Serif Variable', Georgia, serif",mono:"'JetBrains Mono','JetBrains Mono Variable', monospace",Manrope:"Manrope,'Manrope Variable',sans-serif","JetBrains Mono":"'JetBrains Mono','JetBrains Mono Variable',monospace","Noto Sans":"'Noto Sans',sans-serif","Noto Serif":"'Noto Serif','Noto Serif Variable',serif",Roboto:"Roboto,'Roboto Variable',sans-serif",roboto:"Roboto,'Roboto Variable',sans-serif",noto:"'Noto Sans',sans-serif",system:"system-ui,sans-serif"};
@@ -134,9 +142,13 @@ function Reader() {
     root.style.setProperty("--reading-max-width",`${state.widthPercent??80}%`);
     root.style.setProperty("--reader-leading",String(state.lineHeight??1.65));
     Object.entries(state.colors).forEach(([key, value]) => root.style.setProperty(`--${key}`, value));
-    applyZoomStyle();
+    document.querySelectorAll<HTMLElement>('.android-reading').forEach(invalidateDocumentZoom);applyZoomStyle();
   }, [state]);
-  useEffect(()=>{const root=document.querySelector<HTMLElement>(".android-reading");if(!root || typeof ResizeObserver==="undefined")return;let frame=0;const observer=new ResizeObserver(()=>{if(!frame)frame=requestAnimationFrame(()=>{frame=0;applyZoomStyle();});});observer.observe(root);const page=root.querySelector(".document-page");if(page)observer.observe(page);return()=>{observer.disconnect();cancelAnimationFrame(frame);};},[state?.id,state?.mode]);
+  useEffect(()=>{const root=document.querySelector<HTMLElement>(".android-reading");if(!root || typeof ResizeObserver==="undefined")return;let frame=0;const page=root.querySelector<HTMLElement>(".document-page");const observer=new ResizeObserver(()=>{invalidateDocumentZoom(root);if(!frame)frame=requestAnimationFrame(()=>{frame=0;
+    // A scheduled gesture owns its focal point. A resize callback must not
+    // consume the pending scale at the default center before that frame runs.
+    if(Math.abs(Number(page?.dataset.scale)*100-zoomReference.current)<.01)applyZoomStyle();
+  });});observer.observe(root);if(page)observer.observe(page);return()=>{observer.disconnect();cancelAnimationFrame(frame);};},[state?.id,state?.mode]);
   useEffect(()=>{
     if(!state || ["sans","serif","mono","noto","roboto","system","Manrope","Roboto","Noto Sans","Noto Serif","JetBrains Mono"].includes(state.font) || !window.SuperMD || typeof FontFace==="undefined")return;
     const family=state.font;
@@ -211,12 +223,9 @@ function Reader() {
     if(content===previous.content)return;
     if(!replaying.current){
       const history=histories.current.get(previous.id)||{undo:[],redo:[],last:0},now=Date.now();
-      if(now-history.last>600 || Math.abs(content.length-previous.content.length)>1 || !history.undo.length)history.undo.push(previous.content);
-      history.redo=[];history.last=now;
-      while(history.undo.length>60 || history.undo.reduce((size,text)=>size+text.length,0)>2_000_000)history.undo.shift();
+      recordHistory(history,previous.content,content,now);
       histories.current.delete(previous.id);histories.current.set(previous.id,history);
-      let retained=[...histories.current.values()].reduce((size,h)=>size+[...h.undo,...h.redo].reduce((n,text)=>n+text.length,0),0);
-      for(const [id,cached] of histories.current){if(histories.current.size<=40&&retained<=4_000_000)break;if(id===previous.id)continue;histories.current.delete(id);retained-=[...cached.undo,...cached.redo].reduce((n,text)=>n+text.length,0);}
+      trimHistories(previous.id);
     }
     const next = { ...reference.current!, content }; setState(next); reference.current = next;
     // The bridge receives every edit immediately, so closing/rotating cannot lose

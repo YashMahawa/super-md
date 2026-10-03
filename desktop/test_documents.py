@@ -5,9 +5,19 @@ import stat
 import tempfile
 import unittest
 from pathlib import Path
-from documents import atomic_write, bundle, materialize_assets, open_note, validate
+from documents import atomic_write, atomic_json, bundle, materialize_assets, open_note, validate
 
 class DocumentsTest(unittest.TestCase):
+    def test_streamed_recovery_round_trip_and_failed_serialization_are_atomic(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path=Path(directory)/"recovery.json"
+            value=[{"content":'Quoted "λ" and \\math\n'*10000,"saved":"original"}]
+            atomic_json(path,value)
+            self.assertEqual(json.loads(path.read_text()),value)
+            before=path.read_bytes()
+            with self.assertRaises(TypeError):atomic_json(path,{"unsupported":object()})
+            self.assertEqual(path.read_bytes(),before)
+            self.assertEqual(list(Path(directory).iterdir()),[path])
     def test_legacy_and_new_formats(self):
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory)/"note.smd"

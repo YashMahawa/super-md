@@ -42,6 +42,15 @@ describe("image references", () => {
 });
 
 describe("executable Python cells", () => {
+  it('server rendering never drops large-note content when IntersectionObserver exists',()=>{
+    const previous=globalThis.IntersectionObserver;
+    Object.assign(globalThis,{IntersectionObserver:class {}});
+    try {
+      const markdown=Array.from({length:500},(_,i)=>`## Chapter ${i}\n\n${'Full note text. '.repeat(12)} $x_${i}^2$\n\n`).join('');
+      const html=renderToStaticMarkup(<MarkdownPreview markdown={markdown} documentPath={null} python="" dark={false}/>);
+      expect(html.match(/class="katex"/g)).toHaveLength(500);expect(html).toContain('Chapter 499');expect(html).not.toContain('data-windowed-block');
+    } finally {Object.assign(globalThis,{IntersectionObserver:previous});}
+  });
   it("preserves syntax highlighting without changing the executable source", () => {
     const html = renderToStaticMarkup(<MarkdownPreview markdown={"```python\nimport numpy as np\nprint('hello')\n```"} documentPath={null} python="python3" dark={false} />);
     expect(html).toContain('class="hljs-keyword"');

@@ -13,6 +13,34 @@ import java.io.File
 
 @RunWith(AndroidJUnit4::class)
 class EngineTest {
+    @Test fun derivedPythonOutputReloadsWithoutRerunningCode() {
+        val app=ApplicationProvider.getApplicationContext<android.app.Application>()
+        val root=File(app.cacheDir,"output-store-${java.util.UUID.randomUUID()}")
+        try {
+            val source="print('λ') # ../../not-a-path"
+            val result=JSONObject().put("ok",true).put("stdout","λ\n").put("stderr","").put("images",org.json.JSONArray().put("data:image/svg+xml;base64,PHN2Zy8+"))
+            val first=PythonOutputStore(root);assertNull(first.load(source));first.store(source,result)
+            val second=PythonOutputStore(root);assertEquals(result.toString(),second.load(source)!!.toString());assertEquals(1,root.listFiles()!!.size)
+            assertEquals("λ\n",second.load(source)!!.getString("stdout"))
+        } finally {root.deleteRecursively()}
+    }
+    @Test fun streamingRecoveryPreservesLargeDraftsAndReadsPreviousSnapshots() {
+        val app=ApplicationProvider.getApplicationContext<android.app.Application>()
+        val text="Quoted \"Unicode λ\" and \\math\n".repeat(200_000)
+        val clean=Note(name="Large.md",content=text,saved=text)
+        val dirty=Note(name="Draft.md",content=text+"New edit",saved=text)
+        val state=StudioState(tabs=listOf(clean,dirty),activeId=dirty.id,closedTabs=listOf(Note(name="Closed.md",content="Recover me",saved="")),mode="reader",normalZoom=123f)
+        val file=File(app.cacheDir,"streamed-recovery.json")
+        try {
+            file.bufferedWriter().use{NoteRecovery.write(it,state)}
+            val restored=file.bufferedReader().use{NoteRecovery.read(it,StudioState())}
+            assertEquals(state.tabs,restored.tabs);assertEquals(state.closedTabs,restored.closedTabs)
+            assertEquals(dirty.id,restored.activeId);assertEquals(123f,restored.normalZoom)
+            assertSame("Clean saved text should not occupy another full string",restored.tabs[0].content,restored.tabs[0].saved)
+            val previous="""{"tabs":[{"id":"legacy","name":"Legacy.md","content":"Quotes \"λ\"","saved":"original","uri":"","relative":"","assetDirectory":""}],"active":"legacy","closed":[],"mode":"live"}"""
+            val legacy=NoteRecovery.read(previous.reader(),StudioState());assertEquals("Quotes \"λ\"",legacy.active.content);assertEquals("original",legacy.active.saved)
+        } finally {file.delete()}
+    }
     @Test fun selectablePapersAndPrivateFontsExportOnDevice() {
         val app=ApplicationProvider.getApplicationContext<android.app.Application>()
         val font=File(app.cacheDir,"import-Manrope.ttf")

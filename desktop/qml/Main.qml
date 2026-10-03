@@ -185,7 +185,6 @@ ApplicationWindow {
                     anchors.fill: parent
                     ModeGroup { choices: window.width < 1000 ? [{key:"live",label:"Live"},{key:"editor",label:"Source"},{key:"reader",label:"Read"}] : [{key:"live",label:"Live"},{key:"editor",label:"Source"},{key:"reader",label:"Read"},{key:"split",label:"Split"}]; selected: viewState.mode; onChosen: key => studio.setMode(key) }
                     Item { Layout.fillWidth: true }
-                    ActionButton { glyph: "Contents"; compact: true; ToolTip.text: "Table of contents"; onClicked: contentsPopup.open() }
                     ExpressiveSlider { visible: window.width >= 1000; Layout.preferredWidth: 140; from: 60; to: 240; value: viewState.zoom; onMoved: studio.setZoom(value); Accessible.name: "Content zoom" }
                     TextField {
                         objectName: "zoomPercentage"
@@ -255,12 +254,12 @@ ApplicationWindow {
                     }
                 }
             }
-            Row {
-                visible: viewState.fullscreen && !viewState.readerOverlay && (window.chromeAwake || fullscreenHover.hovered || activeFocus)
-                anchors.right: parent.right; anchors.top: parent.top; anchors.margins: 12; spacing: 8
-                HoverHandler { id: fullscreenHover }
-                ActionButton { glyph: "Contents"; compact: true; tonal: true; ToolTip.text: "Table of contents"; onClicked: contentsPopup.open() }
-                ActionButton { glyph: "FullscreenExit"; icon.width: 24; icon.height: 24; compact: true; tonal: true; ToolTip.text: "Exit fullscreen (Esc · F11)"; onClicked: windowModes.setFullscreen(false) }
+            StudyControls {
+                anchors.fill: parent
+                visible: viewState.fullscreen && !viewState.readerOverlay
+                awake: window.chromeAwake
+                onContentsRequested: contentsPopup.open()
+                onExitRequested: windowModes.setFullscreen(false)
             }
         }
     }
@@ -268,7 +267,7 @@ ApplicationWindow {
         id: contentsPopup
         objectName: "contentsOverlay"
         parent: Overlay.overlay
-        x: Math.max(16, window.width - width - 16)
+        x: 16
         y: viewState.fullscreen ? 64 : Math.min(180, window.height / 4)
         width: Math.min(380,window.width-32)
         height: Math.min(560,window.height-y-24)

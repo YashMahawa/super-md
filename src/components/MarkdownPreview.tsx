@@ -132,7 +132,7 @@ interface Props {
 }
 
 function MarkdownPreview({ markdown, documentPath, python, dark, trustedImageHosts = [], onTrustImageHost, onChange }: Props) {
-  const normalized = normalizeCallouts(markdown);
+  const normalized = useMemo(()=>normalizeCallouts(markdown),[markdown]);
   const tasks=useMemo(()=>{
     if(!onChange || !/\[[ xX]\]/.test(markdown))return [];
     const prefix=markdown.match(/^---\r?\n[\s\S]*?\r?\n---\r?\n/)?.[0].length||0;
@@ -142,7 +142,7 @@ function MarkdownPreview({ markdown, documentPath, python, dark, trustedImageHos
     return offsets;
   },[markdown,onChange]);
   return (
-    <article className="markdown-body" onCopy={event=>{const source=selectedMarkdown(window.getSelection());if(source!==null){event.clipboardData.setData("text/plain",source);event.preventDefault();}}}>
+    <article className="markdown-body" onCopy={event=>{if(event.currentTarget.closest('.live-document'))return;const source=selectedMarkdown(window.getSelection(),normalized);if(source!==null){event.clipboardData.setData("text/plain",source);event.preventDefault();}}}>
       <CachedMarkdown
         remarkPlugins={[remarkGfm, remarkMath, remarkObsidianMath, remarkCallouts, remarkHeadingIds, remarkTaskPositions,remarkSourcePositions]}
         rehypePlugins={[rehypeKatex, rehypeHighlight]}

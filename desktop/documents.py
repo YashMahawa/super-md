@@ -76,6 +76,19 @@ def atomic_write(path: Path, data: bytes) -> None:
         if os.path.exists(temporary):
             os.unlink(temporary)
 
+def atomic_json(path: Path, value) -> None:
+    """Write ordered recovery without full-workspace JSON + UTF-8 copies."""
+    handle, temporary = tempfile.mkstemp(prefix=f".{path.name}.", suffix=".tmp", dir=path.parent)
+    try:
+        with os.fdopen(handle, "w", encoding="utf-8") as file:
+            if path.exists() and hasattr(os,"fchmod"):
+                os.fchmod(file.fileno(),stat.S_IMODE(path.stat().st_mode))
+            json.dump(value,file,ensure_ascii=False)
+            file.flush();os.fsync(file.fileno())
+        os.replace(temporary,path)
+    finally:
+        if os.path.exists(temporary):os.unlink(temporary)
+
 def materialize_assets(root: Path, assets: dict[str,str]) -> None:
     """Save a portable note as Markdown without dropping its pictures or overwriting others."""
     bundle("",assets)

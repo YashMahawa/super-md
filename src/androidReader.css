@@ -14,9 +14,11 @@
 .mode-split .android-source { border-right: 1px solid var(--outline); }
 .document-page-space { min-width:100%; overflow-anchor:none; }
 .document-page { margin:0; width:80%; transform-origin:top left; contain:layout style; }
+.windowed-md-block { display:flow-root;overflow-anchor:none; }
 /* Keep a saved intrinsic size as blocks leave the viewport. Layout/paint of
    off-screen KaTeX trees is skipped while source/anchors stay searchable. */
 .android-reading .live-block, .android-reading .document-page > .markdown-body > :is(p,aside,details,pre,table,ul,ol,figure,div) { content-visibility:auto;contain-intrinsic-size:auto 120px; }
+.android-reading .windowed-md-block { content-visibility:visible;contain-intrinsic-size:none; }
 /* Palette commits are atomic. Per-element background transitions otherwise
    reveal a patchwork of the previous and next native theme. */
 :root, body { transition:none; }

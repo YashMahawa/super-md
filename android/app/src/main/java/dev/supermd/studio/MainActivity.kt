@@ -285,7 +285,6 @@ private object NoMotionScheme : MotionScheme {
                             SingleChoiceSegmentedButtonRow(Modifier.weight(1f)) { modes.forEachIndexed { index, mode -> SegmentedButton(selected = actualMode == mode, onClick = { model.mode(mode) }, colors = SegmentedButtonDefaults.colors(activeContainerColor = palette.primary, activeContentColor = palette.onPrimary), shape = SegmentedButtonDefaults.itemShape(index, modes.size)) { Text(when(mode) { "editor" -> "Source"; "reader" -> "Read"; "split" -> "Split"; else -> "Live" }) } } }
                             IconButton(onClick={web?.evaluateJavascript("window.supermdHistory?.('undo')",null)},enabled=readerReady){Icon(Icons.Rounded.Undo,"Undo (Ctrl+Z)")}
                             IconButton(onClick={web?.evaluateJavascript("window.supermdHistory?.('redo')",null)},enabled=readerReady){Icon(Icons.Rounded.Redo,"Redo (Ctrl+Y)")}
-                            IconButton(onClick={contentsShown=true}){Icon(painterResource(R.drawable.symbol_contents),"Show contents")}
                         }
                         HorizontalDivider(color = palette.outlineVariant.copy(alpha = .55f))
                     }
@@ -331,7 +330,10 @@ private object NoMotionScheme : MotionScheme {
                             }
                         })
                     } }, modifier = Modifier.fillMaxSize().clipToBounds(), onRelease = { readerReady = false; web?.removeJavascriptInterface("SuperMD"); web?.destroy(); it.removeAllViews(); web = null })
-                    if (state.fullscreen && !state.readerOverlay && chromeAwake) Surface(shape=RoundedCornerShape(24.dp),color=palette.surfaceContainerHigh,modifier=Modifier.align(Alignment.TopEnd).safeDrawingPadding().padding(8.dp)) {Row {IconButton(onClick={contentsShown=true;wakeChrome()}){Icon(painterResource(R.drawable.symbol_contents),"Show contents")};IconButton(onClick={model.fullscreen(false)}){Icon(painterResource(R.drawable.symbol_fullscreen_exit),"Exit fullscreen")}}}
+                    if (state.fullscreen && !state.readerOverlay && chromeAwake) {
+                        Surface(shape=RoundedCornerShape(24.dp),color=palette.surfaceContainerHigh,modifier=Modifier.align(Alignment.TopStart).safeDrawingPadding().padding(8.dp)) {IconButton(onClick={contentsShown=true;wakeChrome()}){Icon(painterResource(R.drawable.symbol_contents),"Show contents")}}
+                        Surface(shape=RoundedCornerShape(24.dp),color=palette.surfaceContainerHigh,modifier=Modifier.align(Alignment.TopEnd).safeDrawingPadding().padding(8.dp)) {IconButton(onClick={model.fullscreen(false)}){Icon(painterResource(R.drawable.symbol_fullscreen_exit),"Exit fullscreen")}}
+                    }
                     SnackbarHost(snackbar, Modifier.align(Alignment.BottomCenter).safeDrawingPadding())
                     if (state.busy) Surface(color = palette.surface.copy(alpha = .9f), modifier = Modifier.fillMaxSize()) { Column(Modifier.fillMaxSize(), verticalArrangement = Arrangement.Center, horizontalAlignment = Alignment.CenterHorizontally) { CircularProgressIndicator(); Spacer(Modifier.height(16.dp)); Text("Preparing your document…") } }
                 }

@@ -1,4 +1,5 @@
 /** Source offsets survive switching between reflowed reading and source views. */
+import {revealWindowed} from "./windowedSearch";
 export function readingOffset(root:HTMLElement):number {
   const top=root.getBoundingClientRect().top+16;
   const blocks=Array.from(root.querySelectorAll<HTMLElement>(".live-block,[data-source-start]"));
@@ -15,5 +16,5 @@ export function revealReadingOffset(root:HTMLElement,offset:number):void {
     const start=Number(block.dataset.sourceStart),end=Number(block.dataset.sourceEnd);
     if(start<=offset){best=block;if(end>=offset)break;}
   }
-  best?.scrollIntoView({block:"start",behavior:"instant"});
+  if(best){revealWindowed(best);best.scrollIntoView({block:"start",behavior:"instant"});}
 }

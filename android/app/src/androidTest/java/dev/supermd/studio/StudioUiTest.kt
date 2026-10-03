@@ -54,6 +54,24 @@ class StudioUiTest {
         repeat(2) { if (compose.onAllNodesWithText("Continue").fetchSemanticsNodes().isNotEmpty()) compose.onNodeWithText("Continue").performClick() }
         compose.onAllNodesWithText("Explore the sample").fetchSemanticsNodes().firstOrNull()?.let { compose.onNodeWithText("Explore the sample").performClick() }
     }
+    @Test fun largeNoteKeepsOffscreenMathUnmountedAndHeadingSearchAvailable() {
+        welcome()
+        val model=androidx.lifecycle.ViewModelProvider(compose.activity)[StudioViewModel::class.java]
+        temporaryNoteState=model.state.value
+        val content=(0 until 600).joinToString("\n") { index ->
+            "## Chapter $index\n\nUnique-$index ${"Readable **study text**. ".repeat(6)} \$x_$index=\\frac{a+b}{c+d}\$\n\n\$\$\\int_0^1 x^2 dx=\\frac13\$\$\n"
+        }
+        compose.runOnIdle {model.edit(model.state.value.active.id,content);model.mode("reader");model.zoom(100f)}
+        javascriptUntil("document.querySelectorAll('[data-windowed-mounted=true]').length") {(it.toIntOrNull()?:0)>0}
+        val math=javascriptUntil("document.querySelectorAll('.katex').length") {(it.toIntOrNull()?:0)>0}.toInt()
+        assertTrue("Large notes must not keep every equation mounted",math<80)
+        javascriptUntil("(()=>{window.supermdHeading?.('chapter-599');const h=document.querySelector('h2#chapter-599');if(!h)return false;const r=h.getBoundingClientRect();return r.top>=0&&r.top<innerHeight;})()") {it=="true"}
+        assertTrue(javascriptUntil("document.querySelectorAll('.katex').length") {it.toIntOrNull()!=null}.toInt()<80)
+        javascriptUntil("(()=>{window.supermdFind?.();const input=document.querySelector('.reading-search input');if(!input)return false;const set=Object.getOwnPropertyDescriptor(HTMLInputElement.prototype,'value').set;set.call(input,'Unique-300');input.dispatchEvent(new Event('input',{bubbles:true}));return true;})()") {it=="true"}
+        javascriptUntil("document.querySelector('.reading-search output')?.textContent") {it=="\"0 / 1\""}
+        javascriptUntil("(()=>{const b=document.querySelector('button[aria-label=\"Next match\"]');if(b&&!b.disabled)b.click();return document.querySelector('.reading-search output')?.textContent;})()") {it=="\"1 / 1\""}
+        javascriptUntil("window.supermdDismiss?.()") {it=="true"}
+    }
     @Test fun graphNativeTwoFingerPanAndPinchDoesNotRotateOrZoomTheNote() {
         welcome()
         val model=androidx.lifecycle.ViewModelProvider(compose.activity)[StudioViewModel::class.java]
@@ -227,8 +245,13 @@ class StudioUiTest {
         val paletteIcon = android.graphics.Color.parseColor(org.json.JSONArray("[${javascriptUntil("getComputedStyle(document.documentElement).getPropertyValue('--muted')") { it.startsWith("\"#") }}]").getString(0))
         assertTrue("Reader must not overpaint the native toolbar", kotlin.math.abs(android.graphics.Color.red(nativeIcon) - android.graphics.Color.red(paletteIcon)) < 15 && kotlin.math.abs(android.graphics.Color.green(nativeIcon) - android.graphics.Color.green(paletteIcon)) < 15 && kotlin.math.abs(android.graphics.Color.blue(nativeIcon) - android.graphics.Color.blue(paletteIcon)) < 15)
         val normalScale = javascriptUntil("document.querySelector('.document-page')?.dataset.scale") { it.isNotBlank() && it != "null" && it != "\"\"" }
+        compose.onNodeWithContentDescription("Show contents").assertDoesNotExist()
         compose.onNodeWithContentDescription("More actions").performClick()
         compose.onNodeWithText("Fullscreen study").performClick()
+        javascriptUntil("document.documentElement.dataset.fullscreen") { it == "\"true\"" }
+        val contentsBounds=compose.onNodeWithContentDescription("Show contents").fetchSemanticsNode().boundsInRoot
+        val exitBounds=compose.onNodeWithContentDescription("Exit fullscreen").fetchSemanticsNode().boundsInRoot
+        assertTrue("Contents belongs at the left, separate from fullscreen exit",contentsBounds.right<exitBounds.left)
         // Fullscreen intentionally has no zoom buttons. Exercise the same
         // focal pinch path as normal reading instead of restoring stale UI.
         javascriptUntil("(() => { if (window.fullPinchDone) return true; if (window.fullPinchStarted) return false; window.fullPinchStarted=true; const target=document.querySelector('.android-reading'); const touches=(x) => [new Touch({identifier:1,target,clientX:60,clientY:140}),new Touch({identifier:2,target,clientX:x,clientY:140})]; target.dispatchEvent(new TouchEvent('touchstart',{bubbles:true,touches:touches(160)})); target.dispatchEvent(new TouchEvent('touchmove',{bubbles:true,cancelable:true,touches:touches(240)})); requestAnimationFrame(() => requestAnimationFrame(() => { target.dispatchEvent(new TouchEvent('touchend',{bubbles:true,touches:[]})); window.fullPinchDone=true; })); return false; })()") { it == "true" }

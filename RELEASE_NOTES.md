@@ -1,6 +1,31 @@
-# Super MD 0.4.8
+# Super MD 0.4.9
 
 ## This release
+
+- Large notes release offscreen rendered blocks: expanded math, highlighted code,
+  image components and interactive plots are mounted near the viewport instead
+  of retaining the entire rendered document. Full-note text search, heading
+  jumps, reference links, Live editing and copying across hidden blocks remain
+  available. PDF preparation still covers the complete source, not the viewport.
+- Focal zoom uses cached geometry and one visual update per frame, with native
+  zoom notifications debounced. Resize callbacks no longer steal a pinch's focal
+  point. Plain text selection remains available.
+- Cross-mode undo stores reversible changed ranges rather than full-note
+  copies. A large replacement remains undoable, and Source edits remain undoable
+  after switching to Read without a second full-text snapshot history.
+- Android recovery streams JSON, shares unchanged saved text and no longer
+  silently skips larger workspace snapshots. Desktop recovery serialization
+  moves off the UI thread and avoids a full-workspace UTF-8 payload copy.
+- Executed Matplotlib output is disk-backed, so offscreen figure data can leave
+  RAM and still reopen/export without rerunning Python. Small graph-state caches
+  retain larger notes' camera and slider choices without retaining their meshes.
+- Contents stays beside Folder in normal mode; the duplicate mode-toolbar button
+  is removed. Fullscreen Contents is on the left and Exit is on the right, with
+  idle hiding and overlay behavior on desktop and Android.
+- See `docs/LARGE-NOTE-PERFORMANCE.md` for reproducible local measurements and
+  explicit limits; these are not claims of physical-phone or battery benchmarks.
+
+## Included from the preceding maintenance update
 
 - Android device tests exercise fullscreen pinch zoom rather than a removed
   toolbar button, retaining real painted-pixel and PDF verification.

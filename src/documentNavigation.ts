@@ -3,6 +3,7 @@ import { unified } from "unified";
 import remarkParse from "remark-parse";
 import remarkMath from "remark-math";
 import { remarkObsidianMath } from "./obsidianMath";
+import {revealWindowed} from "./windowedSearch";
 
 export interface OutlineEntry {id:string;title:string;level:number;offset:number}
 export function documentOutline(markdown:string):OutlineEntry[] {
@@ -39,10 +40,12 @@ export function navigateHeading(link: HTMLAnchorElement): boolean {
 export function navigateToHeading(root:Element,target:string):boolean {
   const headings = Array.from(root.querySelectorAll<HTMLElement>("[data-heading-key]"));
   const counts = new Map<string, number>();
-  for (const heading of headings) { const key = heading.dataset.headingKey!, count = counts.get(key) || 0; counts.set(key, count + 1); heading.id = key + (count ? `-${count}` : ""); }
+  if(!root.querySelector('[data-windowed-block]'))for (const heading of headings) { const key = heading.dataset.headingKey!, count = counts.get(key) || 0; counts.set(key, count + 1); heading.id = key + (count ? `-${count}` : ""); }
   const heading = headings.find(node => node.id === target) || headings.find(node => node.id === headingSlug(target));
   if (!heading) return true; // Broken local links must not escape into a browser.
+  revealWindowed(heading);
   heading.scrollIntoView({ block: "start", behavior: document.documentElement.dataset.motion === "off" ? "instant" : "smooth" });
   heading.tabIndex = -1; heading.focus({ preventScroll: true });
+  if(heading.closest('[data-windowed-block]'))requestAnimationFrame(()=>requestAnimationFrame(()=>{const mounted=Array.from(root.querySelectorAll<HTMLElement>('[data-heading-key]')).find(node=>node.id===target);mounted?.scrollIntoView({block:'start',behavior:'instant'});}));
   return true;
 }

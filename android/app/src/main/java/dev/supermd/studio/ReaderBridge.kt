@@ -29,6 +29,8 @@ class ReaderBridge(private val web: WebView, private val model: StudioViewModel,
                     "reader_overlay_changed" -> { model.overlay(args.optBoolean("open"), args.optBoolean("image")); true }
                     "document_outline" -> { model.outline(args.getString("id"), args.getJSONArray("headings")); true }
                     "load_font" -> withContext(Dispatchers.IO) {model.fonts.reader(args.getString("family"))}
+                    "cache_python_output" -> withContext(Dispatchers.IO) {PythonOutputStore(java.io.File(web.context.cacheDir,"derived-python")).store(args.getString("source"),args.getJSONObject("result"));true}
+                    "load_python_output" -> withContext(Dispatchers.IO) {PythonOutputStore(java.io.File(web.context.cacheDir,"derived-python")).load(args.getString("source"))}
                     "load_asset" -> model.asset(args.getString("documentPath"), args.getString("source"))
                     "import_images" -> withContext(Dispatchers.IO) { model.media.importJson(args.getJSONArray("images")) }
                     "fetch_resource" -> withContext(Dispatchers.IO) { JSONObject().put("body", model.media.fetch(args.getString("url"), args.optBoolean("image"))) }

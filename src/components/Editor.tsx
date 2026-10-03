@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState } from "react";
-import { Compartment, EditorSelection, EditorState } from "@codemirror/state";
+import { Compartment, EditorSelection, EditorState,Transaction } from "@codemirror/state";
 import { EditorView, keymap, lineNumbers, highlightActiveLine, drawSelection } from "@codemirror/view";
 import { defaultKeymap, history, historyField, historyKeymap, indentWithTab, undo, redo } from "@codemirror/commands";
 import { markdown, markdownLanguage } from "@codemirror/lang-markdown";
@@ -21,7 +21,7 @@ function trimEditorSessions() {
   // The native model still owns every note; evicting a view cannot lose text.
   let retained = [...sessions.values()].reduce((size, entry) => size + entry.state.doc.length, 0);
   for (const [id, entry] of sessions) {
-    if (sessions.size <= 40 && retained <= 4_000_000) break;
+    if (sessions.size<=1 || sessions.size <= 40 && retained <= 4_000_000) break;
     sessions.delete(id); retained -= entry.state.doc.length;
     callbacks.delete(id); statusHandlers.delete(id);
   }
@@ -35,6 +35,11 @@ export function editorReadingOffset(id:string):number|undefined {
   return view.posAtCoords({x:rect.left+80,y:rect.top+16})??view.viewport.from;
 }
 export function editorHistory(id:string,direction:"undo"|"redo"):boolean {const view=visibleEditors.get(id);return !!view && (direction==="undo"?undo(view):redo(view));}
+export function cachedEditorHistory(id:string,direction:'undo'|'redo',content:string):string|undefined {
+  const cached=sessions.get(id);if(!cached||cached.state.doc.toString()!==content)return;
+  const changed=(direction==='undo'?undo:redo)({state:cached.state,dispatch:transaction=>{cached.state=transaction.state;}});
+  return changed?cached.state.doc.toString():undefined;
+}
 export function editorFindQuery(id:string,query:string,caseSensitive:boolean) {
   visibleEditors.get(id)?.dispatch({effects:setSearchQuery.of(new SearchQuery({search:query,caseSensitive,literal:true}))});
 }
@@ -44,6 +49,7 @@ export function editorFindRange(id:string,from:number,to:number) {
 }
 export interface PortableEditorSession { state: unknown; top: number; wrapped: boolean }
 const incomingSessions = new Map<string, PortableEditorSession>();
+const incomingWeights=new Map<string,number>();
 export function exportEditorSession(id: string): PortableEditorSession | undefined {
   const view = visibleEditors.get(id), cached = sessions.get(id);
   const state = view?.state || cached?.state;
@@ -54,8 +60,10 @@ export function exportEditorSession(id: string): PortableEditorSession | undefin
 }
 export function importEditorSession(id: string, data: PortableEditorSession | undefined) {
   if (!data || typeof data.top !== "number" || !Number.isFinite(data.top) || typeof data.wrapped !== "boolean") return;
+  const size=JSON.stringify(data).length;if(size>2_000_000)return;
   incomingSessions.set(id, data); sessions.delete(id);
-  if (incomingSessions.size > 40) incomingSessions.delete(incomingSessions.keys().next().value!);
+  incomingWeights.set(id,size);let retained=[...incomingWeights.values()].reduce((n,size)=>n+size,0);
+  while(incomingSessions.size>40||retained>4_000_000){const first=incomingSessions.keys().next().value!;incomingSessions.delete(first);retained-=incomingWeights.get(first)||0;incomingWeights.delete(first);}
 }
 export default function Editor({ sessionId = "default", value, onChange, dark, focusMode }: Props) {
   const host = useRef<HTMLDivElement>(null);
@@ -93,7 +101,7 @@ export default function Editor({ sessionId = "default", value, onChange, dark, f
   useEffect(() => {
     if (!host.current) return;
     const cached = sessions.get(sessionId);
-    const incoming = incomingSessions.get(sessionId); incomingSessions.delete(sessionId);
+    const incoming = incomingSessions.get(sessionId); incomingSessions.delete(sessionId);incomingWeights.delete(sessionId);
     if (incoming) setWrap(incoming.wrapped);
     if (cached) { appearance.current = cached.appearance; wrapping.current = cached.wrapping; setWrap(cached.wrapped); }
     const config = {
@@ -149,7 +157,7 @@ export default function Editor({ sessionId = "default", value, onChange, dark, f
     while (from < previous.length && from < value.length && previous[from] === value[from]) from++;
     let oldEnd = previous.length, newEnd = value.length;
     while (oldEnd > from && newEnd > from && previous[oldEnd - 1] === value[newEnd - 1]) { oldEnd--; newEnd--; }
-    instance.dispatch({ changes: { from, to: oldEnd, insert: value.slice(from, newEnd) } });
+    instance.dispatch({ changes: { from, to: oldEnd, insert: value.slice(from, newEnd) },annotations:Transaction.addToHistory.of(false) });
   }, [value]);
 
   useEffect(() => {

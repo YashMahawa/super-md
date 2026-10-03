@@ -46,6 +46,7 @@ test("document magnifies like a PDF without changing wraps and keeps a focal poi
   const p=page.locator(".markdown-body p").nth(2),before=(await p.boundingBox())!,height=await p.evaluate(node=>(node as HTMLElement).offsetHeight);
   const focus={x:before.x+before.width*.4,y:before.y+before.height*.4};
   await page.evaluate(focus=>window.supermdZoomBy?.(2,focus),focus);
+  await expect(body).toHaveAttribute("data-scale","2");
   const after=(await p.boundingBox())!;
   expect(after.width/before.width).toBeCloseTo(2,1);expect(after.height/before.height).toBeCloseTo(2,1);
   expect(await p.evaluate(node=>(node as HTMLElement).offsetHeight)).toBe(height);

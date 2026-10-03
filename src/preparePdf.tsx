@@ -19,12 +19,12 @@ function data(blob: Blob): Promise<string> {
 export async function preparePdf(markdown: string, documentPath: string | null) {
   const processor = unified().use(remarkParse).use(remarkGfm).use(remarkMath).use(remarkObsidianMath).use(remarkStringify);
   const tree = processor.parse(normalizeCallouts(markdown));
-  const work: Promise<void>[] = []; const assets: Record<string, string> = {}; let count = 0;
+  const work: Array<()=>Promise<void>> = []; const assets: Record<string, string> = {}; let count = 0;
   const chartTitles = new Map<any,string>();
   const add = (url: string, name: string) => { assets[name] = url.slice(url.indexOf(",") + 1); return name; };
   visit(tree, (node: any) => {
     const exportCell = node.type === "code" && ["mermaid", "svg", "smd-chart", "python", "py"].includes(node.lang);
-    if (node.type === "image") work.push((async () => {
+    if (node.type === "image") work.push(async () => {
       let url: string = node.url;
       if (!/^data:/i.test(url)) {
         if (/^https?:/i.test(url)) url = (await invoke<{ body: string }>("fetch_resource", { url, image: true })).body;
@@ -36,8 +36,8 @@ export async function preparePdf(markdown: string, documentPath: string | null) 
       if (!/^data:image\/(?:svg\+xml|png|jpeg);base64,/i.test(url)) url = await rasterImage(url);
       const extension = url.startsWith("data:image/svg") ? "svg" : url.startsWith("data:image/jpeg") ? "jpg" : "png";
       node.url = add(url, `asset-${++count}.${extension}`);
-    })());
-    if (exportCell) work.push((async () => {
+    });
+    if (exportCell) work.push(async () => {
       if (["mermaid", "smd-chart", "svg"].includes(node.lang)) {
         const svg = node.lang === "svg" ? svgImage(node.value) : node.lang === "mermaid" ? await renderMermaid(node.value) : (() => {
           const html = renderToStaticMarkup(<InteractiveChart source={node.value} />);
@@ -84,7 +84,7 @@ export async function preparePdf(markdown: string, documentPath: string | null) 
         node.children = [{ type: "image", url: add(url, `diagram-${++count}.svg`), alt: "Diagram" }];
         delete node.value; delete node.lang; delete node.meta;
       } else {
-        const output = pythonOutput(node.value);
+        const output = await pythonOutput(node.value);
         if (output && !output.ok) throw new Error(`Python cell failed; fix it before exporting:\n${output.stderr}`);
         if (output?.ok) {
           // Keep source code and output together: export should not erase code
@@ -96,12 +96,17 @@ export async function preparePdf(markdown: string, documentPath: string | null) 
         }
         // Never auto-execute code while exporting. Unrun cells stay source code.
       }
-    })());
+    });
     // A completed Python cell inserts its original code as a child. Do not
     // revisit generated children and recursively prepare that same cell.
     if (exportCell) return SKIP;
   });
-  await Promise.all(work);
+  // Limit concurrent native/image requests and yield between heavy SVG jobs.
+  // A long note must not queue every decode or monopolize the reader thread.
+  let next=0;
+  await Promise.all(Array.from({length:Math.min(4,work.length)},async()=>{
+    while(next<work.length){await work[next++]();await new Promise(resolve=>setTimeout(resolve,0));}
+  }));
   // Insert title paragraphs after all asynchronous replacements settle; parser
   // offsets and concurrent diagram jobs never race over parent array indices.
   visit(tree,(parent:any)=>{

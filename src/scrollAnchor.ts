@@ -3,10 +3,12 @@ export function captureScrollAnchor(root: HTMLElement, focus?:{x:number;y:number
   const caret = (document as Document & { caretRangeFromPoint?: (x:number,y:number)=>Range|null }).caretRangeFromPoint?.(x,y);
   const range = caret && root.contains(caret.startContainer) ? caret.cloneRange() : null;
   if(range?.startContainer.nodeType===Node.TEXT_NODE && range.startOffset<(range.startContainer.textContent?.length??0))range.setEnd(range.startContainer,range.startOffset+1);
-  const blocks = Array.from(root.querySelectorAll<HTMLElement>("p,h1,h2,h3,h4,li,pre,table,.cm-line"));
-  const block = blocks.find(node => { const rect=node.getBoundingClientRect(); return rect.top <= y && rect.bottom >= y; }) || blocks.find(node => node.getBoundingClientRect().bottom > bounds.top);
   const initial = range?.getBoundingClientRect();
   const useRange = !!initial?.height;
+  // A caret anchor already identifies the visible text. Walking every block
+  // anyway made native state/theme updates proportional to document length.
+  const blocks = useRange?[]:Array.from(root.querySelectorAll<HTMLElement>("p,h1,h2,h3,h4,li,pre,table,.cm-line"));
+  const block = blocks.find(node => { const rect=node.getBoundingClientRect(); return rect.top <= y && rect.bottom >= y; }) || blocks.find(node => node.getBoundingClientRect().bottom > bounds.top);
   const top = useRange ? initial!.top : block?.getBoundingClientRect().top;
   const left=useRange?initial!.left:undefined;
   const scroll = root.scrollTop, max = Math.max(1,root.scrollHeight-root.clientHeight);

@@ -4,6 +4,12 @@ import {renderToStaticMarkup} from "react-dom/server";
 import MarkdownPreview from "./components/MarkdownPreview";
 import {selectedMarkdown} from "./copySource";
 import {readingMatches} from "./components/ReadingSearch";
+it('copying across windowed-offscreen blocks retains their complete Markdown',()=>{
+  const text='Before\n\n$$x^2$$\n\nAfter',host=document.createElement('article');host.className='markdown-body';
+  host.innerHTML='<p>Before</p><section data-windowed-mounted="false" data-source-start="8" data-source-end="15"></section><p>After</p>';document.body.append(host);
+  const range=document.createRange();range.selectNodeContents(host);const selection=window.getSelection()!;selection.removeAllRanges();selection.addRange(range);
+  expect(selectedMarkdown(selection,text)).toBe(text);selection.removeAllRanges();host.remove();
+});
 it("copies source math exactly once alongside formatted text",()=>{
   const host=document.createElement("div");host.innerHTML=renderToStaticMarkup(<MarkdownPreview markdown={'**Proof**: $\\frac{1}{2}$ equals half.'} documentPath={null} python="" dark={false}/>);document.body.append(host);
   const range=document.createRange();range.selectNodeContents(host.querySelector("p")!);const selection=window.getSelection()!;selection.removeAllRanges();selection.addRange(range);

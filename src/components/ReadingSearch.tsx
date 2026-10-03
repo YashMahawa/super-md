@@ -2,6 +2,7 @@ import { useEffect, useRef, useState } from "react";
 import { setReaderOverlay } from "../readerOverlays";
 import {ArrowUp,ArrowDown,X,TextAa,ArrowsClockwise} from "@phosphor-icons/react";
 import {editorFindQuery,editorFindRange} from "./Editor";
+import {windowedMatches,revealWindowed,type WindowedMatch} from "../windowedSearch";
 type HighlightRegistry = Map<string, unknown>;
 export function readingMatches(host: Element, query: string, caseSensitive=false): Range[] {
   if (!query.trim()) return [];
@@ -48,8 +49,9 @@ export default function ReadingSearch({content,close,onChange,sourceSession}:{co
   const [matches,setMatches]=useState<Range[]>([]),[index,setIndex]=useState(-1);
   const [caseSensitive,setCaseSensitive]=useState(false),[replacing,setReplacing]=useState(false),[replacement,setReplacement]=useState("");
   const [sourceRanges,setSourceRanges]=useState<Array<{from:number;to:number}>>([]);
+  const [windowed,setWindowed]=useState<WindowedMatch[]|null>(null);
   const sourceSearch=!!sourceSession||replacing;
-  const count=sourceSearch?sourceRanges.length:matches.length;
+  const count=sourceSearch?sourceRanges.length:windowed?.length??matches.length;
   const input=useRef<HTMLInputElement>(null), current=useRef({matches,index});current.current={matches,index};
   const closeRef=useRef(close);closeRef.current=close;
   const registry=typeof CSS==="undefined" ? undefined : (CSS as typeof CSS & {highlights?:HighlightRegistry}).highlights;
@@ -57,6 +59,7 @@ export default function ReadingSearch({content,close,onChange,sourceSession}:{co
   const move=(direction:number) => {
     const {matches,index}=current.current;
     if(sourceSearch){if(!sourceRanges.length)return;const next=(index+direction+sourceRanges.length)%sourceRanges.length;const range=sourceRanges[next];if(sourceSession)editorFindRange(sourceSession,range.from,range.to);setIndex(next);return;}
+    if(windowed){if(!windowed.length)return;const next=(index+direction+windowed.length)%windowed.length,match=windowed[next];revealWindowed(match.element);match.element.scrollIntoView({block:'center',behavior:'instant'});setIndex(next);requestAnimationFrame(()=>requestAnimationFrame(()=>{const ranges=readingMatches(match.element,query,caseSensitive),range=ranges[match.ordinal];if(registry&&HighlightClass){registry.set('smd-search',new HighlightClass(...ranges));if(range)registry.set('smd-search-current',new HighlightClass(range));}range?.startContainer.parentElement?.scrollIntoView({block:'center',behavior:'instant'});}));return;}
     if(!matches.length)return;
     const next=(index+direction+matches.length)%matches.length, range=matches[next];
     let element=range.startContainer.parentElement;
@@ -74,10 +77,16 @@ export default function ReadingSearch({content,close,onChange,sourceSession}:{co
   useEffect(()=>{
     setSourceRanges(sourceMatches(content,query,caseSensitive));
     if(sourceSession)editorFindQuery(sourceSession,query,caseSensitive);
-    const frame=requestAnimationFrame(()=>{const host=document.querySelector(".android-reading")||document.querySelector(".markdown-body");const result=host?readingMatches(host,query,caseSensitive):[];setMatches(result);setIndex(-1);if(registry&&HighlightClass)registry.set("smd-search",new HighlightClass(...result));});
+    const frame=requestAnimationFrame(()=>{const host=document.querySelector(".android-reading")||document.querySelector(".markdown-body");setWindowed(host?windowedMatches(host,query,caseSensitive):null);const result=host?readingMatches(host,query,caseSensitive):[];setMatches(result);setIndex(-1);if(registry&&HighlightClass)registry.set("smd-search",new HighlightClass(...result));});
     return()=>{cancelAnimationFrame(frame);registry?.delete("smd-search");registry?.delete("smd-search-current");if(sourceSession)editorFindQuery(sourceSession,"",false);};
   },[query,content,caseSensitive,sourceSession,replacing]);
-  useEffect(()=>{if(registry&&HighlightClass){registry.delete("smd-search-current");if(index>=0&&matches[index])registry.set("smd-search-current",new HighlightClass(matches[index]));}},[index,matches]);
+  useEffect(()=>{if(!windowed&&registry&&HighlightClass){registry.delete("smd-search-current");if(index>=0&&matches[index])registry.set("smd-search-current",new HighlightClass(matches[index]));}},[index,matches,windowed]);
+  useEffect(()=>{
+    const host=document.querySelector('.android-reading');if(!host||!windowed||!query)return;
+    let frame=0;const refresh=()=>{if(frame)return;frame=requestAnimationFrame(()=>{frame=0;if(registry&&HighlightClass)registry.set('smd-search',new HighlightClass(...readingMatches(host,query,caseSensitive)));});};
+    host.addEventListener('supermd-window-change',refresh);
+    return()=>{cancelAnimationFrame(frame);host.removeEventListener('supermd-window-change',refresh);};
+  },[windowed,query,caseSensitive]);
   return <aside className="reading-search" data-independent-zoom role="search" aria-label="Find in note">
     <input ref={input} aria-label="Find in note" type="search" placeholder="Find in this note" value={query} onChange={event=>setQuery(event.target.value)} onKeyDown={event=>{if(event.key==="Enter"){event.preventDefault();move(event.shiftKey?-1:1);}}}/>
     <output aria-live="polite">{count ? `${index<0 ? 0 : index+1} / ${count}` : query ? "No matches" : ""}</output>

@@ -1,16 +1,20 @@
 /** Serialize the selected rendered fragment as Markdown, not KaTeX's duplicated
  * visual glyphs. Expand selection endpoints inside math to the original formula. */
-export function selectedMarkdown(selection: Selection | null): string | null {
+export function selectedMarkdown(selection: Selection | null, source?:string): string | null {
   if (!selection?.rangeCount || selection.isCollapsed) return null;
   const range=selection.getRangeAt(0).cloneRange();
   const elementAt=(node:Node)=>node instanceof Element?node:node.parentElement;
-  if (!elementAt(range.startContainer)?.closest(".markdown-body") || !elementAt(range.endContainer)?.closest(".markdown-body")) return null;
+  if (!elementAt(range.startContainer)?.closest(".markdown-body,.live-document") || !elementAt(range.endContainer)?.closest(".markdown-body,.live-document")) return null;
   const mathAt=(node:Node)=>node.parentElement?.closest(".katex-display") || node.parentElement?.closest(".katex");
   const start=mathAt(range.startContainer), end=mathAt(range.endContainer);
   if(start)range.setStartBefore(start);if(end)range.setEndAfter(end);
   const serialize=(node:Node):string=>{
     if(node.nodeType===Node.TEXT_NODE)return node.textContent||"";
     if(!(node instanceof Element))return Array.from(node.childNodes).map(serialize).join("");
+    if(source!==undefined&&node.matches('[data-windowed-mounted="false"]')) {
+      const from=Number(node.getAttribute('data-source-start')),to=Number(node.getAttribute('data-source-end'));
+      if(Number.isFinite(from)&&Number.isFinite(to)&&to>from)return source.slice(from,to)+'\n\n';
+    }
     if(node.matches("button,.image-edit-tools,.katex-mathml"))return "";
     if(node.matches(".katex-display,.katex")){const tex=node.querySelector('annotation[encoding="application/x-tex"]')?.textContent;if(tex)return node.matches(".katex-display")?`\n$$\n${tex}\n$$\n`:`$${tex}$`;}
     if(node.tagName==="TABLE"){

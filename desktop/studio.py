@@ -19,9 +19,10 @@ import uuid
 from pathlib import Path
 from PySide6.QtCore import QObject, Property, Signal, Slot, QStandardPaths, QTimer, QUrl, QFileSystemWatcher, QProcess, Qt, QPointF
 from PySide6.QtGui import QDesktopServices, QFontDatabase, QGuiApplication, QCursor
-from documents import atomic_write, bundle, image_data, materialize_assets, open_note, MIMES, MAX_IMAGE
+from documents import atomic_write, atomic_json, bundle, image_data, materialize_assets, open_note, MIMES, MAX_IMAGE
 from theme import detect_system_dark, read_system_palette, system_palette_paths, tokens
 from fonts import FontStore
+from python_outputs import PythonOutputs
 
 ROOT = Path(sys._MEIPASS)/"resources" if getattr(sys,"frozen",False) else Path(__file__).resolve().parent.parent
 DEFAULT_PDF = {"pageSize": "a4", "margin": 18, "fontSize": 10.5, "lineHeight": 1.35, "fontFamily": "Manrope", "pageNumbers": True, "themed": False}
@@ -41,6 +42,7 @@ class Session(QObject):
         self.data = Path(tempfile.mkdtemp(prefix="supermd-test-")) if isolated else Path(QStandardPaths.writableLocation(QStandardPaths.AppDataLocation))/"qt-studio"
         self.data.mkdir(parents=True,exist_ok=True)
         self.font_store = FontStore(self.data)
+        self.python_outputs = PythonOutputs(self.data/"derived-python")
         self.writes = concurrent.futures.ThreadPoolExecutor(max_workers=1,thread_name_prefix="supermd-save")
         self.settings = copy.deepcopy(DEFAULTS)
         self.recent = []
@@ -428,8 +430,8 @@ class Studio(QObject):
     def _recover(self):
         # Snapshot only unsaved tabs. Asset bytes stay in recovery, never in displayed source.
         self.session.drafts[self.window_id] = [copy.deepcopy({key: value for key, value in t.items() if key != "viewState"}) for t in self.tabs if t["content"] != t["saved"] and (t["path"] or t["content"].strip() or t["assets"])]
-        payload = json.dumps([tab for tabs in self.session.drafts.values() for tab in tabs]).encode()
-        self._submit(lambda: atomic_write(self.data / "recovery.json", payload), lambda *_: None, False,self.writes)
+        drafts = [tab for tabs in self.session.drafts.values() for tab in tabs]
+        self._submit(lambda: atomic_json(self.data / "recovery.json", drafts), lambda *_: None, False,self.writes)
 
     @Slot(str)
     def openPath(self, value):
@@ -875,6 +877,8 @@ class Studio(QObject):
             def work():
                 if command == "load_asset": return self._asset(captured,args["source"])
                 if command == "load_font": return self.session.font_store.reader(args["family"])
+                if command == "cache_python_output": self.session.python_outputs.store(args["source"],args["result"]); return True
+                if command == "load_python_output": return self.session.python_outputs.load(args["source"])
                 if command == "fetch_resource": return self._fetch(args)
                 if command == "import_images":
                     results = []

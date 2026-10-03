@@ -1,5 +1,25 @@
 # Verification
 
+## Windowed large notes and memory maintenance — 2026-10-03
+
+- Reproducible 2,000-formula headless-browser comparison: DOM nodes 217,003 to
+  5,090; JS heap about 193 MB to 61 MB; first equation/font readiness 3,555 ms to
+  972 ms. See `LARGE-NOTE-PERFORMANCE.md` for the fixture, method and limits.
+- Full browser regressions cover offscreen heading/search, focal zoom, Live
+  editing, source copying and PDF reload of disk-backed Python figures after RAM
+  eviction without rerunning code. Large-note server rendering stays complete.
+- 51 native Qt/Python checks pass, including opposite-side fullscreen controls,
+  atomic streamed recovery and derived output disk storage.
+- 15 native PDF typesetter tests and two CLI process tests pass. Long tables,
+  formulas, semantic callouts and all selectable paper/font options remain covered.
+- 17 local API 36 Android instrumentation tests pass, including real painting,
+  Python/Matplotlib/PDF, large-note heading/search, streamed recovery and derived
+  figure storage. Release lint and JVM tests pass. This is emulator evidence, not
+  verification of the user's Vivo installer or physical-phone responsiveness.
+- Final tagged source must additionally pass the Android 15/16 and all desktop
+  CI/release gates before publishing installers. Do not treat these local results
+  as evidence of an already published release.
+
 ## Reader, installer and memory maintenance — 2026-10-03
 
 - 74 frontend tests and all 17 browser workflows passed locally, including stable

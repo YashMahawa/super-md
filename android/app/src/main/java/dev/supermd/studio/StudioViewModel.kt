@@ -215,22 +215,14 @@ class StudioViewModel(app: Application, val workspaceKey: String = "main") : And
         var s = StudioState(theme = prefs.getString("theme", "system")!!, fullscreenTheme = prefs.getString("fullTheme", "black")!!, motion = prefs.getBoolean("motion", true), welcomed = prefs.getBoolean("welcomed", false), font = prefs.getString("font", "Manrope")!!, size = prefs.getFloat("size", 17f), folder = windowPrefs.getString("folder", if (workspaceKey == "main" && !windowPrefs.getBoolean("folderMigrated", false)) prefs.getString("folder", null) else null), pdf = prefs.getString("pdf", null) ?: StudioState().pdf)
         s = s.copy(accent = prefs.getString("accent","system")!!, widthPercent = prefs.getFloat("widthPercent",80f),lineHeight = prefs.getFloat("lineHeight",1.65f),autosave = prefs.getBoolean("autosave",true),customFonts = fonts.families)
         try {
-            if (snapshot.isFile && snapshot.length() < 30_000_000) {
-                val json = JSONObject(snapshot.readText()); val list = json.getJSONArray("tabs")
-                val notes = (0 until list.length()).map { i -> val n = list.getJSONObject(i); Note(n.getString("id"), n.getString("name"), n.optString("uri").takeIf { it.isNotBlank() }, n.getString("content"), n.getString("saved"), n.optString("relative").takeIf { it.isNotBlank() }, n.optString("assetDirectory").takeIf { it.isNotBlank() }) }
-                val closed = json.optJSONArray("closed") ?: JSONArray()
-                val closedNotes = (0 until closed.length()).map { i -> val n = closed.getJSONObject(i); Note(n.getString("id"), n.getString("name"), n.optString("uri").takeIf { it.isNotBlank() }, n.getString("content"), n.getString("saved"), n.optString("relative").takeIf { it.isNotBlank() }, n.optString("assetDirectory").takeIf { it.isNotBlank() }) }
-                if (notes.isNotEmpty()) s = s.copy(tabs = notes, closedTabs = closedNotes.take(12), activeId = json.optString("active"), mode = json.optString("mode", "live"), normalZoom = json.optDouble("normalZoom", 100.0).toFloat(), fullscreenZoom = json.optDouble("fullscreenZoom", 100.0).toFloat())
-            }
+            if (snapshot.isFile) s=snapshot.bufferedReader().use {NoteRecovery.read(it,s)}
         } catch (_: Exception) { s = s.copy(error = "The recovery snapshot could not be read. Your original files are untouched.") }
         return s
     }
     private fun schedulePersist() { persistJob?.cancel(); val current = mutable.value; persistJob = viewModelScope.launch(Dispatchers.IO) { delay(200); persist(current) } }
     @Synchronized private fun persist(s: StudioState) {
         try {
-            val tabs = JSONArray(); s.tabs.forEach { tabs.put(JSONObject().put("id", it.id).put("name", it.name).put("uri", it.uri ?: "").put("content", it.content).put("saved", it.saved).put("relative", it.relative ?: "").put("assetDirectory", it.assetDirectory ?: "")) }
-            val closed = JSONArray(); s.closedTabs.forEach { closed.put(JSONObject().put("id", it.id).put("name", it.name).put("uri", it.uri ?: "").put("content", it.content).put("saved", it.saved).put("relative", it.relative ?: "").put("assetDirectory", it.assetDirectory ?: "")) }
-            val temporary = File(snapshot.parentFile, snapshot.name + ".tmp"); temporary.outputStream().use { stream -> stream.write(JSONObject().put("active", s.active.id).put("tabs", tabs).put("closed", closed).put("mode", s.mode).put("normalZoom", s.normalZoom).put("fullscreenZoom", s.fullscreenZoom).toString().toByteArray()); stream.fd.sync() }
+            val temporary = File(snapshot.parentFile, snapshot.name + ".tmp"); temporary.outputStream().use { stream -> NoteRecovery.write(stream.bufferedWriter(),s); stream.fd.sync() }
             if (!temporary.renameTo(snapshot)) error("Could not replace recovery snapshot")
             windowPrefs.edit().putBoolean("folderMigrated", true).putString("folder", s.folder).apply()
         } catch (error: Exception) { viewModelScope.launch { mutable.value = mutable.value.copy(error = "Draft recovery could not save: ${error.message}. Please save your note to a file.") } }
