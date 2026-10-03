@@ -26,7 +26,7 @@ def read_system_palette():
     for path in system_palette_paths():
         try:
             if path.stat().st_size > 100_000: continue
-            data = json.loads(path.read_text())
+            data = json.loads(path.read_text(encoding="utf-8"))
             colors = {key:value for key,raw in data.get("colours",data.get("colors",{})).items() if (value:=normalize_color(raw))}
             if colors: return data.get("mode"),colors
         except (OSError,ValueError,TypeError,AttributeError):

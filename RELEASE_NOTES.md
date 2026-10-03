@@ -1,5 +1,7 @@
 # Super MD 0.4.9
 
+- Unicode draft recovery, imported-font records and settings explicitly use UTF-8 even on Windows machines with a legacy system encoding.
+
 ## This release
 
 - Android reading starts at 15 px for new users; reading sizes down to 6 px and

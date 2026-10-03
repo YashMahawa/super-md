@@ -5,7 +5,7 @@
 - 88 frontend unit tests and all 27 browser workflows pass locally, including
   distant links at 200%, selection hit testing at 175%, two-axis native panning,
   Source undo across modes and complete offscreen Python output export.
-- 55 Qt/Python tests pass, including streamed download size/hash checks and
+- 56 Qt/Python tests pass, including non-UTF-8 system-locale recovery, streamed download size/hash checks and
   rejection of drafts, prereleases, malformed versions and untrusted asset URLs.
   Software-rendered native tests retain the same geometry/color assertions.
 - 16 Rust typesetter tests and two real CLI process tests pass, including 6 pt

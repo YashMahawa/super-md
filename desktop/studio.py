@@ -51,13 +51,13 @@ class Session(QObject):
         self.windows = {}
         self.initial_recovery = []
         try:
-            stored = json.loads((self.data/"settings.json").read_text())
+            stored = json.loads((self.data/"settings.json").read_text(encoding="utf-8"))
             self.settings.update({k:v for k,v in stored["settings"].items() if k in DEFAULTS})
             self.settings["pdf"] = {**DEFAULT_PDF, **self.settings.get("pdf", {})}
             self.recent = [p for p in stored.get("recent",[]) if isinstance(p,str)][:30]
         except (OSError,ValueError,KeyError,TypeError,AttributeError): pass
         try:
-            recovered = json.loads((self.data/"recovery.json").read_text())
+            recovered = json.loads((self.data/"recovery.json").read_text(encoding="utf-8"))
             for tab in recovered:
                 if not isinstance(tab,dict) or any(not isinstance(tab.get(key),str) for key in ("name","content","path","saved")):
                     raise ValueError("Invalid draft recovery")
@@ -85,7 +85,7 @@ class Studio(QObject):
     def __init__(self, isolated: bool = False, session: Session | None = None):
         super().__init__()
         self.setObjectName("studio")
-        self._brand_svg = (ROOT/"public/brand-mark-fixed.svg").read_text()
+        self._brand_svg = (ROOT/"public/brand-mark-fixed.svg").read_text(encoding="utf-8")
         self.pool = concurrent.futures.ThreadPoolExecutor(max_workers=3, thread_name_prefix="supermd")
         self.session = session or Session(isolated)
         self.session.changed.connect(lambda:self._emit())
@@ -301,7 +301,7 @@ class Studio(QObject):
     @Property(str,constant=True)
     def appVersion(self):
         metadata=ROOT/"desktop/build-info.json" if getattr(sys,"frozen",False) else ROOT/"package.json"
-        return json.loads(metadata.read_text())["version"]
+        return json.loads(metadata.read_text(encoding="utf-8"))["version"]
 
     @Property(str,notify=changed)
     def updateStatus(self):return self.update_status

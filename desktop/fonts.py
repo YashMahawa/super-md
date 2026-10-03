@@ -13,7 +13,7 @@ class FontStore:
         self.directory.mkdir(exist_ok=True)
         self.families = {}
         try:
-            records = json.loads((self.directory/"index.json").read_text())
+            records = json.loads((self.directory/"index.json").read_text(encoding="utf-8"))
             for filename in records[:32]:
                 if isinstance(filename,str) and re.fullmatch(r"[0-9a-f]{64}\.(ttf|otf)",filename): self._register(self.directory/filename)
         except (OSError,ValueError,TypeError): pass

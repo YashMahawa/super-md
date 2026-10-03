@@ -13,7 +13,7 @@ class DocumentsTest(unittest.TestCase):
             path=Path(directory)/"recovery.json"
             value=[{"content":'Quoted "λ" and \\math\n'*10000,"saved":"original"}]
             atomic_json(path,value)
-            self.assertEqual(json.loads(path.read_text()),value)
+            self.assertEqual(json.loads(path.read_text(encoding="utf-8")),value)
             before=path.read_bytes()
             with self.assertRaises(TypeError):atomic_json(path,{"unsupported":object()})
             self.assertEqual(path.read_bytes(),before)

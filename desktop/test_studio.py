@@ -3,10 +3,12 @@ import os
 import time
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 os.environ.setdefault("QT_QPA_PLATFORM","offscreen")
 from PySide6.QtGui import QGuiApplication
 from PySide6.QtCore import QUrl
 from studio import Session, Studio
+from documents import atomic_json
 
 class QuietStudio(Studio):
     def _refresh_theme(self):
@@ -116,6 +118,23 @@ class StudioTest(unittest.TestCase):
         second._recover(); self.flush()
         recovered = json.loads((first.data/"recovery.json").read_text())
         self.assertEqual([t["content"] for t in recovered],["First draft"])
+
+    def test_unicode_settings_and_drafts_survive_non_utf8_system_locale(self):
+        draft={"name":"Notes λ.md","content":"# λ 📖\n\\alpha + β","path":"","saved":"","assets":{}}
+        atomic_json(self.session.data/"settings.json",{"settings":{"font":"字体 λ"},"recent":["Notes λ.md"]})
+        atomic_json(self.session.data/"recovery.json",[draft])
+        original_read=Path.read_text
+        def locale_read(path,*args,**kwargs):
+            # Match Windows machines whose implicit text codec is not UTF-8.
+            if not args and "encoding" not in kwargs:kwargs["encoding"]="cp1252"
+            return original_read(path,*args,**kwargs)
+        with patch("studio.tempfile.mkdtemp",return_value=str(self.session.data)),patch.object(Path,"read_text",locale_read):
+            restored=Session(True)
+        try:
+            self.assertEqual(restored.settings["font"],"字体 λ")
+            self.assertEqual(restored.recent,["Notes λ.md"])
+            self.assertEqual(restored.initial_recovery,[draft])
+        finally:restored.writes.shutdown(wait=True)
 
     def test_close_folder_keeps_tabs_and_fullscreen_zoom_is_independent(self):
         studio = self.studio
