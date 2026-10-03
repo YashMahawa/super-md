@@ -35,7 +35,7 @@ ApplicationWindow {
     Material.background: viewState.colors.surface
     Material.foreground: viewState.colors["on-surface"]
     color: viewState.colors.surface
-    font.family: "Manrope"
+    font.family: "Noto Sans"
     onClosing: function(close) { close.accepted = closingAllowed; if (!closingAllowed) studio.closeWindowSafely() }
 
     Connections {

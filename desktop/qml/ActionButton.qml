@@ -10,7 +10,7 @@ Button {
     property bool tonal: false
     property var colors: JSON.parse(studio.snapshot).colors
     property bool motion: JSON.parse(studio.snapshot).settings.motion
-    font.family: "Manrope"
+    font.family: "Noto Sans"
     font.pixelSize: 14
     font.weight: Font.Medium
     implicitHeight: compact ? 36 : 44
