@@ -76,7 +76,10 @@ class MainActivity : ComponentActivity() {
         workspaceKey = (savedInstanceState?.getString("workspace") ?: intent.getStringExtra("workspace") ?: "main").takeIf { it == "main" || runCatching { java.util.UUID.fromString(it) }.isSuccess } ?: "main"
         enableEdgeToEdge()
         if (Build.VERSION.SDK_INT >= 28) window.attributes = window.attributes.apply { layoutInDisplayCutoutMode = if (Build.VERSION.SDK_INT >= 30) WindowManager.LayoutParams.LAYOUT_IN_DISPLAY_CUTOUT_MODE_ALWAYS else WindowManager.LayoutParams.LAYOUT_IN_DISPLAY_CUTOUT_MODE_SHORT_EDGES }
-        setContent { Studio(model, this) }
+        // Create this task's workspace before RESUMED/lifecycle consumers can
+        // request it. Compose's first frame may otherwise run after onResume.
+        val windowModel = model
+        setContent { Studio(windowModel, this) }
         intent?.data?.let { uri -> model.open(uri) }
     }
     override fun onStop() { model.flush(); super.onStop() }
