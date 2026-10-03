@@ -20,7 +20,10 @@ Control {
                 required property var modelData
                 text: modelData.label
                 compact: true
-                highlighted: control.selected === modelData.key
+                // Qt's stock highlighted label uses its own accent palette,
+                // ignoring Material.foreground. Keep our validated color pair.
+                prominent: control.selected === modelData.key
+                Accessible.description: prominent ? "Selected" : ""
                 Layout.fillWidth: true
                 onClicked: control.chosen(modelData.key)
             }

@@ -5,8 +5,11 @@
 - 74 frontend tests and all 17 browser workflows passed locally, including stable
   wrapping/focal magnification, distinct 3D drag vs two-finger pan, slider-free
   image viewing, checkbox source preservation and bounded derived image caches.
-- 44 native Qt tests passed, including zoom-only bridge messages, remembered
+- 45 native Qt tests passed, including zoom-only bridge messages, remembered
   reading mode, heading-derived names and sidebar outline data.
+- Presented-pixel checks caught Qt Material's stock highlighted-label override;
+  selected controls now retain their contrast-validated foreground. A real QML
+  test checks the rendered control label rather than only the palette tokens.
 - 13 native typesetter tests passed. The unchanged local SNS note reproduced the
   old inner-product failure and now exports a 17-page PDF. Its repair suggestions
   were separately checked: zero changes to the original valid document.
