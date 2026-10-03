@@ -29,6 +29,17 @@ class StudioUiTest {
             model.flush()
             assertEquals(before.active.content, model.state.value.active.content)
         }
+        val snapshot = java.io.File(compose.activity.filesDir,
+            if (model.workspaceKey == "main") "workspace.json" else "workspaces/${model.workspaceKey}.json")
+        compose.waitUntil(5000) {
+            runCatching {
+                val notes = org.json.JSONObject(snapshot.readText()).getJSONArray("tabs")
+                (0 until notes.length()).any { index ->
+                    val note = notes.getJSONObject(index)
+                    note.getString("id") == before.active.id && note.getString("content") == before.active.content
+                }
+            }.getOrDefault(false)
+        }
     }
     private fun web(view: View): WebView? = if (view is WebView) view else if (view is ViewGroup) (0 until view.childCount).firstNotNullOfOrNull { web(view.getChildAt(it)) } else null
     private fun javascriptUntil(script: String, accepted: (String) -> Boolean): String {

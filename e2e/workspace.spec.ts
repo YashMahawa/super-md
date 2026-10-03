@@ -90,7 +90,10 @@ test("native document sizing stays percentage based and Live edit exits on outsi
   await expect(text).toHaveCSS("line-height","32.4px");
   const ratio=()=>text.evaluate(node=>node.getBoundingClientRect().width/node.closest(".android-reading")!.getBoundingClientRect().width);
   expect(await ratio()).toBeCloseTo(.8,1);
-  await page.setViewportSize({width:1000,height:700});expect(await ratio()).toBeCloseTo(.8,1);
+  await page.setViewportSize({width:1000,height:700});
+  // ResizeObserver applies the new percentage-based layout on a presentation
+  // frame, not synchronously with the viewport command.
+  await expect.poll(ratio).toBeCloseTo(.8,1);
   await page.getByRole("heading").click();await expect(page.locator("textarea")).toHaveCount(0);
   await page.getByRole("heading").dblclick();await expect(page.getByLabel("Edit Markdown block")).toBeVisible();
   await page.locator(".android-reading").click({position:{x:5,y:500}});await expect(page.getByLabel("Edit Markdown block")).toHaveCount(0);
