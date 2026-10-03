@@ -62,6 +62,7 @@ import androidx.lifecycle.viewmodel.compose.viewModel
 import androidx.window.layout.FoldingFeature
 import androidx.window.layout.WindowInfoTracker
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.delay
 import org.json.JSONObject
 
 class MainActivity : ComponentActivity() {
@@ -83,11 +84,22 @@ class MainActivity : ComponentActivity() {
         intent?.data?.let { uri -> model.open(uri) }
     }
     override fun onStop() { model.flush(); super.onStop() }
+    override fun onResume() { super.onResume(); model.refreshExternal() }
     fun handleShortcut(event: android.view.KeyEvent): Boolean {
         if (event.action == android.view.KeyEvent.ACTION_DOWN && event.repeatCount == 0) {
             if (event.keyCode == android.view.KeyEvent.KEYCODE_F11) { model.fullscreen(!model.state.value.fullscreen); return true }
-            if (event.keyCode == android.view.KeyEvent.KEYCODE_ESCAPE && model.state.value.fullscreen) { dismissDocument?.invoke() ?: model.fullscreen(false); return true }
-            if (event.isCtrlPressed && event.keyCode == android.view.KeyEvent.KEYCODE_N) { if (event.isShiftPressed) newWindow() else model.newNote(); return true }
+            if (event.keyCode == android.view.KeyEvent.KEYCODE_ESCAPE && (model.state.value.fullscreen || model.state.value.readerOverlay)) { dismissDocument?.invoke() ?: model.fullscreen(false); return true }
+            if (event.isCtrlPressed && event.keyCode == android.view.KeyEvent.KEYCODE_N) { newWindow(); return true }
+            if (event.isCtrlPressed) {
+                when(event.keyCode) {
+                    android.view.KeyEvent.KEYCODE_T -> { if(event.isShiftPressed)model.reopen() else model.newNote();return true }
+                    android.view.KeyEvent.KEYCODE_W -> { if(event.isShiftPressed)finish() else model.close(model.state.value.active.id);return true }
+                    android.view.KeyEvent.KEYCODE_TAB -> { model.cycle(if(event.isShiftPressed)-1 else 1);return true }
+                    android.view.KeyEvent.KEYCODE_PAGE_DOWN -> {model.cycle(1);return true}
+                    android.view.KeyEvent.KEYCODE_PAGE_UP -> {model.cycle(-1);return true}
+                }
+                if(event.keyCode in android.view.KeyEvent.KEYCODE_1..android.view.KeyEvent.KEYCODE_9){model.tabNumber(event.keyCode-android.view.KeyEvent.KEYCODE_1+1);return true}
+            }
         }
         return false
     }
@@ -105,9 +117,13 @@ class MainActivity : ComponentActivity() {
     val theme = if (state.fullscreen) state.fullscreenTheme else state.theme
     val dark = theme == "dark" || theme == "black" || (theme == "system" && systemDark)
     val context = LocalContext.current
-    var colors = when { Build.VERSION.SDK_INT >= 31 -> if (dark) dynamicDarkColorScheme(context) else dynamicLightColorScheme(context); dark -> darkColorScheme(primary = Color(0xffb2c8ff), secondary = Color(0xffbcc6dc)); else -> lightColorScheme(primary = Color(0xff42669e), onPrimary = Color.White, primaryContainer = Color(0xffd7e3ff), onPrimaryContainer = Color(0xff162c4c), secondary = Color(0xff56647c), surface = Color(0xfff7f9fd), background = Color(0xfff7f9fd), surfaceContainerLow = Color(0xfff0f3fa), surfaceContainerHigh = Color(0xffe5ebf5)) }
-    if (!dark) colors = studyLightColors(colors)
-    if (theme == "black") colors = colors.copy(background = Color.Black, surface = Color.Black, surfaceContainer = Color(0xff101217), surfaceContainerLow = Color(0xff080a0d))
+    val colors = remember(context,dark,theme,state.accent) {
+        var base = when { Build.VERSION.SDK_INT >= 31 -> if (dark) dynamicDarkColorScheme(context) else dynamicLightColorScheme(context); dark -> darkColorScheme(primary = Color(0xffb2c8ff), secondary = Color(0xffbcc6dc)); else -> lightColorScheme(primary = Color(0xff42669e), onPrimary = Color.White, primaryContainer = Color(0xffd7e3ff), onPrimaryContainer = Color(0xff162c4c), secondary = Color(0xff56647c), surface = Color(0xfff7f9fd), background = Color(0xfff7f9fd), surfaceContainerLow = Color(0xfff0f3fa), surfaceContainerHigh = Color(0xffe5ebf5)) }
+        base=accentColors(base,state.accent,dark)
+        if (!dark) base = studyLightColors(base)
+        if (theme == "black") base = base.copy(primary=Color(0xffdedede),onPrimary=Color(0xff1a1a1a),primaryContainer=Color(0xff343434),onPrimaryContainer=Color(0xfff0f0f0),background=Color.Black,surface=Color.Black,surfaceContainer=Color(0xff171717),surfaceContainerLow=Color(0xff101010),surfaceContainerHigh=Color(0xff242424))
+        base
+    }
     val systemMotion = remember { android.provider.Settings.Global.getFloat(context.contentResolver, android.provider.Settings.Global.ANIMATOR_DURATION_SCALE, 1f) != 0f }
     MaterialExpressiveTheme(colorScheme = colors, motionScheme = if (state.motion && systemMotion) MotionScheme.expressive() else NoMotionScheme) {
         StudioContent(model, state, activity, dark, state.motion && systemMotion)
@@ -133,6 +149,13 @@ private object NoMotionScheme : MotionScheme {
     var zoomEditing by remember { mutableStateOf(false) }
     var menu by remember { mutableStateOf(false) }
     var renaming by remember {mutableStateOf(false)}
+    var contentsShown by remember {mutableStateOf(false)}
+    var sidebarSection by rememberSaveable {mutableStateOf("folder")}
+    var chromeAwake by remember {mutableStateOf(true)}
+    val hideChromeJob=remember {arrayOfNulls<kotlinx.coroutines.Job>(1)}
+    fun wakeChrome(){chromeAwake=true;hideChromeJob[0]?.cancel();hideChromeJob[0]=scope.launch{delay(2200);chromeAwake=false}}
+    LaunchedEffect(state.fullscreen){wakeChrome()}
+    DisposableEffect(Unit){onDispose{hideChromeJob[0]?.cancel()}}
     var web by remember { mutableStateOf<WebView?>(null) }
     DisposableEffect(activity, web) {
         activity.dismissDocument = { web?.evaluateJavascript("window.supermdDismiss?.() || false") { dismissed -> if (dismissed != "true") model.fullscreen(false) } ?: model.fullscreen(false) }
@@ -200,6 +223,7 @@ private object NoMotionScheme : MotionScheme {
         }
         val headings by model.headings.collectAsStateWithLifecycle()
         val imageOverlay by model.imageOverlay.collectAsStateWithLifecycle()
+        if(contentsShown) AlertDialog(onDismissRequest={contentsShown=false},title={Text("Contents")},text={OutlinePanel(headings,state.active.id){heading->web?.evaluateJavascript("window.supermdHeading?.(${JSONObject.quote(heading.id)},${heading.offset})",null);contentsShown=false}},confirmButton={TextButton(onClick={contentsShown=false}){Text("Close")}})
         // Closed-drawer drag recognition steals diagonal scrolls and pinch
         // gestures from WebView. Opening is deliberate (menu button); dragging
         // still dismisses an already-open drawer.
@@ -207,32 +231,26 @@ private object NoMotionScheme : MotionScheme {
             ModalDrawerSheet(modifier = Modifier.widthIn(max = 340.dp)) {
                 Column(Modifier.fillMaxHeight().safeDrawingPadding().padding(horizontal = 16.dp)) {
                     Text("Your files", style = MaterialTheme.typography.headlineSmall, modifier = Modifier.padding(vertical = 20.dp))
+                    SingleChoiceSegmentedButtonRow(Modifier.fillMaxWidth().padding(bottom=12.dp)) {listOf("folder" to "Folder","contents" to "Contents").forEachIndexed {index,entry->SegmentedButton(selected=sidebarSection==entry.first,onClick={sidebarSection=entry.first},shape=SegmentedButtonDefaults.itemShape(index,2),colors=SegmentedButtonDefaults.colors(activeContainerColor=palette.primary,activeContentColor=palette.onPrimary)){Text(entry.second)}}}
                     Button(onClick = { open.launch(arrayOf("text/*", "application/octet-stream", "application/vnd.supermd.smd", "application/vnd.supermd.fmd")); scope.launch { drawer.close() } }, shapes = ButtonDefaults.shapes(), modifier = Modifier.fillMaxWidth()) { Icon(Icons.Rounded.Description, null); Spacer(Modifier.width(8.dp)); Text("Open note") }
                     FilledTonalButton(onClick = { folder.launch(state.folder?.let(android.net.Uri::parse)) }, modifier = Modifier.fillMaxWidth()) { Icon(Icons.Rounded.FolderOpen, null); Spacer(Modifier.width(8.dp)); Text("Open folder") }
                     if (state.folder != null) TextButton(onClick = { folderRelative = ""; model.closeFolder() }) { Icon(Icons.Rounded.Close, null); Text("Close folder", Modifier.padding(start = 8.dp)) }
                     Text("No vault. No hidden metadata.", style = MaterialTheme.typography.bodySmall, color = palette.onSurfaceVariant, modifier = Modifier.padding(vertical = 12.dp))
                     if (folderRelative.isNotEmpty()) TextButton(onClick = { folderRelative = ""; state.folder?.let { model.listFolder(android.net.Uri.parse(it), "") } }) { Icon(Icons.AutoMirrored.Rounded.ArrowBack, null); Text("Folder root") }
-                    LazyColumn(Modifier.weight(1f)) {
-                        if (headings.isNotEmpty()) {
-                            item {Text("Contents", style = MaterialTheme.typography.titleSmall, modifier = Modifier.padding(vertical = 12.dp))}
-                            items(headings, key = {"heading:${it.id}"}) { heading ->
-                                ListItem(headlineContent = { Text(heading.title, maxLines = 2, overflow = TextOverflow.Ellipsis) }, modifier = Modifier.padding(start = ((heading.level - 1) * 10).dp).clickable {
-                                    web?.evaluateJavascript("window.supermdHeading?.(${JSONObject.quote(heading.id)},${heading.offset})", null)
-                                    scope.launch { drawer.close() }
-                                })
-                            }
-                            item {HorizontalDivider(Modifier.padding(vertical = 8.dp))}
-                        }
-                        if (recent.isNotEmpty()) {
-                            item {Row(verticalAlignment = Alignment.CenterVertically) { Text("Recent files", style = MaterialTheme.typography.titleSmall, modifier = Modifier.weight(1f)); TextButton(onClick = model::clearRecent) { Text("Clear") } }}
-                            items(recent.take(12), key={"recent:${it.uri}:${it.relative}"}) { note -> ListItem(headlineContent = { Text(note.name, maxLines = 1, overflow = TextOverflow.Ellipsis) }, leadingContent = { Icon(Icons.Rounded.History, null) }, modifier = Modifier.clickable { model.open(android.net.Uri.parse(note.uri), note.relative); scope.launch { drawer.close() } }) }
-                            item {HorizontalDivider(Modifier.padding(vertical = 8.dp))}
-                        }
+                    if(sidebarSection=="contents") OutlinePanel(headings,state.active.id,Modifier.weight(1f)){heading->web?.evaluateJavascript("window.supermdHeading?.(${JSONObject.quote(heading.id)},${heading.offset})",null);scope.launch{drawer.close()}}
+                    else LazyColumn(Modifier.weight(1f)) {
                         items(state.files, key={"file:${it.uri}:${it.relative}"}) { entry ->
                             val activate = { if (entry.directory) { folderRelative = entry.relative; model.listFolder(android.net.Uri.parse(entry.uri), entry.relative) } else { model.open(android.net.Uri.parse(entry.uri), entry.relative); scope.launch { drawer.close() } }; Unit }
                             ListItem(headlineContent = { Text(entry.name, maxLines = 1, overflow = TextOverflow.Ellipsis) }, leadingContent = { Icon(if (entry.directory) Icons.Rounded.Folder else Icons.Rounded.Description, null) }, modifier = Modifier.fillMaxWidth().clickable(onClick = activate), trailingContent = { Icon(if (entry.directory) Icons.Rounded.ChevronRight else Icons.AutoMirrored.Rounded.MenuBook, null) })
                         }
                     }
+                    HorizontalDivider(Modifier.padding(vertical=8.dp))
+                    if(recent.isNotEmpty()) {
+                        Row(verticalAlignment=Alignment.CenterVertically){Text("Recent notes",Modifier.weight(1f),style=MaterialTheme.typography.titleSmall);TextButton(onClick=model::clearRecent){Text("Clear")}}
+                        LazyColumn(Modifier.heightIn(max=180.dp)){items(recent.take(12),key={it.uri}){note->ListItem(headlineContent={Text(note.name,maxLines=1,overflow=TextOverflow.Ellipsis)},modifier=Modifier.clickable{model.open(android.net.Uri.parse(note.uri),note.relative);scope.launch{drawer.close()}})}}
+                    }
+                    HorizontalDivider(Modifier.padding(vertical=8.dp))
+                    OutlinedButton(onClick=activity::newWindow,modifier=Modifier.fillMaxWidth()){Icon(painterResource(R.drawable.symbol_open_window),null);Text("New window",Modifier.padding(start=8.dp))}
                     FilledTonalButton(onClick = { model.newNote(); scope.launch { drawer.close() } }, modifier = Modifier.fillMaxWidth().padding(bottom = 16.dp)) { Icon(Icons.Rounded.Add, null); Text("New note", Modifier.padding(start = 8.dp)) }
                 }
             }
@@ -267,6 +285,7 @@ private object NoMotionScheme : MotionScheme {
                             SingleChoiceSegmentedButtonRow(Modifier.weight(1f)) { modes.forEachIndexed { index, mode -> SegmentedButton(selected = actualMode == mode, onClick = { model.mode(mode) }, colors = SegmentedButtonDefaults.colors(activeContainerColor = palette.primary, activeContentColor = palette.onPrimary), shape = SegmentedButtonDefaults.itemShape(index, modes.size)) { Text(when(mode) { "editor" -> "Source"; "reader" -> "Read"; "split" -> "Split"; else -> "Live" }) } } }
                             IconButton(onClick={web?.evaluateJavascript("window.supermdHistory?.('undo')",null)},enabled=readerReady){Icon(Icons.Rounded.Undo,"Undo (Ctrl+Z)")}
                             IconButton(onClick={web?.evaluateJavascript("window.supermdHistory?.('redo')",null)},enabled=readerReady){Icon(Icons.Rounded.Redo,"Redo (Ctrl+Y)")}
+                            IconButton(onClick={contentsShown=true}){Icon(painterResource(R.drawable.symbol_contents),"Show contents")}
                         }
                         HorizontalDivider(color = palette.outlineVariant.copy(alpha = .55f))
                     }
@@ -285,6 +304,8 @@ private object NoMotionScheme : MotionScheme {
                             setOnKeyListener { _, _, event -> activity.handleShortcut(event) }
                             setBackgroundColor(AndroidColor.TRANSPARENT)
                             configureReader(this, model, scope) { readerReady = true }
+                            setOnTouchListener {_,_->wakeChrome();false}
+                            setOnGenericMotionListener {_,_->wakeChrome();false}
                             webChromeClient = object : android.webkit.WebChromeClient() {
                                 override fun onShowFileChooser(view: WebView, callback: android.webkit.ValueCallback<Array<android.net.Uri>>, parameters: FileChooserParams): Boolean {
                                     imageCallback?.onReceiveValue(null); imageCallback = callback; imageNote = model.state.value.active.id
@@ -310,7 +331,7 @@ private object NoMotionScheme : MotionScheme {
                             }
                         })
                     } }, modifier = Modifier.fillMaxSize().clipToBounds(), onRelease = { readerReady = false; web?.removeJavascriptInterface("SuperMD"); web?.destroy(); it.removeAllViews(); web = null })
-                    if (state.fullscreen && !state.readerOverlay) Surface(shape = RoundedCornerShape(24.dp), color = palette.surfaceContainer.copy(alpha = .94f), modifier = Modifier.align(Alignment.TopEnd).safeDrawingPadding().padding(8.dp)) { Row(verticalAlignment = Alignment.CenterVertically) { IconButton(onClick = { model.zoom(state.zoom - 10) }) { Icon(Icons.Rounded.Remove, "Zoom out") }; TextButton(onClick = { zoomEditing = true }) { Text("${state.zoom.toInt()}%") }; IconButton(onClick = { model.zoom(state.zoom + 10) }) { Icon(Icons.Rounded.Add, "Zoom in") }; IconButton(onClick = { model.fullscreen(false) }) { Icon(Icons.Rounded.FullscreenExit, "Exit fullscreen") } } }
+                    if (state.fullscreen && !state.readerOverlay && chromeAwake) Surface(shape=RoundedCornerShape(24.dp),color=palette.surfaceContainerHigh,modifier=Modifier.align(Alignment.TopEnd).safeDrawingPadding().padding(8.dp)) {Row {IconButton(onClick={contentsShown=true;wakeChrome()}){Icon(painterResource(R.drawable.symbol_contents),"Show contents")};IconButton(onClick={model.fullscreen(false)}){Icon(painterResource(R.drawable.symbol_fullscreen_exit),"Exit fullscreen")}}}
                     SnackbarHost(snackbar, Modifier.align(Alignment.BottomCenter).safeDrawingPadding())
                     if (state.busy) Surface(color = palette.surface.copy(alpha = .9f), modifier = Modifier.fillMaxSize()) { Column(Modifier.fillMaxSize(), verticalArrangement = Arrangement.Center, horizontalAlignment = Alignment.CenterHorizontally) { CircularProgressIndicator(); Spacer(Modifier.height(16.dp)); Text("Preparing your document…") } }
                 }
@@ -375,6 +396,7 @@ private class NoteDestination(mime: String, private val preferred: () -> String)
                 Text("System follows your wallpaper colors. Fullscreen can have a different theme.", style = MaterialTheme.typography.bodyMedium, color = MaterialTheme.colorScheme.onSurfaceVariant)
                 Choice("Workspace theme", state.theme, listOf("system" to "System", "light" to "Light", "dark" to "Dark", "black" to "Pure black")) { model.appearance(theme = it) }
                 Choice("Fullscreen theme", state.fullscreenTheme, listOf("system" to "System", "light" to "Light", "dark" to "Dark", "black" to "Pure black")) { model.appearance(fullTheme = it) }
+                Choice("Theme color",state.accent,listOf("system" to "System","blue" to "Blue","green" to "Green","violet" to "Violet","rose" to "Rose","amber" to "Amber")){model.appearance(accent=it)}
                 Row(verticalAlignment = Alignment.CenterVertically) { Column(Modifier.weight(1f)) { Text("Expressive motion", style = MaterialTheme.typography.titleMedium); Text("Spring transitions and responsive controls", style = MaterialTheme.typography.bodySmall) }; Switch(checked = state.motion, onCheckedChange = { model.appearance(motion = it) }) }
             }
             SettingsSection("Reading") {

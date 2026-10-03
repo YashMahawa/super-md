@@ -59,6 +59,9 @@ export function suggestMathRepairs(markdown: string): MathRepair[] {
   const overlaps=(ranges:Array<[number,number]>,from:number,to:number)=>ranges.some(([start,end])=>from<end&&to>start);
   const add=(from:number,to:number,after:string,reason:string,existing=false)=>{
     if(changes.length>=200||markdown.slice(from,to)===after||overlaps(protectedRanges,from,to)||!existing&&overlaps(mathRanges,from,to)||changes.some(change=>from<change.to&&to>change.from))return;
+    // A line may look like an unmatched delimiter but be the opening/closing
+    // line of one valid multiline equation. Never repair fragments of math.
+    if(mathRanges.some(([start,end])=>from<end&&to>start&&(from!==start||to!==end)))return;
     changes.push({from,to,before:markdown.slice(from,to),after,reason});
   };
   const wrap=(body:string,display:boolean)=>display?`$$\n${body}\n$$`:`$${body}$`;

@@ -43,6 +43,5 @@ Button {
     }
     scale: down ? .96 : 1
     Behavior on scale { enabled: JSON.parse(studio.snapshot).settings.motion; SpringAnimation { spring: 5; damping: .75 } }
-    ToolTip.visible: hovered && ToolTip.text.length > 0
-    ToolTip.delay: 650
+    Hint { visible: control.hovered && control.ToolTip.text.length > 0; text: control.ToolTip.text }
 }

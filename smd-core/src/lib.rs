@@ -89,6 +89,36 @@ pub fn normalize_callouts(input: &str) -> String {
     output
 }
 
+/// Protect complete math spans on actual table rows before GFM splits columns.
+/// Parsing without tables excludes code, so literal code and TeX norms survive.
+fn normalize_table_math(input: &str) -> String {
+    let mut starts = Vec::new(); let mut offset = 0;
+    let lines = input.split_inclusive('\n').map(|line| {starts.push(offset);offset+=line.len();line.trim_end_matches(['\r','\n'])}).collect::<Vec<_>>();
+    let mut rows = vec![false; lines.len()];
+    for i in 1..lines.len() {
+        let cells = lines[i].trim().trim_start_matches('>').trim().trim_matches('|').split('|').map(str::trim).collect::<Vec<_>>();
+        if cells.len() >= 2 && cells.iter().all(|cell| cell.chars().filter(|c| *c == '-').count() >= 3 && cell.chars().all(|c| c == '-' || c == ':')) && lines[i-1].contains('|') {
+            rows[i-1] = true;
+            for j in i+1..lines.len() { if lines[j].trim().is_empty() || !lines[j].contains('|') { break; } rows[j] = true; }
+        }
+    }
+    let mut edits = Vec::new();
+    for (event, range) in Parser::new_ext(input, Options::ENABLE_MATH).into_offset_iter() {
+        if !matches!(event, Event::InlineMath(_) | Event::DisplayMath(_)) { continue; }
+        let line = starts.partition_point(|start| *start <= range.start).saturating_sub(1);
+        if !rows.get(line).copied().unwrap_or(false) { continue; }
+        let raw = &input[range.clone()]; let mut replaced=String::new(); let mut slashes=0;
+        for ch in raw.chars() {
+            if ch == '|' && slashes % 2 == 0 { replaced.push_str("\\vert "); } else { replaced.push(ch); }
+            slashes=if ch == '\\' {slashes+1} else {0};
+        }
+        if replaced != raw { edits.push((range,replaced)); }
+    }
+    let mut result=input.to_string();
+    for (range,text) in edits.into_iter().rev() { result.replace_range(range,&text); }
+    result
+}
+
 struct Renderer<'a> {
     events: std::iter::Peekable<std::vec::IntoIter<Event<'a>>>,
     assets: &'a HashMap<String, Vec<u8>>,
@@ -158,7 +188,7 @@ impl<'a> Renderer<'a> {
                                 }
                             }
                             let widths = lengths.iter().zip(&counts).map(|(len, count)| format!("{:.2}fr,", ((*len as f64 / (*count).max(1) as f64).max(8.)).sqrt().min(12.))).collect::<String>();
-                            out.push_str(&format!("\n#table(columns: ({widths}), inset: 6pt, stroke: .4pt + smd-line,\n"));
+                            out.push_str(&format!("\n#table(columns: ({widths}), inset: 6pt, stroke: .4pt + smd-line, fill: (x, y) => if y == 0 {{ smd-header-fill }} else {{ none }},\n"));
                             out.push_str(&self.render(Some(close))?); out.push_str(")\n\n");
                         },
                         Tag::TableHead => { out.push_str("table.header("); out.push_str(&self.render(Some(close))?); out.push_str("),\n"); },
@@ -185,10 +215,11 @@ impl<'a> Renderer<'a> {
                                 if matches!(self.events.peek(), Some(Event::SoftBreak | Event::HardBreak)) { self.events.next(); }
                                 let title = if title.is_empty() { kind.clone() } else { title };
                                 let body = self.render(Some(TagEnd::Paragraph))? + "\n\n" + &self.render(Some(close))?;
-                                let accent = match kind.as_str() { "tip" | "success" => "#14735b", "warning" | "caution" => "#946200", "danger" | "error" => "#b3261e", _ => "#315d99" };
-                                (format!("#text(weight: \"bold\", fill: rgb(\"{accent}\"))[{}]\n\n{body}", text(&title)), accent)
+                                let accent = match kind.as_str() { "tip" | "hint" | "success" | "check" | "done" => "#14735b", "warning" | "caution" => "#946200", "danger" | "error" | "failure" | "fail" | "missing" => "#b3261e", _ => "#315d99" };
+                                let icon = match kind.as_str() {"tip"|"hint"=>"tip","warning"|"caution"=>"warning","danger"|"error"=>"error","success"|"check"|"done"=>"success","question"|"faq"=>"question","answer"|"solution"=>"answer","example"=>"example","quote"|"cite"=>"quote",_=>"info"};
+                                (format!("#text(weight: \"bold\", fill: rgb(\"{accent}\"))[#image(\"__smd_icon_{icon}.svg\", width: 11pt) #h(4pt) {}]\n\n{body}", text(&title)), accent)
                             } else { (self.render(Some(close))?, "#315d99") };
-                            out.push_str(&format!("\n#block(width: 100%, breakable: true, fill: smd-callout-fill, stroke: (left: 2pt + rgb(\"{accent}\")), inset: 10pt, radius: 4pt)[{body}]\n\n"));
+                            out.push_str(&format!("\n#block(width: 100%, breakable: true, fill: if smd-themed {{ smd-callout-fill }} else {{ color.mix((white, 94%), (rgb(\"{accent}\"), 6%)) }}, stroke: (left: 2pt + rgb(\"{accent}\")), inset: 10pt, radius: 4pt)[{body}]\n\n"));
                         },
                         _ => {
                             let heading = if matches!(tag, Tag::Heading { .. }) {
@@ -223,7 +254,7 @@ impl<'a> Renderer<'a> {
 
 pub fn source(markdown: &str, options: &PdfOptions, assets: &HashMap<String, Vec<u8>>) -> Result<String> {
     options.validate()?;
-    let normalized = normalize_callouts(markdown);
+    let normalized = normalize_table_math(&normalize_callouts(markdown));
     let events = Parser::new_ext(&normalized, Options::ENABLE_TABLES | Options::ENABLE_STRIKETHROUGH | Options::ENABLE_TASKLISTS | Options::ENABLE_MATH | Options::ENABLE_FOOTNOTES).collect::<Vec<_>>();
     let mut headings = HashMap::new(); let mut current = None::<String>;
     for event in &events { match event {
@@ -245,9 +276,17 @@ pub fn source(markdown: &str, options: &PdfOptions, assets: &HashMap<String, Vec
     // MiTeX's bundled conversion spec still emits Typst's former `sect`
     // intersection name. Typst 0.15 calls it `inter`. Scope aliases preserve
     // equations without rewriting user TeX or changing the section symbol.
-    let accent = &options.theme_accent;
+    let accent = if options.themed { &options.theme_accent } else { "#555555" };
     let themed = if options.themed { "true" } else { "false" };
-    let palette = format!("#let smd-themed = {themed}\n#let smd-accent = rgb({})\n#let smd-paper = if smd-themed {{ color.mix((white, 89%), (smd-accent, 11%)) }} else {{ white }}\n#let smd-code-fill = if smd-themed {{ color.mix((white, 79%), (smd-accent, 21%)) }} else {{ rgb(\"#f4f6f8\") }}\n#let smd-callout-fill = if smd-themed {{ color.mix((white, 84%), (smd-accent, 16%)) }} else {{ rgb(\"#f1f4f8\") }}\n#let smd-line = if smd-themed {{ color.mix((white, 55%), (smd-accent, 45%)) }} else {{ rgb(\"#d6dde5\") }}\n#let smd-link = if smd-themed {{ color.mix((rgb(\"#20252d\"), 45%), (smd-accent, 55%)) }} else {{ rgb(\"#315d99\") }}\n", string(accent));
+    let palette = format!(r##"#let smd-themed = {themed}
+#let smd-accent = rgb({})
+#let smd-paper = if smd-themed {{ color.mix((white, 89%), (smd-accent, 11%)) }} else {{ white }}
+#let smd-code-fill = if smd-themed {{ color.mix((white, 79%), (smd-accent, 21%)) }} else {{ rgb("#f4f4f4") }}
+#let smd-callout-fill = if smd-themed {{ color.mix((white, 84%), (smd-accent, 16%)) }} else {{ rgb("#f2f2f2") }}
+#let smd-header-fill = if smd-themed {{ color.mix((white, 76%), (smd-accent, 24%)) }} else {{ rgb("#e7e7e7") }}
+#let smd-line = if smd-themed {{ color.mix((white, 55%), (smd-accent, 45%)) }} else {{ rgb("#d6d6d6") }}
+#let smd-link = if smd-themed {{ color.mix((rgb("#202020"), 45%), (smd-accent, 55%)) }} else {{ rgb("#315d99") }}
+"##, string(accent));
     Ok(format!("#import \"/mitex/standard.typ\": scope as mitex-scope\n#let smd-math-scope = mitex-scope + (sect: sym.inter,)\n{palette}#set page(paper: {}, margin: {}mm, fill: smd-paper)\n#set text(font: ({}, \"Libertinus Serif\", \"New Computer Modern\"), size: {}pt)\n#set par(leading: {}em)\n{template}\n{body}", string(paper), options.margin, string(&options.font_family), options.font_size, options.line_height - 0.7))
 }
 
@@ -267,7 +306,17 @@ pub fn export(markdown: &str, options: &PdfOptions, assets: &HashMap<String, Vec
             include_bytes!("../fonts/NotoEmoji.ttf").as_slice(),
         ].into_iter().chain(assets.iter().filter(|(name,_)| name.starts_with("__font_") && (name.ends_with(".ttf") || name.ends_with(".otf"))).map(|(_,bytes)| bytes.as_slice())))
         .search_fonts_with(TypstKitFontOptions::default().include_system_fonts(!cfg!(target_os="android")).include_embedded_fonts(true))
-        .with_static_file_resolver(assets.iter().map(|(k,v)| (k.as_str(), v.as_slice())))
+        .with_static_file_resolver(assets.iter().map(|(k,v)| (k.as_str(), v.as_slice())).chain([
+            ("__smd_icon_tip.svg",include_bytes!("../../desktop/icons/CalloutTip.svg").as_slice()),
+            ("__smd_icon_warning.svg",include_bytes!("../../desktop/icons/CalloutWarning.svg").as_slice()),
+            ("__smd_icon_info.svg",include_bytes!("../../desktop/icons/CalloutInfo.svg").as_slice()),
+            ("__smd_icon_error.svg",include_bytes!("../../desktop/icons/CalloutError.svg").as_slice()),
+            ("__smd_icon_success.svg",include_bytes!("../../desktop/icons/CalloutSuccess.svg").as_slice()),
+            ("__smd_icon_question.svg",include_bytes!("../../desktop/icons/CalloutQuestion.svg").as_slice()),
+            ("__smd_icon_answer.svg",include_bytes!("../../desktop/icons/CalloutAnswer.svg").as_slice()),
+            ("__smd_icon_example.svg",include_bytes!("../../desktop/icons/CalloutExample.svg").as_slice()),
+            ("__smd_icon_quote.svg",include_bytes!("../../desktop/icons/CalloutQuote.svg").as_slice()),
+        ]))
         .with_static_source_file_resolver([
             ("mitex/standard.typ", include_str!("mitex/standard.typ")),
             ("mitex/prelude.typ", include_str!("mitex/prelude.typ")),
@@ -326,6 +375,33 @@ pub extern "system" fn Java_dev_supermd_studio_PdfEngine_export(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn complete_table_math_preserves_absolute_values_and_cells() {
+        let md = r"| In probability | In distribution |
+|---|---|
+| $P(|X_n-X|>\varepsilon)\to0$ | $F_{X_n}(x)\to F_X(x)$ at its continuity points |
+| Code `a|b` is not math | $P(A|B)$ |";
+        let normalized=normalize_table_math(md);
+        assert_eq!(normalize_table_math(&md.replace('\n',"\r\n")),normalized.replace('\n',"\r\n"));
+        assert!(normalized.contains(r"$P(\vert X_n-X\vert >\varepsilon)\to0$"));
+        assert!(normalized.contains("`a|b`"));
+        let output=source(md,&PdfOptions::default(),&HashMap::new()).unwrap();
+        let widths=output.split("#table(columns: (").nth(1).unwrap().split(')').next().unwrap();
+        assert_eq!(widths.split(',').filter(|part|!part.is_empty()).count(),2);
+        assert!(output.contains("smd-header-fill"));
+        assert!(export(md,&PdfOptions::default(),&HashMap::new()).unwrap().starts_with(b"%PDF-"));
+    }
+    #[test]
+    fn plain_pdf_keeps_semantic_callouts_not_wallpaper_accent() {
+        let options=PdfOptions{themed:false,theme_accent:"#c123ab".into(),..PdfOptions::default()};
+        let md="> [!TIP] Tip\n> Learn.\n\n> [!CAUTION] Caution\n> Carefully.\n\n| Header | Value |\n|---|---|\n| x | y |";
+        let output=source(md,&options,&HashMap::new()).unwrap();
+        assert!(!output.contains("#c123ab"));
+        assert!(output.contains("#14735b"));assert!(output.contains("#946200"));
+        assert!(output.contains("__smd_icon_tip.svg"));assert!(output.contains("__smd_icon_warning.svg"));
+        assert!(output.contains("#e7e7e7"));
+        assert!(export(md,&options,&HashMap::new()).unwrap().starts_with(b"%PDF-"));
+    }
     #[test]
     fn emoji_font_is_available_without_system_fonts() {
         let bytes = typst::foundations::Bytes::new(include_bytes!("../fonts/NotoEmoji.ttf").as_slice());

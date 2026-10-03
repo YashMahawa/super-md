@@ -63,18 +63,20 @@ def generated(seed,dark):
     theme = theme_from_color(seed,0,Variant.TONALSPOT)
     return (theme.schemes.dark if dark else theme.schemes.light).dict()
 
-def tokens(mode,system_dark,system_colors=None,system_mode=None):
+ACCENTS={"blue":"#386aaf","green":"#386a57","violet":"#7255a5","rose":"#a34569","amber":"#996300"}
+
+def tokens(mode,system_dark,system_colors=None,system_mode=None,accent="system"):
     colors = system_colors or {}
     dark = mode in ("dark","black") or mode == "system" and system_dark is not False
-    seed = colors.get("primary_paletteKeyColor",colors.get("primary", "#386aaf"))
+    seed = colors.get("primary_paletteKeyColor",colors.get("primary", "#386aaf")) if accent=="system" else ACCENTS.get(accent,ACCENTS["blue"])
     scheme = generated(seed,dark)
     roles = {"primary":"primary","on-primary":"on_primary","surface":"surface","surface-low":"surface_container_low","surface-high":"surface_container_high","text":"on_surface","muted":"on_surface_variant","outline":"outline_variant","primary-container":"primary_container","on-primary-container":"on_primary_container"}
     result = {key:scheme[role] for key,role in roles.items()}
-    if mode == "system" and system_mode == ("dark" if dark else "light"):
+    if accent=="system" and mode == "system" and system_mode == ("dark" if dark else "light"):
         names = {"primary":"primary","on-primary":"onPrimary","surface":"surface","surface-low":"surfaceContainerLow","surface-high":"surfaceContainerHigh","text":"onSurface","muted":"onSurfaceVariant","outline":"outlineVariant","primary-container":"primaryContainer","on-primary-container":"onPrimaryContainer"}
         result.update({key:colors[name] for key,name in names.items() if name in colors})
     if mode == "black":
-        result.update({"surface":"#080808","surface-low":"#101010","surface-high":"#1c1c1c"})
+        result.update({"surface":"#080808","surface-low":"#101010","surface-high":"#1c1c1c","primary":"#d4d4d4","on-primary":"#151515","primary-container":"#303030","on-primary-container":"#eeeeee","text":"#e5e5e5","muted":"#bdbdbd","outline":"#454545"})
     if not dark:
         # A tinted paper hierarchy, not a stark white sheet over dark outlines.
         # Keep the actual system accent when available; otherwise use app blue.

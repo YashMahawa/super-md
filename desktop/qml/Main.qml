@@ -21,6 +21,10 @@ ApplicationWindow {
     property bool closingAllowed: false
     property string outputFormat: "pdf"
     property bool sharing: false
+    property string sidebarSection: "folder"
+    property bool chromeAwake: true
+    Timer { id: chromeIdle; interval: 2200; onTriggered: window.chromeAwake = false }
+    HoverHandler { onPointChanged: { window.chromeAwake = true; chromeIdle.restart() } }
     WindowModes {
         id: windowModes
         host: window
@@ -51,7 +55,7 @@ ApplicationWindow {
         function onReaderLoad(payload) { reader.runJavaScript("window.supermdLoad?.(" + payload + ")") }
         function onReaderCall(script) { reader.runJavaScript(script) }
     }
-    Shortcut { sequences: [StandardKey.New]; onActivated: studio.newNote() }
+    Shortcut { sequences: [StandardKey.New]; onActivated: studio.command("window") }
     FileDialog { id:fontDialog;title:"Import a font";fileMode:FileDialog.OpenFile;nameFilters:["Fonts (*.ttf *.otf)"];onAccepted:studio.importFont(selectedFile.toString()) }
     Shortcut { sequences: [StandardKey.Open]; onActivated: openDialog.open() }
     Shortcut { sequences: [StandardKey.Save]; onActivated: studio.saveSafely() }
@@ -59,11 +63,17 @@ ApplicationWindow {
     Shortcut { sequences: [StandardKey.Redo]; enabled: !settingsOpen && !viewState.readerOverlay && !exportDialog.visible; onActivated: studio.command("redo") }
     Shortcut { sequences: [StandardKey.Find]; onActivated: studio.command("find") }
     Shortcut { sequences: [StandardKey.Close]; onActivated: studio.closeTabSafely(viewState.active) }
+    Shortcut { sequences: ["Ctrl+T", "Meta+T"]; onActivated: studio.newNote() }
+    Shortcut { sequences: ["Ctrl+Tab", "Ctrl+PageDown"]; onActivated: studio.cycleTab(1) }
+    Shortcut { sequences: ["Ctrl+Shift+Tab", "Ctrl+PageUp"]; onActivated: studio.cycleTab(-1) }
+    Shortcut { sequences: ["Ctrl+Shift+T", "Meta+Shift+T"]; onActivated: studio.reopenTab() }
+    Repeater { model: 9; delegate: Item { required property int index; Shortcut { sequences: ["Ctrl+" + (index+1), "Meta+" + (index+1)]; onActivated: studio.tabNumber(index+1) } } }
     Shortcut { sequence: "Ctrl+Shift+N"; onActivated: studio.command("window") }
+    Shortcut { sequences: ["Ctrl+Shift+W","Meta+Shift+W"]; onActivated: studio.closeWindowSafely() }
     Shortcut { sequence: "Ctrl+,"; onActivated: settingsOpen = !settingsOpen }
     Shortcut { sequence: "F11"; onActivated: windowModes.setFullscreen(!windowModes.fullscreen) }
     Shortcut { sequence: "Escape"; enabled: settingsOpen; onActivated: settingsOpen = false }
-    Shortcut { sequence: "Escape"; enabled: windowModes.fullscreen && !settingsOpen && !viewState.readerOverlay; onActivated: reader.runJavaScript("window.supermdDismiss?.() || false", function(dismissed) { if (!dismissed) windowModes.setFullscreen(false) }) }
+    Shortcut { sequence: "Escape"; enabled: !settingsOpen && !exportDialog.visible && !contentsPopup.visible; onActivated: reader.runJavaScript("window.supermdDismiss?.() || false", function(dismissed) { if (!dismissed && windowModes.fullscreen) windowModes.setFullscreen(false) }) }
     // Qt's chrome never scales. Keyboard/pinch zoom is routed to the content pane.
     Shortcut { sequence: "Ctrl++"; onActivated: reader.runJavaScript("window.supermdZoomBy?.(1.1)") }
     Shortcut { sequence: "Ctrl+="; onActivated: reader.runJavaScript("window.supermdZoomBy?.(1.1)") }
@@ -116,21 +126,24 @@ ApplicationWindow {
             ColumnLayout {
                 anchors.fill: parent
                 spacing: 12
-                Label { text: "Your files"; font.pixelSize: 22; font.weight: Font.DemiBold }
-                ActionButton { text: "Open folder"; glyph: "FolderOpen"; tonal: true; Layout.fillWidth: true; onClicked: studio.chooseFolder() }
+                Label { text: sidebarSection === "folder" ? "Your files" : "Contents"; font.pixelSize: 22; font.weight: Font.DemiBold }
+                ModeGroup { Layout.fillWidth: true; choices: [{key:"folder",label:"Folder"},{key:"contents",label:"Contents"}]; selected: sidebarSection; onChosen: key => sidebarSection = key }
+                ActionButton { visible: sidebarSection === "folder"; text: "Open folder"; glyph: "FolderOpen"; tonal: true; Layout.fillWidth: true; onClicked: studio.chooseFolder() }
                 RowLayout {
-                    visible: !!viewState.folder
+                    visible: sidebarSection === "folder" && !!viewState.folder
                     Layout.fillWidth: true
                     Label { text: viewState.folder.split("/").pop(); Layout.fillWidth: true; elide: Text.ElideMiddle }
-                    ToolButton { text: "×"; Accessible.name: "Close folder"; ToolTip.text: "Close folder (notes stay open)"; ToolTip.visible: hovered; onClicked: studio.closeFolder() }
+                    ActionButton { glyph: "X"; compact: true; Accessible.name: "Close folder"; ToolTip.text: "Close folder (notes stay open)"; onClicked: studio.closeFolder() }
                 }
-                TextField { id: filter; visible: !!viewState.folder; Layout.fillWidth: true; placeholderText: "Filter files"; selectByMouse: true }
+                TextField { id: filter; visible: sidebarSection === "folder" && !!viewState.folder; Layout.fillWidth: true; placeholderText: "Filter files"; selectByMouse: true }
                 ListView {
+                    visible: sidebarSection === "folder"
                     Layout.fillWidth: true
                     Layout.fillHeight: true
                     clip: true
                     model: viewState.files
                     delegate: ItemDelegate {
+                        id: fileEntry
                         required property var modelData
                         width: ListView.view.width - 20
                         height: visible ? 42 : 0
@@ -138,36 +151,19 @@ ApplicationWindow {
                         leftPadding: 8 + modelData.depth * 16
                         text: (modelData.directory ? (modelData.expanded ? "▾ " : "▸ ") : "") + modelData.name
                         onClicked: modelData.directory ? studio.toggleDirectory(modelData.path) : studio.openNote(modelData.path)
+                        Hint { visible: fileEntry.hovered; text: modelData.path }
                     }
                     ScrollBar.vertical: ExpressiveScrollBar { }
                 }
+                OutlineList { visible: sidebarSection === "contents"; Layout.fillWidth: true; Layout.fillHeight: true; entries: viewState.outline || []; noteId: viewState.active }
                 Rectangle { Layout.fillWidth: true; height: 1; color: viewState.colors.outline }
-                Label { visible: !!viewState.outline?.length; text: "Contents"; font.weight: Font.DemiBold }
-                ListView {
-                    visible: !!viewState.outline?.length
-                    Layout.fillWidth: true
-                    Layout.preferredHeight: Math.min(260, (viewState.outline?.length || 0) * 38)
-                    clip: true
-                    model: viewState.outline || []
-                    delegate: ItemDelegate {
-                        required property var modelData
-                        width: ListView.view.width - 16
-                        height: 38
-                        leftPadding: 8 + Math.max(0, modelData.level - 1) * 12
-                        text: modelData.title
-                        onClicked: studio.navigateHeading(modelData.id, modelData.offset)
-                        ToolTip.visible: hovered
-                        ToolTip.text: modelData.title
-                    }
-                    ScrollBar.vertical: ExpressiveScrollBar { }
-                }
                 Label { text: "Recent notes"; font.weight: Font.DemiBold; color: viewState.colors.text }
                 ListView {
                     Layout.fillWidth: true
                     Layout.preferredHeight: Math.min(240, viewState.recent.length * 40)
                     clip: true
                     model: viewState.recent
-                    delegate: ItemDelegate { required property string modelData; width: ListView.view.width - 20; height: 40; text: modelData.split("/").pop(); onClicked: studio.openNote(modelData); ToolTip.visible: hovered; ToolTip.text: modelData }
+                    delegate: ItemDelegate { id: recentEntry; required property string modelData; width: ListView.view.width - 20; height: 40; text: modelData.split("/").pop(); onClicked: studio.openNote(modelData); Hint { visible: recentEntry.hovered; text: modelData } }
                     ScrollBar.vertical: ExpressiveScrollBar { }
                 }
                 Label { visible: !viewState.folder && !viewState.recent.length; text: "Open any folder for quick access. Your notes stay ordinary files."; wrapMode: Text.WordWrap; Layout.fillWidth: true; color: viewState.colors.muted }
@@ -189,6 +185,7 @@ ApplicationWindow {
                     anchors.fill: parent
                     ModeGroup { choices: window.width < 1000 ? [{key:"live",label:"Live"},{key:"editor",label:"Source"},{key:"reader",label:"Read"}] : [{key:"live",label:"Live"},{key:"editor",label:"Source"},{key:"reader",label:"Read"},{key:"split",label:"Split"}]; selected: viewState.mode; onChosen: key => studio.setMode(key) }
                     Item { Layout.fillWidth: true }
+                    ActionButton { glyph: "Contents"; compact: true; ToolTip.text: "Table of contents"; onClicked: contentsPopup.open() }
                     ExpressiveSlider { visible: window.width >= 1000; Layout.preferredWidth: 140; from: 60; to: 240; value: viewState.zoom; onMoved: studio.setZoom(value); Accessible.name: "Content zoom" }
                     TextField {
                         objectName: "zoomPercentage"
@@ -258,7 +255,30 @@ ApplicationWindow {
                     }
                 }
             }
-            ActionButton { visible: viewState.fullscreen && !viewState.readerOverlay; glyph: "FullscreenExit"; icon.width: 24; icon.height: 24; compact: true; tonal: true; ToolTip.text: "Exit fullscreen (Esc · F11)"; anchors.right: parent.right; anchors.top: parent.top; anchors.margins: 12; onClicked: windowModes.setFullscreen(false) }
+            Row {
+                visible: viewState.fullscreen && !viewState.readerOverlay && (window.chromeAwake || fullscreenHover.hovered || activeFocus)
+                anchors.right: parent.right; anchors.top: parent.top; anchors.margins: 12; spacing: 8
+                HoverHandler { id: fullscreenHover }
+                ActionButton { glyph: "Contents"; compact: true; tonal: true; ToolTip.text: "Table of contents"; onClicked: contentsPopup.open() }
+                ActionButton { glyph: "FullscreenExit"; icon.width: 24; icon.height: 24; compact: true; tonal: true; ToolTip.text: "Exit fullscreen (Esc · F11)"; onClicked: windowModes.setFullscreen(false) }
+            }
+        }
+    }
+    Popup {
+        id: contentsPopup
+        objectName: "contentsOverlay"
+        parent: Overlay.overlay
+        x: Math.max(16, window.width - width - 16)
+        y: viewState.fullscreen ? 64 : Math.min(180, window.height / 4)
+        width: Math.min(380,window.width-32)
+        height: Math.min(560,window.height-y-24)
+        padding: 16
+        closePolicy: Popup.CloseOnEscape | Popup.CloseOnPressOutside
+        background: Rectangle { radius: 24; color: viewState.colors["surface-high"]; border.color: viewState.colors.outline; border.width: 1; antialiasing: true }
+        ColumnLayout {
+            anchors.fill: parent
+            RowLayout { Label { text: "Contents"; font.pixelSize: 22; font.weight: Font.DemiBold; Layout.fillWidth: true } ActionButton { glyph: "X"; compact: true; ToolTip.text: "Close contents"; onClicked: contentsPopup.close() } }
+            OutlineList { Layout.fillWidth: true; Layout.fillHeight: true; entries: viewState.outline || []; noteId: viewState.active; onChosen: contentsPopup.close() }
         }
     }
     Dialog {

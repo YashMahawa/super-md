@@ -26,7 +26,7 @@ from fonts import FontStore
 ROOT = Path(sys._MEIPASS)/"resources" if getattr(sys,"frozen",False) else Path(__file__).resolve().parent.parent
 DEFAULT_PDF = {"pageSize": "a4", "margin": 18, "fontSize": 10.5, "lineHeight": 1.35, "fontFamily": "Manrope", "pageNumbers": True, "themed": False}
 DEFAULTS = {"theme": "system", "fullTheme": "black", "motion": True, "font": "Manrope", "size": 18, "width": 0, "widthPercent":80, "lineHeight":1.65, "autosave":True, "normalZoom": 100, "fullZoom": 100, "python": (shutil.which("python3") or shutil.which("python") or "") if getattr(sys,"frozen",False) else sys.executable, "pdf": DEFAULT_PDF, "welcomed": False}
-DEFAULTS.update(readingMode="live", newNoteLocation="")
+DEFAULTS.update(readingMode="live", newNoteLocation="", accent="system")
 SAMPLE = """# A place to think\n\nWrite in Markdown. Read without distractions.\n\n> [!tip] Start with your notes\n> Open any note or folder. No vault, no import process.\n\n## Learn by exploring\n\n$$E = mc^2$$\n\n> [!answer]- Why does this matter?\n> Tap the heading to reveal an answer, then hide it to test yourself.\n\n```smd-chart\n{\"title\":\"A changing wave\",\"series\":[{\"name\":\"Sine\",\"expression\":\"sin(a*x)\",\"color\":\"#386a57\"},{\"name\":\"Cosine\",\"expression\":\"cos(a*x)\",\"color\":\"#bc6750\"}],\"sliders\":[{\"name\":\"a\",\"min\":0.2,\"max\":3,\"value\":1}]}\n```\n\n## Explore in three dimensions\n\n```smd-chart\n{\"mode\":\"surface3d\",\"title\":\"Bowl and saddle\",\"x\":{\"min\":-2,\"max\":2,\"steps\":20},\"y\":{\"min\":-2,\"max\":2},\"series\":[{\"name\":\"Bowl\",\"expression\":\"a*(x^2+y^2)\",\"color\":\"#39aa7a\"},{\"name\":\"Saddle\",\"expression\":\"x^2-y^2\",\"color\":\"#ad8be3\"}],\"sliders\":[{\"name\":\"a\",\"min\":0.1,\"max\":2,\"value\":1}]}\n```\n\n[Back to exploring](#learn-by-exploring)\n"""
 
 def local_path(value: str) -> Path:
@@ -95,6 +95,16 @@ class Studio(QObject):
         self.data = self.session.data
         self.settings = self.session.settings
         self.tabs: list[dict] = []
+        self.closed_tabs: list[dict] = []
+        self.note_watcher = QFileSystemWatcher(self)
+        self.note_watcher.fileChanged.connect(self._external_note_changed)
+        self.note_watcher.directoryChanged.connect(self._external_note_changed)
+        self.external_paths = set()
+        self.note_watch_paths = None
+        self.note_file_stamps = {}
+        self.external_timer = QTimer(self)
+        self.external_timer.setSingleShot(True)
+        self.external_timer.timeout.connect(self._refresh_external_notes)
         self.active = ""
         self.folder = ""
         self.files: list[dict] = []
@@ -168,6 +178,7 @@ class Studio(QObject):
 
     def _emit(self, load=True):
         if self.retired: return
+        self._watch_notes()
         self.changed.emit()
         if load and self.ready:
             tab = self._current()
@@ -176,10 +187,49 @@ class Studio(QObject):
 
     def _dark(self):
         theme = self.settings["fullTheme" if self.fullscreen else "theme"]
-        return tokens(theme,self.system_dark,self.system_colors,self.system_mode)[0]
+        return tokens(theme,self.system_dark,self.system_colors,self.system_mode,self.settings["accent"])[0]
 
     def _colors(self):
-        return tokens(self.settings["fullTheme" if self.fullscreen else "theme"],self.system_dark,self.system_colors,self.system_mode)[1]
+        return tokens(self.settings["fullTheme" if self.fullscreen else "theme"],self.system_dark,self.system_colors,self.system_mode,self.settings["accent"])[1]
+
+    def _watch_notes(self,force=False):
+        paths=tuple(sorted({tab["path"] for tab in self.tabs if tab["path"]}))
+        if not force and paths==self.note_watch_paths:return
+        self.note_watch_paths=paths
+        self.note_file_stamps={path:stamp for path,stamp in self.note_file_stamps.items() if path in paths}
+        targets={str(path) for tab in self.tabs if tab["path"] for path in (Path(tab["path"]),Path(tab["path"]).parent) if path.exists()}
+        watched=set(self.note_watcher.files()+self.note_watcher.directories())
+        if watched-targets:self.note_watcher.removePaths(list(watched-targets))
+        if targets-watched:self.note_watcher.addPaths(list(targets-watched))
+
+    def _external_note_changed(self,path):
+        if self.retired:return
+        self.external_paths.add(path)
+        self.external_timer.start(250)
+
+    def _refresh_external_notes(self):
+        if self.retired:return
+        changed,self.external_paths=self.external_paths,set()
+        self._watch_notes(force=True)
+        for tab in self.tabs:
+            path=tab["path"]
+            if not path or not ({path,str(Path(path).parent)} & changed) or tab["id"] in self.saving:continue
+            if tab["content"]!=tab["saved"]:continue  # Never clobber a local draft.
+            try:
+                stat=Path(path).stat();stamp=(stat.st_mtime_ns,stat.st_size)
+            except OSError:continue
+            if self.note_file_stamps.get(path)==stamp:continue
+            id,expected=tab["id"],tab["saved"]
+            def finished(result,error,id=id,expected=expected,path=path,stamp=stamp):
+                current=next((note for note in self.tabs if note["id"]==id),None)
+                if error or not current or current["content"]!=expected:return
+                self.note_file_stamps[path]=stamp
+                content,assets,portable=result
+                if content==expected and assets==current["assets"]:return
+                current.update(content=content,saved=content,assets=assets,portable=portable)
+                self.message="Reloaded externally updated note"
+                self._emit(load=id==self.active)
+            self._submit(lambda path=path:open_note(Path(path)),finished,False)
 
     def _schedule_theme(self,*_):
         self.theme_debounce.start(150)
@@ -224,6 +274,7 @@ class Studio(QObject):
         self.recovery_timer.stop()
         self.autosave_timer.stop()
         self.flush_timer.stop()
+        self.external_timer.stop()
         self._recover()
         self.retired = True
         self.session.windows.pop(self.window_id, None)
@@ -444,9 +495,27 @@ class Studio(QObject):
 
     @Slot(str)
     def selectTab(self, id):
-        if any(t["id"] == id for t in self.tabs):
+        if id!=self.active and any(t["id"] == id for t in self.tabs):
             self.active = id
             self._emit()
+
+    @Slot(int)
+    def cycleTab(self, direction):
+        index=next((i for i,t in enumerate(self.tabs) if t["id"]==self.active),0)
+        self.selectTab(self.tabs[(index+direction)%len(self.tabs)]["id"])
+
+    @Slot(int)
+    def tabNumber(self, number):
+        index=len(self.tabs)-1 if number==9 else number-1
+        if 0<=index<len(self.tabs):self.selectTab(self.tabs[index]["id"])
+
+    @Slot()
+    def reopenTab(self):
+        if not self.closed_tabs:return
+        note=self.closed_tabs.pop()
+        existing=next((t for t in self.tabs if note["path"] and t["path"]==note["path"]),None)
+        if existing:self.selectTab(existing["id"]);return
+        self.tabs.append(note);self.active=note["id"];self._emit()
 
     @Slot(str)
     def openFolder(self, value):
@@ -503,10 +572,13 @@ class Studio(QObject):
     @Slot(str)
     def setMode(self, mode):
         if mode in ("live", "reader", "editor", "split"):
-            self.mode = mode
-            self.settings["readingMode"] = mode
-            self.preference_timer.start(500)
-            self._emit()
+            if mode!=self.mode:self._flush("mode",mode)
+
+    def _apply_mode(self,mode):
+        self.mode=mode
+        self.settings["readingMode"]=mode
+        self.preference_timer.start(500)
+        self._emit()
 
     @Slot(bool)
     def setFullscreen(self, value):
@@ -534,6 +606,7 @@ class Studio(QObject):
         except ValueError:
             return
         if key in ("theme","fullTheme") and value not in ("system","light","dark","black"): return
+        if key=="accent" and value not in ("system","blue","green","violet","rose","amber"):return
         if key in ("motion","welcomed","autosave") and not isinstance(value,bool): return
         if key in ("font","python") and (not isinstance(value,str) or not value.strip() or len(value)>2048): return
         if key in ("size","width","widthPercent","lineHeight","normalZoom","fullZoom") and (not isinstance(value,(int,float)) or isinstance(value,bool) or not math.isfinite(value)): return
@@ -558,6 +631,7 @@ class Studio(QObject):
 
     def _after_flush(self,operation):
         if operation["action"] == "save": self.save()
+        elif operation["action"] == "mode": self._apply_mode(operation["target"])
         elif operation["action"] == "move_tab":
             request = json.loads(operation["target"])
             target = self.session.windows.get(request["window"])
@@ -667,12 +741,12 @@ class Studio(QObject):
             self._preferences(); self._recover(); self._emit(); self._load_tree()
         self._submit(work,finished,executor=self.writes)
 
-    @Slot(str,result=str)
+    @Slot(str,result=QUrl)
     def defaultSaveLocation(self,name):
         directory = self.settings.get("newNoteLocation") or QStandardPaths.writableLocation(QStandardPaths.DownloadLocation) or str(Path.home())
-        return QUrl.fromLocalFile(str(Path(directory)/Path(name).name)).toString()
+        return QUrl.fromLocalFile(str(Path(directory)/Path(name).name))
 
-    @Slot(str, result=str)
+    @Slot(str, result=QUrl)
     def defaultExportLocation(self, format):
         return self.defaultSaveLocation(Path(self._current()["name"]).stem + "." + format)
 
@@ -690,7 +764,10 @@ class Studio(QObject):
 
     def _remove_tab(self, id):
         index = next(i for i,t in enumerate(self.tabs) if t["id"] == id)
-        self.tabs.pop(index)
+        removed=self.tabs.pop(index)
+        if removed["content"].strip() or removed["path"]:
+            self.closed_tabs.append(removed)
+            while len(self.closed_tabs)>12 or sum(len(t["content"])+len(t["saved"])+sum(len(v) for v in t["assets"].values()) for t in self.closed_tabs)>4_000_000:self.closed_tabs.pop(0)
         if not self.tabs:
             self.tabs.append(self._note("Untitled.md"))
         if self.active == id:

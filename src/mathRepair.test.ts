@@ -31,6 +31,15 @@ it("leaves valid compact Obsidian formulas and inner products untouched",()=>{
   expect(suggestMathRepairs(source)).toEqual([]);
   expect(applyMathRepairs(source,suggestMathRepairs(source))).toBe(source);
 });
+it("never splits the first and last lines of valid multiline equations",()=>{
+  const source=String.raw`$$\mu_k=\frac1{2h}\int_{-h}^h u^k\,du
+=\begin{cases}0,&k\text{ odd},\\h^k/(k+1),&k\text{ even}.\end{cases}$$
+
+$$\boxed{X_n\xrightarrow{P}X\quad\Longleftrightarrow\quad
+P(|X_n-X|>\varepsilon)\longrightarrow0\ \text{for every }\varepsilon>0.}$$`;
+  expect(suggestMathRepairs(source)).toEqual([]);
+  expect(applyMathRepairs(source,suggestMathRepairs(source))).toBe(source);
+});
 it.each([
   [String.raw`$ x^2 $`,"$x^2$"],
   [String.raw`$ x + y $`,"$x + y$"],

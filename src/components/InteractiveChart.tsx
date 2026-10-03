@@ -1,10 +1,11 @@
-import { useEffect, useId, useMemo, useState, type CSSProperties } from "react";
+import { useEffect, useId, useMemo, useRef, useState, type CSSProperties } from "react";
 import { compileMathExpression } from "../mathExpression";
 import { parseChartSpec, lineSegments } from "../chartModel";
 import { chartValues, chartGrids, remember } from "../renderedOutputs";
 import SurfaceChart from "./SurfaceChart";
 import { useChartZoom } from "../useChartZoom";
 import { axisNumber, axisTicks } from "../focalZoom";
+import GraphProbe from "./GraphProbe";
 
 const palette = ["#6750a4", "#006a6a", "#b3261e", "#7d5700", "#3f6374"];
 const darkPalette = ["#d0bcff", "#72d6d6", "#ffb4ab", "#efd18a", "#a1cce0"];
@@ -16,7 +17,7 @@ export default function InteractiveChart({source,dark=false}:{source:string;dark
   const initial = ()=>chartValues.get(source)||Object.fromEntries((parsed.spec?.sliders||[]).map(slider=>[slider.name,slider.value]));
   const [values,setValues] = useState<Record<string,number>>(initial);
   const [grid,setGrid] = useState(()=>chartGrids.get(source)??true);
-  const [point,setPoint] = useState<{x:number;y:number}|null>(null);
+  const svgRef=useRef<SVGSVGElement>(null);
   const [viewport,setViewport] = useState(760);
   useEffect(()=>{
     const svg=plot.host.current?.querySelector("svg");if(!svg || typeof ResizeObserver==="undefined")return;
@@ -59,16 +60,17 @@ export default function InteractiveChart({source,dark=false}:{source:string;dark
   if(spec.mode!=="surface3d" && (!(xMax>xMin) || !Number.isFinite(xMax-xMin) || !Number.isFinite(yMax-yMin))) return <div className="render-error">Chart limits are outside a usable numeric range. Specify finite axis limits.</div>;
   return <figure ref={plot.host} className="interactive-chart" data-plot-zoom={plot.zoom} data-center-x={plot.center.x} data-center-y={plot.center.y} style={{"--surface-label-size":`${Math.min(36,13*760/Math.max(280,viewport))}px`} as CSSProperties}>
     {spec.title && <figcaption>{spec.title}</figcaption>}
-    <div className="chart-toolbar"><button aria-pressed={grid} onClick={()=>{remember(chartGrids,source,!grid);setGrid(!grid);}}>Grid</button><output className="chart-coordinate" aria-live="off">{spec.mode!=="surface3d" && point ? `(${axisNumber(point.x)}, ${axisNumber(point.y)})` : ""}</output></div>
+    <div className="chart-toolbar"><button aria-pressed={grid} onClick={()=>{remember(chartGrids,source,!grid);setGrid(!grid);}}>Grid</button></div>
     {spec.mode==="surface3d" ? <SurfaceChart key={source} source={source} spec={spec} values={effectiveValues} colors={colors} zoom={plot.zoom} center={plot.center} grid={grid}/> : <><div data-independent-zoom>
-      <svg viewBox={`0 0 ${width} ${height}`} data-plot-left={left} role="img" aria-label={spec.title||"Interactive graph"} onPointerMove={event=>{ const rect=event.currentTarget.getBoundingClientRect(), x=(event.clientX-rect.left)/rect.width*width,y=(event.clientY-rect.top)/rect.height*height;if(x>=left && x<=width-right && y>=top && y<=height-bottom) setPoint({x:xMin+(x-left)/(width-left-right)*(xMax-xMin),y:yMax-(y-top)/(height-top-bottom)*(yMax-yMin)});else setPoint(null); }} onPointerLeave={event=>{if(event.pointerType==="mouse")setPoint(null);}} onPointerDown={event=>{const rect=event.currentTarget.getBoundingClientRect();const x=(event.clientX-rect.left)/rect.width*width,y=(event.clientY-rect.top)/rect.height*height;if(x>=left && x<=width-right && y>=top && y<=height-bottom)setPoint({x:xMin+(x-left)/(width-left-right)*(xMax-xMin),y:yMax-(y-top)/(height-top-bottom)*(yMax-yMin)});}}>
+      <svg ref={svgRef} viewBox={`0 0 ${width} ${height}`} data-plot-left={left} role="img" aria-label={spec.title||"Interactive graph"}>
         <defs><clipPath id={clipId}><rect x={left} y={top} width={width-left-right} height={height-top-bottom}/></clipPath></defs>
         <line className="chart-axis" x1={left} x2={width-right} y1={clamp(py(0),top,height-bottom)} y2={clamp(py(0),top,height-bottom)}/>
         <line className="chart-axis" x1={clamp(px(0),left,width-right)} x2={clamp(px(0),left,width-right)} y1={top} y2={height-bottom}/>
         {axisTicks(xMin,xMax,Math.max(2,Math.min(8,Math.floor((width-left-right)/90)))).map(x=><g key={`x${x}`}>{grid && <line className="chart-grid" x1={px(x)} x2={px(x)} y1={top} y2={height-bottom}/>}<text x={px(x)} y={height-bottom+20} textAnchor="middle">{axisNumber(x)}</text></g>)}
         {axisTicks(yMin,yMax,4).map(y=><g key={`y${y}`}>{grid && <line className="chart-grid" x1={left} x2={width-right} y1={py(y)} y2={py(y)}/>}<text x={left-10} y={py(y)+4} textAnchor="end">{axisNumber(y)}</text></g>)}
         <text x={width-right} y={height-8} textAnchor="end">{spec.x?.label||"x"}</text><text x={left} y={16}>{spec.y?.label||"y"}</text>
-        <g clipPath={`url(#${clipId})`}>{visibleSeries.flatMap((points,index)=>lineSegments(points,yMax-yMin).map((segment,j)=><polyline key={`${index}-${j}`} fill="none" stroke={colors[index]} strokeWidth="2.5" points={segment.map(([x,y])=>`${px(x).toFixed(2)},${py(y).toFixed(2)}`).join(" ")}/>) )}{point && <circle cx={px(point.x)} cy={py(point.y)} r={4} fill="var(--primary)"/>}</g>
+        <g clipPath={`url(#${clipId})`}>{visibleSeries.flatMap((points,index)=>lineSegments(points,yMax-yMin).map((segment,j)=><polyline key={`${index}-${j}`} fill="none" stroke={colors[index]} strokeWidth="2.5" points={segment.map(([x,y])=>`${px(x).toFixed(2)},${py(y).toFixed(2)}`).join(" ")}/>) )}</g>
+        <GraphProbe svg={svgRef} locate={(x,y)=>x>=left&&x<=width-right&&y>=top&&y<=height-bottom?{x,y,coordinates:[xMin+(x-left)/(width-left-right)*(xMax-xMin),yMax-(y-top)/(height-top-bottom)*(yMax-yMin)]}:null}/>
       </svg></div>
       {!allY.length && <div className="chart-warning" role="status">No finite samples. Check the expression and variable names.</div>}
     </>}

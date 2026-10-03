@@ -1,7 +1,7 @@
 // Mechanical conversion of the same pinned Material Symbols used by Qt.
 // Preserve path geometry; translate Google's negative-Y viewBox into Android's.
 import { readFileSync, writeFileSync, mkdirSync, copyFileSync } from "node:fs";
-const names = {SidebarSimple:"sidebar",Plus:"add",File:"file",FolderOpen:"folder_open",FloppyDisk:"save",MagnifyingGlass:"search",Image:"image",GearSix:"settings",Export:"export",ShareNetwork:"share",ArrowsOut:"open_window",X:"close",Bug:"bug",CaretDown:"expand",Check:"check",Fullscreen:"fullscreen",FullscreenExit:"fullscreen_exit"};
+const names = {SidebarSimple:"sidebar",Plus:"add",File:"file",FolderOpen:"folder_open",FloppyDisk:"save",MagnifyingGlass:"search",Image:"image",GearSix:"settings",Export:"export",ShareNetwork:"share",ArrowsOut:"open_window",X:"close",Bug:"bug",CaretDown:"expand",Check:"check",Contents:"contents",Fullscreen:"fullscreen",FullscreenExit:"fullscreen_exit"};
 mkdirSync("android/app/src/main/res/drawable", {recursive:true});
 for (const [source, target] of Object.entries(names)) {
   const svg = readFileSync(`desktop/icons/${source}.svg`, "utf8");
@@ -11,4 +11,4 @@ for (const [source, target] of Object.entries(names)) {
 }
 mkdirSync("android/app/src/main/assets/licenses", {recursive:true});
 copyFileSync("desktop/licenses/Material-Symbols-Apache-2.0.txt", "android/app/src/main/assets/licenses/Material-Symbols-Apache-2.0.txt");
-console.log("Android and desktop now share 17 Material Symbols Rounded (weight 600)");
+console.log(`Android and desktop now share ${Object.keys(names).length} Material Symbols Rounded (weight 600)`);

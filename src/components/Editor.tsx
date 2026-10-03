@@ -4,7 +4,7 @@ import { EditorView, keymap, lineNumbers, highlightActiveLine, drawSelection } f
 import { defaultKeymap, history, historyField, historyKeymap, indentWithTab, undo, redo } from "@codemirror/commands";
 import { markdown, markdownLanguage } from "@codemirror/lang-markdown";
 import { syntaxHighlighting, defaultHighlightStyle, foldGutter, foldKeymap } from "@codemirror/language";
-import { search, searchKeymap, highlightSelectionMatches, openSearchPanel } from "@codemirror/search";
+import { search, searchKeymap, highlightSelectionMatches, openSearchPanel, SearchQuery, setSearchQuery } from "@codemirror/search";
 import { oneDarkHighlightStyle } from "@codemirror/theme-one-dark";
 
 interface Props {
@@ -29,7 +29,19 @@ function trimEditorSessions() {
 const callbacks = new Map<string, (value: string) => void>();
 const statusHandlers = new Map<string, (state: EditorState) => void>();
 const visibleEditors = new Map<string, EditorView>();
+export function editorReadingOffset(id:string):number|undefined {
+  const view=visibleEditors.get(id);if(!view)return;
+  const rect=view.scrollDOM.getBoundingClientRect();
+  return view.posAtCoords({x:rect.left+80,y:rect.top+16})??view.viewport.from;
+}
 export function editorHistory(id:string,direction:"undo"|"redo"):boolean {const view=visibleEditors.get(id);return !!view && (direction==="undo"?undo(view):redo(view));}
+export function editorFindQuery(id:string,query:string,caseSensitive:boolean) {
+  visibleEditors.get(id)?.dispatch({effects:setSearchQuery.of(new SearchQuery({search:query,caseSensitive,literal:true}))});
+}
+export function editorFindRange(id:string,from:number,to:number) {
+  const view=visibleEditors.get(id);if(!view)return;
+  view.dispatch({selection:{anchor:from,head:to},effects:EditorView.scrollIntoView(from,{y:"center"})});
+}
 export interface PortableEditorSession { state: unknown; top: number; wrapped: boolean }
 const incomingSessions = new Map<string, PortableEditorSession>();
 export function exportEditorSession(id: string): PortableEditorSession | undefined {

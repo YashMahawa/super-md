@@ -1,4 +1,36 @@
-# Super MD 0.4.6
+# Super MD 0.4.7
+
+## This release
+
+- PDF, portable SMD and Save dialogs preserve spaces, Unicode and literal percent
+  signs in filenames. Typed file URLs prevent double-encoding at the Qt boundary.
+- Math containing absolute-value or conditional-probability bars stays inside
+  its Markdown table cell on every platform. Original source offsets are retained.
+- LaTeX repair no longer splits valid multiline equations into bogus line fixes.
+  Repairs remain reviewed and undoable; ambiguous prose is not guessed.
+- Plain PDF exports keep neutral paper, shaded/bold table headers and semantic
+  colored callouts with SVG icons, independent of wallpaper accent. Optional
+  light Material PDF theming remains available only in Export and Share.
+- Folder/Contents sidebar sections, collapsed hierarchical headings, independent
+  scroll areas and a floating contents overlay. Fullscreen controls hide when idle.
+- Chrome-style tab shortcuts, reopen-closed-tab and polished native path hints.
+- Search focuses immediately, closes with Esc and uses up/down match arrows,
+  case matching and literal source replacement, including offscreen Source lines.
+- Changing reading/source/live modes retains a source-position anchor. External
+  plain-note updates refresh clean documents without overwriting unsaved edits.
+- Bounded cached Markdown/KaTeX trees avoid repeated conversion when reopening
+  tabs or changing appearance. Offscreen blocks skip layout/paint work.
+- Ordinary text dragging selects again; Alt-drag is optional desktop page pan.
+  Graph probes follow the pointer without rebuilding meshes, and hide on touch-up.
+- System or manual Material accent presets on desktop and Android; lighter OEM
+  palette correction, stronger selected-mode contrast and synchronized reader colors.
+- Shared callout icon geometry, Android contents hierarchy/overlay and hardware
+  tab shortcuts. Native Qt, shared-reader, PDF and Android regression checks.
+
+Android downloads are optimized, signed **release** APKs with the existing upgrade
+certificate. Physical Vivo installation remains unverified without a device test.
+
+## Previous release (0.4.6)
 
 ## This release
 

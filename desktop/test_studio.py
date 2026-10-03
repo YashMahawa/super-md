@@ -237,7 +237,49 @@ class StudioTest(unittest.TestCase):
         self.assertEqual(loads, [])
         self.assertEqual(calls, ["window.supermdSetZoom?.(175)"])
         self.studio.setMode("reader")
+        operation=self.studio.flush_operation
+        self.assertEqual(operation["action"],"mode")
+        self.studio.post("flush-mode","document_flushed",json.dumps({"id":self.studio.active,"content":self.studio._current()["content"],"operation":operation}))
         self.assertEqual(self.window().mode, "reader")
+
+    def test_export_names_are_typed_urls_and_never_double_encode_spaces(self):
+        meta=self.studio.metaObject()
+        for signature in ("defaultSaveLocation(QString)","defaultExportLocation(QString)"):
+            self.assertEqual(meta.method(meta.indexOfMethod(signature)).typeName(),"QUrl")
+        self.studio._current()["name"]="Quiz 2 Ω literal%20.md"
+        for extension in ("pdf","smd"):
+            target=self.studio.defaultExportLocation(extension)
+            self.assertIsInstance(target,QUrl)
+            self.assertEqual(Path(target.toLocalFile()).name,"Quiz 2 Ω literal%20."+extension)
+
+    def test_external_refresh_does_not_overwrite_a_draft(self):
+        studio=self.studio;path=studio.data / "external.md"
+        path.write_text("Original",encoding="utf-8")
+        studio._current().update(path=str(path),content="Original",saved="Original")
+        studio._emit();path.write_text("External update",encoding="utf-8")
+        studio._external_note_changed(str(path));studio.external_timer.stop();studio._refresh_external_notes()
+        deadline=time.monotonic()+3
+        while studio._current()["content"]!="External update" and time.monotonic()<deadline:
+            self.app.processEvents();time.sleep(.005)
+        self.assertEqual(studio._current()["content"],"External update")
+        studio._current()["content"]="Unsaved local draft"
+        path.write_text("Second external version",encoding="utf-8")
+        studio._external_note_changed(str(path));studio.external_timer.stop();studio._refresh_external_notes()
+        self.app.processEvents()
+        self.assertEqual(studio._current()["content"],"Unsaved local draft")
+
+    def test_chrome_tab_navigation_reopen_and_last_tab_shortcut(self):
+        first=self.studio.active
+        self.studio.newNote();second=self.studio.active
+        self.studio.newNote();third=self.studio.active
+        self.studio._current().update(content="Keep this",saved="Keep this")
+        self.studio.cycleTab(1);self.assertEqual(self.studio.active,first)
+        self.studio.cycleTab(-1);self.assertEqual(self.studio.active,third)
+        self.studio.tabNumber(2);self.assertEqual(self.studio.active,second)
+        self.studio.tabNumber(9);self.assertEqual(self.studio.active,third)
+        self.studio.closeTab(third);self.studio.reopenTab()
+        self.assertEqual(self.studio.active,third)
+        self.assertEqual(self.studio._current()["content"],"Keep this")
 
     def test_outline_names_untitled_notes_and_sets_export_filename(self):
         self.studio.newNote()

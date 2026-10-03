@@ -2,13 +2,13 @@ import { useEffect, useId, useMemo, useRef, useState } from "react";
 import type { ChartSpec } from "../types";
 import { compileMathExpression } from "../mathExpression";
 import { chartViews, remember } from "../renderedOutputs";
-import { axisNumber, type Point as Focus } from "../focalZoom";
+import { type Point as Focus } from "../focalZoom";
+import GraphProbe from "./GraphProbe";
 type Point = [number,number,number];
 type View = {azimuth:number;elevation:number};
 export default function SurfaceChart({source,spec,values,colors,zoom=1,center={x:0,y:0},grid=true}:{source:string;spec:ChartSpec;values:Record<string,number>;colors:string[];zoom?:number;center?:Focus;grid?:boolean}) {
   const clipId = `surface-${useId().replace(/:/g, "")}`;
   const [view,setView] = useState<View>(()=>chartViews.get(source)||{azimuth:35,elevation:28});
-  const [point,setPoint] = useState<Point|null>(null);
   const viewRef = useRef(view); viewRef.current = view;
   const svgRef=useRef<SVGSVGElement>(null);
   const drag = useRef<{id:number;x:number;y:number;view:View}|null>(null);
@@ -70,8 +70,8 @@ export default function SurfaceChart({source,spec,values,colors,zoom=1,center={x
   return <>
     <svg ref={svgRef} data-independent-zoom data-azimuth={view.azimuth} data-elevation={view.elevation} viewBox="0 0 760 440" className="surface-chart" role="img" tabIndex={0} aria-label={`${spec.title||"Interactive 3D surface"}. Mouse-drag to rotate. Two-finger move pans, pinch zooms. Arrow keys rotate.`} style={{touchAction:"pan-y"}}
       onKeyDown={event=>{if(["ArrowLeft","ArrowRight","ArrowUp","ArrowDown"].includes(event.key)){event.preventDefault();change({azimuth:view.azimuth+(event.key==="ArrowLeft"?-5:event.key==="ArrowRight"?5:0),elevation:Math.max(5,Math.min(85,view.elevation+(event.key==="ArrowUp"?5:event.key==="ArrowDown"?-5:0)))});}}}
-      onPointerDown={event=>{const rect=event.currentTarget.getBoundingClientRect(), sx=(event.clientX-rect.left)/rect.width*760,sy=(event.clientY-rect.top)/rect.height*440;let best:Point|null=null,closest=Infinity;for(const p of grids.flat(2)){if(!p.every(Number.isFinite))continue;const [px,py]=project(p),d=Math.hypot(px-sx,py-sy);if(d<closest){closest=d;best=p;}}setPoint(closest<40?best:null);if(event.pointerType!=="mouse" || event.button!==0) return;event.currentTarget.setPointerCapture(event.pointerId);drag.current={id:event.pointerId,x:event.clientX,y:event.clientY,view:viewRef.current};}}
-      onPointerMove={event=>{const start=drag.current;if(!start || start.id!==event.pointerId || event.currentTarget.closest('[data-chart-pinching]')) {if(event.pointerType==="mouse"){const rect=event.currentTarget.getBoundingClientRect(), sx=(event.clientX-rect.left)/rect.width*760,sy=(event.clientY-rect.top)/rect.height*440;let best:Point|null=null,closest=Infinity;for(const p of grids.flat(2)){if(!p.every(Number.isFinite))continue;const [px,py]=project(p),d=Math.hypot(px-sx,py-sy);if(d<closest){closest=d;best=p;}}setPoint(closest<25?best:null);}return;}pendingView.current={azimuth:start.view.azimuth+(event.clientX-start.x)*.4,elevation:Math.max(5,Math.min(85,start.view.elevation-(event.clientY-start.y)*.3))};if(!frame.current) frame.current=requestAnimationFrame(()=>{frame.current=0;if(pendingView.current) {change(pendingView.current);pendingView.current=null;}});}}
+      onPointerDown={event=>{if(event.pointerType!=="mouse" || event.button!==0) return;event.currentTarget.setPointerCapture(event.pointerId);drag.current={id:event.pointerId,x:event.clientX,y:event.clientY,view:viewRef.current};}}
+      onPointerMove={event=>{const start=drag.current;if(!start || start.id!==event.pointerId || event.currentTarget.closest('[data-chart-pinching]'))return;pendingView.current={azimuth:start.view.azimuth+(event.clientX-start.x)*.4,elevation:Math.max(5,Math.min(85,start.view.elevation-(event.clientY-start.y)*.3))};if(!frame.current) frame.current=requestAnimationFrame(()=>{frame.current=0;if(pendingView.current) {change(pendingView.current);pendingView.current=null;}});}}
       onPointerUp={finishDrag} onPointerCancel={finishDrag}>
       <defs><clipPath id={clipId}><rect width="760" height="440"/></clipPath></defs>
       <g clipPath={`url(#${clipId})`}>
@@ -80,8 +80,7 @@ export default function SurfaceChart({source,spec,values,colors,zoom=1,center={x
         {axis([x0,y0,z0],[x0,y1,z0],spec.y?.label||"y")}
         {axis([x0,y0,z0],[x0,y0,z1],spec.z?.label||"z")}
       </g>
-      {point && <circle cx={project(point)[0]} cy={project(point)[1]} r="4" fill="var(--primary)"/>}
+      <GraphProbe svg={svgRef} locate={(x,y)=>{let best:Point|null=null,closest=30;for(const surface of grids)for(const row of surface)for(const p of row){if(!p.every(Number.isFinite))continue;const [px,py]=project(p),distance=Math.hypot(px-x,py-y);if(distance<closest){closest=distance;best=p;}}if(!best)return null;const [px,py]=project(best);return {x:px,y:py,coordinates:best};}}/>
     </svg>
-    {point && <output className="chart-coordinate">({point.map(axisNumber).join(", ")})</output>}
   </>;
 }

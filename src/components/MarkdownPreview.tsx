@@ -2,7 +2,7 @@ import { Children, isValidElement, lazy, memo, Suspense, useEffect, useMemo, use
 import {unified} from "unified";
 import remarkParse from "remark-parse";
 import { invoke } from "../nativeBridge";
-import ReactMarkdown, { defaultUrlTransform } from "react-markdown";
+import CachedMarkdown from "./CachedMarkdown";
 import remarkGfm from "remark-gfm";
 import remarkMath from "remark-math";
 import rehypeKatex from "rehype-katex";
@@ -21,6 +21,10 @@ const MermaidDiagram = lazy(() => import("./MermaidDiagram"));
 function remarkTaskPositions() {
   return (tree:unknown)=>{let index=0;visit(tree as never,'listItem',(node:any)=>{if(typeof node.checked==='boolean')node.data={...node.data,hProperties:{...node.data?.hProperties,'data-task-index':index++}};});};
 }
+function remarkSourcePositions(){return (tree:unknown)=>visit(tree as never,(node:any)=>{
+  if(!node.position||!node.children)return;
+  node.data={...node.data,hProperties:{...node.data?.hProperties,"data-source-start":node.position.start.offset,"data-source-end":node.position.end.offset}};
+});}
 
 function textOf(value: ReactNode): string {
   if (typeof value === "string" || typeof value === "number") return String(value);
@@ -139,9 +143,8 @@ function MarkdownPreview({ markdown, documentPath, python, dark, trustedImageHos
   },[markdown,onChange]);
   return (
     <article className="markdown-body" onCopy={event=>{const source=selectedMarkdown(window.getSelection());if(source!==null){event.clipboardData.setData("text/plain",source);event.preventDefault();}}}>
-      <ReactMarkdown
-        urlTransform={(url, key, node) => node.tagName === "img" && key === "src" && /^data:image\/(?:png|jpeg|gif|webp|avif|svg\+xml);base64,/i.test(url) ? url : defaultUrlTransform(url)}
-        remarkPlugins={[remarkGfm, remarkMath, remarkObsidianMath, remarkCallouts, remarkHeadingIds, remarkTaskPositions]}
+      <CachedMarkdown
+        remarkPlugins={[remarkGfm, remarkMath, remarkObsidianMath, remarkCallouts, remarkHeadingIds, remarkTaskPositions,remarkSourcePositions]}
         rehypePlugins={[rehypeKatex, rehypeHighlight]}
         components={{
           input: ({node: _node,...props}) => <input {...props} disabled={!onChange} onChange={()=>{}} />,
@@ -160,7 +163,7 @@ function MarkdownPreview({ markdown, documentPath, python, dark, trustedImageHos
             return <div className="code-container"><CopyCode source={source}/><details className="code-disclosure" open={source.split("\n").length <= 12}><summary>{language || "Code"} <span>{source.split("\n").length} lines</span></summary><pre>{children}</pre></details></div>;
           }
         }}
-      >{normalized}</ReactMarkdown>
+      >{normalized}</CachedMarkdown>
     </article>
   );
 }

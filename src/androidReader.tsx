@@ -8,7 +8,8 @@ import "katex/dist/katex.min.css";
 import "highlight.js/styles/github-dark.css";
 import "./styles.css";
 import "./androidReader.css";
-import Editor, { editorHistory, exportEditorSession, importEditorSession, type PortableEditorSession } from "./components/Editor";
+import Editor, { editorReadingOffset, editorHistory, exportEditorSession, importEditorSession, type PortableEditorSession } from "./components/Editor";
+import {readingOffset,revealReadingOffset} from "./readingPosition";
 import { exportRenderedViews, importRenderedViews } from "./renderedOutputs";
 import LiveEditor from "./components/LiveEditor";
 import MarkdownPreview from "./components/MarkdownPreview";
@@ -48,6 +49,7 @@ function Reader() {
   const replaying=useRef(false);
   const loadedFonts=useRef(new Map<string,Promise<FontFace>>());
   const cursor=useRef<Point|undefined>(undefined);
+  const modeOffset=useRef<number|null>(null);
   const anchors = (focus?:Point) => Array.from(document.querySelectorAll<HTMLElement>(".android-reading,.cm-scroller")).filter(root=>{const r=root.getBoundingClientRect();return !focus || focus.x>=r.left&&focus.x<=r.right&&focus.y>=r.top&&focus.y<=r.bottom;}).map(root=>captureScrollAnchor(root,focus));
   const applyZoomStyle=(focus?:Point,previousFocus=focus)=>{document.querySelector<HTMLElement>(".android-source")?.style.setProperty("--workspace-scale",String(zoomReference.current/100));document.querySelectorAll<HTMLElement>(".android-reading").forEach(root=>applyDocumentZoom(root,zoomReference.current,reference.current?.widthPercent??80,focus,previousFocus));};
   const anchored = (update:()=>void) => { const restore = anchors(); update(); requestAnimationFrame(()=>restore.forEach(callback=>callback())); };
@@ -55,6 +57,11 @@ function Reader() {
     window.supermdDismiss=()=>{const element=document.querySelector(".image-viewer,.math-repair-panel,.reading-search,.cm-search,.live-active-block textarea");if(!element)return false;const target=element.matches("textarea")?element:document.activeElement||document;target.dispatchEvent(new KeyboardEvent("keydown",{key:"Escape",bubbles:true,cancelable:true}));if(element.matches("textarea"))(element as HTMLElement).blur();return true;};
     window.supermdLoad = (next) => {
       const old = reference.current;
+      if(old&&old.id===next.id&&old.mode!==next.mode){
+        const root=document.querySelector<HTMLElement>(".android-reading");
+        modeOffset.current=old.mode==="editor"?(editorReadingOffset(old.id)??0):root?readingOffset(root):0;
+      }
+      if(old&&Object.keys(next).every(key=>key==="viewState"||key==="colors"?key==="viewState"?!next.viewState:JSON.stringify(old.colors)===JSON.stringify(next.colors):(old as any)[key]===(next as any)[key]))return;
       if (old && old.id !== next.id) {
         noteViews.current.set(old.id, {top: document.querySelector<HTMLElement>(".android-reading")?.scrollTop ?? 0});
         if (noteViews.current.size > 40) noteViews.current.delete(noteViews.current.keys().next().value!);
@@ -66,7 +73,7 @@ function Reader() {
         if(history && [history.undo,history.redo].every(list=>Array.isArray(list)&&list.length<=60&&list.every(text=>typeof text==="string")&&list.reduce((size,text)=>size+text.length,0)<=2_000_000))histories.current.set(next.id,{undo:[...history.undo],redo:[...history.redo],last:0});
         noteViews.current.set(next.id, next.viewState);
       }
-      const load = () => { setState(next); zoomReference.current = next.zoom; };
+      const load = () => { reference.current=next;setState(next); zoomReference.current = next.zoom; };
       if (old?.id === next.id && old.mode === next.mode) anchored(load); else load();
     };
     window.supermdHistory=direction=>{
@@ -96,7 +103,7 @@ function Reader() {
       const view = operation.action === "move_tab" || operation.action === "detach_tab" ? {editor:exportEditorSession(id),history:histories.current.get(id), ...(id === current.id ? {top:document.querySelector<HTMLElement>(".android-reading")?.scrollTop ?? 0,rendered:exportRenderedViews(current.content)} : noteViews.current.get(id))} : undefined;
       void invoke("document_flushed",{id:current.id,content:current.content,operation,viewId:id,viewState:view});
     };
-    window.supermdFind = () => { if(reference.current?.mode==="editor" || reference.current?.mode==="split") requestAnimationFrame(()=>window.dispatchEvent(new Event("supermd-find")));else setSearching(true); };
+    window.supermdFind = () => {setSearching(true);requestAnimationFrame(()=>window.dispatchEvent(new Event("supermd-find-focus")));};
     window.supermdPortable = async (save) => {
       const current = reference.current; if (!current) return;
       try { const prepared = await prepareFmd(current.content, current.path); await invoke("export_fmd_native", { ...prepared, originalContent: current.content, id: current.id, save }); }
@@ -142,13 +149,20 @@ function Reader() {
   useLayoutEffect(() => {
     if (!state) return;
     const top = noteViews.current.get(state.id)?.top;
+    if(modeOffset.current!==null){
+      const offset=modeOffset.current;modeOffset.current=null;
+      requestAnimationFrame(()=>{
+        if(state.mode==="editor")window.dispatchEvent(new CustomEvent("supermd-goto-offset",{detail:offset}));
+        else {const host=document.querySelector<HTMLElement>(".android-reading");if(host)revealReadingOffset(host,offset);}
+      });return;
+    }
     if (typeof top === "number" && Number.isFinite(top)) {
       const host = document.querySelector<HTMLElement>(".android-reading");
       if (host) host.scrollTop = Math.max(0, top);
     }
   }, [state?.id, state?.mode]);
   useEffect(() => {
-    const find=(event:KeyboardEvent)=>{if((event.ctrlKey || event.metaKey) && event.key.toLowerCase()==="f" && reference.current?.mode!=="editor" && reference.current?.mode!=="split"){event.preventDefault();setSearching(true);}};
+    const find=(event:KeyboardEvent)=>{if((event.ctrlKey || event.metaKey) && event.key.toLowerCase()==="f"){event.preventDefault();event.stopImmediatePropagation();window.supermdFind?.();}};
     const history=(event:KeyboardEvent)=>{
       if(!(event.ctrlKey||event.metaKey)||event.altKey)return;
       const key=event.key.toLowerCase();if(key!=="z"&&key!=="y")return;
@@ -158,9 +172,9 @@ function Reader() {
       if(event.target instanceof HTMLInputElement || event.target instanceof HTMLTextAreaElement)return;
       event.preventDefault();event.stopImmediatePropagation();window.supermdHistory?.(key==="y"||event.shiftKey?"redo":"undo");
     };
-    document.addEventListener("keydown",find);
+    document.addEventListener("keydown",find,true);
     document.addEventListener("keydown",history,true);
-    return()=>{document.removeEventListener("keydown",find);document.removeEventListener("keydown",history,true);};
+    return()=>{document.removeEventListener("keydown",find,true);document.removeEventListener("keydown",history,true);};
   },[]);
   useEffect(() => {
     let startDistance = 0, startZoom = 100, pinching = false, frame = 0,focus:Point|undefined,previousFocus:Point|undefined,mouseHeld=false;
@@ -169,7 +183,7 @@ function Reader() {
     const down=(event:PointerEvent)=>{
       if(event.pointerType!=="mouse"||event.button!==0)return;mouseHeld=true;
       const target=event.target as Element,root=target.closest<HTMLElement>(".android-reading");
-      if(root && (reference.current?.mode==="reader" || reference.current?.fullscreen) && !event.shiftKey && !target.closest("a,button,input,textarea,summary,img,.note-image,[data-independent-zoom]")){
+      if(root && (reference.current?.mode==="reader" || reference.current?.fullscreen) && event.altKey && !target.closest("a,button,input,textarea,summary,img,.note-image,[data-independent-zoom]")){
         drag={root,point:{x:event.clientX,y:event.clientY},moved:false};root.setPointerCapture(event.pointerId);
       }
     };
@@ -212,7 +226,7 @@ function Reader() {
   }, []);
   if (!state) return <div className="reader-loading">Opening your workspace…</div>;
   return <div className={`android-document mode-${state.mode}`}>
-    {searching && (state.mode==="reader" || state.mode==="live") && <ReadingSearch content={state.content} close={()=>setSearching(false)}/>}
+    {searching && <ReadingSearch content={state.content} close={()=>setSearching(false)} onChange={update} sourceSession={state.mode==="editor"||state.mode==="split"?state.id:undefined}/>}
     <ImageViewer />
     {repairing && <MathRepairPanel content={state.content} apply={update} close={()=>setRepairing(false)} />}
     <MediaTools key={state.id} documentId={state.id} content={state.content} documentPath={state.path} onInsert={(text, point) => { const content = reference.current!.content; const from = Math.min(point?.from ?? content.length, content.length); const to = Math.max(from, Math.min(point?.to ?? from, content.length)); update(content.slice(0, from) + text + content.slice(to)); }} onNotice={(error) => { void invoke("export_failed", { error }); }} />

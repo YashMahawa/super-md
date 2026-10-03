@@ -31,6 +31,5 @@ Slider {
         border.color: control.colors.text
         Behavior on implicitHeight { enabled: control.motion; SpringAnimation { spring: 5; damping: .85 } }
     }
-    ToolTip.visible: pressed
-    ToolTip.text: Math.round(value).toString()
+    Hint { visible: control.pressed; text: Math.round(control.value).toString() }
 }

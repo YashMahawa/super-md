@@ -32,7 +32,7 @@ data class Note(val id: String = UUID.randomUUID().toString(), val name: String 
 data class RecentNote(val name: String, val uri: String, val relative: String? = null)
 data class FileEntry(val name: String, val uri: String, val directory: Boolean, val relative: String)
 data class OutlineHeading(val id: String, val title: String, val level: Int, val offset: Int)
-data class StudioState(val widthPercent: Float = 80f, val lineHeight: Float = 1.65f, val autosave: Boolean = true, val customFonts: List<String> = emptyList(), val readerOverlay: Boolean = false, val tabs: List<Note> = listOf(Note(name = "Welcome.md", content = sample, saved = sample)), val closedTabs: List<Note> = emptyList(), val activeId: String = "", val mode: String = "live", val fullscreen: Boolean = false, val normalZoom: Float = 100f, val fullscreenZoom: Float = 100f, val theme: String = "system", val fullscreenTheme: String = "black", val motion: Boolean = true, val font: String = "Manrope", val size: Float = 17f, val folder: String? = null, val files: List<FileEntry> = emptyList(), val busy: Boolean = false, val message: String? = null, val error: String? = null, val welcomed: Boolean = false, val pdf: String = "{\"pageSize\":\"a4\",\"margin\":18,\"fontSize\":10.5,\"lineHeight\":1.35,\"fontFamily\":\"Manrope\",\"pageNumbers\":true}") {
+data class StudioState(val accent: String = "system", val widthPercent: Float = 80f, val lineHeight: Float = 1.65f, val autosave: Boolean = true, val customFonts: List<String> = emptyList(), val readerOverlay: Boolean = false, val tabs: List<Note> = listOf(Note(name = "Welcome.md", content = sample, saved = sample)), val closedTabs: List<Note> = emptyList(), val activeId: String = "", val mode: String = "live", val fullscreen: Boolean = false, val normalZoom: Float = 100f, val fullscreenZoom: Float = 100f, val theme: String = "system", val fullscreenTheme: String = "black", val motion: Boolean = true, val font: String = "Manrope", val size: Float = 17f, val folder: String? = null, val files: List<FileEntry> = emptyList(), val busy: Boolean = false, val message: String? = null, val error: String? = null, val welcomed: Boolean = false, val pdf: String = "{\"pageSize\":\"a4\",\"margin\":18,\"fontSize\":10.5,\"lineHeight\":1.35,\"fontFamily\":\"Manrope\",\"pageNumbers\":true}") {
     val active get() = tabs.find { it.id == activeId } ?: tabs.first()
     val zoom get() = if (fullscreen) fullscreenZoom else normalZoom
 }
@@ -105,13 +105,23 @@ class StudioViewModel(app: Application, val workspaceKey: String = "main") : And
     private val mutable = MutableStateFlow(restore())
     private val preferencesChanged = android.content.SharedPreferences.OnSharedPreferenceChangeListener { _, key ->
         if (key == "recent") recentMutable.value = runCatching { val list = JSONArray(prefs.getString("recent", "[]")); (0 until minOf(list.length(), 24)).map { i -> val n = list.getJSONObject(i); RecentNote(n.getString("name"), n.getString("uri"), n.optString("relative").takeIf { it.isNotBlank() }) } }.getOrDefault(emptyList())
-        if (key in setOf("theme", "fullTheme", "motion", "font", "size", "pdf", "welcomed", "widthPercent", "lineHeight", "autosave", "fonts")) {
+        if (key in setOf("accent", "theme", "fullTheme", "motion", "font", "size", "pdf", "welcomed", "widthPercent", "lineHeight", "autosave", "fonts")) {
             mutable.value = mutable.value.copy(theme = prefs.getString("theme", "system")!!, fullscreenTheme = prefs.getString("fullTheme", "black")!!, motion = prefs.getBoolean("motion", true), font = prefs.getString("font", "Manrope")!!, size = prefs.getFloat("size", 17f), pdf = prefs.getString("pdf", null) ?: StudioState().pdf, welcomed = prefs.getBoolean("welcomed", false))
-                .copy(widthPercent = prefs.getFloat("widthPercent",80f),lineHeight = prefs.getFloat("lineHeight",1.65f),autosave = prefs.getBoolean("autosave",true),customFonts = fonts.families)
+                .copy(accent = prefs.getString("accent","system")!!, widthPercent = prefs.getFloat("widthPercent",80f),lineHeight = prefs.getFloat("lineHeight",1.65f),autosave = prefs.getBoolean("autosave",true),customFonts = fonts.families)
         }
     }
-    init { prefs.registerOnSharedPreferenceChangeListener(preferencesChanged) }
-    override fun onCleared() { prefs.unregisterOnSharedPreferenceChangeListener(preferencesChanged); super.onCleared() }
+    private var observedUri:String?=null
+    private val documentObserver=object:android.database.ContentObserver(android.os.Handler(android.os.Looper.getMainLooper())) {
+        override fun onChange(selfChange:Boolean){refreshExternal()}
+    }
+    private fun observeActive() {
+        val uri=mutable.value.active.uri
+        if(uri==observedUri)return
+        resolver.unregisterContentObserver(documentObserver);observedUri=uri
+        uri?.let{runCatching{resolver.registerContentObserver(Uri.parse(it),true,documentObserver)}}
+    }
+    init { prefs.registerOnSharedPreferenceChangeListener(preferencesChanged);observeActive() }
+    override fun onCleared() { prefs.unregisterOnSharedPreferenceChangeListener(preferencesChanged);resolver.unregisterContentObserver(documentObserver); super.onCleared() }
     val state = mutable.asStateFlow()
     private val outlineMutable = MutableStateFlow<List<OutlineHeading>>(emptyList())
     val headings = outlineMutable.asStateFlow()
@@ -200,10 +210,10 @@ class StudioViewModel(app: Application, val workspaceKey: String = "main") : And
         return true
     }
     private val resolver get() = getApplication<Application>().contentResolver
-    private fun change(block: (StudioState) -> StudioState) { mutable.value = block(mutable.value); schedulePersist() }
+    private fun change(block: (StudioState) -> StudioState) { mutable.value = block(mutable.value);observeActive(); schedulePersist() }
     private fun restore(): StudioState {
         var s = StudioState(theme = prefs.getString("theme", "system")!!, fullscreenTheme = prefs.getString("fullTheme", "black")!!, motion = prefs.getBoolean("motion", true), welcomed = prefs.getBoolean("welcomed", false), font = prefs.getString("font", "Manrope")!!, size = prefs.getFloat("size", 17f), folder = windowPrefs.getString("folder", if (workspaceKey == "main" && !windowPrefs.getBoolean("folderMigrated", false)) prefs.getString("folder", null) else null), pdf = prefs.getString("pdf", null) ?: StudioState().pdf)
-        s = s.copy(widthPercent = prefs.getFloat("widthPercent",80f),lineHeight = prefs.getFloat("lineHeight",1.65f),autosave = prefs.getBoolean("autosave",true),customFonts = fonts.families)
+        s = s.copy(accent = prefs.getString("accent","system")!!, widthPercent = prefs.getFloat("widthPercent",80f),lineHeight = prefs.getFloat("lineHeight",1.65f),autosave = prefs.getBoolean("autosave",true),customFonts = fonts.families)
         try {
             if (snapshot.isFile && snapshot.length() < 30_000_000) {
                 val json = JSONObject(snapshot.readText()); val list = json.getJSONArray("tabs")
@@ -229,6 +239,20 @@ class StudioViewModel(app: Application, val workspaceKey: String = "main") : And
     fun edit(id: String, content: String) { change { s -> s.copy(tabs = s.tabs.map { if (it.id == id) it.copy(content = content) else it }) }; scheduleAutosave(id) }
     fun newNote() { val note = Note(); change { it.copy(tabs = it.tabs + note, activeId = note.id) } }
     fun select(id: String) = change { it.copy(activeId = id) }
+    fun cycle(direction:Int) {val s=mutable.value;val index=s.tabs.indexOfFirst{it.id==s.active.id};select(s.tabs[Math.floorMod(index+direction,s.tabs.size)].id)}
+    fun tabNumber(number:Int) {val s=mutable.value;val index=if(number==9)s.tabs.lastIndex else number-1;s.tabs.getOrNull(index)?.let{select(it.id)}}
+    private var refreshJob:Job?=null
+    fun refreshExternal() {
+        refreshJob?.cancel()
+        val note=mutable.value.active
+        if(note.uri==null || note.dirty || note.portable)return
+        refreshJob=viewModelScope.launch {
+            delay(200)
+            val text=runCatching{withContext(Dispatchers.IO){resolver.openInputStream(Uri.parse(note.uri))?.use{readLimited(it,20_000_000).toString(Charsets.UTF_8)}}}.getOrNull() ?: return@launch
+            if(text==note.content)return@launch
+            change {s->s.copy(tabs=s.tabs.map{if(it.id==note.id && it.content==note.content && !it.dirty)it.copy(content=text,saved=text)else it})}
+        }
+    }
     fun reorder(id: String, index: Int) = change { it.copy(tabs = reorderedNotes(it.tabs, id, index)) }
     fun close(id: String) {
         val note = mutable.value.tabs.find { it.id == id } ?: return
@@ -238,9 +262,9 @@ class StudioViewModel(app: Application, val workspaceKey: String = "main") : And
     fun mode(value: String) = change { it.copy(mode = value) }
     fun fullscreen(value: Boolean) = change { it.copy(fullscreen = value) }
     fun zoom(value: Float) = change { s -> if (s.fullscreen) s.copy(fullscreenZoom = value.coerceIn(60f, 240f)) else s.copy(normalZoom = value.coerceIn(60f, 240f)) }
-    fun appearance(theme: String? = null, fullTheme: String? = null, motion: Boolean? = null, font: String? = null, size: Float? = null) {
-        change { it.copy(theme = theme ?: it.theme, fullscreenTheme = fullTheme ?: it.fullscreenTheme, motion = motion ?: it.motion, font = font ?: it.font, size = size ?: it.size) }
-        prefs.edit().apply { theme?.let { putString("theme", it) }; fullTheme?.let { putString("fullTheme", it) }; motion?.let { putBoolean("motion", it) }; font?.let { putString("font", it) }; size?.let { putFloat("size", it) } }.apply()
+    fun appearance(accent: String? = null, theme: String? = null, fullTheme: String? = null, motion: Boolean? = null, font: String? = null, size: Float? = null) {
+        change { it.copy(accent = accent ?: it.accent, theme = theme ?: it.theme, fullscreenTheme = fullTheme ?: it.fullscreenTheme, motion = motion ?: it.motion, font = font ?: it.font, size = size ?: it.size) }
+        prefs.edit().apply { accent?.let { putString("accent", it) }; theme?.let { putString("theme", it) }; fullTheme?.let { putString("fullTheme", it) }; motion?.let { putBoolean("motion", it) }; font?.let { putString("font", it) }; size?.let { putFloat("size", it) } }.apply()
     }
     fun pdf(value: String) { change { it.copy(pdf = value) }; prefs.edit().putString("pdf", value).apply() }
     fun noteLocation(): String = prefs.getString("newNoteLocation", "") ?: ""

@@ -1,4 +1,37 @@
 import { expect, test } from "@playwright/test";
+test("Source search covers virtualized lines, matches case and replaces literal Markdown",async({page})=>{
+  await page.addInitScript(()=>{window.SuperMD={post:()=>{}};});await page.goto("/android-reader.html");
+  const content="# Search\n\nNeedle\n\n"+"A long offscreen paragraph.\n\n".repeat(500)+"NEEDLE\n";
+  await page.evaluate(content=>window.supermdLoad?.({id:"full-search",content,path:null,mode:"editor",dark:false,fullscreen:false,colors:{},font:"Manrope",size:18,zoom:100}),content);
+  await expect(page.locator(".cm-editor")).toBeVisible();await page.keyboard.press("Control+f");
+  await expect(page.getByRole("searchbox",{name:"Find in note"})).toBeFocused();await page.getByRole("searchbox",{name:"Find in note"}).fill("Needle");
+  await expect(page.locator(".reading-search output")).toHaveText("0 / 2");
+  await page.getByRole("button",{name:"Match case",exact:true}).click();await expect(page.locator(".reading-search output")).toHaveText("0 / 1");
+  await page.getByRole("button",{name:"Replace in source",exact:true}).click();await page.getByRole("textbox",{name:"Replacement text"}).fill("$x$ literal");await page.getByRole("button",{name:"Replace all",exact:true}).click();
+  await expect(page.locator(".reading-search output")).toHaveText("No matches");await page.keyboard.press("Escape");await expect(page.getByRole("search")).toHaveCount(0);
+  await page.locator(".cm-content").click();await page.keyboard.press("Control+z");await page.keyboard.press("Control+f");await page.getByRole("searchbox",{name:"Find in note"}).fill("NEEDLE");await expect(page.locator(".reading-search output")).toHaveText("0 / 2");
+});
+test("mode changes retain a source anchor and external updates keep the viewport",async({page})=>{
+  await page.addInitScript(()=>{window.SuperMD={post:()=>{}};});await page.goto("/android-reader.html");
+  const content=Array.from({length:80},(_,i)=>`## Chapter ${i}\n\n${"Readable paragraph. ".repeat(20)}\n`).join("\n");
+  const state={id:"anchor",content,path:null,mode:"reader",dark:false,fullscreen:false,colors:{},font:"Manrope",size:18,zoom:100};
+  await page.evaluate(state=>window.supermdLoad?.(state),state);await page.locator("#chapter-40").scrollIntoViewIfNeeded();
+  await page.evaluate(()=>document.querySelector("#chapter-40")!.scrollIntoView({block:"start"}));
+  await page.evaluate(state=>window.supermdLoad?.({...state,mode:"editor"}),state);await expect(page.locator(".cm-editor")).toBeVisible();
+  await expect.poll(()=>page.locator(".cm-scroller").evaluate(el=>el.scrollTop)).toBeGreaterThan(1000);
+  await page.evaluate(state=>window.supermdLoad?.({...state,mode:"live"}),state);await expect(page.locator(".live-document")).toBeVisible();
+  await expect.poll(()=>page.locator(".android-reading").evaluate(el=>el.scrollTop)).toBeGreaterThan(1000);
+  await page.evaluate(state=>window.supermdLoad?.({...state,content:state.content+"\n## External update\nFresh text."}),{...state,mode:"live"});
+  await expect(page.locator("#external-update")).toHaveCount(1);await expect.poll(()=>page.locator(".android-reading").evaluate(el=>el.scrollTop)).toBeGreaterThan(1000);
+});
+test("coordinate probe follows the pointer and touch release clears it",async({page})=>{
+  await page.addInitScript(()=>{window.SuperMD={post:()=>{}};});await page.goto("/android-reader.html");
+  await page.evaluate(()=>window.supermdLoad?.({id:"probe",content:'```smd-chart\n{"series":[{"expression":"Math.sin(x)"}]}\n```',path:null,mode:"reader",dark:false,fullscreen:false,colors:{},font:"Manrope",size:18,zoom:100}));
+  const svg=page.locator(".interactive-chart svg");await expect(svg).toBeVisible();const rect=(await svg.boundingBox())!;const x=rect.x+rect.width*.5,y=rect.y+rect.height*.5;
+  await svg.dispatchEvent("pointerdown",{pointerType:"touch",pointerId:1,clientX:x,clientY:y,bubbles:true});await expect(page.locator(".graph-probe")).toBeVisible();
+  expect((await page.locator(".graph-probe").boundingBox())!.x).toBeGreaterThan(x);
+  await svg.dispatchEvent("pointerup",{pointerType:"touch",pointerId:1,clientX:x,clientY:y,bubbles:true});await expect(page.locator(".graph-probe")).toBeHidden();
+});
 import { mkdir, readFile, writeFile } from "node:fs/promises";
 import { dirname, join } from "node:path";
 
@@ -88,7 +121,7 @@ test("reading search highlights every match without switching mode and escapes c
   await expect(page.locator(".reading-search output")).toContainText("/ 4");
   expect(await page.evaluate(()=>CSS.highlights.get("smd-search")?.size)).toBe(4);
   await expect(page.locator(".cm-editor")).toHaveCount(0);
-  await page.getByRole("button",{name:"Next",exact:true}).click();
+  await page.getByRole("button",{name:"Next match",exact:true}).click();
   await expect(page.locator(".reading-search output")).toContainText("1 / 4");
   await page.keyboard.press("Escape");
   await expect(page.getByRole("search")).toHaveCount(0);

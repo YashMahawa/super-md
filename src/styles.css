@@ -296,6 +296,15 @@ md-filled-button.primary-action, smd-expressive-button.primary-action { display:
 :root[data-theme="light"] .callout-info, :root[data-theme="light"] .callout-question { --callout-accent: #245d92; }
 :root[data-theme="light"] .callout-abstract, :root[data-theme="light"] .callout-summary, :root[data-theme="light"] .callout-example { --callout-accent: #6b3998; }
 .callout .katex-display { margin: .35em 0; }
+.callout-title::before { content:"";display:inline-block;width:1.15em;height:1.15em;margin-right:.5em;vertical-align:-.18em;background:currentColor;mask:url('/icons/CalloutInfo.svg') center/contain no-repeat; }
+.callout-tip .callout-title::before,.callout-hint .callout-title::before {mask-image:url('/icons/CalloutTip.svg');}
+.callout-warning .callout-title::before,.callout-caution .callout-title::before {mask-image:url('/icons/CalloutWarning.svg');}
+.callout-error .callout-title::before,.callout-danger .callout-title::before {mask-image:url('/icons/CalloutError.svg');}
+.callout-success .callout-title::before {mask-image:url('/icons/CalloutSuccess.svg');}
+.callout-question .callout-title::before,.callout-faq .callout-title::before {mask-image:url('/icons/CalloutQuestion.svg');}
+.callout-answer .callout-title::before,.callout-solution .callout-title::before {mask-image:url('/icons/CalloutAnswer.svg');}
+.callout-example .callout-title::before {mask-image:url('/icons/CalloutExample.svg');}
+.callout-quote .callout-title::before {mask-image:url('/icons/CalloutQuote.svg');}
 .interactive-chart { margin: 1.8em 0; padding: 16px; border: 1px solid var(--outline); border-radius: 18px; background: var(--surface); }
 .interactive-chart figcaption { font-weight: 750; font-size: 1.08em; margin: 0 4px 10px; }
 .interactive-chart svg { width: 100%; height: auto; background: var(--surface-low); border-radius: 12px; }
@@ -501,6 +510,10 @@ button.code-copy { padding:6px 12px;min-height:32px;border-radius:16px;backgroun
 .reading-search input { flex:1 1 180px;min-width:120px;width:auto;min-height:44px;border-radius:12px; }
 .reading-search button { min-height:36px;padding:8px 12px;border-radius:18px;background:var(--surface-low);color:var(--text); }
 .reading-search output { min-width:60px;color:var(--muted);font-variant-numeric:tabular-nums; }
+.reading-search .search-icon { width:40px;height:40px;padding:8px;display:grid;place-items:center;flex:none; }
+.reading-search button[aria-pressed="true"] { background:var(--primary);color:var(--on-primary); }
+.search-replace { display:flex;flex-wrap:wrap;align-items:center;gap:8px;flex-basis:100%;padding-top:8px;border-top:1px solid var(--outline); }
+.search-replace small { flex-basis:100%;color:var(--muted);padding:0 4px; }
 ::highlight(smd-search) { background-color:color-mix(in srgb,var(--primary) 35%,transparent);color:var(--text); }
 ::highlight(smd-search-current) { background-color:var(--primary);color:var(--on-primary); }
 .cm-panel.cm-search { display:flex;flex-wrap:wrap;align-items:center;gap:8px;padding:12px 18px !important;background:var(--surface-high);color:var(--text);border-bottom:1px solid var(--outline); }
@@ -528,3 +541,5 @@ button.code-copy { padding:6px 12px;min-height:32px;border-radius:16px;backgroun
 .chart-legend { gap:8px; }
 .chart-legend > span { display:inline-flex;align-items:center;gap:8px;padding:6px 12px;border-radius:16px;background:var(--surface-low);font:13px/1.5 var(--md-ref-typeface-plain,system-ui); }
 .chart-legend i { display:inline-block;width:20px;height:4px;border-radius:4px;background:currentColor; }
+.graph-probe { position:fixed;z-index:1000;pointer-events:none;background:var(--surface-high);color:var(--text);border:1px solid var(--outline);border-radius:10px;padding:7px 10px;font:500 13px var(--sans);box-shadow:0 3px 12px #0002; }
+.graph-probe[hidden] { display:none; }

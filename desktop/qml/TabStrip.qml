@@ -34,6 +34,8 @@ ScrollView {
                 radius: 18
                 antialiasing: true
                 color: modelData.id === strip.viewState.active ? strip.viewState.colors["surface-high"] : strip.viewState.colors.surface
+                HoverHandler { id: tabHover }
+                Hint { visible: tabHover.hovered; text: modelData.path || modelData.name }
                 Drag.dragType: Drag.Automatic
                 Drag.supportedActions: Qt.MoveAction
                 Drag.proposedAction: Qt.MoveAction

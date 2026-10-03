@@ -1,4 +1,5 @@
 import { visit } from "unist-util-visit";
+import { tableMathPipeInsertions } from "./tableMath";
 
 /** Obsidian permits TeX on the opening/closing $$ lines. remark-math's
  * flow grammar instead treats opening-line TeX as metadata and requires a
@@ -43,7 +44,8 @@ export function normalizedDisplayMath(source: string): string {
 export function remarkObsidianMath(this: any) {
   const parser = this.parser;
   this.parser = (source: string, file: any) => {
-    const edits = displayMathInsertions(source);
+    const pipeEdits=tableMathPipeInsertions(source);
+    const edits = [...displayMathInsertions(source),...pipeEdits].sort((a,b)=>a.at-b.at);
     if (!edits.length) return parser(source, file);
     let added = 0, previous = 0; const chunks: string[] = [];
     const mapping = edits.map((edit) => {
@@ -62,7 +64,15 @@ export function remarkObsidianMath(this: any) {
       const line = upperBound(lines, offset);
       return { offset, line, column: offset - lines[line - 1] + 1 };
     };
-    visit(tree, (node: any) => { if (node.position) node.position = { start: originalPoint(node.position.start), end: originalPoint(node.position.end) }; });
+    visit(tree, (node: any) => {
+      if(node.position)node.position={start:originalPoint(node.position.start),end:originalPoint(node.position.end)};
+      if(node.type==="inlineMath"&&pipeEdits.some(edit=>edit.at>=node.position.start.offset&&edit.at<node.position.end.offset)){
+        // remark-math preserves GFM's escape as TeX \| (a double bar). Restore
+        // the original formula, not a global replacement of genuine TeX norms.
+        node.value=source.slice(node.position.start.offset,node.position.end.offset).replace(/^\$+|\$+$/g,"").trim();
+        if(node.data?.hChildren?.[0]?.children?.[0])node.data.hChildren[0].children[0].value=node.value;
+      }
+    });
     return tree;
   };
 }

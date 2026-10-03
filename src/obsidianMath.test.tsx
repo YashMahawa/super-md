@@ -15,7 +15,7 @@ P(A\cup B\cup C)=&P(A)+P(B)+P(C)\\
 describe("Obsidian display math compatibility", () => {
   it("does not swallow later headings and callouts", () => {
     const html = renderToStaticMarkup(<MarkdownPreview markdown={equation + "\n\n**Proof:** then explain.\n\n> [!tip] Fast use\n> Preserved body.\n\n## Bounds\n\n$$P(A)\\le1$$"} documentPath={null} python="" dark />);
-    expect(html).not.toContain("katex-error"); expect(html).toContain("callout-tip"); expect(html).toContain('<h2 id="bounds" data-heading-key="bounds">Bounds</h2>'); expect(html).toContain("Preserved body.");
+    expect(html).not.toContain("katex-error"); expect(html).toContain("callout-tip"); expect(html).toMatch(/<h2 id="bounds" data-heading-key="bounds"[^>]*>Bounds<\/h2>/); expect(html).toContain("Preserved body.");
   });
   it("supports quote prefixes, existing fences and same-line display math", () => {
     const html = renderToStaticMarkup(<MarkdownPreview markdown={"> [!tip] Math\n> $$x+1$$\n\n$$\ny=2\n$$"} documentPath={null} python="" dark />);

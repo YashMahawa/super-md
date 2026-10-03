@@ -36,6 +36,9 @@ Pane {
                 ModeGroup { Layout.fillWidth: true; choices: [{key:"system",label:"System"},{key:"light",label:"Light"},{key:"dark",label:"Dark"},{key:"black",label:"Pure black"}]; selected: viewState.settings.theme; onChosen: key => page.save("theme", key) }
                 Label { text: "Fullscreen theme" }
                 ModeGroup { Layout.fillWidth: true; choices: [{key:"system",label:"System"},{key:"light",label:"Light"},{key:"dark",label:"Dark"},{key:"black",label:"Pure black"}]; selected: viewState.settings.fullTheme; onChosen: key => page.save("fullTheme", key) }
+                Label { text: "Theme color" }
+                ChoiceField { Layout.fillWidth: true; model: ["System accent", "Blue", "Green", "Violet", "Rose", "Amber"]; currentIndex: ["system","blue","green","violet","rose","amber"].indexOf(viewState.settings.accent); onActivated: page.save("accent",["system","blue","green","violet","rose","amber"][currentIndex]) }
+                Label { text: "System uses your desktop accent when available; otherwise app blue. Choose a color independently of light or dark mode."; Layout.fillWidth: true; wrapMode: Text.WordWrap; color: viewState.colors.muted }
                 Switch { text: "Expressive motion"; checked: viewState.settings.motion; onToggled: page.save("motion", checked) }
                 Label { text: "Reading"; font.pixelSize: 22; font.weight: Font.DemiBold; Layout.topMargin: 12 }
                 Label { text: "Reading font" }
