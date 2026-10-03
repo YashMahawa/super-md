@@ -454,10 +454,14 @@ ax.set_title("Matplotlib 3D figure")
             javascriptUntil("document.querySelector('.document-page')?.dataset.scale") {it=="\"1.7\""}
             javascriptUntil("window.getSelection()?.removeAllRanges();true") {it=="true"}
             val width=javascriptUntil("getComputedStyle(document.querySelector('.document-page')).width") {it.contains("px")}
+            val textWidth=javascriptUntil("getComputedStyle(document.querySelector('.markdown-body')).width") {it.contains("px")}
+            val viewport=javascriptUntil("JSON.stringify([innerWidth,innerHeight])") {it.contains(",")}
+            javascriptUntil("document.querySelector('h1').getBoundingClientRect().top>=parseFloat(getComputedStyle(document.documentElement).getPropertyValue('--native-chrome-inset'))") {it=="true"}
             // A margin tap has no text/link/edit action and toggles reading UI.
             compose.onRoot().performTouchInput {click(androidx.compose.ui.geometry.Offset(this.width*.98f,height*.60f))}
             compose.waitUntil(5000) {compose.onAllNodesWithContentDescription("Open files").fetchSemanticsNodes().isEmpty()}
             compose.onNodeWithContentDescription("Fullscreen study").assertDoesNotExist()
+            assertEquals("Hiding normal chrome must not resize the reading viewport",viewport,javascriptUntil("JSON.stringify([innerWidth,innerHeight])") {it.contains(",")})
             compose.waitUntil(5000) {androidx.core.view.ViewCompat.getRootWindowInsets(compose.activity.window.decorView)?.isVisible(androidx.core.view.WindowInsetsCompat.Type.statusBars())==false}
             val nativeWidth=AtomicReference(0)
             compose.runOnIdle {nativeWidth.set(web(compose.activity.window.decorView)!!.width)}
@@ -468,10 +472,13 @@ ax.set_title("Matplotlib 3D figure")
             javascriptUntil("document.documentElement.dataset.fullscreen") {it=="\"true\""}
             javascriptUntil("document.querySelector('.document-page')?.dataset.scale") {it=="\"1.7\""}
             assertEquals(width,javascriptUntil("getComputedStyle(document.querySelector('.document-page')).width") {it.contains("px")})
+            assertEquals("The actual text column, not just its outer page, must retain its width",textWidth,javascriptUntil("getComputedStyle(document.querySelector('.markdown-body')).width") {it.contains("px")})
+            assertEquals("Fullscreen must not resize the reading viewport",viewport,javascriptUntil("JSON.stringify([innerWidth,innerHeight])") {it.contains(",")})
             compose.waitUntil(5000) {compose.onAllNodesWithContentDescription("Exit fullscreen").fetchSemanticsNodes().isEmpty()}
             compose.onRoot().performTouchInput {click(androidx.compose.ui.geometry.Offset(this.width*.98f,height*.60f))}
             compose.waitUntil(5000) {compose.onAllNodesWithContentDescription("Exit fullscreen").fetchSemanticsNodes().isNotEmpty()}
             compose.onNodeWithContentDescription("Show contents").assertIsDisplayed()
+            assertEquals("Showing compact chrome must not resize the reading viewport",viewport,javascriptUntil("JSON.stringify([innerWidth,innerHeight])") {it.contains(",")})
             compose.onNodeWithContentDescription("Exit fullscreen").performClick()
         } finally {
             compose.runOnIdle {model.fullscreen(false);compose.activity.requestedOrientation=android.content.pm.ActivityInfo.SCREEN_ORIENTATION_PORTRAIT}

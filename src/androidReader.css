@@ -22,7 +22,12 @@
 /* Palette commits are atomic. Per-element background transitions otherwise
    reveal a patchwork of the previous and next native theme. */
 :root, body { transition:none; }
-.android-reading .markdown-body { width:100%; max-width:none; font-size:var(--reader-size); padding:22px 0 40vh; }
+/* document-page already owns the percentage width. Match the legacy fullscreen
+   selector's specificity so it cannot constrain the text column a second time. */
+.android-reading .document-page .markdown-body { width:100%; max-width:none; font-size:var(--reader-size); padding:22px 0 40vh; }
+.reader-chrome-spacer { height:var(--native-chrome-inset,0px); pointer-events:none; }
+.android-source { padding-top:var(--native-chrome-inset,0px);box-sizing:border-box; }
+.android-document .reading-search { top:calc(var(--native-chrome-inset,0px) + 12px); }
 .android-reading .live-document { width:100%; max-width:none; padding:24px 0 40vh; }
 .android-reading .live-block .markdown-body, .android-reading .live-active-block textarea { font-size:var(--reader-size); }
 .android-reading .live-block .markdown-body { width: 100%; max-width: none; padding: 0; }

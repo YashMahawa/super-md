@@ -48,6 +48,17 @@ class StudioTest(unittest.TestCase):
         self.session.writes.shutdown(wait=True)
         self.app.processEvents()
 
+    def test_reading_chrome_actions_are_validated_and_only_reach_fullscreen(self):
+        received=[]
+        self.studio.chromeRequested.connect(received.append)
+        self.studio.post("normal","reader_chrome",'{"action":"show"}')
+        self.assertEqual(received,[])
+        self.studio.setFullscreen(True)
+        for action in ("show","hide","toggle"):
+            self.studio.post(action,"reader_chrome",json.dumps({"action":action}))
+        self.studio.post("invalid","reader_chrome",'{"action":"anything"}')
+        self.assertEqual(received,["show","hide","toggle"])
+
     def test_writing_preferences_are_boolean_persistent_and_forwarded_to_reader(self):
         self.studio.setting("spellCheck","true")
         self.studio.setting("grammarCheck","true")

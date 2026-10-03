@@ -245,7 +245,29 @@ def main():
                 def pdf_result():
                     if studio.message == "Exported native-render.pdf" and report.exists() and report.stat().st_size>10000:
                         print(f"PDF SMOKE PASSED: {report}",flush=True)
-                        app.exit(0)
+                        QMetaObject.invokeMethod(window,"hideExport")
+                        studio.setMode("reader")
+                        window.showFullScreen()
+                        geometry = {}
+                        def fullscreen_shown():
+                            window.setProperty("chromeAwake",True)
+                            geometry.update(width=reader.property("width"),height=reader.property("height"))
+                            script="document.querySelector('.android-reading').scrollTop=0;requestAnimationFrame(()=>window.SuperMD.post('chrome-smoke','export_failed',JSON.stringify({error:'CHROME:'+JSON.stringify({inset:parseFloat(getComputedStyle(document.documentElement).getPropertyValue('--native-chrome-inset')),title:document.querySelector('h1').getBoundingClientRect().top})})))"
+                            QMetaObject.invokeMethod(window,"runDocumentScript",Q_ARG("QVariant",script))
+                        def fullscreen_hidden():
+                            toolbar=window.findChild(QObject,"studyToolbar")
+                            capture("fullscreen-hidden")
+                            stable=reader.property("width")==geometry.get("width") and reader.property("height")==geometry.get("height")
+                            import json
+                            clearance=json.loads(studio.message.removeprefix("CHROME:")) if studio.message.startswith("CHROME:") else {}
+                            if toolbar is None or toolbar.property("height")!=56 or toolbar.property("shown") or not stable or clearance.get("inset")!=56 or clearance.get("title",0)<56:
+                                print(f"FULLSCREEN OVERLAY SMOKE FAILED: stable={stable}",flush=True);app.exit(2);return
+                            print("FULLSCREEN OVERLAY SMOKE PASSED: compact bar hides without resizing the reader",flush=True)
+                            app.exit(0)
+                        QTimer.singleShot(600,fullscreen_shown)
+                        QTimer.singleShot(1000,lambda:capture("fullscreen-bar"))
+                        QTimer.singleShot(1300,lambda:studio.chromeRequested.emit("hide"))
+                        QTimer.singleShot(1800,fullscreen_hidden)
                     else:
                         print(f"PDF SMOKE FAILED: {studio.message}",flush=True)
                         app.exit(2)

@@ -1,5 +1,25 @@
 # Verification
 
+## Fixed-size reading overlays and shared branding — 0.4.14
+
+- 95 frontend tests and 64 native Qt/Python checks pass. Brush-S fixed, adaptive
+  and themed SVG geometry is checked for parity. The native compact bar keeps
+  its geometry when hidden, reveals on hover, and validates fullscreen-only
+  gesture commands. Keyboard focus and ordinary mouse focus are distinguished.
+- Browser checks compare the actual Markdown text column, not just the page
+  container, at phone, landscape and tablet sizes in Read and Live. They check
+  title clearance, unscaled start spacing, anchor preservation and fullscreen
+  click/scroll behavior without stealing text selection or double-click editing.
+- Native Qt presented-pixel checks pass, including a visible fullscreen bar,
+  a first heading below its 56 px overlay, unchanged reader bounds after hiding,
+  searchable fonts, native captions and real PDF export.
+- Android overlay instrumentation checks fixed viewport bounds, actual text
+  column width and title clearance in addition to existing zoom, cutout, LaTeX,
+  Python, spelling and PDF checks. API 35/36 exact-source CI remains required;
+  emulator results do not imply testing every handset.
+- Builds remain serialized and resource-limited. Working installed versions,
+  user windows and documents are preserved; no laptop power action is performed.
+
 ## Immersive reading and writing assistance — 0.4.13
 
 - 95 frontend unit tests, all 32 browser workflows and 62 Qt/Python checks pass

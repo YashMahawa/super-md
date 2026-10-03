@@ -1,4 +1,25 @@
-# Super MD 0.4.13
+# Super MD 0.4.14
+
+- Fixed fullscreen narrowing the rendered text column: page width is applied
+  once, not again to the Markdown inside it, on Android and the native reader.
+- Android's expanded and compact reading bars now overlay a fixed-size reader.
+  Hide/show animation does not resize the WebView or push the page up and down.
+- A start-of-note spacer protects the first heading beneath the overlay. It is
+  unscaled, remains stable when chrome hides and preserves the reading anchor
+  when switching expanded/compact bars or changing orientation.
+- Hidden controls leave accessibility navigation, while image/dialog overlays
+  get immersive system-bar handling. Contents navigation hides reading chrome
+  so the selected heading is not covered.
+- Added phone, landscape and tablet regression checks for actual text-column
+  width, title clearance, unscaled spacing and scroll-position stability.
+- Desktop fullscreen now uses a compact overlay bar with Contents, Save, Export
+  and Exit, rather than two floating controls. Scroll down hides it; scroll up,
+  a single reading click or deliberate top-edge hover reveals/toggles it. Text
+  selection, Live double-click editing and independent chart/image zoom are kept.
+- The shared brush-S SVG is used by desktop window, launcher and package icons,
+  matching Android's adaptive/fixed branding without adding a toolbar logo.
+
+## Previous release (0.4.13)
 
 - Android reading chrome and system bars hide together, without floating buttons.
   Tap or scroll upward to reveal controls; landscape uses the cutout region.
@@ -18,7 +39,7 @@
 
 Android downloads are signed, optimized release APKs for Android 8+ ARM64 devices.
 Settings checks are opt-in and English-only. Emulator verification does not imply
-physical testing of every handset. See docs/RELEASE-NOTES-0.4.13.md for details.
+physical testing of every handset. See docs/RELEASE-NOTES-0.4.14.md for details.
 
 ## Previous release (0.4.12)
 

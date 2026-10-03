@@ -69,6 +69,7 @@ class Studio(QObject):
     changed = Signal()
     readerLoad = Signal(str)
     readerCall = Signal(str)
+    chromeRequested = Signal(str)
     replied = Signal(str, str, str)
     completed = Signal(object)
     saveRequested = Signal(str)
@@ -898,6 +899,11 @@ class Studio(QObject):
             args = json.loads(raw)
             tab = self._current()
             if command == "reader_ready": self.ready = True; self._emit(); self.replied.emit(id,"true",""); return
+            if command == "reader_chrome":
+                action = args.get("action")
+                if action not in ("show", "hide", "toggle"): raise ValueError("Invalid reading chrome action")
+                if self.fullscreen: self.chromeRequested.emit(action)
+                self.replied.emit(id,"true",""); return
             if command == "reader_overlay_changed": self.reader_overlay = bool(args.get("open")); self.image_overlay = bool(args.get("image")); self._emit(False); self.replied.emit(id,"true",""); return
             if command == "document_outline":
                 target = next((t for t in self.tabs if t["id"] == args.get("id")), None)

@@ -24,12 +24,14 @@ ApplicationWindow {
     property bool sharing: false
     property string sidebarSection: "folder"
     property bool chromeAwake: true
-    Timer { id: chromeIdle; interval: 2200; onTriggered: window.chromeAwake = false }
-    HoverHandler { onPointChanged: { window.chromeAwake = true; chromeIdle.restart() } }
+    Timer { id: chromeIdle; interval: 2200; onTriggered: { if(studyToolbar.hovered || studyToolbar.focusWithin) restart(); else window.chromeAwake = false } }
+    // Deliberate desktop reveal target; ordinary pointer movement in a note
+    // does not summon controls. Scroll and click requests come from the reader.
+    HoverHandler { onPointChanged: { if(window.viewState.fullscreen && point.position.y < 56) window.chromeAwake = true; if(window.chromeAwake) chromeIdle.restart() } }
     WindowModes {
         id: windowModes
         host: window
-        onFullscreenChanged: studio.setFullscreen(fullscreen)
+        onFullscreenChanged: { window.chromeAwake = !fullscreen; chromeIdle.stop(); studio.setFullscreen(fullscreen) }
     }
     function runDocumentScript(script) { reader.runJavaScript(script) }
     function showExport(share) { sharing = share; exportDialog.open() }
@@ -53,8 +55,9 @@ ApplicationWindow {
         function onExportRequested(format) { outputFormat = format; exportDialog.open() }
         function onFolderPickerRequested() { folderDialog.open() }
         function onFontPickerRequested() { fontDialog.open() }
-        function onReaderLoad(payload) { reader.runJavaScript("window.supermdLoad?.(" + payload + ")") }
+        function onReaderLoad(payload) { const state = JSON.parse(payload); reader.runJavaScript("window.supermdLoad?.(" + payload + ");window.supermdChromeInset?.(" + (state.fullscreen ? 56 : 0) + ")") }
         function onReaderCall(script) { reader.runJavaScript(script) }
+        function onChromeRequested(action) { window.chromeAwake = action === "toggle" ? !window.chromeAwake : action === "show"; if(window.chromeAwake) chromeIdle.restart(); else { chromeIdle.stop(); reader.forceActiveFocus() } }
     }
     Shortcut { sequences: [StandardKey.New]; onActivated: studio.command("window") }
     FileDialog { id:fontDialog;title:"Import a font";fileMode:FileDialog.OpenFile;nameFilters:["Fonts (*.ttf *.otf)"];onAccepted:studio.importFont(selectedFile.toString()) }
@@ -272,11 +275,16 @@ ApplicationWindow {
                 }
             }
             StudyControls {
-                anchors.fill: parent
+                id: studyToolbar
+                anchors.left: parent.left; anchors.right: parent.right; anchors.top: parent.top
                 visible: viewState.fullscreen && !viewState.readerOverlay
                 awake: window.chromeAwake
+                noteName: viewState.name
+                ready: viewState.readerReady && !viewState.busy
                 onContentsRequested: contentsPopup.open()
                 onExitRequested: windowModes.setFullscreen(false)
+                onSaveRequested: studio.saveSafely()
+                onExportRequested: window.showExport(false)
             }
             Rectangle {
                 anchors.fill: parent
@@ -304,7 +312,7 @@ ApplicationWindow {
         ColumnLayout {
             anchors.fill: parent
             RowLayout { Label { text: "Contents"; font.pixelSize: 22; font.weight: Font.DemiBold; Layout.fillWidth: true } ActionButton { glyph: "X"; compact: true; ToolTip.text: "Close contents"; onClicked: contentsPopup.close() } }
-            OutlineList { Layout.fillWidth: true; Layout.fillHeight: true; entries: viewState.outline || []; noteId: viewState.active; onChosen: contentsPopup.close() }
+            OutlineList { Layout.fillWidth: true; Layout.fillHeight: true; entries: viewState.outline || []; noteId: viewState.active; onChosen: { contentsPopup.close(); window.chromeAwake = false; reader.forceActiveFocus() } }
         }
     }
     Dialog {

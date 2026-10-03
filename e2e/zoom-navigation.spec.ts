@@ -1,4 +1,62 @@
 import {test,expect} from '@playwright/test';
+test('desktop fullscreen chrome follows reading gestures without stealing selection or double clicks',async({page})=>{
+  await page.addInitScript(()=>{(window as any).chromeActions=[];window.SuperMD={post:(id,command,args)=>{if(command==='reader_chrome')(window as any).chromeActions.push(JSON.parse(args).action);window.supermdReply?.(id,true,null);}};});
+  await page.goto('/android-reader.html');await page.waitForFunction(()=>typeof window.supermdLoad==='function');
+  await page.evaluate(()=>document.documentElement.dataset.host='qt');
+  const content='# A desktop note\n\n'+('A readable paragraph with enough text to scroll. '.repeat(18)+'\n\n').repeat(25);
+  const state={id:'desktop-chrome',content,path:null,mode:'reader' as const,dark:false,fullscreen:false,colors:{},font:'Manrope',size:18,zoom:100,widthPercent:80};
+  await page.evaluate(state=>window.supermdLoad?.(state),state);await page.mouse.move(350,350);await page.mouse.wheel(0,120);
+  expect(await page.evaluate(()=>(window as any).chromeActions)).toEqual([]);
+  await page.evaluate(state=>{window.supermdLoad?.({...state,fullscreen:true});window.supermdChromeInset?.(56);},state);
+  await page.mouse.wheel(0,120);await expect.poll(()=>page.evaluate(()=>(window as any).chromeActions)).toEqual(['hide']);
+  await page.evaluate(()=>window.supermdNativeWheel?.(0,-40,{x:350,y:350},false));await expect.poll(()=>page.evaluate(()=>(window as any).chromeActions)).toEqual(['hide','show']);
+  const paragraph=page.locator('.markdown-body p').nth(1);
+  await paragraph.click();await expect.poll(()=>page.evaluate(()=>(window as any).chromeActions)).toEqual(['hide','show','toggle']);
+  await paragraph.dblclick();await page.waitForTimeout(400);
+  expect(await page.evaluate(()=>(window as any).chromeActions)).toEqual(['hide','show','toggle']);
+  await paragraph.evaluate(el=>{const range=document.createRange();range.selectNodeContents(el);window.getSelection()!.removeAllRanges();window.getSelection()!.addRange(range);el.dispatchEvent(new MouseEvent('click',{bubbles:true,detail:1}));});
+  await page.waitForTimeout(350);expect(await page.evaluate(()=>(window as any).chromeActions)).toEqual(['hide','show','toggle']);
+  await page.evaluate(()=>{window.getSelection()?.removeAllRanges();window.supermdNativeWheel?.(0,30,{x:350,y:350},true);});
+  expect(await page.evaluate(()=>(window as any).chromeActions)).toEqual(['hide','show','toggle']);
+});
+test('native overlay spacing protects the title and fullscreen never narrows the text column',async({page})=>{
+  await page.addInitScript(()=>{window.SuperMD={post:()=>{}};});await page.goto('/android-reader.html');
+  await page.waitForFunction(()=>typeof window.supermdLoad==='function');
+  const content='# Visible title\n\n'+('A readable paragraph with some words. '.repeat(16)+'\n\n').repeat(35);
+  for(const viewport of [{width:414,height:896},{width:896,height:414},{width:1200,height:900}]){
+    await page.setViewportSize(viewport);
+    for(const mode of ['reader','live'] as const){
+      const state={id:`overlay-${mode}-${viewport.width}`,content,path:null,mode,dark:false,fullscreen:false,colors:{},font:'Manrope',size:15,zoom:100,widthPercent:80};
+      await page.evaluate(state=>window.supermdLoad?.(state),state);
+      await page.evaluate(()=>document.fonts.ready);
+      await page.evaluate(()=>{window.supermdSetZoom?.(100);window.supermdChromeInset?.(196);});
+      await expect(page.locator('.document-page')).toHaveAttribute('data-scale','1');
+      await page.evaluate(()=>new Promise<void>(resolve=>requestAnimationFrame(()=>requestAnimationFrame(()=>resolve()))));
+      const root=page.locator('.android-reading'),title=page.getByRole('heading',{name:'Visible title'});
+      await root.evaluate(el=>el.scrollTop=0);
+      await expect.poll(()=>title.evaluate(el=>el.getBoundingClientRect().top)).toBeGreaterThanOrEqual(196);
+      const text=page.locator('.markdown-body').first(),width=await text.evaluate(el=>el.clientWidth);
+      const height=await root.evaluate(el=>el.clientHeight);
+      await page.evaluate(state=>window.supermdLoad?.({...state,fullscreen:true}),state);
+      await page.waitForFunction(()=>document.documentElement.dataset.fullscreen==='true');
+      await page.evaluate(()=>new Promise<void>(resolve=>requestAnimationFrame(()=>requestAnimationFrame(()=>resolve()))));
+      expect(await text.evaluate(el=>el.clientWidth)).toBe(width);
+      expect(await root.evaluate(el=>el.clientHeight)).toBe(height);
+      // The note's initial spacer is not magnified like its text, and changing
+      // compact/expanded chrome retains the reading position away from the top.
+      await page.evaluate(()=>window.supermdZoomBy?.(2,{x:200,y:300}));
+      await expect(page.locator('.document-page')).toHaveAttribute('data-scale','2');
+      await root.evaluate(el=>el.scrollTop=0);
+      await expect.poll(()=>title.evaluate(el=>el.getBoundingClientRect().top)).toBeLessThan(270);
+      await root.evaluate(el=>el.scrollTop=900);
+      await page.evaluate(()=>new Promise<void>(resolve=>requestAnimationFrame(()=>requestAnimationFrame(()=>resolve()))));
+      const paragraph=page.locator('.markdown-body p').nth(3),before=(await paragraph.boundingBox())!.y;
+      await page.evaluate(()=>window.supermdChromeInset?.(88));
+      await expect.poll(async()=>Math.abs((await paragraph.boundingBox())!.y-before),{message:`${mode} ${viewport.width}: chrome resize must retain the paragraph anchor`}).toBeLessThan(2);
+      await page.evaluate(()=>window.supermdChromeInset?.(196));
+    }
+  }
+});
 test('fullscreen entry keeps the presented zoom and wrapping even before its native acknowledgement',async({page})=>{
   await page.addInitScript(()=>{window.SuperMD={post:(id)=>window.supermdReply?.(id,true,null)};});await page.goto('/android-reader.html');
   const content='# Same page\n\n'+('A readable long paragraph. '.repeat(20)+'\n\n').repeat(100);
