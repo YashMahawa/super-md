@@ -232,7 +232,9 @@ class StudioViewModel(app: Application, val workspaceKey: String = "main") : And
     // The exact String the reader last sent per note. Echoing it back on every
     // keystroke re-serializes the whole note on both sides and costs battery.
     val readerEcho = java.util.concurrent.ConcurrentHashMap<String, String>()
-    fun edit(id: String, content: String) { readerEcho[id] = content; change { s -> s.copy(tabs = s.tabs.map { if (it.id == id) it.copy(content = content) else it }) }; scheduleAutosave(id) }
+    /** An edit that came from the reader itself; only these may skip the echo. */
+    fun readerEdit(id: String, content: String) { readerEcho[id] = content; edit(id, content) }
+    fun edit(id: String, content: String) { change { s -> s.copy(tabs = s.tabs.map { if (it.id == id) it.copy(content = content) else it }) }; scheduleAutosave(id) }
     fun newNote() { val note = Note(); change { it.copy(tabs = it.tabs + note, activeId = note.id) } }
     fun select(id: String) = change { it.copy(activeId = id) }
     fun cycle(direction:Int) {val s=mutable.value;val index=s.tabs.indexOfFirst{it.id==s.active.id};select(s.tabs[Math.floorMod(index+direction,s.tabs.size)].id)}

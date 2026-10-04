@@ -24,7 +24,7 @@ class ReaderBridge(private val web: WebView, private val model: StudioViewModel,
                 val args = JSONObject(raw)
                 val output: Any? = when(command) {
                     "reader_ready" -> { ready(); true }
-                    "document_changed" -> { model.edit(args.getString("id"), args.getString("content")); true }
+                    "document_changed" -> { model.readerEdit(args.getString("id"), args.getString("content")); true }
                     "zoom_changed" -> { model.readerZoom(args.getDouble("zoom").toFloat(), args.optBoolean("fullscreen", model.state.value.fullscreen)); true }
                     "reader_overlay_changed" -> { model.overlay(args.optBoolean("open"), args.optBoolean("image")); true }
                     "document_outline" -> { model.outline(args.getString("id"), args.getJSONArray("headings")); true }
