@@ -225,7 +225,7 @@ def discover(managed: Path, folders: list[str] = ()) -> list[dict]:
     """Detected interpreters, best first: managed env, environments with matplotlib, then the rest."""
     results, prefixes = [], set()
     if bundled_available():
-        results.append({"path": BUNDLED, "label": "Built-in Python", "detail": "Included with Super MD: numpy and matplotlib", "matplotlib": True, "managed": False})
+        results.append({"path": BUNDLED, "label": "Built-in Python", "detail": "Included with Super MD: numpy and matplotlib", "matplotlib": True, "managed": False, "venv": False})
     import concurrent.futures
     paths = candidates(managed, folders)
     with concurrent.futures.ThreadPoolExecutor(max_workers=6) as pool:
@@ -239,10 +239,12 @@ def discover(managed: Path, folders: list[str] = ()) -> list[dict]:
         prefixes.add(key)
         is_managed = Path(info["prefix"]).resolve() == managed.resolve() if managed.exists() else False
         kind = "Super MD environment" if is_managed else ("Virtual environment" if info["venv"] else "System Python")
-        packages = "matplotlib ready" if info["matplotlib"] else "matplotlib missing"
+        ready = info["matplotlib"] and info["numpy"]
+        missing = [name for name in ("numpy", "matplotlib") if not info[name]]
+        packages = "numpy + matplotlib ready" if ready else "needs " + " + ".join(missing)
         location = str(Path(info["prefix"]).name if info["venv"] or is_managed else path)
         results.append({"path": str(path), "label": f"{kind} {info['version']}", "detail": f"{location} · {packages}",
-                        "matplotlib": info["matplotlib"], "managed": is_managed, "venvModule": info.get("venvModule", False)})
+                        "matplotlib": ready, "managed": is_managed, "venv": bool(info["venv"]) or is_managed, "venvModule": info.get("venvModule", False)})
     results.sort(key=lambda item: (item["path"] != BUNDLED, not item["managed"], not item["matplotlib"]))
     return results
 
@@ -282,3 +284,20 @@ def setup_environment(managed: Path, report=lambda text: None) -> str:
     if installed.returncode:
         raise ValueError("pip could not install matplotlib: " + ((installed.stderr.strip().splitlines() or ["check your internet connection"])[-1]))
     return str(python)
+
+def install_packages(executable: str, report=lambda text: None) -> str:
+    """Install numpy + matplotlib into an existing virtual environment."""
+    executable = validate(executable)
+    if executable == BUNDLED:
+        return executable
+    info = probe(executable)
+    if not info:
+        raise ValueError("This Python could not be started")
+    if not info["venv"]:
+        raise ValueError("System Python is managed by your OS. Use Set up Python for a private environment, or install python-numpy and python-matplotlib with your package manager.")
+    report("Installing numpy and matplotlib (needs internet)")
+    installed = subprocess.run([executable, "-m", "pip", "install", "--disable-pip-version-check", "--no-input", "numpy", "matplotlib"],
+                               capture_output=True, text=True, timeout=900, env=clean_environment(), stdin=subprocess.DEVNULL, **_no_window())
+    if installed.returncode:
+        raise ValueError("pip could not install numpy and matplotlib: " + ((installed.stderr.strip().splitlines() or ["check your internet connection"])[-1]))
+    return executable

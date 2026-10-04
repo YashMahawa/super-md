@@ -444,10 +444,27 @@ class Studio(QObject):
             self.python_choices = choices or []
             if error: self.python_status = error
             elif not self.python_choices: self.python_status = "No Python found. Use Set up Python to create one, or install Python 3."
-            elif not any(c["matplotlib"] for c in self.python_choices): self.python_status = "Python found, but matplotlib is missing. Set up Python installs it in a private environment."
+            elif not any(c["matplotlib"] for c in self.python_choices): self.python_status = "Python found, but numpy and matplotlib are missing. Set up Python installs both in a private environment."
             else: self.python_status = ""
             self._emit(False)
         self._submit(lambda: python_runtime.discover(self.data/"python-env", self._python_folders()), done, False)
+
+    @Slot(str)
+    def installPythonPackages(self, path):
+        if self.python_busy: return
+        self.python_busy = True
+        self.python_status = "Preparing to install numpy and matplotlib"
+        self._emit(False)
+        def done(result,error):
+            self.python_busy = False
+            if error:
+                self.python_status = error
+                self._emit(False)
+                return
+            self.settings["python"] = result
+            self._preferences()
+            self.refreshPython()
+        self._submit(lambda: python_runtime.install_packages(path, self.pythonProgress.emit), done, False)
 
     @Slot()
     def setupPython(self):

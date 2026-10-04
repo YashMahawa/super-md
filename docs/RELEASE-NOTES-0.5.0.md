@@ -11,7 +11,8 @@ and Windows finally gets proper fullscreen. Here is what changed.
 - **Linux finds your Python for you.** Settings > Python lists the
   interpreters and virtual environments it detects (system Python, a `.venv`
   next to your notes, pyenv, conda, virtualenvwrapper) and shows which ones
-  have matplotlib. Click one to use it.
+  have numpy and matplotlib. Click one to use it. If the selected virtual
+  environment is missing them, "Install numpy + matplotlib here" adds both.
 - **One-click setup.** No matplotlib anywhere? Press "Set up Python" and Super
   MD creates its own private environment and installs numpy and matplotlib.
 - **Friendlier errors.** A failing cell now shows the line that broke and the

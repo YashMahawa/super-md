@@ -98,12 +98,20 @@ Pane {
                         onClicked: page.save("python", modelData.path)
                     }
                 }
+                ActionButton {
+                    // One tap for the selected environment when it lacks the plotting packages.
+                    readonly property var selected: JSON.parse(studio.pythonChoices).find(choice => choice.path === viewState.settings.python)
+                    visible: !!selected && !selected.matplotlib && selected.venv
+                    objectName: "installPythonPackages"
+                    text: "Install numpy + matplotlib here"; glyph: "DownloadSimple"; prominent: true; enabled: !studio.pythonBusy
+                    onClicked: studio.installPythonPackages(viewState.settings.python)
+                }
                 Label { text: studio.pythonStatus; visible: text.length > 0; Layout.fillWidth: true; wrapMode: Text.WordWrap; color: viewState.colors.text }
                 ExpressiveLoading { visible: studio.pythonBusy; Layout.preferredWidth: 48; Layout.preferredHeight: 48 }
                 Flow {
                     Layout.fillWidth: true
                     spacing: 8
-                    ActionButton { objectName: "setupPython"; text: "Set up Python"; glyph: "DownloadSimple"; prominent: !page.pythonReady; tonal: page.pythonReady; enabled: !studio.pythonBusy; ToolTip.text: "Creates a private environment and installs numpy and matplotlib"; onClicked: studio.setupPython() }
+                    ActionButton { objectName: "setupPython"; text: "Set up Python"; glyph: "DownloadSimple"; prominent: !page.pythonReady; tonal: page.pythonReady; enabled: !studio.pythonBusy; ToolTip.text: "Creates a private Python environment with numpy and matplotlib"; onClicked: studio.setupPython() }
                     ActionButton { text: "Scan again"; glyph: "ArrowClockwise"; tonal: true; enabled: !studio.pythonBusy; onClicked: studio.refreshPython() }
                 }
                 Label { text: "Custom interpreter path"; Layout.topMargin: 4 }
