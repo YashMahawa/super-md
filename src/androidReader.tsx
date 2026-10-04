@@ -220,13 +220,31 @@ function Reader() {
   },[state]);
   useLayoutEffect(() => {
     if (!state) return;
+    const hosts=Array.from(document.querySelectorAll<HTMLElement>(".android-reading"));
+    hosts.forEach(host=>delete host.dataset.measured);
+    let measure=requestAnimationFrame(()=>{measure=requestAnimationFrame(()=>hosts.forEach(host=>{host.dataset.measured="true";}));});
+    return()=>cancelAnimationFrame(measure);
+  }, [state?.id, state?.mode]);
+  useLayoutEffect(() => {
+    if (!state) return;
     const top = noteViews.current.get(state.id)?.top;
     if(modeOffset.current!==null){
       const offset=modeOffset.current;modeOffset.current=null;
-      requestAnimationFrame(()=>{
+      // The new view settles over several frames (editor mount, zoom geometry,
+      // lazy math and fonts). Re-apply the source anchor until it is stable,
+      // and stop as soon as the person scrolls or types.
+      let stopped=false;const stop=()=>{stopped=true;};
+      const inputs=["wheel","touchstart","keydown","pointerdown"] as const;
+      inputs.forEach(name=>window.addEventListener(name,stop,{capture:true,passive:true}));
+      const apply=()=>{
+        if(stopped)return;
         if(state.mode==="editor")window.dispatchEvent(new CustomEvent("supermd-goto-offset",{detail:offset}));
         else {const host=document.querySelector<HTMLElement>(".android-reading");if(host)revealReadingOffset(host,offset);}
-      });return;
+      };
+      requestAnimationFrame(()=>{apply();requestAnimationFrame(apply);});
+      const timers=[120,320,700].map(delay=>window.setTimeout(apply,delay));
+      window.setTimeout(()=>inputs.forEach(name=>window.removeEventListener(name,stop,{capture:true})),760);
+      return()=>{stopped=true;timers.forEach(window.clearTimeout);};
     }
     if (typeof top === "number" && Number.isFinite(top)) {
       const host = document.querySelector<HTMLElement>(".android-reading");

@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import MarkdownPreview from "./MarkdownPreview";
 import WindowedBlock from "./WindowedBlock";
 import {documentOutline,headingSlug} from "../documentNavigation";
@@ -52,7 +52,33 @@ interface Props extends WritingOptions {
 }
 
 export default function LiveEditor({ markdown, onChange, documentPath, python, dark, trustedImageHosts = noTrustedHosts, onTrustImageHost,spellCheck=false,grammarCheck=false }: Props) {
-  const [editing, setEditing] = useState<{ prefix: string; text: string; suffix: string } | null>(null);
+  const [editing, setEditing] = useState<{ prefix: string; text: string; suffix: string; original: number } | null>(null);
+  // Viewport top of the block being opened, so the editor appears exactly in its place.
+  const anchorTop = useRef<number | null>(null);
+  const editor = useRef<HTMLTextAreaElement>(null);
+  const open = (element: HTMLElement, prefix: string, text: string, suffix: string) => {
+    anchorTop.current = element.getBoundingClientRect().top;
+    setEditing({ prefix, text, suffix, original: text.length });
+  };
+  useLayoutEffect(() => {
+    const area = editor.current;
+    if (!area || anchorTop.current === null) return;
+    const scroller = area.closest<HTMLElement>(".android-reading,.reading-scroll,.preview-pane,.live-scroll");
+    const anchor = anchorTop.current;
+    anchorTop.current = null;
+    const hold = () => { const delta = area.getBoundingClientRect().top - anchor; if (scroller && Math.abs(delta) > .5) scroller.scrollTop += delta; };
+    hold();
+    area.focus({ preventScroll: true });
+    // Neighbouring blocks may re-measure lazily for a few frames; keep the
+    // editor pinned where the block was until that settles or the user scrolls.
+    let frames = 0, frame = 0, stopped = false;
+    const stop = () => { stopped = true; };
+    const inputs = ["wheel", "touchstart", "keydown"] as const;
+    inputs.forEach(name => window.addEventListener(name, stop, { capture: true, passive: true }));
+    const tick = () => { if (stopped || !area.isConnected) return; hold(); if (++frames < 24) frame = requestAnimationFrame(tick); };
+    frame = requestAnimationFrame(tick);
+    return () => { cancelAnimationFrame(frame); inputs.forEach(name => window.removeEventListener(name, stop, { capture: true })); };
+  }, [editing?.prefix]);
   const blocks = useMemo(() => splitMarkdownBlocks(markdown), [markdown]);
   const large=markdown.length>80_000;
   const headingMap=useMemo(()=>{
@@ -66,25 +92,27 @@ export default function LiveEditor({ markdown, onChange, documentPath, python, d
   const after = useMemo(() => editing ? splitMarkdownBlocks(editing.suffix).filter((block) => block.text.trim()) : [], [editing?.suffix]);
   const copy=(event:ClipboardEvent)=>{if((event.target as Element).closest('textarea'))return;const source=selectedMarkdown(window.getSelection(),markdown);if(source!==null){event.clipboardData.setData('text/plain',source);event.preventDefault();}};
   useEffect(() => { if (editing && markdown !== editing.prefix + editing.text + editing.suffix) setEditing(null); }, [markdown, editing]);
-  const renderBlock = (block: SourceBlock, index: number, base = 0) => <WindowedBlock enabled={large} estimate={Math.min(1500,Math.max(80,block.text.length/65*30))} text={block.text.replace(/\*\*|__|`/g,'')} headings={headingMap.get(base+block.start)} className="live-block" data-source-start={base + block.start} data-source-end={base + block.end} key={`${base + block.start}-${index}`} tabIndex={0} role="group" aria-label={`Editable block ${index + 1}`} onDoubleClick={(event) => {
+  const renderBlock = (block: SourceBlock, index: number, base = 0, keyBase = base) => <WindowedBlock enabled={large} estimate={Math.min(1500,Math.max(80,block.text.length/65*30))} text={block.text.replace(/\*\*|__|`/g,'')} headings={headingMap.get(base+block.start)} className="live-block" data-source-start={base + block.start} data-source-end={base + block.end} key={`block-${keyBase + block.start}`} tabIndex={0} role="group" aria-label={`Editable block ${index + 1}`} onDoubleClick={(event) => {
     if ((event.target as Element).closest("a,button,input,select,textarea,summary,.interactive-chart,img,.note-image")) return;
     window.getSelection()?.removeAllRanges();
-    setEditing({ prefix: markdown.slice(0, base + block.start), text: block.text, suffix: markdown.slice(base + block.end) });
+    open(event.currentTarget, markdown.slice(0, base + block.start), block.text, markdown.slice(base + block.end));
   }} onKeyDown={(event) => {
-    if (event.target === event.currentTarget && (event.key === "Enter" || event.key === "F2")) { event.preventDefault(); setEditing({ prefix: markdown.slice(0, base + block.start), text: block.text, suffix: markdown.slice(base + block.end) }); }
+    if (event.target === event.currentTarget && (event.key === "Enter" || event.key === "F2")) { event.preventDefault(); open(event.currentTarget, markdown.slice(0, base + block.start), block.text, markdown.slice(base + block.end)); }
   }}>
     <MarkdownPreview markdown={block.text} onChange={text=>onChange(markdown.slice(0,base+block.start)+text+markdown.slice(base+block.end))} documentPath={documentPath} python={python} dark={dark} trustedImageHosts={trustedImageHosts} onTrustImageHost={onTrustImageHost} />
   </WindowedBlock>;
   if (editing) {
-    return <div className="live-document" onCopy={copy}>
-      {before.map((block, index) => renderBlock(block, index))}
-      <div className="live-active-block"><textarea autoFocus data-source-start={editing.prefix.length} spellCheck={false} value={editing.text} style={{ height: Math.max(120, editing.text.split("\n").length * 27 + 32) }} onChange={(event) => {
+    // One flat keyed list, so blocks around the editor are kept, not remounted
+    // (a remount drops their measured size and makes the page jump).
+    return <div className="live-document" onCopy={copy}>{[
+      ...before.map((block, index) => renderBlock(block, index)),
+      <div key="active" className="live-active-block"><textarea ref={editor} data-source-start={editing.prefix.length} spellCheck={false} value={editing.text} style={{ height: Math.max(120, editing.text.split("\n").length * 27 + 32) }} onChange={(event) => {
         const text = event.target.value;
         setEditing({ ...editing, text });
         onChange(editing.prefix + text + editing.suffix);
-      }} onKeyDown={event => { if (event.key === "Escape") { event.preventDefault(); event.stopPropagation(); setEditing(null); } }} onBlur={event => {if(!event.relatedTarget || !event.currentTarget.parentElement?.contains(event.relatedTarget))setEditing(null);}} aria-label="Edit Markdown block" /><WritingSuggestions text={editing.text} spellCheck={spellCheck} grammarCheck={grammarCheck} onChange={text=>{setEditing({...editing,text});onChange(editing.prefix+text+editing.suffix);}} /></div>
-      {after.map((block, index) => renderBlock(block, index, editing.prefix.length + editing.text.length))}
-    </div>;
+      }} onKeyDown={event => { if (event.key === "Escape") { event.preventDefault(); event.stopPropagation(); setEditing(null); } }} onBlur={event => {if(!event.relatedTarget || !event.currentTarget.parentElement?.contains(event.relatedTarget))setEditing(null);}} aria-label="Edit Markdown block" /><WritingSuggestions text={editing.text} spellCheck={spellCheck} grammarCheck={grammarCheck} onChange={text=>{setEditing({...editing,text});onChange(editing.prefix+text+editing.suffix);}} /></div>,
+      ...after.map((block, index) => renderBlock(block, index, editing.prefix.length + editing.text.length, editing.prefix.length + editing.original)),
+    ]}</div>;
   }
   return <div className="live-document" onCopy={copy}>{blocks.map((block, index) => renderBlock(block, index))}</div>;
 }

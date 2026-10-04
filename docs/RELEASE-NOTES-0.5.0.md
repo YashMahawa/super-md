@@ -53,6 +53,10 @@ and Windows finally gets proper fullscreen. Here is what changed.
 - **Wider reading, your way.** Desktop now reads at 90% width by default (was
   80%; untouched settings move to 90% too) and Android at 100%. Width can go
   past 100% on every platform, up to 150%.
+- **No more losing your place.** Switching from Read to Live or Source keeps
+  you at the same spot, double-clicking a block in Live opens the editor
+  exactly where the block was (no jump or jitter), and scrolling back up a
+  long note no longer makes the page jump as blocks appear.
 - **Remembers your window.** Super MD reopens at the size you left it, and
   maximized if it was maximized.
 - **Smoother scrolling and zooming.** Mouse-wheel scrolling is animated, and

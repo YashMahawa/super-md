@@ -531,3 +531,20 @@ test("Material menus, expressive toolbar and fractional-scale surfaces", async (
   await page.screenshot({ path: test.info().outputPath("expressive-workspace-125percent.png") });
   await context.close();
 });
+test("double-click editing in Live opens the editor in place without jumping",async({page})=>{
+  await page.addInitScript(()=>{window.SuperMD={post:()=>{}};});await page.goto("/android-reader.html");
+  const content=Array.from({length:60},(_,i)=>`## Part ${i}\n\nA paragraph with $x^${i}$ math and **bold** words. ${"More text. ".repeat(12)}`).join("\n\n");
+  await page.evaluate(content=>window.supermdLoad?.({id:"live-edit",content,path:null,mode:"live",dark:false,fullscreen:false,colors:{},font:"Manrope",size:18,zoom:100}),content);
+  const target=page.locator(".live-block:has(#part-30)");
+  // Let the freshly opened note finish its first layout (math, fonts) like a reader would.
+  await expect(page.locator(".android-reading")).toHaveAttribute("data-measured","true");await page.waitForTimeout(400);
+  await page.mouse.move(600,400);
+  for(let i=0;i<8&&(await target.boundingBox())!.y>420;i++){await page.mouse.wheel(0,Math.min(600,(await target.boundingBox())!.y-300));await page.waitForTimeout(120);}
+  await page.evaluate(()=>new Promise<void>(resolve=>requestAnimationFrame(()=>requestAnimationFrame(()=>resolve()))));
+  const box=(await target.boundingBox())!,before=box.y;
+  await page.mouse.dblclick(box.x+box.width/2,box.y+box.height/2);
+  const editor=page.locator(".live-active-block textarea");await expect(editor).toBeVisible();await expect(editor).toBeFocused();
+  await page.evaluate(()=>new Promise<void>(resolve=>requestAnimationFrame(()=>requestAnimationFrame(()=>resolve()))));
+  expect(Math.abs((await editor.boundingBox())!.y-before)).toBeLessThan(3);
+  await expect(editor).toHaveValue(/Part 30/);
+});

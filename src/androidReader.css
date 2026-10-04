@@ -19,6 +19,10 @@
    off-screen KaTeX trees is skipped while source/anchors stay searchable. */
 .android-reading .live-block, .android-reading .document-page > .markdown-body > :is(p,aside,details,pre,table,ul,ol,figure,div) { content-visibility:auto;contain-intrinsic-size:auto 120px; }
 .android-reading .windowed-md-block { content-visibility:visible;contain-intrinsic-size:none; }
+/* Lay every block out once per opened note/mode so each remembers its real
+   height. Otherwise blocks first rendered while scrolling up resize from the
+   120px placeholder and the page jumps (no scroll anchoring here). */
+.android-reading:not([data-measured]) :is(.live-block, .document-page > .markdown-body > :is(p,aside,details,pre,table,ul,ol,figure,div)) { content-visibility:visible; }
 /* Palette commits are atomic. Per-element background transitions otherwise
    reveal a patchwork of the previous and next native theme. */
 :root, body { transition:none; }
