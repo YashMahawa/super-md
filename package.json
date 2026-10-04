@@ -1,7 +1,7 @@
 {
   "name": "super-md",
   "private": true,
-  "version": "0.4.14",
+  "version": "0.5.0",
   "author": "Yash Mahawar",
   "license": "MIT",
   "type": "module",
