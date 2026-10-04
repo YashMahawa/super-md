@@ -53,16 +53,19 @@ export function applyDocumentZoom(root:HTMLElement, zoom:number, widthPercent:nu
   const width=Math.max(240,(viewport-32)*widthPercent/100);
   // A compositor transform keeps KaTeX/layout out of each pinch frame. CSS
   // zoom invalidates layout throughout a long document even with fixed wraps.
-  const left=Math.max(16,(viewport-width*next)/2);
+  // Fullscreen lets a narrower page slide left and right too, not only once it
+  // overflows: the spare width becomes scroll room, centred by default.
+  const spare=root.ownerDocument.documentElement.dataset.fullscreen==="true"?Math.max(0,viewport-width*next-32):0;
+  const left=spare?16+spare:Math.max(16,(viewport-width*next)/2);
   if(page.style.zoom && page.style.zoom!=="1")page.style.zoom="1";
   delete page.dataset.selectionScale;
   delete page.dataset.selectionModel;
   if(width!==measured.width){page.style.width=`${width}px`;page.style.marginLeft="0px";measured.width=width;measured.height=page.offsetHeight;}
   page.style.transform=`translateX(${left}px) scale(${next})`;page.dataset.scale=String(next);page.dataset.zoomLeft=String(left);measured.left=left;
-  space.style.width=`${Math.max(viewport,width*next+32)}px`;
+  space.style.width=`${spare?viewport+spare:Math.max(viewport,width*next+32)}px`;
   space.style.height=`${measured.height*next}px`;
   // Solve the focal translation analytically. Reading the whole page's bounds
   // and offsetHeight after every write forced layout in each pinch frame.
-  if(first && !focus){root.scrollLeft=0;root.scrollTop=0;}
+  if(first && !focus){root.scrollLeft=spare/2;root.scrollTop=0;}
   else {root.scrollLeft=measured.originX+left+point.x*next-target.x;root.scrollTop=measured.originY+point.y*next-target.y;}
 }

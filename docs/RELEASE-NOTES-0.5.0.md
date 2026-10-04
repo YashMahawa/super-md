@@ -44,6 +44,9 @@ and Windows finally gets proper fullscreen. Here is what changed.
   covers the whole screen.
 - **Readable title bar in dark mode on Windows.** The minimize, maximize and
   close buttons follow the app theme instead of staying black on dark.
+- **Slide the page in fullscreen.** In fullscreen you can move the page left
+  or right with a sideways swipe, Shift + wheel or a touchpad, even when it is
+  not zoomed in. It still starts centred.
 - **Remembers your window.** Super MD reopens at the size you left it, and
   maximized if it was maximized.
 - **Smoother scrolling and zooming.** Mouse-wheel scrolling is animated, and

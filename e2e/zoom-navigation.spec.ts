@@ -142,3 +142,22 @@ test('settled selection scale stays stable while scrolling lazy content',async({
   for(let i=1;i<samples.length;i++)expect(samples[i].top).toBeGreaterThanOrEqual(samples[i-1].top-1);
   expect(samples.every(sample=>sample.zoom==='1.75')).toBe(true);
 });
+test('fullscreen pages slide left and right even when they fit the screen',async({page})=>{
+  await page.addInitScript(()=>{window.SuperMD={post:()=>{}};});await page.goto('/android-reader.html');
+  await page.setViewportSize({width:1200,height:800});
+  const content='# Wide screen\n\n'+('A readable paragraph with some words. '.repeat(16)+'\n\n').repeat(20);
+  const state={id:'pan',content,path:null,mode:'reader' as const,dark:false,fullscreen:false,colors:{},font:'Manrope',size:15,zoom:100,widthPercent:60};
+  await page.evaluate(state=>window.supermdLoad?.(state),state);
+  const root=page.locator('.android-reading'),title=page.getByRole('heading',{name:'Wide screen'});
+  await expect(page.locator('.document-page')).toHaveAttribute('data-scale','1');
+  expect(await root.evaluate(el=>el.scrollWidth<=el.clientWidth)).toBe(true);
+  const centred=(await title.boundingBox())!.x;
+  await page.evaluate(state=>window.supermdLoad?.({...state,fullscreen:true}),state);
+  await page.waitForFunction(()=>document.documentElement.dataset.fullscreen==='true');
+  await expect.poll(()=>root.evaluate(el=>el.scrollWidth>el.clientWidth)).toBe(true);
+  await expect.poll(async()=>Math.abs((await title.boundingBox())!.x-centred)).toBeLessThan(2);
+  await root.evaluate(el=>el.scrollBy({left:-10000,behavior:'instant'}));
+  await expect.poll(async()=>(await title.boundingBox())!.x).toBeGreaterThan(centred+100);
+  await root.evaluate(el=>el.scrollBy({left:20000,behavior:'instant'}));
+  await expect.poll(async()=>(await title.boundingBox())!.x).toBeLessThan(centred-100);
+});
