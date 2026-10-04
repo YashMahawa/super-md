@@ -50,7 +50,7 @@ Pane {
                 Label { text: "Text size: " + Math.round(viewState.settings.size) + " px" }
                 ExpressiveSlider { Layout.fillWidth: true; from: 6; to: 32; stepSize: 1; value: viewState.settings.size; onMoved: page.save("size", value) }
                 Label { text: "Reading width: " + Math.round(viewState.settings.widthPercent) + "%" }
-                ExpressiveSlider { Layout.fillWidth: true; from: 50; to: 100; stepSize: 1; value: viewState.settings.widthPercent; onMoved: page.save("widthPercent", value) }
+                ExpressiveSlider { Layout.fillWidth: true; from: 50; to: 150; stepSize: 1; value: viewState.settings.widthPercent; onMoved: page.save("widthPercent", value) }
                 Label { text: "Adapts to this window and fullscreen, without a fixed pixel limit."; Layout.fillWidth: true; wrapMode: Text.WordWrap; color: viewState.colors.muted }
                 Label { text: "Vertical spacing: " + viewState.settings.lineHeight.toFixed(2) }
                 ExpressiveSlider { Layout.fillWidth: true; from: 1.15; to: 2.2; stepSize: .05; value: viewState.settings.lineHeight; onMoved: page.save("lineHeight", value) }

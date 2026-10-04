@@ -608,3 +608,9 @@ button.code-copy:active { border-radius:10px; }
 .hljs-strong { font-weight: 700; }
 .markdown-body :not(pre) > code { background: var(--code-bg); border: 1px solid var(--code-border); }
 @media (prefers-reduced-motion:reduce) { .code-disclosure > summary::before, button.code-copy { transition:none; } }
+
+/* Inline SVG drawings */
+.svg-figure { margin: 1.4em 0; display: flex; justify-content: center; }
+.svg-figure img.svg-diagram { display: block; max-width: 100%; height: auto; }
+.svg-figure--color img.svg-diagram { padding: 16px; border-radius: 20px; background: #fdfdfc; box-shadow: 0 0 0 1px var(--code-border); }
+.svg-figure--own-background img.svg-diagram { border-radius: 16px; }

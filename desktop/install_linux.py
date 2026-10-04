@@ -58,6 +58,31 @@ def install(package):
         target.parent.mkdir(parents=True, exist_ok=True)
         backup(target)
         shutil.copy2(source, target)
+    # Launchers prefer raster sizes over scalable SVG, so stale PNGs from older
+    # installs kept showing the previous logo. Render fresh ones (or drop them).
+    icons = local / "share/icons/hicolor"
+    for stale in icons.glob("*/apps/super-md.png"):
+        backup(stale)
+        stale.unlink()
+    try:
+        os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+        from PySide6.QtCore import Qt
+        from PySide6.QtGui import QGuiApplication, QImage, QPainter
+        from PySide6.QtSvg import QSvgRenderer
+        app = QGuiApplication.instance() or QGuiApplication([])
+        renderer = QSvgRenderer(str(resources / "public/brand-mark-fixed.svg"))
+        for size in (16, 24, 32, 48, 64, 128, 256, 512):
+            image = QImage(size, size, QImage.Format.Format_ARGB32)
+            image.fill(Qt.GlobalColor.transparent)
+            painter = QPainter(image)
+            painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+            renderer.render(painter)
+            painter.end()
+            target = icons / f"{size}x{size}/apps/super-md.png"
+            target.parent.mkdir(parents=True, exist_ok=True)
+            image.save(str(target))
+    except ImportError:
+        pass
     for command in [("update-mime-database", str(local / "share/mime")),
                     ("update-desktop-database", str(local / "share/applications")),
                     ("gtk-update-icon-cache", "-f", "-t", str(local / "share/icons/hicolor")),

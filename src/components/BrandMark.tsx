@@ -1,8 +1,8 @@
 export default function BrandMark({ className = "" }: { className?: string }) {
+  // Monochrome "S" with the Markdown down-arrow, inked in the current theme.
   return <svg className={className} xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64" role="img" aria-label="Super MD logo">
-    <rect x="2" y="2" width="60" height="60" rx="18" fill="var(--surface-high)" />
-    <path d="M18 13h23l8 8v31H18z" fill="var(--primary)" />
-    <path d="M41 13v8h8M25 26h13M25 34h17M25 42h11" fill="none" stroke="var(--on-primary)" strokeWidth="3" strokeLinecap="round" strokeLinejoin="round" />
-    <path d="m47 8 2 5 5 2-5 2-2 5-2-5-5-2 5-2z" fill="var(--primary)" />
+    <rect x="2" y="2" width="60" height="60" rx="18" fill="var(--text)" />
+    <path d="M34.5 18.6A9.8 9.3 0 1 0 25.3 32.4A9.8 9.3 0 1 1 16 47" fill="none" stroke="var(--surface)" strokeWidth="7" strokeLinecap="round" />
+    <path d="M46.5 16V48.5M39.5 41.5L46.5 48.5L53.5 41.5" fill="none" stroke="var(--surface)" strokeWidth="6" strokeLinecap="round" strokeLinejoin="round" />
   </svg>;
 }

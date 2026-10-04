@@ -1,11 +1,17 @@
 package dev.supermd.studio
 
+import androidx.compose.animation.core.animateFloatAsState
+import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
+import androidx.compose.foundation.shape.CircleShape
+import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.ui.draw.clip
+import androidx.compose.ui.draw.rotate
+import androidx.compose.ui.graphics.Color
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
 import androidx.compose.material.icons.Icons
-import androidx.compose.material.icons.rounded.ChevronRight
 import androidx.compose.material.icons.rounded.ExpandMore
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
@@ -29,12 +35,21 @@ internal fun outlineRows(entries:List<OutlineHeading>,expanded:Set<String>):List
     var expanded by remember(noteId){mutableStateOf(emptySet<String>())}
     val rows=remember(entries,expanded){outlineRows(entries,expanded)}
     if(entries.isEmpty())Text("Headings in this note will appear here.",modifier.padding(16.dp),color=MaterialTheme.colorScheme.onSurfaceVariant)
-    else LazyColumn(modifier.fillMaxWidth().heightIn(max=520.dp)) {
+    else LazyColumn(modifier.fillMaxWidth().heightIn(max=520.dp),verticalArrangement=Arrangement.spacedBy(2.dp)) {
         items(rows,key={it.heading.id}) {row->
-            Row(Modifier.fillMaxWidth().padding(start=(row.depth*14).dp),verticalAlignment=Alignment.CenterVertically) {
-                if(row.children)IconButton(onClick={expanded=if(row.heading.id in expanded)expanded-row.heading.id else expanded+row.heading.id}){Icon(if(row.heading.id in expanded)Icons.Rounded.ExpandMore else Icons.Rounded.ChevronRight,if(row.heading.id in expanded)"Collapse ${row.heading.title}" else "Expand ${row.heading.title}")}
-                else Spacer(Modifier.width(48.dp))
-                Text(row.heading.title,Modifier.weight(1f).clickable{navigate(row.heading)}.padding(top=14.dp,bottom=14.dp,end=8.dp),maxLines=2,overflow=TextOverflow.Ellipsis,style=MaterialTheme.typography.bodyMedium)
+            val open=row.heading.id in expanded
+            val toggle={expanded=if(open)expanded-row.heading.id else expanded+row.heading.id}
+            val chevron by animateFloatAsState(if(open)0f else -90f,label="Outline chevron")
+            // One rounded row with a soft tonal press state, not a boxy highlight.
+            Surface(onClick={navigate(row.heading)},shape=RoundedCornerShape(50),color=Color.Transparent,modifier=Modifier.fillMaxWidth()) {
+                Row(Modifier.padding(start=(4+row.depth*16).dp,end=12.dp).heightIn(min=if(row.depth==0)48.dp else 44.dp),verticalAlignment=Alignment.CenterVertically) {
+                    if(row.depth>0)Box(Modifier.padding(end=6.dp).width(2.dp).height(18.dp).clip(RoundedCornerShape(1.dp)).background(MaterialTheme.colorScheme.outlineVariant))
+                    if(row.children)Box(Modifier.size(36.dp).clip(CircleShape).clickable(onClick=toggle),contentAlignment=Alignment.Center){Icon(Icons.Rounded.ExpandMore,if(open)"Collapse ${row.heading.title}" else "Expand ${row.heading.title}",Modifier.size(22.dp).rotate(chevron),tint=MaterialTheme.colorScheme.onSurfaceVariant)}
+                    else Spacer(Modifier.width(36.dp))
+                    Text(row.heading.title,Modifier.weight(1f).padding(start=4.dp),maxLines=2,overflow=TextOverflow.Ellipsis,
+                        style=if(row.depth==0)MaterialTheme.typography.titleSmall else MaterialTheme.typography.bodyMedium,
+                        color=if(row.depth==0)MaterialTheme.colorScheme.onSurface else MaterialTheme.colorScheme.onSurfaceVariant)
+                }
             }
         }
     }

@@ -21,13 +21,13 @@ class Palette(QObject):
     def motionEnabled(self): return json.loads(self.snapshot)["settings"]["motion"]
 
 class StudyControlsTest(unittest.TestCase):
-    def test_brand_variants_share_the_brush_s_geometry(self):
+    def test_brand_variants_share_the_mark_geometry(self):
         root=Path(__file__).resolve().parent.parent/'public'
         geometries=[]
         for name in ('brand-mark.svg','brand-mark-fixed.svg','brand-mark-themed.svg'):
             svg=ET.parse(root/name).getroot()
             geometries.append([path.attrib['d'] for path in svg.findall('{http://www.w3.org/2000/svg}path')])
-        self.assertEqual(len(geometries[0]),1)
+        self.assertEqual(len(geometries[0]),2)  # the S and the Markdown arrow
         self.assertEqual(geometries[0],geometries[1])
         self.assertEqual(geometries[1],geometries[2])
 

@@ -18,7 +18,7 @@ export function cachedMarkdownTree(source:string,remarkPlugins:PluggableList,reh
   const key=(deferred?'deferred:':'full:')+source;
   const hit=cache.get(key);if(hit){cache.delete(key);cache.set(key,hit);return hit.tree;}
   const processor=unified().use(remarkParse).use(remarkPlugins).use(remarkRehype,{allowDangerousHtml:true}).use(rehypePlugins);
-  const tree=processor.runSync(processor.parse(source)) as Root;let weight=source.length*2;
+  const tree=processor.runSync(processor.parse(source),source) as Root;let weight=source.length*2;
   visit(tree,(node:any,index,parent:any)=>{
     weight+=160+(typeof node.value==="string"?node.value.length*2:0);
     if(node.type==="raw"&&parent&&index!==undefined){parent.children[index]={type:"text",value:node.value};return;}

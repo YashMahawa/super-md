@@ -614,7 +614,7 @@ class Studio(QObject):
     def brand(self):
         svg = self._brand_svg
         colors = self._colors()
-        svg = svg.replace("#d8e3ff",colors["primary-container"]).replace("#244779",colors["on-primary-container"])
+        svg = svg.replace("#16181d",colors["text"]).replace("#f4f4f1",colors["surface"])
         return "data:image/svg+xml;base64,"+base64.b64encode(svg.encode()).decode()
 
     def _submit(self, action, done, busy=True, executor=None):
@@ -844,7 +844,7 @@ class Studio(QObject):
         if key in ("window","widthMigrated"): return  # Internal state, not user settings.
         if key == "size": value = max(6, min(32, float(value)))
         if key == "width": value = max(0, min(5000, int(value)))
-        if key == "widthPercent": value = max(50,min(100,float(value)))
+        if key == "widthPercent": value = max(50,min(150,float(value)))
         if key == "lineHeight": value = max(1.15,min(2.2,float(value)))
         self.settings[key] = value
         self._preferences()

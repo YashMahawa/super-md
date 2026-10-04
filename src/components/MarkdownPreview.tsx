@@ -11,6 +11,7 @@ import { visit } from "unist-util-visit";
 import InteractiveChart from "./InteractiveChart";
 import PythonCell from "./PythonCell";
 import SvgDiagram from "./SvgDiagram";
+import { remarkSvgBlocks } from "../svgBlocks";
 import { remarkObsidianMath } from "../obsidianMath";
 import { headingSlug, navigateHeading, remarkHeadingIds } from "../documentNavigation";
 import { selectedMarkdown } from "../copySource";
@@ -144,7 +145,7 @@ function MarkdownPreview({ markdown, documentPath, python, dark, trustedImageHos
   return (
     <article className="markdown-body" onCopy={event=>{if(event.currentTarget.closest('.live-document'))return;const source=selectedMarkdown(window.getSelection(),normalized);if(source!==null){event.clipboardData.setData("text/plain",source);event.preventDefault();}}}>
       <CachedMarkdown
-        remarkPlugins={[remarkGfm, remarkMath, remarkObsidianMath, remarkCallouts, remarkHeadingIds, remarkTaskPositions,remarkSourcePositions]}
+        remarkPlugins={[remarkGfm, remarkMath, remarkObsidianMath, remarkSvgBlocks, remarkCallouts, remarkHeadingIds, remarkTaskPositions,remarkSourcePositions]}
         rehypePlugins={[rehypeKatex, rehypeHighlight]}
         components={{
           input: ({node: _node,...props}) => <input {...props} disabled={!onChange} onChange={()=>{}} />,
@@ -157,7 +158,7 @@ function MarkdownPreview({ markdown, documentPath, python, dark, trustedImageHos
             const source = textOf(child.props.children).replace(/\n$/, "");
             const protectedBlock = (block: ReactNode) => <CodeBlockBoundary key={`${language}:${source}`} source={source}>{block}</CodeBlockBoundary>;
             if (language === "smd-chart") return protectedBlock(<InteractiveChart source={source} dark={dark} />);
-            if (language === "svg") return protectedBlock(<SvgDiagram source={source} />);
+            if (language === "svg") return protectedBlock(<SvgDiagram source={source} dark={dark} />);
             if (language === "mermaid") return protectedBlock(<Suspense fallback={<span className="image-loading" role="status">Loading diagram…</span>}><MermaidDiagram source={source} dark={dark} /></Suspense>);
             if (language === "python" || language === "py") return protectedBlock(<PythonCell source={source} python={python} highlighted={child.props.children} />);
             return <div className="code-container"><CopyCode source={source}/><details className="code-disclosure" open={source.split("\n").length <= 12}><summary>{language || "Code"} <span>{source.split("\n").length} lines</span></summary><pre>{children}</pre></details></div>;

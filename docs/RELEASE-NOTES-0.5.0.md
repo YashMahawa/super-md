@@ -50,8 +50,9 @@ and Windows finally gets proper fullscreen. Here is what changed.
   from the keyboard keeps line starts where they were. In fullscreen you can
   slide the page sideways even when it is not zoomed in. Use a sideways
   swipe, Shift + wheel or a touchpad. This applies on Android too.
-- **Wider reading by default.** New installs read at 90% width (was 80%). If
-  you never changed the width, it moves to 90% too.
+- **Wider reading, your way.** Desktop now reads at 90% width by default (was
+  80%; untouched settings move to 90% too) and Android at 100%. Width can go
+  past 100% on every platform, up to 150%.
 - **Remembers your window.** Super MD reopens at the size you left it, and
   maximized if it was maximized.
 - **Smoother scrolling and zooming.** Mouse-wheel scrolling is animated, and
@@ -74,7 +75,17 @@ and Windows finally gets proper fullscreen. Here is what changed.
   soft tonal surface (slightly recessed in dark mode) with syntax colors tuned for both light and dark mode.
   Collapsible blocks get a cleaner header, and the Copy button no longer
   overlaps the border.
-- New, clearer table of contents icon on desktop and Android.
+- **A new logo.** A monochrome "S" with the Markdown down-arrow, on desktop,
+  Android (including themed icons) and the Linux launcher. The Linux installer
+  now replaces old launcher icons instead of leaving the previous logo behind.
+- **Table of contents, redesigned.** Rounded rows with soft hover and press
+  states, animated expand arrows and depth guides replace the boxy highlights
+  and button-like dropdowns, on desktop and Android, plus a clearer icon.
+- **SVG drawings render.** Paste raw `<svg>` markup, or put it in an untagged
+  or XML code block, and the note shows the drawing instead of its code. Line
+  art takes your reading text color so it stays visible in dark mode; colored
+  artwork sits on a white card; an SVG with its own background is shown as
+  drawn. Exports include them too.
 - Graph legends, buttons and the Python cell toolbar follow Material 3
   Expressive shapes and motion, and respect reduced-motion settings.
 

@@ -21,25 +21,59 @@ ListView {
         return result
     }
     model: visibleEntries()
-    delegate: Item {
+    spacing: 2
+    delegate: ItemDelegate {
+        id: heading
         required property var modelData
-        width: ListView.view.width - 18
-        height: 44
-        RowLayout {
-            anchors.fill: parent
-            anchors.leftMargin: modelData.depth * 12
-            spacing: 0
-            ActionButton { visible: modelData.children; compact: true; implicitWidth: 32; glyph: "CaretDown"; rotation: outline.expanded[modelData.id] ? 0 : -90; Accessible.name: (outline.expanded[modelData.id] ? "Collapse " : "Expand ") + modelData.title; onClicked: { const next=Object.assign({},outline.expanded);next[modelData.id]=!next[modelData.id];outline.expanded=next } }
-            Item { visible: !modelData.children; Layout.preferredWidth: 32 }
-            ItemDelegate {
-                id: heading
+        readonly property var colors: studio.palette
+        readonly property bool open: !!outline.expanded[modelData.id]
+        width: ListView.view.width - 14
+        height: modelData.depth === 0 ? 44 : 38
+        leftPadding: 8 + modelData.depth * 16
+        rightPadding: 12
+        Accessible.name: modelData.title
+        onClicked: { studio.navigateHeading(modelData.id,modelData.offset); outline.chosen() }
+        // One soft pill per row: tonal state layer, no boxy outline or nested buttons.
+        background: Rectangle {
+            radius: height / 2
+            antialiasing: true
+            color: heading.colors.text
+            opacity: heading.down ? .12 : heading.hovered || heading.visualFocus ? .07 : 0
+            Behavior on opacity { enabled: studio.motionEnabled; NumberAnimation { duration: 140; easing.type: Easing.OutCubic } }
+        }
+        contentItem: RowLayout {
+            spacing: 6
+            Rectangle {
+                // Depth guide for nested headings.
+                visible: heading.modelData.depth > 0
+                Layout.preferredWidth: 2; Layout.preferredHeight: 18; radius: 1
+                color: heading.colors.outline
+            }
+            ToolButton {
+                id: toggle
+                visible: heading.modelData.children
+                focusPolicy: Qt.NoFocus
+                Layout.preferredWidth: 28; Layout.preferredHeight: 28
+                padding: 2
+                icon.source: "../icons/CaretDown.svg"; icon.color: heading.colors.muted; icon.width: 20; icon.height: 20
+                rotation: heading.open ? 0 : -90
+                Behavior on rotation { enabled: studio.motionEnabled; NumberAnimation { duration: 180; easing.type: Easing.OutCubic } }
+                Accessible.name: (heading.open ? "Collapse " : "Expand ") + heading.modelData.title
+                background: Rectangle { radius: 14; color: heading.colors.text; opacity: toggle.hovered ? .1 : 0 }
+                onClicked: { const next=Object.assign({},outline.expanded);next[heading.modelData.id]=!heading.open;outline.expanded=next }
+            }
+            Item { visible: !heading.modelData.children; Layout.preferredWidth: 28 }
+            Label {
+                id: titleLabel
                 Layout.fillWidth: true
-                height: 44
-                text: modelData.title
-                onClicked: { studio.navigateHeading(modelData.id,modelData.offset); outline.chosen() }
-                Hint { visible: heading.hovered; text: modelData.title }
+                text: heading.modelData.title
+                elide: Text.ElideRight
+                color: heading.modelData.depth === 0 ? heading.colors.text : heading.colors.muted
+                font.pixelSize: heading.modelData.depth === 0 ? 14 : 13
+                font.weight: heading.modelData.depth === 0 ? Font.DemiBold : Font.Normal
             }
         }
+        Hint { visible: heading.hovered && titleLabel.truncated; text: heading.modelData.title }
     }
     signal chosen()
     ScrollBar.vertical: ExpressiveScrollBar { }
