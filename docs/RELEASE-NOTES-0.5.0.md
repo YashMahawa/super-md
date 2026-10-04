@@ -45,9 +45,13 @@ and Windows finally gets proper fullscreen. Here is what changed.
   covers the whole screen.
 - **Readable title bar in dark mode on Windows.** The minimize, maximize and
   close buttons follow the app theme instead of staying black on dark.
-- **Slide the page in fullscreen.** In fullscreen you can move the page left
-  or right with a sideways swipe, Shift + wheel or a touchpad, even when it is
-  not zoomed in. It still starts centred.
+- **Pages are never stuck to the left edge.** When you zoom in, the page can
+  slide right to give the start of each line a comfortable margin, and zooming
+  from the keyboard keeps line starts where they were. In fullscreen you can
+  slide the page sideways even when it is not zoomed in. Use a sideways
+  swipe, Shift + wheel or a touchpad. This applies on Android too.
+- **Wider reading by default.** New installs read at 90% width (was 80%). If
+  you never changed the width, it moves to 90% too.
 - **Remembers your window.** Super MD reopens at the size you left it, and
   maximized if it was maximized.
 - **Smoother scrolling and zooming.** Mouse-wheel scrolling is animated, and
@@ -66,8 +70,8 @@ and Windows finally gets proper fullscreen. Here is what changed.
 
 ## Design
 
-- **Code blocks match your theme.** No more pure-black slabs: code uses a soft
-  tonal surface with syntax colors tuned for both light and dark mode.
+- **Code blocks match your theme.** No more pure-black slabs: code sits in a
+  soft tonal surface (slightly recessed in dark mode) with syntax colors tuned for both light and dark mode.
   Collapsible blocks get a cleaner header, and the Copy button no longer
   overlaps the border.
 - New, clearer table of contents icon on desktop and Android.

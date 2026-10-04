@@ -33,6 +33,6 @@ it('legacy zoom geometry keeps transformed visual and native hit-test coordinate
   page.getBoundingClientRect=()=>({left:0,top:0} as DOMRect);root.getBoundingClientRect=()=>({left:0,top:0,width:1000,height:800} as DOMRect);
   Object.defineProperty(root,'clientWidth',{value:1000});Object.defineProperty(page,'offsetHeight',{value:10000});
   applyDocumentZoom(root,175,80);root.scrollTop=500;settleDocumentZoom(root);
-  expect(page.style.zoom).toBe('1');expect(page.style.transform).toBe('translateX(16px) scale(1.75)');expect(page.dataset.selectionModel).toBe('transform');expect(root.scrollTop).toBe(500);
+  expect(page.style.zoom).toBe('1');expect(page.style.transform).toBe('translateX(250px) scale(1.75)');expect(page.dataset.selectionModel).toBe('transform');expect(root.scrollTop).toBe(500);
   refreshDocumentExtent(root);expect(page.dataset.selectionScale).toBe('1.75');expect(root.scrollTop).toBe(500);
 });

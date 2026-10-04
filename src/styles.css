@@ -579,8 +579,10 @@ button.code-copy:active { border-radius:10px; }
 /* Code: tonal surfaces from the active palette, never a fixed black slab.
    Syntax colors are tuned per theme for WCAG AA on the code surface. */
 :root {
-  --code-bg: color-mix(in srgb, var(--surface-high) 82%, var(--primary) 6%);
-  --code-border: color-mix(in srgb, var(--outline) 70%, transparent);
+  /* Dark: a recessed well a touch darker than the page, so code never reads
+     as a lighter slab floating on the note. */
+  --code-bg: color-mix(in srgb, var(--surface) 86%, #000);
+  --code-border: color-mix(in srgb, var(--outline) 60%, transparent);
   --code-text: var(--text);
   --code-accent: var(--primary);
   --syn-keyword: #d3b6ff; --syn-string: #a6dba8; --syn-number: #f3c886; --syn-function: #9ccbff;

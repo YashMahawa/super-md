@@ -48,24 +48,36 @@ export function applyDocumentZoom(root:HTMLElement, zoom:number, widthPercent:nu
   const first=!page.dataset.scale;
   const target=focus||{x:bounds.left+bounds.width/2,y:bounds.top+(root.scrollTop<1?0:bounds.height*.35)};
   const oldFocus=previousFocus||target;
+  // Where the page's left edge sat on screen before this zoom step.
+  const visibleLeft=measured.left-root.scrollLeft;
   const oldScale=Number(page.dataset.scale)||1,next=zoom/100;
   const point=anchor||{x:(oldFocus.x-measured.originX-measured.left+root.scrollLeft)/oldScale,y:(oldFocus.y-measured.originY+root.scrollTop)/oldScale};
   const width=Math.max(240,(viewport-32)*widthPercent/100);
   // A compositor transform keeps KaTeX/layout out of each pinch frame. CSS
   // zoom invalidates layout throughout a long document even with fixed wraps.
-  // Fullscreen lets a narrower page slide left and right too, not only once it
-  // overflows: the spare width becomes scroll room, centred by default.
-  const spare=root.ownerDocument.documentElement.dataset.fullscreen==="true"?Math.max(0,viewport-width*next-32):0;
-  const left=spare?16+spare:Math.max(16,(viewport-width*next)/2);
+  // Horizontal room, so the page never sticks to the left edge: once it is
+  // magnified past the window it can slide until either edge has a reading
+  // margin, and fullscreen lets even a narrower page slide sideways.
+  const scaled=width*next,overflow=scaled+32>viewport;
+  const fullscreen=root.ownerDocument.documentElement.dataset.fullscreen==="true";
+  const room=overflow?Math.max(16,viewport*.25):fullscreen?Math.max(0,viewport-scaled-32):0;
+  const left=overflow?room:room?16+room:Math.max(16,(viewport-scaled)/2);
+  const spaceWidth=overflow?scaled+2*room:room?viewport+room:viewport;
   if(page.style.zoom && page.style.zoom!=="1")page.style.zoom="1";
   delete page.dataset.selectionScale;
   delete page.dataset.selectionModel;
   if(width!==measured.width){page.style.width=`${width}px`;page.style.marginLeft="0px";measured.width=width;measured.height=page.offsetHeight;}
   page.style.transform=`translateX(${left}px) scale(${next})`;page.dataset.scale=String(next);page.dataset.zoomLeft=String(left);measured.left=left;
-  space.style.width=`${spare?viewport+spare:Math.max(viewport,width*next+32)}px`;
+  space.style.width=`${spaceWidth}px`;
   space.style.height=`${measured.height*next}px`;
   // Solve the focal translation analytically. Reading the whole page's bounds
   // and offsetHeight after every write forced layout in each pinch frame.
-  if(first && !focus){root.scrollLeft=spare/2;root.scrollTop=0;}
-  else {root.scrollLeft=measured.originX+left+point.x*next-target.x;root.scrollTop=measured.originY+point.y*next-target.y;}
+  // A magnified page opens with its line starts in view; fullscreen slack is centred.
+  if(first && !focus){root.scrollLeft=overflow?room-16:(spaceWidth-viewport)/2;root.scrollTop=0;}
+  else {
+    root.scrollLeft=measured.originX+left+point.x*next-target.x;root.scrollTop=measured.originY+point.y*next-target.y;
+    // Keyboard/settings zoom has no focal point: keep line starts where they
+    // were instead of pushing them off the left edge.
+    if(!focus&&overflow&&visibleLeft>=0)root.scrollLeft=left-Math.min(visibleLeft,room);
+  }
 }

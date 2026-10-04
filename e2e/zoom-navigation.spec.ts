@@ -161,3 +161,15 @@ test('fullscreen pages slide left and right even when they fit the screen',async
   await root.evaluate(el=>el.scrollBy({left:20000,behavior:'instant'}));
   await expect.poll(async()=>(await title.boundingBox())!.x).toBeLessThan(centred-100);
 });
+test('a magnified page can slide right to give its line starts a margin',async({page})=>{
+  await page.addInitScript(()=>{window.SuperMD={post:()=>{}};});await page.goto('/android-reader.html');
+  await page.setViewportSize({width:1000,height:800});
+  const content='# Margin\n\n'+('A readable paragraph with some words. '.repeat(16)+'\n\n').repeat(10);
+  await page.evaluate(content=>window.supermdLoad?.({id:'margin',content,path:null,mode:'reader',dark:false,fullscreen:false,colors:{},font:'Manrope',size:15,zoom:100,widthPercent:90}),content);
+  const root=page.locator('.android-reading'),title=page.getByRole('heading',{name:'Margin'});
+  await page.evaluate(()=>window.supermdSetZoom?.(160));
+  await expect(page.locator('.document-page')).toHaveAttribute('data-scale','1.6');
+  await expect.poll(async()=>(await title.boundingBox())!.x).toBeGreaterThan(0);
+  await root.evaluate(el=>el.scrollBy({left:-10000,behavior:'instant'}));
+  await expect.poll(async()=>(await title.boundingBox())!.x).toBeGreaterThan(200);
+});
