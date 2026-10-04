@@ -4,8 +4,8 @@ import QtQuick.Controls
 // Keep Qt's native scroll behavior, with a rounded thumb in a separate gutter.
 ScrollBar {
     id: control
-    property var colors: JSON.parse(studio.snapshot).colors
-    property bool motion: JSON.parse(studio.snapshot).settings.motion
+    property var colors: studio.palette
+    property bool motion: studio.motionEnabled
     implicitWidth: 16
     implicitHeight: 16
     padding: 4

@@ -6,8 +6,8 @@ Item {
     id: indicator
     objectName: "expressiveLoading"
     property bool running: true
-    property bool motion: JSON.parse(studio.snapshot).settings.motion
-    property color ink: JSON.parse(studio.snapshot).colors.primary
+    property bool motion: studio.motionEnabled
+    property color ink: studio.palette.primary
     property real phase: 0
     implicitWidth: 48
     implicitHeight: 48

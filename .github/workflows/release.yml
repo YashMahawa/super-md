@@ -177,9 +177,11 @@ jobs:
         run: |
           if [ "$RUNNER_OS" = Windows ]; then
             desktop/dist/super-md/super-md.exe --version
+            python desktop/check_bundled_python.py desktop/dist/super-md/super-md.exe
             desktop/dist/super-md/_internal/resources/desktop/smd-engine.exe doctor
           else
             desktop/dist/super-md/super-md --version
+            if [ "$RUNNER_OS" = macOS ]; then python desktop/check_bundled_python.py desktop/dist/super-md/super-md; fi
             desktop/dist/super-md/_internal/resources/desktop/smd-engine doctor
           fi
           gh release upload "$RELEASE_TAG" desktop/dist/packages/* --clobber

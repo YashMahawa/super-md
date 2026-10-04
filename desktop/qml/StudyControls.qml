@@ -9,8 +9,8 @@ Rectangle {
     property bool awake: true
     property bool ready: true
     property string noteName: ""
-    property var colors: JSON.parse(studio.snapshot).colors
-    property bool motion: JSON.parse(studio.snapshot).settings.motion
+    property var colors: studio.palette
+    property bool motion: studio.motionEnabled
     readonly property bool hovered: barHover.hovered
     readonly property bool focusWithin: contents.visualFocus || save.visualFocus || exportNote.visualFocus || exit.visualFocus
     readonly property bool shown: awake || hovered || focusWithin

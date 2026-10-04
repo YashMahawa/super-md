@@ -6,8 +6,8 @@ import QtQuick.Controls.Material
 
 Slider {
     id: control
-    property var colors: JSON.parse(studio.snapshot).colors
-    property bool motion: JSON.parse(studio.snapshot).settings.motion
+    property var colors: studio.palette
+    property bool motion: studio.motionEnabled
     implicitHeight: 44
     implicitWidth: 180
     padding: 0

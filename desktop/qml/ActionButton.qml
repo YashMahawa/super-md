@@ -8,8 +8,8 @@ Button {
     property bool compact: false
     property string glyph: ""
     property bool tonal: false
-    property var colors: JSON.parse(studio.snapshot).colors
-    property bool motion: JSON.parse(studio.snapshot).settings.motion
+    property var colors: studio.palette
+    property bool motion: studio.motionEnabled
     font.family: "Noto Sans"
     font.pixelSize: 14
     font.weight: Font.Medium
@@ -29,7 +29,7 @@ Button {
     icon.color: Material.foreground
     Accessible.name: ToolTip.text || text
     Material.roundedScale: Material.FullScale
-    Material.background: prominent ? Material.primary : JSON.parse(studio.snapshot).colors["surface-high"]
+    Material.background: prominent ? Material.primary : studio.palette["surface-high"]
     Material.foreground: prominent || highlighted ? colors["on-primary"] : colors.text
     Material.elevation: 0
     background: Rectangle {
@@ -42,6 +42,6 @@ Button {
         Rectangle { anchors.fill: parent; radius: parent.radius; antialiasing: true; color: control.Material.foreground; opacity: control.down ? .12 : control.hovered ? .08 : 0; Behavior on opacity { enabled: control.motion; NumberAnimation { duration: 120 } } }
     }
     scale: down ? .96 : 1
-    Behavior on scale { enabled: JSON.parse(studio.snapshot).settings.motion; SpringAnimation { spring: 5; damping: .75 } }
+    Behavior on scale { enabled: studio.motionEnabled; SpringAnimation { spring: 5; damping: .75 } }
     Hint { visible: control.hovered && control.ToolTip.text.length > 0; text: control.ToolTip.text }
 }

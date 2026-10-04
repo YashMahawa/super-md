@@ -17,6 +17,10 @@ class ModePalette(QObject):
         return json.dumps({"settings": {"motion": False}, "colors": {
             "text": "#201a17", "primary": "#8c4b2b", "on-primary": "#ffffff",
             "surface-low": "#f8d7c5", "surface-high": "#eac1ac", "outline": "#88756b"}})
+    @Property("QVariantMap", constant=True)
+    def palette(self): return json.loads(self.snapshot)["colors"]
+    @Property(bool, constant=True)
+    def motionEnabled(self): return json.loads(self.snapshot)["settings"]["motion"]
 
 class ModeGroupTest(unittest.TestCase):
     @classmethod

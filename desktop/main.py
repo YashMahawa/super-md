@@ -4,6 +4,11 @@ import os
 import sys
 import subprocess
 from pathlib import Path
+
+if __name__ == "__main__" and len(sys.argv) > 1 and sys.argv[1] == "--python-cell":
+    # The frozen app doubles as the built-in Python for cells. Skip Qt entirely.
+    from python_runtime import run_bundled_cell
+    sys.exit(run_bundled_cell(sys.argv[2:]))
 from PySide6.QtCore import QFile, QIODevice, QUrl, QTimer, QMetaObject, Q_ARG, QObject, QEvent, Signal
 from PySide6.QtGui import QGuiApplication, QIcon, QFont, QFontDatabase
 from PySide6.QtWidgets import QApplication
@@ -13,6 +18,7 @@ from PySide6.QtWebEngineQuick import QtWebEngineQuick
 from studio import Session, Studio, ROOT
 from instance import InstanceBroker
 from reader_gestures import ReaderGestures
+import native_frame
 
 class StudioApplication(QApplication):
     openRequested = Signal(str)
@@ -58,6 +64,13 @@ def main():
         # handle), not a toolkit-built file/folder browser. The plugin is bundled.
         os.environ["QT_QPA_PLATFORMTHEME"] = "xdgdesktopportal"
     QQuickStyle.setStyle("Material")
+    # Animated wheel scrolling, as in Chromium elsewhere, for
+    # mouse wheels. Respect flags a user or packager already set.
+    flags = os.environ.get("QTWEBENGINE_CHROMIUM_FLAGS", "")
+    for flag in ("--enable-smooth-scrolling",):
+        if flag not in flags:
+            flags += " " + flag
+    os.environ["QTWEBENGINE_CHROMIUM_FLAGS"] = flags.strip()
     QtWebEngineQuick.initialize()
     QGuiApplication.setApplicationName("super-md-qt" if args.test_state else "super-md")
     QGuiApplication.setOrganizationName("SuperMD")
@@ -125,12 +138,35 @@ def main():
                 if engine in engines: engines.remove(engine)
                 engine.deleteLater()
         window.visibleChanged.connect(lambda: QTimer.singleShot(0, retire_window))
+        remembered = session.settings.get("window") or {}
+        if not args.smoke and isinstance(remembered, dict):
+            try:
+                window.setWidth(max(760, int(remembered.get("width", window.width()))))
+                window.setHeight(max(520, int(remembered.get("height", window.height()))))
+            except (TypeError, ValueError):
+                remembered = {}
+            available = (window.screen() or app.primaryScreen()).availableGeometry()
+            window.setWidth(min(window.width(), available.width()))
+            window.setHeight(min(window.height(), available.height()))
         laptop = next((s for s in app.screens() if s.name().startswith(("eDP", "LVDS"))), None)
         if laptop:
             window.setScreen(laptop)
             rect = laptop.availableGeometry()
             window.setPosition(rect.x() + max(0,(rect.width()-window.width())//2), rect.y()+max(0,(rect.height()-window.height())//2))
-        window.show()
+        if not args.smoke and isinstance(remembered, dict) and remembered.get("maximized"):
+            window.showMaximized()
+        else:
+            window.show()
+        frame_state = {}
+        def sync_frame(*_):
+            key = (int(window.winId()), studio._dark(), tuple(sorted(studio._colors().items())))
+            if frame_state.get("key") != key:
+                frame_state["key"] = key
+                native_frame.apply(window, key[1], studio._colors())
+        if sys.platform == "win32":
+            studio.changed.connect(sync_frame)
+            window.visibilityChanged.connect(lambda *_: QTimer.singleShot(0, sync_frame))
+            sync_frame()
         engines.append(engine)
         studios.append(studio)
         if args.smoke:

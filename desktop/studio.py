@@ -3,6 +3,7 @@ from __future__ import annotations
 import base64
 import concurrent.futures
 import copy
+import http.client
 import json
 import ipaddress
 import math
@@ -10,6 +11,7 @@ import mimetypes
 import os
 import shutil
 import socket
+import ssl
 import subprocess
 import sys
 import tempfile
@@ -24,12 +26,46 @@ from theme import detect_system_dark, read_system_palette, system_palette_paths,
 from fonts import FontStore
 from python_outputs import PythonOutputs
 import updates
+import python_runtime
 
 ROOT = Path(sys._MEIPASS)/"resources" if getattr(sys,"frozen",False) else Path(__file__).resolve().parent.parent
 DEFAULT_PDF = {"pageSize": "a4", "margin": 18, "fontSize": 10, "lineHeight": 1.45, "paragraphSpacing": 1.2, "fontFamily": "Manrope", "pageNumbers": True, "themed": False}
-DEFAULTS = {"theme": "system", "fullTheme": "black", "motion": True, "font": "Manrope", "size": 18, "width": 0, "widthPercent":80, "lineHeight":1.65, "autosave":True, "normalZoom": 100, "fullZoom": 100, "python": (shutil.which("python3") or shutil.which("python") or "") if getattr(sys,"frozen",False) else sys.executable, "pdf": DEFAULT_PDF, "welcomed": False}
-DEFAULTS.update(spellCheck=False, grammarCheck=False, readingMode="live", newNoteLocation="", accent="system", checkUpdates=True, autoUpdate=False)
+DEFAULTS = {"theme": "system", "fullTheme": "black", "motion": True, "font": "Manrope", "size": 18, "width": 0, "widthPercent":80, "lineHeight":1.65, "autosave":True, "normalZoom": 100, "fullZoom": 100, "python": "", "pdf": DEFAULT_PDF, "welcomed": False}
+DEFAULTS.update(window={"width":1320,"height":880,"maximized":False}, spellCheck=False, grammarCheck=False, readingMode="live", newNoteLocation="", accent="system", checkUpdates=True, autoUpdate=False)
 SAMPLE = """# A place to think\n\nWrite in Markdown. Read without distractions.\n\n> [!tip] Start with your notes\n> Open any note or folder. No vault, no import process.\n\n## Learn by exploring\n\n$$E = mc^2$$\n\n> [!answer]- Why does this matter?\n> Tap the heading to reveal an answer, then hide it to test yourself.\n\n```smd-chart\n{\"title\":\"A changing wave\",\"series\":[{\"name\":\"Sine\",\"expression\":\"sin(a*x)\",\"color\":\"#386a57\"},{\"name\":\"Cosine\",\"expression\":\"cos(a*x)\",\"color\":\"#bc6750\"}],\"sliders\":[{\"name\":\"a\",\"min\":0.2,\"max\":3,\"value\":1}]}\n```\n\n## Matplotlib in three dimensions\n\nRun a Python cell to generate a 3D figure, then save it in your note or PDF.\n\n```python\nimport numpy as np\nimport matplotlib.pyplot as plt\nx, y = np.meshgrid(np.linspace(-2, 2, 32), np.linspace(-2, 2, 32))\nfig = plt.figure()\nax = fig.add_subplot(111, projection=\"3d\")\nax.plot_surface(x, y, x*x + y*y, cmap=\"viridis\")\n```\n\n[Back to exploring](#learn-by-exploring)\n"""
+
+def public_address(url: str) -> str:
+    """Resolve once and return a global IP for the URL's host, or refuse."""
+    parsed = urllib.parse.urlparse(url)
+    if parsed.scheme not in ("http","https") or not parsed.hostname or parsed.username or parsed.password:
+        raise ValueError("Use a public web URL")
+    addresses = socket.getaddrinfo(parsed.hostname,parsed.port or (443 if parsed.scheme=="https" else 80),type=socket.SOCK_STREAM)
+    if not addresses or any(not ipaddress.ip_address(address[4][0]).is_global for address in addresses):
+        raise ValueError("Private, local and reserved network addresses are not allowed")
+    return addresses[0][4][0]
+
+class _PinnedHTTPConnection(http.client.HTTPConnection):
+    def __init__(self, host, *args, pinned="", **kwargs):
+        super().__init__(host, *args, **kwargs); self.pinned = pinned
+    def connect(self):
+        self.sock = socket.create_connection((self.pinned, self.port), self.timeout)
+
+class _PinnedHTTPSConnection(http.client.HTTPSConnection):
+    def __init__(self, host, *args, pinned="", **kwargs):
+        super().__init__(host, *args, **kwargs); self.pinned = pinned
+    def connect(self):
+        # TLS still verifies the certificate against the requested hostname.
+        self.sock = self._context.wrap_socket(socket.create_connection((self.pinned, self.port), self.timeout), server_hostname=self.host)
+
+class PinnedHTTPHandler(urllib.request.HTTPHandler):
+    def http_open(self, request):
+        pinned = public_address(request.full_url)
+        return self.do_open(lambda host, **kwargs: _PinnedHTTPConnection(host, pinned=pinned, **kwargs), request)
+
+class PinnedHTTPSHandler(urllib.request.HTTPSHandler):
+    def https_open(self, request):
+        pinned = public_address(request.full_url)
+        return self.do_open(lambda host, **kwargs: _PinnedHTTPSConnection(host, pinned=pinned, **kwargs), request, context=ssl.create_default_context())
 
 def local_path(value: str) -> Path:
     url = QUrl(value)
@@ -82,6 +118,7 @@ class Studio(QObject):
     fontPickerRequested = Signal()
     noteLocationPickerRequested = Signal()
     flushFailed = Signal(bool)
+    pythonProgress = Signal(str)
 
     def __init__(self, isolated: bool = False, session: Session | None = None):
         super().__init__()
@@ -102,6 +139,11 @@ class Studio(QObject):
         self.update_info=None
         self.update_path=""
         self.update_running=False
+        self.python_status=""
+        self.python_choices=[]
+        self.python_busy=False
+        self.pythonProgress.connect(self._python_progress)
+        if not self.settings.get("python"): QTimer.singleShot(0,self._choose_default_python)
         if not isolated and len(self.session.windows)==1:QTimer.singleShot(6000,lambda:self.checkUpdates(True) if self.settings.get("checkUpdates") and not self.retired else None)
         self.tabs: list[dict] = []
         self.closed_tabs: list[dict] = []
@@ -194,12 +236,26 @@ class Studio(QObject):
             colors = self._colors()
             self.readerLoad.emit(json.dumps({"id": tab["id"], "content": tab["content"], "path": tab["path"] or tab["id"], "mode": self.mode, "dark": self._dark(), "fullscreen": self.fullscreen, "font": self.settings["font"], "size": self.settings["size"], "widthPercent": self.settings["widthPercent"], "lineHeight":self.settings["lineHeight"], "spellCheck":self.settings["spellCheck"], "grammarCheck":self.settings["grammarCheck"], "zoom": self.settings["fullZoom" if self.fullscreen else "normalZoom"], "motion": self.settings["motion"], "python": self.settings["python"], "colors": colors, "viewState": tab.pop("viewState", None)}))
 
-    def _dark(self):
+    def _tokens(self):
+        # Scheme generation is costly and QML reads colors from many bindings.
         theme = self.settings["fullTheme" if self.fullscreen else "theme"]
-        return tokens(theme,self.system_dark,self.system_colors,self.system_mode,self.settings["accent"])[0]
+        key = (theme,self.system_dark,json.dumps(self.system_colors,sort_keys=True),self.system_mode,self.settings["accent"])
+        if getattr(self,"_token_key",None) != key:
+            self._token_key = key
+            self._token_value = tokens(theme,self.system_dark,self.system_colors,self.system_mode,self.settings["accent"])
+        return self._token_value
+
+    def _dark(self):
+        return self._tokens()[0]
 
     def _colors(self):
-        return tokens(self.settings["fullTheme" if self.fullscreen else "theme"],self.system_dark,self.system_colors,self.system_mode,self.settings["accent"])[1]
+        return dict(self._tokens()[1])
+
+    @Property("QVariantMap", notify=changed)
+    def palette(self): return self._colors()
+
+    @Property(bool, notify=changed)
+    def motionEnabled(self): return bool(self.settings["motion"])
 
     def _watch_notes(self,force=False):
         paths=tuple(sorted({tab["path"] for tab in self.tabs if tab["path"]}))
@@ -347,6 +403,80 @@ class Studio(QObject):
                 except RuntimeError:pass
             if self.settings.get("autoUpdate"):self.downloadUpdate()
         self._submit(lambda:updates.release_info(updates.bounded_json(updates.API),self.appVersion),done,False)
+
+    @Property(str,notify=changed)
+    def pythonStatus(self): return self.python_status
+
+    @Property(str,notify=changed)
+    def pythonChoices(self): return json.dumps(self.python_choices)
+
+    @Property(bool,notify=changed)
+    def pythonBusy(self): return self.python_busy
+
+    @Property(bool,constant=True)
+    def pythonBundled(self): return python_runtime.bundled_available()
+
+    def _python_folders(self):
+        return [p for p in [self.folder, *(str(Path(t["path"]).parent) for t in self.tabs if t.get("path"))] if p]
+
+    def _choose_default_python(self):
+        managed = self.data/"python-env"
+        def done(path,error):
+            if path and not self.settings.get("python"):
+                self.settings["python"] = path
+                self._preferences()
+            self._emit(False)
+        self._submit(lambda: python_runtime.preferred(managed), done, False)
+
+    @Slot(str)
+    def _python_progress(self, text):
+        self.python_status = text
+        self._emit(False)
+
+    @Slot()
+    def refreshPython(self):
+        if self.python_busy: return
+        self.python_busy = True
+        self.python_status = "Looking for Python installations"
+        self._emit(False)
+        def done(choices,error):
+            self.python_busy = False
+            self.python_choices = choices or []
+            if error: self.python_status = error
+            elif not self.python_choices: self.python_status = "No Python found. Use Set up Python to create one, or install Python 3."
+            elif not any(c["matplotlib"] for c in self.python_choices): self.python_status = "Python found, but matplotlib is missing. Set up Python installs it in a private environment."
+            else: self.python_status = ""
+            self._emit(False)
+        self._submit(lambda: python_runtime.discover(self.data/"python-env", self._python_folders()), done, False)
+
+    @Slot()
+    def setupPython(self):
+        if self.python_busy: return
+        self.python_busy = True
+        self.python_status = "Preparing Python setup"
+        self._emit(False)
+        def done(path,error):
+            self.python_busy = False
+            if error:
+                self.python_status = error
+                self._emit(False)
+                return
+            self.settings["python"] = path
+            self._preferences()
+            self.python_status = "Python with numpy and matplotlib is ready"
+            self._emit()
+            self.python_busy = False
+            self.refreshPython()
+            self.python_status = "Python with numpy and matplotlib is ready"
+        self._submit(lambda: python_runtime.setup_environment(self.data/"python-env", self.pythonProgress.emit), done, False)
+
+    @Slot(int, int, bool)
+    def rememberWindow(self, width, height, maximized):
+        # Reopen at the size people left, not a fixed default every launch.
+        value = {"width": max(760, min(10000, int(width))), "height": max(520, min(10000, int(height))), "maximized": bool(maximized)}
+        if self.settings.get("window") != value:
+            self.settings["window"] = value
+            self._preferences()
 
     @Slot()
     def installUpdate(self):
@@ -685,8 +815,14 @@ class Studio(QObject):
         if key=="accent" and value not in ("system","blue","green","violet","rose","amber"):return
         if key in ("motion","welcomed","autosave","checkUpdates","autoUpdate","spellCheck","grammarCheck") and not isinstance(value,bool): return
         if key in ("font","python") and (not isinstance(value,str) or not value.strip() or len(value)>2048): return
+        if key == "python":
+            try: value = python_runtime.validate(value.strip())
+            except ValueError as error:
+                self.python_status = str(error); self._emit(False); return
+            self.python_status = ""
         if key in ("size","width","widthPercent","lineHeight","normalZoom","fullZoom") and (not isinstance(value,(int,float)) or isinstance(value,bool) or not math.isfinite(value)): return
         if key == "pdf" and (not isinstance(value,dict) or set(value) != set(DEFAULT_PDF)): return
+        if key == "window": return  # Only rememberWindow writes window geometry.
         if key == "size": value = max(6, min(32, float(value)))
         if key == "width": value = max(0, min(5000, int(value)))
         if key == "widthPercent": value = max(50,min(100,float(value)))
@@ -968,7 +1104,7 @@ class Studio(QObject):
                         captured["assets"][name] = image["data"]
                         results.append({"source":name,"alt":Path(image["name"]).stem})
                     return results
-                if command == "run_python": return self._python(python, args["code"])
+                if command == "run_python": return self._python(python, args["code"], str(Path(captured["path"]).parent) if captured.get("path") else None)
                 if command == "export_markdown_native":
                     if not output or not isinstance(args["content"], str) or len(args["content"].encode()) > 20_000_000: raise ValueError("Choose a Markdown destination for a note under 20 MB")
                     atomic_write(Path(output), args["content"].encode())
@@ -1027,7 +1163,9 @@ class Studio(QObject):
             def redirect_request(self,request,fp,code,msg,headers,newurl):
                 owner._public_url(newurl)
                 return super().redirect_request(request,fp,code,msg,headers,newurl)
-        opener = urllib.request.build_opener(PublicRedirect())
+        # Connect to the exact address that was validated. Resolving again in
+        # the socket layer would allow DNS rebinding onto a private network.
+        opener = urllib.request.build_opener(urllib.request.ProxyHandler({}), PinnedHTTPHandler(), PinnedHTTPSHandler(), PublicRedirect())
         request = urllib.request.Request(url,headers={"User-Agent":"SuperMD/Qt"})
         with opener.open(request,timeout=20) as response:
             data = response.read((MAX_IMAGE if args.get("image") else 2_000_000)+1)
@@ -1040,12 +1178,7 @@ class Studio(QObject):
 
     @staticmethod
     def _public_url(url):
-        parsed = urllib.parse.urlparse(url)
-        if parsed.scheme not in ("http","https") or not parsed.hostname or parsed.username or parsed.password:
-            raise ValueError("Use a public web URL")
-        addresses = socket.getaddrinfo(parsed.hostname,parsed.port or (443 if parsed.scheme=="https" else 80),type=socket.SOCK_STREAM)
-        if not addresses or any(not ipaddress.ip_address(address[4][0]).is_global for address in addresses):
-            raise ValueError("Private, local and reserved network addresses are not allowed")
+        return public_address(url)
 
     def _engine(self):
         executable = "smd-engine.exe" if sys.platform == "win32" else "smd-engine"
@@ -1054,35 +1187,6 @@ class Studio(QObject):
             if path.is_file(): return path
         raise ValueError("Native PDF engine is not installed. Build smd-core's smd-engine binary.")
 
-    def _python(self, executable, code):
-        if len(code) > 200_000: raise ValueError("Python cell exceeds 200 KB")
+    def _python(self, executable, code, folder=None):
         # Explicit Run only. Python is trusted local code, not a sandbox.
-        wrapper = """import sys,json,io,base64,contextlib,traceback
-payload=json.load(sys.stdin)
-out=io.StringIO(); err=io.StringIO(); images=[]; ok=True
-try:
- import matplotlib
- matplotlib.use('Agg')
- import matplotlib.pyplot as plt
- with contextlib.redirect_stdout(out),contextlib.redirect_stderr(err):
-  exec(compile(payload['code'],'<Super MD cell>','exec'),{'__name__':'__main__'})
- for number in plt.get_fignums()[:16]:
-  data=io.BytesIO(); plt.figure(number).savefig(data,format='svg',bbox_inches='tight')
-  images.append('data:image/svg+xml;base64,'+base64.b64encode(data.getvalue()).decode())
- plt.close('all')
-except BaseException:
- ok=False; traceback.print_exc(file=err)
-print(json.dumps({'stdout':out.getvalue()[:200000],'stderr':err.getvalue()[:200000],'images':images,'ok':ok}))
-"""
-        if not executable:
-            raise ValueError("Choose a system Python or virtual environment in Settings first.")
-        environment = os.environ.copy()
-        if getattr(sys,"frozen",False) and sys.platform.startswith("linux"):
-            # An external interpreter must not load our embedded Python/Qt libraries.
-            if "LD_LIBRARY_PATH_ORIG" in environment:
-                environment["LD_LIBRARY_PATH"] = environment["LD_LIBRARY_PATH_ORIG"]
-            else:
-                environment.pop("LD_LIBRARY_PATH",None)
-        process = subprocess.run([executable,"-c",wrapper],input=json.dumps({"code":code}),text=True,capture_output=True,timeout=90,env=environment)
-        if process.returncode: raise ValueError(process.stderr[:2000])
-        return json.loads(process.stdout)
+        return python_runtime.run(executable or self.settings["python"], code, cwd=folder)

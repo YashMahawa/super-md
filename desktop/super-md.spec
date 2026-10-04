@@ -29,9 +29,26 @@ for package in ("PySide6", "PySide6_Essentials", "PySide6_Addons", "shiboken6", 
 if (root / "LICENSE").exists():
     data.append((str(root / "LICENSE"), "resources/licenses"))
 data += collect_data_files("PySide6", includes=["**/LICENSE*", "**/COPYING*", "**/licenses/**"])
+hidden = ["PySide6.QtWebEngineCore", "PySide6.QtWebChannel", "PySide6.QtNetwork"]
+if sys.platform in ("win32", "darwin"):
+    # Built-in Python for cells: most people on Windows and macOS have no Python.
+    # Ship numpy + matplotlib and the standard library cells commonly import.
+    skip = {"tkinter", "turtle", "turtledemo", "idlelib", "test", "lib2to3", "ensurepip", "venv", "pydoc_data",
+            "distutils", "msilib", "unittest", "this", "antigravity", "__phello__", "_tkinter", "curses", "_curses"}
+    hidden += [name for name in sorted(sys.stdlib_module_names) if name not in skip and not name.startswith("_")]
+    hidden += ["numpy", "matplotlib", "matplotlib.pyplot", "matplotlib.backends.backend_agg",
+               "matplotlib.backends.backend_svg", "mpl_toolkits.mplot3d"]
+    for package in ("matplotlib", "pillow", "contourpy", "cycler", "fonttools", "kiwisolver", "pyparsing", "python-dateutil", "packaging"):
+        try:
+            dist = distribution(package)
+        except Exception:
+            continue
+        for file in dist.files or []:
+            if "/licenses/" in str(file) or str(file).endswith(("LICENSE", "LICENSE.txt", "COPYING")):
+                data.append((str(dist.locate_file(file)), "resources/licenses/" + package))
 analysis = Analysis([str(root / "desktop/main.py")], pathex=[str(root / "desktop")],
     binaries=[(str(engine), "resources/desktop")], datas=data,
-    hiddenimports=["PySide6.QtWebEngineCore", "PySide6.QtWebChannel", "PySide6.QtNetwork"],
+    hiddenimports=hidden,
     excludes=["tkinter", "pytest", "unittest", "PyQt6", "PyQt5"], noarchive=False)
 pyz = PYZ(analysis.pure)
 exe = EXE(pyz, analysis.scripts, [], exclude_binaries=True, name="super-md",

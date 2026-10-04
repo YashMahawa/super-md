@@ -7,9 +7,11 @@ Pane {
     id: page
     required property var viewState
     signal back()
+    readonly property bool pythonReady: JSON.parse(studio.pythonChoices).some(choice => choice.matplotlib)
     function save(key, value) { studio.setting(key, JSON.stringify(value)) }
     padding: 0
     background: null
+    Component.onCompleted: studio.refreshPython()
     ColumnLayout {
         anchors.fill: parent
         anchors.margins: 28
@@ -61,9 +63,52 @@ Pane {
                 Switch { text: "Grammar check"; checked: viewState.settings.grammarCheck; onToggled: page.save("grammarCheck", checked) }
                 Label { text: "Offline English suggestions in Source and Live editing. Grammar checks repeated words and a/an. Code, links and LaTeX are excluded; no text is uploaded or automatically replaced."; Layout.fillWidth: true; wrapMode: Text.WordWrap; color: viewState.colors.muted }
                 Label { text: "Python"; font.pixelSize: 22; font.weight: Font.DemiBold; Layout.topMargin: 12 }
-                Label { text: "Interpreter or virtual environment Python executable" }
-                TextField { Layout.fillWidth: true; text: viewState.settings.python; selectByMouse: true; onEditingFinished: page.save("python", text) }
-                Label { text: "Code runs only when you press Run. Use a Python environment with matplotlib installed. Local Python code is not sandboxed."; Layout.fillWidth: true; wrapMode: Text.WordWrap; color: viewState.colors.muted }
+                Label { text: "Code runs only when you press Run. Pick where it runs; numpy and matplotlib are needed for plots."; wrapMode: Text.WordWrap; Layout.fillWidth: true; color: viewState.colors.muted }
+                Repeater {
+                    id: pythonChoices
+                    objectName: "pythonChoices"
+                    model: JSON.parse(studio.pythonChoices)
+                    delegate: ItemDelegate {
+                        id: choice
+                        required property var modelData
+                        readonly property bool current: modelData.path === viewState.settings.python
+                        Layout.fillWidth: true
+                        implicitHeight: 64
+                        leftPadding: 16
+                        rightPadding: 16
+                        Accessible.name: modelData.label + ", " + modelData.detail
+                        background: Rectangle {
+                            radius: choice.current ? 20 : 14
+                            color: choice.current ? viewState.colors["primary-container"] : viewState.colors["surface-high"]
+                            border.width: choice.visualFocus ? 2 : 0
+                            border.color: viewState.colors.primary
+                            Behavior on radius { enabled: viewState.settings.motion; NumberAnimation { duration: 160; easing.type: Easing.OutCubic } }
+                            Rectangle { anchors.fill: parent; radius: parent.radius; color: viewState.colors.text; opacity: choice.down ? .1 : choice.hovered ? .05 : 0 }
+                        }
+                        contentItem: RowLayout {
+                            spacing: 14
+                            ToolButton { enabled: false; focusPolicy: Qt.NoFocus; padding: 0; background: null; icon.source: "../icons/" + (choice.current ? "CheckCircle" : (choice.modelData.matplotlib ? "Code" : "Warning")) + ".svg"; icon.color: choice.current ? viewState.colors["on-primary-container"] : viewState.colors.muted; icon.width: 22; icon.height: 22; Layout.preferredWidth: 28; Layout.preferredHeight: 28 }
+                            ColumnLayout {
+                                spacing: 2
+                                Layout.fillWidth: true
+                                Label { text: choice.modelData.label; font.weight: Font.DemiBold; color: choice.current ? viewState.colors["on-primary-container"] : viewState.colors.text; elide: Text.ElideRight; Layout.fillWidth: true }
+                                Label { text: choice.modelData.detail; font.pixelSize: 12; color: choice.current ? viewState.colors["on-primary-container"] : viewState.colors.muted; elide: Text.ElideMiddle; Layout.fillWidth: true }
+                            }
+                        }
+                        onClicked: page.save("python", modelData.path)
+                    }
+                }
+                Label { text: studio.pythonStatus; visible: text.length > 0; Layout.fillWidth: true; wrapMode: Text.WordWrap; color: viewState.colors.text }
+                ExpressiveLoading { visible: studio.pythonBusy; Layout.preferredWidth: 48; Layout.preferredHeight: 48 }
+                Flow {
+                    Layout.fillWidth: true
+                    spacing: 8
+                    ActionButton { objectName: "setupPython"; text: "Set up Python"; glyph: "DownloadSimple"; prominent: !page.pythonReady; tonal: page.pythonReady; enabled: !studio.pythonBusy; ToolTip.text: "Creates a private environment and installs numpy and matplotlib"; onClicked: studio.setupPython() }
+                    ActionButton { text: "Scan again"; glyph: "ArrowClockwise"; tonal: true; enabled: !studio.pythonBusy; onClicked: studio.refreshPython() }
+                }
+                Label { text: "Custom interpreter path"; Layout.topMargin: 4 }
+                TextField { objectName: "pythonPath"; Layout.fillWidth: true; text: viewState.settings.python === "bundled" ? "" : viewState.settings.python; placeholderText: studio.pythonBundled ? "Using built-in Python" : "/path/to/venv/bin/python"; selectByMouse: true; onEditingFinished: if (text.trim().length && text.trim() !== viewState.settings.python) page.save("python", text.trim()) }
+                Label { text: "Local Python is not sandboxed. Only run cells from notes you trust."; Layout.fillWidth: true; wrapMode: Text.WordWrap; color: viewState.colors.muted }
                 Label { text: "About & updates"; font.pixelSize: 22; font.weight: Font.DemiBold; Layout.topMargin: 12 }
                 Label { text: "Super MD " + studio.appVersion + " · © Yash Mahawar · MIT License"; Layout.fillWidth: true; wrapMode: Text.WordWrap }
                 Switch { text: "Check for updates on opening"; checked: viewState.settings.checkUpdates; onToggled: page.save("checkUpdates", checked) }

@@ -7,7 +7,7 @@ Control {
     required property var choices
     required property string selected
     signal chosen(string key)
-    property var colors: JSON.parse(studio.snapshot).colors
+    property var colors: studio.palette
     padding: 4
     implicitHeight: 44
     implicitWidth: contentItem.implicitWidth + 8

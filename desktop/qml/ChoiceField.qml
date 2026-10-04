@@ -5,8 +5,8 @@ import QtQuick.Controls.Material
 // Skin the native ComboBox; keep its keyboard, type-ahead and accessibility behavior.
 ComboBox {
     id: control
-    property var colors: JSON.parse(studio.snapshot).colors
-    property bool motion: JSON.parse(studio.snapshot).settings.motion
+    property var colors: studio.palette
+    property bool motion: studio.motionEnabled
     // A menu is constrained by its actual scroll viewport, not the whole window.
     property Item viewportItem: null
     function positionChoices() {

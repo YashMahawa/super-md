@@ -13,7 +13,7 @@ ApplicationWindow {
     minimumWidth: 760
     minimumHeight: 520
     visible: false
-    flags: Qt.platform.os === "osx" || Qt.platform.os === "windows" ? Qt.Window | Qt.ExpandedClientAreaHint | Qt.NoTitleBarBackgroundHint : Qt.Window
+    flags: windowModes.immersive ? Qt.Window | Qt.FramelessWindowHint : Qt.platform.os === "osx" || Qt.platform.os === "windows" ? Qt.Window | Qt.ExpandedClientAreaHint | Qt.NoTitleBarBackgroundHint : Qt.Window
     title: viewState.name + " - Super MD"
     property var viewState: JSON.parse(studio.snapshot)
     property bool sidebar: true
@@ -43,7 +43,10 @@ ApplicationWindow {
     Material.foreground: viewState.colors["on-surface"]
     color: viewState.colors.surface
     font.family: "Noto Sans"
-    onClosing: function(close) { close.accepted = closingAllowed; if (!closingAllowed) studio.closeWindowSafely() }
+    onClosing: function(close) {
+        if (!windowModes.fullscreen) studio.rememberWindow(visibility === Window.Maximized ? viewState.settings.window.width : width, visibility === Window.Maximized ? viewState.settings.window.height : height, visibility === Window.Maximized)
+        close.accepted = closingAllowed; if (!closingAllowed) studio.closeWindowSafely()
+    }
 
     Connections {
         target: studio

@@ -3,7 +3,7 @@ import QtQuick.Controls
 
 ToolTip {
     id: tip
-    property var colors: JSON.parse(studio.snapshot).colors
+    property var colors: studio.palette
     delay: 550
     timeout: 7000
     padding: 10

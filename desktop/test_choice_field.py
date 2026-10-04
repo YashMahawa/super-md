@@ -19,6 +19,10 @@ class Palette(QObject):
             "text": "#201a17", "primary": "#8c4b2b", "surface": "#fff8f5", "surface-high": "#f6e6de",
             "surface-low": "#fff1eb", "outline": "#88756b", "muted": "#786a62",
             "primary-container": "#ffdbca", "on-primary-container": "#351000"}})
+    @Property("QVariantMap", constant=True)
+    def palette(self): return json.loads(self.snapshot)["colors"]
+    @Property(bool, constant=True)
+    def motionEnabled(self): return json.loads(self.snapshot)["settings"]["motion"]
 
 
 class ChoiceFieldTest(unittest.TestCase):
