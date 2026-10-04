@@ -34,9 +34,9 @@ if sys.platform in ("win32", "darwin"):
     # Built-in Python for cells: most people on Windows and macOS have no Python.
     # Ship numpy + matplotlib and the standard library cells commonly import.
     skip = {"tkinter", "turtle", "turtledemo", "idlelib", "test", "lib2to3", "ensurepip", "venv", "pydoc_data",
-            "distutils", "msilib", "unittest", "this", "antigravity", "__phello__", "_tkinter", "curses", "_curses"}
+            "distutils", "msilib", "this", "antigravity", "__phello__", "_tkinter", "curses", "_curses"}
     hidden += [name for name in sorted(sys.stdlib_module_names) if name not in skip and not name.startswith("_")]
-    hidden += ["numpy", "matplotlib", "matplotlib.pyplot", "matplotlib.backends.backend_agg",
+    hidden += ["__future__", "numpy", "matplotlib", "matplotlib.pyplot", "matplotlib.backends.backend_agg",
                "matplotlib.backends.backend_svg", "mpl_toolkits.mplot3d"]
     for package in ("matplotlib", "pillow", "contourpy", "cycler", "fonttools", "kiwisolver", "pyparsing", "python-dateutil", "packaging"):
         try:
@@ -46,10 +46,12 @@ if sys.platform in ("win32", "darwin"):
         for file in dist.files or []:
             if "/licenses/" in str(file) or str(file).endswith(("LICENSE", "LICENSE.txt", "COPYING")):
                 data.append((str(dist.locate_file(file)), "resources/licenses/" + package))
+# matplotlib imports unittest (via its testing helpers), so only Linux drops it.
+excluded = ["tkinter", "pytest", "PyQt6", "PyQt5"] + (["unittest"] if sys.platform not in ("win32", "darwin") else [])
 analysis = Analysis([str(root / "desktop/main.py")], pathex=[str(root / "desktop")],
     binaries=[(str(engine), "resources/desktop")], datas=data,
     hiddenimports=hidden,
-    excludes=["tkinter", "pytest", "unittest", "PyQt6", "PyQt5"], noarchive=False)
+    excludes=excluded, noarchive=False)
 pyz = PYZ(analysis.pure)
 exe = EXE(pyz, analysis.scripts, [], exclude_binaries=True, name="super-md",
           debug=False, strip=False, upx=False, console=sys.platform.startswith("linux"),
