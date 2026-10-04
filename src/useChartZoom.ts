@@ -105,5 +105,9 @@ export function useChartZoom(source: string) {
       element.removeEventListener("wheel", wheel); window.removeEventListener("supermd-chart-native-zoom", native);
     };
   }, [source]);
-  return {host, zoom, center, change};
+  const reset = () => {
+    const origin={x:0,y:0};centerRef.current=origin;setCenter(origin);remember(chartCenters,source,origin);
+    value.current=1;setZoom(1);remember(chartZooms,source,1);
+  };
+  return {host, zoom, center, change, reset};
 }

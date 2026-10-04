@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState } from "react";
-import { imageMarkdown, imageRanges, importImageFiles, importImageUrl, linkDetails, markdownLabel, type ImportedImage, type LinkDetails } from "../documentMedia";
+import { imageMarkdown, imageRanges, importImageFiles, importImageUrl, linkDetails, markdownLabel, safeHostname, type ImportedImage, type LinkDetails } from "../documentMedia";
 import { invoke } from "../nativeBridge";
 
 export interface InsertionPoint { from: number; to: number }
@@ -74,7 +74,7 @@ export default function MediaTools({ documentId, content, documentPath, onInsert
   }, [documentId]);
   useEffect(() => { setFetching(false); if (!open || imageMode || !/^https?:\/\/\S+$/.test(url)) return;
     let active = true; setFetching(true); setDetails(null);
-    const timer = setTimeout(() => { void linkDetails(url).then((info) => { if (active) setDetails(info); }).catch((e) => { if (active) { setDetails({ url, title: new URL(url).hostname }); setError(`Title unavailable; you can still insert the link. ${e}`); } }).finally(() => { if (active) setFetching(false); }); }, 300);
+    const timer = setTimeout(() => { void linkDetails(url).then((info) => { if (active) setDetails(info); }).catch((e) => { if (active) { setDetails({ url, title: safeHostname(url) }); setError(`Title unavailable; you can still insert the link. ${e}`); } }).finally(() => { if (active) setFetching(false); }); }, 300);
     return () => { active = false; clearTimeout(timer); };
   }, [open, url, imageMode]);
   useEffect(()=> {
@@ -92,7 +92,7 @@ export default function MediaTools({ documentId, content, documentPath, onInsert
     try {
       let text: string;
       if (imageMode) text = (replacement ? "" : "\n\n") + imageMarkdown(await importImageUrl(url)) + (replacement ? "" : "\n");
-      else { const info = details || { url, title: new URL(url).hostname }; text = `[${markdownLabel(info.title)}](<${info.url.replace(/>/g, "%3E")}>)`; if (thumbnail && info.thumbnail) text += "\n\n" + imageMarkdown(await importImageUrl(info.thumbnail)); }
+      else { const info = details || { url, title: safeHostname(url) }; text = `[${markdownLabel(info.title)}](<${info.url.replace(/>/g, "%3E")}>)`; if (thumbnail && info.thumbnail) text += "\n\n" + imageMarkdown(await importImageUrl(info.thumbnail)); }
       if (mounted.current) {
         if (replacement && reference.current.content !== targetSource.current) throw new Error("The note changed while importing. Select the image again to replace it safely.");
         onInsert(text, point); setOpen(false);

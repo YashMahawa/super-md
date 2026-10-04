@@ -175,6 +175,21 @@ private object NoMotionScheme : MotionScheme {
     DisposableEffect(Unit){onDispose{chromeTapJob[0]?.cancel()}}
     var web by remember { mutableStateOf<WebView?>(null) }
     var chromeHeight by remember { mutableIntStateOf(0) }
+    val readerNote = remember { arrayOfNulls<String>(1) }
+    // Battery: a backgrounded WebView otherwise keeps JS timers, animation
+    // frames and compositor work alive. Pause it once hidden (not on multi-window pause).
+    val lifecycleOwner = androidx.lifecycle.compose.LocalLifecycleOwner.current
+    DisposableEffect(lifecycleOwner, web) {
+        val observer = androidx.lifecycle.LifecycleEventObserver { _, event ->
+            when (event) {
+                androidx.lifecycle.Lifecycle.Event.ON_STOP -> web?.let { it.onPause(); it.pauseTimers() }
+                androidx.lifecycle.Lifecycle.Event.ON_START -> web?.let { it.resumeTimers(); it.onResume() }
+                else -> Unit
+            }
+        }
+        lifecycleOwner.lifecycle.addObserver(observer)
+        onDispose { lifecycleOwner.lifecycle.removeObserver(observer) }
+    }
     DisposableEffect(activity, web) {
         activity.dismissDocument = { web?.evaluateJavascript("window.supermdDismiss?.() || false") { dismissed -> if (dismissed != "true") model.fullscreen(false) } ?: model.fullscreen(false) }
         onDispose { activity.dismissDocument = null }
@@ -224,10 +239,12 @@ private object NoMotionScheme : MotionScheme {
         val wide = displayIsLarge && maxWidth >= 720.dp && maxHeight >= 400.dp
         val actualMode = if (!wide && state.mode == "split") "live" else state.mode
         LaunchedEffect(readerReady, state.active, actualMode, dark, state.fullscreen, state.font, state.size, state.widthPercent,state.lineHeight,state.spellCheck,state.grammarCheck,tokens, hinge, motion) {
+            if (!readerReady) readerNote[0] = null
             if (readerReady) {
                 val note = state.active
-                val payload = JSONObject().put("id", note.id).put("content", note.content).put("path", note.uri ?: note.id).put("mode", actualMode).put("dark", dark).put("fullscreen", state.fullscreen).put("font", state.font).put("size", state.size).put("widthPercent",state.widthPercent).put("lineHeight",state.lineHeight).put("spellCheck",state.spellCheck).put("grammarCheck",state.grammarCheck).put("colors", tokens).put("zoom", state.zoom).put("motion", motion)
+                val payload = JSONObject().put("id", note.id).apply { if (readerNote[0] == note.id && model.readerEcho[note.id] === note.content) put("contentUnchanged", true) else put("content", note.content) }.put("path", note.uri ?: note.id).put("mode", actualMode).put("dark", dark).put("fullscreen", state.fullscreen).put("font", state.font).put("size", state.size).put("widthPercent",state.widthPercent).put("lineHeight",state.lineHeight).put("spellCheck",state.spellCheck).put("grammarCheck",state.grammarCheck).put("colors", tokens).put("zoom", state.zoom).put("motion", motion)
                 web?.evaluateJavascript("document.documentElement.dataset.platform='android';window.supermdLoad?.($payload)", null)
+                readerNote[0] = note.id
                 val hingeGap = if (hinge != null && actualMode == "split") hinge!!.bounds.width() / density.density else 0f
                 web?.evaluateJavascript("document.querySelector('.android-document')?.style.setProperty('gap','${hingeGap}px')", null)
             }
@@ -242,6 +259,12 @@ private object NoMotionScheme : MotionScheme {
             animationSpec=tween(if(motion) 120 else 0),label="Reading chrome")
         LaunchedEffect(readerReady,chromeHeight) {
             if(readerReady) web?.evaluateJavascript("window.supermdChromeInset?.(${chromeHeight/density.density})",null)
+        }
+        // Reader overlays (search, repair) hide the top bar and system bars, so
+        // they anchor to the cutout-safe top edge, not the hidden chrome height.
+        val safeTop = WindowInsets.displayCutout.getTop(density) / density.density
+        LaunchedEffect(readerReady,safeTop) {
+            if(readerReady) web?.evaluateJavascript("document.documentElement.style.setProperty('--native-safe-top','${safeTop}px')",null)
         }
         if(contentsShown) AlertDialog(onDismissRequest={contentsShown=false},title={Text("Contents")},text={OutlinePanel(headings,state.active.id){heading->readingChromeVisible=false;web?.evaluateJavascript("window.supermdHeading?.(${JSONObject.quote(heading.id)},${heading.offset})",null);contentsShown=false}},confirmButton={TextButton(onClick={contentsShown=false}){Text("Close")}})
         // Closed-drawer drag recognition steals diagonal scrolls and pinch

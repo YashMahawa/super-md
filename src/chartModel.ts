@@ -54,3 +54,62 @@ export function lineSegments(points:Array<[number,number]>,span:number):Array<Ar
   }
   end(); return segments;
 }
+
+export type Sample = [number, number];
+export type Curve = (x:number)=>number;
+export type ChartFeature = {x:number;y:number;kind:"root"|"maximum"|"minimum"|"intersection";series:number;other?:number};
+
+/** A throwing or non-finite evaluation is a gap in the curve, never a crash. */
+export function safeCurve(evaluate:((scope:Record<string,number>)=>number)|null, scope:Record<string,number>):Curve|null {
+  if(!evaluate)return null;
+  return (x:number)=>{try{const y=evaluate({...scope,x});return typeof y==="number"&&Number.isFinite(y)?y:Number.NaN;}catch{return Number.NaN;}};
+}
+
+const bisect=(f:Curve,a:number,b:number)=>{
+  let fa=f(a);
+  for(let i=0;i<48;i++){const m=(a+b)/2,fm=f(m);if(!Number.isFinite(fm))return Number.NaN;if(fm===0)return m;if((fa<0)===(fm<0)){a=m;fa=fm;}else b=m;}
+  return (a+b)/2;
+};
+const golden=(f:Curve,a:number,b:number,maximum:boolean)=>{
+  const g=(Math.sqrt(5)-1)/2,score=(x:number)=>maximum?f(x):-f(x);
+  let c=b-g*(b-a),d=a+g*(b-a);
+  for(let i=0;i<40;i++){if(score(c)>score(d))b=d;else a=c;c=b-g*(b-a);d=a+g*(b-a);}
+  return (a+b)/2;
+};
+
+/** Roots, turning points and intersections that a probe can lock onto (GeoGebra style). */
+export function chartFeatures(samples:Sample[][], curves:Array<Curve|null>, span:number):ChartFeature[] {
+  const features:ChartFeature[]=[];
+  const jump=(a:number,b:number)=>Math.abs(a-b)>span*4;
+  samples.forEach((points,series)=>{
+    const f=curves[series];
+    for(let i=1;i<points.length&&features.length<400;i++){
+      const [x0,y0]=points[i-1],[x1,y1]=points[i];
+      if(!Number.isFinite(y0)||!Number.isFinite(y1)||jump(y0,y1))continue;
+      if(y0===0)features.push({x:x0,y:0,kind:"root",series});
+      else if(y0<0!==y1<0&&y1!==0){const x=f?bisect(f,x0,x1):x0-y0*(x1-x0)/(y1-y0);if(Number.isFinite(x))features.push({x,y:0,kind:"root",series});}
+      if(i+1<points.length&&f){
+        const y2=points[i+1][1];
+        if(!Number.isFinite(y2)||jump(y1,y2))continue;
+        const maximum=y1>y0&&y1>=y2,minimum=y1<y0&&y1<=y2;
+        if(maximum||minimum){const x=golden(f,x0,points[i+1][0],maximum),y=f(x);if(Number.isFinite(y))features.push({x,y,kind:maximum?"maximum":"minimum",series});}
+      }
+    }
+  });
+  for(let a=0;a<samples.length;a++)for(let b=a+1;b<samples.length;b++){
+    const fa=curves[a],fb=curves[b];if(!fa||!fb)continue;
+    const difference=(x:number)=>fa(x)-fb(x),points=samples[a];
+    for(let i=1;i<points.length&&features.length<600;i++){
+      const x0=points[i-1][0],x1=points[i][0],d0=difference(x0),d1=difference(x1);
+      if(!Number.isFinite(d0)||!Number.isFinite(d1)||jump(d0,d1))continue;
+      if(d0<0!==d1<0&&d1!==0){const x=bisect(difference,x0,x1),y=fa(x);if(Number.isFinite(y))features.push({x,y,kind:"intersection",series:a,other:b});}
+    }
+  }
+  return features;
+}
+
+export function seriesLabel(series:{name?:string;expression?:string;points?:unknown}, index:number):string {
+  if(series.name)return series.name;
+  if(series.expression)return `y = ${series.expression.replace(/\bMath\./g,"").replace(/\*\*/g,"^").replace(/\s*\*\s*/g,"·")}`;
+  return `Series ${index+1}`;
+}

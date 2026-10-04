@@ -4,6 +4,9 @@ import { pythonResults, remember, retainVisiblePython,storePythonOutput,loadPyth
 import type { PythonResult } from "../types";
 import CopyCode from "./CopyCode";
 
+// Figures come from local processes or caches: accept only bounded SVG/PNG/JPEG data.
+const safeFigure = (image: unknown): image is string => typeof image === "string" && image.length <= 12_000_000 && /^data:image\/(?:svg\+xml|png|jpeg);base64,[A-Za-z0-9+/]+=*$/.test(image.slice(0, 64) + (image.length > 64 ? image.slice(-8) : ""));
+
 export default function PythonCell({ source, python, highlighted }: { source: string; python: string; highlighted?: ReactNode }) {
   const [result, setResult] = useState<PythonResult | null>(() => pythonResults.get(source) || null);
   const [running, setRunning] = useState(false);
@@ -32,12 +35,12 @@ export default function PythonCell({ source, python, highlighted }: { source: st
   const stale = Boolean(result && executedSource.current !== source);
   return (
     <div ref={cell} className="python-cell" data-output-pinned={!!result&&!stored||running}>
-      <div className="cell-toolbar"><span>Python {stale && <small className="stale-badge">Output from earlier code</small>}</span><CopyCode source={source}/><button onClick={run} disabled={running || !python}>{running ? "Running…" : stale ? "Run updated code" : "Run"}</button></div>
+      <div className="cell-toolbar"><span>Python {stale && <small className="stale-badge">Output from earlier code</small>}</span><CopyCode source={source}/><button onClick={run} disabled={running}>{running ? "Running…" : stale ? "Run updated code" : "Run"}</button></div>
       <pre className="python-source" aria-label="Python source"><code className="language-python">{highlighted ?? source}</code></pre>
       {result && <div className={`cell-output ${result.ok ? "" : "failed"} ${stale ? "stale" : ""}`}>
         {result.stdout && <pre>{result.stdout}</pre>}
         {result.stderr && <pre>{result.stderr}</pre>}
-        {result.images.map((image, index) => <img key={index} src={image} alt={`Python figure ${index + 1}`} />)}
+        {result.images.filter(safeFigure).slice(0, 16).map((image, index) => <img key={index} src={image} alt={`Python figure ${index + 1}`} />)}
       </div>}
     </div>
   );

@@ -54,7 +54,8 @@ export async function preparePdf(markdown: string, documentPath: string | null) 
           graph.setAttribute("xmlns", "http://www.w3.org/2000/svg");
           graph.querySelectorAll(".chart-axis").forEach((axis) => axis.setAttribute("stroke", "#667085"));
           graph.querySelectorAll(".chart-grid").forEach((axis) => axis.setAttribute("stroke", "#d5dbe5"));
-          graph.querySelectorAll("text").forEach((text) => { text.setAttribute("fill", "#20252d"); text.setAttribute("font-size", "14"); });
+          graph.querySelectorAll("text:not(.chart-curve-label)").forEach((text) => { text.setAttribute("fill", "#20252d"); text.setAttribute("font-size", "14"); });
+          graph.querySelectorAll(".graph-probe-marker").forEach((marker) => marker.remove());
           const title = parsed.querySelector("figcaption")?.textContent;
           if(title) chartTitles.set(node,title);
           // The interactive HTML legend/controls aren't inside the plot SVG.
@@ -68,15 +69,16 @@ export async function preparePdf(markdown: string, documentPath: string | null) 
           };
           const wrap=(text:string)=>text.match(/.{1,85}(?:\s|$)|.{1,85}/g)||[text];
           for(const item of parsed.querySelectorAll(".chart-legend > span")) {
-            const label=(item.textContent||"").replace(/^\s*●\s*/,"").trim();
-            const color=item.querySelector("i")?.getAttribute("style")?.match(/color:\s*(#[a-f\d]{6})/i)?.[1]||"#6750a4";
+            const small=item.querySelector("small")?.textContent||"";
+            const label=(item.textContent||"").replace(small,small?` (${small})`:"").replace(/^\s*●\s*/,"").trim();
+            const color=(item.getAttribute("style")||item.querySelector("i")?.getAttribute("style"))?.match(/color:\s*(#[a-f\d]{6})/i)?.[1]||"#6750a4";
             const key=parsed.createElementNS("http://www.w3.org/2000/svg","line");
             for(const [name,value] of Object.entries({x1:"20",x2:"36",y1:String(cursor-5),y2:String(cursor-5),stroke:color,"stroke-width":"3"})) key.setAttribute(name,value);
             graph.append(key);
             for(const line of wrap(label)) {svgText(line.trim(),44,cursor);cursor+=18;}
           }
           const plotZoom=Number(parsed.querySelector(".interactive-chart")?.getAttribute("data-plot-zoom")||1);
-          const selected=[...Array.from(parsed.querySelectorAll(".chart-controls label")).map(label=>(label.textContent||"").trim()),`Plot zoom: ${Math.round(plotZoom*100)}%`].join(" · ");
+          const selected=[...Array.from(parsed.querySelectorAll(".chart-controls label")).map(label=>{const head=label.querySelector(".chart-slider-head");return head?`${head.firstElementChild?.textContent||""} = ${head.querySelector("output")?.textContent||""}`:(label.textContent||"").trim();}),`Plot zoom: ${Math.round(plotZoom*100)}%`].join(" · ");
           if(selected) for(const line of wrap(selected)) {svgText(line.trim(),20,cursor+4);cursor+=18;}
           graph.setAttribute("viewBox",`${box[0]} ${box[1]} ${box[2]} ${cursor+10}`);
           return new XMLSerializer().serializeToString(graph);

@@ -29,7 +29,15 @@ export function settleDocumentZoom(root:HTMLElement):void {
 }
 /** Layout at the user's base reading width, then magnify the whole page. Font,
  * math, tables and wrapping stay in the same relative positions as in a PDF. */
-export function applyDocumentZoom(root:HTMLElement, zoom:number, widthPercent:number, focus?:Point, previousFocus=focus):void {
+/** The unscaled page coordinate under a viewport point. A glide holds this
+ * fixed across frames, so clamped intermediate scrolls cannot accumulate drift. */
+export function documentPoint(root:HTMLElement, focus?:Point):Point|null {
+  const measured=geometry.get(root);if(!measured)return null;
+  const scale=Number(measured.page.dataset.scale)||1,bounds=measured.bounds;
+  const target=focus||{x:bounds.left+bounds.width/2,y:bounds.top+(root.scrollTop<1?0:bounds.height*.35)};
+  return {x:(target.x-measured.originX-measured.left+root.scrollLeft)/scale,y:(target.y-measured.originY+root.scrollTop)/scale};
+}
+export function applyDocumentZoom(root:HTMLElement, zoom:number, widthPercent:number, focus?:Point, previousFocus=focus, anchor?:Point|null):void {
   let measured=geometry.get(root);
   if(!measured){
     const page=root.querySelector<HTMLElement>(".document-page");if(!page)return;
@@ -41,7 +49,7 @@ export function applyDocumentZoom(root:HTMLElement, zoom:number, widthPercent:nu
   const target=focus||{x:bounds.left+bounds.width/2,y:bounds.top+(root.scrollTop<1?0:bounds.height*.35)};
   const oldFocus=previousFocus||target;
   const oldScale=Number(page.dataset.scale)||1,next=zoom/100;
-  const point={x:(oldFocus.x-measured.originX-measured.left+root.scrollLeft)/oldScale,y:(oldFocus.y-measured.originY+root.scrollTop)/oldScale};
+  const point=anchor||{x:(oldFocus.x-measured.originX-measured.left+root.scrollLeft)/oldScale,y:(oldFocus.y-measured.originY+root.scrollTop)/oldScale};
   const width=Math.max(240,(viewport-32)*widthPercent/100);
   // A compositor transform keeps KaTeX/layout out of each pinch frame. CSS
   // zoom invalidates layout throughout a long document even with fixed wraps.

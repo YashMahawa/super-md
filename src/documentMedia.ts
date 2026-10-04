@@ -26,6 +26,9 @@ export function imageRanges(markdown: string): ImageRange[] {
   });
   return result.sort((a, b) => a.from - b.from);
 }
+/** Malformed pasted links must never throw out of a UI callback. */
+export function safeParseUrl(raw: string): URL | null { try { return new URL(raw); } catch { return null; } }
+export function safeHostname(raw: string, fallback = raw): string { return safeParseUrl(raw)?.hostname || fallback; }
 export function youtubeUrl(raw: string): string | null {
   try { const url = new URL(raw); let id = "";
     if (url.hostname === "youtu.be") id = url.pathname.slice(1).split('/')[0];
@@ -34,7 +37,7 @@ export function youtubeUrl(raw: string): string | null {
   } catch { return null; }
 }
 export async function linkDetails(raw: string): Promise<LinkDetails> {
-  const url = new URL(raw); if (!["https:", "http:"].includes(url.protocol) || url.username || url.password) throw new Error("Use a public web link without login details.");
+  const url = safeParseUrl(raw); if (!url || !["https:", "http:"].includes(url.protocol) || url.username || url.password) throw new Error("Use a public web link without login details.");
   const video = youtubeUrl(raw);
   if (video) {
     const resource = await invoke<{ body: string }>("fetch_resource", { url: `https://www.youtube.com/oembed?format=json&url=${encodeURIComponent(video)}`, image: false });
@@ -47,7 +50,7 @@ export async function linkDetails(raw: string): Promise<LinkDetails> {
 }
 export async function importImageUrl(url: string): Promise<ImportedImage> {
   const result = await invoke<{ body: string }>("fetch_resource", { url, image: true });
-  const name = new URL(url).pathname.split('/').pop() || "Image";
+  const name = safeParseUrl(url)?.pathname.split('/').pop() || "Image";
   return (await invoke<ImportedImage[]>("import_images", { images: [{ name, data: result.body }] }))[0];
 }
 export function readImage(file: File): Promise<string> {

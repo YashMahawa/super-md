@@ -220,7 +220,7 @@ class StudioViewModel(app: Application, val workspaceKey: String = "main") : And
         } catch (_: Exception) { s = s.copy(error = "The recovery snapshot could not be read. Your original files are untouched.") }
         return s
     }
-    private fun schedulePersist() { persistJob?.cancel(); val current = mutable.value; persistJob = viewModelScope.launch(Dispatchers.IO) { delay(200); persist(current) } }
+    private fun schedulePersist() { persistJob?.cancel(); val current = mutable.value; persistJob = viewModelScope.launch(Dispatchers.IO) { delay(1200); persist(current) } }
     @Synchronized private fun persist(s: StudioState) {
         try {
             val temporary = File(snapshot.parentFile, snapshot.name + ".tmp"); temporary.outputStream().use { stream -> NoteRecovery.write(stream.bufferedWriter(),s); stream.fd.sync() }
@@ -229,7 +229,10 @@ class StudioViewModel(app: Application, val workspaceKey: String = "main") : And
         } catch (error: Exception) { viewModelScope.launch { mutable.value = mutable.value.copy(error = "Draft recovery could not save: ${error.message}. Please save your note to a file.") } }
     }
     fun flush() { persistJob?.cancel(); val current = mutable.value; viewModelScope.launch(Dispatchers.IO) { persist(current) } }
-    fun edit(id: String, content: String) { change { s -> s.copy(tabs = s.tabs.map { if (it.id == id) it.copy(content = content) else it }) }; scheduleAutosave(id) }
+    // The exact String the reader last sent per note. Echoing it back on every
+    // keystroke re-serializes the whole note on both sides and costs battery.
+    val readerEcho = java.util.concurrent.ConcurrentHashMap<String, String>()
+    fun edit(id: String, content: String) { readerEcho[id] = content; change { s -> s.copy(tabs = s.tabs.map { if (it.id == id) it.copy(content = content) else it }) }; scheduleAutosave(id) }
     fun newNote() { val note = Note(); change { it.copy(tabs = it.tabs + note, activeId = note.id) } }
     fun select(id: String) = change { it.copy(activeId = id) }
     fun cycle(direction:Int) {val s=mutable.value;val index=s.tabs.indexOfFirst{it.id==s.active.id};select(s.tabs[Math.floorMod(index+direction,s.tabs.size)].id)}

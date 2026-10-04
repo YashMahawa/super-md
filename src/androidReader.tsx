@@ -5,7 +5,6 @@ import "@fontsource-variable/jetbrains-mono";
 import "@fontsource-variable/roboto";
 import "@fontsource-variable/noto-serif";
 import "katex/dist/katex.min.css";
-import "highlight.js/styles/github-dark.css";
 import "./styles.css";
 import "./androidReader.css";
 import Editor, { editorReadingOffset, editorHistory, exportEditorSession, importEditorSession, type PortableEditorSession } from "./components/Editor";
@@ -24,7 +23,7 @@ import MathRepairPanel from "./components/MathRepairPanel";
 import { captureScrollAnchor } from "./scrollAnchor";
 import ReadingSearch from "./components/ReadingSearch";
 import type { Point } from "./focalZoom";
-import { applyDocumentZoom,invalidateDocumentZoom,settleDocumentZoom,refreshDocumentExtent } from "./documentZoom";
+import { applyDocumentZoom,documentPoint,invalidateDocumentZoom,settleDocumentZoom,refreshDocumentExtent } from "./documentZoom";
 import { documentOutline, navigateToHeading, cancelHeadingNavigation } from "./documentNavigation";
 import {recordHistory,replayHistory,historySize,validHistory,type NoteHistory} from './noteHistory';
 import {cachedEditorHistory} from './components/Editor';
@@ -52,7 +51,7 @@ function Reader() {
   const replaying=useRef(false);
   const loadedFonts=useRef(new Map<string,Promise<FontFace>>());
   const cursor=useRef<Point|undefined>(undefined);
-  const zoomFrame=useRef(0),zoomTimer=useRef(0),zoomFocus=useRef<Point|undefined>(undefined);
+  const zoomFrame=useRef(0),zoomTimer=useRef(0),zoomFocus=useRef<Point|undefined>(undefined),zoomTarget=useRef<number|null>(null),zoomAnchors=useRef<{focus?:Point;points:Map<HTMLElement,Point|null>}>({points:new Map()});
   const settleTimer=useRef(0);
   const chromeRequestAt=useRef(0);
   const chromeLastAction=useRef<string|undefined>(undefined);
@@ -64,7 +63,7 @@ function Reader() {
   const settleSelection=()=>{window.clearTimeout(settleTimer.current);if(document.documentElement.dataset.platform!=="android")return;settleTimer.current=window.setTimeout(()=>document.querySelectorAll<HTMLElement>('.android-reading').forEach(settleDocumentZoom),240);};
   const modeOffset=useRef<number|null>(null);
   const anchors = (focus?:Point) => Array.from(document.querySelectorAll<HTMLElement>(".android-reading,.cm-scroller")).filter(root=>{const r=root.getBoundingClientRect();return !focus || focus.x>=r.left&&focus.x<=r.right&&focus.y>=r.top&&focus.y<=r.bottom;}).map(root=>captureScrollAnchor(root,focus));
-  const applyZoomStyle=(focus?:Point,previousFocus=focus)=>{document.querySelector<HTMLElement>(".android-source")?.style.setProperty("--workspace-scale",String(zoomReference.current/100));document.querySelectorAll<HTMLElement>(".android-reading").forEach(root=>applyDocumentZoom(root,zoomReference.current,reference.current?.widthPercent??80,focus,previousFocus));};
+  const applyZoomStyle=(focus?:Point,previousFocus=focus,anchors?:Map<HTMLElement,Point|null>)=>{document.querySelector<HTMLElement>(".android-source")?.style.setProperty("--workspace-scale",String(zoomReference.current/100));document.querySelectorAll<HTMLElement>(".android-reading").forEach(root=>applyDocumentZoom(root,zoomReference.current,reference.current?.widthPercent??80,focus,previousFocus,anchors?.get(root)));};
   const anchored = (update:()=>void) => { const restore = anchors(); update(); requestAnimationFrame(()=>restore.forEach(callback=>callback())); };
   useEffect(() => {
     window.supermdChromeInset=height=>{
@@ -79,8 +78,12 @@ function Reader() {
       requestAnimationFrame(()=>{restore.forEach(callback=>callback());applyZoomStyle();settleSelection();});
     };
     window.supermdDismiss=()=>{const element=document.querySelector(".image-viewer,.math-repair-panel,.reading-search,.cm-search,.live-active-block textarea");if(!element)return false;const target=element.matches("textarea")?element:document.activeElement||document;target.dispatchEvent(new KeyboardEvent("keydown",{key:"Escape",bubbles:true,cancelable:true}));if(element.matches("textarea"))(element as HTMLElement).blur();return true;};
-    window.supermdLoad = (next) => {
+    window.supermdLoad = (incoming) => {
       const old = reference.current;
+      // Native omits content it received from this reader, unchanged since.
+      const {contentUnchanged,...rest}=incoming as ReaderState&{contentUnchanged?:boolean};
+      if(contentUnchanged&&(!old||old.id!==rest.id))return;
+      const next=(contentUnchanged?{...rest,content:old!.content}:rest) as ReaderState;
       if(old&&(old.id!==next.id||old.mode!==next.mode)){const history=histories.current.get(next.id);if(history)history.last=0;}
       if(old&&old.id===next.id&&old.mode!==next.mode){
         const root=document.querySelector<HTMLElement>(".android-reading");
@@ -103,6 +106,8 @@ function Reader() {
       // Within one workspace mode the reader owns its gesture scale; explicit
       // native zoom controls use supermdSetZoom instead of echoing a snapshot.
       const sameViewport=old && old.fullscreen===next.fullscreen;
+      // A viewport switch presents the zoom the user asked for, even mid-glide.
+      if(old&&!sameViewport&&zoomTarget.current!==null){zoomReference.current=zoomTarget.current;zoomTarget.current=null;}
       const enteringFullscreen=old && !old.fullscreen && next.fullscreen;
       const loaded={...next,zoom:sameViewport||enteringFullscreen?zoomReference.current:clampPreviewZoom(next.zoom),viewState:undefined};
       if(enteringFullscreen){
@@ -111,7 +116,7 @@ function Reader() {
         void invoke("zoom_changed",{zoom:loaded.zoom,fullscreen:false});
         void invoke("zoom_changed",{zoom:loaded.zoom,fullscreen:true});
       }
-      if(old && !sameViewport){window.clearTimeout(zoomTimer.current);cancelAnimationFrame(zoomFrame.current);zoomFrame.current=0;}
+      if(old && !sameViewport){window.clearTimeout(zoomTimer.current);cancelAnimationFrame(zoomFrame.current);zoomFrame.current=0;zoomTarget.current=null;}
       const load = () => { reference.current=loaded;setState(loaded); zoomReference.current = loaded.zoom; };
       if (old?.id === next.id && old.mode === next.mode) anchored(load); else load();
     };
@@ -124,10 +129,29 @@ function Reader() {
       else {const cached=cachedEditorHistory(current.id,direction,current.content);if(cached!==undefined)update(cached);}
       replaying.current=false;
     };
-    window.supermdZoomBy = (factor,focus=cursor.current) => { if (document.querySelector(".image-viewer")) { window.dispatchEvent(new CustomEvent("supermd-image-zoom",{detail:{factor,point:focus}})); return; } cancelHeadingNavigation(document.querySelector('.android-reading'));zoomReference.current=clampPreviewZoom(zoomReference.current*factor);zoomFocus.current=focus;if(!zoomFrame.current)zoomFrame.current=requestAnimationFrame(()=>{zoomFrame.current=0;applyZoomStyle(zoomFocus.current);settleSelection();});window.clearTimeout(zoomTimer.current);const fullscreen=reference.current?.fullscreen;zoomTimer.current=window.setTimeout(()=>void invoke("zoom_changed",{zoom:zoomReference.current,fullscreen}),160); };
-    window.supermdSetZoom=value=>{const next=clampPreviewZoom(value);if(Math.abs(next-zoomReference.current)<.01)return;cancelHeadingNavigation(document.querySelector('.android-reading'));zoomReference.current=next;applyZoomStyle();settleSelection();};
+    window.supermdZoomBy = (factor,focus=cursor.current) => {
+      if (document.querySelector(".image-viewer")) { window.dispatchEvent(new CustomEvent("supermd-image-zoom",{detail:{factor,point:focus}})); return; }
+      cancelHeadingNavigation(document.querySelector('.android-reading'));
+      const target=clampPreviewZoom((zoomTarget.current??zoomReference.current)*factor);zoomFocus.current=focus;
+      // Keyboard and wheel-notch steps glide to the target; continuous pinch
+      // and touchpad deltas are already small and apply directly.
+      const glide=Math.abs(Math.log(factor))>.03&&document.documentElement.dataset.motion!=="off"&&!window.matchMedia?.("(prefers-reduced-motion: reduce)").matches;
+      if(glide){
+        if(zoomTarget.current===null||zoomAnchors.current.focus!==focus)zoomAnchors.current={focus,points:new Map(Array.from(document.querySelectorAll<HTMLElement>(".android-reading"),root=>[root,documentPoint(root,focus)]))};
+        zoomTarget.current=target;
+      } else {zoomTarget.current=null;zoomReference.current=target;}
+      const step=()=>{
+        const goal=zoomTarget.current;
+        if(goal!==null){const current=zoomReference.current;zoomReference.current=Math.abs(goal-current)<.08?goal:current+(goal-current)*.32;if(zoomReference.current===goal)zoomTarget.current=null;}
+        applyZoomStyle(zoomFocus.current,zoomFocus.current,goal!==null?zoomAnchors.current.points:undefined);
+        if(zoomTarget.current!==null)zoomFrame.current=requestAnimationFrame(step);else{zoomFrame.current=0;settleSelection();}
+      };
+      if(!zoomFrame.current)zoomFrame.current=requestAnimationFrame(step);
+      window.clearTimeout(zoomTimer.current);const fullscreen=reference.current?.fullscreen;zoomTimer.current=window.setTimeout(()=>void invoke("zoom_changed",{zoom:target,fullscreen}),220);
+    };
+    window.supermdSetZoom=value=>{zoomTarget.current=null;const next=clampPreviewZoom(value);if(Math.abs(next-zoomReference.current)<.01)return;cancelHeadingNavigation(document.querySelector('.android-reading'));zoomReference.current=next;applyZoomStyle();settleSelection();};
     window.supermdHeading=(id,offset)=>{if(reference.current?.mode==="editor"){window.dispatchEvent(new CustomEvent("supermd-goto-offset",{detail:offset??0}));return;}const root=document.querySelector(".android-reading");if(root)navigateToHeading(root,id);};
-    window.supermdResetZoom = () => { if (document.querySelector(".image-viewer")) { window.dispatchEvent(new Event("supermd-image-reset")); return; } window.supermdZoomBy?.(100/zoomReference.current); };
+    window.supermdResetZoom = () => { if (document.querySelector(".image-viewer")) { window.dispatchEvent(new Event("supermd-image-reset")); return; } window.supermdZoomBy?.(100/(zoomTarget.current??zoomReference.current)); };
     window.supermdRepairMath = () => setRepairing(true);
     window.supermdNativeWheel=(dx,dy,point,held)=>{
       const target=document.elementFromPoint(point.x,point.y),canvas=target?.closest(".interactive-chart svg,.image-viewer-canvas");
@@ -256,7 +280,7 @@ function Reader() {
     const distance = (touches: TouchList) => Math.hypot(touches[0].clientX - touches[1].clientX, touches[0].clientY - touches[1].clientY);
     const start = (event: TouchEvent) => { cancelHeadingNavigation((event.target as Element).closest('.android-reading'));if (event.touches.length === 2 && !(event.target as Element).closest("input,textarea,[data-independent-zoom]")) { window.clearTimeout(settleTimer.current);startDistance = distance(event.touches); startZoom = zoomReference.current; pinching = true;previousFocus={x:(event.touches[0].clientX+event.touches[1].clientX)/2,y:(event.touches[0].clientY+event.touches[1].clientY)/2}; } };
     const move = (event: TouchEvent) => { if (event.touches.length === 2 && pinching && startDistance > 0) {
-      event.preventDefault(); zoomReference.current = clampPreviewZoom(startZoom * distance(event.touches) / startDistance);
+      event.preventDefault(); zoomTarget.current = null; zoomReference.current = clampPreviewZoom(startZoom * distance(event.touches) / startDistance);
       focus={x:(event.touches[0].clientX+event.touches[1].clientX)/2,y:(event.touches[0].clientY+event.touches[1].clientY)/2};
       // Coalesce input to one visual update per frame. Parsing Markdown and
       // crossing the native bridge are deliberately excluded from pinch frames.
