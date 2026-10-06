@@ -25,7 +25,7 @@ Write in `.md`. Carry a note and its images together in `.smd`. Export a properl
 
 https://github.com/user-attachments/assets/471e6025-3ce8-4daf-ba2b-ee66b53b006a
 
-**[Watch or download the walkthrough](https://github.com/user-attachments/assets/471e6025-3ce8-4daf-ba2b-ee66b53b006a)** — 2 minutes 39 seconds, 1440p, with narration. Explore themes, fonts, reading modes, images, interactive graphs, search, Python, PDF options, LaTeX repair, and independent windows.
+**[Watch or download the walkthrough](https://github.com/YashMahawa/super-md/releases/download/v0.5.1/super-md-demo.mp4)** — 2 minutes 39 seconds, 1440p, with narration. Explore themes, fonts, reading modes, images, interactive graphs, search, Python, PDF options, LaTeX repair, and independent windows.
 
 ### A workspace that moves with you
 
