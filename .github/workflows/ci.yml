@@ -205,7 +205,13 @@ jobs:
           profile: pixel_2
           disable-animations: true
           emulator-options: -no-window -gpu swangle -feature -Vulkan -no-snapshot -noaudio -no-boot-anim -memory 2048 -cores 2
-          script: android/gradlew -p android --no-daemon --max-workers=2 :app:connectedDebugAndroidTest
+          # An OS-owned first-use immersive education window intercepts native
+          # pointer injections even though DOM hit testing sees the document.
+          # Acknowledge it ONLY on this disposable emulator, before launching
+          # the app. This leaves every native tap, pinch and paint assertion on.
+          script: |
+            adb shell settings put secure immersive_mode_confirmations confirmed
+            android/gradlew -p android --no-daemon --max-workers=2 :app:connectedDebugAndroidTest
       # Debug is an internal test harness only, never a distributed APK.
       - uses: actions/upload-artifact@v4
         if: always()
