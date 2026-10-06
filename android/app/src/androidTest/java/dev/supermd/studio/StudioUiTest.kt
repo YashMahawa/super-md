@@ -70,15 +70,27 @@ class StudioUiTest {
                 "Long study paragraph with useful context and stable line wrapping. ".repeat(32)
         }
         val rectScript="""(()=>{const task=document.querySelector('input[type=checkbox]');if(!task)return null;const r=task.getBoundingClientRect();return {x:r.left+r.width/2,y:r.top+r.height/2,top:r.top,width:innerWidth,scale:document.querySelector('.document-page').dataset.scale};})()"""
-        fun rect()=org.json.JSONObject(javascriptUntil(rectScript) {it.startsWith("{")})
+        fun rect():org.json.JSONObject {
+            val raw=javascriptUntil(rectScript) {it!="null"&&it.isNotEmpty()}
+            println("TASK RECT RAW: $raw")
+            return org.json.JSONObject(raw)
+        }
         for(mode in listOf("reader","live"))for(zoom in listOf(100f,180f)) {
             compose.runOnIdle {model.edit(model.state.value.active.id,content);model.mode(mode);model.zoom(zoom)}
             javascriptUntil("document.querySelector('.document-page')?.dataset.scale") {
                 kotlin.math.abs((it.trim('"').toFloatOrNull()?:0f)-zoom/100f)<.001f
             }
-            javascriptUntil("(()=>{window.supermdHeading?.('task-section-42');const r=document.querySelector('input[type=checkbox]')?.getBoundingClientRect();return !!r&&r.top>=0&&r.bottom<innerHeight;})()") {it=="true"}
+            javascriptUntil("document.querySelector('[data-heading-key][id=task-section-42]')!==null") {it=="true"}
+            javascriptUntil("window.supermdHeading?.('task-section-42');true") {it=="true"}
+            javascriptUntil("!document.querySelector('.android-reading')?.dataset.navigating") {it=="true"}
+            // Align the TAP below the real native overlay, not merely inside
+            // the WebView's edge-to-edge bounds. A settling heading jump must
+            // not later move that tap target back underneath the toolbar.
+            javascriptUntil("""(()=>{const host=document.querySelector('.android-reading'),task=host?.querySelector('input[type=checkbox]');if(!task)return false;const r=task.getBoundingClientRect(),b=host.getBoundingClientRect();if(r.width<=0||r.height<=0)return false;window.supermdNativeWheel?.(0,0,{x:innerWidth/2,y:innerHeight*.75},false);const inset=parseFloat(getComputedStyle(document.documentElement).getPropertyValue('--native-chrome-inset'))||0;host.scrollTop+=r.top-(inset+innerHeight)/2;host.scrollLeft+=r.left-b.left-32;const after=task.getBoundingClientRect();return after.left>=0&&after.right<innerWidth&&after.top>inset+24&&after.bottom<innerHeight;})()""") {it=="true"}
             android.os.SystemClock.sleep(400)
             val before=rect()
+            println("TASK BEFORE $mode/$zoom: $before")
+            javascriptUntil("(()=>{const task=document.querySelector('input[type=checkbox]'),r=task.getBoundingClientRect();return document.elementFromPoint(r.left+r.width/2,r.top+r.height/2)===task;})()") {it=="true"}
             val point=AtomicReference(androidx.compose.ui.geometry.Offset.Zero)
             compose.runOnIdle {
                 val reader=web(compose.activity.window.decorView)!!
@@ -89,7 +101,8 @@ class StudioUiTest {
             val instrument=androidx.test.platform.app.InstrumentationRegistry.getInstrumentation()
             val time=android.os.SystemClock.uptimeMillis();val position=point.get()
             instrument.sendPointerSync(android.view.MotionEvent.obtain(time,time,android.view.MotionEvent.ACTION_DOWN,position.x,position.y,0))
-            instrument.sendPointerSync(android.view.MotionEvent.obtain(time,time+60,android.view.MotionEvent.ACTION_UP,position.x,position.y,0))
+            android.os.SystemClock.sleep(60)
+            instrument.sendPointerSync(android.view.MotionEvent.obtain(time,android.os.SystemClock.uptimeMillis(),android.view.MotionEvent.ACTION_UP,position.x,position.y,0))
             val checked=content.replaceFirst("- [ ] Keep my place","- [x] Keep my place")
             compose.waitUntil(5000) {model.state.value.active.content==checked}
             fun assertPosition(action:String) {

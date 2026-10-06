@@ -7,6 +7,11 @@
   typesetter tests with two real CLI process tests. Browser checkbox checks cover
   desktop/mobile layout, Read/Live, 100%/180% zoom, checking, undo and redo in a
   long note. They do not substitute for Android handset testing.
+- The native checkbox regression passes locally on Android API 35 in 21.6 s:
+  real pointer taps, Read/Live at 100%/180%, exact source changes, undo/redo and
+  unchanged measured task positions. Its fixture waits for heading settling and
+  positions the actual tap below the native overlay; viewport bounds alone do
+  not prove a target is tappable through native chrome.
 - A missing Wayland EGL integration reproduces exit 134 in the isolated probe.
   The full editor recovers automatically with software rendering. Its native
   visual smoke passes with 677 distinct reader colors, real LaTeX PDF export,
