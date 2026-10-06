@@ -60,6 +60,14 @@ jobs:
           if [ "$RUNNER_OS" = macOS ]; then python desktop/check_bundled_python.py desktop/dist/super-md/super-md; fi
             desktop/dist/super-md/_internal/resources/desktop/smd-engine doctor
           fi
+      - name: Launch packaged editor and verify real reader pixels and math PDF
+        shell: bash
+        env:
+          QT_QPA_PLATFORM: offscreen
+        run: |
+          version=$(node -p 'require("./package.json").version')
+          if [ "$RUNNER_OS" = Windows ]; then binary=desktop/dist/super-md/super-md.exe; else binary=desktop/dist/super-md/super-md; fi
+          python desktop/check_packaged.py "$binary" "$version" --graphics software
 
   browser:
     runs-on: ubuntu-22.04
@@ -139,6 +147,9 @@ jobs:
             android/app/build/reports/lint-results-release.html
 
   android-device-tests:
+    # Explicit one-commit opt-out requested by the user for this desktop fix.
+    # Subsequent commits/PRs automatically resume both device suites.
+    if: ${{ !contains(github.event.head_commit.message, '[skip android device tests]') }}
     strategy:
       fail-fast: false
       matrix:

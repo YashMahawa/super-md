@@ -203,7 +203,12 @@ function Reader() {
     root.style.setProperty("--reader-leading",String(state.lineHeight??1.65));
     Object.entries(state.colors).forEach(([key, value]) => root.style.setProperty(`--${key}`, value));
     document.querySelectorAll<HTMLElement>('.android-reading').forEach(invalidateDocumentZoom);applyZoomStyle();settleSelection();
-  }, [state]);
+  // A source edit (especially checking a task) is not a new viewport. Rebuilding
+  // zoom geometry here resets settled CSS zoom before the native selection and
+  // scroll position have caught up, which jumps on mobile and magnified pages.
+  // ResizeObserver updates the content extent without changing magnification.
+  }, [state?.id,state?.mode,state?.dark,state?.fullscreen,state?.font,state?.size,
+      state?.widthPercent,state?.lineHeight,state?.motion,JSON.stringify(state?.colors)]);
   useEffect(()=>{const root=document.querySelector<HTMLElement>(".android-reading");if(!root || typeof ResizeObserver==="undefined")return;let frame=0;const page=root.querySelector<HTMLElement>(".document-page");const observer=new ResizeObserver(()=>{if(!frame)frame=requestAnimationFrame(()=>{frame=0;
     // A scheduled gesture owns its focal point. A resize callback must not
     // consume the pending scale at the default center before that frame runs.

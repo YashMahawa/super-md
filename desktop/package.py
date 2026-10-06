@@ -68,14 +68,31 @@ def installers(version):
             (deb / "usr/bin").mkdir(parents=True, exist_ok=True)
             (deb / "usr/bin/super-md").symlink_to("/opt/super-md/super-md")
             (deb / "DEBIAN").mkdir()
-            (deb / "DEBIAN/control").write_text(f"Package: super-md\nVersion: {version}\nArchitecture: amd64\nMaintainer: Yash Mahawar <YashMahawa@users.noreply.github.com>\nDepends: libc6 (>= 2.35), libnss3, libasound2, libxcb1, libxkbcommon0, libegl1, libgl1, libdbus-1-3\nSection: editors\nPriority: optional\nDescription: Native Qt Markdown studio with typeset PDF export\n")
+            (deb / "DEBIAN/control").write_text(f"Package: super-md\nVersion: {version}\nArchitecture: amd64\nMaintainer: Yash Mahawar <YashMahawa@users.noreply.github.com>\nDepends: libc6 (>= 2.35), libnss3, libasound2 | libasound2t64, libxcb1, libxcb-cursor0, libxcb-icccm4, libxcb-keysyms1, libxcb-image0, libxcb-render-util0, libxcb-randr0, libxcb-shape0, libxcb-sync1, libxcb-xfixes0, libx11-xcb1, libxkbcommon0, libxkbcommon-x11-0, libwayland-client0, libwayland-cursor0, libegl1, libgl1, libgbm1, libdbus-1-3, fontconfig\nSection: editors\nPriority: optional\nDescription: Native Qt Markdown studio with typeset PDF export\n")
             for hook in ("postinst", "postrm"):
                 shutil.copy2(ROOT / "desktop/linux/mime-refresh.sh", deb / "DEBIAN" / hook)
                 (deb / "DEBIAN" / hook).chmod(0o755)
             debfile = packages / f"Super-MD_{version}_amd64.deb"
             run("dpkg-deb", "--build", "--root-owner-group", deb, debfile)
-            run("fpm", "-s", "deb", "-t", "rpm", "--rpm-rpmbuild-define", "_build_id_links none",
-                "-p", packages / f"Super-MD-{version}-1.x86_64.rpm", debfile)
+            # Debian package names such as libnss3/libasound2 are not Fedora or
+            # openSUSE package names. Require shared-library capabilities in RPM.
+            dependencies = ["glibc >= 2.35", "libEGL.so.1()(64bit)", "libGL.so.1()(64bit)",
+                            "libnss3.so()(64bit)", "libasound.so.2()(64bit)",
+                            "libgbm.so.1()(64bit)", "libdbus-1.so.3()(64bit)", "fontconfig",
+                            "libxkbcommon.so.0()(64bit)", "libxkbcommon-x11.so.0()(64bit)",
+                            "libX11-xcb.so.1()(64bit)", "libwayland-client.so.0()(64bit)",
+                            "libwayland-cursor.so.0()(64bit)",
+                            *[f"libxcb-{name}.so.{abi}()(64bit)" for name,abi in
+                              (("cursor",0),("icccm",4),("keysyms",1),("image",0),
+                               ("render-util",0),("randr",0),("shape",0),("sync",1),("xfixes",0))]]
+            run("fpm", "-s", "dir", "-t", "rpm", "--name", "super-md", "--version", version,
+                "--architecture", "x86_64", "--description", "Native Qt Markdown studio with typeset PDF export",
+                "--license", "MIT", "--maintainer", "Yash Mahawar <YashMahawa@users.noreply.github.com>",
+                "--after-install", ROOT / "desktop/linux/mime-refresh.sh",
+                "--after-remove", ROOT / "desktop/linux/mime-refresh.sh",
+                "--rpm-rpmbuild-define", "_build_id_links none",
+                *[arg for dependency in dependencies for arg in ("--depends", dependency)],
+                "-C", deb, "-p", packages / f"Super-MD-{version}-1.x86_64.rpm", "opt", "usr")
     for file in packages.iterdir():
         if file.is_file() and file.name != "SHA256SUMS":
             print(f"{hashlib.sha256(file.read_bytes()).hexdigest()}  {file.name}")

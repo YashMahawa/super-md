@@ -1,5 +1,24 @@
 # Verification
 
+## Graphics recovery and stable task edits — 0.5.1
+
+- Local checks pass: 101 frontend tests, 38 browser workflows, 73 native Qt/Python
+  tests plus the added windowed-Windows graphics-report regression, and 16 Rust
+  typesetter tests with two real CLI process tests. Browser checkbox checks cover
+  desktop/mobile layout, Read/Live, 100%/180% zoom, checking, undo and redo in a
+  long note. They do not substitute for Android handset testing.
+- A missing Wayland EGL integration reproduces exit 134 in the isolated probe.
+  The full editor recovers automatically with software rendering. Its native
+  visual smoke passes with 677 distinct reader colors, real LaTeX PDF export,
+  font search, themes, and fixed-bounds fullscreen controls. Healthy graphics
+  preserve the user's platform/backend; the windowed Windows executable does
+  not require stdout to report a successful presented frame.
+- Publication requires additional exact-commit CI and actual installer checks:
+  clean Linux distro containers, installed Windows EXE, mounted macOS DMGs and
+  signed/source-matched APK verification. No phone or Android emulator tests are
+  run for this update, following the user's explicit request. Working installs,
+  notes and running user windows are preserved.
+
 ## Fixed-size reading overlays and shared branding — 0.4.14
 
 - 95 frontend tests and 64 native Qt/Python checks pass. Brush-S fixed, adaptive

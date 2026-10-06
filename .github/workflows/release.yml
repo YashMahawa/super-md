@@ -184,6 +184,48 @@ jobs:
             if [ "$RUNNER_OS" = macOS ]; then python desktop/check_bundled_python.py desktop/dist/super-md/super-md; fi
             desktop/dist/super-md/_internal/resources/desktop/smd-engine doctor
           fi
+      - name: Install the Windows EXE in an isolated per-user destination
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $installer = (Get-ChildItem desktop/dist/packages/*-setup.exe | Select-Object -First 1).FullName
+          $destination = Join-Path $env:RUNNER_TEMP 'SuperMDInstalled'
+          $process = Start-Process -FilePath $installer -ArgumentList '/S',"/D=$destination" -Wait -PassThru
+          if ($process.ExitCode -ne 0 -or -not (Test-Path "$destination/super-md.exe")) { throw 'Windows installer failed' }
+          "SUPERMD_INSTALLED_BINARY=$destination/super-md.exe" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+      - name: Launch the installed Windows EXE and mounted macOS DMG
+        if: runner.os != 'Linux'
+        shell: bash
+        run: |
+          version=${{ needs.prepare.outputs.version }}
+          if [ "$RUNNER_OS" = Windows ]; then
+            binary="$SUPERMD_INSTALLED_BINARY"
+          else
+            mount="$RUNNER_TEMP/supermd-dmg-check"
+            mkdir -p "$mount"
+            if [ '${{ matrix.package }}' = macos-arm64 ]; then arch=aarch64; else arch=x64; fi
+            hdiutil attach "desktop/dist/packages/Super-MD_${version}_${arch}.dmg" -nobrowse -readonly -mountpoint "$mount"
+            trap 'hdiutil detach "$mount"' EXIT
+            binary="$mount/Super MD.app/Contents/MacOS/super-md"
+          fi
+          python desktop/check_packaged.py "$binary" "$version" --graphics auto
+          python desktop/check_packaged.py "$binary" "$version" --graphics software
+          python desktop/check_bundled_python.py "$binary"
+      - name: Test installers in clean Linux distributions with no host GPU or venv
+        if: runner.os == 'Linux'
+        shell: bash
+        timeout-minutes: 20
+        run: |
+          for distro in ubuntu:22.04 ubuntu:24.04 debian:12 fedora:43; do
+            docker run --rm \
+              -v "$PWD/desktop/dist/packages:/packages:ro" \
+              -v "$PWD/desktop/check_packaged.py:/checks/check_packaged.py:ro" \
+              -v "$PWD/scripts/check-linux-container.sh:/checks/check-linux-container.sh:ro" \
+              "$distro" bash /checks/check-linux-container.sh '${{ needs.prepare.outputs.version }}'
+          done
+      - name: Upload only tested installers
+        shell: bash
+        run: |
           gh release upload "$RELEASE_TAG" desktop/dist/packages/* --clobber
 
   android:

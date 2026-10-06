@@ -9,7 +9,16 @@ if __name__ == "__main__" and len(sys.argv) > 1 and sys.argv[1] == "--python-cel
     # The frozen app doubles as the built-in Python for cells. Skip Qt entirely.
     from python_runtime import run_bundled_cell
     sys.exit(run_bundled_cell(sys.argv[2:]))
-from PySide6.QtCore import QFile, QIODevice, QUrl, QTimer, QMetaObject, Q_ARG, QObject, QEvent, Signal
+if __name__ == "__main__":
+    from graphics_runtime import configure, probe
+    if len(sys.argv) > 1 and sys.argv[1] == "--graphics-probe":
+        sys.exit(probe(Path(sys.argv[2]) if len(sys.argv) > 2 else None))
+    # CLI/identity queries never need a display or a graphics probe.
+    commands = {"read", "inspect", "assets", "extract", "pack", "export", "export-json", "doctor",
+                "--version", "--help", "-h"}
+    if len(sys.argv) == 1 or sys.argv[1] not in commands:
+        configure(safe="--safe-graphics" in sys.argv)
+from PySide6.QtCore import QFile, QIODevice, QUrl, QTimer, QMetaObject, Q_ARG, QObject, QEvent, Signal, QPointF
 from PySide6.QtGui import QGuiApplication, QIcon, QFont, QFontDatabase
 from PySide6.QtWidgets import QApplication
 from PySide6.QtQml import QQmlApplicationEngine
@@ -50,7 +59,9 @@ def main():
     parser.add_argument("--quit-after", type=int, default=0, help=argparse.SUPPRESS)
     parser.add_argument("--smoke", action="store_true", help=argparse.SUPPRESS)
     parser.add_argument("--visual-smoke", action="store_true", help=argparse.SUPPRESS)
+    parser.add_argument("--smoke-report", type=Path, help=argparse.SUPPRESS)
     parser.add_argument("--version", action="store_true")
+    parser.add_argument("--safe-graphics", action="store_true", help="Use software graphics for Qt and the document renderer")
     args = parser.parse_args()
     if args.version:
         import json
@@ -184,6 +195,26 @@ def main():
                     valid = valid and fullscreen is not None and fullscreen.property("text") == "" and fullscreen.property("availableHeight") >= 24
                     if fullscreen:
                         print(f"FULLSCREEN ICON: availableHeight={fullscreen.property('availableHeight')} padding={fullscreen.property('topPadding')}/{fullscreen.property('bottomPadding')}",flush=True)
+                    # DOM readiness alone is not proof of working graphics. A
+                    # software fallback must paint the WebEngine reader too.
+                    image = window.grabWindow()
+                    colors = set()
+                    if reader is not None and not image.isNull():
+                        point = reader.mapToScene(QPointF(0, 0))
+                        ratio = image.width() / max(1, window.width())
+                        left, top = int(point.x()*ratio), int(point.y()*ratio)
+                        right = min(image.width(), int((point.x()+reader.property('width'))*ratio))
+                        bottom = min(image.height(), int((point.y()+reader.property('height'))*ratio))
+                        for y in range(max(0,top)+12,bottom-12,5):
+                            for x in range(max(0,left)+12,right-12,5):
+                                colors.add(image.pixelColor(x,y).rgb())
+                    valid = valid and len(colors) > 20
+                    print(f"READER PIXELS: {len(colors)} distinct colors",flush=True)
+                    if valid and args.smoke_report:
+                        import json
+                        args.smoke_report.write_text(json.dumps({"ok":True,"readerColors":len(colors),
+                            "software":os.environ.get('QT_QUICK_BACKEND')=='software',
+                            "content":studio.message}),encoding='utf-8')
                     if not valid or not args.visual_smoke:
                         app.exit(0 if valid else 2)
                 else:

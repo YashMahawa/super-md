@@ -1,4 +1,33 @@
 import { expect, test } from "@playwright/test";
+test("checkbox edits retain reading position, magnification and undo in Read and Live",async({page})=>{
+  await page.addInitScript(()=>{window.SuperMD={post:(id,command,args)=>{
+    if(command==='document_changed')(window as any).lastCheckboxEdit=JSON.parse(args).content;
+    queueMicrotask(()=>window.supermdReply?.(id,true,null));
+  }};});
+  await page.goto('/android-reader.html');
+  await page.waitForFunction(()=>typeof window.supermdLoad==='function');
+  const content=Array.from({length:65},(_,i)=>`## Section ${i}\n\n${i===42?'- [ ] Keep my place\n- [ ] Another task\n\n':''}${'Long study paragraph with useful context and stable line wrapping. '.repeat(32)}\n\n`).join('');
+  for(const host of ['qt','android'])for(const mode of ['reader','live'] as const)for(const zoom of [100,180]){
+    await page.evaluate(host=>{document.documentElement.dataset.host=host;document.documentElement.dataset.platform=host==='android'?'android':'desktop';},host);
+    await page.evaluate(({content,mode,zoom})=>window.supermdLoad?.({id:`tasks-${mode}-${zoom}`,content,path:null,mode,dark:false,fullscreen:false,colors:{},font:'Manrope',size:18,zoom,motion:false}),{content,mode,zoom});
+    await page.evaluate(zoom=>window.supermdSetZoom?.(zoom),zoom);
+    await page.evaluate(()=>window.supermdHeading?.('section-42'));
+    const task=page.getByRole('checkbox').first();
+    await task.scrollIntoViewIfNeeded();await page.waitForTimeout(300);
+    const before=await task.boundingBox();
+    expect(await page.locator('.android-reading').evaluate(el=>el.scrollTop)).toBeGreaterThan(1000);
+    await task.click();await expect(task).toBeChecked();
+    await page.waitForTimeout(400);
+    const after=await task.boundingBox();
+    expect(Math.abs(after!.y-before!.y)).toBeLessThan(3);
+    expect(await page.locator('.document-page').getAttribute('data-scale')).toBe(String(zoom/100));
+    expect(await page.evaluate(()=>(window as any).lastCheckboxEdit)).toBe(content.replace('- [ ] Keep my place','- [x] Keep my place'));
+    await page.evaluate(()=>window.supermdHistory?.('undo'));await expect(task).not.toBeChecked();
+    expect(Math.abs((await task.boundingBox())!.y-before!.y)).toBeLessThan(3);
+    await page.evaluate(()=>window.supermdHistory?.('redo'));await expect(task).toBeChecked();
+    expect(Math.abs((await task.boundingBox())!.y-before!.y)).toBeLessThan(3);
+  }
+});
 test("offline writing assistance checks prose only and keeps corrections undoable",async({page})=>{
   await page.addInitScript(()=>{window.SuperMD={post:()=>{}};});await page.goto("/android-reader.html");
   await page.waitForFunction(()=>typeof window.supermdLoad==='function');
