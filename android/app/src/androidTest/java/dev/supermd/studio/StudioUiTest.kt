@@ -231,7 +231,7 @@ class StudioUiTest {
         val raw=javascriptUntil("JSON.stringify((()=>{const s=document.querySelector('.interactive-chart svg');s.scrollIntoView({block:'center',behavior:'instant'});const r=s.getBoundingClientRect();return {x:r.left+r.width*.5,y:r.top+r.height*.5,d:devicePixelRatio};})())") {it.contains("\\\"d\\\"")}
         val rect=org.json.JSONObject(org.json.JSONArray("[$raw]").getString(0))
         println("NATIVE GRAPH GESTURE RECT: $rect")
-        javascriptUntil("(()=>{const r=document.querySelector('.interactive-chart svg').getBoundingClientRect();return document.elementFromPoint(r.left+r.width/2,r.top+r.height/2)?.closest('.interactive-chart svg')!==null;})()") {it=="true"}
+        javascriptUntil("(()=>{const r=document.querySelector('.interactive-chart svg').getBoundingClientRect();return !!document.elementFromPoint(r.left+r.width/2,r.top+r.height/2)?.closest('.interactive-chart svg');})()") {it=="true"}
         val native=AtomicReference(IntArray(2))
         compose.runOnIdle {val xy=IntArray(2);web(compose.activity.window.decorView)!!.getLocationOnScreen(xy);native.set(xy)}
         val density=rect.getDouble("d").toFloat()
