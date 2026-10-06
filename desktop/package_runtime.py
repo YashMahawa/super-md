@@ -2,6 +2,16 @@
 from pathlib import PurePosixPath
 
 
+def wayland_dependencies(package_format):
+    """Qt links all three Wayland libraries, even when launched through X11."""
+    names = ("client", "cursor", "server")
+    if package_format == "deb":
+        return [f"libwayland-{name}0" for name in names]
+    if package_format == "rpm":
+        return [f"libwayland-{name}.so.0()(64bit)" for name in names]
+    raise ValueError(f"Unknown Linux package format: {package_format}")
+
+
 def portable_binaries(entries, platform):
     """Do not shadow the host C++/unwind ABI used by newer Mesa/LLVM drivers.
 

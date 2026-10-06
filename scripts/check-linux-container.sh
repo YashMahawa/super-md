@@ -20,8 +20,8 @@ useradd --create-home supermdtest
 # install, no user's config and no --no-sandbox workaround.
 runuser -u supermdtest -- xvfb-run -a python3 /checks/check_packaged.py /opt/super-md/super-md "$version" --graphics auto
 runuser -u supermdtest -- xvfb-run -a python3 /checks/check_packaged.py /opt/super-md/super-md "$version" --graphics software
+runuser -u supermdtest -- xvfb-run -a python3 /checks/check_packaged.py "/packages/Super-MD_${version}_amd64.AppImage" "$version" --graphics software
 if [[ "$ID" != fedora ]]; then
-  runuser -u supermdtest -- xvfb-run -a python3 /checks/check_packaged.py "/packages/Super-MD_${version}_amd64.AppImage" "$version" --graphics software
   runuser -u supermdtest -- bash -s -- "$version" <<'WAYLAND'
 set -euo pipefail
 export XDG_RUNTIME_DIR

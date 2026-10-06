@@ -41,6 +41,11 @@ forward-compatibility guidance](https://pyinstaller.org/en/stable/usage.html#mak
 The DEB declares `libstdc++6 (>= 12)` and `libgcc-s1`; RPM declares their library
 capabilities. `desktop/test_package_runtime.py` checks this Linux-only boundary.
 
+Both DEB and RPM explicitly require the Wayland client, cursor **and server**
+libraries. Qt can link the server library even in X11 mode; the clean Fedora
+installer check caught that missing dependency before publication. AppImage
+launches are checked on all four distributions too.
+
 Release containers start with no developer Python/Qt environment, no host GPU, and a fresh non-root user. AppImage extraction and installed DEB/RPM launches must render a note, process an embedded SVG portable file and export LaTeX to a real PDF. A headless Wayland compositor plus unavailable EGL client integration reproduces the original fatal path; the packaged editor must recover automatically. The container tests do not claim every GPU/compositor/remote-desktop configuration has been tested.
 
 The disposable CI containers permit Chromium's internal sandbox namespaces
