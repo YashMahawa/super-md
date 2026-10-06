@@ -217,7 +217,10 @@ jobs:
         timeout-minutes: 20
         run: |
           for distro in ubuntu:22.04 ubuntu:24.04 debian:12 fedora:43; do
-            docker run --rm \
+            # Permit Chromium to create its OWN namespaces inside disposable
+            # containers, and avoid Docker's tiny /dev/shm. Never disable the
+            # application sandbox or expose host devices, data or credentials.
+            docker run --rm --cap-add=SYS_ADMIN --shm-size=1g \
               -v "$PWD/desktop/dist/packages:/packages:ro" \
               -v "$PWD/desktop/check_packaged.py:/checks/check_packaged.py:ro" \
               -v "$PWD/scripts/check-linux-container.sh:/checks/check-linux-container.sh:ro" \

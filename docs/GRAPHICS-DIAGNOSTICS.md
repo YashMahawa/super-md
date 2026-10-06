@@ -31,6 +31,12 @@ Linux x86-64 packages are built on Ubuntu 22.04 and require glibc 2.35 or newer.
 
 Release containers start with no developer Python/Qt environment, no host GPU, and a fresh non-root user. AppImage extraction and installed DEB/RPM launches must render a note, process an embedded SVG portable file and export LaTeX to a real PDF. A headless Wayland compositor plus unavailable EGL client integration reproduces the original fatal path; the packaged editor must recover automatically. The container tests do not claim every GPU/compositor/remote-desktop configuration has been tested.
 
+The disposable CI containers permit Chromium's internal sandbox namespaces
+(`SYS_ADMIN`, following [Chromium browser-container guidance](https://pptr.dev/guides/docker))
+and provide 1 GiB of shared-memory capacity. They do not pass `--no-sandbox`,
+mount host GPU devices, user files or credentials. These are container test
+settings, not changes to the laptop or application security policy.
+
 Windows checks exercise the installed EXE and its built-in Python; macOS checks launch from the actual mounted DMG and run its built-in Python on Apple Silicon/Intel. Packages are not a promise of support for operating systems older than their bundled Qt/Python runtimes. macOS ad-hoc signing is not Apple notarization, and Windows installers are not Authenticode signed; OS trust prompts remain possible.
 
 ## Regression checks
