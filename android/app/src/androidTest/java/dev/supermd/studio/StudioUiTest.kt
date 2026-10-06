@@ -77,9 +77,16 @@ class StudioUiTest {
         }
         for(mode in listOf("reader","live"))for(zoom in listOf(100f,180f)) {
             compose.runOnIdle {model.edit(model.state.value.active.id,content);model.mode(mode);model.zoom(zoom)}
+            // The bridge is asynchronous: an old Reader page may already have
+            // the requested scale and heading while Live has not mounted yet.
+            javascriptUntil("document.querySelector('.android-document.mode-$mode .android-reading')?.dataset.measured") {it=="\"true\""}
             javascriptUntil("document.querySelector('.document-page')?.dataset.scale") {
                 kotlin.math.abs((it.trim('"').toFloatOrNull()?:0f)-zoom/100f)<.001f
             }
+            // A real scroll cancels the mode's delayed source-anchor restore.
+            // Dispatch a zero-delta input before our deliberate test positioning
+            // so its later timers cannot relocate the checkbox behind the tap.
+            javascriptUntil("document.querySelector('.android-reading').dispatchEvent(new WheelEvent('wheel',{bubbles:true}));true") {it=="true"}
             javascriptUntil("document.querySelector('[data-heading-key][id=task-section-42]')!==null") {it=="true"}
             javascriptUntil("window.supermdHeading?.('task-section-42');true") {it=="true"}
             javascriptUntil("!document.querySelector('.android-reading')?.dataset.navigating") {it=="true"}
