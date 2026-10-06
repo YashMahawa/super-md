@@ -52,6 +52,9 @@ analysis = Analysis([str(root / "desktop/main.py")], pathex=[str(root / "desktop
     binaries=[(str(engine), "resources/desktop")], datas=data,
     hiddenimports=hidden,
     excludes=excluded, noarchive=False)
+sys.path.insert(0, str(root / "desktop"))
+from package_runtime import portable_binaries
+analysis.binaries = portable_binaries(analysis.binaries, sys.platform)
 pyz = PYZ(analysis.pure)
 exe = EXE(pyz, analysis.scripts, [], exclude_binaries=True, name="super-md",
           debug=False, strip=False, upx=False, console=sys.platform.startswith("linux"),

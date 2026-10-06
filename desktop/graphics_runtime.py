@@ -23,6 +23,10 @@ def command() -> list[str]:
 
 def software_environment(env: dict[str, str]) -> None:
     env["QT_QUICK_BACKEND"] = "software"
+    # XCB otherwise tries GLX even when Quick and Chromium render in software.
+    # A broken GLX driver can abort there; Wayland ignores this XCB-only knob.
+    if sys.platform.startswith("linux"):
+        env["QT_XCB_GL_INTEGRATION"] = "none"
     # Chromium and Qt Quick are separate renderers; forcing only one may
     # leave WebEngine blank even though native controls render successfully.
     flags = env.get("QTWEBENGINE_CHROMIUM_FLAGS", "").split()

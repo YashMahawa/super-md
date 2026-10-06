@@ -4,6 +4,7 @@
 
 - A failed Wayland/OpenGL/EGL graphics initialization no longer aborts the editor before it opens. An isolated, bounded startup probe checks real Qt rendering; when it fails, Super MD selects software rendering for both Qt Quick and the document pane.
 - Healthy systems keep accelerated rendering. `--safe-graphics` is available as an explicit troubleshooting option. This does not disable Chromium's security sandbox or change system drivers.
+- Linux packages use the host C++/unwind runtimes rather than overriding newer Mesa/LLVM drivers with older bundled libraries. Software fallback also avoids X11 GLX initialization, addressing a second clean-Ubuntu-24.04 startup abort caught by the new installer checks.
 - Debian dependencies include the XCB cursor integration, GBM, font configuration and both older/newer ALSA package names. RPM dependencies use Linux shared-library capabilities rather than Debian-only package names.
 - Release gates now launch the packaged editor and require actual painted document pixels, portable-image round trips and native LaTeX PDF output. Linux installers are exercised in fresh Ubuntu 22.04/24.04, Debian 12 and Fedora containers without a developer venv or host GPU, including the missing-Wayland-EGL failure path. Windows checks install the EXE; macOS checks launch the app from the mounted DMG on both architectures.
 

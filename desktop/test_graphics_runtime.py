@@ -51,6 +51,13 @@ class GraphicsRuntimeTest(unittest.TestCase):
         self.assertEqual(graphics_runtime.configure(env, runner=run), "accelerated")
         self.assertEqual(env, {})
 
+    def test_linux_software_does_not_attempt_broken_glx_initialization(self):
+        for platform in ("linux", "win32", "darwin"):
+            env = {}
+            with patch("graphics_runtime.sys.platform", platform):
+                graphics_runtime.configure(env, safe=True)
+            self.assertEqual(env.get("QT_XCB_GL_INTEGRATION"), "none" if platform == "linux" else None)
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -24,6 +24,10 @@ def build():
     (ROOT / "desktop/build-info.json").write_text(json.dumps(identity))
     run(sys.executable, "-m", "PyInstaller", "--noconfirm", "--distpath", OUTPUT,
         "--workpath", ROOT / "desktop/build", ROOT / "desktop/super-md.spec", cwd=ROOT)
+    if sys.platform.startswith("linux"):
+        for name in ("libstdc++.so*", "libgcc_s.so*"):
+            if any((OUTPUT / "super-md").rglob(name)):
+                raise RuntimeError(f"Linux bundle must not override host driver runtime: {name}")
     return version
 
 def installers(version):
@@ -68,7 +72,7 @@ def installers(version):
             (deb / "usr/bin").mkdir(parents=True, exist_ok=True)
             (deb / "usr/bin/super-md").symlink_to("/opt/super-md/super-md")
             (deb / "DEBIAN").mkdir()
-            (deb / "DEBIAN/control").write_text(f"Package: super-md\nVersion: {version}\nArchitecture: amd64\nMaintainer: Yash Mahawar <YashMahawa@users.noreply.github.com>\nDepends: libc6 (>= 2.35), libnss3, libasound2 | libasound2t64, libxcb1, libxcb-cursor0, libxcb-icccm4, libxcb-keysyms1, libxcb-image0, libxcb-render-util0, libxcb-randr0, libxcb-shape0, libxcb-sync1, libxcb-xfixes0, libx11-xcb1, libxkbcommon0, libxkbcommon-x11-0, libwayland-client0, libwayland-cursor0, libegl1, libgl1, libgbm1, libdbus-1-3, fontconfig\nSection: editors\nPriority: optional\nDescription: Native Qt Markdown studio with typeset PDF export\n")
+            (deb / "DEBIAN/control").write_text(f"Package: super-md\nVersion: {version}\nArchitecture: amd64\nMaintainer: Yash Mahawar <YashMahawa@users.noreply.github.com>\nDepends: libc6 (>= 2.35), libstdc++6 (>= 12), libgcc-s1, libnss3, libasound2 | libasound2t64, libxcb1, libxcb-cursor0, libxcb-icccm4, libxcb-keysyms1, libxcb-image0, libxcb-render-util0, libxcb-randr0, libxcb-shape0, libxcb-sync1, libxcb-xfixes0, libx11-xcb1, libxkbcommon0, libxkbcommon-x11-0, libwayland-client0, libwayland-cursor0, libegl1, libgl1, libgbm1, libdbus-1-3, fontconfig\nSection: editors\nPriority: optional\nDescription: Native Qt Markdown studio with typeset PDF export\n")
             for hook in ("postinst", "postrm"):
                 shutil.copy2(ROOT / "desktop/linux/mime-refresh.sh", deb / "DEBIAN" / hook)
                 (deb / "DEBIAN" / hook).chmod(0o755)
@@ -76,7 +80,8 @@ def installers(version):
             run("dpkg-deb", "--build", "--root-owner-group", deb, debfile)
             # Debian package names such as libnss3/libasound2 are not Fedora or
             # openSUSE package names. Require shared-library capabilities in RPM.
-            dependencies = ["glibc >= 2.35", "libEGL.so.1()(64bit)", "libGL.so.1()(64bit)",
+            dependencies = ["glibc >= 2.35", "libstdc++.so.6()(64bit)", "libgcc_s.so.1()(64bit)",
+                            "libEGL.so.1()(64bit)", "libGL.so.1()(64bit)",
                             "libnss3.so()(64bit)", "libasound.so.2()(64bit)",
                             "libgbm.so.1()(64bit)", "libdbus-1.so.3()(64bit)", "fontconfig",
                             "libxkbcommon.so.0()(64bit)", "libxkbcommon-x11.so.0()(64bit)",

@@ -15,6 +15,10 @@ super-md --safe-graphics
 
 No persistent user preference or system-driver setting is changed. Removing that argument lets the next launch probe accelerated graphics again. CLI queries and Python cells bypass the graphics probe.
 
+On Linux, the software path also selects `QT_XCB_GL_INTEGRATION=none` so Qt's
+X11 integration does not try to initialize a failed GLX driver before painting.
+Wayland ignores this XCB-only setting. Healthy accelerated starts are unchanged.
+
 ## FUSE is a separate layer
 
 If an AppImage cannot mount because FUSE is unavailable, use its standard extraction mode:
@@ -28,6 +32,14 @@ A FUSE mounting failure happens before the application starts. It is not evidenc
 ## Linux runtime requirements
 
 Linux x86-64 packages are built on Ubuntu 22.04 and require glibc 2.35 or newer. They include Python/Qt/application resources, not arbitrary host GPU drivers. A normal desktop still supplies EGL/GL loader libraries, NSS, ALSA, DBus, GBM, fonts and a working Wayland/X11 session. The DEB declares its dependencies, including `libasound2 | libasound2t64`. The RPM uses `.so` capability dependencies rather than assuming Debian package names exist on Fedora/openSUSE.
+
+Linux builds deliberately use the destination's C++/unwind runtimes instead of
+bundling old `libstdc++.so.6`/`libgcc_s.so.1`. Newer Mesa/LLVM drivers can require
+newer symbols than a build-machine runtime supplies; shadowing the host library
+can break even an otherwise healthy graphics driver. See [PyInstaller's Linux
+forward-compatibility guidance](https://pyinstaller.org/en/stable/usage.html#making-gnu-linux-apps-forward-compatible).
+The DEB declares `libstdc++6 (>= 12)` and `libgcc-s1`; RPM declares their library
+capabilities. `desktop/test_package_runtime.py` checks this Linux-only boundary.
 
 Release containers start with no developer Python/Qt environment, no host GPU, and a fresh non-root user. AppImage extraction and installed DEB/RPM launches must render a note, process an embedded SVG portable file and export LaTeX to a real PDF. A headless Wayland compositor plus unavailable EGL client integration reproduces the original fatal path; the packaged editor must recover automatically. The container tests do not claim every GPU/compositor/remote-desktop configuration has been tested.
 
