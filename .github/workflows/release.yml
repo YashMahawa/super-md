@@ -161,6 +161,9 @@ jobs:
       - uses: swatinem/rust-cache@v2
         with:
           workspaces: ./smd-core -> target
+          # Preserve compiled engine dependencies when installer testing catches
+          # a packaging bug. Tests/publication still have to pass on every run.
+          cache-on-failure: true
       - run: npm ci
       - run: npm run build
       - run: npx vitest run

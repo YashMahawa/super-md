@@ -1,7 +1,7 @@
 """Select graphics before Qt starts; a failed driver must not abort the editor.
 
 The probe has no preferences, document access or Chromium sandbox changes. It
-paints a tiny non-activating window in an isolated process, because Qt's RHI
+paints HTML in a tiny non-activating window in an isolated process, because Qt's RHI
 initialization can call abort() rather than raise a catchable Python exception.
 """
 from __future__ import annotations
@@ -13,6 +13,15 @@ import tempfile
 from pathlib import Path
 
 PROBE_TIMEOUT = 8
+
+
+def painted_document(image) -> bool:
+    """Two HTML-only markers distinguish document pixels from Qt's surface."""
+    if image.isNull() or image.width() < 4 or image.height() < 2:
+        return False
+    y = image.height() // 2
+    return (image.pixelColor(image.width() // 4, y).name() == "#3476ad" and
+            image.pixelColor(image.width() * 3 // 4, y).name() == "#b34d66")
 
 
 def command() -> list[str]:
@@ -80,7 +89,21 @@ def probe(report: Path | None = None) -> int:
     engine = QQmlApplicationEngine()
     engine.loadData(b'''import QtQuick
 import QtQuick.Window
-Window { width: 24; height: 24; color: "#3476ad"; visible: false }
+import QtWebEngine
+Window {
+    id: probeWindow
+    width: 64; height: 32; color: "#010203"; visible: false
+    property bool documentLoaded: false
+    WebEngineProfile { id: isolatedProfile; offTheRecord: true }
+    WebEngineView {
+        anchors.fill: parent
+        profile: isolatedProfile
+        Component.onCompleted: loadHtml("<!doctype html><html><head><style>html,body{margin:0;width:100%;height:100%;overflow:hidden}body{background:linear-gradient(to right,#3476ad 0%,#3476ad 50%,#b34d66 50%,#b34d66 100%)}</style></head><body></body></html>")
+        onLoadingChanged: function(info) {
+            if (info.status === WebEngineView.LoadSucceededStatus) probeWindow.documentLoaded = true
+        }
+    }
+}
 ''')
     if not engine.rootObjects():
         return 1
@@ -99,15 +122,21 @@ Window { width: 24; height: 24; color: "#3476ad"; visible: false }
     window.show()
 
     def presented():
+        if not window.property("documentLoaded"):
+            return
         image = window.grabWindow()
-        valid = not image.isNull() and image.pixelColor(image.width() // 2, image.height() // 2).name() == "#3476ad"
-        if valid:
-            if report is not None:
-                report.write_text("SUPERMD_GRAPHICS_OK\n", encoding="utf-8")
-            print("SUPERMD_GRAPHICS_OK", flush=True)
+        if not painted_document(image):
+            return
+        if report is not None:
+            report.write_text("SUPERMD_GRAPHICS_OK\n", encoding="utf-8")
+        print("SUPERMD_GRAPHICS_OK", flush=True)
+        timer.stop()
         window.hide()
-        app.exit(0 if valid else 1)
+        app.exit(0)
 
-    QTimer.singleShot(250, presented)
+    timer = QTimer()
+    timer.setInterval(100)
+    timer.timeout.connect(presented)
+    timer.start()
     QTimer.singleShot(5000, lambda: app.exit(1))
     return app.exec()

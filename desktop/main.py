@@ -181,6 +181,8 @@ def main():
         engines.append(engine)
         studios.append(studio)
         if args.smoke:
+            import time
+            smoke_deadline = time.monotonic() + 30
             def verify():
                 script = "window.SuperMD?.post('smoke','export_failed',JSON.stringify({error:'SMOKE:'+JSON.stringify({headings:document.querySelectorAll('h1').length,math:document.querySelectorAll('.katex').length,charts:document.querySelectorAll('.interactive-chart svg').length,surfaces:document.querySelectorAll('.surface-chart').length,answers:document.querySelectorAll('details.callout').length,zoom:getComputedStyle(document.documentElement).getPropertyValue('--workspace-scale')})}))"
                 QMetaObject.invokeMethod(window,"runDocumentScript",Q_ARG("QVariant",script))
@@ -215,13 +217,32 @@ def main():
                         args.smoke_report.write_text(json.dumps({"ok":True,"readerColors":len(colors),
                             "software":os.environ.get('QT_QUICK_BACKEND')=='software',
                             "content":studio.message}),encoding='utf-8')
+                    if not valid and not args.visual_smoke and time.monotonic() < smoke_deadline:
+                        QTimer.singleShot(300, poll_smoke)
+                        return
                     if not valid or not args.visual_smoke:
                         app.exit(0 if valid else 2)
                 else:
+                    if not args.visual_smoke and time.monotonic() < smoke_deadline:
+                        QTimer.singleShot(300, poll_smoke)
+                        return
                     print(f"SMOKE FAILED: reader ready={studio.ready}",flush=True)
                     app.exit(2)
-            QTimer.singleShot(8000,verify)
-            QTimer.singleShot(10000,result)
+            def poll_smoke():
+                # Slow, cold-started mounted installers must present real
+                # document pixels, not merely beat a fixed ten-second timer.
+                if studio.ready:
+                    verify()
+                    QTimer.singleShot(300, result)
+                elif time.monotonic() >= smoke_deadline:
+                    result()
+                else:
+                    QTimer.singleShot(200, poll_smoke)
+            if args.visual_smoke:
+                QTimer.singleShot(8000,verify)
+                QTimer.singleShot(10000,result)
+            else:
+                QTimer.singleShot(200,poll_smoke)
             if args.visual_smoke:
                 # Exercise presented Qt pixels, not just generated tokens or QML parsing.
                 def capture(name):

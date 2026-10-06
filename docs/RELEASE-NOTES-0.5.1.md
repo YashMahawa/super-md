@@ -4,6 +4,7 @@
 
 - A failed Wayland/OpenGL/EGL graphics initialization no longer aborts the editor before it opens. An isolated, bounded startup probe checks real Qt rendering; when it fails, Super MD selects software rendering for both Qt Quick and the document pane.
 - Healthy systems keep accelerated rendering. `--safe-graphics` is available as an explicit troubleshooting option. This does not disable Chromium's security sandbox or change system drivers.
+- The probe checks actual HTML pixels with an off-the-record renderer, not just the native controls. This catches document-only GPU context failures seen on Intel Mac. Installer smoke checks wait for real readiness/presentation within a bounded deadline rather than an arbitrary ten-second startup timer.
 - Linux packages use the host C++/unwind runtimes rather than overriding newer Mesa/LLVM drivers with older bundled libraries. Software fallback also avoids X11 GLX initialization, addressing a second clean-Ubuntu-24.04 startup abort caught by the new installer checks.
 - Debian dependencies include the XCB cursor integration, GBM, font configuration and both older/newer ALSA package names. RPM dependencies use Linux shared-library capabilities rather than Debian-only package names.
 - Both Linux package formats explicitly require Wayland's server library too: Qt links it even in X11 mode. The fresh Fedora check caught this missing dependency before publication.

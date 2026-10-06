@@ -53,7 +53,7 @@ def check(executable: Path, version: str, graphics: str) -> None:
         if not pdf.read_bytes().startswith(b"%PDF-") or pdf.stat().st_size < 10000:
             raise RuntimeError("Packaged native math/PDF engine failed")
         report = root / "presented.json"
-        args = ["--test-state", "--smoke", "--smoke-report", str(report), "--quit-after", "20000"]
+        args = ["--test-state", "--smoke", "--smoke-report", str(report), "--quit-after", "40000"]
         if graphics == "software":
             args.append("--safe-graphics")
         result = run(*args, timeout=60)

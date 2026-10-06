@@ -8,6 +8,15 @@ import graphics_runtime
 
 
 class GraphicsRuntimeTest(unittest.TestCase):
+    def test_only_presented_html_markers_count_as_a_working_document_renderer(self):
+        def image(left, right, empty=False):
+            return SimpleNamespace(isNull=lambda: empty, width=lambda: 64, height=lambda: 32,
+                                   pixelColor=lambda x, y: SimpleNamespace(name=lambda: left if x < 32 else right))
+        self.assertFalse(graphics_runtime.painted_document(image("#010203", "#010203")))
+        self.assertFalse(graphics_runtime.painted_document(image("#3476ad", "#3476ad")))
+        self.assertFalse(graphics_runtime.painted_document(image("#3476ad", "#b34d66", True)))
+        self.assertTrue(graphics_runtime.painted_document(image("#3476ad", "#b34d66")))
+
     def test_healthy_probe_preserves_platform_backend_and_user_flags(self):
         env = {"QT_QPA_PLATFORM": "wayland", "QSG_RHI_BACKEND": "vulkan",
                "QTWEBENGINE_CHROMIUM_FLAGS": "--enable-smooth-scrolling"}

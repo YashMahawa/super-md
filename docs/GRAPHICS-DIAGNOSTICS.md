@@ -58,6 +58,13 @@ Windows checks exercise the installed EXE and its built-in Python; macOS checks 
 
 ## Regression checks
 
+The startup probe renders two HTML-only color markers in an off-the-record
+WebEngine profile. A painted Qt background is not enough: the actual document
+compositor must present both markers. This detects document-only GPU failures
+even when native controls render correctly. Native installer smoke checks wait
+for reader readiness and actual pixels for up to 30 seconds; missing content or
+painting still fails, and a watchdog exit without a success report cannot pass.
+
 `desktop/test_graphics_runtime.py` covers healthy, aborted, timed-out and explicitly software startup. `desktop/check_packaged.py` checks the actual packaged executable, report-based painted pixels, native PDF and portable embedded assets. `scripts/check-linux-container.sh` is for disposable CI distro containers only: do not run it directly on your laptop, because it installs packages and creates a test user in the container.
 
 Checkbox position regressions are covered in the shared browser renderer's desktop/mobile paths. Android API 35/36 emulator suites and APK signature/source/alignment checks remain mandatory publication gates. No physical phone access is required.
