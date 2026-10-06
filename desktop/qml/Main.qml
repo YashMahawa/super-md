@@ -290,6 +290,7 @@ ApplicationWindow {
                 onExportRequested: window.showExport(false)
             }
             Rectangle {
+                objectName: "readerLoadingOverlay"
                 anchors.fill: parent
                 visible: !viewState.readerReady
                 color: viewState.colors.surface

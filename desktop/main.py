@@ -195,6 +195,9 @@ def main():
                     valid = valid and zoom is not None and zoom.property("height") == 36
                     fullscreen = window.findChild(QObject,"fullscreenButton")
                     valid = valid and fullscreen is not None and fullscreen.property("text") == "" and fullscreen.property("availableHeight") >= 24
+                    loading = window.findChild(QObject, "readerLoadingOverlay")
+                    # A painted placeholder/spinner is not a painted document.
+                    valid = valid and loading is not None and not loading.property("visible")
                     if fullscreen:
                         print(f"FULLSCREEN ICON: availableHeight={fullscreen.property('availableHeight')} padding={fullscreen.property('topPadding')}/{fullscreen.property('bottomPadding')}",flush=True)
                     # DOM readiness alone is not proof of working graphics. A
