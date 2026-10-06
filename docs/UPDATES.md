@@ -4,7 +4,7 @@ Settings → About & updates shows the installed version. Startup checks are ena
 by default; automatic downloads are off by default. Turning checks off keeps the
 app fully offline unless you explicitly check. Notes are never uploaded.
 
-Checks use `YashMahawa/super-md`'s latest published, stable GitHub Release. Drafts,
+Checks use this repository's latest published, stable GitHub Release. Drafts,
 prereleases, older versions, missing assets and untrusted asset URLs are rejected.
 Downloads are streamed to temporary files with declared size limits and must
 match SHA256SUMS before becoming installable. HTTPS GitHub checksums establish
