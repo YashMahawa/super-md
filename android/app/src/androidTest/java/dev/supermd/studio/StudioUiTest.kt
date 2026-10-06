@@ -60,6 +60,53 @@ class StudioUiTest {
         repeat(2) { if (compose.onAllNodesWithText("Continue").fetchSemanticsNodes().isNotEmpty()) compose.onNodeWithText("Continue").performClick() }
         compose.onAllNodesWithText("Explore the sample").fetchSemanticsNodes().firstOrNull()?.let { compose.onNodeWithText("Explore the sample").performClick() }
     }
+    @Test fun checkingTasksKeepsNativeReadingPositionThroughUndoAndRedo() {
+        welcome()
+        val model=androidx.lifecycle.ViewModelProvider(compose.activity)[StudioViewModel::class.java]
+        temporaryNoteState=model.state.value
+        val content=(0 until 65).joinToString("\n\n") { index ->
+            "## Task section $index\n\n" +
+                (if(index==42) "- [ ] Keep my place\n- [ ] Another task\n\n" else "") +
+                "Long study paragraph with useful context and stable line wrapping. ".repeat(32)
+        }
+        val rectScript="""(()=>{const task=document.querySelector('input[type=checkbox]');if(!task)return null;const r=task.getBoundingClientRect();return {x:r.left+r.width/2,y:r.top+r.height/2,top:r.top,width:innerWidth,scale:document.querySelector('.document-page').dataset.scale};})()"""
+        fun rect()=org.json.JSONObject(javascriptUntil(rectScript) {it.startsWith("{")})
+        for(mode in listOf("reader","live"))for(zoom in listOf(100f,180f)) {
+            compose.runOnIdle {model.edit(model.state.value.active.id,content);model.mode(mode);model.zoom(zoom)}
+            javascriptUntil("document.querySelector('.document-page')?.dataset.scale") {
+                kotlin.math.abs((it.trim('"').toFloatOrNull()?:0f)-zoom/100f)<.001f
+            }
+            javascriptUntil("(()=>{window.supermdHeading?.('task-section-42');const r=document.querySelector('input[type=checkbox]')?.getBoundingClientRect();return !!r&&r.top>=0&&r.bottom<innerHeight;})()") {it=="true"}
+            android.os.SystemClock.sleep(400)
+            val before=rect()
+            val point=AtomicReference(androidx.compose.ui.geometry.Offset.Zero)
+            compose.runOnIdle {
+                val reader=web(compose.activity.window.decorView)!!
+                val xy=IntArray(2);reader.getLocationOnScreen(xy)
+                val scale=reader.width.toFloat()/before.getDouble("width").toFloat()
+                point.set(androidx.compose.ui.geometry.Offset(xy[0]+before.getDouble("x").toFloat()*scale,xy[1]+before.getDouble("y").toFloat()*scale))
+            }
+            val instrument=androidx.test.platform.app.InstrumentationRegistry.getInstrumentation()
+            val time=android.os.SystemClock.uptimeMillis();val position=point.get()
+            instrument.sendPointerSync(android.view.MotionEvent.obtain(time,time,android.view.MotionEvent.ACTION_DOWN,position.x,position.y,0))
+            instrument.sendPointerSync(android.view.MotionEvent.obtain(time,time+60,android.view.MotionEvent.ACTION_UP,position.x,position.y,0))
+            val checked=content.replaceFirst("- [ ] Keep my place","- [x] Keep my place")
+            compose.waitUntil(5000) {model.state.value.active.content==checked}
+            fun assertPosition(action:String) {
+                android.os.SystemClock.sleep(400)
+                val after=rect()
+                assertEquals("$mode/$zoom $action must retain magnification",before.getString("scale"),after.getString("scale"))
+                assertEquals("$mode/$zoom $action must not scroll away",before.getDouble("top"),after.getDouble("top"),3.0)
+            }
+            assertPosition("checking")
+            javascriptUntil("window.supermdHistory?.('undo');true") {it=="true"}
+            compose.waitUntil(5000) {model.state.value.active.content==content}
+            assertPosition("undo")
+            javascriptUntil("window.supermdHistory?.('redo');true") {it=="true"}
+            compose.waitUntil(5000) {model.state.value.active.content==checked}
+            assertPosition("redo")
+        }
+    }
     @Test fun manualDarkAccentPaintsNativeIconsAndReaderWithoutOemColorLeaks() {
         welcome()
         val model=androidx.lifecycle.ViewModelProvider(compose.activity)[StudioViewModel::class.java]

@@ -37,4 +37,4 @@ Windows checks exercise the installed EXE and its built-in Python; macOS checks 
 
 `desktop/test_graphics_runtime.py` covers healthy, aborted, timed-out and explicitly software startup. `desktop/check_packaged.py` checks the actual packaged executable, report-based painted pixels, native PDF and portable embedded assets. `scripts/check-linux-container.sh` is for disposable CI distro containers only: do not run it directly on your laptop, because it installs packages and creates a test user in the container.
 
-Native Android device/emulator testing is not part of this desktop-portability fix at the user's request. Checkbox position regressions are covered in the shared browser renderer's desktop/mobile paths, and APK signature/source/alignment checks remain mandatory.
+Checkbox position regressions are covered in the shared browser renderer's desktop/mobile paths. Android API 35/36 emulator suites and APK signature/source/alignment checks remain mandatory publication gates. No physical phone access is required.

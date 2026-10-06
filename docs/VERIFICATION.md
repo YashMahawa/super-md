@@ -15,9 +15,10 @@
   not require stdout to report a successful presented frame.
 - Publication requires additional exact-commit CI and actual installer checks:
   clean Linux distro containers, installed Windows EXE, mounted macOS DMGs and
-  signed/source-matched APK verification. No phone or Android emulator tests are
-  run for this update, following the user's explicit request. Working installs,
-  notes and running user windows are preserved.
+  signed/source-matched APK verification. Android API 35/36 emulator jobs are
+  required after the user's clarification to retain Android CI coverage. No
+  physical phone testing is performed. Working installs, notes and running user
+  windows are preserved.
 
 ## Fixed-size reading overlays and shared branding — 0.4.14
 

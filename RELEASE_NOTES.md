@@ -11,7 +11,7 @@
 
 - Checking tasks no longer unnecessarily rebuilds settled zoom geometry. Reading position and magnification stay stable through checking, undo and redo in Read and Live modes.
 - Shared-reader browser regressions exercise both Qt and mobile layout paths at normal and enlarged zoom, including long/windowed notes.
-- Android phone/emulator tests were not rerun, as requested. The updated signed release APK includes the shared-reader fix; signing, alignment and source identity remain publication requirements.
+- Android API 35/36 emulator suites remain release gates alongside shared-reader checkbox regressions. The updated signed release APK includes the shared-reader fix; signing, alignment and source identity remain publication requirements. No physical phone testing is performed.
 
 Previous 0.5.0 features remain intact, including Python/NumPy/Matplotlib setup, graph probing, fullscreen and reading-position improvements. See [0.5.0 notes](https://github.com/YashMahawa/super-md/releases/tag/v0.5.0).
 

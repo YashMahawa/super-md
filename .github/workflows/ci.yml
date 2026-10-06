@@ -147,9 +147,6 @@ jobs:
             android/app/build/reports/lint-results-release.html
 
   android-device-tests:
-    # Explicit one-commit opt-out requested by the user for this desktop fix.
-    # Subsequent commits/PRs automatically resume both device suites.
-    if: ${{ !contains(github.event.head_commit.message, '[skip android device tests]') }}
     strategy:
       fail-fast: false
       matrix:
