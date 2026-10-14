@@ -366,6 +366,7 @@ def main():
         if note:
             studio.openPath(str(note))
         return studio
+    app.aboutToQuit.connect(lambda:setattr(session,"quitting",True))
     create_window(args.note)
     if broker:
         broker.requested.connect(lambda note: create_window(note or None))

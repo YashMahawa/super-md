@@ -1,9 +1,17 @@
 import unittest
 
-from package_runtime import portable_binaries, wayland_dependencies
+from package_runtime import portable_binaries, wayland_dependencies, linux_support_binaries, X11_SUPPORT
 
 
 class PackageRuntimeTest(unittest.TestCase):
+    def test_linux_explicitly_bundles_xcb_helpers_but_not_graphics_driver_abi(self):
+        entries=linux_support_binaries(lambda name:"/usr/lib/"+name,"linux")
+        self.assertEqual(entries,[("/usr/lib/"+name,".") for name in X11_SUPPORT])
+        self.assertIn("libxcb-icccm.so.4",X11_SUPPORT)
+        self.assertFalse(any("libGL" in name or "libEGL" in name or "libstdc++" in name for name in X11_SUPPORT))
+        self.assertEqual(linux_support_binaries(lambda _:None,"darwin"),[])
+        with self.assertRaisesRegex(RuntimeError,"Missing Linux build dependency"):
+            linux_support_binaries(lambda _:None,"linux")
     def test_both_linux_packages_require_wayland_client_cursor_and_server(self):
         self.assertEqual(wayland_dependencies("deb"),
                          ["libwayland-client0", "libwayland-cursor0", "libwayland-server0"])

@@ -59,6 +59,22 @@ class StudioUiTest {
     private fun welcome() {
         repeat(2) { if (compose.onAllNodesWithText("Continue").fetchSemanticsNodes().isNotEmpty()) compose.onNodeWithText("Continue").performClick() }
         compose.onAllNodesWithText("Explore the sample").fetchSemanticsNodes().firstOrNull()?.let { compose.onNodeWithText("Explore the sample").performClick() }
+        // First-use-only Welcome is product behavior. Tests that exercise the
+        // sample must provide their own fixture on subsequent Activity starts.
+        val model=androidx.lifecycle.ViewModelProvider(compose.activity)[StudioViewModel::class.java]
+        compose.runOnIdle {if(model.state.value.active.content.isBlank())model.edit(model.state.value.active.id,sample)}
+    }
+    @Test fun viewingAndDraggingSvgNeverMutatesTheNativeNote() {
+        welcome()
+        val model=androidx.lifecycle.ViewModelProvider(compose.activity)[StudioViewModel::class.java]
+        temporaryNoteState=model.state.value
+        val content="# Image safety\n\n```svg\n<svg xmlns=\"http://www.w3.org/2000/svg\" width=\"200\" height=\"100\"><rect width=\"200\" height=\"100\" fill=\"#6486b2\"/></svg>\n```\n\nLast paragraph."
+        compose.runOnIdle {model.edit(model.state.value.active.id,content);model.mode("reader");model.zoom(100f)}
+        javascriptUntil("(()=>{const img=document.querySelector('.svg-diagram');if(!img)return false;img.click();return !!document.querySelector('.image-viewer');})()") {it=="true"}
+        javascriptUntil("(()=>{document.querySelector('button[aria-label=\"Close image viewer\"]')?.click();return !document.querySelector('.image-viewer');})()") {it=="true"}
+        javascriptUntil("(()=>{const img=document.querySelector('.svg-diagram');return !!img && !img.draggable && !img.dispatchEvent(new DragEvent('dragstart',{bubbles:true,cancelable:true,dataTransfer:new DataTransfer()}));})()") {it=="true"}
+        compose.runOnIdle {assertEquals("Viewing must not import a second asset or append a broken block",content,model.state.value.active.content)}
+        javascriptUntil("document.querySelectorAll('.image-error,.render-error').length") {it=="0"}
     }
     @Test fun checkingTasksKeepsNativeReadingPositionThroughUndoAndRedo() {
         welcome()
@@ -381,8 +397,7 @@ ax.set_title("Matplotlib 3D figure")
         assertNull(model.state.value.error)
     }
     @Test fun realReaderAndNativeControlsAreConnected() {
-        repeat(2) { if (compose.onAllNodesWithText("Continue").fetchSemanticsNodes().isNotEmpty()) compose.onNodeWithText("Continue").performClick() }
-        compose.onAllNodesWithText("Explore the sample").fetchSemanticsNodes().firstOrNull()?.let { compose.onNodeWithText("Explore the sample").performClick() }
+        welcome()
         compose.onNodeWithText("Read", useUnmergedTree = true).performClick()
         val result = javascriptUntil("({math:document.querySelectorAll('.katex').length,callouts:document.querySelectorAll('.callout-tip').length,graphs:document.querySelectorAll('.interactive-chart svg').length,errors:document.querySelectorAll('.katex-error').length})") { it.contains("\"callouts\":1") && it.contains("\"graphs\":1") }
         javascriptUntil("document.querySelector('#root').getBoundingClientRect().height") { (it.toDoubleOrNull() ?: 0.0) > 100 }
@@ -537,7 +552,10 @@ ax.set_title("Matplotlib 3D figure")
             // Orientation/mode restoration may correctly retain a reading
             // anchor below the title. Test title clearance at the note's start,
             // not while intentionally scrolled into the document.
-            javascriptUntil("document.querySelector('.android-reading').scrollTop=0;true") {it=="true"}
+            // Announce an actual user navigation before the start alignment.
+            // A bare programmatic scrollTop write is not a gesture and can be
+            // superseded by pending mode/reading-position restoration.
+            javascriptUntil("window.supermdNativeWheel?.(0,0,{x:innerWidth/2,y:innerHeight*.75},false);document.querySelector('.android-reading').scrollTop=0;true") {it=="true"}
             javascriptUntil("document.querySelector('h1').getBoundingClientRect().top>=parseFloat(getComputedStyle(document.documentElement).getPropertyValue('--native-chrome-inset'))") {it=="true"}
             // A margin tap has no text/link/edit action and toggles reading UI.
             compose.onRoot().performTouchInput {click(androidx.compose.ui.geometry.Offset(this.width*.98f,height*.60f))}

@@ -1,6 +1,28 @@
 """Keep the Linux driver ABI owned by the destination distribution."""
 from pathlib import PurePosixPath
 
+# PyInstaller intentionally omits many /usr/lib libraries. XCB's helper
+# libraries are not installed on every desktop (including AppImageHub's Xvfb
+# runner), unlike the driver-owned GL/EGL/C++ ABI which must stay on the host.
+X11_SUPPORT = ("libxcb-icccm.so.4", "libxcb-keysyms.so.1", "libxcb-image.so.0",
+               "libxcb-render-util.so.0", "libxcb-cursor.so.0",
+               "libxkbcommon-x11.so.0", "libX11-xcb.so.1",
+               "libxcb-randr.so.0", "libxcb-shape.so.0", "libxcb-sync.so.1",
+               "libxcb-xfixes.so.0", "libxcb-xkb.so.1", "libxcb-util.so.1",
+               "libwayland-client.so.0", "libwayland-cursor.so.0", "libwayland-server.so.0")
+
+
+def linux_support_binaries(resolve, platform):
+    if not platform.startswith("linux"):
+        return []
+    entries = []
+    for name in X11_SUPPORT:
+        path = resolve(name)
+        if not path:
+            raise RuntimeError(f"Missing Linux build dependency: {name}")
+        entries.append((path, "."))
+    return entries
+
 
 def wayland_dependencies(package_format):
     """Qt links all three Wayland libraries, even when launched through X11."""

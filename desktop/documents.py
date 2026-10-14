@@ -48,15 +48,17 @@ def open_note(path: Path) -> tuple[str, dict[str, str], bool]:
     if path.stat().st_size > MAX_FILE:
         raise ValueError("Note exceeds 120 MB")
     raw = path.read_text(encoding="utf-8-sig")
-    if path.suffix.lower() in (".smd", ".fmd") and raw.lstrip().startswith("{"):
+    # Sharing providers and browsers may rename a portable note to .txt/.json,
+    # or omit its extension. The validated envelope, not a filename, is decisive.
+    if raw.lstrip().startswith("{"):
         try:
             value = json.loads(raw)
         except json.JSONDecodeError:
             # A Markdown note starting with a brace is not necessarily a bundle.
-            if '"supermd-' in raw[:200]:
+            if re.search(r'"format"\s*:\s*"supermd-(?:smd|fmd)"', raw[:65536]):
                 raise ValueError("This portable note is damaged")
         else:
-            if isinstance(value, dict) and "format" in value:
+            if isinstance(value, dict) and (value.get("format") in ("supermd-smd", "supermd-fmd") or path.suffix.lower() in (".smd", ".fmd") and "format" in value):
                 validate(value)
                 return value["markdown"], value["assets"], True
     return raw, {}, False

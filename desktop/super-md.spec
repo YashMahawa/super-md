@@ -4,6 +4,10 @@ import sys
 from importlib.metadata import distribution
 from pathlib import Path
 from PyInstaller.utils.hooks import collect_data_files
+from PyInstaller.depend.bindepend import resolve_library_path
+
+sys.path.insert(0, str(Path(SPECPATH)))
+from package_runtime import linux_support_binaries, portable_binaries
 
 root = Path(SPECPATH).parent
 engine = root / "smd-core" / "target" / "release" / ("smd-engine.exe" if sys.platform == "win32" else "smd-engine")
@@ -49,11 +53,10 @@ if sys.platform in ("win32", "darwin"):
 # matplotlib imports unittest (via its testing helpers), so only Linux drops it.
 excluded = ["tkinter", "pytest", "PyQt6", "PyQt5"] + (["unittest"] if sys.platform not in ("win32", "darwin") else [])
 analysis = Analysis([str(root / "desktop/main.py")], pathex=[str(root / "desktop")],
-    binaries=[(str(engine), "resources/desktop")], datas=data,
+    binaries=[(str(engine), "resources/desktop"), *linux_support_binaries(resolve_library_path, sys.platform)], datas=data,
     hiddenimports=hidden,
     excludes=excluded, noarchive=False)
 sys.path.insert(0, str(root / "desktop"))
-from package_runtime import portable_binaries
 analysis.binaries = portable_binaries(analysis.binaries, sys.platform)
 pyz = PYZ(analysis.pure)
 exe = EXE(pyz, analysis.scripts, [], exclude_binaries=True, name="super-md",

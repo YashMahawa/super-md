@@ -19,7 +19,7 @@ test("checkbox edits retain reading position, magnification and undo in Read and
     await task.click();await expect(task).toBeChecked();
     await page.waitForTimeout(400);
     const after=await task.boundingBox();
-    expect(Math.abs(after!.y-before!.y)).toBeLessThan(3);
+    expect(Math.abs(after!.y-before!.y),`${host}/${mode}/${zoom}: checkbox viewport`).toBeLessThan(3);
     expect(await page.locator('.document-page').getAttribute('data-scale')).toBe(String(zoom/100));
     expect(await page.evaluate(()=>(window as any).lastCheckboxEdit)).toBe(content.replace('- [ ] Keep my place','- [x] Keep my place'));
     await page.evaluate(()=>window.supermdHistory?.('undo'));await expect(task).not.toBeChecked();

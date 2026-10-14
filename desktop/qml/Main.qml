@@ -26,7 +26,7 @@ ApplicationWindow {
     property bool chromeAwake: true
     Timer { id: chromeIdle; interval: 2200; onTriggered: { if(studyToolbar.hovered || studyToolbar.focusWithin) restart(); else window.chromeAwake = false } }
     // Deliberate desktop reveal target; ordinary pointer movement in a note
-    // does not summon controls. Scroll and click requests come from the reader.
+    // does not summon controls. Scrolling only hides; clicks may toggle them.
     HoverHandler { onPointChanged: { if(window.viewState.fullscreen && point.position.y < 56) window.chromeAwake = true; if(window.chromeAwake) chromeIdle.restart() } }
     WindowModes {
         id: windowModes
@@ -50,9 +50,9 @@ ApplicationWindow {
 
     Connections {
         target: studio
-        function onAllowClose() { closingAllowed = true; window.close() }
-        function onFlushFailed(canClose) { flushDialog.canClose = canClose; flushDialog.open() }
-        function onCloseRequested(name) { closeDialog.title = "Save changes to " + name + "?"; closeDialog.open() }
+        function onAllowClose() { flushDialog.close(); closeDialog.close(); closingAllowed = true; window.close() }
+        function onFlushFailed(canClose) { if(!closingAllowed && !closeDialog.visible) { flushDialog.canClose = canClose; flushDialog.open() } }
+        function onCloseRequested(name) { flushDialog.close(); closeDialog.title = "Save changes to " + name + "?"; if(!closeDialog.visible) closeDialog.open() }
         function onSaveRequested(name) { saveDialog.selectedFile = studio.defaultSaveLocation(name); saveDialog.open() }
         function onNoteLocationPickerRequested() { noteFolderDialog.open() }
         function onExportRequested(format) { outputFormat = format; exportDialog.open() }
@@ -180,7 +180,12 @@ ApplicationWindow {
                     Layout.preferredHeight: Math.min(240, viewState.recent.length * 40)
                     clip: true
                     model: viewState.recent
-                    delegate: ItemDelegate { id: recentEntry; required property string modelData; width: ListView.view.width - 20; height: 40; text: modelData.split("/").pop(); onClicked: studio.openNote(modelData); Hint { visible: recentEntry.hovered; text: modelData } }
+                    delegate: Item {
+                        required property string modelData
+                        width: ListView.view.width - 20; height: 40
+                        ItemDelegate { id: recentEntry; anchors.left: parent.left; anchors.right: pin.left; height: 40; text: modelData.split("/").pop(); onClicked: studio.openNote(modelData); Hint { visible: recentEntry.hovered; text: modelData } }
+                        ActionButton { id: pin; anchors.right: parent.right; anchors.verticalCenter: parent.verticalCenter; glyph: "PushPin"; compact: true; tonal: studio.pinnedRecent.includes(modelData); ToolTip.text: studio.pinnedRecent.includes(modelData) ? "Unpin note" : "Pin note"; Accessible.name: ToolTip.text; onClicked: studio.pinRecent(modelData) }
+                    }
                     ScrollBar.vertical: ExpressiveScrollBar { }
                 }
                 Label { visible: !viewState.folder && !viewState.recent.length; text: "Open any folder for quick access. Your notes stay ordinary files."; wrapMode: Text.WordWrap; Layout.fillWidth: true; color: viewState.colors.muted }

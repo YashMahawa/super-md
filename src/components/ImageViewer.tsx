@@ -4,7 +4,7 @@ import { setReaderOverlay } from "../readerOverlays";
 import { wheelIntent } from "../wheelIntent";
 
 export default function ImageViewer() {
-  const [image, setImage] = useState<{ src: string; alt: string; owner: HTMLElement | null } | null>(null);
+  const [image, setImage] = useState<{ src: string; alt: string; filter:string; owner: HTMLElement | null } | null>(null);
   const [zoom, setZoom] = useState(100), [pan, setPan] = useState({ x: 0, y: 0 });
   const pointers = useRef(new Map<number, Point>()), gesture = useRef({ distance: 0, center: {x:0,y:0} });
   const zoomRef = useRef(zoom); zoomRef.current = zoom;
@@ -23,7 +23,7 @@ export default function ImageViewer() {
       const target = event.target instanceof Element ? event.target.closest<HTMLImageElement>(".markdown-body img") : null;
       if (!target?.currentSrc) return;
       event.preventDefault(); event.stopImmediatePropagation();
-      setImage({ src: target.currentSrc, alt: target.alt || "Image", owner: target.closest("[data-note-image-source]") }); fit();
+      setImage({ src: target.currentSrc, alt: target.alt || "Image", filter:getComputedStyle(target).filter, owner: target.closest("[data-note-image-source]") }); fit();
     };
     document.addEventListener("click", open, true);
     return () => document.removeEventListener("click", open, true);
@@ -62,7 +62,7 @@ export default function ImageViewer() {
       if (pointers.current.size === 2) { const [a,b] = [...pointers.current.values()], center={x:(a.x+b.x)/2,y:(a.y+b.y)/2}, distance=Math.hypot(a.x-b.x,a.y-b.y); if (gesture.current.distance) { scale(zoomRef.current * distance / gesture.current.distance, gesture.current.center); translate({x:panRef.current.x+center.x-gesture.current.center.x,y:panRef.current.y+center.y-gesture.current.center.y}); } gesture.current={distance,center}; }
       else translate({ x: panRef.current.x + event.clientX-old.x, y: panRef.current.y + event.clientY-old.y });
     }} onPointerUp={event => pointers.current.delete(event.pointerId)} onPointerCancel={event => pointers.current.delete(event.pointerId)}>
-      <img draggable={false} src={image.src} alt={image.alt} style={{ transform: `translate(${pan.x}px,${pan.y}px) scale(${zoom/100})` }} />
+      <img draggable={false} src={image.src} alt={image.alt} style={{ filter:image.filter, transform: `translate(${pan.x}px,${pan.y}px) scale(${zoom/100})` }} />
     </div>
     <footer><output aria-label="Image zoom">{Math.round(zoom)}%</output>{image.owner && <><button onClick={() => edit("replace")}>Replace</button><button onClick={() => edit("remove")}>Remove</button></>}</footer>
   </section>;

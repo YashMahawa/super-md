@@ -59,6 +59,116 @@ class StudioTest(unittest.TestCase):
         self.studio.post("invalid","reader_chrome",'{"action":"anything"}')
         self.assertEqual(received,["show","hide","toggle"])
 
+    def test_retired_windows_ignore_queued_jobs_and_late_callbacks(self):
+        studio=self.studio
+        studio.stop();studio.pool.shutdown(wait=True,cancel_futures=True)
+        studio._choose_default_python()
+        studio._submit(lambda:1,lambda *_:self.fail("Retired callback ran"))
+        studio._complete((lambda *_:self.fail("Retired callback ran"),None,None,False))
+
+    def test_pinned_recents_are_first_and_never_evicted_by_recent_opens(self):
+        studio=self.studio;studio.recent=["/notes/pinned.md"]
+        studio.pinRecent("/notes/pinned.md")
+        for i in range(25):studio.recent=[f"/notes/{i}.md"]+studio.recent
+        self.assertEqual(len(studio.recent),10)
+        self.assertEqual(studio.recent[0],"/notes/pinned.md")
+        studio.pinRecent("/notes/pinned.md");self.assertNotIn("/notes/pinned.md",studio.pinnedRecent)
+
+    def test_palette_loads_do_not_reserialize_the_note_and_ready_resets_the_cache(self):
+        studio=self.studio;messages=[];studio.readerLoad.connect(messages.append)
+        studio._current()["content"]="A big note. "*20000
+        studio.post("ready","reader_ready","{}")
+        self.assertIn("content",json.loads(messages[-1]))
+        studio.setting("theme",'"dark"')
+        value=json.loads(messages[-1]);self.assertTrue(value["contentUnchanged"]);self.assertNotIn("content",value)
+        self.assertLess(len(messages[-1]),5000)
+        studio.post("ready-again","reader_ready","{}")
+        self.assertIn("content",json.loads(messages[-1]))
+
+    def test_first_run_sample_does_not_return_for_existing_users(self):
+        self.session.settings["welcomed"]=True
+        window=self.window();self.assertEqual(window._current()["name"],"Untitled.md")
+        self.assertEqual(window._current()["content"],"")
+
+    def test_clean_tabs_are_recorded_for_restart_and_reopened_in_order(self):
+        studio=self.studio;self.session.settings["welcomed"]=True
+        paths=[]
+        for i in range(3):
+            path=studio.data/f"restart-{i}.md";path.write_text(f"# Note {i}");paths.append(str(path));studio.openNote(str(path));self.await_idle()
+        studio._recover();self.flush()
+        value=json.loads((studio.data/"startup.json").read_text());self.assertEqual(value["paths"],paths)
+        self.session.startup_paths=paths;self.session.startup_active=paths[1]
+        restored=self.window()
+        deadline=time.monotonic()+3
+        while restored._restoring_paths and time.monotonic()<deadline:self.app.processEvents();time.sleep(.005)
+        self.assertEqual([tab["path"] for tab in restored.tabs],paths)
+        self.assertEqual(restored._current()["path"],paths[1])
+
+    def test_reading_locations_are_durable_without_a_persistent_web_profile(self):
+        studio=self.studio;path=studio.data/"position.md";path.write_text("# Reading")
+        studio.openNote(str(path));self.await_idle()
+        point={"top":1200,"offset":12,"zoom":150,"mode":"reader"}
+        studio.post("position","reading_position",json.dumps({"id":studio.active,"location":point}))
+        studio._save_positions();self.flush()
+        self.assertEqual(json.loads((studio.data/"reading-positions.json").read_text())[str(path)],point)
+        messages=[];studio.readerLoad.connect(messages.append);studio.ready=True;studio._emit()
+        self.assertEqual(json.loads(messages[-1])["readingLocation"],point)
+
+    def test_blank_startup_keeps_recovered_drafts_but_opens_a_new_active_note(self):
+        self.session.settings.update(welcomed=True,startup="new")
+        self.session.initial_recovery=[self.studio._note("Draft.md","Do not lose this")]
+        window=self.window()
+        self.assertEqual(window._current()["content"],"")
+        self.assertEqual(window.tabs[1]["content"],"Do not lose this")
+
+    def test_closing_one_of_multiple_windows_does_not_restore_its_clean_tabs(self):
+        second=self.window()
+        first_path=self.studio.data/"closed.md";first_path.write_text("# Closed")
+        self.studio.openNote(str(first_path));self.await_idle()
+        self.studio._recover();second._recover();self.flush()
+        self.studio.stop();self.flush()
+        self.assertNotIn(str(first_path),json.loads((self.studio.data/"startup.json").read_text())["paths"])
+
+    def test_mixed_clean_and_draft_startup_keeps_order_and_active_draft(self):
+        studio=self.studio;self.session.settings["welcomed"]=True
+        path=studio.data/"clean.md";path.write_text("# Clean")
+        studio.openNote(str(path));self.await_idle()
+        studio.newNote();draft=studio._current();draft["content"]="Unfinished work"
+        studio._recover();self.flush()
+        value=json.loads((studio.data/"startup.json").read_text())
+        self.session.startup_paths=value["paths"];self.session.startup_entries=value["tabs"]
+        self.session.startup_active=value["active"];self.session.startup_active_id=value["activeId"]
+        self.session.initial_recovery=[dict(draft)]
+        restored=self.window();deadline=time.monotonic()+3
+        while restored._restoring_paths and time.monotonic()<deadline:self.app.processEvents();time.sleep(.005)
+        self.assertEqual([t["path"] for t in restored.tabs],[str(path),""])
+        self.assertEqual(restored._current()["content"],"Unfinished work")
+
+    def test_native_folder_notifications_refresh_additions_and_removals(self):
+        studio=self.studio;folder=studio.data/"watched";folder.mkdir();studio.openFolder(str(folder));self.await_idle()
+        path=folder/"added.md";path.write_text("# Added")
+        deadline=time.monotonic()+3
+        while not any(entry["path"]==str(path) for entry in studio.files) and time.monotonic()<deadline:self.app.processEvents();time.sleep(.01)
+        self.assertIn(str(path),[entry["path"] for entry in studio.files])
+        path.unlink();deadline=time.monotonic()+3
+        while studio.files and time.monotonic()<deadline:self.app.processEvents();time.sleep(.01)
+        self.assertEqual(studio.files,[])
+
+    def test_external_rename_and_delete_update_tabs_and_pins_without_losing_drafts(self):
+        studio=self.studio;old=studio.data/"before.md";old.write_text("# Saved")
+        studio.openNote(str(old));self.await_idle();tab=studio._current();studio.pinRecent(str(old))
+        new=old.with_name("after.md");old.rename(new)
+        studio._location_changed(str(old),str(new))
+        self.assertEqual(tab["name"],"after.md");self.assertEqual(studio.recent[0],str(new));self.assertIn(str(new),studio.pinnedRecent)
+        studio.tabs=[tab];tab["content"]="# Unsaved edit";new.unlink()
+        studio._location_changed(str(new),"")
+        self.assertEqual(studio._current()["name"],"Untitled.md")
+        self.assertNotIn(str(new),studio.recent);self.assertNotIn(str(new),studio.pinnedRecent)
+        self.flush()
+        drafts=json.loads((studio.data/"recovery.json").read_text())
+        self.assertIn("# Unsaved edit",[draft["content"] for draft in drafts])
+        self.assertEqual(drafts[0]["path"],"")
+
     def test_writing_preferences_are_boolean_persistent_and_forwarded_to_reader(self):
         self.studio.setting("spellCheck","true")
         self.studio.setting("grammarCheck","true")

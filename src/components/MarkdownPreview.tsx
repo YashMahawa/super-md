@@ -1,4 +1,4 @@
-import { Children, isValidElement, lazy, memo, Suspense, useEffect, useMemo, useState, type ReactNode } from "react";
+import { Children, isValidElement, lazy, memo, Suspense, useContext, useEffect, useMemo, useState, type ReactNode } from "react";
 import {unified} from "unified";
 import remarkParse from "remark-parse";
 import { invoke } from "../nativeBridge";
@@ -17,8 +17,12 @@ import { headingSlug, navigateHeading, remarkHeadingIds } from "../documentNavig
 import { selectedMarkdown } from "../copySource";
 import CopyCode from "./CopyCode";
 import CodeBlockBoundary from "./CodeBlockBoundary";
+import {DocumentAppearance} from '../documentAppearance';
 
 const MermaidDiagram = lazy(() => import("./MermaidDiagram"));
+function ThemedChart({source,dark}:{source:string;dark:boolean}) {const theme=useContext(DocumentAppearance);return <InteractiveChart source={source} dark={theme?.dark??dark}/>;}
+function ThemedSvg({source,dark}:{source:string;dark:boolean}) {const theme=useContext(DocumentAppearance);return <SvgDiagram source={source} dark={theme?.dark??dark} appearance={theme?.svgAppearance} ink={theme?.svgAppearance==='auto'?theme.ink:theme?.text}/>;}
+function ThemedMermaid({source,dark}:{source:string;dark:boolean}) {const theme=useContext(DocumentAppearance);return <MermaidDiagram source={source} dark={theme?.dark??dark}/>;}
 function remarkTaskPositions() {
   return (tree:unknown)=>{let index=0;visit(tree as never,'listItem',(node:any)=>{if(typeof node.checked==='boolean')node.data={...node.data,hProperties:{...node.data?.hProperties,'data-task-index':index++}};});};
 }
@@ -117,7 +121,7 @@ function AssetImage({ src = "", alt = "", documentPath, trustedImageHosts, onTru
   if (error) return <span className="image-error" role="img" aria-label={alt || "Image unavailable"}>Image unavailable: {alt || src}<small>{error}</small></span>;
   if (!resolved) return <span className="image-loading" role="status">Loading image…</span>;
   return <span className={`note-image ${selected ? "is-selected" : ""}`} data-note-image-source={src} tabIndex={0} aria-label={`Image controls: ${alt || "Image"}`} onFocus={() => setSelected(true)} onBlur={(event) => { if (!event.currentTarget.contains(event.relatedTarget)) setSelected(false); }} onClick={(event) => { event.stopPropagation(); setSelected(true); event.currentTarget.focus(); }} onKeyDown={(event) => { if (event.key === "Escape") { setSelected(false); event.stopPropagation(); } }}>
-    <img src={resolved} alt={alt} loading="lazy" onError={() => setError("The image could not be decoded or loaded.")} />
+    <img draggable={false} data-media-kind={resolved.startsWith('data:image/svg+xml')?'svg':'image'} src={resolved} alt={alt} loading="lazy" onError={() => setError("The image could not be decoded or loaded.")} />
     {selected && <span className="image-edit-tools" role="toolbar" aria-label="Selected image"><button onClick={(event) => { event.stopPropagation(); window.dispatchEvent(new CustomEvent("supermd-image-edit", { detail: { action: "replace", image: event.currentTarget.closest("[data-note-image-source]") } })); }}>Replace</button><button onClick={(event) => { event.stopPropagation(); window.dispatchEvent(new CustomEvent("supermd-image-edit", { detail: { action: "remove", image: event.currentTarget.closest("[data-note-image-source]") } })); }}>Remove</button></span>}
   </span>;
 }
@@ -157,9 +161,9 @@ function MarkdownPreview({ markdown, documentPath, python, dark, trustedImageHos
             const language = child.props.className?.match(/language-([\w-]+)/)?.[1];
             const source = textOf(child.props.children).replace(/\n$/, "");
             const protectedBlock = (block: ReactNode) => <CodeBlockBoundary key={`${language}:${source}`} source={source}>{block}</CodeBlockBoundary>;
-            if (language === "smd-chart") return protectedBlock(<InteractiveChart source={source} dark={dark} />);
-            if (language === "svg") return protectedBlock(<SvgDiagram source={source} dark={dark} />);
-            if (language === "mermaid") return protectedBlock(<Suspense fallback={<span className="image-loading" role="status">Loading diagram…</span>}><MermaidDiagram source={source} dark={dark} /></Suspense>);
+            if (language === "smd-chart") return protectedBlock(<ThemedChart source={source} dark={dark} />);
+            if (language === "svg") return protectedBlock(<ThemedSvg source={source} dark={dark} />);
+            if (language === "mermaid") return protectedBlock(<Suspense fallback={<span className="image-loading" role="status">Loading diagram…</span>}><ThemedMermaid source={source} dark={dark} /></Suspense>);
             if (language === "python" || language === "py") return protectedBlock(<PythonCell source={source} python={python} highlighted={child.props.children} />);
             return <div className="code-container"><CopyCode source={source}/><details className="code-disclosure" open={source.split("\n").length <= 12}><summary>{language || "Code"} <span>{source.split("\n").length} lines</span></summary><pre>{children}</pre></details></div>;
           }

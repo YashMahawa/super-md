@@ -13,6 +13,19 @@ import java.io.File
 
 @RunWith(AndroidJUnit4::class)
 class EngineTest {
+    @Test fun deletedDraftArchiveSurvivesBoundedClosedTabEviction() {
+        val app=ApplicationProvider.getApplicationContext<android.app.Application>()
+        val root=File(app.cacheDir,"deleted-draft-test-${java.util.UUID.randomUUID()}")
+        try {
+            val draft=Note(name="Recovered study.md",content="Unfinished λ mathematics",saved="")
+            DeletedDraftStore(root).save(draft)
+            val reopened=DeletedDraftStore(root).latest(emptySet())!!
+            assertEquals(draft,reopened)
+            assertTrue(reopened.dirty)
+            assertNull(DeletedDraftStore(root).latest(setOf(draft.id)))
+            assertFalse(root.listFiles()!!.any {it.extension=="tmp"})
+        } finally {root.deleteRecursively()}
+    }
     @Test fun derivedPythonOutputReloadsWithoutRerunningCode() {
         val app=ApplicationProvider.getApplicationContext<android.app.Application>()
         val root=File(app.cacheDir,"output-store-${java.util.UUID.randomUUID()}")

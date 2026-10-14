@@ -8,6 +8,17 @@ from pathlib import Path
 from documents import atomic_write, atomic_json, bundle, materialize_assets, open_note, validate
 
 class DocumentsTest(unittest.TestCase):
+    def test_portable_envelopes_are_detected_independently_of_filename(self):
+        with tempfile.TemporaryDirectory() as directory:
+            for name in ("shared", "note.txt", "note.json", "note.md", "note.SMD", "note.FMD"):
+                path=Path(directory)/name
+                for kind in ("supermd-smd", "supermd-fmd"):
+                    value=bundle("# Actual Markdown",{});value["format"]=kind
+                    path.write_text("\ufeff  "+json.dumps(value),encoding="utf-8")
+                    self.assertEqual(open_note(path),("# Actual Markdown",{},True))
+            ordinary=Path(directory)/"data.json"
+            ordinary.write_text('{"format":"csv","markdown":"not a bundle"}')
+            self.assertEqual(open_note(ordinary),(ordinary.read_text(),{},False))
     def test_streamed_recovery_round_trip_and_failed_serialization_are_atomic(self):
         with tempfile.TemporaryDirectory() as directory:
             path=Path(directory)/"recovery.json"

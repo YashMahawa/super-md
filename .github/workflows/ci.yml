@@ -9,6 +9,9 @@ concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
 
+permissions:
+  contents: read
+
 jobs:
   test:
     strategy:
@@ -22,7 +25,7 @@ jobs:
         if: matrix.platform == 'ubuntu-22.04'
         run: |
           sudo apt-get update
-          sudo apt-get install -y libnss3 libasound2 libxcb-cursor0 libxkbcommon-x11-0 libegl1 libgl1 xdg-utils poppler-utils
+          sudo apt-get install -y libnss3 libasound2 libxcb-cursor0 libxcb-icccm4 libxcb-keysyms1 libxcb-image0 libxcb-render-util0 libxkbcommon-x11-0 libegl1 libgl1 xdg-utils poppler-utils
       - uses: actions/setup-python@v5
         with:
           python-version: '3.13'
@@ -220,3 +223,15 @@ jobs:
           path: |
             android/app/build/reports/androidTests/
             android/app/build/outputs/androidTest-results/
+
+  release-gate:
+    name: All release tests passed
+    if: always()
+    needs: [test, browser, android-release, android-device-tests]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Reject failures, cancellations and skipped test families
+        env:
+          RESULTS: ${{ toJSON(needs) }}
+        run: |
+          node -e 'const results=JSON.parse(process.env.RESULTS); for(const [name,job] of Object.entries(results)) { if(job.result!=="success") throw Error(`${name}: ${job.result}`); } console.log("All platform, browser, PDF and Android emulator tests passed");'

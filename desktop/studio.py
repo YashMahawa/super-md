@@ -27,11 +27,13 @@ from fonts import FontStore
 from python_outputs import PythonOutputs
 import updates
 import python_runtime
+import file_events
 
 ROOT = Path(sys._MEIPASS)/"resources" if getattr(sys,"frozen",False) else Path(__file__).resolve().parent.parent
 DEFAULT_PDF = {"pageSize": "a4", "margin": 18, "fontSize": 10, "lineHeight": 1.45, "paragraphSpacing": 1.2, "fontFamily": "Manrope", "pageNumbers": True, "themed": False}
 DEFAULTS = {"theme": "system", "fullTheme": "black", "motion": True, "font": "Manrope", "size": 18, "width": 0, "widthPercent":90, "lineHeight":1.65, "autosave":True, "normalZoom": 100, "fullZoom": 100, "python": "", "pdf": DEFAULT_PDF, "welcomed": False}
 DEFAULTS.update(widthMigrated=True, window={"width":1320,"height":880,"maximized":False}, spellCheck=False, grammarCheck=False, readingMode="live", newNoteLocation="", accent="system", checkUpdates=True, autoUpdate=False)
+DEFAULTS.update(restorePosition=True, startup="restore", imageAppearance="original", svgAppearance="original", imageContrast=1.25)
 SAMPLE = """# A place to think\n\nWrite in Markdown. Read without distractions.\n\n> [!tip] Start with your notes\n> Open any note or folder. No vault, no import process.\n\n## Learn by exploring\n\n$$E = mc^2$$\n\n> [!answer]- Why does this matter?\n> Tap the heading to reveal an answer, then hide it to test yourself.\n\n```smd-chart\n{\"title\":\"A changing wave\",\"series\":[{\"name\":\"Sine\",\"expression\":\"sin(a*x)\",\"color\":\"#386a57\"},{\"name\":\"Cosine\",\"expression\":\"cos(a*x)\",\"color\":\"#bc6750\"}],\"sliders\":[{\"name\":\"a\",\"min\":0.2,\"max\":3,\"value\":1}]}\n```\n\n## Matplotlib in three dimensions\n\nRun a Python cell to generate a 3D figure, then save it in your note or PDF.\n\n```python\nimport numpy as np\nimport matplotlib.pyplot as plt\nx, y = np.meshgrid(np.linspace(-2, 2, 32), np.linspace(-2, 2, 32))\nfig = plt.figure()\nax = fig.add_subplot(111, projection=\"3d\")\nax.plot_surface(x, y, x*x + y*y, cmap=\"viridis\")\n```\n\n[Back to exploring](#learn-by-exploring)\n"""
 
 def public_address(url: str) -> str:
@@ -74,6 +76,7 @@ def local_path(value: str) -> Path:
 class Session(QObject):
     """One ordered persistence stream for every native window in the application."""
     changed = Signal()
+    locationChanged = Signal(str,str)
     def __init__(self,isolated=False):
         super().__init__()
         self.data = Path(tempfile.mkdtemp(prefix="supermd-test-")) if isolated else Path(QStandardPaths.writableLocation(QStandardPaths.AppDataLocation))/"qt-studio"
@@ -83,6 +86,14 @@ class Session(QObject):
         self.writes = concurrent.futures.ThreadPoolExecutor(max_workers=1,thread_name_prefix="supermd-save")
         self.settings = copy.deepcopy(DEFAULTS)
         self.recent = []
+        self.pinned = []
+        self.workspace = {}
+        self.startup_paths = []
+        self.startup_active = ""
+        self.startup_entries = []
+        self.startup_active_id = ""
+        self.quitting = False
+        self.locations = {}
         self.drafts = {}
         self.windows = {}
         self.initial_recovery = []
@@ -92,8 +103,20 @@ class Session(QObject):
             if not stored["settings"].get("widthMigrated") and stored["settings"].get("widthPercent") == 80:
                 self.settings["widthPercent"] = 90  # 80% was the old default, not a choice.
             self.settings["pdf"] = {**DEFAULT_PDF, **self.settings.get("pdf", {})}
-            self.recent = [p for p in stored.get("recent",[]) if isinstance(p,str)][:30]
+            self.pinned = list(dict.fromkeys(p for p in stored.get("pinned",[]) if isinstance(p,str)))[:10]
+            self.recent = list(dict.fromkeys(self.pinned + [p for p in stored.get("recent",[]) if isinstance(p,str)]))[:10]
         except (OSError,ValueError,KeyError,TypeError,AttributeError): pass
+        try:
+            workspace=json.loads((self.data/"startup.json").read_text(encoding="utf-8"))
+            self.startup_paths=list(dict.fromkeys(p for p in workspace.get("paths",[]) if isinstance(p,str)))[:100]
+            self.startup_active=workspace.get("active","")
+            self.startup_entries=[entry for entry in workspace.get("tabs",[]) if isinstance(entry,dict) and isinstance(entry.get("id"),str) and isinstance(entry.get("path"),str)][:100]
+            self.startup_active_id=workspace.get("activeId","")
+        except (OSError,ValueError,TypeError,AttributeError): pass
+        try:
+            locations=json.loads((self.data/"reading-positions.json").read_text(encoding="utf-8"))
+            if isinstance(locations,dict):self.locations=dict(list(locations.items())[-200:])
+        except (OSError,ValueError,TypeError):pass
         try:
             recovered = json.loads((self.data/"recovery.json").read_text(encoding="utf-8"))
             for tab in recovered:
@@ -129,6 +152,7 @@ class Studio(QObject):
         self.pool = concurrent.futures.ThreadPoolExecutor(max_workers=3, thread_name_prefix="supermd")
         self.session = session or Session(isolated)
         self.session.changed.connect(lambda:self._emit())
+        self.session.locationChanged.connect(self._location_changed)
         self.writes = self.session.writes
         self.window_id = uuid.uuid4().hex
         self.session.windows[self.window_id] = self
@@ -155,6 +179,7 @@ class Studio(QObject):
         self.external_paths = set()
         self.note_watch_paths = None
         self.note_file_stamps = {}
+        self.note_identities = {}
         self.external_timer = QTimer(self)
         self.external_timer.setSingleShot(True)
         self.external_timer.timeout.connect(self._refresh_external_notes)
@@ -169,6 +194,7 @@ class Studio(QObject):
         self.busy = 0
         self.message = ""
         self.ready = False
+        self._last_reader_text = None
         self.system_dark = None
         self.system_mode, self.system_colors = read_system_palette()
         self._theme_result = None
@@ -208,23 +234,46 @@ class Studio(QObject):
         self.preference_timer = QTimer(self)
         self.preference_timer.setSingleShot(True)
         self.preference_timer.timeout.connect(self._preferences)
+        self.position_timer=QTimer(self);self.position_timer.setSingleShot(True);self.position_timer.timeout.connect(self._save_positions)
         self.saving = set()
-        self.tabs = [{**tab,"id":uuid.uuid4().hex} for tab in self.session.initial_recovery]
+        self.tabs = [{**tab,"id":tab.get("id") or uuid.uuid4().hex} for tab in self.session.initial_recovery]
         self.session.initial_recovery = []
         self.session.drafts[self.window_id] = [dict(t) for t in self.tabs]
         if not self.tabs:
-            self.tabs.append(self._note("Welcome.md", SAMPLE, saved=SAMPLE))
+            self.tabs.append(self._note("Untitled.md") if self.settings["welcomed"] else self._note("Welcome.md", SAMPLE, saved=SAMPLE))
+        elif self.settings["startup"]=="new":
+            self.tabs.insert(0,self._note("Untitled.md"))
         self.active = self.tabs[0]["id"]
+        if self.settings["startup"]=="restore" and any(t["id"]==self.session.startup_active_id for t in self.tabs):self.active=self.session.startup_active_id
+        self._restoring_paths=set()
+        self._startup_order=[]
+        self._startup_entries=self.session.startup_entries
+        self.session.startup_entries=[]
+        if self.settings["startup"]=="restore" and self.session.startup_paths:
+            self._startup_order,self.session.startup_paths=self.session.startup_paths,[]
+            self._restoring_paths=set(self._startup_order)
+            QTimer.singleShot(0,lambda:[self.openNote(path) for path in self._startup_order])
         self._refresh_theme()
 
     @property
     def recent(self): return self.session.recent
 
     @recent.setter
-    def recent(self,value): self.session.recent = value
+    def recent(self,value): self.session.recent = list(dict.fromkeys(self.session.pinned + value))[:10]
+
+    @Slot(str)
+    def pinRecent(self,path):
+        if path not in self.recent:return
+        if path in self.session.pinned:self.session.pinned.remove(path)
+        else:self.session.pinned.append(path)
+        self.recent=self.recent
+        self._preferences()
 
     def _note(self, name: str, content: str = "", path: str = "", saved: str = "", assets: dict | None = None, portable: bool = False):
         return {"id": uuid.uuid4().hex, "name": name, "content": content, "path": path, "saved": saved, "assets": assets or {}, "portable": portable}
+
+    @Property("QStringList",notify=changed)
+    def pinnedRecent(self):return self.session.pinned
 
     def _current(self):
         return next(t for t in self.tabs if t["id"] == self.active)
@@ -236,7 +285,13 @@ class Studio(QObject):
         if load and self.ready:
             tab = self._current()
             colors = self._colors()
-            self.readerLoad.emit(json.dumps({"id": tab["id"], "content": tab["content"], "path": tab["path"] or tab["id"], "mode": self.mode, "dark": self._dark(), "fullscreen": self.fullscreen, "font": self.settings["font"], "size": self.settings["size"], "widthPercent": self.settings["widthPercent"], "lineHeight":self.settings["lineHeight"], "spellCheck":self.settings["spellCheck"], "grammarCheck":self.settings["grammarCheck"], "zoom": self.settings["fullZoom" if self.fullscreen else "normalZoom"], "motion": self.settings["motion"], "python": self.settings["python"], "colors": colors, "viewState": tab.pop("viewState", None)}))
+            reading_settings={key:self.settings[key] for key in ("restorePosition","imageAppearance","svgAppearance","imageContrast")}
+            payload={**reading_settings,"readingLocation":self.session.locations.get(tab["path"]),"id": tab["id"], "path": tab["path"] or tab["id"], "mode": self.mode, "dark": self._dark(), "fullscreen": self.fullscreen, "font": self.settings["font"], "size": self.settings["size"], "widthPercent": self.settings["widthPercent"], "lineHeight":self.settings["lineHeight"], "spellCheck":self.settings["spellCheck"], "grammarCheck":self.settings["grammarCheck"], "zoom": self.settings["fullZoom" if self.fullscreen else "normalZoom"], "motion": self.settings["motion"], "python": self.settings["python"], "colors": colors, "viewState": tab.pop("viewState", None)}
+            previous=self._last_reader_text
+            if previous and previous[0]==tab["id"] and previous[1] is tab["content"]:payload["contentUnchanged"]=True
+            else:payload["content"]=tab["content"]
+            self._last_reader_text=(tab["id"],tab["content"])
+            self.readerLoad.emit(json.dumps(payload))
 
     def _tokens(self):
         # Scheme generation is costly and QML reads colors from many bindings.
@@ -260,11 +315,14 @@ class Studio(QObject):
     def motionEnabled(self): return bool(self.settings["motion"])
 
     def _watch_notes(self,force=False):
-        paths=tuple(sorted({tab["path"] for tab in self.tabs if tab["path"]}))
-        if not force and paths==self.note_watch_paths:return
-        self.note_watch_paths=paths
+        paths=tuple(sorted({tab["path"] for tab in self.tabs if tab["path"]}|set(self.recent)))
+        signature=(paths,self.folder,tuple(sorted(self.expanded)))
+        if not force and signature==self.note_watch_paths:return
+        self.note_watch_paths=signature
         self.note_file_stamps={path:stamp for path,stamp in self.note_file_stamps.items() if path in paths}
-        targets={str(path) for tab in self.tabs if tab["path"] for path in (Path(tab["path"]),Path(tab["path"]).parent) if path.exists()}
+        self.note_identities={path:file_events.identity(path) or self.note_identities.get(path) for path in paths}
+        targets={str(target) for path in paths for target in (Path(path),Path(path).parent) if target.exists()}
+        targets.update(path for path in ({self.folder}|set(self.expanded)) if path and Path(path).is_dir())
         watched=set(self.note_watcher.files()+self.note_watcher.directories())
         if watched-targets:self.note_watcher.removePaths(list(watched-targets))
         if targets-watched:self.note_watcher.addPaths(list(targets-watched))
@@ -277,6 +335,44 @@ class Studio(QObject):
     def _refresh_external_notes(self):
         if self.retired:return
         changed,self.external_paths=self.external_paths,set()
+        known=dict(self.note_identities)
+        def reconciled(result,error):
+            if self.retired or error:return
+            for old,new in result.items():self.session.locationChanged.emit(old,new or "")
+            self._reload_changed_content(changed)
+            if self.folder and (self.folder in changed or set(self.expanded)&changed):self._load_tree()
+        self._submit(lambda:file_events.reconcile(known,changed),reconciled,False)
+
+    def _location_changed(self,old,new):
+        if self.retired:return
+        if Path(old).exists():return  # A temporary atomic-replace gap has healed.
+        if new and not Path(new).is_file():return
+        if new:
+            location=self.session.locations.pop(old,None)
+            if location:self.session.locations[new]=location
+            for tab in self.tabs:
+                if tab["path"]==old:tab.update(path=new,name=Path(new).name)
+            self.session.pinned=[new if path==old else path for path in self.session.pinned]
+            self.recent=[new if path==old else path for path in self.recent]
+            for paths in self.session.workspace.values():
+                for entry in paths:
+                    if entry["path"]==old:entry["path"]=new
+            self.message="Renamed note: "+Path(new).name
+        else:
+            self.session.locations.pop(old,None)
+            self.session.pinned=[path for path in self.session.pinned if path!=old]
+            self.recent=[path for path in self.recent if path!=old]
+            for tab in list(self.tabs):
+                if tab["path"]!=old:continue
+                if tab["content"]!=tab["saved"]:
+                    draft={**tab,"path":"","name":"Recovered "+tab["name"],"saved":""}
+                    self.session.drafts.setdefault("deleted-notes",[]).append(draft)
+                    tab.update(path="",name=draft["name"])
+                self._remove_tab(tab["id"])
+            self.message="File deleted: "+Path(old).name+". Its tab was closed; unsaved changes remain recoverable."
+        self._preferences();self._recover();self._emit()
+
+    def _reload_changed_content(self,changed):
         self._watch_notes(force=True)
         for tab in self.tabs:
             path=tab["path"]
@@ -335,6 +431,9 @@ class Studio(QObject):
 
     def stop(self):
         if self.retired: return
+        if self.position_timer.isActive():self._save_positions()
+        self.position_timer.stop()
+        if self.preference_timer.isActive():self._preferences(False)
         self.preference_timer.stop()
         self.theme_timer.stop()
         self.theme_debounce.stop()
@@ -345,6 +444,9 @@ class Studio(QObject):
         self._recover()
         self.retired = True
         self.session.windows.pop(self.window_id, None)
+        if not self.session.quitting and self.session.windows:
+            self.session.workspace.pop(self.window_id,None)
+            next(iter(self.session.windows.values()))._recover()
         if self.system_preferences.state() != QProcess.NotRunning:
             self.system_preferences.terminate()
             self.system_preferences.waitForFinished(300)
@@ -422,6 +524,7 @@ class Studio(QObject):
         return [p for p in [self.folder, *(str(Path(t["path"]).parent) for t in self.tabs if t.get("path"))] if p]
 
     def _choose_default_python(self):
+        if self.retired:return
         managed = self.data/"python-env"
         def done(path,error):
             if path and not self.settings.get("python"):
@@ -618,19 +721,27 @@ class Studio(QObject):
         return "data:image/svg+xml;base64,"+base64.b64encode(svg.encode()).decode()
 
     def _submit(self, action, done, busy=True, executor=None):
+        if self.retired:return
+        target=executor or self.pool
+        if getattr(target,"_shutdown",False):return
         if busy:
             self.busy += 1
             self._emit(False)
-        future = (executor or self.pool).submit(action)
+        future = target.submit(action)
         def completed(f):
+            if self.retired or f.cancelled():return
             try:
-                self.completed.emit((done, f.result(), None, busy))
-            except Exception as error:
-                self.completed.emit((done, None, str(error), busy))
+                value,error=f.result(),None
+            except Exception as reason:
+                value,error=None,str(reason)
+            if self.retired:return
+            try:self.completed.emit((done,value,error,busy))
+            except RuntimeError:pass  # The QObject may have been retired meanwhile.
         future.add_done_callback(completed)
 
     @Slot(object)
     def _complete(self, result):
+        if self.retired:return
         done, value, error, busy = result
         if busy:
             self.busy -= 1
@@ -640,13 +751,22 @@ class Studio(QObject):
         done(value, error)
         self._emit(False)
 
-    def _preferences(self):
+    def _preferences(self,notify=True):
         if self.retired or getattr(self.writes, "_shutdown", False): return
-        data = json.dumps({"settings": self.settings, "recent": self.recent}).encode()
+        data = json.dumps({"settings": self.settings, "recent": self.recent, "pinned":self.session.pinned}).encode()
         self._submit(lambda: atomic_write(self.data / "settings.json", data), lambda *_: None, False,self.writes)
-        self.session.changed.emit()
+        if notify:self.session.changed.emit()
+
+    def _save_positions(self):
+        data=json.dumps(self.session.locations).encode()
+        self._submit(lambda:atomic_write(self.data/"reading-positions.json",data),lambda *_:None,False,self.writes)
 
     def _recover(self):
+        # Clean tabs need only paths, never another copy of their image bytes.
+        self.session.workspace[self.window_id]=[{"path":t["path"],"id":t["id"]} for t in self.tabs if t["path"] or t["content"]!=t["saved"]]
+        entries=[entry for tabs in self.session.workspace.values() for entry in tabs]
+        workspace={"paths":list(dict.fromkeys(t["path"] for t in entries if t["path"])),"tabs":entries,"active":self._current()["path"],"activeId":self.active}
+        self._submit(lambda:atomic_json(self.data/"startup.json",workspace),lambda *_:None,False,self.writes)
         # Snapshot only unsaved tabs. Asset bytes stay in recovery, never in displayed source.
         self.session.drafts[self.window_id] = [copy.deepcopy({key: value for key, value in t.items() if key != "viewState"}) for t in self.tabs if t["content"] != t["saved"] and (t["path"] or t["content"].strip() or t["assets"])]
         drafts = [tab for tabs in self.session.drafts.values() for tab in tabs]
@@ -686,24 +806,34 @@ class Studio(QObject):
 
     @Slot(str)
     def openNote(self, value):
+        if self.retired:return
         path = local_path(value)
+        restoring=str(path) in self._restoring_paths
         if path.is_dir():
             self.openFolder(str(path))
             return
         found = next((t for t in self.tabs if t["path"] == str(path)), None)
         if found:
-            self.selectTab(found["id"])
+            self._restoring_paths.discard(str(path))
+            if not restoring or str(path)==self.session.startup_active:self.selectTab(found["id"])
             return
         def finished(result, error):
+            self._restoring_paths.discard(str(path))
             if error:
                 return
             content, assets, portable = result
             note = self._note(path.name, content, str(path), content, assets, portable)
+            if restoring:
+                self.tabs=[t for t in self.tabs if t["path"] or t["content"]!=t["saved"] or t["name"]!="Untitled.md"]
             self.tabs.append(note)
-            self.active = note["id"]
+            if restoring:
+                keys=[entry["path"] or entry["id"] for entry in self._startup_entries] or self._startup_order
+                self.tabs.sort(key=lambda t:keys.index(t["path"] or t["id"]) if (t["path"] or t["id"]) in keys else -1)
+            if not restoring or str(path)==self.session.startup_active or not any(t["id"]==self.active for t in self.tabs):self.active = note["id"]
             self.settings["welcomed"] = True
             self.recent = [str(path)] + [p for p in self.recent if p != str(path)][:29]
             self._preferences()
+            self.recovery_timer.start(800)
             self._emit()
         self._submit(lambda: open_note(path), finished)
 
@@ -712,12 +842,14 @@ class Studio(QObject):
         note = self._note("Untitled.md")
         self.tabs.append(note)
         self.active = note["id"]
+        self.recovery_timer.start(800)
         self._emit()
 
     @Slot(str)
     def selectTab(self, id):
         if id!=self.active and any(t["id"] == id for t in self.tabs):
             self.active = id
+            self.recovery_timer.start(800)
             self._emit()
 
     @Slot(int)
@@ -832,6 +964,10 @@ class Studio(QObject):
             return
         if key in ("theme","fullTheme") and value not in ("system","light","dark","black"): return
         if key=="accent" and value not in ("system","blue","green","violet","rose","amber"):return
+        if key=="startup" and value not in ("restore","new"):return
+        if key in ("imageAppearance","svgAppearance") and value not in ("original","invert-dark","auto","contrast"):return
+        if key=="restorePosition" and not isinstance(value,bool):return
+        if key=="imageContrast" and (not isinstance(value,(int,float)) or isinstance(value,bool) or not math.isfinite(value) or not 1<=value<=2):return
         if key in ("motion","welcomed","autosave","checkUpdates","autoUpdate","spellCheck","grammarCheck") and not isinstance(value,bool): return
         if key in ("font","python") and (not isinstance(value,str) or not value.strip() or len(value)>2048): return
         if key == "python":
@@ -875,6 +1011,7 @@ class Studio(QObject):
             QTimer.singleShot(0,self.allowClose.emit)
 
     def _flush(self,action,target=""):
+        if self.retired or action=="close_window" and self.pending_close:return
         operation = {"action":action,"target":target,"token":uuid.uuid4().hex}
         if not self.ready:
             self._after_flush(operation)
@@ -1053,13 +1190,22 @@ class Studio(QObject):
         try:
             args = json.loads(raw)
             tab = self._current()
-            if command == "reader_ready": self.ready = True; self._emit(); self.replied.emit(id,"true",""); return
+            if command == "reader_ready": self.ready = True; self._last_reader_text=None; self._emit(); self.replied.emit(id,"true",""); return
             if command == "reader_chrome":
                 action = args.get("action")
                 if action not in ("show", "hide", "toggle"): raise ValueError("Invalid reading chrome action")
                 if self.fullscreen: self.chromeRequested.emit(action)
                 self.replied.emit(id,"true",""); return
             if command == "reader_overlay_changed": self.reader_overlay = bool(args.get("open")); self.image_overlay = bool(args.get("image")); self._emit(False); self.replied.emit(id,"true",""); return
+            if command == "reading_position":
+                target=next((t for t in self.tabs if t["id"]==args.get("id")),None);location=args.get("location")
+                if target and target["path"] and self.settings["restorePosition"] and isinstance(location,dict):
+                    if any(isinstance(location.get(key),bool) or not isinstance(location.get(key),(int,float)) or not math.isfinite(location[key]) or location[key]<0 for key in ("top","offset","zoom")):raise ValueError("Invalid reading position")
+                    if location.get("mode") not in ("reader","live","editor","split"):raise ValueError("Invalid reading mode")
+                    self.session.locations.pop(target["path"],None);self.session.locations[target["path"]]={key:location[key] for key in ("top","offset","zoom","mode")}
+                    while len(self.session.locations)>200:self.session.locations.pop(next(iter(self.session.locations)))
+                    self.position_timer.start(500)
+                self.replied.emit(id,"true","");return
             if command == "document_outline":
                 target = next((t for t in self.tabs if t["id"] == args.get("id")), None)
                 headings = args.get("headings", [])
@@ -1089,6 +1235,7 @@ class Studio(QObject):
             if command == "document_changed":
                 target = next((t for t in self.tabs if t["id"] == args["id"]), None)
                 if target: target["content"] = args["content"]
+                if target and target["id"]==self.active:self._last_reader_text=(target["id"],target["content"])
                 self.recovery_timer.start(800)
                 self.autosave_timer.start(900)
                 self._emit(False)

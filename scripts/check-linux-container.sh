@@ -5,17 +5,23 @@ version="$1"
 source /etc/os-release
 if [[ "$ID" == fedora ]]; then
   dnf -y install python3 xorg-x11-server-Xvfb xauth shadow-utils mesa-libEGL mesa-libGL nss alsa-lib mesa-libgbm fontconfig dbus-libs
-  dnf -y install "/packages/Super-MD-${version}-1.x86_64.rpm"
 else
   export DEBIAN_FRONTEND=noninteractive
   apt-get update -qq
   sound=libasound2
   if apt-cache show libasound2t64 >/dev/null 2>&1; then sound=libasound2t64; fi
   apt-get install -y --no-install-recommends python3 xvfb xauth weston dbus-x11 \
-    libegl1 libgl1 libgl1-mesa-dri libnss3 "$sound" libgbm1 libxkbcommon-x11-0 libxcb-cursor0 fontconfig
-  apt-get install -y "/packages/Super-MD_${version}_amd64.deb"
+    libegl1 libgl1 libgl1-mesa-dri libnss3 "$sound" libgbm1 fontconfig
 fi
 useradd --create-home supermdtest
+# Check the portable app BEFORE installing DEB/RPM dependencies: otherwise
+# package-manager installation masks missing AppImage libraries.
+runuser -u supermdtest -- xvfb-run -a python3 /checks/check_packaged.py "/packages/Super-MD_${version}_amd64.AppImage" "$version" --graphics software
+if [[ "$ID" == fedora ]]; then
+  dnf -y install "/packages/Super-MD-${version}-1.x86_64.rpm"
+else
+  apt-get install -y "/packages/Super-MD_${version}_amd64.deb"
+fi
 # A fresh non-root user, no Python packages/venv, no host GPU, no Qt developer
 # install, no user's config and no --no-sandbox workaround.
 runuser -u supermdtest -- xvfb-run -a python3 /checks/check_packaged.py /opt/super-md/super-md "$version" --graphics auto

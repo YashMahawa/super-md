@@ -29,10 +29,12 @@ import java.util.UUID
 private val documentWrites = Mutex()
 
 data class Note(val id: String = UUID.randomUUID().toString(), val name: String = "Untitled.md", val uri: String? = null, val content: String = "", val saved: String = "", val relative: String? = null, val assetDirectory: String? = null) { val dirty get() = content != saved; val portable get() = assetDirectory != null }
-data class RecentNote(val name: String, val uri: String, val relative: String? = null)
+data class RecentNote(val name: String, val uri: String, val relative: String? = null, val pinned:Boolean=false)
+internal fun orderedRecents(notes:List<RecentNote>)=notes.distinctBy {it.uri}.sortedByDescending {it.pinned}.take(10)
+private fun renamedRelative(relative:String?,name:String)=relative?.let {val parent=it.substringBeforeLast('/',"");if(parent.isEmpty())name else "$parent/$name"}
 data class FileEntry(val name: String, val uri: String, val directory: Boolean, val relative: String)
 data class OutlineHeading(val id: String, val title: String, val level: Int, val offset: Int)
-data class StudioState(val spellCheck:Boolean = false, val grammarCheck:Boolean = false, val accent: String = "system", val widthPercent: Float = 100f, val lineHeight: Float = 1.65f, val autosave: Boolean = true, val customFonts: List<String> = emptyList(), val readerOverlay: Boolean = false, val zoomCommand: Long = 0, val tabs: List<Note> = listOf(Note(name = "Welcome.md", content = sample, saved = sample)), val closedTabs: List<Note> = emptyList(), val activeId: String = "", val mode: String = "live", val fullscreen: Boolean = false, val normalZoom: Float = 100f, val fullscreenZoom: Float = 100f, val theme: String = "system", val fullscreenTheme: String = "black", val motion: Boolean = true, val font: String = "Manrope", val size: Float = 15f, val folder: String? = null, val files: List<FileEntry> = emptyList(), val busy: Boolean = false, val message: String? = null, val error: String? = null, val welcomed: Boolean = false, val pdf: String = "{\"pageSize\":\"a4\",\"margin\":18,\"fontSize\":10.0,\"lineHeight\":1.45,\"fontFamily\":\"Manrope\",\"pageNumbers\":true}") {
+data class StudioState(val restorePosition:Boolean=true, val startup:String="restore", val imageAppearance:String="original", val svgAppearance:String="original", val imageContrast:Float=1.25f, val spellCheck:Boolean = false, val grammarCheck:Boolean = false, val accent: String = "system", val widthPercent: Float = 100f, val lineHeight: Float = 1.65f, val autosave: Boolean = true, val customFonts: List<String> = emptyList(), val readerOverlay: Boolean = false, val zoomCommand: Long = 0, val tabs: List<Note> = listOf(Note(name = "Welcome.md", content = sample, saved = sample)), val closedTabs: List<Note> = emptyList(), val activeId: String = "", val mode: String = "live", val fullscreen: Boolean = false, val normalZoom: Float = 100f, val fullscreenZoom: Float = 100f, val theme: String = "system", val fullscreenTheme: String = "black", val motion: Boolean = true, val font: String = "Manrope", val size: Float = 15f, val folder: String? = null, val files: List<FileEntry> = emptyList(), val busy: Boolean = false, val message: String? = null, val error: String? = null, val welcomed: Boolean = false, val pdf: String = "{\"pageSize\":\"a4\",\"margin\":18,\"fontSize\":10.0,\"lineHeight\":1.45,\"fontFamily\":\"Manrope\",\"pageNumbers\":true}") {
     val active get() = tabs.find { it.id == activeId } ?: tabs.first()
     val zoom get() = if (fullscreen) fullscreenZoom else normalZoom
 }
@@ -93,33 +95,74 @@ class StudioViewModel(app: Application, val workspaceKey: String = "main") : And
     val media = MediaStorage(app)
     val fonts = FontLibrary(app)
     val updates = AppUpdates(app)
-    private val recentMutable = MutableStateFlow(runCatching { val list = JSONArray(prefs.getString("recent", "[]")); (0 until minOf(list.length(), 24)).map { i -> val n = list.getJSONObject(i); RecentNote(n.getString("name"), n.getString("uri"), n.optString("relative").takeIf { it.isNotBlank() }) } }.getOrDefault(emptyList()))
+    private fun loadRecent()=runCatching { val list=JSONArray(prefs.getString("recent","[]"));orderedRecents((0 until minOf(list.length(),100)).map {i->val n=list.getJSONObject(i);RecentNote(n.getString("name"),n.getString("uri"),n.optString("relative").takeIf {it.isNotBlank()},n.optBoolean("pinned"))}) }.getOrDefault(emptyList())
+    private val recentMutable = MutableStateFlow(loadRecent())
     val recent = recentMutable.asStateFlow()
     var requestPortable: (() -> Unit)? = null
     private fun remember(note: Note) {
         val uri = note.uri ?: return
-        recentMutable.value = (listOf(RecentNote(note.name, uri, note.relative)) + recentMutable.value.filter { it.uri != uri }).take(24)
-        prefs.edit().putString("recent", JSONArray().apply { recentMutable.value.forEach { put(JSONObject().put("name", it.name).put("uri", it.uri).put("relative", it.relative ?: "")) } }.toString()).apply()
+        storeRecent(listOf(RecentNote(note.name,uri,note.relative,recentMutable.value.any {it.uri==uri&&it.pinned}))+recentMutable.value.filter {it.uri!=uri})
     }
-    fun clearRecent() { recentMutable.value = emptyList(); prefs.edit().remove("recent").apply() }
+    private fun storeRecent(notes:List<RecentNote>) {
+        recentMutable.value=orderedRecents(notes)
+        prefs.edit().putString("recent",JSONArray().apply {recentMutable.value.forEach {put(JSONObject().put("name",it.name).put("uri",it.uri).put("relative",it.relative ?: "").put("pinned",it.pinned))}}.toString()).apply()
+    }
+    fun pinRecent(uri:String)=storeRecent(recentMutable.value.map {if(it.uri==uri)it.copy(pinned=!it.pinned) else it})
+    fun clearRecent()=storeRecent(recentMutable.value.filter {it.pinned})
     private val snapshot = if (workspaceKey == "main") File(app.filesDir, "workspace.json") else File(app.filesDir, "workspaces/$workspaceKey.json").also { it.parentFile!!.mkdirs() }
     private val mutable = MutableStateFlow(restore())
     private val preferencesChanged = android.content.SharedPreferences.OnSharedPreferenceChangeListener { _, key ->
-        if (key == "recent") recentMutable.value = runCatching { val list = JSONArray(prefs.getString("recent", "[]")); (0 until minOf(list.length(), 24)).map { i -> val n = list.getJSONObject(i); RecentNote(n.getString("name"), n.getString("uri"), n.optString("relative").takeIf { it.isNotBlank() }) } }.getOrDefault(emptyList())
+        if (key == "recent") {recentMutable.value=loadRecent();observeActive()}
+        if(key in setOf("restorePosition","startup","imageAppearance","svgAppearance","imageContrast"))mutable.value=readingPreferences(mutable.value)
         if (key in setOf("accent", "theme", "fullTheme", "motion", "font", "size", "pdf", "welcomed", "widthPercent", "lineHeight", "autosave", "fonts", "spellCheck", "grammarCheck")) {
             mutable.value = mutable.value.copy(theme = prefs.getString("theme", "system")!!, fullscreenTheme = prefs.getString("fullTheme", "black")!!, motion = prefs.getBoolean("motion", true), font = prefs.getString("font", "Manrope")!!, size = prefs.getFloat("size", 15f), pdf = prefs.getString("pdf", null) ?: StudioState().pdf, welcomed = prefs.getBoolean("welcomed", false))
                 .copy(spellCheck=prefs.getBoolean("spellCheck",false),grammarCheck=prefs.getBoolean("grammarCheck",false),accent = prefs.getString("accent","system")!!, widthPercent = prefs.getFloat("widthPercent",100f),lineHeight = prefs.getFloat("lineHeight",1.65f),autosave = prefs.getBoolean("autosave",true),customFonts = fonts.families)
         }
     }
-    private var observedUri:String?=null
+    private var observedUris=emptySet<String>()
+    private var metadataJob:Job?=null
+    private var listedRelative=""
+    private val deletedDrafts=DeletedDraftStore(File(app.filesDir,"deleted-drafts/$workspaceKey"))
     private val documentObserver=object:android.database.ContentObserver(android.os.Handler(android.os.Looper.getMainLooper())) {
-        override fun onChange(selfChange:Boolean){refreshExternal()}
+        override fun onChange(selfChange:Boolean){refreshMetadata();refreshExternal()}
+        override fun onChange(selfChange:Boolean,uri:Uri?){refreshMetadata();if(uri==null||uri.toString()==mutable.value.active.uri)refreshExternal()}
     }
     private fun observeActive() {
-        val uri=mutable.value.active.uri
-        if(uri==observedUri)return
-        resolver.unregisterContentObserver(documentObserver);observedUri=uri
-        uri?.let{runCatching{resolver.registerContentObserver(Uri.parse(it),true,documentObserver)}}
+        val uris=(mutable.value.tabs.mapNotNull {it.uri}+recentMutable.value.map {it.uri}+listOfNotNull(mutable.value.folder)).toSet()
+        if(uris==observedUris)return
+        resolver.unregisterContentObserver(documentObserver);observedUris=uris
+        uris.forEach {runCatching{resolver.registerContentObserver(Uri.parse(it),true,documentObserver)}}
+    }
+    /** Notification-driven SAF updates. A failed query is not proof of deletion. */
+    fun refreshMetadata() {
+        metadataJob?.cancel()
+        metadataJob=viewModelScope.launch {
+            delay(200)
+            val uris=(mutable.value.tabs.mapNotNull {it.uri}+recentMutable.value.map {it.uri}).distinct()
+            val metadata=withContext(Dispatchers.IO) {
+                uris.mapNotNull {raw->runCatching {
+                    val uri=Uri.parse(raw)
+                    if(uri.scheme!="content")return@runCatching null
+                    resolver.query(uri,arrayOf(android.provider.OpenableColumns.DISPLAY_NAME),null,null,null)?.use {cursor->
+                        raw to if(cursor.moveToFirst())cursor.getString(0) else null
+                    }
+                }.getOrNull()}.toMap()
+            }
+            val removed=metadata.filterValues {it==null}.keys
+            val s=mutable.value
+            val discarded=s.tabs.filter {it.uri in removed}
+            val recovered=discarded.filter {it.dirty}.map {it.copy(name="Recovered ${it.name}",uri=null,saved="")}
+            // Archive before closing; a failed write leaves the draft open.
+            val archived=withContext(Dispatchers.IO) {runCatching {recovered.forEach(deletedDrafts::save)}}
+            if(archived.isFailure){fail("Could not preserve a deleted note's edits. Its draft is still open; save it to another file.");return@launch}
+            if(mutable.value!==s){refreshMetadata();return@launch} // Never overwrite edits made during archive I/O.
+            discarded.forEach {readerEcho.remove(it.id)}
+            val kept=s.tabs.filter {it.uri !in removed}.map {note->metadata[note.uri]?.takeIf {it.isNotBlank()}?.let {note.copy(name=it,relative=renamedRelative(note.relative,it))} ?: note}
+            if(discarded.isNotEmpty()||kept!=s.tabs) change {it.copy(tabs=kept.ifEmpty {listOf(Note())},closedTabs=(recovered+it.closedTabs).take(12),message=if(discarded.isNotEmpty())"File deleted. Its tab was closed; unsaved edits remain recoverable in Settings." else "Updated renamed note")}
+            val recents=recentMutable.value.filter {it.uri !in removed}.map {note->metadata[note.uri]?.takeIf {it.isNotBlank()}?.let {note.copy(name=it,relative=renamedRelative(note.relative,it))} ?: note}
+            if(recents!=recentMutable.value)storeRecent(recents)
+            mutable.value.folder?.let {listFolder(Uri.parse(it),listedRelative)}
+        }
     }
     init { prefs.registerOnSharedPreferenceChangeListener(preferencesChanged);observeActive();if(!BuildConfig.DEBUG && workspaceKey=="main" && updates.state.value.checkOnOpen)viewModelScope.launch{kotlinx.coroutines.delay(6000);updates.check()} }
     override fun onCleared() { prefs.unregisterOnSharedPreferenceChangeListener(preferencesChanged);resolver.unregisterContentObserver(documentObserver); super.onCleared() }
@@ -218,7 +261,30 @@ class StudioViewModel(app: Application, val workspaceKey: String = "main") : And
         try {
             if (snapshot.isFile) s=snapshot.bufferedReader().use {NoteRecovery.read(it,s)}
         } catch (_: Exception) { s = s.copy(error = "The recovery snapshot could not be read. Your original files are untouched.") }
+        s=readingPreferences(s)
+        if(s.welcomed) {
+            val kept=s.tabs.filter {it.dirty || s.startup=="restore"&&!(it.uri==null&&it.name=="Welcome.md")}
+            val tabs=if(s.startup=="new")listOf(Note())+kept else kept.ifEmpty {listOf(Note())}
+            s=s.copy(tabs=tabs,activeId=if(s.startup=="new")tabs.first().id else s.activeId)
+        }
         return s
+    }
+    private fun readingPreferences(s:StudioState)=s.copy(restorePosition=prefs.getBoolean("restorePosition",true),startup=prefs.getString("startup","restore") ?: "restore",imageAppearance=prefs.getString("imageAppearance","original") ?: "original",svgAppearance=prefs.getString("svgAppearance","original") ?: "original",imageContrast=prefs.getFloat("imageContrast",1.25f))
+    fun readingPreference(key:String,value:String) {
+        if(key in listOf("imageAppearance","svgAppearance")&&value in listOf("original","invert-dark","auto","contrast") || key=="startup"&&value in listOf("restore","new"))prefs.edit().putString(key,value).apply()
+    }
+    fun restorePosition(value:Boolean){prefs.edit().putBoolean("restorePosition",value).apply()}
+    fun imageContrast(value:Float){if(value.isFinite())prefs.edit().putFloat("imageContrast",value.coerceIn(1f,2f)).apply()}
+    fun readingLocation(uri:String?):JSONObject?=if(uri==null)null else runCatching {JSONObject(prefs.getString("readingPositions","{}")!!).optJSONObject(uri)}.getOrNull()
+    fun readingPosition(id:String,location:JSONObject) {
+        val note=mutable.value.tabs.find {it.id==id} ?: return
+        val uri=note.uri ?: return
+        if(!mutable.value.restorePosition)return
+        if(listOf("top","offset","zoom").any {val value=location.optDouble(it,Double.NaN);!value.isFinite()||value<0} || location.optString("mode") !in listOf("reader","live","editor","split"))return
+        val old=runCatching {JSONObject(prefs.getString("readingPositions","{}")!!)}.getOrDefault(JSONObject())
+        old.remove(uri);old.put(uri,JSONObject().put("top",location.getDouble("top")).put("offset",location.getDouble("offset")).put("zoom",location.getDouble("zoom")).put("mode",location.getString("mode")))
+        while(old.length()>200)old.remove(old.keys().next())
+        prefs.edit().putString("readingPositions",old.toString()).apply()
     }
     private fun schedulePersist() { persistJob?.cancel(); val current = mutable.value; persistJob = viewModelScope.launch(Dispatchers.IO) { delay(1200); persist(current) } }
     @Synchronized private fun persist(s: StudioState) {
@@ -253,10 +319,16 @@ class StudioViewModel(app: Application, val workspaceKey: String = "main") : And
     }
     fun reorder(id: String, index: Int) = change { it.copy(tabs = reorderedNotes(it.tabs, id, index)) }
     fun close(id: String) {
+        readerEcho.remove(id)
         val note = mutable.value.tabs.find { it.id == id } ?: return
         change { val remaining = it.tabs.filter { n -> n.id != id }; val next = remaining.ifEmpty { listOf(Note()) }; val empty = note.uri == null && note.content.isBlank(); it.copy(tabs = next, closedTabs = (if (empty) it.closedTabs else listOf(note) + it.closedTabs).take(12), activeId = if (it.active.id == id) next.first().id else it.activeId, message = if (empty) "Empty tab discarded" else "Tab closed. Reopen from the menu to recover edits.") }
     }
     fun reopen() { val note = mutable.value.closedTabs.firstOrNull() ?: return; change { it.copy(tabs = it.tabs + note, closedTabs = it.closedTabs.drop(1), activeId = note.id) } }
+    fun recoverDeletedDraft()=viewModelScope.launch {
+        val note=withContext(Dispatchers.IO){deletedDrafts.latest(mutable.value.tabs.map {it.id}.toSet())}
+        if(note==null)change {it.copy(message="No additional deleted drafts to recover.")}
+        else change {it.copy(tabs=it.tabs+note,activeId=note.id,closedTabs=it.closedTabs.filter {closed->closed.id!=note.id})}
+    }
     fun mode(value: String) = change { it.copy(mode = value) }
     fun fullscreen(value: Boolean) = change { s ->
         if (value == s.fullscreen) s else s.copy(fullscreen = value,
@@ -318,10 +390,10 @@ class StudioViewModel(app: Application, val workspaceKey: String = "main") : And
                 val name = DocumentFile.fromSingleUri(getApplication(), uri)?.name ?: "Note.md"
                 resolver.openInputStream(uri)?.use { stream ->
                     val buffered = stream.buffered()
-                    buffered.mark(4096)
-                    val prefix = ByteArray(2048); val count = buffered.read(prefix); buffered.reset()
+                    buffered.mark(65536)
+                    val prefix = ByteArray(32768); val count = buffered.read(prefix); buffered.reset()
                     val header = if (count > 0) String(prefix, 0, count, Charsets.UTF_8).trimStart('\uFEFF', ' ', '\n', '\r', '\t') else ""
-                    val portable = name.endsWith(".fmd", true) || name.endsWith(".smd", true) && header.startsWith('{') && Regex("\"format\"\\s*:\\s*\"supermd-(smd|fmd)\"").containsMatchIn(header)
+                    val portable = portableEnvelopeHeader(header)
                     if (portable) { val opened = media.openFmd(buffered); Note(name = name, uri = uri.toString(), content = opened.markdown, saved = opened.markdown, relative = relative, assetDirectory = opened.directory) }
                     else { val content = readLimited(buffered, 20_000_000).toString(Charsets.UTF_8); Note(name = name, uri = uri.toString(), content = content, saved = content, relative = relative) }
                 } ?: error("Document permission is unavailable; choose it again")
@@ -354,6 +426,7 @@ class StudioViewModel(app: Application, val workspaceKey: String = "main") : And
     }
     fun closeFolder() = change { it.copy(folder = null, files = emptyList()) }
     fun listFolder(uri: Uri, relative: String) = viewModelScope.launch {
+        listedRelative=relative
         try {
             val entries = withContext(Dispatchers.IO) {
                 var folder = DocumentFile.fromTreeUri(getApplication(), Uri.parse(mutable.value.folder ?: uri.toString())) ?: error("Choose the folder again to restore access")

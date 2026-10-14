@@ -69,6 +69,7 @@ import org.json.JSONObject
 
 class MainActivity : ComponentActivity() {
     var dismissDocument: (() -> Unit)? = null
+    var saveReaderPosition: (() -> Unit)? = null
     private var workspaceKey = "main"
     private val model: StudioViewModel by viewModels { object : androidx.lifecycle.ViewModelProvider.Factory {
         @Suppress("UNCHECKED_CAST")
@@ -85,8 +86,8 @@ class MainActivity : ComponentActivity() {
         setContent { Studio(windowModel, this) }
         intent?.data?.let { uri -> model.open(uri) }
     }
-    override fun onStop() { model.flush(); super.onStop() }
-    override fun onResume() { super.onResume(); model.refreshExternal() }
+    override fun onStop() { saveReaderPosition?.invoke(); model.flush(); super.onStop() }
+    override fun onResume() { super.onResume(); model.refreshMetadata(); model.refreshExternal() }
     fun handleShortcut(event: android.view.KeyEvent): Boolean {
         if (event.action == android.view.KeyEvent.ACTION_DOWN && event.repeatCount == 0) {
             if (event.keyCode == android.view.KeyEvent.KEYCODE_F11) { model.fullscreen(!model.state.value.fullscreen); return true }
@@ -192,7 +193,8 @@ private object NoMotionScheme : MotionScheme {
     }
     DisposableEffect(activity, web) {
         activity.dismissDocument = { web?.evaluateJavascript("window.supermdDismiss?.() || false") { dismissed -> if (dismissed != "true") model.fullscreen(false) } ?: model.fullscreen(false) }
-        onDispose { activity.dismissDocument = null }
+        activity.saveReaderPosition={web?.evaluateJavascript("window.supermdSavePosition?.()",null)}
+        onDispose { activity.dismissDocument = null;activity.saveReaderPosition=null }
     }
     var readerReady by remember { mutableStateOf(false) }
     var folderRelative by remember { mutableStateOf("") }
@@ -238,13 +240,16 @@ private object NoMotionScheme : MotionScheme {
         val displayIsLarge = if (Build.VERSION.SDK_INT >= 30) activity.windowManager.maximumWindowMetrics.bounds.let { minOf(it.width(), it.height()) / density.density >= 600f } else activity.resources.configuration.smallestScreenWidthDp >= 600
         val wide = displayIsLarge && maxWidth >= 720.dp && maxHeight >= 400.dp
         val actualMode = if (!wide && state.mode == "split") "live" else state.mode
-        LaunchedEffect(readerReady, state.active, actualMode, dark, state.fullscreen, state.font, state.size, state.widthPercent,state.lineHeight,state.spellCheck,state.grammarCheck,tokens, hinge, motion) {
+        val readerContent=remember {arrayOfNulls<String>(1)}
+        LaunchedEffect(readerReady, state.active, actualMode, dark, state.fullscreen, state.font, state.size, state.widthPercent,state.lineHeight,state.spellCheck,state.grammarCheck,state.restorePosition,state.imageAppearance,state.svgAppearance,state.imageContrast,tokens, hinge, motion) {
             if (!readerReady) readerNote[0] = null
             if (readerReady) {
                 val note = state.active
-                val payload = JSONObject().put("id", note.id).apply { if (readerNote[0] == note.id && model.readerEcho[note.id] === note.content) put("contentUnchanged", true) else put("content", note.content) }.put("path", note.uri ?: note.id).put("mode", actualMode).put("dark", dark).put("fullscreen", state.fullscreen).put("font", state.font).put("size", state.size).put("widthPercent",state.widthPercent).put("lineHeight",state.lineHeight).put("spellCheck",state.spellCheck).put("grammarCheck",state.grammarCheck).put("colors", tokens).put("zoom", state.zoom).put("motion", motion)
+                val payload = JSONObject().put("id", note.id).apply { if (readerNote[0] == note.id && (readerContent[0] === note.content || model.readerEcho[note.id] === note.content)) put("contentUnchanged", true) else put("content", note.content) }.put("path", note.uri ?: note.id).put("mode", actualMode).put("dark", dark).put("fullscreen", state.fullscreen).put("font", state.font).put("size", state.size).put("widthPercent",state.widthPercent).put("lineHeight",state.lineHeight).put("spellCheck",state.spellCheck).put("grammarCheck",state.grammarCheck).put("restorePosition",state.restorePosition).put("imageAppearance",state.imageAppearance).put("svgAppearance",state.svgAppearance).put("imageContrast",state.imageContrast).put("colors", tokens).put("zoom", state.zoom).put("motion", motion)
+                payload.put("readingLocation",model.readingLocation(note.uri))
                 web?.evaluateJavascript("document.documentElement.dataset.platform='android';window.supermdLoad?.($payload)", null)
                 readerNote[0] = note.id
+                readerContent[0] = note.content
                 val hingeGap = if (hinge != null && actualMode == "split") hinge!!.bounds.width() / density.density else 0f
                 web?.evaluateJavascript("document.querySelector('.android-document')?.style.setProperty('gap','${hingeGap}px')", null)
             }
@@ -289,15 +294,15 @@ private object NoMotionScheme : MotionScheme {
                     }
                     HorizontalDivider(Modifier.padding(vertical=8.dp))
                     if(recent.isNotEmpty()) {
-                        Row(verticalAlignment=Alignment.CenterVertically){Text("Recent notes",Modifier.weight(1f),style=MaterialTheme.typography.titleSmall);TextButton(onClick=model::clearRecent){Text("Clear")}}
+                        Row(verticalAlignment=Alignment.CenterVertically){Text("Recent notes",Modifier.weight(1f),style=MaterialTheme.typography.titleSmall);TextButton(onClick=model::clearRecent){Text("Clear unpinned")}}
                         LazyColumn(Modifier.heightIn(max=200.dp),verticalArrangement=Arrangement.spacedBy(6.dp),contentPadding=PaddingValues(bottom=12.dp)) {
-                            items(recent.take(12),key={it.uri}) { note ->
+                            items(recent,key={it.uri}) { note ->
                                 val selected=state.active.uri==note.uri
                                 Surface(onClick={model.open(android.net.Uri.parse(note.uri),note.relative);scope.launch{drawer.close()}},shape=RoundedCornerShape(16.dp),color=if(selected)palette.secondaryContainer else palette.surfaceContainerLow,contentColor=if(selected)palette.onSecondaryContainer else palette.onSurface) {
                                     Row(Modifier.fillMaxWidth().padding(horizontal=14.dp,vertical=14.dp),verticalAlignment=Alignment.CenterVertically,horizontalArrangement=Arrangement.spacedBy(12.dp)) {
                                         Icon(painterResource(R.drawable.symbol_file),null,Modifier.size(24.dp))
                                         Text(note.name,Modifier.weight(1f),maxLines=2,overflow=TextOverflow.Ellipsis,style=MaterialTheme.typography.bodyMedium)
-                                        if(selected)Icon(Icons.Rounded.Check,"Current note",Modifier.size(20.dp))
+                                        IconButton(onClick={model.pinRecent(note.uri)}) {Icon(Icons.Rounded.PushPin,if(note.pinned)"Unpin note" else "Pin note",tint=if(note.pinned)palette.primary else palette.onSurfaceVariant)}
                                     }
                                 }
                             }
@@ -390,7 +395,9 @@ private object NoMotionScheme : MotionScheme {
                                         chromeTapJob[0]=scope.launch {
                                             if(tap)delay(260)
                                             evaluateJavascript("(() => { const e=document.elementFromPoint($x,$y); return !!document.querySelector('.live-active-block textarea:focus') || !!window.getSelection()?.toString() || ${if(tap) "!!e?.closest('a,button,input,textarea,summary,img,.note-image,[data-independent-zoom],.interactive-chart,.media-dialog,.reading-search,.math-repair-panel')" else "false"}; })()") { interacting ->
-                                                if(interacting!="true" && !gestureActive && completedEpoch==gestureEpoch)readingChromeVisible=show ?: !readingChromeVisible
+                                                if(interacting!="true" && !gestureActive && completedEpoch==gestureEpoch) {
+                                                    readingChromeAfterGesture(model.state.value.fullscreen, readingChromeVisible, show, tap)?.let { readingChromeVisible=it }
+                                                }
                                             }
                                         }
                                     }
@@ -433,7 +440,7 @@ private object NoMotionScheme : MotionScheme {
         BackHandler { settings = false }
         Surface(Modifier.fillMaxSize(), color = palette.surface) { Column(Modifier.fillMaxSize().safeDrawingPadding()) {
             TopAppBar(title = { Text("Settings") }, navigationIcon = { IconButton(onClick = { settings = false }) { Icon(Icons.AutoMirrored.Rounded.ArrowBack, "Back") } })
-            Settings(state, model, activity, noteLocation, {noteFolder.launch(noteLocation.takeIf{it.isNotBlank()}?.let(android.net.Uri::parse))}) {fontPicker.launch(arrayOf("font/ttf","font/otf","application/x-font-ttf","application/vnd.ms-opentype","application/octet-stream"))}
+            Settings(state, model, activity, noteLocation, {noteFolder.launch(noteLocation.takeIf{it.isNotBlank()}?.let(android.net.Uri::parse))}, {model.recoverDeletedDraft();settings=false}) {fontPicker.launch(arrayOf("font/ttf","font/otf","application/x-font-ttf","application/vnd.ms-opentype","application/octet-stream"))}
         } }
     }
     // Long forms must not strand their primary action below a half-open sheet.
@@ -484,7 +491,7 @@ private class NoteDestination(mime: String, private val preferred: () -> String)
     }
 }
 
-@Composable private fun Settings(state: StudioState, model: StudioViewModel, activity:MainActivity, noteLocation: String, chooseNoteLocation: ()->Unit, importFont: ()->Unit) {
+@Composable private fun Settings(state: StudioState, model: StudioViewModel, activity:MainActivity, noteLocation: String, chooseNoteLocation: ()->Unit, recoverDraft:()->Unit, importFont: ()->Unit) {
     val update by model.updates.state.collectAsStateWithLifecycle()
     val scope=rememberCoroutineScope()
     Column(Modifier.fillMaxWidth().verticalScroll(rememberScrollState()), horizontalAlignment = Alignment.CenterHorizontally) {
@@ -497,6 +504,10 @@ private class NoteDestination(mime: String, private val preferred: () -> String)
                 Row(verticalAlignment = Alignment.CenterVertically) { Column(Modifier.weight(1f)) { Text("Expressive motion", style = MaterialTheme.typography.titleMedium); Text("Spring transitions and responsive controls", style = MaterialTheme.typography.bodySmall) }; Switch(checked = state.motion, onCheckedChange = { model.appearance(motion = it) }) }
             }
             SettingsSection("Reading") {
+                Row(verticalAlignment=Alignment.CenterVertically){Text("Continue from last reading position",Modifier.weight(1f));Switch(state.restorePosition,model::restorePosition)}
+                OutlinedButton(onClick=recoverDraft) {Text("Recover latest deleted draft")}
+                Choice("On startup",state.startup,listOf("restore" to "Restore previous tabs","new" to "New blank note")){model.readingPreference("startup",it)}
+                Text("Unsaved drafts are recovered in either mode. Welcome is shown only on first use.",style=MaterialTheme.typography.bodySmall)
                 FontChoice("Reading font", if(state.font=="sans") "Manrope" else state.font, listOf("Manrope" to "Manrope", "roboto" to "Roboto", "noto" to "Noto Sans", "serif" to "Noto Serif", "mono" to "JetBrains Mono", "system" to "System")+state.customFonts.map {it to it}) { model.appearance(font = it) }
                 FilledTonalButton(onClick=importFont){Text("Import font…")}
                 Text("Text size · ${state.size.toInt()} px", style = MaterialTheme.typography.titleSmall, modifier = Modifier.padding(top = 16.dp))
@@ -509,6 +520,14 @@ private class NoteDestination(mime: String, private val preferred: () -> String)
                 Row(verticalAlignment=Alignment.CenterVertically){Text("Autosave existing notes",Modifier.weight(1f));Switch(checked=state.autosave,onCheckedChange={model.reading(autosave=it)})}
                 Text("New note location",style=MaterialTheme.typography.titleSmall)
                 FilledTonalButton(onClick=chooseNoteLocation,modifier=Modifier.fillMaxWidth()){Icon(Icons.Rounded.FolderOpen,null);Text(if(noteLocation.isBlank())"Downloads" else android.net.Uri.decode(noteLocation.substringAfterLast('/')),Modifier.padding(start=8.dp),maxLines=1,overflow=TextOverflow.Ellipsis)}
+            }
+            SettingsSection("Images & diagrams") {
+                val choices=listOf("original" to "Original (off)","invert-dark" to "Invert in dark themes","auto" to "Auto adapt to theme","contrast" to "Increase contrast")
+                Choice("Image appearance",state.imageAppearance,choices){model.readingPreference("imageAppearance",it)}
+                Choice("SVG appearance",state.svgAppearance,choices){model.readingPreference("svgAppearance",it)}
+                Text("Contrast strength · ${"%.2f".format(state.imageContrast)}")
+                StudySlider(value=state.imageContrast,onCommit=model::imageContrast,valueRange=1f..2f)
+                Text("Optional viewing adjustments. Original files and PDF exports are unchanged.",style=MaterialTheme.typography.bodySmall)
             }
             SettingsSection("Writing assistance") {
                 Row(verticalAlignment=Alignment.CenterVertically){Text("Spell check",Modifier.weight(1f));Switch(checked=state.spellCheck,onCheckedChange={model.writing(spellCheck=it)})}

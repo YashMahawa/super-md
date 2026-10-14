@@ -1,5 +1,5 @@
 import {test,expect} from '@playwright/test';
-test('desktop fullscreen chrome follows reading gestures without stealing selection or double clicks',async({page})=>{
+test('desktop fullscreen scrolling only hides controls and deliberate clicks toggle without stealing selection',async({page})=>{
   await page.addInitScript(()=>{(window as any).chromeActions=[];window.SuperMD={post:(id,command,args)=>{if(command==='reader_chrome')(window as any).chromeActions.push(JSON.parse(args).action);window.supermdReply?.(id,true,null);}};});
   await page.goto('/android-reader.html');await page.waitForFunction(()=>typeof window.supermdLoad==='function');
   await page.evaluate(()=>document.documentElement.dataset.host='qt');
@@ -9,15 +9,22 @@ test('desktop fullscreen chrome follows reading gestures without stealing select
   expect(await page.evaluate(()=>(window as any).chromeActions)).toEqual([]);
   await page.evaluate(state=>{window.supermdLoad?.({...state,fullscreen:true});window.supermdChromeInset?.(56);},state);
   await page.mouse.wheel(0,120);await expect.poll(()=>page.evaluate(()=>(window as any).chromeActions)).toEqual(['hide']);
-  await page.evaluate(()=>window.supermdNativeWheel?.(0,-40,{x:350,y:350},false));await expect.poll(()=>page.evaluate(()=>(window as any).chromeActions)).toEqual(['hide','show']);
+  // Mouse-wheel and native touchpad scrolling in either direction must never
+  // reveal fullscreen controls, even after the request debounce has elapsed.
+  await page.waitForTimeout(100);
+  await page.evaluate(()=>window.supermdNativeWheel?.(0,-40,{x:350,y:350},false));await expect.poll(()=>page.evaluate(()=>(window as any).chromeActions)).toEqual(['hide','hide']);
+  await page.waitForTimeout(100);await page.mouse.wheel(0,-40);
+  await expect.poll(()=>page.evaluate(()=>(window as any).chromeActions)).toEqual(['hide','hide','hide']);
+  await page.waitForTimeout(100);await page.evaluate(()=>window.supermdNativeWheel?.(0,40,{x:350,y:350},false));
+  await expect.poll(()=>page.evaluate(()=>(window as any).chromeActions)).toEqual(['hide','hide','hide','hide']);
   const paragraph=page.locator('.markdown-body p').nth(1);
-  await paragraph.click();await expect.poll(()=>page.evaluate(()=>(window as any).chromeActions)).toEqual(['hide','show','toggle']);
+  await paragraph.click();await expect.poll(()=>page.evaluate(()=>(window as any).chromeActions)).toEqual(['hide','hide','hide','hide','toggle']);
   await paragraph.dblclick();await page.waitForTimeout(400);
-  expect(await page.evaluate(()=>(window as any).chromeActions)).toEqual(['hide','show','toggle']);
+  expect(await page.evaluate(()=>(window as any).chromeActions)).toEqual(['hide','hide','hide','hide','toggle']);
   await paragraph.evaluate(el=>{const range=document.createRange();range.selectNodeContents(el);window.getSelection()!.removeAllRanges();window.getSelection()!.addRange(range);el.dispatchEvent(new MouseEvent('click',{bubbles:true,detail:1}));});
-  await page.waitForTimeout(350);expect(await page.evaluate(()=>(window as any).chromeActions)).toEqual(['hide','show','toggle']);
+  await page.waitForTimeout(350);expect(await page.evaluate(()=>(window as any).chromeActions)).toEqual(['hide','hide','hide','hide','toggle']);
   await page.evaluate(()=>{window.getSelection()?.removeAllRanges();window.supermdNativeWheel?.(0,30,{x:350,y:350},true);});
-  expect(await page.evaluate(()=>(window as any).chromeActions)).toEqual(['hide','show','toggle']);
+  expect(await page.evaluate(()=>(window as any).chromeActions)).toEqual(['hide','hide','hide','hide','toggle']);
 });
 test('native overlay spacing protects the title and fullscreen never narrows the text column',async({page})=>{
   await page.addInitScript(()=>{window.SuperMD={post:()=>{}};});await page.goto('/android-reader.html');

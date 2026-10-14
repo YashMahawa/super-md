@@ -21,8 +21,13 @@ export default function MediaTools({ documentId, content, documentPath, onInsert
   const [busy, setBusy] = useState(false); const [fetching, setFetching] = useState(false); const [error, setError] = useState("");
   const [replacement, setReplacement] = useState(false);
   const [removed, setRemoved] = useState<{ from: number; text: string; expected: string } | null>(null);
-  const target = useRef<InsertionPoint | undefined>(undefined); const targetSource = useRef(content); const replacing = useRef(false); const mounted = useRef(true); const reference = useRef({ onInsert, onNotice, content }); reference.current = { onInsert, onNotice, content };
+  const target = useRef<InsertionPoint | undefined>(undefined); const targetSource = useRef<string | null>(null); const replacing = useRef(false); const mounted = useRef(true); const reference = useRef({ onInsert, onNotice, content }); reference.current = { onInsert, onNotice, content };
+  // Keep a full-source guard only while an actual replacement is pending.
+  // Otherwise this ref can retain a huge obsolete document after every edit.
+  useEffect(() => { if (!open) targetSource.current = null; }, [open]);
+  useEffect(() => { if (removed && content !== removed.expected) setRemoved(null); }, [content, removed]);
   const commitImages = (images: ImportedImage[]) => {
+    if (!images.length) return;
     if (replacing.current && reference.current.content !== targetSource.current) { reference.current.onNotice("The note changed while importing. Select the image again to replace it safely."); return; }
     reference.current.onInsert((replacing.current ? "" : "\n\n") + images.map(imageMarkdown).join("\n\n") + (replacing.current ? "" : "\n"), target.current); setOpen(false);
   };
@@ -57,9 +62,30 @@ export default function MediaTools({ documentId, content, documentPath, onInsert
       const pasted = event.clipboardData?.getData("text/plain").trim() || "";
       if (/^https?:\/\/\S+$/.test(pasted)) { event.preventDefault(); show(pasted); }
     };
+    let internalDrag = false;
+    const dragStart = (event: DragEvent) => {
+      const element = event.target instanceof Element ? event.target : null;
+      internalDrag = !!element?.closest(".workspace,.android-document");
+      // A browser can turn an embedded/data-URL image drag into a File.
+      // Viewing or panning a rendered image must never re-import it into the note.
+      if (element?.closest(".markdown-body img,.markdown-body svg,.image-viewer")) {
+        event.preventDefault(); event.stopPropagation();
+        // Cancelled drags do not receive dragend. Do not poison the next real
+        // external file drop with a stale internal-drag flag.
+        queueMicrotask(() => { internalDrag = false; });
+      }
+    };
+    const dragEnd = () => { internalDrag = false; };
     const drop = (event: DragEvent) => {
       const element = event.target as Element;
-      if (!element.closest?.(".workspace,.android-document") || element.closest(".media-scrim")) return;
+      const fromDocument = internalDrag; internalDrag = false;
+      if (!element.closest?.(".workspace,.android-document")) return;
+      if (fromDocument || element.closest(".image-viewer,.math-repair-panel,.reading-search,.media-scrim")) {
+        // Preserve ordinary text drag/drop inside Source/Live editors. Only
+        // suppress file-bearing internal drops and drops on read-only overlays.
+        if (Array.from(event.dataTransfer?.types || []).includes("Files")) { event.preventDefault(); event.stopPropagation(); }
+        return;
+      }
       if ("__TAURI_INTERNALS__" in window) return; // Native desktop path drop owns image files.
       const files = Array.from(event.dataTransfer?.files || []).filter((f) => /^image\//.test(f.type) || /\.svg$/i.test(f.name));
       if (!files.length) return;
@@ -69,8 +95,8 @@ export default function MediaTools({ documentId, content, documentPath, onInsert
       void importImageFiles(files).then((images) => { if (mounted.current) reference.current.onInsert("\n\n" + images.map(imageMarkdown).join("\n\n") + "\n", point); }).catch((e) => reference.current.onNotice(String(e)));
     };
     const over = (event: DragEvent) => { if ((event.target as Element).closest?.(".workspace,.android-document") && Array.from(event.dataTransfer?.types || []).includes("Files")) event.preventDefault(); };
-    document.addEventListener("paste", paste, true); document.addEventListener("drop", drop, true); document.addEventListener("dragover", over); window.addEventListener("supermd-image-edit", editImage);
-    return () => { mounted.current = false; delete window.supermdMedia; delete window.supermdInsertImages; delete window.supermdCaptureInsertion; document.removeEventListener("paste", paste, true); document.removeEventListener("drop", drop, true); document.removeEventListener("dragover", over); window.removeEventListener("supermd-image-edit", editImage); };
+    document.addEventListener("paste", paste, true); document.addEventListener("dragstart", dragStart, true); document.addEventListener("dragend", dragEnd, true); document.addEventListener("drop", drop, true); document.addEventListener("dragover", over); window.addEventListener("supermd-image-edit", editImage);
+    return () => { mounted.current = false; delete window.supermdMedia; delete window.supermdInsertImages; delete window.supermdCaptureInsertion; document.removeEventListener("paste", paste, true); document.removeEventListener("dragstart", dragStart, true); document.removeEventListener("dragend", dragEnd, true); document.removeEventListener("drop", drop, true); document.removeEventListener("dragover", over); window.removeEventListener("supermd-image-edit", editImage); };
   }, [documentId]);
   useEffect(() => { setFetching(false); if (!open || imageMode || !/^https?:\/\/\S+$/.test(url)) return;
     let active = true; setFetching(true); setDetails(null);
