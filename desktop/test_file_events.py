@@ -1,9 +1,20 @@
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 from file_events import identity,reconcile
 
 class FileEventsTest(unittest.TestCase):
+    def test_case_only_rename_is_detected_when_the_old_spelling_still_resolves(self):
+        with tempfile.TemporaryDirectory() as directory:
+            original=Path(directory)/"study.md";original.write_text("# Note")
+            known={str(original):identity(original)}
+            renamed=original.with_name("Study.md");original.rename(renamed)
+            stat=Path.stat
+            def case_insensitive(path,*args,**kwargs):
+                return stat(renamed if path==original else path,*args,**kwargs)
+            with patch.object(Path,"stat",case_insensitive):
+                self.assertEqual(reconcile(known,{directory}),{str(original):str(renamed)})
     def test_same_directory_rename_is_found_by_identity_without_scanning_elsewhere(self):
         with tempfile.TemporaryDirectory() as directory:
             original=Path(directory)/"old.md";original.write_text("# Note")

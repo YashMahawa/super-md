@@ -134,7 +134,7 @@ jobs:
         if: matrix.platform == 'ubuntu-22.04'
         run: |
           sudo apt-get update
-          sudo apt-get install -y libnss3 libasound2 libxcb-cursor0 libxcb-icccm4 libxcb-keysyms1 libxcb-image0 libxcb-render-util0 libxkbcommon-x11-0 libegl1 libgl1 libfuse2 squashfs-tools rpm ruby-dev build-essential
+          sudo apt-get install -y libnss3 libasound2 libxcb-cursor0 libxcb-icccm4 libxcb-keysyms1 libxcb-image0 libxcb-render-util0 libxcb-shape0 libxcb-sync1 libxcb-randr0 libxcb-xfixes0 libxcb-xkb1 libxcb-util1 libwayland-client0 libwayland-cursor0 libwayland-server0 libxkbcommon-x11-0 libegl1 libgl1 libfuse2 squashfs-tools rpm ruby-dev build-essential
           sudo gem install fpm --no-document
           curl -fL https://github.com/AppImage/appimagetool/releases/download/1.9.1/appimagetool-x86_64.AppImage -o "$RUNNER_TEMP/appimagetool"
           echo "ed4ce84f0d9caff66f50bcca6ff6f35aae54ce8135408b3fa33abfc3cb384eb0  $RUNNER_TEMP/appimagetool" | sha256sum -c -

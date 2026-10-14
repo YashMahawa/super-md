@@ -80,6 +80,7 @@ class Session(QObject):
     def __init__(self,isolated=False):
         super().__init__()
         self.data = Path(tempfile.mkdtemp(prefix="supermd-test-")) if isolated else Path(QStandardPaths.writableLocation(QStandardPaths.AppDataLocation))/"qt-studio"
+        self.data=self.data.resolve()
         self.data.mkdir(parents=True,exist_ok=True)
         self.font_store = FontStore(self.data)
         self.python_outputs = PythonOutputs(self.data/"derived-python")
@@ -329,7 +330,7 @@ class Studio(QObject):
 
     def _external_note_changed(self,path):
         if self.retired:return
-        self.external_paths.add(path)
+        self.external_paths.add(str(local_path(path)))
         self.external_timer.start(250)
 
     def _refresh_external_notes(self):
@@ -345,7 +346,7 @@ class Studio(QObject):
 
     def _location_changed(self,old,new):
         if self.retired:return
-        if Path(old).exists():return  # A temporary atomic-replace gap has healed.
+        if Path(old).exists() and not (new and old!=new and old.casefold()==new.casefold()):return  # A temporary atomic-replace gap has healed.
         if new and not Path(new).is_file():return
         if new:
             location=self.session.locations.pop(old,None)

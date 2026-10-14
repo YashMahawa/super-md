@@ -464,9 +464,12 @@ ax.set_title("Matplotlib 3D figure")
         javascriptUntil("document.documentElement.dataset.fullscreen") { it == "\"true\"" }
         javascriptUntil("document.querySelector('.document-page')?.dataset.scale") { it == normalScale }
         compose.waitUntil(5000) {compose.onAllNodesWithContentDescription("Exit fullscreen").fetchSemanticsNodes().isEmpty()}
-        // A native upward traversal reveals a compact toolbar, never floating
-        // circles which remain over the document while chrome is hidden.
+        // Fullscreen scrolls must never reveal chrome. A deliberate margin
+        // tap reveals the compact toolbar, not floating controls.
         compose.onRoot().performTouchInput { swipe(androidx.compose.ui.geometry.Offset(width*.75f,height*.45f),androidx.compose.ui.geometry.Offset(width*.75f,height*.75f),500) }
+        javascriptUntil("true") {it=="true"}
+        compose.onNodeWithContentDescription("Exit fullscreen").assertDoesNotExist()
+        compose.onRoot().performTouchInput {click(androidx.compose.ui.geometry.Offset(width*.98f,height*.6f))}
         compose.waitUntil(5000) {compose.onAllNodesWithContentDescription("Exit fullscreen").fetchSemanticsNodes().isNotEmpty()}
         // Earlier tests/repeated runs deliberately persist fullscreen zoom.
         // Start below the upper limit so this check can require a real increase.

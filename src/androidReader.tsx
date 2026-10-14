@@ -296,6 +296,9 @@ function Reader() {
     const scroll=()=>{window.clearTimeout(timer);timer=window.setTimeout(save,900);};
     savePosition.current=save;
     root.addEventListener('scroll',scroll,{passive:true});window.addEventListener('pagehide',save);document.addEventListener('visibilitychange',save);
+    // A native/heading jump can finish before this passive effect subscribes.
+    // Persist its settled viewport too, even if no later scroll event arrives.
+    scroll();
     return()=>{window.clearTimeout(timer);save();root.removeEventListener('scroll',scroll);window.removeEventListener('pagehide',save);document.removeEventListener('visibilitychange',save);savePosition.current=()=>{};};
   },[state?.id,state?.mode,state?.path,state?.restorePosition]);
   useEffect(() => {
