@@ -10,6 +10,7 @@ export default function ImageViewer() {
   const zoomRef = useRef(zoom); zoomRef.current = zoom;
   const panRef = useRef(pan); panRef.current = pan;
   const canvas = useRef<HTMLDivElement>(null);
+  const source=useRef<HTMLImageElement|null>(null);
   const translate = (next: Point) => { panRef.current = next; setPan(next); };
   const scale = (value: number, focus?: Point) => {
     const bounds = canvas.current?.getBoundingClientRect();
@@ -23,12 +24,30 @@ export default function ImageViewer() {
       const target = event.target instanceof Element ? event.target.closest<HTMLImageElement>(".markdown-body img") : null;
       if (!target?.currentSrc) return;
       event.preventDefault(); event.stopImmediatePropagation();
+      source.current=target;
       setImage({ src: target.currentSrc, alt: target.alt || "Image", filter:getComputedStyle(target).filter, owner: target.closest("[data-note-image-source]") }); fit();
     };
     document.addEventListener("click", open, true);
     return () => document.removeEventListener("click", open, true);
   }, []);
   useEffect(() => { setReaderOverlay("image",!!image);return()=>setReaderOverlay("image",false); }, [!!image]);
+  useEffect(()=>{
+    if(!image){source.current=null;return;}
+    if(!source.current)return;
+    const target=source.current;
+    const sync=()=>{
+      if(!target.isConnected){setImage(null);return;}
+      const src=target.currentSrc||target.src,filter=getComputedStyle(target).filter;
+      setImage(previous=>previous&&(previous.src!==src||previous.filter!==filter)?{...previous,src,filter}:previous);
+    };
+    // Appearance changes should affect an already-open viewer too, without
+    // resetting its magnification or moving the image under the person's hand.
+    const observer=new MutationObserver(sync);
+    observer.observe(document.documentElement,{attributes:true,attributeFilter:['style','data-theme']});
+    observer.observe(target,{attributes:true,attributeFilter:['src','style']});
+    target.addEventListener('load',sync);
+    return()=>{observer.disconnect();target.removeEventListener('load',sync);};
+  },[!!image]);
   useEffect(() => {
     if (!image) return;
     const previous = document.activeElement as HTMLElement | null;
@@ -48,7 +67,7 @@ export default function ImageViewer() {
     document.addEventListener("keydown", key, true); window.addEventListener("supermd-image-zoom", native);
     window.addEventListener("supermd-image-reset",reset);
     return () => { surface?.removeEventListener("supermd-canvas-pan",nativePan);surface?.removeEventListener("wheel",wheel); window.removeEventListener("supermd-image-reset",reset); document.removeEventListener("keydown", key, true); window.removeEventListener("supermd-image-zoom", native); previous?.focus({ preventScroll: true }); pointers.current.clear(); };
-  }, [image]);
+  }, [!!image]);
   if (!image) return null;
   const edit = (action: string) => { if (image.owner) window.dispatchEvent(new CustomEvent("supermd-image-edit", { detail: { action, image: image.owner } })); setImage(null); };
   return <section className="image-viewer" data-independent-zoom role="dialog" aria-modal="true" aria-label="Image viewer">

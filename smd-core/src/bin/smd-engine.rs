@@ -8,14 +8,22 @@ use std::{collections::HashMap, io::{self, Read, Write}, path::{Path, PathBuf}};
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct ExportRequest { content: String, #[serde(default)] assets: HashMap<String, String>, #[serde(default)] options: PdfOptions }
+#[derive(Deserialize)]
+struct FormatMarker { format: Option<String> }
 
 fn read_note(path: &Path) -> Result<(String, Option<PortableDocument>)> {
     let size = std::fs::metadata(path)?.len();
     if size > portable::MAX_FILE as u64 { bail!("Note exceeds 120 MB"); }
-    let content = std::fs::read_to_string(path)?.trim_start_matches('\u{feff}').to_owned();
+    let mut content = std::fs::read_to_string(path)?;
+    if content.starts_with('\u{feff}') { content.drain(..3); }
     // Content, not extension, distinguishes old text SMD from portable SMD.
     let extension = path.extension().and_then(|x| x.to_str()).unwrap_or("").to_ascii_lowercase();
-    let portable = matches!(extension.as_str(), "smd" | "fmd") && content.trim_start().starts_with('{') && content.contains("\"format\"");
+    // Ignore other JSON fields during probing: do not allocate a second copy
+    // of every asset just to recognize a provider-renamed envelope.
+    let portable = content.trim_start().starts_with('{') && (
+        serde_json::from_str::<FormatMarker>(&content).ok().is_some_and(|header| matches!(header.format.as_deref(), Some("supermd-smd" | "supermd-fmd")))
+        || matches!(extension.as_str(), "smd" | "fmd") && content.contains("\"format\"")
+    );
     if portable { let note = PortableDocument::decode(&content)?; Ok((note.markdown.clone(), Some(note))) }
     else { Ok((content, None)) }
 }

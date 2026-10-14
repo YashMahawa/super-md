@@ -37,6 +37,22 @@ fn text_and_portable_commands_never_dump_image_bytes() {
     assert!(!w.run(&["read", "missing.md"]).status.success()); assert!(!w.run(&["unknown", "note.md"]).status.success());
 }
 #[test]
+fn portable_recognition_uses_the_format_marker_not_the_filename() {
+    let w=Workspace::new();
+    for format in ["supermd-smd","supermd-fmd"] {
+        // Put the marker last: JSON object ordering is not part of the format.
+        let content=format!("\u{feff}{{\"markdown\":\"# Renamed note\",\"assets\":{{}},\"version\":1,\"format\":\"{format}\"}}");
+        for name in ["download", "shared.txt", "shared.json", "shared.MD", "shared.SMD"] {
+            fs::write(w.file(name),&content).unwrap();
+            assert_eq!(success(w.run(&["read",name])),"# Renamed note");
+        }
+    }
+    fs::write(w.file("ordinary.json"),r#"{"format":"csv","rows":[]}"#).unwrap();
+    assert_eq!(success(w.run(&["read","ordinary.json"])),r#"{"format":"csv","rows":[]}"#);
+    fs::write(w.file("unsupported.txt"),r##"{"format":"supermd-smd","version":99,"markdown":"# Bad","assets":{}}"##).unwrap();
+    assert!(!w.run(&["read","unsupported.txt"]).status.success());
+}
+#[test]
 fn prepared_pdf_stdin_and_invalid_requests() {
     let w = Workspace::new();
     let mut child = Command::new(env!("CARGO_BIN_EXE_smd-engine")).current_dir(&w.0).args(["export-json", "prepared.pdf"])

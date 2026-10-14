@@ -140,22 +140,30 @@ class StudioViewModel(app: Application, val workspaceKey: String = "main") : And
             delay(200)
             val uris=(mutable.value.tabs.mapNotNull {it.uri}+recentMutable.value.map {it.uri}).distinct()
             val metadata=withContext(Dispatchers.IO) {
-                uris.mapNotNull {raw->runCatching {
+                uris.mapNotNull {raw->
                     val uri=Uri.parse(raw)
-                    if(uri.scheme!="content")return@runCatching null
-                    resolver.query(uri,arrayOf(android.provider.OpenableColumns.DISPLAY_NAME),null,null,null)?.use {cursor->
-                        raw to if(cursor.moveToFirst())cursor.getString(0) else null
+                    if(uri.scheme!="content")return@mapNotNull null
+                    when(val info=queryProviderMetadata {
+                        resolver.query(uri,arrayOf(android.provider.OpenableColumns.DISPLAY_NAME),null,null,null)?.use {cursor->
+                            if(cursor.moveToFirst())ProviderMetadata.Found(cursor.getString(0)) else ProviderMetadata.Missing
+                        }
+                    }) {
+                        is ProviderMetadata.Found->info.name?.takeIf {it.isNotBlank()}?.let {raw to it}
+                        ProviderMetadata.Missing->raw to null
+                        ProviderMetadata.Unavailable->null
                     }
-                }.getOrNull()}.toMap()
+                }.toMap()
             }
             val removed=metadata.filterValues {it==null}.keys
             val s=mutable.value
             val discarded=s.tabs.filter {it.uri in removed}
             val recovered=discarded.filter {it.dirty}.map {it.copy(name="Recovered ${it.name}",uri=null,saved="")}
             // Archive before closing; a failed write leaves the draft open.
-            val archived=withContext(Dispatchers.IO) {runCatching {recovered.forEach(deletedDrafts::save)}}
-            if(archived.isFailure){fail("Could not preserve a deleted note's edits. Its draft is still open; save it to another file.");return@launch}
-            if(mutable.value!==s){refreshMetadata();return@launch} // Never overwrite edits made during archive I/O.
+            if(recovered.isNotEmpty()) {
+                val archived=withContext(Dispatchers.IO) {runCatching {recovered.forEach(deletedDrafts::save)}}
+                if(archived.isFailure){fail("Could not preserve a deleted note's edits. Its draft is still open; save it to another file.");return@launch}
+                if(mutable.value!==s){refreshMetadata();return@launch} // Never overwrite edits made during archive I/O.
+            }
             discarded.forEach {readerEcho.remove(it.id)}
             val kept=s.tabs.filter {it.uri !in removed}.map {note->metadata[note.uri]?.takeIf {it.isNotBlank()}?.let {note.copy(name=it,relative=renamedRelative(note.relative,it))} ?: note}
             if(discarded.isNotEmpty()||kept!=s.tabs) change {it.copy(tabs=kept.ifEmpty {listOf(Note())},closedTabs=(recovered+it.closedTabs).take(12),message=if(discarded.isNotEmpty())"File deleted. Its tab was closed; unsaved edits remain recoverable in Settings." else "Updated renamed note")}
@@ -327,7 +335,10 @@ class StudioViewModel(app: Application, val workspaceKey: String = "main") : And
     fun recoverDeletedDraft()=viewModelScope.launch {
         val note=withContext(Dispatchers.IO){deletedDrafts.latest(mutable.value.tabs.map {it.id}.toSet())}
         if(note==null)change {it.copy(message="No additional deleted drafts to recover.")}
-        else change {it.copy(tabs=it.tabs+note,activeId=note.id,closedTabs=it.closedTabs.filter {closed->closed.id!=note.id})}
+        else change {s->
+            if(s.tabs.any {it.id==note.id})s.copy(activeId=note.id)
+            else s.copy(tabs=s.tabs+(s.closedTabs.find {it.id==note.id} ?: note),activeId=note.id,closedTabs=s.closedTabs.filter {it.id!=note.id})
+        }
     }
     fun mode(value: String) = change { it.copy(mode = value) }
     fun fullscreen(value: Boolean) = change { s ->

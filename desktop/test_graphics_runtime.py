@@ -1,4 +1,5 @@
 import subprocess
+import sys
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
@@ -8,6 +9,15 @@ import graphics_runtime
 
 
 class GraphicsRuntimeTest(unittest.TestCase):
+    @unittest.skipUnless(sys.platform.startswith("linux"),"Linux crash-collector isolation")
+    def test_expected_probe_aborts_are_not_dumpable_and_editor_process_is_unchanged(self):
+        import ctypes
+        libc=ctypes.CDLL(None)
+        before=libc.prctl(3,0,0,0,0)
+        result=subprocess.run([sys.executable,"-c","import ctypes,graphics_runtime; assert graphics_runtime.isolate_probe_dumps(); print(ctypes.CDLL(None).prctl(3,0,0,0,0))"],cwd=Path(__file__).parent,text=True,capture_output=True,check=True,timeout=10)
+        self.assertEqual(result.stdout.strip(),"0")
+        self.assertEqual(libc.prctl(3,0,0,0,0),before)
+
     def test_only_presented_html_markers_count_as_a_working_document_renderer(self):
         def image(left, right, empty=False):
             return SimpleNamespace(isNull=lambda: empty, width=lambda: 64, height=lambda: 32,

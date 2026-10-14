@@ -8,15 +8,16 @@
 - Recent documents can be pinned. Pins appear first and are protected from eviction; the list holds at most ten documents.
 - Reading positions persist across restarts by default, with an option to disable restoration. A heading jump or manual gesture takes priority over delayed position restoration.
 - Welcome appears only on first use. Startup restores prior tabs by default, or opens a blank note when chosen; unsaved drafts remain recoverable.
-- SMD and legacy FMD envelopes are recognized by their format marker, even when a sharing provider changes or omits the filename extension.
+- SMD and legacy FMD envelopes are recognized by their format marker in the desktop/Android readers and native command-line exporter, even when a sharing provider changes or omits the filename extension.
 
 ## Efficient updates and large notes
 
 - Native filesystem/provider notifications update open-folder listings, renamed tabs and recent filenames without a polling loop.
-- Deleted notes leave recents and close their tabs with a notice. The last deleted tab becomes a blank note without closing the window; dirty deleted content is retained for recovery.
+- Deleted notes leave recents and close their tabs with a notice. The last deleted tab becomes a blank note without closing the window; dirty deleted content is retained for recovery. Android keeps a durable private backup independent of its bounded closed-tab history, accessible from Settings. Nullable provider filenames are not treated as deletion.
 - Palette-only changes no longer reserialize an unchanged large note or rebuild the whole rendered Markdown/math tree. The native controls and reader update without remeasuring page geometry or rewinding scrolling.
 - Delayed viewport anchors stop when newer user input arrives. Image-edit guards no longer retain obsolete full-note strings after the operation ends.
 - Desktop shutdown ignores late worker callbacks, prevents duplicate overlapping close prompts and flushes pending preferences and reading positions.
+- Linux's disposable graphics probe is non-dumpable, so a deliberately contained driver abort does not enter the system's crash-collector pipeline. Crash diagnostics for the actual editor are unchanged.
 
 ## Packaging and release verification
 
@@ -24,6 +25,6 @@
 - Clean-distribution checks launch the AppImage **before** installing DEB/RPM dependencies, so native package installation cannot mask missing portable dependencies.
 - Publication requires passing desktop, browser, native PDF, Android unit/lint and Android API 35/36 emulator checks. Packaged installers must paint real reader pixels and produce portable notes and math PDFs; the Android release APK must pass certificate, alignment and non-debuggable checks.
 
-Notification limits: desktop renames can be followed within watched directories; moves to an unrelated, unobserved directory cannot always be found. Android providers must expose stable identifiers and notifications. Failed or denied metadata queries are not treated as deletion. The exact pair of Fedora dialogs reported by a user has not been independently reproduced; the verified shutdown race and overlapping prompts are fixed.
+Notification limits: desktop renames can be followed within watched directories; moves to an unrelated, unobserved directory cannot always be found. Android providers must expose stable identifiers and notifications. Permission errors and unavailable providers are not treated as deletion; an empty result or explicit document-not-found result is required. The exact pair of Fedora dialogs reported by a user has not been independently reproduced; the verified shutdown race and overlapping prompts are fixed.
 
 Custom theme-file support is deliberately reserved for a separate subsequent release. Version 0.5.1 remains available for rollback. macOS packages remain ad-hoc signed rather than notarized, and Windows installers are not code-signed.

@@ -59,3 +59,18 @@ test('image adjustments default to off and change viewing only',async({page})=>{
   await expect.poll(()=>image.getAttribute('src')).toContain(encodeURIComponent('#aaccff'));
   await expect(page.locator('.svg-figure')).toHaveAttribute('data-auto-ink','true');
 });
+
+test('an open image follows theme adjustments without losing its zoom',async({page})=>{
+  const state={id:'viewer-theme',path:null,content:'```svg\n<svg xmlns="http://www.w3.org/2000/svg" width="120" height="80"><path d="M10 10L100 60" stroke="black"/></svg>\n```',mode:'reader' as const,dark:true,fullscreen:false,colors:{text:'#eee0ee',primary:'#aaccff'},font:'Manrope',size:15,zoom:100,svgAppearance:'invert-dark' as const};
+  await page.evaluate(state=>window.supermdLoad?.(state),state);
+  await page.locator('.svg-diagram').click();
+  const image=page.locator('.image-viewer-canvas img');await expect(image).toBeVisible();
+  await expect.poll(()=>image.evaluate(el=>getComputedStyle(el).filter)).toContain('invert(1)');
+  await page.evaluate(()=>window.dispatchEvent(new CustomEvent('supermd-image-zoom',{detail:{factor:1.4}})));
+  await expect(page.getByLabel('Image zoom')).toHaveText('140%');
+  await page.evaluate(state=>window.supermdLoad?.({...state,dark:false}),state);
+  await expect.poll(()=>image.evaluate(el=>getComputedStyle(el).filter)).toBe('none');
+  await page.evaluate(state=>window.supermdLoad?.({...state,svgAppearance:'auto',colors:{text:'#eee0ee',primary:'#df9dca'}}),state);
+  await expect.poll(()=>image.getAttribute('src')).toContain(encodeURIComponent('#df9dca'));
+  await expect(page.getByLabel('Image zoom')).toHaveText('140%');
+});

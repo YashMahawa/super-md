@@ -15,6 +15,25 @@ from pathlib import Path
 PROBE_TIMEOUT = 8
 
 
+def isolate_probe_dumps() -> bool:
+    """Expected probe aborts must not become desktop crash-report dialogs.
+
+    RLIMIT_CORE alone is ignored by Linux's piped crash collectors. Restrict
+    dumpability only in the disposable probe, never in the actual editor.
+    https://man7.org/linux/man-pages/man2/pr_set_dumpable.2const.html
+    """
+    if not sys.platform.startswith("linux"):
+        return False
+    try:
+        import ctypes
+        prctl=ctypes.CDLL(None,use_errno=True).prctl
+        prctl.argtypes=[ctypes.c_int,ctypes.c_ulong,ctypes.c_ulong,ctypes.c_ulong,ctypes.c_ulong]
+        prctl.restype=ctypes.c_int
+        return prctl(4,0,0,0,0)==0  # PR_SET_DUMPABLE, SUID_DUMP_DISABLE
+    except (OSError,AttributeError):
+        return False
+
+
 def painted_document(image) -> bool:
     """Two HTML-only markers distinguish document pixels from Qt's surface."""
     if image.isNull() or image.width() < 4 or image.height() < 2:
@@ -77,6 +96,7 @@ def probe(report: Path | None = None) -> int:
     if sys.platform != "win32":
         import resource
         resource.setrlimit(resource.RLIMIT_CORE, (0, 0))
+    isolate_probe_dumps()
     from PySide6.QtCore import QTimer, Qt
     from PySide6.QtGui import QGuiApplication
     from PySide6.QtQml import QQmlApplicationEngine
