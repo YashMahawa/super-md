@@ -63,13 +63,15 @@ class StudioTest(unittest.TestCase):
         import custom_theme
         studio=self.studio;second=self.window();source=studio.data/"authored-theme.json";source.write_text("{}")
         pending=[]
-        with patch.object(studio,"_submit",side_effect=lambda action,done,*_:pending.append((action,done))),patch("custom_theme.read",return_value=custom_theme.TEMPLATE):
+        # These are persistence/state unit tests. The real shared engine is
+        # exercised by CLI tests and the mandatory packaged rendering checks.
+        with patch.object(studio,"_engine",return_value=Path("unused-theme-engine")),patch.object(studio,"_submit",side_effect=lambda action,done,*_:pending.append((action,done))),patch("custom_theme.read",return_value=custom_theme.TEMPLATE):
             studio.importCustomTheme(str(source));action,done=pending.pop();done(action(),None)
         self.assertEqual(studio.customThemeName,"My theme");self.assertEqual(second.customThemeName,"My theme")
         self.assertTrue((studio.data/"theme.json").is_file());self.assertIn(str(source),studio.custom_theme_watcher.files())
         original=studio._colors()
         pending=[]
-        with patch.object(studio,"_submit",side_effect=lambda action,done,*_:pending.append((action,done))),patch("custom_theme.read",side_effect=ValueError("Invalid edit")):
+        with patch.object(studio,"_engine",return_value=Path("unused-theme-engine")),patch.object(studio,"_submit",side_effect=lambda action,done,*_:pending.append((action,done))),patch("custom_theme.read",side_effect=ValueError("Invalid edit")):
             studio.reloadCustomTheme();action,done=pending.pop();value=action();studio.pending_close="keep";done(value,None)
         self.assertEqual(studio._colors(),original);self.assertIn("Invalid edit",studio.message);self.assertEqual(studio.pending_close,"keep")
         studio.resetCustomTheme();self.assertTrue(source.is_file());self.assertFalse((studio.data/"theme.json").exists());self.assertEqual(second.customThemeName,"Built-in appearance")
@@ -88,7 +90,7 @@ class StudioTest(unittest.TestCase):
         def read(_,path):
             if path==source:raise ValueError("Incomplete edit")
             return custom_theme.TEMPLATE
-        with patch.object(studio,"_submit",side_effect=lambda action,done,*_:pending.append((action,done))),patch("custom_theme.read",side_effect=read):
+        with patch.object(studio,"_engine",return_value=Path("unused-theme-engine")),patch.object(studio,"_submit",side_effect=lambda action,done,*_:pending.append((action,done))),patch("custom_theme.read",side_effect=read):
             studio.reloadCustomTheme()
             while pending:
                 action,done=pending.pop(0);done(action(),None)

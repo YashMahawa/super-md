@@ -267,8 +267,15 @@ def main():
                     if choice is None:
                         app.exit(2)
                     else:
-                        if not QMetaObject.invokeMethod(choice,"revealChoices"):
-                            app.exit(2)
+                        scroll = window.findChild(QObject,"settingsScroll")
+                        viewport = scroll.property("contentItem")
+                        top = choice.mapToItem(viewport,QPointF()).y() + viewport.property("contentY")
+                        viewport.setProperty("contentY",max(0,min(top - viewport.property("height")/2,
+                            viewport.property("contentHeight") - viewport.property("height"))))
+                        def reveal():
+                            if not QMetaObject.invokeMethod(choice,"revealChoices"):
+                                app.exit(2)
+                        QTimer.singleShot(50,reveal)
                 QTimer.singleShot(14500,dropdown)
                 def capture_dropdown():
                     popup = window.findChild(QObject,"readingFontChoicePopup")
@@ -277,6 +284,11 @@ def main():
                     capture("font-dropdown")
                     if popup is None or not popup.property("visible"):
                         print("DROPDOWN SMOKE FAILED: menu is not visible",flush=True)
+                        app.exit(2)
+                        return
+                    overlay = popup.property("parent")
+                    if popup.property("y") < 16 or popup.property("y") + popup.property("height") > overlay.property("height") - 16:
+                        print("DROPDOWN SMOKE FAILED: menu extends outside the window",flush=True)
                         app.exit(2)
                         return
                     if scroll.property("width") - choice.property("width") < 24:
@@ -350,8 +362,15 @@ def main():
                         def fullscreen_shown():
                             window.setProperty("chromeAwake",True)
                             geometry.update(width=reader.property("width"),height=reader.property("height"))
-                            script="document.querySelector('.android-reading').scrollTop=0;requestAnimationFrame(()=>window.SuperMD.post('chrome-smoke','export_failed',JSON.stringify({error:'CHROME:'+JSON.stringify({inset:parseFloat(getComputedStyle(document.documentElement).getPropertyValue('--native-chrome-inset')),title:document.querySelector('h1').getBoundingClientRect().top})})))"
+                            # Announce navigation intent so a pending mode-position
+                            # restore cannot undo this deliberate test scroll.
+                            script="window.supermdNativeWheel?.(0,0,{x:400,y:300},false);document.querySelector('.android-reading').scrollTop=0;requestAnimationFrame(()=>window.SuperMD.post('chrome-smoke','export_failed',JSON.stringify({error:'CHROME:'+JSON.stringify({inset:parseFloat(getComputedStyle(document.documentElement).getPropertyValue('--native-chrome-inset')),title:document.querySelector('h1').getBoundingClientRect().top})})))"
                             QMetaObject.invokeMethod(window,"runDocumentScript",Q_ARG("QVariant",script))
+                            # Move only the isolated test window's synthetic
+                            # pointer away from the toolbar, not the user's cursor.
+                            from PySide6.QtCore import QPoint
+                            from PySide6.QtTest import QTest
+                            QTest.mouseMove(window,QPoint(window.width()//2,window.height()//2))
                         def fullscreen_hidden():
                             toolbar=window.findChild(QObject,"studyToolbar")
                             capture("fullscreen-hidden")
@@ -359,7 +378,7 @@ def main():
                             import json
                             clearance=json.loads(studio.message.removeprefix("CHROME:")) if studio.message.startswith("CHROME:") else {}
                             if toolbar is None or toolbar.property("height")!=56 or toolbar.property("shown") or not stable or clearance.get("inset")!=56 or clearance.get("title",0)<56:
-                                print(f"FULLSCREEN OVERLAY SMOKE FAILED: stable={stable}",flush=True);app.exit(2);return
+                                print(f"FULLSCREEN OVERLAY SMOKE FAILED: stable={stable} height={toolbar.property('height') if toolbar else None} shown={toolbar.property('shown') if toolbar else None} clearance={clearance}",flush=True);app.exit(2);return
                             print("FULLSCREEN OVERLAY SMOKE PASSED: compact bar hides without resizing the reader",flush=True)
                             app.exit(0)
                         QTimer.singleShot(600,fullscreen_shown)
