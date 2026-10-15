@@ -54,3 +54,12 @@ it('resolves embedded paint styles without mounting CSS and keeps muted labels s
   expect((rect as unknown as SVGElement).style.getPropertyPriority('fill')).toBe('important');
   expect(source).toContain('.node{fill:#153d4b!important}');
 });
+it('treats white-only transparent artwork as ink rather than erasing it as paper or a halo',()=>{
+  const source='<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 160 80"><path fill="white" d="M0 0L80 0L80 80L0 80Z"/><path fill="none" stroke="white" stroke-width="10" d="M90 10L150 70"/></svg>';
+  for(const colors of [light,dark]){
+    const xml=parse(adaptSvg(source,colors,colors===dark));
+    expect(xml.querySelectorAll('path')[0].getAttribute('fill')).toBe(colors.primary);
+    expect(xml.querySelectorAll('path')[1].getAttribute('stroke')).toBe(colors.primary);
+  }
+  expect(source).toContain('fill="white"');
+});

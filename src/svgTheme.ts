@@ -1,5 +1,5 @@
 import {mediaContrast,mediaTone} from './mediaAppearance';
-import {svgImage} from './svgImage';
+import {svgImage,svgContrastBackdrop} from './svgImage';
 
 type RGB=[number,number,number];
 type Matrix=[number,number,number,number,number,number];
@@ -96,6 +96,7 @@ export function adaptSvg(source:string,colors:Record<string,string>,dark:boolean
   const nodes=Array.from(root.querySelectorAll('*'));if(nodes.length>6000)return safe;
   if(!flattenPaintRules(root,nodes))return safe;
   const {paper,ink}=mediaTone(colors,dark);
+  const lightInk=svgContrastBackdrop(safe)==='#222026';
   const view=(root.getAttribute('viewBox')||`0 0 ${parseFloat(root.getAttribute('width')||'0')} ${parseFloat(root.getAttribute('height')||'0')}`).split(/[\s,]+/).map(Number);
   const viewArea=view[2]*view[3];let index=0;const paints:Paint[]=[];
   const hasDrawing=nodes.filter(n=>['path','rect','circle','ellipse','polygon','line','text','use'].includes(n.localName)&&!n.closest('defs')).length>1;
@@ -111,11 +112,11 @@ export function adaptSvg(source:string,colors:Record<string,string>,dark:boolean
     if(['path','rect','circle','ellipse','polygon','polyline','line','text','tspan','use'].includes(node.localName)){
       const box=label?null:bounds(node,matrix),area=box?(box[2]-box[0])*(box[3]-box[1]):0;
       const c=rgb(fill);
-      const isPaper=!!box&&viewArea>0&&area>=viewArea*.65&&!!c&&neutral(c)&&(Math.min(...c)>180||hasDrawing);
+      const isPaper=!lightInk&&!!box&&viewArea>0&&area>=viewArea*.65&&!!c&&neutral(c)&&(Math.min(...c)>180||hasDrawing);
       let newFill=fill;
       if(c&&!label){
         if(isPaper)newFill=paper;
-        else if(neutral(c))newFill=Math.min(...c)>180?paper:ink;
+        else if(neutral(c))newFill=Math.min(...c)>180&&!lightInk?paper:ink;
         else if(box&&Math.min(...c)>215&&Math.max(...c)-Math.min(...c)<64){
           const base=rgb(paper)!,average=(c[0]+c[1]+c[2])/3;
           newFill=hex(base.map((v,i)=>v+(c[i]-average)*1.3) as RGB);
@@ -140,7 +141,10 @@ export function adaptSvg(source:string,colors:Record<string,string>,dark:boolean
     if(box){x=(box[0]+box[2])/2;y=(box[1]+box[3])/2;}
     else [x,y]=point(matrix,x,y);
     let local:Paint|undefined;
-    for(let i=shapes.length-1;i>=0;i--){const p=shapes[i];if(p.index<paint.index&&p.box&&x>=p.box[0]&&x<=p.box[2]&&y>=p.box[1]&&y<=p.box[3]){local=p;break;}}
+    // Unbounded/curved paths have no reliable sample point. Do not treat the
+    // default (0,0) as their backdrop: a different shape there can otherwise
+    // make an unrelated line acquire the wrong colour.
+    if(box||label)for(let i=shapes.length-1;i>=0;i--){const p=shapes[i];if(p.index<paint.index&&p.box&&x>=p.box[0]&&x<=p.box[2]&&y>=p.box[1]&&y<=p.box[3]){local=p;break;}}
     const background=rgb(local?.newFill||'')?hex(rgb(local!.newFill)!):paper;
     const c=rgb(paint.fill);
     if(c){
@@ -151,7 +155,7 @@ export function adaptSvg(source:string,colors:Record<string,string>,dark:boolean
     const edge=rgb(paint.stroke);
     if(edge){
       const width=parseFloat((node as SVGElement).style?.getPropertyValue('stroke-width')||node.getAttribute('stroke-width')||'1');
-      const halo=neutral(edge)&&Math.min(...edge)>230&&width>=4;
+      const halo=!lightInk&&neutral(edge)&&Math.min(...edge)>230&&width>=4;
       set(node,'stroke',halo?paper:readable(neutral(edge)?ink:paint.stroke,background,3));
     }
   }

@@ -194,3 +194,12 @@ test('PNG, JPEG and WebP wallpaper paint actual reader pixels and do not replace
     expect(await page.evaluate(()=>(window as any).__rasterArtMath.isConnected)).toBe(true);
   }
 });
+
+test('Auto keeps white-only SVG ink visible on a dark themed page',async({page})=>{
+  const svg='<svg xmlns="http://www.w3.org/2000/svg" width="160" height="80"><path fill="white" d="M0 0L80 0L80 80L0 80Z"/><path fill="none" stroke="white" stroke-width="10" d="M90 10L150 70"/></svg>';
+  const state={id:'white-ink',path:null,content:'```svg\n'+svg+'\n```',mode:'reader' as const,dark:true,fullscreen:false,colors:{surface:'#17131b',text:'#eee0ee',primary:'#aaccff'},font:'Manrope',size:15,zoom:100,svgAppearance:'auto' as const};
+  await page.evaluate(state=>window.supermdLoad?.(state),state);
+  const image=page.locator('.svg-diagram');await expect(image).toBeVisible();
+  const png=PNG.sync.read(await image.screenshot()),i=((png.height>>1)*png.width+(png.width>>2))*4;
+  expect(Array.from(png.data.subarray(i,i+3))).toEqual([170,204,255]);
+});

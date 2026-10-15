@@ -12,6 +12,7 @@
 
 - Auto adapt preserves colours while adapting neutral ink and paper to the current accent and page. SVG labels are checked against their local node backgrounds; poorly contrasted marks and arrowheads are adjusted without flattening all colours.
 - Theme monochrome is a separate option for the previous full-image accent duotone effect. Original remains the default; theme-relative separation preserves source pixels and adds readable backing/edges.
+- White-only transparent SVG drawings are treated as ink, not erased as white paper or a thick edge halo in Auto mode.
 - Existing images, SVGs, notes and PDF source assets are never rewritten by viewing adjustments. An open image keeps its zoom when the theme changes.
 
 ## Desktop polish and navigation
