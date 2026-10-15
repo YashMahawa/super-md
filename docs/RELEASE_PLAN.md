@@ -22,7 +22,7 @@ Native notifications are bounded to open files, recent files and the opened/expa
 
 ## Second release: custom theming
 
-Version 0.6.1 implements the separate theme-file system. Its publication remains gated on the complete CI, native Android emulator and packaged installer checks; see [THEMING.md](THEMING.md) for the supported format and platform limits.
+[Version 0.6.1 is published](https://github.com/YashMahawa/super-md/releases/tag/v0.6.1), separately from 0.5.2, with all seven installers and SHA256SUMS. All nine jobs in [release-commit CI](https://github.com/YashMahawa/super-md/actions/runs/38687923705) passed, including Android API 35/36 native emulator tests. [Installer verification and publication](https://github.com/YashMahawa/super-md/actions/runs/38691156297) passed clean-distribution Linux, installed Windows EXE, both mounted macOS DMGs, signed APK and complete-asset checks. See [THEMING.md](THEMING.md) for the supported format and platform limits.
 
 The earlier v0.6.0 candidate was never published. Its tag is retained unchanged; 0.6.1 incorporates the requested accent-aware image rendering, theme-relative separation, subtle pin controls and persistent centre lock before publication.
 

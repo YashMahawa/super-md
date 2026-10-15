@@ -64,6 +64,7 @@ Native Material 3 Expressive controls, a compact phone workspace, and layouts th
 
 - **Expressive Material styling:** rounded controls, coordinated semantic colors, clear selected states, purposeful motion, and a motion-off setting.
 - **Your theme, your paper:** system colors or chosen accents; tinted light, dark, and pure-black themes; separate fullscreen appearance.
+- **Images that fit the theme:** optional accent-aware recolouring for photos and SVGs, dark-theme inversion, or readable backing/edges that preserve original colours. Viewing adjustments never rewrite assets or change PDF output.
 - **Typography you can choose:** searchable font selection, private TTF/OTF imports, and bundled Manrope, Roboto, Noto Sans, Noto Serif, and JetBrains Mono. Imported fonts can also be used for PDF export.
 - **A layout that fits:** percentage-based reading width, adjustable text size and vertical spacing, and settings that persist across sessions.
 
@@ -72,7 +73,7 @@ Desktop uses native Qt Quick/QML controls; Android uses native Kotlin/Jetpack Co
 ### Reading without the surrounding noise
 
 - **Distraction-free fullscreen** with a compact overlay bar and controls that hide while reading. Desktop supports F11 and Escape.
-- **Page-style zoom:** magnify the document without scaling the toolbar or repeatedly rewrapping paragraphs. Pinch or use content-zoom controls; pan a magnified page with two-finger movement.
+- **Page-style zoom:** magnify the document without scaling the toolbar or repeatedly rewrapping paragraphs. A remembered centre lock prevents horizontal drift during scrolling and zooming; unlock it for free two-finger panning. Image and graph cameras remain independent.
 - **Independent image viewing:** open an image, zoom toward a point, and pan it without changing the note's text size.
 - **An automatic contents outline:** headings become a collapsible, scrollable navigation tree—even when the note has no handwritten contents links. Fullscreen can show the outline as an overlay.
 - **Find in the rendered note:** highlighted matches, directional navigation, case matching, and Source-mode replacement. Internal heading links and existing wiki-style heading links are understood.
@@ -144,21 +145,23 @@ Notes stay local. Folder access uses operating-system permissions, remote-image 
 
 Pin important recent notes, continue from saved reading positions, and restore the last workspace or start blank. Native file/provider notifications keep open tabs, recents and folder listings in sync with external renames and deletions, without a polling loop; unsaved deleted content stays recoverable.
 
+Pinned notes show a small indicator, not a permanent action button on every row. Right-click a recent note on desktop or long-press it on Android to pin or unpin.
+
 Android supports independent app windows and drag-reordering tabs where the device permits it; wider windows can use Split mode and foldable-aware layouts. Desktop adds drag transfer between windows. See [platform behavior](docs/PLATFORM-PARITY.md) for the differences rather than assuming identical operating-system capabilities.
 
 Custom theme files can style native controls and the reader, with light/dark palettes, code/callout colors, typography, corners and subtle background patterns. Export a template, edit it yourself or with an AI, and import it on desktop or Android. See the [theme authoring guide](docs/THEMING.md) and [example themes](public/themes).
 
 ## Download
 
-Get **[Super MD 0.5.2](https://github.com/YashMahawa/super-md/releases/tag/v0.5.2)** or visit the [latest release](https://github.com/YashMahawa/super-md/releases/latest).
+Get **[Super MD 0.6.1](https://github.com/YashMahawa/super-md/releases/tag/v0.6.1)** or visit the [latest release](https://github.com/YashMahawa/super-md/releases/latest).
 
 | Platform | Packages |
 |---|---|
-| Linux x86-64 | [AppImage](https://github.com/YashMahawa/super-md/releases/download/v0.5.2/Super-MD_0.5.2_amd64.AppImage) · [DEB](https://github.com/YashMahawa/super-md/releases/download/v0.5.2/Super-MD_0.5.2_amd64.deb) · [RPM](https://github.com/YashMahawa/super-md/releases/download/v0.5.2/Super-MD-0.5.2-1.x86_64.rpm) |
-| Windows x64 | [Installer](https://github.com/YashMahawa/super-md/releases/download/v0.5.2/Super-MD_0.5.2_x64-setup.exe) |
-| macOS Apple silicon | [DMG](https://github.com/YashMahawa/super-md/releases/download/v0.5.2/Super-MD_0.5.2_aarch64.dmg) |
-| macOS Intel | [DMG](https://github.com/YashMahawa/super-md/releases/download/v0.5.2/Super-MD_0.5.2_x64.dmg) |
-| Android 8+ / ARM64 | [Signed release APK](https://github.com/YashMahawa/super-md/releases/download/v0.5.2/Super-MD-0.5.2-arm64-release.apk) |
+| Linux x86-64 | [AppImage](https://github.com/YashMahawa/super-md/releases/download/v0.6.1/Super-MD_0.6.1_amd64.AppImage) · [DEB](https://github.com/YashMahawa/super-md/releases/download/v0.6.1/Super-MD_0.6.1_amd64.deb) · [RPM](https://github.com/YashMahawa/super-md/releases/download/v0.6.1/Super-MD-0.6.1-1.x86_64.rpm) |
+| Windows x64 | [Installer](https://github.com/YashMahawa/super-md/releases/download/v0.6.1/Super-MD_0.6.1_x64-setup.exe) |
+| macOS Apple silicon | [DMG](https://github.com/YashMahawa/super-md/releases/download/v0.6.1/Super-MD_0.6.1_aarch64.dmg) |
+| macOS Intel | [DMG](https://github.com/YashMahawa/super-md/releases/download/v0.6.1/Super-MD_0.6.1_x64.dmg) |
+| Android 8+ / ARM64 | [Signed release APK](https://github.com/YashMahawa/super-md/releases/download/v0.6.1/Super-MD-0.6.1-arm64-release.apk) |
 
 Release checksums are included. macOS packages are ad-hoc signed, not notarized; Windows installers are not code-signed. Android installation requires the normal system approval. For Linux graphics or AppImage mounting issues, read [graphics diagnostics](docs/GRAPHICS-DIAGNOSTICS.md).
 
