@@ -17,7 +17,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        platform: [ubuntu-22.04, macos-latest, windows-latest]
+        platform: [ubuntu-22.04, macos-latest, macos-15-intel, windows-latest]
     runs-on: ${{ matrix.platform }}
     steps:
       - uses: actions/checkout@v4
@@ -44,6 +44,7 @@ jobs:
       - uses: swatinem/rust-cache@v2
         with:
           workspaces: ./smd-core -> target
+          shared-key: native-desktop-${{ runner.os }}-${{ runner.arch }}
       - run: npm ci
       - run: npm run build
       - run: node --test scripts/release-guards.test.mjs
@@ -137,6 +138,9 @@ jobs:
           SUPERMD_STORE_PASSWORD: ${{ secrets.ANDROID_STORE_PASSWORD }}
           SUPERMD_KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
           SUPERMD_KEY_PASSWORD: ${{ secrets.ANDROID_KEY_PASSWORD }}
+      - name: Lint debug and instrumentation sources without suppressing render assertions
+        working-directory: android
+        run: ./gradlew --no-daemon --max-workers=2 :app:lintDebug
       - uses: actions/upload-artifact@v4
         with:
           name: super-md-android-arm64-release
@@ -148,6 +152,7 @@ jobs:
           path: |
             android/app/build/reports/tests/
             android/app/build/reports/lint-results-release.html
+            android/app/build/reports/lint-results-debug.html
 
   android-device-tests:
     strategy:

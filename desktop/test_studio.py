@@ -59,6 +59,49 @@ class StudioTest(unittest.TestCase):
         self.studio.post("invalid","reader_chrome",'{"action":"anything"}')
         self.assertEqual(received,["show","hide","toggle"])
 
+    def test_custom_theme_import_updates_all_windows_and_reset_never_deletes_source(self):
+        import custom_theme
+        studio=self.studio;second=self.window();source=studio.data/"authored-theme.json";source.write_text("{}")
+        pending=[]
+        with patch.object(studio,"_submit",side_effect=lambda action,done,*_:pending.append((action,done))),patch("custom_theme.read",return_value=custom_theme.TEMPLATE):
+            studio.importCustomTheme(str(source));action,done=pending.pop();done(action(),None)
+        self.assertEqual(studio.customThemeName,"My theme");self.assertEqual(second.customThemeName,"My theme")
+        self.assertTrue((studio.data/"theme.json").is_file());self.assertIn(str(source),studio.custom_theme_watcher.files())
+        original=studio._colors()
+        pending=[]
+        with patch.object(studio,"_submit",side_effect=lambda action,done,*_:pending.append((action,done))),patch("custom_theme.read",side_effect=ValueError("Invalid edit")):
+            studio.reloadCustomTheme();action,done=pending.pop();value=action();studio.pending_close="keep";done(value,None)
+        self.assertEqual(studio._colors(),original);self.assertIn("Invalid edit",studio.message);self.assertEqual(studio.pending_close,"keep")
+        studio.resetCustomTheme();self.assertTrue(source.is_file());self.assertFalse((studio.data/"theme.json").exists());self.assertEqual(second.customThemeName,"Built-in appearance")
+
+    def test_automatic_update_network_errors_do_not_replace_messages_or_close_intent(self):
+        studio=self.studio;pending=[];studio.message="A local note is ready";studio.pending_close="keep"
+        with patch.object(studio,"_submit",side_effect=lambda action,done,*_:pending.append((action,done))),patch("studio.updates.bounded_json",side_effect=OSError("Temporary failure in name resolution")):
+            studio.checkUpdates(True);action,done=pending.pop();studio._complete((done,action(),None,False))
+        self.assertEqual(studio.message,"A local note is ready");self.assertEqual(studio.pending_close,"keep");self.assertIn("offline",studio.updateStatus)
+
+    def test_last_good_theme_is_restored_before_retrying_an_invalid_source(self):
+        import custom_theme
+        studio=self.studio;source=studio.data/"edited-theme.json";source.write_text("broken JSON")
+        atomic_json(studio.data/"theme.json",custom_theme.TEMPLATE);studio.session.theme_source=str(source)
+        pending=[]
+        def read(_,path):
+            if path==source:raise ValueError("Incomplete edit")
+            return custom_theme.TEMPLATE
+        with patch.object(studio,"_submit",side_effect=lambda action,done,*_:pending.append((action,done))),patch("custom_theme.read",side_effect=read):
+            studio.reloadCustomTheme()
+            while pending:
+                action,done=pending.pop(0);done(action(),None)
+        self.assertEqual(studio.customThemeName,"My theme");self.assertIn("Incomplete edit",studio.message)
+
+    def test_unrelated_parent_notifications_do_not_reparse_a_theme(self):
+        studio=self.studio;source=studio.data/"observed-theme.json";source.write_text("{}")
+        studio.session.theme_source=str(source);studio._watch_custom_theme()
+        with patch.object(studio,"reloadCustomTheme") as reload:
+            studio._custom_theme_event();reload.assert_not_called()
+            source.write_text("{ } ")
+            studio._custom_theme_event();reload.assert_called_once()
+
     def test_retired_windows_ignore_queued_jobs_and_late_callbacks(self):
         studio=self.studio
         studio.stop();studio.pool.shutdown(wait=True,cancel_futures=True)

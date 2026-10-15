@@ -1,0 +1,8 @@
+{
+  "format":"supermd-theme","version":1,"name":"Rose paper","accent":"rose",
+  "variants":{
+    "light":{"colors":{"surface":"#eddde0","surface-low":"#e2cbd0","surface-high":"#cfaeb8","text":"#34242a","heading":"#63354a","link":"#7b3c56"},"background":{"pattern":"gradient","color":"#a34569","opacity":0.075,"angle":135}},
+    "dark":{"colors":{"surface":"#21171b","surface-low":"#2b1e24","surface-high":"#3e2a34","text":"#efdee5","heading":"#f5b9d2","link":"#edb0c9"},"background":{"pattern":"gradient","color":"#bd7896","opacity":0.08,"angle":135}}
+  },
+  "metrics":{"controlRadius":24,"contentRadius":20,"paragraphSpacing":1.3,"codePadding":18,"headingWeight":720,"headingTracking":-0.02,"textTracking":0,"tableBorderWidth":1}
+}

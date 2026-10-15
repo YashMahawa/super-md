@@ -46,7 +46,7 @@ class PaintControlTest {
     @Test fun materialDrawerSurfacePaints() {
         compose.activity.runOnUiThread { compose.activity.setContent {
             MaterialExpressiveTheme {
-                BoxWithConstraints(Modifier.fillMaxSize().background(Color.Yellow)) {
+                Box(Modifier.fillMaxSize().background(Color.Yellow)) {
                     ModalNavigationDrawer(drawerState = rememberDrawerState(DrawerValue.Closed), drawerContent = { ModalDrawerSheet { Text("Drawer") } }) {
                         Column(Modifier.fillMaxSize()) {
                             Surface(color = Color.Red, modifier = Modifier.fillMaxWidth().weight(1f)) { Text("RED") }

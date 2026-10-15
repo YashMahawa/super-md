@@ -34,7 +34,7 @@ Button {
     Material.elevation: 0
     background: Rectangle {
         antialiasing: true
-        radius: control.down ? 10 : control.highlighted ? 14 : height / 2
+        radius: Math.min(height/2, (studio.themeMetrics ? studio.themeMetrics.controlRadius : 22) * (control.down ? .5 : control.highlighted ? .7 : 1))
         color: control.prominent || control.highlighted ? control.colors.primary : control.tonal ? control.colors["surface-high"] : "transparent"
         border.width: control.visualFocus ? 2 : control.tonal ? 1 : 0
         border.color: control.visualFocus ? control.colors.primary : control.colors.outline

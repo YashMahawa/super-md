@@ -1,30 +1,24 @@
-# Super MD 0.5.2
+# Super MD 0.6.0
 
-## Reliable reading and document handling
+## Portable custom themes
 
-- Opening, dragging or panning an image or SVG no longer re-imports it or appends a broken block. Genuine external image drops still work.
-- Scrolling in fullscreen hides controls but never reveals them. Deliberate taps and desktop top-edge hover remain available.
-- Optional, separate image and SVG appearance controls: original, dark-theme inversion, theme adaptation and contrast adjustment. Original is the default; these viewing choices do not alter source assets or PDF output.
-- Recent documents can be pinned. Pins appear first and are protected from eviction; the list holds at most ten documents.
-- Reading positions persist across restarts by default, with an option to disable restoration. A heading jump or manual gesture takes priority over delayed position restoration.
-- Welcome appears only on first use. Startup restores prior tabs by default, or opens a blank note when chosen; unsaved drafts remain recoverable.
-- SMD and legacy FMD envelopes are recognized by their format marker in the desktop/Android readers and native command-line exporter, even when a sharing provider changes or omits the filename extension.
+- Import an editable theme JSON file on desktop and Android. One format controls native semantic colors and the reading pane, with independent light, dark and pure-black variants.
+- Customize headings, links, code blocks, callout families, component/content corners, paragraph spacing, heading weight/tracking, text tracking and table borders. Reading fonts, sizes, width and zoom stay user-controlled.
+- Add subtle dot, grid, diagonal or gradient backgrounds without images, scripts, network requests or animated overlays.
+- Export an editable template or the active theme. The authoring guide documents every field, role, limit and platform behavior, including an AI-ready authoring request. Three example themes are bundled.
+- Desktop follows source-file edits using filesystem notifications, including atomic saves. Android observes document providers where supported, with manual Reload and resume-time retry otherwise. Invalid/partial edits preserve the last valid theme; Reset to built-in never deletes the original file or notes.
+- Desktop and Android share the same bounded native validator. Unknown fields, unsafe color expressions, unsupported versions and oversized files are rejected. Contrast safeguards protect native text and controls.
 
-## Efficient updates and large notes
+## Reliability and verification
 
-- Native filesystem/provider notifications update open-folder listings, renamed tabs and recent filenames without a polling loop.
-- Deleted notes leave recents and close their tabs with a notice. The last deleted tab becomes a blank note without closing the window; dirty deleted content is retained for recovery. Android keeps a durable private backup independent of its bounded closed-tab history, accessible from Settings. Nullable provider filenames are not treated as deletion.
-- Palette-only changes no longer reserialize an unchanged large note or rebuild the whole rendered Markdown/math tree. The native controls and reader update without remeasuring page geometry or rewinding scrolling.
-- Delayed viewport anchors stop when newer user input arrives. Image-edit guards no longer retain obsolete full-note strings after the operation ends.
-- Desktop shutdown ignores late worker callbacks, prevents duplicate overlapping close prompts and flushes pending preferences and reading positions.
-- Linux's disposable graphics probe is non-dumpable, so a deliberately contained driver abort does not enter the system's crash-collector pipeline. Crash diagnostics for the actual editor are unchanged.
+- Theme palette changes keep the existing large-note rendering/cache path instead of reparsing Markdown/math. Typography updates use reading-anchor restoration. Removing optional reader preferences is now recognized correctly, including theme reset.
+- Automatic desktop update checks no longer replace a useful note status with a raw offline network error or cancel a pending close operation. Explicit checks still report a friendly offline status.
+- Packaged-app launch checks now import a theme through the real native validator and verify the reader's pattern/typography alongside the existing presented-pixel, Markdown, math, chart, portable-note and PDF assertions.
+- Android instrumentation verifies shared validation, native contrast, actual imported-accent pixels and reader styling, invalid-edit preservation and reset. Existing gesture, selection, hyperlink, export and painting assertions remain enabled.
+- CI now covers Intel macOS before tagging as well as Apple Silicon, Linux and Windows. Debug/instrumentation sources receive their own lint check; desktop CI and release builds share architecture-isolated dependency caches without skipping tests or packaged launch checks.
 
-## Packaging and release verification
+Themes are viewing preferences, not embedded in portable notes. PDF layout remains controlled by Export/Share; custom background patterns and reading metrics do not alter PDF output. Native Android component shapes follow Material's platform behavior rather than replacing every control with desktop geometry.
 
-- Linux explicitly bundles Qt's X11 helper libraries, including `libxcb-icccm.so.4`, whose absence caused the AppImage catalog's clean-machine launch test to fail. Driver-owned GL/EGL and C++/unwind runtimes remain on the host.
-- Clean-distribution checks launch the AppImage **before** installing DEB/RPM dependencies, so native package installation cannot mask missing portable dependencies.
-- Publication requires passing desktop, browser, native PDF, Android unit/lint and Android API 35/36 emulator checks. Packaged installers must paint real reader pixels and produce portable notes and math PDFs; the Android release APK must pass certificate, alignment and non-debuggable checks.
+This is deliberately separate from the published [0.5.2 reliability release](https://github.com/YashMahawa/super-md/releases/tag/v0.5.2), which remains available for rollback. All its document-safety, reading-position, recents, provider-notification and graphics-packaging improvements are retained. On Android, use Reset to built-in before considering a version downgrade; normal installers prevent downgrades and uninstalling may remove private recovery data.
 
-Notification limits: desktop renames can be followed within watched directories; moves to an unrelated, unobserved directory cannot always be found. Android providers must expose stable identifiers and notifications. Permission errors and unavailable providers are not treated as deletion; an empty result or explicit document-not-found result is required. The exact pair of Fedora dialogs reported by a user has not been independently reproduced; the verified shutdown race and overlapping prompts are fixed.
-
-Custom theme-file support is deliberately reserved for a separate subsequent release. Version 0.5.1 remains available for rollback. macOS packages remain ad-hoc signed rather than notarized, and Windows installers are not code-signed.
+macOS packages remain ad-hoc signed rather than notarized. Windows installers are not code-signed.

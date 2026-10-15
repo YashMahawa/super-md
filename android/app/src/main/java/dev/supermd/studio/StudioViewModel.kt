@@ -34,7 +34,7 @@ internal fun orderedRecents(notes:List<RecentNote>)=notes.distinctBy {it.uri}.so
 private fun renamedRelative(relative:String?,name:String)=relative?.let {val parent=it.substringBeforeLast('/',"");if(parent.isEmpty())name else "$parent/$name"}
 data class FileEntry(val name: String, val uri: String, val directory: Boolean, val relative: String)
 data class OutlineHeading(val id: String, val title: String, val level: Int, val offset: Int)
-data class StudioState(val restorePosition:Boolean=true, val startup:String="restore", val imageAppearance:String="original", val svgAppearance:String="original", val imageContrast:Float=1.25f, val spellCheck:Boolean = false, val grammarCheck:Boolean = false, val accent: String = "system", val widthPercent: Float = 100f, val lineHeight: Float = 1.65f, val autosave: Boolean = true, val customFonts: List<String> = emptyList(), val readerOverlay: Boolean = false, val zoomCommand: Long = 0, val tabs: List<Note> = listOf(Note(name = "Welcome.md", content = sample, saved = sample)), val closedTabs: List<Note> = emptyList(), val activeId: String = "", val mode: String = "live", val fullscreen: Boolean = false, val normalZoom: Float = 100f, val fullscreenZoom: Float = 100f, val theme: String = "system", val fullscreenTheme: String = "black", val motion: Boolean = true, val font: String = "Manrope", val size: Float = 15f, val folder: String? = null, val files: List<FileEntry> = emptyList(), val busy: Boolean = false, val message: String? = null, val error: String? = null, val welcomed: Boolean = false, val pdf: String = "{\"pageSize\":\"a4\",\"margin\":18,\"fontSize\":10.0,\"lineHeight\":1.45,\"fontFamily\":\"Manrope\",\"pageNumbers\":true}") {
+data class StudioState(val customTheme:String="", val restorePosition:Boolean=true, val startup:String="restore", val imageAppearance:String="original", val svgAppearance:String="original", val imageContrast:Float=1.25f, val spellCheck:Boolean = false, val grammarCheck:Boolean = false, val accent: String = "system", val widthPercent: Float = 100f, val lineHeight: Float = 1.65f, val autosave: Boolean = true, val customFonts: List<String> = emptyList(), val readerOverlay: Boolean = false, val zoomCommand: Long = 0, val tabs: List<Note> = listOf(Note(name = "Welcome.md", content = sample, saved = sample)), val closedTabs: List<Note> = emptyList(), val activeId: String = "", val mode: String = "live", val fullscreen: Boolean = false, val normalZoom: Float = 100f, val fullscreenZoom: Float = 100f, val theme: String = "system", val fullscreenTheme: String = "black", val motion: Boolean = true, val font: String = "Manrope", val size: Float = 15f, val folder: String? = null, val files: List<FileEntry> = emptyList(), val busy: Boolean = false, val message: String? = null, val error: String? = null, val welcomed: Boolean = false, val pdf: String = "{\"pageSize\":\"a4\",\"margin\":18,\"fontSize\":10.0,\"lineHeight\":1.45,\"fontFamily\":\"Manrope\",\"pageNumbers\":true}") {
     val active get() = tabs.find { it.id == activeId } ?: tabs.first()
     val zoom get() = if (fullscreen) fullscreenZoom else normalZoom
 }
@@ -112,6 +112,8 @@ class StudioViewModel(app: Application, val workspaceKey: String = "main") : And
     private val snapshot = if (workspaceKey == "main") File(app.filesDir, "workspace.json") else File(app.filesDir, "workspaces/$workspaceKey.json").also { it.parentFile!!.mkdirs() }
     private val mutable = MutableStateFlow(restore())
     private val preferencesChanged = android.content.SharedPreferences.OnSharedPreferenceChangeListener { _, key ->
+        if(key=="customTheme")mutable.value=mutable.value.copy(customTheme=prefs.getString("customTheme","")?:"")
+        if(key=="customThemeSource")observeCustomTheme()
         if (key == "recent") {recentMutable.value=loadRecent();observeActive()}
         if(key in setOf("restorePosition","startup","imageAppearance","svgAppearance","imageContrast"))mutable.value=readingPreferences(mutable.value)
         if (key in setOf("accent", "theme", "fullTheme", "motion", "font", "size", "pdf", "welcomed", "widthPercent", "lineHeight", "autosave", "fonts", "spellCheck", "grammarCheck")) {
@@ -120,6 +122,48 @@ class StudioViewModel(app: Application, val workspaceKey: String = "main") : And
         }
     }
     private var observedUris=emptySet<String>()
+    private var themeJob:Job?=null
+    private var themeReloadPending=false
+    private val themeObserver=object:android.database.ContentObserver(android.os.Handler(android.os.Looper.getMainLooper())) {
+        override fun onChange(selfChange:Boolean){reloadCustomTheme()}
+    }
+    private fun observeCustomTheme(){
+        resolver.unregisterContentObserver(themeObserver)
+        prefs.getString("customThemeSource",null)?.let {source->runCatching {resolver.registerContentObserver(Uri.parse(source),true,themeObserver)}}
+    }
+    fun reloadCustomTheme(){if(themeJob?.isActive==true){themeReloadPending=true;return};prefs.getString("customThemeSource",null)?.let {importCustomTheme(Uri.parse(it),false)}}
+    fun resetCustomTheme(){themeReloadPending=false;themeJob?.cancel();prefs.edit().remove("customTheme").remove("customThemeSource").apply()}
+    fun importCustomTheme(uri:Uri,remember:Boolean=true){
+        themeJob?.cancel()
+        themeJob=viewModelScope.launch {
+            if(!remember)delay(250)
+            try {
+                val canonical=withContext(Dispatchers.IO){
+                    val bytes=resolver.openInputStream(uri)?.use {input->
+                        val output=java.io.ByteArrayOutputStream();val buffer=ByteArray(4096)
+                        while(output.size()<=65536){val count=input.read(buffer,0,minOf(buffer.size,65537-output.size()));if(count<0)break;if(count==0)error("Theme provider returned no data");output.write(buffer,0,count)}
+                        output.toByteArray()
+                    }?:error("Cannot read theme")
+                    require(bytes.size<=65536){"Theme exceeds 64 KB"}
+                    val raw=Charsets.UTF_8.newDecoder().onMalformedInput(java.nio.charset.CodingErrorAction.REPORT).onUnmappableCharacter(java.nio.charset.CodingErrorAction.REPORT).decode(java.nio.ByteBuffer.wrap(bytes)).toString()
+                    val response=JSONObject(PdfEngine.validateTheme(raw))
+                    require(!response.has("error")){response.optString("error")}
+                    response.getJSONObject("theme").toString()
+                }
+                if(remember)runCatching {resolver.takePersistableUriPermission(uri,Intent.FLAG_GRANT_READ_URI_PERMISSION)}
+                val changed=canonical!=mutable.value.customTheme
+                prefs.edit().putString("customTheme",canonical).apply {if(remember)putString("customThemeSource",uri.toString())}.apply()
+                if(remember||changed)mutable.value=mutable.value.copy(message="Applied "+JSONObject(canonical).getString("name"))
+            }catch(cancelled:kotlinx.coroutines.CancellationException){throw cancelled}
+            catch(error:Exception){val message="Theme not applied; previous appearance kept. ${error.message}";if(remember)fail(message)else mutable.value=mutable.value.copy(message=message)}
+        }
+        themeJob?.invokeOnCompletion {viewModelScope.launch {if(themeReloadPending){themeReloadPending=false;reloadCustomTheme()}}}
+    }
+    fun exportCustomTheme(uri:Uri)=viewModelScope.launch {
+        val raw=mutable.value.customTheme.ifBlank {themeTemplate}
+        try{withContext(Dispatchers.IO){resolver.openOutputStream(uri,"wt")?.use {it.write(raw.toByteArray(Charsets.UTF_8))}?:error("Cannot write theme")};mutable.value=mutable.value.copy(message="Theme exported. Edit the JSON and import it to apply.")}
+        catch(error:Exception){fail("Could not export theme: ${error.message}")}
+    }
     private var metadataJob:Job?=null
     private var listedRelative=""
     private val deletedDrafts=DeletedDraftStore(File(app.filesDir,"deleted-drafts/$workspaceKey"))
@@ -172,8 +216,8 @@ class StudioViewModel(app: Application, val workspaceKey: String = "main") : And
             mutable.value.folder?.let {listFolder(Uri.parse(it),listedRelative)}
         }
     }
-    init { prefs.registerOnSharedPreferenceChangeListener(preferencesChanged);observeActive();if(!BuildConfig.DEBUG && workspaceKey=="main" && updates.state.value.checkOnOpen)viewModelScope.launch{kotlinx.coroutines.delay(6000);updates.check()} }
-    override fun onCleared() { prefs.unregisterOnSharedPreferenceChangeListener(preferencesChanged);resolver.unregisterContentObserver(documentObserver); super.onCleared() }
+    init { prefs.registerOnSharedPreferenceChangeListener(preferencesChanged);observeActive();observeCustomTheme();if(!BuildConfig.DEBUG && workspaceKey=="main" && updates.state.value.checkOnOpen)viewModelScope.launch{kotlinx.coroutines.delay(6000);updates.check()} }
+    override fun onCleared() { prefs.unregisterOnSharedPreferenceChangeListener(preferencesChanged);resolver.unregisterContentObserver(documentObserver);resolver.unregisterContentObserver(themeObserver); super.onCleared() }
     val state = mutable.asStateFlow()
     private val outlineMutable = MutableStateFlow<List<OutlineHeading>>(emptyList())
     val headings = outlineMutable.asStateFlow()
@@ -269,7 +313,7 @@ class StudioViewModel(app: Application, val workspaceKey: String = "main") : And
         try {
             if (snapshot.isFile) s=snapshot.bufferedReader().use {NoteRecovery.read(it,s)}
         } catch (_: Exception) { s = s.copy(error = "The recovery snapshot could not be read. Your original files are untouched.") }
-        s=readingPreferences(s)
+        s=readingPreferences(s).copy(customTheme=prefs.getString("customTheme","")?:"")
         if(s.welcomed) {
             val kept=s.tabs.filter {it.dirty || s.startup=="restore"&&!(it.uri==null&&it.name=="Welcome.md")}
             val tabs=if(s.startup=="new")listOf(Note())+kept else kept.ifEmpty {listOf(Note())}
@@ -581,4 +625,5 @@ object PdfEngine {
     @JvmStatic external fun export(markdown: String, options: String, assets: String, output: String): String
     @JvmStatic external fun imageSources(markdown: String): String
     @JvmStatic external fun fontFamilies(path: String): String
+    @JvmStatic external fun validateTheme(input:String):String
 }

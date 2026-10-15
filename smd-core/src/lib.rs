@@ -1,5 +1,6 @@
 //! The same local typesetter is used by desktop and Android. No browser print layout.
 pub mod portable;
+pub mod theme;
 use anyhow::{bail, Result};
 use pulldown_cmark::{CodeBlockKind, Event, Options, Parser, Tag, TagEnd};
 use serde::{Deserialize, Serialize};
@@ -325,6 +326,15 @@ pub fn export(markdown: &str, options: &PdfOptions, assets: &HashMap<String, Vec
         .build();
     let document = engine.compile().output.map_err(|errors| anyhow::anyhow!("PDF typesetting failed: {errors:?}"))?;
     typst_pdf::pdf(&document, &Default::default()).map(|v| v.to_vec()).map_err(|e| anyhow::anyhow!("PDF encoding failed: {e:?}"))
+}
+
+#[cfg(target_os = "android")]
+#[no_mangle]
+pub extern "system" fn Java_dev_supermd_studio_PdfEngine_validateTheme(
+    mut env: jni::JNIEnv, _class: jni::objects::JClass, input: jni::objects::JString,
+) -> jni::sys::jstring {
+    let result = match env.get_string(&input) { Ok(value)=>theme::response(&String::from(value)), Err(_)=>"{\"error\":\"Invalid theme input\"}".into() };
+    env.new_string(result).expect("Theme response").into_raw()
 }
 
 #[cfg(target_os = "android")]

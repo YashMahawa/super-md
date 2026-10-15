@@ -14,7 +14,7 @@ if __name__ == "__main__":
     if len(sys.argv) > 1 and sys.argv[1] == "--graphics-probe":
         sys.exit(probe(Path(sys.argv[2]) if len(sys.argv) > 2 else None))
     # CLI/identity queries never need a display or a graphics probe.
-    commands = {"read", "inspect", "assets", "extract", "pack", "export", "export-json", "doctor",
+    commands = {"read", "inspect", "assets", "extract", "pack", "export", "export-json", "doctor", "validate-theme",
                 "--version", "--help", "-h"}
     if len(sys.argv) == 1 or sys.argv[1] not in commands:
         configure(safe="--safe-graphics" in sys.argv)
@@ -44,7 +44,7 @@ class StudioApplication(QApplication):
         return super().event(event)
 
 def main():
-    if len(sys.argv) > 1 and sys.argv[1] in ("read", "inspect", "assets", "extract", "pack", "export", "export-json", "doctor"):
+    if len(sys.argv) > 1 and sys.argv[1] in ("read", "inspect", "assets", "extract", "pack", "export", "export-json", "doctor", "validate-theme"):
         executable = "smd-engine.exe" if sys.platform == "win32" else "smd-engine"
         candidates = (ROOT / "desktop" / executable, ROOT / "smd-core/target/release" / executable,
                       ROOT / "smd-core/target/debug" / executable)
@@ -60,16 +60,19 @@ def main():
     parser.add_argument("--smoke", action="store_true", help=argparse.SUPPRESS)
     parser.add_argument("--visual-smoke", action="store_true", help=argparse.SUPPRESS)
     parser.add_argument("--smoke-report", type=Path, help=argparse.SUPPRESS)
+    parser.add_argument("--smoke-theme", type=Path, help=argparse.SUPPRESS)
     parser.add_argument("--version", action="store_true")
     parser.add_argument("--safe-graphics", action="store_true", help="Use software graphics for Qt and the document renderer")
     args = parser.parse_args()
     if args.version:
         import json
-        print("Super MD " + json.loads((ROOT / "desktop/build-info.json").read_text())["version"] if (ROOT / "desktop/build-info.json").exists() else "Super MD native development")
+        metadata=ROOT/"desktop/build-info.json" if getattr(sys,"frozen",False) else ROOT/"package.json"
+        print("Super MD " + json.loads(metadata.read_text(encoding="utf-8"))["version"] if metadata.exists() else "Super MD native development")
         return 0
     if args.visual_smoke:
         args.smoke = True
         args.test_state = True
+    if args.smoke_theme and not (args.smoke and args.test_state):parser.error("Theme smoke checks require isolated test state")
     if sys.platform.startswith("linux"):
         # Let Qt use the desktop's portal chooser (including its Wayland parent
         # handle), not a toolkit-built file/folder browser. The plugin is bundled.
@@ -123,6 +126,9 @@ def main():
         if args.smoke:
             studio.settings["welcomed"] = True
             studio.mode = "reader"
+            if args.smoke_theme:
+                studio.settings["theme"]="light"
+                studio.importCustomTheme(str(args.smoke_theme))
         studio.newWindowRequested.connect(create_window)
         studio.detachedWindowRequested.connect(detach_window)
         engine.rootContext().setContextProperty("studio", studio)
@@ -184,13 +190,14 @@ def main():
             import time
             smoke_deadline = time.monotonic() + 30
             def verify():
-                script = "window.SuperMD?.post('smoke','export_failed',JSON.stringify({error:'SMOKE:'+JSON.stringify({headings:document.querySelectorAll('h1').length,math:document.querySelectorAll('.katex').length,charts:document.querySelectorAll('.interactive-chart svg').length,surfaces:document.querySelectorAll('.surface-chart').length,answers:document.querySelectorAll('details.callout').length,zoom:getComputedStyle(document.documentElement).getPropertyValue('--workspace-scale')})}))"
+                script = "window.SuperMD?.post('smoke','export_failed',JSON.stringify({error:'SMOKE:'+JSON.stringify({headings:document.querySelectorAll('h1').length,math:document.querySelectorAll('.katex').length,charts:document.querySelectorAll('.interactive-chart svg').length,surfaces:document.querySelectorAll('.surface-chart').length,answers:document.querySelectorAll('details.callout').length,themePattern:getComputedStyle(document.querySelector('.android-reading')).backgroundImage.includes('radial-gradient'),themeWeight:document.documentElement.style.getPropertyValue('--custom-heading-weight'),zoom:getComputedStyle(document.documentElement).getPropertyValue('--workspace-scale')})}))"
                 QMetaObject.invokeMethod(window,"runDocumentScript",Q_ARG("QVariant",script))
             def result():
                 if studio.message.startswith("SMOKE:"):
                     print(studio.message,flush=True)
                     window.grabWindow().save("/tmp/supermd-qt-smoke.png")
                     valid = all(value in studio.message for value in ('"headings":1','"math":1','"charts":1','"surfaces":0','"answers":1'))
+                    if args.smoke_theme:valid=valid and studio.customThemeActive and '"themePattern":true' in studio.message and '"themeWeight":"800"' in studio.message
                     zoom = window.findChild(QObject,"zoomPercentage")
                     valid = valid and zoom is not None and zoom.property("height") == 36
                     fullscreen = window.findChild(QObject,"fullscreenButton")
@@ -219,7 +226,7 @@ def main():
                         import json
                         args.smoke_report.write_text(json.dumps({"ok":True,"readerColors":len(colors),
                             "software":os.environ.get('QT_QUICK_BACKEND')=='software',
-                            "content":studio.message}),encoding='utf-8')
+                            "content":studio.message,"theme":studio.customThemeName if studio.customThemeActive else None}),encoding='utf-8')
                     if not valid and not args.visual_smoke and time.monotonic() < smoke_deadline:
                         QTimer.singleShot(300, poll_smoke)
                         return
@@ -234,7 +241,7 @@ def main():
             def poll_smoke():
                 # Slow, cold-started mounted installers must present real
                 # document pixels, not merely beat a fixed ten-second timer.
-                if studio.ready:
+                if studio.ready and (not args.smoke_theme or studio.customThemeActive):
                     verify()
                     QTimer.singleShot(300, result)
                 elif time.monotonic() >= smoke_deadline:

@@ -1,0 +1,20 @@
+/* Fixed selectors only; absent overrides leave existing app styling untouched. */
+:root[data-custom-tracking] .android-reading .markdown-body {letter-spacing:var(--custom-tracking);}
+:root[data-custom-tracking] .android-reading .markdown-body :is(.katex,pre,code,.cm-editor) {letter-spacing:normal;}
+:root[data-custom-heading] .android-reading .markdown-body :is(h1,h2,h3,h4,h5,h6) {color:var(--custom-heading);}
+:root[data-custom-heading-weight] .android-reading .markdown-body :is(h1,h2,h3,h4,h5,h6) {font-weight:var(--custom-heading-weight);}
+:root[data-custom-heading-tracking] .android-reading .markdown-body :is(h1,h2,h3,h4,h5,h6) {letter-spacing:var(--custom-heading-tracking);}
+:root[data-custom-paragraph] .android-reading .markdown-body > p, :root[data-custom-paragraph] .android-reading .markdown-body .windowed-md-block > p {margin-block:var(--custom-paragraph);}
+:root[data-custom-link] .android-reading .markdown-body a {color:var(--custom-link);}
+:root[data-custom-link] .android-reading .markdown-body a:visited {color:color-mix(in srgb,var(--custom-link) 75%,var(--text));}
+:root[data-custom-code-padding] .android-reading .markdown-body pre {padding:var(--custom-code-padding);}
+:root[data-custom-code-bg] .android-reading .markdown-body pre {background:var(--custom-code-bg);}
+:root[data-custom-code-text] .android-reading .markdown-body pre {color:var(--custom-code-text);}
+:root[data-custom-code-border] .android-reading .markdown-body pre {border-color:var(--custom-code-border);}
+:root[data-custom-radius] .android-reading .markdown-body :is(pre,.callout,.code-cell,.interactive-chart,.svg-figure,img) {border-radius:var(--custom-radius);}
+:root[data-custom-table-border] .android-reading .markdown-body :is(th,td) {border-width:var(--custom-table-border);}
+:root[data-custom-callout-tip] .android-reading .markdown-body :is(.callout-tip,.callout-success,.callout-check) {--callout-accent:var(--custom-callout-tip);}
+:root[data-custom-callout-warning] .android-reading .markdown-body :is(.callout-warning,.callout-caution) {--callout-accent:var(--custom-callout-warning);}
+:root[data-custom-callout-danger] .android-reading .markdown-body :is(.callout-danger,.callout-error,.callout-failure) {--callout-accent:var(--custom-callout-danger);}
+:root[data-custom-callout-info] .android-reading .markdown-body :is(.callout-info,.callout-question) {--callout-accent:var(--custom-callout-info);}
+:root[data-custom-callout-example] .android-reading .markdown-body :is(.callout-abstract,.callout-summary,.callout-example) {--callout-accent:var(--custom-callout-example);}

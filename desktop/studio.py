@@ -28,6 +28,7 @@ from python_outputs import PythonOutputs
 import updates
 import python_runtime
 import file_events
+import custom_theme
 
 ROOT = Path(sys._MEIPASS)/"resources" if getattr(sys,"frozen",False) else Path(__file__).resolve().parent.parent
 DEFAULT_PDF = {"pageSize": "a4", "margin": 18, "fontSize": 10, "lineHeight": 1.45, "paragraphSpacing": 1.2, "fontFamily": "Manrope", "pageNumbers": True, "themed": False}
@@ -97,6 +98,12 @@ class Session(QObject):
         self.locations = {}
         self.drafts = {}
         self.windows = {}
+        self.custom_theme = None
+        self.theme_epoch = 0
+        self.theme_revision = 0
+        self.theme_source = ""
+        try:self.theme_source=json.loads((self.data/"theme-source.json").read_text(encoding="utf-8")).get("path","")
+        except (OSError,ValueError,AttributeError):pass
         self.initial_recovery = []
         try:
             stored = json.loads((self.data/"settings.json").read_text(encoding="utf-8"))
@@ -142,6 +149,8 @@ class Studio(QObject):
     exportRequested = Signal(str)
     folderPickerRequested = Signal()
     fontPickerRequested = Signal()
+    themePickerRequested = Signal()
+    themeExportRequested = Signal()
     noteLocationPickerRequested = Signal()
     flushFailed = Signal(bool)
     pythonProgress = Signal(str)
@@ -209,6 +218,15 @@ class Studio(QObject):
         self.palette_watcher.fileChanged.connect(self._palette_changed)
         self.palette_watcher.directoryChanged.connect(self._palette_changed)
         self._watch_palette()
+        self.custom_theme_watcher=QFileSystemWatcher(self)
+        self.custom_theme_timer=QTimer(self)
+        self.custom_theme_timer.setSingleShot(True)
+        self.custom_theme_timer.setInterval(250)
+        self.custom_theme_timer.timeout.connect(self._custom_theme_event)
+        self.custom_theme_stamp=None
+        self.custom_theme_watcher.fileChanged.connect(lambda *_:self.custom_theme_timer.start())
+        self.custom_theme_watcher.directoryChanged.connect(lambda *_:self.custom_theme_timer.start())
+        QTimer.singleShot(0,self.reloadCustomTheme)
         self.system_preferences = QProcess(self)
         if sys.platform.startswith("linux") and shutil.which("gsettings"):
             self.system_preferences.readyReadStandardOutput.connect(self._system_setting_changed)
@@ -287,6 +305,7 @@ class Studio(QObject):
             tab = self._current()
             colors = self._colors()
             reading_settings={key:self.settings[key] for key in ("restorePosition","imageAppearance","svgAppearance","imageContrast")}
+            reading_settings["customStyle"]=custom_theme.reader(self.session.custom_theme,self.settings["fullTheme" if self.fullscreen else "theme"],self._dark())
             payload={**reading_settings,"readingLocation":self.session.locations.get(tab["path"]),"id": tab["id"], "path": tab["path"] or tab["id"], "mode": self.mode, "dark": self._dark(), "fullscreen": self.fullscreen, "font": self.settings["font"], "size": self.settings["size"], "widthPercent": self.settings["widthPercent"], "lineHeight":self.settings["lineHeight"], "spellCheck":self.settings["spellCheck"], "grammarCheck":self.settings["grammarCheck"], "zoom": self.settings["fullZoom" if self.fullscreen else "normalZoom"], "motion": self.settings["motion"], "python": self.settings["python"], "colors": colors, "viewState": tab.pop("viewState", None)}
             previous=self._last_reader_text
             if previous and previous[0]==tab["id"] and previous[1] is tab["content"]:payload["contentUnchanged"]=True
@@ -297,10 +316,12 @@ class Studio(QObject):
     def _tokens(self):
         # Scheme generation is costly and QML reads colors from many bindings.
         theme = self.settings["fullTheme" if self.fullscreen else "theme"]
-        key = (theme,self.system_dark,json.dumps(self.system_colors,sort_keys=True),self.system_mode,self.settings["accent"])
+        selected=self.session.custom_theme
+        key = (theme,self.system_dark,json.dumps(self.system_colors,sort_keys=True),self.system_mode,self.settings["accent"],self.session.theme_revision)
         if getattr(self,"_token_key",None) != key:
             self._token_key = key
-            self._token_value = tokens(theme,self.system_dark,self.system_colors,self.system_mode,self.settings["accent"])
+            dark,colors=tokens(theme,self.system_dark,self.system_colors,self.system_mode,selected["accent"] if selected else self.settings["accent"])
+            self._token_value = (dark,custom_theme.palette(colors,custom_theme.variant(selected,theme,dark).get("colors",{}))) if selected else (dark,colors)
         return self._token_value
 
     def _dark(self):
@@ -311,6 +332,15 @@ class Studio(QObject):
 
     @Property("QVariantMap", notify=changed)
     def palette(self): return self._colors()
+
+    @Property("QVariantMap",notify=changed)
+    def themeMetrics(self):return {"controlRadius":22,"contentRadius":16,**(self.session.custom_theme or {}).get("metrics",{})}
+
+    @Property(str,notify=changed)
+    def customThemeName(self):return (self.session.custom_theme or {}).get("name","Built-in appearance")
+
+    @Property(bool,notify=changed)
+    def customThemeActive(self):return self.session.custom_theme is not None
 
     @Property(bool, notify=changed)
     def motionEnabled(self): return bool(self.settings["motion"])
@@ -438,6 +468,7 @@ class Studio(QObject):
         self.preference_timer.stop()
         self.theme_timer.stop()
         self.theme_debounce.stop()
+        self.custom_theme_timer.stop()
         self.recovery_timer.stop()
         self.autosave_timer.stop()
         self.flush_timer.stop()
@@ -492,7 +523,10 @@ class Studio(QObject):
         self.update_running=True;self.update_status="Checking published releases…";self._emit(False)
         def done(info,error):
             self.update_running=False
-            if error:self.update_status="Couldn't check updates. Your notes still work offline.";return
+            if error:
+                self.update_status="Couldn't check updates. Your notes still work offline."
+                if not automatic:self.message=self.update_status
+                return
             if not info or not self.update_info or info["version"]!=self.update_info["version"]:self.update_path=""
             self.update_info=info
             if not info:self.update_status="You're on the latest published version.";return
@@ -507,7 +541,10 @@ class Studio(QObject):
                         self.update_tray.setToolTip("Super MD updates");self.update_tray.show();self.update_tray.showMessage("Super MD update",self.update_status)
                 except RuntimeError:pass
             if self.settings.get("autoUpdate"):self.downloadUpdate()
-        self._submit(lambda:updates.release_info(updates.bounded_json(updates.API),self.appVersion),done,False)
+        def check():
+            try:return updates.release_info(updates.bounded_json(updates.API),self.appVersion),None
+            except Exception as failure:return None,str(failure)
+        self._submit(check,lambda result,error:done(*(result or (None,error))),False)
 
     @Property(str,notify=changed)
     def pythonStatus(self): return self.python_status
@@ -693,6 +730,96 @@ class Studio(QObject):
 
     @Slot()
     def chooseFont(self): self.fontPickerRequested.emit()
+
+    @Slot()
+    def chooseCustomTheme(self):self.themePickerRequested.emit()
+
+    @Slot()
+    def chooseThemeExport(self):self.themeExportRequested.emit()
+
+    @Slot()
+    def openThemeGuide(self):QDesktopServices.openUrl(QUrl("https://github.com/YashMahawa/super-md/blob/main/docs/THEMING.md"))
+
+    def _watch_custom_theme(self):
+        watcher=self.custom_theme_watcher
+        paths=watcher.files()+watcher.directories()
+        if paths:watcher.removePaths(paths)
+        source=Path(self.session.theme_source) if self.session.theme_source else None
+        self.custom_theme_stamp=custom_theme.stamp(source) if source else None
+        if source:
+            watcher.addPaths([str(path) for path in (source,source.parent) if path.exists()])
+
+    def _custom_theme_event(self):
+        if self.retired or not self.session.theme_source:return
+        value=custom_theme.stamp(Path(self.session.theme_source))
+        if value==self.custom_theme_stamp:return
+        self.custom_theme_stamp=value
+        self.reloadCustomTheme()
+
+    @Slot(str)
+    def importCustomTheme(self,value):self._load_custom_theme(local_path(value))
+
+    @Slot()
+    def reloadCustomTheme(self):
+        if self.retired:return
+        source=Path(self.session.theme_source) if self.session.theme_source else self.data/"theme.json"
+        if not source.is_file():source=self.data/"theme.json"
+        self._watch_custom_theme()
+        cached=self.data/"theme.json"
+        if self.session.custom_theme is None and cached.is_file() and cached!=source:self._load_custom_theme(cached,False,source)
+        elif source.is_file():self._load_custom_theme(source,False)
+
+    def _load_custom_theme(self,path,importing=True,follow_source=None):
+        self.session.theme_epoch+=1
+        epoch=self.session.theme_epoch
+        try:engine=self._engine()
+        except ValueError as error:self.message=str(error);self._emit(False);return
+        def finished(value,error):
+            if epoch!=self.session.theme_epoch:return
+            if error:
+                self.message="Theme not applied: "+str(error);self._emit(False)
+                if follow_source:self._load_custom_theme(follow_source,False)
+                return
+            try:
+                if importing:
+                    self.session.theme_source=str(path)
+                    atomic_json(self.data/"theme-source.json",{"path":str(path)})
+                changed=value!=self.session.custom_theme
+                if changed:atomic_json(self.data/"theme.json",value)
+                self.session.custom_theme=value
+                if changed:self.session.theme_revision+=1
+                for window in self.session.windows.values():window._watch_custom_theme()
+                if changed or importing:
+                    self.message="Applied "+value["name"]
+                    self.session.changed.emit()
+            except OSError as failure:self.message="Could not save theme: "+str(failure);self._emit(False)
+            if follow_source:self._load_custom_theme(follow_source,False)
+        def read():
+            try:return custom_theme.read(engine,path),None
+            except Exception as failure:return None,str(failure)
+        self._submit(read,lambda result,error:finished(*(result or (None,error))),False)
+
+    @Slot()
+    def resetCustomTheme(self):
+        self.session.theme_epoch+=1
+        self.session.custom_theme=None;self.session.theme_source=""
+        self.session.theme_revision+=1
+        for filename in ("theme.json","theme-source.json"):(self.data/filename).unlink(missing_ok=True)
+        for window in self.session.windows.values():window._watch_custom_theme()
+        self.session.changed.emit()
+
+    @Slot()
+    def editCustomTheme(self):
+        source=Path(self.session.theme_source) if self.session.theme_source else self.data/"theme.json"
+        if source.is_file():QDesktopServices.openUrl(QUrl.fromLocalFile(str(source)))
+
+    @Slot(str)
+    def exportCustomTheme(self,value):
+        try:
+            atomic_json(local_path(value),self.session.custom_theme or custom_theme.TEMPLATE)
+            self.message="Theme exported. Edit the JSON and import it to apply."
+        except OSError as error:self.message=str(error)
+        self._emit(False)
 
     @Slot()
     def chooseNoteLocation(self): self.noteLocationPickerRequested.emit()

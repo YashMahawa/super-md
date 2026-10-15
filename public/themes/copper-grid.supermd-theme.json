@@ -1,0 +1,8 @@
+{
+  "format":"supermd-theme","version":1,"name":"Copper grid","accent":"amber",
+  "variants":{
+    "light":{"colors":{"surface":"#eadfd1","surface-low":"#e0d0bb","surface-high":"#ceb79a","text":"#30251b","heading":"#56351e","link":"#6f3d1e"},"background":{"pattern":"grid","color":"#794d2b","opacity":0.045,"spacing":28}},
+    "dark":{"colors":{"surface":"#1c1712","surface-low":"#251e17","surface-high":"#382b20","text":"#e8dcd0","heading":"#efc997","link":"#e8b674"},"background":{"pattern":"grid","color":"#e8b674","opacity":0.035,"spacing":28}}
+  },
+  "metrics":{"controlRadius":18,"contentRadius":12,"paragraphSpacing":1.25,"codePadding":18,"headingWeight":750,"headingTracking":-0.02,"textTracking":0,"tableBorderWidth":1}
+}

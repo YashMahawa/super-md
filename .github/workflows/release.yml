@@ -161,6 +161,7 @@ jobs:
       - uses: swatinem/rust-cache@v2
         with:
           workspaces: ./smd-core -> target
+          shared-key: native-desktop-${{ runner.os }}-${{ runner.arch }}
           # Preserve compiled engine dependencies when installer testing catches
           # a packaging bug. Tests/publication still have to pass on every run.
           cache-on-failure: true

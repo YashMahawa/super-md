@@ -10,7 +10,7 @@
 :root[data-motion="off"] *, :root[data-motion="off"] { transition: none !important; animation: none !important; scroll-behavior: auto !important; }
 .android-document { height: 100%; display: flex; min-width: 0; }
 .android-source, .android-reading { flex: 1; min-width: 0; height: 100%; overflow: auto; overscroll-behavior: contain; }
-.android-reading { padding: 0; }
+.android-reading { padding: 0; background-image:var(--custom-pattern,none);background-size:var(--custom-pattern-size,auto); }
 .markdown-body img { filter:var(--image-filter,none); }
 .markdown-body .svg-diagram, .markdown-body img[data-media-kind="svg"] { filter:var(--svg-filter,none); }
 .markdown-body .svg-figure[data-auto-ink="true"] img { filter:none; }

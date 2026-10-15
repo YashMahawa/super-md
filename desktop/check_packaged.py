@@ -53,7 +53,9 @@ def check(executable: Path, version: str, graphics: str) -> None:
         if not pdf.read_bytes().startswith(b"%PDF-") or pdf.stat().st_size < 10000:
             raise RuntimeError("Packaged native math/PDF engine failed")
         report = root / "presented.json"
-        args = ["--test-state", "--smoke", "--smoke-report", str(report), "--quit-after", "40000"]
+        theme=root/"Smoke theme.json"
+        theme.write_text(json.dumps({"format":"supermd-theme","version":1,"name":"Packaged theme check","accent":"violet","variants":{"light":{"colors":{},"background":{"pattern":"dots","color":"#7255a5","opacity":.05,"spacing":24}}},"metrics":{"headingWeight":800,"controlRadius":16}}),encoding="utf-8")
+        args = ["--test-state", "--smoke", "--smoke-theme",str(theme),"--smoke-report", str(report), "--quit-after", "40000"]
         if graphics == "software":
             args.append("--safe-graphics")
         result = run(*args, timeout=60)
@@ -62,6 +64,7 @@ def check(executable: Path, version: str, graphics: str) -> None:
         evidence = json.loads(report.read_text(encoding="utf-8"))
         if not evidence.get("ok") or evidence.get("readerColors",0) <= 20:
             raise RuntimeError(f"Document did not paint: {evidence}")
+        if evidence.get("theme")!="Packaged theme check":raise RuntimeError("Packaged custom-theme validator or native/reader bridge failed")
         if graphics != "auto" and evidence.get("software") is not True:
             raise RuntimeError("Required graphics fallback was not selected")
         print(json.dumps({"executable":str(executable),"version":version,"graphics":graphics,

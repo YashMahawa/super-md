@@ -38,7 +38,11 @@ fn atomic_write(path: &Path, data: &[u8]) -> Result<()> {
 fn run() -> Result<()> {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let command = args.first().map(String::as_str).unwrap_or("help");
-    if command == "help" || command == "--help" { println!("Super MD native engine\n\nread NOTE [--offset N] [--limit N]   Markdown only; default 16000 chars\ninspect NOTE                       Format, counts, asset names; no bytes\nassets NOTE                        Image names, MIME and decoded size\nextract NOTE ASSET OUTPUT           Write one asset to a file (no stdout bytes)\npack INPUT OUTPUT.smd              Offline portable note with local images\nexport INPUT OUTPUT.pdf             Native Typst PDF (no browser print)\nexport-json OUTPUT.pdf              Prepared content/assets/options from stdin\ndoctor                             Report engine capabilities\n\nNo command auto-runs Python or downloads URLs. Existing text .smd and .fmd are readable."); return Ok(()); }
+    if command == "validate-theme" {
+        let mut input=String::new();io::stdin().take(smd_core::theme::MAX_THEME as u64+1).read_to_string(&mut input)?;
+        println!("{}",smd_core::theme::response(&input));return Ok(());
+    }
+    if command == "help" || command == "--help" { println!("Super MD native engine\n\nread NOTE [--offset N] [--limit N]   Markdown only; default 16000 chars\ninspect NOTE                       Format, counts, asset names; no bytes\nassets NOTE                        Image names, MIME and decoded size\nextract NOTE ASSET OUTPUT           Write one asset to a file (no stdout bytes)\npack INPUT OUTPUT.smd              Offline portable note with local images\nexport INPUT OUTPUT.pdf             Native Typst PDF (no browser print)\nexport-json OUTPUT.pdf              Prepared content/assets/options from stdin\nvalidate-theme                     Validate theme JSON from stdin\ndoctor                             Report engine capabilities\n\nNo command auto-runs Python or downloads URLs. Existing text .smd and .fmd are readable."); return Ok(()); }
     if command == "doctor" { println!("{{\"engine\":\"typst-mitex\",\"browserPrint\":false,\"portable\":\"supermd-smd\",\"legacyFmd\":true,\"automaticPythonExecution\":false}}"); return Ok(()); }
     if command == "export-json" {
         let output = args.get(1).context("Expected PDF output path")?;

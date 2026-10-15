@@ -5,6 +5,23 @@ test.beforeEach(async({page})=>{
   await page.goto('/android-reader.html');await page.waitForFunction(()=>typeof window.supermdLoad==='function');
 });
 
+test('custom theme patterns and typography reset cleanly without replacing math nodes',async({page})=>{
+  const state={id:'custom-theme',path:null,content:'# A themed note\n\nAn equation $x^2+1$ and a [link](https://example.com).\n\n> [!TIP] A callout\n> Still readable.',mode:'reader' as const,dark:false,fullscreen:false,colors:{surface:'#e4d4c9','surface-low':'#d9c4b4',text:'#30221b',primary:'#774a30'},font:'Manrope',size:17,zoom:140};
+  await page.evaluate(state=>window.supermdLoad?.(state),state);
+  await expect(page.locator('.katex')).toBeVisible();
+  await page.evaluate(()=>{(window as any).__themeMath=document.querySelector('.katex');});
+  const customStyle={colors:{heading:'#542e48',link:'#63314c'},metrics:{headingWeight:800,contentRadius:10},background:{pattern:'dots',color:'#774a30',opacity:.06,spacing:24}};
+  await page.evaluate(({state,customStyle})=>window.supermdLoad?.({...state,customStyle}),{state,customStyle});
+  await expect.poll(()=>page.locator('.android-reading').evaluate(el=>getComputedStyle(el).backgroundImage)).toContain('radial-gradient');
+  await expect(page.locator('.document-page')).toHaveAttribute('data-scale','1.4');
+  expect(await page.locator('h1').evaluate(el=>getComputedStyle(el).fontWeight)).toBe('800');
+  expect(await page.evaluate(()=>(window as any).__themeMath.isConnected)).toBe(true);
+  await page.evaluate(state=>window.supermdLoad?.(state),state);
+  await expect(page.locator('html')).toHaveAttribute('data-custom-theme','false');
+  await expect.poll(()=>page.locator('.android-reading').evaluate(el=>getComputedStyle(el).backgroundImage)).toBe('none');
+  expect(await page.evaluate(()=>(window as any).__themeMath.isConnected)).toBe(true);
+});
+
 test('reading position survives a renderer restart and can be disabled',async({page})=>{
   const content=Array.from({length:90},(_,i)=>`## Chapter ${i}\n\n${'A readable paragraph about balanced search trees. '.repeat(12)}\n\n`).join('');
   const state={id:'first-open',path:'/notes/saved note.md',content,mode:'reader' as const,dark:false,fullscreen:false,colors:{},font:'Manrope',size:15,zoom:100,restorePosition:true};

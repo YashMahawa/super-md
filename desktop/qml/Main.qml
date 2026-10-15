@@ -58,12 +58,16 @@ ApplicationWindow {
         function onExportRequested(format) { outputFormat = format; exportDialog.open() }
         function onFolderPickerRequested() { folderDialog.open() }
         function onFontPickerRequested() { fontDialog.open() }
+        function onThemePickerRequested() { themeDialog.open() }
+        function onThemeExportRequested() { themeExportDialog.open() }
         function onReaderLoad(payload) { const state = JSON.parse(payload); reader.runJavaScript("window.supermdLoad?.(" + payload + ");window.supermdChromeInset?.(" + (state.fullscreen ? 56 : 0) + ")") }
         function onReaderCall(script) { reader.runJavaScript(script) }
         function onChromeRequested(action) { window.chromeAwake = action === "toggle" ? !window.chromeAwake : action === "show"; if(window.chromeAwake) chromeIdle.restart(); else { chromeIdle.stop(); reader.forceActiveFocus() } }
     }
     Shortcut { sequences: [StandardKey.New]; onActivated: studio.command("window") }
     FileDialog { id:fontDialog;title:"Import a font";fileMode:FileDialog.OpenFile;nameFilters:["Fonts (*.ttf *.otf)"];onAccepted:studio.importFont(selectedFile.toString()) }
+    FileDialog { id:themeDialog;title:"Import a Super MD theme";fileMode:FileDialog.OpenFile;nameFilters:["Theme files (*.json)"];onAccepted:studio.importCustomTheme(selectedFile.toString()) }
+    FileDialog { id:themeExportDialog;title:"Export editable theme";fileMode:FileDialog.SaveFile;defaultSuffix:"json";selectedFile:studio.defaultSaveLocation("My theme.supermd-theme.json");nameFilters:["Theme files (*.json)"];onAccepted:studio.exportCustomTheme(selectedFile.toString()) }
     Shortcut { sequences: [StandardKey.Open]; onActivated: openDialog.open() }
     Shortcut { sequences: [StandardKey.Save]; onActivated: studio.saveSafely() }
     Shortcut { sequences: [StandardKey.Undo]; enabled: !settingsOpen && !viewState.readerOverlay && !exportDialog.visible; onActivated: studio.command("undo") }
@@ -342,7 +346,7 @@ ApplicationWindow {
     footer: Pane {
         visible: !viewState.fullscreen && !viewState.imageOverlay
         padding: 6
-        RowLayout { anchors.fill: parent; Label { text: viewState.busy ? "Preparing document…" : viewState.message || "Local files. Automatic draft recovery."; elide: Text.ElideRight; Layout.fillWidth: true; color: viewState.colors.muted; font.pixelSize: 12 } ExpressiveLoading { running: viewState.busy; implicitHeight: 24; implicitWidth: 24 } }
+        RowLayout { anchors.fill: parent; Label { textFormat:Text.PlainText; text: viewState.busy ? "Preparing document…" : viewState.message || "Local files. Automatic draft recovery."; elide: Text.ElideRight; Layout.fillWidth: true; color: viewState.colors.muted; font.pixelSize: 12 } ExpressiveLoading { running: viewState.busy; implicitHeight: 24; implicitWidth: 24 } }
     }
     FileDialog { id: openDialog; title: "Open note"; nameFilters: ["Notes (*.md *.smd *.fmd *.markdown *.txt)", "All files (*)"]; onAccepted: studio.openNote(selectedFile.toString()) }
     FolderDialog { id: folderDialog; title: "Open folder"; onAccepted: studio.openFolder(selectedFolder.toString()) }

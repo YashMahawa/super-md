@@ -87,7 +87,7 @@ class MainActivity : ComponentActivity() {
         intent?.data?.let { uri -> model.open(uri) }
     }
     override fun onStop() { saveReaderPosition?.invoke(); model.flush(); super.onStop() }
-    override fun onResume() { super.onResume(); model.refreshMetadata(); model.refreshExternal() }
+    override fun onResume() { super.onResume(); model.refreshMetadata(); model.refreshExternal();model.reloadCustomTheme() }
     fun handleShortcut(event: android.view.KeyEvent): Boolean {
         if (event.action == android.view.KeyEvent.ACTION_DOWN && event.repeatCount == 0) {
             if (event.keyCode == android.view.KeyEvent.KEYCODE_F11) { model.fullscreen(!model.state.value.fullscreen); return true }
@@ -120,15 +120,17 @@ class MainActivity : ComponentActivity() {
     val theme = if (state.fullscreen) state.fullscreenTheme else state.theme
     val dark = theme == "dark" || theme == "black" || (theme == "system" && systemDark)
     val context = LocalContext.current
-    val colors = remember(context,dark,theme,state.accent) {
+    val custom=remember(state.customTheme){themeDocument(state.customTheme)}
+    val colors = remember(context,dark,theme,state.accent,custom) {
         var base = when { Build.VERSION.SDK_INT >= 31 -> if (dark) dynamicDarkColorScheme(context) else dynamicLightColorScheme(context); dark -> darkColorScheme(primary = Color(0xffb2c8ff), secondary = Color(0xffbcc6dc)); else -> lightColorScheme(primary = Color(0xff42669e), onPrimary = Color.White, primaryContainer = Color(0xffd7e3ff), onPrimaryContainer = Color(0xff162c4c), secondary = Color(0xff56647c), surface = Color(0xfff7f9fd), background = Color(0xfff7f9fd), surfaceContainerLow = Color(0xfff0f3fa), surfaceContainerHigh = Color(0xffe5ebf5)) }
-        base=accentColors(base,state.accent,dark)
+        base=accentColors(base,custom?.optString("accent")?:state.accent,dark)
         if (!dark) base = studyLightColors(base)
         if (theme == "black") base = manualAccent("neutral",true).copy(primary=Color(0xffdedede),onPrimary=Color(0xff1a1a1a),primaryContainer=Color(0xff343434),onPrimaryContainer=Color(0xfff0f0f0),background=Color.Black,surface=Color.Black,surfaceContainer=Color(0xff171717),surfaceContainerLow=Color(0xff101010),surfaceContainerHigh=Color(0xff242424))
-        base
+        customThemeColors(base,custom,theme,dark)
     }
     val systemMotion = remember { android.provider.Settings.Global.getFloat(context.contentResolver, android.provider.Settings.Global.ANIMATOR_DURATION_SCALE, 1f) != 0f }
-    MaterialExpressiveTheme(colorScheme = colors, motionScheme = if (state.motion && systemMotion) MotionScheme.expressive() else NoMotionScheme) {
+    val shapes=remember(custom){val radius=custom?.optJSONObject("metrics")?.optDouble("controlRadius",Double.NaN);if(radius!=null&&radius.isFinite())Shapes().copy(small=RoundedCornerShape(radius.toFloat().coerceIn(0f,28f).dp),medium=RoundedCornerShape(radius.toFloat().coerceIn(0f,28f).dp),large=RoundedCornerShape(radius.toFloat().coerceIn(0f,28f).dp))else Shapes()}
+    MaterialExpressiveTheme(colorScheme = colors, shapes=shapes, motionScheme = if (state.motion && systemMotion) MotionScheme.expressive() else NoMotionScheme) {
         Surface(Modifier.fillMaxSize(), color = colors.surface, contentColor = colors.onSurface) {
             StudioContent(model, state, activity, dark, state.motion && systemMotion)
         }
@@ -213,6 +215,8 @@ private object NoMotionScheme : MotionScheme {
     LaunchedEffect(activity) { WindowInfoTracker.getOrCreate(activity).windowLayoutInfo(activity).collect { info -> hinge = info.displayFeatures.filterIsInstance<FoldingFeature>().firstOrNull { it.isSeparating && it.orientation == FoldingFeature.Orientation.VERTICAL } } }
     val open = rememberLauncherForActivityResult(ActivityResultContracts.OpenDocument()) { it?.let(model::open) }
     val fontPicker = rememberLauncherForActivityResult(ActivityResultContracts.OpenDocument()) {it?.let(model::importFont)}
+    val themePicker = rememberLauncherForActivityResult(ActivityResultContracts.OpenDocument()) {it?.let {uri->model.importCustomTheme(uri)}}
+    val themeExport = rememberLauncherForActivityResult(ActivityResultContracts.CreateDocument("application/json")) {it?.let {uri->model.exportCustomTheme(uri)}}
     var noteLocation by remember {mutableStateOf(model.noteLocation())}
     val noteFolder = rememberLauncherForActivityResult(ActivityResultContracts.OpenDocumentTree()) {it?.let {uri->runCatching{model.noteLocation(uri);noteLocation=uri.toString()}.onFailure{model.fail("Could not remember this folder: ${it.message}")}}}
     val save = rememberLauncherForActivityResult(NoteDestination("text/markdown", model::noteLocation)) { it?.let { uri -> model.save(uri) } }
@@ -233,7 +237,7 @@ private object NoMotionScheme : MotionScheme {
     BackHandler(state.fullscreen || drawer.isOpen || state.readerOverlay) { if (drawer.isOpen) scope.launch { drawer.close() } else web?.evaluateJavascript("window.supermdDismiss?.() || false") {dismissed->if(dismissed!="true")model.fullscreen(false)} }
     val palette = MaterialTheme.colorScheme
     val density = LocalDensity.current
-    val tokens = remember(palette) { JSONObject().put("primary", hex(palette.primary)).put("on-primary", hex(palette.onPrimary)).put("surface", hex(palette.surface)).put("surface-low", hex(palette.surfaceContainerLow)).put("surface-high", hex(palette.surfaceContainerHigh)).put("text", hex(palette.onSurface)).put("muted", hex(palette.onSurfaceVariant)).put("outline", hex(palette.outlineVariant)) }
+    val tokens = remember(palette) { JSONObject().put("primary", hex(palette.primary)).put("on-primary", hex(palette.onPrimary)).put("primary-container",hex(palette.primaryContainer)).put("on-primary-container",hex(palette.onPrimaryContainer)).put("surface", hex(palette.surface)).put("surface-low", hex(palette.surfaceContainerLow)).put("surface-high", hex(palette.surfaceContainerHigh)).put("text", hex(palette.onSurface)).put("muted", hex(palette.onSurfaceVariant)).put("outline", hex(palette.outlineVariant)) }
     BoxWithConstraints(Modifier.fillMaxSize().background(palette.surface)) {
         // A phone in landscape is wide but still short. Keep its three single
         // pane modes; offer split only when both dimensions have tablet room.
@@ -241,12 +245,13 @@ private object NoMotionScheme : MotionScheme {
         val wide = displayIsLarge && maxWidth >= 720.dp && maxHeight >= 400.dp
         val actualMode = if (!wide && state.mode == "split") "live" else state.mode
         val readerContent=remember {arrayOfNulls<String>(1)}
-        LaunchedEffect(readerReady, state.active, actualMode, dark, state.fullscreen, state.font, state.size, state.widthPercent,state.lineHeight,state.spellCheck,state.grammarCheck,state.restorePosition,state.imageAppearance,state.svgAppearance,state.imageContrast,tokens, hinge, motion) {
+        LaunchedEffect(readerReady, state.active, actualMode, dark, state.fullscreen, state.font, state.size, state.widthPercent,state.lineHeight,state.spellCheck,state.grammarCheck,state.restorePosition,state.imageAppearance,state.svgAppearance,state.imageContrast,state.customTheme,tokens, hinge, motion) {
             if (!readerReady) readerNote[0] = null
             if (readerReady) {
                 val note = state.active
                 val payload = JSONObject().put("id", note.id).apply { if (readerNote[0] == note.id && (readerContent[0] === note.content || model.readerEcho[note.id] === note.content)) put("contentUnchanged", true) else put("content", note.content) }.put("path", note.uri ?: note.id).put("mode", actualMode).put("dark", dark).put("fullscreen", state.fullscreen).put("font", state.font).put("size", state.size).put("widthPercent",state.widthPercent).put("lineHeight",state.lineHeight).put("spellCheck",state.spellCheck).put("grammarCheck",state.grammarCheck).put("restorePosition",state.restorePosition).put("imageAppearance",state.imageAppearance).put("svgAppearance",state.svgAppearance).put("imageContrast",state.imageContrast).put("colors", tokens).put("zoom", state.zoom).put("motion", motion)
                 payload.put("readingLocation",model.readingLocation(note.uri))
+                payload.put("customStyle",themeStyle(themeDocument(state.customTheme),if(state.fullscreen)state.fullscreenTheme else state.theme,dark))
                 web?.evaluateJavascript("document.documentElement.dataset.platform='android';window.supermdLoad?.($payload)", null)
                 readerNote[0] = note.id
                 readerContent[0] = note.content
@@ -440,7 +445,7 @@ private object NoMotionScheme : MotionScheme {
         BackHandler { settings = false }
         Surface(Modifier.fillMaxSize(), color = palette.surface) { Column(Modifier.fillMaxSize().safeDrawingPadding()) {
             TopAppBar(title = { Text("Settings") }, navigationIcon = { IconButton(onClick = { settings = false }) { Icon(Icons.AutoMirrored.Rounded.ArrowBack, "Back") } })
-            Settings(state, model, activity, noteLocation, {noteFolder.launch(noteLocation.takeIf{it.isNotBlank()}?.let(android.net.Uri::parse))}, {model.recoverDeletedDraft();settings=false}) {fontPicker.launch(arrayOf("font/ttf","font/otf","application/x-font-ttf","application/vnd.ms-opentype","application/octet-stream"))}
+            Settings(state, model, activity, noteLocation, {noteFolder.launch(noteLocation.takeIf{it.isNotBlank()}?.let(android.net.Uri::parse))}, {model.recoverDeletedDraft();settings=false}, {themePicker.launch(arrayOf("application/json","text/plain","application/octet-stream"))}, {themeExport.launch("My theme.supermd-theme.json")}) {fontPicker.launch(arrayOf("font/ttf","font/otf","application/x-font-ttf","application/vnd.ms-opentype","application/octet-stream"))}
         } }
     }
     // Long forms must not strand their primary action below a half-open sheet.
@@ -491,7 +496,7 @@ private class NoteDestination(mime: String, private val preferred: () -> String)
     }
 }
 
-@Composable private fun Settings(state: StudioState, model: StudioViewModel, activity:MainActivity, noteLocation: String, chooseNoteLocation: ()->Unit, recoverDraft:()->Unit, importFont: ()->Unit) {
+@Composable private fun Settings(state: StudioState, model: StudioViewModel, activity:MainActivity, noteLocation: String, chooseNoteLocation: ()->Unit, recoverDraft:()->Unit, importTheme:()->Unit, exportTheme:()->Unit, importFont: ()->Unit) {
     val update by model.updates.state.collectAsStateWithLifecycle()
     val scope=rememberCoroutineScope()
     Column(Modifier.fillMaxWidth().verticalScroll(rememberScrollState()), horizontalAlignment = Alignment.CenterHorizontally) {
@@ -500,8 +505,17 @@ private class NoteDestination(mime: String, private val preferred: () -> String)
                 Text("System follows your wallpaper colors. Fullscreen can have a different theme.", style = MaterialTheme.typography.bodyMedium, color = MaterialTheme.colorScheme.onSurfaceVariant)
                 Choice("Workspace theme", state.theme, listOf("system" to "System", "light" to "Light", "dark" to "Dark", "black" to "Pure black")) { model.appearance(theme = it) }
                 Choice("Fullscreen theme", state.fullscreenTheme, listOf("system" to "System", "light" to "Light", "dark" to "Dark", "black" to "Pure black")) { model.appearance(fullTheme = it) }
-                Choice("Theme color",state.accent,listOf("system" to "System","blue" to "Blue","violet" to "Violet","rose" to "Rose","amber" to "Amber")){model.appearance(accent=it)}
+                if(state.customTheme.isBlank())Choice("Theme color",state.accent,listOf("system" to "System","blue" to "Blue","violet" to "Violet","rose" to "Rose","amber" to "Amber")){model.appearance(accent=it)}
+                else Text("Colors follow your imported theme. Reset it to use the built-in accent picker.",style=MaterialTheme.typography.bodySmall)
                 Row(verticalAlignment = Alignment.CenterVertically) { Column(Modifier.weight(1f)) { Text("Expressive motion", style = MaterialTheme.typography.titleMedium); Text("Spring transitions and responsive controls", style = MaterialTheme.typography.bodySmall) }; Switch(checked = state.motion, onCheckedChange = { model.appearance(motion = it) }) }
+            }
+            SettingsSection("Custom theme") {
+                Text(themeDocument(state.customTheme)?.optString("name")?:"Built-in appearance",style=MaterialTheme.typography.titleMedium)
+                Text("Theme files customize controls, colors, reading typography and background patterns. Reading font and text size remain yours. Invalid edits keep the last valid appearance.",style=MaterialTheme.typography.bodySmall)
+                FlowRow(horizontalArrangement=Arrangement.spacedBy(8.dp)){FilledTonalButton(onClick=importTheme){Text("Import theme…")};OutlinedButton(onClick=exportTheme){Text(if(state.customTheme.isBlank())"Export template…" else "Export theme…")}}
+                if(state.customTheme.isNotBlank())FlowRow(horizontalArrangement=Arrangement.spacedBy(8.dp)){TextButton(onClick=model::reloadCustomTheme){Text("Reload file")};TextButton(onClick=model::resetCustomTheme){Text("Reset to built-in")}}
+                Text("Edit the exported JSON with an editor or AI, then import it. Providers that support notifications update automatically; otherwise tap Reload.",style=MaterialTheme.typography.bodySmall)
+                TextButton(onClick={runCatching {activity.startActivity(Intent(Intent.ACTION_VIEW,android.net.Uri.parse("https://github.com/YashMahawa/super-md/blob/main/docs/THEMING.md")))}.onFailure {model.fail("No browser could open the theme guide. See docs/THEMING.md in the project repository.")}}){Text("Theme authoring guide")}
             }
             SettingsSection("Reading") {
                 Row(verticalAlignment=Alignment.CenterVertically){Text("Continue from last reading position",Modifier.weight(1f));Switch(state.restorePosition,model::restorePosition)}

@@ -16,6 +16,15 @@ fn success(output: Output) -> String {
 }
 fn pdf(path: &Path) { let bytes = fs::read(path).unwrap(); assert!(bytes.starts_with(b"%PDF-")); assert!(bytes.len() > 1000); }
 #[test]
+fn theme_validation_is_shared_with_the_native_apps() {
+    for (input,valid) in [(r#"{"format":"supermd-theme","version":1,"name":"Ink"}"#,true),(r#"{"format":"supermd-theme","version":1,"name":"Ink","css":"@import url(https://example.com)"}"#,false)] {
+        let mut process=Command::new(env!("CARGO_BIN_EXE_smd-engine")).arg("validate-theme").stdin(Stdio::piped()).stdout(Stdio::piped()).spawn().unwrap();
+        process.stdin.take().unwrap().write_all(input.as_bytes()).unwrap();
+        let response:serde_json::Value=serde_json::from_str(&success(process.wait_with_output().unwrap())).unwrap();
+        assert_eq!(response.get("theme").is_some(),valid);
+    }
+}
+#[test]
 fn text_and_portable_commands_never_dump_image_bytes() {
     let w = Workspace::new();
     let image = b"<svg xmlns=\"http://www.w3.org/2000/svg\" width=\"40\" height=\"40\"><circle cx=\"20\" cy=\"20\" r=\"15\" fill=\"blue\"/></svg>";

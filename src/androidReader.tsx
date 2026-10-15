@@ -7,6 +7,7 @@ import "@fontsource-variable/noto-serif";
 import "katex/dist/katex.min.css";
 import "./styles.css";
 import "./androidReader.css";
+import "./customTheme.css";
 import Editor, { editorReadingOffset, editorHistory, exportEditorSession, importEditorSession, type PortableEditorSession } from "./components/Editor";
 import {readingOffset,revealReadingOffset} from "./readingPosition";
 import { exportRenderedViews, importRenderedViews } from "./renderedOutputs";
@@ -30,6 +31,7 @@ import {cachedEditorHistory} from './components/Editor';
 import {loadReadingLocation,saveReadingLocation,type ReadingLocation} from './readingLocations';
 import {mediaFilter,type MediaAppearance} from './mediaAppearance';
 import {DocumentAppearance} from './documentAppearance';
+import {applyCustomStyle,type CustomStyle} from './customTheme';
 const DocumentPreview = memo(MarkdownPreview);
 const LiveDocument = memo(LiveEditor);
 const SourceEditor = memo(Editor);
@@ -40,7 +42,7 @@ declare global { interface Window {supermdDismiss?:()=>boolean;supermdSetZoom?:(
 declare global { interface Window { supermdLoad?: (state: ReaderState) => void; supermdExport?: (options: ExportOptions) => void; supermdExportMarkdown?: () => void; supermdFind?: () => void; supermdPortable?: (save: boolean) => void; supermdZoomBy?: (factor:number,focus?:Point)=>void; supermdResetZoom?: ()=>void; supermdRepairMath?: ()=>void; supermdFlush?: (operation:Record<string,string>)=>void } }
 declare global { interface Window {supermdChromeInset?:(height:number)=>void} }
 declare global { interface Window {supermdSavePosition?:()=>void} }
-interface ReaderState { restorePosition?:boolean; readingLocation?:ReadingLocation|null; imageAppearance?:MediaAppearance; svgAppearance?:MediaAppearance; imageContrast?:number }
+interface ReaderState { customStyle?:CustomStyle; restorePosition?:boolean; readingLocation?:ReadingLocation|null; imageAppearance?:MediaAppearance; svgAppearance?:MediaAppearance; imageContrast?:number }
 function Reader() {
   const [state, setState] = useState<ReaderState | null>(null);
   const [repairing, setRepairing] = useState(false);
@@ -61,6 +63,7 @@ function Reader() {
   const settleTimer=useRef(0);
   const savePosition=useRef(()=>{});
   const layoutKey=useRef('');
+  const customLayout=useRef<{id:string;mode:string;metrics:string}|null>(null);
   const chromeRequestAt=useRef(0);
   const chromeLastAction=useRef<string|undefined>(undefined);
   const requestChrome=(action:'show'|'hide'|'toggle')=>{
@@ -99,7 +102,7 @@ function Reader() {
         const root=document.querySelector<HTMLElement>(".android-reading");
         modeOffset.current=old.mode==="editor"?(editorReadingOffset(old.id)??0):root?readingOffset(root):0;
       }
-      if(old&&Object.keys(next).every(key=>key==="zoom"&&old.fullscreen===next.fullscreen?true:key==="viewState"||key==="colors"?key==="viewState"?!next.viewState:JSON.stringify(old.colors)===JSON.stringify(next.colors):(old as any)[key]===(next as any)[key]))return;
+      if(old&&[...new Set([...Object.keys(old),...Object.keys(next)])].every(key=>key==="zoom"&&old.fullscreen===next.fullscreen?true:key==="viewState"?!next.viewState:key==="colors"||key==="customStyle"?JSON.stringify((old as any)[key])===JSON.stringify((next as any)[key]):(old as any)[key]===(next as any)[key]))return;
       if (old && old.id !== next.id) {
         savePosition.current();
         noteViews.current.set(old.id, {top: document.querySelector<HTMLElement>(".android-reading")?.scrollTop ?? 0});
@@ -207,6 +210,10 @@ function Reader() {
   useEffect(()=>{if(state)void invoke("document_outline",{id:state.id,headings:documentOutline(state.content)}).catch(()=>{});},[state?.id,state?.content]);
   useLayoutEffect(() => {
     if (!state) return;
+    const nextCustom={id:state.id,mode:state.mode,metrics:JSON.stringify(state.customStyle?.metrics??{})};
+    const previousCustom=customLayout.current;
+    const restoreCustom=previousCustom?.id===state.id&&previousCustom.mode===state.mode&&previousCustom.metrics!==nextCustom.metrics?anchors():[];
+    customLayout.current=nextCustom;
     const root = document.documentElement; root.dataset.theme = state.dark ? "dark" : "light"; root.dataset.motion = state.motion === false ? "off" : "on";root.dataset.fullscreen=String(state.fullscreen);
     root.style.setProperty("--reader-size", `${state.size}px`);
     root.style.setProperty("--editor-size", `${Math.max(12, Math.min(24, state.size - 2))}px`);
@@ -216,18 +223,20 @@ function Reader() {
     root.style.setProperty("--reading-max-width",`${state.widthPercent??90}%`);
     root.style.setProperty("--reader-leading",String(state.lineHeight??1.65));
     Object.entries(state.colors).forEach(([key, value]) => root.style.setProperty(`--${key}`, value));
+    const styleKey=applyCustomStyle(root,state.customStyle,state.colors);
     root.style.setProperty('--image-filter',mediaFilter(state.imageAppearance,state.dark,state.imageContrast));
     root.style.setProperty('--svg-filter',mediaFilter(state.svgAppearance,state.dark,state.imageContrast));
     // A palette-only change must not unset CSS zoom, remeasure a long page or
     // write scrollTop. These operations used to race with momentum scrolling.
-    const nextLayout=JSON.stringify([state.id,state.mode,state.fullscreen,state.font,state.size,state.widthPercent,state.lineHeight]);
+    const nextLayout=JSON.stringify([state.id,state.mode,state.fullscreen,state.font,state.size,state.widthPercent,state.lineHeight,styleKey]);
     if(layoutKey.current!==nextLayout){layoutKey.current=nextLayout;document.querySelectorAll<HTMLElement>('.android-reading').forEach(invalidateDocumentZoom);applyZoomStyle();settleSelection();}
+    if(restoreCustom.length)requestAnimationFrame(()=>restoreCustom.forEach(restore=>restore()));
   // A source edit (especially checking a task) is not a new viewport. Rebuilding
   // zoom geometry here resets settled CSS zoom before the native selection and
   // scroll position have caught up, which jumps on mobile and magnified pages.
   // ResizeObserver updates the content extent without changing magnification.
   }, [state?.id,state?.mode,state?.dark,state?.fullscreen,state?.font,state?.size,
-      state?.widthPercent,state?.lineHeight,state?.motion,state?.imageAppearance,state?.svgAppearance,state?.imageContrast,JSON.stringify(state?.colors)]);
+      state?.widthPercent,state?.lineHeight,state?.motion,state?.imageAppearance,state?.svgAppearance,state?.imageContrast,JSON.stringify(state?.colors),JSON.stringify(state?.customStyle)]);
   useEffect(()=>{const root=document.querySelector<HTMLElement>(".android-reading");if(!root || typeof ResizeObserver==="undefined")return;let frame=0;const page=root.querySelector<HTMLElement>(".document-page");const observer=new ResizeObserver(()=>{if(!frame)frame=requestAnimationFrame(()=>{frame=0;
     // A scheduled gesture owns its focal point. A resize callback must not
     // consume the pending scale at the default center before that frame runs.

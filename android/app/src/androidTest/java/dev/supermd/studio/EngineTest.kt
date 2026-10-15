@@ -13,6 +13,19 @@ import java.io.File
 
 @RunWith(AndroidJUnit4::class)
 class EngineTest {
+    @Test fun portableThemeValidationAndNativeContrast() {
+        val result=JSONObject(PdfEngine.validateTheme(themeTemplate));assertFalse(result.has("error"))
+        val theme=result.getJSONObject("theme");assertEquals("My theme",theme.getString("name"))
+        val untouched=manualAccent("violet",true);assertSame(untouched,customThemeColors(untouched,theme,"dark",true))
+        assertTrue(JSONObject(PdfEngine.validateTheme(themeTemplate.replace("\"opacity\":0.05","\"opacity\":0.9"))).has("error"))
+        assertTrue(JSONObject(PdfEngine.validateTheme(" ".repeat(65537))).has("error"))
+        val roles=JSONObject().put("surface","#222222").put("surface-low","#252525").put("surface-high","#292929").put("text","#222222").put("primary","#222222")
+        theme.getJSONObject("variants").getJSONObject("dark").put("colors",roles)
+        val palette=customThemeColors(manualAccent("violet",true),theme,"dark",true)
+        assertTrue(contrast(palette.onSurface,palette.surface)>=4.5f);assertTrue(contrast(palette.onPrimary,palette.primary)>=4.5f)
+        assertEquals("dots",themeStyle(theme,"dark",true).getJSONObject("background").getString("pattern"))
+        assertEquals(0,themeStyle(theme,"black",true).getJSONObject("colors").length())
+    }
     @Test fun deletedDraftArchiveSurvivesBoundedClosedTabEviction() {
         val app=ApplicationProvider.getApplicationContext<android.app.Application>()
         val root=File(app.cacheDir,"deleted-draft-test-${java.util.UUID.randomUUID()}")

@@ -64,6 +64,37 @@ class StudioUiTest {
         val model=androidx.lifecycle.ViewModelProvider(compose.activity)[StudioViewModel::class.java]
         compose.runOnIdle {if(model.state.value.active.content.isBlank())model.edit(model.state.value.active.id,sample)}
     }
+    @Test fun importedThemePaintsNativeControlsAndReaderAndInvalidEditsKeepIt() {
+        welcome()
+        val model=androidx.lifecycle.ViewModelProvider(compose.activity)[StudioViewModel::class.java]
+        val before=model.state.value;val prefs=compose.activity.getSharedPreferences("studio",0)
+        val previousTheme=prefs.getString("customTheme",null);val previousSource=prefs.getString("customThemeSource",null)
+        val file=java.io.File(compose.activity.cacheDir,"instrumented-theme.json")
+        val theme=org.json.JSONObject(themeTemplate)
+        theme.getJSONObject("variants").getJSONObject("light").put("colors",org.json.JSONObject().put("primary","#63351f").put("surface","#e4d4c9").put("surface-low","#d9c4b4").put("surface-high","#ceb09a").put("text","#30221b"))
+        theme.getJSONObject("metrics").put("headingWeight",800)
+        try {
+            compose.runOnIdle {model.appearance(theme="light",motion=false);model.fullscreen(false);model.mode("reader");model.zoom(140f)}
+            file.writeText(theme.toString())
+            compose.runOnIdle {model.importCustomTheme(android.net.Uri.fromFile(file))}
+            compose.waitUntil(10_000){model.state.value.customTheme.isNotBlank()}
+            javascriptUntil("(()=>{const root=document.documentElement;return root.dataset.customTheme==='true'&&root.style.getPropertyValue('--custom-heading-weight')==='800'&&getComputedStyle(document.querySelector('.android-reading')).backgroundImage.includes('radial-gradient');})()") {it=="true"}
+            javascriptUntil("document.querySelector('.document-page').dataset.scale") {it=="\"1.4\""}
+            val bitmap=compose.onRoot().captureToImage().asAndroidBitmap();var colored=0
+            for(y in 0 until bitmap.height step 4)for(x in 0 until bitmap.width step 4)if(bitmap.getPixel(x,y) and 0xffffff==0x63351f)colored++
+            assertTrue("The selected native control must paint the imported accent",colored>10)
+            val accepted=model.state.value.customTheme
+            file.writeText(theme.put("css","@import url(https://example.com)").toString())
+            compose.runOnIdle {model.reloadCustomTheme()}
+            compose.waitUntil(10_000){model.state.value.message?.contains("Theme not applied")==true}
+            assertEquals(accepted,model.state.value.customTheme);assertEquals(before.active.content,model.state.value.active.content)
+            compose.runOnIdle {model.dismissError();model.resetCustomTheme()}
+            javascriptUntil("document.documentElement.dataset.customTheme==='false'") {it=="true"}
+        } finally {
+            compose.runOnIdle {model.dismissError();model.resetCustomTheme();prefs.edit().apply {if(previousTheme!=null)putString("customTheme",previousTheme);if(previousSource!=null)putString("customThemeSource",previousSource)}.apply();model.appearance(theme=before.theme,motion=before.motion);model.fullscreen(before.fullscreen);model.mode(before.mode);model.zoom(before.normalZoom)}
+            file.delete()
+        }
+    }
     @Test fun viewingAndDraggingSvgNeverMutatesTheNativeNote() {
         welcome()
         val model=androidx.lifecycle.ViewModelProvider(compose.activity)[StudioViewModel::class.java]

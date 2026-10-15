@@ -39,9 +39,21 @@ Pane {
                 Label { text: "Fullscreen theme" }
                 ModeGroup { Layout.fillWidth: true; choices: [{key:"system",label:"System"},{key:"light",label:"Light"},{key:"dark",label:"Dark"},{key:"black",label:"Pure black"}]; selected: viewState.settings.fullTheme; onChosen: key => page.save("fullTheme", key) }
                 Label { text: "Theme color" }
-                ChoiceField { Layout.fillWidth: true; model: ["System accent", "Blue", "Violet", "Rose", "Amber"]; currentIndex: ["system","blue","violet","rose","amber"].indexOf(viewState.settings.accent); onActivated: page.save("accent",["system","blue","violet","rose","amber"][currentIndex]) }
-                Label { text: "System uses your desktop accent when available; otherwise app blue. Choose a color independently of light or dark mode."; Layout.fillWidth: true; wrapMode: Text.WordWrap; color: viewState.colors.muted }
+                ChoiceField { Layout.fillWidth: true; enabled:!studio.customThemeActive; model: ["System accent", "Blue", "Violet", "Rose", "Amber"]; currentIndex: ["system","blue","violet","rose","amber"].indexOf(viewState.settings.accent); onActivated: page.save("accent",["system","blue","violet","rose","amber"][currentIndex]) }
+                Label { text: studio.customThemeActive ? "The imported theme supplies its palette. Reset to built-in below to use this accent picker." : "System uses your desktop accent when available; otherwise app blue. Choose a color independently of light or dark mode."; Layout.fillWidth: true; wrapMode: Text.WordWrap; color: viewState.colors.muted }
                 Switch { text: "Expressive motion"; checked: viewState.settings.motion; onToggled: page.save("motion", checked) }
+                Label { text: "Custom theme"; font.pixelSize:22; font.weight:Font.DemiBold; Layout.topMargin:12 }
+                Label { text:studio.customThemeName; textFormat:Text.PlainText; Layout.fillWidth:true; font.weight:Font.DemiBold }
+                Label { text:"Editable theme files style controls, reading colors, typography and background patterns. Your reading font and text size remain yours. Invalid edits keep the last valid theme."; Layout.fillWidth:true; wrapMode:Text.WordWrap; color:viewState.colors.muted }
+                Flow {
+                    Layout.fillWidth:true;spacing:8
+                    ActionButton { text:"Import theme…";glyph:"FolderOpen";tonal:true;onClicked:studio.chooseCustomTheme() }
+                    ActionButton { text:studio.customThemeActive ? "Export theme…" : "Export template…";glyph:"Export";tonal:true;onClicked:studio.chooseThemeExport() }
+                    ActionButton { text:"Authoring guide";onClicked:studio.openThemeGuide() }
+                    ActionButton { text:"Edit theme file";visible:studio.customThemeActive;onClicked:studio.editCustomTheme() }
+                    ActionButton { text:"Reload";visible:studio.customThemeActive;onClicked:studio.reloadCustomTheme() }
+                    ActionButton { text:"Reset to built-in";visible:studio.customThemeActive;onClicked:studio.resetCustomTheme() }
+                }
                 Label { text: "Images & diagrams"; font.pixelSize: 22; font.weight: Font.DemiBold; Layout.topMargin: 12 }
                 Label { text: "Optional viewing adjustments only. Original files and PDF exports are unchanged."; Layout.fillWidth: true; wrapMode: Text.WordWrap; color: viewState.colors.muted }
                 Label { text: "Image appearance" }

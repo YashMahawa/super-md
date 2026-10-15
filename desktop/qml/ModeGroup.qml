@@ -11,7 +11,7 @@ Control {
     padding: 4
     implicitHeight: 44
     implicitWidth: contentItem.implicitWidth + 8
-    background: Rectangle { radius: 22; antialiasing: true; color: control.colors["surface-low"] }
+    background: Rectangle { radius: studio.themeMetrics ? studio.themeMetrics.controlRadius : 22; antialiasing: true; color: control.colors["surface-low"] }
     contentItem: RowLayout {
         spacing: 2
         Repeater {

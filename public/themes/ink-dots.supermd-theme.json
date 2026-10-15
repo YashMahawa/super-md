@@ -1,0 +1,8 @@
+{
+  "format":"supermd-theme","version":1,"name":"Ink dots","accent":"violet",
+  "variants":{
+    "light":{"colors":{"surface":"#e5deeb","surface-low":"#d9cfe3","surface-high":"#c7b7d5","text":"#282231","heading":"#4b365d","code-bg":"#d8cfe0","code-text":"#282231"},"background":{"pattern":"dots","color":"#6c5280","opacity":0.055,"spacing":24}},
+    "dark":{"colors":{"surface":"#19151f","surface-low":"#231c2c","surface-high":"#32263e","text":"#e6ddee","heading":"#dbc2f3","code-bg":"#211a2a","code-text":"#e6ddee"},"background":{"pattern":"dots","color":"#d4bbfc","opacity":0.05,"spacing":24}}
+  },
+  "metrics":{"controlRadius":22,"contentRadius":16,"paragraphSpacing":1.3,"codePadding":20,"headingWeight":700,"headingTracking":-0.025,"textTracking":0,"tableBorderWidth":1}
+}
