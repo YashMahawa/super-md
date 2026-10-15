@@ -83,3 +83,42 @@ test('large-note zoom frames avoid document-wide style updates and unbounded DOM
   expect(metrics.styleUnchanged).toBe(true);expect(metrics.nodes).toBeLessThan(10_000);expect(metrics.math).toBeLessThan(80);
   await test.info().attach('large-note-metrics',{body:JSON.stringify({sourceBytes:Buffer.byteLength(note),...metrics}),contentType:'application/json'});
 });
+
+test('search owns the viewport immediately after a distant heading jump',async({page})=>{
+  await page.addInitScript(()=>{window.SuperMD={post:()=>{}};});await page.goto('/android-reader.html');
+  await page.evaluate(content=>window.supermdLoad?.({id:'find-after-jump',content,path:null,mode:'reader',dark:false,fullscreen:false,colors:{},font:'Manrope',size:18,zoom:100}),note);
+  await page.evaluate(()=>window.supermdFind?.());
+  await page.getByRole('searchbox',{name:'Find in note'}).fill('Unique-500');
+  await expect(page.locator('.reading-search output')).toHaveText('0 / 1');
+  // Re-arm a fresh navigation token immediately before choosing the result.
+  // Waiting for ordinary UI interaction can hide this race on slower hosts.
+  await page.evaluate(()=>window.supermdHeading?.('chapter-999'));
+  await page.getByRole('button',{name:'Next match',exact:true}).click();
+  expect(await page.locator('.android-reading').getAttribute('data-navigating')).not.toBe('true');
+  const result=page.locator('[data-windowed-mounted="true"]').filter({hasText:'Unique-500'});
+  await expect(result).toBeVisible();await expect(result).toBeInViewport();
+  await page.evaluate(async()=>{
+    await new Promise(resolve=>setTimeout(resolve,200));
+    const target=document.querySelector<HTMLElement>('#chapter-500');
+    if(target)target.style.marginTop='48px';
+    await new Promise(resolve=>requestAnimationFrame(()=>requestAnimationFrame(resolve)));
+  });
+  await expect(result).toBeVisible();await expect(result).toBeInViewport();
+  await expect(page.getByRole('heading',{name:'Chapter 999',exact:true})).not.toBeInViewport();
+  expect(await page.locator('.katex').count()).toBeLessThan(80);
+});
+
+test('changing tabs or reading modes retires the previous heading alignment',async({page})=>{
+  await page.addInitScript(()=>{window.SuperMD={post:()=>{}};});await page.goto('/android-reader.html');
+  const state={id:'navigation-owner',content:'# Top\n\n## Bottom\n\n'+('A readable line. '.repeat(200)),path:null,mode:'reader' as const,dark:false,fullscreen:false,colors:{},font:'Manrope',size:18,zoom:100};
+  await page.evaluate(state=>window.supermdLoad?.(state),state);await expect(page.getByRole('heading',{name:'Bottom'})).toBeVisible();
+  for(const next of [{...state,id:'another-note'},{...state,id:'another-note',mode:'live'}]){
+    const flags=await page.evaluate(next=>{
+      const root=document.querySelector<HTMLElement>('.android-reading')!;
+      window.supermdHeading?.('bottom');const before=root.dataset.navigating;
+      window.supermdLoad?.(next as any);return {before,after:root.dataset.navigating};
+    },next);
+    expect(flags.before).toBe('true');expect(flags.after).toBeUndefined();
+    await expect(page.locator('.android-document')).toHaveClass(new RegExp('mode-'+next.mode));
+  }
+});

@@ -3,6 +3,8 @@ import { setReaderOverlay } from "../readerOverlays";
 import {ArrowUp,ArrowDown,X,TextAa,ArrowsClockwise} from "@phosphor-icons/react";
 import {editorFindQuery,editorFindRange} from "./Editor";
 import {windowedMatches,revealWindowed,type WindowedMatch} from "../windowedSearch";
+import {cancelHeadingNavigation} from '../documentNavigation';
+const cancelSettlingHeading=()=>document.querySelectorAll('.android-reading,.reading-scroll,.live-pane').forEach(cancelHeadingNavigation);
 type HighlightRegistry = Map<string, unknown>;
 export function readingMatches(host: Element, query: string, caseSensitive=false): Range[] {
   if (!query.trim()) return [];
@@ -57,6 +59,9 @@ export default function ReadingSearch({content,close,onChange,sourceSession}:{co
   const registry=typeof CSS==="undefined" ? undefined : (CSS as typeof CSS & {highlights?:HighlightRegistry}).highlights;
   const HighlightClass=(window as typeof window & {Highlight?:new(...ranges:Range[])=>unknown}).Highlight;
   const move=(direction:number) => {
+    // Search is a new deliberate navigation, just like pan/zoom. A briefly
+    // observing heading jump must not pull the viewport back after this move.
+    cancelSettlingHeading();
     const {matches,index}=current.current;
     if(sourceSearch){if(!sourceRanges.length)return;const next=(index+direction+sourceRanges.length)%sourceRanges.length;const range=sourceRanges[next];if(sourceSession)editorFindRange(sourceSession,range.from,range.to);setIndex(next);return;}
     if(windowed){if(!windowed.length)return;const next=(index+direction+windowed.length)%windowed.length,match=windowed[next];revealWindowed(match.element);match.element.scrollIntoView({block:'center',behavior:'instant'});setIndex(next);requestAnimationFrame(()=>requestAnimationFrame(()=>{const ranges=readingMatches(match.element,query,caseSensitive),range=ranges[match.ordinal];if(registry&&HighlightClass){registry.set('smd-search',new HighlightClass(...ranges));if(range)registry.set('smd-search-current',new HighlightClass(range));}range?.startContainer.parentElement?.scrollIntoView({block:'center',behavior:'instant'});}));return;}
@@ -68,6 +73,7 @@ export default function ReadingSearch({content,close,onChange,sourceSession}:{co
     setIndex(next);
   };
   useEffect(()=>{
+    cancelSettlingHeading();
     setReaderOverlay("search",true);
     const focus=()=>{input.current?.focus();input.current?.select();};focus();
     const key=(event:KeyboardEvent)=>{if(event.key==="Escape"){event.preventDefault();event.stopImmediatePropagation();closeRef.current();}};

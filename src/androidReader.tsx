@@ -98,6 +98,7 @@ function Reader() {
       if(contentUnchanged&&(!old||old.id!==rest.id))return;
       const next=(contentUnchanged?{...rest,content:old!.content}:rest) as ReaderState;
       if(old?.id===next.id)next.readingLocation=old.readingLocation;
+      if(old&&(old.id!==next.id||old.mode!==next.mode||old.fullscreen!==next.fullscreen))document.querySelectorAll('.android-reading').forEach(cancelHeadingNavigation);
       if(old&&(old.id!==next.id||old.mode!==next.mode)){const history=histories.current.get(next.id);if(history)history.last=0;}
       if(old&&old.id===next.id&&old.mode!==next.mode){
         const root=document.querySelector<HTMLElement>(".android-reading");

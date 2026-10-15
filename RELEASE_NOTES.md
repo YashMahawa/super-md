@@ -19,6 +19,8 @@
 - Note context menus have opaque, bordered surfaces and consistent hit areas. Duplicate path hints are removed and remaining hints disappear while menus are open.
 - Recent notes have reliable hover/focus highlights and a bounded Pin/Unpin context menu; lightweight pin indicators appear only on pinned entries.
 - Long-document heading jumps now follow late font/layout changes briefly, then yield immediately to deliberate scrolling or zooming instead of snapping back.
+- Opening search or choosing a match cancels a preceding heading jump, so quickly searching after a contents/link jump cannot snap back to the old heading.
+- Switching tabs or reading modes also retires the previous heading alignment instead of applying it to a different document.
 - Artwork and palette changes do not reparse Markdown, replace math nodes or reset reading zoom.
 
 ## Bounded rendering and safety

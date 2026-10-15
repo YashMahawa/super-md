@@ -61,6 +61,7 @@ export function navigateToHeading(root:Element,target:string):boolean {
   const align=(frames:number)=>{
     if(jumps.get(root)!==token || !host.isConnected)return;
     const mounted=Array.from(root.querySelectorAll<HTMLElement>('[data-heading-key]')).find(node=>node.id===heading.id) || heading;
+    if(!host.contains(mounted)){cancelHeadingNavigation(root);return;}
     revealWindowed(mounted);
     const page=host.querySelector<HTMLElement>('.document-page');
     if(page&&!refreshDocumentExtent(host)){invalidateDocumentZoom(host);applyDocumentZoom(host,Number(page.dataset.scale)*100||100,Number.parseFloat(document.documentElement.style.getPropertyValue('--reading-max-width'))||80,undefined,undefined,undefined,host.dataset.centerLocked==='true');}
