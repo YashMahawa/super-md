@@ -25,6 +25,7 @@
 
 - A theme is limited to 2 MiB, with up to eight reusable images. Rasters are capped at 512 KiB and four megapixels; static SVG is capped at 128 KiB and 5000 XML nodes. Animated and executable content, external resources and missing asset references are rejected.
 - Android shares a bounded drawing cache across native areas, downsamples native raster decorations and avoids sending unused sidebar/toolbar images through the reader bridge.
+- Fixed-size SVG artwork is fitted to its cached Android viewport instead of appearing as a tiny mark in one corner. The imported file itself is unchanged.
 - Regression coverage includes actual native and browser artwork pixels, raster type checks, import/share round trips, document identity/zoom retention, menu opacity and tooltip suppression. Android tests run on emulators, not the user's phone.
 - Private detailed-art evaluation samples are not bundled in the repository or release. Only share artwork you have permission to redistribute.
 

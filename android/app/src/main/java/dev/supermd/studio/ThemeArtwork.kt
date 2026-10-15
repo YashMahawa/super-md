@@ -31,6 +31,15 @@ private val artworkPictures=android.util.LruCache<String,Picture>(2)
                 val ratio=svg.documentAspectRatio.let {if(it.isFinite()&&it>0f)it else 1f}
                 val width=if(ratio>=1f)1024 else (1024*ratio).toInt().coerceAtLeast(1)
                 val height=if(ratio>=1f)(1024/ratio).toInt().coerceAtLeast(1)else 1024
+                // AndroidSVG honours an authored fixed root width/height even
+                // when renderToPicture supplies a larger viewport. Normalize
+                // only this private drawing copy, otherwise a 100px diagram
+                // occupies one corner of a 1024px recording and appears blank.
+                if(svg.documentViewBox==null){
+                    val naturalWidth=svg.documentWidth;val naturalHeight=svg.documentHeight
+                    if(naturalWidth.isFinite()&&naturalHeight.isFinite()&&naturalWidth>0f&&naturalHeight>0f)svg.setDocumentViewBox(0f,0f,naturalWidth,naturalHeight)
+                }
+                svg.setDocumentWidth("100%");svg.setDocumentHeight("100%")
                 svg.renderToPicture(width,height)
             }
             uri.startsWith("data:image/png;base64,")||uri.startsWith("data:image/jpeg;base64,")||uri.startsWith("data:image/webp;base64,")->{
