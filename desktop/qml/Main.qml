@@ -340,7 +340,7 @@ ApplicationWindow {
         enter: Transition { NumberAnimation { property: "opacity"; from: 0; to: 1; duration: viewState.settings.motion ? 160 : 0 } }
         exit: Transition { NumberAnimation { property: "opacity"; from: 1; to: 0; duration: viewState.settings.motion ? 100 : 0 } }
         onClosed: settingsOpen = false
-        SettingsPage { viewState: window.viewState; anchors.fill: parent; onBack: settingsOpen = false }
+        SettingsPage { ownerPopup: settingsDialog; viewState: window.viewState; anchors.fill: parent; onBack: settingsOpen = false }
     }
     footer: Pane {
         visible: !viewState.fullscreen && !viewState.imageOverlay
@@ -378,7 +378,7 @@ ApplicationWindow {
                 ScrollBar.vertical: ExpressiveScrollBar { parent: exportScroll; x: exportScroll.width - width; y: 0; height: exportScroll.height }
                 ColumnLayout {
                     width: exportScroll.availableWidth
-                    PdfControls { objectName: "exportPdfControls"; visible: outputFormat === "pdf"; Layout.fillWidth: true; viewportItem: exportScroll.contentItem; options: viewState.settings.pdf; onEdited: options => studio.setting("pdf", JSON.stringify(options)) }
+                    PdfControls { objectName: "exportPdfControls"; ownerPopup: exportDialog; visible: outputFormat === "pdf"; Layout.fillWidth: true; viewportItem: exportScroll.contentItem; options: viewState.settings.pdf; onEdited: options => studio.setting("pdf", JSON.stringify(options)) }
                     Label { visible: outputFormat !== "pdf"; Layout.fillWidth: true; wrapMode: Text.WordWrap; text: outputFormat === "md" ? "Editable Markdown text. Choose portable SMD to include images in one file." : "A portable .smd keeps the editable Markdown and images together. Source mode never shows embedded image bytes." }
                 }
             }

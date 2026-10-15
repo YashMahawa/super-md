@@ -189,6 +189,25 @@ def main():
         if args.smoke:
             import time
             smoke_deadline = time.monotonic() + 30
+            visual_steps = []
+            visual_started = False
+            def at(milliseconds, action):
+                visual_steps.append((milliseconds, action))
+            def start_visual():
+                nonlocal visual_started
+                if visual_started:return
+                visual_started=True
+                def advance(previous=10000):
+                    if not visual_steps:return
+                    when, action=visual_steps.pop(0)
+                    def step():
+                        action()
+                        advance(when)
+                    # A busy renderer must not execute open/capture/close
+                    # timers as one overdue batch. Every phase gets its own
+                    # settling interval after the preceding action completes.
+                    QTimer.singleShot(max(0,when-previous),step)
+                advance()
             def verify():
                 script = "window.SuperMD?.post('smoke','export_failed',JSON.stringify({error:'SMOKE:'+JSON.stringify({headings:document.querySelectorAll('h1').length,math:document.querySelectorAll('.katex').length,charts:document.querySelectorAll('.interactive-chart svg').length,surfaces:document.querySelectorAll('.surface-chart').length,answers:document.querySelectorAll('details.callout').length,themePattern:getComputedStyle(document.querySelector('.android-reading')).backgroundImage.includes('radial-gradient'),themeWeight:document.documentElement.style.getPropertyValue('--custom-heading-weight'),zoom:getComputedStyle(document.documentElement).getPropertyValue('--workspace-scale')})}))"
                 QMetaObject.invokeMethod(window,"runDocumentScript",Q_ARG("QVariant",script))
@@ -227,13 +246,15 @@ def main():
                         args.smoke_report.write_text(json.dumps({"ok":True,"readerColors":len(colors),
                             "software":os.environ.get('QT_QUICK_BACKEND')=='software',
                             "content":studio.message,"theme":studio.customThemeName if studio.customThemeActive else None}),encoding='utf-8')
-                    if not valid and not args.visual_smoke and time.monotonic() < smoke_deadline:
+                    if not valid and time.monotonic() < smoke_deadline:
                         QTimer.singleShot(300, poll_smoke)
                         return
                     if not valid or not args.visual_smoke:
                         app.exit(0 if valid else 2)
+                    elif args.visual_smoke:
+                        start_visual()
                 else:
-                    if not args.visual_smoke and time.monotonic() < smoke_deadline:
+                    if time.monotonic() < smoke_deadline:
                         QTimer.singleShot(300, poll_smoke)
                         return
                     print(f"SMOKE FAILED: reader ready={studio.ready}",flush=True)
@@ -248,20 +269,16 @@ def main():
                     result()
                 else:
                     QTimer.singleShot(200, poll_smoke)
-            if args.visual_smoke:
-                QTimer.singleShot(8000,verify)
-                QTimer.singleShot(10000,result)
-            else:
-                QTimer.singleShot(200,poll_smoke)
+            QTimer.singleShot(200,poll_smoke)
             if args.visual_smoke:
                 # Exercise presented Qt pixels, not just generated tokens or QML parsing.
                 def capture(name):
                     if not window.grabWindow().save(f"/tmp/supermd-qt-{name}.png"):
                         app.exit(2)
-                QTimer.singleShot(10500,lambda:studio.setting("theme",'"light"'))
-                QTimer.singleShot(12000,lambda:capture("light"))
-                QTimer.singleShot(12500,lambda:window.setProperty("settingsOpen",True))
-                QTimer.singleShot(14000,lambda:capture("light-settings"))
+                at(10500,lambda:studio.setting("theme",'"light"'))
+                at(12000,lambda:capture("light"))
+                at(12500,lambda:window.setProperty("settingsOpen",True))
+                at(14000,lambda:capture("light-settings"))
                 def dropdown():
                     choice = window.findChild(QObject,"readingFontChoice")
                     if choice is None:
@@ -276,7 +293,7 @@ def main():
                             if not QMetaObject.invokeMethod(choice,"revealChoices"):
                                 app.exit(2)
                         QTimer.singleShot(50,reveal)
-                QTimer.singleShot(14500,dropdown)
+                at(14500,dropdown)
                 def capture_dropdown():
                     popup = window.findChild(QObject,"readingFontChoicePopup")
                     scroll = window.findChild(QObject,"settingsScroll")
@@ -309,38 +326,38 @@ def main():
                         print(f"FONT SEARCH SMOKE PASSED: {len(names)} filtered families, unchanged selection",flush=True)
                         capture("font-search")
                     QTimer.singleShot(100,verify_search)
-                QTimer.singleShot(15500,capture_dropdown)
-                QTimer.singleShot(16000,lambda:studio.setting("theme",'"dark"'))
-                QTimer.singleShot(17000,lambda:capture("dark-settings"))
+                at(15500,capture_dropdown)
+                at(16000,lambda:studio.setting("theme",'"dark"'))
+                at(17000,lambda:capture("dark-settings"))
                 def narrow():
                     changed = window.setProperty("settingsOpen",False)
                     window.setWidth(800)
                     studio.setting("theme",'"black"')
                     print(f"NARROW SMOKE: settingsChanged={changed} settingsOpen={window.property('settingsOpen')} theme={studio.settings['theme']}",flush=True)
-                QTimer.singleShot(17500,narrow)
-                QTimer.singleShot(19000,lambda:capture("black-narrow"))
+                at(17500,narrow)
+                at(19000,lambda:capture("black-narrow"))
                 def verify_nested_popup_closed():
                     popup=window.findChild(QObject,"readingFontChoicePopup")
                     if popup is not None and popup.property("visible"):
                         print("FONT POPUP SMOKE FAILED: picker outlived Settings",flush=True);app.exit(2)
-                QTimer.singleShot(19500,verify_nested_popup_closed)
+                at(19500,verify_nested_popup_closed)
                 def matplotlib_view():
                     window.setWidth(1320)
                     studio.setting("theme",'"system"')
                     QTimer.singleShot(500,lambda:QMetaObject.invokeMethod(window,"runDocumentScript",Q_ARG("QVariant","document.querySelector('.python-cell')?.scrollIntoView({block:'center',behavior:'instant'})")))
-                QTimer.singleShot(20000,matplotlib_view)
-                QTimer.singleShot(21500,lambda:capture("matplotlib-code"))
+                at(20000,matplotlib_view)
+                at(21500,lambda:capture("matplotlib-code"))
                 report = studio.data/"native-render.pdf"
-                QTimer.singleShot(22000,lambda:studio.exportTo(str(report),"pdf"))
-                QTimer.singleShot(24000,lambda:studio.setMode("editor"))
+                at(22000,lambda:studio.exportTo(str(report),"pdf"))
+                at(24000,lambda:studio.setMode("editor"))
                 def source_capture():
                     dialog = window.findChild(QObject,"settingsDialog")
                     capture("source")
                     if window.property("settingsOpen") or dialog.property("visible"):
                         print(f"SOURCE SMOKE FAILED: settingsOpen={window.property('settingsOpen')} dialogVisible={dialog.property('visible')} theme={studio.settings['theme']}",flush=True)
                         app.exit(2)
-                QTimer.singleShot(25500,source_capture)
-                QTimer.singleShot(26000,lambda:QMetaObject.invokeMethod(window,"showExport",Q_ARG("QVariant",False)))
+                at(25500,source_capture)
+                at(26000,lambda:QMetaObject.invokeMethod(window,"showExport",Q_ARG("QVariant",False)))
                 def export_capture(name):
                     capture(name)
                     panel = window.findChild(QObject,"exportPdfControls")
@@ -348,10 +365,10 @@ def main():
                     if panel is None or not panel.property("visible") or panel.property("width") < 200 or numbers is None or not numbers.property("visible"):
                         print(f"PDF OPTIONS SMOKE FAILED: panel={panel} numbers={numbers}",flush=True)
                         app.exit(2)
-                QTimer.singleShot(27500,lambda:export_capture("export-options"))
-                QTimer.singleShot(28000,lambda:QMetaObject.invokeMethod(window,"hideExport"))
-                QTimer.singleShot(29000,lambda:QMetaObject.invokeMethod(window,"showExport",Q_ARG("QVariant",True)))
-                QTimer.singleShot(30500,lambda:export_capture("share-options"))
+                at(27500,lambda:export_capture("export-options"))
+                at(28000,lambda:QMetaObject.invokeMethod(window,"hideExport"))
+                at(29000,lambda:QMetaObject.invokeMethod(window,"showExport",Q_ARG("QVariant",True)))
+                at(30500,lambda:export_capture("share-options"))
                 def pdf_result():
                     if studio.message == "Exported native-render.pdf" and report.exists() and report.stat().st_size>10000:
                         print(f"PDF SMOKE PASSED: {report}",flush=True)
@@ -388,7 +405,7 @@ def main():
                     else:
                         print(f"PDF SMOKE FAILED: {studio.message}",flush=True)
                         app.exit(2)
-                QTimer.singleShot(32000,pdf_result)
+                at(32000,pdf_result)
         if note:
             studio.openPath(str(note))
         return studio

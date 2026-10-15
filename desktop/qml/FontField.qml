@@ -9,6 +9,7 @@ ActionButton {
     property var families: []
     property string value: "Manrope"
     property Item viewportItem: null
+    property var ownerPopup: null
     signal chosen(string family)
     function revealChoices() { picker.open() }
     onVisibleChanged: { if (!visible) picker.close() }
@@ -16,6 +17,10 @@ ActionButton {
     Connections {
         target: field.Window.window
         function onVisibleChanged() { if (!field.Window.window.visible) picker.close() }
+    }
+    Connections {
+        target: field.ownerPopup
+        function onAboutToHide() { picker.close() }
     }
     text: value
     glyph: "CaretDown"

@@ -6,6 +6,7 @@ ColumnLayout {
     id: controls
     required property var options
     property var viewportItem: null
+    property var ownerPopup: null
     signal edited(var options)
     spacing: 8
     function update(key, value) {
@@ -21,7 +22,7 @@ ColumnLayout {
     ColumnLayout {
         Layout.fillWidth: true; spacing: 4
         Label { text: "Document font" }
-        FontField { objectName: "pdfFontChoice"; viewportItem: controls.viewportItem; Accessible.name: "PDF font"; Layout.fillWidth: true; families: studio.fonts; value: controls.options.fontFamily; onChosen: family => controls.update("fontFamily", family) }
+        FontField { objectName: "pdfFontChoice"; ownerPopup: controls.ownerPopup; viewportItem: controls.viewportItem; Accessible.name: "PDF font"; Layout.fillWidth: true; families: studio.fonts; value: controls.options.fontFamily; onChosen: family => controls.update("fontFamily", family) }
     }
     ColumnLayout {
         Layout.fillWidth: true; spacing: 4

@@ -5,7 +5,7 @@ import unittest
 import xml.etree.ElementTree as ET
 from pathlib import Path
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
-from PySide6.QtCore import QObject, Property, QUrl, QEvent, QPointF, QPoint, Qt
+from PySide6.QtCore import QObject, Property, QUrl, QEvent, QPointF, QPoint, Qt, QMetaObject
 from PySide6.QtGui import QGuiApplication
 from PySide6.QtQml import QQmlEngine, QQmlComponent
 from PySide6.QtTest import QTest
@@ -16,11 +16,31 @@ class Palette(QObject):
     def snapshot(self):
         return json.dumps({"settings":{"motion":False},"colors":{"text":"#201a17","muted":"#69564c","primary":"#8c4b2b","on-primary":"#ffffff","surface-low":"#f8d7c5","surface-high":"#eac1ac","outline":"#88756b"}})
     @Property("QVariantMap", constant=True)
-    def palette(self): return json.loads(self.snapshot)["colors"]
+    def palette(self): return {**json.loads(self.snapshot)["colors"],"primary-container":"#e9cab8"}
     @Property(bool, constant=True)
     def motionEnabled(self): return json.loads(self.snapshot)["settings"]["motion"]
 
 class StudyControlsTest(unittest.TestCase):
+    def test_reparented_font_search_closes_when_its_owner_dialog_closes(self):
+        app=QGuiApplication.instance() or QGuiApplication(["Font popup lifecycle"])
+        engine=QQmlEngine();palette=Palette();engine.rootContext().setContextProperty("studio",palette)
+        component=QQmlComponent(engine)
+        component.setData(b'''import QtQuick
+import QtQuick.Controls
+ApplicationWindow {width:600;height:500;visible:true
+Dialog {id:owner;objectName:"owner";width:400;height:400}
+FontField {objectName:"font";ownerPopup:owner;width:280;families:["Manrope","Noto Serif"]}}
+''',QUrl.fromLocalFile(str(Path(__file__).parent/'qml/font-owner-test.qml')))
+        self.assertFalse(component.isError(),str(component.errors()));window=component.create()
+        try:
+            owner=window.findChild(QObject,"owner");field=window.findChild(QObject,"font");picker=window.findChild(QObject,"fontPopup")
+            QMetaObject.invokeMethod(owner,"open");QTest.qWait(30);QMetaObject.invokeMethod(field,"revealChoices");QTest.qWait(30)
+            self.assertTrue(picker.property("visible"))
+            QMetaObject.invokeMethod(owner,"close");QTest.qWait(150)
+            self.assertFalse(picker.property("visible"));self.assertTrue(field.property("visible"),"Owner lifecycle must work even with an independently visible anchor")
+        finally:
+            window.close();window.deleteLater();app.sendPostedEvents(None,QEvent.Type.DeferredDelete);engine.deleteLater();app.sendPostedEvents(None,QEvent.Type.DeferredDelete)
+
     def test_recent_pin_is_small_and_only_shown_after_context_action(self):
         app=QGuiApplication.instance() or QGuiApplication(["Recent controls"])
         engine=QQmlEngine();palette=Palette();engine.rootContext().setContextProperty("studio",palette)

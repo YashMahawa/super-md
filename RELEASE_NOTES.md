@@ -21,6 +21,7 @@
 - Android instrumentation verifies shared validation, native contrast, actual imported-accent pixels and reader styling, invalid-edit preservation and reset. Existing gesture, selection, hyperlink, export and painting assertions remain enabled.
 - CI now covers Intel macOS before tagging as well as Apple Silicon, Linux and Windows. Debug/instrumentation sources receive their own lint check; desktop CI and release builds share architecture-isolated dependency caches without skipping tests or packaged launch checks.
 - macOS disk-image creation retries only transient “Resource busy” errors, with a bounded retry count. Other packaging failures still fail the release.
+- Native font-search popups close with their Settings or Export/Share owner, even though the searchable list lives in the window overlay.
 
 Themes are viewing preferences, not embedded in portable notes. PDF layout remains controlled by Export/Share; custom background patterns and reading metrics do not alter PDF output. Native Android component shapes follow Material's platform behavior rather than replacing every control with desktop geometry.
 
