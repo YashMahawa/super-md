@@ -38,6 +38,7 @@ RecentNotes {objectName:"recent";anchors.fill:parent;model:["/notes/Study.md"];o
             QTest.qWait(30);items=list(visual_items(window.contentItem()))
             entry=next(item for item in items if item.objectName()=="recentNoteEntry");pin=next(item for item in items if item.objectName()=="recentPinnedIndicator")
             self.assertIsNotNone(entry);self.assertFalse(pin.property("visible"));self.assertEqual(pin.property("width"),18)
+            self.assertGreaterEqual(pin.property("availableHeight"),16,"Decorative pin must not shrink into button padding")
             QTest.mouseClick(window,Qt.RightButton,Qt.NoModifier,QPoint(100,20));QTest.qWait(30)
             menu=next(x for x in visual_items(window.contentItem()) if x.property("text")=="Pin note")
             position=menu.mapToScene(QPointF(menu.property("width")/2,menu.property("height")/2))

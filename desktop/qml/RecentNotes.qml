@@ -22,7 +22,8 @@ ListView {
             objectName: "recentPinnedIndicator"
             visible: entry.isPinned
             anchors.right: parent.right; anchors.rightMargin: 8; anchors.verticalCenter: parent.verticalCenter
-            width: 18; height: 18; padding: 0
+            width: 18; height: 18
+            topPadding: 0; bottomPadding: 0; leftPadding: 0; rightPadding: 0
             glyph: "PinLight"; icon.width: 16; icon.height: 16; icon.color: studio.palette.muted
             background: null
             enabled: false; focusPolicy: Qt.NoFocus; Accessible.ignored: true
