@@ -149,7 +149,7 @@ Pinned notes show a small indicator, not a permanent action button on every row.
 
 Android supports independent app windows and drag-reordering tabs where the device permits it; wider windows can use Split mode and foldable-aware layouts. Desktop adds drag transfer between windows. See [platform behavior](docs/PLATFORM-PARITY.md) for the differences rather than assuming identical operating-system capabilities.
 
-Custom theme files can style native controls and the reader, with light/dark palettes, code/callout colors, typography, corners and subtle background patterns. Export a template, edit it yourself or with an AI, and import it on desktop or Android. See the [theme authoring guide](docs/THEMING.md) and [example themes](public/themes).
+Custom theme files style native controls and the reader: light/dark palettes, code/callout colors, typography, corners, adjustable paw/grid patterns and faded vector or image artwork across the reader, sidebar and top bars. SVG, PNG, JPEG and WebP assets travel inside one portable theme file, with placement and visibility controls. Import, export and share themes between desktop and Android. Export a template and edit it yourself or with an AI. Static artwork is validated, not executable CSS or remote content. See the [theme authoring guide](docs/THEMING.md) and [example themes](public/themes).
 
 ## Download
 

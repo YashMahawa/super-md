@@ -37,8 +37,6 @@ ScrollView {
                 radius: 18
                 antialiasing: true
                 color: modelData.id === strip.viewState.active ? strip.viewState.colors["surface-high"] : strip.viewState.colors.surface
-                HoverHandler { id: tabHover }
-                Hint { visible: tabHover.hovered; text: modelData.path || modelData.name }
                 Drag.dragType: Drag.Automatic
                 Drag.supportedActions: Qt.MoveAction
                 Drag.proposedAction: Qt.MoveAction
@@ -68,13 +66,14 @@ ScrollView {
                     }
                 }
                 TapHandler { acceptedButtons: Qt.RightButton; onTapped: tabMenu.popup() }
-                Menu {
+                NoteContextMenu {
                     id: tabMenu
-                    MenuItem { text: "Rename note"; icon.source: "../icons/Rename.svg"; icon.color: studio.palette.text; onTriggered: { renameField.text=tab.modelData.name;renameDialog.open() } }
-                    MenuItem { text: "Undo"; enabled: tab.modelData.id===strip.viewState.active; onTriggered:studio.command("undo") }
-                    MenuItem { text: "Redo"; enabled: tab.modelData.id===strip.viewState.active; onTriggered:studio.command("redo") }
+                    objectName: "tabContextMenu"
+                    NoteMenuItem { text: "Rename note"; icon.source: "../icons/Rename.svg"; onTriggered: { renameField.text=tab.modelData.name;renameDialog.open() } }
+                    NoteMenuItem { text: "Undo"; enabled: tab.modelData.id===strip.viewState.active; onTriggered:studio.command("undo") }
+                    NoteMenuItem { text: "Redo"; enabled: tab.modelData.id===strip.viewState.active; onTriggered:studio.command("redo") }
                     MenuSeparator {}
-                    MenuItem { text: "Move to new window"; onTriggered: studio.detachTab(tab.modelData.id) }
+                    NoteMenuItem { text: "Move to new window"; onTriggered: studio.detachTab(tab.modelData.id) }
                 }
                 Dialog {
                     id: renameDialog; title:"Rename note"; modal:true; width:360; standardButtons:Dialog.Ok|Dialog.Cancel

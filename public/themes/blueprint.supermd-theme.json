@@ -1,0 +1,45 @@
+{
+  "format": "supermd-theme",
+  "version": 1,
+  "name": "Blueprint",
+  "accent": "blue",
+  "variants": {
+    "dark": {
+      "colors": {
+        "surface": "#172738",
+        "surface-low": "#1d3045",
+        "surface-high": "#2a4057",
+        "text": "#e1edf5",
+        "muted": "#b4c9dc",
+        "primary": "#9dcff0",
+        "on-primary": "#10334b",
+        "primary-container": "#294e69",
+        "on-primary-container": "#d5ebfc",
+        "outline": "#496985",
+        "heading": "#baddf4",
+        "link": "#abd6fa",
+        "code-bg": "#122232",
+        "code-text": "#d5e8f7",
+        "code-border": "#44627e",
+        "callout-tip": "#b3d7cd",
+        "callout-warning": "#edc591"
+      },
+      "background": {
+        "pattern": "grid",
+        "color": "#79a8c7",
+        "opacity": 0.09,
+        "spacing": 32
+      }
+    }
+  },
+  "metrics": {
+    "controlRadius": 10,
+    "contentRadius": 16,
+    "paragraphSpacing": 1.15,
+    "codePadding": 18,
+    "headingWeight": 750,
+    "headingTracking": -0.025,
+    "textTracking": 0,
+    "tableBorderWidth": 1
+  }
+}

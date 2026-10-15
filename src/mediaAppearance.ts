@@ -1,7 +1,8 @@
-export type MediaAppearance='original'|'invert-dark'|'auto'|'contrast';
+export type MediaAppearance='original'|'invert-dark'|'auto'|'monochrome'|'contrast';
 export function mediaFilter(mode:MediaAppearance|undefined,dark:boolean,_separation=1.25):string {
   if(mode==='invert-dark')return dark?'invert(1) hue-rotate(180deg)':'none';
-  if(mode==='auto')return 'url("#supermd-media-tone")';
+  if(mode==='monochrome')return 'url("#supermd-media-tone")';
+  if(mode==='auto')return 'url("#supermd-media-adapt")';
   // Contrast means separation from the surrounding page, not pixel processing.
   return 'none';
 }

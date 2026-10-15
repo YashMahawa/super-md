@@ -9,7 +9,7 @@ export function svgImage(source: string): string {
     if (/^(?:href|xlink:href)$/i.test(attribute.name) && !/^(?:#|data:image\/)/.test(attribute.value)) throw new Error("External SVG resources must be embedded first.");
     if (/url\(\s*['"]?(?:https?:|\/\/|file:)/i.test(attribute.value)) throw new Error("External SVG resources must be embedded first.");
   }
-  if (/url\(\s*['"]?(?:https?:|\/\/|file:)|@import/i.test(root.querySelector("style")?.textContent || "")) throw new Error("External SVG styles are not allowed.");
+  if (Array.from(root.querySelectorAll("style")).some(style=>/url\(\s*['"]?(?:https?:|\/\/|file:)|@import/i.test(style.textContent || ""))) throw new Error("External SVG styles are not allowed.");
   root.setAttribute("xmlns", "http://www.w3.org/2000/svg");
   return new XMLSerializer().serializeToString(root);
 }

@@ -19,10 +19,11 @@ import CopyCode from "./CopyCode";
 import CodeBlockBoundary from "./CodeBlockBoundary";
 import {DocumentAppearance} from '../documentAppearance';
 import {svgDataBackdrop} from '../svgImage';
+import {adaptSvgData} from '../svgTheme';
 
 const MermaidDiagram = lazy(() => import("./MermaidDiagram"));
 function ThemedChart({source,dark}:{source:string;dark:boolean}) {const theme=useContext(DocumentAppearance);return <InteractiveChart source={source} dark={theme?.dark??dark}/>;}
-function ThemedSvg({source,dark}:{source:string;dark:boolean}) {const theme=useContext(DocumentAppearance);return <SvgDiagram source={source} dark={theme?.dark??dark} appearance={theme?.svgAppearance} ink={theme?.svgAppearance==='auto'?theme.ink:theme?.text}/>;}
+function ThemedSvg({source,dark}:{source:string;dark:boolean}) {const theme=useContext(DocumentAppearance);return <SvgDiagram source={source} dark={theme?.dark??dark} appearance={theme?.svgAppearance} ink={theme?.svgAppearance==='auto'?theme.ink:theme?.text} colors={theme?.colors}/>;}
 function ThemedMermaid({source,dark}:{source:string;dark:boolean}) {const theme=useContext(DocumentAppearance);return <MermaidDiagram source={source} dark={theme?.dark??dark}/>;}
 function remarkTaskPositions() {
   return (tree:unknown)=>{let index=0;visit(tree as never,'listItem',(node:any)=>{if(typeof node.checked==='boolean')node.data={...node.data,hProperties:{...node.data?.hProperties,'data-task-index':index++}};});};
@@ -97,6 +98,8 @@ function AssetImage({ src = "", alt = "", documentPath, trustedImageHosts, onTru
   const [error, setError] = useState("");
   const [selected, setSelected] = useState(false);
   const svgBacking=useMemo(()=>svgDataBackdrop(resolved),[resolved]);
+  const appearance=useContext(DocumentAppearance);
+  const adaptedSource=useMemo(()=>appearance?.svgAppearance==='auto'&&svgBacking?adaptSvgData(resolved,appearance.colors??{},appearance.dark):resolved,[resolved,svgBacking,appearance]);
   const allowed = allowOnce || trustedImageHosts.includes(host);
   useEffect(() => { setAllowOnce(false); }, [src]);
   useEffect(() => {
@@ -123,7 +126,7 @@ function AssetImage({ src = "", alt = "", documentPath, trustedImageHosts, onTru
   if (error) return <span className="image-error" role="img" aria-label={alt || "Image unavailable"}>Image unavailable: {alt || src}<small>{error}</small></span>;
   if (!resolved) return <span className="image-loading" role="status">Loading image…</span>;
   return <span className={`note-image ${selected ? "is-selected" : ""}`} data-note-image-source={src} tabIndex={0} aria-label={`Image controls: ${alt || "Image"}`} onFocus={() => setSelected(true)} onBlur={(event) => { if (!event.currentTarget.contains(event.relatedTarget)) setSelected(false); }} onClick={(event) => { event.stopPropagation(); setSelected(true); event.currentTarget.focus(); }} onKeyDown={(event) => { if (event.key === "Escape") { setSelected(false); event.stopPropagation(); } }}>
-    <img draggable={false} data-media-kind={resolved.startsWith('data:image/svg+xml')?'svg':'image'} data-light-ink={svgBacking==='#222026'?'true':undefined} style={svgBacking?{'--svg-contrast-backing':svgBacking} as React.CSSProperties:undefined} src={resolved} alt={alt} loading="lazy" onError={() => setError("The image could not be decoded or loaded.")} />
+    <img draggable={false} data-media-adapted={appearance?.svgAppearance==='auto'&&svgBacking?'true':undefined} data-media-kind={resolved.startsWith('data:image/svg+xml')?'svg':'image'} data-light-ink={svgBacking==='#222026'?'true':undefined} style={svgBacking?{'--svg-contrast-backing':svgBacking} as React.CSSProperties:undefined} src={adaptedSource} alt={alt} loading="lazy" onError={() => setError("The image could not be decoded or loaded.")} />
     {selected && <span className="image-edit-tools" role="toolbar" aria-label="Selected image"><button onClick={(event) => { event.stopPropagation(); window.dispatchEvent(new CustomEvent("supermd-image-edit", { detail: { action: "replace", image: event.currentTarget.closest("[data-note-image-source]") } })); }}>Replace</button><button onClick={(event) => { event.stopPropagation(); window.dispatchEvent(new CustomEvent("supermd-image-edit", { detail: { action: "remove", image: event.currentTarget.closest("[data-note-image-source]") } })); }}>Remove</button></span>}
   </span>;
 }

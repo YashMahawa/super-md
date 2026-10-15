@@ -245,13 +245,13 @@ private object NoMotionScheme : MotionScheme {
         val wide = displayIsLarge && maxWidth >= 720.dp && maxHeight >= 400.dp
         val actualMode = if (!wide && state.mode == "split") "live" else state.mode
         val readerContent=remember {arrayOfNulls<String>(1)}
-        LaunchedEffect(readerReady, state.active, actualMode, dark, state.fullscreen, state.font, state.size, state.widthPercent,state.lineHeight,state.spellCheck,state.grammarCheck,state.restorePosition,state.centerLock,state.imageAppearance,state.svgAppearance,state.imageContrast,state.customTheme,tokens, hinge, motion) {
+        LaunchedEffect(readerReady, state.active, actualMode, dark, state.fullscreen, state.font, state.size, state.widthPercent,state.lineHeight,state.spellCheck,state.grammarCheck,state.restorePosition,state.centerLock,state.imageAppearance,state.svgAppearance,state.imageContrast,state.customTheme,state.patternKind,state.patternOpacity,state.patternSize,state.patternSpacing,tokens, hinge, motion) {
             if (!readerReady) readerNote[0] = null
             if (readerReady) {
                 val note = state.active
                 val payload = JSONObject().put("id", note.id).apply { if (readerNote[0] == note.id && (readerContent[0] === note.content || model.readerEcho[note.id] === note.content)) put("contentUnchanged", true) else put("content", note.content) }.put("path", note.uri ?: note.id).put("mode", actualMode).put("dark", dark).put("fullscreen", state.fullscreen).put("font", state.font).put("size", state.size).put("widthPercent",state.widthPercent).put("lineHeight",state.lineHeight).put("spellCheck",state.spellCheck).put("grammarCheck",state.grammarCheck).put("restorePosition",state.restorePosition).put("centerLock",state.centerLock).put("imageAppearance",state.imageAppearance).put("svgAppearance",state.svgAppearance).put("imageContrast",state.imageContrast).put("colors", tokens).put("zoom", state.zoom).put("motion", motion)
                 payload.put("readingLocation",model.readingLocation(note.uri))
-                payload.put("customStyle",themeStyle(themeDocument(state.customTheme),if(state.fullscreen)state.fullscreenTheme else state.theme,dark))
+                payload.put("customStyle",themeStyle(themeDocument(state.customTheme),if(state.fullscreen)state.fullscreenTheme else state.theme,dark,state.patternKind,state.patternOpacity,state.patternSize,state.patternSpacing))
                 web?.evaluateJavascript("document.documentElement.dataset.platform='android';window.supermdLoad?.($payload)", null)
                 readerNote[0] = note.id
                 readerContent[0] = note.content
@@ -282,7 +282,7 @@ private object NoMotionScheme : MotionScheme {
         // still dismisses an already-open drawer.
         ModalNavigationDrawer(drawerState = drawer, gesturesEnabled = drawer.isOpen && !state.fullscreen, drawerContent = {
             ModalDrawerSheet(modifier = Modifier.widthIn(max = 340.dp)) {
-                Column(Modifier.fillMaxHeight().safeDrawingPadding().padding(horizontal = 16.dp)) {
+                Column(Modifier.fillMaxHeight().themeArtwork(state,"sidebar").safeDrawingPadding().padding(horizontal = 16.dp)) {
                     Text("Your files", style = MaterialTheme.typography.headlineSmall, modifier = Modifier.padding(vertical = 20.dp))
                     SingleChoiceSegmentedButtonRow(Modifier.fillMaxWidth().padding(bottom=12.dp)) {listOf("folder" to "Folder","contents" to "Contents").forEachIndexed {index,entry->SegmentedButton(selected=sidebarSection==entry.first,onClick={sidebarSection=entry.first},shape=SegmentedButtonDefaults.itemShape(index,2),colors=SegmentedButtonDefaults.colors(activeContainerColor=palette.primary,activeContentColor=palette.onPrimary)){Text(entry.second)}}}
                     Button(onClick = { open.launch(arrayOf("text/*", "application/octet-stream", "application/vnd.supermd.smd", "application/vnd.supermd.fmd")); scope.launch { drawer.close() } }, shapes = ButtonDefaults.shapes(), modifier = Modifier.fillMaxWidth()) { Icon(Icons.Rounded.Description, null); Spacer(Modifier.width(8.dp)); Text("Open note") }
@@ -316,8 +316,8 @@ private object NoMotionScheme : MotionScheme {
                     Column(Modifier.fillMaxWidth().zIndex(2f).onSizeChanged {chromeHeight=it.height}
                         .graphicsLayer {translationY=-size.height*(1f-chromeReveal);alpha=chromeReveal}
                         .then(if(chromeShown) Modifier else Modifier.clearAndSetSemantics {})
-                        .background(palette.surfaceContainerLow)) {
-                        TopAppBar(windowInsets=WindowInsets.statusBarsIgnoringVisibility.union(WindowInsets.displayCutout).only(WindowInsetsSides.Top+WindowInsetsSides.Horizontal), colors = TopAppBarDefaults.topAppBarColors(containerColor = palette.surfaceContainerLow), title = { Column { Text(state.active.name, maxLines = 1, overflow = TextOverflow.Ellipsis, style = MaterialTheme.typography.titleMedium); Text(if (state.active.dirty) "Draft recovered automatically" else if (state.active.uri != null) "Saved" else "Local draft", style = MaterialTheme.typography.labelSmall, color = palette.onSurfaceVariant) } }, navigationIcon = { IconButton(onClick = { if (state.fullscreen) contentsShown=true else { scope.launch { drawer.open() }; state.folder?.let { if (state.files.isEmpty()) model.listFolder(android.net.Uri.parse(it), "") } } }) { Icon(painterResource(if(state.fullscreen) R.drawable.symbol_contents else R.drawable.symbol_sidebar), if(state.fullscreen) "Show contents" else "Open files") } }, actions = {
+                        .background(palette.surfaceContainerLow).themeArtwork(state,"toolbar")) {
+                        TopAppBar(windowInsets=WindowInsets.statusBarsIgnoringVisibility.union(WindowInsets.displayCutout).only(WindowInsetsSides.Top+WindowInsetsSides.Horizontal), colors = TopAppBarDefaults.topAppBarColors(containerColor = Color.Transparent), title = { Column { Text(state.active.name, maxLines = 1, overflow = TextOverflow.Ellipsis, style = MaterialTheme.typography.titleMedium); Text(if (state.active.dirty) "Draft recovered automatically" else if (state.active.uri != null) "Saved" else "Local draft", style = MaterialTheme.typography.labelSmall, color = palette.onSurfaceVariant) } }, navigationIcon = { IconButton(onClick = { if (state.fullscreen) contentsShown=true else { scope.launch { drawer.open() }; state.folder?.let { if (state.files.isEmpty()) model.listFolder(android.net.Uri.parse(it), "") } } }) { Icon(painterResource(if(state.fullscreen) R.drawable.symbol_contents else R.drawable.symbol_sidebar), if(state.fullscreen) "Show contents" else "Open files") } }, actions = {
                             IconButton(onClick = saveAction) { Icon(painterResource(R.drawable.symbol_save), "Save note") }
                             IconButton(onClick = { sharing = false; exporting = true }, enabled = readerReady && !state.busy) { Icon(painterResource(R.drawable.symbol_export), "Export") }
                             StudyIcon(if(state.fullscreen) "Exit fullscreen" else "Fullscreen study", if(state.fullscreen) R.drawable.symbol_fullscreen_exit else R.drawable.symbol_fullscreen) { model.fullscreen(!state.fullscreen) }
@@ -507,8 +507,27 @@ private class NoteDestination(mime: String, private val preferred: () -> String)
             SettingsSection("Custom theme") {
                 Text(themeDocument(state.customTheme)?.optString("name")?:"Built-in appearance",style=MaterialTheme.typography.titleMedium)
                 Text("Theme files customize controls, colors, reading typography and background patterns. Reading font and text size remain yours. Invalid edits keep the last valid appearance.",style=MaterialTheme.typography.bodySmall)
-                FlowRow(horizontalArrangement=Arrangement.spacedBy(8.dp)){FilledTonalButton(onClick=importTheme){Text("Import theme…")};OutlinedButton(onClick=exportTheme){Text(if(state.customTheme.isBlank())"Export template…" else "Export theme…")}}
+                FlowRow(horizontalArrangement=Arrangement.spacedBy(8.dp)){FilledTonalButton(onClick=importTheme){Text("Import theme…")};OutlinedButton(onClick=exportTheme){Text(if(state.customTheme.isBlank())"Export template…" else "Export theme…")};if(state.customTheme.isNotBlank())OutlinedButton(onClick={model.shareCustomTheme {send->runCatching {activity.startActivity(Intent.createChooser(send,"Share theme"))}.onFailure {model.fail("No app could share the theme: ${it.message}")}}}){Text("Share theme…")}}
                 if(state.customTheme.isNotBlank())FlowRow(horizontalArrangement=Arrangement.spacedBy(8.dp)){TextButton(onClick=model::reloadCustomTheme){Text("Reload file")};TextButton(onClick=model::resetCustomTheme){Text("Reset to built-in")}}
+                if(state.customTheme.isNotBlank()) {
+                    val themeAppearance=themeStyle(themeDocument(state.customTheme),state.theme,when(state.theme){"dark","black"->true;"light"->false;else->androidx.compose.foundation.isSystemInDarkTheme()},state.patternKind,state.patternOpacity,state.patternSize,state.patternSpacing)
+                    val background=themeAppearance.optJSONObject("background")?:JSONObject()
+                    if(state.patternOpacity<0f)themeAppearance.optJSONObject("artwork")?.optJSONObject("reader")?.let {background.put("opacity",it.optDouble("opacity",.06))}
+                    Text("Reading background",style=MaterialTheme.typography.titleMedium)
+                    Choice("Pattern",background.optString("pattern","none"),listOf("none" to "None","paws" to "Cat paws","dots" to "Dots","grid" to "Grid","diagonal" to "Diagonal","gradient" to "Gradient")){model.readingPreference("patternKind",it)}
+                    Text("Visibility · ${(background.optDouble("opacity",.06)*100).toInt()}%")
+                    StudySlider(value=background.optDouble("opacity",.06).toFloat(),onCommit={model.themeBackgroundPreference("patternOpacity",it)},valueRange=0f..0.25f)
+                    if(background.optString("pattern")=="paws") {
+                        Text("Paw size · ${background.optInt("size",24)} px")
+                        StudySlider(value=background.optDouble("size",24.0).toFloat(),onCommit={model.themeBackgroundPreference("patternSize",it)},valueRange=8f..64f)
+                    }
+                    if(background.optString("pattern")!="gradient") {
+                        Text("Pattern spacing · ${background.optInt("spacing",24)} px")
+                        StudySlider(value=background.optDouble("spacing",24.0).toFloat(),onCommit={model.themeBackgroundPreference("patternSpacing",it)},valueRange=12f..192f)
+                    }
+                    Text("Viewing only. Your theme file, notes and PDF exports are unchanged.",style=MaterialTheme.typography.bodySmall)
+                    TextButton(onClick=model::resetThemeBackground){Text("Use theme's background settings")}
+                }
                 Text("Edit the exported JSON with an editor or AI, then import it. Providers that support notifications update automatically; otherwise tap Reload.",style=MaterialTheme.typography.bodySmall)
                 TextButton(onClick={runCatching {activity.startActivity(Intent(Intent.ACTION_VIEW,android.net.Uri.parse("https://github.com/YashMahawa/super-md/blob/main/docs/THEMING.md")))}.onFailure {model.fail("No browser could open the theme guide. See docs/THEMING.md in the project repository.")}}){Text("Theme authoring guide")}
             }
@@ -531,12 +550,12 @@ private class NoteDestination(mime: String, private val preferred: () -> String)
                 FilledTonalButton(onClick=chooseNoteLocation,modifier=Modifier.fillMaxWidth()){Icon(Icons.Rounded.FolderOpen,null);Text(if(noteLocation.isBlank())"Downloads" else android.net.Uri.decode(noteLocation.substringAfterLast('/')),Modifier.padding(start=8.dp),maxLines=1,overflow=TextOverflow.Ellipsis)}
             }
             SettingsSection("Images & diagrams") {
-                val choices=listOf("original" to "Original (off)","invert-dark" to "Invert in dark themes","auto" to "Auto adapt to theme","contrast" to "Separate from theme")
+                val choices=listOf("original" to "Original (off)","invert-dark" to "Invert in dark themes","auto" to "Auto adapt to theme","monochrome" to "Theme monochrome","contrast" to "Separate from theme")
                 Choice("Image appearance",state.imageAppearance,choices){model.readingPreference("imageAppearance",it)}
                 Choice("SVG appearance",state.svgAppearance,choices){model.readingPreference("svgAppearance",it)}
                 Text("Separation strength · ${"%.2f".format(state.imageContrast)}")
                 StudySlider(value=state.imageContrast,onCommit=model::imageContrast,valueRange=1f..2f)
-                Text("Auto recolours every image with the accent and theme. Separation preserves original colours and adds a readable backing and edge. Original files and PDF exports are unchanged.",style=MaterialTheme.typography.bodySmall)
+                Text("Auto adapts neutral ink and paper, preserving readable colours. Theme monochrome recolours the whole image. Separation preserves original colours and adds a readable backing and edge. Original files and PDF exports are unchanged.",style=MaterialTheme.typography.bodySmall)
             }
             SettingsSection("Writing assistance") {
                 Row(verticalAlignment=Alignment.CenterVertically){Text("Spell check",Modifier.weight(1f));Switch(checked=state.spellCheck,onCheckedChange={model.writing(spellCheck=it)})}

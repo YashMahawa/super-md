@@ -4,9 +4,49 @@ import androidx.compose.material3.ColorScheme
 import androidx.compose.ui.graphics.Color
 import org.json.JSONObject
 
-internal fun themeDocument(raw:String):JSONObject?=runCatching {JSONObject(raw)}.getOrNull()
+internal const val MAX_THEME_BYTES=2*1024*1024
+// Parsed documents are read-only; callers clone before modifying controls or
+// exporting. Keep one active theme, not a parsed copy on every recomposition.
+private var cachedThemeRaw=""
+private var cachedTheme:JSONObject?=null
+@Synchronized internal fun themeDocument(raw:String):JSONObject? {
+    if(raw!=cachedThemeRaw){cachedThemeRaw=raw;cachedTheme=if(raw.length<=MAX_THEME_BYTES)runCatching {JSONObject(raw)}.getOrNull()else null}
+    return cachedTheme
+}
+internal fun artworkImage(theme:JSONObject?,art:JSONObject?):String {
+    val image=art?.optString("image").orEmpty()
+    return if(image.startsWith("asset:"))theme?.optJSONObject("assets")?.optString(image.removePrefix("asset:")).orEmpty()else image
+}
 internal fun themeVariant(theme:JSONObject?,mode:String,dark:Boolean):JSONObject?=theme?.optJSONObject("variants")?.optJSONObject(if(mode=="black")"black" else if(dark)"dark" else "light")
-internal fun themeStyle(theme:JSONObject?,mode:String,dark:Boolean)=JSONObject().put("colors",themeVariant(theme,mode,dark)?.optJSONObject("colors")?:JSONObject()).put("background",themeVariant(theme,mode,dark)?.optJSONObject("background")?:JSONObject.NULL).put("metrics",theme?.optJSONObject("metrics")?:JSONObject())
+internal fun themeStyle(theme:JSONObject?,mode:String,dark:Boolean,kind:String="",opacity:Float=-1f,size:Float=0f,spacing:Float=0f,resolveAssets:Boolean=true):JSONObject {
+    val selected=themeVariant(theme,mode,dark)
+    val source=selected?.optJSONObject("background")
+    val background=if(theme==null)null else source?.let {JSONObject(it.toString())}?:JSONObject().put("pattern","none").put("color",selected?.optJSONObject("colors")?.optString("primary","#82708e")?:"#82708e")
+    background?.apply {
+        if(kind.isNotEmpty())put("pattern",kind)
+        if(opacity>=0f)put("opacity",opacity.toDouble())
+        if(size>0f)put("size",size.toDouble())
+        if(spacing>0f)put("spacing",spacing.toDouble())
+    }
+    val artwork=selected?.optJSONObject("artwork")?.let {JSONObject(it.toString())}?:JSONObject()
+    if(resolveAssets){
+        // Chrome artwork is painted natively. Do not send its potentially large
+        // image strings across the WebView bridge a second/third time.
+        artwork.remove("sidebar");artwork.remove("toolbar")
+        artwork.optJSONObject("reader")?.let {it.put("image",artworkImage(theme,it))}
+    }
+    if(opacity>=0f)artwork.optJSONObject("reader")?.put("opacity",opacity.toDouble())
+    return JSONObject().put("colors",selected?.optJSONObject("colors")?:JSONObject()).put("background",background?:JSONObject.NULL).put("artwork",artwork).put("metrics",theme?.optJSONObject("metrics")?:JSONObject())
+}
+internal fun themeForSharing(state:StudioState):String {
+    val theme=JSONObject(state.customTheme.ifBlank {themeTemplate})
+    val variants=theme.optJSONObject("variants")?:return theme.toString()
+    for(mode in listOf("light","dark","black"))variants.optJSONObject(mode)?.apply {
+        val style=themeStyle(theme,mode,mode!="light",state.patternKind,state.patternOpacity,state.patternSize,state.patternSpacing,resolveAssets=false)
+        put("background",style.opt("background"));if(style.getJSONObject("artwork").length()>0)put("artwork",style.getJSONObject("artwork"))
+    }
+    return theme.toString()
+}
 internal fun customThemeColors(base:ColorScheme,theme:JSONObject?,mode:String,dark:Boolean):ColorScheme {
     val roles=themeVariant(theme,mode,dark)?.optJSONObject("colors")?:return base
     if(listOf("primary","on-primary","primary-container","on-primary-container","surface","surface-low","surface-high","text","muted","outline").none {roles.has(it)})return base

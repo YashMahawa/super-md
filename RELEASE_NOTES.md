@@ -1,30 +1,33 @@
-# Super MD 0.6.1
+# Super MD 0.6.2
 
-## Portable custom themes
+## Portable artwork themes
 
-- Import an editable theme JSON file on desktop and Android. One format controls native semantic colors and the reading pane, with independent light, dark and pure-black variants.
-- Customize headings, links, code blocks, callout families, component/content corners, paragraph spacing, heading weight/tracking, text tracking and table borders. Reading fonts, sizes, width and zoom stay user-controlled.
-- Add subtle dot, grid, diagonal or gradient backgrounds without images, scripts, network requests or animated overlays.
-- Export an editable template or the active theme. The authoring guide documents every field, role, limit and platform behavior, including an AI-ready authoring request. Three example themes are bundled.
-- Desktop follows source-file edits using filesystem notifications, including atomic saves. Android observes document providers where supported, with manual Reload and resume-time retry otherwise. Invalid/partial edits preserve the last valid theme; Reset to built-in never deletes the original file or notes.
-- Desktop and Android share the same bounded native validator. Unknown fields, unsafe color expressions, unsupported versions and oversized files are rejected. Contrast safeguards protect native text and controls.
+- Use both vector art and detailed images: static SVG, PNG, JPEG and WebP can decorate the reader, sidebar and top bars. Artwork is optional; the built-in appearance stays clean.
+- Reuse embedded assets across areas and light/dark variants without copying the same image into every entry. Control placement, cover/contain fit and visibility. Themes work offline and travel as one file between desktop and Android.
+- Add cat-paw backgrounds with adjustable visibility, motif size and spacing, alongside dots, grids, diagonal textures and gradients. Settings adjustments are remembered without modifying the original theme file.
+- Import, export and share the active theme with its background adjustments. Android opens its native share sheet; desktop saves a portable theme file for sharing.
+- The theme authoring guide documents the format, examples, limits and AI-friendly editing workflow. No CSS plugins, scripts or remote asset downloads are required.
 
-## Reliability and verification
+## Better image adaptation
 
-- Auto adapt recolours both photos and SVGs using the current accent and page colours, preserving shading and transparency with guarded contrast. Separation mode preserves the original pixels and adds a readable backing and edge instead of increasing image contrast. Original appearance remains the default; source assets and PDF output are unchanged.
-- Recent notes show a small, lightweight pin only when pinned. Use the desktop context menu or Android long press to pin or unpin; there is no permanent pin button on every row.
-- Centre lock sits immediately after the fullscreen button in both native toolbars, including fullscreen. Enabled by default and remembered between launches, it keeps the document horizontally centered during scrolling and zooming without blocking vertical movement, selection, or independent graph/image navigation.
-- Theme palette changes keep the existing large-note rendering/cache path instead of reparsing Markdown/math. Typography updates use reading-anchor restoration. Removing optional reader preferences is now recognized correctly, including theme reset.
-- Automatic desktop update checks no longer replace a useful note status with a raw offline network error or cancel a pending close operation. Explicit checks still report a friendly offline status.
-- Graph panning no longer drops queued movement when a resize or appearance update renders before the next animation frame. A deterministic regression test covers this input/render race.
-- Packaged-app launch checks now import a theme through the real native validator and verify the reader's pattern/typography alongside the existing presented-pixel, Markdown, math, chart, portable-note and PDF assertions.
-- Android instrumentation verifies shared validation, native contrast, actual imported-accent pixels and reader styling, invalid-edit preservation and reset. Existing gesture, selection, hyperlink, export and painting assertions remain enabled.
-- CI now covers Intel macOS before tagging as well as Apple Silicon, Linux and Windows. Debug/instrumentation sources receive their own lint check; desktop CI and release builds share architecture-isolated dependency caches without skipping tests or packaged launch checks.
-- macOS disk-image creation retries only transient “Resource busy” errors, with a bounded retry count. Other packaging failures still fail the release.
-- Native font-search popups close with their Settings or Export/Share owner, even though the searchable list lives in the window overlay.
+- Auto adapt preserves colours while adapting neutral ink and paper to the current accent and page. SVG labels are checked against their local node backgrounds; poorly contrasted marks and arrowheads are adjusted without flattening all colours.
+- Theme monochrome is a separate option for the previous full-image accent duotone effect. Original remains the default; theme-relative separation preserves source pixels and adds readable backing/edges.
+- Existing images, SVGs, notes and PDF source assets are never rewritten by viewing adjustments. An open image keeps its zoom when the theme changes.
 
-Themes are viewing preferences, not embedded in portable notes. PDF layout remains controlled by Export/Share; custom background patterns and reading metrics do not alter PDF output. Native Android component shapes follow Material's platform behavior rather than replacing every control with desktop geometry.
+## Desktop polish and navigation
 
-This is deliberately separate from the published [0.5.2 reliability release](https://github.com/YashMahawa/super-md/releases/tag/v0.5.2), which remains available for rollback. All its document-safety, reading-position, recents, provider-notification and graphics-packaging improvements are retained. On Android, use Reset to built-in before considering a version downgrade; normal installers prevent downgrades and uninstalling may remove private recovery data.
+- Note context menus have opaque, bordered surfaces and consistent hit areas. Duplicate path hints are removed and remaining hints disappear while menus are open.
+- Recent notes have reliable hover/focus highlights and a bounded Pin/Unpin context menu; lightweight pin indicators appear only on pinned entries.
+- Long-document heading jumps now follow late font/layout changes briefly, then yield immediately to deliberate scrolling or zooming instead of snapping back.
+- Artwork and palette changes do not reparse Markdown, replace math nodes or reset reading zoom.
+
+## Bounded rendering and safety
+
+- A theme is limited to 2 MiB, with up to eight reusable images. Rasters are capped at 512 KiB and four megapixels; static SVG is capped at 128 KiB and 5000 XML nodes. Animated and executable content, external resources and missing asset references are rejected.
+- Android shares a bounded drawing cache across native areas, downsamples native raster decorations and avoids sending unused sidebar/toolbar images through the reader bridge.
+- Regression coverage includes actual native and browser artwork pixels, raster type checks, import/share round trips, document identity/zoom retention, menu opacity and tooltip suppression. Android tests run on emulators, not the user's phone.
+- Private detailed-art evaluation samples are not bundled in the repository or release. Only share artwork you have permission to redistribute.
+
+This is a normal stable update. Earlier published installers remain available for rollback. Themes are viewing preferences, not content embedded in SMD notes or PDF wallpaper. Older versions safely reject unsupported theme extensions.
 
 macOS packages remain ad-hoc signed rather than notarized. Windows installers are not code-signed.

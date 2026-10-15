@@ -34,7 +34,7 @@ internal fun orderedRecents(notes:List<RecentNote>)=notes.distinctBy {it.uri}.so
 private fun renamedRelative(relative:String?,name:String)=relative?.let {val parent=it.substringBeforeLast('/',"");if(parent.isEmpty())name else "$parent/$name"}
 data class FileEntry(val name: String, val uri: String, val directory: Boolean, val relative: String)
 data class OutlineHeading(val id: String, val title: String, val level: Int, val offset: Int)
-data class StudioState(val centerLock:Boolean=true, val customTheme:String="", val restorePosition:Boolean=true, val startup:String="restore", val imageAppearance:String="original", val svgAppearance:String="original", val imageContrast:Float=1.25f, val spellCheck:Boolean = false, val grammarCheck:Boolean = false, val accent: String = "system", val widthPercent: Float = 100f, val lineHeight: Float = 1.65f, val autosave: Boolean = true, val customFonts: List<String> = emptyList(), val readerOverlay: Boolean = false, val zoomCommand: Long = 0, val tabs: List<Note> = listOf(Note(name = "Welcome.md", content = sample, saved = sample)), val closedTabs: List<Note> = emptyList(), val activeId: String = "", val mode: String = "live", val fullscreen: Boolean = false, val normalZoom: Float = 100f, val fullscreenZoom: Float = 100f, val theme: String = "system", val fullscreenTheme: String = "black", val motion: Boolean = true, val font: String = "Manrope", val size: Float = 15f, val folder: String? = null, val files: List<FileEntry> = emptyList(), val busy: Boolean = false, val message: String? = null, val error: String? = null, val welcomed: Boolean = false, val pdf: String = "{\"pageSize\":\"a4\",\"margin\":18,\"fontSize\":10.0,\"lineHeight\":1.45,\"fontFamily\":\"Manrope\",\"pageNumbers\":true}") {
+data class StudioState(val centerLock:Boolean=true, val customTheme:String="", val patternKind:String="", val patternOpacity:Float=-1f, val patternSize:Float=0f, val patternSpacing:Float=0f, val restorePosition:Boolean=true, val startup:String="restore", val imageAppearance:String="original", val svgAppearance:String="original", val imageContrast:Float=1.25f, val spellCheck:Boolean = false, val grammarCheck:Boolean = false, val accent: String = "system", val widthPercent: Float = 100f, val lineHeight: Float = 1.65f, val autosave: Boolean = true, val customFonts: List<String> = emptyList(), val readerOverlay: Boolean = false, val zoomCommand: Long = 0, val tabs: List<Note> = listOf(Note(name = "Welcome.md", content = sample, saved = sample)), val closedTabs: List<Note> = emptyList(), val activeId: String = "", val mode: String = "live", val fullscreen: Boolean = false, val normalZoom: Float = 100f, val fullscreenZoom: Float = 100f, val theme: String = "system", val fullscreenTheme: String = "black", val motion: Boolean = true, val font: String = "Manrope", val size: Float = 15f, val folder: String? = null, val files: List<FileEntry> = emptyList(), val busy: Boolean = false, val message: String? = null, val error: String? = null, val welcomed: Boolean = false, val pdf: String = "{\"pageSize\":\"a4\",\"margin\":18,\"fontSize\":10.0,\"lineHeight\":1.45,\"fontFamily\":\"Manrope\",\"pageNumbers\":true}") {
     val active get() = tabs.find { it.id == activeId } ?: tabs.first()
     val zoom get() = if (fullscreen) fullscreenZoom else normalZoom
 }
@@ -115,7 +115,7 @@ class StudioViewModel(app: Application, val workspaceKey: String = "main") : And
         if(key=="customTheme")mutable.value=mutable.value.copy(customTheme=prefs.getString("customTheme","")?:"")
         if(key=="customThemeSource")observeCustomTheme()
         if (key == "recent") {recentMutable.value=loadRecent();observeActive()}
-        if(key in setOf("restorePosition","centerLock","startup","imageAppearance","svgAppearance","imageContrast"))mutable.value=readingPreferences(mutable.value)
+        if(key in setOf("restorePosition","centerLock","startup","imageAppearance","svgAppearance","imageContrast","patternKind","patternOpacity","patternSize","patternSpacing"))mutable.value=readingPreferences(mutable.value)
         if (key in setOf("accent", "theme", "fullTheme", "motion", "font", "size", "pdf", "welcomed", "widthPercent", "lineHeight", "autosave", "fonts", "spellCheck", "grammarCheck")) {
             mutable.value = mutable.value.copy(theme = prefs.getString("theme", "system")!!, fullscreenTheme = prefs.getString("fullTheme", "black")!!, motion = prefs.getBoolean("motion", true), font = prefs.getString("font", "Manrope")!!, size = prefs.getFloat("size", 15f), pdf = prefs.getString("pdf", null) ?: StudioState().pdf, welcomed = prefs.getBoolean("welcomed", false))
                 .copy(spellCheck=prefs.getBoolean("spellCheck",false),grammarCheck=prefs.getBoolean("grammarCheck",false),accent = prefs.getString("accent","system")!!, widthPercent = prefs.getFloat("widthPercent",100f),lineHeight = prefs.getFloat("lineHeight",1.65f),autosave = prefs.getBoolean("autosave",true),customFonts = fonts.families)
@@ -141,10 +141,10 @@ class StudioViewModel(app: Application, val workspaceKey: String = "main") : And
                 val canonical=withContext(Dispatchers.IO){
                     val bytes=resolver.openInputStream(uri)?.use {input->
                         val output=java.io.ByteArrayOutputStream();val buffer=ByteArray(4096)
-                        while(output.size()<=65536){val count=input.read(buffer,0,minOf(buffer.size,65537-output.size()));if(count<0)break;if(count==0)error("Theme provider returned no data");output.write(buffer,0,count)}
+                        while(output.size()<=MAX_THEME_BYTES){val count=input.read(buffer,0,minOf(buffer.size,MAX_THEME_BYTES+1-output.size()));if(count<0)break;if(count==0)error("Theme provider returned no data");output.write(buffer,0,count)}
                         output.toByteArray()
                     }?:error("Cannot read theme")
-                    require(bytes.size<=65536){"Theme exceeds 64 KB"}
+                    require(bytes.size<=MAX_THEME_BYTES){"Theme exceeds 2 MB"}
                     val raw=Charsets.UTF_8.newDecoder().onMalformedInput(java.nio.charset.CodingErrorAction.REPORT).onUnmappableCharacter(java.nio.charset.CodingErrorAction.REPORT).decode(java.nio.ByteBuffer.wrap(bytes)).toString()
                     val response=JSONObject(PdfEngine.validateTheme(raw))
                     require(!response.has("error")){response.optString("error")}
@@ -160,11 +160,23 @@ class StudioViewModel(app: Application, val workspaceKey: String = "main") : And
         themeJob?.invokeOnCompletion {viewModelScope.launch {if(themeReloadPending){themeReloadPending=false;reloadCustomTheme()}}}
     }
     fun exportCustomTheme(uri:Uri)=viewModelScope.launch {
-        val raw=mutable.value.customTheme.ifBlank {themeTemplate}
+        val raw=themeForSharing(mutable.value)
         try{withContext(Dispatchers.IO){resolver.openOutputStream(uri,"wt")?.use {it.write(raw.toByteArray(Charsets.UTF_8))}?:error("Cannot write theme")};mutable.value=mutable.value.copy(message="Theme exported. Edit the JSON and import it to apply.")}
         catch(error:Exception){fail("Could not export theme: ${error.message}")}
     }
     private var metadataJob:Job?=null
+    fun shareCustomTheme(ready:(Intent)->Unit)=viewModelScope.launch {
+        try {
+            val raw=themeForSharing(mutable.value)
+            val file=withContext(Dispatchers.IO) {
+                val folder=File(getApplication<Application>().cacheDir,"share/${UUID.randomUUID()}").apply {mkdirs()}
+                File(folder,"Super MD theme.supermd-theme.json").apply {writeText(raw,Charsets.UTF_8)}
+            }
+            val app=getApplication<Application>()
+            val uri=androidx.core.content.FileProvider.getUriForFile(app,"${app.packageName}.share",file)
+            ready(Intent(Intent.ACTION_SEND).setType("application/json").putExtra(Intent.EXTRA_STREAM,uri).addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION).apply {clipData=android.content.ClipData.newUri(resolver,file.name,uri)})
+        } catch(error:Exception){fail("Could not share theme: ${error.message}")}
+    }
     private var listedRelative=""
     private val deletedDrafts=DeletedDraftStore(File(app.filesDir,"deleted-drafts/$workspaceKey"))
     private val documentObserver=object:android.database.ContentObserver(android.os.Handler(android.os.Looper.getMainLooper())) {
@@ -321,10 +333,16 @@ class StudioViewModel(app: Application, val workspaceKey: String = "main") : And
         }
         return s
     }
-    private fun readingPreferences(s:StudioState)=s.copy(centerLock=prefs.getBoolean("centerLock",true),restorePosition=prefs.getBoolean("restorePosition",true),startup=prefs.getString("startup","restore") ?: "restore",imageAppearance=prefs.getString("imageAppearance","original") ?: "original",svgAppearance=prefs.getString("svgAppearance","original") ?: "original",imageContrast=prefs.getFloat("imageContrast",1.25f))
+    private fun readingPreferences(s:StudioState)=s.copy(patternKind=prefs.getString("patternKind","")?:"",patternOpacity=prefs.getFloat("patternOpacity",-1f),patternSize=prefs.getFloat("patternSize",0f),patternSpacing=prefs.getFloat("patternSpacing",0f),centerLock=prefs.getBoolean("centerLock",true),restorePosition=prefs.getBoolean("restorePosition",true),startup=prefs.getString("startup","restore") ?: "restore",imageAppearance=prefs.getString("imageAppearance","original") ?: "original",svgAppearance=prefs.getString("svgAppearance","original") ?: "original",imageContrast=prefs.getFloat("imageContrast",1.25f))
     fun readingPreference(key:String,value:String) {
-        if(key in listOf("imageAppearance","svgAppearance")&&value in listOf("original","invert-dark","auto","contrast") || key=="startup"&&value in listOf("restore","new"))prefs.edit().putString(key,value).apply()
+        if(key=="patternKind"&&value in listOf("","none","paws","dots","grid","diagonal","gradient"))prefs.edit().putString(key,value).apply()
+        if(key in listOf("imageAppearance","svgAppearance")&&value in listOf("original","invert-dark","auto","monochrome","contrast") || key=="startup"&&value in listOf("restore","new"))prefs.edit().putString(key,value).apply()
     }
+    fun themeBackgroundPreference(key:String,value:Float) {
+        val range=when(key){"patternOpacity"->0f..0.25f;"patternSize"->8f..64f;"patternSpacing"->12f..192f;else->return}
+        if(value.isFinite()&&value in range)prefs.edit().putFloat(key,value).apply()
+    }
+    fun resetThemeBackground(){prefs.edit().remove("patternKind").remove("patternOpacity").remove("patternSize").remove("patternSpacing").apply()}
     fun restorePosition(value:Boolean){prefs.edit().putBoolean("restorePosition",value).apply()}
     fun centerLock(value:Boolean){prefs.edit().putBoolean("centerLock",value).apply()}
     fun imageContrast(value:Float){if(value.isFinite())prefs.edit().putFloat("imageContrast",value.coerceIn(1f,2f)).apply()}

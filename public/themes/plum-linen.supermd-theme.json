@@ -1,0 +1,46 @@
+{
+  "format": "supermd-theme",
+  "version": 1,
+  "name": "Plum linen",
+  "accent": "rose",
+  "variants": {
+    "light": {
+      "colors": {
+        "surface": "#e7d9e0",
+        "surface-low": "#dbc7d2",
+        "surface-high": "#ceb0c0",
+        "text": "#392730",
+        "muted": "#694e5d",
+        "primary": "#813d61",
+        "on-primary": "#fff1f7",
+        "primary-container": "#dbafc5",
+        "on-primary-container": "#472036",
+        "outline": "#b28b9f",
+        "heading": "#66304c",
+        "link": "#7c355c",
+        "code-bg": "#ddc9d5",
+        "code-text": "#392730",
+        "code-border": "#b28b9f",
+        "callout-tip": "#38634f",
+        "callout-warning": "#825016"
+      },
+      "background": {
+        "pattern": "diagonal",
+        "color": "#76425c",
+        "opacity": 0.05,
+        "spacing": 18,
+        "angle": 135
+      }
+    }
+  },
+  "metrics": {
+    "controlRadius": 22,
+    "contentRadius": 16,
+    "paragraphSpacing": 1.15,
+    "codePadding": 18,
+    "headingWeight": 750,
+    "headingTracking": -0.025,
+    "textTracking": 0,
+    "tableBorderWidth": 1
+  }
+}

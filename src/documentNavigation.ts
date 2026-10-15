@@ -4,12 +4,12 @@ import remarkParse from "remark-parse";
 import remarkMath from "remark-math";
 import { remarkObsidianMath } from "./obsidianMath";
 import {revealWindowed} from "./windowedSearch";
-import {applyDocumentZoom,invalidateDocumentZoom} from './documentZoom';
-const jumps=new WeakMap<Element,object>();
+import {applyDocumentZoom,invalidateDocumentZoom,refreshDocumentExtent} from './documentZoom';
+const jumps=new WeakMap<Element,{stop:()=>void}>();
 /** A user's zoom/pan wins over the settling frames of a preceding link jump. */
 export function cancelHeadingNavigation(root:Element|null):void {
   if(!root)return;
-  jumps.delete(root);delete (root as HTMLElement).dataset.navigating;
+  jumps.get(root)?.stop();jumps.delete(root);delete (root as HTMLElement).dataset.navigating;
 }
 
 export interface OutlineEntry {id:string;title:string;level:number;offset:number}
@@ -50,7 +50,9 @@ export function navigateToHeading(root:Element,target:string):boolean {
   if(!root.querySelector('[data-windowed-block]'))for (const heading of headings) { const key = heading.dataset.headingKey!, count = counts.get(key) || 0; counts.set(key, count + 1); heading.id = key + (count ? `-${count}` : ""); }
   const heading = headings.find(node => node.id === target) || headings.find(node => node.id === headingSlug(target));
   if (!heading) return true; // Broken local links must not escape into a browser.
-  const token={};jumps.set(root,token);
+  cancelHeadingNavigation(root);
+  let observer:ResizeObserver|undefined,timer=0,frame=0;
+  const token={stop:()=>{observer?.disconnect();window.clearTimeout(timer);cancelAnimationFrame(frame);}};jumps.set(root,token);
   const host=root as HTMLElement;host.dataset.navigating='true';
   revealWindowed(heading);
   // Native scrollIntoView can clamp against the old magnified spacer, or move
@@ -61,14 +63,21 @@ export function navigateToHeading(root:Element,target:string):boolean {
     const mounted=Array.from(root.querySelectorAll<HTMLElement>('[data-heading-key]')).find(node=>node.id===heading.id) || heading;
     revealWindowed(mounted);
     const page=host.querySelector<HTMLElement>('.document-page');
-    if(page){invalidateDocumentZoom(host);applyDocumentZoom(host,Number(page.dataset.scale)*100||100,Number.parseFloat(document.documentElement.style.getPropertyValue('--reading-max-width'))||80);}
+    if(page&&!refreshDocumentExtent(host)){invalidateDocumentZoom(host);applyDocumentZoom(host,Number(page.dataset.scale)*100||100,Number.parseFloat(document.documentElement.style.getPropertyValue('--reading-max-width'))||80,undefined,undefined,undefined,host.dataset.centerLocked==='true');}
     host.scrollTop+=mounted.getBoundingClientRect().top-host.getBoundingClientRect().top-16;
     mounted.tabIndex=-1;mounted.focus({preventScroll:true});
-    if(frames>0)requestAnimationFrame(()=>align(frames-1));
-    else delete host.dataset.navigating;
+    if(frames>0)frame=requestAnimationFrame(()=>align(frames-1));
   };
   align(0);
-  host.dataset.navigating='true';
-  requestAnimationFrame(()=>align(5));
+  frame=requestAnimationFrame(()=>align(5));
+  const page=host.querySelector<HTMLElement>('.document-page');
+  if(page&&typeof ResizeObserver!=='undefined'){
+    observer=new ResizeObserver(()=>{cancelAnimationFrame(frame);frame=requestAnimationFrame(()=>align(0));});
+    observer.observe(page);
+  }
+  // Fonts and lazy neighbouring blocks may settle after the initial six
+  // frames. Observe briefly instead of polling/reflowing the entire note.
+  // User zoom/pan cancels this token immediately and wins over the jump.
+  timer=window.setTimeout(()=>{if(jumps.get(root)===token)cancelHeadingNavigation(root);},1200);
   return true;
 }

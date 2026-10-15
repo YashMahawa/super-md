@@ -31,5 +31,5 @@ Slider {
         border.color: control.colors.text
         Behavior on implicitHeight { enabled: control.motion; SpringAnimation { spring: 5; damping: .85 } }
     }
-    Hint { visible: control.pressed; text: Math.round(control.value).toString() }
+    Hint { requested: control.pressed; text: Math.round(control.value).toString() }
 }

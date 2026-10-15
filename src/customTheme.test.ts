@@ -20,3 +20,15 @@ it('palette-only updates have identical layout keys',()=>{
   const b=applyCustomStyle(root,{colors:{heading:'#225544'},metrics:{headingWeight:700}},base);
   expect(a).toBe(b);
 });
+it('renders safe paw tiles with independently adjustable size, opacity and spacing without layout changes',()=>{
+  const root=document.documentElement;
+  const first=applyCustomStyle(root,{background:{pattern:'paws',color:'#97674b',opacity:.12,spacing:96,size:28,angle:342}},base);
+  const uri=root.style.getPropertyValue('--custom-pattern');
+  expect(uri).toContain('data:image/svg+xml');
+  const svg=decodeURIComponent(uri.slice(uri.indexOf(',')+1,uri.lastIndexOf('"')));
+  expect(svg).toContain('opacity="0.12"');expect(svg).toContain('rotate(342)');expect(svg).toContain('scale(0.875)');
+  expect(root.style.getPropertyValue('--custom-pattern-size')).toBe('96px 96px');
+  const second=applyCustomStyle(root,{background:{pattern:'paws',color:'#97674b',opacity:0,spacing:144,size:40}},base);
+  expect(first).toBe(second);expect(decodeURIComponent(root.style.getPropertyValue('--custom-pattern'))).toContain('opacity="0"');
+  applyCustomStyle(root,undefined,base);expect(root.style.getPropertyValue('--custom-pattern')).toBe('');
+});

@@ -4,7 +4,7 @@ Super MD themes are small, editable JSON files. A single file styles native desk
 
 Themes never change a note, its images, or its portable assets. Reading font, text size, width, zoom and PDF layout remain normal user settings. Themes do not execute CSS, JavaScript, Python or QML, and cannot fetch fonts, pictures or other network resources.
 
-Image appearance remains a separate, opt-in viewing setting. **Auto adapt** recolours every photo and SVG with the active accent and page colours, including imported themes; it preserves shading and alpha and guards the foreground/background contrast. **Separate from theme** preserves original image pixels and adds a legible backing and edge instead of boosting image contrast. Both can be set independently for images and SVGs; Original is the default. These adjustments do not rewrite assets or apply to PDF exports.
+Image appearance remains a separate, opt-in viewing setting. **Auto adapt** adapts neutral ink and paper to the current accent and page while preserving readable colours. For SVG diagrams it checks labels against local node backgrounds and adjusts poorly contrasted coloured marks without flattening their hue. For raster images it adapts near-neutral pixels and retains colourful pixels. **Theme monochrome** keeps the earlier full-image accent duotone effect as a separate choice. **Separate from theme** preserves original pixels and adds a legible backing and edge instead of boosting image contrast. Images and SVGs have independent settings; Original is the default. These are display variants, never rewrites of assets or PDF sources.
 
 The lock immediately after the fullscreen button keeps the document horizontally centered while scrolling and zooming. It starts enabled, is remembered across launches, and can be unlocked for free horizontal movement. It does not lock graph or image-viewer cameras. Pinned recent notes use a small indicator only; pin/unpin via right-click on desktop or long press on Android.
 
@@ -15,7 +15,7 @@ The lock immediately after the fullscreen button keeps the document horizontally
 3. Choose Import theme and select the edited `.json` file.
 4. Change the workspace/fullscreen appearance to preview its light, dark and pure-black variants.
 
-Example files are in [`public/themes`](../public/themes). File extensions are descriptive; the required format marker is authoritative. UTF-8 with or without a BOM is accepted. Files are limited to 64 KiB. Unknown properties, invalid colors, unsupported versions and out-of-range values are rejected, rather than silently ignored.
+Example files are in [`public/themes`](../public/themes). File extensions are descriptive; the required format marker is authoritative. UTF-8 with or without a BOM is accepted. Files are limited to 2 MiB, including embedded artwork. Unknown properties, invalid colors, unsupported versions and out-of-range values are rejected, rather than silently ignored.
 
 ```json
 {
@@ -65,10 +65,11 @@ Example files are in [`public/themes`](../public/themes). File extensions are de
 | `accent` | Optional base palette: `blue` (default), `violet`, `rose`, or `amber`. |
 | `variants` | Optional object containing any of `light`, `dark`, `black`. |
 | `metrics` | Optional layout/style values from the table below. |
+| `assets` | Optional reusable embedded SVG/PNG/JPEG/WebP images; up to eight named entries. |
 
 The base palette supplies every unspecified role. Workspace and fullscreen settings still choose the appearance mode. System mode selects the variant using the OS's light/dark preference. An omitted `black` variant retains the built-in neutral pure-black palette, not the dark variant. Your manual/system accent preference is remembered but an imported theme's `accent` takes priority until Reset to built-in.
 
-Each variant accepts only `colors` and `background`. Colors must be opaque six-digit `#RRGGBB` strings. No named colors, alpha channels, CSS expressions, selectors, imports or URLs are supported.
+Each variant accepts `colors`, `background` and `artwork`. Colors must be opaque six-digit `#RRGGBB` strings. No named colors, alpha channels, CSS expressions, selectors, stylesheet imports or remote URLs are supported.
 
 ## Color roles
 
@@ -111,13 +112,60 @@ Omit it or set it to `null` to leave the paper undecorated. Unspecified colors a
 
 | Field | Allowed values |
 |---|---|
-| `pattern` | Required: `none`, `dots`, `grid`, `diagonal`, `gradient`. |
+| `pattern` | Required: `none`, `dots`, `grid`, `diagonal`, `gradient`, `paws`. |
 | `color` | Required: `#RRGGBB`. |
-| `opacity` | 0–0.15; default 0.06. |
-| `spacing` | 12–96 logical px; default 24. Pattern pitch, unused for a gradient. |
-| `angle` | 0–360 degrees; default 0. Gradient direction; diagonal uses 45° when 0 is specified. |
+| `opacity` | 0–0.25; default 0.06. Visibility: 0 hides the pattern. Around 0.06–0.12 is usually comfortable for reading. |
+| `spacing` | 12–192 logical px; default 24. Distance between repeats, unused for a gradient. For paws try 80–120. |
+| `size` | 8–64 logical px; default 24. Paw size, independently adjustable from spacing; capped at 80% of pitch to prevent overlap. Other patterns ignore it. |
+| `angle` | 0–360 degrees; default 0. Paw rotation or gradient direction; diagonal uses 45° when 0 is specified. |
 
-Only a few fixed CSS gradient primitives are generated. There are no remote or embedded image backgrounds, animations, filters, overlays that intercept input, or expensive custom shaders. Normal text selection, search, hyperlinks, zoom and touch gestures keep working.
+Patterns use fixed gradients or a tiny application-owned SVG repeat tile for paws. Theme files cannot supply image URLs, SVG markup, CSS or scripts. There are no animations, overlays that intercept input, or expensive custom shaders. Normal text selection, search, hyperlinks, zoom and touch gestures keep working. Background-only changes do not reparse the note or remeasure its text.
+
+For a cat-paw reading background, use this in either variant and edit its visibility, size and spacing independently:
+
+```json
+"background": {"pattern":"paws","color":"#97674b","opacity":0.10,"size":28,"spacing":96,"angle":342}
+```
+
+Paw backgrounds require a build with the `paws` pattern extension; older releases reject the unsupported pattern and keep their last valid theme.
+
+After importing, **Settings → Custom theme → Reading background** provides a pattern picker and visibility, paw-size and spacing sliders on desktop and Android. Visibility 0 hides the pattern. **Use theme's background settings** restores the file's original values. These adjustments persist as private preferences and never edit the imported file. Export and Share theme include the adjustments for every supplied light/dark variant; Android Share opens the system share sheet with a portable JSON file. Desktop Share saves that same portable file for sending through your preferred app. Import that file on either platform; no CSS plugins or extra assets are required.
+
+## Scene artwork, not just repeating patterns
+
+Each variant can carry different artwork for the reading pane, sidebar and toolbar. A composed scene is shown once, not stamped repeatedly. Artwork is optional and off in the built-in appearance. The gallery includes original fan-inspired Avengers, Iron Man, Doctor Doom, Spider City and Gotham examples, as well as monochrome line art. These are not official or endorsed franchise assets.
+
+```json
+"artwork": {
+  "reader": {"image":"data:image/svg+xml;base64,...", "opacity":0.10, "fit":"cover"},
+  "sidebar": {"image":"data:image/png;base64,...", "opacity":0.06, "fit":"contain"},
+  "toolbar": {"image":"data:image/svg+xml;base64,...", "opacity":0.04, "fit":"cover"}
+}
+```
+
+Replace the placeholder with the base64-encoded image bytes. Both vector art (static SVG) and raster artwork (PNG, JPEG and WebP) are supported. Each decoded raster image is limited to 512 KiB, four megapixels and 4096 pixels per side. SVG is limited to 128 KiB and 5000 XML nodes. The complete theme is limited to 2 MiB. SVG scripts, events, HTML, text/font loading, links, embedded sub-images, CSS, filters, animation and external resources are rejected. SVG gradients, shapes and local clipping paths are allowed. Animated PNG/WebP and other animated formats are not supported. Image types must match their bytes; renaming an extension is not enough. URLs are not fetched. Unsupported or invalid themes leave the last valid appearance active.
+
+For detailed artwork reused across areas or modes, add an optional top-level `assets` dictionary (up to eight images). The artwork's `image` then references `asset:` followed by the dictionary key:
+
+```json
+"assets": {
+  "painting": "data:image/jpeg;base64,...",
+  "line-art": "data:image/svg+xml;base64,..."
+},
+"variants": {
+  "dark": {
+    "artwork": {
+      "reader": {"image":"asset:painting", "opacity":0.18, "fit":"contain", "position":"right"},
+      "sidebar": {"image":"asset:line-art", "opacity":0.08, "fit":"cover"},
+      "toolbar": {"image":"asset:painting", "opacity":0.04, "fit":"cover", "position":"top"}
+    }
+  }
+}
+```
+
+Asset keys use 1–64 letters, numbers, hyphens or underscores. Missing references are rejected. Assets are stored once in exported/shared theme files and work offline after importing on either platform. Include only artwork you have permission to redistribute; bundled fan-style vector examples do not grant rights to third-party franchise illustrations.
+
+`fit` is `cover` (fills and crops) or `contain` (fits the whole composition). Optional `position` is `center` (default), `left`, `right`, `top`, `bottom`, `top-left`, `top-right`, `bottom-left` or `bottom-right`. `opacity` is 0–0.25, default 0.06; native sidebar/toolbar artwork is additionally capped at 0.12 to keep controls readable. The reading visibility slider also adjusts reader artwork, independently of native artwork. No SVG markup enters the interactive document DOM. Native drawing commands and small repeat tiles are cached; Android downsamples native raster decorations to at most 1024 pixels on the longest edge and shares a bounded drawing cache across areas. There are no wallpaper timers, full-size note screenshots, or additional WebViews. Background art remains outside portable notes and PDFs but travels with an exported/shared theme file. Artwork/asset extensions require the updated app; older releases reject them safely.
 
 ## Editing, persistence and recovery
 

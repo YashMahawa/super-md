@@ -76,6 +76,21 @@ class StudioTest(unittest.TestCase):
         self.assertEqual(studio._colors(),original);self.assertIn("Invalid edit",studio.message);self.assertEqual(studio.pending_close,"keep")
         studio.resetCustomTheme();self.assertTrue(source.is_file());self.assertFalse((studio.data/"theme.json").exists());self.assertEqual(second.customThemeName,"Built-in appearance")
 
+    def test_background_controls_validate_persist_and_restore_theme_defaults(self):
+        import custom_theme
+        self.session.custom_theme=custom_theme.TEMPLATE
+        for key,value in (("patternKind","paws"),("patternOpacity",.1),("patternSize",30),("patternSpacing",96)):
+            self.studio.setting(key,json.dumps(value))
+        self.assertEqual(self.studio.themeBackground["pattern"],"paws")
+        self.assertEqual(self.studio.themeBackground["spacing"],96)
+        for key,value in (("patternKind","url(evil)"),("patternOpacity",1),("patternSize",999),("patternSpacing",False)):
+            before=self.studio.themeBackground.copy();self.studio.setting(key,json.dumps(value));self.assertEqual(self.studio.themeBackground,before)
+        self.flush()
+        stored=json.loads((self.studio.data/"settings.json").read_text())
+        self.assertEqual(stored["settings"]["patternKind"],"paws")
+        self.studio.resetThemeBackground()
+        self.assertEqual(self.studio.themeBackground["pattern"],"dots")
+
     def test_automatic_update_network_errors_do_not_replace_messages_or_close_intent(self):
         studio=self.studio;pending=[];studio.message="A local note is ready";studio.pending_close="keep"
         with patch.object(studio,"_submit",side_effect=lambda action,done,*_:pending.append((action,done))),patch("studio.updates.bounded_json",side_effect=OSError("Temporary failure in name resolution")):

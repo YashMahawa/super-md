@@ -49,7 +49,7 @@ function Reader() {
   const [repairing, setRepairing] = useState(false);
   const [searching,setSearching] = useState(false);
   const [trustedHosts,setTrustedHosts] = useState<string[]>([]);
-  const documentAppearance=useMemo(()=>({dark:state?.dark??false,svgAppearance:state?.svgAppearance,ink:state?.colors.primary,text:state?.colors.text}),[state?.dark,state?.svgAppearance,state?.colors.primary,state?.colors.text]);
+  const documentAppearance=useMemo(()=>({dark:state?.dark??false,svgAppearance:state?.svgAppearance,ink:state?.colors.primary,text:state?.colors.text,colors:state?.colors}),[state?.dark,state?.svgAppearance,JSON.stringify(state?.colors)]);
   const trustHost = useCallback((host:string)=>setTrustedHosts(current=>current.includes(host)?current:[...current,host]),[]);
   const reference = useRef(state); reference.current = state;
   const zoomReference = useRef(100);

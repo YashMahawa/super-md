@@ -4,6 +4,7 @@ Checks private user-data roots, CLI/math/portable export, presented WebEngine
 pixels, and automatic graphics recovery. Never loads or writes a user's notes.
 """
 import argparse
+import base64
 import json
 import os
 from pathlib import Path
@@ -55,6 +56,10 @@ def check(executable: Path, version: str, graphics: str) -> None:
         report = root / "presented.json"
         theme=root/"Smoke theme.json"
         theme.write_text(json.dumps({"format":"supermd-theme","version":1,"name":"Packaged theme check","accent":"violet","variants":{"light":{"colors":{},"background":{"pattern":"dots","color":"#7255a5","opacity":.05,"spacing":24}}},"metrics":{"headingWeight":800,"controlRadius":16}}),encoding="utf-8")
+        theme_data=json.loads(theme.read_text(encoding="utf-8"))
+        art='<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 400 300"><circle cx="280" cy="90" r="65" fill="#665599"/><path d="M0 250L250 0" stroke="#aa6677" stroke-width="4"/></svg>'
+        theme_data["variants"]["light"]["artwork"]={"reader":{"image":"data:image/svg+xml;base64,"+base64.b64encode(art.encode()).decode(),"opacity":.08,"fit":"cover"}}
+        theme.write_text(json.dumps(theme_data),encoding="utf-8")
         args = ["--test-state", "--smoke", "--smoke-theme",str(theme),"--smoke-report", str(report), "--quit-after", "40000"]
         if graphics == "software":
             args.append("--safe-graphics")
@@ -65,6 +70,7 @@ def check(executable: Path, version: str, graphics: str) -> None:
         if not evidence.get("ok") or evidence.get("readerColors",0) <= 20:
             raise RuntimeError(f"Document did not paint: {evidence}")
         if evidence.get("theme")!="Packaged theme check":raise RuntimeError("Packaged custom-theme validator or native/reader bridge failed")
+        if '"themeArt":true' not in evidence.get("content",""):raise RuntimeError("Packaged embedded theme artwork did not reach the reader")
         if graphics != "auto" and evidence.get("software") is not True:
             raise RuntimeError("Required graphics fallback was not selected")
         print(json.dumps({"executable":str(executable),"version":version,"graphics":graphics,

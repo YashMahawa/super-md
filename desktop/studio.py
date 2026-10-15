@@ -35,6 +35,7 @@ DEFAULT_PDF = {"pageSize": "a4", "margin": 18, "fontSize": 10, "lineHeight": 1.4
 DEFAULTS = {"theme": "system", "fullTheme": "black", "motion": True, "font": "Manrope", "size": 18, "width": 0, "widthPercent":90, "lineHeight":1.65, "autosave":True, "normalZoom": 100, "fullZoom": 100, "python": "", "pdf": DEFAULT_PDF, "welcomed": False}
 DEFAULTS.update(widthMigrated=True, window={"width":1320,"height":880,"maximized":False}, spellCheck=False, grammarCheck=False, readingMode="live", newNoteLocation="", accent="system", checkUpdates=True, autoUpdate=False)
 DEFAULTS.update(restorePosition=True, centerLock=True, startup="restore", imageAppearance="original", svgAppearance="original", imageContrast=1.25)
+DEFAULTS.update(patternKind="",patternOpacity=-1,patternSize=0,patternSpacing=0)
 SAMPLE = """# A place to think\n\nWrite in Markdown. Read without distractions.\n\n> [!tip] Start with your notes\n> Open any note or folder. No vault, no import process.\n\n## Learn by exploring\n\n$$E = mc^2$$\n\n> [!answer]- Why does this matter?\n> Tap the heading to reveal an answer, then hide it to test yourself.\n\n```smd-chart\n{\"title\":\"A changing wave\",\"series\":[{\"name\":\"Sine\",\"expression\":\"sin(a*x)\",\"color\":\"#386a57\"},{\"name\":\"Cosine\",\"expression\":\"cos(a*x)\",\"color\":\"#bc6750\"}],\"sliders\":[{\"name\":\"a\",\"min\":0.2,\"max\":3,\"value\":1}]}\n```\n\n## Matplotlib in three dimensions\n\nRun a Python cell to generate a 3D figure, then save it in your note or PDF.\n\n```python\nimport numpy as np\nimport matplotlib.pyplot as plt\nx, y = np.meshgrid(np.linspace(-2, 2, 32), np.linspace(-2, 2, 32))\nfig = plt.figure()\nax = fig.add_subplot(111, projection=\"3d\")\nax.plot_surface(x, y, x*x + y*y, cmap=\"viridis\")\n```\n\n[Back to exploring](#learn-by-exploring)\n"""
 
 def public_address(url: str) -> str:
@@ -305,7 +306,7 @@ class Studio(QObject):
             tab = self._current()
             colors = self._colors()
             reading_settings={key:self.settings[key] for key in ("restorePosition","centerLock","imageAppearance","svgAppearance","imageContrast")}
-            reading_settings["customStyle"]=custom_theme.reader(self.session.custom_theme,self.settings["fullTheme" if self.fullscreen else "theme"],self._dark())
+            reading_settings["customStyle"]=custom_theme.reader(self.session.custom_theme,self.settings["fullTheme" if self.fullscreen else "theme"],self._dark(),self.settings)
             payload={**reading_settings,"readingLocation":self.session.locations.get(tab["path"]),"id": tab["id"], "path": tab["path"] or tab["id"], "mode": self.mode, "dark": self._dark(), "fullscreen": self.fullscreen, "font": self.settings["font"], "size": self.settings["size"], "widthPercent": self.settings["widthPercent"], "lineHeight":self.settings["lineHeight"], "spellCheck":self.settings["spellCheck"], "grammarCheck":self.settings["grammarCheck"], "zoom": self.settings["fullZoom" if self.fullscreen else "normalZoom"], "motion": self.settings["motion"], "python": self.settings["python"], "colors": colors, "viewState": tab.pop("viewState", None)}
             previous=self._last_reader_text
             if previous and previous[0]==tab["id"] and previous[1] is tab["content"]:payload["contentUnchanged"]=True
@@ -341,6 +342,21 @@ class Studio(QObject):
 
     @Property(bool,notify=changed)
     def customThemeActive(self):return self.session.custom_theme is not None
+
+    @Property("QVariantMap",notify=changed)
+    def themeArtwork(self):
+        selected=custom_theme.variant(self.session.custom_theme,self.settings["fullTheme" if self.fullscreen else "theme"],self._dark())
+        return custom_theme.artwork(self.session.custom_theme,selected)
+
+    @Property("QVariantMap",notify=changed)
+    def themeBackground(self):
+        style=custom_theme.reader(self.session.custom_theme,self.settings["theme"],self._dark(),self.settings)
+        return {"pattern":"none","size":24,"spacing":24,**(style["background"] or {}),"opacity":style["artwork"].get("reader",{}).get("opacity",(style["background"] or {}).get("opacity",.06))}
+
+    @Slot()
+    def resetThemeBackground(self):
+        self.settings.update(patternKind="",patternOpacity=-1,patternSize=0,patternSpacing=0)
+        self._preferences();self._emit()
 
     @Property(bool, notify=changed)
     def motionEnabled(self): return bool(self.settings["motion"])
@@ -816,7 +832,7 @@ class Studio(QObject):
     @Slot(str)
     def exportCustomTheme(self,value):
         try:
-            atomic_json(local_path(value),self.session.custom_theme or custom_theme.TEMPLATE)
+            atomic_json(local_path(value),custom_theme.for_sharing(self.session.custom_theme,self.settings))
             self.message="Theme exported. Edit the JSON and import it to apply."
         except OSError as error:self.message=str(error)
         self._emit(False)
@@ -1093,7 +1109,12 @@ class Studio(QObject):
         if key in ("theme","fullTheme") and value not in ("system","light","dark","black"): return
         if key=="accent" and value not in ("system","blue","green","violet","rose","amber"):return
         if key=="startup" and value not in ("restore","new"):return
-        if key in ("imageAppearance","svgAppearance") and value not in ("original","invert-dark","auto","contrast"):return
+        if key=="patternKind" and value not in ("","none","paws","dots","grid","diagonal","gradient"):return
+        if key in ("patternOpacity","patternSize","patternSpacing"):
+            if not isinstance(value,(int,float)) or isinstance(value,bool) or not math.isfinite(value):return
+            default,low,high={"patternOpacity":(-1,0,.25),"patternSize":(0,8,64),"patternSpacing":(0,12,192)}[key]
+            if value!=default and not low<=value<=high:return
+        if key in ("imageAppearance","svgAppearance") and value not in ("original","invert-dark","auto","monochrome","contrast"):return
         if key in ("restorePosition","centerLock") and not isinstance(value,bool):return
         if key=="imageContrast" and (not isinstance(value,(int,float)) or isinstance(value,bool) or not math.isfinite(value) or not 1<=value<=2):return
         if key in ("motion","welcomed","autosave","checkUpdates","autoUpdate","spellCheck","grammarCheck") and not isinstance(value,bool): return

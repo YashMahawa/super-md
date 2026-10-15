@@ -2494,10 +2494,12 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "base64 0.22.1",
+ "imagesize",
  "jni",
  "mitex",
  "percent-encoding",
  "pulldown-cmark",
+ "roxmltree 0.21.1",
  "serde",
  "serde_json",
  "typst",

@@ -1,0 +1,47 @@
+{
+  "format": "supermd-theme",
+  "version": 1,
+  "name": "Midnight paws",
+  "accent": "violet",
+  "variants": {
+    "dark": {
+      "colors": {
+        "surface": "#211d2d",
+        "surface-low": "#2a2439",
+        "surface-high": "#393048",
+        "text": "#eee4f5",
+        "muted": "#c8b7d5",
+        "primary": "#dfb1e0",
+        "on-primary": "#36203d",
+        "primary-container": "#59395f",
+        "on-primary-container": "#f9dcf6",
+        "outline": "#655471",
+        "heading": "#f1cbea",
+        "link": "#d9baff",
+        "code-bg": "#2a2238",
+        "code-text": "#e6d9ed",
+        "code-border": "#685271",
+        "callout-tip": "#b7d8bc",
+        "callout-warning": "#edc591"
+      },
+      "background": {
+        "pattern": "paws",
+        "color": "#d2a2da",
+        "opacity": 0.085,
+        "size": 31,
+        "spacing": 112,
+        "angle": 18
+      }
+    }
+  },
+  "metrics": {
+    "controlRadius": 22,
+    "contentRadius": 16,
+    "paragraphSpacing": 1.15,
+    "codePadding": 18,
+    "headingWeight": 750,
+    "headingTracking": -0.025,
+    "textTracking": 0,
+    "tableBorderWidth": 1
+  }
+}

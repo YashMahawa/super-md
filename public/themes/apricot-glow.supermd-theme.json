@@ -1,0 +1,45 @@
+{
+  "format": "supermd-theme",
+  "version": 1,
+  "name": "Apricot glow",
+  "accent": "amber",
+  "variants": {
+    "light": {
+      "colors": {
+        "surface": "#eed8c9",
+        "surface-low": "#e5c7b2",
+        "surface-high": "#d9ac8e",
+        "text": "#3c2a23",
+        "muted": "#694a3d",
+        "primary": "#894c2e",
+        "on-primary": "#fff3e9",
+        "primary-container": "#dfb095",
+        "on-primary-container": "#482819",
+        "outline": "#b58b73",
+        "heading": "#743c2c",
+        "link": "#8c4328",
+        "code-bg": "#e2c9b8",
+        "code-text": "#3c2a23",
+        "code-border": "#bb947b",
+        "callout-tip": "#3d654a",
+        "callout-warning": "#885013"
+      },
+      "background": {
+        "pattern": "gradient",
+        "color": "#b65c8d",
+        "opacity": 0.14,
+        "angle": 128
+      }
+    }
+  },
+  "metrics": {
+    "controlRadius": 22,
+    "contentRadius": 16,
+    "paragraphSpacing": 1.15,
+    "codePadding": 18,
+    "headingWeight": 750,
+    "headingTracking": -0.025,
+    "textTracking": 0,
+    "tableBorderWidth": 1
+  }
+}

@@ -14,10 +14,20 @@ ListView {
         objectName: "recentNoteEntry"
         width: ListView.view.width - 12; height: 40
         text: modelData.split("/").pop()
+        hoverEnabled: true
+        leftPadding: 12
         rightPadding: isPinned ? 30 : 12
         Accessible.name: text + (isPinned ? ", pinned" : "")
         onClicked: list.openRequested(modelData)
-        Hint { visible: entry.hovered; text: entry.modelData }
+        contentItem: Text { text:entry.text; font:entry.font; color:studio.palette.text; elide:Text.ElideRight; verticalAlignment:Text.AlignVCenter }
+        background: Rectangle {
+            radius: 12
+            antialiasing: true
+            color: entry.hovered || entry.down || entry.visualFocus ? studio.palette["surface-high"] : "transparent"
+            border.width: entry.visualFocus ? 1 : 0
+            border.color: studio.palette.primary
+        }
+        Hint { requested: entry.hovered; text: entry.modelData }
         ActionButton {
             objectName: "recentPinnedIndicator"
             visible: entry.isPinned
@@ -30,10 +40,10 @@ ListView {
         }
         TapHandler { acceptedButtons: Qt.RightButton; onTapped: menu.popup() }
         Keys.onMenuPressed: menu.popup()
-        Menu {
+        NoteContextMenu {
             id: menu
-            popupType: Popup.Item
-            MenuItem { text: entry.isPinned ? "Unpin note" : "Pin note"; onTriggered: list.pinRequested(entry.modelData) }
+            objectName: "recentContextMenu"
+            NoteMenuItem { text: entry.isPinned ? "Unpin note" : "Pin note"; icon.source:"../icons/PinLight.svg"; onTriggered: list.pinRequested(entry.modelData) }
         }
     }
     ScrollBar.vertical: ExpressiveScrollBar { }

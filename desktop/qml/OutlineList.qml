@@ -73,7 +73,7 @@ ListView {
                 font.weight: heading.modelData.depth === 0 ? Font.DemiBold : Font.Normal
             }
         }
-        Hint { visible: heading.hovered && titleLabel.truncated; text: heading.modelData.title }
+        Hint { requested: heading.hovered && titleLabel.truncated; text: heading.modelData.title }
     }
     signal chosen()
     ScrollBar.vertical: ExpressiveScrollBar { }

@@ -33,3 +33,8 @@ Source: https://github.com/google/material-design-icons/tree/737e3324305806514d7
 
 Android uses the same path geometry converted to VectorDrawable XML with a
 viewBox translation. Its distribution includes the same Apache-2.0 license.
+
+Android's optional theme artwork renderer uses AndroidSVG 1.4 (Apache-2.0),
+Copyright 2013–2018 Cave Rock Software Ltd.
+Source: https://github.com/BigBadaboom/androidsvg
+Its Apache-2.0 terms are included in the Android package's assets/licenses.

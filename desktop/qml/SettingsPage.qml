@@ -50,17 +50,32 @@ Pane {
                     Layout.fillWidth:true;spacing:8
                     ActionButton { text:"Import theme…";glyph:"FolderOpen";tonal:true;onClicked:studio.chooseCustomTheme() }
                     ActionButton { text:studio.customThemeActive ? "Export theme…" : "Export template…";glyph:"Export";tonal:true;onClicked:studio.chooseThemeExport() }
+                    ActionButton { text:"Share theme…";glyph:"ShareNetwork";visible:studio.customThemeActive;tonal:true;onClicked:studio.chooseThemeExport();ToolTip.text:"Save a portable theme file to send to another device" }
                     ActionButton { text:"Authoring guide";onClicked:studio.openThemeGuide() }
                     ActionButton { text:"Edit theme file";visible:studio.customThemeActive;onClicked:studio.editCustomTheme() }
                     ActionButton { text:"Reload";visible:studio.customThemeActive;onClicked:studio.reloadCustomTheme() }
                     ActionButton { text:"Reset to built-in";visible:studio.customThemeActive;onClicked:studio.resetCustomTheme() }
                 }
+                ColumnLayout {
+                    visible:studio.customThemeActive
+                    Layout.fillWidth:true;spacing:12
+                    Label { text:"Reading background";font.weight:Font.DemiBold }
+                    ChoiceField { Layout.fillWidth:true;model:["None","Cat paws","Dots","Grid","Diagonal","Gradient"];currentIndex:["none","paws","dots","grid","diagonal","gradient"].indexOf(studio.themeBackground.pattern);onActivated:page.save("patternKind",["none","paws","dots","grid","diagonal","gradient"][currentIndex]) }
+                    Label { text:"Visibility: "+Math.round(studio.themeBackground.opacity*100)+"%" }
+                    ExpressiveSlider { Layout.fillWidth:true;from:0;to:.25;stepSize:.01;value:studio.themeBackground.opacity;onMoved:page.save("patternOpacity",value) }
+                    Label { visible:studio.themeBackground.pattern==="paws";text:"Paw size: "+Math.round(studio.themeBackground.size)+" px" }
+                    ExpressiveSlider { visible:studio.themeBackground.pattern==="paws";Layout.fillWidth:true;from:8;to:64;stepSize:1;value:studio.themeBackground.size;onMoved:page.save("patternSize",value) }
+                    Label { visible:studio.themeBackground.pattern!=="gradient";text:"Pattern spacing: "+Math.round(studio.themeBackground.spacing)+" px" }
+                    ExpressiveSlider { visible:studio.themeBackground.pattern!=="gradient";Layout.fillWidth:true;from:12;to:192;stepSize:1;value:studio.themeBackground.spacing;onMoved:page.save("patternSpacing",value) }
+                    Label { text:"Viewing only. These controls leave your theme file, notes and PDF exports unchanged.";Layout.fillWidth:true;wrapMode:Text.WordWrap;color:viewState.colors.muted }
+                    ActionButton { text:"Use theme's background settings";onClicked:studio.resetThemeBackground() }
+                }
                 Label { text: "Images & diagrams"; font.pixelSize: 22; font.weight: Font.DemiBold; Layout.topMargin: 12 }
-                Label { text: "Auto recolours all images with your accent and theme. Separation keeps original colours and adds a readable backing and edge. Original files and PDF exports are unchanged."; Layout.fillWidth: true; wrapMode: Text.WordWrap; color: viewState.colors.muted }
+                Label { text: "Auto adapts neutral ink and paper, preserving readable colours. Theme monochrome recolours the whole image. Separation keeps original colours and adds a readable backing and edge. Original files and PDF exports are unchanged."; Layout.fillWidth: true; wrapMode: Text.WordWrap; color: viewState.colors.muted }
                 Label { text: "Image appearance" }
-                ChoiceField { Layout.fillWidth: true; model: ["Original (off)","Invert in dark themes","Auto adapt to theme","Separate from theme"]; currentIndex: ["original","invert-dark","auto","contrast"].indexOf(viewState.settings.imageAppearance); onActivated: page.save("imageAppearance",["original","invert-dark","auto","contrast"][currentIndex]) }
+                ChoiceField { Layout.fillWidth: true; model: ["Original (off)","Invert in dark themes","Auto adapt to theme","Theme monochrome","Separate from theme"]; currentIndex: ["original","invert-dark","auto","monochrome","contrast"].indexOf(viewState.settings.imageAppearance); onActivated: page.save("imageAppearance",["original","invert-dark","auto","monochrome","contrast"][currentIndex]) }
                 Label { text: "SVG appearance" }
-                ChoiceField { Layout.fillWidth: true; model: ["Original (off)","Invert in dark themes","Auto adapt to theme","Separate from theme"]; currentIndex: ["original","invert-dark","auto","contrast"].indexOf(viewState.settings.svgAppearance); onActivated: page.save("svgAppearance",["original","invert-dark","auto","contrast"][currentIndex]) }
+                ChoiceField { Layout.fillWidth: true; model: ["Original (off)","Invert in dark themes","Auto adapt to theme","Theme monochrome","Separate from theme"]; currentIndex: ["original","invert-dark","auto","monochrome","contrast"].indexOf(viewState.settings.svgAppearance); onActivated: page.save("svgAppearance",["original","invert-dark","auto","monochrome","contrast"][currentIndex]) }
                 Label { text: "Separation strength: " + viewState.settings.imageContrast.toFixed(2) }
                 ExpressiveSlider { Layout.fillWidth: true; from: 1; to: 2; stepSize: .05; value: viewState.settings.imageContrast; onMoved: page.save("imageContrast",value) }
                 Label { text: "Reading"; font.pixelSize: 22; font.weight: Font.DemiBold; Layout.topMargin: 12 }

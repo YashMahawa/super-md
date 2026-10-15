@@ -18,6 +18,7 @@ ApplicationWindow {
     property var viewState: JSON.parse(studio.snapshot)
     property bool sidebar: true
     property bool settingsOpen: false
+    property int contextMenuCount: 0
     onSettingsOpenChanged: settingsOpen ? settingsDialog.open() : settingsDialog.close()
     property bool closingAllowed: false
     property string outputFormat: "pdf"
@@ -98,7 +99,7 @@ ApplicationWindow {
         Pane {
             width: parent.width
             padding: 12
-            background: Rectangle { color: viewState.colors["surface-low"] }
+            background: ThemeSurface { area:"toolbar" }
             RowLayout {
                 anchors.fill: parent
                 spacing: 8
@@ -143,7 +144,7 @@ ApplicationWindow {
             SplitView.minimumWidth: 200
             SplitView.maximumWidth: 500
             padding: 16
-            background: Rectangle { color: window.viewState.colors["surface-low"] }
+            background: ThemeSurface { area:"sidebar" }
             ColumnLayout {
                 anchors.fill: parent
                 spacing: 12
@@ -172,7 +173,7 @@ ApplicationWindow {
                         leftPadding: 8 + modelData.depth * 16
                         text: (modelData.directory ? (modelData.expanded ? "▾ " : "▸ ") : "") + modelData.name
                         onClicked: modelData.directory ? studio.toggleDirectory(modelData.path) : studio.openNote(modelData.path)
-                        Hint { visible: fileEntry.hovered; text: modelData.path }
+                        Hint { requested: fileEntry.hovered; text: modelData.path }
                     }
                     ScrollBar.vertical: ExpressiveScrollBar { }
                 }
@@ -202,7 +203,7 @@ ApplicationWindow {
                     visible: !viewState.fullscreen && !viewState.imageOverlay
                     Layout.fillWidth: true
                     padding: 12
-                    background: Rectangle { color: viewState.colors["surface-low"]; Rectangle { anchors.bottom: parent.bottom; width: parent.width; height: 1; color: viewState.colors.outline; opacity: .4 } }
+                    background: ThemeSurface { area:"toolbar"; Rectangle { anchors.bottom: parent.bottom; width: parent.width; height: 1; color: viewState.colors.outline; opacity: .4 } }
                     RowLayout {
                     anchors.fill: parent
                     ModeGroup { choices: window.width < 1000 ? [{key:"live",label:"Live"},{key:"editor",label:"Source"},{key:"reader",label:"Read"}] : [{key:"live",label:"Live"},{key:"editor",label:"Source"},{key:"reader",label:"Read"},{key:"split",label:"Split"}]; selected: viewState.mode; onChosen: key => studio.setMode(key) }

@@ -100,6 +100,19 @@ test('Android settled zoom hit testing selects the word at the displayed locatio
   });
   expect(hit.text).toBe('Alpha Bravo Charlie Delta');expect(hit.offset).toBeGreaterThanOrEqual(6);expect(hit.offset).toBeLessThanOrEqual(11);
 });
+test('heading navigation follows late layout growth but yields immediately to user pan',async({page})=>{
+  await page.addInitScript(()=>{window.SuperMD={post:()=>{}};});await page.goto('/android-reader.html');
+  const content='[Jump](#destination)\n\n'+('A paragraph with $x^2$.\n\n').repeat(60)+'\n## Destination\n\nThe target.\n\n'+('More reading.\n\n').repeat(20);
+  await page.evaluate(content=>window.supermdLoad?.({id:'late-layout',content,path:null,mode:'reader',dark:false,fullscreen:false,colors:{},font:'Manrope',size:15,zoom:200}),content);
+  await page.getByRole('link',{name:'Jump',exact:true}).click();
+  await page.waitForTimeout(220);
+  await page.evaluate(()=>{const p=document.querySelector<HTMLElement>('.markdown-body p')!;p.style.marginBottom='140px';});
+  await expect.poll(()=>page.locator('#destination').evaluate(el=>Math.abs(el.getBoundingClientRect().top-16))).toBeLessThan(3);
+  await page.evaluate(()=>window.supermdNativeWheel?.(0,160,{x:500,y:300},false));
+  const top=await page.locator('.android-reading').evaluate(el=>el.scrollTop);
+  await page.waitForTimeout(250);
+  expect(await page.locator('.android-reading').evaluate(el=>el.scrollTop)).toBeGreaterThanOrEqual(top-2);
+});
 test('native two-finger deltas pan the magnified page in both directions without changing scale',async({page})=>{
   await page.addInitScript(()=>{window.SuperMD={post:()=>{}};});await page.goto('/android-reader.html');
   await page.evaluate(()=>window.supermdLoad?.({id:'pan',content:'# Pan\n\n'+('Wide readable paragraph. '.repeat(20)+'\n\n').repeat(100),path:null,mode:'reader',dark:false,fullscreen:false,colors:{},font:'Manrope',size:15,zoom:200}));
