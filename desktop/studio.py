@@ -15,6 +15,7 @@ import ssl
 import subprocess
 import sys
 import tempfile
+import time
 import urllib.parse
 import urllib.request
 import uuid
@@ -26,6 +27,7 @@ from theme import detect_system_dark, read_system_palette, system_palette_paths,
 from fonts import FontStore
 from python_outputs import PythonOutputs
 import updates
+import app_integration
 import python_runtime
 import file_events
 import custom_theme
@@ -36,6 +38,7 @@ DEFAULTS = {"theme": "system", "fullTheme": "black", "motion": True, "font": "Ma
 DEFAULTS.update(widthMigrated=True, window={"width":1320,"height":880,"maximized":False}, spellCheck=False, grammarCheck=False, readingMode="live", newNoteLocation="", accent="system", checkUpdates=True, autoUpdate=False)
 DEFAULTS.update(restorePosition=True, centerLock=True, startup="restore", imageAppearance="original", svgAppearance="original", imageContrast=1.25)
 DEFAULTS.update(patternKind="",patternOpacity=-1,patternSize=0,patternSpacing=0)
+DEFAULTS.update(desktopIntegration=False)
 SAMPLE = """# A place to think\n\nWrite in Markdown. Read without distractions.\n\n> [!tip] Start with your notes\n> Open any note or folder. No vault, no import process.\n\n## Learn by exploring\n\n$$E = mc^2$$\n\n> [!answer]- Why does this matter?\n> Tap the heading to reveal an answer, then hide it to test yourself.\n\n```smd-chart\n{\"title\":\"A changing wave\",\"series\":[{\"name\":\"Sine\",\"expression\":\"sin(a*x)\",\"color\":\"#386a57\"},{\"name\":\"Cosine\",\"expression\":\"cos(a*x)\",\"color\":\"#bc6750\"}],\"sliders\":[{\"name\":\"a\",\"min\":0.2,\"max\":3,\"value\":1}]}\n```\n\n## Matplotlib in three dimensions\n\nRun a Python cell to generate a 3D figure, then save it in your note or PDF.\n\n```python\nimport numpy as np\nimport matplotlib.pyplot as plt\nx, y = np.meshgrid(np.linspace(-2, 2, 32), np.linspace(-2, 2, 32))\nfig = plt.figure()\nax = fig.add_subplot(111, projection=\"3d\")\nax.plot_surface(x, y, x*x + y*y, cmap=\"viridis\")\n```\n\n[Back to exploring](#learn-by-exploring)\n"""
 
 def public_address(url: str) -> str:
@@ -181,7 +184,7 @@ class Studio(QObject):
         self.python_busy=False
         self.pythonProgress.connect(self._python_progress)
         if not self.settings.get("python"): QTimer.singleShot(0,self._choose_default_python)
-        if not isolated and len(self.session.windows)==1:QTimer.singleShot(6000,lambda:self.checkUpdates(True) if self.settings.get("checkUpdates") and not self.retired else None)
+        if not isolated and len(self.session.windows)==1:QTimer.singleShot(0,self._restore_update)
         self.tabs: list[dict] = []
         self.closed_tabs: list[dict] = []
         self.note_watcher = QFileSystemWatcher(self)
@@ -521,16 +524,44 @@ class Studio(QObject):
     @Property(bool,notify=changed)
     def updateReady(self):return bool(self.update_path)
 
+    @Property(bool,notify=changed)
+    def updateBusy(self):return self.update_running
+
+    @Property(bool,constant=True)
+    def desktopIntegrationAvailable(self):return app_integration.available()
+
+    def _restore_update(self):
+        self.update_running=True
+        def done(saved,error):
+            self.update_running=False
+            if saved:
+                self.update_info=saved['release'];self.update_path=saved['path'];self.update_status='Verified update ready in Downloads.'
+            if self.settings.get('checkUpdates'):QTimer.singleShot(6000,lambda:self.checkUpdates(True) if not self.retired else None)
+        self._submit(lambda:updates.load_ready(self.data/'updates',self.appVersion),done,False)
+
+    @Slot(bool)
+    def setDesktopIntegration(self,enabled):
+        if not self.desktopIntegrationAvailable or self.update_running:return
+        if not enabled:
+            self.setting('desktopIntegration','false');return
+        self.update_running=True;self.update_status='Adding Super MD to your applications…';self._emit(False)
+        def done(path,error):
+            self.update_running=False
+            if error:self.update_status='Desktop integration failed: '+error;return
+            self.setting('desktopIntegration','true');self.update_status='Added to Applications and Open With. Your file defaults are unchanged.'
+        self._submit(lambda:app_integration.integrate_current(self.appVersion),done,False)
+
     @Slot()
     def downloadUpdate(self):
-        if self.update_running or not self.update_info:return
+        if self.update_running or not self.update_info or self.update_path:return
         self.update_running=True;self.update_status="Downloading and verifying update…";self._emit(False)
         info=dict(self.update_info)
         def done(path,error):
             self.update_running=False
             if error:self.update_status="Update download failed: "+error;return
             self.update_path=path;self.update_status="Verified update ready. Save your work, then open the installer."
-        self._submit(lambda:updates.download(info,self.data/"updates"),done,False)
+        downloads=Path(QStandardPaths.writableLocation(QStandardPaths.DownloadLocation) or str(Path.home()/'Downloads'))/'Super MD Updates'
+        self._submit(lambda:updates.download(info,downloads,self.data/'updates'),done,False)
 
     @Slot()
     @Slot(bool)
@@ -543,7 +574,11 @@ class Studio(QObject):
                 self.update_status="Couldn't check updates. Your notes still work offline."
                 if not automatic:self.message=self.update_status
                 return
-            if not info or not self.update_info or info["version"]!=self.update_info["version"]:self.update_path=""
+            # Offline/repeated checks must not forget a verified ready installer.
+            if info and self.update_info and info['version']==self.update_info['version'] and self.update_path:
+                self.update_status='Verified Super MD '+info['version']+' is already downloaded.';return
+            if not info and self.update_path:return
+            self.update_path=""
             self.update_info=info
             if not info:self.update_status="You're on the latest published version.";return
             self.update_status="Super MD "+info["version"]+" is available."
@@ -656,12 +691,27 @@ class Studio(QObject):
 
     @Slot()
     def installUpdate(self):
-        if not self.update_path:return
-        # Never terminate windows, discard recovery, or overwrite package-managed
-        # installations. The OS installer (or parallel AppImage) owns activation.
-        if self.update_path.endswith('.AppImage'):
-            QProcess.startDetached(self.update_path,[])
-        else:QDesktopServices.openUrl(QUrl.fromLocalFile(self.update_path))
+        if not self.update_path or self.update_running:return
+        if self.update_path.endswith('.AppImage') and not self.desktopIntegrationAvailable:
+            self.update_status='This installation is package-managed. Install the DEB/RPM from the release page using your package manager.'
+            QDesktopServices.openUrl(QUrl(updates.REPO+'/releases/latest'));self._emit(False);return
+        self.update_running=True;self.update_status='Verifying and preparing installation…';self._emit(False)
+        def prepare():
+            saved=updates.load_ready(self.data/'updates',self.appVersion)
+            if not saved or saved['path']!=self.update_path:raise ValueError('Installer changed or is missing. Download the update again.')
+            if self.update_path.endswith('.AppImage'):
+                return app_integration.install_appimage(self.update_path,saved['release']['version'],self.settings.get('desktopIntegration',False))
+            return self.update_path
+        def done(path,error):
+            self.update_running=False
+            if error:self.update_status='Update installation failed: '+error;return
+            if self.update_path.endswith('.AppImage'):
+                self.update_status='Update installed. Close and reopen Super MD to use it. Your previous version and downloaded installer have been kept.'
+            else:
+                opened=QProcess.startDetached(path,[]) if sys.platform=='win32' else QDesktopServices.openUrl(QUrl.fromLocalFile(path))
+                if isinstance(opened,tuple):opened=opened[0]
+                self.update_status='Installer opened. Follow its instructions; the download is kept in Downloads.' if opened else 'Could not open installer. Open the verified file in Downloads.'
+        self._submit(prepare,done,False)
 
     def _can_move(self):
         return not (self.retired or self.busy or self.saving or self.pending_close or self.pending_save_as or self.pending_export or self.flush_operation)
@@ -1090,7 +1140,7 @@ class Studio(QObject):
     def setZoom(self, value):
         zoom = max(40, min(300, round(value)))
         self.settings["fullZoom" if self.fullscreen else "normalZoom"] = zoom
-        self.readerCall.emit(f"window.supermdSetZoom?.({zoom})")
+        self.readerCall.emit(f"window.supermdSetZoom?.({zoom},{int(time.time()*1000)})")
         self.preference_timer.start(500)
         self._emit(False)
 
@@ -1117,7 +1167,7 @@ class Studio(QObject):
         if key in ("imageAppearance","svgAppearance") and value not in ("original","invert-dark","auto","monochrome","contrast"):return
         if key in ("restorePosition","centerLock") and not isinstance(value,bool):return
         if key=="imageContrast" and (not isinstance(value,(int,float)) or isinstance(value,bool) or not math.isfinite(value) or not 1<=value<=2):return
-        if key in ("motion","welcomed","autosave","checkUpdates","autoUpdate","spellCheck","grammarCheck") and not isinstance(value,bool): return
+        if key in ("motion","welcomed","autosave","checkUpdates","autoUpdate","spellCheck","grammarCheck","desktopIntegration") and not isinstance(value,bool): return
         if key in ("font","python") and (not isinstance(value,str) or not value.strip() or len(value)>2048): return
         if key == "python":
             try: value = python_runtime.validate(value.strip())

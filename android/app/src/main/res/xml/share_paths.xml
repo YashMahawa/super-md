@@ -2,4 +2,5 @@
 <paths xmlns:android="http://schemas.android.com/apk/res/android">
     <cache-path name="shared-notes" path="share/" />
     <cache-path name="verified-updates" path="updates/" />
+    <files-path name="verified-update-files" path="updates/" />
 </paths>

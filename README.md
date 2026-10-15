@@ -151,6 +151,48 @@ Android supports independent app windows and drag-reordering tabs where the devi
 
 Custom theme files style native controls and the reader: light/dark palettes, code/callout colors, typography, corners, adjustable paw/grid patterns and faded vector or image artwork across the reader, sidebar and top bars. SVG, PNG, JPEG and WebP assets travel inside one portable theme file, with placement and visibility controls. Import, export and share themes between desktop and Android. Export a template and edit it yourself or with an AI. Static artwork is validated, not executable CSS or remote content. See the [theme authoring guide](docs/THEMING.md) and [example themes](public/themes).
 
+## Make it your own
+
+Themes can change the whole workspace—not just an accent colour. Combine
+separate reader, sidebar and toolbar artwork with coordinated light/dark
+palettes. Style Python source, output, Run buttons, table headers, row stripes,
+callouts and code syntax independently, while keeping readable text and familiar
+controls. Theme files import and share between desktop and Android.
+
+<table>
+  <tr>
+    <td width="33%"><strong>Thor · Comic doodles</strong><br>Slate reading paper, burgundy chrome and warm brass.</td>
+    <td width="33%"><strong>Spider-Man · Web of ink</strong><br>Painted artwork, navy surfaces and dusty rose controls.</td>
+    <td width="33%"><strong>Doom · Illustrated</strong><br>Silver-sage paper, emerald actions and antique gold.</td>
+  </tr>
+  <tr>
+    <td><a href="docs/media/themes/thor-comic-dark.png"><img src="docs/media/themes/thor-comic-dark.png" width="100%" alt="Thor comic doodles custom theme with dark slate reading area and burgundy sidebar"></a></td>
+    <td><a href="docs/media/themes/spider-man-ink-dark.png"><img src="docs/media/themes/spider-man-ink-dark.png" width="100%" alt="Spider-Man custom theme with painted reader artwork, navy paper and rose controls"></a></td>
+    <td><a href="docs/media/themes/doom-illustrated-light.png"><img src="docs/media/themes/doom-illustrated-light.png" width="100%" alt="Doctor Doom custom theme with faded illustrations, light sage paper and emerald buttons"></a></td>
+  </tr>
+</table>
+
+These are real desktop captures of user-configured themes, not UI mockups.
+Artwork visibility is adjustable independently from text and controls. Character
+examples are unofficial visual demonstrations, not bundled licensed artwork.
+See [artwork credits](docs/media/themes/ARTWORK.md).
+
+### A lighter kind of study desk
+
+Lazy Sunday cats combines varied illustrated poses with warm paper, sage
+chrome, rose actions, forest-coloured Python source and pale output. The example
+below shows an actual Python run—not a mocked result. Background visibility is
+adjustable, and the complete [cat theme](public/themes/lazy-sunday-cats.supermd-theme.json)
+can be imported and shared on desktop or Android.
+
+![Lazy Sunday cats light theme showing readable tables, Python source, a peach Run button and its real output](docs/media/themes/lazy-sunday-light.png)
+
+Start with [Study desk](public/themes/study-desk.supermd-theme.json), or export
+your current theme and give the [theme authoring guide](docs/THEMING.md) to an AI.
+The supported format is bounded JSON—not arbitrary executable CSS—so fonts,
+gestures, notes and PDF layout stay under your control. The independent component
+controls require 0.6.3 or newer.
+
 ## Download
 
 Get **[Super MD 0.6.2](https://github.com/YashMahawa/super-md/releases/tag/v0.6.2)** or visit the [latest release](https://github.com/YashMahawa/super-md/releases/latest).

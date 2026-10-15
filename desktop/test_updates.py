@@ -40,3 +40,27 @@ class UpdateTest(unittest.TestCase):
         fixture=self.fixture();fixture['assets'].pop()
         with self.assertRaises(ValueError):updates.release_info(fixture,'1.0.0','linux','x86_64')
         with self.assertRaises(ValueError):updates.checksum('0'*64+'  wrong.apk','right.apk')
+
+    def test_downloads_restore_offline_reuse_and_survive_installed_version(self):
+        info=updates.release_info(self.fixture(),'1.0.0','linux','x86_64');digest=hashlib.sha256(b'good').hexdigest()
+        def stream(url):return io.BytesIO((digest+'  '+info['name']).encode() if url.endswith('SHA256SUMS') else b'good')
+        with tempfile.TemporaryDirectory() as folder:
+            root=Path(folder);downloads=root/'Downloads';state=root/'state'
+            with patch('updates.response',side_effect=stream) as network:
+                path=Path(updates.download(info,downloads,state));self.assertEqual(network.call_count,2)
+            with patch('updates.response',side_effect=AssertionError('No network')):
+                self.assertEqual(updates.load_ready(state,'1.0.0')['path'],str(path))
+            with patch('updates.response',side_effect=stream) as network:
+                self.assertEqual(updates.download(info,downloads,state),str(path));self.assertEqual(network.call_count,1)
+            self.assertIsNone(updates.load_ready(state,'1.2.3'));self.assertTrue(path.is_file())
+            self.assertFalse((state/'ready.json').exists())
+
+    def test_tamper_and_symlinks_refused_conflicting_files_preserved(self):
+        info=updates.release_info(self.fixture(),'1.0.0','linux','x86_64');digest=hashlib.sha256(b'good').hexdigest()
+        def stream(url):return io.BytesIO((digest+'  '+info['name']).encode() if url.endswith('SHA256SUMS') else b'good')
+        with tempfile.TemporaryDirectory() as folder,patch('updates.response',side_effect=stream):
+            root=Path(folder);downloads=root/'Downloads';downloads.mkdir();existing=downloads/info['name'];existing.write_bytes(b'keep')
+            path=Path(updates.download(info,downloads,root/'state'));self.assertNotEqual(path,existing);self.assertEqual(existing.read_bytes(),b'keep')
+            path.write_bytes(b'evil');self.assertIsNone(updates.load_ready(root/'state','1.0.0'))
+            link=root/'linked';link.symlink_to(existing)
+            with self.assertRaises(ValueError):updates.verify_file(link,info,digest)

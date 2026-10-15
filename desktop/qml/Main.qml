@@ -442,6 +442,8 @@ ApplicationWindow {
             Label { text: "Open a Markdown note, or keep images together in a portable .smd. No vault or import process."; Layout.fillWidth: true; wrapMode: Text.WordWrap; font.pixelSize: 17; opacity: .8 }
             ModeGroup { Layout.fillWidth: true; choices: [{key:"system",label:"System"},{key:"light",label:"Light"},{key:"dark",label:"Dark"},{key:"black",label:"Pure black"}]; selected: viewState.settings.theme; onChosen: key => studio.setting("theme", JSON.stringify(key)) }
             Switch { text: "Expressive motion"; checked: viewState.settings.motion; onToggled: studio.setting("motion", JSON.stringify(checked)) }
+            Switch { text: "Add to Applications (experimental)"; visible: studio.desktopIntegrationAvailable; checked: viewState.settings.desktopIntegration; enabled: !studio.updateBusy; onToggled: studio.setDesktopIntegration(checked) }
+            Label { text: "Optional per-user launcher and Open With support. Your default apps are unchanged."; visible: studio.desktopIntegrationAvailable; Layout.fillWidth: true; wrapMode: Text.WordWrap; opacity: .7 }
             RowLayout {
                 ActionButton { text: "Open note"; prominent: true; onClicked: { studio.setting("welcomed", "true"); openDialog.open() } }
                 ActionButton { text: "Explore a sample"; onClicked: studio.setting("welcomed", "true") }

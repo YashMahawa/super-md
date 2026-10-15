@@ -11,6 +11,27 @@ test.beforeEach(async({page})=>{
   await page.goto('/android-reader.html');await page.waitForFunction(()=>typeof window.supermdLoad==='function');
 });
 
+test('component themes paint independent Python, output and table surfaces without replacing note nodes',async({page})=>{
+  await page.evaluate(()=>{window.SuperMD={post:(id,command)=>queueMicrotask(()=>window.supermdReply?.(id,command==='run_python'?{ok:true,stdout:'Ready: 3 routes',stderr:'',images:[]}:null,null))};});
+  const state={id:'components',path:null,content:'# A study desk\n\nKeep $x^2$ and `inline` readable.\n\n| Structure | Cost |\n|---|---|\n| Queue | Linear |\n| Heap | Logarithmic |\n\n```python\nif True:\n    print("Ready")\n```\n\n```javascript\nconst value = "example";\n```',mode:'reader' as const,dark:false,fullscreen:false,colors:{surface:'#eee6da',text:'#30251b',primary:'#37594c'},font:'Manrope',size:15,zoom:100,customStyle:{colors:{'code-bg':'#f6eedc','code-header-bg':'#e2d0ae','python-bg':'#172a31','python-header-bg':'#293d44','python-output-bg':'#e0ece3','python-run-bg':'#9fccc0','table-bg':'#f7eddb','table-border':'#807251','table-header-bg':'#314e40','table-row-alt-bg':'#e6deca','table-row-hover-bg':'#d6dec9'},metrics:{pythonRadius:16,tableCellPadding:14,tableBorderWidth:2}}};
+  await page.evaluate(state=>window.supermdLoad?.(state),state);
+  const css=async(selector:string,property:string)=>page.locator(selector).first().evaluate((el,key)=>getComputedStyle(el).getPropertyValue(key),property);
+  await expect(page.locator('.python-source')).toBeVisible();
+  expect(await css('.python-source','background-color')).toBe('rgb(23, 42, 49)');
+  expect(await css('.python-cell .cell-toolbar','background-color')).toBe('rgb(41, 61, 68)');
+  expect(await css('.python-run','background-color')).toBe('rgb(159, 204, 192)');
+  expect(await css('th','background-color')).toBe('rgb(49, 78, 64)');
+  expect(await css('td','border-color')).toBe('rgb(128, 114, 81)');expect(await css('td','border-width')).toBe('2px');
+  expect(await css('td','padding-top')).toBe('14px');
+  expect(await css('tbody tr:nth-child(2)','background-color')).toBe('rgb(230, 222, 202)');
+  await page.locator('.python-run').click();await expect(page.locator('.cell-output')).toContainText('Ready: 3 routes');
+  expect(await css('.cell-output','background-color')).toBe('rgb(224, 236, 227)');expect(await css('.cell-output pre','background-color')).toBe('rgba(0, 0, 0, 0)');
+  await page.evaluate(()=>{(window as any).__componentMath=document.querySelector('.katex');});
+  await page.evaluate(state=>window.supermdLoad?.({...state,customStyle:undefined}),state);
+  await expect(page.locator('html')).toHaveAttribute('data-custom-theme','false');expect(await page.evaluate(()=>(window as any).__componentMath.isConnected)).toBe(true);
+  expect(await css('td','padding-top')).not.toBe('14px');
+});
+
 test('custom theme patterns and typography reset cleanly without replacing math nodes',async({page})=>{
   const state={id:'custom-theme',path:null,content:'# A themed note\n\nAn equation $x^2+1$ and a [link](https://example.com).\n\n> [!TIP] A callout\n> Still readable.',mode:'reader' as const,dark:false,fullscreen:false,colors:{surface:'#e4d4c9','surface-low':'#d9c4b4',text:'#30221b',primary:'#774a30'},font:'Manrope',size:17,zoom:140};
   await page.evaluate(state=>window.supermdLoad?.(state),state);

@@ -8,6 +8,12 @@ import custom_theme
 from theme import tokens
 
 class CustomThemeTest(unittest.TestCase):
+    def test_component_roles_and_metrics_survive_native_reader_and_theme_sharing(self):
+        document={**custom_theme.TEMPLATE,"variants":{"light":{"colors":{"python-bg":"#172a31","table-header-bg":"#314e40","table-border":"#807251"}}},"metrics":{"pythonRadius":16,"tableBorderWidth":2,"pythonSourceMaxHeight":24}}
+        before=json.dumps(document)
+        style=custom_theme.reader(document,"light",False)
+        self.assertEqual(style['colors'],document['variants']['light']['colors']);self.assertEqual(style['metrics'],document['metrics'])
+        self.assertEqual(custom_theme.for_sharing(document,{})['metrics'],document['metrics']);self.assertEqual(json.dumps(document),before)
     def test_background_controls_do_not_mutate_theme_or_override_reading_layout(self):
         before=json.dumps(custom_theme.TEMPLATE)
         style=custom_theme.reader(custom_theme.TEMPLATE,"light",False,{"patternKind":"paws","patternOpacity":0,"patternSize":32,"patternSpacing":96})

@@ -228,7 +228,7 @@ class StudioViewModel(app: Application, val workspaceKey: String = "main") : And
             mutable.value.folder?.let {listFolder(Uri.parse(it),listedRelative)}
         }
     }
-    init { prefs.registerOnSharedPreferenceChangeListener(preferencesChanged);observeActive();observeCustomTheme();if(!BuildConfig.DEBUG && workspaceKey=="main" && updates.state.value.checkOnOpen)viewModelScope.launch{kotlinx.coroutines.delay(6000);updates.check()} }
+    init { prefs.registerOnSharedPreferenceChangeListener(preferencesChanged);observeActive();observeCustomTheme();if(workspaceKey=="main")viewModelScope.launch{updates.restore();if(!BuildConfig.DEBUG && updates.state.value.checkOnOpen){kotlinx.coroutines.delay(6000);updates.check()}} }
     override fun onCleared() { prefs.unregisterOnSharedPreferenceChangeListener(preferencesChanged);resolver.unregisterContentObserver(documentObserver);resolver.unregisterContentObserver(themeObserver); super.onCleared() }
     val state = mutable.asStateFlow()
     private val outlineMutable = MutableStateFlow<List<OutlineHeading>>(emptyList())
@@ -411,7 +411,7 @@ class StudioViewModel(app: Application, val workspaceKey: String = "main") : And
     }
     // Reader gestures are acknowledgements, not a second command back to WebView.
     // Only an explicit native control/shortcut advances the command generation.
-    fun zoom(value: Float) = change { s -> if (s.fullscreen) s.copy(fullscreenZoom = value.coerceIn(40f, 300f), zoomCommand = s.zoomCommand + 1) else s.copy(normalZoom = value.coerceIn(40f, 300f), zoomCommand = s.zoomCommand + 1) }
+    fun zoom(value: Float) = change { s -> val command=maxOf(System.currentTimeMillis(),s.zoomCommand+1);if (s.fullscreen) s.copy(fullscreenZoom = value.coerceIn(40f, 300f), zoomCommand = command) else s.copy(normalZoom = value.coerceIn(40f, 300f), zoomCommand = command) }
     fun readerZoom(value: Float, fullscreen: Boolean) = change { s -> if (fullscreen) s.copy(fullscreenZoom = value.coerceIn(40f, 300f)) else s.copy(normalZoom = value.coerceIn(40f, 300f)) }
     fun appearance(accent: String? = null, theme: String? = null, fullTheme: String? = null, motion: Boolean? = null, font: String? = null, size: Float? = null) {
         if(size!=null && (!size.isFinite() || size !in 6f..32f))return

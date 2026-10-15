@@ -161,11 +161,13 @@ Pane {
                 Label { text: "Super MD " + studio.appVersion + " · © Yash Mahawar · MIT License"; Layout.fillWidth: true; wrapMode: Text.WordWrap }
                 Switch { text: "Check for updates on opening"; checked: viewState.settings.checkUpdates; onToggled: page.save("checkUpdates", checked) }
                 Switch { text: "Automatically download updates"; checked: viewState.settings.autoUpdate; onToggled: page.save("autoUpdate", checked) }
-                Label { text: "Downloads are verified. Installation is your choice; running windows and notes are never replaced. Linux downloads a portable AppImage; package-managed installs can use the release packages."; Layout.fillWidth: true; wrapMode: Text.WordWrap; color: viewState.colors.muted }
+                Label { text: "Verified installers are kept in Downloads and remembered between launches. Portable Linux updates are installed side-by-side for your next launch; previous versions stay recoverable. System packages use your package manager."; Layout.fillWidth: true; wrapMode: Text.WordWrap; color: viewState.colors.muted }
+                Switch { text: "Add to Applications (experimental)"; visible: studio.desktopIntegrationAvailable; checked: viewState.settings.desktopIntegration; enabled: !studio.updateBusy; onToggled: studio.setDesktopIntegration(checked) }
+                Label { text: "Adds a per-user launcher and Open With entries. Off by default. Turning this off stops automatic registration; it does not remove an existing launcher or change file defaults."; visible: studio.desktopIntegrationAvailable; Layout.fillWidth: true; wrapMode: Text.WordWrap; color: viewState.colors.muted }
                 Label { text: studio.updateStatus; visible: text.length > 0; Layout.fillWidth: true; wrapMode: Text.WordWrap }
                 RowLayout {
-                    ActionButton { text: "Check for updates"; tonal: true; onClicked: studio.checkUpdates() }
-                    ActionButton { text: studio.updateReady ? "Open installer" : "Download update"; visible: studio.updateAvailable; prominent: true; onClicked: studio.updateReady ? studio.installUpdate() : studio.downloadUpdate() }
+                    ActionButton { text: "Check for updates"; tonal: true; enabled: !studio.updateBusy; onClicked: studio.checkUpdates() }
+                    ActionButton { text: studio.updateReady ? "Install update" : "Download update"; visible: studio.updateAvailable; enabled: !studio.updateBusy; prominent: true; onClicked: studio.updateReady ? studio.installUpdate() : studio.downloadUpdate() }
                 }
                 Item { height: 24 }
             }

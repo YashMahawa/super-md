@@ -15,6 +15,23 @@ class QuietStudio(Studio):
         self.system_dark = True
 
 class StudioTest(unittest.TestCase):
+    def test_repeated_update_checks_keep_verified_installer_and_skip_redownload(self):
+        studio=self.studio;info={'version':'9.9.9'};studio.update_info=info;studio.update_path='/verified/installer'
+        calls=[]
+        with patch.object(studio,'_submit',side_effect=lambda action,done,*_:calls.append((action,done))):
+            studio.checkUpdates();_,done=calls.pop();done((info,None),None)
+            self.assertEqual(studio.update_path,'/verified/installer');self.assertIn('already downloaded',studio.update_status)
+            studio.downloadUpdate();self.assertEqual(calls,[])
+            studio.checkUpdates();_,done=calls.pop();done((None,'offline'),None)
+            self.assertEqual(studio.update_path,'/verified/installer')
+
+    def test_portable_update_installs_without_starting_competing_instance(self):
+        studio=self.studio;studio.update_path='/verified/update.AppImage';studio.update_info={'version':'9.9.9'};calls=[]
+        saved={'path':studio.update_path,'release':studio.update_info}
+        with patch('app_integration.available',return_value=True),patch.object(studio,'_submit',side_effect=lambda action,done,*_:calls.append((action,done))),patch('updates.load_ready',return_value=saved),patch('app_integration.install_appimage',return_value='/managed/new') as install,patch('studio.QProcess.startDetached') as spawn:
+            studio.installUpdate();action,done=calls.pop();done(action(),None)
+            install.assert_called_once_with(studio.update_path,'9.9.9',False);spawn.assert_not_called()
+        self.assertIn('Close and reopen',studio.update_status);self.assertFalse(studio.update_running)
     @classmethod
     def setUpClass(cls):
         cls.app = QGuiApplication.instance() or QGuiApplication(["Super MD tests"])
@@ -457,9 +474,9 @@ class StudioTest(unittest.TestCase):
         loads, calls = [], []
         self.studio.readerLoad.connect(loads.append)
         self.studio.readerCall.connect(calls.append)
-        self.studio.setZoom(175)
+        with patch('studio.time.time',return_value=1700000000.123):self.studio.setZoom(175)
         self.assertEqual(loads, [])
-        self.assertEqual(calls, ["window.supermdSetZoom?.(175)"])
+        self.assertEqual(calls, ["window.supermdSetZoom?.(175,1700000000123)"])
         self.studio.setMode("reader")
         operation=self.studio.flush_operation
         self.assertEqual(operation["action"],"mode")

@@ -17,6 +17,13 @@ import org.junit.Test
 
 class ThemeArtworkTest {
     @get:Rule val compose=createAndroidComposeRule<ComponentActivity>()
+    @Test fun componentRolesReachReaderAndRoundtripInSharedTheme() {
+        val document=JSONObject().put("format","supermd-theme").put("version",1).put("name","Components").put("variants",JSONObject().put("light",JSONObject().put("colors",JSONObject().put("python-bg","#172a31").put("table-header-bg","#314e40").put("table-border","#807251")))).put("metrics",JSONObject().put("pythonRadius",16).put("tableBorderWidth",2).put("pythonSourceMaxHeight",24))
+        val original=document.toString();val state=StudioState(customTheme=original,theme="light")
+        val style=themeStyle(themeDocument(original),"light",false)
+        assertEquals("#172a31",style.getJSONObject("colors").getString("python-bg"));assertEquals(16,style.getJSONObject("metrics").getInt("pythonRadius"))
+        val shared=themeForSharing(state);assertFalse(JSONObject(PdfEngine.validateTheme(shared)).has("error"));assertEquals(original,state.customTheme)
+    }
     private fun theme(color:String,opacity:Double=.1,withViewBox:Boolean=true):String {
         val box=if(withViewBox)"viewBox=\"0 0 100 100\"" else ""
         val svg="<svg xmlns=\"http://www.w3.org/2000/svg\" width=\"100\" height=\"100\" $box><rect width=\"100\" height=\"100\" fill=\"$color\"/></svg>"

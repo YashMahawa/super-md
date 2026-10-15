@@ -8,13 +8,69 @@
 :root[data-custom-link] .android-reading .markdown-body a {color:var(--custom-link);}
 :root[data-custom-link] .android-reading .markdown-body a:visited {color:color-mix(in srgb,var(--custom-link) 75%,var(--text));}
 :root[data-custom-code-padding] .android-reading .markdown-body pre {padding:var(--custom-code-padding);}
-:root[data-custom-code-bg] .android-reading .markdown-body pre {background:var(--custom-code-bg);}
-:root[data-custom-code-text] .android-reading .markdown-body pre {color:var(--custom-code-text);}
+:root[data-custom-code-bg] .android-reading .markdown-body pre:where(:not(.cell-output pre,.python-cell pre)) {background:var(--custom-code-bg);}
+:root[data-custom-code-text] .android-reading .markdown-body pre:where(:not(.cell-output pre,.python-cell pre)) {color:var(--custom-code-text);}
 :root[data-custom-code-border] .android-reading .markdown-body pre {border-color:var(--custom-code-border);}
 :root[data-custom-radius] .android-reading .markdown-body :is(pre,.callout,.code-cell,.interactive-chart,.svg-figure,img) {border-radius:var(--custom-radius);}
-:root[data-custom-table-border] .android-reading .markdown-body :is(th,td) {border-width:var(--custom-table-border);}
+:root[data-custom-table-border-width] .android-reading .markdown-body :is(th,td) {border-width:var(--custom-table-border-width);}
 :root[data-custom-callout-tip] .android-reading .markdown-body :is(.callout-tip,.callout-success,.callout-check) {--callout-accent:var(--custom-callout-tip);}
 :root[data-custom-callout-warning] .android-reading .markdown-body :is(.callout-warning,.callout-caution) {--callout-accent:var(--custom-callout-warning);}
 :root[data-custom-callout-danger] .android-reading .markdown-body :is(.callout-danger,.callout-error,.callout-failure) {--callout-accent:var(--custom-callout-danger);}
 :root[data-custom-callout-info] .android-reading .markdown-body :is(.callout-info,.callout-question) {--callout-accent:var(--custom-callout-info);}
 :root[data-custom-callout-example] .android-reading .markdown-body :is(.callout-abstract,.callout-summary,.callout-example) {--callout-accent:var(--custom-callout-example);}
+
+/* Component variables are local to reading content, not native controls, source
+ * editors, PDF layout, or generated Matplotlib/SVG figures. No authored CSS. */
+:root[data-custom-theme="true"] .android-reading .code-disclosure {background:var(--custom-code-bg,var(--code-bg));border-color:var(--custom-code-border,var(--code-border));}
+:root[data-custom-theme="true"] .android-reading .code-disclosure > summary {background:var(--custom-code-header-bg,transparent);color:var(--custom-code-header-text,var(--code-accent));}
+:root[data-custom-code-header-text] .android-reading .code-disclosure > summary span {color:inherit;}
+:root[data-custom-code-header-text] .android-reading .code-container .code-copy {color:var(--custom-code-header-text);}
+:root[data-custom-code-radius] .android-reading :is(.code-disclosure,pre:not(.python-cell pre)) {border-radius:var(--custom-code-radius);}
+:root[data-custom-code-radius] .android-reading .code-disclosure pre {border-radius:0;}
+:root[data-custom-code-width] .android-reading :is(.code-disclosure,pre:not(.code-disclosure pre,.python-cell pre)) {border-width:var(--custom-code-width);}
+:root[data-custom-code-scale] .android-reading .markdown-body pre {font-size:var(--custom-code-scale);}
+:root[data-custom-theme="true"] .android-reading .markdown-body :not(pre) > code {background:var(--custom-inline-code-bg,var(--custom-code-bg,var(--code-bg)));color:var(--custom-inline-code-text,var(--custom-code-text,var(--code-text)));}
+:root[data-custom-theme="true"] .android-reading .python-cell {background:var(--custom-python-bg,var(--custom-code-bg,var(--code-bg)));border-color:var(--custom-python-border,var(--custom-code-border,var(--code-border)));}
+:root[data-custom-python-radius] .android-reading .python-cell {border-radius:var(--custom-python-radius);}
+:root[data-custom-python-width] .android-reading .python-cell {border-width:var(--custom-python-width);}
+:root[data-custom-theme="true"] .android-reading .python-cell .python-source {background:var(--custom-python-bg,var(--custom-code-bg,var(--code-bg)));color:var(--custom-python-text,var(--custom-code-text,var(--code-text)));border:0;border-radius:0;}
+:root[data-custom-theme="true"] .android-reading .python-source code {color:inherit;}
+:root[data-custom-python-height] .android-reading .python-cell .python-source {max-height:var(--custom-python-height);}
+:root[data-custom-theme="true"] .android-reading .python-cell .cell-toolbar {background:var(--custom-python-header-bg,transparent);color:var(--custom-python-header-text,var(--code-accent));border-color:var(--custom-python-border,var(--custom-code-border,var(--code-border)));}
+:root[data-custom-python-header-text] .android-reading .python-cell .cell-toolbar .code-copy {color:inherit;}
+:root[data-custom-theme="true"] .android-reading .python-cell .python-run {background:var(--custom-python-run-bg,var(--primary));color:var(--custom-python-run-text,var(--on-primary));}
+:root[data-custom-theme="true"] .android-reading .python-cell .cell-output {background:var(--custom-python-output-bg,color-mix(in srgb,var(--surface) 60%,var(--code-bg)));color:var(--custom-python-output-text,var(--text));border-color:var(--custom-python-output-border,var(--custom-python-border,var(--code-border)));}
+:root[data-custom-theme="true"] .android-reading .python-cell .cell-output.failed {background:var(--custom-python-error-bg,var(--custom-python-output-bg,color-mix(in srgb,var(--surface) 60%,var(--code-bg))));color:var(--custom-python-error-text,var(--error));}
+:root[data-custom-theme="true"] .android-reading .python-cell .cell-output pre {background:transparent;color:inherit;border:0;border-radius:0;}
+:root[data-custom-theme="true"] .android-reading .markdown-body table {background:var(--custom-table-bg,transparent);color:var(--custom-table-text,var(--text));}
+:root[data-custom-table-bg] .android-reading .markdown-body table {width:max-content;max-width:100%;}
+:root[data-custom-theme="true"] .android-reading .markdown-body table :is(th,td) {border-color:var(--custom-table-border,var(--outline));}
+:root[data-custom-theme="true"] .android-reading .markdown-body th {background:var(--custom-table-header-bg,var(--surface-high));color:var(--custom-table-header-text,var(--custom-table-text,var(--text)));}
+:root[data-custom-table-row-alt-bg] .android-reading .markdown-body tbody tr:nth-child(even) {background:var(--custom-table-row-alt-bg);}
+:root[data-custom-table-row-hover-bg] .android-reading .markdown-body tbody tr:hover {background:var(--custom-table-row-hover-bg);}
+:root[data-custom-table-radius] .android-reading .markdown-body table {border-radius:var(--custom-table-radius);}
+:root[data-custom-table-padding] .android-reading .markdown-body :is(th,td) {padding:var(--custom-table-padding) calc(var(--custom-table-padding) * 1.3);}
+:root[data-custom-table-weight] .android-reading .markdown-body th {font-weight:var(--custom-table-weight);}
+:root[data-custom-callout-bg] .android-reading .markdown-body .callout {background:var(--custom-callout-bg);}
+:root[data-custom-callout-text] .android-reading .markdown-body .callout {color:var(--custom-callout-text);}
+:root[data-custom-callout-radius] .android-reading .markdown-body .callout {border-radius:var(--custom-callout-radius);}
+:root[data-custom-theme="true"] .android-reading .markdown-body blockquote:not(.callout) {background:var(--custom-blockquote-bg,transparent);color:var(--custom-blockquote-text,var(--muted));border-color:var(--custom-blockquote-border,var(--outline));}
+:root[data-custom-blockquote-radius] .android-reading .markdown-body blockquote:not(.callout) {border-radius:var(--custom-blockquote-radius);}
+:root[data-custom-blockquote-width] .android-reading .markdown-body blockquote:not(.callout) {border-left-width:var(--custom-blockquote-width);}
+
+:root[data-custom-syntax-keyword] .android-reading pre :is(.hljs-keyword,.hljs-selector-tag,.hljs-literal,.hljs-doctag,.hljs-template-tag) {color:var(--custom-syntax-keyword);}
+:root[data-custom-syntax-string] .android-reading pre :is(.hljs-string,.hljs-regexp,.hljs-addition,.hljs-template-variable,.hljs-symbol) {color:var(--custom-syntax-string);}
+:root[data-custom-syntax-number] .android-reading pre :is(.hljs-number,.hljs-variable.constant_,.hljs-selector-pseudo) {color:var(--custom-syntax-number);}
+:root[data-custom-syntax-function] .android-reading pre :is(.hljs-title,.hljs-section,.hljs-selector-id) {color:var(--custom-syntax-function);}
+:root[data-custom-syntax-builtin] .android-reading pre :is(.hljs-built_in,.hljs-name,.hljs-selector-class,.hljs-bullet) {color:var(--custom-syntax-builtin);}
+:root[data-custom-syntax-attr] .android-reading pre :is(.hljs-attr,.hljs-attribute,.hljs-property,.hljs-params) {color:var(--custom-syntax-attr);}
+:root[data-custom-syntax-type] .android-reading pre :is(.hljs-type,.hljs-title.class_,.hljs-meta,.hljs-meta .hljs-keyword) {color:var(--custom-syntax-type);}
+:root[data-custom-syntax-comment] .android-reading pre :is(.hljs-comment,.hljs-quote,.hljs-deletion) {color:var(--custom-syntax-comment);}
+:root[data-custom-theme="true"] .android-reading .python-source :is(.hljs-keyword,.hljs-selector-tag,.hljs-literal,.hljs-doctag,.hljs-template-tag) {color:var(--custom-python-syntax-keyword,var(--syn-keyword));}
+:root[data-custom-theme="true"] .android-reading .python-source :is(.hljs-string,.hljs-regexp,.hljs-addition,.hljs-template-variable,.hljs-symbol) {color:var(--custom-python-syntax-string,var(--syn-string));}
+:root[data-custom-theme="true"] .android-reading .python-source :is(.hljs-number,.hljs-variable.constant_,.hljs-selector-pseudo) {color:var(--custom-python-syntax-number,var(--syn-number));}
+:root[data-custom-theme="true"] .android-reading .python-source :is(.hljs-title,.hljs-section,.hljs-selector-id) {color:var(--custom-python-syntax-function,var(--syn-function));}
+:root[data-custom-theme="true"] .android-reading .python-source :is(.hljs-built_in,.hljs-name,.hljs-selector-class,.hljs-bullet) {color:var(--custom-python-syntax-builtin,var(--syn-builtin));}
+:root[data-custom-theme="true"] .android-reading .python-source :is(.hljs-attr,.hljs-attribute,.hljs-property,.hljs-params) {color:var(--custom-python-syntax-attr,var(--syn-attr));}
+:root[data-custom-theme="true"] .android-reading .python-source :is(.hljs-type,.hljs-title.class_,.hljs-meta,.hljs-meta .hljs-keyword) {color:var(--custom-python-syntax-type,var(--syn-type));}
+:root[data-custom-theme="true"] .android-reading .python-source :is(.hljs-comment,.hljs-quote,.hljs-deletion) {color:var(--custom-python-syntax-comment,var(--syn-comment));}

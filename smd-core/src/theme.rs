@@ -6,8 +6,14 @@ use base64::{engine::general_purpose::STANDARD,Engine as _};
 
 pub const MAX_THEME: usize = 2 * 1024 * 1024;
 const MAX_IMAGE: usize = 512 * 1024;
-pub const COLORS: &[&str] = &["primary","on-primary","primary-container","on-primary-container","surface","surface-low","surface-high","text","muted","outline","link","heading","code-bg","code-text","code-border","callout-tip","callout-warning","callout-danger","callout-info","callout-example"];
-pub const METRICS: &[(&str, f64, f64)] = &[("controlRadius",0.,28.),("contentRadius",0.,32.),("paragraphSpacing",0.5,2.5),("codePadding",8.,32.),("headingWeight",400.,900.),("headingTracking",-0.05,0.1),("textTracking",-0.03,0.1),("tableBorderWidth",0.,3.)];
+pub const COLORS: &[&str] = &["primary","on-primary","primary-container","on-primary-container","surface","surface-low","surface-high","text","muted","outline","link","heading","code-bg","code-text","code-border","callout-tip","callout-warning","callout-danger","callout-info","callout-example",
+    "code-header-bg","code-header-text","inline-code-bg","inline-code-text",
+    "python-bg","python-text","python-border","python-header-bg","python-header-text","python-output-bg","python-output-text","python-output-border","python-error-bg","python-error-text","python-run-bg","python-run-text",
+    "table-bg","table-text","table-border","table-header-bg","table-header-text","table-row-alt-bg","table-row-hover-bg",
+    "callout-bg","callout-text","blockquote-bg","blockquote-text","blockquote-border",
+    "syntax-keyword","syntax-string","syntax-number","syntax-function","syntax-builtin","syntax-attr","syntax-type","syntax-comment"];
+pub const METRICS: &[(&str, f64, f64)] = &[("controlRadius",0.,28.),("contentRadius",0.,32.),("paragraphSpacing",0.5,2.5),("codePadding",8.,32.),("headingWeight",400.,900.),("headingTracking",-0.05,0.1),("textTracking",-0.03,0.1),("tableBorderWidth",0.,3.),
+    ("codeRadius",0.,32.),("pythonRadius",0.,32.),("tableRadius",0.,24.),("calloutRadius",0.,32.),("blockquoteRadius",0.,24.),("tableCellPadding",4.,24.),("tableHeaderWeight",400.,900.),("codeFontScale",0.7,1.4),("pythonSourceMaxHeight",8.,60.),("codeBorderWidth",0.,3.),("pythonBorderWidth",0.,3.),("blockquoteBorderWidth",0.,8.)];
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -171,6 +177,18 @@ mod tests {
     use super::*;
     fn sample() -> serde_json::Value { serde_json::json!({"format":"supermd-theme","version":1,"name":"Copper grid","accent":"amber","variants":{"dark":{"colors":{"surface":"#19140e","text":"#efe2d1"},"background":{"pattern":"grid","color":"#aabbcc","opacity":0.06}}},"metrics":{"controlRadius":16,"paragraphSpacing":1.4}}) }
     #[test] fn valid_theme_roundtrips_and_defaults_are_explicit() { let theme=parse(&sample().to_string()).unwrap(); assert_eq!(theme.variants["dark"].background.as_ref().unwrap().spacing,24.); assert_eq!(parse(&serde_json::to_string(&theme).unwrap()).unwrap().name,"Copper grid"); }
+    #[test] fn component_roles_and_metrics_roundtrip_and_are_bounded() {
+        let mut v=sample();
+        for role in COLORS { v["variants"]["dark"]["colors"][*role]=serde_json::json!("#345678"); }
+        for (key,min,max) in METRICS {v["metrics"][*key]=serde_json::json!((min+max)/2.);}
+        let theme=parse(&v.to_string()).unwrap();
+        assert_eq!(theme.variants["dark"].colors["table-border"],"#345678");
+        assert_eq!(parse(&serde_json::to_string(&theme).unwrap()).unwrap().metrics,theme.metrics);
+        for (key,min,max) in METRICS {
+            for value in [min-1.,max+1.] {let mut invalid=v.clone();invalid["metrics"][*key]=serde_json::json!(value);assert!(parse(&invalid.to_string()).is_err(),"{key}");}
+        }
+        for value in ["url(https://example.com)","red","#ffffff;background:red"] {let mut invalid=v.clone();invalid["variants"]["dark"]["colors"]["python-bg"]=serde_json::json!(value);assert!(parse(&invalid.to_string()).is_err());}
+    }
     #[test] fn bundled_examples_all_use_the_documented_format() {
         for input in [include_str!("../../public/themes/copper-grid.supermd-theme.json"),include_str!("../../public/themes/ink-dots.supermd-theme.json"),include_str!("../../public/themes/rose-paper.supermd-theme.json"),include_str!("../../public/themes/catnap-paws.supermd-theme.json"),include_str!("../../public/themes/midnight-paws.supermd-theme.json"),include_str!("../../public/themes/blueprint.supermd-theme.json"),include_str!("../../public/themes/plum-linen.supermd-theme.json"),include_str!("../../public/themes/apricot-glow.supermd-theme.json")] {assert!(!parse(input).unwrap().name.is_empty());}
     }

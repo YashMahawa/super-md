@@ -35,7 +35,7 @@ export default function PythonCell({ source, python, highlighted }: { source: st
   const stale = Boolean(result && executedSource.current !== source);
   return (
     <div ref={cell} className="python-cell" data-output-pinned={!!result&&!stored||running}>
-      <div className="cell-toolbar"><span>Python {stale && <small className="stale-badge">Output from earlier code</small>}</span><CopyCode source={source}/><button onClick={run} disabled={running}>{running ? "Running…" : stale ? "Run updated code" : "Run"}</button></div>
+      <div className="cell-toolbar"><span>Python {stale && <small className="stale-badge">Output from earlier code</small>}</span><CopyCode source={source}/><button className="python-run" onClick={run} disabled={running}>{running ? "Running…" : stale ? "Run updated code" : "Run"}</button></div>
       <pre className="python-source" aria-label="Python source"><code className="language-python">{highlighted ?? source}</code></pre>
       {result && <div className={`cell-output ${result.ok ? "" : "failed"} ${stale ? "stale" : ""}`}>
         {result.stdout && <pre>{result.stdout}</pre>}

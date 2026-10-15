@@ -1,37 +1,34 @@
-# Super MD 0.6.2
+# Super MD 0.6.3
 
-## Portable artwork themes
+## Component-level theme controls
 
-- Use both vector art and detailed images: static SVG, PNG, JPEG and WebP can decorate the reader, sidebar and top bars. Artwork is optional; the built-in appearance stays clean.
-- Reuse embedded assets across areas and light/dark variants without copying the same image into every entry. Control placement, cover/contain fit and visibility. Themes work offline and travel as one file between desktop and Android.
-- Add cat-paw backgrounds with adjustable visibility, motif size and spacing, alongside dots, grids, diagonal textures and gradients. Settings adjustments are remembered without modifying the original theme file.
-- Import, export and share the active theme with its background adjustments. Android opens its native share sheet; desktop saves a portable theme file for sharing.
-- The theme authoring guide documents the format, examples, limits and AI-friendly editing workflow. No CSS plugins, scripts or remote asset downloads are required.
+- Style Python source, headers, Run buttons, output and errors separately from ordinary code blocks.
+- Give tables their own body, header, borders, alternating rows and hover colours. Tune cell padding and header weight independently.
+- Customize inline code, syntax categories, ordinary blockquotes and callout bodies, plus bounded component-specific corners and borders.
+- Text and syntax contrast are checked against each component's actual surface. Dark Python cells can coexist with light code blocks.
+- The same portable JSON works on desktop and Android. Palette changes retain existing math nodes, reading position and zoom; Reset removes all overrides.
+- New Study desk and Lazy Sunday cats examples, a complete authoring reference, and a README showcase of three user-selected character themes. Third-party artwork shown in screenshots is not bundled as a reusable theme.
 
-## Better image adaptation
+## Updates that stay downloaded
 
-- Auto adapt preserves colours while adapting neutral ink and paper to the current accent and page. SVG labels are checked against their local node backgrounds; poorly contrasted marks and arrowheads are adjusted without flattening all colours.
-- Theme monochrome is a separate option for the previous full-image accent duotone effect. Original remains the default; theme-relative separation preserves source pixels and adds readable backing/edges.
-- White-only transparent SVG drawings are treated as ink, not erased as white paper or a thick edge halo in Auto mode.
-- Existing images, SVGs, notes and PDF source assets are never rewritten by viewing adjustments. An open image keeps its zoom when the theme changes.
+- Verified installers are saved in Downloads and remembered between launches. Repeated checks reuse an existing download; missing or modified files are refused.
+- Portable Linux updates install side-by-side and activate the managed launcher for the next launch instead of starting a competing AppImage. Existing windows, notes, downloads and previous installations are kept.
+- Windows and macOS retain their normal installer approval; DEB/RPM installations remain owned by the system package manager.
+- Android stages a verified, signed release APK in private storage and also publishes it to Downloads. It restores a ready download offline after restart.
+- Android removes only its owned installer copies after observing a successful upgrade on a later launch. Cancelling installation does not delete the APK. Desktop downloads are never automatically deleted.
 
-## Desktop polish and navigation
+## Experimental AppImage integration
 
-- Note context menus have opaque, bordered surfaces and consistent hit areas. Duplicate path hints are removed and remaining hints disappear while menus are open.
-- Recent notes have reliable hover/focus highlights and a bounded Pin/Unpin context menu; lightweight pin indicators appear only on pinned entries.
-- Long-document heading jumps now follow late font/layout changes briefly, then yield immediately to deliberate scrolling or zooming instead of snapping back.
-- Opening search or choosing a match cancels a preceding heading jump, so quickly searching after a contents/link jump cannot snap back to the old heading.
-- Switching tabs or reading modes also retires the previous heading alignment instead of applying it to a different document.
-- Artwork and palette changes do not reparse Markdown, replace math nodes or reset reading zoom.
+- Portable Linux onboarding and Settings offer an off-by-default Add to Applications option.
+- Registration creates a per-user launcher, icon and Open With entries without changing file defaults or replacing unrelated launchers.
+- Moving the original download does not break the managed launcher. Turning registration off does not uninstall an existing entry.
+- Package-managed Linux installations do not show this option.
 
-## Bounded rendering and safety
+## Verification and compatibility
 
-- A theme is limited to 2 MiB, with up to eight reusable images. Rasters are capped at 512 KiB and four megapixels; static SVG is capped at 128 KiB and 5000 XML nodes. Animated and executable content, external resources and missing asset references are rejected.
-- Android shares a bounded drawing cache across native areas, downsamples native raster decorations and avoids sending unused sidebar/toolbar images through the reader bridge.
-- Fixed-size SVG artwork is fitted to its cached Android viewport instead of appearing as a tiny mark in one corner. The imported file itself is unchanged.
-- Regression coverage includes actual native and browser artwork pixels, raster type checks, import/share round trips, document identity/zoom retention, menu opacity and tooltip suppression. Android tests run on emulators, not the user's phone.
-- Private detailed-art evaluation samples are not bundled in the repository or release. Only share artwork you have permission to redistribute.
-
-This is a normal stable update. Earlier published installers remain available for rollback. Themes are viewing preferences, not content embedded in SMD notes or PDF wallpaper. Older versions safely reject unsupported theme extensions.
-
-macOS packages remain ad-hoc signed rather than notarized. Windows installers are not code-signed.
+- A delayed native zoom command can no longer overwrite a newer pinch gesture. New gestures also cancel stale glide acknowledgements, preventing snap-back on Android and desktop.
+- Component import/share round trips, bounds, injection rejection, actual reader styling and document-node retention have regression coverage.
+- Updater tests cover offline persistence, tampering, download reuse, launcher activation, rollback preservation and Android success/cancellation cleanup.
+- Releases remain gated on cross-platform CI, signed Android APK validation and complete installer checks.
+- Existing themes remain valid. New component roles require 0.6.3 or newer; older builds reject unsupported fields without replacing the last valid theme.
+- macOS packages remain ad-hoc signed rather than notarized. Windows installers are not code-signed.

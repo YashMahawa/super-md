@@ -1,4 +1,23 @@
 import {test,expect} from '@playwright/test';
+
+test('new pinch owns its scale over an older queued native command',async({page})=>{
+  await page.addInitScript(()=>{window.SuperMD={post:()=>{}};});await page.goto('/android-reader.html');
+  await page.waitForFunction(()=>typeof window.supermdLoad==='function');
+  await page.evaluate(()=>window.supermdLoad?.({id:'zoom-command-race',content:'# A stable page\n\n'+('Readable content. '.repeat(100)),path:null,mode:'reader',dark:false,fullscreen:false,colors:{},font:'Manrope',size:18,zoom:100,motion:false}));
+  await expect(page.locator('.document-page')).toHaveAttribute('data-scale','1');
+  await page.evaluate(()=>{
+    const old=Date.now()-100,root=document.querySelector('.android-reading')!;
+    const touches=(x:number)=>[new Touch({identifier:1,target:root,clientX:60,clientY:140}),new Touch({identifier:2,target:root,clientX:x,clientY:140})];
+    root.dispatchEvent(new TouchEvent('touchstart',{bubbles:true,touches:touches(160)}));
+    root.dispatchEvent(new TouchEvent('touchmove',{bubbles:true,cancelable:true,touches:touches(240)}));
+    root.dispatchEvent(new TouchEvent('touchend',{bubbles:true,touches:[]}));
+    window.supermdSetZoom?.(100,old);
+  });
+  await expect(page.locator('.document-page')).toHaveAttribute('data-scale','1.8');
+  // A later explicit setting must still work; only stale commands are refused.
+  await page.evaluate(()=>window.supermdSetZoom?.(125,Date.now()+1));
+  await expect(page.locator('.document-page')).toHaveAttribute('data-scale','1.25');
+});
 test('desktop fullscreen scrolling only hides controls and deliberate clicks toggle without stealing selection',async({page})=>{
   await page.addInitScript(()=>{(window as any).chromeActions=[];window.SuperMD={post:(id,command,args)=>{if(command==='reader_chrome')(window as any).chromeActions.push(JSON.parse(args).action);window.supermdReply?.(id,true,null);}};});
   await page.goto('/android-reader.html');await page.waitForFunction(()=>typeof window.supermdLoad==='function');

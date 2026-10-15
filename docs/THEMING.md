@@ -83,6 +83,52 @@ Each variant accepts `colors`, `background` and `artwork`. Colors must be opaque
 | `code-bg`, `code-text`, `code-border` | Rendered code blocks. Source syntax highlighting keeps the editor's normal theme. |
 | `callout-tip`, `callout-warning`, `callout-danger`, `callout-info`, `callout-example` | Reader callout accents. Related types share each family: success/check; caution; error/failure; question; abstract/summary. |
 
+### Independent component styling
+
+The following additional roles require Super MD 0.6.3 or newer. Put them inside
+each variant's `colors`, alongside the existing roles—not inside a CSS string or
+an extra `components` object. Desktop and Android use the same names. The
+[Study desk example](../public/themes/study-desk.supermd-theme.json) supplies a
+complete light/dark palette with independent components.
+
+| Roles | Scope |
+|---|---|
+| `code-header-bg`, `code-header-text` | Ordinary folded-code header and Copy control. |
+| `inline-code-bg`, `inline-code-text` | Inline code, independent of fenced blocks. |
+| `python-bg`, `python-text`, `python-border` | Python source and cell container; falls back to the ordinary code palette. |
+| `python-header-bg`, `python-header-text` | Python header and Copy text, independent of the source. |
+| `python-run-bg`, `python-run-text` | Run button only, not Copy or other app buttons. |
+| `python-output-bg`, `python-output-text`, `python-output-border` | Output panel; generated images keep their original colours. |
+| `python-error-bg`, `python-error-text` | Failed-cell output, falling back to the output panel and normal error colour. |
+| `table-bg`, `table-text`, `table-border` | Table body surface, text and cell borders. |
+| `table-header-bg`, `table-header-text` | Header row, independent of the body. |
+| `table-row-alt-bg`, `table-row-hover-bg` | Alternating even rows and hover surface. No motion or layout changes. |
+| `callout-bg`, `callout-text` | Common callout surface/body text; family accent roles still distinguish tips, warnings, etc. |
+| `blockquote-bg`, `blockquote-text`, `blockquote-border` | Ordinary blockquotes, not callout containers. |
+| `syntax-keyword`, `syntax-string`, `syntax-number`, `syntax-function`, `syntax-builtin`, `syntax-attr`, `syntax-type`, `syntax-comment` | Rendered-code syntax categories. Source editing retains the editor's normal syntax theme. |
+
+Component text is checked against its own surface, not just the page colour.
+Syntax colours are checked independently for Python and ordinary blocks, so a
+dark Python well can coexist with light fenced code. If table stripes and hover
+colours have no common legible foreground, they are aligned with the body.
+Choose coherent palettes for faithful results; contrast safeguards may replace
+an unreadable foreground. Reset clears every component override. Changing just
+component colours preserves existing math nodes and reading layout.
+
+For example, this gives Python a forest-coloured source well, pale output and a
+peach Run button without recolouring the rest of the page:
+
+```json
+"colors": {
+  "python-bg":"#1c3036", "python-text":"#e7ede1",
+  "python-header-bg":"#314c49", "python-header-text":"#e0e8d5",
+  "python-output-bg":"#e1e9da", "python-output-text":"#283f35",
+  "python-run-bg":"#f0c392", "python-run-text":"#3f3023",
+  "table-header-bg":"#3a594b", "table-header-text":"#f1ebd6",
+  "table-row-alt-bg":"#e8dfca", "table-border":"#9c8b6d"
+}
+```
+
 Core native text pairs are corrected to readable contrast. If supplied paper/chrome colors are so far apart that no common readable foreground exists, chrome surfaces are aligned with the paper. Reader heading/link/callout and code text also receive contrast safeguards. Choose coherent surfaces yourself for the most faithful result. Patterns should be subtle enough not to compete with equations and text.
 
 Android retains native Material component behavior and platform-specific control shapes. Desktop exposes action-button/segmented-control corners; Android's shape system applies corner preferences to components that use its theme shapes. A theme is not an arbitrary replacement for either platform's layout or gesture model.
@@ -101,6 +147,18 @@ All are optional finite numbers. Pixels are logical CSS px in the reader and nat
 | `headingTracking` | −0.05–0.1 | Heading letter spacing, em. |
 | `textTracking` | −0.03–0.1 | Reading text letter spacing, em. |
 | `tableBorderWidth` | 0–3 | Table cell border width, px. |
+| `codeRadius`, `pythonRadius`, `calloutRadius` | 0–32 | Independent component corners, px. |
+| `tableRadius`, `blockquoteRadius` | 0–24 | Table/blockquote corners, px. |
+| `tableCellPadding` | 4–24 | Vertical cell padding, px; horizontal padding is 1.3 times this. |
+| `tableHeaderWeight` | 400–900 | Table-header font weight. |
+| `codeFontScale` | 0.7–1.4 | Code size relative to the document, em. |
+| `pythonSourceMaxHeight` | 8–60 | Scrollable Python source height, em. Output remains separate. |
+| `codeBorderWidth`, `pythonBorderWidth` | 0–3 | Independent component borders, px. |
+| `blockquoteBorderWidth` | 0–8 | Blockquote leading edge, px. |
+
+The component-specific radius overrides `contentRadius` for that component.
+`table-border` is a colour, while `tableBorderWidth` is a numeric metric; both can
+be used together. New component metrics also require 0.6.3 or newer.
 
 Reading fonts and sizes are deliberately not overridden by theme files; import/select fonts in normal reading settings. PDF font and spacing choices remain in Export/Share.
 

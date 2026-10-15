@@ -260,7 +260,7 @@ private object NoMotionScheme : MotionScheme {
             }
         }
         LaunchedEffect(readerReady, state.zoomCommand) {
-            if (readerReady) web?.evaluateJavascript("window.supermdSetZoom?.(${state.zoom})", null)
+            if (readerReady) web?.evaluateJavascript("window.supermdSetZoom?.(${state.zoom},${state.zoomCommand})", null)
         }
         val headings by model.headings.collectAsStateWithLifecycle()
         val imageOverlay by model.imageOverlay.collectAsStateWithLifecycle()
@@ -494,6 +494,7 @@ private class NoteDestination(mime: String, private val preferred: () -> String)
 @Composable private fun Settings(state: StudioState, model: StudioViewModel, activity:MainActivity, noteLocation: String, chooseNoteLocation: ()->Unit, recoverDraft:()->Unit, importTheme:()->Unit, exportTheme:()->Unit, importFont: ()->Unit) {
     val update by model.updates.state.collectAsStateWithLifecycle()
     val scope=rememberCoroutineScope()
+    val downloadPermission=rememberLauncherForActivityResult(ActivityResultContracts.RequestPermission()){scope.launch{model.updates.download()}}
     Column(Modifier.fillMaxWidth().verticalScroll(rememberScrollState()), horizontalAlignment = Alignment.CenterHorizontally) {
         Column(Modifier.widthIn(max = 760.dp).fillMaxWidth().padding(16.dp), verticalArrangement = Arrangement.spacedBy(16.dp)) {
             SettingsSection("Appearance") {
@@ -572,10 +573,10 @@ private class NoteDestination(mime: String, private val preferred: () -> String)
                 Text("© Yash Mahawar · MIT License",style=MaterialTheme.typography.bodySmall)
                 Row(verticalAlignment=Alignment.CenterVertically){Text("Check for updates on opening",Modifier.weight(1f));Switch(update.checkOnOpen,{model.updates.preference(checkOnOpen=it)})}
                 Row(verticalAlignment=Alignment.CenterVertically){Text("Automatically download updates",Modifier.weight(1f));Switch(update.automatic,{model.updates.preference(automatic=it)})}
-                Text("Only published release APKs. Downloads are checked against the release checksum and this app's signing certificate. Android asks for approval before installation.",color=MaterialTheme.colorScheme.onSurfaceVariant)
+                Text("Only published release APKs, verified against the release checksum and signing certificate. Downloads are remembered between launches and saved in Downloads → Super MD. Android asks for approval; the app's installer copies are removed after a successful upgrade, not after cancellation.",color=MaterialTheme.colorScheme.onSurfaceVariant)
                 if(update.status.isNotBlank())Text(update.status)
                 FilledTonalButton(onClick={scope.launch{model.updates.check()}},enabled=!update.checking){Text("Check for updates")}
-                if(update.version!=null)Button(onClick={if(update.ready)runCatching{model.updates.install(activity)}.onFailure{model.fail(it.message ?: "Could not open installer")} else scope.launch{model.updates.download()}},enabled=!update.checking){Text(if(update.ready)"Install update" else "Download update")}
+                if(update.version!=null)Button(onClick={if(update.ready)runCatching{model.updates.install(activity)}.onFailure{model.fail(it.message ?: "Could not open installer")} else if(Build.VERSION.SDK_INT<=28 && activity.checkSelfPermission(android.Manifest.permission.WRITE_EXTERNAL_STORAGE)!=android.content.pm.PackageManager.PERMISSION_GRANTED)downloadPermission.launch(android.Manifest.permission.WRITE_EXTERNAL_STORAGE) else scope.launch{model.updates.download()}},enabled=!update.checking){Text(if(update.ready)"Install update" else "Download update")}
                 TextButton(onClick={activity.startActivity(Intent(android.provider.Settings.ACTION_APP_NOTIFICATION_SETTINGS).putExtra(android.provider.Settings.EXTRA_APP_PACKAGE,activity.packageName))}){Text("Update notification permissions")}
             }
         }

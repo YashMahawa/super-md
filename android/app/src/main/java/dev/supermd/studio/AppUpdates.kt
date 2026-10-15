@@ -5,9 +5,12 @@ import android.app.NotificationChannel
 import android.app.NotificationManager
 import android.app.PendingIntent
 import android.content.Intent
+import android.content.ContentValues
 import android.content.pm.PackageManager
 import android.net.Uri
 import android.os.Build
+import android.os.Environment
+import android.provider.MediaStore
 import androidx.core.app.NotificationCompat
 import androidx.core.content.FileProvider
 import kotlinx.coroutines.Dispatchers
@@ -45,6 +48,102 @@ class AppUpdates(private val app:Application) {
     val state=mutable.asStateFlow()
     private var release:UpdateRelease?=null
     private var readyFile:File?=null
+    private val folder get()=File(app.filesDir,"updates").apply{mkdirs()}
+    private val receipt get()=File(folder,"ready.json")
+    private var restored=false
+    private fun hash(file:File):String {
+        val digest=MessageDigest.getInstance("SHA-256")
+        file.inputStream().use{input->val buffer=ByteArray(256*1024);while(true){val n=input.read(buffer);if(n<0)break;digest.update(buffer,0,n)}}
+        return digest.digest().joinToString(""){"%02x".format(it)}
+    }
+    private fun saveReceipt(value:JSONObject) {
+        if(receipt.isFile && receipt.length()<=8192) {
+            val previous=runCatching{JSONObject(receipt.readText())}.getOrNull();val old=previous?.optString("version").orEmpty()
+            if(Regex("\\d+\\.\\d+\\.\\d+").matches(old) && old!=value.getString("version")) {
+                val archive=android.util.AtomicFile(File(folder,"download-$old.json"));val output=archive.startWrite()
+                try {output.write(previous.toString().toByteArray(Charsets.UTF_8));archive.finishWrite(output)}catch(error:Exception){archive.failWrite(output);throw error}
+            }
+        }
+        val target=android.util.AtomicFile(receipt);val output=target.startWrite()
+        try {output.write(value.toString().toByteArray(Charsets.UTF_8));target.finishWrite(output)}catch(error:Exception){target.failWrite(output);throw error}
+    }
+    private fun publishDownload(file:File,saved:JSONObject):Boolean {
+        if(Build.VERSION.SDK_INT>=29) {
+            val existing=saved.optString("publicUri")
+            if(existing.isNotEmpty()) {
+                val uri=Uri.parse(existing)
+                val complete=runCatching{app.contentResolver.query(uri,arrayOf(MediaStore.MediaColumns.SIZE,MediaStore.MediaColumns.IS_PENDING,MediaStore.MediaColumns.OWNER_PACKAGE_NAME),null,null,null)?.use{cursor->
+                    if(cursor.moveToFirst() && cursor.getString(2)==app.packageName){
+                        if(cursor.getLong(0)==file.length()&&cursor.getInt(1)==0)true
+                        else {app.contentResolver.delete(uri,null,null);false}
+                    }else false
+                } ?: false}.getOrDefault(false)
+                if(complete)return true
+            }
+            val values=ContentValues().apply{put(MediaStore.MediaColumns.DISPLAY_NAME,file.name);put(MediaStore.MediaColumns.MIME_TYPE,"application/vnd.android.package-archive");put(MediaStore.MediaColumns.RELATIVE_PATH,Environment.DIRECTORY_DOWNLOADS+"/Super MD");put(MediaStore.MediaColumns.IS_PENDING,1)}
+            val uri=app.contentResolver.insert(MediaStore.Downloads.EXTERNAL_CONTENT_URI,values) ?: error("Could not create Downloads entry")
+            // Persist ownership before copying so interrupted downloads can be cleaned up.
+            saved.put("publicUri",uri.toString());saveReceipt(saved)
+            try {
+                app.contentResolver.openOutputStream(uri)?.use{output->file.inputStream().use{it.copyTo(output)}} ?: error("Could not write Downloads entry")
+                app.contentResolver.update(uri,ContentValues().apply{put(MediaStore.MediaColumns.IS_PENDING,0)},null,null)
+                return true
+            }catch(error:Exception){app.contentResolver.delete(uri,null,null);saved.remove("publicUri");saveReceipt(saved);throw error}
+        }
+        if(app.checkSelfPermission(android.Manifest.permission.WRITE_EXTERNAL_STORAGE)!=PackageManager.PERMISSION_GRANTED)return false
+        @Suppress("DEPRECATION") val publicFolder=File(Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_DOWNLOADS),"Super MD").apply{mkdirs()}
+        val previous=saved.optString("publicPath")
+        if(previous.isNotBlank()) {
+            val fileBefore=File(previous)
+            if(fileBefore.canonicalFile.parentFile==publicFolder.canonicalFile && fileBefore.isFile && hash(fileBefore)==saved.getString("sha256"))return true
+        }
+        val target=File.createTempFile("Super-MD-${saved.getString("version")}-",".apk",publicFolder)
+        saved.put("publicPath",target.canonicalPath);saveReceipt(saved)
+        file.copyTo(target,overwrite=true)
+        android.media.MediaScannerConnection.scanFile(app,arrayOf(target.absolutePath),arrayOf("application/vnd.android.package-archive"),null)
+        return true
+    }
+    private fun clearInstalled(saved:JSONObject,file:File,record:File=receipt) {
+        if(Build.VERSION.SDK_INT>=29) {
+            val uri=Uri.parse(saved.optString("publicUri"))
+            if(uri.authority=="media" && uri.path?.startsWith("/external/downloads/")==true)runCatching {
+                app.contentResolver.query(uri,arrayOf(MediaStore.MediaColumns.OWNER_PACKAGE_NAME),null,null,null)?.use{cursor->if(cursor.moveToFirst()&&cursor.getString(0)==app.packageName)app.contentResolver.delete(uri,null,null)}
+            }
+        }else {
+            val path=saved.optString("publicPath")
+            @Suppress("DEPRECATION") val parent=File(Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_DOWNLOADS),"Super MD").canonicalFile
+            if(path.isNotBlank())runCatching {val publicFile=File(path);if(publicFile.canonicalFile.parentFile==parent && hash(publicFile)==saved.getString("sha256"))publicFile.delete()}
+        }
+        file.delete();record.delete()
+    }
+    suspend fun restore() {
+        if(restored || mutable.value.checking)return
+        restored=true;mutable.value=mutable.value.copy(checking=true)
+        try {
+            withContext(Dispatchers.IO) {
+                for(record in folder.listFiles().orEmpty().filter{Regex("download-\\d+\\.\\d+\\.\\d+\\.json").matches(it.name)}.take(64))runCatching {
+                    require(record.length()<=8192);val previous=JSONObject(record.readText());val target=previous.getString("version");stableVersion(target)
+                    val name=previous.getString("name");require(Regex("Super-MD-"+Regex.escape(target)+"-(arm64|x86_64|armeabi-v7a)-release\\.apk").matches(name))
+                    if(!newerVersion(target,BuildConfig.VERSION_NAME)&&BuildConfig.VERSION_CODE.toLong()>=previous.getLong("versionCode"))clearInstalled(previous,File(folder,name),record)
+                }
+                if(!receipt.exists())return@withContext
+                require(receipt.length()<=8192)
+                val saved=JSONObject(receipt.readText());val name=saved.getString("name");val target=saved.getString("version")
+                stableVersion(target);require(Regex("Super-MD-"+Regex.escape(target)+"-(arm64|x86_64|armeabi-v7a)-release\\.apk").matches(name))
+                val file=File(folder,name);require(file.canonicalFile.parentFile==folder.canonicalFile)
+                // Installation success is observed on a subsequent app launch, not
+                // inferred from opening (or cancelling) Android's installer.
+                if(!newerVersion(target,BuildConfig.VERSION_NAME) && BuildConfig.VERSION_CODE.toLong()>=saved.getLong("versionCode")) {clearInstalled(saved,file);return@withContext}
+                val info=UpdateRelease(target,name,officialAsset(saved.getString("url")),officialAsset(saved.getString("sums")),saved.getLong("size"))
+                require(info.size in 1..536_870_912 && file.length()==info.size && hash(file)==saved.getString("sha256")){"Saved installer changed"}
+                release=info;verifyUpgrade(file)
+                readyFile=file
+                val public=runCatching{publishDownload(file,saved)}.getOrDefault(false)
+                mutable.value=mutable.value.copy(version=target,ready=true,status=if(public)"Verified APK ready in Downloads → Super MD." else "Verified APK ready. Allow storage access to also save it in Downloads.")
+            }
+        }catch(error:Exception){mutable.value=mutable.value.copy(status="Saved update unavailable: ${error.message}")}
+        finally {mutable.value=mutable.value.copy(checking=false)}
+    }
     fun preference(automatic:Boolean?=null,checkOnOpen:Boolean?=null) {
         mutable.value=mutable.value.copy(automatic=automatic ?: mutable.value.automatic,checkOnOpen=checkOnOpen ?: mutable.value.checkOnOpen)
         prefs.edit().apply{automatic?.let{putBoolean("automatic",it)};checkOnOpen?.let{putBoolean("checkOnOpen",it)}}.apply()
@@ -66,6 +165,7 @@ class AppUpdates(private val app:Application) {
         finally{conn.disconnect()}
     }
     suspend fun check() {
+        if(!restored)restore()
         if(mutable.value.checking)return
         mutable.value=mutable.value.copy(checking=true,status="Checking published releases…")
         try {
@@ -83,6 +183,10 @@ class AppUpdates(private val app:Application) {
                     UpdateRelease(version,name,officialAsset(apk.getString("browser_download_url")),officialAsset(sums.getString("browser_download_url")),size)
                 }
             }
+            if(info!=null && info.version==release?.version && readyFile?.isFile==true) {
+                mutable.value=mutable.value.copy(checking=false,status="Verified Super MD ${info.version} is already downloaded.");return
+            }
+            if(info==null && readyFile?.isFile==true) {mutable.value=mutable.value.copy(checking=false);return}
             release=info;readyFile=null
             mutable.value=mutable.value.copy(checking=false,version=info?.version,ready=false,status=if(info==null)"You're on the latest published version." else "Super MD ${info.version} is available.")
             if(info!=null){notifyAvailable();if(mutable.value.automatic)download()}
@@ -91,11 +195,15 @@ class AppUpdates(private val app:Application) {
     suspend fun download() {
         val info=release ?: return
         if(mutable.value.checking)return
+        if(readyFile?.isFile==true) {
+            try {withContext(Dispatchers.IO){if(receipt.isFile)publishDownload(readyFile!!,JSONObject(receipt.readText()))}}
+            catch(error:Exception){mutable.value=mutable.value.copy(status="Verified APK kept. Could not save a public Downloads copy: ${error.message}")}
+            return
+        }
         mutable.value=mutable.value.copy(checking=true,status="Downloading and verifying APK…")
         try {
             val file=withContext(Dispatchers.IO){
                 val expected=releaseChecksum(read(info.sums,65_536),info.name)
-                val folder=File(app.cacheDir,"updates").apply{mkdirs()}
                 val temporary=File.createTempFile("apk-",".part",folder)
                 try {
                     val digest=MessageDigest.getInstance("SHA-256");var count=0L;val conn=connection(info.url)
@@ -103,10 +211,18 @@ class AppUpdates(private val app:Application) {
                     val actual=digest.digest().joinToString(""){"%02x".format(it)}
                     require(count==info.size && actual==expected){"APK checksum mismatch"}
                     verifyUpgrade(temporary)
-                    val destination=File(folder,info.name);require(temporary.renameTo(destination)){"Could not stage APK"};destination
+                    val destination=File(folder,info.name);require(temporary.renameTo(destination)){"Could not stage APK"}
+                    @Suppress("DEPRECATION") val archive=app.packageManager.getPackageArchiveInfo(destination.absolutePath,0) ?: error("Invalid staged APK")
+                    @Suppress("DEPRECATION") val versionCode=if(Build.VERSION.SDK_INT>=28)archive.longVersionCode else archive.versionCode.toLong()
+                    val saved=JSONObject().put("version",info.version).put("name",info.name).put("url",info.url).put("sums",info.sums).put("size",info.size).put("sha256",expected).put("versionCode",versionCode)
+                    saveReceipt(saved)
+                    // Downloads publishing is not required for safe installation.
+                    // A provider/storage failure must not discard a verified APK.
+                    runCatching{publishDownload(destination,saved)}
+                    destination
                 } finally{temporary.delete()}
             }
-            readyFile=file;mutable.value=mutable.value.copy(checking=false,ready=true,status="Verified APK ready. Android will ask you to approve installation.")
+            readyFile=file;mutable.value=mutable.value.copy(checking=false,ready=true,status="Verified APK ready. Saved in Downloads when storage access is available. Android will ask you to approve installation; the download is removed only after a successful upgrade.")
             notifyAvailable()
         }catch(error:Exception){mutable.value=mutable.value.copy(checking=false,status="Update download failed: ${error.message}")}
     }

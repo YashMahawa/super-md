@@ -8,9 +8,12 @@ import json
 import platform
 import re
 import sys
+import os
+import tempfile
 import urllib.parse
 import urllib.request
 from pathlib import Path
+from documents import atomic_json
 
 REPO = "https://github.com/YashMahawa/super-md"
 API = "https://api.github.com/repos/YashMahawa/super-md/releases/latest"
@@ -58,12 +61,56 @@ def checksum(text, name):
         if match and match[2]==name:return match[1].lower()
     raise ValueError("Update checksum is missing")
 
-def download(info, directory):
+def validate_info(info):
+    version(info['version'])
+    if not re.fullmatch(r'Super-MD_'+re.escape(info['version'])+r'_(amd64\.AppImage|x64-setup\.exe|(?:x64|aarch64)\.dmg)',info['name']):
+        raise ValueError('Invalid installer name')
+    for key in ('url','checksums'):asset_url(info[key])
+    if info['url']!=f"{REPO}/releases/download/v{info['version']}/{info['name']}" or info['checksums']!=f"{REPO}/releases/download/v{info['version']}/SHA256SUMS":raise ValueError('Mismatched release assets')
+    if type(info['size']) is not int or not 0<info['size']<=1_500_000_000:raise ValueError('Invalid installer size')
+
+def verify_file(path, info, expected):
+    validate_info(info)
+    path=Path(path)
+    if path.is_symlink() or not path.is_file() or path.stat().st_size!=info['size'] or not re.fullmatch('[a-f0-9]{64}',expected):raise ValueError('Downloaded installer is missing or changed')
+    digest=hashlib.sha256()
+    with path.open('rb') as stream:
+        while chunk:=stream.read(256*1024):digest.update(chunk)
+    if digest.hexdigest()!=expected:raise ValueError('Downloaded installer checksum mismatch')
+    return str(path)
+
+def load_ready(state_dir, current):
+    """Restore without networking. Never delete a user's downloaded installer."""
+    record=Path(state_dir)/'ready.json'
+    if not record.is_file():return None
+    try:
+        if record.stat().st_size>8192:raise ValueError('Invalid update record')
+        saved=json.loads(record.read_text(encoding='utf-8'));info=saved['release'];validate_info(info)
+        if version(info['version'])<=version(current):
+            record.unlink(missing_ok=True);return None
+        verify_file(saved['path'],info,saved['sha256'])
+        return saved
+    except (OSError,ValueError,KeyError,TypeError):return None
+
+def download(info, directory, state_dir=None):
+    validate_info(info)
     with response(asset_url(info["checksums"])) as stream: sums=stream.read(65_537)
     if len(sums)>65_536: raise ValueError("Checksum manifest is too large")
     expected=checksum(sums.decode("utf-8"),info["name"])
     directory=Path(directory);directory.mkdir(parents=True,exist_ok=True)
-    target=directory/info["name"];temporary=target.with_suffix(target.suffix+".part")
+    target=directory/info["name"]
+    def remember(path):
+        if state_dir is not None:
+            Path(state_dir).mkdir(parents=True,exist_ok=True)
+            atomic_json(Path(state_dir)/'ready.json',{'release':info,'path':str(path.resolve()),'sha256':expected})
+        return str(path)
+    if target.exists() and not target.is_symlink():
+        try:verify_file(target,info,expected);return remember(target)
+        except ValueError:pass
+    # Preserve a conflicting download instead of overwriting it. A unique staging
+    # name also keeps two windows from corrupting one another's partial download.
+    fd,name=tempfile.mkstemp(prefix='.'+info['name']+'-',suffix='.part',dir=directory);os.close(fd)
+    temporary=Path(name)
     digest=hashlib.sha256();count=0
     try:
         with response(asset_url(info["url"])) as stream, temporary.open("wb") as output:
@@ -72,8 +119,9 @@ def download(info, directory):
                 if count>info["size"]:raise ValueError("Update exceeds its declared size")
                 digest.update(chunk);output.write(chunk)
         if count!=info["size"] or digest.hexdigest()!=expected:raise ValueError("Update checksum or size mismatch")
+        if target.exists() or target.is_symlink():target=directory/(info['name']+".verified-"+temporary.stem[-8:]+Path(info['name']).suffix)
         temporary.replace(target)
         if target.suffix==".AppImage":target.chmod(0o700)
-        return str(target)
+        return remember(target)
     finally:
         temporary.unlink(missing_ok=True)

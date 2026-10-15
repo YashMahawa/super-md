@@ -1,6 +1,7 @@
 // @vitest-environment jsdom
 import {expect,it} from 'vitest';
 import {applyCustomStyle} from './customTheme';
+import {componentContrast,componentRoles,componentMetrics} from './themeComponents';
 const base={surface:'#efe0db','surface-low':'#e8d8d0',text:'#30221b',primary:'#824322'};
 it('applies bounded values and removes every override when reset',()=>{
   const root=document.documentElement;
@@ -19,6 +20,24 @@ it('palette-only updates have identical layout keys',()=>{
   const a=applyCustomStyle(root,{colors:{heading:'#332244'},metrics:{headingWeight:700}},base);
   const b=applyCustomStyle(root,{colors:{heading:'#225544'},metrics:{headingWeight:700}},base);
   expect(a).toBe(b);
+});
+it('keeps component surfaces independent, fixes contrast and resets all component overrides',()=>{
+  const root=document.documentElement;
+  const key=applyCustomStyle(root,{colors:{'code-bg':'#fafafa','python-bg':'#162735','python-text':'#162735','python-header-bg':'#243b46','python-run-bg':'#8bc4b3','python-output-bg':'#e4f0e9','python-error-bg':'#642c36','table-bg':'#eee6da','table-border':'#816948','table-header-bg':'#33493d','syntax-keyword':'#283b42'},metrics:{tableBorderWidth:2,pythonRadius:18,pythonSourceMaxHeight:24}},base);
+  const prop=(k:string)=>root.style.getPropertyValue('--custom-'+k);
+  expect(prop('table-border')).toBe('#816948');expect(prop('table-border-width')).toBe('2px');
+  expect(prop('python-radius')).toBe('18px');expect(prop('python-height')).toBe('24em');
+  for(const [role,bg] of [['python-text','#162735'],['python-header-text','#243b46'],['python-run-text','#8bc4b3'],['python-output-text','#e4f0e9'],['python-error-text','#642c36'],['table-header-text','#33493d'],['syntax-keyword','#fafafa'],['python-syntax-keyword','#162735']])expect(componentContrast(prop(role),bg)).toBeGreaterThanOrEqual(4.5);
+  const next=applyCustomStyle(root,{colors:{'python-bg':'#e4f0e9'},metrics:{tableBorderWidth:2,pythonRadius:18,pythonSourceMaxHeight:24}},base);expect(next).toBe(key);
+  applyCustomStyle(root,undefined,base);
+  for(const role of [...componentRoles,'python-syntax-keyword',...Object.values(componentMetrics).map(v=>v[0])]){expect(prop(role)).toBe('');expect(root.hasAttribute('data-custom-'+role)).toBe(false);}
+});
+it('keeps striped tables legible and ignores invalid component injections and bounds',()=>{
+  const root=document.documentElement;
+  applyCustomStyle(root,{colors:{'table-bg':'#ffffff','table-row-alt-bg':'#000000','table-text':'#eeeeee','python-bg':'url(file:///secret)','python-text':'red'},metrics:{pythonRadius:33,tableCellPadding:3,codeFontScale:Infinity,pythonSourceMaxHeight:61}},base);
+  expect(root.style.getPropertyValue('--custom-table-row-alt-bg')).toBe('#ffffff');
+  expect(componentContrast(root.style.getPropertyValue('--custom-table-text'),'#ffffff')).toBeGreaterThanOrEqual(4.5);
+  for(const role of ['python-bg','python-text','python-radius','table-padding','code-scale','python-height'])expect(root.style.getPropertyValue('--custom-'+role)).toBe('');
 });
 it('renders safe paw tiles with independently adjustable size, opacity and spacing without layout changes',()=>{
   const root=document.documentElement;

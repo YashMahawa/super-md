@@ -39,7 +39,7 @@ const SourceEditor = memo(Editor);
 
 interface NoteView { editor?: PortableEditorSession; history?:NoteHistory; top?: number; rendered?: ReturnType<typeof exportRenderedViews> }
 interface ReaderState { id: string; content: string; path: string | null; mode: "live" | "editor" | "reader" | "split"; dark: boolean; fullscreen: boolean; font: string; size: number; spellCheck?:boolean; grammarCheck?:boolean; width?: number; widthPercent?:number; lineHeight?:number; colors: Record<string, string>; zoom: number; motion?: boolean; python?: string; viewState?: NoteView }
-declare global { interface Window {supermdDismiss?:()=>boolean;supermdSetZoom?:(zoom:number)=>void;supermdHeading?:(id:string,offset?:number)=>void;supermdHistory?:(direction:"undo"|"redo")=>void;supermdNativeWheel?:(dx:number,dy:number,point:Point,held:boolean)=>void;} }
+declare global { interface Window {supermdDismiss?:()=>boolean;supermdSetZoom?:(zoom:number,requestedAt?:number)=>void;supermdHeading?:(id:string,offset?:number)=>void;supermdHistory?:(direction:"undo"|"redo")=>void;supermdNativeWheel?:(dx:number,dy:number,point:Point,held:boolean)=>void;} }
 declare global { interface Window { supermdLoad?: (state: ReaderState) => void; supermdExport?: (options: ExportOptions) => void; supermdExportMarkdown?: () => void; supermdFind?: () => void; supermdPortable?: (save: boolean) => void; supermdZoomBy?: (factor:number,focus?:Point)=>void; supermdResetZoom?: ()=>void; supermdRepairMath?: ()=>void; supermdFlush?: (operation:Record<string,string>)=>void } }
 declare global { interface Window {supermdChromeInset?:(height:number)=>void} }
 declare global { interface Window {supermdSavePosition?:()=>void} }
@@ -53,6 +53,7 @@ function Reader() {
   const trustHost = useCallback((host:string)=>setTrustedHosts(current=>current.includes(host)?current:[...current,host]),[]);
   const reference = useRef(state); reference.current = state;
   const zoomReference = useRef(100);
+  const zoomGestureAt = useRef(0);
   const pendingChange = useRef(0);
   const noteViews = useRef(new Map<string, NoteView>());
   const histories=useRef(new Map<string,NoteHistory>());
@@ -147,6 +148,7 @@ function Reader() {
       replaying.current=false;
     };
     window.supermdZoomBy = (factor,focus=cursor.current) => {
+      zoomGestureAt.current=Date.now();
       if (document.querySelector(".image-viewer")) { window.dispatchEvent(new CustomEvent("supermd-image-zoom",{detail:{factor,point:focus}})); return; }
       cancelHeadingNavigation(document.querySelector('.android-reading'));
       const target=clampPreviewZoom((zoomTarget.current??zoomReference.current)*factor);zoomFocus.current=focus;
@@ -166,7 +168,7 @@ function Reader() {
       if(!zoomFrame.current)zoomFrame.current=requestAnimationFrame(step);
       window.clearTimeout(zoomTimer.current);const fullscreen=reference.current?.fullscreen;zoomTimer.current=window.setTimeout(()=>void invoke("zoom_changed",{zoom:target,fullscreen}),220);
     };
-    window.supermdSetZoom=value=>{zoomTarget.current=null;const next=clampPreviewZoom(value);if(Math.abs(next-zoomReference.current)<.01)return;cancelHeadingNavigation(document.querySelector('.android-reading'));zoomReference.current=next;applyZoomStyle();settleSelection();};
+    window.supermdSetZoom=(value,requestedAt)=>{if(requestedAt!==undefined&&requestedAt<zoomGestureAt.current)return;window.clearTimeout(zoomTimer.current);cancelAnimationFrame(zoomFrame.current);zoomFrame.current=0;zoomTarget.current=null;const next=clampPreviewZoom(value);if(Math.abs(next-zoomReference.current)<.01)return;cancelHeadingNavigation(document.querySelector('.android-reading'));zoomReference.current=next;applyZoomStyle();settleSelection();};
     window.supermdHeading=(id,offset)=>{markScrollInput();if(reference.current?.mode==="editor"){window.dispatchEvent(new CustomEvent("supermd-goto-offset",{detail:offset??0}));return;}const root=document.querySelector(".android-reading");if(root)navigateToHeading(root,id);};
     window.supermdResetZoom = () => { if (document.querySelector(".image-viewer")) { window.dispatchEvent(new Event("supermd-image-reset")); return; } window.supermdZoomBy?.(100/(zoomTarget.current??zoomReference.current)); };
     window.supermdRepairMath = () => setRepairing(true);
@@ -366,7 +368,7 @@ function Reader() {
     document.addEventListener("pointermove",track);document.addEventListener("pointerdown",down);document.addEventListener("pointerup",up);window.addEventListener("blur",up);
     document.addEventListener("pointermove",pan);document.addEventListener("pointercancel",up);
     const distance = (touches: TouchList) => Math.hypot(touches[0].clientX - touches[1].clientX, touches[0].clientY - touches[1].clientY);
-    const start = (event: TouchEvent) => { cancelHeadingNavigation((event.target as Element).closest('.android-reading'));if (event.touches.length === 2 && !(event.target as Element).closest("input,textarea,[data-independent-zoom]")) { window.clearTimeout(settleTimer.current);startDistance = distance(event.touches); startZoom = zoomReference.current; pinching = true;previousFocus={x:(event.touches[0].clientX+event.touches[1].clientX)/2,y:(event.touches[0].clientY+event.touches[1].clientY)/2}; } };
+    const start = (event: TouchEvent) => { cancelHeadingNavigation((event.target as Element).closest('.android-reading'));if (event.touches.length === 2 && !(event.target as Element).closest("input,textarea,[data-independent-zoom]")) { zoomGestureAt.current=Date.now();window.clearTimeout(zoomTimer.current);cancelAnimationFrame(zoomFrame.current);zoomFrame.current=0;zoomTarget.current=null;window.clearTimeout(settleTimer.current);startDistance = distance(event.touches); startZoom = zoomReference.current; pinching = true;previousFocus={x:(event.touches[0].clientX+event.touches[1].clientX)/2,y:(event.touches[0].clientY+event.touches[1].clientY)/2}; } };
     const move = (event: TouchEvent) => { if (event.touches.length === 2 && pinching && startDistance > 0) {
       event.preventDefault(); zoomTarget.current = null; zoomReference.current = clampPreviewZoom(startZoom * distance(event.touches) / startDistance);
       focus={x:(event.touches[0].clientX+event.touches[1].clientX)/2,y:(event.touches[0].clientY+event.touches[1].clientY)/2};
