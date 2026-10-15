@@ -454,8 +454,13 @@ ax.set_title("Matplotlib 3D figure")
     }
     @Test fun shareUsesTheSamePdfOptionsAndARestrictedSystemUri() {
         welcome()
+        // The real share/export actions intentionally stay disabled until the
+        // asynchronous WebView bridge is ready. Compose idleness alone cannot
+        // establish that readiness on a cold emulator.
+        compose.waitUntil(15_000) {compose.onAllNodes(hasContentDescription("Export") and isEnabled()).fetchSemanticsNodes().isNotEmpty()}
         compose.onNodeWithContentDescription("More actions").performClick()
-        compose.onNodeWithText("Share note").performClick()
+        compose.onNodeWithText("Share note").assertIsDisplayed().assertIsEnabled().performClick()
+        compose.waitUntil(15_000) {compose.onNodeWithText("Share your note").isDisplayed()}
         compose.onNodeWithText("Share your note").assertIsDisplayed()
         compose.onNodeWithText("Page numbers").assertExists()
         val model = androidx.lifecycle.ViewModelProvider(compose.activity)[StudioViewModel::class.java]
