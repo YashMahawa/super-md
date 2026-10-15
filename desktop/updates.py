@@ -100,10 +100,11 @@ def download(info, directory, state_dir=None):
     directory=Path(directory);directory.mkdir(parents=True,exist_ok=True)
     target=directory/info["name"]
     def remember(path):
+        canonical=str(path.resolve())
         if state_dir is not None:
             Path(state_dir).mkdir(parents=True,exist_ok=True)
-            atomic_json(Path(state_dir)/'ready.json',{'release':info,'path':str(path.resolve()),'sha256':expected})
-        return str(path)
+            atomic_json(Path(state_dir)/'ready.json',{'release':info,'path':canonical,'sha256':expected})
+        return canonical
     if target.exists() and not target.is_symlink():
         try:verify_file(target,info,expected);return remember(target)
         except ValueError:pass
