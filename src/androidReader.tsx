@@ -24,12 +24,13 @@ import MathRepairPanel from "./components/MathRepairPanel";
 import { captureScrollAnchor,markScrollInput,scrollInputVersion } from "./scrollAnchor";
 import ReadingSearch from "./components/ReadingSearch";
 import type { Point } from "./focalZoom";
-import { applyDocumentZoom,documentPoint,invalidateDocumentZoom,settleDocumentZoom,refreshDocumentExtent } from "./documentZoom";
+import { applyDocumentZoom,documentPoint,invalidateDocumentZoom,settleDocumentZoom,refreshDocumentExtent,enforceDocumentCenter } from "./documentZoom";
 import { documentOutline, navigateToHeading, cancelHeadingNavigation } from "./documentNavigation";
 import {recordHistory,replayHistory,historySize,validHistory,type NoteHistory} from './noteHistory';
 import {cachedEditorHistory} from './components/Editor';
 import {loadReadingLocation,saveReadingLocation,type ReadingLocation} from './readingLocations';
-import {mediaFilter,type MediaAppearance} from './mediaAppearance';
+import {mediaFilter,mediaTone,type MediaAppearance} from './mediaAppearance';
+import MediaThemeFilters from './components/MediaThemeFilters';
 import {DocumentAppearance} from './documentAppearance';
 import {applyCustomStyle,type CustomStyle} from './customTheme';
 const DocumentPreview = memo(MarkdownPreview);
@@ -42,7 +43,7 @@ declare global { interface Window {supermdDismiss?:()=>boolean;supermdSetZoom?:(
 declare global { interface Window { supermdLoad?: (state: ReaderState) => void; supermdExport?: (options: ExportOptions) => void; supermdExportMarkdown?: () => void; supermdFind?: () => void; supermdPortable?: (save: boolean) => void; supermdZoomBy?: (factor:number,focus?:Point)=>void; supermdResetZoom?: ()=>void; supermdRepairMath?: ()=>void; supermdFlush?: (operation:Record<string,string>)=>void } }
 declare global { interface Window {supermdChromeInset?:(height:number)=>void} }
 declare global { interface Window {supermdSavePosition?:()=>void} }
-interface ReaderState { customStyle?:CustomStyle; restorePosition?:boolean; readingLocation?:ReadingLocation|null; imageAppearance?:MediaAppearance; svgAppearance?:MediaAppearance; imageContrast?:number }
+interface ReaderState { centerLock?:boolean; customStyle?:CustomStyle; restorePosition?:boolean; readingLocation?:ReadingLocation|null; imageAppearance?:MediaAppearance; svgAppearance?:MediaAppearance; imageContrast?:number }
 function Reader() {
   const [state, setState] = useState<ReaderState | null>(null);
   const [repairing, setRepairing] = useState(false);
@@ -74,7 +75,7 @@ function Reader() {
   const settleSelection=()=>{window.clearTimeout(settleTimer.current);if(document.documentElement.dataset.platform!=="android")return;settleTimer.current=window.setTimeout(()=>document.querySelectorAll<HTMLElement>('.android-reading').forEach(settleDocumentZoom),240);};
   const modeOffset=useRef<number|null>(null);
   const anchors = (focus?:Point) => Array.from(document.querySelectorAll<HTMLElement>(".android-reading,.cm-scroller")).filter(root=>{const r=root.getBoundingClientRect();return !focus || focus.x>=r.left&&focus.x<=r.right&&focus.y>=r.top&&focus.y<=r.bottom;}).map(root=>captureScrollAnchor(root,focus));
-  const applyZoomStyle=(focus?:Point,previousFocus=focus,anchors?:Map<HTMLElement,Point|null>)=>{document.querySelector<HTMLElement>(".android-source")?.style.setProperty("--workspace-scale",String(zoomReference.current/100));document.querySelectorAll<HTMLElement>(".android-reading").forEach(root=>applyDocumentZoom(root,zoomReference.current,reference.current?.widthPercent??90,focus,previousFocus,anchors?.get(root)));};
+  const applyZoomStyle=(focus?:Point,previousFocus=focus,anchors?:Map<HTMLElement,Point|null>)=>{document.querySelector<HTMLElement>(".android-source")?.style.setProperty("--workspace-scale",String(zoomReference.current/100));document.querySelectorAll<HTMLElement>(".android-reading").forEach(root=>applyDocumentZoom(root,zoomReference.current,reference.current?.widthPercent??90,focus,previousFocus,anchors?.get(root),reference.current?.centerLock===true));};
   const anchored = (update:()=>void) => { const restore = anchors(); update(); requestAnimationFrame(()=>restore.forEach(callback=>callback())); };
   useEffect(() => {
     window.supermdSavePosition=()=>savePosition.current();
@@ -177,7 +178,7 @@ function Reader() {
       if(canvas){canvas.dispatchEvent(new CustomEvent("supermd-canvas-pan",{detail:{dx,dy},cancelable:true}));return;}
       const scroller=target?.closest<HTMLElement>(".android-reading,.cm-scroller,.image-viewer-canvas,.math-repair-list,.media-dialog") || document.querySelector<HTMLElement>('.android-reading');
       if(scroller?.matches('.android-reading')){cancelHeadingNavigation(scroller);if(Math.abs(dy)>2)requestChrome('hide');}
-      scroller?.scrollBy({left:dx,top:dy,behavior:"instant"});
+      scroller?.scrollBy({left:scroller.matches('.android-reading')&&reference.current?.centerLock?0:dx,top:dy,behavior:"instant"});
     };
     window.supermdFlush = operation => {
       savePosition.current();
@@ -226,6 +227,9 @@ function Reader() {
     const styleKey=applyCustomStyle(root,state.customStyle,state.colors);
     root.style.setProperty('--image-filter',mediaFilter(state.imageAppearance,state.dark,state.imageContrast));
     root.style.setProperty('--svg-filter',mediaFilter(state.svgAppearance,state.dark,state.imageContrast));
+    root.dataset.imageAppearance=state.imageAppearance??'original';root.dataset.svgAppearance=state.svgAppearance??'original';
+    root.style.setProperty('--media-edge',mediaTone(state.colors,state.dark).ink);
+    root.style.setProperty('--media-separation',`${Math.max(1,Math.min(2,state.imageContrast??1.25))}px`);
     // A palette-only change must not unset CSS zoom, remeasure a long page or
     // write scrollTop. These operations used to race with momentum scrolling.
     const nextLayout=JSON.stringify([state.id,state.mode,state.fullscreen,state.font,state.size,state.widthPercent,state.lineHeight,styleKey]);
@@ -242,6 +246,12 @@ function Reader() {
     // consume the pending scale at the default center before that frame runs.
     if(Math.abs(Number(page?.dataset.scale)*100-zoomReference.current)<.01 && !refreshDocumentExtent(root)){invalidateDocumentZoom(root);applyZoomStyle();settleSelection();}
   });});observer.observe(root);if(page)observer.observe(page);return()=>{observer.disconnect();cancelAnimationFrame(frame);};},[state?.id,state?.mode]);
+  useLayoutEffect(()=>{if(state){applyZoomStyle();settleSelection();}},[state?.centerLock]);
+  useEffect(()=>{
+    const lock=(event:Event)=>{const root=event.target;if(root instanceof HTMLElement&&root.matches('.android-reading'))enforceDocumentCenter(root);};
+    document.addEventListener('scroll',lock,{capture:true,passive:true});
+    return()=>document.removeEventListener('scroll',lock,true);
+  },[]);
   useEffect(()=>{
     if(!state || ["sans","serif","mono","noto","roboto","system","Manrope","Roboto","Noto Sans","Noto Serif","JetBrains Mono"].includes(state.font) || !window.SuperMD || typeof FontFace==="undefined")return;
     const family=state.font;
@@ -350,7 +360,7 @@ function Reader() {
         drag={root,point:{x:event.clientX,y:event.clientY},moved:false};root.setPointerCapture(event.pointerId);
       }
     };
-    const pan=(event:PointerEvent)=>{if(!drag)return;const dx=event.clientX-drag.point.x,dy=event.clientY-drag.point.y;if(!drag.moved && Math.hypot(dx,dy)<4)return;drag.moved=true;drag.root.classList.add("is-panning");window.getSelection()?.removeAllRanges();drag.root.scrollLeft-=dx;drag.root.scrollTop-=dy;drag.point={x:event.clientX,y:event.clientY};event.preventDefault();};
+    const pan=(event:PointerEvent)=>{if(!drag)return;const dx=event.clientX-drag.point.x,dy=event.clientY-drag.point.y;if(!drag.moved && Math.hypot(dx,dy)<4)return;drag.moved=true;drag.root.classList.add("is-panning");window.getSelection()?.removeAllRanges();if(!reference.current?.centerLock)drag.root.scrollLeft-=dx;drag.root.scrollTop-=dy;drag.point={x:event.clientX,y:event.clientY};event.preventDefault();};
     const up=()=>{mouseHeld=false;drag?.root.classList.remove("is-panning");drag=null;};
     document.addEventListener("pointermove",track);document.addEventListener("pointerdown",down);document.addEventListener("pointerup",up);window.addEventListener("blur",up);
     document.addEventListener("pointermove",pan);document.addEventListener("pointercancel",up);
@@ -390,6 +400,7 @@ function Reader() {
   }, []);
   if (!state) return <div className="reader-loading" role="status"><span className="expressive-loading-shape" aria-hidden="true"/>Opening your workspace</div>;
   return <DocumentAppearance.Provider value={documentAppearance}><div className={`android-document mode-${state.mode}`}>
+    <MediaThemeFilters colors={state.colors} dark={state.dark}/>
     {searching && <ReadingSearch content={state.content} close={()=>setSearching(false)} onChange={update} sourceSession={state.mode==="editor"||state.mode==="split"?state.id:undefined}/>}
     <ImageViewer />
     {repairing && <MathRepairPanel content={state.content} apply={update} close={()=>setRepairing(false)} />}

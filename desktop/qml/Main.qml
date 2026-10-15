@@ -179,18 +179,14 @@ ApplicationWindow {
                 OutlineList { visible: sidebarSection === "contents"; Layout.fillWidth: true; Layout.fillHeight: true; entries: viewState.outline || []; noteId: viewState.active }
                 Rectangle { Layout.fillWidth: true; height: 1; color: viewState.colors.outline }
                 Label { text: "Recent notes"; font.weight: Font.DemiBold; color: viewState.colors.text }
-                ListView {
+                RecentNotes {
                     Layout.fillWidth: true
                     Layout.preferredHeight: Math.min(240, viewState.recent.length * 40)
                     clip: true
                     model: viewState.recent
-                    delegate: Item {
-                        required property string modelData
-                        width: ListView.view.width - 20; height: 40
-                        ItemDelegate { id: recentEntry; anchors.left: parent.left; anchors.right: pin.left; height: 40; text: modelData.split("/").pop(); onClicked: studio.openNote(modelData); Hint { visible: recentEntry.hovered; text: modelData } }
-                        ActionButton { id: pin; anchors.right: parent.right; anchors.verticalCenter: parent.verticalCenter; glyph: "PushPin"; compact: true; tonal: studio.pinnedRecent.includes(modelData); ToolTip.text: studio.pinnedRecent.includes(modelData) ? "Unpin note" : "Pin note"; Accessible.name: ToolTip.text; onClicked: studio.pinRecent(modelData) }
-                    }
-                    ScrollBar.vertical: ExpressiveScrollBar { }
+                    pinned: studio.pinnedRecent
+                    onOpenRequested: path => studio.openNote(path)
+                    onPinRequested: path => studio.pinRecent(path)
                 }
                 Label { visible: !viewState.folder && !viewState.recent.length; text: "Open any folder for quick access. Your notes stay ordinary files."; wrapMode: Text.WordWrap; Layout.fillWidth: true; color: viewState.colors.muted }
                 Rectangle { Layout.fillWidth: true; height: 1; color: viewState.colors.outline }
@@ -231,6 +227,7 @@ ApplicationWindow {
                         Accessible.name: "Zoom percentage"
                     }
                     ActionButton { objectName: "fullscreenButton"; glyph: "Fullscreen"; icon.width: 24; icon.height: 24; compact: true; tonal: true; ToolTip.text: "Fullscreen (F11 · Esc to exit)"; onClicked: windowModes.setFullscreen(true) }
+                    ActionButton { objectName: "centerLockButton"; glyph: viewState.settings.centerLock ? "Lock" : "LockOpen"; compact: true; tonal: viewState.settings.centerLock; ToolTip.text: viewState.settings.centerLock ? "Centre locked · click to allow horizontal movement" : "Lock document to centre"; onClicked: studio.setting("centerLock",JSON.stringify(!viewState.settings.centerLock)) }
                     }
                 }
                 WebEngineView {
@@ -293,6 +290,8 @@ ApplicationWindow {
                 awake: window.chromeAwake
                 noteName: viewState.name
                 ready: viewState.readerReady && !viewState.busy
+                centerLocked: viewState.settings.centerLock
+                onCenterLockRequested: studio.setting("centerLock",JSON.stringify(!viewState.settings.centerLock))
                 onContentsRequested: contentsPopup.open()
                 onExitRequested: windowModes.setFullscreen(false)
                 onSaveRequested: studio.saveSafely()

@@ -4,6 +4,10 @@ Super MD themes are small, editable JSON files. A single file styles native desk
 
 Themes never change a note, its images, or its portable assets. Reading font, text size, width, zoom and PDF layout remain normal user settings. Themes do not execute CSS, JavaScript, Python or QML, and cannot fetch fonts, pictures or other network resources.
 
+Image appearance remains a separate, opt-in viewing setting. **Auto adapt** recolours every photo and SVG with the active accent and page colours, including imported themes; it preserves shading and alpha and guards the foreground/background contrast. **Separate from theme** preserves original image pixels and adds a legible backing and edge instead of boosting image contrast. Both can be set independently for images and SVGs; Original is the default. These adjustments do not rewrite assets or apply to PDF exports.
+
+The lock immediately after the fullscreen button keeps the document horizontally centered while scrolling and zooming. It starts enabled, is remembered across launches, and can be unlocked for free horizontal movement. It does not lock graph or image-viewer cameras. Pinned recent notes use a small indicator only; pin/unpin via right-click on desktop or long press on Android.
+
 ## Start with a template
 
 1. Open Settings → Custom theme → Export template. When a custom theme is active this exports that theme instead.

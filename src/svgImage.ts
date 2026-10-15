@@ -27,6 +27,22 @@ function luminance(color: string): number | null {
   return Math.max(r, g, b) - Math.min(r, g, b) > 24 ? -1 : (r + g + b) / 765;
 }
 
+/** A transparent white drawing needs a dark card, not a contrast filter.
+ * Inspect only bounded SVG paint metadata; do not rasterize full-size artwork. */
+export function svgContrastBackdrop(source:string):string {
+  if(source.length>1_000_000)return '#fdfdfc';
+  const xml=new DOMParser().parseFromString(source,'image/svg+xml');
+  if(xml.querySelector('parsererror'))return '#fdfdfc';
+  const paints=Array.from(source.matchAll(/(?:fill|stroke|color)\s*(?:=\s*["']|:\s*)([^;"'}]+)/gi),m=>m[1].trim());
+  const levels=paints.filter(p=>!NEUTRAL.test(p)).map(luminance);
+  return levels.length&&levels.every(v=>v!==null&&v>.75)?'#222026':'#fdfdfc';
+}
+
+export function svgDataBackdrop(uri:string):string|undefined {
+  if(!uri.startsWith('data:image/svg+xml')||uri.length>1_400_000)return undefined;
+  try {const comma=uri.indexOf(',');return svgContrastBackdrop(uri.slice(0,comma).includes(';base64')?atob(uri.slice(comma+1)):decodeURIComponent(uri.slice(comma+1)));}catch{return undefined;}
+}
+
 /** Monochrome line art adopts the reading text color so it stays readable in
  * dark and light themes; colored artwork keeps its colors on a white card,
  * and an SVG that paints its own background is shown as authored. */

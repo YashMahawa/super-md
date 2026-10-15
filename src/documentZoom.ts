@@ -1,7 +1,14 @@
 import type { Point } from "./focalZoom";
-type Geometry={page:HTMLElement;space:HTMLElement;width:number;height:number;viewport:number;bounds:DOMRect;originX:number;originY:number;left:number};
+type Geometry={page:HTMLElement;space:HTMLElement;width:number;height:number;viewport:number;bounds:DOMRect;originX:number;originY:number;left:number;spaceWidth:number;locked:boolean};
 const geometry=new WeakMap<HTMLElement,Geometry>();
 export function invalidateDocumentZoom(root:HTMLElement):void {geometry.delete(root);}
+/** Uses cached geometry only: a horizontal lock must never fight vertical
+ * momentum, remeasure a large note, or alter independent image/plot cameras. */
+export function enforceDocumentCenter(root:HTMLElement):void {
+  const measured=geometry.get(root);if(!measured?.locked)return;
+  const middle=Math.max(0,(measured.spaceWidth-measured.viewport)/2);
+  if(Math.abs(root.scrollLeft-middle)>.5)root.scrollLeft=middle;
+}
 /** Lazy math/images can change page height while the user scrolls. Update the
  * extent only: reapplying zoom here would repeatedly unset selection zoom and
  * write scrollTop, fighting touchpad momentum and native selection handles. */
@@ -37,12 +44,12 @@ export function documentPoint(root:HTMLElement, focus?:Point):Point|null {
   const target=focus||{x:bounds.left+bounds.width/2,y:bounds.top+(root.scrollTop<1?0:bounds.height*.35)};
   return {x:(target.x-measured.originX-measured.left+root.scrollLeft)/scale,y:(target.y-measured.originY+root.scrollTop)/scale};
 }
-export function applyDocumentZoom(root:HTMLElement, zoom:number, widthPercent:number, focus?:Point, previousFocus=focus, anchor?:Point|null):void {
+export function applyDocumentZoom(root:HTMLElement, zoom:number, widthPercent:number, focus?:Point, previousFocus=focus, anchor?:Point|null, centerLocked=false):void {
   let measured=geometry.get(root);
   if(!measured){
     const page=root.querySelector<HTMLElement>(".document-page");if(!page)return;
     const old=page.getBoundingClientRect(),bounds=root.getBoundingClientRect(),left=Number(page.dataset.zoomLeft)||0;
-    measured={page,space:page.parentElement!,width:0,height:page.offsetHeight,viewport:root.clientWidth,bounds,originX:old.left+root.scrollLeft-left,originY:old.top+root.scrollTop,left};geometry.set(root,measured);
+    measured={page,space:page.parentElement!,width:0,height:page.offsetHeight,viewport:root.clientWidth,bounds,originX:old.left+root.scrollLeft-left,originY:old.top+root.scrollTop,left,spaceWidth:root.clientWidth,locked:centerLocked};geometry.set(root,measured);
   }
   const {page,space,bounds,viewport}=measured;
   const first=!page.dataset.scale;
@@ -63,6 +70,7 @@ export function applyDocumentZoom(root:HTMLElement, zoom:number, widthPercent:nu
   const room=overflow?Math.max(16,viewport*.25):fullscreen?Math.max(0,viewport-scaled-32):0;
   const left=overflow?room:room?16+room:Math.max(16,(viewport-scaled)/2);
   const spaceWidth=overflow?scaled+2*room:room?viewport+room:viewport;
+  measured.spaceWidth=spaceWidth;measured.locked=centerLocked;root.dataset.centerLocked=String(centerLocked);
   if(page.style.zoom && page.style.zoom!=="1")page.style.zoom="1";
   delete page.dataset.selectionScale;
   delete page.dataset.selectionModel;
@@ -75,9 +83,11 @@ export function applyDocumentZoom(root:HTMLElement, zoom:number, widthPercent:nu
   // A magnified page opens with its line starts in view; fullscreen slack is centred.
   if(first && !focus){root.scrollLeft=overflow?room-16:(spaceWidth-viewport)/2;root.scrollTop=0;}
   else {
-    root.scrollLeft=measured.originX+left+point.x*next-target.x;root.scrollTop=measured.originY+point.y*next-target.y;
+    if(!centerLocked)root.scrollLeft=measured.originX+left+point.x*next-target.x;
+    root.scrollTop=measured.originY+point.y*next-target.y;
     // Keyboard/settings zoom has no focal point: keep line starts where they
     // were instead of pushing them off the left edge.
-    if(!focus&&overflow&&visibleLeft>=0)root.scrollLeft=left-Math.min(visibleLeft,room);
+    if(!centerLocked&&!focus&&overflow&&visibleLeft>=0)root.scrollLeft=left-Math.min(visibleLeft,room);
   }
+  enforceDocumentCenter(root);
 }

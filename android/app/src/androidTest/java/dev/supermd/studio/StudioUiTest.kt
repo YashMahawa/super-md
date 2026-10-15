@@ -28,6 +28,7 @@ class StudioUiTest {
             model.edit(before.active.id, before.active.content)
             model.mode(before.mode)
             model.zoom(before.normalZoom)
+            model.centerLock(before.centerLock)
             model.flush()
             assertEquals(before.active.content, model.state.value.active.content)
         }
@@ -107,10 +108,57 @@ class StudioUiTest {
         compose.runOnIdle {assertEquals("Viewing must not import a second asset or append a broken block",content,model.state.value.active.content)}
         javascriptUntil("document.querySelectorAll('.image-error,.render-error').length") {it=="0"}
     }
+    @Test fun mediaUsesAccentPixelsAndCenterLockIsARealPersistentControl() {
+        welcome()
+        val model=androidx.lifecycle.ViewModelProvider(compose.activity)[StudioViewModel::class.java]
+        val before=model.state.value;temporaryNoteState=before
+        val content="# Accent media\n\n```svg\n<svg xmlns=\"http://www.w3.org/2000/svg\" width=\"160\" height=\"100\"><rect width=\"160\" height=\"100\" fill=\"black\"/></svg>\n```"
+        try {
+            compose.runOnIdle {model.fullscreen(false);model.appearance(accent="blue",theme="dark",motion=false);model.centerLock(true);model.readingPreference("svgAppearance","auto");model.edit(model.state.value.active.id,content);model.mode("reader");model.zoom(100f)}
+            javascriptUntil("document.querySelector('h1#accent-media')!==null") {it=="true"}
+            javascriptUntil("document.querySelector('.android-reading')?.dataset.centerLocked") {it=="\"true\""}
+            compose.onNodeWithContentDescription("Centre locked · unlock horizontal movement").performClick()
+            compose.waitUntil(5000){!model.state.value.centerLock}
+            javascriptUntil("document.querySelector('.android-reading')?.dataset.centerLocked") {it=="\"false\""}
+            compose.onNodeWithContentDescription("Lock document to centre").performClick()
+            compose.waitUntil(5000){model.state.value.centerLock}
+            fun painted(expected:Int) {
+                val raw=javascriptUntil("(()=>{const i=document.querySelector('.svg-diagram');if(!i?.complete)return null;const r=i.getBoundingClientRect();return {x:r.left+r.width/2,y:r.top+r.height/2,width:innerWidth};})()") {it.contains("\"width\"")}
+                val point=org.json.JSONObject(raw);val xy=AtomicReference(IntArray(2));val scale=AtomicReference(1f)
+                compose.runOnIdle {val reader=web(compose.activity.window.decorView)!!;val location=IntArray(2);reader.getLocationOnScreen(location);xy.set(location);scale.set(reader.width.toFloat()/point.getDouble("width").toFloat())}
+                var observed=0
+                compose.waitUntil(15_000) {
+                    val bitmap=androidx.test.platform.app.InstrumentationRegistry.getInstrumentation().uiAutomation.takeScreenshot()
+                    try {if(bitmap==null)false else {
+                        observed=bitmap.getPixel(xy.get()[0]+(point.getDouble("x")*scale.get()).toInt(),xy.get()[1]+(point.getDouble("y")*scale.get()).toInt())
+                        listOf(16,8,0).all {shift->kotlin.math.abs((observed shr shift and 255)-(expected shr shift and 255))<=2}
+                    }} finally {bitmap?.recycle()}
+                }
+                assertTrue("Actual image pixels must follow the theme, observed #${Integer.toHexString(observed)}",listOf(16,8,0).all {shift->kotlin.math.abs((observed shr shift and 255)-(expected shr shift and 255))<=2})
+            }
+            fun ink():Int {
+                val raw=javascriptUntil("document.documentElement.style.getPropertyValue('--media-edge')") {it.startsWith("\"#")}
+                return android.graphics.Color.parseColor(org.json.JSONArray("[$raw]").getString(0))
+            }
+            val blue=ink();painted(blue)
+            compose.runOnIdle {model.appearance(accent="rose")}
+            javascriptUntil("document.documentElement.style.getPropertyValue('--media-edge')!==${org.json.JSONObject.quote(String.format("#%06x",blue and 0xffffff))}") {it=="true"}
+            val rose=ink();assertNotEquals(blue,rose);painted(rose)
+            compose.runOnIdle {model.readingPreference("svgAppearance","contrast")}
+            javascriptUntil("document.documentElement.dataset.svgAppearance") {it=="\"contrast\""}
+            painted(android.graphics.Color.BLACK)
+            compose.runOnIdle {assertEquals(content,model.state.value.active.content)}
+        } finally {
+            compose.runOnIdle {model.appearance(accent=before.accent,theme=before.theme,motion=before.motion);model.readingPreference("svgAppearance",before.svgAppearance);model.centerLock(before.centerLock);model.fullscreen(before.fullscreen)}
+        }
+    }
     @Test fun checkingTasksKeepsNativeReadingPositionThroughUndoAndRedo() {
         welcome()
         val model=androidx.lifecycle.ViewModelProvider(compose.activity)[StudioViewModel::class.java]
         temporaryNoteState=model.state.value
+        // This fixture deliberately pans to a left-edge checkbox at 180%.
+        // Free horizontal navigation is an explicit user choice with the lock.
+        compose.runOnIdle {model.centerLock(false)}
         val content=(0 until 65).joinToString("\n\n") { index ->
             "## Task section $index\n\n" +
                 (if(index==42) "- [ ] Keep my place\n- [ ] Another task\n\n" else "") +
@@ -239,6 +287,9 @@ class StudioUiTest {
         val model=androidx.lifecycle.ViewModelProvider(compose.activity)[StudioViewModel::class.java]
         temporaryNoteState=model.state.value
         val content="# Selection\n\nAlpha Bravo Charlie Delta\n\n[Go to distant chapter](#chapter-599)\n\n"+(0 until 600).joinToString("\n"){"## Chapter $it\n\n${"Readable study paragraph. ".repeat(8)}\n"}
+        // Native selection at a magnified line start exercises unlocked pan;
+        // the centre-lock test separately checks the new locked geometry.
+        compose.runOnIdle {model.centerLock(false)}
         compose.runOnIdle{model.edit(model.state.value.active.id,content);model.mode("reader");model.zoom(175f)}
         javascriptUntil("document.querySelector('.document-page')?.dataset.selectionScale"){it=="\"1.75\""}
         // Focal zoom deliberately preserves the previous viewport location.

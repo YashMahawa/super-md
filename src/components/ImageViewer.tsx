@@ -2,9 +2,15 @@ import { useEffect, useRef, useState } from "react";
 import { zoomTranslation, type Point } from "../focalZoom";
 import { setReaderOverlay } from "../readerOverlays";
 import { wheelIntent } from "../wheelIntent";
+import type {CSSProperties} from 'react';
+
+function presentation(target:HTMLImageElement):CSSProperties {
+  const style=getComputedStyle(target);
+  return {filter:style.filter,backgroundColor:style.backgroundColor,outline:style.outline,outlineOffset:style.outlineOffset,borderRadius:style.borderRadius,boxShadow:style.boxShadow};
+}
 
 export default function ImageViewer() {
-  const [image, setImage] = useState<{ src: string; alt: string; filter:string; owner: HTMLElement | null } | null>(null);
+  const [image, setImage] = useState<{ src: string; alt: string; presentation:CSSProperties; owner: HTMLElement | null } | null>(null);
   const [zoom, setZoom] = useState(100), [pan, setPan] = useState({ x: 0, y: 0 });
   const pointers = useRef(new Map<number, Point>()), gesture = useRef({ distance: 0, center: {x:0,y:0} });
   const zoomRef = useRef(zoom); zoomRef.current = zoom;
@@ -25,7 +31,7 @@ export default function ImageViewer() {
       if (!target?.currentSrc) return;
       event.preventDefault(); event.stopImmediatePropagation();
       source.current=target;
-      setImage({ src: target.currentSrc, alt: target.alt || "Image", filter:getComputedStyle(target).filter, owner: target.closest("[data-note-image-source]") }); fit();
+      setImage({ src: target.currentSrc, alt: target.alt || "Image", presentation:presentation(target), owner: target.closest("[data-note-image-source]") }); fit();
     };
     document.addEventListener("click", open, true);
     return () => document.removeEventListener("click", open, true);
@@ -37,13 +43,13 @@ export default function ImageViewer() {
     const target=source.current;
     const sync=()=>{
       if(!target.isConnected){setImage(null);return;}
-      const src=target.currentSrc||target.src,filter=getComputedStyle(target).filter;
-      setImage(previous=>previous&&(previous.src!==src||previous.filter!==filter)?{...previous,src,filter}:previous);
+      const src=target.currentSrc||target.src,style=presentation(target);
+      setImage(previous=>previous&&(previous.src!==src||JSON.stringify(previous.presentation)!==JSON.stringify(style))?{...previous,src,presentation:style}:previous);
     };
     // Appearance changes should affect an already-open viewer too, without
     // resetting its magnification or moving the image under the person's hand.
     const observer=new MutationObserver(sync);
-    observer.observe(document.documentElement,{attributes:true,attributeFilter:['style','data-theme']});
+    observer.observe(document.documentElement,{attributes:true,attributeFilter:['style','data-theme','data-image-appearance','data-svg-appearance']});
     observer.observe(target,{attributes:true,attributeFilter:['src','style']});
     target.addEventListener('load',sync);
     return()=>{observer.disconnect();target.removeEventListener('load',sync);};
@@ -81,7 +87,7 @@ export default function ImageViewer() {
       if (pointers.current.size === 2) { const [a,b] = [...pointers.current.values()], center={x:(a.x+b.x)/2,y:(a.y+b.y)/2}, distance=Math.hypot(a.x-b.x,a.y-b.y); if (gesture.current.distance) { scale(zoomRef.current * distance / gesture.current.distance, gesture.current.center); translate({x:panRef.current.x+center.x-gesture.current.center.x,y:panRef.current.y+center.y-gesture.current.center.y}); } gesture.current={distance,center}; }
       else translate({ x: panRef.current.x + event.clientX-old.x, y: panRef.current.y + event.clientY-old.y });
     }} onPointerUp={event => pointers.current.delete(event.pointerId)} onPointerCancel={event => pointers.current.delete(event.pointerId)}>
-      <img draggable={false} src={image.src} alt={image.alt} style={{ filter:image.filter, transform: `translate(${pan.x}px,${pan.y}px) scale(${zoom/100})` }} />
+      <img draggable={false} src={image.src} alt={image.alt} style={{ ...image.presentation, transform: `translate(${pan.x}px,${pan.y}px) scale(${zoom/100})` }} />
     </div>
     <footer><output aria-label="Image zoom">{Math.round(zoom)}%</output>{image.owner && <><button onClick={() => edit("replace")}>Replace</button><button onClick={() => edit("remove")}>Remove</button></>}</footer>
   </section>;

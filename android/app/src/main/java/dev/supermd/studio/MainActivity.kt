@@ -245,11 +245,11 @@ private object NoMotionScheme : MotionScheme {
         val wide = displayIsLarge && maxWidth >= 720.dp && maxHeight >= 400.dp
         val actualMode = if (!wide && state.mode == "split") "live" else state.mode
         val readerContent=remember {arrayOfNulls<String>(1)}
-        LaunchedEffect(readerReady, state.active, actualMode, dark, state.fullscreen, state.font, state.size, state.widthPercent,state.lineHeight,state.spellCheck,state.grammarCheck,state.restorePosition,state.imageAppearance,state.svgAppearance,state.imageContrast,state.customTheme,tokens, hinge, motion) {
+        LaunchedEffect(readerReady, state.active, actualMode, dark, state.fullscreen, state.font, state.size, state.widthPercent,state.lineHeight,state.spellCheck,state.grammarCheck,state.restorePosition,state.centerLock,state.imageAppearance,state.svgAppearance,state.imageContrast,state.customTheme,tokens, hinge, motion) {
             if (!readerReady) readerNote[0] = null
             if (readerReady) {
                 val note = state.active
-                val payload = JSONObject().put("id", note.id).apply { if (readerNote[0] == note.id && (readerContent[0] === note.content || model.readerEcho[note.id] === note.content)) put("contentUnchanged", true) else put("content", note.content) }.put("path", note.uri ?: note.id).put("mode", actualMode).put("dark", dark).put("fullscreen", state.fullscreen).put("font", state.font).put("size", state.size).put("widthPercent",state.widthPercent).put("lineHeight",state.lineHeight).put("spellCheck",state.spellCheck).put("grammarCheck",state.grammarCheck).put("restorePosition",state.restorePosition).put("imageAppearance",state.imageAppearance).put("svgAppearance",state.svgAppearance).put("imageContrast",state.imageContrast).put("colors", tokens).put("zoom", state.zoom).put("motion", motion)
+                val payload = JSONObject().put("id", note.id).apply { if (readerNote[0] == note.id && (readerContent[0] === note.content || model.readerEcho[note.id] === note.content)) put("contentUnchanged", true) else put("content", note.content) }.put("path", note.uri ?: note.id).put("mode", actualMode).put("dark", dark).put("fullscreen", state.fullscreen).put("font", state.font).put("size", state.size).put("widthPercent",state.widthPercent).put("lineHeight",state.lineHeight).put("spellCheck",state.spellCheck).put("grammarCheck",state.grammarCheck).put("restorePosition",state.restorePosition).put("centerLock",state.centerLock).put("imageAppearance",state.imageAppearance).put("svgAppearance",state.svgAppearance).put("imageContrast",state.imageContrast).put("colors", tokens).put("zoom", state.zoom).put("motion", motion)
                 payload.put("readingLocation",model.readingLocation(note.uri))
                 payload.put("customStyle",themeStyle(themeDocument(state.customTheme),if(state.fullscreen)state.fullscreenTheme else state.theme,dark))
                 web?.evaluateJavascript("document.documentElement.dataset.platform='android';window.supermdLoad?.($payload)", null)
@@ -303,13 +303,7 @@ private object NoMotionScheme : MotionScheme {
                         LazyColumn(Modifier.heightIn(max=200.dp),verticalArrangement=Arrangement.spacedBy(6.dp),contentPadding=PaddingValues(bottom=12.dp)) {
                             items(recent,key={it.uri}) { note ->
                                 val selected=state.active.uri==note.uri
-                                Surface(onClick={model.open(android.net.Uri.parse(note.uri),note.relative);scope.launch{drawer.close()}},shape=RoundedCornerShape(16.dp),color=if(selected)palette.secondaryContainer else palette.surfaceContainerLow,contentColor=if(selected)palette.onSecondaryContainer else palette.onSurface) {
-                                    Row(Modifier.fillMaxWidth().padding(horizontal=14.dp,vertical=14.dp),verticalAlignment=Alignment.CenterVertically,horizontalArrangement=Arrangement.spacedBy(12.dp)) {
-                                        Icon(painterResource(R.drawable.symbol_file),null,Modifier.size(24.dp))
-                                        Text(note.name,Modifier.weight(1f),maxLines=2,overflow=TextOverflow.Ellipsis,style=MaterialTheme.typography.bodyMedium)
-                                        IconButton(onClick={model.pinRecent(note.uri)}) {Icon(Icons.Rounded.PushPin,if(note.pinned)"Unpin note" else "Pin note",tint=if(note.pinned)palette.primary else palette.onSurfaceVariant)}
-                                    }
-                                }
+                                RecentNoteCard(note,selected,onOpen={model.open(android.net.Uri.parse(note.uri),note.relative);scope.launch{drawer.close()}},onPin={model.pinRecent(note.uri)})
                             }
                         }
                     }
@@ -327,6 +321,7 @@ private object NoMotionScheme : MotionScheme {
                             IconButton(onClick = saveAction) { Icon(painterResource(R.drawable.symbol_save), "Save note") }
                             IconButton(onClick = { sharing = false; exporting = true }, enabled = readerReady && !state.busy) { Icon(painterResource(R.drawable.symbol_export), "Export") }
                             StudyIcon(if(state.fullscreen) "Exit fullscreen" else "Fullscreen study", if(state.fullscreen) R.drawable.symbol_fullscreen_exit else R.drawable.symbol_fullscreen) { model.fullscreen(!state.fullscreen) }
+                            StudyIcon(if(state.centerLock) "Centre locked · unlock horizontal movement" else "Lock document to centre",if(state.centerLock) R.drawable.symbol_lock else R.drawable.symbol_lock_open) { model.centerLock(!state.centerLock) }
                             Box { IconButton(onClick = { menu = true }) { Icon(Icons.Rounded.MoreVert, "More actions") }; DropdownMenu(expanded = menu, onDismissRequest = { menu = false }) {
                                 DropdownMenuItem(text = { Text("New window") }, onClick = { menu = false; activity.newWindow() }, leadingIcon = { Icon(painterResource(R.drawable.symbol_open_window), null) })
                                 DropdownMenuItem(text = { Text("Share note") }, enabled = readerReady && !state.busy, onClick = { menu = false; sharing = true; exporting = true }, leadingIcon = { Icon(painterResource(R.drawable.symbol_share), null) })
@@ -536,12 +531,12 @@ private class NoteDestination(mime: String, private val preferred: () -> String)
                 FilledTonalButton(onClick=chooseNoteLocation,modifier=Modifier.fillMaxWidth()){Icon(Icons.Rounded.FolderOpen,null);Text(if(noteLocation.isBlank())"Downloads" else android.net.Uri.decode(noteLocation.substringAfterLast('/')),Modifier.padding(start=8.dp),maxLines=1,overflow=TextOverflow.Ellipsis)}
             }
             SettingsSection("Images & diagrams") {
-                val choices=listOf("original" to "Original (off)","invert-dark" to "Invert in dark themes","auto" to "Auto adapt to theme","contrast" to "Increase contrast")
+                val choices=listOf("original" to "Original (off)","invert-dark" to "Invert in dark themes","auto" to "Auto adapt to theme","contrast" to "Separate from theme")
                 Choice("Image appearance",state.imageAppearance,choices){model.readingPreference("imageAppearance",it)}
                 Choice("SVG appearance",state.svgAppearance,choices){model.readingPreference("svgAppearance",it)}
-                Text("Contrast strength · ${"%.2f".format(state.imageContrast)}")
+                Text("Separation strength · ${"%.2f".format(state.imageContrast)}")
                 StudySlider(value=state.imageContrast,onCommit=model::imageContrast,valueRange=1f..2f)
-                Text("Optional viewing adjustments. Original files and PDF exports are unchanged.",style=MaterialTheme.typography.bodySmall)
+                Text("Auto recolours every image with the accent and theme. Separation preserves original colours and adds a readable backing and edge. Original files and PDF exports are unchanged.",style=MaterialTheme.typography.bodySmall)
             }
             SettingsSection("Writing assistance") {
                 Row(verticalAlignment=Alignment.CenterVertically){Text("Spell check",Modifier.weight(1f));Switch(checked=state.spellCheck,onCheckedChange={model.writing(spellCheck=it)})}

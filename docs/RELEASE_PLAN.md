@@ -22,6 +22,8 @@ Native notifications are bounded to open files, recent files and the opened/expa
 
 ## Second release: custom theming
 
-Version 0.6.0 implements the separate theme-file system. Its publication remains gated on the complete CI, native Android emulator and packaged installer checks; see [THEMING.md](THEMING.md) for the supported format and platform limits.
+Version 0.6.1 implements the separate theme-file system. Its publication remains gated on the complete CI, native Android emulator and packaged installer checks; see [THEMING.md](THEMING.md) for the supported format and platform limits.
+
+The earlier v0.6.0 candidate was never published. Its tag is retained unchanged; 0.6.1 incorporates the requested accent-aware image rendering, theme-relative separation, subtle pin controls and persistent centre lock before publication.
 
 Custom theming is required work, not an optional future suggestion. Implement it only after the first release passes verification and is published. Provide editable, documented theme files covering native controls and the reading pane, including background patterns and an AI-friendly authoring reference. Do not allow themes to execute code or silently fetch remote resources. Keep the first release and its installers available for rollback; never rewrite a published tag.

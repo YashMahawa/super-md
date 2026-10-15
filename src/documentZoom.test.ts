@@ -1,6 +1,24 @@
 // @vitest-environment jsdom
 import {expect,it,vi} from 'vitest';
-import {applyDocumentZoom,invalidateDocumentZoom,settleDocumentZoom,refreshDocumentExtent} from './documentZoom';
+import {applyDocumentZoom,enforceDocumentCenter,invalidateDocumentZoom,settleDocumentZoom,refreshDocumentExtent} from './documentZoom';
+it('centre lock survives off-centre zoom and horizontal gestures without touching vertical momentum',()=>{
+  const root=document.createElement('section'),space=document.createElement('div'),page=document.createElement('div');page.className='document-page';root.append(space);space.append(page);
+  const bounds=vi.fn(()=>({left:0,top:0,width:1000,height:800} as DOMRect));root.getBoundingClientRect=bounds;page.getBoundingClientRect=bounds;
+  Object.defineProperty(root,'clientWidth',{value:1000});Object.defineProperty(page,'offsetHeight',{value:100000});
+  for(const fullscreen of ['false','true']){
+    document.documentElement.dataset.fullscreen=fullscreen;
+    for(const zoom of [40,100,200,300]){
+      applyDocumentZoom(root,zoom,80,{x:140,y:300},undefined,undefined,true);
+      const scaled=Number.parseFloat(page.style.width)*zoom/100,left=Number(page.dataset.zoomLeft);
+      expect(left+scaled/2-root.scrollLeft).toBeCloseTo(500);
+      root.scrollTop=1234;root.scrollLeft+=80;const reads=bounds.mock.calls.length;
+      enforceDocumentCenter(root);expect(root.scrollTop).toBe(1234);expect(bounds).toHaveBeenCalledTimes(reads);
+      expect(left+scaled/2-root.scrollLeft).toBeCloseTo(500);
+    }
+  }
+  applyDocumentZoom(root,200,80,undefined,undefined,undefined,false);root.scrollLeft=42;enforceDocumentCenter(root);expect(root.scrollLeft).toBe(42);
+  delete document.documentElement.dataset.fullscreen;
+});
 it('keeps zoom frames independent of document measurement after initial layout',()=>{
   const root=document.createElement('section'),space=document.createElement('div'),page=document.createElement('div');page.className='document-page';root.append(space);space.append(page);
   const pageBounds=vi.fn(()=>({left:0,top:0,width:800,height:100000} as DOMRect)),rootBounds=vi.fn(()=>({left:0,top:0,width:1000,height:800} as DOMRect));page.getBoundingClientRect=pageBounds;root.getBoundingClientRect=rootBounds;

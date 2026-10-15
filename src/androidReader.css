@@ -11,9 +11,22 @@
 .android-document { height: 100%; display: flex; min-width: 0; }
 .android-source, .android-reading { flex: 1; min-width: 0; height: 100%; overflow: auto; overscroll-behavior: contain; }
 .android-reading { padding: 0; background-image:var(--custom-pattern,none);background-size:var(--custom-pattern-size,auto); }
+.android-reading[data-center-locked="true"] { overflow-x:hidden; }
 .markdown-body img { filter:var(--image-filter,none); }
 .markdown-body .svg-diagram, .markdown-body img[data-media-kind="svg"] { filter:var(--svg-filter,none); }
-.markdown-body .svg-figure[data-auto-ink="true"] img { filter:none; }
+/* Framing is separate from filtering: original pixels stay original in
+   contrast mode, and accents always have a legible boundary against the page. */
+:root[data-image-appearance="contrast"] .markdown-body img:not(.svg-diagram):not([data-media-kind="svg"]),
+:root[data-svg-appearance="contrast"] .markdown-body :is(.svg-diagram,img[data-media-kind="svg"]) {
+  background:var(--svg-contrast-backing,#fdfdfc); border-radius:12px;
+  outline:var(--media-separation,1.25px) solid var(--media-edge);
+  outline-offset:3px; box-shadow:0 0 0 5px var(--surface);
+}
+:root[data-image-appearance="auto"] .markdown-body img:not(.svg-diagram):not([data-media-kind="svg"]),
+:root[data-svg-appearance="auto"] .markdown-body :is(.svg-diagram,img[data-media-kind="svg"]) {
+  background:transparent; box-shadow:none;
+}
+:root[data-svg-appearance="auto"] .markdown-body img[data-light-ink="true"] {filter:url("#supermd-media-tone-reverse");}
 .mode-split .android-source { border-right: 1px solid var(--outline); }
 .document-page-space { min-width:100%; overflow-anchor:none; }
 .document-page { margin:0; width:80%; transform-origin:top left; contain:layout style; -webkit-text-size-adjust:none; text-size-adjust:none; }

@@ -1,4 +1,8 @@
 import {test,expect} from '@playwright/test';
+// The screenshot decoder shipped with the pinned Playwright runtime avoids a
+// second imaging dependency. Assert actual filtered pixels, not only CSS text.
+import {createRequire} from 'node:module';
+const {PNG}=createRequire(import.meta.url)('playwright-core/lib/utilsBundle');
 
 test.beforeEach(async({page})=>{
   await page.addInitScript(()=>{window.SuperMD={post:(id)=>queueMicrotask(()=>window.supermdReply?.(id,true,null))};});
@@ -71,10 +75,13 @@ test('image adjustments default to off and change viewing only',async({page})=>{
   const image=page.locator('.svg-diagram');await expect(image).toBeVisible();
   expect(await image.evaluate(el=>getComputedStyle(el).filter)).toBe('none');
   await page.evaluate(state=>window.supermdLoad?.({...state,svgAppearance:'contrast',imageContrast:1.5}),state);
-  await expect.poll(()=>image.evaluate(el=>getComputedStyle(el).filter)).toBe('contrast(1.5)');
+  await expect.poll(()=>image.evaluate(el=>getComputedStyle(el).filter)).toBe('none');
+  // Chromium rounds device-pixel outline widths, while retaining the setting.
+  await expect.poll(()=>page.locator('html').evaluate(el=>(el as HTMLElement).style.getPropertyValue('--media-separation'))).toBe('1.5px');
+  expect(Number.parseFloat(await image.evaluate(el=>getComputedStyle(el).outlineWidth))).toBeGreaterThanOrEqual(1);
   await page.evaluate(state=>window.supermdLoad?.({...state,svgAppearance:'auto'}),state);
-  await expect.poll(()=>image.getAttribute('src')).toContain(encodeURIComponent('#aaccff'));
-  await expect(page.locator('.svg-figure')).toHaveAttribute('data-auto-ink','true');
+  await expect.poll(()=>image.evaluate(el=>getComputedStyle(el).filter)).toContain('#supermd-media-tone');
+  expect(await image.getAttribute('src')).toContain('stroke%3D%22black%22');
 });
 
 test('an open image follows theme adjustments without losing its zoom',async({page})=>{
@@ -88,6 +95,39 @@ test('an open image follows theme adjustments without losing its zoom',async({pa
   await page.evaluate(state=>window.supermdLoad?.({...state,dark:false}),state);
   await expect.poll(()=>image.evaluate(el=>getComputedStyle(el).filter)).toBe('none');
   await page.evaluate(state=>window.supermdLoad?.({...state,svgAppearance:'auto',colors:{text:'#eee0ee',primary:'#df9dca'}}),state);
-  await expect.poll(()=>image.getAttribute('src')).toContain(encodeURIComponent('#df9dca'));
+  await expect.poll(()=>image.evaluate(el=>getComputedStyle(el).filter)).toContain('#supermd-media-tone');
   await expect(page.getByLabel('Image zoom')).toHaveText('140%');
+});
+
+test('auto recolours raster photos and SVGs using actual accent pixels while contrast preserves source pixels',async({page})=>{
+  const raster=await page.evaluate(()=>{const c=document.createElement('canvas');c.width=160;c.height=80;const x=c.getContext('2d')!;x.fillStyle='#000000';x.fillRect(0,0,80,80);x.fillStyle='#ffffff';x.fillRect(80,0,80,80);return c.toDataURL();});
+  const svg='<svg xmlns="http://www.w3.org/2000/svg" width="160" height="80"><rect width="80" height="80" fill="#000000"/><rect x="80" width="80" height="80" fill="#ffffff"/></svg>';
+  const state={id:'actual-media-pixels',path:null,content:`![Raster](${raster})\n\n\`\`\`svg\n${svg}\n\`\`\``,mode:'reader' as const,dark:false,fullscreen:false,colors:{surface:'#ead8cb',text:'#251c18',primary:'#713453'},font:'Manrope',size:15,zoom:100,imageAppearance:'auto',svgAppearance:'auto'};
+  await page.evaluate(state=>window.supermdLoad?.(state as any),state);
+  const images=page.locator('.markdown-body img');await expect(images).toHaveCount(2);
+  const pixel=async(index:number)=>{
+    const image=images.nth(index);await expect(image).toBeVisible();
+    const png=PNG.sync.read(await image.screenshot());const i=((png.height>>1)*png.width+(png.width>>2))*4;
+    return Array.from(png.data.subarray(i,i+3));
+  };
+  for(const i of [0,1])expect(await pixel(i)).toEqual([113,52,83]);
+  await page.evaluate(state=>window.supermdLoad?.({...state,dark:true,colors:{surface:'#17131b',text:'#eee0ee',primary:'#aaccff'}} as any),state);
+  for(const i of [0,1])await expect.poll(()=>pixel(i)).toEqual([170,204,255]);
+  await page.evaluate(state=>window.supermdLoad?.({...state,imageAppearance:'contrast',svgAppearance:'contrast'} as any),state);
+  for(const i of [0,1])expect(await pixel(i)).toEqual([0,0,0]);
+  expect(await images.first().getAttribute('src')).toBe(raster);
+});
+
+test('centre lock centres normal and fullscreen zoom and keeps vertical pan independent',async({page})=>{
+  const state={id:'centre',path:null,content:'# Centre\n\n'+('A long paragraph with selectable text. '.repeat(600)),mode:'reader' as const,dark:false,fullscreen:false,colors:{},font:'Manrope',size:15,zoom:200,centerLock:true};
+  await page.evaluate(state=>window.supermdLoad?.(state),state);
+  const root=page.locator('.android-reading');
+  const center=()=>root.evaluate(el=>{const a=el.getBoundingClientRect(),b=el.querySelector('.document-page')!.getBoundingClientRect();return Math.abs((a.left+a.right-b.left-b.right)/2);});
+  await expect.poll(center).toBeLessThan(2);
+  await page.evaluate(()=>window.supermdNativeWheel?.(160,190,{x:400,y:300},false));
+  await expect.poll(()=>root.evaluate(el=>el.scrollTop)).toBeGreaterThan(100);await expect.poll(center).toBeLessThan(2);
+  await page.evaluate(state=>window.supermdLoad?.({...state,fullscreen:true,zoom:250}),state);await expect.poll(center).toBeLessThan(2);
+  await page.evaluate(state=>window.supermdLoad?.({...state,fullscreen:true,zoom:250,centerLock:false}),state);
+  const left=await root.evaluate(el=>el.scrollLeft);await page.evaluate(()=>window.supermdNativeWheel?.(120,0,{x:400,y:300},false));
+  await expect.poll(()=>root.evaluate(el=>el.scrollLeft)).toBeGreaterThan(left+50);
 });

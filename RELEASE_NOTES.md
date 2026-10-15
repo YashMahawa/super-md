@@ -1,4 +1,4 @@
-# Super MD 0.6.0
+# Super MD 0.6.1
 
 ## Portable custom themes
 
@@ -11,12 +11,16 @@
 
 ## Reliability and verification
 
+- Auto adapt recolours both photos and SVGs using the current accent and page colours, preserving shading and transparency with guarded contrast. Separation mode preserves the original pixels and adds a readable backing and edge instead of increasing image contrast. Original appearance remains the default; source assets and PDF output are unchanged.
+- Recent notes show a small, lightweight pin only when pinned. Use the desktop context menu or Android long press to pin or unpin; there is no permanent pin button on every row.
+- Centre lock sits immediately after the fullscreen button in both native toolbars, including fullscreen. Enabled by default and remembered between launches, it keeps the document horizontally centered during scrolling and zooming without blocking vertical movement, selection, or independent graph/image navigation.
 - Theme palette changes keep the existing large-note rendering/cache path instead of reparsing Markdown/math. Typography updates use reading-anchor restoration. Removing optional reader preferences is now recognized correctly, including theme reset.
 - Automatic desktop update checks no longer replace a useful note status with a raw offline network error or cancel a pending close operation. Explicit checks still report a friendly offline status.
 - Graph panning no longer drops queued movement when a resize or appearance update renders before the next animation frame. A deterministic regression test covers this input/render race.
 - Packaged-app launch checks now import a theme through the real native validator and verify the reader's pattern/typography alongside the existing presented-pixel, Markdown, math, chart, portable-note and PDF assertions.
 - Android instrumentation verifies shared validation, native contrast, actual imported-accent pixels and reader styling, invalid-edit preservation and reset. Existing gesture, selection, hyperlink, export and painting assertions remain enabled.
 - CI now covers Intel macOS before tagging as well as Apple Silicon, Linux and Windows. Debug/instrumentation sources receive their own lint check; desktop CI and release builds share architecture-isolated dependency caches without skipping tests or packaged launch checks.
+- macOS disk-image creation retries only transient “Resource busy” errors, with a bounded retry count. Other packaging failures still fail the release.
 
 Themes are viewing preferences, not embedded in portable notes. PDF layout remains controlled by Export/Share; custom background patterns and reading metrics do not alter PDF output. Native Android component shapes follow Material's platform behavior rather than replacing every control with desktop geometry.
 

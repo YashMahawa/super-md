@@ -18,6 +18,7 @@ import { selectedMarkdown } from "../copySource";
 import CopyCode from "./CopyCode";
 import CodeBlockBoundary from "./CodeBlockBoundary";
 import {DocumentAppearance} from '../documentAppearance';
+import {svgDataBackdrop} from '../svgImage';
 
 const MermaidDiagram = lazy(() => import("./MermaidDiagram"));
 function ThemedChart({source,dark}:{source:string;dark:boolean}) {const theme=useContext(DocumentAppearance);return <InteractiveChart source={source} dark={theme?.dark??dark}/>;}
@@ -95,6 +96,7 @@ function AssetImage({ src = "", alt = "", documentPath, trustedImageHosts, onTru
   const [resolved, setResolved] = useState(embedded ? src : "");
   const [error, setError] = useState("");
   const [selected, setSelected] = useState(false);
+  const svgBacking=useMemo(()=>svgDataBackdrop(resolved),[resolved]);
   const allowed = allowOnce || trustedImageHosts.includes(host);
   useEffect(() => { setAllowOnce(false); }, [src]);
   useEffect(() => {
@@ -121,7 +123,7 @@ function AssetImage({ src = "", alt = "", documentPath, trustedImageHosts, onTru
   if (error) return <span className="image-error" role="img" aria-label={alt || "Image unavailable"}>Image unavailable: {alt || src}<small>{error}</small></span>;
   if (!resolved) return <span className="image-loading" role="status">Loading image…</span>;
   return <span className={`note-image ${selected ? "is-selected" : ""}`} data-note-image-source={src} tabIndex={0} aria-label={`Image controls: ${alt || "Image"}`} onFocus={() => setSelected(true)} onBlur={(event) => { if (!event.currentTarget.contains(event.relatedTarget)) setSelected(false); }} onClick={(event) => { event.stopPropagation(); setSelected(true); event.currentTarget.focus(); }} onKeyDown={(event) => { if (event.key === "Escape") { setSelected(false); event.stopPropagation(); } }}>
-    <img draggable={false} data-media-kind={resolved.startsWith('data:image/svg+xml')?'svg':'image'} src={resolved} alt={alt} loading="lazy" onError={() => setError("The image could not be decoded or loaded.")} />
+    <img draggable={false} data-media-kind={resolved.startsWith('data:image/svg+xml')?'svg':'image'} data-light-ink={svgBacking==='#222026'?'true':undefined} style={svgBacking?{'--svg-contrast-backing':svgBacking} as React.CSSProperties:undefined} src={resolved} alt={alt} loading="lazy" onError={() => setError("The image could not be decoded or loaded.")} />
     {selected && <span className="image-edit-tools" role="toolbar" aria-label="Selected image"><button onClick={(event) => { event.stopPropagation(); window.dispatchEvent(new CustomEvent("supermd-image-edit", { detail: { action: "replace", image: event.currentTarget.closest("[data-note-image-source]") } })); }}>Replace</button><button onClick={(event) => { event.stopPropagation(); window.dispatchEvent(new CustomEvent("supermd-image-edit", { detail: { action: "remove", image: event.currentTarget.closest("[data-note-image-source]") } })); }}>Remove</button></span>}
   </span>;
 }

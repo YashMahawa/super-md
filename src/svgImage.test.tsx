@@ -3,13 +3,18 @@ import { describe, expect, it } from "vitest";
 import { renderToStaticMarkup } from "react-dom/server";
 import { unified } from "unified";
 import remarkParse from "remark-parse";
-import { presentSvg } from "./svgImage";
+import { presentSvg,svgContrastBackdrop } from "./svgImage";
 import { remarkSvgBlocks } from "./svgBlocks";
 import MarkdownPreview from "./components/MarkdownPreview";
 
 const parse = (markdown: string) => remarkSvgBlocks()(unified().use(remarkParse).parse(markdown), { value: markdown });
 
 describe("inline SVG", () => {
+  it('keeps white transparent art visible on a dark backing without modifying its paint',()=>{
+    expect(svgContrastBackdrop('<svg><path stroke="white" fill="none"/></svg>')).toBe('#222026');
+    expect(svgContrastBackdrop('<svg><path stroke="black" fill="none"/></svg>')).toBe('#fdfdfc');
+    expect(svgContrastBackdrop('<svg><path style="fill:#fff;stroke:none"/></svg>')).toBe('#222026');
+  });
   it("lifts raw svg blocks, one-line svg and untagged fences into svg blocks", () => {
     for (const markdown of [
       '<svg viewBox="0 0 10 10">\n<circle cx="5" cy="5" r="4"/>\n</svg>',

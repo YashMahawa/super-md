@@ -119,6 +119,14 @@ class StudioTest(unittest.TestCase):
         self.assertEqual(studio.recent[0],"/notes/pinned.md")
         studio.pinRecent("/notes/pinned.md");self.assertNotIn("/notes/pinned.md",studio.pinnedRecent)
 
+    def test_center_lock_defaults_on_and_updates_reader_without_reloading_content(self):
+        studio=self.studio;messages=[];studio.readerLoad.connect(messages.append)
+        studio.post("ready","reader_ready","{}")
+        self.assertTrue(json.loads(messages[-1])["centerLock"])
+        studio.setting("centerLock","false");payload=json.loads(messages[-1])
+        self.assertFalse(payload["centerLock"]);self.assertTrue(payload["contentUnchanged"])
+        studio.setting("centerLock",'"invalid"');self.assertFalse(studio.settings["centerLock"])
+
     def test_palette_loads_do_not_reserialize_the_note_and_ready_resets_the_cache(self):
         studio=self.studio;messages=[];studio.readerLoad.connect(messages.append)
         studio._current()["content"]="A big note. "*20000

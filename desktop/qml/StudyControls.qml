@@ -8,14 +8,16 @@ Rectangle {
     height: 56
     property bool awake: true
     property bool ready: true
+    property bool centerLocked: true
     property string noteName: ""
     property var colors: studio.palette
     property bool motion: studio.motionEnabled
     readonly property bool hovered: barHover.hovered
-    readonly property bool focusWithin: contents.visualFocus || save.visualFocus || exportNote.visualFocus || exit.visualFocus
+    readonly property bool focusWithin: contents.visualFocus || save.visualFocus || exportNote.visualFocus || exit.visualFocus || centerLock.visualFocus
     readonly property bool shown: awake || hovered || focusWithin
     signal contentsRequested()
     signal exitRequested()
+    signal centerLockRequested()
     signal saveRequested()
     signal exportRequested()
     color: colors["surface-low"]
@@ -41,6 +43,12 @@ Rectangle {
             glyph: "FullscreenExit"; compact: true
             ToolTip.text: "Exit fullscreen (Esc · F11)"
             onClicked: controls.exitRequested()
+        }
+        ActionButton {
+            id: centerLock; objectName: "studyCenterLockButton"
+            glyph: controls.centerLocked ? "Lock" : "LockOpen"; compact: true; tonal: controls.centerLocked
+            ToolTip.text: controls.centerLocked ? "Centre locked · click to allow horizontal movement" : "Lock document to centre"
+            onClicked: controls.centerLockRequested()
         }
     }
 }

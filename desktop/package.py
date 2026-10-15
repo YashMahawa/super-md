@@ -8,6 +8,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import time
 from pathlib import Path
 from package_runtime import wayland_dependencies
 
@@ -16,6 +17,19 @@ OUTPUT = ROOT / "desktop/dist"
 
 def run(*args, **kwargs):
     subprocess.run([str(arg) for arg in args], check=True, **kwargs)
+
+def create_dmg(folder, destination):
+    command=["hdiutil","create","-volname","Super MD","-srcfolder",str(folder),"-ov","-format","UDZO",str(destination)]
+    for attempt in range(3):
+        result=subprocess.run(command,capture_output=True,text=True)
+        if result.stdout:print(result.stdout,flush=True)
+        if result.stderr:print(result.stderr,file=sys.stderr,flush=True)
+        if result.returncode==0:return
+        # macOS CI occasionally keeps the copied app busy briefly. Retry only
+        # that transient packaging failure; never mask signing/format errors.
+        if "resource busy" not in (result.stdout+result.stderr).lower() or attempt==2:
+            result.check_returncode()
+        time.sleep(2*(attempt+1))
 
 def build():
     version = json.loads((ROOT / "package.json").read_text())["version"]
@@ -42,8 +56,7 @@ def installers(version):
             folder = Path(temporary)
             shutil.copytree(OUTPUT / "Super MD.app", folder / "Super MD.app", symlinks=True)
             (folder / "Applications").symlink_to("/Applications")
-            run("hdiutil", "create", "-volname", "Super MD", "-srcfolder", folder,
-                "-ov", "-format", "UDZO", packages / f"Super-MD_{version}_{architecture}.dmg")
+            create_dmg(folder,packages / f"Super-MD_{version}_{architecture}.dmg")
     else:
         with tempfile.TemporaryDirectory(prefix="supermd-installer-") as temporary:
             stage = Path(temporary)

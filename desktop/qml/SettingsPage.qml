@@ -55,12 +55,12 @@ Pane {
                     ActionButton { text:"Reset to built-in";visible:studio.customThemeActive;onClicked:studio.resetCustomTheme() }
                 }
                 Label { text: "Images & diagrams"; font.pixelSize: 22; font.weight: Font.DemiBold; Layout.topMargin: 12 }
-                Label { text: "Optional viewing adjustments only. Original files and PDF exports are unchanged."; Layout.fillWidth: true; wrapMode: Text.WordWrap; color: viewState.colors.muted }
+                Label { text: "Auto recolours all images with your accent and theme. Separation keeps original colours and adds a readable backing and edge. Original files and PDF exports are unchanged."; Layout.fillWidth: true; wrapMode: Text.WordWrap; color: viewState.colors.muted }
                 Label { text: "Image appearance" }
-                ChoiceField { Layout.fillWidth: true; model: ["Original (off)","Invert in dark themes","Auto adapt to theme","Increase contrast"]; currentIndex: ["original","invert-dark","auto","contrast"].indexOf(viewState.settings.imageAppearance); onActivated: page.save("imageAppearance",["original","invert-dark","auto","contrast"][currentIndex]) }
+                ChoiceField { Layout.fillWidth: true; model: ["Original (off)","Invert in dark themes","Auto adapt to theme","Separate from theme"]; currentIndex: ["original","invert-dark","auto","contrast"].indexOf(viewState.settings.imageAppearance); onActivated: page.save("imageAppearance",["original","invert-dark","auto","contrast"][currentIndex]) }
                 Label { text: "SVG appearance" }
-                ChoiceField { Layout.fillWidth: true; model: ["Original (off)","Invert in dark themes","Auto adapt to theme","Increase contrast"]; currentIndex: ["original","invert-dark","auto","contrast"].indexOf(viewState.settings.svgAppearance); onActivated: page.save("svgAppearance",["original","invert-dark","auto","contrast"][currentIndex]) }
-                Label { text: "Contrast strength: " + viewState.settings.imageContrast.toFixed(2) }
+                ChoiceField { Layout.fillWidth: true; model: ["Original (off)","Invert in dark themes","Auto adapt to theme","Separate from theme"]; currentIndex: ["original","invert-dark","auto","contrast"].indexOf(viewState.settings.svgAppearance); onActivated: page.save("svgAppearance",["original","invert-dark","auto","contrast"][currentIndex]) }
+                Label { text: "Separation strength: " + viewState.settings.imageContrast.toFixed(2) }
                 ExpressiveSlider { Layout.fillWidth: true; from: 1; to: 2; stepSize: .05; value: viewState.settings.imageContrast; onMoved: page.save("imageContrast",value) }
                 Label { text: "Reading"; font.pixelSize: 22; font.weight: Font.DemiBold; Layout.topMargin: 12 }
                 Label { text: "Reading font" }
