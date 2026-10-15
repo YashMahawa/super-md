@@ -7,7 +7,8 @@ TEMPLATE = {"format":"supermd-theme","version":1,"name":"My theme","accent":"vio
 
 def validate(engine, raw):
     if len(raw.encode("utf-8"))>65536:raise ValueError("Theme exceeds 64 KB")
-    result=subprocess.run([str(engine),"validate-theme"],input=raw,text=True,encoding="utf-8",capture_output=True,timeout=10,check=True)
+    result=subprocess.run([str(engine),"validate-theme"],input=raw,text=True,encoding="utf-8",capture_output=True,timeout=10,check=True,
+        creationflags=getattr(subprocess,"CREATE_NO_WINDOW",0))
     response=json.loads(result.stdout)
     if "error" in response:raise ValueError(response["error"])
     return response["theme"]

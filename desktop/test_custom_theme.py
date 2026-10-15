@@ -27,6 +27,7 @@ class CustomThemeTest(unittest.TestCase):
             self.assertEqual(custom_theme.validate("engine",'{}'),custom_theme.TEMPLATE)
             self.assertEqual(run.call_args.kwargs["timeout"],10)
             self.assertEqual(run.call_args.kwargs["encoding"],"utf-8")
+            self.assertEqual(run.call_args.kwargs["creationflags"],getattr(custom_theme.subprocess,"CREATE_NO_WINDOW",0))
 
     def test_theme_file_reads_are_bounded_before_decoding(self):
         with tempfile.TemporaryDirectory() as folder:

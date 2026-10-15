@@ -94,7 +94,9 @@ jobs:
         if: failure()
         with:
           name: browser-test-report
-          path: playwright-report/
+          path: |
+            playwright-report/
+            test-results/
 
   android-release:
     runs-on: ubuntu-22.04

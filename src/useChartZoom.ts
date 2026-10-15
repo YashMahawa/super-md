@@ -8,9 +8,12 @@ import { wheelIntent } from "./wheelIntent";
 export function useChartZoom(source: string) {
   const host = useRef<HTMLElement>(null);
   const [zoom, setZoom] = useState(() => chartZooms.get(source) ?? 1);
-  const value = useRef(zoom); value.current = zoom;
+  const value = useRef(zoom);
   const [center,setCenter] = useState<Point>(()=>chartCenters.get(source) ?? {x:0,y:0});
-  const centerRef = useRef(center); centerRef.current = center;
+  // Input owns these refs until its animation-frame commit. An unrelated
+  // render (e.g. ResizeObserver or a palette update) must not copy older React
+  // state over an already queued pan and silently discard the user's movement.
+  const centerRef = useRef(center);
   const pointer = useRef<Point>({x:.5,y:.5});
   const locate = (point: Point) => {
     const svg = host.current?.querySelector("svg"), rect=svg?.getBoundingClientRect();

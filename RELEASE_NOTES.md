@@ -13,6 +13,7 @@
 
 - Theme palette changes keep the existing large-note rendering/cache path instead of reparsing Markdown/math. Typography updates use reading-anchor restoration. Removing optional reader preferences is now recognized correctly, including theme reset.
 - Automatic desktop update checks no longer replace a useful note status with a raw offline network error or cancel a pending close operation. Explicit checks still report a friendly offline status.
+- Graph panning no longer drops queued movement when a resize or appearance update renders before the next animation frame. A deterministic regression test covers this input/render race.
 - Packaged-app launch checks now import a theme through the real native validator and verify the reader's pattern/typography alongside the existing presented-pixel, Markdown, math, chart, portable-note and PDF assertions.
 - Android instrumentation verifies shared validation, native contrast, actual imported-accent pixels and reader styling, invalid-edit preservation and reset. Existing gesture, selection, hyperlink, export and painting assertions remain enabled.
 - CI now covers Intel macOS before tagging as well as Apple Silicon, Linux and Windows. Debug/instrumentation sources receive their own lint check; desktop CI and release builds share architecture-isolated dependency caches without skipping tests or packaged launch checks.
