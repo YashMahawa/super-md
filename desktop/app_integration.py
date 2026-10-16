@@ -18,12 +18,12 @@ OWNER='X-SuperMD-Managed=true'
 
 def available():
     if not sys.platform.startswith('linux') or not getattr(sys,'frozen',False):return False
-    return bool(os.environ.get('APPIMAGE')) or Path(sys.executable).resolve().parent.parent==Path.home()/'.local/opt' and Path(sys.executable).resolve().parent.name.startswith('super-md-qt-')
+    return bool(os.environ.get('APPIMAGE')) or Path(sys.executable).resolve().parent.parent==(Path.home()/'.local/opt').resolve() and Path(sys.executable).resolve().parent.name.startswith('super-md-qt-')
 
 def _check_launcher(launcher):
     if launcher.is_symlink():
         previous=launcher.resolve()
-        if previous.parent.parent!=launcher.parent.parent/'opt' or not previous.parent.name.startswith('super-md-qt-'):raise ValueError('Existing launcher belongs to another installation')
+        if previous.parent.parent!=(launcher.parent.parent/'opt').resolve() or not previous.parent.name.startswith('super-md-qt-'):raise ValueError('Existing launcher belongs to another installation')
     elif launcher.exists():raise ValueError('Existing launcher is not managed by Super MD')
 
 def _link(target, launcher):
@@ -65,7 +65,7 @@ def register(package, home=None):
 
 def install_appimage(image, expected_version, integrate=True, home=None):
     version(expected_version)
-    home=Path(home) if home is not None else Path.home();opt=home/'.local/opt'
+    home=Path(home) if home is not None else Path.home();opt=(home/'.local/opt').resolve()
     _check_launcher(home/'.local/bin/super-md')
     opt.mkdir(parents=True,exist_ok=True)
     with tempfile.TemporaryDirectory(prefix='.super-md-stage-',dir=opt) as staging:

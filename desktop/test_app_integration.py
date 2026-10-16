@@ -48,3 +48,12 @@ class IntegrationTest(unittest.TestCase):
 
     def test_desktop_exec_escapes_spaces_and_field_codes(self):
         self.assertEqual(integration._exec_path(Path('/home/a b%/app')), '"/home/a b%%/app"')
+
+    def test_symlinked_home_keeps_owned_launcher_recognizable(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root=Path(directory);real=root/'storage';real.mkdir();home=root/'home';home.symlink_to(real,target_is_directory=True)
+            previous=real/'.local/opt/super-md-qt-1.2.2';previous.mkdir(parents=True);(previous/'super-md').write_text('old')
+            launcher=home/'.local/bin/super-md';launcher.parent.mkdir();launcher.symlink_to(previous/'super-md')
+            with patch('app_integration.subprocess.run',side_effect=lambda args,**kw:self.package(Path(kw['cwd']))):
+                destination=Path(integration.install_appimage(home/'image','1.2.3',False,home))
+            self.assertEqual(launcher.resolve(),destination/'super-md');self.assertEqual((previous/'super-md').read_text(),'old')

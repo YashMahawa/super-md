@@ -81,7 +81,7 @@ class AppUpdates(private val app:Application) {
                 if(complete)return true
             }
             val values=ContentValues().apply{put(MediaStore.MediaColumns.DISPLAY_NAME,file.name);put(MediaStore.MediaColumns.MIME_TYPE,"application/vnd.android.package-archive");put(MediaStore.MediaColumns.RELATIVE_PATH,Environment.DIRECTORY_DOWNLOADS+"/Super MD");put(MediaStore.MediaColumns.IS_PENDING,1)}
-            val uri=app.contentResolver.insert(MediaStore.Downloads.EXTERNAL_CONTENT_URI,values) ?: error("Could not create Downloads entry")
+            val uri=app.contentResolver.insert(MediaStore.Downloads.getContentUri(MediaStore.VOLUME_EXTERNAL_PRIMARY),values) ?: error("Could not create Downloads entry")
             // Persist ownership before copying so interrupted downloads can be cleaned up.
             saved.put("publicUri",uri.toString());saveReceipt(saved)
             try {
@@ -106,7 +106,7 @@ class AppUpdates(private val app:Application) {
     private fun clearInstalled(saved:JSONObject,file:File,record:File=receipt) {
         if(Build.VERSION.SDK_INT>=29) {
             val uri=Uri.parse(saved.optString("publicUri"))
-            if(uri.authority=="media" && uri.path?.startsWith("/external/downloads/")==true)runCatching {
+            if(uri.authority=="media" && Regex("/(external|external_primary)/downloads/[0-9]+").matches(uri.path.orEmpty()))runCatching {
                 app.contentResolver.query(uri,arrayOf(MediaStore.MediaColumns.OWNER_PACKAGE_NAME),null,null,null)?.use{cursor->if(cursor.moveToFirst()&&cursor.getString(0)==app.packageName)app.contentResolver.delete(uri,null,null)}
             }
         }else {

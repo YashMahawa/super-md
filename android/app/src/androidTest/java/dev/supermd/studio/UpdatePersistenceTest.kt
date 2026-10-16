@@ -22,7 +22,7 @@ class UpdatePersistenceTest {
             .put("url","https://github.com/YashMahawa/super-md/releases/download/v$version/$name")
             .put("sums","https://github.com/YashMahawa/super-md/releases/download/v$version/SHA256SUMS")
     }
-    @Test fun successfulUpgradeRemovesOnlyOwnedInstallerAndDownloadsCopy()=runBlocking {
+    @Test fun successfulUpgradeRemovesOnlyOwnedInstallerAndDownloadsCopy():Unit=runBlocking {
         val folder=File(app.filesDir,"updates").apply{mkdirs()};val record=File(folder,"ready.json")
         val before=record.takeIf{it.exists()}?.readBytes()
         val saved=receipt(BuildConfig.VERSION_NAME,BuildConfig.VERSION_CODE.toLong());val file=File(folder,saved.getString("name"));val fileBefore=file.takeIf{it.exists()}?.readBytes()
@@ -31,7 +31,7 @@ class UpdatePersistenceTest {
         try {
             file.writeText("test")
             if(Build.VERSION.SDK_INT>=29) {
-                public=app.contentResolver.insert(MediaStore.Downloads.EXTERNAL_CONTENT_URI,ContentValues().apply{put(MediaStore.MediaColumns.DISPLAY_NAME,"supermd-update-persistence-test.apk");put(MediaStore.MediaColumns.MIME_TYPE,"application/vnd.android.package-archive");put(MediaStore.MediaColumns.RELATIVE_PATH,Environment.DIRECTORY_DOWNLOADS+"/Super MD")})
+                public=app.contentResolver.insert(MediaStore.Downloads.getContentUri(MediaStore.VOLUME_EXTERNAL_PRIMARY),ContentValues().apply{put(MediaStore.MediaColumns.DISPLAY_NAME,"supermd-update-persistence-test.apk");put(MediaStore.MediaColumns.MIME_TYPE,"application/vnd.android.package-archive");put(MediaStore.MediaColumns.RELATIVE_PATH,Environment.DIRECTORY_DOWNLOADS+"/Super MD")})
                 assertNotNull(public);app.contentResolver.openOutputStream(public!!)?.use{it.write("test".toByteArray())};saved.put("publicUri",public.toString())
             }
             record.writeText(saved.toString());AppUpdates(app).restore()
@@ -43,7 +43,7 @@ class UpdatePersistenceTest {
             if(before==null)record.delete() else record.writeBytes(before)
         }
     }
-    @Test fun cancelledOrNotInstalledUpdateIsNeverDeleted()=runBlocking {
+    @Test fun cancelledOrNotInstalledUpdateIsNeverDeleted():Unit=runBlocking {
         val folder=File(app.filesDir,"updates").apply{mkdirs()};val record=File(folder,"ready.json");val before=record.takeIf{it.exists()}?.readBytes()
         val saved=receipt("999.0.0",Int.MAX_VALUE.toLong());val file=File(folder,saved.getString("name"))
         try {

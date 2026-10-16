@@ -189,6 +189,10 @@ jobs:
       - uses: swatinem/rust-cache@v2
         with:
           workspaces: ./smd-core -> target
+          shared-key: android-emulator-${{ runner.os }}
+          # Preserve compiled dependencies even when a UI assertion fails.
+          # Every emulator assertion still runs before the release can pass.
+          cache-on-failure: true
       - run: npm ci
       - run: npm run build
       - name: Build the real JNI engine and offline reader for instrumentation
