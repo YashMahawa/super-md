@@ -13,15 +13,18 @@ from PIL import Image
 def build(source, output):
     root=Path(__file__).resolve().parent.parent
     theme=json.loads((root/'public/themes/study-desk.supermd-theme.json').read_text())
+    palettes=json.loads((root/'scripts/lazy-cat-palette.json').read_text())
     image=Image.open(source).convert('RGBA')
     if image.getchannel('A').getextrema()[0]!=0:raise ValueError('Expected transparent artwork')
     image.thumbnail((1200,1200),Image.Resampling.LANCZOS)
     data=io.BytesIO();image.save(data,format='WEBP',quality=88,method=6)
     if len(data.getvalue())>512*1024:raise ValueError('Theme artwork exceeds 512 KiB')
     theme['name']='Lazy Sunday cats'
+    theme['accent']='violet'
     theme['assets']={'cats':'data:image/webp;base64,'+base64.b64encode(data.getvalue()).decode()}
     for mode,variant in theme['variants'].items():
-        variant['artwork']={area:{'image':'asset:cats','fit':'cover','opacity':opacity} for area,opacity in [('reader',.12 if mode=='light' else .08),('sidebar',.055),('toolbar',.035)]}
+        variant['colors']=palettes[mode]
+        variant['artwork']={area:{'image':'asset:cats','fit':'cover','opacity':opacity} for area,opacity in [('reader',.24 if mode=='light' else .14),('sidebar',.12),('toolbar',.08)]}
     output.mkdir(parents=True,exist_ok=True)
     (output/'lazy-sunday-cats.webp').write_bytes(data.getvalue())
     target=output/'lazy-sunday-cats.supermd-theme.json'

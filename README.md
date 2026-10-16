@@ -179,8 +179,8 @@ See [artwork credits](docs/media/themes/ARTWORK.md).
 
 ### A lighter kind of study desk
 
-Lazy Sunday cats combines varied illustrated poses with warm paper, sage
-chrome, rose actions, forest-coloured Python source and pale output. The example
+Lazy Sunday cats combines clearly visible illustrated poses with lavender paper,
+lilac chrome, violet actions, aubergine Python source and apricot output. The example
 below shows an actual Python run—not a mocked result. Background visibility is
 adjustable, and the complete [cat theme](public/themes/lazy-sunday-cats.supermd-theme.json)
 can be imported and shared on desktop or Android.
