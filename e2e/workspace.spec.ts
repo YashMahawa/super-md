@@ -326,6 +326,7 @@ test("Android shares math, callouts, graphs and portable PDF preparation", async
   for (const [name, asset] of Object.entries(prepared.assets)) await writeFile(join(dirname(input), name), Buffer.from(asset as string, "base64"));
   for (const asset of Object.values(prepared.assets) as string[]) {
     const svg = Buffer.from(asset, "base64").toString(); expect(svg).toContain("<svg"); expect(svg).not.toContain("<foreignObject");
+    if(svg.includes('data-diagram-engine="pele"'))expect(svg).not.toContain('var(');
   }
 });
 

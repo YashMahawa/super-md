@@ -4,6 +4,8 @@ import { copyFileSync,readFileSync,writeFileSync } from "node:fs";
 // license after bundling instead of maintaining a second notice by hand.
 copyFileSync(new URL("../LICENSE", import.meta.url), new URL("../dist/LICENSE.txt", import.meta.url));
 copyFileSync(new URL("../docs/THEMING.md", import.meta.url), new URL("../dist/THEMING.md", import.meta.url));
+// Preserve Pele's complete MIT and embedded Lucide ISC notices offline.
+copyFileSync(new URL('../node_modules/pele/LICENSE',import.meta.url),new URL('../dist/DIAGRAM-RENDERER-LICENSES.txt',import.meta.url));
 // Ship the complete notices with the offline dictionary and grammar libraries.
 const dependencies=["dictionary-en","nspell","retext-repeated-words","retext-indefinite-article"];
 const notices=dependencies.map(name=>`${name}\n${readFileSync(new URL(`../node_modules/${name}/license`,import.meta.url),"utf8")}`).join("\n\n");

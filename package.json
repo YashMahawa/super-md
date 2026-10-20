@@ -46,6 +46,7 @@
     "mermaid": "^11.10.0",
     "motion": "^13.4.2",
     "nspell": "^2.1.5",
+    "pele": "1.7.0",
     "react": "^19.1.1",
     "react-dom": "^19.1.1",
     "react-markdown": "^10.1.0",

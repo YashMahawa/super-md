@@ -160,6 +160,7 @@ class StudioUiTest {
         try {
             compose.runOnIdle {model.fullscreen(false);model.appearance(accent="rose",theme="dark",motion=false);model.readingPreference("imageAppearance","original");model.readingPreference("svgAppearance","auto");model.edit(model.state.value.active.id,content);model.mode("reader");model.zoom(100f)}
             javascriptUntil("(()=>{const i=document.querySelector('.mermaid img');return !!i?.complete&&i.naturalWidth>0&&i.dataset.mediaKind==='svg'&&i.dataset.mediaAdapted==='true'&&getComputedStyle(i).filter==='none'&&document.documentElement.dataset.imageAppearance==='original';})()") {it=="true"}
+            javascriptUntil("(()=>{const i=document.querySelector('.mermaid img');if(!i)return false;const svg=decodeURIComponent(i.src.split(',').slice(1).join(','));return svg.includes('data-diagram-engine=\"pele\"')&&!svg.includes('var(');})()") {it=="true"}
             for(mode in listOf("monochrome","contrast","invert-dark","original")) {
                 compose.runOnIdle {model.readingPreference("svgAppearance",mode)}
                 javascriptUntil("(()=>{const i=document.querySelector('.mermaid img');return document.documentElement.dataset.svgAppearance==='$mode'&&!!i?.complete&&i.naturalWidth>0;})()") {it=="true"}

@@ -1,5 +1,13 @@
 # Super MD 0.6.4
 
+## Faster compatible Mermaid diagrams
+
+- Plain flowcharts, sequence/state/class/entity diagrams, pie charts and mind maps use Obsidian's MIT-licensed Pele renderer, loaded on demand. Compatible diagrams no longer load Mermaid's full runtime and can appear sooner while editing.
+- Authored Mermaid configuration, math/HTML labels, advanced interactions and untested diagram families keep Mermaid.js. Fast-path failures also fall back automatically; no source conversion is performed.
+- Generated SVG variables are resolved to self-contained values for the image viewer and native PDF export. Diagram colours still follow the shared appearance setting.
+- A local comparison including SVG sanitization measured roughly 8–29 times faster rendering on the small test corpus. This is not a claim that the whole app, every diagram or every phone is that much faster.
+- Complete Pele and Lucide licence notices are included offline.
+
 ## Consistent diagram appearance
 
 - SVGs, Mermaid diagrams, interactive charts and Python SVG figures now share the Diagram appearance setting on desktop and Android. Ordinary images retain their independent setting. Existing preferences carry over.

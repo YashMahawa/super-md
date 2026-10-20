@@ -1,7 +1,9 @@
 // @vitest-environment jsdom
 import { describe, expect, it, vi } from "vitest";
 const engine = vi.hoisted(() => ({ initialize: vi.fn(), render: vi.fn() }));
+const fast = vi.hoisted(() => ({renderAsync:vi.fn().mockRejectedValue(new Error('Use compatibility renderer'))}));
 vi.mock("mermaid", () => ({ default: engine }));
+vi.mock('pele/lazy',()=>fast);
 import { renderMermaid, sanitizeDiagram } from "./mermaidRenderer";
 describe("isolated SVG diagrams", () => {
   it("retains SVG geometry, text and styles but strips active content", () => {
@@ -31,5 +33,12 @@ describe("isolated SVG diagrams", () => {
     await renderMermaid('graph LR; Cache17-->Output');expect(engine.render.mock.calls.length).toBe(calls);
     await renderMermaid('graph LR; Cache0-->Output');expect(engine.render.mock.calls.length).toBe(calls+1);
     expect(document.body.children.length).toBe(0);
+  });
+  it('uses a sanitized, self-contained Pele vector without loading Mermaid for compatible diagrams',async()=>{
+    fast.renderAsync.mockResolvedValueOnce({svg:'<svg xmlns="http://www.w3.org/2000/svg" width="100" height="50" style="--_fg:var(--pele-fg,#111111)"><path stroke="var(--_fg)" d="M0 0L100 50"/><text>Fast vector</text><script>bad()</script></svg>'});
+    const calls=engine.render.mock.calls.length;
+    const svg=await renderMermaid('flowchart LR; FastUnique-->Vector',true);
+    expect(svg).toContain('data-diagram-engine="pele"');expect(svg).toContain('stroke="#e9e2e8"');expect(svg).not.toMatch(/var\(|<script/);
+    expect(engine.render.mock.calls.length).toBe(calls);expect(document.body.children.length).toBe(0);
   });
 });

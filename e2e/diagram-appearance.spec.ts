@@ -1,4 +1,5 @@
 import {test,expect} from '@playwright/test';
+import {mediaContrast} from '../src/mediaAppearance';
 
 // Authored colours, !important styles and edge halos are common in study notes.
 // This is an independent fixture, not a copy of the user's private document.
@@ -90,8 +91,9 @@ for(const [kind,source]of Object.entries({
       expect(await image.evaluate(i=>getComputedStyle(i).filter)).toBe('none');
       expect(await image.evaluate(i=>getComputedStyle(i).backgroundColor)).toBe('rgb(25, 20, 32)');
       if(kind==='pie'){
-        const fills=await image.evaluate(i=>{const xml=new DOMParser().parseFromString(decodeURIComponent((i as HTMLImageElement).src.split(',').slice(1).join(',')),'image/svg+xml');return {slices:Array.from(xml.querySelectorAll('path.pieCircle'),n=>n.getAttribute('fill')),labels:Array.from(xml.querySelectorAll('text.slice'),n=>n.getAttribute('fill'))};});
-        expect(new Set(fills.slices).size).toBe(2);expect(new Set(fills.labels).size).toBe(2);
+        const fills=await image.evaluate(i=>{const xml=new DOMParser().parseFromString(decodeURIComponent((i as HTMLImageElement).src.split(',').slice(1).join(',')),'image/svg+xml');return {slices:Array.from(xml.querySelectorAll('path.pieCircle,path.pele-slice'),n=>n.getAttribute('fill')!),labels:Array.from(xml.querySelectorAll('text')).filter(n=>/^\d+%$/.test(n.textContent?.trim()??'')).map(n=>n.getAttribute('fill')!)};});
+        expect(new Set(fills.slices).size).toBe(2);expect(fills.labels).toHaveLength(2);
+        for(let i=0;i<2;i++)expect(mediaContrast(fills.slices[i],fills.labels[i])).toBeGreaterThanOrEqual(4.5);
       }
       if(kind==='entity')expect(source).not.toContain('fill="hsl(0, 0%, 100%)"');
     }
@@ -99,4 +101,18 @@ for(const [kind,source]of Object.entries({
   // Display adjustments must reuse layout rather than invoke Mermaid again.
   expect(roots.size).toBe(1);
   await page.locator('.mermaid img').click();await expect(page.getByRole('dialog',{name:'Image viewer'})).toBeVisible();
+});
+
+test('plain Mermaid uses Pele without loading the legacy engine and custom configuration retains Mermaid',async({page})=>{
+  const requested:string[]=[];page.on('request',request=>requested.push(request.url()));
+  const state={id:'pele-routing',path:null,content:'```mermaid\nflowchart LR\n A[Read] --> B[Understand]\n```',mode:'reader' as const,dark:false,fullscreen:false,colors:{surface:'#f8edf5',text:'#392435',primary:'#8d3f6b'},font:'Manrope',size:16,zoom:100,motion:false};
+  await page.evaluate(s=>window.supermdLoad?.(s),state);
+  const image=page.locator('.mermaid img');await expect(image).toBeVisible();
+  let svg=decodeURIComponent((await image.getAttribute('src'))!.split(',').slice(1).join(','));
+  expect(svg).toContain('data-diagram-engine="pele"');expect(svg).not.toContain('var(');
+  expect(requested.some(url=>/\/node_modules\/(?:\.vite\/deps\/mermaid[._]|mermaid\/)/.test(url))).toBe(false);
+  await page.evaluate(s=>window.supermdLoad?.({...s,content:'```mermaid\n%%{init: {"theme":"forest"}}%%\nflowchart LR\n A[Read] --> B[Understand]\n```'}),state);
+  await expect.poll(async()=>decodeURIComponent((await image.getAttribute('src'))!.split(',').slice(1).join(','))).toContain('data-diagram-engine="mermaid"');
+  svg=decodeURIComponent((await image.getAttribute('src'))!.split(',').slice(1).join(','));expect(svg).toContain('Read');expect(svg).toContain('Understand');
+  await expect(page.locator('.render-error')).toHaveCount(0);
 });

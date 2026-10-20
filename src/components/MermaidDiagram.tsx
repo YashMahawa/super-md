@@ -1,5 +1,6 @@
 import { useEffect, useState } from "react";
 import { renderMermaid } from "../mermaidRenderer";
+import {canUsePele} from '../peleRenderer';
 import SvgDiagram from './SvgDiagram';
 import type {MediaAppearance} from '../mediaAppearance';
 export default function MermaidDiagram({ source, dark, appearance, colors }: { source: string; dark: boolean; appearance?:MediaAppearance;colors?:Record<string,string> }) {
@@ -10,7 +11,7 @@ export default function MermaidDiagram({ source, dark, appearance, colors }: { s
   const renderDark=(!appearance||appearance==='original')&&dark;
   useEffect(() => {
     let active = true;
-    const timer = window.setTimeout(() => { renderMermaid(source, renderDark).then((svg) => { if (active) { setRendered({svg,dark:renderDark}); setError(""); } }).catch((reason) => active && setError(String(reason))); }, 220);
+    const timer = window.setTimeout(() => { renderMermaid(source, renderDark).then((svg) => { if (active) { setRendered({svg,dark:renderDark}); setError(""); } }).catch((reason) => active && setError(String(reason))); }, canUsePele(source)?40:220);
     return () => { active = false; window.clearTimeout(timer); };
   }, [renderDark, source]);
   if (error) return <div className="render-error">Mermaid: {error}</div>;

@@ -126,6 +126,11 @@ def main():
         if args.smoke:
             studio.settings["welcomed"] = True
             studio.mode = "reader"
+            # Only the disposable smoke workspace: verify the lazy renderer
+            # in the packaged Qt WebEngine, then its self-contained PDF SVG.
+            smoke_note=next(tab for tab in studio.tabs if tab['id']==studio.active)
+            smoke_note['content']=smoke_note['content'].replace('\n','\n\n```mermaid\nflowchart LR\n Read --> Understand\n```\n',1)
+            smoke_note['saved']=smoke_note['content']
             if args.smoke_theme:
                 studio.settings["theme"]="light"
                 studio.importCustomTheme(str(args.smoke_theme))
@@ -209,13 +214,13 @@ def main():
                     QTimer.singleShot(max(0,when-previous),step)
                 advance()
             def verify():
-                script = "window.SuperMD?.post('smoke','export_failed',JSON.stringify({error:'SMOKE:'+JSON.stringify({headings:document.querySelectorAll('h1').length,math:document.querySelectorAll('.katex').length,charts:document.querySelectorAll('.interactive-chart svg').length,surfaces:document.querySelectorAll('.surface-chart').length,answers:document.querySelectorAll('details.callout').length,themePattern:getComputedStyle(document.querySelector('.android-reading')).backgroundImage.includes('radial-gradient'),themeArt:getComputedStyle(document.querySelector('.android-reading')).backgroundImage.includes('data:image/svg+xml'),themeWeight:document.documentElement.style.getPropertyValue('--custom-heading-weight'),zoom:getComputedStyle(document.documentElement).getPropertyValue('--workspace-scale')})}))"
+                script = "window.SuperMD?.post('smoke','export_failed',JSON.stringify({error:'SMOKE:'+JSON.stringify({headings:document.querySelectorAll('h1').length,math:document.querySelectorAll('.katex').length,charts:document.querySelectorAll('.interactive-chart svg').length,surfaces:document.querySelectorAll('.surface-chart').length,answers:document.querySelectorAll('details.callout').length,pele:Array.from(document.querySelectorAll('.mermaid img')).filter(i=>i.complete&&i.naturalWidth>0&&decodeURIComponent(i.src).includes('data-diagram-engine=\\\"pele\\\"')).length,themePattern:getComputedStyle(document.querySelector('.android-reading')).backgroundImage.includes('radial-gradient'),themeArt:getComputedStyle(document.querySelector('.android-reading')).backgroundImage.includes('data:image/svg+xml'),themeWeight:document.documentElement.style.getPropertyValue('--custom-heading-weight'),zoom:getComputedStyle(document.documentElement).getPropertyValue('--workspace-scale')})}))"
                 QMetaObject.invokeMethod(window,"runDocumentScript",Q_ARG("QVariant",script))
             def result():
                 if studio.message.startswith("SMOKE:"):
                     print(studio.message,flush=True)
                     window.grabWindow().save("/tmp/supermd-qt-smoke.png")
-                    valid = all(value in studio.message for value in ('"headings":1','"math":1','"charts":1','"surfaces":0','"answers":1'))
+                    valid = all(value in studio.message for value in ('"headings":1','"math":1','"charts":1','"surfaces":0','"answers":1','"pele":1'))
                     if args.smoke_theme:valid=valid and studio.customThemeActive and '"themePattern":true' in studio.message and '"themeWeight":"800"' in studio.message
                     zoom = window.findChild(QObject,"zoomPercentage")
                     valid = valid and zoom is not None and zoom.property("height") == 36
