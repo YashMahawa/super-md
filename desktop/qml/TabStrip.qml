@@ -11,6 +11,44 @@ ScrollView {
     contentHeight: 48
     ScrollBar.vertical.policy: ScrollBar.AlwaysOff
     ScrollBar.horizontal: ExpressiveScrollBar { implicitHeight: 8; padding: 1 }
+    function openRename(id, name) {
+        renameDialog.noteId = id
+        renameField.text = name
+        renameDialog.open()
+    }
+    // Keep the prompt outside the Repeater: snapshots recreate tab delegates,
+    // and must not destroy an open dialog or its in-progress filename.
+    AppDialog {
+        id: renameDialog
+        objectName: "renameDialog"
+        property string noteId: ""
+        title: "Rename note"
+        width: Math.min(400, parent ? parent.width - 32 : 400)
+        standardButtons: Dialog.Ok | Dialog.Cancel
+        TextField {
+            id: renameField
+            objectName: "renameField"
+            width: parent.width
+            implicitHeight: 52
+            font.pixelSize: 16
+            leftPadding: 14; rightPadding: 14; topPadding: 10; bottomPadding: 10
+            selectByMouse: true
+            Accessible.name: "Note name"
+            color: renameDialog.colors.text
+            selectionColor: renameDialog.colors.primary
+            selectedTextColor: renameDialog.colors["on-primary"]
+            background: Rectangle {
+                color: renameDialog.colors.surface
+                radius: 12
+                antialiasing: true
+                border.width: renameField.activeFocus ? 2 : 1
+                border.color: renameField.activeFocus ? renameDialog.colors.primary : renameDialog.colors.outline
+            }
+            onAccepted: { if (text.trim().length) renameDialog.accept() }
+        }
+        onOpened: { renameField.forceActiveFocus(); renameField.selectAll() }
+        onAccepted: studio.renameNote(noteId, renameField.text)
+    }
     function receive(drop, index) {
         try {
             const payload = JSON.parse(drop.getDataAsString("application/x-supermd-tab"))
@@ -69,18 +107,11 @@ ScrollView {
                 NoteContextMenu {
                     id: tabMenu
                     objectName: "tabContextMenu"
-                    NoteMenuItem { text: "Rename note"; icon.source: "../icons/Rename.svg"; onTriggered: { renameField.text=tab.modelData.name;renameDialog.open() } }
+                    NoteMenuItem { text: "Rename note"; icon.source: "../icons/Rename.svg"; onTriggered: strip.openRename(tab.modelData.id, tab.modelData.name) }
                     NoteMenuItem { text: "Undo"; enabled: tab.modelData.id===strip.viewState.active; onTriggered:studio.command("undo") }
                     NoteMenuItem { text: "Redo"; enabled: tab.modelData.id===strip.viewState.active; onTriggered:studio.command("redo") }
                     MenuSeparator {}
                     NoteMenuItem { text: "Move to new window"; onTriggered: studio.detachTab(tab.modelData.id) }
-                }
-                Dialog {
-                    id: renameDialog; title:"Rename note"; modal:true; width:360; standardButtons:Dialog.Ok|Dialog.Cancel
-                    anchors.centerIn:Overlay.overlay
-                    TextField { id:renameField; width:parent.width; selectByMouse:true; Accessible.name:"Note name"; Component.onCompleted:selectAll() }
-                    onOpened: {renameField.forceActiveFocus();renameField.selectAll()}
-                    onAccepted:studio.renameNote(tab.modelData.id,renameField.text)
                 }
                 RowLayout {
                     anchors.fill: parent

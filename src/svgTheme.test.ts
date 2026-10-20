@@ -63,3 +63,23 @@ it('treats white-only transparent artwork as ink rather than erasing it as paper
   }
   expect(source).toContain('fill="white"');
 });
+it('adapts Mermaid paint rules even when unused keyframes and authored white edge halos are present',()=>{
+  const source='<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 300 200"><style>@keyframes dash{from{stroke-dashoffset:10}to{stroke-dashoffset:0}}.node{fill:#f8fafc;stroke:#374151}.edge{fill:none;stroke:#737373!important;filter:drop-shadow(1px 0 0 #ffffff)}.label{fill:#111827}</style><rect class="node" x="50" y="50" width="100" height="60"/><path class="edge" d="M0 0L50 50"/><text class="label" x="100" y="80">Visible</text></svg>';
+  const xml=parse(adaptSvg(source,dark,true)),node=xml.querySelector('rect')!,edge=xml.querySelector('path')!;
+  expect(node.getAttribute('fill')).toBe(dark.surface);
+  expect(mediaContrast(edge.getAttribute('stroke')!,dark.surface)).toBeGreaterThanOrEqual(3);
+  expect(edge.getAttribute('style')).toContain('filter: none');
+  expect(mediaContrast(xml.querySelector('text')!.getAttribute('fill')!,node.getAttribute('fill')!)).toBeGreaterThanOrEqual(4.5);
+});
+it('adapts HSL row fills and implicitly closed polygons used by entity diagrams',()=>{
+  const source='<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 200 120"><path d="M10 10L190 10L190 100L10 100" fill="hsl(0, 0%, 100%)"/><text x="50" y="50" fill="hsl(0,0%,10%)">Attribute</text></svg>';
+  const xml=parse(adaptSvg(source,dark,true));
+  expect(xml.querySelector('path')!.getAttribute('fill')).toBe(dark.surface);
+  expect(mediaContrast(xml.querySelector('text')!.getAttribute('fill')!,dark.surface)).toBeGreaterThanOrEqual(7);
+});
+it('monochrome keeps curved area categories and matching legends tonally distinct',()=>{
+  const source='<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 200 120"><path d="M0 0A50 50 0 0 1 50 50L0 0Z" fill="#cccccc"/><path d="M0 0A50 50 0 0 0 50 50L0 0Z" fill="#ffffff"/><rect id="legend" x="100" y="10" width="10" height="10" style="fill:rgb(204, 204, 204)"/></svg>';
+  const xml=parse(adaptSvg(source,dark,true,true)),paths=xml.querySelectorAll('path');
+  expect(paths[0].getAttribute('fill')).not.toBe(paths[1].getAttribute('fill'));
+  expect(xml.querySelector('#legend')!.getAttribute('fill')).toBe(paths[0].getAttribute('fill'));
+});

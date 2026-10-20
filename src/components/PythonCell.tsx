@@ -1,8 +1,16 @@
-import { useEffect, useRef, useState, type ReactNode } from "react";
+import { useContext, useEffect, useMemo, useRef, useState, type ReactNode } from "react";
 import { invoke } from "../nativeBridge";
 import { pythonResults, remember, retainVisiblePython,storePythonOutput,loadPythonOutput,pythonStored } from "../renderedOutputs";
 import type { PythonResult } from "../types";
 import CopyCode from "./CopyCode";
+import {DocumentAppearance} from '../documentAppearance';
+import SvgDiagram from './SvgDiagram';
+
+function PythonFigure({image,index}:{image:string;index:number}) {
+  const theme=useContext(DocumentAppearance);
+  const svg=useMemo(()=>{if(!image.startsWith('data:image/svg+xml;base64,'))return null;try{return new TextDecoder().decode(Uint8Array.from(atob(image.slice(image.indexOf(',')+1)),c=>c.charCodeAt(0)));}catch{return null;}},[image]);
+  return svg?<SvgDiagram source={svg} dark={theme?.dark} appearance={theme?.svgAppearance} colors={theme?.colors} preserveOriginal label={`Python figure ${index+1}`}/>:<img draggable={false} data-media-kind="image" src={image} alt={`Python figure ${index+1}`}/>;
+}
 
 // Figures come from local processes or caches: accept only bounded SVG/PNG/JPEG data.
 const safeFigure = (image: unknown): image is string => typeof image === "string" && image.length <= 12_000_000 && /^data:image\/(?:svg\+xml|png|jpeg);base64,[A-Za-z0-9+/]+=*$/.test(image.slice(0, 64) + (image.length > 64 ? image.slice(-8) : ""));
@@ -40,7 +48,7 @@ export default function PythonCell({ source, python, highlighted }: { source: st
       {result && <div className={`cell-output ${result.ok ? "" : "failed"} ${stale ? "stale" : ""}`}>
         {result.stdout && <pre>{result.stdout}</pre>}
         {result.stderr && <pre>{result.stderr}</pre>}
-        {result.images.filter(safeFigure).slice(0, 16).map((image, index) => <img key={index} src={image} alt={`Python figure ${index + 1}`} />)}
+        {result.images.filter(safeFigure).slice(0, 16).map((image, index) => <PythonFigure key={index} image={image} index={index}/>)}
       </div>}
     </div>
   );

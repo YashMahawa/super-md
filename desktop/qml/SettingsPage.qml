@@ -74,7 +74,7 @@ Pane {
                 Label { text: "Auto adapts neutral ink and paper, preserving readable colours. Theme monochrome recolours the whole image. Separation keeps original colours and adds a readable backing and edge. Original files and PDF exports are unchanged."; Layout.fillWidth: true; wrapMode: Text.WordWrap; color: viewState.colors.muted }
                 Label { text: "Image appearance" }
                 ChoiceField { Layout.fillWidth: true; model: ["Original (off)","Invert in dark themes","Auto adapt to theme","Theme monochrome","Separate from theme"]; currentIndex: ["original","invert-dark","auto","monochrome","contrast"].indexOf(viewState.settings.imageAppearance); onActivated: page.save("imageAppearance",["original","invert-dark","auto","monochrome","contrast"][currentIndex]) }
-                Label { text: "SVG appearance" }
+                Label { text: "Diagram appearance (SVG, Mermaid & charts)" }
                 ChoiceField { Layout.fillWidth: true; model: ["Original (off)","Invert in dark themes","Auto adapt to theme","Theme monochrome","Separate from theme"]; currentIndex: ["original","invert-dark","auto","monochrome","contrast"].indexOf(viewState.settings.svgAppearance); onActivated: page.save("svgAppearance",["original","invert-dark","auto","monochrome","contrast"][currentIndex]) }
                 Label { text: "Separation strength: " + viewState.settings.imageContrast.toFixed(2) }
                 ExpressiveSlider { Layout.fillWidth: true; from: 1; to: 2; stepSize: .05; value: viewState.settings.imageContrast; onMoved: page.save("imageContrast",value) }

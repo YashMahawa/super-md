@@ -19,6 +19,7 @@ ApplicationWindow {
     property bool sidebar: true
     property bool settingsOpen: false
     property int contextMenuCount: 0
+    property int modalDialogCount: 0
     onSettingsOpenChanged: settingsOpen ? settingsDialog.open() : settingsDialog.close()
     property bool closingAllowed: false
     property string outputFormat: "pdf"
@@ -71,10 +72,10 @@ ApplicationWindow {
     FileDialog { id:themeExportDialog;title:"Export editable theme";fileMode:FileDialog.SaveFile;defaultSuffix:"json";selectedFile:studio.defaultSaveLocation("My theme.supermd-theme.json");nameFilters:["Theme files (*.json)"];onAccepted:studio.exportCustomTheme(selectedFile.toString()) }
     Shortcut { sequences: [StandardKey.Open]; onActivated: openDialog.open() }
     Shortcut { sequences: [StandardKey.Save]; onActivated: studio.saveSafely() }
-    Shortcut { sequences: [StandardKey.Undo]; enabled: !settingsOpen && !viewState.readerOverlay && !exportDialog.visible; onActivated: studio.command("undo") }
-    Shortcut { sequences: [StandardKey.Redo]; enabled: !settingsOpen && !viewState.readerOverlay && !exportDialog.visible; onActivated: studio.command("redo") }
+    Shortcut { sequences: [StandardKey.Undo]; enabled: !modalDialogCount && !viewState.readerOverlay; onActivated: studio.command("undo") }
+    Shortcut { sequences: [StandardKey.Redo]; enabled: !modalDialogCount && !viewState.readerOverlay; onActivated: studio.command("redo") }
     Shortcut { sequences: [StandardKey.Find]; onActivated: studio.command("find") }
-    Shortcut { sequences: [StandardKey.Close]; onActivated: studio.closeTabSafely(viewState.active) }
+    Shortcut { sequences: [StandardKey.Close]; enabled:!modalDialogCount; onActivated: studio.closeTabSafely(viewState.active) }
     Shortcut { sequences: ["Ctrl+T", "Meta+T"]; onActivated: studio.newNote() }
     Shortcut { sequences: ["Ctrl+Tab", "Ctrl+PageDown"]; onActivated: studio.cycleTab(1) }
     Shortcut { sequences: ["Ctrl+Shift+Tab", "Ctrl+PageUp"]; onActivated: studio.cycleTab(-1) }
@@ -84,8 +85,7 @@ ApplicationWindow {
     Shortcut { sequences: ["Ctrl+Shift+W","Meta+Shift+W"]; onActivated: studio.closeWindowSafely() }
     Shortcut { sequence: "Ctrl+,"; onActivated: settingsOpen = !settingsOpen }
     Shortcut { sequence: "F11"; onActivated: windowModes.setFullscreen(!windowModes.fullscreen) }
-    Shortcut { sequence: "Escape"; enabled: settingsOpen; onActivated: settingsOpen = false }
-    Shortcut { sequence: "Escape"; enabled: !settingsOpen && !exportDialog.visible && !contentsPopup.visible; onActivated: reader.runJavaScript("window.supermdDismiss?.() || false", function(dismissed) { if (!dismissed && windowModes.fullscreen) windowModes.setFullscreen(false) }) }
+    Shortcut { sequence: "Escape"; enabled: !modalDialogCount && !contentsPopup.visible; onActivated: reader.runJavaScript("window.supermdDismiss?.() || false", function(dismissed) { if (!dismissed && windowModes.fullscreen) windowModes.setFullscreen(false) }) }
     // Qt's chrome never scales. Keyboard/pinch zoom is routed to the content pane.
     Shortcut { sequence: "Ctrl++"; onActivated: reader.runJavaScript("window.supermdZoomBy?.(1.1)") }
     Shortcut { sequence: "Ctrl+="; onActivated: reader.runJavaScript("window.supermdZoomBy?.(1.1)") }
@@ -328,18 +328,12 @@ ApplicationWindow {
             OutlineList { Layout.fillWidth: true; Layout.fillHeight: true; entries: viewState.outline || []; noteId: viewState.active; onChosen: { contentsPopup.close(); window.chromeAwake = false; reader.forceActiveFocus() } }
         }
     }
-    Dialog {
+    AppDialog {
         id: settingsDialog
         objectName: "settingsDialog"
-        modal: true
-        anchors.centerIn: parent
         width: Math.min(640, window.width - 48)
         height: Math.min(780, window.height - 64)
         padding: 0
-        background: Rectangle { color: viewState.colors.surface; radius: 28; antialiasing: true }
-        Overlay.modal: Rectangle { color: "#66000000" }
-        enter: Transition { NumberAnimation { property: "opacity"; from: 0; to: 1; duration: viewState.settings.motion ? 160 : 0 } }
-        exit: Transition { NumberAnimation { property: "opacity"; from: 1; to: 0; duration: viewState.settings.motion ? 100 : 0 } }
         onClosed: settingsOpen = false
         SettingsPage { ownerPopup: settingsDialog; viewState: window.viewState; anchors.fill: parent; onBack: settingsOpen = false }
     }
@@ -353,17 +347,13 @@ ApplicationWindow {
     FolderDialog { id: noteFolderDialog; title: "Default location for new notes"; onAccepted: studio.setNoteLocation(selectedFolder.toString()) }
     FileDialog { id: saveDialog; title: "Save note"; fileMode: FileDialog.SaveFile; nameFilters: viewState.portable ? ["Portable Super MD (*.smd)"] : ["Markdown (*.md)", "Portable Super MD (*.smd)"]; onAccepted: studio.saveAs(selectedFile.toString()); onRejected: studio.resolveClose("cancel") }
     FileDialog { id: destination; title: "Export note"; fileMode: FileDialog.SaveFile; nameFilters: outputFormat === "pdf" ? ["PDF (*.pdf)"] : outputFormat === "md" ? ["Markdown (*.md)"] : ["Portable Super MD (*.smd)"]; onAccepted: studio.exportTo(selectedFile.toString(), outputFormat) }
-    Dialog {
+    AppDialog {
         id: exportDialog
         objectName: "exportDialog"
         title: sharing ? "Share note" : "Export note"
-        modal: true
-        anchors.centerIn: parent
         width: Math.min(560, window.width - 48)
         height: Math.min(760, window.height - 64)
         standardButtons: Dialog.Cancel
-        background: Rectangle { color: viewState.colors.surface; radius: 28; antialiasing: true }
-        Overlay.modal: Rectangle { color: "#66000000" }
         ColumnLayout {
             anchors.fill: parent
             spacing: 16
@@ -391,10 +381,9 @@ ApplicationWindow {
             Qt.callLater(() => exportScroll.contentItem.contentY = 0)
         }
     }
-    Dialog {
+    AppDialog {
         id: closeDialog
-        modal: true
-        anchors.centerIn: parent
+        objectName: "closeDialog"
         width: 440
         closePolicy: Popup.NoAutoClose
         ColumnLayout {
@@ -408,12 +397,11 @@ ApplicationWindow {
             }
         }
     }
-    Dialog {
+    AppDialog {
         id: flushDialog
+        objectName: "flushDialog"
         property bool canClose: false
         title: "The document reader is busy"
-        modal: true
-        anchors.centerIn: parent
         width: Math.min(480,window.width-48)
         closePolicy: Popup.NoAutoClose
         ColumnLayout {

@@ -553,7 +553,7 @@ private class NoteDestination(mime: String, private val preferred: () -> String)
             SettingsSection("Images & diagrams") {
                 val choices=listOf("original" to "Original (off)","invert-dark" to "Invert in dark themes","auto" to "Auto adapt to theme","monochrome" to "Theme monochrome","contrast" to "Separate from theme")
                 Choice("Image appearance",state.imageAppearance,choices){model.readingPreference("imageAppearance",it)}
-                Choice("SVG appearance",state.svgAppearance,choices){model.readingPreference("svgAppearance",it)}
+                Choice("Diagram appearance (SVG, Mermaid & charts)",state.svgAppearance,choices){model.readingPreference("svgAppearance",it)}
                 Text("Separation strength · ${"%.2f".format(state.imageContrast)}")
                 StudySlider(value=state.imageContrast,onCommit=model::imageContrast,valueRange=1f..2f)
                 Text("Auto adapts neutral ink and paper, preserving readable colours. Theme monochrome recolours the whole image. Separation preserves original colours and adds a readable backing and edge. Original files and PDF exports are unchanged.",style=MaterialTheme.typography.bodySmall)

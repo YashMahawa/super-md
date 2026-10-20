@@ -308,7 +308,11 @@ test("Android shares math, callouts, graphs and portable PDF preparation", async
   await expect(page.locator(".python-cell pre code")).toBeVisible();
   await expect(page.locator(".python-cell pre code")).toHaveCSS("color", "rgb(28, 38, 53)");
   await expect(page.locator(".python-cell .hljs-string")).toContainText("local-python-ok");
-  await expect(page.locator(".mermaid svg")).toBeVisible(); await page.locator(".chart-controls input[type=range]").fill("1.98");
+  const diagram=page.locator('.mermaid img');await expect(diagram).toBeVisible();
+  await expect.poll(()=>diagram.evaluate(i=>(i as HTMLImageElement).complete&&(i as HTMLImageElement).naturalWidth>0)).toBe(true);
+  const vector=decodeURIComponent((await diagram.getAttribute('src'))!.split(',').slice(1).join(','));
+  expect(vector).toContain('<svg');expect(vector).toContain('Read');expect(vector).toContain('Understand');
+  await page.locator(".chart-controls input[type=range]").fill("1.98");
   await page.getByRole("button", { name: "Run" }).click(); await expect(page.locator(".cell-output")).toContainText("local-python-ok");
   await page.evaluate(() => window.supermdExport?.({ pageSize: "a4", margin: 18, fontSize: 11, fontFamily: "Libertinus Serif", lineHeight: 1.35, pageNumbers: false }));
   expect(requests.find((item) => item.command === "export_failed")).toBeUndefined();

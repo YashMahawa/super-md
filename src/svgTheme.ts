@@ -7,21 +7,37 @@ type Box=[number,number,number,number];
 const identity:Matrix=[1,0,0,1,0,0];
 const hex=(rgb:RGB)=>'#'+rgb.map(n=>Math.round(Math.max(0,Math.min(255,n))).toString(16).padStart(2,'0')).join('');
 function rgb(value:string):RGB|null {
+  value=value.trim();
   value=({black:'#000000',white:'#ffffff',gray:'#808080',grey:'#808080'} as Record<string,string>)[value.toLowerCase()]??value;
   const h=value.match(/^#([\da-f]{3}|[\da-f]{6})$/i)?.[1];
   if(h)return (h.length===3?h.split('').map(c=>parseInt(c+c,16)):[0,2,4].map(i=>parseInt(h.slice(i,i+2),16))) as RGB;
-  const m=value.match(/^rgb\(\s*(\d+)[, ]+(\d+)[, ]+(\d+)\s*\)$/i);return m?m.slice(1).map(Number) as RGB:null;
+  const m=value.match(/^rgb\(\s*(\d+)[, ]+(\d+)[, ]+(\d+)\s*\)$/i);if(m)return m.slice(1).map(Number) as RGB;
+  const hsl=value.match(/^hsl\(\s*([-+\d.]+)(?:deg)?[, ]+([\d.]+)%[, ]+([\d.]+)%\s*\)$/i);
+  if(hsl){const h=((Number(hsl[1])%360)+360)%360/360,s=Math.min(100,Number(hsl[2]))/100,l=Math.min(100,Number(hsl[3]))/100;const a=s*Math.min(l,1-l);return [0,8,4].map(n=>{const k=(n+h*12)%12;return 255*(l-a*Math.max(-1,Math.min(k-3,9-k,1)));}) as RGB;}
+  return null;
 }
 const neutral=(c:RGB)=>Math.max(...c)-Math.min(...c)<=12||(Math.max(...c)<100&&Math.max(...c)-Math.min(...c)<=32);
+function withoutKeyframes(css:string){
+  // Mermaid emits unused animation definitions even for static diagrams.
+  // Skip their nested bodies while resolving ordinary paint selectors; do not
+  // let their from/to rules masquerade as rules for actual SVG elements.
+  const start=/@(?:-webkit-)?keyframes\b[^{}]*\{/gi;let result='',offset=0,match:RegExpExecArray|null;
+  while((match=start.exec(css))){
+    result+=css.slice(offset,match.index);let depth=1,quote='';let i=start.lastIndex;
+    for(;i<css.length&&depth;i++){const ch=css[i];if(quote){if(ch==='\\')i++;else if(ch===quote)quote='';}else if(ch==='"'||ch==="'")quote=ch;else if(ch==='{')depth++;else if(ch==='}')depth--;}
+    if(depth)return null;offset=i;start.lastIndex=i;
+  }
+  return result+css.slice(offset);
+}
 /** Resolve ordinary embedded SVG paint rules in the inert XML tree. Never
  * mount authored stylesheets in the app DOM or measure the document. */
 function flattenPaintRules(root:Element,nodes:Element[]){
   const rules:Array<{selector:string;weight:number;values:Array<[string,string,boolean]>}>=[];
   for(const style of Array.from(root.querySelectorAll('style'))){
-    const source=(style.textContent??'').replace(/\/\*[\s\S]*?\*\//g,'');
-    if(/@(?:media|supports|layer|keyframes)\b/i.test(source))return false;
+    const source=withoutKeyframes((style.textContent??'').replace(/\/\*[\s\S]*?\*\//g,''));
+    if(source===null||/@(?:media|supports|layer)\b/i.test(source))return false;
     for(const match of source.matchAll(/([^{}]+)\{([^{}]*)\}/g)){
-      const values=Array.from(match[2].matchAll(/(?:^|;)\s*(fill|stroke|stroke-width)\s*:\s*([^;]+)/g),m=>[m[1],m[2].replace(/\s*!important\s*$/i,'').trim(),/!important\s*$/i.test(m[2])] as [string,string,boolean]);
+      const values=Array.from(match[2].matchAll(/(?:^|;)\s*(fill|stroke|stroke-width|filter)\s*:\s*([^;]+)/g),m=>[m[1],m[2].replace(/\s*!important\s*$/i,'').trim(),/!important\s*$/i.test(m[2])] as [string,string,boolean]);
       if(!values.length||match[1].includes('@'))continue;
       for(const selector of match[1].split(',').map(s=>s.trim())){
         if(rules.length>=256)return false;
@@ -78,7 +94,8 @@ function bounds(node:Element,m:Matrix):Box|null {
     const d=node.getAttribute('d')||'';
     // Closed, straight-line paths include Matplotlib's paper patches. Curved
     // paths and font outlines are not guessed to be background rectangles.
-    if(/[zZ]\s*$/.test(d)&&/^[\sMLZ0-9.,eE+\-]+$/.test(d))points=(d.match(/[-+]?(?:\d*\.)?\d+(?:[eE][-+]?\d+)?/g)||[]).map(Number);
+    // SVG fills close straight polygons implicitly, even without a final Z.
+    if(/^[\sMLZ0-9.,eE+\-]+$/.test(d)){const n=(d.match(/[-+]?(?:\d*\.)?\d+(?:[eE][-+]?\d+)?/g)||[]).map(Number);if(n.length>=6)points=n;}
   }
   if(points.length<4||points.length>20000||points.length%2||points.some(v=>!Number.isFinite(v)))return null;
   const world:Array<[number,number]>=[];
@@ -89,7 +106,7 @@ interface Paint {node:Element;index:number;fill:string;stroke:string;matrix:Matr
 /** Inert, display-only adaptation. Coloured nodes remain coloured; labels are
  * contrasted against their local node, not blindly recoloured against paper.
  * No DOM measurement, raster copy, Markdown reparse, scripts or source writes. */
-export function adaptSvg(source:string,colors:Record<string,string>,dark:boolean):string {
+export function adaptSvg(source:string,colors:Record<string,string>,dark:boolean,monochrome=false):string {
   const safe=svgImage(source);
   if(safe.length>1_000_000)return safe;
   const xml=new DOMParser().parseFromString(safe,'image/svg+xml'),root=xml.documentElement;
@@ -116,18 +133,40 @@ export function adaptSvg(source:string,colors:Record<string,string>,dark:boolean
       let newFill=fill;
       if(c&&!label){
         if(isPaper)newFill=paper;
+        else if(monochrome)newFill=box?paper:ink;
         else if(neutral(c))newFill=Math.min(...c)>180&&!lightInk?paper:ink;
         else if(box&&Math.min(...c)>215&&Math.max(...c)-Math.min(...c)<64){
           const base=rgb(paper)!,average=(c[0]+c[1]+c[2])/3;
           newFill=hex(base.map((v,i)=>v+(c[i]-average)*1.3) as RGB);
-        }else if(box&&mediaContrast(hex(c),paper)<1.6)newFill=readable(fill,paper,3);
+        }else if(box&&Math.max(...c)<180&&mediaContrast(hex(c),paper)<1.6)newFill=readable(fill,paper,3);
       }
       paints.push({node,index:index++,fill,stroke,matrix,box,label,paper:isPaper,newFill});
     }
     for(const child of Array.from(node.children))visit(child,fill,stroke,matrix,label);
   };
   visit(root,'#000000','none',identity,false);
-  const shapes=paints.filter(p=>p.box&&rgb(p.fill));
+  // Curved filled areas (pie slices, rounded silhouettes) need a true vector
+  // hit test for their labels. Path2D uses geometry only: no DOM measurement
+  // or raster copy. Older engines retain the bounded-rectangle fallback.
+  const curved=paints.filter(p=>!p.label&&!p.box&&p.node.localName==='path'&&/[zZ]\s*$/.test(p.node.getAttribute('d')||'')&&rgb(p.fill));
+  const paths=new Map<Element,Path2D>();let geometry:CanvasRenderingContext2D|null=null;
+  if(curved.length&&typeof Path2D!=='undefined'){
+    geometry=document.createElement('canvas').getContext('2d');
+    for(const p of curved){const d=p.node.getAttribute('d')!;if(d.length<=20000)try{paths.set(p.node,new Path2D(d));}catch{/* Keep authored unsupported paths. */}}
+  }
+  if(monochrome&&curved.length){
+    // Keep categories distinguishable instead of flattening all slices into
+    // one solid accent. Matching legend swatches use the same tonal mapping.
+    const values=new Map(curved.map(p=>[hex(rgb(p.fill)!),rgb(p.fill)!.reduce((sum,n)=>sum+n,0)/765]));
+    const low=Math.min(...values.values()),high=Math.max(...values.values());
+    if(high-low>.02){const a=rgb(ink)!,b=rgb(paper)!;for(const p of paints){const color=rgb(p.fill),key=color&&hex(color);if(!p.label&&!p.paper&&key&&values.has(key)){const t=.15+.65*(values.get(key)!-low)/(high-low);p.newFill=hex(a.map((v,i)=>v*(1-t)+b[i]*t) as RGB);}}}
+  }
+  const shapes=paints.filter(p=>(p.box||paths.has(p.node))&&rgb(p.fill));
+  const contains=(p:Paint,x:number,y:number)=>{
+    if(p.box)return x>=p.box[0]&&x<=p.box[2]&&y>=p.box[1]&&y<=p.box[3];
+    const m=p.matrix,det=m[0]*m[3]-m[1]*m[2];if(!geometry||Math.abs(det)<1e-9)return false;
+    const dx=x-m[4],dy=y-m[5];return geometry.isPointInPath(paths.get(p.node)!,(m[3]*dx-m[2]*dy)/det,(-m[1]*dx+m[0]*dy)/det,p.node.getAttribute('fill-rule')==='evenodd'?'evenodd':'nonzero');
+  };
   const set=(node:Element,key:string,value:string)=>{
     node.setAttribute(key,value);
     // Adaptation is a display variant: inline paint also wins over embedded
@@ -137,6 +176,11 @@ export function adaptSvg(source:string,colors:Record<string,string>,dark:boolean
   };
   for(const paint of paints){
     const {node,matrix,label,box}=paint;
+    // Authored white drop-shadow halos make edges glow against dark paper.
+    // They are presentation effects, not diagram geometry. Auto mode uses
+    // contrasted edge colours instead; Original mode remains untouched.
+    const filter=(node as SVGElement).style?.getPropertyValue('filter');
+    if(filter?.includes('drop-shadow('))set(node,'filter','none');
     let x=parseFloat(node.getAttribute('x')||'0'),y=parseFloat(node.getAttribute('y')||'0');
     if(box){x=(box[0]+box[2])/2;y=(box[1]+box[3])/2;}
     else [x,y]=point(matrix,x,y);
@@ -144,11 +188,11 @@ export function adaptSvg(source:string,colors:Record<string,string>,dark:boolean
     // Unbounded/curved paths have no reliable sample point. Do not treat the
     // default (0,0) as their backdrop: a different shape there can otherwise
     // make an unrelated line acquire the wrong colour.
-    if(box||label)for(let i=shapes.length-1;i>=0;i--){const p=shapes[i];if(p.index<paint.index&&p.box&&x>=p.box[0]&&x<=p.box[2]&&y>=p.box[1]&&y<=p.box[3]){local=p;break;}}
+    if(box||label)for(let i=shapes.length-1;i>=0;i--){const p=shapes[i];if(p.index<paint.index&&contains(p,x,y)){local=p;break;}}
     const background=rgb(local?.newFill||'')?hex(rgb(local!.newFill)!):paper;
     const c=rgb(paint.fill);
     if(c){
-      const intended=label?(neutral(c)?ink:paint.fill):paint.newFill;
+      const intended=label?(monochrome||neutral(c)?ink:paint.fill):paint.newFill;
       set(node,'fill',label?readable(intended,background,7):intended);
       if(!label&&box&&!paint.paper&&paint.stroke==='none'&&mediaContrast(hex(rgb(intended)!),background)<1.6){set(node,'stroke',readable(intended,background,3));set(node,'stroke-width','1');}
     }
@@ -156,7 +200,7 @@ export function adaptSvg(source:string,colors:Record<string,string>,dark:boolean
     if(edge){
       const width=parseFloat((node as SVGElement).style?.getPropertyValue('stroke-width')||node.getAttribute('stroke-width')||'1');
       const halo=!lightInk&&neutral(edge)&&Math.min(...edge)>230&&width>=4;
-      set(node,'stroke',halo?paper:readable(neutral(edge)?ink:paint.stroke,background,3));
+      set(node,'stroke',halo?paper:readable(monochrome||neutral(edge)?ink:paint.stroke,background,3));
     }
   }
   // Marker geometry lives in defs, outside painter-order node backdrops. Give
@@ -165,14 +209,14 @@ export function adaptSvg(source:string,colors:Record<string,string>,dark:boolean
     if(!marker.getAttribute('fill'))marker.setAttribute('fill',ink);
     for(const node of [marker,...Array.from(marker.querySelectorAll('*'))])for(const key of ['fill','stroke']){
       const value=(node as SVGElement).style?.getPropertyValue(key)||node.getAttribute(key),c=value&&rgb(value);
-      if(c)set(node,key,readable(neutral(c)?ink:value!,paper,3));
+      if(c)set(node,key,readable(monochrome||neutral(c)?ink:value!,paper,3));
     }
   }
   root.setAttribute('color',ink);
   return new XMLSerializer().serializeToString(root);
 }
 
-export function adaptSvgData(uri:string,colors:Record<string,string>,dark:boolean):string {
+export function adaptSvgData(uri:string,colors:Record<string,string>,dark:boolean,monochrome=false):string {
   if(!uri.startsWith('data:image/svg+xml')||uri.length>1_400_000)return uri;
-  try {const comma=uri.indexOf(','),source=uri.slice(0,comma).includes(';base64')?decodeURIComponent(escape(atob(uri.slice(comma+1)))):decodeURIComponent(uri.slice(comma+1));return 'data:image/svg+xml;charset=utf-8,'+encodeURIComponent(adaptSvg(source,colors,dark));}catch{return uri;}
+  try {const comma=uri.indexOf(','),source=uri.slice(0,comma).includes(';base64')?decodeURIComponent(escape(atob(uri.slice(comma+1)))):decodeURIComponent(uri.slice(comma+1));return 'data:image/svg+xml;charset=utf-8,'+encodeURIComponent(adaptSvg(source,colors,dark,monochrome));}catch{return uri;}
 }

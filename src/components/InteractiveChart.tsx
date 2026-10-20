@@ -5,12 +5,13 @@ import { chartValues, chartGrids, remember } from "../renderedOutputs";
 import { useChartZoom } from "../useChartZoom";
 import { axisNumber, axisTicks } from "../focalZoom";
 import GraphProbe, { type Probe } from "./GraphProbe";
+import {mediaContrast,mediaTone,type MediaAppearance} from '../mediaAppearance';
 
 const palette = ["#6750a4", "#006a6a", "#b3261e", "#7d5700", "#3f6374"];
 const darkPalette = ["#d0bcff", "#72d6d6", "#ffb4ab", "#efd18a", "#a1cce0"];
 const featureNames: Record<ChartFeature["kind"], string> = {root:"Root", maximum:"Maximum", minimum:"Minimum", intersection:"Intersection"};
 
-export default function InteractiveChart({source,dark=false}:{source:string;dark?:boolean}) {
+export default function InteractiveChart({source,dark=false,appearance,colors:themeColors}:{source:string;dark?:boolean;appearance?:MediaAppearance;colors?:Record<string,string>}) {
   const clipId = useId().replace(/:/g,"_");
   const plot = useChartZoom(source);
   const parsed = useMemo(()=>{try{return {spec:parseChartSpec(source),error:""};}catch(error){return {spec:null,error:String(error)};}},[source]);
@@ -54,7 +55,14 @@ export default function InteractiveChart({source,dark=false}:{source:string;dark
   const features = useMemo(()=>geometry&&spec?chartFeatures(geometry.visibleSeries,spec.series.map((series,index)=>series.points?null:curves[index]),geometry.yMax-geometry.yMin):[],[geometry,curves,spec]);
   if(!spec || !geometry) return <div className="render-error" role="status">Invalid smd-chart: {parsed.error}</div>;
   const {xMin,xMax,yMin,yMax,hasSamples,visibleSeries}=geometry;
-  const colors=spec.series.map((series,i)=>series.color||(dark?darkPalette:palette)[i%palette.length]);
+  const colors=spec.series.map((series,i)=>{
+    const original=series.color||(dark?darkPalette:palette)[i%palette.length];
+    if(appearance==='monochrome')return mediaTone(themeColors??{},dark).ink;
+    if(appearance!=='auto'||!themeColors?.surface)return original;
+    const color=series.color||(i===0?themeColors.primary:undefined)||original;
+    if(mediaContrast(color,themeColors.surface)>=3)return color;
+    return (dark?darkPalette:palette)[i%palette.length];
+  });
   const labels=spec.series.map(seriesLabel);
   // SVG units follow the displayed width so tick labels remain actual reading
   // size on phones. SSR/PDF preparation retains a deterministic 760px canvas.
@@ -108,7 +116,7 @@ export default function InteractiveChart({source,dark=false}:{source:string;dark
       </div>
     </div>
     <div data-independent-zoom onDoubleClick={moved?plot.reset:undefined}>
-      <svg ref={svgRef} viewBox={`0 0 ${width} ${height}`} data-plot-left={left} role="img" aria-label={spec.title||`Graph of ${labels.join(", ")}`}>
+      <svg ref={svgRef} viewBox={`0 0 ${width} ${height}`} data-media-kind="diagram" data-media-adapted={appearance==='auto'||appearance==='monochrome'?'true':undefined} data-plot-left={left} role="img" aria-label={spec.title||`Graph of ${labels.join(", ")}`}>
         <defs><clipPath id={clipId}><rect x={left} y={top} width={plotWidth} height={plotHeight}/></clipPath></defs>
         {axisTicks(xMin,xMax,Math.max(2,Math.min(8,Math.floor(plotWidth/90)))).map(x=><g key={`x${x}`}>{grid && <line className="chart-grid" x1={px(x)} x2={px(x)} y1={top} y2={height-bottom}/>}<text className="chart-tick" x={px(x)} y={height-bottom+20} textAnchor="middle">{axisNumber(x)}</text></g>)}
         {axisTicks(yMin,yMax,4).map(y=><g key={`y${y}`}>{grid && <line className="chart-grid" x1={left} x2={width-right} y1={py(y)} y2={py(y)}/>}<text className="chart-tick" x={left-10} y={py(y)+4} textAnchor="end">{axisNumber(y)}</text></g>)}

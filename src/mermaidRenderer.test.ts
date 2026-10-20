@@ -16,4 +16,20 @@ describe("isolated SVG diagrams", () => {
     expect(engine.initialize).toHaveBeenLastCalledWith(expect.objectContaining({ securityLevel: "strict" }));
     expect(document.body.children.length).toBe(0);
   });
+  it('keeps intrinsic vector dimensions and reuses a bounded rendered result without another layout',async()=>{
+    engine.render.mockResolvedValueOnce({svg:'<svg xmlns="http://www.w3.org/2000/svg" width="100%" viewBox="0 0 640 240"><text>Cached diagram</text></svg>'});
+    const first=await renderMermaid('graph LR; Unique-->Cached');
+    expect(first).toContain('width="640"');expect(first).toContain('height="240"');
+    const calls=engine.render.mock.calls.length;
+    expect(await renderMermaid('graph LR; Unique-->Cached')).toBe(first);
+    expect(engine.render.mock.calls.length).toBe(calls);
+  });
+  it('evicts old layouts instead of retaining every diagram from previously opened notes',async()=>{
+    engine.render.mockResolvedValue({svg:'<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 100 50"><text>Bounded</text></svg>'});
+    for(let i=0;i<18;i++)await renderMermaid(`graph LR; Cache${i}-->Output`);
+    const calls=engine.render.mock.calls.length;
+    await renderMermaid('graph LR; Cache17-->Output');expect(engine.render.mock.calls.length).toBe(calls);
+    await renderMermaid('graph LR; Cache0-->Output');expect(engine.render.mock.calls.length).toBe(calls+1);
+    expect(document.body.children.length).toBe(0);
+  });
 });

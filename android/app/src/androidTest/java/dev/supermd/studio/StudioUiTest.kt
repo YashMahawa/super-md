@@ -152,6 +152,26 @@ class StudioUiTest {
             compose.runOnIdle {model.appearance(accent=before.accent,theme=before.theme,motion=before.motion);model.readingPreference("svgAppearance",before.svgAppearance);model.centerLock(before.centerLock);model.fullscreen(before.fullscreen)}
         }
     }
+    @Test fun mermaidSharesDiagramAppearanceWithoutChangingTheNoteOrPhotoSetting() {
+        welcome()
+        val model=androidx.lifecycle.ViewModelProvider(compose.activity)[StudioViewModel::class.java]
+        val before=model.state.value;temporaryNoteState=before
+        val content="# Diagram appearance\n\n```mermaid\nflowchart LR\n A[Read] --> B[Understand]\n```"
+        try {
+            compose.runOnIdle {model.fullscreen(false);model.appearance(accent="rose",theme="dark",motion=false);model.readingPreference("imageAppearance","original");model.readingPreference("svgAppearance","auto");model.edit(model.state.value.active.id,content);model.mode("reader");model.zoom(100f)}
+            javascriptUntil("(()=>{const i=document.querySelector('.mermaid img');return !!i?.complete&&i.naturalWidth>0&&i.dataset.mediaKind==='svg'&&i.dataset.mediaAdapted==='true'&&getComputedStyle(i).filter==='none'&&document.documentElement.dataset.imageAppearance==='original';})()") {it=="true"}
+            for(mode in listOf("monochrome","contrast","invert-dark","original")) {
+                compose.runOnIdle {model.readingPreference("svgAppearance",mode)}
+                javascriptUntil("(()=>{const i=document.querySelector('.mermaid img');return document.documentElement.dataset.svgAppearance==='$mode'&&!!i?.complete&&i.naturalWidth>0;})()") {it=="true"}
+                javascriptUntil("document.querySelectorAll('.image-error,.render-error').length") {it=="0"}
+                compose.runOnIdle {assertEquals(content,model.state.value.active.content);assertEquals("original",model.state.value.imageAppearance)}
+            }
+            javascriptUntil("(()=>{document.querySelector('.mermaid img').click();return !!document.querySelector('.image-viewer');})()") {it=="true"}
+            javascriptUntil("(()=>{document.querySelector('button[aria-label=\"Close image viewer\"]')?.click();return !document.querySelector('.image-viewer');})()") {it=="true"}
+        } finally {
+            compose.runOnIdle {model.appearance(accent=before.accent,theme=before.theme,motion=before.motion);model.readingPreference("imageAppearance",before.imageAppearance);model.readingPreference("svgAppearance",before.svgAppearance);model.fullscreen(before.fullscreen)}
+        }
+    }
     @Test fun checkingTasksKeepsNativeReadingPositionThroughUndoAndRedo() {
         welcome()
         val model=androidx.lifecycle.ViewModelProvider(compose.activity)[StudioViewModel::class.java]

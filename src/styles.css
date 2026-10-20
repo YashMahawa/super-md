@@ -328,6 +328,8 @@ md-filled-button.primary-action, smd-expressive-button.primary-action { display:
 .chart-warning { display: block; margin: 8px 4px; color: var(--error); font-size: .8em; }
 .mermaid { padding: 18px; overflow: auto; border-radius: 14px; background: var(--surface); }
 .mermaid svg { max-width: 100%; height: auto; display: block; margin: auto; }
+.mermaid .svg-figure {margin:0;}
+.mermaid img.svg-diagram {padding:16px;box-sizing:border-box;max-width:100%;height:auto;margin:auto;}
 .render-error { padding: 15px; border: 1px solid var(--error); border-radius: 10px; color: var(--error); white-space: pre-wrap; }
 .python-cell { margin: 1.5em 0; border: 1px solid var(--code-border); border-radius: 20px; overflow: hidden; background: var(--code-bg); }
 .python-cell pre { margin: 0; border: 0; border-radius: 0; }
