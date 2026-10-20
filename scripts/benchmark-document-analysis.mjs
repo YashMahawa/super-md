@@ -4,10 +4,12 @@
 // are loaded; the script never starts the Super MD desktop application.
 import { createServer } from "vite";
 import { chromium } from "playwright";
-import { pathToFileURL } from "node:url";
-import { resolve } from "node:path";
+import { fileURLToPath, pathToFileURL } from "node:url";
+import { dirname, resolve } from "node:path";
 import { mkdir, writeFile } from "node:fs/promises";
 import { createDocumentAnalysisFixtures } from "./document-analysis-fixtures.mjs";
+
+const REPOSITORY_ROOT = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 
 export function parseArgs(argv) {
   const options = { repetitions: 3, fixtures: null, output: null, help: false };
@@ -46,7 +48,8 @@ Options:
 
 async function run(options) {
   const server = await createServer({
-    configFile: resolve("vite.config.ts"),
+    root: REPOSITORY_ROOT,
+    configFile: resolve(REPOSITORY_ROOT, "vite.config.ts"),
     mode: "development",
     logLevel: "error",
     server: { host: "127.0.0.1", port: 0, strictPort: false, open: false },
@@ -57,24 +60,52 @@ async function run(options) {
     const address = server.httpServer.address();
     if (!address || typeof address === "string") throw new Error("Vite did not expose a local benchmark port");
     browser = await chromium.launch({ headless: true });
-    const page = await browser.newPage({ viewport: { width: 1280, height: 800 } });
-    page.setDefaultTimeout(600_000);
-    const errors = [];
-    page.on("pageerror", error => errors.push(error.message));
     const base = `http://127.0.0.1:${address.port}`;
-    const response = await page.goto(`${base}/scripts/document-analysis-bench.html`, { waitUntil: "networkidle" });
-    if (!response?.ok()) throw new Error(`Could not open isolated benchmark harness: ${response?.status() ?? "no response"}`);
-    await page.waitForFunction(() => typeof window.runDocumentAnalysisBenchmark === "function");
-    const report = await page.evaluate(options => window.runDocumentAnalysisBenchmark(options), {
-      repetitions: options.repetitions,
-      selectedFixtures: options.fixtures,
-    });
-    if (errors.length) throw new Error(`Browser benchmark error: ${errors.join("; ")}`);
-    report.metadata = {
-      nodeVersion: process.version,
-      browserVersion: browser.version(),
-      platform: process.platform,
-      architecture: process.arch,
+    const available = createDocumentAnalysisFixtures().map(fixture => fixture.name);
+    const fixtureNames = options.fixtures ?? available;
+    const samples = [];
+    for (const fixtureName of fixtureNames) {
+      for (let repetition = 1; repetition <= options.repetitions; repetition++) {
+        const page = await browser.newPage({ viewport: { width: 1280, height: 800 } });
+        page.setDefaultTimeout(600_000);
+        const errors = [];
+        page.on("pageerror", error => errors.push(error.message));
+        try {
+          const response = await page.goto(`${base}/scripts/document-analysis-bench.html`, { waitUntil: "networkidle" });
+          if (!response?.ok()) throw new Error(`Could not open isolated benchmark harness: ${response?.status() ?? "no response"}`);
+          await page.waitForFunction(() => typeof window.runDocumentAnalysisSample === "function");
+          const sample = await page.evaluate(input => window.runDocumentAnalysisSample(input), { fixtureName, repetition });
+          if (errors.length) throw new Error(`Browser benchmark error: ${errors.join("; ")}`);
+          samples.push(sample);
+        } finally {
+          await page.close();
+        }
+      }
+    }
+    const fixtures = createDocumentAnalysisFixtures().filter(fixture => fixtureNames.includes(fixture.name));
+    const report = {
+      schemaVersion: 1,
+      generatedAt: new Date().toISOString(),
+      methodology: {
+        parser: "The current src/documentAnalysis.ts analyzeDocument implementation is called unchanged in the main thread and a dedicated module worker.",
+        workerCold: "Measured immediately around worker creation, source postMessage clone, parse, complete AST/projection postMessage clone and reply; workerParseMs is measured around analyzeDocument inside the worker.",
+        synchronousCold: "Measures analyzeDocument plus a structuredClone of its result to approximate the existing CachedMarkdown clone; parse and clone durations are reported separately.",
+        responsiveness: "Maximum requestAnimationFrame interval observed around each operation in a foreground headless page; this is scheduling responsiveness, not presented pixels.",
+        warm: "Same-source second request using each module's existing bounded analysis LRU.",
+        evicted: "After 16 unique small sources, exceeding the current 16-entry LRU limit; not a byte-cache stress test.",
+        isolation: "Each fixture/repetition runs in a fresh page and closes it before the next sample so module-local analysis LRUs do not accumulate across samples.",
+        memory: "No heap or process-tree memory is measured; Chromium may retain shared process allocations. The report makes no worker memory-benefit claim.",
+        fixtures: "Generated synthetic Markdown only, maximum 4,000,000 ASCII bytes and AST node guard 50,000; no personal files or app workspace state.",
+        limitations: "Worker results are returned as cloned full ASTs. The benchmark does not implement async consumers, renderer integration, revision/staleness handling, app UI or whole-process PSS.",
+      },
+      configuration: { repetitions: options.repetitions, fixtures: fixtures.map(({ name, sourceBytes }) => ({ name, sourceBytes })) },
+      metadata: {
+        nodeVersion: process.version,
+        browserVersion: browser.version(),
+        platform: process.platform,
+        architecture: process.arch,
+      },
+      samples,
     };
     return report;
   } finally {
@@ -93,7 +124,7 @@ async function main() {
     const serialized = `${JSON.stringify(report, null, 2)}\n`;
     if (options.output) {
       const target = resolve(options.output);
-      await mkdir(resolve(target, ".."), { recursive: true });
+      await mkdir(dirname(target), { recursive: true });
       await writeFile(target, serialized, "utf8");
     } else process.stdout.write(serialized);
   } catch (error) { console.error(error.stack ?? String(error)); process.exitCode = 1; }

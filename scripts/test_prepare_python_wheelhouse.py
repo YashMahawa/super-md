@@ -92,7 +92,7 @@ class WheelhouseManifestTests(unittest.TestCase):
                 patch.object(wheelhouse.subprocess, "run", side_effect=AssertionError("warm cache must not rebuild")):
             outcome = wheelhouse.prepare(self.cache, self.requirements, [self.requirements])
         self.assertEqual(outcome, "cache-validated")
-        install.assert_called_once_with(self.cache, self.requirements)
+        install.assert_called_once_with(self.cache.resolve(), self.requirements.resolve())
         self.assertFalse(self.cache.with_name("wheelhouse.quarantine").exists())
 
     def test_partial_corrupt_cache_rebuilds_in_fresh_stage_and_preserves_old_files(self):
@@ -102,7 +102,7 @@ class WheelhouseManifestTests(unittest.TestCase):
             outcome = wheelhouse.prepare(self.cache, self.requirements, [self.requirements])
 
         self.assertEqual(outcome, "rebuilt")
-        self.assertEqual(install.call_args.args[0].parent, self.cache.parent)
+        self.assertEqual(install.call_args.args[0].parent, self.cache.resolve().parent)
         self.assertEqual((self.cache / "example-1.0-py3-none-any.whl").read_bytes(), b"rebuilt wheel")
         quarantine = self.cache.with_name("wheelhouse.quarantine")
         self.assertEqual((quarantine / "example-1.0-py3-none-any.whl").read_bytes(), b"same filename, corrupt contents")

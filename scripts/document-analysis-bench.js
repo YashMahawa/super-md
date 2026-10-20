@@ -78,7 +78,7 @@ async function measureOne(fixture, repetition) {
   const moduleQuery = encodeURIComponent(`${fixture.name}-${repetition}`);
   const { analyzeDocument } = await import(`/src/documentAnalysis.ts?benchmark=${moduleQuery}`);
   const source = fixture.source;
-  const worker = createWorker();
+  let worker;
   const idPrefix = `${fixture.name}-${repetition}`;
   try {
     const syncObservation = await frameMonitor(() => {
@@ -90,11 +90,14 @@ async function measureOne(fixture, repetition) {
       return { analysis, clone, parseMs: parsedAt - started, cloneMs: finished - parsedAt, totalMs: finished - started };
     });
 
-    const workerStarted = performance.now();
-    const workerObservation = await frameMonitor(() => workerRequest(worker, source, `${idPrefix}-cold`));
-    const workerRoundTripMs = performance.now() - workerStarted;
+    const workerObservation = await frameMonitor(async () => {
+      const started = performance.now();
+      worker = createWorker();
+      const response = await workerRequest(worker, source, `${idPrefix}-cold`);
+      return { response, startupAndRoundTripMs: performance.now() - started };
+    });
     const syncResult = syncObservation.value;
-    const workerResult = workerObservation.value;
+    const workerResult = workerObservation.value.response;
     const parity = stableJson(syncResult.analysis) === stableJson(workerResult.analysis);
     if (!parity) throw new Error(`Synchronous and worker AST/projections differ for ${fixture.name}`);
     const astNodeCount = countAstNodes(syncResult.analysis.tree);
@@ -137,7 +140,7 @@ async function measureOne(fixture, repetition) {
       },
       workerCold: {
         workerParseMs: workerResult.parseMs,
-        startupAndRoundTripMs: workerRoundTripMs,
+        startupAndRoundTripMs: workerObservation.value.startupAndRoundTripMs,
         maxRafGapMs: workerObservation.maxRafGapMs,
         rafGapsOver50ms: workerObservation.rafGapsOver50ms,
       },
@@ -145,38 +148,14 @@ async function measureOne(fixture, repetition) {
       after16EntryEvictions: { syncParseMs: syncEvictedMs, workerParseMs: workerEvicted.parseMs, workerRoundTripMs: workerEvictedRoundTripMs },
     };
   } finally {
-    worker.terminate();
+    worker?.terminate();
   }
 }
 
-window.runDocumentAnalysisBenchmark = async ({ repetitions = 3, selectedFixtures = null } = {}) => {
-  if (!Number.isInteger(repetitions) || repetitions < 3 || repetitions > 10) throw new RangeError("Repetitions must be between 3 and 10");
-  const available = createDocumentAnalysisFixtures();
-  const fixtures = selectedFixtures ? available.filter(fixture => selectedFixtures.includes(fixture.name)) : available;
-  if (!fixtures.length) throw new Error("No known fixtures were selected");
-  for (const fixture of fixtures) {
-    if (fixture.sourceBytes > DOCUMENT_ANALYSIS_FIXTURE_LIMIT_BYTES) throw new Error(`${fixture.name} exceeds the fixture byte limit`);
-  }
-  const samples = [];
-  for (const fixture of fixtures) {
-    for (let repetition = 1; repetition <= repetitions; repetition++) {
-      samples.push(await measureOne(fixture, repetition));
-    }
-  }
-  return {
-    schemaVersion: 1,
-    generatedAt: new Date().toISOString(),
-    methodology: {
-      parser: "The current src/documentAnalysis.ts analyzeDocument implementation is called unchanged in the main thread and a dedicated module worker.",
-      workerCold: "Includes worker startup, source postMessage clone, parse, complete AST/projection postMessage clone and reply; workerParseMs is measured around analyzeDocument inside the worker.",
-      synchronousCold: "Measures analyzeDocument plus a structuredClone of its result to approximate the existing CachedMarkdown clone; parse and clone durations are reported separately.",
-      responsiveness: "Maximum requestAnimationFrame interval observed around each operation in a foreground headless page; this is scheduling responsiveness, not presented pixels.",
-      warm: "Same-source second request using each module's existing bounded analysis LRU.",
-      evicted: "After 16 unique small sources, exceeding the current 16-entry LRU limit; not a byte-cache stress test.",
-      fixtures: "Generated synthetic Markdown only, maximum 4,000,000 ASCII bytes and AST node guard 50,000; no personal files or app workspace state.",
-      limitations: "Worker results are returned as cloned full ASTs. The benchmark does not implement async consumers, renderer integration, revision/staleness handling, app UI or whole-process PSS.",
-    },
-    configuration: { repetitions, fixtures: fixtures.map(({ name, sourceBytes }) => ({ name, sourceBytes })) },
-    samples,
-  };
+window.runDocumentAnalysisSample = async ({ fixtureName, repetition }) => {
+  if (!Number.isInteger(repetition) || repetition < 1 || repetition > 10) throw new RangeError("Repetition must be between 1 and 10");
+  const fixture = createDocumentAnalysisFixtures().find(candidate => candidate.name === fixtureName);
+  if (!fixture) throw new Error(`Unknown fixture: ${fixtureName}`);
+  if (fixture.sourceBytes > DOCUMENT_ANALYSIS_FIXTURE_LIMIT_BYTES) throw new Error(`${fixture.name} exceeds the fixture byte limit`);
+  return measureOne(fixture, repetition);
 };

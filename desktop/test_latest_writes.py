@@ -50,6 +50,50 @@ class LatestWriteExecutorTest(unittest.TestCase):
         writer.shutdown(wait=True)
         self.assertEqual(order, ["first-snapshot", "manual-save", "latest-snapshot"])
 
+    def test_flush_waits_for_drain_continuation_queued_after_fifo_sentinel(self):
+        writer = LatestWriteExecutor()
+        active_started = threading.Event()
+        release_active = threading.Event()
+        pending_finished = threading.Event()
+        order = []
+        pending_at_sentinel = []
+
+        def active_snapshot():
+            order.append("active")
+            active_started.set()
+            release_active.wait(2)
+
+        writer.submit_latest("recovery", active_snapshot)
+        self.assertTrue(active_started.wait(1))
+        writer.submit_latest("startup", lambda: (order.append("pending"), pending_finished.set()))
+
+        # Queue this FIFO job while the first drain is blocked. The drain's
+        # continuation will be placed behind it once the active job is freed.
+        def run_sentinel():
+            pending_at_sentinel.append(pending_finished.is_set())
+            order.append("sentinel")
+
+        sentinel = writer.submit(run_sentinel)
+        release_active.set()
+        sentinel.result(timeout=1)
+        self.assertEqual(pending_at_sentinel, [False])
+
+        writer.flush(timeout=1)
+        self.assertTrue(pending_finished.is_set())
+        self.assertEqual(order, ["active", "sentinel", "pending"])
+        writer.shutdown(wait=True)
+
+    def test_flush_from_writer_worker_fails_without_deadlocking(self):
+        writer = LatestWriteExecutor()
+
+        def flush_in_worker():
+            with self.assertRaisesRegex(RuntimeError, "writer worker thread"):
+                writer.flush(timeout=1)
+
+        writer.submit(flush_in_worker).result(timeout=1)
+        writer.flush(timeout=1)
+        writer.shutdown(wait=True)
+
     def test_write_failure_is_reported_to_callback_without_rewriting_error(self):
         writer = LatestWriteExecutor()
         failures = []

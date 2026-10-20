@@ -64,7 +64,7 @@ class StudioTest(unittest.TestCase):
         return window
 
     def flush(self):
-        self.session.writes.submit(lambda:None).result(timeout=3)
+        self.session.writes.flush(timeout=3)
         self.app.processEvents()
 
     def await_idle(self):

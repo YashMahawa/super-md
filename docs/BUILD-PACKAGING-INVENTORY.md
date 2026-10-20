@@ -71,3 +71,19 @@ URLs or assets loaded through APIs may not be visible to static tracing. No
 assets, fonts, Python dependencies, Qt resources or installer contents are
 removed based on the report alone. The build-time checksum path streams each
 installer in 1 MiB blocks to avoid allocating the complete installer in RAM.
+
+## Optional document-analysis worker experiment
+
+Run `node scripts/benchmark-document-analysis.mjs --output PATH` to compare the
+existing synchronous document analyzer with an isolated worker running the same
+implementation. The harness is served only by a temporary Vite development
+server and is not a build entry or packaged asset. It uses generated Markdown
+only, runs each fixture/repetition in a fresh browser page, checks full AST and
+derived-analysis parity, and reports parse/clone/round-trip timings and
+requestAnimationFrame gaps. Fixtures are capped at 4 MB and 50,000 AST nodes.
+The worker result transfers a cloned full AST; no heap/process PSS measurement
+is made, so this experiment cannot establish a worker memory benefit. Its frame
+timing is scheduling responsiveness, not presented pixels. Do not adopt an
+asynchronous production parser path based on this report alone: consumer
+integration, stale-revision handling, memory and semantic gates remain
+separate work.

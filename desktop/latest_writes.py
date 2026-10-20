@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import concurrent.futures
 import threading
+import time
 from collections.abc import Callable
 
 
@@ -43,6 +44,38 @@ class LatestWriteExecutor:
             self._pending[key] = (action, on_done)
             if not self._scheduled:
                 self._schedule_locked()
+
+    def flush(self, timeout=3.0) -> None:
+        """Wait for earlier FIFO work and all latest drains it leaves behind.
+
+        A plain FIFO sentinel is not sufficient: an active latest drain may
+        enqueue its continuation behind that sentinel. After the sentinel,
+        wait for the owned drain state to become idle as well. Calls from the
+        writer thread fail immediately because queued work cannot run until
+        that thread returns.
+        """
+        if timeout is None or timeout < 0:
+            raise ValueError("flush requires a non-negative bounded timeout")
+        deadline = time.monotonic() + timeout
+        with self._condition:
+            if threading.get_ident() in self._worker_ids:
+                raise RuntimeError("flush cannot wait from the writer worker thread")
+            if self._shutdown:
+                raise RuntimeError("cannot flush after writer shutdown")
+            sentinel = self._executor.submit(self._tracked, lambda: None, (), {})
+
+        remaining = max(0.0, deadline - time.monotonic())
+        try:
+            sentinel.result(timeout=remaining)
+        except concurrent.futures.TimeoutError as failure:
+            raise TimeoutError("timed out waiting for FIFO writer barrier") from failure
+
+        with self._condition:
+            while self._scheduled or self._pending:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise TimeoutError("timed out waiting for latest writer drains")
+                self._condition.wait(remaining)
 
     def _schedule_locked(self):
         self._scheduled = True
