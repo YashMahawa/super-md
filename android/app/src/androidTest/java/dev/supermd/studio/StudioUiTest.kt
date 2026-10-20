@@ -265,9 +265,10 @@ class StudioUiTest {
         welcome()
         val model=androidx.lifecycle.ViewModelProvider(compose.activity)[StudioViewModel::class.java]
         compose.onAllNodesWithContentDescription("New tab").assertCountEquals(1)
+        compose.onNodeWithContentDescription("Save note").assertExists()
         compose.onNodeWithContentDescription("More actions").performClick()
         compose.onNodeWithText("Open note").assertIsNotDisplayed() // closed drawer, not an overflow item
-        for(removed in listOf("New tab","New note","Reopen closed tab"))compose.onAllNodesWithText(removed).assertCountEquals(0)
+        for(removed in listOf("New tab","New note","Reopen closed tab","Save as Markdown"))compose.onAllNodesWithText(removed).assertCountEquals(0)
         compose.onNodeWithText("New window").assertExists()
         androidx.test.platform.app.InstrumentationRegistry.getInstrumentation().sendKeyDownUpSync(android.view.KeyEvent.KEYCODE_BACK)
         compose.waitForIdle()
