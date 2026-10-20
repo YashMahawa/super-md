@@ -110,6 +110,43 @@ jobs:
           fi
           echo "release_id=$release_id" >> "$GITHUB_OUTPUT"
 
+  native_frontend:
+    name: native_frontend
+    needs: prepare
+    if: needs.prepare.outputs.reuse_packages != 'true'
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ env.RELEASE_TAG }}
+      - name: Record exact tag checkout SHA
+        id: source
+        shell: bash
+        run: |
+          sha="$(git rev-parse HEAD)"
+          echo "sha=$sha" >> "$GITHUB_OUTPUT"
+          echo "NATIVE_FRONTEND_SOURCE_SHA=$sha" >> "$GITHUB_ENV"
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci
+      - run: npm run build:native
+      - name: Inventory required native reader resources
+        run: node scripts/report-web-assets.mjs dist --verify-native --public-root public
+      - name: Create exact-tag native frontend manifest
+        run: node scripts/native-frontend-artifact.mjs create dist "$RUNNER_TEMP/native-frontend-manifest.json"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: native-frontend-dist-${{ steps.source.outputs.sha }}
+          path: dist/
+          if-no-files-found: error
+      - uses: actions/upload-artifact@v4
+        with:
+          name: native-frontend-manifest-${{ steps.source.outputs.sha }}
+          path: ${{ runner.temp }}/native-frontend-manifest.json
+          if-no-files-found: error
+
   desktop:
     needs: prepare
     if: needs.prepare.outputs.reuse_packages != 'true'
@@ -130,6 +167,13 @@ jobs:
       - uses: actions/checkout@v4
         with:
           ref: ${{ env.RELEASE_TAG }}
+      - name: Record exact tag checkout SHA
+        id: source
+        shell: bash
+        run: |
+          sha="$(git rev-parse HEAD)"
+          echo "sha=$sha" >> "$GITHUB_OUTPUT"
+          echo "NATIVE_FRONTEND_SOURCE_SHA=$sha" >> "$GITHUB_ENV"
       - name: Install Linux build dependencies
         if: matrix.platform == 'ubuntu-22.04'
         run: |
@@ -184,7 +228,23 @@ jobs:
           # a packaging bug. Tests/publication still have to pass on every run.
           cache-on-failure: true
       - run: npm ci
-      - run: npm run build:native
+      - run: npx tsc -b --pretty false
+      - name: Wait for same-run frontend artifacts for this tag checkout
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: node scripts/wait-native-frontend-artifacts.mjs "$NATIVE_FRONTEND_SOURCE_SHA"
+      - uses: actions/download-artifact@v4
+        with:
+          name: native-frontend-dist-${{ steps.source.outputs.sha }}
+          path: dist
+      - uses: actions/download-artifact@v4
+        with:
+          name: native-frontend-manifest-${{ steps.source.outputs.sha }}
+          path: ${{ runner.temp }}
+      - name: Verify exact-source frontend artifact
+        shell: bash
+        run: node scripts/native-frontend-artifact.mjs verify dist "$RUNNER_TEMP/native-frontend-manifest.json"
       - name: Inventory native reader bundle reachability and fonts
         run: node scripts/report-web-assets.mjs dist --verify-native --public-root public
       - run: npx vitest run

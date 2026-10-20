@@ -23,4 +23,26 @@ memory use. OS file caches were not flushed. No personal notes were used.
 
 The raw local report contains machine-specific paths and is intentionally not
 checked in. Candidate comparisons must use the same harness, fixtures, graphics
-mode and repetition count. No improvement is claimed until that comparison runs.
+mode and repetition count.
+
+## Packaged candidate comparison
+
+A local candidate bundle was measured with the same five fixtures, three fresh
+processes per fixture, and two warm/theme cycles. This is an intermediate test
+bundle, not a published release or a final installer qualification.
+
+| Fixture | Baseline → candidate first equation, median ms | Baseline → candidate cold JS heap MB | Baseline → candidate cold PSS MiB |
+|---|---:|---:|---:|
+| Small | 22.3 → 19.2 | 7.60 → 6.93 | 399.3 → 398.0 |
+| Math-heavy | 406.6 → 386.6 | 14.31 → 13.77 | 457.7 → 456.9 |
+| 1 MB Markdown | 802.6 → 693.1 | 17.11 → 18.77 | 444.9 → 444.8 |
+| Many blocks | 349.3 → 346.4 | 13.24 → 14.49 | 426.0 → 425.8 |
+| Huge single block | 143.3 → 116.6 | 8.32 → 7.72 | 425.2 → 422.6 |
+
+This sample shows faster cold document readiness, not a universal responsiveness
+or memory reduction. Sharing the analysis AST retains additional JS data for
+the 1 MB/many-block fixtures while avoiding repeated parsing; total cold process
+PSS is nearly unchanged. After warm/theme cycles, the 1 MB candidate's median
+PSS is about 2.8 MiB above baseline. Theme-cycle scheduling measurements are
+mixed (including slower math/1 MB observations), so repeat and native visual
+checks remain required before declaring the final performance gate passed.

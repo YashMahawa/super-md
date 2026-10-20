@@ -64,6 +64,11 @@ class StudioUiTest {
         // sample must provide their own fixture on subsequent Activity starts.
         val model=androidx.lifecycle.ViewModelProvider(compose.activity)[StudioViewModel::class.java]
         compose.runOnIdle {if(model.state.value.active.content.isBlank())model.edit(model.state.value.active.id,sample)}
+        // Native controls intentionally stay disabled until reader_ready; test
+        // setup must await that bridge handshake rather than race first render.
+        compose.waitUntil(15_000) {
+            compose.onAllNodes(hasContentDescription("Export") and isEnabled()).fetchSemanticsNodes().isNotEmpty()
+        }
     }
     @Test fun importedThemePaintsNativeControlsAndReaderAndInvalidEditsKeepIt() {
         welcome()
@@ -124,6 +129,18 @@ class StudioUiTest {
             assertTrue("The opt-in preference is saved",prefs.getBoolean("fullDocumentAccessibility",false))
         } finally {
             compose.runOnIdle {model.fullDocumentAccessibility(previous);model.edit(before.active.id,before.active.content);model.mode(before.mode);model.zoom(before.normalZoom)}
+            // This fixture disables virtualization and can leave a large DOM
+            // pending after the test method returns. Let both preference state
+            // and the replacement document reach the reader before the next
+            // instrumentation method starts.
+            compose.waitUntil(15_000) {
+                model.state.value.fullDocumentAccessibility == previous &&
+                    model.state.value.active.content == before.active.content &&
+                    model.state.value.mode == before.mode
+            }
+            javascriptUntil("document.querySelector('.android-reading')?.dataset.fullDocumentAccessibility") {
+                if (previous) it == "\"true\"" else it == "null"
+            }
         }
     }
     @Test fun mediaUsesAccentPixelsAndCenterLockIsARealPersistentControl() {
@@ -132,7 +149,10 @@ class StudioUiTest {
         val before=model.state.value;temporaryNoteState=before
         val content="# Accent media\n\n```svg\n<svg xmlns=\"http://www.w3.org/2000/svg\" width=\"160\" height=\"100\"><rect width=\"160\" height=\"100\" fill=\"black\"/></svg>\n```"
         try {
-            compose.runOnIdle {model.fullscreen(false);model.appearance(accent="blue",theme="dark",motion=false);model.centerLock(true);model.readingPreference("svgAppearance","auto");model.edit(model.state.value.active.id,content);model.mode("reader");model.zoom(100f)}
+            compose.runOnIdle {model.fullscreen(false);model.appearance(accent="blue",theme="dark",motion=false);model.centerLock(true);model.readingPreference("svgAppearance","auto");model.edit(model.state.value.active.id,content);model.zoom(100f)}
+            compose.waitUntil(15_000) { model.state.value.active.content == content }
+            compose.runOnIdle { model.mode("reader") }
+            compose.waitUntil(15_000) { model.state.value.mode == "reader" }
             javascriptUntil("document.querySelector('h1#accent-media')!==null") {it=="true"}
             javascriptUntil("document.querySelector('.android-reading')?.dataset.centerLocked") {it=="\"true\""}
             compose.onNodeWithContentDescription("Centre locked · unlock horizontal movement").performClick()
@@ -209,8 +229,12 @@ class StudioUiTest {
             println("TASK RECT RAW: $raw")
             return org.json.JSONObject(raw)
         }
+        compose.runOnIdle { model.edit(model.state.value.active.id, content) }
+        compose.waitUntil(15_000) { model.state.value.active.content == content }
+        javascriptUntil("document.querySelector('.android-reading')?.textContent.includes('Task section 42')") { it == "true" }
         for(mode in listOf("reader","live"))for(zoom in listOf(100f,180f)) {
-            compose.runOnIdle {model.edit(model.state.value.active.id,content);model.mode(mode);model.zoom(zoom)}
+            compose.runOnIdle {model.mode(mode);model.zoom(zoom)}
+            compose.waitUntil(15_000) { model.state.value.active.content == content && model.state.value.mode == mode }
             // The bridge is asynchronous: an old Reader page may already have
             // the requested scale and heading while Live has not mounted yet.
             javascriptUntil("document.querySelector('.android-document.mode-$mode .android-reading')?.dataset.measured") {it=="\"true\""}
@@ -245,7 +269,7 @@ class StudioUiTest {
             android.os.SystemClock.sleep(60)
             instrument.sendPointerSync(android.view.MotionEvent.obtain(time,android.os.SystemClock.uptimeMillis(),android.view.MotionEvent.ACTION_UP,position.x,position.y,0))
             val checked=content.replaceFirst("- [ ] Keep my place","- [x] Keep my place")
-            compose.waitUntil(5000) {model.state.value.active.content==checked}
+            compose.waitUntil(15_000) {model.state.value.active.content==checked}
             fun assertPosition(action:String) {
                 android.os.SystemClock.sleep(400)
                 val after=rect()
@@ -254,11 +278,16 @@ class StudioUiTest {
             }
             assertPosition("checking")
             javascriptUntil("window.supermdHistory?.('undo');true") {it=="true"}
-            compose.waitUntil(5000) {model.state.value.active.content==content}
+            compose.waitUntil(15_000) {model.state.value.active.content==content}
             assertPosition("undo")
             javascriptUntil("window.supermdHistory?.('redo');true") {it=="true"}
-            compose.waitUntil(5000) {model.state.value.active.content==checked}
+            compose.waitUntil(15_000) {model.state.value.active.content==checked}
             assertPosition("redo")
+            // Start the next mode/zoom pass from the same unchecked baseline;
+            // the following tap must exercise checking, not unchecking.
+            javascriptUntil("window.supermdHistory?.('undo');true") {it=="true"}
+            compose.waitUntil(15_000) {model.state.value.active.content==content}
+            assertPosition("reset after redo")
         }
     }
     @Test fun manualDarkAccentPaintsNativeIconsAndReaderWithoutOemColorLeaks() {
@@ -270,6 +299,14 @@ class StudioUiTest {
             val colors=manualAccent("blue",true)
             val primary="#"+Integer.toHexString(colors.primary.toArgb()).substring(2)
             javascriptUntil("getComputedStyle(document.documentElement).getPropertyValue('--primary').trim()") {it.trim('"')==primary}
+            // The selected tab can push the add-tab item beyond the LazyRow
+            // viewport; scroll the real control into view before sampling its
+            // pixels instead of capturing an empty clipped rectangle.
+            compose.onNodeWithContentDescription("New tab").performScrollTo()
+            compose.waitUntil(5_000) {
+                val bounds = compose.onNodeWithContentDescription("New tab").fetchSemanticsNode().boundsInRoot
+                bounds.width > 0f && bounds.height > 0f
+            }
             compose.waitForIdle()
             val icon=compose.onNodeWithContentDescription("New tab").captureToImage().asAndroidBitmap()
             val allowed=listOf(colors.onSurface,colors.onSurfaceVariant).map {it.toArgb() and 0xffffff}
@@ -443,6 +480,7 @@ ax.set_title("Matplotlib 3D figure")
         compose.runOnIdle {assertEquals(original,model.state.value.active.content)}
         compose.onNodeWithContentDescription("Redo (Ctrl+Y)").assertIsDisplayed().performClick()
         javascriptUntil("document.querySelectorAll('.katex').length") {it=="1"}
+        compose.waitUntil(15_000) { model.state.value.active.content.contains("$\\frac{a}{b} = c$") }
         compose.runOnIdle {assertTrue(model.state.value.active.content.contains("$\\frac{a}{b} = c$"))}
     }
     @Test fun longPressReordersNativeTabsAndKeepsTheActiveDraft() {
@@ -555,6 +593,8 @@ ax.set_title("Matplotlib 3D figure")
     @Test fun realReaderAndNativeControlsAreConnected() {
         welcome()
         compose.onNodeWithText("Read", useUnmergedTree = true).performClick()
+        val model = androidx.lifecycle.ViewModelProvider(compose.activity)[StudioViewModel::class.java]
+        compose.waitUntil(15_000) { model.state.value.mode == "reader" }
         val result = javascriptUntil("({math:document.querySelectorAll('.katex').length,callouts:document.querySelectorAll('.callout-tip').length,graphs:document.querySelectorAll('.interactive-chart svg').length,errors:document.querySelectorAll('.katex-error').length})") { it.contains("\"callouts\":1") && it.contains("\"graphs\":1") }
         javascriptUntil("document.querySelector('#root').getBoundingClientRect().height") { (it.toDoubleOrNull() ?: 0.0) > 100 }
         assertTrue(result.contains("\"errors\":0"))
@@ -582,7 +622,6 @@ ax.set_title("Matplotlib 3D figure")
         javascriptUntil("(() => { const b = [...document.querySelectorAll('.python-cell button')].find(button => button.textContent.includes('Run')); if (b) b.click(); return !!document.querySelector('.cell-output img'); })()") { it == "true" }
         val exported = java.io.File(compose.activity.cacheDir, "reader-export-test.pdf")
         exported.delete()
-        val model = androidx.lifecycle.ViewModelProvider(compose.activity)[StudioViewModel::class.java]
         compose.activity.runOnUiThread { model.zoom(100f) }
         javascriptUntil("document.querySelector('.document-page')?.dataset.scale") { it == "\"1\"" }
         javascriptUntil("(() => { if (window.pinchTestDone) return true; if (window.pinchTestStarted) return false; window.pinchTestStarted=true; const target=document.querySelector('.android-reading'); const touches=(x) => [new Touch({identifier:1,target,clientX:60,clientY:140}),new Touch({identifier:2,target,clientX:x,clientY:140})]; target.dispatchEvent(new TouchEvent('touchstart',{bubbles:true,touches:touches(160)})); target.dispatchEvent(new TouchEvent('touchmove',{bubbles:true,cancelable:true,touches:touches(240)})); requestAnimationFrame(() => requestAnimationFrame(() => { target.dispatchEvent(new TouchEvent('touchend',{bubbles:true,touches:[]})); window.pinchTestDone=true; })); return false; })()") { it == "true" }
@@ -649,10 +688,21 @@ ax.set_title("Matplotlib 3D figure")
         compose.runOnIdle { model.edit(model.state.value.active.id, "# Recoverable draft") }
         javascriptUntil("document.querySelector('.android-reading')?.textContent || document.querySelector('.live-document')?.textContent") { it.contains("Recoverable draft") }
         compose.waitUntil(10_000) { model.state.value.active.name == "Recoverable draft.md" }
+        val recoverableId = model.state.value.active.id
         compose.onNodeWithContentDescription("Close Recoverable draft.md").performClick()
+        // Close commits the recoverable snapshot/index asynchronously after
+        // the reader flush barrier. Do not race the reopen shortcut against it.
+        compose.waitUntil(15_000) {
+            model.state.value.tabs.none { it.id == recoverableId } &&
+                model.state.value.closedTabs.any { it.id == recoverableId }
+        }
         compose.runOnIdle {
             val down=android.view.KeyEvent(0,0,android.view.KeyEvent.ACTION_DOWN,android.view.KeyEvent.KEYCODE_T,0,android.view.KeyEvent.META_CTRL_ON or android.view.KeyEvent.META_SHIFT_ON)
             assertTrue(compose.activity.handleShortcut(down))
+        }
+        compose.waitUntil(15_000) {
+            model.state.value.active.id == recoverableId &&
+                model.state.value.active.content == "# Recoverable draft"
         }
         compose.onNodeWithContentDescription("Close Recoverable draft.md").assertExists()
         compose.runOnIdle { assertEquals("# Recoverable draft", model.state.value.active.content) }

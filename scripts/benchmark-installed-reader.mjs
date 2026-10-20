@@ -26,6 +26,7 @@ const FIXTURE_NAMES = ['small', 'math-heavy', '1mb', 'many-blocks', 'huge-single
 const OPTIONAL_FIXTURE_NAMES = ['image-heavy'];
 export const IMAGE_FIXTURE_MAX_PIXELS = 32_000_000;
 export const IMAGE_FIXTURE_MAX_EDGE = 8192;
+export const IMAGE_FIXTURE_MAX_SOURCE_BYTES = 2_000_000;
 const IMAGE_HEAVY_DIMENSIONS = [
   { width: 2800, height: 2800 },
   { width: 2800, height: 2800 },
@@ -84,17 +85,15 @@ function syntheticPng(width, height, seed) {
   header[8] = 8; header[9] = 6; // 8-bit RGBA, standard compression/filter, no interlace.
   const rowBytes = width * 4 + 1;
   const raw = Buffer.allocUnsafe(rowBytes * height);
-  for (let y = 0; y < height; y++) {
-    const row = y * rowBytes;
-    raw[row] = 0;
-    for (let x = 0; x < width; x++) {
-      const pixel = row + 1 + x * 4;
-      raw[pixel] = (x + seed * 43) & 0xff;
-      raw[pixel + 1] = (y + seed * 71) & 0xff;
-      raw[pixel + 2] = ((x >> 3) ^ (y >> 2) ^ seed * 29) & 0xff;
-      raw[pixel + 3] = 255;
-    }
+  const rowData = Buffer.alloc(rowBytes);
+  for (let x = 0; x < width; x++) {
+    const pixel = 1 + x * 4;
+    rowData[pixel] = (seed * 43) & 0xff;
+    rowData[pixel + 1] = (seed * 71) & 0xff;
+    rowData[pixel + 2] = (seed * 29) & 0xff;
+    rowData[pixel + 3] = 255;
   }
+  for (let y = 0; y < height; y++) rowData.copy(raw, y * rowBytes);
   const compressed = deflateSync(raw, { level: 1 });
   return Buffer.concat([
     Buffer.from([137, 80, 78, 71, 13, 10, 26, 10]),
@@ -116,9 +115,11 @@ export function createImageHeavyFixture(dimensions = IMAGE_HEAVY_DIMENSIONS) {
   });
   const imageMarkdown = images.map((image, index) => `### Synthetic image ${index + 1} (${image.width} × ${image.height})\n\n![Generated benchmark image ${index + 1}](${image.source})`).join('\n\n');
   const content = `# Image-heavy synthetic note\n\nAn equation keeps the common readiness probe active: $E=mc^2$.\n\n${imageMarkdown}\n`;
+  const sourceBytes = Buffer.byteLength(content);
+  if (sourceBytes > IMAGE_FIXTURE_MAX_SOURCE_BYTES) throw new Error(`Image fixture source exceeds the ${IMAGE_FIXTURE_MAX_SOURCE_BYTES}-byte budget`);
   return {
     name: 'image-heavy', content, title: 'Image-heavy synthetic note',
-    sourceBytes: Buffer.byteLength(content), synthetic: true, hasEquation: true,
+    sourceBytes, synthetic: true, hasEquation: true,
     blockCount: content.split(/\n\s*\n/).filter(Boolean).length,
     images: images.map(({ width, height, pngBytes }) => ({ width, height, pngBytes })),
     decodedPixels, decodedMegapixels: decodedPixels / 1_000_000,
@@ -138,8 +139,23 @@ function summarize(values) {
 }
 
 export function aggregateSamples(samples) {
-  const fields = ['firstEquationMs', 'fontReadyMs', 'presentedRafReadyMs', 'frameIntervalP95Ms', 'zoomCallP95Ms', 'jsHeapBytes', 'domElements', 'imageReadyMs', 'imageLayoutShift', 'imageDecodedPixels'];
+  const fields = ['firstEquationMs', 'fontReadyMs', 'presentedRafReadyMs', 'frameIntervalP95Ms', 'zoomCallP95Ms', 'jsHeapBytes', 'domElements', 'imageReadyMs', 'imageLayoutShift', 'imageDecodedPixels', 'imageTraversalSteps', 'imagePeakSampledPssKb', 'imagePeakSampledRssKb', 'imagePeakSampledHeapBytes'];
   return Object.fromEntries(fields.map(field => [field, summarize(samples.map(sample => sample[field]))]));
+}
+
+export function formatReadinessDiagnostics(snapshot = {}) {
+  const count = value => Number.isSafeInteger(value) && value >= 0 ? value : null;
+  const mode = ['reader', 'editor', 'live', 'split'].includes(snapshot.mode) ? snapshot.mode : 'unknown';
+  return {
+    titlePresent: snapshot.titlePresent === true,
+    headingCount: count(snapshot.headingCount),
+    mathCount: count(snapshot.mathCount),
+    mode,
+    windowedMounted: count(snapshot.windowedMounted),
+    imageCount: count(snapshot.imageCount),
+    readerScrollHeight: count(snapshot.readerScrollHeight),
+    readerClientHeight: count(snapshot.readerClientHeight),
+  };
 }
 
 export function parseProcStat(contents) {
@@ -343,7 +359,9 @@ async function attachPage(browser, timeoutMs) {
     const pages = contexts.flatMap(context => context.pages());
     const page = pages.find(candidate => /(?:^|\/)qt-reader\.html(?:[?#]|$)/i.test(candidate.url())) ?? pages.find(candidate => candidate.url() !== 'about:blank');
     if (page) {
-      await page.waitForFunction(() => typeof window.supermdLoad === 'function', undefined, { timeout: Math.max(1, deadline - Date.now()) });
+      // The bridge function is installed before native sends its first note.
+      // Do not race that first payload with the synthetic benchmark payload.
+      await page.waitForFunction(() => typeof window.supermdLoad === 'function' && !!document.querySelector('.android-reading h1'), undefined, { timeout: Math.max(1, deadline - Date.now()) });
       return page;
     }
     await new Promise(resolve => setTimeout(resolve, 100));
@@ -352,56 +370,143 @@ async function attachPage(browser, timeoutMs) {
 }
 
 async function loadAndMeasure(page, fixture, id, dark = false) {
-  return page.evaluate(async ({ content, title, id: noteId, dark: themeDark, fixtureImageCount }) => {
+  const result = await page.evaluate(async ({ content, title, id: noteId, dark: themeDark, fixtureImageCount }) => {
     const started = performance.now();
-    let imageLayoutShift = 0;
-    let layoutObserver;
-    if (fixtureImageCount > 0 && typeof PerformanceObserver !== 'undefined') {
-      try {
-        layoutObserver = new PerformanceObserver(list => {
-          for (const entry of list.getEntries()) if (!entry.hadRecentInput) imageLayoutShift += entry.value;
-        });
-        layoutObserver.observe({ type: 'layout-shift', buffered: false });
-      } catch { layoutObserver = null; }
+    if (fixtureImageCount > 0) {
+      window.__benchmarkMeasureStartedAt = started;
+      window.__benchmarkLayoutShiftValue = 0;
+      window.__benchmarkSeenImages = new Map();
     }
-    const state = { id: noteId, content, path: null, mode: 'reader', dark: themeDark, fullscreen: false, colors: {}, font: 'Manrope', size: 18, zoom: 100, motion: false };
-    const waitForEquation = new Promise((resolve, reject) => {
-      const deadline = performance.now() + 60_000;
-      const check = () => {
-        const reader = document.querySelector('.android-reading');
-        if (reader?.textContent?.includes(title) && reader.querySelector('.katex')) resolve(performance.now() - started);
-        else if (performance.now() > deadline) reject(new Error('Timed out waiting for first rendered equation'));
-        else requestAnimationFrame(check);
-      };
-      requestAnimationFrame(check);
-    });
+    if (fixtureImageCount > 0 && typeof PerformanceObserver !== 'undefined' && !window.__benchmarkLayoutObserver) {
+      try {
+        window.__benchmarkLayoutObserver = new PerformanceObserver(list => {
+          for (const entry of list.getEntries()) if (!entry.hadRecentInput) window.__benchmarkLayoutShiftValue += entry.value;
+        });
+        window.__benchmarkLayoutObserver.observe({ type: 'layout-shift', buffered: false });
+      } catch { window.__benchmarkLayoutObserver = null; }
+    }
+    // These are fresh synthetic documents, not a revisit to a user's saved
+    // position. Prevent the native reading-location effect from restoring a
+    // previous viewport into the fixture. The native reader's location effect
+    // can restore asynchronously, so mark a benchmark-owned navigation intent
+    // after commit and put the synthetic viewport at the document origin.
+    const state = { id: noteId, content, path: null, mode: 'reader', dark: themeDark, fullscreen: false, colors: {}, font: 'Manrope', size: 18, zoom: 100, motion: false, restorePosition: false };
+    window.supermdLoad(state);
+    await new Promise(resolve => requestAnimationFrame(() => requestAnimationFrame(resolve)));
+    const reader = document.querySelector('.android-reading');
+    window.supermdNativeWheel?.(0, 0, { x: -1, y: -1 }, false);
+    if (reader) reader.scrollTop = 0;
     const waitForFont = (async () => {
       await document.fonts.load('18px Manrope');
       await document.fonts.ready;
       return performance.now() - started;
     })();
-    const waitForImages = fixtureImageCount === 0 ? Promise.resolve({ imageReadyMs: null, imageDecodedPixels: 0, imageCount: 0 }) : new Promise((resolve, reject) => {
+    const waitForEquation = new Promise((resolve, reject) => {
       const deadline = performance.now() + 60_000;
       const check = () => {
-        const reader = document.querySelector('.android-reading');
-        const images = [...(reader?.querySelectorAll('img') ?? [])];
-        if (reader?.textContent?.includes(title) && images.length === fixtureImageCount && images.every(image => image.complete && image.naturalWidth > 0 && image.naturalHeight > 0)) {
-          resolve({
-            imageReadyMs: performance.now() - started,
-            imageDecodedPixels: images.reduce((total, image) => total + image.naturalWidth * image.naturalHeight, 0),
-            imageCount: images.length,
-          });
-        } else if (performance.now() > deadline) reject(new Error(`Timed out waiting for ${fixtureImageCount} generated images`));
+        const currentReader = document.querySelector('.android-reading');
+        if (currentReader?.textContent?.includes(title) && currentReader.querySelector('.katex')) resolve(performance.now() - started);
+        else if (performance.now() > deadline) reject(new Error('benchmark:first-equation-timeout'));
         else requestAnimationFrame(check);
       };
       requestAnimationFrame(check);
     });
-    window.supermdLoad(state);
-    const [firstEquationMs, fontReadyMs, imageMetrics] = await Promise.all([waitForEquation, waitForFont, waitForImages]);
+    let firstEquationMs, fontReadyMs;
+    try { [firstEquationMs, fontReadyMs] = await Promise.all([waitForEquation, waitForFont]); }
+    catch (error) {
+      if (error?.message !== 'benchmark:first-equation-timeout') throw error;
+      const reader = document.querySelector('.android-reading');
+      return { readinessTimeout: {
+        titlePresent: reader?.textContent?.includes(title) === true,
+        headingCount: reader?.querySelectorAll('h1,h2,h3,h4,h5,h6').length ?? 0,
+        mathCount: reader?.querySelectorAll('.katex').length ?? 0,
+        mode: state.mode,
+        windowedMounted: reader?.querySelectorAll('[data-windowed-block]').length ?? 0,
+        imageCount: reader?.querySelectorAll('img').length ?? 0,
+        readerScrollHeight: reader?.scrollHeight ?? null,
+        readerClientHeight: reader?.clientHeight ?? null,
+      } };
+    }
     await new Promise(resolve => requestAnimationFrame(() => requestAnimationFrame(resolve)));
-    layoutObserver?.disconnect();
-    return { firstEquationMs, fontReadyMs, presentedRafReadyMs: performance.now() - started, theme: document.documentElement.dataset.theme, ...imageMetrics, imageLayoutShift };
+    return { firstEquationMs, fontReadyMs, presentedRafReadyMs: performance.now() - started, theme: document.documentElement.dataset.theme };
   }, { content: fixture.content, title: fixture.title, id, dark, fixtureImageCount: fixture.images?.length ?? 0 });
+  if (result.readinessTimeout) {
+    throw new Error(`Timed out waiting for first rendered equation; counts=${JSON.stringify(formatReadinessDiagnostics(result.readinessTimeout))}`);
+  }
+  return result;
+}
+
+async function traverseFixtureImages(page, fixture, cdp, rootPid) {
+  const expected = fixture.images?.length ?? 0;
+  if (!expected) return { imageReadyMs: null, imageDecodedPixels: 0, imageCount: 0, imageLayoutShift: 0, imageTraversalSteps: 0 };
+  let peakPssKb = null, peakRssKb = null, peakHeapBytes = null;
+  let scrollSteps = 0, bottomStalledAt = null;
+  const known = new Set();
+  const imageDetails = new Map();
+  const startedAt = Date.now();
+  while (imageDetails.size < expected || scrollSteps === 0) {
+    if (scrollSteps >= 500 || Date.now() - startedAt > 60_000) {
+      throw new Error(`Timed out traversing generated images (${imageDetails.size}/${expected} decoded in ${scrollSteps} scroll steps)`);
+    }
+    const result = await page.evaluate(async () => {
+      const reader = document.querySelector('.android-reading');
+      if (!reader) throw new Error('Reader scroller is unavailable');
+      const rememberLoaded = () => {
+        for (const image of reader.querySelectorAll('img[alt^="Generated benchmark image "]')) {
+          if (!image.complete || image.naturalWidth < 1 || image.naturalHeight < 1) continue;
+          const alt = image.getAttribute('alt') ?? 'generated image';
+          if (!window.__benchmarkSeenImages.has(alt)) {
+            window.__benchmarkSeenImages.set(alt, {
+              alt, width: image.naturalWidth, height: image.naturalHeight,
+              decodeMs: performance.now() - window.__benchmarkMeasureStartedAt,
+              layoutShiftAtDecode: window.__benchmarkLayoutShiftValue ?? 0,
+            });
+          }
+        }
+      };
+      rememberLoaded();
+      const step = Math.max(400, Math.floor(reader.clientHeight * 0.65));
+      const maxScrollTop = Math.max(0, reader.scrollHeight - reader.clientHeight);
+      const previousTop = reader.scrollTop;
+      reader.scrollTop = Math.min(maxScrollTop, previousTop + step);
+      await new Promise(resolve => requestAnimationFrame(() => requestAnimationFrame(() => setTimeout(resolve, 80))));
+      rememberLoaded();
+      return {
+        images: [...window.__benchmarkSeenImages.values()],
+        scrollTop: reader.scrollTop, maxScrollTop: Math.max(0, reader.scrollHeight - reader.clientHeight),
+        imageLayoutShift: window.__benchmarkLayoutShiftValue ?? 0,
+      };
+    });
+    scrollSteps++;
+    for (const image of result.images) {
+      if (!known.has(image.alt)) { known.add(image.alt); imageDetails.set(image.alt, image); }
+    }
+    if (result.scrollTop >= result.maxScrollTop - 1 && imageDetails.size < expected) {
+      bottomStalledAt ??= Date.now();
+      if (Date.now() - bottomStalledAt > 10_000) throw new Error(`Reader remained at the bottom with only ${imageDetails.size}/${expected} generated images decoded`);
+    } else bottomStalledAt = null;
+
+    const processTree = process.platform === 'linux' ? await aggregateProcessTree(rootPid) : null;
+    if (processTree?.pssKb !== null && processTree?.pssKb !== undefined) peakPssKb = Math.max(peakPssKb ?? 0, processTree.pssKb);
+    if (processTree?.rssKb !== null && processTree?.rssKb !== undefined) peakRssKb = Math.max(peakRssKb ?? 0, processTree.rssKb);
+    try {
+      const heap = (await cdp.send('Runtime.getHeapUsage')).usedSize;
+      if (Number.isFinite(heap)) peakHeapBytes = Math.max(peakHeapBytes ?? 0, heap);
+    } catch { /* Process RSS/PSS is still sampled if the heap endpoint is unavailable. */ }
+    if (imageDetails.size >= expected && result.scrollTop >= result.maxScrollTop - 1) break;
+  }
+  const imageDimensions = [...imageDetails.values()];
+  return {
+    imageReadyMs: Math.max(...imageDimensions.map(image => image.decodeMs)),
+    imageDecodedPixels: imageDimensions.reduce((total, image) => total + image.width * image.height, 0),
+    imageCount: imageDimensions.length,
+    imageDimensions,
+    imageLayoutShift: await page.evaluate(() => window.__benchmarkLayoutShiftValue ?? 0),
+    imageTraversalSteps: scrollSteps,
+    imagePeakSampledPssKb: peakPssKb,
+    imagePeakSampledRssKb: peakRssKb,
+    imagePeakSampledHeapBytes: peakHeapBytes,
+  };
 }
 
 async function sampleFrames(page, count) {
@@ -526,7 +631,9 @@ async function launchAndMeasure(binary, fixture, repetition, options) {
     await cdp.send('Runtime.enable');
     await cdp.send('HeapProfiler.enable');
     const idPrefix = `benchmark-${fixture.name}-${repetition}-${Date.now()}`;
-    const cold = await loadAndMeasure(page, fixture, `${idPrefix}-cold`);
+    const coldTiming = await loadAndMeasure(page, fixture, `${idPrefix}-cold`);
+    const coldImages = await traverseFixtureImages(page, fixture, cdp, child.pid);
+    const cold = { ...coldTiming, ...coldImages };
     const coldPageMemory = await samplePageMemory(page, cdp);
     const coldProcessMemory = process.platform === 'linux' ? await aggregateProcessTree(child.pid) : null;
     const coldFrameIntervals = await sampleFrames(page, options.frameSamples);
@@ -537,9 +644,10 @@ async function launchAndMeasure(binary, fixture, repetition, options) {
     for (let cycle = 0; cycle < options.warmCycles; cycle++) {
       const id = `${idPrefix}-warm-${cycle + 1}`;
       const timing = await loadAndMeasure(page, fixture, id);
+      const imageTraversal = await traverseFixtureImages(page, fixture, cdp, child.pid);
       const warmMemory = fixture.images ? await samplePageMemory(page, cdp) : null;
       const warmProcessMemory = fixture.images && process.platform === 'linux' ? await aggregateProcessTree(child.pid) : null;
-      warmRevisits.push({ cycle: cycle + 1, ...timing, ...(warmMemory ?? {}), ...(warmProcessMemory ? { processTree: warmProcessMemory } : {}) });
+      warmRevisits.push({ cycle: cycle + 1, ...timing, ...imageTraversal, ...(warmMemory ?? {}), ...(warmProcessMemory ? { processTree: warmProcessMemory } : {}) });
       lastStateId = id;
     }
     const themeCycles = [];
@@ -628,7 +736,8 @@ export async function runBenchmark(options) {
       quitAfterMs: options.quitAfterMs,
       fixtureParameters: {
         oneMbBytes: options.oneMbBytes, manyBlockCount: options.manyBlockCount, hugeBlockBytes: options.hugeBlockBytes,
-        mathCount: options.mathCount, imageFixtureMaxPixels: IMAGE_FIXTURE_MAX_PIXELS, imageFixtureMaxEdge: IMAGE_FIXTURE_MAX_EDGE,
+        mathCount: options.mathCount, imageFixtureMaxPixels: IMAGE_FIXTURE_MAX_PIXELS,
+        imageFixtureMaxEdge: IMAGE_FIXTURE_MAX_EDGE, imageFixtureMaxSourceBytes: IMAGE_FIXTURE_MAX_SOURCE_BYTES,
       },
       fixtures: fixtures.map(({ name, sourceBytes, blockCount, images, decodedPixels }) => ({
         name, sourceBytes, blockCount, imageCount: images?.length ?? 0,
@@ -639,7 +748,7 @@ export async function runBenchmark(options) {
       cold: 'Each fixture and repetition starts a fresh installed-app process with isolated --test-state. OS file cache is not flushed; cold means process/document cold, not storage-cold.',
       presentedFrame: 'After the first KaTeX equation and Manrope font readiness, wait for two requestAnimationFrame callbacks. This measures Chromium scheduling/layout readiness, not a native captured-pixel or display-scanout timestamp.',
       frameIntervals: 'Intervals between requestAnimationFrame callbacks while the loaded fixture is idle; not an input-to-presented-frame latency.',
-      imageReadiness: 'For the optional image-heavy fixture, waits for every generated PNG to decode, reports natural dimensions and cumulative layout-shift entries observed during load; this is synthetic data and not a personal note.',
+      imageReadiness: 'For the optional image-heavy fixture, scrolls the normal reader one viewport step at a time so windowed blocks mount naturally, records each generated PNG natural size/decode observation, samples process-tree memory during traversal, and reports layout-shift observations. These are not input-to-presented-frame latency measurements.',
       zoomCall: 'Synchronous JavaScript call duration for supermdSetZoom; it excludes subsequent layout and painting.',
       jsHeap: 'CDP JavaScript heap used after HeapProfiler.collectGarbage when supported; each sample records whether garbage collection was available. Excludes native and GPU memory.',
       processMemory: process.platform === 'linux' ? 'Linux /proc process-tree RSS is summed (shared mappings may be double-counted); PSS sums smaps_rollup proportional set sizes for the launched reader and descendants only.' : 'Process-tree RSS/PSS collection is Linux-only; values are null on this platform.',

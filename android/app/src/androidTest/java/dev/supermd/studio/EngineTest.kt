@@ -112,6 +112,28 @@ class EngineTest {
         val opened = media.openFmd(output.toByteArray().inputStream()); assertEquals(markdown, opened.markdown)
         assertEquals(data, media.data(media.local("assets/image-long.svg", opened.directory)!!))
     }
+    @Test fun portableAssetsResolveWhenFilesDirUsesCanonicalAlias() {
+        val app=ApplicationProvider.getApplicationContext<android.app.Application>()
+        val alias=File(app.cacheDir,"files-alias-${java.util.UUID.randomUUID()}")
+        java.nio.file.Files.createSymbolicLink(alias.toPath(),app.filesDir.canonicalFile.toPath())
+        try {
+            val aliasedContext=object:android.content.ContextWrapper(app) {
+                override fun getFilesDir():File=alias
+            }
+            val media=MediaStorage(aliasedContext)
+            val markdown="# Aliased filesDir"
+            val vector="<svg xmlns='http://www.w3.org/2000/svg' width='20' height='10'><path d='M0 9L20 1'/></svg>"
+            val data="data:image/svg+xml;base64,"+android.util.Base64.encodeToString(vector.toByteArray(),android.util.Base64.NO_WRAP)
+            val output=java.io.ByteArrayOutputStream()
+            media.writeFmd(output,markdown,JSONObject().put("assets/alias.svg",data))
+            val opened=media.openFmd(output.toByteArray().inputStream())
+            val asset=media.local("assets/alias.svg",opened.directory)
+            assertNotNull("Canonical filesDir aliases must not make valid portable assets disappear",asset)
+            assertEquals(data,media.data(asset!!))
+        } finally {
+            alias.delete()
+        }
+    }
     @Test fun portableImagesStayOutsideSourceAndExportOffline() = runBlocking {
         val app = ApplicationProvider.getApplicationContext<android.app.Application>()
         val media = MediaStorage(app)

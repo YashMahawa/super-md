@@ -236,6 +236,7 @@ def main():
                 QMetaObject.invokeMethod(window,"runDocumentScript",Q_ARG("QVariant",script))
             def result():
                 if studio.message.startswith("SMOKE:"):
+                    reader = window.findChild(QObject, "documentReader")
                     print(studio.message,flush=True)
                     window.grabWindow().save("/tmp/supermd-qt-smoke.png")
                     valid = all(value in studio.message for value in ('"headings":1','"math":1','"charts":1','"surfaces":0','"answers":1','"pele":1'))
@@ -400,8 +401,9 @@ def main():
                         window.showFullScreen()
                         geometry = {}
                         def fullscreen_shown():
+                            reader = window.findChild(QObject, "documentReader")
                             window.setProperty("chromeAwake",True)
-                            geometry.update(width=reader.property("width"),height=reader.property("height"))
+                            if reader is not None: geometry.update(width=reader.property("width"),height=reader.property("height"))
                             # Announce navigation intent so a pending mode-position
                             # restore cannot undo this deliberate test scroll.
                             script="window.supermdNativeWheel?.(0,0,{x:400,y:300},false);document.querySelector('.android-reading').scrollTop=0;requestAnimationFrame(()=>window.SuperMD.post('chrome-smoke','export_failed',JSON.stringify({error:'CHROME:'+JSON.stringify({inset:parseFloat(getComputedStyle(document.documentElement).getPropertyValue('--native-chrome-inset')),title:document.querySelector('h1').getBoundingClientRect().top})})))"
@@ -412,9 +414,10 @@ def main():
                             from PySide6.QtTest import QTest
                             QTest.mouseMove(window,QPoint(window.width()//2,window.height()//2))
                         def fullscreen_hidden():
+                            reader = window.findChild(QObject, "documentReader")
                             toolbar=window.findChild(QObject,"studyToolbar")
                             capture("fullscreen-hidden")
-                            stable=reader.property("width")==geometry.get("width") and reader.property("height")==geometry.get("height")
+                            stable=reader is not None and reader.property("width")==geometry.get("width") and reader.property("height")==geometry.get("height")
                             import json
                             clearance=json.loads(studio.message.removeprefix("CHROME:")) if studio.message.startswith("CHROME:") else {}
                             if toolbar is None or toolbar.property("height")!=56 or toolbar.property("shown") or not stable or clearance.get("inset")!=56 or clearance.get("title",0)<56:

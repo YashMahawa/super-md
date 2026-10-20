@@ -43,10 +43,13 @@ ApplicationWindow {
         host: window
         onFullscreenChanged: { window.chromeAwake = !fullscreen; chromeIdle.stop(); studio.setFullscreen(fullscreen) }
     }
-    function runDocumentScript(script, callback) {
+    function runDocumentScript(script) {
         if (!reader) return
-        if (callback) reader.runJavaScript(script, callback)
-        else reader.runJavaScript(script)
+        reader.runJavaScript(script)
+    }
+    function runDocumentScriptWithCallback(script, callback) {
+        if (!reader) return
+        reader.runJavaScript(script, callback)
     }
     function focusReader() { if (reader) reader.forceActiveFocus() }
     function scheduleReaderRemount(delay) {
@@ -167,7 +170,7 @@ ApplicationWindow {
     Shortcut { sequences: ["Ctrl+Shift+W","Meta+Shift+W"]; onActivated: studio.closeWindowSafely() }
     Shortcut { sequence: "Ctrl+,"; onActivated: settingsOpen = !settingsOpen }
     Shortcut { sequence: "F11"; onActivated: windowModes.setFullscreen(!windowModes.fullscreen) }
-    Shortcut { sequence: "Escape"; enabled: !modalDialogCount && !contentsPopup.visible; onActivated: window.runDocumentScript("window.supermdDismiss?.() || false", function(dismissed) { if (!dismissed && windowModes.fullscreen) windowModes.setFullscreen(false) }) }
+    Shortcut { sequence: "Escape"; enabled: !modalDialogCount && !contentsPopup.visible; onActivated: window.runDocumentScriptWithCallback("window.supermdDismiss?.() || false", function(dismissed) { if (!dismissed && windowModes.fullscreen) windowModes.setFullscreen(false) }) }
     // Qt's chrome never scales. Keyboard/pinch zoom is routed to the content pane.
     Shortcut { sequence: "Ctrl++"; onActivated: window.runDocumentScript("window.supermdZoomBy?.(1.1)") }
     Shortcut { sequence: "Ctrl+="; onActivated: window.runDocumentScript("window.supermdZoomBy?.(1.1)") }

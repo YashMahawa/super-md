@@ -27,6 +27,7 @@ import ReadingSearch from "./components/ReadingSearch";
 import type { Point } from "./focalZoom";
 import { applyDocumentZoom,documentPoint,invalidateDocumentZoom,settleDocumentZoom,refreshDocumentExtent,enforceDocumentCenter } from "./documentZoom";
 import { documentOutline, navigateToHeading, cancelHeadingNavigation } from "./documentNavigation";
+import {OutlineWorkerClient} from './outlineWorker';
 import {recordHistory,replayHistory,historySize,validHistory,type NoteHistory} from './noteHistory';
 import {cachedEditorHistory} from './components/Editor';
 import {loadReadingLocation,saveReadingLocation,type ReadingLocation} from './readingLocations';
@@ -73,6 +74,7 @@ function Reader() {
   const documentAppearance=useMemo(()=>({dark:state?.dark??false,svgAppearance:state?.svgAppearance,ink:state?.colors.primary,text:state?.colors.text,colors:state?.colors}),[state?.dark,state?.svgAppearance,JSON.stringify(state?.colors)]);
   const trustHost = useCallback((host:string)=>setTrustedHosts(current=>current.includes(host)?current:[...current,host]),[]);
   const reference = useRef(state); reference.current = state;
+  const outlineWorker=useRef<OutlineWorkerClient|null>(null);
   const edits=useRef<ReaderEdits|null>(null);
   if(!edits.current)edits.current=new ReaderEdits((command,args)=>invoke(command,args));
   const [editError,setEditError]=useState('');
@@ -280,9 +282,28 @@ function Reader() {
     // Outline is derived state, not durable edits. Coalesce expensive Source
     // typing work and cancel obsolete document generations before parsing.
     const {id,content}=state;
-    const timer=window.setTimeout(()=>{if(reference.current?.id===id&&reference.current.content===content)void invoke('document_outline',{id,headings:documentOutline(content)}).catch(()=>{});},content.length>80_000?180:0);
-    return()=>window.clearTimeout(timer);
-  },[state?.id,state?.content]);
+    const controller=new AbortController();
+    const workerBacked=state.mode==='editor'&&content.length>80_000&&typeof Worker!=='undefined';
+    const timer=window.setTimeout(()=>{
+      if(reference.current?.id!==id||reference.current.content!==content)return;
+      void (async()=>{
+        let headings;
+        try{
+          if(workerBacked){outlineWorker.current??=new OutlineWorkerClient();headings=await outlineWorker.current.request(content,controller.signal);}
+          else headings=documentOutline(content);
+        }catch{
+          if(controller.signal.aborted)return;
+          // Worker creation/analysis can be unavailable in an older WebView;
+          // keep the existing synchronous analysis as the correctness path.
+          headings=documentOutline(content);
+        }
+        if(controller.signal.aborted||reference.current?.id!==id||reference.current.content!==content)return;
+        void invoke('document_outline',{id,headings}).catch(()=>{});
+      })();
+    },content.length>80_000?180:0);
+    return()=>{window.clearTimeout(timer);controller.abort();if(workerBacked)outlineWorker.current?.cancel();};
+  },[state?.id,state?.content,state?.mode]);
+  useEffect(()=>()=>{outlineWorker.current?.dispose();outlineWorker.current=null;},[]);
   useLayoutEffect(() => {
     if (!state) return;
     const nextCustom={id:state.id,mode:state.mode,metrics:JSON.stringify(state.customStyle?.metrics??{})};

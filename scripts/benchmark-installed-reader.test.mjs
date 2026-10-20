@@ -1,11 +1,11 @@
 import assert from 'node:assert/strict';
-import { mkdtemp, mkdir, rm, writeFile } from 'node:fs/promises';
+import { mkdtemp, mkdir, readFile, rm, writeFile } from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
 import test from 'node:test';
 import {
-  aggregateProcessTree, aggregateSamples, createFixtures, createImageHeavyFixture, IMAGE_FIXTURE_MAX_EDGE,
-  IMAGE_FIXTURE_MAX_PIXELS, parseProcMemory, parseProcStat, percentile, pngDimensions, validateImageFixtureDimensions,
+  aggregateProcessTree, aggregateSamples, createFixtures, createImageHeavyFixture, formatReadinessDiagnostics, IMAGE_FIXTURE_MAX_EDGE,
+  IMAGE_FIXTURE_MAX_PIXELS, IMAGE_FIXTURE_MAX_SOURCE_BYTES, parseProcMemory, parseProcStat, percentile, pngDimensions, validateImageFixtureDimensions,
 } from './benchmark-installed-reader.mjs';
 
 test('percentiles and aggregate summaries ignore unavailable values and preserve zeros', () => {
@@ -13,6 +13,38 @@ test('percentiles and aggregate summaries ignore unavailable values and preserve
   assert.deepEqual(aggregateSamples([{ firstEquationMs: 0 }, { firstEquationMs: 10 }, { firstEquationMs: null }]).firstEquationMs,
     { count: 2, median: 0, p95: 10 });
   assert.deepEqual(aggregateSamples([]).jsHeapBytes, { count: 0, median: null, p95: null });
+});
+
+test('readiness timeout diagnostics retain only bounded synthetic counts', () => {
+  assert.deepEqual(formatReadinessDiagnostics({
+    titlePresent: true, headingCount: 4, mathCount: 0, mode: 'reader', windowedMounted: 6,
+    imageCount: 3, readerScrollHeight: 2400, readerClientHeight: 800,
+    content: 'synthetic base64 payload must not escape', path: '/private/note.md',
+  }), {
+    titlePresent: true, headingCount: 4, mathCount: 0, mode: 'reader', windowedMounted: 6,
+    imageCount: 3, readerScrollHeight: 2400, readerClientHeight: 800,
+  });
+  assert.deepEqual(formatReadinessDiagnostics({ mode: 'unexpected', headingCount: -1, imageCount: 1.2 }), {
+    titlePresent: false, headingCount: null, mathCount: null, mode: 'unknown', windowedMounted: null,
+    imageCount: null, readerScrollHeight: null, readerClientHeight: null,
+  });
+});
+
+test('synthetic note loads disable saved-position restore and reset viewport before readiness', async () => {
+  const source = await readFile(new URL('./benchmark-installed-reader.mjs', import.meta.url), 'utf8');
+  const start = source.indexOf('async function loadAndMeasure');
+  const end = source.indexOf('async function traverseFixtureImages', start);
+  const load = source.slice(start, end);
+  const injection = load.indexOf('window.supermdLoad(state)');
+  const commitWait = load.indexOf('await new Promise(resolve => requestAnimationFrame(() => requestAnimationFrame(resolve)))', injection);
+  const navigationIntent = load.indexOf('window.supermdNativeWheel?.(0, 0, { x: -1, y: -1 }, false)', commitWait);
+  const reset = load.indexOf('if (reader) reader.scrollTop = 0', navigationIntent);
+  const readiness = load.indexOf('const waitForEquation', reset);
+  assert.match(load, /restorePosition: false/);
+  assert.ok(injection >= 0 && commitWait > injection && navigationIntent > commitWait && reset > navigationIntent && readiness > reset,
+    'reset the synthetic viewport after React commit and before checking title/KaTeX readiness');
+  assert.match(load, /currentReader\?\.textContent\?\.includes\(title\) && currentReader\.querySelector\('\.katex'\)/,
+    'keep both the title and first rendered equation as readiness assertions');
 });
 
 test('parses Linux stat records with spaces and parentheses in process names', () => {
@@ -78,4 +110,12 @@ test('generates valid bounded PNG payloads with matching natural dimensions', ()
   assert.ok(fixture.sourceBytes < 1_000_000);
   assert.ok(fixture.content.includes('Synthetic image 2'));
   assert.ok(IMAGE_FIXTURE_MAX_PIXELS <= 32_000_000);
+});
+
+test('default 31 MP fixture stays within the encoded Markdown source budget', () => {
+  const fixture = createImageHeavyFixture();
+  assert.equal(fixture.decodedPixels, 31_360_000);
+  assert.ok(fixture.sourceBytes <= IMAGE_FIXTURE_MAX_SOURCE_BYTES);
+  assert.equal(fixture.images.length, 4);
+  assert.ok(fixture.images.every(image => image.pngBytes > 1_000));
 });

@@ -85,9 +85,11 @@ class MediaStorage(private val context: Context) {
 
     private fun containedFile(root: File, candidate: File): File? = runCatching {
         val expectedRoot = context.filesDir.canonicalFile.toPath().resolve(root.name).normalize()
-        val rootPath = root.absoluteFile.toPath().normalize()
         val target = candidate.canonicalFile
-        if (rootPath != expectedRoot || root.canonicalFile.toPath().normalize() != expectedRoot) return@runCatching null
+        // filesDir may be exposed through a non-canonical alias (for example
+        // /data/data/... vs /data/user/0/... on Android). Compare canonical
+        // roots so valid portable assets resolve on every API level.
+        if (root.canonicalFile.toPath().normalize() != expectedRoot) return@runCatching null
         val canonicalRoot = root.canonicalPath + File.separator
         target.takeIf { it.isFile && it.canonicalPath.startsWith(canonicalRoot) }
     }.getOrNull()

@@ -11,8 +11,41 @@ concurrency:
 
 permissions:
   contents: read
+  actions: read
 
 jobs:
+  native_frontend:
+    name: native_frontend
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Record exact checked-out source SHA
+        id: source
+        run: echo "sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci
+      - run: npm run build:native
+      - name: Inventory required native reader resources
+        run: node scripts/report-web-assets.mjs dist --verify-native --public-root public --output "$RUNNER_TEMP/reader-assets-report.json"
+      - name: Test and create exact-source native frontend manifest
+        run: |
+          node --test scripts/native-frontend-artifact.test.mjs
+          node --test scripts/wait-native-frontend-artifacts.test.mjs
+          node scripts/native-frontend-artifact.mjs create dist "$RUNNER_TEMP/native-frontend-manifest.json"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: native-frontend-dist-${{ steps.source.outputs.sha }}
+          path: dist/
+          if-no-files-found: error
+      - uses: actions/upload-artifact@v4
+        with:
+          name: native-frontend-manifest-${{ steps.source.outputs.sha }}
+          path: ${{ runner.temp }}/native-frontend-manifest.json
+          if-no-files-found: error
+
   test:
     strategy:
       fail-fast: false
@@ -21,6 +54,13 @@ jobs:
     runs-on: ${{ matrix.platform }}
     steps:
       - uses: actions/checkout@v4
+      - name: Record exact checked-out source SHA
+        id: source
+        shell: bash
+        run: |
+          sha="$(git rev-parse HEAD)"
+          echo "sha=$sha" >> "$GITHUB_OUTPUT"
+          echo "NATIVE_FRONTEND_SOURCE_SHA=$sha" >> "$GITHUB_ENV"
       - name: Install Linux build dependencies
         if: matrix.platform == 'ubuntu-22.04'
         run: |
@@ -81,7 +121,23 @@ jobs:
           workspaces: ./smd-core -> target
           shared-key: native-desktop-${{ runner.os }}-${{ runner.arch }}
       - run: npm ci
-      - run: npm run build:native
+      - run: npx tsc -b --pretty false
+      - name: Wait for same-run frontend artifacts for this checkout
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: node scripts/wait-native-frontend-artifacts.mjs "$NATIVE_FRONTEND_SOURCE_SHA"
+      - uses: actions/download-artifact@v4
+        with:
+          name: native-frontend-dist-${{ steps.source.outputs.sha }}
+          path: dist
+      - uses: actions/download-artifact@v4
+        with:
+          name: native-frontend-manifest-${{ steps.source.outputs.sha }}
+          path: ${{ runner.temp }}
+      - name: Verify exact-source frontend artifact
+        shell: bash
+        run: node scripts/native-frontend-artifact.mjs verify dist "$RUNNER_TEMP/native-frontend-manifest.json"
       - name: Inventory native reader bundle reachability and fonts
         shell: bash
         run: node scripts/report-web-assets.mjs dist --verify-native --public-root public --output "$RUNNER_TEMP/reader-assets-report.json"
@@ -218,6 +274,28 @@ jobs:
             android/app/build/reports/lint-results-release.html
             android/app/build/reports/lint-results-debug.html
 
+  compiler-canary:
+    name: tsc-ts canary (${{ matrix.platform }})
+    continue-on-error: true
+    strategy:
+      fail-fast: false
+      matrix:
+        platform: [ubuntu-22.04, macos-latest, macos-15-intel, windows-latest]
+    runs-on: ${{ matrix.platform }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: npm
+      - run: npm ci
+      - name: Install pinned experimental compiler in an isolated prefix
+        shell: bash
+        run: npm install --prefix "$RUNNER_TEMP/tsc-ts" --no-save --ignore-scripts --package-lock=false --no-audit --no-fund tsc-ts@0.0.5
+      - name: Compare project build and negative diagnostics with the TypeScript 5.9 baseline
+        shell: bash
+        run: node scripts/verify-tsc-ts-canary.mjs "$RUNNER_TEMP/tsc-ts/node_modules/tsc-ts/bin/tsc-ts.js"
+
   android-device-tests:
     strategy:
       fail-fast: false
@@ -230,6 +308,13 @@ jobs:
       SUPERMD_ABIS: x86_64
     steps:
       - uses: actions/checkout@v4
+      - name: Record exact checked-out source SHA
+        id: source
+        shell: bash
+        run: |
+          sha="$(git rev-parse HEAD)"
+          echo "sha=$sha" >> "$GITHUB_OUTPUT"
+          echo "NATIVE_FRONTEND_SOURCE_SHA=$sha" >> "$GITHUB_ENV"
       - uses: actions/setup-node@v4
         with:
           node-version: 22
@@ -265,7 +350,23 @@ jobs:
           # Every emulator assertion still runs before the release can pass.
           cache-on-failure: true
       - run: npm ci
-      - run: npm run build:native
+      - run: npx tsc -b --pretty false
+      - name: Wait for same-run frontend artifacts for this checkout
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: node scripts/wait-native-frontend-artifacts.mjs "$NATIVE_FRONTEND_SOURCE_SHA"
+      - uses: actions/download-artifact@v4
+        with:
+          name: native-frontend-dist-${{ steps.source.outputs.sha }}
+          path: dist
+      - uses: actions/download-artifact@v4
+        with:
+          name: native-frontend-manifest-${{ steps.source.outputs.sha }}
+          path: ${{ runner.temp }}
+      - name: Verify exact-source frontend artifact
+        shell: bash
+        run: node scripts/native-frontend-artifact.mjs verify dist "$RUNNER_TEMP/native-frontend-manifest.json"
       - name: Build the real JNI engine and offline reader for instrumentation
         run: |
           export NDK_BIN="$ANDROID_HOME/ndk/27.1.12297006/toolchains/llvm/prebuilt/linux-x86_64/bin"
