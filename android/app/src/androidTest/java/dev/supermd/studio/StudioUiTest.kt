@@ -108,6 +108,24 @@ class StudioUiTest {
         compose.runOnIdle {assertEquals("Viewing must not import a second asset or append a broken block",content,model.state.value.active.content)}
         javascriptUntil("document.querySelectorAll('.image-error,.render-error').length") {it=="0"}
     }
+    @Test fun fullDocumentAccessibilityPreferencePersistsAndRendersLargeNotesWithoutWindowing() {
+        welcome()
+        val model=androidx.lifecycle.ViewModelProvider(compose.activity)[StudioViewModel::class.java]
+        val before=model.state.value;temporaryNoteState=before
+        val prefs=compose.activity.getSharedPreferences("studio",0)
+        val previous=prefs.getBoolean("fullDocumentAccessibility",false)
+        val body="Accessible full-document fixture. ".repeat(2_700).trimEnd()
+        val content="# Full document accessibility\n\n$body"
+        try {
+            compose.runOnIdle {model.edit(before.active.id,content);model.mode("reader");model.zoom(100f);model.fullDocumentAccessibility(true)}
+            compose.waitUntil(5_000){model.state.value.fullDocumentAccessibility&&prefs.getBoolean("fullDocumentAccessibility",false)}
+            val expectedLength=body.length
+            javascriptUntil("(()=>{const root=document.querySelector('.android-reading'),paragraph=document.querySelector('.markdown-body p');return root?.dataset.fullDocumentAccessibility==='true'&&!document.querySelector('[data-windowed-block]')&&paragraph?.textContent?.length===$expectedLength;})()") {it=="true"}
+            assertTrue("The opt-in preference is saved",prefs.getBoolean("fullDocumentAccessibility",false))
+        } finally {
+            compose.runOnIdle {model.fullDocumentAccessibility(previous);model.edit(before.active.id,before.active.content);model.mode(before.mode);model.zoom(before.normalZoom)}
+        }
+    }
     @Test fun mediaUsesAccentPixelsAndCenterLockIsARealPersistentControl() {
         welcome()
         val model=androidx.lifecycle.ViewModelProvider(compose.activity)[StudioViewModel::class.java]
@@ -473,6 +491,35 @@ ax.set_title("Matplotlib 3D figure")
         assertEquals("First window remains intact", first.state.value.active.content)
         assertEquals("Second window draft", second.state.value.active.content)
         androidx.test.platform.app.InstrumentationRegistry.getInstrumentation().runOnMainSync { first.edit(initial, original); other!!.finishAndRemoveTask() }
+    }
+    @Test fun rendererExitRecreatesReaderFromNativeState() {
+        welcome()
+        val model = androidx.lifecycle.ViewModelProvider(compose.activity)[StudioViewModel::class.java]
+        temporaryNoteState = model.state.value
+        val content = "# Renderer recovery\n\nAcknowledged draft survives.\n\n```python\nprint('must not auto-run')\n```"
+        compose.runOnIdle { model.edit(model.state.value.active.id, content); model.mode("reader") }
+        compose.waitUntil(15_000) { compose.onAllNodes(hasContentDescription("Export") and isEnabled()).fetchSemanticsNodes().isNotEmpty() }
+
+        val originalReader = AtomicReference<WebView>()
+        compose.runOnIdle {
+            originalReader.set(web(compose.activity.window.decorView)!!)
+            // Android's documented renderer-crash test hook. This test runs
+            // only in the disposable instrumentation app process.
+            originalReader.get().loadUrl("chrome://crash")
+        }
+        compose.waitUntil(10_000) {
+            compose.onAllNodesWithText("The reader restarted. Changes already received by Super MD were restored; an edit still in transit may be missing.").fetchSemanticsNodes().isNotEmpty()
+        }
+        compose.waitUntil(30_000) {
+            val currentReader = AtomicReference<WebView>()
+            androidx.test.platform.app.InstrumentationRegistry.getInstrumentation().runOnMainSync {
+                currentReader.set(web(compose.activity.window.decorView))
+            }
+            currentReader.get() != null && currentReader.get() !== originalReader.get() &&
+                compose.onAllNodes(hasContentDescription("Export") and isEnabled()).fetchSemanticsNodes().isNotEmpty()
+        }
+        assertEquals(content, model.state.value.active.content)
+        javascriptUntil("document.querySelector('.android-reading')?.innerText.includes('Acknowledged draft survives') && !document.querySelector('.python-cell .cell-output')") { it == "true" }
     }
     @Test fun shareUsesTheSamePdfOptionsAndARestrictedSystemUri() {
         welcome()

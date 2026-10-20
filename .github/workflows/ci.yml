@@ -29,7 +29,42 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: '3.13'
-      - run: python -m pip install -r desktop/requirements-build.txt
+      - name: Compute Python wheel cache identity
+        id: python-wheel-identity
+        shell: bash
+        run: |
+          digest="$(python scripts/python_wheel_identity.py desktop/requirements.txt desktop/requirements-build.txt)"
+          echo "digest=$digest" >> "$GITHUB_OUTPUT"
+      - uses: actions/cache@v4
+        id: python-wheels
+        with:
+          path: ${{ runner.temp }}/supermd-python-wheels
+          key: python-wheelhouse-v3-${{ steps.python-wheel-identity.outputs.digest }}
+      - name: Validate or rebuild the platform-specific Python wheelhouse
+        shell: bash
+        env:
+          WHEELHOUSE: ${{ runner.temp }}/supermd-python-wheels
+          PYTHON_WHEEL_CACHE_HIT: ${{ steps.python-wheels.outputs.cache-hit }}
+        run: |
+          python scripts/prepare_python_wheelhouse.py "$WHEELHOUSE" desktop/requirements-build.txt desktop/requirements.txt desktop/requirements-build.txt
+          python - <<'PY'
+          import json, os, platform, sys
+          from pathlib import Path
+
+          wheels = sorted(Path(os.environ["WHEELHOUSE"]).glob("*.whl"))
+          report = {
+              "cacheHit": os.environ["PYTHON_WHEEL_CACHE_HIT"],
+              "python": sys.version,
+              "platform": sys.platform,
+              "architecture": platform.machine(),
+              "wheelCount": len(wheels),
+              "wheels": [{"name": wheel.name, "bytes": wheel.stat().st_size} for wheel in wheels],
+          }
+          output = Path(os.environ["RUNNER_TEMP"]) / "python-wheel-inventory.json"
+          output.write_text(json.dumps(report, indent=2) + "\n", encoding="utf-8")
+          print(f"wheel_cache_hit={report['cacheHit']} wheel_count={report['wheelCount']}")
+          PY
+      - run: python -m unittest scripts.test_prepare_python_wheelhouse
       - name: Test native state, file safety, themes and actual Qt menu geometry
         timeout-minutes: 8
         run: python desktop/run_tests.py
@@ -46,7 +81,16 @@ jobs:
           workspaces: ./smd-core -> target
           shared-key: native-desktop-${{ runner.os }}-${{ runner.arch }}
       - run: npm ci
-      - run: npm run build
+      - run: npm run build:native
+      - name: Inventory native reader bundle reachability and fonts
+        shell: bash
+        run: node scripts/report-web-assets.mjs dist --verify-native --public-root public --output "$RUNNER_TEMP/reader-assets-report.json"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: build-inventory-${{ runner.os }}-${{ runner.arch }}
+          path: |
+            ${{ runner.temp }}/reader-assets-report.json
+            ${{ runner.temp }}/python-wheel-inventory.json
       - run: node --test scripts/release-guards.test.mjs
       - run: npx vitest run
       - run: npm run test:pdf
@@ -64,6 +108,10 @@ jobs:
           if [ "$RUNNER_OS" = macOS ]; then python desktop/check_bundled_python.py desktop/dist/super-md/super-md; fi
             desktop/dist/super-md/_internal/resources/desktop/smd-engine doctor
           fi
+      - name: Recover the packaged reader after an isolated renderer failure
+        if: runner.os == 'Linux'
+        timeout-minutes: 4
+        run: node desktop/test_reader_crash_recovery_integration.mjs --binary desktop/dist/super-md/super-md
       - name: Launch packaged editor and verify real reader pixels and math PDF
         shell: bash
         env:
@@ -84,7 +132,9 @@ jobs:
       - run: npm ci
       - run: npx playwright install --with-deps chromium
       - run: npm run test:coverage
-      - run: npm run test:browser
+      # Keep the constrained local default at one worker (playwright.config.ts);
+      # CI uses two based on same-source 68-test measurements.
+      - run: npm run test:browser -- --workers=2
       - uses: actions/upload-artifact@v4
         if: always()
         with:
@@ -117,6 +167,15 @@ jobs:
         with:
           log-accepted-android-sdk-licenses: false
       - run: sdkmanager "platforms;android-37.0" "build-tools;36.0.0" "ndk;27.1.12297006"
+      - uses: actions/cache@v4
+        id: gradle-cache
+        with:
+          path: |
+            ~/.gradle/caches/modules-2
+            ~/.gradle/caches/transforms-4
+            ~/.gradle/caches/build-cache-1
+            ~/.gradle/wrapper/dists
+          key: gradle-linux-jdk17-${{ hashFiles('android/**/*.gradle', 'android/**/*.gradle.kts', 'android/gradle/wrapper/gradle-wrapper.properties', 'android/gradle/libs.versions.toml', 'android/gradle/dependency-locks/**') }}
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: aarch64-linux-android
@@ -137,12 +196,15 @@ jobs:
       - name: Build and validate release variant (never debug distribution)
         run: npm run android:release
         env:
+          SUPERMD_GRADLE_BUILD_CACHE: 'false'
           SUPERMD_STORE_PASSWORD: ${{ secrets.ANDROID_STORE_PASSWORD }}
           SUPERMD_KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
           SUPERMD_KEY_PASSWORD: ${{ secrets.ANDROID_KEY_PASSWORD }}
+      - name: Report Gradle dependency cache restoration
+        run: echo "gradle_dependency_cache_hit=${{ steps.gradle-cache.outputs.cache-hit }}; task_output_cache=disabled_for_signed_release"
       - name: Lint debug and instrumentation sources without suppressing render assertions
         working-directory: android
-        run: ./gradlew --no-daemon --max-workers=2 :app:lintDebug
+        run: ./gradlew --no-daemon --build-cache --max-workers=2 :app:lintDebug
       - uses: actions/upload-artifact@v4
         with:
           name: super-md-android-arm64-release
@@ -183,6 +245,15 @@ jobs:
         with:
           log-accepted-android-sdk-licenses: false
       - run: sdkmanager "platforms;android-37.0" "build-tools;36.0.0" "ndk;27.1.12297006"
+      - uses: actions/cache@v4
+        id: gradle-cache
+        with:
+          path: |
+            ~/.gradle/caches/modules-2
+            ~/.gradle/caches/transforms-4
+            ~/.gradle/caches/build-cache-1
+            ~/.gradle/wrapper/dists
+          key: gradle-linux-jdk17-${{ hashFiles('android/**/*.gradle', 'android/**/*.gradle.kts', 'android/gradle/wrapper/gradle-wrapper.properties', 'android/gradle/libs.versions.toml', 'android/gradle/dependency-locks/**') }}
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: x86_64-linux-android
@@ -194,7 +265,7 @@ jobs:
           # Every emulator assertion still runs before the release can pass.
           cache-on-failure: true
       - run: npm ci
-      - run: npm run build
+      - run: npm run build:native
       - name: Build the real JNI engine and offline reader for instrumentation
         run: |
           export NDK_BIN="$ANDROID_HOME/ndk/27.1.12297006/toolchains/llvm/prebuilt/linux-x86_64/bin"
@@ -225,7 +296,9 @@ jobs:
           # the app. This leaves every native tap, pinch and paint assertion on.
           script: |
             adb shell settings put secure immersive_mode_confirmations confirmed
-            android/gradlew -p android --no-daemon --max-workers=2 :app:connectedDebugAndroidTest
+            android/gradlew -p android --no-daemon --build-cache --max-workers=2 :app:connectedDebugAndroidTest
+      - name: Report Gradle dependency cache restoration
+        run: echo "gradle_cache_hit=${{ steps.gradle-cache.outputs.cache-hit }}; task output reuse is reported by Gradle FROM-CACHE task lines"
       # Debug is an internal test harness only, never a distributed APK.
       - uses: actions/upload-artifact@v4
         if: always()

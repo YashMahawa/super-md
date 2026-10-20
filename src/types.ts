@@ -6,6 +6,11 @@ export interface DocumentData {
   content: string;
 }
 
+/** User-selected opt-in for keeping large reader documents fully mounted. */
+export interface ReaderAccessibilityPreference {
+  fullDocumentAccessibility?: boolean;
+}
+
 export interface ExportOptions {
   pageSize: "a3" | "a4" | "a5" | "a6" | "iso-b4" | "iso-b5" | "iso-b6" | "letter" | "legal" | "tabloid" | "executive";
   margin: number;
@@ -24,6 +29,23 @@ export interface PythonResult {
   stderr: string;
   images: string[];
   ok: boolean;
+  provenance?: PythonProvenance;
+}
+
+export interface PythonProvenance {
+  verified: boolean;
+  unsaved?: boolean;
+  document?: string;
+  cell?: string;
+  interpreter?: string;
+  savedAt?: string;
+  reason?: string;
+}
+
+export interface PythonContext {
+  document: string;
+  cell: string;
+  interpreter: string;
 }
 
 export interface ChartSpec {

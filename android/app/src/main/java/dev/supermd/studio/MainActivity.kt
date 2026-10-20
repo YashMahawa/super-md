@@ -179,19 +179,50 @@ private object NoMotionScheme : MotionScheme {
     var web by remember { mutableStateOf<WebView?>(null) }
     var chromeHeight by remember { mutableIntStateOf(0) }
     val readerNote = remember { arrayOfNulls<String>(1) }
-    // Battery: a backgrounded WebView otherwise keeps JS timers, animation
-    // frames and compositor work alive. Pause it once hidden (not on multi-window pause).
+    // WebView timer controls are process-wide. Track every reader so a stopped
+    // activity cannot pause another window that is still visible.
     val lifecycleOwner = androidx.lifecycle.compose.LocalLifecycleOwner.current
     DisposableEffect(lifecycleOwner, web) {
-        val observer = androidx.lifecycle.LifecycleEventObserver { _, event ->
-            when (event) {
-                androidx.lifecycle.Lifecycle.Event.ON_STOP -> web?.let { it.onPause(); it.pauseTimers() }
-                androidx.lifecycle.Lifecycle.Event.ON_START -> web?.let { it.resumeTimers(); it.onResume() }
-                else -> Unit
+        val currentWeb = web
+        if (currentWeb == null) {
+            // No reader exists during initial composition or renderer recovery;
+            // registering that gap would create an owner with no view through
+            // which to apply WebView's process-wide timer call.
+            onDispose { }
+        } else {
+            val owner = Any()
+            fun applyGlobalAction(action: ReaderTimerOwners.GlobalAction) {
+                when (action) {
+                    ReaderTimerOwners.GlobalAction.PAUSE -> currentWeb.pauseTimers()
+                    ReaderTimerOwners.GlobalAction.RESUME -> currentWeb.resumeTimers()
+                    ReaderTimerOwners.GlobalAction.NONE -> Unit
+                }
+            }
+            val started = lifecycleOwner.lifecycle.currentState.isAtLeast(androidx.lifecycle.Lifecycle.State.STARTED)
+            // A view can be recreated while its Activity is already STOPPED;
+            // explicitly pause that view even when another reader keeps the
+            // process-wide timers running.
+            if (started) currentWeb.onResume() else currentWeb.onPause()
+            applyGlobalAction(ReaderTimerOwners.process.acquire(owner, started))
+            val observer = androidx.lifecycle.LifecycleEventObserver { _, event ->
+                when (event) {
+                    androidx.lifecycle.Lifecycle.Event.ON_STOP -> {
+                        currentWeb.onPause()
+                        applyGlobalAction(ReaderTimerOwners.process.setStarted(owner, false))
+                    }
+                    androidx.lifecycle.Lifecycle.Event.ON_START -> {
+                        applyGlobalAction(ReaderTimerOwners.process.setStarted(owner, true))
+                        currentWeb.onResume()
+                    }
+                    else -> Unit
+                }
+            }
+            lifecycleOwner.lifecycle.addObserver(observer)
+            onDispose {
+                lifecycleOwner.lifecycle.removeObserver(observer)
+                applyGlobalAction(ReaderTimerOwners.process.release(owner))
             }
         }
-        lifecycleOwner.lifecycle.addObserver(observer)
-        onDispose { lifecycleOwner.lifecycle.removeObserver(observer) }
     }
     DisposableEffect(activity, web) {
         activity.dismissDocument = { web?.evaluateJavascript("window.supermdDismiss?.() || false") { dismissed -> if (dismissed != "true") model.fullscreen(false) } ?: model.fullscreen(false) }
@@ -199,6 +230,15 @@ private object NoMotionScheme : MotionScheme {
         onDispose { activity.dismissDocument = null;activity.saveReaderPosition=null }
     }
     var readerReady by remember { mutableStateOf(false) }
+    var readerGeneration by remember { mutableIntStateOf(0) }
+    DisposableEffect(model, readerReady, readerGeneration, web) {
+        model.readerFlushRequester = { noteId ->
+            val current = web
+            if (!readerReady || current == null) model.readerStateIsNativeAuthoritative(noteId)
+            else (current.getTag(R.id.reader_bridge_tag) as? ReaderBridge)?.requestFlush(noteId) ?: false
+        }
+        onDispose { model.readerFlushRequester = null }
+    }
     var folderRelative by remember { mutableStateOf("") }
     var hinge by remember { mutableStateOf<FoldingFeature?>(null) }
     val recent by model.recent.collectAsStateWithLifecycle()
@@ -245,11 +285,11 @@ private object NoMotionScheme : MotionScheme {
         val wide = displayIsLarge && maxWidth >= 720.dp && maxHeight >= 400.dp
         val actualMode = if (!wide && state.mode == "split") "live" else state.mode
         val readerContent=remember {arrayOfNulls<String>(1)}
-        LaunchedEffect(readerReady, state.active, actualMode, dark, state.fullscreen, state.font, state.size, state.widthPercent,state.lineHeight,state.spellCheck,state.grammarCheck,state.restorePosition,state.centerLock,state.imageAppearance,state.svgAppearance,state.imageContrast,state.customTheme,state.patternKind,state.patternOpacity,state.patternSize,state.patternSpacing,tokens, hinge, motion) {
+        LaunchedEffect(readerReady, state.active, actualMode, dark, state.fullscreen, state.font, state.size, state.widthPercent,state.lineHeight,state.spellCheck,state.grammarCheck,state.restorePosition,state.centerLock,state.imageAppearance,state.svgAppearance,state.imageContrast,state.fullDocumentAccessibility,state.customTheme,state.patternKind,state.patternOpacity,state.patternSize,state.patternSpacing,tokens, hinge, motion) {
             if (!readerReady) readerNote[0] = null
             if (readerReady) {
                 val note = state.active
-                val payload = JSONObject().put("id", note.id).apply { if (readerNote[0] == note.id && (readerContent[0] === note.content || model.readerEcho[note.id] === note.content)) put("contentUnchanged", true) else put("content", note.content) }.put("path", note.uri ?: note.id).put("mode", actualMode).put("dark", dark).put("fullscreen", state.fullscreen).put("font", state.font).put("size", state.size).put("widthPercent",state.widthPercent).put("lineHeight",state.lineHeight).put("spellCheck",state.spellCheck).put("grammarCheck",state.grammarCheck).put("restorePosition",state.restorePosition).put("centerLock",state.centerLock).put("imageAppearance",state.imageAppearance).put("svgAppearance",state.svgAppearance).put("imageContrast",state.imageContrast).put("colors", tokens).put("zoom", state.zoom).put("motion", motion)
+                val payload = JSONObject().put("id", note.id).put("editProtocol", 1).apply { if (readerNote[0] == note.id && (readerContent[0] === note.content || model.readerEcho[note.id] === note.content)) put("contentUnchanged", true) else put("content", note.content) }.put("path", note.uri ?: note.id).put("mode", actualMode).put("dark", dark).put("fullscreen", state.fullscreen).put("font", state.font).put("size", state.size).put("widthPercent",state.widthPercent).put("lineHeight",state.lineHeight).put("spellCheck",state.spellCheck).put("grammarCheck",state.grammarCheck).put("restorePosition",state.restorePosition).put("centerLock",state.centerLock).put("imageAppearance",state.imageAppearance).put("svgAppearance",state.svgAppearance).put("imageContrast",state.imageContrast).put("fullDocumentAccessibility",state.fullDocumentAccessibility).put("colors", tokens).put("zoom", state.zoom).put("motion", motion)
                 payload.put("readingLocation",model.readingLocation(note.uri))
                 payload.put("customStyle",themeStyle(themeDocument(state.customTheme),if(state.fullscreen)state.fullscreenTheme else state.theme,dark,state.patternKind,state.patternOpacity,state.patternSize,state.patternSpacing))
                 web?.evaluateJavascript("document.documentElement.dataset.platform='android';window.supermdLoad?.($payload)", null)
@@ -344,7 +384,7 @@ private object NoMotionScheme : MotionScheme {
                 // The reading surface is edge-to-edge in BOTH chrome states.
                 // Only controls receive safe insets, not the document width.
                 Box(Modifier.fillMaxSize()) {
-                    AndroidView(factory = { context -> FrameLayout(context).apply {
+                    key(readerGeneration) { AndroidView(factory = { context -> FrameLayout(context).apply {
                         layoutParams = ViewGroup.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT)
                         clipChildren = true
                         clipToPadding = true
@@ -356,7 +396,19 @@ private object NoMotionScheme : MotionScheme {
                             web = this
                             setOnKeyListener { _, _, event -> activity.handleShortcut(event) }
                             setBackgroundColor(AndroidColor.TRANSPARENT)
-                            configureReader(this, model, scope) { readerReady = true }
+                            configureReader(this, model, scope, ready = { if (web === this) readerReady = true }, rendererGone = { failedView ->
+                                val wasCurrent = web === failedView
+                                retireAndDestroyReader(failedView)
+                                if (wasCurrent) {
+                                    readerReady = false
+                                    readerNote[0] = null
+                                    readerGeneration++
+                                    web = null
+                                    scope.launch {
+                                        snackbar.showSnackbar("The reader restarted. Changes already received by Super MD were restored; an edit still in transit may be missing.")
+                                    }
+                                }
+                            })
                             var touchY=0f
                             var downX=0f
                             var downY=0f
@@ -428,7 +480,14 @@ private object NoMotionScheme : MotionScheme {
                                 }
                             }
                         })
-                    } }, modifier = Modifier.fillMaxSize().clipToBounds(), onRelease = { readerReady = false; web?.removeJavascriptInterface("SuperMD"); web?.destroy(); it.removeAllViews(); web = null })
+                    } }, modifier = Modifier.fillMaxSize().clipToBounds(), onRelease = { frame ->
+                        val released = frame.getChildAt(0) as? WebView
+                        if (released != null) {
+                            if (web === released) { web = null; readerReady = false }
+                            retireAndDestroyReader(released)
+                        }
+                        frame.removeAllViews()
+                    }) }
                     SnackbarHost(snackbar, Modifier.align(Alignment.BottomCenter).safeDrawingPadding())
                     if (state.busy || !readerReady) Surface(color = palette.surface.copy(alpha = .96f), modifier = Modifier.fillMaxSize()) { Column(Modifier.fillMaxSize(), verticalArrangement = Arrangement.Center, horizontalAlignment = Alignment.CenterHorizontally) { if(motion) LoadingIndicator() else Icon(Icons.Rounded.Description,null,Modifier.size(48.dp),tint=palette.primary); Spacer(Modifier.height(16.dp)); Text(if(state.busy) "Preparing your document…" else "Opening your workspace…") } }
                 }
@@ -533,6 +592,8 @@ private class NoteDestination(mime: String, private val preferred: () -> String)
             }
             SettingsSection("Reading") {
                 Row(verticalAlignment=Alignment.CenterVertically){Text("Continue from last reading position",Modifier.weight(1f));Switch(state.restorePosition,model::restorePosition)}
+                Row(verticalAlignment=Alignment.CenterVertically){Text("Full document accessibility",Modifier.weight(1f));Switch(state.fullDocumentAccessibility,model::fullDocumentAccessibility)}
+                Text("Keeps the complete document in the semantic tree for assistive technology and browser Find. Large notes may use substantially more memory.",style=MaterialTheme.typography.bodySmall,color=MaterialTheme.colorScheme.onSurfaceVariant)
                 OutlinedButton(onClick=recoverDraft) {Text("Recover latest deleted draft")}
                 Choice("On startup",state.startup,listOf("restore" to "Restore previous tabs","new" to "New blank note")){model.readingPreference("startup",it)}
                 Text("Unsaved drafts are recovered in either mode. Welcome is shown only on first use.",style=MaterialTheme.typography.bodySmall)
@@ -567,6 +628,23 @@ private class NoteDestination(mime: String, private val preferred: () -> String)
                 Text("New window opens an independent workspace. Your device controls split-screen and desktop window placement. Hold and drag a tab to reorder it.", style = MaterialTheme.typography.bodyMedium)
                 Text("The monochrome icon follows your launcher's themed-icon setting.", style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
             }
+            SettingsSection("Storage & diagnostics") {
+                Text("Inspect app-owned storage sizes and file counts. This read-only report does not inspect Downloads or other documents, and never changes files.", style = MaterialTheme.typography.bodyMedium)
+                FilledTonalButton(onClick = model::inspectStorage, enabled = !state.storageScanning) {
+                    Text(if (state.storageScanning) "Inspecting…" else "Inspect storage")
+                }
+                if (state.storageScanning) LinearProgressIndicator(Modifier.fillMaxWidth())
+                state.storageReport?.let { report ->
+                    Text("Retained app data", style = MaterialTheme.typography.titleSmall)
+                    report.retained.filterNot { it.label == "Execution results" }.forEach { StorageUsageLine(it) }
+                    Text("Execution results", style = MaterialTheme.typography.titleSmall, modifier = Modifier.padding(top = 8.dp))
+                    StorageUsageLine(report.executionResults)
+                    StorageUsageLine(report.legacyExecutionResults)
+                    Text("Other cache", style = MaterialTheme.typography.titleSmall, modifier = Modifier.padding(top = 8.dp))
+                    StorageUsageLine(report.otherCache)
+                    if (report.partial) Text("Some entries could not be measured or were skipped; totals may be incomplete. No files were changed.", color = MaterialTheme.colorScheme.onSurfaceVariant, style = MaterialTheme.typography.bodySmall)
+                }
+            }
             SettingsSection("About & updates") {
                 Text("Super MD ${BuildConfig.VERSION_NAME}",style=MaterialTheme.typography.titleMedium)
                 Text("© Yash Mahawar · MIT License",style=MaterialTheme.typography.bodySmall)
@@ -579,6 +657,16 @@ private class NoteDestination(mime: String, private val preferred: () -> String)
                 TextButton(onClick={activity.startActivity(Intent(android.provider.Settings.ACTION_APP_NOTIFICATION_SETTINGS).putExtra(android.provider.Settings.EXTRA_APP_PACKAGE,activity.packageName))}){Text("Update notification permissions")}
             }
         }
+    }
+}
+
+@Composable private fun StorageUsageLine(usage: StorageCategoryUsage) {
+    Column(Modifier.fillMaxWidth().padding(vertical = 2.dp)) {
+        Row(verticalAlignment = Alignment.CenterVertically) {
+            Text(usage.label, Modifier.weight(1f), style = MaterialTheme.typography.bodyMedium)
+            Text("${usage.files} files · ${formatStorageBytes(usage.bytes)}", style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+        }
+        if (usage.skippedEntries > 0) Text("${usage.skippedEntries} entries skipped or unreadable", style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
     }
 }
 

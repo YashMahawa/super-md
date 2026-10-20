@@ -1,8 +1,8 @@
 import { visit } from "unist-util-visit";
-import { unified } from "unified";
-import remarkParse from "remark-parse";
-import remarkMath from "remark-math";
-import { remarkObsidianMath } from "./obsidianMath";
+import {analyzeDocument,type OutlineEntry} from './documentAnalysis';
+import {headingSlug} from './headingSlug';
+export {headingSlug} from './headingSlug';
+export type {OutlineEntry} from './documentAnalysis';
 import {revealWindowed} from "./windowedSearch";
 import {applyDocumentZoom,invalidateDocumentZoom,refreshDocumentExtent} from './documentZoom';
 const jumps=new WeakMap<Element,{stop:()=>void}>();
@@ -12,17 +12,8 @@ export function cancelHeadingNavigation(root:Element|null):void {
   jumps.get(root)?.stop();jumps.delete(root);delete (root as HTMLElement).dataset.navigating;
 }
 
-export interface OutlineEntry {id:string;title:string;level:number;offset:number}
 export function documentOutline(markdown:string):OutlineEntry[] {
-  const front=markdown.match(/^---\r?\n[\s\S]*?\r?\n---\r?\n/)?.[0].length||0;
-  const tree=unified().use(remarkParse).use(remarkMath).use(remarkObsidianMath).parse(markdown.slice(front));
-  const result:OutlineEntry[]=[],counts=new Map<string,number>();
-  visit(tree,"heading",(node:any)=>{const title=headingText(node),slug=headingSlug(title),count=counts.get(slug)||0;counts.set(slug,count+1);if(result.length<2000)result.push({id:slug+(count?`-${count}`:""),title,level:node.depth,offset:front+(node.position?.start.offset||0)});});
-  return result;
-}
-
-export function headingSlug(text: string): string {
-  return text.normalize("NFKC").toLowerCase().replace(/<[^>]+>/g, "").replace(/[^\p{L}\p{N}\s_-]/gu, "").trim().replace(/\s/g, "-") || "section";
+  return analyzeDocument(markdown).outline;
 }
 export function headingText(node: any): string {
   return typeof node.value === "string" ? node.value : (node.children || []).map(headingText).join("");
@@ -48,7 +39,7 @@ export function navigateToHeading(root:Element,target:string):boolean {
   const headings = Array.from(root.querySelectorAll<HTMLElement>("[data-heading-key]"));
   const counts = new Map<string, number>();
   if(!root.querySelector('[data-windowed-block]'))for (const heading of headings) { const key = heading.dataset.headingKey!, count = counts.get(key) || 0; counts.set(key, count + 1); heading.id = key + (count ? `-${count}` : ""); }
-  const heading = headings.find(node => node.id === target) || headings.find(node => node.id === headingSlug(target));
+  const heading = headings.find(node => node.id === target) || Array.from(root.querySelectorAll<HTMLElement>('[id]')).find(node=>node.id===target) || headings.find(node => node.id === headingSlug(target));
   if (!heading) return true; // Broken local links must not escape into a browser.
   cancelHeadingNavigation(root);
   let observer:ResizeObserver|undefined,timer=0,frame=0;
@@ -60,7 +51,7 @@ export function navigateToHeading(root:Element,target:string):boolean {
   // height after the first frame. Resolve and align within this scroller only.
   const align=(frames:number)=>{
     if(jumps.get(root)!==token || !host.isConnected)return;
-    const mounted=Array.from(root.querySelectorAll<HTMLElement>('[data-heading-key]')).find(node=>node.id===heading.id) || heading;
+    const mounted=Array.from(root.querySelectorAll<HTMLElement>('[id]')).find(node=>node.id===heading.id) || heading;
     if(!host.contains(mounted)){cancelHeadingNavigation(root);return;}
     revealWindowed(mounted);
     const page=host.querySelector<HTMLElement>('.document-page');

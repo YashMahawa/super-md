@@ -9,7 +9,14 @@ Pane {
     property var ownerPopup: null
     signal back()
     readonly property bool pythonReady: JSON.parse(studio.pythonChoices).some(choice => choice.matplotlib)
+    readonly property var storageSummary: JSON.parse(studio.storageReport)
     function save(key, value) { studio.setting(key, JSON.stringify(value)) }
+    function formatBytes(value) {
+        if (value < 1024) return value + " B"
+        if (value < 1024 * 1024) return (value / 1024).toFixed(1) + " KB"
+        if (value < 1024 * 1024 * 1024) return (value / (1024 * 1024)).toFixed(1) + " MB"
+        return (value / (1024 * 1024 * 1024)).toFixed(2) + " GB"
+    }
     padding: 0
     background: null
     Component.onCompleted: studio.refreshPython()
@@ -90,6 +97,8 @@ Pane {
                 Label { text: "Adapts to this window and fullscreen, without a fixed pixel limit."; Layout.fillWidth: true; wrapMode: Text.WordWrap; color: viewState.colors.muted }
                 Label { text: "Vertical spacing: " + viewState.settings.lineHeight.toFixed(2) }
                 ExpressiveSlider { Layout.fillWidth: true; from: 1.15; to: 2.2; stepSize: .05; value: viewState.settings.lineHeight; onMoved: page.save("lineHeight", value) }
+                Switch { text: "Full document accessibility"; checked: viewState.settings.fullDocumentAccessibility; onToggled: page.save("fullDocumentAccessibility", checked) }
+                Label { text: "Keeps the complete document in the semantic tree for assistive technology and browser Find. Large notes may use substantially more memory."; Layout.fillWidth: true; wrapMode: Text.WordWrap; color: viewState.colors.muted }
                 Switch { text: "Autosave existing notes"; checked: viewState.settings.autosave; onToggled: page.save("autosave", checked) }
                 Switch { text: "Continue from the last reading position"; checked: viewState.settings.restorePosition; onToggled: page.save("restorePosition", checked) }
                 Label { text: "On startup" }
@@ -169,6 +178,32 @@ Pane {
                     ActionButton { text: "Check for updates"; tonal: true; enabled: !studio.updateBusy; onClicked: studio.checkUpdates() }
                     ActionButton { text: studio.updateReady ? "Install update" : "Download update"; visible: studio.updateAvailable; enabled: !studio.updateBusy; prominent: true; onClicked: studio.updateReady ? studio.installUpdate() : studio.downloadUpdate() }
                 }
+                Label { text: "App storage"; font.pixelSize: 22; font.weight: Font.DemiBold; Layout.topMargin: 12 }
+                Label { text: "A read-only inventory of known Super MD app data. It does not scan notes, Downloads or your home folder."; Layout.fillWidth: true; wrapMode: Text.WordWrap; color: viewState.colors.muted }
+                Flow {
+                    Layout.fillWidth: true
+                    spacing: 8
+                    ActionButton { objectName: "inspectAppStorage"; text: studio.storageBusy ? "Inspecting…" : "Inspect app storage"; glyph: "MagnifyingGlass"; tonal: true; enabled: !studio.storageBusy; onClicked: studio.inspectStorage() }
+                    ActionButton { objectName: "cancelStorageInspection"; text: "Cancel"; visible: studio.storageBusy; onClicked: studio.cancelStorageInspection() }
+                }
+                Label {
+                    Layout.fillWidth: true
+                    wrapMode: Text.WordWrap
+                    color: viewState.colors.muted
+                    text: studio.storageBusy ? "Scanning app-owned storage…" : page.storageSummary.status === "complete" ? "Inventory complete · " + page.storageSummary.scannedEntries + " entries checked" : page.storageSummary.status === "partial" ? "Partial inventory · some entries could not be checked or the scan was bounded/cancelled" : "No inventory has been run."
+                }
+                Repeater {
+                    model: page.storageSummary.categories || []
+                    delegate: RowLayout {
+                        required property var modelData
+                        Layout.fillWidth: true
+                        spacing: 10
+                        Label { text: modelData.label; Layout.fillWidth: true; wrapMode: Text.WordWrap; font.weight: Font.DemiBold }
+                        Label { text: modelData.classification === "managed" ? "Managed" : "Preserved"; color: viewState.colors.muted }
+                        Label { text: page.formatBytes(modelData.bytes) + " · " + modelData.files + " files"; color: viewState.colors.muted; horizontalAlignment: Text.AlignRight }
+                    }
+                }
+                Label { text: "Recovery snapshots and Python execution results are preserved. This tool does not delete anything; no disposable app-managed cache is tracked or cleared."; Layout.fillWidth: true; wrapMode: Text.WordWrap; color: viewState.colors.muted }
                 Item { height: 24 }
             }
         }

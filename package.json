@@ -8,9 +8,11 @@
   "scripts": {
     "dev": "vite",
     "build": "tsc -b && vite build && node scripts/bundle-license.mjs",
+    "build:native": "tsc -b && vite build --mode native && node scripts/bundle-license.mjs",
     "tauri": "tauri",
     "desktop": "python desktop/main.py",
     "package": "python desktop/package.py",
+    "package:native": "npm run build:native && python desktop/package.py",
     "test": "vitest run && cd src-tauri && cargo test",
     "test:browser": "playwright test",
     "test:coverage": "vitest run --coverage",

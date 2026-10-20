@@ -15,6 +15,7 @@ import ssl
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 import urllib.parse
 import urllib.request
@@ -26,9 +27,16 @@ from documents import atomic_write, atomic_json, bundle, image_data, materialize
 from theme import detect_system_dark, read_system_palette, system_palette_paths, tokens
 from fonts import FontStore
 from python_outputs import PythonOutputs
+from reader_edits import ReaderEdits
+from closed_notes import ClosedNoteStore
+from reader_assets import ReaderAssetStore, note_file_path, resolve_source
+from storage_inspector import inspect_storage
+from latest_writes import LatestWriteExecutor
 import updates
 import app_integration
 import python_runtime
+import pending_python
+from export_jobs import ExportJobRegistry
 import file_events
 import custom_theme
 
@@ -36,7 +44,7 @@ ROOT = Path(sys._MEIPASS)/"resources" if getattr(sys,"frozen",False) else Path(_
 DEFAULT_PDF = {"pageSize": "a4", "margin": 18, "fontSize": 10, "lineHeight": 1.45, "paragraphSpacing": 1.2, "fontFamily": "Manrope", "pageNumbers": True, "themed": False}
 DEFAULTS = {"theme": "system", "fullTheme": "black", "motion": True, "font": "Manrope", "size": 18, "width": 0, "widthPercent":90, "lineHeight":1.65, "autosave":True, "normalZoom": 100, "fullZoom": 100, "python": "", "pdf": DEFAULT_PDF, "welcomed": False}
 DEFAULTS.update(widthMigrated=True, window={"width":1320,"height":880,"maximized":False}, spellCheck=False, grammarCheck=False, readingMode="live", newNoteLocation="", accent="system", checkUpdates=True, autoUpdate=False)
-DEFAULTS.update(restorePosition=True, centerLock=True, startup="restore", imageAppearance="original", svgAppearance="original", imageContrast=1.25)
+DEFAULTS.update(restorePosition=True, centerLock=True, startup="restore", imageAppearance="original", svgAppearance="original", imageContrast=1.25, fullDocumentAccessibility=False)
 DEFAULTS.update(patternKind="",patternOpacity=-1,patternSize=0,patternSpacing=0)
 DEFAULTS.update(desktopIntegration=False)
 SAMPLE = """# A place to think\n\nWrite in Markdown. Read without distractions.\n\n> [!tip] Start with your notes\n> Open any note or folder. No vault, no import process.\n\n## Learn by exploring\n\n$$E = mc^2$$\n\n> [!answer]- Why does this matter?\n> Tap the heading to reveal an answer, then hide it to test yourself.\n\n```smd-chart\n{\"title\":\"A changing wave\",\"series\":[{\"name\":\"Sine\",\"expression\":\"sin(a*x)\",\"color\":\"#386a57\"},{\"name\":\"Cosine\",\"expression\":\"cos(a*x)\",\"color\":\"#bc6750\"}],\"sliders\":[{\"name\":\"a\",\"min\":0.2,\"max\":3,\"value\":1}]}\n```\n\n## Matplotlib in three dimensions\n\nRun a Python cell to generate a 3D figure, then save it in your note or PDF.\n\n```python\nimport numpy as np\nimport matplotlib.pyplot as plt\nx, y = np.meshgrid(np.linspace(-2, 2, 32), np.linspace(-2, 2, 32))\nfig = plt.figure()\nax = fig.add_subplot(111, projection=\"3d\")\nax.plot_surface(x, y, x*x + y*y, cmap=\"viridis\")\n```\n\n[Back to exploring](#learn-by-exploring)\n"""
@@ -78,6 +86,13 @@ def local_path(value: str) -> Path:
     url = QUrl(value)
     return Path(url.toLocalFile() if url.isLocalFile() else value).expanduser().resolve()
 
+def _same_closed_revision(current: dict, captured: dict) -> bool:
+    """Compare content-bearing fields after a background close snapshot."""
+    return current == captured
+
+def _asset_identity(value):
+    return id(value)
+
 class Session(QObject):
     """One ordered persistence stream for every native window in the application."""
     changed = Signal()
@@ -89,7 +104,11 @@ class Session(QObject):
         self.data.mkdir(parents=True,exist_ok=True)
         self.font_store = FontStore(self.data)
         self.python_outputs = PythonOutputs(self.data/"derived-python")
-        self.writes = concurrent.futures.ThreadPoolExecutor(max_workers=1,thread_name_prefix="supermd-save")
+        self.reader_assets = ReaderAssetStore(self.reader_asset_is_current, self.reader_asset_payload)
+        self.closed_note_store = ClosedNoteStore(self.data/"closed-notes")
+        try:self.closed_tabs = self.closed_note_store.load_index_strict();self.closed_note_error=""
+        except (OSError,ValueError,TypeError) as error:self.closed_tabs=[];self.closed_note_error=str(error)
+        self.writes = LatestWriteExecutor(max_workers=1,thread_name_prefix="supermd-save")
         self.settings = copy.deepcopy(DEFAULTS)
         self.recent = []
         self.pinned = []
@@ -137,6 +156,45 @@ class Session(QObject):
                 bundle(tab["content"],tab.get("assets",{}))
                 self.initial_recovery.append(tab)
         except (OSError,ValueError,TypeError): pass
+        # A crash can land after an active-tab recovery write but before the
+        # small closed-tab index is refreshed. Prefer the active recovery entry.
+        active_ids={entry.get("id") for entry in self.startup_entries if isinstance(entry,dict)}
+        active_ids.update(tab.get("id") for tab in self.initial_recovery)
+        kept=[ref for ref in self.closed_tabs if ref.get("id") not in active_ids]
+        if kept != self.closed_tabs:
+            self.closed_tabs=kept
+            try:self.closed_note_store.save_index(kept)
+            except OSError:pass
+
+    def reader_asset_is_current(self, grant):
+        return self.reader_asset_source_is_current(grant.owner_id, grant.tab_id, grant.source,
+                                                   grant.embedded_identity, grant.path)
+
+    def reader_asset_source_is_current(self, owner_id, tab_id, source, embedded_identity, path):
+        studio = self.windows.get(owner_id)
+        if not studio or studio.retired:
+            return False
+        tab = next((item for item in studio.tabs if item["id"] == tab_id), None)
+        if tab is None:
+            return False
+        if source in tab.get("assets", {}):
+            # Asset strings are immutable; identity keeps request validation
+            # cheap for large embedded images and replacement revokes access.
+            return id(tab["assets"][source]) == embedded_identity
+        try:
+            return str(note_file_path(tab, source)) == path
+        except (OSError, ValueError):
+            return False
+
+    def reader_asset_payload(self, grant):
+        studio = self.windows.get(grant.owner_id)
+        if not studio or studio.retired:
+            return None
+        tab = next((item for item in studio.tabs if item["id"] == grant.tab_id), None)
+        if tab is None:
+            return None
+        payload = tab.get("assets", {}).get(grant.source)
+        return payload if isinstance(payload, str) and id(payload) == grant.embedded_identity else None
 
 class Studio(QObject):
     changed = Signal()
@@ -171,7 +229,7 @@ class Studio(QObject):
         self.window_id = uuid.uuid4().hex
         self.session.windows[self.window_id] = self
         self.host_window = None
-        self.retired = False
+        self._retired = False
         self.completed.connect(self._complete)
         self.data = self.session.data
         self.settings = self.session.settings
@@ -179,6 +237,9 @@ class Studio(QObject):
         self.update_info=None
         self.update_path=""
         self.update_running=False
+        self._storage_report = json.dumps({"status":"idle","cancelled":False,"truncated":False,"scannedEntries":0,"categories":[]})
+        self.storage_busy = False
+        self._storage_cancel_event = None
         self.python_status=""
         self.python_choices=[]
         self.python_busy=False
@@ -186,7 +247,8 @@ class Studio(QObject):
         if not self.settings.get("python"): QTimer.singleShot(0,self._choose_default_python)
         if not isolated and len(self.session.windows)==1:QTimer.singleShot(0,self._restore_update)
         self.tabs: list[dict] = []
-        self.closed_tabs: list[dict] = []
+        self.closed_tabs = self.session.closed_tabs
+        self._closing_tabs: set[str] = set()
         self.note_watcher = QFileSystemWatcher(self)
         self.note_watcher.fileChanged.connect(self._external_note_changed)
         self.note_watcher.directoryChanged.connect(self._external_note_changed)
@@ -206,9 +268,11 @@ class Studio(QObject):
         self.reader_overlay = False
         self.image_overlay = False
         self.busy = 0
-        self.message = ""
+        self.message = ("Closed-note recovery index could not be read; historical snapshots were left untouched. "+self.session.closed_note_error) if self.session.closed_note_error else ""
         self.ready = False
         self._last_reader_text = None
+        self._export_jobs = ExportJobRegistry()
+        self.reader_edits = ReaderEdits()
         self.system_dark = None
         self.system_mode, self.system_colors = read_system_palette()
         self._theme_result = None
@@ -308,9 +372,10 @@ class Studio(QObject):
         if load and self.ready:
             tab = self._current()
             colors = self._colors()
-            reading_settings={key:self.settings[key] for key in ("restorePosition","centerLock","imageAppearance","svgAppearance","imageContrast")}
+            reading_settings={key:self.settings[key] for key in ("restorePosition","centerLock","imageAppearance","svgAppearance","imageContrast","fullDocumentAccessibility")}
             reading_settings["customStyle"]=custom_theme.reader(self.session.custom_theme,self.settings["fullTheme" if self.fullscreen else "theme"],self._dark(),self.settings)
             payload={**reading_settings,"readingLocation":self.session.locations.get(tab["path"]),"id": tab["id"], "path": tab["path"] or tab["id"], "mode": self.mode, "dark": self._dark(), "fullscreen": self.fullscreen, "font": self.settings["font"], "size": self.settings["size"], "widthPercent": self.settings["widthPercent"], "lineHeight":self.settings["lineHeight"], "spellCheck":self.settings["spellCheck"], "grammarCheck":self.settings["grammarCheck"], "zoom": self.settings["fullZoom" if self.fullscreen else "normalZoom"], "motion": self.settings["motion"], "python": self.settings["python"], "colors": colors, "viewState": tab.pop("viewState", None)}
+            payload["editProtocol"]=1
             previous=self._last_reader_text
             if previous and previous[0]==tab["id"] and previous[1] is tab["content"]:payload["contentUnchanged"]=True
             else:payload["content"]=tab["content"]
@@ -481,6 +546,8 @@ class Studio(QObject):
 
     def stop(self):
         if self.retired: return
+        if self._storage_cancel_event is not None:self._storage_cancel_event.set()
+        self._export_jobs.cancel_all()
         if self.position_timer.isActive():self._save_positions()
         self.position_timer.stop()
         if self.preference_timer.isActive():self._preferences(False)
@@ -493,7 +560,8 @@ class Studio(QObject):
         self.flush_timer.stop()
         self.external_timer.stop()
         self._recover()
-        self.retired = True
+        self.session.reader_assets.revoke_owner(self.window_id)
+        self._retired = True
         self.session.windows.pop(self.window_id, None)
         if not self.session.quitting and self.session.windows:
             self.session.workspace.pop(self.window_id,None)
@@ -506,6 +574,12 @@ class Studio(QObject):
     def snapshot(self):
         tab = self._current()
         return json.dumps({"tabs": [{"id": t["id"], "name": t["name"], "path": t["path"], "dirty": t["content"] != t["saved"]} for t in self.tabs], "active": self.active, "name": tab["name"], "outline": tab.get("outline", []), "portable": tab["portable"], "folder": self.folder, "files": self.files, "recent": self.recent, "settings": self.settings, "mode": self.mode, "fullscreen": self.fullscreen, "readerOverlay": self.reader_overlay, "imageOverlay": self.image_overlay, "readerReady": self.ready, "dark": self._dark(), "zoom": self.settings["fullZoom" if self.fullscreen else "normalZoom"], "busy": self.busy > 0, "message": self.message, "colors": self._colors()})
+
+    @Property(bool,notify=changed)
+    def readerFullscreen(self):return self.fullscreen
+
+    @Property(bool,notify=changed)
+    def retired(self):return self._retired
 
     @Property(str, constant=True)
     def windowId(self): return self.window_id
@@ -526,6 +600,36 @@ class Studio(QObject):
 
     @Property(bool,notify=changed)
     def updateBusy(self):return self.update_running
+
+    @Property(str,notify=changed)
+    def storageReport(self):return self._storage_report
+
+    @Property(bool,notify=changed)
+    def storageBusy(self):return self.storage_busy
+
+    @Slot()
+    def inspectStorage(self):
+        if self.retired or self.storage_busy:return
+        cancel_event=threading.Event()
+        self._storage_cancel_event=cancel_event
+        self.storage_busy=True
+        self._storage_report=json.dumps({"status":"scanning","cancelled":False,"truncated":False,"scannedEntries":0,"categories":[]})
+        self._emit(False)
+        def done(report,error):
+            if self._storage_cancel_event is not cancel_event:return
+            self._storage_cancel_event=None
+            self.storage_busy=False
+            if error or not isinstance(report,dict):
+                # Keep exception text out of UI/report: filesystem errors may
+                # contain private local paths.
+                report={"status":"partial","cancelled":cancel_event.is_set(),"truncated":False,"scannedEntries":0,"categories":[],"message":"Some app data could not be inspected."}
+            self._storage_report=json.dumps(report,separators=(",",":"))
+            self._emit(False)
+        self._submit(lambda:inspect_storage(self.data,cancel_event),done,False)
+
+    @Slot()
+    def cancelStorageInspection(self):
+        if self._storage_cancel_event is not None:self._storage_cancel_event.set()
 
     @Property(bool,constant=True)
     def desktopIntegrationAvailable(self):return app_integration.available()
@@ -741,6 +845,7 @@ class Studio(QObject):
         if not note: return False
         old = self.tabs.index(note)
         self.tabs.remove(note)
+        self.session.reader_assets.revoke_tab(self.window_id, tab_id)
         target.tabs.insert(max(0, min(len(target.tabs), index)), note)
         target.active = tab_id
         emptied = not self.tabs
@@ -960,11 +1065,25 @@ class Studio(QObject):
         self.session.workspace[self.window_id]=[{"path":t["path"],"id":t["id"]} for t in self.tabs if t["path"] or t["content"]!=t["saved"]]
         entries=[entry for tabs in self.session.workspace.values() for entry in tabs]
         workspace={"paths":list(dict.fromkeys(t["path"] for t in entries if t["path"])),"tabs":entries,"active":self._current()["path"],"activeId":self.active}
-        self._submit(lambda:atomic_json(self.data/"startup.json",workspace),lambda *_:None,False,self.writes)
+        self.session.writes.submit_latest("startup",lambda:atomic_json(self.data/"startup.json",workspace),lambda error:self._notify_recovery_write("startup",error))
         # Snapshot only unsaved tabs. Asset bytes stay in recovery, never in displayed source.
         self.session.drafts[self.window_id] = [copy.deepcopy({key: value for key, value in t.items() if key != "viewState"}) for t in self.tabs if t["content"] != t["saved"] and (t["path"] or t["content"].strip() or t["assets"])]
         drafts = [tab for tabs in self.session.drafts.values() for tab in tabs]
-        self._submit(lambda: atomic_json(self.data / "recovery.json", drafts), lambda *_: None, False,self.writes)
+        self.session.writes.submit_latest("recovery",lambda:atomic_json(self.data/"recovery.json",drafts),lambda error:self._notify_recovery_write("recovery",error))
+
+    def _notify_recovery_write(self,category,error):
+        try:self.completed.emit((self._recovery_write_completed,(category,error),None,False))
+        except RuntimeError:pass
+
+    def _recovery_write_completed(self,result,_error):
+        category,error=result
+        notice={
+            "startup":"Couldn't save the current workspace state. Keep Super MD open and retry.",
+            "recovery":"Couldn't save draft recovery data. Keep Super MD open and retry.",
+        }[category]
+        if error:self.message=notice
+        elif self.message==notice:self.message=""
+        self._emit(False)
 
     @Slot(str)
     def openPath(self, value):
@@ -1059,10 +1178,22 @@ class Studio(QObject):
     @Slot()
     def reopenTab(self):
         if not self.closed_tabs:return
-        note=self.closed_tabs.pop()
-        existing=next((t for t in self.tabs if note["path"] and t["path"]==note["path"]),None)
-        if existing:self.selectTab(existing["id"]);return
-        self.tabs.append(note);self.active=note["id"];self._emit()
+        reference=self.closed_tabs[-1]
+        def finished(note,error):
+            if error:
+                self.message="Could not reopen the closed note: "+error
+                self._emit(False);return
+            if reference not in self.closed_tabs:return
+            existing=next((t for t in self.tabs if note.get("path") and t["path"]==note["path"]),None)
+            if existing:self.active=existing["id"]
+            else:self.tabs.append(note);self.active=note["id"]
+            self.closed_tabs.remove(reference)
+            self._recover();self._emit()
+        def read_note():
+            if reference.get("_closedSnapshot"):
+                return self.session.closed_note_store.load(reference)
+            return copy.deepcopy(reference)  # compatibility with old in-memory entries
+        self._submit(read_note,finished,False,self.writes)
 
     @Slot(str)
     def openFolder(self, value):
@@ -1167,7 +1298,7 @@ class Studio(QObject):
         if key in ("imageAppearance","svgAppearance") and value not in ("original","invert-dark","auto","monochrome","contrast"):return
         if key in ("restorePosition","centerLock") and not isinstance(value,bool):return
         if key=="imageContrast" and (not isinstance(value,(int,float)) or isinstance(value,bool) or not math.isfinite(value) or not 1<=value<=2):return
-        if key in ("motion","welcomed","autosave","checkUpdates","autoUpdate","spellCheck","grammarCheck","desktopIntegration") and not isinstance(value,bool): return
+        if key in ("motion","welcomed","autosave","checkUpdates","autoUpdate","spellCheck","grammarCheck","desktopIntegration","fullDocumentAccessibility") and not isinstance(value,bool): return
         if key in ("font","python") and (not isinstance(value,str) or not value.strip() or len(value)>2048): return
         if key == "python":
             try: value = python_runtime.validate(value.strip())
@@ -1330,15 +1461,46 @@ class Studio(QObject):
             self._remove_tab(id)
 
     def _remove_tab(self, id):
-        index = next(i for i,t in enumerate(self.tabs) if t["id"] == id)
-        removed=self.tabs.pop(index)
-        if removed["content"].strip() or removed["path"]:
-            self.closed_tabs.append(removed)
-            while len(self.closed_tabs)>12 or sum(len(t["content"])+len(t["saved"])+sum(len(v) for v in t["assets"].values()) for t in self.closed_tabs)>4_000_000:self.closed_tabs.pop(0)
+        removed=next((tab for tab in self.tabs if tab["id"]==id),None)
+        if removed is None:return
+        if removed["content"].strip() or removed["path"] or removed.get("assets"):
+            if id in self._closing_tabs:return
+            self._closing_tabs.add(id)
+            # Strings and encoded assets are immutable; deepcopy shares their
+            # bytes while snapshotting small mutable metadata/asset mappings.
+            captured=copy.deepcopy(removed)
+            def saved(reference,error):
+                self._closing_tabs.discard(id)
+                if error:
+                    self.message="Could not preserve the closed note: "+error
+                    return
+                current=next((tab for tab in self.tabs if tab["id"]==id),None)
+                if current is None:return
+                if not _same_closed_revision(current,captured):
+                    self.message="The note changed while it was closing. It remains open with the latest text."
+                    return
+                next_refs=[reference]+self.closed_tabs
+                next_refs=next_refs[:ClosedNoteStore.LIMIT]
+                try:self.session.closed_note_store.save_index(next_refs)
+                except Exception as failure:
+                    self.message="Could not update closed-note recovery: "+str(failure)
+                    return
+                self.closed_tabs[:]=next_refs
+                self._finish_remove_tab(id)
+            self._submit(lambda:self.session.closed_note_store.save(captured),saved,False,self.writes)
+            return
+        self._finish_remove_tab(id)
+
+    def _finish_remove_tab(self,id):
+        self.reader_edits.clear(id)
+        current_index=next((i for i,tab in enumerate(self.tabs) if tab["id"]==id),None)
+        if current_index is None:return
+        self.session.reader_assets.revoke_tab(self.window_id, id)
+        self.tabs.pop(current_index)
         if not self.tabs:
             self.tabs.append(self._note("Untitled.md"))
         if self.active == id:
-            self.active = self.tabs[min(index, len(self.tabs)-1)]["id"]
+            self.active = self.tabs[min(current_index, len(self.tabs)-1)]["id"]
         self._recover()
         self._emit()
 
@@ -1357,6 +1519,13 @@ class Studio(QObject):
         if choice == "cancel": self.pending_close = ""; return
         if choice == "save": self.save(); return
         if choice == "discard":
+            # For a single-tab close, "discard" confirms closing the dirty
+            # buffer; the closed snapshot must retain its original saved text.
+            if self.pending_close != "window":
+                action=self.pending_close
+                self.pending_close=""
+                if action:self._remove_tab(action)
+                return
             self._current()["saved"] = self._current()["content"]
             self._finish_close()
 
@@ -1386,8 +1555,15 @@ class Studio(QObject):
 
     @Slot(str, str, str)
     def post(self, id, command, raw):
+        if self.retired:return
         try:
             args = json.loads(raw)
+            if command == "cancel_export":
+                job_id = args.get("jobId")
+                if not isinstance(job_id, str) or not job_id or len(job_id) > 128:
+                    raise ValueError("Invalid PDF export job id")
+                self.replied.emit(id, json.dumps({"cancelled": self._export_jobs.cancel(job_id)}), "")
+                return
             tab = self._current()
             if command == "reader_ready": self.ready = True; self._last_reader_text=None; self._emit(); self.replied.emit(id,"true",""); return
             if command == "reader_chrome":
@@ -1409,13 +1585,15 @@ class Studio(QObject):
                 target = next((t for t in self.tabs if t["id"] == args.get("id")), None)
                 headings = args.get("headings", [])
                 if not isinstance(headings, list) or len(headings) > 2000: raise ValueError("Invalid outline")
+                changed=bool(target and target.get("outline",[])!=headings)
                 if target:
                     target["outline"] = headings
                     if not target["path"] and target["name"].startswith("Untitled") and headings:
                         title = str(headings[0].get("title", "")).strip()
                         title = "".join(c for c in title if c not in '/\\:*?"<>|' and ord(c) >= 32).strip(". ")[:120]
                         if title: target["name"] = title + (".smd" if target["portable"] else ".md")
-                self._emit(False); self.replied.emit(id,"true",""); return
+                if changed:self._emit(False)
+                self.replied.emit(id,"true",""); return
             if command == "document_flushed":
                 operation = args.get("operation")
                 if operation != self.flush_operation or operation is None:
@@ -1431,34 +1609,103 @@ class Studio(QObject):
                 self._recover()
                 self._after_flush(operation)
                 self.replied.emit(id,"true",""); return
+            if command in ("document_sync", "document_patch", "document_resync"):
+                target = next((t for t in self.tabs if t["id"] == args.get("id")), None)
+                def commit_edit(content):
+                    was_dirty=target["content"]!=target["saved"]
+                    target["content"] = content
+                    if target["id"] == self.active:self._last_reader_text=(target["id"],content)
+                    self.recovery_timer.start(800)
+                    self.autosave_timer.start(900)
+                    if was_dirty != (content!=target["saved"]):self._emit(False)
+                result=self.reader_edits.apply(command,args,target["content"] if target else None,commit_edit)
+                if command == "document_resync" and not result["accepted"] and isinstance(args.get("content"),str):
+                    draft=args["content"]
+                    destination=self.data/"reader-conflicts"/(uuid.uuid4().hex+".json")
+                    payload={"id":args.get("id"),"content":draft,"reason":"Native and renderer revisions diverged"}
+                    def preserve_done(_value,error):
+                        self.message="Conflicting editor draft preserved for recovery." if not error else "Could not preserve the conflicting draft; keep the editor open. "+str(error)
+                        self._emit(False)
+                        self.replied.emit(id,json.dumps({**result,"draftSaved":not bool(error)}),"")
+                    self._submit(lambda:atomic_json(destination,payload),preserve_done,False)
+                    return
+                self.replied.emit(id,json.dumps(result),"");return
             if command == "document_changed":
                 target = next((t for t in self.tabs if t["id"] == args["id"]), None)
+                self.reader_edits.clear(args["id"])
                 if target: target["content"] = args["content"]
                 if target and target["id"]==self.active:self._last_reader_text=(target["id"],target["content"])
                 self.recovery_timer.start(800)
                 self.autosave_timer.start(900)
                 self._emit(False)
                 self.replied.emit(id,"true",""); return
+            if command == "resolve_reader_asset":
+                document = args.get("documentPath")
+                source = args.get("source")
+                if not isinstance(document, str) or not isinstance(source, str):
+                    raise ValueError("Invalid reader asset request")
+                tab = next((item for item in self.tabs if document in (item["id"], item["path"])), None)
+                if tab is None:
+                    raise ValueError("The note for this image is no longer open")
+                captured = dict(tab)
+                captured["assets"] = dict(tab["assets"])
+                owner_id, tab_id = self.window_id, tab["id"]
+                def work():
+                    return resolve_source(captured, source)
+                def finished(resolved, error):
+                    current = next((item for item in self.tabs if item["id"] == tab_id), None)
+                    if error:
+                        self.replied.emit(id, "null", error)
+                    elif current is None or not self.session.reader_asset_source_is_current(
+                            owner_id, tab_id, source, _asset_identity(resolved.get("embedded_data")) if resolved.get("embedded_data") else 0,
+                            resolved.get("path", "")):
+                        self.replied.emit(id, "null", "The note or image changed while it was being resolved")
+                    else:
+                        try:
+                            url = self.session.reader_assets.register(owner_id, tab_id, source, resolved)
+                            self.replied.emit(id, json.dumps({"url": url, "mime": resolved["mime"]}), "")
+                        except Exception as failure:
+                            self.replied.emit(id, "null", str(failure))
+                self._submit(work, finished, False)
+                return
             if command == "zoom_changed":
                 self.settings["fullZoom" if args.get("fullscreen", self.fullscreen) else "normalZoom"] = max(40,min(300,args["zoom"]))
                 self.preference_timer.start(500)
                 self._emit(False); self.replied.emit(id,"true",""); return
             if command == "export_failed": self.pending_export = self.pending_save_as = ""; self.message = args["error"]; self._emit(False); self.replied.emit(id,"true",""); return
             if command == "request_fmd_export": self.exportRequested.emit("smd"); self.replied.emit(id,"true",""); return
-            reference = args.get("id") or args.get("documentPath")
+            context=args.get("context")
+            if context is not None:
+                if not isinstance(context,dict) or set(context)!={"document","cell","interpreter"}:raise ValueError("Invalid Python output context")
+                if context["interpreter"] != (self.settings["python"] or "embedded"):raise ValueError("Python runtime changed; retry this operation")
+            reference = args.get("id") or args.get("documentPath") or (context.get("document") if context else None)
             if reference:
                 tab = next((t for t in self.tabs if reference in (t["id"],t["path"])),None)
                 if tab is None: raise ValueError("The note for this operation is no longer open")
+            if context and context["document"] not in (tab["id"],tab["path"]):raise ValueError("Python output belongs to another note")
             captured = dict(tab)
             captured["assets"] = dict(tab["assets"])
             output = self.pending_export
             save_as = self.pending_save_as
             python = self.settings["python"]
+            export_job = None
+            if command == "export_pdf_native":
+                if not output: raise ValueError("Choose a PDF destination before exporting")
+                job_id = args.get("jobId")
+                if job_id is None: job_id = uuid.uuid4().hex
+                export_job = self._export_jobs.register(job_id)
             def work():
                 if command == "load_asset": return self._asset(captured,args["source"])
                 if command == "load_font": return self.session.font_store.reader(args["family"])
-                if command == "cache_python_output": self.session.python_outputs.store(args["source"],args["result"]); return True
-                if command == "load_python_output": return self.session.python_outputs.load(args["source"])
+                if command == "cache_python_output":
+                    if context and args["result"].get("provenance",{}).get("verified") is False:raise ValueError("Legacy output cannot be promoted to verified output")
+                    if context and not pending_python.matches(args["source"],args["result"],context):raise ValueError("Only an unsaved native execution can be retried")
+                    self.session.python_outputs.store(args["source"],args["result"],context)
+                    if context:pending_python.forget(args["source"],context)
+                    return True
+                if command == "load_python_output":
+                    value=self.session.python_outputs.load(args["source"],context)
+                    return {**value["result"],"provenance":value["provenance"]} if context and value else value
                 if command == "fetch_resource": return self._fetch(args)
                 if command == "import_images":
                     results = []
@@ -1469,7 +1716,19 @@ class Studio(QObject):
                         captured["assets"][name] = image["data"]
                         results.append({"source":name,"alt":Path(image["name"]).stem})
                     return results
-                if command == "run_python": return self._python(python, args["code"], str(Path(captured["path"]).parent) if captured.get("path") else None)
+                if command == "run_python":
+                    result=self._python(python,args["code"],str(Path(captured["path"]).parent) if captured.get("path") else None)
+                    if context:
+                        try:
+                            self.session.python_outputs.store(args["code"],result,context)
+                            pending_python.forget(args["code"],context)
+                            saved=self.session.python_outputs.load(args["code"],context)
+                            return {**result,"provenance":saved["provenance"]}
+                        except (OSError,ValueError) as error:
+                            # Successful execution is still useful if derived-cache I/O fails.
+                            pending_python.remember(args["code"],result,context)
+                            return {**result,"provenance":{"verified":False,"unsaved":True,"reason":f"Could not save execution output: {error}"}}
+                    return result
                 if command == "export_markdown_native":
                     if not output or not isinstance(args["content"], str) or len(args["content"].encode()) > 20_000_000: raise ValueError("Choose a Markdown destination for a note under 20 MB")
                     atomic_write(Path(output), args["content"].encode())
@@ -1479,11 +1738,65 @@ class Studio(QObject):
                     atomic_write(target,json.dumps(bundle(args["content"],args["assets"]),ensure_ascii=False).encode())
                     return {"path":str(target)}
                 if command == "export_pdf_native":
-                    engine = self._engine()
-                    args["assets"].update(self.session.font_store.pdf_assets(args["options"]["fontFamily"]))
-                    result = subprocess.run([str(engine),"export-json",output], input=json.dumps(args), text=True, capture_output=True, timeout=120)
-                    if result.returncode: raise ValueError(result.stderr.strip() or "PDF export failed")
-                    return {"path":output}
+                    job = export_job
+                    assert job is not None
+                    destination = Path(output)
+                    stage = destination.with_name(f".{destination.name}.{uuid.uuid4().hex}.stage.pdf")
+                    process = None
+                    rust_temp = None
+                    try:
+                        job.check()
+                        if not destination.parent.is_dir(): raise ValueError("The PDF destination folder is unavailable")
+                        engine = self._engine()
+                        args["assets"].update(self.session.font_store.pdf_assets(args["options"]["fontFamily"]))
+                        job.check()
+                        with tempfile.TemporaryFile() as request_file, tempfile.TemporaryFile() as stdout_file, tempfile.TemporaryFile() as stderr_file:
+                            request_size = 0
+                            for chunk in json.JSONEncoder(ensure_ascii=False).iterencode(args):
+                                encoded = chunk.encode("utf-8")
+                                request_size += len(encoded)
+                                request_file.write(encoded)
+                            request_file.flush()
+                            request_file.seek(0)
+                            job.check()
+                            process = subprocess.Popen(
+                                [str(engine), "export-json", str(stage)],
+                                stdin=request_file, stdout=stdout_file, stderr=stderr_file,
+                            )
+                            rust_temp = stage.with_name(f".{stage.name}.{process.pid}.tmp")
+                            job.attach_process(process)
+                            deadline=time.monotonic()+120
+                            while True:
+                                try:
+                                    process.wait(timeout=.1)
+                                    break
+                                except subprocess.TimeoutExpired:
+                                    if not job.cancelled.is_set() and time.monotonic()<deadline:continue
+                                    job.stop_process()
+                                    try: process.wait(timeout=2)
+                                    except subprocess.TimeoutExpired:
+                                        try: process.kill()
+                                        except OSError: pass
+                                        process.wait()
+                                    job.check()
+                                    raise ValueError("PDF export timed out")
+                            job.check()
+                            stderr_file.seek(0)
+                            error_text = stderr_file.read(64 * 1024).decode("utf-8", errors="replace").strip()
+                        if process.returncode:
+                            raise ValueError(error_text or "PDF export failed")
+                        if not stage.is_file() or stage.stat().st_size < 5:
+                            raise ValueError("PDF export produced an incomplete file")
+                        with stage.open("rb") as generated:
+                            if generated.read(5) != b"%PDF-": raise ValueError("PDF export produced an invalid file")
+                        job.promote(stage, destination,lambda:self.readerCall.emit("window.supermdExportPhase?.("+json.dumps(job.job_id)+",'publishing')"))
+                        return {"path":output}
+                    finally:
+                        for owned in (stage, rust_temp):
+                            if owned is not None:
+                                try: owned.unlink(missing_ok=True)
+                                except OSError: pass
+                        self._export_jobs.discard(job.job_id, job)
                 raise ValueError(f"Unsupported command: {command}")
             def finished(result,error):
                 if command.startswith("export_") and self.pending_export == output: self.pending_export = ""
@@ -1508,6 +1821,17 @@ class Studio(QObject):
             self._submit(work,finished,command in ("run_python","export_fmd_native","export_pdf_native","export_markdown_native"),self.writes if command in ("export_fmd_native", "export_markdown_native") else None)
         except Exception as error:
             self.replied.emit(id,"null",str(error))
+
+    @Slot()
+    def readerCrashed(self):
+        if self.retired:return
+        # Native tab text and persisted positions are authoritative. Reloading
+        # a renderer must not restore an older recovery snapshot or run cells.
+        self.ready=False
+        self._last_reader_text=None
+        self.reader_overlay=False
+        self.image_overlay=False
+        self._emit(False)
 
     def _asset(self, tab, source):
         if source in tab["assets"]: return tab["assets"][source]

@@ -14,9 +14,36 @@ from package_runtime import wayland_dependencies
 
 ROOT = Path(__file__).resolve().parent.parent
 OUTPUT = ROOT / "desktop/dist"
+PHASES = []
+CHECKSUM_CHUNK_SIZE = 1024 * 1024
 
 def run(*args, **kwargs):
     subprocess.run([str(arg) for arg in args], check=True, **kwargs)
+
+def sha256_stream(stream, chunk_size=CHECKSUM_CHUNK_SIZE):
+    digest = hashlib.sha256()
+    for chunk in iter(lambda: stream.read(chunk_size), b""):
+        digest.update(chunk)
+    return digest.hexdigest()
+
+def phase(name, action):
+    started = time.perf_counter()
+    action()
+    record = {"phase": name, "seconds": round(time.perf_counter() - started, 3)}
+    PHASES.append(record)
+    print(f"PHASE {name}: {record['seconds']:.3f}s", flush=True)
+
+def write_phase_report():
+    report = {"platform": sys.platform, "architecture": platform.machine(), "phases": PHASES}
+    report_path = OUTPUT / "package-timings.json"
+    report_path.parent.mkdir(parents=True, exist_ok=True)
+    report_path.write_text(json.dumps(report, indent=2) + "\n")
+    summary = os.environ.get("GITHUB_STEP_SUMMARY")
+    if summary:
+        with open(summary, "a", encoding="utf-8") as stream:
+            stream.write("\n### Package phase timings\n\n| Phase | Seconds |\n| --- | ---: |\n")
+            for item in PHASES:
+                stream.write(f"| {item['phase']} | {item['seconds']:.3f} |\n")
 
 def create_dmg(folder, destination):
     command=["hdiutil","create","-volname","Super MD","-srcfolder",str(folder),"-ov","-format","UDZO",str(destination)]
@@ -37,8 +64,8 @@ def build():
                 "commit": subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=ROOT, text=True).strip(),
                 "dirty": bool(subprocess.check_output(["git", "status", "--porcelain"], cwd=ROOT, text=True).strip())}
     (ROOT / "desktop/build-info.json").write_text(json.dumps(identity))
-    run(sys.executable, "-m", "PyInstaller", "--noconfirm", "--distpath", OUTPUT,
-        "--workpath", ROOT / "desktop/build", ROOT / "desktop/super-md.spec", cwd=ROOT)
+    phase("pyinstaller", lambda: run(sys.executable, "-m", "PyInstaller", "--noconfirm", "--distpath", OUTPUT,
+        "--workpath", ROOT / "desktop/build", ROOT / "desktop/super-md.spec", cwd=ROOT))
     if sys.platform.startswith("linux"):
         for name in ("libstdc++.so*", "libgcc_s.so*"):
             if any((OUTPUT / "super-md").rglob(name)):
@@ -111,15 +138,21 @@ def installers(version):
                 "--rpm-rpmbuild-define", "_build_id_links none",
                 *[arg for dependency in dependencies for arg in ("--depends", dependency)],
                 "-C", deb, "-p", packages / f"Super-MD-{version}-1.x86_64.rpm", "opt", "usr")
-    for file in packages.iterdir():
-        if file.is_file() and file.name != "SHA256SUMS":
-            print(f"{hashlib.sha256(file.read_bytes()).hexdigest()}  {file.name}")
+    def checksum_packages():
+        for file in packages.iterdir():
+            if file.is_file() and file.name != "SHA256SUMS":
+                with file.open("rb") as stream:
+                    print(f"{sha256_stream(stream)}  {file.name}")
+    phase("installer-checksums", checksum_packages)
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--bundle-only", action="store_true")
     parser.add_argument("--installers-only", action="store_true")
     args = parser.parse_args()
-    version = json.loads((ROOT / "package.json").read_text())["version"] if args.installers_only else build()
-    if not args.bundle_only:
-        installers(version)
+    try:
+        version = json.loads((ROOT / "package.json").read_text())["version"] if args.installers_only else build()
+        if not args.bundle_only:
+            phase("installer-build", lambda: installers(version))
+    finally:
+        write_phase_report()

@@ -82,7 +82,7 @@ def atomic_json(path: Path, value) -> None:
     """Write ordered recovery without full-workspace JSON + UTF-8 copies."""
     handle, temporary = tempfile.mkstemp(prefix=f".{path.name}.", suffix=".tmp", dir=path.parent)
     try:
-        with os.fdopen(handle, "w", encoding="utf-8") as file:
+        with os.fdopen(handle, "w", encoding="utf-8", errors="backslashreplace") as file:
             if path.exists() and hasattr(os,"fchmod"):
                 os.fchmod(file.fileno(),stat.S_IMODE(path.stat().st_mode))
             json.dump(value,file,ensure_ascii=False)

@@ -14,8 +14,9 @@ import { exportRenderedViews, importRenderedViews } from "./renderedOutputs";
 import LiveEditor from "./components/LiveEditor";
 import MarkdownPreview from "./components/MarkdownPreview";
 import { invoke } from "./nativeBridge";
+import {ReaderEdits,type SourceChange} from './readerEdits';
 import { preparePdf } from "./preparePdf";
-import type { ExportOptions } from "./types";
+import type { ExportOptions,ReaderAccessibilityPreference } from "./types";
 import { clampPreviewZoom } from "./zoom";
 import MediaTools from "./components/MediaTools";
 import { prepareFmd } from "./documentMedia";
@@ -36,22 +37,45 @@ import {applyCustomStyle,type CustomStyle} from './customTheme';
 const DocumentPreview = memo(MarkdownPreview);
 const LiveDocument = memo(LiveEditor);
 const SourceEditor = memo(Editor);
+interface PdfExportStatus {id:string;phase:'preparing'|'typesetting'|'publishing';completed:number;total:number;cancelRequested?:boolean}
 
 interface NoteView { editor?: PortableEditorSession; history?:NoteHistory; top?: number; rendered?: ReturnType<typeof exportRenderedViews> }
-interface ReaderState { id: string; content: string; path: string | null; mode: "live" | "editor" | "reader" | "split"; dark: boolean; fullscreen: boolean; font: string; size: number; spellCheck?:boolean; grammarCheck?:boolean; width?: number; widthPercent?:number; lineHeight?:number; colors: Record<string, string>; zoom: number; motion?: boolean; python?: string; viewState?: NoteView }
+interface ReaderState extends ReaderAccessibilityPreference { id: string; content: string; path: string | null; mode: "live" | "editor" | "reader" | "split"; dark: boolean; fullscreen: boolean; font: string; size: number; spellCheck?:boolean; grammarCheck?:boolean; width?: number; widthPercent?:number; lineHeight?:number; colors: Record<string, string>; zoom: number; motion?: boolean; python?: string; viewState?: NoteView }
 declare global { interface Window {supermdDismiss?:()=>boolean;supermdSetZoom?:(zoom:number,requestedAt?:number)=>void;supermdHeading?:(id:string,offset?:number)=>void;supermdHistory?:(direction:"undo"|"redo")=>void;supermdNativeWheel?:(dx:number,dy:number,point:Point,held:boolean)=>void;} }
 declare global { interface Window { supermdLoad?: (state: ReaderState) => void; supermdExport?: (options: ExportOptions) => void; supermdExportMarkdown?: () => void; supermdFind?: () => void; supermdPortable?: (save: boolean) => void; supermdZoomBy?: (factor:number,focus?:Point)=>void; supermdResetZoom?: ()=>void; supermdRepairMath?: ()=>void; supermdFlush?: (operation:Record<string,string>)=>void } }
 declare global { interface Window {supermdChromeInset?:(height:number)=>void} }
 declare global { interface Window {supermdSavePosition?:()=>void} }
+declare global {interface Window {supermdExportPhase?:(id:string,phase:'typesetting'|'publishing')=>void}}
 interface ReaderState { centerLock?:boolean; customStyle?:CustomStyle; restorePosition?:boolean; readingLocation?:ReadingLocation|null; imageAppearance?:MediaAppearance; svgAppearance?:MediaAppearance; imageContrast?:number }
 function Reader() {
   const [state, setState] = useState<ReaderState | null>(null);
   const [repairing, setRepairing] = useState(false);
   const [searching,setSearching] = useState(false);
+  const [pdfExport,setPdfExport]=useState<PdfExportStatus|null>(null);
+  const exportOwner=useRef<{id:string;controller:AbortController;phase:PdfExportStatus['phase']}|null>(null);
+  const cancelPdfExport=useCallback(async()=>{
+    const owner=exportOwner.current;if(!owner||owner.phase==='publishing')return;
+    setPdfExport(value=>value?.id===owner.id?{...value,cancelRequested:true}:value);
+    if(owner.phase==='preparing'){owner.controller.abort();return;}
+    try{
+      const result=await invoke<{cancelled:boolean}>('cancel_export',{jobId:owner.id});
+      if(!result?.cancelled&&exportOwner.current?.id===owner.id){owner.phase='publishing';setPdfExport(value=>value?.id===owner.id?{...value,phase:'publishing',cancelRequested:false}:value);}
+    }catch{
+      // An older native host may not support cancellation once typesetting starts.
+      if(exportOwner.current?.id===owner.id){owner.phase='publishing';setPdfExport(value=>value?.id===owner.id?{...value,phase:'publishing',cancelRequested:false}:value);}
+    }
+  },[]);
+  useEffect(()=>{
+    window.supermdExportPhase=(id,phase)=>{const owner=exportOwner.current;if(owner?.id!==id)return;owner.phase=phase;setPdfExport(value=>value?.id===id?{...value,phase,cancelRequested:false}:value);};
+    return()=>{delete window.supermdExportPhase;};
+  },[]);
   const [trustedHosts,setTrustedHosts] = useState<string[]>([]);
   const documentAppearance=useMemo(()=>({dark:state?.dark??false,svgAppearance:state?.svgAppearance,ink:state?.colors.primary,text:state?.colors.text,colors:state?.colors}),[state?.dark,state?.svgAppearance,JSON.stringify(state?.colors)]);
   const trustHost = useCallback((host:string)=>setTrustedHosts(current=>current.includes(host)?current:[...current,host]),[]);
   const reference = useRef(state); reference.current = state;
+  const edits=useRef<ReaderEdits|null>(null);
+  if(!edits.current)edits.current=new ReaderEdits((command,args)=>invoke(command,args));
+  const [editError,setEditError]=useState('');
   const zoomReference = useRef(100);
   const zoomGestureAt = useRef(0);
   const pendingChange = useRef(0);
@@ -98,6 +122,12 @@ function Reader() {
       const {contentUnchanged,...rest}=incoming as ReaderState&{contentUnchanged?:boolean};
       if(contentUnchanged&&(!old||old.id!==rest.id))return;
       const next=(contentUnchanged?{...rest,content:old!.content}:rest) as ReaderState;
+      const draft=edits.current!.unacknowledged(next.id);
+      if(draft!==undefined&&next.content!==draft&&!contentUnchanged){
+        next.content=draft;
+        setEditError('A native update arrived while edits were awaiting acknowledgement. Your editor draft has been kept. Save or close will wait for a verified edit session.');
+      }
+      if((next as ReaderState&{editProtocol?:number}).editProtocol===1)edits.current!.open(next.id,next.content);
       if(old?.id===next.id)next.readingLocation=old.readingLocation;
       if(old&&(old.id!==next.id||old.mode!==next.mode||old.fullscreen!==next.fullscreen))document.querySelectorAll('.android-reading').forEach(cancelHeadingNavigation);
       if(old&&(old.id!==next.id||old.mode!==next.mode)){const history=histories.current.get(next.id);if(history)history.last=0;}
@@ -186,32 +216,73 @@ function Reader() {
     window.supermdFlush = operation => {
       savePosition.current();
       const current = reference.current; if (!current) return;
+      if(operation.action==='android_flush'){
+        void (async()=>{
+          if(current.id!==operation.target)throw new Error('The active note changed before its edit flush');
+          if((current as ReaderState&{editProtocol?:number}).editProtocol===1)await edits.current!.flush(current.id);
+          const latest=reference.current;
+          if(!latest||latest.id!==operation.target)throw new Error('The active note changed during its edit flush');
+          await invoke('document_flushed',{id:latest.id,token:operation.token,content:latest.content});
+        })().catch(error=>{
+          setEditError(String(error));
+          void invoke('document_flushed',{id:current.id,token:operation.token,error:String(error)}).catch(()=>{});
+        });
+        return;
+      }
       let id = current.id;
       if (operation.action === "move_tab") { try { id = JSON.parse(operation.target).tab; } catch { return; } }
       else if (operation.action === "detach_tab") id = operation.target;
       const view = operation.action === "move_tab" || operation.action === "detach_tab" ? {editor:exportEditorSession(id),history:histories.current.get(id), ...(id === current.id ? {top:document.querySelector<HTMLElement>(".android-reading")?.scrollTop ?? 0,rendered:exportRenderedViews(current.content)} : noteViews.current.get(id))} : undefined;
-      void invoke("document_flushed",{id:current.id,content:current.content,operation,viewId:id,viewState:view});
+      void (async()=>{
+        if((current as ReaderState&{editProtocol?:number}).editProtocol===1)await edits.current!.flush(current.id);
+        // Snapshot after the acknowledgement barrier, including edits made while waiting.
+        const latest=reference.current;
+        await invoke("document_flushed",{id:current.id,content:latest?.id===current.id?latest.content:current.content,operation,viewId:id,viewState:view});
+      })().catch(error=>setEditError(String(error)));
     };
     window.supermdFind = () => {setSearching(true);requestAnimationFrame(()=>window.dispatchEvent(new Event("supermd-find-focus")));};
     window.supermdPortable = async (save) => {
       const current = reference.current; if (!current) return;
-      try { const prepared = await prepareFmd(current.content, current.path); await invoke("export_fmd_native", { ...prepared, originalContent: current.content, id: current.id, save }); }
+      try {
+        if((current as ReaderState&{editProtocol?:number}).editProtocol===1)await edits.current!.flush(current.id);
+        const latest=reference.current;if(!latest||latest.id!==current.id)throw new Error('The export note changed');
+        const prepared = await prepareFmd(latest.content, latest.path); await invoke("export_fmd_native", { ...prepared, originalContent: latest.content, id: latest.id, save }); }
       catch (error) { await invoke("export_failed", { error: String(error) }); }
     };
     window.supermdExport = async (options) => {
       const current = reference.current; if (!current) return;
-      try { const prepared = await preparePdf(current.content, current.path); await invoke("export_pdf_native", { ...prepared, options: {...options, themeAccent: current.colors.primary}, id: current.id }); }
-      catch (error) { await invoke("export_failed", { error: String(error) }); }
+      if(exportOwner.current)return;
+      const owner={id:crypto.randomUUID(),controller:new AbortController(),phase:'preparing' as PdfExportStatus['phase']};
+      exportOwner.current=owner;setPdfExport({id:owner.id,phase:'preparing',completed:0,total:0});
+      try {
+        if((current as ReaderState&{editProtocol?:number}).editProtocol===1)await edits.current!.flush(current.id);
+        const latest=reference.current;if(!latest||latest.id!==current.id)throw new Error('The export note changed');
+        const prepared = await preparePdf(latest.content, latest.path, latest.python || "embedded",{signal:owner.controller.signal,onProgress:progress=>setPdfExport(value=>value?.id===owner.id?{...value,completed:progress.completed,total:progress.total}:value)});
+        owner.controller.signal.throwIfAborted();
+        owner.phase='typesetting';setPdfExport({id:owner.id,phase:'typesetting',completed:0,total:0});
+        await invoke("export_pdf_native", { ...prepared, options: {...options, themeAccent: latest.colors.primary}, id: latest.id,jobId:owner.id }); }
+      catch (error) { await invoke("export_failed", { error: owner.controller.signal.aborted||(error instanceof Error&&error.message==='PDF export cancelled')?'PDF export cancelled':String(error) }); }
+      finally{if(exportOwner.current?.id===owner.id){exportOwner.current=null;setPdfExport(null);}}
     };
     window.supermdExportMarkdown = async () => {
       const current = reference.current; if (!current) return;
-      try { await invoke("export_markdown_native", {id: current.id, content: current.content}); }
+      try {
+        if((current as ReaderState&{editProtocol?:number}).editProtocol===1)await edits.current!.flush(current.id);
+        const latest=reference.current;if(!latest||latest.id!==current.id)throw new Error('The export note changed');
+        await invoke("export_markdown_native", {id: latest.id, content: latest.content}); }
       catch (error) { await invoke("export_failed", {error: String(error)}); }
     };
     void invoke("reader_ready");
     return () => { cancelAnimationFrame(zoomFrame.current);window.clearTimeout(zoomTimer.current);delete window.supermdSavePosition;delete window.supermdChromeInset;delete window.supermdLoad; delete window.supermdExport; delete window.supermdExportMarkdown; delete window.supermdPortable; delete window.supermdZoomBy; delete window.supermdResetZoom; delete window.supermdRepairMath; delete window.supermdFlush; delete window.supermdSetZoom; delete window.supermdHeading; };
   }, []);
-  useEffect(()=>{if(state)void invoke("document_outline",{id:state.id,headings:documentOutline(state.content)}).catch(()=>{});},[state?.id,state?.content]);
+  useEffect(()=>{
+    if(!state)return;
+    // Outline is derived state, not durable edits. Coalesce expensive Source
+    // typing work and cancel obsolete document generations before parsing.
+    const {id,content}=state;
+    const timer=window.setTimeout(()=>{if(reference.current?.id===id&&reference.current.content===content)void invoke('document_outline',{id,headings:documentOutline(content)}).catch(()=>{});},content.length>80_000?180:0);
+    return()=>window.clearTimeout(timer);
+  },[state?.id,state?.content]);
   useLayoutEffect(() => {
     if (!state) return;
     const nextCustom={id:state.id,mode:state.mode,metrics:JSON.stringify(state.customStyle?.metrics??{})};
@@ -386,7 +457,7 @@ function Reader() {
     document.addEventListener("wheel",wheel,{passive:false});
     return () => { document.removeEventListener("pointermove",pan);document.removeEventListener("pointercancel",up);document.removeEventListener("pointermove",track);document.removeEventListener("pointerdown",down);document.removeEventListener("pointerup",up);window.removeEventListener("blur",up);cancelAnimationFrame(frame); document.removeEventListener("wheel",wheel); document.removeEventListener("touchstart", start); document.removeEventListener("touchmove", move); document.removeEventListener("touchend", end); document.removeEventListener("touchcancel", end); };
   }, []);
-  const update = useCallback((content: string) => {
+  const update = useCallback((content: string,changes?:SourceChange[]) => {
     const previous=reference.current!;
     if(content===previous.content)return;
     if(!replaying.current){
@@ -399,18 +470,27 @@ function Reader() {
     // The bridge receives every edit immediately, so closing/rotating cannot lose
     // a pending debounced WebView update. Disk snapshots are debounced natively.
     window.clearTimeout(pendingChange.current);
-    void invoke("document_changed", { id: next.id, content });
+    const delivery=(next as ReaderState&{editProtocol?:number}).editProtocol===1?edits.current!.change(next.id,content,changes):invoke("document_changed",{id:next.id,content});
+    void delivery.then(()=>setEditError(''),error=>setEditError(String(error)));
   }, []);
   if (!state) return <div className="reader-loading" role="status"><span className="expressive-loading-shape" aria-hidden="true"/>Opening your workspace</div>;
   return <DocumentAppearance.Provider value={documentAppearance}><div className={`android-document mode-${state.mode}`}>
+    {pdfExport&&<div className="reader-export-backdrop"><section className="reader-export-progress" role="dialog" aria-modal="true" aria-label="Exporting PDF" onKeyDown={event=>{if(event.key==='Escape'){event.preventDefault();event.stopPropagation();void cancelPdfExport();}}}>
+      <h2>Exporting PDF</h2>
+      <p role="status">{pdfExport.cancelRequested?'Cancelling export…':pdfExport.phase==='preparing'?'Preparing text, diagrams and images':pdfExport.phase==='typesetting'?'Typesetting your document':'Saving to destination'}</p>
+      {pdfExport.phase==='preparing'&&pdfExport.total>0?<progress max={pdfExport.total} value={pdfExport.completed}/>:<progress aria-label="Export in progress"/>}
+      <p className="reader-export-detail">{pdfExport.phase==='publishing'?'Finishing the destination write safely.':pdfExport.phase==='preparing'&&pdfExport.total>0?`${pdfExport.completed} of ${pdfExport.total} preparation steps`:'Your original note is unchanged.'}</p>
+      {pdfExport.phase!=='publishing'&&<button type="button" autoFocus disabled={pdfExport.cancelRequested} onClick={()=>void cancelPdfExport()}>Cancel export</button>}
+    </section></div>}
+    {editError&&<div role="alert" className="reader-edit-error">{editError}</div>}
     <MediaThemeFilters colors={state.colors} dark={state.dark}/>
     {searching && <ReadingSearch content={state.content} close={()=>setSearching(false)} onChange={update} sourceSession={state.mode==="editor"||state.mode==="split"?state.id:undefined}/>}
     <ImageViewer />
     {repairing && <MathRepairPanel content={state.content} apply={update} close={()=>setRepairing(false)} />}
     <MediaTools key={state.id} documentId={state.id} content={state.content} documentPath={state.path} onInsert={(text, point) => { const content = reference.current!.content; const from = Math.min(point?.from ?? content.length, content.length); const to = Math.max(from, Math.min(point?.to ?? from, content.length)); update(content.slice(0, from) + text + content.slice(to)); }} onNotice={(error) => { void invoke("export_failed", { error }); }} />
     {(state.mode === "editor" || state.mode === "split") && <section className="android-source"><SourceEditor key={state.id} sessionId={state.id} value={state.content} onChange={update} dark={state.dark} focusMode={state.fullscreen} spellCheck={state.spellCheck} grammarCheck={state.grammarCheck} /></section>}
-    {state.mode === "live" && <section className="android-reading"><div className="reader-chrome-spacer" aria-hidden="true"/><div className="document-page-space"><div className="document-page"><LiveDocument key={state.id} spellCheck={state.spellCheck} grammarCheck={state.grammarCheck} markdown={state.content} onChange={update} documentPath={state.path} python={state.python || "embedded"} dark={false} trustedImageHosts={trustedHosts} onTrustImageHost={trustHost} /></div></div></section>}
-    {(state.mode === "reader" || state.mode === "split") && <section className="android-reading"><div className="reader-chrome-spacer" aria-hidden="true"/><div className="document-page-space"><div className="document-page"><DocumentPreview markdown={state.content} onChange={update} documentPath={state.path} python={state.python || "embedded"} dark={false} trustedImageHosts={trustedHosts} onTrustImageHost={trustHost} /></div></div></section>}
+    {state.mode === "live" && <section className="android-reading" data-full-document-accessibility={state.fullDocumentAccessibility ? "true" : undefined}><div className="reader-chrome-spacer" aria-hidden="true"/><div className="document-page-space"><div className="document-page"><LiveDocument key={state.id} spellCheck={state.spellCheck} grammarCheck={state.grammarCheck} markdown={state.content} onChange={update} documentPath={state.path} python={state.python || "embedded"} dark={false} trustedImageHosts={trustedHosts} onTrustImageHost={trustHost} fullDocumentAccessibility={state.fullDocumentAccessibility} /></div></div></section>}
+    {(state.mode === "reader" || state.mode === "split") && <section className="android-reading" data-full-document-accessibility={state.fullDocumentAccessibility ? "true" : undefined}><div className="reader-chrome-spacer" aria-hidden="true"/><div className="document-page-space"><div className="document-page"><DocumentPreview markdown={state.content} onChange={update} documentPath={state.path} python={state.python || "embedded"} dark={false} trustedImageHosts={trustedHosts} onTrustImageHost={trustHost} fullDocumentAccessibility={state.fullDocumentAccessibility} /></div></div></section>}
   </div></DocumentAppearance.Provider>;
 }
 createRoot(document.getElementById("root")!).render(<Reader />);

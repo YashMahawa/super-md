@@ -558,7 +558,7 @@ export default function App() {
     try {
       const output = exportFormat === "fmd"
         ? await invoke<string | null>("export_fmd", await prepareFmd(content, path))
-        : await invoke<string | null>("export_portable_pdf", { path, ...await preparePdf(content, path), options: exportOptions });
+        : await invoke<string | null>("export_portable_pdf", { path, ...await preparePdf(content, path, python || "embedded"), options: exportOptions });
       if (output) { flash(`Exported ${output}`); setShowExport(false); }
     } catch (error) { setExportError(String(error)); }
     finally { setExporting(false); }

@@ -8,11 +8,12 @@ import {linter,type Diagnostic} from "@codemirror/lint";
 import {checkWriting,type WritingOptions} from "../proofreading";
 import { search, searchKeymap, highlightSelectionMatches, openSearchPanel, SearchQuery, setSearchQuery } from "@codemirror/search";
 import { oneDarkHighlightStyle } from "@codemirror/theme-one-dark";
+import type {SourceChange} from '../readerEdits';
 
 interface Props extends WritingOptions {
   sessionId?: string;
   value: string;
-  onChange: (value: string) => void;
+  onChange: (value: string, changes?:SourceChange[]) => void;
   dark: boolean;
   focusMode: boolean;
 }
@@ -28,7 +29,7 @@ function trimEditorSessions() {
     callbacks.delete(id); statusHandlers.delete(id);
   }
 }
-const callbacks = new Map<string, (value: string) => void>();
+const callbacks = new Map<string, (value: string,changes?:SourceChange[]) => void>();
 const statusHandlers = new Map<string, (state: EditorState) => void>();
 const visibleEditors = new Map<string, EditorView>();
 export function editorReadingOffset(id:string):number|undefined {
@@ -132,7 +133,11 @@ export default function Editor({ sessionId = "default", value, onChange, dark, f
         wrapping.current.of(EditorView.lineWrapping),
         proofing.current.of(writingExtension()),
         EditorView.updateListener.of((update) => {
-          if (update.docChanged) callbacks.get(sessionId)?.(update.state.doc.toString());
+          if (update.docChanged) {
+            const changes:SourceChange[]=[];
+            update.changes.iterChanges((from,to,_fromB,_toB,insert)=>changes.push({from,to,insert:insert.toString()}));
+            callbacks.get(sessionId)?.(update.state.doc.toString(),changes);
+          }
           if (update.docChanged || update.selectionSet) statusHandlers.get(sessionId)?.(update.state);
         }),
         appearance.current.of(editorTheme())

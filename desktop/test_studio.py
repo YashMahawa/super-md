@@ -15,6 +15,23 @@ class QuietStudio(Studio):
         self.system_dark = True
 
 class StudioTest(unittest.TestCase):
+    def test_reader_patches_commit_in_order_and_reject_external_changes(self):
+        studio=self.studio;note=studio._current();note['content']='a😀z'
+        replies=[]
+        studio.replied.connect(lambda identifier,value,error:replies.append((identifier,json.loads(value),error)))
+        base={'id':note['id'],'epoch':'new-renderer'}
+        studio.post('sync','document_sync',json.dumps({**base,'revision':0,'content':note['content']}))
+        patch={**base,'baseRevision':0,'revision':1,'changes':[{'from':1,'to':3,'insert':'!'}]}
+        studio.post('edit','document_patch',json.dumps(patch))
+        self.assertEqual(note['content'],'a!z')
+        self.assertTrue(replies[-1][1]['accepted'])
+        studio.post('duplicate','document_patch',json.dumps(patch))
+        self.assertTrue(replies[-1][1]['accepted'])
+        note['content']='external'
+        studio.post('stale','document_patch',json.dumps({**patch,'baseRevision':1,'revision':2}))
+        self.assertFalse(replies[-1][1]['accepted'])
+        self.assertEqual(note['content'],'external')
+
     def test_repeated_update_checks_keep_verified_installer_and_skip_redownload(self):
         studio=self.studio;info={'version':'9.9.9'};studio.update_info=info;studio.update_path='/verified/installer'
         calls=[]
@@ -159,6 +176,21 @@ class StudioTest(unittest.TestCase):
         self.assertFalse(payload["centerLock"]);self.assertTrue(payload["contentUnchanged"])
         studio.setting("centerLock",'"invalid"');self.assertFalse(studio.settings["centerLock"])
 
+    def test_full_document_accessibility_is_opt_in_persisted_and_sent_to_reader(self):
+        studio=self.studio;messages=[];studio.readerLoad.connect(messages.append)
+        studio.post("ready","reader_ready","{}")
+        self.assertFalse(json.loads(messages[-1])["fullDocumentAccessibility"])
+        studio.setting("fullDocumentAccessibility","true")
+        payload=json.loads(messages[-1])
+        self.assertTrue(payload["fullDocumentAccessibility"])
+        self.assertTrue(payload["contentUnchanged"])
+        self.assertTrue(studio.settings["fullDocumentAccessibility"])
+        self.flush()
+        stored=json.loads((studio.data/"settings.json").read_text())
+        self.assertTrue(stored["settings"]["fullDocumentAccessibility"])
+        studio.setting("fullDocumentAccessibility",'"true"')
+        self.assertTrue(studio.settings["fullDocumentAccessibility"])
+
     def test_palette_loads_do_not_reserialize_the_note_and_ready_resets_the_cache(self):
         studio=self.studio;messages=[];studio.readerLoad.connect(messages.append)
         studio._current()["content"]="A big note. "*20000
@@ -247,6 +279,7 @@ class StudioTest(unittest.TestCase):
         self.assertEqual(tab["name"],"after.md");self.assertEqual(studio.recent[0],str(new));self.assertIn(str(new),studio.pinnedRecent)
         studio.tabs=[tab];tab["content"]="# Unsaved edit";new.unlink()
         studio._location_changed(str(new),"")
+        self._wait_for(lambda:studio._current()["name"]=="Untitled.md")
         self.assertEqual(studio._current()["name"],"Untitled.md")
         self.assertNotIn(str(new),studio.recent);self.assertNotIn(str(new),studio.pinnedRecent)
         self.flush()
@@ -518,9 +551,54 @@ class StudioTest(unittest.TestCase):
         self.studio.cycleTab(-1);self.assertEqual(self.studio.active,third)
         self.studio.tabNumber(2);self.assertEqual(self.studio.active,second)
         self.studio.tabNumber(9);self.assertEqual(self.studio.active,third)
-        self.studio.closeTab(third);self.studio.reopenTab()
+        self.studio.closeTab(third)
+        self._wait_for(lambda: all(tab["id"]!=third for tab in self.studio.tabs))
+        self.studio.reopenTab()
+        self._wait_for(lambda: self.studio.active==third)
         self.assertEqual(self.studio.active,third)
         self.assertEqual(self.studio._current()["content"],"Keep this")
+
+    def _wait_for(self,predicate,timeout=5):
+        deadline=time.monotonic()+timeout
+        while not predicate() and time.monotonic()<deadline:
+            self.app.processEvents();time.sleep(.005)
+        self.assertTrue(predicate(),"condition did not complete")
+
+    def test_close_persists_dirty_baseline_assets_and_reopen_restores_full_note(self):
+        note=self.studio._current()
+        note.update(name="Portable.smd",content="new draft",saved="old saved text",
+                    assets={"assets/a.svg":"data:image/svg+xml;base64,PHN2Zy8+"},portable=True)
+        note_id=note["id"]
+        self.studio.closeTab(note_id)
+        self.studio.resolveClose("discard")
+        self.assertEqual(note["saved"],"old saved text")
+        self._wait_for(lambda: all(tab["id"]!=note_id for tab in self.studio.tabs))
+        reference=self.studio.closed_tabs[-1]
+        self.assertEqual(reference["content"],"")
+        self.studio.reopenTab()
+        self._wait_for(lambda: self.studio.active==note_id)
+        restored=self.studio._current()
+        self.assertEqual(restored["content"],"new draft")
+        self.assertEqual(restored["saved"],"old saved text")
+        self.assertEqual(restored["assets"],note["assets"])
+        self.assertTrue(restored["portable"])
+
+    def test_close_aborts_when_note_changes_during_background_snapshot(self):
+        import threading
+        note=self.studio._current();note.update(content="captured",saved="captured")
+        note_id=note["id"];started=threading.Event();release=threading.Event()
+        store=self.session.closed_note_store;real_save=store.save
+        def blocked(value):
+            started.set();release.wait(3);return real_save(value)
+        with patch.object(store,"save",side_effect=blocked):
+            self.studio.closeTab(note_id)
+            self.assertTrue(started.wait(2))
+            note["content"]="latest reader text"
+            release.set()
+            self._wait_for(lambda: note_id not in self.studio._closing_tabs)
+        self.assertIn(note,self.studio.tabs)
+        self.assertEqual(note["content"],"latest reader text")
+        self.assertEqual(self.studio.closed_tabs,[])
 
     def test_outline_names_untitled_notes_and_sets_export_filename(self):
         self.studio.newNote()

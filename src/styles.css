@@ -222,6 +222,10 @@ md-filled-button.primary-action, smd-expressive-button.primary-action { display:
 .image-viewer footer label { display: flex; align-items: center; gap: 12px; }
 .live-document { width: min(var(--reader-width), calc(100% - 64px)); margin: 0 auto; padding: 42px 0 28vh; }
 .live-block { position: relative; min-height: 25px; border-radius: 12px; }
+.live-document > .markdown-body { width:100%; max-width:none; margin:0; padding:0; }
+.live-block { display:flow-root; }
+.live-block > :first-child { margin-top:0; }
+.live-block > :last-child { margin-bottom:.85em; }
 .live-block .markdown-body { width: 100%; padding: 0; font-size: calc(var(--reader-size) * var(--workspace-scale, 1)); }
 .live-block .markdown-body > :first-child { margin-top: 0; }
 .live-block .markdown-body > :last-child { margin-bottom: .85em; }

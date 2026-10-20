@@ -13,7 +13,7 @@ it("has no edit icons; single clicks select and double clicks edit, not links", 
   act(() => host.querySelector("h1")!.dispatchEvent(new MouseEvent("click", { bubbles: true })));
   expect(host.querySelector("textarea")).toBeNull();
   act(() => host.querySelector("h1")!.dispatchEvent(new MouseEvent("dblclick", { bubbles: true })));
-  expect(host.querySelector("textarea")?.value).toContain("# Clear notes");
+  expect(host.querySelector("textarea")?.value).toBe("# Clear notes");
   act(()=>host.querySelector("textarea")!.dispatchEvent(new KeyboardEvent("keydown",{key:"Escape",bubbles:true,cancelable:true})));
   expect(host.querySelector("textarea")).toBeNull();
   act(() => root.unmount()); host.remove();

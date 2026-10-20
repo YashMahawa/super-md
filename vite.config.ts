@@ -2,7 +2,15 @@ import { defineConfig } from "vite";
 import react from "@vitejs/plugin-react";
 import {fileURLToPath} from "node:url";
 
-export default defineConfig({
+export const nativeReaderEntries = { reader: "android-reader.html", qtReader: "qt-reader.html" } as const;
+
+export function buildHtmlEntries(mode: string) {
+  return mode === "native"
+    ? nativeReaderEntries
+    : { app: "index.html", ...nativeReaderEntries };
+}
+
+export default defineConfig(({mode}) => ({
   base: "./",
   plugins: [react()],
   // These imports are reached only through the lazy writing worker. Discover
@@ -15,5 +23,5 @@ export default defineConfig({
   clearScreen: false,
   server: { port: 1420, strictPort: true },
   envPrefix: ["VITE_", "TAURI_"]
-  ,build: { rollupOptions: { input: { app: "index.html", reader: "android-reader.html", qtReader: "qt-reader.html" } } }
-});
+  ,build: { rollupOptions: { input: buildHtmlEntries(mode) } }
+}));

@@ -24,7 +24,9 @@ from PySide6.QtWidgets import QApplication
 from PySide6.QtQml import QQmlApplicationEngine
 from PySide6.QtQuickControls2 import QQuickStyle
 from PySide6.QtWebEngineQuick import QtWebEngineQuick
+from PySide6.QtWebEngineCore import QWebEngineProfile, QWebEngineUrlScheme
 from studio import Session, Studio, ROOT
+from reader_assets import ReaderAssetSchemeHandler, SCHEME
 from instance import InstanceBroker
 from reader_gestures import ReaderGestures
 import native_frame
@@ -85,6 +87,13 @@ def main():
         if flag not in flags:
             flags += " " + flag
     os.environ["QTWEBENGINE_CHROMIUM_FLAGS"] = flags.strip()
+    # The reader image scheme is deliberately not a local-file access scheme;
+    # it serves only opaque, per-open-note raster capabilities.
+    scheme = QWebEngineUrlScheme(SCHEME.encode("ascii"))
+    scheme.setSyntax(QWebEngineUrlScheme.Syntax.Host)
+    scheme.setFlags(QWebEngineUrlScheme.Flag.SecureScheme | QWebEngineUrlScheme.Flag.CorsEnabled |
+                    QWebEngineUrlScheme.Flag.LocalScheme)
+    QWebEngineUrlScheme.registerScheme(scheme)
     QtWebEngineQuick.initialize()
     QGuiApplication.setApplicationName("super-md-qt" if args.test_state else "super-md")
     QGuiApplication.setOrganizationName("SuperMD")
@@ -103,6 +112,8 @@ def main():
     channel_script = bytes(channel.readAll()).decode()
     engines, studios = [], []
     session = Session(args.test_state)
+    asset_handler = ReaderAssetSchemeHandler(session.reader_assets, app)
+    QWebEngineProfile.defaultProfile().installUrlSchemeHandler(SCHEME.encode("ascii"), asset_handler)
     def detach_window(source_id, tab_id):
         source = session.windows.get(source_id)
         if not source or not source._can_move(): return
@@ -149,11 +160,18 @@ def main():
         # The user's laptop screen is preferred without changing active desktop focus.
         window = engine.rootObjects()[0]
         studio.host_window = window
-        reader = window.findChild(QObject, "documentReader")
-        if reader is not None:
-            # Filter this window only, never the application's global QObject
-            # stream (PySide wrapper creation can recursively generate events).
-            studio.reader_gestures = ReaderGestures(window, reader, studio.readerCall.emit)
+        def attach_reader_gestures(reader):
+            previous = getattr(studio, "reader_gestures", None)
+            if previous is not None:
+                window.removeEventFilter(previous)
+                previous.deleteLater()
+                studio.reader_gestures = None
+            if reader is not None:
+                # Filter this window only, never the application's global QObject
+                # stream (PySide wrapper creation can recursively generate events).
+                studio.reader_gestures = ReaderGestures(window, reader, studio.readerCall.emit)
+        window.readerViewChanged.connect(attach_reader_gestures)
+        attach_reader_gestures(window.findChild(QObject, "documentReader"))
         def retire_window():
             if not window.isVisible() and not studio.retired:
                 studio.stop()

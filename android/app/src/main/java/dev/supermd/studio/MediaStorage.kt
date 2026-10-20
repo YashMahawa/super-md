@@ -59,10 +59,38 @@ class MediaStorage(private val context: Context) {
     }
     fun local(source: String, directory: String?): File? {
         if (!validKey(source)) return null
-        if (directory != null && Regex("[a-f0-9-]{36}").matches(directory)) File(bundles, "$directory/${source.substringAfter('/')}").takeIf { it.isFile }?.let { return it }
-        if (source.startsWith("assets/import-")) return File(attachments, source.substringAfter('/')).takeIf { it.isFile }
+        if (directory != null && Regex("[a-f0-9-]{36}").matches(directory)) containedFile(bundles, File(bundles, "$directory/${source.substringAfter('/')}")).let { if (it != null) return it }
+        if (source.startsWith("assets/import-")) return containedFile(attachments, File(attachments, source.substringAfter('/')))
         return null
     }
+
+    internal fun readerAsset(file: File): ReaderAssetSource {
+        val canonical = file.canonicalFile
+        require(canonical.isFile) { "Image not found" }
+        require(canonical.length() <= BoundedAssetInputStream.MAX_READER_ASSET_BYTES) { "Image exceeds 25 MB" }
+        val mime = imageMime(canonical.name, null)
+        val open = { canonical.inputStream() }
+        return ReaderAssetSource(mime, readerAssetFingerprint(canonical.path, canonical.length(), canonical.lastModified(), open), canonical.length(), open)
+    }
+
+    internal fun imageMime(name: String, providerMime: String?): String {
+        val supported = setOf("image/png", "image/jpeg", "image/gif", "image/webp", "image/avif", "image/svg+xml")
+        val normalized = providerMime?.substringBefore(';')?.lowercase()
+        if (normalized != null && normalized.startsWith("image/")) {
+            require(normalized in supported) { "Unsupported image type" }
+            return normalized
+        }
+        return mime(name)
+    }
+
+    private fun containedFile(root: File, candidate: File): File? = runCatching {
+        val expectedRoot = context.filesDir.canonicalFile.toPath().resolve(root.name).normalize()
+        val rootPath = root.absoluteFile.toPath().normalize()
+        val target = candidate.canonicalFile
+        if (rootPath != expectedRoot || root.canonicalFile.toPath().normalize() != expectedRoot) return@runCatching null
+        val canonicalRoot = root.canonicalPath + File.separator
+        target.takeIf { it.isFile && it.canonicalPath.startsWith(canonicalRoot) }
+    }.getOrNull()
     data class Opened(val markdown: String, val directory: String)
     fun openFmd(input: InputStream): Opened {
         val directory = UUID.randomUUID().toString(); val root = File(bundles, directory).apply { mkdirs() }

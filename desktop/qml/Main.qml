@@ -8,6 +8,7 @@ import QtWebChannel
 
 ApplicationWindow {
     id: window
+    signal readerViewChanged(var readerView)
     width: 1320
     height: 880
     minimumWidth: 760
@@ -16,12 +17,19 @@ ApplicationWindow {
     flags: windowModes.immersive ? Qt.Window | Qt.FramelessWindowHint : Qt.platform.os === "osx" || Qt.platform.os === "windows" ? Qt.Window | Qt.ExpandedClientAreaHint | Qt.NoTitleBarBackgroundHint : Qt.Window
     title: viewState.name + " - Super MD"
     property var viewState: JSON.parse(studio.snapshot)
+    property var reader: readerLoader.item
     property bool sidebar: true
     property bool settingsOpen: false
     property int contextMenuCount: 0
     property int modalDialogCount: 0
     onSettingsOpenChanged: settingsOpen ? settingsDialog.open() : settingsDialog.close()
     property bool closingAllowed: false
+    property bool intentionalShutdown: false
+    property bool readerRecoveryPending: false
+    property bool readerRecoveryLoading: false
+    property bool readerRecoveryExhausted: false
+    property int readerRetryCount: 0
+    property string readerRecoveryMessage: ""
     property string outputFormat: "pdf"
     property bool sharing: false
     property string sidebarSection: "folder"
@@ -35,7 +43,39 @@ ApplicationWindow {
         host: window
         onFullscreenChanged: { window.chromeAwake = !fullscreen; chromeIdle.stop(); studio.setFullscreen(fullscreen) }
     }
-    function runDocumentScript(script) { reader.runJavaScript(script) }
+    function runDocumentScript(script, callback) {
+        if (!reader) return
+        if (callback) reader.runJavaScript(script, callback)
+        else reader.runJavaScript(script)
+    }
+    function focusReader() { if (reader) reader.forceActiveFocus() }
+    function scheduleReaderRemount(delay) {
+        readerRecoveryPending = true
+        readerRetryTimer.interval = delay
+        readerRetryTimer.restart()
+    }
+    function handleReaderCrash(terminationStatus) {
+        if (intentionalShutdown || closingAllowed || studio.retired || readerRecoveryPending || terminationStatus === WebEngineView.NormalTerminationStatus) return
+        console.warn("Qt reader recovery: renderer terminated", terminationStatus)
+        studio.readerCrashed()
+        const retryDelays = [500, 1500, 4000]
+        if (readerRetryCount >= retryDelays.length) {
+            readerRecoveryPending = false
+            readerRecoveryExhausted = true
+            readerRecoveryMessage = "The document reader stopped repeatedly. Your last received changes are preserved. Retry when ready."
+            return
+        }
+        readerRecoveryMessage = "The document reader stopped unexpectedly. Reopening it…"
+        scheduleReaderRemount(retryDelays[readerRetryCount])
+        readerRetryCount += 1
+    }
+    function retryReaderManually() {
+        if (intentionalShutdown || closingAllowed || studio.retired || readerRecoveryPending) return
+        readerRetryCount = 0
+        readerRecoveryExhausted = false
+        readerRecoveryMessage = "Reopening the document reader…"
+        scheduleReaderRemount(0)
+    }
     function showExport(share) { sharing = share; exportDialog.open() }
     function hideExport() { exportDialog.close() }
     Material.theme: viewState.dark ? Material.Dark : Material.Light
@@ -47,12 +87,12 @@ ApplicationWindow {
     font.family: "Noto Sans"
     onClosing: function(close) {
         if (!windowModes.fullscreen) studio.rememberWindow(visibility === Window.Maximized ? viewState.settings.window.width : width, visibility === Window.Maximized ? viewState.settings.window.height : height, visibility === Window.Maximized)
-        close.accepted = closingAllowed; if (!closingAllowed) studio.closeWindowSafely()
+        close.accepted = closingAllowed; if (closingAllowed) intentionalShutdown = true; else studio.closeWindowSafely()
     }
 
     Connections {
         target: studio
-        function onAllowClose() { flushDialog.close(); closeDialog.close(); closingAllowed = true; window.close() }
+        function onAllowClose() { flushDialog.close(); closeDialog.close(); intentionalShutdown = true; closingAllowed = true; window.close() }
         function onFlushFailed(canClose) { if(!closingAllowed && !closeDialog.visible) { flushDialog.canClose = canClose; flushDialog.open() } }
         function onCloseRequested(name) { flushDialog.close(); closeDialog.title = "Save changes to " + name + "?"; if(!closeDialog.visible) closeDialog.open() }
         function onSaveRequested(name) { saveDialog.selectedFile = studio.defaultSaveLocation(name); saveDialog.open() }
@@ -62,9 +102,51 @@ ApplicationWindow {
         function onFontPickerRequested() { fontDialog.open() }
         function onThemePickerRequested() { themeDialog.open() }
         function onThemeExportRequested() { themeExportDialog.open() }
-        function onReaderLoad(payload) { const state = JSON.parse(payload); reader.runJavaScript("window.supermdLoad?.(" + payload + ");window.supermdChromeInset?.(" + (state.fullscreen ? 56 : 0) + ")") }
-        function onReaderCall(script) { reader.runJavaScript(script) }
-        function onChromeRequested(action) { window.chromeAwake = action === "toggle" ? !window.chromeAwake : action === "show"; if(window.chromeAwake) chromeIdle.restart(); else { chromeIdle.stop(); reader.forceActiveFocus() } }
+        function onReaderLoad(payload) {
+            const script = "(function(){if(!window.supermdLoad)return false;window.supermdLoad(" + payload + ");window.supermdChromeInset?.(" + (studio.readerFullscreen ? 56 : 0) + ");return true})()"
+            window.runDocumentScript(script)
+        }
+        function onReaderCall(script) { window.runDocumentScript(script) }
+        function onChromeRequested(action) { window.chromeAwake = action === "toggle" ? !window.chromeAwake : action === "show"; if(window.chromeAwake) chromeIdle.restart(); else { chromeIdle.stop(); window.focusReader() } }
+    }
+    onViewStateChanged: {
+        if (!viewState.readerReady) readerStableTimer.stop()
+        else if (!readerStableTimer.running && (readerRetryCount > 0 || readerRecoveryLoading)) readerStableTimer.start()
+    }
+    Timer {
+        id: readerRetryTimer
+        interval: 500
+        repeat: false
+        onTriggered: {
+            readerRecoveryPending = false
+            if (!window.intentionalShutdown && !window.closingAllowed && !studio.retired && reader) {
+                console.warn("Qt reader recovery: recreating view", window.readerRetryCount)
+                window.readerRecoveryLoading = true
+                readerLoader.active = false
+                readerRecoveryRestoreTimer.start()
+            }
+        }
+    }
+    Timer {
+        id: readerRecoveryRestoreTimer
+        interval: 120
+        repeat: false
+        onTriggered: {
+            if (!window.intentionalShutdown && !window.closingAllowed && !studio.retired && readerLoader) {
+                readerLoader.active = true
+            }
+        }
+    }
+    Timer {
+        id: readerStableTimer
+        interval: 15000
+        repeat: false
+        onTriggered: if (viewState.readerReady) {
+            window.readerRecoveryLoading = false
+            readerRetryCount = 0
+            readerRecoveryExhausted = false
+            readerRecoveryMessage = ""
+        }
     }
     Shortcut { sequences: [StandardKey.New]; onActivated: studio.command("window") }
     FileDialog { id:fontDialog;title:"Import a font";fileMode:FileDialog.OpenFile;nameFilters:["Fonts (*.ttf *.otf)"];onAccepted:studio.importFont(selectedFile.toString()) }
@@ -85,12 +167,12 @@ ApplicationWindow {
     Shortcut { sequences: ["Ctrl+Shift+W","Meta+Shift+W"]; onActivated: studio.closeWindowSafely() }
     Shortcut { sequence: "Ctrl+,"; onActivated: settingsOpen = !settingsOpen }
     Shortcut { sequence: "F11"; onActivated: windowModes.setFullscreen(!windowModes.fullscreen) }
-    Shortcut { sequence: "Escape"; enabled: !modalDialogCount && !contentsPopup.visible; onActivated: reader.runJavaScript("window.supermdDismiss?.() || false", function(dismissed) { if (!dismissed && windowModes.fullscreen) windowModes.setFullscreen(false) }) }
+    Shortcut { sequence: "Escape"; enabled: !modalDialogCount && !contentsPopup.visible; onActivated: window.runDocumentScript("window.supermdDismiss?.() || false", function(dismissed) { if (!dismissed && windowModes.fullscreen) windowModes.setFullscreen(false) }) }
     // Qt's chrome never scales. Keyboard/pinch zoom is routed to the content pane.
-    Shortcut { sequence: "Ctrl++"; onActivated: reader.runJavaScript("window.supermdZoomBy?.(1.1)") }
-    Shortcut { sequence: "Ctrl+="; onActivated: reader.runJavaScript("window.supermdZoomBy?.(1.1)") }
-    Shortcut { sequence: "Ctrl+-"; onActivated: reader.runJavaScript("window.supermdZoomBy?.(1/1.1)") }
-    Shortcut { sequence: "Ctrl+0"; onActivated: reader.runJavaScript("window.supermdResetZoom?.()") }
+    Shortcut { sequence: "Ctrl++"; onActivated: window.runDocumentScript("window.supermdZoomBy?.(1.1)") }
+    Shortcut { sequence: "Ctrl+="; onActivated: window.runDocumentScript("window.supermdZoomBy?.(1.1)") }
+    Shortcut { sequence: "Ctrl+-"; onActivated: window.runDocumentScript("window.supermdZoomBy?.(1/1.1)") }
+    Shortcut { sequence: "Ctrl+0"; onActivated: window.runDocumentScript("window.supermdResetZoom?.()") }
 
     header: Column {
         visible: !viewState.fullscreen && !viewState.imageOverlay && viewState.settings.welcomed
@@ -231,11 +313,20 @@ ApplicationWindow {
                     ActionButton { objectName: "centerLockButton"; glyph: viewState.settings.centerLock ? "Lock" : "LockOpen"; compact: true; tonal: viewState.settings.centerLock; ToolTip.text: viewState.settings.centerLock ? "Centre locked · click to allow horizontal movement" : "Lock document to centre"; onClicked: studio.setting("centerLock",JSON.stringify(!viewState.settings.centerLock)) }
                     }
                 }
-                WebEngineView {
-                    id: reader
-                    objectName: "documentReader"
+                Loader {
+                    id: readerLoader
+                    objectName: "documentReaderLoader"
                     Layout.fillWidth: true
                     Layout.fillHeight: true
+                    active: true
+                    sourceComponent: readerComponent
+                    onItemChanged: window.readerViewChanged(item)
+                }
+                Component {
+                    id: readerComponent
+                    WebEngineView {
+                    objectName: "documentReader"
+                    anchors.fill: parent
                     backgroundColor: window.color
                     webChannel: WebChannel { id: documentChannel; Component.onCompleted: registerObject("studio", studio) }
                     settings.localContentCanAccessRemoteUrls: false
@@ -269,6 +360,11 @@ ApplicationWindow {
                         userScripts.insert(script)
                         url = readerUrl
                     }
+                    onRenderProcessTerminated: function(terminationStatus, exitCode) {
+                        // Do not log renderer diagnostics or document data.
+                        console.warn("Qt reader recovery: renderer terminated", terminationStatus, exitCode)
+                        window.handleReaderCrash(terminationStatus)
+                    }
                     onZoomFactorChanged: {
                         if (Math.abs(zoomFactor - 1) > .001) {
                             const factor = zoomFactor
@@ -277,10 +373,12 @@ ApplicationWindow {
                         }
                     }
                     onNavigationRequested: function(request) {
+                        if (window.readerRecoveryLoading && request.url.toString() === "about:blank") return
                         if (request.url.toString().split("#")[0] !== readerUrl.toString()) {
                             request.reject()
                             if (request.url.toString().startsWith("https://") || request.url.toString().startsWith("http://")) Qt.openUrlExternally(request.url)
                         }
+                    }
                     }
                 }
             }
@@ -305,8 +403,9 @@ ApplicationWindow {
                 color: viewState.colors.surface
                 Column {
                     anchors.centerIn: parent; spacing: 16
-                    ExpressiveLoading { anchors.horizontalCenter: parent.horizontalCenter }
-                    Label { text: "Opening your workspace"; color: viewState.colors.muted }
+                    ExpressiveLoading { visible: !readerRecoveryExhausted; anchors.horizontalCenter: parent.horizontalCenter }
+                    Label { text: readerRecoveryMessage || "Opening your workspace"; color: viewState.colors.muted; wrapMode: Text.WordWrap; horizontalAlignment: Text.AlignHCenter; width: Math.min(460, window.width - 80) }
+                    ActionButton { visible: readerRecoveryExhausted; text: "Retry reader"; prominent: true; anchors.horizontalCenter: parent.horizontalCenter; onClicked: retryReaderManually() }
                 }
             }
         }
@@ -325,7 +424,7 @@ ApplicationWindow {
         ColumnLayout {
             anchors.fill: parent
             RowLayout { Label { text: "Contents"; font.pixelSize: 22; font.weight: Font.DemiBold; Layout.fillWidth: true } ActionButton { glyph: "X"; compact: true; ToolTip.text: "Close contents"; onClicked: contentsPopup.close() } }
-            OutlineList { Layout.fillWidth: true; Layout.fillHeight: true; entries: viewState.outline || []; noteId: viewState.active; onChosen: { contentsPopup.close(); window.chromeAwake = false; reader.forceActiveFocus() } }
+            OutlineList { Layout.fillWidth: true; Layout.fillHeight: true; entries: viewState.outline || []; noteId: viewState.active; onChosen: { contentsPopup.close(); window.chromeAwake = false; window.focusReader() } }
         }
     }
     AppDialog {

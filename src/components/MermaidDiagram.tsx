@@ -10,9 +10,10 @@ export default function MermaidDiagram({ source, dark, appearance, colors }: { s
   // inversion is not applied a second time to a dark Mermaid rendering.
   const renderDark=(!appearance||appearance==='original')&&dark;
   useEffect(() => {
-    let active = true;
-    const timer = window.setTimeout(() => { renderMermaid(source, renderDark).then((svg) => { if (active) { setRendered({svg,dark:renderDark}); setError(""); } }).catch((reason) => active && setError(String(reason))); }, canUsePele(source)?40:220);
-    return () => { active = false; window.clearTimeout(timer); };
+    let active=true;
+    const controller=new AbortController();
+    const timer = window.setTimeout(() => { renderMermaid(source, renderDark, controller.signal).then((svg) => { if(active){setRendered({svg,dark:renderDark}); setError("");} }).catch((reason) => {if(active&&!controller.signal.aborted)setError(String(reason));}); }, canUsePele(source)?40:220);
+    return () => { active=false;controller.abort();window.clearTimeout(timer); };
   }, [renderDark, source]);
   if (error) return <div className="render-error">Mermaid: {error}</div>;
   // Keep authored themeCSS inside an inert image. It must not style the app,

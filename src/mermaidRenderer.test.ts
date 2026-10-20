@@ -41,4 +41,31 @@ describe("isolated SVG diagrams", () => {
     expect(svg).toContain('data-diagram-engine="pele"');expect(svg).toContain('stroke="#e9e2e8"');expect(svg).not.toMatch(/var\(|<script/);
     expect(engine.render.mock.calls.length).toBe(calls);expect(document.body.children.length).toBe(0);
   });
+  it('cancels queued work before it starts and allows a later owner to render the same key',async()=>{
+    const source='sequenceDiagram\nAlice->>Bob: Cancel before start unique';
+    engine.render.mockResolvedValueOnce({svg:'<svg xmlns="http://www.w3.org/2000/svg"><text>Fresh owner</text></svg>'});
+    const calls=engine.render.mock.calls.length;
+    const controller=new AbortController();
+    const cancelled=renderMermaid(source,false,controller.signal);
+    controller.abort();
+    await expect(cancelled).rejects.toMatchObject({name:'AbortError'});
+    await expect(renderMermaid(source)).resolves.toContain('Fresh owner');
+    expect(engine.render.mock.calls.length).toBe(calls+1);
+  });
+  it('deduplicates active work while cancellation only releases one subscriber',async()=>{
+    const source='sequenceDiagram\nAlice->>Bob: Shared subscriber unique';
+    let finish!:(result:{svg:string})=>void;
+    engine.render.mockReturnValueOnce(new Promise(resolve=>{finish=resolve;}));
+    const calls=engine.render.mock.calls.length;
+    const controller=new AbortController();
+    const cancelled=renderMermaid(source,false,controller.signal);
+    const remaining=renderMermaid(source);
+    await vi.waitFor(()=>expect(engine.render.mock.calls.length).toBe(calls+1));
+    controller.abort();
+    await expect(cancelled).rejects.toMatchObject({name:'AbortError'});
+    finish({svg:'<svg xmlns="http://www.w3.org/2000/svg"><text>Shared result</text></svg>'});
+    await expect(remaining).resolves.toContain('Shared result');
+    expect(engine.render.mock.calls.length).toBe(calls+1);
+    expect(document.body.children.length).toBe(0);
+  });
 });

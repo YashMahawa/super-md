@@ -1,0 +1,4 @@
+<resources>
+    <item name="reader_bridge_tag" type="id" />
+    <item name="reader_destroyed_tag" type="id" />
+</resources>

@@ -14,6 +14,23 @@ let root: Root | null = null;
 afterEach(() => { if (root) { act(() => root?.unmount()); root = null; } document.body.innerHTML = ""; loadAsset.mockClear(); });
 
 describe("local image preview", () => {
+  it("keeps large notes windowed by default and mounts the complete semantic tree when opted in",async()=>{
+    class FakeIntersectionObserver { constructor(_callback:IntersectionObserverCallback){} observe(){} unobserve(){} disconnect(){} }
+    class FakeResizeObserver { constructor(_callback:ResizeObserverCallback){} observe(){} disconnect(){} }
+    vi.stubGlobal("IntersectionObserver",FakeIntersectionObserver);
+    vi.stubGlobal("ResizeObserver",FakeResizeObserver);
+    const host=document.createElement("div");document.body.append(host);root=createRoot(host);
+    const markdown=`## Chapter\n\n${"Full note content. ".repeat(4_300)}`;
+    await act(async()=>root?.render(<MarkdownPreview markdown={markdown} documentPath={null} python="" dark/>));
+    expect(host.querySelectorAll("[data-windowed-block]").length).toBeGreaterThan(0);
+    expect(host.querySelector(".windowed-md-block p")).toBeNull();
+    await act(async()=>root?.render(<MarkdownPreview markdown={markdown} documentPath={null} python="" dark fullDocumentAccessibility/>));
+    expect(host.querySelector("[data-windowed-block]")).toBeNull();
+    expect(host.querySelector(".windowed-md-block")).toBeNull();
+    expect(host.querySelector(".markdown-body p")?.textContent?.match(/Full note content\./g)).toHaveLength(4_300);
+  });
+
+
   it("toggles a task marker without changing frontmatter, code or neighboring source",async()=>{
     const host=document.createElement('div');document.body.append(host);root=createRoot(host);
     const markdown='---\ntitle: Tasks\n---\n# Tasks\n\n- [ ] Read $E=mc^2$ 😊\n- [x] Done\n\n```md\n- [ ] Literal example\n```';

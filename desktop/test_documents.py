@@ -53,6 +53,14 @@ class DocumentsTest(unittest.TestCase):
             with self.assertRaises(OSError):
                 atomic_write(path/"missing",b"bad")
             self.assertEqual(path.read_text(),"original")
+    def test_recovery_preserves_transient_utf16_surrogates_without_invalid_utf8(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path=Path(directory)/"recovery.json"
+            value={"content":"Draft 😀\ud800 unfinished"}
+            atomic_json(path,value)
+            self.assertEqual(json.loads(path.read_text(encoding="utf-8")),value)
+            self.assertIn(b"\\ud800",path.read_bytes())
+
     def test_markdown_conversion_keeps_images_without_overwriting_other_notes(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)

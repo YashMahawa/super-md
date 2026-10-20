@@ -8,6 +8,9 @@ declare global {
 }
 const pending = new Map<string, { resolve: (value: any) => void; reject: (error: Error) => void; timer: number }>();
 let sequence = 0;
+// A recreated renderer starts its counter at zero. A per-context nonce keeps
+// late replies from its predecessor from resolving unrelated new requests.
+const bridgeEpoch=globalThis.crypto?.randomUUID?.()??`${Date.now().toString(36)}-${Math.random().toString(36).slice(2)}`;
 if (typeof window !== "undefined") window.supermdReply = (id, value, error) => {
   const task = pending.get(id); if (!task) return;
   pending.delete(id); window.clearTimeout(task.timer);
@@ -16,7 +19,7 @@ if (typeof window !== "undefined") window.supermdReply = (id, value, error) => {
 export function invoke<T>(command: string, args: Record<string, unknown> = {}): Promise<T> {
   if (!window.SuperMD) return tauriInvoke<T>(command, args);
   return new Promise((resolve, reject) => {
-    const id = String(++sequence);
+    const id = `${bridgeEpoch}:${++sequence}`;
     const timeout = command === "export_pdf_native" ? 180_000 : command === "run_python" ? 120_000 : 60_000;
     const timer = window.setTimeout(() => { pending.delete(id); reject(new Error(`${command} timed out`)); }, timeout);
     pending.set(id, { resolve, reject, timer });
