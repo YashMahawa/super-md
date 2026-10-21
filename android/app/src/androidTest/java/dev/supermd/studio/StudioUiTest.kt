@@ -18,30 +18,40 @@ import java.util.concurrent.atomic.AtomicReference
 class StudioUiTest {
     @get:Rule val compose = createAndroidComposeRule<MainActivity>()
     private var temporaryNoteState: StudioState? = null
+    private var temporaryRestorePosition: Boolean? = null
     @After fun restoreTemporaryNoteAndRecovery() {
-        val before = temporaryNoteState ?: return
-        val model = androidx.lifecycle.ViewModelProvider(compose.activity)[StudioViewModel::class.java]
-        // The real app persists recovery between instrumentation methods. A
-        // temporary gesture/repair fixture must not replace the welcome note
-        // used by the existing end-to-end rendering/Python/PDF checks.
-        compose.runOnIdle {
-            model.edit(before.active.id, before.active.content)
-            model.mode(before.mode)
-            model.zoom(before.normalZoom)
-            model.centerLock(before.centerLock)
-            model.flush()
-            assertEquals(before.active.content, model.state.value.active.content)
-        }
-        val snapshot = java.io.File(compose.activity.filesDir,
-            if (model.workspaceKey == "main") "workspace.json" else "workspaces/${model.workspaceKey}.json")
-        compose.waitUntil(5000) {
-            runCatching {
-                val notes = org.json.JSONObject(snapshot.readText()).getJSONArray("tabs")
-                (0 until notes.length()).any { index ->
-                    val note = notes.getJSONObject(index)
-                    note.getString("id") == before.active.id && note.getString("content") == before.active.content
-                }
-            }.getOrDefault(false)
+        try {
+            val before = temporaryNoteState ?: return
+            val model = androidx.lifecycle.ViewModelProvider(compose.activity)[StudioViewModel::class.java]
+            // The real app persists recovery between instrumentation methods. A
+            // temporary gesture/repair fixture must not replace the welcome note
+            // used by the existing end-to-end rendering/Python/PDF checks.
+            compose.runOnIdle {
+                model.edit(before.active.id, before.active.content)
+                model.mode(before.mode)
+                model.zoom(before.normalZoom)
+                model.centerLock(before.centerLock)
+                model.flush()
+                assertEquals(before.active.content, model.state.value.active.content)
+            }
+            val snapshot = java.io.File(compose.activity.filesDir,
+                if (model.workspaceKey == "main") "workspace.json" else "workspaces/${model.workspaceKey}.json")
+            compose.waitUntil(5000) {
+                runCatching {
+                    val notes = org.json.JSONObject(snapshot.readText()).getJSONArray("tabs")
+                    (0 until notes.length()).any { index ->
+                        val note = notes.getJSONObject(index)
+                        note.getString("id") == before.active.id && note.getString("content") == before.active.content
+                    }
+                }.getOrDefault(false)
+            }
+        } finally {
+            temporaryRestorePosition?.let { previous ->
+                val model = androidx.lifecycle.ViewModelProvider(compose.activity)[StudioViewModel::class.java]
+                compose.runOnIdle { model.restorePosition(previous) }
+            }
+            temporaryRestorePosition = null
+            temporaryNoteState = null
         }
     }
     private fun web(view: View): WebView? = if (view is WebView) view else if (view is ViewGroup) (0 until view.childCount).firstNotNullOfOrNull { web(view.getChildAt(it)) } else null
@@ -215,6 +225,7 @@ class StudioUiTest {
         welcome()
         val model=androidx.lifecycle.ViewModelProvider(compose.activity)[StudioViewModel::class.java]
         temporaryNoteState=model.state.value
+        temporaryRestorePosition=model.state.value.restorePosition
         // This fixture deliberately pans to a left-edge checkbox at 180%.
         // Free horizontal navigation is an explicit user choice with the lock.
         compose.runOnIdle {model.centerLock(false)}
@@ -229,12 +240,24 @@ class StudioUiTest {
             println("TASK RECT RAW: $raw")
             return org.json.JSONObject(raw)
         }
-        compose.runOnIdle { model.edit(model.state.value.active.id, content) }
+        compose.runOnIdle { model.restorePosition(false); model.edit(model.state.value.active.id, content) }
         compose.waitUntil(15_000) { model.state.value.active.content == content }
-        javascriptUntil("document.querySelector('.android-reading')?.textContent.includes('Task section 42')") { it == "true" }
+        // Native edit replaces this same note id, so its prior position can
+        // otherwise leave the new fixture's first checkbox outside the
+        // virtualized reader window. Establish an explicit test-owned start
+        // position before requiring later headings to mount.
+        javascriptUntil("window.supermdNativeWheel?.(0,0,{x:-1,y:-1},false);const root=document.querySelector('.android-reading');if(root)root.scrollTop=0;true") {it=="true"}
+        // Offscreen virtualized blocks keep heading anchors but intentionally
+        // omit their rendered text. Confirm the fixture was parsed without
+        // requiring section 42 to mount before the test navigates to it.
+        javascriptUntil("document.querySelector('[data-heading-key][id=task-section-42]')!==null") { it == "true" }
         for(mode in listOf("reader","live"))for(zoom in listOf(100f,180f)) {
             compose.runOnIdle {model.mode(mode);model.zoom(zoom)}
-            compose.waitUntil(15_000) { model.state.value.active.content == content && model.state.value.mode == mode }
+            compose.waitUntil(15_000) {
+                model.state.value.active.content == content &&
+                    (model.state.value.mode == mode || model.state.value.message?.contains("reader could not confirm") == true)
+            }
+            assertEquals("Mode change must wait for the exact reader flush; native status: ${model.state.value.message}", mode, model.state.value.mode)
             // The bridge is asynchronous: an old Reader page may already have
             // the requested scale and heading while Live has not mounted yet.
             javascriptUntil("document.querySelector('.android-document.mode-$mode .android-reading')?.dataset.measured") {it=="\"true\""}
@@ -510,25 +533,42 @@ ax.set_title("Matplotlib 3D figure")
         val original = first.state.value.active.content
         compose.runOnIdle { first.edit(initial, "First window remains intact"); compose.activity.newWindow() }
         var other: MainActivity? = null
-        compose.waitUntil(10_000) {
-            androidx.test.platform.app.InstrumentationRegistry.getInstrumentation().runOnMainSync {
-                other = androidx.test.runner.lifecycle.ActivityLifecycleMonitorRegistry.getInstance().getActivitiesInStage(androidx.test.runner.lifecycle.Stage.RESUMED).filterIsInstance<MainActivity>().firstOrNull { it !== compose.activity }
+        try {
+            compose.waitUntil(10_000) {
+                androidx.test.platform.app.InstrumentationRegistry.getInstrumentation().runOnMainSync {
+                    other = androidx.test.runner.lifecycle.ActivityLifecycleMonitorRegistry.getInstance().getActivitiesInStage(androidx.test.runner.lifecycle.Stage.RESUMED).filterIsInstance<MainActivity>().firstOrNull { it !== compose.activity }
+                }
+                other != null
             }
-            other != null
+            val second = androidx.lifecycle.ViewModelProvider(other!!)[StudioViewModel::class.java]
+            assertNotEquals(compose.activity.taskId, other!!.taskId)
+            assertNotEquals(first.workspaceKey, second.workspaceKey)
+            androidx.test.platform.app.InstrumentationRegistry.getInstrumentation().runOnMainSync {
+                second.edit(second.state.value.active.id, "Second window draft")
+                first.flush(); second.flush()
+            }
+            val files = compose.activity.filesDir
+            val recovery = java.io.File(files, "workspaces/${second.workspaceKey}.json")
+            compose.waitUntil(5000) { recovery.isFile && recovery.readText().contains("Second window draft") && java.io.File(files, "workspace.json").readText().contains("First window remains intact") }
+            assertEquals("First window remains intact", first.state.value.active.content)
+            assertEquals("Second window draft", second.state.value.active.content)
+        } finally {
+            androidx.test.platform.app.InstrumentationRegistry.getInstrumentation().runOnMainSync {
+                first.edit(initial, original)
+                first.flush()
+                other?.let { if (!it.isFinishing && !it.isDestroyed) it.finishAndRemoveTask() }
+            }
+            val mainRecovery = java.io.File(compose.activity.filesDir, "workspace.json")
+            compose.waitUntil(5000) {
+                runCatching {
+                    val notes = org.json.JSONObject(mainRecovery.readText()).getJSONArray("tabs")
+                    (0 until notes.length()).any { index ->
+                        val note = notes.getJSONObject(index)
+                        note.getString("id") == initial && note.getString("content") == original
+                    }
+                }.getOrDefault(false)
+            }
         }
-        val second = androidx.lifecycle.ViewModelProvider(other!!)[StudioViewModel::class.java]
-        assertNotEquals(compose.activity.taskId, other!!.taskId)
-        assertNotEquals(first.workspaceKey, second.workspaceKey)
-        androidx.test.platform.app.InstrumentationRegistry.getInstrumentation().runOnMainSync {
-            second.edit(second.state.value.active.id, "Second window draft")
-            first.flush(); second.flush()
-        }
-        val files = compose.activity.filesDir
-        val recovery = java.io.File(files, "workspaces/${second.workspaceKey}.json")
-        compose.waitUntil(5000) { recovery.isFile && recovery.readText().contains("Second window draft") && java.io.File(files, "workspace.json").readText().contains("First window remains intact") }
-        assertEquals("First window remains intact", first.state.value.active.content)
-        assertEquals("Second window draft", second.state.value.active.content)
-        androidx.test.platform.app.InstrumentationRegistry.getInstrumentation().runOnMainSync { first.edit(initial, original); other!!.finishAndRemoveTask() }
     }
     @Test fun rendererExitRecreatesReaderFromNativeState() {
         welcome()
