@@ -84,7 +84,19 @@ ApplicationWindow {
         readerRecoveryMessage = "Reopening the document reader…"
         scheduleReaderRemount(0)
     }
-    function showExport(share) { sharing = share; exportDialog.open() }
+    function showExport(share) { sharing = share; outputFormat = "pdf"; exportDialog.open() }
+    function chooseExportDestination() {
+        // A fresh native chooser for every operation: some portal helpers keep
+        // the first selected URL/filter when a FileDialog instance is reused.
+        // Keep the format with the chooser, never in mutable options UI state.
+        const format = outputFormat
+        exportDialog.close()
+        const dialog = exportDestinationComponent.createObject(window, {
+            exportFormat: format,
+            selectedFile: studio.defaultExportLocation(format)
+        })
+        dialog.open()
+    }
     function hideExport() { exportDialog.close() }
     Material.theme: viewState.dark ? Material.Dark : Material.Light
     Material.primary: viewState.colors.primary
@@ -105,7 +117,7 @@ ApplicationWindow {
         function onCloseRequested(name) { flushDialog.close(); closeDialog.title = "Save changes to " + name + "?"; if(!closeDialog.visible) closeDialog.open() }
         function onSaveRequested(name) { saveDialog.selectedFile = studio.defaultSaveLocation(name); saveDialog.open() }
         function onNoteLocationPickerRequested() { noteFolderDialog.open() }
-        function onExportRequested(format) { outputFormat = format; exportDialog.open() }
+        function onExportRequested(format) { sharing = false; outputFormat = format; exportDialog.open() }
         function onFolderPickerRequested() { folderDialog.open() }
         function onFontPickerRequested() { fontDialog.open() }
         function onThemePickerRequested() { themeDialog.open() }
@@ -341,6 +353,21 @@ ApplicationWindow {
                     settings.localContentCanAccessFileUrls: true
                     settings.javascriptCanOpenWindows: false
                     settings.fullScreenSupportEnabled: false
+                    onContextMenuRequested: function(request) {
+                        request.accepted = true
+                        readerContextMenu.popup(request.position.x, request.position.y)
+                    }
+                    NoteContextMenu {
+                        id: readerContextMenu
+                        objectName: "readerContextMenu"
+                        MenuItem { text: "Undo"; visible: window.reader && window.reader.action(WebEngineView.Undo).enabled; onTriggered: window.reader.triggerWebAction(WebEngineView.Undo) }
+                        MenuItem { text: "Redo"; visible: window.reader && window.reader.action(WebEngineView.Redo).enabled; onTriggered: window.reader.triggerWebAction(WebEngineView.Redo) }
+                        MenuItem { text: "Cut"; visible: window.reader && window.reader.action(WebEngineView.Cut).enabled; onTriggered: window.reader.triggerWebAction(WebEngineView.Cut) }
+                        MenuItem { text: "Copy"; enabled: window.reader && window.reader.action(WebEngineView.Copy).enabled; onTriggered: window.reader.triggerWebAction(WebEngineView.Copy) }
+                        MenuItem { text: "Paste"; visible: window.reader && window.reader.action(WebEngineView.Paste).enabled; onTriggered: window.reader.triggerWebAction(WebEngineView.Paste) }
+                        MenuItem { text: "Copy link address"; visible: window.reader && window.reader.action(WebEngineView.CopyLinkToClipboard).enabled; onTriggered: window.reader.triggerWebAction(WebEngineView.CopyLinkToClipboard) }
+                        MenuItem { text: "Select all"; onTriggered: window.reader.triggerWebAction(WebEngineView.SelectAll) }
+                    }
                     WheelHandler {
                         target: null
                         acceptedDevices: PointerDevice.Mouse | PointerDevice.TouchPad
@@ -453,7 +480,19 @@ ApplicationWindow {
     FolderDialog { id: folderDialog; title: "Open folder"; onAccepted: studio.openFolder(selectedFolder.toString()) }
     FolderDialog { id: noteFolderDialog; title: "Default location for new notes"; onAccepted: studio.setNoteLocation(selectedFolder.toString()) }
     FileDialog { id: saveDialog; title: "Save note"; fileMode: FileDialog.SaveFile; nameFilters: viewState.portable ? ["Portable Super MD (*.smd)"] : ["Markdown (*.md)", "Portable Super MD (*.smd)"]; onAccepted: studio.saveAs(selectedFile.toString()); onRejected: studio.resolveClose("cancel") }
-    FileDialog { id: destination; title: "Export note"; fileMode: FileDialog.SaveFile; defaultSuffix: outputFormat === "pdf" ? "pdf" : outputFormat === "md" ? "md" : "smd"; nameFilters: outputFormat === "pdf" ? ["PDF (*.pdf)"] : outputFormat === "md" ? ["Markdown (*.md)"] : ["Portable Super MD (*.smd)"]; onAccepted: studio.exportTo(selectedFile.toString(), outputFormat) }
+    Component {
+        id: exportDestinationComponent
+        FileDialog {
+            property string exportFormat: "pdf"
+            objectName: "exportDestination"
+            title: "Export note"
+            fileMode: FileDialog.SaveFile
+            defaultSuffix: exportFormat
+            nameFilters: exportFormat === "pdf" ? ["PDF (*.pdf)"] : exportFormat === "md" ? ["Markdown (*.md)"] : ["Portable Super MD (*.smd)"]
+            onAccepted: { studio.exportTo(selectedFile.toString(), exportFormat); destroy() }
+            onRejected: destroy()
+        }
+    }
     AppDialog {
         id: exportDialog
         objectName: "exportDialog"
@@ -480,10 +519,9 @@ ApplicationWindow {
                     Label { visible: outputFormat !== "pdf"; Layout.fillWidth: true; wrapMode: Text.WordWrap; text: outputFormat === "md" ? "Editable Markdown text. Choose portable SMD to include images in one file." : "A portable .smd keeps the editable Markdown and images together. Source mode never shows embedded image bytes." }
                 }
             }
-            ActionButton { text: sharing ? "Prepare share copy" : "Choose destination"; prominent: true; Layout.fillWidth: true; onClicked: { exportDialog.close(); destination.selectedFile = studio.defaultExportLocation(outputFormat); destination.open() } }
+            ActionButton { text: sharing ? "Prepare share copy" : "Choose destination"; prominent: true; Layout.fillWidth: true; onClicked: window.chooseExportDestination() }
         }
         onOpened: {
-            outputFormat = "pdf"
             forceActiveFocus()
             Qt.callLater(() => exportScroll.contentItem.contentY = 0)
         }

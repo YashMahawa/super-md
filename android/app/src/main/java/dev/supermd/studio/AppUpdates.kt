@@ -24,7 +24,20 @@ import java.net.URL
 import java.security.MessageDigest
 
 internal data class UpdateRelease(val version:String,val name:String,val url:String,val sums:String,val size:Long)
-data class UpdateState(val status:String="",val checking:Boolean=false,val version:String?=null,val ready:Boolean=false,val automatic:Boolean=false,val checkOnOpen:Boolean=true)
+data class UpdateState(val status:String="",val checking:Boolean=false,val version:String?=null,val ready:Boolean=false,val automatic:Boolean=false,val checkOnOpen:Boolean=true,val publicCopy:Boolean=false)
+internal data class PublicUpdateEntry(val owner:String?,val size:Long?,val pending:Boolean)
+
+internal fun requirePublishedUpdateCopy(updatedRows:Int,entry:PublicUpdateEntry?,expectedSize:Long,packageName:String) {
+    require(updatedRows>0 && entry?.owner==packageName && entry.size==expectedSize && !entry.pending) {
+        "Android did not make the verified APK visible in Downloads"
+    }
+}
+
+internal fun updateDownloadStatus(publicCopy:Boolean,error:String?=null):String = when {
+    publicCopy -> "Verified APK ready to install. A copy is saved in Downloads → Super MD."
+    !error.isNullOrBlank() -> "Verified APK ready to install, but the Downloads copy failed: $error. You can retry saving it."
+    else -> "Verified APK ready to install. Save a copy to Downloads, or install it from Super MD's private storage."
+}
 
 internal fun stableVersion(value:String):List<Int> {
     require(Regex("v?\\d+\\.\\d+\\.\\d+").matches(value)){"Invalid stable version"}
@@ -47,6 +60,7 @@ class AppUpdates(private val app:Application) {
     private val mutable=MutableStateFlow(UpdateState(automatic=prefs.getBoolean("automatic",false),checkOnOpen=prefs.getBoolean("checkOnOpen",true)))
     val state=mutable.asStateFlow()
     private var release:UpdateRelease?=null
+    private var readyRelease:UpdateRelease?=null
     private var readyFile:File?=null
     private val folder get()=File(app.filesDir,"updates").apply{mkdirs()}
     private val receipt get()=File(folder,"ready.json")
@@ -86,7 +100,11 @@ class AppUpdates(private val app:Application) {
             saved.put("publicUri",uri.toString());saveReceipt(saved)
             try {
                 app.contentResolver.openOutputStream(uri)?.use{output->file.inputStream().use{it.copyTo(output)}} ?: error("Could not write Downloads entry")
-                app.contentResolver.update(uri,ContentValues().apply{put(MediaStore.MediaColumns.IS_PENDING,0)},null,null)
+                val updated=app.contentResolver.update(uri,ContentValues().apply{put(MediaStore.MediaColumns.IS_PENDING,0)},null,null)
+                val entry=app.contentResolver.query(uri,arrayOf(MediaStore.MediaColumns.SIZE,MediaStore.MediaColumns.IS_PENDING,MediaStore.MediaColumns.OWNER_PACKAGE_NAME),null,null,null)?.use{cursor->
+                    if(cursor.moveToFirst())PublicUpdateEntry(cursor.getString(2),cursor.getLong(0),cursor.getInt(1)!=0) else null
+                }
+                requirePublishedUpdateCopy(updated,entry,file.length(),app.packageName)
                 return true
             }catch(error:Exception){app.contentResolver.delete(uri,null,null);saved.remove("publicUri");saveReceipt(saved);throw error}
         }
@@ -99,9 +117,12 @@ class AppUpdates(private val app:Application) {
         }
         val target=File.createTempFile("Super-MD-${saved.getString("version")}-",".apk",publicFolder)
         saved.put("publicPath",target.canonicalPath);saveReceipt(saved)
-        file.copyTo(target,overwrite=true)
-        android.media.MediaScannerConnection.scanFile(app,arrayOf(target.absolutePath),arrayOf("application/vnd.android.package-archive"),null)
-        return true
+        try {
+            file.copyTo(target,overwrite=true)
+            require(hash(target)==saved.getString("sha256")){"Downloads copy checksum mismatch"}
+            android.media.MediaScannerConnection.scanFile(app,arrayOf(target.absolutePath),arrayOf("application/vnd.android.package-archive"),null)
+            return true
+        }catch(error:Exception){target.delete();saved.remove("publicPath");saveReceipt(saved);throw error}
     }
     private fun clearInstalled(saved:JSONObject,file:File,record:File=receipt) {
         if(Build.VERSION.SDK_INT>=29) {
@@ -136,10 +157,11 @@ class AppUpdates(private val app:Application) {
                 if(!newerVersion(target,BuildConfig.VERSION_NAME) && BuildConfig.VERSION_CODE.toLong()>=saved.getLong("versionCode")) {clearInstalled(saved,file);return@withContext}
                 val info=UpdateRelease(target,name,officialAsset(saved.getString("url")),officialAsset(saved.getString("sums")),saved.getLong("size"))
                 require(info.size in 1..536_870_912 && file.length()==info.size && hash(file)==saved.getString("sha256")){"Saved installer changed"}
-                release=info;verifyUpgrade(file)
+                release=info;readyRelease=info;verifyUpgrade(file)
                 readyFile=file
-                val public=runCatching{publishDownload(file,saved)}.getOrDefault(false)
-                mutable.value=mutable.value.copy(version=target,ready=true,status=if(public)"Verified APK ready in Downloads → Super MD." else "Verified APK ready. Allow storage access to also save it in Downloads.")
+                val publication=runCatching{publishDownload(file,saved)}
+                val public=publication.getOrDefault(false)
+                mutable.value=mutable.value.copy(version=target,ready=true,publicCopy=public,status=updateDownloadStatus(public,publication.exceptionOrNull()?.message))
             }
         }catch(error:Exception){mutable.value=mutable.value.copy(status="Saved update unavailable: ${error.message}")}
         finally {mutable.value=mutable.value.copy(checking=false)}
@@ -183,26 +205,25 @@ class AppUpdates(private val app:Application) {
                     UpdateRelease(version,name,officialAsset(apk.getString("browser_download_url")),officialAsset(sums.getString("browser_download_url")),size)
                 }
             }
-            if(info!=null && info.version==release?.version && readyFile?.isFile==true) {
+            if(info!=null && info.version==readyRelease?.version && readyFile?.isFile==true) {
                 mutable.value=mutable.value.copy(checking=false,status="Verified Super MD ${info.version} is already downloaded.");return
             }
             if(info==null && readyFile?.isFile==true) {mutable.value=mutable.value.copy(checking=false);return}
-            release=info;readyFile=null
-            mutable.value=mutable.value.copy(checking=false,version=info?.version,ready=false,status=if(info==null)"You're on the latest published version." else "Super MD ${info.version} is available.")
+            release=info
+            mutable.value=mutable.value.copy(checking=false,version=info?.version,ready=false,publicCopy=false,status=if(info==null)"You're on the latest published version." else "Super MD ${info.version} is available.")
             if(info!=null){notifyAvailable();if(mutable.value.automatic)download()}
         } catch(error:Exception){mutable.value=mutable.value.copy(checking=false,status="Couldn't check updates: ${error.message}. Notes still work offline.")}
     }
     suspend fun download() {
         val info=release ?: return
         if(mutable.value.checking)return
-        if(readyFile?.isFile==true) {
-            try {withContext(Dispatchers.IO){if(receipt.isFile)publishDownload(readyFile!!,JSONObject(receipt.readText()))}}
-            catch(error:Exception){mutable.value=mutable.value.copy(status="Verified APK kept. Could not save a public Downloads copy: ${error.message}")}
+        if(readyFile?.isFile==true && readyRelease?.version==info.version) {
+            saveToDownloads()
             return
         }
         mutable.value=mutable.value.copy(checking=true,status="Downloading and verifying APK…")
         try {
-            val file=withContext(Dispatchers.IO){
+            val (file,publication)=withContext(Dispatchers.IO){
                 val expected=releaseChecksum(read(info.sums,65_536),info.name)
                 val temporary=File.createTempFile("apk-",".part",folder)
                 try {
@@ -218,19 +239,40 @@ class AppUpdates(private val app:Application) {
                     saveReceipt(saved)
                     // Downloads publishing is not required for safe installation.
                     // A provider/storage failure must not discard a verified APK.
-                    runCatching{publishDownload(destination,saved)}
-                    destination
+                    destination to runCatching{publishDownload(destination,saved)}
                 } finally{temporary.delete()}
             }
-            readyFile=file;mutable.value=mutable.value.copy(checking=false,ready=true,status="Verified APK ready. Saved in Downloads when storage access is available. Android will ask you to approve installation; the download is removed only after a successful upgrade.")
+            readyFile=file;readyRelease=info
+            val public=publication.getOrDefault(false)
+            mutable.value=mutable.value.copy(checking=false,ready=true,publicCopy=public,status=updateDownloadStatus(public,publication.exceptionOrNull()?.message)+" Android will ask you to approve installation; the download is removed only after a successful upgrade.")
             notifyAvailable()
-        }catch(error:Exception){mutable.value=mutable.value.copy(checking=false,status="Update download failed: ${error.message}")}
+        }catch(error:Exception){
+            val retained=readyFile?.isFile==true && readyRelease!=null
+            mutable.value=mutable.value.copy(checking=false,version=if(retained)readyRelease?.version else mutable.value.version,ready=retained,status=if(retained)"Update download failed: ${error.message}. Verified Super MD ${readyRelease?.version} remains ready to install." else "Update download failed: ${error.message}")
+        }
     }
-    @Suppress("DEPRECATION") private fun verifyUpgrade(file:File) {
+    suspend fun saveToDownloads() {
+        val file=readyFile?.takeIf{it.isFile} ?: return
+        if(mutable.value.checking)return
+        mutable.value=mutable.value.copy(checking=true,status="Saving verified APK to Downloads…")
+        try {
+            val public=withContext(Dispatchers.IO){
+                require(receipt.isFile){"Saved update details are missing; check for updates again"}
+                publishDownload(file,JSONObject(receipt.readText()))
+            }
+            mutable.value=mutable.value.copy(checking=false,publicCopy=public,status=updateDownloadStatus(public))
+        }catch(error:Exception){
+            mutable.value=mutable.value.copy(checking=false,publicCopy=false,status=updateDownloadStatus(false,error.message))
+        }
+    }
+    fun storagePermissionDenied() {
+        mutable.value=mutable.value.copy(publicCopy=false,status="Android storage permission was denied. The verified APK is still ready to install privately; you can grant storage access and retry saving a Downloads copy.")
+    }
+    @Suppress("DEPRECATION") private fun verifyUpgrade(file:File,expected:UpdateRelease?=release) {
         val pm=app.packageManager;val flags=if(Build.VERSION.SDK_INT>=28)PackageManager.GET_SIGNING_CERTIFICATES else PackageManager.GET_SIGNATURES
         val incoming=pm.getPackageArchiveInfo(file.absolutePath,flags) ?: error("Invalid APK package")
         val installed=pm.getPackageInfo(app.packageName,flags)
-        require(incoming.packageName==app.packageName && incoming.versionName==release?.version){"APK identity mismatch"}
+        require(incoming.packageName==app.packageName && incoming.versionName==expected?.version){"APK identity mismatch"}
         require((incoming.applicationInfo?.flags ?: error("Missing APK application info")) and android.content.pm.ApplicationInfo.FLAG_DEBUGGABLE == 0){"Refusing a debug APK"}
         val code=if(Build.VERSION.SDK_INT>=28)incoming.longVersionCode else incoming.versionCode.toLong()
         val oldCode=if(Build.VERSION.SDK_INT>=28)installed.longVersionCode else installed.versionCode.toLong()
@@ -244,7 +286,7 @@ class AppUpdates(private val app:Application) {
             activity.startActivity(Intent(android.provider.Settings.ACTION_MANAGE_UNKNOWN_APP_SOURCES,Uri.parse("package:${app.packageName}")))
             mutable.value=mutable.value.copy(status="Allow installs from Super MD, then tap Install update again.");return
         }
-        verifyUpgrade(file)
+        verifyUpgrade(file,readyRelease)
         val uri=FileProvider.getUriForFile(app,"${app.packageName}.share",file)
         activity.startActivity(Intent(Intent.ACTION_VIEW).setDataAndType(uri,"application/vnd.android.package-archive").addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION))
     }

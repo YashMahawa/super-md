@@ -9,6 +9,7 @@ from PySide6.QtGui import QGuiApplication
 from PySide6.QtCore import QUrl, QObject, Slot
 from studio import Session, Studio
 from documents import atomic_json
+import updates
 
 class QuietStudio(Studio):
     def _refresh_theme(self):
@@ -43,12 +44,47 @@ class StudioTest(unittest.TestCase):
             self.assertEqual(studio.update_path,'/verified/installer')
 
     def test_portable_update_installs_without_starting_competing_instance(self):
-        studio=self.studio;studio.update_path='/verified/update.AppImage';studio.update_info={'version':'9.9.9'};calls=[]
+        studio=self.studio;name='Super-MD_9.9.9_amd64.AppImage';studio.update_path='/verified/update.AppImage';studio.update_info={'version':'9.9.9','name':name,'size':4,'url':updates.REPO+'/releases/download/v9.9.9/'+name,'checksums':updates.REPO+'/releases/download/v9.9.9/SHA256SUMS'};calls=[]
         saved={'path':studio.update_path,'release':studio.update_info}
         with patch('app_integration.available',return_value=True),patch.object(studio,'_submit',side_effect=lambda action,done,*_:calls.append((action,done))),patch('updates.load_ready',return_value=saved),patch('app_integration.install_appimage',return_value='/managed/new') as install,patch('studio.QProcess.startDetached') as spawn:
             studio.installUpdate();action,done=calls.pop();done(action(),None)
             install.assert_called_once_with(studio.update_path,'9.9.9',False);spawn.assert_not_called()
         self.assertIn('Close and reopen',studio.update_status);self.assertFalse(studio.update_running)
+
+    def test_package_update_handoff_opens_matching_verified_installer(self):
+        studio=self.studio;name='Super-MD_9.9.9_amd64.deb';studio.update_path='/verified/update.deb';studio.update_info={'version':'9.9.9','name':name,'size':4,'url':updates.REPO+'/releases/download/v9.9.9/'+name,'checksums':updates.REPO+'/releases/download/v9.9.9/SHA256SUMS'};calls=[]
+        saved={'path':studio.update_path,'release':studio.update_info}
+        with patch.object(studio,'_submit',side_effect=lambda action,done,*_:calls.append((action,done))),patch('updates.load_ready',return_value=saved),patch('studio.QDesktopServices.openUrl',return_value=True) as open_url,patch('app_integration.install_appimage') as appimage:
+            studio.installUpdate();action,done=calls.pop();done(action(),None)
+        open_url.assert_called_once_with(QUrl.fromLocalFile(studio.update_path))
+        appimage.assert_not_called()
+        self.assertIn('Package installer opened',studio.update_status)
+
+    def test_update_check_selects_detected_linux_install_channel(self):
+        studio=self.studio;calls=[]
+        release={'tag_name':'v9.9.9','draft':False,'prerelease':False,'assets':[
+            {'name':'Super-MD_9.9.9_amd64.AppImage','size':4,'browser_download_url':updates.REPO+'/releases/download/v9.9.9/Super-MD_9.9.9_amd64.AppImage'},
+            {'name':'Super-MD_9.9.9_amd64.deb','size':4,'browser_download_url':updates.REPO+'/releases/download/v9.9.9/Super-MD_9.9.9_amd64.deb'},
+            {'name':'SHA256SUMS','size':100,'browser_download_url':updates.REPO+'/releases/download/v9.9.9/SHA256SUMS'}]}
+        with patch.object(studio,'_submit',side_effect=lambda action,done,*_:calls.append((action,done))),patch('updates.linux_install_kind',return_value='deb') as channel,patch('updates.bounded_json',return_value=release):
+            studio.checkUpdates();action,done=calls.pop();done(action(),None)
+        channel.assert_called_once_with()
+        self.assertEqual(studio.update_info['name'],'Super-MD_9.9.9_amd64.deb')
+
+    def test_macos_and_windows_updates_handoff_to_their_native_installers(self):
+        for name,kind in (("Super-MD_9.9.9_aarch64.dmg","macos"),("Super-MD_9.9.9_x64-setup.exe","windows")):
+            with self.subTest(kind=kind):
+                studio=self.studio;studio.update_path="/verified/"+name
+                studio.update_info={'version':'9.9.9','name':name,'size':4,'url':updates.REPO+'/releases/download/v9.9.9/'+name,'checksums':updates.REPO+'/releases/download/v9.9.9/SHA256SUMS'}
+                saved={'path':studio.update_path,'release':studio.update_info};calls=[]
+                with patch.object(studio,'_submit',side_effect=lambda action,done,*_:calls.append((action,done))),patch('updates.load_ready',return_value=saved),patch('studio.QDesktopServices.openUrl',return_value=True) as open_url,patch('studio.QProcess.startDetached',return_value=(True,123)) as start:
+                    studio.installUpdate();action,done=calls.pop();done(action(),None)
+                if kind=='macos':
+                    open_url.assert_called_once_with(QUrl.fromLocalFile(studio.update_path));start.assert_not_called()
+                    self.assertIn('Disk image opened',studio.update_status)
+                else:
+                    start.assert_called_once_with(studio.update_path,[]);open_url.assert_not_called()
+                    self.assertIn('Installer opened',studio.update_status)
     @classmethod
     def setUpClass(cls):
         cls.app = QGuiApplication.instance() or QGuiApplication(["Super MD tests"])
@@ -710,9 +746,8 @@ class StudioTest(unittest.TestCase):
 
     def test_export_dialog_tracks_selected_format_suffix_and_filters(self):
         qml=(Path(__file__).parent/"qml"/"Main.qml").read_text(encoding="utf-8")
-        destination=next(line for line in qml.splitlines() if "id: destination;" in line)
-        self.assertIn('defaultSuffix: outputFormat === "pdf" ? "pdf" : outputFormat === "md" ? "md" : "smd"',destination)
-        self.assertIn('outputFormat === "pdf" ? ["PDF (*.pdf)"] : outputFormat === "md" ? ["Markdown (*.md)"] : ["Portable Super MD (*.smd)"]',destination)
+        self.assertIn('defaultSuffix: exportFormat',qml)
+        self.assertIn('exportFormat === "pdf" ? ["PDF (*.pdf)"] : exportFormat === "md" ? ["Markdown (*.md)"] : ["Portable Super MD (*.smd)"]',qml)
         choice=next(line for line in qml.splitlines() if "currentIndex: outputFormat === \"pdf\"" in line)
         self.assertIn('onActivated: outputFormat = currentIndex === 0 ? "pdf" : currentIndex === 1 ? "smd" : "md"',choice)
 

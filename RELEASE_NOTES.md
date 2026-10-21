@@ -1,4 +1,16 @@
-# Super MD 0.6.6
+# Super MD 0.6.7
+
+## Export, menus, navigation and updates
+
+- Desktop exports now use a fresh native save chooser for each operation, with a captured format, matching filename suffix and filter. Requesting portable SMD no longer gets reset to PDF when the options panel finishes opening.
+- Real Linux portal tests exercise consecutive PDF, SMD and Markdown exports, including Unicode, spaces and intentional percent sequences in filenames. Existing backend checks still reject mismatched destination types before writing.
+- Replaced the reader's unstyled browser right-click menu with the application's opaque themed context menu. Copy, Select all, available editing actions and link copying remain supported; browser-only page commands are no longer exposed. Tests right-click an actual WebEngine page and verify painted menu pixels and clipboard actions.
+- When Contents has a single root heading, it is shown without a disclosure control and its sections are immediately accessible. Nested sections and documents with multiple root headings retain their normal collapsible navigation on desktop and Android.
+- Linux updates select the installer matching the current AppImage/portable, Debian or RPM installation, instead of always downloading an AppImage. Verified Windows installers and macOS disk images are handed to the operating system, with actionable handoff failures. Operating-system installation approval remains required where applicable.
+- Android verifies that the downloaded APK was actually published in Downloads before reporting success, offers a retry if publication fails, and keeps a verified older installer usable if a newer download fails. Private installation remains available when public storage publication fails.
+- Previously downloaded installers and existing application versions remain recoverable on desktop. Android removes only its recorded installer after a successful upgrade.
+
+The following fixes and performance improvements from 0.6.6 are retained.
 
 ## PDF compatibility and export filenames
 

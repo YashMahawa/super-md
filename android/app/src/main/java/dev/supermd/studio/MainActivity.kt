@@ -585,7 +585,10 @@ internal class NoteDestination(private val mime: String, private val preferred: 
 @Composable private fun Settings(state: StudioState, model: StudioViewModel, activity:MainActivity, noteLocation: String, chooseNoteLocation: ()->Unit, recoverDraft:()->Unit, importTheme:()->Unit, exportTheme:()->Unit, importFont: ()->Unit) {
     val update by model.updates.state.collectAsStateWithLifecycle()
     val scope=rememberCoroutineScope()
-    val downloadPermission=rememberLauncherForActivityResult(ActivityResultContracts.RequestPermission()){scope.launch{model.updates.download()}}
+    val downloadPermission=rememberLauncherForActivityResult(ActivityResultContracts.RequestPermission()){granted->
+        if(update.ready) { if(granted)scope.launch{model.updates.saveToDownloads()} else model.updates.storagePermissionDenied() }
+        else scope.launch{model.updates.download()}
+    }
     Column(Modifier.fillMaxWidth().verticalScroll(rememberScrollState()), horizontalAlignment = Alignment.CenterHorizontally) {
         Column(Modifier.widthIn(max = 760.dp).fillMaxWidth().padding(16.dp), verticalArrangement = Arrangement.spacedBy(16.dp)) {
             SettingsSection("Appearance") {
@@ -687,6 +690,7 @@ internal class NoteDestination(private val mime: String, private val preferred: 
                 if(update.status.isNotBlank())Text(update.status)
                 FilledTonalButton(onClick={scope.launch{model.updates.check()}},enabled=!update.checking){Text("Check for updates")}
                 if(update.version!=null)Button(onClick={if(update.ready)runCatching{model.updates.install(activity)}.onFailure{model.fail(it.message ?: "Could not open installer")} else if(Build.VERSION.SDK_INT<=28 && activity.checkSelfPermission(android.Manifest.permission.WRITE_EXTERNAL_STORAGE)!=android.content.pm.PackageManager.PERMISSION_GRANTED)downloadPermission.launch(android.Manifest.permission.WRITE_EXTERNAL_STORAGE) else scope.launch{model.updates.download()}},enabled=!update.checking){Text(if(update.ready)"Install update" else "Download update")}
+                if(update.ready && !update.publicCopy)TextButton(onClick={if(Build.VERSION.SDK_INT<=28 && activity.checkSelfPermission(android.Manifest.permission.WRITE_EXTERNAL_STORAGE)!=android.content.pm.PackageManager.PERMISSION_GRANTED)downloadPermission.launch(android.Manifest.permission.WRITE_EXTERNAL_STORAGE) else scope.launch{model.updates.saveToDownloads()}},enabled=!update.checking){Text("Save verified APK to Downloads")}
                 TextButton(onClick={activity.startActivity(Intent(android.provider.Settings.ACTION_APP_NOTIFICATION_SETTINGS).putExtra(android.provider.Settings.EXTRA_APP_PACKAGE,activity.packageName))}){Text("Update notification permissions")}
             }
         }

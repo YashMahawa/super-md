@@ -7,15 +7,27 @@ ListView {
     property var entries: []
     property string noteId: ""
     property var expanded: ({})
+    readonly property var rootHeadingId: singleRootId()
     onNoteIdChanged: expanded = ({})
     clip: true
-    function visibleEntries() {
-        const result = [], stack = []
+    function singleRootId() {
+        const stack = [], roots = []
         for (let i=0; i<entries.length; i++) {
             const entry=entries[i]
             while(stack.length && stack[stack.length-1].level >= entry.level)stack.pop()
-            const hidden=stack.some(parent => !expanded[parent.id])
-            if(!hidden)result.push({id:entry.id,title:entry.title,offset:entry.offset,depth:stack.length,children:i+1<entries.length&&entries[i+1].level>entry.level})
+            if(!stack.length)roots.push(entry.id)
+            stack.push(entry)
+        }
+        return roots.length === 1 ? roots[0] : null
+    }
+    function visibleEntries() {
+        const result = [], stack = [], soloRoot = rootHeadingId
+        for (let i=0; i<entries.length; i++) {
+            const entry=entries[i]
+            while(stack.length && stack[stack.length-1].level >= entry.level)stack.pop()
+            const hidden=stack.some(parent => !expanded[parent.id] && parent.id !== soloRoot)
+            const children=i+1<entries.length&&entries[i+1].level>entry.level
+            if(!hidden)result.push({id:entry.id,title:entry.title,offset:entry.offset,depth:stack.length,children:children,collapsible:children&&entry.id!==soloRoot})
             stack.push(entry)
         }
         return result
@@ -26,7 +38,7 @@ ListView {
         id: heading
         required property var modelData
         readonly property var colors: studio.palette
-        readonly property bool open: !!outline.expanded[modelData.id]
+        readonly property bool open: !!outline.expanded[modelData.id] || modelData.id === outline.rootHeadingId
         width: ListView.view.width - 14
         height: modelData.depth === 0 ? 44 : 38
         leftPadding: 8 + modelData.depth * 16
@@ -51,7 +63,7 @@ ListView {
             }
             ToolButton {
                 id: toggle
-                visible: heading.modelData.children
+                visible: heading.modelData.collapsible
                 focusPolicy: Qt.NoFocus
                 Layout.preferredWidth: 28; Layout.preferredHeight: 28
                 padding: 2
@@ -62,7 +74,7 @@ ListView {
                 background: Rectangle { radius: 14; color: heading.colors.text; opacity: toggle.hovered ? .1 : 0 }
                 onClicked: { const next=Object.assign({},outline.expanded);next[heading.modelData.id]=!heading.open;outline.expanded=next }
             }
-            Item { visible: !heading.modelData.children; Layout.preferredWidth: 28 }
+            Item { visible: !heading.modelData.collapsible; Layout.preferredWidth: 28 }
             Label {
                 id: titleLabel
                 Layout.fillWidth: true

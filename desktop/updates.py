@@ -9,6 +9,8 @@ import platform
 import re
 import sys
 import os
+import shutil
+import subprocess
 import tempfile
 import urllib.parse
 import urllib.request
@@ -44,12 +46,57 @@ def bounded_json(url, limit=1_000_000):
     if len(data)>limit: raise ValueError("Update response is too large")
     return json.loads(data)
 
-def release_info(data, current, system=None, machine=None):
+def linux_install_kind(executable=None, environ=None, frozen=None, home=None):
+    """Return the current Linux package channel without changing the system."""
+    environ = os.environ if environ is None else environ
+    if environ.get("APPIMAGE"):
+        return "appimage"
+    executable = Path(executable or sys.executable).resolve()
+    home = Path(home or Path.home()).resolve()
+    if frozen is None:
+        frozen = bool(getattr(sys, "frozen", False))
+    if frozen and executable.parent.parent == (home / ".local/opt").resolve() and executable.parent.name.startswith("super-md-qt-"):
+        return "appimage"
+    if frozen:
+        # Query ownership of this exact executable, not whether a package
+        # manager happens to be installed on the host.
+        if shutil.which("dpkg-query"):
+            try:
+                result = subprocess.run(["dpkg-query", "-S", str(executable)], capture_output=True, text=True, timeout=3, check=False)
+                owners = [entry.split(": ", 1)[0].split(":", 1)[0] for entry in result.stdout.splitlines() if ": " in entry]
+                if result.returncode == 0 and "super-md" in owners:
+                    return "deb"
+            except (OSError, subprocess.TimeoutExpired):
+                pass
+        if shutil.which("rpm"):
+            try:
+                result = subprocess.run(["rpm", "-qf", "--qf", "%{NAME}", str(executable)], capture_output=True, text=True, timeout=3, check=False)
+                if result.returncode == 0 and result.stdout.strip() == "super-md":
+                    return "rpm"
+            except (OSError, subprocess.TimeoutExpired):
+                pass
+    # Unknown/source installations retain the existing portable Linux update
+    # path; the install action still refuses to replace an unmanaged system app.
+    return "appimage"
+
+def release_info(data, current, system=None, machine=None, linux_kind="appimage"):
     tag=data.get("tag_name", "")
     if data.get("draft") or data.get("prerelease") or version(tag)<=version(current): return None
     system=system or sys.platform;machine=machine or platform.machine()
-    suffix="_x64-setup.exe" if system=="win32" else ("_aarch64.dmg" if machine in ("arm64","aarch64") else "_x64.dmg") if system=="darwin" else "_amd64.AppImage"
-    name=f"Super-MD_{tag.lstrip('v')}{suffix}"
+    if system.startswith("linux") and linux_kind not in ("appimage", "deb", "rpm"):
+        raise ValueError("Unsupported Linux update channel")
+    if system == "win32":
+        suffix = "_x64-setup.exe"
+    elif system == "darwin":
+        suffix = "_aarch64.dmg" if machine in ("arm64", "aarch64") else "_x64.dmg"
+    else:
+        suffix = {"appimage": "_amd64.AppImage", "deb": "_amd64.deb", "rpm": "-1.x86_64.rpm"}.get(linux_kind)
+        if suffix is None:
+            raise ValueError("Unsupported Linux update channel")
+    release_version = tag.lstrip("v")
+    # The RPM packaging job follows the native RPM package naming convention;
+    # unlike the other generated installers its published name uses hyphens.
+    name = f"Super-MD-{release_version}-1.x86_64.rpm" if linux_kind == "rpm" and system.startswith("linux") else f"Super-MD_{release_version}{suffix}"
     assets={asset["name"]:asset for asset in data.get("assets", [])}
     if name not in assets or "SHA256SUMS" not in assets: raise ValueError("The published update is incomplete for this platform")
     if not 0<assets[name].get("size",0)<=1_500_000_000: raise ValueError("Invalid update size")
@@ -63,11 +110,21 @@ def checksum(text, name):
 
 def validate_info(info):
     version(info['version'])
-    if not re.fullmatch(r'Super-MD_'+re.escape(info['version'])+r'_(amd64\.AppImage|x64-setup\.exe|(?:x64|aarch64)\.dmg)',info['name']):
+    if not re.fullmatch(r'(?:Super-MD_'+re.escape(info['version'])+r'_(?:amd64\.(?:AppImage|deb)|x64-setup\.exe|(?:x64|aarch64)\.dmg)|Super-MD-'+re.escape(info['version'])+r'-1\.x86_64\.rpm)',info['name']):
         raise ValueError('Invalid installer name')
     for key in ('url','checksums'):asset_url(info[key])
     if info['url']!=f"{REPO}/releases/download/v{info['version']}/{info['name']}" or info['checksums']!=f"{REPO}/releases/download/v{info['version']}/SHA256SUMS":raise ValueError('Mismatched release assets')
     if type(info['size']) is not int or not 0<info['size']<=1_500_000_000:raise ValueError('Invalid installer size')
+
+def installer_kind(info):
+    validate_info(info)
+    name = info["name"]
+    if name.endswith(".AppImage"): return "appimage"
+    if name.endswith(".deb"): return "deb"
+    if name.endswith(".rpm"): return "rpm"
+    if name.endswith(".exe"): return "windows"
+    if name.endswith(".dmg"): return "macos"
+    raise ValueError("Unsupported installer type")
 
 def verify_file(path, info, expected):
     validate_info(info)

@@ -733,7 +733,9 @@ class Studio(QObject):
                 except RuntimeError:pass
             if self.settings.get("autoUpdate"):self.downloadUpdate()
         def check():
-            try:return updates.release_info(updates.bounded_json(updates.API),self.appVersion),None
+            try:
+                linux_kind=updates.linux_install_kind() if sys.platform.startswith("linux") else "appimage"
+                return updates.release_info(updates.bounded_json(updates.API),self.appVersion,linux_kind=linux_kind),None
             except Exception as failure:return None,str(failure)
         self._submit(check,lambda result,error:done(*(result or (None,error))),False)
 
@@ -832,25 +834,42 @@ class Studio(QObject):
     @Slot()
     def installUpdate(self):
         if not self.update_path or self.update_running:return
-        if self.update_path.endswith('.AppImage') and not self.desktopIntegrationAvailable:
+        try:
+            kind=updates.installer_kind(self.update_info)
+        except (TypeError,ValueError,KeyError):
+            self.update_status='Update information is invalid. Check for updates again.'
+            self._emit(False);return
+        if kind=='appimage' and not self.desktopIntegrationAvailable:
             self.update_status='This installation is package-managed. Install the DEB/RPM from the release page using your package manager.'
             QDesktopServices.openUrl(QUrl(updates.REPO+'/releases/latest'));self._emit(False);return
         self.update_running=True;self.update_status='Verifying and preparing installation…';self._emit(False)
         def prepare():
             saved=updates.load_ready(self.data/'updates',self.appVersion)
             if not saved or saved['path']!=self.update_path:raise ValueError('Installer changed or is missing. Download the update again.')
-            if self.update_path.endswith('.AppImage'):
-                return app_integration.install_appimage(self.update_path,saved['release']['version'],self.settings.get('desktopIntegration',False))
-            return self.update_path
-        def done(path,error):
+            prepared_kind=updates.installer_kind(saved['release'])
+            if not self.update_info or saved['release']['version']!=self.update_info.get('version'):
+                raise ValueError('The verified installer no longer matches the selected update. Check for updates again.')
+            if prepared_kind=='appimage':
+                installed=app_integration.install_appimage(self.update_path,saved['release']['version'],self.settings.get('desktopIntegration',False))
+                return installed,prepared_kind
+            return self.update_path,prepared_kind
+        def done(prepared,error):
             self.update_running=False
             if error:self.update_status='Update installation failed: '+error;return
-            if self.update_path.endswith('.AppImage'):
+            path,prepared_kind=prepared
+            if prepared_kind=='appimage':
                 self.update_status='Update installed. Close and reopen Super MD to use it. Your previous version and downloaded installer have been kept.'
             else:
-                opened=QProcess.startDetached(path,[]) if sys.platform=='win32' else QDesktopServices.openUrl(QUrl.fromLocalFile(path))
+                opened=QProcess.startDetached(path,[]) if prepared_kind=='windows' else QDesktopServices.openUrl(QUrl.fromLocalFile(path))
                 if isinstance(opened,tuple):opened=opened[0]
-                self.update_status='Installer opened. Follow its instructions; the download is kept in Downloads.' if opened else 'Could not open installer. Open the verified file in Downloads.'
+                if not opened:
+                    self.update_status='Could not open the verified installer. It is still available in Downloads.'
+                elif prepared_kind in ('deb','rpm'):
+                    self.update_status='Package installer opened. Confirm the update there; Super MD will not request elevated permissions automatically.'
+                elif prepared_kind=='macos':
+                    self.update_status='Disk image opened. Drag Super MD into Applications and confirm replacement to update.'
+                else:
+                    self.update_status='Installer opened. Follow its instructions; the download is kept in Downloads.'
         self._submit(prepare,done,False)
 
     def _can_move(self):
