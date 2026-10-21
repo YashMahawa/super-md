@@ -9,13 +9,16 @@ import platform
 import re
 import sys
 import os
+import socket
 import shutil
+import ssl
 import subprocess
 import tempfile
 import urllib.parse
 import urllib.request
 from pathlib import Path
 from documents import atomic_json
+from network_tls import client_context
 
 REPO = "https://github.com/YashMahawa/super-md"
 API = "https://api.github.com/repos/YashMahawa/super-md/releases/latest"
@@ -39,7 +42,23 @@ class SafeRedirect(urllib.request.HTTPRedirectHandler):
         return super().redirect_request(request, fp, code, message, headers, newurl)
 
 def response(url):
-    return urllib.request.build_opener(SafeRedirect()).open(urllib.request.Request(url, headers={"User-Agent": "Super-MD-updater", "Accept": "application/vnd.github+json"}), timeout=30)
+    return urllib.request.build_opener(
+        SafeRedirect(), urllib.request.HTTPSHandler(context=client_context())
+    ).open(urllib.request.Request(url, headers={"User-Agent": "Super-MD-updater", "Accept": "application/vnd.github+json"}), timeout=30)
+
+def check_failure(error):
+    """Return a short actionable update-check error without exposing internals."""
+    reason = getattr(error, "reason", error)
+    if isinstance(reason, ssl.SSLCertVerificationError):
+        return "Could not verify the update server certificate. Check your system date, time, and network trust settings; no update was downloaded."
+    status = getattr(error, "code", None)
+    if status == 403:
+        return "The update service denied the request. Check GitHub availability and try again."
+    if status == 429:
+        return "The update service is rate-limiting requests. Wait briefly, then try again."
+    if isinstance(reason, (TimeoutError, socket.timeout)):
+        return "The update check timed out. Check your connection and try again."
+    return "Could not check for updates. Check your internet connection and try again. Your notes still work offline."
 
 def bounded_json(url, limit=1_000_000):
     with response(url) as stream: data=stream.read(limit+1)

@@ -2,6 +2,7 @@
 
 ## Export, menus, navigation and updates
 
+- Fixed an update-check failure reproduced in the installed Linux app: its bundled OpenSSL searched build-machine certificate paths that did not exist on the destination, leaving no trusted authorities. Desktop HTTPS now includes a portable Mozilla CA bundle alongside system trust, without disabling certificate or hostname verification. Packaged-runtime tests explicitly remove host CA paths; update errors now identify certificate, connection and service failures.
 - Desktop exports now use a fresh native save chooser for each operation, with a captured format, matching filename suffix and filter. Requesting portable SMD no longer gets reset to PDF when the options panel finishes opening.
 - Real Linux portal tests exercise consecutive PDF, SMD and Markdown exports, including Unicode, spaces and intentional percent sequences in filenames. Existing backend checks still reject mismatched destination types before writing.
 - Replaced the reader's unstyled browser right-click menu with the application's opaque themed context menu. Copy, Select all, available editing actions and link copying remain supported; browser-only page commands are no longer exposed. Tests right-click an actual WebEngine page and verify painted menu pixels and clipboard actions.

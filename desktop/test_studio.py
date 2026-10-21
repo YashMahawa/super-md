@@ -71,6 +71,20 @@ class StudioTest(unittest.TestCase):
         channel.assert_called_once_with()
         self.assertEqual(studio.update_info['name'],'Super-MD_9.9.9_amd64.deb')
 
+    def test_update_check_preserves_tls_error_type_for_actionable_message(self):
+        import ssl
+        from urllib.error import URLError
+        studio=self.studio
+        jobs=[]
+        failure=URLError(ssl.SSLCertVerificationError("certificate verify failed"))
+        with patch.object(studio,'_submit',side_effect=lambda action,done,*_:jobs.append((action,done))),patch('updates.bounded_json',side_effect=failure):
+            studio.checkUpdates()
+            action,done=jobs.pop()
+            done(action(),None)
+        self.assertFalse(studio.update_running)
+        self.assertIn('certificate',studio.update_status)
+        self.assertIn('system date',studio.update_status)
+
     def test_macos_and_windows_updates_handoff_to_their_native_installers(self):
         for name,kind in (("Super-MD_9.9.9_aarch64.dmg","macos"),("Super-MD_9.9.9_x64-setup.exe","windows")):
             with self.subTest(kind=kind):

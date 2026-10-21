@@ -25,7 +25,7 @@ data = [(str(root / "dist"), "resources/dist"),
         (str(root / "desktop/NOTICE.md"), "resources/licenses")]
 data.append((str(root / "desktop/licenses"), "resources/licenses/qt"))
 data.append((str(root / "desktop/build-info.json"), "resources/desktop"))
-for package in ("PySide6", "PySide6_Essentials", "PySide6_Addons", "shiboken6", "numpy", "material-color-utilities"):
+for package in ("PySide6", "PySide6_Essentials", "PySide6_Addons", "shiboken6", "numpy", "material-color-utilities", "certifi"):
     dist = distribution(package)
     for file in dist.files or []:
         if "/licenses/" in str(file) or str(file).endswith(("LICENSE", "LICENSE.txt", "COPYING")):
@@ -33,7 +33,8 @@ for package in ("PySide6", "PySide6_Essentials", "PySide6_Addons", "shiboken6", 
 if (root / "LICENSE").exists():
     data.append((str(root / "LICENSE"), "resources/licenses"))
 data += collect_data_files("PySide6", includes=["**/LICENSE*", "**/COPYING*", "**/licenses/**"])
-hidden = ["PySide6.QtWebEngineCore", "PySide6.QtWebChannel", "PySide6.QtNetwork"]
+data += collect_data_files("certifi", includes=["cacert.pem"])
+hidden = ["PySide6.QtWebEngineCore", "PySide6.QtWebChannel", "PySide6.QtNetwork", "certifi"]
 if sys.platform in ("win32", "darwin"):
     # Built-in Python for cells: most people on Windows and macOS have no Python.
     # Ship numpy + matplotlib and the standard library cells commonly import.

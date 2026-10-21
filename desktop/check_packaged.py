@@ -39,6 +39,29 @@ def check(executable: Path, version: str, graphics: str) -> None:
         # below remain mandatory; they cannot succeed by merely exiting early.
         if identity.stdout.strip() and f"Super MD {version}" not in identity.stdout:
             raise RuntimeError(f"Unexpected packaged version: {identity.stdout}")
+        # CI Python's compiled OpenSSL paths may not exist on the destination
+        # machine. Exercise the frozen interpreter with those paths unavailable,
+        # not the developer's Python or a runner's conveniently installed roots.
+        tls_input, tls_output = root / "tls-check.json", root / "tls-result.json"
+        tls_input.write_text(json.dumps({"code":
+            "import json, ssl, network_tls\n"
+            "ctx = network_tls.client_context()\n"
+            "assert ctx.check_hostname\n"
+            "assert ctx.verify_mode == ssl.CERT_REQUIRED\n"
+            "assert ctx.cert_store_stats()['x509_ca'] > 20\n"
+            "print(json.dumps(ctx.cert_store_stats()))\n"}), encoding="utf-8")
+        saved_env = env.copy()
+        try:
+            env["SSL_CERT_FILE"] = str(root / "absent-host-ca.pem")
+            env["SSL_CERT_DIR"] = str(root / "absent-host-ca-directory")
+            run("--python-cell", tls_input, tls_output, timeout=30)
+        finally:
+            env.clear()
+            env.update(saved_env)
+        tls_result = json.loads(tls_output.read_text(encoding="utf-8"))
+        if not tls_result.get("ok"):
+            raise RuntimeError(f"Packaged verified TLS trust store failed: {tls_result.get('stderr')}")
+        tls_evidence = json.loads(tls_result["stdout"])
         run("doctor")
         note = root / "Fresh machine.md"
         (root / "figure.svg").write_text('<svg xmlns="http://www.w3.org/2000/svg" width="80" height="40" viewBox="0 0 80 40"><rect width="80" height="40" fill="#3476ad"/></svg>',encoding='utf-8')
@@ -77,7 +100,8 @@ def check(executable: Path, version: str, graphics: str) -> None:
             raise RuntimeError("Required graphics fallback was not selected")
         print(json.dumps({"executable":str(executable),"version":version,"graphics":graphics,
                           "software":evidence.get("software"),
-                          "readerColors":evidence['readerColors'],"pdfBytes":pdf.stat().st_size}))
+                          "readerColors":evidence['readerColors'],"pdfBytes":pdf.stat().st_size,
+                          "trustedCAsWithoutHostPaths":tls_evidence['x509_ca']}))
 
 
 if __name__ == "__main__":

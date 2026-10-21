@@ -1,10 +1,12 @@
 import hashlib
 import io
+import ssl
+import socket
 import subprocess
 import tempfile
 import unittest
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 import updates
 
 class UpdateTest(unittest.TestCase):
@@ -33,6 +35,21 @@ class UpdateTest(unittest.TestCase):
             self.assertIsNone(updates.release_info(fixture,'1.0.0','linux','x86_64'))
         for url in ('http://github.com/YashMahawa/super-md/releases/download/v1/x',updates.REPO+'.evil/releases/download/v1/x','https://github.com/attacker/super-md/releases/download/v1/x','https://github.com@evil.test/YashMahawa/super-md/releases/download/v1/x'):
             with self.assertRaises(ValueError):updates.asset_url(url)
+    def test_update_failures_are_classified_without_internal_details(self):
+        self.assertIn('certificate',updates.check_failure(ssl.SSLCertVerificationError('bad cert')).lower())
+        self.assertIn('timed out',updates.check_failure(socket.timeout()).lower())
+        self.assertIn('rate-limiting',updates.check_failure(type('HttpFailure',(Exception,),{'code':429})()).lower())
+        self.assertIn('could not check',updates.check_failure(OSError('private path /secret')).lower())
+    def test_release_requests_use_verified_context_on_the_same_proxy_aware_opener(self):
+        opener=Mock();opener.open.return_value='response'
+        with patch('updates.urllib.request.build_opener',return_value=opener) as build:
+            self.assertEqual(updates.response('https://api.github.com/repos/YashMahawa/super-md/releases/latest'),'response')
+        handlers=build.call_args.args
+        self.assertTrue(any(isinstance(handler,updates.SafeRedirect) for handler in handlers))
+        https=next(handler for handler in handlers if isinstance(handler,updates.urllib.request.HTTPSHandler))
+        self.assertTrue(https._context.check_hostname)
+        self.assertEqual(https._context.verify_mode,ssl.CERT_REQUIRED)
+        opener.open.assert_called_once()
     def test_streamed_download_requires_exact_size_and_hash(self):
         info=updates.release_info(self.fixture(),'1.0.0','linux','x86_64')
         for payload,valid in ((b'good',True),(b'evil',False),(b'too big',False)):

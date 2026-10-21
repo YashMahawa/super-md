@@ -4,6 +4,10 @@ Super MD's original code is licensed under the MIT License. Its complete
 copyright and license notice is included in LICENSE with this package.
 The following third-party components retain their own notices and licenses.
 
+HTTPS clients include certifi's unmodified Mozilla CA certificate bundle
+(MPL-2.0), alongside operating-system trust. The certifi license is included
+under resources/licenses/certifi. Source: https://github.com/certifi/python-certifi
+
 The desktop package uses unmodified PySide6 / Qt 6.11.2 dynamically linked
 libraries, Python, NumPy, Material Color Utilities and the bundled Rust/Typst
 PDF engine. Qt is available under LGPLv3/GPLv3 and commercial terms; this

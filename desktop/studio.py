@@ -11,7 +11,6 @@ import mimetypes
 import os
 import shutil
 import socket
-import ssl
 import subprocess
 import sys
 import tempfile
@@ -21,6 +20,7 @@ import urllib.parse
 import urllib.request
 import uuid
 from pathlib import Path
+from network_tls import client_context
 from PySide6.QtCore import QObject, Property, Signal, Slot, QStandardPaths, QTimer, QUrl, QFileSystemWatcher, QProcess, Qt, QPointF, QMetaObject
 from PySide6.QtGui import QDesktopServices, QFontDatabase, QGuiApplication, QCursor
 from documents import atomic_write, atomic_json, bundle, image_data, materialize_assets, open_note, MIMES, MAX_IMAGE
@@ -80,7 +80,7 @@ class PinnedHTTPHandler(urllib.request.HTTPHandler):
 class PinnedHTTPSHandler(urllib.request.HTTPSHandler):
     def https_open(self, request):
         pinned = public_address(request.full_url)
-        return self.do_open(lambda host, **kwargs: _PinnedHTTPSConnection(host, pinned=pinned, **kwargs), request, context=ssl.create_default_context())
+        return self.do_open(lambda host, **kwargs: _PinnedHTTPSConnection(host, pinned=pinned, **kwargs), request, context=client_context())
 
 def local_path(value: str) -> Path:
     url = QUrl(value)
@@ -711,7 +711,7 @@ class Studio(QObject):
         def done(info,error):
             self.update_running=False
             if error:
-                self.update_status="Couldn't check updates. Your notes still work offline."
+                self.update_status=updates.check_failure(error)
                 if not automatic:self.message=self.update_status
                 return
             # Offline/repeated checks must not forget a verified ready installer.
@@ -736,7 +736,7 @@ class Studio(QObject):
             try:
                 linux_kind=updates.linux_install_kind() if sys.platform.startswith("linux") else "appimage"
                 return updates.release_info(updates.bounded_json(updates.API),self.appVersion,linux_kind=linux_kind),None
-            except Exception as failure:return None,str(failure)
+            except Exception as failure:return None,failure
         self._submit(check,lambda result,error:done(*(result or (None,error))),False)
 
     @Property(str,notify=changed)
