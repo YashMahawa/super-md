@@ -57,7 +57,7 @@ per fixture). These newer observations do **not** establish a passed final gate:
 |---|---:|---:|---:|
 | Small | 40.2 → 37.1 | 391.4 → 407.1 | 33.2 → 33.2 |
 | Math-heavy | 440.7 → 435.8 | 451.7 → 464.7 | 70.5 → 70.0 |
-| 1 MB Markdown | 786.0 → 874.6 | 435.0 → 452.9 | 78.1 → 66.4 |
+| 1 MB Markdown | 786.0 → 874.6 | 434.9 → 452.9 | 78.1 → 66.4 |
 | Many blocks | 391.5 → 359.3 | 414.3 → 433.1 | 44.0 → 36.3 |
 | Huge single block | 139.2 → 118.2 | 414.1 → 431.3 | 33.4 → 33.1 |
 
@@ -68,3 +68,27 @@ and implementation costs. In particular the 1 MB cold slowdown and consistent
 native-memory increase must not be hidden behind the earlier faster sample.
 No runtime-memory or universal performance improvement is claimed from these
 results, and they do not qualify a release.
+
+### Follow-up isolation
+
+Reversing the packaged test order produced 693 ms for the candidate's 1 MB
+load versus 767 ms for the baseline (three launches each), so the earlier
+single slower batch was not reproducible. The package-memory gap persisted.
+An allowlisted `/proc` mapping check found that ICU/libxml2 explained less
+than 1 MiB of that gap, despite their substantial on-disk sizes; library file
+size alone is not a resident-memory explanation.
+
+For a controlled implementation comparison, both source versions were then
+run with the **same Python/Qt environment**, each with its matching reader
+assets and three fresh processes. This is not an installed-package test:
+
+| Fixture | Baseline → candidate first equation, median ms | Baseline → candidate cold PSS MiB | Baseline → candidate post-revisit/theme PSS MiB |
+|---|---:|---:|---:|
+| Small | 31.1 → 39.4 | 415.2 → 415.3 | 415.6 → 415.3 |
+| 1 MB Markdown | 768.7 → 691.1 | 460.2 → 461.7 | 466.0 → 469.4 |
+
+The large constant package-memory gap is absent in this controlled source
+comparison. The 1 MB candidate retains more analysis data (JS heap 17.10 →
+18.78 MB) while avoiding repeated work. This bounded speed/memory tradeoff
+is recorded explicitly; final comparable release-package and interactive
+checks are still required.

@@ -13,6 +13,7 @@ export interface SourceBlock {start:number;end:number;text:string}
 export interface OutlineEntry {id:string;title:string;level:number;offset:number}
 export interface PythonCellSource {source:string;ordinal:number;offset:number}
 export interface DocumentAnalysis {tree:Root;blocks:SourceBlock[];outline:OutlineEntry[];tasks:number[];pythonCells:PythonCellSource[]}
+export interface SourceDocumentAnalysis {source:string;analysis:DocumentAnalysis}
 const processor=unified().use(remarkParse).use(remarkSourceSyntax).use(remarkGfm).use(remarkMath).use(remarkObsidianMath).use(remarkSvgBlocks);
 const cache=new Map<string,{value:DocumentAnalysis;weight:number}>();let retained=0;
 const LIMIT=8_000_000;

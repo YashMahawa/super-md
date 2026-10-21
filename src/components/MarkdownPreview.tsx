@@ -19,6 +19,7 @@ import {DocumentAppearance} from '../documentAppearance';
 import {svgDataBackdrop} from '../svgImage';
 import {adaptSvgData} from '../svgTheme';
 import {analyzeDocument} from '../documentAnalysis';
+import type {SourceDocumentAnalysis} from '../documentAnalysis';
 import {resolveReaderRasterAsset} from '../readerAssets';
 import type {ReaderAccessibilityPreference} from '../types';
 export {normalizeCallouts} from '../markdownSource';
@@ -130,15 +131,17 @@ interface Props extends ReaderAccessibilityPreference {
   onTrustImageHost?: (host: string) => void;
   onChange?: (markdown:string)=>void;
   renderBlock?:MarkdownBlockRenderer;
+  sourceAnalysis?:SourceDocumentAnalysis;
 }
 
-function MarkdownPreview({ markdown, documentPath, python, dark, trustedImageHosts = EMPTY_TRUSTED_IMAGE_HOSTS, onTrustImageHost, onChange,renderBlock,fullDocumentAccessibility=false }: Props) {
-  const analysis=useMemo(()=>analyzeDocument(markdown),[markdown]);
+function MarkdownPreview({ markdown, documentPath, python, dark, trustedImageHosts = EMPTY_TRUSTED_IMAGE_HOSTS, onTrustImageHost, onChange,renderBlock,fullDocumentAccessibility=false,sourceAnalysis }: Props) {
+  const analysis=useMemo(()=>sourceAnalysis?.source===markdown?sourceAnalysis.analysis:analyzeDocument(markdown),[markdown,sourceAnalysis]);
   const tasks=onChange?analysis.tasks:[];
   const renderImage = useCallback(({src,alt}:{src?:string;alt?:string})=><AssetImage src={src} alt={alt} documentPath={documentPath} trustedImageHosts={trustedImageHosts} onTrustImageHost={onTrustImageHost}/>,[documentPath,trustedImageHosts,onTrustImageHost]);
   return (
     <article className="markdown-body" onCopy={event=>{if(event.currentTarget.closest('.live-document'))return;const source=selectedMarkdown(window.getSelection(),markdown);if(source!==null){event.clipboardData.setData("text/plain",source);event.preventDefault();}}}>
       <CachedMarkdown
+        sourceAnalysis={{source:markdown,analysis}}
         renderBlock={renderBlock}
         windowingEnabled={!fullDocumentAccessibility}
         remarkPlugins={[remarkGfm, remarkMath, remarkObsidianMath, remarkSvgBlocks, remarkCallouts, remarkHeadingIds, remarkTaskPositions,remarkSourcePositions]}

@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 import { renderToStaticMarkup } from "react-dom/server";
 import MarkdownPreview, { normalizeCallouts } from "./MarkdownPreview";
+import { analyzeDocument } from "../documentAnalysis";
 
 describe("Obsidian callouts", () => {
   it("renders a tip with its title and body", () => {
@@ -31,6 +32,38 @@ describe("Obsidian callouts", () => {
     expect(html).toContain('class="callout callout-warning"');
     expect(html).toContain("No silent code execution");
     expect(html).toContain("Python runs only on click.");
+  });
+});
+
+describe("supplied source analysis rendering", () => {
+  it("preserves math, headings, tasks, references, footnotes, and Python blocks", () => {
+    const markdown = [
+      "# Supplied analysis heading",
+      "",
+      "A reference [source][destination] and a footnote[^note].",
+      "",
+      "[destination]: https://example.org/reference",
+      "[^note]: Generated footnote detail.",
+      "",
+      "- [ ] A task with $x^2$",
+      "",
+      "```python",
+      "print('unchanged')",
+      "```",
+    ].join("\n");
+    const sourceAnalysis = { source: markdown, analysis: analyzeDocument(markdown) };
+    const props = { markdown, documentPath: null, python: "", dark: false };
+    const withoutSupplied = renderToStaticMarkup(<MarkdownPreview {...props} />);
+    const withSupplied = renderToStaticMarkup(<MarkdownPreview {...props} sourceAnalysis={sourceAnalysis} />);
+
+    expect(withSupplied).toBe(withoutSupplied);
+    expect(withSupplied).toContain('id="supplied-analysis-heading"');
+    expect(withSupplied).toContain('class="katex"');
+    expect(withSupplied).toContain('type="checkbox"');
+    expect(withSupplied).toContain('href="https://example.org/reference"');
+    expect(withSupplied).toContain("Generated footnote detail.");
+    expect(withSupplied).toContain('class="python-cell"');
+    expect(withSupplied).toContain("unchanged");
   });
 });
 

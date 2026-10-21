@@ -12,7 +12,10 @@ export class ReaderEdits {
     // not retain forty large source snapshots merely to keep revision numbers.
     for(const [key,value] of this.sessions)if(key!==id&&!value.running&&value.latest===value.ack)this.sessions.delete(key);
     const existing=this.sessions.get(id);
-    if(existing&&(existing.latest===content||existing.running))return;
+    // A clean baseline may be superseded while its initial sync is in flight.
+    // Keep unsent edits even after a failed sync, but do not let a stale clean
+    // session poison a later flush of native-authoritative replacement text.
+    if(existing&&(existing.latest===content||existing.latest!==existing.ack))return;
     this.sessions.set(id,{id,epoch:crypto.randomUUID(),ack:content,latest:content,revision:0,ready:false});
     // Only inactive, settled sessions may be evicted. Notes remain native-owned.
     for(const [key,value] of this.sessions){if(this.sessions.size<=40)break;if(key!==id&&!value.running&&value.latest===value.ack)this.sessions.delete(key);}
@@ -25,9 +28,14 @@ export class ReaderEdits {
     return this.pump(session);
   }
   async flush(id:string){
-    const session=this.sessions.get(id);if(!session)return;
-    await this.pump(session);
-    if(session.error)throw session.error;
+    for(;;){
+      const session=this.sessions.get(id);if(!session)return;
+      try{await this.pump(session);}
+      catch(error){if(this.sessions.get(id)!==session)continue;throw error;}
+      if(this.sessions.get(id)!==session)continue;
+      if(session.error)throw session.error;
+      return;
+    }
   }
   private pump(session:Session):Promise<void>{
     if(session.running)return session.running;
@@ -38,9 +46,11 @@ export class ReaderEdits {
     try{
       if(!session.ready){
         const reply=await this.send('document_sync',{id:session.id,epoch:session.epoch,revision:0,content:session.ack});
+        if(this.sessions.get(session.id)!==session)return;
         if(!reply.accepted){
           const draft=session.latest;
           const recovery=await this.send('document_resync',{id:session.id,epoch:session.epoch,revision:0,bases:[session.ack],content:draft});
+          if(this.sessions.get(session.id)!==session)return;
           if(!recovery.accepted)throw new Error('The document changed outside this edit session. Your unsent text is still in the editor.');
           session.ack=draft;session.revision=0;
         }
@@ -54,10 +64,12 @@ export class ReaderEdits {
         let reply:Reply;
         try{reply=await this.send('document_patch',args);}
         catch{reply={accepted:false};}
+        if(this.sessions.get(session.id)!==session)return;
         if(!reply.accepted||reply.revision!==revision){
           // Native may already have applied the transaction when its reply was lost.
           const recovered=session.latest;
           reply=await this.send('document_resync',{id:session.id,epoch:session.epoch,revision:0,bases:[before,after],content:recovered});
+          if(this.sessions.get(session.id)!==session)return;
           if(!reply.accepted)throw new Error('Edit acknowledgement failed. Your unsent text is still in the editor; save/close was stopped.');
           session.ack=recovered;session.revision=0;continue;
         }
@@ -66,7 +78,7 @@ export class ReaderEdits {
       }
       if(session.pending?.after===session.ack)session.pending=undefined;
       session.error=undefined;
-    }catch(error){session.error=error instanceof Error?error:new Error(String(error));throw session.error;}
+    }catch(error){if(this.sessions.get(session.id)!==session)return;session.error=error instanceof Error?error:new Error(String(error));throw session.error;}
   }
 }
 

@@ -8,18 +8,19 @@ import {visit} from "unist-util-visit";
 import type {Root} from "hast";
 import {useMemo,type ReactNode} from "react";
 import WindowedBlock,{useWindowing} from "./WindowedBlock";
-import {analyzeDocument} from '../documentAnalysis';
+import {analyzeDocument,type SourceDocumentAnalysis} from '../documentAnalysis';
 
 // Theme, mode and tab changes must not run KaTeX/highlighting again. Cache
 // immutable, sanitized trees, with a byte estimate and LRU bound, not an
 // unbounded collection of whole documents or screenshots.
 const cache=new Map<string,{tree:Root;weight:number}>();let retained=0;
 const LIMIT=24_000_000;
-export function cachedMarkdownTree(source:string,remarkPlugins:PluggableList,rehypePlugins:PluggableList,deferred=false):Root {
+export function cachedMarkdownTree(source:string,remarkPlugins:PluggableList,rehypePlugins:PluggableList,deferred=false,sourceAnalysis?:SourceDocumentAnalysis):Root {
   const key=(deferred?'deferred:':'full:')+source;
   const hit=cache.get(key);if(hit){cache.delete(key);cache.set(key,hit);return hit.tree;}
   const processor=unified().use(remarkParse).use(remarkPlugins).use(remarkRehype,{allowDangerousHtml:true}).use(rehypePlugins);
-  const tree=processor.runSync(structuredClone(analyzeDocument(source).tree),source) as Root;let weight=source.length*2;
+  const analysis=sourceAnalysis?.source===source?sourceAnalysis.analysis:analyzeDocument(source);
+  const tree=processor.runSync(structuredClone(analysis.tree),source) as Root;let weight=source.length*2;
   visit(tree,(node:any,index,parent:any)=>{
     weight+=160+(typeof node.value==="string"?node.value.length*2:0);
     if(node.type==="raw"&&parent&&index!==undefined){parent.children[index]={type:"text",value:node.value};return;}
@@ -35,9 +36,9 @@ export function cachedMarkdownTree(source:string,remarkPlugins:PluggableList,reh
 }
 export interface RenderedMarkdownBlock {node:any;index:number;content:ReactNode;text:string;headings:Array<{id:string;key:string}>;estimate:number;windowed:boolean}
 export type MarkdownBlockRenderer=(block:RenderedMarkdownBlock)=>ReactNode;
-export default function CachedMarkdown({children,remarkPlugins,rehypePlugins,components,renderBlock,windowingEnabled=true}:{children:string;remarkPlugins:PluggableList;rehypePlugins:PluggableList;components:Components;renderBlock?:MarkdownBlockRenderer;windowingEnabled?:boolean}){
+export default function CachedMarkdown({children,remarkPlugins,rehypePlugins,components,renderBlock,windowingEnabled=true,sourceAnalysis}:{children:string;remarkPlugins:PluggableList;rehypePlugins:PluggableList;components:Components;renderBlock?:MarkdownBlockRenderer;windowingEnabled?:boolean;sourceAnalysis?:SourceDocumentAnalysis}){
   const supportsWindowing=useWindowing(),windowing=windowingEnabled&&supportsWindowing&&children.length>80_000;
-  const tree=cachedMarkdownTree(children,remarkPlugins,windowing?[]:rehypePlugins,windowing);
+  const tree=cachedMarkdownTree(children,remarkPlugins,windowing?[]:rehypePlugins,windowing,sourceAnalysis);
   const blocks=useMemo(()=>windowing||renderBlock?tree.children.filter(node=>node.type!=='text'||node.value.trim()).map((node:any,index)=>{const text=plainText(node);return {node,index,text,headings:headingsOf(node),estimate:Math.min(1200,Math.max(80,text.length/65*30+(node.tagName==='pre'?220:40)))};}):[],[tree,windowing,!!renderBlock]);
   if(renderBlock)return <>{blocks.map(block=>renderBlock({...block,windowed:windowing,content:windowing?<DeferredMarkdown node={block.node} plugins={rehypePlugins} components={components}/>:toJsxRuntime({type:'root',children:[block.node]},{Fragment,jsx,jsxs,components,ignoreInvalidStyle:true,passKeys:true,passNode:true})}))}</>;
   if(!windowing)return toJsxRuntime(tree,{Fragment,jsx,jsxs,components,ignoreInvalidStyle:true,passKeys:true,passNode:true});

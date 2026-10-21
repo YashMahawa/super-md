@@ -26,4 +26,51 @@ describe('reader edit transport',()=>{
     const edits=new ReaderEdits(send);edits.open('note','a');await edits.change('note','b');
     expect((send.mock.calls[2] as any)[1]).toMatchObject({bases:['a','b'],content:'b'});
   });
+  it('rebinds a clean session when native content changes during its initial sync',async()=>{
+    let release!:(value:any)=>void;
+    const send=vi.fn(async(command:string,args:any)=>{
+      if(command==='document_sync'&&args.content==='old native text')return await new Promise<any>(resolve=>{release=resolve;});
+      if(command==='document_sync'&&args.content==='new native text')return {accepted:true,revision:0};
+      return {accepted:false};
+    });
+    const edits=new ReaderEdits(send);
+    edits.open('note','old native text');
+    const flushing=edits.flush('note');
+    edits.open('note','new native text');
+    release({accepted:false});
+    await expect(flushing).resolves.toBeUndefined();
+    await expect(edits.flush('note')).resolves.toBeUndefined();
+    expect(send.mock.calls.map(([command])=>command)).toEqual(['document_sync','document_sync']);
+    expect(edits.unacknowledged('note')).toBeUndefined();
+  });
+  it('never replaces an unsent local draft with an incoming native baseline',async()=>{
+    let release!:(value:any)=>void;
+    const send=vi.fn(async(command:string)=>command==='document_sync'?await new Promise<any>(resolve=>{release=resolve;}):{accepted:false});
+    const edits=new ReaderEdits(send);
+    edits.open('note','old native text');
+    const changing=edits.change('note','unsent local draft');
+    edits.open('note','external native text');
+    release({accepted:false});
+    await expect(changing).rejects.toThrow();
+    expect(edits.unacknowledged('note')).toBe('unsent local draft');
+    edits.open('note','another external update');
+    expect(edits.unacknowledged('note')).toBe('unsent local draft');
+  });
+  it('ignores a retired resync failure and flushes the new clean baseline',async()=>{
+    let release!:(value:any)=>void,entered!:()=>void;
+    const resyncStarted=new Promise<void>(resolve=>{entered=resolve;});
+    const send=vi.fn(async(command:string,args:any)=>{
+      if(command==='document_resync')return await new Promise<any>(resolve=>{release=resolve;entered();});
+      return {accepted:args.content==='replacement',revision:0};
+    });
+    const edits=new ReaderEdits(send);
+    edits.open('note','original');
+    const flushing=edits.flush('note');
+    await resyncStarted;
+    edits.open('note','replacement');
+    release({accepted:false});
+    await expect(flushing).resolves.toBeUndefined();
+    expect(send.mock.calls.map(([command])=>command)).toEqual(['document_sync','document_resync','document_sync']);
+    expect(send.mock.calls.at(-1)?.[1].content).toBe('replacement');
+  });
 });

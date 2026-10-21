@@ -27,6 +27,7 @@ import ReadingSearch from "./components/ReadingSearch";
 import type { Point } from "./focalZoom";
 import { applyDocumentZoom,documentPoint,invalidateDocumentZoom,settleDocumentZoom,refreshDocumentExtent,enforceDocumentCenter } from "./documentZoom";
 import { documentOutline, navigateToHeading, cancelHeadingNavigation } from "./documentNavigation";
+import { readerSourceAnalysis } from "./readerSourceAnalysis";
 import {OutlineWorkerClient} from './outlineWorker';
 import {recordHistory,replayHistory,historySize,validHistory,type NoteHistory} from './noteHistory';
 import {cachedEditorHistory} from './components/Editor';
@@ -50,6 +51,7 @@ declare global {interface Window {supermdExportPhase?:(id:string,phase:'typesett
 interface ReaderState { centerLock?:boolean; customStyle?:CustomStyle; restorePosition?:boolean; readingLocation?:ReadingLocation|null; imageAppearance?:MediaAppearance; svgAppearance?:MediaAppearance; imageContrast?:number }
 function Reader() {
   const [state, setState] = useState<ReaderState | null>(null);
+  const readerAnalysis=useMemo(()=>state?readerSourceAnalysis(state.mode,state.content):null,[state?.mode,state?.content]);
   const [repairing, setRepairing] = useState(false);
   const [searching,setSearching] = useState(false);
   const [pdfExport,setPdfExport]=useState<PdfExportStatus|null>(null);
@@ -289,20 +291,21 @@ function Reader() {
       void (async()=>{
         let headings;
         try{
-          if(workerBacked){outlineWorker.current??=new OutlineWorkerClient();headings=await outlineWorker.current.request(content,controller.signal);}
+          if(readerAnalysis?.source===content)headings=readerAnalysis.analysis.outline;
+          else if(workerBacked){outlineWorker.current??=new OutlineWorkerClient();headings=await outlineWorker.current.request(content,controller.signal);}
           else headings=documentOutline(content);
         }catch{
           if(controller.signal.aborted)return;
           // Worker creation/analysis can be unavailable in an older WebView;
           // keep the existing synchronous analysis as the correctness path.
-          headings=documentOutline(content);
+          headings=readerAnalysis?.source===content?readerAnalysis.analysis.outline:documentOutline(content);
         }
         if(controller.signal.aborted||reference.current?.id!==id||reference.current.content!==content)return;
         void invoke('document_outline',{id,headings}).catch(()=>{});
       })();
     },content.length>80_000?180:0);
     return()=>{window.clearTimeout(timer);controller.abort();if(workerBacked)outlineWorker.current?.cancel();};
-  },[state?.id,state?.content,state?.mode]);
+  },[state?.id,state?.content,state?.mode,readerAnalysis]);
   useEffect(()=>()=>{outlineWorker.current?.dispose();outlineWorker.current=null;},[]);
   useLayoutEffect(() => {
     if (!state) return;
@@ -511,7 +514,7 @@ function Reader() {
     <MediaTools key={state.id} documentId={state.id} content={state.content} documentPath={state.path} onInsert={(text, point) => { const content = reference.current!.content; const from = Math.min(point?.from ?? content.length, content.length); const to = Math.max(from, Math.min(point?.to ?? from, content.length)); update(content.slice(0, from) + text + content.slice(to)); }} onNotice={(error) => { void invoke("export_failed", { error }); }} />
     {(state.mode === "editor" || state.mode === "split") && <section className="android-source"><SourceEditor key={state.id} sessionId={state.id} value={state.content} onChange={update} dark={state.dark} focusMode={state.fullscreen} spellCheck={state.spellCheck} grammarCheck={state.grammarCheck} /></section>}
     {state.mode === "live" && <section className="android-reading" data-full-document-accessibility={state.fullDocumentAccessibility ? "true" : undefined}><div className="reader-chrome-spacer" aria-hidden="true"/><div className="document-page-space"><div className="document-page"><LiveDocument key={state.id} spellCheck={state.spellCheck} grammarCheck={state.grammarCheck} markdown={state.content} onChange={update} documentPath={state.path} python={state.python || "embedded"} dark={false} trustedImageHosts={trustedHosts} onTrustImageHost={trustHost} fullDocumentAccessibility={state.fullDocumentAccessibility} /></div></div></section>}
-    {(state.mode === "reader" || state.mode === "split") && <section className="android-reading" data-full-document-accessibility={state.fullDocumentAccessibility ? "true" : undefined}><div className="reader-chrome-spacer" aria-hidden="true"/><div className="document-page-space"><div className="document-page"><DocumentPreview markdown={state.content} onChange={update} documentPath={state.path} python={state.python || "embedded"} dark={false} trustedImageHosts={trustedHosts} onTrustImageHost={trustHost} fullDocumentAccessibility={state.fullDocumentAccessibility} /></div></div></section>}
+    {(state.mode === "reader" || state.mode === "split") && <section className="android-reading" data-full-document-accessibility={state.fullDocumentAccessibility ? "true" : undefined}><div className="reader-chrome-spacer" aria-hidden="true"/><div className="document-page-space"><div className="document-page"><DocumentPreview markdown={state.content} onChange={update} documentPath={state.path} python={state.python || "embedded"} dark={false} trustedImageHosts={trustedHosts} onTrustImageHost={trustHost} fullDocumentAccessibility={state.fullDocumentAccessibility} sourceAnalysis={readerAnalysis?.source===state.content?readerAnalysis:undefined} /></div></div></section>}
   </div></DocumentAppearance.Provider>;
 }
 createRoot(document.getElementById("root")!).render(<Reader />);

@@ -40,6 +40,26 @@ at its response. It excludes the harness's rAF monitor warmup/cooldown. Earlier
 exploratory timing that included those monitor delays is invalid and is not
 used in this table.
 
+### Oversized-document analysis reuse
+
+The bounded analysis LRU deliberately rejects entries whose estimated retained
+size exceeds 8 MB. A generated 4 MB paragraph therefore returned different
+analysis objects on successive calls (about 1.94 s per call in one isolated
+diagnostic run). Previously, preview rendering could request that cold analysis
+again immediately after its parent had already computed it; native outlines
+could add another parse.
+
+Read/Split now own one memoized analysis for the exact source, sharing it with
+preview transformation and outline projection. Live shares its existing frozen
+editor-source analysis with its preview; it does not gain a new parent analysis
+on every keystroke. Source mode retains the compact-outline worker. The shared
+handoff checks the exact source and preserves the original fallback, and the
+global cache bounds are unchanged. Tests verify one analysis call on the large
+Read path, fallback for mismatched source, no new Live/Source parent analysis,
+and equivalent math, tasks, headings, references, footnotes and Python markup.
+End-to-end large-file timings must be repeated after this change; the isolated
+diagnostic is not an installed-app speed guarantee.
+
 ## Image stress methodology
 
 The optional image fixture keeps encoded Markdown under 2 MB while containing
