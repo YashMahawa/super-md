@@ -14,6 +14,7 @@ import org.junit.After
 import org.junit.Rule
 import org.junit.Test
 import java.util.concurrent.atomic.AtomicReference
+import kotlin.math.abs
 
 class StudioUiTest {
     @get:Rule val compose = createAndroidComposeRule<MainActivity>()
@@ -55,6 +56,36 @@ class StudioUiTest {
         }
     }
     private fun web(view: View): WebView? = if (view is WebView) view else if (view is ViewGroup) (0 until view.childCount).firstNotNullOfOrNull { web(view.getChildAt(it)) } else null
+    /** Resolve touch input to this resumed activity, never an instrumentation helper root. */
+    private fun activityRoot(): SemanticsNodeInteraction {
+        compose.waitForIdle()
+        val metrics = AtomicReference<Triple<Int, Int, Boolean>>()
+        androidx.test.platform.app.InstrumentationRegistry.getInstrumentation().runOnMainSync {
+            val activity = compose.activity
+            val decor = activity.window.decorView
+            val resumed = androidx.test.runner.lifecycle.ActivityLifecycleMonitorRegistry.getInstance()
+                .getActivitiesInStage(androidx.test.runner.lifecycle.Stage.RESUMED).any { it === activity }
+            metrics.set(Triple(decor.width, decor.height, resumed && decor.isAttachedToWindow && decor.isShown))
+        }
+        val (width, height, displayed) = metrics.get()
+        assertTrue("The tested MainActivity must be resumed and displayed before injecting touch", displayed)
+        assertTrue("The tested activity must have measured bounds", width > 0 && height > 0)
+        val roots = compose.onAllNodes(isRoot(), useUnmergedTree = true).fetchSemanticsNodes()
+        val matching = roots.filter { node ->
+            abs(node.boundsInRoot.width - width) <= 1f && abs(node.boundsInRoot.height - height) <= 1f
+        }
+        assertEquals(
+            "Expected exactly one semantics root matching the resumed MainActivity bounds ${width}x${height}; found ${matching.size}",
+            1,
+            matching.size,
+        )
+        return compose.onNode(
+            isRoot() and SemanticsMatcher("root matching resumed MainActivity bounds ${width}x${height}") { node ->
+                abs(node.boundsInRoot.width - width) <= 1f && abs(node.boundsInRoot.height - height) <= 1f
+            },
+            useUnmergedTree = true,
+        )
+    }
     private fun javascriptUntil(script: String, accepted: (String) -> Boolean): String {
         val result = AtomicReference("")
         val inFlight=java.util.concurrent.atomic.AtomicBoolean(false)
@@ -435,7 +466,7 @@ class StudioUiTest {
         val density=rect.getDouble("d").toFloat()
         val x=native.get()[0]+rect.getDouble("x").toFloat()*density
         val y=native.get()[1]+rect.getDouble("y").toFloat()*density
-        compose.onRoot().performTouchInput {
+        activityRoot().performTouchInput {
             down(0,androidx.compose.ui.geometry.Offset(x-25*density,y));down(1,androidx.compose.ui.geometry.Offset(x+25*density,y));advanceEventTime(50)
             moveTo(0,androidx.compose.ui.geometry.Offset(x-15*density,y+10*density));moveTo(1,androidx.compose.ui.geometry.Offset(x+35*density,y+10*density));advanceEventTime(50)
             moveTo(0,androidx.compose.ui.geometry.Offset(x-35*density,y+10*density));moveTo(1,androidx.compose.ui.geometry.Offset(x+55*density,y+10*density));advanceEventTime(50);up(0);up(1)
@@ -807,7 +838,7 @@ ax.set_title("Matplotlib 3D figure")
             javascriptUntil("window.supermdNativeWheel?.(0,0,{x:innerWidth/2,y:innerHeight*.75},false);document.querySelector('.android-reading').scrollTop=0;true") {it=="true"}
             javascriptUntil("document.querySelector('h1').getBoundingClientRect().top>=parseFloat(getComputedStyle(document.documentElement).getPropertyValue('--native-chrome-inset'))") {it=="true"}
             // A margin tap has no text/link/edit action and toggles reading UI.
-            compose.onRoot().performTouchInput {click(androidx.compose.ui.geometry.Offset(this.width*.98f,height*.60f))}
+            activityRoot().performTouchInput {click(androidx.compose.ui.geometry.Offset(this.width*.98f,height*.60f))}
             compose.waitUntil(5000) {compose.onAllNodesWithContentDescription("Open files").fetchSemanticsNodes().isEmpty()}
             compose.onNodeWithContentDescription("Fullscreen study").assertDoesNotExist()
             assertEquals("Hiding normal chrome must not resize the reading viewport",viewport,javascriptUntil("JSON.stringify([innerWidth,innerHeight])") {it.contains(",")})
@@ -815,7 +846,7 @@ ax.set_title("Matplotlib 3D figure")
             val nativeWidth=AtomicReference(0)
             compose.runOnIdle {nativeWidth.set(web(compose.activity.window.decorView)!!.width)}
             assertEquals("Landscape document must extend into the cutout region",compose.activity.window.decorView.width,nativeWidth.get())
-            compose.onRoot().performTouchInput {click(androidx.compose.ui.geometry.Offset(this.width*.98f,height*.60f))}
+            activityRoot().performTouchInput {click(androidx.compose.ui.geometry.Offset(this.width*.98f,height*.60f))}
             compose.waitUntil(5000) {compose.onAllNodesWithContentDescription("Open files").fetchSemanticsNodes().isNotEmpty()}
             compose.onNodeWithContentDescription("Fullscreen study").performClick()
             javascriptUntil("document.documentElement.dataset.fullscreen") {it=="\"true\""}
@@ -824,7 +855,7 @@ ax.set_title("Matplotlib 3D figure")
             assertEquals("The actual text column, not just its outer page, must retain its width",textWidth,javascriptUntil("document.querySelector('.markdown-body').clientWidth") {it.toIntOrNull()!=null})
             assertEquals("Fullscreen must not resize the reading viewport",viewport,javascriptUntil("JSON.stringify([innerWidth,innerHeight])") {it.contains(",")})
             compose.waitUntil(5000) {compose.onAllNodesWithContentDescription("Exit fullscreen").fetchSemanticsNodes().isEmpty()}
-            compose.onRoot().performTouchInput {click(androidx.compose.ui.geometry.Offset(this.width*.98f,height*.60f))}
+            activityRoot().performTouchInput {click(androidx.compose.ui.geometry.Offset(this.width*.98f,height*.60f))}
             compose.waitUntil(5000) {compose.onAllNodesWithContentDescription("Exit fullscreen").fetchSemanticsNodes().isNotEmpty()}
             compose.onNodeWithContentDescription("Show contents").assertIsDisplayed()
             assertEquals("Showing compact chrome must not resize the reading viewport",viewport,javascriptUntil("JSON.stringify([innerWidth,innerHeight])") {it.contains(",")})

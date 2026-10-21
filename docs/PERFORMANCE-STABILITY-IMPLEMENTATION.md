@@ -23,7 +23,7 @@ No release is ready until the final cross-platform and installer gates pass.
 - [x] Add native lifecycle and renderer-failure recovery tests (owned Qt renderer kill passed; Android lifecycle unit coverage, emulator execution remains a release gate).
 - [x] Add Unicode/reordering/interruption/flush edit-protocol tests (TypeScript, Qt and Android).
 - [x] Add huge-block, image-decode and repeated-cycle memory fixtures (three fresh 31.36 MP image runs and six revisits passed; long-session leak qualification remains separate).
-- [ ] Verify screen-reader/keyboard semantic navigation strategy.
+- [x] Verify full-document accessibility strategy with Chromium AX-tree and keyboard navigation tests (distant headings, lists, tables, links, footnotes and code controls; manual TalkBack/NVDA/Orca validation is not claimed).
 
 ## Correctness and resilience
 
@@ -51,7 +51,7 @@ No release is ready until the final cross-platform and installer gates pass.
 
 ## Build and package efficiency
 
-- [ ] ABI/platform-keyed Python wheel caching and verify actual warm reuse.
+- [x] ABI/platform-keyed Python wheel caching and verify actual warm reuse (Ubuntu CI 39521221615 restored the exact key, verified wheel hashes, and completed a real offline cached install; mock-test log messages are not counted as this evidence).
 - [x] Gradle dependency/task caching and phase-level Android CI timings (signed task output reuse disabled).
 - [ ] Evaluate immutable emulator APK reuse while retaining both API suites.
 - [x] Bounded incremental local build lane; no unrelated daemon termination.

@@ -26,7 +26,7 @@ describe('reader edit transport',()=>{
     const edits=new ReaderEdits(send);edits.open('note','a');await edits.change('note','b');
     expect((send.mock.calls[2] as any)[1]).toMatchObject({bases:['a','b'],content:'b'});
   });
-  it('rebinds a clean session when native content changes during its initial sync',async()=>{
+  it.each([false,true])('rebinds a clean session when native content changes during initial sync (retired acceptance %s)',async accepted=>{
     let release!:(value:any)=>void;
     const send=vi.fn(async(command:string,args:any)=>{
       if(command==='document_sync'&&args.content==='old native text')return await new Promise<any>(resolve=>{release=resolve;});
@@ -37,7 +37,7 @@ describe('reader edit transport',()=>{
     edits.open('note','old native text');
     const flushing=edits.flush('note');
     edits.open('note','new native text');
-    release({accepted:false});
+    release({accepted});
     await expect(flushing).resolves.toBeUndefined();
     await expect(edits.flush('note')).resolves.toBeUndefined();
     expect(send.mock.calls.map(([command])=>command)).toEqual(['document_sync','document_sync']);

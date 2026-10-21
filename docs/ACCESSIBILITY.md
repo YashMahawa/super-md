@@ -12,9 +12,13 @@ screen-reader traversal or document-wide Find is more important than the
 large-note memory savings. The regular outline, in-app search, heading links,
 and focused-block reveal remain available in the default mode.
 
-This opt-in has been covered by DOM tests for complete rendering and heading
-navigation, but it has **not** been manually verified with TalkBack, NVDA,
-Orca, or another screen reader. Before claiming assistive-technology support,
+This opt-in has DOM coverage for complete rendering and heading navigation, and
+a Playwright check that inspects Chromium's full accessibility tree for distant
+headings, lists, tables, links and footnote text, then checks keyboard focus
+from a link to the Python run button. This is an automated browser-tree check,
+not manual assistive-technology validation. It has **not** been manually
+verified with TalkBack, NVDA, Orca, or another screen reader. Before claiming
+assistive-technology support,
 manually verify continuous reading, heading/list/table/link traversal,
 footnotes and backlinks, keyboard tab/focus, browser or in-app Find, and
 navigation back from results on Android and Qt desktop. Record OS, screen
