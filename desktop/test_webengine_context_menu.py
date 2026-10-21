@@ -7,6 +7,7 @@ import os
 import subprocess
 import sys
 import textwrap
+import time
 import unittest
 from pathlib import Path
 
@@ -65,6 +66,7 @@ ApplicationWindow {{
     width: 560; height: 420; visible: true; color: "#b32c55"
     property var reader: readerView
     property int contextMenuCount: 0
+    property bool pageReady: false
     property string menuItems: ""
     function collectMenuItems() {{
         let names = []
@@ -76,6 +78,13 @@ ApplicationWindow {{
         id: readerView; objectName: "documentReader"
         anchors.fill: parent
         url: "data:text/html,<html><body style='background:white;color:black;font:24px sans-serif'><p id='content'>Synthetic selectable text for native menu</p></body></html>"
+        onLoadingChanged: function(loadRequest) {{
+            if (loadRequest.status === WebEngineView.LoadSucceededStatus) {{
+                runJavaScript("document.readyState === 'complete' && !!document.getElementById('content')", function(ready) {{
+                    if (ready) window.pageReady = true
+                }})
+            }}
+        }}
         {production_block}
     }}
 }}
@@ -88,7 +97,14 @@ ApplicationWindow {{
     if window is None:
         raise AssertionError("Test QML failed to create: " + "\n".join(str(e) for e in component.errors()))
     try:
-        QTest.qWait(600)
+        window.show()
+        window.raise_()
+        window.requestActivate()
+        deadline = time.monotonic() + 10
+        while not window.property("pageReady") and time.monotonic() < deadline:
+            QTest.qWait(50)
+        if not window.property("pageReady"):
+            raise AssertionError("WebEngine page did not reach load-success plus DOM-ready within 10 seconds")
         reader = window.findChild(object, "documentReader")
         menu = window.findChild(object, "readerContextMenu")
         if reader is None or menu is None:
@@ -97,10 +113,14 @@ ApplicationWindow {{
         # A right-click is dispatched through Chromium's actual context request,
         # not by calling Menu.popup directly.
         context_point = QPoint(180, 120)
+        QTest.mouseMove(window, context_point)
+        QTest.qWait(100)
         QTest.mouseClick(window, Qt.MouseButton.RightButton, Qt.KeyboardModifier.NoModifier, context_point)
-        QTest.qWait(250)
+        deadline = time.monotonic() + 3
+        while not menu.property("visible") and time.monotonic() < deadline:
+            QTest.qWait(30)
         if not menu.property("visible"):
-            raise AssertionError("Right-click on WebEngine content did not open the custom menu")
+            raise AssertionError("Right-click on loaded WebEngine content did not open the custom menu within 3 seconds")
         window.collectMenuItems()
         labels = window.property("menuItems").split("|")
         if "Copy" not in labels or "Select all" not in labels:

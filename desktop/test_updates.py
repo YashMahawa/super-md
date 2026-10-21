@@ -80,7 +80,7 @@ class UpdateTest(unittest.TestCase):
             self.assertEqual(updates.linux_install_kind(executable,{},True,folder),'appimage')
         with patch('updates.shutil.which',side_effect=lambda name:'/usr/bin/dpkg-query' if name=='dpkg-query' else None),patch('updates.subprocess.run',return_value=subprocess.CompletedProcess([],0,'super-md: /opt/super-md/super-md\n','')) as query:
             self.assertEqual(updates.linux_install_kind('/opt/super-md/super-md',{},True,'/home/test'),'deb')
-            self.assertEqual(query.call_args.args[0][:3],['dpkg-query','-S','/opt/super-md/super-md'])
+            self.assertEqual(query.call_args.args[0][:3],['dpkg-query','-S',str(Path('/opt/super-md/super-md').resolve())])
         with patch('updates.shutil.which',side_effect=lambda name:'/usr/bin/rpm' if name=='rpm' else None),patch('updates.subprocess.run',return_value=subprocess.CompletedProcess([],0,'super-md','')):
             self.assertEqual(updates.linux_install_kind('/opt/super-md/super-md',{},True,'/home/test'),'rpm')
         self.assertEqual(updates.linux_install_kind('/source/desktop/.venv/bin/python',{},False,'/home/test'),'appimage')

@@ -66,7 +66,7 @@ class StudioTest(unittest.TestCase):
             {'name':'Super-MD_9.9.9_amd64.AppImage','size':4,'browser_download_url':updates.REPO+'/releases/download/v9.9.9/Super-MD_9.9.9_amd64.AppImage'},
             {'name':'Super-MD_9.9.9_amd64.deb','size':4,'browser_download_url':updates.REPO+'/releases/download/v9.9.9/Super-MD_9.9.9_amd64.deb'},
             {'name':'SHA256SUMS','size':100,'browser_download_url':updates.REPO+'/releases/download/v9.9.9/SHA256SUMS'}]}
-        with patch.object(studio,'_submit',side_effect=lambda action,done,*_:calls.append((action,done))),patch('updates.linux_install_kind',return_value='deb') as channel,patch('updates.bounded_json',return_value=release):
+        with patch('studio.sys.platform','linux'),patch.object(studio,'_submit',side_effect=lambda action,done,*_:calls.append((action,done))),patch('updates.linux_install_kind',return_value='deb') as channel,patch('updates.bounded_json',return_value=release):
             studio.checkUpdates();action,done=calls.pop();done(action(),None)
         channel.assert_called_once_with()
         self.assertEqual(studio.update_info['name'],'Super-MD_9.9.9_amd64.deb')
