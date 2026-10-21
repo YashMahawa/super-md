@@ -102,6 +102,19 @@ class StudioViewModel(app: Application, val workspaceKey: String = "main") : And
     var requestPortable: (() -> Unit)? = null
     @Volatile internal var readerFlushRequester: (suspend (String) -> Boolean)? = null
     private val readerActionMutex = Mutex()
+    private val openRequests = OpenRequestGate()
+    private val openIntentDispatcher = OpenIntentDispatcher<Uri>()
+    internal val openDispatcherSessionId: String = java.util.UUID.randomUUID().toString()
+    private var initialOpenIntentUri: String? = null
+    fun requestOpen(uri: Uri, relative: String? = null) = openIntentDispatcher.request(uri, relative)
+    fun requestInitialOpen(uri: Uri) {
+        val key = uri.toString()
+        if (initialOpenIntentUri == key) return
+        initialOpenIntentUri = key
+        requestOpen(uri)
+    }
+    internal fun attachReaderOpenHandler(handler: OpenIntentDispatcher.Handler<Uri>?) = openIntentDispatcher.attach(handler)
+    internal fun detachReaderOpenHandler(handler: OpenIntentDispatcher.Handler<Uri>) = openIntentDispatcher.detach(handler)
     private suspend fun performReaderBarrier(expectedActiveId: String, action: () -> Unit): Boolean = readerActionMutex.withLock {
         if (mutable.value.active.id != expectedActiveId) return@withLock false
         // A missing bridge is not an implicit flush acknowledgement. Only
@@ -600,6 +613,7 @@ class StudioViewModel(app: Application, val workspaceKey: String = "main") : And
 
     fun edit(id: String, content: String) { change { s -> s.copy(tabs = s.tabs.map { if (it.id == id) it.copy(content = content) else it }) }; scheduleAutosave(id) }
     fun newNote() {
+        openRequests.invalidate()
         val expected = mutable.value.active.id
         viewModelScope.launch {
             val note = Note()
@@ -619,6 +633,9 @@ class StudioViewModel(app: Application, val workspaceKey: String = "main") : And
         state.tabs.getOrNull(index)?.let{selectExpected(state.active.id,it.id)}
     }
     private fun selectExpected(expectedActiveId:String,targetId:String) {
+        // A later explicit tab choice must not be overwritten by a file load
+        // that began earlier and is still waiting on I/O or the reader flush.
+        openRequests.invalidate()
         viewModelScope.launch {
             val accepted=performReaderBarrier(expectedActiveId) {
                 if(mutable.value.tabs.any {it.id==targetId})change {it.copy(activeId=targetId)}
@@ -672,6 +689,7 @@ class StudioViewModel(app: Application, val workspaceKey: String = "main") : And
         } finally {if(locked)closedNoteMutex.unlock()}
     }
     fun close(id: String) {
+        openRequests.invalidate()
         viewModelScope.launch {
             var preserve = false
             val activeId = mutable.value.active.id
@@ -754,6 +772,7 @@ class StudioViewModel(app: Application, val workspaceKey: String = "main") : And
         }
     }
     fun reopen() {
+        openRequests.invalidate()
         val expectedActiveId = mutable.value.active.id
         val referenceNote=mutable.value.closedTabs.firstOrNull() ?: return
         val reference=closedNoteRefs.firstOrNull {it.id==referenceNote.id}
@@ -774,6 +793,7 @@ class StudioViewModel(app: Application, val workspaceKey: String = "main") : And
         }
     }
     fun recoverDeletedDraft() {
+        openRequests.invalidate()
         val expectedActiveId = mutable.value.active.id
         viewModelScope.launch {
             val note=withContext(Dispatchers.IO){deletedDrafts.latest(mutable.value.tabs.map {it.id}.toSet())}
@@ -860,8 +880,19 @@ class StudioViewModel(app: Application, val workspaceKey: String = "main") : And
         mutable.value = mutable.value.copy(busy = false, message = "PDF export cancelled")
     }
     fun busy(value: Boolean) { mutable.value = mutable.value.copy(busy = value) }
-    fun open(uri: Uri, relative: String? = null) = viewModelScope.launch {
-        val expectedActiveId = mutable.value.active.id
+    private fun retainOpenedNote(note: Note, activate: Boolean) {
+        val existing = mutable.value.tabs.find { it.uri == note.uri }
+        change { state ->
+            state.copy(
+                tabs = if (existing != null) state.tabs else state.tabs + note,
+                activeId = if (activate) existing?.id ?: note.id else state.activeId,
+            )
+        }
+        remember(existing ?: note)
+    }
+    fun open(uri: Uri, relative: String? = null): Job {
+        val request = openRequests.begin()
+        return viewModelScope.launch {
         try {
             val note = withContext(Dispatchers.IO) {
                 val existing = mutable.value.tabs.find { it.uri == uri.toString() }; if (existing != null) return@withContext existing
@@ -877,13 +908,25 @@ class StudioViewModel(app: Application, val workspaceKey: String = "main") : And
                     else { val content = readLimited(buffered, 20_000_000).toString(Charsets.UTF_8); Note(name = name, uri = uri.toString(), content = content, saved = content, relative = relative) }
                 } ?: error("Document permission is unavailable; choose it again")
             }
-            val accepted = performReaderBarrier(expectedActiveId) {
-                val existing = mutable.value.tabs.find { it.uri == note.uri }
-                change { s -> s.copy(tabs = if (existing != null) s.tabs else s.tabs + note, activeId = existing?.id ?: note.id) }
-                remember(existing ?: note)
+            if (!openRequests.isCurrent(request)) {
+                // A newer open or a user tab action owns focus, but every file
+                // the user requested still becomes an available tab.
+                retainOpenedNote(note, activate = false)
+                return@launch
             }
-            if (!accepted) readerBarrierFailed()
-        } catch (error: Exception) { fail("Could not open note: ${error.message}") }
+            val expectedActiveId = mutable.value.active.id
+            var applied = false
+            val accepted = performReaderBarrier(expectedActiveId) {
+                retainOpenedNote(note, activate = openRequests.isCurrent(request))
+                applied = true
+            }
+            if (!accepted || !applied) {
+                if (!openRequests.isCurrent(request)) retainOpenedNote(note, activate = false)
+                else readerBarrierFailed()
+            }
+        } catch (cancelled: kotlinx.coroutines.CancellationException) { throw cancelled }
+        catch (error: Exception) { if (openRequests.isCurrent(request)) fail("Could not open note: ${error.message}") }
+        }
     }
     fun save(uri: Uri? = null) = viewModelScope.launch {
         val requestedNoteId = mutable.value.active.id

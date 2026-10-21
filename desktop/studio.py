@@ -21,7 +21,7 @@ import urllib.parse
 import urllib.request
 import uuid
 from pathlib import Path
-from PySide6.QtCore import QObject, Property, Signal, Slot, QStandardPaths, QTimer, QUrl, QFileSystemWatcher, QProcess, Qt, QPointF
+from PySide6.QtCore import QObject, Property, Signal, Slot, QStandardPaths, QTimer, QUrl, QFileSystemWatcher, QProcess, Qt, QPointF, QMetaObject
 from PySide6.QtGui import QDesktopServices, QFontDatabase, QGuiApplication, QCursor
 from documents import atomic_write, atomic_json, bundle, image_data, materialize_assets, open_note, MIMES, MAX_IMAGE
 from theme import detect_system_dark, read_system_palette, system_palette_paths, tokens
@@ -362,6 +362,11 @@ class Studio(QObject):
             self.tabs.insert(0,self._note("Untitled.md"))
         self.active = self.tabs[0]["id"]
         if self.settings["startup"]=="restore" and any(t["id"]==self.session.startup_active_id for t in self.tabs):self.active=self.session.startup_active_id
+        self._activation_generation = 0
+        self._startup_placeholder_ids = {
+            tab["id"] for tab in self.tabs
+            if tab["name"] == "Untitled.md" and not tab["path"] and not tab["content"] and not tab["saved"] and not tab["assets"]
+        }
         self._restoring_paths=set()
         self._startup_order=[]
         self._startup_entries=self.session.startup_entries
@@ -369,7 +374,8 @@ class Studio(QObject):
         if self.settings["startup"]=="restore" and self.session.startup_paths:
             self._startup_order,self.session.startup_paths=self.session.startup_paths,[]
             self._restoring_paths=set(self._startup_order)
-            QTimer.singleShot(0,lambda:[self.openNote(path) for path in self._startup_order])
+            restore_generation = self._activation_generation
+            QTimer.singleShot(0,lambda:[self._open_note(path, explicit=False, activation_generation=restore_generation) for path in self._startup_order])
         self._refresh_theme()
 
     @property
@@ -1149,39 +1155,79 @@ class Studio(QObject):
 
     @Slot(str)
     def openNote(self, value):
+        self._open_note(value, explicit=True)
+
+    def _focus_open_target(self, generation):
+        if generation != self._activation_generation or self.retired:
+            return
+        window = self.host_window
+        if window is None:
+            return
+        window.raise_()
+        window.requestActivate()
+        QTimer.singleShot(0, lambda: QMetaObject.invokeMethod(window, "focusReader", Qt.ConnectionType.QueuedConnection)
+                          if generation == self._activation_generation and not self.retired else None)
+
+    def _open_note(self, value, *, explicit, activation_generation=None):
         if self.retired:return
         path = local_path(value)
-        restoring=str(path) in self._restoring_paths
         if path.is_dir():
             self.openFolder(str(path))
             return
+        if explicit:
+            self._activation_generation += 1
+            activation_generation = self._activation_generation
+        elif activation_generation is None:
+            activation_generation = self._activation_generation
+        restoring = not explicit and str(path) in self._restoring_paths
         found = next((t for t in self.tabs if t["path"] == str(path)), None)
         if found:
             self._restoring_paths.discard(str(path))
-            if not restoring or str(path)==self.session.startup_active:self.selectTab(found["id"])
+            if restoring and activation_generation == self._activation_generation and str(path) == self.session.startup_active:
+                self._select_tab_from_open(found["id"], activation_generation)
+            if explicit and activation_generation == self._activation_generation:
+                self._select_tab_from_open(found["id"], activation_generation)
+                self._focus_open_target(activation_generation)
             return
         def finished(result, error):
             self._restoring_paths.discard(str(path))
             if error:
                 return
             content, assets, portable = result
+            # A startup read and an explicit open may race for the same path.
+            # Keep one tab and let only an explicit, still-current request focus it.
+            existing = next((tab for tab in self.tabs if tab["path"] == str(path)), None)
+            if existing:
+                if explicit and activation_generation == self._activation_generation:
+                    self._select_tab_from_open(existing["id"], activation_generation)
+                    self._focus_open_target(activation_generation)
+                return
             note = self._note(path.name, content, str(path), content, assets, portable)
             if restoring:
-                self.tabs=[t for t in self.tabs if t["path"] or t["content"]!=t["saved"] or t["name"]!="Untitled.md"]
+                if activation_generation == self._activation_generation:
+                    self.tabs=[t for t in self.tabs if t["id"] not in self._startup_placeholder_ids]
+                    self._startup_placeholder_ids.clear()
             self.tabs.append(note)
             if restoring:
                 keys=[entry["path"] or entry["id"] for entry in self._startup_entries] or self._startup_order
                 self.tabs.sort(key=lambda t:keys.index(t["path"] or t["id"]) if (t["path"] or t["id"]) in keys else -1)
-            if not restoring or str(path)==self.session.startup_active or not any(t["id"]==self.active for t in self.tabs):self.active = note["id"]
+            should_activate = (explicit and activation_generation == self._activation_generation)
+            if restoring and activation_generation == self._activation_generation:
+                should_activate = str(path) == self.session.startup_active or not any(t["id"] == self.active for t in self.tabs)
+            if should_activate:
+                self.active = note["id"]
             self.settings["welcomed"] = True
             self.recent = [str(path)] + [p for p in self.recent if p != str(path)][:29]
             self._preferences()
             self.recovery_timer.start(800)
             self._emit()
+            if explicit and should_activate:
+                self._focus_open_target(activation_generation)
         self._submit(lambda: open_note(path), finished)
 
     @Slot()
     def newNote(self):
+        self._activation_generation += 1
         note = self._note("Untitled.md")
         self.tabs.append(note)
         self.active = note["id"]
@@ -1190,6 +1236,13 @@ class Studio(QObject):
 
     @Slot(str)
     def selectTab(self, id):
+        if any(t["id"] == id for t in self.tabs):
+            self._activation_generation += 1
+        self._select_tab_from_open(id, self._activation_generation)
+
+    def _select_tab_from_open(self, id, generation):
+        if generation != self._activation_generation:
+            return
         if id!=self.active and any(t["id"] == id for t in self.tabs):
             self.active = id
             self.recovery_timer.start(800)
@@ -1208,6 +1261,8 @@ class Studio(QObject):
     @Slot()
     def reopenTab(self):
         if not self.closed_tabs:return
+        self._activation_generation += 1
+        activation_generation=self._activation_generation
         reference=self.closed_tabs[-1]
         def finished(note,error):
             if error:
@@ -1215,8 +1270,11 @@ class Studio(QObject):
                 self._emit(False);return
             if reference not in self.closed_tabs:return
             existing=next((t for t in self.tabs if note.get("path") and t["path"]==note["path"]),None)
-            if existing:self.active=existing["id"]
-            else:self.tabs.append(note);self.active=note["id"]
+            if existing:
+                if activation_generation==self._activation_generation:self.active=existing["id"]
+            else:
+                self.tabs.append(note)
+                if activation_generation==self._activation_generation:self.active=note["id"]
             self.closed_tabs.remove(reference)
             self._recover();self._emit()
         def read_note():
@@ -1483,6 +1541,7 @@ class Studio(QObject):
         tab = next((t for t in self.tabs if t["id"] == id), None)
         if not tab:
             return
+        self._activation_generation += 1
         if tab["content"] != tab["saved"] and (tab["path"] or tab["content"].strip() or tab["assets"]):
             self.pending_close = id
             self.selectTab(id)
@@ -1530,6 +1589,7 @@ class Studio(QObject):
         if not self.tabs:
             self.tabs.append(self._note("Untitled.md"))
         if self.active == id:
+            self._activation_generation += 1
             self.active = self.tabs[min(current_index, len(self.tabs)-1)]["id"]
         self._recover()
         self._emit()

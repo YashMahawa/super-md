@@ -6,7 +6,7 @@ from pathlib import Path
 from unittest.mock import patch
 os.environ.setdefault("QT_QPA_PLATFORM","offscreen")
 from PySide6.QtGui import QGuiApplication
-from PySide6.QtCore import QUrl
+from PySide6.QtCore import QUrl, QObject, Slot
 from studio import Session, Studio
 from documents import atomic_json
 
@@ -346,6 +346,122 @@ class StudioTest(unittest.TestCase):
         self.await_idle()
         self.assertEqual(self.studio._current()["path"], str(path.resolve()))
         self.assertEqual(self.studio._current()["content"], "# Open me")
+
+    def test_opening_already_open_note_selects_tab_and_focuses_reader(self):
+        path=self.studio.data/"already-open.md"
+        path.write_text("# Existing",encoding="utf-8")
+        self.studio.openNote(str(path));self.await_idle()
+        opened_id=self.studio.active
+        self.studio.newNote()
+
+        class Host(QObject):
+            def __init__(self):
+                super().__init__();self.raised=0;self.activated=0;self.focused=0
+            def raise_(self):self.raised+=1
+            def requestActivate(self):self.activated+=1
+            @Slot()
+            def focusReader(self):self.focused+=1
+
+        host=Host();self.studio.host_window=host
+        self.studio.openNote(str(path))
+        deadline=time.monotonic()+1
+        while not host.focused and time.monotonic()<deadline:
+            self.app.processEvents();time.sleep(.005)
+        self.assertEqual(self.studio.active,opened_id)
+        self.assertEqual((host.raised,host.activated,host.focused),(1,1,1))
+
+    def test_latest_explicit_open_wins_when_reads_finish_out_of_order(self):
+        paths=[]
+        for name in ("first-request.md","latest-request.md"):
+            path=self.studio.data/name;path.write_text(f"# {name}",encoding="utf-8");paths.append(path)
+        pending=[]
+        with patch.object(self.studio,"_submit",side_effect=lambda action,done,*args,**kwargs:pending.append((action,done))):
+            self.studio.openNote(str(paths[0]))
+            self.studio.openNote(str(paths[1]))
+            self.assertEqual(len(pending),2)
+            action,done=pending[1];done(action(),None)
+            latest_id=self.studio.active
+            action,done=pending[0];done(action(),None)
+        self.assertEqual(self.studio._current()["path"],str(paths[1].resolve()))
+        self.assertEqual(self.studio.active,latest_id)
+        self.assertEqual({tab["path"] for tab in self.studio.tabs if tab["path"]},{str(path.resolve()) for path in paths})
+
+    def test_manual_tab_selection_wins_over_a_pending_open_completion(self):
+        existing=self.studio.data/"selected-before-open.md";existing.write_text("# Selected",encoding="utf-8")
+        self.studio.openNote(str(existing));self.await_idle();selected_id=self.studio.active
+        self.studio.newNote()
+        requested=self.studio.data/"slow-open.md";requested.write_text("# Slow",encoding="utf-8")
+        pending=[]
+        with patch.object(self.studio,"_submit",side_effect=lambda action,done,*args,**kwargs:pending.append((action,done))):
+            self.studio.openNote(str(requested))
+            self.studio.selectTab(selected_id)
+            action,done=pending[0];done(action(),None)
+        self.assertEqual(self.studio.active,selected_id)
+        self.assertEqual(self.studio._current()["path"],str(existing.resolve()))
+
+    def test_new_blank_note_wins_over_a_pending_open_completion(self):
+        requested=self.studio.data/"slow-open-new-tab.md";requested.write_text("# Slow",encoding="utf-8")
+        pending=[]
+        with patch.object(self.studio,"_submit",side_effect=lambda action,done,*args,**kwargs:pending.append((action,done))):
+            self.studio.openNote(str(requested))
+            self.studio.newNote()
+            new_id=self.studio.active
+            action,done=pending[0];done(action(),None)
+        self.assertEqual(self.studio.active,new_id)
+        self.assertEqual(self.studio._current()["name"],"Untitled.md")
+
+    def test_startup_restore_keeps_new_blank_tab_created_before_queued_restore(self):
+        startup=self.session.data/"queued-startup.md";startup.write_text("# Startup",encoding="utf-8")
+        self.session.settings.update(welcomed=True,startup="restore")
+        restored=self.window()
+        placeholder_id=restored.active
+        restored._restoring_paths={str(startup.resolve())}
+        restored._startup_order=[str(startup.resolve())]
+        self.session.startup_active=str(startup.resolve())
+        pending=[]
+        with patch.object(restored,"_submit",side_effect=lambda action,done,*args,**kwargs:pending.append((action,done))):
+            restored.newNote()
+            new_id=restored.active
+            # Simulate the queued startup callback, which captured generation 0
+            # before the user created a new blank tab.
+            restored._open_note(str(startup),explicit=False,activation_generation=0)
+            self.assertEqual(len(pending),1)
+            action,done=pending[0];done(action(),None)
+        self.assertEqual(restored.active,new_id)
+        self.assertIn(placeholder_id,[tab["id"] for tab in restored.tabs])
+        self.assertIn(new_id,[tab["id"] for tab in restored.tabs])
+        self.assertIn(str(startup.resolve()),[tab["path"] for tab in restored.tabs])
+
+    def test_delayed_startup_restore_does_not_steal_explicit_open_focus(self):
+        startup=self.studio.data/"startup-restore.md";startup.write_text("# Startup",encoding="utf-8")
+        requested=self.studio.data/"requested.md";requested.write_text("# Requested",encoding="utf-8")
+        self.session.startup_active=str(startup.resolve())
+        self.studio._restoring_paths={str(startup.resolve())}
+        pending=[]
+        with patch.object(self.studio,"_submit",side_effect=lambda action,done,*args,**kwargs:pending.append((action,done))):
+            self.studio.openNote(str(requested))
+            # The queued startup callback must retain the generation from when
+            # startup began, not inherit an explicit request made just before it runs.
+            self.studio._open_note(str(startup),explicit=False,activation_generation=0)
+            self.assertEqual(len(pending),2)
+            action,done=pending[0];done(action(),None)
+            requested_id=self.studio.active
+            action,done=pending[1];done(action(),None)
+        self.assertEqual(self.studio._current()["path"],str(requested.resolve()))
+        self.assertEqual(self.studio.active,requested_id)
+        self.assertEqual({tab["path"] for tab in self.studio.tabs if tab["path"]},{str(startup.resolve()),str(requested.resolve())})
+
+    def test_background_external_refresh_updates_other_tab_without_changing_focus(self):
+        first=self.studio.data/"background-refresh.md";first.write_text("# Original",encoding="utf-8")
+        self.studio.openNote(str(first));self.await_idle();first_id=self.studio.active
+        second=self.studio.data/"focused-note.md";second.write_text("# Focused",encoding="utf-8")
+        self.studio.openNote(str(second));self.await_idle();focused_id=self.studio.active
+        first.write_text("# External update",encoding="utf-8")
+        self.studio._reload_changed_content({str(first.resolve())})
+        self._wait_for(lambda:next(tab for tab in self.studio.tabs if tab["id"]==first_id)["content"]=="# External update")
+        self.assertEqual(self.studio.active,focused_id)
+        self.assertEqual(self.studio._current()["path"],str(second.resolve()))
+        self.assertEqual(next(tab for tab in self.studio.tabs if tab["id"]==first_id)["content"],"# External update")
 
     def test_save_then_close_commits_the_file_before_closing(self):
         studio = self.studio

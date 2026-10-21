@@ -2,6 +2,10 @@
 
 ## PDF compatibility and export filenames
 
+- Opening a document now activates its tab without delayed startup restoration or an older file load stealing selection. Already-open files reuse their tab; background refresh leaves selection alone, and later explicit tab choices are respected.
+- Android queues file-opening requests until the reader bridge is ready, retains all requested files, handles new system intents and avoids replaying the initial intent on Activity recreation.
+- Fixed proofreading worker idle eviction so cold startup and queued checks are not terminated as if they were idle. Delayed-work and worker-ownership regression tests retain idle memory cleanup without dropping active results.
+
 - Fixed circular convolution (`\circledast`, including indexed forms) failing native PDF export with an “unknown symbol modifier” error. The Markdown source does not need to change.
 - Audited all 397 zero-argument symbolic commands in MiTeX's embedded inventory against the shipping typesetter. Updated circled and large operators, dashed arrows, double brackets, Planck's constant, inverted omega and partial derivatives.
 - Symbol compatibility now uses math syntax rather than text substitution, preserving literal TeX text and quoted strings. Ordinary equations without legacy identifiers avoid the additional syntax parsing.

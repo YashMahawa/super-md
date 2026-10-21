@@ -84,8 +84,23 @@ class MainActivity : ComponentActivity() {
         // request it. Compose's first frame may otherwise run after onResume.
         val windowModel = model
         setContent { Studio(windowModel, this) }
-        intent?.data?.let { uri -> model.open(uri) }
+        val savedDispatcherSession = savedInstanceState?.getString(OPEN_DISPATCHER_SESSION)
+        if (savedDispatcherSession != windowModel.openDispatcherSessionId) {
+            intent?.data?.let { uri ->
+                if (savedInstanceState == null || windowModel.state.value.let { state ->
+                        state.tabs.none { it.uri == uri.toString() } && state.closedTabs.none { it.uri == uri.toString() }
+                    }) {
+                    windowModel.requestInitialOpen(uri)
+                }
+            }
+        }
     }
+    override fun onNewIntent(intent: Intent) {
+        super.onNewIntent(intent)
+        setIntent(intent)
+        intent.data?.let { requestOpen(it) }
+    }
+    fun requestOpen(uri: android.net.Uri, relative: String? = null) = model.requestOpen(uri, relative)
     override fun onStop() { saveReaderPosition?.invoke(); model.flush(); super.onStop() }
     override fun onResume() { super.onResume(); model.refreshMetadata(); model.refreshExternal();model.reloadCustomTheme() }
     fun handleShortcut(event: android.view.KeyEvent): Boolean {
@@ -107,7 +122,12 @@ class MainActivity : ComponentActivity() {
         return false
     }
     override fun onKeyDown(keyCode: Int, event: android.view.KeyEvent): Boolean = handleShortcut(event) || super.onKeyDown(keyCode, event)
-    override fun onSaveInstanceState(outState: Bundle) { outState.putString("workspace", workspaceKey); super.onSaveInstanceState(outState) }
+    override fun onSaveInstanceState(outState: Bundle) {
+        outState.putString("workspace", workspaceKey)
+        outState.putString(OPEN_DISPATCHER_SESSION, model.openDispatcherSessionId)
+        super.onSaveInstanceState(outState)
+    }
+    companion object { private const val OPEN_DISPATCHER_SESSION = "open_dispatcher_session" }
     fun newWindow() {
         model.flush()
         startActivity(Intent(this, MainActivity::class.java).putExtra("workspace", java.util.UUID.randomUUID().toString()).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_MULTIPLE_TASK or Intent.FLAG_ACTIVITY_LAUNCH_ADJACENT))
@@ -239,6 +259,11 @@ private object NoMotionScheme : MotionScheme {
         }
         onDispose { model.readerFlushRequester = null }
     }
+    DisposableEffect(activity, model, readerReady) {
+        val handler = if (readerReady) OpenIntentDispatcher.Handler<android.net.Uri> { uri, relative -> model.open(uri, relative) } else null
+        model.attachReaderOpenHandler(handler)
+        onDispose { if (handler != null) model.detachReaderOpenHandler(handler) }
+    }
     var folderRelative by remember { mutableStateOf("") }
     var hinge by remember { mutableStateOf<FoldingFeature?>(null) }
     val recent by model.recent.collectAsStateWithLifecycle()
@@ -253,7 +278,7 @@ private object NoMotionScheme : MotionScheme {
         if (uris.isNotEmpty()) model.importDropped(uris, imageNote) { images -> images?.let { web?.evaluateJavascript("window.supermdInsertImages?.($it)", null) } }
     }
     LaunchedEffect(activity) { WindowInfoTracker.getOrCreate(activity).windowLayoutInfo(activity).collect { info -> hinge = info.displayFeatures.filterIsInstance<FoldingFeature>().firstOrNull { it.isSeparating && it.orientation == FoldingFeature.Orientation.VERTICAL } } }
-    val open = rememberLauncherForActivityResult(ActivityResultContracts.OpenDocument()) { it?.let(model::open) }
+    val open = rememberLauncherForActivityResult(ActivityResultContracts.OpenDocument()) { it?.let { uri -> activity.requestOpen(uri) } }
     val fontPicker = rememberLauncherForActivityResult(ActivityResultContracts.OpenDocument()) {it?.let(model::importFont)}
     val themePicker = rememberLauncherForActivityResult(ActivityResultContracts.OpenDocument()) {it?.let {uri->model.importCustomTheme(uri)}}
     val themeExport = rememberLauncherForActivityResult(ActivityResultContracts.CreateDocument("application/json")) {it?.let {uri->model.exportCustomTheme(uri)}}
@@ -339,7 +364,7 @@ private object NoMotionScheme : MotionScheme {
                     if(sidebarSection=="contents") OutlinePanel(headings,state.active.id,Modifier.weight(1f)){heading->readingChromeVisible=false;web?.evaluateJavascript("window.supermdHeading?.(${JSONObject.quote(heading.id)},${heading.offset})",null);scope.launch{drawer.close()}}
                     else LazyColumn(Modifier.weight(1f)) {
                         items(state.files, key={"file:${it.uri}:${it.relative}"}) { entry ->
-                            val activate = { if (entry.directory) { folderRelative = entry.relative; model.listFolder(android.net.Uri.parse(entry.uri), entry.relative) } else { model.open(android.net.Uri.parse(entry.uri), entry.relative); scope.launch { drawer.close() } }; Unit }
+                            val activate = { if (entry.directory) { folderRelative = entry.relative; model.listFolder(android.net.Uri.parse(entry.uri), entry.relative) } else { activity.requestOpen(android.net.Uri.parse(entry.uri), entry.relative); scope.launch { drawer.close() } }; Unit }
                             ListItem(headlineContent = { Text(entry.name, maxLines = 1, overflow = TextOverflow.Ellipsis) }, leadingContent = { Icon(if (entry.directory) Icons.Rounded.Folder else Icons.Rounded.Description, null) }, modifier = Modifier.fillMaxWidth().clickable(onClick = activate), trailingContent = { Icon(if (entry.directory) Icons.Rounded.ChevronRight else Icons.AutoMirrored.Rounded.MenuBook, null) })
                         }
                     }
@@ -349,7 +374,7 @@ private object NoMotionScheme : MotionScheme {
                         LazyColumn(Modifier.heightIn(max=200.dp),verticalArrangement=Arrangement.spacedBy(6.dp),contentPadding=PaddingValues(bottom=12.dp)) {
                             items(recent,key={it.uri}) { note ->
                                 val selected=state.active.uri==note.uri
-                                RecentNoteCard(note,selected,onOpen={model.open(android.net.Uri.parse(note.uri),note.relative);scope.launch{drawer.close()}},onPin={model.pinRecent(note.uri)})
+                                RecentNoteCard(note,selected,onOpen={activity.requestOpen(android.net.Uri.parse(note.uri),note.relative);scope.launch{drawer.close()}},onPin={model.pinRecent(note.uri)})
                             }
                         }
                     }

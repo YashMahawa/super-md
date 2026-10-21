@@ -89,12 +89,18 @@ class StudioUiTest {
     private fun javascriptUntil(script: String, accepted: (String) -> Boolean): String {
         val result = AtomicReference("")
         val inFlight=java.util.concurrent.atomic.AtomicBoolean(false)
-        compose.waitUntil(60_000) {
-            // Mutating checks (dismiss, click, navigate) must never enqueue a
-            // second evaluation before observing the first successful reply.
-            if(accepted(result.get()))return@waitUntil true
-            if(inFlight.compareAndSet(false,true))compose.activity.runOnUiThread { val reader=web(compose.activity.window.decorView);if(reader==null)inFlight.set(false) else reader.evaluateJavascript(script) { result.set(it);inFlight.set(false) } }
-            accepted(result.get())
+        try {
+            compose.waitUntil(60_000) {
+                // Mutating checks (dismiss, click, navigate) must never enqueue a
+                // second evaluation before observing the first successful reply.
+                if(accepted(result.get()))return@waitUntil true
+                if(inFlight.compareAndSet(false,true))compose.activity.runOnUiThread { val reader=web(compose.activity.window.decorView);if(reader==null)inFlight.set(false) else reader.evaluateJavascript(script) { result.set(it);inFlight.set(false) } }
+                accepted(result.get())
+            }
+        } catch (timeout: androidx.compose.ui.test.ComposeTimeoutException) {
+            val boundedScript = script.replace('\n', ' ').take(240)
+            val boundedReply = result.get().replace('\n', ' ').take(320)
+            throw AssertionError("JavaScript condition timed out; script=$boundedScript; lastReply=$boundedReply; evaluationInFlight=${inFlight.get()}", timeout)
         }
         return result.get()
     }
@@ -109,6 +115,78 @@ class StudioUiTest {
         // setup must await that bridge handshake rather than race first render.
         compose.waitUntil(15_000) {
             compose.onAllNodes(hasContentDescription("Export") and isEnabled()).fetchSemanticsNodes().isNotEmpty()
+        }
+    }
+    @Test fun externalOpenActivatesNewAndAlreadyOpenFileTabs() {
+        val context = androidx.test.platform.app.InstrumentationRegistry.getInstrumentation().targetContext
+        val workspace = java.util.UUID.randomUUID().toString()
+        val prefs = context.getSharedPreferences("studio", 0)
+        val oldWelcomed = prefs.getBoolean("welcomed", false)
+        val oldRecent = prefs.getString("recent", null)
+        val shareDir = java.io.File(context.cacheDir, "share").apply { mkdirs() }
+        val firstFile = java.io.File(shareDir, "$workspace-first.md").apply { writeText("# First External Open\n\nFirst body.\n") }
+        val secondFile = java.io.File(shareDir, "$workspace-second.md").apply { writeText("# Second External Open\n\nSecond body.\n") }
+        val authority = "${context.packageName}.share"
+        val firstUri = androidx.core.content.FileProvider.getUriForFile(context, authority, firstFile)
+        val secondUri = androidx.core.content.FileProvider.getUriForFile(context, authority, secondFile)
+        var scenario: androidx.test.core.app.ActivityScenario<MainActivity>? = null
+        try {
+            val launch = android.content.Intent(android.content.Intent.ACTION_VIEW, firstUri)
+                .setClass(context, MainActivity::class.java)
+                .putExtra("workspace", workspace)
+            scenario = androidx.test.core.app.ActivityScenario.launch(launch)
+            val openedModel = AtomicReference<StudioViewModel>()
+            scenario.onActivity { activity ->
+                val model = androidx.lifecycle.ViewModelProvider(activity)[StudioViewModel::class.java]
+                openedModel.set(model)
+                model.welcomeDone()
+            }
+            val model = openedModel.get()
+            compose.waitUntil(30_000) { model.state.value.active.uri == firstUri.toString() }
+            val firstId = model.state.value.active.id
+            scenario.onActivity { it.requestOpen(secondUri) }
+            compose.waitUntil(30_000) {
+                val state = model.state.value
+                state.active.uri == secondUri.toString() && state.tabs.any { it.uri == firstUri.toString() }
+            }
+            val secondId = model.state.value.active.id
+            scenarioJavascriptUntil(scenario, "document.querySelector('.android-document h1')?.textContent?.trim()==='Second External Open'", "true")
+
+            scenario.onActivity { model.select(firstId) }
+            compose.waitUntil(15_000) { model.state.value.active.id == firstId }
+            scenarioJavascriptUntil(scenario, "document.querySelector('.android-document h1')?.textContent?.trim()==='First External Open'", "true")
+            scenario.onActivity { it.requestOpen(secondUri) }
+            compose.waitUntil(15_000) { model.state.value.active.id == secondId }
+            assertEquals(1, model.state.value.tabs.count { it.uri == secondUri.toString() })
+            scenarioJavascriptUntil(scenario, "document.querySelector('.android-document h1')?.textContent?.trim()==='Second External Open'", "true")
+        } finally {
+            scenario?.close()
+            // This test owns a UUID workspace and these two cache files only.
+            java.io.File(context.filesDir, "workspaces/$workspace.json").delete()
+            firstFile.delete()
+            secondFile.delete()
+            if (shareDir.list()?.isEmpty() == true) shareDir.delete()
+            prefs.edit().also { editor ->
+                if (oldWelcomed) editor.putBoolean("welcomed", true) else editor.remove("welcomed")
+                if (oldRecent == null) editor.remove("recent") else editor.putString("recent", oldRecent)
+            }.apply()
+        }
+    }
+    private fun scenarioJavascriptUntil(
+        scenario: androidx.test.core.app.ActivityScenario<MainActivity>,
+        script: String,
+        expected: String,
+    ) {
+        val result = AtomicReference<String?>(null)
+        val inFlight = java.util.concurrent.atomic.AtomicBoolean(false)
+        compose.waitUntil(15_000) {
+            if (result.get() == expected) return@waitUntil true
+            if (inFlight.compareAndSet(false, true)) scenario.onActivity { activity ->
+                val reader = web(activity.window.decorView)
+                if (reader == null) inFlight.set(false)
+                else reader.evaluateJavascript(script) { value -> result.set(value); inFlight.set(false) }
+            }
+            result.get() == expected
         }
     }
     @Test fun importedThemePaintsNativeControlsAndReaderAndInvalidEditsKeepIt() {
@@ -560,8 +638,18 @@ ax.set_title("Matplotlib 3D figure")
         val model=androidx.lifecycle.ViewModelProvider(compose.activity)[StudioViewModel::class.java]
         temporaryNoteState=model.state.value
         val previousSpell=model.state.value.spellCheck;val previousGrammar=model.state.value.grammarCheck
+        val noteId=model.state.value.active.id
+        val fixture="# Writing\n\nThis sentnce has a apple and the the word.\n\n```python\nsentnce = 'a apple the the'\n```"
         try {
-            compose.runOnIdle {model.writing(spellCheck=true,grammarCheck=true);model.edit(model.state.value.active.id,"# Writing\n\nThis sentnce has a apple and the the word.\n\n```python\nsentnce = 'a apple the the'\n```");model.mode("editor")}
+            // Let the actual WebView render the fixture in its current mode
+            // before switching modes; this avoids asking the reader flush
+            // barrier to acknowledge a native edit that has not reached it yet.
+            compose.runOnIdle {model.edit(noteId,fixture)}
+            compose.waitUntil(5_000) { model.state.value.tabs.find { it.id==noteId }?.content==fixture }
+            javascriptUntil("document.querySelector('.android-document')?.textContent.includes('This sentnce has a apple and the the word.')") {it=="true"}
+            compose.runOnIdle {model.mode("editor")}
+            javascriptUntil("(()=>{const lines=[...document.querySelectorAll('.cm-content .cm-line')].map(line=>line.textContent).join('\\n');return lines.includes('This sentnce has a apple and the the word.')&&lines.includes(\"sentnce = 'a apple the the'\")})()") {it=="true"}
+            compose.runOnIdle {model.writing(spellCheck=true,grammarCheck=true)}
             javascriptUntil("document.querySelectorAll('.cm-lintRange-info').length") {it=="3"}
             compose.runOnIdle {model.writing(spellCheck=false,grammarCheck=false)}
             javascriptUntil("document.querySelectorAll('.cm-lintRange-info').length") {it=="0"}

@@ -11,11 +11,22 @@
   engine to a 13-page, 451,244-byte PDF. Both Mermaid diagrams are prepared as SVG;
   extracted text contains four circular-convolution glyphs. Pages 1 and 5 were
   visually checked. The source note was not modified and Python was not executed.
-- Local checks pass: 216 frontend tests, 196 desktop tests, Android filename and
+- Local checks pass: 220 frontend tests, 203 desktop tests, 76 browser workflows, Android filename and
   provider-policy unit tests, Kotlin instrumentation compilation and lint. The
   API 35 emulator passed 48 instrumentation tests, including actual JNI symbol
   export and repeated Unicode share-format/MIME/header transitions. This is not
   a claim of physical-phone testing or compatibility with every cloud provider.
+- File-open regressions cover selecting an existing tab, out-of-order reads,
+  manual selection/new blank notes during a pending open, startup restore and
+  background refresh. Android adds real FileProvider/system-intent coverage and
+  queued-open ownership tests. A local 49-test emulator attempt outlived its
+  stopped host wrapper; it is not counted as a successful Gradle run. Exact-source
+  Android 15/16 CI remains mandatory before release.
+- Four proofreading worker lifecycle tests exercise delayed active work beyond
+  45 seconds, queue draining, actual idle eviction, failures and retired owners.
+  The Android writing fixture waits for actual document acknowledgement before
+  switching modes; its 60-second timeout and all three diagnostic assertions are
+  retained, with additional timeout diagnostics rather than weaker checks.
 - Desktop callbacks revalidate the actual writer's format. Overlapping export
   destinations, wrong-format callbacks and unconfirmed appended-file collisions
   cannot overwrite an existing test document. macOS temporary-path comparisons
