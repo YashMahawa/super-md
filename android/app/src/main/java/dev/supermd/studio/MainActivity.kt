@@ -262,10 +262,10 @@ private object NoMotionScheme : MotionScheme {
     val save = rememberLauncherForActivityResult(NoteDestination("text/markdown", model::noteLocation)) { it?.let { uri -> model.save(uri) } }
     val folder = rememberLauncherForActivityResult(ActivityResultContracts.OpenDocumentTree()) { it?.let { uri -> folderRelative = ""; model.setFolder(uri) } }
     val pdf = rememberLauncherForActivityResult(NoteDestination("application/pdf", model::noteLocation)) { uri ->
-        if (uri != null) { model.outputUri = uri; model.busy(true); web?.evaluateJavascript("window.supermdExport?.(${state.pdf})", null) ?: model.fail("The reader is not ready. Open the note again.") }
+        if (uri != null) { model.setPdfDestination(uri); model.busy(true); web?.evaluateJavascript("window.supermdExport?.(${state.pdf})", null) ?: model.fail("The reader is not ready. Open the note again.") }
     }
     val portable = rememberLauncherForActivityResult(NoteDestination("application/vnd.supermd.smd", model::noteLocation)) { uri ->
-        if (uri != null) { model.portableOutput = uri; model.busy(true); web?.evaluateJavascript("window.supermdPortable?.(false)", null) ?: model.fail("The reader is not ready") }
+        if (uri != null) { model.setPortableDestination(uri); model.busy(true); web?.evaluateJavascript("window.supermdPortable?.(false)", null) ?: model.fail("The reader is not ready") }
     }
     DisposableEffect(portable, state.active.name) { model.requestPortable = { portable.launch(state.active.name.substringBeforeLast('.') + ".smd") }; onDispose { model.requestPortable = null } }
     val saveAction: () -> Unit = { if (state.active.uri == null) save.launch(state.active.name.substringBeforeLast('.') + ".md") else if (state.active.portable) { model.busy(true); web?.evaluateJavascript("window.supermdPortable?.(true)", null) ?: model.fail("The reader is not ready") } else model.save(); Unit }
@@ -512,7 +512,7 @@ private object NoMotionScheme : MotionScheme {
         var name by remember(state.active.id) {mutableStateOf(state.active.name)}
         AlertDialog(onDismissRequest={renaming=false},title={Text("Rename note")},text={OutlinedTextField(value=name,onValueChange={name=it},singleLine=true,label={Text("Note name")})},confirmButton={TextButton(onClick={model.rename(state.active.id,name);renaming=false},enabled=name.isNotBlank()){Text("Rename")}},dismissButton={TextButton(onClick={renaming=false}){Text("Cancel")}})
     }
-    if (exporting) ModalBottomSheet(onDismissRequest = { exporting = false }, sheetState = rememberModalBottomSheetState(skipPartiallyExpanded = true)) { ExportSettings(state.pdf, model::pdf, state.active.portable, sharing,state.customFonts) { format ->
+    if (exporting) ModalBottomSheet(onDismissRequest = { exporting = false }, sheetState = rememberModalBottomSheetState(skipPartiallyExpanded = true)) { ExportSettings(state.pdf, model::pdf, sharing = sharing, fonts = state.customFonts) { format ->
         exporting = false
         if (sharing) {
             if (model.prepareShare(format)) when (format) { "pdf" -> web?.evaluateJavascript("window.supermdExport?.(${state.pdf})", null) ?: model.fail("The reader is not ready"); "smd" -> web?.evaluateJavascript("window.supermdPortable?.(false)", null) ?: model.fail("The reader is not ready"); "md" -> web?.evaluateJavascript("window.supermdExportMarkdown?.()", null) ?: model.fail("The reader is not ready") }
@@ -545,13 +545,15 @@ private object NoMotionScheme : MotionScheme {
     }
 }
 private fun hex(color: Color) = "#%06x".format(color.toArgb() and 0xffffff)
-private class NoteDestination(mime: String, private val preferred: () -> String): ActivityResultContracts.CreateDocument(mime) {
+internal class NoteDestination(private val mime: String, private val preferred: () -> String): ActivityResultContracts.CreateDocument(mime) {
     override fun createIntent(context: android.content.Context, input: String): Intent {
+        val expected = NativeExportFormat.fromMime(mime)
+        val suggested = ExportFilename.suggestedName(input, expected)
         val location = preferred().takeIf { it.isNotBlank() }?.let { tree ->
             val uri=android.net.Uri.parse(tree)
             android.provider.DocumentsContract.buildDocumentUriUsingTree(uri, android.provider.DocumentsContract.getTreeDocumentId(uri))
         } ?: android.net.Uri.parse("content://com.android.externalstorage.documents/document/primary%3ADownload")
-        return super.createIntent(context,input).putExtra(android.provider.DocumentsContract.EXTRA_INITIAL_URI,location)
+        return super.createIntent(context,suggested).putExtra(android.provider.DocumentsContract.EXTRA_INITIAL_URI,location)
     }
 }
 
@@ -734,7 +736,7 @@ private class NoteDestination(mime: String, private val preferred: () -> String)
     Text("Off uses plain paper. On uses your accent with light surfaces, even in dark mode.", style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
 }
 
-@Composable private fun ExportSettings(raw: String, onChange: (String) -> Unit, portableSource: Boolean = false, sharing: Boolean = false, fonts:List<String> = emptyList(), export: (String) -> Unit) {
+@Composable private fun ExportSettings(raw: String, onChange: (String) -> Unit, sharing: Boolean = false, fonts:List<String> = emptyList(), export: (String) -> Unit) {
     var format by rememberSaveable { mutableStateOf("pdf") }
     var options by remember(raw) { mutableStateOf(JSONObject(raw)) }
     fun update(key: String, value: Any) { options = JSONObject(options.toString()).put(key, value); onChange(options.toString()) }
@@ -743,7 +745,7 @@ private class NoteDestination(mime: String, private val preferred: () -> String)
             Column(Modifier.weight(1f, fill = false).fillMaxWidth().verticalScroll(rememberScrollState()).padding(horizontal = 24.dp)) {
                 Text(if (sharing) "Share your note" else "Export your note", style = MaterialTheme.typography.headlineSmall)
                 val formats = if (sharing) listOf("pdf" to "PDF", "md" to "Markdown", "smd" to "Portable SMD") else listOf("pdf" to "PDF document", "smd" to "Portable SMD")
-                if (!portableSource || sharing) SingleChoiceSegmentedButtonRow(Modifier.fillMaxWidth().padding(vertical = 16.dp)) {
+                SingleChoiceSegmentedButtonRow(Modifier.fillMaxWidth().padding(vertical = 16.dp)) {
                     formats.forEachIndexed { index, (key, label) -> SegmentedButton(selected = format == key, onClick = { format = key }, shape = SegmentedButtonDefaults.itemShape(index, formats.size)) { Text(label) } }
                 }
                 if (format == "pdf") {

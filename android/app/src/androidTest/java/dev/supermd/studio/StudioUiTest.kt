@@ -708,6 +708,48 @@ ax.set_title("Matplotlib 3D figure")
         compose.activity.contentResolver.openInputStream(uri)!!.use { input -> assertEquals("%PDF", String(ByteArray(4).also { input.read(it) })) }
         assertNull(model.state.value.error)
     }
+    @Test fun nativeShareSwitchingKeepsUnicodeNamesMimesAndFileHeaders() {
+        welcome()
+        val model=androidx.lifecycle.ViewModelProvider(compose.activity)[StudioViewModel::class.java]
+        temporaryNoteState=model.state.value
+        val id=model.state.value.active.id
+        val originalName=model.state.value.active.name
+        val noteName="Révision 📚 — [draft] + 50%.md"
+        val content="# Unicode share\n\nRésumé λ, emoji 📚, punctuation [x] + 50%.\n"
+        val intents=mutableListOf<android.content.Intent>()
+        val previousShareReady=model.shareReady
+        try {
+            compose.runOnIdle { model.rename(id,noteName) }
+            compose.waitUntil(5_000) { model.state.value.tabs.find { it.id==id }?.name==noteName }
+            compose.runOnIdle { model.edit(id,content);model.shareReady={intents.add(it)} }
+            compose.waitUntil(5_000) { model.state.value.tabs.find { it.id==id }?.content==content }
+            val formats=listOf("md","smd","pdf","md")
+            for(format in formats) {
+                compose.runOnIdle { assertTrue("Could not prepare $format share",model.prepareShare(format)) }
+                when(format) {
+                    "md" -> kotlinx.coroutines.runBlocking { model.shareMarkdown(content) }
+                    "smd" -> kotlinx.coroutines.runBlocking { model.writePortable(id,content,org.json.JSONObject(),save=false,originalContent=content) }
+                    "pdf" -> kotlinx.coroutines.runBlocking { model.export(content,model.state.value.pdf,org.json.JSONObject()) }
+                }
+                val intent=intents.last()
+                val expected=ExportFilename.suggestedName(noteName,NativeExportFormat.fromShareFormat(format))
+                assertEquals(expected,intent.clipData?.description?.label?.toString())
+                assertEquals(NativeExportFormat.fromShareFormat(format).mimeType,intent.type)
+                assertTrue(intent.flags and android.content.Intent.FLAG_GRANT_READ_URI_PERMISSION!=0)
+                val uri=intent.getParcelableExtra<android.net.Uri>(android.content.Intent.EXTRA_STREAM)!!
+                val bytes=compose.activity.contentResolver.openInputStream(uri)!!.use { it.readBytes() }
+                when(format) {
+                    "md" -> assertEquals(content,String(bytes,Charsets.UTF_8))
+                    "smd" -> assertTrue(String(bytes,Charsets.UTF_8).startsWith("{\"format\":\"supermd-smd\""))
+                    "pdf" -> assertTrue(bytes.copyOfRange(0,5).contentEquals("%PDF-".toByteArray(Charsets.US_ASCII)))
+                }
+            }
+            assertEquals(formats.size,intents.size)
+        } finally {
+            compose.runOnIdle { model.rename(id,originalName);model.shareReady=previousShareReady }
+            compose.waitUntil(5_000) { model.state.value.tabs.find { it.id==id }?.name==originalName }
+        }
+    }
     @Test fun realReaderAndNativeControlsAreConnected() {
         welcome()
         compose.onNodeWithText("Read", useUnmergedTree = true).performClick()

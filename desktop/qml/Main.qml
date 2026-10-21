@@ -453,7 +453,7 @@ ApplicationWindow {
     FolderDialog { id: folderDialog; title: "Open folder"; onAccepted: studio.openFolder(selectedFolder.toString()) }
     FolderDialog { id: noteFolderDialog; title: "Default location for new notes"; onAccepted: studio.setNoteLocation(selectedFolder.toString()) }
     FileDialog { id: saveDialog; title: "Save note"; fileMode: FileDialog.SaveFile; nameFilters: viewState.portable ? ["Portable Super MD (*.smd)"] : ["Markdown (*.md)", "Portable Super MD (*.smd)"]; onAccepted: studio.saveAs(selectedFile.toString()); onRejected: studio.resolveClose("cancel") }
-    FileDialog { id: destination; title: "Export note"; fileMode: FileDialog.SaveFile; nameFilters: outputFormat === "pdf" ? ["PDF (*.pdf)"] : outputFormat === "md" ? ["Markdown (*.md)"] : ["Portable Super MD (*.smd)"]; onAccepted: studio.exportTo(selectedFile.toString(), outputFormat) }
+    FileDialog { id: destination; title: "Export note"; fileMode: FileDialog.SaveFile; defaultSuffix: outputFormat === "pdf" ? "pdf" : outputFormat === "md" ? "md" : "smd"; nameFilters: outputFormat === "pdf" ? ["PDF (*.pdf)"] : outputFormat === "md" ? ["Markdown (*.md)"] : ["Portable Super MD (*.smd)"]; onAccepted: studio.exportTo(selectedFile.toString(), outputFormat) }
     AppDialog {
         id: exportDialog
         objectName: "exportDialog"

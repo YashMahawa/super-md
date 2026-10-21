@@ -86,6 +86,36 @@ def local_path(value: str) -> Path:
     url = QUrl(value)
     return Path(url.toLocalFile() if url.isLocalFile() else value).expanduser().resolve()
 
+def export_destination(value: str, format: str) -> Path:
+    suffixes = {"pdf": ".pdf", "smd": ".smd", "md": ".md"}
+    # These are known payload extensions, not merely dotted stem names.  In
+    # particular, .fmd is an older portable format and must not be silently
+    # rewritten as .fmd.pdf/.fmd.smd.
+    payload_formats = {
+        ".pdf": "pdf",
+        ".smd": "smd",
+        ".md": "md",
+        ".markdown": "md",
+        ".txt": "md",
+    }
+    if format not in suffixes:
+        raise ValueError("Unsupported export format")
+    destination = local_path(value)
+    if not destination.name or destination.is_dir():
+        raise ValueError("Choose a file destination for the export")
+    expected = suffixes[format]
+    existing_suffix = destination.suffix.casefold()
+    if existing_suffix == ".fmd":
+        raise ValueError("Legacy .fmd files are not a supported export destination; choose .smd or a new filename")
+    if existing_suffix in payload_formats:
+        if payload_formats[existing_suffix] != format:
+            raise ValueError(f"Choose a filename ending in {expected} for this export")
+        return destination
+    target = destination.with_name(destination.name + expected)
+    if target.exists():
+        raise ValueError(f"The {expected} destination already exists; choose its full filename to confirm replacement")
+    return target
+
 def _same_closed_revision(current: dict, captured: dict) -> bool:
     """Compare content-bearing fields after a background close snapshot."""
     return current == captured
@@ -1542,7 +1572,13 @@ class Studio(QObject):
     @Slot(str, str)
     def exportTo(self, value, format):
         self.pending_save_as = ""
-        self.pending_export = str(local_path(value))
+        self.pending_export = ""
+        try:
+            self.pending_export = str(export_destination(value, format))
+        except ValueError as error:
+            self.message = str(error)
+            self._emit(False)
+            return
         if format == "md": self.readerCall.emit("window.supermdExportMarkdown?.()")
         elif format == "smd": self.readerCall.emit("window.supermdPortable?.(false)")
         else: self.readerCall.emit(f"window.supermdExport?.({json.dumps(self.settings['pdf'])})")

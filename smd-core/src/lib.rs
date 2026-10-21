@@ -1,6 +1,8 @@
 //! The same local typesetter is used by desktop and Android. No browser print layout.
 pub mod portable;
 pub mod theme;
+mod math_compatibility;
+use math_compatibility::compatible_math;
 use anyhow::{bail, Result};
 use pulldown_cmark::{CodeBlockKind, Event, Options, Parser, Tag, TagEnd};
 use serde::{Deserialize, Serialize};
@@ -39,35 +41,6 @@ impl PdfOptions {
 
 fn string(value: &str) -> String { serde_json::to_string(value).unwrap() }
 fn text(value: &str) -> String { format!("#text({})", string(value)) }
-
-/// MiTeX 0.2 predates Typst's angle-bracket rename. Rewrite generated
-/// identifiers only, never quoted TeX text (or the user's Markdown).
-fn compatible_math(value: &str) -> String {
-    let mut output = String::new();
-    let mut quoted = false;
-    let mut escaped = false;
-    let mut token = String::new();
-    let flush = |token: &mut String, output: &mut String| {
-        let replacement = match token.as_str() {
-            "angle.l" => "chevron.l", "angle.r" => "chevron.r",
-            "angle.l.double" => "chevron.l.double", "angle.r.double" => "chevron.r.double",
-            other => other,
-        };
-        output.push_str(replacement); token.clear();
-    };
-    for ch in value.chars() {
-        if quoted {
-            output.push(ch);
-            if ch == '"' && !escaped { quoted = false; }
-            escaped = ch == '\\' && !escaped;
-        } else if ch == '"' {
-            flush(&mut token, &mut output); output.push(ch); quoted = true;
-        } else if ch.is_ascii_alphanumeric() || ch == '.' || ch == '_' {
-            token.push(ch);
-        } else { flush(&mut token, &mut output); output.push(ch); }
-    }
-    flush(&mut token, &mut output); output
-}
 
 pub fn image_sources(markdown: &str) -> Vec<String> {
     Parser::new_ext(markdown, Options::all()).filter_map(|event| match event { Event::Start(Tag::Image { dest_url, .. }) => Some(dest_url.to_string()), _ => None }).collect()

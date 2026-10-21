@@ -2497,6 +2497,7 @@ dependencies = [
  "imagesize",
  "jni",
  "mitex",
+ "mitex-spec-gen",
  "percent-encoding",
  "pulldown-cmark",
  "roxmltree 0.21.1",

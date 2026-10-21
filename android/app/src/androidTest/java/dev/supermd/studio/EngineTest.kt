@@ -1,5 +1,6 @@
 package dev.supermd.studio
 import android.graphics.pdf.PdfRenderer
+import android.content.Intent
 import android.os.ParcelFileDescriptor
 import androidx.test.core.app.ApplicationProvider
 import androidx.test.ext.junit.runners.AndroidJUnit4
@@ -13,6 +14,22 @@ import java.io.File
 
 @RunWith(AndroidJUnit4::class)
 class EngineTest {
+    @Test fun createDocumentIntentKeepsUnicodeNameAndMatchesRequestedFormat() {
+        val context=ApplicationProvider.getApplicationContext<android.content.Context>()
+        val cases=listOf(
+            Triple("application/pdf","Résumé 📚 [draft].smd","Résumé 📚 [draft].pdf"),
+            Triple("text/markdown","Résumé 📚 [draft].pdf","Résumé 📚 [draft].md"),
+            Triple("application/vnd.supermd.smd","Résumé 📚 [draft].md","Résumé 📚 [draft].smd"),
+        )
+        for((mime,input,expectedTitle) in cases) {
+            val intent=NoteDestination(mime){""}.createIntent(context,input)
+            assertEquals(Intent.ACTION_CREATE_DOCUMENT,intent.action)
+            assertEquals(mime,intent.type)
+            assertEquals(expectedTitle,intent.getStringExtra(Intent.EXTRA_TITLE))
+            assertTrue(expectedTitle.endsWith(".${NativeExportFormat.fromMime(mime).extension}"))
+        }
+    }
+
     @Test fun portableThemeValidationAndNativeContrast() {
         val result=JSONObject(PdfEngine.validateTheme(themeTemplate));assertFalse(result.has("error"))
         val theme=result.getJSONObject("theme");assertEquals("My theme",theme.getString("name"))
@@ -102,6 +119,24 @@ class EngineTest {
         val pdf = File(app.cacheDir, "probability.pdf")
         assertEquals("", PdfEngine.export(md, StudioState().pdf, assets.absolutePath, pdf.absolutePath))
         PdfRenderer(ParcelFileDescriptor.open(pdf, ParcelFileDescriptor.MODE_READ_ONLY)).use { assertTrue(it.pageCount > 0) }
+    }
+    @Test fun circularConvolutionAndRenamedSymbolsExportThroughShippingJni() {
+        val app = ApplicationProvider.getApplicationContext<android.app.Application>()
+        val directory = File(app.cacheDir, "symbol-compat-${java.util.UUID.randomUUID()}").apply { mkdirs() }
+        try {
+            val markdown = """# Symbol compatibility
+
+${'$'}${'$'}y[n]=(x\circledast_N h)[n]=\sum_{m=0}^{N-1}x[m]h[(n-m)\bmod N].${'$'}${'$'}
+
+${'$'}\oplus\otimes\odot\ominus\bigoplus\bigotimes\bigodot\partial\hbar\mho\llbracket x\rrbracket${'$'}
+
+Literal ${'$'}\text{ast.circle}${'$'} must remain text.
+"""
+            val pdf = File(directory, "Circular convolution 📚.pdf")
+            assertEquals("", PdfEngine.export(markdown, StudioState().pdf, directory.absolutePath, pdf.absolutePath))
+            assertTrue(pdf.inputStream().use { String(it.readNBytes(5), Charsets.US_ASCII) } == "%PDF-")
+            PdfRenderer(ParcelFileDescriptor.open(pdf, ParcelFileDescriptor.MODE_READ_ONLY)).use { assertTrue(it.pageCount > 0) }
+        } finally { directory.deleteRecursively() }
     }
     @Test fun largePortableStringsCrossReaderBufferBoundaries() {
         val app = ApplicationProvider.getApplicationContext<android.app.Application>(); val media = MediaStorage(app)

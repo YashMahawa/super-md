@@ -526,6 +526,80 @@ class StudioTest(unittest.TestCase):
             self.assertIsInstance(target,QUrl)
             self.assertEqual(Path(target.toLocalFile()).name,"Quiz 2 Ω literal%20."+extension)
 
+    def test_export_format_writes_to_matching_suffix_and_preserves_url_filename(self):
+        base=self.studio.data/"Quarterly Notes Ω literal%20.rev 2"
+        selected=QUrl.fromLocalFile(str(base)).toString()
+        markdown=Path(str(base)+".md")
+        portable=Path(str(base)+".smd")
+
+        self.studio.exportTo(selected,"md")
+        self.assertEqual(self.studio.pending_export,str(markdown))
+        self.studio.post("markdown-export","export_markdown_native",json.dumps({"id":self.studio.active,"content":"Final Markdown"}))
+        self.await_idle()
+        self.assertEqual(markdown.read_text(encoding="utf-8"),"Final Markdown")
+
+        self.studio.exportTo(selected,"smd")
+        self.assertEqual(self.studio.pending_export,str(portable))
+        self.studio.post("portable-export","export_fmd_native",json.dumps({"id":self.studio.active,"content":"Portable Markdown","assets":{},"save":False}))
+        self.await_idle()
+        value=json.loads(portable.read_text(encoding="utf-8"))
+        self.assertEqual(value["format"],"supermd-smd")
+        self.assertEqual(value["markdown"],"Portable Markdown")
+        self.assertEqual(markdown.read_text(encoding="utf-8"),"Final Markdown")
+        self.assertFalse(Path(str(base)+".smd.md").exists())
+
+    def test_export_rejects_mismatched_suffixes_and_unconfirmed_appended_overwrite(self):
+        calls=[]
+        self.studio.readerCall.connect(calls.append)
+        for name,format in (("wrong.smd","pdf"),("wrong.pdf","smd"),("wrong.md","pdf"),("wrong.pdf","md")):
+            path=self.studio.data/name
+            self.studio.exportTo(QUrl.fromLocalFile(str(path)).toString(),format)
+            self.assertEqual(self.studio.pending_export,"")
+            self.assertIn("ending in",self.studio.message)
+            self.assertFalse(path.exists())
+        self.assertEqual(calls,[])
+
+        extensionless=self.studio.data/"report"
+        actual_target=Path(str(extensionless)+".pdf")
+        actual_target.write_bytes(b"keep existing bytes")
+        self.studio.exportTo(QUrl.fromLocalFile(str(extensionless)).toString(),"pdf")
+        self.assertEqual(self.studio.pending_export,"")
+        self.assertIn("choose its full filename",self.studio.message)
+        self.assertEqual(actual_target.read_bytes(),b"keep existing bytes")
+
+    def test_export_legacy_and_markdown_alias_suffix_policy(self):
+        for format in ("pdf", "smd", "md"):
+            legacy=self.studio.data/f"old-{format}.fmd"
+            self.studio.exportTo(QUrl.fromLocalFile(str(legacy)).toString(),format)
+            self.assertEqual(self.studio.pending_export,"")
+            self.assertIn("Legacy .fmd",self.studio.message)
+            self.assertFalse(legacy.exists())
+
+        for suffix in (".markdown", ".txt"):
+            destination=self.studio.data/f"notes{suffix}"
+            self.studio.exportTo(QUrl.fromLocalFile(str(destination)).toString(),"md")
+            self.assertEqual(self.studio.pending_export,str(destination))
+            self.studio.pending_export=""
+            for format in ("pdf", "smd"):
+                self.studio.exportTo(QUrl.fromLocalFile(str(destination)).toString(),format)
+                self.assertEqual(self.studio.pending_export,"")
+                self.assertIn("ending in",self.studio.message)
+                self.assertFalse(Path(str(destination)+({"pdf":".pdf","smd":".smd"}[format])).exists())
+
+    def test_export_preserves_matching_case_insensitive_multi_dot_extension(self):
+        selected_path=self.studio.data/"Quarterly.notes Ω literal%20.v2.PDF"
+        self.studio.exportTo(QUrl.fromLocalFile(str(selected_path)).toString(),"pdf")
+        self.assertEqual(self.studio.pending_export,str(selected_path))
+        self.assertFalse(Path(str(selected_path)+".pdf").exists())
+
+    def test_export_dialog_tracks_selected_format_suffix_and_filters(self):
+        qml=(Path(__file__).parent/"qml"/"Main.qml").read_text(encoding="utf-8")
+        destination=next(line for line in qml.splitlines() if "id: destination;" in line)
+        self.assertIn('defaultSuffix: outputFormat === "pdf" ? "pdf" : outputFormat === "md" ? "md" : "smd"',destination)
+        self.assertIn('outputFormat === "pdf" ? ["PDF (*.pdf)"] : outputFormat === "md" ? ["Markdown (*.md)"] : ["Portable Super MD (*.smd)"]',destination)
+        choice=next(line for line in qml.splitlines() if "currentIndex: outputFormat === \"pdf\"" in line)
+        self.assertIn('onActivated: outputFormat = currentIndex === 0 ? "pdf" : currentIndex === 1 ? "smd" : "md"',choice)
+
     def test_external_refresh_does_not_overwrite_a_draft(self):
         studio=self.studio;path=studio.data / "external.md"
         path.write_text("Original",encoding="utf-8")

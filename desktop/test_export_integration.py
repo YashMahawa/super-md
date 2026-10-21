@@ -9,6 +9,7 @@ from unittest.mock import patch
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 from PySide6.QtGui import QGuiApplication
+from PySide6.QtCore import QUrl
 
 from studio import Session, Studio
 
@@ -105,6 +106,26 @@ class NativePdfIntegrationTest(unittest.TestCase):
         self.assertTrue(destination.read_bytes().startswith(b"%PDF-"))
         self._assert_no_owned_stages()
         self.assertEqual(self.studio._export_jobs._jobs, {})
+
+    def test_export_to_extensionless_url_reaches_the_pdf_writer_with_safe_final_name(self):
+        stem = self.root / "Research Notes Ω literal%20.v4"
+        destination = Path(str(stem) + ".pdf")
+        self.studio.exportTo(QUrl.fromLocalFile(str(stem)).toString(), "pdf")
+        self.assertEqual(self.studio.pending_export, str(destination))
+        args = {
+            "jobId": "export-to-url-job",
+            "content": "# Synthetic PDF fixture",
+            "assets": {},
+            "options": {"fontFamily": "Fixture Sans"},
+            "testMode": "valid",
+        }
+        self.studio.post("export-to-url-request", "export_pdf_native", json.dumps(args))
+        _, raw, error = self._await_reply("export-to-url-request")
+        self.assertEqual(error, "")
+        self.assertEqual(json.loads(raw), {"path": str(destination)})
+        self.assertTrue(destination.read_bytes().startswith(b"%PDF-"))
+        self.assertFalse(Path(str(stem) + ".smd").exists())
+        self._assert_no_owned_stages()
 
     def test_invalid_pdf_does_not_overwrite_existing_destination(self):
         destination = self.root / "report.pdf"

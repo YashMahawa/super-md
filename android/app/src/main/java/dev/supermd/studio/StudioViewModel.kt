@@ -365,18 +365,25 @@ class StudioViewModel(app: Application, val workspaceKey: String = "main") : And
         }
     }
     var outputUri: Uri? = null
+    private var pdfDestinationIsNew = false
+    private var portableDestinationIsNew = false
     var shareReady: ((Intent) -> Unit)? = null
     private var shareFile: File? = null
+
+    internal fun setPdfDestination(uri: Uri) { outputUri = uri; pdfDestinationIsNew = true }
+    internal fun setPortableDestination(uri: Uri) { portableOutput = uri; portableDestinationIsNew = true }
+
     fun prepareShare(format: String): Boolean {
         if (mutable.value.busy || format !in listOf("pdf", "smd", "md")) return false
         val folder = File(getApplication<Application>().cacheDir, "share/${UUID.randomUUID()}").apply { mkdirs() }
-        val stem = mutable.value.active.name.substringBeforeLast('.').replace(Regex("[^\\p{L}\\p{N} _.-]"), "_").take(100).ifBlank { "Note" }
-        val file = File(folder, "$stem.$format")
+        val exportFormat = NativeExportFormat.fromShareFormat(format)
+        val filename = ExportFilename.suggestedName(mutable.value.active.name, exportFormat)
+        val file = File(folder, filename)
         shareFile = file
         busy(true)
         when (format) {
-            "pdf" -> outputUri = Uri.fromFile(file)
-            "smd" -> portableOutput = Uri.fromFile(file)
+            "pdf" -> { outputUri = Uri.fromFile(file); pdfDestinationIsNew = false }
+            "smd" -> { portableOutput = Uri.fromFile(file); portableDestinationIsNew = false }
         }
         return true
     }
@@ -390,7 +397,8 @@ class StudioViewModel(app: Application, val workspaceKey: String = "main") : And
         if (target != Uri.fromFile(file)) return false
         val app = getApplication<Application>()
         val uri = androidx.core.content.FileProvider.getUriForFile(app, "${app.packageName}.share", file)
-        val mime = when (file.extension) { "pdf" -> "application/pdf"; "smd" -> "application/vnd.supermd.smd"; else -> "text/markdown" }
+        val format = NativeExportFormat.fromShareFormat(file.extension)
+        val mime = format.mimeType
         val send = Intent(Intent.ACTION_SEND).setType(mime).putExtra(Intent.EXTRA_STREAM, uri).addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION).apply { clipData = android.content.ClipData.newUri(app.contentResolver, file.name, uri) }
         shareFile = null
         mutable.value = mutable.value.copy(busy = false, message = "Share copy ready")
@@ -398,6 +406,74 @@ class StudioViewModel(app: Application, val workspaceKey: String = "main") : And
         return true
     }
     private val resolver get() = getApplication<Application>().contentResolver
+
+    /** Validate the new SAF target before opening it for output; never rename an existing note URI. */
+    private fun prepareExportDestination(uri: Uri, format: NativeExportFormat, allowRename: Boolean): Uri {
+        if (uri.scheme != "content") {
+            val name = uri.lastPathSegment ?: ""
+            require(ExportFilename.suffixMatches(name, format)) { "The destination name must end in .${format.extension}" }
+            return uri
+        }
+        fun displayName(target: Uri): String? = resolver.query(
+            target,
+            arrayOf(android.provider.OpenableColumns.DISPLAY_NAME),
+            null,
+            null,
+            null,
+        )?.use { cursor ->
+            val column = cursor.getColumnIndex(android.provider.OpenableColumns.DISPLAY_NAME)
+            if (column >= 0 && cursor.moveToFirst()) cursor.getString(column)?.takeIf(String::isNotBlank) else null
+        }
+
+        var target = uri
+        var name = displayName(target)
+        if (name == null) {
+            // Some otherwise-compliant document providers omit DISPLAY_NAME.
+            // Accept only when their explicit MIME still identifies the
+            // requested format; a generic/unknown MIME gives us no safe way to
+            // distinguish (for example) a PDF from an SMD destination.
+            val actualMime = resolver.getType(target)
+            require(!actualMime.isNullOrBlank() && actualMime.substringBefore(';').trim().lowercase() !in setOf("application/octet-stream", "binary/octet-stream") && ExportFilename.mimeMatches(actualMime, format)) {
+                "The destination provider did not report a filename or a matching file type; choose another location."
+            }
+            return target
+        }
+        if (!ExportFilename.suffixMatches(name, format)) {
+            require(allowRename) { "This existing file does not have the .${format.extension} extension; use Export As instead." }
+            val correctedName = ExportFilename.suggestedName(name, format)
+            target = runCatching { DocumentsContract.renameDocument(resolver, target, correctedName) }.getOrNull()
+                ?: error("The destination provider cannot correct the filename. Choose a name ending in .${format.extension}.")
+            name = displayName(target) ?: error("The destination provider did not confirm the corrected filename.")
+        }
+        require(ExportFilename.suffixMatches(name, format)) {
+            "The destination provider kept a different extension. Choose a name ending in .${format.extension}."
+        }
+        require(ExportFilename.mimeMatches(resolver.getType(target), format)) {
+            "The destination provider identifies this as a different file type. Choose another location."
+        }
+        if (target != uri) {
+            if (uri == outputUri) outputUri = target
+            if (uri == portableOutput) portableOutput = target
+        }
+        return target
+    }
+
+    private fun verifyExportHeader(file: File, format: NativeExportFormat) {
+        val prefix = file.inputStream().use { input ->
+            val buffer = ByteArray(64)
+            var length = 0
+            while (length < buffer.size) {
+                val read = input.read(buffer, length, buffer.size - length)
+                if (read <= 0) break
+                length += read
+            }
+            buffer.copyOf(length)
+        }
+        require(ExportFilename.hasExpectedHeader(prefix, format)) {
+            "The generated ${format.extension.uppercase()} did not have its expected file signature."
+        }
+    }
+
     private fun change(block: (StudioState) -> StudioState) { mutable.value = block(mutable.value);observeActive(); schedulePersist() }
     private fun restore(): StudioState {
         var s = StudioState(theme = prefs.getString("theme", "system")!!, fullscreenTheme = prefs.getString("fullTheme", "black")!!, motion = prefs.getBoolean("motion", true), welcomed = prefs.getBoolean("welcomed", false), font = prefs.getString("font", "Manrope")!!, size = prefs.getFloat("size", 15f), folder = windowPrefs.getString("folder", if (workspaceKey == "main" && !windowPrefs.getBoolean("folderMigrated", false)) prefs.getString("folder", null) else null), pdf = prefs.getString("pdf", null) ?: StudioState().pdf)
@@ -850,13 +926,14 @@ class StudioViewModel(app: Application, val workspaceKey: String = "main") : And
                 mutable.value = mutable.value.copy(busy = false, message = "Save canceled because the note no longer has a destination.")
                 return@withLock
             }
-            val savedName = withContext(Dispatchers.IO) {
+            val (writtenTarget, savedName) = withContext(Dispatchers.IO) {
                 require(!note.portable || uri != null) { "Use portable save for this SMD file" }
-                copyAttachments(note, target)
-                resolver.openOutputStream(target, "wt")?.use { it.write(note.content.toByteArray()) } ?: error("Writing permission is unavailable; use Save as")
-                DocumentFile.fromSingleUri(getApplication(), target)?.name ?: note.name
+                val destination = if (uri != null) prepareExportDestination(target, NativeExportFormat.MARKDOWN, allowRename = true) else target
+                copyAttachments(note, destination)
+                resolver.openOutputStream(destination, "wt")?.use { it.write(note.content.toByteArray()) } ?: error("Writing permission is unavailable; use Save as")
+                destination to (DocumentFile.fromSingleUri(getApplication(), destination)?.name ?: note.name)
             }
-            change { s -> s.copy(busy = false, tabs = s.tabs.map { if (it.id == note.id) it.copy(uri = target.toString(), name = savedName, saved = note.content, assetDirectory = null) else it }, message = "Saved") }
+            change { s -> s.copy(busy = false, tabs = s.tabs.map { if (it.id == note.id) it.copy(uri = writtenTarget.toString(), name = savedName, saved = note.content, assetDirectory = null) else it }, message = "Saved") }
             mutable.value.tabs.find { it.id == note.id }?.let(::remember)
             }
         } catch (error: Exception) { fail("Could not save note: ${error.message}") }
@@ -1016,16 +1093,18 @@ class StudioViewModel(app: Application, val workspaceKey: String = "main") : And
         val note = mutable.value.tabs.find { it.id == id } ?: error("The note is no longer open")
         val target = if (save) note.uri?.let(Uri::parse) else portableOutput
         require(target != null) { "Choose a portable file destination" }
+        val destination = if (save) target else prepareExportDestination(target, NativeExportFormat.PORTABLE_SMD, allowRename = portableDestinationIsNew)
         val staged = File(getApplication<Application>().cacheDir, "fmd-${UUID.randomUUID()}.tmp")
         try {
             staged.outputStream().use { media.writeFmd(it, content, assets) }
+            verifyExportHeader(staged, NativeExportFormat.PORTABLE_SMD)
             // Extract assets independently so a saved draft can immediately resolve
             // new portable references without carrying binary data in its state.
             val opened = if (save) staged.inputStream().use(media::openFmd) else null
-            resolver.openOutputStream(target, "wt")?.use { output -> staged.inputStream().use { it.copyTo(output) } } ?: error("Cannot write portable file")
+            resolver.openOutputStream(destination, "wt")?.use { output -> staged.inputStream().use { it.copyTo(output) } } ?: error("Cannot write portable file")
             withContext(Dispatchers.Main) {
                 if (save) { change { s -> s.copy(tabs = s.tabs.map { if (it.id == id) it.copy(content = if (it.content == originalContent) content else it.content, saved = content, assetDirectory = opened!!.directory) else it }, busy = false, message = "Portable note saved") }; mutable.value.tabs.find { it.id == id }?.let(::remember) }
-                else { portableOutput = null; if (!finishShare(target)) mutable.value = mutable.value.copy(busy = false, message = "Portable .smd exported") }
+                else { portableOutput = null; portableDestinationIsNew = false; if (!finishShare(destination)) mutable.value = mutable.value.copy(busy = false, message = "Portable .smd exported") }
             }
         } finally { staged.delete() }
         }
@@ -1043,6 +1122,7 @@ class StudioViewModel(app: Application, val workspaceKey: String = "main") : And
         onPublishing: (suspend (PdfExportJob) -> Unit)? = null,
     ) = withContext(Dispatchers.IO + kotlinx.coroutines.NonCancellable) {
         val target = destination ?: error("Choose a PDF destination first")
+        val outputTarget = prepareExportDestination(target, NativeExportFormat.PDF, allowRename = target == outputUri && pdfDestinationIsNew)
         val staging = File(getApplication<Application>().cacheDir, "pdf-${UUID.randomUUID()}").apply { mkdirs() }
         try {
             val assetDir = File(staging, "assets").apply { mkdirs() }
@@ -1051,13 +1131,14 @@ class StudioViewModel(app: Application, val workspaceKey: String = "main") : And
             val output = File(staging, "document.pdf")
             val error = PdfEngine.export(content, options, assetDir.absolutePath, output.absolutePath)
             if (error.isNotEmpty()) error(error)
+            verifyExportHeader(output, NativeExportFormat.PDF)
             if (job != null) {
                 check(job.beginPublishing()) { "PDF export cancelled" }
                 onPublishing?.invoke(job)
             }
-            resolver.openOutputStream(target, "wt")?.use { stream -> output.inputStream().use { it.copyTo(stream) } } ?: error("Cannot write PDF destination")
+            resolver.openOutputStream(outputTarget, "wt")?.use { stream -> output.inputStream().use { it.copyTo(stream) } } ?: error("Cannot write PDF destination")
             job?.succeed()
-            withContext(Dispatchers.Main) { if (!finishShare(target)) mutable.value = mutable.value.copy(busy = false, message = "PDF exported"); outputUri = null }
+            withContext(Dispatchers.Main) { if (!finishShare(outputTarget)) mutable.value = mutable.value.copy(busy = false, message = "PDF exported"); outputUri = null; pdfDestinationIsNew = false }
         } catch (error: Exception) {
             job?.fail()
             throw error

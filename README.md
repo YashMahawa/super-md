@@ -195,15 +195,15 @@ controls require 0.6.3 or newer.
 
 ## Download
 
-Get **[Super MD 0.6.5](https://github.com/YashMahawa/super-md/releases/tag/v0.6.5)** or visit the [latest release](https://github.com/YashMahawa/super-md/releases/latest).
+Get **[Super MD 0.6.6](https://github.com/YashMahawa/super-md/releases/tag/v0.6.6)** or visit the [latest release](https://github.com/YashMahawa/super-md/releases/latest).
 
 | Platform | Packages |
 |---|---|
-| Linux x86-64 | [AppImage](https://github.com/YashMahawa/super-md/releases/download/v0.6.5/Super-MD_0.6.5_amd64.AppImage) · [DEB](https://github.com/YashMahawa/super-md/releases/download/v0.6.5/Super-MD_0.6.5_amd64.deb) · [RPM](https://github.com/YashMahawa/super-md/releases/download/v0.6.5/Super-MD-0.6.5-1.x86_64.rpm) |
-| Windows x64 | [Installer](https://github.com/YashMahawa/super-md/releases/download/v0.6.5/Super-MD_0.6.5_x64-setup.exe) |
-| macOS Apple silicon | [DMG](https://github.com/YashMahawa/super-md/releases/download/v0.6.5/Super-MD_0.6.5_aarch64.dmg) |
-| macOS Intel | [DMG](https://github.com/YashMahawa/super-md/releases/download/v0.6.5/Super-MD_0.6.5_x64.dmg) |
-| Android 8+ / ARM64 | [Signed release APK](https://github.com/YashMahawa/super-md/releases/download/v0.6.5/Super-MD-0.6.5-arm64-release.apk) |
+| Linux x86-64 | [AppImage](https://github.com/YashMahawa/super-md/releases/download/v0.6.6/Super-MD_0.6.6_amd64.AppImage) · [DEB](https://github.com/YashMahawa/super-md/releases/download/v0.6.6/Super-MD_0.6.6_amd64.deb) · [RPM](https://github.com/YashMahawa/super-md/releases/download/v0.6.6/Super-MD-0.6.6-1.x86_64.rpm) |
+| Windows x64 | [Installer](https://github.com/YashMahawa/super-md/releases/download/v0.6.6/Super-MD_0.6.6_x64-setup.exe) |
+| macOS Apple silicon | [DMG](https://github.com/YashMahawa/super-md/releases/download/v0.6.6/Super-MD_0.6.6_aarch64.dmg) |
+| macOS Intel | [DMG](https://github.com/YashMahawa/super-md/releases/download/v0.6.6/Super-MD_0.6.6_x64.dmg) |
+| Android 8+ / ARM64 | [Signed release APK](https://github.com/YashMahawa/super-md/releases/download/v0.6.6/Super-MD-0.6.6-arm64-release.apk) |
 
 Release checksums are included. macOS packages are ad-hoc signed, not notarized; Windows installers are not code-signed. Android installation requires the normal system approval. For Linux graphics or AppImage mounting issues, read [graphics diagnostics](docs/GRAPHICS-DIAGNOSTICS.md).
 

@@ -1,4 +1,19 @@
-# Super MD 0.6.5
+# Super MD 0.6.6
+
+## PDF compatibility and export filenames
+
+- Fixed circular convolution (`\circledast`, including indexed forms) failing native PDF export with an “unknown symbol modifier” error. The Markdown source does not need to change.
+- Audited all 397 zero-argument symbolic commands in MiTeX's embedded inventory against the shipping typesetter. Updated circled and large operators, dashed arrows, double brackets, Planck's constant, inverted omega and partial derivatives.
+- Symbol compatibility now uses math syntax rather than text substitution, preserving literal TeX text and quoted strings. Ordinary equations without legacy identifiers avoid the additional syntax parsing.
+- Android share copies preserve Unicode, emoji, spaces and ordinary punctuation. Unsafe path/control characters remain sanitized; long names are bounded by Unicode code points and UTF-8 bytes.
+- Export suggestions strip known document suffixes before adding the selected format's canonical suffix. PDF, Markdown and SMD use corresponding filenames and MIME types.
+- Newly created Android export destinations are checked before writing. A provider-supplied wrong extension is corrected when supported or reported clearly; existing notes are never renamed by this correction. PDF/SMD file signatures are checked before publishing bytes.
+- Portable Android notes now display the PDF/SMD format selector rather than hiding it.
+- Desktop export dialogs track the selected format's suffix. Mismatched known extensions are rejected before exporting, and extensionless/custom dotted stems get the proper suffix without silently overwriting an unconfirmed destination.
+- Added native JNI symbol checks, Unicode filename/MIME/header share transitions, desktop export/collision regressions and the generated symbol audit.
+- Verified the complete supplied SNS note through real PDF preparation, including both Mermaid diagrams, without modifying the note or automatically executing its Python code.
+
+The performance, recovery and compatibility improvements below are retained from 0.6.5.
 
 ## More reliable editing and recovery
 
