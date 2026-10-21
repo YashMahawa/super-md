@@ -56,21 +56,30 @@ describe('reader edit transport',()=>{
     edits.open('note','another external update');
     expect(edits.unacknowledged('note')).toBe('unsent local draft');
   });
-  it('ignores a retired resync failure and flushes the new clean baseline',async()=>{
-    let release!:(value:any)=>void,entered!:()=>void;
-    const resyncStarted=new Promise<void>(resolve=>{entered=resolve;});
-    const send=vi.fn(async(command:string,args:any)=>{
-      if(command==='document_resync')return await new Promise<any>(resolve=>{release=resolve;entered();});
-      return {accepted:args.content==='replacement',revision:0};
-    });
+  it('does not create a conflict recovery copy for a rejected clean native baseline',async()=>{
+    const send=vi.fn(async(_command:string,args:any)=>({accepted:args.content==='replacement',revision:0}));
+    const edits=new ReaderEdits(send);
+    edits.open('note','original');
+    await expect(edits.flush('note')).rejects.toThrow('baseline');
+    expect(send.mock.calls.map(([command])=>command)).toEqual(['document_sync']);
+    expect(edits.unacknowledged('note')).toBeUndefined();
+    edits.open('note','replacement');
+    await expect(edits.flush('note')).resolves.toBeUndefined();
+    expect(send.mock.calls.map(([command])=>command)).toEqual(['document_sync','document_sync']);
+    expect(send.mock.calls.at(-1)?.[1].content).toBe('replacement');
+  });
+  it('ignores a retired initial transport failure without failing the new native baseline',async()=>{
+    let reject!:(reason:Error)=>void;
+    const send=vi.fn(async(_command:string,args:any)=>args.content==='original'
+      ?await new Promise<any>((_resolve,rejectPromise)=>{reject=rejectPromise;})
+      :{accepted:true,revision:0});
     const edits=new ReaderEdits(send);
     edits.open('note','original');
     const flushing=edits.flush('note');
-    await resyncStarted;
     edits.open('note','replacement');
-    release({accepted:false});
+    reject(new Error('Late obsolete bridge failure'));
     await expect(flushing).resolves.toBeUndefined();
-    expect(send.mock.calls.map(([command])=>command)).toEqual(['document_sync','document_resync','document_sync']);
-    expect(send.mock.calls.at(-1)?.[1].content).toBe('replacement');
+    expect(send.mock.calls.map(([command])=>command)).toEqual(['document_sync','document_sync']);
+    expect(edits.unacknowledged('note')).toBeUndefined();
   });
 });

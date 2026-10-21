@@ -131,7 +131,12 @@ function Reader() {
         next.content=draft;
         setEditError('A native update arrived while edits were awaiting acknowledgement. Your editor draft has been kept. Save or close will wait for a verified edit session.');
       }
-      if((next as ReaderState&{editProtocol?:number}).editProtocol===1)edits.current!.open(next.id,next.content);
+      if((next as ReaderState&{editProtocol?:number}).editProtocol===1){
+        edits.current!.open(next.id,next.content);
+        // Retiring an untouched stale baseline also retires its reader-only
+        // warning. Never hide an error while an unacknowledged draft remains.
+        if(draft===undefined&&(old?.id!==next.id||old?.content!==next.content))setEditError('');
+      }
       if(old?.id===next.id)next.readingLocation=old.readingLocation;
       if(old&&(old.id!==next.id||old.mode!==next.mode||old.fullscreen!==next.fullscreen))document.querySelectorAll('.android-reading').forEach(cancelHeadingNavigation);
       if(old&&(old.id!==next.id||old.mode!==next.mode)){const history=histories.current.get(next.id);if(history)history.last=0;}

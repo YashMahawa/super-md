@@ -4,8 +4,9 @@ import os from 'node:os';
 import path from 'node:path';
 import test from 'node:test';
 import {
-  aggregateAllowlistedLibraryMemory, aggregateProcessTree, aggregateSamples, createFixtures, createImageHeavyFixture, formatReadinessDiagnostics, IMAGE_FIXTURE_MAX_EDGE,
-  IMAGE_FIXTURE_MAX_PIXELS, IMAGE_FIXTURE_MAX_SOURCE_BYTES, parseAllowlistedLibrarySmaps, parseProcMemory, parseProcStat, percentile, pngDimensions, validateImageFixtureDimensions,
+  aggregateAllowlistedLibraryMemory, aggregateProcessTree, aggregateSamples, createDiagramHeavyFixture, createFixtures, createImageHeavyFixture, DIAGRAM_READY_TIMEOUT_MS,
+  formatReadinessDiagnostics, IMAGE_FIXTURE_MAX_EDGE, IMAGE_FIXTURE_MAX_PIXELS, IMAGE_FIXTURE_MAX_SOURCE_BYTES, parseAllowlistedLibrarySmaps,
+  parseArgs, parseProcMemory, parseProcStat, percentile, pngDimensions, validateImageFixtureDimensions,
 } from './benchmark-installed-reader.mjs';
 
 test('percentiles and aggregate summaries ignore unavailable values and preserve zeros', () => {
@@ -130,6 +131,43 @@ test('generates bounded, reproducible fixtures with an exact 1 MB ASCII note', (
   assert.equal(fixtures.find(fixture => fixture.name === 'many-blocks').blockCount, 8);
   assert.ok(fixtures.find(fixture => fixture.name === 'huge-single-block').sourceBytes >= 4096);
   assert.ok(fixtures.every(fixture => fixture.synthetic && fixture.hasEquation));
+});
+
+test('diagram-heavy fixture is opt-in and contains 12 unique plain/init flowcharts after the first inline equation', () => {
+  const fixture = createDiagramHeavyFixture();
+  assert.equal(fixture.name, 'diagram-heavy');
+  assert.equal(fixture.diagramCount, 12);
+  assert.equal(fixture.peleEligibleDiagramCount, 6);
+  assert.equal(fixture.legacyFallbackDiagramCount, 6);
+  assert.equal(fixture.synthetic, true);
+  assert.equal(fixture.hasEquation, true);
+  assert.ok(fixture.content.indexOf('$E=mc^2$') < fixture.content.indexOf('```mermaid'));
+  const diagrams = [...fixture.content.matchAll(/```mermaid\n([\s\S]*?)\n```/g)].map(match => match[1]);
+  assert.equal(diagrams.length, 12);
+  assert.equal(new Set(diagrams).size, 12);
+  assert.equal(diagrams.filter(source => source.startsWith('%%{init:')).length, 6);
+  assert.ok(diagrams.filter(source => !source.startsWith('%%{init:')).every(source => /^flowchart LR\n/.test(source)));
+  assert.deepEqual(createFixtures().map(candidate => candidate.name), ['small', 'math-heavy', '1mb', 'many-blocks', 'huge-single-block']);
+  assert.deepEqual(parseArgs(['--binary', '/tmp/reader', '--fixtures', 'diagram-heavy']).fixtures, ['diagram-heavy']);
+  assert.equal(DIAGRAM_READY_TIMEOUT_MS, 90_000);
+});
+
+test('diagram readiness checks all SVG images from load start, fails explicit render errors, and aggregates cold/warm timings', async () => {
+  const source = await readFile(new URL('./benchmark-installed-reader.mjs', import.meta.url), 'utf8');
+  const start = source.indexOf('const waitForDiagrams =');
+  const end = source.indexOf('let firstEquationMs, fontReadyMs, diagramReadyMs', start);
+  const readiness = source.slice(start, end);
+  assert.ok(start >= 0 && end > start);
+  assert.match(readiness, /performance\.now\(\) \+ diagramTimeoutMs/);
+  assert.match(readiness, /querySelectorAll\('\.mermaid img'\)/);
+  assert.match(readiness, /image\.complete && image\.naturalWidth > 0/);
+  assert.match(readiness, /benchmark:mermaid-render-error/);
+  assert.match(readiness, /resolve\(performance\.now\(\) - started\)/);
+  assert.match(source, /'diagramReadyMs'/);
+  assert.match(source, /diagramTimeoutMs: DIAGRAM_READY_TIMEOUT_MS/);
+  assert.match(source, /loadAndMeasure\(page, fixture, id\)/, 'warm revisits use the same measured load path');
+  assert.deepEqual(aggregateSamples([{ diagramReadyMs: 30 }, { diagramReadyMs: 10 }, { diagramReadyMs: null }]).diagramReadyMs,
+    { count: 2, median: 10, p95: 30 });
 });
 
 test('keeps image-heavy fixtures opt-in and caps total pixels and edge dimensions', () => {

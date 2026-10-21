@@ -92,3 +92,31 @@ comparison. The 1 MB candidate retains more analysis data (JS heap 17.10 →
 18.78 MB) while avoiding repeated work. This bounded speed/memory tradeoff
 is recorded explicitly; final comparable release-package and interactive
 checks are still required.
+
+### Oversized single-block follow-up
+
+After exact-source analysis sharing, a generated 4,000,008-byte note (one huge
+paragraph plus its heading) was compared against 0.6.4 using the same Python/Qt
+runtime and matching frontend assets. Each version had three fresh processes
+and six total same-source revisits, with two theme cycles per process.
+
+| Metric | 0.6.4 source | Candidate source |
+|---|---:|---:|
+| Cold first equation, median | 1,729.5 ms | 1,513.0 ms |
+| Two-frame layout readiness, median | 2,453.3 ms | 2,245.8 ms |
+| Same-source revisit, median | 265.8 ms | 24.0 ms |
+| Collected cold JS heap | 19.54 MB | 18.94 MB |
+| Cold process-tree PSS | 702.1 MiB | 704.0 MiB |
+| Post-revisit/theme PSS | 721.8 MiB | 724.2 MiB |
+| Theme readiness, median | 150.2 ms | 165.8 ms |
+
+This sample supports improved large-source reuse, not universal memory or theme
+speed improvements. Candidate cold timings varied (first-equation p95 1,760.7
+ms versus baseline 1,743.5 ms); process memory was slightly higher and theme
+readiness slower in this batch. The framework scheduling and software-renderer
+limitations above still apply. No native 60 Hz smoothness claim follows from
+these numbers, and final release-package validation remains required.
+The harness deliberately sends the complete synthetic source on each theme
+cycle for baseline compatibility, so its theme timing also includes that CDP
+payload transfer; it does not isolate the optimized native preference-update
+path, which can omit unchanged content.

@@ -34,6 +34,8 @@ ApplicationWindow {
     property bool sharing: false
     property string sidebarSection: "folder"
     property bool chromeAwake: true
+    readonly property real readerVisibleChromeInset: studyToolbar.visible && studyToolbar.shown ? studyToolbar.height : 0
+    onReaderVisibleChromeInsetChanged: syncVisibleReaderChrome()
     Timer { id: chromeIdle; interval: 2200; onTriggered: { if(studyToolbar.hovered || studyToolbar.focusWithin) restart(); else window.chromeAwake = false } }
     // Deliberate desktop reveal target; ordinary pointer movement in a note
     // does not summon controls. Scrolling only hides; clicks may toggle them.
@@ -50,6 +52,9 @@ ApplicationWindow {
     function runDocumentScriptWithCallback(script, callback) {
         if (!reader) return
         reader.runJavaScript(script, callback)
+    }
+    function syncVisibleReaderChrome() {
+        window.runDocumentScript("document.documentElement.style.setProperty('--native-visible-chrome-inset','" + readerVisibleChromeInset + "px')")
     }
     function focusReader() { if (reader) reader.forceActiveFocus() }
     function scheduleReaderRemount(delay) {
@@ -106,7 +111,7 @@ ApplicationWindow {
         function onThemePickerRequested() { themeDialog.open() }
         function onThemeExportRequested() { themeExportDialog.open() }
         function onReaderLoad(payload) {
-            const script = "(function(){if(!window.supermdLoad)return false;window.supermdLoad(" + payload + ");window.supermdChromeInset?.(" + (studio.readerFullscreen ? 56 : 0) + ");return true})()"
+            const script = "(function(){if(!window.supermdLoad)return false;window.supermdLoad(" + payload + ");window.supermdChromeInset?.(" + (studio.readerFullscreen ? 56 : 0) + ");document.documentElement.style.setProperty('--native-visible-chrome-inset','" + window.readerVisibleChromeInset + "px');return true})()"
             window.runDocumentScript(script)
         }
         function onReaderCall(script) { window.runDocumentScript(script) }

@@ -25,7 +25,8 @@ const DEFAULTS = {
   mathCount: 80,
 };
 const FIXTURE_NAMES = ['small', 'math-heavy', '1mb', 'many-blocks', 'huge-single-block'];
-const OPTIONAL_FIXTURE_NAMES = ['image-heavy'];
+const OPTIONAL_FIXTURE_NAMES = ['image-heavy', 'diagram-heavy'];
+export const DIAGRAM_READY_TIMEOUT_MS = 90_000;
 export const IMAGE_FIXTURE_MAX_PIXELS = 32_000_000;
 export const IMAGE_FIXTURE_MAX_EDGE = 8192;
 export const IMAGE_FIXTURE_MAX_SOURCE_BYTES = 2_000_000;
@@ -128,6 +129,26 @@ export function createImageHeavyFixture(dimensions = IMAGE_HEAVY_DIMENSIONS) {
   };
 }
 
+export function createDiagramHeavyFixture() {
+  const diagramCount = 12;
+  const legacyFallbackDiagramCount = 6;
+  const diagrams = Array.from({ length: diagramCount }, (_, index) => {
+    const number = index + 1;
+    const nodes = `  A${number}[Read ${number}] --> B${number}[Practice ${number}] --> C${number}[Review ${number}]`;
+    const authoredInit = number % 2 === 0;
+    const source = `${authoredInit ? '%%{init: {"theme":"neutral"}}%%\n' : ''}flowchart LR\n${nodes}`;
+    return `### Diagram ${number}\n\n\`\`\`mermaid\n${source}\n\`\`\``;
+  });
+  const content = `# Diagram-heavy synthetic note\n\nThe first inline equation is $E=mc^2$.\n\n${diagrams.join('\n\n')}\n`;
+  return {
+    name: 'diagram-heavy', content, title: 'Diagram-heavy synthetic note',
+    sourceBytes: Buffer.byteLength(content), blockCount: content.split(/\n\s*\n/).filter(Boolean).length,
+    synthetic: true, hasEquation: true, diagramCount,
+    peleEligibleDiagramCount: diagramCount - legacyFallbackDiagramCount,
+    legacyFallbackDiagramCount,
+  };
+}
+
 export function percentile(values, fraction = 0.95) {
   const sorted = values.filter(Number.isFinite).sort((a, b) => a - b);
   if (!sorted.length) return null;
@@ -141,7 +162,7 @@ function summarize(values) {
 }
 
 export function aggregateSamples(samples) {
-  const fields = ['firstEquationMs', 'fontReadyMs', 'presentedRafReadyMs', 'frameIntervalP95Ms', 'zoomCallP95Ms', 'jsHeapBytes', 'domElements', 'imageReadyMs', 'imageLayoutShift', 'imageDecodedPixels', 'imageTraversalSteps', 'imagePeakSampledPssKb', 'imagePeakSampledRssKb', 'imagePeakSampledHeapBytes'];
+  const fields = ['firstEquationMs', 'fontReadyMs', 'diagramReadyMs', 'presentedRafReadyMs', 'frameIntervalP95Ms', 'zoomCallP95Ms', 'jsHeapBytes', 'domElements', 'imageReadyMs', 'imageLayoutShift', 'imageDecodedPixels', 'imageTraversalSteps', 'imagePeakSampledPssKb', 'imagePeakSampledRssKb', 'imagePeakSampledHeapBytes'];
   return Object.fromEntries(fields.map(field => [field, summarize(samples.map(sample => sample[field]))]));
 }
 
@@ -343,7 +364,7 @@ export function createFixtures(options = {}) {
   }));
 }
 
-function parseArgs(argv) {
+export function parseArgs(argv) {
   const args = { ...DEFAULTS, fixtures: [...FIXTURE_NAMES] };
   for (let i = 0; i < argv.length; i++) {
     const key = argv[i];
@@ -395,7 +416,7 @@ Options:
   --library-memory          Linux-only allowlisted per-library PSS/RSS snapshot after timing probes
   --repetitions N           Fresh app launches per fixture (default: 3, minimum: 3)
   --warm-cycles N           Same-source revisit and theme cycles (default: 2, max: 5)
-  --fixtures LIST           Comma-separated names (default: five baseline fixtures; optional: image-heavy)
+  --fixtures LIST           Comma-separated names (default: five baseline fixtures; optional: image-heavy, diagram-heavy)
   --frame-samples N         Animation-frame intervals to collect (default: 120)
   --one-mb-bytes N          1 MB fixture target, at least 1000000 (default: 1000000)
   --many-block-count N      Paragraph blocks (default: 1500)
@@ -463,7 +484,7 @@ async function attachPage(browser, timeoutMs) {
 }
 
 async function loadAndMeasure(page, fixture, id, dark = false) {
-  const result = await page.evaluate(async ({ content, title, id: noteId, dark: themeDark, fixtureImageCount }) => {
+  const result = await page.evaluate(async ({ content, title, id: noteId, dark: themeDark, fixtureImageCount, fixtureDiagramCount, diagramTimeoutMs }) => {
     const started = performance.now();
     if (fixtureImageCount > 0) {
       window.__benchmarkMeasureStartedAt = started;
@@ -504,8 +525,27 @@ async function loadAndMeasure(page, fixture, id, dark = false) {
       };
       requestAnimationFrame(check);
     });
-    let firstEquationMs, fontReadyMs;
-    try { [firstEquationMs, fontReadyMs] = await Promise.all([waitForEquation, waitForFont]); }
+    const waitForDiagrams = fixtureDiagramCount > 0 ? new Promise((resolve, reject) => {
+      const deadline = performance.now() + diagramTimeoutMs;
+      const check = () => {
+        const currentReader = document.querySelector('.android-reading');
+        const errors = Array.from(currentReader?.querySelectorAll('.render-error') ?? [])
+          .filter(error => /^Mermaid:/i.test(error.textContent?.trim() ?? ''));
+        if (errors.length) {
+          reject(new Error(`benchmark:mermaid-render-error (${errors.length} of ${fixtureDiagramCount} diagrams)`));
+          return;
+        }
+        const diagrams = Array.from(currentReader?.querySelectorAll('.mermaid img') ?? []);
+        if (diagrams.length === fixtureDiagramCount && diagrams.every(image => image.complete && image.naturalWidth > 0)) {
+          resolve(performance.now() - started);
+        } else if (performance.now() >= deadline) {
+          reject(new Error(`benchmark:mermaid-readiness-timeout (${diagrams.filter(image => image.complete && image.naturalWidth > 0).length}/${fixtureDiagramCount} images ready)`));
+        } else requestAnimationFrame(check);
+      };
+      requestAnimationFrame(check);
+    }) : Promise.resolve(null);
+    let firstEquationMs, fontReadyMs, diagramReadyMs;
+    try { [firstEquationMs, fontReadyMs, diagramReadyMs] = await Promise.all([waitForEquation, waitForFont, waitForDiagrams]); }
     catch (error) {
       if (error?.message !== 'benchmark:first-equation-timeout') throw error;
       const reader = document.querySelector('.android-reading');
@@ -521,8 +561,8 @@ async function loadAndMeasure(page, fixture, id, dark = false) {
       } };
     }
     await new Promise(resolve => requestAnimationFrame(() => requestAnimationFrame(resolve)));
-    return { firstEquationMs, fontReadyMs, presentedRafReadyMs: performance.now() - started, theme: document.documentElement.dataset.theme };
-  }, { content: fixture.content, title: fixture.title, id, dark, fixtureImageCount: fixture.images?.length ?? 0 });
+    return { firstEquationMs, fontReadyMs, diagramReadyMs, presentedRafReadyMs: performance.now() - started, theme: document.documentElement.dataset.theme };
+  }, { content: fixture.content, title: fixture.title, id, dark, fixtureImageCount: fixture.images?.length ?? 0, fixtureDiagramCount: fixture.diagramCount ?? 0, diagramTimeoutMs: DIAGRAM_READY_TIMEOUT_MS });
   if (result.readinessTimeout) {
     throw new Error(`Timed out waiting for first rendered equation; counts=${JSON.stringify(formatReadinessDiagnostics(result.readinessTimeout))}`);
   }
@@ -779,6 +819,7 @@ export async function runBenchmark(options) {
   if (options.entrypoint) await access(path.resolve(options.entrypoint));
   const generatedFixtures = createFixtures(options);
   if (options.fixtures.includes('image-heavy')) generatedFixtures.push(createImageHeavyFixture());
+  if (options.fixtures.includes('diagram-heavy')) generatedFixtures.push(createDiagramHeavyFixture());
   const fixtures = generatedFixtures.filter(fixture => options.fixtures.includes(fixture.name));
   const samples = [];
   // Each fixture/repetition gets a fresh isolated process, so cold measurements
@@ -800,6 +841,9 @@ export async function runBenchmark(options) {
         imageCount: fixture.images?.length ?? 0,
         imageDimensions: fixture.images?.map(({ width, height }) => ({ width, height })) ?? [],
         decodedPixels: fixture.decodedPixels ?? 0,
+        diagramCount: fixture.diagramCount ?? 0,
+        peleEligibleDiagramCount: fixture.peleEligibleDiagramCount ?? 0,
+        legacyFallbackDiagramCount: fixture.legacyFallbackDiagramCount ?? 0,
         decodedMegapixels: fixture.decodedMegapixels ?? 0,
       },
       cold: aggregateSamples(cold), warmRevisits: aggregateSamples(warm),
@@ -835,9 +879,12 @@ export async function runBenchmark(options) {
         mathCount: options.mathCount, imageFixtureMaxPixels: IMAGE_FIXTURE_MAX_PIXELS,
         imageFixtureMaxEdge: IMAGE_FIXTURE_MAX_EDGE, imageFixtureMaxSourceBytes: IMAGE_FIXTURE_MAX_SOURCE_BYTES,
       },
-      fixtures: fixtures.map(({ name, sourceBytes, blockCount, images, decodedPixels }) => ({
+      fixtures: fixtures.map(({ name, sourceBytes, blockCount, images, decodedPixels, diagramCount, peleEligibleDiagramCount, legacyFallbackDiagramCount }) => ({
         name, sourceBytes, blockCount, imageCount: images?.length ?? 0,
         imageDimensions: images?.map(({ width, height }) => ({ width, height })) ?? [], decodedPixels: decodedPixels ?? 0,
+        diagramCount: diagramCount ?? 0,
+        peleEligibleDiagramCount: peleEligibleDiagramCount ?? 0,
+        legacyFallbackDiagramCount: legacyFallbackDiagramCount ?? 0,
       })),
     },
     methodology: {
@@ -845,6 +892,7 @@ export async function runBenchmark(options) {
       presentedFrame: 'After the first KaTeX equation and Manrope font readiness, wait for two requestAnimationFrame callbacks. This measures Chromium scheduling/layout readiness, not a native captured-pixel or display-scanout timestamp.',
       frameIntervals: 'Intervals between requestAnimationFrame callbacks while the loaded fixture is idle; not an input-to-presented-frame latency.',
       imageReadiness: 'For the optional image-heavy fixture, scrolls the normal reader one viewport step at a time so windowed blocks mount naturally, records each generated PNG natural size/decode observation, samples process-tree memory during traversal, and reports layout-shift observations. These are not input-to-presented-frame latency measurements.',
+      diagramReadiness: 'For the opt-in diagram-heavy fixture, measures from the same load start until all 12 normal reader Mermaid SVG images are complete with positive naturalWidth; any Mermaid render error or 90-second readiness timeout fails the sample. The fixture mixes plain Pele-eligible flowcharts and authored-init Mermaid fallback diagrams.',
       zoomCall: 'Synchronous JavaScript call duration for supermdSetZoom; it excludes subsequent layout and painting.',
       jsHeap: 'CDP JavaScript heap used after HeapProfiler.collectGarbage when supported; each sample records whether garbage collection was available. Excludes native and GPU memory.',
       processMemory: process.platform === 'linux' ? 'Linux /proc process-tree RSS is summed (shared mappings may be double-counted); PSS sums smaps_rollup proportional set sizes for the launched reader and descendants only.' : 'Process-tree RSS/PSS collection is Linux-only; values are null on this platform.',

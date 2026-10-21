@@ -1,5 +1,38 @@
 import {test,expect} from '@playwright/test';
 
+test('an obsolete untouched baseline blocks flush without manufacturing a recovery draft, then accepts the native replacement',async({page})=>{
+  await page.addInitScript(()=>{
+    const native={content:'# New native content',resyncs:0,flushed:[] as any[]};
+    (window as any).__cleanBaseline=native;
+    window.SuperMD={post:(id,command,raw)=>{
+      const args=JSON.parse(raw);
+      if(command==='document_resync')native.resyncs++;
+      if(command==='document_flushed')native.flushed.push(args);
+      const result=command==='document_sync'?{accepted:args.content===native.content,revision:0}:true;
+      queueMicrotask(()=>window.supermdReply?.(id,result,null));
+    }};
+  });
+  await page.goto('/android-reader.html');
+  await page.waitForFunction(()=>typeof window.supermdLoad==='function');
+  const state={id:'clean-baseline',path:null,content:'# Obsolete native content',mode:'reader' as const,dark:false,fullscreen:false,colors:{},font:'Manrope',size:16,zoom:100,editProtocol:1};
+  await page.evaluate(state=>window.supermdLoad?.(state),state);
+  await page.evaluate(()=>window.supermdFlush?.({action:'android_flush',target:'clean-baseline',token:'obsolete'}));
+  await expect.poll(()=>page.evaluate(()=>(window as any).__cleanBaseline.flushed.length)).toBe(1);
+  const rejected=await page.evaluate(()=>(window as any).__cleanBaseline.flushed[0]);
+  expect(rejected.error).toContain('baseline');
+  expect(rejected.content).toBeUndefined();
+  await expect(page.getByRole('alert')).toContainText('baseline');
+  await page.evaluate(state=>window.supermdLoad?.(state),{...state,content:'# New native content'});
+  await expect(page.getByRole('heading',{name:'New native content',exact:true})).toBeVisible();
+  await expect(page.getByRole('alert')).toHaveCount(0);
+  await page.evaluate(()=>window.supermdFlush?.({action:'android_flush',target:'clean-baseline',token:'current'}));
+  await expect.poll(()=>page.evaluate(()=>(window as any).__cleanBaseline.flushed.length)).toBe(2);
+  const native=await page.evaluate(()=>(window as any).__cleanBaseline);
+  expect(native.resyncs).toBe(0);
+  expect(native.flushed[1]).toMatchObject({token:'current',content:native.content});
+  expect(native.flushed[1].error).toBeUndefined();
+});
+
 test('native edits send small UTF-16 patches and flush waits for all acknowledgements',async({page})=>{
   const content='# Draft\n\n'+('A substantial unchanged paragraph.\n'.repeat(12000));
   await page.addInitScript(initial=>{

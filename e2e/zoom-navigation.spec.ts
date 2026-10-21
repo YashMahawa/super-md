@@ -1,5 +1,32 @@
 import {test,expect} from '@playwright/test';
 
+test('heading targets avoid a visible native overlay without resizing the reader or changing zoom',async({page})=>{
+  await page.addInitScript(()=>{window.SuperMD={post:()=>{}};});
+  await page.goto('/android-reader.html');
+  await page.waitForFunction(()=>typeof window.supermdLoad==='function');
+  const content='# Top\n\n[Go to destination](#destination)\n\n'+Array.from({length:600},(_,i)=>`## Part ${i}\n\n${'Generated readable paragraph. '.repeat(5)}\n\n`).join('')+'\n## Destination\n\nEnd of the generated note.\n';
+  await page.evaluate(content=>window.supermdLoad?.({id:'native-navigation-occlusion',content,path:null,mode:'reader',dark:false,fullscreen:false,colors:{},font:'Manrope',size:18,zoom:175,motion:false,restorePosition:false}),content);
+  await page.evaluate(()=>document.fonts.ready);
+  await expect(page.locator('.document-page')).toHaveAttribute('data-scale','1.75');
+  await page.evaluate(()=>window.supermdChromeInset?.(196));
+  const viewportHeight=await page.locator('.android-reading').evaluate(el=>el.clientHeight);
+  const textWidth=await page.locator('.markdown-body').evaluate(el=>(el as HTMLElement).offsetWidth);
+  for(const inset of [196,0]){
+    await page.evaluate(inset=>{
+      document.documentElement.style.setProperty('--native-visible-chrome-inset',`${inset}px`);
+      window.supermdHeading?.('destination');
+    },inset);
+    await expect.poll(()=>page.locator('h2#destination').evaluate(el=>{
+      const root=el.closest('.android-reading')!;
+      const visible=Number.parseFloat(getComputedStyle(document.documentElement).getPropertyValue('--native-visible-chrome-inset'))||0;
+      return Math.abs(el.getBoundingClientRect().top-root.getBoundingClientRect().top-16-visible);
+    })).toBeLessThan(3);
+    expect(await page.locator('.android-reading').evaluate(el=>el.clientHeight)).toBe(viewportHeight);
+    expect(await page.locator('.markdown-body').evaluate(el=>(el as HTMLElement).offsetWidth)).toBe(textWidth);
+    await expect(page.locator('.document-page')).toHaveAttribute('data-scale','1.75');
+  }
+});
+
 test('new pinch owns its scale over an older queued native command',async({page})=>{
   await page.addInitScript(()=>{window.SuperMD={post:()=>{}};});await page.goto('/android-reader.html');
   await page.waitForFunction(()=>typeof window.supermdLoad==='function');

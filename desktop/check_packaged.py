@@ -74,6 +74,7 @@ def check(executable: Path, version: str, graphics: str) -> None:
         if graphics != "auto" and evidence.get("software") is not True:
             raise RuntimeError("Required graphics fallback was not selected")
         print(json.dumps({"executable":str(executable),"version":version,"graphics":graphics,
+                          "software":evidence.get("software"),
                           "readerColors":evidence['readerColors'],"pdfBytes":pdf.stat().st_size}))
 
 

@@ -56,7 +56,12 @@ export function navigateToHeading(root:Element,target:string):boolean {
     revealWindowed(mounted);
     const page=host.querySelector<HTMLElement>('.document-page');
     if(page&&!refreshDocumentExtent(host)){invalidateDocumentZoom(host);applyDocumentZoom(host,Number(page.dataset.scale)*100||100,Number.parseFloat(document.documentElement.style.getPropertyValue('--reading-max-width'))||80,undefined,undefined,undefined,host.dataset.centerLocked==='true');}
-    host.scrollTop+=mounted.getBoundingClientRect().top-host.getBoundingClientRect().top-16;
+    // Native toolbars overlay the document rather than resizing its viewport.
+    // The host reports only their CURRENT visible occlusion separately from
+    // the permanent first-note spacer, so hidden controls add no jump margin.
+    const visibleChrome=Number.parseFloat(getComputedStyle(host.ownerDocument.documentElement).getPropertyValue('--native-visible-chrome-inset'));
+    const gap=16+(Number.isFinite(visibleChrome)?Math.max(0,Math.min(480,visibleChrome)):0);
+    host.scrollTop+=mounted.getBoundingClientRect().top-host.getBoundingClientRect().top-gap;
     mounted.tabIndex=-1;mounted.focus({preventScroll:true});
     if(frames>0)frame=requestAnimationFrame(()=>align(frames-1));
   };

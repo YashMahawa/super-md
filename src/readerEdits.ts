@@ -48,6 +48,10 @@ export class ReaderEdits {
         const reply=await this.send('document_sync',{id:session.id,epoch:session.epoch,revision:0,content:session.ack});
         if(this.sessions.get(session.id)!==session)return;
         if(!reply.accepted){
+          // A stale native snapshot is not a local draft. Keep operations
+          // fail-closed until the replacement arrives, but do not ask native
+          // recovery to archive untouched, obsolete text as a conflict.
+          if(session.latest===session.ack)throw new Error('The native document baseline changed. Wait for its latest content before saving or continuing.');
           const draft=session.latest;
           const recovery=await this.send('document_resync',{id:session.id,epoch:session.epoch,revision:0,bases:[session.ack],content:draft});
           if(this.sessions.get(session.id)!==session)return;

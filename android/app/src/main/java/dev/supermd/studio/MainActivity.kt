@@ -310,6 +310,12 @@ private object NoMotionScheme : MotionScheme {
         LaunchedEffect(readerReady,chromeHeight) {
             if(readerReady) web?.evaluateJavascript("window.supermdChromeInset?.(${chromeHeight/density.density})",null)
         }
+        // Navigation needs to avoid visible controls, but showing/hiding an
+        // overlay must never resize the reader or change its first-note spacer.
+        LaunchedEffect(readerReady,chromeHeight,chromeShown) {
+            val visibleInset=if(chromeShown) chromeHeight/density.density else 0f
+            if(readerReady) web?.evaluateJavascript("document.documentElement.style.setProperty('--native-visible-chrome-inset','${visibleInset}px')",null)
+        }
         // Reader overlays (search, repair) hide the top bar and system bars, so
         // they anchor to the cutout-safe top edge, not the hidden chrome height.
         val safeTop = WindowInsets.displayCutout.getTop(density) / density.density

@@ -417,27 +417,74 @@ class StudioUiTest {
         welcome()
         val model=androidx.lifecycle.ViewModelProvider(compose.activity)[StudioViewModel::class.java]
         temporaryNoteState=model.state.value
-        val content="# Selection\n\nAlpha Bravo Charlie Delta\n\n[Go to distant chapter](#chapter-599)\n\n"+(0 until 600).joinToString("\n"){"## Chapter $it\n\n${"Readable study paragraph. ".repeat(8)}\n"}
+        temporaryRestorePosition=model.state.value.restorePosition
+        val content="# Selection\n\nThis short introduction places the selectable sample below the native reading controls.\n\nThe test taps only visible document text, never the Compose toolbar layered above the WebView.\n\nAlpha Bravo Charlie Delta\n\n[Go to distant chapter](#chapter-550)\n\n"+(0 until 600).joinToString("\n"){"## Chapter $it\n\n${"Readable study paragraph. ".repeat(8)}\n"}
         // Native selection at a magnified line start exercises unlocked pan;
         // the centre-lock test separately checks the new locked geometry.
         compose.runOnIdle {model.centerLock(false)}
-        compose.runOnIdle{model.edit(model.state.value.active.id,content);model.mode("reader");model.zoom(175f)}
+        compose.runOnIdle {model.restorePosition(false)}
+        compose.waitUntil(5_000) {!model.state.value.restorePosition}
+        compose.runOnIdle {model.edit(model.state.value.active.id,content)}
+        compose.waitUntil(5_000) {model.state.value.active.content==content}
+        compose.runOnIdle {model.mode("reader");model.zoom(175f)}
         javascriptUntil("document.querySelector('.document-page')?.dataset.selectionScale"){it=="\"1.75\""}
-        // Focal zoom deliberately preserves the previous viewport location.
-        // Wait for the fixture, then bring the measured word onto the screen.
-        javascriptUntil("(()=>{const p=document.querySelector('.markdown-body p');if(!p?.textContent.includes('Alpha Bravo Charlie Delta'))return false;document.querySelector('.android-reading').scrollTop=0;const r=p.getBoundingClientRect();return r.top>=0&&r.bottom<innerHeight;})()") {it=="true"}
-        val raw=javascriptUntil("(()=>{const el=document.querySelector('.markdown-body p');if(!el)return null;const r=document.createRange();r.setStart(el.firstChild,6);r.setEnd(el.firstChild,11);const b=r.getBoundingClientRect();const caret=document.caretRangeFromPoint(b.left+b.width/2,b.top+b.height/2);return {x:b.left+b.width/2,y:b.top+b.height/2,width:innerWidth,word:caret?.startContainer.textContent,offset:caret?.startOffset};})()"){it.contains("Alpha Bravo Charlie Delta")}
+        // Reset navigation only to mount the target; then align its measured
+        // range below native controls inside the usable viewport.
+        javascriptUntil("(()=>{window.supermdNativeWheel?.(0,0,{x:-1,y:-1},false);const host=document.querySelector('.android-reading');if(!host)return false;host.scrollTop=0;window.__selectionTargetAlign=0;return true;})()") {it=="true"}
+        javascriptUntil("[...document.querySelectorAll('.markdown-body p')].some(p=>p.textContent.includes('Alpha Bravo Charlie Delta'))") {it=="true"}
+        javascriptUntil("(()=>{const host=document.querySelector('.android-reading'),el=[...document.querySelectorAll('.markdown-body p')].find(p=>p.textContent.includes('Alpha Bravo Charlie Delta'));if(!host||!el)return false;const inset=parseFloat(getComputedStyle(document.documentElement).getPropertyValue('--native-chrome-inset'))||0,targetY=(inset+innerHeight)/2;if(window.__selectionTargetAlign===0){const range=document.createRange();range.setStart(el.firstChild,6);range.setEnd(el.firstChild,11);const b=range.getBoundingClientRect();host.scrollTop+=b.top+b.height/2-targetY;window.__selectionTargetAlign=1;requestAnimationFrame(()=>requestAnimationFrame(()=>window.__selectionTargetAlign=2));return false;}if(window.__selectionTargetAlign!==2)return false;const r=document.createRange();r.setStart(el.firstChild,6);r.setEnd(el.firstChild,11);const b=r.getBoundingClientRect();return Math.abs(b.top+b.height/2-targetY)<2;})()") {it=="true"}
+        val raw=javascriptUntil("(()=>{const el=[...document.querySelectorAll('.markdown-body p')].find(p=>p.textContent.includes('Alpha Bravo Charlie Delta'));if(!el)return null;try{const r=document.createRange();r.setStart(el.firstChild,6);r.setEnd(el.firstChild,11);const b=r.getBoundingClientRect();const caret=document.caretRangeFromPoint(b.left+b.width/2,b.top+b.height/2);return {target:el.textContent,x:b.left+b.width/2,y:b.top+b.height/2,width:innerWidth,word:caret?.startContainer.textContent,offset:caret?.startOffset,chromeInset:parseFloat(getComputedStyle(document.documentElement).getPropertyValue('--native-chrome-inset'))||0};}catch(e){return {target:el.textContent,error:String(e),child:el.firstChild?.textContent,childType:el.firstChild?.nodeType};}})()"){it.contains("Alpha Bravo Charlie Delta")}
         val point=org.json.JSONObject(raw)
+        assertFalse("Could not measure selection target: $point",point.has("error"))
+        assertTrue("Caret geometry must resolve inside the intended text: $point",point.optString("word").contains("Alpha Bravo Charlie Delta"))
         assertTrue(point.getInt("offset") in 6..11)
+        assertTrue("Selection target must be below the native toolbar overlay: point=$point",point.getDouble("y")>point.getDouble("chromeInset")+8)
+        val nativeControlsBottom=listOf("Save note","Export","More actions","Undo (Ctrl+Z)","Redo (Ctrl+Y)")
+            .maxOf { compose.onNodeWithContentDescription(it).fetchSemanticsNode().boundsInRoot.bottom }
         val nativePoint=AtomicReference(androidx.compose.ui.geometry.Offset.Zero)
-        compose.runOnIdle {val reader=web(compose.activity.window.decorView)!!;val xy=IntArray(2);reader.getLocationOnScreen(xy);val scale=reader.width.toFloat()/point.getDouble("width").toFloat();nativePoint.set(androidx.compose.ui.geometry.Offset(xy[0]+point.getDouble("x").toFloat()*scale,xy[1]+point.getDouble("y").toFloat()*scale))}
+        val nativeGeometry=AtomicReference("")
+        val nativeScale=AtomicReference(1f)
+        val nativeWebTop=AtomicReference(0f)
+        compose.runOnIdle {val reader=web(compose.activity.window.decorView)!!;val xy=IntArray(2);reader.getLocationOnScreen(xy);val scale=reader.width.toFloat()/point.getDouble("width").toFloat();nativeScale.set(scale);nativeWebTop.set(xy[1].toFloat());nativePoint.set(androidx.compose.ui.geometry.Offset(xy[0]+point.getDouble("x").toFloat()*scale,xy[1]+point.getDouble("y").toFloat()*scale));nativeGeometry.set("web=${reader.width}x${reader.height} at=${xy.contentToString()} scale=$scale decor=${compose.activity.window.decorView.width}x${compose.activity.window.decorView.height} density=${compose.activity.resources.displayMetrics.density}")}
+        assertTrue("Selection point must be below the bottom edge of visible native controls: point=${nativePoint.get()}, controlsBottom=$nativeControlsBottom, $nativeGeometry",nativePoint.get().y>nativeControlsBottom+8)
+        println("SELECTION GEOMETRY: point=$point native=${nativePoint.get()} controlsBottom=$nativeControlsBottom ${nativeGeometry.get()}")
         val instrument=androidx.test.platform.app.InstrumentationRegistry.getInstrumentation()
+        javascriptUntil("(()=>{window.__selectionInput=[];for(const type of ['pointerdown','pointerup','touchstart','touchend','contextmenu','selectionchange'])document.addEventListener(type,e=>window.__selectionInput.push({type,target:e.target?.textContent?.slice?.(0,40),client:[e.clientX,e.clientY],buttons:e.buttons,selection:window.getSelection()?.toString()}),true);return true;})()") {it=="true"}
         val time=android.os.SystemClock.uptimeMillis();val position=nativePoint.get()
-        instrument.sendPointerSync(android.view.MotionEvent.obtain(time,time,android.view.MotionEvent.ACTION_DOWN,position.x,position.y,0))
-        android.os.SystemClock.sleep(750)
-        instrument.sendPointerSync(android.view.MotionEvent.obtain(time,android.os.SystemClock.uptimeMillis(),android.view.MotionEvent.ACTION_UP,position.x,position.y,0))
+        fun pointer(action:Int,eventTime:Long):android.view.MotionEvent {
+            val properties=android.view.MotionEvent.PointerProperties().apply {id=0;toolType=android.view.MotionEvent.TOOL_TYPE_FINGER}
+            val coordinates=android.view.MotionEvent.PointerCoords().apply {x=position.x;y=position.y;pressure=1f;size=1f}
+            return android.view.MotionEvent.obtain(time,eventTime,action,1,arrayOf(properties),arrayOf(coordinates),0,0,1f,1f,0,0,android.view.InputDevice.SOURCE_TOUCHSCREEN,0)
+        }
+        val down=pointer(android.view.MotionEvent.ACTION_DOWN,time)
+        println("SELECTION INPUT DOWN: (${down.x},${down.y}) source=${down.source} tool=${down.getToolType(0)} longPressTimeout=${android.view.ViewConfiguration.getLongPressTimeout()}")
+        var up:android.view.MotionEvent?=null
+        try {
+            instrument.sendPointerSync(down)
+            android.os.SystemClock.sleep(750)
+            up=pointer(android.view.MotionEvent.ACTION_UP,android.os.SystemClock.uptimeMillis())
+            instrument.sendPointerSync(up)
+        } finally {
+            down.recycle()
+            up?.recycle()
+        }
+        println("SELECTION AFTER POINTER: "+javascriptUntil("JSON.stringify({events:window.__selectionInput,selection:window.getSelection()?.toString(),range:(()=>{const p=[...document.querySelectorAll('.markdown-body p')].find(p=>p.textContent.includes('Alpha Bravo Charlie Delta'));const r=document.createRange();r.setStart(p.firstChild,6);r.setEnd(p.firstChild,11);const b=r.getBoundingClientRect();return {x:b.left+b.width/2,y:b.top+b.height/2,viewport:[innerWidth,innerHeight]}})()})") {it.contains("selection")})
         javascriptUntil("window.getSelection()?.toString()"){it=="\"Bravo\""}
-        javascriptUntil("(()=>{window.getSelection()?.removeAllRanges();document.querySelector('a[href=\"#chapter-599\"]')?.click();const h=document.querySelector('h2#chapter-599');if(!h)return false;const host=document.querySelector('.android-reading');return Math.abs(h.getBoundingClientRect().top-host.getBoundingClientRect().top-16)<3;})()"){it=="true"}
+        val headingNavigationProbe="""(()=>{const host=document.querySelector('.android-reading'),style=getComputedStyle(document.documentElement);if(!host)return false;if(!window.__headingNavigationFrames){window.getSelection()?.removeAllRanges();document.querySelector('a[href="#chapter-550"]')?.click();window.__headingNavigationFrames=0;const tick=()=>{window.__headingNavigationFrames++;if(window.__headingNavigationFrames<8)requestAnimationFrame(tick);};requestAnimationFrame(tick);return false;}if(window.__headingNavigationFrames<8)return false;const h=document.querySelector('h2#chapter-550');if(!h)return false;const r=h.getBoundingClientRect();return {headingTop:r.top,hostTop:host.getBoundingClientRect().top,scrollTop:host.scrollTop,maxScroll:host.scrollHeight-host.clientHeight,chromeInset:parseFloat(style.getPropertyValue('--native-chrome-inset'))||0,visibleInset:parseFloat(style.getPropertyValue('--native-visible-chrome-inset'))||0,viewportHeight:innerHeight};})()"""
+        val headingLayout=org.json.JSONObject(javascriptUntil(headingNavigationProbe) {it.contains("headingTop")})
+        val headingScreenY=nativeWebTop.get()+headingLayout.getDouble("headingTop")*nativeScale.get()
+        println("SELECTION HEADING GEOMETRY: $headingLayout screenY=$headingScreenY nativeControlsBottom=$nativeControlsBottom scale=${nativeScale.get()}")
+        val headingGap=16+headingLayout.getDouble("visibleInset")
+        assertEquals("The interior heading should align below visible native controls",headingGap,headingLayout.getDouble("headingTop")-headingLayout.getDouble("hostTop"),3.0)
+        assertTrue("The heading must be below the displayed Compose controls: layout=$headingLayout screenY=$headingScreenY controlsBottom=$nativeControlsBottom",headingScreenY>nativeControlsBottom+8)
+        val finalHeadingLayout=org.json.JSONObject(javascriptUntil("""(()=>{const host=document.querySelector('.android-reading'),style=getComputedStyle(document.documentElement);if(!host)return false;if(!window.__finalHeadingNavigationFrames){window.supermdHeading?.('chapter-599');window.__finalHeadingNavigationFrames=0;const tick=()=>{window.__finalHeadingNavigationFrames++;if(window.__finalHeadingNavigationFrames<8)requestAnimationFrame(tick);};requestAnimationFrame(tick);return false;}if(window.__finalHeadingNavigationFrames<8)return false;const h=document.querySelector('h2#chapter-599');if(!h)return false;const r=h.getBoundingClientRect();return {headingTop:r.top,hostTop:host.getBoundingClientRect().top,scrollTop:host.scrollTop,maxScroll:host.scrollHeight-host.clientHeight,chromeInset:parseFloat(style.getPropertyValue('--native-chrome-inset'))||0,visibleInset:parseFloat(style.getPropertyValue('--native-visible-chrome-inset'))||0,viewportHeight:innerHeight};})()""") {it.contains("headingTop")})
+        val finalHeadingTop=finalHeadingLayout.getDouble("headingTop")-finalHeadingLayout.getDouble("hostTop")
+        val finalHeadingGap=16+finalHeadingLayout.getDouble("visibleInset")
+        val finalHeadingClamped=finalHeadingLayout.getDouble("scrollTop")>=finalHeadingLayout.getDouble("maxScroll")-2
+        val finalHeadingScreenY=nativeWebTop.get()+finalHeadingLayout.getDouble("headingTop")*nativeScale.get()
+        println("SELECTION FINAL HEADING GEOMETRY: $finalHeadingLayout clamped=$finalHeadingClamped screenY=$finalHeadingScreenY controlsBottom=$nativeControlsBottom")
+        assertTrue("The final heading must not overlap visible native controls: layout=$finalHeadingLayout screenY=$finalHeadingScreenY controlsBottom=$nativeControlsBottom",finalHeadingTop>=finalHeadingGap-3&&finalHeadingTop+30<=finalHeadingLayout.getDouble("viewportHeight")&&finalHeadingScreenY>nativeControlsBottom+8)
+        assertTrue("The final heading should align normally or be prevented only by the confirmed scroll-range clamp: layout=$finalHeadingLayout gap=$finalHeadingGap",abs(finalHeadingTop-finalHeadingGap)<3||finalHeadingClamped)
     }
     @Test fun graphNativeTwoFingerPanAndPinchDoesNotZoomTheNote() {
         welcome()
@@ -814,6 +861,7 @@ ax.set_title("Matplotlib 3D figure")
         welcome()
         val model=androidx.lifecycle.ViewModelProvider(compose.activity)[StudioViewModel::class.java]
         temporaryNoteState=model.state.value
+        fun currentVisibleChromeInset():Float = javascriptUntil("parseFloat(getComputedStyle(document.documentElement).getPropertyValue('--native-visible-chrome-inset'))||0") {it.trim('"').toFloatOrNull()!=null}.trim('"').toFloat()
         compose.runOnIdle {
             model.edit(model.state.value.active.id,"# Immersive reading\n\n"+("A paragraph to scroll and read comfortably. ".repeat(12)+"\n\n").repeat(80))
             model.mode("reader");model.zoom(170f)
@@ -822,6 +870,7 @@ ax.set_title("Matplotlib 3D figure")
         try {
             compose.waitUntil(10000) {compose.activity.resources.configuration.orientation==android.content.res.Configuration.ORIENTATION_LANDSCAPE}
             javascriptUntil("document.querySelector('.document-page')?.dataset.scale") {it=="\"1.7\""}
+            assertTrue("Visible normal reading controls must report their occlusion",currentVisibleChromeInset()>0f)
             javascriptUntil("window.getSelection()?.removeAllRanges();true") {it=="true"}
             // Layout zoom can serialize the same width with 0.002 px rounding
             // differences. Compare actual CSS-pixel layout widths instead.
@@ -840,6 +889,7 @@ ax.set_title("Matplotlib 3D figure")
             // A margin tap has no text/link/edit action and toggles reading UI.
             activityRoot().performTouchInput {click(androidx.compose.ui.geometry.Offset(this.width*.98f,height*.60f))}
             compose.waitUntil(5000) {compose.onAllNodesWithContentDescription("Open files").fetchSemanticsNodes().isEmpty()}
+            assertEquals("Hidden normal controls must clear the navigation occlusion without resizing the viewport",0f,currentVisibleChromeInset(),.1f)
             compose.onNodeWithContentDescription("Fullscreen study").assertDoesNotExist()
             assertEquals("Hiding normal chrome must not resize the reading viewport",viewport,javascriptUntil("JSON.stringify([innerWidth,innerHeight])") {it.contains(",")})
             compose.waitUntil(5000) {androidx.core.view.ViewCompat.getRootWindowInsets(compose.activity.window.decorView)?.isVisible(androidx.core.view.WindowInsetsCompat.Type.statusBars())==false}
@@ -848,6 +898,7 @@ ax.set_title("Matplotlib 3D figure")
             assertEquals("Landscape document must extend into the cutout region",compose.activity.window.decorView.width,nativeWidth.get())
             activityRoot().performTouchInput {click(androidx.compose.ui.geometry.Offset(this.width*.98f,height*.60f))}
             compose.waitUntil(5000) {compose.onAllNodesWithContentDescription("Open files").fetchSemanticsNodes().isNotEmpty()}
+            assertTrue("Revealed normal reading controls must report their occlusion",currentVisibleChromeInset()>0f)
             compose.onNodeWithContentDescription("Fullscreen study").performClick()
             javascriptUntil("document.documentElement.dataset.fullscreen") {it=="\"true\""}
             javascriptUntil("document.querySelector('.document-page')?.dataset.scale") {it=="\"1.7\""}
@@ -855,9 +906,11 @@ ax.set_title("Matplotlib 3D figure")
             assertEquals("The actual text column, not just its outer page, must retain its width",textWidth,javascriptUntil("document.querySelector('.markdown-body').clientWidth") {it.toIntOrNull()!=null})
             assertEquals("Fullscreen must not resize the reading viewport",viewport,javascriptUntil("JSON.stringify([innerWidth,innerHeight])") {it.contains(",")})
             compose.waitUntil(5000) {compose.onAllNodesWithContentDescription("Exit fullscreen").fetchSemanticsNodes().isEmpty()}
+            assertEquals("Immersive fullscreen controls must clear the navigation occlusion",0f,currentVisibleChromeInset(),.1f)
             activityRoot().performTouchInput {click(androidx.compose.ui.geometry.Offset(this.width*.98f,height*.60f))}
             compose.waitUntil(5000) {compose.onAllNodesWithContentDescription("Exit fullscreen").fetchSemanticsNodes().isNotEmpty()}
             compose.onNodeWithContentDescription("Show contents").assertIsDisplayed()
+            assertTrue("Revealed fullscreen controls must report their occlusion",currentVisibleChromeInset()>0f)
             assertEquals("Showing compact chrome must not resize the reading viewport",viewport,javascriptUntil("JSON.stringify([innerWidth,innerHeight])") {it.contains(",")})
             compose.onNodeWithContentDescription("Exit fullscreen").performClick()
         } finally {

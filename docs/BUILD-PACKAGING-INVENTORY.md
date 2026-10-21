@@ -45,8 +45,11 @@ their own source build. Gradle dependency/task caches remain input-keyed, with
 task output reuse disabled for signed release APKs; signing material and
 daemon/user state are not cached.
 
-Rust release profile changes are also deferred: current settings already favor
-size, and no controlled size/compile-memory/PDF-speed comparison is available.
+Rust release profile changes were evaluated in a clean-source, package-scoped
+experiment with identical stripping and debug settings. The alternatives saved
+only 480 or 26,000 bytes in a roughly 52.8 MB engine; PDF output was identical
+and no reliable runtime speedup was observed. Keep the existing profile; see
+PERFORMANCE-EXPERIMENTS.md for timings and limitations.
 Release artifact promotion is limited to the existing recovery workflow, which
 requires a completed run for the exact tagged source and successful desktop
 builds, while Android is re-verified rather than reused. This change does not

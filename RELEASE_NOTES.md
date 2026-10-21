@@ -1,30 +1,38 @@
-# Super MD 0.6.4
+# Super MD 0.6.5
 
-## Faster compatible Mermaid diagrams
+## More reliable editing and recovery
 
-- Plain flowcharts, sequence/state/class/entity diagrams, pie charts and mind maps use Obsidian's MIT-licensed Pele renderer, loaded on demand. Compatible diagrams no longer load Mermaid's full runtime and can appear sooner while editing.
-- Authored Mermaid configuration, math/HTML labels, advanced interactions and untested diagram families keep Mermaid.js. Fast-path failures also fall back automatically; no source conversion is performed.
-- Generated SVG variables are resolved to self-contained values for the image viewer and native PDF export. Diagram colours still follow the shared appearance setting.
-- A local comparison including SVG sanitization measured roughly 8–29 times faster rendering on the small test corpus. This is not a claim that the whole app, every diagram or every phone is that much faster.
-- Complete Pele and Lucide licence notices are included offline.
+- Small edits now use acknowledged, revisioned UTF-16 changes instead of repeatedly transferring an entire large note. Save, close, export and window transfer wait for the edit queue, with a full-snapshot compatibility fallback.
+- Conflicting unsent drafts are preserved rather than silently overwriting newer native content. Untouched stale baselines no longer manufacture conflict recovery copies.
+- Live mode retains whole-document reference links, footnotes and loose-list semantics, including their numbering and source offsets.
+- Heading links avoid currently visible reading controls on Android and in desktop fullscreen. This changes navigation destinations, not the document width or layout; hiding controls does not reflow the page.
+- Android and desktop recover a failed document renderer from native-owned state. Already acknowledged changes are restored, reading position is retained where available, and Python is never automatically rerun.
+- Closed large notes use recoverable disk-backed snapshots rather than retaining their full bodies in memory or immediately losing reopen availability.
+- Recovery writes coalesce obsolete queued snapshots while preserving actual saves and shutdown flushes.
 
-## Consistent diagram appearance
+## Large-note work and memory
 
-- SVGs, Mermaid diagrams, interactive charts and Python SVG figures now share the Diagram appearance setting on desktop and Android. Ordinary images retain their independent setting. Existing preferences carry over.
-- Auto adapts neutral paper, text and edges to the current theme and accent, while preserving useful authored colours. Monochrome remains a separate choice. Original, contrast framing and dark-theme inversion are still available.
-- Mermaid's animation rules no longer prevent adaptation of otherwise static diagrams. Auto and monochrome remove harsh white edge halos without changing the note.
-- HSL colours and implicitly closed entity-table rows adapt correctly. Labels on curved filled areas, including pie slices, are contrasted against their local background; monochrome categories retain distinct tones and matching legends.
-- Diagrams open in the image viewer at vector quality. Appearance changes preserve viewer zoom. Authored diagram CSS remains inside an inert image rather than leaking into the app.
-- A bounded Mermaid layout cache avoids repeated rendering when changing appearance. Reading adjustments never rewrite source or alter PDF export settings.
+- Shared exact-source analysis avoids redundant parsing across Read/Split previews and outlines. Live reuses its existing document context without introducing a new whole-note parse on each keystroke.
+- Large Source-mode outlines use a cancellable worker returning compact metadata. Stale results are discarded; ordinary rendering and export keep their existing semantics.
+- Windowed blocks share visibility observation, and diagram work is owner-scoped, deduplicated and retired when no longer needed.
+- Local raster assets can use bounded document-scoped streams instead of base64 JSON copies. Ownership, path validation, remote-image consent and legacy loading fallbacks remain in place; originals are not downscaled or deleted.
+- A full-document accessibility setting provides the complete semantic tree when continuous traversal is more important than windowed-rendering memory savings. Automated accessibility-tree and keyboard tests cover distant content; manual screen-reader compatibility is not claimed.
 
-## Solid, readable dialogs
+## Python output and PDF export
 
-- Fixed intermittent transparent dialog bodies and washed-out backgrounds with Qt's software renderer. Rename, Settings, Export and close-confirmation dialogs use one opaque themed surface and a dark scrim.
-- Rename prompts survive tab snapshot refreshes without losing their draft filename. Enter accepts and Escape cancels; note-history shortcuts do not intercept typing in modal dialogs.
-- Hover hints stay hidden while a modal dialog or context menu is open.
+- Python results are scoped to their document, cell, source and runtime context, preventing identical code in another note from inheriting unrelated output.
+- Legacy saved results remain available with an unverified label. Fresh output awaiting durable storage is visibly marked and retained; opening or exporting a note never executes code to reconstruct an image.
+- PDF export reports preparation and typesetting progress and supports cancellation before destination publication. A destination write already in progress is allowed to finish safely rather than leaving a deliberately truncated output.
+- Removed the redundant Save as Markdown action from Android's overflow menu.
 
-## Verification and compatibility
+## Builds, diagnostics and compatibility
 
-- Added real software-rendered dialog pixel tests, Mermaid appearance tests across flowchart, sequence, state, entity, pie and mind-map diagrams, and Android WebView integration coverage.
-- Releases remain gated on exact-source cross-platform CI, emulator tests, signed Android release validation and complete installer checks.
+- CI builds the native frontend once per workflow and verifies its exact source, lockfile and complete file hashes before each platform packages it.
+- Verified ABI/platform-specific Python wheel caches avoid repeated source compilation, including macOS Intel. Gradle caching and bounded browser parallelism retain all existing test families.
+- Package checksums stream through bounded buffers. Resource inventories retain offline fonts, diagrams, help and licence notices; no speculative dependency or feature removal is included.
+- Read-only storage diagnostics distinguish recoverable or irreplaceable data from disposable runtime data. Existing user content and caches are not automatically deleted.
+- Vercel's experimental TypeScript compiler is evaluated in isolated cross-platform canaries; it does not replace the authoritative production compiler. Measured Rust alternatives did not justify changing the shipping profile.
+- Releases remain gated on exact-source desktop, browser, PDF and Android API 35/36 tests, the existing Android signing identity, and complete installer checks.
 - macOS packages remain ad-hoc signed rather than notarized. Windows installers are not code-signed.
+
+Performance observations and their limitations are recorded in `docs/PERFORMANCE-BASELINE.md` and `docs/PERFORMANCE-EXPERIMENTS.md`; they are not universal speed or memory guarantees.

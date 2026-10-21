@@ -82,6 +82,17 @@ was 568 MiB, settling to 526 MiB after collection; final post-theme median was
 Two warm cycles do not establish long-session leak freedom. These measurements
 use the offscreen software renderer, not interactive presented-frame timings.
 
+The loader deduplicates overlapping native resolutions by document and source,
+then drops settled entries. Image components invalidate stale asynchronous
+results on source change or unmount; this ignores late results rather than
+cancelling an already-issued native request. Browser lazy loading and async
+decoding remain enabled, with natural aspect ratio and full-quality assets.
+Neither this source review nor the stress measurements establish a bottleneck
+that justifies a new decode cap, settled capability cache or preview derivative.
+Those changes are not adopted: retaining original quality and existing remote
+consent, SVG appearance and ownership semantics takes precedence over an
+unmeasured optimization.
+
 The cold layout-shift observation (0.428) includes replacing the startup note
 with the fixture and must not be attributed solely to image decoding. Warm
 traversals observed zero layout shift. No preview/decode policy change is
@@ -178,7 +189,28 @@ seconds, but those runs cannot estimate a clean compile or compare profiles.
 Changing optimization level or codegen units could affect engine size,
 compile time and runtime behavior (including PDF rendering); no benefit is
 established by the present evidence. Keep the profile unchanged. If measured,
-compare isolated clean target directories for the current profile and a
-separately selected alternative, recording compile wall time, binary size,
-runtime/PDF correctness, and Android integration tests. Do not run a profile
+compare controlled variants, recording compile wall time, binary size and
+runtime/PDF correctness before considering integration. Do not run a profile
 experiment against or rewrite a developer's dirty Rust source tree.
+
+A clean full-source archive of commit `55af0a3` was subsequently tested in an
+experiment-owned target directory. The dependency profile stayed unchanged;
+only the `smd-core` package's optimization level and codegen units differed.
+All three variants explicitly used `strip=true` and `debug=0`. The initial cold
+dependency build took 264.78 s; that is not a candidate cold-build comparison.
+The table reports cached-dependency **package rebuilds**, not clean builds.
+
+| Package profile | Stripped engine bytes | Package rebuild wall | Three-run PDF export median |
+|---|---:|---:|---:|
+| s / 8 units (current) | 52,833,624 | 2.92 s; forced repeat 3.64 s | 428.6 ms |
+| z / 8 units | 52,833,144 | 3.45 s | 419.4 ms |
+| s / 1 unit | 52,807,624 | 5.36 s | 432.0 ms |
+
+Doctor, read/inspect, portable pack/read and PDF export passed for every variant.
+Text, JSON and portable outputs matched byte-for-byte; the generated 70,318-byte
+PDF also had the same SHA-256. The small synthetic runtime measurements overlap
+noise and do not establish a speed advantage. Peak RSS was not measured. An
+initial comparison omitted stripping on the overrides and was invalid; its
+symbol-table size difference is excluded from these results. The corrected
+savings are negligible, and the one-unit build costs more. Retain the current
+profile; no Android profile change or speculative LTO default is introduced.
