@@ -43,6 +43,8 @@ def check(executable: Path, version: str, graphics: str) -> None:
         note = root / "Fresh machine.md"
         (root / "figure.svg").write_text('<svg xmlns="http://www.w3.org/2000/svg" width="80" height="40" viewBox="0 0 80 40"><rect width="80" height="40" fill="#3476ad"/></svg>',encoding='utf-8')
         note.write_text("# Fresh machine\n\nMath: $E=mc^2$.\n\n"
+                        "Native symbols: $x\\circledast_N h$, $\\oplus\\otimes\\partial\\hbar$; "
+                        "literal $\\text{ast.circle}$.\n\n"
                         "> [!tip] Portable\n> A local check.\n\n"
                         "| Name | Value |\n|---|---|\n| x | $x^2$ |\n\n![Embedded figure](figure.svg)\n", encoding="utf-8")
         portable, pdf = root / "Fresh machine.smd", root / "Fresh machine.pdf"

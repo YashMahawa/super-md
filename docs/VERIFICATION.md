@@ -1,5 +1,35 @@
 # Verification
 
+## Native symbol compatibility and export destinations — 0.6.6
+
+- Reproduced the reported circular-convolution failure with the published 0.6.5
+  engine, not just a developer binary. Clean-source release-mode tests pass:
+  25 library tests, four CLI tests and two compatibility tests. The generated
+  compatibility audit exports all 397 symbolic commands from MiTeX's inventory;
+  literal markup, quoted strings and Unicode offsets have separate regressions.
+- The complete supplied SNS note exports through real `preparePdf` and the native
+  engine to a 13-page, 451,244-byte PDF. Both Mermaid diagrams are prepared as SVG;
+  extracted text contains four circular-convolution glyphs. Pages 1 and 5 were
+  visually checked. The source note was not modified and Python was not executed.
+- Local checks pass: 216 frontend tests, 196 desktop tests, Android filename and
+  provider-policy unit tests, Kotlin instrumentation compilation and lint. The
+  API 35 emulator passed 48 instrumentation tests, including actual JNI symbol
+  export and repeated Unicode share-format/MIME/header transitions. This is not
+  a claim of physical-phone testing or compatibility with every cloud provider.
+- Desktop callbacks revalidate the actual writer's format. Overlapping export
+  destinations, wrong-format callbacks and unconfirmed appended-file collisions
+  cannot overwrite an existing test document. macOS temporary-path comparisons
+  account for its `/var` symlink rather than changing native URL handling.
+- Packaged executable checks also export the formerly failing native symbols.
+  The software-rendered app paints real reader pixels and exports a valid PDF;
+  isolated renderer-crash recovery retains acknowledged edits and reading
+  position without executing Python. Local packaged engine/JNI hashes are checked
+  against their built inputs. Older cached developer binaries are not accepted
+  as evidence for the shipping typesetter.
+- Publication still requires successful CI on the exact release commit, Android
+  API 35/36 emulator gates, signing verification and all seven complete installers
+  with checksums. Local checks alone do not establish those release gates.
+
 ## Graphics recovery and stable task edits — 0.5.1
 
 - Local checks pass: 101 frontend tests, 38 browser workflows, 73 native Qt/Python
