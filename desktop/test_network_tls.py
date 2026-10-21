@@ -2,6 +2,11 @@
 import os
 import ssl
 import unittest
+import json
+import subprocess
+import sys
+import tempfile
+from pathlib import Path
 from unittest.mock import patch
 
 import certifi
@@ -9,6 +14,20 @@ import network_tls
 
 
 class NetworkTlsTests(unittest.TestCase):
+    def test_cli_probe_does_not_initialize_qt_or_python_plotting(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root=Path(temporary)
+            output=root/'tls.json'
+            environment=dict(os.environ, QT_QPA_PLATFORM='not-a-real-platform',
+                SSL_CERT_FILE=str(root/'missing-ca.pem'),SSL_CERT_DIR=str(root/'missing-ca-directory'))
+            result=subprocess.run([sys.executable,str(Path(__file__).with_name('main.py')),'--tls-probe',str(output)],
+                env=environment,capture_output=True,text=True,timeout=20)
+            self.assertEqual(result.returncode,0,result.stdout+result.stderr)
+            evidence=json.loads(output.read_text())
+            self.assertGreater(evidence['x509_ca'],20)
+            self.assertTrue(evidence['checkHostname'])
+            self.assertTrue(evidence['verifyRequired'])
+
     def test_bundled_roots_work_without_compiled_system_ca_paths(self):
         with patch.dict(os.environ, {
             "SSL_CERT_FILE": os.path.join(os.path.abspath(os.sep), "no-system-ca-file"),

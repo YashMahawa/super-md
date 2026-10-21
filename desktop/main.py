@@ -9,6 +9,17 @@ if __name__ == "__main__" and len(sys.argv) > 1 and sys.argv[1] == "--python-cel
     # The frozen app doubles as the built-in Python for cells. Skip Qt entirely.
     from python_runtime import run_bundled_cell
     sys.exit(run_bundled_cell(sys.argv[2:]))
+if __name__ == "__main__" and len(sys.argv) == 3 and sys.argv[1] == "--tls-probe":
+    # A trust-store check must not start Qt or the optional scientific runtime.
+    import json
+    import ssl
+    from network_tls import client_context
+    context = client_context()
+    Path(sys.argv[2]).write_text(json.dumps({
+        **context.cert_store_stats(), "checkHostname": context.check_hostname,
+        "verifyRequired": context.verify_mode == ssl.CERT_REQUIRED,
+    }), encoding="utf-8")
+    sys.exit(0)
 if __name__ == "__main__":
     from graphics_runtime import configure, probe
     if len(sys.argv) > 1 and sys.argv[1] == "--graphics-probe":
