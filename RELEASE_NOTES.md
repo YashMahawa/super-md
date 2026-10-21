@@ -10,6 +10,8 @@
 - Newly created Android export destinations are checked before writing. A provider-supplied wrong extension is corrected when supported or reported clearly; existing notes are never renamed by this correction. PDF/SMD file signatures are checked before publishing bytes.
 - Portable Android notes now display the PDF/SMD format selector rather than hiding it.
 - Desktop export dialogs track the selected format's suffix. Mismatched known extensions are rejected before exporting, and extensionless/custom dotted stems get the proper suffix without silently overwriting an unconfirmed destination.
+- Overlapping desktop destination changes are blocked while export is pending. Writers independently reject stale cross-format callbacks before opening a destination, preserving existing files.
+- Android provider policy tests cover rename failures, mismatched types and missing filenames. Valid `.smd` destinations also accept a provider reporting the underlying JSON/text representation instead of the custom MIME type.
 - Added native JNI symbol checks, Unicode filename/MIME/header share transitions, desktop export/collision regressions and the generated symbol audit.
 - Verified the complete supplied SNS note through real PDF preparation, including both Mermaid diagrams, without modifying the note or automatically executing its Python code.
 

@@ -65,7 +65,9 @@ internal object ExportFilename {
         return when (format) {
             NativeExportFormat.PDF -> actual in setOf("application/pdf", "application/x-pdf")
             NativeExportFormat.MARKDOWN -> actual in setOf("text/markdown", "text/x-markdown", "text/plain")
-            NativeExportFormat.PORTABLE_SMD -> actual in setOf("application/vnd.supermd.smd", "application/vnd.supermd.fmd")
+            // Portable notes are JSON text, so providers may report their
+            // underlying representation rather than the custom extension MIME.
+            NativeExportFormat.PORTABLE_SMD -> actual in setOf("application/vnd.supermd.smd", "application/vnd.supermd.fmd", "application/json", "text/json", "text/plain")
         }
     }
 
@@ -104,4 +106,50 @@ internal object ExportFilename {
     // Leave room for the longest supported suffix and stay below common
     // 255-byte filesystem component limits, even with multi-byte names.
     private const val MAX_STEM_UTF8_BYTES = 240
+}
+
+internal data class ExportDocumentMetadata(val displayName: String?, val mimeType: String?)
+
+/** Pure policy for checking/renaming a destination before any output stream is opened. */
+internal object ExportDestinationPolicy {
+    fun validate(
+        initial: ExportDocumentMetadata,
+        format: NativeExportFormat,
+        allowRename: Boolean,
+        rename: (String) -> ExportDocumentMetadata?,
+    ): ExportDocumentMetadata {
+        var current = initial
+        val initialName = current.displayName
+        if (initialName == null) {
+            val mime = current.mimeType?.substringBefore(';')?.trim()?.lowercase()
+            require(!mime.isNullOrBlank() && mime !in setOf("application/octet-stream", "binary/octet-stream") && mimeMatchesWithoutFilename(mime, format)) {
+                "The destination provider did not report a filename or a matching file type; choose another location."
+            }
+            return current
+        }
+
+        if (!ExportFilename.suffixMatches(initialName, format)) {
+            require(allowRename) { "This existing file does not have the .${format.extension} extension; use Export As instead." }
+            current = rename(ExportFilename.suggestedName(initialName, format))
+                ?: error("The destination provider cannot correct the filename. Choose a name ending in .${format.extension}.")
+            val renamedName = current.displayName
+                ?: error("The destination provider did not confirm the corrected filename.")
+            require(ExportFilename.suffixMatches(renamedName, format)) {
+                "The destination provider kept a different extension. Choose a name ending in .${format.extension}."
+            }
+        }
+        require(ExportFilename.mimeMatches(current.mimeType, format)) {
+            "The destination provider identifies this as a different file type. Choose another location."
+        }
+        return current
+    }
+
+    // Without an extension there is no evidence that JSON/plain text is an
+    // SMD note. Require its exact MIME; those generic representations are
+    // accepted only when a `.smd` display name confirms the format.
+    private fun mimeMatchesWithoutFilename(mime: String, format: NativeExportFormat): Boolean = when (format) {
+        NativeExportFormat.PDF -> mime in setOf("application/pdf", "application/x-pdf")
+        NativeExportFormat.MARKDOWN -> mime in setOf("text/markdown", "text/x-markdown", "text/plain")
+        NativeExportFormat.PORTABLE_SMD -> mime in setOf("application/vnd.supermd.smd", "application/vnd.supermd.fmd")
+    }
 }

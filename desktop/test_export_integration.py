@@ -51,7 +51,9 @@ class NativePdfIntegrationTest(unittest.TestCase):
     def setUp(self):
         self.temporary = tempfile.TemporaryDirectory(prefix="supermd-pdf-integration-")
         self.addCleanup(self.temporary.cleanup)
-        self.root = Path(self.temporary.name)
+        # macOS exposes its temporary directory through /var -> /private/var.
+        # Native file URLs are canonicalized; compare the same actual location.
+        self.root = Path(self.temporary.name).resolve()
         self.engine = self.root / "owned-fake-smd-engine"
         self.engine.write_text(FAKE_ENGINE, encoding="utf-8")
         self.engine.chmod(0o700)
@@ -126,6 +128,28 @@ class NativePdfIntegrationTest(unittest.TestCase):
         self.assertTrue(destination.read_bytes().startswith(b"%PDF-"))
         self.assertFalse(Path(str(stem) + ".smd").exists())
         self._assert_no_owned_stages()
+
+    def test_overlapping_export_selection_keeps_the_original_destination(self):
+        first = self.root / "First.pdf"
+        second = self.root / "Second.smd"
+        self.studio.exportTo(QUrl.fromLocalFile(str(first)).toString(), "pdf")
+        self.studio.exportTo(QUrl.fromLocalFile(str(second)).toString(), "smd")
+        self.assertEqual(self.studio.pending_export, str(first))
+        self.assertIn("already in progress", self.studio.message)
+        self.assertFalse(second.exists())
+
+    def test_cross_format_callbacks_never_write_to_the_selected_file(self):
+        for command, suffix in (("export_pdf_native", ".smd"), ("export_fmd_native", ".pdf"), ("export_markdown_native", ".smd")):
+            destination = self.root / (command + suffix)
+            destination.write_bytes(b"preserve existing document")
+            self.studio.pending_export = str(destination)
+            identifier = command + "-stale"
+            self.studio.post(identifier, command, json.dumps({"content": "wrong format", "assets": {}, "save": False}))
+            _, raw, error = self._await_reply(identifier)
+            self.assertEqual(raw, "null")
+            self.assertIn("does not match", error)
+            self.assertEqual(destination.read_bytes(), b"preserve existing document")
+            self.assertEqual(self.studio._export_jobs._jobs, {})
 
     def test_invalid_pdf_does_not_overwrite_existing_destination(self):
         destination = self.root / "report.pdf"

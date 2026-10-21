@@ -1571,6 +1571,10 @@ class Studio(QObject):
 
     @Slot(str, str)
     def exportTo(self, value, format):
+        if self.pending_export:
+            self.message = "An export is already in progress; finish or cancel it before choosing another destination"
+            self._emit(False)
+            return
         self.pending_save_as = ""
         self.pending_export = ""
         try:
@@ -1723,6 +1727,17 @@ class Studio(QObject):
             captured["assets"] = dict(tab["assets"])
             output = self.pending_export
             save_as = self.pending_save_as
+            # Preparation is asynchronous. Recheck the actual writer, not just
+            # the dialog choice, so a stale/cross-format callback cannot put
+            # PDF bytes in an SMD file (or overwrite a portable note with text).
+            expected_suffixes = {
+                "export_pdf_native": (".pdf",),
+                "export_markdown_native": (".md", ".markdown", ".txt"),
+                "export_fmd_native": (".smd",),
+            }
+            if command in expected_suffixes and not (command == "export_fmd_native" and args.get("save")):
+                if not output or Path(output).suffix.casefold() not in expected_suffixes[command]:
+                    raise ValueError("The export destination does not match the requested file format; choose the destination again")
             python = self.settings["python"]
             export_job = None
             if command == "export_pdf_native":

@@ -414,42 +414,23 @@ class StudioViewModel(app: Application, val workspaceKey: String = "main") : And
             require(ExportFilename.suffixMatches(name, format)) { "The destination name must end in .${format.extension}" }
             return uri
         }
-        fun displayName(target: Uri): String? = resolver.query(
-            target,
-            arrayOf(android.provider.OpenableColumns.DISPLAY_NAME),
-            null,
-            null,
-            null,
-        )?.use { cursor ->
-            val column = cursor.getColumnIndex(android.provider.OpenableColumns.DISPLAY_NAME)
-            if (column >= 0 && cursor.moveToFirst()) cursor.getString(column)?.takeIf(String::isNotBlank) else null
-        }
+        fun metadata(target: Uri) = ExportDocumentMetadata(
+            resolver.query(target, arrayOf(android.provider.OpenableColumns.DISPLAY_NAME), null, null, null)?.use { cursor ->
+                val column = cursor.getColumnIndex(android.provider.OpenableColumns.DISPLAY_NAME)
+                if (column >= 0 && cursor.moveToFirst()) cursor.getString(column)?.takeIf(String::isNotBlank) else null
+            },
+            resolver.getType(target),
+        )
 
         var target = uri
-        var name = displayName(target)
-        if (name == null) {
-            // Some otherwise-compliant document providers omit DISPLAY_NAME.
-            // Accept only when their explicit MIME still identifies the
-            // requested format; a generic/unknown MIME gives us no safe way to
-            // distinguish (for example) a PDF from an SMD destination.
-            val actualMime = resolver.getType(target)
-            require(!actualMime.isNullOrBlank() && actualMime.substringBefore(';').trim().lowercase() !in setOf("application/octet-stream", "binary/octet-stream") && ExportFilename.mimeMatches(actualMime, format)) {
-                "The destination provider did not report a filename or a matching file type; choose another location."
+        ExportDestinationPolicy.validate(metadata(target), format, allowRename) { correctedName ->
+            val renamed = runCatching { DocumentsContract.renameDocument(resolver, target, correctedName) }.getOrNull()
+            if (renamed == null) null else {
+                // Keep the provider-returned URI; some providers move documents
+                // to a different document ID when renaming.
+                target = renamed
+                metadata(target)
             }
-            return target
-        }
-        if (!ExportFilename.suffixMatches(name, format)) {
-            require(allowRename) { "This existing file does not have the .${format.extension} extension; use Export As instead." }
-            val correctedName = ExportFilename.suggestedName(name, format)
-            target = runCatching { DocumentsContract.renameDocument(resolver, target, correctedName) }.getOrNull()
-                ?: error("The destination provider cannot correct the filename. Choose a name ending in .${format.extension}.")
-            name = displayName(target) ?: error("The destination provider did not confirm the corrected filename.")
-        }
-        require(ExportFilename.suffixMatches(name, format)) {
-            "The destination provider kept a different extension. Choose a name ending in .${format.extension}."
-        }
-        require(ExportFilename.mimeMatches(resolver.getType(target), format)) {
-            "The destination provider identifies this as a different file type. Choose another location."
         }
         if (target != uri) {
             if (uri == outputUri) outputUri = target
