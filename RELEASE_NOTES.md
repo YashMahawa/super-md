@@ -27,6 +27,7 @@
 
 ## Builds, diagnostics and compatibility
 
+- Healthy RGB565 Wayland/EGL surfaces no longer trigger software fallback merely because their painted HTML colors are quantized. Missing or broken graphics still use the existing safe fallback.
 - CI builds the native frontend once per workflow and verifies its exact source, lockfile and complete file hashes before each platform packages it.
 - Verified ABI/platform-specific Python wheel caches avoid repeated source compilation, including macOS Intel. Gradle caching and bounded browser parallelism retain all existing test families.
 - Package checksums stream through bounded buffers. Resource inventories retain offline fonts, diagrams, help and licence notices; no speculative dependency or feature removal is included.

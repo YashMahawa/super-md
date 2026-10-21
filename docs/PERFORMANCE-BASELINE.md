@@ -120,3 +120,22 @@ The harness deliberately sends the complete synthetic source on each theme
 cycle for baseline compatibility, so its theme timing also includes that CDP
 payload transfer; it does not isolate the optimized native preference-update
 path, which can omit unchanged content.
+
+### Native diagram follow-up
+
+The same-runtime 0.6.4/candidate comparison also exercised 12 unique flowcharts:
+six plain Pele-eligible diagrams and six authored-init Mermaid fallbacks. All
+12 SVG images had to decode successfully; rendering errors fail the sample.
+Three fresh processes and six same-source revisits passed for each version.
+
+| Metric | 0.6.4 source | Candidate source |
+|---|---:|---:|
+| All diagrams ready, cold median | 954.6 ms | 913.3 ms |
+| All diagrams ready, revisit median | 47.6 ms | 47.1 ms |
+| Collected cold JS heap | 11.98 MB | 11.34 MB |
+| Cold process-tree PSS | 417.4 MiB | 420.9 MiB |
+| Post-revisit/theme process-tree PSS | 418.4 MiB | 421.6 MiB |
+
+This small software-rendered sample demonstrates compatibility of both paths,
+not a universal diagram speedup or total-memory reduction. The scheduling,
+runtime and presented-frame limitations above still apply.

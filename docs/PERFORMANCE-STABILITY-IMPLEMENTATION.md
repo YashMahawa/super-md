@@ -39,7 +39,7 @@ No release is ready until the final cross-platform and installer gates pass.
 - [x] Shared revision-aware document analysis and coalesced outlines (shared exact-source bounded cache and original offsets).
 - [x] Measure and, if justified, move cold parsing behind a worker boundary (large Source outlines only; full-AST worker round trips did not improve total latency and are not shipped).
 - [x] Shared visibility observation and stable block metadata (observer ownership/focus tests).
-- [x] Owned/cancellable/deduplicated diagram scheduling (cancellation/dedup tests; native performance comparison still required).
+- [x] Owned/cancellable/deduplicated diagram scheduling (cancellation/dedup tests; same-runtime native comparison verified all 12 mixed Pele/fallback diagrams across three fresh processes and six revisits per version; measurements and limitations in PERFORMANCE-BASELINE.md).
 - [x] Revisioned UTF-16 edit transport with atomic native apply and fallback.
 - [x] Save/close/export/window-transfer acknowledgement barriers (unit/browser checked; native emulator verification remains below).
 - [x] Scoped streamed asset URLs on Android and Qt with legacy fallback (capability, ownership, revocation tests and real Qt raster check).

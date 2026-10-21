@@ -38,9 +38,16 @@ def painted_document(image) -> bool:
     """Two HTML-only markers distinguish document pixels from Qt's surface."""
     if image.isNull() or image.width() < 4 or image.height() < 2:
         return False
+    def marker(x, expected):
+        # Healthy Wayland EGL surfaces may be RGB565 rather than RGB888.
+        # Readback then quantizes the authored colors by one channel step.
+        # Keep both spatially distinct HTML markers mandatory; this is not a
+        # substitute for painting, nor permission to accept a blank Qt surface.
+        actual = image.pixelColor(x, y).name()
+        return all(abs(int(actual[i:i+2], 16)-int(expected[i:i+2], 16)) <= tolerance
+                   for i, tolerance in ((1, 8), (3, 4), (5, 8)))
     y = image.height() // 2
-    return (image.pixelColor(image.width() // 4, y).name() == "#3476ad" and
-            image.pixelColor(image.width() * 3 // 4, y).name() == "#b34d66")
+    return marker(image.width() // 4, "#3476ad") and marker(image.width() * 3 // 4, "#b34d66")
 
 
 def command() -> list[str]:

@@ -26,6 +26,11 @@ class GraphicsRuntimeTest(unittest.TestCase):
         self.assertFalse(graphics_runtime.painted_document(image("#3476ad", "#3476ad")))
         self.assertFalse(graphics_runtime.painted_document(image("#3476ad", "#b34d66", True)))
         self.assertTrue(graphics_runtime.painted_document(image("#3476ad", "#b34d66")))
+        # Actual Intel/Mesa Wayland EGL RGB565 readback of the HTML markers.
+        self.assertTrue(graphics_runtime.painted_document(image("#3175ad", "#ad4d63")))
+        self.assertFalse(graphics_runtime.painted_document(image("#3175ad", "#3175ad")))
+        self.assertFalse(graphics_runtime.painted_document(image("#3175ad", "#ad5863")))
+        self.assertFalse(graphics_runtime.painted_document(image("#2476ad", "#b34d66")))
 
     def test_healthy_probe_preserves_platform_backend_and_user_flags(self):
         env = {"QT_QPA_PLATFORM": "wayland", "QSG_RHI_BACKEND": "vulkan",
