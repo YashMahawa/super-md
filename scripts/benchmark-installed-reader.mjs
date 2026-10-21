@@ -4,6 +4,8 @@
 // or edits a user's notes or the normal Super MD instance.
 import { spawn } from 'node:child_process';
 import { access, mkdtemp, readFile, readdir, rm, writeFile } from 'node:fs/promises';
+import { createReadStream } from 'node:fs';
+import { createInterface } from 'node:readline';
 import { deflateSync } from 'node:zlib';
 import os from 'node:os';
 import path from 'node:path';
@@ -177,6 +179,95 @@ export function parseProcMemory(status, smapsRollup) {
   return { rssKb: procValue(status, 'VmRSS'), pssKb: procValue(smapsRollup, 'Pss') };
 }
 
+const ALLOWLISTED_LIBRARY_BASENAME = /^lib(?:icudata|icuuc|xml2|glycin(?:-[0-9]+)?|opus)\.so(?:\.[0-9]+)+$/;
+const MAX_LIBRARY_SAMPLE_PROCESSES = 16;
+
+function newLibrarySmapsAccumulator() {
+  const libraries = new Map();
+  let currentLibrary = null;
+  let currentRssKb = null;
+  let currentPssKb = null;
+
+  const finishMapping = () => {
+    if (currentLibrary && currentRssKb !== null && currentPssKb !== null) {
+      const totals = libraries.get(currentLibrary) ?? { rssKb: 0, pssKb: 0, mappingCount: 0 };
+      totals.rssKb += currentRssKb;
+      totals.pssKb += currentPssKb;
+      totals.mappingCount++;
+      libraries.set(currentLibrary, totals);
+    }
+    currentLibrary = null;
+    currentRssKb = null;
+    currentPssKb = null;
+  };
+
+  const addLine = line => {
+    const header = line.match(/^[a-f0-9]+-[a-f0-9]+\s+\S+\s+\S+\s+\S+\s+\d+\s*(.*)$/i);
+    if (header) {
+      finishMapping();
+      const pathname = header[1].trim().replace(/ \(deleted\)$/, '');
+      const basename = path.posix.basename(pathname);
+      if (ALLOWLISTED_LIBRARY_BASENAME.test(basename)) currentLibrary = basename;
+      return;
+    }
+    if (!currentLibrary) return;
+    const metric = line.match(/^(Rss|Pss):\s+(\d+)\s+kB$/);
+    if (!metric) return;
+    if (metric[1] === 'Rss') currentRssKb = Number(metric[2]);
+    else currentPssKb = Number(metric[2]);
+  };
+
+  return { libraries, addLine, finish: finishMapping };
+}
+
+export function parseAllowlistedLibrarySmaps(contents) {
+  const accumulator = newLibrarySmapsAccumulator();
+  for (const line of contents.split(/\r?\n/)) accumulator.addLine(line);
+  accumulator.finish();
+  return [...accumulator.libraries.entries()]
+    .sort(([left], [right]) => left < right ? -1 : left > right ? 1 : 0)
+    .map(([library, values]) => ({ library, ...values }));
+}
+
+export async function aggregateAllowlistedLibraryMemory(pids, procRoot = '/proc') {
+  const selectedPids = pids.slice(0, MAX_LIBRARY_SAMPLE_PROCESSES);
+  const totals = new Map();
+  let processesRead = 0;
+  let processesUnreadable = 0;
+
+  for (const pid of selectedPids) {
+    const accumulator = newLibrarySmapsAccumulator();
+    const file = path.join(procRoot, String(pid), 'smaps');
+    try {
+      const lines = createInterface({ input: createReadStream(file, { encoding: 'utf8' }), crlfDelay: Infinity });
+      for await (const line of lines) accumulator.addLine(line);
+      accumulator.finish();
+      processesRead++;
+    } catch {
+      processesUnreadable++;
+      continue;
+    }
+    for (const [library, values] of accumulator.libraries) {
+      const total = totals.get(library) ?? { rssKb: 0, pssKb: 0, mappingCount: 0, processCount: 0 };
+      total.rssKb += values.rssKb;
+      total.pssKb += values.pssKb;
+      total.mappingCount += values.mappingCount;
+      total.processCount++;
+      totals.set(library, total);
+    }
+  }
+
+  return {
+    processCount: pids.length,
+    processesSampled: processesRead,
+    processesUnreadable,
+    truncated: pids.length > selectedPids.length,
+    libraries: [...totals.entries()]
+      .sort(([left], [right]) => left < right ? -1 : left > right ? 1 : 0)
+      .map(([library, values]) => ({ library, ...values })),
+  };
+}
+
 async function readOptional(file) {
   try { return await readFile(file, 'utf8'); } catch { return ''; }
 }
@@ -265,6 +356,7 @@ function parseArgs(argv) {
     else if (key === '--entrypoint') args.entrypoint = value();
     else if (key === '--output') args.output = value();
     else if (key === '--label') args.label = value();
+    else if (key === '--library-memory') args.libraryMemory = true;
     else if (key === '--fixtures') args.fixtures = value().split(',').map(item => item.trim()).filter(Boolean);
     else if (['--repetitions', '--warm-cycles', '--frame-samples', '--quit-after-ms', '--startup-timeout-ms', '--one-mb-bytes', '--many-block-count', '--huge-block-bytes', '--math-count'].includes(key)) {
       const number = Number(value());
@@ -300,6 +392,7 @@ Options:
   --entrypoint PATH         Optional Python source entrypoint; marks this as a source run
   --output PATH             Write the full JSON report (default: stdout)
   --label TEXT              Human-readable build label, e.g. baseline-0.6.4
+  --library-memory          Linux-only allowlisted per-library PSS/RSS snapshot after timing probes
   --repetitions N           Fresh app launches per fixture (default: 3, minimum: 3)
   --warm-cycles N           Same-source revisit and theme cycles (default: 2, max: 5)
   --fixtures LIST           Comma-separated names (default: five baseline fixtures; optional: image-heavy)
@@ -660,12 +753,15 @@ async function launchAndMeasure(binary, fixture, repetition, options) {
     }
     const finalPageMemory = await samplePageMemory(page, cdp);
     const finalProcessMemory = process.platform === 'linux' ? await aggregateProcessTree(child.pid) : null;
+    const finalLibraryMemory = options.libraryMemory && process.platform === 'linux'
+      ? await aggregateAllowlistedLibraryMemory(finalProcessMemory?.pids ?? [])
+      : null;
     await cdp.detach().catch(() => {});
     return {
       fixture: fixture.name, repetition, appReadyMs,
       cold: { ...cold, ...coldPageMemory, frameIntervalP95Ms: coldFrameIntervals.p95Ms, zoomCallP95Ms: zoomCall.p95Ms, frameIntervals: coldFrameIntervals, zoomCall, processTree: coldProcessMemory },
       warmRevisits, themeCycles,
-      afterWarmAndTheme: { ...finalPageMemory, processTree: finalProcessMemory },
+      afterWarmAndTheme: { ...finalPageMemory, processTree: finalProcessMemory, ...(options.libraryMemory ? { allowlistedLibraries: finalLibraryMemory } : {}) },
       runtime: { browserVersion: browser.version(), cdpBrowser: cdpInfo.version.Browser ?? null, pageUrl: page.url() },
     };
   } catch (error) {
@@ -733,7 +829,7 @@ export async function runBenchmark(options) {
     },
     configuration: {
       repetitions: options.repetitions, warmCycles: options.warmCycles, frameSamples: options.frameSamples,
-      quitAfterMs: options.quitAfterMs,
+      quitAfterMs: options.quitAfterMs, libraryMemory: options.libraryMemory === true,
       fixtureParameters: {
         oneMbBytes: options.oneMbBytes, manyBlockCount: options.manyBlockCount, hugeBlockBytes: options.hugeBlockBytes,
         mathCount: options.mathCount, imageFixtureMaxPixels: IMAGE_FIXTURE_MAX_PIXELS,
@@ -752,6 +848,9 @@ export async function runBenchmark(options) {
       zoomCall: 'Synchronous JavaScript call duration for supermdSetZoom; it excludes subsequent layout and painting.',
       jsHeap: 'CDP JavaScript heap used after HeapProfiler.collectGarbage when supported; each sample records whether garbage collection was available. Excludes native and GPU memory.',
       processMemory: process.platform === 'linux' ? 'Linux /proc process-tree RSS is summed (shared mappings may be double-counted); PSS sums smaps_rollup proportional set sizes for the launched reader and descendants only.' : 'Process-tree RSS/PSS collection is Linux-only; values are null on this platform.',
+      allowlistedLibraryMemory: options.libraryMemory
+        ? 'After all timed probes, Linux /proc/PID/smaps is streamed for at most 16 PIDs in the launched reader process tree. RSS/PSS are summed by allowlisted library basename only (ICU, libxml2, libglycin, libopus); mappings with other basenames and filesystem paths are omitted.'
+        : 'Disabled; no per-library /proc/PID/smaps reads are made.',
       installedBinary: options.entrypoint ? 'Source run through the supplied interpreter and entrypoint; this does not verify packaging or represent an installed binary.' : 'The supplied executable is launched directly; the harness records its path and optional label but does not independently verify installation provenance.',
       fixtures: 'All note contents are generated in memory, use no personal files, and are never saved or exported.',
     },

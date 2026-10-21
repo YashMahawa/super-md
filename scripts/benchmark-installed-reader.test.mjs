@@ -4,8 +4,8 @@ import os from 'node:os';
 import path from 'node:path';
 import test from 'node:test';
 import {
-  aggregateProcessTree, aggregateSamples, createFixtures, createImageHeavyFixture, formatReadinessDiagnostics, IMAGE_FIXTURE_MAX_EDGE,
-  IMAGE_FIXTURE_MAX_PIXELS, IMAGE_FIXTURE_MAX_SOURCE_BYTES, parseProcMemory, parseProcStat, percentile, pngDimensions, validateImageFixtureDimensions,
+  aggregateAllowlistedLibraryMemory, aggregateProcessTree, aggregateSamples, createFixtures, createImageHeavyFixture, formatReadinessDiagnostics, IMAGE_FIXTURE_MAX_EDGE,
+  IMAGE_FIXTURE_MAX_PIXELS, IMAGE_FIXTURE_MAX_SOURCE_BYTES, parseAllowlistedLibrarySmaps, parseProcMemory, parseProcStat, percentile, pngDimensions, validateImageFixtureDimensions,
 } from './benchmark-installed-reader.mjs';
 
 test('percentiles and aggregate summaries ignore unavailable values and preserve zeros', () => {
@@ -69,6 +69,57 @@ test('sums only the launched process tree from proc-style fixtures', async () =>
     await addProcess(201, 1, 'Unrelated process', 900, 800);
     const result = await aggregateProcessTree(101, root);
     assert.deepEqual(result, { pids: [101, 102, 103], processCount: 3, rssKb: 600, pssKb: 350, rssProcessCount: 3, pssProcessCount: 3 });
+  } finally { await rm(root, { recursive: true, force: true }); }
+});
+
+test('parses only allowlisted native library mappings and emits basenames, not paths', () => {
+  const parsed = parseAllowlistedLibrarySmaps([
+    '1000-2000 r--p 00000000 08:01 1 /candidate/_internal/libicudata.so.78',
+    'Size: 100 kB', 'Rss: 24 kB', 'Pss: 12 kB',
+    '2000-3000 r--p 00001000 08:01 1 /candidate/_internal/libicudata.so.78 (deleted)',
+    'Size: 80 kB', 'Rss: 20 kB', 'Pss: 10 kB',
+    '3000-4000 r--p 00000000 08:01 2 /candidate/_internal/libxml2.so.16',
+    'Size: 40 kB', 'Rss: 30 kB', 'Pss: 15 kB',
+    '4000-5000 r--p 00000000 08:01 3 /private/note-or-user-lib.so',
+    'Size: 900 kB', 'Rss: 900 kB', 'Pss: 900 kB',
+  ].join('\n'));
+  assert.deepEqual(parsed, [
+    { library: 'libicudata.so.78', rssKb: 44, pssKb: 22, mappingCount: 2 },
+    { library: 'libxml2.so.16', rssKb: 30, pssKb: 15, mappingCount: 1 },
+  ]);
+  assert.equal(JSON.stringify(parsed).includes('/candidate/'), false);
+  assert.equal(JSON.stringify(parsed).includes('/private/'), false);
+});
+
+test('aggregates allowlisted smaps only for supplied owned PIDs with bounded metadata', async () => {
+  const root = await mkdtemp(path.join(os.tmpdir(), 'supermd-library-smaps-'));
+  try {
+    const addSmaps = async (pid, content) => {
+      const folder = path.join(root, String(pid));
+      await mkdir(folder);
+      await writeFile(path.join(folder, 'smaps'), content);
+    };
+    await addSmaps(101, [
+      '1000-2000 r--p 00000000 08:01 1 /package/libicuuc.so.78', 'Rss: 80 kB', 'Pss: 40 kB',
+    ].join('\n'));
+    await addSmaps(102, [
+      '2000-3000 r--p 00000000 08:01 1 /package/libicuuc.so.78', 'Rss: 60 kB', 'Pss: 30 kB',
+      '3000-4000 r--p 00000000 08:01 2 /package/libopus.so.0', 'Rss: 20 kB', 'Pss: 10 kB',
+    ].join('\n'));
+    await addSmaps(103, '4000-5000 r--p 00000000 08:01 3 /package/libicudata.so.78\nRss: 999 kB\nPss: 999 kB\n');
+
+    const result = await aggregateAllowlistedLibraryMemory([101, 102], root);
+    assert.deepEqual(result, {
+      processCount: 2,
+      processesSampled: 2,
+      processesUnreadable: 0,
+      truncated: false,
+      libraries: [
+        { library: 'libicuuc.so.78', rssKb: 140, pssKb: 70, mappingCount: 2, processCount: 2 },
+        { library: 'libopus.so.0', rssKb: 20, pssKb: 10, mappingCount: 1, processCount: 1 },
+      ],
+    });
+    assert.equal(JSON.stringify(result).includes(String(root)), false);
   } finally { await rm(root, { recursive: true, force: true }); }
 });
 

@@ -1,4 +1,4 @@
-import { Children, isValidElement, lazy, memo, Suspense, useContext, useEffect, useMemo, useState, type ReactNode } from "react";
+import { Children, isValidElement, lazy, memo, Suspense, useCallback, useContext, useEffect, useMemo, useState, type ReactNode } from "react";
 import { invoke } from "../nativeBridge";
 import CachedMarkdown,{type MarkdownBlockRenderer} from "./CachedMarkdown";
 import remarkGfm from "remark-gfm";
@@ -27,6 +27,7 @@ const MermaidDiagram = lazy(() => import("./MermaidDiagram"));
 function ThemedChart({source,dark}:{source:string;dark:boolean}) {const theme=useContext(DocumentAppearance);return <InteractiveChart source={source} dark={theme?.dark??dark} appearance={theme?.svgAppearance} colors={theme?.colors}/>;}
 function ThemedSvg({source,dark}:{source:string;dark:boolean}) {const theme=useContext(DocumentAppearance);return <SvgDiagram source={source} dark={theme?.dark??dark} appearance={theme?.svgAppearance} ink={theme?.svgAppearance==='auto'?theme.ink:theme?.text} colors={theme?.colors}/>;}
 function ThemedMermaid({source,dark}:{source:string;dark:boolean}) {const theme=useContext(DocumentAppearance);return <MermaidDiagram source={source} dark={theme?.dark??dark} appearance={theme?.svgAppearance} colors={theme?.colors}/>;}
+const EMPTY_TRUSTED_IMAGE_HOSTS: string[] = [];
 function remarkTaskPositions() {
   return (tree:unknown)=>{let index=0;visit(tree as never,'listItem',(node:any)=>{if(typeof node.checked==='boolean')node.data={...node.data,hProperties:{...node.data?.hProperties,'data-task-index':index++}};});};
 }
@@ -72,7 +73,7 @@ function AssetImage({ src = "", alt = "", documentPath, trustedImageHosts, onTru
     try { host = new URL(src).host; }
     catch { host = "invalid address"; }
   }
-  const [allowOnce, setAllowOnce] = useState(false);
+  const [allowedOnceSource, setAllowedOnceSource] = useState<string | null>(null);
   const [resolved, setResolved] = useState(embedded ? src : "");
   const [error, setError] = useState("");
   const [selected, setSelected] = useState(false);
@@ -80,8 +81,9 @@ function AssetImage({ src = "", alt = "", documentPath, trustedImageHosts, onTru
   const appearance=useContext(DocumentAppearance);
   const adaptsSvg=appearance?.svgAppearance==='auto'||appearance?.svgAppearance==='monochrome';
   const adaptedSource=useMemo(()=>adaptsSvg&&svgBacking?adaptSvgData(resolved,appearance?.colors??{},appearance?.dark??false,appearance?.svgAppearance==='monochrome'):resolved,[resolved,svgBacking,appearance,adaptsSvg]);
-  const allowed = allowOnce || trustedImageHosts.includes(host);
-  useEffect(() => { setAllowOnce(false); }, [src]);
+  // A one-time approval belongs to the exact URL the user approved. Keeping
+  // that scope in state avoids a passive-effect reset window when `src` changes.
+  const allowed = allowedOnceSource === src || trustedImageHosts.includes(host);
   useEffect(() => {
     let active = true;
     setError("");
@@ -110,7 +112,7 @@ function AssetImage({ src = "", alt = "", documentPath, trustedImageHosts, onTru
     })();
     return () => { active = false; };
   }, [documentPath, embedded, isRemote, src, allowed]);
-  if (isRemote && !allowed) return <span className="remote-image-card" role="group" aria-label={`Remote image from ${host}`}><span><strong>{alt || "Remote image"}</strong><small>{host} · blocked until you choose to load it</small></span><span className="remote-image-actions"><button onClick={() => setAllowOnce(true)}>Load image</button>{onTrustImageHost && <button onClick={() => onTrustImageHost(host)}>Trust domain</button>}</span></span>;
+  if (isRemote && !allowed) return <span className="remote-image-card" role="group" aria-label={`Remote image from ${host}`}><span><strong>{alt || "Remote image"}</strong><small>{host} · blocked until you choose to load it</small></span><span className="remote-image-actions"><button onClick={() => setAllowedOnceSource(src)}>Load image</button>{onTrustImageHost && <button onClick={() => onTrustImageHost(host)}>Trust domain</button>}</span></span>;
   if (error) return <span className="image-error" role="img" aria-label={alt || "Image unavailable"}>Image unavailable: {alt || src}<small>{error}</small></span>;
   if (!resolved) return <span className="image-loading" role="status">Loading image…</span>;
   return <span className={`note-image ${selected ? "is-selected" : ""}`} data-note-image-source={src} tabIndex={0} aria-label={`Image controls: ${alt || "Image"}`} onFocus={() => setSelected(true)} onBlur={(event) => { if (!event.currentTarget.contains(event.relatedTarget)) setSelected(false); }} onClick={(event) => { event.stopPropagation(); setSelected(true); event.currentTarget.focus(); }} onKeyDown={(event) => { if (event.key === "Escape") { setSelected(false); event.stopPropagation(); } }}>
@@ -130,9 +132,10 @@ interface Props extends ReaderAccessibilityPreference {
   renderBlock?:MarkdownBlockRenderer;
 }
 
-function MarkdownPreview({ markdown, documentPath, python, dark, trustedImageHosts = [], onTrustImageHost, onChange,renderBlock,fullDocumentAccessibility=false }: Props) {
+function MarkdownPreview({ markdown, documentPath, python, dark, trustedImageHosts = EMPTY_TRUSTED_IMAGE_HOSTS, onTrustImageHost, onChange,renderBlock,fullDocumentAccessibility=false }: Props) {
   const analysis=useMemo(()=>analyzeDocument(markdown),[markdown]);
   const tasks=onChange?analysis.tasks:[];
+  const renderImage = useCallback(({src,alt}:{src?:string;alt?:string})=><AssetImage src={src} alt={alt} documentPath={documentPath} trustedImageHosts={trustedImageHosts} onTrustImageHost={onTrustImageHost}/>,[documentPath,trustedImageHosts,onTrustImageHost]);
   return (
     <article className="markdown-body" onCopy={event=>{if(event.currentTarget.closest('.live-document'))return;const source=selectedMarkdown(window.getSelection(),markdown);if(source!==null){event.clipboardData.setData("text/plain",source);event.preventDefault();}}}>
       <CachedMarkdown
@@ -143,7 +146,7 @@ function MarkdownPreview({ markdown, documentPath, python, dark, trustedImageHos
         components={{
           input: ({node: _node,...props}) => <input {...props} disabled={!onChange} onChange={()=>{}} />,
           li: ({node,children,...props}) => <li {...props} className={Array.isArray(node?.properties.className)?node.properties.className.join(' '):undefined} onChange={event=>{const index=Number(node?.properties['data-task-index']);const offset=tasks[index];if(offset===undefined || !onChange || !(event.target instanceof HTMLInputElement))return;onChange(markdown.slice(0,offset)+(event.target.checked?'x':' ')+markdown.slice(offset+1));}}>{children}</li>,
-          img: ({ src, alt }) => <AssetImage src={src} alt={alt} documentPath={documentPath} trustedImageHosts={trustedImageHosts} onTrustImageHost={onTrustImageHost} />,
+          img: renderImage,
           a: ({node:_node,href,children,...props}) => <a {...props} href={href} target={href?.startsWith("#") ? undefined : "_blank"} rel="noreferrer" onClick={event => { if (navigateHeading(event.currentTarget)) { event.preventDefault(); event.stopPropagation(); } else event.currentTarget.dataset.visited='true'; }}>{children}</a>,
           pre: ({ node, children }) => {
             const child = Children.only(children) as React.ReactElement<{ className?: string; children?: ReactNode }>;

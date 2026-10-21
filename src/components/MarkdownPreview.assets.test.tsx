@@ -25,6 +25,13 @@ async function render(markdown: string) {
   return host;
 }
 
+async function rerender(host: HTMLElement, markdown: string) {
+  await act(async () => {
+    root?.render(<MarkdownPreview markdown={markdown} documentPath="/notes/a.md" python="" dark />);
+  });
+  return host;
+}
+
 describe("MarkdownPreview streamed local assets", () => {
   it("renders the scoped native raster URL without materializing base64", async () => {
     const url = `https://appassets.androidplatform.net/reader-assets/${"1".repeat(32)}?v=${"a".repeat(64)}`;
@@ -51,6 +58,34 @@ describe("MarkdownPreview streamed local assets", () => {
     const host = await render("![Raster](images/a.png)");
     expect(invoke).toHaveBeenNthCalledWith(2, "load_asset", { documentPath: "/notes/a.md", source: "images/a.png" });
     expect(host.querySelector("img")?.getAttribute("src")).toMatch(/^data:image\/png;base64,/);
+  });
+
+  it("does not carry one-time remote consent to a changed image source", async () => {
+    invoke.mockResolvedValue({ body: "data:image/png;base64,iVBORw0KGgo=" });
+    const first = "https://images.example/a.png";
+    const second = "https://images.example/b.png";
+    const host = await render(`![Remote](${first})`);
+    expect(host.querySelector(".remote-image-card")).not.toBeNull();
+
+    await act(async () => host.querySelector<HTMLButtonElement>(".remote-image-actions button")?.click());
+    expect(invoke).toHaveBeenCalledTimes(1);
+    expect(invoke).toHaveBeenCalledWith("fetch_resource", { url: first, image: true });
+
+    await rerender(host, `![Remote](${second})`);
+    expect(host.querySelector(".remote-image-card")).not.toBeNull();
+    expect(invoke).toHaveBeenCalledTimes(1);
+    expect(invoke).not.toHaveBeenCalledWith("fetch_resource", { url: second, image: true });
+  });
+
+  it("continues to allow explicitly trusted remote image hosts", async () => {
+    invoke.mockResolvedValue({ body: "data:image/png;base64,iVBORw0KGgo=" });
+    const host = document.createElement("div");
+    document.body.append(host);
+    root = createRoot(host);
+    await act(async () => {
+      root?.render(<MarkdownPreview markdown="![Remote](https://images.example/a.png)" documentPath="/notes/a.md" python="" dark trustedImageHosts={["images.example"]} />);
+    });
+    expect(invoke).toHaveBeenCalledWith("fetch_resource", { url: "https://images.example/a.png", image: true });
   });
 
   it("passes whole-document duplicate ordinals and interpreter context to runs", async () => {

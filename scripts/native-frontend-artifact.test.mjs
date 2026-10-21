@@ -1,6 +1,7 @@
 import { afterEach, it } from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtemp, mkdir, rm, writeFile } from 'node:fs/promises';
+import { execFileSync } from 'node:child_process';
+import { mkdtemp, mkdir, readFile, rm, writeFile } from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
 import { createNativeFrontendManifest, verifyNativeFrontendManifest } from './native-frontend-artifact.mjs';
@@ -57,6 +58,34 @@ it('rejects source, package-lock, modified, missing, and unexpected files', asyn
   await rm(path.join(files.distRoot, 'unexpected.txt'));
   await rm(path.join(files.distRoot, 'qt-reader.html'));
   await assert.rejects(verifyNativeFrontendManifest({ ...files, expectedSourceSha: sourceSha }), /inventory or checksum mismatch/);
+});
+
+it('keeps package-lock bytes LF on checkout with core.autocrlf=true and verifies the raw digest', async () => {
+  const files = await fixture();
+  const repository = path.join(path.dirname(files.packageLockPath), 'line-ending-repo');
+  await mkdir(repository);
+  await writeFile(path.join(repository, '.gitattributes'), await readFile(new URL('../.gitattributes', import.meta.url)));
+  const lockPath = path.join(repository, 'package-lock.json');
+  await writeFile(lockPath, '{"lockfileVersion":3}\n');
+  execFileSync('git', ['init', '--quiet'], { cwd: repository });
+  execFileSync('git', ['config', 'core.autocrlf', 'true'], { cwd: repository });
+  execFileSync('git', ['config', 'user.name', 'Artifact Test'], { cwd: repository });
+  execFileSync('git', ['config', 'user.email', 'artifact-test@example.invalid'], { cwd: repository });
+  execFileSync('git', ['add', '--', '.gitattributes', 'package-lock.json'], { cwd: repository });
+  execFileSync('git', ['commit', '--quiet', '-m', 'fixture'], { cwd: repository });
+  await writeFile(lockPath, '{"lockfileVersion":3}\r\n');
+  execFileSync('git', ['checkout', '--', 'package-lock.json'], { cwd: repository });
+  const checkoutBytes = await readFile(lockPath);
+  assert.equal(checkoutBytes.includes(0x0d), false);
+  files.packageLockPath = lockPath;
+
+  const value = await createNativeFrontendManifest({
+    distRoot: files.distRoot,
+    packageLockPath: files.packageLockPath,
+    sourceSha,
+  });
+  await writeFile(files.manifestPath, JSON.stringify(value));
+  assert.equal((await verifyNativeFrontendManifest({ ...files, expectedSourceSha: sourceSha })).fileCount, 3);
 });
 
 it('rejects an incomplete manifest and source identifiers that are not full commit SHAs', async () => {

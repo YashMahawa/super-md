@@ -46,3 +46,25 @@ PSS is nearly unchanged. After warm/theme cycles, the 1 MB candidate's median
 PSS is about 2.8 MiB above baseline. Theme-cycle scheduling measurements are
 mixed (including slower math/1 MB observations), so repeat and native visual
 checks remain required before declaring the final performance gate passed.
+
+## Corrected-harness recheck
+
+After making generated-note navigation explicit, both binaries were rerun with
+the same corrected harness (three fresh processes and two revisit/theme cycles
+per fixture). These newer observations do **not** establish a passed final gate:
+
+| Fixture | Baseline → candidate first equation, median ms | Baseline → candidate cold process-tree PSS MiB | Baseline → candidate theme readiness, median ms |
+|---|---:|---:|---:|
+| Small | 40.2 → 37.1 | 391.4 → 407.1 | 33.2 → 33.2 |
+| Math-heavy | 440.7 → 435.8 | 451.7 → 464.7 | 70.5 → 70.0 |
+| 1 MB Markdown | 786.0 → 874.6 | 435.0 → 452.9 | 78.1 → 66.4 |
+| Many blocks | 391.5 → 359.3 | 414.3 → 433.1 | 44.0 → 36.3 |
+| Huge single block | 139.2 → 118.2 | 414.1 → 431.3 | 33.4 → 33.1 |
+
+The local candidate bundle is approximately 39 MiB larger than the installed
+baseline. Package/runtime inventory and a counterbalanced timing repeat are
+required to distinguish dependency/build-environment drift, measurement variance
+and implementation costs. In particular the 1 MB cold slowdown and consistent
+native-memory increase must not be hidden behind the earlier faster sample.
+No runtime-memory or universal performance improvement is claimed from these
+results, and they do not qualify a release.

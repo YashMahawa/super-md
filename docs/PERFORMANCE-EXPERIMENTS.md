@@ -53,6 +53,26 @@ No decode cap, lossy preview, image rejection or automatic asset deletion is
 justified by fixture construction alone. Native capability transport and the
 legacy loader must retain equivalent image content.
 
+The packaged candidate completed three fresh launches and six warm revisits
+of the 31.36 MP fixture. Every traversal verified all four original 2800×2800
+images. Median first equation was 117 ms; all four images were observed decoded
+after 373 ms cold and 290 ms warm. Median sampled cold peak process-tree PSS
+was 568 MiB, settling to 526 MiB after collection; final post-theme median was
+525 MiB. Collected JS heap was 9.39 MB cold and 9.58 MB after revisits/themes.
+Two warm cycles do not establish long-session leak freedom. These measurements
+use the offscreen software renderer, not interactive presented-frame timings.
+
+The cold layout-shift observation (0.428) includes replacing the startup note
+with the fixture and must not be attributed solely to image decoding. Warm
+traversals observed zero layout shift. No preview/decode policy change is
+accepted from this observation alone.
+
+The harness explicitly disables saved-position restoration for generated
+documents, marks its navigation intent, and resets the viewport after commit.
+Otherwise an offscreen virtualized heading can invalidate the readiness probe.
+The earlier baseline/candidate table predates this harness correction; final
+comparisons must rerun both binaries with the same corrected harness.
+
 ## TypeScript compiler canary
 
 An isolated comparison used the repository project and its TypeScript build
@@ -97,6 +117,11 @@ run or locally generated unverified bundle. This avoids serializing Python,
 Rust and Android setup behind the frontend build while retaining exact-source
 provenance. Release `publish_only` recovery continues to verify Android rather
 than reusing its APKs.
+
+The lockfile digest is over raw bytes; `.gitattributes` pins its checkout to
+LF so Windows `core.autocrlf` cannot cause a false cross-platform manifest
+mismatch. Lockfile content changes still change the digest, and every built
+frontend file remains checked by its exact byte count and SHA-256.
 
 ## Android APK reuse and release recovery assessment
 

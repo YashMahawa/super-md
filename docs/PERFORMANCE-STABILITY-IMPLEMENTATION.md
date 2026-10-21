@@ -22,7 +22,7 @@ No release is ready until the final cross-platform and installer gates pass.
 - [x] Add Python cross-document/context/provenance regressions (native, reader and PDF lookup; legacy and unsaved output labels).
 - [x] Add native lifecycle and renderer-failure recovery tests (owned Qt renderer kill passed; Android lifecycle unit coverage, emulator execution remains a release gate).
 - [x] Add Unicode/reordering/interruption/flush edit-protocol tests (TypeScript, Qt and Android).
-- [ ] Add huge-block, image-decode and repeated-cycle memory fixtures.
+- [x] Add huge-block, image-decode and repeated-cycle memory fixtures (three fresh 31.36 MP image runs and six revisits passed; long-session leak qualification remains separate).
 - [ ] Verify screen-reader/keyboard semantic navigation strategy.
 
 ## Correctness and resilience
@@ -37,7 +37,7 @@ No release is ready until the final cross-platform and installer gates pass.
 ## Reader work and transport
 
 - [x] Shared revision-aware document analysis and coalesced outlines (shared exact-source bounded cache and original offsets).
-- [ ] Measure and, if justified, move cold parsing behind a worker boundary.
+- [x] Measure and, if justified, move cold parsing behind a worker boundary (large Source outlines only; full-AST worker round trips did not improve total latency and are not shipped).
 - [x] Shared visibility observation and stable block metadata (observer ownership/focus tests).
 - [x] Owned/cancellable/deduplicated diagram scheduling (cancellation/dedup tests; native performance comparison still required).
 - [x] Revisioned UTF-16 edit transport with atomic native apply and fallback.
@@ -55,7 +55,7 @@ No release is ready until the final cross-platform and installer gates pass.
 - [x] Gradle dependency/task caching and phase-level Android CI timings (signed task output reuse disabled).
 - [ ] Evaluate immutable emulator APK reuse while retaining both API suites.
 - [x] Bounded incremental local build lane; no unrelated daemon termination.
-- [ ] Measure two browser CI workers for speed, memory and determinism (first pair: all 68 passed, 235 s vs 148 s; repeat/flakiness evidence still pending).
+- [x] Measure two browser CI workers for speed, memory and determinism (initial same-source 68-test pair: 235 s vs 148 s with increased peak memory; subsequent complete 70-test local and CI runs passed at two workers; local default stays one).
 - [x] Cache inventory/retention report; no destructive blanket cleanup.
 - [x] Reader-entry asset manifest and packaged offline reachability checks (94 fonts retained; every public resource checked).
 - [x] Font/dependency inventory and only verified non-feature-removing pruning (no speculative pruning accepted).
