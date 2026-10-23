@@ -1,4 +1,4 @@
-import { Children, isValidElement, lazy, memo, Suspense, useCallback, useContext, useEffect, useMemo, useState, type ReactNode } from "react";
+import { Children, isValidElement, lazy, memo, Suspense, useCallback, useContext, useEffect, useMemo, useRef, useState, type ReactNode } from "react";
 import { invoke } from "../nativeBridge";
 import CachedMarkdown,{type MarkdownBlockRenderer} from "./CachedMarkdown";
 import remarkGfm from "remark-gfm";
@@ -21,6 +21,7 @@ import {adaptSvgData} from '../svgTheme';
 import {analyzeDocument} from '../documentAnalysis';
 import type {SourceDocumentAnalysis} from '../documentAnalysis';
 import {resolveReaderRasterAsset} from '../readerAssets';
+import {commitMediaLayout} from '../mediaLayout';
 import type {ReaderAccessibilityPreference} from '../types';
 export {normalizeCallouts} from '../markdownSource';
 
@@ -49,18 +50,37 @@ export function remarkCallouts() {
     const paragraph = node.children?.[0];
     const first = paragraph?.children?.[0];
     if (first?.type !== "text") return;
-    const match = first.value.match(/^\[!([\w-]+)\]([+-]?)[ \t]*([^\n]*)/i);
+    const match = first.value.match(/^\[!([\w-]+)\]([+-]?)[ \t]*/i);
     if (!match) return;
     const type = match[1].toLowerCase();
-    const title = match[3].trim() || type[0].toUpperCase() + type.slice(1);
-    first.value = first.value.slice(match[0].length).replace(/^\n/, "");
-    if (!first.value) paragraph.children.shift();
-    if (paragraph.children.length === 0) node.children.shift();
+    first.value = first.value.slice(match[0].length);
+    // A title is a line of inline Markdown, not just the first text node.
+    // Keep emphasis, links and math in their original AST form and split only
+    // the first line, even if its newline is inside an emphasis/link node.
+    const split=(children:any[]):{title:any[];body:any[];ended:boolean}=>{
+      const title:any[]=[],body:any[]=[];let ended=false;
+      for(const child of children){
+        if(ended){body.push(child);continue;}
+        if(child.type==='break'){ended=true;continue;}
+        if(child.type==='text'){
+          const at=child.value.indexOf('\n');
+          if(at>=0){if(at)title.push({...child,value:child.value.slice(0,at)});if(child.value.length>at+1)body.push({...child,value:child.value.slice(at+1)});ended=true;}
+          else if(child.value)title.push(child);
+        }else if(child.children){
+          const parts=split(child.children);if(parts.title.length)title.push({...child,children:parts.title});if(parts.body.length)body.push({...child,children:parts.body});ended=parts.ended;
+        }else title.push(child);
+      }
+      return {title,body,ended};
+    };
+    const parts=split(paragraph.children);
+    paragraph.children=parts.body;
+    if(!paragraph.children.length)node.children.shift();
+    const title=parts.title.some((child:any)=>child.type!=='text'||child.value.trim())?parts.title:[{type:'text',value:type[0].toUpperCase()+type.slice(1)}];
     const collapsible = Boolean(match[2]) || type === "answer" || type === "solution";
     node.children.unshift({
       type: "paragraph",
       data: { hName: collapsible ? "summary" : "p", hProperties: { className: "callout-title" } },
-      children: [{ type: "text", value: title }]
+      children: title
     });
     node.data = { hName: collapsible ? "details" : "aside", hProperties: { ...(collapsible ? {open:match[2] === "+"} : {}), className: `callout callout-${type}`, "data-callout-type": type } };
   });
@@ -78,6 +98,9 @@ function AssetImage({ src = "", alt = "", documentPath, trustedImageHosts, onTru
   const [resolved, setResolved] = useState(embedded ? src : "");
   const [error, setError] = useState("");
   const [selected, setSelected] = useState(false);
+  const mediaElement=useRef<HTMLSpanElement>(null);
+  const imageElement=useRef<HTMLImageElement>(null);
+  const [sizedSource,setSizedSource]=useState('');
   const svgBacking=useMemo(()=>svgDataBackdrop(resolved),[resolved]);
   const appearance=useContext(DocumentAppearance);
   const adaptsSvg=appearance?.svgAppearance==='auto'||appearance?.svgAppearance==='monochrome';
@@ -95,7 +118,7 @@ function AssetImage({ src = "", alt = "", documentPath, trustedImageHosts, onTru
       // Explicit consent routes through the bounded native fetcher, not a raw
       // remote request from a local WebEngine page. This also works offline after insertion.
       invoke<{body:string}>("fetch_resource",{url:src,image:true})
-        .then(value=>{if(active) setResolved(value.body);})
+        .then(value=>{if(active)commitMediaLayout(mediaElement.current,()=>setResolved(value.body));})
         .catch(reason=>{if(active) setError(String(reason));});
       return ()=>{active=false;};
     }
@@ -104,20 +127,22 @@ function AssetImage({ src = "", alt = "", documentPath, trustedImageHosts, onTru
       try {
         const streamed = documentPath ? await resolveReaderRasterAsset(documentPath, src) : null;
         if (!active) return;
-        if (streamed) { setResolved(streamed); return; }
+        if (streamed) { commitMediaLayout(mediaElement.current,()=>setResolved(streamed)); return; }
         const value = await invoke<string>("load_asset", { documentPath: documentPath || "", source: src });
-        if (active) setResolved(value);
+        if (active)commitMediaLayout(mediaElement.current,()=>setResolved(value));
       } catch (reason) {
         if (active) setError(String(reason));
       }
     })();
     return () => { active = false; };
   }, [documentPath, embedded, isRemote, src, allowed]);
-  if (isRemote && !allowed) return <span className="remote-image-card" role="group" aria-label={`Remote image from ${host}`}><span><strong>{alt || "Remote image"}</strong><small>{host} · blocked until you choose to load it</small></span><span className="remote-image-actions"><button onClick={() => setAllowedOnceSource(src)}>Load image</button>{onTrustImageHost && <button onClick={() => onTrustImageHost(host)}>Trust domain</button>}</span></span>;
-  if (error) return <span className="image-error" role="img" aria-label={alt || "Image unavailable"}>Image unavailable: {alt || src}<small>{error}</small></span>;
-  if (!resolved) return <span className="image-loading" role="status">Loading image…</span>;
-  return <span className={`note-image ${selected ? "is-selected" : ""}`} data-note-image-source={src} tabIndex={0} aria-label={`Image controls: ${alt || "Image"}`} onFocus={() => setSelected(true)} onBlur={(event) => { if (!event.currentTarget.contains(event.relatedTarget)) setSelected(false); }} onClick={(event) => { event.stopPropagation(); setSelected(true); event.currentTarget.focus(); }} onKeyDown={(event) => { if (event.key === "Escape") { setSelected(false); event.stopPropagation(); } }}>
-    <img draggable={false} data-media-adapted={adaptsSvg&&svgBacking?'true':undefined} data-media-kind={resolved.startsWith('data:image/svg+xml')?'svg':'image'} data-light-ink={svgBacking==='#222026'?'true':undefined} style={svgBacking?{'--svg-contrast-backing':svgBacking} as React.CSSProperties:undefined} src={adaptedSource} alt={alt} loading="lazy" decoding="async" onError={() => setError("The image could not be decoded or loaded.")} />
+  if (isRemote && !allowed) return <span ref={mediaElement} className="remote-image-card" role="group" aria-label={`Remote image from ${host}`}><span><strong>{alt || "Remote image"}</strong><small>{host} · blocked until you choose to load it</small></span><span className="remote-image-actions"><button onClick={() => setAllowedOnceSource(src)}>Load image</button>{onTrustImageHost && <button onClick={() => onTrustImageHost(host)}>Trust domain</button>}</span></span>;
+  if (error) return <span ref={mediaElement} className="image-error" role="img" aria-label={alt || "Image unavailable"}>Image unavailable: {alt || src}<small>{error}</small></span>;
+  if (!resolved) return <span ref={mediaElement} className="image-loading" role="status">Loading image…</span>;
+  const sizing=sizedSource!==resolved;
+  return <span ref={mediaElement} className={`note-image ${sizing?'image-loading':''} ${selected ? "is-selected" : ""}`} style={sizing?{width:'100%',boxSizing:'border-box'}:undefined} data-note-image-source={src} tabIndex={0} aria-label={`Image controls: ${alt || "Image"}`} onFocus={() => setSelected(true)} onBlur={(event) => { if (!event.currentTarget.contains(event.relatedTarget)) setSelected(false); }} onClick={(event) => { event.stopPropagation(); setSelected(true); event.currentTarget.focus(); }} onKeyDown={(event) => { if (event.key === "Escape") { setSelected(false); event.stopPropagation(); } }}>
+    {sizing&&<span role="status">Loading image…</span>}
+    <img ref={imageElement} draggable={false} data-media-adapted={adaptsSvg&&svgBacking?'true':undefined} data-media-kind={resolved.startsWith('data:image/svg+xml')?'svg':'image'} data-light-ink={svgBacking==='#222026'?'true':undefined} style={{...(svgBacking?{'--svg-contrast-backing':svgBacking}:{}),...(sizing?{position:'absolute',height:0,visibility:'hidden'}:{})} as React.CSSProperties} src={adaptedSource} alt={alt} loading="lazy" decoding="async" onLoad={()=>{if(sizedSource!==resolved)commitMediaLayout(imageElement.current,()=>setSizedSource(resolved));}} onError={() => commitMediaLayout(imageElement.current,()=>setError("The image could not be decoded or loaded."))} />
     {selected && <span className="image-edit-tools" role="toolbar" aria-label="Selected image"><button onClick={(event) => { event.stopPropagation(); window.dispatchEvent(new CustomEvent("supermd-image-edit", { detail: { action: "replace", image: event.currentTarget.closest("[data-note-image-source]") } })); }}>Replace</button><button onClick={(event) => { event.stopPropagation(); window.dispatchEvent(new CustomEvent("supermd-image-edit", { detail: { action: "remove", image: event.currentTarget.closest("[data-note-image-source]") } })); }}>Remove</button></span>}
   </span>;
 }

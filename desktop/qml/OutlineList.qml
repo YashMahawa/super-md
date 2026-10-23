@@ -8,8 +8,24 @@ ListView {
     property string noteId: ""
     property var expanded: ({})
     readonly property var rootHeadingId: singleRootId()
-    onNoteIdChanged: expanded = ({})
+    onNoteIdChanged: { expanded = ({}); positionViewAtBeginning() }
     clip: true
+    function toggleExpanded(id) {
+        const previous = contentY, note = noteId
+        const next = Object.assign({}, expanded)
+        next[id] = !expanded[id]
+        expanded = next
+        forceLayout()
+        contentY = Math.max(originY, Math.min(previous, originY + Math.max(0, contentHeight-height)))
+        const restored = contentY
+        Qt.callLater(function() {
+            // Do not undo a newer note switch or deliberate scroll.
+            if(noteId === note && contentY === restored) {
+                forceLayout()
+                contentY = Math.max(originY, Math.min(previous, originY + Math.max(0, contentHeight-height)))
+            }
+        })
+    }
     function singleRootId() {
         const stack = [], roots = []
         for (let i=0; i<entries.length; i++) {
@@ -72,7 +88,7 @@ ListView {
                 Behavior on rotation { enabled: studio.motionEnabled; NumberAnimation { duration: 180; easing.type: Easing.OutCubic } }
                 Accessible.name: (heading.open ? "Collapse " : "Expand ") + heading.modelData.title
                 background: Rectangle { radius: 14; color: heading.colors.text; opacity: toggle.hovered ? .1 : 0 }
-                onClicked: { const next=Object.assign({},outline.expanded);next[heading.modelData.id]=!heading.open;outline.expanded=next }
+                onClicked: outline.toggleExpanded(heading.modelData.id)
             }
             Item { visible: !heading.modelData.collapsible; Layout.preferredWidth: 28 }
             Label {

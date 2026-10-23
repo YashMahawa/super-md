@@ -95,7 +95,7 @@ export default function ReadingSearch({content,close,onChange,sourceSession}:{co
   },[windowed,query,caseSensitive]);
   return <aside className="reading-search" data-independent-zoom role="search" aria-label="Find in note">
     <input ref={input} aria-label="Find in note" type="search" placeholder="Find in this note" value={query} onChange={event=>setQuery(event.target.value)} onKeyDown={event=>{if(event.key==="Enter"){event.preventDefault();move(event.shiftKey?-1:1);}}}/>
-    <output aria-live="polite">{count ? `${index<0 ? 0 : index+1} / ${count}` : query ? "No matches" : ""}</output>
+    <output aria-live="polite" title={count>=5000?'Showing the first 5,000 matches. Narrow your search to find later results.':undefined}>{count ? `${index<0 ? 0 : index+1} / ${count}${count>=5000?'+':''}` : query ? "No matches" : ""}</output>
     <button className="search-icon" aria-label="Previous match" disabled={!count} onClick={()=>move(-1)} title="Previous match (Shift+Enter)"><ArrowUp size={20} weight="bold"/></button>
     <button className="search-icon" aria-label="Next match" disabled={!count} onClick={()=>move(1)} title="Next match (Enter)"><ArrowDown size={20} weight="bold"/></button>
     <button className="search-icon" aria-pressed={caseSensitive} onClick={()=>setCaseSensitive(!caseSensitive)} title="Match case" aria-label="Match case"><TextAa size={20} weight="bold"/></button>

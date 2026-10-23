@@ -65,6 +65,20 @@ test('reading position survives a renderer restart and can be disabled',async({p
   await expect.poll(()=>root.evaluate(el=>el.scrollTop)).toBe(0);
 });
 
+test('a newly opened document starts at its own beginning, not the previous tab position',async({page})=>{
+  const content=Array.from({length:90},(_,i)=>`## Chapter ${i}\n\n${'A readable paragraph about trees. '.repeat(14)}\n\n`).join('');
+  const state={id:'existing-note',path:null,content,mode:'reader' as const,dark:false,colors:{},font:'Manrope',size:15,zoom:100,restorePosition:false};
+  await page.evaluate(state=>window.supermdLoad?.(state),state);
+  await page.evaluate(()=>window.supermdHeading?.('chapter-40'));
+  const root=page.locator('.android-reading');
+  await expect.poll(()=>root.evaluate(el=>el.scrollTop)).toBeGreaterThan(3000);
+  await page.evaluate(state=>window.supermdLoad?.({...state,id:'new-note',content:'# Newly opened note\n\n'+state.content}),state);
+  await expect.poll(()=>root.evaluate(el=>el.scrollTop)).toBe(0);
+  await expect(page.getByRole('heading',{name:'Newly opened note'})).toBeInViewport();
+  await page.evaluate(state=>window.supermdLoad?.(state),state);
+  await expect.poll(()=>root.evaluate(el=>el.scrollTop)).toBeGreaterThan(3000);
+});
+
 test('paw backgrounds paint adjustable tiles without intercepting reading or replacing math',async({page})=>{
   const state={id:'paws',path:null,content:'# Quiet study\n\nA [working jump](#destination) and $x^2+1$.\n\n## Destination\n\nStill ordinary text.',mode:'reader' as const,dark:false,fullscreen:false,colors:{surface:'#f0e1d0',text:'#39291f',primary:'#80502d'},font:'Manrope',size:17,zoom:125,customStyle:{background:{pattern:'paws',color:'#865d3e',opacity:.2,spacing:96,size:30,angle:342}}};
   await page.evaluate(state=>window.supermdLoad?.(state),state);

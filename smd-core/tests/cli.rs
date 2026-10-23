@@ -72,3 +72,33 @@ fn prepared_pdf_stdin_and_invalid_requests() {
     assert!(!w.run(&["inspect", "invalid.smd"]).status.success());
     assert!(!w.run(&["extract", "invalid.smd", "nope", "bad.svg"]).status.success()); assert!(!w.file("bad.svg").exists());
 }
+
+#[test]
+fn malformed_streams_and_asset_paths_fail_without_overwriting_the_destination() {
+    let w=Workspace::new();
+    fs::write(w.file("preserved.pdf"),b"existing user file").unwrap();
+    for input in [b"{\"content\":".as_slice(), &[0xff], br#"{"content":"test","options":{"fontSize":100}}"#.as_slice()] {
+        let mut child=Command::new(env!("CARGO_BIN_EXE_smd-engine")).current_dir(&w.0).args(["export-json","preserved.pdf"])
+            .stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped()).spawn().unwrap();
+        child.stdin.take().unwrap().write_all(input).unwrap();
+        let output=child.wait_with_output().unwrap();assert!(!output.status.success());assert!(!output.stderr.is_empty());
+        assert_eq!(fs::read(w.file("preserved.pdf")).unwrap(),b"existing user file");
+    }
+    fs::write(w.file("outside.md"),"![outside](../outside.svg)").unwrap();
+    assert!(!w.run(&["export","outside.md","preserved.pdf"]).status.success());
+    assert_eq!(fs::read(w.file("preserved.pdf")).unwrap(),b"existing user file");
+}
+
+#[test]
+fn inline_data_images_export_and_pack_but_remote_images_never_download_implicitly() {
+    use base64::Engine;
+    let w=Workspace::new();
+    let svg=b"<svg xmlns=\"http://www.w3.org/2000/svg\" width=\"20\" height=\"20\"><circle cx=\"10\" cy=\"10\" r=\"8\" fill=\"blue\"/></svg>";
+    let encoded=base64::engine::general_purpose::STANDARD.encode(svg);
+    fs::write(w.file("inline.md"),format!("![inline](data:image/svg+xml;base64,{encoded})")).unwrap();
+    success(w.run(&["export","inline.md","inline.pdf"]));pdf(&w.file("inline.pdf"));
+    success(w.run(&["pack","inline.md","inline.smd"]));
+    fs::write(w.file("remote.md"),"![remote](https://example.invalid/diagram.png)").unwrap();
+    let output=w.run(&["export","remote.md","remote.pdf"]);
+    assert!(!output.status.success());assert!(String::from_utf8_lossy(&output.stderr).contains("explicit download"));assert!(!w.file("remote.pdf").exists());
+}
