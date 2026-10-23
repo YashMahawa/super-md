@@ -2,8 +2,41 @@
  * the viewport. The registry is released with each document, never persisted. */
 import {flushSync} from 'react-dom';
 import {refreshDocumentExtent} from './documentZoom';
+import {scrollInputVersion} from './scrollAnchor';
 const blocks=new Map<HTMLElement,string>();
 const pendingAnchors=new WeakSet<HTMLElement>();
+type ScrollSource={range:Range;node:Node;offset:number;input:number};
+const scrollSources=new WeakMap<HTMLElement,ScrollSource>();
+/** Remember source identity, never a previous scroll position. During a fast
+ * upward step an image can move from above the viewport to between the default
+ * anchor and the text the reader just saw. Keep that surviving text instead.
+ * The three caret probes are bounded regardless of document length. */
+export function rememberWindowedScrollSource(root:HTMLElement,delta:number):void {
+  scrollSources.delete(root);
+  if(!delta||!root.querySelector('[data-windowed-block]'))return;
+  const bounds=root.getBoundingClientRect(),low=Math.max(0,delta),high=Math.min(bounds.height,bounds.height+delta);
+  if(high-low<2)return;
+  const x=bounds.left+bounds.width*.5;
+  for(const fraction of [.5,.25,.75]){
+    const range=(document as Document&{caretRangeFromPoint?:(x:number,y:number)=>Range|null}).caretRangeFromPoint?.(x,bounds.top+low+(high-low)*fraction)?.cloneRange();
+    if(!range||range.startContainer.nodeType!==Node.TEXT_NODE||!root.contains(range.startContainer))continue;
+    if(range.startContainer.parentElement?.closest('.image-loading,.note-image'))continue;
+    if(range.startOffset>=(range.startContainer.textContent?.length??0))continue;
+    range.setEnd(range.startContainer,range.startOffset+1);
+    if(!range.getBoundingClientRect().height)continue;
+    scrollSources.set(root,{range,node:range.startContainer,offset:range.startOffset,input:scrollInputVersion()});return;
+  }
+}
+function currentScrollSource(root:HTMLElement):ScrollSource|undefined {
+  const source=scrollSources.get(root);
+  if(!source)return;
+  if(!scrollSourceAlive(root,source)){scrollSources.delete(root);return;}
+  const rect=source.range.getBoundingClientRect(),bounds=root.getBoundingClientRect();
+  if(rect.height&&rect.bottom>bounds.top&&rect.top<bounds.bottom)return source;
+}
+function scrollSourceAlive(root:HTMLElement,source:ScrollSource):boolean {
+  return source.input===scrollInputVersion()&&source.node.isConnected&&root.contains(source.node)&&source.range.startContainer===source.node&&source.range.startOffset===source.offset;
+}
 /** Mount/unmount one observer batch before paint. A deferred RAF correction
  * loses the anchor when another wheel/momentum step arrives before React
  * commits. Keep the latest viewport, change only layout, and restore its source
@@ -17,6 +50,11 @@ export function commitWindowedLayout(root:Element|Document|null,update:()=>void)
 }
 /** Synchronous layout transaction only; never retain this across input frames. */
 export function captureWindowedScrollAnchor(root:HTMLElement,changing?:HTMLElement):()=>void {
+  const source=!root.dataset.navigating?currentScrollSource(root):undefined;
+  if(source){
+    const top=source.range.getBoundingClientRect().top;
+    return()=>{if(root.isConnected&&!root.dataset.navigating&&scrollSourceAlive(root,source))root.scrollTop+=source.range.getBoundingClientRect().top-top;};
+  }
   const anchor=!root.dataset.navigating?windowedViewportAnchor(root,changing):undefined;
   const top=anchor?.getBoundingClientRect().top;
   return()=>{if(root.isConnected&&!root.dataset.navigating&&anchor?.isConnected&&root.contains(anchor)&&top!==undefined)root.scrollTop+=anchor.getBoundingClientRect().top-top;};

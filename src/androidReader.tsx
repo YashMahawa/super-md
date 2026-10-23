@@ -23,6 +23,7 @@ import { prepareFmd } from "./documentMedia";
 import ImageViewer from "./components/ImageViewer";
 import MathRepairPanel from "./components/MathRepairPanel";
 import { captureScrollAnchor,markScrollInput,scrollInputVersion } from "./scrollAnchor";
+import {rememberWindowedScrollSource} from './windowedSearch';
 import ReadingSearch from "./components/ReadingSearch";
 import type { Point } from "./focalZoom";
 import { applyDocumentZoom,documentPoint,invalidateDocumentZoom,settleDocumentZoom,refreshDocumentExtent,enforceDocumentCenter } from "./documentZoom";
@@ -220,7 +221,7 @@ function Reader() {
       if(held){if(canvas?.matches("svg"))canvas.dispatchEvent(new WheelEvent("wheel",{bubbles:true,cancelable:true,ctrlKey:true,deltaY:dy,clientX:point.x,clientY:point.y}));else window.supermdZoomBy?.(Math.exp(-dy*.002),point);return;}
       if(canvas){canvas.dispatchEvent(new CustomEvent("supermd-canvas-pan",{detail:{dx,dy},cancelable:true}));return;}
       const scroller=target?.closest<HTMLElement>(".android-reading,.cm-scroller,.image-viewer-canvas,.math-repair-list,.media-dialog") || document.querySelector<HTMLElement>('.android-reading');
-      if(scroller?.matches('.android-reading')){cancelHeadingNavigation(scroller);if(Math.abs(dy)>2)requestChrome('hide');}
+      if(scroller?.matches('.android-reading')){cancelHeadingNavigation(scroller);rememberWindowedScrollSource(scroller,dy);if(Math.abs(dy)>2)requestChrome('hide');}
       scroller?.scrollBy({left:scroller.matches('.android-reading')&&reference.current?.centerLock?0:dx,top:dy,behavior:"instant"});
     };
     window.supermdFlush = operation => {
@@ -351,6 +352,9 @@ function Reader() {
     if(Math.abs(Number(page?.dataset.scale)*100-zoomReference.current)<.01 && !refreshDocumentExtent(root)){invalidateDocumentZoom(root);applyZoomStyle();settleSelection();}
   });});observer.observe(root);if(page)observer.observe(page);return()=>{observer.disconnect();cancelAnimationFrame(frame);};},[state?.id,state?.mode]);
   useLayoutEffect(()=>{if(state){applyZoomStyle();settleSelection();}},[state?.centerLock]);
+  // A Range must not retain a detached previous note after a tab switch or
+  // source replacement, including edits made directly inside this reader.
+  useLayoutEffect(()=>{document.querySelectorAll<HTMLElement>('.android-reading').forEach(root=>rememberWindowedScrollSource(root,0));},[state?.id,state?.content,state?.mode]);
   useEffect(()=>{
     const lock=(event:Event)=>{const root=event.target;if(root instanceof HTMLElement&&root.matches('.android-reading'))enforceDocumentCenter(root);};
     document.addEventListener('scroll',lock,{capture:true,passive:true});
@@ -464,13 +468,14 @@ function Reader() {
         drag={root,point:{x:event.clientX,y:event.clientY},moved:false};root.setPointerCapture(event.pointerId);
       }
     };
-    const pan=(event:PointerEvent)=>{if(!drag)return;const dx=event.clientX-drag.point.x,dy=event.clientY-drag.point.y;if(!drag.moved && Math.hypot(dx,dy)<4)return;drag.moved=true;drag.root.classList.add("is-panning");window.getSelection()?.removeAllRanges();if(!reference.current?.centerLock)drag.root.scrollLeft-=dx;drag.root.scrollTop-=dy;drag.point={x:event.clientX,y:event.clientY};event.preventDefault();};
+    const pan=(event:PointerEvent)=>{if(!drag)return;const dx=event.clientX-drag.point.x,dy=event.clientY-drag.point.y;if(!drag.moved && Math.hypot(dx,dy)<4)return;drag.moved=true;drag.root.classList.add("is-panning");window.getSelection()?.removeAllRanges();rememberWindowedScrollSource(drag.root,-dy);if(!reference.current?.centerLock)drag.root.scrollLeft-=dx;drag.root.scrollTop-=dy;drag.point={x:event.clientX,y:event.clientY};event.preventDefault();};
     const up=()=>{mouseHeld=false;drag?.root.classList.remove("is-panning");drag=null;};
     document.addEventListener("pointermove",track);document.addEventListener("pointerdown",down);document.addEventListener("pointerup",up);window.addEventListener("blur",up);
     document.addEventListener("pointermove",pan);document.addEventListener("pointercancel",up);
     const distance = (touches: TouchList) => Math.hypot(touches[0].clientX - touches[1].clientX, touches[0].clientY - touches[1].clientY);
-    const start = (event: TouchEvent) => { cancelHeadingNavigation((event.target as Element).closest('.android-reading'));if (event.touches.length === 2 && !(event.target as Element).closest("input,textarea,[data-independent-zoom]")) { zoomGestureAt.current=Date.now();window.clearTimeout(zoomTimer.current);cancelAnimationFrame(zoomFrame.current);zoomFrame.current=0;zoomTarget.current=null;window.clearTimeout(settleTimer.current);startDistance = distance(event.touches); startZoom = zoomReference.current; pinching = true;previousFocus={x:(event.touches[0].clientX+event.touches[1].clientX)/2,y:(event.touches[0].clientY+event.touches[1].clientY)/2}; } };
-    const move = (event: TouchEvent) => { if (event.touches.length === 2 && pinching && startDistance > 0) {
+    let touchY:number|undefined;
+    const start = (event: TouchEvent) => { touchY=event.touches.length===1?event.touches[0].clientY:undefined;cancelHeadingNavigation((event.target as Element).closest('.android-reading'));if (event.touches.length === 2 && !(event.target as Element).closest("input,textarea,[data-independent-zoom]")) { zoomGestureAt.current=Date.now();window.clearTimeout(zoomTimer.current);cancelAnimationFrame(zoomFrame.current);zoomFrame.current=0;zoomTarget.current=null;window.clearTimeout(settleTimer.current);startDistance = distance(event.touches); startZoom = zoomReference.current; pinching = true;previousFocus={x:(event.touches[0].clientX+event.touches[1].clientX)/2,y:(event.touches[0].clientY+event.touches[1].clientY)/2}; } };
+    const move = (event: TouchEvent) => { if(event.touches.length===1){const target=event.target as Element,root=target.closest<HTMLElement>('.android-reading');if(root&&touchY!==undefined&&!target.closest('textarea,input,[data-independent-zoom]'))rememberWindowedScrollSource(root,touchY-event.touches[0].clientY);touchY=event.touches[0].clientY;}else touchY=undefined;if (event.touches.length === 2 && pinching && startDistance > 0) {
       event.preventDefault(); zoomTarget.current = null; zoomReference.current = clampPreviewZoom(startZoom * distance(event.touches) / startDistance);
       focus={x:(event.touches[0].clientX+event.touches[1].clientX)/2,y:(event.touches[0].clientY+event.touches[1].clientY)/2};
       // Coalesce input to one visual update per frame. Parsing Markdown and
@@ -482,10 +487,20 @@ function Reader() {
     const wheel = (event:WheelEvent) => {
       const target=event.target as Element,root=target.closest('.android-reading');cancelHeadingNavigation(root);
       if ((event.ctrlKey || event.metaKey || mouseHeld || event.buttons&1) && !target.closest("textarea,input,[data-independent-zoom]")) { event.preventDefault(); window.supermdZoomBy?.(Math.exp(-event.deltaY*.002),{x:event.clientX,y:event.clientY}); }
-      else if(root&&!event.ctrlKey&&!event.metaKey&&!mouseHeld&&!(event.buttons&1)&&!target.closest('textarea,input,.interactive-chart,.note-image,[data-independent-zoom]')&&Math.abs(event.deltaY)>2)requestChrome('hide');
+      else if(root instanceof HTMLElement&&!event.ctrlKey&&!event.metaKey&&!mouseHeld&&!(event.buttons&1)&&!target.closest('textarea,input,.interactive-chart,.note-image,[data-independent-zoom]')){rememberWindowedScrollSource(root,event.deltaY*(event.deltaMode===1?16:event.deltaMode===2?root.clientHeight:1));if(Math.abs(event.deltaY)>2)requestChrome('hide');}
+    };
+    const scrollKey=(event:KeyboardEvent)=>{
+      const target=event.target as Element;
+      if(event.defaultPrevented||event.ctrlKey||event.metaKey||event.altKey||target.closest('input,textarea,button,summary,[contenteditable="true"],.image-viewer,.media-dialog,.reading-search'))return;
+      const root=target.closest<HTMLElement>('.android-reading')||(target===document.body?document.querySelector<HTMLElement>('.android-reading'):null);
+      if(!root)return;
+      const page=root.clientHeight*.875;
+      const delta=event.key==='ArrowUp'?-40:event.key==='ArrowDown'?40:event.key==='PageUp'?-page:event.key==='PageDown'?page:event.key===' '?(event.shiftKey?-page:page):0;
+      if(delta)rememberWindowedScrollSource(root,delta);
     };
     document.addEventListener("wheel",wheel,{passive:false});
-    return () => { document.removeEventListener("pointermove",pan);document.removeEventListener("pointercancel",up);document.removeEventListener("pointermove",track);document.removeEventListener("pointerdown",down);document.removeEventListener("pointerup",up);window.removeEventListener("blur",up);cancelAnimationFrame(frame); document.removeEventListener("wheel",wheel); document.removeEventListener("touchstart", start); document.removeEventListener("touchmove", move); document.removeEventListener("touchend", end); document.removeEventListener("touchcancel", end); };
+    document.addEventListener('keydown',scrollKey);
+    return () => { document.removeEventListener('keydown',scrollKey);document.removeEventListener("pointermove",pan);document.removeEventListener("pointercancel",up);document.removeEventListener("pointermove",track);document.removeEventListener("pointerdown",down);document.removeEventListener("pointerup",up);window.removeEventListener("blur",up);cancelAnimationFrame(frame); document.removeEventListener("wheel",wheel); document.removeEventListener("touchstart", start); document.removeEventListener("touchmove", move); document.removeEventListener("touchend", end); document.removeEventListener("touchcancel", end); };
   }, []);
   const update = useCallback((content: string,changes?:SourceChange[]) => {
     const previous=reference.current!;

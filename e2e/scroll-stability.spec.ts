@@ -33,7 +33,7 @@ for(const {platform,zoom,cold} of scrollCases){
     await page.evaluate(()=>window.supermdHeading?.('section-174'));
     await expect(page.locator('.android-reading')).not.toHaveAttribute('data-navigating','true');
     const result=await page.evaluate(async()=>{
-      const root=document.querySelector<HTMLElement>('.android-reading')!,drifts:number[]=[];
+      const root=document.querySelector<HTMLElement>('.android-reading')!,drifts:number[]=[],anomalies:unknown[]=[];
       for(let cycle=0;cycle<4;cycle++)for(let step=0;step<28;step++){
         const delta=step<14?-520:520,bounds=root.getBoundingClientRect(),point={x:bounds.left+bounds.width*.5,y:bounds.top+bounds.height*.5};
         // Track text expected to remain visible AFTER this input, not an old
@@ -43,13 +43,15 @@ for(const {platform,zoom,cold} of scrollCases){
         if(range?.startContainer.nodeType===Node.TEXT_NODE&&range.startOffset<(range.startContainer.textContent?.length??0))range.setEnd(range.startContainer,range.startOffset+1);
         const sourceNode=range?.startContainer,sourceOffset=range?.startOffset;
         const before=range?.getBoundingClientRect();
+        const scrollBefore=root.scrollTop,block=sourceNode?.parentElement?.closest('[data-windowed-block]');
+        const imageBefore=root.querySelector('.note-image,.image-loading')?.getBoundingClientRect().toJSON();
         window.supermdNativeWheel?.(0,delta,point,false);
         await new Promise(requestAnimationFrame);
         // A removed text node retargets its live Range to a parent. Measuring
         // that parent's rectangle is not measuring the original source line.
-        if(before?.height&&sourceNode?.nodeType===Node.TEXT_NODE&&sourceNode.isConnected&&range?.startContainer===sourceNode&&range.startOffset===sourceOffset){const after=range.getBoundingClientRect();if(after.height)drifts.push(after.top-before.top+delta);}
+        if(before?.height&&sourceNode?.nodeType===Node.TEXT_NODE&&sourceNode.isConnected&&range?.startContainer===sourceNode&&range.startOffset===sourceOffset){const after=range.getBoundingClientRect();if(after.height){const drift=after.top-before.top+delta;drifts.push(drift);if(Math.abs(drift)>3)anomalies.push({cycle,step,delta,drift,scrollBefore,scrollAfter:root.scrollTop,before:before.toJSON(),after:after.toJSON(),text:sourceNode.textContent,block:block?.textContent?.slice(0,100),imageBefore,imageAfter:root.querySelector('.note-image,.image-loading')?.getBoundingClientRect().toJSON()});}}
       }
-      return {drifts,mounted:root.querySelectorAll('[data-windowed-mounted="true"]').length,total:root.querySelectorAll('[data-windowed-block]').length};
+      return {drifts,anomalies,mounted:root.querySelectorAll('[data-windowed-mounted="true"]').length,total:root.querySelectorAll('[data-windowed-block]').length};
     });
     await test.info().attach('fast-scroll-source-drift',{body:JSON.stringify(result,null,2),contentType:'application/json'});
     expect(result.drifts.length).toBeGreaterThan(50);
@@ -58,6 +60,34 @@ for(const {platform,zoom,cold} of scrollCases){
     expect(result.mounted).toBeLessThan(result.total/3);
   });
 }
+
+for(const input of ['native','browser'] as const)test(`cold image growth preserves carried source text after a fast ${input} wheel step`,async({page})=>{
+  await page.setViewportSize({width:1280,height:800});
+  await page.addInitScript(image=>{
+    const waiting:Array<()=>void>=[];
+    (window as any).releaseFixtureImage=()=>waiting.splice(0).forEach(reply=>reply());
+    window.SuperMD={post:(id,command)=>{
+      if(command==='load_asset')waiting.push(()=>window.supermdReply?.(id,image,null));
+      else queueMicrotask(()=>window.supermdReply?.(id,null,null));
+    }};
+  },scrollImage);
+  await page.goto('/android-reader.html');await page.waitForFunction(()=>!!window.supermdLoad);
+  await page.evaluate(content=>window.supermdLoad?.({id:'controlled-cold-scroll',content,path:'/fixture/scroll.md',mode:'reader',dark:true,colors:{},font:'Manrope',size:16,zoom:180,restorePosition:false}),scrollContent);
+  await page.evaluate(()=>document.fonts.ready);
+  await page.evaluate(()=>window.supermdHeading?.('section-172'));
+  await expect(page.locator('.android-reading')).not.toHaveAttribute('data-navigating','true');
+  await expect(page.locator('.image-loading')).toBeAttached();
+  const source=page.locator('#section-172');
+  await source.evaluate(node=>{const root=node.closest<HTMLElement>('.android-reading')!;root.scrollTop+=node.getBoundingClientRect().top-root.getBoundingClientRect().top-100;});
+  const before=await source.evaluate(node=>node.getBoundingClientRect().top);
+  if(input==='native')await page.evaluate(()=>window.supermdNativeWheel?.(0,-520,{x:640,y:400},false));
+  else {await page.mouse.move(640,400);await page.mouse.wheel(0,-520);}
+  await expect.poll(()=>source.evaluate(node=>node.getBoundingClientRect().top)).toBeCloseTo(before+520,0);
+  const carried=await source.evaluate(node=>node.getBoundingClientRect().top);
+  await page.evaluate(()=>(window as any).releaseFixtureImage());
+  await expect.poll(()=>page.locator('.note-image img').evaluateAll(images=>images.some(image=>image.getBoundingClientRect().height>100))).toBe(true);
+  expect(Math.abs(await source.evaluate(node=>node.getBoundingClientRect().top)-carried)).toBeLessThan(3);
+});
 
 test('a failed remounted image releases its reserved footprint without leaving a stale gap',async({page})=>{
   await mockScrollAssets(page);await page.goto('/android-reader.html');await page.waitForFunction(()=>!!window.supermdLoad);
