@@ -1,6 +1,7 @@
 import {useEffect,useLayoutEffect,useRef,useState,useSyncExternalStore,type ReactNode,type HTMLAttributes} from "react";
 import {registerWindowedText,preserveWindowedScroll,commitWindowedLayout} from "../windowedSearch";
 import {observeSharedIntersection} from "../sharedIntersectionObserver";
+import {flushSync} from 'react-dom';
 const subscribe=()=>()=>{};
 export function useWindowing():boolean {
   // Server rendering (PDF preparation/tests) always receives the complete tree,
@@ -10,11 +11,12 @@ export function useWindowing():boolean {
 export interface WindowHeading {id:string;key:string}
 export default function WindowedBlock({enabled,estimate=120,text="",headings=[],children,...props}:{enabled:boolean;estimate?:number;text?:string;headings?:WindowHeading[];children:ReactNode}&HTMLAttributes<HTMLElement>) {
   const supported=useWindowing(),active=enabled&&supported;
-  const [shown,setShown]=useState(!active),height=useRef(estimate),element=useRef<HTMLElement>(null);
+  const [shown,setShown]=useState(!active),[reserved,setReserved]=useState(false),height=useRef(estimate),measuredBefore=useRef(false),element=useRef<HTMLElement>(null);
   useEffect(()=>{
     const node=element.current;if(!node||!active)return;
     const unregister=registerWindowedText(node,text);
-    const reveal=()=>{preserveWindowedScroll(node);setShown(true);};node.addEventListener('supermd-reveal-window',reveal);node.addEventListener('focusin',reveal);
+    const show=()=>{if(node.dataset.windowedMounted!=='true')setReserved(measuredBefore.current);setShown(true);};
+    const reveal=()=>{preserveWindowedScroll(node);show();};node.addEventListener('supermd-reveal-window',reveal);node.addEventListener('focusin',reveal);
     let near=false;
     const release=(preserve=true)=>{if(!near&&!node.contains(document.activeElement)&&!window.getSelection()?.containsNode(node,true)&&!node.querySelector('[data-output-pinned="true"]')){
       // ResizeObserver may not have delivered the last expanded size yet.
@@ -22,7 +24,7 @@ export default function WindowedBlock({enabled,estimate=120,text="",headings=[],
       if(node.dataset.windowedMounted==='true'){
         const scale=Number(node.closest<HTMLElement>('.document-page')?.dataset.scale)||1;
         const measured=node.getBoundingClientRect().height/scale;
-        if(measured>0)height.current=measured;
+        if(measured>0){height.current=measured;measuredBefore.current=true;}
       }
       if(preserve)preserveWindowedScroll(node);setShown(false);
     }};
@@ -32,11 +34,21 @@ export default function WindowedBlock({enabled,estimate=120,text="",headings=[],
     const outputStored=()=>release();node.addEventListener('supermd-output-stored',outputStored);
     const unobserve=observeSharedIntersection(node,entry=>{
       near=entry.isIntersecting;
-      if(entry.isIntersecting)setShown(true);
+      if(entry.isIntersecting)show();
       else release(false);
     },{root:node.closest('.android-reading'),rootMargin:'900px 0px'},commitWindowedLayout);
     return()=>{window.clearTimeout(focusReleaseTimer);unobserve();unregister();node.removeEventListener('supermd-reveal-window',reveal);node.removeEventListener('focusin',reveal);node.removeEventListener('focusout',focusout);node.removeEventListener('supermd-output-stored',outputStored);};
   },[active,text]);
+  useLayoutEffect(()=>{
+    const node=element.current;if(!node||!shown||!reserved)return;
+    if(!node.querySelector('.image-loading')){setReserved(false);return;}
+    // Keep the known footprint while an offscreen image/diagram is resolved
+    // again. Otherwise every remount collapses to a tiny loading label before
+    // expanding back, even though its final dimensions have not changed.
+    const ready=()=>{if(!node.querySelector('.image-loading'))flushSync(()=>setReserved(false));};
+    node.addEventListener('supermd-media-layout',ready);
+    return()=>node.removeEventListener('supermd-media-layout',ready);
+  },[shown,reserved]);
   useLayoutEffect(()=>{
     const node=element.current;if(!node||!active||!shown)return;
     const observer=new ResizeObserver(entries=>{const measured=entries[0].borderBoxSize?.[0]?.blockSize??entries[0].contentRect.height;if(measured>0)height.current=measured;});observer.observe(node);
@@ -46,7 +58,7 @@ export default function WindowedBlock({enabled,estimate=120,text="",headings=[],
     return()=>observer.disconnect();
   },[active,shown,headings]);
   if(!active)return <section {...props}>{children}</section>;
-  return <section {...props} ref={element} className={`windowed-md-block ${props.className||""}`} data-windowed-block data-windowed-mounted={shown} style={{...props.style,...(!shown?{height:height.current}:{} )}}>
+  return <section {...props} ref={element} className={`windowed-md-block ${props.className||""}`} data-windowed-block data-windowed-mounted={shown} style={{...props.style,...(!shown?{height:height.current}:reserved?{minHeight:height.current}:{} )}}>
     {shown?children:headings.map(heading=><span key={heading.id} id={heading.id} data-heading-key={heading.key} aria-hidden="true"/>)}
   </section>;
 }

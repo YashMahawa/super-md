@@ -110,6 +110,7 @@ function AssetImage({ src = "", alt = "", documentPath, trustedImageHosts, onTru
   const allowed = allowedOnceSource === src || trustedImageHosts.includes(host);
   useEffect(() => {
     let active = true;
+    const fail=(reason:string)=>{if(active)commitMediaLayout(mediaElement.current,()=>setError(reason));};
     setError("");
     if (embedded) { setResolved(src); return; }
     setResolved("");
@@ -119,10 +120,10 @@ function AssetImage({ src = "", alt = "", documentPath, trustedImageHosts, onTru
       // remote request from a local WebEngine page. This also works offline after insertion.
       invoke<{body:string}>("fetch_resource",{url:src,image:true})
         .then(value=>{if(active)commitMediaLayout(mediaElement.current,()=>setResolved(value.body));})
-        .catch(reason=>{if(active) setError(String(reason));});
+        .catch(reason=>fail(String(reason)));
       return ()=>{active=false;};
     }
-    if (!documentPath && !/^assets\/import-[\w-]+\./.test(src)) { setError("Save this document to resolve relative images."); return; }
+    if (!documentPath && !/^assets\/import-[\w-]+\./.test(src)) { queueMicrotask(()=>fail("Save this document to resolve relative images.")); return ()=>{active=false;}; }
     (async () => {
       try {
         const streamed = documentPath ? await resolveReaderRasterAsset(documentPath, src) : null;
@@ -131,7 +132,7 @@ function AssetImage({ src = "", alt = "", documentPath, trustedImageHosts, onTru
         const value = await invoke<string>("load_asset", { documentPath: documentPath || "", source: src });
         if (active)commitMediaLayout(mediaElement.current,()=>setResolved(value));
       } catch (reason) {
-        if (active) setError(String(reason));
+        fail(String(reason));
       }
     })();
     return () => { active = false; };

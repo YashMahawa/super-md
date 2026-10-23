@@ -1,9 +1,10 @@
 // @vitest-environment jsdom
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { act } from "react";
+import { act,useRef,useState } from "react";
 import { createRoot, type Root } from "react-dom/client";
 import WindowedBlock from "./WindowedBlock";
 import { cancelHeadingNavigation, navigateToHeading } from "../documentNavigation";
+import {commitMediaLayout} from '../mediaLayout';
 
 class FakeIntersectionObserver {
   static instances: FakeIntersectionObserver[] = [];
@@ -31,6 +32,24 @@ afterEach(() => {
 });
 
 describe("windowed block focus reveal", () => {
+  it('reserves the known footprint on media remount until the final loading indicator is gone',async()=>{
+    vi.stubGlobal('IntersectionObserver',FakeIntersectionObserver);vi.stubGlobal('ResizeObserver',FakeResizeObserver);
+    let finish:()=>void=()=>{};
+    function PendingMedia(){
+      const [count,setCount]=useState(0),ref=useRef<HTMLDivElement>(null);
+      finish=()=>commitMediaLayout(ref.current,()=>setCount(value=>value+1));
+      return <div ref={ref}>{count<1&&<span className="image-loading">First image</span>}{count<2&&<span className="image-loading">Second image</span>}</div>;
+    }
+    const host=document.createElement('div');document.body.append(host);root=createRoot(host);
+    await act(async()=>root?.render(<div className="android-reading"><WindowedBlock enabled><PendingMedia/></WindowedBlock></div>));
+    const block=host.querySelector<HTMLElement>('[data-windowed-block]')!,observer=FakeIntersectionObserver.instances[0];
+    await act(async()=>observer.emit(block,true));await act(async()=>finish());await act(async()=>finish());
+    vi.spyOn(block,'getBoundingClientRect').mockReturnValue({height:415.25} as DOMRect);
+    await act(async()=>observer.emit(block,false));await act(async()=>observer.emit(block,true));
+    expect(block.style.minHeight).toBe('415.25px');expect(block.querySelectorAll('.image-loading')).toHaveLength(2);
+    await act(async()=>finish());expect(block.style.minHeight).toBe('415.25px');
+    await act(async()=>finish());expect(block.style.minHeight).toBe('');expect(block.querySelector('.image-loading')).toBeNull();
+  });
   it('retains the final height when leaving before a ResizeObserver measurement arrives',async()=>{
     vi.stubGlobal('IntersectionObserver',FakeIntersectionObserver);vi.stubGlobal('ResizeObserver',FakeResizeObserver);
     const host=document.createElement('div');document.body.append(host);root=createRoot(host);
