@@ -1,4 +1,16 @@
-# Super MD 0.6.8
+# Super MD 0.6.9
+
+## Fast scrolling without lazy-layout jumps
+
+- Fixed a second scroll-jump cause in large notes: fast upward wheel/touchpad scrolling could race with lazy block mounting and return the visible text to a later section. Shared reader observer deliveries now commit as one anchored batch before paint, preserving the current source location rather than replaying an earlier scroll position.
+- Placeholder expansion anchors an already-rendered neighbouring block instead of the placeholder itself. Paragraph margins use bounded viewport sampling, not a scan through the whole note.
+- Offscreen blocks retain their latest fractional height before their rendered children are removed. This avoids both stale ResizeObserver measurements and rounding drift at magnified zoom.
+- Offscreen unmounting, bounded rendered math, heading navigation, selection, source editing and zoom remain supported. The fix does not keep the entire note rendered or change the Markdown source.
+- Added fast alternating-scroll regressions for desktop and Android layouts at 100% and 180% zoom. The regression reproduces hundreds of pixels of unwanted movement on 0.6.8; the new code is checked against a 3-pixel source-anchor limit. The separate delayed-image regression is retained.
+
+The existing Android signing identity and all 0.6.8 fixes are retained. Cross-platform CI and packaged-installer checks remain release gates.
+
+## Retained improvements from 0.6.8
 
 ## Stable reading and expressive export
 

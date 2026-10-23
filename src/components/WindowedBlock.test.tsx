@@ -31,6 +31,16 @@ afterEach(() => {
 });
 
 describe("windowed block focus reveal", () => {
+  it('retains the final height when leaving before a ResizeObserver measurement arrives',async()=>{
+    vi.stubGlobal('IntersectionObserver',FakeIntersectionObserver);vi.stubGlobal('ResizeObserver',FakeResizeObserver);
+    const host=document.createElement('div');document.body.append(host);root=createRoot(host);
+    await act(async()=>root?.render(<div className="android-reading"><WindowedBlock enabled estimate={80}><p>Measured lazily</p></WindowedBlock></div>));
+    const block=host.querySelector<HTMLElement>('[data-windowed-block]')!;
+    await act(async()=>FakeIntersectionObserver.instances[0].emit(block,true));
+    vi.spyOn(block,'getBoundingClientRect').mockReturnValue({height:227.375} as DOMRect);
+    await act(async()=>FakeIntersectionObserver.instances[0].emit(block,false));
+    expect(block.querySelector('p')).toBeNull();expect(block.style.height).toBe('227.375px');
+  });
   it("mounts content on keyboard focus and keeps a focused block mounted outside the viewport", async () => {
     vi.stubGlobal("IntersectionObserver", FakeIntersectionObserver);
     vi.stubGlobal("ResizeObserver", FakeResizeObserver);

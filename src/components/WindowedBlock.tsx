@@ -1,5 +1,5 @@
 import {useEffect,useLayoutEffect,useRef,useState,useSyncExternalStore,type ReactNode,type HTMLAttributes} from "react";
-import {registerWindowedText,preserveWindowedScroll} from "../windowedSearch";
+import {registerWindowedText,preserveWindowedScroll,commitWindowedLayout} from "../windowedSearch";
 import {observeSharedIntersection} from "../sharedIntersectionObserver";
 const subscribe=()=>()=>{};
 export function useWindowing():boolean {
@@ -16,17 +16,26 @@ export default function WindowedBlock({enabled,estimate=120,text="",headings=[],
     const unregister=registerWindowedText(node,text);
     const reveal=()=>{preserveWindowedScroll(node);setShown(true);};node.addEventListener('supermd-reveal-window',reveal);node.addEventListener('focusin',reveal);
     let near=false;
-    const release=()=>{if(!near&&!node.contains(document.activeElement)&&!window.getSelection()?.containsNode(node,true)&&!node.querySelector('[data-output-pinned="true"]')){preserveWindowedScroll(node);setShown(false);}};
+    const release=(preserve=true)=>{if(!near&&!node.contains(document.activeElement)&&!window.getSelection()?.containsNode(node,true)&&!node.querySelector('[data-output-pinned="true"]')){
+      // ResizeObserver may not have delivered the last expanded size yet.
+      // Cache layout units before removing children, including at CSS zoom.
+      if(node.dataset.windowedMounted==='true'){
+        const scale=Number(node.closest<HTMLElement>('.document-page')?.dataset.scale)||1;
+        const measured=node.getBoundingClientRect().height/scale;
+        if(measured>0)height.current=measured;
+      }
+      if(preserve)preserveWindowedScroll(node);setShown(false);
+    }};
     let focusReleaseTimer=0;
     const focusout=(event:FocusEvent)=>{if(event.relatedTarget instanceof Node&&node.contains(event.relatedTarget))return;window.clearTimeout(focusReleaseTimer);focusReleaseTimer=window.setTimeout(release,0);};
     node.addEventListener('focusout',focusout);
-    node.addEventListener('supermd-output-stored',release);
+    const outputStored=()=>release();node.addEventListener('supermd-output-stored',outputStored);
     const unobserve=observeSharedIntersection(node,entry=>{
       near=entry.isIntersecting;
-      if(entry.isIntersecting){preserveWindowedScroll(node);setShown(true);}
-      else release();
-    },{root:node.closest('.android-reading'),rootMargin:'900px 0px'});
-    return()=>{window.clearTimeout(focusReleaseTimer);unobserve();unregister();node.removeEventListener('supermd-reveal-window',reveal);node.removeEventListener('focusin',reveal);node.removeEventListener('focusout',focusout);node.removeEventListener('supermd-output-stored',release);};
+      if(entry.isIntersecting)setShown(true);
+      else release(false);
+    },{root:node.closest('.android-reading'),rootMargin:'900px 0px'},commitWindowedLayout);
+    return()=>{window.clearTimeout(focusReleaseTimer);unobserve();unregister();node.removeEventListener('supermd-reveal-window',reveal);node.removeEventListener('focusin',reveal);node.removeEventListener('focusout',focusout);node.removeEventListener('supermd-output-stored',outputStored);};
   },[active,text]);
   useLayoutEffect(()=>{
     const node=element.current;if(!node||!active||!shown)return;

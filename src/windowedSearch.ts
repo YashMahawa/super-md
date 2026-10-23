@@ -1,7 +1,47 @@
 /** Lightweight text indexes stay available when expensive rendered blocks leave
  * the viewport. The registry is released with each document, never persisted. */
+import {flushSync} from 'react-dom';
+import {refreshDocumentExtent} from './documentZoom';
 const blocks=new Map<HTMLElement,string>();
 const pendingAnchors=new WeakSet<HTMLElement>();
+/** Mount/unmount one observer batch before paint. A deferred RAF correction
+ * loses the anchor when another wheel/momentum step arrives before React
+ * commits. Keep the latest viewport, change only layout, and restore its source
+ * synchronously; never replay an earlier scrollTop or scroll gesture. */
+export function commitWindowedLayout(root:Element|Document|null,update:()=>void):void {
+  const host=root instanceof HTMLElement?root:null;
+  const anchor=host&&!host.dataset.navigating?windowedViewportAnchor(host):undefined;
+  const top=anchor?.getBoundingClientRect().top;
+  flushSync(update);
+  if(host)refreshDocumentExtent(host);
+  if(host?.isConnected&&!host.dataset.navigating&&anchor?.isConnected&&host.contains(anchor)&&top!==undefined)host.scrollTop+=anchor.getBoundingClientRect().top-top;
+}
+function windowedViewportAnchor(root:HTMLElement):HTMLElement|undefined {
+  if(root.scrollTop<1)return;
+  const bounds=root.getBoundingClientRect(),x=bounds.left+bounds.width*.5;
+  let hit:HTMLElement|undefined;
+  // The preferred line can be in a paragraph margin. Try a bounded handful of
+  // viewport points, not a scan through thousands of offscreen wrappers.
+  for(const y of [Math.min(160,bounds.height*.35),bounds.height*.1,bounds.height*.6,bounds.height*.85]){
+    const candidate=document.elementFromPoint(x,bounds.top+y)?.closest<HTMLElement>('[data-windowed-block]');
+    if(candidate&&root.contains(candidate)){
+      if(candidate.dataset.windowedMounted==='true')return candidate;
+      hit??=candidate;
+    }
+  }
+  if(hit&&root.contains(hit)){
+    // Fast scrolling can put the sample point on an estimated placeholder.
+    // Its own top cannot anchor the real content below it as it expands.
+    // Prefer a nearby, already-mounted block; never search the whole note.
+    let next=hit.nextElementSibling,previous=hit.previousElementSibling;
+    for(let i=0;i<64;i++){
+      if(next instanceof HTMLElement&&next.dataset.windowedMounted==='true')return next;
+      if(previous instanceof HTMLElement&&previous.dataset.windowedMounted==='true')return previous;
+      next=next?.nextElementSibling??null;previous=previous?.previousElementSibling??null;
+      if(!next&&!previous)break;
+    }
+  }
+}
 /** Preserve one viewport anchor for a batch of lazy mount/unmount changes. */
 export function preserveWindowedScroll(element:HTMLElement):void {
   const root=element.closest<HTMLElement>('.android-reading');if(!root||root.dataset.navigating||pendingAnchors.has(root)||root.scrollTop<1)return;

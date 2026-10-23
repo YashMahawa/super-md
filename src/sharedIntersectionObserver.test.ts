@@ -21,6 +21,19 @@ class FakeIntersectionObserver {
 afterEach(() => { vi.unstubAllGlobals(); FakeIntersectionObserver.instances = []; });
 
 describe("shared intersection observers", () => {
+  it("commits a delivery once and isolates transactional subscribers from ordinary observers",()=>{
+    vi.stubGlobal("IntersectionObserver",FakeIntersectionObserver);
+    const root=document.createElement('main'),first=document.createElement('section'),second=document.createElement('section');
+    const order:string[]=[];
+    const commit=vi.fn((host:Element|Document|null,update:()=>void)=>{expect(host).toBe(root);order.push('before');update();order.push('after');});
+    const stops=[observeSharedIntersection(first,()=>order.push('first'),{root},commit),observeSharedIntersection(second,()=>order.push('second'),{root},commit),observeSharedIntersection(document.createElement('section'),vi.fn(),{root})];
+    expect(FakeIntersectionObserver.instances).toHaveLength(2);
+    const observer=FakeIntersectionObserver.instances[0];
+    const entries=[first,second].map((target,i)=>({target,isIntersecting:i===0,intersectionRatio:i===0?1:0,time:0,boundingClientRect:target.getBoundingClientRect(),intersectionRect:target.getBoundingClientRect(),rootBounds:root.getBoundingClientRect()}));
+    observer.callback(entries,observer as unknown as IntersectionObserver);
+    expect(commit).toHaveBeenCalledTimes(1);expect(order).toEqual(['before','first','second','after']);
+    stops.forEach(stop=>stop());expect(observer.disconnected).toBe(true);
+  });
   it("shares by root and options and releases callbacks and observer ownership", () => {
     vi.stubGlobal("IntersectionObserver", FakeIntersectionObserver);
     const root = document.createElement("main");

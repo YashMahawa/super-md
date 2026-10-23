@@ -1,5 +1,41 @@
 import {test,expect} from '@playwright/test';
 
+for(const platform of ['desktop','android'])for(const zoom of [100,180]){
+  test(`fast upward windowed scrolling preserves visible text on ${platform} at ${zoom}%`,async({page})=>{
+    await page.setViewportSize(platform==='desktop'?{width:1280,height:800}:{width:412,height:850});
+    await page.addInitScript(()=>{window.SuperMD={post:(id,command)=>{if(command==='run_python')throw Error('A scroll test must not execute code');queueMicrotask(()=>window.supermdReply?.(id,null,null));}};});
+    await page.goto('/android-reader.html');await page.waitForFunction(()=>!!window.supermdLoad);
+    const content=Array.from({length:450},(_,i)=>`## Section ${i}\n\n${'A source paragraph explains the difference between differentiating a signal and differentiating its spectrum. '.repeat(3)}\n\n$$x(t)e^{j\\omega_ct}\\leftrightarrow X(j(\\omega-\\omega_c)),\\quad \\frac{dX}{d\\omega}=\\int_{-\\infty}^{\\infty}(-jt)x(t)e^{-j\\omega t}dt.$$`).join('\n\n');
+    await page.evaluate(({content,platform,zoom})=>{
+      document.documentElement.dataset.platform=platform;document.documentElement.dataset.host=platform==='desktop'?'qt':'android';
+      window.supermdLoad?.({id:'fast-windowed-scroll',content,path:null,mode:'reader',dark:true,colors:{},font:'Manrope',size:16,zoom,restorePosition:false});
+    },{content,platform,zoom});
+    await expect(page.locator('[data-windowed-block]').first()).toBeAttached();
+    await page.evaluate(()=>document.fonts.ready);
+    await page.evaluate(()=>window.supermdHeading?.('section-174'));
+    await expect(page.locator('.android-reading')).not.toHaveAttribute('data-navigating','true');
+    const result=await page.evaluate(async()=>{
+      const root=document.querySelector<HTMLElement>('.android-reading')!,drifts:number[]=[];
+      for(let cycle=0;cycle<4;cycle++)for(let step=0;step<28;step++){
+        const delta=step<14?-520:520,bounds=root.getBoundingClientRect(),point={x:bounds.left+bounds.width*.5,y:bounds.top+180};
+        const caret=(document as Document&{caretRangeFromPoint?:(x:number,y:number)=>Range|null}).caretRangeFromPoint?.(point.x,point.y);
+        const range=caret&&root.contains(caret.startContainer)?caret.cloneRange():null;
+        if(range?.startContainer.nodeType===Node.TEXT_NODE&&range.startOffset<(range.startContainer.textContent?.length??0))range.setEnd(range.startContainer,range.startOffset+1);
+        const before=range?.getBoundingClientRect();
+        window.supermdNativeWheel?.(0,delta,point,false);
+        await new Promise(requestAnimationFrame);
+        if(before?.height&&range?.startContainer.isConnected){const after=range.getBoundingClientRect();if(after.height)drifts.push(after.top-before.top+delta);}
+      }
+      return {drifts,mounted:root.querySelectorAll('[data-windowed-mounted="true"]').length,total:root.querySelectorAll('[data-windowed-block]').length};
+    });
+    await test.info().attach('fast-scroll-source-drift',{body:JSON.stringify(result,null,2),contentType:'application/json'});
+    expect(result.drifts.length).toBeGreaterThan(50);
+    expect(Math.max(...result.drifts.map(Math.abs))).toBeLessThan(3);
+    // Fixing the anchor must not disable offscreen unmounting to hide the bug.
+    expect(result.mounted).toBeLessThan(result.total/3);
+  });
+}
+
 test('delayed image sizing does not move the visible source anchor during scrolling',async({page})=>{
   await page.exposeFunction('nativeFetch',async(id:string,command:string)=>{
     if(command==='fetch_resource'){
