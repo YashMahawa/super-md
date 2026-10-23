@@ -1,4 +1,30 @@
-# Super MD 0.6.7
+# Super MD 0.6.8
+
+## Stable reading and expressive export
+
+- Fixed a reproduced scroll jump when an image finishes loading above the text being read. Image, SVG and Mermaid size changes now preserve the visible source anchor without polling or image-sized JavaScript buffers.
+- Newly opened notes start at their own beginning rather than inheriting another tab's scroll position. Returning to an existing tab still restores its reading position.
+- PDF export now shows the house Material 3 Expressive-inspired loading animation alongside useful phase/count information and cancellation. App motion-off and system reduced-motion preferences are respected.
+- Auto image adaptation no longer leaves pale outlines around coloured plots on dark paper. A small hue-preserving luminance matrix improves dark-paper contrast while keeping colours distinct; monochrome remains a separate option. Transparent images retain their source alpha, and SVG adaptation no longer invents extra strokes.
+- Drawing decode failures report an actionable error instead of leaving a loading placeholder indefinitely.
+
+## Safer edits and faithful documents
+
+- Proofreading suggestions are tied to the exact source/options that were checked. Unrelated edits retire stale suggestions, repeated clicks cannot apply a correction twice, and accepted corrections safely remap remaining non-overlapping ranges.
+- LaTeX repair selection resets for a changed document and guards repeated Apply clicks.
+- Nested callouts, rich inline callout titles and code fences inside callouts retain their structure in reading and native PDF export.
+- Native PDF tables preserve left, centre and right column alignment. Ordered-list copying preserves numbering, and expanding Contents no longer resets the outline's scroll position.
+- Searches explicitly indicate the existing 5,000-match display limit rather than presenting the capped list as a complete total.
+
+## Android and export resilience
+
+- Android's JNI PDF loader reads only referenced staged images plus imported fonts, checks per-file and cumulative limits before allocation, and reserves known lengths without repeated buffer growth. Existing supported document/image limits are retained.
+- CLI export and packing support validated inline image data; remote images are never downloaded implicitly. Malformed input and invalid export options preserve an existing destination.
+- Mermaid cache/theme transitions avoid the typing debounce, retain a valid diagram while the replacement is prepared, and recover correctly after an earlier source error.
+
+This patch retains the existing Android upgrade certificate and the previous release's export filename, updater, graphics fallback, recovery and portable-file fixes. Cross-platform CI and release installer checks remain mandatory; no universal speed or RAM-reduction multiplier is claimed.
+
+## Retained improvements from 0.6.7
 
 ## Export, menus, navigation and updates
 
