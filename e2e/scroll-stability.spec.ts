@@ -31,10 +31,13 @@ for(const platform of ['desktop','android'])for(const zoom of [40,100,104,180,30
         const caret=(document as Document&{caretRangeFromPoint?:(x:number,y:number)=>Range|null}).caretRangeFromPoint?.(point.x,delta<0?bounds.top+100:bounds.bottom-100);
         const range=caret&&root.contains(caret.startContainer)?caret.cloneRange():null;
         if(range?.startContainer.nodeType===Node.TEXT_NODE&&range.startOffset<(range.startContainer.textContent?.length??0))range.setEnd(range.startContainer,range.startOffset+1);
+        const sourceNode=range?.startContainer,sourceOffset=range?.startOffset;
         const before=range?.getBoundingClientRect();
         window.supermdNativeWheel?.(0,delta,point,false);
         await new Promise(requestAnimationFrame);
-        if(before?.height&&range?.startContainer.isConnected){const after=range.getBoundingClientRect();if(after.height)drifts.push(after.top-before.top+delta);}
+        // A removed text node retargets its live Range to a parent. Measuring
+        // that parent's rectangle is not measuring the original source line.
+        if(before?.height&&sourceNode?.nodeType===Node.TEXT_NODE&&sourceNode.isConnected&&range?.startContainer===sourceNode&&range.startOffset===sourceOffset){const after=range.getBoundingClientRect();if(after.height)drifts.push(after.top-before.top+delta);}
       }
       return {drifts,mounted:root.querySelectorAll('[data-windowed-mounted="true"]').length,total:root.querySelectorAll('[data-windowed-block]').length};
     });
