@@ -9,8 +9,10 @@ async function mockScrollAssets(page:import('@playwright/test').Page){
     else queueMicrotask(()=>window.supermdReply?.(id,null,null));
   }};},scrollImage);
 }
-for(const platform of ['desktop','android'])for(const zoom of [40,100,104,180,300]){
-  test(`fast upward windowed scrolling preserves visible text on ${platform} at ${zoom}%`,async({page})=>{
+const scrollCases=['desktop','android'].flatMap(platform=>[40,100,104,180,300].map(zoom=>({platform,zoom,cold:false})));
+scrollCases.push(...['desktop','android'].map(platform=>({platform,zoom:180,cold:true})));
+for(const {platform,zoom,cold} of scrollCases){
+  test(`fast upward windowed scrolling preserves visible text on ${platform} at ${zoom}%${cold?' with a cold image':''}`,async({page})=>{
     await page.setViewportSize(platform==='desktop'?{width:1280,height:800}:{width:412,height:850});
     await mockScrollAssets(page);
     await page.goto('/android-reader.html');await page.waitForFunction(()=>!!window.supermdLoad);
@@ -20,6 +22,14 @@ for(const platform of ['desktop','android'])for(const zoom of [40,100,104,180,30
     },{content:scrollContent,platform,zoom});
     await expect(page.locator('[data-windowed-block]').first()).toBeAttached();
     await page.evaluate(()=>document.fonts.ready);
+    // This is a repeated-windowing test: establish the figure's real size
+    // once before cycling past it. A first-ever intrinsic-size discovery
+    // within the viewport legitimately reflows content on either side; the
+    // separate delayed-image test checks first loading ABOVE the viewport.
+    if(!cold){
+      await page.evaluate(()=>window.supermdHeading?.('section-171'));
+      await expect.poll(()=>page.locator('.note-image img').evaluateAll(images=>images.some(image=>(image as HTMLImageElement).complete&&image.getBoundingClientRect().height>100))).toBe(true);
+    }
     await page.evaluate(()=>window.supermdHeading?.('section-174'));
     await expect(page.locator('.android-reading')).not.toHaveAttribute('data-navigating','true');
     const result=await page.evaluate(async()=>{

@@ -1,6 +1,6 @@
 // @vitest-environment jsdom
 import {afterEach,expect,it,vi} from 'vitest';
-import {commitWindowedLayout} from './windowedSearch';
+import {commitWindowedLayout,captureWindowedScrollAnchor} from './windowedSearch';
 afterEach(()=>{document.body.replaceChildren();vi.restoreAllMocks();});
 function fixture(placeholder=false){
   const root=document.createElement('main');root.className='android-reading';root.scrollTop=700;
@@ -10,7 +10,7 @@ function fixture(placeholder=false){
   root.append(before,anchor);document.body.append(root);
   let height=120;
   vi.spyOn(root,'getBoundingClientRect').mockImplementation(()=>({top:0,left:0,width:800,height:600,bottom:600,right:800}) as DOMRect);
-  vi.spyOn(anchor,'getBoundingClientRect').mockImplementation(()=>({top:height+800-root.scrollTop,height:90}) as DOMRect);
+  vi.spyOn(anchor,'getBoundingClientRect').mockImplementation(()=>new DOMRect(0,height+800-root.scrollTop,800,90));
   Object.defineProperty(document,'elementFromPoint',{configurable:true,value:vi.fn(()=>placeholder?before:anchor)});
   return {root,anchor,grow:()=>{height=420;}};
 }
@@ -25,6 +25,12 @@ it('anchors an already-mounted neighbour instead of an expanding placeholder',()
   root.scrollTop+=80;
   commitWindowedLayout(root,grow);
   expect(root.scrollTop).toBe(1080);expect(anchor.getBoundingClientRect().top).toBe(top-80);
+});
+it('a loading block uses visible source after it rather than anchoring its own unchanged top',()=>{
+  const {root,anchor,grow}=fixture(true),loading=anchor.previousElementSibling as HTMLElement;
+  loading.dataset.windowedMounted='true';const top=anchor.getBoundingClientRect().top;
+  const restore=captureWindowedScrollAnchor(root,loading);grow();restore();
+  expect(root.scrollTop).toBe(1000);expect(anchor.getBoundingClientRect().top).toBe(top);
 });
 it('finds a viewport anchor when the preferred point is in a paragraph margin',()=>{
   const {root,anchor,grow}=fixture();

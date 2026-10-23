@@ -7,6 +7,7 @@
 - Offscreen blocks retain their latest fractional height before their rendered children are removed. This avoids both stale ResizeObserver measurements and rounding drift at magnified zoom.
 - Previously measured image/diagram blocks keep their known footprint while remounted media load again, then release it on completion or failure. A failed reload does not leave a permanent empty gap.
 - Scroll anchors now retain the original text-node identity. A browser Range retargeted to a parent after a loading label disappears can no longer generate a false scroll correction.
+- A figure first appearing during scrolling anchors already-visible text after its loading area rather than the placeholder's unchanged top. Separate cold-load and previously-loaded/remounted-image regressions cover both cases.
 - Offscreen unmounting, bounded rendered math, heading navigation, selection, source editing and zoom remain supported. The fix does not keep the entire note rendered or change the Markdown source.
 - Added fast alternating-scroll regressions with remounted media for desktop and Android layouts at 40%, 100%, 104%, 180% and 300% zoom, plus failed-reload and Range-retargeting tests. The original regression reproduces hundreds of pixels of unwanted movement on 0.6.8; the new code is checked against a 3-pixel source-anchor limit. The separate delayed-image regression is retained.
 

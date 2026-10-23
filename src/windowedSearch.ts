@@ -10,13 +10,18 @@ const pendingAnchors=new WeakSet<HTMLElement>();
  * synchronously; never replay an earlier scrollTop or scroll gesture. */
 export function commitWindowedLayout(root:Element|Document|null,update:()=>void):void {
   const host=root instanceof HTMLElement?root:null;
-  const anchor=host&&!host.dataset.navigating?windowedViewportAnchor(host):undefined;
-  const top=anchor?.getBoundingClientRect().top;
+  const restore=host?captureWindowedScrollAnchor(host):undefined;
   flushSync(update);
   if(host)refreshDocumentExtent(host);
-  if(host?.isConnected&&!host.dataset.navigating&&anchor?.isConnected&&host.contains(anchor)&&top!==undefined)host.scrollTop+=anchor.getBoundingClientRect().top-top;
+  restore?.();
 }
-function windowedViewportAnchor(root:HTMLElement):HTMLElement|undefined {
+/** Synchronous layout transaction only; never retain this across input frames. */
+export function captureWindowedScrollAnchor(root:HTMLElement,changing?:HTMLElement):()=>void {
+  const anchor=!root.dataset.navigating?windowedViewportAnchor(root,changing):undefined;
+  const top=anchor?.getBoundingClientRect().top;
+  return()=>{if(root.isConnected&&!root.dataset.navigating&&anchor?.isConnected&&root.contains(anchor)&&top!==undefined)root.scrollTop+=anchor.getBoundingClientRect().top-top;};
+}
+function windowedViewportAnchor(root:HTMLElement,changing?:HTMLElement):HTMLElement|undefined {
   if(root.scrollTop<1)return;
   const bounds=root.getBoundingClientRect(),x=bounds.left+bounds.width*.5;
   let hit:HTMLElement|undefined;
@@ -25,6 +30,20 @@ function windowedViewportAnchor(root:HTMLElement):HTMLElement|undefined {
   for(const y of [Math.min(160,bounds.height*.35),bounds.height*.1,bounds.height*.6,bounds.height*.85]){
     const candidate=document.elementFromPoint(x,bounds.top+y)?.closest<HTMLElement>('[data-windowed-block]');
     if(candidate&&root.contains(candidate)){
+      if(candidate===changing){
+        // A loading label has no stable intrinsic geometry. If it occupies the
+        // sample point, keep the already-visible source immediately after it,
+        // not the top of the placeholder that is about to grow.
+        let next=candidate.nextElementSibling;
+        for(let i=0;next&&i<64;i++,next=next.nextElementSibling){
+          if(next instanceof HTMLElement&&next.dataset.windowedMounted==='true'){
+            const rect=next.getBoundingClientRect();
+            if(rect.top>=bounds.bottom)break;
+            if(rect.bottom>bounds.top)return next;
+          }
+        }
+        continue;
+      }
       if(candidate.dataset.windowedMounted==='true')return candidate;
       hit??=candidate;
     }
@@ -35,8 +54,8 @@ function windowedViewportAnchor(root:HTMLElement):HTMLElement|undefined {
     // Prefer a nearby, already-mounted block; never search the whole note.
     let next=hit.nextElementSibling,previous=hit.previousElementSibling;
     for(let i=0;i<64;i++){
-      if(next instanceof HTMLElement&&next.dataset.windowedMounted==='true')return next;
-      if(previous instanceof HTMLElement&&previous.dataset.windowedMounted==='true')return previous;
+      if(next instanceof HTMLElement&&next!==changing&&next.dataset.windowedMounted==='true')return next;
+      if(previous instanceof HTMLElement&&previous!==changing&&previous.dataset.windowedMounted==='true')return previous;
       next=next?.nextElementSibling??null;previous=previous?.previousElementSibling??null;
       if(!next&&!previous)break;
     }
