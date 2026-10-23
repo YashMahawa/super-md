@@ -193,8 +193,8 @@ export function adaptSvg(source:string,colors:Record<string,string>,dark:boolean
     const c=rgb(paint.fill);
     if(c){
       const intended=label?(monochrome||neutral(c)?ink:paint.fill):paint.newFill;
-      set(node,'fill',label?readable(intended,background,7):intended);
-      if(!label&&box&&!paint.paper&&paint.stroke==='none'&&mediaContrast(hex(rgb(intended)!),background)<1.6){set(node,'stroke',readable(intended,background,3));set(node,'stroke-width','1');}
+      const faintShape=!label&&box&&!paint.paper&&paint.stroke==='none'&&mediaContrast(hex(rgb(intended)!),background)<1.6;
+      set(node,'fill',label?readable(intended,background,7):faintShape?readable(intended,background,1.6):intended);
     }
     const edge=rgb(paint.stroke);
     if(edge){

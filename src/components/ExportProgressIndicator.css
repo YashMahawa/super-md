@@ -1,0 +1,33 @@
+.export-progress-indicator {
+  display: grid;
+  justify-items: center;
+  gap: 14px;
+  margin: 12px 0;
+}
+
+.export-progress-morph {
+  width: 44px;
+  height: 44px;
+  display: block;
+  background: var(--primary);
+  border-radius: 42% 18% 42% 18%;
+  animation: export-progress-morph 2.1s cubic-bezier(.4, 0, .2, 1) infinite;
+}
+
+.export-progress-indicator progress {
+  width: 100%;
+  height: 8px;
+  accent-color: var(--primary);
+}
+
+@keyframes export-progress-morph {
+  0%, 100% { transform: rotate(0deg); border-radius: 42% 18% 42% 18%; }
+  33% { transform: rotate(120deg); border-radius: 25% 42% 25% 42%; }
+  66% { transform: rotate(240deg); border-radius: 45% 25% 45% 25%; }
+}
+
+:root[data-motion="off"] .export-progress-morph { animation: none; }
+
+@media (prefers-reduced-motion: reduce) {
+  .export-progress-morph { animation: none; }
+}

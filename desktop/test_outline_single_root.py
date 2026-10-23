@@ -4,7 +4,7 @@ import unittest
 from pathlib import Path
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
-from PySide6.QtCore import QEvent, QMetaObject, Q_RETURN_ARG, Qt, QUrl
+from PySide6.QtCore import Q_ARG, QEvent, QMetaObject, Q_RETURN_ARG, Qt, QUrl
 from PySide6.QtGui import QGuiApplication
 from PySide6.QtQml import QQmlComponent, QQmlEngine
 
@@ -28,6 +28,8 @@ Item {
     property var headings: []
     property string currentNote: "one"
     property alias expanded: outline.expanded
+    property alias scrollPosition: outline.contentY
+    function toggleHeading(id) { outline.toggleExpanded(id) }
     function readRows() { return outline.visibleEntries() }
     OutlineList {
         id: outline
@@ -94,6 +96,19 @@ Item {
         self.assertEqual([row["id"] for row in self.rows()], ["root", "child", "nested"])
         self.window.setProperty("currentNote", "two")
         self.assertEqual([row["id"] for row in self.rows()], ["root", "child"])
+
+    def test_expanding_at_a_scrolled_position_does_not_reset_the_outline(self):
+        self.window.setProperty("headings", [entry for i in range(80) for entry in (
+            {"id": f"section-{i}", "title": f"Section {i}", "level": 1, "offset": i*20},
+            {"id": f"child-{i}", "title": "Child", "level": 2, "offset": i*20+10})])
+        self.rows()
+        self.window.setProperty("scrollPosition", 700.0)
+        QMetaObject.invokeMethod(self.window, "toggleHeading", Qt.DirectConnection, Q_ARG("QVariant", "section-16"))
+        self.app.processEvents()
+        self.assertAlmostEqual(self.window.property("scrollPosition"), 700.0)
+        self.window.setProperty("currentNote", "another")
+        self.app.processEvents()
+        self.assertAlmostEqual(self.window.property("scrollPosition"), 0.0)
 
 
 if __name__ == "__main__":

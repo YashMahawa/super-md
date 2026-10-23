@@ -3,7 +3,12 @@ import { applyMathRepairs, suggestMathRepairs } from "../mathRepair";
 import { setReaderOverlay } from "../readerOverlays";
 export default function MathRepairPanel({ content, apply, close }: { content: string; apply: (value:string)=>void; close: ()=>void }) {
   const repairs = useMemo(()=>suggestMathRepairs(content),[content]);
-  const [excluded,setExcluded] = useState(new Set<number>());
+  const [selection,setSelection] = useState<{content:string; excluded:Set<number>}>({content,excluded:new Set()});
+  const excluded = selection.content === content ? selection.excluded : new Set<number>();
+  const currentContent = useRef(content);
+  const applied = useRef<{content:string; done:boolean}>({content,done:false});
+  currentContent.current = content;
+  if (applied.current.content !== content) applied.current = {content,done:false};
   const dialog = useRef<HTMLElement>(null);
   const closeRef = useRef(close); closeRef.current = close;
   useEffect(() => {
@@ -21,14 +26,20 @@ export default function MathRepairPanel({ content, apply, close }: { content: st
     document.addEventListener("keydown", key, true);
     return () => { setReaderOverlay("repair",false);document.removeEventListener("keydown", key, true); previous?.focus({preventScroll:true}); };
   }, []);
-  const count = repairs.length-excluded.size;
+  const count = repairs.filter((_,index)=>!excluded.has(index)).length;
+  const applySelected = () => {
+    if (currentContent.current !== content || applied.current.content !== content || applied.current.done || !count) return;
+    applied.current.done = true;
+    apply(applyMathRepairs(content,repairs.filter((_,index)=>!excluded.has(index))));
+    closeRef.current();
+  };
   return <div className="repair-scrim" onClick={event => { if (event.target === event.currentTarget) close(); }}>
     <section ref={dialog} className="math-repair-panel" data-independent-zoom role="dialog" aria-modal="true" aria-labelledby="repair-title">
       <header><div><h2 id="repair-title">Review LaTeX repairs</h2><small>{count} of {repairs.length} selected</small></div><button className="repair-dismiss" onClick={close} aria-label="Close LaTeX repairs">Close</button></header>
       <p>{repairs.length ? "Review validated formula and delimiter changes before applying. Code, links and currency are protected." : "No safe repairs found. Ambiguous prose or unsupported TeX commands need manual review."}</p>
-      {!!repairs.length && <div className="repair-selection"><button onClick={()=>setExcluded(new Set())}>Select all</button><button onClick={()=>setExcluded(new Set(repairs.map((_,i)=>i)))}>Select none</button></div>}
-      <div className="math-repair-list">{repairs.map((repair,index)=><div className="repair-item" key={repair.from}><label><input aria-label={`Apply repair ${index+1}`} type="checkbox" checked={!excluded.has(index)} onChange={()=>setExcluded(current=>{ const next=new Set(current); next.has(index)?next.delete(index):next.add(index); return next; })}/><span><strong>{repair.reason}</strong><small>Line {content.slice(0,repair.from).split("\n").length}</small></span></label><pre>{repair.after}</pre><details><summary>Original source</summary><pre>{content.slice(repair.from,repair.to)}</pre></details></div>)}</div>
-      <footer><span>No changes until you apply</span><button disabled={!count} onClick={()=>{apply(applyMathRepairs(content,repairs.filter((_,index)=>!excluded.has(index))));close();}}>Apply {count} {count === 1 ? "repair" : "repairs"}</button></footer>
+      {!!repairs.length && <div className="repair-selection"><button onClick={()=>setSelection({content,excluded:new Set()})}>Select all</button><button onClick={()=>setSelection({content,excluded:new Set(repairs.map((_,i)=>i))})}>Select none</button></div>}
+      <div className="math-repair-list">{repairs.map((repair,index)=><div className="repair-item" key={repair.from}><label><input aria-label={`Apply repair ${index+1}`} type="checkbox" checked={!excluded.has(index)} onChange={()=>setSelection(current=>{ if(currentContent.current!==content)return current; const next=new Set(current.content===content?current.excluded:[]); next.has(index)?next.delete(index):next.add(index); return {content,excluded:next}; })}/><span><strong>{repair.reason}</strong><small>Line {content.slice(0,repair.from).split("\n").length}</small></span></label><pre>{repair.after}</pre><details><summary>Original source</summary><pre>{content.slice(repair.from,repair.to)}</pre></details></div>)}</div>
+      <footer><span>No changes until you apply</span><button disabled={!count} onClick={applySelected}>Apply {count} {count === 1 ? "repair" : "repairs"}</button></footer>
     </section>
   </div>;
 }

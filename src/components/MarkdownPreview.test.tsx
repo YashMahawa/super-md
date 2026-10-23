@@ -4,6 +4,12 @@ import MarkdownPreview, { normalizeCallouts } from "./MarkdownPreview";
 import { analyzeDocument } from "../documentAnalysis";
 
 describe("Obsidian callouts", () => {
+  it('keeps rich inline title formatting in the title rather than moving it into the body',()=>{
+    const html=renderToStaticMarkup(<MarkdownPreview markdown={'> [!tip] **Useful** $x^2$ [reference](https://example.com)\n> Body stays below.'} documentPath={null} python="" dark/>);
+    const title=html.match(/class="callout-title"[^>]*>([\s\S]*?)<\/p>/)?.[1]||'';
+    expect(title).toMatch(/<strong[^>]*>Useful<\/strong>/);expect(title).toContain('class="katex"');expect(title).toContain('reference');
+    expect(title).not.toContain('Body stays below.');expect(html.match(/Body stays below\./g)).toHaveLength(1);
+  });
   it("renders a tip with its title and body", () => {
     const html = renderToStaticMarkup(
       <MarkdownPreview

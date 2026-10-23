@@ -8,6 +8,17 @@ export function selectedMarkdown(selection: Selection | null, source?:string): s
   const mathAt=(node:Node)=>node.parentElement?.closest(".katex-display") || node.parentElement?.closest(".katex");
   const start=mathAt(range.startContainer), end=mathAt(range.endContainer);
   if(start)range.setStartBefore(start);if(end)range.setEndAfter(end);
+  const listNumber=(item:Element):number=>{
+    const list=item.parentElement!,reversed=list.hasAttribute('reversed'),step=reversed?-1:1;
+    let number=Number(list.getAttribute('start')??(reversed?list.children.length:1));
+    for(const sibling of Array.from(list.children)){
+      if(sibling.tagName!=='LI')continue;
+      if(sibling.hasAttribute('value'))number=Number(sibling.getAttribute('value'));
+      if(sibling===item)return number;
+      number+=step;
+    }
+    return number;
+  };
   const serialize=(node:Node):string=>{
     if(node.nodeType===Node.TEXT_NODE)return node.textContent||"";
     if(!(node instanceof Element))return Array.from(node.childNodes).map(serialize).join("");
@@ -36,11 +47,21 @@ export function selectedMarkdown(selection: Selection | null, source?:string): s
       case "code":return node.parentElement?.tagName==="PRE"?content:`\`${content}\``;
       case "pre":return `\n\`\`\`${node.querySelector("code")?.className.match(/language-([\w-]+)/)?.[1]||""}\n${content.trimEnd()}\n\`\`\`\n`;
       case "p":case "div":case "section":return `${content}\n\n`;
-      case "li":return `- ${content}\n`;
+      case "li":return `${node.parentElement?.tagName==='OL'?`${listNumber(node)}.`:'-'} ${content}\n`;
       case "h1":case "h2":case "h3":case "h4":case "h5":case "h6":return `${"#".repeat(Number(node.tagName[1]))} ${content}\n\n`;
       case "img":{const source=node.closest("[data-note-image-source]")?.getAttribute("data-note-image-source")||node.getAttribute("src")||"";return /^(data:|blob:)/.test(source)?`[${node.getAttribute("alt")||"Image"}]`:`![${node.getAttribute("alt")||""}](${source})`;}
       default:return content;
     }
   };
-  return serialize(range.cloneContents()).trim();
+  const fragment=range.cloneContents();
+  // cloneContents omits the common ancestor. Preserve ordered-list context
+  // when copying a subset of its items rather than the complete outer list.
+  const parent=elementAt(range.commonAncestorContainer);
+  if(parent?.tagName==='OL'&&Array.from(fragment.children).some(node=>node.tagName==='LI')){
+    const list=parent.cloneNode(false) as Element;
+    const first=Array.from(parent.children).find(node=>node.tagName==='LI'&&range.intersectsNode(node));
+    if(first)list.setAttribute('start',String(listNumber(first)));
+    list.append(fragment);return serialize(list).trim();
+  }
+  return serialize(fragment).trim();
 }

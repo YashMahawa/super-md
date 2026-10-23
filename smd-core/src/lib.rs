@@ -1,6 +1,7 @@
 //! The same local typesetter is used by desktop and Android. No browser print layout.
 pub mod portable;
 pub mod theme;
+pub mod pdf_assets;
 mod math_compatibility;
 use math_compatibility::compatible_math;
 use anyhow::{bail, Result};
@@ -49,17 +50,35 @@ pub fn image_sources(markdown: &str) -> Vec<String> {
 /// Normalize both Obsidian and Super MD callouts before parsing ordinary Markdown.
 pub fn normalize_callouts(input: &str) -> String {
     let mut output = String::new();
-    let mut in_callout = false;
-    let mut in_fence = false;
+    let mut depth = 0usize;
+    let mut fence: Option<(char,usize)> = None;
     for line in input.lines() {
-        if line.trim_start().starts_with("```") || line.trim_start().starts_with("~~~") { in_fence = !in_fence; }
-        if !in_fence && line.starts_with(":::callout") {
-            let spec = line.trim_start_matches(":::callout").trim();
-            let (kind, title) = spec.split_once(' ').unwrap_or((spec, spec));
-            output.push_str(&format!("> [!{}] {}\n", kind, title.trim_matches('"')));
-            in_callout = true;
-        } else if in_callout && line.trim() == ":::" { in_callout = false; output.push('\n'); }
-        else { if in_callout { output.push_str("> "); } output.push_str(line); output.push('\n'); }
+        let body=line.trim_start_matches(' ');
+        let code=body.chars().next().filter(|ch| matches!(ch,'`'|'~')).and_then(|ch| {
+            let count=body.chars().take_while(|value| *value==ch).count();
+            (line.len()-body.len()<=3 && count>=3).then_some((ch,count))
+        });
+        let inside_fence=fence.is_some();
+        if let Some((ch,count))=code {
+            if let Some((marker,length))=fence {
+                if ch==marker && count>=length && body[count..].trim().is_empty() { fence=None; }
+            } else { fence=Some((ch,count)); }
+        }
+        let start=if !inside_fence && code.is_none() {
+            line.strip_prefix(":::callout").filter(|spec| spec.chars().next().is_some_and(char::is_whitespace))
+        } else { None };
+        if let Some(spec)=start {
+            let spec=spec.trim();
+            let (kind,title)=spec.split_once(char::is_whitespace).unwrap_or((spec,spec));
+            if !kind.is_empty() && kind.chars().all(|ch| ch.is_alphanumeric() || ch=='_' || ch=='-') {
+                depth+=1;
+                output.push_str(&format!("{}[!{}] {}\n","> ".repeat(depth),kind,title.trim().trim_matches(['\"','\''])));
+                continue;
+            }
+        }
+        if !inside_fence && code.is_none() && depth>0 && line.trim()==":::" {
+            depth-=1;output.push_str("> ".repeat(depth).trim_end());output.push('\n');
+        } else { output.push_str(&"> ".repeat(depth));output.push_str(line);output.push('\n'); }
     }
     output
 }
@@ -163,7 +182,12 @@ impl<'a> Renderer<'a> {
                                 }
                             }
                             let widths = lengths.iter().zip(&counts).map(|(len, count)| format!("{:.2}fr,", ((*len as f64 / (*count).max(1) as f64).max(8.)).sqrt().min(12.))).collect::<String>();
-                            out.push_str(&format!("\n#table(columns: ({widths}), inset: 6pt, stroke: .4pt + smd-line, fill: (x, y) => if y == 0 {{ smd-header-fill }} else {{ none }},\n"));
+                            let alignments = columns.iter().map(|column| match column {
+                                pulldown_cmark::Alignment::Center => "center,",
+                                pulldown_cmark::Alignment::Right => "right,",
+                                _ => "left,",
+                            }).collect::<String>();
+                            out.push_str(&format!("\n#table(columns: ({widths}), align: ({alignments}), inset: 6pt, stroke: .4pt + smd-line, fill: (x, y) => if y == 0 {{ smd-header-fill }} else {{ none }},\n"));
                             out.push_str(&self.render(Some(close))?); out.push_str(")\n\n");
                         },
                         Tag::TableHead => { out.push_str("table.header("); out.push_str(&self.render(Some(close))?); out.push_str("),\n"); },
@@ -345,11 +369,7 @@ pub extern "system" fn Java_dev_supermd_studio_PdfEngine_export(
         let asset_dir: String = env.get_string(&asset_dir)?.into();
         let output: String = env.get_string(&output)?.into();
         let options: PdfOptions = serde_json::from_str(&options)?;
-        let mut assets = HashMap::new();
-        for entry in std::fs::read_dir(asset_dir)? {
-            let path = entry?.path();
-            if path.is_file() { assets.insert(path.file_name().unwrap().to_string_lossy().into_owned(), std::fs::read(path)?); }
-        }
+        let assets = pdf_assets::load_referenced_assets(&markdown, std::path::Path::new(&asset_dir))?;
         std::fs::write(&output, export(&markdown, &options, &assets)?)?;
         Ok(())
     })();
