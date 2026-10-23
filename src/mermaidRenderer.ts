@@ -10,6 +10,10 @@ export function sanitizeDiagram(svg: string): string {
 let queue = Promise.resolve();
 let serial = 0;
 const cache=new Map<string,string>();
+/** Read-only render-time lookup; asynchronous rendering still owns LRU updates. */
+export function cachedMermaid(source:string,dark=false):string|undefined {
+  return cache.get(JSON.stringify([source,dark]));
+}
 let cacheBytes=0;
 type RenderJob = {
   key: string;

@@ -1,5 +1,5 @@
 import { useEffect, useState } from "react";
-import { invoke } from "@tauri-apps/api/core";
+import { invoke } from "../nativeBridge";
 import { CaretDown, CaretRight, FileText, Folder, FolderOpen, X } from "@phosphor-icons/react";
 import { readRecent } from "../recentFiles";
 

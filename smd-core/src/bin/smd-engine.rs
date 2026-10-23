@@ -79,6 +79,7 @@ fn run() -> Result<()> {
             let root = path.canonicalize()?.parent().context("No containing folder")?.to_path_buf();
             let packed = portable::pack(&markdown, |source| {
                 if let Some(data) = note.as_ref().and_then(|n| n.assets.get(source)) { return Ok(data.clone()); }
+                if source.starts_with("data:") { portable::image_bytes(source)?; return Ok(source.to_owned()); }
                 if source.contains("://") { bail!("Remote image requires explicit download in the app: {source}"); }
                 let local = root.join(percent_encoding::percent_decode_str(source).decode_utf8()?.as_ref()).canonicalize()?;
                 if !local.starts_with(&root) { bail!("Image is outside the note folder"); }
@@ -93,9 +94,13 @@ fn run() -> Result<()> {
             let output = args.get(2).context("Expected PDF output path")?; let mut assets = HashMap::new();
             let root = path.canonicalize()?.parent().context("No containing folder")?.to_path_buf();
             for source in smd_core::image_sources(&markdown) {
-                let bytes = if let Some(data) = note.as_ref().and_then(|n| n.assets.get(&source)) { portable::image_bytes(data)?.1 } else {
+                let bytes = if let Some(data) = note.as_ref().and_then(|n| n.assets.get(&source)) { portable::image_bytes(data)?.1 }
+                else if source.starts_with("data:") { portable::image_bytes(&source)?.1 }
+                else {
+                    if source.contains("://") { bail!("Remote image requires explicit download in the app: {source}"); }
                     let file = root.join(percent_encoding::percent_decode_str(&source).decode_utf8()?.as_ref()).canonicalize()?;
                     if !file.starts_with(&root) { bail!("Image is outside the note folder"); }
+                    if std::fs::metadata(&file)?.len() > portable::MAX_IMAGE as u64 { bail!("Image exceeds 25 MB"); }
                     std::fs::read(file)?
                 }; assets.insert(source,bytes);
             }

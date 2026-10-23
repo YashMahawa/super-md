@@ -36,12 +36,18 @@ export function normalizeMarkdownSource(markdown:string):Stage {
   add(regexStage(value,/!\[\[([^\]|]+)(?:\|([^\]]+))?\]\]/g,(_all,path,label)=>`![${label??path}](${encodeURI(path)})`));
   add(regexStage(value,/\[\[(#[\s\S]*?)\]\]/g,(_all,target:string)=>{const [id,label]=target.split('|');return `[${label||id.slice(1)}](#${headingSlug(id.slice(1))})`;}));
   add(regexStage(value,/\[\[([^\]|]+)(?:\|([^\]]+))?\]\]/g,(_all,target,label)=>`[${label??target}](${target.endsWith('.md')?target:`${target}.md`})`));
-  const edits:Edit[]=[];let offset=0,current=false;
+  const edits:Edit[]=[];let offset=0,depth=0,fence='',fenceLength=0;
   for(const line of value.split('\n')){
-    const start=line.match(/^:::callout\s+(\w+)(?:\s+(.+))?\s*$/i);
-    if(start&&!current){current=true;edits.push({start:offset,end:offset+line.length,text:`> [!${start[1].toUpperCase()}] ${start[2]?.replace(/^['"]|['"]$/g,'')||start[1]}`});}
-    else if(line.trim()===':::'&&current){current=false;edits.push({start:offset,end:offset+line.length,text:''});}
-    else if(current)edits.push({start:offset,end:offset,text:'> '});
+    const code=line.match(/^ {0,3}(`{3,}|~{3,})(.*)$/);
+    const insideCode=!!fence;
+    if(code){
+      if(!fence){fence=code[1][0];fenceLength=code[1].length;}
+      else if(code[1][0]===fence&&code[1].length>=fenceLength&&!code[2].trim())fence='';
+    }
+    const start=!insideCode&&!code&&line.match(/^:::callout\s+([\w-]+)(?:\s+(.+))?\s*$/i);
+    if(start){depth++;edits.push({start:offset,end:offset+line.length,text:`${'> '.repeat(depth)}[!${start[1].toUpperCase()}] ${start[2]?.replace(/^['"]|['"]$/g,'')||start[1]}`});}
+    else if(!insideCode&&!code&&line.trim()===':::'&&depth){depth--;edits.push({start:offset,end:offset+line.length,text:'> '.repeat(depth).trimEnd()});}
+    else if(depth)edits.push({start:offset,end:offset,text:'> '.repeat(depth)});
     offset+=line.length+1;
   }
   add(replaceStage(value,edits));

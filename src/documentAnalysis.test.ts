@@ -3,6 +3,20 @@ import {analyzeDocument} from './documentAnalysis';
 import {normalizeMarkdownSource} from './markdownSource';
 
 describe('shared source analysis',()=>{
+  it('nests container callouts and keeps literal delimiters inside variable-length code fences',()=>{
+    const source=':::callout note Outer\nOuter body\n\n:::callout tip Inner\nInner body\n:::\n\nAfter inner\n\n````text\n:::callout warning Not a callout\n::: \n```\n````\n:::\n\n# After\n';
+    const normalized=normalizeMarkdownSource(source);
+    expect(normalized.value).toContain('> > [!TIP] Inner\n> > Inner body\n>');
+    expect(normalized.value).toContain('> After inner');
+    expect(normalized.value).toContain('> :::callout warning Not a callout\n> ::: ');
+    expect(normalized.originalOffset(normalized.value.indexOf('# After'))).toBe(source.indexOf('# After'));
+    const analysis=analyzeDocument(source);expect(analysis.blocks.map(x=>x.text).join('')).toBe(source);
+    expect(analysis.outline.at(-1)?.offset).toBe(source.indexOf('# After'));
+  });
+  it('does not turn fenced examples or unmatched closes into callouts',()=>{
+    const source='~~~text\n:::callout note Literal\n::: \n~~~\n\n::: \n';
+    expect(normalizeMarkdownSource(source).value).toBe(source);
+  });
   it('reuses immutable raw syntax and keeps source blocks lossless',()=>{
     const source='---\ntitle: Notes\n---\n# Real heading\n\nA paragraph.\n\n1. First\n\n2. Second\n';
     const first=analyzeDocument(source);expect(analyzeDocument(source)).toBe(first);

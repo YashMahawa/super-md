@@ -4,6 +4,14 @@ import {adaptSvg,adaptSvgData} from './svgTheme';
 import {mediaContrast} from './mediaAppearance';
 const light={surface:'#f0e1d0',primary:'#80502d'},dark={surface:'#211d2d',primary:'#dfb1e0'};
 const parse=(s:string)=>new DOMParser().parseFromString(s,'image/svg+xml');
+it('improves a faint fill without inventing a border or changing blue plot geometry',()=>{
+  const source='<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 300 200"><rect id="faint" x="10" y="10" width="40" height="30" fill="#211d2d"/><path id="blue" d="M 0 100 L 40 100 L 40 40 L 80 40" fill="none" stroke="#2366b2" stroke-width="2"/></svg>';
+  const xml=parse(adaptSvg(source,dark,true));
+  expect(xml.querySelector('#faint')!.getAttribute('stroke')).toBeNull();
+  expect(xml.querySelector('#faint')!.getAttribute('stroke-width')).toBeNull();
+  expect(xml.querySelector('#blue')!.getAttribute('d')).toBe('M 0 100 L 40 100 L 40 40 L 80 40');
+  expect(xml.querySelector('#blue')!.getAttribute('stroke-width')).toBe('2');
+});
 it('preserves colourful nodes and makes labels readable against their own node, not the page',()=>{
   const source='<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 300 160"><circle cx="90" cy="70" r="35" fill="#153d4b" stroke="#73e3e0"/><text id="inside" x="90" y="70" fill="#f2f7fc">Root</text><text id="outside" x="180" y="70" fill="#a0bad8">Height</text></svg>';
   for(const colors of [light,dark]){
