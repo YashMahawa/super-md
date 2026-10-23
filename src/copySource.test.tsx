@@ -4,6 +4,14 @@ import {renderToStaticMarkup} from "react-dom/server";
 import MarkdownPreview from "./components/MarkdownPreview";
 import {selectedMarkdown} from "./copySource";
 import {readingMatches} from "./components/ReadingSearch";
+it('retains ordered-list start values, item overrides and partial-list selection',()=>{
+  const host=document.createElement('article');host.className='markdown-body';host.innerHTML='<ol start="4"><li>Fourth</li><li value="9">Ninth</li><li>Tenth</li></ol>';document.body.append(host);
+  const range=document.createRange(),selection=window.getSelection()!;range.selectNodeContents(host);selection.removeAllRanges();selection.addRange(range);
+  expect(selectedMarkdown(selection)).toBe('4. Fourth\n9. Ninth\n10. Tenth');
+  const items=host.querySelectorAll('li');range.setStartBefore(items[1]);range.setEndAfter(items[2]);selection.removeAllRanges();selection.addRange(range);
+  expect(selectedMarkdown(selection)).toBe('9. Ninth\n10. Tenth');
+  selection.removeAllRanges();host.remove();
+});
 it('copying across windowed-offscreen blocks retains their complete Markdown',()=>{
   const text='Before\n\n$$x^2$$\n\nAfter',host=document.createElement('article');host.className='markdown-body';
   host.innerHTML='<p>Before</p><section data-windowed-mounted="false" data-source-start="8" data-source-end="15"></section><p>After</p>';document.body.append(host);

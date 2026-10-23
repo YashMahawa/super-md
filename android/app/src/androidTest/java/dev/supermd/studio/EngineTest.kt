@@ -138,6 +138,34 @@ Literal ${'$'}\text{ast.circle}${'$'} must remain text.
             PdfRenderer(ParcelFileDescriptor.open(pdf, ParcelFileDescriptor.MODE_READ_ONLY)).use { assertTrue(it.pageCount > 0) }
         } finally { directory.deleteRecursively() }
     }
+    @Test fun jniPdfLoadsReferencedAssetAndSkipsOversizedUnrelatedFile() {
+        val app = ApplicationProvider.getApplicationContext<android.app.Application>()
+        val directory = File(app.cacheDir, "pdf-assets-${java.util.UUID.randomUUID()}").apply { mkdirs() }
+        try {
+            val assets = File(directory, "assets").apply { mkdirs() }
+            File(assets, "used.svg").writeText("<svg xmlns='http://www.w3.org/2000/svg' width='120' height='60'><path d='M0 55L120 5' stroke='blue'/></svg>")
+            java.io.RandomAccessFile(File(assets, "unrelated.png"), "rw").use { it.setLength(500_000_000L) }
+            val output = File(directory, "document.pdf")
+            val error = PdfEngine.export("![Used](used.svg)", StudioState().pdf, assets.absolutePath, output.absolutePath)
+            assertEquals("", error)
+            assertTrue(output.isFile)
+            val header = ByteArray(5)
+            assertEquals(5, output.inputStream().use { it.read(header) })
+            assertEquals("%PDF-", String(header, Charsets.US_ASCII))
+        } finally { directory.deleteRecursively() }
+    }
+    @Test fun jniPdfRejectsReferencedAssetOverLimitBeforeWritingOutput() {
+        val app = ApplicationProvider.getApplicationContext<android.app.Application>()
+        val directory = File(app.cacheDir, "pdf-assets-limit-${java.util.UUID.randomUUID()}").apply { mkdirs() }
+        try {
+            val assets = File(directory, "assets").apply { mkdirs() }
+            java.io.RandomAccessFile(File(assets, "too-large.png"), "rw").use { it.setLength(25_000_001L) }
+            val output = File(directory, "document.pdf")
+            val error = PdfEngine.export("![Too large](too-large.png)", StudioState().pdf, assets.absolutePath, output.absolutePath)
+            assertTrue("Expected a clear asset size error, received: $error", error.contains("PDF asset exceeds its supported size: too-large.png"))
+            assertFalse("A failed export must not leave a PDF", output.exists())
+        } finally { directory.deleteRecursively() }
+    }
     @Test fun largePortableStringsCrossReaderBufferBoundaries() {
         val app = ApplicationProvider.getApplicationContext<android.app.Application>(); val media = MediaStorage(app)
         val markdown = sample + "\n\n" + "Unicode λ and escaped quotes \"remain editable\".\n".repeat(200)

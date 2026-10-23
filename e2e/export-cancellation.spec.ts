@@ -23,6 +23,15 @@ test('PDF progress allows native cancellation without publishing a partial resul
   });
   const dialog=page.getByRole('dialog',{name:'Exporting PDF'});
   await expect(dialog).toContainText('Typesetting your document');
+  const shape=dialog.locator('.export-progress-morph');
+  await expect(shape).toBeVisible();
+  expect(await shape.evaluate(el=>getComputedStyle(el).animationName)).toBe('export-progress-morph');
+  await page.emulateMedia({reducedMotion:'reduce'});
+  await expect.poll(()=>shape.evaluate(el=>getComputedStyle(el).animationName)).toBe('none');
+  await page.emulateMedia({reducedMotion:'no-preference'});
+  await page.evaluate(()=>{document.documentElement.dataset.motion='off';});
+  await expect.poll(()=>shape.evaluate(el=>getComputedStyle(el).animationName)).toBe('none');
+  await expect(dialog.getByRole('progressbar')).not.toHaveAttribute('value');
   await dialog.getByRole('button',{name:'Cancel export'}).click();
   await expect(dialog).toHaveCount(0);
   const events=await page.evaluate(()=>(window as any).__pdfEvents);
