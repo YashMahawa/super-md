@@ -1,4 +1,15 @@
-# Super MD 0.6.9
+# Super MD 0.6.10
+
+## Diagrams that use the reading width
+
+- Inline SVG drawings, Mermaid diagrams and Python figures now fill their available reading column instead of stopping at a small intrinsic export size. This works on desktop, tablets, landscape phones and narrow Split panes, with the original aspect ratio retained.
+- Standalone linked/embedded SVG diagrams use the same responsive sizing. Ordinary photographs and SVG icons inside prose keep their existing sizing.
+- Padding and borders stay inside the column. Click-to-open, independent image zoom, document zoom and offscreen windowing remain supported. No resize polling or new image buffers are introduced, and note contents are unchanged.
+- Added responsive sizing regressions across Read, Live and Split modes at desktop, tablet and phone dimensions, including magnified and reduced document zoom.
+
+All fixes from 0.6.9 are retained, including the fast-scroll anchor corrections. The separately documented small first-pass cold-font reflow at Android's 40% zoom is not claimed to be fixed by this sizing patch.
+
+## Retained improvements from 0.6.9
 
 ## Fast scrolling without lazy-layout jumps
 

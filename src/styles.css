@@ -110,6 +110,11 @@ button { color: inherit; }
 .media-dialog small { color: var(--muted); font-size: .76rem; line-height: 1.6; }
 .media-dialog p[role=alert] { margin: 0; color: var(--error); font-size: .78rem; overflow-wrap: anywhere; }
 .note-image { position: relative; display: inline-block; max-width: 100%; border-radius: 12px; }
+/* Standalone vector diagrams use the reading column, not their export's
+   intrinsic pixel width. Inline icons and ordinary photographs stay authored. */
+.markdown-body .media-paragraph > .note-image--diagram { width:100%; }
+.markdown-body .media-paragraph > .note-image--diagram > img,
+.python-cell .cell-output > img { width:100%; box-sizing:border-box; }
 .note-image.is-selected, .note-image:focus-visible { outline: 2px solid var(--primary); outline-offset: 4px; }
 .image-edit-tools { position: absolute; bottom: 8px; left: 8px; display: flex; gap: 4px; padding: 4px; border-radius: 999px; background: var(--surface-high); color: var(--text); box-shadow: 0 2px 12px var(--shadow); font-family: var(--md-ref-typeface-plain); font-size: 13px; }
 .image-edit-tools button { min-height: 40px; border-radius: 999px; }
@@ -617,6 +622,6 @@ button.code-copy:active { border-radius:10px; }
 
 /* Inline SVG drawings */
 .svg-figure { margin: 1.4em 0; display: flex; justify-content: center; }
-.svg-figure img.svg-diagram { display: block; max-width: 100%; height: auto; }
+.svg-figure img.svg-diagram { display: block; width:100%; max-width: 100%; min-width:0; height: auto; box-sizing:border-box; }
 .svg-figure--color img.svg-diagram { padding: 16px; border-radius: 20px; background: #fdfdfc; box-shadow: 0 0 0 1px var(--code-border); }
 .svg-figure--own-background img.svg-diagram { border-radius: 16px; }
