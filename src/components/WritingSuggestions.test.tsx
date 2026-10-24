@@ -7,7 +7,7 @@ import {checkWriting,type WritingIssue} from '../proofreading';
 vi.mock('../proofreading',()=>({checkWriting:vi.fn()}));
 Object.assign(globalThis,{IS_REACT_ACT_ENVIRONMENT:true});
 let host:HTMLDivElement,root:Root;
-const issue:WritingIssue={from:3,to:6,kind:'spelling',message:'typo',replacements:['right']};
+const issue:WritingIssue={from:3,to:6,kind:'spelling',message:'typo',replacements:['right'],originalText:'teh'};
 beforeEach(()=>{vi.useFakeTimers();vi.mocked(checkWriting).mockReset();host=document.createElement('div');document.body.append(host);root=createRoot(host);});
 afterEach(()=>{act(()=>root.unmount());host.remove();vi.useRealTimers();});
 const render=(text:string,onChange=vi.fn())=>act(()=>root.render(<WritingSuggestions text={text} spellCheck onChange={onChange}/>));
