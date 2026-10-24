@@ -23,6 +23,7 @@ import type {SourceDocumentAnalysis} from '../documentAnalysis';
 import {resolveReaderRasterAsset} from '../readerAssets';
 import {commitMediaLayout} from '../mediaLayout';
 import type {ReaderAccessibilityPreference} from '../types';
+import type {Components} from 'react-markdown';
 export {normalizeCallouts} from '../markdownSource';
 
 const MermaidDiagram = lazy(() => import("./MermaidDiagram"));
@@ -30,6 +31,13 @@ function ThemedChart({source,dark}:{source:string;dark:boolean}) {const theme=us
 function ThemedSvg({source,dark}:{source:string;dark:boolean}) {const theme=useContext(DocumentAppearance);return <SvgDiagram source={source} dark={theme?.dark??dark} appearance={theme?.svgAppearance} ink={theme?.svgAppearance==='auto'?theme.ink:theme?.text} colors={theme?.colors}/>;}
 function ThemedMermaid({source,dark}:{source:string;dark:boolean}) {const theme=useContext(DocumentAppearance);return <MermaidDiagram source={source} dark={theme?.dark??dark} appearance={theme?.svgAppearance} colors={theme?.colors}/>;}
 const EMPTY_TRUSTED_IMAGE_HOSTS: string[] = [];
+// Keep this component type stable across edits so unchanged paragraphs and
+// their loaded media are not remounted just to classify a standalone figure.
+const MarkdownParagraph:Components['p']=({node,children,...props})=>{
+  const child=node?.children.length===1?node.children[0]:undefined;
+  const standalone=child?.type==='element'&&child.tagName==='img';
+  return <p {...props} className={[props.className,standalone?'media-paragraph':''].filter(Boolean).join(' ')||undefined}>{children}</p>;
+};
 function remarkTaskPositions() {
   return (tree:unknown)=>{let index=0;visit(tree as never,'listItem',(node:any)=>{if(typeof node.checked==='boolean')node.data={...node.data,hProperties:{...node.data?.hProperties,'data-task-index':index++}};});};
 }
@@ -173,11 +181,7 @@ function MarkdownPreview({ markdown, documentPath, python, dark, trustedImageHos
         remarkPlugins={[remarkGfm, remarkMath, remarkObsidianMath, remarkSvgBlocks, remarkCallouts, remarkHeadingIds, remarkTaskPositions,remarkSourcePositions]}
         rehypePlugins={[rehypeKatex, rehypeHighlight]}
         components={{
-          p: ({node,children,...props}) => {
-            const child=node?.children.length===1?node.children[0]:undefined;
-            const standalone=child?.type==='element'&&child.tagName==='img';
-            return <p {...props} className={[props.className,standalone?'media-paragraph':''].filter(Boolean).join(' ')||undefined}>{children}</p>;
-          },
+          p: MarkdownParagraph,
           input: ({node: _node,...props}) => <input {...props} disabled={!onChange} onChange={()=>{}} />,
           li: ({node,children,...props}) => <li {...props} className={Array.isArray(node?.properties.className)?node.properties.className.join(' '):undefined} onChange={event=>{const index=Number(node?.properties['data-task-index']);const offset=tasks[index];if(offset===undefined || !onChange || !(event.target instanceof HTMLInputElement))return;onChange(markdown.slice(0,offset)+(event.target.checked?'x':' ')+markdown.slice(offset+1));}}>{children}</li>,
           img: renderImage,
