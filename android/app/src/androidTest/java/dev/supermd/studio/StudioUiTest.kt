@@ -548,6 +548,37 @@ class StudioUiTest {
         }
         println("SELECTION AFTER POINTER: "+javascriptUntil("JSON.stringify({events:window.__selectionInput,selection:window.getSelection()?.toString(),range:(()=>{const p=[...document.querySelectorAll('.markdown-body p')].find(p=>p.textContent.includes('Alpha Bravo Charlie Delta'));const r=document.createRange();r.setStart(p.firstChild,6);r.setEnd(p.firstChild,11);const b=r.getBoundingClientRect();return {x:b.left+b.width/2,y:b.top+b.height/2,viewport:[innerWidth,innerHeight]}})()})") {it.contains("selection")})
         javascriptUntil("window.getSelection()?.toString()"){it=="\"Bravo\""}
+        // Inspect the real OS toolbar, including its overflow, without invoking
+        // an external search or submitting any synthetic text to a provider.
+        val automation=instrument.uiAutomation
+        val originalFlags=automation.serviceInfo.flags
+        automation.serviceInfo=automation.serviceInfo.apply {flags=flags or android.accessibilityservice.AccessibilityServiceInfo.FLAG_RETRIEVE_INTERACTIVE_WINDOWS}
+        try {
+            fun toolbarNodes():List<android.view.accessibility.AccessibilityNodeInfo> {
+                val result=mutableListOf<android.view.accessibility.AccessibilityNodeInfo>()
+                fun visit(node:android.view.accessibility.AccessibilityNodeInfo?) {
+                    if(node==null)return
+                    result.add(node)
+                    for(index in 0 until node.childCount)visit(node.getChild(index))
+                }
+                automation.windows.forEach {visit(it.root)}
+                return result
+            }
+            val ask="Ask ${SelectionActions.label(model.state.value.selectionAssistant)}…"
+            val seen=mutableSetOf<String>()
+            fun record(nodes:List<android.view.accessibility.AccessibilityNodeInfo>){seen.addAll(nodes.filter {it.isVisibleToUser}.mapNotNull {it.text?.toString()?.takeIf(String::isNotBlank)})}
+            fun complete()=seen.contains("Search Google")&&seen.contains(ask)
+            var nodes=toolbarNodes();record(nodes)
+            val deadline=android.os.SystemClock.uptimeMillis()+6_000
+            while(!complete()&&nodes.none {it.contentDescription?.toString()=="More options"}&&android.os.SystemClock.uptimeMillis()<deadline){android.os.SystemClock.sleep(50);nodes=toolbarNodes();record(nodes)}
+            // Expanding overflow can hide main-row actions, so retain the
+            // visible labels from both presentations instead of requiring all
+            // actions to occupy the same row on every device/OS version.
+            if(!complete())nodes.firstOrNull {it.contentDescription?.toString()=="More options"}?.performAction(android.view.accessibility.AccessibilityNodeInfo.ACTION_CLICK)
+            while(!complete()&&android.os.SystemClock.uptimeMillis()<deadline){android.os.SystemClock.sleep(50);nodes=toolbarNodes();record(nodes)}
+            assertTrue("Native selection toolbar is missing Search Google: ${seen.take(12)}",seen.contains("Search Google"))
+            assertTrue("Native selection toolbar is missing $ask: ${seen.take(12)}",seen.contains(ask))
+        } finally {automation.serviceInfo=automation.serviceInfo.apply {flags=originalFlags}}
         val headingNavigationProbe="""(()=>{const host=document.querySelector('.android-reading'),style=getComputedStyle(document.documentElement);if(!host)return false;if(!window.__headingNavigationFrames){window.getSelection()?.removeAllRanges();document.querySelector('a[href="#chapter-550"]')?.click();window.__headingNavigationFrames=0;const tick=()=>{window.__headingNavigationFrames++;if(window.__headingNavigationFrames<8)requestAnimationFrame(tick);};requestAnimationFrame(tick);return false;}if(window.__headingNavigationFrames<8)return false;const h=document.querySelector('h2#chapter-550');if(!h)return false;const r=h.getBoundingClientRect();return {headingTop:r.top,hostTop:host.getBoundingClientRect().top,scrollTop:host.scrollTop,maxScroll:host.scrollHeight-host.clientHeight,chromeInset:parseFloat(style.getPropertyValue('--native-chrome-inset'))||0,visibleInset:parseFloat(style.getPropertyValue('--native-visible-chrome-inset'))||0,viewportHeight:innerHeight};})()"""
         val headingLayout=org.json.JSONObject(javascriptUntil(headingNavigationProbe) {it.contains("headingTop")})
         val headingScreenY=nativeWebTop.get()+headingLayout.getDouble("headingTop")*nativeScale.get()

@@ -355,18 +355,27 @@ ApplicationWindow {
                     settings.fullScreenSupportEnabled: false
                     onContextMenuRequested: function(request) {
                         request.accepted = true
+                        readerContextMenu.selectionText = request.selectedText
+                        readerContextMenu.editFlags = request.editFlags
+                        readerContextMenu.hasLink = request.linkUrl.toString().length > 0
                         readerContextMenu.popup(request.position.x, request.position.y)
                     }
                     NoteContextMenu {
                         id: readerContextMenu
                         objectName: "readerContextMenu"
-                        MenuItem { text: "Undo"; visible: window.reader && window.reader.action(WebEngineView.Undo).enabled; onTriggered: window.reader.triggerWebAction(WebEngineView.Undo) }
-                        MenuItem { text: "Redo"; visible: window.reader && window.reader.action(WebEngineView.Redo).enabled; onTriggered: window.reader.triggerWebAction(WebEngineView.Redo) }
-                        MenuItem { text: "Cut"; visible: window.reader && window.reader.action(WebEngineView.Cut).enabled; onTriggered: window.reader.triggerWebAction(WebEngineView.Cut) }
-                        MenuItem { text: "Copy"; enabled: window.reader && window.reader.action(WebEngineView.Copy).enabled; onTriggered: window.reader.triggerWebAction(WebEngineView.Copy) }
-                        MenuItem { text: "Paste"; visible: window.reader && window.reader.action(WebEngineView.Paste).enabled; onTriggered: window.reader.triggerWebAction(WebEngineView.Paste) }
-                        MenuItem { text: "Copy link address"; visible: window.reader && window.reader.action(WebEngineView.CopyLinkToClipboard).enabled; onTriggered: window.reader.triggerWebAction(WebEngineView.CopyLinkToClipboard) }
-                        MenuItem { text: "Select all"; onTriggered: window.reader.triggerWebAction(WebEngineView.SelectAll) }
+                        property string selectionText: ""
+                        property int editFlags: 0
+                        property bool hasLink: false
+                        NoteMenuItem { text: "Undo"; actionVisible: Boolean(readerContextMenu.editFlags & ContextMenuRequest.CanUndo); onTriggered: window.reader.triggerWebAction(WebEngineView.Undo) }
+                        NoteMenuItem { text: "Redo"; actionVisible: Boolean(readerContextMenu.editFlags & ContextMenuRequest.CanRedo); onTriggered: window.reader.triggerWebAction(WebEngineView.Redo) }
+                        NoteMenuItem { text: "Cut"; actionVisible: Boolean(readerContextMenu.editFlags & ContextMenuRequest.CanCut); onTriggered: window.reader.triggerWebAction(WebEngineView.Cut) }
+                        NoteMenuItem { text: "Copy"; enabled: Boolean(readerContextMenu.editFlags & ContextMenuRequest.CanCopy); onTriggered: window.reader.triggerWebAction(WebEngineView.Copy) }
+                        NoteMenuItem { text: "Paste"; actionVisible: Boolean(readerContextMenu.editFlags & ContextMenuRequest.CanPaste); onTriggered: window.reader.triggerWebAction(WebEngineView.Paste) }
+                        NoteMenuItem { text: "Copy link address"; actionVisible: readerContextMenu.hasLink; onTriggered: window.reader.triggerWebAction(WebEngineView.CopyLinkToClipboard) }
+                        NoteMenuItem { text: "Select all"; onTriggered: window.reader.triggerWebAction(WebEngineView.SelectAll) }
+                        MenuSeparator { visible: readerContextMenu.selectionText.trim().length > 0; height: visible ? implicitHeight : 0 }
+                        NoteMenuItem { text: "Search Google"; actionVisible: readerContextMenu.selectionText.trim().length > 0; onTriggered: studio.selectionAction("google", readerContextMenu.selectionText) }
+                        NoteMenuItem { text: "Ask " + (studio.selectionAssistantLabel || "ChatGPT") + "…"; actionVisible: readerContextMenu.selectionText.trim().length > 0; onTriggered: studio.selectionAction("assistant", readerContextMenu.selectionText) }
                     }
                     WheelHandler {
                         target: null
@@ -380,10 +389,12 @@ ApplicationWindow {
                                 // resetting zoomFactor afterward flashes a stale scale.
                                 event.accepted = true
                                 const dy = event.pixelDelta.y || event.angleDelta.y
-                                reader.runJavaScript("window.supermdNativeWheel?.(0," + (-dy) + "," + JSON.stringify({x:event.x,y:event.y}) + ",true)")
+                                reader.runJavaScript("window.supermdNativeWheel?.(0," + (-dy) + "," + JSON.stringify({x:event.x,y:event.y}) + ",true,true)")
                             } else if (event.pixelDelta.x || event.pixelDelta.y) {
                                 event.accepted = true
-                                reader.runJavaScript("window.supermdNativeWheel?.(" + (-event.pixelDelta.x) + "," + (-event.pixelDelta.y) + "," + JSON.stringify({x:event.x,y:event.y}) + "," + !!(event.buttons & Qt.LeftButton) + ")")
+                                // The reader gives text drags priority over held-button zoom.
+                                const held = Boolean(event.buttons & Qt.LeftButton)
+                                reader.runJavaScript("window.supermdNativeWheel?.(" + (-event.pixelDelta.x) + "," + (-event.pixelDelta.y) + "," + JSON.stringify({x:event.x,y:event.y}) + "," + held + ")")
                             } else event.accepted = false
                         }
                     }
@@ -497,14 +508,15 @@ ApplicationWindow {
         id: exportDialog
         objectName: "exportDialog"
         title: sharing ? "Share note" : "Export note"
-        width: Math.min(560, window.width - 48)
-        height: Math.min(760, window.height - 64)
+        uiScale: Math.max(1, Math.min(1.5, Math.min(window.width / 1280, window.height / 800)))
+        width: Math.min(window.width - 48, Math.max(560, Math.min(960, window.width * .48)))
+        height: Math.min(window.height - 64, 760 * uiScale)
         standardButtons: Dialog.Cancel
         ColumnLayout {
             anchors.fill: parent
-            spacing: 16
+            spacing: 16 * exportDialog.uiScale
             Label { text: sharing ? "Choose a format. Sharing availability depends on your desktop." : "PDF preserves the layout. Portable SMD includes editable Markdown and images."; wrapMode: Text.WordWrap; Layout.fillWidth: true }
-            ChoiceField { Layout.fillWidth: true; visible: model.length > 1; model: sharing ? ["PDF", "Portable SMD", "Markdown"] : viewState.portable ? ["PDF"] : ["PDF", "Portable SMD"]; currentIndex: outputFormat === "pdf" ? 0 : outputFormat === "smd" ? 1 : 2; onActivated: outputFormat = currentIndex === 0 ? "pdf" : currentIndex === 1 ? "smd" : "md" }
+            ChoiceField { Layout.fillWidth: true; Layout.minimumHeight: 48 * exportDialog.uiScale; font: exportDialog.font; visible: model.length > 1; model: sharing ? ["PDF", "Portable SMD", "Markdown"] : viewState.portable ? ["PDF"] : ["PDF", "Portable SMD"]; currentIndex: outputFormat === "pdf" ? 0 : outputFormat === "smd" ? 1 : 2; onActivated: outputFormat = currentIndex === 0 ? "pdf" : currentIndex === 1 ? "smd" : "md" }
             ScrollView {
                 id: exportScroll
                 Layout.fillWidth: true
@@ -515,11 +527,11 @@ ApplicationWindow {
                 ScrollBar.vertical: ExpressiveScrollBar { parent: exportScroll; x: exportScroll.width - width; y: 0; height: exportScroll.height }
                 ColumnLayout {
                     width: exportScroll.availableWidth
-                    PdfControls { objectName: "exportPdfControls"; ownerPopup: exportDialog; visible: outputFormat === "pdf"; Layout.fillWidth: true; viewportItem: exportScroll.contentItem; options: viewState.settings.pdf; onEdited: options => studio.setting("pdf", JSON.stringify(options)) }
+                    PdfControls { objectName: "exportPdfControls"; uiScale: exportDialog.uiScale; controlFont: exportDialog.font; ownerPopup: exportDialog; visible: outputFormat === "pdf"; Layout.fillWidth: true; viewportItem: exportScroll.contentItem; options: viewState.settings.pdf; onEdited: options => studio.setting("pdf", JSON.stringify(options)) }
                     Label { visible: outputFormat !== "pdf"; Layout.fillWidth: true; wrapMode: Text.WordWrap; text: outputFormat === "md" ? "Editable Markdown text. Choose portable SMD to include images in one file." : "A portable .smd keeps the editable Markdown and images together. Source mode never shows embedded image bytes." }
                 }
             }
-            ActionButton { text: sharing ? "Prepare share copy" : "Choose destination"; prominent: true; Layout.fillWidth: true; onClicked: window.chooseExportDestination() }
+            ActionButton { text: sharing ? "Prepare share copy" : "Choose destination"; font: exportDialog.font; prominent: true; Layout.fillWidth: true; Layout.minimumHeight: 44 * exportDialog.uiScale; onClicked: window.chooseExportDestination() }
         }
         onOpened: {
             forceActiveFocus()

@@ -25,6 +25,8 @@ def _production_context_menu_block():
     block = block.replace("NoteContextMenu {", "Production.NoteContextMenu {", 1)
     block = block.replace('text: "Copy";', 'objectName: "copyMenuItem"; text: "Copy";', 1)
     block = block.replace('text: "Select all";', 'objectName: "selectAllMenuItem"; text: "Select all";', 1)
+    block = block.replace('text: "Search Google";', 'objectName: "googleMenuItem"; text: "Search Google";', 1)
+    block = block.replace('text: "Ask " +', 'objectName: "assistantMenuItem"; text: "Ask " +', 1)
     return block
 
 
@@ -34,7 +36,7 @@ def _probe():
     os.environ.setdefault("QT_QUICK_BACKEND", "software")
     os.environ.setdefault("QTWEBENGINE_CHROMIUM_FLAGS", "--disable-gpu --disable-dev-shm-usage")
 
-    from PySide6.QtCore import QEvent, QPoint, QPointF, QUrl, Qt
+    from PySide6.QtCore import QEvent, QPoint, QPointF, QUrl, Qt, QObject, Property, Slot
     from PySide6.QtGui import QGuiApplication
     from PySide6.QtWidgets import QApplication
     from PySide6.QtQml import QQmlComponent, QQmlEngine
@@ -51,7 +53,13 @@ def _probe():
 
     qml_dir = ROOT / "qml"
     engine = QQmlEngine()
-    palette = Palette()
+    class SelectionPalette(Palette):
+        def __init__(self):super().__init__();self.selection_actions=[]
+        @Property(str, constant=True)
+        def selectionAssistantLabel(self):return 'ChatGPT'
+        @Slot(str,str)
+        def selectionAction(self,action,text):self.selection_actions.append((action,text))
+    palette = SelectionPalette()
     engine.rootContext().setContextProperty("studio", palette)
     engine.addImportPath(str(qml_dir))
     production_block = _production_context_menu_block()
@@ -67,6 +75,8 @@ ApplicationWindow {{
     property var reader: readerView
     property int contextMenuCount: 0
     property bool pageReady: false
+    property bool selectionReady: false
+    function checkSelection() {{ readerView.runJavaScript("window.getSelection().toString()", function(text) {{ selectionReady = text.includes('Synthetic selectable text') }}) }}
     property string menuItems: ""
     function collectMenuItems() {{
         let names = []
@@ -115,12 +125,18 @@ ApplicationWindow {{
         context_point = QPoint(180, 120)
         QTest.mouseMove(window, context_point)
         QTest.qWait(100)
+        before_menu=window.grabWindow().pixelColor(20,80).name()
         QTest.mouseClick(window, Qt.MouseButton.RightButton, Qt.KeyboardModifier.NoModifier, context_point)
         deadline = time.monotonic() + 3
         while not menu.property("visible") and time.monotonic() < deadline:
             QTest.qWait(30)
         if not menu.property("visible"):
             raise AssertionError("Right-click on loaded WebEngine content did not open the custom menu within 3 seconds")
+        ripples=[child.metaObject().className() for child in menu.findChildren(QObject) if 'Ripple' in child.metaObject().className()]
+        if ripples:
+            raise AssertionError(f"Stock material ripple leaked into reader menu: {ripples!r}")
+        if menu.property('selectionText'):
+            raise AssertionError('Opening an empty-page context menu invented a selection')
         window.collectMenuItems()
         labels = window.property("menuItems").split("|")
         if "Copy" not in labels or "Select all" not in labels:
@@ -135,6 +151,8 @@ ApplicationWindow {{
         shot = window.grabWindow()
         if shot.isNull():
             raise AssertionError("Could not capture rendered WebEngine menu")
+        if shot.pixelColor(20,80).name()!=before_menu:
+            raise AssertionError('Opening the menu painted an unrelated ripple in the top-left document area')
         pixel = shot.pixelColor(round(point.x()), round(point.y()))
         expected = palette.palette["surface-low"]
         if pixel.name().lower() != expected.lower():
@@ -147,14 +165,34 @@ ApplicationWindow {{
         select_point = select_all.mapToScene(QPointF(select_all.width() / 2, select_all.height() / 2))
         QTest.mouseClick(window, Qt.MouseButton.LeftButton, Qt.KeyboardModifier.NoModifier,
                          QPoint(round(select_point.x()), round(select_point.y())))
-        QTest.qWait(80)
+        deadline=time.monotonic()+3
+        while (menu.property('visible') or not window.property('selectionReady')) and time.monotonic()<deadline:
+            window.checkSelection();QTest.qWait(30)
+        if not window.property('selectionReady'):raise AssertionError('Select all did not establish native selected text')
         QTest.mouseClick(window, Qt.MouseButton.RightButton, Qt.KeyboardModifier.NoModifier, context_point)
-        QTest.qWait(120)
+        deadline=time.monotonic()+3
+        while not menu.property('visible') and time.monotonic()<deadline:QTest.qWait(30)
         if not menu.property("visible"):
             raise AssertionError("Could not reopen reader menu after selecting page text")
         copy = window.findChild(object, "copyMenuItem")
         if copy is None or not copy.property("enabled"):
             raise AssertionError("Copy did not become enabled after selecting page text")
+        if 'Synthetic selectable text' not in menu.property('selectionText'):
+            raise AssertionError('Context action did not capture the selected text before menu focus changed')
+        window.collectMenuItems()
+        if 'Search Google' not in window.property('menuItems') or 'Ask ChatGPT' not in window.property('menuItems'):
+            raise AssertionError('Selected-text search actions missing from native reader menu')
+        QTest.mouseMove(window,copy.mapToScene(QPointF(copy.width()/2,copy.height()/2)).toPoint())
+        QTest.qWait(50)
+        highlight=copy.property('background');shot=window.grabWindow()
+        if os.environ.get('SUPERMD_MENU_TEST_OUTPUT'):shot.save(os.environ['SUPERMD_MENU_TEST_OUTPUT'])
+        def highlight_pixel(x,y):
+            point=highlight.mapToScene(QPointF(x,y));return shot.pixelColor(round(point.x()),round(point.y())).name()
+        if highlight_pixel(highlight.width()/2,highlight.height()/2)!=palette.palette['surface-high']:
+            raise AssertionError(f"Hovered item did not paint its highlight: {highlight_pixel(highlight.width()/2,highlight.height()/2)}, hovered={copy.property('hovered')}, highlighted={copy.property('highlighted')}, size={highlight.width()}x{highlight.height()}")
+        if highlight_pixel(0,0)!=expected:
+            raise AssertionError('Hovered item has square corners instead of exposing menu surface')
+        if os.environ.get('SUPERMD_MENU_TEST_OUTPUT'):shot.save(os.environ['SUPERMD_MENU_TEST_OUTPUT'])
         copy_point = copy.mapToScene(QPointF(copy.width() / 2, copy.height() / 2))
         QTest.mouseClick(window, Qt.MouseButton.LeftButton, Qt.KeyboardModifier.NoModifier,
                          QPoint(round(copy_point.x()), round(copy_point.y())))
@@ -162,6 +200,19 @@ ApplicationWindow {{
         copied = QGuiApplication.clipboard().text()
         if "Synthetic selectable text" not in copied:
             raise AssertionError(f"Select all / Copy did not copy the synthetic page text: {copied!r}")
+        for name,action in [('googleMenuItem','google'),('assistantMenuItem','assistant')]:
+            deadline=time.monotonic()+3
+            while menu.property('visible') and time.monotonic()<deadline:QTest.qWait(20)
+            QTest.mouseClick(window,Qt.RightButton,Qt.NoModifier,context_point)
+            deadline=time.monotonic()+3
+            while not menu.property('visible') and time.monotonic()<deadline:QTest.qWait(20)
+            item=window.findChild(QObject,name)
+            if not item or not item.property('visible'):raise AssertionError(f'{name} was not available for selected text')
+            QTest.mouseClick(window,Qt.LeftButton,Qt.NoModifier,item.mapToScene(QPointF(item.width()/2,item.height()/2)).toPoint())
+            deadline=time.monotonic()+3
+            while (not palette.selection_actions or palette.selection_actions[-1][0]!=action) and time.monotonic()<deadline:QTest.qWait(20)
+            if not palette.selection_actions or palette.selection_actions[-1]!=(action,copied):
+                raise AssertionError(f'{action} did not receive the exact selected text: {palette.selection_actions!r}')
     finally:
         window.close()
         window.deleteLater()

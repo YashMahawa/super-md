@@ -68,7 +68,11 @@ export function applyDocumentZoom(root:HTMLElement, zoom:number, widthPercent:nu
   const scaled=width*next,overflow=scaled+32>viewport;
   const fullscreen=root.ownerDocument.documentElement.dataset.fullscreen==="true";
   const room=overflow?Math.max(16,viewport*.25):fullscreen?Math.max(0,viewport-scaled-32):0;
-  const left=overflow?room:room?16+room:Math.max(16,(viewport-scaled)/2);
+  let left=overflow?room:room?16+room:Math.max(16,(viewport-scaled)/2);
+  // Chromium can collapse each drag update to a caret when tiny transformed
+  // text has a fractional X translation (notably a zoomed-out Split pane).
+  // Align the compositor translation, without changing text width/wrapping.
+  if(root.ownerDocument.documentElement.dataset.platform==='desktop'&&next<1)left=Math.round(left);
   const spaceWidth=overflow?scaled+2*room:room?viewport+room:viewport;
   measured.spaceWidth=spaceWidth;measured.locked=centerLocked;root.dataset.centerLocked=String(centerLocked);
   if(page.style.zoom && page.style.zoom!=="1")page.style.zoom="1";

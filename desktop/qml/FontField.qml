@@ -53,6 +53,7 @@ ActionButton {
             spacing: 8
             TextField {
                 id: query
+                font: field.font
                 objectName: "fontSearch"
                 Layout.fillWidth: true
                 placeholderText: "Search fonts"
@@ -77,7 +78,8 @@ ActionButton {
                     required property string modelData
                     required property int index
                     width: results.width - 18
-                    height: 44
+                    height: Math.max(44, Math.ceil(field.font.pixelSize * 44 / 14))
+                    font: field.font
                     text: modelData
                     highlighted: index === results.currentIndex
                     onClicked: { field.chosen(modelData); picker.close() }

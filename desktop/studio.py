@@ -39,6 +39,7 @@ import pending_python
 from export_jobs import ExportJobRegistry
 import file_events
 import custom_theme
+from selection_actions import ASSISTANTS, selection_target
 
 ROOT = Path(sys._MEIPASS)/"resources" if getattr(sys,"frozen",False) else Path(__file__).resolve().parent.parent
 DEFAULT_PDF = {"pageSize": "a4", "margin": 18, "fontSize": 10, "lineHeight": 1.45, "paragraphSpacing": 1.2, "fontFamily": "Manrope", "pageNumbers": True, "themed": False}
@@ -47,6 +48,7 @@ DEFAULTS.update(widthMigrated=True, window={"width":1320,"height":880,"maximized
 DEFAULTS.update(restorePosition=True, centerLock=True, startup="restore", imageAppearance="original", svgAppearance="original", imageContrast=1.25, fullDocumentAccessibility=False)
 DEFAULTS.update(patternKind="",patternOpacity=-1,patternSize=0,patternSpacing=0)
 DEFAULTS.update(desktopIntegration=False)
+DEFAULTS.update(selectionAssistant="chatgpt")
 SAMPLE = """# A place to think\n\nWrite in Markdown. Read without distractions.\n\n> [!tip] Start with your notes\n> Open any note or folder. No vault, no import process.\n\n## Learn by exploring\n\n$$E = mc^2$$\n\n> [!answer]- Why does this matter?\n> Tap the heading to reveal an answer, then hide it to test yourself.\n\n```smd-chart\n{\"title\":\"A changing wave\",\"series\":[{\"name\":\"Sine\",\"expression\":\"sin(a*x)\",\"color\":\"#386a57\"},{\"name\":\"Cosine\",\"expression\":\"cos(a*x)\",\"color\":\"#bc6750\"}],\"sliders\":[{\"name\":\"a\",\"min\":0.2,\"max\":3,\"value\":1}]}\n```\n\n## Matplotlib in three dimensions\n\nRun a Python cell to generate a 3D figure, then save it in your note or PDF.\n\n```python\nimport numpy as np\nimport matplotlib.pyplot as plt\nx, y = np.meshgrid(np.linspace(-2, 2, 32), np.linspace(-2, 2, 32))\nfig = plt.figure()\nax = fig.add_subplot(111, projection=\"3d\")\nax.plot_surface(x, y, x*x + y*y, cmap=\"viridis\")\n```\n\n[Back to exploring](#learn-by-exploring)\n"""
 
 def public_address(url: str) -> str:
@@ -613,6 +615,22 @@ class Studio(QObject):
 
     @Property(bool,notify=changed)
     def readerFullscreen(self):return self.fullscreen
+
+    @Property(str,notify=changed)
+    def selectionAssistantLabel(self):
+        provider=self.settings.get("selectionAssistant")
+        return ASSISTANTS.get(provider,"ChatGPT") if isinstance(provider,str) else "ChatGPT"
+
+    @Slot(str,str)
+    def selectionAction(self, action, text):
+        try:
+            url, copy_text, message=selection_target(action,text,self.settings.get("selectionAssistant","chatgpt"))
+            if copy_text:QGuiApplication.clipboard().setText(text.replace("\u2029","\n"))
+            opened=QDesktopServices.openUrl(QUrl(url))
+            self.message=message if opened else "Could not open your browser." + (" The selected text is copied." if copy_text else "")
+        except (ValueError,UnicodeError) as error:
+            self.message=str(error)
+        self._emit(False)
 
     @Property(bool,notify=changed)
     def retired(self):return self._retired
@@ -1397,6 +1415,7 @@ class Studio(QObject):
         if key in ("theme","fullTheme") and value not in ("system","light","dark","black"): return
         if key=="accent" and value not in ("system","blue","green","violet","rose","amber"):return
         if key=="startup" and value not in ("restore","new"):return
+        if key=="selectionAssistant" and (not isinstance(value,str) or value not in ASSISTANTS):return
         if key=="patternKind" and value not in ("","none","paws","dots","grid","diagonal","gradient"):return
         if key in ("patternOpacity","patternSize","patternSpacing"):
             if not isinstance(value,(int,float)) or isinstance(value,bool) or not math.isfinite(value):return

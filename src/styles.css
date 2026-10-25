@@ -19,6 +19,7 @@
   --editor-leading: 1.7;
   --reader-size: 17px;
   --reader-width: 880px;
+  --reader-ui-font-size: clamp(16px, calc(12px + .35vw), 22px);
   /* One Material theme for official and community components. Shape rule:
      pill actions, 16px filled fields, 24px panes, 28px modal surfaces. */
   --md-ref-typeface-brand: "Manrope Variable", system-ui, sans-serif;
@@ -529,17 +530,19 @@ button.code-copy:active { border-radius:10px; }
 .repair-item pre { white-space:pre-wrap;overflow-wrap:anywhere;font:13px/1.5 var(--mono);margin:12px 0 0;padding:12px;border-radius:10px;background:var(--surface-high); }
 .repair-item summary { cursor:pointer;margin-top:12px;color:var(--muted);font-size:12px; }
 .image-viewer header { padding-right:24px; }
-.reading-search { position:absolute;z-index:100;top:12px;right:24px;left:24px;max-width:800px;margin:auto;padding:12px;display:flex;align-items:center;flex-wrap:wrap;gap:8px;background:var(--surface-high);border:1px solid var(--outline);border-radius:20px;box-shadow:0 6px 24px var(--shadow);font:13px/1.5 var(--md-ref-typeface-plain,system-ui); }
-.reading-search input { flex:1 1 180px;min-width:120px;width:auto;min-height:44px;border-radius:12px; }
-.reading-search button { min-height:36px;padding:8px 12px;border-radius:18px;background:var(--surface-low);color:var(--text); }
-.reading-search output { min-width:60px;color:var(--muted);font-variant-numeric:tabular-nums; }
-.reading-search .search-icon { width:40px;height:40px;padding:8px;display:grid;place-items:center;flex:none; }
+.reading-search { position:absolute;z-index:100;top:12px;right:24px;left:24px;max-width:1440px;max-height:calc(100dvh - 32px);overflow:auto;margin:auto;padding:clamp(12px,1vw,20px);display:flex;align-items:center;flex-wrap:wrap;gap:.5em;background:var(--surface-high);border:1px solid var(--outline);border-radius:24px;box-shadow:0 6px 24px var(--shadow);font:var(--reader-ui-font-size)/1.5 "Manrope",var(--md-ref-typeface-plain,system-ui); }
+.reading-search input { flex:1 1 240px;min-width:min(100%,140px);width:auto;min-height:2.75em;padding:.6em .85em;border:1px solid var(--outline);border-radius:14px;background:var(--surface-low);color:var(--text);font:inherit;line-height:1.4; }
+.reading-search input:focus-visible {outline:2px solid var(--primary);outline-offset:1px;}
+.reading-search button { min-height:2.5em;padding:.5em .75em;border-radius:1.2em;background:var(--surface-low);color:var(--text); }
+.reading-search output { min-width:3.75em;color:var(--muted);font-variant-numeric:tabular-nums; }
+.reading-search .search-icon { width:2.75em;height:2.75em;padding:.7em;display:grid;place-items:center;flex:none; }
+.reading-search .search-icon svg {width:1.25em;height:1.25em;}
 .reading-search button[aria-pressed="true"] { background:var(--primary);color:var(--on-primary); }
 .search-replace { display:flex;flex-wrap:wrap;align-items:center;gap:8px;flex-basis:100%;padding-top:8px;border-top:1px solid var(--outline); }
 .search-replace small { flex-basis:100%;color:var(--muted);padding:0 4px; }
 ::highlight(smd-search) { background-color:color-mix(in srgb,var(--primary) 35%,transparent);color:var(--text); }
 ::highlight(smd-search-current) { background-color:var(--primary);color:var(--on-primary); }
-.cm-panel.cm-search { display:flex;flex-wrap:wrap;align-items:center;gap:8px;padding:12px 18px !important;background:var(--surface-high);color:var(--text);border-bottom:1px solid var(--outline); }
+.cm-panel.cm-search { display:flex;flex-wrap:wrap;align-items:center;gap:8px;padding:12px 18px !important;background:var(--surface-high);color:var(--text);border-bottom:1px solid var(--outline);font:var(--reader-ui-font-size)/1.5 "Manrope",var(--md-ref-typeface-plain,system-ui); }
 .cm-search input:not([type="checkbox"]) { width:min(240px,100%);min-height:40px;padding:8px 12px !important;font:inherit !important; }
 .cm-search label { display:inline-flex;align-items:center;gap:6px;white-space:nowrap; }
 .cm-search input[type="checkbox"] { width:18px;height:18px;margin:0 4px; }
