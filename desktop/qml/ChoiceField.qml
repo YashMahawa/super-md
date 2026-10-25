@@ -7,6 +7,7 @@ ComboBox {
     id: control
     property var colors: studio.palette
     property bool motion: studio.motionEnabled
+    readonly property real rowHeight: Math.max(44, Math.ceil(font.pixelSize * 44 / 14))
     // A menu is constrained by its actual scroll viewport, not the whole window.
     property Item viewportItem: null
     function positionChoices() {
@@ -19,11 +20,11 @@ ComboBox {
         const above = Math.max(0, field.y - 6 - top)
         // Prefer a short, scrollable menu below the field over flipping across
         // unrelated section labels. Only open above when even two rows won't fit.
-        const desired = Math.min(7, control.count) * 44 + 16
+        const desired = Math.min(7, control.count) * control.rowHeight + 16
         const openBelow = below >= Math.min(104, desired) || below >= above
         const available = openBelow ? below : above
-        const rows = Math.max(1, Math.min(7, control.count, Math.floor((available - 16) / 44)))
-        choices.height = Math.min(available, rows * 44 + 16)
+        const rows = Math.max(1, Math.min(7, control.count, Math.floor((available - 16) / control.rowHeight)))
+        choices.height = Math.min(available, rows * control.rowHeight + 16)
         choices.x = field.x
         choices.y = openBelow ? field.y + control.height + 6 : field.y - 6 - choices.height
     }
@@ -85,7 +86,7 @@ ComboBox {
         required property var modelData
         required property int index
         width: Math.max(0, choicesList.width - 20)
-        height: 44
+        height: control.rowHeight
         text: modelData.toString()
         font: control.font
         highlighted: control.highlightedIndex === index

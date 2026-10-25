@@ -6,7 +6,7 @@ can scroll horizontally. Native chrome stays fixed. Source mode scales editor te
 
 | Area | Gesture | Result |
 | --- | --- | --- |
-| Document | Pinch / Ctrl-wheel / held-left-button wheel | Focal page zoom |
+| Document | Pinch / Ctrl-wheel / held-left-button wheel on empty page space | Focal page zoom (text drags keep selecting and scrolling) |
 | Document | Two-finger movement | Pan the magnified page |
 | Graph canvas | Left drag / two-finger movement | Pan camera |
 | Graph canvas | Pinch / Ctrl-wheel / held-left-button wheel | Focal graph zoom |

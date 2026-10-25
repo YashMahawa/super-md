@@ -3,6 +3,23 @@
 This describes the current development source. Check the installed application's
 version before assuming a new feature is in a published release.
 
+## Selection, search and assistants
+
+Select text normally in Read, Live or Split. Scrolling during a text drag keeps
+the current magnification; Ctrl/Cmd-wheel and pinch still zoom. Held-button
+wheel zoom is available on empty page space and independently inside plots.
+
+Right-click selected text on desktop, or use Android's selection toolbar, to
+choose **Search Google** or **Ask ChatGPT**. Settings → Selected text lets you
+choose ChatGPT, Gemini or Claude. Google searches the selected excerpt. Ask
+copies the complete selection and opens the assistant's site for you to paste,
+review and send; it never submits a prompt automatically. This fallback avoids
+unverified prefill-only links. Nothing is sent just because text is selected.
+
+Search and export panels adapt to the window size without magnifying the rest
+of the interface. PDF export uses one expressive animation, retains accessible
+progress information, and can be cancelled before publishing the result.
+
 ## Files and portable images
 
 Write ordinary notes as UTF-8 **`.md`**. Use normal Markdown, not vault metadata.

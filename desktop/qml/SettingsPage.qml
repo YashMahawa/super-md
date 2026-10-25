@@ -111,6 +111,9 @@ Pane {
                 Switch { text: "Spell check"; checked: viewState.settings.spellCheck; onToggled: page.save("spellCheck", checked) }
                 Switch { text: "Grammar check"; checked: viewState.settings.grammarCheck; onToggled: page.save("grammarCheck", checked) }
                 Label { text: "Offline English suggestions in Source and Live editing. Grammar checks repeated words and a/an. Code, links and LaTeX are excluded; no text is uploaded or automatically replaced."; Layout.fillWidth: true; wrapMode: Text.WordWrap; color: viewState.colors.muted }
+                Label { text: "Selected text"; font.pixelSize: 22; font.weight: Font.DemiBold; Layout.topMargin: 12 }
+                ChoiceField { Layout.fillWidth: true; Accessible.name: "Selection assistant"; model: ["ChatGPT", "Gemini", "Claude"]; currentIndex: Math.max(0,["chatgpt","gemini","claude"].indexOf(viewState.settings.selectionAssistant)); onActivated: page.save("selectionAssistant",["chatgpt","gemini","claude"][currentIndex]) }
+                Label { Layout.fillWidth: true; wrapMode: Text.WordWrap; color: viewState.colors.muted; text: "Right-click selected text to search Google or ask this assistant. Ask copies the text and opens its site for you to paste and review, since prefill-only web links are not verified. It never submits a prompt automatically." }
                 Label { text: "Python"; font.pixelSize: 22; font.weight: Font.DemiBold; Layout.topMargin: 12 }
                 Label { text: "Code runs only when you press Run. Pick where it runs; numpy and matplotlib are needed for plots."; wrapMode: Text.WordWrap; Layout.fillWidth: true; color: viewState.colors.muted }
                 Repeater {

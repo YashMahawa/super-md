@@ -1,6 +1,19 @@
 // @vitest-environment jsdom
 import {expect,it,vi} from 'vitest';
 import {applyDocumentZoom,enforceDocumentCenter,invalidateDocumentZoom,settleDocumentZoom,refreshDocumentExtent} from './documentZoom';
+it('zoomed-out desktop translation aligns native selection without changing base wrapping width',()=>{
+  const previous=document.documentElement.dataset.platform;
+  document.documentElement.dataset.platform='desktop';
+  try {
+    const root=document.createElement('section'),space=document.createElement('div'),page=document.createElement('div');page.className='document-page';root.append(space);space.append(page);
+    page.getBoundingClientRect=()=>({left:800.5,top:0} as DOMRect);root.getBoundingClientRect=()=>({left:800.5,top:0,width:799,height:800} as DOMRect);
+    Object.defineProperty(root,'clientWidth',{value:799});Object.defineProperty(page,'offsetHeight',{value:10000});
+    applyDocumentZoom(root,40,90,undefined,undefined,undefined,true);
+    const left=Number(page.dataset.zoomLeft),base=Number.parseFloat(page.style.width);
+    expect(left).toBe(Math.round(left));expect(base).toBeCloseTo((799-32)*.9);
+    expect(Math.abs(left+base*.4/2-799/2)).toBeLessThanOrEqual(.5);
+  } finally {if(previous===undefined)delete document.documentElement.dataset.platform;else document.documentElement.dataset.platform=previous;}
+});
 it('centre lock survives off-centre zoom and horizontal gestures without touching vertical momentum',()=>{
   const root=document.createElement('section'),space=document.createElement('div'),page=document.createElement('div');page.className='document-page';root.append(space);space.append(page);
   const bounds=vi.fn(()=>({left:0,top:0,width:1000,height:800} as DOMRect));root.getBoundingClientRect=bounds;page.getBoundingClientRect=bounds;

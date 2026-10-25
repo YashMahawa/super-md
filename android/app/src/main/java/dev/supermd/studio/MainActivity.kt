@@ -419,7 +419,7 @@ private object NoMotionScheme : MotionScheme {
                         layoutParams = ViewGroup.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT)
                         clipChildren = true
                         clipToPadding = true
-                        addView(WebView(context).apply {
+                        addView(SelectionReaderWebView(context, model).apply {
                             // Percentage-height HTML needs MATCH_PARENT, not
                             // WRAP_CONTENT. The native container also confines
                             // WebView's accelerated drawing to the reading pane.
@@ -658,6 +658,10 @@ internal class NoteDestination(private val mime: String, private val preferred: 
                 Row(verticalAlignment=Alignment.CenterVertically){Text("Spell check",Modifier.weight(1f));Switch(checked=state.spellCheck,onCheckedChange={model.writing(spellCheck=it)})}
                 Row(verticalAlignment=Alignment.CenterVertically){Text("Grammar check",Modifier.weight(1f));Switch(checked=state.grammarCheck,onCheckedChange={model.writing(grammarCheck=it)})}
                 Text("Offline English suggestions in Source and Live editing. Grammar checks repeated words and a/an. Code, links and LaTeX are excluded; no text is uploaded or automatically replaced.",style=MaterialTheme.typography.bodySmall,color=MaterialTheme.colorScheme.onSurfaceVariant)
+            }
+            SettingsSection("Selected text") {
+                Choice("Selection assistant", state.selectionAssistant, SelectionActions.assistants, model::selectionAssistant)
+                Text("Select text and use Search Google or Ask in the selection toolbar. Ask copies the text and opens the assistant for you to paste and review; it never submits a prompt automatically.",style=MaterialTheme.typography.bodySmall,color=MaterialTheme.colorScheme.onSurfaceVariant)
             }
             SettingsSection("Python & windows") {
                 Text("NumPy and Matplotlib run locally in a separate worker. Code runs only when you press Run; never automatically on open or export.", style = MaterialTheme.typography.bodyMedium)

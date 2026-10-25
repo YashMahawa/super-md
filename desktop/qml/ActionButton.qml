@@ -13,7 +13,7 @@ Button {
     font.family: "Noto Sans"
     font.pixelSize: 14
     font.weight: Font.Medium
-    implicitHeight: compact ? 36 : 44
+    implicitHeight: Math.max(compact ? 36 : 44, contentItem.implicitHeight + topPadding + bottomPadding)
     implicitWidth: Math.max(text.length ? 64 : 44, contentItem.implicitWidth + leftPadding + rightPadding)
     topInset: 0
     bottomInset: 0

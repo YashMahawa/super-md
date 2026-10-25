@@ -5,7 +5,10 @@ import QtQuick.Controls.Material
 MenuItem {
     id: item
     property var colors: studio.palette
-    implicitHeight: 42
+    property bool actionVisible: true
+    visible: actionVisible
+    hoverEnabled: true
+    implicitHeight: actionVisible ? 42 : 0
     font.family: "Noto Sans"
     font.pixelSize: 14
     leftPadding: 12
