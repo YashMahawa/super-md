@@ -86,6 +86,12 @@ internal class ReaderBridge(
                     "reading_position" -> {model.readingPosition(args.getString("id"),args.getJSONObject("location"));true}
                     "zoom_changed" -> { model.readerZoom(args.getDouble("zoom").toFloat(), args.optBoolean("fullscreen", model.state.value.fullscreen)); true }
                     "reader_overlay_changed" -> { model.overlay(args.optBoolean("open"), args.optBoolean("image")); true }
+                    "copy_text" -> {
+                        val text=args.opt("text") as? String ?: error("Clipboard text is invalid")
+                        require(text.length<=2_000_000) {"Clipboard text is too large"}
+                        web.context.getSystemService(android.content.ClipboardManager::class.java).setPrimaryClip(android.content.ClipData.newPlainText("Super MD",text))
+                        true
+                    }
                     "document_outline" -> { model.outline(args.getString("id"), args.getJSONArray("headings")); true }
                     "load_font" -> withContext(Dispatchers.IO) {model.fonts.reader(args.getString("family"))}
                     "cache_python_output" -> cachePythonOutput(args)

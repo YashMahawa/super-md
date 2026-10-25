@@ -1,9 +1,10 @@
 import { useEffect, useRef, useState } from "react";
 import { Compartment, EditorSelection, EditorState,Transaction } from "@codemirror/state";
 import { EditorView, keymap, lineNumbers, highlightActiveLine, drawSelection } from "@codemirror/view";
-import { defaultKeymap, history, historyField, historyKeymap, indentWithTab, undo, redo } from "@codemirror/commands";
+import { defaultKeymap, history, historyField, historyKeymap, indentWithTab, undo, redo,isolateHistory } from "@codemirror/commands";
 import { markdown, markdownLanguage } from "@codemirror/lang-markdown";
-import { syntaxHighlighting, defaultHighlightStyle, foldGutter, foldKeymap, syntaxTree } from "@codemirror/language";
+import { syntaxHighlighting, defaultHighlightStyle, foldGutter, foldKeymap, syntaxTree,syntaxTreeAvailable } from "@codemirror/language";
+import {repairPastedMath} from '../mathRepair';
 import {linter,type Diagnostic} from "@codemirror/lint";
 import {checkWriting,type WritingOptions} from "../proofreading";
 import { search, searchKeymap, highlightSelectionMatches, openSearchPanel, SearchQuery, setSearchQuery } from "@codemirror/search";
@@ -11,6 +12,7 @@ import { oneDarkHighlightStyle } from "@codemirror/theme-one-dark";
 import type {SourceChange} from '../readerEdits';
 
 interface Props extends WritingOptions {
+  latexAutofix?:boolean;
   sessionId?: string;
   value: string;
   onChange: (value: string, changes?:SourceChange[]) => void;
@@ -27,9 +29,11 @@ function trimEditorSessions() {
     if (sessions.size<=1 || sessions.size <= 40 && retained <= 4_000_000) break;
     sessions.delete(id); retained -= entry.state.doc.length;
     callbacks.delete(id); statusHandlers.delete(id);
+    pasteSettings.delete(id);
   }
 }
 const callbacks = new Map<string, (value: string,changes?:SourceChange[]) => void>();
+const pasteSettings=new Map<string,boolean>();
 const statusHandlers = new Map<string, (state: EditorState) => void>();
 const visibleEditors = new Map<string, EditorView>();
 export function editorReadingOffset(id:string):number|undefined {
@@ -68,7 +72,8 @@ export function importEditorSession(id: string, data: PortableEditorSession | un
   incomingWeights.set(id,size);let retained=[...incomingWeights.values()].reduce((n,size)=>n+size,0);
   while(incomingSessions.size>40||retained>4_000_000){const first=incomingSessions.keys().next().value!;incomingSessions.delete(first);retained-=incomingWeights.get(first)||0;incomingWeights.delete(first);}
 }
-export default function Editor({ sessionId = "default", value, onChange, dark, focusMode,spellCheck=false,grammarCheck=false }: Props) {
+export default function Editor({ sessionId = "default", value, onChange, dark, focusMode,spellCheck=false,grammarCheck=false,latexAutofix=false }: Props) {
+  pasteSettings.set(sessionId,latexAutofix);
   const host = useRef<HTMLDivElement>(null);
   const view = useRef<EditorView | null>(null);
   const changeHandler = useRef(onChange);
@@ -122,6 +127,21 @@ export default function Editor({ sessionId = "default", value, onChange, dark, f
         lineNumbers(),
         foldGutter(),
         history({ minDepth: 30 }),
+        EditorView.domEventHandlers({paste(event,editor){
+          if(!pasteSettings.get(sessionId)||event.defaultPrevented||event.clipboardData?.files.length)return false;
+          const text=event.clipboardData?.getData('text/plain');if(!text||!/[\\$^]/.test(text))return false;
+          let repaired:string|undefined;
+          for(const range of editor.state.selection.ranges){
+            if(!syntaxTreeAvailable(editor.state,range.to))return false;
+            for(let node=syntaxTree(editor.state).resolveInner(range.from,-1);node;node=node.parent!){
+              if(['FencedCode','CodeBlock','InlineCode','HTMLBlock','HTMLTag','Link','Image','URL'].includes(node.name)&&!(range.from<=node.from&&range.to>=node.to))return false;
+            }
+            const next=repairPastedMath(text,editor.state.sliceDoc(Math.max(0,range.from-16_384),range.from),editor.state.sliceDoc(range.to,Math.min(editor.state.doc.length,range.to+16_384)));
+            if(repaired!==undefined&&repaired!==next)return false;repaired=next;
+          }
+          if(repaired===undefined||repaired===text)return false;
+          event.preventDefault();editor.dispatch({...editor.state.replaceSelection(repaired),annotations:isolateHistory.of('full'),userEvent:'input.paste',scrollIntoView:true});return true;
+        }}),
         drawSelection(),
         highlightActiveLine(),
         highlightSelectionMatches(),

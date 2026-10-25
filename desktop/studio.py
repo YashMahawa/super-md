@@ -49,6 +49,7 @@ DEFAULTS.update(restorePosition=True, centerLock=True, startup="restore", imageA
 DEFAULTS.update(patternKind="",patternOpacity=-1,patternSize=0,patternSpacing=0)
 DEFAULTS.update(desktopIntegration=False)
 DEFAULTS.update(selectionAssistant="chatgpt")
+DEFAULTS.update(latexAutofix=False)
 SAMPLE = """# A place to think\n\nWrite in Markdown. Read without distractions.\n\n> [!tip] Start with your notes\n> Open any note or folder. No vault, no import process.\n\n## Learn by exploring\n\n$$E = mc^2$$\n\n> [!answer]- Why does this matter?\n> Tap the heading to reveal an answer, then hide it to test yourself.\n\n```smd-chart\n{\"title\":\"A changing wave\",\"series\":[{\"name\":\"Sine\",\"expression\":\"sin(a*x)\",\"color\":\"#386a57\"},{\"name\":\"Cosine\",\"expression\":\"cos(a*x)\",\"color\":\"#bc6750\"}],\"sliders\":[{\"name\":\"a\",\"min\":0.2,\"max\":3,\"value\":1}]}\n```\n\n## Matplotlib in three dimensions\n\nRun a Python cell to generate a 3D figure, then save it in your note or PDF.\n\n```python\nimport numpy as np\nimport matplotlib.pyplot as plt\nx, y = np.meshgrid(np.linspace(-2, 2, 32), np.linspace(-2, 2, 32))\nfig = plt.figure()\nax = fig.add_subplot(111, projection=\"3d\")\nax.plot_surface(x, y, x*x + y*y, cmap=\"viridis\")\n```\n\n[Back to exploring](#learn-by-exploring)\n"""
 
 def public_address(url: str) -> str:
@@ -410,7 +411,7 @@ class Studio(QObject):
         if load and self.ready:
             tab = self._current()
             colors = self._colors()
-            reading_settings={key:self.settings[key] for key in ("restorePosition","centerLock","imageAppearance","svgAppearance","imageContrast","fullDocumentAccessibility")}
+            reading_settings={key:self.settings[key] for key in ("restorePosition","centerLock","imageAppearance","svgAppearance","imageContrast","fullDocumentAccessibility","latexAutofix")}
             reading_settings["customStyle"]=custom_theme.reader(self.session.custom_theme,self.settings["fullTheme" if self.fullscreen else "theme"],self._dark(),self.settings)
             payload={**reading_settings,"readingLocation":self.session.locations.get(tab["path"]),"id": tab["id"], "path": tab["path"] or tab["id"], "mode": self.mode, "dark": self._dark(), "fullscreen": self.fullscreen, "font": self.settings["font"], "size": self.settings["size"], "widthPercent": self.settings["widthPercent"], "lineHeight":self.settings["lineHeight"], "spellCheck":self.settings["spellCheck"], "grammarCheck":self.settings["grammarCheck"], "zoom": self.settings["fullZoom" if self.fullscreen else "normalZoom"], "motion": self.settings["motion"], "python": self.settings["python"], "colors": colors, "viewState": tab.pop("viewState", None)}
             payload["editProtocol"]=1
@@ -982,7 +983,7 @@ class Studio(QObject):
     def chooseThemeExport(self):self.themeExportRequested.emit()
 
     @Slot()
-    def openThemeGuide(self):QDesktopServices.openUrl(QUrl("https://github.com/YashMahawa/super-md/blob/main/docs/THEMING.md"))
+    def openThemeGuide(self):self.readerCall.emit("window.supermdThemeGuide?.()")
 
     def _watch_custom_theme(self):
         watcher=self.custom_theme_watcher
@@ -1424,7 +1425,7 @@ class Studio(QObject):
         if key in ("imageAppearance","svgAppearance") and value not in ("original","invert-dark","auto","monochrome","contrast"):return
         if key in ("restorePosition","centerLock") and not isinstance(value,bool):return
         if key=="imageContrast" and (not isinstance(value,(int,float)) or isinstance(value,bool) or not math.isfinite(value) or not 1<=value<=2):return
-        if key in ("motion","welcomed","autosave","checkUpdates","autoUpdate","spellCheck","grammarCheck","desktopIntegration","fullDocumentAccessibility") and not isinstance(value,bool): return
+        if key in ("motion","welcomed","autosave","checkUpdates","autoUpdate","spellCheck","grammarCheck","latexAutofix","desktopIntegration","fullDocumentAccessibility") and not isinstance(value,bool): return
         if key in ("font","python") and (not isinstance(value,str) or not value.strip() or len(value)>2048): return
         if key == "python":
             try: value = python_runtime.validate(value.strip())
@@ -1710,6 +1711,10 @@ class Studio(QObject):
                 if self.fullscreen: self.chromeRequested.emit(action)
                 self.replied.emit(id,"true",""); return
             if command == "reader_overlay_changed": self.reader_overlay = bool(args.get("open")); self.image_overlay = bool(args.get("image")); self._emit(False); self.replied.emit(id,"true",""); return
+            if command == "copy_text":
+                text=args.get("text")
+                if not isinstance(text,str) or len(text)>2_000_000:raise ValueError("Clipboard text is too large or invalid")
+                QGuiApplication.clipboard().setText(text);self.replied.emit(id,"true","");return
             if command == "reading_position":
                 target=next((t for t in self.tabs if t["id"]==args.get("id")),None);location=args.get("location")
                 if target and target["path"] and self.settings["restorePosition"] and isinstance(location,dict):

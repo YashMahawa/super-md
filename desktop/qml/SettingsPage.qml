@@ -58,7 +58,7 @@ Pane {
                     ActionButton { text:"Import theme…";glyph:"FolderOpen";tonal:true;onClicked:studio.chooseCustomTheme() }
                     ActionButton { text:studio.customThemeActive ? "Export theme…" : "Export template…";glyph:"Export";tonal:true;onClicked:studio.chooseThemeExport() }
                     ActionButton { text:"Share theme…";glyph:"ShareNetwork";visible:studio.customThemeActive;tonal:true;onClicked:studio.chooseThemeExport();ToolTip.text:"Save a portable theme file to send to another device" }
-                    ActionButton { text:"Authoring guide";onClicked:studio.openThemeGuide() }
+                    ActionButton { text:"Authoring guide";enabled:viewState.readerReady===true;onClicked:{if(page.ownerPopup)page.ownerPopup.close();studio.openThemeGuide();const host=page.Window.window;if(host&&typeof host.focusReader==="function")host.focusReader()} }
                     ActionButton { text:"Edit theme file";visible:studio.customThemeActive;onClicked:studio.editCustomTheme() }
                     ActionButton { text:"Reload";visible:studio.customThemeActive;onClicked:studio.reloadCustomTheme() }
                     ActionButton { text:"Reset to built-in";visible:studio.customThemeActive;onClicked:studio.resetCustomTheme() }
@@ -110,6 +110,8 @@ Pane {
                 Label { text: "Writing assistance"; font.pixelSize: 22; font.weight: Font.DemiBold; Layout.topMargin: 12 }
                 Switch { text: "Spell check"; checked: viewState.settings.spellCheck; onToggled: page.save("spellCheck", checked) }
                 Switch { text: "Grammar check"; checked: viewState.settings.grammarCheck; onToggled: page.save("grammarCheck", checked) }
+                Switch { text: "LaTeX autofix on paste"; checked: viewState.settings.latexAutofix === true; onToggled: page.save("latexAutofix", checked) }
+                Label { text: "Off by default. Repairs validated LaTeX errors in pasted text in Source, Split and Live. Existing code, links and formula fragments are protected; Undo restores the paste."; Layout.fillWidth: true; wrapMode: Text.WordWrap; color: viewState.colors.muted }
                 Label { text: "Offline English suggestions in Source and Live editing. Grammar checks repeated words and a/an. Code, links and LaTeX are excluded; no text is uploaded or automatically replaced."; Layout.fillWidth: true; wrapMode: Text.WordWrap; color: viewState.colors.muted }
                 Label { text: "Selected text"; font.pixelSize: 22; font.weight: Font.DemiBold; Layout.topMargin: 12 }
                 ChoiceField { Layout.fillWidth: true; Accessible.name: "Selection assistant"; model: ["ChatGPT", "Gemini", "Claude"]; currentIndex: Math.max(0,["chatgpt","gemini","claude"].indexOf(viewState.settings.selectionAssistant)); onActivated: page.save("selectionAssistant",["chatgpt","gemini","claude"][currentIndex]) }

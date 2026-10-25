@@ -117,6 +117,39 @@ class StudioUiTest {
             compose.onAllNodes(hasContentDescription("Export") and isEnabled()).fetchSemanticsNodes().isNotEmpty()
         }
     }
+    @Test fun themeGuideOpensOfflineCopiesAndPasteAutofixIsOptIn() {
+        welcome()
+        val model=androidx.lifecycle.ViewModelProvider(compose.activity)[StudioViewModel::class.java]
+        temporaryNoteState=model.state.value
+        val original=model.state.value.active.content
+        val oldAutofix=model.state.value.latexAutofix
+        val prefs=compose.activity.getSharedPreferences("studio",0)
+        try {
+            assertFalse(StudioState().latexAutofix)
+            compose.runOnIdle {model.latexAutofix(false);model.mode("editor");model.edit(model.state.value.active.id,"Start here.")}
+            javascriptUntil("document.querySelector('.cm-content')?.textContent==='Start here.'",{it=="true"})
+            compose.onNodeWithContentDescription("Settings").performClick()
+            compose.onNodeWithText("Theme authoring guide").performScrollTo().performClick()
+            javascriptUntil("!!document.querySelector('.theme-guide-dialog .markdown-body h1')",{it=="true"})
+            javascriptUntil("(()=>{const b=[...document.querySelectorAll('.theme-guide-dialog button')].find(b=>b.textContent==='Copy guide');if(b)b.click();return true})()",{it=="true"})
+            javascriptUntil("document.querySelector('.theme-guide-dialog')?.textContent.includes('Copied')",{it=="true"})
+            val copied=AtomicReference("")
+            compose.runOnIdle {copied.set(compose.activity.getSystemService(android.content.ClipboardManager::class.java).primaryClip?.getItemAt(0)?.text?.toString()?:"")}
+            assertTrue(copied.get().startsWith("# Custom themes"));assertTrue(copied.get().contains("pythonSourceMaxHeight"))
+            assertEquals("Start here.",model.state.value.active.content)
+            javascriptUntil("window.supermdDismiss()",{it=="true"})
+            javascriptUntil("!document.querySelector('.theme-guide-dialog')",{it=="true"})
+            compose.runOnIdle {model.latexAutofix(true)}
+            assertTrue(prefs.getBoolean("latexAutofix",false))
+            // Exercise the native payload and real CodeMirror paste handler,
+            // then verify the edit travelled back through the Android bridge.
+            javascriptUntil("(()=>{const c=document.querySelector('.cm-content');if(!c)return false;c.focus();const r=document.createRange();r.selectNodeContents(c);getSelection().removeAllRanges();getSelection().addRange(r);return true})()",{it=="true"})
+            javascriptUntil("(()=>{const c=document.querySelector('.cm-content');const d=new DataTransfer();d.setData('text/plain',String.raw`\\[\\frac{a}{b}\\]`);c.dispatchEvent(new ClipboardEvent('paste',{bubbles:true,cancelable:true,clipboardData:d}));return true})()",{it=="true"})
+            compose.waitUntil(10_000){model.state.value.active.content.contains("$$\n\\frac{a}{b}\n$$")}
+        } finally {
+            compose.runOnIdle {model.latexAutofix(oldAutofix);model.edit(model.state.value.active.id,original)}
+        }
+    }
     @Test fun externalOpenActivatesNewAndAlreadyOpenFileTabs() {
         val context = androidx.test.platform.app.InstrumentationRegistry.getInstrumentation().targetContext
         val workspace = java.util.UUID.randomUUID().toString()

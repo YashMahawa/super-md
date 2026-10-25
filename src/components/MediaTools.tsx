@@ -56,7 +56,7 @@ export default function MediaTools({ documentId, content, documentPath, onInsert
     };
     const paste = (event: ClipboardEvent) => {
       const element = event.target as Element;
-      if (!element.closest?.(".workspace,.android-document") || element.closest(".media-scrim,.cm-search")) return;
+      if (!element.closest?.(".workspace,.android-document") || element.closest(".media-scrim,.cm-search,.theme-guide-dialog")) return;
       const files = Array.from(event.clipboardData?.files || []).filter((f) => /^image\//.test(f.type));
       if (files.length) { event.preventDefault(); const point = insertionPoint(); void importImageFiles(files).then((images) => { if (mounted.current) reference.current.onInsert("\n\n" + images.map(imageMarkdown).join("\n\n") + "\n", point); }).catch((e) => reference.current.onNotice(String(e))); return; }
       const pasted = event.clipboardData?.getData("text/plain").trim() || "";
@@ -80,7 +80,7 @@ export default function MediaTools({ documentId, content, documentPath, onInsert
       const element = event.target as Element;
       const fromDocument = internalDrag; internalDrag = false;
       if (!element.closest?.(".workspace,.android-document")) return;
-      if (fromDocument || element.closest(".image-viewer,.math-repair-panel,.reading-search,.media-scrim")) {
+      if (fromDocument || element.closest(".image-viewer,.math-repair-panel,.reading-search,.media-scrim,.theme-guide-dialog")) {
         // Preserve ordinary text drag/drop inside Source/Live editors. Only
         // suppress file-bearing internal drops and drops on read-only overlays.
         if (Array.from(event.dataTransfer?.types || []).includes("Files")) { event.preventDefault(); event.stopPropagation(); }
