@@ -125,3 +125,39 @@ export function suggestMathRepairs(markdown: string): MathRepair[] {
 export function applyMathRepairs(markdown: string, changes: MathRepair[]): string {
   return [...changes].sort((a,b)=>b.from-a.from).reduce((content,change)=> content.slice(change.from,change.to) === change.before ? content.slice(0,change.from)+change.after+content.slice(change.to) : content,markdown);
 }
+
+/** Paste-only assistance. Inspect a bounded neighbourhood, never reparse a
+ * large existing note or rewrite it. Existing code/math fragments are left
+ * alone; only validated, self-contained changes inside the paste are used. */
+export function repairPastedMath(text:string,before='',after=''):string {
+  if(!/[\\$^]/.test(text))return text;
+  const radius=16_384,left=before.slice(-radius),right=after.slice(0,radius);
+  let marker='\ue000supermd-paste-location\ue001';
+  while(left.includes(marker)||right.includes(marker))marker+='x';
+  const context=left+marker+right,from=left.length,to=from+marker.length;
+  let protectedContext=false;
+  const inspect=(math:boolean)=>visit(math?unified().use(remarkParse).use(remarkMath).parse(context):unified().use(remarkParse).parse(context),(node:any)=>{
+    if(['code','inlineCode','link','image','definition','html','math','inlineMath'].includes(node.type)&&node.position?.start.offset<=from&&node.position?.end.offset>=to)protectedContext=true;
+  });
+  inspect(false);inspect(true);
+  // Incomplete surrounding delimiters are not permission to wrap a formula
+  // fragment again. A closing fence outside a clipped neighbourhood is also
+  // ambiguous, so keep the original paste in that case.
+  const line=left.slice(left.lastIndexOf('\n')+1);
+  if((line.match(/(?<!\\)\$/g)?.length||0)%2)protectedContext=true;
+  if(left.lastIndexOf('\\(')>left.lastIndexOf('\\)')||left.lastIndexOf('\\[')>left.lastIndexOf('\\]'))protectedContext=true;
+  if(before.length>=radius&&(right.match(/(?<!\\)\$\$/g)?.length||0)%2)protectedContext=true;
+  if(protectedContext)return text;
+  const repairs=suggestMathRepairs(text).filter(repair=>{
+    const inline=repair.before.match(/^\$([^$\n]+)\$$/);
+    if(inline&&valid(inline[1]))return false; // Valid spacing is not an error.
+    return repair.reason!=='Enclose a standalone formula missing dollar signs'||/[\\$^]/.test(repair.before);
+  }).map(repair=>{
+    if(repair.reason==='Enclose a standalone formula missing dollar signs'&&((repair.from===0&&line.trim())||(repair.to===text.length&&right.split('\n',1)[0].trim()))){
+      const display=repair.after.match(/^\$\$\n([^\n]+)\n\$\$$/);
+      if(display)return {...repair,after:`$${display[1]}$`};
+    }
+    return repair;
+  });
+  return applyMathRepairs(text,repairs);
+}

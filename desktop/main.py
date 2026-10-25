@@ -434,7 +434,26 @@ def main():
                             if toolbar is None or toolbar.property("height")!=56 or toolbar.property("shown") or not stable or clearance.get("inset")!=56 or clearance.get("title",0)<56:
                                 print(f"FULLSCREEN OVERLAY SMOKE FAILED: stable={stable} height={toolbar.property('height') if toolbar else None} shown={toolbar.property('shown') if toolbar else None} clearance={clearance}",flush=True);app.exit(2);return
                             print("FULLSCREEN OVERLAY SMOKE PASSED: compact bar hides without resizing the reader",flush=True)
-                            app.exit(0)
+                            original=studio._current()['content']
+                            studio.openThemeGuide()
+                            script="""(()=>{let tries=0;const check=()=>{const guide=document.querySelector('.theme-guide-dialog');const copy=guide&&[...guide.querySelectorAll('button')].find(b=>b.textContent==='Copy guide');if(!copy||copy.disabled){if(++tries<40)setTimeout(check,150);return;}copy.click();};check();})()"""
+                            QMetaObject.invokeMethod(window,"runDocumentScript",Q_ARG("QVariant",script))
+                            def verify_guide(attempt=0):
+                                copied=QGuiApplication.clipboard().text()
+                                if copied.startswith('# Custom themes') and 'pythonSourceMaxHeight' in copied:
+                                    capture('theme-guide')
+                                    QMetaObject.invokeMethod(window,"runDocumentScript",Q_ARG("QVariant","window.supermdDismiss?.()"))
+                                    if studio._current()['content']!=original:
+                                        print('THEME GUIDE SMOKE FAILED: changed note',flush=True);app.exit(2);return
+                                    print('THEME GUIDE SMOKE PASSED: offline rendering and native clipboard',flush=True);app.exit(0)
+                                elif attempt<40:QTimer.singleShot(200,lambda:verify_guide(attempt+1))
+                                else:
+                                    capture('theme-guide-failed')
+                                    QMetaObject.invokeMethod(window,"runDocumentScript",Q_ARG("QVariant","window.SuperMD.post('guide-failed','export_failed',JSON.stringify({error:'GUIDE:'+JSON.stringify({api:typeof window.supermdThemeGuide,dialog:document.querySelector('.theme-guide-dialog')?.textContent.slice(0,500)})}))"))
+                                    def failed():
+                                        print(f'THEME GUIDE SMOKE FAILED: {studio.message}; clipboard={copied[:80]!r}',flush=True);app.exit(2)
+                                    QTimer.singleShot(150,failed)
+                            QTimer.singleShot(200,verify_guide)
                         QTimer.singleShot(600,fullscreen_shown)
                         QTimer.singleShot(1000,lambda:capture("fullscreen-bar"))
                         QTimer.singleShot(1300,lambda:studio.chromeRequested.emit("hide"))

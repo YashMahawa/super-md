@@ -31,6 +31,8 @@ unknown commands, missing fraction arguments and arbitrary TeX macros are not
 guessed. Spaces inside dollar delimiters are legal in the parser; trimming them
 is a compatibility normalization, not proof that whitespace caused a failure.
 
+Settings → Writing assistance → **LaTeX autofix on paste** is off by default. When enabled, Source, Split and Live editors apply conservative, validated repairs to pasted text as one undoable paste. Ordinary typing, existing valid formulas, code, links and unsupported commands stay unchanged. Context is bounded so pasting does not reparse the entire note. Image/file pastes retain their normal behavior. Use Fix LaTeX to review more ambiguous repairs manually.
+
 Implementation references:
 
 - [KaTeX delimiters and ignored code tags](https://katex.org/docs/autorender.html)

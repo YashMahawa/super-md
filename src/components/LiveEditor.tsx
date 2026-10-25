@@ -7,24 +7,27 @@ import {selectedMarkdown} from '../copySource';
 import type {WritingOptions} from '../proofreading';
 import type {ReaderAccessibilityPreference} from '../types';
 import WritingSuggestions from './WritingSuggestions';
+import {repairPastedMath} from '../mathRepair';
 const noTrustedHosts:string[]=[];
 export type {SourceBlock} from '../documentAnalysis';
 export function splitMarkdownBlocks(markdown:string):SourceBlock[]{return analyzeDocument(markdown).blocks;}
 
 interface Props extends WritingOptions,ReaderAccessibilityPreference {
+  latexAutofix?:boolean;
   markdown:string;onChange:(value:string)=>void;documentPath:string|null;python:string;dark:boolean;
   trustedImageHosts?:string[];onTrustImageHost?:(host:string)=>void;
 }
-interface Editing {prefix:string;text:string;suffix:string;originalText:string}
+interface Editing {prefix:string;text:string;suffix:string;originalText:string;protectedBlock:boolean}
 
 /** One document render preserves references, footnote numbering, duplicate
  * heading IDs and loose lists. Substitute one original-source editing block. */
-export default function LiveEditor({markdown,onChange,documentPath,python,dark,trustedImageHosts=noTrustedHosts,onTrustImageHost,spellCheck=false,grammarCheck=false,fullDocumentAccessibility=false}:Props){
+export default function LiveEditor({markdown,onChange,documentPath,python,dark,trustedImageHosts=noTrustedHosts,onTrustImageHost,spellCheck=false,grammarCheck=false,latexAutofix=false,fullDocumentAccessibility=false}:Props){
   const [editing,setEditing]=useState<Editing|null>(null);
   const anchorTop=useRef<number|null>(null),editor=useRef<HTMLTextAreaElement>(null);
   const open=(element:HTMLElement,start:number,end:number)=>{
     anchorTop.current=element.getBoundingClientRect().top;
-    const text=markdown.slice(start,end);setEditing({prefix:markdown.slice(0,start),text,suffix:markdown.slice(end),originalText:text});
+    const text=markdown.slice(start,end),protectedBlock=sourceAnalysis.analysis.tree.children.some(node=>['code','math','html','definition'].includes(node.type)&&(node.position?.start.offset??-1)>=start&&(node.position?.end.offset??Infinity)<=end);
+    setEditing({prefix:markdown.slice(0,start),text,suffix:markdown.slice(end),originalText:text,protectedBlock});
   };
   useLayoutEffect(()=>{
     const area=editor.current;if(!area||anchorTop.current===null)return;
@@ -43,7 +46,20 @@ export default function LiveEditor({markdown,onChange,documentPath,python,dark,t
   useEffect(()=>{if(editing&&markdown!==editing.prefix+editing.text+editing.suffix)setEditing(null);},[markdown,editing]);
   const copy=(event:ClipboardEvent)=>{if((event.target as Element).closest('textarea'))return;const source=selectedMarkdown(window.getSelection(),markdown);if(source!==null){event.clipboardData.setData('text/plain',source);event.preventDefault();}};
   const update=(text:string)=>{if(!editing)return;setEditing({...editing,text});onChange(editing.prefix+text+editing.suffix);};
-  const textarea=()=> <div className="live-active-block"><textarea ref={editor} data-source-start={editing!.prefix.length} spellCheck={false} value={editing!.text} style={{height:Math.max(120,editing!.text.split('\n').length*27+32)}} onChange={event=>update(event.target.value)} onKeyDown={event=>{if(event.key==='Escape'){event.preventDefault();event.stopPropagation();setEditing(null);}}} onBlur={event=>{if(!event.relatedTarget||!event.currentTarget.parentElement?.contains(event.relatedTarget))setEditing(null);}} aria-label="Edit Markdown block"/><WritingSuggestions text={editing!.text} spellCheck={spellCheck} grammarCheck={grammarCheck} onChange={update}/></div>;
+  const paste=(event:ClipboardEvent<HTMLTextAreaElement>)=>{
+    if(!latexAutofix||!editing||event.defaultPrevented||event.clipboardData.files.length)return;
+    const area=event.currentTarget,from=area.selectionStart,to=area.selectionEnd;
+    if(editing.protectedBlock&&!(from===0&&to===area.value.length))return;
+    const raw=event.clipboardData.getData('text/plain');
+    if(!/[\\$^]/.test(raw))return;
+    const before=(editing.prefix.slice(-16_384)+area.value.slice(Math.max(0,from-16_384),from)).slice(-16_384);
+    const after=(area.value.slice(to,to+16_384)+editing.suffix.slice(0,16_384)).slice(0,16_384);
+    const repaired=repairPastedMath(raw,before,after);if(repaired===raw)return;
+    // Browser editing commands preserve the textarea's native undo history.
+    // If unavailable, leave the original paste to the platform without loss.
+    try {if(document.execCommand('insertText',false,repaired))event.preventDefault();}catch{/* Preserve native paste. */}
+  };
+  const textarea=()=> <div className="live-active-block"><textarea ref={editor} data-source-start={editing!.prefix.length} spellCheck={false} value={editing!.text} style={{height:Math.max(120,editing!.text.split('\n').length*27+32)}} onPaste={paste} onChange={event=>update(event.target.value)} onKeyDown={event=>{if(event.key==='Escape'){event.preventDefault();event.stopPropagation();setEditing(null);}}} onBlur={event=>{if(!event.relatedTarget||!event.currentTarget.parentElement?.contains(event.relatedTarget))setEditing(null);}} aria-label="Edit Markdown block"/><WritingSuggestions text={editing!.text} spellCheck={spellCheck} grammarCheck={grammarCheck} onChange={update}/></div>;
   const currentOffset=(offset:number)=>editing&&offset>=editing.prefix.length+editing.originalText.length?offset+editing.text.length-editing.originalText.length:offset;
   const renderBlock=(entry:RenderedMarkdownBlock)=>{
     const offset=entry.node.position?.start.offset;

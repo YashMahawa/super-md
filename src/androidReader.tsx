@@ -22,6 +22,7 @@ import MediaTools from "./components/MediaTools";
 import { prepareFmd } from "./documentMedia";
 import ImageViewer from "./components/ImageViewer";
 import MathRepairPanel from "./components/MathRepairPanel";
+import ThemeGuideDialog from "./components/ThemeGuideDialog";
 import { captureScrollAnchor,markScrollInput,scrollInputVersion } from "./scrollAnchor";
 import {rememberWindowedScrollSource} from './windowedSearch';
 import ReadingSearch from "./components/ReadingSearch";
@@ -44,8 +45,8 @@ const SourceEditor = memo(Editor);
 interface PdfExportStatus {id:string;phase:'preparing'|'typesetting'|'publishing';completed:number;total:number;cancelRequested?:boolean}
 
 interface NoteView { editor?: PortableEditorSession; history?:NoteHistory; top?: number; rendered?: ReturnType<typeof exportRenderedViews> }
-interface ReaderState extends ReaderAccessibilityPreference { id: string; content: string; path: string | null; mode: "live" | "editor" | "reader" | "split"; dark: boolean; fullscreen: boolean; font: string; size: number; spellCheck?:boolean; grammarCheck?:boolean; width?: number; widthPercent?:number; lineHeight?:number; colors: Record<string, string>; zoom: number; motion?: boolean; python?: string; viewState?: NoteView }
-declare global { interface Window {supermdDismiss?:()=>boolean;supermdSetZoom?:(zoom:number,requestedAt?:number)=>void;supermdHeading?:(id:string,offset?:number)=>void;supermdHistory?:(direction:"undo"|"redo")=>void;supermdNativeWheel?:(dx:number,dy:number,point:Point,held:boolean,modifier?:boolean)=>void;} }
+interface ReaderState extends ReaderAccessibilityPreference { id: string; content: string; path: string | null; mode: "live" | "editor" | "reader" | "split"; dark: boolean; fullscreen: boolean; font: string; size: number; latexAutofix?:boolean;spellCheck?:boolean; grammarCheck?:boolean; width?: number; widthPercent?:number; lineHeight?:number; colors: Record<string, string>; zoom: number; motion?: boolean; python?: string; viewState?: NoteView }
+declare global { interface Window {supermdThemeGuide?:()=>void;supermdDismiss?:()=>boolean;supermdSetZoom?:(zoom:number,requestedAt?:number)=>void;supermdHeading?:(id:string,offset?:number)=>void;supermdHistory?:(direction:"undo"|"redo")=>void;supermdNativeWheel?:(dx:number,dy:number,point:Point,held:boolean,modifier?:boolean)=>void;} }
 declare global { interface Window { supermdLoad?: (state: ReaderState) => void; supermdExport?: (options: ExportOptions) => void; supermdExportMarkdown?: () => void; supermdFind?: () => void; supermdPortable?: (save: boolean) => void; supermdZoomBy?: (factor:number,focus?:Point)=>void; supermdResetZoom?: ()=>void; supermdRepairMath?: ()=>void; supermdFlush?: (operation:Record<string,string>)=>void } }
 declare global { interface Window {supermdChromeInset?:(height:number)=>void} }
 declare global { interface Window {supermdSavePosition?:()=>void} }
@@ -82,6 +83,7 @@ function Reader() {
   const edits=useRef<ReaderEdits|null>(null);
   if(!edits.current)edits.current=new ReaderEdits((command,args)=>invoke(command,args));
   const [editError,setEditError]=useState('');
+  const [themeGuide,setThemeGuide]=useState(false);
   const zoomReference = useRef(100);
   const zoomGestureAt = useRef(0);
   const pendingChange = useRef(0);
@@ -126,7 +128,8 @@ function Reader() {
       document.querySelectorAll<HTMLElement>('.android-reading').forEach(invalidateDocumentZoom);
       requestAnimationFrame(()=>{restore.forEach(callback=>callback());applyZoomStyle();settleSelection();});
     };
-    window.supermdDismiss=()=>{const element=document.querySelector(".image-viewer,.math-repair-panel,.reading-search,.cm-search,.live-active-block textarea");if(!element)return false;const target=element.matches("textarea")?element:document.activeElement||document;target.dispatchEvent(new KeyboardEvent("keydown",{key:"Escape",bubbles:true,cancelable:true}));if(element.matches("textarea"))(element as HTMLElement).blur();return true;};
+    window.supermdThemeGuide=()=>setThemeGuide(true);
+    window.supermdDismiss=()=>{const element=document.querySelector(".theme-guide-dialog")||document.querySelector(".image-viewer,.math-repair-panel,.reading-search,.cm-search,.live-active-block textarea");if(!element)return false;const target=element.matches("textarea")?element:document.activeElement||document;target.dispatchEvent(new KeyboardEvent("keydown",{key:"Escape",bubbles:true,cancelable:true}));if(element.matches("textarea"))(element as HTMLElement).blur();return true;};
     window.supermdLoad = (incoming) => {
       const old = reference.current;
       // Native omits content it received from this reader, unchanged since.
@@ -185,6 +188,7 @@ function Reader() {
       if (old?.id === next.id && old.mode === next.mode) anchored(load); else load();
     };
     window.supermdHistory=direction=>{
+      if(document.querySelector('.theme-guide-dialog'))return;
       const current=reference.current;if(!current)return;
       replaying.current=true;
       const history=histories.current.get(current.id);const next=history?replayHistory(history,current.content,direction):undefined;
@@ -221,6 +225,7 @@ function Reader() {
     window.supermdNativeWheel=(dx,dy,point,held,modifier=false)=>{
       markScrollInput();
       const target=document.elementFromPoint(point.x,point.y),canvas=target?.closest(".interactive-chart svg,.image-viewer-canvas");
+      if(target?.closest('.theme-guide-dialog')){if(!held)target.closest<HTMLElement>('.theme-guide-body')?.scrollBy({left:dx,top:dy,behavior:'instant'});return;}
       const editor=target?.closest<HTMLTextAreaElement>('textarea');
       if(editor){editor.scrollBy({left:dx,top:dy,behavior:"instant"});return;}
       if(held&&(modifier||canvas||(!selectingText.current&&!window.getSelection()?.toString()))){if(canvas?.matches("svg"))canvas.dispatchEvent(new WheelEvent("wheel",{bubbles:true,cancelable:true,ctrlKey:true,deltaY:dy,clientX:point.x,clientY:point.y}));else window.supermdZoomBy?.(Math.exp(-dy*.002),point);return;}
@@ -256,7 +261,7 @@ function Reader() {
         await invoke("document_flushed",{id:current.id,content:latest?.id===current.id?latest.content:current.content,operation,viewId:id,viewState:view});
       })().catch(error=>setEditError(String(error)));
     };
-    window.supermdFind = () => {setSearching(true);requestAnimationFrame(()=>window.dispatchEvent(new Event("supermd-find-focus")));};
+    window.supermdFind = () => {if(document.querySelector('.theme-guide-dialog'))return;setSearching(true);requestAnimationFrame(()=>window.dispatchEvent(new Event("supermd-find-focus")));};
     window.supermdPortable = async (save) => {
       const current = reference.current; if (!current) return;
       try {
@@ -289,7 +294,7 @@ function Reader() {
       catch (error) { await invoke("export_failed", {error: String(error)}); }
     };
     void invoke("reader_ready");
-    return () => { cancelAnimationFrame(zoomFrame.current);window.clearTimeout(zoomTimer.current);delete window.supermdSavePosition;delete window.supermdChromeInset;delete window.supermdLoad; delete window.supermdExport; delete window.supermdExportMarkdown; delete window.supermdPortable; delete window.supermdZoomBy; delete window.supermdResetZoom; delete window.supermdRepairMath; delete window.supermdFlush; delete window.supermdSetZoom; delete window.supermdHeading; };
+    return () => { cancelAnimationFrame(zoomFrame.current);window.clearTimeout(zoomTimer.current);delete window.supermdThemeGuide;delete window.supermdSavePosition;delete window.supermdChromeInset;delete window.supermdLoad; delete window.supermdExport; delete window.supermdExportMarkdown; delete window.supermdPortable; delete window.supermdZoomBy; delete window.supermdResetZoom; delete window.supermdRepairMath; delete window.supermdFlush; delete window.supermdSetZoom; delete window.supermdHeading; };
   }, []);
   useEffect(()=>{
     if(!state)return;
@@ -531,6 +536,7 @@ function Reader() {
   }, []);
   if (!state) return <div className="reader-loading" role="status"><span className="expressive-loading-shape" aria-hidden="true"/>Opening your workspace</div>;
   return <DocumentAppearance.Provider value={documentAppearance}><div className={`android-document mode-${state.mode}`}>
+    {themeGuide&&<ThemeGuideDialog close={()=>setThemeGuide(false)}/>}
     {pdfExport&&<div className="reader-export-backdrop"><section className="reader-export-progress" role="dialog" aria-modal="true" aria-label="Exporting PDF" onKeyDown={event=>{if(event.key==='Escape'){event.preventDefault();event.stopPropagation();void cancelPdfExport();}}}>
       <h2>Exporting PDF</h2>
       <p role="status">{pdfExport.cancelRequested?'Cancelling export…':pdfExport.phase==='preparing'?'Preparing text, diagrams and images':pdfExport.phase==='typesetting'?'Typesetting your document':'Saving to destination'}</p>
@@ -544,8 +550,8 @@ function Reader() {
     <ImageViewer />
     {repairing && <MathRepairPanel content={state.content} apply={update} close={()=>setRepairing(false)} />}
     <MediaTools key={state.id} documentId={state.id} content={state.content} documentPath={state.path} onInsert={(text, point) => { const content = reference.current!.content; const from = Math.min(point?.from ?? content.length, content.length); const to = Math.max(from, Math.min(point?.to ?? from, content.length)); update(content.slice(0, from) + text + content.slice(to)); }} onNotice={(error) => { void invoke("export_failed", { error }); }} />
-    {(state.mode === "editor" || state.mode === "split") && <section className="android-source"><SourceEditor key={state.id} sessionId={state.id} value={state.content} onChange={update} dark={state.dark} focusMode={state.fullscreen} spellCheck={state.spellCheck} grammarCheck={state.grammarCheck} /></section>}
-    {state.mode === "live" && <section className="android-reading" data-full-document-accessibility={state.fullDocumentAccessibility ? "true" : undefined}><div className="reader-chrome-spacer" aria-hidden="true"/><div key={state.id} className="document-page-space"><div className="document-page"><LiveDocument key={state.id} spellCheck={state.spellCheck} grammarCheck={state.grammarCheck} markdown={state.content} onChange={update} documentPath={state.path} python={state.python || "embedded"} dark={false} trustedImageHosts={trustedHosts} onTrustImageHost={trustHost} fullDocumentAccessibility={state.fullDocumentAccessibility} /></div></div></section>}
+    {(state.mode === "editor" || state.mode === "split") && <section className="android-source"><SourceEditor key={state.id} sessionId={state.id} value={state.content} onChange={update} dark={state.dark} focusMode={state.fullscreen} latexAutofix={state.latexAutofix} spellCheck={state.spellCheck} grammarCheck={state.grammarCheck} /></section>}
+    {state.mode === "live" && <section className="android-reading" data-full-document-accessibility={state.fullDocumentAccessibility ? "true" : undefined}><div className="reader-chrome-spacer" aria-hidden="true"/><div key={state.id} className="document-page-space"><div className="document-page"><LiveDocument key={state.id} latexAutofix={state.latexAutofix} spellCheck={state.spellCheck} grammarCheck={state.grammarCheck} markdown={state.content} onChange={update} documentPath={state.path} python={state.python || "embedded"} dark={false} trustedImageHosts={trustedHosts} onTrustImageHost={trustHost} fullDocumentAccessibility={state.fullDocumentAccessibility} /></div></div></section>}
     {(state.mode === "reader" || state.mode === "split") && <section className="android-reading" data-full-document-accessibility={state.fullDocumentAccessibility ? "true" : undefined}><div className="reader-chrome-spacer" aria-hidden="true"/><div key={state.id} className="document-page-space"><div className="document-page"><DocumentPreview markdown={state.content} onChange={update} documentPath={state.path} python={state.python || "embedded"} dark={false} trustedImageHosts={trustedHosts} onTrustImageHost={trustHost} fullDocumentAccessibility={state.fullDocumentAccessibility} sourceAnalysis={readerAnalysis?.source===state.content?readerAnalysis:undefined} /></div></div></section>}
   </div></DocumentAppearance.Provider>;
 }

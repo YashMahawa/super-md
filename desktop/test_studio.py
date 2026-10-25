@@ -16,6 +16,34 @@ class QuietStudio(Studio):
         self.system_dark = True
 
 class StudioTest(unittest.TestCase):
+    def test_paste_autofix_is_opt_in_validated_and_sent_to_reader(self):
+        studio=self.studio;loads=[];studio.readerLoad.connect(loads.append);studio.ready=True
+        self.assertFalse(studio.settings['latexAutofix'])
+        for invalid in ('true',1,None):
+            studio.setting('latexAutofix',json.dumps(invalid))
+            self.assertFalse(studio.settings['latexAutofix'])
+        studio.setting('latexAutofix','true')
+        self.assertTrue(json.loads(loads[-1])['latexAutofix'])
+        self.assertTrue(self.session.settings['latexAutofix'])
+        studio.setting('latexAutofix','false')
+        self.assertFalse(json.loads(loads[-1])['latexAutofix'])
+
+    def test_theme_guide_opens_in_reader_and_copies_without_editing_note(self):
+        studio=self.studio;calls=[];replies=[];studio.readerCall.connect(calls.append)
+        studio.replied.connect(lambda identifier,value,error:replies.append((identifier,value,error)))
+        original=studio._current()['content']
+        with patch('studio.QDesktopServices.openUrl') as external:
+            studio.openThemeGuide();external.assert_not_called()
+        self.assertEqual(calls,['window.supermdThemeGuide?.()'])
+        guide='# Theme guide\n\n```json\n{}\n```\n'
+        studio.post('copy','copy_text',json.dumps({'text':guide}))
+        self.assertEqual(QGuiApplication.clipboard().text(),guide)
+        self.assertEqual(replies[-1],('copy','true',''))
+        for invalid in (42,None,'x'*2_000_001):
+            studio.post('invalid','copy_text',json.dumps({'text':invalid}))
+            self.assertTrue(replies[-1][2]);self.assertEqual(QGuiApplication.clipboard().text(),guide)
+        self.assertEqual(studio._current()['content'],original)
+
     def test_reader_patches_commit_in_order_and_reject_external_changes(self):
         studio=self.studio;note=studio._current();note['content']='a😀z'
         replies=[]
