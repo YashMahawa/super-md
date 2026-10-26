@@ -1,5 +1,6 @@
 import json
 import os
+import sys
 import time
 import unittest
 from pathlib import Path
@@ -745,7 +746,7 @@ class StudioTest(unittest.TestCase):
         self.assertIn("Open note",conflict)
         self.assertEqual(studio.shortcutSequences("find"),original)
         self.assertEqual(studio.setShortcut("find","Ctrl+Alt+F"),"")
-        self.assertEqual(studio.shortcutLabel("find"),"Ctrl+Alt+F")
+        self.assertEqual(studio.shortcutLabel("find"),"⌥⌘F" if sys.platform == "darwin" else "Ctrl+Alt+F")
         self.flush()
         stored=json.loads((studio.data/"settings.json").read_text())
         self.assertEqual(stored["settings"]["shortcuts"]["find"],["Ctrl+Alt+F"])

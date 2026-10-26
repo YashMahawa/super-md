@@ -173,8 +173,15 @@ class StudioUiTest {
             javascriptUntil("!!document.querySelector('.theme-guide-dialog .markdown-body h1')",{it=="true"})
             javascriptUntil("(()=>{const b=[...document.querySelectorAll('.theme-guide-dialog button')].find(b=>b.textContent==='Copy guide');if(b)b.click();return true})()",{it=="true"})
             javascriptUntil("document.querySelector('.theme-guide-dialog')?.textContent.includes('Copied')",{it=="true"})
+            val clipboard = compose.activity.getSystemService(android.content.ClipboardManager::class.java)
+            compose.waitUntil(5_000) {
+                runCatching {
+                    val text=clipboard.primaryClip?.getItemAt(0)?.text?.toString().orEmpty()
+                    text.startsWith("# Custom themes") && text.contains("pythonSourceMaxHeight")
+                }.getOrDefault(false)
+            }
             val copied=AtomicReference("")
-            compose.runOnIdle {copied.set(compose.activity.getSystemService(android.content.ClipboardManager::class.java).primaryClip?.getItemAt(0)?.text?.toString()?:"")}
+            compose.runOnIdle {copied.set(clipboard.primaryClip?.getItemAt(0)?.text?.toString()?:"")}
             assertTrue(copied.get().startsWith("# Custom themes"));assertTrue(copied.get().contains("pythonSourceMaxHeight"))
             assertEquals("Start here.",model.state.value.active.content)
             javascriptUntil("window.supermdDismiss()",{it=="true"})
@@ -505,10 +512,9 @@ class StudioUiTest {
             val colors=manualAccent("blue",true)
             val primary="#"+Integer.toHexString(colors.primary.toArgb()).substring(2)
             javascriptUntil("getComputedStyle(document.documentElement).getPropertyValue('--primary').trim()") {it.trim('"')==primary}
-            // The selected tab can push the add-tab item beyond the LazyRow
-            // viewport; scroll the real control into view before sampling its
-            // pixels instead of capturing an empty clipped rectangle.
-            compose.onNodeWithContentDescription("New tab").performScrollTo()
+            // The add-tab control is pinned outside the scrolling tab list and
+            // remains visible even when many tabs are open.
+            compose.onNodeWithContentDescription("New tab").assertExists()
             compose.waitUntil(5_000) {
                 val bounds = compose.onNodeWithContentDescription("New tab").fetchSemanticsNode().boundsInRoot
                 bounds.width > 0f && bounds.height > 0f
@@ -1118,9 +1124,11 @@ ax.set_title("Matplotlib 3D figure")
         javascriptUntil("document.querySelector('.android-reading')?.textContent || document.querySelector('.live-document')?.textContent") { it.contains("Recoverable draft") }
         compose.waitUntil(10_000) { model.state.value.active.name == "Recoverable draft.md" }
         val recoverableId = model.state.value.active.id
-        compose.onNodeWithContentDescription("Close Recoverable draft.md").performClick()
         // Close commits the recoverable snapshot/index asynchronously after
         // the reader flush barrier. Do not race the reopen shortcut against it.
+        val closeBounds = compose.onNodeWithContentDescription("Close Recoverable draft.md").fetchSemanticsNode().boundsInRoot
+        assertTrue("The selected tab's close control must be visible before closing it: $closeBounds", closeBounds.width > 0f && closeBounds.height > 0f)
+        compose.onNodeWithContentDescription("Close Recoverable draft.md").performClick()
         compose.waitUntil(15_000) {
             model.state.value.tabs.none { it.id == recoverableId } &&
                 model.state.value.closedTabs.any { it.id == recoverableId }

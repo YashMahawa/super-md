@@ -7,6 +7,7 @@
 - Desktop Ctrl/Command+C copies the selected Markdown source even after a toolbar has taken focus. Dragging selected text to another app also carries Markdown, including formatting, links and formulas.
 - Find focuses the typing field immediately on desktop and Android, including repeated opens. Android explicitly restores WebView focus after closing the menu and respects the hardware keyboard preference.
 - Desktop Settings now lists editable keyboard shortcuts, validates conflicts, and offers a reset button. Native text fields retain their own editing commands.
+- Android keeps the new-tab plus visible beside the scrollable tabs and reveals the active tab after selection, renaming or a width change, keeping its close control accessible.
 - The desktop context menu includes Reload. It acknowledges pending edits and preserves the note's view state before recreating the reader.
 
 ## Scrolling and export

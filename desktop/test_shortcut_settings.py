@@ -1,6 +1,7 @@
 """Qt smoke for the settings page and its focusable shortcut recorder."""
 import json
 import os
+import sys
 import unittest
 from pathlib import Path
 
@@ -130,7 +131,7 @@ ApplicationWindow {{
         self.assertFalse(self.window.property("capturingShortcut"))
         self.assertEqual(self.studio.shortcutSequences("find"), ["Ctrl+Alt+K"])
         self.assertFalse(self.window.property("triggered"), "The app shortcut must stay suppressed while recording a binding")
-        self.assertEqual(recorder.property("value"), "Ctrl+Alt+K")
+        self.assertEqual(recorder.property("value"), "⌥⌘K" if sys.platform == "darwin" else "Ctrl+Alt+K")
         QTest.keyClick(self.window, Qt.Key_K, Qt.KeyboardModifier.ControlModifier | Qt.KeyboardModifier.AltModifier)
         QTest.qWait(30)
         self.assertTrue(self.window.property("triggered"), "The newly recorded binding must activate after capture ends")
