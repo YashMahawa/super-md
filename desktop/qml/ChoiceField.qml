@@ -14,6 +14,7 @@ ComboBox {
         const overlay = Overlay.overlay
         const field = control.mapToItem(overlay, 0, 0)
         const bounds = viewportItem ? viewportItem.mapToItem(overlay, 0, 0) : Qt.point(0, 0)
+        choices.width = Math.min(control.width, Math.max(0, Math.min(440, overlay.width - 32)))
         const top = bounds.y + 6
         const bottom = bounds.y + (viewportItem ? viewportItem.height : overlay.height) - 6
         const below = Math.max(0, bottom - field.y - control.height - 6)
@@ -25,7 +26,7 @@ ComboBox {
         const available = openBelow ? below : above
         const rows = Math.max(1, Math.min(7, control.count, Math.floor((available - 16) / control.rowHeight)))
         choices.height = Math.min(available, rows * control.rowHeight + 16)
-        choices.x = field.x
+        choices.x = Math.max(16, Math.min(field.x, overlay.width - choices.width - 16))
         choices.y = openBelow ? field.y + control.height + 6 : field.y - 6 - choices.height
     }
     function revealChoices() { forceActiveFocus(); popup.open() }

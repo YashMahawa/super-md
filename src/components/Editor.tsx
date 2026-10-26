@@ -1,6 +1,6 @@
 import { useEffect, useRef, useState } from "react";
 import { Compartment, EditorSelection, EditorState,Transaction } from "@codemirror/state";
-import { EditorView, keymap, lineNumbers, highlightActiveLine, drawSelection } from "@codemirror/view";
+import { EditorView, keymap, lineNumbers, highlightActiveLine, drawSelection,type KeyBinding } from "@codemirror/view";
 import { defaultKeymap, history, historyField, historyKeymap, indentWithTab, undo, redo,isolateHistory } from "@codemirror/commands";
 import { markdown, markdownLanguage } from "@codemirror/lang-markdown";
 import { syntaxHighlighting, defaultHighlightStyle, foldGutter, foldKeymap, syntaxTree,syntaxTreeAvailable } from "@codemirror/language";
@@ -36,6 +36,12 @@ const callbacks = new Map<string, (value: string,changes?:SourceChange[]) => voi
 const pasteSettings=new Map<string,boolean>();
 const statusHandlers = new Map<string, (state: EditorState) => void>();
 const visibleEditors = new Map<string, EditorView>();
+export function editorKeyBindings(host: string | undefined = typeof document === "undefined" ? undefined : document.documentElement.dataset.host): KeyBinding[] {
+  // Qt owns application shortcuts and forwards undo/redo/find through native
+  // commands. Android and browser builds retain CodeMirror's normal keymaps.
+  const nativeShortcuts = host === "qt";
+  return [...defaultKeymap, ...(nativeShortcuts ? [] : historyKeymap), ...(nativeShortcuts ? [] : searchKeymap), ...foldKeymap, indentWithTab];
+}
 export function editorReadingOffset(id:string):number|undefined {
   const view=visibleEditors.get(id);if(!view)return;
   const rect=view.scrollDOM.getBoundingClientRect();
@@ -148,7 +154,7 @@ export default function Editor({ sessionId = "default", value, onChange, dark, f
         search({top:true}),
         markdown({ base: markdownLanguage }),
         syntaxHighlighting(defaultHighlightStyle, { fallback: true }),
-        keymap.of([...defaultKeymap, ...historyKeymap, ...searchKeymap, ...foldKeymap, indentWithTab]),
+        keymap.of(editorKeyBindings()),
         EditorState.allowMultipleSelections.of(true),
         wrapping.current.of(EditorView.lineWrapping),
         proofing.current.of(writingExtension()),

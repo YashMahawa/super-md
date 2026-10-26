@@ -22,6 +22,9 @@ ApplicationWindow {
     property bool settingsOpen: false
     property int contextMenuCount: 0
     property int modalDialogCount: 0
+    property bool capturingShortcut: false
+    property var shortcutBindings: JSON.parse(studio.shortcutBindings)
+    property var shortcutLabels: JSON.parse(studio.shortcutLabels)
     onSettingsOpenChanged: settingsOpen ? settingsDialog.open() : settingsDialog.close()
     property bool closingAllowed: false
     property bool intentionalShutdown: false
@@ -55,6 +58,85 @@ ApplicationWindow {
     }
     function syncVisibleReaderChrome() {
         window.runDocumentScript("document.documentElement.style.setProperty('--native-visible-chrome-inset','" + readerVisibleChromeInset + "px')")
+    }
+    function openFind() {
+        if (!reader) return
+        const target = reader
+        target.forceActiveFocus()
+        target.runJavaScript("window.supermdFind?.()", function() {
+            if (window.reader === target) target.forceActiveFocus()
+        })
+    }
+    function nativeTextEditorFocused() {
+        // Application-level shortcuts must leave real Qt settings fields to
+        // their own platform editing commands. WebEngine's DOM inputs are
+        // handled by the reader edit-action route below.
+        let item = window.activeFocusItem
+        while (item) {
+            if (item instanceof TextInput || item instanceof TextEdit) return true
+            item = item.parent
+        }
+        return false
+    }
+    function shortcutEnabled(action) {
+        // App actions must not escape a modal into the note underneath. Native
+        // Qt text fields keep their own editing bindings because these QML
+        // application shortcuts are disabled while the modal is open.
+        if (modalDialogCount > 0) return false
+        if (["copy", "cut", "paste", "select_all"].includes(action) && window.nativeTextEditorFocused()) return false
+        if (action === "undo" || action === "redo") return !modalDialogCount && !viewState.readerOverlay
+        if (action === "close_tab") return !modalDialogCount
+        if (action === "dismiss") return !modalDialogCount && !contentsPopup.visible
+        return true
+    }
+    function nativeReaderEditAction(action) {
+        if (!reader) return
+        if (action === "copy") {
+            // Chromium's WebAction.Copy uses native focus, which may still be
+            // on a toolbar item while the rendered selection remains visible.
+            // Restore the view's focus before dispatching the native action so
+            // its copy event reaches MarkdownPreview's source serializer.
+            reader.forceActiveFocus()
+            reader.triggerWebAction(WebEngineView.Copy)
+            return
+        }
+        // A QML toolbar can retain focus while Chromium still paints a DOM
+        // selection. Refocus the view and dispatch its native action directly
+        // in the key event's turn; this preserves Chromium's user gesture and
+        // lets MarkdownPreview's copy handler serialize source (including math).
+        reader.forceActiveFocus()
+        if (action === "cut") reader.triggerWebAction(WebEngineView.Cut)
+        else if (action === "paste") reader.triggerWebAction(WebEngineView.Paste)
+        else if (action === "select_all") reader.triggerWebAction(WebEngineView.SelectAll)
+    }
+    function activateShortcut(action) {
+        if (action.startsWith("tab_")) { studio.tabNumber(Number(action.slice(4))); return }
+        switch (action) {
+        case "new_window": studio.command("window"); break
+        case "new_note": studio.newNote(); break
+        case "open": openDialog.open(); break
+        case "save": studio.saveSafely(); break
+        case "undo": studio.command("undo"); break
+        case "redo": studio.command("redo"); break
+        case "copy": window.nativeReaderEditAction("copy"); break
+        case "cut": window.nativeReaderEditAction("cut"); break
+        case "paste": window.nativeReaderEditAction("paste"); break
+        case "select_all": window.nativeReaderEditAction("select_all"); break
+        case "find": window.openFind(); break
+        case "close_tab": studio.closeTabSafely(viewState.active); break
+        case "next_tab": studio.cycleTab(1); break
+        case "previous_tab": studio.cycleTab(-1); break
+        case "move_tab_left": studio.moveActiveTab(-1); break
+        case "move_tab_right": studio.moveActiveTab(1); break
+        case "reopen_tab": studio.reopenTab(); break
+        case "close_window": studio.closeWindowSafely(); break
+        case "settings": settingsOpen = !settingsOpen; break
+        case "fullscreen": windowModes.setFullscreen(!windowModes.fullscreen); break
+        case "dismiss": window.runDocumentScriptWithCallback("window.supermdDismiss?.() || false", function(dismissed) { if (!dismissed && windowModes.fullscreen) windowModes.setFullscreen(false) }); break
+        case "zoom_in": window.runDocumentScript("window.supermdZoomBy?.(1.1)"); break
+        case "zoom_out": window.runDocumentScript("window.supermdZoomBy?.(1/1.1)"); break
+        case "zoom_reset": window.runDocumentScript("window.supermdResetZoom?.()"); break
+        }
     }
     function focusReader() { if (reader) reader.forceActiveFocus() }
     function scheduleReaderRemount(delay) {
@@ -127,6 +209,7 @@ ApplicationWindow {
             window.runDocumentScript(script)
         }
         function onReaderCall(script) { window.runDocumentScript(script) }
+        function onReaderReloadRequested() { if (window.reader) window.reader.reload() }
         function onChromeRequested(action) { window.chromeAwake = action === "toggle" ? !window.chromeAwake : action === "show"; if(window.chromeAwake) chromeIdle.restart(); else { chromeIdle.stop(); window.focusReader() } }
     }
     onViewStateChanged: {
@@ -168,31 +251,23 @@ ApplicationWindow {
             readerRecoveryMessage = ""
         }
     }
-    Shortcut { sequences: [StandardKey.New]; onActivated: studio.command("window") }
+    Repeater {
+        model: JSON.parse(studio.shortcutActions)
+        delegate: Item {
+            required property var modelData
+            width: 0; height: 0
+            Shortcut {
+                sequences: window.shortcutBindings[modelData.id]
+                enabled: !window.capturingShortcut && window.shortcutEnabled(modelData.id)
+                context: Qt.WindowShortcut
+                onActivated: window.activateShortcut(modelData.id)
+            }
+        }
+    }
     FileDialog { id:fontDialog;title:"Import a font";fileMode:FileDialog.OpenFile;nameFilters:["Fonts (*.ttf *.otf)"];onAccepted:studio.importFont(selectedFile.toString()) }
     FileDialog { id:themeDialog;title:"Import a Super MD theme";fileMode:FileDialog.OpenFile;nameFilters:["Theme files (*.json)"];onAccepted:studio.importCustomTheme(selectedFile.toString()) }
     FileDialog { id:themeExportDialog;title:"Export editable theme";fileMode:FileDialog.SaveFile;defaultSuffix:"json";selectedFile:studio.defaultSaveLocation("My theme.supermd-theme.json");nameFilters:["Theme files (*.json)"];onAccepted:studio.exportCustomTheme(selectedFile.toString()) }
-    Shortcut { sequences: [StandardKey.Open]; onActivated: openDialog.open() }
-    Shortcut { sequences: [StandardKey.Save]; onActivated: studio.saveSafely() }
-    Shortcut { sequences: [StandardKey.Undo]; enabled: !modalDialogCount && !viewState.readerOverlay; onActivated: studio.command("undo") }
-    Shortcut { sequences: [StandardKey.Redo]; enabled: !modalDialogCount && !viewState.readerOverlay; onActivated: studio.command("redo") }
-    Shortcut { sequences: [StandardKey.Find]; onActivated: studio.command("find") }
-    Shortcut { sequences: [StandardKey.Close]; enabled:!modalDialogCount; onActivated: studio.closeTabSafely(viewState.active) }
-    Shortcut { sequences: ["Ctrl+T", "Meta+T"]; onActivated: studio.newNote() }
-    Shortcut { sequences: ["Ctrl+Tab", "Ctrl+PageDown"]; onActivated: studio.cycleTab(1) }
-    Shortcut { sequences: ["Ctrl+Shift+Tab", "Ctrl+PageUp"]; onActivated: studio.cycleTab(-1) }
-    Shortcut { sequences: ["Ctrl+Shift+T", "Meta+Shift+T"]; onActivated: studio.reopenTab() }
-    Repeater { model: 9; delegate: Item { required property int index; Shortcut { sequences: ["Ctrl+" + (index+1), "Meta+" + (index+1)]; onActivated: studio.tabNumber(index+1) } } }
-    Shortcut { sequence: "Ctrl+Shift+N"; onActivated: studio.command("window") }
-    Shortcut { sequences: ["Ctrl+Shift+W","Meta+Shift+W"]; onActivated: studio.closeWindowSafely() }
-    Shortcut { sequence: "Ctrl+,"; onActivated: settingsOpen = !settingsOpen }
-    Shortcut { sequence: "F11"; onActivated: windowModes.setFullscreen(!windowModes.fullscreen) }
-    Shortcut { sequence: "Escape"; enabled: !modalDialogCount && !contentsPopup.visible; onActivated: window.runDocumentScriptWithCallback("window.supermdDismiss?.() || false", function(dismissed) { if (!dismissed && windowModes.fullscreen) windowModes.setFullscreen(false) }) }
     // Qt's chrome never scales. Keyboard/pinch zoom is routed to the content pane.
-    Shortcut { sequence: "Ctrl++"; onActivated: window.runDocumentScript("window.supermdZoomBy?.(1.1)") }
-    Shortcut { sequence: "Ctrl+="; onActivated: window.runDocumentScript("window.supermdZoomBy?.(1.1)") }
-    Shortcut { sequence: "Ctrl+-"; onActivated: window.runDocumentScript("window.supermdZoomBy?.(1/1.1)") }
-    Shortcut { sequence: "Ctrl+0"; onActivated: window.runDocumentScript("window.supermdResetZoom?.()") }
 
     header: Column {
         visible: !viewState.fullscreen && !viewState.imageOverlay && viewState.settings.welcomed
@@ -207,12 +282,12 @@ ApplicationWindow {
                 spacing: 8
                 SidebarToggle { expanded: sidebar; onClicked: sidebar = !sidebar }
                 ActionButton { glyph: "FolderOpen"; ToolTip.text: "Open folder"; Accessible.name: "Open folder"; onClicked: studio.chooseFolder() }
-                ActionButton { text: window.width < 1060 ? "" : "Open note"; glyph: "File"; ToolTip.text: "Open note (Ctrl+O)"; onClicked: openDialog.open() }
-                ActionButton { glyph: "FloppyDisk"; ToolTip.text: "Save note"; onClicked: studio.saveSafely(); enabled: !viewState.busy }
-                ActionButton { glyph: "Undo"; ToolTip.text: "Undo (Ctrl+Z)"; onClicked: studio.command("undo") }
-                ActionButton { glyph: "Redo"; ToolTip.text: "Redo (Ctrl+Y)"; onClicked: studio.command("redo") }
+                ActionButton { text: window.width < 1060 ? "" : "Open note"; glyph: "File"; ToolTip.text: "Open note (" + window.shortcutLabels.open + ")"; onClicked: openDialog.open() }
+                ActionButton { glyph: "FloppyDisk"; ToolTip.text: "Save note (" + window.shortcutLabels.save + ")"; onClicked: studio.saveSafely(); enabled: !viewState.busy }
+                ActionButton { glyph: "Undo"; ToolTip.text: "Undo (" + window.shortcutLabels.undo + ")"; onClicked: studio.command("undo") }
+                ActionButton { glyph: "Redo"; ToolTip.text: "Redo (" + window.shortcutLabels.redo + ")"; onClicked: studio.command("redo") }
                 Item { Layout.fillWidth: true }
-                ActionButton { glyph: "MagnifyingGlass"; ToolTip.text: "Find in note (Ctrl+F)"; onClicked: studio.command("find") }
+                ActionButton { glyph: "MagnifyingGlass"; ToolTip.text: "Find in note (" + window.shortcutLabels.find + ")"; onClicked: window.openFind() }
                 ActionButton { visible: window.width >= 1060; glyph: "Image"; ToolTip.text: "Insert image or link"; onClicked: studio.command("insert") }
                 ActionButton { visible: window.width >= 1060; glyph: "Bug"; ToolTip.text: "Fix LaTeX"; onClicked: studio.command("repair") }
                 ActionButton { visible: window.width >= 1060; glyph: "ShareNetwork"; ToolTip.text: "Share note"; onClicked: window.showExport(true) }
@@ -233,6 +308,7 @@ ApplicationWindow {
         TabStrip {
             width: parent.width
             viewState: window.viewState
+            shortcutLabels: window.shortcutLabels
         }
         Rectangle { width: parent.width; height: 1; color: viewState.colors.outline; opacity: .55 }
     }
@@ -329,7 +405,7 @@ ApplicationWindow {
                         background: Rectangle { radius: 12; antialiasing: true; color: viewState.colors["surface-high"]; border.width: parent.activeFocus ? 2 : 0; border.color: viewState.colors.primary }
                         Accessible.name: "Zoom percentage"
                     }
-                    ActionButton { objectName: "fullscreenButton"; glyph: "Fullscreen"; icon.width: 24; icon.height: 24; compact: true; tonal: true; ToolTip.text: "Fullscreen (F11 · Esc to exit)"; onClicked: windowModes.setFullscreen(true) }
+                    ActionButton { objectName: "fullscreenButton"; glyph: "Fullscreen"; icon.width: 24; icon.height: 24; compact: true; tonal: true; ToolTip.text: "Fullscreen (" + window.shortcutLabels.fullscreen + " · " + window.shortcutLabels.dismiss + " to exit)"; onClicked: windowModes.setFullscreen(true) }
                     ActionButton { objectName: "centerLockButton"; glyph: viewState.settings.centerLock ? "Lock" : "LockOpen"; compact: true; tonal: viewState.settings.centerLock; ToolTip.text: viewState.settings.centerLock ? "Centre locked · click to allow horizontal movement" : "Lock document to centre"; onClicked: studio.setting("centerLock",JSON.stringify(!viewState.settings.centerLock)) }
                     }
                 }
@@ -373,6 +449,8 @@ ApplicationWindow {
                         NoteMenuItem { text: "Paste"; actionVisible: Boolean(readerContextMenu.editFlags & ContextMenuRequest.CanPaste); onTriggered: window.reader.triggerWebAction(WebEngineView.Paste) }
                         NoteMenuItem { text: "Copy link address"; actionVisible: readerContextMenu.hasLink; onTriggered: window.reader.triggerWebAction(WebEngineView.CopyLinkToClipboard) }
                         NoteMenuItem { text: "Select all"; onTriggered: window.reader.triggerWebAction(WebEngineView.SelectAll) }
+                        MenuSeparator {}
+                        NoteMenuItem { objectName: "reloadMenuItem"; text: "Reload"; enabled: viewState.readerReady && !viewState.busy; onTriggered: studio.reloadReaderSafely() }
                         MenuSeparator { visible: readerContextMenu.selectionText.trim().length > 0; height: visible ? implicitHeight : 0 }
                         NoteMenuItem { text: "Search Google"; actionVisible: readerContextMenu.selectionText.trim().length > 0; onTriggered: studio.selectionAction("google", readerContextMenu.selectionText) }
                         NoteMenuItem { text: "Ask " + (studio.selectionAssistantLabel || "ChatGPT") + "…"; actionVisible: readerContextMenu.selectionText.trim().length > 0; onTriggered: studio.selectionAction("assistant", readerContextMenu.selectionText) }
@@ -390,11 +468,13 @@ ApplicationWindow {
                                 event.accepted = true
                                 const dy = event.pixelDelta.y || event.angleDelta.y
                                 reader.runJavaScript("window.supermdNativeWheel?.(0," + (-dy) + "," + JSON.stringify({x:event.x,y:event.y}) + ",true,true)")
-                            } else if (event.pixelDelta.x || event.pixelDelta.y) {
+                            } else if (event.pixelDelta.x || event.pixelDelta.y || (event.buttons & Qt.LeftButton)) {
                                 event.accepted = true
                                 // The reader gives text drags priority over held-button zoom.
                                 const held = Boolean(event.buttons & Qt.LeftButton)
-                                reader.runJavaScript("window.supermdNativeWheel?.(" + (-event.pixelDelta.x) + "," + (-event.pixelDelta.y) + "," + JSON.stringify({x:event.x,y:event.y}) + "," + held + ")")
+                                const dx = event.pixelDelta.x || event.angleDelta.x
+                                const dy = event.pixelDelta.y || event.angleDelta.y
+                                reader.runJavaScript("window.supermdNativeWheel?.(" + (-dx) + "," + (-dy) + "," + JSON.stringify({x:event.x,y:event.y}) + "," + held + ")")
                             } else event.accepted = false
                         }
                     }
@@ -434,6 +514,7 @@ ApplicationWindow {
                 visible: viewState.fullscreen && !viewState.readerOverlay
                 awake: window.chromeAwake
                 noteName: viewState.name
+                shortcutLabels: window.shortcutLabels
                 ready: viewState.readerReady && !viewState.busy
                 centerLocked: viewState.settings.centerLock
                 onCenterLockRequested: studio.setting("centerLock",JSON.stringify(!viewState.settings.centerLock))
@@ -462,8 +543,8 @@ ApplicationWindow {
         parent: Overlay.overlay
         x: 16
         y: viewState.fullscreen ? 64 : Math.min(180, window.height / 4)
-        width: Math.min(380,window.width-32)
-        height: Math.min(560,window.height-y-24)
+        width: Math.min(340,window.width-32)
+        height: Math.min(480,window.height-y-24)
         padding: 16
         closePolicy: Popup.CloseOnEscape | Popup.CloseOnPressOutside
         background: Rectangle { radius: 24; color: viewState.colors["surface-high"]; border.color: viewState.colors.outline; border.width: 1; antialiasing: true }
@@ -476,8 +557,8 @@ ApplicationWindow {
     AppDialog {
         id: settingsDialog
         objectName: "settingsDialog"
-        width: Math.min(640, window.width - 48)
-        height: Math.min(780, window.height - 64)
+        width: Math.min(580, window.width - 48)
+        height: Math.min(620, window.height - 64)
         padding: 0
         onClosed: settingsOpen = false
         SettingsPage { ownerPopup: settingsDialog; viewState: window.viewState; anchors.fill: parent; onBack: settingsOpen = false }
@@ -508,9 +589,8 @@ ApplicationWindow {
         id: exportDialog
         objectName: "exportDialog"
         title: sharing ? "Share note" : "Export note"
-        uiScale: Math.max(1, Math.min(1.5, Math.min(window.width / 1280, window.height / 800)))
-        width: Math.min(window.width - 48, Math.max(560, Math.min(960, window.width * .48)))
-        height: Math.min(window.height - 64, 760 * uiScale)
+        width: Math.min(window.width - 48, Math.max(500, Math.min(720, window.width * .44)))
+        height: Math.min(window.height - 64, 620)
         standardButtons: Dialog.Cancel
         ColumnLayout {
             anchors.fill: parent

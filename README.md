@@ -235,20 +235,19 @@ desktop/.venv/bin/python desktop/main.py
 <summary>Useful desktop shortcuts</summary>
 
 Use Ctrl on Linux/Windows and Command on macOS where supported.
+View and change desktop bindings in Settings → Keyboard shortcuts.
 
 | Shortcut | Action |
 |---|---|
-| Ctrl/Command+N | New tab |
+| Ctrl/Command+T | New tab |
 | Ctrl/Command+W | Close tab |
 | Ctrl/Command+Shift+T | Reopen closed tab |
 | Ctrl/Command+Tab | Next tab |
-| Ctrl/Command+O / S / Shift+S | Open / Save / Save as |
-| Ctrl/Command+Shift+O | Open folder |
-| Ctrl/Command+B | Toggle sidebar |
+| Ctrl/Command+O / S | Open / Save |
 | Ctrl/Command+F | Find; Source also supports replace |
-| Ctrl/Command+Z / Y | Undo / Redo |
+| Ctrl/Command+Z / Y (Shift+Z on macOS) | Undo / Redo |
 | Ctrl/Command++ / − / 0 | Content zoom / reset |
-| Ctrl/Command+Shift+N | New window |
+| Ctrl/Command+N or Shift+N | New window |
 | F11 / Escape | Enter / leave fullscreen |
 
 </details>

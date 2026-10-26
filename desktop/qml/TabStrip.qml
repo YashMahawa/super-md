@@ -7,6 +7,7 @@ ScrollView {
     id: strip
     objectName: "tabStrip"
     required property var viewState
+    property var shortcutLabels: ({})
     height: 48
     contentHeight: 48
     ScrollBar.vertical.policy: ScrollBar.AlwaysOff
@@ -136,7 +137,7 @@ ScrollView {
             glyph: "Plus"; compact: true; implicitWidth: 40; implicitHeight: 40
             y: (strip.height - height) / 2
             Accessible.name: "New tab"
-            ToolTip.text: "New tab (Ctrl+T)"
+            ToolTip.text: "New tab (" + (strip.shortcutLabels.new_note || "Ctrl+T") + ")"
             onClicked: studio.newNote()
             DropArea { anchors.fill: parent; keys: ["application/x-supermd-tab"]; onDropped: function(drop) { strip.receive(drop, strip.viewState.tabs.length) } }
         }

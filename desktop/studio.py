@@ -40,6 +40,7 @@ from export_jobs import ExportJobRegistry
 import file_events
 import custom_theme
 from selection_actions import ASSISTANTS, selection_target
+from shortcuts import DEFINITIONS as SHORTCUT_DEFINITIONS, capture_sequence, default_shortcuts, native_label, normalize_shortcuts, parse_sequence
 
 ROOT = Path(sys._MEIPASS)/"resources" if getattr(sys,"frozen",False) else Path(__file__).resolve().parent.parent
 DEFAULT_PDF = {"pageSize": "a4", "margin": 18, "fontSize": 10, "lineHeight": 1.45, "paragraphSpacing": 1.2, "fontFamily": "Manrope", "pageNumbers": True, "themed": False}
@@ -50,6 +51,7 @@ DEFAULTS.update(patternKind="",patternOpacity=-1,patternSize=0,patternSpacing=0)
 DEFAULTS.update(desktopIntegration=False)
 DEFAULTS.update(selectionAssistant="chatgpt")
 DEFAULTS.update(latexAutofix=False)
+DEFAULTS.update(shortcuts=default_shortcuts())
 SAMPLE = """# A place to think\n\nWrite in Markdown. Read without distractions.\n\n> [!tip] Start with your notes\n> Open any note or folder. No vault, no import process.\n\n## Learn by exploring\n\n$$E = mc^2$$\n\n> [!answer]- Why does this matter?\n> Tap the heading to reveal an answer, then hide it to test yourself.\n\n```smd-chart\n{\"title\":\"A changing wave\",\"series\":[{\"name\":\"Sine\",\"expression\":\"sin(a*x)\",\"color\":\"#386a57\"},{\"name\":\"Cosine\",\"expression\":\"cos(a*x)\",\"color\":\"#bc6750\"}],\"sliders\":[{\"name\":\"a\",\"min\":0.2,\"max\":3,\"value\":1}]}\n```\n\n## Matplotlib in three dimensions\n\nRun a Python cell to generate a 3D figure, then save it in your note or PDF.\n\n```python\nimport numpy as np\nimport matplotlib.pyplot as plt\nx, y = np.meshgrid(np.linspace(-2, 2, 32), np.linspace(-2, 2, 32))\nfig = plt.figure()\nax = fig.add_subplot(111, projection=\"3d\")\nax.plot_surface(x, y, x*x + y*y, cmap=\"viridis\")\n```\n\n[Back to exploring](#learn-by-exploring)\n"""
 
 def public_address(url: str) -> str:
@@ -170,6 +172,8 @@ class Session(QObject):
             self.pinned = list(dict.fromkeys(p for p in stored.get("pinned",[]) if isinstance(p,str)))[:10]
             self.recent = list(dict.fromkeys(self.pinned + [p for p in stored.get("recent",[]) if isinstance(p,str)]))[:10]
         except (OSError,ValueError,KeyError,TypeError,AttributeError): pass
+        shortcuts, _ = normalize_shortcuts(self.settings.get("shortcuts"))
+        self.settings["shortcuts"] = shortcuts or default_shortcuts()
         try:
             workspace=json.loads((self.data/"startup.json").read_text(encoding="utf-8"))
             self.startup_paths=list(dict.fromkeys(p for p in workspace.get("paths",[]) if isinstance(p,str)))[:100]
@@ -231,8 +235,10 @@ class Session(QObject):
 
 class Studio(QObject):
     changed = Signal()
+    shortcutsChanged = Signal()
     readerLoad = Signal(str)
     readerCall = Signal(str)
+    readerReloadRequested = Signal()
     chromeRequested = Signal(str)
     replied = Signal(str, str, str)
     completed = Signal(object)
@@ -467,6 +473,64 @@ class Studio(QObject):
 
     @Property(bool, notify=changed)
     def motionEnabled(self): return bool(self.settings["motion"])
+
+    @Property(str, constant=True)
+    def shortcutActions(self): return json.dumps(SHORTCUT_DEFINITIONS)
+
+    @Property(str, notify=shortcutsChanged)
+    def shortcutBindings(self): return json.dumps(self.settings.get("shortcuts", {}))
+
+    @Property(str, notify=shortcutsChanged)
+    def shortcutLabels(self):
+        return json.dumps({action: self.shortcutLabel(action) for action in self.settings.get("shortcuts", {})})
+
+    @Slot(str, result="QVariantList")
+    def shortcutSequences(self, action):
+        return list(self.settings.get("shortcuts", {}).get(action, []))
+
+    @Slot(str, result=str)
+    def shortcutLabel(self, action):
+        values = self.shortcutSequences(action)
+        return "  /  ".join(native_label(value) for value in values) if values else "Disabled"
+
+    @Slot(int, int, result=str)
+    def captureShortcut(self, key, modifiers):
+        sequence, error = capture_sequence(key, modifiers)
+        return json.dumps({"sequence": sequence, "error": error})
+
+    @Slot(str, str, result=str)
+    def setShortcut(self, action, value):
+        if action not in self.settings.get("shortcuts", {}):
+            return "Unknown shortcut action."
+        sequence = parse_sequence(value) if value else None
+        if value and sequence is None:
+            return "Invalid key combination."
+        candidate = copy.deepcopy(self.settings["shortcuts"])
+        candidate[action] = [sequence] if sequence else []
+        validated, error = normalize_shortcuts(candidate)
+        if error: return error
+        if validated == self.settings["shortcuts"]: return ""
+        self.settings["shortcuts"] = validated
+        self._notify_shortcuts()
+        self._preferences()
+        self._emit(False)
+        return ""
+
+    @Slot(result=str)
+    def resetShortcuts(self):
+        defaults = default_shortcuts()
+        if defaults == self.settings["shortcuts"]: return ""
+        self.settings["shortcuts"] = defaults
+        self._notify_shortcuts()
+        self._preferences()
+        self._emit(False)
+        return ""
+
+    def _notify_shortcuts(self):
+        # Do not rebuild every QML Shortcut/recorder on each note edit, zoom or
+        # scroll update. Only an actual binding change invalidates these maps.
+        for window in tuple(self.session.windows.values()):
+            if not window.retired: window.shortcutsChanged.emit()
 
     def _watch_notes(self,force=False):
         paths=tuple(sorted({tab["path"] for tab in self.tabs if tab["path"]}|set(self.recent)))
@@ -1292,6 +1356,16 @@ class Studio(QObject):
         self.selectTab(self.tabs[(index+direction)%len(self.tabs)]["id"])
 
     @Slot(int)
+    def moveActiveTab(self, direction):
+        if direction not in (-1, 1) or len(self.tabs) < 2: return
+        index=next((i for i,t in enumerate(self.tabs) if t["id"]==self.active),-1)
+        target=max(0,min(len(self.tabs)-1,index+direction))
+        if index < 0 or target == index: return
+        self.tabs.insert(target,self.tabs.pop(index))
+        self._recover()
+        self._emit(False)
+
+    @Slot(int)
     def tabNumber(self, number):
         index=len(self.tabs)-1 if number==9 else number-1
         if 0<=index<len(self.tabs):self.selectTab(self.tabs[index]["id"])
@@ -1434,12 +1508,16 @@ class Studio(QObject):
             self.python_status = ""
         if key in ("size","width","widthPercent","lineHeight","normalZoom","fullZoom") and (not isinstance(value,(int,float)) or isinstance(value,bool) or not math.isfinite(value)): return
         if key == "pdf" and (not isinstance(value,dict) or set(value) != set(DEFAULT_PDF)): return
+        if key == "shortcuts":
+            value, error = normalize_shortcuts(value)
+            if error: return
         if key in ("window","widthMigrated"): return  # Internal state, not user settings.
         if key == "size": value = max(6, min(32, float(value)))
         if key == "width": value = max(0, min(5000, int(value)))
         if key == "widthPercent": value = max(50,min(150,float(value)))
         if key == "lineHeight": value = max(1.15,min(2.2,float(value)))
         self.settings[key] = value
+        if key == "shortcuts": self._notify_shortcuts()
         self._preferences()
         self._emit()
 
@@ -1455,6 +1533,15 @@ class Studio(QObject):
 
     def _after_flush(self,operation):
         if operation["action"] == "save": self.save()
+        elif operation["action"] == "reload_reader":
+            # The renderer has acknowledged all edits. Reopen it from native
+            # state and the just-captured view snapshot in document_flushed.
+            self.ready=False
+            self._last_reader_text=None
+            self.reader_overlay=False
+            self.image_overlay=False
+            self._emit(False)
+            self.readerReloadRequested.emit()
         elif operation["action"] == "mode": self._apply_mode(operation["target"])
         elif operation["action"] == "move_tab":
             request = json.loads(operation["target"])
@@ -1480,6 +1567,11 @@ class Studio(QObject):
 
     @Slot()
     def saveSafely(self): self._flush("save")
+
+    @Slot()
+    def reloadReaderSafely(self):
+        if not self.ready or self.retired or self.busy or self.flush_operation: return
+        self._flush("reload_reader")
 
     @Slot(str)
     def closeTabSafely(self,id): self._flush("close_tab",id)
@@ -1743,7 +1835,7 @@ class Studio(QObject):
                     self.replied.emit(id,"true",""); return
                 target = next((t for t in self.tabs if t["id"] == args["id"]),None)
                 if target: target["content"] = args["content"]
-                if operation["action"] in ("move_tab", "detach_tab"):
+                if operation["action"] in ("move_tab", "detach_tab", "reload_reader"):
                     view_tab = next((t for t in self.tabs if t["id"] == args.get("viewId")), None)
                     view = args.get("viewState")
                     if view_tab and isinstance(view, dict) and len(json.dumps(view)) <= 12_000_000: view_tab["viewState"] = view

@@ -1,5 +1,6 @@
 import json
 import os
+import sys
 import time
 import unittest
 from pathlib import Path
@@ -16,6 +17,16 @@ class QuietStudio(Studio):
         self.system_dark = True
 
 class StudioTest(unittest.TestCase):
+    def test_shortcut_maps_only_notify_when_bindings_change_across_windows(self):
+        other=self.window();first=[];second=[]
+        self.studio.shortcutsChanged.connect(lambda:first.append(True));other.shortcutsChanged.connect(lambda:second.append(True))
+        self.studio._emit();self.studio.setZoom(125)
+        self.assertEqual((first,second),([],[]))
+        self.assertEqual(self.studio.setShortcut('find','Ctrl+Alt+F'),'')
+        self.assertEqual((len(first),len(second)),(1,1));self.assertEqual(other.shortcutSequences('find'),['Ctrl+Alt+F'])
+        self.studio._emit();self.studio.setShortcut('find','Ctrl+Alt+F')
+        self.assertEqual((len(first),len(second)),(1,1))
+
     def test_paste_autofix_is_opt_in_validated_and_sent_to_reader(self):
         studio=self.studio;loads=[];studio.readerLoad.connect(loads.append);studio.ready=True
         self.assertFalse(studio.settings['latexAutofix'])
@@ -635,6 +646,20 @@ class StudioTest(unittest.TestCase):
         self.assertEqual(studio.active, note["id"])
         self.assertEqual(note["assets"], {"x": "image bytes"})
 
+    def test_keyboard_move_reorders_only_the_active_tab_and_keeps_its_content(self):
+        studio=self.studio
+        first=studio._current()
+        first.update(content="draft A",saved="",assets={"asset":"bytes"},portable=True)
+        studio.newNote()
+        second=studio._current();second["content"]="draft B"
+        studio.moveActiveTab(-1)
+        self.assertEqual([tab["id"] for tab in studio.tabs],[second["id"],first["id"]])
+        self.assertEqual(studio.active,second["id"])
+        self.assertEqual(second["content"],"draft B")
+        self.assertEqual(first["assets"],{"asset":"bytes"})
+        studio.moveActiveTab(1)
+        self.assertEqual([tab["id"] for tab in studio.tabs],[first["id"],second["id"]])
+
     def test_window_transfer_flushes_latest_text_and_recovers_exactly_once(self):
         source, target = self.studio, self.window()
         note = source._current()
@@ -678,6 +703,23 @@ class StudioTest(unittest.TestCase):
         self.assertEqual(requests, [(studio.window_id, studio.active)])
         self.assertEqual(studio._current()["content"], "unsaved")
 
+    def test_reader_reload_waits_for_latest_draft_and_view_snapshot_acknowledgement(self):
+        studio=self.studio;studio.ready=True
+        calls=[];reloads=[]
+        studio.readerCall.connect(calls.append)
+        studio.readerReloadRequested.connect(lambda:reloads.append(True))
+        studio.reloadReaderSafely()
+        operation=dict(studio.flush_operation)
+        self.assertEqual(operation["action"],"reload_reader")
+        self.assertEqual(calls,[f"window.supermdFlush?.({json.dumps(operation)})"])
+        self.assertEqual(reloads,[])
+        state={"top":842,"rendered":{"openDetails":["proof"]}}
+        studio.post("reload","document_flushed",json.dumps({"id":studio.active,"content":"last keystroke","operation":operation,"viewId":studio.active,"viewState":state}))
+        self.assertEqual(studio._current()["content"],"last keystroke")
+        self.assertEqual(studio._current()["viewState"],state)
+        self.assertEqual(reloads,[True])
+        self.assertFalse(studio.ready)
+
     def test_share_markdown_uses_the_final_reader_snapshot_and_releases_tab_moves(self):
         path = self.studio.data / "shared.md"
         self.studio.exportTo(str(path), "md")
@@ -695,6 +737,26 @@ class StudioTest(unittest.TestCase):
         self.studio.setting("size",'NaN')
         self.assertEqual(second.settings["theme"],"light")
         self.assertEqual(second.settings["size"],18)
+
+    def test_shortcut_remaps_are_persisted_conflict_checked_and_resettable(self):
+        studio=self.studio
+        original=studio.shortcutSequences("find")
+        self.assertTrue(original)
+        conflict=studio.setShortcut("find",studio.shortcutSequences("open")[0])
+        self.assertIn("Open note",conflict)
+        self.assertEqual(studio.shortcutSequences("find"),original)
+        self.assertEqual(studio.setShortcut("find","Ctrl+Alt+F"),"")
+        self.assertEqual(studio.shortcutLabel("find"),"⌥⌘F" if sys.platform == "darwin" else "Ctrl+Alt+F")
+        self.flush()
+        stored=json.loads((studio.data/"settings.json").read_text())
+        self.assertEqual(stored["settings"]["shortcuts"]["find"],["Ctrl+Alt+F"])
+        self.assertEqual(studio.setShortcut("find",""),"")
+        self.assertEqual(studio.shortcutLabel("find"),"Disabled")
+        self.assertEqual(studio.resetShortcuts(),"")
+        self.assertEqual(studio.shortcutSequences("find"),original)
+        self.flush()
+        restored=json.loads((studio.data/"settings.json").read_text())
+        self.assertEqual(restored["settings"]["shortcuts"]["find"],original)
 
     def test_zoom_sends_a_delta_not_the_document_and_remembers_mode(self):
         self.studio.ready = True

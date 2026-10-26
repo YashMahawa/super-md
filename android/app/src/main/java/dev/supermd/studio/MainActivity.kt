@@ -5,9 +5,11 @@ import android.graphics.Color as AndroidColor
 import android.os.Build
 import android.os.Bundle
 import android.content.Intent
+import android.view.View
 import android.view.WindowManager
 import android.view.ViewGroup
 import android.widget.FrameLayout
+import android.view.inputmethod.InputMethodManager
 import android.webkit.WebView
 import androidx.activity.ComponentActivity
 import androidx.activity.viewModels
@@ -66,10 +68,39 @@ import androidx.window.layout.WindowInfoTracker
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.delay
 import org.json.JSONObject
+import java.util.concurrent.atomic.AtomicBoolean
+import kotlin.coroutines.resume
+import kotlinx.coroutines.suspendCancellableCoroutine
+
+internal fun shouldShowNativeBusyOverlay(busy: Boolean, readerReady: Boolean, readerOwnsProgress: Boolean): Boolean =
+    !readerOwnsProgress && (busy || !readerReady)
+
+private suspend fun View.awaitWindowFocus() {
+    if (hasWindowFocus()) return
+    suspendCancellableCoroutine<Unit> { continuation ->
+        val observer = viewTreeObserver
+        val completed = AtomicBoolean(false)
+        lateinit var listener: android.view.ViewTreeObserver.OnWindowFocusChangeListener
+        fun removeListener() { if (observer.isAlive) observer.removeOnWindowFocusChangeListener(listener) }
+        fun resumeIfFocused() {
+            if (hasWindowFocus() && completed.compareAndSet(false, true)) {
+                removeListener()
+                continuation.resume(Unit)
+            }
+        }
+        listener = android.view.ViewTreeObserver.OnWindowFocusChangeListener { hasFocus ->
+            if (hasFocus) resumeIfFocused()
+        }
+        observer.addOnWindowFocusChangeListener(listener)
+        continuation.invokeOnCancellation { removeListener() }
+        resumeIfFocused()
+    }
+}
 
 class MainActivity : ComponentActivity() {
     var dismissDocument: (() -> Unit)? = null
     var saveReaderPosition: (() -> Unit)? = null
+    var openReaderFind: (() -> Unit)? = null
     private var workspaceKey = "main"
     private val model: StudioViewModel by viewModels { object : androidx.lifecycle.ViewModelProvider.Factory {
         @Suppress("UNCHECKED_CAST")
@@ -115,6 +146,7 @@ class MainActivity : ComponentActivity() {
                     android.view.KeyEvent.KEYCODE_TAB -> { model.cycle(if(event.isShiftPressed)-1 else 1);return true }
                     android.view.KeyEvent.KEYCODE_PAGE_DOWN -> {model.cycle(1);return true}
                     android.view.KeyEvent.KEYCODE_PAGE_UP -> {model.cycle(-1);return true}
+                    android.view.KeyEvent.KEYCODE_F -> {openReaderFind?.invoke();return true}
                 }
                 if(event.keyCode in android.view.KeyEvent.KEYCODE_1..android.view.KeyEvent.KEYCODE_9){model.tabNumber(event.keyCode-android.view.KeyEvent.KEYCODE_1+1);return true}
             }
@@ -185,11 +217,14 @@ private object NoMotionScheme : MotionScheme {
     }
     var exporting by remember { mutableStateOf(false) }
     var sharing by remember { mutableStateOf(false) }
+    var readerPdfOwnsProgress by remember { mutableStateOf(false) }
     var menu by remember { mutableStateOf(false) }
+    var findRequest by remember { mutableIntStateOf(0) }
     var renaming by remember {mutableStateOf(false)}
     var contentsShown by remember {mutableStateOf(false)}
     var sidebarSection by rememberSaveable {mutableStateOf("folder")}
     var readingChromeVisible by remember {mutableStateOf(true)}
+    LaunchedEffect(state.busy) { if (!state.busy) readerPdfOwnsProgress = false }
     LaunchedEffect(state.active.id, state.mode, settings) { if (!state.fullscreen) readingChromeVisible = true }
     LaunchedEffect(state.fullscreen) { if (state.fullscreen) readingChromeVisible = false }
     // A delayed single tap allows Live's double tap to enter editing without
@@ -247,7 +282,39 @@ private object NoMotionScheme : MotionScheme {
     DisposableEffect(activity, web) {
         activity.dismissDocument = { web?.evaluateJavascript("window.supermdDismiss?.() || false") { dismissed -> if (dismissed != "true") model.fullscreen(false) } ?: model.fullscreen(false) }
         activity.saveReaderPosition={web?.evaluateJavascript("window.supermdSavePosition?.()",null)}
-        onDispose { activity.dismissDocument = null;activity.saveReaderPosition=null }
+        activity.openReaderFind = {
+            menu = false
+            findRequest++
+        }
+        onDispose { activity.dismissDocument = null;activity.saveReaderPosition=null;activity.openReaderFind=null }
+    }
+    LaunchedEffect(findRequest, menu, web) {
+        if (findRequest == 0 || menu) return@LaunchedEffect
+        val requested = findRequest
+        // Wait for the popup window to release native focus before asking the
+        // WebView for focus. This follows the actual dismissal instead of
+        // estimating its transition duration.
+        val reader = web ?: return@LaunchedEffect
+        reader.awaitWindowFocus()
+        if (menu || requested != findRequest || reader !== web) return@LaunchedEffect
+        findRequest = 0
+        reader.requestFocus(View.FOCUS_DOWN)
+        reader.evaluateJavascript("window.supermdFind?.(); true") {
+            reader.post {
+                reader.requestFocus(View.FOCUS_DOWN)
+                val hasHardwareKeyboard = activity.resources.configuration.keyboard != android.content.res.Configuration.KEYBOARD_NOKEYS
+                val showImeWithHardware = android.provider.Settings.Secure.getInt(activity.contentResolver, "show_ime_with_hard_keyboard", 0) == 1
+                val inputMethod = activity.getSystemService(android.content.Context.INPUT_METHOD_SERVICE) as? InputMethodManager
+                if (!hasHardwareKeyboard || showImeWithHardware) {
+                    inputMethod?.showSoftInput(reader, InputMethodManager.SHOW_IMPLICIT)
+                } else {
+                    // WebView.focus() can itself open the software keyboard
+                    // after an input receives focus. Honor the hardware-keyboard
+                    // preference even when DOM focus was restored natively.
+                    inputMethod?.hideSoftInputFromWindow(reader.windowToken, 0)
+                }
+            }
+        }
     }
     var readerReady by remember { mutableStateOf(false) }
     var readerGeneration by remember { mutableIntStateOf(0) }
@@ -287,7 +354,7 @@ private object NoMotionScheme : MotionScheme {
     val save = rememberLauncherForActivityResult(NoteDestination("text/markdown", model::noteLocation)) { it?.let { uri -> model.save(uri) } }
     val folder = rememberLauncherForActivityResult(ActivityResultContracts.OpenDocumentTree()) { it?.let { uri -> folderRelative = ""; model.setFolder(uri) } }
     val pdf = rememberLauncherForActivityResult(NoteDestination("application/pdf", model::noteLocation)) { uri ->
-        if (uri != null) { model.setPdfDestination(uri); model.busy(true); web?.evaluateJavascript("window.supermdExport?.(${state.pdf})", null) ?: model.fail("The reader is not ready. Open the note again.") }
+        if (uri != null) { readerPdfOwnsProgress = true; model.setPdfDestination(uri); model.busy(true); web?.evaluateJavascript("window.supermdExport?.(${state.pdf})", null) ?: model.fail("The reader is not ready. Open the note again.") }
     }
     val portable = rememberLauncherForActivityResult(NoteDestination("application/vnd.supermd.smd", model::noteLocation)) { uri ->
         if (uri != null) { model.setPortableDestination(uri); model.busy(true); web?.evaluateJavascript("window.supermdPortable?.(false)", null) ?: model.fail("The reader is not ready") }
@@ -398,7 +465,7 @@ private object NoMotionScheme : MotionScheme {
                                 DropdownMenuItem(text = { Text("Share note") }, enabled = readerReady && !state.busy, onClick = { menu = false; sharing = true; exporting = true }, leadingIcon = { Icon(painterResource(R.drawable.symbol_share), null) })
                                 DropdownMenuItem(text = { Text("Insert image or link") }, onClick = { menu = false; web?.evaluateJavascript("window.supermdMedia?.()", null) }, leadingIcon = { Icon(painterResource(R.drawable.symbol_image), null) })
                                 DropdownMenuItem(text = { Text("Fix LaTeX") }, onClick = { menu = false; web?.evaluateJavascript("window.supermdRepairMath?.()", null) }, leadingIcon = { Icon(painterResource(R.drawable.symbol_bug), null) })
-                                DropdownMenuItem(text = { Text("Find in note") }, onClick = { menu = false; web?.evaluateJavascript("window.supermdFind?.()", null) }, leadingIcon = { Icon(painterResource(R.drawable.symbol_search), null) })
+                                DropdownMenuItem(text = { Text("Find in note") }, onClick = { menu = false; activity.openReaderFind?.invoke() }, leadingIcon = { Icon(painterResource(R.drawable.symbol_search), null) })
                                 DropdownMenuItem(text = {Text("Rename note")},onClick = {menu=false;renaming=true},leadingIcon={Icon(painterResource(R.drawable.symbol_rename),null)})
                                 DropdownMenuItem(text = { Text("Settings") }, onClick = { menu = false; settings = true }, leadingIcon = { Icon(painterResource(R.drawable.symbol_settings), null) })
                             } }
@@ -432,6 +499,7 @@ private object NoMotionScheme : MotionScheme {
                                 retireAndDestroyReader(failedView)
                                 if (wasCurrent) {
                                     readerReady = false
+                                    readerPdfOwnsProgress = false
                                     readerNote[0] = null
                                     readerGeneration++
                                     web = null
@@ -520,7 +588,7 @@ private object NoMotionScheme : MotionScheme {
                         frame.removeAllViews()
                     }) }
                     SnackbarHost(snackbar, Modifier.align(Alignment.BottomCenter).safeDrawingPadding())
-                    if (state.busy || !readerReady) Surface(color = palette.surface.copy(alpha = .96f), modifier = Modifier.fillMaxSize()) { Column(Modifier.fillMaxSize(), verticalArrangement = Arrangement.Center, horizontalAlignment = Alignment.CenterHorizontally) { if(motion) LoadingIndicator() else Icon(Icons.Rounded.Description,null,Modifier.size(48.dp),tint=palette.primary); Spacer(Modifier.height(16.dp)); Text(if(state.busy) "Preparing your document…" else "Opening your workspace…") } }
+                    if (shouldShowNativeBusyOverlay(state.busy, readerReady, readerPdfOwnsProgress)) Surface(color = palette.surface.copy(alpha = .96f), modifier = Modifier.fillMaxSize()) { Column(Modifier.fillMaxSize(), verticalArrangement = Arrangement.Center, horizontalAlignment = Alignment.CenterHorizontally) { if(motion) LoadingIndicator() else Icon(Icons.Rounded.Description,null,Modifier.size(48.dp),tint=palette.primary); Spacer(Modifier.height(16.dp)); Text(if(state.busy) "Preparing your document…" else "Opening your workspace…") } }
                 }
             }
         }
@@ -540,7 +608,10 @@ private object NoMotionScheme : MotionScheme {
     if (exporting) ModalBottomSheet(onDismissRequest = { exporting = false }, sheetState = rememberModalBottomSheetState(skipPartiallyExpanded = true)) { ExportSettings(state.pdf, model::pdf, sharing = sharing, fonts = state.customFonts) { format ->
         exporting = false
         if (sharing) {
-            if (model.prepareShare(format)) when (format) { "pdf" -> web?.evaluateJavascript("window.supermdExport?.(${state.pdf})", null) ?: model.fail("The reader is not ready"); "smd" -> web?.evaluateJavascript("window.supermdPortable?.(false)", null) ?: model.fail("The reader is not ready"); "md" -> web?.evaluateJavascript("window.supermdExportMarkdown?.()", null) ?: model.fail("The reader is not ready") }
+            if (model.prepareShare(format)) {
+                if (format == "pdf") readerPdfOwnsProgress = true
+                when (format) { "pdf" -> web?.evaluateJavascript("window.supermdExport?.(${state.pdf})", null) ?: model.fail("The reader is not ready"); "smd" -> web?.evaluateJavascript("window.supermdPortable?.(false)", null) ?: model.fail("The reader is not ready"); "md" -> web?.evaluateJavascript("window.supermdExportMarkdown?.()", null) ?: model.fail("The reader is not ready") }
+            }
         } else if (format == "smd") portable.launch(state.active.name.substringBeforeLast('.') + ".smd") else pdf.launch(state.active.name.substringBeforeLast('.') + ".pdf")
     } }
     state.error?.let { AlertDialog(onDismissRequest = model::dismissError, title = { Text("Couldn't finish") }, text = { Text(it, Modifier.heightIn(max = 360.dp).verticalScroll(rememberScrollState())) }, confirmButton = { TextButton(onClick = model::dismissError) { Text("OK") } }) }

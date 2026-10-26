@@ -10,6 +10,7 @@ Rectangle {
     property bool ready: true
     property bool centerLocked: true
     property string noteName: ""
+    property var shortcutLabels: ({})
     property var colors: studio.palette
     property bool motion: studio.motionEnabled
     readonly property bool hovered: barHover.hovered
@@ -36,12 +37,12 @@ Rectangle {
             onClicked: controls.contentsRequested()
         }
         Label { text: controls.noteName; Layout.fillWidth: true; elide: Text.ElideRight; color: controls.colors.text; font.pixelSize: 14; font.weight: Font.Medium }
-        ActionButton { id: save; glyph: "FloppyDisk"; compact: true; enabled: controls.ready; ToolTip.text: "Save note (Ctrl+S)"; onClicked: controls.saveRequested() }
+        ActionButton { id: save; glyph: "FloppyDisk"; compact: true; enabled: controls.ready; ToolTip.text: "Save note (" + (controls.shortcutLabels.save || "Ctrl+S") + ")"; onClicked: controls.saveRequested() }
         ActionButton { id: exportNote; glyph: "Export"; compact: true; enabled: controls.ready; ToolTip.text: "Export note"; onClicked: controls.exportRequested() }
         ActionButton {
             id: exit; objectName: "studyExitButton"
             glyph: "FullscreenExit"; compact: true
-            ToolTip.text: "Exit fullscreen (Esc · F11)"
+            ToolTip.text: "Exit fullscreen (" + (controls.shortcutLabels.dismiss || "Esc") + " · " + (controls.shortcutLabels.fullscreen || "F11") + ")"
             onClicked: controls.exitRequested()
         }
         ActionButton {

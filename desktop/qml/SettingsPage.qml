@@ -7,9 +7,16 @@ Pane {
     id: page
     required property var viewState
     property var ownerPopup: null
+    property string shortcutMessage: ""
+    property string shortcutErrorAction: ""
+    property var shortcutLabels: JSON.parse(studio.shortcutLabels)
     signal back()
     readonly property bool pythonReady: JSON.parse(studio.pythonChoices).some(choice => choice.matplotlib)
     readonly property var storageSummary: JSON.parse(studio.storageReport)
+    onVisibleChanged: if (!visible) {
+        const host = page.Window.window
+        if (host) host.capturingShortcut = false
+    }
     function save(key, value) { studio.setting(key, JSON.stringify(value)) }
     function formatBytes(value) {
         if (value < 1024) return value + " B"
@@ -99,6 +106,36 @@ Pane {
                 ExpressiveSlider { Layout.fillWidth: true; from: 1.15; to: 2.2; stepSize: .05; value: viewState.settings.lineHeight; onMoved: page.save("lineHeight", value) }
                 Switch { text: "Full document accessibility"; checked: viewState.settings.fullDocumentAccessibility; onToggled: page.save("fullDocumentAccessibility", checked) }
                 Label { text: "Keeps the complete document in the semantic tree for assistive technology and browser Find. Large notes may use substantially more memory."; Layout.fillWidth: true; wrapMode: Text.WordWrap; color: viewState.colors.muted }
+                Label { text: "Keyboard shortcuts"; font.pixelSize: 22; font.weight: Font.DemiBold; Layout.topMargin: 12 }
+                Label { text: "Select a shortcut, then press the key combination you want. Command labels follow macOS; Ctrl, Alt and function keys are supported."; Layout.fillWidth: true; wrapMode: Text.WordWrap; color: viewState.colors.muted }
+                Repeater {
+                    model: JSON.parse(studio.shortcutActions)
+                    delegate: ColumnLayout {
+                        required property var modelData
+                        Layout.fillWidth: true
+                        RowLayout {
+                            Layout.fillWidth: true
+                            Label { text: modelData.label; Layout.fillWidth: true; wrapMode: Text.WordWrap }
+                            ShortcutRecorder {
+                                objectName: "shortcutRecorder_" + modelData.id
+                                value: page.shortcutLabels[modelData.id]
+                                onRecordingChanged: {
+                                    const host = page.Window.window
+                                    if (host) host.capturingShortcut = recording
+                                }
+                                onCaptured: function(sequence, error) {
+                                    const host = page.Window.window
+                                    if (host) host.capturingShortcut = false
+                                    if (error === "cancel") return
+                                    page.shortcutErrorAction = modelData.id
+                                    page.shortcutMessage = error || studio.setShortcut(modelData.id, sequence)
+                                }
+                            }
+                        }
+                        Label { text: page.shortcutMessage; visible: page.shortcutErrorAction === modelData.id && text.length > 0; Layout.fillWidth: true; wrapMode: Text.WordWrap; color: viewState.colors.primary }
+                    }
+                }
+                ActionButton { text: "Reset shortcuts to defaults"; tonal: true; onClicked: { page.shortcutMessage = studio.resetShortcuts(); page.shortcutErrorAction = "" } }
                 Switch { text: "Autosave existing notes"; checked: viewState.settings.autosave; onToggled: page.save("autosave", checked) }
                 Switch { text: "Continue from the last reading position"; checked: viewState.settings.restorePosition; onToggled: page.save("restorePosition", checked) }
                 Label { text: "On startup" }

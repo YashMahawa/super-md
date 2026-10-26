@@ -1,6 +1,8 @@
 #set heading(numbering: none)
 #set text(fill: rgb("#202020"))
 #show heading: set text(weight: "bold")
+// Allow long cell labels to wrap when generated fractional columns are narrow.
+#show table.cell: set text(hyphenate: true)
 #show raw: set text(font: "DejaVu Sans Mono", size: .86em)
 #show link: set text(fill: smd-link)
 #show table.cell.where(y: 0): set text(weight: "bold")
