@@ -75,7 +75,19 @@ export default function ReadingSearch({content,close,onChange,sourceSession}:{co
   useEffect(()=>{
     cancelSettlingHeading();
     setReaderOverlay("search",true);
-    const focus=()=>{input.current?.focus();input.current?.select();};focus();
+    const focus=()=>{
+      let attempts=0;
+      const focusInput=()=>{
+        const field=input.current;
+        if(field){field.focus({preventScroll:true});field.select();}
+        // Native menus/toolbars can retain host focus while React mounts this
+        // overlay. Reassert focus across the mount frames so the very next key
+        // reaches the search field, including when Find is opened repeatedly.
+        if(document.activeElement!==field&&attempts++<4)requestAnimationFrame(focusInput);
+      };
+      focusInput();
+    };
+    focus();
     const key=(event:KeyboardEvent)=>{if(event.key==="Escape"){event.preventDefault();event.stopImmediatePropagation();closeRef.current();}};
     document.addEventListener("keydown",key,true);window.addEventListener("supermd-find-focus",focus);
     return()=>{setReaderOverlay("search",false);document.removeEventListener("keydown",key,true);window.removeEventListener("supermd-find-focus",focus);};
@@ -94,7 +106,7 @@ export default function ReadingSearch({content,close,onChange,sourceSession}:{co
     return()=>{cancelAnimationFrame(frame);host.removeEventListener('supermd-window-change',refresh);};
   },[windowed,query,caseSensitive]);
   return <aside className="reading-search" data-independent-zoom role="search" aria-label="Find in note">
-    <input ref={input} aria-label="Find in note" type="search" placeholder="Find in this note" value={query} onChange={event=>setQuery(event.target.value)} onKeyDown={event=>{if(event.key==="Enter"){event.preventDefault();move(event.shiftKey?-1:1);}}}/>
+    <input ref={input} aria-label="Find in note" role="searchbox" type="text" inputMode="search" placeholder="Find in this note" value={query} onChange={event=>setQuery(event.target.value)} onKeyDown={event=>{if(event.key==="Enter"){event.preventDefault();move(event.shiftKey?-1:1);}}}/>
     <output aria-live="polite" title={count>=5000?'Showing the first 5,000 matches. Narrow your search to find later results.':undefined}>{count ? `${index<0 ? 0 : index+1} / ${count}${count>=5000?'+':''}` : query ? "No matches" : ""}</output>
     <button className="search-icon" aria-label="Previous match" disabled={!count} onClick={()=>move(-1)} title="Previous match (Shift+Enter)"><ArrowUp size={20} weight="bold"/></button>
     <button className="search-icon" aria-label="Next match" disabled={!count} onClick={()=>move(1)} title="Next match (Enter)"><ArrowDown size={20} weight="bold"/></button>

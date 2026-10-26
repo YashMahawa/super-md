@@ -11,6 +11,43 @@ import org.junit.Assert.*
 import org.junit.Test
 import org.junit.runner.RunWith
 import java.io.File
+import java.io.ByteArrayOutputStream
+import java.io.DataOutputStream
+import java.util.zip.CRC32
+
+private fun writeOversizedValidPng(file: File, minimumBytes: Int) {
+    val bitmap = android.graphics.Bitmap.createBitmap(1, 1, android.graphics.Bitmap.Config.ARGB_8888)
+    val png = ByteArrayOutputStream().use { output ->
+        check(bitmap.compress(android.graphics.Bitmap.CompressFormat.PNG, 100, output))
+        output.toByteArray()
+    }
+    bitmap.recycle()
+    check(png.size > 20 && png.copyOfRange(png.size - 12, png.size).contentEquals(
+        byteArrayOf(0, 0, 0, 0, 0x49, 0x45, 0x4e, 0x44, 0xae.toByte(), 0x42, 0x60, 0x82.toByte())
+    ))
+    val chunkType = "tEXt".toByteArray(Charsets.US_ASCII)
+    val keyword = "metadata\u0000".toByteArray(Charsets.ISO_8859_1)
+    val chunkDataLength = minimumBytes - png.size
+    check(chunkDataLength > keyword.size)
+    val crc = CRC32().apply { update(chunkType); update(keyword) }
+    file.outputStream().buffered().use { output ->
+        output.write(png, 0, png.size - 12)
+        val data = DataOutputStream(output)
+        data.writeInt(chunkDataLength)
+        data.write(chunkType)
+        data.write(keyword)
+        var remaining = chunkDataLength - keyword.size
+        val block = ByteArray(64 * 1024) { 'x'.code.toByte() }
+        while (remaining > 0) {
+            val count = minOf(remaining, block.size)
+            data.write(block, 0, count)
+            crc.update(block, 0, count)
+            remaining -= count
+        }
+        data.writeInt(crc.value.toInt())
+        data.write(png, png.size - 12, 12)
+    }
+}
 
 @RunWith(AndroidJUnit4::class)
 class EngineTest {
@@ -159,10 +196,18 @@ Literal ${'$'}\text{ast.circle}${'$'} must remain text.
         val directory = File(app.cacheDir, "pdf-assets-limit-${java.util.UUID.randomUUID()}").apply { mkdirs() }
         try {
             val assets = File(directory, "assets").apply { mkdirs() }
-            java.io.RandomAccessFile(File(assets, "too-large.png"), "rw").use { it.setLength(25_000_001L) }
+            val oversized = File(assets, "too-large.png")
+            writeOversizedValidPng(oversized, 25_000_001)
+            assertTrue("The fixture must exceed the native PDF asset limit: ${oversized.length()}", oversized.length() > 25_000_000)
+            val decoded = android.graphics.BitmapFactory.decodeFile(oversized.absolutePath)
+            assertNotNull("The over-limit fixture must still be a valid PNG", decoded)
+            assertEquals(1, decoded!!.width)
+            decoded.recycle()
             val output = File(directory, "document.pdf")
-            val error = PdfEngine.export("![Too large](too-large.png)", StudioState().pdf, assets.absolutePath, output.absolutePath)
-            assertTrue("Expected a clear asset size error, received: $error", error.contains("PDF asset exceeds its supported size: too-large.png"))
+            val markdown = "![Too large](too-large.png)"
+            assertEquals("[\"too-large.png\"]", PdfEngine.imageSources(markdown))
+            val error = PdfEngine.export(markdown, StudioState().pdf, assets.absolutePath, output.absolutePath)
+            assertTrue("Expected a clear asset size error for ${oversized.length()} bytes, received: $error", error.contains("PDF asset exceeds its supported size: too-large.png"))
             assertFalse("A failed export must not leave a PDF", output.exists())
         } finally { directory.deleteRecursively() }
     }

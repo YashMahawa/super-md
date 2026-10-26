@@ -63,5 +63,62 @@ export function selectedMarkdown(selection: Selection | null, source?:string): s
     if(first)list.setAttribute('start',String(listNumber(first)));
     list.append(fragment);return serialize(list).trim();
   }
-  return serialize(fragment).trim();
+  // cloneContents drops inline ancestors when both selection endpoints sit
+  // inside the same text node. Restore their Markdown meaning for narrow
+  // selections such as a few characters inside bold or linked text.
+  let output:Node=fragment;
+  let context=elementAt(range.commonAncestorContainer);
+  while(context&&!context.matches('.markdown-body,.live-document')&&!/^(ADDRESS|ARTICLE|ASIDE|BLOCKQUOTE|BODY|DD|DIV|DL|DT|FIELDSET|FIGCAPTION|FIGURE|FOOTER|FORM|H[1-6]|HEADER|HR|LI|MAIN|NAV|OL|P|PRE|SECTION|TABLE|TBODY|TD|TFOOT|TH|THEAD|TR|UL)$/.test(context.tagName)){
+    const tag=context.tagName.toLowerCase();
+    if(['strong','b','em','i','a','code'].includes(tag)&&!(tag==='code'&&context.parentElement?.tagName==='PRE')){
+      const wrapper=context.cloneNode(false) as Element;wrapper.append(output);output=wrapper;
+    }
+    context=context.parentElement;
+  }
+  return serialize(output).trim();
+}
+
+/** Replace the browser's rendered-text payload when a rendered Markdown
+ * selection is dragged out of the document. Keep the native drag operation
+ * itself intact so links, editor text, images, and internal drops retain their
+ * normal behavior. */
+export function setSelectedMarkdownDrag(event: Pick<DragEvent,"target"|"dataTransfer"|"defaultPrevented"|"clientX"|"clientY">, source?:string): boolean {
+  if(event.defaultPrevented||!event.dataTransfer)return false;
+  const target=event.target instanceof Element?event.target:null;
+  if(!target)return false;
+  // Do not replace native link/image drags or text drags from editable widgets.
+  if(target.closest("textarea,input,.cm-editor,.image-viewer,.markdown-body img,.markdown-body svg"))return false;
+  // A Live document can contain several rendered block roots. Resolve its
+  // owner first so selections spanning blocks use the full document source.
+  const root=target.closest(".live-document")||target.closest(".markdown-body");
+  if(!root)return false;
+  const selection=window.getSelection();
+  if(!selection?.rangeCount||selection.isCollapsed)return false;
+  // dragstart can also fire for an unselected link while an older text
+  // selection remains elsewhere in the same paragraph. Resolve the pointer to
+  // its caret and only replace text when dragging actually began in selection.
+  const doc=target.ownerDocument as Document&{
+    caretPositionFromPoint?:(x:number,y:number)=>{offsetNode:Node;offset:number}|null;
+    caretRangeFromPoint?:(x:number,y:number)=>Range|null;
+  };
+  const caret=doc.caretPositionFromPoint?.(event.clientX,event.clientY);
+  if(caret){
+    if(!selection.getRangeAt(0).isPointInRange(caret.offsetNode,caret.offset))return false;
+  }else{
+    const pointRange=doc.caretRangeFromPoint?.(event.clientX,event.clientY);
+    if(!pointRange||!selection.getRangeAt(0).isPointInRange(pointRange.startContainer,pointRange.startOffset))return false;
+  }
+  const endpointRoot=(node:Node)=>{
+    const element=node instanceof Element?node:node.parentElement;
+    return element?.closest(".live-document")||element?.closest(".markdown-body");
+  };
+  if(endpointRoot(selection.anchorNode!)!==root||endpointRoot(selection.focusNode!)!==root)return false;
+  const markdown=selectedMarkdown(selection,source);
+  if(markdown===null)return false;
+  event.dataTransfer.setData("text/plain",markdown);
+  // Rich text targets prefer the browser's HTML/URL payload over text/plain.
+  // A source-text drag must match Copy, which provides Markdown plain text.
+  event.dataTransfer.clearData('text/html');
+  event.dataTransfer.clearData('text/uri-list');
+  return true;
 }

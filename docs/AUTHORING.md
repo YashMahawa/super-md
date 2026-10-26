@@ -7,7 +7,13 @@ version before assuming a new feature is in a published release.
 
 Select text normally in Read, Live or Split. Scrolling during a text drag keeps
 the current magnification; Ctrl/Cmd-wheel and pinch still zoom. Held-button
-wheel zoom is available on empty page space and independently inside plots.
+wheel zoom is available while holding the mouse still over the page, including
+text, and independently inside plots. Once a text drag starts, scrolling extends
+the selection instead. Starting in a paragraph gap anchors to the following line.
+
+On desktop, Settings → Keyboard shortcuts lists the available commands. Select
+a binding and press a new combination, or use Backspace to disable it. Conflicts
+are rejected; Reset shortcuts to defaults restores the original bindings.
 
 Right-click selected text on desktop, or use Android's selection toolbar, to
 choose **Search Google** or **Ask ChatGPT**. Settings → Selected text lets you

@@ -3,7 +3,7 @@ import MarkdownPreview from './MarkdownPreview';
 import WindowedBlock from './WindowedBlock';
 import type {RenderedMarkdownBlock} from './CachedMarkdown';
 import {analyzeDocument,type SourceBlock} from '../documentAnalysis';
-import {selectedMarkdown} from '../copySource';
+import {selectedMarkdown,setSelectedMarkdownDrag} from '../copySource';
 import type {WritingOptions} from '../proofreading';
 import type {ReaderAccessibilityPreference} from '../types';
 import WritingSuggestions from './WritingSuggestions';
@@ -85,7 +85,7 @@ export default function LiveEditor({markdown,onChange,documentPath,python,dark,t
     const from=currentOffset(start),to=currentOffset(end);setEditing(null);
     onChange(markdown.slice(0,from)+next.slice(start,nextEnd)+markdown.slice(to));
   };
-  return <div className="live-document" onCopy={copy}>
+  return <div className="live-document" onCopy={copy} onDragStart={event=>{setSelectedMarkdownDrag(event.nativeEvent,renderedSource);}}>
     {!renderedSource.trim()?(editing?textarea():<section className="live-block" tabIndex={0} role="group" aria-label="Editable block 1" onDoubleClick={event=>open(event.currentTarget,0,markdown.length)} onKeyDown={event=>{if(event.key==='Enter'||event.key==='F2'){event.preventDefault();open(event.currentTarget,0,markdown.length);}}}/> ):<MarkdownPreview markdown={renderedSource} onChange={previewChange} documentPath={documentPath} python={python} dark={dark} trustedImageHosts={trustedImageHosts} onTrustImageHost={onTrustImageHost} renderBlock={renderBlock} fullDocumentAccessibility={fullDocumentAccessibility} sourceAnalysis={sourceAnalysis}/>}
   </div>;
 }

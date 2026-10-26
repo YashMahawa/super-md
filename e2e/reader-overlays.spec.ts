@@ -1,5 +1,20 @@
 import {test,expect} from '@playwright/test';
 
+test('native Find invocation sends immediate typing to search and refocuses an existing search',async({page})=>{
+  await page.addInitScript(()=>{window.SuperMD={post:(id,command)=>queueMicrotask(()=>window.supermdReply?.(id,command==='load_python_output'?null:true,null))};});
+  await page.goto('/android-reader.html');await page.waitForFunction(()=>!!window.supermdLoad);
+  await page.evaluate(()=>window.supermdLoad?.({id:'native-find',path:null,content:'# Needle in a note',mode:'reader',dark:false,fullscreen:false,colors:{},font:'Manrope',size:16,zoom:100,restorePosition:false}));
+  await page.evaluate(()=>window.supermdFind?.());
+  await page.keyboard.type('Needle');
+  const field=page.getByRole('searchbox',{name:'Find in note'});
+  await expect(field).toHaveValue('Needle');
+  await expect(page.getByRole('search').locator('output')).toHaveText('0 / 1');
+  await page.getByRole('button',{name:'Next match'}).click();
+  await page.evaluate(()=>window.supermdFind?.());
+  await page.keyboard.type('next');
+  await expect(field).toHaveValue('next');
+});
+
 for(const width of [390,1280,2560])test(`search and export overlays use readable native-size text at ${width}px`,async({page})=>{
   await page.setViewportSize({width,height:width===390?844:1440});
   await page.addInitScript(()=>{
@@ -26,14 +41,14 @@ for(const width of [390,1280,2560])test(`search and export overlays use readable
   expect(geometry.left).toBeGreaterThanOrEqual(0);expect(geometry.right).toBeLessThanOrEqual(width);
   expect(Math.abs(geometry.height-geometry.layoutHeight)).toBeLessThan(1);
   expect(geometry.transform).toBe('none');
-  if(width===2560){expect((await search.boundingBox())!.width).toBeGreaterThan(1000);await page.screenshot({path:'/tmp/supermd-large-search.png'});}
+  if(width===2560){expect((await search.boundingBox())!.width).toBeLessThanOrEqual(960);await page.screenshot({path:'/tmp/supermd-large-search.png'});}
   await page.keyboard.press('Escape');await expect(search).toHaveCount(0);
   await page.evaluate(()=>void window.supermdExport?.({pageSize:'a4',margin:18,fontSize:10,lineHeight:1.45,fontFamily:'Manrope',pageNumbers:true}));
   const dialog=page.getByRole('dialog',{name:'Exporting PDF'});
   await expect(dialog).toContainText('Typesetting your document');
   const bounds=(await dialog.boundingBox())!;
   expect(bounds.x).toBeGreaterThanOrEqual(0);expect(bounds.x+bounds.width).toBeLessThanOrEqual(width);
-  if(width===2560)expect(bounds.width).toBeGreaterThan(900);
+  if(width===2560)expect(bounds.width).toBeLessThanOrEqual(760);
   await expect(dialog.locator('.export-progress-morph')).toBeVisible();
   const progress=dialog.getByRole('progressbar');await expect(progress).toBeAttached();
   expect(await progress.evaluate(el=>getComputedStyle(el).clipPath)).toBe('inset(50%)');

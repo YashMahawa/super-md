@@ -20,6 +20,16 @@ class StudioUiTest {
     @get:Rule val compose = createAndroidComposeRule<MainActivity>()
     private var temporaryNoteState: StudioState? = null
     private var temporaryRestorePosition: Boolean? = null
+    private var temporaryImeSetting: Int? = null
+    private fun setShowImeWithHardware(enabled: Boolean) {
+        if (temporaryImeSetting == null) {
+            temporaryImeSetting = android.provider.Settings.Secure.getInt(compose.activity.contentResolver, "show_ime_with_hard_keyboard", 0)
+        }
+        shellOutput("settings put secure show_ime_with_hard_keyboard ${if (enabled) 1 else 0}")
+        compose.waitUntil(3_000) {
+            android.provider.Settings.Secure.getInt(compose.activity.contentResolver, "show_ime_with_hard_keyboard", 0) == if (enabled) 1 else 0
+        }
+    }
     @After fun restoreTemporaryNoteAndRecovery() {
         try {
             val before = temporaryNoteState ?: return
@@ -47,6 +57,15 @@ class StudioUiTest {
                 }.getOrDefault(false)
             }
         } finally {
+            temporaryImeSetting?.let { previous ->
+                runCatching { shellOutput("settings put secure show_ime_with_hard_keyboard $previous") }
+                temporaryImeSetting = null
+            }
+            runCatching {
+                val reader = web(compose.activity.window.decorView)
+                if (reader != null) (compose.activity.getSystemService(android.content.Context.INPUT_METHOD_SERVICE) as android.view.inputmethod.InputMethodManager)
+                    .hideSoftInputFromWindow(reader.windowToken, 0)
+            }
             temporaryRestorePosition?.let { previous ->
                 val model = androidx.lifecycle.ViewModelProvider(compose.activity)[StudioViewModel::class.java]
                 compose.runOnIdle { model.restorePosition(previous) }
@@ -56,6 +75,12 @@ class StudioUiTest {
         }
     }
     private fun web(view: View): WebView? = if (view is WebView) view else if (view is ViewGroup) (0 until view.childCount).firstNotNullOfOrNull { web(view.getChildAt(it)) } else null
+    private fun imeVisible(): Boolean {
+        val decor = compose.activity.window.decorView
+        val platformInsets = decor.rootWindowInsets ?: return false
+        return androidx.core.view.WindowInsetsCompat.toWindowInsetsCompat(platformInsets)
+            .isVisible(androidx.core.view.WindowInsetsCompat.Type.ime())
+    }
     /** Resolve touch input to this resumed activity, never an instrumentation helper root. */
     private fun activityRoot(): SemanticsNodeInteraction {
         compose.waitForIdle()
@@ -86,11 +111,12 @@ class StudioUiTest {
             useUnmergedTree = true,
         )
     }
-    private fun javascriptUntil(script: String, accepted: (String) -> Boolean): String {
+    private fun javascriptUntil(script: String, accepted: (String) -> Boolean): String = javascriptUntil(script, 60_000, accepted)
+    private fun javascriptUntil(script: String, timeoutMs: Long, accepted: (String) -> Boolean): String {
         val result = AtomicReference("")
         val inFlight=java.util.concurrent.atomic.AtomicBoolean(false)
         try {
-            compose.waitUntil(60_000) {
+            compose.waitUntil(timeoutMs) {
                 // Mutating checks (dismiss, click, navigate) must never enqueue a
                 // second evaluation before observing the first successful reply.
                 if(accepted(result.get()))return@waitUntil true
@@ -103,6 +129,19 @@ class StudioUiTest {
             throw AssertionError("JavaScript condition timed out; script=$boundedScript; lastReply=$boundedReply; evaluationInFlight=${inFlight.get()}", timeout)
         }
         return result.get()
+    }
+    private fun javascriptSnapshot(script: String): String {
+        val result = AtomicReference<String?>(null)
+        compose.activity.runOnUiThread {
+            web(compose.activity.window.decorView)?.evaluateJavascript(script) { result.set(it) }
+        }
+        compose.waitUntil(3_000) { result.get() != null }
+        return (org.json.JSONTokener(result.get()).nextValue() as? String)
+            ?: error("Expected JavaScript string result, got ${result.get()}")
+    }
+    private fun shellOutput(command: String): String {
+        val descriptor = androidx.test.platform.app.InstrumentationRegistry.getInstrumentation().uiAutomation.executeShellCommand(command)
+        return android.os.ParcelFileDescriptor.AutoCloseInputStream(descriptor).use { String(it.readBytes()) }
     }
     private fun welcome() {
         repeat(2) { if (compose.onAllNodesWithText("Continue").fetchSemanticsNodes().isNotEmpty()) compose.onNodeWithText("Continue").performClick() }
@@ -525,6 +564,82 @@ class StudioUiTest {
         javascriptUntil("document.querySelector('.reading-search output')?.textContent") {it=="\"0 / 1\""}
         javascriptUntil("(()=>{const b=document.querySelector('button[aria-label=\"Next match\"]');if(b&&!b.disabled)b.click();return document.querySelector('.reading-search output')?.textContent;})()") {it=="\"1 / 1\""}
         javascriptUntil("window.supermdDismiss?.()") {it=="true"}
+    }
+    @Test fun findFromMoreActionsAcceptsImmediateNativeTextInput() {
+        welcome()
+        setShowImeWithHardware(false)
+        val instrumentation=androidx.test.platform.app.InstrumentationRegistry.getInstrumentation()
+        val reader = requireNotNull(web(compose.activity.window.decorView))
+        // Control: compare Android's native key injection on a plain input in
+        // this same WebView/activity before exercising the React search field.
+        javascriptUntil("(()=>{const i=document.createElement('input');i.id='native-key-probe';i.type='text';i.style.cssText='position:fixed;top:2px;left:2px;z-index:999999';document.body.append(i);i.focus();return document.activeElement===i})()") { it == "true" }
+        shellOutput("input text focusneedle")
+        instrumentation.waitForIdleSync()
+        javascriptUntil("document.querySelector('#native-key-probe')?.value") { it != "null" && it != "\"\"" }
+        val plainInputTrace = javascriptSnapshot("(()=>{const i=document.querySelector('#native-key-probe');return JSON.stringify({value:i?.value??null,active:document.activeElement===i,selection:[i?.selectionStart,i?.selectionEnd]})})()")
+        android.util.Log.i("StudioUiTest", "Plain WebView input keyboard control: $plainInputTrace")
+        (compose.activity.getSystemService(android.content.Context.INPUT_METHOD_SERVICE) as android.view.inputmethod.InputMethodManager)
+            .hideSoftInputFromWindow(reader.windowToken, 0)
+        compose.waitUntil(2_000) { !imeVisible() }
+        javascriptUntil("(()=>{document.querySelector('#native-key-probe')?.remove();return !document.querySelector('#native-key-probe')})()") { it == "true" }
+        val model=androidx.lifecycle.ViewModelProvider(compose.activity)[StudioViewModel::class.java]
+        temporaryNoteState=model.state.value
+        val content="# Immediate Find Focus\n\nHardware typing should land here without tapping the search field. FocusNeedle appears in this paragraph.\n"
+        compose.runOnIdle {model.edit(model.state.value.active.id,content);model.mode("reader")}
+        javascriptUntil("document.querySelector('.android-reading')?.textContent.includes('FocusNeedle')") {it=="true"}
+        compose.onNodeWithContentDescription("More actions").performClick()
+        compose.onNodeWithText("Find in note").performClick()
+        javascriptUntil("(()=>{const input=document.querySelector('.reading-search input');return !!input&&document.activeElement===input})()") {it=="true"}
+        compose.waitUntil(3_000) { web(compose.activity.window.decorView)?.hasFocus() == true }
+        val nativeInputState = AtomicReference<org.json.JSONObject>()
+        androidx.test.platform.app.InstrumentationRegistry.getInstrumentation().runOnMainSync {
+            val imm = compose.activity.getSystemService(android.content.Context.INPUT_METHOD_SERVICE) as android.view.inputmethod.InputMethodManager
+            nativeInputState.set(org.json.JSONObject().put("webViewHasFocus", reader.hasFocus())
+                .put("windowHasFocus", reader.hasWindowFocus()).put("isTextEditor", reader.onCheckIsTextEditor())
+                .put("inputMethodActive", imm.isActive(reader)).put("imeVisible", imeVisible()))
+        }
+        javascriptUntil("(()=>{const i=document.querySelector('.reading-search input');if(!i)return false;window.__searchKeyTrace=[];for(const name of ['keydown','beforeinput','input'])i.addEventListener(name,e=>window.__searchKeyTrace.push({type:e.type,key:e.key??null,keyCode:e.keyCode??null,data:e.data??null,inputType:e.inputType??null,ctrl:e.ctrlKey??false,meta:e.metaKey??false,shift:e.shiftKey??false,start:i.selectionStart,end:i.selectionEnd,value:i.value}),true);return true})()") { it == "true" }
+        try {
+            shellOutput("input text focusneedle")
+            instrumentation.waitForIdleSync()
+            try {
+                javascriptUntil("document.querySelector('.reading-search input')?.value", 2_000) { it == "\"focusneedle\"" }
+            } catch (failure: AssertionError) {
+                val droppedState = javascriptSnapshot("(()=>{const i=document.querySelector('.reading-search input');return JSON.stringify({value:i?.value??null,active:document.activeElement===i,documentFocused:document.hasFocus(),selection:[i?.selectionStart,i?.selectionEnd],events:window.__searchKeyTrace??[],search:!!document.querySelector('.reading-search'),reader:!!document.querySelector('.android-reading'),modal:!!document.querySelector('[role=dialog]'),exportProgress:!!document.querySelector('.reader-export-progress')})})()")
+                val afterDrop = AtomicReference<org.json.JSONObject>()
+                instrumentation.runOnMainSync {
+                    val imm = compose.activity.getSystemService(android.content.Context.INPUT_METHOD_SERVICE) as android.view.inputmethod.InputMethodManager
+                    afterDrop.set(org.json.JSONObject().put("webViewHasFocus", reader.hasFocus()).put("windowHasFocus", reader.hasWindowFocus())
+                        .put("isTextEditor", reader.onCheckIsTextEditor()).put("inputMethodActive", imm.isActive(reader)).put("imeVisible", imeVisible()))
+                }
+                throw AssertionError("Native input text was dropped; state=${afterDrop.get()}; DOM=$droppedState; plain=$plainInputTrace", failure)
+            }
+        } finally {
+            listOf(android.view.KeyEvent.KEYCODE_SHIFT_LEFT, android.view.KeyEvent.KEYCODE_SHIFT_RIGHT,
+                android.view.KeyEvent.KEYCODE_CTRL_LEFT, android.view.KeyEvent.KEYCODE_CTRL_RIGHT,
+                android.view.KeyEvent.KEYCODE_ALT_LEFT, android.view.KeyEvent.KEYCODE_ALT_RIGHT,
+                android.view.KeyEvent.KEYCODE_META_LEFT, android.view.KeyEvent.KEYCODE_META_RIGHT).forEach { keyCode ->
+                instrumentation.sendKeySync(android.view.KeyEvent(android.view.KeyEvent.ACTION_UP, keyCode))
+            }
+        }
+        android.os.SystemClock.sleep(250)
+        val searchTrace = javascriptSnapshot("(()=>{const i=document.querySelector('.reading-search input');return JSON.stringify({value:i?.value??null,active:document.activeElement===i,selection:[i?.selectionStart,i?.selectionEnd],events:window.__searchKeyTrace??[]})})()")
+        android.util.Log.i("StudioUiTest", "React search keyboard trace: $searchTrace")
+        val query = org.json.JSONObject(searchTrace).optString("value")
+        assertEquals("React search must accept native hardware text without a field tap; state=${nativeInputState.get()}; trace=$searchTrace; plain=$plainInputTrace", "focusneedle", query)
+        javascriptUntil("(()=>{const input=document.querySelector('.reading-search input');return !!input&&document.activeElement===input&&input.selectionStart===input.selectionEnd&&input.selectionEnd===input.value.length})()") {it=="true"}
+    }
+    @Test fun findFromMoreActionsShowsImeWhenTouchInputIsRequested() {
+        welcome()
+        setShowImeWithHardware(true)
+        val model=androidx.lifecycle.ViewModelProvider(compose.activity)[StudioViewModel::class.java]
+        temporaryNoteState=model.state.value
+        compose.runOnIdle { model.mode("reader") }
+        compose.onNodeWithContentDescription("More actions").performClick()
+        compose.onNodeWithText("Find in note").performClick()
+        javascriptUntil("(()=>{const input=document.querySelector('.reading-search input');return !!input&&document.activeElement===input})()") {it=="true"}
+        compose.waitUntil(3_000) { web(compose.activity.window.decorView)?.hasFocus() == true }
+        compose.waitUntil(5_000) { imeVisible() }
     }
     @Test fun nativeSelectionAndHeadingLinksUseMagnifiedPageCoordinates() {
         welcome()

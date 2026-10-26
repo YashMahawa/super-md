@@ -12,7 +12,7 @@ import SvgDiagram from "./SvgDiagram";
 import { remarkSvgBlocks } from "../svgBlocks";
 import { remarkObsidianMath } from "../obsidianMath";
 import { navigateHeading, remarkHeadingIds } from "../documentNavigation";
-import { selectedMarkdown } from "../copySource";
+import { selectedMarkdown, setSelectedMarkdownDrag } from "../copySource";
 import CopyCode from "./CopyCode";
 import CodeBlockBoundary from "./CodeBlockBoundary";
 import {DocumentAppearance} from '../documentAppearance';
@@ -173,7 +173,7 @@ function MarkdownPreview({ markdown, documentPath, python, dark, trustedImageHos
   const tasks=onChange?analysis.tasks:[];
   const renderImage = useCallback(({src,alt}:{src?:string;alt?:string})=><AssetImage src={src} alt={alt} documentPath={documentPath} trustedImageHosts={trustedImageHosts} onTrustImageHost={onTrustImageHost}/>,[documentPath,trustedImageHosts,onTrustImageHost]);
   return (
-    <article className="markdown-body" onCopy={event=>{if(event.currentTarget.closest('.live-document'))return;const source=selectedMarkdown(window.getSelection(),markdown);if(source!==null){event.clipboardData.setData("text/plain",source);event.preventDefault();}}}>
+    <article className="markdown-body" onCopy={event=>{if(event.currentTarget.closest('.live-document'))return;const source=selectedMarkdown(window.getSelection(),markdown);if(source!==null){event.clipboardData.setData("text/plain",source);event.preventDefault();}}} onDragStart={event=>{if(!event.currentTarget.closest('.live-document'))setSelectedMarkdownDrag(event.nativeEvent,markdown);}}>
       <CachedMarkdown
         sourceAnalysis={{source:markdown,analysis}}
         renderBlock={renderBlock}
