@@ -118,14 +118,15 @@ function imageResult(response: { result?: unknown; error?: string }) {
   if (!image || image.mime_type !== "image/png" || typeof image.data !== "string" || !Number.isInteger(image.width) || !Number.isInteger(image.height) || typeof image.revision !== "string") return textResult({ error: "The app returned an invalid image response." }, true);
   const bytes = Buffer.from(image.data, "base64");
   if (bytes.length < 8 || bytes.length > 4 * 1024 * 1024 || !bytes.subarray(0, 8).equals(Buffer.from([137,80,78,71,13,10,26,10]))) return textResult({ error: "The app image is not a bounded PNG." }, true);
-  return { content: [{ type: "image" as const, data: bytes.toString("base64"), mimeType: "image/png" }, { type: "text" as const, text: JSON.stringify({ width: image.width, height: image.height, revision: image.revision }) }] };
+  const metadata = image.metadata && typeof image.metadata === "object" && Buffer.byteLength(JSON.stringify(image.metadata)) <= 12_000 ? image.metadata : undefined;
+  return { content: [{ type: "image" as const, data: bytes.toString("base64"), mimeType: "image/png" }, { type: "text" as const, text: JSON.stringify({ width: image.width, height: image.height, revision: image.revision, metadata }) }] };
 }
 function registerTools(server: McpServer, group: Group): void {
   const deviceId = z.string().regex(UUID_RE).optional();
   const tabId = z.string().min(1).max(512);
   const pageSize = z.enum(["a3","a4","a5","a6","iso-b4","iso-b5","iso-b6","letter","legal","tabloid","executive"]);
   const exportOptions = z.object({
-    pageSize: pageSize.optional(), margin: z.number().min(0).max(50).optional(), fontSize: z.number().min(5).max(24).optional(),
+    pageSize: pageSize.optional(), margin: z.number().min(4).max(60).optional(), fontSize: z.number().min(5).max(24).optional(),
     lineHeight: z.number().min(0.9).max(2.2).optional(), paragraphSpacing: z.number().min(0).max(3).optional(),
     fontFamily: z.string().max(128).optional(), pageNumbers: z.boolean().optional(), themed: z.boolean().optional(),
   });
@@ -233,6 +234,19 @@ app.all("/mcp/:groupId/:connectorKey", hostGuard, (req, res, next) => {
   if (req.method === "GET") { next(); return; }
   if (!authenticatedGroup(param(req.params.groupId), param(req.params.connectorKey))) { res.status(401).send("Invalid MCP capability"); return; }
   void modernNodeHandler(req, res).catch(() => { if (!res.headersSent) res.status(500).send("MCP request failed"); });
+});
+app.post("/device/revoke", hostGuard, express.json({ limit: "8kb", strict: true }), (req, res) => {
+  const {groupId, pairingKey, deviceId} = req.body ?? {};
+  if (typeof groupId !== "string" || !GROUP_ID_RE.test(groupId) || !validToken(pairingKey) || typeof deviceId !== "string" || !UUID_RE.test(deviceId)) { res.status(400).json({error:"Invalid revocation request"}); return; }
+  const group = groups.get(groupId);
+  if (group && !equalSecret(group.pairingHash, digest(pairingKey))) { res.status(401).json({error:"Invalid pairing authorization"}); return; }
+  const device = group?.devices.get(deviceId);
+  if (device) {
+    rejectPending(device, "This device's access was revoked.");
+    device.socket?.close(4003, "Device access revoked");
+    group!.devices.delete(deviceId);
+  }
+  res.status(200).json({revoked:true,groupId});
 });
 app.use((_req, res) => res.status(404).send("Not found"));
 

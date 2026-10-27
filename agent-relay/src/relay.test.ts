@@ -67,7 +67,7 @@ test("relay auth, bounded device RPC, Streamable HTTP, legacy SSE and disconnect
     let result: unknown;
     if (request.action === "list_tabs") result = { tabs: [{ id: tabId, name: "Untitled.md", revision, saved: false }] };
     else if (request.action === "read_tab") result = { tabId, text: "# Live\\ncontent", revision, offset: 0 };
-    else if (request.action === "render_tab") result = { mime_type: "image/png", data: png.toString("base64"), width: 1, height: 1, revision };
+    else if (request.action === "render_tab") result = { mime_type: "image/png", data: png.toString("base64"), width: 1, height: 1, revision, metadata: {reading:{offset:123,heading:"Current section"}} };
     else if (request.action === "patch_tab") { ws.send(JSON.stringify({ type: "reply", requestId: request.requestId, error: "Revision conflict: tab changed." })); return; }
     else result = { accepted: true };
     ws.send(JSON.stringify({ type: "reply", requestId: request.requestId, result }));
@@ -89,6 +89,7 @@ test("relay auth, bounded device RPC, Streamable HTTP, legacy SSE and disconnect
   assert.match(String(read.content?.[0]?.type === "text" ? read.content[0].text : ""), /Live/);
   const image = await http.callTool({ name: "render_tab", arguments: { deviceId, tabId: "tab:" + deviceId + ":main:1", width: 500 } });
   assert.equal(image.content?.[0]?.type, "image");
+  assert.match(String(image.content?.[1]?.type === "text" ? image.content[1].text : ""), /Current section/);
   const stale = await http.callTool({ name: "patch_tab", arguments: { deviceId, tabId: "tab:" + deviceId + ":main:1", expectedRevision: revision, operations: [{ type: "replace", old: "Live", new: "New" }] } });
   assert.equal(stale.isError, true);
 
@@ -113,6 +114,15 @@ test("relay auth, bounded device RPC, Streamable HTTP, legacy SSE and disconnect
   assert.equal(ambiguousWrite.isError, true, "writes require a selected device when multiple devices are connected");
   const ambiguousRead = await http.callTool({ name: "list_tabs", arguments: {} });
   assert.equal(ambiguousRead.isError, true, "tab reads report device ambiguity instead of guessing");
+  const revoke = (key: string) => fetch(base + "/device/revoke", {method:"POST",headers:{"content-type":"application/json"},body:JSON.stringify({groupId,pairingKey:key,deviceId:secondId})});
+  assert.equal((await revoke(token())).status,401,"only the pairing authority may revoke a device");
+  const closed = once(second,"close");
+  assert.deepEqual(await (await revoke(pairingKey)).json(),{revoked:true,groupId});
+  await closed;
+  assert.equal((await revoke(pairingKey)).status,200,"revocation is idempotent");
+  const stolen = new WebSocket("ws://" + host + "/device?groupId=" + groupId + "&deviceId=" + secondId, {headers:{authorization:"Bearer " + secondKey,"x-supermd-connector-hash":connectorHash}});
+  const revokedStatus = await new Promise<number>((resolve,reject)=>{const timer=setTimeout(()=>reject(Error("revocation timeout")),2000);stolen.on("unexpected-response",(_request,response)=>{clearTimeout(timer);resolve(response.statusCode??0);});stolen.on("error",()=>undefined);});
+  assert.equal(revokedStatus,401,"a copied device key cannot reconnect after revocation");
 
   const sse = new Client({ name: "relay-sse-test", version: "1.0.0" });
   const sseTransport = new SSEClientTransport(url);
