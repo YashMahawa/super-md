@@ -57,6 +57,13 @@ The MCP connector URL is a bearer capability; it contains the connector key
 and must only be given to the intended AI client. Never paste pairing JSON,
 device credentials or the connector URL in logs, issue reports or screenshots.
 
+Explicit device revocation calls `POST /device/revoke` with pairing authority. It
+removes that device registration, closes its socket and rejects pending calls;
+the previous device key cannot reconnect. A trusted holder of the pairing file
+can enroll devices again. Turning access off only disconnects it. If the app
+cannot confirm revocation while offline, it still erases its local credentials
+and reports that server confirmation is outstanding.
+
 Device enrollment and reconnect after a relay restart are ephemeral. A paired
 app re-enrolls from its Keystore-protected credentials. The relay holds the
 current group/device directory and in-flight requests only in RAM; disconnected

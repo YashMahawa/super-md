@@ -59,7 +59,7 @@ export function validateRpcRequest(value: unknown): RpcRequest {
   if (r.assetId !== undefined && (typeof r.assetId !== "string" || r.assetId.length > 512)) throw new Error("Invalid asset id");
   if (r.mimeType !== undefined && (typeof r.mimeType !== "string" || r.mimeType.length > 128)) throw new Error("Invalid media type");
   if (r.body !== undefined && (typeof r.body !== "string" || Buffer.byteLength(r.body) > 25 * 1024 * 1024)) throw new Error("Media body is too large");
-  if (r.assetName !== undefined && (typeof r.assetName !== "string" || Buffer.byteLength(r.assetName) > 256 || /[\\/\0]/.test(r.assetName))) throw new Error("Invalid asset name");
+  if (r.assetName !== undefined && (typeof r.assetName !== "string" || Buffer.byteLength(r.assetName) > 256 || !( /^[a-f0-9]{64}$/.test(r.assetName) || /^(?:assets\/)?[A-Za-z0-9._-]{1,150}$/.test(r.assetName) && ![".",".."].includes(r.assetName.split("/").at(-1)!)))) throw new Error("Invalid asset name");
   if (r.assetPath !== undefined && (typeof r.assetPath !== "string" || Buffer.byteLength(r.assetPath) > 4096 || r.assetPath.includes("\0"))) throw new Error("Invalid asset path");
   if (r.view !== undefined && r.view !== "source" && r.view !== "prose") throw new Error("Invalid document view");
   for (const key of ["offset", "limit", "context", "width"] as const) {

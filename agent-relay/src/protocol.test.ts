@@ -14,4 +14,9 @@ test("device RPC schema rejects unknown fields, oversized ranges and stale-write
   assert.throws(() => validateRpcRequest({ requestId: "r5", action: "get_diagram", tabId: "tab:1", diagramId: "diagram:0" }), /diagram requests need/);
   assert.equal(validateRpcRequest({ requestId: "r6", action: "document_action", documentAction: "job_status", jobId: "job-1" }).jobId, "job-1");
   assert.throws(() => validateRpcRequest({ requestId: "r7", action: "replace_tab_asset", tabId: "tab:1", assetName: "image.png", assetPath: "a".repeat(4097), expectedRevision: "a".repeat(64) }), /asset path/);
+  const assetRequest = {requestId:"asset",action:"replace_tab_asset",tabId:"tab:1",assetPath:"/Downloads/new.png",expectedRevision:"a".repeat(64)};
+  assert.equal(validateRpcRequest({...assetRequest,assetName:"assets/current.png"}).assetName,"assets/current.png");
+  assert.equal(validateRpcRequest({...assetRequest,assetName:"b".repeat(64)}).assetName,"b".repeat(64));
+  for(const assetName of ["../secret.png","assets/../secret.png","assets/a/b.png","assets/..","/secret.png"])
+    assert.throws(()=>validateRpcRequest({...assetRequest,assetName}),/asset name/);
 });
