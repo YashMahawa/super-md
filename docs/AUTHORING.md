@@ -34,7 +34,9 @@ Super MD's source editor exposes its Markdown only, never a wall of image bytes.
 The old `.fmd` envelope and older *plain-text* `.smd` notes remain readable.
 Do not rename a plain Markdown file to `.smd` and claim its images are embedded.
 
-An agent should create/edit `.md` and let the app or native engine pack it:
+Agents can edit Markdown or SMD directly with revision-checked, targeted patches,
+replace individual assets, and work with open unsaved tabs. See the
+[CLI and MCP guide](AGENT-INTERFACE.md). The lower-level engine also packs notes:
 
 ```sh
 smd-engine pack ./lesson.md ./lesson.smd
@@ -48,15 +50,20 @@ smd-engine extract ./lesson.smd assets/image-1.svg ./figure.svg
 and `assets` emit metadata, not image bytes. `extract` writes one named image to a
 file and refuses to overwrite an existing output. Avoid `cat lesson.smd` or
 putting its JSON/base64 envelope in an AI's context. Use file/image tools on the
-extracted asset separately. For edits, export or unpack the relevant images into
-a working folder, edit Markdown, and pack a new portable note. The GUI handles
+extracted asset separately. For edits, use `super-md agent patch` and `replace-asset` to keep unchanged
+assets intact without unpacking or rewriting a document through a script. The GUI handles
 image insertion, drag/drop, replacement/removal and portable Save in-place.
 
 The v1 portable envelope has `format: "supermd-smd"`, `version: 1`, `markdown` and
 `assets`. Only the assets map holds base64 image data URLs. Names are bounded,
 safe `assets/<filename>` references. Use the packer instead of synthesizing binary
 JSON. Limits: 20 MB Markdown, 25 MB per image, 75 MB total images, 512 assets,
-120 MB envelope. The CLI does not download URLs or auto-run Python.
+120 MB envelope. New saves wrap the unchanged JSON v1 envelope in deterministic
+gzip compression. The reader detects it from its bytes, independently of the
+filename, and continues to accept legacy uncompressed JSON SMD/FMD. Compressed
+SMD needs Super MD 0.6.14 or newer. Compression is lossless; image bytes, vector
+paths and editable source are retained. The CLI does not download URLs or
+auto-run Python.
 
 ## Markdown and navigation
 

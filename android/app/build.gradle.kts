@@ -2,7 +2,7 @@ plugins { id("com.android.application"); id("org.jetbrains.kotlin.plugin.compose
 android {
     namespace = "dev.supermd.studio"
     compileSdk { version = release(37) }
-    defaultConfig { applicationId = "dev.supermd.studio"; minSdk = 26; targetSdk = 36; versionCode = 1038; versionName = "0.6.13"; ndk { abiFilters += (System.getenv("SUPERMD_ABIS") ?: "arm64-v8a").split(',') }; testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner" }
+    defaultConfig { applicationId = "dev.supermd.studio"; minSdk = 26; targetSdk = 36; versionCode = 1039; versionName = "0.6.14"; ndk { abiFilters += (System.getenv("SUPERMD_ABIS") ?: "arm64-v8a").split(',') }; testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner" }
     buildFeatures { compose = true; buildConfig = true }
     compileOptions { sourceCompatibility = JavaVersion.VERSION_17; targetCompatibility = JavaVersion.VERSION_17 }
     signingConfigs {
@@ -36,6 +36,7 @@ dependencies {
     implementation("com.caverock:androidsvg-aar:1.4")
     implementation("androidx.window:window:1.4.0")
     implementation("org.jetbrains.kotlinx:kotlinx-coroutines-android:1.10.2")
+    implementation("com.squareup.okhttp3:okhttp:4.12.0")
     testImplementation("junit:junit:4.13.2")
     testImplementation("org.robolectric:robolectric:4.14.1")
     androidTestImplementation("androidx.test.ext:junit:1.3.0")

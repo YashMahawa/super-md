@@ -3,7 +3,7 @@ import json
 import sys
 from importlib.metadata import distribution
 from pathlib import Path
-from PyInstaller.utils.hooks import collect_data_files
+from PyInstaller.utils.hooks import collect_data_files, collect_submodules, copy_metadata
 from PyInstaller.depend.bindepend import resolve_library_path
 
 sys.path.insert(0, str(Path(SPECPATH)))
@@ -22,6 +22,7 @@ data = [(str(root / "dist"), "resources/dist"),
         (str(root / "public/third-party-ui-licenses.txt"), "resources/licenses"),
         (str(root / "smd-core/fonts"), "resources/smd-core/fonts"),
         (str(root / "docs/AUTHORING.md"), "resources/docs"),
+        (str(root / "docs/AGENT-INTERFACE.md"), "resources/docs"),
         (str(root / "desktop/NOTICE.md"), "resources/licenses")]
 data.append((str(root / "desktop/licenses"), "resources/licenses/qt"))
 data.append((str(root / "desktop/build-info.json"), "resources/desktop"))
@@ -35,6 +36,13 @@ if (root / "LICENSE").exists():
 data += collect_data_files("PySide6", includes=["**/LICENSE*", "**/COPYING*", "**/licenses/**"])
 data += collect_data_files("certifi", includes=["cacert.pem"])
 hidden = ["PySide6.QtWebEngineCore", "PySide6.QtWebChannel", "PySide6.QtNetwork", "certifi"]
+# The SDK loads transports and validators lazily. Bundle these once in the
+# shared onedir runtime; CLI startup still avoids importing the SDK or Qt.
+hidden += collect_submodules("mcp", filter=lambda name: name != "mcp.__main__" and name != "mcp.cli" and not name.startswith("mcp.cli."))
+hidden += collect_submodules("websockets")
+data += collect_data_files("mcp")
+data += copy_metadata("mcp", recursive=True)
+data += copy_metadata("websockets", recursive=True)
 if sys.platform in ("win32", "darwin"):
     # Built-in Python for cells: most people on Windows and macOS have no Python.
     # Ship numpy + matplotlib and the standard library cells commonly import.
@@ -63,7 +71,14 @@ pyz = PYZ(analysis.pure)
 exe = EXE(pyz, analysis.scripts, [], exclude_binaries=True, name="super-md",
           debug=False, strip=False, upx=False, console=sys.platform.startswith("linux"),
           icon=str(root / "src-tauri/icons/icon.ico") if sys.platform == "win32" else None)
-collection = COLLECT(exe, analysis.binaries, analysis.datas, strip=False, upx=False, name="super-md")
+executables = [exe]
+if sys.platform == "win32":
+    # Windows GUI executables have no stdin/stdout. MCP stdio needs a console
+    # launcher, sharing the same Python/runtime files instead of duplicating it.
+    executables.append(EXE(pyz, analysis.scripts, [], exclude_binaries=True,
+        name="super-md-cli", debug=False, strip=False, upx=False, console=True,
+        icon=str(root / "src-tauri/icons/icon.ico")))
+collection = COLLECT(*executables, analysis.binaries, analysis.datas, strip=False, upx=False, name="super-md")
 if sys.platform == "darwin":
     app = BUNDLE(collection, name="Super MD.app", icon=str(root / "src-tauri/icons/icon.icns"),
         bundle_identifier="dev.supermd.studio", info_plist={

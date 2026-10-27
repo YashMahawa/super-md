@@ -5,6 +5,11 @@ import sys
 import subprocess
 from pathlib import Path
 
+if __name__ == "__main__" and len(sys.argv) > 1 and sys.argv[1] == "agent":
+    # Agents never need Qt, a display, or the scientific Python runtime.
+    from agent_cli import main as agent_main
+    sys.exit(agent_main(sys.argv[2:]))
+
 if __name__ == "__main__" and len(sys.argv) > 1 and sys.argv[1] == "--python-cell":
     # The frozen app doubles as the built-in Python for cells. Skip Qt entirely.
     from python_runtime import run_bundled_cell
@@ -37,6 +42,7 @@ from PySide6.QtQuickControls2 import QQuickStyle
 from PySide6.QtWebEngineQuick import QtWebEngineQuick
 from PySide6.QtWebEngineCore import QWebEngineProfile, QWebEngineUrlScheme
 from studio import Session, Studio, ROOT
+from agent_live import create_qt_bridge
 from reader_assets import ReaderAssetSchemeHandler, SCHEME
 from instance import InstanceBroker
 from reader_gestures import ReaderGestures
@@ -123,6 +129,8 @@ def main():
     channel_script = bytes(channel.readAll()).decode()
     engines, studios = [], []
     session = Session(args.test_state)
+    session.agent_bridge = create_qt_bridge(session, session.data)
+    app.aboutToQuit.connect(session.agent_bridge.stop)
     asset_handler = ReaderAssetSchemeHandler(session.reader_assets, app)
     QWebEngineProfile.defaultProfile().installUrlSchemeHandler(SCHEME.encode("ascii"), asset_handler)
     def detach_window(source_id, tab_id):
@@ -315,6 +323,9 @@ def main():
                 at(12500,lambda:window.setProperty("settingsOpen",True))
                 at(14000,lambda:capture("light-settings"))
                 def dropdown():
+                    page = window.findChild(QObject,"settingsPage")
+                    if page is not None:
+                        page.setProperty("section", "reading")
                     choice = window.findChild(QObject,"readingFontChoice")
                     if choice is None:
                         app.exit(2)

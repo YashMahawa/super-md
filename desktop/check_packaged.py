@@ -6,6 +6,7 @@ pixels, and automatic graphics recovery. Never loads or writes a user's notes.
 import argparse
 import base64
 import json
+import gzip
 import os
 from pathlib import Path
 import subprocess
@@ -64,10 +65,16 @@ def check(executable: Path, version: str, graphics: str) -> None:
                         "| Name | Value |\n|---|---|\n| x | $x^2$ |\n\n![Embedded figure](figure.svg)\n", encoding="utf-8")
         portable, pdf = root / "Fresh machine.smd", root / "Fresh machine.pdf"
         run("pack", note, portable)
-        packed = json.loads(portable.read_text(encoding="utf-8"))
+        encoded = portable.read_bytes()
+        if not encoded.startswith(b"\x1f\x8b"):
+            raise RuntimeError("Portable CLI must produce compressed SMD by default")
+        packed = json.loads(gzip.decompress(encoded))
         if packed["format"] != "supermd-smd" or len(packed["assets"]) != 1:
             raise RuntimeError("Portable CLI did not produce a valid note")
         run("export", portable, pdf)
+        legacy = root / "Legacy portable.fmd"
+        legacy.write_text(json.dumps({**packed, "format":"supermd-fmd"}), encoding="utf-8")
+        run("inspect", legacy)
         if not pdf.read_bytes().startswith(b"%PDF-") or pdf.stat().st_size < 10000:
             raise RuntimeError("Packaged native math/PDF engine failed")
         report = root / "presented.json"

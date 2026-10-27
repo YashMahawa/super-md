@@ -1,20 +1,24 @@
-# Super MD 0.6.13
+# Super MD 0.6.14
 
-## Selection and input
+## Agents in your notes
 
-- Starting a text selection in blank space above a paragraph anchors to the following line, rather than selecting an earlier heading. Read, Live and Split share the fix, including large notes that render in sections.
-- Hold the left mouse button still and scroll to zoom. Once a text drag begins, wheel scrolling and edge scrolling extend the selection without zooming.
-- Desktop Ctrl/Command+C copies the selected Markdown source even after a toolbar has taken focus. Dragging selected text to another app also carries Markdown, including formatting, links and formulas.
-- Find focuses the typing field immediately on desktop and Android, including repeated opens. Android explicitly restores WebView focus after closing the menu and respects the hardware keyboard preference.
-- Desktop Settings now lists editable keyboard shortcuts, validates conflicts, and offers a reset button. Native text fields retain their own editing commands.
-- Android keeps the new-tab plus visible beside the scrollable tabs and reveals the active tab after selection, renaming or a width change, keeping its close control accessible.
-- The desktop context menu includes Reload. It acknowledges pending edits and preserves the note's view state before recreating the reader.
+- Desktop CLI for creating MD/SMD, bounded section reads, exact text and line patches, image asset replacement, and PDF/SMD export. Edits require a current revision and preserve other assets.
+- Local MCP access to open desktop tabs, including unsaved changes, and remote MCP access to paired desktop and Android devices. Access is off by default.
+- Agents can identify online devices, read the current visible Markdown, fetch diagram source or images, inspect a viewport snapshot, search, edit, review LaTeX repairs, and create/save/export notes. Long exports return a job ID with status polling.
+- Settings includes setup instructions and pairing-file import/export. The cloud relay supports Streamable HTTP and legacy SSE, keeps no document database, and authenticates device enrollment separately from MCP access. Explicit revocation unregisters a device and removes its local credentials.
+- Large SVG bodies stay out of prose reads, with exact source ranges and pagination that skips the omitted artwork. Source mode remains available when an agent needs the full drawing.
 
-## Scrolling and export
+## Smaller portable files and better exports
 
-- Touchpad input is combined once per display frame, preserving the complete scroll distance. Zoom easing follows elapsed time so it behaves consistently across refresh rates, with no idle animation loop.
-- Dialogs use bounded sizes instead of growing with the monitor. Export progress uses a compact card with the expressive animation beside its status text; accessible progress and cancellation remain available.
-- Android PDF export has one progress owner, preventing the native loading surface from covering the reader's progress card.
-- Long PDF table labels can hyphenate within narrow columns instead of overlapping the next cell. Text size and table column proportions are preserved.
+- New SMD saves use deterministic, lossless gzip compression around the existing portable envelope. Markdown, SVG detail, and embedded image bytes are retained. A 1.51 MB vector-rich viva note becomes about 153 KB.
+- Existing uncompressed SMD/FMD files remain readable. **New compressed SMD requires Super MD 0.6.14 or newer.** The extension remains `.smd`.
+- Right-click an image, SVG, chart, or Mermaid diagram to save a PNG with a neutral light background, an SVG where available, or its original image/Mermaid source. Android supports touch and hold. Saving a figure leaves the note unchanged.
+- Fresh PDF defaults use 10.5 pt text, 1.55 line spacing, and 1.35 paragraph spacing, with clearer heading and list spacing. Existing custom PDF preferences are preserved.
 
-Existing LaTeX autofix, custom theme guide, portable formats and signing identity are retained. Android's version code increases for in-place updates.
+## Settings and quality checks
+
+- Settings is organized into categories. Desktop keyboard shortcuts have a separate popup.
+- The export options dialog provides more vertical space within laptop bounds and a capped height on large monitors. Other dialogs and the compact export progress card retain their sizing.
+- CI checks the relay transports and authentication, compressed-format compatibility, live agent behavior, and the official MCP client against the packaged executable. Windows includes a separate console launcher for MCP stdio.
+
+Android uses the existing signing identity and a higher version code for in-place updates.

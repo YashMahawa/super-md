@@ -17,6 +17,23 @@ class QuietStudio(Studio):
         self.system_dark = True
 
 class StudioTest(unittest.TestCase):
+    def test_agent_pdf_options_match_gui_limits_and_remembered_preferences(self):
+        import hashlib
+        studio = self.studio
+        studio.settings["newNoteLocation"] = str(studio.data)
+        studio.settings["pdf"] = {**studio.settings["pdf"], "fontFamily": "Noto Serif", "fontSize": 13}
+        tab = studio._current()
+        request = {"id": tab["id"], "expectedRevision": hashlib.sha256(tab["content"].encode()).hexdigest(),
+                   "format": "pdf", "content": tab["content"], "assets": {}, "filename": "Agent options.pdf",
+                   "options": {"fontSize": 5, "margin": 60, "lineHeight": .9, "paragraphSpacing": 3}}
+        with patch.object(studio, "post") as post:
+            studio._agent_export_native("native-options", request)
+        forwarded = json.loads(post.call_args.args[2])
+        self.assertEqual(forwarded["options"]["fontFamily"], "Noto Serif")
+        self.assertEqual(forwarded["options"]["fontSize"], 5)
+        self.assertEqual(forwarded["options"]["lineHeight"], .9)
+        self.assertEqual(studio.settings["pdf"]["fontSize"], 13, "An agent export must not change GUI preferences")
+
     def test_shortcut_maps_only_notify_when_bindings_change_across_windows(self):
         other=self.window();first=[];second=[]
         self.studio.shortcutsChanged.connect(lambda:first.append(True));other.shortcutsChanged.connect(lambda:second.append(True))
@@ -798,9 +815,11 @@ class StudioTest(unittest.TestCase):
         self.assertEqual(self.studio.pending_export,str(portable))
         self.studio.post("portable-export","export_fmd_native",json.dumps({"id":self.studio.active,"content":"Portable Markdown","assets":{},"save":False}))
         self.await_idle()
-        value=json.loads(portable.read_text(encoding="utf-8"))
-        self.assertEqual(value["format"],"supermd-smd")
-        self.assertEqual(value["markdown"],"Portable Markdown")
+        from documents import open_note
+        content, assets, is_portable = open_note(portable)
+        self.assertTrue(is_portable)
+        self.assertEqual(content,"Portable Markdown")
+        self.assertEqual(assets,{})
         self.assertEqual(markdown.read_text(encoding="utf-8"),"Final Markdown")
         self.assertFalse(Path(str(base)+".smd.md").exists())
 

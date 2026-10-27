@@ -628,3 +628,8 @@ button.code-copy:active { border-radius:10px; }
 .svg-figure img.svg-diagram { display: block; width:100%; max-width: 100%; min-width:0; height: auto; box-sizing:border-box; }
 .svg-figure--color img.svg-diagram { padding: 16px; border-radius: 20px; background: #fdfdfc; box-shadow: 0 0 0 1px var(--code-border); }
 .svg-figure--own-background img.svg-diagram { border-radius: 16px; }
+.media-save-menu{position:fixed;z-index:2147483000;min-width:240px;max-width:calc(100vw - 16px);padding:8px;border:1px solid var(--border,#7776);border-radius:18px;background:var(--surface,#fff);color:var(--text,#20252d);box-shadow:0 14px 42px #0004;font:14px/1.45 'Manrope Variable',sans-serif;filter:none;user-select:none}
+.media-save-title{padding:7px 12px;color:var(--muted,var(--text));font-size:12px;max-width:320px;overflow-wrap:anywhere}
+.media-save-menu button{display:block;width:100%;padding:12px;border:0;border-radius:12px;background:transparent;color:inherit;font:inherit;text-align:left;cursor:pointer}
+.media-save-menu button:hover,.media-save-menu button:focus-visible{background:color-mix(in srgb,var(--primary,#6750a4) 16%,var(--surface,#fff));outline:2px solid transparent}
+.media-save-menu button:disabled{opacity:.55;cursor:wait}

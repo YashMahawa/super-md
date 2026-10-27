@@ -25,6 +25,8 @@ internal class ReaderBridge(
     private val scope: CoroutineScope,
     private val ready: () -> Unit,
     private val assetCapabilities: ReaderAssetCapabilities,
+    private val onAgentReply: (String, Any?, String?) -> Unit = { _, _, _ -> },
+    private val onAgentExport: (JSONObject) -> Unit = {},
 ) {
     private val retired = AtomicBoolean(false)
     private val capabilityLock = Any()
@@ -111,6 +113,8 @@ internal class ReaderBridge(
                             .put("mime", capability.mime)
                     }
                     "import_images" -> withContext(Dispatchers.IO) { model.media.importJson(args.getJSONArray("images")) }
+                    "save_media_native" -> model.saveAgentMedia(args)
+                    "agent_export_native" -> { onAgentExport(args); JSONObject().put("accepted", true).put("jobId", args.optString("requestId")) }
                     "fetch_resource" -> withContext(Dispatchers.IO) { JSONObject().put("body", model.media.fetch(args.getString("url"), args.optBoolean("image"))) }
                     "request_fmd_export" -> { model.requestPortable?.invoke() ?: error("The file picker is not ready"); true }
                     "export_fmd_native" -> { model.writePortable(args.getString("id"), args.getString("content"), args.getJSONObject("assets"), args.optBoolean("save"), args.getString("originalContent")); true }
@@ -133,6 +137,16 @@ internal class ReaderBridge(
                 web.post { if (!retired.get()) web.evaluateJavascript("window.supermdReply?.(${JSONObject.quote(id)},null,${JSONObject.quote(error.message ?: "Operation failed")})", null) }
             }
         } }
+    }
+
+    /** A JS-only, request-ID-scoped callback for the outbound cloud relay. */
+    @JavascriptInterface fun agentReply(requestId: String, resultJson: String, error: String) {
+        if (retired.get() || requestId.length !in 1..96 || resultJson.length > 5_000_000 || error.length > 2048) return
+        val result = runCatching {
+            val value = org.json.JSONTokener(resultJson).nextValue()
+            if (value === JSONObject.NULL) null else value
+        }.getOrElse { null }
+        web.post { if (!retired.get()) onAgentReply(requestId, result, error.takeIf(String::isNotEmpty)) }
     }
 
     private suspend fun exportPdf(args: JSONObject): Boolean {
@@ -390,7 +404,7 @@ internal fun retireAndDestroyReader(web: WebView) {
     }
 }
 
-fun configureReader(web: WebView, model: StudioViewModel, scope: CoroutineScope, ready: () -> Unit, rendererGone: (WebView) -> Unit) {
+fun configureReader(web: WebView, model: StudioViewModel, scope: CoroutineScope, ready: () -> Unit, rendererGone: (WebView) -> Unit, onAgentReply: (String, Any?, String?) -> Unit = { _, _, _ -> }, onAgentExport: (JSONObject) -> Unit = {}) {
     web.settings.javaScriptEnabled = true
     web.settings.domStorageEnabled = true
     web.settings.allowFileAccess = false
@@ -410,7 +424,7 @@ fun configureReader(web: WebView, model: StudioViewModel, scope: CoroutineScope,
         .addPathHandler("/assets/", WebViewAssetLoader.AssetsPathHandler(web.context))
         .addPathHandler("/reader-assets/", assetPathHandler)
         .build()
-    val bridge = ReaderBridge(web, model, scope, ready, capabilities)
+    val bridge = ReaderBridge(web, model, scope, ready, capabilities, onAgentReply, onAgentExport)
     web.webViewClient = object : WebViewClient() {
         override fun onRenderProcessGone(view: WebView, detail: android.webkit.RenderProcessGoneDetail): Boolean {
             // Android says a WebView whose renderer exited cannot be reused.

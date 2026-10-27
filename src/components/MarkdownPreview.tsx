@@ -22,6 +22,7 @@ import {analyzeDocument} from '../documentAnalysis';
 import type {SourceDocumentAnalysis} from '../documentAnalysis';
 import {resolveReaderRasterAsset} from '../readerAssets';
 import {commitMediaLayout} from '../mediaLayout';
+import {registerMedia,installMediaMenu} from '../mediaExport';
 import type {ReaderAccessibilityPreference} from '../types';
 import type {Components} from 'react-markdown';
 export {normalizeCallouts} from '../markdownSource';
@@ -109,6 +110,12 @@ function AssetImage({ src = "", alt = "", documentPath, trustedImageHosts, onTru
   const mediaElement=useRef<HTMLSpanElement>(null);
   const imageElement=useRef<HTMLImageElement>(null);
   const [sizedSource,setSizedSource]=useState('');
+  const [assetEpoch,setAssetEpoch]=useState(0);
+  useEffect(()=>{
+    const changed=()=>setAssetEpoch(value=>value+1);
+    window.addEventListener('supermd-assets-changed',changed);
+    return()=>window.removeEventListener('supermd-assets-changed',changed);
+  },[]);
   const svgBacking=useMemo(()=>svgDataBackdrop(resolved),[resolved]);
   const appearance=useContext(DocumentAppearance);
   const adaptsSvg=appearance?.svgAppearance==='auto'||appearance?.svgAppearance==='monochrome';
@@ -121,7 +128,7 @@ function AssetImage({ src = "", alt = "", documentPath, trustedImageHosts, onTru
     const fail=(reason:string)=>{if(active)commitMediaLayout(mediaElement.current,()=>setError(reason));};
     setError("");
     if (embedded) { setResolved(src); return; }
-    setResolved("");
+    if(!assetEpoch)setResolved("");
     if (isRemote) {
       if (!allowed) return;
       // Explicit consent routes through the bounded native fetcher, not a raw
@@ -144,7 +151,12 @@ function AssetImage({ src = "", alt = "", documentPath, trustedImageHosts, onTru
       }
     })();
     return () => { active = false; };
-  }, [documentPath, embedded, isRemote, src, allowed]);
+  }, [documentPath, embedded, isRemote, src, allowed, assetEpoch]);
+  useEffect(()=>{
+    if(!resolved||error||isRemote&&!allowed)return;
+    const svg=resolved.startsWith('data:image/svg+xml');
+    return registerMedia(imageElement.current,{label:alt||'Image',uri:()=>resolved,...(svg?{svg:()=>{const comma=resolved.indexOf(',');return resolved.slice(0,comma).includes(';base64')?new TextDecoder().decode(Uint8Array.from(atob(resolved.slice(comma+1)),value=>value.charCodeAt(0))):decodeURIComponent(resolved.slice(comma+1));}}:{})});
+  },[resolved,error,isRemote,allowed,alt]);
   if (isRemote && !allowed) return <span ref={mediaElement} className="remote-image-card" role="group" aria-label={`Remote image from ${host}`}><span><strong>{alt || "Remote image"}</strong><small>{host} · blocked until you choose to load it</small></span><span className="remote-image-actions"><button onClick={() => setAllowedOnceSource(src)}>Load image</button>{onTrustImageHost && <button onClick={() => onTrustImageHost(host)}>Trust domain</button>}</span></span>;
   if (error) return <span ref={mediaElement} className="image-error" role="img" aria-label={alt || "Image unavailable"}>Image unavailable: {alt || src}<small>{error}</small></span>;
   if (!resolved) return <span ref={mediaElement} className="image-loading" role="status">Loading image…</span>;
@@ -169,6 +181,7 @@ interface Props extends ReaderAccessibilityPreference {
 }
 
 function MarkdownPreview({ markdown, documentPath, python, dark, trustedImageHosts = EMPTY_TRUSTED_IMAGE_HOSTS, onTrustImageHost, onChange,renderBlock,fullDocumentAccessibility=false,sourceAnalysis }: Props) {
+  useEffect(installMediaMenu,[]);
   const analysis=useMemo(()=>sourceAnalysis?.source===markdown?sourceAnalysis.analysis:analyzeDocument(markdown),[markdown,sourceAnalysis]);
   const tasks=onChange?analysis.tasks:[];
   const renderImage = useCallback(({src,alt}:{src?:string;alt?:string})=><AssetImage src={src} alt={alt} documentPath={documentPath} trustedImageHosts={trustedImageHosts} onTrustImageHost={onTrustImageHost}/>,[documentPath,trustedImageHosts,onTrustImageHost]);

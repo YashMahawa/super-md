@@ -2,6 +2,12 @@
 package dev.supermd.studio
 
 import android.graphics.Color as AndroidColor
+import android.graphics.Bitmap
+import android.graphics.Rect
+import android.os.Handler
+import android.os.Looper
+import android.view.PixelCopy
+import java.io.ByteArrayOutputStream
 import android.os.Build
 import android.os.Bundle
 import android.content.Intent
@@ -67,7 +73,11 @@ import androidx.window.layout.FoldingFeature
 import androidx.window.layout.WindowInfoTracker
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.withContext
+import kotlinx.coroutines.flow.first
 import org.json.JSONObject
+import java.security.MessageDigest
 import java.util.concurrent.atomic.AtomicBoolean
 import kotlin.coroutines.resume
 import kotlinx.coroutines.suspendCancellableCoroutine
@@ -101,7 +111,20 @@ class MainActivity : ComponentActivity() {
     var dismissDocument: (() -> Unit)? = null
     var saveReaderPosition: (() -> Unit)? = null
     var openReaderFind: (() -> Unit)? = null
+    val agentAccessState: AgentAccessState by lazy { AgentAccessState(this) }
+    var agentRelayState by mutableStateOf(AgentRelayClient.State.DISCONNECTED)
+        private set
+    @Volatile private var agentBridgeHandler: ((JSONObject, (Any?, String?) -> Unit) -> Unit)? = null
+    @Volatile private var agentUiHandler: ((JSONObject, (Any?, String?) -> Unit) -> Boolean)? = null
+    @Volatile private var agentExportHandler: ((JSONObject) -> Unit)? = null
+    private val agentExportJobs = java.util.concurrent.ConcurrentHashMap<String, JSONObject>()
+    private val pendingAgentReplies = java.util.concurrent.ConcurrentHashMap<String, (Any?, String?) -> Unit>()
+    private val pendingAgentReplyTimeouts = java.util.concurrent.ConcurrentHashMap<String, Runnable>()
+    private val agentMainHandler = Handler(Looper.getMainLooper())
+    private val agentRelayClient: AgentRelayClient by lazy { AgentRelayClient { agentRelayState = it } }
+    private var relayIdentity: String? = null
     private var workspaceKey = "main"
+    internal val agentWorkspaceKey: String get() = workspaceKey
     private val model: StudioViewModel by viewModels { object : androidx.lifecycle.ViewModelProvider.Factory {
         @Suppress("UNCHECKED_CAST")
         override fun <T : androidx.lifecycle.ViewModel> create(modelClass: Class<T>): T = StudioViewModel(application, workspaceKey) as T
@@ -132,8 +155,157 @@ class MainActivity : ComponentActivity() {
         intent.data?.let { requestOpen(it) }
     }
     fun requestOpen(uri: android.net.Uri, relative: String? = null) = model.requestOpen(uri, relative)
-    override fun onStop() { saveReaderPosition?.invoke(); model.flush(); super.onStop() }
-    override fun onResume() { super.onResume(); model.refreshMetadata(); model.refreshExternal();model.reloadCustomTheme() }
+    override fun onStop() { saveReaderPosition?.invoke(); model.flush(); agentRelayClient.disconnect(); relayIdentity = null; pendingAgentReplies.clear(); pendingAgentReplyTimeouts.values.forEach(agentMainHandler::removeCallbacks); pendingAgentReplyTimeouts.clear(); super.onStop() }
+    override fun onResume() { super.onResume(); model.refreshMetadata(); model.refreshExternal();model.reloadCustomTheme(); refreshAgentRelay() }
+    internal fun agentConfigForThisWindow(): AgentAccessConfig? = agentAccessState.configForWorkspace(workspaceKey)
+    internal fun localAgentTabId(value: String): String? {
+        if (value.isBlank()) return null
+        if (!value.startsWith("tab:")) return value.takeIf { ':' !in it }
+        val parts = value.split(':')
+        if (parts.size != 4) return null
+        val config = agentConfigForThisWindow() ?: return null
+        if (parts[1] != config.deviceId || parts[2] != workspaceKey) return null
+        return parts[3].takeIf { it.matches(Regex("^[A-Za-z0-9_-]{1,128}$")) }
+    }
+    internal fun setAgentRequestHandlers(
+        bridge: ((JSONObject, (Any?, String?) -> Unit) -> Unit)?,
+        ui: ((JSONObject, (Any?, String?) -> Unit) -> Boolean)?,
+    ) { agentBridgeHandler = bridge; agentUiHandler = ui }
+    internal fun setAgentUiHandler(handler: ((JSONObject, (Any?, String?) -> Unit) -> Boolean)?) { agentUiHandler = handler }
+    internal fun setAgentExportHandler(handler: ((JSONObject) -> Unit)?) { agentExportHandler = handler }
+    internal fun requestAgentExport(args: JSONObject) {
+        val jobId = args.optString("requestId").takeIf { it.matches(Regex("^[a-zA-Z0-9_-]{1,96}$")) } ?: error("Invalid export job id")
+        check(args.optString("expectedRevision").matches(Regex("^[a-fA-F0-9]{64}$"))) { "Export requires the current document revision" }
+        if (agentExportJobs.size >= 128) {
+            agentExportJobs.entries.filter { it.value.optString("phase") in setOf("completed", "failed", "cancelled") }.take(64).forEach { agentExportJobs.remove(it.key, it.value) }
+        }
+        check(agentExportJobs.size < 128) { "Too many export jobs are being tracked; retry after checking earlier jobs" }
+        agentExportJobs[jobId] = JSONObject().put("jobId", jobId).put("phase", "awaiting_destination")
+        val handler = agentExportHandler ?: run { agentExportJobs.remove(jobId); error("The Android export picker is unavailable") }
+        handler(args)
+    }
+    internal fun updateAgentExportJob(jobId: String, phase: String, error: String? = null) {
+        if (jobId.isNotBlank()) agentExportJobs[jobId] = JSONObject().put("jobId", jobId).put("phase", phase).apply { if (error != null) put("error", error.take(2048)) }
+    }
+    internal fun agentExportJob(jobId: String): JSONObject? = agentExportJobs[jobId]?.let { JSONObject(it.toString()) }
+    internal fun revokeAgentAccess(completion: (serverRevoked: Boolean) -> Unit) {
+        val configs = agentAccessState.allConfigs()
+        agentAccessState.setEnabled(false)
+        agentRelayClient.disconnect()
+        relayIdentity = null
+        clearPendingAgentReplies()
+        if (configs.isEmpty()) { agentAccessState.revoke(); completion(true); return }
+        val remaining = java.util.concurrent.atomic.AtomicInteger(configs.size)
+        val allRevoked = java.util.concurrent.atomic.AtomicBoolean(true)
+        configs.forEach { config -> agentRelayClient.revokeDevice(config) { revoked ->
+            if (!revoked) allRevoked.set(false)
+            if (remaining.decrementAndGet() == 0) {
+                agentAccessState.revoke()
+                clearPendingAgentReplies()
+                completion(allRevoked.get())
+            }
+        } }
+    }
+    internal fun deliverAgentReply(requestId: String, result: Any?, error: String?) {
+        pendingAgentReplyTimeouts.remove(requestId)?.let(agentMainHandler::removeCallbacks)
+        pendingAgentReplies.remove(requestId)?.invoke(result, error)
+    }
+    internal fun captureAgentReply(requestId: String, callback: (Any?, String?) -> Unit) {
+        pendingAgentReplyTimeouts.remove(requestId)?.let(agentMainHandler::removeCallbacks)
+        pendingAgentReplies[requestId] = callback
+        val timeout = Runnable {
+            pendingAgentReplyTimeouts.remove(requestId)
+            pendingAgentReplies.remove(requestId)?.invoke(null, "The live reader did not finish this request before its deadline")
+        }
+        pendingAgentReplyTimeouts[requestId] = timeout
+        agentMainHandler.postDelayed(timeout, 18_000)
+    }
+    private fun clearPendingAgentReplies() {
+        pendingAgentReplies.clear()
+        pendingAgentReplyTimeouts.values.forEach(agentMainHandler::removeCallbacks)
+        pendingAgentReplyTimeouts.clear()
+    }
+    internal fun dispatchAgentRequest(web: WebView, request: JSONObject, reply: (Any?, String?) -> Unit) {
+        val requestId = request.optString("requestId")
+        if (requestId.isBlank() || requestId.length > 96) { reply(null, "Invalid request id"); return }
+        val payload = JSONObject(request.toString()).apply { remove("deviceId") }
+        captureAgentReply(requestId, reply)
+        val script = "window.supermdAgentRequest?.($payload,(result,error)=>window.SuperMD?.agentReply?.(${JSONObject.quote(requestId)},JSON.stringify(result??null),String(error||'')));true"
+        web.evaluateJavascript(script, null)
+    }
+    internal fun agentRevision(value: String): String = MessageDigest.getInstance("SHA-256")
+        .digest(value.toByteArray(Charsets.UTF_8)).joinToString("") { "%02x".format(it) }
+    internal suspend fun captureAgentViewport(reader: WebView, requestedWidth: Int): JSONObject {
+        check(Build.VERSION.SDK_INT >= 26) { "Viewport snapshots require Android 8 or newer" }
+        check(reader.width > 0 && reader.height > 0 && reader.isAttachedToWindow) { "The live reading viewport is unavailable" }
+        val context = kotlinx.coroutines.suspendCancellableCoroutine<JSONObject> { continuation ->
+            val requestId = "snapshot_context_${java.util.UUID.randomUUID()}"
+            val request = JSONObject().put("requestId", requestId).put("action", "get_context")
+            dispatchAgentRequest(reader, request) { result, error ->
+                if (!continuation.isActive) return@dispatchAgentRequest
+                val value = result as? JSONObject
+                if (error != null) continuation.resumeWith(Result.failure(IllegalStateException(error)))
+                else if (value == null) continuation.resumeWith(Result.failure(IllegalStateException("The reader returned no snapshot context")))
+                else continuation.resume(value)
+            }
+            continuation.invokeOnCancellation {
+                pendingAgentReplyTimeouts.remove(requestId)?.let(agentMainHandler::removeCallbacks)
+                pendingAgentReplies.remove(requestId)
+            }
+        }
+        val origin = IntArray(2)
+        reader.getLocationInWindow(origin)
+        val source = Rect(origin[0], origin[1], origin[0] + reader.width, origin[1] + reader.height)
+        val targetWidth = requestedWidth.coerceIn(320, 1600).coerceAtMost(source.width())
+        val targetHeight = (source.height().toDouble() * targetWidth / source.width()).toInt().coerceAtLeast(1)
+        val bitmap = Bitmap.createBitmap(targetWidth, targetHeight, Bitmap.Config.ARGB_8888)
+        val status = kotlinx.coroutines.suspendCancellableCoroutine<Int> { continuation ->
+            PixelCopy.request(window, source, bitmap, { result ->
+                if (continuation.isActive) continuation.resume(result)
+            }, Handler(Looper.getMainLooper()))
+            continuation.invokeOnCancellation { bitmap.recycle() }
+        }
+        check(status == PixelCopy.SUCCESS) { "Android could not capture the reading viewport (PixelCopy status $status)" }
+        var encoded: ByteArray
+        var finalBitmap = bitmap
+        try {
+            while (true) {
+                val output = ByteArrayOutputStream()
+                check(finalBitmap.compress(Bitmap.CompressFormat.PNG, 100, output)) { "Could not encode the viewport image" }
+                encoded = output.toByteArray()
+                if (encoded.size <= 3_500_000 || finalBitmap.width <= 480) break
+                val next = Bitmap.createScaledBitmap(finalBitmap, (finalBitmap.width * .8f).toInt().coerceAtLeast(1), (finalBitmap.height * .8f).toInt().coerceAtLeast(1), true)
+                if (next !== finalBitmap && finalBitmap !== bitmap) finalBitmap.recycle()
+                finalBitmap = next
+            }
+            check(encoded.size <= 3_500_000) { "The reading viewport image exceeds the safe transfer limit" }
+            val note = model.state.value.active
+            val revision = context.optString("revision", agentRevision(note.content))
+            return JSONObject().put("mime_type", "image/png").put("data", android.util.Base64.encodeToString(encoded, android.util.Base64.NO_WRAP))
+                .put("width", finalBitmap.width).put("height", finalBitmap.height).put("revision", revision)
+                .put("metadata", JSONObject().put("tabId", context.optString("tabId", "tab:${agentConfigForThisWindow()?.deviceId ?: "local"}:$workspaceKey:${note.id}"))
+                    .put("mode", context.optString("mode", model.state.value.mode)).put("zoom", context.optDouble("zoom", model.state.value.zoom.toDouble()))
+                    .put("reading", context.optJSONObject("reading") ?: JSONObject()).put("selection", context.optJSONObject("selection") ?: JSONObject()))
+        } finally { if (finalBitmap !== bitmap) finalBitmap.recycle(); bitmap.recycle() }
+    }
+    internal fun refreshAgentRelay() {
+        if (!agentAccessState.enabled) {
+            agentRelayClient.disconnect(); relayIdentity = null; clearPendingAgentReplies(); return
+        }
+        val config = agentConfigForThisWindow()
+        if (config == null) { agentRelayClient.disconnect(); relayIdentity = null; clearPendingAgentReplies(); return }
+        val identity = "${config.groupId}:${config.deviceId}"
+        if (identity == relayIdentity && agentRelayState != AgentRelayClient.State.DISCONNECTED) return
+        relayIdentity = identity
+        agentRelayClient.connect(config) { request, reply ->
+            val ui = agentUiHandler
+            if (ui?.invoke(request, reply) != true) {
+                val bridge = agentBridgeHandler
+                if (bridge == null) reply(null, "The live reader is not ready. Keep Super MD open on a note and retry.")
+                else bridge(request, reply)
+            }
+        }
+    }
     fun handleShortcut(event: android.view.KeyEvent): Boolean {
         if (event.action == android.view.KeyEvent.ACTION_DOWN && event.repeatCount == 0) {
             if (event.keyCode == android.view.KeyEvent.KEYCODE_F11) { model.fullscreen(!model.state.value.fullscreen); return true }
@@ -331,6 +503,99 @@ private object NoMotionScheme : MotionScheme {
         model.attachReaderOpenHandler(handler)
         onDispose { if (handler != null) model.detachReaderOpenHandler(handler) }
     }
+    DisposableEffect(activity, model, readerReady, web, state.tabs, state.activeId) {
+        val bridge: ((JSONObject, (Any?, String?) -> Unit) -> Unit)? = if (!readerReady || web == null) null else bridge@{ incoming, reply ->
+            val request = JSONObject(incoming.toString())
+            val globallyQualified = request.optString("tabId")
+            val rawTabId = if (globallyQualified.isNotBlank()) activity.localAgentTabId(globallyQualified) else null
+            if (globallyQualified.isNotBlank() && rawTabId == null) { reply(null, "This tab belongs to a different device or workspace"); return@bridge }
+            if (rawTabId != null) request.put("tabId", rawTabId)
+            fun withSelectedTab(action: suspend () -> Unit) {
+                val target = request.optString("tabId").takeIf { it.isNotBlank() }
+                if (target == null) { scope.launch { action() }; return }
+                if (model.state.value.tabs.none { it.id == target }) { reply(null, "The requested tab is not open on this device"); return }
+                if (model.state.value.activeId != target) {
+                    model.select(target)
+                    scope.launch {
+                        val selected = kotlinx.coroutines.withTimeoutOrNull(5_000) { model.state.first { it.activeId == target } }
+                        if (selected == null) reply(null, "Could not switch to the requested open tab")
+                        else { delay(250); action() }
+                    }
+                } else scope.launch { action() }
+            }
+            when (request.optString("action")) {
+                "list_tabs" -> {
+                    val tabs = org.json.JSONArray()
+                    state.tabs.take(100).forEach { note ->
+                        val id = "tab:${activity.agentConfigForThisWindow()?.deviceId ?: "local"}:${activity.agentWorkspaceKey}:${note.id}"
+                        tabs.put(JSONObject().put("id", id).put("tabId", id).put("name", note.name).put("saved", !note.dirty).put("active", note.id == state.activeId).put("mode", if (note.id == state.activeId) state.mode else "live"))
+                    }
+                    reply(JSONObject().put("tabs", tabs), null)
+                }
+                "document_action" -> when (request.optString("documentAction")) {
+                    "create" -> {
+                        val before = state.activeId
+                        model.newNote()
+                        scope.launch {
+                            val created = kotlinx.coroutines.withTimeoutOrNull(5000) { model.state.first { it.activeId != before }.active }
+                            if (created == null) reply(null, "Super MD could not create a tab")
+                            else {
+                                if (request.has("content")) model.edit(created.id, request.getString("content"))
+                                val updated = model.state.value.tabs.firstOrNull { it.id == created.id } ?: created
+                                reply(JSONObject().put("tabId", "tab:${activity.agentConfigForThisWindow()?.deviceId ?: "local"}:${activity.agentWorkspaceKey}:${updated.id}").put("name", updated.name).put("revision", activity.agentRevision(updated.content)), null)
+                            }
+                        }
+                    }
+                    "save" -> { model.save(); reply(JSONObject().put("accepted", true), null) }
+                    "open" -> { reply(null, "Use Super MD's Open action on Android, then retry the device request.") }
+                    "job_status" -> reply(activity.agentExportJob(request.optString("jobId")) ?: JSONObject().put("jobId", request.optString("jobId")).put("phase", "unknown"), null)
+                    else -> {
+                        val action = when (request.optString("documentAction")) {
+                            "latexfix" -> if (request.optJSONObject("options")?.has("repairIndices") == true) "latex_apply" else "latex_review"
+                            "snapshot" -> "snapshot"
+                            else -> request.optString("documentAction")
+                        }
+                        if (request.optString("documentAction") == "latexfix" && action == "latex_apply") request.put("repairIndices", request.getJSONObject("options").getJSONArray("repairIndices"))
+                        request.optJSONObject("options")?.takeIf { it.has("limit") }?.let { request.put("limit", it.getInt("limit")) }
+                        if (request.optString("documentAction") == "export") {
+                            val options = request.optJSONObject("options")
+                            val filename = options?.optString("filename")?.let { it.substringAfterLast('/').substringAfterLast('\\').replace(Regex("[\\u0000-\\u001f\\u007f]"), "").take(240) }
+                                ?.takeIf { it.isNotBlank() }
+                            request.put("action", "export_document").put("format", options?.optString("format", "pdf") ?: "pdf")
+                            if (filename != null) request.put("filename", filename)
+                        }
+                        else request.put("action", action)
+                        if (request.optString("action") == "snapshot") withSelectedTab { runCatching { activity.captureAgentViewport(web!!, request.optInt("width", 1200)) }.onSuccess { reply(it, null) }.onFailure { reply(null, it.message ?: "Could not capture the reading viewport") } }
+                        else withSelectedTab { activity.dispatchAgentRequest(web!!, request, reply) }
+                    }
+                }
+                "render_tab" -> withSelectedTab { runCatching { activity.captureAgentViewport(web!!, request.optInt("width", 1200)) }.onSuccess { reply(it, null) }.onFailure { reply(null, it.message ?: "Could not capture the reading viewport") } }
+                "get_diagram", "get_diagram_image", "list_diagrams" -> withSelectedTab { activity.dispatchAgentRequest(web!!, request, reply) }
+                "replace_tab_asset" -> withSelectedTab {
+                    val flush = JSONObject(request.toString()).put("action", "flush_current")
+                    activity.dispatchAgentRequest(web!!, flush) { _, flushError ->
+                        if (flushError != null) reply(null, flushError)
+                        else scope.launch {
+                            runCatching {
+                                model.replacePortableAsset(
+                                    request.getString("tabId"), request.getString("assetName"),
+                                    request.getString("assetPath"), request.getString("expectedRevision"),
+                                )
+                            }.onSuccess {
+                                if (it.optBoolean("changed")) web?.evaluateJavascript("window.dispatchEvent(new Event('supermd-assets-changed'))", null)
+                                reply(it, null)
+                            }
+                                .onFailure { reply(null, it.message ?: "Could not replace the portable image") }
+                        }
+                    }
+                }
+                "read_tab", "search_tab", "patch_tab", "get_context", "outline_tab", "latex_review", "latex_apply" -> withSelectedTab { activity.dispatchAgentRequest(web!!, request, reply) }
+                else -> reply(null, "This action is not supported by the Android live reader.")
+            }
+        }
+        activity.setAgentRequestHandlers(bridge, null)
+        onDispose { activity.setAgentRequestHandlers(null, null) }
+    }
     var folderRelative by remember { mutableStateOf("") }
     var hinge by remember { mutableStateOf<FoldingFeature?>(null) }
     val recent by model.recent.collectAsStateWithLifecycle()
@@ -358,6 +623,90 @@ private object NoMotionScheme : MotionScheme {
     }
     val portable = rememberLauncherForActivityResult(NoteDestination("application/vnd.supermd.smd", model::noteLocation)) { uri ->
         if (uri != null) { model.setPortableDestination(uri); model.busy(true); web?.evaluateJavascript("window.supermdPortable?.(false)", null) ?: model.fail("The reader is not ready") }
+    }
+    var pendingAgentExport by remember { mutableStateOf<JSONObject?>(null) }
+    val agentPdf = rememberLauncherForActivityResult(NoteDestination("application/pdf", model::noteLocation)) { uri ->
+        val args = pendingAgentExport; pendingAgentExport = null
+        val jobId = args?.optString("requestId").orEmpty()
+        if (args != null && uri != null) scope.launch {
+            activity.updateAgentExportJob(jobId, "preparing")
+            runCatching {
+                val base = JSONObject(state.pdf)
+                val provided = args.optJSONObject("options") ?: JSONObject()
+                listOf("pageSize", "margin", "fontSize", "lineHeight", "paragraphSpacing", "fontFamily", "pageNumbers", "themed").forEach { key -> if (provided.has(key)) base.put(key, provided.get(key)) }
+                if (!base.has("fontSize")) base.put("fontSize", 10.5)
+                if (!base.has("lineHeight")) base.put("lineHeight", 1.55)
+                if (!base.has("paragraphSpacing")) base.put("paragraphSpacing", 1.35)
+                model.busy(true)
+                model.export(args.getString("content"), base.toString(), args.optJSONObject("assets") ?: JSONObject(), destination = uri)
+            }.onSuccess { activity.updateAgentExportJob(jobId, "completed") }
+                .onFailure { error -> activity.updateAgentExportJob(jobId, "failed", error.message ?: "PDF export failed"); model.fail("Agent PDF export failed: ${error.message}") }
+        } else if (args != null) activity.updateAgentExportJob(jobId, "cancelled")
+    }
+    val agentPortable = rememberLauncherForActivityResult(NoteDestination("application/vnd.supermd.smd", model::noteLocation)) { uri ->
+        val args = pendingAgentExport; pendingAgentExport = null
+        val jobId = args?.optString("requestId").orEmpty()
+        if (args != null && uri != null) scope.launch {
+            activity.updateAgentExportJob(jobId, "preparing")
+            runCatching {
+                model.setPortableDestination(uri)
+                model.writePortable(args.getString("id"), args.getString("content"), args.optJSONObject("assets") ?: JSONObject(), false, args.getString("content"))
+            }.onSuccess { activity.updateAgentExportJob(jobId, "completed") }
+                .onFailure { error -> activity.updateAgentExportJob(jobId, "failed", error.message ?: "SMD export failed"); model.fail("Agent SMD export failed: ${error.message}") }
+        } else if (args != null) activity.updateAgentExportJob(jobId, "cancelled")
+    }
+    val agentMarkdown = rememberLauncherForActivityResult(NoteDestination("text/markdown", model::noteLocation)) { uri ->
+        val args = pendingAgentExport; pendingAgentExport = null
+        val jobId = args?.optString("requestId").orEmpty()
+        if (args != null && uri != null) scope.launch {
+            activity.updateAgentExportJob(jobId, "saving")
+            runCatching { withContext(Dispatchers.IO) { activity.contentResolver.openOutputStream(uri, "wt")?.use { it.write(args.getString("content").toByteArray(Charsets.UTF_8)) } ?: error("Android cannot write the selected file") } }
+                .onSuccess { activity.updateAgentExportJob(jobId, "completed") }
+                .onFailure { error -> activity.updateAgentExportJob(jobId, "failed", error.message ?: "Markdown export failed"); model.fail("Agent Markdown export failed: ${error.message}") }
+        } else if (args != null) activity.updateAgentExportJob(jobId, "cancelled")
+    }
+    DisposableEffect(activity, agentPdf, agentPortable, agentMarkdown, state.active.name) {
+        activity.setAgentExportHandler { args ->
+            check(pendingAgentExport == null) { "Finish the current export before starting another" }
+            pendingAgentExport = JSONObject(args.toString())
+            val jobId = args.optString("requestId")
+            val suggested = args.optString("filename").takeIf { it.isNotBlank() } ?: args.optString("id", state.active.name.substringBeforeLast('.'))
+            when (args.optString("format", "pdf")) {
+                "pdf" -> agentPdf.launch(if (suggested.endsWith(".pdf", true)) suggested else "$suggested.pdf")
+                "smd" -> agentPortable.launch(if (suggested.endsWith(".smd", true)) suggested else "$suggested.smd")
+                "md" -> agentMarkdown.launch(if (suggested.endsWith(".md", true)) suggested else "$suggested.md")
+                else -> { pendingAgentExport = null; activity.updateAgentExportJob(jobId, "failed", "Unsupported export format"); error("Unsupported export format") }
+            }
+        }
+        onDispose { activity.setAgentExportHandler(null) }
+    }
+    DisposableEffect(activity, open, save, model) {
+        activity.setAgentUiHandler { request, reply ->
+            if (request.optString("action") != "document_action") false
+            else when (request.optString("documentAction")) {
+                "open" -> { open.launch(arrayOf("text/*", "application/octet-stream", "application/vnd.supermd.smd", "application/vnd.supermd.fmd", "application/gzip", "application/x-gzip")); reply(JSONObject().put("accepted", true).put("message", "Choose a file in Android's document picker"), null); true }
+                "save" -> {
+                    val targetId = request.optString("tabId").substringAfterLast(':').takeIf { request.optString("tabId").isNotBlank() }
+                    if (targetId != null && model.state.value.tabs.any { it.id == targetId } && model.state.value.activeId != targetId) model.select(targetId)
+                    scope.launch {
+                        val active = if (targetId == null) model.state.value.active else kotlinx.coroutines.withTimeoutOrNull(5_000) { model.state.first { it.activeId == targetId }.active }
+                        if (active == null) reply(null, "Could not switch to the requested open tab")
+                        else {
+                            delay(250)
+                            when {
+                                active.portable -> { model.busy(true); web?.evaluateJavascript("window.supermdPortable?.(true)", null) ?: model.fail("The live reader is not ready") }
+                                active.uri == null -> save.launch(active.name.substringBeforeLast('.') + ".md")
+                                else -> model.save()
+                            }
+                            reply(JSONObject().put("accepted", true), null)
+                        }
+                    }
+                    true
+                }
+                else -> false
+            }
+        }
+        onDispose { activity.setAgentUiHandler(null) }
     }
     DisposableEffect(portable, state.active.name) { model.requestPortable = { portable.launch(state.active.name.substringBeforeLast('.') + ".smd") }; onDispose { model.requestPortable = null } }
     val saveAction: () -> Unit = { if (state.active.uri == null) save.launch(state.active.name.substringBeforeLast('.') + ".md") else if (state.active.portable) { model.busy(true); web?.evaluateJavascript("window.supermdPortable?.(true)", null) ?: model.fail("The reader is not ready") } else model.save(); Unit }
@@ -423,7 +772,7 @@ private object NoMotionScheme : MotionScheme {
                 Column(Modifier.fillMaxHeight().themeArtwork(state,"sidebar").safeDrawingPadding().padding(horizontal = 16.dp)) {
                     Text("Your files", style = MaterialTheme.typography.headlineSmall, modifier = Modifier.padding(vertical = 20.dp))
                     SingleChoiceSegmentedButtonRow(Modifier.fillMaxWidth().padding(bottom=12.dp)) {listOf("folder" to "Folder","contents" to "Contents").forEachIndexed {index,entry->SegmentedButton(selected=sidebarSection==entry.first,onClick={sidebarSection=entry.first},shape=SegmentedButtonDefaults.itemShape(index,2),colors=SegmentedButtonDefaults.colors(activeContainerColor=palette.primary,activeContentColor=palette.onPrimary)){Text(entry.second)}}}
-                    Button(onClick = { open.launch(arrayOf("text/*", "application/octet-stream", "application/vnd.supermd.smd", "application/vnd.supermd.fmd")); scope.launch { drawer.close() } }, shapes = ButtonDefaults.shapes(), modifier = Modifier.fillMaxWidth()) { Icon(Icons.Rounded.Description, null); Spacer(Modifier.width(8.dp)); Text("Open note") }
+                    Button(onClick = { open.launch(arrayOf("text/*", "application/octet-stream", "application/vnd.supermd.smd", "application/vnd.supermd.fmd", "application/gzip", "application/x-gzip")); scope.launch { drawer.close() } }, shapes = ButtonDefaults.shapes(), modifier = Modifier.fillMaxWidth()) { Icon(Icons.Rounded.Description, null); Spacer(Modifier.width(8.dp)); Text("Open note") }
                     FilledTonalButton(onClick = { folder.launch(state.folder?.let(android.net.Uri::parse)) }, modifier = Modifier.fillMaxWidth()) { Icon(Icons.Rounded.FolderOpen, null); Spacer(Modifier.width(8.dp)); Text("Open folder") }
                     if (state.folder != null) TextButton(onClick = { folderRelative = ""; model.closeFolder() }) { Icon(Icons.Rounded.Close, null); Text("Close folder", Modifier.padding(start = 8.dp)) }
                     Text("No vault. No hidden metadata.", style = MaterialTheme.typography.bodySmall, color = palette.onSurfaceVariant, modifier = Modifier.padding(vertical = 12.dp))
@@ -494,7 +843,7 @@ private object NoMotionScheme : MotionScheme {
                             web = this
                             setOnKeyListener { _, _, event -> activity.handleShortcut(event) }
                             setBackgroundColor(AndroidColor.TRANSPARENT)
-                            configureReader(this, model, scope, ready = { if (web === this) readerReady = true }, rendererGone = { failedView ->
+                            configureReader(this, model, scope, ready = { if (web === this) readerReady = true }, onAgentReply = activity::deliverAgentReply, onAgentExport = activity::requestAgentExport, rendererGone = { failedView ->
                                 val wasCurrent = web === failedView
                                 retireAndDestroyReader(failedView)
                                 if (wasCurrent) {
@@ -615,7 +964,7 @@ private object NoMotionScheme : MotionScheme {
         } else if (format == "smd") portable.launch(state.active.name.substringBeforeLast('.') + ".smd") else pdf.launch(state.active.name.substringBeforeLast('.') + ".pdf")
     } }
     state.error?.let { AlertDialog(onDismissRequest = model::dismissError, title = { Text("Couldn't finish") }, text = { Text(it, Modifier.heightIn(max = 360.dp).verticalScroll(rememberScrollState())) }, confirmButton = { TextButton(onClick = model::dismissError) { Text("OK") } }) }
-    if (!state.welcomed) WelcomeSetup(state, model) { model.welcomeDone(); open.launch(arrayOf("text/*", "application/octet-stream", "application/vnd.supermd.smd", "application/vnd.supermd.fmd")) }
+    if (!state.welcomed) WelcomeSetup(state, model) { model.welcomeDone(); open.launch(arrayOf("text/*", "application/octet-stream", "application/vnd.supermd.smd", "application/vnd.supermd.fmd", "application/gzip", "application/x-gzip")) }
 }
 
 @Composable private fun WelcomeSetup(state: StudioState, model: StudioViewModel, open: () -> Unit) {
@@ -670,7 +1019,7 @@ internal class NoteDestination(private val mime: String, private val preferred: 
                 else Text("Colors follow your imported theme. Reset it to use the built-in accent picker.",style=MaterialTheme.typography.bodySmall)
                 Row(verticalAlignment = Alignment.CenterVertically) { Column(Modifier.weight(1f)) { Text("Expressive motion", style = MaterialTheme.typography.titleMedium); Text("Spring transitions and responsive controls", style = MaterialTheme.typography.bodySmall) }; Switch(checked = state.motion, onCheckedChange = { model.appearance(motion = it) }) }
             }
-            SettingsSection("Custom theme") {
+            SettingsSection("Appearance · Custom theme") {
                 Text(themeDocument(state.customTheme)?.optString("name")?:"Built-in appearance",style=MaterialTheme.typography.titleMedium)
                 Text("Theme files customize controls, colors, reading typography and background patterns. Reading font and text size remain yours. Invalid edits keep the last valid appearance.",style=MaterialTheme.typography.bodySmall)
                 FlowRow(horizontalArrangement=Arrangement.spacedBy(8.dp)){FilledTonalButton(onClick=importTheme){Text("Import theme…")};OutlinedButton(onClick=exportTheme){Text(if(state.customTheme.isBlank())"Export template…" else "Export theme…")};if(state.customTheme.isNotBlank())OutlinedButton(onClick={model.shareCustomTheme {send->runCatching {activity.startActivity(Intent.createChooser(send,"Share theme"))}.onFailure {model.fail("No app could share the theme: ${it.message}")}}}){Text("Share theme…")}}
@@ -717,7 +1066,7 @@ internal class NoteDestination(private val mime: String, private val preferred: 
                 Text("New note location",style=MaterialTheme.typography.titleSmall)
                 FilledTonalButton(onClick=chooseNoteLocation,modifier=Modifier.fillMaxWidth()){Icon(Icons.Rounded.FolderOpen,null);Text(if(noteLocation.isBlank())"Downloads" else android.net.Uri.decode(noteLocation.substringAfterLast('/')),Modifier.padding(start=8.dp),maxLines=1,overflow=TextOverflow.Ellipsis)}
             }
-            SettingsSection("Images & diagrams") {
+            SettingsSection("Reading · Images & diagrams") {
                 val choices=listOf("original" to "Original (off)","invert-dark" to "Invert in dark themes","auto" to "Auto adapt to theme","monochrome" to "Theme monochrome","contrast" to "Separate from theme")
                 Choice("Image appearance",state.imageAppearance,choices){model.readingPreference("imageAppearance",it)}
                 Choice("Diagram appearance (SVG, Mermaid & charts)",state.svgAppearance,choices){model.readingPreference("svgAppearance",it)}
@@ -725,14 +1074,14 @@ internal class NoteDestination(private val mime: String, private val preferred: 
                 StudySlider(value=state.imageContrast,onCommit=model::imageContrast,valueRange=1f..2f)
                 Text("Auto adapts neutral ink and paper, preserving readable colours. Theme monochrome recolours the whole image. Separation preserves original colours and adds a readable backing and edge. Original files and PDF exports are unchanged.",style=MaterialTheme.typography.bodySmall)
             }
-            SettingsSection("Writing assistance") {
+            SettingsSection("Writing") {
                 Row(verticalAlignment=Alignment.CenterVertically){Text("Spell check",Modifier.weight(1f));Switch(checked=state.spellCheck,onCheckedChange={model.writing(spellCheck=it)})}
                 Row(verticalAlignment=Alignment.CenterVertically){Text("Grammar check",Modifier.weight(1f));Switch(checked=state.grammarCheck,onCheckedChange={model.writing(grammarCheck=it)})}
                 Row(verticalAlignment=Alignment.CenterVertically){Text("LaTeX autofix on paste",Modifier.weight(1f));Switch(checked=state.latexAutofix,onCheckedChange=model::latexAutofix)}
                 Text("Off by default. Repairs validated LaTeX errors in pasted text in Source and Live. Code, links and existing formula fragments are protected; Undo restores the paste.",style=MaterialTheme.typography.bodySmall,color=MaterialTheme.colorScheme.onSurfaceVariant)
                 Text("Offline English suggestions in Source and Live editing. Grammar checks repeated words and a/an. Code, links and LaTeX are excluded; no text is uploaded or automatically replaced.",style=MaterialTheme.typography.bodySmall,color=MaterialTheme.colorScheme.onSurfaceVariant)
             }
-            SettingsSection("Selected text") {
+            SettingsSection("Writing · Selected text") {
                 Choice("Selection assistant", state.selectionAssistant, SelectionActions.assistants, model::selectionAssistant)
                 Text("Select text and use Search Google or Ask in the selection toolbar. Ask copies the text and opens the assistant for you to paste and review; it never submits a prompt automatically.",style=MaterialTheme.typography.bodySmall,color=MaterialTheme.colorScheme.onSurfaceVariant)
             }
@@ -741,7 +1090,8 @@ internal class NoteDestination(private val mime: String, private val preferred: 
                 Text("New window opens an independent workspace. Your device controls split-screen and desktop window placement. Hold and drag a tab to reorder it.", style = MaterialTheme.typography.bodyMedium)
                 Text("The monochrome icon follows your launcher's themed-icon setting.", style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
             }
-            SettingsSection("Storage & diagnostics") {
+            SettingsSection("AI agents · Live Agent Access") { AgentAccessSettings(activity) }
+            SettingsSection("Storage, updates & diagnostics") {
                 Text("Inspect app-owned storage sizes and file counts. This read-only report does not inspect Downloads or other documents, and never changes files.", style = MaterialTheme.typography.bodyMedium)
                 FilledTonalButton(onClick = model::inspectStorage, enabled = !state.storageScanning) {
                     Text(if (state.storageScanning) "Inspecting…" else "Inspect storage")
@@ -758,7 +1108,7 @@ internal class NoteDestination(private val mime: String, private val preferred: 
                     if (report.partial) Text("Some entries could not be measured or were skipped; totals may be incomplete. No files were changed.", color = MaterialTheme.colorScheme.onSurfaceVariant, style = MaterialTheme.typography.bodySmall)
                 }
             }
-            SettingsSection("About & updates") {
+            SettingsSection("Storage, updates & diagnostics · About & updates") {
                 Text("Super MD ${BuildConfig.VERSION_NAME}",style=MaterialTheme.typography.titleMedium)
                 Text("© Yash Mahawar · MIT License",style=MaterialTheme.typography.bodySmall)
                 Row(verticalAlignment=Alignment.CenterVertically){Text("Check for updates on opening",Modifier.weight(1f));Switch(update.checkOnOpen,{model.updates.preference(checkOnOpen=it)})}
@@ -771,6 +1121,119 @@ internal class NoteDestination(private val mime: String, private val preferred: 
                 TextButton(onClick={activity.startActivity(Intent(android.provider.Settings.ACTION_APP_NOTIFICATION_SETTINGS).putExtra(android.provider.Settings.EXTRA_APP_PACKAGE,activity.packageName))}){Text("Update notification permissions")}
             }
         }
+    }
+}
+
+@Composable private fun AgentAccessSettings(activity: MainActivity) {
+    val scope = rememberCoroutineScope()
+    val saved = activity.agentAccessState.currentConfig()
+    var origin by remember { mutableStateOf(saved?.serverOrigin ?: "https://supermd-agent-relay.onrender.com") }
+    var message by remember { mutableStateOf("") }
+    var pendingPairingFile by remember { mutableStateOf<String?>(null) }
+    var pendingGuide by remember { mutableStateOf<String?>(null) }
+    var enabled by remember { mutableStateOf(activity.agentAccessState.enabled) }
+    fun revokeThen(action: () -> Unit) {
+        message = "Disconnecting and revoking previous device registrations…"
+        activity.revokeAgentAccess { confirmed ->
+            enabled = false
+            action()
+            if (!confirmed) message = "Local credentials were erased, but the relay could not confirm revocation. A previously copied device key may remain usable until the relay expires or restarts."
+        }
+    }
+    fun joinWorkspace(text: String) {
+        runCatching { activity.agentAccessState.joinPairingFile(text) }
+            .onSuccess { config -> enabled = false; origin = config.serverOrigin; activity.refreshAgentRelay(); message = "This Android device joined the workspace. Switch Live Agent Access on when you want it connected. Keep the pairing file private." }
+            .onFailure { message = "Could not join workspace: ${it.message}" }
+    }
+    val pairingExport = rememberLauncherForActivityResult(ActivityResultContracts.CreateDocument("application/json")) { uri ->
+        val raw = pendingPairingFile
+        pendingPairingFile = null
+        if (uri != null && raw != null) runCatching {
+            activity.contentResolver.openOutputStream(uri, "w")?.use { it.write(raw.toByteArray(Charsets.UTF_8)); it.flush() }
+                ?: error("Android could not write the pairing file")
+        }.onSuccess { message = "Trusted pairing file saved. Share it only with a device you trust." }
+            .onFailure { message = "Could not save pairing file: ${it.message}" }
+    }
+    fun createWorkspace() {
+        runCatching { activity.agentAccessState.createPairingFile(origin) }
+            .onSuccess { pendingPairingFile = it; origin = activity.agentAccessState.currentConfig()?.serverOrigin.orEmpty(); activity.refreshAgentRelay(); pairingExport.launch("SuperMD-pairing.json") }
+            .onFailure { message = "Could not create workspace: ${it.message}" }
+    }
+    val pairingImport = rememberLauncherForActivityResult(ActivityResultContracts.OpenDocument()) { uri ->
+        if (uri != null) scope.launch {
+            val raw = runCatching { withContext(Dispatchers.IO) {
+                activity.contentResolver.openInputStream(uri)?.use { input ->
+                    val bytes = ByteArray(8 * 1024 + 1); val count = input.read(bytes)
+                    require(count in 1..8 * 1024) { "Pairing file is empty or too large" }
+                    String(bytes, 0, count, Charsets.UTF_8)
+                } ?: error("The pairing file cannot be read")
+            } }
+            raw.onSuccess { text ->
+                if (activity.agentAccessState.currentConfig() != null) revokeThen { joinWorkspace(text) }
+                else joinWorkspace(text)
+            }
+                .onFailure { message = "Could not read pairing file: ${it.message}" }
+        }
+    }
+    val guideExport = rememberLauncherForActivityResult(ActivityResultContracts.CreateDocument("text/markdown")) { uri ->
+        val guide = pendingGuide
+        pendingGuide = null
+        if (uri != null && guide != null) runCatching {
+            activity.contentResolver.openOutputStream(uri, "w")?.use { it.write(guide.toByteArray(Charsets.UTF_8)); it.flush() }
+                ?: error("Android could not write the setup guide")
+        }.onFailure { message = "Could not save setup guide: ${it.message}" }
+    }
+    val config = activity.agentConfigForThisWindow() ?: activity.agentAccessState.currentConfig()
+    Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
+        Text("Connect an AI client to currently open tabs on this device. Access is off by default; the relay does not store notes.", style = MaterialTheme.typography.bodyMedium)
+        OutlinedTextField(value = origin, onValueChange = { origin = it }, modifier = Modifier.fillMaxWidth(), singleLine = true,
+            label = { Text("HTTPS relay origin") }, placeholder = { Text("https://relay.example.com") })
+        Row(verticalAlignment = Alignment.CenterVertically) {
+            Column(Modifier.weight(1f)) {
+                Text("Live Agent Access", style = MaterialTheme.typography.titleSmall)
+                Text(if (enabled) "${activity.agentRelayState.name.lowercase().replaceFirstChar(Char::uppercase)} · reconnects while this app is open" else "Off · the device will not connect to the relay", style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+            }
+            Switch(checked = enabled, enabled = config != null, onCheckedChange = { checked ->
+                enabled = checked
+                activity.agentAccessState.setEnabled(checked)
+                activity.refreshAgentRelay()
+            })
+        }
+        FlowRow(horizontalArrangement = Arrangement.spacedBy(8.dp), verticalArrangement = Arrangement.spacedBy(6.dp)) {
+            FilledTonalButton(onClick = {
+                if (activity.agentAccessState.currentConfig() != null) revokeThen(::createWorkspace) else createWorkspace()
+            }) { Text("Create workspace & export pairing file") }
+            OutlinedButton(onClick = { pairingImport.launch(arrayOf("application/json", "application/octet-stream", "text/plain")) }) { Text("Join from pairing file…") }
+            OutlinedButton(enabled = config != null, onClick = {
+                val file = activity.agentAccessState.currentPairingFile()
+                if (file == null) message = "Create or join a workspace first"
+                else { pendingPairingFile = file; pairingExport.launch("SuperMD-pairing.json") }
+            }) { Text("Export trusted pairing file…") }
+        }
+        if (config != null) {
+            FlowRow(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                TextButton(onClick = {
+                    val clipboard = activity.getSystemService(android.content.ClipboardManager::class.java)
+                    clipboard.setPrimaryClip(android.content.ClipData.newPlainText("Super MD MCP connector", config.mcpUrl))
+                    message = "Private MCP connector URL copied. Share it only with the intended AI client."
+                }) { Text("Copy private MCP URL") }
+                TextButton(onClick = {
+                    pendingGuide = AgentSetupGuide.instructions(config)
+                    guideExport.launch("SuperMD-Live-Agent-setup.md")
+                }) { Text("Save setup instructions…") }
+            }
+        }
+        Text("The pairing file authorizes trusted devices; it is not for an AI client. Give the AI client only the private MCP URL. Each phone or open app window gets its own device key. Turning Live Agent Access off disconnects this app. Revoke removes this device from the relay and erases this device's credentials.", style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+        if (config != null) TextButton(onClick = {
+            message = "Disconnecting and revoking device registrations…"
+            activity.revokeAgentAccess { confirmed ->
+                enabled = false
+                message = if (confirmed) "Live Agent access revoked on this device and the relay confirmed removal."
+                    else "Local credentials were erased, but the relay could not confirm revocation. A previously copied device key may remain usable until the relay expires or restarts."
+                activity.refreshAgentRelay()
+            }
+        }) { Text("Revoke this device's Live Agent access") }
+        if (message.isNotBlank()) Text(message, style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.primary)
     }
 }
 
@@ -809,10 +1272,14 @@ internal class NoteDestination(private val mime: String, private val preferred: 
 }
 
 @Composable private fun SettingsSection(title: String, content: @Composable ColumnScope.() -> Unit) {
+    var expanded by rememberSaveable(title) { mutableStateOf(title == "Appearance") }
     Surface(shape = RoundedCornerShape(28.dp), color = MaterialTheme.colorScheme.surfaceContainerLow) {
-        Column(Modifier.fillMaxWidth().padding(20.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
-            Text(title, style = MaterialTheme.typography.titleLarge)
-            content()
+        Column(Modifier.fillMaxWidth().padding(16.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
+            Row(Modifier.fillMaxWidth().clickable { expanded = !expanded }.padding(vertical = 4.dp), verticalAlignment = Alignment.CenterVertically) {
+                Text(title, style = MaterialTheme.typography.titleLarge, modifier = Modifier.weight(1f))
+                Icon(if (expanded) Icons.Rounded.ExpandLess else Icons.Rounded.ExpandMore, if (expanded) "Collapse $title" else "Expand $title")
+            }
+            if (expanded) content()
         }
     }
 }

@@ -2,6 +2,10 @@ import { createRoot } from "react-dom/client";
 import {flushSync} from 'react-dom';
 import {createGapSelection,type GapSelection} from './gapSelection';
 import {FrameScrollQueue,zoomFrameStep} from './frameMotion';
+import {agentCharLength,agentOutline,agentRead,agentRevision,agentSearch,applyAgentPatches} from './agentOperations';
+import {suggestMathRepairs,applyMathRepairs} from './mathRepair';
+import {agentDiagrams,diagramMetadata,diagramMedia,visibleSourceRange} from './agentView';
+import {mediaBytes} from './mediaExport';
 import { memo, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import "@fontsource-variable/manrope";
 import "@fontsource-variable/jetbrains-mono";
@@ -49,7 +53,7 @@ interface PdfExportStatus {id:string;phase:'preparing'|'typesetting'|'publishing
 
 interface NoteView { editor?: PortableEditorSession; history?:NoteHistory; top?: number; rendered?: ReturnType<typeof exportRenderedViews> }
 interface ReaderState extends ReaderAccessibilityPreference { id: string; content: string; path: string | null; mode: "live" | "editor" | "reader" | "split"; dark: boolean; fullscreen: boolean; font: string; size: number; latexAutofix?:boolean;spellCheck?:boolean; grammarCheck?:boolean; width?: number; widthPercent?:number; lineHeight?:number; colors: Record<string, string>; zoom: number; motion?: boolean; python?: string; viewState?: NoteView }
-declare global { interface Window {supermdThemeGuide?:()=>void;supermdDismiss?:()=>boolean;supermdSetZoom?:(zoom:number,requestedAt?:number)=>void;supermdHeading?:(id:string,offset?:number)=>void;supermdHistory?:(direction:"undo"|"redo")=>void;supermdNativeWheel?:(dx:number,dy:number,point:Point,held:boolean,modifier?:boolean)=>void;} }
+declare global { interface Window {supermdAgentRequest?:(request:Record<string,unknown>,callback?:(result:unknown,error:string)=>void)=>void;supermdThemeGuide?:()=>void;supermdDismiss?:()=>boolean;supermdSetZoom?:(zoom:number,requestedAt?:number)=>void;supermdHeading?:(id:string,offset?:number)=>void;supermdHistory?:(direction:"undo"|"redo")=>void;supermdNativeWheel?:(dx:number,dy:number,point:Point,held:boolean,modifier?:boolean)=>void;} }
 declare global { interface Window { supermdLoad?: (state: ReaderState) => void; supermdExport?: (options: ExportOptions) => void; supermdExportMarkdown?: () => void; supermdFind?: () => void; supermdPortable?: (save: boolean) => void; supermdZoomBy?: (factor:number,focus?:Point)=>void; supermdResetZoom?: ()=>void; supermdRepairMath?: ()=>void; supermdFlush?: (operation:Record<string,string>)=>void } }
 declare global { interface Window {supermdChromeInset?:(height:number)=>void} }
 declare global { interface Window {supermdSavePosition?:()=>void} }
@@ -553,6 +557,86 @@ function Reader() {
     const delivery=(next as ReaderState&{editProtocol?:number}).editProtocol===1?edits.current!.change(next.id,content,changes):invoke("document_changed",{id:next.id,content});
     void delivery.then(()=>setEditError(''),error=>setEditError(String(error)));
   }, []);
+  useEffect(()=>{
+    let pending=false,disposed=false;
+    window.supermdAgentRequest=(request,callback)=>{
+      const reply=(result:unknown,error='')=>{if(disposed)return;if(callback)callback(result,error);else void invoke('agent_result',{requestId:request.requestId,result,error});};
+      if(pending){reply(null,'The reader is handling another agent request; retry shortly.');return;}
+      pending=true;
+      void (async()=>{
+        const current=reference.current;if(!current)throw Error('The reader is not ready');
+        if((current as ReaderState&{editProtocol?:number}).editProtocol===1)await edits.current!.flush(current.id);
+        const note=reference.current;if(!note||note.id!==current.id)throw Error('The active tab changed; refresh the tab list');
+        const revision=await agentRevision(note.content);
+        if(reference.current?.id!==note.id||reference.current.content!==note.content)throw Error('The note changed while reading; retry');
+        const base={tabId:note.id,revision,sourceLength:agentCharLength(note.content)};
+        if(request.action==='flush_current')return base;
+        if(request.action==='list_tabs'){
+          const tabs=Array.isArray(request.tabs)?request.tabs:[];
+          return {tabs:tabs.map(item=>{const tab=item as Record<string,unknown>;return tab.id===note.id?{...tab,...base,id:note.id}:tab;})};
+        }
+        if(request.tabId!==undefined&&request.tabId!==note.id)throw Error('Select this tab before requesting its live reader');
+        if(request.expectedRevision!==undefined&&request.expectedRevision!==revision)throw Error('Revision conflict: the note changed; read it again before editing');
+        if(request.action==='read_tab')return {...base,...agentRead(note.content,request.offset,request.limit,request.heading,request.view)};
+        if(request.action==='outline_tab'){const headings=agentOutline(note.content);return {...base,headings:headings.slice(0,80),total:headings.length,truncated:headings.length>80};}
+        if(request.action==='search_tab')return {...base,...agentSearch(note.content,request.query,request.limit,request.context)};
+        if(request.action==='list_diagrams'){
+          const diagrams=agentDiagrams(note.content);return {...base,diagrams:diagrams.slice(0,80).map(item=>diagramMetadata(note.content,item)),total:diagrams.length,truncated:diagrams.length>80};
+        }
+        if(request.action==='get_diagram'||request.action==='get_diagram_image'){
+          if(request.expectedRevision!==revision)throw Error('A current expectedRevision is required to retrieve this diagram');
+          const diagram=agentDiagrams(note.content).find(item=>item.id===request.diagramId);if(!diagram)throw Error('Diagram not found in this revision');
+          if(request.action==='get_diagram')return {...base,...diagramMetadata(note.content,diagram),...agentRead(diagram.source,request.offset,request.limit,undefined,'source')};
+          const image=await mediaBytes(await diagramMedia(diagram,note.path),'png',typeof request.width==='number'?Math.min(1600,Math.max(64,Math.round(request.width))):1600);return {...base,diagramId:diagram.id,mime_type:image.mimeType,data:image.body,width:image.width,height:image.height};
+        }
+        if(request.action==='get_context'){
+          const host=document.querySelector<HTMLElement>('.android-reading,.cm-scroller'),bounds=host?.getBoundingClientRect();
+          const visible=host&&bounds?Array.from(host.querySelectorAll<HTMLElement>('h1,h2,h3,h4,p,li,pre')).filter(element=>{const box=element.getBoundingClientRect();return box.bottom>bounds.top&&box.top<bounds.bottom&&box.height>0;}).slice(0,30):[];
+          const visibleText=visible.map(element=>{const copy=element.cloneNode(true) as HTMLElement;copy.querySelectorAll('.katex-mathml,button,script,style').forEach(node=>node.remove());return copy.textContent?.trim()??'';}).join('\n').slice(0,2000);
+          const range=host?visibleSourceRange(host,note.content):null,offset=range?.start??(host?(note.mode==='editor'?(editorReadingOffset(note.id)??0):readingOffset(host)):0);
+          const requestedContextLimit=typeof request.limit==='number'&&Number.isFinite(request.limit)?Math.max(1,Math.min(12000,Math.floor(request.limit))):6000;
+          const sourceOffset=agentCharLength(note.content.slice(0,offset)),sourceLimit=Math.max(1,Math.min(requestedContextLimit,agentCharLength(note.content.slice(offset,range?.end??offset+requestedContextLimit))));
+          const diagrams=agentDiagrams(note.content).filter(item=>range?item.end>range.start&&item.start<range.end:item.start>=offset&&item.start<offset+requestedContextLimit);
+          const viewportRect=host?.getBoundingClientRect();
+          const left=viewportRect?Math.max(0,viewportRect.left):0,top=viewportRect?Math.max(0,viewportRect.top):0;
+          const right=viewportRect?Math.min(window.innerWidth,viewportRect.right):0,bottom=viewportRect?Math.min(window.innerHeight,viewportRect.bottom):0;
+          return {...base,mode:note.mode,zoom:zoomReference.current,reading:{offset:sourceOffset,scrollFraction:host?host.scrollTop/Math.max(1,host.scrollHeight-host.clientHeight):0,heading:visible.find(element=>/^H[1-6]$/.test(element.tagName))?.textContent?.slice(0,300)??'',visibleText},visibleSource:agentRead(range?note.content.slice(0,range.end):note.content,sourceOffset,sourceLimit),diagrams:diagrams.slice(0,30).map(item=>diagramMetadata(note.content,item)),viewport:{x:left,y:top,width:Math.max(0,right-left),height:Math.max(0,bottom-top),viewportWidth:window.innerWidth,viewportHeight:window.innerHeight,devicePixelRatio:window.devicePixelRatio},selection:{text:window.getSelection()?.toString().slice(0,2000)??''}};
+        }
+        if(request.action==='latex_review'){
+          const repairs=suggestMathRepairs(note.content);let remaining=48000;
+          const view=[];
+          for(const [index,repair] of repairs.slice(0,40).entries()){
+            const item={index,before:repair.before.slice(0,2000),after:repair.after.slice(0,2000),reason:repair.reason},size=JSON.stringify(item).length;
+            if(size>remaining)break;remaining-=size;view.push(item);
+          }
+          return {...base,repairs:view,total:repairs.length,truncated:view.length<repairs.length};
+        }
+        if(request.action==='patch_tab'||request.action==='latex_apply'){
+          if(typeof request.expectedRevision!=='string'||request.expectedRevision!==revision)throw Error('A current expectedRevision is required to edit a tab');
+          let content:string,applied=0;
+          if(request.action==='latex_apply'){
+            const selected=request.repairIndices;
+            if(!Array.isArray(selected)||!selected.length||selected.length>40||selected.some(index=>!Number.isInteger(index)||index<0))throw Error('Choose 1–40 repairIndices from latex_review');
+            const repairs=suggestMathRepairs(note.content),indices=Array.from(new Set(selected)) as number[];
+            if(indices.some(index=>index>=repairs.length))throw Error('A selected repair is no longer available');
+            content=applyMathRepairs(note.content,indices.map(index=>repairs[index]));applied=indices.length;
+          }else content=applyAgentPatches(note.content,request.operations);
+          if(reference.current?.id!==note.id||reference.current.content!==note.content)throw Error('Revision conflict: typing changed the note before the edit');
+          const history=histories.current.get(note.id);if(history)history.last=0;
+          update(content);const nextHistory=histories.current.get(note.id);if(nextHistory)nextHistory.last=0;
+          if((note as ReaderState&{editProtocol?:number}).editProtocol===1)await edits.current!.flush(note.id);
+          return {tabId:note.id,revision:await agentRevision(content),changed:content!==note.content,applied};
+        }
+        if(request.action==='export_document'){
+          const format=request.format;if(!['pdf','smd','md'].includes(String(format)))throw Error('Export format must be pdf, smd or md');
+          const prepared=format==='pdf'?await preparePdf(note.content,note.path,note.python||'embedded'):format==='smd'?await prepareFmd(note.content,note.path):{content:note.content};
+          return await invoke('agent_export_native',{...prepared,id:note.id,expectedRevision:revision,requestId:request.requestId,format,filename:request.filename,options:request.options});
+        }
+        throw Error('Unsupported live reader action');
+      })().then(result=>reply(result),error=>reply(null,error instanceof Error?error.message:'Agent request failed')).finally(()=>{pending=false;});
+    };
+    return()=>{disposed=true;delete window.supermdAgentRequest;};
+  },[update]);
   if (!state) return <div className="reader-loading" role="status"><span className="expressive-loading-shape" aria-hidden="true"/>Opening your workspace</div>;
   return <DocumentAppearance.Provider value={documentAppearance}><div className={`android-document mode-${state.mode}`}>
     {themeGuide&&<ThemeGuideDialog close={()=>setThemeGuide(false)}/>}

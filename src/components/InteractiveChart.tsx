@@ -6,6 +6,7 @@ import { useChartZoom } from "../useChartZoom";
 import { axisNumber, axisTicks } from "../focalZoom";
 import GraphProbe, { type Probe } from "./GraphProbe";
 import {mediaContrast,mediaTone,type MediaAppearance} from '../mediaAppearance';
+import {registerMedia,neutralChartSvg} from '../mediaExport';
 
 const palette = ["#6750a4", "#006a6a", "#b3261e", "#7d5700", "#3f6374"];
 const darkPalette = ["#d0bcff", "#72d6d6", "#ffb4ab", "#efd18a", "#a1cce0"];
@@ -20,6 +21,14 @@ export default function InteractiveChart({source,dark=false,appearance,colors:th
   const [grid,setGrid] = useState(()=>chartGrids.get(source)??true);
   const svgRef=useRef<SVGSVGElement>(null);
   const [viewport,setViewport] = useState(760);
+  useEffect(()=>registerMedia(svgRef.current,{label:parsed.spec?.title||'Chart',svg:()=>{
+    if(!svgRef.current)throw Error('Chart is no longer visible');
+    const xml=new DOMParser().parseFromString(neutralChartSvg(svgRef.current),'image/svg+xml');
+    const originals=parsed.spec?.series.map((series,index)=>series.color||palette[index%palette.length])??palette;
+    xml.querySelectorAll('.chart-line').forEach((node,index)=>node.setAttribute('stroke',originals[Number(node.getAttribute("data-series-index")??index)%originals.length]));
+    xml.querySelectorAll('.chart-curve-label').forEach((node,index)=>{node.setAttribute('fill',originals[Number(node.getAttribute("data-series-index")??index)%originals.length]);node.removeAttribute('style');});
+    return new XMLSerializer().serializeToString(xml);
+  }}),[source,parsed]);
   useEffect(()=>{
     const svg=plot.host.current?.querySelector("svg");if(!svg || typeof ResizeObserver==="undefined")return;
     const observer=new ResizeObserver(entries=>{const next=Math.round(entries[0].contentRect.width);if(next>0)setViewport(next);});
@@ -123,8 +132,8 @@ export default function InteractiveChart({source,dark=false,appearance,colors:th
         <line className="chart-axis" x1={left} x2={width-right} y1={axisY} y2={axisY}/>
         <line className="chart-axis" x1={axisX} x2={axisX} y1={top} y2={height-bottom}/>
         <text className="chart-axis-label" x={width-right} y={height-8} textAnchor="end">{spec.x?.label||"x"}</text><text className="chart-axis-label" x={left} y={16}>{spec.y?.label||"y"}</text>
-        <g clipPath={`url(#${clipId})`}>{visibleSeries.flatMap((points,index)=>lineSegments(points,yMax-yMin).map((segment,j)=><polyline key={`${index}-${j}`} className="chart-line" fill="none" stroke={colors[index]} strokeWidth="2.75" strokeLinejoin="round" strokeLinecap="round" points={segment.map(([x,y])=>`${px(x).toFixed(2)},${py(y).toFixed(2)}`).join(" ")}/>) )}</g>
-        {endLabels.map(label=><text key={`label${label.index}`} className="chart-curve-label" x={Math.min(label.x,width-right)-6} y={label.y-8} textAnchor="end" fill={colors[label.index]} style={{fill:colors[label.index]}}>{labels[label.index]}</text>)}
+        <g clipPath={`url(#${clipId})`}>{visibleSeries.flatMap((points,index)=>lineSegments(points,yMax-yMin).map((segment,j)=><polyline key={`${index}-${j}`} className="chart-line" data-series-index={index} fill="none" stroke={colors[index]} strokeWidth="2.75" strokeLinejoin="round" strokeLinecap="round" points={segment.map(([x,y])=>`${px(x).toFixed(2)},${py(y).toFixed(2)}`).join(" ")}/>) )}</g>
+        {endLabels.map(label=><text key={`label${label.index}`} className="chart-curve-label" data-series-index={label.index} x={Math.min(label.x,width-right)-6} y={label.y-8} textAnchor="end" fill={colors[label.index]} style={{fill:colors[label.index]}}>{labels[label.index]}</text>)}
         <GraphProbe svg={svgRef} locate={locate}/>
       </svg></div>
       {!hasSamples && <div className="chart-warning" role="status">No finite samples. Check the expression and variable names.</div>}

@@ -191,7 +191,7 @@ jobs:
         id: python-wheel-identity
         shell: bash
         run: |
-          digest="$(python scripts/python_wheel_identity.py desktop/requirements.txt desktop/requirements-build.txt)"
+          digest="$(python scripts/python_wheel_identity.py desktop/requirements.txt desktop/requirements-build.txt desktop/requirements-agent.txt)"
           echo "digest=$digest" >> "$GITHUB_OUTPUT"
       - uses: actions/cache@v4
         id: python-wheels
@@ -203,7 +203,7 @@ jobs:
         env:
           WHEELHOUSE: ${{ runner.temp }}/supermd-python-wheels
         run: |
-          python scripts/prepare_python_wheelhouse.py "$WHEELHOUSE" desktop/requirements-build.txt desktop/requirements.txt desktop/requirements-build.txt
+          python scripts/prepare_python_wheelhouse.py "$WHEELHOUSE" desktop/requirements-build.txt desktop/requirements.txt desktop/requirements-build.txt desktop/requirements-agent.txt
           echo "wheel_cache_hit=${{ steps.python-wheels.outputs.cache-hit }}"
       - run: python -m unittest scripts.test_prepare_python_wheelhouse
       - name: Install Windows installer compiler
@@ -229,6 +229,8 @@ jobs:
           cache-on-failure: true
       - run: npm ci
       - run: npx tsc -b --pretty false
+      - name: Build the relay for cross-platform Qt/MCP integration tests
+        run: npm ci --prefix agent-relay && npm run build --prefix agent-relay
       - name: Wait for same-run frontend artifacts for this tag checkout
         shell: bash
         env:
@@ -248,14 +250,23 @@ jobs:
       - name: Inventory native reader bundle reachability and fonts
         run: node scripts/report-web-assets.mjs dist --verify-native --public-root public
       - run: npx vitest run
+      - run: cargo test --locked --manifest-path smd-core/Cargo.toml
+      - run: cargo build --locked --release --manifest-path smd-core/Cargo.toml --bin smd-engine
       - run: python desktop/run_tests.py
         timeout-minutes: 8
         env:
           QT_QPA_PLATFORM: offscreen
           QT_QUICK_BACKEND: software
-      - run: cargo test --locked --manifest-path smd-core/Cargo.toml
-      - run: cargo build --locked --release --manifest-path smd-core/Cargo.toml --bin smd-engine
       - run: python desktop/package.py
+      - name: Verify packaged MCP stdio with the official client
+        shell: bash
+        run: |
+          if [ "$RUNNER_OS" = Windows ]; then
+            binary=desktop/dist/super-md/super-md-cli.exe
+          else
+            binary=desktop/dist/super-md/super-md
+          fi
+          python desktop/check_packaged_mcp.py "$binary"
       - name: Verify real AppImage updater handoff without touching the runner installation
         if: runner.os == 'Linux'
         run: python desktop/check_update_install.py "desktop/dist/packages/Super-MD_${{ needs.prepare.outputs.version }}_amd64.AppImage" "${{ needs.prepare.outputs.version }}"

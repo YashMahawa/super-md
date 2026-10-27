@@ -27,6 +27,16 @@ fn explicit_table_alignments_survive_the_real_pdf_typesetter() {
 }
 
 #[test]
+fn headings_and_lists_keep_breathing_room_in_typeset_output() {
+    let markdown="# Topic\n\nShort intro.\n\n- First item\n- Second item\n\n## Detail\n\nAnother paragraph.";
+    let generated=source(markdown,&PdfOptions::default(),&HashMap::new()).unwrap();
+    assert!(generated.contains("#show heading: set block(above: 1.05em, below: .42em)"));
+    assert!(generated.contains("#set list(spacing: .42em, indent: 1.25em, body-indent: .38em)"));
+    assert!(generated.contains("#set enum(spacing: .42em, indent: 1.25em, body-indent: .38em)"));
+    assert!(export(markdown,&PdfOptions::default(),&HashMap::new()).unwrap().starts_with(b"%PDF-"));
+}
+
+#[test]
 fn staged_pdf_assets_include_only_referenced_images_and_custom_fonts() {
     let temp=std::env::temp_dir().join(format!("supermd-pdf-assets-{}",std::process::id()));
     std::fs::create_dir(&temp).unwrap();

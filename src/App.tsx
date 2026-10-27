@@ -74,7 +74,7 @@ plt.grid(alpha=.2)
 \`\`\`
 `;
 
-const defaultExport: ExportOptions = { pageSize: "a4", margin: 18, fontSize: 10.5, lineHeight: 1.35, fontFamily: "Libertinus Serif", pageNumbers: true };
+const defaultExport: ExportOptions = { pageSize: "a4", margin: 18, fontSize: 10.5, lineHeight: 1.55, paragraphSpacing: 1.35, fontFamily: "Libertinus Serif", pageNumbers: true };
 const readerFonts = [
   { value: "sans", label: "Noto Sans · clean" },
   { value: "humanist", label: "Manrope · expressive" },

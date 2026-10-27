@@ -3,6 +3,7 @@ from __future__ import annotations
 import base64
 import concurrent.futures
 import copy
+import hashlib
 import http.client
 import json
 import ipaddress
@@ -10,6 +11,8 @@ import math
 import mimetypes
 import os
 import shutil
+import re
+import secrets
 import socket
 import subprocess
 import sys
@@ -21,9 +24,9 @@ import urllib.request
 import uuid
 from pathlib import Path
 from network_tls import client_context
-from PySide6.QtCore import QObject, Property, Signal, Slot, QStandardPaths, QTimer, QUrl, QFileSystemWatcher, QProcess, Qt, QPointF, QMetaObject
+from PySide6.QtCore import QObject, Property, Signal, Slot, QStandardPaths, QTimer, QUrl, QFileSystemWatcher, QProcess, Qt, QPointF, QRect, QMetaObject, QBuffer, QByteArray, QIODevice
 from PySide6.QtGui import QDesktopServices, QFontDatabase, QGuiApplication, QCursor
-from documents import atomic_write, atomic_json, bundle, image_data, materialize_assets, open_note, MIMES, MAX_IMAGE
+from documents import atomic_write, atomic_json, bundle, image_data, materialize_assets, open_note, write_portable, MIMES, MAX_IMAGE
 from theme import detect_system_dark, read_system_palette, system_palette_paths, tokens
 from fonts import FontStore
 from python_outputs import PythonOutputs
@@ -43,7 +46,7 @@ from selection_actions import ASSISTANTS, selection_target
 from shortcuts import DEFINITIONS as SHORTCUT_DEFINITIONS, capture_sequence, default_shortcuts, native_label, normalize_shortcuts, parse_sequence
 
 ROOT = Path(sys._MEIPASS)/"resources" if getattr(sys,"frozen",False) else Path(__file__).resolve().parent.parent
-DEFAULT_PDF = {"pageSize": "a4", "margin": 18, "fontSize": 10, "lineHeight": 1.45, "paragraphSpacing": 1.2, "fontFamily": "Manrope", "pageNumbers": True, "themed": False}
+DEFAULT_PDF = {"pageSize": "a4", "margin": 18, "fontSize": 10.5, "lineHeight": 1.55, "paragraphSpacing": 1.35, "fontFamily": "Manrope", "pageNumbers": True, "themed": False}
 DEFAULTS = {"theme": "system", "fullTheme": "black", "motion": True, "font": "Manrope", "size": 18, "width": 0, "widthPercent":90, "lineHeight":1.65, "autosave":True, "normalZoom": 100, "fullZoom": 100, "python": "", "pdf": DEFAULT_PDF, "welcomed": False}
 DEFAULTS.update(widthMigrated=True, window={"width":1320,"height":880,"maximized":False}, spellCheck=False, grammarCheck=False, readingMode="live", newNoteLocation="", accent="system", checkUpdates=True, autoUpdate=False)
 DEFAULTS.update(restorePosition=True, centerLock=True, startup="restore", imageAppearance="original", svgAppearance="original", imageContrast=1.25, fullDocumentAccessibility=False)
@@ -52,6 +55,7 @@ DEFAULTS.update(desktopIntegration=False)
 DEFAULTS.update(selectionAssistant="chatgpt")
 DEFAULTS.update(latexAutofix=False)
 DEFAULTS.update(shortcuts=default_shortcuts())
+DEFAULTS.update(agentAccessEnabled=False, cloudAgentEnabled=False)
 SAMPLE = """# A place to think\n\nWrite in Markdown. Read without distractions.\n\n> [!tip] Start with your notes\n> Open any note or folder. No vault, no import process.\n\n## Learn by exploring\n\n$$E = mc^2$$\n\n> [!answer]- Why does this matter?\n> Tap the heading to reveal an answer, then hide it to test yourself.\n\n```smd-chart\n{\"title\":\"A changing wave\",\"series\":[{\"name\":\"Sine\",\"expression\":\"sin(a*x)\",\"color\":\"#386a57\"},{\"name\":\"Cosine\",\"expression\":\"cos(a*x)\",\"color\":\"#bc6750\"}],\"sliders\":[{\"name\":\"a\",\"min\":0.2,\"max\":3,\"value\":1}]}\n```\n\n## Matplotlib in three dimensions\n\nRun a Python cell to generate a 3D figure, then save it in your note or PDF.\n\n```python\nimport numpy as np\nimport matplotlib.pyplot as plt\nx, y = np.meshgrid(np.linspace(-2, 2, 32), np.linspace(-2, 2, 32))\nfig = plt.figure()\nax = fig.add_subplot(111, projection=\"3d\")\nax.plot_surface(x, y, x*x + y*y, cmap=\"viridis\")\n```\n\n[Back to exploring](#learn-by-exploring)\n"""
 
 def public_address(url: str) -> str:
@@ -172,6 +176,10 @@ class Session(QObject):
             self.pinned = list(dict.fromkeys(p for p in stored.get("pinned",[]) if isinstance(p,str)))[:10]
             self.recent = list(dict.fromkeys(self.pinned + [p for p in stored.get("recent",[]) if isinstance(p,str)]))[:10]
         except (OSError,ValueError,KeyError,TypeError,AttributeError): pass
+        # The authenticated live bridge is explicitly enabled per app run;
+        # stale saved preferences must never start a new network listener.
+        self.settings["agentAccessEnabled"] = False
+        self.settings["cloudAgentEnabled"] = False
         shortcuts, _ = normalize_shortcuts(self.settings.get("shortcuts"))
         self.settings["shortcuts"] = shortcuts or default_shortcuts()
         try:
@@ -255,6 +263,8 @@ class Studio(QObject):
     noteLocationPickerRequested = Signal()
     flushFailed = Signal(bool)
     pythonProgress = Signal(str)
+    agentRequest = Signal(str)
+    cloudRevocationFinished = Signal(bool, str)
 
     def __init__(self, isolated: bool = False, session: Session | None = None):
         super().__init__()
@@ -272,6 +282,17 @@ class Studio(QObject):
         self.completed.connect(self._complete)
         self.data = self.session.data
         self.settings = self.session.settings
+        self._agent_error = ""
+        self._agent_cloud_error = ""
+        self._agent_cloud_config_path = self.data / "agent-cloud.json"
+        self._cloud_started_local_bridge = False
+        self._cloud_revocation_pending = False
+        self.cloudRevocationFinished.connect(self._finish_cloud_revocation)
+        self._agent_viewport_capture = None
+        agent_bridge = getattr(self.session, "agent_bridge", None)
+        if agent_bridge is not None:
+            agent_bridge.enabledChanged.connect(lambda: self._emit(False))
+            agent_bridge.cloudStatusChanged.connect(self._cloud_status_changed)
         self.update_status=""
         self.update_info=None
         self.update_path=""
@@ -311,6 +332,10 @@ class Studio(QObject):
         self.ready = False
         self._last_reader_text = None
         self._export_jobs = ExportJobRegistry()
+        self._agent_exports: dict[str, dict] = {}
+        self._agent_owned_files: set[str] = getattr(self.session, "agent_owned_files", None) or set()
+        self.session.agent_owned_files = self._agent_owned_files
+        self._agent_job_records = {}
         self.reader_edits = ReaderEdits()
         self.system_dark = None
         self.system_mode, self.system_colors = read_system_palette()
@@ -651,6 +676,14 @@ class Studio(QObject):
         if self.retired: return
         if self._storage_cancel_event is not None:self._storage_cancel_event.set()
         self._export_jobs.cancel_all()
+        for agent_export in tuple(self._agent_exports.values()):
+            try:
+                reserved = Path(agent_export["path"])
+                if reserved.exists() and reserved.stat().st_size == 0:
+                    reserved.unlink()
+            except (OSError, TypeError, KeyError):
+                pass
+        self._agent_exports.clear()
         if self.position_timer.isActive():self._save_positions()
         self.position_timer.stop()
         if self.preference_timer.isActive():self._preferences(False)
@@ -677,6 +710,335 @@ class Studio(QObject):
     def snapshot(self):
         tab = self._current()
         return json.dumps({"tabs": [{"id": t["id"], "name": t["name"], "path": t["path"], "dirty": t["content"] != t["saved"]} for t in self.tabs], "active": self.active, "name": tab["name"], "outline": tab.get("outline", []), "portable": tab["portable"], "folder": self.folder, "files": self.files, "recent": self.recent, "settings": self.settings, "mode": self.mode, "fullscreen": self.fullscreen, "readerOverlay": self.reader_overlay, "imageOverlay": self.image_overlay, "readerReady": self.ready, "dark": self._dark(), "zoom": self.settings["fullZoom" if self.fullscreen else "normalZoom"], "busy": self.busy > 0, "message": self.message, "colors": self._colors()})
+
+    @Property(bool, notify=changed)
+    def agentAccessEnabled(self):
+        bridge = getattr(self.session, "agent_bridge", None)
+        return bool(bridge and bridge.enabled)
+
+    @Property(str, notify=changed)
+    def agentAccessStatus(self):
+        bridge = getattr(self.session, "agent_bridge", None)
+        if self._agent_error:
+            return self._agent_error
+        if not bridge or not bridge.enabled:
+            return "Off · no live tabs are exposed"
+        return "On for this app session · loopback only"
+
+    @Property(str, notify=changed)
+    def agentSetupInstructions(self):
+        bridge = getattr(self.session, "agent_bridge", None)
+        if not bridge or not bridge.enabled:
+            return "Enable live agent access to prepare the local MCP server configuration."
+        command = "super-md-cli.exe" if sys.platform.startswith("win") else "super-md"
+        return json.dumps({"command": command, "args": ["agent", "mcp", "--live-sessions-dir",
+                             str(bridge.discovery_dir), "--transport", "stdio"]}, ensure_ascii=False, indent=2)
+
+    @Property(str, notify=changed)
+    def agentAccessTabsSummary(self):
+        bridge = getattr(self.session, "agent_bridge", None)
+        if not bridge or not bridge.enabled:
+            return "No tabs are exposed."
+        studios = [window for window in self.session.windows.values() if not window.retired]
+        tabs = sum(len(window.tabs) for window in studios)
+        return f"{tabs} open tabs across {len(studios)} windows are available to the local MCP server."
+
+    @Property(bool, notify=changed)
+    def cloudAgentConfigured(self):
+        return self._agent_cloud_config_path.is_file()
+
+    @Property(bool, notify=changed)
+    def cloudAgentRevocationPending(self):
+        return self._cloud_revocation_pending
+
+    @Property(bool, notify=changed)
+    def cloudAgentEnabled(self):
+        bridge = getattr(self.session, "agent_bridge", None)
+        return bool(bridge and bridge.cloudClient.enabled)
+
+    @Property(str, notify=changed)
+    def cloudAgentStatus(self):
+        if self._agent_cloud_error:
+            return self._agent_cloud_error
+        if self._cloud_revocation_pending:
+            return "Disconnecting and revoking this desktop pairing…"
+        bridge = getattr(self.session, "agent_bridge", None)
+        return bridge.cloudClient.status if bridge else "Cloud relay is unavailable."
+
+    @Property(str, notify=changed)
+    def cloudConnectorUrl(self):
+        if not self.cloudAgentConfigured:
+            return ""
+        try:
+            try:
+                from .agent_cloud import connector_url, read_cloud_config
+            except ImportError:
+                from agent_cloud import connector_url, read_cloud_config
+            return connector_url(read_cloud_config(self._agent_cloud_config_path))
+        except Exception:
+            return ""
+
+    def _best_effort_revoke_cloud_config(self, config):
+        if not config:
+            return
+        def run():
+            try:
+                try:
+                    from .agent_cloud import revoke
+                except ImportError:
+                    from agent_cloud import revoke
+                revoke(config, timeout=8)
+            except Exception:
+                pass
+        threading.Thread(target=run, name="supermd-agent-cloud-revoke-old", daemon=True).start()
+
+    @Slot(bool, str)
+    def _finish_cloud_revocation(self, confirmed, device_id):
+        erased = False
+        try:
+            try:
+                from .agent_cloud import read_cloud_config
+            except ImportError:
+                from agent_cloud import read_cloud_config
+            current = read_cloud_config(self._agent_cloud_config_path)
+            if current.get("deviceId") == device_id:
+                self._agent_cloud_config_path.unlink(missing_ok=True)
+                erased = not self._agent_cloud_config_path.exists()
+        except FileNotFoundError:
+            erased = True
+        except Exception:
+            confirmed = False
+        self._cloud_revocation_pending = False
+        self.settings["cloudAgentEnabled"] = False
+        self._preferences()
+        if not erased:
+            self._agent_cloud_error = "Relay revoke finished, but the local pairing file could not be erased. Remove it from app data before reconnecting."
+        elif confirmed:
+            self._agent_cloud_error = "Relay revocation confirmed; local pairing credentials were erased."
+        else:
+            self._agent_cloud_error = "Local pairing credentials were erased, but relay revocation could not be confirmed."
+        self._emit(False)
+
+    @Slot()
+    def revokeCloudAgent(self):
+        if self._cloud_revocation_pending:
+            return
+        try:
+            try:
+                from .agent_cloud import read_cloud_config, revoke
+            except ImportError:
+                from agent_cloud import read_cloud_config, revoke
+            config = read_cloud_config(self._agent_cloud_config_path)
+            bridge = getattr(self.session, "agent_bridge", None)
+            self.settings["cloudAgentEnabled"] = False
+            self._preferences()
+            self._cloud_revocation_pending = True
+            self._agent_cloud_error = ""
+            device_id = config["deviceId"]
+            def run():
+                confirmed = False
+                try:
+                    if bridge:
+                        bridge.stop_cloud()
+                    revoke(config, timeout=8)
+                    confirmed = True
+                except Exception:
+                    pass
+                self.cloudRevocationFinished.emit(confirmed, device_id)
+            threading.Thread(target=run, name="supermd-agent-cloud-revoke", daemon=True).start()
+        except Exception as error:
+            self._agent_cloud_error = str(error)[:180]
+        self._emit(False)
+
+    @Slot(str)
+    def _cloud_status_changed(self, _status):
+        self._emit(False)
+
+    @Slot(str, result=bool)
+    def createAgentPairing(self, server_origin):
+        try:
+            if self._cloud_revocation_pending:
+                raise ValueError("Wait for desktop pairing revocation to finish")
+            old_config = None
+            try:
+                try:
+                    from .agent_cloud import read_cloud_config
+                except ImportError:
+                    from agent_cloud import read_cloud_config
+                old_config = read_cloud_config(self._agent_cloud_config_path)
+            except Exception:
+                pass
+            bridge = getattr(self.session, "agent_bridge", None)
+            if bridge and bridge.cloudClient.enabled:
+                bridge.stop_cloud()
+                self.settings["cloudAgentEnabled"] = False
+                if self._cloud_started_local_bridge and not self.settings.get("agentAccessEnabled", False):
+                    bridge.stop()
+                self._cloud_started_local_bridge = False
+            try:
+                from .agent_cloud import device_config, new_pairing, write_cloud_config
+            except ImportError:
+                from agent_cloud import device_config, new_pairing, write_cloud_config
+            write_cloud_config(self._agent_cloud_config_path, device_config(new_pairing(server_origin)))
+            self._best_effort_revoke_cloud_config(old_config)
+            self._agent_cloud_error = ""
+            self._emit(False)
+            return True
+        except Exception as error:
+            self._agent_cloud_error = str(error)[:180]
+            self._emit(False)
+            return False
+
+    @Slot(str, result=bool)
+    def importAgentPairing(self, source):
+        try:
+            if self._cloud_revocation_pending:
+                raise ValueError("Wait for desktop pairing revocation to finish")
+            old_config = None
+            try:
+                try:
+                    from .agent_cloud import read_cloud_config
+                except ImportError:
+                    from agent_cloud import read_cloud_config
+                old_config = read_cloud_config(self._agent_cloud_config_path)
+            except Exception:
+                pass
+            bridge = getattr(self.session, "agent_bridge", None)
+            if bridge and bridge.cloudClient.enabled:
+                bridge.stop_cloud()
+                self.settings["cloudAgentEnabled"] = False
+                if self._cloud_started_local_bridge and not self.settings.get("agentAccessEnabled", False):
+                    bridge.stop()
+                self._cloud_started_local_bridge = False
+            try:
+                from .agent_cloud import device_config, validate_pairing, write_cloud_config
+            except ImportError:
+                from agent_cloud import device_config, validate_pairing, write_cloud_config
+            path = local_path(source)
+            if path.stat().st_size > 16_000:
+                raise ValueError("Pairing file is too large")
+            pairing = validate_pairing(json.loads(path.read_text(encoding="utf-8")))
+            write_cloud_config(self._agent_cloud_config_path, device_config(pairing))
+            self._best_effort_revoke_cloud_config(old_config)
+            self._agent_cloud_error = ""
+            self._emit(False)
+            return True
+        except Exception as error:
+            self._agent_cloud_error = str(error)[:180]
+            self._emit(False)
+            return False
+
+    @Slot(str, result=bool)
+    def exportAgentPairing(self, destination):
+        try:
+            try:
+                from .agent_cloud import export_pairing, read_cloud_config
+            except ImportError:
+                from agent_cloud import export_pairing, read_cloud_config
+            path = local_path(destination)
+            export_pairing(path, read_cloud_config(self._agent_cloud_config_path))
+            self.message = f"Pairing file saved to {path}"
+            self._agent_cloud_error = ""
+            self._emit(False)
+            return True
+        except Exception as error:
+            self._agent_cloud_error = str(error)[:180]
+            self._emit(False)
+            return False
+
+    @Slot(bool)
+    def setCloudAgentEnabled(self, enabled):
+        bridge = getattr(self.session, "agent_bridge", None)
+        try:
+            if bridge is None:
+                raise ValueError("Cloud agent access is unavailable in this app session")
+            if enabled:
+                try:
+                    from .agent_cloud import read_cloud_config
+                except ImportError:
+                    from agent_cloud import read_cloud_config
+                config = read_cloud_config(self._agent_cloud_config_path)
+                was_enabled = bridge.enabled
+                bridge.start_cloud(config)
+                self._cloud_started_local_bridge = not was_enabled
+            else:
+                bridge.stop_cloud()
+                if self._cloud_started_local_bridge and not self.settings.get("agentAccessEnabled", False):
+                    bridge.stop()
+                self._cloud_started_local_bridge = False
+            self.settings["cloudAgentEnabled"] = bool(enabled)
+            self._preferences()
+            self._agent_cloud_error = ""
+        except Exception as error:
+            self.settings["cloudAgentEnabled"] = False
+            self._agent_cloud_error = str(error)[:180]
+        self._emit(False)
+
+    @Slot()
+    def copyCloudConnectorUrl(self):
+        url = self.cloudConnectorUrl
+        if not url:
+            self._agent_cloud_error = "Create or import a pairing before copying the connector URL."
+        else:
+            QGuiApplication.clipboard().setText(url)
+            self._agent_cloud_error = "Connector URL copied. Treat it as a secret."
+        self._emit(False)
+
+    @Slot(bool)
+    def setAgentAccessEnabled(self, enabled):
+        bridge = getattr(self.session, "agent_bridge", None)
+        if bridge is None:
+            self._agent_error = "Live agent access is unavailable in this app session."
+            self._emit(False)
+            return
+        try:
+            if enabled:
+                bridge.start()
+                self._agent_error = ""
+            else:
+                bridge.stop()
+                self.settings["cloudAgentEnabled"] = False
+                self._agent_error = ""
+            self.settings["agentAccessEnabled"] = bool(enabled)
+            self._preferences()
+            self._emit(False)
+        except Exception as error:
+            self._agent_error = f"Could not enable live agent access ({type(error).__name__})."
+            self.settings["agentAccessEnabled"] = False
+            self._emit(False)
+
+    @Slot()
+    def copyAgentSetupInstructions(self):
+        QGuiApplication.clipboard().setText(self.agentSetupInstructions)
+
+    @Slot(str)
+    def saveAgentSetupInstructions(self, destination):
+        if not self.agentAccessEnabled:
+            self._agent_error = "Enable live agent access before saving its setup guide."
+            self._emit(False)
+            return
+        try:
+            path = local_path(destination)
+            if path.suffix.casefold() != ".md":
+                path = path.with_suffix(".md")
+            guide = ("# Super MD live-tab MCP setup\n\n"
+                     "This local MCP server can inspect and revise tabs that are open in this Super MD app session. "
+                     "It runs over stdio and reads the private, temporary discovery directory shown below.\n\n"
+                     "## MCP client configuration\n\n```json\n" + self.agentSetupInstructions + "\n```\n\n"
+                     "Live access is off by default. Enable it in Super MD Settings → AI agents before starting the MCP server. "
+                     "Disabling access or closing Super MD revokes the temporary session token. The token is not included in this file.\n")
+            if self.cloudAgentConfigured and self.cloudConnectorUrl:
+                guide += ("\n## Cloud relay connector\n\n"
+                          "Use this Streamable HTTP MCP endpoint with the intended MCP client. It is a bearer capability; "
+                          "keep this guide private and share it only with that client.\n\n"
+                          "```text\n" + self.cloudConnectorUrl + "\n```\n")
+            atomic_write(path, guide.encode("utf-8"))
+            self._agent_error = ""
+            self.message = f"Setup guide saved to {path}"
+            self._emit(False)
+        except (OSError, ValueError, TypeError) as error:
+            self._agent_error = f"Could not save setup guide ({type(error).__name__})."
+            self._emit(False)
 
     @Property(bool,notify=changed)
     def readerFullscreen(self):return self.fullscreen
@@ -1622,7 +1984,7 @@ class Studio(QObject):
         def write():
             if automatic and (not path.exists() or open_note(path)[0] != expected):
                 raise ValueError("Autosave paused: this file changed outside Super MD. Your edits remain in draft recovery; use Save as to keep both versions.")
-            if portable: atomic_write(path,json.dumps(bundle(content,assets),ensure_ascii=False).encode())
+            if portable: write_portable(path,content,assets)
             else:
                 materialize_assets(path.parent,assets)
                 atomic_write(path,content.encode())
@@ -1784,11 +2146,474 @@ class Studio(QObject):
         if action in calls: self.readerCall.emit(calls[action])
         elif action == "window": self.newWindowRequested.emit()
 
+    def _agent_export_path(self, filename: str, format: str, tab: dict) -> Path:
+        extension = {"pdf": ".pdf", "smd": ".smd", "md": ".md"}[format]
+        selected = filename or Path(tab["name"]).stem or "Super MD export"
+        if Path(selected).name != selected or any(char in selected for char in ("/", "\\", "\0")):
+            raise ValueError("Export filename must be a basename")
+        stem = Path(selected).stem if Path(selected).suffix else selected
+        stem = "".join(char for char in stem if char.isalnum() or char in " ._()-").strip(" .")[:100]
+        if not stem or stem in (".", ".."):
+            stem = "Super MD export"
+        directory = Path(self.settings.get("newNoteLocation") or QStandardPaths.writableLocation(QStandardPaths.DownloadLocation) or str(Path.home())).expanduser()
+        if not directory.is_dir():
+            raise ValueError("The configured export folder is unavailable")
+        for index in range(1, 10_001):
+            suffix = "" if index == 1 else f" ({index})"
+            candidate = directory / f"{stem}{suffix}{extension}"
+            try:
+                descriptor = os.open(candidate, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+            except FileExistsError:
+                continue
+            os.close(descriptor)
+            return candidate
+        raise ValueError("Could not choose a unique export filename")
+
+    @staticmethod
+    def _agent_export_metadata(path: Path, format: str) -> dict:
+        digest = hashlib.sha256()
+        size = 0
+        with path.open("rb") as source:
+            while True:
+                chunk = source.read(1024 * 1024)
+                if not chunk:
+                    break
+                size += len(chunk)
+                digest.update(chunk)
+        return {"path": str(path), "filename": path.name, "format": format,
+                "bytes": size, "sha256": digest.hexdigest()}
+
+    def _agent_export_native(self, request_id: str, args: dict):
+        tab_id = args.get("id")
+        target = next((tab for tab in self.tabs if tab["id"] == tab_id), None)
+        if target is None or target["id"] != self.active:
+            raise ValueError("Export the currently active live tab")
+        fmt = args.get("format")
+        if fmt not in ("pdf", "smd", "md"):
+            raise ValueError("Export format must be PDF, SMD or Markdown")
+        expected = args.get("expectedRevision")
+        current = hashlib.sha256(target["content"].encode("utf-8")).hexdigest()
+        if not isinstance(expected, str) or expected != current:
+            raise ValueError("Live tab revision changed; inspect it again before exporting")
+        if self.pending_export or self.pending_save_as:
+            raise ValueError("Finish the current save or export before starting another one")
+        content, assets = args.get("content"), args.get("assets", {})
+        if not isinstance(content, str) or len(content.encode("utf-8")) > 20_000_000:
+            raise ValueError("Prepared export content must be a string under 20 MB")
+        if not isinstance(assets, dict) or len(assets) > 512 or any(not isinstance(k, str) or not isinstance(v, str) for k, v in assets.items()):
+            raise ValueError("Prepared export assets are invalid")
+        if sum(len(value) for value in assets.values()) > 110_000_000:
+            raise ValueError("Prepared export assets exceed the bounded total size")
+        options = args.get("options", {})
+        if fmt == "pdf":
+            from agent_exports import validate_pdf_options
+            if not isinstance(options, dict):
+                raise ValueError("PDF options must be an object")
+            supplied = dict(options)
+            options = {**DEFAULT_PDF, **self.settings.get("pdf", {}), **supplied}
+            options["themeAccent"] = supplied.get("themeAccent") or self._colors().get("primary", "#386a57")
+            options = validate_pdf_options(options)
+        output = self._agent_export_path(args.get("filename", ""), fmt, target)
+        self.pending_export = str(output)
+        job_id = uuid.uuid4().hex
+        while len(self._agent_job_records) >= 20:
+            removable = next((key for key, value in self._agent_job_records.items()
+                              if value.get("status") in ("completed", "failed", "cancelled")), None)
+            if removable is None:
+                self.pending_export = ""
+                output.unlink(missing_ok=True)
+                raise ValueError("The desktop already has 20 active agent export jobs")
+            self._agent_job_records.pop(removable, None)
+        self._agent_exports[request_id] = {"path": str(output), "format": fmt, "jobId": job_id}
+        self._agent_job_records[job_id] = {"jobId": job_id, "status": "running", "filename": output.name,
+                                           "format": fmt, "path": str(output), "bytes": 0}
+        command = {"pdf": "export_pdf_native", "smd": "export_fmd_native", "md": "export_markdown_native"}[fmt]
+        forwarded = {"id": tab_id, "content": content, "assets": assets, "options": options,
+                     "expectedRevision": expected, "save": False, "jobId": job_id}
+        try:
+            self.post(request_id, command, json.dumps(forwarded, ensure_ascii=False, separators=(",", ":")))
+            self.replied.emit(request_id, json.dumps({"jobId": job_id, "status": "running",
+                                                     "filename": output.name, "format": fmt}), "")
+        except Exception:
+            self._agent_exports.pop(request_id, None)
+            self.pending_export = ""
+            try:
+                output.unlink(missing_ok=True)
+            except OSError:
+                pass
+            raise
+
+    def _agent_job_status(self, job_id):
+        if not isinstance(job_id, str) or not job_id:
+            raise ValueError("jobId is required")
+        record = self._agent_job_records.get(job_id)
+        if not record:
+            raise ValueError("Export job is unavailable or expired")
+        return {key: value for key, value in record.items() if key != "path"} | ({"path": record["path"]} if record.get("status") == "completed" else {})
+
+    def _agent_document_action(self, args):
+        action = args.get("action")
+        if action == "replace_tab_asset":
+            return self._replace_tab_asset_native(args)
+        if action == "create_document":
+            fmt = args.get("format", "md")
+            content = args.get("content", "")
+            title = args.get("title", "")
+            if fmt not in ("md", "smd") or not isinstance(content, str) or len(content.encode("utf-8")) > 20_000_000:
+                raise ValueError("New document content or format is invalid")
+            title = title.strip() or ("Untitled.smd" if fmt == "smd" else "Untitled.md")
+            if not title.lower().endswith("." + fmt):
+                title += "." + fmt
+            note = self._note(title, content, "", "", {}, fmt == "smd")
+            self.tabs.append(note)
+            self.active = note["id"]
+            self.recovery_timer.start(800)
+            self._emit()
+            revision = hashlib.sha256(content.encode("utf-8")).hexdigest()
+            return {"tabId": note["id"], "windowId": self.window_id, "title": title,
+                    "revision": revision, "path": "", "isDirty": bool(content), "format": fmt}
+        if action == "save_document":
+            tab_id = args.get("tabId")
+            tab = next((item for item in self.tabs if item["id"] == tab_id), None)
+            if not tab or tab_id != self.active:
+                raise ValueError("Save requires the target tab to be active")
+            revision = hashlib.sha256(tab["content"].encode("utf-8")).hexdigest()
+            if args.get("expectedRevision") != revision:
+                raise ValueError("Live tab revision changed; inspect it again before saving")
+            fmt = args.get("format", "md")
+            if fmt not in ("md", "smd"):
+                raise ValueError("Save format must be md or smd")
+            if tab["content"] != tab["saved"] and tab["path"] and Path(tab["path"]).suffix.lower() == (".smd" if fmt == "smd" else ".md"):
+                # A save to the same existing path is allowed only if it was
+                # opened by Super MD; it does not overwrite a different file.
+                path = Path(tab["path"])
+            else:
+                path = self._agent_export_path(args.get("filename", ""), fmt, tab)
+                self._agent_owned_files.add(str(path.resolve()))
+            try:
+                if fmt == "smd":
+                    write_portable(path, tab["content"], tab["assets"])
+                else:
+                    atomic_write(path, tab["content"].encode("utf-8"))
+            except Exception:
+                if str(path) in self._agent_owned_files:
+                    self._agent_owned_files.discard(str(path.resolve()))
+                raise
+            tab.update(path=str(path), name=path.name, saved=tab["content"], portable=fmt == "smd")
+            self._recover(); self._emit()
+            return {"tabId": tab_id, "windowId": self.window_id, "path": str(path),
+                    "filename": path.name, "revision": revision, "format": fmt, "isDirty": False}
+        if action == "open_document":
+            filename = args.get("filename", "")
+            if filename == "":
+                tab_id = args.get("tabId")
+                existing = next((item for item in self.tabs if item["id"] == tab_id), None)
+                if existing is None:
+                    raise ValueError("The requested live tab is no longer open")
+                self.selectTab(existing["id"])
+                return {"tabId": existing["id"], "windowId": self.window_id, "title": existing["name"],
+                        "path": existing["path"], "revision": hashlib.sha256(existing["content"].encode()).hexdigest(),
+                        "isDirty": existing["content"] != existing["saved"],
+                        "format": "smd" if existing.get("portable") or str(existing["path"]).lower().endswith(".smd") else "markdown"}
+            candidate = Path(filename).expanduser()
+            if not candidate.is_absolute():
+                directory = Path(self.settings.get("newNoteLocation") or QStandardPaths.writableLocation(QStandardPaths.DownloadLocation) or str(Path.home())).expanduser()
+                candidate = directory / candidate.name
+            resolved = str(candidate.resolve())
+            existing = next((item for item in self.tabs if item["path"] and str(Path(item["path"]).resolve()) == resolved), None)
+            if existing:
+                self.selectTab(existing["id"])
+                return {"tabId": existing["id"], "windowId": self.window_id, "title": existing["name"],
+                        "path": existing["path"], "revision": hashlib.sha256(existing["content"].encode()).hexdigest()}
+            if resolved not in self._agent_owned_files:
+                raise ValueError("Only files created or saved by this live session can be opened")
+            self._open_note(resolved, explicit=True)
+            return {"status": "opening", "path": resolved, "windowId": self.window_id}
+        raise ValueError("Unsupported native document action")
+
+    def _save_media_native(self, args):
+        body, mime_type, filename = args.get("body"), args.get("mimeType"), args.get("filename", "")
+        extensions = {"image/png": ".png", "image/svg+xml": ".svg", "image/jpeg": ".jpg",
+                      "image/webp": ".webp", "image/gif": ".gif", "image/avif": ".avif",
+                      "text/plain": ".mmd"}
+        if mime_type not in extensions:
+            raise ValueError("Unsupported media type")
+        if not isinstance(filename, str) or len(filename) > 160 or any(char in filename for char in ("/", "\\", "\0")):
+            raise ValueError("Media filename must be a short basename")
+        if not isinstance(body, str) or len(body) > 36_000_000:
+            raise ValueError("Media data is invalid or exceeds 25 MB")
+        try:
+            data = base64.b64decode(body, validate=True)
+        except (ValueError, base64.binascii.Error):
+            raise ValueError("Media data is not valid base64") from None
+        if not data or len(data) > 25_000_000:
+            raise ValueError("Media data is empty or exceeds 25 MB")
+        signatures = {"image/png": data.startswith(b"\x89PNG\r\n\x1a\n"),
+                      "image/jpeg": data.startswith(b"\xff\xd8\xff"),
+                      "image/webp": len(data) >= 12 and data[:4] == b"RIFF" and data[8:12] == b"WEBP",
+                      "image/gif": data.startswith((b"GIF87a", b"GIF89a")),
+                      "image/avif": len(data) >= 12 and data[4:8] == b"ftyp" and b"avif" in data[8:16],
+                      "image/svg+xml": b"<svg" in data[:4096].lower(),
+                      "text/plain": True}
+        if not signatures[mime_type]:
+            raise ValueError("Media bytes do not match the declared type")
+        safe = re.sub(r"[^A-Za-z0-9._ -]", "", Path(str(filename)).stem).strip(" .")[:100] or "Super-MD-media"
+        extension = extensions[mime_type]
+        directory = Path(self.settings.get("newNoteLocation") or QStandardPaths.writableLocation(QStandardPaths.DownloadLocation) or str(Path.home())).expanduser()
+        if not directory.is_dir():
+            raise ValueError("The media download folder is unavailable")
+        for suffix in range(1, 10000):
+            name = f"{safe}{'' if suffix == 1 else f' ({suffix})'}{extension}"
+            path = directory / name
+            try:
+                fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+                with os.fdopen(fd, "wb") as stream:
+                    stream.write(data)
+                    stream.flush()
+                    os.fsync(stream.fileno())
+                return {"filename": name, "path": str(path), "bytes": len(data), "mimeType": mime_type}
+            except FileExistsError:
+                continue
+        raise ValueError("Could not find an unused media filename")
+
+    def _replace_tab_asset_native(self, args):
+        tab_id = args.get("tabId")
+        tab = next((item for item in self.tabs if item["id"] == tab_id), None)
+        if not tab or tab_id != self.active:
+            raise ValueError("Asset replacement requires the target tab to be active")
+        current = hashlib.sha256(tab["content"].encode("utf-8")).hexdigest()
+        if args.get("expectedRevision") != current:
+            raise ValueError("Live tab revision changed; inspect it again before replacing an asset")
+        path = Path(tab.get("path") or "")
+        if not tab.get("portable") or path.suffix.lower() != ".smd" or not path.is_file():
+            raise ValueError("Asset replacement requires a saved portable .smd note")
+        asset_id, asset_path_value = args.get("assetName"), args.get("assetPath")
+        assets = tab.get("assets", {})
+        asset_name = asset_id if asset_id in assets else next((name for name in assets
+            if hashlib.sha256(name.encode("utf-8")).hexdigest() == asset_id), None)
+        if not asset_name:
+            raise ValueError("Asset ID is not present in the current note")
+        roots = [path.parent]
+        if self.folder:
+            roots.append(Path(self.folder))
+        location = self.settings.get("newNoteLocation")
+        if location:
+            roots.append(Path(location))
+        candidate = Path(asset_path_value).expanduser()
+        try:
+            candidate = candidate.resolve(strict=True)
+        except OSError as error:
+            raise ValueError("Replacement asset file is unavailable") from error
+        if not candidate.is_file() or not any(candidate == root.resolve() or root.resolve() in candidate.parents for root in roots if root.exists()):
+            raise ValueError("Replacement asset must be inside the current note folder or a configured folder")
+        if candidate.stat().st_size > MAX_IMAGE:
+            raise ValueError("Replacement asset exceeds 25 MB")
+        extension = candidate.suffix.lower().lstrip(".")
+        mime = MIMES.get(extension)
+        expected_mime = MIMES.get(asset_name.rsplit(".", 1)[-1].lower())
+        if not mime or mime != expected_mime:
+            raise ValueError("Replacement asset must keep the existing MIME type and extension")
+        raw = candidate.read_bytes()
+        signatures = {"image/png": raw.startswith(b"\x89PNG\r\n\x1a\n"),
+                      "image/jpeg": raw.startswith(b"\xff\xd8\xff"),
+                      "image/webp": len(raw) >= 12 and raw[:4] == b"RIFF" and raw[8:12] == b"WEBP",
+                      "image/gif": raw.startswith((b"GIF87a", b"GIF89a")),
+                      "image/avif": len(raw) >= 12 and raw[4:8] == b"ftyp" and b"avif" in raw[8:16],
+                      "image/svg+xml": b"<svg" in raw[:4096].lower()}
+        if not signatures.get(mime, False):
+            raise ValueError("Replacement asset bytes do not match the current MIME type")
+        old_mime, old_data = image_data(assets[asset_name])
+        if old_mime != mime:
+            raise ValueError("Stored asset MIME type does not match its extension")
+        if old_data == raw:
+            return {"tabId": tab_id, "assetName": asset_name, "revision": current, "changed": False}
+        updated = dict(assets)
+        updated[asset_name] = f"data:{mime};base64," + base64.b64encode(raw).decode("ascii")
+        disk_content, disk_assets, disk_portable = open_note(path)
+        if not disk_portable or disk_content != tab["saved"] or disk_assets != assets:
+            raise ValueError("The portable note changed on disk; reopen it before replacing an asset")
+        # The text revision is checked above; writing the existing open SMD is
+        # atomic and preserves every other asset and the exact Markdown string.
+        write_portable(path, tab["content"], updated)
+        tab["assets"] = updated
+        tab["saved"] = tab["content"]
+        self.session.reader_assets.revoke_tab(self.window_id, tab_id)
+        self.readerCall.emit("window.dispatchEvent(new Event('supermd-assets-changed'))")
+        self._recover(); self._emit()
+        return {"tabId": tab_id, "assetName": asset_name, "revision": current, "changed": True,
+                "bytes": len(raw), "mimeType": mime}
+
+    def _agent_viewport_pending(self, request_id, tab_id):
+        bridge = getattr(self.session, "agent_bridge", None)
+        return bool(bridge and bridge.has_pending(request_id, self.window_id, "render_tab", tab_id))
+
+    def _agent_viewport_revision(self, tab_id):
+        if self.retired or self.active != tab_id:
+            raise ValueError("The target tab is no longer active; refresh the live tab list")
+        tab = next((item for item in self.tabs if item["id"] == tab_id), None)
+        if tab is None:
+            raise ValueError("The requested live tab is no longer open")
+        return hashlib.sha256(tab["content"].encode("utf-8")).hexdigest()
+
+    def _begin_agent_viewport_capture(self, request_id, args):
+        if not isinstance(args, dict) or args.get("requestId") != request_id:
+            raise ValueError("Viewport capture request is invalid")
+        tab_id, revision, context = args.get("tabId"), args.get("revision"), args.get("context")
+        if not isinstance(tab_id, str) or not isinstance(revision, str) or len(revision) != 64:
+            raise ValueError("Viewport capture is missing its live tab revision")
+        if not isinstance(context, dict) or context.get("revision") != revision:
+            raise ValueError("Viewport context revision does not match the request")
+        if not self._agent_viewport_pending(request_id, tab_id):
+            return
+        if self._agent_viewport_revision(tab_id) != revision:
+            raise ValueError("The live tab changed before its viewport was captured")
+        bounds = context.get("viewport")
+        if not isinstance(bounds, dict):
+            raise ValueError("Reader viewport bounds are unavailable")
+        try:
+            rect = {key: float(bounds[key]) for key in ("x", "y", "width", "height", "viewportWidth", "viewportHeight")}
+        except (KeyError, TypeError, ValueError) as error:
+            raise ValueError("Reader viewport bounds are invalid") from error
+        if any(not math.isfinite(value) for value in rect.values()) or rect["width"] <= 0 or rect["height"] <= 0 or rect["viewportWidth"] <= 0 or rect["viewportHeight"] <= 0:
+            raise ValueError("Reader viewport bounds are invalid")
+        if rect["x"] < 0 or rect["y"] < 0 or rect["x"] + rect["width"] > rect["viewportWidth"] + 1 or rect["y"] + rect["height"] > rect["viewportHeight"] + 1:
+            raise ValueError("Reader viewport bounds are outside the visible page")
+        width = args.get("width", 1600)
+        if not isinstance(width, int) or isinstance(width, bool) or not 64 <= width <= 1600:
+            raise ValueError("Viewport width must be between 64 and 1,600 pixels")
+        if self._agent_viewport_capture is not None:
+            raise ValueError("Another viewport capture is already in progress")
+        window = self.host_window
+        if window is None:
+            raise ValueError("The desktop reader window is unavailable")
+        pending = {"requestId": request_id, "tabId": tab_id, "revision": revision,
+                   "context": context, "bounds": rect, "width": width, "window": window}
+        self._agent_viewport_capture = pending
+        try:
+            window.frameSwapped.connect(self._agent_viewport_frame_swapped, Qt.ConnectionType.QueuedConnection)
+        except (AttributeError, RuntimeError, TypeError):
+            pass
+        window.update()
+        # Some software Qt backends do not emit frameSwapped for an unchanged
+        # exposed window. Try a bounded capture after 200 ms in that case.
+        QTimer.singleShot(200, lambda rid=request_id: self._agent_viewport_fallback(rid))
+
+    def _clear_agent_viewport_capture(self, pending):
+        if self._agent_viewport_capture is not pending:
+            return
+        self._agent_viewport_capture = None
+        try:
+            pending["window"].frameSwapped.disconnect(self._agent_viewport_frame_swapped)
+        except (AttributeError, RuntimeError, TypeError):
+            pass
+
+    def _agent_viewport_fallback(self, request_id):
+        pending = self._agent_viewport_capture
+        if pending is not None and pending["requestId"] == request_id:
+            self._capture_agent_viewport(pending)
+
+    @Slot()
+    def _agent_viewport_frame_swapped(self):
+        pending = self._agent_viewport_capture
+        if pending is not None:
+            self._capture_agent_viewport(pending)
+
+    def _capture_agent_viewport(self, pending):
+        if self._agent_viewport_capture is not pending:
+            return
+        bridge = getattr(self.session, "agent_bridge", None)
+        request_id, tab_id, revision = pending["requestId"], pending["tabId"], pending["revision"]
+        if bridge is None or not self._agent_viewport_pending(request_id, tab_id):
+            self._clear_agent_viewport_capture(pending)
+            return
+        try:
+            if self._agent_viewport_revision(tab_id) != revision:
+                raise ValueError("The live tab changed before its viewport was captured")
+            window = pending["window"]
+            reader = window.property("reader")
+            if reader is None:
+                reader = window.findChild(QObject, "documentReader")
+            if reader is None or not callable(getattr(reader, "mapToScene", None)):
+                raise ValueError("The desktop WebEngine view is unavailable")
+            bounds = pending["bounds"]
+            view_width, view_height = float(reader.width()), float(reader.height())
+            if view_width <= 0 or view_height <= 0:
+                raise ValueError("The desktop WebEngine view has no visible area")
+            scale_x, scale_y = view_width / bounds["viewportWidth"], view_height / bounds["viewportHeight"]
+            top_left = reader.mapToScene(QPointF(bounds["x"] * scale_x, bounds["y"] * scale_y))
+            bottom_right = reader.mapToScene(QPointF((bounds["x"] + bounds["width"]) * scale_x,
+                                                      (bounds["y"] + bounds["height"]) * scale_y))
+            image = window.grabWindow()
+            if image is None or image.isNull():
+                raise ValueError("The desktop reader frame could not be captured")
+            pixel_scale_x = image.width() / max(1.0, float(window.width()))
+            pixel_scale_y = image.height() / max(1.0, float(window.height()))
+            left = max(0, math.floor(min(top_left.x(), bottom_right.x()) * pixel_scale_x))
+            top = max(0, math.floor(min(top_left.y(), bottom_right.y()) * pixel_scale_y))
+            right = min(image.width(), math.ceil(max(top_left.x(), bottom_right.x()) * pixel_scale_x))
+            bottom = min(image.height(), math.ceil(max(top_left.y(), bottom_right.y()) * pixel_scale_y))
+            if right <= left or bottom <= top:
+                raise ValueError("The reader viewport is outside the captured window")
+            crop = image.copy(QRect(left, top, right - left, bottom - top))
+            longest = max(crop.width(), crop.height())
+            if longest > pending["width"]:
+                ratio = pending["width"] / longest
+                crop = crop.scaled(max(1, round(crop.width() * ratio)), max(1, round(crop.height() * ratio)),
+                                   Qt.AspectRatioMode.KeepAspectRatio, Qt.TransformationMode.SmoothTransformation)
+            if self._agent_viewport_revision(tab_id) != revision:
+                raise ValueError("The live tab changed while its viewport was being captured")
+            if not bridge.has_pending(request_id, self.window_id, "render_tab", tab_id):
+                self._clear_agent_viewport_capture(pending)
+                return
+            array = QByteArray()
+            buffer = QBuffer(array)
+            if not buffer.open(QIODevice.OpenModeFlag.WriteOnly) or not crop.save(buffer, "PNG"):
+                raise ValueError("Could not encode the live viewport as PNG")
+            result = dict(pending["context"])
+            result.update({"mime_type": "image/png", "data": base64.b64encode(bytes(array)).decode("ascii"),
+                           "width": crop.width(), "height": crop.height(), "revision": revision,
+                           "tabId": tab_id, "windowId": self.window_id})
+            self._clear_agent_viewport_capture(pending)
+            bridge.complete(request_id, result, window_id=self.window_id)
+        except Exception as error:
+            self._clear_agent_viewport_capture(pending)
+            bridge.complete(request_id, None, str(error)[:1000], window_id=self.window_id)
+
     @Slot(str, str, str)
     def post(self, id, command, raw):
         if self.retired:return
         try:
             args = json.loads(raw)
+            if command == "agent_result":
+                bridge = getattr(self.session, "agent_bridge", None)
+                if bridge is not None:
+                    result = args.get("result")
+                    error = args.get("error", "")
+                    if error and not isinstance(error, str):
+                        error = "Live tab operation failed"
+                    bridge.complete(id, result, error or "", window_id=self.window_id)
+                return
+            if command == "agent_render_bounds":
+                bridge = getattr(self.session, "agent_bridge", None)
+                tab_id = args.get("tabId", "")
+                if bridge is None or not bridge.has_pending(id, self.window_id, "render_tab", tab_id):
+                    return
+                if args.get("error"):
+                    bridge.complete(id, None, str(args["error"])[:1000], window_id=self.window_id)
+                    return
+                try:
+                    self._begin_agent_viewport_capture(id, args)
+                except Exception as error:
+                    bridge.complete(id, None, str(error)[:1000], window_id=self.window_id)
+                return
+            if command == "agent_export_native":
+                self._agent_export_native(id, args)
+                return
+            if command == "save_media_native":
+                result = self._save_media_native(args)
+                self.replied.emit(id, json.dumps(result), "")
+                return
+            agent_export_info = self._agent_exports.get(id)
             if command == "cancel_export":
                 job_id = args.get("jobId")
                 if not isinstance(job_id, str) or not job_id or len(job_id) > 128:
@@ -1940,6 +2765,10 @@ class Studio(QObject):
                 job_id = args.get("jobId")
                 if job_id is None: job_id = uuid.uuid4().hex
                 export_job = self._export_jobs.register(job_id)
+            def export_result(path):
+                if agent_export_info:
+                    return self._agent_export_metadata(Path(path), agent_export_info["format"])
+                return {"path": str(path)}
             def work():
                 if command == "load_asset": return self._asset(captured,args["source"])
                 if command == "load_font": return self.session.font_store.reader(args["family"])
@@ -1978,11 +2807,11 @@ class Studio(QObject):
                 if command == "export_markdown_native":
                     if not output or not isinstance(args["content"], str) or len(args["content"].encode()) > 20_000_000: raise ValueError("Choose a Markdown destination for a note under 20 MB")
                     atomic_write(Path(output), args["content"].encode())
-                    return {"path": output}
+                    return export_result(output)
                 if command == "export_fmd_native":
                     target = Path(captured["path"]) if args.get("save") else Path(output)
-                    atomic_write(target,json.dumps(bundle(args["content"],args["assets"]),ensure_ascii=False).encode())
-                    return {"path":str(target)}
+                    write_portable(target,args["content"],args["assets"])
+                    return export_result(target)
                 if command == "export_pdf_native":
                     job = export_job
                     assert job is not None
@@ -2036,7 +2865,7 @@ class Studio(QObject):
                         with stage.open("rb") as generated:
                             if generated.read(5) != b"%PDF-": raise ValueError("PDF export produced an invalid file")
                         job.promote(stage, destination,lambda:self.readerCall.emit("window.supermdExportPhase?.("+json.dumps(job.job_id)+",'publishing')"))
-                        return {"path":output}
+                        return export_result(output)
                     finally:
                         for owned in (stage, rust_temp):
                             if owned is not None:
@@ -2047,7 +2876,21 @@ class Studio(QObject):
             def finished(result,error):
                 if command.startswith("export_") and self.pending_export == output: self.pending_export = ""
                 if error and self.pending_save_as == save_as: self.pending_save_as = ""
-                if error: self.replied.emit(id,"null",error); return
+                if error:
+                    if agent_export_info:
+                        record = self._agent_job_records.get(agent_export_info.get("jobId"))
+                        if record:
+                            record.update(status="failed", error=str(error)[:1000])
+                        try:
+                            reserved = Path(agent_export_info["path"])
+                            if reserved.exists() and reserved.stat().st_size == 0:
+                                reserved.unlink()
+                        except OSError:
+                            pass
+                        self._agent_exports.pop(id, None)
+                    if not agent_export_info:
+                        self.replied.emit(id,"null",error)
+                    return
                 target = next((t for t in self.tabs if t["id"] == captured["id"]),None)
                 if command == "import_images" and target: target["assets"].update(captured["assets"])
                 if command == "export_fmd_native" and args.get("save") and target:
@@ -2063,9 +2906,29 @@ class Studio(QObject):
                         if self.pending_close: self._finish_close()
                     self.pending_save_as = ""
                 if command.startswith("export_"): self.message = f"Exported {Path(result['path']).name}"
-                self.replied.emit(id,json.dumps(result),"")
+                if agent_export_info:
+                    record = self._agent_job_records.get(agent_export_info.get("jobId"))
+                    if record:
+                        record.update(status="completed", bytes=result.get("bytes", 0),
+                                      sha256=result.get("sha256", ""), path=result.get("path", ""),
+                                      filename=result.get("filename", ""))
+                    if result.get("path"):
+                        self._agent_owned_files.add(str(Path(result["path"]).resolve()))
+                    self._agent_exports.pop(id, None)
+                if not agent_export_info:
+                    self.replied.emit(id,json.dumps(result),"")
             self._submit(work,finished,command in ("run_python","export_fmd_native","export_pdf_native","export_markdown_native"),self.writes if command in ("export_fmd_native", "export_markdown_native") else None)
         except Exception as error:
+            agent_export = self._agent_exports.pop(id, None)
+            if agent_export:
+                if self.pending_export == agent_export.get("path"):
+                    self.pending_export = ""
+                try:
+                    reserved = Path(agent_export["path"])
+                    if reserved.exists() and reserved.stat().st_size == 0:
+                        reserved.unlink()
+                except (OSError, TypeError, KeyError):
+                    pass
             self.replied.emit(id,"null",str(error))
 
     @Slot()

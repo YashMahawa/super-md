@@ -33,6 +33,18 @@ async function rerender(host: HTMLElement, markdown: string) {
 }
 
 describe("MarkdownPreview streamed local assets", () => {
+  it("refreshes replaced asset pixels without clearing the current image or editing Markdown", async () => {
+    const before=`https://appassets.androidplatform.net/reader-assets/${"1".repeat(32)}?v=${"a".repeat(64)}`;
+    const after=`https://appassets.androidplatform.net/reader-assets/${"2".repeat(32)}?v=${"b".repeat(64)}`;
+    invoke.mockResolvedValueOnce({url:before,mime:"image/png"});
+    const host=await render("![Raster](assets/a.png)");const image=host.querySelector("img");
+    let finish!:(value:unknown)=>void;invoke.mockImplementationOnce(()=>new Promise(resolve=>{finish=resolve;}));
+    await act(async()=>window.dispatchEvent(new Event("supermd-assets-changed")));
+    expect(image?.getAttribute("src")).toBe(before);
+    await act(async()=>finish({url:after,mime:"image/png"}));
+    expect(host.querySelector("img")).toBe(image);expect(image?.getAttribute("src")).toBe(after);
+    expect(invoke.mock.calls.every(([command])=>command==="resolve_reader_asset")).toBe(true);
+  });
   it("renders the scoped native raster URL without materializing base64", async () => {
     const url = `https://appassets.androidplatform.net/reader-assets/${"1".repeat(32)}?v=${"a".repeat(64)}`;
     invoke.mockResolvedValueOnce({ url, mime: "image/png" });

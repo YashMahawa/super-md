@@ -111,9 +111,13 @@ ApplicationWindow {{
             pending.extend(item.childItems())
         return None
 
-    def test_settings_render_shortcut_rows_and_capture_real_key_input(self):
+    def test_shortcuts_open_in_separate_popup_and_capture_real_key_input(self):
+        popup = self.window.findChild(object, "shortcutsPopup")
+        self.assertIsNotNone(popup)
+        popup.open()
+        QTest.qWait(40)
         recorder = self.named_item("shortcutRecorder_find")
-        scroll = self.window.findChild(object, "settingsScroll")
+        scroll = self.window.findChild(object, "shortcutScroll")
         self.assertIsNotNone(recorder)
         self.assertIsNotNone(scroll)
         self.assertEqual(recorder.property("value"), self.studio.shortcutLabel("find"))
@@ -132,9 +136,20 @@ ApplicationWindow {{
         self.assertEqual(self.studio.shortcutSequences("find"), ["Ctrl+Alt+K"])
         self.assertFalse(self.window.property("triggered"), "The app shortcut must stay suppressed while recording a binding")
         self.assertEqual(recorder.property("value"), "⌥⌘K" if sys.platform == "darwin" else "Ctrl+Alt+K")
-        QTest.keyClick(self.window, Qt.Key_K, Qt.KeyboardModifier.ControlModifier | Qt.KeyboardModifier.AltModifier)
-        QTest.qWait(30)
-        self.assertTrue(self.window.property("triggered"), "The newly recorded binding must activate after capture ends")
+        popup.close()
+        self.assertFalse(self.window.property("capturingShortcut"), "Closing the shortcut popup must clear capture suppression")
+
+    def test_settings_categories_keep_controls_reachable_at_window_sizes(self):
+        page = self.window.findChild(object, "settingsPage")
+        self.assertIsNotNone(page)
+        for width, height in ((1280, 720), (1920, 1080), (900, 560)):
+            self.window.resize(width, height)
+            for section, control_name in (("appearance", "settingsScroll"), ("reading", "readingFontChoice"), ("writing", "writingAutosave"), ("python", "pythonPath"), ("system", "inspectAppStorage")):
+                page.setProperty("section", section)
+                QTest.qWait(20)
+                control = self.window.findChild(object, control_name)
+                self.assertIsNotNone(control, f"{section} controls must exist at {width}x{height}")
+                self.assertTrue(control.isVisible(), f"{section} controls must be reachable at {width}x{height}")
 
     def test_native_settings_text_copy_keeps_the_qml_editor_shortcut(self):
         field = self.named_item("nativeTextField")

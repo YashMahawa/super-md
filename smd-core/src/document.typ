@@ -1,6 +1,9 @@
 #set heading(numbering: none)
 #set text(fill: rgb("#202020"))
 #show heading: set text(weight: "bold")
+#show heading: set block(above: 1.05em, below: .42em)
+#set list(spacing: .42em, indent: 1.25em, body-indent: .38em)
+#set enum(spacing: .42em, indent: 1.25em, body-indent: .38em)
 // Allow long cell labels to wrap when generated fractional columns are narrow.
 #show table.cell: set text(hyphenate: true)
 #show raw: set text(font: "DejaVu Sans Mono", size: .86em)

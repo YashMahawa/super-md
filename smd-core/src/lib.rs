@@ -25,7 +25,7 @@ pub struct PdfOptions {
 }
 impl Default for PdfOptions {
     fn default() -> Self {
-        Self { page_size: "a4".into(), margin: 18., font_size: 10., line_height: 1.45, paragraph_spacing: 1.2, font_family: "Libertinus Serif".into(), page_numbers: true, themed: false, theme_accent: "#386a57".into() }
+        Self { page_size: "a4".into(), margin: 18., font_size: 10.5, line_height: 1.55, paragraph_spacing: 1.35, font_family: "Libertinus Serif".into(), page_numbers: true, themed: false, theme_accent: "#386a57".into() }
     }
 }
 impl PdfOptions {
