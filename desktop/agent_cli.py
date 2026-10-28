@@ -9,8 +9,10 @@ from pathlib import Path
 
 try:
     from .agent_documents import AgentDocumentError, DocumentStore
+    from .agent_stdio import configure_stdio
 except ImportError:  # python desktop/agent_cli.py
     from agent_documents import AgentDocumentError, DocumentStore
+    from agent_stdio import configure_stdio
 
 
 class _UsageError(Exception):
@@ -78,6 +80,7 @@ def _parser() -> argparse.ArgumentParser:
 
 def _emit(value: dict) -> None:
     # Exactly one bounded JSON record is written to stdout on success or failure.
+    configure_stdio(stdin=False, stderr=False)
     encoded = json.dumps(value, ensure_ascii=False, separators=(",", ":"))
     if len(encoded.encode("utf-8")) > 64_000:
         raise AgentDocumentError("Response exceeded the 64 KB output limit; request a smaller page")
@@ -85,6 +88,8 @@ def _emit(value: dict) -> None:
 
 
 def main(argv: list[str] | None = None) -> int:
+    # Configure stdin before --stdin or the MCP stdio transport reads it.
+    configure_stdio()
     argv = list(sys.argv[1:] if argv is None else argv)
     # Packaged `super-md agent mcp ...` shares this lightweight entry point
     # without importing Qt; stdio remains reserved for MCP protocol traffic.

@@ -3,6 +3,9 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import json
+import os
+import subprocess
 import tempfile
 from pathlib import Path
 
@@ -14,7 +17,13 @@ async def verify(binary: Path) -> None:
     with tempfile.TemporaryDirectory(prefix="supermd-packaged-mcp-") as directory:
         root = Path(directory)
         note = root / "protocol.md"
-        note.write_bytes(b"# Packaged protocol check\n\nMCP is alive.\n")
+        source = "# Packaged protocol check\n\nMCP is alive. 🧭 東京\n"
+        note.write_bytes(source.encode("utf-8"))
+        cli = subprocess.run([str(binary), "agent", "--root", str(root), "read", note.name, "--view", "source"],
+                             capture_output=True, timeout=30, check=True,
+                             env={**os.environ, "PYTHONIOENCODING": "cp1252"})
+        if json.loads(cli.stdout.decode("utf-8"))["result"]["text"] != source:
+            raise RuntimeError("Packaged CLI did not preserve UTF-8 source over redirected stdio")
         params = StdioServerParameters(command=str(binary), args=["agent", "mcp", "--root", str(root)])
         async with Client(params) as client:
             tools = await client.list_tools()

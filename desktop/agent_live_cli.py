@@ -8,6 +8,11 @@ import sys
 from pathlib import Path
 from typing import Any
 
+try:
+    from .agent_stdio import configure_stdio
+except ImportError:  # python desktop/agent_live_cli.py
+    from agent_stdio import configure_stdio
+
 MAX_OUTPUT = 64_000
 MAX_INPUT = 64_000
 MAX_CONTENT = 20_000_000
@@ -25,6 +30,7 @@ class _JSONArgumentParser(argparse.ArgumentParser):
 
 
 def _emit(value: dict[str, Any]) -> None:
+    configure_stdio(stdin=False, stderr=False)
     encoded = json.dumps(value, ensure_ascii=False, separators=(",", ":"))
     if len(encoded.encode("utf-8")) > MAX_OUTPUT:
         raise _CLIError("Response exceeded 64 KB; request a smaller page")
@@ -187,6 +193,7 @@ def _parse_indices(value: str) -> list[int]:
 
 
 def main(argv: list[str] | None = None) -> int:
+    configure_stdio()
     try:
         args = _parser().parse_args(sys.argv[1:] if argv is None else argv)
         try:

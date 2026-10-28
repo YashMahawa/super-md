@@ -20,7 +20,7 @@ class AgentExportsTest(unittest.TestCase):
         engine = self.root / "resources" / "desktop" / ("smd-engine.exe" if os.name == "nt" else "smd-engine")
         engine.parent.mkdir(parents=True);engine.write_bytes(b"test executable")
         with patch.object(sys, "frozen", True, create=True), patch.object(sys, "_MEIPASS", str(self.root), create=True):
-            self.assertEqual(find_engine(), engine)
+            self.assertEqual(find_engine(), engine.resolve())
 
     @classmethod
     def setUpClass(cls):
