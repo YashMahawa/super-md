@@ -15,7 +15,8 @@ from studio import Studio
 from websockets.sync.client import connect
 from websockets.sync.server import serve
 
-PNG = base64.b64decode("iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+/lS8AAAAASUVORK5CYII=")
+# Valid 1x1 RGBA PNG; Sharp/libpng rejects the former fixture's bad CRC.
+PNG = base64.b64decode("iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR4nGNgYGD4DwABBAEAX+XDSwAAAABJRU5ErkJggg==")
 
 class QtStudio(QObject):
     agentRequest = Signal(str)
@@ -24,6 +25,7 @@ class QtStudio(QObject):
         self.window_id=window_id; self.retired=False; self.active="tab-1"; self.live_source="# Current\n\n```svg\n<svg/>\n```\n"
         self.tabs=[{"id":"tab-1","name":"Current.md","path":"","content":self.live_source,"saved":"","portable":False,"assets":{}}]
         self._agent_job_records={"job-x":{"status":"completed"}}
+        self.received=[]
         self.agentRequest.connect(self.on_request)
     def _agent_job_status(self,job_id): return {"jobId":job_id,"status":"completed","format":"pdf","filename":"Current.pdf","bytes":12,"sha256":"a"*64}
     def _agent_document_action(self,request):
@@ -32,6 +34,7 @@ class QtStudio(QObject):
         raise AssertionError(request["action"])
     def on_request(self, raw):
         request=json.loads(raw); action=request["action"]; rid=request["requestId"]
+        self.received.append(request)
         tab=self.tabs[0]; revision=hashlib.sha256(self.live_source.encode()).hexdigest()
         def reply(result=None,error=""):
             self.session.agent_bridge.complete(rid,result,error,window_id=self.window_id)
@@ -136,14 +139,14 @@ class DesktopCloudQtIntegration(unittest.TestCase):
                       {"action":"read_tab","tabId":tab_id,"offset":0,"limit":12000},
                       {"action":"list_diagrams","tabId":tab_id,"expectedRevision":revision},
                       {"action":"get_diagram","tabId":tab_id,"diagramId":"diagram:24","expectedRevision":revision,"offset":0,"limit":12000},
-                      {"action":"get_diagram_image","tabId":tab_id,"diagramId":"diagram:24","expectedRevision":revision,"width":1600},
+                      {"action":"get_diagram_image","tabId":tab_id,"diagramId":"diagram:24","expectedRevision":revision,"width":1600,"imageFormat":"jpeg"},
                       {"action":"asset_action","tabId":tab_id,"assetAction":"attach","assetName":"assets/model.svg","mimeType":"image/svg+xml","body":base64.b64encode(b"<svg xmlns='http://www.w3.org/2000/svg'/>").decode(),"expectedRevision":revision},
                       {"action":"asset_action","tabId":tab_id,"assetAction":"list","expectedRevision":revision},
                       {"action":"asset_action","tabId":tab_id,"assetAction":"source","assetName":"assets/model.svg","expectedRevision":revision},
                       {"action":"document_action","documentAction":"export","tabId":tab_id,"expectedRevision":revision,"options":{"format":"pdf"}},
                       {"action":"document_action","documentAction":"job_status","tabId":tab_id,"jobId":"job-x"},
                       {"action":"document_action","documentAction":"snapshot","tabId":tab_id,"options":{"width":1600}},
-                      {"action":"render_tab","tabId":tab_id,"width":1600},
+                      {"action":"render_tab","tabId":tab_id,"width":1600,"imageFormat":"jpeg"},
                     ]
                     for n,rpc_request in enumerate(rpc,1):
                         ws.send(json.dumps({"type":"request","requestId":f"r{n}","deviceId":config["deviceId"],**rpc_request}))
@@ -181,6 +184,15 @@ class DesktopCloudQtIntegration(unittest.TestCase):
         self.assertEqual(base64.b64decode(calls[7]["result"]["body"]),b"<svg xmlns='http://www.w3.org/2000/svg'/>")
         self.assertEqual(calls[8]["result"]["status"],"running")
         self.assertEqual(calls[9]["result"]["status"],"completed")
+        forwarded = [request for request in self.studio.received if request["action"] == "render_tab"][-1]
+        self.assertEqual(forwarded["imageFormat"], "jpeg")
+        diagram_forwarded = next(request for request in self.studio.received if request["action"] == "get_diagram_image")
+        self.assertEqual(diagram_forwarded["imageFormat"], "jpeg")
+        with self.assertRaisesRegex(ValueError, "imageFormat must be png or jpeg"):
+            self.bridge._call_gui({"action":"render_tab", "tabId":"tab-1", "imageFormat":"webp"})
+        with self.assertRaisesRegex(ValueError, "imageFormat must be png or jpeg"):
+            self.bridge._call_gui({"action":"get_diagram_image", "tabId":"tab-1", "diagramId":"diagram:24",
+                                   "expectedRevision":diagram_forwarded["expectedRevision"], "imageFormat":"webp"})
 
     @unittest.skipUnless(shutil.which("node"), "Node.js is required for the relay integration test")
     def test_actual_node_relay_and_python_mcp_client_route_through_qt(self):
@@ -271,6 +283,8 @@ class DesktopCloudQtIntegration(unittest.TestCase):
         self.assertEqual(base64.b64decode(result_box["original_png"].content[0].data),PNG)
         self.assertEqual(result_box["diagrams"][0]["id"],"diagram:24")
         self.assertIn("<svg/>",result_box["source"].content[0].text)
+        self.assertFalse(result_box["image"].is_error,
+                         f"diagram image RPC failed: {[item.text for item in result_box['image'].content if hasattr(item, 'text')]}")
         self.assertEqual(result_box["image"].content[0].type,"image")
         self.assertEqual(result_box["status"]["status"],"completed")
         self.assertEqual(result_box["rendered"].content[0].type,"image")

@@ -179,7 +179,7 @@ class CloudRelayClient:
         uri=f"{ws_origin}/device?groupId={c['groupId']}&deviceId={c['deviceId']}"
         ws_logger=logging.getLogger("supermd.agent_cloud.websocket"); ws_logger.disabled=True
         local= urlsplit(origin).hostname in ("localhost","127.0.0.1","::1")
-        kwargs={"additional_headers":{"Authorization":"Bearer "+c["deviceKey"],"X-SuperMD-Connector-Hash":_hash(c["connectorKey"]),"X-SuperMD-Display-Name":c["displayName"],"X-SuperMD-Platform":"desktop"},"open_timeout":10,"ping_interval":25,"ping_timeout":15,"close_timeout":3,"max_size":MAX_FRAME,"max_queue":8,"logger":ws_logger,"proxy":None if local else True}
+        kwargs={"additional_headers":{"Authorization":"Bearer "+c["deviceKey"],"X-SuperMD-Connector-Hash":_hash(c["connectorKey"]),"X-SuperMD-Display-Name":c["displayName"],"X-SuperMD-Platform":"desktop","X-SuperMD-Preview-Formats":"png,jpeg"},"open_timeout":10,"ping_interval":25,"ping_timeout":15,"close_timeout":3,"max_size":MAX_FRAME,"max_queue":8,"logger":ws_logger,"proxy":None if local else True}
         if parts.scheme == "https":
             try:
                 from .network_tls import client_context

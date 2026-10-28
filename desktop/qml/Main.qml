@@ -82,8 +82,10 @@ ApplicationWindow {
         const contextValue = {requestId:request.requestId, tabId:request.tabId, action:"get_context", limit:6000}
         if (request.expectedRevision !== undefined) contextValue.expectedRevision = request.expectedRevision
         const contextRequest = JSON.stringify(contextValue)
+        const captureWidth = JSON.stringify(request.width || 1600)
+        const captureFormat = JSON.stringify(request.imageFormat || "png")
         const requestId = JSON.stringify(request.requestId || "")
-        const script = "(function(){const request=" + contextRequest + ";if(typeof window.supermdAgentRequest!=='function'){window.SuperMD?.post(" + requestId + ",'agent_render_bounds',JSON.stringify({requestId:request.requestId,error:'Reader agent hook is unavailable'}));return;}window.supermdAgentRequest(request,function(context,error){if(error){window.SuperMD?.post(request.requestId,'agent_render_bounds',JSON.stringify({requestId:request.requestId,error:error}));return;}window.SuperMD?.post(request.requestId,'agent_render_bounds',JSON.stringify({requestId:request.requestId,tabId:context&&context.tabId,revision:context&&context.revision,width:request.width||1600,context:context}));});})()"
+        const script = "(function(){const request=" + contextRequest + ";if(typeof window.supermdAgentRequest!=='function'){window.SuperMD?.post(" + requestId + ",'agent_render_bounds',JSON.stringify({requestId:request.requestId,error:'Reader agent hook is unavailable'}));return;}window.supermdAgentRequest(request,function(context,error){if(error){window.SuperMD?.post(request.requestId,'agent_render_bounds',JSON.stringify({requestId:request.requestId,error:error}));return;}window.SuperMD?.post(request.requestId,'agent_render_bounds',JSON.stringify({requestId:request.requestId,tabId:context&&context.tabId,revision:context&&context.revision,width:" + captureWidth + ",imageFormat:" + captureFormat + ",context:context}));});})()"
         webView.runJavaScript(script)
     }
     function syncVisibleReaderChrome() {

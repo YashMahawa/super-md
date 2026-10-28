@@ -109,14 +109,7 @@ class AgentRelayClient(private val onState: (State) -> Unit = {}) {
     }
 
     private fun openSocket(current: AgentAccessConfig) {
-        val endpoint = current.serverOrigin.replaceFirst("https://", "wss://") +
-            "/device?groupId=${current.groupId}&deviceId=${current.deviceId}"
-        val request = Request.Builder().url(endpoint)
-            .header("Authorization", "Bearer ${current.deviceKey}")
-            .header("X-SuperMD-Connector-Hash", sha256(current.connectorKey))
-            .header("X-SuperMD-Display-Name", current.displayName.take(80))
-            .header("X-SuperMD-Platform", current.platform)
-            .build()
+        val request = authenticatedWebSocketRequest(current)
         webSocket = client.newWebSocket(request, object : WebSocketListener() {
             override fun onOpen(webSocket: WebSocket, response: Response) {
                 if (stopped) webSocket.close(1000, "Disabled")
@@ -151,6 +144,18 @@ class AgentRelayClient(private val onState: (State) -> Unit = {}) {
         })
     }
 
+    internal fun authenticatedWebSocketRequest(current: AgentAccessConfig): Request {
+        val endpoint = current.serverOrigin.replaceFirst("https://", "wss://") +
+            "/device?groupId=${current.groupId}&deviceId=${current.deviceId}"
+        return Request.Builder().url(endpoint)
+            .header("Authorization", "Bearer ${current.deviceKey}")
+            .header("X-SuperMD-Connector-Hash", sha256(current.connectorKey))
+            .header("X-SuperMD-Display-Name", current.displayName.take(80))
+            .header("X-SuperMD-Platform", current.platform)
+            .header("X-SuperMD-Preview-Formats", "png,jpeg")
+            .build()
+    }
+
     private fun acceptRequest(message: JSONObject, socket: WebSocket) {
         val requestId = message.optString("requestId")
         require(REQUEST_ID.matches(requestId)) { "Invalid request id" }
@@ -177,6 +182,10 @@ class AgentRelayClient(private val onState: (State) -> Unit = {}) {
         require(keys.all { it in RPC_FIELDS }) { "Unknown RPC field" }
         require(REQUEST_ID.matches(request.optString("requestId"))) { "Invalid request id" }
         val action = request.getString("action")
+        if (request.has("imageFormat")) {
+            require(action in setOf("render_tab", "get_diagram_image")) { "imageFormat is only supported for viewport or diagram images" }
+            require(request.getString("imageFormat") in setOf("png", "jpeg")) { "Invalid imageFormat" }
+        }
         if (action in TAB_ACTIONS) require(request.optString("tabId").isNotBlank() && request.optString("tabId").length <= 512) { "tabId is required" }
         if (action in setOf("list_diagrams", "get_diagram", "get_diagram_image", "replace_tab_asset", "asset_action")) require(request.optString("tabId").isNotBlank()) { "tabId is required" }
         if (action in setOf("get_diagram", "get_diagram_image", "list_diagrams", "replace_tab_asset", "asset_action")) require(REVISION.matches(request.optString("expectedRevision"))) { "A current document revision is required" }
@@ -271,6 +280,6 @@ class AgentRelayClient(private val onState: (State) -> Unit = {}) {
         const val MAX_ASSET_BYTES = 1024 * 1024
         const val MAX_ASSET_BASE64 = 1_400_000
         val ASSET_MIMES = setOf("image/png", "image/jpeg", "image/gif", "image/webp", "image/avif", "image/svg+xml")
-        val RPC_FIELDS = setOf("requestId", "action", "tabId", "offset", "limit", "query", "context", "expectedRevision", "operations", "width", "documentAction", "content", "options", "diagramId", "format", "repairIndices", "jobId", "heading", "filename", "windowId", "assetName", "assetPath", "assetAction", "mimeType", "body", "view")
+        val RPC_FIELDS = setOf("requestId", "action", "tabId", "offset", "limit", "query", "context", "expectedRevision", "operations", "width", "imageFormat", "documentAction", "content", "options", "diagramId", "format", "repairIndices", "jobId", "heading", "filename", "windowId", "assetName", "assetPath", "assetAction", "mimeType", "body", "view")
     }
 }

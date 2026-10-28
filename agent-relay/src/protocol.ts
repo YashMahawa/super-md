@@ -17,6 +17,7 @@ export type RpcRequest = {
   expectedRevision?: string;
   operations?: unknown[];
   width?: number;
+  imageFormat?: "png" | "jpeg";
   documentAction?: string;
   content?: string;
   options?: Record<string, unknown>;
@@ -39,7 +40,7 @@ export type RpcRequest = {
 export function validateRpcRequest(value: unknown): RpcRequest {
   if (!value || typeof value !== "object" || Array.isArray(value)) throw new Error("Invalid RPC request");
   const r = value as Record<string, unknown>;
-  const allowed = new Set(["requestId", "action", "deviceId", "tabId", "offset", "limit", "query", "context", "expectedRevision", "operations", "width", "documentAction", "content", "options", "diagramId", "format", "repairIndices", "jobId", "heading", "filename", "windowId", "assetId", "mimeType", "body", "assetName", "assetPath", "assetAction", "view"]);
+  const allowed = new Set(["requestId", "action", "deviceId", "tabId", "offset", "limit", "query", "context", "expectedRevision", "operations", "width", "imageFormat", "documentAction", "content", "options", "diagramId", "format", "repairIndices", "jobId", "heading", "filename", "windowId", "assetId", "mimeType", "body", "assetName", "assetPath", "assetAction", "view"]);
   if (Object.keys(r).some((key) => !allowed.has(key))) throw new Error("Unknown RPC field");
   if (typeof r.requestId !== "string" || !/^[a-zA-Z0-9_-]{1,96}$/.test(r.requestId)) throw new Error("Invalid request id");
   if (typeof r.action !== "string" || !ACTIONS.has(r.action)) throw new Error("Unsupported action");
@@ -64,6 +65,7 @@ export function validateRpcRequest(value: unknown): RpcRequest {
   if (r.assetName !== undefined && (typeof r.assetName !== "string" || Buffer.byteLength(r.assetName) > 256 || !( /^[a-f0-9]{64}$/.test(r.assetName) || /^(?:assets\/)?[A-Za-z0-9._-]{1,150}$/.test(r.assetName) && ![".",".."].includes(r.assetName.split("/").at(-1)!)))) throw new Error("Invalid asset name");
   if (r.assetPath !== undefined && (typeof r.assetPath !== "string" || Buffer.byteLength(r.assetPath) > 4096 || r.assetPath.includes("\0"))) throw new Error("Invalid asset path");
   if (r.view !== undefined && r.view !== "source" && r.view !== "prose") throw new Error("Invalid document view");
+  if (r.imageFormat !== undefined && (!(["render_tab", "get_diagram_image"] as string[]).includes(r.action as string) || (r.imageFormat !== "png" && r.imageFormat !== "jpeg"))) throw new Error("imageFormat is only valid as png or jpeg on viewport or diagram image captures");
   for (const key of ["offset", "limit", "context", "width"] as const) {
     const n = r[key];
     if (n !== undefined && (typeof n !== "number" || !Number.isInteger(n) || n < 0)) throw new Error(`Invalid ${key}`);

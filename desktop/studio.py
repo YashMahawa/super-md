@@ -2622,13 +2622,17 @@ class Studio(QObject):
         width = args.get("width", 1600)
         if not isinstance(width, int) or isinstance(width, bool) or not 64 <= width <= 1600:
             raise ValueError("Viewport width must be between 64 and 1,600 pixels")
+        image_format = args.get("imageFormat", "png")
+        if image_format not in ("png", "jpeg"):
+            raise ValueError("Viewport imageFormat must be png or jpeg")
         if self._agent_viewport_capture is not None:
             raise ValueError("Another viewport capture is already in progress")
         window = self.host_window
         if window is None:
             raise ValueError("The desktop reader window is unavailable")
         pending = {"requestId": request_id, "tabId": tab_id, "revision": revision,
-                   "context": context, "bounds": rect, "width": width, "window": window}
+                   "context": context, "bounds": rect, "width": width,
+                   "imageFormat": image_format, "window": window}
         self._agent_viewport_capture = pending
         try:
             window.frameSwapped.connect(self._agent_viewport_frame_swapped, Qt.ConnectionType.QueuedConnection)
@@ -2708,10 +2712,15 @@ class Studio(QObject):
                 return
             array = QByteArray()
             buffer = QBuffer(array)
-            if not buffer.open(QIODevice.OpenModeFlag.WriteOnly) or not crop.save(buffer, "PNG"):
-                raise ValueError("Could not encode the live viewport as PNG")
+            image_format = pending.get("imageFormat", "png")
+            image_encoder = "JPEG" if image_format == "jpeg" else "PNG"
+            saved = (crop.save(buffer, image_encoder, 90) if image_format == "jpeg"
+                     else crop.save(buffer, image_encoder)) if buffer.open(QIODevice.OpenModeFlag.WriteOnly) else False
+            if not saved:
+                raise ValueError(f"Could not encode the live viewport as {image_encoder}")
             result = dict(pending["context"])
-            result.update({"mime_type": "image/png", "data": base64.b64encode(bytes(array)).decode("ascii"),
+            mime_type = "image/jpeg" if image_format == "jpeg" else "image/png"
+            result.update({"mime_type": mime_type, "data": base64.b64encode(bytes(array)).decode("ascii"),
                            "width": crop.width(), "height": crop.height(), "revision": revision,
                            "tabId": tab_id, "windowId": self.window_id})
             self._clear_agent_viewport_capture(pending)

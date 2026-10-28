@@ -44,4 +44,43 @@ class AgentRelayClientTest {
         }
         assertEquals("asset_action", request().getString("action"))
     }
+
+    @Test fun acceptsViewportImageFormatOnlyForRenderTabAndOnlySupportedEncodings() {
+        val jpeg = JSONObject().put("requestId", "render_1").put("action", "render_tab")
+            .put("tabId", "tab:device:workspace:1").put("imageFormat", "jpeg").put("width", 1000)
+        client.validateRequest(jpeg)
+        client.validateRequest(JSONObject(jpeg.toString()).put("imageFormat", "png"))
+        client.validateRequest(JSONObject(jpeg.toString()).put("action", "get_diagram_image")
+            .put("expectedRevision", revision).put("diagramId", "diagram-1"))
+
+        assertThrows(IllegalArgumentException::class.java) {
+            client.validateRequest(JSONObject(jpeg.toString()).put("imageFormat", "webp"))
+        }
+        assertThrows(IllegalArgumentException::class.java) {
+            client.validateRequest(JSONObject(jpeg.toString()).put("action", "read_tab"))
+        }
+        assertThrows(IllegalArgumentException::class.java) {
+            val missingTab = JSONObject(jpeg.toString())
+            missingTab.remove("tabId")
+            client.validateRequest(missingTab)
+        }
+    }
+
+    @Test fun authenticatedWebSocketAdvertisesSupportedPreviewFormats() {
+        val config = AgentAccessConfig(
+            serverOrigin = "https://relay.example.test",
+            groupId = "group-1",
+            deviceId = "device-1",
+            deviceKey = "device-secret",
+            pairingKey = "pairing-secret",
+            connectorKey = "connector-secret",
+            displayName = "Android",
+            platform = "android",
+        )
+
+        val request = client.authenticatedWebSocketRequest(config)
+        assertEquals("png,jpeg", request.header("X-SuperMD-Preview-Formats"))
+        assertEquals("Bearer device-secret", request.header("Authorization"))
+        assertEquals("https", request.url.scheme)
+    }
 }

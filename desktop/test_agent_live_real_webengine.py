@@ -113,6 +113,41 @@ def _probe(directory: str) -> int:
             raise RuntimeError("Real CLI integration sequence ended before completion")
         key,builder=sequence.pop(0)
         start_call(key,*builder(state.get("row",{})))
+    def start_jpeg_capture():
+        from agent_live import LiveTabClient
+        state["jpeg_done"]=False
+        def capture():
+            try:
+                state["jpeg_result"]=LiveTabClient(bridge.discovery_path).render_tab(
+                    state["second_native_id"],width=640,window_id=studio.window_id,image_format="jpeg")
+            except Exception as error:
+                state["jpeg_error"]=str(error)
+            state["jpeg_done"]=True
+        import threading
+        state["jpeg_thread"]=threading.Thread(target=capture,daemon=True)
+        state["jpeg_thread"].start()
+        QTimer.singleShot(10,poll_jpeg_capture)
+    def poll_jpeg_capture():
+        if not state.get("jpeg_done"):
+            QTimer.singleShot(10,poll_jpeg_capture); return
+        try:
+            if state.get("jpeg_error"):
+                raise RuntimeError(f"JPEG viewport request failed: {state['jpeg_error']}")
+            result=state["jpeg_result"]
+            image=QImage()
+            if result.get("mime_type")!="image/jpeg" or not image.loadFromData(result.get("data",b""),"JPEG"):
+                raise RuntimeError("Requested JPEG viewport did not decode as JPEG")
+            if max(image.width(),image.height())>640 or image.width()<200 or image.height()<100:
+                raise RuntimeError(f"JPEG viewport ignored its 640-pixel bound: {image.width()}x{image.height()}")
+            colors={image.pixelColor(x,y).rgba() for x in range(0,image.width(),16) for y in range(0,image.height(),16)}
+            if len(colors)<2:
+                raise RuntimeError("JPEG viewport image contains no visible reader detail")
+            state["results"]["jpegImageSize"]=[image.width(),image.height()]
+            if studio.active!=state["second_native_id"] or studio.mode!="live":
+                raise RuntimeError("JPEG viewport capture changed the active reader view")
+            start_next()
+        except Exception as error:
+            state["failure"]=str(error); finish(2)
     def on_result(key,result):
         state["results"][key]=result
         if key=="list_initial":
@@ -151,7 +186,7 @@ def _probe(directory: str) -> int:
         elif key=="list_after_patch":
             row=next(row for row in result["tabs"] if row["id"]==state["second_id"]); state["row"]=row
             sequence.extend([
-                ("snapshot",lambda _row:("snapshot",state["second_id"],str(temp/"actual-reader"))),
+                ("snapshot",lambda _row:("snapshot",state["second_id"],str(temp/"actual-reader"),"--width","640")),
                 ("export",lambda row:("export",state["second_id"],"md","--revision",row["revision"])),
                 ("activate_first",lambda _row:("activate",state["first_id"])),
             ])
@@ -160,10 +195,12 @@ def _probe(directory: str) -> int:
             image=QImage(result["path"])
             if image.isNull() or image.width()<200 or image.height()<100:
                 raise RuntimeError(f"Viewport was not captured from the real app: {image.width()}x{image.height()}")
+            if max(image.width(),image.height())>640:
+                raise RuntimeError(f"Viewport ignored the requested 640-pixel bound: {image.width()}x{image.height()}")
             colors={image.pixelColor(x,y).rgba() for x in range(0,image.width(),16) for y in range(0,image.height(),16)}
             if len(colors)<2: raise RuntimeError("Viewport image contains no visible reader detail")
             state["results"]["imageSize"]=[image.width(),image.height()]
-            start_next()
+            start_jpeg_capture()
         elif key=="activate_first":
             if result.get("tabId")!=state["first_native_id"]:
                 raise RuntimeError(f"CLI did not reactivate the first tab: {result}")
@@ -221,6 +258,7 @@ def _probe(directory: str) -> int:
         except Exception: pass
         if code==0:
             print(json.dumps({"ok":True,"steps":list(state["results"]),"imageSize":state["results"].get("imageSize"),
+                              "jpegImageSize":state["results"].get("jpegImageSize"),
                               "exportPath":state["results"].get("export_path")},separators=(",",":")))
         else:
             print(json.dumps({"ok":False,"error":state["failure"]},separators=(",",":")))
@@ -262,6 +300,7 @@ class RealWebEngineAgentRenderTests(unittest.TestCase):
         self.assertIn("activate_second",report["steps"]); self.assertIn("read_first_draft",report["steps"])
         self.assertIn("read_after_undo",report["steps"])
         self.assertGreaterEqual(report["imageSize"][0],200)
+        self.assertLessEqual(max(report["imageSize"]),640)
 
 if __name__=="__main__" and len(sys.argv)>1 and sys.argv[1]=="--probe":
     raise SystemExit(_probe(sys.argv[2]))

@@ -22,7 +22,7 @@ export function neutralChartSvg(element:SVGSVGElement):string {
   copy.removeAttribute('style');return svgImage(new XMLSerializer().serializeToString(copy));
 }
 async function asDataUrl(blob:Blob):Promise<string>{return new Promise((resolve,reject)=>{const reader=new FileReader();reader.onload=()=>resolve(String(reader.result));reader.onerror=()=>reject(Error('Cannot read media bytes'));reader.readAsDataURL(blob);});}
-export async function mediaBytes(media:ExportableMedia,format:'png'|'svg'|'original'|'source'='png',maxDimension=4096):Promise<{body:string;mimeType:string;filename:string;width?:number;height?:number}> {
+export async function mediaBytes(media:ExportableMedia,format:'png'|'jpeg'|'svg'|'original'|'source'='png',maxDimension=4096):Promise<{body:string;mimeType:string;filename:string;width?:number;height?:number}> {
   if(!Number.isInteger(maxDimension)||maxDimension<64||maxDimension>4096)throw Error('Image size must be between 64 and 4096 pixels');
   const filename=media.label.replace(/[\\/:*?"<>|\x00-\x1f]/g,' ').trim().slice(0,100)||'Diagram';
   if(format==='source'){
@@ -45,19 +45,22 @@ export async function mediaBytes(media:ExportableMedia,format:'png'|'svg'|'origi
     const blob=await response.blob();if(blob.size>25_000_000)throw Error('Image exceeds 25 MB');uri=await asDataUrl(blob);
   }
   if(format==='svg'&&!uri.startsWith('data:image/svg+xml'))throw Error('This image has no SVG representation');
-  if(format==='png'){
+  let rasterDimensions:{width:number;height:number}|undefined;
+  if(format==='png'||format==='jpeg'){
     const image=new Image();await new Promise<void>((resolve,reject)=>{image.onload=()=>resolve();image.onerror=()=>reject(Error('Cannot decode media for export'));image.src=uri;});
     const naturalWidth=image.naturalWidth||1200,naturalHeight=image.naturalHeight||800;
     const factor=Math.min(media.svg?2:1,maxDimension/Math.max(naturalWidth,naturalHeight),Math.sqrt(16_000_000/(naturalWidth*naturalHeight)));
     const canvas=document.createElement('canvas');canvas.width=Math.max(1,Math.round(naturalWidth*factor));canvas.height=Math.max(1,Math.round(naturalHeight*factor));
     const context=canvas.getContext('2d');if(!context)throw Error('Cannot create export canvas');
-    context.fillStyle='#fff';context.fillRect(0,0,canvas.width,canvas.height);context.drawImage(image,0,0,canvas.width,canvas.height);uri=canvas.toDataURL('image/png');
+    context.fillStyle='#fff';context.fillRect(0,0,canvas.width,canvas.height);context.drawImage(image,0,0,canvas.width,canvas.height);
+    rasterDimensions={width:canvas.width,height:canvas.height};
+    uri=format==='jpeg'?canvas.toDataURL('image/jpeg',0.9):canvas.toDataURL('image/png');
   }
   const match=/^data:(image\/(?:png|jpeg|gif|webp|avif|svg\+xml));base64,([A-Za-z0-9+/=\r\n]+)$/.exec(uri);
   if(!match)throw Error('Unsupported original image format');
   if(match[2].length>34_000_000)throw Error('Image exceeds 25 MB');
   const extension:Record<string,string>={'image/png':'png','image/jpeg':'jpg','image/gif':'gif','image/webp':'webp','image/avif':'avif','image/svg+xml':'svg'};
-  let dimensions:{width:number;height:number}|undefined;
+  let dimensions=rasterDimensions;
   if(match[1]==='image/png'){
     const header=Uint8Array.from(atob(match[2].slice(0,44)),value=>value.charCodeAt(0));
     if(header.length>=24){const view=new DataView(header.buffer);dimensions={width:view.getUint32(16),height:view.getUint32(20)};}

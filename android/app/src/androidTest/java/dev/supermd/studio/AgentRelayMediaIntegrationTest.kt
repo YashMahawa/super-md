@@ -87,6 +87,32 @@ class AgentRelayMediaIntegrationTest {
                 return result.get()
             }
 
+            val jpegRender = call("render_tab", JSONObject().put("imageFormat", "jpeg").put("width", 1000))
+            assertNull(jpegRender.second)
+            val jpegResult = jpegRender.first as JSONObject
+            assertEquals("image/jpeg", jpegResult.getString("mime_type"))
+            val jpegBytes = Base64.decode(jpegResult.getString("data"), Base64.DEFAULT)
+            assertTrue("Viewport bytes should have JPEG SOI/EOI markers", jpegBytes.size >= 4 &&
+                jpegBytes[0] == 0xff.toByte() && jpegBytes[1] == 0xd8.toByte() &&
+                jpegBytes[jpegBytes.lastIndex - 1] == 0xff.toByte() && jpegBytes.last() == 0xd9.toByte())
+            val jpegBitmap = android.graphics.BitmapFactory.decodeByteArray(jpegBytes, 0, jpegBytes.size)
+            assertNotNull("JPEG capture should decode", jpegBitmap)
+            assertEquals(jpegResult.getInt("width"), jpegBitmap!!.width)
+            assertEquals(jpegResult.getInt("height"), jpegBitmap.height)
+            assertTrue(jpegBitmap.width <= 1000)
+            jpegBitmap.recycle()
+            assertEquals(sha256(note.content), jpegResult.getString("revision"))
+            assertEquals("live reading context should identify the current tab", note.id,
+                jpegResult.getJSONObject("metadata").getString("tabId"))
+
+            val defaultRender = call("render_tab", JSONObject().put("width", 1000))
+            assertNull(defaultRender.second)
+            val pngResult = defaultRender.first as JSONObject
+            assertEquals("image/png", pngResult.getString("mime_type"))
+            val pngBytes = Base64.decode(pngResult.getString("data"), Base64.DEFAULT)
+            assertTrue("Default viewport capture should preserve PNG encoding", pngBytes.size >= 8 &&
+                pngBytes.take(8).map { it.toInt() and 0xff } == listOf(0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a))
+
             val attached = call("asset_action", JSONObject().put("assetAction", "attach")
                 .put("assetName", "assets/model.svg").put("mimeType", "image/svg+xml")
                 .put("body", Base64.encodeToString(modelSvg, Base64.NO_WRAP)).put("expectedRevision", revision))

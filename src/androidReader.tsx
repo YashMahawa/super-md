@@ -587,7 +587,8 @@ function Reader() {
           if(request.expectedRevision!==revision)throw Error('A current expectedRevision is required to retrieve this diagram');
           const diagram=agentDiagrams(note.content).find(item=>item.id===request.diagramId);if(!diagram)throw Error('Diagram not found in this revision');
           if(request.action==='get_diagram')return {...base,...diagramMetadata(note.content,diagram),...agentRead(diagram.source,request.offset,request.limit,undefined,'source')};
-          const image=await mediaBytes(await diagramMedia(diagram,note.path),'png',typeof request.width==='number'?Math.min(1600,Math.max(64,Math.round(request.width))):1600);return {...base,diagramId:diagram.id,mime_type:image.mimeType,data:image.body,width:image.width,height:image.height};
+          const imageFormat=request.action==='get_diagram_image'&&request.imageFormat==='jpeg'?'jpeg':'png';
+          const image=await mediaBytes(await diagramMedia(diagram,note.path),imageFormat,typeof request.width==='number'?Math.min(1600,Math.max(64,Math.round(request.width))):1600);return {...base,diagramId:diagram.id,mime_type:image.mimeType,data:image.body,width:image.width,height:image.height};
         }
         if(request.action==='get_context'){
           const host=document.querySelector<HTMLElement>('.android-reading,.cm-scroller'),bounds=host?.getBoundingClientRect();

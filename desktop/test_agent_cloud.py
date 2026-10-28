@@ -138,6 +138,7 @@ class CloudPairingTests(unittest.TestCase):
             cloud._connect(config)
         tls.assert_called_once()
         self.assertIs(seen["kwargs"]["ssl"],context)
+        self.assertEqual(seen["kwargs"]["additional_headers"]["X-SuperMD-Preview-Formats"],"png,jpeg")
         self.assertTrue(seen["uri"].startswith("wss://relay.example.test/device?"))
 
     def test_revoke_posts_only_device_identity_over_verified_tls_with_bounded_timeout(self):

@@ -225,12 +225,24 @@ Use the exported pairing file to join another trusted device; its own device
 key is generated locally. `list_devices` reports online devices and their open
 tabs. Explicitly choose the device ID when several are connected.
 
+For voice explanations, start with `view_current`. It returns the visible
+Markdown, reading position, diagram references and a compact JPEG viewport in
+one MCP response, without a document-wide diagram search. With one connected
+device and one active tab it needs no arguments. When several devices or active
+windows exist, supply their returned IDs. `width` controls the preview's longest
+edge (64–1600, default 1000); `includeImage:false` returns context only. All
+cloud preview tools default to JPEG; `quality:"high"` requests a larger
+lossless PNG (default edge 1600). The preview preserves the displayed theme; original media and explicit PNG captures
+remain available through the tools below. Context and capture must have the
+same source revision. A moved reading position is reported with the capture so
+an agent can distinguish it from the preceding source context.
+
 `document_action(get_context)` provides the visible Markdown and current reading
 position. `diagram_action(list/source/image)` identifies diagrams and Markdown
-images, fetches bounded source chunks, or returns actual PNG image content.
+images, fetches bounded source chunks, or returns a compact JPEG preview (`quality:"high"` for PNG).
 Asset references stay compact; image/base64 bytes are omitted from ordinary
-reads. `render_tab` returns the current themed viewport as a PNG with position
-metadata. Export supports the GUI's PDF options and returns a job ID; poll it
+reads. `render_tab` returns the current themed viewport as an image with position
+metadata, using the same standard/high-quality choice. Export supports the GUI's PDF options and returns a job ID; poll it
 with `document_action(job_status)`.
 
 `asset_action(list/source/attach)` provides compact embedded-asset metadata,

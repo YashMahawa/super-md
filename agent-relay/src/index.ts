@@ -7,11 +7,12 @@ import { SSEServerTransport } from "@modelcontextprotocol/server-legacy/sse";
 import { toNodeHandler } from "@modelcontextprotocol/node";
 import { z } from "zod";
 import { MAX_FRAME_BYTES, MAX_PENDING, REQUEST_TIMEOUT_MS, validateRpcRequest, validReply, type RpcRequest } from "./protocol.js";
+import { decodeViewportBase64, makeJpegPreview, viewportContexts } from "./preview.js";
 
 type Pending = { resolve: (value: { result?: unknown; error?: string }) => void; timer: NodeJS.Timeout };
 type Device = {
   deviceId: string; displayName: string; platform: "android" | "desktop"; deviceKeyHash: string;
-  socket: WebSocket | null; pending: Map<string, Pending>; lastSeen: number;
+  socket: WebSocket | null; pending: Map<string, Pending>; lastSeen: number; jpegPreview: boolean;
 };
 type Group = { groupId: string; connectorHash: string; pairingHash: string; devices: Map<string, Device> };
 
@@ -102,6 +103,12 @@ function rpc(group: Group, partial: Omit<RpcRequest, "requestId">): Promise<{ re
     catch (error) { clearTimeout(timer); device.pending.delete(requestId); resolve({ error: error instanceof Error ? error.message : "Could not send the request to the app." }); }
   });
 }
+function jpegCaptureRpc(group: Group, partial: Omit<RpcRequest, "requestId" | "action" | "tabId" | "width"> & { action: "render_tab" | "get_diagram_image"; tabId: string; width: number }) {
+  const chosen = chooseDevice(group, partial.deviceId);
+  const device = chosen.device;
+  const imageFormat = device?.jpegPreview ? "jpeg" as const : undefined;
+  return rpc(group, { ...partial, ...(imageFormat ? { imageFormat } : {}) });
+}
 function parseSocketText(raw: RawData): unknown {
   const text = raw.toString();
   if (Buffer.byteLength(text) > MAX_FRAME_BYTES) throw new Error("Relay frame exceeds its limit");
@@ -120,6 +127,20 @@ function imageResult(response: { result?: unknown; error?: string }) {
   if (bytes.length < 8 || bytes.length > 4 * 1024 * 1024 || !bytes.subarray(0, 8).equals(Buffer.from([137,80,78,71,13,10,26,10]))) return textResult({ error: "The app image is not a bounded PNG." }, true);
   const metadata = image.metadata && typeof image.metadata === "object" && Buffer.byteLength(JSON.stringify(image.metadata)) <= 12_000 ? image.metadata : undefined;
   return { content: [{ type: "image" as const, data: bytes.toString("base64"), mimeType: "image/png" }, { type: "text" as const, text: JSON.stringify({ width: image.width, height: image.height, revision: image.revision, metadata }) }] };
+}
+async function jpegImageResult(response: { result?: unknown; error?: string }, width: number) {
+  if (response.error) return textResult({ error: response.error }, true);
+  const image = response.result as Record<string, unknown> | undefined;
+  if (!image || typeof image.revision !== "string" || (image.mime_type !== "image/png" && image.mime_type !== "image/jpeg")) return textResult({ error: "The app returned an invalid viewport image response." }, true);
+  try {
+    const preview = await makeJpegPreview(decodeViewportBase64(image.data), width, image.mime_type, { width: image.width, height: image.height });
+    return { content: [
+      { type: "image" as const, data: preview.data.toString("base64"), mimeType: "image/jpeg" },
+      { type: "text" as const, text: JSON.stringify({ mimeType: "image/jpeg", width: preview.width, height: preview.height, revision: image.revision, previewOnly: true }) },
+    ] };
+  } catch (error) {
+    return textResult({ error: error instanceof Error ? error.message : "Could not create the bounded JPEG viewport preview." }, true);
+  }
 }
 function assetSourceResult(response: { result?: unknown; error?: string }, offset = 0, limit = 12_000) {
   if (response.error) return textResult({ error: response.error }, true);
@@ -169,11 +190,101 @@ function registerTools(server: McpServer, group: Group): void {
   server.registerTool("read_tab", { description: "Read a bounded source or rendered-prose range from an open tab, including its SHA-256 revision.", inputSchema: { deviceId, tabId, view: z.enum(["source","prose"]).optional(), offset: z.number().int().min(0).max(20_000_000).optional(), limit: z.number().int().min(1).max(12_000).optional() } }, async ({ deviceId: selected, tabId: tab, view, offset, limit }) => toolResponse(await rpc(group, { action: "read_tab", deviceId: selected, tabId: tab, view, offset, limit })));
   server.registerTool("search_tab", { description: "Search an open tab and return bounded matches with line context.", inputSchema: { deviceId, tabId, query: z.string().min(1).max(2048), limit: z.number().int().min(1).max(25).optional(), context: z.number().int().min(0).max(500).optional() } }, async ({ deviceId: selected, tabId: tab, query, limit, context }) => toolResponse(await rpc(group, { action: "search_tab", deviceId: selected, tabId: tab, query, limit, context })));
   server.registerTool("patch_tab", { description: "Edit an open tab using bounded source operations. Requires an unchanged SHA-256 revision; stale edits are rejected. With multiple devices connected, deviceId is required.", inputSchema: { deviceId, tabId, expectedRevision: z.string().regex(/^[a-f0-9]{64}$/i), operations: z.array(z.record(z.string(), z.unknown())).min(1).max(100) } }, async ({ deviceId: selected, tabId: tab, expectedRevision, operations }) => toolResponse(await rpc(group, { action: "patch_tab", deviceId: selected, tabId: tab, expectedRevision, operations })));
-  server.registerTool("render_tab", { description: "Render the current reading/editor viewport as an actual bounded PNG MCP image. Supply deviceId when ambiguous.", inputSchema: { deviceId, tabId, width: z.number().int().min(1).max(1600).optional() } }, async ({ deviceId: selected, tabId: tab, width }) => imageResult(await rpc(group, { action: "render_tab", deviceId: selected, tabId: tab, width })));
-  server.registerTool("diagram_action", { description: "List diagrams in an open note, read a diagram's source, or capture a diagram image, guarded by the note's current revision.", inputSchema: { deviceId, tabId, diagramAction: z.enum(["list","source","image"]), diagramId: z.string().min(1).max(128).optional(), expectedRevision: z.string().regex(/^[a-f0-9]{64}$/i), offset: z.number().int().min(0).max(20_000_000).optional(), limit: z.number().int().min(1).max(12_000).optional(), width: z.number().int().min(1).max(1600).optional() } }, async ({ deviceId: selected, tabId: tab, diagramAction, diagramId, expectedRevision, offset, limit, width }) => {
+  server.registerTool("render_tab", { description: "Render the current reading/editor viewport as an MCP image. Standard quality returns a compact JPEG preview; high quality returns the lossless PNG. Supply deviceId when ambiguous.", inputSchema: { deviceId, tabId, width: z.number().int().min(64).max(1600).optional(), quality: z.enum(["standard", "high"]).optional() } }, async ({ deviceId: selected, tabId: tab, width, quality }) => {
+    const selectedQuality = quality ?? "standard";
+    const edge = width ?? (selectedQuality === "high" ? 1600 : 1000);
+    const request = { action: "render_tab" as const, deviceId: selected, tabId: tab, width: edge };
+    return selectedQuality === "high" ? imageResult(await rpc(group, request)) : jpegImageResult(await jpegCaptureRpc(group, request), edge);
+  });
+  server.registerTool("view_current", {
+    description: "Use FIRST to explain the current Super MD reading area. In one call, returns exact reading context and its matching viewport image, including visible source ranges and nearby diagram references.",
+    inputSchema: { deviceId, tabId: tabId.optional(), width: z.number().int().min(64).max(1600).optional(), quality: z.enum(["standard", "high"]).optional(), includeImage: z.boolean().optional() },
+  }, async ({ deviceId: selected, tabId: requestedTab, width, quality, includeImage }) => {
+    const chosen = chooseDevice(group, selected);
+    if (!chosen.device) return textResult({ error: chosen.error }, true);
+    if (!chosen.device.socket || chosen.device.socket.readyState !== WebSocket.OPEN) return textResult({ error: "The selected Super MD device is offline." }, true);
+    const chosenDeviceId = chosen.device.deviceId;
+    const selectedQuality = quality ?? "standard";
+    let tab = requestedTab;
+    if (!tab) {
+      const listed = await rpc(group, { action: "list_tabs", deviceId: chosenDeviceId });
+      if (listed.error) return toolResponse(listed);
+      const value = listed.result as { tabs?: unknown } | unknown[] | undefined;
+      const tabs = Array.isArray(value) ? value : value && Array.isArray(value.tabs) ? value.tabs : [];
+      const validTabs = tabs.filter((item): item is { id: string; active?: boolean } => !!item && typeof item === "object" && typeof (item as Record<string, unknown>).id === "string");
+      const active = validTabs.filter((item) => item.active === true);
+      const target = active.length === 1 ? active[0] : active.length === 0 && validTabs.length === 1 ? validTabs[0] : undefined;
+      if (!target) return textResult({ error: active.length > 1 || validTabs.length > 1 ? "Could not choose a tab safely: provide tabId when multiple tabs are open or active." : "No open tab was returned by the selected device." }, true);
+      tab = target.id;
+    }
+
+    const contextResponse = await rpc(group, { action: "document_action", documentAction: "get_context", deviceId: chosenDeviceId, tabId: tab, options: { limit: 4000 } });
+    if (contextResponse.error) return toolResponse(contextResponse);
+    const context = contextResponse.result as Record<string, unknown> | undefined;
+    if (!context || typeof context.tabId !== "string" || !context.tabId || typeof context.revision !== "string" || !/^[a-f0-9]{64}$/i.test(context.revision)) return textResult({ error: "The app returned invalid reading context for the selected tab." }, true);
+    const readingContext = context.tabId === tab ? context : { ...context, tabId: tab, nativeTabId: context.tabId };
+
+    let previewInfo: { mimeType: "image/jpeg" | "image/png"; width: number; height: number; previewOnly: boolean } | undefined;
+    let previewContent: { type: "image"; data: string; mimeType: string } | undefined;
+    let captureContext: Record<string, unknown> | undefined;
+    let finalReadingContext = readingContext;
+    let readingContextSource: "context_read" | "viewport_capture" = "context_read";
+    let readingContextAlignedWithCapture: boolean | undefined;
+    if (includeImage !== false) {
+      const edge = width ?? (selectedQuality === "high" ? 1600 : 1000);
+      const request = { action: "render_tab" as const, deviceId: chosenDeviceId, tabId: tab, expectedRevision: context.revision, width: edge };
+      const rendered = selectedQuality === "high" ? await rpc(group, request) : await jpegCaptureRpc(group, request);
+      if (rendered.error) return toolResponse(rendered);
+      const image = rendered.result as Record<string, unknown> | undefined;
+      if (!image || image.revision !== context.revision) return textResult({ error: "The reading tab changed while its viewport was being captured; request the current view again." }, true);
+      const checked = selectedQuality === "high" ? imageResult(rendered) : await jpegImageResult(rendered, edge);
+      if ("isError" in checked && checked.isError) return checked;
+      previewContent = checked.content.find((item) => item.type === "image") as { type: "image"; data: string; mimeType: string } | undefined;
+      if (!previewContent) return textResult({ error: "The app returned an invalid viewport image response." }, true);
+      const mimeType = selectedQuality === "high" ? "image/png" as const : "image/jpeg" as const;
+      const checkedInfo = JSON.parse(String(checked.content.find((item) => item.type === "text")?.text ?? "{}")) as Record<string, unknown>;
+      previewInfo = { mimeType, width: Number(checkedInfo.width), height: Number(checkedInfo.height), previewOnly: selectedQuality === "standard" };
+      const capture = viewportContexts(image, tab, context.revision);
+      captureContext = capture.captureContext;
+      if (capture.capturedReadingContext) {
+        finalReadingContext = capture.capturedReadingContext;
+        readingContextSource = "viewport_capture";
+        readingContextAlignedWithCapture = true;
+      } else {
+        const initialReading = readingContext.reading as Record<string, unknown> | undefined;
+        const capturedReading = capture.captureContext.reading as Record<string, unknown> | undefined;
+        if (typeof initialReading?.offset === "number" && typeof capturedReading?.offset === "number") {
+          readingContextAlignedWithCapture = capture.captureContext.contextRevisionMatches === true && initialReading.offset === capturedReading.offset;
+        }
+      }
+    }
+
+    const result = {
+      deviceId: chosenDeviceId,
+      tabId: tab,
+      revision: context.revision,
+      quality: selectedQuality,
+      readingContext: finalReadingContext,
+      readingContextSource,
+      ...(readingContextAlignedWithCapture !== undefined ? { readingContextAlignedWithCapture } : {}),
+      ...(captureContext ? { captureContext } : {}),
+      ...(previewInfo ? { imagePreview: previewInfo } : {}),
+    };
+    const text = JSON.stringify(result);
+    if (Buffer.byteLength(text) > 48 * 1024) return textResult({ error: "The current reading context exceeds the bounded response size." }, true);
+    return { content: [...(previewContent ? [previewContent] : []), { type: "text" as const, text }] };
+  });
+  server.registerTool("diagram_action", { description: "List diagrams, read their source, or capture a diagram image. Standard image quality returns a compact JPEG; high quality returns lossless PNG.", inputSchema: { deviceId, tabId, diagramAction: z.enum(["list","source","image"]), diagramId: z.string().min(1).max(128).optional(), expectedRevision: z.string().regex(/^[a-f0-9]{64}$/i), offset: z.number().int().min(0).max(20_000_000).optional(), limit: z.number().int().min(1).max(12_000).optional(), width: z.number().int().min(64).max(1600).optional(), quality: z.enum(["standard", "high"]).optional() } }, async ({ deviceId: selected, tabId: tab, diagramAction, diagramId, expectedRevision, offset, limit, width, quality }) => {
     const action = diagramAction === "list" ? "list_diagrams" : diagramAction === "source" ? "get_diagram" : "get_diagram_image";
+    if (diagramAction === "image") {
+      const selectedQuality = quality ?? "standard";
+      const edge = width ?? (selectedQuality === "high" ? 1600 : 1000);
+      const request = { action: "get_diagram_image" as const, deviceId: selected, tabId: tab, diagramId, expectedRevision, width: edge };
+      return selectedQuality === "high" ? imageResult(await rpc(group, request)) : jpegImageResult(await jpegCaptureRpc(group, request), edge);
+    }
+    if (quality !== undefined) return textResult({ error: "quality is only supported for diagramAction image." }, true);
     const response = await rpc(group, { action, deviceId: selected, tabId: tab, diagramId, expectedRevision, offset, limit, width });
-    return diagramAction === "image" ? imageResult(response) : toolResponse(response);
+    return toolResponse(response);
   });
   server.registerTool("replace_tab_asset", { description: "Replace a linked asset using a path available to the selected Super MD device. The device restricts reads to its configured asset roots; the relay never reads or stores the file.", inputSchema: { deviceId, tabId, assetName: z.string().min(1).max(256), assetPath: z.string().min(1).max(4096), expectedRevision: z.string().regex(/^[a-f0-9]{64}$/i) } }, async ({ deviceId: selected, tabId: tab, assetName, assetPath, expectedRevision }) => toolResponse(await rpc(group, { action: "replace_tab_asset", deviceId: selected, tabId: tab, assetName, assetPath, expectedRevision })));
   server.registerTool("asset_action", { description: "List embedded assets, retrieve an original image/SVG (SVG source is returned in bounded chunks), or attach model-supplied bytes to a saved portable .smd note. Attachments are limited to 1 MiB and require the note's current source revision; the relay does not read files or fetch URLs.", inputSchema: { deviceId, tabId, assetAction: z.enum(["list", "source", "attach"]), assetName: z.string().min(1).max(256).optional(), mimeType: z.enum(["image/png", "image/jpeg", "image/gif", "image/webp", "image/avif", "image/svg+xml"]).optional(), body: z.string().max(1_400_000).optional(), offset: z.number().int().min(0).max(1_048_576).optional(), limit: z.number().int().min(1).max(12_000).optional(), expectedRevision: z.string().regex(/^[a-f0-9]{64}$/i) } }, async ({ deviceId: selected, tabId: tab, assetAction, assetName, mimeType, body, offset, limit, expectedRevision }) => {
@@ -182,13 +293,21 @@ function registerTools(server: McpServer, group: Group): void {
     if (assetAction === "source") return assetSourceResult(response, offset, limit);
     return toolResponse(response);
   });
-  server.registerTool("document_action", { description: "Read exact reading context, create, export, repair LaTeX, open, save, check an export job, or snapshot through Super MD's native UI. No shell or code execution. PDF options match app controls; choose deviceId when ambiguous.", inputSchema: { deviceId, documentAction: z.enum(["get_context","create","export","latexfix","open","save","snapshot","job_status"]), tabId: tabId.optional(), expectedRevision: z.string().regex(/^[a-f0-9]{64}$/i).optional(), operations: z.array(z.record(z.string(), z.unknown())).max(100).optional(), content: z.string().max(60_000).optional(), options: exportOptions.extend({format:z.enum(["pdf","smd","md"]).optional(),repairIndices:z.array(z.number().int().min(0)).max(40).optional(),filename:z.string().max(256).optional(),jobId:z.string().max(128).optional(),limit:z.number().int().min(1).max(500).optional()}).optional() } }, async ({ deviceId: selected, documentAction, tabId: tab, expectedRevision, operations, content, options }) => {
+  server.registerTool("document_action", { description: "Read exact reading context, create, export, repair LaTeX, open, save, check an export job, or snapshot through Super MD's native UI. Snapshot defaults to JPEG at 1000 pixels; set options.quality to high for lossless PNG at 1600 pixels. options.width overrides the edge from 64 to 1600 pixels. No shell or code execution. PDF options match app controls; choose deviceId when ambiguous.", inputSchema: { deviceId, documentAction: z.enum(["get_context","create","export","latexfix","open","save","snapshot","job_status"]), tabId: tabId.optional(), expectedRevision: z.string().regex(/^[a-f0-9]{64}$/i).optional(), operations: z.array(z.record(z.string(), z.unknown())).max(100).optional(), content: z.string().max(60_000).optional(), options: exportOptions.extend({format:z.enum(["pdf","smd","md"]).optional(),repairIndices:z.array(z.number().int().min(0)).max(40).optional(),filename:z.string().max(256).optional(),jobId:z.string().max(128).optional(),limit:z.number().int().min(1).max(500).optional(),width:z.number().int().min(64).max(1600).optional(),quality:z.enum(["standard","high"]).optional()}).optional() } }, async ({ deviceId: selected, documentAction, tabId: tab, expectedRevision, operations, content, options }) => {
     const jobId = options?.jobId;
+    if (documentAction === "snapshot") {
+      if (!tab) return textResult({ error: "tabId is required for snapshot." }, true);
+      const quality = options?.quality ?? "standard";
+      const width = options?.width ?? (quality === "high" ? 1600 : 1000);
+      const request = { action: "render_tab" as const, deviceId: selected, tabId: tab, expectedRevision, width };
+      return quality === "high" ? imageResult(await rpc(group, request)) : jpegImageResult(await jpegCaptureRpc(group, request), width);
+    }
+    if (options?.quality !== undefined || options?.width !== undefined) return textResult({ error: "Snapshot width and quality options are only supported for documentAction snapshot." }, true);
     const response = await rpc(group, { action: "document_action", deviceId: selected, documentAction, tabId: tab, expectedRevision, operations, content, jobId, options });
-    return documentAction === "snapshot" ? imageResult(response) : toolResponse(response);
+    return toolResponse(response);
   });
 }
-function buildServer(group: Group): McpServer { const mcp = new McpServer({ name: "super-md-live", version: "0.1.0" }); registerTools(mcp, group); return mcp; }
+function buildServer(group: Group): McpServer { const mcp = new McpServer({ name: "super-md-live", version: "0.2.0" }); registerTools(mcp, group); return mcp; }
 
 const modernHandler = createMcpHandler((ctx) => {
   const path = new URL(ctx.requestInfo!.url).pathname.split("/");
@@ -223,13 +342,13 @@ app.post("/device/enroll", hostGuard, express.json({ limit: "8kb", strict: true 
   if (previous && !equalSecret(previous.deviceKeyHash, deviceKeyHash)) {
     rejectPending(previous, "The device credentials were replaced by the pairing owner.");
     previous.socket?.close(4003, "Device credentials replaced");
-    group.devices.set(deviceId, { deviceId, displayName, platform, deviceKeyHash, socket: null, pending: new Map(), lastSeen: Date.now() });
+    group.devices.set(deviceId, { deviceId, displayName, platform, deviceKeyHash, socket: null, pending: new Map(), lastSeen: Date.now(), jpegPreview: false });
   } else if (previous) {
     previous.displayName = displayName;
     previous.platform = platform;
     previous.lastSeen = Date.now();
   } else {
-    group.devices.set(deviceId, { deviceId, displayName, platform, deviceKeyHash, socket: null, pending: new Map(), lastSeen: Date.now() });
+    group.devices.set(deviceId, { deviceId, displayName, platform, deviceKeyHash, socket: null, pending: new Map(), lastSeen: Date.now(), jpegPreview: false });
   }
   res.status(200).json({ groupId });
 });
@@ -305,11 +424,13 @@ function safeHeader(value: string | string[] | undefined, max: number): string {
   const text = Array.isArray(value) ? value[0] ?? "" : value ?? "";
   return text.replace(/[\u0000-\u001f\u007f]/g, "").trim().slice(0, max);
 }
-wss.on("connection", (ws: WebSocket, _req: IncomingMessage, groupId: string, deviceId: string) => {
+wss.on("connection", (ws: WebSocket, req: IncomingMessage, groupId: string, deviceId: string) => {
   const group = groups.get(groupId), device = group?.devices.get(deviceId);
   if (!group || !device) { ws.close(1008, "Device registration expired"); return; }
   if (device.socket && device.socket !== ws) device.socket.close(4001, "Reconnected elsewhere");
   device.socket = ws;
+  const previewFormats = safeHeader(req.headers["x-supermd-preview-formats"], 64).split(",").map((value) => value.trim().toLowerCase());
+  device.jpegPreview = previewFormats.includes("jpeg");
   device.lastSeen = Date.now();
   ws.on("message", (raw: RawData) => {
     try {
@@ -322,7 +443,12 @@ wss.on("connection", (ws: WebSocket, _req: IncomingMessage, groupId: string, dev
     } catch { ws.close(1008, "Invalid device message"); }
   });
   ws.on("close", () => {
-    if (device.socket === ws) { device.socket = null; device.lastSeen = Date.now(); rejectPending(device, "The app disconnected before replying."); }
+    if (device.socket === ws) {
+      device.socket = null;
+      device.jpegPreview = false;
+      device.lastSeen = Date.now();
+      rejectPending(device, "The app disconnected before replying.");
+    }
   });
   ws.on("error", () => { /* close handler clears pending requests */ });
   sendJson(ws, { type: "registered", groupId, deviceId });

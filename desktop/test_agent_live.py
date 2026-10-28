@@ -136,6 +136,7 @@ class LiveDesktopBridgeTests(unittest.TestCase):
         self.session.windows[self.window_id] = self.studio
         self.bridge = agent_live.create_qt_bridge(self.session, Path(self.temp.name))
         self.discovery = self.bridge.start()
+        self.render_formats = []
         self.studio.agentRequest.connect(self._handle_qml_request)
         self.client = agent_live.LiveTabClient(self.bridge.discovery_path)
 
@@ -184,6 +185,7 @@ class LiveDesktopBridgeTests(unittest.TestCase):
             self.studio.tabs[0]["content"] = updated
             self._finish(request, {"revision": hashlib.sha256(updated.encode()).hexdigest(), "changed": True})
         elif action == "render_tab":
+            self.render_formats.append(request.get("imageFormat", "png"))
             png = base64.b64decode("iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+/lS8AAAAASUVORK5CYII=")
             self._finish(request, {"mime_type": "image/png", "data": base64.b64encode(png).decode(),
                                    "width": 1, "height": 1,
@@ -271,6 +273,9 @@ class LiveDesktopBridgeTests(unittest.TestCase):
             self.active_id, 64, window_id=self.window_id))
         self.assertEqual(image["mime_type"], "image/png")
         self.assertTrue(image["data"].startswith(b"\x89PNG\r\n\x1a\n"))
+        self.assertEqual(self.render_formats, ["png"])
+        with self.assertRaisesRegex(agent_live.LiveBridgeError, "image_format must be png or jpeg"):
+            self.client.render_tab(self.active_id, image_format="webp")
 
     def test_live_listing_preserves_native_tabs_and_updates_active_revision(self):
         self.studio.live_source = self.source

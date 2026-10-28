@@ -315,10 +315,14 @@ class LiveTabClient:
         return self._call("patch_tab", tabId=tab_id, expectedRevision=expected_revision, operations=operations,
                           **self._window_params(window_id))
 
-    def render_tab(self, tab_id: str, width: int = 1600, window_id: str | None = None) -> dict[str, Any]:
+    def render_tab(self, tab_id: str, width: int = 1600, window_id: str | None = None,
+                   image_format: str = "png") -> dict[str, Any]:
         if not isinstance(width, int) or isinstance(width, bool) or not 64 <= width <= 1600:
             raise LiveBridgeError("width must be between 64 and 1,600 pixels")
-        return self._call("render_tab", tabId=tab_id, width=width, **self._window_params(window_id))
+        if image_format not in ("png", "jpeg"):
+            raise LiveBridgeError("image_format must be png or jpeg")
+        return self._call("render_tab", tabId=tab_id, width=width, imageFormat=image_format,
+                          **self._window_params(window_id))
 
 
 def _qt_bridge_class():
@@ -533,12 +537,18 @@ def _qt_bridge_class():
                 return result
             if action in ("read_tab", "search_tab", "patch_tab", "render_tab", "list_diagrams", "get_diagram", "get_diagram_image", "replace_tab_asset", "asset_action"):
                 payload.update({"tabId": raw_tab_id, "windowId": window_id})
-                for external, internal in (("expectedRevision", "expectedRevision"), ("operations", "operations"),
+                forwarded_fields = (("expectedRevision", "expectedRevision"), ("operations", "operations"),
                                            ("offset", "offset"), ("limit", "limit"), ("query", "query"),
-                                           ("context", "context"), ("width", "width"), ("diagramId", "diagramId"),
+                                           ("context", "context"), ("width", "width"),
+                                           ("diagramId", "diagramId"),
                                            ("assetName", "assetName"), ("assetPath", "assetPath"),
                                            ("assetAction", "assetAction"), ("mimeType", "mimeType"), ("body", "body"),
-                                           ("view", "view")):
+                                           ("view", "view"))
+                if action == "render_tab":
+                    forwarded_fields += (("imageFormat", "imageFormat"),)
+                elif action == "get_diagram_image":
+                    forwarded_fields += (("imageFormat", "imageFormat"),)
+                for external, internal in forwarded_fields:
                     if external in message:
                         payload[internal] = message[external]
                 return self._remote_call_gui(payload)
@@ -655,6 +665,11 @@ def _qt_bridge_class():
                 width = payload.get("width", 1600)
                 if not isinstance(width, int) or isinstance(width, bool) or not 64 <= width <= 1600:
                     raise ValueError("width must be between 64 and 1,600 pixels")
+                if payload.get("imageFormat", "png") not in ("png", "jpeg"):
+                    raise ValueError("imageFormat must be png or jpeg")
+            elif action == "get_diagram_image":
+                if payload.get("imageFormat", "png") not in ("png", "jpeg"):
+                    raise ValueError("imageFormat must be png or jpeg")
             elif action == "get_tab_image":
                 asset_name, revision = payload.get("assetName"), payload.get("expectedRevision")
                 if not isinstance(asset_name, str) or not asset_name or len(asset_name) > 256:

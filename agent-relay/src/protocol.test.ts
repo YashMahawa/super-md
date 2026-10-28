@@ -25,4 +25,9 @@ test("device RPC schema rejects unknown fields, oversized ranges and stale-write
   assert.throws(()=>validateRpcRequest({...inline,mimeType:"text/html"}),/Unsupported image type/);
   assert.throws(()=>validateRpcRequest({...inline,assetName:"assets/../model.png"}),/Invalid asset name/);
   assert.throws(()=>validateRpcRequest({...inline,assetAction:"source",assetName:undefined,body:undefined}),/source requires assetName/);
+  assert.equal(validateRpcRequest({ requestId: "jpeg", action: "render_tab", tabId: "tab:1", imageFormat: "jpeg" }).imageFormat, "jpeg");
+  assert.equal(validateRpcRequest({ requestId: "png", action: "render_tab", tabId: "tab:1", imageFormat: "png" }).imageFormat, "png");
+  assert.equal(validateRpcRequest({ requestId: "diagram_jpeg", action: "get_diagram_image", tabId: "tab:1", diagramId: "diagram:0", expectedRevision: "a".repeat(64), imageFormat: "jpeg" }).imageFormat, "jpeg");
+  assert.throws(() => validateRpcRequest({ ...base, imageFormat: "jpeg" }), /only valid.*captures/);
+  assert.throws(() => validateRpcRequest({ requestId: "bad_format", action: "render_tab", tabId: "tab:1", imageFormat: "webp" }), /only valid.*captures/);
 });

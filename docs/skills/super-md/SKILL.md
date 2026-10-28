@@ -12,6 +12,25 @@ connector URLs, discovery records, and pairing files out of messages and logs.
 
 ## Start with what the user is reading
 
+For cloud voice conversations, call `view_current` **first** when the connected
+server exposes it. With one device and one active tab, `view_current({})`
+returns the current visible Markdown, reading position, diagram references and
+a compact viewport image in one tool response. Supply `deviceId` or `tabId`
+only when needed to disambiguate; reuse identifiers already returned. The JPEG
+is a model preview, not an original diagram or export. Its default longest edge
+is 1000 pixels; request 800 for a quicker overview or up to 1600 for small text.
+Use `includeImage:false` when the visible source alone is enough. Set
+`quality:"high"` only when a larger lossless PNG is needed; ordinary cloud
+`render_tab` and diagram-image requests also default to JPEG previews.
+
+Do not list every diagram or fetch every SVG to explain the current screen.
+Start explaining from this combined result, then fetch only a relevant diagram
+reference when its original source or more detail is needed. Reuse inventories
+while the source revision is unchanged; never reuse a stale revision for edits.
+If a remote image has not been loaded with the user's consent, report that once
+instead of retrying the same failed pixel request. Older relays without
+`view_current` use the context/viewport tools below.
+
 | Task | Local MCP | Cloud MCP |
 |---|---|---|
 | Discover devices/tabs | `document_action(action="list_devices")`, `list_sessions()` | `list_devices()`, `list_tabs(deviceId)` |
@@ -21,7 +40,7 @@ connector URLs, discovery records, and pairing files out of messages and logs.
 | Search | `document_search(path=TARGET, query)` | `search_tab(deviceId, tabId, query)` |
 | Diagram inventory | `document_action(action="list_diagrams", path=TARGET)` | `diagram_action(deviceId, tabId, diagramAction="list", expectedRevision=REV)` |
 | Original SVG/Mermaid/chart block source | `document_action(action="get_diagram", path=TARGET, diagram_id=ID, expected_revision=REV)` | `diagram_action(deviceId, tabId, diagramAction="source", diagramId=ID, expectedRevision=REV)` |
-| Diagram rendered as PNG | `document_view(path=TARGET, diagram_id=ID, expected_revision=REV)` | `diagram_action(deviceId, tabId, diagramAction="image", diagramId=ID, expectedRevision=REV)` |
+| Diagram rendered as an image | `document_view(path=TARGET, diagram_id=ID, expected_revision=REV)` | `diagram_action(deviceId, tabId, diagramAction="image", diagramId=ID, expectedRevision=REV)` |
 
 `TARGET` is the complete returned `tab:…` target, not a filename guessed from its
 title. Cloud calls use the returned `tabId` and an explicit `deviceId` when
@@ -30,9 +49,9 @@ several devices are online. Re-list after a tab closes or a device reconnects.
 For “explain what I am looking at”, read context and take a viewport screenshot.
 Use the returned visible source offsets to fetch exact Markdown if needed;
 visible text alone is not necessarily exact Markdown. Fetch the relevant
-diagram's source for reasoning/editing and its PNG for visual inspection. A
+diagram's source for reasoning/editing and its preview for visual inspection. A
 viewport screenshot shows the current theme, zoom and scroll position; a
-diagram PNG shows that diagram alone. Neither is a substitute for original
+diagram preview shows that diagram alone. Neither is a substitute for original
 editable SVG/Mermaid source.
 
 Request only relevant pages and media. Ordinary reads omit large fenced SVG

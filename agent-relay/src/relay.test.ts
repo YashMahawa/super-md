@@ -7,8 +7,10 @@ import { setTimeout as delay } from "node:timers/promises";
 import { fileURLToPath } from "node:url";
 import WebSocket from "ws";
 import { Client, StreamableHTTPClientTransport, SSEClientTransport } from "@modelcontextprotocol/client";
+import sharp from "sharp";
 
-const png = Buffer.from("iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+/p9sAAAAASUVORK5CYII=", "base64");
+const png = await sharp({ create: { width: 1600, height: 900, channels: 3, background: { r: 245, g: 246, b: 248 } } }).png().toBuffer();
+const jpeg = await sharp(png).jpeg({ quality: 90, mozjpeg: false, chromaSubsampling: "4:4:4" }).toBuffer();
 const token = () => randomBytes(32).toString("base64url");
 const sha = (v: string) => createHash("sha256").update(v).digest("hex");
 const revision = "b".repeat(64);
@@ -50,7 +52,7 @@ test("relay auth, bounded device RPC, Streamable HTTP, legacy SSE and disconnect
 
   const ws = new WebSocket("ws://" + host + "/device?groupId=" + groupId + "&deviceId=" + deviceId, {
     headers: { authorization: "Bearer " + deviceKey, "x-supermd-connector-hash": connectorHash,
-      "x-supermd-display-name": "Test Android", "x-supermd-platform": "android" },
+      "x-supermd-display-name": "Test Android", "x-supermd-platform": "android", "x-supermd-preview-formats": "png,jpeg" },
   });
   const firstRegistered = new Promise<void>((resolve, reject) => {
     const timer = setTimeout(() => reject(new Error("registration timeout")), 2000);
@@ -59,15 +61,38 @@ test("relay auth, bounded device RPC, Streamable HTTP, legacy SSE and disconnect
   await once(ws, "open");
   await firstRegistered;
   let dropNext = false;
+  let fastTabs: unknown[] | undefined;
+  let fastContext: Record<string, unknown> | undefined;
+  let fastCaptureContext: Record<string, unknown> | undefined;
+  let fastImageMetadata: Record<string, unknown> | undefined;
+  let fastImageMimeOverride: string | undefined;
+  let fastImageDataFormat: "image/png" | "image/jpeg" | undefined;
+  let fastSnapshotRevision: string | undefined;
+  let fastCaptureError: string | undefined;
+  let fastRpcCounts = { list_tabs: 0, get_context: 0, render_tab: 0, list_diagrams: 0 };
+  const fastRequests: Record<string, unknown>[] = [];
   ws.on("message", (raw) => {
     const request = JSON.parse(raw.toString()) as Record<string, unknown>;
     if (request.type !== "request") return;
+    fastRequests.push(request);
     if (dropNext) { dropNext = false; ws.close(); return; }
     const tabId = "tab:" + deviceId + ":main:1";
     let result: unknown;
-    if (request.action === "list_tabs") result = { tabs: [{ id: tabId, name: "Untitled.md", revision, saved: false }] };
+    if (request.action === "list_tabs") { fastRpcCounts.list_tabs++; result = { tabs: fastTabs ?? [{ id: tabId, name: "Untitled.md", revision, saved: false }] }; }
     else if (request.action === "read_tab") result = { tabId, text: "# Live\\ncontent", revision, offset: 0 };
-    else if (request.action === "render_tab") result = { mime_type: "image/png", data: png.toString("base64"), width: 1, height: 1, revision, metadata: {reading:{offset:123,heading:"Current section"}} };
+    else if (request.action === "render_tab") {
+      fastRpcCounts.render_tab++;
+      if (fastCaptureError) { ws.send(JSON.stringify({ type: "reply", requestId: request.requestId, error: fastCaptureError })); return; }
+      const useJpeg = request.imageFormat === "jpeg";
+      const dataFormat = fastImageDataFormat ?? (useJpeg ? "image/jpeg" : "image/png");
+      result = { ...(fastCaptureContext ?? {}), mime_type: fastImageMimeOverride ?? (useJpeg ? "image/jpeg" : "image/png"), data: (dataFormat === "image/jpeg" ? jpeg : png).toString("base64"), width: 1600, height: 900, revision: fastSnapshotRevision ?? revision, metadata: fastImageMetadata ?? { tabId, mode: "reading", reading: { offset: 123, heading: "Current section" }, selection: { text: "" } } };
+    }
+    else if (request.action === "get_diagram_image") { const useJpeg = request.imageFormat === "jpeg"; result = { mime_type: useJpeg ? "image/jpeg" : "image/png", data: (useJpeg ? jpeg : png).toString("base64"), width: 1600, height: 900, revision }; }
+    else if (request.action === "document_action" && request.documentAction === "get_context") {
+      fastRpcCounts.get_context++;
+      result = fastContext ?? { tabId: request.tabId, revision, mode: "reading", reading: { offset: 123, heading: "Current section", visibleText: "Visible text" }, visibleSource: { text: "# Exact source", start: 120, end: 140 }, diagrams: [{ id: "diagram:124", kind: "mermaid", sourceStart: 124, sourceEnd: 136 }] };
+    }
+    else if (request.action === "list_diagrams") { fastRpcCounts.list_diagrams++; result = { tabId: request.tabId, revision, diagrams: [] }; }
     else if (request.action === "asset_action" && request.assetAction === "list") result = { tabId: request.tabId, revision, assets: [{ name: "assets/original.svg", mimeType: "image/svg+xml", bytes: 32, sha256: "c".repeat(64) }] };
     else if (request.action === "asset_action" && request.assetAction === "source") {
       const bytes = request.assetName === "assets/original.png" ? png : Buffer.from(request.assetName === "assets/unicode.svg" ? "<svg>猫🧭a</svg>" : "<svg xmlns='http://www.w3.org/2000/svg'/>");
@@ -85,12 +110,18 @@ test("relay auth, bounded device RPC, Streamable HTTP, legacy SSE and disconnect
   await http.connect(httpTransport);
   t.after(async () => { await http.close().catch(() => undefined); await httpTransport.close().catch(() => undefined); });
   const list = await http.listTools();
-  assert.deepEqual(list.tools.map((x) => x.name).sort(), ["asset_action", "diagram_action", "document_action", "list_devices", "list_tabs", "patch_tab", "read_tab", "render_tab", "replace_tab_asset", "search_tab"].sort());
+  assert.deepEqual(list.tools.map((x) => x.name).sort(), ["asset_action", "diagram_action", "document_action", "list_devices", "list_tabs", "patch_tab", "read_tab", "render_tab", "replace_tab_asset", "search_tab", "view_current"].sort());
   const devices = await http.callTool({ name: "list_devices", arguments: {} });
   assert.match(String(devices.content?.[0]?.type === "text" ? devices.content[0].text : ""), /Test Android/);
   assert.match(String(devices.content?.[0]?.type === "text" ? devices.content[0].text : ""), /Untitled\.md/);
   const diagram = await http.callTool({ name: "diagram_action", arguments: { deviceId, tabId: "tab:" + deviceId + ":main:1", diagramAction: "source", diagramId: "diagram:0", expectedRevision: revision, offset: 0, limit: 100 } });
   assert.equal(diagram.isError, undefined);
+  const diagramSourceWithQuality = await http.callTool({ name: "diagram_action", arguments: { deviceId, tabId: "tab:" + deviceId + ":main:1", diagramAction: "source", diagramId: "diagram:0", expectedRevision: revision, quality: "high" } });
+  assert.equal(diagramSourceWithQuality.isError, true, "quality options are reserved for image actions");
+  const diagramImage = await http.callTool({ name: "diagram_action", arguments: { deviceId, tabId: "tab:" + deviceId + ":main:1", diagramAction: "image", diagramId: "diagram:0", expectedRevision: revision } });
+  assert.equal(diagramImage.content?.[0]?.type === "image" ? diagramImage.content[0].mimeType : "", "image/jpeg", "diagram images return standard JPEG by default");
+  assert.equal(fastRequests.find((request) => request.action === "get_diagram_image")?.imageFormat, "jpeg");
+  assert.equal(fastRequests.find((request) => request.action === "get_diagram_image")?.width, 1000);
   const mediaTab = "tab:" + deviceId + ":main:1";
   const assetList = await http.callTool({ name: "asset_action", arguments: { deviceId, tabId: mediaTab, assetAction: "list", expectedRevision: revision } });
   assert.match(String(assetList.content?.[0]?.type === "text" ? assetList.content[0].text : ""), /assets\/original\.svg/);
@@ -110,29 +141,221 @@ test("relay auth, bounded device RPC, Streamable HTTP, legacy SSE and disconnect
   assert.match(String(attached.content?.[0]?.type === "text" ? attached.content[0].text : ""), /assets\/model\.png/);
   const read = await http.callTool({ name: "read_tab", arguments: { deviceId, tabId: "tab:" + deviceId + ":main:1", limit: 100 } });
   assert.match(String(read.content?.[0]?.type === "text" ? read.content[0].text : ""), /Live/);
-  const image = await http.callTool({ name: "render_tab", arguments: { deviceId, tabId: "tab:" + deviceId + ":main:1", width: 500 } });
+  const image = await http.callTool({ name: "render_tab", arguments: { deviceId, tabId: "tab:" + deviceId + ":main:1" } });
   assert.equal(image.content?.[0]?.type, "image");
-  assert.match(String(image.content?.[1]?.type === "text" ? image.content[1].text : ""), /Current section/);
+  assert.equal(image.content?.[0]?.type === "image" ? image.content[0].mimeType : "", "image/jpeg", "render_tab returns standard JPEG by default");
+  assert.match(String(image.content?.[1]?.type === "text" ? image.content[1].text : ""), /"revision"/);
+  assert.equal(fastRequests.filter((request) => request.action === "render_tab").at(-1)?.width, 1000);
+  const highImage = await http.callTool({ name: "render_tab", arguments: { deviceId, tabId: mediaTab, quality: "high", width: 640 } });
+  assert.equal(highImage.content?.[0]?.type === "image" ? highImage.content[0].mimeType : "", "image/png", "high quality preserves lossless PNG");
+  assert.equal(fastRequests.filter((request) => request.action === "render_tab").at(-1)?.imageFormat, undefined, "high quality requests native PNG without imageFormat");
+  assert.equal(fastRequests.filter((request) => request.action === "render_tab").at(-1)?.width, 640, "explicit width overrides the high-quality default edge");
+  const highDiagramImage = await http.callTool({ name: "diagram_action", arguments: { deviceId, tabId: mediaTab, diagramAction: "image", diagramId: "diagram:0", expectedRevision: revision, quality: "high" } });
+  assert.equal(highDiagramImage.content?.[0]?.type === "image" ? highDiagramImage.content[0].mimeType : "", "image/png");
+  assert.equal(fastRequests.filter((request) => request.action === "get_diagram_image").at(-1)?.imageFormat, undefined);
+  assert.equal(fastRequests.filter((request) => request.action === "get_diagram_image").at(-1)?.width, 1600);
+  fastRpcCounts = { list_tabs: 0, get_context: 0, render_tab: 0, list_diagrams: 0 };
+  fastRequests.length = 0;
+  fastTabs = [{ id: mediaTab, active: true }, { id: "tab:other", active: false }];
+  const currentView = await http.callTool({ name: "view_current", arguments: { width: 777 } });
+  assert.equal(currentView.isError, undefined);
+  assert.equal(currentView.content?.[0]?.type, "image", "view_current returns the MCP viewport image first");
+  assert.equal(currentView.content?.[0]?.type === "image" ? currentView.content[0].mimeType : "", "image/jpeg", "view_current returns a compact JPEG preview");
+  assert.equal(currentView.content?.[0]?.type === "image" ? Buffer.from(currentView.content[0].data, "base64").subarray(0, 2).toString("hex") : "", "ffd8");
+  const currentViewText = JSON.parse(String(currentView.content?.[1]?.type === "text" ? currentView.content[1].text : "{}"));
+  assert.equal(currentViewText.deviceId, deviceId);
+  assert.equal(currentViewText.tabId, mediaTab);
+  assert.equal(currentViewText.revision, revision);
+  assert.equal(currentViewText.readingContext.visibleSource.text, "# Exact source");
+  assert.equal(currentViewText.readingContext.diagrams[0].id, "diagram:124");
+  assert.deepEqual(currentViewText.imagePreview, { mimeType: "image/jpeg", width: 777, height: 437, previewOnly: true });
+  assert.equal(currentViewText.readingContext.nativeTabId, undefined, "Android's already-qualified tab id is preserved without native id rewriting");
+  assert.equal(currentViewText.readingContextSource, "context_read", "Android capture metadata without source retains the separate context read");
+  assert.equal(currentViewText.captureContext.reading.offset, 123, "Android position metadata reports where the PNG was captured");
+  assert.equal(currentViewText.captureContext.tabId, mediaTab);
+  assert.equal(currentViewText.readingContextAlignedWithCapture, true);
+  assert.equal(fastRequests.find((request) => request.documentAction === "get_context")?.options && (fastRequests.find((request) => request.documentAction === "get_context")?.options as Record<string, unknown>).limit, 4000, "native context limit is passed in document options");
+  assert.equal(fastRequests.find((request) => request.action === "render_tab")?.imageFormat, "jpeg", "view_current requests client-side JPEG capture");
+  assert.deepEqual(fastRpcCounts, { list_tabs: 1, get_context: 1, render_tab: 1, list_diagrams: 0 }, "fast path reads context and screenshot without diagram inventory RPCs");
+  assert.equal(fastRequests.find((request) => request.action === "render_tab")?.width, 777);
+  assert.equal(fastRequests.find((request) => request.action === "render_tab")?.expectedRevision, revision);
+  assert.equal(fastRequests.filter((request) => request.action === "document_action").length, 1);
+
+  const highCurrentView = await http.callTool({ name: "view_current", arguments: { deviceId, tabId: mediaTab, quality: "high" } });
+  assert.equal(highCurrentView.isError, undefined);
+  assert.equal(highCurrentView.content?.[0]?.type === "image" ? highCurrentView.content[0].mimeType : "", "image/png");
+  const highCurrentText = JSON.parse(String(highCurrentView.content?.[1]?.type === "text" ? highCurrentView.content[1].text : "{}"));
+  assert.equal(highCurrentText.quality, "high");
+  assert.equal(highCurrentText.imagePreview.previewOnly, false);
+  assert.equal(fastRequests.filter((request) => request.action === "render_tab").at(-1)?.width, 1600);
+  assert.equal(fastRequests.filter((request) => request.action === "render_tab").at(-1)?.imageFormat, undefined);
+
+  const snapshotStandard = await http.callTool({ name: "document_action", arguments: { deviceId, documentAction: "snapshot", tabId: mediaTab } });
+  assert.equal(snapshotStandard.content?.[0]?.type === "image" ? snapshotStandard.content[0].mimeType : "", "image/jpeg", "document snapshot defaults to standard JPEG");
+  assert.equal(fastRequests.filter((request) => request.action === "render_tab").at(-1)?.width, 1000);
+  assert.equal(fastRequests.filter((request) => request.action === "render_tab").at(-1)?.imageFormat, "jpeg");
+  const snapshotHigh = await http.callTool({ name: "document_action", arguments: { deviceId, documentAction: "snapshot", tabId: mediaTab, expectedRevision: revision, options: { quality: "high" } } });
+  assert.equal(snapshotHigh.content?.[0]?.type === "image" ? snapshotHigh.content[0].mimeType : "", "image/png", "high document snapshot opts into lossless PNG");
+  assert.equal(fastRequests.filter((request) => request.action === "render_tab").at(-1)?.width, 1600);
+  assert.equal(fastRequests.filter((request) => request.action === "render_tab").at(-1)?.imageFormat, undefined);
+  const snapshotHighSized = await http.callTool({ name: "document_action", arguments: { deviceId, documentAction: "snapshot", tabId: mediaTab, options: { quality: "high", width: 900 } } });
+  assert.equal(snapshotHighSized.content?.[0]?.type === "image" ? snapshotHighSized.content[0].mimeType : "", "image/png");
+  assert.equal(fastRequests.filter((request) => request.action === "render_tab").at(-1)?.width, 900);
+  const jobStatus = await http.callTool({ name: "document_action", arguments: { deviceId, documentAction: "job_status", options: { jobId: "job-1" } } });
+  assert.equal(jobStatus.isError, undefined, "non-snapshot document actions retain their existing RPC route");
+  assert.equal(fastRequests.at(-1)?.action, "document_action");
+  assert.equal(fastRequests.at(-1)?.documentAction, "job_status");
+
+  const qualifiedDesktopTab = "window:desktop-window:note-17";
+  fastContext = { tabId: "note-17", revision, mode: "reading", reading: { offset: 123 }, visibleSource: { text: "Desktop source", start: 120, end: 140 }, diagrams: [] };
+  fastRpcCounts = { list_tabs: 0, get_context: 0, render_tab: 0, list_diagrams: 0 };
+  fastRequests.length = 0;
+  const desktopView = await http.callTool({ name: "view_current", arguments: { deviceId, tabId: qualifiedDesktopTab } });
+  assert.equal(desktopView.isError, undefined, "trusted desktop dispatch may return its native raw tab id");
+  const desktopContext = JSON.parse(String(desktopView.content?.[1]?.type === "text" ? desktopView.content[1].text : "{}"));
+  assert.equal(desktopContext.tabId, qualifiedDesktopTab);
+  assert.equal(desktopContext.readingContext.tabId, qualifiedDesktopTab);
+  assert.equal(desktopContext.readingContext.nativeTabId, "note-17");
+  assert.equal(fastRequests.filter((request) => request.action === "list_tabs").length, 0, "an explicit qualified tab avoids discovery");
+  assert.equal(fastRequests.find((request) => request.action === "render_tab")?.width, 1000, "the omitted width uses the default capture size");
+  fastContext = undefined;
+
+  fastContext = { tabId: "note-17", revision, mode: "reading", reading: { offset: 10, heading: "Before scroll" }, visibleSource: { text: "Source from first context read", start: 10, end: 100, total_chars: 1000, next_offset: 100 } };
+  fastCaptureContext = { tabId: "note-17", revision, mode: "reading", zoom: 125, reading: { offset: 900, heading: "After scroll" }, selection: { text: "selected after scroll" }, viewport: { x: 0, y: 90, width: 800, height: 600 }, visibleSource: { text: "Source captured after scroll", start: 900, end: 1000, total_chars: 1000, next_offset: null }, diagrams: [{ id: "diagram:925", kind: "mermaid", sourceStart: 925, sourceEnd: 950, sourceChars: 25, preview: "graph TD; A-->B" }] };
+  const movedView = await http.callTool({ name: "view_current", arguments: { deviceId, tabId: qualifiedDesktopTab } });
+  assert.equal(movedView.isError, undefined);
+  const movedContext = JSON.parse(String(movedView.content?.[1]?.type === "text" ? movedView.content[1].text : "{}"));
+  assert.equal(movedContext.readingContextSource, "viewport_capture", "same-revision captures prefer their own full visible source");
+  assert.equal(movedContext.readingContext.reading.offset, 900);
+  assert.equal(movedContext.readingContext.visibleSource.text, "Source captured after scroll");
+  assert.equal(movedContext.readingContext.visibleSource.next_offset, null);
+  assert.equal(movedContext.readingContext.diagrams[0].id, "diagram:925");
+  assert.equal(movedContext.captureContext.reading.offset, 900);
+  assert.equal(movedContext.captureContext.sourceRange.start, 900);
+  assert.equal(movedContext.captureContext.nativeTabId, "note-17");
+  assert.equal(movedContext.readingContextAlignedWithCapture, true);
+  fastContext = undefined;
+  fastCaptureContext = undefined;
+
+  fastContext = { tabId: mediaTab, revision, reading: { offset: 123 }, visibleSource: { text: "Before scroll source", start: 123, end: 200 } };
+  fastImageMetadata = { tabId: mediaTab, reading: { offset: 456, heading: "Scrolled during capture" }, selection: { text: "" } };
+  const androidMovedView = await http.callTool({ name: "view_current", arguments: { deviceId, tabId: mediaTab } });
+  assert.equal(androidMovedView.isError, undefined);
+  const androidMoved = JSON.parse(String(androidMovedView.content?.[1]?.type === "text" ? androidMovedView.content[1].text : "{}"));
+  assert.equal(androidMoved.readingContextSource, "context_read", "Android retains its source response when capture metadata has no source text");
+  assert.equal(androidMoved.readingContext.reading.offset, 123);
+  assert.equal(androidMoved.captureContext.reading.offset, 456);
+  assert.equal(androidMoved.readingContextAlignedWithCapture, false, "same revision does not hide scroll movement between context and capture");
+  fastContext = undefined;
+  fastImageMetadata = undefined;
+
+  fastRpcCounts = { list_tabs: 0, get_context: 0, render_tab: 0, list_diagrams: 0 };
+  fastContext = { tabId: mediaTab, revision: "invalid-revision" };
+  const malformedContext = await http.callTool({ name: "view_current", arguments: { deviceId, tabId: mediaTab } });
+  assert.equal(malformedContext.isError, true);
+  assert.equal(fastRpcCounts.render_tab, 0, "invalid context revisions are rejected before viewport capture");
+  fastContext = { revision };
+  const missingContextTab = await http.callTool({ name: "view_current", arguments: { deviceId, tabId: mediaTab } });
+  assert.equal(missingContextTab.isError, true, "context requires a nonempty native tab id");
+  fastContext = undefined;
+
+  fastRpcCounts = { list_tabs: 0, get_context: 0, render_tab: 0, list_diagrams: 0 };
+  fastTabs = [{ id: "tab:first", active: true }, { id: "tab:second", active: true }];
+  const ambiguousTab = await http.callTool({ name: "view_current", arguments: { deviceId } });
+  assert.equal(ambiguousTab.isError, true);
+  assert.equal(fastRpcCounts.get_context, 0, "ambiguous active tabs are rejected before context reads");
+  assert.equal(fastRpcCounts.render_tab, 0);
+
+  fastTabs = undefined;
+  fastSnapshotRevision = "c".repeat(64);
+  const staleView = await http.callTool({ name: "view_current", arguments: { deviceId, tabId: mediaTab } });
+  assert.equal(staleView.isError, true, "a snapshot from a changed revision is rejected");
+  assert.match(String(staleView.content?.[0]?.type === "text" ? staleView.content[0].text : ""), /changed while its viewport/);
+  fastSnapshotRevision = undefined;
+  fastCaptureError = "Viewport capture failed clearly";
+  fastRequests.length = 0;
+  const captureFailure = await http.callTool({ name: "view_current", arguments: { deviceId, tabId: mediaTab } });
+  assert.equal(captureFailure.isError, true);
+  assert.match(String(captureFailure.content?.[0]?.type === "text" ? captureFailure.content[0].text : ""), /Viewport capture failed clearly/);
+  assert.equal(fastRequests.filter((request) => request.action === "render_tab").length, 1, "unrelated capture failures are not retried as PNG fallback");
+  fastCaptureError = undefined;
+
+  fastImageMimeOverride = "image/jpeg";
+  fastImageDataFormat = "image/png";
+  const forgedMime = await http.callTool({ name: "view_current", arguments: { deviceId, tabId: mediaTab } });
+  assert.equal(forgedMime.isError, true, "a forged JPEG MIME type over PNG bytes is rejected");
+  assert.match(String(forgedMime.content?.[0]?.type === "text" ? forgedMime.content[0].text : ""), /MIME type does not match/);
+  fastImageMimeOverride = undefined;
+  fastImageDataFormat = undefined;
+
+  fastRpcCounts = { list_tabs: 0, get_context: 0, render_tab: 0, list_diagrams: 0 };
+  const contextOnly = await http.callTool({ name: "view_current", arguments: { deviceId, tabId: mediaTab, includeImage: false } });
+  assert.equal(contextOnly.content?.some((item) => item.type === "image"), false);
+  assert.equal(fastRpcCounts.get_context, 1);
+  assert.equal(fastRpcCounts.list_tabs, 0, "an explicit tab skips discovery even without an image");
+  assert.equal(fastRpcCounts.render_tab, 0, "context-only requests do not issue a PNG capture RPC");
   const stale = await http.callTool({ name: "patch_tab", arguments: { deviceId, tabId: "tab:" + deviceId + ":main:1", expectedRevision: revision, operations: [{ type: "replace", old: "Live", new: "New" }] } });
   assert.equal(stale.isError, true);
 
   const secondId = randomUUID(), secondKey = token();
   assert.equal((await enroll(pairingKey, connectorKey, groupId, secondId, secondKey, "Test Desktop", "desktop")).status, 200);
-  const second = new WebSocket("ws://" + host + "/device?groupId=" + groupId + "&deviceId=" + secondId, {
-    headers: { authorization: "Bearer " + secondKey, "x-supermd-connector-hash": connectorHash,
-      "x-supermd-display-name": "Test Desktop", "x-supermd-platform": "desktop" },
-  });
-  const secondRegistered = new Promise<void>((resolve, reject) => {
-    const timer = setTimeout(() => reject(new Error("second device registration timeout")), 2000);
-    second.once("message", (raw) => { clearTimeout(timer); try { assert.equal(JSON.parse(raw.toString()).deviceId, secondId); resolve(); } catch (e) { reject(e); } });
-  });
-  await once(second, "open");
-  await secondRegistered;
-  second.on("message", (raw) => {
+  let second!: WebSocket;
+  const secondRequests: Record<string, unknown>[] = [];
+  const secondTab = "tab:second";
+  const attachSecondHandler = (socket: WebSocket) => socket.on("message", (raw) => {
     const request = JSON.parse(raw.toString()) as Record<string, unknown>;
-    if (request.type === "request") second.send(JSON.stringify({ type: "reply", requestId: request.requestId, result: [{ deviceId: secondId, tabId: "tab:second", revision }] }));
+    if (request.type !== "request") return;
+    secondRequests.push(request);
+    const result = request.action === "list_tabs" ? { tabs: [{ id: secondTab, active: true }] }
+      : request.action === "document_action" && request.documentAction === "get_context"
+        ? { tabId: request.tabId, revision, mode: "reading", reading: { offset: 1 }, visibleSource: { text: "Legacy source", start: 1, end: 20 } }
+        : request.action === "render_tab"
+          ? { mime_type: request.imageFormat === "jpeg" ? "image/jpeg" : "image/png", data: (request.imageFormat === "jpeg" ? jpeg : png).toString("base64"), width: 1600, height: 900, revision, metadata: { tabId: request.tabId, reading: { offset: 1 } } }
+          : { accepted: true };
+    socket.send(JSON.stringify({ type: "reply", requestId: request.requestId, result }));
   });
+  const connectSecond = async (previewFormats?: string) => {
+    second = new WebSocket("ws://" + host + "/device?groupId=" + groupId + "&deviceId=" + secondId, {
+      headers: { authorization: "Bearer " + secondKey, "x-supermd-connector-hash": connectorHash,
+        "x-supermd-display-name": "Test Desktop", "x-supermd-platform": "desktop",
+        ...(previewFormats ? { "x-supermd-preview-formats": previewFormats } : {}) },
+    });
+    const registered = new Promise<void>((resolve, reject) => {
+      const timer = setTimeout(() => reject(new Error("second device registration timeout")), 2000);
+      second.once("message", (raw) => { clearTimeout(timer); try { assert.equal(JSON.parse(raw.toString()).deviceId, secondId); resolve(); } catch (e) { reject(e); } });
+    });
+    await once(second, "open");
+    await registered;
+    attachSecondHandler(second);
+  };
+  await connectSecond();
   t.after(() => second.close());
+  const legacyPreview = await http.callTool({ name: "view_current", arguments: { deviceId: secondId, tabId: secondTab } });
+  assert.equal(legacyPreview.isError, undefined);
+  const legacyRender = secondRequests.find((request) => request.action === "render_tab");
+  assert.equal(legacyRender?.imageFormat, undefined, "legacy connections receive no unknown imageFormat field");
+  assert.equal(second.readyState, WebSocket.OPEN, "legacy PNG requests do not disconnect the device");
+  assert.equal(legacyPreview.content?.[0]?.type === "image" ? legacyPreview.content[0].mimeType : "", "image/jpeg", "legacy PNG capture is converted by the server");
+  const legacySocketClosed = once(second, "close");
+  second.close(1000, "Reconnect with JPEG capability");
+  await legacySocketClosed;
+  await connectSecond("png,jpeg");
+  secondRequests.length = 0;
+  const capablePreview = await http.callTool({ name: "view_current", arguments: { deviceId: secondId, tabId: secondTab } });
+  assert.equal(capablePreview.isError, undefined);
+  assert.equal(secondRequests.find((request) => request.action === "render_tab")?.imageFormat, "jpeg", "capability is refreshed from the current authenticated connection");
+  const beforeAmbiguousView = { ...fastRpcCounts };
+  const ambiguousDeviceView = await http.callTool({ name: "view_current", arguments: {} });
+  assert.equal(ambiguousDeviceView.isError, true, "view_current requires an explicit device when multiple are online");
+  assert.deepEqual(fastRpcCounts, beforeAmbiguousView, "ambiguous device selection stops before any context or capture RPC");
+  const unknownDeviceView = await http.callTool({ name: "view_current", arguments: { deviceId: randomUUID(), tabId: "unknown-tab" } });
+  assert.equal(unknownDeviceView.isError, true, "unknown devices fail before context reads");
+  assert.deepEqual(fastRpcCounts, beforeAmbiguousView);
+  const offlineDeviceId = randomUUID();
+  assert.equal((await enroll(pairingKey, connectorKey, groupId, offlineDeviceId, token(), "Offline Device", "desktop")).status, 200);
+  const offlineView = await http.callTool({ name: "view_current", arguments: { deviceId: offlineDeviceId, tabId: "offline-tab" } });
+  assert.equal(offlineView.isError, true);
+  assert.match(String(offlineView.content?.[0]?.type === "text" ? offlineView.content[0].text : ""), /device is offline/);
   const ambiguousWrite = await http.callTool({ name: "patch_tab", arguments: { tabId: "tab:one", expectedRevision: revision, operations: [{ type: "replace", old: "x", new: "y" }] } });
   assert.equal(ambiguousWrite.isError, true, "writes require a selected device when multiple devices are connected");
   const ambiguousRead = await http.callTool({ name: "list_tabs", arguments: {} });

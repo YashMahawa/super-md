@@ -235,7 +235,8 @@ class MainActivity : ComponentActivity() {
     }
     internal fun agentRevision(value: String): String = MessageDigest.getInstance("SHA-256")
         .digest(value.toByteArray(Charsets.UTF_8)).joinToString("") { "%02x".format(it) }
-    internal suspend fun captureAgentViewport(reader: WebView, requestedWidth: Int): JSONObject {
+    internal suspend fun captureAgentViewport(reader: WebView, requestedWidth: Int, imageFormat: String = "png"): JSONObject {
+        require(imageFormat in setOf("png", "jpeg")) { "Unsupported viewport image format" }
         check(Build.VERSION.SDK_INT >= 26) { "Viewport snapshots require Android 8 or newer" }
         check(reader.width > 0 && reader.height > 0 && reader.isAttachedToWindow) { "The live reading viewport is unavailable" }
         val context = kotlinx.coroutines.suspendCancellableCoroutine<JSONObject> { continuation ->
@@ -271,7 +272,9 @@ class MainActivity : ComponentActivity() {
         try {
             while (true) {
                 val output = ByteArrayOutputStream()
-                check(finalBitmap.compress(Bitmap.CompressFormat.PNG, 100, output)) { "Could not encode the viewport image" }
+                val format = if (imageFormat == "jpeg") Bitmap.CompressFormat.JPEG else Bitmap.CompressFormat.PNG
+                val quality = if (imageFormat == "jpeg") 90 else 100
+                check(finalBitmap.compress(format, quality, output)) { "Could not encode the viewport image" }
                 encoded = output.toByteArray()
                 if (encoded.size <= 3_500_000 || finalBitmap.width <= 480) break
                 val next = Bitmap.createScaledBitmap(finalBitmap, (finalBitmap.width * .8f).toInt().coerceAtLeast(1), (finalBitmap.height * .8f).toInt().coerceAtLeast(1), true)
@@ -281,7 +284,8 @@ class MainActivity : ComponentActivity() {
             check(encoded.size <= 3_500_000) { "The reading viewport image exceeds the safe transfer limit" }
             val note = model.state.value.active
             val revision = context.optString("revision", agentRevision(note.content))
-            return JSONObject().put("mime_type", "image/png").put("data", android.util.Base64.encodeToString(encoded, android.util.Base64.NO_WRAP))
+            val mimeType = if (imageFormat == "jpeg") "image/jpeg" else "image/png"
+            return JSONObject().put("mime_type", mimeType).put("data", android.util.Base64.encodeToString(encoded, android.util.Base64.NO_WRAP))
                 .put("width", finalBitmap.width).put("height", finalBitmap.height).put("revision", revision)
                 .put("metadata", JSONObject().put("tabId", context.optString("tabId", "tab:${agentConfigForThisWindow()?.deviceId ?: "local"}:$workspaceKey:${note.id}"))
                     .put("mode", context.optString("mode", model.state.value.mode)).put("zoom", context.optDouble("zoom", model.state.value.zoom.toDouble()))
@@ -569,7 +573,7 @@ private object NoMotionScheme : MotionScheme {
                         else withSelectedTab { activity.dispatchAgentRequest(web!!, request, reply) }
                     }
                 }
-                "render_tab" -> withSelectedTab { runCatching { activity.captureAgentViewport(web!!, request.optInt("width", 1200)) }.onSuccess { reply(it, null) }.onFailure { reply(null, it.message ?: "Could not capture the reading viewport") } }
+                "render_tab" -> withSelectedTab { runCatching { activity.captureAgentViewport(web!!, request.optInt("width", 1200), request.optString("imageFormat", "png")) }.onSuccess { reply(it, null) }.onFailure { reply(null, it.message ?: "Could not capture the reading viewport") } }
                 "get_diagram", "get_diagram_image", "list_diagrams" -> withSelectedTab { activity.dispatchAgentRequest(web!!, request, reply) }
                 "replace_tab_asset" -> withSelectedTab {
                     val flush = JSONObject(request.toString()).put("action", "flush_current")

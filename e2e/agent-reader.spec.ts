@@ -91,6 +91,17 @@ test('live reader serves bounded exact diagram source, visible context and revis
   expect(flowImage.mime_type).toBe('image/png');
   expect(flowImage.width).toBeGreaterThan(0);expect(flowImage.height).toBeGreaterThan(0);
   expect(Buffer.from(flowImage.data,'base64').subarray(0,8)).toEqual(Buffer.from([137,80,78,71,13,10,26,10]));
+  const flowJpeg:any=await agent(page,{action:'get_diagram_image',tabId:state.id,diagramId:flow.id,
+    expectedRevision:context.revision,imageFormat:'jpeg',width:640});
+  expect(flowJpeg.mime_type).toBe('image/jpeg');
+  expect(flowJpeg.width).toBeGreaterThan(0);expect(flowJpeg.height).toBeGreaterThan(0);
+  expect(Math.max(flowJpeg.width,flowJpeg.height)).toBeLessThanOrEqual(640);
+  const jpeg=Buffer.from(flowJpeg.data,'base64');expect(jpeg.subarray(0,3)).toEqual(Buffer.from([0xff,0xd8,0xff]));
+  const decodedJpeg=await page.evaluate(async body=>{const image=new Image();image.src='data:image/jpeg;base64,'+body;await image.decode();return [image.naturalWidth,image.naturalHeight];},flowJpeg.data);
+  expect(decodedJpeg).toEqual([flowJpeg.width,flowJpeg.height]);
+  const sourceAfterImage:any=await agent(page,{action:'get_diagram',tabId:state.id,diagramId:flow.id,
+    expectedRevision:context.revision,offset:0,limit:12000});
+  expect(sourceAfterImage.text).toBe(mermaid);
   expect(await page.locator('.android-reading').evaluate(element=>element.scrollTop)).toBe(before);
 
   // Let a real CodeMirror keystroke enter the native edit queue, then ask the

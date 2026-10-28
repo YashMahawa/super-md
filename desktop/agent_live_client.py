@@ -108,9 +108,9 @@ class MultiSessionLiveClient:
         client, local_id, window_id = self._route(tab_id)
         return client.patch_tab(local_id, expected_revision=expected_revision, operations=operations, window_id=window_id)
 
-    def render_tab(self, tab_id: str, width: int = 1600) -> dict[str, Any]:
+    def render_tab(self, tab_id: str, width: int = 1600, image_format: str = "png") -> dict[str, Any]:
         client, local_id, window_id = self._route(tab_id)
-        return client.render_tab(local_id, width=width, window_id=window_id)
+        return client.render_tab(local_id, width=width, image_format=image_format, window_id=window_id)
 
     def get_tab_image(self, tab_id: str, *, asset_name: str, expected_revision: str):
         client, local_id, window_id = self._route(tab_id)

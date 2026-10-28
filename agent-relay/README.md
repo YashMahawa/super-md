@@ -15,8 +15,14 @@ supported for connection probes.
 
 ## Tools
 
-The MCP server publishes ten focused tools:
+The MCP server publishes eleven focused tools:
 
+- `view_current` is the first call for voice explanations: current source context,
+  position and a compact JPEG viewport arrive together. It selects a sole active
+  tab safely, or accepts explicit device/tab IDs. Preview widths are bounded
+  (default 1000), originals remain unchanged, and `includeImage:false` skips
+  pixels. JPEG-capable apps send the compact preview directly; older apps keep
+  their PNG capture and the relay converts the response in memory.
 - `list_devices` shows paired device display names, platforms, connection
   status, last-seen time and current tabs for connected devices.
 - `list_tabs`, `read_tab`, `search_tab`, `patch_tab` and `render_tab` work with
@@ -36,7 +42,8 @@ The MCP server publishes ten focused tools:
 Tab IDs are globally qualified by the app. If more than one device is online,
 reads without a `deviceId` return an ambiguity error; mutations always require
 an explicit device in that case. `render_tab`, diagram images and the snapshot
-action return actual bounded PNG image content blocks. Desktop window identity
+action return bounded JPEG previews by default. Pass `quality:"high"` for a
+lossless PNG; the default maximum edge increases from 1000 to 1600. Desktop window identity
 travels in the bounded `windowId` field; Android tabs use their app-instance ID.
 
 ## Pairing and secrets
