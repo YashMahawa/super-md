@@ -191,14 +191,15 @@ jobs:
         shell: bash
         run: |
           if [ "$RUNNER_OS" = Windows ]; then
-            desktop/dist/super-md/super-md.exe --version
-          python desktop/check_bundled_python.py desktop/dist/super-md/super-md.exe
-            desktop/dist/super-md/_internal/resources/desktop/smd-engine.exe doctor
+            binary=desktop/dist/super-md/super-md.exe
+          elif [ "$RUNNER_OS" = macOS ]; then
+            binary="desktop/dist/Super MD.app/Contents/MacOS/super-md"
           else
-            desktop/dist/super-md/super-md --version
-          if [ "$RUNNER_OS" = macOS ]; then python desktop/check_bundled_python.py desktop/dist/super-md/super-md; fi
-            desktop/dist/super-md/_internal/resources/desktop/smd-engine doctor
+            binary=desktop/dist/super-md/super-md
           fi
+          "$binary" --version
+          if [ "$RUNNER_OS" != Linux ]; then python desktop/check_bundled_python.py "$binary"; fi
+          "$binary" doctor
       - name: Recover the packaged reader after an isolated renderer failure
         if: runner.os == 'Linux'
         timeout-minutes: 4
@@ -209,7 +210,13 @@ jobs:
           QT_QPA_PLATFORM: offscreen
         run: |
           version=$(node -p 'require("./package.json").version')
-          if [ "$RUNNER_OS" = Windows ]; then binary=desktop/dist/super-md/super-md.exe; else binary=desktop/dist/super-md/super-md; fi
+          if [ "$RUNNER_OS" = Windows ]; then
+            binary=desktop/dist/super-md/super-md.exe
+          elif [ "$RUNNER_OS" = macOS ]; then
+            binary="desktop/dist/Super MD.app/Contents/MacOS/super-md"
+          else
+            binary=desktop/dist/super-md/super-md
+          fi
           python desktop/check_packaged.py "$binary" "$version" --graphics software
 
   browser:
