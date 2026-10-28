@@ -193,7 +193,7 @@ jobs:
         run: |
           digest="$(python scripts/python_wheel_identity.py desktop/requirements.txt desktop/requirements-build.txt desktop/requirements-agent.txt)"
           echo "digest=$digest" >> "$GITHUB_OUTPUT"
-      - uses: actions/cache@v4
+      - uses: actions/cache/restore@v4
         id: python-wheels
         with:
           path: ${{ runner.temp }}/supermd-python-wheels
@@ -205,6 +205,12 @@ jobs:
         run: |
           python scripts/prepare_python_wheelhouse.py "$WHEELHOUSE" desktop/requirements-build.txt desktop/requirements.txt desktop/requirements-build.txt desktop/requirements-agent.txt
           echo "wheel_cache_hit=${{ steps.python-wheels.outputs.cache-hit }}"
+      # Preserve the validated wheelhouse even if a later UI/package check fails.
+      - uses: actions/cache/save@v4
+        if: steps.python-wheels.outputs.cache-hit != 'true'
+        with:
+          path: ${{ runner.temp }}/supermd-python-wheels
+          key: python-wheelhouse-v3-${{ steps.python-wheel-identity.outputs.digest }}
       - run: python -m unittest scripts.test_prepare_python_wheelhouse
       - name: Install Windows installer compiler
         if: runner.os == 'Windows'

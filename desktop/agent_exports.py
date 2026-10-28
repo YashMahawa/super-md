@@ -7,6 +7,7 @@ import json
 import os
 import re
 import subprocess
+import sys
 import tempfile
 import urllib.parse
 from pathlib import Path
@@ -63,7 +64,8 @@ def find_engine(explicit: str | os.PathLike[str] | None = None) -> Path:
         raise AgentDocumentError("Native export engine is not a file")
     executable = "smd-engine.exe" if os.name == "nt" else "smd-engine"
     desktop_dir = Path(__file__).resolve().parent
-    candidates = (desktop_dir / executable, desktop_dir.parent / "smd-core" / "target" / "release" / executable,
+    packaged = (Path(sys._MEIPASS) / "resources" / "desktop" / executable,) if getattr(sys, "frozen", False) else ()
+    candidates = (*packaged, desktop_dir / executable, desktop_dir.parent / "smd-core" / "target" / "release" / executable,
                   desktop_dir.parent / "smd-core" / "target" / "debug" / executable)
     for candidate in candidates:
         if candidate.is_file():

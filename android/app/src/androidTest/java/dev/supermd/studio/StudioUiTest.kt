@@ -169,6 +169,7 @@ class StudioUiTest {
             javascriptUntil("document.querySelector('.cm-content')?.textContent==='Start here.'",{it=="true"})
             compose.onNodeWithContentDescription("More actions").performClick()
             compose.onNodeWithText("Settings").performClick()
+            compose.onNodeWithContentDescription("Expand Appearance · Custom theme").performClick()
             compose.onNodeWithText("Theme authoring guide").performScrollTo().performClick()
             javascriptUntil("!!document.querySelector('.theme-guide-dialog .markdown-body h1')",{it=="true"})
             javascriptUntil("(()=>{const b=[...document.querySelectorAll('.theme-guide-dialog button')].find(b=>b.textContent==='Copy guide');if(b)b.click();return true})()",{it=="true"})
@@ -1015,7 +1016,12 @@ ax.set_title("Matplotlib 3D figure")
                 val bytes=compose.activity.contentResolver.openInputStream(uri)!!.use { it.readBytes() }
                 when(format) {
                     "md" -> assertEquals(content,String(bytes,Charsets.UTF_8))
-                    "smd" -> assertTrue(String(bytes,Charsets.UTF_8).startsWith("{\"format\":\"supermd-smd\""))
+                    "smd" -> {
+                        assertTrue("Portable SMD must use the gzip wire header", bytes.size >= 2 &&
+                            bytes[0] == 0x1f.toByte() && bytes[1] == 0x8b.toByte())
+                        assertEquals(content, MediaStorage(compose.activity).portableMarkdown(
+                            java.io.ByteArrayInputStream(bytes)))
+                    }
                     "pdf" -> assertTrue(bytes.copyOfRange(0,5).contentEquals("%PDF-".toByteArray(Charsets.US_ASCII)))
                 }
             }

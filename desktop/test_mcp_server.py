@@ -275,7 +275,7 @@ class OfficialMCPClientTest(unittest.IsolatedAsyncioTestCase):
             note = root / "notes.md"
             svg = "<svg>" + ("<path/>" * 1000) + "</svg>"
             source = "# Protocol proof\n```svg\n" + svg + "\n```\n"
-            note.write_text(source, encoding="utf-8")
+            note.write_bytes(source.encode("utf-8"))
             server_script = Path(__file__).with_name("agent_cli.py")
             params = StdioServerParameters(command=sys.executable,
                                            args=[str(server_script), "mcp", "--root", str(root)])

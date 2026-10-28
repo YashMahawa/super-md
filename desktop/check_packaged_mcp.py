@@ -14,7 +14,7 @@ async def verify(binary: Path) -> None:
     with tempfile.TemporaryDirectory(prefix="supermd-packaged-mcp-") as directory:
         root = Path(directory)
         note = root / "protocol.md"
-        note.write_text("# Packaged protocol check\n\nMCP is alive.\n", encoding="utf-8")
+        note.write_bytes(b"# Packaged protocol check\n\nMCP is alive.\n")
         params = StdioServerParameters(command=str(binary), args=["agent", "mcp", "--root", str(root)])
         async with Client(params) as client:
             tools = await client.list_tools()
@@ -27,6 +27,13 @@ async def verify(binary: Path) -> None:
                 raise RuntimeError(f"Packaged MCP inspect failed: {detail}")
             if result.structured_content.get("characters") != len(note.read_text(encoding="utf-8")):
                 raise RuntimeError("Packaged MCP returned incorrect document metadata")
+            for format, filename, magic in (("smd", "Protocol portable.smd", b"\x1f\x8b"), ("pdf", "Protocol print.pdf", b"%PDF-")):
+                exported = await client.call_tool("document_action", {"action":"export", "path":note.name, "format":format, "output_path":filename})
+                if exported.is_error:
+                    detail = exported.content[0].text if exported.content else "no tool output"
+                    raise RuntimeError(f"Packaged MCP {format} export failed: {detail}")
+                if not (root / filename).read_bytes().startswith(magic):
+                    raise RuntimeError(f"Packaged MCP returned invalid {format} bytes")
 
 
 def main() -> int:

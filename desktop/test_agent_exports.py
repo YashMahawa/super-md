@@ -14,6 +14,14 @@ from documents import open_note
 
 
 class AgentExportsTest(unittest.TestCase):
+    def test_frozen_export_engine_is_resolved_from_bundled_resources(self):
+        import sys
+        from unittest.mock import patch
+        engine = self.root / "resources" / "desktop" / ("smd-engine.exe" if os.name == "nt" else "smd-engine")
+        engine.parent.mkdir(parents=True);engine.write_bytes(b"test executable")
+        with patch.object(sys, "frozen", True, create=True), patch.object(sys, "_MEIPASS", str(self.root), create=True):
+            self.assertEqual(find_engine(), engine)
+
     @classmethod
     def setUpClass(cls):
         cls.engine = find_engine()
@@ -41,7 +49,7 @@ class AgentExportsTest(unittest.TestCase):
     def test_pack_md_to_smd_preserves_markdown_and_local_svg_bytes(self):
         svg = "<svg xmlns='http://www.w3.org/2000/svg'><text>Export λ</text></svg>".encode("utf-8")
         (self.root / "diagram.svg").write_bytes(svg)
-        (self.root / "source.md").write_text("# Export\n\n![diagram](diagram.svg)\n", encoding="utf-8")
+        (self.root / "source.md").write_bytes(b"# Export\n\n![diagram](diagram.svg)\n")
         result = export_smd(self.store, "source.md", "portable.smd", engine=self.engine)
         markdown, assets, portable = open_note(self.root / "portable.smd")
         self.assertTrue(portable)

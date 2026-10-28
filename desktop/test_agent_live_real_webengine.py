@@ -58,17 +58,46 @@ def _probe(directory: str) -> int:
         reader=window.findChild(QObject,"documentReader")
         if reader is None:
             state["failure"]="Production WebEngine reader object was not found"; finish(2); return
-        script="""(()=>{const block=document.querySelector('.live-block');if(!block)return 'no editable block';
+        script="""(()=>{const block=document.querySelector('.live-block');if(!block){document.title='supermd-agent-typing-error:no editable block';return 'no editable block';}
           block.dispatchEvent(new MouseEvent('dblclick',{bubbles:true}));
-          setTimeout(()=>{const area=document.querySelector('.live-active-block textarea');if(!area){window.__agentTypingFailure='live editor did not open';return;}
-          const setter=Object.getOwnPropertyDescriptor(HTMLTextAreaElement.prototype,'value').set;
-          setter.call(area,area.value+'\\nPending human draft');area.dispatchEvent(new Event('input',{bubbles:true}));},200);return 'scheduled';})()"""
+          const deadline=Date.now()+10000;
+          const typeWhenReady=()=>{const area=document.querySelector('.live-active-block textarea');
+            if(!area){if(Date.now()<deadline){setTimeout(typeWhenReady,50);return;}
+              window.__agentTypingFailure='live editor did not open';document.title='supermd-agent-typing-error:live editor did not open';return;}
+            area.focus();area.setSelectionRange(area.value.length,area.value.length);
+            const inserted=document.execCommand('insertText',false,'\\nPending human draft');
+            if(!inserted){window.__agentTypingFailure='browser could not insert the pending draft';document.title='supermd-agent-typing-error:browser could not insert the pending draft';return;}
+            // execCommand produces the browser's real textarea input event,
+            // which React handles as a user edit. Wait for its controlled value
+            // to settle while keeping focus in the editor: the subsequent CLI
+            // activation must flush an unblurred human draft.
+            const expected='Pending human draft';
+            const confirm=()=>{const current=document.querySelector('.live-active-block textarea');
+              if(current?.value.endsWith(expected)&&document.activeElement===current){window.__agentTypingReady=true;document.title='supermd-agent-typing-ready';return;}
+              if(Date.now()<deadline){setTimeout(confirm,25);return;}
+              window.__agentTypingFailure='textarea did not retain the focused pending draft after input';document.title='supermd-agent-typing-error:textarea did not retain the focused pending draft after input';};
+            setTimeout(confirm,25);};
+          typeWhenReady();return 'scheduled';})()"""
         if not QMetaObject.invokeMethod(window,"runDocumentScript",Qt.ConnectionType.DirectConnection,Q_ARG("QVariant",script)):
             state["failure"]="Could not schedule the real reader DOM edit"; finish(2); return
         # Run through the production QML helper: PySide's QQuickWebEngineView
         # wrapper exposes only its callback overload, while QML supports the
         # fire-and-forget form used by the app.
-        QTimer.singleShot(700,lambda: start_call("list_initial","list"))
+        # Bridge the in-page DOM readiness check through the WebEngine title
+        # property. This avoids PySide's platform-dependent runJavaScript
+        # callback overload and starts activation as soon as the focused,
+        # controlled textarea has accepted the input.
+        def wait_for_pending_edit():
+            title=reader.property("title")
+            if title=="supermd-agent-typing-ready":
+                start_call("list_initial","list"); return
+            if isinstance(title,str) and title.startswith("supermd-agent-typing-error:"):
+                state["failure"]=title.partition(":")[2]; finish(2); return
+            if time.monotonic()>typing_deadline:
+                state["failure"]=f"Timed out waiting for focused pending draft input; reader title={title!r}"; finish(2); return
+            QTimer.singleShot(50,wait_for_pending_edit)
+        typing_deadline=time.monotonic()+12
+        QTimer.singleShot(50,wait_for_pending_edit)
     def parse_output(process,key):
         stdout,stderr=process.communicate()
         if process.returncode!=0:

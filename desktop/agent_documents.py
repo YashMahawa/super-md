@@ -98,13 +98,18 @@ class DocumentStore:
         if not roots and not allow_empty:
             raise AgentDocumentError("At least one explicit workspace root is required")
         normalized: list[Path] = []
+        aliases: list[tuple[Path, Path]] = []
         for value in roots:
-            root = Path(value).expanduser().resolve(strict=True)
+            supplied = Path(os.path.abspath(Path(value).expanduser()))
+            root = supplied.resolve(strict=True)
             if not root.is_dir():
                 raise AgentDocumentError(f"Workspace root is not a directory: {root}")
             if root not in normalized:
                 normalized.append(root)
+            if supplied != root:
+                aliases.append((supplied, root))
         self.roots = tuple(normalized)
+        self._root_aliases = tuple(sorted(aliases, key=lambda pair: len(pair[0].parts), reverse=True))
 
     def resolve(self, value: str | os.PathLike[str], *, must_exist: bool = True) -> Path:
         """Resolve a caller path under one configured root; reject symlinks."""
@@ -112,6 +117,13 @@ class DocumentStore:
         candidates = [raw] if raw.is_absolute() else [root / raw for root in self.roots]
         for candidate in candidates:
             absolute = Path(os.path.abspath(candidate))
+            # macOS exposes /var through /private/var. Preserve the caller's
+            # explicitly configured root spelling without permitting symlinks
+            # inside that workspace or following a root retargeted afterward.
+            for alias, canonical in self._root_aliases:
+                if absolute == alias or alias in absolute.parents:
+                    absolute = canonical / absolute.relative_to(alias)
+                    break
             root = next((r for r in self.roots if absolute == r or r in absolute.parents), None)
             if root is None:
                 continue

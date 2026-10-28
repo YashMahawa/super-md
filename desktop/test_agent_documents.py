@@ -57,7 +57,7 @@ class AgentDocumentsTest(unittest.TestCase):
         prefix = "# Figure\n```svg\n"
         after = "After the figure. " * 1500
         source = prefix + svg + "\n```\n" + after
-        (self.root / "diagram.md").write_text(source, encoding="utf-8")
+        (self.root / "diagram.md").write_bytes(source.encode("utf-8"))
         prose = self.store.read("diagram.md", limit=12000)
         self.assertNotIn("<svg>", prose["text"])
         self.assertLessEqual(len(prose["text"]), 12_100)
@@ -79,12 +79,22 @@ class AgentDocumentsTest(unittest.TestCase):
     def test_prose_svg_page_end_is_clamped_to_heading_section(self):
         svg = "<svg>" + ("<path/>" * 500) + "</svg>"
         source = "# Figure\n```svg\n" + svg + "\n```\n\n# Next\nNext section text.\n"
-        (self.root / "heading.svg.md").write_text(source, encoding="utf-8")
+        (self.root / "heading.svg.md").write_bytes(source.encode("utf-8"))
         page = self.store.read("heading.svg.md", heading=0, limit=12000)
         heading_end = source.index("# Next")
         self.assertEqual(page["end"], heading_end)
         self.assertIsNone(page["next_offset"])
         self.assertIn("[SVG omitted:", page["text"])
+
+    def test_crlf_source_offsets_preserve_the_exact_document_bytes(self):
+        source = "# Figure\r\n```svg\r\n<svg><path/></svg>\r\n```\r\n\r\n# Next\r\nNext text.\r\n"
+        (self.root / "windows.md").write_bytes(source.encode("utf-8"))
+        exact = self.store.read("windows.md", view="source")
+        self.assertEqual(exact["text"], source)
+        self.assertEqual(exact["end"], len(source))
+        page = self.store.read("windows.md", heading=0)
+        self.assertEqual(page["end"], source.index("# Next"))
+        self.assertEqual(page["svg_omissions"][0]["source_start"], source.index("<svg>"))
 
     def test_heading_read_search_and_line_patch_keep_exact_embedded_asset(self):
         svg = "<svg><text>Exact α</text></svg>".encode("utf-8")
@@ -208,6 +218,33 @@ class AgentDocumentsTest(unittest.TestCase):
                 self.store.inspect("bad.smd")
         finally:
             outside.unlink(missing_ok=True)
+
+    @unittest.skipUnless(os.name == "posix", "directory symlink root aliases require POSIX")
+    def test_explicit_root_alias_accepts_absolute_paths_but_rejects_internal_links(self):
+        real = self.root / "canonical"
+        real.mkdir()
+        workspace = real / "workspace"
+        workspace.mkdir()
+        (workspace / "note.md").write_text("# Aliased workspace\n", encoding="utf-8")
+        alias = self.root / "alias"
+        alias.symlink_to(real, target_is_directory=True)
+        store = DocumentStore([alias / "workspace"])
+        self.assertEqual(store.resolve(alias / "workspace/note.md"), workspace.resolve() / "note.md")
+        self.assertEqual(store.resolve(alias / "workspace/new.md", must_exist=False), workspace.resolve() / "new.md")
+        (workspace / "link.md").symlink_to(workspace / "note.md")
+        with self.assertRaises(AgentDocumentError):
+            store.resolve(alias / "workspace/link.md")
+        (real / "outside.md").write_text("outside", encoding="utf-8")
+        with self.assertRaises(AgentDocumentError):
+            store.resolve(alias / "workspace/../outside.md")
+        # An explicitly approved alias is bound to its original root, even
+        # if another process later changes that symlink's destination.
+        alias.unlink()
+        other = self.root / "other"
+        (other / "workspace").mkdir(parents=True)
+        (other / "workspace/note.md").write_text("outside", encoding="utf-8")
+        alias.symlink_to(other, target_is_directory=True)
+        self.assertEqual(store.read(str(alias / "workspace/note.md"), view="source")["text"], "# Aliased workspace\n")
 
     def test_cli_is_headless_json_and_emits_no_startup_noise(self):
         path = self.root / "cli.md"

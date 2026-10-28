@@ -56,6 +56,33 @@ DEFAULTS.update(selectionAssistant="chatgpt")
 DEFAULTS.update(latexAutofix=False)
 DEFAULTS.update(shortcuts=default_shortcuts())
 DEFAULTS.update(agentAccessEnabled=False, cloudAgentEnabled=False)
+
+def agent_mcp_setup_config(discovery_dir, *, executable=None, frozen=None, platform=None, cli_script=None):
+    """Return a directly executable, absolute MCP stdio command for this install."""
+    executable_path = Path(executable or sys.executable).expanduser().resolve()
+    frozen = getattr(sys, "frozen", False) if frozen is None else bool(frozen)
+    platform = sys.platform if platform is None else platform
+    if frozen:
+        if platform.startswith("win"):
+            command = str(executable_path.with_name("super-md-cli.exe").resolve())
+        elif platform.startswith("linux"):
+            appimage = os.environ.get("APPIMAGE", "")
+            appimage_path = Path(appimage).expanduser() if appimage else None
+            command = str(appimage_path.resolve()) if appimage_path and appimage_path.is_file() else str(executable_path)
+        else:
+            command = str(executable_path)
+        args = ["agent", "mcp"]
+    else:
+        if platform.startswith("win") and executable_path.name.casefold() == "pythonw.exe":
+            console_python = executable_path.with_name("python.exe")
+            if console_python.is_file():
+                executable_path = console_python
+        script = Path(cli_script or Path(__file__).with_name("agent_cli.py")).expanduser().resolve()
+        command = str(executable_path)
+        args = [str(script), "mcp"]
+    args.extend(["--live-sessions-dir", str(Path(discovery_dir).expanduser().resolve()), "--transport", "stdio"])
+    return {"command": command, "args": args}
+
 SAMPLE = """# A place to think\n\nWrite in Markdown. Read without distractions.\n\n> [!tip] Start with your notes\n> Open any note or folder. No vault, no import process.\n\n## Learn by exploring\n\n$$E = mc^2$$\n\n> [!answer]- Why does this matter?\n> Tap the heading to reveal an answer, then hide it to test yourself.\n\n```smd-chart\n{\"title\":\"A changing wave\",\"series\":[{\"name\":\"Sine\",\"expression\":\"sin(a*x)\",\"color\":\"#386a57\"},{\"name\":\"Cosine\",\"expression\":\"cos(a*x)\",\"color\":\"#bc6750\"}],\"sliders\":[{\"name\":\"a\",\"min\":0.2,\"max\":3,\"value\":1}]}\n```\n\n## Matplotlib in three dimensions\n\nRun a Python cell to generate a 3D figure, then save it in your note or PDF.\n\n```python\nimport numpy as np\nimport matplotlib.pyplot as plt\nx, y = np.meshgrid(np.linspace(-2, 2, 32), np.linspace(-2, 2, 32))\nfig = plt.figure()\nax = fig.add_subplot(111, projection=\"3d\")\nax.plot_surface(x, y, x*x + y*y, cmap=\"viridis\")\n```\n\n[Back to exploring](#learn-by-exploring)\n"""
 
 def public_address(url: str) -> str:
@@ -730,9 +757,7 @@ class Studio(QObject):
         bridge = getattr(self.session, "agent_bridge", None)
         if not bridge or not bridge.enabled:
             return "Enable live agent access to prepare the local MCP server configuration."
-        command = "super-md-cli.exe" if sys.platform.startswith("win") else "super-md"
-        return json.dumps({"command": command, "args": ["agent", "mcp", "--live-sessions-dir",
-                             str(bridge.discovery_dir), "--transport", "stdio"]}, ensure_ascii=False, indent=2)
+        return json.dumps(agent_mcp_setup_config(bridge.discovery_dir), ensure_ascii=False, indent=2)
 
     @Property(str, notify=changed)
     def agentAccessTabsSummary(self):
