@@ -82,19 +82,6 @@ jobs:
           appendFileSync(process.env.GITHUB_OUTPUT, 'reuse_packages=true\n');
           console.log(`Verified all five build jobs on tagged source ${sha}`);
           NODE
-      - name: Require successful CI on this exact commit
-        run: |
-          node --input-type=module <<'NODE'
-          import { execFileSync } from 'node:child_process';
-          const sha = execFileSync('git', ['rev-parse', 'HEAD'], {encoding:'utf8'}).trim();
-          for (let attempt = 0; attempt < 120; attempt++) {
-            const runs = JSON.parse(execFileSync('gh', ['run','list','--repo',process.env.GITHUB_REPOSITORY,'--workflow','ci.yml','--commit',sha,'--json','status,conclusion'],{encoding:'utf8'}));
-            if (runs.some(run => run.status === 'completed' && run.conclusion === 'success')) process.exit(0);
-            if (runs.some(run => run.status === 'completed' && run.conclusion !== 'success')) throw Error('CI failed on the release commit');
-            await new Promise(resolve => setTimeout(resolve, 20000));
-          }
-          throw Error('No successful CI run found for the release commit');
-          NODE
       - name: Create or reuse a protected draft
         id: draft
         run: |
@@ -445,6 +432,19 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version: 22
+      - name: Require successful CI on this exact commit
+        run: |
+          node --input-type=module <<'NODE'
+          import { execFileSync } from 'node:child_process';
+          const sha = execFileSync('git', ['rev-parse', 'HEAD'], {encoding:'utf8'}).trim();
+          for (let attempt = 0; attempt < 120; attempt++) {
+            const runs = JSON.parse(execFileSync('gh', ['run','list','--repo',process.env.GITHUB_REPOSITORY,'--workflow','ci.yml','--commit',sha,'--json','status,conclusion'],{encoding:'utf8'}));
+            if (runs.some(run => run.status === 'completed' && run.conclusion === 'success')) process.exit(0);
+            if (runs.some(run => run.status === 'completed' && run.conclusion !== 'success')) throw Error('CI failed on the release commit');
+            await new Promise(resolve => setTimeout(resolve, 20000));
+          }
+          throw Error('No successful CI run found for the release commit');
+          NODE
       - name: Require complete installers and create package checksums
         run: |
           gh release view "$RELEASE_TAG" --json assets --jq .assets > "$RUNNER_TEMP/assets.json"
