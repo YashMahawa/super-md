@@ -30,6 +30,10 @@ import java.util.concurrent.atomic.AtomicBoolean
 private val documentWrites = Mutex()
 
 data class Note(val id: String = UUID.randomUUID().toString(), val name: String = "Untitled.md", val uri: String? = null, val content: String = "", val saved: String = "", val relative: String? = null, val assetDirectory: String? = null) { val dirty get() = content != saved; val portable get() = assetDirectory != null }
+internal fun matchesAssetWriteSnapshot(current: Note?, activeId: String, expected: Note, requireActive: Boolean = true): Boolean =
+    current != null && current.id == expected.id && (!requireActive || activeId == expected.id)
+        && current.content == expected.content && current.saved == expected.saved
+        && current.uri == expected.uri && current.assetDirectory == expected.assetDirectory && current.portable == expected.portable
 data class RecentNote(val name: String, val uri: String, val relative: String? = null, val pinned:Boolean=false)
 internal fun orderedRecents(notes:List<RecentNote>)=notes.distinctBy {it.uri}.sortedByDescending {it.pinned}.take(10)
 private fun renamedRelative(relative:String?,name:String)=relative?.let {val parent=it.substringBeforeLast('/',"");if(parent.isEmpty())name else "$parent/$name"}
@@ -1128,6 +1132,137 @@ class StudioViewModel(app: Application, val workspaceKey: String = "main") : And
                 diskAssets?.let { File(getApplication<Application>().filesDir, "portable-assets/$it").deleteRecursively() }
             }
         }
+    }
+
+    /** Read original embedded assets or add one model-supplied image to a saved portable note. */
+    internal suspend fun agentAssetAction(request: JSONObject): JSONObject = withContext(Dispatchers.IO) {
+        val id = request.getString("tabId")
+        val action = request.getString("assetAction")
+        documentWrites.withLock {
+            require(action in setOf("list", "source", "attach")) { "Unsupported asset action" }
+            val note = mutable.value.tabs.find { it.id == id } ?: error("The document is no longer open")
+            val revision = java.security.MessageDigest.getInstance("SHA-256").digest(note.content.toByteArray(Charsets.UTF_8)).joinToString("") { "%02x".format(it) }
+            require(request.getString("expectedRevision") == revision) { "The document changed; read it again before using an asset" }
+            val directory = note.assetDirectory
+            if (action == "list") {
+                val page = media.portableAssetPage(directory, request.optInt("offset", 0), request.optInt("limit", 50))
+                return@withLock JSONObject().put("tabId", id).put("revision", revision)
+                    .put("assets", page.getJSONArray("assets")).put("total", page.getInt("total"))
+                    .put("nextOffset", page.opt("nextOffset") ?: JSONObject.NULL)
+            }
+            if (action == "source") {
+                val name = media.resolvePortableAssetName(directory, request.getString("assetName"))
+                    ?: error("Asset is not present in the current note")
+                val (mime, bytes) = media.portableAssetBytes(directory, name, 1_048_576)
+                return@withLock JSONObject().put("tabId", id).put("revision", revision).put("assetName", name)
+                    .put("mimeType", mime).put("bytes", bytes.size)
+                    .put("sha256", java.security.MessageDigest.getInstance("SHA-256").digest(bytes).joinToString("") { "%02x".format(it) })
+                    .put("body", android.util.Base64.encodeToString(bytes, android.util.Base64.NO_WRAP))
+            }
+            require(mutable.value.activeId == id) { "Select the target tab before attaching its image" }
+            require(note.portable && note.uri != null && note.saved == note.content) { "Attaching an image requires a saved, unchanged portable .smd note" }
+            val rawName = request.getString("assetName")
+            val filename = rawName.removePrefix("assets/")
+            require(Regex("[A-Za-z0-9_.-]{1,150}").matches(filename) && filename !in setOf(".", "..")) { "Asset name must be a simple filename" }
+            val mime = request.getString("mimeType").substringBefore(';').lowercase()
+            require(mime in setOf("image/png", "image/jpeg", "image/gif", "image/webp", "image/avif", "image/svg+xml")) { "Unsupported image type" }
+            val extension = filename.substringAfterLast('.', "").lowercase()
+            val normalizedName = if (extension.isEmpty()) "$filename.${when(mime) { "image/png" -> "png"; "image/jpeg" -> "jpg"; "image/gif" -> "gif"; "image/webp" -> "webp"; "image/avif" -> "avif"; else -> "svg" }}" else filename
+            require(media.assetMime(normalizedName) == mime) { "Asset extension must match its image type" }
+            val encoded = request.getString("body")
+            require(encoded.length <= 1_400_000 && encoded.length % 4 == 0) { "Asset body must be at most 1 MiB" }
+            val incomingBytes = android.util.Base64.decode(encoded, android.util.Base64.DEFAULT)
+            require(incomingBytes.size in 1..1_048_576 && android.util.Base64.encodeToString(incomingBytes, android.util.Base64.NO_WRAP) == encoded) { "Asset body must be canonical base64 and at most 1 MiB" }
+            fun currentNote(): Note? = mutable.value.tabs.find { it.id == id }
+            fun requireSameSnapshot(active: Boolean = true) {
+                val latest = currentNote() ?: error("The document is no longer open")
+                require(matchesAssetWriteSnapshot(latest, mutable.value.activeId, note, requireActive = active) && latest.assetDirectory == directory) {
+                    "The document changed while the image was being attached; no changes were saved"
+                }
+            }
+            requireSameSnapshot()
+            val currentAssets = media.portableAssets(directory)
+            val newKey = "assets/$normalizedName"
+            require(!currentAssets.has(newKey)) { "An asset with that name already exists" }
+            val newData = media.portableImageData(mime, incomingBytes)
+            val uri = Uri.parse(note.uri)
+            val backup = resolver.openInputStream(uri)?.use { readLimited(it, 120_000_000) } ?: error("Cannot read the current portable note")
+            val diskNote = backup.inputStream().use(media::openFmd)
+            val diskAssetsDir = diskNote.directory
+            val stagedNote = File(getApplication<Application>().cacheDir, "agent-attach-${UUID.randomUUID()}.smd.gz")
+            var writeAttempted = false
+            var openedDir: String? = null
+            fun rollbackWrite() {
+                resolver.openOutputStream(uri, "wt")?.use { it.write(backup); it.flush() }
+                    ?: error("The document changed during attachment and its previous bytes could not be restored")
+                val restored = resolver.openInputStream(uri)?.use { readLimited(it, 120_000_000) }
+                require(restored != null && restored.contentEquals(backup)) {
+                    "The document changed during attachment and rollback could not be confirmed; reopen it from disk"
+                }
+                writeAttempted = false
+            }
+            try {
+                require(diskNote.markdown == note.saved && sameAssets(currentAssets, media.portableAssets(diskAssetsDir))) {
+                    "The portable note changed on disk; reopen it before attaching an image"
+                }
+                requireSameSnapshot()
+                val updated = JSONObject(currentAssets.toString()).put(newKey, newData)
+                stagedNote.outputStream().use { media.writeFmd(it, note.content, updated) }
+                verifyExportHeader(stagedNote, NativeExportFormat.PORTABLE_SMD)
+                openedDir = stagedNote.inputStream().use(media::openFmd).directory
+                val currentDiskBytes = resolver.openInputStream(uri)?.use { readLimited(it, 120_000_000) }
+                    ?: error("Cannot recheck the current portable note before saving")
+                require(currentDiskBytes.contentEquals(backup)) { "The portable note changed on disk; no changes were saved" }
+                requireSameSnapshot()
+                writeAttempted = true
+                try {
+                    resolver.openOutputStream(uri, "wt")?.use { output -> stagedNote.inputStream().use { it.copyTo(output) } }
+                        ?: error("Cannot save the updated portable note")
+                } catch (error: Exception) { throw error }
+                requireSameSnapshot()
+                val writtenSource = note.content
+                val writtenDirectory = openedDir ?: error("The updated portable note was not staged")
+                val committed = withContext(Dispatchers.Main) {
+                    val latest = mutable.value.tabs.find { it.id == id }
+                    val matches = latest != null && latest.content == writtenSource
+                        && matchesAssetWriteSnapshot(latest, mutable.value.activeId, note) && latest.assetDirectory == directory
+                    if (!matches) return@withContext false
+                    change { state -> state.copy(tabs = state.tabs.map {
+                        if (it.id == id && it.content == writtenSource && it.uri == note.uri && it.assetDirectory == directory)
+                            it.copy(saved = writtenSource, assetDirectory = writtenDirectory) else it
+                    }, busy = false, message = "Portable image attached") }
+                    mutable.value.tabs.find { it.id == id }?.let(::remember)
+                    true
+                }
+                if (!committed) {
+                    rollbackWrite()
+                    error("The document changed while the image was being attached; the new draft was preserved")
+                }
+                writeAttempted = false
+                JSONObject().put("tabId", id).put("assetName", newKey).put("mimeType", mime)
+                    .put("bytes", incomingBytes.size)
+                    .put("sha256", java.security.MessageDigest.getInstance("SHA-256").digest(incomingBytes).joinToString("") { "%02x".format(it) })
+                    .put("revision", revision).put("saved", true).put("changed", true)
+            } catch (error: Exception) {
+                if (writeAttempted) {
+                    try { rollbackWrite() }
+                    catch (rollbackError: Exception) {
+                        throw IllegalStateException("The portable note may not match the latest draft; rollback could not be confirmed. Reopen it from disk before editing.", rollbackError)
+                    }
+                }
+                throw error
+            } finally {
+                stagedNote.delete()
+                File(getApplication<Application>().filesDir, "portable-assets/$diskAssetsDir").deleteRecursively()
+                openedDir?.takeIf { it != mutable.value.tabs.find { tab -> tab.id == id }?.assetDirectory }
+                    ?.let { File(getApplication<Application>().filesDir, "portable-assets/$it").deleteRecursively() }
+            }
+        }
+    }
+
+    private fun sameAssets(left: JSONObject, right: JSONObject): Boolean {
+        if (left.length() != right.length()) return false
+        return left.keys().asSequence().all { right.has(it) && left.getString(it) == right.getString(it) }
     }
     suspend fun python(code: String): JSONObject = withContext(Dispatchers.IO) {
         pythonExecution.lock()

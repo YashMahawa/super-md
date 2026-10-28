@@ -68,6 +68,12 @@ test("relay auth, bounded device RPC, Streamable HTTP, legacy SSE and disconnect
     if (request.action === "list_tabs") result = { tabs: [{ id: tabId, name: "Untitled.md", revision, saved: false }] };
     else if (request.action === "read_tab") result = { tabId, text: "# Live\\ncontent", revision, offset: 0 };
     else if (request.action === "render_tab") result = { mime_type: "image/png", data: png.toString("base64"), width: 1, height: 1, revision, metadata: {reading:{offset:123,heading:"Current section"}} };
+    else if (request.action === "asset_action" && request.assetAction === "list") result = { tabId: request.tabId, revision, assets: [{ name: "assets/original.svg", mimeType: "image/svg+xml", bytes: 32, sha256: "c".repeat(64) }] };
+    else if (request.action === "asset_action" && request.assetAction === "source") {
+      const bytes = request.assetName === "assets/original.png" ? png : Buffer.from(request.assetName === "assets/unicode.svg" ? "<svg>猫🧭a</svg>" : "<svg xmlns='http://www.w3.org/2000/svg'/>");
+      result = { tabId: request.tabId, revision, assetName: request.assetName, mimeType: request.assetName === "assets/original.png" ? "image/png" : "image/svg+xml", bytes: bytes.length, sha256: createHash("sha256").update(bytes).digest("hex"), body: bytes.toString("base64") };
+    }
+    else if (request.action === "asset_action" && request.assetAction === "attach") result = { tabId: request.tabId, assetName: request.assetName, mimeType: request.mimeType, bytes: Buffer.from(String(request.body), "base64").length, revision, saved: true };
     else if (request.action === "patch_tab") { ws.send(JSON.stringify({ type: "reply", requestId: request.requestId, error: "Revision conflict: tab changed." })); return; }
     else result = { accepted: true };
     ws.send(JSON.stringify({ type: "reply", requestId: request.requestId, result }));
@@ -79,12 +85,29 @@ test("relay auth, bounded device RPC, Streamable HTTP, legacy SSE and disconnect
   await http.connect(httpTransport);
   t.after(async () => { await http.close().catch(() => undefined); await httpTransport.close().catch(() => undefined); });
   const list = await http.listTools();
-  assert.deepEqual(list.tools.map((x) => x.name).sort(), ["diagram_action", "document_action", "list_devices", "list_tabs", "patch_tab", "read_tab", "render_tab", "replace_tab_asset", "search_tab"].sort());
+  assert.deepEqual(list.tools.map((x) => x.name).sort(), ["asset_action", "diagram_action", "document_action", "list_devices", "list_tabs", "patch_tab", "read_tab", "render_tab", "replace_tab_asset", "search_tab"].sort());
   const devices = await http.callTool({ name: "list_devices", arguments: {} });
   assert.match(String(devices.content?.[0]?.type === "text" ? devices.content[0].text : ""), /Test Android/);
   assert.match(String(devices.content?.[0]?.type === "text" ? devices.content[0].text : ""), /Untitled\.md/);
   const diagram = await http.callTool({ name: "diagram_action", arguments: { deviceId, tabId: "tab:" + deviceId + ":main:1", diagramAction: "source", diagramId: "diagram:0", expectedRevision: revision, offset: 0, limit: 100 } });
   assert.equal(diagram.isError, undefined);
+  const mediaTab = "tab:" + deviceId + ":main:1";
+  const assetList = await http.callTool({ name: "asset_action", arguments: { deviceId, tabId: mediaTab, assetAction: "list", expectedRevision: revision } });
+  assert.match(String(assetList.content?.[0]?.type === "text" ? assetList.content[0].text : ""), /assets\/original\.svg/);
+  const assetSource = await http.callTool({ name: "asset_action", arguments: { deviceId, tabId: mediaTab, assetAction: "source", assetName: "assets/original.svg", expectedRevision: revision } });
+  assert.match(String(assetSource.content?.[0]?.type === "text" ? assetSource.content[0].text : ""), /<svg xmlns=/);
+  const svgPage = await http.callTool({ name: "asset_action", arguments: { deviceId, tabId: mediaTab, assetAction: "source", assetName: "assets/original.svg", expectedRevision: revision, offset: 0, limit: 8 } });
+  assert.match(String(svgPage.content?.[0]?.type === "text" ? svgPage.content[0].text : ""), /"nextOffset":8/);
+  const unicodePage = await http.callTool({ name: "asset_action", arguments: { deviceId, tabId: mediaTab, assetAction: "source", assetName: "assets/unicode.svg", expectedRevision: revision, offset: 6, limit: 1 } });
+  const unicodeMeta = JSON.parse(String(unicodePage.content?.[0]?.type === "text" ? unicodePage.content[0].text : ""));
+  assert.equal(unicodeMeta.source, "🧭");
+  assert.equal(unicodeMeta.nextOffset, 7);
+  assert.equal(unicodeMeta.revision, revision);
+  const originalPng = await http.callTool({ name: "asset_action", arguments: { deviceId, tabId: mediaTab, assetAction: "source", assetName: "assets/original.png", expectedRevision: revision } });
+  assert.equal(originalPng.content?.[0]?.type, "image");
+  assert.equal(Buffer.from(String(originalPng.content?.[0]?.type === "image" ? originalPng.content[0].data : ""), "base64").compare(png), 0);
+  const attached = await http.callTool({ name: "asset_action", arguments: { deviceId, tabId: mediaTab, assetAction: "attach", assetName: "assets/model.png", mimeType: "image/png", body: png.toString("base64"), expectedRevision: revision } });
+  assert.match(String(attached.content?.[0]?.type === "text" ? attached.content[0].text : ""), /assets\/model\.png/);
   const read = await http.callTool({ name: "read_tab", arguments: { deviceId, tabId: "tab:" + deviceId + ":main:1", limit: 100 } });
   assert.match(String(read.content?.[0]?.type === "text" ? read.content[0].text : ""), /Live/);
   const image = await http.callTool({ name: "render_tab", arguments: { deviceId, tabId: "tab:" + deviceId + ":main:1", width: 500 } });

@@ -19,4 +19,10 @@ test("device RPC schema rejects unknown fields, oversized ranges and stale-write
   assert.equal(validateRpcRequest({...assetRequest,assetName:"b".repeat(64)}).assetName,"b".repeat(64));
   for(const assetName of ["../secret.png","assets/../secret.png","assets/a/b.png","assets/..","/secret.png"])
     assert.throws(()=>validateRpcRequest({...assetRequest,assetName}),/asset name/);
+  const inline = {requestId:"media",action:"asset_action",tabId:"tab:1",assetAction:"attach",assetName:"assets/model.png",mimeType:"image/png",body:"iVBORw0KGgo=",expectedRevision:"b".repeat(64)};
+  assert.equal(validateRpcRequest(inline).assetAction,"attach");
+  assert.throws(()=>validateRpcRequest({...inline,body:"A".repeat(1_400_001)}),/Media body is too large/);
+  assert.throws(()=>validateRpcRequest({...inline,mimeType:"text/html"}),/Unsupported image type/);
+  assert.throws(()=>validateRpcRequest({...inline,assetName:"assets/../model.png"}),/Invalid asset name/);
+  assert.throws(()=>validateRpcRequest({...inline,assetAction:"source",assetName:undefined,body:undefined}),/source requires assetName/);
 });

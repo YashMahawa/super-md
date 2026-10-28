@@ -151,6 +151,10 @@ The desktop CLI creates and edits MD/SMD files, replaces individual assets, and
 exports documents without a custom Python script. Live access also offers the
 app's PDF controls and LaTeX repair. Settings provides connection and pairing
 instructions; see the [CLI and MCP guide](docs/AGENT-INTERFACE.md).
+Downloadable setup instructions also include an [agent skill](docs/skills/super-md/SKILL.md)
+with recipes for viewport screenshots, exact Markdown, original SVGs, diagram
+images and safe edits. Agents can attach new images to portable notes, while
+the live CLI can extract originals or save individual diagram images.
 
 Access is off by default. Local connections stay on loopback; cloud devices
 connect outward to an authenticated relay. Pairing files and connector URLs

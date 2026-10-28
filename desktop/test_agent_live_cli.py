@@ -33,6 +33,14 @@ class FakeStudio(QObject):
         if action=="save_document":
             return {"tabId":request["tabId"],"windowId":self.window_id,"path":"/tmp/Current.md","revision":request["expectedRevision"]}
         if action=="open_document": raise AssertionError(action)
+        if action=="replace_tab_asset":
+            if request.get("expectedRevision")!=hashlib.sha256(self.tabs[0]["content"].encode()).hexdigest():
+                raise ValueError("Live tab revision changed; inspect it again before replacing an asset")
+            return {"tabId":request["tabId"],"assetName":request["assetName"],"revision":request["expectedRevision"],"changed":True}
+        if action=="asset_action" and request.get("assetAction")=="attach":
+            if request.get("expectedRevision")!=hashlib.sha256(self.tabs[0]["content"].encode()).hexdigest():
+                raise ValueError("Live tab revision changed; inspect it again before attaching an asset")
+            return {"tabId":request["tabId"],"asset":"assets/attached.svg","revision":request["expectedRevision"],"saved":True}
         raise AssertionError(action)
     def _agent_job_status(self,job_id): return {"jobId":job_id,"status":"completed","format":"pdf","filename":"Current.pdf","bytes":12}
     def _on_request(self,raw):
@@ -63,6 +71,10 @@ class FakeStudio(QObject):
         if action=="latex_apply": self._reply(rid,{"tabId":tab["id"],"revision":revision,"applied":len(request["repairIndices"])}); return
         if action=="list_diagrams": self._reply(rid,{"tabId":tab["id"],"revision":revision,"diagrams":[{"id":"diagram:0","kind":"mermaid","sourceStart":0,"sourceEnd":20,"sourceChars":20,"preview":"graph TD"}]}); return
         if action=="get_diagram": self._reply(rid,{"tabId":tab["id"],"revision":revision,"diagramId":request["diagramId"],"source":"graph TD; A-->B","start":0,"end":15,"nextOffset":None}); return
+        if action=="get_diagram_image":
+            self.last_diagram_image_width=request.get("width")
+            if request.get("expectedRevision")!=revision: self._reply(rid,error="A current expectedRevision is required to retrieve this diagram"); return
+            self._reply(rid,{"tabId":tab["id"],"revision":revision,"diagramId":request["diagramId"],"mime_type":"image/png","data":base64.b64encode(PNG).decode(),"width":1,"height":1}); return
         if action=="render_tab": self._reply(rid,{"tabId":tab["id"],"revision":revision,"mime_type":"image/png","data":base64.b64encode(PNG).decode(),"width":1,"height":1}); return
         self._reply(rid,error="unsupported test action")
 
@@ -73,7 +85,13 @@ class LiveCLISubprocessTests(unittest.TestCase):
         self.temp=Path(tempfile.mkdtemp()); self.studio=FakeStudio(); self.session=SimpleNamespace(windows={self.studio.window_id:self.studio})
         self.bridge=agent_live.create_qt_bridge(self.session,self.temp/"data"); self.session.agent_bridge=self.bridge; self.studio.session=self.session; self.bridge.start()
         self.cli=Path(__file__).with_name("agent_cli.py"); self.env=dict(os.environ,QT_QPA_PLATFORM="offscreen")
-    def tearDown(self): self.bridge.stop(); self.app.processEvents()
+    def tearDown(self):
+        self.bridge.stop()
+        if hasattr(self.studio,"stop"):
+            self.studio.stop()
+            self.studio.pool.shutdown(wait=False,cancel_futures=True)
+            self.studio.session.writes.shutdown(wait=False)
+        self.app.processEvents()
     def run_cli(self,*args,timeout=5):
         process=subprocess.Popen([sys.executable,str(self.cli),"live","--sessions-dir",str(self.bridge.discovery_dir),*map(str,args)],cwd=self.cli.parent,env=self.env,stdout=subprocess.PIPE,stderr=subprocess.PIPE,text=True)
         deadline=time.monotonic()+timeout
@@ -119,5 +137,99 @@ class LiveCLISubprocessTests(unittest.TestCase):
         self.assertNotEqual(result.returncode,0)
         self.assertEqual(result.stderr,"")
         self.assertEqual(json.loads(result.stdout)["ok"],False)
+
+    def test_live_asset_metadata_diagram_image_and_asset_extract(self):
+        tab=self.run_cli("list")[1]["result"]["tabs"][0]["id"]
+        revision=self.run_cli("list")[1]["result"]["tabs"][0]["revision"]
+        self.studio.tabs[0]["assets"]={"assets/vector.svg":"data:image/svg+xml;base64,PHN2Zy8+"}
+
+        assets=self.run_cli("assets",tab,"--offset",0,"--limit",10)[1]["result"]
+        self.assertEqual(assets["assetCount"],1)
+        self.assertEqual(assets["assets"][0]["name"],"assets/vector.svg")
+        self.assertNotIn("data",json.dumps(assets))
+
+        diagram_path=self.temp/"diagram"
+        diagram=self.run_cli("diagram-image",tab,"diagram:0",diagram_path,"--revision",revision,"--width",640)[1]["result"]
+        self.assertEqual(self.studio.last_diagram_image_width,640)
+        self.assertEqual(Path(diagram["path"]).suffix,".png")
+        self.assertEqual(Path(diagram["path"]).read_bytes(),PNG)
+        existing=Path(diagram["path"])
+        self.assertNotEqual(self.run_cli("diagram-image",tab,"diagram:0",existing,"--revision",revision)[0],0)
+        self.assertEqual(existing.read_bytes(),PNG)
+        self.assertNotEqual(self.run_cli("diagram-image",tab,"diagram:0",self.temp/"stale.png","--revision","0"*64)[0],0)
+
+        extracted=self.run_cli("extract",tab,"assets/vector.svg",self.temp/"vector","--revision",revision)[1]["result"]
+        self.assertEqual(Path(extracted["path"]).suffix,".svg")
+        self.assertEqual(Path(extracted["path"]).read_bytes(),b"<svg/>")
+        self.assertNotIn("data",json.dumps(extracted))
+        self.assertNotEqual(self.run_cli("extract",tab,"assets/vector.svg",extracted["path"],"--revision",revision)[0],0)
+        self.assertNotEqual(self.run_cli("extract",tab,"assets/vector.svg",self.temp/"stale.svg","--revision","0"*64)[0],0)
+
+    def test_asset_mutation_preflight_and_live_replace_revision_guard(self):
+        tab=self.run_cli("list")[1]["result"]["tabs"][0]["id"]
+        revision=self.run_cli("list")[1]["result"]["tabs"][0]["revision"]
+        valid=self.temp/"replacement.svg"; valid.write_bytes(b"<svg/>")
+        replaced=self.run_cli("replace-asset",tab,"stable-asset-id",valid,"--revision",revision)
+        self.assertEqual(replaced[0],0,replaced[1])
+        self.assertEqual(replaced[1]["result"]["assetName"],"stable-asset-id")
+        self.assertNotEqual(self.run_cli("replace-asset",tab,"stable-asset-id",valid,"--revision","0"*64)[0],0)
+
+        unsupported=self.temp/"replacement.txt"; unsupported.write_text("not an image")
+        self.assertNotEqual(self.run_cli("replace-asset",tab,"asset",unsupported,"--revision",revision)[0],0)
+        oversized=self.temp/"oversized.png"
+        with oversized.open("wb") as stream: stream.truncate(25*1024*1024+1)
+        self.assertNotEqual(self.run_cli("replace-asset",tab,"asset",oversized,"--revision",revision)[0],0)
+
+    def test_live_attach_sends_only_local_path_and_revision(self):
+        tab=self.run_cli("list")[1]["result"]["tabs"][0]["id"]
+        revision=self.run_cli("list")[1]["result"]["tabs"][0]["revision"]
+        source=self.temp/"new.svg"; source.write_bytes(b"<svg/>")
+        code,value=self.run_cli("attach",tab,source,"--revision",revision,"--name","attached.svg")
+        self.assertEqual(code,0,value)
+        self.assertEqual(value["result"]["asset"],"assets/attached.svg")
+        self.assertNotIn("data",json.dumps(value))
+
+    def test_attach_through_actual_local_bridge_and_studio(self):
+        from documents import write_portable
+        from studio import Session, Studio
+
+        self.bridge.stop()
+        session=Session(True)
+        session.settings["newNoteLocation"]=str(self.temp)
+        studio=Studio(True,session)
+        note_path=self.temp/"Attached note.smd"
+        markdown="# Portable note\n\nKeep the note text.\n"
+        write_portable(note_path,markdown,{})
+        note=studio._note(note_path.name,markdown,str(note_path),markdown,{},True)
+        studio.tabs=[note]
+        studio.active=note["id"]
+        studio.mode="live"
+        bridge=agent_live.create_qt_bridge(session,session.data)
+        session.agent_bridge=bridge
+
+        def handle_native_request(raw):
+            request=json.loads(raw)
+            try:
+                result={"flushed":True} if request["action"]=="flush_current" else studio._agent_document_action(request)
+                bridge.complete(request["requestId"],result,window_id=studio.window_id)
+            except Exception as error:
+                bridge.complete(request["requestId"],None,str(error),window_id=studio.window_id)
+
+        studio.agentRequest.connect(handle_native_request)
+        bridge.start()
+        self.studio=studio
+        self.bridge=bridge
+        asset=self.temp/"local image.png"
+        asset.write_bytes(PNG)
+        row=self.run_cli("list")[1]["result"]["tabs"][0]
+        first=self.run_cli("attach",row["id"],asset,"--revision",row["revision"],"--name","local.png")
+        self.assertEqual(first[0],0,first[1])
+        self.assertNotIn("data",json.dumps(first[1]))
+        self.assertEqual(set(note["assets"]),{"assets/local.png"})
+
+        note["content"]+="\nChanged after inspection.\n"
+        stale=self.run_cli("attach",row["id"],asset,"--revision",row["revision"],"--name","stale.png")
+        self.assertNotEqual(stale[0],0)
+        self.assertEqual(set(note["assets"]),{"assets/local.png"})
 
 if __name__=="__main__": unittest.main()

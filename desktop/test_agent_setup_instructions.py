@@ -4,11 +4,28 @@ import tempfile
 import unittest
 from pathlib import Path
 from unittest.mock import patch
+from types import SimpleNamespace
 
-from studio import agent_mcp_setup_config
+from studio import Studio, agent_mcp_setup_config
 
 
 class AgentSetupInstructionsTests(unittest.TestCase):
+    def test_exported_setup_guide_is_a_self_contained_skill_with_working_configuration(self):
+        with tempfile.TemporaryDirectory() as directory:
+            destination = Path(directory) / "agent guide.md"
+            setup = json.dumps({"command": "/apps/super-md", "args": ["agent", "mcp"]})
+            proxy = SimpleNamespace(agentAccessEnabled=True, agentSetupInstructions=setup,
+                                    cloudAgentConfigured=False, _emit=lambda *args: None)
+            Studio.saveAgentSetupInstructions(proxy, str(destination))
+            self.assertEqual(proxy._agent_error, "")
+            text = destination.read_text(encoding="utf-8")
+            self.assertTrue(text.startswith("---\nname: super-md\n"))
+            self.assertIn(setup, text)
+            self.assertIn("diagram-image", text)
+            self.assertIn("asset_action", text)
+            self.assertIn("get_context", text)
+            self.assertNotIn("pairingKey", text)
+
     @unittest.skipUnless(os.name == "posix", "venv Python symlinks require POSIX")
     def test_source_python_symlink_retains_its_virtual_environment(self):
         with tempfile.TemporaryDirectory() as directory:

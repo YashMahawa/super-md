@@ -172,14 +172,32 @@ class AgentRelayClient(private val onState: (State) -> Unit = {}) {
         }
     }
 
-    private fun validateRequest(request: JSONObject) {
+    internal fun validateRequest(request: JSONObject) {
         val keys = request.keys().asSequence().toSet()
         require(keys.all { it in RPC_FIELDS }) { "Unknown RPC field" }
         require(REQUEST_ID.matches(request.optString("requestId"))) { "Invalid request id" }
         val action = request.getString("action")
         if (action in TAB_ACTIONS) require(request.optString("tabId").isNotBlank() && request.optString("tabId").length <= 512) { "tabId is required" }
-        if (action in setOf("list_diagrams", "get_diagram", "get_diagram_image", "replace_tab_asset")) require(request.optString("tabId").isNotBlank()) { "tabId is required" }
-        if (action in setOf("get_diagram", "get_diagram_image", "list_diagrams", "replace_tab_asset")) require(REVISION.matches(request.optString("expectedRevision"))) { "A current document revision is required" }
+        if (action in setOf("list_diagrams", "get_diagram", "get_diagram_image", "replace_tab_asset", "asset_action")) require(request.optString("tabId").isNotBlank()) { "tabId is required" }
+        if (action in setOf("get_diagram", "get_diagram_image", "list_diagrams", "replace_tab_asset", "asset_action")) require(REVISION.matches(request.optString("expectedRevision"))) { "A current document revision is required" }
+        if (action == "asset_action") {
+            val kind = request.optString("assetAction")
+            require(kind in setOf("list", "source", "attach")) { "Invalid assetAction" }
+            if (kind == "source") require(request.optString("assetName").isNotBlank()) { "assetName is required" }
+            if (kind == "list") {
+                require(request.optInt("offset", 0) in 0..512) { "Invalid asset offset" }
+                require(request.optInt("limit", 50) in 1..50) { "Invalid asset limit" }
+            }
+            if (kind == "attach") {
+                require(request.optString("assetName").isNotBlank()) { "assetName is required" }
+                require(request.optString("mimeType") in ASSET_MIMES) { "Unsupported image type" }
+                val body = request.optString("body")
+                require(body.isNotEmpty() && body.length <= MAX_ASSET_BASE64 && body.length % 4 == 0) { "Asset body must be at most 1 MiB of base64" }
+                val bytes = android.util.Base64.decode(body, android.util.Base64.DEFAULT)
+                require(bytes.size in 1..MAX_ASSET_BYTES && android.util.Base64.encodeToString(bytes, android.util.Base64.NO_WRAP) == body) { "Asset body must be canonical base64 and at most 1 MiB" }
+                require(Regex("^(?:assets/)?[A-Za-z0-9._-]{1,150}$").matches(request.getString("assetName")) && request.getString("assetName").substringAfterLast('/') !in setOf(".", "..")) { "Invalid assetName" }
+            }
+        }
         if (action == "document_action") {
             require(request.optString("documentAction") in DOCUMENT_ACTIONS) { "Invalid document action" }
             val docAction = request.getString("documentAction")
@@ -246,10 +264,13 @@ class AgentRelayClient(private val onState: (State) -> Unit = {}) {
         val RETRY_TOKEN = Any()
         val REQUEST_ID = Regex("^[a-zA-Z0-9_-]{1,96}$")
         val REVISION = Regex("^[a-f0-9]{64}$", RegexOption.IGNORE_CASE)
-        val ACTIONS = setOf("list_tabs", "read_tab", "search_tab", "patch_tab", "render_tab", "list_diagrams", "get_diagram", "get_diagram_image", "replace_tab_asset", "document_action")
+        val ACTIONS = setOf("list_tabs", "read_tab", "search_tab", "patch_tab", "render_tab", "list_diagrams", "get_diagram", "get_diagram_image", "replace_tab_asset", "asset_action", "document_action")
         val TAB_ACTIONS = setOf("read_tab", "search_tab", "patch_tab", "render_tab")
         val TAB_DOCUMENT_ACTIONS = setOf("export", "latexfix", "save", "snapshot", "get_context")
         val DOCUMENT_ACTIONS = setOf("create", "export", "latexfix", "open", "save", "snapshot", "job_status", "get_context")
-        val RPC_FIELDS = setOf("requestId", "action", "tabId", "offset", "limit", "query", "context", "expectedRevision", "operations", "width", "documentAction", "content", "options", "diagramId", "format", "repairIndices", "jobId", "heading", "filename", "windowId", "assetName", "assetPath", "view")
+        const val MAX_ASSET_BYTES = 1024 * 1024
+        const val MAX_ASSET_BASE64 = 1_400_000
+        val ASSET_MIMES = setOf("image/png", "image/jpeg", "image/gif", "image/webp", "image/avif", "image/svg+xml")
+        val RPC_FIELDS = setOf("requestId", "action", "tabId", "offset", "limit", "query", "context", "expectedRevision", "operations", "width", "documentAction", "content", "options", "diagramId", "format", "repairIndices", "jobId", "heading", "filename", "windowId", "assetName", "assetPath", "assetAction", "mimeType", "body", "view")
     }
 }

@@ -88,7 +88,7 @@ function chooseDevice(group: Group, requestedId: string | undefined, mutation = 
   return { error: "More than one device is connected; choose deviceId." };
 }
 function rpc(group: Group, partial: Omit<RpcRequest, "requestId">): Promise<{ result?: unknown; error?: string }> {
-  const chosen = chooseDevice(group, partial.deviceId, partial.action === "patch_tab" || partial.action === "document_action" || partial.action === "replace_tab_asset");
+  const chosen = chooseDevice(group, partial.deviceId, partial.action === "patch_tab" || partial.action === "document_action" || partial.action === "replace_tab_asset" || (partial.action === "asset_action" && partial.assetAction === "attach"));
   const device = chosen.device;
   if (!device) return Promise.resolve({ error: chosen.error });
   if (!device.socket || device.socket.readyState !== WebSocket.OPEN) return Promise.resolve({ error: "The selected Super MD device is offline." });
@@ -120,6 +120,26 @@ function imageResult(response: { result?: unknown; error?: string }) {
   if (bytes.length < 8 || bytes.length > 4 * 1024 * 1024 || !bytes.subarray(0, 8).equals(Buffer.from([137,80,78,71,13,10,26,10]))) return textResult({ error: "The app image is not a bounded PNG." }, true);
   const metadata = image.metadata && typeof image.metadata === "object" && Buffer.byteLength(JSON.stringify(image.metadata)) <= 12_000 ? image.metadata : undefined;
   return { content: [{ type: "image" as const, data: bytes.toString("base64"), mimeType: "image/png" }, { type: "text" as const, text: JSON.stringify({ width: image.width, height: image.height, revision: image.revision, metadata }) }] };
+}
+function assetSourceResult(response: { result?: unknown; error?: string }, offset = 0, limit = 12_000) {
+  if (response.error) return textResult({ error: response.error }, true);
+  const value = response.result as Record<string, unknown> | undefined;
+  if (!value || typeof value.assetName !== "string" || typeof value.mimeType !== "string" || typeof value.body !== "string" || typeof value.sha256 !== "string") return textResult({ error: "The app returned an invalid original asset." }, true);
+  const bytes = Buffer.from(value.body, "base64");
+  if (bytes.length < 1 || bytes.length > 1024 * 1024 || bytes.toString("base64") !== value.body) return textResult({ error: "The original asset is not valid bounded base64." }, true);
+  const mimeType = value.mimeType;
+  if (mimeType === "image/svg+xml") {
+    const text = bytes.toString("utf8");
+    if (!Buffer.from(text, "utf8").equals(bytes)) return textResult({ error: "The original SVG is not valid UTF-8." }, true);
+    // Source offsets count Unicode characters, as in the document tools.
+    // Never split an emoji/surrogate pair at a chunk boundary.
+    const source = Array.from(text);
+    const end = Math.min(source.length, offset + limit);
+    return { content: [{ type: "text" as const, text: JSON.stringify({ assetName: value.assetName, mimeType, bytes: bytes.length, sha256: value.sha256, revision: value.revision, source: source.slice(offset, end).join(""), offset, totalChars: source.length, nextOffset: end < source.length ? end : null }) }] };
+  }
+  if (offset !== 0) return textResult({ error: "Offsets are supported for SVG source only." }, true);
+  if (!["image/png", "image/jpeg", "image/gif", "image/webp", "image/avif"].includes(mimeType)) return textResult({ error: "The app returned an unsupported original image type." }, true);
+  return { content: [{ type: "image" as const, data: bytes.toString("base64"), mimeType }, { type: "text" as const, text: JSON.stringify({ assetName: value.assetName, mimeType, bytes: bytes.length, sha256: value.sha256, revision: value.revision }) }] };
 }
 function registerTools(server: McpServer, group: Group): void {
   const deviceId = z.string().regex(UUID_RE).optional();
@@ -156,6 +176,12 @@ function registerTools(server: McpServer, group: Group): void {
     return diagramAction === "image" ? imageResult(response) : toolResponse(response);
   });
   server.registerTool("replace_tab_asset", { description: "Replace a linked asset using a path available to the selected Super MD device. The device restricts reads to its configured asset roots; the relay never reads or stores the file.", inputSchema: { deviceId, tabId, assetName: z.string().min(1).max(256), assetPath: z.string().min(1).max(4096), expectedRevision: z.string().regex(/^[a-f0-9]{64}$/i) } }, async ({ deviceId: selected, tabId: tab, assetName, assetPath, expectedRevision }) => toolResponse(await rpc(group, { action: "replace_tab_asset", deviceId: selected, tabId: tab, assetName, assetPath, expectedRevision })));
+  server.registerTool("asset_action", { description: "List embedded assets, retrieve an original image/SVG (SVG source is returned in bounded chunks), or attach model-supplied bytes to a saved portable .smd note. Attachments are limited to 1 MiB and require the note's current source revision; the relay does not read files or fetch URLs.", inputSchema: { deviceId, tabId, assetAction: z.enum(["list", "source", "attach"]), assetName: z.string().min(1).max(256).optional(), mimeType: z.enum(["image/png", "image/jpeg", "image/gif", "image/webp", "image/avif", "image/svg+xml"]).optional(), body: z.string().max(1_400_000).optional(), offset: z.number().int().min(0).max(1_048_576).optional(), limit: z.number().int().min(1).max(12_000).optional(), expectedRevision: z.string().regex(/^[a-f0-9]{64}$/i) } }, async ({ deviceId: selected, tabId: tab, assetAction, assetName, mimeType, body, offset, limit, expectedRevision }) => {
+    const response = await rpc(group, { action: "asset_action", deviceId: selected, tabId: tab, assetAction, assetName, mimeType, body, offset, limit, expectedRevision });
+    if (response.error) return toolResponse(response);
+    if (assetAction === "source") return assetSourceResult(response, offset, limit);
+    return toolResponse(response);
+  });
   server.registerTool("document_action", { description: "Read exact reading context, create, export, repair LaTeX, open, save, check an export job, or snapshot through Super MD's native UI. No shell or code execution. PDF options match app controls; choose deviceId when ambiguous.", inputSchema: { deviceId, documentAction: z.enum(["get_context","create","export","latexfix","open","save","snapshot","job_status"]), tabId: tabId.optional(), expectedRevision: z.string().regex(/^[a-f0-9]{64}$/i).optional(), operations: z.array(z.record(z.string(), z.unknown())).max(100).optional(), content: z.string().max(60_000).optional(), options: exportOptions.extend({format:z.enum(["pdf","smd","md"]).optional(),repairIndices:z.array(z.number().int().min(0)).max(40).optional(),filename:z.string().max(256).optional(),jobId:z.string().max(128).optional(),limit:z.number().int().min(1).max(500).optional()}).optional() } }, async ({ deviceId: selected, documentAction, tabId: tab, expectedRevision, operations, content, options }) => {
     const jobId = options?.jobId;
     const response = await rpc(group, { action: "document_action", deviceId: selected, documentAction, tabId: tab, expectedRevision, operations, content, jobId, options });

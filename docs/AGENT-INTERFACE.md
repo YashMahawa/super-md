@@ -1,5 +1,10 @@
 # Super MD CLI and MCP interface
 
+For an agent-ready workflow, use [the Super MD skill](skills/super-md/SKILL.md).
+Settings → AI agents → **Save setup instructions** includes this skill with the
+connection details for that installation, on desktop and Android. Keep that
+export private because a configured cloud connector URL grants access.
+
 In Settings → AI agents, create a pairing on the built-in relay, then copy the
 private MCP connector URL into your AI client's remote MCP configuration.
 Import the pairing file on another trusted phone or computer to add it to the
@@ -37,8 +42,8 @@ super-md agent --root /path/to/notes export chapter.md pdf print.pdf --options-j
 For a source checkout without the packaged launcher, replace `super-md agent`
 with `python desktop/agent_cli.py`.
 
-Success and failure both return one JSON object on stdout. Human diagnostics
-from the argument parser go to stderr. Reads are limited to 12,000 characters
+Success and failure both return one JSON object on stdout. Image extraction
+writes to an explicit output file instead of printing binary data. Reads are limited to 12,000 characters
 per page and 64 KB per JSON result. Prose reads elide fenced SVG bodies by
 default; `--view source` returns the exact source. Both modes keep `start` and
 `end` as original source offsets, and prose pages report each omitted SVG's
@@ -227,6 +232,23 @@ Asset references stay compact; image/base64 bytes are omitted from ordinary
 reads. `render_tab` returns the current themed viewport as a PNG with position
 metadata. Export supports the GUI's PDF options and returns a job ID; poll it
 with `document_action(job_status)`.
+
+`asset_action(list/source/attach)` provides compact embedded-asset metadata,
+original SVG text or raster image content, and direct image attachment without
+a device-local source file. Attach passes `assetName`, matching `mimeType` and
+base64 `body`, with a current `expectedRevision`. Inline payloads and original
+asset retrieval are limited to 1 MiB. SVG source is paginated; binary originals
+are MCP image blocks, never a large base64 text response. A saved portable SMD
+is required for attachment; the returned asset reference can then be inserted
+at the intended source position with `patch_tab`. Ordinary Markdown can receive
+fenced SVG/Mermaid blocks directly through a patch.
+
+The desktop live CLI also has `diagram-image TAB ID OUTPUT --revision REV`,
+`assets TAB`, `extract TAB ASSET OUTPUT --revision REV`,
+`attach TAB IMAGE --revision REV [--name NAME]`, and
+`replace-asset TAB ASSET IMAGE --revision REV`. Use `--sessions-dir` as in the
+other live commands. Capture and extraction create new files without
+overwriting existing files, with extensions matched to their actual content.
 
 Turning access off disconnects the device. **Revoke access** also asks the relay
 to unregister its device key and removes local credentials. If offline, the

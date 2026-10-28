@@ -50,6 +50,90 @@ class MediaStorage(private val context: Context) {
         file.outputStream().use { it.write(bytes); it.fd.sync() }
         return JSONObject().put("source", "assets/${file.name}").put("alt", name.substringBeforeLast('.').take(160))
     }
+
+    /** Canonical image data URL for a relay-supplied portable asset. */
+    fun portableImageData(type: String, bytes: ByteArray): String {
+        val mime = type.substringBefore(';').lowercase()
+        require(mime in setOf("image/png", "image/jpeg", "image/gif", "image/webp", "image/avif", "image/svg+xml")) { "Unsupported image type" }
+        require(bytes.size in 1..1_048_576) { "Relay supplied assets are limited to 1 MiB" }
+        requireMediaSignature(mime, bytes)
+        return "data:$mime;base64," + Base64.encodeToString(bytes, Base64.NO_WRAP)
+    }
+
+    /** Return every extracted asset in a portable note, including currently unlinked originals. */
+    fun portableAssets(directory: String?): JSONObject {
+        val result = JSONObject()
+        if (directory == null) return result
+        require(Regex("[a-f0-9-]{36}").matches(directory)) { "Portable asset directory is invalid" }
+        val root = File(bundles, directory).canonicalFile
+        require(root.parentFile == bundles.canonicalFile && root.isDirectory) { "Portable assets are unavailable" }
+        root.listFiles()?.sortedBy { it.name }?.forEach { file ->
+            if (!file.isFile) return@forEach
+            val source = "assets/${file.name}"
+            if (!validKey(source)) return@forEach
+            val value = data(file)
+            val (type, bytes) = decode(value)
+            require(mime(source) == type) { "Portable image extension does not match its type" }
+            require(bytes.size <= 25_000_000) { "Portable image exceeds 25 MB" }
+            result.put(source, value)
+        }
+        return result
+    }
+
+    fun portableAssetPage(directory: String?, offset: Int, limit: Int): JSONObject {
+        require(offset in 0..512 && limit in 1..50) { "Invalid asset page" }
+        if (directory == null) return JSONObject().put("assets", JSONArray()).put("total", 0).put("nextOffset", JSONObject.NULL)
+        require(Regex("[a-f0-9-]{36}").matches(directory)) { "Portable asset directory is invalid" }
+        val root = File(bundles, directory).canonicalFile
+        require(root.parentFile == bundles.canonicalFile && root.isDirectory) { "Portable assets are unavailable" }
+        val files = root.listFiles()?.filter { it.isFile && validKey("assets/${it.name}") }?.sortedBy { it.name }.orEmpty()
+        val page = JSONArray()
+        files.drop(offset).take(limit).forEach { file ->
+            val source = "assets/${file.name}"
+            val type = mime(source)
+            val digest = java.security.MessageDigest.getInstance("SHA-256")
+            file.inputStream().use { input ->
+                val buffer = ByteArray(8192)
+                while (true) {
+                    val count = input.read(buffer)
+                    if (count < 0) break
+                    digest.update(buffer, 0, count)
+                }
+            }
+            page.put(JSONObject().put("id", java.security.MessageDigest.getInstance("SHA-256").digest(source.toByteArray(Charsets.UTF_8)).joinToString("") { "%02x".format(it) })
+                .put("name", source).put("mimeType", type).put("bytes", file.length())
+                .put("sha256", digest.digest().joinToString("") { "%02x".format(it) }))
+        }
+        val next = (offset + page.length()).takeIf { it < files.size }
+        return JSONObject().put("assets", page).put("total", files.size).put("nextOffset", next ?: JSONObject.NULL)
+    }
+
+    fun portableAssetBytes(directory: String?, source: String, maxBytes: Int): Pair<String, ByteArray> {
+        val file = local(source, directory) ?: error("Asset is not present in the current note")
+        require(file.length() in 1..maxBytes.toLong()) { "Original asset retrieval is limited to ${maxBytes / 1_000_000} MB" }
+        return mime(source) to file.readBytes()
+    }
+
+    fun resolvePortableAssetName(directory: String?, requested: String): String? {
+        if (directory == null || !Regex("[a-f0-9-]{36}").matches(directory)) return null
+        val root = File(bundles, directory).canonicalFile
+        if (root.parentFile != bundles.canonicalFile || !root.isDirectory) return null
+        val simple = if (requested.startsWith("assets/")) requested.substringAfter('/') else requested
+        val files = root.listFiles()?.filter { it.isFile && validKey("assets/${it.name}") }.orEmpty()
+        val exact = files.firstOrNull { it.name == simple }
+        if (exact != null) return "assets/${exact.name}"
+        return files.firstOrNull { file ->
+            java.security.MessageDigest.getInstance("SHA-256").digest("assets/${file.name}".toByteArray(Charsets.UTF_8))
+                .joinToString("") { "%02x".format(it) } == requested
+        }?.let { "assets/${it.name}" }
+    }
+
+    fun assetMime(name: String): String = mime(name)
+
+    fun decodePortableImage(data: String): Pair<String, ByteArray> = decode(data)
+
+    fun requirePortableImage(type: String, bytes: ByteArray) = requireMediaSignature(type.substringBefore(';').lowercase(), bytes)
+
     fun importJson(images: JSONArray): JSONArray {
         require(images.length() in 1..32)
         var total = 0L; val result = JSONArray()

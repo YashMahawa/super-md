@@ -10,6 +10,8 @@ from PySide6.QtCore import QObject, Signal
 from PySide6.QtGui import QGuiApplication
 import agent_cloud
 import agent_live
+import documents
+from studio import Studio
 from websockets.sync.client import connect
 from websockets.sync.server import serve
 
@@ -26,6 +28,7 @@ class QtStudio(QObject):
     def _agent_job_status(self,job_id): return {"jobId":job_id,"status":"completed","format":"pdf","filename":"Current.pdf","bytes":12,"sha256":"a"*64}
     def _agent_document_action(self,request):
         if request["action"]=="create_document": raise AssertionError("create not part of this test")
+        if request["action"]=="asset_action": return Studio._attach_tab_asset_native(self,request)
         raise AssertionError(request["action"])
     def on_request(self, raw):
         request=json.loads(raw); action=request["action"]; rid=request["requestId"]
@@ -75,6 +78,12 @@ class DesktopCloudQtIntegration(unittest.TestCase):
     def setUp(self):
         self.session=SimpleNamespace(windows={})
         self.studio=QtStudio("qt-window")
+        self.studio.folder = None
+        self.studio.settings = {"newNoteLocation": ""}
+        self.studio.readerCall = SimpleNamespace(emit=lambda _value: None)
+        self.studio._recover = lambda: None
+        self.studio._emit = lambda: None
+        self.session.reader_assets = SimpleNamespace(revoke_tab=lambda *_args: None)
         self.session.windows[self.studio.window_id]=self.studio
         self.bridge=agent_live.create_qt_bridge(self.session,Path(__import__("tempfile").mkdtemp()))
         self.session.agent_bridge=self.bridge; self.studio.session=self.session
@@ -97,6 +106,10 @@ class DesktopCloudQtIntegration(unittest.TestCase):
         return out["result"]
     def test_actual_loopback_http_and_cloud_rpc_source_context_diagram_export_snapshot(self):
         self.studio.live_source="# Current\n\n```svg\n<svg/>\n```\n"
+        portable_root=Path(__import__("tempfile").mkdtemp())
+        portable_path=portable_root/"Current.smd"
+        documents.write_portable(portable_path,self.studio.live_source,{})
+        self.studio.tabs[0].update(path=str(portable_path),name=portable_path.name,portable=True,saved=self.studio.live_source,assets={})
         local=agent_live.LiveTabClient(self.bridge.discovery_path)
         tabs=self.pump_call(local.list_tabs)
         self.assertEqual(tabs["tabs"][0]["revision"],hashlib.sha256(self.studio.live_source.encode()).hexdigest())
@@ -124,6 +137,9 @@ class DesktopCloudQtIntegration(unittest.TestCase):
                       {"action":"list_diagrams","tabId":tab_id,"expectedRevision":revision},
                       {"action":"get_diagram","tabId":tab_id,"diagramId":"diagram:24","expectedRevision":revision,"offset":0,"limit":12000},
                       {"action":"get_diagram_image","tabId":tab_id,"diagramId":"diagram:24","expectedRevision":revision,"width":1600},
+                      {"action":"asset_action","tabId":tab_id,"assetAction":"attach","assetName":"assets/model.svg","mimeType":"image/svg+xml","body":base64.b64encode(b"<svg xmlns='http://www.w3.org/2000/svg'/>").decode(),"expectedRevision":revision},
+                      {"action":"asset_action","tabId":tab_id,"assetAction":"list","expectedRevision":revision},
+                      {"action":"asset_action","tabId":tab_id,"assetAction":"source","assetName":"assets/model.svg","expectedRevision":revision},
                       {"action":"document_action","documentAction":"export","tabId":tab_id,"expectedRevision":revision,"options":{"format":"pdf"}},
                       {"action":"document_action","documentAction":"job_status","tabId":tab_id,"jobId":"job-x"},
                       {"action":"document_action","documentAction":"snapshot","tabId":tab_id,"options":{"width":1600}},
@@ -154,14 +170,17 @@ class DesktopCloudQtIntegration(unittest.TestCase):
         server_holder["server"].shutdown(); server.join(2)
         self.assertTrue(completed.is_set(),f"cloud request sequence did not complete: {failures}")
         self.assertFalse(failures,failures)
-        self.assertEqual(len(calls),9)
+        self.assertEqual(len(calls),12)
         self.assertIn("SVG omitted",calls[1]["result"]["markdown"])
         self.assertNotIn("<svg/>",calls[1]["result"]["markdown"])
         self.assertEqual(calls[2]["result"]["diagrams"][0]["id"],"diagram:24")
         self.assertEqual(calls[3]["result"]["source"],"<svg/>")
         self.assertEqual(calls[4]["result"]["mime_type"],"image/png")
-        self.assertEqual(calls[5]["result"]["status"],"running")
-        self.assertEqual(calls[6]["result"]["status"],"completed")
+        self.assertEqual(calls[5]["result"]["assetName"],"assets/model.svg")
+        self.assertEqual(calls[6]["result"]["assets"][0]["name"],"assets/model.svg")
+        self.assertEqual(base64.b64decode(calls[7]["result"]["body"]),b"<svg xmlns='http://www.w3.org/2000/svg'/>")
+        self.assertEqual(calls[8]["result"]["status"],"running")
+        self.assertEqual(calls[9]["result"]["status"],"completed")
 
     @unittest.skipUnless(shutil.which("node"), "Node.js is required for the relay integration test")
     def test_actual_node_relay_and_python_mcp_client_route_through_qt(self):
@@ -181,6 +200,10 @@ class DesktopCloudQtIntegration(unittest.TestCase):
                     if response.status==200:break
             except Exception:time.sleep(.05)
         else:self.fail("local relay did not become healthy")
+        portable_root=Path(__import__("tempfile").mkdtemp())
+        portable_path=portable_root/"Current.smd"
+        documents.write_portable(portable_path,self.studio.live_source,{})
+        self.studio.tabs[0].update(path=str(portable_path),name=portable_path.name,portable=True,saved=self.studio.live_source,assets={})
         pairing=agent_cloud.device_config(agent_cloud.new_pairing(f"http://127.0.0.1:{port}"),"Qt relay test")
         relay_url=agent_cloud.connector_url(pairing)
         cloud_statuses=[]
@@ -200,9 +223,17 @@ class DesktopCloudQtIntegration(unittest.TestCase):
                     await session.initialize()
                     tools=await session.list_tools()
                     self.assertIn("diagram_action",[tool.name for tool in tools.tools])
+                    self.assertIn("asset_action",[tool.name for tool in tools.tools])
                     first=await session.call_tool("list_tabs",{})
                     rows=json.loads(first.content[0].text)["tabs"]
                     tab=rows[0]["id"];revision=rows[0]["revision"]
+                    svg_body=b"<svg xmlns='http://www.w3.org/2000/svg'><path d='M0 0L2 2'/></svg>"
+                    attached=await session.call_tool("asset_action",{"tabId":tab,"assetAction":"attach","assetName":"assets/model.svg","mimeType":"image/svg+xml","body":base64.b64encode(svg_body).decode(),"expectedRevision":revision})
+                    assets=await session.call_tool("asset_action",{"tabId":tab,"assetAction":"list","expectedRevision":revision})
+                    original_svg=await session.call_tool("asset_action",{"tabId":tab,"assetAction":"source","assetName":"assets/model.svg","expectedRevision":revision,"offset":0,"limit":12000})
+                    original_png_body=base64.b64encode(PNG).decode()
+                    await session.call_tool("asset_action",{"tabId":tab,"assetAction":"attach","assetName":"assets/model.png","mimeType":"image/png","body":original_png_body,"expectedRevision":revision})
+                    original_png=await session.call_tool("asset_action",{"tabId":tab,"assetAction":"source","assetName":"assets/model.png","expectedRevision":revision})
                     read=await session.call_tool("read_tab",{"tabId":tab,"offset":0,"limit":12000})
                     source_read=await session.call_tool("read_tab",{"tabId":tab,"view":"source","offset":0,"limit":12000})
                     context=await session.call_tool("document_action",{"documentAction":"get_context","tabId":tab,"options":{"limit":500}})
@@ -218,6 +249,7 @@ class DesktopCloudQtIntegration(unittest.TestCase):
                     rendered=await session.call_tool("render_tab",{"tabId":tab,"width":1600})
                     snapshot=await session.call_tool("document_action",{"documentAction":"snapshot","tabId":tab,"options":{"width":1600}})
                     result_box.update(read=read,source_read=source_read,context=context_value,
+                                      attach=attached,assets=assets,original_svg=original_svg,original_png=original_png,
                                       diagrams=diagrams,source=source,image=image,export=job,
                                       status=json.loads(status.content[0].text),rendered=rendered,snapshot=snapshot)
         def run_mcp():
@@ -233,6 +265,10 @@ class DesktopCloudQtIntegration(unittest.TestCase):
         self.assertIn("SVG omitted",result_box["read"].content[0].text)
         self.assertIn("<svg/>",result_box["source_read"].content[0].text)
         self.assertEqual(result_box["context"]["reading"]["visibleText"],"Current note")
+        self.assertIn("assets/model.svg",result_box["assets"].content[0].text)
+        self.assertIn("<path",result_box["original_svg"].content[0].text)
+        self.assertEqual(result_box["original_png"].content[0].type,"image")
+        self.assertEqual(base64.b64decode(result_box["original_png"].content[0].data),PNG)
         self.assertEqual(result_box["diagrams"][0]["id"],"diagram:24")
         self.assertIn("<svg/>",result_box["source"].content[0].text)
         self.assertEqual(result_box["image"].content[0].type,"image")

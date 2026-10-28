@@ -37,6 +37,7 @@ test('verifies generated notices and every public help, font, license, and theme
     const required = [
       'LICENSE.txt',
       'THEMING.md',
+      'super-md-agent-SKILL.md',
       'DIAGRAM-RENDERER-LICENSES.txt',
       'WRITING-ASSISTANCE-LICENSES.txt',
       'fonts/reader.ttf',

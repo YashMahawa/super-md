@@ -1052,7 +1052,11 @@ class Studio(QObject):
             path = local_path(destination)
             if path.suffix.casefold() != ".md":
                 path = path.with_suffix(".md")
-            guide = ("# Super MD live-tab MCP setup\n\n"
+            skill_path = ROOT / "dist" / "super-md-agent-SKILL.md"
+            if not skill_path.is_file() and not getattr(sys, "frozen", False):
+                skill_path = ROOT / "docs" / "skills" / "super-md" / "SKILL.md"
+            skill = skill_path.read_text(encoding="utf-8")
+            guide = (skill + "\n\n# Connection for this installation\n\n"
                      "This local MCP server can inspect and revise tabs that are open in this Super MD app session. "
                      "It runs over stdio and reads the private, temporary discovery directory shown below.\n\n"
                      "## MCP client configuration\n\n```json\n" + self.agentSetupInstructions + "\n```\n\n"
@@ -2286,6 +2290,8 @@ class Studio(QObject):
         action = args.get("action")
         if action == "replace_tab_asset":
             return self._replace_tab_asset_native(args)
+        if action == "asset_action" and args.get("assetAction") == "attach":
+            return self._attach_tab_asset_native(args)
         if action == "create_document":
             fmt = args.get("format", "md")
             content = args.get("content", "")
@@ -2361,6 +2367,97 @@ class Studio(QObject):
             self._open_note(resolved, explicit=True)
             return {"status": "opening", "path": resolved, "windowId": self.window_id}
         raise ValueError("Unsupported native document action")
+
+    def _attach_tab_asset_native(self, args):
+        """Attach a bounded local or relay-supplied image to a saved portable note."""
+        tab_id = args.get("tabId")
+        tab = next((item for item in self.tabs if item["id"] == tab_id), None)
+        if not tab or tab_id != self.active:
+            raise ValueError("Attaching an asset requires the target tab to be active")
+        revision = hashlib.sha256(tab["content"].encode("utf-8")).hexdigest()
+        if args.get("expectedRevision") != revision:
+            raise ValueError("Live tab revision changed; inspect it again before attaching an asset")
+        path = Path(tab.get("path") or "")
+        if not tab.get("portable") or path.suffix.lower() != ".smd" or not path.is_file():
+            raise ValueError("Attaching an asset requires a saved portable .smd note")
+        if tab["content"] != tab["saved"]:
+            raise ValueError("Save the note before attaching a portable asset")
+
+        mime = args.get("mimeType")
+        body = args.get("body")
+        asset_path = args.get("assetPath")
+        if (isinstance(body, str)) == (isinstance(asset_path, str) and bool(asset_path)):
+            raise ValueError("Provide exactly one of base64 body or local assetPath")
+        if isinstance(body, str):
+            if mime not in MIMES.values() or len(body) > (MAX_IMAGE * 4 // 3 + 8):
+                raise ValueError("Inline asset type or size is invalid")
+            try:
+                raw = base64.b64decode(body, validate=True)
+            except (ValueError, TypeError) as error:
+                raise ValueError("Asset body must be valid base64") from error
+            if not 1 <= len(raw) <= 1024 * 1024:
+                raise ValueError("Relay supplied assets are limited to 1 MiB")
+            requested_name = args.get("assetName")
+        else:
+            roots = [path.parent]
+            if self.folder:
+                roots.append(Path(self.folder))
+            location = self.settings.get("newNoteLocation")
+            if location:
+                roots.append(Path(location))
+            candidate = Path(asset_path).expanduser()
+            try:
+                candidate = candidate.resolve(strict=True)
+            except OSError as error:
+                raise ValueError("Asset file is unavailable") from error
+            if (not candidate.is_file()
+                    or not any(candidate == root.resolve() or root.resolve() in candidate.parents
+                               for root in roots if root.exists())):
+                raise ValueError("Asset must be inside the current note folder or a configured folder")
+            if candidate.stat().st_size > MAX_IMAGE:
+                raise ValueError("Asset exceeds 25 MB")
+            extension = candidate.suffix.lower().lstrip(".")
+            mime = MIMES.get(extension)
+            if mime is None:
+                raise ValueError("Asset type must be PNG, JPEG, SVG, GIF, WebP or AVIF")
+            raw = candidate.read_bytes()
+            requested_name = args.get("assetName") or candidate.name
+
+        filename = requested_name.removeprefix("assets/") if isinstance(requested_name, str) else ""
+        if not re.fullmatch(r"[A-Za-z0-9._-]{1,150}", filename) or filename in (".", ".."):
+            raise ValueError("Asset name must be a simple filename")
+        extension = Path(filename).suffix.lower().lstrip(".")
+        if not extension:
+            extension = next((ext for ext, kind in MIMES.items() if kind == mime), "")
+            filename += "." + extension
+        if MIMES.get(extension) != mime:
+            raise ValueError("Asset name extension must match the image type")
+        signatures = {"image/png": raw.startswith(b"\x89PNG\r\n\x1a\n"),
+                      "image/jpeg": raw.startswith(b"\xff\xd8\xff"),
+                      "image/webp": len(raw) >= 12 and raw[:4] == b"RIFF" and raw[8:12] == b"WEBP",
+                      "image/gif": raw.startswith((b"GIF87a", b"GIF89a")),
+                      "image/avif": len(raw) >= 12 and raw[4:8] == b"ftyp" and b"avif" in raw[8:16],
+                      "image/svg+xml": b"<svg" in raw[:4096].lower()}
+        if not signatures.get(mime, False):
+            raise ValueError("Asset bytes do not match the declared image type")
+        asset_key = "assets/" + filename
+        assets = tab.get("assets", {})
+        if asset_key in assets:
+            raise ValueError("An asset with that name already exists")
+        disk_content, disk_assets, portable = open_note(path)
+        if not portable or disk_content != tab["saved"] or disk_assets != assets:
+            raise ValueError("The portable note changed on disk; reopen it before attaching an asset")
+        updated = dict(assets)
+        updated[asset_key] = f"data:{mime};base64," + base64.b64encode(raw).decode("ascii")
+        write_portable(path, tab["content"], updated)
+        tab["assets"] = updated
+        tab["saved"] = tab["content"]
+        self.session.reader_assets.revoke_tab(self.window_id, tab_id)
+        self.readerCall.emit("window.dispatchEvent(new Event('supermd-assets-changed'))")
+        self._recover(); self._emit()
+        record = {"name": asset_key, "mime": mime, "bytes": len(raw), "sha256": hashlib.sha256(raw).hexdigest()}
+        return {"tabId": tab_id, "assetName": asset_key, "asset": record, "mimeType": mime,
+                "bytes": len(raw), "sha256": record["sha256"], "revision": revision, "saved": True}
 
     def _save_media_native(self, args):
         body, mime_type, filename = args.get("body"), args.get("mimeType"), args.get("filename", "")

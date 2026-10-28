@@ -589,6 +589,20 @@ private object NoMotionScheme : MotionScheme {
                         }
                     }
                 }
+                "asset_action" -> withSelectedTab {
+                    val flush = JSONObject(request.toString()).put("action", "flush_current")
+                    activity.dispatchAgentRequest(web!!, flush) { _, flushError ->
+                        if (flushError != null) reply(null, flushError)
+                        else scope.launch {
+                            runCatching { model.agentAssetAction(request) }
+                                .onSuccess {
+                                    if (request.optString("assetAction") == "attach") web?.evaluateJavascript("window.dispatchEvent(new Event('supermd-assets-changed'))", null)
+                                    reply(it, null)
+                                }
+                                .onFailure { reply(null, it.message ?: "Could not use the portable image asset") }
+                        }
+                    }
+                }
                 "read_tab", "search_tab", "patch_tab", "get_context", "outline_tab", "latex_review", "latex_apply" -> withSelectedTab { activity.dispatchAgentRequest(web!!, request, reply) }
                 else -> reply(null, "This action is not supported by the Android live reader.")
             }
@@ -1218,7 +1232,8 @@ internal class NoteDestination(private val mime: String, private val preferred: 
                     message = "Private MCP connector URL copied. Share it only with the intended AI client."
                 }) { Text("Copy private MCP URL") }
                 TextButton(onClick = {
-                    pendingGuide = AgentSetupGuide.instructions(config)
+                    val skill = runCatching { activity.assets.open("web/super-md-agent-SKILL.md").bufferedReader().use { it.readText() } }.getOrNull()
+                    pendingGuide = AgentSetupGuide.instructions(config, skill)
                     guideExport.launch("SuperMD-Live-Agent-setup.md")
                 }) { Text("Save setup instructions…") }
             }

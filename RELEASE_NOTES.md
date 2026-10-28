@@ -1,6 +1,11 @@
-# Super MD 0.6.14
+# Super MD 0.6.15
 
 ## Agents in your notes
+
+- Live CLI now saves individual diagram images, extracts original assets, and attaches/replaces images. Local MCP image attachment reaches the app correctly.
+- Cloud MCP can attach an image supplied by an agent and retrieve original SVG text or raster bytes. The app preserves the rest of the portable note.
+- Desktop and Android setup exports include a self-contained SKILL.md workflow for reading the current viewport, retrieving its Markdown, working with diagrams, and making revision-checked edits.
+
 
 - Desktop CLI for creating MD/SMD, bounded section reads, exact text and line patches, image asset replacement, and PDF/SMD export. Edits require a current revision and preserve other assets.
 - Local MCP access to open desktop tabs, including unsaved changes, and remote MCP access to paired desktop and Android devices. Access is off by default.

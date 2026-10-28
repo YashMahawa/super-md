@@ -11,6 +11,7 @@ import http.server
 import hashlib
 import json
 import os
+import re
 import secrets
 import sys
 import threading
@@ -28,6 +29,7 @@ EXPORT_TIMEOUT = 180.0
 MAX_SOURCE_PAGE = 12_000
 MAX_PATCH_BYTES = 64_000
 MAX_SEARCH_CONTEXT = 500
+MAX_RELAY_ASSET_BYTES = 1024 * 1024
 
 
 class LiveBridgeError(RuntimeError):
@@ -177,9 +179,23 @@ class LiveTabClient:
                           **self._window_params(window_id))
 
     def get_diagram_image(self, tab_id: str, diagram_id: str, expected_revision: str,
-                          window_id: str | None = None) -> dict[str, Any]:
+                          window_id: str | None = None, width: int = 1600) -> dict[str, Any]:
+        if not isinstance(width, int) or isinstance(width, bool) or not 64 <= width <= 1600:
+            raise LiveBridgeError("width must be between 64 and 1,600 pixels")
         return self._call("get_diagram_image", tabId=tab_id, diagramId=diagram_id,
-                          expectedRevision=expected_revision, **self._window_params(window_id))
+                          expectedRevision=expected_revision, width=width, **self._window_params(window_id))
+
+    def attach_tab(self, tab_id: str, *, asset_path: str, expected_revision: str,
+                   name: str | None = None, window_id: str | None = None) -> dict[str, Any]:
+        if not isinstance(asset_path, str) or not asset_path or len(asset_path) > 4096:
+            raise LiveBridgeError("asset_path must be a local image file path")
+        if not isinstance(expected_revision, str) or len(expected_revision) != 64:
+            raise LiveBridgeError("expected_revision must be the current SHA-256 revision")
+        if name is not None and (not isinstance(name, str) or len(name.encode("utf-8")) > 256):
+            raise LiveBridgeError("name must be a short asset filename")
+        return self._call("asset_action", tabId=tab_id, assetAction="attach", assetPath=asset_path,
+                          **({"assetName": name} if name else {}), expectedRevision=expected_revision,
+                          **self._window_params(window_id))
 
     def get_tab_image(self, tab_id: str, *, asset_name: str, expected_revision: str,
                       window_id: str | None = None) -> dict[str, Any]:
@@ -258,7 +274,12 @@ class LiveTabClient:
                                     window_id=window_id)
         if action == "get_diagram_image":
             return self.get_diagram_image(tab_id, params.get("diagram_id", ""),
-                                          params.get("expected_revision", ""), window_id=window_id)
+                                          params.get("expected_revision", ""), window_id=window_id,
+                                          width=params.get("width", 1600))
+        if action == "attach_tab_asset":
+            return self.attach_tab(tab_id, asset_path=params.get("asset_path", ""),
+                                   expected_revision=params.get("expected_revision", ""),
+                                   name=params.get("name"), window_id=window_id)
         if action == "replace_tab_asset":
             return self._call("replace_tab_asset", tabId=tab_id, assetName=params.get("asset_name", ""),
                               assetPath=params.get("asset_path", ""),
@@ -510,12 +531,13 @@ def _qt_bridge_class():
                     row["tabId"] = f"{row.get('windowId', '')}:{row.get('id', '')}"
                     row["id"] = row["tabId"]
                 return result
-            if action in ("read_tab", "search_tab", "patch_tab", "render_tab", "list_diagrams", "get_diagram", "get_diagram_image", "replace_tab_asset"):
+            if action in ("read_tab", "search_tab", "patch_tab", "render_tab", "list_diagrams", "get_diagram", "get_diagram_image", "replace_tab_asset", "asset_action"):
                 payload.update({"tabId": raw_tab_id, "windowId": window_id})
                 for external, internal in (("expectedRevision", "expectedRevision"), ("operations", "operations"),
                                            ("offset", "offset"), ("limit", "limit"), ("query", "query"),
                                            ("context", "context"), ("width", "width"), ("diagramId", "diagramId"),
                                            ("assetName", "assetName"), ("assetPath", "assetPath"),
+                                           ("assetAction", "assetAction"), ("mimeType", "mimeType"), ("body", "body"),
                                            ("view", "view")):
                     if external in message:
                         payload[internal] = message[external]
@@ -566,7 +588,7 @@ def _qt_bridge_class():
             if action not in ("list_tabs", "read_tab", "search_tab", "outline_tab", "patch_tab", "render_tab",
                               "get_tab_image", "get_diagram_image", "get_context", "latex_review", "latex_apply", "export_document",
                               "create_document", "save_document", "open_document", "job_status",
-                              "list_diagrams", "get_diagram", "replace_tab_asset"):
+                              "list_diagrams", "get_diagram", "replace_tab_asset", "asset_action"):
                 raise ValueError("Unsupported live-tab operation")
             if action not in ("list_tabs", "create_document", "open_document", "job_status"):
                 tab_id = payload.get("tabId")
@@ -662,6 +684,34 @@ def _qt_bridge_class():
                 revision = payload.get("expectedRevision")
                 if not isinstance(revision, str) or len(revision) != 64 or any(c not in "0123456789abcdef" for c in revision):
                     raise ValueError("expectedRevision must be the current SHA-256 revision")
+            elif action == "asset_action":
+                if payload.get("assetAction") not in ("list", "source", "attach"):
+                    raise ValueError("assetAction must be list, source, or attach")
+                revision = payload.get("expectedRevision")
+                if not isinstance(revision, str) or len(revision) != 64 or any(c not in "0123456789abcdef" for c in revision):
+                    raise ValueError("expectedRevision must be the current SHA-256 revision")
+                kind = payload["assetAction"]
+                name = payload.get("assetName")
+                if kind in ("source", "attach") and (not isinstance(name, str) or not name or len(name.encode("utf-8")) > 256):
+                    if not (kind == "attach" and isinstance(payload.get("assetPath"), str) and payload.get("assetPath")):
+                        raise ValueError("assetName is required")
+                if kind == "attach":
+                    inline = isinstance(payload.get("body"), str)
+                    local_path = isinstance(payload.get("assetPath"), str) and bool(payload.get("assetPath"))
+                    if inline == local_path:
+                        raise ValueError("Attach exactly one of base64 body or local assetPath")
+                    if inline and (payload.get("mimeType") not in ("image/png", "image/jpeg", "image/gif", "image/webp", "image/avif", "image/svg+xml")):
+                        raise ValueError("Attaching an asset requires a supported image mimeType")
+                    if inline and len(payload["body"]) > 1_400_000:
+                        raise ValueError("Asset body must be at most 1 MiB")
+                    if local_path and len(payload["assetPath"]) > 4096:
+                        raise ValueError("Asset path is too long")
+                if kind == "list":
+                    offset, limit = payload.get("offset", 0), payload.get("limit", 50)
+                    if not isinstance(offset, int) or isinstance(offset, bool) or not 0 <= offset <= 512:
+                        raise ValueError("offset must be between 0 and 512")
+                    if not isinstance(limit, int) or isinstance(limit, bool) or not 1 <= limit <= 50:
+                        raise ValueError("limit must be between 1 and 50")
             elif action == "get_context":
                 limit = payload.get("limit", 6000)
                 if not isinstance(limit, int) or isinstance(limit, bool) or not 1 <= limit <= 12_000:
@@ -807,7 +857,7 @@ def _qt_bridge_class():
                     if owner is None:
                         raise ValueError("The requested live tab is no longer open")
                     if tab_id != owner.active:
-                        if action in ("read_tab", "search_tab", "outline_tab", "get_tab_image", "list_diagrams", "get_diagram", "get_diagram_image"):
+                        if action in ("read_tab", "search_tab", "outline_tab", "get_tab_image", "list_diagrams", "get_diagram", "get_diagram_image") or (action == "asset_action" and payload.get("assetAction") != "attach"):
                             self._flush_then_native(request_id, owner, payload)
                             return
                         elif action == "open_document" and not payload.get("filename"):
@@ -830,6 +880,9 @@ def _qt_bridge_class():
                     studio.agentRequest.emit(json.dumps(request, ensure_ascii=False, separators=(",", ":")))
                     return
                 if action == "replace_tab_asset":
+                    self._flush_then_native(request_id, studio, payload)
+                    return
+                if action == "asset_action":
                     self._flush_then_native(request_id, studio, payload)
                     return
                 if action in ("save_document", "open_document"):
@@ -858,6 +911,8 @@ def _qt_bridge_class():
 
         def _native_result(self, payload: dict[str, Any], studio) -> dict[str, Any]:
             action = payload["action"]
+            if action == "asset_action":
+                return self._asset_action_native(payload, studio)
             if action in ("create_document", "save_document", "open_document", "replace_tab_asset"):
                 return studio._agent_document_action(payload)
             tab_id = payload["tabId"]
@@ -976,6 +1031,58 @@ def _qt_bridge_class():
                 return _asset_metadata(tab.get("assets", {}), offset=offset, limit=limit)
             except Exception:
                 return []
+
+        def _asset_action_native(self, args: dict[str, Any], studio) -> dict[str, Any]:
+            tab_id = args.get("tabId")
+            tab = next((item for item in studio.tabs if item["id"] == tab_id), None)
+            if tab is None:
+                raise ValueError("The requested live tab is no longer open")
+            revision = hashlib.sha256(tab["content"].encode("utf-8")).hexdigest()
+            if args.get("expectedRevision") != revision:
+                raise ValueError("Live tab revision changed; inspect it again before using an asset")
+            assets = tab.get("assets", {})
+            action = args.get("assetAction")
+            try:
+                try:
+                    from .documents import image_data, open_note, write_portable, MIMES
+                except ImportError:
+                    from documents import image_data, open_note, write_portable, MIMES
+            except ImportError as error:
+                raise ValueError("Portable asset handling is unavailable") from error
+
+            def resolve_name(value: str) -> str:
+                if value in assets:
+                    return value
+                name = value if value.startswith("assets/") else "assets/" + value
+                if name in assets:
+                    return name
+                return next((key for key in assets if hashlib.sha256(key.encode("utf-8")).hexdigest() == value), "")
+
+            if action == "list":
+                offset, limit = args.get("offset", 0), args.get("limit", 50)
+                page = [{"id": item.get("id"), "name": item.get("name"), "mimeType": item.get("mime"),
+                         "bytes": item.get("bytes"), "sha256": item.get("sha256"), **({"invalid": True} if item.get("invalid") else {})}
+                        for item in self._asset_metadata(tab, offset, limit)]
+                total = len(assets)
+                next_offset = offset + len(page) if offset + len(page) < total else None
+                return {"tabId": tab_id, "revision": revision, "assets": page,
+                        "total": total, "nextOffset": next_offset}
+            if action == "source":
+                name = resolve_name(args.get("assetName", ""))
+                if not name:
+                    raise ValueError("Asset is not present in the current note")
+                try:
+                    mime, raw = image_data(assets[name])
+                except (ValueError, TypeError) as error:
+                    raise ValueError("The embedded image is invalid") from error
+                if not 1 <= len(raw) <= MAX_RELAY_ASSET_BYTES:
+                    raise ValueError("Original asset retrieval is limited to 1 MiB")
+                return {"tabId": tab_id, "revision": revision, "assetName": name, "mimeType": mime,
+                        "bytes": len(raw), "sha256": hashlib.sha256(raw).hexdigest(),
+                        "body": base64.b64encode(raw).decode("ascii")}
+            if action != "attach":
+                raise ValueError("Unsupported asset action")
+            return studio._agent_document_action(args)
 
         def complete(self, request_id: str, result: Any, error: str = "", window_id: str = ""):
             with self._lock:

@@ -2,8 +2,9 @@ package dev.supermd.studio
 
 /** Human-readable handoff shown only after the user explicitly opens Live Agent setup. */
 object AgentSetupGuide {
-    fun instructions(config: AgentAccessConfig): String = buildString {
-        appendLine("Super MD Live Agent")
+    fun instructions(config: AgentAccessConfig, skill: String? = null): String = buildString {
+        if (!skill.isNullOrBlank()) appendLine(skill)
+        appendLine("# Connection for this installation")
         appendLine()
         appendLine("Keep Super MD open and Live Agent Access enabled while the agent is using your tabs.")
         appendLine("Connect your AI client to this private MCP URL using Streamable HTTP:")

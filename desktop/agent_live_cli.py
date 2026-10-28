@@ -17,6 +17,11 @@ MAX_OUTPUT = 64_000
 MAX_INPUT = 64_000
 MAX_CONTENT = 20_000_000
 MAX_IMAGE = 8 * 1024 * 1024
+MAX_ASSET_INPUT = 25 * 1024 * 1024
+ASSET_EXTENSIONS = {
+    "image/png": ".png", "image/jpeg": ".jpg", "image/svg+xml": ".svg",
+    "image/gif": ".gif", "image/webp": ".webp", "image/avif": ".avif",
+}
 
 
 class _CLIError(ValueError):
@@ -25,7 +30,6 @@ class _CLIError(ValueError):
 
 class _JSONArgumentParser(argparse.ArgumentParser):
     def error(self, message):
-        _emit({"ok": False, "error": {"type": "UsageError", "message": message[:1000]}})
         raise _CLIError(message)
 
 
@@ -114,6 +118,36 @@ def _parser() -> argparse.ArgumentParser:
     diagram.add_argument("--offset", type=int, default=0)
     diagram.add_argument("--limit", type=int, default=12_000)
 
+    diagram_image = sub.add_parser("diagram-image", help="Save one rendered diagram as an image")
+    diagram_image.add_argument("tab")
+    diagram_image.add_argument("diagram_id")
+    diagram_image.add_argument("output")
+    diagram_image.add_argument("--revision", required=True)
+    diagram_image.add_argument("--width", type=int, default=1600)
+
+    assets = sub.add_parser("assets", help="List bounded metadata for embedded assets")
+    assets.add_argument("tab")
+    assets.add_argument("--offset", type=int, default=0)
+    assets.add_argument("--limit", type=int, default=50)
+
+    extract = sub.add_parser("extract", help="Save one embedded image asset")
+    extract.add_argument("tab")
+    extract.add_argument("asset_name")
+    extract.add_argument("output")
+    extract.add_argument("--revision", required=True)
+
+    attach = sub.add_parser("attach", help="Attach a local image to an active portable note")
+    attach.add_argument("tab")
+    attach.add_argument("asset_path")
+    attach.add_argument("--revision", required=True)
+    attach.add_argument("--name")
+
+    replace_asset = sub.add_parser("replace-asset", help="Replace one embedded image asset")
+    replace_asset.add_argument("tab")
+    replace_asset.add_argument("asset_id")
+    replace_asset.add_argument("asset_path")
+    replace_asset.add_argument("--revision", required=True)
+
     snapshot = sub.add_parser("snapshot", help="Capture an active tab's rendered viewport as an image")
     snapshot.add_argument("tab")
     snapshot.add_argument("output")
@@ -151,17 +185,23 @@ def _native_id(value: str) -> str:
 
 
 def _write_image(path: str, image: dict[str, Any]) -> dict[str, Any]:
+    return _write_media(path, image, {"image/png": ".png", "image/jpeg": ".jpg", "image/webp": ".webp"},
+                        label="viewport image")
+
+
+def _write_media(path: str, image: dict[str, Any], extensions: dict[str, str], *, label: str) -> dict[str, Any]:
     data = image.get("data")
     mime = image.get("mime_type") or image.get("mimeType")
     if not isinstance(data, bytes) or not 0 < len(data) <= MAX_IMAGE:
-        raise _CLIError("Desktop returned an invalid or oversized viewport image")
-    extensions = {"image/png": ".png", "image/jpeg": ".jpg", "image/webp": ".webp"}
+        raise _CLIError(f"Desktop returned an invalid or oversized {label}")
     extension = extensions.get(mime)
     if extension is None:
-        raise _CLIError("Desktop returned an unsupported viewport image format")
+        raise _CLIError(f"Desktop returned an unsupported {label} format")
     target = Path(path).expanduser()
     if not target.suffix:
         target = target.with_suffix(extension)
+    elif target.suffix.lower() not in ({extension} | ({".jpeg"} if extension == ".jpg" else set())):
+        raise _CLIError(f"Output extension must match {mime} ({extension})")
     flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
     if hasattr(os, "O_NOFOLLOW"):
         flags |= os.O_NOFOLLOW
@@ -178,6 +218,25 @@ def _write_image(path: str, image: dict[str, Any]) -> dict[str, Any]:
     return {"path": str(target.resolve()), "mimeType": mime, "bytes": len(data),
             "width": image.get("width"), "height": image.get("height"),
             "revision": image.get("revision")}
+
+
+def _asset_input(path: str, label: str) -> str:
+    target = Path(path).expanduser()
+    if target.is_symlink() or not target.is_file():
+        raise _CLIError(f"{label} must be a regular local file")
+    extension = target.suffix.lower().lstrip(".")
+    mime_by_extension = {suffix.lstrip("."): mime for mime, suffix in ASSET_EXTENSIONS.items()}
+    mime_by_extension.update({"jpeg": "image/jpeg"})
+    mime = mime_by_extension.get(extension)
+    if mime is None:
+        raise _CLIError(f"{label} must be PNG, JPEG, SVG, GIF, WebP, or AVIF")
+    try:
+        size = target.stat().st_size
+    except OSError as error:
+        raise _CLIError(f"{label} is unavailable") from error
+    if size <= 0 or size > MAX_ASSET_INPUT:
+        raise _CLIError(f"{label} must be between 1 byte and 25 MB")
+    return str(target.resolve(strict=True))
 
 
 def _parse_indices(value: str) -> list[int]:
@@ -263,6 +322,31 @@ def main(argv: list[str] | None = None) -> int:
             result = client.document_action(tab, "get_diagram", diagram_id=args.diagram_id,
                                             expected_revision=args.revision,
                                             offset=args.offset, limit=args.limit)
+        elif args.command == "diagram-image":
+            if not 64 <= args.width <= 1600:
+                raise _CLIError("--width must be between 64 and 1,600 pixels")
+            image = client.document_action(tab, "get_diagram_image", diagram_id=args.diagram_id,
+                                           expected_revision=args.revision, width=args.width)
+            result = _write_media(args.output, image, {"image/png": ".png"}, label="diagram image")
+        elif args.command == "assets":
+            if args.offset < 0 or not 1 <= args.limit <= 50:
+                raise _CLIError("--offset must be nonnegative and --limit must be between 1 and 50")
+            metadata = client.read_tab(tab, offset=0, limit=1,
+                                      asset_offset=args.offset, asset_limit=args.limit)
+            result = {key: metadata[key] for key in
+                      ("revision", "assets", "assetCount", "assetsNextOffset") if key in metadata}
+        elif args.command == "extract":
+            image = client.get_tab_image(tab, asset_name=args.asset_name, expected_revision=args.revision)
+            result = _write_media(args.output, image, ASSET_EXTENSIONS, label="embedded asset")
+            result.update({key: image[key] for key in ("asset", "sha256") if key in image})
+        elif args.command == "attach":
+            asset_path = _asset_input(args.asset_path, "Asset")
+            result = client.attach_tab(tab, asset_path=asset_path,
+                                       expected_revision=args.revision, name=args.name)
+        elif args.command == "replace-asset":
+            asset_path = _asset_input(args.asset_path, "Replacement asset")
+            result = client.document_action(tab, "replace_tab_asset", asset_name=args.asset_id,
+                                            asset_path=asset_path, expected_revision=args.revision)
         elif args.command == "snapshot":
             image = client.render_tab(tab, width=args.width)
             result = _write_image(args.output, image)
@@ -270,7 +354,8 @@ def main(argv: list[str] | None = None) -> int:
             raise _CLIError("Unsupported live command")
         _emit({"ok": True, "result": result})
         return 0
-    except _CLIError:
+    except _CLIError as error:
+        _emit({"ok": False, "error": {"type": "UsageError", "message": str(error)[:1000]}})
         return 2
     except (ValueError, OSError, UnicodeError, TypeError) as error:
         try:
