@@ -15,7 +15,7 @@ supported for connection probes.
 
 ## Tools
 
-The MCP server publishes nine focused tools:
+The MCP server publishes ten focused tools:
 
 - `list_devices` shows paired device display names, platforms, connection
   status, last-seen time and current tabs for connected devices.
@@ -26,6 +26,8 @@ The MCP server publishes nine focused tools:
   diagram image as a real MCP image. Requests include the source revision.
 - `replace_tab_asset` asks the selected device to use an image path within its
   own configured asset roots; no asset path is opened by the relay.
+- `asset_action` lists embedded assets, returns original SVG source or raster
+  image content, and attaches bounded model-supplied images to portable notes.
 - `document_action` requests native create/open/save/export, LaTeX repair,
   export-job status or snapshot. PDF export options use the app's page size,
   margins, type size, line height, paragraph spacing, font, page-number and

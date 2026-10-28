@@ -7,6 +7,9 @@ ColumnLayout {
     id: panel
     required property var hostStudio
     required property var viewState
+    // Re-evaluate the input only when the configured origin actually changes;
+    // unrelated Studio notifications must not erase a partially typed server.
+    property string configuredRelayOrigin: hostStudio.cloudRelayOrigin
     Layout.fillWidth: true
     spacing: 16
 
@@ -70,18 +73,18 @@ ColumnLayout {
         Layout.fillWidth: true
         wrapMode: Text.WordWrap
         color: panel.viewState.colors.muted
-        text: "Pair this computer with the Super MD relay or your own server. The app makes an outbound TLS/WebSocket connection; documents and images are forwarded only when the connected MCP client requests them."
+        text: "Enter your own Super MD relay server or import a trusted pairing file. The app makes an outbound TLS/WebSocket connection; documents and images are forwarded only when the connected MCP client requests them."
     }
     TextField {
         id: relayOrigin
         objectName: "agentRelayOrigin"
         Layout.fillWidth: true
         placeholderText: "https://relay.example.net"
-        text: "https://supermd-agent-relay.onrender.com"
+        text: panel.configuredRelayOrigin
     }
     RowLayout {
         Layout.fillWidth: true
-        ActionButton { objectName: "createAgentPairing"; text: "Create pairing"; glyph: "Plus"; tonal: true; enabled: !panel.hostStudio.cloudAgentRevocationPending; onClicked: panel.hostStudio.createAgentPairing(relayOrigin.text) }
+        ActionButton { objectName: "createAgentPairing"; text: "Create pairing"; glyph: "Plus"; tonal: true; enabled: relayOrigin.text.trim().length > 0 && !panel.hostStudio.cloudAgentRevocationPending; onClicked: panel.hostStudio.createAgentPairing(relayOrigin.text) }
         ActionButton { objectName: "importAgentPairing"; text: "Import pairing…"; glyph: "DownloadSimple"; tonal: true; enabled: !panel.hostStudio.cloudAgentRevocationPending; onClicked: importPairingDialog.open() }
         ActionButton { objectName: "exportAgentPairing"; text: "Export pairing…"; glyph: "Export"; tonal: true; enabled: panel.hostStudio.cloudAgentConfigured && !panel.hostStudio.cloudAgentRevocationPending; onClicked: exportPairingDialog.open() }
     }

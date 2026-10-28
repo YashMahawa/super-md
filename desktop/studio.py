@@ -797,6 +797,19 @@ class Studio(QObject):
         return bridge.cloudClient.status if bridge else "Cloud relay is unavailable."
 
     @Property(str, notify=changed)
+    def cloudRelayOrigin(self):
+        if not self.cloudAgentConfigured:
+            return ""
+        try:
+            try:
+                from .agent_cloud import read_cloud_config
+            except ImportError:
+                from agent_cloud import read_cloud_config
+            return read_cloud_config(self._agent_cloud_config_path)["serverOrigin"]
+        except Exception:
+            return ""
+
+    @Property(str, notify=changed)
     def cloudConnectorUrl(self):
         if not self.cloudAgentConfigured:
             return ""

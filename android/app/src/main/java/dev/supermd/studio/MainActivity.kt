@@ -1141,7 +1141,7 @@ internal class NoteDestination(private val mime: String, private val preferred: 
 @Composable private fun AgentAccessSettings(activity: MainActivity) {
     val scope = rememberCoroutineScope()
     val saved = activity.agentAccessState.currentConfig()
-    var origin by remember { mutableStateOf(saved?.serverOrigin ?: "https://supermd-agent-relay.onrender.com") }
+    var origin by remember { mutableStateOf(saved?.serverOrigin.orEmpty()) }
     var message by remember { mutableStateOf("") }
     var pendingPairingFile by remember { mutableStateOf<String?>(null) }
     var pendingGuide by remember { mutableStateOf<String?>(null) }
@@ -1199,7 +1199,7 @@ internal class NoteDestination(private val mime: String, private val preferred: 
     }
     val config = activity.agentConfigForThisWindow() ?: activity.agentAccessState.currentConfig()
     Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
-        Text("Connect an AI client to currently open tabs on this device. Access is off by default; the relay does not store notes.", style = MaterialTheme.typography.bodyMedium)
+        Text("Enter your own Super MD relay server or import a trusted pairing file. Connect an AI client to currently open tabs on this device. Access is off by default; the relay does not store notes.", style = MaterialTheme.typography.bodyMedium)
         OutlinedTextField(value = origin, onValueChange = { origin = it }, modifier = Modifier.fillMaxWidth(), singleLine = true,
             label = { Text("HTTPS relay origin") }, placeholder = { Text("https://relay.example.com") })
         Row(verticalAlignment = Alignment.CenterVertically) {
@@ -1214,7 +1214,7 @@ internal class NoteDestination(private val mime: String, private val preferred: 
             })
         }
         FlowRow(horizontalArrangement = Arrangement.spacedBy(8.dp), verticalArrangement = Arrangement.spacedBy(6.dp)) {
-            FilledTonalButton(onClick = {
+            FilledTonalButton(enabled = origin.isNotBlank(), onClick = {
                 if (activity.agentAccessState.currentConfig() != null) revokeThen(::createWorkspace) else createWorkspace()
             }) { Text("Create workspace & export pairing file") }
             OutlinedButton(onClick = { pairingImport.launch(arrayOf("application/json", "application/octet-stream", "text/plain")) }) { Text("Join from pairing file…") }

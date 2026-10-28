@@ -1,6 +1,9 @@
-# Super MD 0.6.15
+# Super MD 0.6.16
 
 ## Agents in your notes
+
+- No hosted relay or private connector URL is built into desktop or Android. Enter your own server or import a trusted pairing; existing configurations are preserved.
+
 
 - Live CLI now saves individual diagram images, extracts original assets, and attaches/replaces images. Local MCP image attachment reaches the app correctly.
 - Cloud MCP can attach an image supplied by an agent and retrieve original SVG text or raster bytes. The app preserves the rest of the portable note.

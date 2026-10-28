@@ -5,13 +5,13 @@ Settings → AI agents → **Save setup instructions** includes this skill with 
 connection details for that installation, on desktop and Android. Keep that
 export private because a configured cloud connector URL grants access.
 
-In Settings → AI agents, create a pairing on the built-in relay, then copy the
+In Settings → AI agents, enter your own relay server, create a pairing, enable access, then copy the
 private MCP connector URL into your AI client's remote MCP configuration.
 Import the pairing file on another trusted phone or computer to add it to the
 same workspace. `list_devices` tells the agent which devices are online; give
-mutations an explicit device ID when more than one is connected. The default
-relay is `https://supermd-agent-relay.onrender.com`; you can host the original
-service in `agent-relay/` instead. The public origin alone grants no access.
+mutations an explicit device ID when more than one is connected. No server or
+private connector URL is built into the app. Host the service in `agent-relay/`
+or use a compatible server you control. The public origin alone grants no access.
 Keep the pairing file and connector URL private. Access is off until enabled.
 
 The agent interface reads and edits notes through one Qt-free Python operation
@@ -219,7 +219,7 @@ worker. Token contents are never accepted on the command line or printed.
 ## Remote and cloud use
 
 For live desktop and Android notes, open **Settings → AI agents**, create a
-pairing on the default Super MD relay, enable access, and copy the MCP connector
+pairing on your chosen Super MD relay, enable access, and copy the MCP connector
 URL to your AI client. Both Streamable HTTP and legacy SSE use that same URL.
 Use the exported pairing file to join another trusted device; its own device
 key is generated locally. `list_devices` reports online devices and their open
@@ -256,7 +256,7 @@ app reports that server revocation could not be confirmed. The pairing file is
 trusted enrollment authority: create a new workspace and re-pair your devices
 to replace that authority or the AI connector URL.
 
-The default relay is hosted separately from note storage and retains routing
+The relay is hosted separately from note storage and retains routing
 state only in RAM. Reconnect restores enrollment after a restart. You can
 self-host the same service using [agent-relay](../agent-relay/README.md).
 
