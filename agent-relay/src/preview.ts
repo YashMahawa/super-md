@@ -50,6 +50,27 @@ function record(value: unknown): Record<string, unknown> | undefined {
   return value !== null && typeof value === "object" && !Array.isArray(value) ? value as Record<string, unknown> : undefined;
 }
 
+/** Repair old clients' prefix-relative pagination using their authoritative code-point sourceLength. */
+export function normalizeReadingContext(value: unknown): Record<string, unknown> | undefined {
+  const context = record(value);
+  if (!context) return undefined;
+  const sourceLength = context.sourceLength;
+  const visibleSource = record(context.visibleSource);
+  if (!Number.isSafeInteger(sourceLength) || (sourceLength as number) < 0 || !visibleSource) return context;
+  const start = visibleSource.start;
+  const end = visibleSource.end;
+  if (!Number.isSafeInteger(start) || !Number.isSafeInteger(end) || (start as number) < 0 || (end as number) < (start as number) || (end as number) > (sourceLength as number)) return context;
+  return {
+    ...context,
+    visibleSource: {
+      ...visibleSource,
+      total_chars: sourceLength,
+      next_offset: (end as number) < (sourceLength as number) ? end : null,
+      truncated: (end as number) < (sourceLength as number),
+    },
+  };
+}
+
 function textField(value: unknown, limit: number): string | undefined {
   return typeof value === "string" ? value.slice(0, limit) : undefined;
 }
@@ -145,7 +166,9 @@ export function viewportContexts(image: Record<string, unknown>, requestedTab: s
   const reading = boundedReading(source.reading ?? metadata?.reading);
   const selection = boundedSelection(source.selection ?? metadata?.selection);
   const viewport = boundedViewport(source.viewport ?? metadata?.viewport);
-  const { value: visibleSource, range: sourceRange } = boundedSource(source.visibleSource);
+  const sourceLength = Number.isSafeInteger(source.sourceLength) && (source.sourceLength as number) >= 0 ? source.sourceLength as number : undefined;
+  const normalizedSource = sourceLength === undefined ? source.visibleSource : normalizeReadingContext({ sourceLength, visibleSource: source.visibleSource })?.visibleSource;
+  const { value: visibleSource, range: sourceRange } = boundedSource(normalizedSource);
   const diagrams = boundedDiagrams(source.diagrams);
   const captureContext: Record<string, unknown> = { tabId: requestedTab, revision: expectedRevision };
   if (rawTabId && rawTabId !== requestedTab) captureContext.nativeTabId = rawTabId;
@@ -161,6 +184,7 @@ export function viewportContexts(image: Record<string, unknown>, requestedTab: s
   let capturedReadingContext: Record<string, unknown> | undefined;
   if (hasCoherentCapturedSource) {
     capturedReadingContext = { ...captureContext, visibleSource };
+    if (sourceLength !== undefined) capturedReadingContext.sourceLength = sourceLength;
     if (diagrams) capturedReadingContext.diagrams = diagrams;
   }
   return { captureContext, capturedReadingContext, hasCoherentCapturedSource };

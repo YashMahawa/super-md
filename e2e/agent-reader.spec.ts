@@ -127,3 +127,40 @@ test('live reader serves bounded exact diagram source, visible context and revis
   expect(twiceUndone.text).toBe(Array.from(content).slice(-40).join(''));
   expect(await page.evaluate(()=>(window as any).__agentNative.patches.length)).toBeGreaterThanOrEqual(4);
 });
+
+test('visible context keeps full document cursors and exact partial selections',async({page})=>{
+  const opening='It calculates silhouette only on retained observations.';
+  const paragraphs=Array.from({length:55},(_,i)=>`Paragraph ${i}: a separate page of notes with Unicode 🧭 and useful context.`).join('\n\n');
+  const svg='<svg xmlns="http://www.w3.org/2000/svg" width="64" height="32">'+('<path d="M0 0L1 1"/>'.repeat(20000))+'</svg>';
+  const content=`# Start 🧭\n\n${opening}\n\n${paragraphs}\n\n## Artwork\n\n\`\`\`svg\n${svg}\n\`\`\`\n\n## Ending\n\nEnd of document.`;
+  await page.goto('/android-reader.html');
+  await page.waitForFunction(()=>typeof window.supermdLoad==='function');
+  await page.evaluate(value=>window.supermdLoad?.(value),{id:'agent-context-page',path:null,content,mode:'reader',dark:false,fullscreen:false,colors:{},font:'Manrope',size:16,zoom:100,restorePosition:false});
+  await expect(page.getByRole('heading',{name:'Start 🧭',exact:true})).toBeVisible();
+  await settleReadingScroll(page);
+  const selected=await page.getByText(opening,{exact:true}).evaluate(element=>{
+    const node=element.firstChild!,range=document.createRange();range.setStart(node,7);range.setEnd(node,24);
+    const selection=window.getSelection()!;selection.removeAllRanges();selection.addRange(range);return selection.toString();
+  });
+  expect(selected).toBe(opening.slice(7,24));
+  const context:any=await agent(page,{action:'get_context',tabId:'agent-context-page'});
+  const total=Array.from(content).length;
+  expect(context.sourceLength).toBe(total);
+  expect(context.visibleSource.total_chars).toBe(total);
+  expect(context.visibleSource.end).toBeLessThan(total);
+  expect(context.visibleSource.next_offset).toBe(context.visibleSource.end);
+  expect(context.visibleSource.truncated).toBe(true);
+  expect(context.selection.text).toBe(selected);
+  const next:any=await agent(page,{action:'read_tab',tabId:'agent-context-page',view:'source',offset:context.visibleSource.next_offset,limit:120});
+  expect(next.start).toBe(context.visibleSource.end);
+  expect(next.text).toBe(Array.from(content).slice(next.start,next.end).join(''));
+  await page.evaluate(()=>{window.getSelection()?.removeAllRanges();window.supermdHeading?.('ending');});
+  await expect(page.getByRole('heading',{name:'Ending',exact:true})).toBeVisible();
+  await settleReadingScroll(page);
+  const end:any=await agent(page,{action:'get_context',tabId:'agent-context-page'});
+  expect(end.visibleSource.total_chars).toBe(total);
+  expect(end.visibleSource.end).toBe(total);
+  expect(end.visibleSource.next_offset).toBeNull();
+  expect(end.visibleSource.truncated).toBe(false);
+  expect(end.visibleSource.text).toContain('End of document.');
+});

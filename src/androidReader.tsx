@@ -598,10 +598,13 @@ function Reader() {
           const requestedContextLimit=typeof request.limit==='number'&&Number.isFinite(request.limit)?Math.max(1,Math.min(12000,Math.floor(request.limit))):6000;
           const sourceOffset=agentCharLength(note.content.slice(0,offset)),sourceLimit=Math.max(1,Math.min(requestedContextLimit,agentCharLength(note.content.slice(offset,range?.end??offset+requestedContextLimit))));
           const diagrams=agentDiagrams(note.content).filter(item=>range?item.end>range.start&&item.start<range.end:item.start>=offset&&item.start<offset+requestedContextLimit);
+          const visiblePage=agentRead(range?note.content.slice(0,range.end):note.content,sourceOffset,sourceLimit);
+          // The viewport bounds the page text, not the document's pagination.
+          const visibleSource={...visiblePage,total_chars:base.sourceLength,next_offset:visiblePage.end<base.sourceLength?visiblePage.end:null,truncated:visiblePage.end<base.sourceLength};
           const viewportRect=host?.getBoundingClientRect();
           const left=viewportRect?Math.max(0,viewportRect.left):0,top=viewportRect?Math.max(0,viewportRect.top):0;
           const right=viewportRect?Math.min(window.innerWidth,viewportRect.right):0,bottom=viewportRect?Math.min(window.innerHeight,viewportRect.bottom):0;
-          return {...base,mode:note.mode,zoom:zoomReference.current,reading:{offset:sourceOffset,scrollFraction:host?host.scrollTop/Math.max(1,host.scrollHeight-host.clientHeight):0,heading:visible.find(element=>/^H[1-6]$/.test(element.tagName))?.textContent?.slice(0,300)??'',visibleText},visibleSource:agentRead(range?note.content.slice(0,range.end):note.content,sourceOffset,sourceLimit),diagrams:diagrams.slice(0,30).map(item=>diagramMetadata(note.content,item)),viewport:{x:left,y:top,width:Math.max(0,right-left),height:Math.max(0,bottom-top),viewportWidth:window.innerWidth,viewportHeight:window.innerHeight,devicePixelRatio:window.devicePixelRatio},selection:{text:window.getSelection()?.toString().slice(0,2000)??''}};
+          return {...base,mode:note.mode,zoom:zoomReference.current,reading:{offset:sourceOffset,scrollFraction:host?host.scrollTop/Math.max(1,host.scrollHeight-host.clientHeight):0,heading:visible.find(element=>/^H[1-6]$/.test(element.tagName))?.textContent?.slice(0,300)??'',visibleText},visibleSource,diagrams:diagrams.slice(0,30).map(item=>diagramMetadata(note.content,item)),viewport:{x:left,y:top,width:Math.max(0,right-left),height:Math.max(0,bottom-top),viewportWidth:window.innerWidth,viewportHeight:window.innerHeight,devicePixelRatio:window.devicePixelRatio},selection:{text:window.getSelection()?.toString().slice(0,2000)??''}};
         }
         if(request.action==='latex_review'){
           const repairs=suggestMathRepairs(note.content);let remaining=48000;

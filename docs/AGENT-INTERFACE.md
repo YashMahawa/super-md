@@ -238,7 +238,12 @@ same source revision. A moved reading position is reported with the capture so
 an agent can distinguish it from the preceding source context.
 
 `document_action(get_context)` provides the visible Markdown and current reading
-position. `diagram_action(list/source/image)` identifies diagrams and Markdown
+position. `visibleSource.total_chars` is the full document length in Unicode
+code points. Its `next_offset` continues after the returned source range, even
+when that range ends at the viewport boundary; a null cursor means actual EOF.
+For a current-view question, use that visible range rather than paging through
+the remaining note. `selection.text` preserves the exact selection, including
+partial words. `diagram_action(list/source/image)` identifies diagrams and Markdown
 images, fetches bounded source chunks, or returns a compact JPEG preview (`quality:"high"` for PNG).
 Asset references stay compact; image/base64 bytes are omitted from ordinary
 reads. `render_tab` returns the current themed viewport as an image with position

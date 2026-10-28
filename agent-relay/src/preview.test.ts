@@ -1,7 +1,28 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import sharp from "sharp";
-import { makeJpegPreview, MAX_PREVIEW_OUTPUT_BYTES, MAX_ACTIVE_PREVIEWS, MAX_QUEUED_PREVIEWS, previewQueueState, viewportContexts } from "./preview.js";
+import { makeJpegPreview, MAX_PREVIEW_OUTPUT_BYTES, MAX_ACTIVE_PREVIEWS, MAX_QUEUED_PREVIEWS, normalizeReadingContext, previewQueueState, viewportContexts } from "./preview.js";
+
+test("reading context restores full-source pagination from the authoritative code-point length", () => {
+  const legacy = {
+    sourceLength: 1_431_884,
+    visibleSource: { text: "a猫🙂", start: 1_019_045, end: 1_019_048, total_chars: 1_019_048, next_offset: null, truncated: false },
+    selection: { text: "🙂" },
+  };
+  const normalized = normalizeReadingContext(legacy)!;
+  assert.deepEqual(normalized.visibleSource, { text: "a猫🙂", start: 1_019_045, end: 1_019_048, total_chars: 1_431_884, next_offset: 1_019_048, truncated: true });
+  assert.equal(normalized.selection, legacy.selection, "selection is preserved exactly");
+  assert.equal((normalized.visibleSource as Record<string, unknown>).text, legacy.visibleSource.text, "Unicode source text is untouched");
+
+  const atEof = normalizeReadingContext({ sourceLength: 3, visibleSource: { text: "猫🙂", start: 1, end: 3, total_chars: 3, next_offset: 3, truncated: true } })!;
+  assert.deepEqual(atEof.visibleSource, { text: "猫🙂", start: 1, end: 3, total_chars: 3, next_offset: null, truncated: false });
+  const unknownLength = { visibleSource: { text: "x", start: 0, end: 1, total_chars: 1, next_offset: null, truncated: false } };
+  assert.equal(normalizeReadingContext(unknownLength), unknownLength, "pagination is not guessed when sourceLength is absent");
+  const invalidLength = { sourceLength: Number.MAX_SAFE_INTEGER + 1, visibleSource: { text: "x", start: 0, end: 1, total_chars: 1, next_offset: null, truncated: false } };
+  assert.equal(normalizeReadingContext(invalidLength), invalidLength, "unsafe source lengths are not used");
+  const inconsistentRange = { sourceLength: 4, visibleSource: { text: "x", start: 0, end: 5, total_chars: 5, next_offset: null, truncated: false } };
+  assert.equal(normalizeReadingContext(inconsistentRange), inconsistentRange, "inconsistent ranges are left intact rather than invented");
+});
 
 test("JPEG previews downscale to the requested longest edge without upscaling", async () => {
   const png = await sharp({ create: { width: 1600, height: 900, channels: 3, background: { r: 20, g: 90, b: 170 } } }).png().toBuffer();
@@ -71,4 +92,17 @@ test("capture context is bounded and only replaces reading source at the matchin
   assert.equal(mismatched.hasCoherentCapturedSource, false);
   assert.equal(mismatched.capturedReadingContext, undefined);
   assert.equal(mismatched.captureContext.contextRevisionMatches, false);
+});
+
+test("desktop captured reading context retains sourceLength and corrected pagination", () => {
+  const revision = "d".repeat(64);
+  const captured = viewportContexts({
+    tabId: "note",
+    revision,
+    sourceLength: 1_431_884,
+    visibleSource: { text: "captured", start: 1_019_040, end: 1_019_048, total_chars: 1_019_048, next_offset: null, truncated: false },
+  }, "window:desktop:note", revision);
+  assert.equal(captured.capturedReadingContext?.sourceLength, 1_431_884);
+  assert.deepEqual(captured.capturedReadingContext?.visibleSource, { text: "captured", start: 1_019_040, end: 1_019_048, total_chars: 1_431_884, next_offset: 1_019_048, truncated: true });
+  assert.deepEqual(captured.captureContext.sourceRange, { start: 1_019_040, end: 1_019_048, total_chars: 1_431_884, next_offset: 1_019_048, truncated: true });
 });

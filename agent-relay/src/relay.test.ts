@@ -181,6 +181,18 @@ test("relay auth, bounded device RPC, Streamable HTTP, legacy SSE and disconnect
   assert.equal(fastRequests.find((request) => request.action === "render_tab")?.expectedRevision, revision);
   assert.equal(fastRequests.filter((request) => request.action === "document_action").length, 1);
 
+  fastContext = { tabId: mediaTab, revision, sourceLength: 1_431_884, visibleSource: { text: "a猫🙂", start: 1_019_045, end: 1_019_048, total_chars: 1_019_048, next_offset: null, truncated: false }, selection: { text: "🙂" } };
+  const paginatedRead = await http.callTool({ name: "document_action", arguments: { deviceId, tabId: mediaTab, documentAction: "get_context" } });
+  const paginatedContext = JSON.parse(String(paginatedRead.content?.[0]?.type === "text" ? paginatedRead.content[0].text : "{}"));
+  assert.deepEqual(paginatedContext.visibleSource, { text: "a猫🙂", start: 1_019_045, end: 1_019_048, total_chars: 1_431_884, next_offset: 1_019_048, truncated: true });
+  assert.deepEqual(paginatedContext.selection, { text: "🙂" });
+  const paginatedView = await http.callTool({ name: "view_current", arguments: { deviceId, tabId: mediaTab, includeImage: false } });
+  const paginatedViewText = JSON.parse(String(paginatedView.content?.[0]?.type === "text" ? paginatedView.content[0].text : "{}"));
+  assert.equal(paginatedViewText.readingContext.visibleSource.total_chars, 1_431_884);
+  assert.equal(paginatedViewText.readingContext.visibleSource.next_offset, 1_019_048);
+  assert.equal(paginatedViewText.readingContext.visibleSource.text, "a猫🙂");
+  fastContext = undefined;
+
   const highCurrentView = await http.callTool({ name: "view_current", arguments: { deviceId, tabId: mediaTab, quality: "high" } });
   assert.equal(highCurrentView.isError, undefined);
   assert.equal(highCurrentView.content?.[0]?.type === "image" ? highCurrentView.content[0].mimeType : "", "image/png");
@@ -221,14 +233,17 @@ test("relay auth, bounded device RPC, Streamable HTTP, legacy SSE and disconnect
   fastContext = undefined;
 
   fastContext = { tabId: "note-17", revision, mode: "reading", reading: { offset: 10, heading: "Before scroll" }, visibleSource: { text: "Source from first context read", start: 10, end: 100, total_chars: 1000, next_offset: 100 } };
-  fastCaptureContext = { tabId: "note-17", revision, mode: "reading", zoom: 125, reading: { offset: 900, heading: "After scroll" }, selection: { text: "selected after scroll" }, viewport: { x: 0, y: 90, width: 800, height: 600 }, visibleSource: { text: "Source captured after scroll", start: 900, end: 1000, total_chars: 1000, next_offset: null }, diagrams: [{ id: "diagram:925", kind: "mermaid", sourceStart: 925, sourceEnd: 950, sourceChars: 25, preview: "graph TD; A-->B" }] };
+  fastCaptureContext = { tabId: "note-17", revision, sourceLength: 143_188, mode: "reading", zoom: 125, reading: { offset: 900, heading: "After scroll" }, selection: { text: "selected after scroll" }, viewport: { x: 0, y: 90, width: 800, height: 600 }, visibleSource: { text: "Source captured after scroll", start: 900, end: 1000, total_chars: 1000, next_offset: null }, diagrams: [{ id: "diagram:925", kind: "mermaid", sourceStart: 925, sourceEnd: 950, sourceChars: 25, preview: "graph TD; A-->B" }] };
   const movedView = await http.callTool({ name: "view_current", arguments: { deviceId, tabId: qualifiedDesktopTab } });
   assert.equal(movedView.isError, undefined);
   const movedContext = JSON.parse(String(movedView.content?.[1]?.type === "text" ? movedView.content[1].text : "{}"));
   assert.equal(movedContext.readingContextSource, "viewport_capture", "same-revision captures prefer their own full visible source");
   assert.equal(movedContext.readingContext.reading.offset, 900);
   assert.equal(movedContext.readingContext.visibleSource.text, "Source captured after scroll");
-  assert.equal(movedContext.readingContext.visibleSource.next_offset, null);
+  assert.equal(movedContext.readingContext.sourceLength, 143_188);
+  assert.equal(movedContext.readingContext.visibleSource.total_chars, 143_188);
+  assert.equal(movedContext.readingContext.visibleSource.next_offset, 1000);
+  assert.equal(movedContext.readingContext.visibleSource.truncated, true);
   assert.equal(movedContext.readingContext.diagrams[0].id, "diagram:925");
   assert.equal(movedContext.captureContext.reading.offset, 900);
   assert.equal(movedContext.captureContext.sourceRange.start, 900);

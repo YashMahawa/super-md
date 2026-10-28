@@ -7,7 +7,7 @@ import { SSEServerTransport } from "@modelcontextprotocol/server-legacy/sse";
 import { toNodeHandler } from "@modelcontextprotocol/node";
 import { z } from "zod";
 import { MAX_FRAME_BYTES, MAX_PENDING, REQUEST_TIMEOUT_MS, validateRpcRequest, validReply, type RpcRequest } from "./protocol.js";
-import { decodeViewportBase64, makeJpegPreview, viewportContexts } from "./preview.js";
+import { decodeViewportBase64, makeJpegPreview, normalizeReadingContext, viewportContexts } from "./preview.js";
 
 type Pending = { resolve: (value: { result?: unknown; error?: string }) => void; timer: NodeJS.Timeout };
 type Device = {
@@ -197,7 +197,7 @@ function registerTools(server: McpServer, group: Group): void {
     return selectedQuality === "high" ? imageResult(await rpc(group, request)) : jpegImageResult(await jpegCaptureRpc(group, request), edge);
   });
   server.registerTool("view_current", {
-    description: "Use FIRST to explain the current Super MD reading area. In one call, returns exact reading context and its matching viewport image, including visible source ranges and nearby diagram references.",
+    description: "Use FIRST for the current Super MD page or selected/highlighted text. Returns the exact selection, surrounding Markdown, reading position and visible diagram references in one call, with an optional matching image. Set includeImage:false for selection/text-only questions.",
     inputSchema: { deviceId, tabId: tabId.optional(), width: z.number().int().min(64).max(1600).optional(), quality: z.enum(["standard", "high"]).optional(), includeImage: z.boolean().optional() },
   }, async ({ deviceId: selected, tabId: requestedTab, width, quality, includeImage }) => {
     const chosen = chooseDevice(group, selected);
@@ -222,7 +222,8 @@ function registerTools(server: McpServer, group: Group): void {
     if (contextResponse.error) return toolResponse(contextResponse);
     const context = contextResponse.result as Record<string, unknown> | undefined;
     if (!context || typeof context.tabId !== "string" || !context.tabId || typeof context.revision !== "string" || !/^[a-f0-9]{64}$/i.test(context.revision)) return textResult({ error: "The app returned invalid reading context for the selected tab." }, true);
-    const readingContext = context.tabId === tab ? context : { ...context, tabId: tab, nativeTabId: context.tabId };
+    const normalizedContext = normalizeReadingContext(context) ?? context;
+    const readingContext = normalizedContext.tabId === tab ? normalizedContext : { ...normalizedContext, tabId: tab, nativeTabId: normalizedContext.tabId };
 
     let previewInfo: { mimeType: "image/jpeg" | "image/png"; width: number; height: number; previewOnly: boolean } | undefined;
     let previewContent: { type: "image"; data: string; mimeType: string } | undefined;
@@ -304,10 +305,13 @@ function registerTools(server: McpServer, group: Group): void {
     }
     if (options?.quality !== undefined || options?.width !== undefined) return textResult({ error: "Snapshot width and quality options are only supported for documentAction snapshot." }, true);
     const response = await rpc(group, { action: "document_action", deviceId: selected, documentAction, tabId: tab, expectedRevision, operations, content, jobId, options });
+    if (documentAction === "get_context" && !response.error) {
+      return toolResponse({ ...response, result: normalizeReadingContext(response.result) ?? response.result });
+    }
     return toolResponse(response);
   });
 }
-function buildServer(group: Group): McpServer { const mcp = new McpServer({ name: "super-md-live", version: "0.2.0" }); registerTools(mcp, group); return mcp; }
+function buildServer(group: Group): McpServer { const mcp = new McpServer({ name: "super-md-live", version: "0.2.1" }); registerTools(mcp, group); return mcp; }
 
 const modernHandler = createMcpHandler((ctx) => {
   const path = new URL(ctx.requestInfo!.url).pathname.split("/");
