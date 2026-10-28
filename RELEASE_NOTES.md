@@ -20,5 +20,6 @@
 - Settings is organized into categories. Desktop keyboard shortcuts have a separate popup.
 - The export options dialog provides more vertical space within laptop bounds and a capped height on large monitors. Other dialogs and the compact export progress card retain their sizing.
 - CI checks the relay transports and authentication, compressed-format compatibility, live agent behavior, and the official MCP client against the packaged executable. Windows includes a separate console launcher for MCP stdio.
+- macOS packages include the required WebEngine helper; Intel MCP builds isolate their cryptography runtime from the app's other SSL libraries.
 
 Android uses the existing signing identity and a higher version code for in-place updates.

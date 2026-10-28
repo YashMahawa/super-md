@@ -63,6 +63,7 @@ if sys.platform in ("win32", "darwin"):
 excluded = ["tkinter", "pytest", "PyQt6", "PyQt5"] + (["unittest"] if sys.platform not in ("win32", "darwin") else [])
 analysis = Analysis([str(root / "desktop/main.py")], pathex=[str(root / "desktop")],
     binaries=[(str(engine), "resources/desktop"), *linux_support_binaries(resolve_library_path, sys.platform)], datas=data,
+    hookspath=[str(root / "desktop/pyinstaller_hooks")],
     hiddenimports=hidden,
     excludes=excluded, noarchive=False)
 sys.path.insert(0, str(root / "desktop"))

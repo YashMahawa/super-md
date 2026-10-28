@@ -6,6 +6,7 @@ import asyncio
 import json
 import os
 import subprocess
+import sys
 import tempfile
 from pathlib import Path
 
@@ -24,7 +25,14 @@ async def verify(binary: Path) -> None:
                              env={**os.environ, "PYTHONIOENCODING": "cp1252"})
         if json.loads(cli.stdout.decode("utf-8"))["result"]["text"] != source:
             raise RuntimeError("Packaged CLI did not preserve UTF-8 source over redirected stdio")
-        params = StdioServerParameters(command=str(binary), args=["agent", "mcp", "--root", str(root)])
+        server_env = None
+        if sys.platform == "darwin":
+            # The distributed SDK must initialize and serve tools without a
+            # Homebrew OpenSSL provider directory on the recipient's Mac.
+            modules = root / "empty-openssl-modules"
+            modules.mkdir()
+            server_env = {"OPENSSL_MODULES": str(modules)}
+        params = StdioServerParameters(command=str(binary), args=["agent", "mcp", "--root", str(root)], env=server_env)
         async with Client(params) as client:
             tools = await client.list_tools()
             names = {tool.name for tool in tools.tools}

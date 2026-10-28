@@ -10,11 +10,14 @@ import gzip
 import os
 from pathlib import Path
 import subprocess
+import sys
 import tempfile
-
 
 def check(executable: Path, version: str, graphics: str) -> None:
     executable = executable.resolve()
+    if sys.platform == "darwin":
+        from package_runtime import require_macos_qtwebengine_process
+        require_macos_qtwebengine_process(executable.parents[2])
     with tempfile.TemporaryDirectory(prefix="supermd-packaged-check-") as folder:
         root = Path(folder)
         env = dict(os.environ, XDG_CONFIG_HOME=str(root / "config"),

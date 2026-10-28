@@ -1,5 +1,7 @@
 """Keep the Linux driver ABI owned by the destination distribution."""
 from pathlib import PurePosixPath
+from pathlib import Path
+import os
 
 # PyInstaller intentionally omits many /usr/lib libraries. XCB's helper
 # libraries are not installed on every desktop (including AppImageHub's Xvfb
@@ -10,6 +12,41 @@ X11_SUPPORT = ("libxcb-icccm.so.4", "libxcb-keysyms.so.1", "libxcb-image.so.0",
                "libxcb-randr.so.0", "libxcb-shape.so.0", "libxcb-sync.so.1",
                "libxcb-xfixes.so.0", "libxcb-xkb.so.1", "libxcb-util.so.1",
                "libwayland-client.so.0", "libwayland-cursor.so.0", "libwayland-server.so.0")
+
+
+def qtwebengine_framework_version(framework_path):
+    """Find the real QtWebEngineCore.framework version, excluding resource dirs."""
+    framework = Path(framework_path)
+    versions = framework / "Versions"
+    candidates = sorted(
+        entry.name for entry in versions.iterdir()
+        if entry.name != "Current" and (entry / "QtWebEngineCore").is_file()
+    ) if versions.is_dir() else []
+    if len(candidates) != 1:
+        raise RuntimeError(
+            f"Expected one QtWebEngineCore.framework version containing QtWebEngineCore; "
+            f"found {candidates!r} in {versions}"
+        )
+    return candidates[0]
+
+
+def qtwebengine_framework_entries(entries, selected_version):
+    """Keep only the selected framework version and conventional Current link."""
+    return [entry for entry in entries if entry in (selected_version, "Current")]
+
+
+def macos_qtwebengine_process_path(app_bundle):
+    """Return the QtWebEngineProcess path searched by the frozen macOS app."""
+    return (Path(app_bundle) / "Contents/Frameworks/PySide6/Qt/lib/QtWebEngineCore.framework/"
+            "Helpers/QtWebEngineProcess.app/Contents/MacOS/QtWebEngineProcess")
+
+
+def require_macos_qtwebengine_process(app_bundle):
+    """Fail packaged-app checks when PyInstaller omitted Qt's WebEngine child."""
+    helper = macos_qtwebengine_process_path(app_bundle)
+    if not helper.is_file() or not os.access(helper, os.X_OK):
+        raise RuntimeError(f"Packaged macOS app is missing or has a non-executable QtWebEngineProcess at {helper}")
+    return helper
 
 
 def linux_support_binaries(resolve, platform):
