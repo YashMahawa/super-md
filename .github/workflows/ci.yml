@@ -14,6 +14,21 @@ permissions:
   actions: read
 
 jobs:
+  agent_relay:
+    name: agent_relay
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: agent-relay/package-lock.json
+      - run: npm ci
+        working-directory: agent-relay
+      - run: npm test
+        working-directory: agent-relay
+
   native_frontend:
     name: native_frontend
     runs-on: ubuntu-22.04
@@ -73,9 +88,9 @@ jobs:
         id: python-wheel-identity
         shell: bash
         run: |
-          digest="$(python scripts/python_wheel_identity.py desktop/requirements.txt desktop/requirements-build.txt)"
+          digest="$(python scripts/python_wheel_identity.py desktop/requirements.txt desktop/requirements-build.txt desktop/requirements-agent.txt)"
           echo "digest=$digest" >> "$GITHUB_OUTPUT"
-      - uses: actions/cache@v4
+      - uses: actions/cache/restore@v4
         id: python-wheels
         with:
           path: ${{ runner.temp }}/supermd-python-wheels
@@ -86,7 +101,7 @@ jobs:
           WHEELHOUSE: ${{ runner.temp }}/supermd-python-wheels
           PYTHON_WHEEL_CACHE_HIT: ${{ steps.python-wheels.outputs.cache-hit }}
         run: |
-          python scripts/prepare_python_wheelhouse.py "$WHEELHOUSE" desktop/requirements-build.txt desktop/requirements.txt desktop/requirements-build.txt
+          python scripts/prepare_python_wheelhouse.py "$WHEELHOUSE" desktop/requirements-build.txt desktop/requirements.txt desktop/requirements-build.txt desktop/requirements-agent.txt
           python - <<'PY'
           import json, os, platform, sys
           from pathlib import Path
@@ -104,13 +119,13 @@ jobs:
           output.write_text(json.dumps(report, indent=2) + "\n", encoding="utf-8")
           print(f"wheel_cache_hit={report['cacheHit']} wheel_count={report['wheelCount']}")
           PY
+      # Preserve the validated wheelhouse even if a later UI/package check fails.
+      - uses: actions/cache/save@v4
+        if: steps.python-wheels.outputs.cache-hit != 'true'
+        with:
+          path: ${{ runner.temp }}/supermd-python-wheels
+          key: python-wheelhouse-v3-${{ steps.python-wheel-identity.outputs.digest }}
       - run: python -m unittest scripts.test_prepare_python_wheelhouse
-      - name: Test native state, file safety, themes and actual Qt menu geometry
-        timeout-minutes: 8
-        run: python desktop/run_tests.py
-        env:
-          QT_QPA_PLATFORM: offscreen
-          QT_QUICK_BACKEND: software
       - uses: actions/setup-node@v4
         with:
           node-version: 22
@@ -120,8 +135,11 @@ jobs:
         with:
           workspaces: ./smd-core -> target
           shared-key: native-desktop-${{ runner.os }}-${{ runner.arch }}
+          cache-on-failure: true
       - run: npm ci
       - run: npx tsc -b --pretty false
+      - name: Build the relay for cross-platform Qt/MCP integration tests
+        run: npm ci --prefix agent-relay && npm run build --prefix agent-relay
       - name: Wait for same-run frontend artifacts for this checkout
         shell: bash
         env:
@@ -151,19 +169,37 @@ jobs:
       - run: npx vitest run
       - run: npm run test:pdf
       - run: cargo build --locked --release --manifest-path smd-core/Cargo.toml --bin smd-engine
+      - name: Test native state, file safety, themes and actual Qt menu geometry
+        timeout-minutes: 8
+        run: python desktop/run_tests.py
+        env:
+          QT_QPA_PLATFORM: offscreen
+          QT_QUICK_BACKEND: software
       - run: python desktop/package.py --bundle-only
+      - name: Verify the packaged MCP stdio entry point with the official client
+        shell: bash
+        run: |
+          if [ "$RUNNER_OS" = Windows ]; then
+            binary=desktop/dist/super-md/super-md-cli.exe
+          elif [ "$RUNNER_OS" = macOS ]; then
+            binary="desktop/dist/Super MD.app/Contents/MacOS/super-md"
+          else
+            binary=desktop/dist/super-md/super-md
+          fi
+          python desktop/check_packaged_mcp.py "$binary"
       - name: Check packaged runtime identity and native PDF engine
         shell: bash
         run: |
           if [ "$RUNNER_OS" = Windows ]; then
-            desktop/dist/super-md/super-md.exe --version
-          python desktop/check_bundled_python.py desktop/dist/super-md/super-md.exe
-            desktop/dist/super-md/_internal/resources/desktop/smd-engine.exe doctor
+            binary=desktop/dist/super-md/super-md.exe
+          elif [ "$RUNNER_OS" = macOS ]; then
+            binary="desktop/dist/Super MD.app/Contents/MacOS/super-md"
           else
-            desktop/dist/super-md/super-md --version
-          if [ "$RUNNER_OS" = macOS ]; then python desktop/check_bundled_python.py desktop/dist/super-md/super-md; fi
-            desktop/dist/super-md/_internal/resources/desktop/smd-engine doctor
+            binary=desktop/dist/super-md/super-md
           fi
+          "$binary" --version
+          if [ "$RUNNER_OS" != Linux ]; then python desktop/check_bundled_python.py "$binary"; fi
+          "$binary" doctor
       - name: Recover the packaged reader after an isolated renderer failure
         if: runner.os == 'Linux'
         timeout-minutes: 4
@@ -174,7 +210,13 @@ jobs:
           QT_QPA_PLATFORM: offscreen
         run: |
           version=$(node -p 'require("./package.json").version')
-          if [ "$RUNNER_OS" = Windows ]; then binary=desktop/dist/super-md/super-md.exe; else binary=desktop/dist/super-md/super-md; fi
+          if [ "$RUNNER_OS" = Windows ]; then
+            binary=desktop/dist/super-md/super-md.exe
+          elif [ "$RUNNER_OS" = macOS ]; then
+            binary="desktop/dist/Super MD.app/Contents/MacOS/super-md"
+          else
+            binary=desktop/dist/super-md/super-md
+          fi
           python desktop/check_packaged.py "$binary" "$version" --graphics software
 
   browser:

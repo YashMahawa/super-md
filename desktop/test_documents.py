@@ -4,8 +4,9 @@ import os
 import stat
 import tempfile
 import unittest
+import zlib
 from pathlib import Path
-from documents import atomic_write, atomic_json, bundle, materialize_assets, open_note, validate
+from documents import atomic_write, atomic_json, bundle, compressed_bundle, materialize_assets, open_note, validate, write_portable
 
 class DocumentsTest(unittest.TestCase):
     def test_portable_envelopes_are_detected_independently_of_filename(self):
@@ -19,6 +20,50 @@ class DocumentsTest(unittest.TestCase):
             ordinary=Path(directory)/"data.json"
             ordinary.write_text('{"format":"csv","markdown":"not a bundle"}')
             self.assertEqual(open_note(ordinary),(ordinary.read_text(),{},False))
+
+    def test_gzip_portable_is_deterministic_and_round_trips_source_and_asset_bytes(self):
+        import base64
+        svg="<svg xmlns='http://www.w3.org/2000/svg'><text>α &amp; β</text></svg>".encode()
+        source="# α\n\n![Exact](assets/plot.svg)\n"
+        assets={"assets/plot.svg":"data:image/svg+xml;base64,"+base64.b64encode(svg).decode("ascii")}
+        first=compressed_bundle(source,assets)
+        self.assertEqual(first[:2],b"\x1f\x8b")
+        self.assertEqual(first,compressed_bundle(source,assets))
+        with tempfile.TemporaryDirectory() as directory:
+            path=Path(directory)/"opaque.bin"
+            path.write_bytes(first)
+            self.assertEqual(open_note(path),(source,assets,True))
+            decoded=base64.b64decode(open_note(path)[1]["assets/plot.svg"].split(",",1)[1])
+            self.assertEqual(decoded,svg)
+            write_portable(path,source,assets)
+            self.assertEqual(open_note(path),(source,assets,True))
+
+    def test_gzip_portable_rejects_corruption_truncation_and_extra_members(self):
+        import gzip
+        from documents import _gzip_json_input
+        data=compressed_bundle("# source",{})
+        with tempfile.TemporaryDirectory() as directory:
+            path=Path(directory)/"renamed.txt"
+            for invalid in (data[:-2],data+data,data+b"trailing",bytes([data[0]^255])+data[1:]):
+                path.write_bytes(invalid)
+                with self.assertRaises((ValueError,OSError,zlib.error)):
+                    _gzip_json_input(path)
+                with self.assertRaises((ValueError,OSError)):
+                    open_note(path)
+            bomb=gzip.compress(b"x"*4096,mtime=0)
+            path.write_bytes(bomb)
+            from unittest.mock import patch
+            with patch("documents.MAX_FILE",1024):
+                with self.assertRaises(ValueError): _gzip_json_input(path)
+
+    def test_failed_compressed_write_preserves_existing_destination(self):
+        from unittest.mock import patch
+        with tempfile.TemporaryDirectory() as directory:
+            path=Path(directory)/"note.smd"
+            path.write_bytes(b"existing note")
+            with patch("documents.MAX_FILE",32):
+                with self.assertRaises(ValueError): write_portable(path,"# too large for bound",{})
+            self.assertEqual(path.read_bytes(),b"existing note")
     def test_streamed_recovery_round_trip_and_failed_serialization_are_atomic(self):
         with tempfile.TemporaryDirectory() as directory:
             path=Path(directory)/"recovery.json"

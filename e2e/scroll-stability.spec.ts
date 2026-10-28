@@ -38,18 +38,37 @@ for(const {platform,zoom,cold} of scrollCases){
         const delta=step<14?-520:520,bounds=root.getBoundingClientRect(),point={x:bounds.left+bounds.width*.5,y:bounds.top+bounds.height*.5};
         // Track text expected to remain visible AFTER this input, not an old
         // source line that legitimately leaves the viewport during a burst.
-        const caret=(document as Document&{caretRangeFromPoint?:(x:number,y:number)=>Range|null}).caretRangeFromPoint?.(point.x,delta<0?bounds.top+100:bounds.bottom-100);
-        const range=caret&&root.contains(caret.startContainer)?caret.cloneRange():null;
-        if(range?.startContainer.nodeType===Node.TEXT_NODE&&range.startOffset<(range.startContainer.textContent?.length??0))range.setEnd(range.startContainer,range.startOffset+1);
-        const sourceNode=range?.startContainer,sourceOffset=range?.startOffset;
-        const before=range?.getBoundingClientRect();
-        const scrollBefore=root.scrollTop,block=sourceNode?.parentElement?.closest('[data-windowed-block]');
+        const caretAtPoint=(document as Document&{caretRangeFromPoint?:(x:number,y:number)=>Range|null}).caretRangeFromPoint;
+        const probeY=delta<0?bounds.top+100:bounds.bottom-100;
+        // One point can land in math, whitespace, or a block gap. Sample a
+        // small grid around the same carried source band so each wheel step
+        // can still contribute connected text ranges without changing the
+        // drift threshold or counting a detached/remounted node.
+        const probes=[] as Array<{range:Range;sourceNode:Node;sourceOffset:number;before:DOMRect;block:string|null}>;
+        const sampled=new Map<Node,Set<number>>();
+        for(const yOffset of [-18,0,18])for(const xFraction of [.35,.5,.65]){
+          const caret=caretAtPoint?.call(document,bounds.left+bounds.width*xFraction,probeY+yOffset);
+          if(!caret||!root.contains(caret.startContainer)||caret.startContainer.nodeType!==Node.TEXT_NODE)continue;
+          const range=caret.cloneRange(),sourceNode=range.startContainer,sourceOffset=range.startOffset;
+          if(sourceOffset>=(sourceNode.textContent?.length??0))continue;
+          const offsets=sampled.get(sourceNode)??new Set<number>();
+          if(offsets.has(sourceOffset))continue;
+          offsets.add(sourceOffset);sampled.set(sourceNode,offsets);
+          range.setEnd(sourceNode,sourceOffset+1);
+          const before=range.getBoundingClientRect();
+          if(before.height)probes.push({range,sourceNode,sourceOffset,before,block:sourceNode.parentElement?.closest('[data-windowed-block]')?.textContent?.slice(0,100)??null});
+        }
+        const scrollBefore=root.scrollTop;
         const imageBefore=root.querySelector('.note-image,.image-loading')?.getBoundingClientRect().toJSON();
         window.supermdNativeWheel?.(0,delta,point,false);
         await new Promise(requestAnimationFrame);
         // A removed text node retargets its live Range to a parent. Measuring
         // that parent's rectangle is not measuring the original source line.
-        if(before?.height&&sourceNode?.nodeType===Node.TEXT_NODE&&sourceNode.isConnected&&range?.startContainer===sourceNode&&range.startOffset===sourceOffset){const after=range.getBoundingClientRect();if(after.height){const drift=after.top-before.top+delta;drifts.push(drift);if(Math.abs(drift)>3)anomalies.push({cycle,step,delta,drift,scrollBefore,scrollAfter:root.scrollTop,before:before.toJSON(),after:after.toJSON(),text:sourceNode.textContent,block:block?.textContent?.slice(0,100),imageBefore,imageAfter:root.querySelector('.note-image,.image-loading')?.getBoundingClientRect().toJSON()});}}
+        for(const {range,sourceNode,sourceOffset,before,block} of probes){
+          if(sourceNode.nodeType!==Node.TEXT_NODE||!sourceNode.isConnected||range.startContainer!==sourceNode||range.startOffset!==sourceOffset)continue;
+          const after=range.getBoundingClientRect();
+          if(after.height){const drift=after.top-before.top+delta;drifts.push(drift);if(Math.abs(drift)>3)anomalies.push({cycle,step,delta,drift,scrollBefore,scrollAfter:root.scrollTop,before:before.toJSON(),after:after.toJSON(),text:sourceNode.textContent,block,imageBefore,imageAfter:root.querySelector('.note-image,.image-loading')?.getBoundingClientRect().toJSON()});}
+        }
       }
       return {drifts,anomalies,mounted:root.querySelectorAll('[data-windowed-mounted="true"]').length,total:root.querySelectorAll('[data-windowed-block]').length};
     });

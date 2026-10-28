@@ -305,7 +305,8 @@ class WebEngineContextMenuTest(unittest.TestCase):
     def test_main_qml_routes_real_context_requests_to_only_reader_actions(self):
         handler = _production_context_menu_block()
         self.assertIn("request.accepted = true", handler)
-        self.assertIn("readerContextMenu.popup(request.position.x, request.position.y)", handler)
+        self.assertIn("supermdMediaMenuAt", handler)
+        self.assertIn("if (!handled) readerContextMenu.popup(x, y)", handler)
         self.assertIn('text: "Copy"', handler)
         self.assertIn('text: "Select all"', handler)
         self.assertIn("triggerWebAction(WebEngineView.Copy)", handler)

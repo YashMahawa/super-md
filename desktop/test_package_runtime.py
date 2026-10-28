@@ -1,6 +1,11 @@
 import unittest
+import os
+import tempfile
+from pathlib import Path
 
-from package_runtime import portable_binaries, wayland_dependencies, linux_support_binaries, X11_SUPPORT
+from package_runtime import (portable_binaries, wayland_dependencies, linux_support_binaries,
+                             X11_SUPPORT, qtwebengine_framework_version, qtwebengine_framework_entries,
+                             macos_qtwebengine_process_path, require_macos_qtwebengine_process)
 
 
 class PackageRuntimeTest(unittest.TestCase):
@@ -36,6 +41,31 @@ class PackageRuntimeTest(unittest.TestCase):
         entries = [("libstdc++.so.6", "/build/runtime", "BINARY")]
         for platform in ("win32", "darwin"):
             self.assertEqual(portable_binaries(entries, platform), entries)
+
+    def test_macos_webengine_version_selection_ignores_resources_directory(self):
+        with tempfile.TemporaryDirectory() as directory:
+            framework = Path(directory) / "QtWebEngineCore.framework"
+            (framework / "Versions/A").mkdir(parents=True)
+            (framework / "Versions/A/QtWebEngineCore").write_bytes(b"framework binary")
+            (framework / "Versions/Resources/Helpers").mkdir(parents=True)
+            self.assertEqual(qtwebengine_framework_version(framework), "A")
+            self.assertEqual(qtwebengine_framework_entries(["A", "Resources", "Current"], "A"),
+                             ["A", "Current"])
+
+    def test_macos_packaged_inventory_requires_webengine_process_in_framework_helper_path(self):
+        with tempfile.TemporaryDirectory() as directory:
+            app = Path(directory) / "Super MD.app"
+            helper = macos_qtwebengine_process_path(app)
+            with self.assertRaisesRegex(RuntimeError, "missing or has a non-executable"):
+                require_macos_qtwebengine_process(app)
+            helper.parent.mkdir(parents=True)
+            helper.write_bytes(b"QtWebEngineProcess")
+            helper.chmod(0o755)
+            self.assertEqual(require_macos_qtwebengine_process(app), helper)
+            if os.name == "posix":
+                helper.chmod(0o644)
+                with self.assertRaisesRegex(RuntimeError, "non-executable"):
+                    require_macos_qtwebengine_process(app)
 
 
 if __name__ == "__main__":

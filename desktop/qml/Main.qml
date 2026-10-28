@@ -56,6 +56,36 @@ ApplicationWindow {
         if (!reader) return
         reader.runJavaScript(script, callback)
     }
+    function routeAgentRequest(raw) {
+        let request
+        try { request = JSON.parse(raw) } catch (error) { return }
+        if (request.action === "render_tab") {
+            window.routeAgentRender(request)
+            return
+        }
+        const requestId = JSON.stringify(request.requestId || "")
+        const failure = "window.SuperMD?.post(" + requestId + ", 'agent_result', JSON.stringify({requestId:" + requestId + ",error:'reader is unavailable'}))"
+        if (!window.reader || !viewState.readerReady) {
+            studio.post(request.requestId || "", "agent_result", JSON.stringify({requestId: request.requestId, error: "Reader is not ready"}))
+            return
+        }
+        const encoded = JSON.stringify(request)
+        const script = "(function(){const request=" + encoded + ";if(typeof window.supermdAgentRequest!=='function'){" + failure + ";return;}window.supermdAgentRequest(request,function(result,error){window.SuperMD?.post(request.requestId,'agent_result',JSON.stringify({requestId:request.requestId,result:result,error:error||''}));});})()"
+        window.reader.runJavaScript(script)
+    }
+    function routeAgentRender(request) {
+        if (!window.reader || !viewState.readerReady) {
+            studio.post(request.requestId || "", "agent_render_bounds", JSON.stringify({requestId:request.requestId,error:"Reader is not ready"}))
+            return
+        }
+        const webView = window.reader
+        const contextValue = {requestId:request.requestId, tabId:request.tabId, action:"get_context", limit:6000}
+        if (request.expectedRevision !== undefined) contextValue.expectedRevision = request.expectedRevision
+        const contextRequest = JSON.stringify(contextValue)
+        const requestId = JSON.stringify(request.requestId || "")
+        const script = "(function(){const request=" + contextRequest + ";if(typeof window.supermdAgentRequest!=='function'){window.SuperMD?.post(" + requestId + ",'agent_render_bounds',JSON.stringify({requestId:request.requestId,error:'Reader agent hook is unavailable'}));return;}window.supermdAgentRequest(request,function(context,error){if(error){window.SuperMD?.post(request.requestId,'agent_render_bounds',JSON.stringify({requestId:request.requestId,error:error}));return;}window.SuperMD?.post(request.requestId,'agent_render_bounds',JSON.stringify({requestId:request.requestId,tabId:context&&context.tabId,revision:context&&context.revision,width:request.width||1600,context:context}));});})()"
+        webView.runJavaScript(script)
+    }
     function syncVisibleReaderChrome() {
         window.runDocumentScript("document.documentElement.style.setProperty('--native-visible-chrome-inset','" + readerVisibleChromeInset + "px')")
     }
@@ -211,6 +241,7 @@ ApplicationWindow {
         function onReaderCall(script) { window.runDocumentScript(script) }
         function onReaderReloadRequested() { if (window.reader) window.reader.reload() }
         function onChromeRequested(action) { window.chromeAwake = action === "toggle" ? !window.chromeAwake : action === "show"; if(window.chromeAwake) chromeIdle.restart(); else { chromeIdle.stop(); window.focusReader() } }
+        function onAgentRequest(payload) { window.routeAgentRequest(payload) }
     }
     onViewStateChanged: {
         if (!viewState.readerReady) readerStableTimer.stop()
@@ -434,7 +465,10 @@ ApplicationWindow {
                         readerContextMenu.selectionText = request.selectedText
                         readerContextMenu.editFlags = request.editFlags
                         readerContextMenu.hasLink = request.linkUrl.toString().length > 0
-                        readerContextMenu.popup(request.position.x, request.position.y)
+                        const x = request.position.x, y = request.position.y
+                        window.reader.runJavaScript("Boolean(window.supermdMediaMenuAt && window.supermdMediaMenuAt(" + x + "," + y + "))", function(handled) {
+                            if (!handled) readerContextMenu.popup(x, y)
+                        })
                     }
                     NoteContextMenu {
                         id: readerContextMenu
@@ -557,8 +591,8 @@ ApplicationWindow {
     AppDialog {
         id: settingsDialog
         objectName: "settingsDialog"
-        width: Math.min(580, window.width - 48)
-        height: Math.min(620, window.height - 64)
+        width: Math.min(840, window.width - 48)
+        height: Math.min(760, window.height - 48)
         padding: 0
         onClosed: settingsOpen = false
         SettingsPage { ownerPopup: settingsDialog; viewState: window.viewState; anchors.fill: parent; onBack: settingsOpen = false }
@@ -590,7 +624,7 @@ ApplicationWindow {
         objectName: "exportDialog"
         title: sharing ? "Share note" : "Export note"
         width: Math.min(window.width - 48, Math.max(500, Math.min(720, window.width * .44)))
-        height: Math.min(window.height - 64, 620)
+        height: outputFormat === "pdf" ? Math.min(window.height - 48, Math.max(620, Math.min(900, window.height * .9))) : Math.min(window.height - 48, 390)
         standardButtons: Dialog.Cancel
         ColumnLayout {
             anchors.fill: parent

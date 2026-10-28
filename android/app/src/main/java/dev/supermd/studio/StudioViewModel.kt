@@ -35,7 +35,7 @@ internal fun orderedRecents(notes:List<RecentNote>)=notes.distinctBy {it.uri}.so
 private fun renamedRelative(relative:String?,name:String)=relative?.let {val parent=it.substringBeforeLast('/',"");if(parent.isEmpty())name else "$parent/$name"}
 data class FileEntry(val name: String, val uri: String, val directory: Boolean, val relative: String)
 data class OutlineHeading(val id: String, val title: String, val level: Int, val offset: Int)
-data class StudioState(val latexAutofix:Boolean=false, val selectionAssistant:String="chatgpt", val centerLock:Boolean=true, val customTheme:String="", val patternKind:String="", val patternOpacity:Float=-1f, val patternSize:Float=0f, val patternSpacing:Float=0f, val restorePosition:Boolean=true, val fullDocumentAccessibility:Boolean=false, val startup:String="restore", val imageAppearance:String="original", val svgAppearance:String="original", val imageContrast:Float=1.25f, val spellCheck:Boolean = false, val grammarCheck:Boolean = false, val accent: String = "system", val widthPercent: Float = 100f, val lineHeight: Float = 1.65f, val autosave: Boolean = true, val customFonts: List<String> = emptyList(), val readerOverlay: Boolean = false, val zoomCommand: Long = 0, val tabs: List<Note> = listOf(Note(name = "Welcome.md", content = sample, saved = sample)), val closedTabs: List<Note> = emptyList(), val activeId: String = "", val mode: String = "live", val fullscreen: Boolean = false, val normalZoom: Float = 100f, val fullscreenZoom: Float = 100f, val theme: String = "system", val fullscreenTheme: String = "black", val motion: Boolean = true, val font: String = "Manrope", val size: Float = 15f, val folder: String? = null, val files: List<FileEntry> = emptyList(), val busy: Boolean = false, val message: String? = null, val error: String? = null, val welcomed: Boolean = false, val pdf: String = "{\"pageSize\":\"a4\",\"margin\":18,\"fontSize\":10.0,\"lineHeight\":1.45,\"fontFamily\":\"Manrope\",\"pageNumbers\":true}", val storageReport: StorageReport? = null, val storageScanning: Boolean = false) {
+data class StudioState(val latexAutofix:Boolean=false, val selectionAssistant:String="chatgpt", val centerLock:Boolean=true, val customTheme:String="", val patternKind:String="", val patternOpacity:Float=-1f, val patternSize:Float=0f, val patternSpacing:Float=0f, val restorePosition:Boolean=true, val fullDocumentAccessibility:Boolean=false, val startup:String="restore", val imageAppearance:String="original", val svgAppearance:String="original", val imageContrast:Float=1.25f, val spellCheck:Boolean = false, val grammarCheck:Boolean = false, val accent: String = "system", val widthPercent: Float = 100f, val lineHeight: Float = 1.65f, val autosave: Boolean = true, val customFonts: List<String> = emptyList(), val readerOverlay: Boolean = false, val zoomCommand: Long = 0, val tabs: List<Note> = listOf(Note(name = "Welcome.md", content = sample, saved = sample)), val closedTabs: List<Note> = emptyList(), val activeId: String = "", val mode: String = "live", val fullscreen: Boolean = false, val normalZoom: Float = 100f, val fullscreenZoom: Float = 100f, val theme: String = "system", val fullscreenTheme: String = "black", val motion: Boolean = true, val font: String = "Manrope", val size: Float = 15f, val folder: String? = null, val files: List<FileEntry> = emptyList(), val busy: Boolean = false, val message: String? = null, val error: String? = null, val welcomed: Boolean = false, val pdf: String = "{\"pageSize\":\"a4\",\"margin\":18,\"fontSize\":10.5,\"lineHeight\":1.55,\"paragraphSpacing\":1.35,\"fontFamily\":\"Manrope\",\"pageNumbers\":true}", val storageReport: StorageReport? = null, val storageScanning: Boolean = false) {
     val active get() = tabs.find { it.id == activeId } ?: tabs.first()
     val zoom get() = if (fullscreen) fullscreenZoom else normalZoom
 }
@@ -841,6 +841,9 @@ class StudioViewModel(app: Application, val workspaceKey: String = "main") : And
     }
     fun pdf(value: String) { change { it.copy(pdf = value) }; prefs.edit().putString("pdf", value).apply() }
     fun noteLocation(): String = prefs.getString("newNoteLocation", "") ?: ""
+    internal suspend fun saveAgentMedia(args: JSONObject): JSONObject = withContext(Dispatchers.IO) {
+        media.saveAgentMedia(args, noteLocation())
+    }
     fun noteLocation(uri: Uri) {
         getApplication<Application>().contentResolver.takePersistableUriPermission(uri, Intent.FLAG_GRANT_READ_URI_PERMISSION or Intent.FLAG_GRANT_WRITE_URI_PERMISSION)
         prefs.edit().putString("newNoteLocation", uri.toString()).apply()
@@ -914,7 +917,7 @@ class StudioViewModel(app: Application, val workspaceKey: String = "main") : And
                     buffered.mark(65536)
                     val prefix = ByteArray(32768); val count = buffered.read(prefix); buffered.reset()
                     val header = if (count > 0) String(prefix, 0, count, Charsets.UTF_8).trimStart('\uFEFF', ' ', '\n', '\r', '\t') else ""
-                    val portable = portableEnvelopeHeader(header)
+                    val portable = portableGzipHeader(prefix.copyOfRange(0, maxOf(count, 0))) || portableEnvelopeHeader(header)
                     if (portable) { val opened = media.openFmd(buffered); Note(name = name, uri = uri.toString(), content = opened.markdown, saved = opened.markdown, relative = relative, assetDirectory = opened.directory) }
                     else { val content = readLimited(buffered, 20_000_000).toString(Charsets.UTF_8); Note(name = name, uri = uri.toString(), content = content, saved = content, relative = relative) }
                 } ?: error("Document permission is unavailable; choose it again")
@@ -1053,6 +1056,78 @@ class StudioViewModel(app: Application, val workspaceKey: String = "main") : And
         require(current.fingerprint == expectedFingerprint) { "The image changed; reload the document image" }
         require(current.size <= BoundedAssetInputStream.MAX_READER_ASSET_BYTES) { "Image exceeds 25 MB" }
         return OpenReaderAsset(current.mime, current.fingerprint, current.open())
+    }
+
+    /** Replace one image inside a saved portable note, without changing Markdown or other assets. */
+    internal suspend fun replacePortableAsset(id: String, assetName: String, replacementPath: String, expectedRevision: String): JSONObject = withContext(Dispatchers.IO) {
+        documentWrites.withLock {
+            val note = mutable.value.tabs.find { it.id == id } ?: error("The document is no longer open")
+            require(mutable.value.activeId == id) { "Select the target tab before replacing its image" }
+            val revision = java.security.MessageDigest.getInstance("SHA-256").digest(note.content.toByteArray(Charsets.UTF_8)).joinToString("") { "%02x".format(it) }
+            require(revision == expectedRevision) { "The document changed; read it again before replacing an image" }
+            require(note.portable && note.uri != null && note.saved == note.content) { "Image replacement requires a saved, unchanged portable .smd note" }
+            val sourceList = JSONArray(PdfEngine.imageSources(note.content))
+            val linkedAssets = (0 until sourceList.length()).map { sourceList.getString(it) }.distinct().filter(media::validKey)
+            val resolvedAssetName = linkedAssets.firstOrNull { source ->
+                source == assetName || java.security.MessageDigest.getInstance("SHA-256").digest(source.toByteArray(Charsets.UTF_8)).joinToString("") { byte -> "%02x".format(byte) } == assetName
+            } ?: error("The image ID is not linked from the current note")
+            require(replacementPath.length in 1..4096 && !replacementPath.startsWith("/") && !replacementPath.contains('\\')) {
+                "Choose an image path inside the note folder or an app-authorized asset folder"
+            }
+            val target = media.local(resolvedAssetName, note.assetDirectory) ?: error("Image asset is not present in this portable note")
+            val old = media.readerAsset(target)
+            val (_, incoming) = resolveReaderAsset(note.id, replacementPath)
+            require(incoming.mime == old.mime) { "Replacement must keep the current image type and extension" }
+            require(incoming.size in 1..BoundedAssetInputStream.MAX_READER_ASSET_BYTES) { "Replacement image must be at most 25 MB" }
+            val incomingBytes = incoming.open().use { readLimited(it, 25_000_000) }
+            val backup = target.readBytes()
+            require(backup.size <= 25_000_000) { "Current image exceeds 25 MB" }
+            val temporaryAsset = File(target.parentFile, ".${target.name}.${UUID.randomUUID()}.tmp")
+            val backupAsset = File(target.parentFile, ".${target.name}.${UUID.randomUUID()}.bak")
+            val stagedNote = File(getApplication<Application>().cacheDir, "agent-asset-${UUID.randomUUID()}.smd.gz")
+            val noteUri = Uri.parse(note.uri)
+            var replaced = false
+            var diskAssets: String? = null
+            try {
+                // Refuse to overwrite a portable file whose saved bytes changed outside this app.
+                val disk = resolver.openInputStream(noteUri)?.use(media::openFmd) ?: error("Cannot read the current portable note")
+                diskAssets = disk.directory
+                require(disk.markdown == note.saved) { "The portable note's Markdown changed on disk; reopen it before replacement" }
+                val sources = JSONArray(PdfEngine.imageSources(note.content))
+                (0 until sources.length()).map { sources.getString(it) }.distinct().filter(media::validKey).forEach { source ->
+                    val currentFile = media.local(source, note.assetDirectory) ?: error("An open image is missing: $source")
+                    val diskFile = media.local(source, disk.directory) ?: error("The saved note no longer contains image $source")
+                    require(currentFile.readBytes().contentEquals(diskFile.readBytes())) { "The portable note's images changed on disk; reopen it before replacement" }
+                }
+                require((media.local(resolvedAssetName, disk.directory) ?: error("The saved note no longer contains this image")).readBytes().contentEquals(backup)) {
+                    "The portable note's image changed on disk; reopen it before replacement"
+                }
+                val stagedAssetStream = temporaryAsset.outputStream()
+                stagedAssetStream.use { it.write(incomingBytes); it.fd.sync() }
+                check(target.renameTo(backupAsset)) { "Could not safely stage the current image" }
+                check(temporaryAsset.renameTo(target)) { backupAsset.renameTo(target); error("Could not stage the replacement image") }
+                replaced = true
+                stagedNote.outputStream().use { media.writeLocalPortable(it, note.content, note.assetDirectory) }
+                verifyExportHeader(stagedNote, NativeExportFormat.PORTABLE_SMD)
+                resolver.openOutputStream(noteUri, "wt")?.use { output -> stagedNote.inputStream().use { it.copyTo(output) } }
+                    ?: error("Cannot save the updated portable note")
+                withContext(Dispatchers.Main) {
+                    change { state -> state.copy(tabs = state.tabs.map { if (it.id == id) it.copy(saved = it.content) else it }, busy = false, message = "Portable image replaced") }
+                    mutable.value.tabs.find { it.id == id }?.let(::remember)
+                }
+                backupAsset.delete()
+                JSONObject().put("tabId", id).put("assetName", resolvedAssetName).put("assetId", assetName).put("revision", revision).put("changed", !backup.contentEquals(incomingBytes)).put("saved", true)
+            } catch (error: Exception) {
+                if (replaced) {
+                    target.delete()
+                    backupAsset.renameTo(target)
+                }
+                throw error
+            } finally {
+                temporaryAsset.delete(); backupAsset.delete(); stagedNote.delete()
+                diskAssets?.let { File(getApplication<Application>().filesDir, "portable-assets/$it").deleteRecursively() }
+            }
+        }
     }
     suspend fun python(code: String): JSONObject = withContext(Dispatchers.IO) {
         pythonExecution.lock()

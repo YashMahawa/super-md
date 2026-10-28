@@ -2,8 +2,9 @@
 //! The former FMD envelope remains readable, without silently renaming user files.
 use anyhow::{bail, Result};
 use base64::{engine::general_purpose::STANDARD, Engine};
+use flate2::{bufread::GzDecoder, Compression, GzBuilder};
 use serde::{Deserialize, Serialize};
-use std::collections::BTreeMap;
+use std::{collections::BTreeMap, io::{self, Cursor, Read, Write}};
 
 pub const MAX_FILE: usize = 120_000_000;
 pub const MAX_IMAGE: usize = 25_000_000;
@@ -52,6 +53,50 @@ impl PortableDocument {
         Ok(document)
     }
     pub fn encode(&self) -> Result<String> { self.validate()?; let value = serde_json::to_string(self)?; if value.len() > MAX_FILE { bail!("FMD file exceeds 120 MB"); } Ok(value) }
+
+    /// Encode the unchanged v1 JSON envelope in a deterministic, single-member gzip stream.
+    pub fn encode_compressed(&self) -> Result<Vec<u8>> {
+        self.validate()?;
+        let mut output = Vec::new();
+        {
+            let mut gzip = GzBuilder::new().mtime(0).operating_system(255).write(&mut output, Compression::best());
+            struct Bounded<'a, W: Write> { inner: &'a mut W, bytes: usize }
+            impl<W: Write> Write for Bounded<'_, W> {
+                fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+                    if self.bytes.saturating_add(bytes.len()) > MAX_FILE { return Err(io::Error::new(io::ErrorKind::InvalidData, "SMD JSON exceeds 120 MB")); }
+                    let written = self.inner.write(bytes)?; self.bytes += written; Ok(written)
+                }
+                fn flush(&mut self) -> io::Result<()> { self.inner.flush() }
+            }
+            let mut bounded = Bounded { inner: &mut gzip, bytes: 0 };
+            serde_json::to_writer(&mut bounded, self)?;
+            drop(bounded);
+            gzip.finish()?;
+        }
+        if output.len() > MAX_FILE { bail!("Compressed SMD file exceeds 120 MB"); }
+        Ok(output)
+    }
+
+    /// Decode legacy JSON or the default gzip-wrapped v1 envelope. Both limits are
+    /// applied before JSON parsing, and gzip must contain exactly one complete member.
+    pub fn decode_bytes(input: &[u8]) -> Result<Self> {
+        if input.len() > MAX_FILE { bail!("SMD file exceeds 120 MB"); }
+        if input.starts_with(&[0x1f, 0x8b]) {
+            let cursor = Cursor::new(input);
+            let mut decoder = GzDecoder::new(cursor);
+            let mut json = Vec::new();
+            decoder.by_ref().take((MAX_FILE + 1) as u64).read_to_end(&mut json)?;
+            if json.len() > MAX_FILE { bail!("Inflated SMD exceeds 120 MB"); }
+            let consumed = decoder.into_inner().position() as usize;
+            if consumed != input.len() { bail!("SMD gzip stream contains trailing or concatenated data"); }
+            let document: Self = serde_json::from_slice(&json)?;
+            document.validate()?;
+            Ok(document)
+        } else {
+            let text = std::str::from_utf8(input)?;
+            Self::decode(text)
+        }
+    }
 }
 
 /// Offline CLI packing uses parser offsets so code and other Markdown are not
@@ -89,5 +134,25 @@ pub fn pack(markdown: &str, mut load: impl FnMut(&str) -> Result<String>) -> Res
         for name in ["../x", "assets/../x", "assets/x/y", "/x"] { assert!(!asset_name(name)); }
         assert!(image_bytes("data:text/html;base64,eA==").is_err());
         let mut doc = PortableDocument::new("notes".into(), BTreeMap::new()); doc.version = 2; assert!(doc.encode().is_err());
+    }
+    #[test] fn compressed_v1_round_trip_is_deterministic_and_preserves_assets() {
+        let svg = "<svg xmlns='http://www.w3.org/2000/svg'><text>α</text></svg>".as_bytes();
+        let doc = PortableDocument::new("# α\n\n![Proof](assets/proof.svg)\n".into(), BTreeMap::from([("assets/proof.svg".into(), format!("data:image/svg+xml;base64,{}", STANDARD.encode(svg)))]));
+        let first = doc.encode_compressed().unwrap();
+        assert_eq!(first, doc.encode_compressed().unwrap());
+        assert_eq!(&first[..2], &[0x1f, 0x8b]);
+        let reopened = PortableDocument::decode_bytes(&first).unwrap();
+        assert_eq!(reopened.markdown, doc.markdown);
+        assert_eq!(image_bytes(&reopened.assets["assets/proof.svg"]).unwrap().1, svg);
+        assert_eq!(PortableDocument::decode(&doc.encode().unwrap()).unwrap().markdown, doc.markdown);
+    }
+    #[test] fn rejects_truncated_and_concatenated_gzip_members() {
+        let doc = PortableDocument::new("source".into(), BTreeMap::new());
+        let encoded = doc.encode_compressed().unwrap();
+        assert!(PortableDocument::decode_bytes(&encoded[..encoded.len()-2]).is_err());
+        let mut joined = encoded.clone(); joined.extend_from_slice(&encoded);
+        assert!(PortableDocument::decode_bytes(&joined).is_err());
+        let mut trailing = encoded.clone(); trailing.push(0);
+        assert!(PortableDocument::decode_bytes(&trailing).is_err());
     }
 }

@@ -19,7 +19,7 @@
 
 Super MD brings expressive native controls, focused reading, and interactive study tools to ordinary Markdown. Open a file or folder and get started—no vault, import process, account, or proprietary note database.
 
-Write in `.md`. Carry a note and its images together in `.smd`. Export a properly typeset PDF when it is time to share.
+Write in `.md`. Carry a note and its images together in a losslessly compressed `.smd`. Export a properly typeset PDF when it is time to share.
 
 ## See it in action
 
@@ -138,6 +138,23 @@ smd-engine export lesson.smd lesson.pdf
 ```
 
 See the [authoring guide](docs/AUTHORING.md) for supported syntax, runnable examples, portable-file limits, and GUI versus headless export capabilities.
+
+### Work with an agent in the same note
+
+Connect a local or remote MCP client to open tabs, including unsaved edits, on
+Android and desktop. Choose a connected device, read the current visible
+Markdown and diagram source, inspect a viewport snapshot, search a section, or
+apply a targeted edit with a revision check. Large SVG bodies and image bytes
+stay out of ordinary text responses.
+
+The desktop CLI creates and edits MD/SMD files, replaces individual assets, and
+exports documents without a custom Python script. Live access also offers the
+app's PDF controls and LaTeX repair. Settings provides connection and pairing
+instructions; see the [CLI and MCP guide](docs/AGENT-INTERFACE.md).
+
+Access is off by default. Local connections stay on loopback; cloud devices
+connect outward to an authenticated relay. Pairing files and connector URLs
+are private credentials. The relay keeps no document database.
 
 ### Built around local work
 

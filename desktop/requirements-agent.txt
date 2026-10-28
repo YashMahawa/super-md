@@ -1,0 +1,4 @@
+# Optional, isolated runtime for the MCP server. The native CLI uses stdlib only.
+# Pin the official Model Context Protocol SDK v2 stable release tested by this interface.
+mcp==2.3.0
+websockets==15.0.1

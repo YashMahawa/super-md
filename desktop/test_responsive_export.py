@@ -48,7 +48,8 @@ function chooseExportDestination() {}
             window.setWidth(2560);window.setHeight(1440);QTest.qWait(100)
             self.assertEqual(dialog.property('width'),720)
             self.assertGreater(dialog.property('height'),small_height)
-            self.assertLessEqual(dialog.property('height'),window.height()-64)
+            self.assertLessEqual(dialog.property('height'),900,'Large displays must not create a tall empty export card')
+            self.assertLessEqual(dialog.property('height'),window.height()-48)
             font=controls.property('controlFont');self.assertEqual(font.pixelSize(),small_font)
             self.assertEqual(font.pixelSize(),14)
             choice=controls.findChild(QObject,'pdfFontChoice')
@@ -58,7 +59,7 @@ function chooseExportDestination() {}
             if os.environ.get('SUPERMD_EXPORT_TEST_OUTPUT'):window.grabWindow().save(os.environ['SUPERMD_EXPORT_TEST_OUTPUT'])
             window.setWidth(660);window.setHeight(480);QTest.qWait(60)
             self.assertLessEqual(dialog.property('width'),window.width()-48)
-            self.assertLessEqual(dialog.property('height'),window.height()-64)
+            self.assertLessEqual(dialog.property('height'),window.height()-48)
             self.assertEqual(controls.property('controlFont').pixelSize(),14)
             QMetaObject.invokeMethod(dialog,'close')
             deadline=time.monotonic()+2

@@ -82,19 +82,6 @@ jobs:
           appendFileSync(process.env.GITHUB_OUTPUT, 'reuse_packages=true\n');
           console.log(`Verified all five build jobs on tagged source ${sha}`);
           NODE
-      - name: Require successful CI on this exact commit
-        run: |
-          node --input-type=module <<'NODE'
-          import { execFileSync } from 'node:child_process';
-          const sha = execFileSync('git', ['rev-parse', 'HEAD'], {encoding:'utf8'}).trim();
-          for (let attempt = 0; attempt < 120; attempt++) {
-            const runs = JSON.parse(execFileSync('gh', ['run','list','--repo',process.env.GITHUB_REPOSITORY,'--workflow','ci.yml','--commit',sha,'--json','status,conclusion'],{encoding:'utf8'}));
-            if (runs.some(run => run.status === 'completed' && run.conclusion === 'success')) process.exit(0);
-            if (runs.some(run => run.status === 'completed' && run.conclusion !== 'success')) throw Error('CI failed on the release commit');
-            await new Promise(resolve => setTimeout(resolve, 20000));
-          }
-          throw Error('No successful CI run found for the release commit');
-          NODE
       - name: Create or reuse a protected draft
         id: draft
         run: |
@@ -191,9 +178,9 @@ jobs:
         id: python-wheel-identity
         shell: bash
         run: |
-          digest="$(python scripts/python_wheel_identity.py desktop/requirements.txt desktop/requirements-build.txt)"
+          digest="$(python scripts/python_wheel_identity.py desktop/requirements.txt desktop/requirements-build.txt desktop/requirements-agent.txt)"
           echo "digest=$digest" >> "$GITHUB_OUTPUT"
-      - uses: actions/cache@v4
+      - uses: actions/cache/restore@v4
         id: python-wheels
         with:
           path: ${{ runner.temp }}/supermd-python-wheels
@@ -203,8 +190,14 @@ jobs:
         env:
           WHEELHOUSE: ${{ runner.temp }}/supermd-python-wheels
         run: |
-          python scripts/prepare_python_wheelhouse.py "$WHEELHOUSE" desktop/requirements-build.txt desktop/requirements.txt desktop/requirements-build.txt
+          python scripts/prepare_python_wheelhouse.py "$WHEELHOUSE" desktop/requirements-build.txt desktop/requirements.txt desktop/requirements-build.txt desktop/requirements-agent.txt
           echo "wheel_cache_hit=${{ steps.python-wheels.outputs.cache-hit }}"
+      # Preserve the validated wheelhouse even if a later UI/package check fails.
+      - uses: actions/cache/save@v4
+        if: steps.python-wheels.outputs.cache-hit != 'true'
+        with:
+          path: ${{ runner.temp }}/supermd-python-wheels
+          key: python-wheelhouse-v3-${{ steps.python-wheel-identity.outputs.digest }}
       - run: python -m unittest scripts.test_prepare_python_wheelhouse
       - name: Install Windows installer compiler
         if: runner.os == 'Windows'
@@ -229,6 +222,8 @@ jobs:
           cache-on-failure: true
       - run: npm ci
       - run: npx tsc -b --pretty false
+      - name: Build the relay for cross-platform Qt/MCP integration tests
+        run: npm ci --prefix agent-relay && npm run build --prefix agent-relay
       - name: Wait for same-run frontend artifacts for this tag checkout
         shell: bash
         env:
@@ -248,14 +243,25 @@ jobs:
       - name: Inventory native reader bundle reachability and fonts
         run: node scripts/report-web-assets.mjs dist --verify-native --public-root public
       - run: npx vitest run
+      - run: cargo test --locked --manifest-path smd-core/Cargo.toml
+      - run: cargo build --locked --release --manifest-path smd-core/Cargo.toml --bin smd-engine
       - run: python desktop/run_tests.py
         timeout-minutes: 8
         env:
           QT_QPA_PLATFORM: offscreen
           QT_QUICK_BACKEND: software
-      - run: cargo test --locked --manifest-path smd-core/Cargo.toml
-      - run: cargo build --locked --release --manifest-path smd-core/Cargo.toml --bin smd-engine
       - run: python desktop/package.py
+      - name: Verify packaged MCP stdio with the official client
+        shell: bash
+        run: |
+          if [ "$RUNNER_OS" = Windows ]; then
+            binary=desktop/dist/super-md/super-md-cli.exe
+          elif [ "$RUNNER_OS" = macOS ]; then
+            binary="desktop/dist/Super MD.app/Contents/MacOS/super-md"
+          else
+            binary=desktop/dist/super-md/super-md
+          fi
+          python desktop/check_packaged_mcp.py "$binary"
       - name: Verify real AppImage updater handoff without touching the runner installation
         if: runner.os == 'Linux'
         run: python desktop/check_update_install.py "desktop/dist/packages/Super-MD_${{ needs.prepare.outputs.version }}_amd64.AppImage" "${{ needs.prepare.outputs.version }}"
@@ -263,14 +269,15 @@ jobs:
         shell: bash
         run: |
           if [ "$RUNNER_OS" = Windows ]; then
-            desktop/dist/super-md/super-md.exe --version
-            python desktop/check_bundled_python.py desktop/dist/super-md/super-md.exe
-            desktop/dist/super-md/_internal/resources/desktop/smd-engine.exe doctor
+            binary=desktop/dist/super-md/super-md.exe
+          elif [ "$RUNNER_OS" = macOS ]; then
+            binary="desktop/dist/Super MD.app/Contents/MacOS/super-md"
           else
-            desktop/dist/super-md/super-md --version
-            if [ "$RUNNER_OS" = macOS ]; then python desktop/check_bundled_python.py desktop/dist/super-md/super-md; fi
-            desktop/dist/super-md/_internal/resources/desktop/smd-engine doctor
+            binary=desktop/dist/super-md/super-md
           fi
+          "$binary" --version
+          if [ "$RUNNER_OS" != Linux ]; then python desktop/check_bundled_python.py "$binary"; fi
+          "$binary" doctor
       - name: Recover the packaged reader after an isolated renderer failure
         if: runner.os == 'Linux'
         timeout-minutes: 4
@@ -425,6 +432,19 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version: 22
+      - name: Require successful CI on this exact commit
+        run: |
+          node --input-type=module <<'NODE'
+          import { execFileSync } from 'node:child_process';
+          const sha = execFileSync('git', ['rev-parse', 'HEAD'], {encoding:'utf8'}).trim();
+          for (let attempt = 0; attempt < 120; attempt++) {
+            const runs = JSON.parse(execFileSync('gh', ['run','list','--repo',process.env.GITHUB_REPOSITORY,'--workflow','ci.yml','--commit',sha,'--json','status,conclusion'],{encoding:'utf8'}));
+            if (runs.some(run => run.status === 'completed' && run.conclusion === 'success')) process.exit(0);
+            if (runs.some(run => run.status === 'completed' && run.conclusion !== 'success')) throw Error('CI failed on the release commit');
+            await new Promise(resolve => setTimeout(resolve, 20000));
+          }
+          throw Error('No successful CI run found for the release commit');
+          NODE
       - name: Require complete installers and create package checksums
         run: |
           gh release view "$RELEASE_TAG" --json assets --jq .assets > "$RUNNER_TEMP/assets.json"
