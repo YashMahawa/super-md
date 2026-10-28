@@ -203,7 +203,8 @@ class WheelhouseManifestTests(unittest.TestCase):
     def test_valid_warm_cache_installs_without_fetch_or_rebuild(self):
         self._wheel(self.cache)
         wheelhouse.write_manifest(self.cache, [self.requirements])
-        with patch.object(wheelhouse, "install_offline", return_value=True) as install, \
+        with patch.object(wheelhouse, "native_build_inputs", return_value={}), \
+                patch.object(wheelhouse, "install_offline", return_value=True) as install, \
                 patch.object(wheelhouse.subprocess, "run", side_effect=AssertionError("warm cache must not rebuild")):
             outcome = wheelhouse.prepare(self.cache, self.requirements, [self.requirements])
         self.assertEqual(outcome, "cache-validated")
@@ -212,7 +213,8 @@ class WheelhouseManifestTests(unittest.TestCase):
 
     def test_partial_corrupt_cache_rebuilds_in_fresh_stage_and_preserves_old_files(self):
         self._wheel(self.cache, b"same filename, corrupt contents")
-        with patch.object(wheelhouse.subprocess, "run", side_effect=self._wheel_command()), \
+        with patch.object(wheelhouse, "native_build_inputs", return_value={}), \
+                patch.object(wheelhouse.subprocess, "run", side_effect=self._wheel_command()), \
                 patch.object(wheelhouse, "install_offline", return_value=True) as install:
             outcome = wheelhouse.prepare(self.cache, self.requirements, [self.requirements])
 
@@ -227,7 +229,8 @@ class WheelhouseManifestTests(unittest.TestCase):
         old_wheel = self._wheel(self.cache, b"old wheel")
         old_manifest = wheelhouse.write_manifest(self.cache, [self.requirements])
         old_manifest_bytes = (self.cache / wheelhouse.MANIFEST).read_bytes()
-        with patch.object(wheelhouse.subprocess, "run", side_effect=self._wheel_command()), \
+        with patch.object(wheelhouse, "native_build_inputs", return_value={}), \
+                patch.object(wheelhouse.subprocess, "run", side_effect=self._wheel_command()), \
                 patch.object(wheelhouse, "install_offline", side_effect=[False, False]) as install:
             with self.assertRaisesRegex(RuntimeError, "Offline install failed"):
                 wheelhouse.prepare(self.cache, self.requirements, [self.requirements])
@@ -242,7 +245,8 @@ class WheelhouseManifestTests(unittest.TestCase):
         old_wheel = self._wheel(self.cache, b"old wheel")
         wheelhouse.write_manifest(self.cache, [self.requirements])
         old_manifest = (self.cache / wheelhouse.MANIFEST).read_bytes()
-        with patch.object(wheelhouse, "install_offline", return_value=False), \
+        with patch.object(wheelhouse, "native_build_inputs", return_value={}), \
+                patch.object(wheelhouse, "install_offline", return_value=False), \
                 patch.object(wheelhouse.subprocess, "run", side_effect=subprocess.CalledProcessError(1, ["pip", "wheel"])) as run:
             with self.assertRaises(subprocess.CalledProcessError):
                 wheelhouse.prepare(self.cache, self.requirements, [self.requirements])
@@ -256,7 +260,8 @@ class WheelhouseManifestTests(unittest.TestCase):
         self._wheel(self.cache, b"current corrupt cache")
         quarantine = self.cache.with_name("wheelhouse.quarantine")
         self._wheel(quarantine, b"older preserved quarantine")
-        with patch.object(wheelhouse.subprocess, "run", side_effect=self._wheel_command()), \
+        with patch.object(wheelhouse, "native_build_inputs", return_value={}), \
+                patch.object(wheelhouse.subprocess, "run", side_effect=self._wheel_command()), \
                 patch.object(wheelhouse, "install_offline", return_value=True):
             outcome = wheelhouse.prepare(self.cache, self.requirements, [self.requirements])
         self.assertEqual(outcome, "rebuilt-uncached")
