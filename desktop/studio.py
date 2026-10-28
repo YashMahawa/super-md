@@ -59,8 +59,12 @@ DEFAULTS.update(agentAccessEnabled=False, cloudAgentEnabled=False)
 
 def agent_mcp_setup_config(discovery_dir, *, executable=None, frozen=None, platform=None, cli_script=None):
     """Return a directly executable, absolute MCP stdio command for this install."""
-    executable_path = Path(executable or sys.executable).expanduser().resolve()
     frozen = getattr(sys, "frozen", False) if frozen is None else bool(frozen)
+    # Resolving a source venv's Python symlink would bypass that environment
+    # and lose its MCP dependencies. Frozen launchers can use canonical paths.
+    executable_path = Path(os.path.abspath(Path(executable or sys.executable).expanduser()))
+    if frozen:
+        executable_path = executable_path.resolve()
     platform = sys.platform if platform is None else platform
     if frozen:
         if platform.startswith("win"):
@@ -68,7 +72,9 @@ def agent_mcp_setup_config(discovery_dir, *, executable=None, frozen=None, platf
         elif platform.startswith("linux"):
             appimage = os.environ.get("APPIMAGE", "")
             appimage_path = Path(appimage).expanduser() if appimage else None
-            command = str(appimage_path.resolve()) if appimage_path and appimage_path.is_file() else str(executable_path)
+            appdir = os.environ.get("APPDIR", "")
+            from_image = bool(appdir and executable_path.is_relative_to(Path(appdir).resolve()))
+            command = str(appimage_path.resolve()) if from_image and appimage_path and appimage_path.is_file() else str(executable_path)
         else:
             command = str(executable_path)
         args = ["agent", "mcp"]

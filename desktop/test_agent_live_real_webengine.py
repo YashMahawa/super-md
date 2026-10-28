@@ -58,9 +58,7 @@ def _probe(directory: str) -> int:
         reader=window.findChild(QObject,"documentReader")
         if reader is None:
             state["failure"]="Production WebEngine reader object was not found"; finish(2); return
-        script="""(()=>{const block=document.querySelector('.live-block');if(!block){document.title='supermd-agent-typing-error:no editable block';return 'no editable block';}
-          block.dispatchEvent(new MouseEvent('dblclick',{bubbles:true}));
-          const deadline=Date.now()+10000;
+        script="""(()=>{const deadline=Date.now()+10000;
           const typeWhenReady=()=>{const area=document.querySelector('.live-active-block textarea');
             if(!area){if(Date.now()<deadline){setTimeout(typeWhenReady,50);return;}
               window.__agentTypingFailure='live editor did not open';document.title='supermd-agent-typing-error:live editor did not open';return;}
@@ -77,7 +75,13 @@ def _probe(directory: str) -> int:
               if(Date.now()<deadline){setTimeout(confirm,25);return;}
               window.__agentTypingFailure='textarea did not retain the focused pending draft after input';document.title='supermd-agent-typing-error:textarea did not retain the focused pending draft after input';};
             setTimeout(confirm,25);};
-          typeWhenReady();return 'scheduled';})()"""
+          // The native bridge can become ready before React has committed the
+          // document. Wait for the actual editable block before double-clicking.
+          const openWhenReady=()=>{const block=document.querySelector('.live-block');
+            if(!block){if(Date.now()<deadline){setTimeout(openWhenReady,25);return;}
+              document.title='supermd-agent-typing-error:no editable block';return;}
+            block.dispatchEvent(new MouseEvent('dblclick',{bubbles:true}));typeWhenReady();};
+          openWhenReady();return 'scheduled';})()"""
         if not QMetaObject.invokeMethod(window,"runDocumentScript",Qt.ConnectionType.DirectConnection,Q_ARG("QVariant",script)):
             state["failure"]="Could not schedule the real reader DOM edit"; finish(2); return
         # Run through the production QML helper: PySide's QQuickWebEngineView

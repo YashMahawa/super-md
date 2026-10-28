@@ -9,6 +9,29 @@ from studio import agent_mcp_setup_config
 
 
 class AgentSetupInstructionsTests(unittest.TestCase):
+    @unittest.skipUnless(os.name == "posix", "venv Python symlinks require POSIX")
+    def test_source_python_symlink_retains_its_virtual_environment(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            base = root / "base-python"
+            base.touch()
+            python = root / "venv/bin/python"
+            python.parent.mkdir(parents=True)
+            python.symlink_to(base)
+            config = agent_mcp_setup_config(root / "sessions", executable=python, frozen=False)
+            self.assertEqual(config["command"], os.path.abspath(python))
+            self.assertNotEqual(config["command"], str(python.resolve()))
+
+    def test_unrelated_parent_appimage_environment_does_not_replace_managed_launcher(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            image = root / "Other editor.AppImage"
+            image.touch()
+            executable = root / "installed/super-md"
+            with patch.dict(os.environ, {"APPIMAGE": str(image), "APPDIR": str(root / "other-mount")}):
+                config = agent_mcp_setup_config(root / "sessions", executable=executable, frozen=True, platform="linux")
+            self.assertEqual(config["command"], str(executable.resolve()))
+
     def test_source_checkout_uses_absolute_python_script_and_session_directory(self):
         with tempfile.TemporaryDirectory(prefix="Super MD setup ") as directory:
             root = Path(directory)
@@ -17,7 +40,7 @@ class AgentSetupInstructionsTests(unittest.TestCase):
             sessions = root / "app data" / "agent sessions"
             config = agent_mcp_setup_config(sessions, executable=python, frozen=False,
                                             platform="linux", cli_script=script)
-        self.assertEqual(config["command"], str(python.resolve()))
+        self.assertEqual(config["command"], os.path.abspath(python))
         self.assertEqual(config["args"], [str(script.resolve()), "mcp", "--live-sessions-dir",
                                            str(sessions.resolve()), "--transport", "stdio"])
         self.assertTrue(Path(config["command"]).is_absolute())
@@ -30,7 +53,7 @@ class AgentSetupInstructionsTests(unittest.TestCase):
             python.touch()
             config = agent_mcp_setup_config(Path(directory) / "sessions", executable=pythonw,
                                             frozen=False, platform="win32", cli_script=Path(directory) / "agent_cli.py")
-        self.assertEqual(config["command"], str(python.resolve()))
+        self.assertEqual(config["command"], os.path.abspath(python))
         self.assertEqual(config["args"][1], "mcp")
 
     def test_frozen_linux_and_macos_run_the_absolute_app_executable_dispatch(self):
@@ -61,7 +84,7 @@ class AgentSetupInstructionsTests(unittest.TestCase):
             mounted_executable.touch()
             image = root / "Super MD.AppImage"
             image.touch()
-            with patch.dict(os.environ, {"APPIMAGE": str(image)}):
+            with patch.dict(os.environ, {"APPIMAGE": str(image), "APPDIR": str(root / ".mount_supermd")}):
                 config = agent_mcp_setup_config(root / "sessions", executable=mounted_executable,
                                                 frozen=True, platform="linux")
         self.assertEqual(config["command"], str(image.resolve()))
@@ -90,7 +113,7 @@ class AgentSetupInstructionsTests(unittest.TestCase):
                                                 frozen=False, platform="linux", cli_script=root / "agent_cli.py")
                 mac = agent_mcp_setup_config(root / "sessions", executable=executable,
                                              frozen=True, platform="darwin")
-        self.assertEqual(source["command"], str(executable.resolve()))
+        self.assertEqual(source["command"], os.path.abspath(executable))
         self.assertEqual(mac["command"], str(executable.resolve()))
 
     def test_property_json_contains_ready_to_copy_command_configuration(self):
@@ -99,7 +122,7 @@ class AgentSetupInstructionsTests(unittest.TestCase):
                                             frozen=False, platform="darwin", cli_script=Path("/opt/Super MD/desktop/agent_cli.py"))
             encoded = json.dumps(config, ensure_ascii=False, indent=2)
         parsed = json.loads(encoded)
-        self.assertEqual(parsed["command"], str(Path("/usr/bin/python3").resolve()))
+        self.assertEqual(parsed["command"], os.path.abspath("/usr/bin/python3"))
         self.assertEqual(parsed["args"][1:], ["mcp", "--live-sessions-dir", str((Path(directory) / "private sessions").resolve()), "--transport", "stdio"])
 
 
