@@ -130,10 +130,15 @@ def _contains_unsupported_diagrams(markdown: str) -> bool:
 
 def _resolve_image_assets(store: DocumentStore, note: Path, markdown: str,
                           embedded: dict[str, str]) -> dict[str, str]:
-    assets = dict(embedded)
+    # Portable SMD stores complete data URLs, whereas export-json accepts raw
+    # base64. Send only referenced images, preserving their decoded bytes and
+    # avoiding unrelated portable assets in the typesetter request.
+    assets: dict[str, str] = {}
     note_dir = note.parent.resolve(strict=True)
     for source in _image_destinations(markdown):
-        if source in assets:
+        if source in embedded:
+            _mime, payload = documents.image_data(embedded[source])
+            assets[source] = base64.b64encode(payload).decode("ascii")
             continue
         if source.startswith("data:"):
             documents.image_data(source)

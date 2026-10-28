@@ -191,6 +191,8 @@ def build_mcp_server(roots: list[str], live_client=None):
                     row[key] = value[:maximum]
             if isinstance(tab.get("isDirty"), bool):
                 row["isDirty"] = tab["isDirty"]
+            if isinstance(tab.get("active"), bool):
+                row["active"] = tab["active"]
             if isinstance(tab.get("sourceLength"), int):
                 row["sourceLength"] = tab["sourceLength"]
             sessions.append(row)

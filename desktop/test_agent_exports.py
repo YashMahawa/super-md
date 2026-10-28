@@ -3,10 +3,15 @@ import contextlib
 import io
 import json
 import os
+import struct
 import tempfile
 import unittest
+import zlib
 from pathlib import Path
+from unittest.mock import patch
 
+import agent_exports
+import documents
 from agent_documents import AgentDocumentError, DocumentStore, RevisionConflict
 from agent_cli import main as agent_cli_main
 from agent_exports import DEFAULT_PDF_OPTIONS, export_pdf, export_smd, find_engine, validate_pdf_options
@@ -100,6 +105,61 @@ class AgentExportsTest(unittest.TestCase):
         with self.assertRaisesRegex(AgentDocumentError, "does not render Mermaid"):
             export_pdf(self.store, "chart.md", "chart.pdf", engine=self.engine)
         self.assertFalse((self.root / "chart.pdf").exists())
+
+    def test_compressed_portable_pdf_uses_referenced_raw_assets_and_preserves_source(self):
+        svg = b"<svg xmlns='http://www.w3.org/2000/svg' width='40' height='20'><text x='1' y='14'>Portable \xce\xbb</text></svg>"
+
+        def png_chunk(kind, payload):
+            body = kind + payload
+            return struct.pack(">I", len(payload)) + body + struct.pack(">I", zlib.crc32(body) & 0xffffffff)
+
+        png = (b"\x89PNG\r\n\x1a\n" +
+               png_chunk(b"IHDR", struct.pack(">IIBBBBB", 1, 1, 8, 2, 0, 0, 0)) +
+               png_chunk(b"IDAT", zlib.compress(b"\x00\xff\x20\x10")) +
+               png_chunk(b"IEND", b""))
+
+        def data_uri(mime, raw):
+            return f"data:{mime};base64," + base64.b64encode(raw).decode("ascii")
+
+        svg_uri, png_uri = data_uri("image/svg+xml", svg), data_uri("image/png", png)
+        unused_uri = data_uri("image/svg+xml", b"<svg xmlns='http://www.w3.org/2000/svg'/>")
+        markdown = "# Portable artwork\n\n![vector](<assets/diagram.svg>)\n\n![pixel](<assets/pixel.png>)\n"
+        source = self.root / "portable.smd"
+        source.write_bytes(documents.compressed_bundle(markdown, {
+            "assets/diagram.svg": svg_uri,
+            "assets/pixel.png": png_uri,
+            "assets/unused.svg": unused_uri,
+        }))
+        original_source = source.read_bytes()
+
+        captured = {}
+        real_run = agent_exports.subprocess.run
+
+        def capture_and_run(*args, **kwargs):
+            captured["request"] = json.loads(kwargs["input"].decode("utf-8"))
+            return real_run(*args, **kwargs)
+
+        with patch.object(agent_exports.subprocess, "run", side_effect=capture_and_run):
+            result = export_pdf(self.store, source.name, "portable.pdf", engine=self.engine)
+
+        self.assertEqual(result["format"], "pdf")
+        self.assertTrue((self.root / "portable.pdf").read_bytes().startswith(b"%PDF-"))
+        request_assets = captured["request"]["assets"]
+        self.assertEqual(set(request_assets), {"assets/diagram.svg", "assets/pixel.png"})
+        self.assertEqual(base64.b64decode(request_assets["assets/diagram.svg"], validate=True), svg)
+        self.assertEqual(base64.b64decode(request_assets["assets/pixel.png"], validate=True), png)
+        self.assertNotIn("data:", request_assets["assets/diagram.svg"])
+        self.assertNotIn("data:", request_assets["assets/pixel.png"])
+        self.assertEqual(source.read_bytes(), original_source)
+
+        revision = self.store.inspect(source.name)["revision"]
+        stdout = io.StringIO()
+        with contextlib.redirect_stdout(stdout):
+            status = agent_cli_main(["--root", str(self.root), "extract", source.name,
+                                     "assets/diagram.svg", "extracted.svg", "--revision", revision])
+        self.assertEqual(status, 0)
+        self.assertEqual((self.root / "extracted.svg").read_bytes(), svg)
+        self.assertEqual(source.read_bytes(), original_source)
 
 
 if __name__ == "__main__":

@@ -1,6 +1,9 @@
-# Super MD 0.6.16
+# Super MD 0.6.17
 
 ## Agents in your notes
+
+- Fixed CLI and filesystem MCP PDF export of portable SMD with embedded images. Original image bytes are preserved, and unused assets no longer inflate the PDF request. Packaged regression checks cover both SVG and PNG assets.
+
 
 - No hosted relay or private connector URL is built into desktop or Android. Enter your own server or import a trusted pairing; existing configurations are preserved.
 

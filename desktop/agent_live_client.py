@@ -53,7 +53,7 @@ class MultiSessionLiveClient:
                     qualified = f"{session_id}:{window_id}:{local_id}"
                     local_ids[qualified] = (local_id, window_id)
                     row = {key: value for key, value in tab.items()
-                           if key in ("title", "path", "format", "isDirty", "sourceLength", "revision")}
+                           if key in ("title", "path", "format", "isDirty", "sourceLength", "revision", "active")}
                     row.update({"id": qualified, "windowId": window_id, "sessionId": session_id})
                     rows.append(row)
                 sessions[session_id] = (client, local_ids)

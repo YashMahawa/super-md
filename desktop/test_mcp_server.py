@@ -48,13 +48,14 @@ class MultiSessionLiveClientTest(unittest.TestCase):
                 (directory / "one.json").chmod(0o600)
             fake = Mock()
             fake.list_tabs.return_value = {"tabs": [{"id": "tab-local", "windowId": "window-a",
-                                                       "title": "Draft", "format": "smd", "isDirty": True}]}
+                                                       "title": "Draft", "format": "smd", "isDirty": True, "active": True}]}
             fake.read_tab.return_value = {"tabId": "tab-local", "revision": "a" * 64,
                                           "markdown": "unsaved source", "offset": 0, "totalLength": 14}
             with patch("agent_live_client.LiveTabClient", return_value=fake):
                 live = MultiSessionLiveClient(directory)
                 tabs = live.list_tabs()["tabs"]
                 self.assertEqual(tabs[0]["id"], "session-one:window-a:tab-local")
+                self.assertTrue(tabs[0]["active"])
                 result = live.read_tab(tabs[0]["id"], offset=0, limit=200)
                 self.assertEqual(result["markdown"], "unsaved source")
                 fake.read_tab.assert_called_once_with("tab-local", offset=0, limit=200, window_id="window-a",
@@ -138,7 +139,7 @@ class OfficialMCPClientTest(unittest.IsolatedAsyncioTestCase):
             def __init__(self): self.edits = []; self.actions = []
             def list_tabs(self):
                 return {"tabs": [{"id": "session:window:tab", "title": "Unsaved", "isDirty": True,
-                                  "format": "smd", "revision": "a" * 64}]}
+                                  "format": "smd", "revision": "a" * 64, "active": True}]}
             def read_tab(self, tab_id, offset=0, limit=12000, view="prose"):
                 return {"tabId": tab_id, "revision": "a" * 64, "markdown": "# Unsaved\nbody\n"[offset:offset + limit],
                         "offset": offset, "totalLength": 15, "title": "Unsaved", "view": view}
@@ -208,6 +209,7 @@ class OfficialMCPClientTest(unittest.IsolatedAsyncioTestCase):
             tabs = await client.call_tool("list_sessions", {})
             target = tabs.structured_content["sessions"][0]["target"]
             self.assertEqual(target, "tab:session:window:tab")
+            self.assertTrue(tabs.structured_content["sessions"][0]["active"])
             read = await client.call_tool("document_read", {"path": target, "offset": 0, "limit": 5})
             self.assertEqual(read.structured_content["markdown"], "# Uns")
             patch = await client.call_tool("document_patch", {

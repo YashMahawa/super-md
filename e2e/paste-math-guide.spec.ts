@@ -29,6 +29,9 @@ test('Source paste is unchanged by default; enabling in-place repairs a single u
   await paste(page,raw);await expect.poll(()=>page.evaluate(()=>(window as any).pastedDocument)).toBe('Start here.'+raw);
   await page.keyboard.press('Control+z');await expect.poll(()=>page.evaluate(()=>(window as any).pastedDocument)).toBe('Start here.');
   await page.evaluate(()=>window.supermdLoad?.({id:'paste-test',path:null,content:'Start here.',mode:'editor',latexAutofix:true,dark:true,colors:{},font:'Manrope',size:16,zoom:100,restorePosition:false}));
+  // Native snapshots commit asynchronously. Re-enter the presented editor as
+  // a user would; do not paste into its previous render immediately after eval.
+  await content.click();await page.keyboard.press('Control+End');
   await paste(page,raw);await expect.poll(()=>page.evaluate(()=>(window as any).pastedDocument)).toBe('Start here.$'+raw+'$');
   await page.keyboard.press('Control+z');await expect.poll(()=>page.evaluate(()=>(window as any).pastedDocument)).toBe('Start here.');
   await page.keyboard.press('Control+y');await expect.poll(()=>page.evaluate(()=>(window as any).pastedDocument)).toBe('Start here.$'+raw+'$');
