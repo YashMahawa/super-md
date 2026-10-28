@@ -12,16 +12,18 @@ connector URLs, discovery records, and pairing files out of messages and logs.
 
 ## Start with what the user is reading
 
-For cloud voice conversations, call `view_current` **first** when the connected
-server exposes it. With one device and one active tab, `view_current({})`
-returns the current visible Markdown, reading position, diagram references and
-a compact viewport image in one tool response. Supply `deviceId` or `tabId`
-only when needed to disambiguate; reuse identifiers already returned. The JPEG
-is a model preview, not an original diagram or export. Its default longest edge
-is 1000 pixels; request 800 for a quicker overview or up to 1600 for small text.
-Use `includeImage:false` when the visible source alone is enough. Set
-`quality:"high"` only when a larger lossless PNG is needed; ordinary cloud
-`render_tab` and diagram-image requests also default to JPEG previews.
+For cloud voice and other questions about the current page, call `view_current`
+**first** when the connected server exposes it. With one device and one active
+tab, `view_current({includeImage:false})` returns visible Markdown, reading
+position and diagram references without an image. Use `includeImage:true` when
+layout or appearance matters; the returned JPEG is a model preview, not an
+original diagram or export. Supply `deviceId` or `tabId` only when needed to
+disambiguate; reuse identifiers already returned. Its default longest edge is
+1000 pixels; request 800 for a quicker overview or up to 1600 for small text.
+Set `quality:"high"` only when a larger lossless PNG is needed; ordinary cloud
+`render_tab` and diagram-image requests also default to JPEG previews. Context
+and capture use the same source revision, and a moved reading position is
+reported with the capture.
 
 Do not list every diagram or fetch every SVG to explain the current screen.
 Start explaining from this combined result, then fetch only a relevant diagram
@@ -37,7 +39,9 @@ instead of retrying the same failed pixel request. Older relays without
 | Visible Markdown, selection, position and diagram references | `document_action(action="get_context", path=TARGET)` | `document_action(documentAction="get_context", deviceId, tabId)` |
 | Actual current viewport pixels | `document_view(path=TARGET, width=1200)` | `render_tab(deviceId, tabId, width=1200)` |
 | Exact Markdown page | `document_read(path=TARGET, view="source", offset, limit)` | `read_tab(deviceId, tabId, view="source", offset, limit)` |
-| Search | `document_search(path=TARGET, query)` | `search_tab(deviceId, tabId, query)` |
+| Selected heading section | `document_read(path=TARGET, heading="7.4", view="prose", limit=3000)` | `read_tab(deviceId, tabId?, heading="7.4", view="prose", limit=3000)` |
+| Paged outline | `document_action(action="inspect", path=TARGET)` for the first page | `document_action(documentAction="outline", deviceId, tabId, options={offset, limit:80})` |
+| Search | `document_search(path=TARGET, query, offset, limit, case_sensitive, whole_word, regex, exclude_diagrams)` | `search_tab(deviceId, tabId, query, offset, limit, caseSensitive, wholeWord, regex, excludeDiagrams)` |
 | Diagram inventory | `document_action(action="list_diagrams", path=TARGET)` | `diagram_action(deviceId, tabId, diagramAction="list", expectedRevision=REV)` |
 | Original SVG/Mermaid/chart block source | `document_action(action="get_diagram", path=TARGET, diagram_id=ID, expected_revision=REV)` | `diagram_action(deviceId, tabId, diagramAction="source", diagramId=ID, expectedRevision=REV)` |
 | Diagram rendered as an image | `document_view(path=TARGET, diagram_id=ID, expected_revision=REV)` | `diagram_action(deviceId, tabId, diagramAction="image", diagramId=ID, expectedRevision=REV)` |
@@ -60,6 +64,44 @@ not `offset + displayed text length`. Diagram-source reads are also paginated.
 An image diagram's source is its Markdown reference: retrieve the embedded
 asset separately for original SVG text or image bytes.
 
+When the heading is known, use its outline index, exact title, slug, or
+unambiguous numbered prefix such as `7.4`; duplicate titles are reported as
+ambiguous instead of guessed. Cloud `read_tab` accepts an optional `tabId` when
+the active tab is unambiguous. Prose pages are bounded to 12,000 characters;
+for voice or focused retrieval, start with `limit:3000` and use the returned
+`next_offset` with the same heading to continue. If the heading is unknown,
+page `document_action(documentAction="outline", tabId,
+options:{offset:0,limit:80})`; each page contains up to 80 headings plus
+`nextOffset`, `sectionStart`, `sectionEnd`, and `documentLength` metadata.
+
+## Export a whole note or section
+
+For a full document or one selected heading section, export Markdown, portable
+SMD, or PDF with the cloud `document_action(documentAction="export", deviceId,
+tabId, expectedRevision=REV, options:{format:"smd", section:"7.4"})`. Omit
+`section` to export the whole note. Use the current SHA-256 revision from
+`view_current` or `read_tab`; do not export from an old revision. Poll
+`document_action(documentAction="job_status", options:{jobId:JOB})` until it
+completes. The result includes an MCP `resource_link` and a `download.url` with
+expiry and file metadata. MCP defines resource links as references a client may
+fetch, and `resources/read` as the standard resource retrieval method; see the
+[MCP tools result specification](https://modelcontextprotocol.io/specification/2025-11-25/server/tools#resource-links)
+and [MCP Resources](https://modelcontextprotocol.io/specification/2025-11-25/server/resources#reading-resources). Client support for PDF/SMD blobs varies; if a voice client cannot
+consume a binary resource, read a Markdown export or use bounded Markdown
+section pages with `read_tab`.
+
+`resources/read` returns Markdown as text and PDF/SMD as binary resource blobs
+for files up to 3 MiB. Larger exports stream from the returned private HTTPS
+`download.url` in 512 KiB chunks; at most four downloads run at once and the
+file limit is 128 MiB. The URL expires after ten minutes and requires the paired
+device to remain connected. The relay holds no export contents and requests
+bounded chunks from the device on demand. Do not turn binary/base64 export data
+into model text. The native CLI's `download JOB_ID OUTPUT` creates a new file
+and verifies the complete SHA-256; it will not overwrite an existing path.
+Choose SMD to carry embedded images; Markdown retains ordinary asset
+references. PDF preparation resolves reference-style images as well as inline
+images.
+
 ## Make a small, reliable edit
 
 Use the latest returned SHA-256 revision for edits. Local MCP uses
@@ -80,11 +122,14 @@ with a narrow patch. Keep the source fence language (`mermaid`, `svg`, or
 `smd-chart`) intact. Exact replacements default to one unique match; explicitly
 use `count:"all"` only for an intended document-wide replacement.
 
-Local reads/searches can target inactive tabs. Before a local edit or capture,
-activate a different target with
-`document_action(action="open_document", path=TARGET)`. This flushes the current
-human draft before switching tabs. Cloud operations select the specified tab
-on the chosen device. Do not change focus unnecessarily just to search notes.
+Local reads, searches and source patches can target inactive tabs. The desktop
+bridge flushes the current editor draft before a mutation, so saving or patching
+another tab does not require changing focus. Use
+`document_action(action="activate_document", path=TARGET)` only when the user
+needs that tab selected. Create and open actions accept `background:true` to
+preserve the current tab. A newly opened file returns a job ID while it loads;
+poll `job_status` for its tab metadata. Cloud operations select the specified
+tab on the chosen device. Do not change focus just to search or patch notes.
 
 ## Embedded assets and new notes
 
@@ -112,19 +157,19 @@ a revision-checked patch. For plain Markdown, insert a fenced SVG/Mermaid block
 or a permitted ordinary image reference instead.
 
 To create a live note, use local `document_action(action="create_document",
-content, title, format="smd")` or cloud
+content, title, filename, format="smd", background=true)` or cloud
 `document_action(documentAction="create", deviceId, content,
-options={"format":"smd"})`. Save it before attaching embedded images. Preserve
+options={"format":"smd", "background":true})`. The filename is a naming hint;
+creation does not write to disk. Save it before attaching embedded images. Preserve
 an existing note's format and assets unless the user asks for conversion.
 
-Export with local `document_action(action="export_document", path,
-expected_revision, format="pdf", options)` or cloud
-`document_action(documentAction="export", deviceId, tabId, expectedRevision,
-options={"format":"pdf"})`. Poll the returned job ID with `job_status`;
-starting a job is not export completion. PDF options include page size,
-margins, font family/size, line/paragraph spacing, page numbers and theme.
-For LaTeX repair, review proposed fixes before applying selected repair indices
-against their review revision; retain valid intentional math.
+Local export uses `document_action(action="export_document", path,
+expected_revision, format, options)`; cloud whole-note or section export uses
+the workflow above. Poll the returned job ID with `job_status`; starting a job
+is not export completion. PDF options include page size, margins, font
+family/size, line/paragraph spacing, page numbers and theme. For LaTeX repair,
+review proposed fixes before applying selected repair indices against their
+review revision; retain valid intentional math.
 
 ## CLI
 

@@ -70,6 +70,8 @@ test("relay auth, bounded device RPC, Streamable HTTP, legacy SSE and disconnect
   let fastSnapshotRevision: string | undefined;
   let fastCaptureError: string | undefined;
   let fastRpcCounts = { list_tabs: 0, get_context: 0, render_tab: 0, list_diagrams: 0 };
+  const exportBytes=Buffer.from("%PDF-1.7\n"+"A".repeat(600_000));
+  const exportMetadata={downloadable:true,status:"completed",jobId:"export-qa",filename:"Notes with spaces 猫.pdf",format:"pdf",bytes:exportBytes.length,sha256:sha(exportBytes.toString())};
   const fastRequests: Record<string, unknown>[] = [];
   ws.on("message", (raw) => {
     const request = JSON.parse(raw.toString()) as Record<string, unknown>;
@@ -91,6 +93,11 @@ test("relay auth, bounded device RPC, Streamable HTTP, legacy SSE and disconnect
     else if (request.action === "document_action" && request.documentAction === "get_context") {
       fastRpcCounts.get_context++;
       result = fastContext ?? { tabId: request.tabId, revision, mode: "reading", reading: { offset: 123, heading: "Current section", visibleText: "Visible text" }, visibleSource: { text: "# Exact source", start: 120, end: 140 }, diagrams: [{ id: "diagram:124", kind: "mermaid", sourceStart: 124, sourceEnd: 136 }] };
+    }
+    else if (request.action === "document_action" && request.documentAction === "job_status" && request.jobId === "export-qa") result=exportMetadata;
+    else if (request.action === "document_action" && request.documentAction === "export_chunk" && request.jobId === "export-qa") {
+      const offset=Number(request.offset),end=Math.min(exportBytes.length,offset+Number(request.limit));
+      result={...exportMetadata,offset,nextOffset:end<exportBytes.length?end:null,body:exportBytes.subarray(offset,end).toString("base64")};
     }
     else if (request.action === "list_diagrams") { fastRpcCounts.list_diagrams++; result = { tabId: request.tabId, revision, diagrams: [] }; }
     else if (request.action === "asset_action" && request.assetAction === "list") result = { tabId: request.tabId, revision, assets: [{ name: "assets/original.svg", mimeType: "image/svg+xml", bytes: 32, sha256: "c".repeat(64) }] };
@@ -114,6 +121,28 @@ test("relay auth, bounded device RPC, Streamable HTTP, legacy SSE and disconnect
   const devices = await http.callTool({ name: "list_devices", arguments: {} });
   assert.match(String(devices.content?.[0]?.type === "text" ? devices.content[0].text : ""), /Test Android/);
   assert.match(String(devices.content?.[0]?.type === "text" ? devices.content[0].text : ""), /Untitled\.md/);
+  // The discoverable schema must teach an unfamiliar agent the operation
+  // shapes before it edits a note, and typos must never reach a device.
+  const patchTool = list.tools.find(item => item.name === "patch_tab")!;
+  const operationSchema = JSON.stringify(patchTool.inputSchema);
+  for (const key of ["start_line", "end_line", "expectedCount", "insert", "additionalProperties"]) assert.ok(operationSchema.includes(key));
+  const beforeInvalidPatch = fastRequests.length;
+  const badPatch = await http.callTool({name:"patch_tab",arguments:{deviceId,tabId:"tab:"+deviceId+":main:1",expectedRevision:revision,operations:[{type:"lines",start_line:1,end_line:1,text:"test",startLine:1}]}});
+  assert.equal(badPatch.isError,true);
+  assert.equal(fastRequests.length,beforeInvalidPatch,"unknown operation fields never reach a device");
+  await http.callTool({name:"search_tab",arguments:{deviceId,tabId:"tab:"+deviceId+":main:1",query:"Ward",offset:100,wholeWord:true,excludeDiagrams:true,caseSensitive:true,limit:4}});
+  assert.deepEqual(Object.fromEntries(Object.entries(fastRequests.at(-1)!).filter(([key])=>["offset","wholeWord","excludeDiagrams","caseSensitive","limit"].includes(key))),{offset:100,limit:4,caseSensitive:true,wholeWord:true,excludeDiagrams:true});
+  await http.callTool({name:"diagram_action",arguments:{deviceId,tabId:"tab:"+deviceId+":main:1",diagramAction:"list",offset:10,limit:5}});
+  assert.equal(fastRequests.at(-1)?.offset,10);
+  assert.equal(fastRequests.at(-1)?.limit,5);
+  assert.equal(fastRequests.at(-1)?.expectedRevision,undefined);
+  for(const documentAction of ["activate","latex_review","close"]){
+    const response=await http.callTool({name:"document_action",arguments:{deviceId,tabId:"tab:"+deviceId+":main:1",documentAction,...(documentAction==="close"?{expectedRevision:revision}:{}),options:documentAction==="close"?{discardChanges:false}:{}}});
+    assert.equal(response.isError,undefined);
+    assert.equal(fastRequests.at(-1)?.documentAction,documentAction);
+  }
+  await http.callTool({name:"document_action",arguments:{deviceId,documentAction:"create",content:"# QA",options:{filename:"QA.smd",background:true}}});
+  assert.deepEqual(fastRequests.at(-1)?.options,{filename:"QA.smd",background:true});
   const diagram = await http.callTool({ name: "diagram_action", arguments: { deviceId, tabId: "tab:" + deviceId + ":main:1", diagramAction: "source", diagramId: "diagram:0", expectedRevision: revision, offset: 0, limit: 100 } });
   assert.equal(diagram.isError, undefined);
   const diagramSourceWithQuality = await http.callTool({ name: "diagram_action", arguments: { deviceId, tabId: "tab:" + deviceId + ":main:1", diagramAction: "source", diagramId: "diagram:0", expectedRevision: revision, quality: "high" } });
@@ -141,6 +170,30 @@ test("relay auth, bounded device RPC, Streamable HTTP, legacy SSE and disconnect
   assert.match(String(attached.content?.[0]?.type === "text" ? attached.content[0].text : ""), /assets\/model\.png/);
   const read = await http.callTool({ name: "read_tab", arguments: { deviceId, tabId: "tab:" + deviceId + ":main:1", limit: 100 } });
   assert.match(String(read.content?.[0]?.type === "text" ? read.content[0].text : ""), /Live/);
+  const sectionRead=await http.callTool({name:"read_tab",arguments:{deviceId,heading:"7.4",limit:2000}});
+  assert.equal(sectionRead.isError,undefined);
+  assert.equal(fastRequests.at(-1)?.heading,"7.4","section selector is forwarded without a separate model discovery call");
+  const outline=await http.callTool({name:"document_action",arguments:{deviceId,documentAction:"outline",options:{offset:10,limit:5}}});
+  assert.equal(outline.isError,undefined);
+  assert.equal(fastRequests.at(-1)?.documentAction,"outline");
+  const exportJob=await http.callTool({name:"document_action",arguments:{deviceId,documentAction:"job_status",options:{jobId:"export-qa"}}});
+  const download=exportJob.content?.find(item=>item.type==="resource_link");
+  assert.ok(download&&download.type==="resource_link");
+  if(!download||download.type!=="resource_link")throw Error("Missing export resource link");
+  assert.equal(download.name,"Notes with spaces 猫.pdf");
+  assert.ok(!download.uri.includes(connectorKey),"download capabilities never expose the workspace MCP credential");
+  const response=await fetch(download.uri,{headers:{Origin:"https://client.example"}});
+  assert.equal(response.status,200);
+  assert.equal(response.headers.get("content-type"),"application/pdf");
+  assert.equal(response.headers.get("cache-control"),"no-store");
+  assert.equal(response.headers.get("access-control-allow-origin"),"*","capability downloads work for browser clients without ambient credentials");
+  assert.ok(response.headers.get("content-disposition")?.includes("Notes%20with%20spaces%20"));
+  assert.ok(Buffer.from(await response.arrayBuffer()).equals(exportBytes));
+  assert.equal(fastRequests.filter(item=>item.documentAction==="export_chunk").length,2,"file bytes use bounded internal chunks, never model-visible base64");
+  const resource=await http.readResource({uri:download.uri});
+  const resourceBytes=resource.contents[0]!;
+  assert.ok("blob" in resourceBytes&&Buffer.from(String(resourceBytes.blob),"base64").equals(exportBytes),"MCP resource clients receive the same verified original PDF");
+  assert.equal((await fetch(base+"/download/unknown")).status,404);
   const image = await http.callTool({ name: "render_tab", arguments: { deviceId, tabId: "tab:" + deviceId + ":main:1" } });
   assert.equal(image.content?.[0]?.type, "image");
   assert.equal(image.content?.[0]?.type === "image" ? image.content[0].mimeType : "", "image/jpeg", "render_tab returns standard JPEG by default");
@@ -168,7 +221,10 @@ test("relay auth, bounded device RPC, Streamable HTTP, legacy SSE and disconnect
   assert.equal(currentViewText.revision, revision);
   assert.equal(currentViewText.readingContext.visibleSource.text, "# Exact source");
   assert.equal(currentViewText.readingContext.diagrams[0].id, "diagram:124");
-  assert.deepEqual(currentViewText.imagePreview, { mimeType: "image/jpeg", width: 777, height: 437, previewOnly: true });
+  const { byteLength, serverMs, ...previewDimensions } = currentViewText.imagePreview;
+  assert.deepEqual(previewDimensions, { mimeType: "image/jpeg", width: 777, height: 437, previewOnly: true });
+  assert.equal(byteLength, Buffer.from(String(currentView.content?.[0]?.type === "image" ? currentView.content[0].data : ""), "base64").length);
+  assert.ok(Number.isInteger(serverMs) && serverMs >= 0, "relay timing accompanies real preview bytes");
   assert.equal(currentViewText.readingContext.nativeTabId, undefined, "Android's already-qualified tab id is preserved without native id rewriting");
   assert.equal(currentViewText.readingContextSource, "context_read", "Android capture metadata without source retains the separate context read");
   assert.equal(currentViewText.captureContext.reading.offset, 123, "Android position metadata reports where the PNG was captured");

@@ -2,11 +2,12 @@ import { createHash, randomUUID, timingSafeEqual } from "node:crypto";
 import { createServer, type IncomingMessage } from "node:http";
 import express, { type NextFunction, type Request, type Response } from "express";
 import { WebSocket, WebSocketServer, type RawData } from "ws";
-import { createMcpHandler, McpServer } from "@modelcontextprotocol/server";
+import { createMcpHandler, McpServer, ResourceTemplate } from "@modelcontextprotocol/server";
 import { SSEServerTransport } from "@modelcontextprotocol/server-legacy/sse";
 import { toNodeHandler } from "@modelcontextprotocol/node";
 import { z } from "zod";
 import { MAX_FRAME_BYTES, MAX_PENDING, REQUEST_TIMEOUT_MS, validateRpcRequest, validReply, type RpcRequest } from "./protocol.js";
+import { ExportDownloads, attachmentHeader, waitForDownloadDrain } from "./downloads.js";
 import { decodeViewportBase64, makeJpegPreview, normalizeReadingContext, viewportContexts } from "./preview.js";
 
 type Pending = { resolve: (value: { result?: unknown; error?: string }) => void; timer: NodeJS.Timeout };
@@ -89,6 +90,7 @@ function chooseDevice(group: Group, requestedId: string | undefined, mutation = 
   return { error: "More than one device is connected; choose deviceId." };
 }
 function rpc(group: Group, partial: Omit<RpcRequest, "requestId">): Promise<{ result?: unknown; error?: string }> {
+  const started = performance.now();
   const chosen = chooseDevice(group, partial.deviceId, partial.action === "patch_tab" || partial.action === "document_action" || partial.action === "replace_tab_asset" || (partial.action === "asset_action" && partial.assetAction === "attach"));
   const device = chosen.device;
   if (!device) return Promise.resolve({ error: chosen.error });
@@ -97,8 +99,14 @@ function rpc(group: Group, partial: Omit<RpcRequest, "requestId">): Promise<{ re
   const requestId = randomUUID();
   const request = validateRpcRequest({ requestId, deviceId: device.deviceId, ...partial });
   return new Promise((resolve) => {
+    const complete = (reply: { result?: unknown; error?: string }) => {
+      const value = reply.result;
+      if (value && typeof value === "object" && !Array.isArray(value)) {
+        resolve({ ...reply, result: { ...value, serverMs: Math.round(performance.now() - started) } });
+      } else resolve(reply);
+    };
     const timer = setTimeout(() => { device.pending.delete(requestId); resolve({ error: "The app did not answer before the request timed out." }); }, requestTimeout);
-    device.pending.set(requestId, { resolve, timer });
+    device.pending.set(requestId, { resolve: complete, timer });
     try { sendJson(device.socket!, { type: "request", ...request }); }
     catch (error) { clearTimeout(timer); device.pending.delete(requestId); resolve({ error: error instanceof Error ? error.message : "Could not send the request to the app." }); }
   });
@@ -118,7 +126,16 @@ function textResult(value: unknown, isError = false) {
   const text = JSON.stringify(value ?? null);
   return { content: [{ type: "text" as const, text: Buffer.byteLength(text) <= 64 * 1024 ? text : JSON.stringify({ error: "The app response exceeds the text result limit." }) }], ...(isError ? { isError: true } : {}) };
 }
-function toolResponse(response: { result?: unknown; error?: string }) { return response.error ? textResult({ error: response.error }, true) : textResult(response.result); }
+function toolResponse(response: { result?: unknown; error?: string }) {
+  if (!response.error) return textResult(response.result);
+  // Devices still transport errors as strings. Preserve structured conflict
+  // details without interpreting arbitrary note text or changing MCP errors.
+  try {
+    const detail = JSON.parse(response.error);
+    if (detail && typeof detail === "object" && !Array.isArray(detail) && typeof detail.error === "string") return textResult(detail, true);
+  } catch { /* Legacy device error. */ }
+  return textResult({ error: response.error }, true);
+}
 function imageResult(response: { result?: unknown; error?: string }) {
   if (response.error) return textResult({ error: response.error }, true);
   const image = response.result as Record<string, unknown> | undefined;
@@ -126,7 +143,7 @@ function imageResult(response: { result?: unknown; error?: string }) {
   const bytes = Buffer.from(image.data, "base64");
   if (bytes.length < 8 || bytes.length > 4 * 1024 * 1024 || !bytes.subarray(0, 8).equals(Buffer.from([137,80,78,71,13,10,26,10]))) return textResult({ error: "The app image is not a bounded PNG." }, true);
   const metadata = image.metadata && typeof image.metadata === "object" && Buffer.byteLength(JSON.stringify(image.metadata)) <= 12_000 ? image.metadata : undefined;
-  return { content: [{ type: "image" as const, data: bytes.toString("base64"), mimeType: "image/png" }, { type: "text" as const, text: JSON.stringify({ width: image.width, height: image.height, revision: image.revision, metadata }) }] };
+  return { content: [{ type: "image" as const, data: bytes.toString("base64"), mimeType: "image/png" }, { type: "text" as const, text: JSON.stringify({ mimeType: "image/png", byteLength: bytes.length, width: image.width, height: image.height, revision: image.revision, serverMs: image.serverMs, metadata }) }] };
 }
 async function jpegImageResult(response: { result?: unknown; error?: string }, width: number) {
   if (response.error) return textResult({ error: response.error }, true);
@@ -136,7 +153,7 @@ async function jpegImageResult(response: { result?: unknown; error?: string }, w
     const preview = await makeJpegPreview(decodeViewportBase64(image.data), width, image.mime_type, { width: image.width, height: image.height });
     return { content: [
       { type: "image" as const, data: preview.data.toString("base64"), mimeType: "image/jpeg" },
-      { type: "text" as const, text: JSON.stringify({ mimeType: "image/jpeg", width: preview.width, height: preview.height, revision: image.revision, previewOnly: true }) },
+      { type: "text" as const, text: JSON.stringify({ mimeType: "image/jpeg", byteLength: preview.data.length, width: preview.width, height: preview.height, revision: image.revision, serverMs: image.serverMs, previewOnly: true }) },
     ] };
   } catch (error) {
     return textResult({ error: error instanceof Error ? error.message : "Could not create the bounded JPEG viewport preview." }, true);
@@ -162,7 +179,45 @@ function assetSourceResult(response: { result?: unknown; error?: string }, offse
   if (!["image/png", "image/jpeg", "image/gif", "image/webp", "image/avif"].includes(mimeType)) return textResult({ error: "The app returned an unsupported original image type." }, true);
   return { content: [{ type: "image" as const, data: bytes.toString("base64"), mimeType }, { type: "text" as const, text: JSON.stringify({ assetName: value.assetName, mimeType, bytes: bytes.length, sha256: value.sha256, revision: value.revision }) }] };
 }
+const exportsAvailable = new ExportDownloads();
+const downloadOrigin = (/^(localhost|127\.0\.0\.1)(:|$)/.test(expectedHost) ? "http://" : "https://") + expectedHost;
+async function readTarget(group: Group, selected?: string, tab?: string): Promise<{deviceId?:string;tabId?:string;error?:string}> {
+  const chosen=chooseDevice(group,selected);
+  if(!chosen.device)return {error:chosen.error};
+  if(tab)return {deviceId:chosen.device.deviceId,tabId:tab};
+  const listing=await rpc(group,{action:"list_tabs",deviceId:chosen.device.deviceId});
+  if(listing.error)return {error:listing.error};
+  const value=listing.result as {tabs?:Array<Record<string,unknown>>}|undefined;
+  const tabs=Array.isArray(value?.tabs)?value.tabs:[];
+  const active=tabs.filter(item=>item.active===true),row=active.length===1?active[0]:tabs.length===1?tabs[0]:null;
+  const id=row&&(typeof row.tabId==="string"?row.tabId:typeof row.id==="string"?row.id:null);
+  return id?{deviceId:chosen.device.deviceId,tabId:id}:{error:"Choose tabId from list_tabs; several windows or no active document are available."};
+}
+function exportJobResult(group:Group, selected:string|undefined, jobId:string|undefined, response:{result?:unknown;error?:string}) {
+  if(response.error||!jobId)return toolResponse(response);
+  const device=chooseDevice(group,selected).device;
+  if(!device)return toolResponse(response);
+  const lease=exportsAvailable.issue(group.groupId,device.deviceId,jobId,response.result);
+  if(!lease)return toolResponse(response);
+  const uri=downloadOrigin+"/download/"+lease.token;
+  const metadata={...(response.result as Record<string,unknown>),download:{url:uri,expiresAt:new Date(lease.expiresAt).toISOString(),mimeType:lease.mimeType,bytes:lease.bytes,sha256:lease.sha256}};
+  return {content:[{type:"resource_link" as const,uri,name:lease.filename,mimeType:lease.mimeType,size:lease.bytes,description:"Private exported file; expires in ten minutes. The Super MD device must remain connected."},...textResult(metadata).content]};
+}
 function registerTools(server: McpServer, group: Group): void {
+  server.registerResource("completed-export",new ResourceTemplate(downloadOrigin+"/download/{token}",{list:undefined}),{
+    title:"Completed Super MD export",description:"Private MD, SMD or PDF export. Small files support MCP resource reads; large files stream over the same HTTPS URL.",
+  },async(uri,variables)=>{
+    const token=variables.token;
+    if(typeof token!=="string")throw Error("Invalid export resource");
+    const lease=exportsAvailable.get(token);
+    if(!lease||lease.groupId!==group.groupId||groups.get(group.groupId)!==group||!group.devices.has(lease.deviceId))throw Error("This export resource expired or was revoked.");
+    if(lease.bytes>3*1024*1024)throw Error("Use the private HTTPS download for exports over 3 MiB; it streams without loading the file into model context.");
+    const chunks:Buffer[]=[];
+    for await(const chunk of exportsAvailable.stream(token,(info,offset,limit)=>rpc(group,{action:"document_action",documentAction:"export_chunk",deviceId:info.deviceId,jobId:info.jobId,offset,limit})))chunks.push(chunk);
+    const bytes=Buffer.concat(chunks);
+    if(lease.format==="md"&&!Buffer.from(bytes.toString("utf8"),"utf8").equals(bytes))throw Error("This Markdown export is not valid UTF-8; download the original bytes over HTTPS.");
+    return {contents:[lease.format==="md"?{uri:uri.href,mimeType:lease.mimeType,text:bytes.toString("utf8")}:{uri:uri.href,mimeType:lease.mimeType,blob:bytes.toString("base64")}]};
+  });
   const deviceId = z.string().regex(UUID_RE).optional();
   const tabId = z.string().min(1).max(512);
   const pageSize = z.enum(["a3","a4","a5","a6","iso-b4","iso-b5","iso-b6","letter","legal","tabloid","executive"]);
@@ -171,6 +226,11 @@ function registerTools(server: McpServer, group: Group): void {
     lineHeight: z.number().min(0.9).max(2.2).optional(), paragraphSpacing: z.number().min(0).max(3).optional(),
     fontFamily: z.string().max(128).optional(), pageNumbers: z.boolean().optional(), themed: z.boolean().optional(),
   });
+  const patchOperation = z.discriminatedUnion("type", [
+    z.object({ type: z.literal("replace"), old: z.string().min(1), new: z.string(), count: z.union([z.literal(1), z.literal("all")]).optional(), expectedCount: z.number().int().positive().optional() }).strict(),
+    z.object({ type: z.literal("lines"), start_line: z.number().int().positive().describe("First line, 1-based inclusive"), end_line: z.number().int().positive().describe("Last line, 1-based inclusive"), text: z.string() }).strict(),
+    z.object({ type: z.literal("insert"), line: z.number().int().positive().describe("Insert before this 1-based line; line count + 1 appends"), text: z.string() }).strict(),
+  ]);
   server.registerTool("list_devices", { description: "List devices paired with this Super MD workspace and their live/last-seen state. Includes current open tabs for connected devices.", inputSchema: {} }, async () => {
     const devices = await Promise.all([...group.devices.values()].map(async (device) => {
       const online = device.socket?.readyState === WebSocket.OPEN;
@@ -187,9 +247,12 @@ function registerTools(server: McpServer, group: Group): void {
     return textResult({ devices });
   });
   server.registerTool("list_tabs", { description: "List open tabs on a connected device. Supply deviceId when the workspace has multiple connected devices.", inputSchema: { deviceId } }, async ({ deviceId: selected }) => toolResponse(await rpc(group, { action: "list_tabs", deviceId: selected })));
-  server.registerTool("read_tab", { description: "Read a bounded source or rendered-prose range from an open tab, including its SHA-256 revision.", inputSchema: { deviceId, tabId, view: z.enum(["source","prose"]).optional(), offset: z.number().int().min(0).max(20_000_000).optional(), limit: z.number().int().min(1).max(12_000).optional() } }, async ({ deviceId: selected, tabId: tab, view, offset, limit }) => toolResponse(await rpc(group, { action: "read_tab", deviceId: selected, tabId: tab, view, offset, limit })));
-  server.registerTool("search_tab", { description: "Search an open tab and return bounded matches with line context.", inputSchema: { deviceId, tabId, query: z.string().min(1).max(2048), limit: z.number().int().min(1).max(25).optional(), context: z.number().int().min(0).max(500).optional() } }, async ({ deviceId: selected, tabId: tab, query, limit, context }) => toolResponse(await rpc(group, { action: "search_tab", deviceId: selected, tabId: tab, query, limit, context })));
-  server.registerTool("patch_tab", { description: "Edit an open tab using bounded source operations. Requires an unchanged SHA-256 revision; stale edits are rejected. With multiple devices connected, deviceId is required.", inputSchema: { deviceId, tabId, expectedRevision: z.string().regex(/^[a-f0-9]{64}$/i), operations: z.array(z.record(z.string(), z.unknown())).min(1).max(100) } }, async ({ deviceId: selected, tabId: tab, expectedRevision, operations }) => toolResponse(await rpc(group, { action: "patch_tab", deviceId: selected, tabId: tab, expectedRevision, operations })));
+  server.registerTool("read_tab", { description: "Read only the needed Markdown/prose page. Omit tabId for the current document. heading accepts an outline index, exact title, slug, or numbered prefix such as 7.4; returns that section and nested subsections, bounded by limit. Follow the cursor within sectionEnd. Use view:source for exact editable source; prose skips SVG bodies. Whole-file PDF/MD/SMD is available through export followed by job_status and its private resource link.", inputSchema: { deviceId, tabId:tabId.optional(), heading:z.union([z.number().int().min(0),z.string().min(1).max(512)]).optional(), view: z.enum(["source","prose"]).optional(), offset: z.number().int().min(0).max(20_000_000).optional(), limit: z.number().int().min(1).max(12_000).optional() } }, async ({ deviceId: selected, tabId: tab, heading, view, offset, limit }) => {
+    const target=await readTarget(group,selected,tab);if(target.error)return textResult({error:target.error},true);
+    return toolResponse(await rpc(group,{action:"read_tab",deviceId:target.deviceId,tabId:target.tabId,heading,view,offset,limit}));
+  });
+  server.registerTool("search_tab", { description: "Search source with paged code-point offsets. Follow nextOffset for more matches. Regex accepts only safe fixed-width literals, dot, character classes and anchors; no groups, alternation or quantifiers.", inputSchema: { deviceId, tabId, query: z.string().min(1).max(500), offset: z.number().int().min(0).max(20_000_000).optional(), limit: z.number().int().min(1).max(25).optional(), context: z.number().int().min(0).max(500).optional(), caseSensitive: z.boolean().optional(), wholeWord: z.boolean().optional(), regex: z.boolean().optional(), excludeDiagrams: z.boolean().optional() } }, async ({ deviceId: selected, tabId: tab, query, offset, limit, context, caseSensitive, wholeWord, regex, excludeDiagrams }) => toolResponse(await rpc(group, { action: "search_tab", deviceId: selected, tabId: tab, query, offset, limit, context, caseSensitive, wholeWord, regex, excludeDiagrams })));
+  server.registerTool("patch_tab", { description: "Atomically edit an open tab, including inactive tabs without changing focus. Operations run sequentially; applied counts completed operations. Exact replace defaults to one unique match; count:'all' replaces all. expectedCount asserts the match count (if greater than one, omitted count means all). Writes require the latest SHA-256 expectedRevision; never guess it.", inputSchema: { deviceId, tabId, expectedRevision: z.string().regex(/^[a-f0-9]{64}$/i), operations: z.array(patchOperation).min(1).max(100) } }, async ({ deviceId: selected, tabId: tab, expectedRevision, operations }) => toolResponse(await rpc(group, { action: "patch_tab", deviceId: selected, tabId: tab, expectedRevision, operations })));
   server.registerTool("render_tab", { description: "Render the current reading/editor viewport as an MCP image. Standard quality returns a compact JPEG preview; high quality returns the lossless PNG. Supply deviceId when ambiguous.", inputSchema: { deviceId, tabId, width: z.number().int().min(64).max(1600).optional(), quality: z.enum(["standard", "high"]).optional() } }, async ({ deviceId: selected, tabId: tab, width, quality }) => {
     const selectedQuality = quality ?? "standard";
     const edge = width ?? (selectedQuality === "high" ? 1600 : 1000);
@@ -225,7 +288,7 @@ function registerTools(server: McpServer, group: Group): void {
     const normalizedContext = normalizeReadingContext(context) ?? context;
     const readingContext = normalizedContext.tabId === tab ? normalizedContext : { ...normalizedContext, tabId: tab, nativeTabId: normalizedContext.tabId };
 
-    let previewInfo: { mimeType: "image/jpeg" | "image/png"; width: number; height: number; previewOnly: boolean } | undefined;
+    let previewInfo: { mimeType: "image/jpeg" | "image/png"; byteLength: number; width: number; height: number; serverMs?: number; previewOnly: boolean } | undefined;
     let previewContent: { type: "image"; data: string; mimeType: string } | undefined;
     let captureContext: Record<string, unknown> | undefined;
     let finalReadingContext = readingContext;
@@ -244,7 +307,7 @@ function registerTools(server: McpServer, group: Group): void {
       if (!previewContent) return textResult({ error: "The app returned an invalid viewport image response." }, true);
       const mimeType = selectedQuality === "high" ? "image/png" as const : "image/jpeg" as const;
       const checkedInfo = JSON.parse(String(checked.content.find((item) => item.type === "text")?.text ?? "{}")) as Record<string, unknown>;
-      previewInfo = { mimeType, width: Number(checkedInfo.width), height: Number(checkedInfo.height), previewOnly: selectedQuality === "standard" };
+      previewInfo = { mimeType, byteLength: Number(checkedInfo.byteLength), width: Number(checkedInfo.width), height: Number(checkedInfo.height), ...(typeof checkedInfo.serverMs === "number" ? {serverMs: checkedInfo.serverMs} : {}), previewOnly: selectedQuality === "standard" };
       const capture = viewportContexts(image, tab, context.revision);
       captureContext = capture.captureContext;
       if (capture.capturedReadingContext) {
@@ -275,7 +338,9 @@ function registerTools(server: McpServer, group: Group): void {
     if (Buffer.byteLength(text) > 48 * 1024) return textResult({ error: "The current reading context exceeds the bounded response size." }, true);
     return { content: [...(previewContent ? [previewContent] : []), { type: "text" as const, text }] };
   });
-  server.registerTool("diagram_action", { description: "List diagrams, read their source, or capture a diagram image. Standard image quality returns a compact JPEG; high quality returns lossless PNG.", inputSchema: { deviceId, tabId, diagramAction: z.enum(["list","source","image"]), diagramId: z.string().min(1).max(128).optional(), expectedRevision: z.string().regex(/^[a-f0-9]{64}$/i), offset: z.number().int().min(0).max(20_000_000).optional(), limit: z.number().int().min(1).max(12_000).optional(), width: z.number().int().min(64).max(1600).optional(), quality: z.enum(["standard", "high"]).optional() } }, async ({ deviceId: selected, tabId: tab, diagramAction, diagramId, expectedRevision, offset, limit, width, quality }) => {
+  server.registerTool("diagram_action", { description: "List diagrams, read their source, or capture a diagram image. Standard image quality returns a compact JPEG; high quality returns lossless PNG.", inputSchema: { deviceId, tabId, diagramAction: z.enum(["list","source","image"]), diagramId: z.string().min(1).max(128).optional(), expectedRevision: z.string().regex(/^[a-f0-9]{64}$/i).optional(), offset: z.number().int().min(0).max(20_000_000).optional(), limit: z.number().int().min(1).max(12_000).optional(), width: z.number().int().min(64).max(1600).optional(), quality: z.enum(["standard", "high"]).optional() } }, async ({ deviceId: selected, tabId: tab, diagramAction, diagramId, expectedRevision, offset, limit, width, quality }) => {
+    if (diagramAction !== "list" && !expectedRevision) return textResult({error: "Diagram source/image needs expectedRevision from the inventory or reading context."}, true);
+    if (diagramAction === "list" && limit !== undefined && limit > 80) return textResult({error: "Diagram list limit must be between 1 and 80."}, true);
     const action = diagramAction === "list" ? "list_diagrams" : diagramAction === "source" ? "get_diagram" : "get_diagram_image";
     if (diagramAction === "image") {
       const selectedQuality = quality ?? "standard";
@@ -288,13 +353,13 @@ function registerTools(server: McpServer, group: Group): void {
     return toolResponse(response);
   });
   server.registerTool("replace_tab_asset", { description: "Replace a linked asset using a path available to the selected Super MD device. The device restricts reads to its configured asset roots; the relay never reads or stores the file.", inputSchema: { deviceId, tabId, assetName: z.string().min(1).max(256), assetPath: z.string().min(1).max(4096), expectedRevision: z.string().regex(/^[a-f0-9]{64}$/i) } }, async ({ deviceId: selected, tabId: tab, assetName, assetPath, expectedRevision }) => toolResponse(await rpc(group, { action: "replace_tab_asset", deviceId: selected, tabId: tab, assetName, assetPath, expectedRevision })));
-  server.registerTool("asset_action", { description: "List embedded assets, retrieve an original image/SVG (SVG source is returned in bounded chunks), or attach model-supplied bytes to a saved portable .smd note. Attachments are limited to 1 MiB and require the note's current source revision; the relay does not read files or fetch URLs.", inputSchema: { deviceId, tabId, assetAction: z.enum(["list", "source", "attach"]), assetName: z.string().min(1).max(256).optional(), mimeType: z.enum(["image/png", "image/jpeg", "image/gif", "image/webp", "image/avif", "image/svg+xml"]).optional(), body: z.string().max(1_400_000).optional(), offset: z.number().int().min(0).max(1_048_576).optional(), limit: z.number().int().min(1).max(12_000).optional(), expectedRevision: z.string().regex(/^[a-f0-9]{64}$/i) } }, async ({ deviceId: selected, tabId: tab, assetAction, assetName, mimeType, body, offset, limit, expectedRevision }) => {
+  server.registerTool("asset_action", { description: "List embedded assets, retrieve an original image/SVG (SVG source is returned in bounded chunks), or attach model-supplied bytes to a saved portable .smd note. Attachments are limited to 1 MiB and require the note's current source revision; the relay does not read files or fetch URLs.", inputSchema: { deviceId, tabId, assetAction: z.enum(["list", "source", "attach"]), assetName: z.string().min(1).max(256).optional(), mimeType: z.enum(["image/png", "image/jpeg", "image/gif", "image/webp", "image/avif", "image/svg+xml"]).optional(), body: z.string().max(1_400_000).describe("Base64-encoded original bytes, including UTF-8 SVG; not raw SVG text or a data URL").optional(), offset: z.number().int().min(0).max(1_048_576).optional(), limit: z.number().int().min(1).max(12_000).optional(), expectedRevision: z.string().regex(/^[a-f0-9]{64}$/i) } }, async ({ deviceId: selected, tabId: tab, assetAction, assetName, mimeType, body, offset, limit, expectedRevision }) => {
     const response = await rpc(group, { action: "asset_action", deviceId: selected, tabId: tab, assetAction, assetName, mimeType, body, offset, limit, expectedRevision });
     if (response.error) return toolResponse(response);
     if (assetAction === "source") return assetSourceResult(response, offset, limit);
     return toolResponse(response);
   });
-  server.registerTool("document_action", { description: "Read exact reading context, create, export, repair LaTeX, open, save, check an export job, or snapshot through Super MD's native UI. Snapshot defaults to JPEG at 1000 pixels; set options.quality to high for lossless PNG at 1600 pixels. options.width overrides the edge from 64 to 1600 pixels. No shell or code execution. PDF options match app controls; choose deviceId when ambiguous.", inputSchema: { deviceId, documentAction: z.enum(["get_context","create","export","latexfix","open","save","snapshot","job_status"]), tabId: tabId.optional(), expectedRevision: z.string().regex(/^[a-f0-9]{64}$/i).optional(), operations: z.array(z.record(z.string(), z.unknown())).max(100).optional(), content: z.string().max(60_000).optional(), options: exportOptions.extend({format:z.enum(["pdf","smd","md"]).optional(),repairIndices:z.array(z.number().int().min(0)).max(40).optional(),filename:z.string().max(256).optional(),jobId:z.string().max(128).optional(),limit:z.number().int().min(1).max(500).optional(),width:z.number().int().min(64).max(1600).optional(),quality:z.enum(["standard","high"]).optional()}).optional() } }, async ({ deviceId: selected, documentAction, tabId: tab, expectedRevision, operations, content, options }) => {
+  server.registerTool("document_action", { description: "Read exact reading context, create, export, repair LaTeX, open, save, check an export job, or snapshot through Super MD's native UI. Snapshot defaults to JPEG at 1000 pixels; set options.quality to high for lossless PNG at 1600 pixels. options.width overrides the edge from 64 to 1600 pixels. Create/open support options.background. Save preserves the existing path and format; options.saveAs is explicit. Close requires expectedRevision and refuses dirty drafts unless options.discardChanges is true. latex_review proposes indexed repairs; latex_apply applies chosen repairIndices against that revision. Poll job_status after asynchronous open/export. No shell or code execution. For a whole document export use format md, smd or pdf; options.section exports only a chosen heading and its descendants. Completed export job_status returns a private expiring download resource link, so file bytes do not consume model tokens. Use outline with options.offset/limit for bounded heading discovery. Android agent exports use the configured folder or Downloads. PDF options match app controls; choose deviceId when ambiguous.", inputSchema: { deviceId, documentAction: z.enum(["get_context","outline","create","export","latexfix","latex_review","latex_apply","open","activate","close","save","snapshot","job_status"]), tabId: tabId.optional(), expectedRevision: z.string().regex(/^[a-f0-9]{64}$/i).optional(), operations: z.array(patchOperation).max(100).optional(), content: z.string().max(60_000).optional(), options: exportOptions.extend({section:z.union([z.number().int().min(0),z.string().min(1).max(512)]).optional(),offset:z.number().int().min(0).max(20_000_000).optional(),background:z.boolean().optional(),saveAs:z.boolean().optional(),discardChanges:z.boolean().optional(),title:z.string().max(160).optional(),format:z.enum(["pdf","smd","md"]).optional(),repairIndices:z.array(z.number().int().min(0)).max(40).optional(),filename:z.string().max(256).optional(),jobId:z.string().max(128).optional(),limit:z.number().int().min(1).max(12_000).optional(),width:z.number().int().min(64).max(1600).optional(),quality:z.enum(["standard","high"]).optional()}).optional() } }, async ({ deviceId: selected, documentAction, tabId: tab, expectedRevision, operations, content, options }) => {
     const jobId = options?.jobId;
     if (documentAction === "snapshot") {
       if (!tab) return textResult({ error: "tabId is required for snapshot." }, true);
@@ -304,14 +369,19 @@ function registerTools(server: McpServer, group: Group): void {
       return quality === "high" ? imageResult(await rpc(group, request)) : jpegImageResult(await jpegCaptureRpc(group, request), width);
     }
     if (options?.quality !== undefined || options?.width !== undefined) return textResult({ error: "Snapshot width and quality options are only supported for documentAction snapshot." }, true);
-    const response = await rpc(group, { action: "document_action", deviceId: selected, documentAction, tabId: tab, expectedRevision, operations, content, jobId, options });
+    let target={deviceId:selected,tabId:tab};
+    if((documentAction==="get_context"||documentAction==="outline")&&!tab){
+      const resolved=await readTarget(group,selected);if(resolved.error)return textResult({error:resolved.error},true);target={deviceId:resolved.deviceId,tabId:resolved.tabId};
+    }
+    const response = await rpc(group, { action: "document_action", ...target, documentAction, expectedRevision, operations, content, jobId, options });
+    if(documentAction==="job_status")return exportJobResult(group,selected,jobId,response);
     if (documentAction === "get_context" && !response.error) {
       return toolResponse({ ...response, result: normalizeReadingContext(response.result) ?? response.result });
     }
     return toolResponse(response);
   });
 }
-function buildServer(group: Group): McpServer { const mcp = new McpServer({ name: "super-md-live", version: "0.2.1" }); registerTools(mcp, group); return mcp; }
+function buildServer(group: Group): McpServer { const mcp = new McpServer({ name: "super-md-live", version: "0.3.0" }); registerTools(mcp, group); return mcp; }
 
 const modernHandler = createMcpHandler((ctx) => {
   const path = new URL(ctx.requestInfo!.url).pathname.split("/");
@@ -321,6 +391,32 @@ const modernHandler = createMcpHandler((ctx) => {
 const modernNodeHandler = toNodeHandler(modernHandler, { maxRequestBodySize: 2 * 1024 * 1024 });
 
 app.disable("x-powered-by");
+app.get("/download/:token",async(req,res)=>{
+  // A file link is an explicit short-lived capability, not ambient cookie
+  // authorization. Permit clients on other origins to fetch their own link.
+  if((req.headers.host??"").toLowerCase()!==expectedHost){res.status(403).end();return;}
+  res.set({"Cache-Control":"no-store","Access-Control-Allow-Origin":"*","Access-Control-Expose-Headers":"Content-Disposition, Content-Length, ETag","X-Content-Type-Options":"nosniff","X-Robots-Tag":"noindex, nofollow","Referrer-Policy":"no-referrer"});
+  const token=param(req.params.token),lease=exportsAvailable.get(token);
+  if(!lease||!groups.get(lease.groupId)?.devices.has(lease.deviceId)){res.status(404).json({error:"This export download expired or was revoked."});return;}
+  let aborted=false;res.on("close",()=>{aborted=true;});
+  const deadline=setTimeout(()=>{aborted=true;res.destroy();},180_000);
+  try {
+    let headers=false;
+    for await(const chunk of exportsAvailable.stream(token,async(info,offset,limit)=>{
+      const group=groups.get(info.groupId);if(!group||!group.devices.has(info.deviceId))return {error:"Device access was revoked."};
+      return rpc(group,{action:"document_action",documentAction:"export_chunk",deviceId:info.deviceId,jobId:info.jobId,offset,limit});
+    },()=>aborted)){
+      if(!headers){
+        res.set({"Content-Type":lease.mimeType,"Content-Length":String(lease.bytes),"Content-Disposition":attachmentHeader(lease.filename),"ETag":'"'+lease.sha256+'"'});headers=true;
+      }
+      if(!res.write(chunk))await waitForDownloadDrain(res);
+    }
+    if(!headers)res.set({"Content-Type":lease.mimeType,"Content-Length":"0","Content-Disposition":attachmentHeader(lease.filename)});
+    res.end();
+  } catch {
+    if(res.headersSent)res.destroy();else res.status(409).json({error:"The export is unavailable, changed, or another download is active. Check job_status and retry."});
+  } finally {clearTimeout(deadline);}
+});
 app.get("/health", (_req, res) => res.status(200).json({ status: "ok", activeGroups: groups.size, connectedDevices: [...groups.values()].reduce((n, g) => n + onlineDevices(g).length, 0) }));
 app.post("/device/enroll", hostGuard, express.json({ limit: "8kb", strict: true }), (req, res) => {
   const body = req.body as Record<string, unknown>;

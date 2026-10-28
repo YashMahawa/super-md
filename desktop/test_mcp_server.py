@@ -60,6 +60,12 @@ class MultiSessionLiveClientTest(unittest.TestCase):
                 self.assertEqual(result["markdown"], "unsaved source")
                 fake.read_tab.assert_called_once_with("tab-local", offset=0, limit=200, window_id="window-a",
                                                       asset_offset=0, asset_limit=0, view="prose")
+                fake.search_tab.return_value = {"revision": "a" * 64, "matches": []}
+                live.search_tab(tabs[0]["id"], "needle", offset=50, case_sensitive=True,
+                                whole_word=True, regex=True, exclude_diagrams=True)
+                fake.search_tab.assert_called_once_with("tab-local", query="needle", limit=10, context=100,
+                                                        offset=50, case_sensitive=True, whole_word=True,
+                                                        regex=True, exclude_diagrams=True, window_id="window-a")
 
     def test_live_export_job_id_stays_scoped_to_its_session_while_polling(self):
         with tempfile.TemporaryDirectory() as folder:
@@ -94,6 +100,71 @@ class MultiSessionLiveClientTest(unittest.TestCase):
                                                device_id="local")
                 self.assertEqual(created["target"], "tab:session-one:window-a:new-tab")
                 self.assertEqual(fake.document_action.call_args_list[2].args, ("", "create_document"))
+
+    def test_async_open_job_id_stays_scoped_and_returns_qualified_tab(self):
+        with tempfile.TemporaryDirectory() as folder:
+            directory = Path(folder)
+            if os.name == "posix": directory.chmod(0o700)
+            (directory / "one.json").write_text(json.dumps({"version": 1, "sessionId": "session-one",
+                                                              "host": "127.0.0.1", "port": 32123,
+                                                              "token": "x" * 48}), encoding="utf-8")
+            if os.name == "posix": (directory / "one.json").chmod(0o600)
+            fake = Mock()
+            fake.list_tabs.return_value = {"tabs": []}
+            fake.document_action.side_effect = [
+                {"status": "opening", "jobId": "native-open", "windowId": "window-a",
+                 "path": "/notes/open.md", "active": False},
+                {"status": "completed", "jobId": "native-open", "tabId": "opened-tab",
+                 "windowId": "window-a", "path": "/notes/open.md", "revision": "f" * 64,
+                 "sourceLength": 12, "active": False},
+            ]
+            with patch("agent_live_client.LiveTabClient", return_value=fake):
+                live = MultiSessionLiveClient(directory)
+                opened = live.document_action(None, "open_document", filename="/notes/open.md", background=True)
+                self.assertEqual(opened["jobId"], "session-one:native-open")
+                done = live.document_action(None, "job_status", job_id=opened["jobId"])
+                self.assertEqual(done["target"], "tab:session-one:window-a:opened-tab")
+                self.assertEqual(done["revision"], "f" * 64)
+                self.assertFalse(done["active"])
+                self.assertEqual(fake.document_action.call_args_list[1].kwargs["window_id"], "window-a")
+                fake.list_tabs.return_value = {"tabs": [{"id": "opened-tab", "windowId": "window-a"}]}
+                routed, local_id, window_id = live._route(done["target"])
+                self.assertIs(routed, fake)
+                self.assertEqual((local_id, window_id), ("opened-tab", "window-a"))
+                live.patch_tab(done["target"], "f" * 64, [])
+                fake.patch_tab.assert_called_once_with("opened-tab", expected_revision="f" * 64,
+                                                       operations=[], window_id="window-a")
+
+    def test_export_chunk_alias_survives_completed_job_poll(self):
+        with tempfile.TemporaryDirectory() as folder:
+            directory = Path(folder)
+            if os.name == "posix": directory.chmod(0o700)
+            (directory / "one.json").write_text(json.dumps({"version": 1, "sessionId": "session-one",
+                                                              "host": "127.0.0.1", "port": 32123,
+                                                              "token": "x" * 48}), encoding="utf-8")
+            if os.name == "posix": (directory / "one.json").chmod(0o600)
+            fake = Mock()
+            fake.list_tabs.return_value = {"tabs": [{"id": "tab-local", "windowId": "window-a"}]}
+            fake.document_action.side_effect = [
+                {"jobId": "native-export", "status": "running"},
+                {"jobId": "native-export", "status": "completed", "downloadable": True},
+                {"jobId": "native-export", "filename": "whole note.pdf", "format": "pdf",
+                 "mimeType": "application/pdf", "bytes": 3, "sha256": "a" * 64,
+                 "offset": 0, "nextOffset": None, "body": "eHl6"},
+            ]
+            with patch("agent_live_client.LiveTabClient", return_value=fake):
+                live = MultiSessionLiveClient(directory)
+                tab = live.list_tabs()["tabs"][0]["id"]
+                started = live.document_action(tab, "export_document", format="pdf",
+                                               expected_revision="b" * 64)
+                self.assertEqual(started["jobId"], "session-one:native-export")
+                status = live.document_action(None, "job_status", job_id=started["jobId"])
+                self.assertEqual(status["status"], "completed")
+                chunk = live.document_action(None, "export_chunk", job_id=started["jobId"], offset=0, limit=3)
+                self.assertEqual(chunk["body"], "eHl6")
+                self.assertEqual(fake.document_action.call_args_list[2].args, ("", "export_chunk"))
+                self.assertEqual(fake.document_action.call_args_list[2].kwargs,
+                                 {"window_id": "window-a", "job_id": "native-export", "offset": 0, "limit": 3})
 
 
 @unittest.skipUnless(importlib.util.find_spec("mcp"), "install desktop/requirements-agent.txt for official SDK transport tests")
@@ -140,10 +211,25 @@ class OfficialMCPClientTest(unittest.IsolatedAsyncioTestCase):
             def list_tabs(self):
                 return {"tabs": [{"id": "session:window:tab", "title": "Unsaved", "isDirty": True,
                                   "format": "smd", "revision": "a" * 64, "active": True}]}
-            def read_tab(self, tab_id, offset=0, limit=12000, view="prose"):
+            def read_tab(self, tab_id, offset=0, limit=12000, view="prose", heading=None):
+                self.read_call = {"tab_id": tab_id, "offset": offset, "limit": limit,
+                                  "view": view, "heading": heading}
                 return {"tabId": tab_id, "revision": "a" * 64, "markdown": "# Unsaved\nbody\n"[offset:offset + limit],
-                        "offset": offset, "totalLength": 15, "title": "Unsaved", "view": view}
-            def search_tab(self, tab_id, query, limit=10, context=100):
+                        "offset": offset, "totalLength": 15, "title": "Unsaved", "view": view,
+                        **({"heading": {"index": 0, "level": 1, "title": "Unsaved", "line": 1},
+                            "sectionStart": 0, "sectionEnd": 15, "documentLength": 15} if heading is not None else {})}
+            def outline_tab(self, tab_id, offset=0, limit=80):
+                self.outline_call = {"tab_id": tab_id, "offset": offset, "limit": limit}
+                headings = [{"index": 0, "level": 1, "title": "Unsaved", "line": 1, "start": 0}]
+                return {"revision": "a" * 64, "headings": headings[offset:offset + limit],
+                        "offset": offset, "total": len(headings), "nextOffset": None,
+                        "truncated": False, "sourceLength": 15}
+            def search_tab(self, tab_id, query, limit=10, context=100, offset=0,
+                           case_sensitive=False, whole_word=False, regex=False, exclude_diagrams=False):
+                self.search_call = {"tab_id": tab_id, "query": query, "limit": limit, "context": context,
+                                    "offset": offset, "case_sensitive": case_sensitive,
+                                    "whole_word": whole_word, "regex": regex,
+                                    "exclude_diagrams": exclude_diagrams}
                 return {"revision": "a" * 64, "matches": [{"line": 2, "text": "body"}]}
             def patch_tab(self, tab_id, expected_revision, operations):
                 self.edits.append((tab_id, expected_revision, operations))
@@ -160,10 +246,18 @@ class OfficialMCPClientTest(unittest.IsolatedAsyncioTestCase):
                 if action == "export_document":
                     return {"jobId": "job-1", "status": "running", "filename": "Unsaved.pdf", "format": "pdf"}
                 if action == "job_status":
-                    return {"jobId": params["job_id"], "status": "completed", "format": "pdf", "bytes": 100}
+                    return {"jobId": params["job_id"], "status": "completed", "format": "pdf", "bytes": 100,
+                            **({"tabId": "opened-tab", "revision": "f" * 64, "path": "/notes/open.md",
+                               "sourceLength": 12, "active": False} if params["job_id"] == "open-job" else {})}
                 if action == "create_document":
                     return {"tabId": "new-tab", "windowId": "window", "title": params.get("title"),
-                            "revision": "c" * 64, "isDirty": True, "format": params["format"]}
+                            "revision": "c" * 64, "isDirty": True, "format": params.get("format") or "md",
+                            "active": not params.get("background", False), "sourceLength": 6, "path": ""}
+                if action == "open_document":
+                    return {"status": "opening", "jobId": "open-job", "windowId": "window",
+                            "path": params.get("filename", ""), "active": not params.get("background", False)}
+                if action in ("save_document", "activate_document", "close_document"):
+                    return {"status": "ok", "pathChanged": False, "active": True}
                 if action == "list_diagrams":
                     return {"revision": "a" * 64, "diagrams": [{"id": "diagram:12", "kind": "mermaid",
                                                                      "sourceStart": 12, "sourceEnd": 30,
@@ -212,6 +306,24 @@ class OfficialMCPClientTest(unittest.IsolatedAsyncioTestCase):
             self.assertTrue(tabs.structured_content["sessions"][0]["active"])
             read = await client.call_tool("document_read", {"path": target, "offset": 0, "limit": 5})
             self.assertEqual(read.structured_content["markdown"], "# Uns")
+            selected_read = await client.call_tool("document_read", {
+                "path": target, "heading": "Unsaved", "view": "source"})
+            self.assertEqual(live.read_call["heading"], "Unsaved")
+            self.assertEqual(selected_read.structured_content["markdown"], "# Unsaved\nbody\n")
+            self.assertEqual(selected_read.structured_content["heading"]["title"], "Unsaved")
+            self.assertEqual(selected_read.structured_content["sectionEnd"], 15)
+            outline = await client.call_tool("document_action", {
+                "action": "outline", "path": target, "offset": 2, "limit": 7})
+            self.assertEqual(outline.structured_content["target"], target)
+            self.assertEqual((live.outline_call["offset"], live.outline_call["limit"]), (2, 7))
+            search = await client.call_tool("document_search", {
+                "path": target, "query": "body", "limit": 3, "context": 10, "offset": 5,
+                "case_sensitive": True, "whole_word": True, "regex": False, "exclude_diagrams": True,
+            })
+            self.assertEqual(live.search_call["offset"], 5)
+            self.assertTrue(live.search_call["case_sensitive"])
+            self.assertTrue(live.search_call["whole_word"])
+            self.assertTrue(live.search_call["exclude_diagrams"])
             patch = await client.call_tool("document_patch", {
                 "path": target, "expected_revision": "a" * 64,
                 "operations": [{"type": "replace", "old": "body", "new": "edited"}],
@@ -229,21 +341,52 @@ class OfficialMCPClientTest(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(svg_block.mime_type, "image/svg+xml")
             self.assertEqual(base64.b64decode(svg_block.data), b"<svg xmlns='http://www.w3.org/2000/svg'></svg>")
             exported = await client.call_tool("document_action", {"action": "export", "path": target,
-                                                                     "format": "pdf", "expected_revision": "a" * 64})
+                                                                     "format": "pdf", "expected_revision": "a" * 64,
+                                                                     "options": {"section": "Unsaved"}})
             job_id = exported.structured_content["jobId"]
+            self.assertEqual(live.actions[-1][2]["options"], {"section": "Unsaved"})
             status = await client.call_tool("document_action", {"action": "job_status", "job_id": job_id})
             self.assertEqual(status.structured_content["status"], "completed")
             created = await client.call_tool("document_action", {"action": "create_document", "content": "# New",
-                                                                    "format": "smd", "title": "New note"})
+                                                                    "filename": "New.smd", "background": True})
             self.assertEqual(created.structured_content["tabId"], "new-tab")
+            self.assertFalse(created.structured_content["active"])
+            self.assertEqual(live.actions[-1][2]["filename"], "New.smd")
+            self.assertTrue(live.actions[-1][2]["background"])
             saved = await client.call_tool("document_action", {"action": "save_document", "path": target,
                                                                   "expected_revision": "a" * 64,
-                                                                  "filename": "saved.md", "format": "md"})
+                                                                  "filename": "saved.md", "save_as": True})
             self.assertEqual(saved.structured_content["status"], "ok")
+            self.assertTrue(live.actions[-1][2]["save_as"])
+            self.assertIsNone(live.actions[-1][2]["format"])
             activated = await client.call_tool("document_action", {"action": "open_document", "path": target})
             self.assertTrue(activated.structured_content["opened"])
-            diagrams = await client.call_tool("document_action", {"action": "list_diagrams", "path": target})
+            opened = await client.call_tool("document_action", {"action": "open_document",
+                                                                   "filename": "/notes/open.md", "background": True})
+            self.assertEqual(opened.structured_content["status"], "opening")
+            self.assertTrue(opened.structured_content["active"] is False)
+            done = await client.call_tool("document_action", {"action": "job_status", "job_id": "open-job"})
+            self.assertEqual(done.structured_content["tabId"], "opened-tab")
+            self.assertFalse(done.structured_content["active"])
+            await client.call_tool("document_action", {"action": "activate_document", "path": target})
+            self.assertEqual(live.actions[-1][1], "activate_document")
+            await client.call_tool("document_action", {"action": "close_document", "path": target,
+                                                          "expected_revision": "a" * 64, "discard_changes": True})
+            self.assertEqual(live.actions[-1][1], "close_document")
+            self.assertTrue(live.actions[-1][2]["discard_changes"])
+            diagrams = await client.call_tool("document_action", {"action": "list_diagrams", "path": target,
+                                                                    "expected_revision": "a" * 64})
             diagram_id = diagrams.structured_content["diagrams"][0]["id"]
+            self.assertEqual(live.actions[-1][2]["offset"], 0)
+            self.assertEqual(live.actions[-1][2]["limit"], 80)
+            self.assertEqual(live.actions[-1][2]["expected_revision"], "a" * 64)
+            paged_diagrams = await client.call_tool("document_action", {
+                "action": "list_diagrams", "path": target, "offset": 14, "limit": 6})
+            self.assertEqual(paged_diagrams.structured_content["diagrams"][0]["id"], diagram_id)
+            self.assertEqual((live.actions[-1][2]["offset"], live.actions[-1][2]["limit"]), (14, 6))
+            invalid_diagrams = await client.call_tool("document_action", {
+                "action": "list_diagrams", "path": target, "limit": 81})
+            self.assertTrue(invalid_diagrams.is_error)
             diagram = await client.call_tool("document_action", {"action": "get_diagram", "path": target,
                                                                      "diagram_id": diagram_id,
                                                                      "expected_revision": "a" * 64,

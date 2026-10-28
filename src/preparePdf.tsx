@@ -66,11 +66,17 @@ export async function preparePdf(markdown: string, documentPath: string | null, 
   // parse() runs no transformers: lift raw <svg> markup into svg blocks here.
   const tree = remarkSvgBlocks()(processor.parse(normalized), { value: normalized });
   const work: Array<()=>Promise<void>> = []; const assets: Record<string, string> = {}; let count = 0;
+  const referenceDefinitions=new Map<string,any>();
+  visit(tree,"definition",(node:any)=>{if(!referenceDefinitions.has(node.identifier))referenceDefinitions.set(node.identifier,node);});
   const chartTitles = new Map<any,string>();
   const pythonCells=analyzeDocument(markdown).pythonCells;
   const pythonOrdinals=new Map<string,number>();
   const add = (url: string, name: string) => { assets[name] = url.slice(url.indexOf(",") + 1); return name; };
   visit(tree, (node: any) => {
+    if(node.type==="imageReference"){
+      const definition=referenceDefinitions.get(node.identifier);
+      if(definition){node.type="image";node.url=definition.url;node.title=definition.title;delete node.identifier;delete node.label;delete node.referenceType;}
+    }
     if(node.type==='code'&&['python','py'].includes(String(node.lang||'').toLowerCase()))node.lang=String(node.lang).toLowerCase();
     const exportCell = node.type === "code" && ["mermaid", "svg", "smd-chart", "python", "py"].includes(node.lang);
     let pythonContext: {document:string;cell:string;interpreter:string}|undefined;

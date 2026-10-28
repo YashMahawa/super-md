@@ -11,11 +11,12 @@ export function agentDiagrams(source:string):AgentDiagram[]{
   const definitionsIn=(node:any)=>{if(node.type==='definition')definitions.set(node.identifier,node.url);for(const child of node.children??[])definitionsIn(child);};definitionsIn(tree);
   const walk=(node:any)=>{
     if(node.type==='code'&&['svg','mermaid','smd-chart'].includes(node.lang)&&node.position){
-      result.push({id:`diagram:${node.position.start.offset}`,kind:node.lang,source:node.value,start:node.position.start.offset,end:node.position.end.offset});
+      const start=agentCharLength(source.slice(0,node.position.start.offset));
+      result.push({id:`diagram:${start}`,kind:node.lang,source:node.value,start:node.position.start.offset,end:node.position.end.offset});
     }
     if(['image','imageReference'].includes(node.type)&&node.position){
       const url=node.type==='image'?node.url:definitions.get(node.identifier);
-      if(url)result.push({id:`diagram:image:${node.position.start.offset}`,kind:'image',url,label:node.alt||'Image',source:source.slice(node.position.start.offset,node.position.end.offset),start:node.position.start.offset,end:node.position.end.offset});
+      if(url)result.push({id:`diagram:image:${agentCharLength(source.slice(0,node.position.start.offset))}`,kind:'image',url,label:node.alt||'Image',source:source.slice(node.position.start.offset,node.position.end.offset),start:node.position.start.offset,end:node.position.end.offset});
     }
     for(const child of node.children??[])walk(child);
   };

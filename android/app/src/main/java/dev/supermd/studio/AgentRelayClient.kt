@@ -177,7 +177,29 @@ class AgentRelayClient(private val onState: (State) -> Unit = {}) {
         }
     }
 
+    private fun normalizeDocumentOptions(request: JSONObject) {
+        if (request.optString("action") != "document_action") return
+        val action = request.optString("documentAction")
+        if (action == "export_chunk") {
+            val options = request.optJSONObject("options") ?: return
+            if (!request.has("jobId") && options.has("jobId")) request.put("jobId", options.get("jobId"))
+            return
+        }
+        if (action !in setOf("create", "save", "export")) return
+        val options = request.optJSONObject("options") ?: return
+        listOf("filename", "format").forEach { key -> if (!request.has(key) && options.has(key)) request.put(key, options.get(key)) }
+        if (!request.has("titleHint")) {
+            val title = when {
+                options.has("titleHint") -> options.get("titleHint")
+                options.has("title") -> options.get("title")
+                else -> null
+            }
+            if (title != null) request.put("titleHint", title)
+        }
+    }
+
     internal fun validateRequest(request: JSONObject) {
+        normalizeDocumentOptions(request)
         val keys = request.keys().asSequence().toSet()
         require(keys.all { it in RPC_FIELDS }) { "Unknown RPC field" }
         require(REQUEST_ID.matches(request.optString("requestId"))) { "Invalid request id" }
@@ -187,8 +209,10 @@ class AgentRelayClient(private val onState: (State) -> Unit = {}) {
             require(request.getString("imageFormat") in setOf("png", "jpeg")) { "Invalid imageFormat" }
         }
         if (action in TAB_ACTIONS) require(request.optString("tabId").isNotBlank() && request.optString("tabId").length <= 512) { "tabId is required" }
+        if (action in setOf("outline_tab", "latex_review", "latex_apply", "get_context")) require(request.optString("tabId").isNotBlank()) { "tabId is required" }
         if (action in setOf("list_diagrams", "get_diagram", "get_diagram_image", "replace_tab_asset", "asset_action")) require(request.optString("tabId").isNotBlank()) { "tabId is required" }
-        if (action in setOf("get_diagram", "get_diagram_image", "list_diagrams", "replace_tab_asset", "asset_action")) require(REVISION.matches(request.optString("expectedRevision"))) { "A current document revision is required" }
+        if (action in setOf("get_diagram", "get_diagram_image", "replace_tab_asset", "asset_action")) require(REVISION.matches(request.optString("expectedRevision"))) { "A current document revision is required" }
+        if (action in setOf("get_diagram", "get_diagram_image")) require(request.optString("diagramId").startsWith("diagram:") && request.optString("diagramId").length <= 100) { "A listed diagramId is required" }
         if (action == "asset_action") {
             val kind = request.optString("assetAction")
             require(kind in setOf("list", "source", "attach")) { "Invalid assetAction" }
@@ -211,8 +235,21 @@ class AgentRelayClient(private val onState: (State) -> Unit = {}) {
             require(request.optString("documentAction") in DOCUMENT_ACTIONS) { "Invalid document action" }
             val docAction = request.getString("documentAction")
             if (docAction in TAB_DOCUMENT_ACTIONS && docAction != "job_status") require(request.optString("tabId").isNotBlank()) { "tabId is required for this action" }
-            if (docAction == "job_status") require(request.optString("jobId").isNotBlank()) { "jobId is required for this action" }
+            if (docAction in setOf("job_status", "export_chunk")) require(request.optString("jobId").matches(REQUEST_ID)) { "A valid jobId is required for this action" }
+            if (docAction in REVISIONED_DOCUMENT_ACTIONS || (docAction == "latexfix" && request.optJSONObject("options")?.has("repairIndices") == true))
+                require(REVISION.matches(request.optString("expectedRevision"))) { "A current document revision is required" }
+            if (docAction == "save" && request.optJSONObject("options")?.optBoolean("saveAs", false) == true)
+                require(request.optString("filename").isNotBlank()) { "Save As requires an explicit filename" }
+            if (docAction == "create" && request.has("format")) require(request.getString("format") in setOf("md", "smd")) { "Create format must be md or smd" }
+            if (docAction == "save" && request.has("format")) require(request.getString("format") in setOf("md", "smd")) { "Save format must be md or smd" }
+            if (docAction == "export_chunk") {
+                require(!request.has("offset") || request.getLong("offset") >= 0L) { "Export chunk offset must be a non-negative byte position" }
+                require(!request.has("limit") || request.getInt("limit") in 1..MAX_EXPORT_CHUNK_BYTES) { "Export chunk limit must be 1–524288 bytes" }
+            }
+            if (docAction == "latex_apply") require(request.has("repairIndices") || request.optJSONObject("options")?.has("repairIndices") == true) { "latex_apply requires reviewed repair indices" }
         }
+        if (action in setOf("patch_tab", "latex_apply")) require(REVISION.matches(request.optString("expectedRevision"))) { "A current document revision is required" }
+        if (action == "latex_apply") require(request.has("repairIndices")) { "latex_apply requires reviewed repair indices" }
         if (action == "patch_tab") {
             require(request.has("expectedRevision") && request.has("operations")) { "A patch needs an expected revision and operations" }
         }
@@ -229,13 +266,34 @@ class AgentRelayClient(private val onState: (State) -> Unit = {}) {
         if (request.has("format")) require(request.getString("format") in setOf("pdf", "smd", "md")) { "Invalid export format" }
         if (request.has("repairIndices")) {
             val indices = request.getJSONArray("repairIndices")
-            require(indices.length() <= 40 && (0 until indices.length()).all { indices.optInt(it, -1) >= 0 }) { "Invalid repair indices" }
+            val values = (0 until indices.length()).map { indices.optInt(it, -1) }
+            require(values.size in 1..40 && values.all { it >= 0 } && values.distinct().size == values.size) { "Invalid repair indices" }
         }
-        if (request.has("filename")) require(request.getString("filename").length <= 256 && !request.getString("filename").contains('/') && !request.getString("filename").contains('\\')) { "Invalid filename" }
+        request.optJSONObject("options")?.takeIf { it.has("repairIndices") }?.let { options ->
+            val indices = options.getJSONArray("repairIndices")
+            val values = (0 until indices.length()).map { indices.optInt(it, -1) }
+            require(values.size in 1..40 && values.all { it >= 0 } && values.distinct().size == values.size) { "Invalid repair indices" }
+        }
+        if (request.has("filename")) require(request.get("filename") is String && request.getString("filename").length <= 256 && !request.getString("filename").contains('/') && !request.getString("filename").contains('\\')) { "Invalid filename" }
+        if (request.has("titleHint")) require(request.get("titleHint") is String && request.getString("titleHint").length <= 200 && !request.getString("titleHint").contains('\u0000')) { "Invalid titleHint" }
+        if (request.has("format")) require(request.get("format") is String) { "Invalid format" }
         if (request.has("query")) require(request.getString("query").length in 1..2048) { "Invalid query" }
-        listOf("offset" to 20_000_000, "limit" to 12_000, "context" to 500, "width" to 1600).forEach { (field, max) ->
+        if (action == "search_tab") require(request.optString("query").length in 1..500) { "Search query must contain 1–500 characters" }
+        if (request.has("caseSensitive")) require(request.get("caseSensitive") is Boolean) { "caseSensitive must be a boolean" }
+        if (request.has("wholeWord")) require(request.get("wholeWord") is Boolean) { "wholeWord must be a boolean" }
+        if (request.has("regex")) require(request.get("regex") is Boolean) { "regex must be a boolean" }
+        if (request.has("excludeDiagrams")) require(request.get("excludeDiagrams") is Boolean) { "excludeDiagrams must be a boolean" }
+        if (request.has("options")) {
+            val options = request.getJSONObject("options")
+            options.keys().forEach { key ->
+                if (key in BOOLEAN_OPTIONS) require(options.get(key) is Boolean) { "$key must be a boolean" }
+            }
+        }
+        listOf("context" to 500, "width" to 1600).forEach { (field, max) ->
             if (request.has(field)) require(request.getInt(field) in 0..max) { "Invalid $field" }
         }
+        if (request.has("offset") && !(action == "document_action" && request.optString("documentAction") == "export_chunk")) require(request.getInt("offset") in 0..20_000_000) { "Invalid offset" }
+        if (request.has("limit") && !(action == "document_action" && request.optString("documentAction") == "export_chunk")) require(request.getInt("limit") in 0..12_000) { "Invalid limit" }
         if (request.has("width")) require(request.getInt("width") >= 1) { "Invalid width" }
     }
 
@@ -273,13 +331,16 @@ class AgentRelayClient(private val onState: (State) -> Unit = {}) {
         val RETRY_TOKEN = Any()
         val REQUEST_ID = Regex("^[a-zA-Z0-9_-]{1,96}$")
         val REVISION = Regex("^[a-f0-9]{64}$", RegexOption.IGNORE_CASE)
-        val ACTIONS = setOf("list_tabs", "read_tab", "search_tab", "patch_tab", "render_tab", "list_diagrams", "get_diagram", "get_diagram_image", "replace_tab_asset", "asset_action", "document_action")
+        val ACTIONS = setOf("list_tabs", "read_tab", "search_tab", "patch_tab", "render_tab", "list_diagrams", "get_diagram", "get_diagram_image", "replace_tab_asset", "asset_action", "document_action", "outline_tab", "get_context", "latex_review", "latex_apply")
         val TAB_ACTIONS = setOf("read_tab", "search_tab", "patch_tab", "render_tab")
-        val TAB_DOCUMENT_ACTIONS = setOf("export", "latexfix", "save", "snapshot", "get_context")
-        val DOCUMENT_ACTIONS = setOf("create", "export", "latexfix", "open", "save", "snapshot", "job_status", "get_context")
+        val TAB_DOCUMENT_ACTIONS = setOf("export", "latexfix", "latex_review", "latex_apply", "save", "snapshot", "get_context", "activate", "close", "outline")
+        val DOCUMENT_ACTIONS = setOf("create", "export", "latexfix", "latex_review", "latex_apply", "open", "save", "snapshot", "job_status", "get_context", "activate", "close", "outline", "export_chunk")
+        val REVISIONED_DOCUMENT_ACTIONS = setOf("save", "close", "latex_apply")
+        val BOOLEAN_OPTIONS = setOf("background", "saveAs", "discardChanges")
         const val MAX_ASSET_BYTES = 1024 * 1024
         const val MAX_ASSET_BASE64 = 1_400_000
+        const val MAX_EXPORT_CHUNK_BYTES = 524_288
         val ASSET_MIMES = setOf("image/png", "image/jpeg", "image/gif", "image/webp", "image/avif", "image/svg+xml")
-        val RPC_FIELDS = setOf("requestId", "action", "tabId", "offset", "limit", "query", "context", "expectedRevision", "operations", "width", "imageFormat", "documentAction", "content", "options", "diagramId", "format", "repairIndices", "jobId", "heading", "filename", "windowId", "assetName", "assetPath", "assetAction", "mimeType", "body", "view")
+        val RPC_FIELDS = setOf("requestId", "action", "tabId", "offset", "limit", "query", "context", "expectedRevision", "operations", "width", "imageFormat", "documentAction", "content", "options", "diagramId", "format", "repairIndices", "jobId", "heading", "filename", "titleHint", "title", "windowId", "assetName", "assetPath", "assetAction", "mimeType", "body", "view", "caseSensitive", "wholeWord", "regex", "excludeDiagrams")
     }
 }

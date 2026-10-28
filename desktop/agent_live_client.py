@@ -28,6 +28,7 @@ class MultiSessionLiveClient:
         self._lock = threading.RLock()
         self._sessions: dict[str, tuple[LiveTabClient, dict[str, tuple[str, str]]]] = {}
         self._jobs: dict[str, tuple[str, LiveTabClient, str, str, str]] = {}
+        self._export_jobs: dict[str, tuple[str, LiveTabClient, str, str, str]] = {}
 
     def _refresh(self) -> list[dict[str, Any]]:
         sessions: dict[str, tuple[LiveTabClient, dict[str, tuple[str, str]]]] = {}
@@ -69,6 +70,10 @@ class MultiSessionLiveClient:
         return {"tabs": self._refresh()}
 
     def _route(self, tab_id: str) -> tuple[LiveTabClient, str, str]:
+        # MCP document targets are exposed as ``tab:<session>:<window>:<tab>``;
+        # list_tabs and the lower-level client use the bare qualified ID.
+        if isinstance(tab_id, str) and tab_id.startswith("tab:"):
+            tab_id = tab_id[4:]
         with self._lock:
             for _session, (client, local_ids) in self._sessions.items():
                 if tab_id in local_ids:
@@ -85,7 +90,7 @@ class MultiSessionLiveClient:
 
     def read_tab(self, tab_id: str, offset: int = 0, limit: int = 12_000,
                  asset_offset: int = 0, asset_limit: int = 0, view: str = "prose",
-                 heading: int | None = None) -> dict[str, Any]:
+                 heading: int | str | None = None) -> dict[str, Any]:
         client, local_id, window_id = self._route(tab_id)
         params = {"offset": offset, "limit": limit, "window_id": window_id,
                   "asset_offset": asset_offset, "asset_limit": asset_limit, "view": view}
@@ -93,16 +98,20 @@ class MultiSessionLiveClient:
             params["heading"] = heading
         return client.read_tab(local_id, **params)
 
-    def search_tab(self, tab_id: str, query: str, limit: int = 10, context: int = 100) -> dict[str, Any]:
+    def search_tab(self, tab_id: str, query: str, limit: int = 10, context: int = 100,
+                   offset: int = 0, case_sensitive: bool = False, whole_word: bool = False,
+                   regex: bool = False, exclude_diagrams: bool = False) -> dict[str, Any]:
         client, local_id, window_id = self._route(tab_id)
-        return client.search_tab(local_id, query=query, limit=limit, context=context, window_id=window_id)
+        return client.search_tab(local_id, query=query, limit=limit, context=context, offset=offset,
+                                 case_sensitive=case_sensitive, whole_word=whole_word, regex=regex,
+                                 exclude_diagrams=exclude_diagrams, window_id=window_id)
 
-    def outline_tab(self, tab_id: str) -> dict[str, Any]:
+    def outline_tab(self, tab_id: str, offset: int = 0, limit: int = 80) -> dict[str, Any]:
         client, local_id, window_id = self._route(tab_id)
         method = getattr(client, "outline_tab", None)
         if not callable(method):
             raise ValueError("Live heading outlines are not available from this desktop bridge")
-        return method(local_id, window_id=window_id)
+        return method(local_id, window_id=window_id, offset=offset, limit=limit)
 
     def patch_tab(self, tab_id: str, expected_revision: str, operations: list[dict[str, Any]]) -> dict[str, Any]:
         client, local_id, window_id = self._route(tab_id)
@@ -121,8 +130,8 @@ class MultiSessionLiveClient:
 
     def document_action(self, tab_id: str | None, action: str, **params):
         """Dispatch one documented live-document action to its owning window."""
-        allowed = {"create_document", "save_document", "open_document", "export_document",
-                   "job_status", "get_context", "latex_review", "latex_apply",
+        allowed = {"create_document", "save_document", "open_document", "activate_document", "close_document", "export_document",
+                   "job_status", "export_chunk", "get_context", "latex_review", "latex_apply",
                    "list_diagrams", "get_diagram", "get_diagram_image", "replace_tab_asset"}
         if action not in allowed:
             raise ValueError("Unsupported live document action")
@@ -137,10 +146,22 @@ class MultiSessionLiveClient:
             if isinstance(result, dict):
                 result = dict(result)
                 result["jobId"] = external_id
+                result_tab_id = result.get("tabId") or result.get("id")
+                if isinstance(result_tab_id, str) and result_tab_id and window_id:
+                    result["target"] = f"tab:{session_id}:{window_id}:{result_tab_id}"
                 if result.get("status") in ("completed", "failed", "cancelled"):
                     with self._lock:
                         self._jobs.pop(external_id, None)
             return result
+        if action == "export_chunk":
+            external_id = params.get("job_id")
+            with self._lock:
+                saved = self._export_jobs.get(external_id) if isinstance(external_id, str) else None
+            if saved is None:
+                raise ValueError("Export artifact job is unknown or expired")
+            _session_id, client, raw_id, _local_id, window_id = saved
+            return client.document_action("", action, window_id=window_id, job_id=raw_id,
+                                          offset=params.get("offset", 0), limit=params.get("limit", 262_144))
         if action == "create_document" or (action == "open_document" and not tab_id):
             self._refresh()
             requested_device = params.pop("device_id", None)
@@ -158,8 +179,8 @@ class MultiSessionLiveClient:
             client, local_id, window_id = self._route(tab_id)
             if action == "open_document" and params.get("filename") is not None:
                 filename = params["filename"]
-                if filename != "" and (not isinstance(filename, str) or len(filename) > 300 or Path(filename).name != filename or filename in (".", "..")):
-                    raise ValueError("open_document accepts only a bridge-owned filename or a current tab target")
+                if filename != "" and (not isinstance(filename, str) or len(filename) > 4096 or "\0" in filename):
+                    raise ValueError("open_document filename must be a bounded path or basename")
             result = client.document_action(local_id, action, window_id=window_id, **params)
             session_id = tab_id.split(":", 1)[0]
         if action == "export_document" and isinstance(result, dict):
@@ -168,7 +189,23 @@ class MultiSessionLiveClient:
                 raise ValueError("Desktop returned an invalid export job ID")
             external_id = f"{session_id}:{raw_id}"
             with self._lock:
-                self._jobs[external_id] = (session_id, client, raw_id, local_id, window_id)
+                saved = (session_id, client, raw_id, local_id, window_id)
+                self._jobs[external_id] = saved
+                self._export_jobs[external_id] = saved
+                while len(self._export_jobs) > 100:
+                    self._export_jobs.pop(next(iter(self._export_jobs)))
+            result = dict(result)
+            result["jobId"] = external_id
+        if action == "open_document" and isinstance(result, dict) and result.get("status") == "opening":
+            raw_id = result.get("jobId")
+            if not isinstance(raw_id, str) or not raw_id or len(raw_id) > 128:
+                raise ValueError("Desktop returned an invalid open job ID")
+            actual_window_id = result.get("windowId")
+            if not isinstance(actual_window_id, str) or not actual_window_id:
+                raise ValueError("Desktop returned an invalid open job window")
+            external_id = f"{session_id}:{raw_id}"
+            with self._lock:
+                self._jobs[external_id] = (session_id, client, raw_id, "", actual_window_id)
             result = dict(result)
             result["jobId"] = external_id
         if action in ("create_document", "save_document", "open_document") and isinstance(result, dict):

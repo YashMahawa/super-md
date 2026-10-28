@@ -14,6 +14,7 @@ import re
 import stat
 import tempfile
 import threading
+import unicodedata
 from contextlib import contextmanager
 from pathlib import Path
 from typing import Iterator
@@ -25,6 +26,7 @@ except ImportError:
 
 MAX_PAGE_CHARS = 12_000
 MAX_SEARCH_RESULTS = 25
+MAX_OUTLINE_PAGE = 80
 MAX_QUERY_CHARS = 500
 MAX_ASSET_BYTES = documents.MAX_IMAGE
 _HEADING = re.compile(r"^(#{1,6})[ \t]+(.+?)[ \t]*#*[ \t]*$")
@@ -53,28 +55,100 @@ def validate_patch_operations(operations: list[dict]) -> None:
             raise AgentDocumentError("Patch operations exceed 64 KB")
     except (TypeError, UnicodeError) as exc:
         raise AgentDocumentError("Patch operations must contain valid JSON text") from exc
-    for operation in operations:
+    for index, operation in enumerate(operations):
+        fail = lambda message: AgentDocumentError(f"operations[{index}]: {message}")
         if not isinstance(operation, dict):
-            raise AgentDocumentError("Each patch operation must be an object")
+            raise fail("Each patch operation must be an object")
         kind = operation.get("type")
+        allowed = ({"type", "old", "new", "count", "expectedCount"} if kind == "replace" else
+                   {"type", "start_line", "end_line", "text"} if kind == "lines" else
+                   {"type", "line", "text"} if kind == "insert" else {"type"})
+        unknown = next((key for key in operation if key not in allowed), None)
+        if unknown is not None:
+            expected = ", ".join(sorted(allowed))
+            raise fail(f"Unknown field '{unknown}'; expected {expected}")
         if kind == "replace":
             old, new = operation.get("old"), operation.get("new")
             if not isinstance(old, str) or not old:
-                raise AgentDocumentError("replace.old must be non-empty text")
+                raise fail("replace.old must be non-empty text")
             if not isinstance(new, str):
-                raise AgentDocumentError("replace.new must be text")
-            count = operation.get("count", 1)
+                raise fail("replace.new must be text")
+            expected_count = operation.get("expectedCount")
+            if "expectedCount" in operation and (not isinstance(expected_count, int) or isinstance(expected_count, bool) or expected_count < 1):
+                raise fail("replace.expectedCount must be a positive integer")
+            count = operation.get("count", "all" if isinstance(expected_count, int) and not isinstance(expected_count, bool) and expected_count > 1 else 1)
             if not ((isinstance(count, int) and not isinstance(count, bool) and count == 1) or count == "all"):
-                raise AgentDocumentError("replace.count must be 1 or 'all'")
+                raise fail("replace.count must be 1 or 'all'")
         elif kind == "lines":
             start, end, replacement = operation.get("start_line"), operation.get("end_line"), operation.get("text")
             if (not isinstance(start, int) or isinstance(start, bool) or
                     not isinstance(end, int) or isinstance(end, bool) or start < 1 or end < start):
-                raise AgentDocumentError("Line range must be 1-based, inclusive, with end_line >= start_line")
+                raise fail("Line range must be 1-based, inclusive, with end_line >= start_line")
             if not isinstance(replacement, str):
-                raise AgentDocumentError("lines.text must be text")
+                raise fail("lines.text must be text")
+        elif kind == "insert":
+            line, replacement = operation.get("line"), operation.get("text")
+            if not isinstance(line, int) or isinstance(line, bool) or line < 1:
+                raise fail("insert.line must be a positive 1-based line number")
+            if not isinstance(replacement, str):
+                raise fail("insert.text must be text")
         else:
-            raise AgentDocumentError("Patch type must be 'replace' or 'lines'")
+            raise fail("Patch type must be 'replace', 'lines' or 'insert'")
+
+
+def apply_patch_operations_detailed(source: str, operations: list[dict]) -> tuple[str, list[dict]]:
+    """Apply a validated batch sequentially and report Unicode code-point ranges."""
+    validate_patch_operations(operations)
+    edited = source
+    summaries = []
+    for index, operation in enumerate(operations):
+        previous = edited
+        kind = operation["type"]
+        if kind == "replace":
+            old, replacement = operation["old"], operation["new"]
+            expected_count = operation.get("expectedCount")
+            count = operation.get("count", "all" if isinstance(expected_count, int) and expected_count > 1 else 1)
+            occurrences = edited.count(old)
+            if occurrences < 1 or (count == 1 and occurrences != 1) or (expected_count is not None and occurrences != expected_count):
+                expected = expected_count if expected_count is not None else ("one" if count == 1 else "at least one")
+                raise AgentDocumentError(f"operations[{index}]: Exact replacement expected {expected} match; found {occurrences}")
+            start_index = edited.index(old)
+            last_index = edited.rfind(old) if count == "all" else start_index
+            start_offset, end_offset = start_index, last_index + len(old)
+            edited = edited.replace(old, replacement, 1 if count == 1 else -1)
+        else:
+            parts = edited.splitlines(keepends=True)
+            if not parts and edited == "":
+                parts = []
+            if kind == "insert":
+                start = operation["line"]
+                if start > len(parts) + 1:
+                    raise AgentDocumentError(f"operations[{index}]: insert.line must be between 1 and {len(parts) + 1}")
+                end = start
+                replacement = operation["text"]
+                if start == len(parts) + 1 and parts and not re.search(r"[\r\n\v\f\x85\u2028\u2029]$", parts[-1]):
+                    delimiter = re.search(r"\r\n|[\r\n\v\f\x85\u2028\u2029]", edited)
+                    replacement = (delimiter.group(0) if delimiter else "\n") + replacement
+                start_offset = sum(map(len, parts[:start - 1]))
+                end_offset = start_offset
+                edited = "".join(parts[:start - 1]) + replacement + "".join(parts[start - 1:])
+            else:
+                start, end, replacement = operation["start_line"], operation["end_line"], operation["text"]
+                if start > len(parts) + 1 or end > len(parts) + 1:
+                    raise AgentDocumentError(f"operations[{index}]: Line range must be 1-based, inclusive, with end_line <= line_count + 1")
+                start_offset = sum(map(len, parts[:start - 1]))
+                end_offset = sum(map(len, parts[:min(end, len(parts))]))
+                replacement_parts = replacement.splitlines(keepends=True)
+                if replacement and not replacement.endswith(("\n", "\r")) and end <= len(parts):
+                    target = parts[start - 1:min(end, len(parts))]
+                    if target and target[-1].endswith("\n"):
+                        replacement_parts[-1] += "\n"
+                edited = "".join(parts[:start - 1] + replacement_parts + parts[min(end, len(parts)):])
+        if len(edited.encode("utf-8")) > 20_000_000:
+            raise AgentDocumentError(f"operations[{index}]: Edited Markdown exceeds the 20 MB limit")
+        summaries.append({"operationIndex": index, "type": kind, "startOffset": start_offset,
+                          "endOffset": end_offset, "deltaChars": len(edited) - len(previous)})
+    return edited, summaries
 
 
 def _symlink_component(path: Path) -> Path | None:
@@ -167,17 +241,25 @@ class DocumentStore:
         path = self.resolve(path_value)
         with _path_lock(path):
             text, assets, portable, raw = self._load(path)
-        headings = _headings(text)
+        outline = outline_source(text)
+        headings = outline["headings"]
         return {
             "path": self.display_path(path), "format": "smd" if portable or path.suffix.lower() == ".smd" else "markdown",
             "portable": portable, "revision": digest_bytes(raw), "sha256": digest_bytes(raw),
             "bytes": len(raw), "characters": len(text), "lines": len(text.splitlines()),
-            "heading_count": len(headings), "headings": headings[:80], "headings_truncated": len(headings) > 80,
+            "heading_count": outline["total"], "headings": headings,
+            "headings_truncated": outline["truncated"], "next_heading_offset": outline["nextOffset"],
             "assets": _asset_metadata(assets, limit=40), "asset_count": len(assets),
         }
 
+    def outline(self, path_value: str, *, offset: int = 0, limit: int = MAX_OUTLINE_PAGE) -> dict:
+        path = self.resolve(path_value)
+        with _path_lock(path):
+            text, _, _, raw = self._load(path)
+        return {"path": self.display_path(path), "revision": digest_bytes(raw), **outline_source(text, offset, limit)}
+
     def read(self, path_value: str, *, offset: int = 0, limit: int = MAX_PAGE_CHARS,
-             heading: int | None = None, view: str = "prose") -> dict:
+             heading: int | str | None = None, view: str = "prose") -> dict:
         path = self.resolve(path_value)
         with _path_lock(path):
             text, _, _, raw = self._load(path)
@@ -187,15 +269,17 @@ class DocumentStore:
             raise AgentDocumentError(f"limit must be between 1 and {MAX_PAGE_CHARS}")
         if view not in ("prose", "source"):
             raise AgentDocumentError("view must be 'prose' or 'source'")
-        start, end = 0, len(text)
+        document_length = len(text)
+        section_start, section_end = 0, document_length
         if heading is not None:
             headings = _headings(text, include_internal=True)
-            if not isinstance(heading, int) or heading < 0 or heading >= len(headings):
-                raise AgentDocumentError("heading index is not present in this document")
-            item = headings[heading]
-            start = item["start"]
-            end = next((other["start"] for other in headings[heading + 1:] if other["level"] <= item["level"]), len(text))
-            offset = start
+            item = resolve_heading(headings, heading)
+            section_start, section_end = item["sectionStart"], item["sectionEnd"]
+        if offset > section_end:
+            raise AgentDocumentError(f"offset must be within the selected section (sectionEnd {section_end})")
+        start = offset if heading is None else max(section_start, offset)
+        end = section_end
+        offset = start
         spans = _svg_spans(text) if view == "prose" else []
         page_end = (_prose_page_end(offset, limit, end, spans) if view == "prose"
                     else min(end, offset + limit))
@@ -204,33 +288,19 @@ class DocumentStore:
         if view == "prose":
             page_text, omitted = _elide_svg_page(text, offset, page_end, spans)
         return {"path": self.display_path(path), "revision": digest_bytes(raw), "start": offset,
-                "end": page_end, "total_chars": end - start, "next_offset": page_end if page_end < end else None,
+                "end": page_end, "total_chars": section_end - section_start, "next_offset": page_end if page_end < end else None,
                 "truncated": page_end < end, "view": view, "text": page_text,
-                "returned_chars": len(page_text), "svg_omissions": omitted}
+                "returned_chars": len(page_text), "svg_omissions": omitted,
+                "sectionStart": section_start, "sectionEnd": section_end, "documentLength": document_length}
 
-    def search(self, path_value: str, query: str, *, limit: int = 10, context: int = 100) -> dict:
-        if not query or len(query) > MAX_QUERY_CHARS:
-            raise AgentDocumentError(f"query must contain 1–{MAX_QUERY_CHARS} characters")
-        if not 1 <= limit <= MAX_SEARCH_RESULTS or not 0 <= context <= 500:
-            raise AgentDocumentError("limit must be 1–25 and context 0–500")
+    def search(self, path_value: str, query: str, *, limit: int = 10, context: int = 100,
+               offset: int = 0, case_sensitive: bool = False, whole_word: bool = False,
+               regex: bool = False, exclude_diagrams: bool = False) -> dict:
         path = self.resolve(path_value)
         with _path_lock(path):
             text, _, _, raw = self._load(path)
-        matches = []
-        pattern = re.compile(re.escape(query), re.IGNORECASE)
-        cursor = 0
-        while len(matches) < limit:
-            match = pattern.search(text, cursor)
-            if match is None:
-                break
-            index = match.start()
-            line = text.count("\n", 0, index) + 1
-            left, right = max(0, index - context), min(len(text), match.end() + context)
-            matches.append({"offset": index, "line": line, "start": left, "end": right,
-                            "snippet": text[left:right]})
-            cursor = max(index + 1, match.end())
-        return {"path": self.display_path(path), "revision": digest_bytes(raw), "query": query,
-                "matches": matches, "truncated": len(matches) == limit and pattern.search(text, cursor) is not None}
+        result = search_source(text, query, limit, context, offset, case_sensitive, whole_word, regex, exclude_diagrams)
+        return {"path": self.display_path(path), "revision": digest_bytes(raw), "query": query, **result}
 
     def create(self, path_value: str, content: str, *, expected_absent: bool = True) -> dict:
         path = self.resolve(path_value, must_exist=False)
@@ -256,38 +326,7 @@ class DocumentStore:
             actual = digest_bytes(raw)
             if actual != expected_revision:
                 raise RevisionConflict("Document changed since it was read; inspect it again before editing")
-            edited = text
-            for operation in operations:
-                if not isinstance(operation, dict):
-                    raise AgentDocumentError("Each patch operation must be an object")
-                kind = operation.get("type")
-                if kind == "replace":
-                    old, new = operation.get("old"), operation.get("new")
-                    if not isinstance(old, str) or not old:
-                        raise AgentDocumentError("replace.old must be non-empty text")
-                    if not isinstance(new, str):
-                        raise AgentDocumentError("replace.new must be text")
-                    count = operation.get("count", 1)
-                    if count not in (1, "all"):
-                        raise AgentDocumentError("replace.count must be 1 or 'all'")
-                    occurrences = edited.count(old)
-                    if occurrences < 1 or (count == 1 and occurrences != 1):
-                        raise AgentDocumentError(f"Exact replacement expected {'one' if count == 1 else 'at least one'} match; found {occurrences}")
-                    edited = edited.replace(old, new, 1 if count == 1 else -1)
-                elif kind == "lines":
-                    start, end, replacement = operation.get("start_line"), operation.get("end_line"), operation.get("text")
-                    lines = edited.splitlines(keepends=True)
-                    if not isinstance(start, int) or not isinstance(end, int) or start < 1 or end < start or end > len(lines) + 1:
-                        raise AgentDocumentError("Line range must be 1-based, inclusive, with end_line <= line_count + 1")
-                    if not isinstance(replacement, str):
-                        raise AgentDocumentError("lines.text must be text")
-                    # end_line is inclusive; line_count + 1 permits insertion at EOF.
-                    replacement_lines = replacement.splitlines(keepends=True)
-                    if replacement and not replacement.endswith(("\n", "\r")) and end <= len(lines):
-                        replacement_lines[-1] += "\n" if lines[start - 1:end][-1].endswith("\n") else ""
-                    edited = "".join(lines[:start - 1] + replacement_lines + lines[min(end, len(lines)):])
-                else:
-                    raise AgentDocumentError("Patch type must be 'replace' or 'lines'")
+            edited, operation_results = apply_patch_operations_detailed(text, operations)
             if len(edited.encode("utf-8")) > 20_000_000:
                 raise AgentDocumentError("Edited Markdown exceeds the 20 MB limit")
             data = _serialize(path, edited, assets, portable=portable)
@@ -298,7 +337,8 @@ class DocumentStore:
             _atomic_replace(path, data)
         return {"path": self.display_path(path), "previous_revision": actual,
                 "revision": digest_bytes(data), "sha256": digest_bytes(data), "bytes": len(data),
-                "characters": len(edited), "operations": len(operations), "saved": True}
+                "characters": len(edited), "operations": len(operations), "applied": len(operation_results),
+                "operation_results": operation_results, "saved": True}
 
     def assets(self, path_value: str, *, offset: int = 0, limit: int = 50) -> dict:
         path = self.resolve(path_value)
@@ -498,8 +538,205 @@ def _headings(text: str, *, include_internal: bool = False) -> list[dict]:
                               "line": line_number, "start": offset})
         offset += len(line); line_number += 1
     if include_internal:
-        return found
+        return _heading_sections(text, found)
     return [{k: v for k, v in item.items() if k != "start"} for item in found]
+
+
+def _heading_sections(text: str, headings: list[dict]) -> list[dict]:
+    """Add code-point section bounds using the next same-or-higher-level heading."""
+    section_ends = [len(text)] * len(headings)
+    stack: list[int] = []
+    for heading in headings:
+        while stack and headings[stack[-1]]["level"] >= heading["level"]:
+            section_ends[stack.pop()] = heading["start"]
+        stack.append(heading["index"])
+    return [{**heading, "sectionStart": heading["start"], "sectionEnd": section_ends[index]}
+            for index, heading in enumerate(headings)]
+
+
+def outline_source(source: str, offset: int = 0, limit: int = MAX_OUTLINE_PAGE) -> dict:
+    """Pure bounded outline page with code-point positions and section ranges."""
+    if not isinstance(source, str):
+        raise AgentDocumentError("source must be text")
+    headings = _headings(source, include_internal=True)
+    if not isinstance(offset, int) or isinstance(offset, bool) or not 0 <= offset <= len(headings):
+        raise AgentDocumentError("outline offset must be between 0 and the heading count")
+    if not isinstance(limit, int) or isinstance(limit, bool) or not 1 <= limit <= MAX_OUTLINE_PAGE:
+        raise AgentDocumentError(f"outline limit must be between 1 and {MAX_OUTLINE_PAGE}")
+    end = min(len(headings), offset + limit)
+    return {"headings": headings[offset:end], "offset": offset, "total": len(headings),
+            "nextOffset": end if end < len(headings) else None, "truncated": end < len(headings),
+            "documentLength": len(source)}
+
+
+def _heading_slug(title: str) -> str:
+    decomposed = unicodedata.normalize("NFKD", title.lower())
+    parts: list[str] = []
+    current: list[str] = []
+    for char in decomposed:
+        if unicodedata.category(char)[0] in ("L", "N"):
+            current.append(char)
+        elif current:
+            parts.append("".join(current))
+            current.clear()
+    if current:
+        parts.append("".join(current))
+    return "-".join(parts)
+
+
+def _ambiguous_heading(selector: str, matches: list[dict]) -> AgentDocumentError:
+    candidates = "; ".join(f"{item['index']}: {item['title'][:80]} (line {item['line']})"
+                            for item in matches[:5])
+    if len(matches) > 5:
+        candidates += "; …"
+    return AgentDocumentError(f"Heading selector '{selector[:80]}' is ambiguous ({len(matches)} matches); "
+                              f"candidates: {candidates}. Use an outline index or a more specific exact title/slug.")
+
+
+def resolve_heading(headings: list[dict], selector: int | str) -> dict:
+    """Resolve a zero-based outline index or an exact title, slug, or section number."""
+    if isinstance(selector, int) and not isinstance(selector, bool):
+        if 0 <= selector < len(headings):
+            return headings[selector]
+        raise AgentDocumentError(f"Heading index {selector} is not present in this document")
+    if not isinstance(selector, str) or not selector.strip() or len(selector) > 300:
+        raise AgentDocumentError("heading must be an outline index or exact title, slug, or numbered heading prefix")
+    query = selector.strip()
+    exact = [item for item in headings if item["title"] == query]
+    if len(exact) == 1:
+        return exact[0]
+    if len(exact) > 1:
+        raise _ambiguous_heading(query, exact)
+    slug = _heading_slug(query)
+    slug_matches = [item for item in headings if _heading_slug(item["title"]) == slug]
+    if len(slug_matches) == 1:
+        return slug_matches[0]
+    if len(slug_matches) > 1:
+        raise _ambiguous_heading(query, slug_matches)
+    if re.fullmatch(r"\d+(?:\.\d+)*", query):
+        numbered = [item for item in headings
+                    if re.match(r"^" + re.escape(query) + r"(?:$|[\s:)\-—]|\.(?=\s))", item["title"])]
+        if len(numbered) == 1:
+            return numbered[0]
+        if len(numbered) > 1:
+            raise _ambiguous_heading(query, numbered)
+    raise AgentDocumentError(f"No heading matches '{query[:80]}'; use an exact title, slug, or outline index")
+
+
+def section_source(source: str, selector: int | str) -> dict:
+    """Return the exact source range for one heading and its nested subsections."""
+    if not isinstance(source, str):
+        raise AgentDocumentError("source must be text")
+    heading = resolve_heading(_headings(source, include_internal=True), selector)
+    start, end = heading["sectionStart"], heading["sectionEnd"]
+    return {"text": source[start:end], "sectionStart": start, "sectionEnd": end,
+            "documentLength": len(source)}
+
+
+def _word_character(value: str) -> bool:
+    return value == "_" or (bool(value) and unicodedata.category(value)[0] in ("L", "N"))
+
+
+def diagram_spans(text: str) -> list[dict]:
+    """Return diagram body ranges as code-point `{start, end}` offsets; end is exclusive."""
+    spans = list(_svg_spans(text))
+    offset = 0
+    opened = None
+    for line in text.splitlines(keepends=True):
+        body = line.rstrip("\r\n")
+        match = _FENCE.match(body)
+        if match:
+            marker = match.group(1)
+            if opened is None:
+                info = body[match.end():].strip().split(None, 1)
+                language = info[0].casefold() if info else ""
+                if language in ("svg", "svg+xml", "image/svg+xml", "mermaid", "smd-chart"):
+                    opened = {"char": marker[0], "size": len(marker), "start": offset + len(line)}
+            elif marker[0] == opened["char"] and len(marker) >= opened["size"]:
+                spans.append({"start": opened["start"], "end": offset})
+                opened = None
+        offset += len(line)
+    if opened is not None:
+        spans.append({"start": opened["start"], "end": len(text)})
+    unique = {(item["start"], item["end"]) for item in spans}
+    return [{"start": start, "end": end} for start, end in sorted(unique)]
+
+
+def search_source(source: str, query: str, limit: int = 10, context: int = 100, offset: int = 0,
+                  case_sensitive: bool = False, whole_word: bool = False, regex: bool = False,
+                  exclude_diagrams: bool = False) -> dict:
+    """Search a Markdown snapshot without file or UI access; offsets are code points."""
+    if not isinstance(source, str):
+        raise AgentDocumentError("source must be text")
+    if not isinstance(query, str) or not query or len(query) > MAX_QUERY_CHARS:
+        raise AgentDocumentError(f"query must contain 1–{MAX_QUERY_CHARS} characters")
+    if not isinstance(offset, int) or isinstance(offset, bool) or offset < 0 or offset > len(source):
+        raise AgentDocumentError("offset must be between 0 and the document character count")
+    if (not isinstance(limit, int) or isinstance(limit, bool) or not 1 <= limit <= MAX_SEARCH_RESULTS or
+            not isinstance(context, int) or isinstance(context, bool) or not 0 <= context <= 500):
+        raise AgentDocumentError("limit must be 1–25 and context 0–500")
+    if any(not isinstance(value, bool) for value in (case_sensitive, whole_word, regex, exclude_diagrams)):
+        raise AgentDocumentError("case_sensitive, whole_word, regex and exclude_diagrams must be booleans")
+    if regex:
+        escaped = False
+        in_class = False
+        for char in query:
+            if escaped:
+                if char.isdigit() or char == "k":
+                    raise AgentDocumentError("regex supports no backreferences")
+                if not in_class and char in ("b", "B"):
+                    raise AgentDocumentError("regex supports no zero-width word-boundary assertions")
+                escaped = False
+            elif char == "\\":
+                escaped = True
+            elif char == "[":
+                in_class = True
+            elif char == "]":
+                in_class = False
+            elif not in_class and char in "*+?{}()|":
+                raise AgentDocumentError("regex supports literals, dot, character classes and anchors only; quantifiers, groups and alternation are not supported")
+        if escaped:
+            raise AgentDocumentError("regex ends with an incomplete escape")
+        try:
+            pattern = re.compile(query, re.MULTILINE | (0 if case_sensitive else re.IGNORECASE))
+        except re.error as exc:
+            raise AgentDocumentError("regex is not valid in the supported safe subset") from exc
+        if pattern.search("") is not None:
+            raise AgentDocumentError("regex must match at least one character")
+    else:
+        pattern = re.compile(re.escape(query), re.MULTILINE | (0 if case_sensitive else re.IGNORECASE))
+    spans = diagram_spans(source) if exclude_diagrams else []
+    matches = []
+    total = 0
+    remaining = 0
+    cursor = 0
+    while True:
+        match = pattern.search(source, cursor)
+        if match is None:
+            break
+        start, end = match.span()
+        if end <= start:
+            cursor = start + 1
+            continue
+        cursor = end
+        if whole_word and ((start > 0 and _word_character(source[start - 1])) or
+                           (end < len(source) and _word_character(source[end]))):
+            continue
+        if exclude_diagrams and any(start < span["end"] and end > span["start"] for span in spans):
+            continue
+        total += 1
+        if start < offset:
+            continue
+        remaining += 1
+        if len(matches) < limit:
+            left, right = max(0, start - context), min(len(source), end + context)
+            matches.append({"offset": start, "line": source.count("\n", 0, start) + 1,
+                            "start": left, "end": right, "snippet": source[left:right],
+                            "matchOffset": start, "matchLength": end - start, "snippetOffset": left})
+    next_offset = (matches[-1]["matchOffset"] + matches[-1]["matchLength"]
+                   if remaining > len(matches) and matches else None)
+    return {"matches": matches, "totalMatches": total, "remainingMatches": remaining,
+            "nextOffset": next_offset, "truncated": remaining > len(matches)}
 
 
 def _svg_spans(text: str) -> list[dict]:

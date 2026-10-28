@@ -5,7 +5,9 @@ test('typing in a huge note stores tiny edits and preserves grouped undo/redo',(
   for(let i=0;i<100;i++){const next=content+'x';recordHistory(h,content,next,1000+i*10);content=next;}
   expect(historySize(h)).toBeLessThan(4000);expect(h.undo).toHaveLength(1);expect(validHistory(h)).toBe(true);
   expect(replayHistory(h,content,'undo')).toBe(original);expect(replayHistory(h,original,'redo')).toBe(content);
-});
+// Keep the full 4 MB / 100-keystroke correctness workload on slower CI hosts.
+// This is not a latency benchmark: concurrent renderer tests can delay it.
+},30_000);
 test('replacement/deletion and legacy transferred snapshots remain reversible',()=>{
   const h:NoteHistory={undo:[],redo:[],last:0};const original='😀 A note with $x^2$';const changed='😀 A note with $y^3$';
   recordHistory(h,original,changed,1000);recordHistory(h,changed,'😀 A note',2000);

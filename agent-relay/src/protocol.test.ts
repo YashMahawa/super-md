@@ -31,3 +31,16 @@ test("device RPC schema rejects unknown fields, oversized ranges and stale-write
   assert.throws(() => validateRpcRequest({ ...base, imageFormat: "jpeg" }), /only valid.*captures/);
   assert.throws(() => validateRpcRequest({ requestId: "bad_format", action: "render_tab", tabId: "tab:1", imageFormat: "webp" }), /only valid.*captures/);
 });
+
+
+test("audit lifecycle and paged read options preserve write guards", () => {
+  const base={requestId:"audit",action:"document_action",tabId:"window:tab"};
+  for(const documentAction of ["save","close","export","latex_apply"]){
+    assert.throws(()=>validateRpcRequest({...base,documentAction}),/expectedRevision/);
+    assert.equal(validateRpcRequest({...base,documentAction,expectedRevision:"a".repeat(64)}).documentAction,documentAction);
+  }
+  assert.equal(validateRpcRequest({...base,documentAction:"latex_review"}).documentAction,"latex_review");
+  assert.equal(validateRpcRequest({requestId:"list",action:"list_diagrams",tabId:"window:tab",offset:10,limit:5}).limit,5);
+  assert.throws(()=>validateRpcRequest({requestId:"injected",action:"read_tab",tabId:"window:tab",content:"replacement"}),/only accepted for create/);
+  assert.throws(()=>validateRpcRequest({requestId:"flags",action:"search_tab",tabId:"window:tab",query:"x",wholeWord:"yes"}),/Invalid wholeWord/);
+});

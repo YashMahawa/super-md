@@ -24,9 +24,14 @@ def _probe(directory: str) -> int:
     temp=Path(directory); temp.mkdir(parents=True,exist_ok=True)
     session=Session(True); session.settings["newNoteLocation"]=str(temp)
     studio=Studio(True,session); session.agent_bridge=create_qt_bridge(session,session.data); bridge=session.agent_bridge
-    tab=studio._current(); tab["name"]="Live capture proof.md"; tab["content"]="# Live capture proof\n\nBefore patch: visible native pixels.\n\n- Reader viewport\n"; tab["saved"]=tab["content"]
+    svg_body="<svg xmlns=\"http://www.w3.org/2000/svg\">\n"+"\n".join(f"<path id=\"svg-{index}\" d=\"M0 {index}L10 {index}\"/>" for index in range(2200))+"\n</svg>"
+    mermaid='graph TD; A["Σ 😀"]-->B'
+    prose_after="After the drawing, ordinary prose remains readable.\n"*900
+    first_content=("# Live capture proof 🧭\n\nBefore patch: visible native pixels.\n\n- Reader viewport\n\n"+
+                   "```mermaid\n"+mermaid+"\n```\n\n```svg\n"+svg_body+"\n```\n\n"+prose_after)
+    tab=studio._current(); tab["name"]="Live capture proof.md"; tab["content"]=first_content; tab["saved"]=first_content
     first_native_id=tab["id"]
-    second=studio._note("Second.md", "# Second tab\n\nSecond original text.\n", saved="# Second tab\n\nSecond original text.\n")
+    second=studio._note("Second.md", "# Second tab\n\nSecond untouched text.\n", saved="# Second tab\n\nSecond untouched text.\n")
     studio.tabs.append(second)
     studio.mode="live"; studio.settings["readingMode"]="live"; studio.settings["welcomed"]=True
     channel=QFile(":/qtwebchannel/qwebchannel.js")
@@ -45,13 +50,15 @@ def _probe(directory: str) -> int:
     studio._emit()
     bridge.start()
     cli=ROOT/"agent_cli.py"; sessions=str(bridge.discovery_dir); state={"proc":None,"results":{},"failure":"",
-        "first_native_id":first_native_id,"second_native_id":second["id"]}
+        "first_native_id":first_native_id,"second_native_id":second["id"],"first_content":first_content,
+        "save_path":str(temp/"existing-note.md"),"save_as_path":str(temp/"existing-note-copy.md")}
+    Path(state["save_path"]).write_text("# Saved note\n\nOriginal persisted text.\n",encoding="utf-8")
     sequence=[]
-    def start_call(key,*arguments):
+    def start_call(key,*arguments,expect_error=False):
         command=[sys.executable,str(cli),"live","--sessions-dir",sessions,*map(str,arguments)]
         process=subprocess.Popen(command,cwd=ROOT,stdout=subprocess.PIPE,stderr=subprocess.PIPE,text=True,
                                  env=dict(os.environ,QT_QPA_PLATFORM="invalid"))
-        state["proc"]=process; state["key"]=key; state["stage"]=key
+        state["proc"]=process; state["key"]=key; state["stage"]=key; state["expect_error"]=expect_error
         QTimer.singleShot(5,poll)
     def begin_cli_after_pending_typing():
         state["stage"]="open textarea and type pending draft"
@@ -105,14 +112,22 @@ def _probe(directory: str) -> int:
     def parse_output(process,key):
         stdout,stderr=process.communicate()
         if process.returncode!=0:
-            raise RuntimeError(f"CLI {key} failed: {stdout.strip()} {stderr.strip()}")
+            if state.get("expect_error"):
+                try:
+                    report=json.loads(stdout)
+                    if report.get("ok") is False and isinstance(report.get("error"),dict):
+                        return {"expectedError":report["error"].get("message","")}
+                except Exception: pass
+            context=(f" target={state.get('saved_target')!r} openJob={state.get('results',{}).get('open_job')!r} "
+                     f"tabs={[(tab['id'],tab.get('path')) for tab in studio.tabs]!r}" if key=="patch_saved_note" else "")
+            raise RuntimeError(f"CLI {key} failed:{context} {stdout.strip()} {stderr.strip()}")
         try: return json.loads(stdout)["result"]
         except Exception as error: raise RuntimeError(f"CLI {key} returned invalid JSON: {stdout!r}") from error
     def start_next():
         if not sequence:
             raise RuntimeError("Real CLI integration sequence ended before completion")
-        key,builder=sequence.pop(0)
-        start_call(key,*builder(state.get("row",{})))
+        item=sequence.pop(0);key,builder=item[:2];expect_error=bool(item[2]) if len(item)>2 else False
+        start_call(key,*builder(state.get("row",{})),expect_error=expect_error)
     def start_jpeg_capture():
         from agent_live import LiveTabClient
         state["jpeg_done"]=False
@@ -156,14 +171,37 @@ def _probe(directory: str) -> int:
             state["first_id"]=next(row["id"] for row in rows if row["id"].endswith(":"+state["first_native_id"]))
             state["second_id"]=next(row["id"] for row in rows if row["id"].endswith(":"+state["second_native_id"]))
             state["row"]=next(row for row in rows if row["id"]==state["first_id"]); state["tab_id"]=state["first_id"]
+            second_row=next(row for row in rows if row["id"]==state["second_id"])
+            state["second_revision_before_inactive_patch"]=second_row["revision"]
             sequence.extend([
                 ("read",lambda _row:("read",state["tab_id"],"--view","source")),
                 ("context",lambda _row:("context",state["tab_id"])),
-                ("activate_second",lambda _row:("activate",state["second_id"])),
+                ("prose_read",lambda _row:("read",state["first_id"],"--view","prose")),
+                ("patch_second_inactive",lambda _row:("patch",state["second_id"],"--revision",state["second_revision_before_inactive_patch"],"--operations-json",
+                                    json.dumps([{"type":"replace","old":"Second untouched","new":"Second inactive"}]))),
             ])
             start_next()
         elif key=="read":
             if "Before patch" not in result.get("markdown",""): raise RuntimeError("Live read did not show current source")
+            start_next()
+        elif key=="prose_read":
+            text=result.get("markdown",""); omitted=result.get("svg_omissions",[])
+            svg_end=len(state["first_content"][:state["first_content"].index("\n```\n\n"+prose_after)])
+            if not omitted or "[SVG omitted:" not in text or "After the drawing" not in text:
+                raise RuntimeError("Production prose read did not elide the SVG and continue into following prose")
+            if result.get("end",0)<=svg_end or result.get("returned_chars")!=len(text):
+                raise RuntimeError(f"Prose pagination did not jump over the SVG with exact returned_chars: {result}")
+            state["results"]["prose_svg_jump"]={"end":result.get("end"),"omittedChars":omitted[0].get("omitted_chars"),"returnedChars":result.get("returned_chars")}
+            start_next()
+        elif key=="patch_second_inactive":
+            if not result.get("changed") or result.get("applied")!=1:
+                raise RuntimeError(f"Inactive patch did not apply once: {result}")
+            if studio.active!=state["first_native_id"]:
+                raise RuntimeError("Patching an inactive tab changed the focused tab")
+            state["second_revision_after_inactive_patch"]=result["revision"]
+            if result["revision"]==state["second_revision_before_inactive_patch"]:
+                raise RuntimeError("Inactive patch did not advance the target revision")
+            sequence.append(("activate_second",lambda _row:("activate",state["second_id"])))
             start_next()
         elif key=="context":
             viewport=result.get("viewport",{})
@@ -173,15 +211,44 @@ def _probe(directory: str) -> int:
         elif key=="activate_second":
             if result.get("tabId")!=state["second_native_id"]:
                 raise RuntimeError(f"CLI did not activate the requested second tab: {result}")
+            if result.get("revision")!=state["second_revision_after_inactive_patch"]:
+                raise RuntimeError("Activating the second tab did not retain the inactive patch revision")
             state["row"]=result
             sequence.extend([
-                ("patch",lambda row:("patch",state["second_id"],"--revision",row["revision"],"--operations-json",
-                                     json.dumps([{"type":"replace","old":"Second original","new":"Second patched"}]))),
+                ("diagrams_inactive",lambda _row:("diagrams",state["first_id"])),
+            ])
+            start_next()
+        elif key=="diagrams_inactive":
+            diagrams=result.get("diagrams",[])
+            if len(diagrams)!=2 or result.get("total")!=2:
+                raise RuntimeError(f"Inactive diagram inventory was incomplete: {result}")
+            current_first=next(tab for tab in studio.tabs if tab["id"]==state["first_native_id"])
+            mermaid_fence_start=current_first["content"].index("```mermaid")
+            expected_start=len(current_first["content"][:mermaid_fence_start])
+            first_diagram=diagrams[0]
+            if first_diagram.get("sourceStart")!=expected_start or first_diagram.get("id")!=f"diagram:{expected_start}":
+                raise RuntimeError(f"Diagram ID/sourceStart mismatch: expected Mermaid fence at code-point offset {expected_start}; got {first_diagram}")
+            if studio.active!=state["second_native_id"]:
+                raise RuntimeError("Inactive diagram inventory changed focus")
+            state["diagram_revision"]=result["revision"];state["diagram_id"]=first_diagram["id"]
+            sequence.append(("diagram_source_inactive",lambda _row:("diagram",state["first_id"],state["diagram_id"],"--revision",state["diagram_revision"])))
+            start_next()
+        elif key=="diagram_source_inactive":
+            if result.get("text")!=mermaid:
+                raise RuntimeError(f"Inactive source hook did not return the exact diagram text: {result}")
+            if studio.active!=state["second_native_id"]:
+                raise RuntimeError("Reading inactive diagram source changed focus")
+            state["results"]["inactive_diagram"]={"id":state["diagram_id"],"sourceStart":result.get("sourceStart"),"text":result.get("text")}
+            row=state["row"]
+            sequence.extend([
+                ("patch",lambda _row:("patch",state["second_id"],"--revision",state["second_revision_after_inactive_patch"],"--operations-json",
+                                     json.dumps([{"type":"replace","old":"Second inactive","new":"Second patched"}]))),
                 ("list_after_patch",lambda _row:("list",)),
             ])
             start_next()
         elif key=="patch":
             if not result.get("changed"): raise RuntimeError("Live patch did not change the note")
+            if studio.active!=state["second_native_id"]: raise RuntimeError("Patching second tab changed focus unexpectedly")
             start_next()
         elif key=="list_after_patch":
             row=next(row for row in result["tabs"] if row["id"]==state["second_id"]); state["row"]=row
@@ -209,8 +276,8 @@ def _probe(directory: str) -> int:
             ])
             start_next()
         elif key=="read_first_draft":
-            if "Pending human draft" not in result.get("markdown",""):
-                raise RuntimeError(f"Switching tabs lost the pending human draft: {result}")
+            if "Pending human draft" not in result.get("markdown","") or "Before patch" not in result.get("markdown",""):
+                raise RuntimeError(f"Switching tabs lost the pending human draft or altered the first tab: {result}")
             if not result.get("isDirty",True):
                 raise RuntimeError("The pending draft was unexpectedly marked clean after tab activation")
             undo_script="window.supermdHistory('undo')"
@@ -220,7 +287,118 @@ def _probe(directory: str) -> int:
         elif key=="read_after_undo":
             if "Pending human draft" in result.get("markdown","") or "Before patch" not in result.get("markdown",""):
                 raise RuntimeError("The first tab's undo history was not preserved across activation")
-            finish()
+            # Continue with the document lifecycle checks after the real editor
+            # has acknowledged its undo and the pending draft is gone.
+            sequence.append(("create_background",lambda _row:("create","--content-file",str(temp/"background.md"),"--filename","Background.md","--background")))
+            (temp/"background.md").write_text("# Background\n\nUnsaved background tab.\n",encoding="utf-8")
+            start_next()
+        elif key=="create_background":
+            if result.get("active") is not False or studio.active!=state["first_native_id"]:
+                raise RuntimeError(f"Background create stole focus: {result}")
+            state["created_target"]=result.get("target")
+            state["created_revision"]=result.get("revision")
+            sequence.extend([
+                ("activate_created",lambda _row:("activate",state["created_target"])),
+            ])
+            start_next()
+        elif key=="activate_created":
+            if result.get("active") is not True or studio.active!=result.get("tabId"):
+                raise RuntimeError(f"Explicit activation did not focus the created tab: {result}")
+            state["created_revision"]=result["revision"]
+            sequence.append(("close_dirty_created",lambda _row:("close",state["created_target"],"--revision",state["created_revision"]),True))
+            start_next()
+        elif key=="close_dirty_created":
+            if "unsaved changes" not in result.get("expectedError",""):
+                raise RuntimeError(f"Dirty close was not safely refused: {result}")
+            sequence.append(("close_created",lambda _row:("close",state["created_target"],"--revision",state["created_revision"],"--discard-changes")))
+            start_next()
+        elif key=="close_created":
+            if result.get("status") not in ("closed","closing"):
+                raise RuntimeError(f"Explicit discard did not close created tab: {result}")
+            state["focus_before_background_open"]=studio.active
+            sequence.append(("open_background",lambda _row:("open",state["save_path"],"--background")))
+            start_next()
+        elif key=="open_background":
+            if result.get("status")!="opening" or not result.get("jobId"):
+                raise RuntimeError(f"Background open did not return an async job: {result}")
+            if studio.active!=state["focus_before_background_open"]:
+                raise RuntimeError("Background open changed focus before completion")
+            state["open_job"]=result["jobId"]
+            sequence.insert(0,("open_job",lambda _row:("job",state["open_job"])))
+            QTimer.singleShot(100,start_next)
+        elif key=="open_job":
+            if result.get("status")=="completed":
+                if result.get("active") is not False or studio.active!=state["focus_before_background_open"]:
+                    raise RuntimeError(f"Background-opened note changed focus: {result}")
+                state["saved_native_id"]=result.get("tabId")
+                state["saved_revision"]=result.get("revision")
+                state["saved_path"]=result.get("path")
+                if Path(state["saved_path"]).resolve()!=Path(state["save_path"]).resolve():
+                    raise RuntimeError(f"Opening did not bind the requested path: {result}")
+                sequence.append(("list_opened",lambda _row:("list",)))
+                start_next()
+            elif result.get("status") in ("failed","cancelled"):
+                raise RuntimeError(f"Background open job failed: {result}")
+            else:
+                sequence.insert(0,("open_job",lambda _row:("job",state["open_job"])))
+                QTimer.singleShot(100,start_next)
+        elif key=="list_opened":
+            opened=next((row for row in result.get("tabs",[]) if row["id"].endswith(":"+state["saved_native_id"])),None)
+            if opened is None or Path(opened.get("path","")).resolve()!=Path(state["save_path"]).resolve():
+                raise RuntimeError(f"Completed open job was not visible in a fresh session listing: {result}")
+            state["saved_target"]=opened["id"]
+            if opened["revision"]!=state["saved_revision"]:
+                raise RuntimeError("Fresh session listing disagreed with the completed open job revision")
+            sequence.append(("patch_saved_note",lambda _row:("patch",state["saved_target"],"--revision",state["saved_revision"],"--operations-json",
+                                 json.dumps([{"type":"replace","old":"Original persisted text","new":"Updated persisted text"}]))))
+            start_next()
+        elif key=="patch_saved_note":
+            if not result.get("changed") or studio.active!=state["focus_before_background_open"]:
+                raise RuntimeError(f"Inactive file patch changed focus or failed: result={result}; target={state.get('saved_target')!r}; open_job={state.get('results',{}).get('open_job')!r}; tabs={[(tab['id'],tab.get('path')) for tab in studio.tabs]!r}")
+            state["saved_revision"]=result["revision"]
+            sequence.append(("save_in_place",lambda _row:("save",state["saved_target"],"--revision",state["saved_revision"])))
+            start_next()
+        elif key=="save_in_place":
+            if result.get("pathChanged") or Path(result.get("path","")).resolve()!=Path(state["save_path"]).resolve():
+                raise RuntimeError(f"Default save changed the existing path: {result}")
+            saved_text=Path(state["save_path"]).read_text(encoding="utf-8")
+            if saved_text!="# Saved note\n\nUpdated persisted text.\n":
+                raise RuntimeError(f"In-place save did not overwrite the existing file: {saved_text!r}")
+            state["saved_revision"]=result["revision"]
+            sequence.append(("save_as",lambda _row:("save",state["saved_target"],"--revision",state["saved_revision"],"--filename",Path(state["save_as_path"]).name,"--save-as")))
+            start_next()
+        elif key=="save_as":
+            if not result.get("pathChanged") or Path(result.get("path","")).resolve()!=Path(state["save_as_path"]).resolve():
+                raise RuntimeError(f"Explicit save-as did not return its new path: {result}")
+            if Path(state["save_path"]).read_text(encoding="utf-8")!="# Saved note\n\nUpdated persisted text.\n":
+                raise RuntimeError("Save-as changed the existing source file")
+            if Path(state["save_as_path"]).read_text(encoding="utf-8")!="# Saved note\n\nUpdated persisted text.\n":
+                raise RuntimeError("Save-as output did not contain the current note")
+            state["saved_revision"]=result["revision"]
+            sequence.append(("close_saved",lambda _row:("close",state["saved_target"],"--revision",state["saved_revision"])))
+            start_next()
+        elif key=="close_saved":
+            if result.get("status") not in ("closed","closing"):
+                raise RuntimeError(f"Saved tab failed to close cleanly: {result}")
+            sequence.append(("reopen_background",lambda _row:("open",state["save_path"],"--background")))
+            start_next()
+        elif key=="reopen_background":
+            if result.get("status")!="opening" or not result.get("jobId"):
+                raise RuntimeError(f"Reopening the closed path did not start an async job: {result}")
+            state["reopen_job"]=result["jobId"]
+            sequence.insert(0,("reopen_job",lambda _row:("job",state["reopen_job"])))
+            QTimer.singleShot(100,start_next)
+        elif key=="reopen_job":
+            if result.get("status")=="completed":
+                if result.get("active") is not False or Path(result.get("path","")).resolve()!=Path(state["save_path"]).resolve():
+                    raise RuntimeError(f"Reopened note returned inconsistent tab metadata: {result}")
+                state["results"]["document_lifecycle"]={"opened":state["save_path"],"savedAs":state["save_as_path"],"reopened":True}
+                finish()
+            elif result.get("status") in ("failed","cancelled"):
+                raise RuntimeError(f"Reopen job failed: {result}")
+            else:
+                sequence.insert(0,("reopen_job",lambda _row:("job",state["reopen_job"])))
+                QTimer.singleShot(100,start_next)
         elif key=="export":
             state["job_id"]=result["jobId"]
             sequence.insert(0,("job",lambda _row:("job",state["job_id"])))
@@ -259,7 +437,10 @@ def _probe(directory: str) -> int:
         if code==0:
             print(json.dumps({"ok":True,"steps":list(state["results"]),"imageSize":state["results"].get("imageSize"),
                               "jpegImageSize":state["results"].get("jpegImageSize"),
-                              "exportPath":state["results"].get("export_path")},separators=(",",":")))
+                              "exportPath":state["results"].get("export_path"),
+                              "prose_svg_jump":state["results"].get("prose_svg_jump"),
+                              "inactive_diagram":state["results"].get("inactive_diagram"),
+                              "document_lifecycle":state["results"].get("document_lifecycle")},separators=(",",":")))
         else:
             print(json.dumps({"ok":False,"error":state["failure"]},separators=(",",":")))
         app.exit(code)
@@ -276,7 +457,7 @@ def _probe(directory: str) -> int:
         QTimer.singleShot(50,wait_ready)
     deadline=time.monotonic()+25
     QTimer.singleShot(50,wait_ready)
-    QTimer.singleShot(75_000,lambda: (state.update(failure=f"Real viewport CLI flow timed out at {state.get('stage')}"),finish(2)))
+    QTimer.singleShot(125_000,lambda: (state.update(failure=f"Real viewport CLI flow timed out at {state.get('stage')}"),finish(2)))
     code=app.exec()
     return code
 
@@ -288,19 +469,29 @@ class RealWebEngineAgentRenderTests(unittest.TestCase):
                      QT_SCALE_FACTOR="2",
                      QTWEBENGINE_DISABLE_SANDBOX="1",QTWEBENGINE_CHROMIUM_FLAGS="--disable-gpu --disable-dev-shm-usage")
             result=subprocess.run([sys.executable,str(Path(__file__).resolve()),"--probe",temp],cwd=ROOT,env=env,
-                                  capture_output=True,text=True,timeout=90)
+                                  capture_output=True,text=True,timeout=150)
         lines=[line for line in result.stdout.splitlines() if line.startswith("{" )]
         self.assertTrue(lines,f"real QML/WebEngine probe emitted no report: {result.stdout}\n{result.stderr}")
         report=json.loads(lines[-1])
         self.assertEqual(result.returncode,0,f"real app probe failed: {report}\n{result.stderr}")
         self.assertTrue(report["ok"],report)
         self.assertIn("read",report["steps"]); self.assertIn("patch",report["steps"])
+        self.assertIn("prose_read",report["steps"]); self.assertIn("patch_second_inactive",report["steps"])
+        self.assertIn("diagrams_inactive",report["steps"]); self.assertIn("diagram_source_inactive",report["steps"])
+        self.assertIn("create_background",report["steps"]); self.assertIn("activate_created",report["steps"])
+        self.assertIn("open_background",report["steps"]); self.assertIn("open_job",report["steps"])
+        self.assertIn("save_in_place",report["steps"]); self.assertIn("save_as",report["steps"])
+        self.assertIn("reopen_job",report["steps"])
         self.assertIn("context",report["steps"])
         self.assertIn("snapshot",report["steps"]); self.assertIn("export",report["steps"])
         self.assertIn("activate_second",report["steps"]); self.assertIn("read_first_draft",report["steps"])
         self.assertIn("read_after_undo",report["steps"])
         self.assertGreaterEqual(report["imageSize"][0],200)
         self.assertLessEqual(max(report["imageSize"]),640)
+        self.assertGreater(report["prose_svg_jump"]["end"],0)
+        self.assertGreater(report["prose_svg_jump"]["omittedChars"],12_000)
+        self.assertTrue(report["inactive_diagram"]["text"])
+        self.assertTrue(report["document_lifecycle"]["reopened"])
 
 if __name__=="__main__" and len(sys.argv)>1 and sys.argv[1]=="--probe":
     raise SystemExit(_probe(sys.argv[2]))

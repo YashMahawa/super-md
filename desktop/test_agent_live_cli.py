@@ -22,16 +22,40 @@ class FakeStudio(QObject):
         self.session.agent_bridge.complete(rid,result,error,window_id=self.window_id)
     def _agent_document_action(self,request):
         action=request["action"]
+        self.last_document_action=request
+        if action=="patch_tab":
+            tab=next(item for item in self.tabs if item["id"]==request["tabId"])
+            revision=hashlib.sha256(tab["content"].encode()).hexdigest()
+            if request.get("expectedRevision")!=revision: raise ValueError("Live tab revision changed")
+            old=tab["content"]
+            for operation in request["operations"]:
+                if operation["type"]=="replace": tab["content"]=tab["content"].replace(operation["old"],operation["new"],1)
+            updated=hashlib.sha256(tab["content"].encode()).hexdigest()
+            return {"tabId":tab["id"],"revision":updated,"sourceLength":len(tab["content"]),
+                    "changed":tab["content"]!=old,"applied":len(request["operations"]),"operation_results":[]}
         if action=="create_document":
             tab_id="created-1"; content=request["content"]
-            self.tabs.append({"id":tab_id,"name":request.get("title") or "Untitled.md","path":"","content":content,"saved":"","portable":request.get("format")=="smd","assets":{}})
-            self.active=tab_id
-            return {"tabId":tab_id,"windowId":self.window_id,"revision":hashlib.sha256(content.encode()).hexdigest()}
+            name=request.get("title") or request.get("filename") or ("Untitled.smd" if request.get("format")=="smd" else "Untitled.md")
+            self.tabs.append({"id":tab_id,"name":name,"path":"","content":content,"saved":"","portable":request.get("format")=="smd","assets":{}})
+            if not request.get("background",False): self.active=tab_id
+            return {"tabId":tab_id,"windowId":self.window_id,"revision":hashlib.sha256(content.encode()).hexdigest(),
+                    "title":name,"path":"","format":request.get("format","md"),"active":self.active==tab_id,
+                    "sourceLength":len(content),"isDirty":True}
         if action=="export_document":
             job="job-cli-1"; self._agent_job_records[job]={"status":"running"}
             return {"jobId":job,"status":"running","filename":request.get("filename") or "Current.pdf","format":request["format"]}
         if action=="save_document":
             return {"tabId":request["tabId"],"windowId":self.window_id,"path":"/tmp/Current.md","revision":request["expectedRevision"]}
+        if action=="activate_document":
+            self.active=request["tabId"]
+            tab=next(item for item in self.tabs if item["id"]==self.active)
+            return {"tabId":self.active,"windowId":self.window_id,"revision":hashlib.sha256(tab["content"].encode()).hexdigest(),"active":True}
+        if action=="close_document":
+            tab=next(item for item in self.tabs if item["id"]==request["tabId"])
+            self.tabs.remove(tab)
+            if not self.tabs: self.active=""
+            elif self.active==tab["id"]: self.active=self.tabs[0]["id"]
+            return {"status":"closed","tabId":tab["id"],"windowId":self.window_id}
         if action=="open_document": raise AssertionError(action)
         if action=="replace_tab_asset":
             if request.get("expectedRevision")!=hashlib.sha256(self.tabs[0]["content"].encode()).hexdigest():
@@ -43,6 +67,11 @@ class FakeStudio(QObject):
             return {"tabId":request["tabId"],"asset":"assets/attached.svg","revision":request["expectedRevision"],"saved":True}
         raise AssertionError(action)
     def _agent_job_status(self,job_id): return {"jobId":job_id,"status":"completed","format":"pdf","filename":"Current.pdf","bytes":12}
+    def _agent_export_chunk(self,job_id,offset=0,limit=262144):
+        data=b"fake artifact"; body=data[offset:offset+limit]; next_offset=offset+len(body)
+        return {"jobId":job_id,"filename":"fake artifact.pdf","format":"pdf","mimeType":"application/pdf",
+                "bytes":len(data),"sha256":hashlib.sha256(data).hexdigest(),"offset":offset,
+                "nextOffset":next_offset if next_offset<len(data) else None,"body":base64.b64encode(body).decode()}
     def _on_request(self,raw):
         request=json.loads(raw); action=request["action"]; rid=request["requestId"]
         tab=next((item for item in self.tabs if item["id"]==request.get("tabId",self.active)),self.tabs[0])
@@ -58,7 +87,9 @@ class FakeStudio(QObject):
         if action=="read_tab":
             start=request.get("offset",0); end=min(len(source),start+request.get("limit",12000))
             self._reply(rid,{"tabId":tab["id"],"revision":revision,"offset":start,"start":start,"end":end,"nextOffset":end if end<len(source) else None,"totalChars":len(source),"markdown":source[start:end],"text":source[start:end],"omissions":[]}); return
-        if action=="search_tab": self._reply(rid,{"tabId":tab["id"],"revision":revision,"matches":[{"line":1,"text":"CLI note"}]}); return
+        if action=="search_tab":
+            self.last_search_request=request
+            self._reply(rid,{"tabId":tab["id"],"revision":revision,"matches":[{"line":1,"text":"CLI note"}],"nextOffset":None}); return
         if action=="patch_tab":
             if request["expectedRevision"]!=revision: self._reply(rid,error="stale revision"); return
             op=request["operations"][0]; tab["content"]=tab["content"].replace(op["old"],op["new"],1)
@@ -69,7 +100,9 @@ class FakeStudio(QObject):
             self._reply(rid,{"jobId":"job-cli-1","status":"running","filename":"Current.pdf","format":request["format"]}); return
         if action=="latex_review": self._reply(rid,{"tabId":tab["id"],"revision":revision,"repairs":[{"index":0,"before":"a","after":"b","reason":"test"}],"total":1,"truncated":False}); return
         if action=="latex_apply": self._reply(rid,{"tabId":tab["id"],"revision":revision,"applied":len(request["repairIndices"])}); return
-        if action=="list_diagrams": self._reply(rid,{"tabId":tab["id"],"revision":revision,"diagrams":[{"id":"diagram:0","kind":"mermaid","sourceStart":0,"sourceEnd":20,"sourceChars":20,"preview":"graph TD"}]}); return
+        if action=="list_diagrams":
+            self.last_diagram_list_request=request
+            self._reply(rid,{"tabId":tab["id"],"revision":revision,"diagrams":[{"id":"diagram:0","kind":"mermaid","sourceStart":0,"sourceEnd":20,"sourceChars":20,"preview":"graph TD"}]}); return
         if action=="get_diagram": self._reply(rid,{"tabId":tab["id"],"revision":revision,"diagramId":request["diagramId"],"source":"graph TD; A-->B","start":0,"end":15,"nextOffset":None}); return
         if action=="get_diagram_image":
             self.last_diagram_image_width=request.get("width")
@@ -111,7 +144,11 @@ class LiveCLISubprocessTests(unittest.TestCase):
         self.assertIn(":cli-window:tab-1",tab)
         self.assertEqual(self.run_cli("context",tab)[1]["result"]["reading"]["visibleText"],"CLI note")
         self.assertIn("CLI note",self.run_cli("read",tab,"--view","source")[1]["result"]["markdown"])
+        self.assertEqual(self.run_cli("read", tab, "--heading", "CLI note", "--view", "source")[1]["result"]["heading"]["title"], "CLI note")
+        self.assertEqual(self.run_cli("read", tab, "--heading", "0", "--view", "source")[1]["result"]["heading"]["index"], 0)
         self.assertEqual(self.run_cli("search",tab,"note")[1]["result"]["matches"][0]["line"],1)
+        self.assertEqual(self.run_cli("search",tab,"note","--offset","4","--case-sensitive",
+                                      "--whole-word","--regex","--exclude-diagrams")[0],0)
         ops=json.dumps([{"type":"replace","old":"text","new":"edited"}])
         self.assertTrue(self.run_cli("patch",tab,"--revision",revision,"--operations-json",ops)[1]["result"]["changed"])
         updated=self.run_cli("list")[1]["result"]["tabs"][0]["revision"]
@@ -119,6 +156,11 @@ class LiveCLISubprocessTests(unittest.TestCase):
         self.assertEqual(self.run_cli("latex-apply",tab,"--revision",updated,"--indices","0")[1]["result"]["applied"],1)
         diagrams=self.run_cli("diagrams",tab,"--revision",updated)[1]["result"]["diagrams"]
         self.assertEqual(diagrams[0]["id"],"diagram:0")
+        self.assertEqual((self.studio.last_diagram_list_request["offset"],
+                          self.studio.last_diagram_list_request["limit"]), (0, 80))
+        self.assertEqual(self.run_cli("diagrams", tab, "--offset", "3", "--limit", "5")[0], 0)
+        self.assertEqual((self.studio.last_diagram_list_request["offset"],
+                          self.studio.last_diagram_list_request["limit"]), (3, 5))
         self.assertIn("graph TD",self.run_cli("diagram",tab,"diagram:0","--revision",updated)[1]["result"]["source"])
         snapshot=self.temp/"snapshot"
         meta=self.run_cli("snapshot",tab,snapshot)[1]["result"]
@@ -137,6 +179,23 @@ class LiveCLISubprocessTests(unittest.TestCase):
         self.assertNotEqual(result.returncode,0)
         self.assertEqual(result.stderr,"")
         self.assertEqual(json.loads(result.stdout)["ok"],False)
+
+    def test_download_reassembles_registered_export_without_overwriting(self):
+        self.studio._agent_job_records["export-job"]={"action":"export_document","status":"completed"}
+        output = self.temp / "résumé export.pdf"
+        job_id = f"{self.bridge.session_id}:export-job"
+        code, value = self.run_cli("download", job_id, output)
+        self.assertEqual(code, 0)
+        self.assertEqual(output.read_bytes(), b"fake artifact")
+        self.assertEqual(value["result"]["filename"], "fake artifact.pdf")
+        self.assertEqual(value["result"]["format"], "pdf")
+        self.assertEqual(value["result"]["bytes"], len(b"fake artifact"))
+        self.assertEqual(value["result"]["sha256"], hashlib.sha256(b"fake artifact").hexdigest())
+
+        existing = self.temp / "keep.pdf"
+        existing.write_bytes(b"keep")
+        self.assertNotEqual(self.run_cli("download", job_id, existing)[0], 0)
+        self.assertEqual(existing.read_bytes(), b"keep")
 
     def test_live_asset_metadata_diagram_image_and_asset_extract(self):
         tab=self.run_cli("list")[1]["result"]["tabs"][0]["id"]
@@ -164,6 +223,20 @@ class LiveCLISubprocessTests(unittest.TestCase):
         self.assertNotIn("data",json.dumps(extracted))
         self.assertNotEqual(self.run_cli("extract",tab,"assets/vector.svg",extracted["path"],"--revision",revision)[0],0)
         self.assertNotEqual(self.run_cli("extract",tab,"assets/vector.svg",self.temp/"stale.svg","--revision","0"*64)[0],0)
+
+    def test_cli_background_create_activate_save_as_and_close_flags(self):
+        content=self.temp/"background.smd"; content.write_text("# Background\n",encoding="utf-8")
+        created=self.run_cli("create","--content-file",content,"--filename","background.smd","--background")[1]["result"]
+        self.assertFalse(created["active"])
+        self.assertTrue(self.studio.last_document_action["background"])
+        self.assertEqual(self.studio.last_document_action["format"],"smd")
+        target=created["target"]
+        self.run_cli("activate",target)
+        self.assertEqual(self.studio.last_document_action["action"],"activate_document")
+        self.run_cli("save",target,"--revision",created["revision"],"--save-as")
+        self.assertTrue(self.studio.last_document_action["saveAs"])
+        self.run_cli("close",target,"--revision",created["revision"],"--discard-changes")
+        self.assertTrue(self.studio.last_document_action["discardChanges"])
 
     def test_asset_mutation_preflight_and_live_replace_revision_guard(self):
         tab=self.run_cli("list")[1]["result"]["tabs"][0]["id"]

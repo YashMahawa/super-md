@@ -70,7 +70,7 @@ ApplicationWindow {
             return
         }
         const encoded = JSON.stringify(request)
-        const script = "(function(){const request=" + encoded + ";if(typeof window.supermdAgentRequest!=='function'){" + failure + ";return;}window.supermdAgentRequest(request,function(result,error){window.SuperMD?.post(request.requestId,'agent_result',JSON.stringify({requestId:request.requestId,result:result,error:error||''}));});})()"
+        const script = "(function(){const request=" + encoded + ";if(typeof window[request._snapshot?'supermdAgentCompute':'supermdAgentRequest']!=='function'){" + failure + ";return;}window[request._snapshot?'supermdAgentCompute':'supermdAgentRequest'](request,function(result,error){window.SuperMD?.post(request.requestId,'agent_result',JSON.stringify({requestId:request.requestId,result:result,error:error||''}));});})()"
         window.reader.runJavaScript(script)
     }
     function routeAgentRender(request) {
@@ -85,7 +85,7 @@ ApplicationWindow {
         const captureWidth = JSON.stringify(request.width || 1600)
         const captureFormat = JSON.stringify(request.imageFormat || "png")
         const requestId = JSON.stringify(request.requestId || "")
-        const script = "(function(){const request=" + contextRequest + ";if(typeof window.supermdAgentRequest!=='function'){window.SuperMD?.post(" + requestId + ",'agent_render_bounds',JSON.stringify({requestId:request.requestId,error:'Reader agent hook is unavailable'}));return;}window.supermdAgentRequest(request,function(context,error){if(error){window.SuperMD?.post(request.requestId,'agent_render_bounds',JSON.stringify({requestId:request.requestId,error:error}));return;}window.SuperMD?.post(request.requestId,'agent_render_bounds',JSON.stringify({requestId:request.requestId,tabId:context&&context.tabId,revision:context&&context.revision,width:" + captureWidth + ",imageFormat:" + captureFormat + ",context:context}));});})()"
+        const script = "(function(){const request=" + contextRequest + ";if(typeof window[request._snapshot?'supermdAgentCompute':'supermdAgentRequest']!=='function'){window.SuperMD?.post(" + requestId + ",'agent_render_bounds',JSON.stringify({requestId:request.requestId,error:'Reader agent hook is unavailable'}));return;}window.supermdAgentRequest(request,function(context,error){if(error){window.SuperMD?.post(request.requestId,'agent_render_bounds',JSON.stringify({requestId:request.requestId,error:error}));return;}window.SuperMD?.post(request.requestId,'agent_render_bounds',JSON.stringify({requestId:request.requestId,tabId:context&&context.tabId,revision:context&&context.revision,width:" + captureWidth + ",imageFormat:" + captureFormat + ",context:context}));});})()"
         webView.runJavaScript(script)
     }
     function syncVisibleReaderChrome() {

@@ -1,15 +1,28 @@
-# Super MD 0.6.18
+# Super MD 0.6.19
 
-## Faster agent previews
+## Reliable agent editing across devices
 
-- Cloud agent screenshots and diagram previews default to compact JPEG. Ask for `quality: "high"` for a larger, lossless PNG. Original images, SVG/Mermaid source and document exports are unchanged.
-- The new `view_current` MCP tool returns visible Markdown, reading position, relevant diagram references and a preview together, avoiding a document-wide diagram search during voice explanations.
-- Desktop and Android create JPEG previews before uploading them when connected to a supporting relay. Existing apps and relays remain compatible through authenticated capability negotiation.
-- Fixed desktop viewport captures ignoring the requested image size on high-density displays.
-- Capture-time context distinguishes a changed reading position from the source read before the screenshot. Revision checks reject changed documents rather than mixing their contents.
-- Preview decoding, dimensions, concurrency and queue length are bounded to protect the relay's memory. No document or image database is added.
+- Saving an existing note now keeps its path and format. Creating a copy requires an explicit save-as request. Portable SMD saves preserve embedded assets and guard against external changes.
+- Added background create/open, explicit tab activation and guarded tab closing. Read, search and edit inactive notes without silently changing the reader's focus.
+- Newly opened desktop files return an asynchronous job ID. Polling it returns the completed tab identifier and revision without blocking the interface.
+- Patch tools publish strict operation schemas, reject misspelled fields, identify the failed operation, and report completed edits accurately. Exact replacement, asserted multiple replacements, line edits and insertion work in atomic batches.
+- Search supports continuation offsets, total counts, case matching, whole words, diagram filtering and a bounded regex subset.
+- Prose reads skip large SVG bodies in one page instead of repeatedly returning the same omission. Context pagination reports the complete document length. Diagram inventories respect pagination and use consistent Unicode offsets.
+- LaTeX review and apply are separate discoverable actions. Writes still require the current revision; stale writes never overwrite newer content.
+- PDF export separates filename/format controls from typography options. Image responses include explicit media type and byte size alongside the actual image block.
 
-## Verification and compatibility
+## Focused retrieval and file delivery
 
-- Added real desktop QML/WebEngine checks for PNG and JPEG captures at the requested size, Android JPEG capture coverage, and MCP SDK integration tests for default/high-quality previews and older devices.
-- This update retains compressed SMD compatibility and the portable-image PDF export fix from 0.6.17. Android keeps the existing upgrade signing certificate.
+- Read a section by heading index, title, slug or numbered prefix, with stable section bounds and continuation cursors. Paginated outlines help agents discover headings without fetching a whole note.
+- Export the whole note or just one section as Markdown, portable SMD or PDF. Section exports retain supporting image/link definitions without modifying the source note.
+- Completed cloud exports provide private, expiring download links and MCP resources. File bytes stream in bounded chunks with SHA-256 verification instead of filling the model's text context with base64. The CLI also supports verified, create-only downloads.
+- PDF export now prepares reference-style images through the same asset pipeline as inline images.
+
+## Android settings
+
+- Settings now opens a category home with separate pages for appearance, reading/media, files/startup, writing/shortcuts, agent connections, storage and updates. Back returns to the category list before closing settings.
+
+## Compatibility
+
+- Existing Markdown and compressed/uncompressed SMD files remain readable. The compact JPEG agent preview default and optional lossless PNG previews are retained; original diagrams and export assets are unchanged.
+- Android retains its existing upgrade signing certificate. Desktop installers are supplied for Linux, Windows and both Mac architectures.

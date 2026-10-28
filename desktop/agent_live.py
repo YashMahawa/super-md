@@ -30,6 +30,7 @@ MAX_SOURCE_PAGE = 12_000
 MAX_PATCH_BYTES = 64_000
 MAX_SEARCH_CONTEXT = 500
 MAX_RELAY_ASSET_BYTES = 1024 * 1024
+MAX_EXPORT_CHUNK_BYTES = 524_288
 
 
 class LiveBridgeError(RuntimeError):
@@ -85,6 +86,12 @@ class LiveTabClient:
         except urllib.error.HTTPError as error:
             if error.code == 401:
                 raise LiveBridgeError("Live desktop authorization failed") from None
+            try:
+                detail = json.loads(error.read(4096).decode("utf-8"))
+                if isinstance(detail, dict) and isinstance(detail.get("error"), str):
+                    raise LiveBridgeError(detail["error"][:2000]) from None
+            except (ValueError, UnicodeError, OSError):
+                pass
             raise LiveBridgeError(f"Live desktop request failed (HTTP {error.code})") from None
         except (OSError, TimeoutError, urllib.error.URLError) as error:
             raise LiveBridgeError("Live desktop is unavailable or did not respond in time") from error
@@ -122,7 +129,7 @@ class LiveTabClient:
 
     def read_tab(self, tab_id: str, offset: int = 0, limit: int = 12_000,
                  window_id: str | None = None, asset_offset: int = 0, asset_limit: int = 0,
-                 view: str = "prose", heading: int | None = None) -> dict[str, Any]:
+                 view: str = "prose", heading: int | str | None = None) -> dict[str, Any]:
         if not isinstance(offset, int) or isinstance(offset, bool) or offset < 0:
             raise LiveBridgeError("offset must be a nonnegative integer")
         if not isinstance(limit, int) or isinstance(limit, bool) or not 1 <= limit <= MAX_SOURCE_PAGE:
@@ -133,30 +140,44 @@ class LiveTabClient:
             raise LiveBridgeError("asset_limit must be between 0 and 50")
         if view not in ("prose", "source"):
             raise LiveBridgeError("view must be prose or source")
-        if heading is not None and (not isinstance(heading, int) or isinstance(heading, bool) or heading < 0):
-            raise LiveBridgeError("heading must be a nonnegative outline index")
+        if heading is not None and not (
+                isinstance(heading, int) and not isinstance(heading, bool) and heading >= 0
+                or isinstance(heading, str) and bool(heading.strip()) and len(heading) <= 300):
+            raise LiveBridgeError("heading must be an outline index, exact title, slug, or numbered heading prefix")
         return self._call("read_tab", tabId=tab_id, offset=offset, limit=limit,
                           assetOffset=asset_offset, assetLimit=asset_limit, view=view,
                           **({"heading": heading} if heading is not None else {}),
                           **self._window_params(window_id))
 
     def search_tab(self, tab_id: str, query: str, limit: int = 10, context: int = 100,
-                   window_id: str | None = None) -> dict[str, Any]:
-        if not isinstance(query, str) or not query or len(query) > 1000:
-            raise LiveBridgeError("query must contain between 1 and 1,000 characters")
+                   window_id: str | None = None, *, offset: int = 0, case_sensitive: bool = False,
+                   whole_word: bool = False, regex: bool = False, exclude_diagrams: bool = False) -> dict[str, Any]:
+        if not isinstance(query, str) or not query or len(query) > 500:
+            raise LiveBridgeError("query must contain between 1 and 500 characters")
         if not isinstance(limit, int) or isinstance(limit, bool) or not 1 <= limit <= 25:
             raise LiveBridgeError("limit must be between 1 and 25")
         if not isinstance(context, int) or isinstance(context, bool) or not 0 <= context <= MAX_SEARCH_CONTEXT:
             raise LiveBridgeError("context must be between 0 and 500")
-        return self._call("search_tab", tabId=tab_id, query=query, limit=limit, context=context,
+        return self._call("search_tab", tabId=tab_id, query=query, limit=limit, context=context, offset=offset,
+                          caseSensitive=case_sensitive, wholeWord=whole_word, regex=regex, excludeDiagrams=exclude_diagrams,
                           **self._window_params(window_id))
 
-    def outline_tab(self, tab_id: str, window_id: str | None = None) -> dict[str, Any]:
-        return self._call("outline_tab", tabId=tab_id, **self._window_params(window_id))
+    def outline_tab(self, tab_id: str, window_id: str | None = None,
+                    offset: int = 0, limit: int = 80) -> dict[str, Any]:
+        if not isinstance(offset, int) or isinstance(offset, bool) or offset < 0:
+            raise LiveBridgeError("offset must be a nonnegative integer")
+        if not isinstance(limit, int) or isinstance(limit, bool) or not 1 <= limit <= 80:
+            raise LiveBridgeError("limit must be between 1 and 80")
+        return self._call("outline_tab", tabId=tab_id, offset=offset, limit=limit,
+                          **self._window_params(window_id))
 
     def list_diagrams(self, tab_id: str, window_id: str | None = None,
-                      expected_revision: str | None = None) -> dict[str, Any]:
-        params = {"tabId": tab_id, **self._window_params(window_id)}
+                      expected_revision: str | None = None, offset: int = 0, limit: int = 80) -> dict[str, Any]:
+        if not isinstance(offset, int) or isinstance(offset, bool) or offset < 0:
+            raise LiveBridgeError("offset must be a nonnegative integer")
+        if not isinstance(limit, int) or isinstance(limit, bool) or not 1 <= limit <= 80:
+            raise LiveBridgeError("limit must be between 1 and 80")
+        params = {"tabId": tab_id, "offset": offset, "limit": limit, **self._window_params(window_id)}
         if expected_revision is not None:
             if not isinstance(expected_revision, str) or len(expected_revision) != 64:
                 raise LiveBridgeError("expected_revision must be the current SHA-256 revision")
@@ -264,9 +285,20 @@ class LiveTabClient:
                                         expected_revision=params.get("expected_revision"), window_id=window_id)
         if action == "job_status":
             return self.job_status(tab_id or "", params.get("job_id", ""), window_id=window_id)
+        if action == "export_chunk":
+            job_id, offset, limit = params.get("job_id", ""), params.get("offset", 0), params.get("limit", 262_144)
+            if not isinstance(job_id, str) or not job_id or len(job_id) > 128:
+                raise LiveBridgeError("job_id is required")
+            if not isinstance(offset, int) or isinstance(offset, bool) or offset < 0:
+                raise LiveBridgeError("offset must be a nonnegative byte offset")
+            if not isinstance(limit, int) or isinstance(limit, bool) or not 1 <= limit <= MAX_EXPORT_CHUNK_BYTES:
+                raise LiveBridgeError("limit must be between 1 and 524,288 bytes")
+            return self._call("export_chunk", jobId=job_id, offset=offset, limit=limit,
+                              **self._window_params(window_id))
         if action == "list_diagrams":
             return self.list_diagrams(tab_id, window_id=window_id,
-                                      expected_revision=params.get("expected_revision"))
+                                      expected_revision=params.get("expected_revision"),
+                                      offset=params.get("offset", 0), limit=params.get("limit", 80))
         if action == "get_diagram":
             return self.get_diagram(tab_id, params.get("diagram_id", ""),
                                     params.get("expected_revision", ""),
@@ -285,17 +317,20 @@ class LiveTabClient:
                               assetPath=params.get("asset_path", ""),
                               expectedRevision=params.get("expected_revision", ""),
                               **self._window_params(window_id))
-        if action in ("create_document", "save_document", "open_document"):
+        if action in ("create_document", "save_document", "open_document", "activate_document", "close_document"):
+            payload = {"action": action, "tabId": tab_id or ""}
             if action == "create_document":
-                tab_id = ""
-                payload = {"action": action, "content": params.get("content", ""),
-                           "title": params.get("title", ""), "format": params.get("format", "md")}
-            elif action == "save_document":
-                payload = {"action": action, "tabId": tab_id,
-                           "expectedRevision": params.get("expected_revision", ""),
-                           "filename": params.get("filename", ""), "format": params.get("format", "md")}
-            else:
-                payload = {"action": action, "tabId": tab_id or "", "filename": params.get("filename", "")}
+                payload.update(content=params.get("content", ""), title=params.get("title", ""),
+                               filename=params.get("filename", ""))
+                if params.get("format") is not None: payload["format"] = params["format"]
+            if action in ("save_document", "close_document"):
+                payload["expectedRevision"] = params.get("expected_revision", "")
+            if action in ("save_document", "open_document"):
+                payload["filename"] = params.get("filename", "")
+            if action == "save_document" and params.get("format") is not None:
+                payload["format"] = params["format"]
+            for external, internal in (("background", "background"), ("save_as", "saveAs"), ("discard_changes", "discardChanges")):
+                if external in params: payload[internal] = params[external]
             payload.update(self._window_params(window_id))
             return self._call_payload(payload)
         raise LiveBridgeError("Unsupported live document action")
@@ -522,6 +557,15 @@ def _qt_bridge_class():
             window_id, raw_id = tab_id.split(":", 1)
             return (window_id or None), raw_id
 
+        @staticmethod
+        def _canonical_cloud_result(result: dict[str, Any]) -> dict[str, Any]:
+            result = dict(result)
+            raw, window = result.get("tabId"), result.get("windowId")
+            if isinstance(raw, str) and raw and isinstance(window, str) and window and not raw.startswith(window + ":"):
+                result["nativeTabId"] = raw
+                result["tabId"] = window + ":" + raw
+            return result
+
         def handle_cloud_request(self, message: dict[str, Any]) -> dict[str, Any]:
             """Translate the relay's constrained RPC envelope into local actions."""
             action = message.get("action")
@@ -540,10 +584,12 @@ def _qt_bridge_class():
                 forwarded_fields = (("expectedRevision", "expectedRevision"), ("operations", "operations"),
                                            ("offset", "offset"), ("limit", "limit"), ("query", "query"),
                                            ("context", "context"), ("width", "width"),
+                                           ("caseSensitive", "caseSensitive"), ("wholeWord", "wholeWord"),
+                                           ("regex", "regex"), ("excludeDiagrams", "excludeDiagrams"),
                                            ("diagramId", "diagramId"),
                                            ("assetName", "assetName"), ("assetPath", "assetPath"),
                                            ("assetAction", "assetAction"), ("mimeType", "mimeType"), ("body", "body"),
-                                           ("view", "view"))
+                                           ("view", "view"), ("heading", "heading"))
                 if action == "render_tab":
                     forwarded_fields += (("imageFormat", "imageFormat"),)
                 elif action == "get_diagram_image":
@@ -551,40 +597,55 @@ def _qt_bridge_class():
                 for external, internal in forwarded_fields:
                     if external in message:
                         payload[internal] = message[external]
-                return self._remote_call_gui(payload)
+                return self._canonical_cloud_result(self._remote_call_gui(payload))
             if action == "document_action":
                 doc_action = message.get("documentAction")
                 options = message.get("options") if isinstance(message.get("options"), dict) else {}
                 payload = {"windowId": window_id}
                 if doc_action == "create":
+                    filename = options.get("filename", "")
+                    inferred_format = "smd" if isinstance(filename, str) and filename.lower().endswith(".smd") else "md"
                     payload.update(action="create_document", content=message.get("content", ""),
-                                   title=options.get("title", ""), format=options.get("format", "md"))
+                                   title=options.get("title", ""), filename=filename,
+                                   background=options.get("background", False),
+                                   format=options.get("format", inferred_format))
                 elif doc_action == "export":
                     payload.update(action="export_document", tabId=raw_tab_id,
                                    expectedRevision=message.get("expectedRevision"),
-                                   format=options.get("format", "pdf"), options=options,
+                                   format=options.get("format", "pdf"), options={key: value for key, value in options.items() if key not in ("format", "filename")},
                                    filename=options.get("filename", ""))
-                elif doc_action == "latexfix":
-                    indices = message.get("repairIndices", options.get("repairIndices", []))
-                    payload.update(action="latex_apply", tabId=raw_tab_id,
-                                   expectedRevision=message.get("expectedRevision"), repairIndices=indices)
+                elif doc_action in ("latexfix", "latex_review", "latex_apply"):
+                    indices = message.get("repairIndices", options.get("repairIndices"))
+                    apply = doc_action == "latex_apply" or (doc_action == "latexfix" and indices is not None)
+                    payload.update(action="latex_apply" if apply else "latex_review", tabId=raw_tab_id)
+                    if apply: payload.update(expectedRevision=message.get("expectedRevision"), repairIndices=indices)
+                elif doc_action in ("activate", "close"):
+                    payload.update(action=doc_action + "_document", tabId=raw_tab_id)
+                    if doc_action == "close": payload.update(expectedRevision=message.get("expectedRevision"), discardChanges=options.get("discardChanges", False))
                 elif doc_action == "open":
                     payload.update(action="open_document", tabId=raw_tab_id,
-                                   filename=options.get("filename", ""))
+                                   filename=options.get("filename", ""), background=options.get("background", False))
                 elif doc_action == "save":
                     payload.update(action="save_document", tabId=raw_tab_id,
                                    expectedRevision=message.get("expectedRevision"),
-                                   filename=options.get("filename", ""), format=options.get("format", "md"))
+                                   filename=options.get("filename", ""), saveAs=options.get("saveAs", False))
+                    if "format" in options: payload["format"] = options["format"]
                 elif doc_action == "snapshot":
                     payload.update(action="render_tab", tabId=raw_tab_id, width=options.get("width", 1600))
+                elif doc_action == "outline":
+                    payload.update(action="outline_tab", tabId=raw_tab_id,
+                                   offset=options.get("offset", 0), limit=options.get("limit", 80))
                 elif doc_action == "get_context":
                     payload.update(action="get_context", tabId=raw_tab_id, limit=options.get("limit", 6000))
                 elif doc_action == "job_status":
                     payload.update(action="job_status", tabId=raw_tab_id,
                                    jobId=message.get("jobId", options.get("jobId", "")))
+                elif doc_action == "export_chunk":
+                    payload.update(action="export_chunk", jobId=message.get("jobId", ""),
+                                   offset=message.get("offset", 0), limit=message.get("limit", 262_144))
                 else:
                     raise ValueError("Unsupported native document action")
-                return self._remote_call_gui(payload)
+                return self._canonical_cloud_result(self._remote_call_gui(payload))
             if action == "list_devices":
                 return {"devices": [{"deviceId": self.cloudClient._config["deviceId"],
                                      "displayName": self.cloudClient._config["displayName"],
@@ -597,10 +658,10 @@ def _qt_bridge_class():
             action = payload.get("action")
             if action not in ("list_tabs", "read_tab", "search_tab", "outline_tab", "patch_tab", "render_tab",
                               "get_tab_image", "get_diagram_image", "get_context", "latex_review", "latex_apply", "export_document",
-                              "create_document", "save_document", "open_document", "job_status",
+                              "create_document", "save_document", "open_document", "activate_document", "close_document", "job_status", "export_chunk",
                               "list_diagrams", "get_diagram", "replace_tab_asset", "asset_action"):
                 raise ValueError("Unsupported live-tab operation")
-            if action not in ("list_tabs", "create_document", "open_document", "job_status"):
+            if action not in ("list_tabs", "create_document", "open_document", "job_status", "export_chunk"):
                 tab_id = payload.get("tabId")
                 if not isinstance(tab_id, str) or not tab_id or len(tab_id) > 128:
                     raise ValueError("tabId is required")
@@ -613,6 +674,9 @@ def _qt_bridge_class():
                     raise ValueError("title must be a short filename")
                 if payload.get("format", "md") not in ("md", "smd"):
                     raise ValueError("format must be md or smd")
+                filename = payload.get("filename", "")
+                if not isinstance(filename, str) or len(filename) > 160 or any(c in filename for c in ("/", "\\", "\0")):
+                    raise ValueError("filename must be a short basename")
             elif action == "save_document":
                 revision = payload.get("expectedRevision")
                 if not isinstance(revision, str) or len(revision) != 64:
@@ -621,14 +685,27 @@ def _qt_bridge_class():
                     raise ValueError("format must be md or smd")
             elif action == "open_document":
                 filename = payload.get("filename")
-                if not isinstance(filename, str) or len(filename) > 240:
-                    raise ValueError("filename must identify a bridge-owned file or be empty to activate a listed tab")
+                if not isinstance(filename, str) or len(filename) > 4096 or "\0" in filename:
+                    raise ValueError("filename must identify an approved note path or be empty to activate a listed tab")
                 if not filename and not payload.get("tabId"):
                     raise ValueError("An empty filename requires a listed live tab target")
-            elif action == "job_status":
+            elif action == "close_document":
+                revision = payload.get("expectedRevision")
+                if not isinstance(revision, str) or not re.fullmatch("[0-9a-f]{64}", revision):
+                    raise ValueError("expectedRevision must be the current SHA-256 revision")
+            for flag in ("background", "saveAs", "discardChanges"):
+                if flag in payload and not isinstance(payload[flag], bool):
+                    raise ValueError(flag + " must be a boolean")
+            if action in ("job_status", "export_chunk"):
                 job_id = payload.get("jobId")
                 if not isinstance(job_id, str) or not job_id or len(job_id) > 128:
                     raise ValueError("jobId is required")
+                if action == "export_chunk":
+                    offset, limit = payload.get("offset", 0), payload.get("limit", 262_144)
+                    if not isinstance(offset, int) or isinstance(offset, bool) or offset < 0:
+                        raise ValueError("offset must be a nonnegative byte offset")
+                    if not isinstance(limit, int) or isinstance(limit, bool) or not 1 <= limit <= MAX_EXPORT_CHUNK_BYTES:
+                        raise ValueError("limit must be between 1 and 524,288 bytes")
             if action == "read_tab":
                 offset, limit = payload.get("offset", 0), payload.get("limit", MAX_SOURCE_PAGE)
                 asset_offset, asset_limit = payload.get("assetOffset", 0), payload.get("assetLimit", 0)
@@ -643,22 +720,37 @@ def _qt_bridge_class():
                 if payload.get("view", "prose") not in ("prose", "source"):
                     raise ValueError("view must be prose or source")
                 heading = payload.get("heading")
-                if heading is not None and (not isinstance(heading, int) or isinstance(heading, bool) or heading < 0):
-                    raise ValueError("heading must be a nonnegative outline index")
+                if heading is not None and not (
+                        isinstance(heading, int) and not isinstance(heading, bool) and heading >= 0
+                        or isinstance(heading, str) and bool(heading.strip()) and len(heading) <= 300):
+                    raise ValueError("heading must be an outline index, exact title, slug, or numbered heading prefix")
             elif action == "search_tab":
                 query, limit, context = payload.get("query"), payload.get("limit", 10), payload.get("context", 100)
-                if not isinstance(query, str) or not query or len(query) > 1000:
-                    raise ValueError("query must contain between 1 and 1,000 characters")
+                if not isinstance(query, str) or not query or len(query) > 500:
+                    raise ValueError("query must contain between 1 and 500 characters")
                 if not isinstance(limit, int) or isinstance(limit, bool) or not 1 <= limit <= 25:
                     raise ValueError("limit must be between 1 and 25")
                 if not isinstance(context, int) or isinstance(context, bool) or not 0 <= context <= MAX_SEARCH_CONTEXT:
                     raise ValueError("context must be between 0 and 500")
+                if not isinstance(payload.get("offset", 0), int) or isinstance(payload.get("offset", 0), bool) or payload.get("offset", 0) < 0:
+                    raise ValueError("offset must be a nonnegative integer")
+                for flag in ("caseSensitive", "wholeWord", "regex", "excludeDiagrams"):
+                    if flag in payload and not isinstance(payload[flag], bool): raise ValueError(flag + " must be a boolean")
+            elif action == "outline_tab":
+                offset, limit = payload.get("offset", 0), payload.get("limit", 80)
+                if not isinstance(offset, int) or isinstance(offset, bool) or offset < 0:
+                    raise ValueError("offset must be a nonnegative integer")
+                if not isinstance(limit, int) or isinstance(limit, bool) or not 1 <= limit <= 80:
+                    raise ValueError("limit must be between 1 and 80")
             elif action == "patch_tab":
                 revision, operations = payload.get("expectedRevision"), payload.get("operations")
                 if not isinstance(revision, str) or len(revision) != 64 or any(c not in "0123456789abcdef" for c in revision):
                     raise ValueError("expectedRevision must be the current SHA-256 revision")
-                if not isinstance(operations, list) or len(operations) > 100:
-                    raise ValueError("operations must contain at most 100 edits")
+                try:
+                    from .agent_documents import validate_patch_operations
+                except ImportError:
+                    from agent_documents import validate_patch_operations
+                validate_patch_operations(operations)
                 if len(json.dumps(operations, ensure_ascii=False).encode("utf-8")) > MAX_PATCH_BYTES:
                     raise ValueError("Patch operations exceed the 64 KB limit")
             elif action == "render_tab":
@@ -676,7 +768,7 @@ def _qt_bridge_class():
                     raise ValueError("assetName is required")
                 if not isinstance(revision, str) or len(revision) != 64 or any(c not in "0123456789abcdef" for c in revision):
                     raise ValueError("expectedRevision must be the current SHA-256 revision")
-            elif action in ("get_diagram", "get_diagram_image"):
+            if action in ("get_diagram", "get_diagram_image"):
                 diagram_id, revision = payload.get("diagramId"), payload.get("expectedRevision")
                 if not isinstance(diagram_id, str) or not diagram_id.startswith("diagram:") or len(diagram_id) > 100:
                     raise ValueError("diagramId is invalid")
@@ -693,6 +785,10 @@ def _qt_bridge_class():
                 if revision is not None and (not isinstance(revision, str) or len(revision) != 64
                         or any(c not in "0123456789abcdef" for c in revision)):
                     raise ValueError("expectedRevision must be the current SHA-256 revision")
+                if isinstance(payload.get("offset", 0), bool) or not isinstance(payload.get("offset", 0), int) or payload.get("offset", 0) < 0:
+                    raise ValueError("diagram offset must be a nonnegative integer")
+                if isinstance(payload.get("limit", 80), bool) or not isinstance(payload.get("limit", 80), int) or not 1 <= payload.get("limit", 80) <= 80:
+                    raise ValueError("diagram limit must be between 1 and 80")
             elif action == "replace_tab_asset":
                 if not isinstance(payload.get("assetName"), str) or not isinstance(payload.get("assetPath"), str):
                     raise ValueError("assetName and assetPath are required")
@@ -835,22 +931,29 @@ def _qt_bridge_class():
                     return
                 else:
                     tab_id = payload.get("tabId")
-                    if action == "job_status":
+                    if action in ("job_status", "export_chunk"):
                         requested_window = payload.get("windowId")
                         origin_tab = payload.get("tabId")
                         studio = next((window for window in self.session.windows.values()
                                        if not window.retired and (not requested_window or window.window_id == requested_window)
                                        and (not origin_tab or any(tab["id"] == origin_tab for tab in window.tabs))
-                                       and payload.get("jobId") in getattr(window, "_agent_job_records", {})), None)
+                                       and payload.get("jobId") in getattr(window, "_agent_job_records", {})
+                                       and (action != "export_chunk" or
+                                            getattr(window, "_agent_job_records", {}).get(payload.get("jobId"), {}).get("action") == "export_document")), None)
                         if studio is None and not requested_window and not origin_tab:
                             candidates = [window for window in self.session.windows.values() if not window.retired
-                                          and payload.get("jobId") in getattr(window, "_agent_job_records", {})]
+                                          and payload.get("jobId") in getattr(window, "_agent_job_records", {})
+                                          and (action != "export_chunk" or
+                                               getattr(window, "_agent_job_records", {}).get(payload.get("jobId"), {}).get("action") == "export_document")]
                             studio = candidates[0] if len(candidates) == 1 else None
                         if studio is None:
                             raise ValueError("No desktop window is available")
                         with self._lock:
                             self._pending[request_id]["window_id"] = studio.window_id
-                        self.complete(request_id, studio._agent_job_status(payload.get("jobId")), window_id=studio.window_id)
+                        result = (studio._agent_export_chunk(payload.get("jobId"), payload.get("offset", 0),
+                                                            payload.get("limit", 262_144))
+                                  if action == "export_chunk" else studio._agent_job_status(payload.get("jobId")))
+                        self.complete(request_id, result, window_id=studio.window_id)
                         return
                     if action == "open_document" and not payload.get("tabId"):
                         requested_window = payload.get("windowId")
@@ -871,24 +974,16 @@ def _qt_bridge_class():
                                   and any(tab["id"] == tab_id for tab in window.tabs)), None)
                     if owner is None:
                         raise ValueError("The requested live tab is no longer open")
-                    if tab_id != owner.active:
-                        if action in ("read_tab", "search_tab", "outline_tab", "get_tab_image", "list_diagrams", "get_diagram", "get_diagram_image") or (action == "asset_action" and payload.get("assetAction") != "attach"):
-                            self._flush_then_native(request_id, owner, payload)
-                            return
-                        elif action == "open_document" and not payload.get("filename"):
-                            self._flush_then_native(request_id, owner, payload)
-                            return
-                        elif action in ("create_document", "save_document", "open_document"):
-                            raise ValueError("Document changes require the target tab to be active; activate it in Super MD first")
-                        else:
-                            # Never silently activate a tab and discard a user's
-                            # live draft. The explicit activate operation is a later UI affordance.
-                            raise ValueError("Editing or rendering requires the tab to be active; activate it in Super MD first")
+                    if tab_id != owner.active and action in ("render_tab", "get_context", "get_diagram_image", "latex_review", "latex_apply", "export_document"):
+                        raise ValueError("This action needs the active reader view; activate the target tab explicitly first")
                     studio = owner
-                if action == "get_tab_image":
+                if action in ("get_tab_image", "read_tab", "search_tab", "outline_tab", "patch_tab", "activate_document", "close_document"):
                     self._flush_then_native(request_id, studio, payload)
                     return
                 if action in ("list_diagrams", "get_diagram", "get_diagram_image"):
+                    if action != "get_diagram_image":
+                        self._flush_then_native(request_id, studio, payload)
+                        return
                     request = {**payload, "requestId": request_id}
                     with self._lock:
                         self._pending[request_id]["window_id"] = studio.window_id
@@ -928,7 +1023,18 @@ def _qt_bridge_class():
             action = payload["action"]
             if action == "asset_action":
                 return self._asset_action_native(payload, studio)
-            if action in ("create_document", "save_document", "open_document", "replace_tab_asset"):
+            if action in ("create_document", "save_document", "open_document", "activate_document", "close_document", "patch_tab", "replace_tab_asset"):
+                if action in ("save_document", "close_document", "patch_tab", "replace_tab_asset"):
+                    target = next((tab for tab in studio.tabs if tab["id"] == payload.get("tabId")), None)
+                    if target is None:
+                        raise ValueError("The requested live tab is no longer open")
+                    source = target["content"]
+                    current_revision = hashlib.sha256(source.encode("utf-8")).hexdigest()
+                    expected = payload.get("expectedRevision")
+                    if expected is not None and expected != current_revision:
+                        raise ValueError(json.dumps({"error": "Revision conflict; inspect the current note before retrying",
+                                                     "currentRevision": current_revision,
+                                                     "sourceLength": len(source)}))
                 return studio._agent_document_action(payload)
             tab_id = payload["tabId"]
             target = next((tab for tab in studio.tabs if tab["id"] == tab_id), None)
@@ -936,28 +1042,32 @@ def _qt_bridge_class():
                 raise ValueError("The requested live tab is no longer open")
             source = target["content"]
             revision = hashlib.sha256(source.encode("utf-8")).hexdigest()
+            if payload.get("expectedRevision") is not None and payload["expectedRevision"] != revision:
+                raise ValueError(json.dumps({"error": "Revision conflict; inspect the current note before retrying", "currentRevision": revision, "sourceLength": len(source)}))
             common = {"tabId": tab_id, "windowId": studio.window_id, "revision": revision,
                       "sourceLength": len(source), "title": target["name"], "path": target["path"],
                       "format": "smd" if target.get("portable") or str(target["path"]).lower().endswith(".smd") else "markdown",
                       "isDirty": target["content"] != target["saved"]}
             if action == "read_tab":
                 offset, limit = payload.get("offset", 0), payload.get("limit", MAX_SOURCE_PAGE)
+                if offset > len(source):
+                    raise ValueError("offset must be between 0 and the document character count")
                 view = payload.get("view", "prose")
                 section_start, section_end = 0, len(source)
                 heading = payload.get("heading")
+                selected_heading = None
                 if heading is not None:
                     try:
                         try:
-                            from .agent_documents import _headings
+                            from .agent_documents import _headings, resolve_heading
                         except ImportError:
-                            from agent_documents import _headings
-                        headings = _headings(source, include_internal=True)
-                        if not isinstance(heading, int) or isinstance(heading, bool) or not 0 <= heading < len(headings):
-                            raise ValueError("heading index is not present in this document")
-                        selected = headings[heading]
-                        section_start = offset = selected["start"]
-                        section_end = next((item["start"] for item in headings[heading + 1:]
-                                            if item["level"] <= selected["level"]), len(source))
+                            from agent_documents import _headings, resolve_heading
+                        selected_heading = resolve_heading(_headings(source, include_internal=True), heading)
+                        section_start = selected_heading["sectionStart"]
+                        section_end = selected_heading["sectionEnd"]
+                        if offset > section_end:
+                            raise ValueError(f"offset must be within the selected section (sectionEnd {section_end})")
+                        offset = max(section_start, offset)
                     except ImportError:
                         raise ValueError("Heading outlines are unavailable") from None
                 spans = []
@@ -989,32 +1099,29 @@ def _qt_bridge_class():
                 result = {**common, "offset": offset, "start": offset, "end": end,
                           "markdown": page_text, "text": page_text, "view": view,
                           "omissions": omitted, "totalLength": len(source), "total_chars": section_end - section_start,
-                          "next_offset": end if end < section_end else None,
-                          "assetCount": asset_count}
+                          "sectionStart": section_start, "sectionEnd": section_end, "documentLength": len(source),
+                          "next_offset": end if end < section_end else None, "truncated": end < section_end,
+                          "returned_chars": len(page_text), "svg_omissions": omitted, "assetCount": asset_count}
+                if selected_heading is not None:
+                    result["heading"] = {key: selected_heading[key] for key in ("index", "level", "title", "line")}
                 if asset_limit:
                     result.update({"assets": assets,
                                    "assetsNextOffset": asset_offset + len(assets) if asset_offset + len(assets) < asset_count else None})
                 return result
             if action == "search_tab":
-                query = payload["query"]
-                limit, context = payload.get("limit", 10), payload.get("context", 100)
-                matches = []
-                for line_number, line in enumerate(source.splitlines(), 1):
-                    position = line.casefold().find(query.casefold())
-                    if position < 0:
-                        continue
-                    start = max(0, position - context)
-                    end = min(len(line), position + len(query) + context)
-                    matches.append({"line": line_number, "text": line[start:end]})
-                    if len(matches) >= limit:
-                        break
-                return {**common, "matches": matches}
+                try:
+                    from .agent_documents import search_source
+                except ImportError:
+                    from agent_documents import search_source
+                return {**common, **search_source(source, payload["query"], limit=payload.get("limit", 10), context=payload.get("context", 100),
+                       offset=payload.get("offset", 0), case_sensitive=payload.get("caseSensitive", False), whole_word=payload.get("wholeWord", False),
+                       regex=payload.get("regex", False), exclude_diagrams=payload.get("excludeDiagrams", False))}
             if action == "outline_tab":
                 try:
-                    from .agent_documents import _headings
+                    from .agent_documents import outline_source
                 except ImportError:
-                    from agent_documents import _headings
-                return {**common, "headings": _headings(source, include_internal=True)}
+                    from agent_documents import outline_source
+                return {**common, **outline_source(source, payload.get("offset", 0), payload.get("limit", 80))}
             if action == "get_tab_image":
                 if payload["expectedRevision"] != revision:
                     raise ValueError("Live tab revision changed; inspect again before extracting the image")
@@ -1117,6 +1224,23 @@ def _qt_bridge_class():
                             try:
                                 if studio is None or studio.retired:
                                     raise ValueError("The target desktop window was closed")
+                                if pending["payload"]["action"] in ("list_diagrams", "get_diagram"):
+                                    payload = pending["payload"]
+                                    target = next((tab for tab in studio.tabs if tab["id"] == payload.get("tabId")), None)
+                                    if target is None: raise ValueError("The requested live tab is no longer open")
+                                    pending["window_id"] = studio.window_id
+                                    request = {**payload, "requestId": parent_id, "_snapshot": True, "content": target["content"]}
+                                    studio.agentRequest.emit(json.dumps(request, ensure_ascii=False, separators=(",", ":")))
+                                    return True
+                                if (pending["payload"]["action"] == "patch_tab"
+                                        and pending["payload"].get("tabId") == studio.active):
+                                    # Let the active reader apply through its editor/history path. Native
+                                    # patches remain appropriate for inactive tabs, where no reader view
+                                    # exists and switching tabs would disturb the user's current draft.
+                                    pending["window_id"] = studio.window_id
+                                    request = {**pending["payload"], "requestId": parent_id}
+                                    studio.agentRequest.emit(json.dumps(request, ensure_ascii=False, separators=(",", ":")))
+                                    return True
                                 pending["result"] = self._native_result(pending["payload"], studio)
                             except Exception as failure:
                                 pending["error"] = str(failure)[:1000]
@@ -1151,48 +1275,37 @@ def _qt_bridge_class():
                     return False
                 if pending.get("window_id") and window_id != pending["window_id"]:
                     return False
-                if not error and pending["payload"].get("action") == "read_tab":
+                if not error and pending["payload"].get("action") == "patch_tab":
                     studio = self.session.windows.get(window_id)
                     tab_id = pending["payload"].get("tabId")
                     target = next((tab for tab in studio.tabs if tab["id"] == tab_id), None) if studio else None
-                    if target is None:
+                    if target is None or not isinstance(result, dict):
                         error = "The requested live tab is no longer open"
                     else:
                         current_revision = hashlib.sha256(target["content"].encode("utf-8")).hexdigest()
-                        if isinstance(result, dict) and result.get("revision") != current_revision:
-                            error = "Live tab changed while it was being read; inspect again"
-                        elif isinstance(result, dict):
-                            asset_offset = pending["payload"].get("assetOffset", 0)
-                            asset_limit = pending["payload"].get("assetLimit", 0)
-                            count = len(target.get("assets", {}))
-                            offset = pending["payload"].get("offset", 0)
-                            end = min(len(target["content"]), offset + pending["payload"].get("limit", MAX_SOURCE_PAGE))
-                            view = pending["payload"].get("view", "prose")
-                            page_text = target["content"][offset:end]
-                            omissions = []
-                            if view == "prose":
-                                try:
-                                    try:
-                                        from .agent_documents import _elide_svg_page
-                                    except ImportError:
-                                        from agent_documents import _elide_svg_page
-                                    page_text, omissions = _elide_svg_page(target["content"], offset, end)
-                                except Exception:
-                                    pass
-                            result.update({"offset": offset, "start": offset, "end": end,
-                                           "markdown": page_text, "text": page_text, "view": view,
-                                           "omissions": omissions, "totalLength": len(target["content"]),
-                                           "total_chars": len(target["content"]),
-                                           "next_offset": end if end < len(target["content"]) else None})
-                            update = {"sourceLength": len(target["content"]), "windowId": window_id,
-                                           "title": target["name"], "path": target["path"],
-                                           "format": "smd" if target.get("portable") or str(target["path"]).lower().endswith(".smd") else "markdown",
-                                           "isDirty": target["content"] != target["saved"], "assetCount": count}
-                            if asset_limit:
-                                page = self._asset_metadata(target, asset_offset, asset_limit)
-                                update.update({"assets": page,
-                                               "assetsNextOffset": asset_offset + len(page) if asset_offset + len(page) < count else None})
-                            result.update(update)
+                        returned_revision = result.get("revision")
+                        if returned_revision != current_revision:
+                            error = json.dumps({"error": "Revision conflict; inspect the current note before retrying",
+                                                "currentRevision": current_revision,
+                                                "sourceLength": len(target["content"])})
+                        else:
+                            result = dict(result)
+                            result.setdefault("tabId", tab_id)
+                            result.setdefault("windowId", window_id)
+                            result["sourceLength"] = len(target["content"])
+                            if "operations" in result:
+                                result.setdefault("operation_results", result["operations"])
+                elif error and pending["payload"].get("action") == "patch_tab":
+                    studio = self.session.windows.get(window_id)
+                    tab_id = pending["payload"].get("tabId")
+                    target = next((tab for tab in studio.tabs if tab["id"] == tab_id), None) if studio else None
+                    expected = pending["payload"].get("expectedRevision")
+                    if target is not None:
+                        current_revision = hashlib.sha256(target["content"].encode("utf-8")).hexdigest()
+                        if expected != current_revision:
+                            error = json.dumps({"error": "Revision conflict; inspect the current note before retrying",
+                                                "currentRevision": current_revision,
+                                                "sourceLength": len(target["content"])})
                 if not error and pending["payload"].get("action") in ("list_diagrams", "get_diagram", "get_diagram_image"):
                     studio = self.session.windows.get(window_id)
                     tab_id = pending["payload"].get("tabId")

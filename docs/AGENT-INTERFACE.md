@@ -31,13 +31,21 @@ newer and an explicit allowed root:
 super-md agent --root /path/to/notes inspect chapter.smd
 super-md agent --root /path/to/notes read chapter.smd --limit 4000
 super-md agent --root /path/to/notes read chapter.smd --heading 2
+super-md agent --root /path/to/notes read chapter.smd --heading "7.4"
 super-md agent --root /path/to/notes read chapter.smd --view source
-super-md agent --root /path/to/notes search chapter.smd "assumption"
+super-md agent --root /path/to/notes search chapter.smd "assumption" --limit 25
+super-md agent --root /path/to/notes search chapter.smd "assumption" --offset 1400 --whole-word
+super-md agent --root /path/to/notes search chapter.smd 'assumpt[a-z]+' --regex --case-sensitive
 super-md agent --root /path/to/notes assets chapter.smd
 super-md agent --root /path/to/notes replace-asset chapter.smd ASSET_ID 'replacement image.svg' --revision SHA256
 super-md agent --root /path/to/notes export chapter.md smd portable.smd
 super-md agent --root /path/to/notes export chapter.md pdf print.pdf --options-json '{"pageSize":"letter","margin":18}'
 ```
+
+`inspect` includes the first bounded outline page. `read --heading` accepts its
+0-based index, an exact title or slug, or an unambiguous numbered heading such
+as `7.4`. A selected read includes nested headings up to the next heading at
+the same or higher level; use its `next_offset` to page through that section.
 
 For a source checkout without the packaged launcher, replace `super-md agent`
 with `python desktop/agent_cli.py`.
@@ -53,7 +61,15 @@ the requested amount of ordinary prose (or reaches the heading/document end).
 Thus a prose page's consumed `end` can be beyond `start + limit`; use that
 returned cursor for the next page. `view=source` always returns exact source
 characters and advances by at most `limit`. Search returns short snippets and
-line locations. `inspect` returns the note SHA-256 revision, heading outline,
+line locations and supports case sensitivity, whole words, a safe regex subset,
+and excluding fenced diagrams. `totalMatches` counts all matches for the
+current query and filters across the document, so it remains the same on every
+page. `remainingMatches` counts matches at or after the supplied `offset`;
+`truncated` and `nextOffset` describe only that remaining page. The last page
+and an exhausted cursor return `nextOffset: null`, even though
+`totalMatches` remains nonzero. Pass the returned cursor as `--offset` to
+continue; match offsets use Unicode code points.
+`inspect` returns the note SHA-256 revision, heading outline,
 and bounded asset metadata; assets themselves are returned only by the explicit
 extract operation.
 
@@ -149,33 +165,48 @@ open tabs from discovered desktop sessions and namespaces targets as
 `tab:<session>:<window>:<tab>` so multiple windows can be addressed without
 path collisions. Closed or disabled sessions disappear after the next list.
 
+Live outline pages use `offset` and `limit` (maximum 80) and include each
+heading's code-point `sectionStart`/`sectionEnd` plus `documentLength`. A live
+`document_read` heading can be a 0-based outline index, an exact title or slug,
+or an unambiguous numbered heading such as `7.4`; duplicate titles return a
+bounded candidate list instead of guessing. Keep the returned `next_offset`
+when paging within a selected section. A live `document_action` export accepts
+the same selector as `options.section`; it exports that section through the
+regular PDF/Markdown/SMD pipeline while guarding against the full document
+revision. Omitting `section` exports the whole document as before.
+
 The server exposes at most nine focused tools: `list_sessions`,
 `document_inspect`, `document_read`, `document_search`, `document_action`,
 `document_patch`, `document_assets`, `document_attach_asset`, and
 `document_view`. `document_action` handles filesystem create/export, live tab
-create/open/save/export, reading context, LaTeX review/apply, device listing,
-diagram-source listing/chunks, and asynchronous export status. Disk exports require a new `output_path`
+create/open/save/activate/close/export, reading context, LaTeX review/apply,
+device listing, diagram-source listing/chunks, and asynchronous job status. Disk exports require a new `output_path`
 inside an allowed root. Live-tab exports let the app choose a safe unique
 destination and accept the desktop PDF options; poll the returned `jobId` with
-`action="job_status"`. Live `create_document` opens a new unsaved tab, while
-`save_document` requires the current tab revision. `open_document` activates an
-open tab or a bridge-owned filename only; use explicit-root paths for arbitrary
-disk files. LaTeX fixes are proposed first, then selected indices are applied
+`action="job_status"`. Live `create_document` opens a new unsaved tab; its
+`filename` is a naming hint and it never writes to disk. `background=true` on
+create or open preserves the current tab. `save_document` requires the current
+tab revision and stays at its existing path unless `save_as=true` or a filename
+is supplied. Save-as creates a new unique target and returns `pathChanged`,
+`oldPath`, and `newPath`. `open_document` can activate an open tab or ask the
+desktop to open a file under its approved note roots; a new file returns a
+`jobId` while loading, then job status contains its tab metadata. Use
+`activate_document` to select a tab, and `close_document` with the current
+revision to close it; dirty tabs require `discard_changes=true`, and closed-note
+recovery may return `closing` while it finishes. LaTeX fixes are proposed first, then selected indices are applied
 against the review revision as one desktop edit. `get_context` reports the
 current selection, visible source range, and revision-bound diagram references;
-`list_diagrams` and `get_diagram` fetch exact Markdown source in bounded chunks.
+`list_diagrams` pages diagram metadata with `offset` and `limit` (default 80,
+maximum 80); `get_diagram` fetches exact Markdown source in bounded chunks.
 `document_view` returns a viewport image or a specifically requested rendered
 diagram image. A live desktop bridge adds
 currently open and unsaved tabs to
 `list_sessions`. Use a returned `tab:<id>` target for tab inspection, bounded
 source reads/searches, revision-checked edits, and rendered viewport images.
 Live-tab edits go through the app bridge so its editor state and rendered view
-update immediately. `read` and `search` can target inactive tabs. Before an
-edit, export, save, or viewport capture on an inactive tab, explicitly activate
-it with `super-md agent live --sessions-dir <directory> activate <tab-id>` or
-`open_document` with the tab target and an empty filename. Activation first
-flushes the currently selected tab's draft, then selects the requested tab;
-the operation returns its current revision for the next edit. The server must never resolve a `tab:<id>` through a
+update immediately. `read`, `search`, and source patches can target inactive
+tabs. The bridge flushes the current editor draft before a mutation, so you can
+patch or save another tab without switching focus. The server must never resolve a `tab:<id>` through a
 filesystem root. Image extraction uses `document_assets` with
 `action="extract"` and the exact asset name; MCP returns an image content block,
 not base64 text. `action="replace"` accepts the stable asset ID or exact name,
@@ -186,7 +217,8 @@ edit from current text.
 The optional live adapter passed to `build_mcp_server(roots, live_client=...)`
 is synchronous so the SDK can run filesystem and bridge calls in its worker
 pool. Its methods are `list_tabs()`, `read_tab(tab_id, offset=0, limit=...)`,
-`search_tab(tab_id, query=..., limit=..., context=...)`,
+`search_tab(tab_id, query=..., limit=..., context=..., offset=...,
+case_sensitive=..., whole_word=..., regex=..., exclude_diagrams=...)`,
 `patch_tab(tab_id, expected_revision=..., operations=...)`, and
 `render_tab(tab_id, width=...)`. Read responses include the current revision;
 patch receives the caller's unchanged revision and operation list. Render
@@ -225,17 +257,18 @@ Use the exported pairing file to join another trusted device; its own device
 key is generated locally. `list_devices` reports online devices and their open
 tabs. Explicitly choose the device ID when several are connected.
 
-For voice explanations, start with `view_current`. It returns the visible
-Markdown, reading position, diagram references and a compact JPEG viewport in
-one MCP response, without a document-wide diagram search. With one connected
-device and one active tab it needs no arguments. When several devices or active
-windows exist, supply their returned IDs. `width` controls the preview's longest
-edge (64–1600, default 1000); `includeImage:false` returns context only. All
-cloud preview tools default to JPEG; `quality:"high"` requests a larger
-lossless PNG (default edge 1600). The preview preserves the displayed theme; original media and explicit PNG captures
-remain available through the tools below. Context and capture must have the
-same source revision. A moved reading position is reported with the capture so
-an agent can distinguish it from the preceding source context.
+For voice and other questions about the current page, start with
+`view_current`. It returns visible Markdown, reading position, diagram
+references, and optionally a compact viewport image in one MCP response,
+without a document-wide diagram search. Use `includeImage:false` when the
+visible text is enough; use `includeImage:true` when visual appearance matters.
+With one connected device and one active tab it needs no arguments. When
+several devices or active windows exist, supply IDs returned by discovery.
+`width` controls the image's longest edge (64–1600, default 1000); previews
+default to JPEG and `quality:"high"` requests a lossless PNG at the larger
+default edge of 1600. Context and capture must have the same source revision. A
+moved reading position is reported with the capture so an agent can distinguish
+it from the preceding source context.
 
 `document_action(get_context)` provides the visible Markdown and current reading
 position. `visibleSource.total_chars` is the full document length in Unicode
@@ -243,12 +276,50 @@ code points. Its `next_offset` continues after the returned source range, even
 when that range ends at the viewport boundary; a null cursor means actual EOF.
 For a current-view question, use that visible range rather than paging through
 the remaining note. `selection.text` preserves the exact selection, including
-partial words. `diagram_action(list/source/image)` identifies diagrams and Markdown
-images, fetches bounded source chunks, or returns a compact JPEG preview (`quality:"high"` for PNG).
-Asset references stay compact; image/base64 bytes are omitted from ordinary
-reads. `render_tab` returns the current themed viewport as an image with position
-metadata, using the same standard/high-quality choice. Export supports the GUI's PDF options and returns a job ID; poll it
-with `document_action(job_status)`.
+partial words. `diagram_action(list/source/image)` identifies diagrams and
+Markdown images, fetches bounded source chunks, or returns a compact JPEG
+preview (`quality:"high"` for PNG). Asset references stay compact; image bytes
+are not included as base64 text in ordinary reads. `render_tab` returns the
+current themed viewport as an image with position metadata.
+
+For a known section, use `read_tab` with its exact title, slug, unambiguous
+numbered prefix (for example `heading:"7.4"`), or outline index. `tabId` is
+optional when one active tab is unambiguous. A compact prose request can use
+`limit:3000`; continue the same heading with the returned `next_offset`. Use
+`view:"source"` when exact Markdown is needed. If the heading is not known,
+page the active tab's outline with
+`document_action(documentAction:"outline", tabId, options:{offset:0, limit:80})`;
+the maximum outline page is 80 headings and results include `nextOffset`,
+`sectionStart`, `sectionEnd`, and `documentLength`.
+
+Export the whole note or one heading section as Markdown, portable SMD, or PDF
+with `document_action(documentAction:"export", tabId,
+expectedRevision:REV, options:{format:"smd", section:"7.4"})`. Omit `section`
+for a whole-document export. Use the latest revision from the current view or
+read result; exports reject a stale revision. Poll
+`document_action(documentAction:"job_status", options:{jobId:JOB})` until the
+job completes. The completed result includes an MCP `resource_link` and
+`download.url` metadata (expiry, MIME type, length, and SHA-256). MCP tool
+results can include resource links, and MCP clients can read supported
+resources with `resources/read`; see the [MCP tools result specification](https://modelcontextprotocol.io/specification/2025-11-25/server/tools#resource-links)
+and [MCP Resources](https://modelcontextprotocol.io/specification/2025-11-25/server/resources#reading-resources). Client support for binary
+PDF/SMD resource blobs varies, so do not assume every voice client can consume
+them. For a text-only client, use a Markdown export or read the needed section
+with `read_tab`.
+
+For an export no larger than 3 MiB, `resources/read` returns Markdown as text
+and PDF/SMD as a binary resource blob. Larger exports must use the returned
+HTTPS `download.url`; it streams in 512 KiB chunks, supports at most four active
+downloads across the relay, and is capped at 128 MiB. The private URL expires
+after ten minutes and works only while the paired Super MD device remains
+connected. The relay stores no export contents; it reads bounded chunks from
+the device as needed. Do not place base64 export bytes in model text. The
+native CLI can instead create and SHA-256-verify a new local file with
+`super-md agent live --sessions-dir "$SESSIONS" download JOB_ID OUTPUT`; it
+refuses to overwrite an existing destination. Choose SMD when embedded images
+must travel with the export. Markdown keeps ordinary asset references. PDF
+preparation resolves defined reference-style images through the same asset
+pipeline as inline images.
 
 `asset_action(list/source/attach)` provides compact embedded-asset metadata,
 original SVG text or raster image content, and direct image attachment without
@@ -260,12 +331,26 @@ is required for attachment; the returned asset reference can then be inserted
 at the intended source position with `patch_tab`. Ordinary Markdown can receive
 fenced SVG/Mermaid blocks directly through a patch.
 
-The desktop live CLI also has `diagram-image TAB ID OUTPUT --revision REV`,
+The desktop live CLI also has `diagrams TAB [--offset N] [--limit N]` for
+paginated diagram metadata and `diagram-image TAB ID OUTPUT --revision REV`,
 `assets TAB`, `extract TAB ASSET OUTPUT --revision REV`,
 `attach TAB IMAGE --revision REV [--name NAME]`, and
 `replace-asset TAB ASSET IMAGE --revision REV`. Use `--sessions-dir` as in the
 other live commands. Capture and extraction create new files without
 overwriting existing files, with extensions matched to their actual content.
+The `search` command accepts `--offset`, `--case-sensitive`, `--whole-word`,
+`--regex`, and `--exclude-diagrams`. `patch TAB --revision REV` can edit an
+inactive tab. `create` and `open FILE` accept `--background`; `activate TAB`
+selects an existing tab, and `close TAB --revision REV` closes a clean tab.
+`read TAB --heading SELECTOR` accepts a 0-based outline index, exact title,
+slug, or numbered heading prefix and pages the selected section using the
+returned `next_offset`.
+Pass `--discard-changes` to close a dirty tab while retaining its closed-note
+recovery snapshot. `save TAB --revision REV` preserves the existing path;
+`--save-as` or `--filename NAME` requests a new unique target. Poll the returned
+job ID with `job JOB_ID`, including for a newly opened file.
+Use `download JOB_ID OUTPUT` to retrieve a completed PDF, Markdown, or SMD
+export in verified byte chunks without overwriting an existing destination.
 
 Turning access off disconnects the device. **Revoke access** also asks the relay
 to unregister its device key and removes local credentials. If offline, the

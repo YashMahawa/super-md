@@ -92,6 +92,42 @@ class AgentCLIWorkflowTests(unittest.TestCase):
         self.assertTrue(saved["result"]["saved"])
         self.assertEqual((self.root / "repeat.md").read_text(encoding="utf-8"), "new new\n")
 
+    def test_search_filters_and_offset_cursor_continue_past_first_page(self):
+        note = self.root / "search.md"
+        note.write_text("echo echo echoing ECHO\n```mermaid\nneedle\n```\nneedle outside\n", encoding="utf-8")
+
+        first = self.run_cli("search", note.name, "echo", "--limit", 1,
+                             "--whole-word", "--case-sensitive")["result"]
+        self.assertEqual(first["totalMatches"], 2)
+        self.assertEqual(first["matches"][0]["matchOffset"], 0)
+        self.assertEqual(first["matches"][0]["matchLength"], 4)
+        self.assertIsNotNone(first["nextOffset"])
+        second = self.run_cli("search", note.name, "echo", "--limit", 1,
+                              "--whole-word", "--case-sensitive", "--offset", first["nextOffset"])["result"]
+        self.assertGreaterEqual(second["matches"][0]["offset"], first["nextOffset"])
+        self.assertIsNone(second["nextOffset"])
+
+        filtered = self.run_cli("search", note.name, "needle", "--regex", "--exclude-diagrams")["result"]
+        self.assertEqual(filtered["totalMatches"], 1)
+        self.assertEqual(filtered["matches"][0]["line"], 5)
+
+    def test_read_accepts_a_numbered_heading_selector_and_pages_the_section(self):
+        source = "😀 preamble\n# Intro\n\n## 7.4 Methods\nFirst paragraph.\n### Nested\nNested paragraph.\n## 7.40 Other\nMust stay out.\n"
+        note = self.root / "numbered.md"
+        note.write_text(source, encoding="utf-8")
+        first = self.run_cli("read", note.name, "--heading", "7.4", "--limit", 24, "--view", "source")["result"]
+        self.assertEqual(first["sectionStart"], len(source[:source.index("## 7.4 Methods")]))
+        self.assertEqual(first["sectionEnd"], len(source[:source.index("## 7.40 Other")]))
+        self.assertEqual(first["documentLength"], len(source))
+        combined = first["text"]
+        while first["next_offset"] is not None:
+            first = self.run_cli("read", note.name, "--heading", "7.4 Methods", "--offset",
+                                 first["next_offset"], "--limit", 24, "--view", "source")["result"]
+            combined += first["text"]
+        expected = source[source.index("## 7.4 Methods"):source.index("## 7.40 Other")]
+        self.assertEqual(combined, expected)
+        self.assertNotIn("Must stay out", combined)
+
 
 if __name__ == "__main__":
     unittest.main()

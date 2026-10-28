@@ -26,6 +26,13 @@ class _JSONArgumentParser(argparse.ArgumentParser):
         raise _UsageError(message)
 
 
+def _heading_selector(value: str) -> int | str:
+    try:
+        return int(value)
+    except ValueError:
+        return value
+
+
 def _parser() -> argparse.ArgumentParser:
     parser = _JSONArgumentParser(description="Bounded, revision-guarded Super MD note operations")
     parser.add_argument("--root", action="append", required=True, help="Explicit workspace root (repeatable)")
@@ -37,13 +44,19 @@ def _parser() -> argparse.ArgumentParser:
         if command == "read":
             p.add_argument("--offset", type=int, default=0)
             p.add_argument("--limit", type=int, default=12000)
-            p.add_argument("--heading", type=int, help="Read the indexed heading section (0-based from inspect)")
+            p.add_argument("--heading", type=_heading_selector,
+                           help="Read a 0-based outline index or an exact heading title, slug, or section number")
             p.add_argument("--view", choices=("prose", "source"), default="prose",
                            help="Elide fenced SVG bodies by default; use source for exact Markdown")
         elif command == "search":
             p.add_argument("query")
             p.add_argument("--limit", type=int, default=10)
             p.add_argument("--context", type=int, default=100)
+            p.add_argument("--offset", type=int, default=0, help="Resume at this source character offset")
+            p.add_argument("--case-sensitive", action="store_true")
+            p.add_argument("--whole-word", action="store_true")
+            p.add_argument("--regex", action="store_true", help="Use the safe literal/class/anchor regex subset")
+            p.add_argument("--exclude-diagrams", action="store_true")
         elif command == "create":
             group = p.add_mutually_exclusive_group(required=True)
             group.add_argument("--content")
@@ -117,7 +130,10 @@ def main(argv: list[str] | None = None) -> int:
         elif args.command == "read":
             result = store.read(args.path, offset=args.offset, limit=args.limit, heading=args.heading, view=args.view)
         elif args.command == "search":
-            result = store.search(args.path, args.query, limit=args.limit, context=args.context)
+            result = store.search(args.path, args.query, limit=args.limit, context=args.context,
+                                  offset=args.offset, case_sensitive=args.case_sensitive,
+                                  whole_word=args.whole_word, regex=args.regex,
+                                  exclude_diagrams=args.exclude_diagrams)
         elif args.command == "create":
             if args.stdin:
                 raw = sys.stdin.buffer.read(20_000_001)

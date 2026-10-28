@@ -156,6 +156,35 @@ class StudioUiTest {
             compose.onAllNodes(hasContentDescription("Export") and isEnabled()).fetchSemanticsNodes().isNotEmpty()
         }
     }
+    @Test fun settingsUseDistinctCategoryPagesAndBackReturnsToSectionHome() {
+        welcome()
+        val model=androidx.lifecycle.ViewModelProvider(compose.activity)[StudioViewModel::class.java]
+        val originalTheme=model.state.value.theme
+        val originalStartup=model.state.value.startup
+        try {
+            compose.onNodeWithContentDescription("More actions").performClick()
+            compose.onNodeWithText("Settings").performClick()
+            compose.onNodeWithText("Appearance").performClick()
+            compose.onNodeWithText("Workspace theme").assertExists()
+            compose.onAllNodesWithText("On startup").assertCountEquals(0)
+            compose.onAllNodesWithText("Dark").onFirst().performClick()
+            compose.runOnIdle { assertEquals("dark",model.state.value.theme) }
+            compose.onNodeWithContentDescription("Back").performClick()
+            compose.onNodeWithText("Settings").assertExists()
+            compose.onAllNodesWithText("Workspace theme").assertCountEquals(0)
+            compose.onNodeWithText("Files & startup").performClick()
+            compose.onNodeWithText("On startup").assertExists()
+            compose.onAllNodesWithText("Workspace theme").assertCountEquals(0)
+            compose.onNodeWithText("New blank note").performClick()
+            compose.runOnIdle { assertEquals("new",model.state.value.startup) }
+            compose.onNodeWithContentDescription("Back").performClick()
+            compose.onNodeWithText("Appearance").assertExists()
+            compose.onAllNodesWithText("On startup").assertCountEquals(0)
+            compose.onNodeWithContentDescription("Back").performClick()
+        } finally {
+            compose.runOnIdle { model.appearance(theme=originalTheme);model.readingPreference("startup",originalStartup) }
+        }
+    }
     @Test fun themeGuideOpensOfflineCopiesAndPasteAutofixIsOptIn() {
         welcome()
         val model=androidx.lifecycle.ViewModelProvider(compose.activity)[StudioViewModel::class.java]
@@ -169,7 +198,7 @@ class StudioUiTest {
             javascriptUntil("document.querySelector('.cm-content')?.textContent==='Start here.'",{it=="true"})
             compose.onNodeWithContentDescription("More actions").performClick()
             compose.onNodeWithText("Settings").performClick()
-            compose.onNodeWithContentDescription("Expand Appearance · Custom theme").performClick()
+            compose.onNodeWithText("Appearance").performClick()
             compose.onNodeWithText("Theme authoring guide").performScrollTo().performClick()
             javascriptUntil("!!document.querySelector('.theme-guide-dialog .markdown-body h1')",{it=="true"})
             javascriptUntil("(()=>{const b=[...document.querySelectorAll('.theme-guide-dialog button')].find(b=>b.textContent==='Copy guide');if(b)b.click();return true})()",{it=="true"})

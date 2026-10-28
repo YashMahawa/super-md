@@ -82,13 +82,25 @@ class _FakeStudio:
         self.active = active
         self.retired = False
         self.live_source = next(tab["content"] for tab in tabs if tab["id"] == active)
-        self._agent_job_records = {"job-1": {"status": "completed"}}
+        self._agent_job_records = {"job-1": {"status": "completed"},
+                                   "export-job": {"action": "export_document", "status": "completed"}}
 
     def _agent_document_action(self, payload):
+        if payload["action"] == "patch_tab":
+            from agent_documents import apply_patch_operations_detailed
+            tab = next(tab for tab in self.tabs if tab["id"] == payload["tabId"])
+            revision = hashlib.sha256(tab["content"].encode()).hexdigest()
+            if payload["expectedRevision"] != revision: raise ValueError("Revision conflict")
+            edited, operations = apply_patch_operations_detailed(tab["content"], payload["operations"])
+            tab["content"] = edited
+            if tab["id"] == self.active: self.live_source = edited
+            return {"tabId": tab["id"], "windowId": self.window_id, "revision": hashlib.sha256(edited.encode()).hexdigest(),
+                    "changed": edited != revision, "applied": len(operations), "operation_results": operations}
         if payload["action"] == "create_document":
             tab = {"id": "created", "name": payload.get("title") or "Untitled.md", "path": "",
                    "content": payload["content"], "saved": "", "portable": False, "assets": {}}
             self.tabs.append(tab); self.active = tab["id"]
+            self.live_source = tab["content"]
             return {"tabId": tab["id"], "windowId": self.window_id, "title": tab["name"],
                     "path": "", "revision": hashlib.sha256(tab["content"].encode()).hexdigest(), "isDirty": True}
         if payload["action"] == "save_document":
@@ -115,6 +127,15 @@ class _FakeStudio:
         return {"jobId": job_id, "status": "completed", "filename": "a.pdf", "format": "pdf",
                 "bytes": 10, "sha256": "a" * 64}
 
+    def _agent_export_chunk(self, job_id, offset=0, limit=262_144):
+        body = b"fake artifact"
+        data = body[offset:offset + limit]
+        next_offset = offset + len(data)
+        return {"jobId": job_id, "filename": "fake artifact.pdf", "format": "pdf",
+                "mimeType": "application/pdf", "bytes": len(body), "sha256": hashlib.sha256(body).hexdigest(),
+                "offset": offset, "nextOffset": next_offset if next_offset < len(body) else None,
+                "body": base64.b64encode(data).decode("ascii")}
+
 
 class LiveDesktopBridgeTests(unittest.TestCase):
     def setUp(self):
@@ -139,6 +160,7 @@ class LiveDesktopBridgeTests(unittest.TestCase):
         self.render_formats = []
         self.studio.agentRequest.connect(self._handle_qml_request)
         self.client = agent_live.LiveTabClient(self.bridge.discovery_path)
+        self.diagram_list_requests = []
 
     def tearDown(self):
         self.bridge.stop()
@@ -171,19 +193,21 @@ class LiveDesktopBridgeTests(unittest.TestCase):
                                    "revision": revision, "offset": start, "markdown": text,
                                    "totalLength": len(self.studio.live_source)})
         elif action == "patch_tab":
+            from agent_documents import apply_patch_operations_detailed
             current_revision = hashlib.sha256(self.studio.live_source.encode()).hexdigest()
             if request["expectedRevision"] != current_revision:
                 self._finish(request, error="The live tab revision changed")
                 return
-            updated = self.studio.live_source
-            for operation in request["operations"]:
-                if operation.get("type") != "replace" or operation["old"] not in updated:
-                    self._finish(request, error="Invalid test operation")
-                    return
-                updated = updated.replace(operation["old"], operation["new"], 1)
+            try:
+                updated, operation_results = apply_patch_operations_detailed(
+                    self.studio.live_source, request["operations"])
+            except Exception:
+                self._finish(request, error="Invalid test operation")
+                return
             self.studio.live_source = updated
             self.studio.tabs[0]["content"] = updated
-            self._finish(request, {"revision": hashlib.sha256(updated.encode()).hexdigest(), "changed": True})
+            self._finish(request, {"revision": hashlib.sha256(updated.encode()).hexdigest(), "changed": True,
+                                   "applied": len(operation_results), "operations": operation_results})
         elif action == "render_tab":
             self.render_formats.append(request.get("imageFormat", "png"))
             png = base64.b64decode("iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+/lS8AAAAASUVORK5CYII=")
@@ -202,8 +226,10 @@ class LiveDesktopBridgeTests(unittest.TestCase):
             self._finish(request, {"tabId": self.active_id, "revision": hashlib.sha256(self.studio.live_source.encode()).hexdigest(),
                                    "applied": len(request.get("repairIndices", []))})
         elif action == "list_diagrams":
+            self.diagram_list_requests.append((request.get("offset", 0), request.get("limit", 80)))
             self._finish(request, {"tabId": self.active_id, "revision": hashlib.sha256(self.studio.live_source.encode()).hexdigest(),
-                                   "diagrams": [{"id": "diagram:4", "kind": "svg", "sourceStart": 4}]})
+                                   "diagrams": [{"id": "diagram:4", "kind": "svg", "sourceStart": 4}],
+                                   "total": 1, "nextOffset": None})
         elif action == "get_diagram":
             self._finish(request, {"tabId": self.active_id, "revision": hashlib.sha256(self.studio.live_source.encode()).hexdigest(),
                                    "diagramId": request["diagramId"], "source": "<svg/>", "start": 4, "end": 10})
@@ -263,6 +289,26 @@ class LiveDesktopBridgeTests(unittest.TestCase):
         self.assertIn("A chart", self.studio.live_source)
         self.assertFalse(self.bridge._pending)
 
+    def test_active_patch_uses_reader_edit_path_and_returns_revision_metadata(self):
+        revision = hashlib.sha256(self.studio.live_source.encode()).hexdigest()
+        result = self._call_with_qt_pump(lambda: self.client.patch_tab(
+            self.active_id, revision, [{"type": "replace", "old": "Old", "new": "Updated"}],
+            window_id=self.window_id))
+        self.assertTrue(result["changed"])
+        self.assertEqual(result["applied"], 1)
+        self.assertEqual(result["sourceLength"], len(self.studio.live_source))
+        self.assertEqual(result["revision"], hashlib.sha256(self.studio.live_source.encode()).hexdigest())
+        self.assertEqual(self.studio.active, self.active_id)
+
+    def test_patch_conflict_contains_current_revision_and_source_length(self):
+        with self.assertRaises(agent_live.LiveBridgeError) as caught:
+            self._call_with_qt_pump(lambda: self.client.patch_tab(
+                self.active_id, "0" * 64, [{"type": "replace", "old": "Old", "new": "No"}],
+                window_id=self.window_id))
+        details = json.loads(str(caught.exception))
+        self.assertEqual(details["currentRevision"], hashlib.sha256(self.studio.live_source.encode()).hexdigest())
+        self.assertEqual(details["sourceLength"], len(self.studio.live_source))
+
     def test_inactive_search_flushes_active_draft_and_viewport_decodes_image(self):
         self.studio.live_source = self.source
         search = self._call_with_qt_pump(lambda: self.client.search_tab(
@@ -276,6 +322,65 @@ class LiveDesktopBridgeTests(unittest.TestCase):
         self.assertEqual(self.render_formats, ["png"])
         with self.assertRaisesRegex(agent_live.LiveBridgeError, "image_format must be png or jpeg"):
             self.client.render_tab(self.active_id, image_format="webp")
+
+    def test_live_search_limit_matches_helper_and_diagrams_accept_pagination(self):
+        with self.assertRaisesRegex(agent_live.LiveBridgeError, "500 characters"):
+            self.client.search_tab(self.active_id, "x" * 501)
+        default = self._call_with_qt_pump(lambda: self.client.list_diagrams(self.active_id))
+        page = self._call_with_qt_pump(lambda: self.client.document_action(
+            self.active_id, "list_diagrams", offset=12, limit=7))
+        self.assertEqual(default["total"], 1)
+        self.assertEqual(page["nextOffset"], None)
+        self.assertEqual(self.diagram_list_requests, [(0, 80), (12, 7)])
+        with self.assertRaisesRegex(agent_live.LiveBridgeError, "between 1 and 80"):
+            self.client.list_diagrams(self.active_id, limit=81)
+        outline = self._call_with_qt_pump(lambda: self.client.outline_tab(self.active_id))
+        self.assertEqual(outline["total"], 1)
+        self.assertFalse(outline["truncated"])
+        outline_page = self._call_with_qt_pump(lambda: self.client.outline_tab(self.active_id, offset=0, limit=1))
+        self.assertEqual(outline_page["headings"][0]["title"], "Old")
+        with self.assertRaisesRegex(agent_live.LiveBridgeError, "between 1 and 80"):
+            self.client.outline_tab(self.active_id, limit=81)
+
+    def test_live_read_accepts_heading_title_slug_and_number_prefix_selectors(self):
+        source = "# Overview\nIntro\n\n## 2. Findings\nEvidence\n### Detail\nMore\n\n## 3. Next\nLater\n"
+        self.studio.live_source = source
+        self.studio.tabs[0]["content"] = source
+        start, end = source.index("## 2. Findings"), source.index("## 3. Next")
+        result = self._call_with_qt_pump(lambda: self.client.read_tab(
+            self.active_id, heading="2", view="source", window_id=self.window_id))
+        self.assertEqual(result["sectionStart"], start)
+        self.assertEqual(result["sectionEnd"], end)
+        self.assertEqual(result["documentLength"], len(source))
+        self.assertEqual(result["total_chars"], end - start)
+        self.assertEqual(result["markdown"], source[start:end])
+        self.assertIsNone(result["next_offset"])
+        by_slug = self._call_with_qt_pump(lambda: self.client.read_tab(
+            self.active_id, heading="detail", view="source", window_id=self.window_id))
+        self.assertEqual(by_slug["sectionStart"], source.index("### Detail"))
+        with self.assertRaises(agent_live.LiveBridgeError):
+            self._call_with_qt_pump(lambda: self.client.read_tab(
+                self.active_id, heading="missing heading", window_id=self.window_id))
+
+    def test_heading_read_paginates_long_section_without_leaking_next_section(self):
+        section = "# Long section\n" + "x" * 25_000 + "\n## Nested\ninside\n"
+        source = section + "# Following section\nThis must stay out.\n"
+        self.studio.live_source = source
+        self.studio.tabs[0]["content"] = source
+        first = self._call_with_qt_pump(lambda: self.client.read_tab(
+            self.active_id, limit=12_000, view="source", heading="long-section", window_id=self.window_id))
+        second = self._call_with_qt_pump(lambda: self.client.read_tab(
+            self.active_id, offset=first["next_offset"], limit=12_000,
+            view="source", heading=0, window_id=self.window_id))
+        third = self._call_with_qt_pump(lambda: self.client.read_tab(
+            self.active_id, offset=second["next_offset"], limit=12_000,
+            view="source", heading="Long section", window_id=self.window_id))
+        self.assertIsNotNone(first["next_offset"])
+        self.assertIsNotNone(second["next_offset"])
+        self.assertIsNone(third["next_offset"])
+        self.assertEqual(first["sectionStart"], 0)
+        self.assertEqual(third["sectionEnd"], len(section))
+        self.assertNotIn("Following section", first["markdown"] + second["markdown"] + third["markdown"])
 
     def test_live_listing_preserves_native_tabs_and_updates_active_revision(self):
         self.studio.live_source = self.source
@@ -336,6 +441,15 @@ class LiveDesktopBridgeTests(unittest.TestCase):
             "created", "job_status", job_id="job-1", window_id=self.window_id))
         self.assertEqual(status["status"], "completed")
 
+    def test_export_chunk_is_routed_by_registered_job_without_tab_or_path(self):
+        result = self._call_with_qt_pump(lambda: self.client.document_action(
+            "", "export_chunk", job_id="export-job", offset=2, limit=5, window_id=self.window_id))
+        self.assertEqual(result["offset"], 2)
+        self.assertEqual(base64.b64decode(result["body"]), b"ke ar")
+        with self.assertRaisesRegex(agent_live.LiveBridgeError, "between 1 and 524,288"):
+            self.client.document_action("", "export_chunk", job_id="export-job", limit=524_289,
+                                        window_id=self.window_id)
+
     def test_explicit_open_on_inactive_tab_flushes_then_activates_it(self):
         self.studio.live_source = self.source
         activated = self._call_with_qt_pump(lambda: self.client.document_action(
@@ -370,11 +484,87 @@ class LiveDesktopBridgeTests(unittest.TestCase):
         self.assertIn("cancelled", str(failure.get("error", "")).lower())
         self.assertFalse(self.bridge._pending)
 
+    def test_cloud_document_mapping_keeps_controls_out_of_pdf_options_and_qualifies_results(self):
+        calls = []
+        original = self.bridge._remote_call_gui
+        def capture(payload):
+            calls.append(dict(payload))
+            if payload.get("action") == "export_chunk":
+                return {"jobId": payload["jobId"], "offset": payload["offset"]}
+            return {"tabId": "tab-local", "windowId": self.window_id, "format": payload.get("format")}
+        self.bridge._remote_call_gui = capture
+        try:
+            exported = self.bridge.handle_cloud_request({
+                "action": "document_action", "documentAction": "export", "tabId": f"{self.window_id}:tab-local",
+                "expectedRevision": "a" * 64,
+                "options": {"format": "pdf", "filename": "result.pdf", "scale": 2}})
+            self.assertEqual(calls[-1]["format"], "pdf")
+            self.assertEqual(calls[-1]["filename"], "result.pdf")
+            self.assertEqual(calls[-1]["options"], {"scale": 2})
+            self.assertEqual(exported["tabId"], f"{self.window_id}:tab-local")
+            self.assertEqual(exported["nativeTabId"], "tab-local")
+
+            self.bridge.handle_cloud_request({
+                "action": "document_action", "documentAction": "save", "tabId": f"{self.window_id}:tab-local",
+                "expectedRevision": "a" * 64, "options": {}})
+            self.assertNotIn("format", calls[-1])
+
+            self.bridge.handle_cloud_request({
+                "action": "document_action", "documentAction": "create", "content": "# New",
+                "options": {"filename": "New.smd", "background": True}})
+            self.assertEqual(calls[-1]["format"], "smd")
+            self.assertTrue(calls[-1]["background"])
+
+            self.bridge.handle_cloud_request({
+                "action": "document_action", "documentAction": "close", "tabId": f"{self.window_id}:tab-local",
+                "expectedRevision": "a" * 64, "options": {"discardChanges": True}})
+            self.assertTrue(calls[-1]["discardChanges"])
+
+            self.bridge.handle_cloud_request({
+                "action": "document_action", "documentAction": "outline", "tabId": f"{self.window_id}:tab-local",
+                "options": {"offset": 4, "limit": 9}})
+            self.assertEqual((calls[-1]["action"], calls[-1]["offset"], calls[-1]["limit"]),
+                             ("outline_tab", 4, 9))
+
+            chunk = self.bridge.handle_cloud_request({
+                "action": "document_action", "documentAction": "export_chunk", "deviceId": "desktop-1",
+                "jobId": "export-job", "offset": 300, "limit": 8192})
+            self.assertEqual(calls[-1], {"windowId": None, "action": "export_chunk", "jobId": "export-job",
+                                         "offset": 300, "limit": 8192})
+            self.assertNotIn("tabId", chunk)
+        finally:
+            self.bridge._remote_call_gui = original
+
     def _capture_cloud_failure(self, target):
         try:
             self.bridge._remote_call_gui({"action": "read_tab", "tabId": self.active_id})
         except Exception as error:
             target["error"] = error
+
+    def test_prose_read_jumps_large_svg_and_keeps_payload_length_and_offsets(self):
+        source = "# Unicode 🧪\n\n```svg\n<svg>" + "x" * 50_000 + "</svg>\n```\nAfter drawing.\n"
+        self.studio.live_source = source
+        result = self._call_with_qt_pump(lambda: self.client.read_tab(self.active_id, limit=100))
+        self.assertEqual(result["returned_chars"], len(result["text"]))
+        self.assertNotIn("x" * 100, result["text"])
+        self.assertGreater(result["end"], 50_000)
+        self.assertTrue(result["next_offset"] is None or result["next_offset"] >= source.index("</svg>"))
+        self.assertEqual(result["total_chars"], len(source))
+
+    def test_inactive_patches_and_paged_search_preserve_focus(self):
+        source = "# Other 🧪\n" + "needle " * 30
+        self.studio.tabs[1]["content"] = source
+        revision = hashlib.sha256(source.encode()).hexdigest()
+        changed = self._call_with_qt_pump(lambda: self.client.patch_tab(self.inactive_id, revision,
+                        [{"type": "replace", "old": "needle", "new": "result", "count": "all", "expectedCount": 30}]))
+        self.assertEqual(changed["applied"], 1)
+        self.assertEqual(self.studio.active, self.active_id)
+        first = self._call_with_qt_pump(lambda: self.client.search_tab(self.inactive_id, "result", limit=25, whole_word=True))
+        second = self._call_with_qt_pump(lambda: self.client.search_tab(self.inactive_id, "result", limit=25, offset=first["nextOffset"]))
+        self.assertEqual(first["totalMatches"], 30)
+        self.assertEqual(len(first["matches"]) + len(second["matches"]), 30)
+        self.assertIsNone(second["nextOffset"])
+        self.assertEqual(self.studio.active, self.active_id)
 
     def test_auth_invalid_origin_discovery_permissions_and_disable_cleanup(self):
         url = self.bridge.endpoint

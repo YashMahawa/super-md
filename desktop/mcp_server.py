@@ -92,15 +92,17 @@ def build_mcp_server(roots: list[str], live_client=None):
             raise AgentDocumentError("Live bridge result exceeded the 64 KB tool-output limit")
         return value
 
-    def live_outline(tab_id: str) -> dict:
-        result = live_call("outline_tab", tab_id)
+    def live_outline(tab_id: str, offset: int = 0, limit: int = 80) -> dict:
+        result = live_call("outline_tab", tab_id, offset=offset, limit=limit)
         if not isinstance(result, dict):
             raise AgentDocumentError("Live bridge returned invalid outline metadata")
         headings = result.get("headings", result.get("outline"))
         if not isinstance(headings, list) or len(headings) > 5000:
             raise AgentDocumentError("Live bridge returned an invalid or oversized heading outline")
         return {"headings": headings, "revision": result.get("revision"),
-                "sourceLength": result.get("sourceLength", result.get("totalLength"))}
+                "sourceLength": result.get("sourceLength", result.get("documentLength", result.get("totalLength"))),
+                "total": result.get("total", len(headings)), "offset": result.get("offset", offset),
+                "nextOffset": result.get("nextOffset"), "truncated": result.get("truncated", False)}
 
     def normalize_live_heading(item: dict) -> dict:
         start = item.get("start", item.get("offset", item.get("charOffset")))
@@ -112,7 +114,8 @@ def build_mcp_server(roots: list[str], live_client=None):
         return {"index": item.get("index", 0), "level": level, "title": str(item.get("title", ""))[:300],
                 "line": item.get("line"), "start": start}
 
-    def read_live_tab(tab_id: str, offset: int, limit: int, view: str, heading: int | None = None) -> dict:
+    def read_live_tab(tab_id: str, offset: int, limit: int, view: str,
+                      heading: int | str | None = None) -> dict:
         params = {"offset": offset, "limit": limit, "view": view}
         if heading is not None:
             params["heading"] = heading
@@ -129,6 +132,8 @@ def build_mcp_server(roots: list[str], live_client=None):
             raise AgentDocumentError("Live bridge returned invalid source offsets")
         response = {key: result[key] for key in ("revision", "id", "title", "path", "format", "isDirty")
                     if key in result}
+        response.update({key: result[key] for key in ("heading", "sectionStart", "sectionEnd", "documentLength")
+                         if key in result})
         response.update({"start": start, "end": end,
                          "markdown": markdown, "view": view,
                          "returned_chars": len(markdown)})
@@ -215,8 +220,8 @@ def build_mcp_server(roots: list[str], live_client=None):
             metadata = {key: result[key] for key in allowed if key in result}
             headings = outline["headings"]
             metadata["outline"] = [normalize_live_heading(item) for item in headings[:80] if isinstance(item, dict)]
-            metadata["outline_truncated"] = len(headings) > 80
-            metadata["heading_count"] = len(headings)
+            metadata["outline_truncated"] = outline["truncated"] or len(headings) > 80
+            metadata["heading_count"] = outline["total"]
             metadata["target"] = path
             if isinstance(metadata.get("assets"), list):
                 metadata["assets"] = [
@@ -237,43 +242,41 @@ def build_mcp_server(roots: list[str], live_client=None):
 
     @server.tool()
     def document_read(path: str, offset: int = 0, limit: int = 12000,
-                      heading: int | None = None, view: str = "prose") -> dict[str, Any]:
+                      heading: int | str | None = None, view: str = "prose") -> dict[str, Any]:
         """Read a bounded source page; fenced SVG bodies are elided unless view='source'."""
         if view not in ("prose", "source"):
             raise AgentDocumentError("view must be 'prose' or 'source'")
         tab_id = live_id(path)
         if tab_id is not None:
-            if not 1 <= limit <= 12000 or offset < 0:
+            if (not isinstance(offset, int) or isinstance(offset, bool) or offset < 0
+                    or not isinstance(limit, int) or isinstance(limit, bool) or not 1 <= limit <= 12000):
                 raise AgentDocumentError("limit must be 1–12,000 and offset must be nonnegative")
-            section_end = None
-            if heading is not None:
-                outline = live_outline(tab_id)
-                headings = [normalize_live_heading(item) for item in outline["headings"] if isinstance(item, dict)]
-                if not isinstance(heading, int) or isinstance(heading, bool) or not 0 <= heading < len(headings):
-                    raise AgentDocumentError("heading index is not present in the current tab outline")
-                selected = headings[heading]
-                offset = selected["start"]
-                section_end = next((item["start"] for item in headings[heading + 1:]
-                                    if item["level"] <= selected["level"]), outline.get("sourceLength"))
+            if heading is not None and not (
+                    isinstance(heading, int) and not isinstance(heading, bool) and heading >= 0
+                    or isinstance(heading, str) and bool(heading.strip()) and len(heading) <= 300):
+                raise AgentDocumentError("heading must be an outline index, exact title, slug, or numbered heading prefix")
             response = read_live_tab(tab_id, offset, limit, view, heading=heading)
             response["target"] = path
-            if section_end is not None:
-                section_end = max(offset, section_end)
-                response["total_chars"] = section_end - offset
-                response["next_offset"] = response["end"] if response["end"] < section_end else None
-                response["truncated"] = response["next_offset"] is not None
-                response["heading"] = {key: selected[key] for key in ("index", "level", "title", "line")}
             return bounded_result(response)
         return store.read(path, offset=offset, limit=limit, heading=heading, view=view)
 
     @server.tool()
-    def document_search(path: str, query: str, limit: int = 10, context: int = 100) -> dict[str, Any]:
-        """Find case-insensitive matches and short source snippets."""
+    def document_search(path: str, query: str, limit: int = 10, context: int = 100,
+                        offset: int = 0, case_sensitive: bool = False,
+                        whole_word: bool = False, regex: bool = False,
+                        exclude_diagrams: bool = False) -> dict[str, Any]:
+        """Find paginated source matches with optional word, case, regex and diagram filters."""
         tab_id = live_id(path)
         if tab_id is not None:
-            if not query or len(query) > 500 or not 1 <= limit <= 25 or not 0 <= context <= 500:
-                raise AgentDocumentError("query must be 1–500 characters, limit 1–25, context 0–500")
-            result = live_call("search_tab", tab_id, query=query, limit=limit, context=context)
+            if (not isinstance(query, str) or not query or len(query) > 500 or
+                    not isinstance(limit, int) or isinstance(limit, bool) or not 1 <= limit <= 25 or
+                    not isinstance(context, int) or isinstance(context, bool) or not 0 <= context <= 500 or
+                    not isinstance(offset, int) or isinstance(offset, bool) or not 0 <= offset <= 20_000_000 or
+                    any(not isinstance(value, bool) for value in (case_sensitive, whole_word, regex, exclude_diagrams))):
+                raise AgentDocumentError("query, limit, context, offset, or search flags are invalid")
+            result = live_call("search_tab", tab_id, query=query, limit=limit, context=context,
+                               offset=offset, case_sensitive=case_sensitive, whole_word=whole_word,
+                               regex=regex, exclude_diagrams=exclude_diagrams)
             if not isinstance(result, dict) or not isinstance(result.get("matches"), list):
                 raise AgentDocumentError("Live bridge returned invalid search results")
             result = dict(result)
@@ -281,7 +284,8 @@ def build_mcp_server(roots: list[str], live_client=None):
             for item in result["matches"][:limit]:
                 if not isinstance(item, dict):
                     continue
-                match = {key: item[key] for key in ("offset", "line", "start", "end", "snippet") if key in item}
+                match = {key: item[key] for key in ("offset", "line", "start", "end", "snippet",
+                                                     "matchOffset", "matchLength", "snippetOffset") if key in item}
                 if "snippet" not in match and isinstance(item.get("text"), str):
                     match["snippet"] = item["text"]
                 clean_matches.append(match)
@@ -298,10 +302,12 @@ def build_mcp_server(roots: list[str], live_client=None):
                         title: str | None = None, output_path: str | None = None, filename: str | None = None,
                         format: str | None = None,
                         options: dict[str, Any] | None = None,
+                        background: bool = False, save_as: bool = False,
+                        discard_changes: bool = False,
                         expected_revision: str | None = None,
                         repair_indices: list[int] | None = None, job_id: str | None = None,
                         device_id: str | None = None, diagram_id: str | None = None,
-                        offset: int = 0, limit: int = 12000) -> dict[str, Any]:
+                        offset: int = 0, limit: int | None = None) -> dict[str, Any]:
         """Create/open/save/export notes, read context/diagrams, review fixes, or poll."""
         if action == "create":
             if path is None or content is None:
@@ -312,13 +318,21 @@ def build_mcp_server(roots: list[str], live_client=None):
                 raise AgentDocumentError("create_document requires a live desktop session")
             if not isinstance(content, str) or len(content.encode("utf-8")) > 20_000_000:
                 raise AgentDocumentError("create_document requires UTF-8 content up to 20 MB")
-            format = format or "md"
-            if format not in ("md", "smd"):
+            if format is not None and format not in ("md", "smd"):
                 raise AgentDocumentError("format must be md or smd")
             if title is not None and (not isinstance(title, str) or len(title) > 160 or "\0" in title):
                 raise AgentDocumentError("title must be at most 160 characters")
+            if filename is not None and (not isinstance(filename, str) or not filename or len(filename) > 160 or
+                                         Path(filename).name != filename or filename in (".", "..") or "\0" in filename):
+                raise AgentDocumentError("filename must be a safe naming hint")
+            naming_hint = title or filename or ""
+            if format is None:
+                format = "smd" if Path(naming_hint).suffix.lower() == ".smd" else "md"
+            if not isinstance(background, bool):
+                raise AgentDocumentError("background must be a boolean")
             result = live_call("document_action", None, "create_document", content=content,
-                               title=title, format=format, device_id=device_id)
+                               title=title or "", filename=filename or "", format=format, background=background,
+                               device_id=device_id)
             if not isinstance(result, dict):
                 raise AgentDocumentError("Desktop returned invalid created-tab metadata")
             return bounded_result(result)
@@ -327,16 +341,17 @@ def build_mcp_server(roots: list[str], live_client=None):
                 raise AgentDocumentError("save_document requires a current tab target")
             if not isinstance(expected_revision, str) or not re.fullmatch(r"[0-9a-f]{64}", expected_revision):
                 raise AgentDocumentError("save_document requires expected_revision from document_inspect")
-            format = format or "md"
-            if format not in ("md", "smd"):
+            if format is not None and format not in ("md", "smd"):
                 raise AgentDocumentError("format must be md or smd")
             if title:
                 raise AgentDocumentError("Use filename for save_document; title applies to create_document")
             if filename is not None and (not isinstance(filename, str) or not filename or len(filename) > 160
                                          or Path(filename).name != filename or filename in (".", "..")):
                 raise AgentDocumentError("filename must be a safe basename")
+            if not isinstance(save_as, bool):
+                raise AgentDocumentError("save_as must be a boolean")
             result = live_call("document_action", live_id(path), "save_document", expected_revision=expected_revision,
-                               filename=filename, format=format)
+                               filename=filename or "", format=format, save_as=save_as)
             if not isinstance(result, dict):
                 raise AgentDocumentError("Desktop returned invalid save status")
             return bounded_result(result)
@@ -345,20 +360,42 @@ def build_mcp_server(roots: list[str], live_client=None):
                 raise AgentDocumentError("open_document requires a live desktop session")
             if path and live_id(path) is not None:
                 target_id = live_id(path)
-                result = live_call("document_action", target_id, "open_document")
+                if not isinstance(background, bool):
+                    raise AgentDocumentError("background must be a boolean")
+                result = live_call("document_action", target_id, "open_document", background=background)
                 if not isinstance(result, dict):
                     raise AgentDocumentError("Desktop returned invalid open status")
                 return bounded_result({**result, "target": path, "opened": True})
             if filename is None and path is not None:
                 filename = path
-            if not isinstance(filename, str) or not filename or len(filename) > 300 or \
-                    Path(filename).name != filename or filename in (".", ".."):
-                raise AgentDocumentError("open_document accepts only a bridge-owned basename or an open tab target")
+            if not isinstance(filename, str) or not filename or len(filename) > 4096 or "\0" in filename:
+                raise AgentDocumentError("open_document requires a bounded path, basename, or open tab target")
+            if not isinstance(background, bool):
+                raise AgentDocumentError("background must be a boolean")
             result = live_call("document_action", None, "open_document", filename=filename,
-                               device_id=device_id)
+                               background=background, device_id=device_id)
             if not isinstance(result, dict):
                 raise AgentDocumentError("Desktop returned invalid open status")
             return bounded_result(result)
+        if action == "activate_document":
+            if path is None or live_id(path) is None:
+                raise AgentDocumentError("activate_document requires an open desktop tab target")
+            result = live_call("document_action", live_id(path), "activate_document")
+            if not isinstance(result, dict):
+                raise AgentDocumentError("Desktop returned invalid activation metadata")
+            return bounded_result({**result, "target": path})
+        if action == "close_document":
+            if path is None or live_id(path) is None:
+                raise AgentDocumentError("close_document requires an open desktop tab target")
+            if not isinstance(expected_revision, str) or not re.fullmatch(r"[0-9a-f]{64}", expected_revision):
+                raise AgentDocumentError("close_document requires expected_revision from document_inspect")
+            if not isinstance(discard_changes, bool):
+                raise AgentDocumentError("discard_changes must be a boolean")
+            result = live_call("document_action", live_id(path), "close_document",
+                               expected_revision=expected_revision, discard_changes=discard_changes)
+            if not isinstance(result, dict):
+                raise AgentDocumentError("Desktop returned invalid close status")
+            return bounded_result({**result, "target": path})
         if action in ("export", "export_document"):
             if path is None or format not in ("pdf", "smd", "md"):
                 raise AgentDocumentError("export requires a source path and format pdf, smd, or md")
@@ -399,7 +436,7 @@ def build_mcp_server(roots: list[str], live_client=None):
             return store.create(output_path, markdown)
         if action == "job_status":
             if not isinstance(job_id, str) or not job_id or len(job_id) > 300:
-                raise AgentDocumentError("job_status requires a jobId returned by a live export")
+                raise AgentDocumentError("job_status requires a live jobId")
             result = live_call("document_action", None, "job_status", job_id=job_id)
             if not isinstance(result, dict):
                 raise AgentDocumentError("Desktop returned invalid export job status")
@@ -407,11 +444,33 @@ def build_mcp_server(roots: list[str], live_client=None):
         if action == "list_diagrams":
             if path is None or live_id(path) is None:
                 raise AgentDocumentError("list_diagrams requires an open desktop tab target")
-            result = live_call("document_action", live_id(path), "list_diagrams")
+            diagram_limit = 80 if limit is None else limit
+            if (not isinstance(offset, int) or isinstance(offset, bool) or not 0 <= offset <= 20_000_000
+                    or not isinstance(diagram_limit, int) or isinstance(diagram_limit, bool)
+                    or not 1 <= diagram_limit <= 80):
+                raise AgentDocumentError("diagram offset must be nonnegative and limit must be 1–80")
+            if expected_revision is not None and (not isinstance(expected_revision, str)
+                                                  or not re.fullmatch(r"[0-9a-f]{64}", expected_revision)):
+                raise AgentDocumentError("list_diagrams expected_revision must be a SHA-256 revision")
+            result = live_call("document_action", live_id(path), "list_diagrams",
+                               expected_revision=expected_revision, offset=offset, limit=diagram_limit)
             if not isinstance(result, dict) or not isinstance(result.get("diagrams"), list):
                 raise AgentDocumentError("Desktop returned invalid diagram metadata")
             result = dict(result)
-            result["diagrams"] = result["diagrams"][:50]
+            result["target"] = path
+            return bounded_result(result)
+        if action == "outline":
+            if path is None or live_id(path) is None:
+                raise AgentDocumentError("outline requires an open desktop tab target")
+            outline_limit = 80 if limit is None else limit
+            if (not isinstance(offset, int) or isinstance(offset, bool) or not 0 <= offset <= 20_000_000
+                    or not isinstance(outline_limit, int) or isinstance(outline_limit, bool)
+                    or not 1 <= outline_limit <= 80):
+                raise AgentDocumentError("outline offset must be nonnegative and limit must be 1–80")
+            result = live_call("outline_tab", live_id(path), offset=offset, limit=outline_limit)
+            if not isinstance(result, dict) or not isinstance(result.get("headings"), list):
+                raise AgentDocumentError("Desktop returned invalid outline metadata")
+            result = dict(result)
             result["target"] = path
             return bounded_result(result)
         if action == "get_diagram":
@@ -421,10 +480,11 @@ def build_mcp_server(roots: list[str], live_client=None):
                 raise AgentDocumentError("diagram_id must come from list_diagrams")
             if not isinstance(expected_revision, str) or not re.fullmatch(r"[0-9a-f]{64}", expected_revision):
                 raise AgentDocumentError("get_diagram requires expected_revision from list_diagrams or document_inspect")
-            if not 0 <= offset <= 20_000_000 or not 1 <= limit <= 12_000:
+            diagram_limit = 12_000 if limit is None else limit
+            if not isinstance(offset, int) or isinstance(offset, bool) or not 0 <= offset <= 20_000_000 or not isinstance(diagram_limit, int) or isinstance(diagram_limit, bool) or not 1 <= diagram_limit <= 12_000:
                 raise AgentDocumentError("diagram offset must be nonnegative and limit must be 1–12,000")
             result = live_call("document_action", live_id(path), "get_diagram", diagram_id=diagram_id,
-                               expected_revision=expected_revision, offset=offset, limit=limit)
+                               expected_revision=expected_revision, offset=offset, limit=diagram_limit)
             if not isinstance(result, dict):
                 raise AgentDocumentError("Desktop returned invalid diagram source")
             result["target"] = path
@@ -467,7 +527,8 @@ def build_mcp_server(roots: list[str], live_client=None):
             if not isinstance(result, dict):
                 raise AgentDocumentError("Live bridge returned invalid patch status")
             status = {key: result[key] for key in
-                      ("revision", "previous_revision", "saved", "characters", "operations", "id", "title")
+                      ("revision", "previous_revision", "saved", "characters", "sourceLength", "operations",
+                       "applied", "operation_results", "changed", "isDirty", "id", "tabId", "title")
                       if key in result}
             status["target"] = path
             return bounded_result(status)

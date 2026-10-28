@@ -1,5 +1,5 @@
 export const ACTIONS = new Set(["list_devices", "list_tabs", "read_tab", "search_tab", "patch_tab", "render_tab", "list_diagrams", "get_diagram", "get_diagram_image", "replace_tab_asset", "asset_action", "document_action"]);
-export const DOCUMENT_ACTIONS = new Set(["create", "export", "latexfix", "open", "save", "snapshot", "job_status", "get_context"]);
+export const DOCUMENT_ACTIONS = new Set(["create", "export", "export_chunk", "outline", "latexfix", "latex_review", "latex_apply", "open", "activate", "close", "save", "snapshot", "job_status", "get_context"]);
 export const MAX_FRAME_BYTES = 5 * 1024 * 1024;
 export const MAX_TEXT_BYTES = 64 * 1024;
 export const MAX_PENDING = 8;
@@ -14,6 +14,10 @@ export type RpcRequest = {
   limit?: number;
   query?: string;
   context?: number;
+  caseSensitive?: boolean;
+  wholeWord?: boolean;
+  regex?: boolean;
+  excludeDiagrams?: boolean;
   expectedRevision?: string;
   operations?: unknown[];
   width?: number;
@@ -25,7 +29,7 @@ export type RpcRequest = {
   format?: string;
   repairIndices?: number[];
   jobId?: string;
-  heading?: string;
+  heading?: string | number;
   filename?: string;
   windowId?: string;
   assetId?: string;
@@ -41,6 +45,10 @@ export function validateRpcRequest(value: unknown): RpcRequest {
   if (!value || typeof value !== "object" || Array.isArray(value)) throw new Error("Invalid RPC request");
   const r = value as Record<string, unknown>;
   const allowed = new Set(["requestId", "action", "deviceId", "tabId", "offset", "limit", "query", "context", "expectedRevision", "operations", "width", "imageFormat", "documentAction", "content", "options", "diagramId", "format", "repairIndices", "jobId", "heading", "filename", "windowId", "assetId", "mimeType", "body", "assetName", "assetPath", "assetAction", "view"]);
+  for (const key of ["caseSensitive", "wholeWord", "regex", "excludeDiagrams"]) {
+    allowed.add(key);
+    if (r[key] !== undefined && typeof r[key] !== "boolean") throw new Error(`Invalid ${key}`);
+  }
   if (Object.keys(r).some((key) => !allowed.has(key))) throw new Error("Unknown RPC field");
   if (typeof r.requestId !== "string" || !/^[a-zA-Z0-9_-]{1,96}$/.test(r.requestId)) throw new Error("Invalid request id");
   if (typeof r.action !== "string" || !ACTIONS.has(r.action)) throw new Error("Unsupported action");
@@ -55,7 +63,7 @@ export function validateRpcRequest(value: unknown): RpcRequest {
   if (r.format !== undefined && (typeof r.format !== "string" || !["pdf", "smd", "md"].includes(r.format))) throw new Error("Invalid export format");
   if (r.repairIndices !== undefined && (!Array.isArray(r.repairIndices) || r.repairIndices.length > 40 || r.repairIndices.some((n) => !Number.isInteger(n) || n < 0))) throw new Error("Invalid repair indices");
   if (r.jobId !== undefined && (typeof r.jobId !== "string" || r.jobId.length > 128)) throw new Error("Invalid job id");
-  if (r.heading !== undefined && (typeof r.heading !== "string" || Buffer.byteLength(r.heading) > 512)) throw new Error("Invalid heading");
+  if (r.heading !== undefined && !(typeof r.heading === "string" && Buffer.byteLength(r.heading) <= 512 || typeof r.heading === "number" && Number.isSafeInteger(r.heading) && r.heading >= 0)) throw new Error("Invalid heading");
   if (r.filename !== undefined && (typeof r.filename !== "string" || Buffer.byteLength(r.filename) > 256 || /[\\/\0]/.test(r.filename))) throw new Error("Invalid filename");
   if (r.windowId !== undefined && (typeof r.windowId !== "string" || r.windowId.length > 128)) throw new Error("Invalid window id");
   if (r.assetId !== undefined && (typeof r.assetId !== "string" || r.assetId.length > 512)) throw new Error("Invalid asset id");
@@ -70,14 +78,15 @@ export function validateRpcRequest(value: unknown): RpcRequest {
     const n = r[key];
     if (n !== undefined && (typeof n !== "number" || !Number.isInteger(n) || n < 0)) throw new Error(`Invalid ${key}`);
   }
-  if (typeof r.offset === "number" && r.offset > 20_000_000) throw new Error("Offset is too large");
-  if (typeof r.limit === "number" && r.limit > 12_000) throw new Error("Limit is too large");
+  const exportChunk = r.action === "document_action" && r.documentAction === "export_chunk";
+  if (typeof r.offset === "number" && r.offset > (exportChunk ? 128 * 1024 * 1024 : 20_000_000)) throw new Error("Offset is too large");
+  if (typeof r.limit === "number" && r.limit > (exportChunk ? 524288 : 12_000)) throw new Error("Limit is too large");
   if (typeof r.context === "number" && r.context > 500) throw new Error("Context is too large");
   if (typeof r.width === "number" && (r.width < 1 || r.width > 1600)) throw new Error("Width must be between 1 and 1600");
   if (r.action === "document_action" && (typeof r.documentAction !== "string" || !DOCUMENT_ACTIONS.has(r.documentAction))) throw new Error("Unsupported document action");
   if (["read_tab", "search_tab", "patch_tab", "render_tab", "list_diagrams", "get_diagram", "get_diagram_image", "replace_tab_asset", "asset_action"].includes(r.action) && typeof r.tabId !== "string") throw new Error("tabId is required");
   if (["get_diagram", "get_diagram_image"].includes(r.action) && (!r.diagramId || !r.expectedRevision)) throw new Error("diagram requests need diagramId and expectedRevision");
-  if (["list_diagrams", "replace_tab_asset"].includes(r.action) && !r.expectedRevision) throw new Error("This action needs the current document revision");
+  if (r.action === "replace_tab_asset" && !r.expectedRevision) throw new Error("This action needs the current document revision");
   if (r.action === "replace_tab_asset" && (!r.assetName || !r.assetPath)) throw new Error("Asset replacement requires assetName and assetPath");
   if (r.action === "asset_action") {
     if (!r.expectedRevision) throw new Error("Asset actions need the current document revision");
@@ -92,8 +101,12 @@ export function validateRpcRequest(value: unknown): RpcRequest {
     }
     if (r.assetAction === "attach" && (!/^(?:assets\/)?[A-Za-z0-9._-]{1,150}$/.test(String(r.assetName)) || [".", ".."].includes(String(r.assetName).split("/").at(-1)!))) throw new Error("Invalid new asset name");
   }
-  if (r.action === "document_action" && ["export", "latexfix", "save", "snapshot", "get_context"].includes(String(r.documentAction)) && typeof r.tabId !== "string") throw new Error("tabId is required for this document action");
-  if (r.action === "document_action" && r.documentAction === "job_status" && typeof r.jobId !== "string") throw new Error("job_status requires jobId");
+  if (r.action === "document_action" && ["export", "outline", "latexfix", "latex_review", "latex_apply", "activate", "close", "save", "snapshot", "get_context"].includes(String(r.documentAction)) && typeof r.tabId !== "string") throw new Error("tabId is required for this document action");
+  if (r.action === "document_action" && ["job_status", "export_chunk"].includes(String(r.documentAction)) && typeof r.jobId !== "string") throw new Error("This action requires jobId");
+  if (r.action === "document_action" && ["save", "close", "export", "latex_apply"].includes(String(r.documentAction)) && !r.expectedRevision) throw new Error("This document action requires expectedRevision");
+  if (r.content !== undefined && !(r.action === "document_action" && r.documentAction === "create")) throw new Error("Document content is only accepted for create");
+  if (r.action === "list_diagrams" && r.limit !== undefined && (Number(r.limit) < 1 || Number(r.limit) > 80)) throw new Error("Diagram list limit must be between 1 and 80");
+  if (r.action === "search_tab" && r.limit !== undefined && (Number(r.limit) < 1 || Number(r.limit) > 25)) throw new Error("Search limit must be between 1 and 25");
   if (r.action === "patch_tab" && (!r.expectedRevision || !r.operations)) throw new Error("Patch requires expectedRevision and operations");
   return r as RpcRequest;
 }

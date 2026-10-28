@@ -26,6 +26,12 @@ import java.util.zip.GZIPOutputStream
 class MediaStorage(private val context: Context) {
     private val attachments = File(context.filesDir, "attachments").apply { mkdirs() }
     private val bundles = File(context.filesDir, "portable-assets").apply { mkdirs() }
+
+    fun createEmptyPortableDirectory(): String {
+        val id = UUID.randomUUID().toString()
+        check(File(bundles, id).mkdirs()) { "Could not prepare the portable note's local asset directory" }
+        return id
+    }
     private val key = Regex("assets/[a-zA-Z0-9_.-]{1,150}")
     private fun gzip(output: java.io.OutputStream) = object : GZIPOutputStream(output, 8192) {
         init { def.setLevel(Deflater.BEST_COMPRESSION) }
@@ -215,6 +221,60 @@ class MediaStorage(private val context: Context) {
             }
         } catch (error: Exception) { runCatching { resolver.delete(uri, null, null) }; throw error }
         return JSONObject().put("filename", name).put("bytes", bytes.size).put("mimeType", mime).put("uri", uri.toString())
+    }
+
+    /** Create a new document in the configured SAF folder or the app's Downloads collection. */
+    fun writeAgentDocument(filename: String, mimeType: String, configuredLocation: String?, writer: (Uri, java.io.OutputStream) -> Unit): Pair<Uri, String> {
+        require(filename.isNotBlank() && filename.length <= 240 && filename == filename.substringAfterLast('/').substringAfterLast('\\') &&
+            !filename.contains(Regex("[\\u0000-\\u001f\\u007f]"))) { "Invalid save-as filename" }
+        val mime = mimeType.substringBefore(';').lowercase()
+        require(mime in setOf("text/markdown", "application/vnd.supermd.smd", "application/pdf")) { "Unsupported document format" }
+        val folder = configuredLocation?.takeIf(String::isNotBlank)?.let(Uri::parse)
+        if (folder != null) {
+            require(DocumentsContract.isTreeUri(folder)) { "The configured note location is not a folder; choose it again in Super MD settings" }
+            val parent = androidx.documentfile.provider.DocumentFile.fromTreeUri(context, folder)
+                ?: error("Open the configured folder again to restore access")
+            val name = uniqueName(filename) { parent.findFile(it) != null }
+            val file = parent.createFile(mime, name) ?: error("The configured folder cannot create files")
+            try {
+                context.contentResolver.openOutputStream(file.uri, "w")?.use { writer(file.uri, it) } ?: error("The configured folder cannot write files")
+            } catch (error: Exception) {
+                runCatching { file.delete() }
+                throw error
+            }
+            return file.uri to (file.name ?: name)
+        }
+        require(Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+            "Choose a folder in Settings → New note location before saving to Downloads on this Android version"
+        }
+        val relativePath = Environment.DIRECTORY_DOWNLOADS + "/Super MD"
+        val resolver = context.contentResolver
+        val name = uniqueName(filename) { candidate ->
+            resolver.query(MediaStore.Downloads.EXTERNAL_CONTENT_URI, arrayOf(MediaStore.Downloads._ID),
+                "${MediaStore.Downloads.DISPLAY_NAME}=? AND ${MediaStore.Downloads.RELATIVE_PATH}=?",
+                arrayOf(candidate, "$relativePath/"), null)?.use { it.moveToFirst() } == true
+        }
+        val values = ContentValues().apply {
+            put(MediaStore.Downloads.DISPLAY_NAME, name)
+            put(MediaStore.Downloads.MIME_TYPE, mime)
+            put(MediaStore.Downloads.RELATIVE_PATH, "$relativePath/")
+            put(MediaStore.Downloads.IS_PENDING, 1)
+        }
+        val uri = resolver.insert(MediaStore.Downloads.EXTERNAL_CONTENT_URI, values)
+            ?: error("Android could not create a Downloads entry")
+        try {
+            resolver.openOutputStream(uri, "w")?.use { writer(uri, it) } ?: error("Android could not write the Downloads entry")
+            require(resolver.update(uri, ContentValues().apply { put(MediaStore.Downloads.IS_PENDING, 0) }, null, null) > 0) { "Android could not publish the Downloads entry" }
+        } catch (error: Exception) {
+            runCatching { resolver.delete(uri, null, null) }
+            throw error
+        }
+        return uri to name
+    }
+
+    fun deleteAgentDocument(uri: Uri) {
+        if (uri.authority == MediaStore.AUTHORITY) context.contentResolver.delete(uri, null, null)
+        else androidx.documentfile.provider.DocumentFile.fromSingleUri(context, uri)?.delete()
     }
 
     private fun uniqueName(requested: String, exists: (String) -> Boolean): String {

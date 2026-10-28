@@ -66,6 +66,12 @@ test('live reader serves bounded exact diagram source, visible context and revis
   // Prose can consume a large SVG range in one step, while the returned
   // text stays bounded and exposes the exact omitted source span.
   expect(context.visibleSource.returned_chars).toBeLessThanOrEqual(7000);
+  const snapshotCompute:any=await page.evaluate(({content,tabId,expectedRevision})=>new Promise((resolve,reject)=>{
+    const compute=(window as any).supermdAgentCompute;if(typeof compute!=='function'){reject(new Error('Snapshot compute hook is unavailable'));return;}
+    compute({action:'patch_tab',content,tabId,expectedRevision,operations:[{type:'replace',old:'Tail text.',new:'Snapshot edit.'}]},(result:unknown,error:string)=>error?reject(new Error(error)):resolve(result));
+  }),{content,tabId:'inactive-snapshot',expectedRevision:context.revision});
+  expect(snapshotCompute).toMatchObject({changed:true,applied:1,patchedContent:content.replace('Tail text.','Snapshot edit.')});
+  expect(await page.evaluate(()=>(window as any).__agentNative.content)).toBe(content);
   const sourceCheckLength=Math.min(6000,context.visibleSource.end-context.visibleSource.start);
   const rangeRead:any=await agent(page,{action:'read_tab',tabId:state.id,offset:context.visibleSource.start,
     limit:sourceCheckLength,view:'source',requestId:'context-source-check'});
@@ -75,6 +81,11 @@ test('live reader serves bounded exact diagram source, visible context and revis
 
   const diagrams:any=await agent(page,{action:'list_diagrams',tabId:state.id,requestId:'diagrams'});
   expect(diagrams.diagrams.map((item:any)=>item.kind)).toEqual(['mermaid','svg']);
+  const firstDiagramPage:any=await agent(page,{action:'list_diagrams',tabId:state.id,offset:0,limit:1,requestId:'diagrams-page-1'});
+  expect(firstDiagramPage).toMatchObject({total:2,nextOffset:1,truncated:true});
+  const secondDiagramPage:any=await agent(page,{action:'list_diagrams',tabId:state.id,offset:firstDiagramPage.nextOffset,limit:1,requestId:'diagrams-page-2'});
+  expect(secondDiagramPage).toMatchObject({total:2,nextOffset:null,truncated:false});
+  expect(secondDiagramPage.diagrams[0].id).toBe(diagrams.diagrams[1].id);
   const flow=diagrams.diagrams[0],svgInfo=diagrams.diagrams[1];
   const prose:any=await agent(page,{action:'read_tab',tabId:state.id,offset:svgInfo.sourceStart,limit:12000,view:'prose'});
   expect(prose.text.toLowerCase()).not.toContain('<path id=');
@@ -115,7 +126,7 @@ test('live reader serves bounded exact diagram source, visible context and revis
   expect(afterTyping.text).toBe(Array.from(typedContent).slice(0,100).join(''));
   const patched:any=await agent(page,{action:'patch_tab',tabId:state.id,expectedRevision:afterTyping.revision,
     operations:[{type:'replace',old:'Tail text.',new:'Agent edit.'}],requestId:'agent-patch'});
-  expect(patched.changed).toBe(true);
+  expect(patched.changed).toBe(true);expect(patched.applied).toBe(1);expect(patched.operations).toMatchObject([{operationIndex:0,type:'replace',deltaChars:1}]);
   await expect.poll(()=>page.evaluate(()=>(window as any).__agentNative.content)).toBe(typedContent.replace('Tail text.','Agent edit.'));
   await page.evaluate(()=>window.supermdHistory?.('undo'));
   const onceUndone:any=await agent(page,{action:'read_tab',tabId:state.id,
@@ -163,4 +174,72 @@ test('visible context keeps full document cursors and exact partial selections',
   expect(end.visibleSource.next_offset).toBeNull();
   expect(end.visibleSource.truncated).toBe(false);
   expect(end.visibleSource.text).toContain('End of document.');
+});
+
+test('reader hook paginates outline pages and repeated selected-section source pages',async({page})=>{
+  const body='Long selected body 🧭 continues across source pages.\n'.repeat(360),
+    trailing=Array.from({length:84},(_,index)=>`# Appendix ${index}\nAppendix text ${index}.\n`).join('\n'),
+    content=`# Introduction\n\n## Long Section\n${body}\n## Following Section\nDo not leak this text.\n\n${trailing}`;
+  await page.goto('/android-reader.html');await page.waitForFunction(()=>typeof window.supermdLoad==='function');
+  await page.evaluate(value=>window.supermdLoad?.(value),{id:'agent-section-page-e2e',path:null,content,mode:'editor',dark:false,fullscreen:false,colors:{},font:'Manrope',size:16,zoom:100,restorePosition:false});
+  await expect(page.locator('.cm-content')).toBeVisible();
+  const outline:any=await agent(page,{action:'outline_tab',tabId:'agent-section-page-e2e',offset:0,limit:80});
+  expect(outline).toMatchObject({offset:0,total:87,nextOffset:80,truncated:true,documentLength:Array.from(content).length});
+  expect(outline.headings).toHaveLength(80);
+  const outlineEnd:any=await agent(page,{action:'outline_tab',tabId:'agent-section-page-e2e',offset:outline.nextOffset,limit:80});
+  expect(outlineEnd).toMatchObject({offset:80,total:87,nextOffset:null,truncated:false});
+  expect(outlineEnd.headings.map((heading:any)=>heading.title)).toEqual(['Appendix 77','Appendix 78','Appendix 79','Appendix 80','Appendix 81','Appendix 82','Appendix 83']);
+  let pageResult:any=await agent(page,{action:'read_tab',tabId:'agent-section-page-e2e',heading:'Long Section',view:'source',offset:0,limit:12000});
+  expect(pageResult).toMatchObject({sectionStart:Array.from(content.slice(0,content.indexOf('## Long Section'))).length,documentLength:Array.from(content).length,truncated:true});
+  let combined=pageResult.text;
+  while(pageResult.next_offset!==null){pageResult=await agent(page,{action:'read_tab',tabId:'agent-section-page-e2e',heading:'Long Section',view:'source',offset:pageResult.next_offset,limit:12000});combined+=pageResult.text;}
+  expect(combined).toBe(Array.from(content).slice(outline.headings[1].sectionStart,outline.headings[2].sectionStart).join(''));
+  expect(combined).toContain('Long selected body 🧭');expect(combined).not.toContain('Do not leak this text.');
+});
+
+test('section export prepares MD, SMD and PDF with only selected text and needed external references',async({page})=>{
+  const image='data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+a44kAAAAASUVORK5CYII=';
+  const content='[photo]: https://example.test/photo.png\n[spec]: https://example.test/spec\n[unused]: https://example.test/unused.png\n\n# Selected Section\n\nThis text belongs in the export.\n\n![selected photo][photo]\n\n[Read the specification][spec].\n\n# Following Section\n\nThis text must stay out.\n\n'+('A long paragraph that remains in the original note only.\n\n'.repeat(30));
+  await page.addInitScript(({initial,imageData})=>{
+    const native={content:initial,revision:0,exports:[] as any[],fetches:[] as any[]};(window as any).__agentNative=native;
+    window.SuperMD={post:(id:string,command:string,raw:string)=>{
+      const args=JSON.parse(raw);let result:any=true;
+      if(command==='document_sync')result={accepted:args.content===native.content,revision:native.revision};
+      else if(command==='document_resync'){native.content=args.content;native.revision=0;result={accepted:true,revision:0};}
+      else if(command==='fetch_resource'){native.fetches.push(args);result={body:imageData};}
+      else if(command==='load_asset')result=imageData;
+      else if(command==='agent_export_native'){native.exports.push(args);result={accepted:true,jobId:String(args.requestId)};}
+      window.setTimeout(()=>window.supermdReply?.(id,result,null),0);
+    }};
+  },{initial:content,imageData:image});
+  await page.goto('/android-reader.html');await page.waitForFunction(()=>typeof window.supermdLoad==='function');
+  await page.evaluate(value=>window.supermdLoad?.(value),{id:'agent-section-export-e2e',path:'/tmp/section-export.md',content,mode:'reader',dark:false,fullscreen:false,colors:{},font:'Manrope',size:16,zoom:100,restorePosition:false});
+  await expect(page.getByRole('heading',{name:'Selected Section',exact:true})).toBeVisible();
+  const before=await agent(page,{action:'get_context',tabId:'agent-section-export-e2e'});
+  const reading=page.locator('.android-reading');await reading.evaluate(element=>{element.scrollTop=100;});
+  await page.waitForTimeout(50);
+  const scrollBefore=await reading.evaluate(element=>element.scrollTop),focusBefore=await page.evaluate(()=>document.activeElement?.tagName||null);
+  for(const format of ['md','smd','pdf'] as const){
+    const result:any=await agent(page,{action:'export_document',tabId:'agent-section-export-e2e',format,filename:`selected.${format}`,requestId:`export-${format}`,
+      options:{section:'Selected Section',pageSize:'a4',fontSize:12,margin:10}});
+    expect(result).toMatchObject({accepted:true,jobId:`export-${format}`,sectionStart:Array.from(content.slice(0,content.indexOf('# Selected Section'))).length,documentLength:Array.from(content).length});
+    const call=await page.evaluate(format=>(window as any).__agentNative.exports.find((entry:any)=>entry.format===format),format);
+    expect(call).toMatchObject({id:'agent-section-export-e2e',expectedRevision:(before as any).revision,format,filename:`selected.${format}`,requestId:`export-${format}`,options:{pageSize:'a4',fontSize:12,margin:10}});
+    expect(call.options).not.toHaveProperty('section');
+    expect(call.content).toContain('This text belongs in the export.');expect(call.content).toContain('Read the specification');
+    expect(call.content).not.toContain('This text must stay out.');
+    if(format==='md'){
+      expect(call.content).toContain('![selected photo][photo]');expect(call.content).toContain('[photo]: https://example.test/photo.png');
+      expect(call.content).toContain('[spec]: https://example.test/spec');expect(call.content).not.toContain('[unused]:');
+    }else{
+      expect(call.content).toContain('[spec]: https://example.test/spec');expect(call.content).not.toContain('[unused]:');
+      expect(call.content).toContain('[photo]:');
+      expect(Object.keys(call.assets||{}),`${format} should package only the referenced section image`).toHaveLength(1);
+      if(format==='pdf')expect(call.content).toMatch(/!\[selected photo\]\(asset-1\.png\)/);
+    }
+  }
+  expect(await page.evaluate(()=>(window as any).__agentNative.content)).toBe(content);
+  expect(await reading.evaluate(element=>element.scrollTop)).toBe(scrollBefore);
+  expect(await page.evaluate(()=>document.activeElement?.tagName||null)).toBe(focusBefore);
+  expect(await page.evaluate(()=>(window as any).__agentNative.fetches.length)).toBe(2);
 });

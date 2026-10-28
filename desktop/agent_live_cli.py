@@ -2,8 +2,11 @@
 from __future__ import annotations
 
 import argparse
+import base64
+import hashlib
 import json
 import os
+import re
 import sys
 from pathlib import Path
 from typing import Any
@@ -57,6 +60,7 @@ def _parser() -> argparse.ArgumentParser:
     read.add_argument("tab")
     read.add_argument("--offset", type=int, default=0)
     read.add_argument("--limit", type=int, default=12_000)
+    read.add_argument("--heading", help="Heading index, exact title, slug, or numbered prefix")
     read.add_argument("--view", choices=("prose", "source"), default="prose")
 
     search = sub.add_parser("search", help="Search text in one open tab")
@@ -64,8 +68,13 @@ def _parser() -> argparse.ArgumentParser:
     search.add_argument("query")
     search.add_argument("--limit", type=int, default=10)
     search.add_argument("--context", type=int, default=100)
+    search.add_argument("--offset", type=int, default=0)
+    search.add_argument("--case-sensitive", action="store_true")
+    search.add_argument("--whole-word", action="store_true")
+    search.add_argument("--regex", action="store_true")
+    search.add_argument("--exclude-diagrams", action="store_true")
 
-    patch = sub.add_parser("patch", help="Patch an active tab; run activate first if needed")
+    patch = sub.add_parser("patch", help="Patch an open tab using its current source revision")
     patch.add_argument("tab")
     patch.add_argument("--revision", required=True)
     ops = patch.add_mutually_exclusive_group(required=True)
@@ -75,16 +84,28 @@ def _parser() -> argparse.ArgumentParser:
     create = sub.add_parser("create", help="Create a new unsaved live tab")
     create.add_argument("--content-file", required=True)
     create.add_argument("--title")
-    create.add_argument("--format", choices=("md", "smd"), default="md")
+    create.add_argument("--filename", help="Naming hint; creation never writes a file")
+    create.add_argument("--format", choices=("md", "smd"))
+    create.add_argument("--background", action="store_true", help="Create without changing the active tab")
 
-    save = sub.add_parser("save", help="Save an active tab without overwriting an existing file")
+    save = sub.add_parser("save", help="Save an open tab against its current revision")
     save.add_argument("tab")
     save.add_argument("--revision", required=True)
     save.add_argument("--filename")
-    save.add_argument("--format", choices=("md", "smd"), default="md")
+    save.add_argument("--format", choices=("md", "smd"))
+    save.add_argument("--save-as", action="store_true", help="Save to a new unique filename")
 
-    activate = sub.add_parser("activate", help="Flush the current draft, then activate another listed tab")
+    activate = sub.add_parser("activate", help="Activate another listed tab without losing its draft")
     activate.add_argument("tab")
+
+    close = sub.add_parser("close", help="Close an open tab; dirty notes require explicit discard")
+    close.add_argument("tab")
+    close.add_argument("--revision", required=True)
+    close.add_argument("--discard-changes", action="store_true")
+
+    open_doc = sub.add_parser("open", help="Open an approved existing note in the desktop session")
+    open_doc.add_argument("filename")
+    open_doc.add_argument("--background", action="store_true", help="Open without changing the active tab")
 
     export = sub.add_parser("export", help="Export an active tab; run activate first if needed")
     export.add_argument("tab")
@@ -95,8 +116,12 @@ def _parser() -> argparse.ArgumentParser:
     exp_options.add_argument("--options-json")
     exp_options.add_argument("--options-file")
 
-    job = sub.add_parser("job", help="Read an export job's current status")
+    job = sub.add_parser("job", help="Read an export or open job's current status")
     job.add_argument("job_id")
+
+    download = sub.add_parser("download", help="Download a completed export job without overwriting a file")
+    download.add_argument("job_id")
+    download.add_argument("output")
 
     latex_review = sub.add_parser("latex-review", help="Review proposed LaTeX repairs")
     latex_review.add_argument("tab")
@@ -110,6 +135,8 @@ def _parser() -> argparse.ArgumentParser:
     diagrams = sub.add_parser("diagrams", help="List rendered diagram source references")
     diagrams.add_argument("tab")
     diagrams.add_argument("--revision")
+    diagrams.add_argument("--offset", type=int, default=0)
+    diagrams.add_argument("--limit", type=int, default=80)
 
     diagram = sub.add_parser("diagram", help="Read a bounded source page for one diagram")
     diagram.add_argument("tab")
@@ -184,9 +211,95 @@ def _native_id(value: str) -> str:
     return value[4:] if value.startswith("tab:") else value
 
 
+def _heading_selector(value: str | None) -> int | str | None:
+    if value is None:
+        return None
+    if value.isascii() and value.isdecimal():
+        return int(value)
+    return value
+
+
 def _write_image(path: str, image: dict[str, Any]) -> dict[str, Any]:
     return _write_media(path, image, {"image/png": ".png", "image/jpeg": ".jpg", "image/webp": ".webp"},
                         label="viewport image")
+
+
+def _download_export(live_client, raw_job_id: str, output: str) -> dict[str, Any]:
+    target = Path(output).expanduser()
+    offset = 0
+    metadata = None
+    digest = hashlib.sha256()
+    fd = None
+    file_identity = None
+    try:
+        while True:
+            chunk = live_client.document_action("", "export_chunk", job_id=raw_job_id,
+                                                offset=offset, limit=262_144)
+            if not isinstance(chunk, dict):
+                raise _CLIError("Desktop returned invalid export chunk metadata")
+            filename, fmt, mime = chunk.get("filename"), chunk.get("format"), chunk.get("mimeType")
+            total, expected_hash = chunk.get("bytes"), chunk.get("sha256")
+            if (not isinstance(filename, str) or not filename or Path(filename).name != filename
+                    or fmt not in ("pdf", "smd", "md") or not isinstance(mime, str)
+                    or not isinstance(total, int) or isinstance(total, bool) or total < 0
+                    or not isinstance(expected_hash, str) or not re.fullmatch(r"[0-9a-f]{64}", expected_hash)
+                    or chunk.get("offset") != offset):
+                raise _CLIError("Desktop returned invalid export chunk metadata")
+            current = (filename, fmt, mime, total, expected_hash)
+            if metadata is None:
+                metadata = current
+                flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0)
+                fd = os.open(target, flags, 0o600)
+                created_stat = os.fstat(fd)
+                file_identity = (created_stat.st_dev, created_stat.st_ino)
+            elif current != metadata:
+                raise _CLIError("Export metadata changed during download")
+            encoded = chunk.get("body")
+            if not isinstance(encoded, str) or len(encoded) > 4 * 524_288 // 3 + 8:
+                raise _CLIError("Desktop returned an invalid or oversized export chunk")
+            try:
+                body = base64.b64decode(encoded, validate=True)
+            except (ValueError, base64.binascii.Error) as error:
+                raise _CLIError("Desktop returned an invalid export chunk encoding") from error
+            if not body and offset < total:
+                raise _CLIError("Export download ended before all bytes arrived")
+            next_offset = chunk.get("nextOffset")
+            consumed = offset + len(body)
+            if consumed > total or (next_offset is None and consumed != total) or (
+                    next_offset is not None and (not isinstance(next_offset, int) or isinstance(next_offset, bool)
+                                                 or next_offset != consumed or next_offset >= total)):
+                raise _CLIError("Desktop returned an invalid export chunk cursor")
+            if fd is None:
+                raise _CLIError("Export destination was not created")
+            with os.fdopen(os.dup(fd), "wb") as stream:
+                stream.write(body)
+                stream.flush()
+            digest.update(body)
+            offset = consumed
+            if next_offset is None:
+                break
+        if digest.hexdigest() != metadata[4]:
+            raise _CLIError("Downloaded export did not match its SHA-256 checksum")
+        os.fsync(fd)
+        os.close(fd)
+        fd = None
+        return {"path": str(target.resolve()), "filename": metadata[0], "format": metadata[1],
+                "mimeType": metadata[2], "bytes": offset, "sha256": digest.hexdigest()}
+    except Exception:
+        if fd is not None:
+            try:
+                os.close(fd)
+            except OSError:
+                pass
+        if file_identity is not None:
+            try:
+                current = target.stat(follow_symlinks=False)
+                if (not target.is_symlink() and current.st_size >= 0
+                        and (current.st_dev, current.st_ino) == file_identity):
+                    target.unlink()
+            except OSError:
+                pass
+        raise
 
 
 def _write_media(path: str, image: dict[str, Any], extensions: dict[str, str], *, label: str) -> dict[str, Any]:
@@ -267,9 +380,13 @@ def main(argv: list[str] | None = None) -> int:
         elif args.command == "context":
             result = client.document_action(tab, "get_context", limit=args.limit)
         elif args.command == "read":
-            result = client.read_tab(tab, offset=args.offset, limit=args.limit, view=args.view)
+            result = client.read_tab(tab, offset=args.offset, limit=args.limit, view=args.view,
+                                     heading=_heading_selector(args.heading))
         elif args.command == "search":
-            result = client.search_tab(tab, args.query, limit=args.limit, context=args.context)
+            result = client.search_tab(tab, args.query, limit=args.limit, context=args.context,
+                                       offset=args.offset, case_sensitive=args.case_sensitive,
+                                       whole_word=args.whole_word, regex=args.regex,
+                                       exclude_diagrams=args.exclude_diagrams)
         elif args.command == "patch":
             ops_text = args.operations_json if args.operations_json is not None else _read_limited(args.operations_file, MAX_INPUT, "operations file")
             operations = _json_object_or_array(ops_text, "operations")
@@ -278,13 +395,22 @@ def main(argv: list[str] | None = None) -> int:
             result = client.patch_tab(tab, expected_revision=args.revision, operations=operations)
         elif args.command == "create":
             content = _read_limited(args.content_file, MAX_CONTENT, "content file")
+            requested_name = args.title or args.filename or ""
+            document_format = args.format or ("smd" if Path(requested_name).suffix.lower() == ".smd" else "md")
             result = client.document_action(None, "create_document", content=content,
-                                            title=args.title, format=args.format)
+                                            title=args.title or "", filename=args.filename or "", format=document_format,
+                                            background=args.background)
         elif args.command == "save":
             result = client.document_action(tab, "save_document", expected_revision=args.revision,
-                                            filename=args.filename, format=args.format)
+                                            filename=args.filename or "", format=args.format, save_as=args.save_as)
         elif args.command == "activate":
-            result = client.document_action(tab, "open_document", filename="")
+            result = client.document_action(tab, "activate_document")
+        elif args.command == "close":
+            result = client.document_action(tab, "close_document", expected_revision=args.revision,
+                                            discard_changes=args.discard_changes)
+        elif args.command == "open":
+            result = client.document_action(None, "open_document", filename=args.filename,
+                                            background=args.background)
         elif args.command == "export":
             options_text = None
             if args.options_json is not None:
@@ -300,8 +426,18 @@ def main(argv: list[str] | None = None) -> int:
         elif args.command == "job":
             # A CLI invocation is intentionally stateless, so the MCP adapter's
             # in-memory job alias table is unavailable on subsequent commands.
-            # Export IDs use `session-id:raw-job-id`; the bridge owns lookup by
+            # Job IDs use `session-id:raw-job-id`; the bridge owns lookup by
             # raw ID and does not require the source tab to stay selected.
+            client.list_tabs()
+            session_id, separator, raw_job_id = args.job_id.partition(":")
+            if not separator or not session_id or not raw_job_id:
+                raise _CLIError("Job ID must be copied from a live create, open, or export result")
+            saved = client._sessions.get(session_id)
+            if not saved:
+                raise _CLIError("Export session is no longer available")
+            live_client, _tab_map = saved
+            result = live_client.document_action("", "job_status", job_id=raw_job_id)
+        elif args.command == "download":
             client.list_tabs()
             session_id, separator, raw_job_id = args.job_id.partition(":")
             if not separator or not session_id or not raw_job_id:
@@ -310,14 +446,15 @@ def main(argv: list[str] | None = None) -> int:
             if not saved:
                 raise _CLIError("Export session is no longer available")
             live_client, _tab_map = saved
-            result = live_client.document_action("", "job_status", job_id=raw_job_id)
+            result = _download_export(live_client, raw_job_id, args.output)
         elif args.command == "latex-review":
             result = client.document_action(tab, "latex_review")
         elif args.command == "latex-apply":
             result = client.document_action(tab, "latex_apply", expected_revision=args.revision,
                                             repair_indices=_parse_indices(args.indices))
         elif args.command == "diagrams":
-            result = client.document_action(tab, "list_diagrams", expected_revision=args.revision)
+            result = client.document_action(tab, "list_diagrams", expected_revision=args.revision,
+                                            offset=args.offset, limit=args.limit)
         elif args.command == "diagram":
             result = client.document_action(tab, "get_diagram", diagram_id=args.diagram_id,
                                             expected_revision=args.revision,

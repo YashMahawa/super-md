@@ -2,7 +2,7 @@ import { createRoot } from "react-dom/client";
 import {flushSync} from 'react-dom';
 import {createGapSelection,type GapSelection} from './gapSelection';
 import {FrameScrollQueue,zoomFrameStep} from './frameMotion';
-import {agentCharLength,agentOutline,agentRead,agentRevision,agentSearch,applyAgentPatches} from './agentOperations';
+import {agentCharLength,agentOutlinePage,agentRead,agentRevision,agentSearch,agentSectionForExport,applyAgentPatchesDetailed} from './agentOperations';
 import {suggestMathRepairs,applyMathRepairs} from './mathRepair';
 import {agentDiagrams,diagramMetadata,diagramMedia,visibleSourceRange} from './agentView';
 import {mediaBytes} from './mediaExport';
@@ -53,12 +53,42 @@ interface PdfExportStatus {id:string;phase:'preparing'|'typesetting'|'publishing
 
 interface NoteView { editor?: PortableEditorSession; history?:NoteHistory; top?: number; rendered?: ReturnType<typeof exportRenderedViews> }
 interface ReaderState extends ReaderAccessibilityPreference { id: string; content: string; path: string | null; mode: "live" | "editor" | "reader" | "split"; dark: boolean; fullscreen: boolean; font: string; size: number; latexAutofix?:boolean;spellCheck?:boolean; grammarCheck?:boolean; width?: number; widthPercent?:number; lineHeight?:number; colors: Record<string, string>; zoom: number; motion?: boolean; python?: string; viewState?: NoteView }
-declare global { interface Window {supermdAgentRequest?:(request:Record<string,unknown>,callback?:(result:unknown,error:string)=>void)=>void;supermdThemeGuide?:()=>void;supermdDismiss?:()=>boolean;supermdSetZoom?:(zoom:number,requestedAt?:number)=>void;supermdHeading?:(id:string,offset?:number)=>void;supermdHistory?:(direction:"undo"|"redo")=>void;supermdNativeWheel?:(dx:number,dy:number,point:Point,held:boolean,modifier?:boolean)=>void;} }
+declare global { interface Window {supermdAgentRequest?:(request:Record<string,unknown>,callback?:(result:unknown,error:string)=>void)=>void;supermdAgentCompute?:(request:Record<string,unknown>,callback:(result:unknown,error:string)=>void)=>void;supermdThemeGuide?:()=>void;supermdDismiss?:()=>boolean;supermdSetZoom?:(zoom:number,requestedAt?:number)=>void;supermdHeading?:(id:string,offset?:number)=>void;supermdHistory?:(direction:"undo"|"redo")=>void;supermdNativeWheel?:(dx:number,dy:number,point:Point,held:boolean,modifier?:boolean)=>void;} }
 declare global { interface Window { supermdLoad?: (state: ReaderState) => void; supermdExport?: (options: ExportOptions) => void; supermdExportMarkdown?: () => void; supermdFind?: () => void; supermdPortable?: (save: boolean) => void; supermdZoomBy?: (factor:number,focus?:Point)=>void; supermdResetZoom?: ()=>void; supermdRepairMath?: ()=>void; supermdFlush?: (operation:Record<string,string>)=>void } }
 declare global { interface Window {supermdChromeInset?:(height:number)=>void} }
 declare global { interface Window {supermdSavePosition?:()=>void} }
 declare global {interface Window {supermdExportPhase?:(id:string,phase:'typesetting'|'publishing')=>void}}
 interface ReaderState { centerLock?:boolean; customStyle?:CustomStyle; restorePosition?:boolean; readingLocation?:ReadingLocation|null; imageAppearance?:MediaAppearance; svgAppearance?:MediaAppearance; imageContrast?:number }
+/** Pure snapshot operations for native-owned inactive tabs. `content` is added
+ * only by the trusted native router and is never accepted from MCP requests. */
+export async function computeAgentDocumentRequest(request:Record<string,unknown>):Promise<Record<string,unknown>> {
+  const content=request.content,tabId=request.tabId,action=request.action;
+  if(typeof content!=='string'||typeof tabId!=='string')throw Error('Native document snapshot is required');
+  const revision=await agentRevision(content),sourceLength=agentCharLength(content),base={tabId,revision,sourceLength};
+  if(request.expectedRevision!==undefined&&request.expectedRevision!==revision)throw Error('Revision conflict: the note changed; read it again before editing');
+  if(action==='read_tab')return {...base,...agentRead(content,request.offset,request.limit,request.heading,request.view)};
+  if(action==='outline_tab')return {...base,...agentOutlinePage(content,request.offset,request.limit)};
+  if(action==='search_tab')return {...base,...agentSearch(content,request.query,request.limit,request.context,{offset:request.offset,caseSensitive:request.caseSensitive,wholeWord:request.wholeWord,regex:request.regex,excludeDiagrams:request.excludeDiagrams})};
+  if(action==='list_diagrams'){
+    const diagrams=agentDiagrams(content),offset=request.offset===undefined?0:request.offset,limit=request.limit===undefined?80:request.limit;
+    if(typeof offset!=='number'||!Number.isInteger(offset)||offset<0)throw Error('diagram offset must be a nonnegative integer');
+    if(typeof limit!=='number'||!Number.isInteger(limit)||limit<1||limit>80)throw Error('diagram limit must be 1–80');
+    if(offset>diagrams.length)throw Error(`diagram offset must be between 0 and ${diagrams.length}`);
+    const end=Math.min(diagrams.length,offset+limit);return {...base,diagrams:diagrams.slice(offset,end).map(item=>diagramMetadata(content,item)),total:diagrams.length,nextOffset:end<diagrams.length?end:null,truncated:end<diagrams.length};
+  }
+  if(action==='get_diagram'){
+    if(request.expectedRevision!==revision)throw Error('A current expectedRevision is required to retrieve this diagram');
+    const diagram=agentDiagrams(content).find(item=>item.id===request.diagramId);if(!diagram)throw Error('Diagram not found in this revision');
+    return {...base,...diagramMetadata(content,diagram),...agentRead(diagram.source,request.offset,request.limit,undefined,'source'),sourceLength};
+  }
+  if(action==='patch_tab'){
+    if(typeof request.expectedRevision!=='string'||request.expectedRevision!==revision)throw Error('A current expectedRevision is required to edit a tab');
+    const patch=applyAgentPatchesDetailed(content,request.operations);
+    return {...base,baseRevision:revision,baseSourceLength:sourceLength,revision:await agentRevision(patch.text),sourceLength:agentCharLength(patch.text),changed:patch.text!==content,applied:patch.applied,operations:patch.operations,patchedContent:patch.text};
+  }
+  if(action==='get_diagram_image')throw Error('Diagram image requests require the active reader view');
+  throw Error('Unsupported snapshot agent action');
+}
 function Reader() {
   const [state, setState] = useState<ReaderState | null>(null);
   const readerAnalysis=useMemo(()=>state?readerSourceAnalysis(state.mode,state.content):null,[state?.mode,state?.content]);
@@ -559,6 +589,7 @@ function Reader() {
   }, []);
   useEffect(()=>{
     let pending=false,disposed=false;
+    window.supermdAgentCompute=(request,callback)=>{void computeAgentDocumentRequest(request).then(result=>callback(result,''),error=>callback(null,error instanceof Error?error.message:'Agent request failed'));};
     window.supermdAgentRequest=(request,callback)=>{
       const reply=(result:unknown,error='')=>{if(disposed)return;if(callback)callback(result,error);else void invoke('agent_result',{requestId:request.requestId,result,error});};
       if(pending){reply(null,'The reader is handling another agent request; retry shortly.');return;}
@@ -578,10 +609,14 @@ function Reader() {
         if(request.tabId!==undefined&&request.tabId!==note.id)throw Error('Select this tab before requesting its live reader');
         if(request.expectedRevision!==undefined&&request.expectedRevision!==revision)throw Error('Revision conflict: the note changed; read it again before editing');
         if(request.action==='read_tab')return {...base,...agentRead(note.content,request.offset,request.limit,request.heading,request.view)};
-        if(request.action==='outline_tab'){const headings=agentOutline(note.content);return {...base,headings:headings.slice(0,80),total:headings.length,truncated:headings.length>80};}
-        if(request.action==='search_tab')return {...base,...agentSearch(note.content,request.query,request.limit,request.context)};
+        if(request.action==='outline_tab')return {...base,...agentOutlinePage(note.content,request.offset,request.limit)};
+        if(request.action==='search_tab')return {...base,...agentSearch(note.content,request.query,request.limit,request.context,{offset:request.offset,caseSensitive:request.caseSensitive,wholeWord:request.wholeWord,regex:request.regex,excludeDiagrams:request.excludeDiagrams})};
         if(request.action==='list_diagrams'){
-          const diagrams=agentDiagrams(note.content);return {...base,diagrams:diagrams.slice(0,80).map(item=>diagramMetadata(note.content,item)),total:diagrams.length,truncated:diagrams.length>80};
+          const diagrams=agentDiagrams(note.content),offset=request.offset===undefined?0:request.offset,limit=request.limit===undefined?80:request.limit;
+          if(typeof offset!=='number'||!Number.isInteger(offset)||offset<0)throw Error('diagram offset must be a nonnegative integer');
+          if(typeof limit!=='number'||!Number.isInteger(limit)||limit<1||limit>80)throw Error('diagram limit must be 1–80');
+          if(offset>diagrams.length)throw Error(`diagram offset must be between 0 and ${diagrams.length}`);
+          const end=Math.min(diagrams.length,offset+limit);return {...base,diagrams:diagrams.slice(offset,end).map(item=>diagramMetadata(note.content,item)),total:diagrams.length,nextOffset:end<diagrams.length?end:null,truncated:end<diagrams.length};
         }
         if(request.action==='get_diagram'||request.action==='get_diagram_image'){
           if(request.expectedRevision!==revision)throw Error('A current expectedRevision is required to retrieve this diagram');
@@ -617,29 +652,36 @@ function Reader() {
         }
         if(request.action==='patch_tab'||request.action==='latex_apply'){
           if(typeof request.expectedRevision!=='string'||request.expectedRevision!==revision)throw Error('A current expectedRevision is required to edit a tab');
-          let content:string,applied=0;
+          let content:string,applied=0,patchOperations:unknown[]|undefined;
           if(request.action==='latex_apply'){
             const selected=request.repairIndices;
             if(!Array.isArray(selected)||!selected.length||selected.length>40||selected.some(index=>!Number.isInteger(index)||index<0))throw Error('Choose 1–40 repairIndices from latex_review');
             const repairs=suggestMathRepairs(note.content),indices=Array.from(new Set(selected)) as number[];
             if(indices.some(index=>index>=repairs.length))throw Error('A selected repair is no longer available');
             content=applyMathRepairs(note.content,indices.map(index=>repairs[index]));applied=indices.length;
-          }else content=applyAgentPatches(note.content,request.operations);
+          }else {const patch=applyAgentPatchesDetailed(note.content,request.operations);content=patch.text;applied=patch.applied;patchOperations=patch.operations;}
           if(reference.current?.id!==note.id||reference.current.content!==note.content)throw Error('Revision conflict: typing changed the note before the edit');
           const history=histories.current.get(note.id);if(history)history.last=0;
           update(content);const nextHistory=histories.current.get(note.id);if(nextHistory)nextHistory.last=0;
           if((note as ReaderState&{editProtocol?:number}).editProtocol===1)await edits.current!.flush(note.id);
-          return {tabId:note.id,revision:await agentRevision(content),changed:content!==note.content,applied};
+          const response:{tabId:string;revision:string;changed:boolean;applied:number;operations?:unknown[]}={tabId:note.id,revision:await agentRevision(content),changed:content!==note.content,applied};
+          if(patchOperations)response.operations=patchOperations;
+          return response;
         }
         if(request.action==='export_document'){
           const format=request.format;if(!['pdf','smd','md'].includes(String(format)))throw Error('Export format must be pdf, smd or md');
-          const prepared=format==='pdf'?await preparePdf(note.content,note.path,note.python||'embedded'):format==='smd'?await prepareFmd(note.content,note.path):{content:note.content};
-          return await invoke('agent_export_native',{...prepared,id:note.id,expectedRevision:revision,requestId:request.requestId,format,filename:request.filename,options:request.options});
+          const suppliedOptions=request.options&&typeof request.options==='object'&&!Array.isArray(request.options)?request.options as Record<string,unknown>:{};
+          const hasSection=Object.prototype.hasOwnProperty.call(suppliedOptions,'section'),section=hasSection?agentSectionForExport(note.content,suppliedOptions.section):undefined;
+          const exportContent=section?.text??note.content,{section:_section,...exportOptions}=suppliedOptions;
+          const prepared=format==='pdf'?await preparePdf(exportContent,note.path,note.python||'embedded'):format==='smd'?await prepareFmd(exportContent,note.path):{content:exportContent};
+          if(reference.current?.id!==note.id||reference.current.content!==note.content)throw Error('Revision conflict: the note changed while preparing the export');
+          const result=await invoke<Record<string,unknown>>('agent_export_native',{...prepared,id:note.id,expectedRevision:revision,requestId:request.requestId,format,filename:request.filename,options:exportOptions});
+          return section?{...result,sectionStart:section.sectionStart,sectionEnd:section.sectionEnd,documentLength:section.documentLength}:result;
         }
         throw Error('Unsupported live reader action');
       })().then(result=>reply(result),error=>reply(null,error instanceof Error?error.message:'Agent request failed')).finally(()=>{pending=false;});
     };
-    return()=>{disposed=true;delete window.supermdAgentRequest;};
+    return()=>{disposed=true;delete window.supermdAgentRequest;delete window.supermdAgentCompute;};
   },[update]);
   if (!state) return <div className="reader-loading" role="status"><span className="expressive-loading-shape" aria-hidden="true"/>Opening your workspace</div>;
   return <DocumentAppearance.Provider value={documentAppearance}><div className={`android-document mode-${state.mode}`}>
