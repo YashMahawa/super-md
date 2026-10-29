@@ -6,19 +6,23 @@ import { captureWindowedScrollAnchor } from './windowedSearch';
 import { refreshDocumentExtent } from './documentZoom';
 import { flushSync } from 'react-dom';
 
-vi.mock('./scrollAnchor', () => ({
+vi.mock('./scrollAnchor', async (importOriginal) => ({
+  ...(await importOriginal<typeof import('./scrollAnchor')>()),
   captureScrollAnchor: vi.fn(),
 }));
 
-vi.mock('./windowedSearch', () => ({
+vi.mock('./windowedSearch', async (importOriginal) => ({
+  ...(await importOriginal<typeof import('./windowedSearch')>()),
   captureWindowedScrollAnchor: vi.fn(),
 }));
 
-vi.mock('./documentZoom', () => ({
+vi.mock('./documentZoom', async (importOriginal) => ({
+  ...(await importOriginal<typeof import('./documentZoom')>()),
   refreshDocumentExtent: vi.fn(),
 }));
 
-vi.mock('react-dom', () => ({
+vi.mock('react-dom', async (importOriginal) => ({
+  ...(await importOriginal<typeof import('react-dom')>()),
   flushSync: vi.fn((fn: () => void) => fn()),
 }));
 
