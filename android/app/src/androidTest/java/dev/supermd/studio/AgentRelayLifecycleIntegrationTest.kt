@@ -30,7 +30,7 @@ class AgentRelayLifecycleIntegrationTest {
     @Test fun completedPortableExportDownloadsBoundedChunksWithRealEmbeddedAssetBytes() {
         val app = ApplicationProvider.getApplicationContext<Application>()
         val workspace = UUID.randomUUID().toString()
-        val jobId = "download_${UUID.randomUUID().toString().replace("-", "")}" 
+        val jobId = "download_${UUID.randomUUID().toString().replace("-", "")}"
         val svg = "<svg xmlns='http://www.w3.org/2000/svg'><path d='M1 2'/></svg>".toByteArray()
         val media = MediaStorage(app)
         val export = File(app.cacheDir, "agent-export-${UUID.randomUUID()}.smd")
@@ -83,7 +83,7 @@ class AgentRelayLifecycleIntegrationTest {
             val downloadedAsset = media.decodePortableImage(media.portableAssets(opened.directory).getString("assets/photo.svg")).second
             assertArrayEquals("The downloaded portable file contains the original image bytes", svg, downloadedAsset)
 
-            val emptyJobId = "empty_${UUID.randomUUID().toString().replace("-", "")}" 
+            val emptyJobId = "empty_${UUID.randomUUID().toString().replace("-", "")}"
             scenario.onActivity { owner ->
                 owner.requestAgentExport(JSONObject().put("requestId", emptyJobId).put("expectedRevision", "a".repeat(64)))
                 owner.updateAgentExportJob(emptyJobId, "saving")
@@ -137,6 +137,9 @@ class AgentRelayLifecycleIntegrationTest {
             waitUntil(20_000) { model?.state?.value?.autosave == false && model?.state?.value?.tabs?.isNotEmpty() == true }
             awaitBridge(scenario, handler)
             val initial = model!!.state.value.active
+            assertEquals(initial.id, model!!.state.value.activeId)
+            val visibleDraft = evaluateReaderText(scenario)
+            assertTrue("Lifecycle test needs visible reader content", visibleDraft.length > 2)
 
             val created = call(scenario, handler, "document_action", JSONObject()
                 .put("documentAction", "create").put("content", "😀 # Before patch\n")
@@ -146,6 +149,7 @@ class AgentRelayLifecycleIntegrationTest {
             val background = model!!.state.value.tabs.first { it.name == "Background draft.md" }
             assertFalse(createResult.getBoolean("active"))
             assertEquals(initial.id, model!!.state.value.activeId)
+            assertEquals("Background creation must preserve the focused reader draft", visibleDraft, evaluateReaderText(scenario))
             val baseRevision = sha256(background.content)
 
             val read = call(scenario, handler, "read_tab", JSONObject().put("tabId", background.id)
@@ -165,6 +169,7 @@ class AgentRelayLifecycleIntegrationTest {
             assertTrue(patchedNote.content.contains("After patch 🚀"))
             assertEquals(patchedNote.content.codePointCount(0, patchedNote.content.length), patchResult.getInt("sourceLength"))
             assertEquals(initial.id, model!!.state.value.activeId)
+            assertEquals("Inactive patching must not replace the focused reader draft", visibleDraft, evaluateReaderText(scenario))
 
             val staleRead = call(scenario, handler, "read_tab", JSONObject().put("tabId", background.id)
                 .put("expectedRevision", baseRevision))
@@ -362,6 +367,18 @@ class AgentRelayLifecycleIntegrationTest {
             Thread.sleep(20)
         }
         assertTrue("Condition timed out", condition())
+    }
+
+    private fun evaluateReaderText(scenario: ActivityScenario<MainActivity>): String {
+        val reply = AtomicReference<String?>(null)
+        val latch = CountDownLatch(1)
+        scenario.onActivity { owner ->
+            findWebView(owner.window.decorView)?.evaluateJavascript(
+                "document.querySelector('.cm-content')?.textContent ?? document.querySelector('.markdown-body')?.textContent ?? ''",
+            ) { value -> reply.set(value); latch.countDown() } ?: latch.countDown()
+        }
+        assertTrue("Reader did not return its visible document text", latch.await(10, TimeUnit.SECONDS))
+        return requireNotNull(reply.get()) { "Reader WebView was unavailable" }
     }
 
     private fun findWebView(view: View): WebView? = when (view) {

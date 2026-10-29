@@ -114,7 +114,7 @@ class AgentCLIWorkflowTests(unittest.TestCase):
     def test_read_accepts_a_numbered_heading_selector_and_pages_the_section(self):
         source = "😀 preamble\n# Intro\n\n## 7.4 Methods\nFirst paragraph.\n### Nested\nNested paragraph.\n## 7.40 Other\nMust stay out.\n"
         note = self.root / "numbered.md"
-        note.write_text(source, encoding="utf-8")
+        note.write_bytes(source.encode("utf-8"))
         first = self.run_cli("read", note.name, "--heading", "7.4", "--limit", 24, "--view", "source")["result"]
         self.assertEqual(first["sectionStart"], len(source[:source.index("## 7.4 Methods")]))
         self.assertEqual(first["sectionEnd"], len(source[:source.index("## 7.40 Other")]))

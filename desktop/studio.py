@@ -2467,6 +2467,10 @@ class Studio(QObject):
             if fmt not in ("md", "smd"):
                 raise ValueError("Save format must be md or smd")
             old_path = tab["path"]
+            try:
+                old_canonical_path = str(Path(old_path).resolve(strict=True)) if old_path else ""
+            except (OSError, RuntimeError):
+                old_canonical_path = ""
             save_as = bool(args.get("saveAs", False)) or bool(args.get("filename"))
             if not isinstance(args.get("saveAs", False), bool):
                 raise ValueError("saveAs must be a boolean")
@@ -2515,14 +2519,15 @@ class Studio(QObject):
                     except OSError:
                         pass
                 raise
-            path_changed = str(path) != old_path
+            path_changed = not old_canonical_path or str(path) != old_canonical_path
             tab.update(path=str(path), name=path.name, saved=tab["content"], portable=fmt == "smd")
             tab["saved_assets"] = copy.deepcopy(tab["assets"])
             self._agent_open_paths.add(str(path.resolve()))
             self._recover(); self._emit()
             return {"tabId": tab_id, "windowId": self.window_id, "path": str(path),
                     "filename": path.name, "revision": revision, "format": fmt, "isDirty": False,
-                    "pathChanged": path_changed, "oldPath": old_path, "newPath": str(path)}
+                    "pathChanged": path_changed, "oldPath": old_canonical_path or old_path,
+                    "newPath": str(path)}
         if action == "activate_document":
             tab_id = args.get("tabId")
             tab = next((item for item in self.tabs if item["id"] == tab_id), None)
@@ -2609,6 +2614,19 @@ class Studio(QObject):
     def _agent_path_allowed(self, path: Path) -> bool:
         """Check open targets against user-selected note roots and session paths."""
         absolute = Path(os.path.abspath(path))
+        # On macOS /var is the system-provided alias for /private/var. Resolve
+        # this one known alias before checking path components so a temporary
+        # folder selected through /var remains usable, while symlinks inside
+        # the selected note root are still rejected below.
+        if sys.platform == "darwin":
+            alias = Path("/var")
+            canonical = Path("/private/var")
+            try:
+                if (alias.is_symlink() and alias.resolve(strict=True) == canonical.resolve(strict=True)
+                        and (absolute == alias or alias in absolute.parents)):
+                    absolute = canonical / absolute.relative_to(alias)
+            except (OSError, RuntimeError):
+                pass
         try:
             if not absolute.is_file(): return False
             # Refuse symlinks in every component, including the selected file.

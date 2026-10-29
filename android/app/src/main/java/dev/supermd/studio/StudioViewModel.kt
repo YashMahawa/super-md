@@ -500,12 +500,14 @@ class StudioViewModel(app: Application, val workspaceKey: String = "main") : And
             val tabs=if(s.startup=="new")listOf(Note())+kept else kept.ifEmpty {listOf(Note())}
             s=s.copy(tabs=tabs,activeId=if(s.startup=="new")tabs.first().id else s.activeId)
         }
+        if (s.tabs.isEmpty()) s = s.copy(tabs = listOf(Note()))
         val activeIds=s.tabs.map {it.id}.toSet()
+        val activeId = s.activeId.takeIf { it in activeIds } ?: s.tabs.first().id
         val indexResult=runCatching {closedNoteStore.loadIndexStrict()}
         if(indexResult.isSuccess)closedNoteIndexError=null else closedNoteIndexError=indexResult.exceptionOrNull()?.message ?: "invalid closed-note index"
         val refs=indexResult.getOrDefault(emptyList()).filterNot {it.id in activeIds}.take(ClosedNoteStore.LIMIT)
         closedNoteRefs=refs
-        return s.copy(closedTabs=closedNotesForRestore(refs,s.closedTabs,activeIds,indexResult.isSuccess),
+        return s.copy(activeId=activeId, closedTabs=closedNotesForRestore(refs,s.closedTabs,activeIds,indexResult.isSuccess),
             error=closedNoteIndexError?.let {"Closed-note recovery index could not be read; historical snapshots were left untouched. $it"} ?: s.error)
     }
     private fun readingPreferences(s:StudioState)=s.copy(patternKind=prefs.getString("patternKind","")?:"",patternOpacity=prefs.getFloat("patternOpacity",-1f),patternSize=prefs.getFloat("patternSize",0f),patternSpacing=prefs.getFloat("patternSpacing",0f),centerLock=prefs.getBoolean("centerLock",true),restorePosition=prefs.getBoolean("restorePosition",true),fullDocumentAccessibility=prefs.getBoolean("fullDocumentAccessibility",false),startup=prefs.getString("startup","restore") ?: "restore",imageAppearance=prefs.getString("imageAppearance","original") ?: "original",svgAppearance=prefs.getString("svgAppearance","original") ?: "original",imageContrast=prefs.getFloat("imageContrast",1.25f))
@@ -659,7 +661,10 @@ class StudioViewModel(app: Application, val workspaceKey: String = "main") : And
             val assets = if (format == "smd") media.createEmptyPortableDirectory() else null
             val note = Note(name = title, content = content ?: "", assetDirectory = assets)
             val accepted = performReaderBarrier(expected) {
-                    change { state -> state.copy(tabs = state.tabs + note, activeId = if (background) state.activeId else note.id) }
+                    change { state ->
+                        val preservedId = state.tabs.firstOrNull { it.id == state.activeId }?.id ?: state.tabs.firstOrNull()?.id ?: note.id
+                        state.copy(tabs = state.tabs + note, activeId = if (background) preservedId else note.id)
+                    }
                 }
             if (!accepted) {
                 assets?.let { File(getApplication<Application>().filesDir, "portable-assets/$it").deleteRecursively() }

@@ -276,10 +276,10 @@ Pane {
         id: shortcutsPopup
         objectName: "shortcutsPopup"
         parent: Overlay.overlay
-        x: Math.max(16, (page.Window.window.width - width) / 2)
-        y: Math.max(16, (page.Window.window.height - height) / 2)
-        width: Math.min(560, page.Window.window.width - 32)
-        height: Math.min(680, page.Window.window.height - 32)
+        x: page.Window.window ? Math.max(16, (page.Window.window.width - width) / 2) : 16
+        y: page.Window.window ? Math.max(16, (page.Window.window.height - height) / 2) : 16
+        width: page.Window.window ? Math.max(1, Math.min(560, page.Window.window.width - 32)) : 560
+        height: page.Window.window ? Math.max(1, Math.min(680, page.Window.window.height - 32)) : 680
         padding: 20
         modal: true
         focus: true

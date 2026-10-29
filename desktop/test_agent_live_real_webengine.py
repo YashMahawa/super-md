@@ -1,9 +1,23 @@
 """Real QML/WebEngine viewport and live CLI integration in an isolated process."""
 from __future__ import annotations
-import json, os, subprocess, sys, tempfile, unittest, time
+import json, os, queue, subprocess, sys, tempfile, threading, unittest, time
 from pathlib import Path
 
 ROOT=Path(__file__).resolve().parent
+
+def _drain_process_output(process):
+    """Start draining both child pipes before the child can fill either one."""
+    completed = queue.Queue(maxsize=1)
+    def collect():
+        try:
+            stdout, stderr = process.communicate()
+            completed.put(((process.returncode, stdout, stderr), None))
+        except BaseException as error:
+            completed.put((None, error))
+    thread = threading.Thread(target=collect, name="supermd-cli-output", daemon=True)
+    thread.start()
+    return completed, thread
+
 
 def _probe(directory: str) -> int:
     os.environ["QT_QPA_PLATFORM"]="offscreen"
@@ -58,7 +72,9 @@ def _probe(directory: str) -> int:
         command=[sys.executable,str(cli),"live","--sessions-dir",sessions,*map(str,arguments)]
         process=subprocess.Popen(command,cwd=ROOT,stdout=subprocess.PIPE,stderr=subprocess.PIPE,text=True,
                                  env=dict(os.environ,QT_QPA_PLATFORM="invalid"))
-        state["proc"]=process; state["key"]=key; state["stage"]=key; state["expect_error"]=expect_error
+        capture, drain_thread = _drain_process_output(process)
+        state["proc"]=process; state["capture"]=capture; state["drain_thread"]=drain_thread
+        state["key"]=key; state["stage"]=key; state["expect_error"]=expect_error
         QTimer.singleShot(5,poll)
     def begin_cli_after_pending_typing():
         state["stage"]="open textarea and type pending draft"
@@ -109,9 +125,8 @@ def _probe(directory: str) -> int:
             QTimer.singleShot(50,wait_for_pending_edit)
         typing_deadline=time.monotonic()+12
         QTimer.singleShot(50,wait_for_pending_edit)
-    def parse_output(process,key):
-        stdout,stderr=process.communicate()
-        if process.returncode!=0:
+    def parse_output(process,key,returncode,stdout,stderr):
+        if returncode!=0:
             if state.get("expect_error"):
                 try:
                     report=json.loads(stdout)
@@ -415,15 +430,31 @@ def _probe(directory: str) -> int:
     def poll():
         process=state["proc"]
         if process is None: return
-        if process.poll() is None:
+        try:
+            captured, capture_error = state["capture"].get_nowait()
+        except queue.Empty:
             QTimer.singleShot(20,poll); return
+        if capture_error is not None:
+            state["failure"]=f"Could not collect CLI output: {capture_error}"; finish(2); return
+        returncode,stdout,stderr=captured
         key=state["key"]
-        try: on_result(key,parse_output(process,key))
+        try: on_result(key,parse_output(process,key,returncode,stdout,stderr))
         except Exception as error:
             state["failure"]=str(error); finish(2)
     def finish(code=0):
         if state.get("done"): return
         state["done"]=True
+        process=state.get("proc")
+        if code and process is not None and process.poll() is None:
+            try:
+                process.terminate()
+                process.wait(timeout=2)
+            except subprocess.TimeoutExpired:
+                process.kill()
+                try: process.wait(timeout=2)
+                except subprocess.TimeoutExpired: pass
+            except OSError:
+                pass
         try: bridge.stop()
         except Exception: pass
         try: window.close()
@@ -462,6 +493,19 @@ def _probe(directory: str) -> int:
     return code
 
 class RealWebEngineAgentRenderTests(unittest.TestCase):
+    def test_cli_output_drainer_handles_both_pipes_beyond_windows_buffer_size(self):
+        payload="x"*256_000
+        code="import sys; sys.stdout.write('x'*256000); sys.stdout.flush(); sys.stderr.write('y'*256000); sys.stderr.flush()"
+        process=subprocess.Popen([sys.executable,"-c",code],stdout=subprocess.PIPE,stderr=subprocess.PIPE,text=True)
+        completed,thread=_drain_process_output(process)
+        captured,error=completed.get(timeout=15)
+        thread.join(timeout=1)
+        self.assertIsNone(error)
+        returncode,stdout,stderr=captured
+        self.assertEqual(returncode,0)
+        self.assertEqual(stdout,payload)
+        self.assertEqual(stderr,"y"*256_000)
+
     @unittest.skipUnless((ROOT.parent/"dist"/"qt-reader.html").is_file(),"Build the Qt reader before real WebEngine integration tests")
     def test_real_studio_qml_browser_hook_and_cli_capture_current_reader_pixels(self):
         with tempfile.TemporaryDirectory(prefix="supermd-real-agent-render-") as temp:

@@ -80,11 +80,12 @@ class AgentSessionIntegrityTests(unittest.TestCase):
 
         result = self._save(tab)
 
-        self.assertEqual(result["path"], str(path))
+        canonical_path = str(path.resolve())
+        self.assertEqual(result["path"], canonical_path)
         self.assertFalse(result["pathChanged"])
-        self.assertEqual((result["oldPath"], result["newPath"]), (str(path), str(path)))
+        self.assertEqual((result["oldPath"], result["newPath"]), (canonical_path, canonical_path))
         self.assertEqual(path.read_text(encoding="utf-8"), "# Updated\n")
-        self.assertEqual(tab["path"], str(path))
+        self.assertEqual(tab["path"], canonical_path)
         self.assertEqual(list(self.root.glob("original (*).md")), [])
 
     def test_save_existing_portable_note_updates_text_and_unsaved_assets_in_place(self):
@@ -101,10 +102,11 @@ class AgentSessionIntegrityTests(unittest.TestCase):
         result = self._save(tab)
 
         content, saved_assets, portable = open_note(path)
-        self.assertEqual(result["path"], str(path))
+        canonical_path = str(path.resolve())
+        self.assertEqual(result["path"], canonical_path)
         self.assertFalse(result["pathChanged"])
         self.assertEqual((content, saved_assets, portable), ("# After\n", revised_assets, True))
-        self.assertEqual(tab["path"], str(path))
+        self.assertEqual(tab["path"], canonical_path)
         self.assertEqual(tab["saved_assets"], revised_assets)
 
     def test_save_portable_copy_as_markdown_materializes_image_assets(self):
@@ -336,16 +338,17 @@ class AgentSessionIntegrityTests(unittest.TestCase):
         })
         self.assertEqual(result["status"], "opening")
         self.assertFalse(result["active"])
+        canonical_note_path = str(note_path.resolve())
 
         deadline = time.monotonic() + 3
-        while not any(tab["path"] == str(note_path) for tab in self.studio.tabs) and time.monotonic() < deadline:
+        while not any(tab["path"] == canonical_note_path for tab in self.studio.tabs) and time.monotonic() < deadline:
             self.app.processEvents()
             time.sleep(0.005)
-        self.assertTrue(any(tab["path"] == str(note_path) for tab in self.studio.tabs))
+        self.assertTrue(any(tab["path"] == canonical_note_path for tab in self.studio.tabs))
         self.assertEqual(self.studio.active, original["id"])
         job = self.studio._agent_job_status(result["jobId"])
         self.assertEqual(job["status"], "completed")
-        self.assertEqual(job["path"], str(note_path))
+        self.assertEqual(job["path"], canonical_note_path)
         self.assertEqual(job["sourceLength"], len("# Read me\n"))
         self.assertEqual(job["revision"], hashlib.sha256(b"# Read me\n").hexdigest())
         self.assertFalse(job["active"])

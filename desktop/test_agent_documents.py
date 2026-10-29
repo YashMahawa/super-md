@@ -80,7 +80,7 @@ class AgentDocumentsTest(unittest.TestCase):
         first = "<svg><text>first</text></svg>"
         second = "<svg><text>second</text></svg>"
         source = "```svg\n" + first + "\n```\n" + ("prose line\n" * 20) + "```svg\n" + second + "\n```\n"
-        (self.root / "two-diagrams.md").write_text(source, encoding="utf-8")
+        (self.root / "two-diagrams.md").write_bytes(source.encode("utf-8"))
         page = self.store.read("two-diagrams.md", limit=20)
         self.assertEqual(page["returned_chars"], len(page["text"]))
         self.assertEqual(len(page["svg_omissions"]), 1)
@@ -133,7 +133,7 @@ class AgentDocumentsTest(unittest.TestCase):
         source = ("😀 Preamble\n# Intro\n\n## 7.4 Methods\nA paragraph with details.\n"
                   "### Nested\nNested content stays in the parent section.\n## 7.40 Other\nOther section.\n")
         path = self.root / "numbered-sections.md"
-        path.write_text(source, encoding="utf-8")
+        path.write_bytes(source.encode("utf-8"))
         start = len(source[:source.index("## 7.4 Methods")])
         finish = len(source[:source.index("## 7.40 Other")])
         page = self.store.read("numbered-sections.md", heading="7.4", limit=32, view="source")
@@ -191,7 +191,7 @@ class AgentDocumentsTest(unittest.TestCase):
         body = "Body 🧭 stays in this section.\n" * 600
         source = f"# Intro\n## Long Section\n{body}## Next Section\nDo not include this text.\n"
         path = self.root / "long-section.md"
-        path.write_text(source, encoding="utf-8")
+        path.write_bytes(source.encode("utf-8"))
         first = self.store.read(path.name, heading="Long Section", limit=12_000, view="source")
         self.assertEqual(first["start"], len(source[:source.index("## Long Section")]))
         self.assertEqual(first["returned_chars"], 12_000)
@@ -221,7 +221,7 @@ class AgentDocumentsTest(unittest.TestCase):
 
     def test_patch_validation_insert_summaries_and_expected_counts(self):
         path = self.root / "patch-contract.md"
-        path.write_text("😀 one\none one\n", encoding="utf-8")
+        path.write_bytes("😀 one\none one\n".encode("utf-8"))
         revision = self.store.inspect("patch-contract.md")["revision"]
         result = self.store.patch("patch-contract.md", expected_revision=revision, operations=[
             {"type": "replace", "old": "one", "new": "two", "expectedCount": 3},
@@ -252,7 +252,7 @@ class AgentDocumentsTest(unittest.TestCase):
     def test_search_pagination_unicode_word_filters_diagrams_and_safe_regex(self):
         path = self.root / "search-contract.md"
         source = "😀 Ward afterward\n```mermaid\nWard --> X\n```\nward ward"
-        path.write_text(source, encoding="utf-8")
+        path.write_bytes(source.encode("utf-8"))
         first = self.store.search("search-contract.md", "ward", limit=2, context=0)
         self.assertEqual([item["matchOffset"] for item in first["matches"]], [2, 12])
         self.assertEqual(first["totalMatches"], 5)
@@ -279,7 +279,7 @@ class AgentDocumentsTest(unittest.TestCase):
     def test_search_total_matches_is_stable_across_pages_and_exhausted_offsets(self):
         path = self.root / "search-pagination.md"
         source = "x " * 30
-        path.write_text(source, encoding="utf-8")
+        path.write_bytes(source.encode("utf-8"))
         first = self.store.search("search-pagination.md", "x", limit=25, context=0)
         self.assertEqual(len(first["matches"]), 25)
         self.assertEqual(first["totalMatches"], 30)

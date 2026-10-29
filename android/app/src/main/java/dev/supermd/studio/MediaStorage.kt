@@ -244,8 +244,8 @@ class MediaStorage(private val context: Context) {
             }
             return file.uri to (file.name ?: name)
         }
-        require(Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
-            "Choose a folder in Settings → New note location before saving to Downloads on this Android version"
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.Q) {
+            error("Choose a folder in Settings → New note location before saving to Downloads on this Android version")
         }
         val relativePath = Environment.DIRECTORY_DOWNLOADS + "/Super MD"
         val resolver = context.contentResolver
