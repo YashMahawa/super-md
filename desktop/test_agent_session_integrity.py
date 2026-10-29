@@ -250,6 +250,11 @@ class AgentSessionIntegrityTests(unittest.TestCase):
         path.write_text("# Saved snapshot\n", encoding="utf-8")
         tab = self._tab_for(path)
         tab["content"] = "# Current draft\n"
+        # Rejected saves must retain even a noncanonical, valid path spelling.
+        # This also exercises the macOS /var and Windows short-path invariant
+        # on platforms whose temporary directory has no built-in alias.
+        tab["path"] = str(path.parent) + os.sep + "." + os.sep + path.name
+        original_path = tab["path"]
         original_saved = tab["saved"]
         original_content = tab["content"]
         self.studio.saving.add(tab["id"])
@@ -259,7 +264,7 @@ class AgentSessionIntegrityTests(unittest.TestCase):
                     with self.assertRaisesRegex(ValueError, "save is already in progress"):
                         self._save(tab, **options)
                     self.assertEqual(path.read_text(encoding="utf-8"), "# Saved snapshot\n")
-                    self.assertEqual(tab["path"], str(path.resolve()))
+                    self.assertEqual(tab["path"], original_path)
                     self.assertEqual(tab["saved"], original_saved)
                     self.assertEqual(tab["content"], original_content)
                     self.assertFalse((self.root / "copy.md").exists())
