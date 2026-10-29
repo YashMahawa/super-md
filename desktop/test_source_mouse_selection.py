@@ -108,7 +108,7 @@ def _probe(mode: str, zoom: float = 95.59963715447921, fullscreen: bool = False)
                     break
             raise AssertionError(f"The production WebEngine reader did not return the probe result: title={reader.property('title')!r}")
 
-        geometry_script = "(()=>{document.title=JSON.stringify({ready:false});const phrase=" + json.dumps(target_text) + ";const visible=el=>{const r=el.getBoundingClientRect(),s=getComputedStyle(el);return r.width>10&&r.height>8&&s.display!=='none'&&s.visibility!=='hidden'&&s.opacity!=='0'};const makeRange=root=>{const w=document.createTreeWalker(root,NodeFilter.SHOW_TEXT),nodes=[];let joined='',n;while(n=w.nextNode()){nodes.push({node:n,start:joined.length});joined+=n.nodeValue}const at=joined.indexOf(phrase);if(at<0)return null;const point=offset=>{const item=nodes.find(x=>offset>=x.start&&offset<=x.start+x.node.nodeValue.length);return item?[item.node,offset-item.start]:null};const a=point(at),b=point(at+phrase.length);if(!a||!b)return null;const r=document.createRange();r.setStart(a[0],a[1]);r.setEnd(b[0],b[1]);return r};let range=null;const line=[...document.querySelectorAll('.cm-line')].find(x=>x.textContent.includes(phrase)&&visible(x));if(line)range=makeRange(line);if(!range){const body=document.body;if(!body)return 'waiting';const w=document.createTreeWalker(body,NodeFilter.SHOW_TEXT);let n;while(n=w.nextNode()){const at=n.nodeValue.indexOf(phrase);if(at<0)continue;const r=document.createRange();r.setStart(n,at);r.setEnd(n,at+phrase.length);const b=r.getBoundingClientRect();if(b.width>10&&b.height>8){range=r;break}}}if(!range){document.title=JSON.stringify({ready:false});return 'waiting'}const rs=[...range.getClientRects()].filter(r=>r.width>1&&r.height>1);if(!rs.length){document.title=JSON.stringify({ready:false});return 'waiting'}document.title=JSON.stringify({ready:true,first:{x:rs[0].x,y:rs[0].y,w:rs[0].width,h:rs[0].height},last:{x:rs[rs.length-1].x,y:rs[rs.length-1].y,w:rs[rs.length-1].width,h:rs[rs.length-1].height}});return 'ready'})()"
+        geometry_script = "(()=>{document.title=JSON.stringify({ready:false});const phrase=" + json.dumps(target_text) + ";const visible=el=>{const r=el.getBoundingClientRect(),s=getComputedStyle(el);return r.width>10&&r.height>8&&s.display!=='none'&&s.visibility!=='hidden'&&s.opacity!=='0'};const makeRange=root=>{const w=document.createTreeWalker(root,NodeFilter.SHOW_TEXT),nodes=[];let joined='',n;while(n=w.nextNode()){nodes.push({node:n,start:joined.length});joined+=n.nodeValue}const at=joined.indexOf(phrase);if(at<0)return null;const point=offset=>{const item=nodes.find(x=>offset>=x.start&&offset<=x.start+x.node.nodeValue.length);return item?[item.node,offset-item.start]:null};const a=point(at),b=point(at+phrase.length);if(!a||!b)return null;const r=document.createRange();r.setStart(a[0],a[1]);r.setEnd(b[0],b[1]);return r};let range=null;const line=[...document.querySelectorAll('.cm-line')].find(x=>x.textContent.includes(phrase)&&visible(x));if(line)range=makeRange(line);if(!range){const body=document.body;if(!body)return 'waiting';const w=document.createTreeWalker(body,NodeFilter.SHOW_TEXT);let n;while(n=w.nextNode()){const at=n.nodeValue.indexOf(phrase);if(at<0)continue;const r=document.createRange();r.setStart(n,at);r.setEnd(n,at+phrase.length);const b=r.getBoundingClientRect();if(b.width>10&&b.height>8){range=r;break}}}if(!range){document.title=JSON.stringify({ready:false});return 'waiting'}const rs=[...range.getClientRects()].filter(r=>r.width>1&&r.height>1);if(!rs.length||document.fonts.status!=='loaded'){document.title=JSON.stringify({ready:false});return 'waiting'}document.title=JSON.stringify({ready:true,first:{x:rs[0].x,y:rs[0].y,w:rs[0].width,h:rs[0].height},last:{x:rs[rs.length-1].x,y:rs[rs.length-1].y,w:rs[rs.length-1].width,h:rs[rs.length-1].height}});return 'ready'})()"
 
         def drag(mode: str, reverse: bool = False) -> dict:
             geometry = run_script(geometry_script)
@@ -116,8 +116,15 @@ def _probe(mode: str, zoom: float = 95.59963715447921, fullscreen: bool = False)
                 raise AssertionError(f"Source selection geometry unavailable in {mode}: {geometry}")
             reader_origin = reader.mapToGlobal(QPointF(0, 0))
             reader_left = window.mapFromGlobal(QPoint(round(reader_origin.x()), round(reader_origin.y())))
-            left = QPoint(round(reader_left.x() + geometry["first"]["x"] + 3), round(reader_left.y() + geometry["first"]["y"] + geometry["first"]["h"] / 2))
-            right = QPoint(round(reader_left.x() + geometry["last"]["x"] + geometry["last"]["w"] - 3), round(reader_left.y() + geometry["last"]["y"] + geometry["last"]["h"] / 2))
+            # Each direction is a fresh selection. Starting the reverse drag
+            # inside the previous highlight can invoke native text drag/drop,
+            # which deliberately moves text rather than starting a new range.
+            QTest.mouseClick(window, Qt.MouseButton.LeftButton, Qt.KeyboardModifier.NoModifier,
+                             QPoint(round(reader_left.x() + geometry["first"]["x"] + 1),
+                                    round(reader_left.y() + geometry["first"]["y"] - 30)), delay=80)
+            geometry = run_script(geometry_script)
+            left = QPoint(round(reader_left.x() + geometry["first"]["x"] + 1), round(reader_left.y() + geometry["first"]["y"] + geometry["first"]["h"] / 2))
+            right = QPoint(round(reader_left.x() + geometry["last"]["x"] + geometry["last"]["w"] - 1), round(reader_left.y() + geometry["last"]["y"] + geometry["last"]["h"] / 2))
             start, end = (right, left) if reverse else (left, right)
             QTest.mousePress(window, Qt.MouseButton.LeftButton, Qt.KeyboardModifier.NoModifier, start, delay=80)
             distance = end.x() - start.x()
@@ -154,8 +161,8 @@ def _probe(mode: str, zoom: float = 95.59963715447921, fullscreen: bool = False)
         geometry = run_script(geometry_script)
         origin = reader.mapToGlobal(QPointF(0, 0))
         reader_left = window.mapFromGlobal(QPoint(round(origin.x()), round(origin.y())))
-        base_left = round(reader_left.x() + geometry["first"]["x"] + 3)
-        base_right = round(reader_left.x() + geometry["last"]["x"] + geometry["last"]["w"] - 3)
+        base_left = round(reader_left.x() + geometry["first"]["x"] + 1)
+        base_right = round(reader_left.x() + geometry["last"]["x"] + geometry["last"]["w"] - 1)
         base_y = round(reader_left.y() + geometry["first"]["y"] + geometry["first"]["h"] / 2)
         # Clear the whole-line selection on an unselected heading line first.
         QTest.mouseClick(window, Qt.MouseButton.LeftButton, Qt.KeyboardModifier.NoModifier,
