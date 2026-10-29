@@ -7,7 +7,7 @@ import indefiniteArticle from "retext-indefinite-article";
 import {VFile} from "vfile";
 
 export interface WritingOptions {spellCheck?:boolean;grammarCheck?:boolean}
-export interface WritingIssue {from:number;to:number;message:string;kind:"spelling"|"grammar";replacements:string[]}
+export interface WritingIssue {from:number;to:number;message:string;kind:"spelling"|"grammar";replacements:string[];originalText:string}
 export interface Speller {correct(word:string):boolean;suggest(word:string):string[]}
 const markdown=unified().use(remarkParse).use(remarkMath);
 const grammar=unified().use(retextEnglish).use(repeatedWords).use(indefiniteArticle);
@@ -34,7 +34,7 @@ export function writingIssues(source:string,options:WritingOptions,speller?:Spel
       const from=position?.start?.offset,to=position?.end?.offset;
       if(from===undefined||to===undefined||!allowed(from,to))continue;
       const expected=(message as any).expected;
-      issues.push({from,to,message:message.reason,kind:"grammar",replacements:Array.isArray(expected)?expected.slice(0,3):[]});
+      issues.push({from,to,message:message.reason,kind:"grammar",replacements:Array.isArray(expected)?expected.slice(0,3):[],originalText:source.slice(from,to)});
     }
   }
   if(options.spellCheck&&speller){
@@ -49,7 +49,7 @@ export function writingIssues(source:string,options:WritingOptions,speller?:Spel
     const suggestions=new Map<string,string[]>();
     for(const {word,from,to} of candidates){
       if(!suggestions.has(word))suggestions.set(word,suggestions.size<8?speller.suggest(word).slice(0,3):[]);
-      issues.push({from,to,message:`Possible spelling error: ${word}`,kind:"spelling",replacements:suggestions.get(word)!});
+      issues.push({from,to,message:`Possible spelling error: ${word}`,kind:"spelling",replacements:suggestions.get(word)!,originalText:source.slice(from,to)});
     }
   }
   return issues.sort((a,b)=>a.from-b.from).slice(0,40);
