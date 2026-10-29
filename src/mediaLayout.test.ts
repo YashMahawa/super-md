@@ -4,7 +4,6 @@ import { commitMediaLayout } from './mediaLayout';
 import { captureScrollAnchor } from './scrollAnchor';
 import { captureWindowedScrollAnchor } from './windowedSearch';
 import { refreshDocumentExtent } from './documentZoom';
-import { flushSync } from 'react-dom';
 
 vi.mock('./scrollAnchor', async (importOriginal) => ({
   ...(await importOriginal<typeof import('./scrollAnchor')>()),
@@ -21,11 +20,6 @@ vi.mock('./documentZoom', async (importOriginal) => ({
   refreshDocumentExtent: vi.fn(),
 }));
 
-vi.mock('react-dom', async (importOriginal) => ({
-  ...(await importOriginal<typeof import('react-dom')>()),
-  flushSync: vi.fn((fn: () => void) => fn()),
-}));
-
 describe('commitMediaLayout', () => {
   beforeEach(() => {
     vi.clearAllMocks();
@@ -37,8 +31,6 @@ describe('commitMediaLayout', () => {
 
     commitMediaLayout(null, updateSpy);
 
-    expect(flushSync).toHaveBeenCalledTimes(1);
-    expect(flushSync).toHaveBeenCalledWith(updateSpy);
     expect(updateSpy).toHaveBeenCalledTimes(1);
     expect(captureScrollAnchor).not.toHaveBeenCalled();
     expect(captureWindowedScrollAnchor).not.toHaveBeenCalled();
@@ -61,7 +53,6 @@ describe('commitMediaLayout', () => {
     expect(captureScrollAnchor).toHaveBeenCalledTimes(1);
     expect(captureScrollAnchor).toHaveBeenCalledWith(root);
     expect(captureWindowedScrollAnchor).not.toHaveBeenCalled();
-    expect(flushSync).toHaveBeenCalledWith(updateSpy);
     expect(updateSpy).toHaveBeenCalledTimes(1);
     expect(refreshDocumentExtent).toHaveBeenCalledTimes(1);
     expect(refreshDocumentExtent).toHaveBeenCalledWith(root);
@@ -106,7 +97,6 @@ describe('commitMediaLayout', () => {
     expect(captureWindowedScrollAnchor).toHaveBeenCalledTimes(1);
     expect(captureWindowedScrollAnchor).toHaveBeenCalledWith(root, block);
     expect(captureScrollAnchor).not.toHaveBeenCalled();
-    expect(flushSync).toHaveBeenCalledWith(updateSpy);
     expect(updateSpy).toHaveBeenCalledTimes(1);
 
     expect(eventListenerSpy).toHaveBeenCalledTimes(1);
@@ -159,12 +149,6 @@ describe('commitMediaLayout', () => {
       return restoreSpy;
     });
 
-    vi.mocked(flushSync).mockImplementation((fn: () => void) => {
-      executionOrder.push('flushSync:start');
-      fn();
-      executionOrder.push('flushSync:end');
-    });
-
     const updateSpy = vi.fn(() => {
       executionOrder.push('update');
     });
@@ -182,9 +166,7 @@ describe('commitMediaLayout', () => {
 
     expect(executionOrder).toEqual([
       'captureWindowedScrollAnchor',
-      'flushSync:start',
       'update',
-      'flushSync:end',
       'supermd-media-layout',
       'refreshDocumentExtent',
       'restore',
