@@ -7,6 +7,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
+import uuid
 from collections import Counter
 from pathlib import Path
 
@@ -79,16 +80,33 @@ def _probe(mode: str, zoom: float = 95.59963715447921, fullscreen: bool = False)
 
         def run_script(script: str, timeout: float = 20) -> dict:
             deadline = __import__("time").monotonic() + timeout
+            request = uuid.uuid4().hex
+            wrapped = "(()=>{try{" + script + ";document.title=JSON.stringify({request:" + json.dumps(request) + ",value:JSON.parse(document.title)})}catch(error){document.title=JSON.stringify({request:" + json.dumps(request) + ",error:String(error)})}})()"
             while __import__("time").monotonic() < deadline:
-                app.processEvents()
-                QMetaObject.invokeMethod(window, "runDocumentScript", Qt.ConnectionType.DirectConnection, Q_ARG("QVariant", script))
-                QTest.qWait(30)
-                title = reader.property("title")
-                if isinstance(title, str) and title.startswith("{"):
-                    value = json.loads(title)
+                # WebEngine dispatch is asynchronous. A slower renderer may
+                # still expose the prior geometry/result in its title; never
+                # mistake that for this request's acknowledged response.
+                QMetaObject.invokeMethod(window, "runDocumentScript", Qt.ConnectionType.DirectConnection, Q_ARG("QVariant", wrapped))
+                # Evaluations sent before the initial document exists may be
+                # dropped. Retry this same request without accepting an older
+                # query's reply or flooding the renderer with queued scripts.
+                attempt_deadline = min(deadline, __import__("time").monotonic() + .5)
+                while __import__("time").monotonic() < attempt_deadline:
+                    app.processEvents()
+                    QTest.qWait(10)
+                    title = reader.property("title")
+                    if not isinstance(title, str) or not title.startswith("{"):
+                        continue
+                    response = json.loads(title)
+                    if response.get("request") != request:
+                        continue
+                    if response.get("error"):
+                        raise AssertionError(response["error"])
+                    value = response["value"]
                     if value.get("ready") is not False:
                         return value
-            raise AssertionError("The production WebEngine reader did not return the probe result")
+                    break
+            raise AssertionError(f"The production WebEngine reader did not return the probe result: title={reader.property('title')!r}")
 
         geometry_script = "(()=>{document.title=JSON.stringify({ready:false});const phrase=" + json.dumps(target_text) + ";const visible=el=>{const r=el.getBoundingClientRect(),s=getComputedStyle(el);return r.width>10&&r.height>8&&s.display!=='none'&&s.visibility!=='hidden'&&s.opacity!=='0'};const makeRange=root=>{const w=document.createTreeWalker(root,NodeFilter.SHOW_TEXT),nodes=[];let joined='',n;while(n=w.nextNode()){nodes.push({node:n,start:joined.length});joined+=n.nodeValue}const at=joined.indexOf(phrase);if(at<0)return null;const point=offset=>{const item=nodes.find(x=>offset>=x.start&&offset<=x.start+x.node.nodeValue.length);return item?[item.node,offset-item.start]:null};const a=point(at),b=point(at+phrase.length);if(!a||!b)return null;const r=document.createRange();r.setStart(a[0],a[1]);r.setEnd(b[0],b[1]);return r};let range=null;const line=[...document.querySelectorAll('.cm-line')].find(x=>x.textContent.includes(phrase)&&visible(x));if(line)range=makeRange(line);if(!range){const body=document.body;if(!body)return 'waiting';const w=document.createTreeWalker(body,NodeFilter.SHOW_TEXT);let n;while(n=w.nextNode()){const at=n.nodeValue.indexOf(phrase);if(at<0)continue;const r=document.createRange();r.setStart(n,at);r.setEnd(n,at+phrase.length);const b=r.getBoundingClientRect();if(b.width>10&&b.height>8){range=r;break}}}if(!range){document.title=JSON.stringify({ready:false});return 'waiting'}const rs=[...range.getClientRects()].filter(r=>r.width>1&&r.height>1);if(!rs.length){document.title=JSON.stringify({ready:false});return 'waiting'}document.title=JSON.stringify({ready:true,first:{x:rs[0].x,y:rs[0].y,w:rs[0].width,h:rs[0].height},last:{x:rs[rs.length-1].x,y:rs[rs.length-1].y,w:rs[rs.length-1].width,h:rs[rs.length-1].height}});return 'ready'})()"
 
