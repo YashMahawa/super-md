@@ -166,7 +166,10 @@ test('visible context keeps full document cursors and exact partial selections',
   expect(next.start).toBe(context.visibleSource.end);
   expect(next.text).toBe(Array.from(content).slice(next.start,next.end).join(''));
   await page.evaluate(()=>{window.getSelection()?.removeAllRanges();window.supermdHeading?.('ending');});
-  await expect(page.getByRole('heading',{name:'Ending',exact:true})).toBeVisible();
+  const endingHeading=page.getByRole('heading',{name:'Ending',exact:true});
+  await expect(endingHeading).toBeVisible();
+  await expect(endingHeading).toBeInViewport();
+  await expect(page.getByText('End of document.',{exact:true})).toBeInViewport();
   await settleReadingScroll(page);
   const end:any=await agent(page,{action:'get_context',tabId:'agent-context-page'});
   expect(end.visibleSource.total_chars).toBe(total);
@@ -174,6 +177,25 @@ test('visible context keeps full document cursors and exact partial selections',
   expect(end.visibleSource.next_offset).toBeNull();
   expect(end.visibleSource.truncated).toBe(false);
   expect(end.visibleSource.text).toContain('End of document.');
+});
+
+test('heading navigation realigns after delayed layout growth beyond a windowed SVG',async({page})=>{
+  const paragraphs=Array.from({length:65},(_,index)=>`Paragraph ${index}: notes before the oversized drawing.\n\n`).join(''),
+    svg='<svg xmlns="http://www.w3.org/2000/svg" width="64" height="32">'+('<path d="M0 0L1 1"/>'.repeat(10_000))+'</svg>',
+    content=`# Start\n\n${paragraphs}## Artwork\n\n\`\`\`svg\n${svg}\n\`\`\`\n\n## Ending\n\nFinal paragraph.`;
+  await page.goto('/android-reader.html');await page.waitForFunction(()=>typeof window.supermdLoad==='function');
+  await page.evaluate(value=>window.supermdLoad?.(value),{id:'delayed-svg-heading-navigation',path:null,content,mode:'reader',dark:false,fullscreen:false,colors:{},font:'Manrope',size:16,zoom:100,restorePosition:false});
+  await expect(page.getByRole('heading',{name:'Start',exact:true})).toBeVisible();
+  const ending=page.getByRole('heading',{name:'Ending',exact:true});
+  await page.evaluate(()=>window.supermdHeading?.('ending'));
+  await expect(ending).toBeInViewport();
+  // Simulate a late media/layout resize after the first heading alignment.
+  // Keep it outside the old short settle window so the navigation observer
+  // must still be active when the page grows.
+  await page.waitForTimeout(1500);
+  await page.locator('#artwork').evaluate(element=>{(element as HTMLElement).style.marginBottom='1400px';});
+  await expect(ending).toBeInViewport({timeout:5000});
+  await expect(page.getByText('Final paragraph.',{exact:true})).toBeInViewport();
 });
 
 test('reader hook paginates outline pages and repeated selected-section source pages',async({page})=>{

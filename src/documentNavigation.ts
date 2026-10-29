@@ -73,8 +73,9 @@ export function navigateToHeading(root:Element,target:string):boolean {
     observer.observe(page);
   }
   // Fonts and lazy neighbouring blocks may settle after the initial six
-  // frames. Observe briefly instead of polling/reflowing the entire note.
+  // frames, including delayed diagrams above the target. Keep the observer
+  // briefly active so those size changes do not strand the heading offscreen.
   // User zoom/pan cancels this token immediately and wins over the jump.
-  timer=window.setTimeout(()=>{if(jumps.get(root)===token)cancelHeadingNavigation(root);},1200);
+  timer=window.setTimeout(()=>{if(jumps.get(root)===token)cancelHeadingNavigation(root);},5000);
   return true;
 }

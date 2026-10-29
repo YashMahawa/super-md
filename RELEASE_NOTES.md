@@ -4,6 +4,7 @@
 
 - Saving an existing note now keeps its path and format. Creating a copy requires an explicit save-as request. Portable SMD saves preserve embedded assets and guard against external changes.
 - Added background create/open, explicit tab activation and guarded tab closing. Read, search and edit inactive notes without silently changing the reader's focus.
+- Android activation now waits for the selected reader's acknowledgement before reporting completion, keeping immediate follow-up actions on the correct document.
 - Newly opened desktop files return an asynchronous job ID. Polling it returns the completed tab identifier and revision without blocking the interface.
 - Patch tools publish strict operation schemas, reject misspelled fields, identify the failed operation, and report completed edits accurately. Exact replacement, asserted multiple replacements, line edits and insertion work in atomic batches.
 - Search supports continuation offsets, total counts, case matching, whole words, diagram filtering and a bounded regex subset.
@@ -17,6 +18,7 @@
 - Export the whole note or just one section as Markdown, portable SMD or PDF. Section exports retain supporting image/link definitions without modifying the source note.
 - Completed cloud exports provide private, expiring download links and MCP resources. File bytes stream in bounded chunks with SHA-256 verification instead of filling the model's text context with base64. The CLI also supports verified, create-only downloads.
 - PDF export now prepares reference-style images through the same asset pipeline as inline images.
+- Heading jumps retain their target when a neighbouring diagram finishes sizing late, while user scrolling and zooming immediately take control.
 
 ## Android settings
 

@@ -31,7 +31,9 @@ for(const {platform,zoom,cold} of scrollCases){
       await expect.poll(()=>page.locator('.note-image img').evaluateAll(images=>images.some(image=>(image as HTMLImageElement).complete&&image.getBoundingClientRect().height>100))).toBe(true);
     }
     await page.evaluate(()=>window.supermdHeading?.('section-174'));
-    await expect(page.locator('.android-reading')).not.toHaveAttribute('data-navigating','true');
+    // Navigation keeps its resize observer alive for five seconds to handle
+    // slow diagrams; allow that bounded settling phase to finish first.
+    await expect(page.locator('.android-reading')).not.toHaveAttribute('data-navigating','true',{timeout:8000});
     const result=await page.evaluate(async()=>{
       const root=document.querySelector<HTMLElement>('.android-reading')!,drifts:number[]=[],anomalies:unknown[]=[];
       for(let cycle=0;cycle<4;cycle++)for(let step=0;step<28;step++){
@@ -94,7 +96,7 @@ for(const input of ['native','browser'] as const)test(`cold image growth preserv
   await page.evaluate(content=>window.supermdLoad?.({id:'controlled-cold-scroll',content,path:'/fixture/scroll.md',mode:'reader',dark:true,colors:{},font:'Manrope',size:16,zoom:180,restorePosition:false}),scrollContent);
   await page.evaluate(()=>document.fonts.ready);
   await page.evaluate(()=>window.supermdHeading?.('section-172'));
-  await expect(page.locator('.android-reading')).not.toHaveAttribute('data-navigating','true');
+  await expect(page.locator('.android-reading')).not.toHaveAttribute('data-navigating','true',{timeout:8000});
   await expect(page.locator('.image-loading')).toBeAttached();
   const source=page.locator('#section-172');
   await source.evaluate(node=>{const root=node.closest<HTMLElement>('.android-reading')!;root.scrollTop+=node.getBoundingClientRect().top-root.getBoundingClientRect().top-100;});
