@@ -40,7 +40,7 @@ instead of retrying the same failed pixel request. Older relays without
 | Actual current viewport pixels | `document_view(path=TARGET, width=1200)` | `render_tab(deviceId, tabId, width=1200)` |
 | Exact Markdown page | `document_read(path=TARGET, view="source", offset, limit)` | `read_tab(deviceId, tabId, view="source", offset, limit)` |
 | Selected heading section | `document_read(path=TARGET, heading="7.4", view="prose", limit=3000)` | `read_tab(deviceId, tabId?, heading="7.4", view="prose", limit=3000)` |
-| Paged outline | `document_action(action="inspect", path=TARGET)` for the first page | `document_action(documentAction="outline", deviceId, tabId, options={offset, limit:80})` |
+| Paged outline | `document_action(action="outline", path=TARGET, offset=0, limit=80)` for open tabs; `document_inspect(path)` for a saved file's first page | `document_action(documentAction="outline", deviceId, tabId, options={offset, limit:80})` |
 | Search | `document_search(path=TARGET, query, offset, limit, case_sensitive, whole_word, regex, exclude_diagrams)` | `search_tab(deviceId, tabId, query, offset, limit, caseSensitive, wholeWord, regex, excludeDiagrams)` |
 | Diagram inventory | `document_action(action="list_diagrams", path=TARGET)` | `diagram_action(deviceId, tabId, diagramAction="list", expectedRevision=REV)` |
 | Original SVG/Mermaid/chart block source | `document_action(action="get_diagram", path=TARGET, diagram_id=ID, expected_revision=REV)` | `diagram_action(deviceId, tabId, diagramAction="source", diagramId=ID, expectedRevision=REV)` |
@@ -71,8 +71,8 @@ the active tab is unambiguous. Prose pages are bounded to 12,000 characters;
 for voice or focused retrieval, start with `limit:3000` and use the returned
 `next_offset` with the same heading to continue. If the heading is unknown,
 page `document_action(documentAction="outline", tabId,
-options:{offset:0,limit:80})`; each page contains up to 80 headings plus
-`nextOffset`, `sectionStart`, `sectionEnd`, and `documentLength` metadata.
+options:{offset:0,limit:80})`; each page contains up to 80 headings with their
+`sectionStart`/`sectionEnd` bounds, plus `nextOffset` and `documentLength` metadata.
 
 ## Export a whole note or section
 
