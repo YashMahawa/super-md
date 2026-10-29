@@ -196,7 +196,10 @@ class AgentRelayLifecycleIntegrationTest {
             val activated = call(scenario, handler, "document_action", JSONObject().put("documentAction", "activate").put("tabId", background.id))
             assertNull(activated.second)
             assertEquals(background.id, model!!.state.value.activeId)
+            assertTrue("Activation must return only after the reader acknowledges the selected note", model!!.readerStateIsNativeAuthoritative(background.id))
 
+            // Exercise the same back-to-back agent sequence as MCP: activation
+            // must finish the reader handoff so neither close needs a test-side wait.
             val refusedClose = call(scenario, handler, "document_action", JSONObject().put("documentAction", "close")
                 .put("tabId", background.id).put("expectedRevision", patchResult.getString("revision")))
             assertNull(refusedClose.first)

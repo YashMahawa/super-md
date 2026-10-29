@@ -723,9 +723,38 @@ private object NoMotionScheme : MotionScheme {
                             scope.launch {
                                 val selected = kotlinx.coroutines.withTimeoutOrNull(5_000) { model.state.first { it.activeId == target } }
                                 if (selected == null) reply(null, "Could not activate the requested open tab")
-                                else { val note = selected.active; reply(JSONObject().put("tabId", canonicalTabId(note)).put("name", note.name)
-                                    .put("path", note.uri ?: note.id).put("uri", note.uri ?: JSONObject.NULL).put("active", true)
-                                    .put("revision", activity.agentRevision(note.content)), null) }
+                                else {
+                                    // ActiveId changes before the WebView's React tree has necessarily received
+                                    // supermdLoad for the new tab. Do not report activation complete until the
+                                    // live reader has acknowledged this exact native snapshot; otherwise an
+                                    // immediate close can safely fail its own flush while JS still holds the
+                                    // previous tab. The close barrier remains mandatory after this handshake.
+                                    val readerReady = kotlinx.coroutines.withTimeoutOrNull(8_000) {
+                                        while (true) {
+                                            if (model.state.value.activeId != target) return@withTimeoutOrNull false
+                                            val acknowledged = try {
+                                                model.readerFlushRequester?.invoke(target)
+                                                    ?: model.readerStateIsNativeAuthoritative(target)
+                                            } catch (cancelled: kotlinx.coroutines.CancellationException) {
+                                                throw cancelled
+                                            } catch (_: Exception) {
+                                                false
+                                            }
+                                            if (acknowledged) return@withTimeoutOrNull true
+                                            kotlinx.coroutines.delay(40)
+                                        }
+                                        @Suppress("UNREACHABLE_CODE")
+                                        false
+                                    } == true
+                                    if (!readerReady) reply(null, "The requested tab is still loading in the reader; retry activation shortly")
+                                    else {
+                                        val note = model.state.value.tabs.firstOrNull { it.id == target }
+                                        if (note == null || model.state.value.activeId != target) reply(null, "The requested tab is no longer open")
+                                        else reply(JSONObject().put("tabId", canonicalTabId(note)).put("name", note.name)
+                                            .put("path", note.uri ?: note.id).put("uri", note.uri ?: JSONObject.NULL).put("active", true)
+                                            .put("revision", activity.agentRevision(note.content)), null)
+                                    }
+                                }
                             }
                         }
                     }
