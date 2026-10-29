@@ -108,21 +108,28 @@ def _probe(mode: str, zoom: float = 95.59963715447921, fullscreen: bool = False)
                     break
             raise AssertionError(f"The production WebEngine reader did not return the probe result: title={reader.property('title')!r}")
 
-        geometry_script = "(()=>{document.title=JSON.stringify({ready:false});const phrase=" + json.dumps(target_text) + ";const visible=el=>{const r=el.getBoundingClientRect(),s=getComputedStyle(el);return r.width>10&&r.height>8&&s.display!=='none'&&s.visibility!=='hidden'&&s.opacity!=='0'};const makeRange=root=>{const w=document.createTreeWalker(root,NodeFilter.SHOW_TEXT),nodes=[];let joined='',n;while(n=w.nextNode()){nodes.push({node:n,start:joined.length});joined+=n.nodeValue}const at=joined.indexOf(phrase);if(at<0)return null;const point=offset=>{const item=nodes.find(x=>offset>=x.start&&offset<=x.start+x.node.nodeValue.length);return item?[item.node,offset-item.start]:null};const a=point(at),b=point(at+phrase.length);if(!a||!b)return null;const r=document.createRange();r.setStart(a[0],a[1]);r.setEnd(b[0],b[1]);return r};let range=null;const line=[...document.querySelectorAll('.cm-line')].find(x=>x.textContent.includes(phrase)&&visible(x));if(line)range=makeRange(line);if(!range){const body=document.body;if(!body)return 'waiting';const w=document.createTreeWalker(body,NodeFilter.SHOW_TEXT);let n;while(n=w.nextNode()){const at=n.nodeValue.indexOf(phrase);if(at<0)continue;const r=document.createRange();r.setStart(n,at);r.setEnd(n,at+phrase.length);const b=r.getBoundingClientRect();if(b.width>10&&b.height>8){range=r;break}}}if(!range){document.title=JSON.stringify({ready:false});return 'waiting'}const rs=[...range.getClientRects()].filter(r=>r.width>1&&r.height>1);if(!rs.length||document.fonts.status!=='loaded'){document.title=JSON.stringify({ready:false});return 'waiting'}document.title=JSON.stringify({ready:true,first:{x:rs[0].x,y:rs[0].y,w:rs[0].width,h:rs[0].height},last:{x:rs[rs.length-1].x,y:rs[rs.length-1].y,w:rs[rs.length-1].width,h:rs[rs.length-1].height}});return 'ready'})()"
+        geometry_script = "(()=>{document.title=JSON.stringify({ready:false});const phrase=" + json.dumps(target_text) + ";const visible=el=>{const r=el.getBoundingClientRect(),s=getComputedStyle(el);return r.width>10&&r.height>8&&s.display!=='none'&&s.visibility!=='hidden'&&s.opacity!=='0'};const makeRange=root=>{const w=document.createTreeWalker(root,NodeFilter.SHOW_TEXT),nodes=[];let joined='',n;while(n=w.nextNode()){nodes.push({node:n,start:joined.length});joined+=n.nodeValue}const at=joined.indexOf(phrase);if(at<0)return null;const point=offset=>{const item=nodes.find(x=>offset>=x.start&&offset<=x.start+x.node.nodeValue.length);return item?[item.node,offset-item.start]:null};const a=point(at),b=point(at+phrase.length);if(!a||!b)return null;const r=document.createRange();r.setStart(a[0],a[1]);r.setEnd(b[0],b[1]);return r};let range=null;const line=[...document.querySelectorAll('.cm-line')].find(x=>x.textContent.includes(phrase)&&visible(x));if(line)range=makeRange(line);if(!range){const body=document.body;if(!body)return 'waiting';const w=document.createTreeWalker(body,NodeFilter.SHOW_TEXT);let n;while(n=w.nextNode()){const at=n.nodeValue.indexOf(phrase);if(at<0)continue;const r=document.createRange();r.setStart(n,at);r.setEnd(n,at+phrase.length);const b=r.getBoundingClientRect();if(b.width>10&&b.height>8){range=r;break}}}if(!range){document.title=JSON.stringify({ready:false});return 'waiting'}const rs=[...range.getClientRects()].filter(r=>r.width>1&&r.height>1);if(!rs.length||document.fonts.status!=='loaded'){document.title=JSON.stringify({ready:false});return 'waiting'}if(!window.__selectionProbePresented){if(!window.__selectionProbePreparing){window.__selectionProbePreparing=true;document.fonts.ready.then(()=>requestAnimationFrame(()=>requestAnimationFrame(()=>{window.__selectionProbePresented=true})))}document.title=JSON.stringify({ready:false});return 'waiting'}const heading=document.querySelector('.cm-line')||document.querySelector('.android-reading h1'),walker=heading&&document.createTreeWalker(heading,NodeFilter.SHOW_TEXT);let clearNode=walker?.nextNode();while(clearNode&&!clearNode.textContent.trim())clearNode=walker.nextNode();if(!clearNode){document.title=JSON.stringify({ready:false});return 'waiting'}const clearRange=document.createRange();clearRange.setStart(clearNode,0);clearRange.setEnd(clearNode,1);const clearRect=clearRange.getBoundingClientRect();document.title=JSON.stringify({ready:true,clear:{x:clearRect.x+clearRect.width/2,y:clearRect.y+clearRect.height/2},first:{x:rs[0].x,y:rs[0].y,w:rs[0].width,h:rs[0].height},last:{x:rs[rs.length-1].x,y:rs[rs.length-1].y,w:rs[rs.length-1].width,h:rs[rs.length-1].height}});return 'ready'})()"
+
+        def clear_selection() -> None:
+            geometry = run_script(geometry_script)
+            origin = reader.mapToGlobal(QPointF(0, 0))
+            top_left = window.mapFromGlobal(QPoint(round(origin.x()), round(origin.y())))
+            # Hit actual unselected heading text, not the padding above a line.
+            # CodeMirror leaves the old range intact for clicks outside content.
+            point = geometry["clear"]
+            QTest.mouseClick(window, Qt.MouseButton.LeftButton, Qt.KeyboardModifier.NoModifier,
+                             QPoint(round(top_left.x() + point["x"]), round(top_left.y() + point["y"])), delay=80)
+            run_script("document.title=JSON.stringify({ready:!window.getSelection()?.toString(),selection:window.getSelection()?.toString()||''})")
 
         def drag(mode: str, reverse: bool = False) -> dict:
+            # A second drag inside an existing highlight is native text
+            # drag/drop, not a fresh selection in the opposite direction.
+            clear_selection()
             geometry = run_script(geometry_script)
             if "first" not in geometry:
                 raise AssertionError(f"Source selection geometry unavailable in {mode}: {geometry}")
             reader_origin = reader.mapToGlobal(QPointF(0, 0))
             reader_left = window.mapFromGlobal(QPoint(round(reader_origin.x()), round(reader_origin.y())))
-            # Each direction is a fresh selection. Starting the reverse drag
-            # inside the previous highlight can invoke native text drag/drop,
-            # which deliberately moves text rather than starting a new range.
-            QTest.mouseClick(window, Qt.MouseButton.LeftButton, Qt.KeyboardModifier.NoModifier,
-                             QPoint(round(reader_left.x() + geometry["first"]["x"] + 1),
-                                    round(reader_left.y() + geometry["first"]["y"] - 30)), delay=80)
-            geometry = run_script(geometry_script)
             left = QPoint(round(reader_left.x() + geometry["first"]["x"] + 1), round(reader_left.y() + geometry["first"]["y"] + geometry["first"]["h"] / 2))
             right = QPoint(round(reader_left.x() + geometry["last"]["x"] + geometry["last"]["w"] - 1), round(reader_left.y() + geometry["last"]["y"] + geometry["last"]["h"] / 2))
             start, end = (right, left) if reverse else (left, right)
@@ -155,8 +162,7 @@ def _probe(mode: str, zoom: float = 95.59963715447921, fullscreen: bool = False)
             if result.get("selection") != target_text:
                 raise AssertionError(f"Qt mouse drag did not select all {len(target_text)} target characters in {mode} {direction}: {result}")
 
-        # Exercise the path that differs from a clean drag: first create a
-        # short selection, then start another held drag inside that selection.
+        # A partial range must paint distinctly from the full active line.
         selection_result_script = "document.title=JSON.stringify({selection:window.getSelection()?.toString(),status:document.querySelector('.source-editor-status')?.textContent||''})"
         geometry = run_script(geometry_script)
         origin = reader.mapToGlobal(QPointF(0, 0))
@@ -164,12 +170,14 @@ def _probe(mode: str, zoom: float = 95.59963715447921, fullscreen: bool = False)
         base_left = round(reader_left.x() + geometry["first"]["x"] + 1)
         base_right = round(reader_left.x() + geometry["last"]["x"] + geometry["last"]["w"] - 1)
         base_y = round(reader_left.y() + geometry["first"]["y"] + geometry["first"]["h"] / 2)
+        end_y = round(reader_left.y() + geometry["last"]["y"] + geometry["last"]["h"] / 2)
         # Clear the whole-line selection on an unselected heading line first.
-        QTest.mouseClick(window, Qt.MouseButton.LeftButton, Qt.KeyboardModifier.NoModifier,
-                         QPoint(base_left, base_y - 30), delay=80)
+        clear_selection()
         partial_end = QPoint(base_left + max(8, round((base_right - base_left) * 2.2 / len(target_text))), base_y)
         held_drag(QPoint(base_left, base_y), partial_end)
         partial = run_script(selection_result_script)
+        if not 0 < len(partial.get("selection", "")) < len(target_text):
+            raise AssertionError(f"A short mouse drag did not create a partial range in {mode}: {partial}")
         pixel_delta = None
         selected_pixel = unselected_pixel = None
         if mode in ("editor", "split"):
@@ -182,13 +190,16 @@ def _probe(mode: str, zoom: float = 95.59963715447921, fullscreen: bool = False)
             selected_rect, active_rect = pixel_geometry["selected"], pixel_geometry["active"]
             reader_origin = reader.mapToGlobal(QPointF(0, 0))
             reader_left = window.mapFromGlobal(QPoint(round(reader_origin.x()), round(reader_origin.y())))
-            ratio = frame.devicePixelRatio()
+            # QQuickWindow grab images can carry a default DPR of one even
+            # when their physical dimensions are scaled. Map the actual image
+            # size to the logical window instead of trusting that metadata.
+            ratio_x, ratio_y = frame.width() / window.width(), frame.height() / window.height()
             # Compare dominant colors over the selection and an empty region
             # on the same active line. Opaque .cm-activeLine used to cover the
             # selection rectangle and make these background colors identical.
             def frame_rect(x: float, y: float, width: float, height: float) -> tuple[int, int, int, int]:
-                return (round((reader_left.x() + x) * ratio), round((reader_left.y() + y) * ratio),
-                        round(width * ratio), round(height * ratio))
+                return (round((reader_left.x() + x) * ratio_x), round((reader_left.y() + y) * ratio_y),
+                        round(width * ratio_x), round(height * ratio_y))
 
             def dominant(rect: tuple[int, int, int, int]) -> str:
                 x, y, width, height = rect
@@ -199,13 +210,15 @@ def _probe(mode: str, zoom: float = 95.59963715447921, fullscreen: bool = False)
                     raise AssertionError(f"Selection color sample is outside the native frame in {mode}: {rect}, {frame.width()}x{frame.height()}")
                 return Counter(pixels).most_common(1)[0][0]
 
-            selected_box = frame_rect(selected_rect["x"], active_rect["y"],
-                                      selected_rect["w"], active_rect["h"])
+            # The active source line can wrap. Compare only the selected
+            # visual row, not the unselected rows underneath it.
+            selected_box = frame_rect(selected_rect["x"], selected_rect["y"],
+                                      selected_rect["w"], selected_rect["h"])
             empty_width = min(32, active_rect["w"] - selected_rect["x"] - selected_rect["w"] - 8)
             if empty_width < 8:
                 raise AssertionError(f"Active line has no empty comparison area in {mode}: {pixel_geometry}")
             empty_box = frame_rect(active_rect["x"] + active_rect["w"] - empty_width - 4,
-                                   active_rect["y"], empty_width, active_rect["h"])
+                                   selected_rect["y"], empty_width, selected_rect["h"])
             selected_pixel = dominant(selected_box)
             unselected_pixel = dominant(empty_box)
             selected_rgb = tuple(int(selected_pixel[i:i + 2], 16) for i in (1, 3, 5))
@@ -213,18 +226,15 @@ def _probe(mode: str, zoom: float = 95.59963715447921, fullscreen: bool = False)
             pixel_delta = max(abs(a - b) for a, b in zip(selected_rgb, unselected_rgb))
             if pixel_delta < 5:
                 raise AssertionError(f"Partial source selection is not visibly distinct from the active-line fill in {mode}: selected={selected_pixel}, unselected={unselected_pixel}, delta={pixel_delta}, geometry={pixel_geometry}")
-        held_drag(QPoint(base_left + 2, base_y), QPoint(base_right, base_y))
-        selected_drag = run_script(selection_result_script)
-
         # A longer native-style gesture: hold still, then move for >1 second.
-        QTest.mouseClick(window, Qt.MouseButton.LeftButton, Qt.KeyboardModifier.NoModifier,
-                         QPoint(base_left, base_y - 30), delay=80)
-        held_drag(QPoint(base_left, base_y), QPoint(base_right, base_y), hold_ms=1200, step_ms=45)
+        clear_selection()
+        held_drag(QPoint(base_left, base_y), QPoint(base_right, end_y), hold_ms=1200, step_ms=45)
         long_drag = run_script(selection_result_script)
         if long_drag.get("selection") != target_text:
             raise AssertionError(f"Long-held native drag failed in {mode}: {long_drag}")
 
         # Release beyond the WebEngine viewport, then begin a fresh selection.
+        clear_selection()
         viewport_origin = reader.mapToGlobal(QPointF(0, 0))
         viewport_exit = QPoint(min(window.width() - 8, base_right + 24),
                                window.mapFromGlobal(QPoint(round(viewport_origin.x()), round(viewport_origin.y()))).y() - 8)
@@ -234,22 +244,19 @@ def _probe(mode: str, zoom: float = 95.59963715447921, fullscreen: bool = False)
         QTest.mouseRelease(window, Qt.MouseButton.LeftButton, Qt.KeyboardModifier.NoModifier,
                            viewport_exit, delay=80)
         QTest.qWait(120)
-        QTest.mouseClick(window, Qt.MouseButton.LeftButton, Qt.KeyboardModifier.NoModifier,
-                         QPoint(base_left, base_y - 30), delay=80)
-        held_drag(QPoint(base_left, base_y), QPoint(base_right, base_y))
+        clear_selection()
+        held_drag(QPoint(base_left, base_y), QPoint(base_right, end_y))
         after_outside_release = run_script(selection_result_script)
         if after_outside_release.get("selection") != target_text:
             raise AssertionError(f"A drag released outside the reader blocked the next selection in {mode}: {after_outside_release}")
-        print(json.dumps({"probe": "preselected-drag", "mode": mode,
+        print(json.dumps({"probe": "native-selection", "mode": mode,
                           "partialLength": len(partial.get("selection", "")),
-                          "afterStartInsideSelectionLength": len(selected_drag.get("selection", "")),
                           "afterLongHeldDragLength": len(long_drag.get("selection", "")),
                           "afterOutsideReleaseLength": len(after_outside_release.get("selection", "")),
                           "partialSelectionPixelDelta": pixel_delta,
                           "partialSelectedPixel": selected_pixel,
                           "activeLinePixel": unselected_pixel,
                           "partialStatus": partial.get("status"),
-                          "afterStatus": selected_drag.get("status"),
                           "longStatus": long_drag.get("status"),
                           "outsideStatus": after_outside_release.get("status")}))
 

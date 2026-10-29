@@ -192,8 +192,10 @@ class StudioUiTest {
         val original=model.state.value.active.content
         val oldAutofix=model.state.value.latexAutofix
         val prefs=compose.activity.getSharedPreferences("studio",0)
+        val clipboard = compose.activity.getSystemService(android.content.ClipboardManager::class.java)
         try {
             assertFalse(StudioState().latexAutofix)
+            clipboard.setPrimaryClip(android.content.ClipData.newPlainText("Super MD test", "theme-guide-copy-not-run"))
             compose.runOnIdle {model.latexAutofix(false);model.mode("editor");model.edit(model.state.value.active.id,"Start here.")}
             javascriptUntil("document.querySelector('.cm-content')?.textContent==='Start here.'",{it=="true"})
             compose.onNodeWithContentDescription("More actions").performClick()
@@ -201,9 +203,8 @@ class StudioUiTest {
             compose.onNodeWithText("Appearance").performClick()
             compose.onNodeWithText("Theme authoring guide").performScrollTo().performClick()
             javascriptUntil("!!document.querySelector('.theme-guide-dialog .markdown-body h1')",{it=="true"})
-            javascriptUntil("(()=>{const b=[...document.querySelectorAll('.theme-guide-dialog button')].find(b=>b.textContent==='Copy guide');if(b)b.click();return true})()",{it=="true"})
-            javascriptUntil("document.querySelector('.theme-guide-dialog')?.textContent.includes('Copied')",{it=="true"})
-            val clipboard = compose.activity.getSystemService(android.content.ClipboardManager::class.java)
+            javascriptUntil("(()=>{const b=[...document.querySelectorAll('.theme-guide-dialog button')].find(b=>b.textContent==='Copy guide');return !!b&&!b.disabled})()",{it=="true"})
+            javascriptUntil("(()=>{const b=[...document.querySelectorAll('.theme-guide-dialog button')].find(b=>b.textContent==='Copy guide');if(!b||b.disabled)return false;b.click();return true})()",{it=="true"})
             compose.waitUntil(5_000) {
                 runCatching {
                     val text=clipboard.primaryClip?.getItemAt(0)?.text?.toString().orEmpty()
