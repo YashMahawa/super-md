@@ -331,6 +331,17 @@ def _probe(directory: str) -> int:
         elif key=="close_created":
             if result.get("status") not in ("closed","closing"):
                 raise RuntimeError(f"Explicit discard did not close created tab: {result}")
+            sequence.append(("confirm_created_closed",lambda _row:("list",)))
+            start_next()
+        elif key=="confirm_created_closed":
+            still_open=any(row.get("id")==state["created_target"] for row in result.get("tabs",[]))
+            if still_open:
+                sequence.insert(0,("confirm_created_closed",lambda _row:("list",)))
+                QTimer.singleShot(100,start_next)
+                return
+            # A close can report "closing" while closed-note recovery is still
+            # being written. Capture focus only after a fresh CLI listing proves
+            # that the target tab has actually left the live session.
             state["focus_before_background_open"]=studio.active
             sequence.append(("open_background",lambda _row:("open",state["save_path"],"--background")))
             start_next()
@@ -396,8 +407,16 @@ def _probe(directory: str) -> int:
         elif key=="close_saved":
             if result.get("status") not in ("closed","closing"):
                 raise RuntimeError(f"Saved tab failed to close cleanly: {result}")
-            sequence.append(("reopen_background",lambda _row:("open",state["save_path"],"--background")))
+            sequence.append(("confirm_saved_closed",lambda _row:("list",)))
             start_next()
+        elif key=="confirm_saved_closed":
+            still_open=any(row.get("id")==state["saved_target"] for row in result.get("tabs",[]))
+            if still_open:
+                sequence.insert(0,("confirm_saved_closed",lambda _row:("list",)))
+                QTimer.singleShot(100,start_next)
+            else:
+                sequence.append(("reopen_background",lambda _row:("open",state["save_path"],"--background")))
+                start_next()
         elif key=="reopen_background":
             if result.get("status")!="opening" or not result.get("jobId"):
                 raise RuntimeError(f"Reopening the closed path did not start an async job: {result}")

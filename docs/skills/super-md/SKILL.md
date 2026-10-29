@@ -49,6 +49,9 @@ instead of retrying the same failed pixel request. Older relays without
 `TARGET` is the complete returned `tab:…` target, not a filename guessed from its
 title. Cloud calls use the returned `tabId` and an explicit `deviceId` when
 several devices are online. Re-list after a tab closes or a device reconnects.
+Desktop close can return `status:"closing"` while its recovery snapshot is
+written. Refresh the tab/session list until that target disappears before
+assuming its replacement tab has focus; do not send the close again.
 
 For “explain what I am looking at”, read context and take a viewport screenshot.
 Use the returned visible source offsets to fetch exact Markdown if needed;

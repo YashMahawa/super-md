@@ -193,7 +193,9 @@ desktop to open a file under its approved note roots; a new file returns a
 `jobId` while loading, then job status contains its tab metadata. Use
 `activate_document` to select a tab, and `close_document` with the current
 revision to close it; dirty tabs require `discard_changes=true`, and closed-note
-recovery may return `closing` while it finishes. LaTeX fixes are proposed first, then selected indices are applied
+recovery may return `closing` while it finishes. In that case, refresh the
+tab/session list until the target is gone before depending on the new active
+tab; do not repeat the close request. LaTeX fixes are proposed first, then selected indices are applied
 against the review revision as one desktop edit. `get_context` reports the
 current selection, visible source range, and revision-bound diagram references;
 `list_diagrams` pages diagram metadata with `offset` and `limit` (default 80,
