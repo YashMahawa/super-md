@@ -147,6 +147,27 @@ class StudioViewModel(app: Application, val workspaceKey: String = "main") : And
         action()
         true
     }
+    /** Waits until the reader reflects an already-selected native tab. This is
+     * a read/flush acknowledgement only; it never changes focus or retries a
+     * document write. */
+    internal suspend fun awaitReaderSnapshot(noteId: String, timeoutMillis: Long = 8_000): Boolean =
+        kotlinx.coroutines.withTimeoutOrNull(timeoutMillis) {
+            while (true) {
+                val current = mutable.value
+                if (current.activeId != noteId || current.active.id != noteId) return@withTimeoutOrNull false
+                val acknowledged = try {
+                    readerFlushRequester?.invoke(noteId) ?: readerStateIsNativeAuthoritative(noteId)
+                } catch (cancelled: kotlinx.coroutines.CancellationException) {
+                    throw cancelled
+                } catch (_: Exception) {
+                    false
+                }
+                if (acknowledged) return@withTimeoutOrNull true
+                kotlinx.coroutines.delay(40)
+            }
+            @Suppress("UNREACHABLE_CODE")
+            false
+        } == true
     private fun readerBarrierFailed() {
         mutable.value = mutable.value.copy(message = "The reader could not confirm its latest edits. The action was canceled; keep the note open and try again.")
     }
@@ -779,7 +800,18 @@ class StudioViewModel(app: Application, val workspaceKey: String = "main") : And
             if (revisionError != null) { onComplete?.invoke(revisionError); return@launch }
             if (closeError != null) { onComplete?.invoke(closeError); return@launch }
             if (preserve) closeAfterReaderBarrier(id)
-            onComplete?.invoke(if (mutable.value.tabs.any { it.id == id }) "The note could not be closed; it remains open" else null)
+            val afterClose = mutable.value
+            if (afterClose.tabs.any { it.id == id }) {
+                onComplete?.invoke("The note could not be closed; it remains open")
+                return@launch
+            }
+            if (afterClose.active.id != activeId && !awaitReaderSnapshot(afterClose.active.id)) {
+                val message = "The note was closed and preserved, but the active reader is still loading; refresh the tabs before the next action."
+                mutable.value = mutable.value.copy(message = message)
+                onComplete?.invoke(message)
+                return@launch
+            }
+            onComplete?.invoke(null)
         }
     }
 

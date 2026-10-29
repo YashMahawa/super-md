@@ -213,6 +213,7 @@ class AgentRelayLifecycleIntegrationTest {
             assertTrue((closed.first as JSONObject).getBoolean("closed"))
             assertFalse(model!!.state.value.tabs.any { it.id == background.id })
             assertTrue(model!!.state.value.closedTabs.any { it.id == background.id })
+            assertTrue("Closing must acknowledge its fallback reader before replying", model!!.readerStateIsNativeAuthoritative(model!!.state.value.active.id))
 
             val portableCreated = call(scenario, handler, "document_action", JSONObject().put("documentAction", "create")
                 .put("content", "# Portable format\n").put("options", JSONObject().put("title", "Background portable")

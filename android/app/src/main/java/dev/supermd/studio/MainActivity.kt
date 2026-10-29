@@ -729,23 +729,7 @@ private object NoMotionScheme : MotionScheme {
                                     // live reader has acknowledged this exact native snapshot; otherwise an
                                     // immediate close can safely fail its own flush while JS still holds the
                                     // previous tab. The close barrier remains mandatory after this handshake.
-                                    val readerReady = kotlinx.coroutines.withTimeoutOrNull(8_000) {
-                                        while (true) {
-                                            if (model.state.value.activeId != target) return@withTimeoutOrNull false
-                                            val acknowledged = try {
-                                                model.readerFlushRequester?.invoke(target)
-                                                    ?: model.readerStateIsNativeAuthoritative(target)
-                                            } catch (cancelled: kotlinx.coroutines.CancellationException) {
-                                                throw cancelled
-                                            } catch (_: Exception) {
-                                                false
-                                            }
-                                            if (acknowledged) return@withTimeoutOrNull true
-                                            kotlinx.coroutines.delay(40)
-                                        }
-                                        @Suppress("UNREACHABLE_CODE")
-                                        false
-                                    } == true
+                                    val readerReady = model.awaitReaderSnapshot(target)
                                     if (!readerReady) reply(null, "The requested tab is still loading in the reader; retry activation shortly")
                                     else {
                                         val note = model.state.value.tabs.firstOrNull { it.id == target }
