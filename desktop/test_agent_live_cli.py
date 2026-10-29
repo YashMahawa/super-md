@@ -126,7 +126,7 @@ class LiveCLISubprocessTests(unittest.TestCase):
             self.studio.session.writes.shutdown(wait=False)
         self.app.processEvents()
     def run_cli(self,*args,timeout=5):
-        process=subprocess.Popen([sys.executable,str(self.cli),"live","--sessions-dir",str(self.bridge.discovery_dir),*map(str,args)],cwd=self.cli.parent,env=self.env,stdout=subprocess.PIPE,stderr=subprocess.PIPE,text=True)
+        process=subprocess.Popen([sys.executable,str(self.cli),"live","--sessions-dir",str(self.bridge.discovery_dir),*map(str,args)],cwd=self.cli.parent,env=self.env,stdout=subprocess.PIPE,stderr=subprocess.PIPE,text=True,encoding="utf-8",errors="strict")
         deadline=time.monotonic()+timeout
         while process.poll() is None and time.monotonic()<deadline:
             self.app.processEvents(); time.sleep(.003)
@@ -175,7 +175,7 @@ class LiveCLISubprocessTests(unittest.TestCase):
 
     def test_command_is_headless_and_requires_private_sessions_directory(self):
         env=dict(self.env,QT_QPA_PLATFORM="invalid"); missing=self.temp/"missing-sessions"
-        result=subprocess.run([sys.executable,str(self.cli),"live","--sessions-dir",str(missing),"list"],cwd=self.cli.parent,env=env,capture_output=True,text=True,timeout=5)
+        result=subprocess.run([sys.executable,str(self.cli),"live","--sessions-dir",str(missing),"list"],cwd=self.cli.parent,env=env,capture_output=True,text=True,encoding="utf-8",errors="strict",timeout=5)
         self.assertNotEqual(result.returncode,0)
         self.assertEqual(result.stderr,"")
         self.assertEqual(json.loads(result.stdout)["ok"],False)

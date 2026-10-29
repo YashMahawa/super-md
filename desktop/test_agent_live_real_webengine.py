@@ -71,6 +71,7 @@ def _probe(directory: str) -> int:
     def start_call(key,*arguments,expect_error=False):
         command=[sys.executable,str(cli),"live","--sessions-dir",sessions,*map(str,arguments)]
         process=subprocess.Popen(command,cwd=ROOT,stdout=subprocess.PIPE,stderr=subprocess.PIPE,text=True,
+                                 encoding="utf-8",errors="strict",
                                  env=dict(os.environ,QT_QPA_PLATFORM="invalid"))
         capture, drain_thread = _drain_process_output(process)
         state["proc"]=process; state["capture"]=capture; state["drain_thread"]=drain_thread
@@ -494,9 +495,12 @@ def _probe(directory: str) -> int:
 
 class RealWebEngineAgentRenderTests(unittest.TestCase):
     def test_cli_output_drainer_handles_both_pipes_beyond_windows_buffer_size(self):
-        payload="x"*256_000
-        code="import sys; sys.stdout.write('x'*256000); sys.stdout.flush(); sys.stderr.write('y'*256000); sys.stderr.flush()"
-        process=subprocess.Popen([sys.executable,"-c",code],stdout=subprocess.PIPE,stderr=subprocess.PIPE,text=True)
+        payload="x"*256_000+"🧭東京"
+        stderr_payload="y"*256_000+"café"
+        code=("import sys; sys.stdout.buffer.write(('x'*256000+'🧭東京').encode('utf-8')); "
+              "sys.stdout.flush(); sys.stderr.buffer.write(('y'*256000+'café').encode('utf-8')); sys.stderr.flush()")
+        process=subprocess.Popen([sys.executable,"-c",code],stdout=subprocess.PIPE,stderr=subprocess.PIPE,text=True,
+                                 encoding="utf-8",errors="strict")
         completed,thread=_drain_process_output(process)
         captured,error=completed.get(timeout=15)
         thread.join(timeout=1)
@@ -504,7 +508,7 @@ class RealWebEngineAgentRenderTests(unittest.TestCase):
         returncode,stdout,stderr=captured
         self.assertEqual(returncode,0)
         self.assertEqual(stdout,payload)
-        self.assertEqual(stderr,"y"*256_000)
+        self.assertEqual(stderr,stderr_payload)
 
     @unittest.skipUnless((ROOT.parent/"dist"/"qt-reader.html").is_file(),"Build the Qt reader before real WebEngine integration tests")
     def test_real_studio_qml_browser_hook_and_cli_capture_current_reader_pixels(self):
@@ -513,7 +517,7 @@ class RealWebEngineAgentRenderTests(unittest.TestCase):
                      QT_SCALE_FACTOR="2",
                      QTWEBENGINE_DISABLE_SANDBOX="1",QTWEBENGINE_CHROMIUM_FLAGS="--disable-gpu --disable-dev-shm-usage")
             result=subprocess.run([sys.executable,str(Path(__file__).resolve()),"--probe",temp],cwd=ROOT,env=env,
-                                  capture_output=True,text=True,timeout=150)
+                                  capture_output=True,text=True,encoding="utf-8",errors="strict",timeout=150)
         lines=[line for line in result.stdout.splitlines() if line.startswith("{" )]
         self.assertTrue(lines,f"real QML/WebEngine probe emitted no report: {result.stdout}\n{result.stderr}")
         report=json.loads(lines[-1])

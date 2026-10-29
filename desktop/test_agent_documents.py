@@ -420,7 +420,7 @@ class AgentDocumentsTest(unittest.TestCase):
         code = "import sys; from agent_cli import main; raise SystemExit(main())"
         env = dict(os.environ, PYTHONPATH=str(Path(__file__).parent))
         result = subprocess.run([sys.executable, "-c", code, "--root", str(self.root), "inspect", "cli.md"],
-                                capture_output=True, text=True, env=env, check=False)
+                                capture_output=True, text=True, encoding="utf-8", errors="strict", env=env, check=False)
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(result.stderr, "")
         parsed = json.loads(result.stdout)
@@ -429,7 +429,7 @@ class AgentDocumentsTest(unittest.TestCase):
         self.assertNotIn("PySide6", result.stderr)
         headless = subprocess.run([sys.executable, "-c",
                                    "import agent_cli,mcp_server,agent_live_client,sys; assert 'PySide6' not in sys.modules and 'mcp' not in sys.modules"],
-                                  capture_output=True, text=True, env=env, check=False)
+                                  capture_output=True, text=True, encoding="utf-8", errors="strict", env=env, check=False)
         self.assertEqual(headless.returncode, 0, headless.stderr)
 
 

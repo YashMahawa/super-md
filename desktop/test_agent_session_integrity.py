@@ -224,7 +224,7 @@ class AgentSessionIntegrityTests(unittest.TestCase):
         result = self._save(tab, filename="taken.md")
 
         self.assertTrue(result["pathChanged"])
-        self.assertEqual(result["oldPath"], str(source))
+        self.assertEqual(result["oldPath"], str(source.resolve()))
         self.assertEqual(result["newPath"], result["path"])
         self.assertEqual(occupied.read_text(encoding="utf-8"), "# Keep\n")
         self.assertEqual(Path(result["path"]).read_text(encoding="utf-8"), "# Saved elsewhere\n")
@@ -241,7 +241,7 @@ class AgentSessionIntegrityTests(unittest.TestCase):
 
         result = self._save(target)
 
-        self.assertEqual(result["path"], str(path))
+        self.assertEqual(result["path"], str(path.resolve()))
         self.assertEqual(path.read_text(encoding="utf-8"), "# Saved inactive\n")
         self.assertEqual(self.studio.active, active["id"])
 
@@ -259,7 +259,7 @@ class AgentSessionIntegrityTests(unittest.TestCase):
                     with self.assertRaisesRegex(ValueError, "save is already in progress"):
                         self._save(tab, **options)
                     self.assertEqual(path.read_text(encoding="utf-8"), "# Saved snapshot\n")
-                    self.assertEqual(tab["path"], str(path))
+                    self.assertEqual(tab["path"], str(path.resolve()))
                     self.assertEqual(tab["saved"], original_saved)
                     self.assertEqual(tab["content"], original_content)
                     self.assertFalse((self.root / "copy.md").exists())

@@ -138,6 +138,13 @@ class AgentRelayLifecycleIntegrationTest {
             awaitBridge(scenario, handler)
             val initial = model!!.state.value.active
             assertEquals(initial.id, model!!.state.value.activeId)
+            val focusContent = "# Agent focus fixture\n\nVisible focused paragraph with emoji 😀 and math \$E = mc^2\$.\n\n```svg\n<svg xmlns=\"http://www.w3.org/2000/svg\" width=\"12\" height=\"12\"><rect width=\"12\" height=\"12\" fill=\"#3478f6\"/></svg>\n```\n"
+            scenario.onActivity { model!!.edit(initial.id, focusContent) }
+            waitUntil(20_000) {
+                readerJavascript(scenario, """(()=>{const a=document.querySelector('.markdown-body'),i=a?.querySelector('.svg-diagram');if(!a?.innerText.includes('Visible focused paragraph with emoji 😀')||!i?.complete||document.fonts.status!=='loaded')return false;if(window.__agentLifecycleFixtureStable===undefined){window.__agentLifecycleFixtureStable=false;requestAnimationFrame(()=>requestAnimationFrame(()=>window.__agentLifecycleFixtureStable=true));return false}return window.__agentLifecycleFixtureStable===true})()""") == "true"
+            }
+            assertTrue("Reader did not acknowledge the focused fixture", runBlocking { model!!.readerFlushRequester?.invoke(initial.id) == true })
+            assertEquals(focusContent, model!!.state.value.tabs.first { it.id == initial.id }.content)
             val visibleDraft = evaluateReaderText(scenario)
             assertTrue("Lifecycle test needs visible reader content", visibleDraft.length > 2)
 
@@ -370,12 +377,15 @@ class AgentRelayLifecycleIntegrationTest {
     }
 
     private fun evaluateReaderText(scenario: ActivityScenario<MainActivity>): String {
+        return readerJavascript(scenario, "document.querySelector('.markdown-body')?.innerText ?? document.querySelector('.cm-content')?.textContent ?? ''")
+    }
+
+    private fun readerJavascript(scenario: ActivityScenario<MainActivity>, script: String): String {
         val reply = AtomicReference<String?>(null)
         val latch = CountDownLatch(1)
         scenario.onActivity { owner ->
-            findWebView(owner.window.decorView)?.evaluateJavascript(
-                "document.querySelector('.cm-content')?.textContent ?? document.querySelector('.markdown-body')?.textContent ?? ''",
-            ) { value -> reply.set(value); latch.countDown() } ?: latch.countDown()
+            findWebView(owner.window.decorView)?.evaluateJavascript(script) { value -> reply.set(value); latch.countDown() }
+                ?: latch.countDown()
         }
         assertTrue("Reader did not return its visible document text", latch.await(10, TimeUnit.SECONDS))
         return requireNotNull(reply.get()) { "Reader WebView was unavailable" }

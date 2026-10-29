@@ -23,7 +23,7 @@ class AgentCLIWorkflowTests(unittest.TestCase):
 
     def run_cli(self, *args, ok=True):
         completed = subprocess.run([self.python, str(self.cli), "--root", str(self.root), *map(str, args)],
-                                   capture_output=True, text=True, check=False)
+                                   capture_output=True, text=True, encoding="utf-8", errors="strict", check=False)
         self.assertEqual(completed.returncode == 0, ok, completed.stderr + completed.stdout[:500])
         self.assertLessEqual(len(completed.stdout.encode("utf-8")), 64_000)
         value = json.loads(completed.stdout)
