@@ -1,4 +1,4 @@
-# Super MD 0.6.19
+# Super MD 0.6.20
 
 ## Reliable agent editing across devices
 
@@ -19,6 +19,15 @@
 - Completed cloud exports provide private, expiring download links and MCP resources. File bytes stream in bounded chunks with SHA-256 verification instead of filling the model's text context with base64. The CLI also supports verified, create-only downloads.
 - PDF export now prepares reference-style images through the same asset pipeline as inline images.
 - Heading jumps retain their target when a neighbouring diagram finishes sizing late, while user scrolling and zooming immediately take control.
+
+## Selection and desktop settings
+
+- Partial selections in Source and Split now stay visible: the active-line background no longer covers the selected characters. Native mouse tests check both the selected text and the painted highlight.
+- The Qt reader now declares its desktop platform before shared-reader startup, enabling the intended desktop selection alignment.
+- Keyboard shortcuts have their own Settings category with inline key recording, conflict validation and reset controls.
+- Onboarding actions remain reachable in short desktop windows.
+- Long uninterrupted typing sessions split undo groups before reaching the session-transfer limit, preserving undo and redo when restoring a view.
+- The legacy PDF export path now rejects image paths that escape the document or export folders, including symlink escapes.
 
 ## Android settings
 

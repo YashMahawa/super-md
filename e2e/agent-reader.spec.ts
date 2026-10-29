@@ -198,6 +198,134 @@ test('heading navigation realigns after delayed layout growth beyond a windowed 
   await expect(page.getByText('Final paragraph.',{exact:true})).toBeInViewport();
 });
 
+test('slow mouse drags keep selecting source, reader and live text after a prior selection',async({page})=>{
+  const first='The first realistic mouse drag should select this complete sentence.',
+    second='A later drag must keep extending selection instead of stopping after a character.',
+    paragraphs=Array.from({length:78},(_,index)=>index===2?first:index===6?second:`Paragraph ${index}: mixed Markdown with **bold**, a [link](https://example.org), inline $x^2$, and enough useful words to fill a realistic note.`),
+    content=`# Mouse selection 🧭\n\n${paragraphs.join('\n\n')}\n\n\`\`\`ts\nconst source = "selection spans CodeMirror text";\n\`\`\`\n`;
+  await page.setViewportSize({width:2182,height:1164});
+  await page.addInitScript(()=>{document.documentElement.dataset.host='qt';});
+  for(const mode of ['editor','reader','live'] as const)for(const zoom of [40,95.59963715447921,300]){
+    await page.goto('/android-reader.html');await page.waitForFunction(()=>typeof window.supermdLoad==='function');
+    await page.evaluate(({content,mode,zoom})=>window.supermdLoad?.({id:`mouse-selection-${mode}-${zoom}`,path:null,content,mode,dark:false,fullscreen:false,colors:{},font:'Manrope',size:16,zoom:100,restorePosition:false}),{content,mode,zoom});
+    const editor=page.locator('.cm-editor'),source=page.locator('.android-source');
+    const rendered=page.locator('.android-reading .markdown-body');
+    if(mode==='editor')await expect(editor).toBeVisible();else await expect(rendered).toBeVisible();
+    await page.evaluate(zoom=>window.supermdSetZoom?.(zoom),zoom);
+    if(mode==='editor')await expect.poll(()=>source.evaluate(element=>getComputedStyle(element).getPropertyValue('--workspace-scale').trim())).toBe(String(zoom/100));
+    else await expect.poll(()=>page.locator('.document-page').getAttribute('data-scale')).toBe(String(zoom/100));
+    await page.evaluate(()=>new Promise<void>(resolve=>requestAnimationFrame(()=>requestAnimationFrame(()=>resolve()))));
+    const dragSelect=async(text:string)=>{
+      const lineElement=mode==='editor'?page.locator('.cm-line').filter({hasText:text}).first():rendered.locator('p').filter({hasText:text}).first();
+      await expect(lineElement).toBeVisible();await lineElement.scrollIntoViewIfNeeded();
+      const points=await lineElement.evaluate((element,text)=>{
+        const walker=document.createTreeWalker(element,NodeFilter.SHOW_TEXT);let node:Node|null;
+        while(node=walker.nextNode()){
+          const value=node.textContent??'',from=value.indexOf(text);if(from<0)continue;
+          const aRange=document.createRange(),bRange=document.createRange();aRange.setStart(node,from);aRange.setEnd(node,from+1);bRange.setStart(node,from+text.length-1);bRange.setEnd(node,from+text.length);
+          const a=aRange.getBoundingClientRect(),b=bRange.getBoundingClientRect();return {start:{x:a.left+a.width/2,y:a.top+a.height/2},end:{x:b.right+1,y:b.top+b.height/2}};
+        }
+        return null;
+      },text);
+      expect(points,`text hit coordinates for ${mode} at ${zoom}%`).not.toBeNull();
+      await page.mouse.move(points!.start.x,points!.start.y);await page.mouse.down();
+      for(let step=1;step<=18;step++){
+        const fraction=step/18;await page.mouse.move(points!.start.x+(points!.end.x-points!.start.x)*fraction,points!.start.y+(points!.end.y-points!.start.y)*fraction);
+        await page.waitForTimeout(18);
+      }
+      await page.mouse.up();await expect.poll(()=>page.evaluate(()=>window.getSelection()?.toString()??'')).toContain(text);
+    };
+    await dragSelect(first);
+    // Keep the first selection when beginning the second physical drag; a
+    // stale selection must not turn the new gesture into a text drag operation.
+    await dragSelect(second);
+  }
+});
+
+test('long-held outside release keeps later mouse selections active at fractional zoom',async({page})=>{
+  const first='The first drag waits before moving and must still select this whole sentence.',
+    second='The next drag releases outside the window before another selection starts.',
+    third='The final drag checks that native release cleanup did not strand the pointer.',
+    paragraphs=Array.from({length:70},(_,index)=>index===2?third:index===4?second:index===6?first:`Paragraph ${index}: realistic mixed Markdown with **bold**, a [link](https://example.org), inline $x^2$, and useful note text.`),
+    content=`# Gesture lifecycle 🧭\n\n${paragraphs.join('\n\n')}\n\n\`\`\`ts\nconst source = "selection remains available";\n\`\`\`\n`,
+    zoom=95.59963715447921;
+  await page.setViewportSize({width:2182,height:1164});await page.addInitScript(()=>{document.documentElement.dataset.host='qt';});
+  for(const mode of ['editor','reader','split','live'] as const){
+    await page.goto('/android-reader.html');await page.waitForFunction(()=>typeof window.supermdLoad==='function');
+    const state={id:`gesture-lifecycle-${mode}`,path:null,content,mode,dark:false,fullscreen:false,colors:{},font:'Manrope',size:16,zoom:100,restorePosition:false};
+    await page.evaluate(value=>window.supermdLoad?.(value),state);
+    const editor=page.locator('.cm-editor'),source=page.locator('.android-source'),rendered=page.locator('.android-reading .markdown-body');
+    if(mode==='editor')await expect(editor).toBeVisible();else await expect(rendered).toBeVisible();
+    await page.evaluate(value=>window.supermdSetZoom?.(value),zoom);
+    if(mode==='editor')await expect.poll(()=>source.evaluate(element=>getComputedStyle(element).getPropertyValue('--workspace-scale').trim())).toBe(String(zoom/100));
+    else await expect.poll(()=>page.locator('.document-page').getAttribute('data-scale')).toBe(String(zoom/100));
+    await page.evaluate(()=>new Promise<void>(resolve=>requestAnimationFrame(()=>requestAnimationFrame(()=>resolve()))));
+    const pointsFor=async(text:string)=>{
+      const locator=mode==='editor'?page.locator('.cm-line').filter({hasText:text}).first():rendered.locator('p').filter({hasText:text}).first();
+      await expect(locator).toBeVisible();await locator.scrollIntoViewIfNeeded();
+      const points=await locator.evaluate((element,text)=>{
+        const walker=document.createTreeWalker(element,NodeFilter.SHOW_TEXT);let node:Node|null;
+        while(node=walker.nextNode()){
+          const value=node.textContent??'',from=value.indexOf(text);if(from<0)continue;
+          const aRange=document.createRange(),bRange=document.createRange();aRange.setStart(node,from);aRange.setEnd(node,from+1);bRange.setStart(node,from+text.length-1);bRange.setEnd(node,from+text.length);
+          const a=aRange.getBoundingClientRect(),b=bRange.getBoundingClientRect();return {start:{x:a.left+a.width/2,y:a.top+a.height/2},end:{x:b.right+1,y:b.top+b.height/2}};
+        }
+        return null;
+      },text);
+      expect(points,`text hit coordinates for ${mode}`).not.toBeNull();return points!;
+    };
+    const slowDrag=async(points:{start:{x:number;y:number};end:{x:number;y:number}},holdMs=0,releaseOutside=false)=>{
+      await page.mouse.move(points.start.x,points.start.y);await page.mouse.down();if(holdMs)await page.waitForTimeout(holdMs);
+      // A same-document native snapshot echo while the mouse is held must not
+      // remount the editor or replace the reader selection target.
+      await page.evaluate(value=>window.supermdLoad?.({...value,contentUnchanged:true}),state);
+      for(let step=1;step<=30;step++){
+        const fraction=step/30;await page.mouse.move(points.start.x+(points.end.x-points.start.x)*fraction,points.start.y+(points.end.y-points.start.y)*fraction);await page.waitForTimeout(40);
+      }
+      if(releaseOutside){await page.mouse.move(2190,1172);await page.waitForTimeout(50);}
+      await page.mouse.up();
+    };
+    await slowDrag(await pointsFor(first),1200);
+    await expect.poll(()=>page.evaluate(()=>window.getSelection()?.toString()??'')).toContain(first);
+    const outsidePoints=await pointsFor(second);
+    // A click outside the old selection makes this a fresh text drag rather
+    // than the platform's native selected-text move gesture.
+    await page.mouse.click(outsidePoints.start.x,outsidePoints.start.y);await page.evaluate(()=>window.getSelection()?.removeAllRanges());
+    await slowDrag(outsidePoints,0,true);await expect.poll(()=>page.evaluate(()=>window.getSelection()?.toString()??'')).toContain(second);
+    // The final target is before the range extended by the outside release.
+    await slowDrag(await pointsFor(third));await expect.poll(()=>page.evaluate(()=>window.getSelection()?.toString()??'')).toContain(third);
+  }
+});
+
+test('mode switches after fractional zoom still allow a fresh drag selection',async({page})=>{
+  const sentence='Mouse selection remains available after switching reader modes.',
+    content=`# Mode switch check\n\n${sentence}\n\n\`\`\`ts\nconst source = "mode switch";\n\`\`\`\n`,zoom=95.59963715447921;
+  await page.setViewportSize({width:2182,height:1164});await page.addInitScript(()=>{document.documentElement.dataset.host='qt';});
+  await page.goto('/android-reader.html');await page.waitForFunction(()=>typeof window.supermdLoad==='function');
+  for(const mode of ['editor','reader','split','live'] as const){
+    const state={id:'mode-switch-selection',path:null,content,mode,dark:false,fullscreen:false,colors:{},font:'Manrope',size:16,zoom:100,restorePosition:false};
+    await page.evaluate(value=>window.supermdLoad?.(value),state);await page.evaluate(value=>window.supermdSetZoom?.(value),zoom);
+    const rendered=page.locator('.android-reading .markdown-body');
+    const locator=mode==='editor'?page.locator('.cm-line').filter({hasText:sentence}).first():rendered.locator('p').filter({hasText:sentence}).first();
+    await expect(locator).toBeVisible();await locator.scrollIntoViewIfNeeded();
+    const points=await locator.evaluate((element,text)=>{
+      const walker=document.createTreeWalker(element,NodeFilter.SHOW_TEXT);let node:Node|null;
+      while(node=walker.nextNode()){
+        const value=node.textContent??'',from=value.indexOf(text);if(from<0)continue;
+        const aRange=document.createRange(),bRange=document.createRange();aRange.setStart(node,from);aRange.setEnd(node,from+1);bRange.setStart(node,from+text.length-1);bRange.setEnd(node,from+text.length);
+        const a=aRange.getBoundingClientRect(),b=bRange.getBoundingClientRect();return {start:{x:a.left+a.width/2,y:a.top+a.height/2},end:{x:b.right+1,y:b.top+b.height/2}};
+      }
+      return null;
+    },sentence);
+    expect(points).not.toBeNull();await page.mouse.move(points!.start.x,points!.start.y);await page.mouse.down();
+    for(let step=1;step<=24;step++){
+      const fraction=step/24;await page.mouse.move(points!.start.x+(points!.end.x-points!.start.x)*fraction,points!.start.y+(points!.end.y-points!.start.y)*fraction);await page.waitForTimeout(20);
+    }
+    await page.mouse.up();await expect.poll(()=>page.evaluate(()=>window.getSelection()?.toString()??'')).toContain(sentence);
+    await page.evaluate(()=>window.getSelection()?.removeAllRanges());
+  }
+});
+
 test('reader hook paginates outline pages and repeated selected-section source pages',async({page})=>{
   const body='Long selected body 🧭 continues across source pages.\n'.repeat(360),
     trailing=Array.from({length:84},(_,index)=>`# Appendix ${index}\nAppendix text ${index}.\n`).join('\n'),

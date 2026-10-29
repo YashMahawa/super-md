@@ -113,7 +113,9 @@ export default function Editor({ sessionId = "default", value, onChange, dark, f
     ".cm-line": { padding: "0 4px" },
     ".cm-gutters": { background: "var(--surface)", border: "0", color: "var(--muted)", paddingRight: "8px" },
     ".cm-lineNumbers .cm-gutterElement": { paddingLeft: "16px", paddingRight: "10px" },
-    ".cm-activeLine": { background: "color-mix(in srgb, var(--primary) 7%, var(--surface))", borderRadius: "6px" },
+    // CodeMirror paints selection behind its text lines. An opaque active-line
+    // fill hides the selected characters even while the native range is right.
+    ".cm-activeLine": { background: "color-mix(in srgb, var(--primary) 7%, transparent)", borderRadius: "6px" },
     ".cm-activeLineGutter": { background: "transparent", color: "var(--primary)", fontWeight: "600" },
     ".cm-cursor, .cm-dropCursor": { borderLeftColor: "var(--primary)", borderLeftWidth: "2px" },
     ".cm-selectionBackground": { background: "color-mix(in srgb, var(--primary) 25%, transparent) !important" },

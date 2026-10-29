@@ -5101,6 +5101,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "base64 0.22.1",
+ "flate2",
  "imagesize",
  "jni",
  "mitex",
@@ -5277,7 +5278,7 @@ checksum = "13c2bddecc57b384dee18652358fb23172facb8a2c51ccc10d74c157bdea3292"
 
 [[package]]
 name = "super-md"
-version = "0.6.19"
+version = "0.6.20"
 dependencies = [
  "anyhow",
  "base64 0.22.1",

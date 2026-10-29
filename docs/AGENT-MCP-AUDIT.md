@@ -1,6 +1,6 @@
 # Agent interface audit
 
-The 0.6.19 update addresses the verified document-integrity and navigation issues
+The 0.6.20 update addresses the verified document-integrity and navigation issues
 found during a large-note MCP stress test. See [the interface guide](AGENT-INTERFACE.md)
 for the supported operations and wire parameters.
 

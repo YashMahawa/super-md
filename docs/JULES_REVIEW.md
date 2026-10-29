@@ -66,3 +66,47 @@ were generic templates; the code was checked before each decision.
 - **Atomic file writes** (`90f2229c`): stale, saves already write a temporary
   file and rename it.
 - Wellness, gamification and coworking proposals were again not added.
+
+
+## Refresh, 29 October 2026
+
+Reviewed the inventory of 193 historical insights and directly checked recent
+high-priority findings against the current implementation. Historical resolved
+or dismissed states are workflow evidence, not proof that a defect is absent.
+
+Three actionable findings received fixes and regressions:
+
+- **PDF image containment** (`03a6611c`): the legacy Tauri PDF path did not
+  enforce the boundary already present in the image preview loader. Canonical
+  containment now rejects absolute, traversal and symlink escapes while a
+  legitimate document-local image still exports. The in-place containment
+  proposal (`2f8c915a`) was useful; a broad asset-layer rewrite was unnecessary.
+- **Short-window onboarding** (`17cc754a`): a wide desktop window only 520px
+  high could clip the last action. A height-based rule keeps the card within the
+  viewport and permits internal scrolling, with browser checks at 1000 by 520
+  and 1440 by 900. The responsive-height proposal (`cad7d94a`) identified the
+  right area; the implementation preserves ordinary and mobile layouts.
+- **Undo-group limit** (`db31d203`): an unusually long coalesced edit group
+  could exceed the session-transfer validator's 10,000-edit limit. New groups
+  start at that boundary. A 10,025-edit test checks validity and complete
+  undo/redo. The proposed inner-array pruning would have discarded undo steps;
+  the implemented fix retains them instead.
+
+The AppImage finding overstates the normal update path: recorded download
+checksums are verified before installation. Replacing the verified local file
+between verification and execution remains a separate defense-in-depth question.
+The reported Typst filesystem disclosure is not demonstrated with the current
+static-only resolver. Intentional user-selected open/save/import paths also do
+not establish an untrusted caller or a remote disclosure by themselves.
+
+Several test-gap insights identify worthwhile narrower coverage opportunities,
+but overlook existing browser, native, worker-consumer or component tests.
+A missing dedicated unit-test filename is not evidence of a broken feature.
+Optional workflow features remain product proposals; they are not counted as
+correctness fixes or automatically dismissed as useless.
+
+The insights helped locate three concrete edge cases. The solution descriptions
+were useful starting points, but still required code review and regression
+work: some retain template instructions, repeat existing safeguards, or propose
+more invasive changes than the defect needs. This review does not by itself
+establish generated-PR quality.

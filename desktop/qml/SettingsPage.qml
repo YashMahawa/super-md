@@ -45,17 +45,18 @@ Pane {
                 model: [
                     {key:"appearance", label:"Appearance"}, {key:"reading", label:"Reading"},
                     {key:"writing", label:"Writing"}, {key:"python", label:"Python"},
-                    {key:"system", label:"Updates & storage"}, {key:"agents", label:"AI agents"}
+                    {key:"system", label:"Updates & storage"}, {key:"agents", label:"AI agents"},
+                    {key:"shortcuts", label:"Keyboard shortcuts"}
                 ]
                 delegate: ActionButton {
                     required property var modelData
+                    objectName: "settingsSection_" + modelData.key
                     text: modelData.label
                     compact: true
                     tonal: page.section === modelData.key
                     onClicked: page.section = modelData.key
                 }
             }
-            ActionButton { text: "Keyboard shortcuts…"; compact: true; tonal: true; onClicked: shortcutsPopup.open() }
         }
         ScrollView {
             id: settingsScroll
@@ -268,39 +269,17 @@ Pane {
                     hostStudio: studio
                     viewState: page.viewState
                 }
-                Item { height: 24 }
-            }
-        }
-    }
-    Popup {
-        id: shortcutsPopup
-        objectName: "shortcutsPopup"
-        parent: Overlay.overlay
-        x: page.Window.window ? Math.max(16, (page.Window.window.width - width) / 2) : 16
-        y: page.Window.window ? Math.max(16, (page.Window.window.height - height) / 2) : 16
-        width: page.Window.window ? Math.max(1, Math.min(560, page.Window.window.width - 32)) : 560
-        height: page.Window.window ? Math.max(1, Math.min(680, page.Window.window.height - 32)) : 680
-        padding: 20
-        modal: true
-        focus: true
-        closePolicy: Popup.CloseOnEscape | Popup.CloseOnPressOutside
-        background: Rectangle { radius: 24; color: viewState.colors["surface-high"]; border.color: viewState.colors.outline; border.width: 1 }
-        onOpened: forceActiveFocus()
-        onClosed: { const host = page.Window.window; if (host) host.capturingShortcut = false }
-        ColumnLayout {
-            anchors.fill: parent
-            RowLayout {
-                Label { text: "Keyboard shortcuts"; font.pixelSize: 24; font.weight: Font.DemiBold; Layout.fillWidth: true }
-                ActionButton { glyph: "X"; ToolTip.text: "Close shortcuts"; onClicked: shortcutsPopup.close() }
-            }
-            Label { text: "Select a shortcut, then press the key combination you want. Command labels follow macOS; Ctrl, Alt and function keys are supported."; Layout.fillWidth: true; wrapMode: Text.WordWrap; color: viewState.colors.muted }
-            ScrollView {
-                id: shortcutScroll
-                objectName: "shortcutScroll"
-                Layout.fillWidth: true; Layout.fillHeight: true; contentWidth: availableWidth
-                ScrollBar.horizontal.policy: ScrollBar.AlwaysOff
                 ColumnLayout {
-                    width: shortcutScroll.availableWidth
+                    visible: page.section === "shortcuts"
+                    Layout.fillWidth: true
+                    spacing: 14
+                    Label { text: "Keyboard shortcuts"; font.pixelSize: 22; font.weight: Font.DemiBold }
+                    Label {
+                        text: "Select a shortcut, then press the combination you want. Command or Ctrl, Alt and function keys are supported."
+                        Layout.fillWidth: true
+                        wrapMode: Text.WordWrap
+                        color: viewState.colors.muted
+                    }
                     Repeater {
                         model: JSON.parse(studio.shortcutActions)
                         delegate: ColumnLayout {
@@ -325,9 +304,16 @@ Pane {
                             Label { text: page.shortcutMessage; visible: page.shortcutErrorAction === modelData.id && text.length > 0; Layout.fillWidth: true; wrapMode: Text.WordWrap; color: viewState.colors.primary }
                         }
                     }
+                    ActionButton {
+                        objectName: "resetShortcuts"
+                        text: "Reset shortcuts to defaults"
+                        tonal: true
+                        Layout.fillWidth: true
+                        onClicked: { page.shortcutMessage = studio.resetShortcuts(); page.shortcutErrorAction = "" }
+                    }
                 }
+                Item { height: 24 }
             }
-            ActionButton { text: "Reset shortcuts to defaults"; tonal: true; Layout.fillWidth: true; onClicked: { page.shortcutMessage = studio.resetShortcuts(); page.shortcutErrorAction = "" } }
         }
     }
 }
