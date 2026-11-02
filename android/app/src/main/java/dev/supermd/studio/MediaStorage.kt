@@ -228,7 +228,7 @@ class MediaStorage(private val context: Context) {
         require(filename.isNotBlank() && filename.length <= 240 && filename == filename.substringAfterLast('/').substringAfterLast('\\') &&
             !filename.contains(Regex("[\\u0000-\\u001f\\u007f]"))) { "Invalid save-as filename" }
         val mime = mimeType.substringBefore(';').lowercase()
-        require(mime in setOf("text/markdown", "application/vnd.supermd.smd", "application/pdf")) { "Unsupported document format" }
+        require(mime in setOf("text/markdown", "application/vnd.supermd.smd", "application/pdf", "application/zip")) { "Unsupported document format" }
         val folder = configuredLocation?.takeIf(String::isNotBlank)?.let(Uri::parse)
         if (folder != null) {
             require(DocumentsContract.isTreeUri(folder)) { "The configured note location is not a folder; choose it again in Super MD settings" }

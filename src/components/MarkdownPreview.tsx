@@ -114,11 +114,22 @@ function AssetImage({ src = "", alt = "", documentPath, trustedImageHosts, onTru
   const imageElement=useRef<HTMLImageElement>(null);
   const [sizedSource,setSizedSource]=useState('');
   const [assetEpoch,setAssetEpoch]=useState(0);
+  const [permissionRetry,setPermissionRetry]=useState(0);
   useEffect(()=>{
     const changed=()=>setAssetEpoch(value=>value+1);
     window.addEventListener('supermd-assets-changed',changed);
     return()=>window.removeEventListener('supermd-assets-changed',changed);
   },[]);
+  useEffect(()=>{
+    const restored=(event:Event)=>{
+      if(!error||isRemote||embedded)return;
+      const detail=(event as CustomEvent<{documentPath?:unknown;source?:unknown}>).detail;
+      if(!detail||String(detail.documentPath??'')!==(documentPath??'')||detail.source!==src)return;
+      commitMediaLayout(mediaElement.current,()=>{setError('');setResolved('');setPermissionRetry(value=>value+1);});
+    };
+    window.addEventListener('supermd-asset-access-restored',restored);
+    return()=>window.removeEventListener('supermd-asset-access-restored',restored);
+  },[documentPath,embedded,error,isRemote,src]);
   const svgBacking=useMemo(()=>svgDataBackdrop(resolved),[resolved]);
   const appearance=useContext(DocumentAppearance);
   const adaptsSvg=appearance?.svgAppearance==='auto'||appearance?.svgAppearance==='monochrome';
@@ -154,7 +165,7 @@ function AssetImage({ src = "", alt = "", documentPath, trustedImageHosts, onTru
       }
     })();
     return () => { active = false; };
-  }, [documentPath, embedded, isRemote, src, allowed, assetEpoch]);
+  }, [documentPath, embedded, isRemote, src, allowed, assetEpoch, permissionRetry]);
   useEffect(()=>{
     if(!resolved||error||isRemote&&!allowed)return;
     const svg=resolved.startsWith('data:image/svg+xml');

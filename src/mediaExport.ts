@@ -82,7 +82,7 @@ export function installMediaMenu():()=>void {
       const media=mediaAt(document.elementFromPoint(x,y));if(!media)return false;
       close();const panel=document.createElement('div');menu=panel;panel.className='media-save-menu';panel.setAttribute('role','menu');panel.setAttribute('aria-label','Save image or diagram');
       const title=document.createElement('div');title.className='media-save-title';title.textContent='Save image';panel.append(title);
-      const options:Array<['png'|'svg'|'original'|'source',string]>=[['png','Save as PNG · light background']];
+      const options:Array<['png'|'svg'|'original'|'source',string]>=[['png','Save as PNG']];
       if(media.svg)options.push(['svg','Save as SVG']);else options.push(['original','Save original image']);
       if(media.source)options.push(['source','Save Mermaid source']);
       for(const [format,label] of options){const button=document.createElement('button');button.type='button';button.textContent=label;button.setAttribute('role','menuitem');button.onclick=()=>{panel.querySelectorAll('button').forEach(item=>item.disabled=true);void saveMedia(media,format).then(result=>{title.textContent=`Saved ${result.filename}`;window.setTimeout(close,1800);},error=>{title.textContent=String(error instanceof Error?error.message:error);panel.querySelectorAll('button').forEach(item=>item.disabled=false);});};panel.append(button);}

@@ -28,6 +28,7 @@ from network_tls import client_context
 from PySide6.QtCore import QObject, Property, Signal, Slot, QStandardPaths, QTimer, QUrl, QFileSystemWatcher, QProcess, Qt, QPointF, QRect, QMetaObject, QBuffer, QByteArray, QIODevice
 from PySide6.QtGui import QDesktopServices, QFontDatabase, QGuiApplication, QCursor
 from documents import atomic_write, atomic_json, bundle, image_data, materialize_assets, open_note, write_portable, MIMES, MAX_IMAGE
+from markdown_export import write_markdown_export, write_markdown_zip
 from theme import detect_system_dark, read_system_palette, system_palette_paths, tokens
 from fonts import FontStore
 from python_outputs import PythonOutputs
@@ -130,7 +131,7 @@ def local_path(value: str) -> Path:
     return Path(url.toLocalFile() if url.isLocalFile() else value).expanduser().resolve()
 
 def export_destination(value: str, format: str) -> Path:
-    suffixes = {"pdf": ".pdf", "smd": ".smd", "md": ".md"}
+    suffixes = {"pdf": ".pdf", "smd": ".smd", "md": ".md", "mdzip": ".zip"}
     # These are known payload extensions, not merely dotted stem names.  In
     # particular, .fmd is an older portable format and must not be silently
     # rewritten as .fmd.pdf/.fmd.smd.
@@ -140,6 +141,7 @@ def export_destination(value: str, format: str) -> Path:
         ".md": "md",
         ".markdown": "md",
         ".txt": "md",
+        ".zip": "mdzip",
     }
     if format not in suffixes:
         raise ValueError("Unsupported export format")
@@ -2126,7 +2128,8 @@ class Studio(QObject):
 
     @Slot(str, result=QUrl)
     def defaultExportLocation(self, format):
-        return self.defaultSaveLocation(Path(self._current()["name"]).stem + "." + format)
+        suffix = "zip" if format == "mdzip" else format
+        return self.defaultSaveLocation(Path(self._current()["name"]).stem + "." + suffix)
 
     @Slot(str)
     def closeTab(self, id):
@@ -2235,7 +2238,7 @@ class Studio(QObject):
             self.message = str(error)
             self._emit(False)
             return
-        if format == "md": self.readerCall.emit("window.supermdExportMarkdown?.()")
+        if format in ("md", "mdzip"): self.readerCall.emit(f"window.supermdExportMarkdown?.({str(format == 'mdzip').lower()})")
         elif format == "smd": self.readerCall.emit("window.supermdPortable?.(false)")
         else: self.readerCall.emit(f"window.supermdExport?.({json.dumps(self.settings['pdf'])})")
 
@@ -3209,7 +3212,7 @@ class Studio(QObject):
             # PDF bytes in an SMD file (or overwrite a portable note with text).
             expected_suffixes = {
                 "export_pdf_native": (".pdf",),
-                "export_markdown_native": (".md", ".markdown", ".txt"),
+                "export_markdown_native": (".md", ".markdown", ".txt", ".zip"),
                 "export_fmd_native": (".smd",),
             }
             if command in expected_suffixes and not (command == "export_fmd_native" and args.get("save")):
@@ -3228,6 +3231,7 @@ class Studio(QObject):
                 return {"path": str(path)}
             def work():
                 if command == "load_asset": return self._asset(captured,args["source"])
+                if command == "load_text_asset": return {"text": self._text_asset(captured,args["source"])}
                 if command == "load_font": return self.session.font_store.reader(args["family"])
                 if command == "cache_python_output":
                     if context and args["result"].get("provenance",{}).get("verified") is False:raise ValueError("Legacy output cannot be promoted to verified output")
@@ -3262,8 +3266,12 @@ class Studio(QObject):
                             return {**result,"provenance":{"verified":False,"unsaved":True,"reason":f"Could not save execution output: {error}"}}
                     return result
                 if command == "export_markdown_native":
-                    if not output or not isinstance(args["content"], str) or len(args["content"].encode()) > 20_000_000: raise ValueError("Choose a Markdown destination for a note under 20 MB")
-                    atomic_write(Path(output), args["content"].encode())
+                    if not output: raise ValueError("Choose a Markdown destination")
+                    if not isinstance(args.get("archive", False), bool): raise ValueError("archive must be a boolean")
+                    if captured.get("path") and Path(output).resolve() == Path(captured["path"]).resolve():
+                        raise ValueError("Markdown export must not overwrite the original note")
+                    if args.get("archive", False): write_markdown_zip(Path(output), args.get("content"), args.get("assets", {}))
+                    else: write_markdown_export(Path(output), args.get("content"), args.get("assets", {}))
                     return export_result(output)
                 if command == "export_fmd_native":
                     target = Path(captured["path"]) if args.get("save") else Path(output)
@@ -3427,6 +3435,22 @@ class Studio(QObject):
         mime = MIMES.get(path.suffix[1:].lower())
         if not mime: raise ValueError("Unsupported image type")
         return f"data:{mime};base64,{base64.b64encode(path.read_bytes()).decode()}"
+
+    def _text_asset(self, tab, source):
+        if not isinstance(source, str) or len(source) > 4096 or Path(source).suffix.lower() not in (".mmd", ".mermaid"):
+            raise ValueError("Only local .mmd or .mermaid source files can be inlined")
+        if not tab.get("path"): raise ValueError("Save this note to resolve relative diagram source files")
+        root = Path(tab["path"]).parent.resolve()
+        relative = urllib.parse.unquote(source.split("#", 1)[0].split("?", 1)[0])
+        requested = root / relative
+        current = root
+        for part in Path(relative).parts:
+            current = current / part
+            if current.is_symlink(): raise ValueError("Diagram source symlink paths are not allowed")
+        path = requested.resolve(strict=True)
+        if not path.is_relative_to(root) or not path.is_file(): raise ValueError("Diagram source is outside the note folder")
+        if path.stat().st_size > 2_000_000: raise ValueError("Diagram source exceeds 2 MB")
+        return path.read_text(encoding="utf-8")
 
     def _fetch(self, args):
         url = args["url"]
