@@ -92,6 +92,7 @@ internal class MarkdownExport(private val context: Context, val filename: String
             return requireNotNull(result) to filename
         } catch (error: Exception) { runCatching { folder.delete() }; throw error }
     }
+    @androidx.annotation.RequiresApi(29)
     private fun saveDownloads(): Pair<Uri, String> {
         require(Build.VERSION.SDK_INT >= 29) { "Choose an export folder in Settings before saving Markdown with assets" }
         val resolver = context.contentResolver

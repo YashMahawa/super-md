@@ -162,7 +162,7 @@ def write_markdown_zip(output: str | os.PathLike[str], content: str, assets: dic
             archive.writestr(markdown_filename or Path(target.name).stem + ".md", content.encode("utf-8"))
             for name, payload in prepared:
                 archive.writestr(name, payload)
-        with stage.open("rb") as stream:
+        with stage.open("r+b") as stream:
             os.fsync(stream.fileno())
         if create_only:
             os.link(stage, target)
