@@ -1270,6 +1270,14 @@ internal class NoteDestination(private val mime: String, private val preferred: 
 @Composable private fun Settings(state: StudioState, model: StudioViewModel, activity:MainActivity, noteLocation: String, section: String?, onSection: (String?)->Unit, chooseNoteLocation: ()->Unit, recoverDraft:()->Unit, importTheme:()->Unit, exportTheme:()->Unit, showThemeGuide:()->Unit, themeGuideReady:Boolean, importFont: ()->Unit) {
     val update by model.updates.state.collectAsStateWithLifecycle()
     val scope=rememberCoroutineScope()
+    var confirmPythonCleanup by remember { mutableStateOf(false) }
+    if (confirmPythonCleanup) AlertDialog(
+        onDismissRequest = { confirmPythonCleanup = false },
+        title = { Text("Clear temporary Python results?") },
+        text = { Text("This deletes app-generated Python plots and execution previews. Saved notes, recovery drafts, exported files and installed Python are not deleted. Re-run a Python cell to regenerate missing previews.") },
+        confirmButton = { TextButton(onClick = { confirmPythonCleanup = false; model.clearPythonStorage() }) { Text("Clear results") } },
+        dismissButton = { TextButton(onClick = { confirmPythonCleanup = false }) { Text("Cancel") } },
+    )
     val downloadPermission=rememberLauncherForActivityResult(ActivityResultContracts.RequestPermission()){granted->
         if(update.ready) { if(granted)scope.launch{model.updates.saveToDownloads()} else model.updates.storagePermissionDenied() }
         else scope.launch{model.updates.download()}
@@ -1362,7 +1370,7 @@ internal class NoteDestination(private val mime: String, private val preferred: 
             }
             if (section == "Agent connection") SettingsGroup("Live Agent Access") { AgentAccessSettings(activity) }
             if (section == "Storage") SettingsGroup("Storage diagnostics") {
-                Text("Inspect app-owned storage sizes and file counts. This read-only report does not inspect Downloads or other documents, and never changes files.", style = MaterialTheme.typography.bodyMedium)
+                Text("Inspect app-owned storage sizes and file counts. Clean only generated Python previews with confirmation; notes, exports and recovery are protected.", style = MaterialTheme.typography.bodyMedium)
                 FilledTonalButton(onClick = model::inspectStorage, enabled = !state.storageScanning) {
                     Text(if (state.storageScanning) "Inspecting…" else "Inspect storage")
                 }
@@ -1373,6 +1381,11 @@ internal class NoteDestination(private val mime: String, private val preferred: 
                     Text("Execution results", style = MaterialTheme.typography.titleSmall, modifier = Modifier.padding(top = 8.dp))
                     StorageUsageLine(report.executionResults)
                     StorageUsageLine(report.legacyExecutionResults)
+                    OutlinedButton(
+                        onClick = { confirmPythonCleanup = true },
+                        enabled = !state.storageScanning && report.executionResults.files + report.legacyExecutionResults.files > 0,
+                    ) { Text("Clear temporary Python results…") }
+
                     Text("Other cache", style = MaterialTheme.typography.titleSmall, modifier = Modifier.padding(top = 8.dp))
                     StorageUsageLine(report.otherCache)
                     if (report.partial) Text("Some entries could not be measured or were skipped; totals may be incomplete. No files were changed.", color = MaterialTheme.colorScheme.onSurfaceVariant, style = MaterialTheme.typography.bodySmall)
@@ -1388,6 +1401,10 @@ internal class NoteDestination(private val mime: String, private val preferred: 
                 FilledTonalButton(onClick={scope.launch{model.updates.check()}},enabled=!update.checking){Text("Check for updates")}
                 if(update.version!=null)Button(onClick={if(update.ready)runCatching{model.updates.install(activity)}.onFailure{model.fail(it.message ?: "Could not open installer")} else if(Build.VERSION.SDK_INT<=28 && activity.checkSelfPermission(android.Manifest.permission.WRITE_EXTERNAL_STORAGE)!=android.content.pm.PackageManager.PERMISSION_GRANTED)downloadPermission.launch(android.Manifest.permission.WRITE_EXTERNAL_STORAGE) else scope.launch{model.updates.download()}},enabled=!update.checking){Text(if(update.ready)"Install update" else "Download update")}
                 if(update.ready && !update.publicCopy)TextButton(onClick={if(Build.VERSION.SDK_INT<=28 && activity.checkSelfPermission(android.Manifest.permission.WRITE_EXTERNAL_STORAGE)!=android.content.pm.PackageManager.PERMISSION_GRANTED)downloadPermission.launch(android.Manifest.permission.WRITE_EXTERNAL_STORAGE) else scope.launch{model.updates.saveToDownloads()}},enabled=!update.checking){Text("Save verified APK to Downloads")}
+                OutlinedButton(onClick = {
+                    runCatching { activity.startActivity(Intent(Intent.ACTION_VIEW, android.net.Uri.parse("https://github.com/YashMahawa/super-md/releases/latest"))) }
+                        .onFailure { model.fail("Could not open GitHub releases: " + it.message) }
+                }) { Text("Open latest release on GitHub") }
                 TextButton(onClick={activity.startActivity(Intent(android.provider.Settings.ACTION_APP_NOTIFICATION_SETTINGS).putExtra(android.provider.Settings.EXTRA_APP_PACKAGE,activity.packageName))}){Text("Update notification permissions")}
             }
         }
