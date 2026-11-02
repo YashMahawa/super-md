@@ -66,7 +66,9 @@ internal class MarkdownExport(private val context: Context, val filename: String
         val media = MediaStorage(context)
         if (archive) return media.writeAgentDocument(filename.removeSuffix(".md") + ".zip", "application/zip", configuredFolder) { _, output -> writeZip(output) }
         if (files.isEmpty()) return media.writeAgentDocument(filename, "text/markdown", configuredFolder) { _, output -> markdown.inputStream().use { it.copyTo(output) } }
-        return if (!configuredFolder.isNullOrBlank()) saveTree(Uri.parse(configuredFolder)) else saveDownloads()
+        return if (!configuredFolder.isNullOrBlank()) saveTree(Uri.parse(configuredFolder))
+        else if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) saveDownloads()
+        else error("Choose an export folder in Settings before saving Markdown with assets")
     }
     private fun saveTree(tree: Uri): Pair<Uri, String> {
         val parent = DocumentFile.fromTreeUri(context, tree) ?: error("Choose the export folder again to restore access")
