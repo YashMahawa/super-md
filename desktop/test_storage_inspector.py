@@ -4,6 +4,7 @@ import tempfile
 import threading
 import time
 import unittest
+from types import SimpleNamespace
 from pathlib import Path
 from unittest.mock import patch
 
@@ -105,6 +106,25 @@ class StorageInspectorTest(unittest.TestCase):
             for category in ("recovery","workspace","python-runtime", "../outside"):
                 with self.assertRaises(ValueError):clear_storage_category(root,category)
             self.assertEqual((root / "settings.json").read_text(),"settings")
+
+    def test_windows_cleanup_fallback_checks_reparse_points_without_following(self):
+        # Simulate Windows' non-descriptor rmtree path on this Linux runner.
+        with tempfile.TemporaryDirectory() as tmp:
+            root=Path(tmp)
+            target=root / "derived-python"
+            target.mkdir()
+            (target / "generated.svg").write_bytes(b"temporary")
+            windows_os=SimpleNamespace(name="nt", walk=os.walk)
+            with patch("storage_inspector.os",windows_os), patch("storage_inspector.shutil.rmtree.avoids_symlink_attacks",False):
+                self.assertTrue(clear_storage_category(root,"execution-results")["cleared"])
+            self.assertFalse(target.exists())
+            target.mkdir()
+            outside=root / "outside";outside.mkdir()
+            (outside / "keep").write_text("safe")
+            (target / "linked").symlink_to(outside,target_is_directory=True)
+            with patch("storage_inspector.os",windows_os), patch("storage_inspector.shutil.rmtree.avoids_symlink_attacks",False):
+                with self.assertRaises(ValueError):clear_storage_category(root,"execution-results")
+            self.assertEqual((outside / "keep").read_text(),"safe")
 
     @unittest.skipUnless(hasattr(os,"symlink"),"symlinks unavailable")
     def test_cleanup_refuses_linked_root_or_target(self):

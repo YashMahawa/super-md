@@ -1,14 +1,15 @@
-import {useEffect,useMemo,useState, type KeyboardEvent, type ReactNode} from "react";
+import {useEffect,useMemo,useRef,useState, type KeyboardEvent, type ReactNode} from "react";
 import InlineDiagram,{parseDiagram,type DiagramSpec} from "./InlineDiagram";
 import {parseBinaryTree} from "./BinaryTree";
+import {parseChartSpec} from "../chartModel";
 
-export interface StepCard { label:string; image?:string; diagram?:DiagramSpec; description?:string; alt?:string }
+export interface StepCard { label:string; image?:string; diagram?:DiagramSpec; chart?:string; description?:string; alt?:string }
 export interface StepDeck { title:string; steps:StepCard[] }
 
 /** Pure parsing with bounds; no authored scripts or HTML are executed. */
 export function parseStepDeck(source:string):StepDeck|null {
   try {
-    if(source.length>24000)return null;
+    if(source.length>120000)return null;
     const value:unknown=JSON.parse(source);
     if(!value||typeof value!=="object"||Array.isArray(value))return null;
     const raw=value as Record<string,unknown>;
@@ -24,24 +25,55 @@ export function parseStepDeck(source:string):StepDeck|null {
       if(s.alt!==undefined&&(typeof s.alt!=="string"||s.alt.length>200))return null;
       const diagram=s.diagram===undefined?undefined:(parseDiagram(s.diagram)??parseBinaryTree(s.diagram));
       if(s.diagram!==undefined&&!diagram)return null;
-      if(s.image!==undefined&&diagram)return null;
-      if(s.image===undefined&&!s.description&&!diagram)return null;
-      steps.push({label:s.label.trim(),...(typeof s.image==="string"?{image:s.image}:{}),...(diagram?{diagram}:{}),...(typeof s.description==="string"?{description:s.description}:{}),...(typeof s.alt==="string"?{alt:s.alt}:{})});
+      let chart:string|undefined;
+      if(s.chart!==undefined){
+        if(!s.chart||typeof s.chart!=="object"||Array.isArray(s.chart))return null;
+        chart=JSON.stringify(s.chart);
+        if(chart.length>28000)return null;
+        try{parseChartSpec(chart);}catch{return null;}
+      }
+      if([s.image!==undefined,!!diagram,!!chart].filter(Boolean).length>1)return null;
+      if(s.image===undefined&&!s.description&&!diagram&&!chart)return null;
+      steps.push({label:s.label.trim(),...(typeof s.image==="string"?{image:s.image}:{}),...(diagram?{diagram}:{}),...(chart?{chart}:{}),...(typeof s.description==="string"?{description:s.description}:{}),...(typeof s.alt==="string"?{alt:s.alt}:{})});
     }
     return {title:raw.title.trim(),steps};
   } catch {return null;}
 }
 
 /** One diagram at a time; keyboard, buttons and native range slider. */
-export default function StepCards({source,renderImage}:{source:string;renderImage:(src:string,alt:string)=>ReactNode}) {
+export default function StepCards({source,renderImage,renderChart}:{source:string;renderImage:(src:string,alt:string)=>ReactNode;renderChart?:(source:string)=>ReactNode}) {
   const deck=useMemo(()=>parseStepDeck(source),[source]);
   const [index,setIndex]=useState(0);
+  const figureRef=useRef<HTMLDivElement>(null);
+  const imageHeights=useRef<Map<number,number>>(new Map());
+  const [figureHeight,setFigureHeight]=useState<number|null>(null);
   // Mount nearby slides ahead of time. Once loaded, a slide stays mounted so
   // moving back, forward, or dragging the slider never re-fetches its asset.
   const [mounted,setMounted]=useState<Set<number>>(()=>new Set([0,1,2]));
-  useEffect(()=>{setIndex(0);setMounted(new Set([0,1,2]));},[source]);
+  useEffect(()=>{setIndex(0);setMounted(new Set([0,1,2]));imageHeights.current.clear();setFigureHeight(null);},[source]);
   const count=deck?.steps.length??0;
   const current=Math.min(index,count-1);
+  useEffect(()=>{
+    const host=figureRef.current;
+    if(!host || !deck?.steps[current]?.image){setFigureHeight(null);return;}
+    const measure=()=>{
+      const img=host.querySelector<HTMLImageElement>(".step-cards-figure.is-current img");
+      if(!img || !img.complete || img.naturalWidth<=0 || img.naturalHeight<=0)return;
+      const width=host.clientWidth;
+      if(!width)return;
+      const desired=Math.max(88,Math.ceil(Math.min(480,img.naturalHeight,width*img.naturalHeight/img.naturalWidth)+12));
+      imageHeights.current.set(current,desired);
+      setFigureHeight(old=>old===desired?old:desired);
+    };
+    setFigureHeight(imageHeights.current.get(current)??null);
+    measure();
+    host.addEventListener("load",measure,true);
+    const mutation=typeof MutationObserver!=="undefined"?new MutationObserver(measure):null;
+    mutation?.observe(host,{childList:true,subtree:true});
+    const resize=typeof ResizeObserver!=="undefined"?new ResizeObserver(measure):null;
+    resize?.observe(host);
+    return()=>{host.removeEventListener("load",measure,true);mutation?.disconnect();resize?.disconnect();};
+  },[deck,current]);
   const go=(next:number)=>{
     const target=Math.max(0,Math.min(next,count-1));
     setMounted(prev=>{
@@ -65,13 +97,18 @@ export default function StepCards({source,renderImage}:{source:string;renderImag
     </header>
     <div className="step-cards-stage">
       <div className="step-cards-step-title" aria-live="polite">{step.label}</div>
-      {deck.steps.some(slide=>slide.image)&&<div className="step-cards-figure-stack">
+      {deck.steps.some(slide=>slide.image)&&<div className={"step-cards-figure-stack"+(step.image?"":" is-inactive")} ref={figureRef} style={step.image && figureHeight?{height:figureHeight}:undefined}>
         {deck.steps.map((slide,i)=>mounted.has(i)&&slide.image&&
           <div key={i} className={"step-cards-figure "+(i===current?"is-current":"is-offstage")} aria-hidden={i!==current} inert={i!==current}>
             {renderImage(slide.image,slide.alt??(deck.title+": "+slide.label))}
           </div>)}
       </div>}
       {step.diagram&&<div className="step-cards-inline-figure"><InlineDiagram diagram={step.diagram}/></div>}
+      {deck.steps.some(slide=>slide.chart)&&<div className={"step-cards-chart-stack"+(step.chart?" is-visible":"")}>
+        {deck.steps.map((slide,i)=>mounted.has(i)&&slide.chart&&<div key={i} className={"step-cards-chart-frame "+(i===current?"is-current":"is-offstage")} aria-hidden={i!==current} inert={i!==current}>
+          {renderChart?renderChart(slide.chart):<div className="step-cards-error">2D chart rendering is unavailable in this reader.</div>}
+        </div>)}
+      </div>}
       {step.description&&<p className="step-cards-description" aria-live="polite">{step.description}</p>}
     </div>
     <footer className="step-cards-controls">

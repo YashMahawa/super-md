@@ -14,6 +14,29 @@ Object.assign(globalThis,{IS_REACT_ACT_ENVIRONMENT:true});
 let root:Root|null=null;
 afterEach(()=>{if(root){act(()=>root?.unmount());root=null;}document.body.innerHTML="";});
 describe("step cards",()=>{
+  it("embeds existing interactive 2D charts alongside diagrams in one deck",async()=>{
+    const source=JSON.stringify({title:"Graph and tree steps",steps:[
+      {label:"Graph",chart:{title:"Wave with control",series:[{expression:"sin(a*x)"}],sliders:[{name:"a",value:1,min:0.5,max:3}]},description:"Explore the wave."},
+      {label:"Tree",diagram:{values:[10,5,7]},description:"Now view a heap."},
+      {label:"Again",chart:{title:"Another graph",series:[{points:[[0,0],[1,1],[2,4]]}]}}
+    ]});
+    expect(parseStepDeck(source)?.steps[0].chart).toContain("sin(a*x)");
+    expect(parseStepDeck(source)?.steps[1].diagram?.nodes).toHaveLength(3);
+    const invalid=JSON.stringify({title:"Unsafe",steps:[{label:"A",chart:{series:[{expression:"not_a_function(x)"}]}},{label:"B",description:"ok"}]});
+    expect(parseStepDeck(invalid)).toBeNull();
+    const host=document.createElement("div");document.body.append(host);root=createRoot(host);
+    await act(async()=>root?.render(<StepCards source={source} renderImage={()=>null} renderChart={s=><div className="actual-2d-chart" data-chart={s}/>}/>));
+    expect(host.querySelectorAll(".actual-2d-chart")).toHaveLength(2);
+    expect(host.querySelector(".step-cards-chart-stack.is-visible")).toBeTruthy();
+    const chartElement=host.querySelector(".step-cards-chart-frame.is-current")!;
+    await act(async()=>host.querySelector<HTMLButtonElement>('[aria-label="Next step"]')!.click());
+    expect(host.querySelector(".step-cards-inline-figure svg")).toBeTruthy();
+    expect(host.querySelector(".step-cards-chart-stack.is-visible")).toBeNull();
+    await act(async()=>host.querySelector<HTMLButtonElement>('[aria-label="Previous step"]')!.click());
+    expect(host.querySelector(".step-cards-chart-frame.is-current")).toBe(chartElement);
+    expect(host.querySelector(".step-cards-figure-stack")).toBeNull();
+  });
+
   it("renders through the ordinary Markdown fence in read mode",()=>{
     const markdown="```smd-steps\n"+deck+"\n```";
     const html=renderToStaticMarkup(<MarkdownPreview markdown={markdown} documentPath={null} python="" dark/>);

@@ -213,7 +213,7 @@ function MarkdownPreview({ markdown, documentPath, python, dark, trustedImageHos
             const protectedBlock = (block: ReactNode) => <CodeBlockBoundary key={`${language}:${source}`} source={source}>{block}</CodeBlockBoundary>;
             if (language === "smd-tree") return protectedBlock(<InlineDiagram diagram={parseBinaryTreeSource(source)}/>);
             if (language === "smd-diagram") return protectedBlock(<InlineDiagram diagram={parseDiagramSource(source)}/>);
-            if (language === "smd-steps") return protectedBlock(<StepCards source={source} renderImage={(src,alt)=><AssetImage src={src} alt={alt} documentPath={documentPath} trustedImageHosts={trustedImageHosts} onTrustImageHost={onTrustImageHost}/>} />);
+            if (language === "smd-steps") return protectedBlock(<StepCards source={source} renderImage={(src,alt)=><AssetImage src={src} alt={alt} documentPath={documentPath} trustedImageHosts={trustedImageHosts} onTrustImageHost={onTrustImageHost}/>} renderChart={chartSource=><ThemedChart source={chartSource} dark={dark}/>} />);
             if (language === "smd-chart") return protectedBlock(<ThemedChart source={source} dark={dark} />);
             if (language === "svg") return protectedBlock(<ThemedSvg source={source} dark={dark} />);
             if (language === "mermaid") return protectedBlock(<Suspense fallback={<span className="image-loading" role="status">Loading diagram…</span>}><ThemedMermaid source={source} dark={dark} /></Suspense>);
