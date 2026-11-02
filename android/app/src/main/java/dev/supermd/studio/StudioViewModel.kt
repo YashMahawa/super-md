@@ -355,6 +355,26 @@ class StudioViewModel(app: Application, val workspaceKey: String = "main") : And
             mutable.value = mutable.value.copy(storageReport = report, storageScanning = false)
         }
     }
+    fun clearPythonStorage() {
+        if (mutable.value.storageScanning) return
+        mutable.value = mutable.value.copy(storageScanning = true)
+        viewModelScope.launch {
+            val result = withContext(Dispatchers.IO) {
+                runCatching {
+                    val app = getApplication<Application>()
+                    val cleared = StorageInspector.clearPythonResults(app.filesDir, app.cacheDir)
+                    cleared to StorageInspector.inspect(app.filesDir, app.cacheDir)
+                }
+            }
+            val value = result.getOrNull()
+            mutable.value = mutable.value.copy(
+                storageScanning = false,
+                storageReport = value?.second ?: mutable.value.storageReport,
+                message = if (value != null) "Cleared ${value.first} temporary Python result files. Notes and recovery data were preserved." else mutable.value.message,
+                error = if (value == null) "Could not safely clear temporary results: ${result.exceptionOrNull()?.message.orEmpty()}" else null,
+            )
+        }
+    }
     private val outlineMutable = MutableStateFlow<List<OutlineHeading>>(emptyList())
     val headings = outlineMutable.asStateFlow()
     private val imageMutable = MutableStateFlow(false)

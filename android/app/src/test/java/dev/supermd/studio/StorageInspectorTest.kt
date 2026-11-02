@@ -42,6 +42,43 @@ class StorageInspectorTest {
         }
     }
 
+    @Test fun cleanupClearsOnlyGeneratedPythonResultFolders() {
+        val files = Files.createTempDirectory("storage-cleanup-files").toFile()
+        val cache = Files.createTempDirectory("storage-cleanup-cache").toFile()
+        try {
+            File(files, "derived-python/nested").apply { mkdirs(); File(this, "result.png").writeBytes(ByteArray(7)) }
+            File(cache, "derived-python").apply { mkdirs(); File(this, "old.json").writeBytes(ByteArray(11)) }
+            File(files, "closed-notes").apply { mkdirs(); File(this, "draft.md").writeText("keep") }
+            File(files, "updates").apply { mkdirs(); File(this, "verified.apk").writeBytes(ByteArray(3)) }
+            val cleaned = StorageInspector.clearPythonResults(files, cache)
+            assertEquals(2, cleaned)
+            assertFalse(File(files, "derived-python").exists())
+            assertFalse(File(cache, "derived-python").exists())
+            assertEquals("keep", File(files, "closed-notes/draft.md").readText())
+            assertTrue(File(files, "updates/verified.apk").exists())
+        } finally {
+            files.deleteRecursively()
+            cache.deleteRecursively()
+        }
+    }
+
+    @Test fun cleanupRejectsLinkedResultsWithoutTouchingExternalFiles() {
+        val files = Files.createTempDirectory("storage-links-files").toFile()
+        val cache = Files.createTempDirectory("storage-links-cache").toFile()
+        val outside = Files.createTempDirectory("storage-links-outside").toFile()
+        try {
+            File(outside, "important.txt").writeText("keep")
+            Files.createSymbolicLink(File(files, "derived-python").toPath(), outside.toPath())
+            val rejected = runCatching { StorageInspector.clearPythonResults(files, cache) }
+            assertTrue(rejected.isFailure)
+            assertEquals("keep", File(outside, "important.txt").readText())
+        } finally {
+            files.deleteRecursively()
+            cache.deleteRecursively()
+            outside.deleteRecursively()
+        }
+    }
+
     @Test fun skipsSymlinksAndMarksBoundedOrUnreadableScansPartial() {
         val files = Files.createTempDirectory("storage-inspector-symlinks").toFile()
         val cache = Files.createTempDirectory("storage-inspector-empty-cache").toFile()

@@ -57,6 +57,41 @@ internal object StorageInspector {
         )
     }
 
+    /** Deletes only generated Python result caches in the app sandbox.
+     * Never walks links, recovery folders, notes, update APKs or exports.
+     * Called only after an explicit confirmation in Settings. */
+    fun clearPythonResults(filesDir: File, cacheDir: File): Int {
+        val roots = listOf(File(filesDir, "derived-python"), File(cacheDir, "derived-python"))
+        var deletedFiles = 0
+        for (root in roots) {
+            val path = root.toPath()
+            if (Files.isSymbolicLink(path)) error("Refusing linked Python output directory")
+            if (!Files.exists(path, java.nio.file.LinkOption.NOFOLLOW_LINKS)) continue
+            if (!Files.isDirectory(path, java.nio.file.LinkOption.NOFOLLOW_LINKS)) error("Not a Python result directory")
+            val entries = mutableListOf<java.nio.file.Path>()
+            Files.walkFileTree(path, object : java.nio.file.SimpleFileVisitor<java.nio.file.Path>() {
+                override fun visitFile(file: java.nio.file.Path, attrs: java.nio.file.attribute.BasicFileAttributes): java.nio.file.FileVisitResult {
+                    if (!attrs.isRegularFile || attrs.isSymbolicLink) error("Refusing a linked or special file in Python results")
+                    if (entries.size >= 100_000) error("Too many cached result files to clear safely")
+                    entries.add(file)
+                    return java.nio.file.FileVisitResult.CONTINUE
+                }
+                override fun preVisitDirectory(dir: java.nio.file.Path, attrs: java.nio.file.attribute.BasicFileAttributes): java.nio.file.FileVisitResult {
+                    if (attrs.isSymbolicLink) error("Refusing a linked directory in Python results")
+                    if (entries.size >= 100_000) error("Too many cached result files to clear safely")
+                    entries.add(dir)
+                    return java.nio.file.FileVisitResult.CONTINUE
+                }
+            })
+            val fileCount = entries.count { Files.isRegularFile(it, java.nio.file.LinkOption.NOFOLLOW_LINKS) }
+            for (entry in entries.asReversed()) {
+                Files.delete(entry) // Deleting a swapped symlink removes the link, never follows it.
+            }
+            deletedFiles += fileCount
+        }
+        return deletedFiles
+    }
+
     fun unavailableReport(): StorageReport {
         fun unavailable(label: String) = StorageCategoryUsage(label, 0L, 0, 1)
         val retained = listOf(
