@@ -191,7 +191,7 @@ ApplicationWindow {{
         self.assertIsNotNone(page)
         for width, height in ((1280, 720), (1920, 1080), (900, 560)):
             self.window.resize(width, height)
-            for section, control_name in (("appearance", "settingsScroll"), ("reading", "readingFontChoice"), ("writing", "writingAutosave"), ("python", "pythonPath"), ("system", "inspectAppStorage"), ("shortcuts", "shortcutRecorder_find")):
+            for section, control_name in (("appearance", "settingsScroll"), ("reading", "readingFontChoice"), ("writing", "writingAutosave"), ("python", "pythonPath"), ("storage", "inspectAppStorage"), ("updates", "openLatestGitHubRelease"), ("shortcuts", "shortcutRecorder_find")):
                 page.setProperty("section", section)
                 QTest.qWait(20)
                 control = self.named_item(control_name)

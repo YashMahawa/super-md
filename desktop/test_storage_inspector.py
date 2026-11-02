@@ -7,7 +7,7 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
-from storage_inspector import inspect_storage
+from storage_inspector import inspect_storage, clear_storage_category
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 from PySide6.QtGui import QGuiApplication
@@ -45,7 +45,7 @@ class StorageInspectorTest(unittest.TestCase):
             self.assertNotIn("outside-category", json.dumps(report))
             self.assertNotIn(temporary, json.dumps(report))
             self.assertEqual(categories["recovery"]["classification"], "preserved")
-            self.assertEqual(categories["execution-results"]["classification"], "preserved")
+            self.assertEqual(categories["execution-results"]["classification"], "clearable")
 
     @unittest.skipUnless(hasattr(os, "symlink"), "symlinks unavailable")
     def test_skips_symlinked_files_and_directories(self):
@@ -86,6 +86,37 @@ class StorageInspectorTest(unittest.TestCase):
             self.assertEqual(report["status"], "partial")
             self.assertTrue(report["cancelled"])
             self.assertEqual((root / "recovery.json").read_text(encoding="utf-8"), "keep")
+
+    def test_cleanup_only_disposable_categories(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "derived-python").mkdir()
+            (root / "derived-python" / "temporary.svg").write_bytes(b"preview")
+            (root / "updates").mkdir()
+            (root / "updates" / "cached.json").write_text("cached")
+            (root / "closed-notes").mkdir()
+            (root / "closed-notes" / "critical.md").write_text("keep")
+            (root / "settings.json").write_text("settings")
+            self.assertTrue(clear_storage_category(root,"execution-results")["cleared"])
+            self.assertFalse((root / "derived-python").exists())
+            self.assertTrue((root / "closed-notes" / "critical.md").exists())
+            self.assertTrue(clear_storage_category(root,"update-state")["cleared"])
+            self.assertFalse((root / "updates").exists())
+            for category in ("recovery","workspace","python-runtime", "../outside"):
+                with self.assertRaises(ValueError):clear_storage_category(root,category)
+            self.assertEqual((root / "settings.json").read_text(),"settings")
+
+    @unittest.skipUnless(hasattr(os,"symlink"),"symlinks unavailable")
+    def test_cleanup_refuses_linked_root_or_target(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root=Path(tmp) / "app";outside=Path(tmp) / "outside"
+            root.mkdir();outside.mkdir()
+            (outside / "protected").write_text("keep")
+            (root / "derived-python").symlink_to(outside, target_is_directory=True)
+            with self.assertRaises(ValueError):clear_storage_category(root,"execution-results")
+            (Path(tmp) / "linked-root").symlink_to(root,target_is_directory=True)
+            with self.assertRaises(ValueError):clear_storage_category(Path(tmp) / "linked-root","execution-results")
+            self.assertEqual((outside / "protected").read_text(),"keep")
 
     def test_missing_app_data_is_an_empty_complete_inventory(self):
         with tempfile.TemporaryDirectory() as temporary:

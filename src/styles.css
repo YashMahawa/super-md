@@ -315,6 +315,71 @@ md-filled-button.primary-action, smd-expressive-button.primary-action { display:
 .callout-answer .callout-title::before,.callout-solution .callout-title::before {mask-image:url('/icons/CalloutAnswer.svg');}
 .callout-example .callout-title::before {mask-image:url('/icons/CalloutExample.svg');}
 .callout-quote .callout-title::before {mask-image:url('/icons/CalloutQuote.svg');}
+
+/* Interactive step decks: the SVG/image occupies one stage rather than a vertical stack. */
+.markdown-body .step-cards {
+  max-width: 100%; margin: 1.45em 0; padding: 14px 17px 12px;
+  border-radius: 18px; border: 1px solid var(--outline);
+  background: var(--surface); box-shadow: 0 5px 22px var(--shadow);
+  outline-offset: 3px; overflow: hidden;
+}
+.step-cards:focus-visible { outline: 2px solid var(--primary); }
+.step-cards-heading { display:flex; align-items:center; justify-content:space-between; gap:12px; font-size:.94em; letter-spacing:-.015em; }
+.step-cards-heading strong { font-weight:780; min-width:0; }
+.step-cards-progress { flex:none; font-variant-numeric:tabular-nums; font-weight:700; font-size:.81em; color:var(--muted); }
+.step-cards-stage { padding: 10px 0 2px; text-align:center; }
+.step-cards-step-title { color:var(--primary); font-size:.84em; font-weight:750; text-align:center; margin:0 0 9px; }
+.step-cards-figure-stack { position:relative; display:grid; place-items:center; width:100%; height:clamp(170px, 28vw, 350px); isolation:isolate; overflow:hidden; }
+.step-cards-figure { grid-area:1/1; position:absolute; inset:0; display:flex; align-items:center; justify-content:center; max-width:100%; overflow:hidden; transition:opacity 170ms ease; }
+.step-cards-figure.is-offstage { opacity:0; pointer-events:none; visibility:hidden; }
+.step-cards-figure.is-current { opacity:1; visibility:visible; z-index:1; }
+.step-cards-figure .note-image { max-width:100%; display:block; margin:0 auto; }
+.markdown-body .step-cards-figure img { border:0; border-radius:8px; background:transparent; display:block; height:auto; max-width:100%; max-height:100%; width:auto; object-fit:contain; margin:0 auto; }
+.step-cards-figure .note-image { max-height:100%; }
+.step-cards-figure .note-image > img { max-height:100%; }
+.step-cards-description { margin:8px auto 5px !important; max-width:65ch; text-align:center; font-size:.86em; line-height:1.5; color:var(--muted); white-space:pre-line; }
+.step-cards-controls { display:flex; align-items:center; gap:13px; margin-top:9px; padding-top:10px; border-top:1px solid var(--outline); }
+.step-cards-arrow { flex:none; display:flex; align-items:center; justify-content:center; gap:6px; border-radius:999px; border:1px solid var(--outline); min-height:38px; padding:4px 13px; background:var(--surface-high); color:var(--text); cursor:pointer; font-size:.78em; font-weight:700; transition:background-color .16s ease; }
+.step-cards-arrow:hover:not(:disabled) { background:color-mix(in srgb,var(--primary) 13%,var(--surface-high)); }
+.step-cards-arrow:focus-visible { outline:2px solid var(--primary); outline-offset:2px; }
+.step-cards-arrow:disabled { opacity:.38; cursor:default; }
+.step-cards-arrow [aria-hidden] { font-size:1.8em; line-height:1; font-weight:400; }
+.step-cards-slider-wrap { display:flex; min-width:50px; flex:1; align-items:center; }
+.step-cards-slider { display:block; width:100%; min-width:0; height:32px; accent-color:var(--primary); cursor:pointer; }
+.step-cards-slider:focus-visible { outline:2px solid var(--primary); outline-offset:2px; }
+.step-cards-error { color:var(--error); }
+
+/* Safe declarative SVG graphics — authored with smd-diagram or embedded in smd-steps. */
+.markdown-body .inline-diagram { width:100%; max-width:100%; margin:1em auto; padding:8px; display:flex; align-items:center; justify-content:center; border:1px solid var(--outline); border-radius:14px; background:var(--surface-low); }
+.inline-diagram svg { width:100%; height:auto; display:block; max-height:440px; overflow:visible; }
+.inline-diagram-edge { stroke:var(--muted); stroke-width:3; stroke-linecap:round; fill:none; transition:stroke .17s ease, opacity .17s ease; }
+.inline-diagram-edge.is-dashed { stroke-dasharray:5 7; opacity:.48; }
+.inline-diagram-node { transition:transform .2s ease, opacity .2s ease; }
+.inline-diagram-node :is(circle,rect) { fill:var(--surface-high); stroke:var(--primary); stroke-width:2.5; transition:fill .2s ease,stroke .2s ease; }
+.inline-diagram-node text { fill:var(--text); font-family:var(--reader-font,"Noto Sans",sans-serif); font-size:21px; font-weight:700; pointer-events:none; }
+.inline-diagram-node.is-active :is(circle,rect) { fill:#ffb367; stroke:#df934e; }
+.inline-diagram-node.is-active text { fill:#1b2735; }
+.inline-diagram-node.is-visited :is(circle,rect) { fill:#153d4b; stroke:#73e3e0; }
+.inline-diagram-node.is-visited text { fill:#f1faff; }
+.inline-diagram-node.is-muted { opacity:.36; }
+.step-cards-inline-figure { height:clamp(170px,28vw,350px); display:flex; justify-content:center; align-items:center; }
+.step-cards-inline-figure .inline-diagram { margin:0; border:0; background:transparent; padding:0; height:100%; }
+.step-cards-inline-figure .inline-diagram svg { height:100%; max-height:100%; }
+.inline-diagram-error { display:block; color:var(--error); }
+@media(max-width:540px){ .step-cards-inline-figure { height:clamp(145px,38vw,285px); } }
+@media(prefers-reduced-motion:reduce) { .inline-diagram-node,.inline-diagram-node :is(circle,rect),.inline-diagram-edge { transition:none; } }
+
+@media(max-width:540px) {
+  .markdown-body .step-cards { padding:12px; }
+  .step-cards-arrow { min-width:40px; padding:4px 8px; }
+  .step-cards-arrow-text { display:none; }
+  .step-cards-controls { gap:8px; }
+  .step-cards-figure-stack { height:clamp(145px, 38vw, 285px); }
+  .markdown-body .step-cards-figure img { max-height:100%; }
+}
+@media(prefers-reduced-motion:reduce) { .step-cards-arrow,.step-cards-figure { transition:none; } }
+@media print { .step-cards-controls { display:none; } .step-cards { break-inside:avoid; } }
+
 .interactive-chart { margin: 1.8em 0; padding: 16px; border: 1px solid var(--outline); border-radius: 18px; background: var(--surface); }
 .interactive-chart figcaption { font-weight: 750; font-size: 1.08em; margin: 0 4px 10px; }
 .interactive-chart svg { width: 100%; height: auto; background: var(--surface-low); border-radius: 12px; }

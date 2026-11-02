@@ -11,6 +11,7 @@ Pane {
     property string shortcutMessage: ""
     property string section: "appearance"
     property string shortcutErrorAction: ""
+    property string pendingCleanup: ""
     property var shortcutLabels: JSON.parse(studio.shortcutLabels)
     signal back()
     readonly property bool pythonReady: JSON.parse(studio.pythonChoices).some(choice => choice.matplotlib)
@@ -29,6 +30,20 @@ Pane {
     }
     padding: 0
     background: null
+    Dialog {
+        id: confirmStorageCleanup
+        objectName: "confirmStorageCleanup"
+        title: page.pendingCleanup === "execution-results" ? "Clear temporary Python results?" : "Clear cached update state?"
+        modal: true
+        parent: Overlay.overlay
+        x: (parent ? (parent.width - width) / 2 : 0)
+        y: (parent ? (parent.height - height) / 2 : 0)
+        width: Math.min(440, page.width - 32)
+        height: 220
+        standardButtons: Dialog.Ok | Dialog.Cancel
+        onAccepted: studio.clearStorageCategory(page.pendingCleanup)
+        contentItem: Label { width: 360; wrapMode: Text.WordWrap; text: page.pendingCleanup === "execution-results" ? "Remove app-generated Python result previews. Saved notes, exported images and recovery data will not be touched. This cannot be undone." : "Remove cached update verification/download state. Installed versions and Downloads outside app storage remain unchanged. This cannot be undone." }
+    }
     Component.onCompleted: studio.refreshPython()
     ColumnLayout {
         anchors.fill: parent
@@ -45,7 +60,7 @@ Pane {
                 model: [
                     {key:"appearance", label:"Appearance"}, {key:"reading", label:"Reading"},
                     {key:"writing", label:"Writing"}, {key:"python", label:"Python"},
-                    {key:"system", label:"Updates & storage"}, {key:"agents", label:"AI agents"},
+                    {key:"updates", label:"Updates"}, {key:"storage", label:"Storage"}, {key:"agents", label:"AI agents"},
                     {key:"shortcuts", label:"Keyboard shortcuts"}
                 ]
                 delegate: ActionButton {
@@ -222,7 +237,7 @@ Pane {
                 Label { text: "Local Python is not sandboxed. Only run cells from notes you trust."; Layout.fillWidth: true; wrapMode: Text.WordWrap; color: viewState.colors.muted }
                 }
                 ColumnLayout {
-                    visible: page.section === "system"
+                    visible: page.section === "updates"
                     Layout.fillWidth: true
                     spacing: 16
                 Label { text: "About & updates"; font.pixelSize: 22; font.weight: Font.DemiBold; Layout.topMargin: 12 }
@@ -235,10 +250,16 @@ Pane {
                 Label { text: studio.updateStatus; visible: text.length > 0; Layout.fillWidth: true; wrapMode: Text.WordWrap }
                 RowLayout {
                     ActionButton { text: "Check for updates"; tonal: true; enabled: !studio.updateBusy; onClicked: studio.checkUpdates() }
+                    ActionButton { objectName: "openLatestGitHubRelease"; text: "Open latest release on GitHub"; tonal: true; onClicked: studio.openLatestGitHubRelease() }
                     ActionButton { text: studio.updateReady ? "Install update" : "Download update"; visible: studio.updateAvailable; enabled: !studio.updateBusy; prominent: true; onClicked: studio.updateReady ? studio.installUpdate() : studio.downloadUpdate() }
                 }
+                }
+                ColumnLayout {
+                    visible: page.section === "storage"
+                    Layout.fillWidth: true
+                    spacing: 16
                 Label { text: "App storage"; font.pixelSize: 22; font.weight: Font.DemiBold; Layout.topMargin: 12 }
-                Label { text: "A read-only inventory of known Super MD app data. It does not scan notes, Downloads or your home folder."; Layout.fillWidth: true; wrapMode: Text.WordWrap; color: viewState.colors.muted }
+                Label { text: "Inspect and selectively clear app-generated temporary data. Notes, saved files, fonts, preferences and recovery snapshots stay protected."; Layout.fillWidth: true; wrapMode: Text.WordWrap; color: viewState.colors.muted }
                 Flow {
                     Layout.fillWidth: true
                     spacing: 8
@@ -258,11 +279,13 @@ Pane {
                         Layout.fillWidth: true
                         spacing: 10
                         Label { text: modelData.label; Layout.fillWidth: true; wrapMode: Text.WordWrap; font.weight: Font.DemiBold }
-                        Label { text: modelData.classification === "managed" ? "Managed" : "Preserved"; color: viewState.colors.muted }
+                        Label { text: modelData.classification === "clearable" ? "Clearable" : modelData.classification === "managed" ? "Managed" : "Protected"; color: viewState.colors.muted }
                         Label { text: page.formatBytes(modelData.bytes) + " · " + modelData.files + " files"; color: viewState.colors.muted; horizontalAlignment: Text.AlignRight }
+                        ActionButton { text: "Clear"; objectName: "clearStorage_" + modelData.id; visible: modelData.classification === "clearable"; enabled: !studio.storageBusy && !studio.storageCleanupBusy && modelData.files > 0 && (modelData.id !== "update-state" || !studio.updateBusy && !studio.updateReady); compact: true; tonal: true; onClicked: {page.pendingCleanup = modelData.id; confirmStorageCleanup.open()} }
                     }
                 }
-                Label { text: "Recovery snapshots and Python execution results are preserved. This tool does not delete anything; no disposable app-managed cache is tracked or cleared."; Layout.fillWidth: true; wrapMode: Text.WordWrap; color: viewState.colors.muted }
+                Label { text: studio.storageCleanupBusy ? "Cleaning temporary app data…" : studio.storageCleanupStatus; visible: text.length > 0; Layout.fillWidth: true; wrapMode: Text.WordWrap; color: viewState.colors.muted }
+                Label { text: "Only app-generated Python results and obsolete update state can be cleared. Your notes, exports, recovery snapshots and Python environment are never deleted here."; Layout.fillWidth: true; wrapMode: Text.WordWrap; color: viewState.colors.muted }
                 }
                 AgentAccess {
                     visible: page.section === "agents"

@@ -47,6 +47,64 @@ Common types include `note`, `tip`, `info`, `warning`, `danger`, `example`, and 
 
 Expressions receive `x`, each slider name, and JavaScript's `Math` object. A series may instead provide literal `points` as `[[x, y], ...]`.
 
+## Step-by-step cards
+
+Use a `smd-steps` fenced block when several diagrams show consecutive stages of
+one operation. Super MD shows **one stage at a time** with Previous/Next buttons,
+a draggable slider, and Left/Right keys while the card has focus. It is supported
+by the shared desktop and Android reader.
+
+````markdown
+```smd-steps
+{
+  "title": "Heap insertion",
+  "steps": [
+    {"label": "Before", "image": "assets/heap-before.svg", "description": "Start with a valid heap."},
+    {"label": "Append", "image": "assets/heap-append.svg", "description": "Insert at the next free leaf."},
+    {"label": "Sift up", "image": "assets/heap-after.svg", "description": "Swap until the parent dominates."}
+  ]
+}
+```
+````
+
+Each step needs a short `label`, an `image` or `description`, and may include
+both. `alt` can describe a diagram for screen readers. Images follow normal
+relative-asset handling, including embedded `.smd` assets and remote-image
+consent rules. A deck supports **2–40 steps**, with no executable HTML/JS.
+Existing Mermaid/SVG diagrams and Markdown remain unchanged.
+
+## Inline SVG diagrams and binary trees
+
+For diagrams that change over time, Super MD supports **safe declarative SVG** in
+`smd-diagram` blocks. Specify an explicit canvas and nodes with stable `id`,
+`label`, `x`, `y`, optional `state` (`normal`, `active`, `visited`, `muted`), plus
+edges by node ID. The renderer draws native SVG with no executable HTML/JS.
+
+````markdown
+```smd-diagram
+{"title":"Graph traversal","width":360,"height":180,
+ "nodes":[{"id":"A","label":"A","x":180,"y":45,"state":"active"},
+          {"id":"B","label":"B","x":90,"y":140},
+          {"id":"C","label":"C","x":270,"y":140}],
+ "edges":[{"from":"A","to":"B"},{"from":"A","to":"C"}]}
+```
+````
+
+For **binary trees**, use `smd-tree` to preserve left/right slots without
+vertical single-child ambiguity. Use `null` for an empty slot. The array uses
+0-based heap indices (left child `2*i+1`, right child `2*i+2`), up to 15 slots.
+
+````markdown
+```smd-tree
+{"title":"Max heap","values":["50","30","40","10","20","35"],"highlight":[5]}
+```
+````
+
+Both objects can also be supplied as a `diagram` property on any `smd-steps`
+slide, alongside its `label` and `description`. All steps then update a single
+SVG rather than repeatedly constructing an image; use consistent node IDs for
+animated highlighting and position changes.
+
 ## Python and Matplotlib
 
 ````markdown

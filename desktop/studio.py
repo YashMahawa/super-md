@@ -34,7 +34,7 @@ from python_outputs import PythonOutputs
 from reader_edits import ReaderEdits
 from closed_notes import ClosedNoteStore
 from reader_assets import ReaderAssetStore, note_file_path, resolve_source
-from storage_inspector import inspect_storage
+from storage_inspector import inspect_storage, clear_storage_category
 from latest_writes import LatestWriteExecutor
 import updates
 import app_integration
@@ -333,6 +333,8 @@ class Studio(QObject):
         self.update_running=False
         self._storage_report = json.dumps({"status":"idle","cancelled":False,"truncated":False,"scannedEntries":0,"categories":[]})
         self.storage_busy = False
+        self.storage_cleanup_busy = False
+        self.storage_cleanup_status = ""
         self._storage_cancel_event = None
         self.python_status=""
         self.python_choices=[]
@@ -1143,6 +1145,38 @@ class Studio(QObject):
 
     @Property(bool,notify=changed)
     def storageBusy(self):return self.storage_busy
+
+    @Property(bool,notify=changed)
+    def storageCleanupBusy(self):return self.storage_cleanup_busy
+
+    @Property(str,notify=changed)
+    def storageCleanupStatus(self):return self.storage_cleanup_status
+
+    @Slot(str)
+    def clearStorageCategory(self, category):
+        if category not in ("execution-results", "update-state"):
+            self.storage_cleanup_status = "This storage category is protected."
+            self._emit(False)
+            return
+        if self.retired or self.storage_busy or self.storage_cleanup_busy or (category == "update-state" and (self.update_running or self.update_path)):
+            self.storage_cleanup_status = "Cleanup is unavailable while storage or updates are in use."
+            self._emit(False)
+            return
+        self.storage_cleanup_busy = True
+        self.storage_cleanup_status = ""
+        self._emit(False)
+        def done(result,error):
+            self.storage_cleanup_busy = False
+            self.storage_cleanup_status = ("Cleanup failed; app files were not intentionally changed." if error or not result else "Temporary app data cleared. Notes and recovery preserved.")
+            self._emit(False)
+            self.inspectStorage()
+        self._submit(lambda:clear_storage_category(self.data,category),done,False)
+
+    @Slot()
+    def openLatestGitHubRelease(self):
+        if not QDesktopServices.openUrl(QUrl(updates.REPO + "/releases/latest")):
+            self.message = "Could not open the latest GitHub release in your browser."
+        self._emit(False)
 
     @Slot()
     def inspectStorage(self):
