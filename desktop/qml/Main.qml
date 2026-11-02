@@ -326,11 +326,13 @@ ApplicationWindow {
                 ActionButton { visible: window.width >= 1060; glyph: "ShareNetwork"; ToolTip.text: "Share note"; onClicked: window.showExport(true) }
                 ActionButton {
                     visible: window.width < 1060; glyph: "More"; ToolTip.text: "More note actions"; onClicked: noteActions.popup()
-                    Menu {
+                    NoteContextMenu {
                         id: noteActions
-                        MenuItem { text: "Insert image or link"; onTriggered: studio.command("insert") }
-                        MenuItem { text: "Fix LaTeX"; onTriggered: studio.command("repair") }
-                        MenuItem { text: "Share note"; onTriggered: window.showExport(true) }
+                        objectName: "compactNoteActions"
+                        implicitWidth: 250
+                        NoteMenuItem { text: "Insert image or link"; icon.source: "../icons/Image.svg"; onTriggered: studio.command("insert") }
+                        NoteMenuItem { text: "Fix LaTeX"; icon.source: "../icons/Bug.svg"; onTriggered: studio.command("repair") }
+                        NoteMenuItem { text: "Share note"; icon.source: "../icons/ShareNetwork.svg"; onTriggered: window.showExport(true) }
                     }
                 }
                 ActionButton { text: window.width < 1060 ? "" : "Export"; glyph: "Export"; ToolTip.text: "Export note"; prominent: true; enabled: !viewState.busy; onClicked: window.showExport(false) }

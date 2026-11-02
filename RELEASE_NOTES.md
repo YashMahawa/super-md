@@ -1,23 +1,12 @@
-# Super MD 0.6.23
+# Super MD 0.6.25
 
-## Interactive notes
+## Interactive diagrams and portable notes
 
-- Step-by-step cards keep loaded diagrams in place while navigating, dynamically fit SVG height, and prevent diagram/explanation overlap.
-- Interactive two-dimensional charts now work inside cards with independent zoom, panning, parameter sliders and state retention.
-- Native inline SVG graphs and fixed binary-tree left/right child layout remain available on desktop **and Android**.
+- Portable `.smd` export now embeds images referenced inside interactive `smd-steps` decks, including heap, BFS and DFS illustrations. Shared images are deduplicated and step-by-step interactions remain intact after reopening.
+- The compact desktop toolbar menu now uses an opaque, palette-matched background with SVG action icons and suppresses overlapping tooltip bubbles.
+- Windows document saving retries brief file-sharing locks from antivirus or indexers without compromising atomic writes.
 
-## Android and desktop Settings
+## Verification
 
-- Android Storage offers a confirmation-based cleanup action for generated Python previews, protecting notes, recovery, exports and verified update APKs.
-- Android Updates & about now provides **Open latest release on GitHub**.
-- Desktop Updates and Storage are separate sections; Storage also offers constrained temporary-data cleanup.
-
-## Verification and packaging
-
-- Increased Intel macOS native test-suite watchdog without disabling any individual mouse, selection or gesture assertions.
-- Corrected Windows app-owned temporary storage cleanup safety handling.
-- Release publication remains gated on tagged-source desktop, Android and CI verification. Release APKs retain the existing upgrade certificate and are verified as signed, aligned, non-debuggable arm64 builds.
-
-## Scope
-
-The separate unfinished MCP changes are **not** part of this release.
+- Adds regressions for embedded step-deck images, small-window native Qt menu painting, and Windows sharing-lock recovery.
+- Release publication requires successful CI on the exact release commit, verified Android signing, and all platform installers.
