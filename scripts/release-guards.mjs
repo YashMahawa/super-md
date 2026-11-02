@@ -19,7 +19,6 @@ export function validateAssets(tag, assets) {
     "Linux RPM": (name) => /\.x86_64\.rpm$/.test(name),
     "Windows installer": (name) => /_x64-setup\.exe$/.test(name),
     "macOS Apple Silicon": (name) => /_aarch64\.dmg$/.test(name),
-    "macOS Intel": (name) => /_x64\.dmg$/.test(name),
   };
   for (const [role, matches] of Object.entries(roles)) {
     const found = assets.filter((asset) => asset.name.includes(version) && matches(asset.name));
@@ -40,6 +39,6 @@ if (process.argv[1] === fileURLToPath(import.meta.url)) {
       android: android.match(/versionName\s*=\s*"([^"]+)"/)?.[1],
     }));
   } else if (command === "assets") {
-    validateAssets(tag, JSON.parse(readFileSync(input, "utf8"))); console.log("All seven release packages are uploaded");
+    validateAssets(tag, JSON.parse(readFileSync(input, "utf8"))); console.log("All six release packages are uploaded");
   } else throw new Error("Expected versions TAG or assets TAG ASSETS_JSON");
 }
