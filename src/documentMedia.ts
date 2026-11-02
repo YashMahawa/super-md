@@ -97,6 +97,31 @@ export async function prepareFmd(markdown: string, documentPath: string | null) 
       for (const match of raw.matchAll(/!\[\[([^\]|]+)(?:\|([^\]]+))?\]\]/g)) collect(encodeURI(match[1]), (name) => { edits.push({ start: node.position.start.offset + match.index!, end: node.position.start.offset + match.index! + match[0].length, value: imageMarkdown({ source: name, alt: match[2] || match[1] }) }); });
     }
   });
+  // Fenced smd-steps JSON is deliberately opaque to the Markdown AST. Collect
+  // its image references separately, and rewrite *inside* the JSON while
+  // preserving the interactive deck rather than flattening it into Markdown.
+  visit(tree, "code", (node: any) => {
+    if (node.lang !== "smd-steps" || !node.position) return;
+    const raw = markdown.slice(node.position.start.offset, node.position.end.offset);
+    const opening = /^(`{3,}|~{3,})[^\n]*\n/.exec(raw);
+    if (!opening) return;
+    const payloadStart = node.position.start.offset + opening[0].length;
+    const payloadEnd = payloadStart + node.value.length;
+    let deck: { steps?: Array<{ image?: unknown }> };
+    try { deck = JSON.parse(node.value); } catch { return; }
+    if (!Array.isArray(deck.steps)) return;
+    const stepSources = new Set(deck.steps.map(step => step?.image).filter((image): image is string => typeof image === "string" && image.length > 0));
+    if (!stepSources.size) return;
+    const rewritten = new Map<string, string>();
+    const offset = work.length;
+    for (const source of stepSources) collect(source, name => { rewritten.set(source, name); });
+    // All corresponding assets must finish loading before serializing this deck.
+    const waiting = work.splice(offset);
+    work.push(Promise.all(waiting).then(() => {
+      for (const step of deck.steps!) if (typeof step.image === "string" && rewritten.has(step.image)) step.image = rewritten.get(step.image);
+      edits.push({start: payloadStart, end: payloadEnd, value: JSON.stringify(deck, null, 2)});
+    }));
+  });
   await Promise.all(work);
   let content = markdown;
   for (const edit of edits.sort((a, b) => b.start - a.start)) content = content.slice(0, edit.start) + edit.value + content.slice(edit.end);

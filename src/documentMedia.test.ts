@@ -22,6 +22,20 @@ describe("portable media", () => {
     expect(result.content).toContain('```mermaid\nA --> B\n```'); expect(result.content).toContain('print("![Not an attachment](fake.png)")'); expect(result.content).not.toContain("base64");
     expect(result.content.match(/assets\/image-/g)).toHaveLength(2);
   });
+  it("packs image references inside interactive smd-steps and preserves shared slide assets", async () => {
+    native.mockReset().mockResolvedValue("data:image/svg+xml;base64,PHN2Zy8+");
+    const deck = {title:"Heap steps",steps:[{label:"Before",image:"assets/clean-01.svg"},{label:"After",image:"assets/clean-02.svg"},{label:"Again",image:"assets/clean-01.svg"}]};
+    const md = "# Heap\n\n```smd-steps\n"+JSON.stringify(deck,null,2)+"\n```\n";
+    const result = await prepareFmd(md,"/notes/heaps.md");
+    const match = /```smd-steps\n([\s\S]*?)\n```/.exec(result.content);
+    expect(match).not.toBeNull();
+    const packed = JSON.parse(match![1]);
+    expect(packed.steps[0].image).toBe(packed.steps[2].image);
+    expect(packed.steps[0].image).not.toBe(deck.steps[0].image);
+    expect(Object.keys(result.assets)).toHaveLength(2);
+    expect(packed.steps.every((step:{image:string})=>step.image in result.assets)).toBe(true);
+    expect(native).toHaveBeenCalledTimes(2);
+  });
   it("embeds reference-style images and preserves adjacent source", async () => {
     native.mockResolvedValue("data:image/png;base64,aGVsbG8=");
     const result = await prepareFmd("# Keep\n\n![Proof][p]\n\n[p]: proof.png \"A title\"\n", "/notes/a.md");
