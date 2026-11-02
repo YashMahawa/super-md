@@ -99,6 +99,7 @@ internal class ReaderBridge(
                     "cache_python_output" -> cachePythonOutput(args)
                     "load_python_output" -> loadPythonOutput(args)
                     "load_asset" -> model.asset(args.getString("documentPath"), args.getString("source"))
+                    "load_text_asset" -> model.textAsset(args.getString("documentPath"), args.getString("source"))
                     "resolve_reader_asset" -> withContext(Dispatchers.IO) {
                         val source = args.getString("source")
                         val (noteId, asset) = model.resolveReaderAsset(args.getString("documentPath"), source)
@@ -121,10 +122,11 @@ internal class ReaderBridge(
                     "run_python" -> runPython(args)
                     "export_pdf_native" -> exportPdf(args)
                     "cancel_export" -> cancelPdfExport(args)
-                    "export_markdown_native" -> { model.shareMarkdown(args.getString("content")); true }
+                    "export_markdown_native" -> { model.shareMarkdown(args.getString("id"), args.getString("content"), args.optJSONObject("assets") ?: JSONObject(), args.optBoolean("archive")); true }
                     "export_failed" -> {
                         val message = args.getString("error")
-                        if (isPdfExportCancellationMessage(message)) model.pdfExportCancelled() else model.fail(message)
+                        if (isPdfExportCancellationMessage(message)) model.pdfExportCancelled()
+                        else if (message !in listOf(DOCUMENT_ACCESS_MESSAGE, "Error: $DOCUMENT_ACCESS_MESSAGE", LINKED_ASSET_ACCESS_MESSAGE, "Error: $LINKED_ASSET_ACCESS_MESSAGE")) model.fail(message)
                         true
                     }
                     else -> error("Unknown document command")
@@ -132,9 +134,18 @@ internal class ReaderBridge(
                 val encoded = when(output) { null -> "null"; is JSONObject -> output.toString(); is String -> JSONObject.quote(output); else -> output.toString() }
                 web.post { if (!retired.get()) web.evaluateJavascript("window.supermdReply?.(${JSONObject.quote(id)},$encoded,null)", null) }
             } catch (error: Exception) {
+                val portableSave = command == "export_fmd_native" && runCatching { JSONObject(raw).optBoolean("save") }.getOrDefault(false)
+                val permissionFailure = portableSave && isDocumentAccessFailure(error)
+                val linkedFailure = command in listOf("load_asset", "load_text_asset", "resolve_reader_asset") && isDocumentAccessFailure(error) && run {
+                    val args = JSONObject(raw)
+                    model.reportLinkedAssetFailure(args.getString("documentPath"), args.getString("source"), error)
+                }
+                val message = if (linkedFailure) LINKED_ASSET_ACCESS_MESSAGE
+                    else if (permissionFailure) model.reportDocumentSaveFailure(JSONObject(raw).getString("id"), error, "Could not save portable note")
+                    else error.message ?: "Operation failed"
                 if (!retired.get() && error is PdfExportCancelledException) model.pdfExportCancelled()
-                else if (!retired.get() && command in listOf("export_pdf_native", "export_fmd_native", "export_markdown_native")) model.fail("Export failed: ${error.message}")
-                web.post { if (!retired.get()) web.evaluateJavascript("window.supermdReply?.(${JSONObject.quote(id)},null,${JSONObject.quote(error.message ?: "Operation failed")})", null) }
+                else if (!retired.get() && !permissionFailure && command in listOf("export_pdf_native", "export_fmd_native", "export_markdown_native")) model.fail("Export failed: $message")
+                web.post { if (!retired.get()) web.evaluateJavascript("window.supermdReply?.(${JSONObject.quote(id)},null,${JSONObject.quote(message)})", null) }
             }
         } }
     }

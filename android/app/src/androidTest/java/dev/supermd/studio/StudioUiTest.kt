@@ -1033,7 +1033,7 @@ ax.set_title("Matplotlib 3D figure")
             for(format in formats) {
                 compose.runOnIdle { assertTrue("Could not prepare $format share",model.prepareShare(format)) }
                 when(format) {
-                    "md" -> kotlinx.coroutines.runBlocking { model.shareMarkdown(content) }
+                    "md" -> kotlinx.coroutines.runBlocking { model.shareMarkdown(model.state.value.active.id, content, org.json.JSONObject(), false) }
                     "smd" -> kotlinx.coroutines.runBlocking { model.writePortable(id,content,org.json.JSONObject(),save=false,originalContent=content) }
                     "pdf" -> kotlinx.coroutines.runBlocking { model.export(content,model.state.value.pdf,org.json.JSONObject()) }
                 }

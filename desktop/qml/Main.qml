@@ -615,8 +615,8 @@ ApplicationWindow {
             objectName: "exportDestination"
             title: "Export note"
             fileMode: FileDialog.SaveFile
-            defaultSuffix: exportFormat
-            nameFilters: exportFormat === "pdf" ? ["PDF (*.pdf)"] : exportFormat === "md" ? ["Markdown (*.md)"] : ["Portable Super MD (*.smd)"]
+            defaultSuffix: exportFormat === "mdzip" ? "zip" : exportFormat
+            nameFilters: exportFormat === "pdf" ? ["PDF (*.pdf)"] : exportFormat === "md" ? ["Markdown (*.md)"] : exportFormat === "mdzip" ? ["Markdown bundle (*.zip)"] : ["Portable Super MD (*.smd)"]
             onAccepted: { studio.exportTo(selectedFile.toString(), exportFormat); destroy() }
             onRejected: destroy()
         }
@@ -624,15 +624,16 @@ ApplicationWindow {
     AppDialog {
         id: exportDialog
         objectName: "exportDialog"
+        property var availableFormats: sharing ? ["pdf", "smd", "md", "mdzip"] : viewState.portable ? ["pdf", "md", "mdzip"] : ["pdf", "smd", "md", "mdzip"]
         title: sharing ? "Share note" : "Export note"
         width: Math.min(window.width - 48, Math.max(500, Math.min(720, window.width * .44)))
-        height: outputFormat === "pdf" ? Math.min(window.height - 48, Math.max(620, Math.min(900, window.height * .9))) : Math.min(window.height - 48, 390)
+        height: Math.min(window.height - 32, Math.max(460, Math.min(900, window.height * .85)))
         standardButtons: Dialog.Cancel
         ColumnLayout {
             anchors.fill: parent
             spacing: 16 * exportDialog.uiScale
             Label { text: sharing ? "Choose a format. Sharing availability depends on your desktop." : "PDF preserves the layout. Portable SMD includes editable Markdown and images."; wrapMode: Text.WordWrap; Layout.fillWidth: true }
-            ChoiceField { Layout.fillWidth: true; Layout.minimumHeight: 48 * exportDialog.uiScale; font: exportDialog.font; visible: model.length > 1; model: sharing ? ["PDF", "Portable SMD", "Markdown"] : viewState.portable ? ["PDF"] : ["PDF", "Portable SMD"]; currentIndex: outputFormat === "pdf" ? 0 : outputFormat === "smd" ? 1 : 2; onActivated: outputFormat = currentIndex === 0 ? "pdf" : currentIndex === 1 ? "smd" : "md" }
+            ChoiceField { Layout.fillWidth: true; Layout.minimumHeight: 48 * exportDialog.uiScale; font: exportDialog.font; visible: model.length > 1; model: exportDialog.availableFormats.map(format => format === "pdf" ? "PDF" : format === "smd" ? "Portable SMD" : format === "md" ? "Markdown" : "Markdown ZIP"); currentIndex: Math.max(0, exportDialog.availableFormats.indexOf(outputFormat)); onActivated: outputFormat = exportDialog.availableFormats[currentIndex] }
             ScrollView {
                 id: exportScroll
                 Layout.fillWidth: true
@@ -644,7 +645,7 @@ ApplicationWindow {
                 ColumnLayout {
                     width: exportScroll.availableWidth
                     PdfControls { objectName: "exportPdfControls"; uiScale: exportDialog.uiScale; controlFont: exportDialog.font; ownerPopup: exportDialog; visible: outputFormat === "pdf"; Layout.fillWidth: true; viewportItem: exportScroll.contentItem; options: viewState.settings.pdf; onEdited: options => studio.setting("pdf", JSON.stringify(options)) }
-                    Label { visible: outputFormat !== "pdf"; Layout.fillWidth: true; wrapMode: Text.WordWrap; text: outputFormat === "md" ? "Editable Markdown text. Choose portable SMD to include images in one file." : "A portable .smd keeps the editable Markdown and images together. Source mode never shows embedded image bytes." }
+                    Label { visible: outputFormat !== "pdf"; Layout.fillWidth: true; wrapMode: Text.WordWrap; text: outputFormat === "md" ? "Editable Markdown with raster images beside the file. Vector diagrams are embedded as SVG source." : outputFormat === "mdzip" ? "One ZIP with editable Markdown and its referenced raster images. Vector diagrams are embedded as SVG source." : "A portable .smd keeps the editable Markdown and images together. Source mode never shows embedded image bytes." }
                 }
             }
             ActionButton { text: sharing ? "Prepare share copy" : "Choose destination"; font: exportDialog.font; prominent: true; Layout.fillWidth: true; Layout.minimumHeight: 44 * exportDialog.uiScale; onClicked: window.chooseExportDestination() }

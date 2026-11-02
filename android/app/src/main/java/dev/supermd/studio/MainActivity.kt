@@ -147,6 +147,7 @@ class MainActivity : ComponentActivity() {
         // Create this task's workspace before RESUMED/lifecycle consumers can
         // request it. Compose's first frame may otherwise run after onResume.
         val windowModel = model
+        intent?.data?.let(windowModel::retainDocumentAccess)
         setContent { Studio(windowModel, this) }
         val savedDispatcherSession = savedInstanceState?.getString(OPEN_DISPATCHER_SESSION)
         if (savedDispatcherSession != windowModel.openDispatcherSessionId) {
@@ -164,7 +165,10 @@ class MainActivity : ComponentActivity() {
         setIntent(intent)
         intent.data?.let { requestOpen(it) }
     }
-    fun requestOpen(uri: android.net.Uri, relative: String? = null) = model.requestOpen(uri, relative)
+    fun requestOpen(uri: android.net.Uri, relative: String? = null) {
+        model.retainDocumentAccess(uri)
+        model.requestOpen(uri, relative)
+    }
     override fun onStop() { saveReaderPosition?.invoke(); model.flush(); agentRelayClient.disconnect(); relayIdentity = null; pendingAgentReplies.clear(); pendingAgentReplyTimeouts.values.forEach(agentMainHandler::removeCallbacks); pendingAgentReplyTimeouts.clear(); super.onStop() }
     override fun onResume() { super.onResume(); model.refreshMetadata(); model.refreshExternal();model.reloadCustomTheme(); refreshAgentRelay() }
     internal fun agentConfigForThisWindow(): AgentAccessConfig? = agentAccessState.configForWorkspace(workspaceKey)
@@ -551,13 +555,16 @@ private object NoMotionScheme : MotionScheme {
         }
     }
     DisposableEffect(activity, web) {
+        model.assetAccessRestored = { document, source ->
+            web?.evaluateJavascript("window.dispatchEvent(new CustomEvent('supermd-asset-access-restored',{detail:{documentPath:${JSONObject.quote(document)},source:${JSONObject.quote(source)}}}))", null)
+        }
         activity.dismissDocument = { web?.evaluateJavascript("window.supermdDismiss?.() || false") { dismissed -> if (dismissed != "true") model.fullscreen(false) } ?: model.fullscreen(false) }
         activity.saveReaderPosition={web?.evaluateJavascript("window.supermdSavePosition?.()",null)}
         activity.openReaderFind = {
             menu = false
             findRequest++
         }
-        onDispose { activity.dismissDocument = null;activity.saveReaderPosition=null;activity.openReaderFind=null }
+        onDispose { activity.dismissDocument = null;activity.saveReaderPosition=null;activity.openReaderFind=null;model.assetAccessRestored=null }
     }
     LaunchedEffect(findRequest, menu, web) {
         if (findRequest == 0 || menu) return@LaunchedEffect
@@ -779,7 +786,7 @@ private object NoMotionScheme : MotionScheme {
                                 model.busy(true)
                                 scope.launch {
                                     runCatching { model.saveAgentPortable(target, request.getString("expectedRevision")) }
-                                        .onFailure { error -> model.fail("Could not save portable note: ${error.message}"); sendAgentReply(target, null, error.message ?: "Could not save portable note") }
+                                        .onFailure { error -> sendAgentReply(target, null, model.reportDocumentSaveFailure(target, error, "Could not save portable note: ${error.message}")) }
                                         .onSuccess {
                                             val saved = model.state.value.tabs.firstOrNull { it.id == target }
                                             if (saved == null) reply(null, "The note closed while it was saving")
@@ -901,6 +908,13 @@ private object NoMotionScheme : MotionScheme {
     var folderRelative by remember { mutableStateOf("") }
     var hinge by remember { mutableStateOf<FoldingFeature?>(null) }
     val recent by model.recent.collectAsStateWithLifecycle()
+    val accessRequest by model.documentAccessRequests.collectAsStateWithLifecycle()
+    var accessPickerShowing by rememberSaveable { mutableStateOf(false) }
+    val accessPicker = rememberLauncherForActivityResult(RestoreDocumentAccess()) { uri ->
+        accessPickerShowing = false
+        val request = model.documentAccessRequests.value
+        if (uri != null && request != null) model.restoreDocumentAccess(request, uri) else model.dismissDocumentAccess()
+    }
     var imageCallback by remember { mutableStateOf<android.webkit.ValueCallback<Array<android.net.Uri>>?>(null) }
     var imageNote by remember { mutableStateOf("") }
     DisposableEffect(model, activity) {
@@ -974,7 +988,7 @@ private object NoMotionScheme : MotionScheme {
         onDispose { activity.setAgentUiHandler(null) }
     }
     DisposableEffect(portable, state.active.name) { model.requestPortable = { portable.launch(state.active.name.substringBeforeLast('.') + ".smd") }; onDispose { model.requestPortable = null } }
-    val saveAction: () -> Unit = { if (state.active.uri == null) save.launch(state.active.name.substringBeforeLast('.') + ".md") else if (state.active.portable) { model.busy(true); web?.evaluateJavascript("window.supermdPortable?.(true)", null) ?: model.fail("The reader is not ready") } else model.save(); Unit }
+    val saveAction: () -> Unit = { if (model.requestWriteAccessIfBlocked(state.active.id, explicit = true)) Unit else if (state.active.uri == null) save.launch(state.active.name.substringBeforeLast('.') + ".md") else if (state.active.portable) { model.busy(true); web?.evaluateJavascript("window.supermdPortable?.(true)", null) ?: model.fail("The reader is not ready") } else model.save(); Unit }
     LaunchedEffect(state.message) { state.message?.let { snackbar.showSnackbar(it); model.dismissMessage() } }
     val immersive = (state.fullscreen || !readingChromeVisible || state.readerOverlay) && !settings
     LaunchedEffect(immersive, dark) {
@@ -1069,7 +1083,7 @@ private object NoMotionScheme : MotionScheme {
                         .graphicsLayer {translationY=-size.height*(1f-chromeReveal);alpha=chromeReveal}
                         .then(if(chromeShown) Modifier else Modifier.clearAndSetSemantics {})
                         .background(palette.surfaceContainerLow).themeArtwork(state,"toolbar")) {
-                        TopAppBar(windowInsets=WindowInsets.statusBarsIgnoringVisibility.union(WindowInsets.displayCutout).only(WindowInsetsSides.Top+WindowInsetsSides.Horizontal), colors = TopAppBarDefaults.topAppBarColors(containerColor = Color.Transparent), title = { Column { Text(state.active.name, maxLines = 1, overflow = TextOverflow.Ellipsis, style = MaterialTheme.typography.titleMedium); Text(if (state.active.dirty) "Draft recovered automatically" else if (state.active.uri != null) "Saved" else "Local draft", style = MaterialTheme.typography.labelSmall, color = palette.onSurfaceVariant) } }, navigationIcon = { IconButton(onClick = { if (state.fullscreen) contentsShown=true else { scope.launch { drawer.open() }; state.folder?.let { if (state.files.isEmpty()) model.listFolder(android.net.Uri.parse(it), "") } } }) { Icon(painterResource(if(state.fullscreen) R.drawable.symbol_contents else R.drawable.symbol_sidebar), if(state.fullscreen) "Show contents" else "Open files") } }, actions = {
+                        TopAppBar(windowInsets=WindowInsets.statusBarsIgnoringVisibility.union(WindowInsets.displayCutout).only(WindowInsetsSides.Top+WindowInsetsSides.Horizontal), colors = TopAppBarDefaults.topAppBarColors(containerColor = Color.Transparent), title = { Column { Text(state.active.name, maxLines = 1, overflow = TextOverflow.Ellipsis, style = MaterialTheme.typography.titleMedium); Text(if (model.documentWriteNeedsAccess(state.active.id)) "Local draft · restore file access" else if (state.active.dirty) "Draft recovered automatically" else if (state.active.uri != null) "Saved" else "Local draft", style = MaterialTheme.typography.labelSmall, color = palette.onSurfaceVariant) } }, navigationIcon = { IconButton(onClick = { if (state.fullscreen) contentsShown=true else { scope.launch { drawer.open() }; state.folder?.let { if (state.files.isEmpty()) model.listFolder(android.net.Uri.parse(it), "") } } }) { Icon(painterResource(if(state.fullscreen) R.drawable.symbol_contents else R.drawable.symbol_sidebar), if(state.fullscreen) "Show contents" else "Open files") } }, actions = {
                             IconButton(onClick = saveAction) { Icon(painterResource(R.drawable.symbol_save), "Save note") }
                             IconButton(onClick = { sharing = false; exporting = true }, enabled = readerReady && !state.busy) { Icon(painterResource(R.drawable.symbol_export), "Export") }
                             StudyIcon(if(state.fullscreen) "Exit fullscreen" else "Fullscreen study", if(state.fullscreen) R.drawable.symbol_fullscreen_exit else R.drawable.symbol_fullscreen) { model.fullscreen(!state.fullscreen) }
@@ -1221,13 +1235,31 @@ private object NoMotionScheme : MotionScheme {
     }
     if (exporting) ModalBottomSheet(onDismissRequest = { exporting = false }, sheetState = rememberModalBottomSheetState(skipPartiallyExpanded = true)) { ExportSettings(state.pdf, model::pdf, sharing = sharing, fonts = state.customFonts) { format ->
         exporting = false
-        if (sharing) {
+        if (format in listOf("md", "mdzip")) {
+            val archive = format == "mdzip"
+            if (model.prepareMarkdownExport(sharing, archive)) web?.evaluateJavascript("window.supermdExportMarkdown?.($archive)", null) ?: model.fail("The reader is not ready")
+        } else if (sharing) {
             if (model.prepareShare(format)) {
                 if (format == "pdf") readerPdfOwnsProgress = true
                 when (format) { "pdf" -> web?.evaluateJavascript("window.supermdExport?.(${state.pdf})", null) ?: model.fail("The reader is not ready"); "smd" -> web?.evaluateJavascript("window.supermdPortable?.(false)", null) ?: model.fail("The reader is not ready"); "md" -> web?.evaluateJavascript("window.supermdExportMarkdown?.()", null) ?: model.fail("The reader is not ready") }
             }
         } else if (format == "smd") portable.launch(state.active.name.substringBeforeLast('.') + ".smd") else pdf.launch(state.active.name.substringBeforeLast('.') + ".pdf")
     } }
+    if (!accessPickerShowing) accessRequest?.let { request ->
+        AlertDialog(onDismissRequest = model::dismissDocumentAccess,
+            title = { Text(if (request.assetSource == null) "Restore file access" else "Allow linked file access") },
+            text = { Column(verticalArrangement = Arrangement.spacedBy(12.dp)) {
+                Text(request.name, style = MaterialTheme.typography.titleSmall)
+                Text(request.detail ?: if(request.assetSource == null) DOCUMENT_ACCESS_MESSAGE else LINKED_ASSET_ACCESS_MESSAGE)
+                if (request.assetSource == null && request.noteId == state.active.id) TextButton(onClick = {
+                    model.dismissDocumentAccess()
+                    if (state.active.portable) portable.launch(state.active.name.substringBeforeLast('.') + ".smd")
+                    else save.launch(state.active.name.substringBeforeLast('.') + ".md")
+                }) { Text("Save a copy instead") }
+            } },
+            confirmButton = { TextButton(onClick = { accessPickerShowing = true; accessPicker.launch(android.net.Uri.parse(request.uri)) }) { Text(if(request.assetSource == null) "Choose original file" else "Choose linked file") } },
+            dismissButton = { TextButton(onClick = model::dismissDocumentAccess) { Text("Not now") } })
+    }
     state.error?.let { AlertDialog(onDismissRequest = model::dismissError, title = { Text("Couldn't finish") }, text = { Text(it, Modifier.heightIn(max = 360.dp).verticalScroll(rememberScrollState())) }, confirmButton = { TextButton(onClick = model::dismissError) { Text("OK") } }) }
     if (!state.welcomed) WelcomeSetup(state, model) { model.welcomeDone(); open.launch(arrayOf("text/*", "application/octet-stream", "application/vnd.supermd.smd", "application/vnd.supermd.fmd", "application/gzip", "application/x-gzip")) }
 }
@@ -1630,29 +1662,42 @@ internal class NoteDestination(private val mime: String, private val preferred: 
 
 @Composable private fun ExportSettings(raw: String, onChange: (String) -> Unit, sharing: Boolean = false, fonts:List<String> = emptyList(), export: (String) -> Unit) {
     var format by rememberSaveable { mutableStateOf("pdf") }
+    var markdownZip by rememberSaveable { mutableStateOf(false) }
     var options by remember(raw) { mutableStateOf(JSONObject(raw)) }
     fun update(key: String, value: Any) { options = JSONObject(options.toString()).put(key, value); onChange(options.toString()) }
     Box(Modifier.fillMaxWidth(), contentAlignment = Alignment.TopCenter) {
         Column(Modifier.widthIn(max = 640.dp).fillMaxWidth()) {
             Column(Modifier.weight(1f, fill = false).fillMaxWidth().verticalScroll(rememberScrollState()).padding(horizontal = 24.dp)) {
                 Text(if (sharing) "Share your note" else "Export your note", style = MaterialTheme.typography.headlineSmall)
-                val formats = if (sharing) listOf("pdf" to "PDF", "md" to "Markdown", "smd" to "Portable SMD") else listOf("pdf" to "PDF document", "smd" to "Portable SMD")
-                SingleChoiceSegmentedButtonRow(Modifier.fillMaxWidth().padding(vertical = 16.dp)) {
-                    formats.forEachIndexed { index, (key, label) -> SegmentedButton(selected = format == key, onClick = { format = key }, shape = SegmentedButtonDefaults.itemShape(index, formats.size)) { Text(label) } }
+                val formats = listOf("pdf" to "PDF", "md" to "Markdown", "smd" to "Portable SMD", "mdzip" to "ZIP")
+                Column(Modifier.fillMaxWidth().padding(vertical = 12.dp)) {
+                    formats.chunked(2).forEach { row ->
+                        Row(Modifier.fillMaxWidth()) {
+                            row.forEach { (key, label) ->
+                                FilterChip(selected = format == key, onClick = { format = key }, label = { Text(label) }, modifier = Modifier.weight(1f).padding(horizontal = 4.dp))
+                            }
+                        }
+                    }
                 }
                 if (format == "pdf") {
                     Text("Vector equations, plots and real pagination. Typeset locally on this device.", style = MaterialTheme.typography.bodyMedium, modifier = Modifier.padding(bottom = 12.dp))
                     PdfOptions(options, fonts, ::update)
+                } else if (format == "mdzip") {
+                    Text("A single ZIP archive containing editable Markdown and all referenced assets in one folder.", style = MaterialTheme.typography.bodyMedium)
                 } else if (format == "md") {
-                    Text("Editable Markdown text. For a single file that also includes images, choose Portable SMD.", style = MaterialTheme.typography.bodyMedium)
+                    Text("SVGs and diagram sources are embedded in the Markdown. Images and GIFs keep readable relative filenames.", style = MaterialTheme.typography.bodyMedium)
+                    Row(Modifier.fillMaxWidth().padding(top = 12.dp), verticalAlignment = Alignment.CenterVertically) {
+                        Column(Modifier.weight(1f)) { Text("Bundle as ZIP", style = MaterialTheme.typography.titleSmall); Text("Keep Markdown and all companion files together.", style = MaterialTheme.typography.bodySmall) }
+                        Switch(checked = markdownZip, onCheckedChange = { markdownZip = it })
+                    }
                 } else {
                     Text("Your Markdown and images in one editable file.", style = MaterialTheme.typography.titleMedium)
                     Text("Reopen it in Super MD to edit, drop in images, or select an image to replace or remove it. Source mode shows Markdown, never image bytes.", style = MaterialTheme.typography.bodyMedium, modifier = Modifier.padding(top = 12.dp))
                 }
             }
-            Button(onClick = { export(format) }, shapes = ButtonDefaults.shapes(), modifier = Modifier.fillMaxWidth().padding(horizontal = 24.dp, vertical = 16.dp)) {
+            Button(onClick = { export(if (format == "md" && markdownZip) "mdzip" else format) }, shapes = ButtonDefaults.shapes(), modifier = Modifier.fillMaxWidth().padding(horizontal = 24.dp, vertical = 16.dp)) {
                 Icon(painterResource(if (sharing) R.drawable.symbol_share else R.drawable.symbol_export), null)
-                Text(if (sharing) "Prepare & share" else "Choose destination & export", Modifier.padding(start = 8.dp))
+                Text(if (sharing) "Prepare & share" else if (format == "md") "Export Markdown" else "Choose destination & export", Modifier.padding(start = 8.dp))
             }
         }
     }

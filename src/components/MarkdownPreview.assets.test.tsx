@@ -72,6 +72,28 @@ describe("MarkdownPreview streamed local assets", () => {
     expect(host.querySelector("img")?.getAttribute("src")).toMatch(/^data:image\/png;base64,/);
   });
 
+  it("retries only the matching failed asset after its folder access is restored", async () => {
+    const loads:string[]=[];
+    invoke.mockImplementation(async (command: string,args:any) => {
+      if(command==="resolve_reader_asset")throw new Error("Asset access is required");
+      if(command==="load_asset"){
+        loads.push(args.source);
+        if(args.source==="images/photo.png"&&loads.filter(source=>source===args.source).length===1)throw new Error("Choose the note folder permission");
+        return "data:image/png;base64,iVBORw0KGgo=";
+      }
+      return undefined;
+    });
+    const host=await render("![Photo](images/photo.png)\n\n![Other](images/other.png)");
+    expect(host.querySelector(".image-error")?.textContent).toContain("Choose the note folder permission");
+    expect(loads).toEqual(["images/photo.png","images/other.png"]);
+    await act(async()=>window.dispatchEvent(new CustomEvent("supermd-asset-access-restored",{detail:{documentPath:"/notes/a.md",source:"images/other.png"}})));
+    expect(loads).toEqual(["images/photo.png","images/other.png"]);
+    await act(async()=>window.dispatchEvent(new CustomEvent("supermd-asset-access-restored",{detail:{documentPath:"/notes/a.md",source:"images/photo.png"}})));
+    expect(loads).toEqual(["images/photo.png","images/other.png","images/photo.png"]);
+    expect(host.querySelector(".image-error")).toBeNull();
+    expect(host.querySelector("img")?.getAttribute("src")).toBe("data:image/png;base64,iVBORw0KGgo=");
+  });
+
   it("does not carry one-time remote consent to a changed image source", async () => {
     invoke.mockResolvedValue({ body: "data:image/png;base64,iVBORw0KGgo=" });
     const first = "https://images.example/a.png";

@@ -109,6 +109,119 @@ private val pythonExecution = kotlinx.coroutines.sync.Mutex()
 
 class StudioViewModel(app: Application, val workspaceKey: String = "main") : AndroidViewModel(app) {
     private val prefs = app.getSharedPreferences("studio", 0)
+    private val documentAccess = DocumentAccess(app)
+    private val accessRequestsMutable = MutableStateFlow<DocumentAccessRequest?>(null)
+    val documentAccessRequests = accessRequestsMutable.asStateFlow()
+    private val blockedDocumentWrites = mutableSetOf<String>()
+    private val promptedDocumentAccess = mutableSetOf<String>()
+    private val promptedAssetAccess = mutableSetOf<String>()
+    var assetAccessRestored: ((String, String) -> Unit)? = null
+    fun retainDocumentAccess(uri: Uri) = documentAccess.persist(uri)
+    fun dismissDocumentAccess() { accessRequestsMutable.value = null }
+    private fun linkedAssetUri(note: Note, source: String): Uri? = runCatching {
+        val grants = JSONArray(prefs.getString("linkedAssetGrants", "[]"))
+        (0 until minOf(grants.length(), 256)).asSequence().map { grants.getJSONObject(it) }
+            .firstOrNull { record -> record.optString("source") == source && sameDocumentUri(record.optString("document"), note.uri ?: note.id) }
+            ?.getString("uri")?.let(Uri::parse)
+    }.getOrNull()
+    private fun rememberLinkedAsset(note: Note, source: String, uri: Uri) {
+        val previous = runCatching { JSONArray(prefs.getString("linkedAssetGrants", "[]")) }.getOrDefault(JSONArray())
+        val records = JSONArray().put(JSONObject().put("document", note.uri ?: note.id).put("source", source).put("uri", uri.toString()))
+        for (i in 0 until minOf(previous.length(), 255)) {
+            val record = previous.optJSONObject(i) ?: continue
+            if (!(record.optString("source") == source && sameDocumentUri(record.optString("document"), note.uri ?: note.id))) records.put(record)
+        }
+        prefs.edit().putString("linkedAssetGrants", records.toString()).apply()
+    }
+    internal fun reportLinkedAssetFailure(document: String, source: String, error: Throwable): Boolean {
+        if (!isDocumentAccessFailure(error)) return false
+        val note = mutable.value.tabs.firstOrNull { it.id == document || it.uri?.let { uri -> sameDocumentUri(uri, document) } == true } ?: return false
+        val key = "${note.id}\n$source"
+        if (accessRequestsMutable.value == null && promptedAssetAccess.add(key)) {
+            accessRequestsMutable.value = DocumentAccessRequest(note.uri ?: note.id, Uri.decode(source).substringAfterLast('/'), note.id, false, assetSource = source)
+            mutable.value = mutable.value.copy(busy = false, message = LINKED_ASSET_ACCESS_MESSAGE)
+        } else mutable.value = mutable.value.copy(busy = false)
+        return true
+    }
+    private fun sameDocumentUri(left: String, right: String) = sameDocument(Uri.parse(left), Uri.parse(right))
+    private fun writeIsBlocked(uri: String) = blockedDocumentWrites.any { sameDocumentUri(it, uri) }
+    private fun clearDocumentAccessFailure(uri: String) {
+        blockedDocumentWrites.removeAll { sameDocumentUri(it, uri) }
+        promptedDocumentAccess.removeAll { sameDocumentUri(it, uri) }
+    }
+    private fun requestDocumentAccess(uri: String, note: Note?, writing: Boolean, explicit: Boolean = false): String {
+        if (writing) blockedDocumentWrites.add(uri)
+        val alreadyPrompted = promptedDocumentAccess.any { sameDocumentUri(it, uri) }
+        promptedDocumentAccess.add(uri)
+        if ((!alreadyPrompted || explicit) && accessRequestsMutable.value == null) {
+            val name = note?.name ?: Uri.parse(uri).lastPathSegment?.substringAfterLast('/') ?: "This note"
+            accessRequestsMutable.value = DocumentAccessRequest(uri, name, note?.id, writing)
+        }
+        mutable.value = if (!alreadyPrompted || explicit) mutable.value.copy(busy = false, message = DOCUMENT_ACCESS_MESSAGE)
+            else mutable.value.copy(busy = false)
+        return DOCUMENT_ACCESS_MESSAGE
+    }
+    fun requestWriteAccessIfBlocked(id: String, explicit: Boolean = false): Boolean {
+        val note = mutable.value.tabs.firstOrNull { it.id == id } ?: return false
+        val uri = note.uri ?: return false
+        if (!writeIsBlocked(uri)) return false
+        requestDocumentAccess(uri, note, writing = true, explicit = explicit)
+        return true
+    }
+    fun documentWriteNeedsAccess(id: String) = mutable.value.tabs.firstOrNull { it.id == id }?.uri?.let(::writeIsBlocked) == true
+    internal fun reportDocumentSaveFailure(id: String, error: Throwable, fallback: String): String {
+        val note = mutable.value.tabs.firstOrNull { it.id == id }
+        return if (isDocumentAccessFailure(error) && note?.uri != null) requestDocumentAccess(note.uri, note, writing = true)
+        else { fail(fallback); fallback }
+    }
+    fun restoreDocumentAccess(request: DocumentAccessRequest, chosen: Uri) = viewModelScope.launch {
+        try {
+            if (request.assetSource != null) {
+                val note = mutable.value.tabs.firstOrNull { it.id == request.noteId } ?: error("The note is no longer open")
+                require(sameDocumentUri(note.uri ?: note.id, request.uri)) { "The note's destination changed; its draft was left intact." }
+                withContext(Dispatchers.IO) {
+                    documentAccess.persist(chosen)
+                    val name = DocumentFile.fromSingleUri(getApplication(), chosen)?.name
+                    require(name == request.name) { "Choose ${request.name}; the selected file has a different name." }
+                    resolver.openFileDescriptor(chosen, "r")?.use { } ?: error("Android did not grant read access")
+                }
+                rememberLinkedAsset(note, request.assetSource, chosen)
+                promptedAssetAccess.remove("${note.id}\n${request.assetSource}")
+                accessRequestsMutable.value = null
+                mutable.value = mutable.value.copy(message = "Linked file access restored. You can retry the export.")
+                assetAccessRestored?.invoke(note.uri ?: note.id, request.assetSource)
+                return@launch
+            }
+            require(sameDocument(Uri.parse(request.uri), chosen)) { "Choose the original ${request.name}. To use another destination, save a copy instead." }
+            val resolved = withContext(Dispatchers.IO) {
+                documentAccess.persist(chosen)
+                val target = documentAccess.resolve(chosen, request.writing)
+                // Verify without truncating or writing any bytes. The existing
+                // draft and its saved baseline remain authoritative.
+                resolver.openFileDescriptor(target, if (request.writing) "rw" else "r")?.use { }
+                    ?: error("Android did not grant access to this file")
+                target
+            }
+            val note = mutable.value.tabs.firstOrNull { it.id == request.noteId }
+            require(request.noteId == null || note != null) { "The note was closed; its recovery data was left intact." }
+            if (note != null) {
+                require(note.uri?.let { sameDocumentUri(it, request.uri) } == true) { "The note's destination changed; its draft was left intact." }
+                change { state -> state.copy(tabs = state.tabs.map { if (it.id == note.id) it.copy(uri = resolved.toString()) else it }, message = "File access restored; your draft is unchanged") }
+                if (request.writing || documentAccess.hasWriteGrant(resolved)) clearDocumentAccessFailure(request.uri)
+                accessRequestsMutable.value = null
+                mutable.value.tabs.first { it.id == note.id }.let(::remember)
+                if (note.dirty) scheduleAutosave(note.id)
+            } else {
+                clearDocumentAccessFailure(request.uri)
+                accessRequestsMutable.value = null
+                open(resolved)
+            }
+        } catch (cancelled: kotlinx.coroutines.CancellationException) { throw cancelled }
+        catch (error: Exception) {
+            val detail = if (isDocumentAccessFailure(error)) "This file is still read-only. Your draft is safe; choose the original file with write access or save a copy." else error.message ?: "Access could not be restored"
+            accessRequestsMutable.value = request.copy(detail = detail)
+        }
+    }
     private val windowPrefs = app.getSharedPreferences("studio-window-$workspaceKey", 0)
     val media = MediaStorage(app)
     val fonts = FontLibrary(app)
@@ -173,7 +286,7 @@ class StudioViewModel(app: Application, val workspaceKey: String = "main") : And
     }
     private fun remember(note: Note) {
         val uri = note.uri ?: return
-        storeRecent(listOf(RecentNote(note.name,uri,note.relative,recentMutable.value.any {it.uri==uri&&it.pinned}))+recentMutable.value.filter {it.uri!=uri})
+        storeRecent(listOf(RecentNote(note.name,uri,note.relative,recentMutable.value.any {sameDocumentUri(it.uri,uri)&&it.pinned}))+recentMutable.value.filterNot {sameDocumentUri(it.uri,uri)})
     }
     private fun storeRecent(notes:List<RecentNote>) {
         recentMutable.value=orderedRecents(notes)
@@ -395,6 +508,7 @@ class StudioViewModel(app: Application, val workspaceKey: String = "main") : And
     private val autosavePending = mutableSetOf<String>()
     private fun scheduleAutosave(id: String) {
         if (!mutable.value.autosave) return
+        if (mutable.value.tabs.firstOrNull { it.id == id }?.uri?.let(::writeIsBlocked) == true) return
         autosavePending.add(id)
         if (autosaveJob?.isActive == true) return
         autosaveJob = viewModelScope.launch {
@@ -402,6 +516,7 @@ class StudioViewModel(app: Application, val workspaceKey: String = "main") : And
                 delay(900)
                 val next=autosavePending.first();autosavePending.remove(next)
                 var note=mutable.value.tabs.find { it.id==next && it.uri!=null && it.dirty } ?: continue
+                if (writeIsBlocked(note.uri!!)) continue
                 if (!mutable.value.autosave) continue
                 try {
                     if (mutable.value.active.id == note.id) {
@@ -418,8 +533,8 @@ class StudioViewModel(app: Application, val workspaceKey: String = "main") : And
                         if (closingNoteIds.contains(note.id) || mutable.value.tabs.none {
                                 it.id == note.id && it.uri == note.uri && it.content == note.content
                             }) return@withLock
-                        withContext(Dispatchers.IO) {
-                            val target=Uri.parse(note.uri)
+                        val writtenTarget = withContext(Dispatchers.IO) {
+                            val target=documentAccess.resolve(Uri.parse(note.uri), writing = true)
                             val previous=resolver.openInputStream(target)?.use { if(note.portable) media.portableMarkdown(it) else readLimited(it,20_000_000).toString(Charsets.UTF_8).removePrefix("\uFEFF") } ?: error("Writing permission is unavailable")
                             require(previous==note.saved) {"This file changed outside Super MD. Use Save as to keep both versions; your draft is safe."}
                             val staged=File(getApplication<Application>().cacheDir,"autosave-${UUID.randomUUID()}.tmp")
@@ -428,12 +543,14 @@ class StudioViewModel(app: Application, val workspaceKey: String = "main") : And
                                 if (!note.portable) copyAttachments(note,target)
                                 resolver.openOutputStream(target,"wt")?.use { staged.inputStream().use { input->input.copyTo(it) } } ?: error("Cannot write this document")
                             } finally {staged.delete()}
+                            target
                         }
-                        change { s->s.copy(tabs=s.tabs.map { if(it.id==note.id)it.copy(saved=note.content) else it }) }
+                        change { s->s.copy(tabs=s.tabs.map { if(it.id==note.id)it.copy(saved=note.content,uri=writtenTarget.toString()) else it }) }
+                        mutable.value.tabs.firstOrNull { it.id == note.id }?.let(::remember)
                         if(mutable.value.tabs.any {it.id==note.id && it.dirty})autosavePending.add(note.id)
                         }
                     }
-                } catch(error:Exception) {fail("Autosave paused: ${error.message}")}
+                } catch(error:Exception) {if(isDocumentAccessFailure(error))requestDocumentAccess(note.uri!!,note,writing=true) else fail("Autosave paused: ${error.message}")}
             }
         }
     }
@@ -447,10 +564,10 @@ class StudioViewModel(app: Application, val workspaceKey: String = "main") : And
     internal fun setPortableDestination(uri: Uri) { portableOutput = uri; portableDestinationIsNew = true }
 
     fun prepareShare(format: String): Boolean {
-        if (mutable.value.busy || format !in listOf("pdf", "smd", "md")) return false
+        if (mutable.value.busy || format !in listOf("pdf", "smd", "md", "mdzip")) return false
         val folder = File(getApplication<Application>().cacheDir, "share/${UUID.randomUUID()}").apply { mkdirs() }
-        val exportFormat = NativeExportFormat.fromShareFormat(format)
-        val filename = ExportFilename.suggestedName(mutable.value.active.name, exportFormat)
+        val filename = if (format == "mdzip") ExportFilename.suggestedName(mutable.value.active.name, NativeExportFormat.MARKDOWN).removeSuffix(".md") + ".zip"
+            else ExportFilename.suggestedName(mutable.value.active.name, NativeExportFormat.fromShareFormat(format))
         val file = File(folder, filename)
         shareFile = file
         busy(true)
@@ -460,19 +577,55 @@ class StudioViewModel(app: Application, val workspaceKey: String = "main") : And
         }
         return true
     }
-    suspend fun shareMarkdown(content: String) {
-        val file = shareFile?.takeIf { it.extension == "md" } ?: error("Choose Markdown in Share first")
-        withContext(Dispatchers.IO) { file.writeText(content) }
-        finishShare(Uri.fromFile(file))
+    fun prepareMarkdownExport(sharing: Boolean, archive: Boolean): Boolean {
+        if (mutable.value.busy) return false
+        shareFile = null
+        if (sharing) return prepareShare(if (archive) "mdzip" else "md")
+        busy(true)
+        return true
     }
-    private fun finishShare(target: Uri): Boolean {
+    suspend fun shareMarkdown(id: String, content: String, assets: JSONObject, archive: Boolean) {
+        val note = mutable.value.tabs.firstOrNull { it.id == id } ?: error("The export note is no longer open")
+        val filename = ExportFilename.suggestedName(note.name, NativeExportFormat.MARKDOWN)
+        val shared = shareFile
+        val companions = mutableListOf<File>()
+        val output = withContext(Dispatchers.IO) {
+            MarkdownExport(getApplication(), filename, content, assets).use { bundle ->
+                if (shared == null) bundle.save(noteLocation(), archive)
+                else {
+                    require(shared.extension == if (archive) "zip" else "md") { "The share format changed; try again" }
+                    if (archive) shared.outputStream().use(bundle::writeZip)
+                    else {
+                        for ((path, item) in bundle.files) {
+                            val target = File(shared.parentFile, path)
+                            check(target.parentFile!!.mkdirs() || target.parentFile!!.isDirectory)
+                            item.first.copyTo(target, overwrite = false)
+                            companions += target
+                        }
+                        bundle.markdown.copyTo(shared, overwrite = false)
+                    }
+                    Uri.fromFile(shared) to shared.name
+                }
+            }
+        }
+        if (shared != null) finishShare(output.first, companions)
+        else mutable.value = mutable.value.copy(busy = false, message = "Exported ${output.second}${if (noteLocation().isBlank()) " to Downloads/Super MD" else " to your configured folder"}")
+    }
+    private fun finishShare(target: Uri, companions: List<File> = emptyList()): Boolean {
         val file = shareFile ?: return false
         if (target != Uri.fromFile(file)) return false
         val app = getApplication<Application>()
         val uri = androidx.core.content.FileProvider.getUriForFile(app, "${app.packageName}.share", file)
-        val format = NativeExportFormat.fromShareFormat(file.extension)
-        val mime = format.mimeType
-        val send = Intent(Intent.ACTION_SEND).setType(mime).putExtra(Intent.EXTRA_STREAM, uri).addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION).apply { clipData = android.content.ClipData.newUri(app.contentResolver, file.name, uri) }
+        val mime = if (file.extension == "zip") "application/zip" else NativeExportFormat.fromShareFormat(file.extension).mimeType
+        val send = if (companions.isEmpty()) Intent(Intent.ACTION_SEND).setType(mime).putExtra(Intent.EXTRA_STREAM, uri)
+            else Intent(Intent.ACTION_SEND_MULTIPLE).setType("*/*").putParcelableArrayListExtra(Intent.EXTRA_STREAM, arrayListOf(uri).apply {
+                companions.forEach { add(androidx.core.content.FileProvider.getUriForFile(app, "${app.packageName}.share", it)) }
+            })
+        send.addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION).apply {
+            clipData = android.content.ClipData.newUri(app.contentResolver, file.name, uri).also { clip ->
+                companions.forEach { clip.addItem(android.content.ClipData.Item(androidx.core.content.FileProvider.getUriForFile(app, "${app.packageName}.share", it))) }
+            }
+        }
         shareFile = null
         mutable.value = mutable.value.copy(busy = false, message = "Share copy ready")
         shareReady?.invoke(send) ?: error("The share screen is no longer open. Your copy is still in the app cache.")
@@ -1012,33 +1165,41 @@ class StudioViewModel(app: Application, val workspaceKey: String = "main") : And
     }
     fun busy(value: Boolean) { mutable.value = mutable.value.copy(busy = value) }
     private fun retainOpenedNote(note: Note, activate: Boolean) {
-        val existing = mutable.value.tabs.find { it.uri == note.uri }
+        val existing = mutable.value.tabs.find { it.uri != null && note.uri != null && sameDocumentUri(it.uri, note.uri) }
         change { state ->
             state.copy(
-                tabs = if (existing != null) state.tabs else state.tabs + note,
+                tabs = if (existing != null) state.tabs.map { if(it.id == existing.id) it.copy(uri = note.uri) else it } else state.tabs + note,
                 activeId = if (activate) existing?.id ?: note.id else state.activeId,
             )
         }
-        remember(existing ?: note)
+        mutable.value.tabs.firstOrNull { it.id == (existing?.id ?: note.id) }?.let(::remember)
     }
     fun open(uri: Uri, relative: String? = null): Job {
         val request = openRequests.begin()
         return viewModelScope.launch {
         try {
             val note = withContext(Dispatchers.IO) {
-                val existing = mutable.value.tabs.find { it.uri == uri.toString() }; if (existing != null) return@withContext existing
-                try { resolver.takePersistableUriPermission(uri, Intent.FLAG_GRANT_READ_URI_PERMISSION or Intent.FLAG_GRANT_WRITE_URI_PERMISSION) } catch (_: SecurityException) { }
-                val name = DocumentFile.fromSingleUri(getApplication(), uri)?.name ?: "Note.md"
-                resolver.openInputStream(uri)?.use { stream ->
+                documentAccess.persist(uri)
+                val target = documentAccess.resolve(uri)
+                val existing = mutable.value.tabs.find { it.uri?.let { raw -> sameDocumentUri(raw, uri.toString()) } == true }
+                // Reopening an existing draft must still validate its grant,
+                // but must never reload older disk bytes over its edits.
+                if (existing != null) {
+                    resolver.openInputStream(target)?.use { } ?: error("Document permission is unavailable; choose it again")
+                    return@withContext existing.copy(uri = target.toString())
+                }
+                val name = DocumentFile.fromSingleUri(getApplication(), target)?.name ?: "Note.md"
+                resolver.openInputStream(target)?.use { stream ->
                     val buffered = stream.buffered()
                     buffered.mark(65536)
                     val prefix = ByteArray(32768); val count = buffered.read(prefix); buffered.reset()
                     val header = if (count > 0) String(prefix, 0, count, Charsets.UTF_8).trimStart('\uFEFF', ' ', '\n', '\r', '\t') else ""
                     val portable = portableGzipHeader(prefix.copyOfRange(0, maxOf(count, 0))) || portableEnvelopeHeader(header)
-                    if (portable) { val opened = media.openFmd(buffered); Note(name = name, uri = uri.toString(), content = opened.markdown, saved = opened.markdown, relative = relative, assetDirectory = opened.directory) }
-                    else { val content = readLimited(buffered, 20_000_000).toString(Charsets.UTF_8); Note(name = name, uri = uri.toString(), content = content, saved = content, relative = relative) }
+                    if (portable) { val opened = media.openFmd(buffered); Note(name = name, uri = target.toString(), content = opened.markdown, saved = opened.markdown, relative = relative, assetDirectory = opened.directory) }
+                    else { val content = readLimited(buffered, 20_000_000).toString(Charsets.UTF_8); Note(name = name, uri = target.toString(), content = content, saved = content, relative = relative) }
                 } ?: error("Document permission is unavailable; choose it again")
             }
+            if (note.uri?.let { documentAccess.hasWriteGrant(Uri.parse(it)) } == true) clearDocumentAccessFailure(uri.toString())
             if (!openRequests.isCurrent(request)) {
                 // A newer open or a user tab action owns focus, but every file
                 // the user requested still becomes an available tab.
@@ -1056,17 +1217,21 @@ class StudioViewModel(app: Application, val workspaceKey: String = "main") : And
                 else readerBarrierFailed()
             }
         } catch (cancelled: kotlinx.coroutines.CancellationException) { throw cancelled }
-        catch (error: Exception) { if (openRequests.isCurrent(request)) fail("Could not open note: ${error.message}") }
+        catch (error: Exception) { if (openRequests.isCurrent(request)) {
+            if (isDocumentAccessFailure(error)) requestDocumentAccess(uri.toString(), mutable.value.tabs.firstOrNull { it.uri?.let { raw -> sameDocumentUri(raw, uri.toString()) } == true }, writing = false, explicit = true)
+            else fail("Could not open note: ${error.message}")
+        } }
         }
     }
     internal suspend fun saveAgentPortable(id: String, expectedRevision: String) {
+        if (requestWriteAccessIfBlocked(id)) throw SecurityException(DOCUMENT_ACCESS_MESSAGE)
         require(mutable.value.activeId == id) { "Select the portable note before saving it on Android" }
         require(performReaderBarrier(id) { }) { "The note draft could not be synchronized before saving" }
         val note = mutable.value.tabs.firstOrNull { it.id == id } ?: error("The note is no longer open")
         require(note.portable && note.uri != null) { "This portable note has no saved destination" }
         require(agentContentRevision(note.content).equals(expectedRevision, ignoreCase = true)) { "The note changed since the supplied revision; no changes were saved" }
         val assets = media.portableAssets(note.assetDirectory)
-        val target = Uri.parse(note.uri)
+        val target = documentAccess.resolve(Uri.parse(note.uri), writing = true)
         val staged = File(getApplication<Application>().cacheDir, "agent-portable-save-${UUID.randomUUID()}.smd.gz")
         var openedDirectory: String? = null
         try { withContext(Dispatchers.IO) {
@@ -1098,7 +1263,7 @@ class StudioViewModel(app: Application, val workspaceKey: String = "main") : And
                             require(current == note && current?.let { agentContentRevision(it.content).equals(expectedRevision, ignoreCase = true) } == true) {
                                 "The note changed while it was saving; the portable file was restored"
                             }
-                            change { state -> state.copy(tabs = state.tabs.map { if (it.id == id) it.copy(saved = note.content, assetDirectory = opened.directory) else it }, busy = false, message = "Portable note saved") }
+                            change { state -> state.copy(tabs = state.tabs.map { if (it.id == id) it.copy(saved = note.content, uri = target.toString(), assetDirectory = opened.directory) else it }, busy = false, message = "Portable note saved") }
                             mutable.value.tabs.firstOrNull { it.id == id }?.let(::remember)
                             openedDirectory = null
                         }
@@ -1204,6 +1369,10 @@ class StudioViewModel(app: Application, val workspaceKey: String = "main") : And
     }
     fun save(uri: Uri? = null, noteId: String? = null, expectedRevision: String? = null, onComplete: ((String?) -> Unit)? = null) = viewModelScope.launch {
         val requestedNoteId = noteId ?: mutable.value.active.id
+        if (uri == null && requestWriteAccessIfBlocked(requestedNoteId, explicit = onComplete == null)) {
+            onComplete?.invoke(DOCUMENT_ACCESS_MESSAGE)
+            return@launch
+        }
         if (requestedNoteId != mutable.value.active.id) {
             onComplete?.invoke("Select the target note before saving it on Android")
             return@launch
@@ -1242,16 +1411,21 @@ class StudioViewModel(app: Application, val workspaceKey: String = "main") : And
             }
             val (writtenTarget, savedName) = withContext(Dispatchers.IO) {
                 require(!note.portable || uri != null) { "Use portable save for this SMD file" }
-                val destination = if (uri != null) prepareExportDestination(target, NativeExportFormat.MARKDOWN, allowRename = true) else target
+                val destination = if (uri != null) prepareExportDestination(target, NativeExportFormat.MARKDOWN, allowRename = true) else documentAccess.resolve(target, writing = true)
                 copyAttachments(note, destination)
                 resolver.openOutputStream(destination, "wt")?.use { it.write(note.content.toByteArray()) } ?: error("Writing permission is unavailable; use Save as")
+                documentAccess.persist(destination)
                 destination to (DocumentFile.fromSingleUri(getApplication(), destination)?.name ?: note.name)
             }
             change { s -> s.copy(busy = false, tabs = s.tabs.map { if (it.id == note.id) it.copy(uri = writtenTarget.toString(), name = savedName, saved = note.content, assetDirectory = null) else it }, message = "Saved") }
             mutable.value.tabs.find { it.id == note.id }?.let(::remember)
             onComplete?.invoke(null)
             }
-        } catch (error: Exception) { fail("Could not save note: ${error.message}"); onComplete?.invoke(error.message ?: "Could not save note") }
+        } catch (error: Exception) {
+            val message = if (uri == null) reportDocumentSaveFailure(requestedNoteId, error, "Could not save note: ${error.message}")
+                else "Could not save note: ${error.message}".also(::fail)
+            onComplete?.invoke(message)
+        }
     }
     fun setFolder(uri: Uri) = viewModelScope.launch {
         try {
@@ -1275,48 +1449,52 @@ class StudioViewModel(app: Application, val workspaceKey: String = "main") : And
             mutable.value = mutable.value.copy(files = entries)
         } catch (error: Exception) { fail("Could not list folder: ${error.message}") }
     }
-    suspend fun asset(document: String, source: String): String = withContext(Dispatchers.IO) {
-        val note = mutable.value.tabs.find { it.uri == document || it.id == document } ?: error("The image's document is no longer open")
-        media.local(source, note.assetDirectory)?.let { return@withContext media.data(it) }
-        val documentId = runCatching { DocumentsContract.getDocumentId(Uri.parse(document)) }.getOrDefault("")
-        // A recently reopened note may belong to a different previously granted
-        // folder. Prefer its matching tree grant, not the currently browsed tree.
-        val folderUri = resolver.persistedUriPermissions.filter { it.isReadPermission && DocumentsContract.isTreeUri(it.uri) && it.uri.authority == Uri.parse(document).authority }.mapNotNull { permission ->
-            val root = runCatching { DocumentsContract.getTreeDocumentId(permission.uri) }.getOrNull() ?: return@mapNotNull null
-            if (documentId.startsWith("$root/") || root.endsWith(':') && documentId.startsWith(root)) root to permission.uri else null
-        }.maxByOrNull { it.first.length }?.second ?: mutable.value.folder?.let(Uri::parse) ?: error("Open the note's containing folder to grant access to relative images")
-        var file = DocumentFile.fromTreeUri(getApplication(), folderUri) ?: error("Restore folder access by opening it again")
-        val rootId = DocumentsContract.getTreeDocumentId(folderUri)
-        val relative = documentId.takeIf { it.startsWith("$rootId/") }?.removePrefix("$rootId/") ?: documentId.takeIf { rootId.endsWith(':') && it.startsWith(rootId) }?.removePrefix(rootId)?.trimStart('/') ?: note.relative
-        val parent = relative?.substringBeforeLast('/', "") ?: ""
-        val parts = (if (parent.isEmpty()) "" else "$parent/") + Uri.decode(source)
-        val stack = ArrayDeque<String>()
-        parts.replace('\\', '/').split('/').forEach { part -> when(part) { "", "." -> Unit; ".." -> if (stack.isEmpty()) error("Image escapes the selected folder") else stack.removeLast(); else -> stack.addLast(part) } }
-        stack.forEach { part -> file = file.findFile(part) ?: error("Image not found: $source") }
-        val bytes = resolver.openInputStream(file.uri)?.use { readLimited(it, 25_000_000) } ?: error("Cannot read image")
-        val mime = resolver.getType(file.uri)?.takeIf { it.startsWith("image/") } ?: when(file.name?.substringAfterLast('.')?.lowercase()) { "svg" -> "image/svg+xml"; "jpg", "jpeg" -> "image/jpeg"; else -> "image/png" }
-        "data:$mime;base64," + Base64.encodeToString(bytes, Base64.NO_WRAP)
-    }
+    private fun noteForAsset(document: String): Note = mutable.value.tabs.firstOrNull {
+        it.id == document || it.uri?.let { uri -> sameDocumentUri(uri, document) } == true
+    } ?: error("The asset's document is no longer open")
 
-    /** Resolves only a note still open in this workspace, using its existing SAF grant. */
-    internal fun resolveReaderAsset(document: String, source: String): Pair<String, ReaderAssetSource> {
-        val note = mutable.value.tabs.find { it.uri == document || it.id == document } ?: error("The image's document is no longer open")
-        media.local(source, note.assetDirectory)?.let { return note.id to media.readerAsset(it) }
-        val noteUri = note.uri?.let(Uri::parse) ?: error("Save this document before loading relative images")
+    /** Resolves only an already granted tree or an individually user-selected linked file. */
+    private fun linkedAssetFile(note: Note, source: String): DocumentFile {
+        require(source.length in 1..4096 && !Regex("^[a-zA-Z][a-zA-Z0-9+.-]*:").containsMatchIn(source) && !source.startsWith("//")) { "Choose a relative asset path" }
+        linkedAssetUri(note, source)?.let { uri ->
+            return DocumentFile.fromSingleUri(getApplication(), uri) ?: throw LinkedAssetAccessRequiredException()
+        }
+        val noteUri = note.uri?.let(Uri::parse) ?: throw LinkedAssetAccessRequiredException()
         val documentId = runCatching { DocumentsContract.getDocumentId(noteUri) }.getOrDefault("")
-        // Prefer the matching persisted tree grant for this note, not merely
-        // whichever folder the user most recently browsed.
         val folderUri = resolver.persistedUriPermissions.filter { it.isReadPermission && DocumentsContract.isTreeUri(it.uri) && it.uri.authority == noteUri.authority }.mapNotNull { permission ->
             val root = runCatching { DocumentsContract.getTreeDocumentId(permission.uri) }.getOrNull() ?: return@mapNotNull null
             if (documentId.startsWith("$root/") || root.endsWith(':') && documentId.startsWith(root)) root to permission.uri else null
-        }.maxByOrNull { it.first.length }?.second ?: mutable.value.folder?.let(Uri::parse) ?: error("Open the note's containing folder to grant access to relative images")
-        var file = DocumentFile.fromTreeUri(getApplication(), folderUri) ?: error("Restore folder access by opening it again")
+        }.maxByOrNull { it.first.length }?.second ?: throw LinkedAssetAccessRequiredException()
+        var file = DocumentFile.fromTreeUri(getApplication(), folderUri) ?: throw LinkedAssetAccessRequiredException()
         val rootId = DocumentsContract.getTreeDocumentId(folderUri)
-        val relative = documentId.takeIf { it.startsWith("$rootId/") }?.removePrefix("$rootId/") ?: documentId.takeIf { rootId.endsWith(':') && it.startsWith(rootId) }?.removePrefix(rootId)?.trimStart('/') ?: note.relative
-        val parent = relative?.substringBeforeLast('/', "") ?: ""
-        val parts = readerAssetPathParts(parent, source)
-        parts.forEach { part -> file = file.findFile(part) ?: error("Image not found: $source") }
-        require(file.isFile) { "Image not found: $source" }
+        val relative = documentId.takeIf { it.startsWith("$rootId/") }?.removePrefix("$rootId/")
+            ?: documentId.takeIf { rootId.endsWith(':') && it.startsWith(rootId) }?.removePrefix(rootId)?.trimStart('/')
+            ?: throw LinkedAssetAccessRequiredException()
+        val parts = readerAssetPathParts(relative.substringBeforeLast('/', ""), source)
+        for (part in parts) file = file.findFile(part) ?: throw LinkedAssetAccessRequiredException()
+        require(file.isFile) { "Linked file is not a regular file" }
+        return file
+    }
+    suspend fun textAsset(document: String, source: String): JSONObject = withContext(Dispatchers.IO) {
+        require(Uri.decode(source).substringBefore('?').substringBefore('#').substringAfterLast('.').lowercase() in setOf("mmd", "mermaid")) { "Choose a Mermaid source file" }
+        val file = linkedAssetFile(noteForAsset(document), source)
+        val bytes = resolver.openInputStream(file.uri)?.use { readLimited(it, 2_000_000) } ?: error("Cannot read diagram source")
+        val text = Charsets.UTF_8.newDecoder().onMalformedInput(java.nio.charset.CodingErrorAction.REPORT)
+            .decode(java.nio.ByteBuffer.wrap(bytes)).toString()
+        JSONObject().put("text", text)
+    }
+    suspend fun asset(document: String, source: String): String = withContext(Dispatchers.IO) {
+        val note = noteForAsset(document)
+        media.local(source, note.assetDirectory)?.let { return@withContext media.data(it) }
+        val file = linkedAssetFile(note, source)
+        val bytes = resolver.openInputStream(file.uri)?.use { readLimited(it, 25_000_000) } ?: error("Cannot read image")
+        val mime = media.imageMime(file.name ?: source.substringAfterLast('/'), resolver.getType(file.uri))
+        "data:$mime;base64," + Base64.encodeToString(bytes, Base64.NO_WRAP)
+    }
+    internal fun resolveReaderAsset(document: String, source: String): Pair<String, ReaderAssetSource> {
+        val note = noteForAsset(document)
+        media.local(source, note.assetDirectory)?.let { return note.id to media.readerAsset(it) }
+        val file = linkedAssetFile(note, source)
         val size = file.length()
         require(size <= BoundedAssetInputStream.MAX_READER_ASSET_BYTES) { "Image exceeds 25 MB" }
         val uri = file.uri
@@ -1606,7 +1784,7 @@ class StudioViewModel(app: Application, val workspaceKey: String = "main") : And
     var portableOutput: Uri? = null
     suspend fun writePortable(id: String, content: String, assets: JSONObject, save: Boolean, originalContent: String) = withContext(Dispatchers.IO) { documentWrites.withLock {
         val note = mutable.value.tabs.find { it.id == id } ?: error("The note is no longer open")
-        val target = if (save) note.uri?.let(Uri::parse) else portableOutput
+        val target = if (save) note.uri?.let { documentAccess.resolve(Uri.parse(it), writing = true) } else portableOutput
         require(target != null) { "Choose a portable file destination" }
         val destination = if (save) target else prepareExportDestination(target, NativeExportFormat.PORTABLE_SMD, allowRename = portableDestinationIsNew)
         val staged = File(getApplication<Application>().cacheDir, "fmd-${UUID.randomUUID()}.tmp")
@@ -1617,8 +1795,9 @@ class StudioViewModel(app: Application, val workspaceKey: String = "main") : And
             // new portable references without carrying binary data in its state.
             val opened = if (save) staged.inputStream().use(media::openFmd) else null
             resolver.openOutputStream(destination, "wt")?.use { output -> staged.inputStream().use { it.copyTo(output) } } ?: error("Cannot write portable file")
+            documentAccess.persist(destination)
             withContext(Dispatchers.Main) {
-                if (save) { change { s -> s.copy(tabs = s.tabs.map { if (it.id == id) it.copy(content = if (it.content == originalContent) content else it.content, saved = content, assetDirectory = opened!!.directory) else it }, busy = false, message = "Portable note saved") }; mutable.value.tabs.find { it.id == id }?.let(::remember) }
+                if (save) { change { s -> s.copy(tabs = s.tabs.map { if (it.id == id) it.copy(content = if (it.content == originalContent) content else it.content, saved = content, uri = destination.toString(), assetDirectory = opened!!.directory) else it }, busy = false, message = "Portable note saved") }; mutable.value.tabs.find { it.id == id }?.let(::remember) }
                 else { portableOutput = null; portableDestinationIsNew = false; if (!finishShare(destination)) mutable.value = mutable.value.copy(busy = false, message = "Portable .smd exported") }
             }
         } finally { staged.delete() }

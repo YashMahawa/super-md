@@ -807,9 +807,12 @@ class StudioTest(unittest.TestCase):
 
         self.studio.exportTo(selected,"md")
         self.assertEqual(self.studio.pending_export,str(markdown))
-        self.studio.post("markdown-export","export_markdown_native",json.dumps({"id":self.studio.active,"content":"Final Markdown"}))
+        gif="R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7"
+        markdown_content="![Loop](images/loop.gif)"
+        self.studio.post("markdown-export","export_markdown_native",json.dumps({"id":self.studio.active,"content":markdown_content,"assets":{"images/loop.gif":"data:image/gif;base64,"+gif}}))
         self.await_idle()
-        self.assertEqual(markdown.read_text(encoding="utf-8"),"Final Markdown")
+        self.assertEqual(markdown.read_text(encoding="utf-8"),markdown_content)
+        self.assertEqual((markdown.parent/"images"/"loop.gif").read_bytes(),__import__("base64").b64decode(gif))
 
         self.studio.exportTo(selected,"smd")
         self.assertEqual(self.studio.pending_export,str(portable))
@@ -820,8 +823,33 @@ class StudioTest(unittest.TestCase):
         self.assertTrue(is_portable)
         self.assertEqual(content,"Portable Markdown")
         self.assertEqual(assets,{})
-        self.assertEqual(markdown.read_text(encoding="utf-8"),"Final Markdown")
+        self.assertEqual(markdown.read_text(encoding="utf-8"),markdown_content)
         self.assertFalse(Path(str(base)+".smd.md").exists())
+
+    def test_markdown_zip_export_preserves_raster_paths(self):
+        import base64, zipfile
+        base=self.studio.data/"Markdown bundle"
+        selected=QUrl.fromLocalFile(str(base)).toString()
+        target=Path(str(base)+".zip")
+        gif="R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7"
+        self.studio.exportTo(selected,"mdzip")
+        self.assertEqual(self.studio.pending_export,str(target))
+        self.studio.post("markdown-zip","export_markdown_native",json.dumps({"id":self.studio.active,"content":"![Loop](media/loop.gif)","assets":{"media/loop.gif":"data:image/gif;base64,"+gif},"archive":True}))
+        self.await_idle()
+        with zipfile.ZipFile(target) as archive:
+            self.assertEqual(archive.namelist(),["Markdown bundle.md","media/loop.gif"])
+            self.assertEqual(archive.read("media/loop.gif"),base64.b64decode(gif))
+
+    def test_markdown_export_never_overwrites_the_original_note(self):
+        source=self.studio.data/"original.md"
+        original=b"# Original note\n![Photo](images/photo.gif)\n"
+        source.write_bytes(original)
+        self.studio._current()["path"]=str(source)
+        self.studio.exportTo(QUrl.fromLocalFile(str(source)).toString(),"md")
+        self.studio.post("same-path","export_markdown_native",json.dumps({"id":self.studio.active,"content":"replacement","assets":{"images/photo.gif":"data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7"}}))
+        self.await_idle()
+        self.assertEqual(source.read_bytes(),original)
+        self.assertFalse((self.studio.data/"images"/"photo.gif").exists())
 
     def test_export_rejects_mismatched_suffixes_and_unconfirmed_appended_overwrite(self):
         calls=[]
