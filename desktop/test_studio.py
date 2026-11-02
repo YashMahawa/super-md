@@ -897,10 +897,11 @@ class StudioTest(unittest.TestCase):
 
     def test_export_dialog_tracks_selected_format_suffix_and_filters(self):
         qml=(Path(__file__).parent/"qml"/"Main.qml").read_text(encoding="utf-8")
-        self.assertIn('defaultSuffix: exportFormat',qml)
-        self.assertIn('exportFormat === "pdf" ? ["PDF (*.pdf)"] : exportFormat === "md" ? ["Markdown (*.md)"] : ["Portable Super MD (*.smd)"]',qml)
-        choice=next(line for line in qml.splitlines() if "currentIndex: outputFormat === \"pdf\"" in line)
-        self.assertIn('onActivated: outputFormat = currentIndex === 0 ? "pdf" : currentIndex === 1 ? "smd" : "md"',choice)
+        self.assertIn('defaultSuffix: exportFormat === "mdzip" ? "zip" : exportFormat',qml)
+        for expected in ('PDF (*.pdf)', 'Markdown (*.md)', 'Markdown bundle (*.zip)', 'Portable Super MD (*.smd)'):
+            self.assertIn(expected,qml)
+        self.assertIn('availableFormats.indexOf(outputFormat)',qml)
+        self.assertIn('onActivated: outputFormat = exportDialog.availableFormats[currentIndex]',qml)
 
     def test_external_refresh_does_not_overwrite_a_draft(self):
         studio=self.studio;path=studio.data / "external.md"

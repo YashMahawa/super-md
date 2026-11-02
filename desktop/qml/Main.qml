@@ -627,7 +627,7 @@ ApplicationWindow {
         property var availableFormats: sharing ? ["pdf", "smd", "md", "mdzip"] : viewState.portable ? ["pdf", "md", "mdzip"] : ["pdf", "smd", "md", "mdzip"]
         title: sharing ? "Share note" : "Export note"
         width: Math.min(window.width - 48, Math.max(500, Math.min(720, window.width * .44)))
-        height: Math.min(window.height - 32, Math.max(460, Math.min(900, window.height * .85)))
+        height: Math.min(window.height - 48, Math.max(460, Math.min(900, window.height * .85)))
         standardButtons: Dialog.Cancel
         ColumnLayout {
             anchors.fill: parent
