@@ -73,14 +73,13 @@ jobs:
             'desktop (ubuntu-22.04, linux)',
             'desktop (windows-latest, windows)',
             'desktop (macos-15, macos-arm64)',
-            'desktop (macos-15-intel, macos-x64)',
           ];
           for (const name of required) {
             const jobs = response.jobs.filter(job => job.name === name);
             if (jobs.length !== 1 || jobs[0].status !== 'completed' || jobs[0].conclusion !== 'success') throw Error(`Missing successful build: ${name}`);
           }
           appendFileSync(process.env.GITHUB_OUTPUT, 'reuse_packages=true\n');
-          console.log(`Verified all five build jobs on tagged source ${sha}`);
+          console.log(`Verified all four platform build jobs on tagged source ${sha}`);
           NODE
       - name: Create or reuse a protected draft
         id: draft
@@ -147,8 +146,6 @@ jobs:
             package: windows
           - platform: macos-15
             package: macos-arm64
-          - platform: macos-15-intel
-            package: macos-x64
     runs-on: ${{ matrix.platform }}
     steps:
       - uses: actions/checkout@v4
