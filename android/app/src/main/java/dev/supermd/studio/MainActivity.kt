@@ -1435,7 +1435,7 @@ internal class NoteDestination(private val mime: String, private val preferred: 
                 if(update.ready && !update.publicCopy)TextButton(onClick={if(Build.VERSION.SDK_INT<=28 && activity.checkSelfPermission(android.Manifest.permission.WRITE_EXTERNAL_STORAGE)!=android.content.pm.PackageManager.PERMISSION_GRANTED)downloadPermission.launch(android.Manifest.permission.WRITE_EXTERNAL_STORAGE) else scope.launch{model.updates.saveToDownloads()}},enabled=!update.checking){Text("Save verified APK to Downloads")}
                 OutlinedButton(onClick = {
                     runCatching { activity.startActivity(Intent(Intent.ACTION_VIEW, android.net.Uri.parse("https://github.com/YashMahawa/super-md/releases/latest"))) }
-                        .onFailure { model.fail("Could not open GitHub releases: ${it.message}") }
+                        .onFailure { model.fail("Could not open GitHub releases: " + it.message) }
                 }) { Text("Open latest release on GitHub") }
                 TextButton(onClick={activity.startActivity(Intent(android.provider.Settings.ACTION_APP_NOTIFICATION_SETTINGS).putExtra(android.provider.Settings.EXTRA_APP_PACKAGE,activity.packageName))}){Text("Update notification permissions")}
             }

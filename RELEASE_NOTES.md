@@ -1,15 +1,23 @@
-# Super MD 0.6.22
+# Super MD 0.6.23
 
-## Diagram cards that don't clip or overlap
+## Interactive notes
 
-- Step-card figures now measure their loaded image's intrinsic aspect ratio and the available reader width, reserving the correct height with a maximum height. This removes both diagram clipping and large empty bands on narrow/desktop screens.
-- Descriptions and navigation controls participate in normal document flow below the image rather than overlapping an absolutely positioned illustration.
-- Loaded images remain mounted between slides, with subtle transitions and no unnecessary reload on Back/Next.
-- Step cards can now contain full interactive smd-chart 2D plots, including parameter sliders, zoom, pan, roots and graph probes. Charts retain their individual slider state when visiting other slides.
-- SVG node/edge diagrams and fixed-slot binary trees are still supported alongside images and 2D graphs, with safe declarative input validation and accessibility labels.
-- Browser-tested desktop and phone layouts and navigation; regression tests cover mixed deck types.
+- Step-by-step cards keep loaded diagrams in place while navigating, dynamically fit SVG height, and prevent diagram/explanation overlap.
+- Interactive two-dimensional charts now work inside cards with independent zoom, panning, parameter sliders and state retention.
+- Native inline SVG graphs and fixed binary-tree left/right child layout remain available on desktop **and Android**.
 
-## Cross-platform
+## Android and desktop Settings
 
-- Fixed Windows-only storage cleanup regression found by the 0.6.21 CI: protected cleanup now rejects Windows symlinks and junctions while allowing the carefully scoped app-owned temporary directories to be cleaned.
-- No changes to MCP transport; other pending agent changes are not included.
+- Android Storage offers a confirmation-based cleanup action for generated Python previews, protecting notes, recovery, exports and verified update APKs.
+- Android Updates & about now provides **Open latest release on GitHub**.
+- Desktop Updates and Storage are separate sections; Storage also offers constrained temporary-data cleanup.
+
+## Verification and packaging
+
+- Increased Intel macOS native test-suite watchdog without disabling any individual mouse, selection or gesture assertions.
+- Corrected Windows app-owned temporary storage cleanup safety handling.
+- Release publication remains gated on tagged-source desktop, Android and CI verification. Release APKs retain the existing upgrade certificate and are verified as signed, aligned, non-debuggable arm64 builds.
+
+## Scope
+
+The separate unfinished MCP changes are **not** part of this release.
