@@ -1,12 +1,15 @@
-# Super MD 0.6.25
+# Super MD 0.6.26
 
-## Interactive diagrams and portable notes
+## Agent and cloud relay
 
-- Portable `.smd` export now embeds images referenced inside interactive `smd-steps` decks, including heap, BFS and DFS illustrations. Shared images are deduplicated and step-by-step interactions remain intact after reopening.
-- The compact desktop toolbar menu now uses an opaque, palette-matched background with SVG action icons and suppresses overlapping tooltip bubbles.
-- Windows document saving retries brief file-sharing locks from antivirus or indexers without compromising atomic writes.
+- Embedded SVG assets can now be inspected by agents as exact paginated UTF-8 XML source, rather than an unsupported SVG image MIME block. Large diagrams support source offsets for safe restyling.
+- Previously enabled cloud relay connections automatically reconnect when Super MD starts, using the same saved pairing without requiring manual reconnection or rotating credentials.
+
+## Export and Android reliability
+
+- Export Portable Super MD (`.smd`) from an existing `.smd` note, or export any note as PDF, Markdown, Markdown ZIP, or SMD.
+- Fix Android 16 instrumentation timing for the asynchronous editor-mode transition, retaining all real editor-content assertions.
 
 ## Verification
 
-- Adds regressions for embedded step-deck images, small-window native Qt menu painting, and Windows sharing-lock recovery.
-- Release publication requires successful CI on the exact release commit, verified Android signing, and all platform installers.
+- Full CI and all supported platform installers must pass on the exact release commit before publication.
