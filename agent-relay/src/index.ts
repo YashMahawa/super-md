@@ -84,10 +84,11 @@ function chooseDevice(group: Group, requestedId: string | undefined, mutation = 
     const device = group.devices.get(requestedId);
     return device ? { device } : { error: "The requested device is not paired with this group." };
   }
-  if (mutation && online.length > 1) return { error: "Choose deviceId explicitly before making this change." };
+  const choices = online.map(d => `${d.displayName} (${d.platform}, deviceId: ${d.deviceId})`).join("; ");
+  if (mutation && online.length > 1) return { error: `Choose deviceId explicitly before making this change. Connected devices: ${choices}` };
   if (online.length === 1) return { device: online[0] };
   if (online.length === 0) return { error: "No Super MD devices are connected. Open the app and enable Live Agent Access." };
-  return { error: "More than one device is connected; choose deviceId." };
+  return { error: `More than one device is connected; choose deviceId. Connected devices: ${choices}` };
 }
 function rpc(group: Group, partial: Omit<RpcRequest, "requestId">): Promise<{ result?: unknown; error?: string }> {
   const started = performance.now();
@@ -353,7 +354,8 @@ function registerTools(server: McpServer, group: Group): void {
     return toolResponse(response);
   });
   server.registerTool("replace_tab_asset", { description: "Replace a linked asset using a path available to the selected Super MD device. The device restricts reads to its configured asset roots; the relay never reads or stores the file.", inputSchema: { deviceId, tabId, assetName: z.string().min(1).max(256), assetPath: z.string().min(1).max(4096), expectedRevision: z.string().regex(/^[a-f0-9]{64}$/i) } }, async ({ deviceId: selected, tabId: tab, assetName, assetPath, expectedRevision }) => toolResponse(await rpc(group, { action: "replace_tab_asset", deviceId: selected, tabId: tab, assetName, assetPath, expectedRevision })));
-  server.registerTool("asset_action", { description: "List embedded assets, retrieve an original image/SVG (SVG source is returned in bounded chunks), or attach model-supplied bytes to a saved portable .smd note. Attachments are limited to 1 MiB and require the note's current source revision; the relay does not read files or fetch URLs.", inputSchema: { deviceId, tabId, assetAction: z.enum(["list", "source", "attach"]), assetName: z.string().min(1).max(256).optional(), mimeType: z.enum(["image/png", "image/jpeg", "image/gif", "image/webp", "image/avif", "image/svg+xml"]).optional(), body: z.string().max(1_400_000).describe("Base64-encoded original bytes, including UTF-8 SVG; not raw SVG text or a data URL").optional(), offset: z.number().int().min(0).max(1_048_576).optional(), limit: z.number().int().min(1).max(12_000).optional(), expectedRevision: z.string().regex(/^[a-f0-9]{64}$/i) } }, async ({ deviceId: selected, tabId: tab, assetAction, assetName, mimeType, body, offset, limit, expectedRevision }) => {
+  server.registerTool("asset_action", { description: "List embedded assets, retrieve an original image/SVG (SVG source is returned in bounded chunks), or attach model-supplied bytes to a saved portable .smd note. Attachments are limited to 1 MiB and require the note's current source revision; the relay does not read files or fetch URLs.", inputSchema: { deviceId, tabId, assetAction: z.enum(["list", "source", "attach"]), assetName: z.string().min(1).max(256).optional(), mimeType: z.enum(["image/png", "image/jpeg", "image/gif", "image/webp", "image/avif", "image/svg+xml"]).optional(), body: z.string().max(1_400_000).describe("Base64-encoded original bytes, including UTF-8 SVG; not raw SVG text or a data URL").optional(), offset: z.number().int().min(0).max(20_000_000).optional(), limit: z.number().int().min(1).max(50).optional(), expectedRevision: z.string().regex(/^[a-f0-9]{64}$/i) } }, async ({ deviceId: selected, tabId: tab, assetAction, assetName, mimeType, body, offset, limit, expectedRevision }) => {
+    if (assetAction !== "attach" && (body !== undefined || mimeType !== undefined)) return textResult({error:"body and mimeType are only for asset writes; omit both for list/source."},true);
     const response = await rpc(group, { action: "asset_action", deviceId: selected, tabId: tab, assetAction, assetName, mimeType, body, offset, limit, expectedRevision });
     if (response.error) return toolResponse(response);
     if (assetAction === "source") return assetSourceResult(response, offset, limit);
