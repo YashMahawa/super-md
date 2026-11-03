@@ -176,6 +176,31 @@ def build_mcp_server(roots: list[str], live_client=None):
         return [TextContent(type="text", text=json.dumps(metadata, ensure_ascii=False, separators=(",", ":"))),
                 ImageContent(type="image", data=base64.b64encode(data).decode("ascii"), mime_type=mime_type)]
 
+    def svg_source_blocks(data: bytes, metadata: dict, offset: int = 0, limit: int = 12000) -> list[Any]:
+        """Expose original SVG XML as paginated text, not an unsupported MCP image MIME.
+
+        MCP clients commonly reject image/svg+xml in ImageContent, preventing
+        agents from inspecting or restyling an embedded vector illustration.
+        """
+        if not isinstance(data, bytes) or not data or len(data) > 25 * 1024 * 1024:
+            raise AgentDocumentError("SVG asset must be nonempty and no larger than 25 MB")
+        if not isinstance(offset, int) or isinstance(offset, bool) or offset < 0:
+            raise AgentDocumentError("SVG source offset must be nonnegative")
+        if not isinstance(limit, int) or isinstance(limit, bool) or not 1 <= limit <= 12000:
+            raise AgentDocumentError("SVG source limit must be 1–12000 characters")
+        try:
+            source = data.decode("utf-8")
+        except UnicodeDecodeError as error:
+            raise AgentDocumentError("SVG source must be valid UTF-8") from error
+        if "<svg" not in source[:4096].lower():
+            raise AgentDocumentError("Asset does not contain SVG source")
+        page = source[offset:offset + limit]
+        end = offset + len(page)
+        return [TextContent(type="text", text=json.dumps({**metadata, "source": page,
+                "offset": offset, "totalLength": len(source),
+                "next_offset": end if end < len(source) else None,
+                "truncated": end < len(source)}, ensure_ascii=False))]
+
     @server.tool()
     def list_sessions() -> dict[str, Any]:
         """List currently open desktop tabs, including unsaved source and revision IDs."""
@@ -538,8 +563,9 @@ def build_mcp_server(roots: list[str], live_client=None):
     def document_assets(path: str, offset: int = 0, limit: int = 50,
                         action: str = "list", asset_name: str | None = None,
                         expected_revision: str | None = None, asset_id: str | None = None,
-                        asset_path: str | None = None) -> Any:
-        """List assets, replace by stable ID, or extract one image as MCP image content."""
+                        asset_path: str | None = None, source_offset: int = 0,
+                        source_limit: int = 12000) -> Any:
+        """List/replace assets; extract SVG as paginated XML text, raster as MCP image."""
         tab_id = live_id(path)
         if action == "list":
             if tab_id is not None:
@@ -585,6 +611,8 @@ def build_mcp_server(roots: list[str], live_client=None):
                 raise AgentDocumentError("Live bridge returned invalid image data")
             metadata = {key: image[key] for key in ("asset", "mime_type", "bytes", "sha256", "revision") if key in image}
             metadata["target"] = path
+            if image.get("mime_type") == "image/svg+xml":
+                return svg_source_blocks(image.get("data"), metadata, source_offset, source_limit)
             return as_asset_image_blocks(image.get("data"), image.get("mime_type", ""), metadata)
         if not expected_revision:
             raise AgentDocumentError("Image extraction requires expected_revision from document_inspect")
@@ -596,10 +624,11 @@ def build_mcp_server(roots: list[str], live_client=None):
         # Pass verified, app-supported asset types as true MCP image blocks.
         # Viewport snapshots stay raster-only, but explicit SVG extraction can
         # preserve the SVG MIME and bytes without interpreting or rendering it.
-        return as_asset_image_blocks(data, mime, {"target": path, "asset": asset_name,
-                                                   "mime_type": mime, "bytes": len(data),
-                                                   "sha256": asset["sha256"],
-                                                   "revision": expected_revision})
+        metadata = {"target": path, "asset": asset_name, "mime_type": mime,
+                    "bytes": len(data), "sha256": asset["sha256"], "revision": expected_revision}
+        if mime == "image/svg+xml":
+            return svg_source_blocks(data, metadata, source_offset, source_limit)
+        return as_asset_image_blocks(data, mime, metadata)
 
     @server.tool()
     def document_attach_asset(path: str, asset_path: str, expected_revision: str,
