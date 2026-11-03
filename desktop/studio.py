@@ -212,10 +212,10 @@ class Session(QObject):
             self.pinned = list(dict.fromkeys(p for p in stored.get("pinned",[]) if isinstance(p,str)))[:10]
             self.recent = list(dict.fromkeys(self.pinned + [p for p in stored.get("recent",[]) if isinstance(p,str)]))[:10]
         except (OSError,ValueError,KeyError,TypeError,AttributeError): pass
-        # The authenticated live bridge is explicitly enabled per app run;
-        # stale saved preferences must never start a new network listener.
+        # Local MCP access remains session-only. Cloud relay reconnection is
+        # an explicit, persisted opt-in made through its connect switch.
         self.settings["agentAccessEnabled"] = False
-        self.settings["cloudAgentEnabled"] = False
+        self.settings["cloudAgentEnabled"] = self.settings.get("cloudAgentEnabled") is True
         shortcuts, _ = normalize_shortcuts(self.settings.get("shortcuts"))
         self.settings["shortcuts"] = shortcuts or default_shortcuts()
         try:
@@ -454,6 +454,32 @@ class Studio(QObject):
             restore_generation = self._activation_generation
             QTimer.singleShot(0,lambda:[self._open_note(path, explicit=False, activation_generation=restore_generation) for path in self._startup_order])
         self._refresh_theme()
+        # Only the first real desktop window may restore the user's opted-in
+        # cloud connection. The cloud client handles network retry/backoff.
+        if not isolated and len(self.session.windows) == 1 and self.settings.get("cloudAgentEnabled"):
+            QTimer.singleShot(0, self._restore_cloud_connection)
+
+    def _restore_cloud_connection(self):
+        if self.retired or not self.settings.get("cloudAgentEnabled") or self._cloud_revocation_pending:
+            return
+        bridge = getattr(self.session, "agent_bridge", None)
+        if bridge is None or bridge.cloudClient.enabled:
+            return
+        try:
+            try:
+                from .agent_cloud import read_cloud_config
+            except ImportError:
+                from agent_cloud import read_cloud_config
+            config = read_cloud_config(self._agent_cloud_config_path)
+            was_enabled = bridge.enabled
+            bridge.start_cloud(config)
+            self._cloud_started_local_bridge = not was_enabled
+            self._agent_cloud_error = ""
+        except Exception as error:
+            # Keep the opt-in on transient errors so the user can retry without
+            # re-pairing. Invalid pairing is surfaced, never silently replaced.
+            self._agent_cloud_error = f"Cloud auto-connect failed: {str(error)[:140]}"
+        self._emit(False)
 
     @property
     def recent(self): return self.session.recent
