@@ -643,8 +643,21 @@ class StudioUiTest {
         }
         javascriptUntil("(()=>{const i=document.querySelector('.reading-search input');if(!i)return false;window.__searchKeyTrace=[];for(const name of ['keydown','beforeinput','input'])i.addEventListener(name,e=>window.__searchKeyTrace.push({type:e.type,key:e.key??null,keyCode:e.keyCode??null,data:e.data??null,inputType:e.inputType??null,ctrl:e.ctrlKey??false,meta:e.metaKey??false,shift:e.shiftKey??false,start:i.selectionStart,end:i.selectionEnd,value:i.value}),true);return true})()") { it == "true" }
         try {
-            shellOutput("input text focusneedle")
-            instrumentation.waitForIdleSync()
+            // Android 15 emulator shell `input text` can deliver a whole string
+            // out of order (observed "ofcusneedle"), despite a focused WebView.
+            // Inject actual native key events in sequence, awaiting each DOM
+            // update; this still tests Android -> WebView -> React input.
+            val expectedQuery = "focusneedle"
+            for (index in expectedQuery.indices) {
+                val char = expectedQuery[index]
+                val key = android.view.KeyEvent.keyCodeFromString("KEYCODE_${char.uppercaseChar()}")
+                assertTrue("Missing Android key code for $char", key != android.view.KeyEvent.KEYCODE_UNKNOWN)
+                instrumentation.sendKeyDownUpSync(key)
+                val prefix = expectedQuery.substring(0, index + 1)
+                javascriptUntil("document.querySelector('.reading-search input')?.value", 3_000) {
+                    it == org.json.JSONObject.quote(prefix)
+                }
+            }
             try {
                 javascriptUntil("document.querySelector('.reading-search input')?.value", 2_000) { it == "\"focusneedle\"" }
             } catch (failure: AssertionError) {
