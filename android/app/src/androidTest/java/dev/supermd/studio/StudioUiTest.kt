@@ -196,7 +196,13 @@ class StudioUiTest {
         try {
             assertFalse(StudioState().latexAutofix)
             clipboard.setPrimaryClip(android.content.ClipData.newPlainText("Super MD test", "theme-guide-copy-not-run"))
-            compose.runOnIdle {model.latexAutofix(false);model.mode("editor");model.edit(model.state.value.active.id,"Start here.")}
+            // mode() is asynchronous: it waits for a WebView reader barrier.
+            // Editing in the same idle callback can race that transition on
+            // slower Android 16 emulators and leave the editor with stale text.
+            compose.runOnIdle { model.latexAutofix(false); model.mode("editor") }
+            compose.waitUntil(15_000) { model.state.value.mode == "editor" }
+            javascriptUntil("!!document.querySelector('.cm-content')", { it == "true" })
+            compose.runOnIdle { model.edit(model.state.value.active.id, "Start here.") }
             javascriptUntil("document.querySelector('.cm-content')?.textContent==='Start here.'",{it=="true"})
             compose.onNodeWithContentDescription("More actions").performClick()
             compose.onNodeWithText("Settings").performClick()
