@@ -5,7 +5,7 @@ pub mod pdf_assets;
 mod math_compatibility;
 use math_compatibility::compatible_math;
 use anyhow::{bail, Result};
-use pulldown_cmark::{CodeBlockKind, Event, Options, Parser, Tag, TagEnd};
+use pulldown_cmark::{Alignment, CodeBlockKind, Event, Options, Parser, Tag, TagEnd};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use typst_as_lib::{typst_kit_options::TypstKitFontOptions, TypstEngine};
@@ -183,8 +183,8 @@ impl<'a> Renderer<'a> {
                             }
                             let widths = lengths.iter().zip(&counts).map(|(len, count)| format!("{:.2}fr,", ((*len as f64 / (*count).max(1) as f64).max(8.)).sqrt().min(12.))).collect::<String>();
                             let alignments = columns.iter().map(|column| match column {
-                                pulldown_cmark::Alignment::Center => "center,",
-                                pulldown_cmark::Alignment::Right => "right,",
+                                Alignment::Center => "center,",
+                                Alignment::Right => "right,",
                                 _ => "left,",
                             }).collect::<String>();
                             out.push_str(&format!("\n#table(columns: ({widths}), align: ({alignments}), inset: 6pt, stroke: .4pt + smd-line, fill: (x, y) => if y == 0 {{ smd-header-fill }} else {{ none }},\n"));
@@ -553,5 +553,21 @@ P(A\cup B\cup C)=&P(A)+P(B)+P(C)\\
                 }
             }
         }
+    }
+    #[test]
+    fn table_column_alignments_are_preserved_in_typst_source_and_pdf() {
+        let md = r"| Left | Center | Right | Unspecified |
+| :--- | :----: | ----: | ----------- |
+| L1   | C1     | R1    | U1          |
+| L2   | C2     | R2    | U2          |";
+        let src = source(md, &PdfOptions::default(), &HashMap::new()).unwrap();
+        assert!(src.contains("align: (left,center,right,left,)"), "Table must preserve column alignments: {src}");
+
+        let single_col_md = "| Single Center |\n| :---: |\n| Cell |";
+        let single_src = source(single_col_md, &PdfOptions::default(), &HashMap::new()).unwrap();
+        assert!(single_src.contains("align: (center,)"), "Single column table must have trailing comma in align tuple: {single_src}");
+
+        let pdf_bytes = export(md, &PdfOptions::default(), &HashMap::new()).unwrap();
+        assert!(pdf_bytes.starts_with(b"%PDF-"));
     }
 }
