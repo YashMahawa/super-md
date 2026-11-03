@@ -900,6 +900,7 @@ class StudioTest(unittest.TestCase):
         self.assertIn('defaultSuffix: exportFormat === "mdzip" ? "zip" : exportFormat',qml)
         for expected in ('PDF (*.pdf)', 'Markdown (*.md)', 'Markdown bundle (*.zip)', 'Portable Super MD (*.smd)'):
             self.assertIn(expected,qml)
+        self.assertIn('property var availableFormats: ["pdf", "smd", "md", "mdzip"]',qml)
         self.assertIn('availableFormats.indexOf(outputFormat)',qml)
         self.assertIn('onActivated: outputFormat = exportDialog.availableFormats[currentIndex]',qml)
 

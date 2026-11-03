@@ -138,8 +138,12 @@ tab on the chosen device. Do not change focus just to search or patch notes.
 
 Local MCP: `document_assets(path)` lists stable asset IDs and names without
 binary payloads. `action="extract"` with `asset_name` and `expected_revision`
-returns original bytes as MCP image content, including SVG. Use diagram-source
-reads for fenced SVG text. `document_attach_asset(path, asset_path,
+returns raster images as MCP image content. Embedded SVG is returned as
+exact UTF-8 source text with `source`, `next_offset`, `totalLength`, and
+`sha256` so an agent can preserve its geometry when restyling. For large SVGs,
+repeat `action="extract"` with `source_offset=next_offset` and
+`source_limit=12000` until `next_offset` is null. Use diagram-source reads
+for fenced SVG text. `document_attach_asset(path, asset_path,
 expected_revision, name)` attaches a local image from an allowed root;
 `document_assets(action="replace", asset_id, asset_path, expected_revision,
 path)` replaces an existing image without changing its reference.
