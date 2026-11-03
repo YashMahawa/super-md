@@ -44,3 +44,13 @@ test("audit lifecycle and paged read options preserve write guards", () => {
   assert.throws(()=>validateRpcRequest({requestId:"injected",action:"read_tab",tabId:"window:tab",content:"replacement"}),/only accepted for create/);
   assert.throws(()=>validateRpcRequest({requestId:"flags",action:"search_tab",tabId:"window:tab",query:"x",wholeWord:"yes"}),/Invalid wholeWord/);
 });
+
+test("asset reads are body-free, lists accept pagination, writes remain bounded", () => {
+ const base={requestId:"assets",action:"asset_action",tabId:"tab:1",expectedRevision:"a".repeat(64)};
+ assert.equal(validateRpcRequest({...base,assetAction:"list",offset:600,limit:50}).assetAction,"list");
+ assert.equal(validateRpcRequest({...base,assetAction:"source",assetName:"assets/heap.svg"}).assetAction,"source");
+ assert.throws(()=>validateRpcRequest({...base,assetAction:"source",assetName:"assets/heap.svg",body:""}),/only accepted for asset writes/);
+ assert.throws(()=>validateRpcRequest({...base,assetAction:"attach",assetName:"assets/heap.svg",mimeType:"image/svg+xml",body:""}),/requires assetName, mimeType and body/);
+ assert.equal(validateRpcRequest({requestId:"diagrams",action:"list_diagrams",tabId:"tab:1"}).action,"list_diagrams");
+ assert.equal(validateRpcRequest({requestId:"whole",action:"read_tab",tabId:"tab:1",offset:100,limit:200}).offset,100);
+});

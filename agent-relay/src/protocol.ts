@@ -92,9 +92,10 @@ export function validateRpcRequest(value: unknown): RpcRequest {
     if (!r.expectedRevision) throw new Error("Asset actions need the current document revision");
     if (!["list", "source", "attach"].includes(String(r.assetAction))) throw new Error("Unsupported asset action");
     if (r.assetAction === "source" && !r.assetName) throw new Error("Asset source requires assetName");
-    if (r.assetAction === "list" && ((r.offset !== undefined && (!Number.isInteger(r.offset) || Number(r.offset) > 512)) || (r.limit !== undefined && (!Number.isInteger(r.limit) || Number(r.limit) < 1 || Number(r.limit) > 50)))) throw new Error("Invalid asset page");
+    if (r.assetAction === "list" && ((r.offset !== undefined && (!Number.isInteger(r.offset) || Number(r.offset) > 20_000_000)) || (r.limit !== undefined && (!Number.isInteger(r.limit) || Number(r.limit) < 1 || Number(r.limit) > 50)))) throw new Error("Invalid asset page");
     if (r.assetAction === "attach" && (!r.assetName || !r.mimeType || !r.body)) throw new Error("Attaching an asset requires assetName, mimeType and body");
-    if (r.body !== undefined) {
+    if (r.assetAction !== "attach" && r.body !== undefined) throw new Error("Media body is only accepted for asset writes");
+    if (r.assetAction === "attach" && r.body !== undefined) {
       if (typeof r.body !== "string" || r.body.length % 4 !== 0 || !/^(?:[A-Za-z0-9+/]{4})*(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?$/.test(r.body)) throw new Error("Media body must be base64");
       const bytes = Buffer.from(r.body, "base64");
       if (bytes.length < 1 || bytes.length > 1_048_576) throw new Error("Media body must be at most 1 MiB");
