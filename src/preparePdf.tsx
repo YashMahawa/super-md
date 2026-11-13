@@ -14,6 +14,8 @@ import { analyzeDocument } from "./documentAnalysis";
 import { svgImage } from "./svgImage";
 import { remarkObsidianMath } from "./obsidianMath";
 import { remarkSvgBlocks } from "./svgBlocks";
+import {parseStepDeck} from "./components/StepCards";
+import {stepDiagramSvg} from "./stepPdf";
 
 function data(blob: Blob): Promise<string> {
   return new Promise((resolve, reject) => { const reader = new FileReader(); reader.onload = () => resolve(String(reader.result)); reader.onerror = () => reject(reader.error); reader.readAsDataURL(blob); });
@@ -73,6 +75,35 @@ export async function preparePdf(markdown: string, documentPath: string | null, 
   const pythonOrdinals=new Map<string,number>();
   const add = (url: string, name: string) => { assets[name] = url.slice(url.indexOf(",") + 1); return name; };
   visit(tree, (node: any) => {
+    if (node.type === "code" && node.lang === "smd-steps") {
+      work.push(async () => {
+        const deck = parseStepDeck(node.value);
+        if (!deck) throw new Error("Invalid step cards; fix the diagram sequence before exporting.");
+        const steps = [];
+        for (const step of deck.steps) {
+          checkCurrent();
+          let image: string | undefined;
+          if (step.image || step.diagram || step.chart) {
+            const source = step.image
+              ? processor.stringify({type:"root",children:[{type:"paragraph",children:[{type:"image",url:step.image,alt:step.alt||step.label}]}]} as any)
+              : "```" + (step.diagram ? "svg\n" + stepDiagramSvg(step.diagram) : "smd-chart\n" + step.chart) + "\n```";
+            const prepared = await preparePdf(source, documentPath, python, {signal});
+            checkCurrent();
+            const names = new Map<string,string>();
+            for (const [name, body] of Object.entries(prepared.assets)) {
+              const renamed = `step-${++count}-${name}`;
+              assets[renamed] = body; names.set(name, renamed);
+            }
+            visit(processor.parse(prepared.content), "image", (picture:any) => { if (!image) image = names.get(picture.url); });
+            if (!image) throw new Error(`Step cannot export its diagram: ${step.label}`);
+          }
+          steps.push({label:step.label, ...(image?{image}:{}), ...(step.description?{description:step.description}:{})});
+        }
+        node.lang = "smd-step-grid";
+        node.value = JSON.stringify({title:deck.title, steps});
+      });
+      return SKIP;
+    }
     if(node.type==="imageReference"){
       const definition=referenceDefinitions.get(node.identifier);
       if(definition){node.type="image";node.url=definition.url;node.title=definition.title;delete node.identifier;delete node.label;delete node.referenceType;}

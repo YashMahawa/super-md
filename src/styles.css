@@ -710,3 +710,8 @@ button.code-copy:active { border-radius:10px; }
 .media-save-menu button{display:block;width:100%;padding:12px;border:0;border-radius:12px;background:transparent;color:inherit;font:inherit;text-align:left;cursor:pointer}
 .media-save-menu button:hover,.media-save-menu button:focus-visible{background:color-mix(in srgb,var(--primary,#6750a4) 16%,var(--surface,#fff));outline:2px solid transparent}
 .media-save-menu button:disabled{opacity:.55;cursor:wait}
+
+/* Viewing/focus restoration never selects destructive image tools. */
+.image-options { position:absolute; top:8px; right:8px; border-radius:999px; min-width:36px; min-height:36px; opacity:0; background:var(--surface-high); color:var(--text); box-shadow:0 2px 8px var(--shadow); }
+.note-image:hover > .image-options, .note-image:focus-within > .image-options { opacity:1; }
+@media(hover:none) { .image-options { opacity:1; } }

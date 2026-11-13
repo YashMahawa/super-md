@@ -106,6 +106,30 @@ def _image_destinations(markdown: str) -> list[str]:
         normalized = " ".join(label.casefold().split())
         if normalized in references:
             sources.append(references[normalized])
+    # Image sequences are fenced JSON, not Markdown image nodes. Include every
+    # frame for offline PDF export, while ignoring fences containing examples.
+    marker = None
+    language = ""
+    body = []
+    for line in markdown.splitlines():
+        fence = _FENCE.match(line)
+        if marker is None:
+            if fence:
+                marker = fence.group(1)
+                language = line[fence.end():].strip()
+                body = []
+        elif fence and fence.group(1)[0] == marker[0] and len(fence.group(1)) >= len(marker) and not line[fence.end():].strip():
+            if language in ("smd-steps", "smd-step-grid"):
+                try:
+                    deck = json.loads("\n".join(body))
+                    steps = deck.get("steps", []) if isinstance(deck, dict) else []
+                    if isinstance(steps, list):
+                        sources.extend(step["image"] for step in steps if isinstance(step, dict) and isinstance(step.get("image"), str))
+                except (ValueError, TypeError):
+                    pass  # The native renderer reports invalid step JSON.
+            marker = None
+        else:
+            body.append(line)
     # Stable unique sequence keeps request sizes down while preserving lookup keys.
     return list(dict.fromkeys(source for source in sources if source))
 

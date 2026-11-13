@@ -1,0 +1,85 @@
+use anyhow::{bail, Result};
+use serde::Deserialize;
+use std::collections::HashMap;
+use crate::{string, text};
+
+#[derive(Deserialize)]
+struct Deck { title: String, steps: Vec<Step> }
+#[derive(Deserialize)]
+struct Step { label: String, image: Option<String>, description: Option<String>, diagram: Option<serde_json::Value>, chart: Option<serde_json::Value> }
+
+pub fn render(source: &str, assets: &HashMap<String, Vec<u8>>) -> Result<String> {
+    if source.len() > 480_000 { bail!("Step cards exceed the export size limit"); }
+    let deck: Deck = serde_json::from_str(source)?;
+    if deck.title.trim().is_empty() || deck.title.len() > 480 || !(2..=40).contains(&deck.steps.len()) { bail!("Invalid step cards title or number of steps"); }
+    let columns = "1fr,".repeat(deck.steps.len().min(3));
+    let mut out = format!("\n#block(above: .7em, below: 4pt, sticky: true)[#strong[{}]]\n", text(&deck.title));
+    for row in deck.steps.chunks(3) {
+        // Each row can move intact to the next page. The deck itself can span
+        // pages, and its final partial row retains the same diagram scale.
+        out.push_str(&format!("#block(width: 100%, breakable: false, above: 3pt, below: 3pt)[#grid(columns: ({columns}), column-gutter: 6pt, align: top,\n"));
+        for step in row {
+            if step.label.trim().is_empty() || step.label.len() > 400 || step.description.as_ref().is_some_and(|s| s.len() > 6000) { bail!("Invalid step card label or description"); }
+            if step.diagram.is_some() || step.chart.is_some() { bail!("Open this note in Super MD to prepare its interactive step diagrams for PDF export"); }
+            if step.image.is_none() && step.description.is_none() { bail!("Step card has no image or description"); }
+            out.push_str(&format!("[#set text(size: .84em)\n#set par(spacing: 3pt, leading: .28em)\n#block(below: 3pt)[#strong[{}]]\n", text(&step.label)));
+            if let Some(image) = &step.image {
+                if !assets.contains_key(image) { bail!("Image unavailable for PDF step: {image}"); }
+                out.push_str(&format!("#smd-step-image({})\n", string(image)));
+            }
+            if let Some(description) = &step.description { out.push_str(&format!("\n{}\n", text(description))); }
+            out.push_str("],\n");
+        }
+        out.push_str(")]\n");
+    }
+    out.push('\n');
+    Ok(out)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{export, image_sources, source, PdfOptions};
+    fn fixture(count: usize) -> (String, HashMap<String, Vec<u8>>) {
+        let svg = br##"<svg xmlns="http://www.w3.org/2000/svg" width="320" height="150"><rect x="4" y="4" width="312" height="142" rx="8" fill="#e8f0ff"/><path d="M25 115L125 45L290 100" stroke="#2463b3" stroke-width="4" fill="none"/></svg>"##.to_vec();
+        let steps: Vec<_> = (1..=count).map(|i| serde_json::json!({"label":format!("FRAME-{i:02}"),"image":"frame.svg","description":format!("CAPTION-{i:02}")})).collect();
+        (format!("# Before\n\n```smd-steps\n{}\n```\n\nEND-SEQUENCE",serde_json::json!({"title":"All stages", "steps":steps})), HashMap::from([("frame.svg".into(),svg)]))
+    }
+    #[test]
+    fn discovers_hidden_frames_and_preserves_code_examples() {
+        let (md, _) = fixture(7);
+        assert_eq!(image_sources(&md), vec!["frame.svg";7]);
+        assert!(image_sources(&format!("````text\n{md}\n````")).is_empty());
+    }
+    #[test]
+    fn rows_have_at_most_three_cells_and_no_interactive_chrome() {
+        for n in [2,3,4,5,7,40] {
+            let (md, assets) = fixture(n);
+            let out = source(&md,&PdfOptions::default(),&assets).unwrap();
+            assert_eq!(out.matches("#grid(columns:").count(), n.div_ceil(3));
+            assert!(out.contains(&format!("columns: ({})","1fr,".repeat(n.min(3)))));
+            assert_eq!(out.matches("#smd-step-image(\"frame.svg\")").count(),n);
+            assert!(!out.contains("raw(\"{\\\""));
+        }
+    }
+    #[test]
+    fn forty_frames_paginate_without_losing_labels_or_captions() {
+        let (md, assets) = fixture(40);
+        let bytes = export(&md,&PdfOptions::default(),&assets).unwrap();
+        let path = std::env::temp_dir().join(format!("supermd-step-grid-{}.pdf",std::process::id()));
+        std::fs::write(&path,bytes).unwrap();
+        if let Ok(output) = std::process::Command::new("pdftotext").args([path.to_str().unwrap(),"-"]).output() {
+            assert!(output.status.success());
+            let text=String::from_utf8_lossy(&output.stdout);
+            for i in 1..=40 { assert!(text.contains(&format!("FRAME-{i:02}"))); assert!(text.contains(&format!("CAPTION-{i:02}"))); }
+            assert!(text.contains("END-SEQUENCE"));
+        }
+        let _ = std::fs::remove_file(path);
+    }
+    #[test]
+    fn missing_frames_or_unprepared_diagrams_fail_visibly() {
+        let (md, _) = fixture(3);
+        assert!(source(&md,&PdfOptions::default(),&HashMap::new()).unwrap_err().to_string().contains("Image unavailable"));
+        assert!(render(r#"{"title":"X","steps":[{"label":"A","diagram":{}},{"label":"B","description":"Text"}]}"#,&HashMap::new()).is_err());
+    }
+}

@@ -73,6 +73,7 @@ jobs:
             'desktop (ubuntu-22.04, linux)',
             'desktop (windows-latest, windows)',
             'desktop (macos-15, macos-arm64)',
+            'desktop (macos-15-intel, macos-x64)',
           ];
           for (const name of required) {
             const jobs = response.jobs.filter(job => job.name === name);
@@ -146,6 +147,8 @@ jobs:
             package: windows
           - platform: macos-15
             package: macos-arm64
+          - platform: macos-15-intel
+            package: macos-x64
     runs-on: ${{ matrix.platform }}
     steps:
       - uses: actions/checkout@v4

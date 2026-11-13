@@ -3,6 +3,7 @@ pub mod portable;
 pub mod theme;
 pub mod pdf_assets;
 mod math_compatibility;
+mod step_grid;
 use math_compatibility::compatible_math;
 use anyhow::{bail, Result};
 use pulldown_cmark::{CodeBlockKind, Event, Options, Parser, Tag, TagEnd};
@@ -44,7 +45,27 @@ fn string(value: &str) -> String { serde_json::to_string(value).unwrap() }
 fn text(value: &str) -> String { format!("#text({})", string(value)) }
 
 pub fn image_sources(markdown: &str) -> Vec<String> {
-    Parser::new_ext(markdown, Options::all()).filter_map(|event| match event { Event::Start(Tag::Image { dest_url, .. }) => Some(dest_url.to_string()), _ => None }).collect()
+    let mut sources = Vec::new();
+    let mut events = Parser::new_ext(markdown, Options::all());
+    while let Some(event) = events.next() {
+        match event {
+            Event::Start(Tag::Image { dest_url, .. }) => sources.push(dest_url.to_string()),
+            Event::Start(Tag::CodeBlock(CodeBlockKind::Fenced(lang))) if ["smd-steps", "smd-step-grid"].contains(&lang.as_ref()) => {
+                let mut code = String::new();
+                for event in events.by_ref() {
+                    if event == Event::End(TagEnd::CodeBlock) { break; }
+                    if let Event::Text(value) = event { code.push_str(&value); }
+                }
+                if let Ok(deck) = serde_json::from_str::<serde_json::Value>(&code) {
+                    if let Some(steps) = deck.get("steps").and_then(|v| v.as_array()) {
+                        sources.extend(steps.iter().filter_map(|step| step.get("image").and_then(|v| v.as_str()).map(str::to_owned)));
+                    }
+                }
+            },
+            _ => {},
+        }
+    }
+    sources
 }
 
 /// Normalize both Obsidian and Super MD callouts before parsing ordinary Markdown.
@@ -153,6 +174,10 @@ impl<'a> Renderer<'a> {
                             let mut code = String::new();
                             while let Some(e) = self.events.next() { if e == Event::End(close) { break; } if let Event::Text(v) = e { code.push_str(&v); } }
                             let lang = match kind { CodeBlockKind::Fenced(v) => v.to_string(), _ => String::new() };
+                            if ["smd-steps", "smd-step-grid"].contains(&lang.as_str()) {
+                                out.push_str(&step_grid::render(&code, self.assets)?);
+                                continue;
+                            }
                             if ["mermaid", "smd-chart"].contains(&lang.as_str()) { bail!("Export preparation did not render a {lang} block"); }
                             // Individual lines fit the available width while the
                             // enclosing block stays breakable across pages.

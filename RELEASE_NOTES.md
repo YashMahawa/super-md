@@ -1,15 +1,18 @@
-# Super MD 0.6.26
+# Super MD 0.6.27
 
-## Agent and cloud relay
+## Compact diagram grids in PDF exports
 
-- Embedded SVG assets can now be inspected by agents as exact paginated UTF-8 XML source, rather than an unsupported SVG image MIME block. Large diagrams support source offsets for safe restyling.
-- Previously enabled cloud relay connections automatically reconnect when Super MD starts, using the same saved pairing without requiring manual reconnection or rotating credentials.
+- Interactive step sequences now export every frame as a diagram grid with at most three columns. Short sequences use two or three columns; longer sequences continue in reading order across rows and pages.
+- Diagram labels and descriptions stay with their frame. Equal-width cells, narrow gutters, natural image proportions and no slider chrome keep the PDF compact.
+- Embedded SVGs, raster images, declarative node diagrams, binary trees and 2D charts are supported through the shared desktop/Android export pipeline. Image and text sequences also work in offline PDF exports.
+- The original note keeps its interactive sliders. Invalid or unavailable frames report an export error instead of printing JSON or silently dropping stages.
 
-## Export and Android reliability
+## Image viewing without accidental editing controls
 
-- Export Portable Super MD (`.smd`) from an existing `.smd` note, or export any note as PDF, Markdown, Markdown ZIP, or SMD.
-- Fix Android 16 instrumentation timing for the asynchronous editor-mode transition, retaining all real editor-content assertions.
+- Closing an image, SVG or slider-frame viewer no longer reveals Replace/Remove merely because focus returns to the source image.
+- Image editing tools open explicitly through Image options or the image context menu. Keyboard focus alone keeps the reading view clean.
 
 ## Verification
 
-- Full CI and all supported platform installers must pass on the exact release commit before publication.
+- Regression checks cover all sequence frames, mixed diagram/chart decks, page-spanning grids, asset discovery and viewer focus restoration.
+- Publication requires successful CI, signed Android release verification and all supported platform installer checks on the exact release commit.
