@@ -52,7 +52,9 @@ Expressions receive `x`, each slider name, and JavaScript's `Math` object. A ser
 Use a `smd-steps` fenced block when several diagrams show consecutive stages of
 one operation. Super MD shows **one stage at a time** with Previous/Next buttons,
 a draggable slider, and Left/Right keys while the card has focus. It is supported
-by the shared desktop and Android reader.
+by the shared desktop and Android reader. PDF export expands every stage into a compact grid with at most three equal-width diagrams per row. Labels and descriptions stay with their diagrams; rows can continue on subsequent pages. The editable note retains its slider.
+
+Offline CLI export supports image and text sequences. Open the note in Super MD to prepare sequences containing declarative diagrams or charts.
 
 ````markdown
 ```smd-steps

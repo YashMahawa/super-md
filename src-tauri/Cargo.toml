@@ -1,6 +1,6 @@
 [package]
 name = "super-md"
-version = "0.6.26"
+version = "0.6.27"
 description = "A distraction-free, interactive Markdown studio"
 authors = ["Yash Mahawar", "Super MD contributors"]
 license = "MIT"

@@ -23,3 +23,9 @@
   let width = calc.min(size.width, 170mm * (bounds.width / bounds.height))
   image(path, width: width)
 })
+// Compact export-only sequence cells: no card chrome or fixed empty stage.
+#let smd-step-image(path) = layout(size => {
+  let bounds = measure(image(path))
+  let width = calc.min(size.width, 60mm * (bounds.width / bounds.height))
+  align(center, image(path, width: width))
+})
