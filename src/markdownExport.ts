@@ -89,7 +89,11 @@ function sourceFenceBlock(source: string, language: "svg" | "mermaid"): string {
  * written beside the exported Markdown by the native host; remote URLs remain
  * untouched and are never fetched as a side effect of export.
  */
-export async function prepareMarkdownExport(markdown: string, documentPath: string | null) {
+export async function prepareMarkdownExport(markdown: string, documentPath: string | null, options: {compatible?:boolean} = {}) {
+  if(options.compatible){
+    const {compatibleMarkdown}=await import('./compatibleMarkdown');
+    markdown=await compatibleMarkdown(markdown,documentPath);
+  }
   const assets: Record<string, string> = {};
   const edits: Array<{ start: number; end: number; value: string }> = [];
   const shared = new Map<string, Promise<{ mime: string; dataUrl: string; text?: string } | { mermaid: string }>>();
@@ -97,7 +101,7 @@ export async function prepareMarkdownExport(markdown: string, documentPath: stri
   const definitionsToRemove = new Map<number, { start: number; end: number }>();
   const reservedPaths = new Set(references.flatMap(({ source }) => {
     const path = cleanRelativePath(source);
-    return path && !APP_GENERATED.test(path) && !/\.(?:svg|mmd|mermaid)$/i.test(path) ? [path] : [];
+    return path && !APP_GENERATED.test(path) && (!/\.(?:svg|mmd|mermaid)$/i.test(path)||options.compatible&&/\.svg$/i.test(path)) ? [path] : [];
   }));
   const generatedPaths = new Map<string, string>();
   const usedPaths = new Set(reservedPaths);
@@ -143,7 +147,7 @@ export async function prepareMarkdownExport(markdown: string, documentPath: stri
       continue;
     }
     if (!MIME_EXT[resolved.mime]) throw Error(`Image format is not supported for Markdown export: ${ref.source}`);
-    if (resolved.mime === "image/svg+xml" && resolved.text !== undefined) {
+    if (!options.compatible && resolved.mime === "image/svg+xml" && resolved.text !== undefined) {
       edits.push({ start: ref.start, end: ref.end, value: sourceFenceBlock(resolved.text, "svg") });
       if (ref.definition) definitionsToRemove.set(ref.definition.start, ref.definition);
       continue;
@@ -154,7 +158,7 @@ export async function prepareMarkdownExport(markdown: string, documentPath: stri
       ? allocateGeneratedPath(generatedKey, MIME_EXT[resolved.mime]) : relative;
     if (assets[path] && assets[path] !== resolved.dataUrl) throw Error(`Markdown asset path collision: ${path}`);
     if (!assets[path]) assets[path] = resolved.dataUrl;
-    if (ref.image && path !== ref.source) {
+    if ((ref.image && path !== ref.source) || options.compatible && !ref.image && resolved.mime === "image/svg+xml") {
       const label = ref.source.startsWith("data:") ? "Image" : ref.source.split("/").pop() || "Image";
       const altMatch = markdown.slice(ref.start, ref.end).match(/^!\[([^\]]*)\]/);
       const alt = (altMatch?.[1] || label).replace(/[\[\]\\]/g, "\\$&").replace(/[\r\n]+/g, " ");

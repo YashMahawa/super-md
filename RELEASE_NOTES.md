@@ -1,4 +1,4 @@
-# Super MD 0.6.30
+# Super MD 0.6.31
 
 ## Compact, responsive step cards
 
@@ -20,3 +20,5 @@
 - Personal profiles and connection credentials are excluded from the public package.
 
 The complete study-note skill now documents contrast, theme adaptation, large labels and substantial action arrows. Standalone agent setup exports preserve their installable skill header and full connection instructions.
+
+Markdown ZIP exports now expand slider states into consecutive static figures with their text and formulas, convert custom diagrams/charts and SVG blocks to linked SVG assets, and retain Obsidian callouts, math, Mermaid and ordinary code. Export never executes Python or changes the source note. Invalid unsupported blocks report a conversion error instead of silently losing content.

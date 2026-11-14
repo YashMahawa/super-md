@@ -212,3 +212,7 @@ A step may include a `markdown` string (up to 12,000 characters within the deck 
 Wide cards place rich explanations to the right; narrow portrait layouts stack them below. Image-only cards use a compact control strip, without repeated title banners or visible “Choose step” text. Left/Right arrows navigate while hovering or focusing the card, without intercepting text-editor cursor keys.
 
 PDF exports retain Markdown/LaTeX and use full-width visual/text pairs for rich steps. Longer image sequences use two columns for readable diagrams, while short sequences can use up to three. Export defaults use 14 mm margins, 1.4 line height and 0.65 em paragraph spacing; saved user settings are preserved.
+
+### Markdown ZIP compatibility
+
+Markdown ZIP is a reader-friendly copy for Obsidian: step cards expand into consecutive labelled figures and Markdown/math, custom diagram/tree/chart blocks and SVG fences become ordinary linked SVG assets, and supported Mermaid, callouts and math remain native Markdown. Images use relative paths within the archive. Saved Python output may be included but code is never executed. The original note is unchanged. Standalone Markdown retains its source-oriented export behavior.

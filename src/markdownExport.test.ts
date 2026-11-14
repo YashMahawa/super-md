@@ -119,3 +119,52 @@ describe("plain Markdown export assets", () => {
     expect(native).toHaveBeenCalledTimes(1);
   });
 });
+
+describe('compatible Markdown ZIP preparation',()=>{
+ it('expands every step in order, keeps callouts/math and bundles SVG files',async()=>{
+  native.mockImplementation(async(command:string,args:any)=>{
+   expect(command).toBe('load_asset');expect(args.source).toBe('assets/first.svg');
+   return 'data:image/svg+xml;base64,'+btoa('<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 100 100"><circle cx="50" cy="50" r="30"/></svg>');
+  });
+  const source='> [!question] Q1. Find the mean.\n> Use both values.\n\n```smd-steps\n'+JSON.stringify({title:'Mean update',steps:[{label:'Before',image:'assets/first.svg',markdown:'**Values:** 2 and 4.\n\n$$\\mu=3$$'},{label:'After',diagram:{width:120,height:100,nodes:[{id:'a',label:'3',x:60,y:50}],edges:[]},description:'The centre is 3.'}]})+'\n```\n\n```svg\n<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 100 100"><text x="10" y="50">Done</text></svg>\n```';
+  const result=await prepareMarkdownExport(source,'/notes/test.smd',{compatible:true});
+  expect(result.content).toContain('> [!question] Q1. Find the mean.');
+  expect(result.content).toContain('$$\\mu=3$$');
+  expect(result.content).toContain('**Values:** 2 and 4.');
+  expect(result.content.indexOf('**Before**')).toBeLessThan(result.content.indexOf('**After**'));
+  expect(result.content).not.toMatch(/```(?:smd-|svg)/);
+  const tree=unified().use(remarkParse).parse(result.content);
+  const pictures:any[]=[];const scan=(node:any)=>{if(node.type==='image')pictures.push(node);node.children?.forEach(scan);};scan(tree);
+  expect(pictures).toHaveLength(3);
+  expect(Object.keys(result.assets)).toHaveLength(3);
+  for(const picture of pictures)expect(result.assets[picture.url]).toMatch(/^data:image\/svg\+xml;base64,/);
+  expect(source).toContain('```smd-steps');
+ });
+ it('preserves supported Mermaid and never runs Python on export',async()=>{
+  native.mockResolvedValue(null);
+  const source='```mermaid\nflowchart LR\nA-->B\n```\n\n```python\nraise RuntimeError("must never run")\n```';
+  const result=await prepareMarkdownExport(source,'/notes/test.smd',{compatible:true});
+  expect(result.content).toContain('```mermaid');expect(result.content).toContain('raise RuntimeError');
+  expect(native.mock.calls.every(([command])=>command!=='run_python')).toBe(true);
+ });
+ it('rejects malformed custom blocks instead of silently dropping frames',async()=>{
+  await expect(prepareMarkdownExport('```smd-steps\n{"title":"Broken","steps":[]}\n```',null,{compatible:true})).rejects.toThrow('Invalid step sequence');
+ });
+});
+
+it('exports custom trees and charts after Obsidian-style multiline display math',async()=>{
+ const source='$$a=1+2\n=3.$$\n\n```smd-tree\n{"values":[8,4,12]}\n```\n\n```smd-chart\n{"title":"Line","xRange":[-2,2],"yRange":[-2,2],"series":[{"expression":"x"}]}\n```';
+ const result=await prepareMarkdownExport(source,null,{compatible:true});
+ expect(result.content).toContain('$$a=1+2\n=3.$$');
+ expect(result.content).not.toMatch(/```smd-/);
+ expect(Object.keys(result.assets)).toHaveLength(2);
+ for(const uri of Object.values(result.assets))expect(atob(uri.split(',')[1])).toContain('<svg');
+});
+it('keeps converted SVGs inside their enclosing callout and preserves frontmatter',async()=>{
+ const source='---\ntitle: Lesson\n---\n\n:::callout question Q1\nDraw the tree.\n\n```smd-tree\n{"values":[8,4,12]}\n```\n:::';
+ const result=await prepareMarkdownExport(source,null,{compatible:true});
+ expect(result.content).toContain('---\ntitle: Lesson\n---');
+ expect(result.content).toContain('> [!QUESTION] Q1');
+ expect(result.content).toMatch(/^> !\[Diagram\]/m);
+ expect(result.content).not.toContain(':::');
+});

@@ -337,7 +337,7 @@ function Reader() {
       try {
         if((current as ReaderState&{editProtocol?:number}).editProtocol===1)await edits.current!.flush(current.id);
         const latest=reference.current;if(!latest||latest.id!==current.id)throw new Error('The export note changed');
-        const prepared=await prepareMarkdownExport(latest.content,latest.path);
+        const prepared=await prepareMarkdownExport(latest.content,latest.path,{compatible:archive});
         if(reference.current?.id!==latest.id||reference.current.content!==latest.content)throw new Error('The note changed while preparing the Markdown export');
         await invoke("export_markdown_native", {id: latest.id, content: prepared.content, assets: prepared.assets, archive}); }
       catch (error) { await invoke("export_failed", {error: String(error)}); }
