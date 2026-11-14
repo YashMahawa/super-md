@@ -20,6 +20,10 @@ Use tables for genuinely parallel data: candidate models, train/dev results, inp
 
 Give one calculation stage per short paragraph or display equation. Use spaces in coordinate lists and after punctuation; keep leading zeros (0.5). Define quantities before using them. Put a space after closing bold markers before a following word. Inspect rendered output for literal **, raw HTML anchors, broken LaTeX, excessive whitespace and giant inline equation chains. Do not bold entire paragraphs.
 
+Keep repeated classification answers in a Property/Result table when that is clearer than a run-on sequence of subpart labels. Give other subparts separate paragraphs or list items; a newline inside one quoted paragraph may still render as a single block. Inspect the rendered labels as well as the source.
+
+Write currency as escaped literal Markdown outside math, for example `\$2`, while keeping formulas such as `$p$` in math. Do not wrap an escaped currency sign in another dollar-math pair (for example `$\$2$`): some Markdown math parsers treat its inner dollar as a delimiter and swallow the surrounding prose. Verify money amounts next to formulas in the actual reader.
+
 Use callouts selectively: a key result, convention, common trap, or a question. They should not surround every paragraph. Avoid repetitive banners, “original question”, “worked prompt”, “corresponding solution”, “task 1”, “pass 2” and drafting/process chatter.
 
 ## Questions and exam solutions
