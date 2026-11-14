@@ -655,7 +655,11 @@ def build_mcp_server(roots: list[str], live_client=None):
         """Return a current viewport or one requested rendered diagram as MCP image content."""
         tab_id = live_id(path)
         if tab_id is None:
-            raise AgentDocumentError("Viewport rendering is available for open desktop tabs only")
+            if diagram_id is not None:raise AgentDocumentError("Use the background service for individual rendered frames, or extract the original asset")
+            if not 320 <= width <= 1600:raise AgentDocumentError("Offline preview width must be between 320 and 1,600 pixels")
+            from offline_view import render_offline
+            body=render_offline(store,path,width=width,expected_revision=expected_revision)
+            return [ImageContent(type="image",data=base64.b64encode(body).decode(),mimeType="image/png")]
         if not 64 <= width <= 1600:
             raise AgentDocumentError("width must be between 64 and 1,600 pixels")
         if diagram_id is not None:

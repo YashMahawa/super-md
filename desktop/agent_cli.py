@@ -36,12 +36,24 @@ def _heading_selector(value: str) -> int | str:
 def _parser() -> argparse.ArgumentParser:
     parser = _JSONArgumentParser(description="Bounded, revision-guarded Super MD note operations")
     parser.add_argument("--root", action="append", required=True, help="Explicit workspace root (repeatable)")
+    parser.add_argument("--live-sessions-dir",help="Optional private live-session directory for MCP-equivalent calls")
     sub = parser.add_subparsers(dest="command", required=True)
+    tool=sub.add_parser("call",help="Call any named MCP tool with the same JSON arguments")
+    tool.add_argument("tool")
+    tool.add_argument("--arguments-json",default="{}")
+    tool.add_argument("--output",help="New PNG output path for image tool results")
     for command in ("inspect", "read", "search", "create", "patch", "assets", "attach", "replace-asset",
-                    "extract", "export"):
+                    "extract", "export", "preview"):
         p = sub.add_parser(command)
         p.add_argument("path", help="Path relative to a configured root, or an absolute path inside one")
-        if command == "read":
+        if command == "preview":
+            p.add_argument("output_path")
+            p.add_argument("--width",type=int,default=1200)
+            p.add_argument("--height",type=int,default=900)
+            p.add_argument("--heading")
+            p.add_argument("--dark",action="store_true")
+            p.add_argument("--snapshot",help=argparse.SUPPRESS)
+        elif command == "read":
             p.add_argument("--offset", type=int, default=0)
             p.add_argument("--limit", type=int, default=12000)
             p.add_argument("--heading", type=_heading_selector,
@@ -106,6 +118,12 @@ def main(argv: list[str] | None = None) -> int:
     argv = list(sys.argv[1:] if argv is None else argv)
     # Packaged `super-md agent mcp ...` shares this lightweight entry point
     # without importing Qt; stdio remains reserved for MCP protocol traffic.
+    if argv and argv[0] == "install-skill":
+        from install_skill import main as install_main
+        return install_main(argv[1:])
+    if argv and argv[0] == "service":
+        from background_cli import main as service_main
+        return service_main(argv[1:])
     if argv and argv[0] == "mcp":
         try:
             from .mcp_server import main as mcp_main
@@ -168,6 +186,14 @@ def main(argv: list[str] | None = None) -> int:
             except json.JSONDecodeError as exc:
                 raise AgentDocumentError(f"Invalid patch JSON at character {exc.pos}") from exc
             result = store.patch(args.path, expected_revision=args.revision, operations=operations)
+        elif args.command == "call":
+            from agent_call import call
+            result=call(args.root,args.tool,json.loads(args.arguments_json),sessions=args.live_sessions_dir,output=args.output)
+            _emit({"ok":not result.get("is_error",False),"result":result})
+            return 2 if result.get("is_error",False) else 0
+        elif args.command == "preview":
+            from agent_preview import preview
+            result=preview(store,args.path,args.output_path,width=args.width,height=args.height,heading=args.heading,dark=args.dark,snapshot_value=args.snapshot)
         elif args.command == "assets":
             result = store.assets(args.path, offset=args.offset, limit=args.limit)
         elif args.command == "attach":

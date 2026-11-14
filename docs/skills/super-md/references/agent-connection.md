@@ -214,3 +214,9 @@ reference, just like MCP attachment. `attach` and `replace-asset` require an
 active, saved portable SMD and a source image in the note folder or a configured
 note folder. Replacement keeps the original reference's MIME/extension; local
 input images are limited to 25 MB. Use the current revision after saving.
+
+## Headless authoring and the background service
+
+The installed executable includes `agent install-skill`, `agent service start|status|stop`, root-restricted offline authoring, and `agent --root ROOT preview NOTE OUTPUT.png --heading TITLE --dark`. Preview uses the actual offline reader without a desktop window, never runs Python/fetches remote images, and creates a new PNG. Use the render–inspect–repair loop on those pixels. Do not substitute a guessed HTML clone for the application's renderer.
+
+For exact MCP/CLI parity, `agent --root ROOT call TOOL --arguments-json JSON` invokes the same named MCP tool. Supply `--output NEW.png` for image results. Offline `document_view` can preview saved notes; live/background tool actions use `--live-sessions-dir PRIVATE_DIR` and preserve unsaved buffers. The background tray offers Open, Recent notes and Quit; Quit waits for note flushes. Starting agent service mode is an explicit local agent-access opt-in. Do not enable public networking or print discovery credentials. The repository README contains installation and stdio MCP configuration commands.

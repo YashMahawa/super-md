@@ -1306,6 +1306,11 @@ class Studio(QObject):
             except Exception as failure:return None,failure
         self._submit(check,lambda result,error:done(*(result or (None,error))),False)
 
+    @Property(bool,notify=changed)
+    def backgroundEnabled(self):
+        service=getattr(self.session,"background",None)
+        return bool(service and service.enabled and not service.quitting)
+
     @Property(str,notify=changed)
     def pythonStatus(self): return self.python_status
 
@@ -2948,6 +2953,9 @@ class Studio(QObject):
             return
         if self._agent_viewport_revision(tab_id) != revision:
             raise ValueError("The live tab changed before its viewport was captured")
+        if self.host_window is not None and not self.host_window.isVisible():
+            self._capture_background_preview(request_id,tab_id,revision,context,args)
+            return
         bounds = context.get("viewport")
         if not isinstance(bounds, dict):
             raise ValueError("Reader viewport bounds are unavailable")
@@ -2982,6 +2990,25 @@ class Studio(QObject):
         # Some software Qt backends do not emit frameSwapped for an unchanged
         # exposed window. Try a bounded capture after 200 ms in that case.
         QTimer.singleShot(200, lambda rid=request_id: self._agent_viewport_fallback(rid))
+
+    def _capture_background_preview(self, request_id, tab_id, revision, context, args):
+        from offline_view import render_live_snapshot
+        tab=next(t for t in self.tabs if t["id"]==tab_id)
+        content,assets,path=tab["content"],copy.deepcopy(tab.get("assets",{})),tab.get("path","")
+        width=max(320,min(1600,int(args.get("width",1200))))
+        heading=context.get("reading",{}).get("heading") or None
+        view={"dark":self._dark(),"colors":self._colors(),"font":self.settings["font"],"size":self.settings["size"],"svgAppearance":self.settings["svgAppearance"],"lineHeight":self.settings["lineHeight"]}
+        def done(body,error):
+            bridge=getattr(self.session,"agent_bridge",None)
+            if bridge is None:return
+            if error:bridge.complete(request_id,None,str(error),window_id=self.window_id);return
+            if self._agent_viewport_revision(tab_id)!=revision:
+                bridge.complete(request_id,None,"The note changed during background preview; retry",window_id=self.window_id);return
+            image=QImage.fromData(body,"PNG")
+            mime="image/jpeg" if args.get("imageFormat")=="jpeg" else "image/png"
+            encoded=QByteArray();buffer=QBuffer(encoded);buffer.open(QIODevice.WriteOnly);image.save(buffer,"JPEG" if mime=="image/jpeg" else "PNG")
+            bridge.complete(request_id,{"tabId":tab_id,"revision":revision,"mime_type":mime,"data":base64.b64encode(bytes(encoded)).decode(),"width":image.width(),"height":image.height(),"context":context,"renderedFrom":"background-preview"},window_id=self.window_id)
+        self._submit(lambda:render_live_snapshot(content,assets,path,width=width,heading=heading,view=view),done,False)
 
     def _clear_agent_viewport_capture(self, pending):
         if self._agent_viewport_capture is not pending:
