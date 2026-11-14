@@ -12,7 +12,14 @@ pub fn render(source: &str, assets: &HashMap<String, Vec<u8>>) -> Result<String>
     if source.len() > 480_000 { bail!("Step cards exceed the export size limit"); }
     let deck: Deck = serde_json::from_str(source)?;
     if deck.title.trim().is_empty() || deck.title.len() > 480 || !(2..=40).contains(&deck.steps.len()) { bail!("Invalid step cards title or number of steps"); }
-    let count = if deck.steps.iter().any(|s| s.markdown.is_some()) { 1 } else if deck.steps.len() > 3 { 2 } else { deck.steps.len() };
+    let wide = deck.steps.iter().filter_map(|s| s.image.as_ref()).filter_map(|name| assets.get(name)).any(|bytes| {
+        if let Ok(svg) = std::str::from_utf8(bytes) { if let Ok(doc) = roxmltree::Document::parse(svg) {
+            let view: Vec<f64> = doc.root_element().attribute("viewBox").unwrap_or("").split(|c: char| c.is_whitespace() || c == ',').filter_map(|v| v.parse().ok()).collect();
+            if view.len()==4 && view[3]>0. { return view[2]/view[3]>1.8; }
+        }}
+        imagesize::blob_size(bytes).is_ok_and(|size| size.width as f64 / size.height.max(1) as f64 > 1.8)
+    });
+    let count = if wide || deck.steps.iter().any(|s| s.markdown.is_some()) { 1 } else if deck.steps.len() > 3 { 2 } else { deck.steps.len() };
     let columns = "1fr,".repeat(count);
     let mut out = format!("\n#block(above: .7em, below: 4pt, sticky: true)[#strong[{}]]\n", text(&deck.title));
     for row in deck.steps.chunks(count) {
@@ -49,7 +56,7 @@ mod tests {
     use super::*;
     use crate::{export, image_sources, source, PdfOptions};
     fn fixture(count: usize) -> (String, HashMap<String, Vec<u8>>) {
-        let svg = br##"<svg xmlns="http://www.w3.org/2000/svg" width="320" height="150"><rect x="4" y="4" width="312" height="142" rx="8" fill="#e8f0ff"/><path d="M25 115L125 45L290 100" stroke="#2463b3" stroke-width="4" fill="none"/></svg>"##.to_vec();
+        let svg = br##"<svg xmlns="http://www.w3.org/2000/svg" width="320" height="210"><rect x="4" y="4" width="312" height="142" rx="8" fill="#e8f0ff"/><path d="M25 115L125 45L290 100" stroke="#2463b3" stroke-width="4" fill="none"/></svg>"##.to_vec();
         let steps: Vec<_> = (1..=count).map(|i| serde_json::json!({"label":format!("FRAME-{i:02}"),"image":"frame.svg","description":format!("CAPTION-{i:02}")})).collect();
         (format!("# Before\n\n```smd-steps\n{}\n```\n\nEND-SEQUENCE",serde_json::json!({"title":"All stages", "steps":steps})), HashMap::from([("frame.svg".into(),svg)]))
     }
