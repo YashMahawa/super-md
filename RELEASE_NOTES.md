@@ -1,4 +1,4 @@
-# Super MD 0.6.33
+# Super MD 0.6.34
 
 ## Slides that use the available space
 
@@ -10,6 +10,7 @@
 
 - Opening a slider image or diagram opens the complete slide, including its Markdown/LaTeX and next/previous controls. Left/Right navigates slides; Escape closes the viewer while preserving the selected step.
 - The visual has its own zoom/pan pane. Pinch, wheel and keyboard zoom clip at its boundary, leaving the separate text panel readable and independently scrollable. Fit restores the image; moving to another slide resets its zoom.
+- Mixed image/tree/diagram decks hide inactive visual panes completely when advancing in the enlarged viewer.
 - Portrait layouts stack the panels, keep navigation fixed, and use the available viewport. Switching frames no longer crossfades overlapping diagram states.
 
 Validated responsive layouts, enlarged-slide navigation, text scrolling, zoom/pan clipping, image-viewer cleanup and image copy/export with browser tests.
