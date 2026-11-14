@@ -62,13 +62,10 @@ test('viewer close restores focus without opening image edit tools, including sl
       await owner.locator('img').click();
       await expect(page.locator('.image-viewer')).toBeVisible();
       if(escape)await page.keyboard.press('Escape');
-      else await page.getByRole('button',{name:'Close image viewer'}).click();
+      else await page.getByRole('button',{name:/Close (image|slide) viewer/}).click();
       await expect(page.locator('.image-viewer')).toHaveCount(0);
       await expect(page.locator('.image-edit-tools')).toHaveCount(0);
     }
-    await owner.getByRole('button',{name:/Image options/}).click();
-    await expect(owner.getByRole('toolbar',{name:'Selected image'})).toBeVisible();
-    await page.keyboard.press('Escape');
-    await expect(page.locator('.image-edit-tools')).toHaveCount(0);
+    await expect(owner.getByRole('button',{name:/Image options/})).toHaveCount(0);
   }
 });

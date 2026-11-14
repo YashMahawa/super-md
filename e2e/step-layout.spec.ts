@@ -23,7 +23,7 @@ for(const width of [1200,900,412])test(`compact rich step layout ${width}`,async
  }
  const long={title:'Long explanation',steps:[{label:'One',markdown:Array.from({length:50},(_,i)=>`Paragraph ${i}: a necessary explanation.`).join('\n\n')},{label:'Two',markdown:'Short ending.'}]};
  await page.evaluate(content=>window.supermdLoad?.({id:'scrolling',content,path:null,mode:'reader',dark:false,colors:{},font:'Manrope',size:16,zoom:100}),'```smd-steps\n'+JSON.stringify(long)+'\n```');
- const layout=page.locator('.step-cards-layout');
+ const layout=page.locator('.step-cards-notes');
  await expect.poll(()=>layout.evaluate(el=>el.scrollHeight>el.clientHeight)).toBe(true);
  const before=(await page.locator('.step-cards-controls').boundingBox())!;
  await layout.evaluate(el=>el.scrollTop=el.scrollHeight);
