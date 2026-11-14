@@ -30,7 +30,7 @@ fn explicit_table_alignments_survive_the_real_pdf_typesetter() {
 fn headings_and_lists_keep_breathing_room_in_typeset_output() {
     let markdown="# Topic\n\nShort intro.\n\n- First item\n- Second item\n\n## Detail\n\nAnother paragraph.";
     let generated=source(markdown,&PdfOptions::default(),&HashMap::new()).unwrap();
-    assert!(generated.contains("#show heading: set block(above: .85em, below: .35em)"));
+    assert!(generated.contains("#show heading: set block(above: 1.6em, below: .85em)"));
     assert!(generated.contains("#set list(spacing: .42em, indent: 1.25em, body-indent: .38em)"));
     assert!(generated.contains("#set enum(spacing: .42em, indent: 1.25em, body-indent: .38em)"));
     assert!(export(markdown,&PdfOptions::default(),&HashMap::new()).unwrap().starts_with(b"%PDF-"));

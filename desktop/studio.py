@@ -26,7 +26,7 @@ import uuid
 from pathlib import Path
 from network_tls import client_context
 from PySide6.QtCore import QObject, Property, Signal, Slot, QStandardPaths, QTimer, QUrl, QFileSystemWatcher, QProcess, Qt, QPointF, QRect, QMetaObject, QBuffer, QByteArray, QIODevice
-from PySide6.QtGui import QDesktopServices, QFontDatabase, QGuiApplication, QCursor
+from PySide6.QtGui import QDesktopServices, QFontDatabase, QGuiApplication, QCursor, QImage
 from documents import atomic_write, atomic_json, bundle, image_data, materialize_assets, open_note, write_portable, MIMES, MAX_IMAGE
 from markdown_export import write_markdown_export, write_markdown_zip
 from theme import detect_system_dark, read_system_palette, system_palette_paths, tokens
@@ -1305,6 +1305,11 @@ class Studio(QObject):
                 return updates.release_info(updates.bounded_json(updates.API),self.appVersion,linux_kind=linux_kind),None
             except Exception as failure:return None,failure
         self._submit(check,lambda result,error:done(*(result or (None,error))),False)
+
+    @Property(bool,notify=changed)
+    def backgroundEnabled(self):
+        service=getattr(self.session,"background",None)
+        return bool(service and service.enabled and not service.quitting)
 
     @Property(str,notify=changed)
     def pythonStatus(self): return self.python_status
@@ -2948,6 +2953,9 @@ class Studio(QObject):
             return
         if self._agent_viewport_revision(tab_id) != revision:
             raise ValueError("The live tab changed before its viewport was captured")
+        if self.host_window is not None and not self.host_window.isVisible():
+            self._capture_background_preview(request_id,tab_id,revision,context,args)
+            return
         bounds = context.get("viewport")
         if not isinstance(bounds, dict):
             raise ValueError("Reader viewport bounds are unavailable")
@@ -2982,6 +2990,25 @@ class Studio(QObject):
         # Some software Qt backends do not emit frameSwapped for an unchanged
         # exposed window. Try a bounded capture after 200 ms in that case.
         QTimer.singleShot(200, lambda rid=request_id: self._agent_viewport_fallback(rid))
+
+    def _capture_background_preview(self, request_id, tab_id, revision, context, args):
+        from offline_view import render_live_snapshot
+        tab=next(t for t in self.tabs if t["id"]==tab_id)
+        content,assets,path=tab["content"],copy.deepcopy(tab.get("assets",{})),tab.get("path","")
+        width=max(320,min(1600,int(args.get("width",1200))))
+        heading=context.get("reading",{}).get("heading") or None
+        view={"dark":self._dark(),"colors":self._colors(),"font":self.settings["font"],"size":self.settings["size"],"svgAppearance":self.settings["svgAppearance"],"lineHeight":self.settings["lineHeight"]}
+        def done(body,error):
+            bridge=getattr(self.session,"agent_bridge",None)
+            if bridge is None:return
+            if error:bridge.complete(request_id,None,str(error),window_id=self.window_id);return
+            if self._agent_viewport_revision(tab_id)!=revision:
+                bridge.complete(request_id,None,"The note changed during background preview; retry",window_id=self.window_id);return
+            image=QImage.fromData(body,"PNG")
+            mime="image/jpeg" if args.get("imageFormat")=="jpeg" else "image/png"
+            encoded=QByteArray();buffer=QBuffer(encoded);buffer.open(QIODevice.WriteOnly);image.save(buffer,"JPEG" if mime=="image/jpeg" else "PNG")
+            bridge.complete(request_id,{"tabId":tab_id,"revision":revision,"mime_type":mime,"data":base64.b64encode(bytes(encoded)).decode(),"width":image.width(),"height":image.height(),"context":context,"renderedFrom":"background-preview"},window_id=self.window_id)
+        self._submit(lambda:render_live_snapshot(content,assets,path,width=width,heading=heading,view=view),done,False)
 
     def _clear_agent_viewport_capture(self, pending):
         if self._agent_viewport_capture is not pending:
@@ -3118,6 +3145,23 @@ class Studio(QObject):
                 if self.fullscreen: self.chromeRequested.emit(action)
                 self.replied.emit(id,"true",""); return
             if command == "reader_overlay_changed": self.reader_overlay = bool(args.get("open")); self.image_overlay = bool(args.get("image")); self._emit(False); self.replied.emit(id,"true",""); return
+            if command == "copy_image_native":
+                body = args.get("body")
+                if args.get("mimeType") != "image/png" or not isinstance(body, str) or len(body) > 34_000_000:
+                    raise ValueError("Clipboard image must be a PNG under 25 MB")
+                try:
+                    data = base64.b64decode(body, validate=True)
+                except (ValueError, base64.binascii.Error):
+                    raise ValueError("Clipboard image is not valid base64") from None
+                if not data.startswith(b"\x89PNG\r\n\x1a\n") or len(data) < 24 or len(data) > 25_000_000:
+                    raise ValueError("Clipboard image is not a valid PNG")
+                width, height = int.from_bytes(data[16:20], "big"), int.from_bytes(data[20:24], "big")
+                if not 0 < width <= 4096 or not 0 < height <= 4096 or width * height > 16_000_000:
+                    raise ValueError("Clipboard image dimensions exceed the limit")
+                image = QImage.fromData(data, "PNG")
+                if image.isNull(): raise ValueError("Clipboard PNG could not be decoded")
+                QGuiApplication.clipboard().setImage(image)
+                self.replied.emit(id, "true", ""); return
             if command == "copy_text":
                 text=args.get("text")
                 if not isinstance(text,str) or len(text)>2_000_000:raise ValueError("Clipboard text is too large or invalid")

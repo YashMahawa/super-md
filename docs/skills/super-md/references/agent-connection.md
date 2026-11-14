@@ -71,6 +71,12 @@ page `document_action(documentAction="outline", tabId,
 options:{offset:0,limit:80})`; each page contains up to 80 headings with their
 `sectionStart`/`sectionEnd` bounds, plus `nextOffset` and `documentLength` metadata.
 
+## Retrieve a slider frame directly
+
+In builds with slider-frame indexing, `list_diagrams`/cloud `diagram_action(diagramAction="list")` includes each visual frame, with `deckTitle`, `stepLabel`, zero-based `stepIndex`, `stepCount`, readable `preview` and `assetReference` when backed by an image. List bounded metadata once, select the process/step by these fields, then request `get_diagram_image`/cloud `diagram_action(diagramAction="image")` using that frame's ID and current revision. This does not advance the slider or require opening every frame. Text-only steps are not diagrams. Standalone declarative trees and diagrams are indexed too.
+
+For the live CLI, use `super-md agent live --sessions-dir PRIVATE_DIR diagrams TAB --limit 80`; select the returned frame ID, then `super-md agent live --sessions-dir PRIVATE_DIR diagram-image TAB FRAME_ID OUTPUT.png --revision REV --width 1600`. Use the existing private discovery directory from setup; never print its credentials. Follow `nextOffset` for long listings. For original SVG instead of raster previews, use the listed `assetReference` with asset source/extract; read declarative frame source using `diagram TAB FRAME_ID --revision REV`. IDs are revision-relative: refresh after edits. On older installations that omit slider frames, inspect only the relevant `smd-steps` block and extract its exact image asset, rather than reading the entire note or repeatedly rendering the viewport.
+
 ## Export a whole note or section
 
 For a full document or one selected heading section, export Markdown, portable
@@ -208,3 +214,9 @@ reference, just like MCP attachment. `attach` and `replace-asset` require an
 active, saved portable SMD and a source image in the note folder or a configured
 note folder. Replacement keeps the original reference's MIME/extension; local
 input images are limited to 25 MB. Use the current revision after saving.
+
+## Headless authoring and the background service
+
+The installed executable includes `agent install-skill`, `agent service start|status|stop`, root-restricted offline authoring, and `agent --root ROOT preview NOTE OUTPUT.png --heading TITLE --dark`. Preview uses the actual offline reader without a desktop window, never runs Python/fetches remote images, and creates a new PNG. Use the render–inspect–repair loop on those pixels. Do not substitute a guessed HTML clone for the application's renderer.
+
+For exact MCP/CLI parity, `agent --root ROOT call TOOL --arguments-json JSON` invokes the same named MCP tool. Supply `--output NEW.png` for image results. Offline `document_view` can preview saved notes; live/background tool actions use `--live-sessions-dir PRIVATE_DIR` and preserve unsaved buffers. The background tray offers Open, Recent notes and Quit; Quit waits for note flushes. Starting agent service mode is an explicit local agent-access opt-in. Do not enable public networking or print discovery credentials. The repository README contains installation and stdio MCP configuration commands.

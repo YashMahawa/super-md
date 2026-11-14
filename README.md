@@ -276,3 +276,59 @@ View and change desktop bindings in Settings → Keyboard shortcuts.
 ## License
 
 Super MD's original code is available under the [MIT License](LICENSE). Bundled libraries, fonts, and icons retain their own licenses and notices. See [desktop distribution notices](desktop/NOTICE.md) and [third-party UI licenses](public/third-party-ui-licenses.txt).
+
+## AI agents: CLI, MCP and authoring skill
+
+The desktop installation includes the CLI and MCP server; a separate Python install is unnecessary. Linux uses `super-md` (or `./Super-MD_VERSION_amd64.AppImage`), Windows uses `super-md-cli.exe` in the installation directory, and macOS uses `/Applications/Super MD.app/Contents/MacOS/super-md`.
+
+Install or update the Linux x86-64 executable in `~/.local/bin` with checksum verification and a backup of the previous binary:
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/YashMahawa/super-md/main/scripts/install-cli.py | python3
+```
+
+Ensure `~/.local/bin` is on PATH. The installer supports `--dry-run` and `--prefix` when downloaded and run as a script. For Windows and macOS, use the [published platform installer](https://github.com/YashMahawa/super-md/releases/latest); the CLI and MCP runtime are included.
+
+Install the complete bundled study-note skill:
+
+```sh
+super-md agent install-skill
+```
+
+The default destination is `~/.codex/skills/super-md` (or `$CODEX_HOME/skills/super-md`). Use `--destination PATH` for another agent's skill directory. `--replace` backs up an existing skill and preserves its local preferences. The package includes its reference guides and SVG example.
+
+Create and inspect notes without opening the application:
+
+```sh
+mkdir -p ./course
+super-md agent --root ./course create notes.smd --content-file ./course/draft.md
+super-md agent --root ./course preview notes.smd preview.png --width 1200 --height 900
+```
+
+`preview` uses the real offline Super MD reader, supports `--heading "Section title"` and `--dark`, and creates a new PNG. It never changes the note, executes Python, or fetches remote images.
+
+Start the background service and use the same tools as MCP:
+
+```sh
+super-md agent service start
+super-md agent service status
+super-md agent --root ./course call document_read --arguments-json '{"path":"notes.smd","limit":3000}'
+super-md agent --root ./course call document_view --arguments-json '{"path":"notes.smd","width":1200}' --output ./course/preview.png
+super-md agent service stop
+```
+
+`call TOOL` invokes the identical named MCP tool with its JSON arguments. Add `--live-sessions-dir PRIVATE_DIR` before `call` for live/background tabs. Image results go to `--output`, not base64 in the terminal. Existing bounded read/search/patch/assets/export and `agent live` commands remain available. Background mode retains live work after windows close; its tray menu offers Open, Recent notes and Quit. Quit waits for note flushes. On systems without a tray, use `service stop`.
+
+For Codex, register the bundled stdio server (use an absolute executable path if it is not on PATH):
+
+```sh
+codex mcp add super-md -- super-md agent mcp --root /absolute/path/to/course --transport stdio
+```
+
+For clients using JSON MCP configuration, use the installed executable and explicit note roots:
+
+```json
+{"mcpServers":{"super-md":{"command":"super-md","args":["agent","mcp","--root","/absolute/path/to/course","--transport","stdio"]}}}
+```
+
+For live/background sessions, `service start` reports the private sessions directory. Add `"--live-sessions-dir", "/returned/private/directory"` to the argument list. The local service is not a public network endpoint. See [the full agent interface](docs/AGENT-INTERFACE.md) and [skill installation guide](docs/skills/INSTALL.md).

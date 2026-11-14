@@ -1,4 +1,4 @@
-# Super MD 0.6.31
+# Super MD 0.6.32
 
 ## Compact, responsive step cards
 
@@ -22,3 +22,11 @@
 The complete study-note skill now documents contrast, theme adaptation, large labels and substantial action arrows. Standalone agent setup exports preserve their installable skill header and full connection instructions.
 
 Markdown ZIP exports now expand slider states into consecutive static figures with their text and formulas, convert custom diagrams/charts and SVG blocks to linked SVG assets, and retain Obsidian callouts, math, Mermaid and ordinary code. Export never executes Python or changes the source note. Invalid unsupported blocks report a conversion error instead of silently losing content.
+
+Diagram context menus now offer Copy image, using a real PNG clipboard payload on desktop and a shared PNG URI on Android. This includes authored SVGs, images, declarative trees/diagrams and slider frames. Agent diagram listings now include individual slider frames with process title, step label, step index/count and direct asset references; retrieve any frame by its revision-guarded diagram ID without changing slider position.
+
+Sequential agent requests can immediately follow a completed response. PDF callout titles stay with their first body paragraph instead of being stranded at the bottom of a page.
+
+PDF paragraph-spacing controls now produce the requested visible gap instead of being collapsed against line leading. Lecture/section headings have a clearer size hierarchy and space around tables is restored, while keeping print layout more compact than the reading view.
+
+The installed CLI now installs the complete skill, invokes the same named MCP tools, renders real offline-reader PNG previews, and starts/stops the background service. MCP can preview saved notes without an open application window. Background previews preserve unsaved buffers. The tray offers Open, Recent notes and safe Quit; local agent access remains explicit through service mode or settings. GitHub documents installation and configuration commands.

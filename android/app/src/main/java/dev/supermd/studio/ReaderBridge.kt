@@ -88,6 +88,22 @@ internal class ReaderBridge(
                     "reading_position" -> {model.readingPosition(args.getString("id"),args.getJSONObject("location"));true}
                     "zoom_changed" -> { model.readerZoom(args.getDouble("zoom").toFloat(), args.optBoolean("fullscreen", model.state.value.fullscreen)); true }
                     "reader_overlay_changed" -> { model.overlay(args.optBoolean("open"), args.optBoolean("image")); true }
+                    "copy_image_native" -> {
+                        val uri = withContext(Dispatchers.IO) {
+                            val body = args.opt("body") as? String ?: error("Clipboard image is invalid")
+                            require(args.optString("mimeType") == "image/png" && body.length <= 34_000_000) { "Clipboard image must be a PNG under 25 MB" }
+                            val bytes = android.util.Base64.decode(body, android.util.Base64.DEFAULT)
+                            require(bytes.size in 24..25_000_000 && bytes.take(8).toByteArray().contentEquals(byteArrayOf(-119,80,78,71,13,10,26,10))) { "Clipboard image is not a valid PNG" }
+                            val bounds = android.graphics.BitmapFactory.Options().apply { inJustDecodeBounds = true }
+                            android.graphics.BitmapFactory.decodeByteArray(bytes, 0, bytes.size, bounds)
+                            require(bounds.outWidth in 1..4096 && bounds.outHeight in 1..4096 && bounds.outWidth.toLong()*bounds.outHeight <= 16_000_000L) { "Clipboard image dimensions exceed the limit" }
+                            val folder = java.io.File(web.context.cacheDir, "share/clipboard-${UUID.randomUUID()}").apply { mkdirs() }
+                            val file = java.io.File(folder, "Diagram.png").apply { writeBytes(bytes) }
+                            androidx.core.content.FileProvider.getUriForFile(web.context, "${web.context.packageName}.share", file)
+                        }
+                        web.context.getSystemService(android.content.ClipboardManager::class.java).setPrimaryClip(android.content.ClipData.newUri(web.context.contentResolver, "Super MD diagram", uri))
+                        true
+                    }
                     "copy_text" -> {
                         val text=args.opt("text") as? String ?: error("Clipboard text is invalid")
                         require(text.length<=2_000_000) {"Clipboard text is too large"}

@@ -226,7 +226,11 @@ ApplicationWindow {
 
     Connections {
         target: studio
-        function onAllowClose() { flushDialog.close(); closeDialog.close(); intentionalShutdown = true; closingAllowed = true; window.close() }
+        function onAllowClose() {
+            flushDialog.close(); closeDialog.close()
+            if (studio.backgroundEnabled) { window.hide(); return }
+            intentionalShutdown = true; closingAllowed = true; window.close()
+        }
         function onFlushFailed(canClose) { if(!closingAllowed && !closeDialog.visible) { flushDialog.canClose = canClose; flushDialog.open() } }
         function onCloseRequested(name) { flushDialog.close(); closeDialog.title = "Save changes to " + name + "?"; if(!closeDialog.visible) closeDialog.open() }
         function onSaveRequested(name) { saveDialog.selectedFile = studio.defaultSaveLocation(name); saveDialog.open() }

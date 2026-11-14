@@ -243,7 +243,7 @@ impl<'a> Renderer<'a> {
                                 let body = self.render(Some(TagEnd::Paragraph))? + "\n\n" + &self.render(Some(close))?;
                                 let accent = match kind.as_str() { "tip" | "hint" | "success" | "check" | "done" => "#14735b", "warning" | "caution" => "#946200", "danger" | "error" | "failure" | "fail" | "missing" => "#b3261e", _ => "#315d99" };
                                 let icon = match kind.as_str() {"tip"|"hint"=>"tip","warning"|"caution"=>"warning","danger"|"error"=>"error","success"|"check"|"done"=>"success","question"|"faq"=>"question","answer"|"solution"=>"answer","example"=>"example","quote"|"cite"=>"quote",_=>"info"};
-                                (format!("#text(weight: \"bold\", fill: rgb(\"{accent}\"))[#box(image(\"__smd_icon_{icon}.svg\", width: 11pt)) #h(4pt) {}]\n\n{body}", text(&title)), accent)
+                                (format!("#block(sticky: true, below: 6pt)[#text(weight: \"bold\", fill: rgb(\"{accent}\"))[#box(image(\"__smd_icon_{icon}.svg\", width: 11pt)) #h(4pt) {}]]\n\n{body}", text(&title)), accent)
                             } else { (self.render(Some(close))?, "#315d99") };
                             out.push_str(&format!("\n#block(width: 100%, breakable: true, fill: if smd-themed {{ smd-callout-fill }} else {{ color.mix((white, 94%), (rgb(\"{accent}\"), 6%)) }}, stroke: (left: 2pt + rgb(\"{accent}\")), inset: 10pt, radius: 4pt)[{body}]\n\n"));
                         },
@@ -319,7 +319,9 @@ pub fn source(markdown: &str, options: &PdfOptions, assets: &HashMap<String, Vec
 #let smd-line = if smd-themed {{ color.mix((white, 55%), (smd-accent, 45%)) }} else {{ rgb("#d6d6d6") }}
 #let smd-link = if smd-themed {{ color.mix((rgb("#202020"), 45%), (smd-accent, 55%)) }} else {{ rgb("#315d99") }}
 "##, string(accent));
-    Ok(format!("#import \"/mitex/standard.typ\": scope as mitex-scope\n#let smd-math-scope = mitex-scope + (sect: sym.inter,)\n{palette}#set page(paper: {}, margin: {}mm, fill: smd-paper)\n#set text(font: ({}, \"Libertinus Serif\", \"New Computer Modern\"), size: {}pt)\n#set par(leading: {}em, spacing: {}em)\n{template}\n{body}", string(paper), options.margin, string(&options.font_family), options.font_size, options.line_height - 0.7, options.paragraph_spacing))
+    // Typst collapses paragraph spacing against leading. Add leading so the
+    // export control specifies the visible gap instead of disappearing below it.
+    Ok(format!("#import \"/mitex/standard.typ\": scope as mitex-scope\n#let smd-math-scope = mitex-scope + (sect: sym.inter,)\n{palette}#set page(paper: {}, margin: {}mm, fill: smd-paper)\n#set text(font: ({}, \"Libertinus Serif\", \"New Computer Modern\"), size: {}pt)\n#set par(leading: {}em, spacing: {}em)\n{template}\n{body}", string(paper), options.margin, string(&options.font_family), options.font_size, options.line_height - 0.7, options.line_height - 0.7 + options.paragraph_spacing))
 }
 
 pub fn export(markdown: &str, options: &PdfOptions, assets: &HashMap<String, Vec<u8>>) -> Result<Vec<u8>> {
@@ -433,7 +435,7 @@ mod tests {
         let options=PdfOptions{font_size:6.,line_height:1.45,paragraph_spacing:1.2,..PdfOptions::default()};
         let md="# Compact\n\nFirst paragraph.\n\nSecond paragraph with $x^2$.";
         let text=source(md,&options,&HashMap::new()).unwrap();
-        assert!(text.contains("spacing: 1.2em"));
+        assert!(text.contains("spacing: 1.95em"));
         assert!(export(md,&options,&HashMap::new()).unwrap().starts_with(b"%PDF-"));
         let invalid=PdfOptions{paragraph_spacing:f32::NAN,..options};assert!(invalid.validate().is_err());
     }
