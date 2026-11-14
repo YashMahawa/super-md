@@ -1,7 +1,7 @@
 #set heading(numbering: none)
 #set text(fill: rgb("#202020"))
 #show heading: set text(weight: "bold")
-#show heading: set block(above: 1.05em, below: .42em)
+#show heading: set block(above: .85em, below: .35em)
 #set list(spacing: .42em, indent: 1.25em, body-indent: .38em)
 #set enum(spacing: .42em, indent: 1.25em, body-indent: .38em)
 // Allow long cell labels to wrap when generated fractional columns are narrow.
@@ -26,6 +26,6 @@
 // Compact export-only sequence cells: no card chrome or fixed empty stage.
 #let smd-step-image(path) = layout(size => {
   let bounds = measure(image(path))
-  let width = calc.min(size.width, 60mm * (bounds.width / bounds.height))
+  let width = calc.min(size.width, 90mm * (bounds.width / bounds.height))
   align(center, image(path, width: width))
 })

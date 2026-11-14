@@ -107,14 +107,15 @@ export async function prepareFmd(markdown: string, documentPath: string | null) 
     if (!opening) return;
     const payloadStart = node.position.start.offset + opening[0].length;
     const payloadEnd = payloadStart + node.value.length;
-    let deck: { steps?: Array<{ image?: unknown }> };
+    let deck: { steps?: Array<{ image?: unknown; markdown?: unknown }> };
     try { deck = JSON.parse(node.value); } catch { return; }
     if (!Array.isArray(deck.steps)) return;
     const stepSources = new Set(deck.steps.map(step => step?.image).filter((image): image is string => typeof image === "string" && image.length > 0));
-    if (!stepSources.size) return;
+    if (!stepSources.size && !deck.steps.some(step=>typeof step.markdown==="string")) return;
     const rewritten = new Map<string, string>();
     const offset = work.length;
     for (const source of stepSources) collect(source, name => { rewritten.set(source, name); });
+    for(const step of deck.steps) if(typeof step.markdown==='string') work.push(prepareFmd(step.markdown,documentPath).then(prepared=>{step.markdown=prepared.content;Object.assign(assets,prepared.assets);}));
     // All corresponding assets must finish loading before serializing this deck.
     const waiting = work.splice(offset);
     work.push(Promise.all(waiting).then(() => {

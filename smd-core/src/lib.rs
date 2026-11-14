@@ -26,7 +26,7 @@ pub struct PdfOptions {
 }
 impl Default for PdfOptions {
     fn default() -> Self {
-        Self { page_size: "a4".into(), margin: 18., font_size: 10.5, line_height: 1.55, paragraph_spacing: 1.35, font_family: "Libertinus Serif".into(), page_numbers: true, themed: false, theme_accent: "#386a57".into() }
+        Self { page_size: "a4".into(), margin: 14., font_size: 10.5, line_height: 1.4, paragraph_spacing: 0.65, font_family: "Manrope".into(), page_numbers: true, themed: false, theme_accent: "#386a57".into() }
     }
 }
 impl PdfOptions {
@@ -59,6 +59,8 @@ pub fn image_sources(markdown: &str) -> Vec<String> {
                 if let Ok(deck) = serde_json::from_str::<serde_json::Value>(&code) {
                     if let Some(steps) = deck.get("steps").and_then(|v| v.as_array()) {
                         sources.extend(steps.iter().filter_map(|step| step.get("image").and_then(|v| v.as_str()).map(str::to_owned)));
+                        for step in steps { if let Some(body) = step.get("markdown").and_then(|v| v.as_str()) { sources.extend(image_sources(body)); } }
+
                     }
                 }
             },
@@ -241,7 +243,7 @@ impl<'a> Renderer<'a> {
                                 let body = self.render(Some(TagEnd::Paragraph))? + "\n\n" + &self.render(Some(close))?;
                                 let accent = match kind.as_str() { "tip" | "hint" | "success" | "check" | "done" => "#14735b", "warning" | "caution" => "#946200", "danger" | "error" | "failure" | "fail" | "missing" => "#b3261e", _ => "#315d99" };
                                 let icon = match kind.as_str() {"tip"|"hint"=>"tip","warning"|"caution"=>"warning","danger"|"error"=>"error","success"|"check"|"done"=>"success","question"|"faq"=>"question","answer"|"solution"=>"answer","example"=>"example","quote"|"cite"=>"quote",_=>"info"};
-                                (format!("#text(weight: \"bold\", fill: rgb(\"{accent}\"))[#image(\"__smd_icon_{icon}.svg\", width: 11pt) #h(4pt) {}]\n\n{body}", text(&title)), accent)
+                                (format!("#text(weight: \"bold\", fill: rgb(\"{accent}\"))[#box(image(\"__smd_icon_{icon}.svg\", width: 11pt)) #h(4pt) {}]\n\n{body}", text(&title)), accent)
                             } else { (self.render(Some(close))?, "#315d99") };
                             out.push_str(&format!("\n#block(width: 100%, breakable: true, fill: if smd-themed {{ smd-callout-fill }} else {{ color.mix((white, 94%), (rgb(\"{accent}\"), 6%)) }}, stroke: (left: 2pt + rgb(\"{accent}\")), inset: 10pt, radius: 4pt)[{body}]\n\n"));
                         },
@@ -253,7 +255,7 @@ impl<'a> Renderer<'a> {
                             } else { None };
                             let body = self.render(Some(close))?;
                             match tag {
-                                Tag::Paragraph => out.push_str(&format!("{body}\n\n")),
+                                Tag::Paragraph => { if body.starts_with("#strong[") && body.ends_with(']') { out.push_str(&format!("#block(sticky: true, below: .35em)[{body}]\n\n")); } else { out.push_str(&format!("{body}\n\n")); } },
                                 Tag::Heading { level, .. } => out.push_str(&format!("\n#heading(level: {})[{body}] <smd-{}>\n\n", level as u8, heading.unwrap())),
                                 Tag::Emphasis => out.push_str(&format!("#emph[{body}]")),
                                 Tag::Strong => out.push_str(&format!("#strong[{body}]")),
@@ -274,6 +276,12 @@ impl<'a> Renderer<'a> {
         }
         Ok(out)
     }
+}
+
+pub(crate) fn render_fragment(markdown: &str, assets: &HashMap<String, Vec<u8>>) -> Result<String> {
+    let normalized = normalize_table_math(&normalize_callouts(markdown));
+    let events = Parser::new_ext(&normalized, Options::ENABLE_TABLES | Options::ENABLE_STRIKETHROUGH | Options::ENABLE_MATH).collect::<Vec<_>>();
+    Renderer { events: events.into_iter().peekable(), assets, footnotes: HashMap::new(), headings: HashMap::new(), heading_counts: HashMap::new() }.render(None)
 }
 
 pub fn source(markdown: &str, options: &PdfOptions, assets: &HashMap<String, Vec<u8>>) -> Result<String> {
@@ -552,7 +560,8 @@ P(A\cup B\cup C)=&P(A)+P(B)+P(C)\\
         if let Ok(output) = std::process::Command::new("pdftotext").arg("-bbox").arg(&path).arg("-").output() {
             for line in String::from_utf8_lossy(&output.stdout).lines().filter(|line| line.contains("<word ")) {
                 let x = line.split("xMax=\"").nth(1).unwrap().split('"').next().unwrap().parse::<f64>().unwrap();
-                assert!(x < 550., "Wide equation escaped the page: {line}");
+                let right_edge = (210. - PdfOptions::default().margin as f64) * 72. / 25.4;
+                assert!(x <= right_edge + 0.5, "Wide equation escaped the printable area: {line}");
             }
         }
     }

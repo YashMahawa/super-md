@@ -204,3 +204,11 @@ image references (including reference-style images). External hyperlinks remain
 links, not archived web pages. Unrun Python source is included; transient cell
 outputs are not part of FMD v1. Run trusted cells again after reopening to
 include their figures in PDF export.
+
+### Rich explanations in step cards
+
+A step may include a `markdown` string (up to 12,000 characters within the deck size limit) for formatted text, tables and LaTeX beside its visual. It may also be text-only. Standard Markdown and math syntax are rendered through the ordinary safe reader; scripts and HTML are not executed. The existing `description` field remains a plain-language legacy explanation, available on demand.
+
+Wide cards place rich explanations to the right; narrow portrait layouts stack them below. Image-only cards use a compact control strip, without repeated title banners or visible “Choose step” text. Left/Right arrows navigate while hovering or focusing the card, without intercepting text-editor cursor keys.
+
+PDF exports retain Markdown/LaTeX and use full-width visual/text pairs for rich steps. Longer image sequences use two columns for readable diagrams, while short sequences can use up to three. Export defaults use 14 mm margins, 1.4 line height and 0.65 em paragraph spacing; saved user settings are preserved.

@@ -715,3 +715,46 @@ button.code-copy:active { border-radius:10px; }
 .image-options { position:absolute; top:8px; right:8px; border-radius:999px; min-width:36px; min-height:36px; opacity:0; background:var(--surface-high); color:var(--text); box-shadow:0 2px 8px var(--shadow); }
 .note-image:hover > .image-options, .note-image:focus-within > .image-options { opacity:1; }
 @media(hover:none) { .image-options { opacity:1; } }
+
+/* Step sequences reserve space for the visual rather than stacked captions. */
+.markdown-body .step-cards { padding:12px; margin:1em 0; box-shadow:none; }
+.step-cards-layout { display:grid; grid-template-columns:minmax(0,1fr) minmax(220px,28%); gap:18px; align-items:center; }
+.step-cards-notes { min-width:0; }
+.step-cards-heading { font-size:.8em; gap:8px; align-items:flex-start; }
+.step-cards-step-title { text-align:left; margin:12px 0 8px; font-size:.92em; }
+.step-cards-stage { padding:0; gap:0; min-width:0; }
+.step-cards-description { text-align:left; margin:0 !important; max-width:none; white-space:normal; font-size:.92em; line-height:1.5; }
+.step-cards-description .markdown-body { font-size:inherit; padding:0; }
+.step-cards-description .markdown-body > :first-child { margin-top:0; }
+.step-cards-description .markdown-body > :last-child { margin-bottom:0; }
+.step-cards-description .katex-display { overflow-x:auto; margin:.55em 0; }
+.step-cards-controls { margin-top:8px; padding-top:8px; gap:10px; }
+.step-cards-figure-stack { height:clamp(240px,42vw,680px); }
+.step-cards-inline-figure { height:clamp(240px,42vw,620px); }
+@media(max-width:700px) {
+ .step-cards-layout { grid-template-columns:minmax(0,1fr); gap:10px; }
+ .step-cards-notes { display:flex; flex-direction:column; }
+ .step-cards-heading { font-size:.82em; }
+ .step-cards-step-title { margin:6px 0; }
+ .step-cards-description { font-size:.88em; }
+}
+
+.step-cards.is-visual-only .step-cards-layout { display:block; }
+.step-cards.is-visual-only .step-cards-notes { display:none; }
+.step-cards.is-visual-only { padding:4px 4px 0; }
+.step-cards-controls { flex-wrap:wrap; padding:4px 8px; margin-top:2px; min-height:36px; }
+.step-cards-arrow-text { display:none; }
+.step-cards-arrow { min-height:30px; min-width:30px; padding:0 6px; border:0; background:transparent; }
+.step-cards-compact-label { font-size:.72em; color:var(--muted); margin-right:auto; }
+.step-cards-compact-label small { margin-left:8px; font-variant-numeric:tabular-nums; }
+.step-cards-slider { height:26px; }
+.step-cards-legacy-note { font-size:.72em; }
+.step-cards-legacy-note > div { padding:8px; max-width:65ch; }
+.sr-only { position:absolute!important; width:1px!important; height:1px!important; padding:0!important; margin:-1px!important; overflow:hidden!important; clip:rect(0,0,0,0)!important; white-space:nowrap!important; border:0!important; }
+.android-reading .document-page .step-cards-description .markdown-body { width:100%; max-width:none; margin:0; padding:0; min-height:0; }
+/* Bound only overflowing content; short cards keep their natural compact size. */
+.markdown-body .step-cards { display:flex; flex-direction:column; max-height:calc(100dvh - 24px); }
+.step-cards-layout { min-height:0; max-height:min(72dvh,740px); overflow-y:auto; overscroll-behavior:contain; scrollbar-gutter:stable; }
+.step-cards-controls { flex:none; position:sticky; bottom:0; z-index:3; background:var(--surface); }
+.step-cards-notes { align-self:center; }
+@media(max-width:700px) { .step-cards-layout { max-height:68dvh; } }
