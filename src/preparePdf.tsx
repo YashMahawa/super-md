@@ -97,9 +97,18 @@ export async function preparePdf(markdown: string, documentPath: string | null, 
             visit(processor.parse(prepared.content), "image", (picture:any) => { if (!image) image = names.get(picture.url); });
             if (!image) throw new Error(`Step cannot export its diagram: ${step.label}`);
           }
-          steps.push({label:step.label, ...(image?{image}:{}), ...(step.description?{description:step.description}:{})});
+          let markdown: string|undefined;
+          if(step.markdown){
+            const prepared=await preparePdf(step.markdown,documentPath,python,{signal});checkCurrent();
+            markdown=prepared.content;
+            for(const [name,body] of Object.entries(prepared.assets)){
+              const renamed=`step-${++count}-${name}`;assets[renamed]=body;
+              markdown=markdown.replaceAll(name,renamed);
+            }
+          }
+          steps.push({label:step.label, ...(image?{image}:{}), ...(markdown?{markdown}:step.description?{description:step.description}:{})});
         }
-        node.lang = "smd-step-grid";
+        node.lang = "smd-step-grid"; delete node.meta;
         node.value = JSON.stringify({title:deck.title, steps});
       });
       return SKIP;

@@ -34,3 +34,12 @@ it("prepares declarative diagrams and charts as actual print SVGs",async()=>{
 it("reports malformed decks rather than printing their raw JSON",async()=>{
   await expect(preparePdf('```smd-steps\n{"steps":[]}\n```',null)).rejects.toThrow('Invalid step cards');
 });
+
+it("keeps step Markdown and LaTeX as formatted export content",async()=>{
+  const source='```smd-steps\n'+JSON.stringify({title:'Calculation',steps:[{label:'Mean',markdown:'**Result**\n\n$$x=3$$'},{label:'Interpretation',markdown:'- First item\n- Second item'}]})+'\n```';
+  const prepared=await preparePdf(source,null);
+  const grid=JSON.parse(/```smd-step-grid\n([\s\S]*?)\n```/.exec(prepared.content)![1]);
+  expect(grid.steps[0].markdown).toContain('**Result**');
+  expect(grid.steps[0].markdown).toContain('$$');
+  expect(grid.steps[1].markdown).toContain('First item');
+});

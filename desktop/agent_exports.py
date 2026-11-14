@@ -21,8 +21,8 @@ except ImportError:
     from agent_documents import AgentDocumentError, DocumentStore, RevisionConflict, _symlink_component
 
 DEFAULT_PDF_OPTIONS = {
-    "pageSize": "a4", "margin": 18, "fontSize": 10.5, "lineHeight": 1.55,
-    "paragraphSpacing": 1.35, "fontFamily": "Manrope", "pageNumbers": True,
+    "pageSize": "a4", "margin": 14, "fontSize": 10.5, "lineHeight": 1.4,
+    "paragraphSpacing": 0.65, "fontFamily": "Manrope", "pageNumbers": True,
     "themed": False, "themeAccent": "#386a57",
 }
 PAGE_SIZES = {"a3", "a4", "a5", "a6", "iso-b4", "iso-b5", "iso-b6", "letter", "legal", "tabloid", "executive"}
