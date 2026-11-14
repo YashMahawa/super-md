@@ -1,4 +1,4 @@
-# Super MD 0.6.28
+# Super MD 0.6.29
 
 ## Compact, responsive step cards
 
