@@ -13,7 +13,7 @@ pub fn render(source: &str, assets: &HashMap<String, Vec<u8>>) -> Result<String>
     let deck: Deck = serde_json::from_str(source)?;
     if deck.title.trim().is_empty() || deck.title.len() > 480 || !(2..=40).contains(&deck.steps.len()) { bail!("Invalid step cards title or number of steps"); }
     let wide = deck.steps.iter().filter_map(|s| s.image.as_ref()).filter_map(|name| assets.get(name)).any(|bytes| {
-        if let Ok(svg) = std::str::from_utf8(bytes) { if let Ok(doc) = roxmltree::Document::parse(svg) {
+        if let Ok(svg) = std::str::from_utf8(bytes) { if let Ok(doc) = roxmltree::Document::parse(&svg[svg.find("<svg").unwrap_or(0)..]) {
             let view: Vec<f64> = doc.root_element().attribute("viewBox").unwrap_or("").split(|c: char| c.is_whitespace() || c == ',').filter_map(|v| v.parse().ok()).collect();
             if view.len()==4 && view[3]>0. { return view[2]/view[3]>1.8; }
         }}
@@ -90,6 +90,14 @@ mod tests {
             assert!(text.contains("END-SEQUENCE"));
         }
         let _ = std::fs::remove_file(path);
+    }
+    #[test]
+    fn matplotlib_doctype_keeps_wide_figures_full_width() {
+        let (md,mut assets)=fixture(5);
+        assets.insert("frame.svg".into(),br##"<?xml version="1.0"?><!DOCTYPE svg PUBLIC "-//W3C//DTD SVG 1.1//EN" "http://www.w3.org/Graphics/SVG/1.1/DTD/svg11.dtd"><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 720 260"><path d="M1 1L700 240" stroke="black"/></svg>"##.to_vec());
+        let rendered=source(&md,&PdfOptions::default(),&assets).unwrap();
+        assert_eq!(rendered.matches("#grid(columns: (1fr,)").count(),5);
+        assert!(export(&md,&PdfOptions::default(),&assets).unwrap().starts_with(b"%PDF-"));
     }
     #[test]
     fn rich_steps_typeset_math_and_markdown_beside_the_image() {
