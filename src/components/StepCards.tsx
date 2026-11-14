@@ -71,11 +71,12 @@ export default function StepCards({source,renderImage,renderChart,renderMarkdown
     setFigureHeight(imageHeights.current.get(current)??null);
     measure();
     host.addEventListener("load",measure,true);
+    window.addEventListener("resize",measure);
     const mutation=typeof MutationObserver!=="undefined"?new MutationObserver(measure):null;
     mutation?.observe(host,{childList:true,subtree:true});
     const resize=typeof ResizeObserver!=="undefined"?new ResizeObserver(measure):null;
     resize?.observe(host);
-    return()=>{host.removeEventListener("load",measure,true);mutation?.disconnect();resize?.disconnect();};
+    return()=>{window.removeEventListener("resize",measure);host.removeEventListener("load",measure,true);mutation?.disconnect();resize?.disconnect();};
   },[deck,current]);
   const go=(next:number)=>{
     const target=Math.max(0,Math.min(next,count-1));

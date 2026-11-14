@@ -1107,6 +1107,10 @@ class Studio(QObject):
             if not skill_path.is_file() and not getattr(sys, "frozen", False):
                 skill_path = ROOT / "docs" / "skills" / "super-md" / "SKILL.md"
             skill = skill_path.read_text(encoding="utf-8")
+            if skill_path.parent.name == "super-md":
+                # The source-tree router needs its connection reference flattened
+                # into this standalone private setup export.
+                skill += "\n\n" + (skill_path.parent / "references" / "agent-connection.md").read_text(encoding="utf-8")
             guide = (skill + "\n\n# Connection for this installation\n\n"
                      "This local MCP server can inspect and revise tabs that are open in this Super MD app session. "
                      "It runs over stdio and reads the private, temporary discovery directory shown below.\n\n"

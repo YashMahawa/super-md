@@ -1,4 +1,4 @@
-# Super MD 0.6.29
+# Super MD 0.6.30
 
 ## Compact, responsive step cards
 
@@ -18,3 +18,5 @@
 - The public skill now includes source coverage, concise teaching, tutorial question/solution formatting and visual-authoring guidance, plus a compact tree reference image.
 - Native builds include the complete `super-md-skill.zip` and unpacked package, rather than only an entrypoint whose reference files were absent.
 - Personal profiles and connection credentials are excluded from the public package.
+
+The complete study-note skill now documents contrast, theme adaptation, large labels and substantial action arrows. Standalone agent setup exports preserve their installable skill header and full connection instructions.
