@@ -274,6 +274,8 @@ function Reader() {
       markScrollInput();
       const target=document.elementFromPoint(point.x,point.y),canvas=target?.closest(".interactive-chart svg,.image-viewer-canvas");
       if(target?.closest('.theme-guide-dialog')){const body=target.closest<HTMLElement>('.theme-guide-body');if(!held&&body)nativeScroll.scroll(body,dx,dy);return;}
+      const slideNotes=target?.closest<HTMLElement>('.step-viewer .step-cards-notes');
+      if(slideNotes){nativeScroll.scroll(slideNotes,dx,dy);return;}
       const editor=target?.closest<HTMLTextAreaElement>('textarea');
       if(editor){nativeScroll.scroll(editor,dx,dy);return;}
       if(held&&(modifier||canvas||(!selectingText.current&&!window.getSelection()?.toString()))){gapSelection.current?.cancelStationary();if(canvas?.matches("svg"))canvas.dispatchEvent(new WheelEvent("wheel",{bubbles:true,cancelable:true,ctrlKey:true,deltaY:dy,clientX:point.x,clientY:point.y}));else window.supermdZoomBy?.(Math.exp(-dy*.002),point);return;}
