@@ -647,7 +647,7 @@ ApplicationWindow {
                 ColumnLayout {
                     width: exportScroll.availableWidth
                     PdfControls { objectName: "exportPdfControls"; uiScale: exportDialog.uiScale; controlFont: exportDialog.font; ownerPopup: exportDialog; visible: outputFormat === "pdf"; Layout.fillWidth: true; viewportItem: exportScroll.contentItem; options: viewState.settings.pdf; onEdited: options => studio.setting("pdf", JSON.stringify(options)) }
-                    Label { visible: outputFormat !== "pdf"; Layout.fillWidth: true; wrapMode: Text.WordWrap; text: outputFormat === "md" ? "Editable Markdown with raster images beside the file. Vector diagrams are embedded as SVG source." : outputFormat === "mdzip" ? "One ZIP with editable Markdown and its referenced raster images. Vector diagrams are embedded as SVG source." : "A portable .smd keeps the editable Markdown and images together. Source mode never shows embedded image bytes." }
+                    Label { visible: outputFormat !== "pdf"; Layout.fillWidth: true; wrapMode: Text.WordWrap; text: outputFormat === "md" ? "Editable Markdown with raster images beside the file. Vector diagrams are embedded as SVG source." : outputFormat === "mdzip" ? "Obsidian-ready Markdown and images in one ZIP. Sliders become static figures; diagrams and charts become linked SVG images." : "A portable .smd keeps the editable Markdown and images together. Source mode never shows embedded image bytes." }
                 }
             }
             ActionButton { text: sharing ? "Prepare share copy" : "Choose destination"; font: exportDialog.font; prominent: true; Layout.fillWidth: true; Layout.minimumHeight: 44 * exportDialog.uiScale; onClicked: window.chooseExportDestination() }

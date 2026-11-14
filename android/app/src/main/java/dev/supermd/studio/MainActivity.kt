@@ -1683,7 +1683,7 @@ internal class NoteDestination(private val mime: String, private val preferred: 
                     Text("Vector equations, plots and real pagination. Typeset locally on this device.", style = MaterialTheme.typography.bodyMedium, modifier = Modifier.padding(bottom = 12.dp))
                     PdfOptions(options, fonts, ::update)
                 } else if (format == "mdzip") {
-                    Text("A single ZIP archive containing editable Markdown and all referenced assets in one folder.", style = MaterialTheme.typography.bodyMedium)
+                    Text("Obsidian-ready Markdown and images in one ZIP. Sliders become static figures; diagrams and charts become linked SVG images.", style = MaterialTheme.typography.bodyMedium)
                 } else if (format == "md") {
                     Text("SVGs and diagram sources are embedded in the Markdown. Images and GIFs keep readable relative filenames.", style = MaterialTheme.typography.bodyMedium)
                     Row(Modifier.fillMaxWidth().padding(top = 12.dp), verticalAlignment = Alignment.CenterVertically) {
