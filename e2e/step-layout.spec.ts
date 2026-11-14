@@ -15,6 +15,12 @@ for(const width of [1200,900,412])test(`compact rich step layout ${width}`,async
  await page.keyboard.press('ArrowLeft');await expect(card.locator('.step-cards-step-title')).toHaveText('Before');
  await expect(page.getByText('Choose step',{exact:true})).toHaveCount(0);
  await page.screenshot({path:test.info().outputPath(`steps-${width}.png`)});
+ if(width===1200){
+  const prior=(await card.locator('.step-cards-stage').boundingBox())!.height;
+  await page.setViewportSize({width,height:350});
+  await expect.poll(async()=> (await card.locator('.step-cards-stage').boundingBox())!.height).toBeLessThan(prior);
+  await page.setViewportSize({width,height:800});
+ }
  const long={title:'Long explanation',steps:[{label:'One',markdown:Array.from({length:50},(_,i)=>`Paragraph ${i}: a necessary explanation.`).join('\n\n')},{label:'Two',markdown:'Short ending.'}]};
  await page.evaluate(content=>window.supermdLoad?.({id:'scrolling',content,path:null,mode:'reader',dark:false,colors:{},font:'Manrope',size:16,zoom:100}),'```smd-steps\n'+JSON.stringify(long)+'\n```');
  const layout=page.locator('.step-cards-layout');
