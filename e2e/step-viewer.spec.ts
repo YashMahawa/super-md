@@ -2,7 +2,7 @@ import {test,expect} from '@playwright/test';
 
 const image='data:image/svg+xml;base64,'+Buffer.from('<svg xmlns="http://www.w3.org/2000/svg" width="320" height="140" viewBox="0 0 320 140"><rect x="6" y="6" width="308" height="128" rx="12" fill="#153d4b" stroke="#73e3e0" stroke-width="6"/><text x="160" y="82" text-anchor="middle" fill="white" font-family="sans-serif" font-size="36">Large visual</text></svg>').toString('base64');
 const deck={title:'Shared filter',steps:[{label:'First position',image},{label:'Second position',image},{label:'Result',image,markdown:'**Output**\n\n$$y=3$$'}]};
-async function load(page:import('@playwright/test').Page,value=deck){
+async function load(page:import('@playwright/test').Page,value:{title:string;steps:unknown[]}=deck){
  await page.addInitScript(()=>{window.SuperMD={post:id=>queueMicrotask(()=>window.supermdReply?.(id,true,null))};});
  await page.goto('/android-reader.html');await page.waitForFunction(()=>!!window.supermdLoad);
  await page.evaluate(content=>window.supermdLoad?.({id:'fit',content,path:null,mode:'reader',dark:false,colors:{},font:'Manrope',size:18,zoom:100}),'```smd-steps\n'+JSON.stringify(value)+'\n```');
@@ -56,4 +56,19 @@ test('expanded rich slide scrolls its text without moving visual or navigation',
  await viewer.getByRole('button',{name:'Fit slide image'}).click();
  await expect(viewer.getByLabel('Slide image zoom')).toHaveText('100%');
  await page.keyboard.press('ArrowRight');await expect(viewer.locator('.step-cards-step-title')).toHaveText('Final');
+});
+
+test('enlarged mixed image and declarative tree deck shows the selected visual',async({page})=>{
+ await page.setViewportSize({width:1400,height:900});
+ await load(page,{title:'Mixed visual process',steps:[{label:'Picture',image},{label:'Tree',diagram:{width:640,height:320,nodes:[{id:'root',label:'8',x:320,y:70},{id:'left',label:'4',x:170,y:250},{id:'right',label:'12',x:470,y:250}],edges:[{from:'root',to:'left'},{from:'root',to:'right'}]}}]});
+ await page.locator('.step-cards-figure.is-current img').click();
+ const viewer=page.getByRole('dialog',{name:'Slide viewer'});
+ await page.keyboard.press('ArrowRight');
+ await expect(viewer.locator('.step-cards-inline-figure svg')).toBeInViewport();
+ await expect(viewer.locator('.step-cards-figure-stack.is-inactive')).toHaveCSS('height','0px');
+ await page.keyboard.press('Control+=');
+ await expect(viewer.locator('.step-cards-inline-figure svg')).toHaveCSS('transform',/matrix\(1\.1,/);
+ await page.keyboard.press('Escape');
+ await page.locator('.step-cards-inline-figure svg').click();
+ await expect(viewer).toBeVisible();
 });
