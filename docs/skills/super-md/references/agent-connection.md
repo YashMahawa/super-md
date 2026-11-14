@@ -71,6 +71,12 @@ page `document_action(documentAction="outline", tabId,
 options:{offset:0,limit:80})`; each page contains up to 80 headings with their
 `sectionStart`/`sectionEnd` bounds, plus `nextOffset` and `documentLength` metadata.
 
+## Retrieve a slider frame directly
+
+In builds with slider-frame indexing, `list_diagrams`/cloud `diagram_action(diagramAction="list")` includes each visual frame, with `deckTitle`, `stepLabel`, zero-based `stepIndex`, `stepCount`, readable `preview` and `assetReference` when backed by an image. List bounded metadata once, select the process/step by these fields, then request `get_diagram_image`/cloud `diagram_action(diagramAction="image")` using that frame's ID and current revision. This does not advance the slider or require opening every frame. Text-only steps are not diagrams. Standalone declarative trees and diagrams are indexed too.
+
+For the live CLI, use `super-md agent live --sessions-dir PRIVATE_DIR diagrams TAB --limit 80`; select the returned frame ID, then `super-md agent live --sessions-dir PRIVATE_DIR diagram-image TAB FRAME_ID OUTPUT.png --revision REV --width 1600`. Use the existing private discovery directory from setup; never print its credentials. Follow `nextOffset` for long listings. For original SVG instead of raster previews, use the listed `assetReference` with asset source/extract; read declarative frame source using `diagram TAB FRAME_ID --revision REV`. IDs are revision-relative: refresh after edits. On older installations that omit slider frames, inspect only the relevant `smd-steps` block and extract its exact image asset, rather than reading the entire note or repeatedly rendering the viewport.
+
 ## Export a whole note or section
 
 For a full document or one selected heading section, export Markdown, portable

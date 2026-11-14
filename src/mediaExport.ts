@@ -67,6 +67,13 @@ export async function mediaBytes(media:ExportableMedia,format:'png'|'jpeg'|'svg'
   }
   return {body:match[2],mimeType:match[1],filename:`${filename}.${extension[match[1]]}`,...dimensions};
 }
+export async function copyMedia(media:ExportableMedia):Promise<void> {
+  const image=await mediaBytes(media,'png');
+  if(window.SuperMD){await invoke('copy_image_native',image);return;}
+  if(!navigator.clipboard?.write||typeof ClipboardItem==='undefined')throw Error('Image clipboard is unavailable in this browser.');
+  const bytes=Uint8Array.from(atob(image.body),char=>char.charCodeAt(0));
+  await navigator.clipboard.write([new ClipboardItem({'image/png':new Blob([bytes],{type:'image/png'})})]);
+}
 export async function saveMedia(media:ExportableMedia,format:'png'|'svg'|'original'|'source') {
   return invoke<{filename:string}>('save_media_native',await mediaBytes(media,format));
 }
@@ -81,7 +88,9 @@ export function installMediaMenu():()=>void {
     const open=(x:number,y:number)=>{
       const media=mediaAt(document.elementFromPoint(x,y));if(!media)return false;
       close();const panel=document.createElement('div');menu=panel;panel.className='media-save-menu';panel.setAttribute('role','menu');panel.setAttribute('aria-label','Save image or diagram');
-      const title=document.createElement('div');title.className='media-save-title';title.textContent='Save image';panel.append(title);
+      const title=document.createElement('div');title.className='media-save-title';title.textContent='Image';panel.append(title);
+      const copy=document.createElement('button');copy.type='button';copy.textContent='Copy image';copy.setAttribute('role','menuitem');
+      copy.onclick=()=>{panel.querySelectorAll('button').forEach(item=>item.disabled=true);void copyMedia(media).then(()=>{title.textContent='Image copied';window.setTimeout(close,1200);},error=>{title.textContent=String(error instanceof Error?error.message:error);panel.querySelectorAll('button').forEach(item=>item.disabled=false);});};panel.append(copy);
       const options:Array<['png'|'svg'|'original'|'source',string]>=[['png','Save as PNG']];
       if(media.svg)options.push(['svg','Save as SVG']);else options.push(['original','Save original image']);
       if(media.source)options.push(['source','Save Mermaid source']);

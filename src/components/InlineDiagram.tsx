@@ -1,4 +1,5 @@
-import {useMemo} from "react";
+import {useMemo,useEffect,useRef} from "react";
+import {registerMedia} from "../mediaExport";
 
 /** Portable, responsive SVG for authored diagrams. Only geometry and text;
  * no arbitrary markup, scripts, URLs or event handlers. */
@@ -43,9 +44,14 @@ export function parseDiagramSource(source:string):DiagramSpec|null {
 
 /** Update SVG primitives in place: React preserves matching node and edge keys. */
 export default function InlineDiagram({diagram}:{diagram:DiagramSpec|null}){
+  const host=useRef<HTMLElement>(null);
+  useEffect(()=>{
+    if(!diagram)return;
+    return registerMedia(host.current,{label:diagram.title||'Diagram',svg:async()=>{const {stepDiagramSvg}=await import('../stepPdf');return stepDiagramSvg(diagram);}});
+  },[diagram]);
   const lookups=useMemo(()=>new Map(diagram?.nodes.map(n=>[n.id,n])??[]),[diagram]);
   if(!diagram)return <span className="inline-diagram-error" role="alert">Invalid diagram. Check node positions, IDs and edges.</span>;
-  return <figure className="inline-diagram" role="group" aria-label={diagram.title||"Interactive SVG diagram"}>
+  return <figure ref={host} className="inline-diagram" role="group" aria-label={diagram.title||"Interactive SVG diagram"}>
     <svg xmlns="http://www.w3.org/2000/svg" viewBox={"0 0 "+diagram.width+" "+diagram.height} role="img" aria-label={diagram.title||"Diagram"} preserveAspectRatio="xMidYMid meet">
       {diagram.edges.map((e,i)=>{
         const a=lookups.get(e.from)!,b=lookups.get(e.to)!;

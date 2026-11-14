@@ -412,3 +412,7 @@ live devices, the paired relay above avoids configuring an inbound tunnel.
 
 The optional server targets Python 3.11+. The stdlib CLI and operation layer
 remain usable without the MCP package.
+
+## Slider-frame diagram retrieval
+
+Diagram listings include individual visual slider frames, with `deckTitle`, `stepLabel`, zero-based `stepIndex`, `stepCount`, readable previews and image asset references. Use each returned revision-relative frame ID with the existing diagram source/image actions or live CLI `diagram-image`; no slider navigation is needed. Text-only steps are omitted. `smd-tree` and `smd-diagram` blocks are also directly retrievable.

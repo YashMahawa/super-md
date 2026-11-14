@@ -26,7 +26,7 @@ import uuid
 from pathlib import Path
 from network_tls import client_context
 from PySide6.QtCore import QObject, Property, Signal, Slot, QStandardPaths, QTimer, QUrl, QFileSystemWatcher, QProcess, Qt, QPointF, QRect, QMetaObject, QBuffer, QByteArray, QIODevice
-from PySide6.QtGui import QDesktopServices, QFontDatabase, QGuiApplication, QCursor
+from PySide6.QtGui import QDesktopServices, QFontDatabase, QGuiApplication, QCursor, QImage
 from documents import atomic_write, atomic_json, bundle, image_data, materialize_assets, open_note, write_portable, MIMES, MAX_IMAGE
 from markdown_export import write_markdown_export, write_markdown_zip
 from theme import detect_system_dark, read_system_palette, system_palette_paths, tokens
@@ -3118,6 +3118,23 @@ class Studio(QObject):
                 if self.fullscreen: self.chromeRequested.emit(action)
                 self.replied.emit(id,"true",""); return
             if command == "reader_overlay_changed": self.reader_overlay = bool(args.get("open")); self.image_overlay = bool(args.get("image")); self._emit(False); self.replied.emit(id,"true",""); return
+            if command == "copy_image_native":
+                body = args.get("body")
+                if args.get("mimeType") != "image/png" or not isinstance(body, str) or len(body) > 34_000_000:
+                    raise ValueError("Clipboard image must be a PNG under 25 MB")
+                try:
+                    data = base64.b64decode(body, validate=True)
+                except (ValueError, base64.binascii.Error):
+                    raise ValueError("Clipboard image is not valid base64") from None
+                if not data.startswith(b"\x89PNG\r\n\x1a\n") or len(data) < 24 or len(data) > 25_000_000:
+                    raise ValueError("Clipboard image is not a valid PNG")
+                width, height = int.from_bytes(data[16:20], "big"), int.from_bytes(data[20:24], "big")
+                if not 0 < width <= 4096 or not 0 < height <= 4096 or width * height > 16_000_000:
+                    raise ValueError("Clipboard image dimensions exceed the limit")
+                image = QImage.fromData(data, "PNG")
+                if image.isNull(): raise ValueError("Clipboard PNG could not be decoded")
+                QGuiApplication.clipboard().setImage(image)
+                self.replied.emit(id, "true", ""); return
             if command == "copy_text":
                 text=args.get("text")
                 if not isinstance(text,str) or len(text)>2_000_000:raise ValueError("Clipboard text is too large or invalid")

@@ -243,7 +243,7 @@ impl<'a> Renderer<'a> {
                                 let body = self.render(Some(TagEnd::Paragraph))? + "\n\n" + &self.render(Some(close))?;
                                 let accent = match kind.as_str() { "tip" | "hint" | "success" | "check" | "done" => "#14735b", "warning" | "caution" => "#946200", "danger" | "error" | "failure" | "fail" | "missing" => "#b3261e", _ => "#315d99" };
                                 let icon = match kind.as_str() {"tip"|"hint"=>"tip","warning"|"caution"=>"warning","danger"|"error"=>"error","success"|"check"|"done"=>"success","question"|"faq"=>"question","answer"|"solution"=>"answer","example"=>"example","quote"|"cite"=>"quote",_=>"info"};
-                                (format!("#text(weight: \"bold\", fill: rgb(\"{accent}\"))[#box(image(\"__smd_icon_{icon}.svg\", width: 11pt)) #h(4pt) {}]\n\n{body}", text(&title)), accent)
+                                (format!("#block(sticky: true, below: 6pt)[#text(weight: \"bold\", fill: rgb(\"{accent}\"))[#box(image(\"__smd_icon_{icon}.svg\", width: 11pt)) #h(4pt) {}]]\n\n{body}", text(&title)), accent)
                             } else { (self.render(Some(close))?, "#315d99") };
                             out.push_str(&format!("\n#block(width: 100%, breakable: true, fill: if smd-themed {{ smd-callout-fill }} else {{ color.mix((white, 94%), (rgb(\"{accent}\"), 6%)) }}, stroke: (left: 2pt + rgb(\"{accent}\")), inset: 10pt, radius: 4pt)[{body}]\n\n"));
                         },

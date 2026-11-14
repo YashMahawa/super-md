@@ -682,7 +682,7 @@ function Reader() {
           return section?{...result,sectionStart:section.sectionStart,sectionEnd:section.sectionEnd,documentLength:section.documentLength}:result;
         }
         throw Error('Unsupported live reader action');
-      })().then(result=>reply(result),error=>reply(null,error instanceof Error?error.message:'Agent request failed')).finally(()=>{pending=false;});
+      })().then(result=>{pending=false;reply(result);},error=>{pending=false;reply(null,error instanceof Error?error.message:'Agent request failed');});
     };
     return()=>{disposed=true;delete window.supermdAgentRequest;delete window.supermdAgentCompute;};
   },[update]);

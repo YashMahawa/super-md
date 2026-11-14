@@ -1,6 +1,6 @@
 // @vitest-environment jsdom
 import {describe,it,expect} from 'vitest';
-import {agentDiagrams,diagramMetadata,visibleSourceRange} from './agentView';
+import {agentDiagrams,diagramMetadata,visibleSourceRange,diagramMedia} from './agentView';
 describe('structured reader context',()=>{
   it('exposes exact diagram source with compact revision-relative references',()=>{
     const source='# 😀 Notes\n\n```mermaid\ngraph TD; A-->B\n```\n\n```svg\n<svg xmlns="http://www.w3.org/2000/svg"/>\n```';
@@ -18,4 +18,16 @@ describe('structured reader context',()=>{
     const media=agentDiagrams(source);expect(media.map(item=>item.kind)).toEqual(['image','image']);
     const metadata=media.map(item=>diagramMetadata(source,item));expect(metadata[0].assetReference).toBe('assets/photo.png');expect(metadata[1].assetReference).toBe('(embedded image)');expect(JSON.stringify(metadata)).not.toContain('PHN2Zy8+');
   });
+});
+
+it('indexes every slider frame by title and step without mounting or changing the current frame',async()=>{
+ const deck={title:'K-means',steps:[{label:'Initialize',image:'assets/start.svg'},{label:'Update',diagram:{width:120,height:100,nodes:[{id:'a',label:'3',x:60,y:50}],edges:[]}},{label:'Reasoning only',markdown:'The points stay fixed.'}]};
+ const source='😀\n\n```smd-steps\n'+JSON.stringify(deck)+'\n```';
+ const diagrams=agentDiagrams(source);expect(diagrams).toHaveLength(2);
+ expect(diagrams.map(d=>d.id)).toEqual(['diagram:step:3:0','diagram:step:3:1']);
+ const metadata=diagrams.map(d=>diagramMetadata(source,d));
+ expect(metadata[0]).toMatchObject({deckTitle:'K-means',stepLabel:'Initialize',stepIndex:0,stepCount:3,assetReference:'assets/start.svg'});
+ expect(metadata[1].preview).toBe('K-means — Update');
+ const frame=await diagramMedia(diagrams[1]);expect(await frame.svg!()).toContain('>3</text>');
+ expect(source).toContain('Reasoning only');
 });
