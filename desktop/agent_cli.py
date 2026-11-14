@@ -118,12 +118,16 @@ def main(argv: list[str] | None = None) -> int:
     argv = list(sys.argv[1:] if argv is None else argv)
     # Packaged `super-md agent mcp ...` shares this lightweight entry point
     # without importing Qt; stdio remains reserved for MCP protocol traffic.
-    if argv and argv[0] == "install-skill":
-        from install_skill import main as install_main
-        return install_main(argv[1:])
-    if argv and argv[0] == "service":
-        from background_cli import main as service_main
-        return service_main(argv[1:])
+    if argv and argv[0] in ("install-skill", "service"):
+        try:
+            if argv[0] == "install-skill":
+                from install_skill import main as extension_main
+            else:
+                from background_cli import main as extension_main
+            return extension_main(argv[1:])
+        except (ValueError, OSError, ImportError) as error:
+            _emit({"ok": False, "error": {"type": type(error).__name__, "message": str(error)[:1000]}})
+            return 2
     if argv and argv[0] == "mcp":
         try:
             from .mcp_server import main as mcp_main
