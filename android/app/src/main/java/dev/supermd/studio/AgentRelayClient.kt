@@ -218,7 +218,7 @@ class AgentRelayClient(private val onState: (State) -> Unit = {}) {
             require(kind in setOf("list", "source", "attach")) { "Invalid assetAction" }
             if (kind == "source") require(request.optString("assetName").isNotBlank()) { "assetName is required" }
             if (kind == "list") {
-                require(request.optInt("offset", 0) in 0..512) { "Invalid asset offset" }
+                require(request.optInt("offset", 0) in 0..20_000_000) { "Invalid asset offset" }
                 require(request.optInt("limit", 50) in 1..50) { "Invalid asset limit" }
             }
             if (kind == "attach") {

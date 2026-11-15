@@ -819,8 +819,8 @@ def _qt_bridge_class():
                         raise ValueError("Asset path is too long")
                 if kind == "list":
                     offset, limit = payload.get("offset", 0), payload.get("limit", 50)
-                    if not isinstance(offset, int) or isinstance(offset, bool) or not 0 <= offset <= 512:
-                        raise ValueError("offset must be between 0 and 512")
+                    if not isinstance(offset, int) or isinstance(offset, bool) or not 0 <= offset <= 20_000_000:
+                        raise ValueError("offset must be between 0 and 20,000,000")
                     if not isinstance(limit, int) or isinstance(limit, bool) or not 1 <= limit <= 50:
                         raise ValueError("limit must be between 1 and 50")
             elif action == "get_context":
