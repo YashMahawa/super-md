@@ -8,7 +8,15 @@ from unittest.mock import patch
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 from PySide6.QtGui import QGuiApplication
-from reader_assets import ReaderAssetStore, resolve_source
+from reader_assets import (
+    READER_HOST,
+    READER_SCHEME,
+    ReaderAssetStore,
+    ReaderBundleSchemeHandler,
+    reader_bundle_url,
+    resolve_bundle_file,
+    resolve_source,
+)
 from studio import Session, Studio
 
 
@@ -182,6 +190,47 @@ class ReaderAssetTests(unittest.TestCase):
             studio.stop()
             studio.pool.shutdown(wait=True, cancel_futures=True)
             session.writes.shutdown(wait=True)
+
+    def test_reader_bundle_scheme_serves_contained_dist_files_and_rejects_escapes_or_symlinks(self):
+        self.assertEqual(reader_bundle_url().toString(), f"{READER_SCHEME}://{READER_HOST}/qt-reader.html")
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            dist = root / "dist"
+            assets = dist / "assets"
+            assets.mkdir(parents=True)
+            (dist / "qt-reader.html").write_text("<!doctype html><title>ok</title>", encoding="utf-8")
+            (assets / "reader.js").write_text("export default 1;", encoding="utf-8")
+            (dist / "secret.exe").write_bytes(b"MZ")
+            outside = root / "outside.html"
+            outside.write_text("outside", encoding="utf-8")
+            (dist / "linked.html").symlink_to(outside)
+
+            resolved_html, html_mime = resolve_bundle_file(dist, "/qt-reader.html")
+            self.assertEqual(resolved_html, (dist / "qt-reader.html").resolve())
+            self.assertEqual(html_mime, "text/html")
+
+            handler = ReaderBundleSchemeHandler(dist)
+            device, js_mime = handler.open_bundle_device("/assets/reader.js")
+            try:
+                self.assertEqual(js_mime, "text/javascript")
+                self.assertEqual(bytes(device.readAll()), b"export default 1;")
+            finally:
+                device.close()
+
+            for blocked in (
+                "/../outside.html",
+                "/%2e%2e/outside.html",
+                "/linked.html",
+                "/secret.exe",
+                "/",
+                "qt-reader.html",
+            ):
+                with self.assertRaises(PermissionError, msg=blocked):
+                    resolve_bundle_file(dist, blocked)
+
+            qml_source = (Path(__file__).resolve().parent / "qml" / "Main.qml").read_text(encoding="utf-8")
+            self.assertIn("settings.localContentCanAccessFileUrls: false", qml_source)
+            self.assertNotIn("settings.localContentCanAccessFileUrls: true", qml_source)
 
 
 if __name__ == "__main__":

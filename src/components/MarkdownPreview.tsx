@@ -19,8 +19,8 @@ import { selectedMarkdown, setSelectedMarkdownDrag } from "../copySource";
 import CopyCode from "./CopyCode";
 import CodeBlockBoundary from "./CodeBlockBoundary";
 import {DocumentAppearance} from '../documentAppearance';
-import {svgDataBackdrop} from '../svgImage';
-import {adaptSvgData} from '../svgTheme';
+import {svgDataBackdrop,svgImage} from '../svgImage';
+import {adaptSvgData,decodeSvgDataUri} from '../svgTheme';
 import {analyzeDocument} from '../documentAnalysis';
 import type {SourceDocumentAnalysis} from '../documentAnalysis';
 import {resolveReaderRasterAsset} from '../readerAssets';
@@ -130,10 +130,22 @@ function AssetImage({ src = "", alt = "", documentPath, trustedImageHosts, onTru
     window.addEventListener('supermd-asset-access-restored',restored);
     return()=>window.removeEventListener('supermd-asset-access-restored',restored);
   },[documentPath,embedded,error,isRemote,src]);
+  const isSvgData=/^data:image\/svg\+xml(?:[;,]|$)/i.test(resolved);
   const svgBacking=useMemo(()=>svgDataBackdrop(resolved),[resolved]);
   const appearance=useContext(DocumentAppearance);
   const adaptsSvg=appearance?.svgAppearance==='auto'||appearance?.svgAppearance==='monochrome';
-  const adaptedSource=useMemo(()=>adaptsSvg&&svgBacking?adaptSvgData(resolved,appearance?.colors??{},appearance?.dark??false,appearance?.svgAppearance==='monochrome'):resolved,[resolved,svgBacking,appearance,adaptsSvg]);
+  const adapted=useMemo(()=>{
+    if(!resolved||!isSvgData)return {src:resolved,error:''};
+    try{
+      if(adaptsSvg&&svgBacking)return {src:adaptSvgData(resolved,appearance?.colors??{},appearance?.dark??false,appearance?.svgAppearance==='monochrome'),error:''};
+      svgImage(decodeSvgDataUri(resolved));
+      return {src:resolved,error:''};
+    }catch(reason){
+      return {src:'',error:reason instanceof Error?reason.message:String(reason)};
+    }
+  },[resolved,isSvgData,svgBacking,appearance,adaptsSvg]);
+  const adaptedSource=adapted.src;
+  const displayError=error||adapted.error;
   // A one-time approval belongs to the exact URL the user approved. Keeping
   // that scope in state avoids a passive-effect reset window when `src` changes.
   const allowed = allowedOnceSource === src || trustedImageHosts.includes(host);
@@ -167,17 +179,17 @@ function AssetImage({ src = "", alt = "", documentPath, trustedImageHosts, onTru
     return () => { active = false; };
   }, [documentPath, embedded, isRemote, src, allowed, assetEpoch, permissionRetry]);
   useEffect(()=>{
-    if(!resolved||error||isRemote&&!allowed)return;
-    const svg=resolved.startsWith('data:image/svg+xml');
-    return registerMedia(imageElement.current,{label:alt||'Image',uri:()=>resolved,...(svg?{svg:()=>{const comma=resolved.indexOf(',');return resolved.slice(0,comma).includes(';base64')?new TextDecoder().decode(Uint8Array.from(atob(resolved.slice(comma+1)),value=>value.charCodeAt(0))):decodeURIComponent(resolved.slice(comma+1));}}:{})});
-  },[resolved,error,isRemote,allowed,alt]);
+    if(!resolved||displayError||isRemote&&!allowed)return;
+    const svg=isSvgData;
+    return registerMedia(imageElement.current,{label:alt||'Image',uri:()=>resolved,...(svg?{svg:()=>decodeSvgDataUri(resolved)}:{})});
+  },[resolved,displayError,isSvgData,isRemote,allowed,alt]);
   if (isRemote && !allowed) return <span ref={mediaElement} className="remote-image-card" role="group" aria-label={`Remote image from ${host}`}><span><strong>{alt || "Remote image"}</strong><small>{host} · blocked until you choose to load it</small></span><span className="remote-image-actions"><button onClick={() => setAllowedOnceSource(src)}>Load image</button>{onTrustImageHost && <button onClick={() => onTrustImageHost(host)}>Trust domain</button>}</span></span>;
-  if (error) return <span ref={mediaElement} className="image-error" role="img" aria-label={alt || "Image unavailable"}>Image unavailable: {alt || src}<small>{error}</small></span>;
+  if (displayError) return <span ref={mediaElement} className="image-error" role="img" aria-label={alt || "Image unavailable"}>Image unavailable: {alt || src}<small>{displayError}</small></span>;
   if (!resolved) return <span ref={mediaElement} className="image-loading" role="status">Loading image…</span>;
   const sizing=sizedSource!==resolved;
-  return <span ref={mediaElement} className={`note-image ${resolved.startsWith('data:image/svg+xml')?'note-image--diagram':''} ${sizing?'image-loading':''} ${selected ? "is-selected" : ""}`} style={sizing?{width:'100%',boxSizing:'border-box'}:undefined} data-note-image-source={src} tabIndex={0} aria-label={`Image: ${alt || "Image"}`} onBlur={(event) => { if (!event.currentTarget.contains(event.relatedTarget)) setSelected(false); }} onContextMenu={(event) => { event.preventDefault(); event.stopPropagation(); setSelected(true); event.currentTarget.focus(); }} onKeyDown={(event) => { if (event.key === "Escape") { setSelected(false); event.stopPropagation(); } }}>
+  return <span ref={mediaElement} className={`note-image ${isSvgData?'note-image--diagram':''} ${sizing?'image-loading':''} ${selected ? "is-selected" : ""}`} style={sizing?{width:'100%',boxSizing:'border-box'}:undefined} data-note-image-source={src} tabIndex={0} aria-label={`Image: ${alt || "Image"}`} onBlur={(event) => { if (!event.currentTarget.contains(event.relatedTarget)) setSelected(false); }} onContextMenu={(event) => { event.preventDefault(); event.stopPropagation(); setSelected(true); event.currentTarget.focus(); }} onKeyDown={(event) => { if (event.key === "Escape") { setSelected(false); event.stopPropagation(); } }}>
     {sizing&&<span role="status">Loading image…</span>}
-    <img ref={imageElement} draggable={false} data-media-adapted={adaptsSvg&&svgBacking?'true':undefined} data-media-kind={resolved.startsWith('data:image/svg+xml')?'svg':'image'} data-light-ink={svgBacking==='#222026'?'true':undefined} style={{...(svgBacking?{'--svg-contrast-backing':svgBacking}:{}),...(sizing?{position:'absolute',height:0,visibility:'hidden'}:{})} as React.CSSProperties} src={adaptedSource} alt={alt} loading="lazy" decoding="async" onLoad={()=>{if(sizedSource!==resolved)commitMediaLayout(imageElement.current,()=>setSizedSource(resolved));}} onError={() => commitMediaLayout(imageElement.current,()=>setError("The image could not be decoded or loaded."))} />
+    <img ref={imageElement} draggable={false} data-media-adapted={adaptsSvg&&svgBacking?'true':undefined} data-media-kind={isSvgData?'svg':'image'} data-light-ink={svgBacking==='#222026'?'true':undefined} style={{...(svgBacking?{'--svg-contrast-backing':svgBacking}:{}),...(sizing?{position:'absolute',height:0,visibility:'hidden'}:{})} as React.CSSProperties} src={adaptedSource} alt={alt} loading="lazy" decoding="async" onLoad={()=>{if(sizedSource!==resolved)commitMediaLayout(imageElement.current,()=>setSizedSource(resolved));}} onError={() => commitMediaLayout(imageElement.current,()=>setError("The image could not be decoded or loaded."))} />
     {selected && <span className="image-edit-tools" role="toolbar" aria-label="Selected image"><button onClick={(event) => { event.stopPropagation(); window.dispatchEvent(new CustomEvent("supermd-image-edit", { detail: { action: "replace", image: event.currentTarget.closest("[data-note-image-source]") } })); }}>Replace</button><button onClick={(event) => { event.stopPropagation(); window.dispatchEvent(new CustomEvent("supermd-image-edit", { detail: { action: "remove", image: event.currentTarget.closest("[data-note-image-source]") } })); }}>Remove</button></span>}
   </span>;
 }

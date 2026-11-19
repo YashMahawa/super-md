@@ -465,7 +465,7 @@ ApplicationWindow {
                     backgroundColor: window.color
                     webChannel: WebChannel { id: documentChannel; Component.onCompleted: registerObject("studio", studio) }
                     settings.localContentCanAccessRemoteUrls: false
-                    settings.localContentCanAccessFileUrls: true
+                    settings.localContentCanAccessFileUrls: false
                     settings.javascriptCanOpenWindows: false
                     settings.fullScreenSupportEnabled: false
                     onContextMenuRequested: function(request) {

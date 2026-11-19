@@ -431,6 +431,40 @@ internal fun retireAndDestroyReader(web: WebView) {
     }
 }
 
+internal fun interceptReaderRequest(
+    loader: WebViewAssetLoader,
+    url: Uri,
+    method: String = "GET",
+): WebResourceResponse {
+    val allowedMethod = method.equals("GET", ignoreCase = true) || method.equals("HEAD", ignoreCase = true)
+    val isAppAssetsHost = url.scheme.equals("https", ignoreCase = true) &&
+        url.host.equals("appassets.androidplatform.net", ignoreCase = true)
+    val path = url.path ?: ""
+    val isReaderPath = path.startsWith("/assets/") || path.startsWith("/reader-assets/")
+    if (allowedMethod && isAppAssetsHost && isReaderPath) {
+        val loaded = loader.shouldInterceptRequest(url)
+        if (loaded != null && loaded.data != null) return loaded
+        if (path.startsWith("/assets/")) {
+            return WebResourceResponse(
+                "text/plain",
+                "UTF-8",
+                404,
+                "Not Found",
+                ReaderAssetPathHandler.NO_STORE_HEADERS,
+                java.io.ByteArrayInputStream(ByteArray(0)),
+            )
+        }
+    }
+    return WebResourceResponse(
+        "text/plain",
+        "UTF-8",
+        403,
+        "Forbidden",
+        ReaderAssetPathHandler.NO_STORE_HEADERS,
+        java.io.ByteArrayInputStream(ByteArray(0)),
+    )
+}
+
 fun configureReader(web: WebView, model: StudioViewModel, scope: CoroutineScope, ready: () -> Unit, rendererGone: (WebView) -> Unit, onAgentReply: (String, Any?, String?) -> Unit = { _, _, _ -> }, onAgentExport: (JSONObject) -> Unit = {}) {
     web.settings.javaScriptEnabled = true
     web.settings.domStorageEnabled = true
@@ -462,7 +496,8 @@ fun configureReader(web: WebView, model: StudioViewModel, scope: CoroutineScope,
             return true
         }
 
-        override fun shouldInterceptRequest(view: WebView, request: WebResourceRequest): WebResourceResponse? = loader.shouldInterceptRequest(request.url)
+        override fun shouldInterceptRequest(view: WebView, request: WebResourceRequest): WebResourceResponse =
+            interceptReaderRequest(loader, request.url, request.method)
         override fun onReceivedHttpError(view: WebView, request: WebResourceRequest, response: WebResourceResponse) {
             if (request.url.host == "appassets.androidplatform.net" && request.url.path?.startsWith("/assets/") == true) {
                 model.fail("A bundled document resource is missing. Please reinstall a complete release.")
