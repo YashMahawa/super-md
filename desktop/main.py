@@ -43,7 +43,7 @@ from PySide6.QtWebEngineQuick import QtWebEngineQuick
 from PySide6.QtWebEngineCore import QWebEngineProfile, QWebEngineUrlScheme
 from studio import Session, Studio, ROOT
 from agent_live import create_qt_bridge
-from reader_assets import ReaderAssetSchemeHandler, SCHEME
+from reader_assets import READER_SCHEME, ReaderAssetSchemeHandler, ReaderBundleSchemeHandler, SCHEME, reader_bundle_url, register_reader_schemes
 from instance import InstanceBroker
 from reader_gestures import ReaderGestures
 import native_frame
@@ -106,13 +106,9 @@ def main():
         if flag not in flags:
             flags += " " + flag
     os.environ["QTWEBENGINE_CHROMIUM_FLAGS"] = flags.strip()
-    # The reader image scheme is deliberately not a local-file access scheme;
-    # it serves only opaque, per-open-note raster capabilities.
-    scheme = QWebEngineUrlScheme(SCHEME.encode("ascii"))
-    scheme.setSyntax(QWebEngineUrlScheme.Syntax.Host)
-    scheme.setFlags(QWebEngineUrlScheme.Flag.SecureScheme | QWebEngineUrlScheme.Flag.CorsEnabled |
-                    QWebEngineUrlScheme.Flag.LocalScheme)
-    QWebEngineUrlScheme.registerScheme(scheme)
+    # The reader and raster image schemes are deliberately not local-file access
+    # schemes; they serve only packaged reader assets and per-note capabilities.
+    register_reader_schemes()
     QtWebEngineQuick.initialize()
     QGuiApplication.setApplicationName("super-md-qt" if args.test_state else "super-md")
     QGuiApplication.setOrganizationName("SuperMD")
@@ -135,7 +131,9 @@ def main():
     session.agent_bridge = create_qt_bridge(session, session.data)
     app.aboutToQuit.connect(session.agent_bridge.stop)
     asset_handler = ReaderAssetSchemeHandler(session.reader_assets, app)
+    bundle_handler = ReaderBundleSchemeHandler(ROOT / "dist", app)
     QWebEngineProfile.defaultProfile().installUrlSchemeHandler(SCHEME.encode("ascii"), asset_handler)
+    QWebEngineProfile.defaultProfile().installUrlSchemeHandler(READER_SCHEME.encode("ascii"), bundle_handler)
     def detach_window(source_id, tab_id):
         source = session.windows.get(source_id)
         if not source or not source._can_move(): return
@@ -170,7 +168,7 @@ def main():
         studio.newWindowRequested.connect(create_window)
         studio.detachedWindowRequested.connect(detach_window)
         engine.rootContext().setContextProperty("studio", studio)
-        engine.rootContext().setContextProperty("readerUrl", QUrl.fromLocalFile(str(ROOT / "dist" / "qt-reader.html")))
+        engine.rootContext().setContextProperty("readerUrl", reader_bundle_url())
         engine.rootContext().setContextProperty("channelScript", channel_script)
         engine.rootContext().setContextProperty("brandUrl", QUrl.fromLocalFile(str(ROOT / "public" / "brand-mark-fixed.svg")))
         engine.load(QUrl.fromLocalFile(str(ROOT / "desktop" / "qml" / "Main.qml")))
