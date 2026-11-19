@@ -168,3 +168,54 @@ it('keeps converted SVGs inside their enclosing callout and preserves frontmatte
  expect(result.content).toMatch(/^> !\[Diagram\]/m);
  expect(result.content).not.toContain(':::');
 });
+it('preserves fenced :::callout literals, Obsidian wikilinks and C++ [[nodiscard]] when no unfenced callouts exist',async()=>{
+ const source=[
+  'See [[Project Notes]] and `[[Project Notes]]` plus `![[diagram.png]]`.',
+  '',
+  '```markdown',
+  ':::callout tip "Documented syntax"',
+  'Keep literal [[WikiLink]] inside fenced callout example.',
+  ':::',
+  '```',
+  '',
+  '```cpp',
+  '[[nodiscard]] int compute() { return 42; }',
+  '```',
+ ].join('\n');
+ const result=await prepareMarkdownExport(source,null,{compatible:true});
+ expect(result.content).toBe(source);
+ expect(result.assets).toEqual({});
+});
+it('converts prose wikilinks and callouts while keeping code blocks and smd-chart point arrays intact in compatible exports',async()=>{
+ native.mockResolvedValue(null);
+ const source=[
+  ':::callout note Summary',
+  'Read [[Guide|the guide]].',
+  ':::',
+  '',
+  '````markdown',
+  ':::callout warning Literal',
+  ':::',
+  '````',
+  '',
+  '```cpp',
+  '[[nodiscard]] bool ok();',
+  '```',
+  '',
+  '```bash',
+  'if [[ -n "$HOME" ]]; then echo ok; fi',
+  '```',
+  '',
+  '```smd-chart',
+  '{"title":"Points","series":[{"name":"Samples","points":[[0,1],[1,2]]}]}',
+  '```',
+ ].join('\n');
+ const result=await prepareMarkdownExport(source,null,{compatible:true});
+ expect(result.content).toContain('> [!NOTE] Summary\n> Read [the guide](Guide.md).');
+ expect(result.content).toContain('````markdown\n:::callout warning Literal\n:::\n````');
+ expect(result.content).toContain('[[nodiscard]] bool ok();');
+ expect(result.content).toContain('if [[ -n "$HOME" ]]; then echo ok; fi');
+ expect(Object.keys(result.assets)).toHaveLength(1);
+ expect(atob(Object.values(result.assets)[0].split(',')[1])).toContain('<svg');
+});
+

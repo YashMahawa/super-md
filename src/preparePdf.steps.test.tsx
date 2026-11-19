@@ -43,3 +43,34 @@ it("keeps step Markdown and LaTeX as formatted export content",async()=>{
   expect(grid.steps[0].markdown).toContain('$$');
   expect(grid.steps[1].markdown).toContain('First item');
 });
+
+it("exports smd-chart point arrays and code literals alongside prose wikilinks and callouts without JSON corruption",async()=>{
+  const source=[
+    ':::callout tip Overview',
+    'Compare [[#Samples|sample plot]] and [[Notes|study notes]].',
+    ':::',
+    '',
+    '## Samples',
+    '',
+    '```smd-chart',
+    '{"title":"Discrete","series":[{"name":"Points","points":[[0,1],[1,3]]}]}',
+    '```',
+    '',
+    '```python',
+    'matrix = [[1, 2]]',
+    '```',
+    '',
+    '```bash',
+    'if [[ -f note.md ]]; then echo ok; fi',
+    '```',
+  ].join('\n');
+  const prepared=await preparePdf(source,null);
+  expect(Object.keys(prepared.assets)).toHaveLength(1);
+  const svg=atob(Object.values(prepared.assets)[0]);
+  expect(svg).toContain('<svg');
+  expect(prepared.content).toContain('[!TIP] Overview');
+  expect(prepared.content).toContain('[sample plot](#samples)');
+  expect(prepared.content).toContain('[study notes](Notes.md)');
+  expect(prepared.content).toContain('matrix = [[1, 2]]');
+  expect(prepared.content).toContain('if [[ -f note.md ]]; then echo ok; fi');
+});
