@@ -422,8 +422,8 @@ def build_mcp_server(roots: list[str], live_client=None):
                 raise AgentDocumentError("Desktop returned invalid close status")
             return bounded_result({**result, "target": path})
         if action in ("export", "export_document"):
-            if path is None or format not in ("pdf", "smd", "md"):
-                raise AgentDocumentError("export requires a source path and format pdf, smd, or md")
+            if path is None or format not in ("pdf", "smd", "md", "mdzip"):
+                raise AgentDocumentError("export requires a source path and format pdf, smd, md, or mdzip")
             tab_id = live_id(path)
             if tab_id is not None:
                 if not isinstance(expected_revision, str) or not re.fullmatch(r"[0-9a-f]{64}", expected_revision):
@@ -431,7 +431,7 @@ def build_mcp_server(roots: list[str], live_client=None):
                 if options is not None and (not isinstance(options, dict) or
                                             len(json.dumps(options, ensure_ascii=False).encode("utf-8")) > 8000):
                     raise AgentDocumentError("Export options must be an object no larger than 8 KB")
-                if format != "pdf" and options:
+                if format != "pdf" and options and any(key != "section" for key in options):
                     raise AgentDocumentError("PDF options apply only to PDF export")
                 if filename is not None and (not isinstance(filename, str) or not filename or len(filename) > 160
                                               or Path(filename).name != filename or filename in (".", "..")):
@@ -442,6 +442,8 @@ def build_mcp_server(roots: list[str], live_client=None):
                     raise AgentDocumentError("Live export returned invalid status")
                 return bounded_result({key: value for key, value in result.items()
                                    if key in ("jobId", "status", "filename", "format", "bytes", "sha256", "path")})
+            if format == "mdzip":
+                raise AgentDocumentError("mdzip export requires an open live tab")
             if output_path is None:
                 raise AgentDocumentError("Filesystem export requires output_path inside an allowed root")
             if format != "pdf" and options:

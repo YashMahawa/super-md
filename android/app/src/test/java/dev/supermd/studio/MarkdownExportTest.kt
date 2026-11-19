@@ -74,6 +74,36 @@ class MarkdownExportTest {
         }
     }
 
+    @Test fun zipPackagesSvgAssetEntriesAndRejectsMimeExtensionMismatches() = withExportContext { context ->
+        val svgBytes = "<svg xmlns=\"http://www.w3.org/2000/svg\" viewBox=\"0 0 20 20\"><circle cx=\"10\" cy=\"10\" r=\"6\"/></svg>"
+            .toByteArray(Charsets.UTF_8)
+        val svgDataUrl = "data:image/svg+xml;base64," + Base64.encodeToString(svgBytes, Base64.NO_WRAP)
+        val gifDataUrl = "data:image/gif;base64," + Base64.encodeToString(gifBytes, Base64.NO_WRAP)
+        val source = "# Shapes\n\n![Inline](<image1.svg>)\n\n![Nested](<figures/diagram.svg>)\n"
+        val assets = JSONObject()
+            .put("image1.svg", svgDataUrl)
+            .put("figures/diagram.svg", svgDataUrl)
+            .put("figures/anim.gif", gifDataUrl)
+
+        MarkdownExport(context, "Shapes.md", source, assets).use { export ->
+            val zipBytes = ByteArrayOutputStream().also(export::writeZip).toByteArray()
+            assertTrue(ExportFilename.hasExpectedHeader(zipBytes, NativeExportFormat.MARKDOWN_ZIP))
+            val entries = readZip(zipBytes)
+            assertEquals(setOf("Shapes.md", "image1.svg", "figures/diagram.svg", "figures/anim.gif"), entries.keys)
+            assertEquals(source, entries["Shapes.md"]!!.toString(Charsets.UTF_8))
+            assertArrayEquals(svgBytes, entries["image1.svg"])
+            assertArrayEquals(svgBytes, entries["figures/diagram.svg"])
+            assertArrayEquals(gifBytes, entries["figures/anim.gif"])
+        }
+
+        assertThrows(IllegalArgumentException::class.java) {
+            MarkdownExport(context, "Shapes.md", source, JSONObject().put("image1.svg", gifDataUrl))
+        }
+        assertThrows(IllegalArgumentException::class.java) {
+            MarkdownExport(context, "Shapes.md", source, JSONObject().put("image1.png", svgDataUrl))
+        }
+    }
+
     private fun withExportContext(block: (Context) -> Unit) {
         val app = RuntimeEnvironment.getApplication()
         val tempCache = Files.createTempDirectory("markdown-export-test").toFile()
