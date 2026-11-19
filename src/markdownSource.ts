@@ -27,6 +27,28 @@ function regexStage(source:string,regex:RegExp,replacement:(...args:any[])=>stri
   return replaceStage(source,edits);
 }
 
+export function normalizeCalloutBlocks(value:string):Stage {
+  const frontmatterEnd=value.match(/^---\r?\n[\s\S]*?\r?\n---(?:\r?\n|$)/)?.[0].length??0;
+  const edits:Edit[]=[];let offset=0,depth=0,fence='',fenceLength=0;
+  for(const rawLine of value.split('\n')){
+    const line=rawLine.endsWith('\r')?rawLine.slice(0,-1):rawLine;
+    if(offset>=frontmatterEnd){
+      const code=line.match(/^ {0,3}(`{3,}|~{3,})(.*)$/);
+      const insideCode=!!fence;
+      if(code){
+        if(!fence){fence=code[1][0];fenceLength=code[1].length;}
+        else if(code[1][0]===fence&&code[1].length>=fenceLength&&!code[2].trim())fence='';
+      }
+      const start=!insideCode&&!code&&line.match(/^:::callout\s+([\w-]+)(?:\s+(.+))?\s*$/i);
+      if(start){depth++;edits.push({start:offset,end:offset+line.length,text:`${'> '.repeat(depth)}[!${start[1].toUpperCase()}] ${start[2]?.replace(/^['"]|['"]$/g,'')||start[1]}`});}
+      else if(!insideCode&&!code&&line.trim()===':::'&&depth){depth--;edits.push({start:offset,end:offset+line.length,text:'> '.repeat(depth).trimEnd()});}
+      else if(depth)edits.push({start:offset,end:offset,text:'> '.repeat(depth)});
+    }
+    offset+=rawLine.length+1;
+  }
+  return replaceStage(value,edits);
+}
+
 /** Render-only syntax normalization with a sparse offset map. Source positions
  * always address the original note, including frontmatter and wiki/callout edits. */
 export function normalizeMarkdownSource(markdown:string):Stage {
@@ -36,21 +58,7 @@ export function normalizeMarkdownSource(markdown:string):Stage {
   add(regexStage(value,/!\[\[([^\]|]+)(?:\|([^\]]+))?\]\]/g,(_all,path,label)=>`![${label??path}](${encodeURI(path)})`));
   add(regexStage(value,/\[\[(#[\s\S]*?)\]\]/g,(_all,target:string)=>{const [id,label]=target.split('|');return `[${label||id.slice(1)}](#${headingSlug(id.slice(1))})`;}));
   add(regexStage(value,/\[\[([^\]|]+)(?:\|([^\]]+))?\]\]/g,(_all,target,label)=>`[${label??target}](${target.endsWith('.md')?target:`${target}.md`})`));
-  const edits:Edit[]=[];let offset=0,depth=0,fence='',fenceLength=0;
-  for(const line of value.split('\n')){
-    const code=line.match(/^ {0,3}(`{3,}|~{3,})(.*)$/);
-    const insideCode=!!fence;
-    if(code){
-      if(!fence){fence=code[1][0];fenceLength=code[1].length;}
-      else if(code[1][0]===fence&&code[1].length>=fenceLength&&!code[2].trim())fence='';
-    }
-    const start=!insideCode&&!code&&line.match(/^:::callout\s+([\w-]+)(?:\s+(.+))?\s*$/i);
-    if(start){depth++;edits.push({start:offset,end:offset+line.length,text:`${'> '.repeat(depth)}[!${start[1].toUpperCase()}] ${start[2]?.replace(/^['"]|['"]$/g,'')||start[1]}`});}
-    else if(!insideCode&&!code&&line.trim()===':::'&&depth){depth--;edits.push({start:offset,end:offset+line.length,text:'> '.repeat(depth).trimEnd()});}
-    else if(depth)edits.push({start:offset,end:offset,text:'> '.repeat(depth)});
-    offset+=line.length+1;
-  }
-  add(replaceStage(value,edits));
+  add(normalizeCalloutBlocks(value));
   return {value,originalOffset(offset){for(let i=stages.length-1;i>=0;i--)offset=stages[i].originalOffset(offset);return offset;}};
 }
 export function normalizeCallouts(markdown:string):string{return normalizeMarkdownSource(markdown).value;}

@@ -339,7 +339,7 @@ function Reader() {
       try {
         if((current as ReaderState&{editProtocol?:number}).editProtocol===1)await edits.current!.flush(current.id);
         const latest=reference.current;if(!latest||latest.id!==current.id)throw new Error('The export note changed');
-        const prepared=await prepareMarkdownExport(latest.content,latest.path,{compatible:archive});
+        const prepared=await prepareMarkdownExport(latest.content,latest.path,{compatible:archive,python:latest.python||"embedded"});
         if(reference.current?.id!==latest.id||reference.current.content!==latest.content)throw new Error('The note changed while preparing the Markdown export');
         await invoke("export_markdown_native", {id: latest.id, content: prepared.content, assets: prepared.assets, archive}); }
       catch (error) { await invoke("export_failed", {error: String(error)}); }
@@ -674,11 +674,11 @@ function Reader() {
           return response;
         }
         if(request.action==='export_document'){
-          const format=request.format;if(!['pdf','smd','md'].includes(String(format)))throw Error('Export format must be pdf, smd or md');
+          const format=request.format;if(!['pdf','smd','md','mdzip'].includes(String(format)))throw Error('Export format must be pdf, smd, md or mdzip');
           const suppliedOptions=request.options&&typeof request.options==='object'&&!Array.isArray(request.options)?request.options as Record<string,unknown>:{};
           const hasSection=Object.prototype.hasOwnProperty.call(suppliedOptions,'section'),section=hasSection?agentSectionForExport(note.content,suppliedOptions.section):undefined;
           const exportContent=section?.text??note.content,{section:_section,...exportOptions}=suppliedOptions;
-          const prepared=format==='pdf'?await preparePdf(exportContent,note.path,note.python||'embedded'):format==='smd'?await prepareFmd(exportContent,note.path):await prepareMarkdownExport(exportContent,note.path);
+          const prepared=format==='pdf'?await preparePdf(exportContent,note.path,note.python||'embedded'):format==='smd'?await prepareFmd(exportContent,note.path):await prepareMarkdownExport(exportContent,note.path,{compatible:format==='mdzip',python:note.python||'embedded'});
           if(reference.current?.id!==note.id||reference.current.content!==note.content)throw Error('Revision conflict: the note changed while preparing the export');
           const result=await invoke<Record<string,unknown>>('agent_export_native',{...prepared,id:note.id,expectedRevision:revision,requestId:request.requestId,format,filename:request.filename,options:exportOptions});
           return section?{...result,sectionStart:section.sectionStart,sectionEnd:section.sectionEnd,documentLength:section.documentLength}:result;

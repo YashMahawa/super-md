@@ -89,10 +89,10 @@ function sourceFenceBlock(source: string, language: "svg" | "mermaid"): string {
  * written beside the exported Markdown by the native host; remote URLs remain
  * untouched and are never fetched as a side effect of export.
  */
-export async function prepareMarkdownExport(markdown: string, documentPath: string | null, options: {compatible?:boolean} = {}) {
+export async function prepareMarkdownExport(markdown: string, documentPath: string | null, options: {compatible?:boolean;python?:string} = {}) {
   if(options.compatible){
     const {compatibleMarkdown}=await import('./compatibleMarkdown');
-    markdown=await compatibleMarkdown(markdown,documentPath);
+    markdown=await compatibleMarkdown(markdown,documentPath,options.python);
   }
   const assets: Record<string, string> = {};
   const edits: Array<{ start: number; end: number; value: string }> = [];

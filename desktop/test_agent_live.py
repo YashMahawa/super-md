@@ -238,8 +238,10 @@ class LiveDesktopBridgeTests(unittest.TestCase):
             self._finish(request, {"mime_type": "image/png", "data": base64.b64encode(png).decode(), "width": 1, "height": 1,
                                    "diagramId": request["diagramId"], "revision": hashlib.sha256(self.studio.live_source.encode()).hexdigest()})
         elif action == "export_document":
-            self._finish(request, {"filename": "Active.pdf", "format": "pdf", "bytes": 12,
-                                   "sha256": "a" * 64, "path": "/tmp/Active.pdf"})
+            fmt = request.get("format", "pdf")
+            ext = ".zip" if fmt == "mdzip" else f".{fmt}"
+            self._finish(request, {"filename": f"Active{ext}", "format": fmt, "bytes": 12,
+                                   "sha256": "a" * 64, "path": f"/tmp/Active{ext}"})
         else:
             self._finish(request, error="Unknown test action")
 
@@ -424,6 +426,11 @@ class LiveDesktopBridgeTests(unittest.TestCase):
             self.active_id, "export_document", format="pdf", expected_revision=revision,
             window_id=self.window_id))
         self.assertEqual(exported["filename"], "Active.pdf")
+        exported_zip = self._call_with_qt_pump(lambda: self.client.export_document(
+            self.active_id, format="mdzip", expected_revision=revision,
+            window_id=self.window_id))
+        self.assertEqual(exported_zip["filename"], "Active.zip")
+        self.assertEqual(exported_zip["format"], "mdzip")
         with self.assertRaises(agent_live.LiveBridgeError):
             self.client.document_action(self.active_id, "unknown", window_id=self.window_id)
 

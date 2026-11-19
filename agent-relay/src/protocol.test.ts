@@ -39,6 +39,8 @@ test("audit lifecycle and paged read options preserve write guards", () => {
     assert.throws(()=>validateRpcRequest({...base,documentAction}),/expectedRevision/);
     assert.equal(validateRpcRequest({...base,documentAction,expectedRevision:"a".repeat(64)}).documentAction,documentAction);
   }
+  assert.equal(validateRpcRequest({...base,documentAction:"export",format:"mdzip",expectedRevision:"a".repeat(64)}).format,"mdzip");
+  assert.throws(()=>validateRpcRequest({...base,documentAction:"export",format:"zip",expectedRevision:"a".repeat(64)}),/Invalid export format/);
   assert.equal(validateRpcRequest({...base,documentAction:"latex_review"}).documentAction,"latex_review");
   assert.equal(validateRpcRequest({requestId:"list",action:"list_diagrams",tabId:"window:tab",offset:10,limit:5}).limit,5);
   assert.throws(()=>validateRpcRequest({requestId:"injected",action:"read_tab",tabId:"window:tab",content:"replacement"}),/only accepted for create/);
