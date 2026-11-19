@@ -168,6 +168,7 @@ ApplicationWindow {
         case "zoom_in": window.runDocumentScript("window.supermdZoomBy?.(1.1)"); break
         case "zoom_out": window.runDocumentScript("window.supermdZoomBy?.(1/1.1)"); break
         case "zoom_reset": window.runDocumentScript("window.supermdResetZoom?.()"); break
+        case "typewriter_scroll": studio.setting("typewriterScroll", JSON.stringify(!viewState.settings.typewriterScroll)); break
         }
     }
     function focusReader() { if (reader) reader.forceActiveFocus() }

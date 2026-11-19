@@ -56,6 +56,23 @@ class StudioTest(unittest.TestCase):
         studio.setting('latexAutofix','false')
         self.assertFalse(json.loads(loads[-1])['latexAutofix'])
 
+    def test_typewriter_scroll_is_opt_in_validated_and_synced_with_reader(self):
+        studio=self.studio;loads=[];replies=[];studio.readerLoad.connect(loads.append);studio.ready=True
+        studio.replied.connect(lambda identifier,value,error:replies.append((identifier,value,error)))
+        self.assertFalse(studio.settings['typewriterScroll'])
+        for invalid in ('true',1,None):
+            studio.setting('typewriterScroll',json.dumps(invalid))
+            self.assertFalse(studio.settings['typewriterScroll'])
+        studio.setting('typewriterScroll','true')
+        self.assertTrue(json.loads(loads[-1])['typewriterScroll'])
+        self.assertTrue(self.session.settings['typewriterScroll'])
+        studio.post('tw1','typewriter_scroll',json.dumps({'enabled':False}))
+        self.assertEqual(replies[-1],('tw1','true',''))
+        self.assertFalse(studio.settings['typewriterScroll'])
+        self.assertFalse(json.loads(loads[-1])['typewriterScroll'])
+        studio.post('tw2','typewriter_scroll',json.dumps({'enabled':'yes'}))
+        self.assertTrue(replies[-1][2])
+
     def test_theme_guide_opens_in_reader_and_copies_without_editing_note(self):
         studio=self.studio;calls=[];replies=[];studio.readerCall.connect(calls.append)
         studio.replied.connect(lambda identifier,value,error:replies.append((identifier,value,error)))
