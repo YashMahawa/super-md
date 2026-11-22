@@ -58,7 +58,7 @@ DEFAULTS.update(desktopIntegration=False)
 DEFAULTS.update(selectionAssistant="chatgpt")
 DEFAULTS.update(latexAutofix=False)
 DEFAULTS.update(shortcuts=default_shortcuts())
-DEFAULTS.update(agentAccessEnabled=False, cloudAgentEnabled=False)
+DEFAULTS.update(agentAccessEnabled=False, cloudAgentEnabled=False, keepInBackground=False)
 
 def agent_mcp_setup_config(discovery_dir, *, executable=None, frozen=None, platform=None, cli_script=None):
     """Return a directly executable, absolute MCP stdio command for this install."""
@@ -194,6 +194,7 @@ class Session(QObject):
         self.startup_entries = []
         self.startup_active_id = ""
         self.quitting = False
+        self.update_installed = False
         self.locations = {}
         self.drafts = {}
         self.windows = {}
@@ -217,6 +218,7 @@ class Session(QObject):
         # an explicit, persisted opt-in made through its connect switch.
         self.settings["agentAccessEnabled"] = False
         self.settings["cloudAgentEnabled"] = self.settings.get("cloudAgentEnabled") is True
+        self.settings["keepInBackground"] = self.settings.get("keepInBackground") is True
         shortcuts, _ = normalize_shortcuts(self.settings.get("shortcuts"))
         self.settings["shortcuts"] = shortcuts or default_shortcuts()
         try:
@@ -1309,8 +1311,19 @@ class Studio(QObject):
 
     @Property(bool,notify=changed)
     def backgroundEnabled(self):
+        if getattr(self.session, "update_installed", False):
+            return False
         service=getattr(self.session,"background",None)
         return bool(service and service.enabled and not service.quitting)
+
+    @Slot(result=bool)
+    def hasOtherOpenWindows(self):
+        return any(
+            other is not self
+            and not other.retired
+            and (getattr(other, "host_window", None) is None or other.host_window.isVisible())
+            for other in self.session.windows.values()
+        )
 
     @Property(str,notify=changed)
     def pythonStatus(self): return self.python_status
@@ -1431,6 +1444,8 @@ class Studio(QObject):
             if error:self.update_status='Update installation failed: '+error;return
             path,prepared_kind=prepared
             if prepared_kind=='appimage':
+                self.session.update_installed=True
+                self.session.changed.emit()
                 self.update_status='Update installed. Close and reopen Super MD to use it. Your previous version and downloaded installer have been kept.'
             else:
                 opened=QProcess.startDetached(path,[]) if prepared_kind=='windows' else QDesktopServices.openUrl(QUrl.fromLocalFile(path))
@@ -1443,6 +1458,7 @@ class Studio(QObject):
                     self.update_status='Disk image opened. Drag Super MD into Applications and confirm replacement to update.'
                 else:
                     self.update_status='Installer opened. Follow its instructions; the download is kept in Downloads.'
+            self._emit(False)
         self._submit(prepare,done,False)
 
     def _can_move(self):
@@ -2008,7 +2024,7 @@ class Studio(QObject):
         if key in ("imageAppearance","svgAppearance") and value not in ("original","invert-dark","auto","monochrome","contrast"):return
         if key in ("restorePosition","centerLock") and not isinstance(value,bool):return
         if key=="imageContrast" and (not isinstance(value,(int,float)) or isinstance(value,bool) or not math.isfinite(value) or not 1<=value<=2):return
-        if key in ("motion","welcomed","autosave","checkUpdates","autoUpdate","spellCheck","grammarCheck","latexAutofix","desktopIntegration","fullDocumentAccessibility") and not isinstance(value,bool): return
+        if key in ("motion","welcomed","autosave","checkUpdates","autoUpdate","spellCheck","grammarCheck","latexAutofix","desktopIntegration","fullDocumentAccessibility","keepInBackground") and not isinstance(value,bool): return
         if key in ("font","python") and (not isinstance(value,str) or not value.strip() or len(value)>2048): return
         if key == "python":
             try: value = python_runtime.validate(value.strip())

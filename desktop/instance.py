@@ -10,8 +10,9 @@ class InstanceBroker(QObject):
     requested = Signal(str)
     serviceRequested = Signal(str)
 
-    def __init__(self, parent=None):
+    def __init__(self, parent=None, *, service_handler=None):
         super().__init__(parent)
+        self.service_handler = service_handler
         root = Path(QStandardPaths.writableLocation(QStandardPaths.AppDataLocation))
         root.mkdir(parents=True, exist_ok=True)
         self.lock = QLockFile(str(root / "native-instance.lock"))
@@ -20,6 +21,9 @@ class InstanceBroker(QObject):
         self.server = QLocalServer(self)
         self.server.setSocketOptions(QLocalServer.SocketOption.UserAccessOption)
         self.server.newConnection.connect(self.accept)
+
+    def set_service_handler(self, handler):
+        self.service_handler = handler
 
     def claim_or_forward(self, note):
         if self.lock.tryLock(0):
@@ -54,10 +58,21 @@ class InstanceBroker(QObject):
                     return
                 try:
                     request = json.loads(buffer.split(b"\n", 1)[0])
-                    if set(request)=={"service"} and request["service"] in ("start","status","quit"):
-                        socket.write(b"ok\n");socket.flush()
-                        self.serviceRequested.emit(request["service"])
-                        socket.disconnectFromServer();return
+                    if not isinstance(request, dict):
+                        raise ValueError("Invalid IPC request")
+                    if set(request) == {"service"} and request["service"] in ("start", "status", "stop", "quit"):
+                        raw_action = request["service"]
+                        action = "stop" if raw_action == "quit" else raw_action
+                        self.serviceRequested.emit(raw_action)
+                        reply = (
+                            self.service_handler(action)
+                            if self.service_handler is not None
+                            else {"ok": False, "running": False, "error": "Background service is unavailable"}
+                        )
+                        socket.write(json.dumps(reply, separators=(",", ":")).encode("utf-8") + b"\n")
+                        socket.flush()
+                        socket.disconnectFromServer()
+                        return
                     note = request["note"]
                     if set(request) != {"note"} or not isinstance(note, str) or "\0" in note:
                         raise ValueError("Invalid file-opening request")

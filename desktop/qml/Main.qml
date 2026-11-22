@@ -248,7 +248,7 @@ ApplicationWindow {
         target: studio
         function onAllowClose() {
             flushDialog.close(); closeDialog.close()
-            if (studio.backgroundEnabled) { window.hide(); return }
+            if (studio.backgroundEnabled && !studio.hasOtherOpenWindows()) { window.hide(); return }
             intentionalShutdown = true; closingAllowed = true; window.close()
         }
         function onFlushFailed(canClose) { if(!closingAllowed && !closeDialog.visible) { flushDialog.canClose = canClose; flushDialog.open() } }

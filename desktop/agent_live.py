@@ -900,6 +900,8 @@ def _qt_bridge_class():
                         parent["completed"] = 0
                         parent["fallback"] = {}
                     for studio in candidates:
+                        host_window = getattr(studio, "host_window", None)
+                        window_visible = host_window is None or host_window.isVisible()
                         tab_rows = []
                         for tab in studio.tabs:
                             source = tab["content"]
@@ -909,14 +911,14 @@ def _qt_bridge_class():
                                              "isDirty": tab["content"] != tab["saved"],
                                              "sourceLength": len(source),
                                              "revision": __import__("hashlib").sha256(source.encode("utf-8")).hexdigest(),
-                                             "active": tab["id"] == studio.active})
+                                             "active": window_visible and tab["id"] == studio.active})
                         child_id = uuid.uuid4().hex
                         with self._lock:
                             self._dispatches[child_id] = (request_id, studio.window_id, "list")
                             if request_id in self._pending:
                                 self._pending[request_id]["fallback"][studio.window_id] = tab_rows
                         request = {"action": "list_tabs", "requestId": child_id, "tabs": tab_rows,
-                                   "windowId": studio.window_id, "activeTabId": studio.active}
+                                   "windowId": studio.window_id, "activeTabId": studio.active if window_visible else ""}
                         studio.agentRequest.emit(json.dumps(request, ensure_ascii=False, separators=(",", ":")))
                     return
                 elif action == "create_document":
@@ -1249,6 +1251,9 @@ def _qt_bridge_class():
                     rows = result.get("tabs") if isinstance(result, dict) else None
                     fallback = pending.get("fallback", {}).get(expected_window, [])
                     fallback_by_id = {row.get("id"): row for row in fallback if isinstance(row, dict)}
+                    owner_studio = self.session.windows.get(expected_window)
+                    owner_host = getattr(owner_studio, "host_window", None) if owner_studio is not None else None
+                    owner_visible = owner_host is None or owner_host.isVisible()
                     if isinstance(rows, list):
                         for row in rows:
                             if not isinstance(row, dict):
@@ -1257,6 +1262,8 @@ def _qt_bridge_class():
                             merged.update({key: row[key] for key in (
                                 "id", "windowId", "title", "path", "format", "isDirty",
                                 "sourceLength", "revision", "active") if key in row})
+                            if not owner_visible:
+                                merged["active"] = False
                             if merged.get("id"):
                                 pending["aggregate"].append(merged)
                     else:

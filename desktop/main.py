@@ -195,8 +195,14 @@ def main():
         window.readerViewChanged.connect(attach_reader_gestures)
         attach_reader_gestures(window.findChild(QObject, "documentReader"))
         def retire_window():
-            if not window.isVisible() and not studio.retired and not studio.backgroundEnabled:
+            service = getattr(session, "background", None)
+            if service is not None:
+                service.handle_window_visibility(studio, engines=engines, studios=studios, engine=engine)
+                return
+            has_other_window = any(other is not studio and not other.retired for other in session.windows.values())
+            if not window.isVisible() and not studio.retired and (not studio.backgroundEnabled or has_other_window):
                 studio.stop()
+                if studio in studios: studios.remove(studio)
                 if engine in engines: engines.remove(engine)
                 engine.deleteLater()
         window.visibleChanged.connect(lambda: QTimer.singleShot(0, retire_window))
@@ -494,18 +500,13 @@ def main():
     if args.agent_access:session.agent_bridge.start()
     if broker:
         broker.requested.connect(lambda note: open_from_service(note or None))
-    if broker:
-        def service_request(action):
-            if action=="quit":session.background.quit()
-            elif action=="start":
-                session.background.enabled=True;app.setQuitOnLastWindowClosed(False)
-                session.settings["agentAccessEnabled"]=True;session.agent_bridge.start()
-        broker.serviceRequested.connect(service_request)
+        broker.set_service_handler(session.background.handle_service_request)
     app.openRequested.connect(open_from_service)
     if args.quit_after:
         QTimer.singleShot(args.quit_after, app.quit)
     status = app.exec()
-    for studio in studios:
+    session.agent_bridge.stop()
+    for studio in list(studios):
         studio.stop()
     # Destroy QML contexts while their Python backend objects are still alive.
     for engine in engines:
