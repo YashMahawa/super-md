@@ -40,7 +40,12 @@ class InstanceBroker(QObject):
         local = url.toLocalFile() if url.isLocalFile() else note
         socket.write(json.dumps({"note": str(Path(local).resolve()) if local else ""}).encode() + b"\n")
         socket.waitForBytesWritten(1000)
-        if not socket.waitForReadyRead(2000) or bytes(socket.readAll()) != b"ok\n":
+        raw = bytes(socket.readAll())
+        while b"\n" not in raw and socket.waitForReadyRead(2000):
+            raw += bytes(socket.readAll())
+        if b"\n" not in raw:
+            raw += bytes(socket.readAll())
+        if raw != b"ok\n":
             raise RuntimeError("The existing Super MD process did not acknowledge the new window")
         socket.disconnectFromServer()
         return False
@@ -71,6 +76,7 @@ class InstanceBroker(QObject):
                         )
                         socket.write(json.dumps(reply, separators=(",", ":")).encode("utf-8") + b"\n")
                         socket.flush()
+                        socket.waitForBytesWritten(500)
                         socket.disconnectFromServer()
                         return
                     note = request["note"]
@@ -81,6 +87,7 @@ class InstanceBroker(QObject):
                     return
                 socket.write(b"ok\n")
                 socket.flush()
+                socket.waitForBytesWritten(500)
                 self.requested.emit(note)
                 socket.disconnectFromServer()
             socket.readyRead.connect(read)

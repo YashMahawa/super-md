@@ -14,15 +14,16 @@ def main(argv):
     name='supermd-qt-'+hashlib.sha256(str(root).encode()).hexdigest()[:20]
     def request(action):
         socket=QLocalSocket();socket.connectToServer(name)
-        if not socket.waitForConnected(400):return None
-        socket.write(json.dumps({'service':action}).encode('utf-8')+b'\n');socket.waitForBytesWritten(500)
-        if not socket.waitForReadyRead(1000):
-            socket.disconnectFromServer()
-            raise ValueError('Existing Super MD instance did not respond to service request')
+        if not socket.waitForConnected(1000):return None
+        socket.write(json.dumps({'service':action}).encode('utf-8')+b'\n');socket.waitForBytesWritten(1000)
         raw=bytes(socket.readAll())
-        while b'\n' not in raw and socket.waitForReadyRead(500):
+        while b'\n' not in raw and socket.waitForReadyRead(2000):
+            raw+=bytes(socket.readAll())
+        if b'\n' not in raw:
             raw+=bytes(socket.readAll())
         socket.disconnectFromServer()
+        if not raw:
+            raise ValueError('Existing Super MD instance did not respond to service request')
         try:
             reply=json.loads(raw.split(b'\n',1)[0].decode('utf-8'))
         except (UnicodeDecodeError,ValueError) as error:

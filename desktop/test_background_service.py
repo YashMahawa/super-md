@@ -19,6 +19,7 @@ os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 from PySide6.QtCore import QEvent, QObject, QPointF, QStandardPaths, Qt, QUrl, Signal
 from PySide6.QtQml import QQmlComponent, QQmlEngine
 from PySide6.QtQuick import QQuickItem
+from PySide6.QtQuickControls2 import QQuickStyle
 from PySide6.QtTest import QTest
 from PySide6.QtWidgets import QApplication
 
@@ -26,6 +27,7 @@ import agent_cloud
 import agent_live
 from agent_live_client import MultiSessionLiveClient
 import mcp_server
+import python_runtime
 import updates
 from background_service import BackgroundService
 from instance import InstanceBroker
@@ -104,6 +106,8 @@ class _FakeRelaySocket:
 class BackgroundTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
+        if QApplication.instance() is None:
+            QQuickStyle.setStyle("Material")
         cls.qt_app = QApplication.instance() or QApplication(["BackgroundTests"])
 
     def _pump(self, rounds=8):
@@ -113,6 +117,9 @@ class BackgroundTests(unittest.TestCase):
 
     def _make_session(self):
         session = Session(True)
+        # Prevent background python_runtime.discover() subprocess scans across tests
+        # that do not exercise Python interpreter discovery.
+        session.settings["python"] = sys.executable
         session.agent_bridge = agent_live.create_qt_bridge(session, session.data)
         self.addCleanup(lambda: shutil.rmtree(session.data, ignore_errors=True))
         self.addCleanup(session.writes.shutdown, wait=True)
@@ -122,7 +129,7 @@ class BackgroundTests(unittest.TestCase):
     def _make_studio(self, session, *, visible=True):
         studio = QuietStudio(True, session)
         studio.host_window = _VisibleHost(visible=visible)
-        self.addCleanup(lambda: (studio.stop(), studio.pool.shutdown(wait=True)))
+        self.addCleanup(lambda: (studio.stop(), studio.pool.shutdown(wait=True, cancel_futures=True)))
         return studio
 
     def _write_test_pairing(self, studio):
@@ -391,10 +398,11 @@ ApplicationWindow {
     SettingsPage { id: settings; anchors.fill: parent; viewState: host.viewState }
 }
 """
-        component.setData(qml_source.encode("utf-8"), QUrl.fromLocalFile(str(QML_DIR / "tray-settings-test.qml")))
-        self.assertFalse(component.isError(), "\n".join(err.toString() for err in component.errors()))
-        window = component.create()
-        self.assertIsNotNone(window)
+        with patch.object(python_runtime, "discover", return_value=[]):
+            component.setData(qml_source.encode("utf-8"), QUrl.fromLocalFile(str(QML_DIR / "tray-settings-test.qml")))
+            self.assertFalse(component.isError(), "\n".join(err.toString() for err in component.errors()))
+            window = component.create()
+            self.assertIsNotNone(window)
         try:
             QTest.qWait(40)
 
@@ -440,13 +448,108 @@ ApplicationWindow {
             self.qt_app.sendPostedEvents(None, QEvent.Type.DeferredDelete)
 
 
+_IPC_WORKER_SCRIPT = """
+import contextlib, io, json, sys
+from unittest.mock import MagicMock, patch
+from PySide6.QtCore import QCoreApplication, QStandardPaths
+
+app = QCoreApplication.instance() or QCoreApplication(["super-md"])
+orig_writable = QStandardPaths.writableLocation
+import agent_cli, background_cli
+from instance import InstanceBroker
+
+control_in = sys.stdin
+control_out = sys.stdout
+
+for raw_line in control_in:
+    line = raw_line.strip()
+    if not line:
+        continue
+    cmd = json.loads(line)
+    kind = cmd.get("kind")
+    if kind == "quit":
+        break
+    appdata = cmd["appdata"]
+    with patch.object(
+        QStandardPaths,
+        "writableLocation",
+        side_effect=lambda k, p=appdata: p if k == QStandardPaths.AppDataLocation else orig_writable(k),
+    ):
+        if kind == "claim":
+            broker = InstanceBroker()
+            try:
+                claimed = broker.claim_or_forward(cmd.get("note"))
+            finally:
+                if claimed:
+                    broker.close()
+            control_out.write(json.dumps({"claimed": claimed}) + "\\n")
+            control_out.flush()
+        elif kind == "service":
+            out_buf = io.StringIO()
+            err_buf = io.StringIO()
+            marker = cmd.get("spawnMarker")
+            def fake_popen(spawn_cmd, **kwargs):
+                if not marker:
+                    raise AssertionError("Unexpected Popen")
+                with open(marker, "w", encoding="utf-8") as handle:
+                    json.dump(spawn_cmd, handle)
+                return MagicMock()
+            with patch.object(background_cli.subprocess, "Popen", side_effect=fake_popen), \\
+                 patch.object(sys, "stdin", io.StringIO("")), \\
+                 contextlib.redirect_stdout(out_buf), \\
+                 contextlib.redirect_stderr(err_buf):
+                try:
+                    code = agent_cli.main(["service", cmd["action"]])
+                except SystemExit as exc:
+                    code = exc.code if isinstance(exc.code, int) else 1
+            control_out.write(json.dumps({
+                "code": code,
+                "stdout": out_buf.getvalue(),
+                "stderr": err_buf.getvalue(),
+            }) + "\\n")
+            control_out.flush()
+"""
+
+
 class InstanceBrokerAndServiceCliTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
+        if QApplication.instance() is None:
+            QQuickStyle.setStyle("Material")
         cls.qt_app = QApplication.instance() or QApplication(["InstanceBrokerAndServiceCliTests"])
+        env = {**os.environ, "QT_QPA_PLATFORM": "offscreen", "PYTHONPATH": str(DESKTOP_DIR)}
+        cls._worker = subprocess.Popen(
+            [sys.executable, "-u", "-c", _IPC_WORKER_SCRIPT],
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            encoding="utf-8",
+            env=env,
+        )
+
+    @classmethod
+    def tearDownClass(cls):
+        worker = getattr(cls, "_worker", None)
+        if worker is None:
+            return
+        try:
+            if worker.poll() is None and worker.stdin is not None:
+                worker.stdin.write(json.dumps({"kind": "quit"}) + "\n")
+                worker.stdin.flush()
+                worker.wait(timeout=3)
+        except Exception:
+            pass
+        if worker.poll() is None:
+            worker.kill()
+        try:
+            worker.communicate(timeout=2)
+        except Exception:
+            pass
 
     def setUp(self):
         self.temp_appdata = Path(tempfile.mkdtemp(prefix="supermd-ipc-")).resolve()
+        self.addCleanup(lambda: shutil.rmtree(self.temp_appdata, ignore_errors=True))
         self._orig_writable = QStandardPaths.writableLocation
         self.appdata_patcher = patch.object(
             QStandardPaths,
@@ -456,60 +559,65 @@ class InstanceBrokerAndServiceCliTests(unittest.TestCase):
             else self._orig_writable(kind),
         )
         self.appdata_patcher.start()
+        self.addCleanup(self.appdata_patcher.stop)
         self.session = Session(True)
+        self.session.settings["python"] = sys.executable
+        self.addCleanup(lambda: shutil.rmtree(self.session.data, ignore_errors=True))
+        self.addCleanup(self.session.writes.shutdown, wait=True)
         self.session.agent_bridge = agent_live.create_qt_bridge(self.session, self.session.data)
+        self.addCleanup(self.session.agent_bridge.stop)
         self.studio = QuietStudio(True, self.session)
         self.studio.host_window = _VisibleHost(visible=True)
+        self.addCleanup(lambda: (self.studio.stop(), self.studio.pool.shutdown(wait=True, cancel_futures=True)))
         self.app_stub = App()
         self.tray_patcher = patch("background_service.QSystemTrayIcon.isSystemTrayAvailable", return_value=False)
         self.tray_patcher.start()
+        self.addCleanup(self.tray_patcher.stop)
         self.session.background = BackgroundService(self.app_stub, self.session, ROOT, lambda _: None, force=False)
         self.broker = InstanceBroker(self.qt_app, service_handler=self.session.background.handle_service_request)
+        self.addCleanup(self.broker.close)
         self.assertTrue(self.broker.claim_or_forward(None))
 
-    def tearDown(self):
-        self.broker.close()
-        self.session.agent_bridge.stop()
-        self.studio.stop()
-        self.studio.pool.shutdown(wait=True)
-        self.session.writes.shutdown(wait=True)
-        self.tray_patcher.stop()
-        self.appdata_patcher.stop()
-        shutil.rmtree(self.session.data, ignore_errors=True)
-        shutil.rmtree(self.temp_appdata, ignore_errors=True)
+    def _ipc_worker_call(self, payload: dict, *, on_tick=None, timeout: float = 8.0) -> dict:
+        self.assertIsNone(self._worker.poll(), "IPC worker exited unexpectedly")
+        reply_holder = {}
+        error_holder = []
 
-    def _run_child_python(self, code_snippet: str):
-        env = {**os.environ, "QT_QPA_PLATFORM": "offscreen", "PYTHONPATH": str(DESKTOP_DIR)}
-        proc = subprocess.Popen(
-            [sys.executable, "-c", code_snippet],
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True,
-            encoding="utf-8",
-            env=env,
-        )
-        deadline = time.monotonic() + 8
-        while proc.poll() is None and time.monotonic() < deadline:
+        def reader():
+            try:
+                self._worker.stdin.write(json.dumps(payload) + "\n")
+                self._worker.stdin.flush()
+                line = self._worker.stdout.readline()
+                if not line:
+                    stderr_text = self._worker.stderr.read() if self._worker.poll() is not None else ""
+                    raise RuntimeError(f"IPC worker returned EOF; stderr={stderr_text}")
+                reply_holder["data"] = json.loads(line)
+            except BaseException as exc:
+                error_holder.append(exc)
+
+        thread = threading.Thread(target=reader, daemon=True)
+        thread.start()
+        deadline = time.monotonic() + timeout
+        while thread.is_alive() and time.monotonic() < deadline:
+            if on_tick is not None:
+                on_tick()
             self.qt_app.processEvents()
             time.sleep(0.005)
-        stdout, stderr = proc.communicate(timeout=2)
+        thread.join(timeout=1)
         self.qt_app.processEvents()
-        return proc.returncode, stdout, stderr
+        if error_holder:
+            raise error_holder[0]
+        self.assertIn("data", reply_holder, "IPC worker timed out")
+        return reply_holder["data"]
 
     def _run_service_cli(self, action: str):
-        script = f"""
-import os, sys
-from unittest.mock import patch
-from PySide6.QtCore import QStandardPaths
-orig = QStandardPaths.writableLocation
-with patch.object(QStandardPaths, "writableLocation", side_effect=lambda k: {str(self.temp_appdata)!r} if k == QStandardPaths.AppDataLocation else orig(k)):
-    import background_cli, agent_cli
-    with patch.object(background_cli.subprocess, "Popen", side_effect=AssertionError("Unexpected Popen")):
-        raise SystemExit(agent_cli.main(["service", {action!r}]))
-"""
-        code, stdout, stderr = self._run_child_python(script)
-        self.assertTrue(stdout.strip(), f"Empty CLI output; stderr={stderr}")
-        return code, json.loads(stdout)
+        res = self._ipc_worker_call({
+            "kind": "service",
+            "action": action,
+            "appdata": str(self.temp_appdata),
+        })
+        self.assertTrue(res["stdout"].strip(), f"Empty CLI output; stderr={res['stderr']}")
+        return res["code"], json.loads(res["stdout"])
 
     def test_note_forwarding_preserves_single_instance_lock_and_ok_ack(self):
         forwarded = []
@@ -517,20 +625,12 @@ with patch.object(QStandardPaths, "writableLocation", side_effect=lambda k: {str
         note_path = self.temp_appdata / "hello.md"
         note_path.write_text("# Hello\n", encoding="utf-8")
 
-        script = f"""
-import json
-from unittest.mock import patch
-from PySide6.QtCore import QCoreApplication, QStandardPaths
-app = QCoreApplication(["super-md"])
-orig = QStandardPaths.writableLocation
-with patch.object(QStandardPaths, "writableLocation", side_effect=lambda k: {str(self.temp_appdata)!r} if k == QStandardPaths.AppDataLocation else orig(k)):
-    from instance import InstanceBroker
-    broker = InstanceBroker()
-    print(json.dumps({{"claimed": broker.claim_or_forward({str(note_path)!r})}}))
-"""
-        code, stdout, stderr = self._run_child_python(script)
-        self.assertEqual(code, 0, stderr)
-        self.assertIs(json.loads(stdout)["claimed"], False)
+        res = self._ipc_worker_call({
+            "kind": "claim",
+            "note": str(note_path),
+            "appdata": str(self.temp_appdata),
+        })
+        self.assertIs(res["claimed"], False)
         self.assertEqual(forwarded, [str(note_path.resolve())])
 
     def test_service_status_reports_false_for_standard_gui_and_true_when_background_enabled(self):
@@ -607,46 +707,29 @@ with patch.object(QStandardPaths, "writableLocation", side_effect=lambda k: {str
 
         # Simulate cold-start: Popen triggers our main-thread broker to begin listening with running=True.
         spawned_commands = []
-
-        script = f"""
-import json, os, sys
-from unittest.mock import MagicMock, patch
-from PySide6.QtCore import QStandardPaths
-orig = QStandardPaths.writableLocation
-marker = {str(self.temp_appdata / 'spawned.json')!r}
-def fake_popen(cmd, **kwargs):
-    with open(marker, 'w', encoding='utf-8') as f:
-        json.dump(cmd, f)
-    return MagicMock()
-with patch.object(QStandardPaths, "writableLocation", side_effect=lambda k: {str(self.temp_appdata)!r} if k == QStandardPaths.AppDataLocation else orig(k)):
-    import background_cli, agent_cli
-    with patch.object(background_cli.subprocess, "Popen", side_effect=fake_popen):
-        raise SystemExit(agent_cli.main(["service", "start"]))
-"""
-        env = {**os.environ, "QT_QPA_PLATFORM": "offscreen", "PYTHONPATH": str(DESKTOP_DIR)}
-        proc = subprocess.Popen(
-            [sys.executable, "-c", script],
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True,
-            encoding="utf-8",
-            env=env,
-        )
         marker_file = self.temp_appdata / "spawned.json"
-        deadline = time.monotonic() + 8
-        while proc.poll() is None and time.monotonic() < deadline:
+
+        def bring_up_daemon_when_spawned():
             if marker_file.is_file() and not spawned_commands:
                 spawned_commands.append(json.loads(marker_file.read_text(encoding="utf-8")))
                 self.session.settings["agentAccessEnabled"] = True
                 self.session.agent_bridge.start()
                 self.session.background.set_forced(True)
                 self.assertTrue(self.broker.claim_or_forward(None))
-            self.qt_app.processEvents()
-            time.sleep(0.01)
-        stdout, stderr = proc.communicate(timeout=2)
 
-        self.assertEqual(proc.returncode, 0, f"stdout={stdout} stderr={stderr}")
-        started = json.loads(stdout)
+        res = self._ipc_worker_call(
+            {
+                "kind": "service",
+                "action": "start",
+                "appdata": str(self.temp_appdata),
+                "spawnMarker": str(marker_file),
+            },
+            on_tick=bring_up_daemon_when_spawned,
+            timeout=10.0,
+        )
+
+        self.assertEqual(res["code"], 0, f"stdout={res['stdout']} stderr={res['stderr']}")
+        started = json.loads(res["stdout"])
         self.assertTrue(started["ok"])
         self.assertTrue(started["result"]["running"])
         self.assertIn("--background", spawned_commands[0])
