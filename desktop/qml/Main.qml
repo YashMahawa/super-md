@@ -14,7 +14,7 @@ ApplicationWindow {
     minimumWidth: 760
     minimumHeight: 520
     visible: false
-    flags: windowModes.immersive ? Qt.Window | Qt.FramelessWindowHint : Qt.platform.os === "osx" || Qt.platform.os === "windows" ? Qt.Window | Qt.ExpandedClientAreaHint | Qt.NoTitleBarBackgroundHint : Qt.Window
+    flags: (studio.fedoraWindowFrame || windowModes.immersive) ? Qt.Window | Qt.FramelessWindowHint : Qt.platform.os === "osx" || Qt.platform.os === "windows" ? Qt.Window | Qt.ExpandedClientAreaHint | Qt.NoTitleBarBackgroundHint : Qt.Window
     title: viewState.name + " - Super MD"
     property var viewState: JSON.parse(studio.snapshot)
     property var reader: readerLoader.item
@@ -47,6 +47,26 @@ ApplicationWindow {
         id: windowModes
         host: window
         onFullscreenChanged: { window.chromeAwake = !fullscreen; chromeIdle.stop(); studio.setFullscreen(fullscreen) }
+    }
+    Repeater {
+        parent: Overlay.overlay
+        model: studio.fedoraWindowFrame && window.visibility === Window.Windowed
+            ? [Qt.LeftEdge, Qt.RightEdge, Qt.TopEdge, Qt.BottomEdge,
+               Qt.LeftEdge | Qt.TopEdge, Qt.RightEdge | Qt.TopEdge,
+               Qt.LeftEdge | Qt.BottomEdge, Qt.RightEdge | Qt.BottomEdge] : []
+        delegate: MouseArea {
+            required property int modelData
+            readonly property int horizontalEdge: modelData & (Qt.LeftEdge | Qt.RightEdge)
+            readonly property int verticalEdge: modelData & (Qt.TopEdge | Qt.BottomEdge)
+            width: horizontalEdge ? 5 : parent.width
+            height: verticalEdge ? 5 : parent.height
+            x: modelData & Qt.RightEdge ? parent.width - width : 0
+            y: modelData & Qt.BottomEdge ? parent.height - height : 0
+            z: -1
+            cursorShape: !horizontalEdge ? Qt.SizeVerCursor : !verticalEdge ? Qt.SizeHorCursor
+                : (horizontalEdge === Qt.LeftEdge) === (verticalEdge === Qt.TopEdge) ? Qt.SizeFDiagCursor : Qt.SizeBDiagCursor
+            onPressed: window.startSystemResize(modelData)
+        }
     }
     function runDocumentScript(script) {
         if (!reader) return
@@ -323,7 +343,19 @@ ApplicationWindow {
                 ActionButton { glyph: "FloppyDisk"; ToolTip.text: "Save note (" + window.shortcutLabels.save + ")"; onClicked: studio.saveSafely(); enabled: !viewState.busy }
                 ActionButton { glyph: "Undo"; ToolTip.text: "Undo (" + window.shortcutLabels.undo + ")"; onClicked: studio.command("undo") }
                 ActionButton { glyph: "Redo"; ToolTip.text: "Redo (" + window.shortcutLabels.redo + ")"; onClicked: studio.command("redo") }
-                Item { Layout.fillWidth: true }
+                Item {
+                    Layout.fillWidth: true
+                    Layout.fillHeight: true
+                    DragHandler {
+                        enabled: studio.fedoraWindowFrame
+                        target: null
+                        onActiveChanged: if (active) window.startSystemMove()
+                    }
+                    TapHandler {
+                        enabled: studio.fedoraWindowFrame
+                        onDoubleTapped: window.visibility === Window.Maximized ? window.showNormal() : window.showMaximized()
+                    }
+                }
                 ActionButton { glyph: "MagnifyingGlass"; ToolTip.text: "Find in note (" + window.shortcutLabels.find + ")"; onClicked: window.openFind() }
                 ActionButton { visible: window.width >= 1060; glyph: "Image"; ToolTip.text: "Insert image or link"; onClicked: studio.command("insert") }
                 ActionButton { visible: window.width >= 1060; glyph: "Bug"; ToolTip.text: "Fix LaTeX"; onClicked: studio.command("repair") }
@@ -341,7 +373,7 @@ ApplicationWindow {
                 }
                 ActionButton { text: window.width < 1060 ? "" : "Export"; glyph: "Export"; ToolTip.text: "Export note"; prominent: true; enabled: !viewState.busy; onClicked: window.showExport(false) }
                 ActionButton { glyph: "GearSix"; ToolTip.text: "Settings"; onClicked: settingsOpen = !settingsOpen }
-                WindowControls { visible: studio.captionlessDesktop; host: window; colors: viewState.colors; Layout.preferredWidth: 124; Layout.preferredHeight: 36; Layout.alignment: Qt.AlignVCenter; onCloseRequested: studio.closeWindowSafely() }
+                WindowControls { visible: studio.showToolbarWindowControls; host: window; colors: viewState.colors; Layout.preferredWidth: 124; Layout.preferredHeight: 36; Layout.alignment: Qt.AlignVCenter; onCloseRequested: studio.closeWindowSafely() }
             }
         }
         TabStrip {
@@ -701,6 +733,14 @@ ApplicationWindow {
         anchors.fill: parent
         padding: 40
         background: Rectangle { color: window.color }
+        WindowControls {
+            visible: studio.fedoraWindowFrame
+            anchors.right: parent.right
+            anchors.top: parent.top
+            host: window
+            colors: viewState.colors
+            onCloseRequested: studio.closeWindowSafely()
+        }
         ColumnLayout {
             anchors.centerIn: parent
             width: Math.min(600, parent.width - 40)
