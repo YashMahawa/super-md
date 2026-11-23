@@ -2,14 +2,19 @@
 use anyhow::{anyhow, bail, Result};
 use std::borrow::Cow;
 use std::collections::{HashMap, HashSet, VecDeque};
+#[cfg(not(target_os = "android"))]
 use std::ops::Deref;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{Arc, LazyLock, Mutex, OnceLock};
+#[cfg(not(target_os = "android"))]
+use std::sync::OnceLock;
+use std::sync::{Arc, LazyLock, Mutex};
 use typst::diag::{FileError, FileResult};
 use typst::foundations::{Bytes, Datetime, Duration};
 use typst::syntax::{FileId, RootedPath, Source, VirtualPath, VirtualRoot};
-use typst::text::{Font, FontBook, FontInfo};
+#[cfg(not(target_os = "android"))]
+use typst::text::FontInfo;
+use typst::text::{Font, FontBook};
 use typst::utils::LazyHash;
 use typst::{Library, LibraryExt, World};
 use typst_kit::datetime::Time;
