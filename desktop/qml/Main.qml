@@ -86,6 +86,10 @@ ApplicationWindow {
         const requestId = JSON.stringify(request.requestId || "")
         const failure = "window.SuperMD?.post(" + requestId + ", 'agent_result', JSON.stringify({requestId:" + requestId + ",error:'reader is unavailable'}))"
         if (!window.reader || !viewState.readerReady) {
+            if (!window.visible && request.action === "flush_current") {
+                studio.post(request.requestId || "", "agent_result", JSON.stringify({requestId: request.requestId, result: {flushed: false}, error: ""}))
+                return
+            }
             studio.post(request.requestId || "", "agent_result", JSON.stringify({requestId: request.requestId, error: "Reader is not ready"}))
             return
         }

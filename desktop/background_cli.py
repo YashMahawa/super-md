@@ -34,17 +34,24 @@ def main(argv):
     root=Path(QStandardPaths.writableLocation(QStandardPaths.AppDataLocation))
     name='supermd-qt-'+hashlib.sha256(str(root).encode()).hexdigest()[:20]
     def request(action):
+        wire_action='quit' if action=='stop' else action
         socket=QLocalSocket();socket.connectToServer(name)
         if not socket.waitForConnected(1000):return None
-        socket.write(json.dumps({'service':action}).encode('utf-8')+b'\n');socket.waitForBytesWritten(1000)
+        socket.write(json.dumps({'service':wire_action}).encode('utf-8')+b'\n');socket.waitForBytesWritten(1000)
         raw=bytes(socket.readAll())
         while b'\n' not in raw and socket.waitForReadyRead(2000):raw+=bytes(socket.readAll())
         if b'\n' not in raw:raw+=bytes(socket.readAll())
+        peer_closed=socket.state()==QLocalSocket.LocalSocketState.UnconnectedState
         socket.disconnectFromServer()
         if not raw:
-            if socket.state()==QLocalSocket.LocalSocketState.UnconnectedState:return None
+            if peer_closed:return None
             raise ValueError('Existing Super MD instance did not respond to service request')
-        try:reply=json.loads(raw.split(b'\n',1)[0].decode('utf-8'))
+        line=raw.split(b'\n',1)[0].rstrip(b'\r')
+        if line==b'ok':
+            if action=='status':return {'ok':True,'running':True}
+            if action=='stop':return {'ok':True,'running':False,'quitRequested':True}
+            return {'ok':True,'running':True,'sessionsDirectory':str(root/'qt-studio'/'agent-sessions')}
+        try:reply=json.loads(line.decode('utf-8'))
         except (UnicodeDecodeError,ValueError) as error:raise ValueError('Invalid response from Super MD instance') from error
         if not isinstance(reply,dict):raise ValueError('Invalid response from Super MD instance')
         return reply
@@ -72,8 +79,10 @@ def main(argv):
         while time.monotonic()<deadline:
             status=request('status')
             if status is not None:
-                if not status.get('ok',False):raise ValueError(status.get('error') or 'Background service failed to start')
-                if status.get('running'):running=True;break
+                if status.get('ok',False):
+                    if status.get('running'):running=True;break
+                elif status.get('error')!='Background service is unavailable':
+                    raise ValueError(status.get('error') or 'Background service failed to start')
             time.sleep(.2)
         if not running:raise ValueError('Background service did not start; inspect its local log')
     result={'running':running,'action':args.action}

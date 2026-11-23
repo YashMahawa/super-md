@@ -134,6 +134,7 @@ def main():
     channel_script = bytes(channel.readAll()).decode()
     engines, studios = [], []
     session = Session(args.test_state)
+    if args.background:session.settings["keepInBackground"]=True
     if args.agent_access:session.settings["agentAccessEnabled"]=True
     session.agent_bridge = create_qt_bridge(session, session.data)
     app.aboutToQuit.connect(session.agent_bridge.stop)
