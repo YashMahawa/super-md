@@ -423,6 +423,16 @@ class WorkspaceSearchDesktopTest(unittest.TestCase):
         self.assertTrue(res["cancelled"])
         self.assertLess(res["scannedFiles"], 60)
 
+    def test_open_search_match_supersedes_pending_sync_for_search_flush(self):
+        target = self.root / "target.md"
+        target.write_text("# Target\n\nNeedle match here.\n", encoding="utf-8")
+        self.studio.ready = True
+        self.studio.openFolderSearch()
+        self.assertIsNotNone(self.studio.flush_operation)
+        self.assertEqual(self.studio.flush_operation["action"], "sync_for_search")
+        self.studio.openFolderSearchMatch("", str(target), "Needle", True)
+        self.assertEqual(self.studio.flush_operation["action"], "open_search_match")
+
     def test_qml_and_webengine_quick_switcher_escape_and_seeded_reader_search(self):
         completed = subprocess.run(
             [sys.executable, __file__, "--webengine-probe"],
