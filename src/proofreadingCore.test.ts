@@ -8,6 +8,7 @@ it("offers local grammar corrections at exact source offsets",()=>{
   const issues=writingIssues(source,{grammarCheck:true});
   expect(issues).toHaveLength(2);
   expect(issues.map(issue=>source.slice(issue.from,issue.to))).toEqual(["a","the the"]);
+  expect(issues.map(issue=>issue.originalText)).toEqual(["a","the the"]);
   expect(issues.map(issue=>issue.replacements[0])).toEqual(["an","the"]);
 });
 it("leaves Markdown code, links, image assets, HTML and math unchecked",()=>{
@@ -21,6 +22,7 @@ it("uses a bundled real dictionary and skips reserved technical words",()=>{
   const issues=writingIssues(source,{spellCheck:true},dictionary);
   expect(issues).toHaveLength(1);
   expect(source.slice(issues[0].from,issues[0].to)).toBe("sentnce");
+  expect(issues[0].originalText).toBe("sentnce");
   expect(issues[0].replacements).toContain("sentence");
   expect(writingIssues(source,{},dictionary)).toEqual([]);
 },15_000);

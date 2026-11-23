@@ -93,8 +93,9 @@ export default function Editor({ sessionId = "default", value, onChange, dark, f
     const to=Math.min(editor.state.doc.length,from+12_000,editor.viewport.to+500);
     const blocked:Array<[number,number]>=[];
     syntaxTree(editor.state).iterate({from,to,enter(node){if(["FencedCode","CodeBlock","InlineCode","HTMLBlock","HTMLTag","Link","Image","URL"].includes(node.name)){blocked.push([Math.max(0,node.from-from),node.to-from]);return false;}}});
-    const issues=await checkWriting(editor.state.sliceDoc(from,to),{spellCheck,grammarCheck},blocked);
-    return issues.map(issue=>({from:from+issue.from,to:from+issue.to,severity:"info",source:issue.kind==="spelling"?"Spelling":"Grammar",message:issue.message,actions:issue.replacements.map(replacement=>({name:`Use “${replacement}”`,apply(view,start,end){view.dispatch({changes:{from:start,to:end,insert:replacement}});}}))} satisfies Diagnostic));
+    const slice=editor.state.sliceDoc(from,to);
+    const issues=await checkWriting(slice,{spellCheck,grammarCheck},blocked);
+    return issues.filter(issue=>issue.originalText.length>0&&slice.slice(issue.from,issue.to)===issue.originalText).map(issue=>({from:from+issue.from,to:from+issue.to,severity:"info",source:issue.kind==="spelling"?"Spelling":"Grammar",message:issue.message,actions:issue.replacements.map(replacement=>({name:`Use “${replacement}”`,apply(view,start,end){if(view.state.sliceDoc(start,end)!==issue.originalText)return;view.dispatch({changes:{from:start,to:end,insert:replacement}});}}))} satisfies Diagnostic));
   },{delay:600,needsRefresh:update=>update.viewportChanged});
   const [wrap, setWrap] = useState(true);
   const wrapReference = useRef(wrap); wrapReference.current = wrap;
