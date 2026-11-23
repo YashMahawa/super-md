@@ -1,6 +1,6 @@
 """Cloud pairing revocation must stay responsive and erase local credentials."""
 from __future__ import annotations
-import os, threading, time, unittest
+import os, sys, threading, time, unittest
 os.environ.setdefault("QT_QPA_PLATFORM","offscreen")
 from pathlib import Path
 from PySide6.QtCore import QEvent, QObject, QUrl
@@ -11,6 +11,12 @@ from studio import Session, Studio
 import agent_cloud
 
 class QuietStudio(Studio):
+    def __init__(self, isolated=False, session=None):
+        if isolated:
+            session = session or Session(True)
+            if not session.settings.get("python"):
+                session.settings["python"] = sys.executable
+        super().__init__(isolated, session)
     def _refresh_theme(self): self.system_dark=True
 
 class CloudRevocationUITests(unittest.TestCase):

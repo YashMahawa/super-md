@@ -4,6 +4,7 @@ import os
 import sys
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 os.environ.setdefault("QT_QUICK_BACKEND", "software")
@@ -56,6 +57,20 @@ class ShortcutSettingsSmokeTest(unittest.TestCase):
         cls.app = QGuiApplication.instance() or QGuiApplication(["shortcut settings smoke"])
 
     def setUp(self):
+        self._discover_patch = patch(
+            "python_runtime.discover",
+            return_value=[{
+                "path": sys.executable,
+                "label": "Test Python",
+                "detail": "test · numpy + matplotlib ready",
+                "matplotlib": True,
+                "managed": False,
+                "venv": True,
+                "venvModule": True,
+            }],
+        )
+        self.discover_mock = self._discover_patch.start()
+        self.addCleanup(self._discover_patch.stop)
         self.session = Session(True)
         self.studio = QuietStudio(True, self.session)
         self.engine = QQmlEngine()
@@ -189,6 +204,7 @@ ApplicationWindow {{
     def test_settings_categories_keep_controls_reachable_at_window_sizes(self):
         page = self.window.findChild(object, "settingsPage")
         self.assertIsNotNone(page)
+        self.assertEqual(self.discover_mock.call_count, 0, "Opening Settings on Appearance must not eagerly probe Python interpreters")
         for width, height in ((1280, 720), (1920, 1080), (900, 560)):
             self.window.resize(width, height)
             for section, control_name in (("appearance", "settingsScroll"), ("reading", "readingFontChoice"), ("writing", "writingAutosave"), ("python", "pythonPath"), ("storage", "inspectAppStorage"), ("updates", "openLatestGitHubRelease"), ("shortcuts", "shortcutRecorder_find")):
@@ -197,6 +213,7 @@ ApplicationWindow {{
                 control = self.named_item(control_name)
                 self.assertIsNotNone(control, f"{section} controls must exist at {width}x{height}")
                 self.assertTrue(control.isVisible(), f"{section} controls must be reachable at {width}x{height}")
+        self.assertEqual(self.discover_mock.call_count, 1, "Entering the Python section should populate choices once without rescanning every tab switch")
 
     def test_native_settings_text_copy_keeps_the_qml_editor_shortcut(self):
         field = self.named_item("nativeTextField")

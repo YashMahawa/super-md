@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import base64
 import os
+import sys
 import tempfile
 import time
 import unittest
@@ -17,6 +18,13 @@ from documents import open_note, write_portable
 
 
 class QuietStudio(Studio):
+    def __init__(self, isolated=False, session=None):
+        if isolated:
+            session = session or Session(True)
+            if not session.settings.get("python"):
+                session.settings["python"] = sys.executable
+        super().__init__(isolated, session)
+
     def _refresh_theme(self):
         self.system_dark = True
 

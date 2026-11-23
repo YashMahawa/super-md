@@ -1,6 +1,7 @@
 """Native Studio PDF-command integration with a private synthetic engine."""
 import json
 import os
+import sys
 import tempfile
 import time
 import unittest
@@ -38,6 +39,13 @@ else:
 
 
 class QuietStudio(Studio):
+    def __init__(self, isolated=False, session=None):
+        if isolated:
+            session = session or Session(True)
+            if not session.settings.get("python"):
+                session.settings["python"] = sys.executable
+        super().__init__(isolated, session)
+
     def _refresh_theme(self):
         self.system_dark = True
 
