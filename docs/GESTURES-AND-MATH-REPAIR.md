@@ -6,7 +6,7 @@ can scroll horizontally. Native chrome stays fixed. Source mode scales editor te
 
 | Area | Gesture | Result |
 | --- | --- | --- |
-| Document | Pinch / Ctrl-wheel / held-left-button wheel | Focal page zoom |
+| Document | Pinch / Ctrl-wheel / held-left-button wheel while stationary | Focal page zoom (text drags keep selecting and scrolling) |
 | Document | Two-finger movement | Pan the magnified page |
 | Graph canvas | Left drag / two-finger movement | Pan camera |
 | Graph canvas | Pinch / Ctrl-wheel / held-left-button wheel | Focal graph zoom |
@@ -30,6 +30,8 @@ Currency, code, links, image source and HTML are protected. Ambiguous sentences,
 unknown commands, missing fraction arguments and arbitrary TeX macros are not
 guessed. Spaces inside dollar delimiters are legal in the parser; trimming them
 is a compatibility normalization, not proof that whitespace caused a failure.
+
+Settings → Writing assistance → **LaTeX autofix on paste** is off by default. When enabled, Source, Split and Live editors apply conservative, validated repairs to pasted text as one undoable paste. Ordinary typing, existing valid formulas, code, links and unsupported commands stay unchanged. Context is bounded so pasting does not reparse the entire note. Image/file pastes retain their normal behavior. Use Fix LaTeX to review more ambiguous repairs manually.
 
 Implementation references:
 

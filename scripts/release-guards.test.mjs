@@ -8,7 +8,7 @@ test("tags and platform versions must agree", () => {
   for (const tag of ["main", "v0.3.0;evil", "v0.3.0-rc1", "../v0.3.0"]) assert.throws(() => versionFromTag(tag));
   assert.throws(() => validateVersions("v0.3.0", { android: "0.2.0" }));
 });
-test("publication requires every package, especially the release APK", () => {
+test("publication requires all seven supported packages, especially the release APK", () => {
   assert.equal(validateAssets("v0.3.0", assets), true);
   for (let i = 0; i < assets.length; i++) assert.throws(() => validateAssets("v0.3.0", assets.filter((_, index) => index !== i)));
   assert.throws(() => validateAssets("v0.3.0", [{ ...assets[0], name: "app-debug.apk" }, ...assets.slice(1)]));

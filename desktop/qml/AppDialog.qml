@@ -9,6 +9,8 @@ Dialog {
     id: control
     property var colors: studio.palette
     property bool motion: studio.motionEnabled
+    property real uiScale: 1
+    font.pixelSize: Math.round(14 * uiScale)
     readonly property var hostWindow: parent ? parent.Window.window : null
     property bool blockingHints: false
     parent: Overlay.overlay
@@ -19,9 +21,9 @@ Dialog {
     focus: true
     closePolicy: Popup.CloseOnEscape | Popup.CloseOnPressOutside
     width: Math.min(440, parent ? parent.width - 32 : 440)
-    padding: 24
-    topPadding: 16
-    spacing: 16
+    padding: 24 * uiScale
+    topPadding: 16 * uiScale
+    spacing: 16 * uiScale
     Material.theme: hostWindow && hostWindow.viewState !== undefined ? (hostWindow.viewState.dark ? Material.Dark : Material.Light) : Material.System
     Material.primary: colors.primary
     Material.accent: colors.primary
@@ -41,20 +43,22 @@ Dialog {
         textFormat: Text.PlainText
         visible: text.length > 0
         wrapMode: Text.Wrap
-        leftPadding: 24; rightPadding: 24; topPadding: 24; bottomPadding: 0
+        leftPadding: 24 * control.uiScale; rightPadding: 24 * control.uiScale; topPadding: 24 * control.uiScale; bottomPadding: 0
         color: control.colors.text
-        font.pixelSize: 22
+        font.pixelSize: Math.round(22 * control.uiScale)
         font.weight: Font.DemiBold
     }
     footer: DialogButtonBox {
         visible: count > 0
         standardButtons: control.standardButtons
         alignment: Qt.AlignRight
-        spacing: 8
-        leftPadding: 24; rightPadding: 24; topPadding: 8; bottomPadding: 24
+        spacing: 8 * control.uiScale
+        leftPadding: 24 * control.uiScale; rightPadding: 24 * control.uiScale; topPadding: 8 * control.uiScale; bottomPadding: 24 * control.uiScale
         background: Item {}
         delegate: ActionButton {
             colors: control.colors
+            font: control.font
+            implicitHeight: 44 * control.uiScale
             prominent: DialogButtonBox.buttonRole === DialogButtonBox.AcceptRole || DialogButtonBox.buttonRole === DialogButtonBox.YesRole
         }
     }

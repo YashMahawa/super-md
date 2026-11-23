@@ -1,5 +1,126 @@
 import {test,expect} from '@playwright/test';
 
+const scrollContent=Array.from({length:450},(_,i)=>`## Section ${i}\n\n${'A source paragraph explains the difference between differentiating a signal and differentiating its spectrum. '.repeat(3)}\n\n$$x(t)e^{j\\omega_ct}\\leftrightarrow X(j(\\omega-\\omega_c)),\\quad \\frac{dX}{d\\omega}=\\int_{-\\infty}^{\\infty}(-jt)x(t)e^{-j\\omega t}dt.$$${i===171?'\n\n![Remounted figure](figure.svg)':''}`).join('\n\n');
+const scrollImage='data:image/svg+xml;base64,'+Buffer.from('<svg xmlns="http://www.w3.org/2000/svg" width="1200" height="900"><rect width="1200" height="900" fill="#dae7f2"/><path d="M40 800L500 300L1100 80" stroke="#2673ba" stroke-width="8" fill="none"/></svg>').toString('base64');
+async function mockScrollAssets(page:import('@playwright/test').Page){
+  await page.addInitScript(image=>{window.SuperMD={post:(id,command)=>{
+    if(command==='run_python')throw Error('A scroll test must not execute code');
+    if(command==='load_asset'){const fail=(window as any).failFixtureImage;window.setTimeout(()=>window.supermdReply?.(id,fail?null:image,fail?'Fixture image unavailable':null),100);}
+    else queueMicrotask(()=>window.supermdReply?.(id,null,null));
+  }};},scrollImage);
+}
+const scrollCases=['desktop','android'].flatMap(platform=>[40,100,104,180,300].map(zoom=>({platform,zoom,cold:false})));
+scrollCases.push(...['desktop','android'].map(platform=>({platform,zoom:180,cold:true})));
+for(const {platform,zoom,cold} of scrollCases){
+  test(`fast upward windowed scrolling preserves visible text on ${platform} at ${zoom}%${cold?' with a cold image':''}`,async({page})=>{
+    await page.setViewportSize(platform==='desktop'?{width:1280,height:800}:{width:412,height:850});
+    await mockScrollAssets(page);
+    await page.goto('/android-reader.html');await page.waitForFunction(()=>!!window.supermdLoad);
+    await page.evaluate(({content,platform,zoom})=>{
+      document.documentElement.dataset.platform=platform;document.documentElement.dataset.host=platform==='desktop'?'qt':'android';
+      window.supermdLoad?.({id:'fast-windowed-scroll',content,path:'/fixture/scroll.md',mode:'reader',dark:true,colors:{},font:'Manrope',size:16,zoom,restorePosition:false});
+    },{content:scrollContent,platform,zoom});
+    await expect(page.locator('[data-windowed-block]').first()).toBeAttached();
+    await page.evaluate(()=>document.fonts.ready);
+    // This is a repeated-windowing test: establish the figure's real size
+    // once before cycling past it. A first-ever intrinsic-size discovery
+    // within the viewport legitimately reflows content on either side; the
+    // separate delayed-image test checks first loading ABOVE the viewport.
+    if(!cold){
+      await page.evaluate(()=>window.supermdHeading?.('section-171'));
+      await expect.poll(()=>page.locator('.note-image img').evaluateAll(images=>images.some(image=>(image as HTMLImageElement).complete&&image.getBoundingClientRect().height>100))).toBe(true);
+    }
+    await page.evaluate(()=>window.supermdHeading?.('section-174'));
+    // Navigation keeps its resize observer alive for five seconds to handle
+    // slow diagrams; allow that bounded settling phase to finish first.
+    await expect(page.locator('.android-reading')).not.toHaveAttribute('data-navigating','true',{timeout:8000});
+    const result=await page.evaluate(async()=>{
+      const root=document.querySelector<HTMLElement>('.android-reading')!,drifts:number[]=[],anomalies:unknown[]=[];
+      for(let cycle=0;cycle<4;cycle++)for(let step=0;step<28;step++){
+        const delta=step<14?-520:520,bounds=root.getBoundingClientRect(),point={x:bounds.left+bounds.width*.5,y:bounds.top+bounds.height*.5};
+        // Track text expected to remain visible AFTER this input, not an old
+        // source line that legitimately leaves the viewport during a burst.
+        const caretAtPoint=(document as Document&{caretRangeFromPoint?:(x:number,y:number)=>Range|null}).caretRangeFromPoint;
+        const probeY=delta<0?bounds.top+100:bounds.bottom-100;
+        // One point can land in math, whitespace, or a block gap. Sample a
+        // small grid around the same carried source band so each wheel step
+        // can still contribute connected text ranges without changing the
+        // drift threshold or counting a detached/remounted node.
+        const probes=[] as Array<{range:Range;sourceNode:Node;sourceOffset:number;before:DOMRect;block:string|null}>;
+        const sampled=new Map<Node,Set<number>>();
+        for(const yOffset of [-18,0,18])for(const xFraction of [.35,.5,.65]){
+          const caret=caretAtPoint?.call(document,bounds.left+bounds.width*xFraction,probeY+yOffset);
+          if(!caret||!root.contains(caret.startContainer)||caret.startContainer.nodeType!==Node.TEXT_NODE)continue;
+          const range=caret.cloneRange(),sourceNode=range.startContainer,sourceOffset=range.startOffset;
+          if(sourceOffset>=(sourceNode.textContent?.length??0))continue;
+          const offsets=sampled.get(sourceNode)??new Set<number>();
+          if(offsets.has(sourceOffset))continue;
+          offsets.add(sourceOffset);sampled.set(sourceNode,offsets);
+          range.setEnd(sourceNode,sourceOffset+1);
+          const before=range.getBoundingClientRect();
+          if(before.height)probes.push({range,sourceNode,sourceOffset,before,block:sourceNode.parentElement?.closest('[data-windowed-block]')?.textContent?.slice(0,100)??null});
+        }
+        const scrollBefore=root.scrollTop;
+        const imageBefore=root.querySelector('.note-image,.image-loading')?.getBoundingClientRect().toJSON();
+        window.supermdNativeWheel?.(0,delta,point,false);
+        await new Promise(requestAnimationFrame);
+        // A removed text node retargets its live Range to a parent. Measuring
+        // that parent's rectangle is not measuring the original source line.
+        for(const {range,sourceNode,sourceOffset,before,block} of probes){
+          if(sourceNode.nodeType!==Node.TEXT_NODE||!sourceNode.isConnected||range.startContainer!==sourceNode||range.startOffset!==sourceOffset)continue;
+          const after=range.getBoundingClientRect();
+          if(after.height){const drift=after.top-before.top+delta;drifts.push(drift);if(Math.abs(drift)>3)anomalies.push({cycle,step,delta,drift,scrollBefore,scrollAfter:root.scrollTop,before:before.toJSON(),after:after.toJSON(),text:sourceNode.textContent,block,imageBefore,imageAfter:root.querySelector('.note-image,.image-loading')?.getBoundingClientRect().toJSON()});}
+        }
+      }
+      return {drifts,anomalies,mounted:root.querySelectorAll('[data-windowed-mounted="true"]').length,total:root.querySelectorAll('[data-windowed-block]').length};
+    });
+    await test.info().attach('fast-scroll-source-drift',{body:JSON.stringify(result,null,2),contentType:'application/json'});
+    expect(result.drifts.length).toBeGreaterThan(50);
+    expect(Math.max(...result.drifts.map(Math.abs))).toBeLessThan(3);
+    // Fixing the anchor must not disable offscreen unmounting to hide the bug.
+    expect(result.mounted).toBeLessThan(result.total/3);
+  });
+}
+
+for(const input of ['native','browser'] as const)test(`cold image growth preserves carried source text after a fast ${input} wheel step`,async({page})=>{
+  await page.setViewportSize({width:1280,height:800});
+  await page.addInitScript(image=>{
+    const waiting:Array<()=>void>=[];
+    (window as any).releaseFixtureImage=()=>waiting.splice(0).forEach(reply=>reply());
+    window.SuperMD={post:(id,command)=>{
+      if(command==='load_asset')waiting.push(()=>window.supermdReply?.(id,image,null));
+      else queueMicrotask(()=>window.supermdReply?.(id,null,null));
+    }};
+  },scrollImage);
+  await page.goto('/android-reader.html');await page.waitForFunction(()=>!!window.supermdLoad);
+  await page.evaluate(content=>window.supermdLoad?.({id:'controlled-cold-scroll',content,path:'/fixture/scroll.md',mode:'reader',dark:true,colors:{},font:'Manrope',size:16,zoom:180,restorePosition:false}),scrollContent);
+  await page.evaluate(()=>document.fonts.ready);
+  await page.evaluate(()=>window.supermdHeading?.('section-172'));
+  await expect(page.locator('.android-reading')).not.toHaveAttribute('data-navigating','true',{timeout:8000});
+  await expect(page.locator('.image-loading')).toBeAttached();
+  const source=page.locator('#section-172');
+  await source.evaluate(node=>{const root=node.closest<HTMLElement>('.android-reading')!;root.scrollTop+=node.getBoundingClientRect().top-root.getBoundingClientRect().top-100;});
+  const before=await source.evaluate(node=>node.getBoundingClientRect().top);
+  if(input==='native')await page.evaluate(()=>window.supermdNativeWheel?.(0,-520,{x:640,y:400},false));
+  else {await page.mouse.move(640,400);await page.mouse.wheel(0,-520);}
+  await expect.poll(()=>source.evaluate(node=>node.getBoundingClientRect().top)).toBeCloseTo(before+520,0);
+  const carried=await source.evaluate(node=>node.getBoundingClientRect().top);
+  await page.evaluate(()=>(window as any).releaseFixtureImage());
+  await expect.poll(()=>page.locator('.note-image img').evaluateAll(images=>images.some(image=>image.getBoundingClientRect().height>100))).toBe(true);
+  expect(Math.abs(await source.evaluate(node=>node.getBoundingClientRect().top)-carried)).toBeLessThan(3);
+});
+
+test('a failed remounted image releases its reserved footprint without leaving a stale gap',async({page})=>{
+  await mockScrollAssets(page);await page.goto('/android-reader.html');await page.waitForFunction(()=>!!window.supermdLoad);
+  await page.evaluate(content=>window.supermdLoad?.({id:'image-failure-scroll',content,path:'/fixture/scroll.md',mode:'reader',dark:false,colors:{},font:'Manrope',size:16,zoom:104,restorePosition:false}),scrollContent);
+  await page.evaluate(()=>window.supermdHeading?.('section-174'));
+  await expect.poll(()=>page.locator('.note-image img').evaluateAll(images=>images.some(image=>(image as HTMLImageElement).complete&&image.getBoundingClientRect().height>100))).toBe(true);
+  await page.evaluate(()=>window.supermdHeading?.('section-350'));await expect(page.locator('.note-image')).toHaveCount(0);
+  await page.evaluate(()=>{(window as any).failFixtureImage=true;window.supermdHeading?.('section-174');});
+  await expect(page.locator('.image-error')).toContainText('Fixture image unavailable');
+  await expect.poll(()=>page.locator('.image-error').evaluate(node=>(node.closest<HTMLElement>('[data-windowed-block]')!).style.minHeight)).toBe('');
+});
+
 test('delayed image sizing does not move the visible source anchor during scrolling',async({page})=>{
   await page.exposeFunction('nativeFetch',async(id:string,command:string)=>{
     if(command==='fetch_resource'){

@@ -10,6 +10,8 @@ The lock immediately after the fullscreen button keeps the document horizontally
 
 ## Start with a template
 
+Settings → Custom theme → Theme authoring guide opens this reference inside the app, even offline. The popup follows the current theme, supports scrolling and has **Copy guide** plus individual code-block copy buttons. Copy guide includes the full Markdown reference so it can be pasted into an AI assistant. Close it with the close button, Escape or Android Back to return to the same reading position.
+
 1. Open Settings → Custom theme → Export template. When a custom theme is active this exports that theme instead.
 2. Edit the JSON in any text editor, or ask an AI to edit it using this reference.
 3. Choose Import theme and select the edited `.json` file.

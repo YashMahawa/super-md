@@ -5,6 +5,11 @@ import sys
 import subprocess
 from pathlib import Path
 
+if __name__ == "__main__" and len(sys.argv) > 1 and sys.argv[1] == "agent":
+    # Ordinary agent operations stay lightweight; explicit preview/service commands load their runtime lazily.
+    from agent_cli import main as agent_main
+    sys.exit(agent_main(sys.argv[2:]))
+
 if __name__ == "__main__" and len(sys.argv) > 1 and sys.argv[1] == "--python-cell":
     # The frozen app doubles as the built-in Python for cells. Skip Qt entirely.
     from python_runtime import run_bundled_cell
@@ -37,6 +42,7 @@ from PySide6.QtQuickControls2 import QQuickStyle
 from PySide6.QtWebEngineQuick import QtWebEngineQuick
 from PySide6.QtWebEngineCore import QWebEngineProfile, QWebEngineUrlScheme
 from studio import Session, Studio, ROOT
+from agent_live import create_qt_bridge
 from reader_assets import ReaderAssetSchemeHandler, SCHEME
 from instance import InstanceBroker
 from reader_gestures import ReaderGestures
@@ -68,6 +74,8 @@ def main():
         return subprocess.call([str(engine), *sys.argv[1:]])
     parser = argparse.ArgumentParser(description="Super MD native Qt desktop")
     parser.add_argument("note", nargs="?")
+    parser.add_argument("--background",action="store_true",help="Start the background service without showing a window")
+    parser.add_argument("--agent-access",action="store_true",help="Enable private local agent access for this process")
     parser.add_argument("--test-state", action="store_true", help="Isolated preferences and recovery for UI tests")
     parser.add_argument("--quit-after", type=int, default=0, help=argparse.SUPPRESS)
     parser.add_argument("--smoke", action="store_true", help=argparse.SUPPRESS)
@@ -123,6 +131,9 @@ def main():
     channel_script = bytes(channel.readAll()).decode()
     engines, studios = [], []
     session = Session(args.test_state)
+    if args.agent_access:session.settings["agentAccessEnabled"]=True
+    session.agent_bridge = create_qt_bridge(session, session.data)
+    app.aboutToQuit.connect(session.agent_bridge.stop)
     asset_handler = ReaderAssetSchemeHandler(session.reader_assets, app)
     QWebEngineProfile.defaultProfile().installUrlSchemeHandler(SCHEME.encode("ascii"), asset_handler)
     def detach_window(source_id, tab_id):
@@ -142,7 +153,7 @@ def main():
         else:
             destination.tabs, destination.active = welcome, active
             QTimer.singleShot(0, destination.allowClose.emit)
-    def create_window(note=None):
+    def create_window(note=None, *, show_window=True):
         engine = QQmlApplicationEngine()
         studio = Studio(args.test_state,session)
         if args.smoke:
@@ -184,7 +195,7 @@ def main():
         window.readerViewChanged.connect(attach_reader_gestures)
         attach_reader_gestures(window.findChild(QObject, "documentReader"))
         def retire_window():
-            if not window.isVisible() and not studio.retired:
+            if not window.isVisible() and not studio.retired and not studio.backgroundEnabled:
                 studio.stop()
                 if engine in engines: engines.remove(engine)
                 engine.deleteLater()
@@ -204,10 +215,11 @@ def main():
             window.setScreen(laptop)
             rect = laptop.availableGeometry()
             window.setPosition(rect.x() + max(0,(rect.width()-window.width())//2), rect.y()+max(0,(rect.height()-window.height())//2))
-        if not args.smoke and isinstance(remembered, dict) and remembered.get("maximized"):
-            window.showMaximized()
-        else:
-            window.show()
+        if show_window:
+            if not args.smoke and isinstance(remembered, dict) and remembered.get("maximized"):
+                window.showMaximized()
+            else:
+                window.show()
         frame_state = {}
         def sync_frame(*_):
             key = (int(window.winId()), studio._dark(), tuple(sorted(studio._colors().items())))
@@ -315,6 +327,9 @@ def main():
                 at(12500,lambda:window.setProperty("settingsOpen",True))
                 at(14000,lambda:capture("light-settings"))
                 def dropdown():
+                    page = window.findChild(QObject,"settingsPage")
+                    if page is not None:
+                        page.setProperty("section", "reading")
                     choice = window.findChild(QObject,"readingFontChoice")
                     if choice is None:
                         app.exit(2)
@@ -434,7 +449,26 @@ def main():
                             if toolbar is None or toolbar.property("height")!=56 or toolbar.property("shown") or not stable or clearance.get("inset")!=56 or clearance.get("title",0)<56:
                                 print(f"FULLSCREEN OVERLAY SMOKE FAILED: stable={stable} height={toolbar.property('height') if toolbar else None} shown={toolbar.property('shown') if toolbar else None} clearance={clearance}",flush=True);app.exit(2);return
                             print("FULLSCREEN OVERLAY SMOKE PASSED: compact bar hides without resizing the reader",flush=True)
-                            app.exit(0)
+                            original=studio._current()['content']
+                            studio.openThemeGuide()
+                            script="""(()=>{let tries=0;const check=()=>{const guide=document.querySelector('.theme-guide-dialog');const copy=guide&&[...guide.querySelectorAll('button')].find(b=>b.textContent==='Copy guide');if(!copy||copy.disabled){if(++tries<40)setTimeout(check,150);return;}copy.click();};check();})()"""
+                            QMetaObject.invokeMethod(window,"runDocumentScript",Q_ARG("QVariant",script))
+                            def verify_guide(attempt=0):
+                                copied=QGuiApplication.clipboard().text()
+                                if copied.startswith('# Custom themes') and 'pythonSourceMaxHeight' in copied:
+                                    capture('theme-guide')
+                                    QMetaObject.invokeMethod(window,"runDocumentScript",Q_ARG("QVariant","window.supermdDismiss?.()"))
+                                    if studio._current()['content']!=original:
+                                        print('THEME GUIDE SMOKE FAILED: changed note',flush=True);app.exit(2);return
+                                    print('THEME GUIDE SMOKE PASSED: offline rendering and native clipboard',flush=True);app.exit(0)
+                                elif attempt<40:QTimer.singleShot(200,lambda:verify_guide(attempt+1))
+                                else:
+                                    capture('theme-guide-failed')
+                                    QMetaObject.invokeMethod(window,"runDocumentScript",Q_ARG("QVariant","window.SuperMD.post('guide-failed','export_failed',JSON.stringify({error:'GUIDE:'+JSON.stringify({api:typeof window.supermdThemeGuide,dialog:document.querySelector('.theme-guide-dialog')?.textContent.slice(0,500)})}))"))
+                                    def failed():
+                                        print(f'THEME GUIDE SMOKE FAILED: {studio.message}; clipboard={copied[:80]!r}',flush=True);app.exit(2)
+                                    QTimer.singleShot(150,failed)
+                            QTimer.singleShot(200,verify_guide)
                         QTimer.singleShot(600,fullscreen_shown)
                         QTimer.singleShot(1000,lambda:capture("fullscreen-bar"))
                         QTimer.singleShot(1300,lambda:studio.chromeRequested.emit("hide"))
@@ -447,10 +481,27 @@ def main():
             studio.openPath(str(note))
         return studio
     app.aboutToQuit.connect(lambda:setattr(session,"quitting",True))
-    create_window(args.note)
+    def open_from_service(note=None):
+        hidden=next((studio for studio in studios if not studio.retired and getattr(studio,"host_window",None) is not None and not studio.host_window.isVisible()),None)
+        if hidden is not None:
+            hidden.host_window.show();hidden.host_window.raise_();hidden.host_window.requestActivate()
+            if note:hidden.openNote(str(note))
+            return
+        create_window(note)
+    from background_service import BackgroundService
+    session.background=BackgroundService(app,session,ROOT,open_from_service,force=args.background)
+    create_window(args.note,show_window=not args.background)
+    if args.agent_access:session.agent_bridge.start()
     if broker:
-        broker.requested.connect(lambda note: create_window(note or None))
-    app.openRequested.connect(create_window)
+        broker.requested.connect(lambda note: open_from_service(note or None))
+    if broker:
+        def service_request(action):
+            if action=="quit":session.background.quit()
+            elif action=="start":
+                session.background.enabled=True;app.setQuitOnLastWindowClosed(False)
+                session.settings["agentAccessEnabled"]=True;session.agent_bridge.start()
+        broker.serviceRequested.connect(service_request)
+    app.openRequested.connect(open_from_service)
     if args.quit_after:
         QTimer.singleShot(args.quit_after, app.quit)
     status = app.exec()

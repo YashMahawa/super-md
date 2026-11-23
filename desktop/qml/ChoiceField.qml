@@ -7,24 +7,26 @@ ComboBox {
     id: control
     property var colors: studio.palette
     property bool motion: studio.motionEnabled
+    readonly property real rowHeight: Math.max(44, Math.ceil(font.pixelSize * 44 / 14))
     // A menu is constrained by its actual scroll viewport, not the whole window.
     property Item viewportItem: null
     function positionChoices() {
         const overlay = Overlay.overlay
         const field = control.mapToItem(overlay, 0, 0)
         const bounds = viewportItem ? viewportItem.mapToItem(overlay, 0, 0) : Qt.point(0, 0)
+        choices.width = Math.min(control.width, Math.max(0, Math.min(440, overlay.width - 32)))
         const top = bounds.y + 6
         const bottom = bounds.y + (viewportItem ? viewportItem.height : overlay.height) - 6
         const below = Math.max(0, bottom - field.y - control.height - 6)
         const above = Math.max(0, field.y - 6 - top)
         // Prefer a short, scrollable menu below the field over flipping across
         // unrelated section labels. Only open above when even two rows won't fit.
-        const desired = Math.min(7, control.count) * 44 + 16
+        const desired = Math.min(7, control.count) * control.rowHeight + 16
         const openBelow = below >= Math.min(104, desired) || below >= above
         const available = openBelow ? below : above
-        const rows = Math.max(1, Math.min(7, control.count, Math.floor((available - 16) / 44)))
-        choices.height = Math.min(available, rows * 44 + 16)
-        choices.x = field.x
+        const rows = Math.max(1, Math.min(7, control.count, Math.floor((available - 16) / control.rowHeight)))
+        choices.height = Math.min(available, rows * control.rowHeight + 16)
+        choices.x = Math.max(16, Math.min(field.x, overlay.width - choices.width - 16))
         choices.y = openBelow ? field.y + control.height + 6 : field.y - 6 - choices.height
     }
     function revealChoices() { forceActiveFocus(); popup.open() }
@@ -85,7 +87,7 @@ ComboBox {
         required property var modelData
         required property int index
         width: Math.max(0, choicesList.width - 20)
-        height: 44
+        height: control.rowHeight
         text: modelData.toString()
         font: control.font
         highlighted: control.highlightedIndex === index

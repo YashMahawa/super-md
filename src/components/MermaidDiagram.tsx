@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import { cachedMermaid, renderMermaid } from "../mermaidRenderer";
 import {canUsePele} from '../peleRenderer';
 import SvgDiagram from './SvgDiagram';
@@ -14,6 +14,7 @@ export default function MermaidDiagram({ source, dark, appearance, colors }: { s
   // inversion is not applied a second time to a dark Mermaid rendering.
   const renderDark=(!appearance||appearance==='original')&&dark;
   const cached=cachedMermaid(source,renderDark);
+  const exportMedia=useMemo(()=>({label:'Mermaid diagram',svg:()=>renderMermaid(source,false),source:{text:source,extension:'mmd' as const}}),[source]);
   useEffect(() => {
     let active=true;
     const controller=new AbortController();
@@ -28,5 +29,5 @@ export default function MermaidDiagram({ source, dark, appearance, colors }: { s
   const display=cached?{svg:cached,dark:renderDark}:rendered?.source===source?rendered:undefined;
   // Keep authored themeCSS inside an inert image. It must not style the app,
   // other notes, or a diagram with a different theme.
-  return <div ref={container} className="mermaid" data-render-dark={display?String(display.dark):undefined}>{display?<SvgDiagram source={display.svg} dark={!appearance||appearance==='original'?display.dark:dark} appearance={appearance} colors={colors} preserveOriginal label="Mermaid diagram"/>:<span className="image-loading" role="status">Loading diagram…</span>}</div>;
+  return <div ref={container} className="mermaid" data-render-dark={display?String(display.dark):undefined}>{display?<SvgDiagram source={display.svg} dark={!appearance||appearance==='original'?display.dark:dark} appearance={appearance} colors={colors} preserveOriginal label="Mermaid diagram" exportMedia={exportMedia}/>:<span className="image-loading" role="status">Loading diagram…</span>}</div>;
 }

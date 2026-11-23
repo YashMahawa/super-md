@@ -14,7 +14,7 @@ ApplicationWindow {
     minimumWidth: 760
     minimumHeight: 520
     visible: false
-    flags: windowModes.immersive ? Qt.Window | Qt.FramelessWindowHint : Qt.platform.os === "osx" || Qt.platform.os === "windows" ? Qt.Window | Qt.ExpandedClientAreaHint | Qt.NoTitleBarBackgroundHint : Qt.Window
+    flags: (studio.fedoraWindowFrame || windowModes.immersive) ? Qt.Window | Qt.FramelessWindowHint : Qt.platform.os === "osx" || Qt.platform.os === "windows" ? Qt.Window | Qt.ExpandedClientAreaHint | Qt.NoTitleBarBackgroundHint : Qt.Window
     title: viewState.name + " - Super MD"
     property var viewState: JSON.parse(studio.snapshot)
     property var reader: readerLoader.item
@@ -22,6 +22,9 @@ ApplicationWindow {
     property bool settingsOpen: false
     property int contextMenuCount: 0
     property int modalDialogCount: 0
+    property bool capturingShortcut: false
+    property var shortcutBindings: JSON.parse(studio.shortcutBindings)
+    property var shortcutLabels: JSON.parse(studio.shortcutLabels)
     onSettingsOpenChanged: settingsOpen ? settingsDialog.open() : settingsDialog.close()
     property bool closingAllowed: false
     property bool intentionalShutdown: false
@@ -45,6 +48,26 @@ ApplicationWindow {
         host: window
         onFullscreenChanged: { window.chromeAwake = !fullscreen; chromeIdle.stop(); studio.setFullscreen(fullscreen) }
     }
+    Repeater {
+        parent: Overlay.overlay
+        model: studio.fedoraWindowFrame && window.visibility === Window.Windowed
+            ? [Qt.LeftEdge, Qt.RightEdge, Qt.TopEdge, Qt.BottomEdge,
+               Qt.LeftEdge | Qt.TopEdge, Qt.RightEdge | Qt.TopEdge,
+               Qt.LeftEdge | Qt.BottomEdge, Qt.RightEdge | Qt.BottomEdge] : []
+        delegate: MouseArea {
+            required property int modelData
+            readonly property int horizontalEdge: modelData & (Qt.LeftEdge | Qt.RightEdge)
+            readonly property int verticalEdge: modelData & (Qt.TopEdge | Qt.BottomEdge)
+            width: horizontalEdge ? 5 : parent.width
+            height: verticalEdge ? 5 : parent.height
+            x: modelData & Qt.RightEdge ? parent.width - width : 0
+            y: modelData & Qt.BottomEdge ? parent.height - height : 0
+            z: -1
+            cursorShape: !horizontalEdge ? Qt.SizeVerCursor : !verticalEdge ? Qt.SizeHorCursor
+                : (horizontalEdge === Qt.LeftEdge) === (verticalEdge === Qt.TopEdge) ? Qt.SizeFDiagCursor : Qt.SizeBDiagCursor
+            onPressed: window.startSystemResize(modelData)
+        }
+    }
     function runDocumentScript(script) {
         if (!reader) return
         reader.runJavaScript(script)
@@ -53,8 +76,119 @@ ApplicationWindow {
         if (!reader) return
         reader.runJavaScript(script, callback)
     }
+    function routeAgentRequest(raw) {
+        let request
+        try { request = JSON.parse(raw) } catch (error) { return }
+        if (request.action === "render_tab") {
+            window.routeAgentRender(request)
+            return
+        }
+        const requestId = JSON.stringify(request.requestId || "")
+        const failure = "window.SuperMD?.post(" + requestId + ", 'agent_result', JSON.stringify({requestId:" + requestId + ",error:'reader is unavailable'}))"
+        if (!window.reader || !viewState.readerReady) {
+            studio.post(request.requestId || "", "agent_result", JSON.stringify({requestId: request.requestId, error: "Reader is not ready"}))
+            return
+        }
+        const encoded = JSON.stringify(request)
+        const script = "(function(){const request=" + encoded + ";if(typeof window[request._snapshot?'supermdAgentCompute':'supermdAgentRequest']!=='function'){" + failure + ";return;}window[request._snapshot?'supermdAgentCompute':'supermdAgentRequest'](request,function(result,error){window.SuperMD?.post(request.requestId,'agent_result',JSON.stringify({requestId:request.requestId,result:result,error:error||''}));});})()"
+        window.reader.runJavaScript(script)
+    }
+    function routeAgentRender(request) {
+        if (!window.reader || !viewState.readerReady) {
+            studio.post(request.requestId || "", "agent_render_bounds", JSON.stringify({requestId:request.requestId,error:"Reader is not ready"}))
+            return
+        }
+        const webView = window.reader
+        const contextValue = {requestId:request.requestId, tabId:request.tabId, action:"get_context", limit:6000}
+        if (request.expectedRevision !== undefined) contextValue.expectedRevision = request.expectedRevision
+        const contextRequest = JSON.stringify(contextValue)
+        const captureWidth = JSON.stringify(request.width || 1600)
+        const captureFormat = JSON.stringify(request.imageFormat || "png")
+        const requestId = JSON.stringify(request.requestId || "")
+        const script = "(function(){const request=" + contextRequest + ";if(typeof window[request._snapshot?'supermdAgentCompute':'supermdAgentRequest']!=='function'){window.SuperMD?.post(" + requestId + ",'agent_render_bounds',JSON.stringify({requestId:request.requestId,error:'Reader agent hook is unavailable'}));return;}window.supermdAgentRequest(request,function(context,error){if(error){window.SuperMD?.post(request.requestId,'agent_render_bounds',JSON.stringify({requestId:request.requestId,error:error}));return;}window.SuperMD?.post(request.requestId,'agent_render_bounds',JSON.stringify({requestId:request.requestId,tabId:context&&context.tabId,revision:context&&context.revision,width:" + captureWidth + ",imageFormat:" + captureFormat + ",context:context}));});})()"
+        webView.runJavaScript(script)
+    }
     function syncVisibleReaderChrome() {
         window.runDocumentScript("document.documentElement.style.setProperty('--native-visible-chrome-inset','" + readerVisibleChromeInset + "px')")
+    }
+    function openFind() {
+        if (!reader) return
+        const target = reader
+        target.forceActiveFocus()
+        target.runJavaScript("window.supermdFind?.()", function() {
+            if (window.reader === target) target.forceActiveFocus()
+        })
+    }
+    function nativeTextEditorFocused() {
+        // Application-level shortcuts must leave real Qt settings fields to
+        // their own platform editing commands. WebEngine's DOM inputs are
+        // handled by the reader edit-action route below.
+        let item = window.activeFocusItem
+        while (item) {
+            if (item instanceof TextInput || item instanceof TextEdit) return true
+            item = item.parent
+        }
+        return false
+    }
+    function shortcutEnabled(action) {
+        // App actions must not escape a modal into the note underneath. Native
+        // Qt text fields keep their own editing bindings because these QML
+        // application shortcuts are disabled while the modal is open.
+        if (modalDialogCount > 0) return false
+        if (["copy", "cut", "paste", "select_all"].includes(action) && window.nativeTextEditorFocused()) return false
+        if (action === "undo" || action === "redo") return !modalDialogCount && !viewState.readerOverlay
+        if (action === "close_tab") return !modalDialogCount
+        if (action === "dismiss") return !modalDialogCount && !contentsPopup.visible
+        return true
+    }
+    function nativeReaderEditAction(action) {
+        if (!reader) return
+        if (action === "copy") {
+            // Chromium's WebAction.Copy uses native focus, which may still be
+            // on a toolbar item while the rendered selection remains visible.
+            // Restore the view's focus before dispatching the native action so
+            // its copy event reaches MarkdownPreview's source serializer.
+            reader.forceActiveFocus()
+            reader.triggerWebAction(WebEngineView.Copy)
+            return
+        }
+        // A QML toolbar can retain focus while Chromium still paints a DOM
+        // selection. Refocus the view and dispatch its native action directly
+        // in the key event's turn; this preserves Chromium's user gesture and
+        // lets MarkdownPreview's copy handler serialize source (including math).
+        reader.forceActiveFocus()
+        if (action === "cut") reader.triggerWebAction(WebEngineView.Cut)
+        else if (action === "paste") reader.triggerWebAction(WebEngineView.Paste)
+        else if (action === "select_all") reader.triggerWebAction(WebEngineView.SelectAll)
+    }
+    function activateShortcut(action) {
+        if (action.startsWith("tab_")) { studio.tabNumber(Number(action.slice(4))); return }
+        switch (action) {
+        case "new_window": studio.command("window"); break
+        case "new_note": studio.newNote(); break
+        case "open": openDialog.open(); break
+        case "save": studio.saveSafely(); break
+        case "undo": studio.command("undo"); break
+        case "redo": studio.command("redo"); break
+        case "copy": window.nativeReaderEditAction("copy"); break
+        case "cut": window.nativeReaderEditAction("cut"); break
+        case "paste": window.nativeReaderEditAction("paste"); break
+        case "select_all": window.nativeReaderEditAction("select_all"); break
+        case "find": window.openFind(); break
+        case "close_tab": studio.closeTabSafely(viewState.active); break
+        case "next_tab": studio.cycleTab(1); break
+        case "previous_tab": studio.cycleTab(-1); break
+        case "move_tab_left": studio.moveActiveTab(-1); break
+        case "move_tab_right": studio.moveActiveTab(1); break
+        case "reopen_tab": studio.reopenTab(); break
+        case "close_window": studio.closeWindowSafely(); break
+        case "settings": settingsOpen = !settingsOpen; break
+        case "fullscreen": windowModes.setFullscreen(!windowModes.fullscreen); break
+        case "dismiss": window.runDocumentScriptWithCallback("window.supermdDismiss?.() || false", function(dismissed) { if (!dismissed && windowModes.fullscreen) windowModes.setFullscreen(false) }); break
+        case "zoom_in": window.runDocumentScript("window.supermdZoomBy?.(1.1)"); break
+        case "zoom_out": window.runDocumentScript("window.supermdZoomBy?.(1/1.1)"); break
+        case "zoom_reset": window.runDocumentScript("window.supermdResetZoom?.()"); break
+        }
     }
     function focusReader() { if (reader) reader.forceActiveFocus() }
     function scheduleReaderRemount(delay) {
@@ -112,7 +246,11 @@ ApplicationWindow {
 
     Connections {
         target: studio
-        function onAllowClose() { flushDialog.close(); closeDialog.close(); intentionalShutdown = true; closingAllowed = true; window.close() }
+        function onAllowClose() {
+            flushDialog.close(); closeDialog.close()
+            if (studio.backgroundEnabled) { window.hide(); return }
+            intentionalShutdown = true; closingAllowed = true; window.close()
+        }
         function onFlushFailed(canClose) { if(!closingAllowed && !closeDialog.visible) { flushDialog.canClose = canClose; flushDialog.open() } }
         function onCloseRequested(name) { flushDialog.close(); closeDialog.title = "Save changes to " + name + "?"; if(!closeDialog.visible) closeDialog.open() }
         function onSaveRequested(name) { saveDialog.selectedFile = studio.defaultSaveLocation(name); saveDialog.open() }
@@ -127,7 +265,9 @@ ApplicationWindow {
             window.runDocumentScript(script)
         }
         function onReaderCall(script) { window.runDocumentScript(script) }
+        function onReaderReloadRequested() { if (window.reader) window.reader.reload() }
         function onChromeRequested(action) { window.chromeAwake = action === "toggle" ? !window.chromeAwake : action === "show"; if(window.chromeAwake) chromeIdle.restart(); else { chromeIdle.stop(); window.focusReader() } }
+        function onAgentRequest(payload) { window.routeAgentRequest(payload) }
     }
     onViewStateChanged: {
         if (!viewState.readerReady) readerStableTimer.stop()
@@ -168,31 +308,23 @@ ApplicationWindow {
             readerRecoveryMessage = ""
         }
     }
-    Shortcut { sequences: [StandardKey.New]; onActivated: studio.command("window") }
+    Repeater {
+        model: JSON.parse(studio.shortcutActions)
+        delegate: Item {
+            required property var modelData
+            width: 0; height: 0
+            Shortcut {
+                sequences: window.shortcutBindings[modelData.id]
+                enabled: !window.capturingShortcut && window.shortcutEnabled(modelData.id)
+                context: Qt.WindowShortcut
+                onActivated: window.activateShortcut(modelData.id)
+            }
+        }
+    }
     FileDialog { id:fontDialog;title:"Import a font";fileMode:FileDialog.OpenFile;nameFilters:["Fonts (*.ttf *.otf)"];onAccepted:studio.importFont(selectedFile.toString()) }
     FileDialog { id:themeDialog;title:"Import a Super MD theme";fileMode:FileDialog.OpenFile;nameFilters:["Theme files (*.json)"];onAccepted:studio.importCustomTheme(selectedFile.toString()) }
     FileDialog { id:themeExportDialog;title:"Export editable theme";fileMode:FileDialog.SaveFile;defaultSuffix:"json";selectedFile:studio.defaultSaveLocation("My theme.supermd-theme.json");nameFilters:["Theme files (*.json)"];onAccepted:studio.exportCustomTheme(selectedFile.toString()) }
-    Shortcut { sequences: [StandardKey.Open]; onActivated: openDialog.open() }
-    Shortcut { sequences: [StandardKey.Save]; onActivated: studio.saveSafely() }
-    Shortcut { sequences: [StandardKey.Undo]; enabled: !modalDialogCount && !viewState.readerOverlay; onActivated: studio.command("undo") }
-    Shortcut { sequences: [StandardKey.Redo]; enabled: !modalDialogCount && !viewState.readerOverlay; onActivated: studio.command("redo") }
-    Shortcut { sequences: [StandardKey.Find]; onActivated: studio.command("find") }
-    Shortcut { sequences: [StandardKey.Close]; enabled:!modalDialogCount; onActivated: studio.closeTabSafely(viewState.active) }
-    Shortcut { sequences: ["Ctrl+T", "Meta+T"]; onActivated: studio.newNote() }
-    Shortcut { sequences: ["Ctrl+Tab", "Ctrl+PageDown"]; onActivated: studio.cycleTab(1) }
-    Shortcut { sequences: ["Ctrl+Shift+Tab", "Ctrl+PageUp"]; onActivated: studio.cycleTab(-1) }
-    Shortcut { sequences: ["Ctrl+Shift+T", "Meta+Shift+T"]; onActivated: studio.reopenTab() }
-    Repeater { model: 9; delegate: Item { required property int index; Shortcut { sequences: ["Ctrl+" + (index+1), "Meta+" + (index+1)]; onActivated: studio.tabNumber(index+1) } } }
-    Shortcut { sequence: "Ctrl+Shift+N"; onActivated: studio.command("window") }
-    Shortcut { sequences: ["Ctrl+Shift+W","Meta+Shift+W"]; onActivated: studio.closeWindowSafely() }
-    Shortcut { sequence: "Ctrl+,"; onActivated: settingsOpen = !settingsOpen }
-    Shortcut { sequence: "F11"; onActivated: windowModes.setFullscreen(!windowModes.fullscreen) }
-    Shortcut { sequence: "Escape"; enabled: !modalDialogCount && !contentsPopup.visible; onActivated: window.runDocumentScriptWithCallback("window.supermdDismiss?.() || false", function(dismissed) { if (!dismissed && windowModes.fullscreen) windowModes.setFullscreen(false) }) }
     // Qt's chrome never scales. Keyboard/pinch zoom is routed to the content pane.
-    Shortcut { sequence: "Ctrl++"; onActivated: window.runDocumentScript("window.supermdZoomBy?.(1.1)") }
-    Shortcut { sequence: "Ctrl+="; onActivated: window.runDocumentScript("window.supermdZoomBy?.(1.1)") }
-    Shortcut { sequence: "Ctrl+-"; onActivated: window.runDocumentScript("window.supermdZoomBy?.(1/1.1)") }
-    Shortcut { sequence: "Ctrl+0"; onActivated: window.runDocumentScript("window.supermdResetZoom?.()") }
 
     header: Column {
         visible: !viewState.fullscreen && !viewState.imageOverlay && viewState.settings.welcomed
@@ -207,32 +339,47 @@ ApplicationWindow {
                 spacing: 8
                 SidebarToggle { expanded: sidebar; onClicked: sidebar = !sidebar }
                 ActionButton { glyph: "FolderOpen"; ToolTip.text: "Open folder"; Accessible.name: "Open folder"; onClicked: studio.chooseFolder() }
-                ActionButton { text: window.width < 1060 ? "" : "Open note"; glyph: "File"; ToolTip.text: "Open note (Ctrl+O)"; onClicked: openDialog.open() }
-                ActionButton { glyph: "FloppyDisk"; ToolTip.text: "Save note"; onClicked: studio.saveSafely(); enabled: !viewState.busy }
-                ActionButton { glyph: "Undo"; ToolTip.text: "Undo (Ctrl+Z)"; onClicked: studio.command("undo") }
-                ActionButton { glyph: "Redo"; ToolTip.text: "Redo (Ctrl+Y)"; onClicked: studio.command("redo") }
-                Item { Layout.fillWidth: true }
-                ActionButton { glyph: "MagnifyingGlass"; ToolTip.text: "Find in note (Ctrl+F)"; onClicked: studio.command("find") }
+                ActionButton { text: window.width < 1060 ? "" : "Open note"; glyph: "File"; ToolTip.text: "Open note (" + window.shortcutLabels.open + ")"; onClicked: openDialog.open() }
+                ActionButton { glyph: "FloppyDisk"; ToolTip.text: "Save note (" + window.shortcutLabels.save + ")"; onClicked: studio.saveSafely(); enabled: !viewState.busy }
+                ActionButton { glyph: "Undo"; ToolTip.text: "Undo (" + window.shortcutLabels.undo + ")"; onClicked: studio.command("undo") }
+                ActionButton { glyph: "Redo"; ToolTip.text: "Redo (" + window.shortcutLabels.redo + ")"; onClicked: studio.command("redo") }
+                Item {
+                    Layout.fillWidth: true
+                    Layout.fillHeight: true
+                    DragHandler {
+                        enabled: studio.fedoraWindowFrame
+                        target: null
+                        onActiveChanged: if (active) window.startSystemMove()
+                    }
+                    TapHandler {
+                        enabled: studio.fedoraWindowFrame
+                        onDoubleTapped: window.visibility === Window.Maximized ? window.showNormal() : window.showMaximized()
+                    }
+                }
+                ActionButton { glyph: "MagnifyingGlass"; ToolTip.text: "Find in note (" + window.shortcutLabels.find + ")"; onClicked: window.openFind() }
                 ActionButton { visible: window.width >= 1060; glyph: "Image"; ToolTip.text: "Insert image or link"; onClicked: studio.command("insert") }
                 ActionButton { visible: window.width >= 1060; glyph: "Bug"; ToolTip.text: "Fix LaTeX"; onClicked: studio.command("repair") }
                 ActionButton { visible: window.width >= 1060; glyph: "ShareNetwork"; ToolTip.text: "Share note"; onClicked: window.showExport(true) }
                 ActionButton {
                     visible: window.width < 1060; glyph: "More"; ToolTip.text: "More note actions"; onClicked: noteActions.popup()
-                    Menu {
+                    NoteContextMenu {
                         id: noteActions
-                        MenuItem { text: "Insert image or link"; onTriggered: studio.command("insert") }
-                        MenuItem { text: "Fix LaTeX"; onTriggered: studio.command("repair") }
-                        MenuItem { text: "Share note"; onTriggered: window.showExport(true) }
+                        objectName: "compactNoteActions"
+                        implicitWidth: 250
+                        NoteMenuItem { text: "Insert image or link"; icon.source: "../icons/Image.svg"; onTriggered: studio.command("insert") }
+                        NoteMenuItem { text: "Fix LaTeX"; icon.source: "../icons/Bug.svg"; onTriggered: studio.command("repair") }
+                        NoteMenuItem { text: "Share note"; icon.source: "../icons/ShareNetwork.svg"; onTriggered: window.showExport(true) }
                     }
                 }
                 ActionButton { text: window.width < 1060 ? "" : "Export"; glyph: "Export"; ToolTip.text: "Export note"; prominent: true; enabled: !viewState.busy; onClicked: window.showExport(false) }
                 ActionButton { glyph: "GearSix"; ToolTip.text: "Settings"; onClicked: settingsOpen = !settingsOpen }
-                WindowControls { visible: studio.captionlessDesktop; host: window; colors: viewState.colors; Layout.preferredWidth: 124; Layout.preferredHeight: 36; Layout.alignment: Qt.AlignVCenter; onCloseRequested: studio.closeWindowSafely() }
+                WindowControls { visible: studio.showToolbarWindowControls; host: window; colors: viewState.colors; Layout.preferredWidth: 124; Layout.preferredHeight: 36; Layout.alignment: Qt.AlignVCenter; onCloseRequested: studio.closeWindowSafely() }
             }
         }
         TabStrip {
             width: parent.width
             viewState: window.viewState
+            shortcutLabels: window.shortcutLabels
         }
         Rectangle { width: parent.width; height: 1; color: viewState.colors.outline; opacity: .55 }
     }
@@ -329,7 +476,7 @@ ApplicationWindow {
                         background: Rectangle { radius: 12; antialiasing: true; color: viewState.colors["surface-high"]; border.width: parent.activeFocus ? 2 : 0; border.color: viewState.colors.primary }
                         Accessible.name: "Zoom percentage"
                     }
-                    ActionButton { objectName: "fullscreenButton"; glyph: "Fullscreen"; icon.width: 24; icon.height: 24; compact: true; tonal: true; ToolTip.text: "Fullscreen (F11 · Esc to exit)"; onClicked: windowModes.setFullscreen(true) }
+                    ActionButton { objectName: "fullscreenButton"; glyph: "Fullscreen"; icon.width: 24; icon.height: 24; compact: true; tonal: true; ToolTip.text: "Fullscreen (" + window.shortcutLabels.fullscreen + " · " + window.shortcutLabels.dismiss + " to exit)"; onClicked: windowModes.setFullscreen(true) }
                     ActionButton { objectName: "centerLockButton"; glyph: viewState.settings.centerLock ? "Lock" : "LockOpen"; compact: true; tonal: viewState.settings.centerLock; ToolTip.text: viewState.settings.centerLock ? "Centre locked · click to allow horizontal movement" : "Lock document to centre"; onClicked: studio.setting("centerLock",JSON.stringify(!viewState.settings.centerLock)) }
                     }
                 }
@@ -355,18 +502,32 @@ ApplicationWindow {
                     settings.fullScreenSupportEnabled: false
                     onContextMenuRequested: function(request) {
                         request.accepted = true
-                        readerContextMenu.popup(request.position.x, request.position.y)
+                        readerContextMenu.selectionText = request.selectedText
+                        readerContextMenu.editFlags = request.editFlags
+                        readerContextMenu.hasLink = request.linkUrl.toString().length > 0
+                        const x = request.position.x, y = request.position.y
+                        window.reader.runJavaScript("Boolean(window.supermdMediaMenuAt && window.supermdMediaMenuAt(" + x + "," + y + "))", function(handled) {
+                            if (!handled) readerContextMenu.popup(x, y)
+                        })
                     }
                     NoteContextMenu {
                         id: readerContextMenu
                         objectName: "readerContextMenu"
-                        MenuItem { text: "Undo"; visible: window.reader && window.reader.action(WebEngineView.Undo).enabled; onTriggered: window.reader.triggerWebAction(WebEngineView.Undo) }
-                        MenuItem { text: "Redo"; visible: window.reader && window.reader.action(WebEngineView.Redo).enabled; onTriggered: window.reader.triggerWebAction(WebEngineView.Redo) }
-                        MenuItem { text: "Cut"; visible: window.reader && window.reader.action(WebEngineView.Cut).enabled; onTriggered: window.reader.triggerWebAction(WebEngineView.Cut) }
-                        MenuItem { text: "Copy"; enabled: window.reader && window.reader.action(WebEngineView.Copy).enabled; onTriggered: window.reader.triggerWebAction(WebEngineView.Copy) }
-                        MenuItem { text: "Paste"; visible: window.reader && window.reader.action(WebEngineView.Paste).enabled; onTriggered: window.reader.triggerWebAction(WebEngineView.Paste) }
-                        MenuItem { text: "Copy link address"; visible: window.reader && window.reader.action(WebEngineView.CopyLinkToClipboard).enabled; onTriggered: window.reader.triggerWebAction(WebEngineView.CopyLinkToClipboard) }
-                        MenuItem { text: "Select all"; onTriggered: window.reader.triggerWebAction(WebEngineView.SelectAll) }
+                        property string selectionText: ""
+                        property int editFlags: 0
+                        property bool hasLink: false
+                        NoteMenuItem { text: "Undo"; actionVisible: Boolean(readerContextMenu.editFlags & ContextMenuRequest.CanUndo); onTriggered: window.reader.triggerWebAction(WebEngineView.Undo) }
+                        NoteMenuItem { text: "Redo"; actionVisible: Boolean(readerContextMenu.editFlags & ContextMenuRequest.CanRedo); onTriggered: window.reader.triggerWebAction(WebEngineView.Redo) }
+                        NoteMenuItem { text: "Cut"; actionVisible: Boolean(readerContextMenu.editFlags & ContextMenuRequest.CanCut); onTriggered: window.reader.triggerWebAction(WebEngineView.Cut) }
+                        NoteMenuItem { text: "Copy"; enabled: Boolean(readerContextMenu.editFlags & ContextMenuRequest.CanCopy); onTriggered: window.reader.triggerWebAction(WebEngineView.Copy) }
+                        NoteMenuItem { text: "Paste"; actionVisible: Boolean(readerContextMenu.editFlags & ContextMenuRequest.CanPaste); onTriggered: window.reader.triggerWebAction(WebEngineView.Paste) }
+                        NoteMenuItem { text: "Copy link address"; actionVisible: readerContextMenu.hasLink; onTriggered: window.reader.triggerWebAction(WebEngineView.CopyLinkToClipboard) }
+                        NoteMenuItem { text: "Select all"; onTriggered: window.reader.triggerWebAction(WebEngineView.SelectAll) }
+                        MenuSeparator {}
+                        NoteMenuItem { objectName: "reloadMenuItem"; text: "Reload"; enabled: viewState.readerReady && !viewState.busy; onTriggered: studio.reloadReaderSafely() }
+                        MenuSeparator { visible: readerContextMenu.selectionText.trim().length > 0; height: visible ? implicitHeight : 0 }
+                        NoteMenuItem { text: "Search Google"; actionVisible: readerContextMenu.selectionText.trim().length > 0; onTriggered: studio.selectionAction("google", readerContextMenu.selectionText) }
+                        NoteMenuItem { text: "Ask " + (studio.selectionAssistantLabel || "ChatGPT") + "…"; actionVisible: readerContextMenu.selectionText.trim().length > 0; onTriggered: studio.selectionAction("assistant", readerContextMenu.selectionText) }
                     }
                     WheelHandler {
                         target: null
@@ -380,10 +541,14 @@ ApplicationWindow {
                                 // resetting zoomFactor afterward flashes a stale scale.
                                 event.accepted = true
                                 const dy = event.pixelDelta.y || event.angleDelta.y
-                                reader.runJavaScript("window.supermdNativeWheel?.(0," + (-dy) + "," + JSON.stringify({x:event.x,y:event.y}) + ",true)")
-                            } else if (event.pixelDelta.x || event.pixelDelta.y) {
+                                reader.runJavaScript("window.supermdNativeWheel?.(0," + (-dy) + "," + JSON.stringify({x:event.x,y:event.y}) + ",true,true)")
+                            } else if (event.pixelDelta.x || event.pixelDelta.y || (event.buttons & Qt.LeftButton)) {
                                 event.accepted = true
-                                reader.runJavaScript("window.supermdNativeWheel?.(" + (-event.pixelDelta.x) + "," + (-event.pixelDelta.y) + "," + JSON.stringify({x:event.x,y:event.y}) + "," + !!(event.buttons & Qt.LeftButton) + ")")
+                                // The reader gives text drags priority over held-button zoom.
+                                const held = Boolean(event.buttons & Qt.LeftButton)
+                                const dx = event.pixelDelta.x || event.angleDelta.x
+                                const dy = event.pixelDelta.y || event.angleDelta.y
+                                reader.runJavaScript("window.supermdNativeWheel?.(" + (-dx) + "," + (-dy) + "," + JSON.stringify({x:event.x,y:event.y}) + "," + held + ")")
                             } else event.accepted = false
                         }
                     }
@@ -423,6 +588,7 @@ ApplicationWindow {
                 visible: viewState.fullscreen && !viewState.readerOverlay
                 awake: window.chromeAwake
                 noteName: viewState.name
+                shortcutLabels: window.shortcutLabels
                 ready: viewState.readerReady && !viewState.busy
                 centerLocked: viewState.settings.centerLock
                 onCenterLockRequested: studio.setting("centerLock",JSON.stringify(!viewState.settings.centerLock))
@@ -451,8 +617,8 @@ ApplicationWindow {
         parent: Overlay.overlay
         x: 16
         y: viewState.fullscreen ? 64 : Math.min(180, window.height / 4)
-        width: Math.min(380,window.width-32)
-        height: Math.min(560,window.height-y-24)
+        width: Math.min(340,window.width-32)
+        height: Math.min(480,window.height-y-24)
         padding: 16
         closePolicy: Popup.CloseOnEscape | Popup.CloseOnPressOutside
         background: Rectangle { radius: 24; color: viewState.colors["surface-high"]; border.color: viewState.colors.outline; border.width: 1; antialiasing: true }
@@ -465,8 +631,8 @@ ApplicationWindow {
     AppDialog {
         id: settingsDialog
         objectName: "settingsDialog"
-        width: Math.min(640, window.width - 48)
-        height: Math.min(780, window.height - 64)
+        width: Math.min(840, window.width - 48)
+        height: Math.min(760, window.height - 48)
         padding: 0
         onClosed: settingsOpen = false
         SettingsPage { ownerPopup: settingsDialog; viewState: window.viewState; anchors.fill: parent; onBack: settingsOpen = false }
@@ -487,8 +653,8 @@ ApplicationWindow {
             objectName: "exportDestination"
             title: "Export note"
             fileMode: FileDialog.SaveFile
-            defaultSuffix: exportFormat
-            nameFilters: exportFormat === "pdf" ? ["PDF (*.pdf)"] : exportFormat === "md" ? ["Markdown (*.md)"] : ["Portable Super MD (*.smd)"]
+            defaultSuffix: exportFormat === "mdzip" ? "zip" : exportFormat
+            nameFilters: exportFormat === "pdf" ? ["PDF (*.pdf)"] : exportFormat === "md" ? ["Markdown (*.md)"] : exportFormat === "mdzip" ? ["Markdown bundle (*.zip)"] : ["Portable Super MD (*.smd)"]
             onAccepted: { studio.exportTo(selectedFile.toString(), exportFormat); destroy() }
             onRejected: destroy()
         }
@@ -496,15 +662,16 @@ ApplicationWindow {
     AppDialog {
         id: exportDialog
         objectName: "exportDialog"
+        property var availableFormats: ["pdf", "smd", "md", "mdzip"]
         title: sharing ? "Share note" : "Export note"
-        width: Math.min(560, window.width - 48)
-        height: Math.min(760, window.height - 64)
+        width: Math.min(window.width - 48, Math.max(500, Math.min(720, window.width * .44)))
+        height: Math.min(window.height - 48, Math.max(460, Math.min(900, window.height * .85)))
         standardButtons: Dialog.Cancel
         ColumnLayout {
             anchors.fill: parent
-            spacing: 16
+            spacing: 16 * exportDialog.uiScale
             Label { text: sharing ? "Choose a format. Sharing availability depends on your desktop." : "PDF preserves the layout. Portable SMD includes editable Markdown and images."; wrapMode: Text.WordWrap; Layout.fillWidth: true }
-            ChoiceField { Layout.fillWidth: true; visible: model.length > 1; model: sharing ? ["PDF", "Portable SMD", "Markdown"] : viewState.portable ? ["PDF"] : ["PDF", "Portable SMD"]; currentIndex: outputFormat === "pdf" ? 0 : outputFormat === "smd" ? 1 : 2; onActivated: outputFormat = currentIndex === 0 ? "pdf" : currentIndex === 1 ? "smd" : "md" }
+            ChoiceField { Layout.fillWidth: true; Layout.minimumHeight: 48 * exportDialog.uiScale; font: exportDialog.font; visible: model.length > 1; model: exportDialog.availableFormats.map(format => format === "pdf" ? "PDF" : format === "smd" ? "Portable SMD" : format === "md" ? "Markdown" : "Markdown ZIP"); currentIndex: Math.max(0, exportDialog.availableFormats.indexOf(outputFormat)); onActivated: outputFormat = exportDialog.availableFormats[currentIndex] }
             ScrollView {
                 id: exportScroll
                 Layout.fillWidth: true
@@ -515,11 +682,11 @@ ApplicationWindow {
                 ScrollBar.vertical: ExpressiveScrollBar { parent: exportScroll; x: exportScroll.width - width; y: 0; height: exportScroll.height }
                 ColumnLayout {
                     width: exportScroll.availableWidth
-                    PdfControls { objectName: "exportPdfControls"; ownerPopup: exportDialog; visible: outputFormat === "pdf"; Layout.fillWidth: true; viewportItem: exportScroll.contentItem; options: viewState.settings.pdf; onEdited: options => studio.setting("pdf", JSON.stringify(options)) }
-                    Label { visible: outputFormat !== "pdf"; Layout.fillWidth: true; wrapMode: Text.WordWrap; text: outputFormat === "md" ? "Editable Markdown text. Choose portable SMD to include images in one file." : "A portable .smd keeps the editable Markdown and images together. Source mode never shows embedded image bytes." }
+                    PdfControls { objectName: "exportPdfControls"; uiScale: exportDialog.uiScale; controlFont: exportDialog.font; ownerPopup: exportDialog; visible: outputFormat === "pdf"; Layout.fillWidth: true; viewportItem: exportScroll.contentItem; options: viewState.settings.pdf; onEdited: options => studio.setting("pdf", JSON.stringify(options)) }
+                    Label { visible: outputFormat !== "pdf"; Layout.fillWidth: true; wrapMode: Text.WordWrap; text: outputFormat === "md" ? "Editable Markdown with raster images beside the file. Vector diagrams are embedded as SVG source." : outputFormat === "mdzip" ? "Obsidian-ready Markdown and images in one ZIP. Sliders become static figures; diagrams and charts become linked SVG images." : "A portable .smd keeps the editable Markdown and images together. Source mode never shows embedded image bytes." }
                 }
             }
-            ActionButton { text: sharing ? "Prepare share copy" : "Choose destination"; prominent: true; Layout.fillWidth: true; onClicked: window.chooseExportDestination() }
+            ActionButton { text: sharing ? "Prepare share copy" : "Choose destination"; font: exportDialog.font; prominent: true; Layout.fillWidth: true; Layout.minimumHeight: 44 * exportDialog.uiScale; onClicked: window.chooseExportDestination() }
         }
         onOpened: {
             forceActiveFocus()
@@ -566,6 +733,14 @@ ApplicationWindow {
         anchors.fill: parent
         padding: 40
         background: Rectangle { color: window.color }
+        WindowControls {
+            visible: studio.fedoraWindowFrame
+            anchors.right: parent.right
+            anchors.top: parent.top
+            host: window
+            colors: viewState.colors
+            onCloseRequested: studio.closeWindowSafely()
+        }
         ColumnLayout {
             anchors.centerIn: parent
             width: Math.min(600, parent.width - 40)

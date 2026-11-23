@@ -1,5 +1,6 @@
 import json
 import os
+import sys
 import time
 import unittest
 from pathlib import Path
@@ -16,6 +17,92 @@ class QuietStudio(Studio):
         self.system_dark = True
 
 class StudioTest(unittest.TestCase):
+    def test_fedora_uses_toolbar_frame_across_desktops(self):
+        for distro, desktop, frame, controls in (
+            ("fedora", "niri", True, True),
+            ("fedora", "GNOME", True, True),
+            ("debian", "niri", False, True),
+            ("debian", "GNOME", False, False),
+        ):
+            with self.subTest(distro=distro, desktop=desktop), patch("studio.sys.platform", "linux"), patch(
+                "studio.platform.freedesktop_os_release", return_value={"ID": distro}
+            ), patch.dict(os.environ, {"XDG_CURRENT_DESKTOP": desktop}):
+                self.assertEqual(self.studio.fedoraWindowFrame, frame)
+                self.assertEqual(self.studio.showToolbarWindowControls, controls)
+
+    def test_agent_pdf_options_match_gui_limits_and_remembered_preferences(self):
+        import hashlib
+        studio = self.studio
+        studio.settings["newNoteLocation"] = str(studio.data)
+        studio.settings["pdf"] = {**studio.settings["pdf"], "fontFamily": "Noto Serif", "fontSize": 13}
+        tab = studio._current()
+        request = {"id": tab["id"], "expectedRevision": hashlib.sha256(tab["content"].encode()).hexdigest(),
+                   "format": "pdf", "content": tab["content"], "assets": {}, "filename": "Agent options.pdf",
+                   "options": {"fontSize": 5, "margin": 60, "lineHeight": .9, "paragraphSpacing": 3}}
+        with patch.object(studio, "post") as post:
+            studio._agent_export_native("native-options", request)
+        forwarded = json.loads(post.call_args.args[2])
+        self.assertEqual(forwarded["options"]["fontFamily"], "Noto Serif")
+        self.assertEqual(forwarded["options"]["fontSize"], 5)
+        self.assertEqual(forwarded["options"]["lineHeight"], .9)
+        self.assertEqual(studio.settings["pdf"]["fontSize"], 13, "An agent export must not change GUI preferences")
+
+    def test_shortcut_maps_only_notify_when_bindings_change_across_windows(self):
+        other=self.window();first=[];second=[]
+        self.studio.shortcutsChanged.connect(lambda:first.append(True));other.shortcutsChanged.connect(lambda:second.append(True))
+        self.studio._emit();self.studio.setZoom(125)
+        self.assertEqual((first,second),([],[]))
+        self.assertEqual(self.studio.setShortcut('find','Ctrl+Alt+F'),'')
+        self.assertEqual((len(first),len(second)),(1,1));self.assertEqual(other.shortcutSequences('find'),['Ctrl+Alt+F'])
+        self.studio._emit();self.studio.setShortcut('find','Ctrl+Alt+F')
+        self.assertEqual((len(first),len(second)),(1,1))
+
+    def test_paste_autofix_is_opt_in_validated_and_sent_to_reader(self):
+        studio=self.studio;loads=[];studio.readerLoad.connect(loads.append);studio.ready=True
+        self.assertFalse(studio.settings['latexAutofix'])
+        for invalid in ('true',1,None):
+            studio.setting('latexAutofix',json.dumps(invalid))
+            self.assertFalse(studio.settings['latexAutofix'])
+        studio.setting('latexAutofix','true')
+        self.assertTrue(json.loads(loads[-1])['latexAutofix'])
+        self.assertTrue(self.session.settings['latexAutofix'])
+        studio.setting('latexAutofix','false')
+        self.assertFalse(json.loads(loads[-1])['latexAutofix'])
+
+    def test_theme_guide_opens_in_reader_and_copies_without_editing_note(self):
+        studio=self.studio;calls=[];replies=[];studio.readerCall.connect(calls.append)
+        studio.replied.connect(lambda identifier,value,error:replies.append((identifier,value,error)))
+        original=studio._current()['content']
+        with patch('studio.QDesktopServices.openUrl') as external:
+            studio.openThemeGuide();external.assert_not_called()
+        self.assertEqual(calls,['window.supermdThemeGuide?.()'])
+        guide='# Theme guide\n\n```json\n{}\n```\n'
+        studio.post('copy','copy_text',json.dumps({'text':guide}))
+        self.assertEqual(QGuiApplication.clipboard().text(),guide)
+        self.assertEqual(replies[-1],('copy','true',''))
+        for invalid in (42,None,'x'*2_000_001):
+            studio.post('invalid','copy_text',json.dumps({'text':invalid}))
+            self.assertTrue(replies[-1][2]);self.assertEqual(QGuiApplication.clipboard().text(),guide)
+        self.assertEqual(studio._current()['content'],original)
+
+    def test_copy_image_writes_real_pixels_and_rejects_invalid_data_without_changing_note(self):
+        import base64
+        from PySide6.QtCore import QBuffer, QByteArray, QIODevice
+        from PySide6.QtGui import QImage, QColor
+        image=QImage(8,6,QImage.Format_ARGB32);image.fill(QColor("#1688dd"))
+        raw=QByteArray();buffer=QBuffer(raw);buffer.open(QIODevice.WriteOnly);image.save(buffer,"PNG")
+        studio=self.studio;original=studio._current()['content'];replies=[]
+        studio.replied.connect(lambda identifier,value,error:replies.append((identifier,value,error)))
+        body=base64.b64encode(bytes(raw)).decode()
+        studio.post('copy-image','copy_image_native',json.dumps({'body':body,'mimeType':'image/png'}))
+        copied=QGuiApplication.clipboard().image()
+        self.assertEqual((copied.width(),copied.height()),(8,6))
+        self.assertEqual(copied.pixelColor(2,2).name(),'#1688dd')
+        self.assertEqual(replies[-1],('copy-image','true',''))
+        studio.post('bad-image','copy_image_native',json.dumps({'body':'aGVsbG8=','mimeType':'image/png'}))
+        self.assertTrue(replies[-1][2]);self.assertEqual(QGuiApplication.clipboard().image().pixelColor(2,2).name(),'#1688dd')
+        self.assertEqual(studio._current()['content'],original)
+
     def test_reader_patches_commit_in_order_and_reject_external_changes(self):
         studio=self.studio;note=studio._current();note['content']='a😀z'
         replies=[]
@@ -607,6 +694,20 @@ class StudioTest(unittest.TestCase):
         self.assertEqual(studio.active, note["id"])
         self.assertEqual(note["assets"], {"x": "image bytes"})
 
+    def test_keyboard_move_reorders_only_the_active_tab_and_keeps_its_content(self):
+        studio=self.studio
+        first=studio._current()
+        first.update(content="draft A",saved="",assets={"asset":"bytes"},portable=True)
+        studio.newNote()
+        second=studio._current();second["content"]="draft B"
+        studio.moveActiveTab(-1)
+        self.assertEqual([tab["id"] for tab in studio.tabs],[second["id"],first["id"]])
+        self.assertEqual(studio.active,second["id"])
+        self.assertEqual(second["content"],"draft B")
+        self.assertEqual(first["assets"],{"asset":"bytes"})
+        studio.moveActiveTab(1)
+        self.assertEqual([tab["id"] for tab in studio.tabs],[first["id"],second["id"]])
+
     def test_window_transfer_flushes_latest_text_and_recovers_exactly_once(self):
         source, target = self.studio, self.window()
         note = source._current()
@@ -650,6 +751,23 @@ class StudioTest(unittest.TestCase):
         self.assertEqual(requests, [(studio.window_id, studio.active)])
         self.assertEqual(studio._current()["content"], "unsaved")
 
+    def test_reader_reload_waits_for_latest_draft_and_view_snapshot_acknowledgement(self):
+        studio=self.studio;studio.ready=True
+        calls=[];reloads=[]
+        studio.readerCall.connect(calls.append)
+        studio.readerReloadRequested.connect(lambda:reloads.append(True))
+        studio.reloadReaderSafely()
+        operation=dict(studio.flush_operation)
+        self.assertEqual(operation["action"],"reload_reader")
+        self.assertEqual(calls,[f"window.supermdFlush?.({json.dumps(operation)})"])
+        self.assertEqual(reloads,[])
+        state={"top":842,"rendered":{"openDetails":["proof"]}}
+        studio.post("reload","document_flushed",json.dumps({"id":studio.active,"content":"last keystroke","operation":operation,"viewId":studio.active,"viewState":state}))
+        self.assertEqual(studio._current()["content"],"last keystroke")
+        self.assertEqual(studio._current()["viewState"],state)
+        self.assertEqual(reloads,[True])
+        self.assertFalse(studio.ready)
+
     def test_share_markdown_uses_the_final_reader_snapshot_and_releases_tab_moves(self):
         path = self.studio.data / "shared.md"
         self.studio.exportTo(str(path), "md")
@@ -667,6 +785,26 @@ class StudioTest(unittest.TestCase):
         self.studio.setting("size",'NaN')
         self.assertEqual(second.settings["theme"],"light")
         self.assertEqual(second.settings["size"],18)
+
+    def test_shortcut_remaps_are_persisted_conflict_checked_and_resettable(self):
+        studio=self.studio
+        original=studio.shortcutSequences("find")
+        self.assertTrue(original)
+        conflict=studio.setShortcut("find",studio.shortcutSequences("open")[0])
+        self.assertIn("Open note",conflict)
+        self.assertEqual(studio.shortcutSequences("find"),original)
+        self.assertEqual(studio.setShortcut("find","Ctrl+Alt+F"),"")
+        self.assertEqual(studio.shortcutLabel("find"),"⌥⌘F" if sys.platform == "darwin" else "Ctrl+Alt+F")
+        self.flush()
+        stored=json.loads((studio.data/"settings.json").read_text())
+        self.assertEqual(stored["settings"]["shortcuts"]["find"],["Ctrl+Alt+F"])
+        self.assertEqual(studio.setShortcut("find",""),"")
+        self.assertEqual(studio.shortcutLabel("find"),"Disabled")
+        self.assertEqual(studio.resetShortcuts(),"")
+        self.assertEqual(studio.shortcutSequences("find"),original)
+        self.flush()
+        restored=json.loads((studio.data/"settings.json").read_text())
+        self.assertEqual(restored["settings"]["shortcuts"]["find"],original)
 
     def test_zoom_sends_a_delta_not_the_document_and_remembers_mode(self):
         self.studio.ready = True
@@ -700,19 +838,49 @@ class StudioTest(unittest.TestCase):
 
         self.studio.exportTo(selected,"md")
         self.assertEqual(self.studio.pending_export,str(markdown))
-        self.studio.post("markdown-export","export_markdown_native",json.dumps({"id":self.studio.active,"content":"Final Markdown"}))
+        gif="R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7"
+        markdown_content="![Loop](images/loop.gif)"
+        self.studio.post("markdown-export","export_markdown_native",json.dumps({"id":self.studio.active,"content":markdown_content,"assets":{"images/loop.gif":"data:image/gif;base64,"+gif}}))
         self.await_idle()
-        self.assertEqual(markdown.read_text(encoding="utf-8"),"Final Markdown")
+        self.assertEqual(markdown.read_text(encoding="utf-8"),markdown_content)
+        self.assertEqual((markdown.parent/"images"/"loop.gif").read_bytes(),__import__("base64").b64decode(gif))
 
         self.studio.exportTo(selected,"smd")
         self.assertEqual(self.studio.pending_export,str(portable))
         self.studio.post("portable-export","export_fmd_native",json.dumps({"id":self.studio.active,"content":"Portable Markdown","assets":{},"save":False}))
         self.await_idle()
-        value=json.loads(portable.read_text(encoding="utf-8"))
-        self.assertEqual(value["format"],"supermd-smd")
-        self.assertEqual(value["markdown"],"Portable Markdown")
-        self.assertEqual(markdown.read_text(encoding="utf-8"),"Final Markdown")
+        from documents import open_note
+        content, assets, is_portable = open_note(portable)
+        self.assertTrue(is_portable)
+        self.assertEqual(content,"Portable Markdown")
+        self.assertEqual(assets,{})
+        self.assertEqual(markdown.read_text(encoding="utf-8"),markdown_content)
         self.assertFalse(Path(str(base)+".smd.md").exists())
+
+    def test_markdown_zip_export_preserves_raster_paths(self):
+        import base64, zipfile
+        base=self.studio.data/"Markdown bundle"
+        selected=QUrl.fromLocalFile(str(base)).toString()
+        target=Path(str(base)+".zip")
+        gif="R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7"
+        self.studio.exportTo(selected,"mdzip")
+        self.assertEqual(self.studio.pending_export,str(target))
+        self.studio.post("markdown-zip","export_markdown_native",json.dumps({"id":self.studio.active,"content":"![Loop](media/loop.gif)","assets":{"media/loop.gif":"data:image/gif;base64,"+gif},"archive":True}))
+        self.await_idle()
+        with zipfile.ZipFile(target) as archive:
+            self.assertEqual(archive.namelist(),["Markdown bundle.md","media/loop.gif"])
+            self.assertEqual(archive.read("media/loop.gif"),base64.b64decode(gif))
+
+    def test_markdown_export_never_overwrites_the_original_note(self):
+        source=self.studio.data/"original.md"
+        original=b"# Original note\n![Photo](images/photo.gif)\n"
+        source.write_bytes(original)
+        self.studio._current()["path"]=str(source)
+        self.studio.exportTo(QUrl.fromLocalFile(str(source)).toString(),"md")
+        self.studio.post("same-path","export_markdown_native",json.dumps({"id":self.studio.active,"content":"replacement","assets":{"images/photo.gif":"data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7"}}))
+        self.await_idle()
+        self.assertEqual(source.read_bytes(),original)
+        self.assertFalse((self.studio.data/"images"/"photo.gif").exists())
 
     def test_export_rejects_mismatched_suffixes_and_unconfirmed_appended_overwrite(self):
         calls=[]
@@ -760,10 +928,12 @@ class StudioTest(unittest.TestCase):
 
     def test_export_dialog_tracks_selected_format_suffix_and_filters(self):
         qml=(Path(__file__).parent/"qml"/"Main.qml").read_text(encoding="utf-8")
-        self.assertIn('defaultSuffix: exportFormat',qml)
-        self.assertIn('exportFormat === "pdf" ? ["PDF (*.pdf)"] : exportFormat === "md" ? ["Markdown (*.md)"] : ["Portable Super MD (*.smd)"]',qml)
-        choice=next(line for line in qml.splitlines() if "currentIndex: outputFormat === \"pdf\"" in line)
-        self.assertIn('onActivated: outputFormat = currentIndex === 0 ? "pdf" : currentIndex === 1 ? "smd" : "md"',choice)
+        self.assertIn('defaultSuffix: exportFormat === "mdzip" ? "zip" : exportFormat',qml)
+        for expected in ('PDF (*.pdf)', 'Markdown (*.md)', 'Markdown bundle (*.zip)', 'Portable Super MD (*.smd)'):
+            self.assertIn(expected,qml)
+        self.assertIn('property var availableFormats: ["pdf", "smd", "md", "mdzip"]',qml)
+        self.assertIn('availableFormats.indexOf(outputFormat)',qml)
+        self.assertIn('onActivated: outputFormat = exportDialog.availableFormats[currentIndex]',qml)
 
     def test_external_refresh_does_not_overwrite_a_draft(self):
         studio=self.studio;path=studio.data / "external.md"

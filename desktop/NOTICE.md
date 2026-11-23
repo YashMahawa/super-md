@@ -4,6 +4,12 @@ Super MD's original code is licensed under the MIT License. Its complete
 copyright and license notice is included in LICENSE with this package.
 The following third-party components retain their own notices and licenses.
 
+The optional agent interface uses the official Model Context Protocol Python
+SDK (MIT) and websockets (BSD-3-Clause). Their distribution metadata, dependency
+notices and supplied license files are retained in the bundled runtime.
+Sources: https://github.com/modelcontextprotocol/python-sdk and
+https://github.com/python-websockets/websockets.
+
 HTTPS clients include certifi's unmodified Mozilla CA certificate bundle
 (MPL-2.0), alongside operating-system trust. The certifi license is included
 under resources/licenses/certifi. Source: https://github.com/certifi/python-certifi

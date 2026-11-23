@@ -12,9 +12,15 @@ struct ExportRequest { content: String, #[serde(default)] assets: HashMap<String
 struct FormatMarker { format: Option<String> }
 
 fn read_note(path: &Path) -> Result<(String, Option<PortableDocument>)> {
-    let size = std::fs::metadata(path)?.len();
-    if size > portable::MAX_FILE as u64 { bail!("Note exceeds 120 MB"); }
-    let mut content = std::fs::read_to_string(path)?;
+    if std::fs::metadata(path)?.len() > portable::MAX_FILE as u64 { bail!("Note exceeds 120 MB"); }
+    let mut raw = Vec::new();
+    std::fs::File::open(path)?.take(portable::MAX_FILE as u64 + 1).read_to_end(&mut raw)?;
+    if raw.len() > portable::MAX_FILE { bail!("Note exceeds 120 MB"); }
+    if raw.starts_with(&[0x1f, 0x8b]) {
+        let note = PortableDocument::decode_bytes(&raw)?;
+        return Ok((note.markdown.clone(), Some(note)));
+    }
+    let mut content = String::from_utf8(raw)?;
     if content.starts_with('\u{feff}') { content.drain(..3); }
     // Content, not extension, distinguishes old text SMD from portable SMD.
     let extension = path.extension().and_then(|x| x.to_str()).unwrap_or("").to_ascii_lowercase();
@@ -87,7 +93,7 @@ fn run() -> Result<()> {
                 let mime = portable::asset_mime(local.to_str().context("Invalid image path")?).context("Unsupported image type")?;
                 Ok(format!("data:{mime};base64,{}",STANDARD.encode(std::fs::read(local)?)))
             })?;
-            atomic_write(Path::new(output),packed.encode()?.as_bytes())?;
+            atomic_write(Path::new(output),&packed.encode_compressed()?)?;
             println!("{}",serde_json::json!({"output":output,"assets":packed.assets.len()}));
         }
         "export" => {

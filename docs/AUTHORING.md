@@ -3,6 +3,29 @@
 This describes the current development source. Check the installed application's
 version before assuming a new feature is in a published release.
 
+## Selection, search and assistants
+
+Select text normally in Read, Live or Split. Scrolling during a text drag keeps
+the current magnification; Ctrl/Cmd-wheel and pinch still zoom. Held-button
+wheel zoom is available while holding the mouse still over the page, including
+text, and independently inside plots. Once a text drag starts, scrolling extends
+the selection instead. Starting in a paragraph gap anchors to the following line.
+
+On desktop, Settings → Keyboard shortcuts lists the available commands. Select
+a binding and press a new combination, or use Backspace to disable it. Conflicts
+are rejected; Reset shortcuts to defaults restores the original bindings.
+
+Right-click selected text on desktop, or use Android's selection toolbar, to
+choose **Search Google** or **Ask ChatGPT**. Settings → Selected text lets you
+choose ChatGPT, Gemini or Claude. Google searches the selected excerpt. Ask
+copies the complete selection and opens the assistant's site for you to paste,
+review and send; it never submits a prompt automatically. This fallback avoids
+unverified prefill-only links. Nothing is sent just because text is selected.
+
+Search and export panels adapt to the window size without magnifying the rest
+of the interface. PDF export uses one expressive animation, retains accessible
+progress information, and can be cancelled before publishing the result.
+
 ## Files and portable images
 
 Write ordinary notes as UTF-8 **`.md`**. Use normal Markdown, not vault metadata.
@@ -11,7 +34,9 @@ Super MD's source editor exposes its Markdown only, never a wall of image bytes.
 The old `.fmd` envelope and older *plain-text* `.smd` notes remain readable.
 Do not rename a plain Markdown file to `.smd` and claim its images are embedded.
 
-An agent should create/edit `.md` and let the app or native engine pack it:
+Agents can edit Markdown or SMD directly with revision-checked, targeted patches,
+replace individual assets, and work with open unsaved tabs. See the
+[CLI and MCP guide](AGENT-INTERFACE.md). The lower-level engine also packs notes:
 
 ```sh
 smd-engine pack ./lesson.md ./lesson.smd
@@ -25,15 +50,20 @@ smd-engine extract ./lesson.smd assets/image-1.svg ./figure.svg
 and `assets` emit metadata, not image bytes. `extract` writes one named image to a
 file and refuses to overwrite an existing output. Avoid `cat lesson.smd` or
 putting its JSON/base64 envelope in an AI's context. Use file/image tools on the
-extracted asset separately. For edits, export or unpack the relevant images into
-a working folder, edit Markdown, and pack a new portable note. The GUI handles
+extracted asset separately. For edits, use `super-md agent patch` and `replace-asset` to keep unchanged
+assets intact without unpacking or rewriting a document through a script. The GUI handles
 image insertion, drag/drop, replacement/removal and portable Save in-place.
 
 The v1 portable envelope has `format: "supermd-smd"`, `version: 1`, `markdown` and
 `assets`. Only the assets map holds base64 image data URLs. Names are bounded,
 safe `assets/<filename>` references. Use the packer instead of synthesizing binary
 JSON. Limits: 20 MB Markdown, 25 MB per image, 75 MB total images, 512 assets,
-120 MB envelope. The CLI does not download URLs or auto-run Python.
+120 MB envelope. New saves wrap the unchanged JSON v1 envelope in deterministic
+gzip compression. The reader detects it from its bytes, independently of the
+filename, and continues to accept legacy uncompressed JSON SMD/FMD. Compressed
+SMD needs Super MD 0.6.14 or newer. Compression is lossless; image bytes, vector
+paths and editable source are retained. The CLI does not download URLs or
+auto-run Python.
 
 ## Markdown and navigation
 

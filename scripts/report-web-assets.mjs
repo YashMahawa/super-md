@@ -89,6 +89,7 @@ export async function verifyNativeResources(distRoot, publicRoot = 'public') {
   const required = [
     'LICENSE.txt',
     'THEMING.md',
+    'super-md-agent-SKILL.md',
     'DIAGRAM-RENDERER-LICENSES.txt',
     'WRITING-ASSISTANCE-LICENSES.txt',
   ];

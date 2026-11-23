@@ -5,12 +5,23 @@ import QtQuick.Layouts
 
 Pane {
     id: page
+    objectName: "settingsPage"
     required property var viewState
     property var ownerPopup: null
+    property string shortcutMessage: ""
+    property string section: "appearance"
+    property string shortcutErrorAction: ""
+    property string pendingCleanup: ""
+    property var shortcutLabels: JSON.parse(studio.shortcutLabels)
     signal back()
     readonly property bool pythonReady: JSON.parse(studio.pythonChoices).some(choice => choice.matplotlib)
     readonly property var storageSummary: JSON.parse(studio.storageReport)
+    onVisibleChanged: if (!visible) {
+        const host = page.Window.window
+        if (host) host.capturingShortcut = false
+    }
     function save(key, value) { studio.setting(key, JSON.stringify(value)) }
+    onSectionChanged: if (settingsScroll) settingsScroll.contentItem.contentY = 0
     function formatBytes(value) {
         if (value < 1024) return value + " B"
         if (value < 1024 * 1024) return (value / 1024).toFixed(1) + " KB"
@@ -19,6 +30,20 @@ Pane {
     }
     padding: 0
     background: null
+    Dialog {
+        id: confirmStorageCleanup
+        objectName: "confirmStorageCleanup"
+        title: page.pendingCleanup === "execution-results" ? "Clear temporary Python results?" : "Clear cached update state?"
+        modal: true
+        parent: Overlay.overlay
+        x: (parent ? (parent.width - width) / 2 : 0)
+        y: (parent ? (parent.height - height) / 2 : 0)
+        width: Math.min(440, page.width - 32)
+        height: 220
+        standardButtons: Dialog.Ok | Dialog.Cancel
+        onAccepted: studio.clearStorageCategory(page.pendingCleanup)
+        contentItem: Label { width: 360; wrapMode: Text.WordWrap; text: page.pendingCleanup === "execution-results" ? "Remove app-generated Python result previews. Saved notes, exported images and recovery data will not be touched. This cannot be undone." : "Remove cached update verification/download state. Installed versions and Downloads outside app storage remain unchanged. This cannot be undone." }
+    }
     Component.onCompleted: studio.refreshPython()
     ColumnLayout {
         anchors.fill: parent
@@ -27,6 +52,26 @@ Pane {
         RowLayout {
             Label { text: "Settings"; font.pixelSize: 30; font.weight: Font.DemiBold; Layout.fillWidth: true }
             ActionButton { glyph: "X"; ToolTip.text: "Close settings"; onClicked: page.back() }
+        }
+        Flow {
+            Layout.fillWidth: true
+            spacing: 6
+            Repeater {
+                model: [
+                    {key:"appearance", label:"Appearance"}, {key:"reading", label:"Reading"},
+                    {key:"writing", label:"Writing"}, {key:"python", label:"Python"},
+                    {key:"updates", label:"Updates"}, {key:"storage", label:"Storage"}, {key:"agents", label:"AI agents"},
+                    {key:"shortcuts", label:"Keyboard shortcuts"}
+                ]
+                delegate: ActionButton {
+                    required property var modelData
+                    objectName: "settingsSection_" + modelData.key
+                    text: modelData.label
+                    compact: true
+                    tonal: page.section === modelData.key
+                    onClicked: page.section = modelData.key
+                }
+            }
         }
         ScrollView {
             id: settingsScroll
@@ -40,6 +85,10 @@ Pane {
             ColumnLayout {
                 width: settingsScroll.availableWidth
                 spacing: 16
+                ColumnLayout {
+                    visible: page.section === "appearance"
+                    Layout.fillWidth: true
+                    spacing: 16
                 Label { text: "Appearance"; font.pixelSize: 22; font.weight: Font.DemiBold }
                 Label { text: "System follows your desktop colors. Fullscreen can have a different theme."; wrapMode: Text.WordWrap; Layout.fillWidth: true; color: viewState.colors.muted }
                 Label { text: "Workspace theme" }
@@ -58,7 +107,7 @@ Pane {
                     ActionButton { text:"Import theme…";glyph:"FolderOpen";tonal:true;onClicked:studio.chooseCustomTheme() }
                     ActionButton { text:studio.customThemeActive ? "Export theme…" : "Export template…";glyph:"Export";tonal:true;onClicked:studio.chooseThemeExport() }
                     ActionButton { text:"Share theme…";glyph:"ShareNetwork";visible:studio.customThemeActive;tonal:true;onClicked:studio.chooseThemeExport();ToolTip.text:"Save a portable theme file to send to another device" }
-                    ActionButton { text:"Authoring guide";onClicked:studio.openThemeGuide() }
+                    ActionButton { text:"Authoring guide";enabled:viewState.readerReady===true;onClicked:{if(page.ownerPopup)page.ownerPopup.close();studio.openThemeGuide();const host=page.Window.window;if(host&&typeof host.focusReader==="function")host.focusReader()} }
                     ActionButton { text:"Edit theme file";visible:studio.customThemeActive;onClicked:studio.editCustomTheme() }
                     ActionButton { text:"Reload";visible:studio.customThemeActive;onClicked:studio.reloadCustomTheme() }
                     ActionButton { text:"Reset to built-in";visible:studio.customThemeActive;onClicked:studio.resetCustomTheme() }
@@ -85,6 +134,11 @@ Pane {
                 ChoiceField { Layout.fillWidth: true; model: ["Original (off)","Invert in dark themes","Auto adapt to theme","Theme monochrome","Separate from theme"]; currentIndex: ["original","invert-dark","auto","monochrome","contrast"].indexOf(viewState.settings.svgAppearance); onActivated: page.save("svgAppearance",["original","invert-dark","auto","monochrome","contrast"][currentIndex]) }
                 Label { text: "Separation strength: " + viewState.settings.imageContrast.toFixed(2) }
                 ExpressiveSlider { Layout.fillWidth: true; from: 1; to: 2; stepSize: .05; value: viewState.settings.imageContrast; onMoved: page.save("imageContrast",value) }
+                }
+                ColumnLayout {
+                    visible: page.section === "reading"
+                    Layout.fillWidth: true
+                    spacing: 16
                 Label { text: "Reading"; font.pixelSize: 22; font.weight: Font.DemiBold; Layout.topMargin: 12 }
                 Label { text: "Reading font" }
                 FontField { objectName: "readingFontChoice"; ownerPopup: page.ownerPopup; viewportItem: settingsScroll.contentItem; Accessible.name: "Reading font"; Layout.fillWidth: true; families: studio.fonts; value: viewState.settings.font; onChosen: family => page.save("font", family) }
@@ -99,7 +153,12 @@ Pane {
                 ExpressiveSlider { Layout.fillWidth: true; from: 1.15; to: 2.2; stepSize: .05; value: viewState.settings.lineHeight; onMoved: page.save("lineHeight", value) }
                 Switch { text: "Full document accessibility"; checked: viewState.settings.fullDocumentAccessibility; onToggled: page.save("fullDocumentAccessibility", checked) }
                 Label { text: "Keeps the complete document in the semantic tree for assistive technology and browser Find. Large notes may use substantially more memory."; Layout.fillWidth: true; wrapMode: Text.WordWrap; color: viewState.colors.muted }
-                Switch { text: "Autosave existing notes"; checked: viewState.settings.autosave; onToggled: page.save("autosave", checked) }
+                }
+                ColumnLayout {
+                    visible: page.section === "writing"
+                    Layout.fillWidth: true
+                    spacing: 16
+                Switch { objectName: "writingAutosave"; text: "Autosave existing notes"; checked: viewState.settings.autosave; onToggled: page.save("autosave", checked) }
                 Switch { text: "Continue from the last reading position"; checked: viewState.settings.restorePosition; onToggled: page.save("restorePosition", checked) }
                 Label { text: "On startup" }
                 ChoiceField { Layout.fillWidth: true; model: ["Restore previous tabs","Open a new blank note"]; currentIndex: viewState.settings.startup === "new" ? 1 : 0; onActivated: page.save("startup", currentIndex === 1 ? "new" : "restore") }
@@ -110,7 +169,17 @@ Pane {
                 Label { text: "Writing assistance"; font.pixelSize: 22; font.weight: Font.DemiBold; Layout.topMargin: 12 }
                 Switch { text: "Spell check"; checked: viewState.settings.spellCheck; onToggled: page.save("spellCheck", checked) }
                 Switch { text: "Grammar check"; checked: viewState.settings.grammarCheck; onToggled: page.save("grammarCheck", checked) }
+                Switch { text: "LaTeX autofix on paste"; checked: viewState.settings.latexAutofix === true; onToggled: page.save("latexAutofix", checked) }
+                Label { text: "Off by default. Repairs validated LaTeX errors in pasted text in Source, Split and Live. Existing code, links and formula fragments are protected; Undo restores the paste."; Layout.fillWidth: true; wrapMode: Text.WordWrap; color: viewState.colors.muted }
                 Label { text: "Offline English suggestions in Source and Live editing. Grammar checks repeated words and a/an. Code, links and LaTeX are excluded; no text is uploaded or automatically replaced."; Layout.fillWidth: true; wrapMode: Text.WordWrap; color: viewState.colors.muted }
+                Label { text: "Selected text"; font.pixelSize: 22; font.weight: Font.DemiBold; Layout.topMargin: 12 }
+                ChoiceField { Layout.fillWidth: true; Accessible.name: "Selection assistant"; model: ["ChatGPT", "Gemini", "Claude"]; currentIndex: Math.max(0,["chatgpt","gemini","claude"].indexOf(viewState.settings.selectionAssistant)); onActivated: page.save("selectionAssistant",["chatgpt","gemini","claude"][currentIndex]) }
+                Label { Layout.fillWidth: true; wrapMode: Text.WordWrap; color: viewState.colors.muted; text: "Right-click selected text to search Google or ask this assistant. Ask copies the text and opens its site for you to paste and review, since prefill-only web links are not verified. It never submits a prompt automatically." }
+                }
+                ColumnLayout {
+                    visible: page.section === "python"
+                    Layout.fillWidth: true
+                    spacing: 16
                 Label { text: "Python"; font.pixelSize: 22; font.weight: Font.DemiBold; Layout.topMargin: 12 }
                 Label { text: "Code runs only when you press Run. Pick where it runs; numpy and matplotlib are needed for plots."; wrapMode: Text.WordWrap; Layout.fillWidth: true; color: viewState.colors.muted }
                 Repeater {
@@ -166,6 +235,11 @@ Pane {
                 Label { text: "Custom interpreter path"; Layout.topMargin: 4 }
                 TextField { objectName: "pythonPath"; Layout.fillWidth: true; text: viewState.settings.python === "bundled" ? "" : viewState.settings.python; placeholderText: studio.pythonBundled ? "Using built-in Python" : "/path/to/venv/bin/python"; selectByMouse: true; onEditingFinished: if (text.trim().length && text.trim() !== viewState.settings.python) page.save("python", text.trim()) }
                 Label { text: "Local Python is not sandboxed. Only run cells from notes you trust."; Layout.fillWidth: true; wrapMode: Text.WordWrap; color: viewState.colors.muted }
+                }
+                ColumnLayout {
+                    visible: page.section === "updates"
+                    Layout.fillWidth: true
+                    spacing: 16
                 Label { text: "About & updates"; font.pixelSize: 22; font.weight: Font.DemiBold; Layout.topMargin: 12 }
                 Label { text: "Super MD " + studio.appVersion + " · © Yash Mahawar · MIT License"; Layout.fillWidth: true; wrapMode: Text.WordWrap }
                 Switch { text: "Check for updates on opening"; checked: viewState.settings.checkUpdates; onToggled: page.save("checkUpdates", checked) }
@@ -176,10 +250,16 @@ Pane {
                 Label { text: studio.updateStatus; visible: text.length > 0; Layout.fillWidth: true; wrapMode: Text.WordWrap }
                 RowLayout {
                     ActionButton { text: "Check for updates"; tonal: true; enabled: !studio.updateBusy; onClicked: studio.checkUpdates() }
+                    ActionButton { objectName: "openLatestGitHubRelease"; text: "Open latest release on GitHub"; tonal: true; onClicked: studio.openLatestGitHubRelease() }
                     ActionButton { text: studio.updateReady ? "Install update" : "Download update"; visible: studio.updateAvailable; enabled: !studio.updateBusy; prominent: true; onClicked: studio.updateReady ? studio.installUpdate() : studio.downloadUpdate() }
                 }
+                }
+                ColumnLayout {
+                    visible: page.section === "storage"
+                    Layout.fillWidth: true
+                    spacing: 16
                 Label { text: "App storage"; font.pixelSize: 22; font.weight: Font.DemiBold; Layout.topMargin: 12 }
-                Label { text: "A read-only inventory of known Super MD app data. It does not scan notes, Downloads or your home folder."; Layout.fillWidth: true; wrapMode: Text.WordWrap; color: viewState.colors.muted }
+                Label { text: "Inspect and selectively clear app-generated temporary data. Notes, saved files, fonts, preferences and recovery snapshots stay protected."; Layout.fillWidth: true; wrapMode: Text.WordWrap; color: viewState.colors.muted }
                 Flow {
                     Layout.fillWidth: true
                     spacing: 8
@@ -199,11 +279,62 @@ Pane {
                         Layout.fillWidth: true
                         spacing: 10
                         Label { text: modelData.label; Layout.fillWidth: true; wrapMode: Text.WordWrap; font.weight: Font.DemiBold }
-                        Label { text: modelData.classification === "managed" ? "Managed" : "Preserved"; color: viewState.colors.muted }
+                        Label { text: modelData.classification === "clearable" ? "Clearable" : modelData.classification === "managed" ? "Managed" : "Protected"; color: viewState.colors.muted }
                         Label { text: page.formatBytes(modelData.bytes) + " · " + modelData.files + " files"; color: viewState.colors.muted; horizontalAlignment: Text.AlignRight }
+                        ActionButton { text: "Clear"; objectName: "clearStorage_" + modelData.id; visible: modelData.classification === "clearable"; enabled: !studio.storageBusy && !studio.storageCleanupBusy && modelData.files > 0 && (modelData.id !== "update-state" || !studio.updateBusy && !studio.updateReady); compact: true; tonal: true; onClicked: {page.pendingCleanup = modelData.id; confirmStorageCleanup.open()} }
                     }
                 }
-                Label { text: "Recovery snapshots and Python execution results are preserved. This tool does not delete anything; no disposable app-managed cache is tracked or cleared."; Layout.fillWidth: true; wrapMode: Text.WordWrap; color: viewState.colors.muted }
+                Label { text: studio.storageCleanupBusy ? "Cleaning temporary app data…" : studio.storageCleanupStatus; visible: text.length > 0; Layout.fillWidth: true; wrapMode: Text.WordWrap; color: viewState.colors.muted }
+                Label { text: "Only app-generated Python results and obsolete update state can be cleared. Your notes, exports, recovery snapshots and Python environment are never deleted here."; Layout.fillWidth: true; wrapMode: Text.WordWrap; color: viewState.colors.muted }
+                }
+                AgentAccess {
+                    visible: page.section === "agents"
+                    hostStudio: studio
+                    viewState: page.viewState
+                }
+                ColumnLayout {
+                    visible: page.section === "shortcuts"
+                    Layout.fillWidth: true
+                    spacing: 14
+                    Label { text: "Keyboard shortcuts"; font.pixelSize: 22; font.weight: Font.DemiBold }
+                    Label {
+                        text: "Select a shortcut, then press the combination you want. Command or Ctrl, Alt and function keys are supported."
+                        Layout.fillWidth: true
+                        wrapMode: Text.WordWrap
+                        color: viewState.colors.muted
+                    }
+                    Repeater {
+                        model: JSON.parse(studio.shortcutActions)
+                        delegate: ColumnLayout {
+                            required property var modelData
+                            Layout.fillWidth: true
+                            RowLayout {
+                                Layout.fillWidth: true
+                                Label { text: modelData.label; Layout.fillWidth: true; wrapMode: Text.WordWrap }
+                                ShortcutRecorder {
+                                    objectName: "shortcutRecorder_" + modelData.id
+                                    value: page.shortcutLabels[modelData.id]
+                                    onRecordingChanged: { const host = page.Window.window; if (host) host.capturingShortcut = recording }
+                                    onCaptured: function(sequence, error) {
+                                        const host = page.Window.window
+                                        if (host) host.capturingShortcut = false
+                                        if (error === "cancel") return
+                                        page.shortcutErrorAction = modelData.id
+                                        page.shortcutMessage = error || studio.setShortcut(modelData.id, sequence)
+                                    }
+                                }
+                            }
+                            Label { text: page.shortcutMessage; visible: page.shortcutErrorAction === modelData.id && text.length > 0; Layout.fillWidth: true; wrapMode: Text.WordWrap; color: viewState.colors.primary }
+                        }
+                    }
+                    ActionButton {
+                        objectName: "resetShortcuts"
+                        text: "Reset shortcuts to defaults"
+                        tonal: true
+                        Layout.fillWidth: true
+                        onClicked: { page.shortcutMessage = studio.resetShortcuts(); page.shortcutErrorAction = "" }
+                    }
+                }
                 Item { height: 24 }
             }
         }

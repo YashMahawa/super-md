@@ -41,6 +41,8 @@ import androidx.compose.ui.unit.dp
     var grip by remember { mutableFloatStateOf(0f) }
     val currentNotes by rememberUpdatedState(notes)
     val move by rememberUpdatedState(reorder)
+    val tabIds = notes.map { it.id }
+    val activeName = notes.firstOrNull { it.id == active }?.name
     val haptics = LocalHapticFeedback.current
     val edge = with(LocalDensity.current) { 48.dp.toPx() }
     LaunchedEffect(dragging) {
@@ -50,7 +52,12 @@ import androidx.compose.ui.unit.dp
             if (delta != 0f) scroll.scrollBy(delta)
         }
     }
-    LazyRow(state = scroll, modifier = Modifier.fillMaxWidth().onGloballyPositioned { viewport = it.boundsInRoot() }, contentPadding = PaddingValues(horizontal = 12.dp, vertical = 4.dp), horizontalArrangement = Arrangement.spacedBy(4.dp), verticalAlignment = Alignment.CenterVertically) {
+    LaunchedEffect(tabIds, active, activeName, viewport.width, dragging) {
+        val activeIndex = tabIds.indexOf(active)
+        if (activeIndex >= 0 && dragging == null) scroll.scrollToItem(activeIndex)
+    }
+    Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
+      LazyRow(state = scroll, modifier = Modifier.weight(1f).onGloballyPositioned { viewport = it.boundsInRoot() }, contentPadding = PaddingValues(start = 12.dp, end = 8.dp, top = 4.dp, bottom = 4.dp), horizontalArrangement = Arrangement.spacedBy(4.dp), verticalAlignment = Alignment.CenterVertically) {
         items(notes, key = { it.id }) { note ->
             DisposableEffect(note.id) { onDispose { bounds.remove(note.id) } }
             Surface(color = if (note.id == active) MaterialTheme.colorScheme.secondaryContainer else MaterialTheme.colorScheme.surfaceContainerLow, shape = RoundedCornerShape(20.dp), modifier = Modifier
@@ -80,6 +87,7 @@ import androidx.compose.ui.unit.dp
                 }
             }
         }
-        item("new-tab") { IconButton(onClick = newNote) { Icon(painterResource(R.drawable.symbol_add), "New tab") } }
+      }
+      IconButton(onClick = newNote, modifier = Modifier.size(48.dp)) { Icon(painterResource(R.drawable.symbol_add), "New tab") }
     }
 }

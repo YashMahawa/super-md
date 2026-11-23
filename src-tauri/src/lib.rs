@@ -69,7 +69,7 @@ async fn export_portable_pdf(path: Option<String>, content: String, assets: std:
         }
     };
     tauri::async_runtime::spawn_blocking(move || {
-        let options = smd_core::PdfOptions { page_size: options.page_size, margin: options.margin, font_size: options.font_size, line_height: options.line_height, font_family: options.font_family, page_numbers: options.page_numbers };
+        let options = smd_core::PdfOptions { page_size: options.page_size, margin: options.margin, font_size: options.font_size, line_height: options.line_height, font_family: options.font_family, page_numbers: options.page_numbers, ..smd_core::PdfOptions::default() };
         let assets = assets.into_iter().map(|(name, b64)| STANDARD.decode(b64).map(|bytes| (name, bytes))).collect::<Result<std::collections::HashMap<_,_>,_>>().map_err(display_error)?;
         let bytes = smd_core::export(&content, &options, &assets).map_err(display_error)?;
         atomic_write(&output, &bytes).map_err(display_error)?;
@@ -519,15 +519,30 @@ fn export_pdf_inner(
                 smd_core::portable::image_bytes(&data)?.1
             } else {
             let decoded = percent_decode_str(&image).decode_utf8()?.to_string();
-            let local = directory.path().join(&decoded);
-            let image_path = if local.is_file() { local } else { source.and_then(Path::parent).unwrap_or(Path::new(".")).join(decoded) };
+            let requested = Path::new(&decoded);
+            let document_root = source.map(|path| path.parent().unwrap_or(Path::new(".")).canonicalize())
+                .transpose().context("Could not resolve the document folder for PDF image")?;
+            let temporary_root = directory.path().canonicalize()?;
+            let candidate = if requested.is_absolute() {
+                requested.to_path_buf()
+            } else {
+                let temporary = temporary_root.join(requested);
+                if temporary.is_file() { temporary } else if let Some(root) = &document_root { root.join(requested) } else {
+                    bail!("Relative PDF images require a saved document folder: {image}");
+                }
+            };
+            let image_path = candidate.canonicalize()
+                .with_context(|| format!("Could not resolve PDF image: {image}"))?;
+            if !image_path.is_file() || !(document_root.as_ref().is_some_and(|root| image_path.starts_with(root)) || image_path.starts_with(&temporary_root)) {
+                bail!("PDF images must be inside the document folder: {image}");
+            }
             if fs::metadata(&image_path)?.len() > 25 * 1024 * 1024 { bail!("Image exceeds 25 MB: {image}"); }
             fs::read(image_path)?
             }
         };
         assets.insert(image, bytes);
     }
-    let options = smd_core::PdfOptions { page_size: options.page_size.to_lowercase(), margin: options.margin, font_size: options.font_size, line_height: options.line_height, font_family: options.font_family.clone(), page_numbers: options.page_numbers };
+    let options = smd_core::PdfOptions { page_size: options.page_size.to_lowercase(), margin: options.margin, font_size: options.font_size, line_height: options.line_height, font_family: options.font_family.clone(), page_numbers: options.page_numbers, ..smd_core::PdfOptions::default() };
     atomic_write(output, &smd_core::export(&prepared, &options, &assets)?)?;
     Ok(())
 }
@@ -950,6 +965,46 @@ mod tests {
                 .into_owned()
         )
         .is_err());
+    }
+
+    #[test]
+    fn pdf_export_rejects_absolute_traversal_and_symlink_escape_images() {
+        let directory = tempfile::tempdir().unwrap();
+        let notes = directory.path().join("notes");
+        fs::create_dir(&notes).unwrap();
+        let note = notes.join("note.md");
+        let private = directory.path().join("private.png");
+        fs::write(&private, include_bytes!("../icons/128x128.png")).unwrap();
+
+        for (index, image) in [
+            private.to_string_lossy().into_owned(),
+            "../private.png".into(),
+        ].into_iter().enumerate() {
+            let output = directory.path().join(format!("escaped-{index}.pdf"));
+            let markdown = format!("![private]({image})");
+            assert!(export_pdf_inner(Some(&note), &markdown, &output, &ExportOptions::default()).is_err(), "accepted {image}");
+            assert!(!output.exists());
+        }
+
+        #[cfg(unix)]
+        {
+            std::os::unix::fs::symlink(&private, notes.join("linked.png")).unwrap();
+            let output = directory.path().join("symlink-escape.pdf");
+            assert!(export_pdf_inner(Some(&note), "![private](linked.png)", &output, &ExportOptions::default()).is_err());
+            assert!(!output.exists());
+        }
+    }
+
+    #[test]
+    fn pdf_export_keeps_document_local_images_available() {
+        let directory = tempfile::tempdir().unwrap();
+        let notes = directory.path().join("notes");
+        fs::create_dir_all(notes.join("images")).unwrap();
+        let note = notes.join("note.md");
+        fs::write(notes.join("images/photo.png"), include_bytes!("../icons/128x128.png")).unwrap();
+        let output = directory.path().join("local-image.pdf");
+        export_pdf_inner(Some(&note), "![local](images/photo.png)", &output, &ExportOptions::default()).unwrap();
+        assert!(fs::read(output).unwrap().starts_with(b"%PDF-"));
     }
 
     #[test]

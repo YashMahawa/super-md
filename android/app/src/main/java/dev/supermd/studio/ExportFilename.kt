@@ -65,16 +65,16 @@ internal object ExportFilename {
         return when (format) {
             NativeExportFormat.PDF -> actual in setOf("application/pdf", "application/x-pdf")
             NativeExportFormat.MARKDOWN -> actual in setOf("text/markdown", "text/x-markdown", "text/plain")
-            // Portable notes are JSON text, so providers may report their
-            // underlying representation rather than the custom extension MIME.
-            NativeExportFormat.PORTABLE_SMD -> actual in setOf("application/vnd.supermd.smd", "application/vnd.supermd.fmd", "application/json", "text/json", "text/plain")
+            // Portable notes may be reported as JSON or gzip by providers
+            // instead of their custom extension MIME.
+            NativeExportFormat.PORTABLE_SMD -> actual in setOf("application/vnd.supermd.smd", "application/vnd.supermd.fmd", "application/json", "application/gzip", "application/x-gzip", "text/json", "text/plain")
         }
     }
 
     fun hasExpectedHeader(prefix: ByteArray, format: NativeExportFormat): Boolean = when (format) {
         NativeExportFormat.PDF -> prefix.startsWithAscii("%PDF-")
         NativeExportFormat.MARKDOWN -> true // Markdown is UTF-8 text and has no required magic prefix.
-        NativeExportFormat.PORTABLE_SMD -> prefix.startsWithAscii("{\"format\":\"supermd-smd\"")
+        NativeExportFormat.PORTABLE_SMD -> prefix.size >= 2 && prefix[0] == 0x1f.toByte() && prefix[1] == 0x8b.toByte() || prefix.startsWithAscii("{\"format\":\"supermd-smd\"")
     }
 
     private fun limitLength(value: String): String {

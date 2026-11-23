@@ -2,12 +2,20 @@
 package dev.supermd.studio
 
 import android.graphics.Color as AndroidColor
+import android.graphics.Bitmap
+import android.graphics.Rect
+import android.os.Handler
+import android.os.Looper
+import android.view.PixelCopy
+import java.io.ByteArrayOutputStream
 import android.os.Build
 import android.os.Bundle
 import android.content.Intent
+import android.view.View
 import android.view.WindowManager
 import android.view.ViewGroup
 import android.widget.FrameLayout
+import android.view.inputmethod.InputMethodManager
 import android.webkit.WebView
 import androidx.activity.ComponentActivity
 import androidx.activity.viewModels
@@ -65,12 +73,68 @@ import androidx.window.layout.FoldingFeature
 import androidx.window.layout.WindowInfoTracker
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.withContext
+import kotlinx.coroutines.flow.first
 import org.json.JSONObject
+import java.security.MessageDigest
+import java.util.concurrent.atomic.AtomicBoolean
+import kotlin.coroutines.resume
+import kotlinx.coroutines.suspendCancellableCoroutine
+
+internal fun shouldShowNativeBusyOverlay(busy: Boolean, readerReady: Boolean, readerOwnsProgress: Boolean): Boolean =
+    !readerOwnsProgress && (busy || !readerReady)
+
+private suspend fun View.awaitWindowFocus() {
+    if (hasWindowFocus()) return
+    suspendCancellableCoroutine<Unit> { continuation ->
+        val observer = viewTreeObserver
+        val completed = AtomicBoolean(false)
+        lateinit var listener: android.view.ViewTreeObserver.OnWindowFocusChangeListener
+        fun removeListener() { if (observer.isAlive) observer.removeOnWindowFocusChangeListener(listener) }
+        fun resumeIfFocused() {
+            if (hasWindowFocus() && completed.compareAndSet(false, true)) {
+                removeListener()
+                continuation.resume(Unit)
+            }
+        }
+        listener = android.view.ViewTreeObserver.OnWindowFocusChangeListener { hasFocus ->
+            if (hasFocus) resumeIfFocused()
+        }
+        observer.addOnWindowFocusChangeListener(listener)
+        continuation.invokeOnCancellation { removeListener() }
+        resumeIfFocused()
+    }
+}
 
 class MainActivity : ComponentActivity() {
+    private data class AgentExportArtifact(
+        val uri: android.net.Uri,
+        val filename: String,
+        val format: String,
+        val mimeType: String,
+        val bytes: Long,
+        val sha256: String,
+        val createdAtMillis: Long,
+    )
     var dismissDocument: (() -> Unit)? = null
     var saveReaderPosition: (() -> Unit)? = null
+    var openReaderFind: (() -> Unit)? = null
+    val agentAccessState: AgentAccessState by lazy { AgentAccessState(this) }
+    var agentRelayState by mutableStateOf(AgentRelayClient.State.DISCONNECTED)
+        private set
+    @Volatile private var agentBridgeHandler: ((JSONObject, (Any?, String?) -> Unit) -> Unit)? = null
+    @Volatile private var agentUiHandler: ((JSONObject, (Any?, String?) -> Unit) -> Boolean)? = null
+    @Volatile private var agentExportHandler: ((JSONObject) -> Unit)? = null
+    private val agentExportJobs = java.util.concurrent.ConcurrentHashMap<String, JSONObject>()
+    private val agentExportArtifacts = java.util.concurrent.ConcurrentHashMap<String, AgentExportArtifact>()
+    private val pendingAgentReplies = java.util.concurrent.ConcurrentHashMap<String, (Any?, String?) -> Unit>()
+    private val pendingAgentReplyTimeouts = java.util.concurrent.ConcurrentHashMap<String, Runnable>()
+    private val agentMainHandler = Handler(Looper.getMainLooper())
+    private val agentRelayClient: AgentRelayClient by lazy { AgentRelayClient { agentRelayState = it } }
+    private var relayIdentity: String? = null
     private var workspaceKey = "main"
+    internal val agentWorkspaceKey: String get() = workspaceKey
     private val model: StudioViewModel by viewModels { object : androidx.lifecycle.ViewModelProvider.Factory {
         @Suppress("UNCHECKED_CAST")
         override fun <T : androidx.lifecycle.ViewModel> create(modelClass: Class<T>): T = StudioViewModel(application, workspaceKey) as T
@@ -83,6 +147,7 @@ class MainActivity : ComponentActivity() {
         // Create this task's workspace before RESUMED/lifecycle consumers can
         // request it. Compose's first frame may otherwise run after onResume.
         val windowModel = model
+        intent?.data?.let(windowModel::retainDocumentAccess)
         setContent { Studio(windowModel, this) }
         val savedDispatcherSession = savedInstanceState?.getString(OPEN_DISPATCHER_SESSION)
         if (savedDispatcherSession != windowModel.openDispatcherSessionId) {
@@ -100,9 +165,245 @@ class MainActivity : ComponentActivity() {
         setIntent(intent)
         intent.data?.let { requestOpen(it) }
     }
-    fun requestOpen(uri: android.net.Uri, relative: String? = null) = model.requestOpen(uri, relative)
-    override fun onStop() { saveReaderPosition?.invoke(); model.flush(); super.onStop() }
-    override fun onResume() { super.onResume(); model.refreshMetadata(); model.refreshExternal();model.reloadCustomTheme() }
+    fun requestOpen(uri: android.net.Uri, relative: String? = null) {
+        model.retainDocumentAccess(uri)
+        model.requestOpen(uri, relative)
+    }
+    override fun onStop() { saveReaderPosition?.invoke(); model.flush(); agentRelayClient.disconnect(); relayIdentity = null; pendingAgentReplies.clear(); pendingAgentReplyTimeouts.values.forEach(agentMainHandler::removeCallbacks); pendingAgentReplyTimeouts.clear(); super.onStop() }
+    override fun onResume() { super.onResume(); model.refreshMetadata(); model.refreshExternal();model.reloadCustomTheme(); refreshAgentRelay() }
+    internal fun agentConfigForThisWindow(): AgentAccessConfig? = agentAccessState.configForWorkspace(workspaceKey)
+    internal fun localAgentTabId(value: String): String? {
+        if (value.isBlank()) return null
+        if (!value.startsWith("tab:")) return value.takeIf { ':' !in it }
+        val parts = value.split(':')
+        if (parts.size != 4) return null
+        val config = agentConfigForThisWindow() ?: return null
+        if (parts[1] != config.deviceId || parts[2] != workspaceKey) return null
+        return parts[3].takeIf { it.matches(Regex("^[A-Za-z0-9_-]{1,128}$")) }
+    }
+    internal fun setAgentRequestHandlers(
+        bridge: ((JSONObject, (Any?, String?) -> Unit) -> Unit)?,
+        ui: ((JSONObject, (Any?, String?) -> Unit) -> Boolean)?,
+    ) { agentBridgeHandler = bridge; agentUiHandler = ui }
+    internal fun setAgentUiHandler(handler: ((JSONObject, (Any?, String?) -> Unit) -> Boolean)?) { agentUiHandler = handler }
+    internal fun setAgentExportHandler(handler: ((JSONObject) -> Unit)?) { agentExportHandler = handler }
+    internal fun requestAgentExport(args: JSONObject) {
+        val jobId = args.optString("requestId").takeIf { it.matches(Regex("^[a-zA-Z0-9_-]{1,96}$")) } ?: error("Invalid export job id")
+        check(args.optString("expectedRevision").matches(Regex("^[a-fA-F0-9]{64}$"))) { "Export requires the current document revision" }
+        if (agentExportJobs.size >= 128) {
+            agentExportJobs.entries.filter { it.value.optString("phase") in setOf("completed", "failed", "cancelled") }.take(64).forEach {
+                if (agentExportJobs.remove(it.key, it.value)) agentExportArtifacts.remove(it.key)
+            }
+        }
+        check(agentExportJobs.size < 128) { "Too many export jobs are being tracked; retry after checking earlier jobs" }
+        check(agentExportJobs.putIfAbsent(jobId, JSONObject().put("jobId", jobId).put("phase", "awaiting_destination")) == null) { "That export job id has already been used" }
+        val handler = agentExportHandler ?: run { agentExportJobs.remove(jobId); error("The Android export picker is unavailable") }
+        handler(args)
+    }
+    internal fun updateAgentExportJob(jobId: String, phase: String, error: String? = null) {
+        if (jobId.isNotBlank()) agentExportJobs[jobId] = JSONObject().put("jobId", jobId).put("phase", phase).apply { if (error != null) put("error", error.take(2048)) }
+    }
+    internal fun agentExportJob(jobId: String): JSONObject? = agentExportJobs[jobId]?.let { JSONObject(it.toString()) }
+    internal suspend fun completeAgentExport(jobId: String, uri: android.net.Uri, fallbackName: String, format: String) = withContext(Dispatchers.IO) {
+        require(agentExportJobs[jobId]?.optString("phase") in setOf("preparing", "saving")) { "This export job is not active in this app" }
+        require(format in setOf("pdf", "smd", "md")) { "Unsupported export format" }
+        val (bytes, digest) = fingerprintAgentExport(uri)
+        require(bytes > 0 || format == "md") { "The completed PDF or portable export is empty" }
+        require(bytes <= MAX_AGENT_EXPORT_BYTES) { "Agent downloads are limited to 128 MiB per export" }
+        val queriedName = runCatching {
+            contentResolver.query(uri, arrayOf(android.provider.OpenableColumns.DISPLAY_NAME), null, null, null)?.use { cursor ->
+                if (cursor.moveToFirst()) cursor.getString(0) else null
+            }
+        }.getOrNull()
+        val rawName = queriedName?.takeIf { it.isNotBlank() } ?: fallbackName
+        val filename = rawName.substringAfterLast('/').substringAfterLast('\\')
+            .replace(Regex("[\\u0000-\\u001f\\u007f]"), "").take(256)
+        require(filename.isNotBlank()) { "Android did not provide a valid export filename" }
+        val mimeType = when (format) { "pdf" -> "application/pdf"; "smd" -> "application/vnd.supermd.smd"; else -> "text/markdown" }
+        val artifact = AgentExportArtifact(uri, filename, format, mimeType, bytes, digest, System.currentTimeMillis())
+        agentExportArtifacts[jobId] = artifact
+        agentExportJobs[jobId] = JSONObject().put("jobId", jobId).put("status", "completed").put("phase", "completed")
+            .put("filename", filename).put("format", format).put("mimeType", mimeType).put("bytes", bytes)
+            .put("sha256", digest).put("downloadable", true)
+    }
+    internal suspend fun readAgentExportChunk(jobId: String, offset: Long, limit: Int): JSONObject = withContext(Dispatchers.IO) {
+        require(offset >= 0) { "Export chunk offset must be non-negative" }
+        require(limit in 1..524_288) { "Export chunk limit must be between 1 and 524288 bytes" }
+        require(agentExportJobs[jobId]?.optString("phase") == "completed") { "Only a completed export from this app can be downloaded" }
+        val artifact = agentExportArtifacts[jobId] ?: error("This export artifact is unavailable in this app session")
+        require(System.currentTimeMillis() - artifact.createdAtMillis <= AGENT_EXPORT_LEASE_MILLIS) { "The export download has expired; create a new export" }
+        require(offset <= artifact.bytes) { "Export chunk offset is beyond the end of the file" }
+        val remaining = artifact.bytes - offset
+        val size = minOf(limit.toLong(), remaining).toInt()
+        val body = ByteArray(size)
+        contentResolver.openInputStream(artifact.uri)?.use { input ->
+            var skipped = 0L
+            while (skipped < offset) {
+                val amount = input.skip(offset - skipped)
+                if (amount > 0) skipped += amount else {
+                    if (input.read() < 0) error("The completed export ended before the requested offset")
+                    skipped += 1
+                }
+            }
+            var read = 0
+            while (read < size) {
+                val amount = input.read(body, read, size - read)
+                if (amount < 0) error("The completed export changed while reading a chunk")
+                read += amount
+            }
+        } ?: error("Android cannot open the completed export")
+        val next = offset + size
+        JSONObject().put("jobId", jobId).put("filename", artifact.filename).put("format", artifact.format)
+            .put("mimeType", artifact.mimeType).put("bytes", artifact.bytes).put("sha256", artifact.sha256)
+            .put("offset", offset).put("nextOffset", if (next < artifact.bytes) next else JSONObject.NULL)
+            .put("body", android.util.Base64.encodeToString(body, android.util.Base64.NO_WRAP))
+    }
+    private fun fingerprintAgentExport(uri: android.net.Uri): Pair<Long, String> {
+        val digest = MessageDigest.getInstance("SHA-256")
+        var bytes = 0L
+        contentResolver.openInputStream(uri)?.use { input ->
+            val buffer = ByteArray(64 * 1024)
+            while (true) {
+                val count = input.read(buffer)
+                if (count < 0) break
+                bytes = Math.addExact(bytes, count.toLong())
+                digest.update(buffer, 0, count)
+            }
+        } ?: error("Android cannot open the completed export")
+        return bytes to digest.digest().joinToString("") { "%02x".format(it) }
+    }
+    internal fun revokeAgentAccess(completion: (serverRevoked: Boolean) -> Unit) {
+        val configs = agentAccessState.allConfigs()
+        agentAccessState.setEnabled(false)
+        agentRelayClient.disconnect()
+        relayIdentity = null
+        clearPendingAgentReplies()
+        if (configs.isEmpty()) { agentAccessState.revoke(); completion(true); return }
+        val remaining = java.util.concurrent.atomic.AtomicInteger(configs.size)
+        val allRevoked = java.util.concurrent.atomic.AtomicBoolean(true)
+        configs.forEach { config -> agentRelayClient.revokeDevice(config) { revoked ->
+            if (!revoked) allRevoked.set(false)
+            if (remaining.decrementAndGet() == 0) {
+                agentAccessState.revoke()
+                clearPendingAgentReplies()
+                completion(allRevoked.get())
+            }
+        } }
+    }
+    internal fun deliverAgentReply(requestId: String, result: Any?, error: String?) {
+        pendingAgentReplyTimeouts.remove(requestId)?.let(agentMainHandler::removeCallbacks)
+        pendingAgentReplies.remove(requestId)?.invoke(result, error)
+    }
+    internal fun captureAgentReply(requestId: String, callback: (Any?, String?) -> Unit) {
+        pendingAgentReplyTimeouts.remove(requestId)?.let(agentMainHandler::removeCallbacks)
+        pendingAgentReplies[requestId] = callback
+        val timeout = Runnable {
+            pendingAgentReplyTimeouts.remove(requestId)
+            pendingAgentReplies.remove(requestId)?.invoke(null, "The live reader did not finish this request before its deadline")
+        }
+        pendingAgentReplyTimeouts[requestId] = timeout
+        agentMainHandler.postDelayed(timeout, 18_000)
+    }
+    private fun clearPendingAgentReplies() {
+        pendingAgentReplies.clear()
+        pendingAgentReplyTimeouts.values.forEach(agentMainHandler::removeCallbacks)
+        pendingAgentReplyTimeouts.clear()
+    }
+    internal fun dispatchAgentRequest(web: WebView, request: JSONObject, reply: (Any?, String?) -> Unit) {
+        val requestId = request.optString("requestId")
+        if (requestId.isBlank() || requestId.length > 96) { reply(null, "Invalid request id"); return }
+        val payload = JSONObject(request.toString()).apply { remove("deviceId") }
+        captureAgentReply(requestId, reply)
+        val script = "window.supermdAgentRequest?.($payload,(result,error)=>window.SuperMD?.agentReply?.(${JSONObject.quote(requestId)},JSON.stringify(result??null),String(error||'')));true"
+        web.evaluateJavascript(script, null)
+    }
+    internal fun dispatchAgentCompute(web: WebView, request: JSONObject, reply: (Any?, String?) -> Unit) {
+        val requestId = request.optString("requestId")
+        if (requestId.isBlank() || requestId.length > 96) { reply(null, "Invalid request id"); return }
+        captureAgentReply(requestId, reply)
+        val payload = JSONObject(request.toString())
+        val callback = "(result,error)=>window.SuperMD?.agentReply?.(${JSONObject.quote(requestId)},JSON.stringify(result??null),String(error||''))"
+        val script = "if(window.supermdAgentCompute)window.supermdAgentCompute($payload,$callback);else window.SuperMD?.agentReply?.(${JSONObject.quote(requestId)},'null','The native document computation helper is unavailable');true"
+        web.evaluateJavascript(script, null)
+    }
+    internal fun agentRevision(value: String): String = MessageDigest.getInstance("SHA-256")
+        .digest(value.toByteArray(Charsets.UTF_8)).joinToString("") { "%02x".format(it) }
+    internal fun agentSourceLength(value: String): Int = value.codePointCount(0, value.length)
+    internal suspend fun captureAgentViewport(reader: WebView, requestedWidth: Int, imageFormat: String = "png"): JSONObject {
+        require(imageFormat in setOf("png", "jpeg")) { "Unsupported viewport image format" }
+        check(Build.VERSION.SDK_INT >= 26) { "Viewport snapshots require Android 8 or newer" }
+        check(reader.width > 0 && reader.height > 0 && reader.isAttachedToWindow) { "The live reading viewport is unavailable" }
+        val context = kotlinx.coroutines.suspendCancellableCoroutine<JSONObject> { continuation ->
+            val requestId = "snapshot_context_${java.util.UUID.randomUUID()}"
+            val request = JSONObject().put("requestId", requestId).put("action", "get_context")
+            dispatchAgentRequest(reader, request) { result, error ->
+                if (!continuation.isActive) return@dispatchAgentRequest
+                val value = result as? JSONObject
+                if (error != null) continuation.resumeWith(Result.failure(IllegalStateException(error)))
+                else if (value == null) continuation.resumeWith(Result.failure(IllegalStateException("The reader returned no snapshot context")))
+                else continuation.resume(value)
+            }
+            continuation.invokeOnCancellation {
+                pendingAgentReplyTimeouts.remove(requestId)?.let(agentMainHandler::removeCallbacks)
+                pendingAgentReplies.remove(requestId)
+            }
+        }
+        val origin = IntArray(2)
+        reader.getLocationInWindow(origin)
+        val source = Rect(origin[0], origin[1], origin[0] + reader.width, origin[1] + reader.height)
+        val targetWidth = requestedWidth.coerceIn(320, 1600).coerceAtMost(source.width())
+        val targetHeight = (source.height().toDouble() * targetWidth / source.width()).toInt().coerceAtLeast(1)
+        val bitmap = Bitmap.createBitmap(targetWidth, targetHeight, Bitmap.Config.ARGB_8888)
+        val status = kotlinx.coroutines.suspendCancellableCoroutine<Int> { continuation ->
+            PixelCopy.request(window, source, bitmap, { result ->
+                if (continuation.isActive) continuation.resume(result)
+            }, Handler(Looper.getMainLooper()))
+            continuation.invokeOnCancellation { bitmap.recycle() }
+        }
+        check(status == PixelCopy.SUCCESS) { "Android could not capture the reading viewport (PixelCopy status $status)" }
+        var encoded: ByteArray
+        var finalBitmap = bitmap
+        try {
+            while (true) {
+                val output = ByteArrayOutputStream()
+                val format = if (imageFormat == "jpeg") Bitmap.CompressFormat.JPEG else Bitmap.CompressFormat.PNG
+                val quality = if (imageFormat == "jpeg") 90 else 100
+                check(finalBitmap.compress(format, quality, output)) { "Could not encode the viewport image" }
+                encoded = output.toByteArray()
+                if (encoded.size <= 3_500_000 || finalBitmap.width <= 480) break
+                val next = Bitmap.createScaledBitmap(finalBitmap, (finalBitmap.width * .8f).toInt().coerceAtLeast(1), (finalBitmap.height * .8f).toInt().coerceAtLeast(1), true)
+                if (next !== finalBitmap && finalBitmap !== bitmap) finalBitmap.recycle()
+                finalBitmap = next
+            }
+            check(encoded.size <= 3_500_000) { "The reading viewport image exceeds the safe transfer limit" }
+            val note = model.state.value.active
+            val revision = context.optString("revision", agentRevision(note.content))
+            val mimeType = if (imageFormat == "jpeg") "image/jpeg" else "image/png"
+            return JSONObject().put("mime_type", mimeType).put("data", android.util.Base64.encodeToString(encoded, android.util.Base64.NO_WRAP))
+                .put("width", finalBitmap.width).put("height", finalBitmap.height).put("revision", revision)
+                .put("metadata", JSONObject().put("tabId", context.optString("tabId", "tab:${agentConfigForThisWindow()?.deviceId ?: "local"}:$workspaceKey:${note.id}"))
+                    .put("mode", context.optString("mode", model.state.value.mode)).put("zoom", context.optDouble("zoom", model.state.value.zoom.toDouble()))
+                    .put("reading", context.optJSONObject("reading") ?: JSONObject()).put("selection", context.optJSONObject("selection") ?: JSONObject()))
+        } finally { if (finalBitmap !== bitmap) finalBitmap.recycle(); bitmap.recycle() }
+    }
+    internal fun refreshAgentRelay() {
+        if (!agentAccessState.enabled) {
+            agentRelayClient.disconnect(); relayIdentity = null; clearPendingAgentReplies(); return
+        }
+        val config = agentConfigForThisWindow()
+        if (config == null) { agentRelayClient.disconnect(); relayIdentity = null; clearPendingAgentReplies(); return }
+        val identity = "${config.groupId}:${config.deviceId}"
+        if (identity == relayIdentity && agentRelayState != AgentRelayClient.State.DISCONNECTED) return
+        relayIdentity = identity
+        agentRelayClient.connect(config) { request, reply ->
+            val ui = agentUiHandler
+            if (ui?.invoke(request, reply) != true) {
+                val bridge = agentBridgeHandler
+                if (bridge == null) reply(null, "The live reader is not ready. Keep Super MD open on a note and retry.")
+                else bridge(request, reply)
+            }
+        }
+    }
     fun handleShortcut(event: android.view.KeyEvent): Boolean {
         if (event.action == android.view.KeyEvent.ACTION_DOWN && event.repeatCount == 0) {
             if (event.keyCode == android.view.KeyEvent.KEYCODE_F11) { model.fullscreen(!model.state.value.fullscreen); return true }
@@ -115,6 +416,7 @@ class MainActivity : ComponentActivity() {
                     android.view.KeyEvent.KEYCODE_TAB -> { model.cycle(if(event.isShiftPressed)-1 else 1);return true }
                     android.view.KeyEvent.KEYCODE_PAGE_DOWN -> {model.cycle(1);return true}
                     android.view.KeyEvent.KEYCODE_PAGE_UP -> {model.cycle(-1);return true}
+                    android.view.KeyEvent.KEYCODE_F -> {openReaderFind?.invoke();return true}
                 }
                 if(event.keyCode in android.view.KeyEvent.KEYCODE_1..android.view.KeyEvent.KEYCODE_9){model.tabNumber(event.keyCode-android.view.KeyEvent.KEYCODE_1+1);return true}
             }
@@ -127,7 +429,11 @@ class MainActivity : ComponentActivity() {
         outState.putString(OPEN_DISPATCHER_SESSION, model.openDispatcherSessionId)
         super.onSaveInstanceState(outState)
     }
-    companion object { private const val OPEN_DISPATCHER_SESSION = "open_dispatcher_session" }
+    companion object {
+        private const val OPEN_DISPATCHER_SESSION = "open_dispatcher_session"
+        private const val MAX_AGENT_EXPORT_BYTES = 128L * 1024 * 1024
+        private const val AGENT_EXPORT_LEASE_MILLIS = 10L * 60 * 1000
+    }
     fun newWindow() {
         model.flush()
         startActivity(Intent(this, MainActivity::class.java).putExtra("workspace", java.util.UUID.randomUUID().toString()).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_MULTIPLE_TASK or Intent.FLAG_ACTIVITY_LAUNCH_ADJACENT))
@@ -171,6 +477,7 @@ private object NoMotionScheme : MotionScheme {
     val drawer = rememberDrawerState(DrawerValue.Closed)
     val snackbar = remember { SnackbarHostState() }
     var settings by remember { mutableStateOf(activity.intent.getBooleanExtra("showUpdates",false)) }
+    var settingsSection by rememberSaveable { mutableStateOf<String?>(null) }
     val update by model.updates.state.collectAsStateWithLifecycle()
     val notificationPermission=rememberLauncherForActivityResult(ActivityResultContracts.RequestPermission()){granted->if(granted)model.updates.notifyAvailable()}
     LaunchedEffect(update.version) {
@@ -185,11 +492,14 @@ private object NoMotionScheme : MotionScheme {
     }
     var exporting by remember { mutableStateOf(false) }
     var sharing by remember { mutableStateOf(false) }
+    var readerPdfOwnsProgress by remember { mutableStateOf(false) }
     var menu by remember { mutableStateOf(false) }
+    var findRequest by remember { mutableIntStateOf(0) }
     var renaming by remember {mutableStateOf(false)}
     var contentsShown by remember {mutableStateOf(false)}
     var sidebarSection by rememberSaveable {mutableStateOf("folder")}
     var readingChromeVisible by remember {mutableStateOf(true)}
+    LaunchedEffect(state.busy) { if (!state.busy) readerPdfOwnsProgress = false }
     LaunchedEffect(state.active.id, state.mode, settings) { if (!state.fullscreen) readingChromeVisible = true }
     LaunchedEffect(state.fullscreen) { if (state.fullscreen) readingChromeVisible = false }
     // A delayed single tap allows Live's double tap to enter editing without
@@ -245,9 +555,44 @@ private object NoMotionScheme : MotionScheme {
         }
     }
     DisposableEffect(activity, web) {
+        model.assetAccessRestored = { document, source ->
+            web?.evaluateJavascript("window.dispatchEvent(new CustomEvent('supermd-asset-access-restored',{detail:{documentPath:${JSONObject.quote(document)},source:${JSONObject.quote(source)}}}))", null)
+        }
         activity.dismissDocument = { web?.evaluateJavascript("window.supermdDismiss?.() || false") { dismissed -> if (dismissed != "true") model.fullscreen(false) } ?: model.fullscreen(false) }
         activity.saveReaderPosition={web?.evaluateJavascript("window.supermdSavePosition?.()",null)}
-        onDispose { activity.dismissDocument = null;activity.saveReaderPosition=null }
+        activity.openReaderFind = {
+            menu = false
+            findRequest++
+        }
+        onDispose { activity.dismissDocument = null;activity.saveReaderPosition=null;activity.openReaderFind=null;model.assetAccessRestored=null }
+    }
+    LaunchedEffect(findRequest, menu, web) {
+        if (findRequest == 0 || menu) return@LaunchedEffect
+        val requested = findRequest
+        // Wait for the popup window to release native focus before asking the
+        // WebView for focus. This follows the actual dismissal instead of
+        // estimating its transition duration.
+        val reader = web ?: return@LaunchedEffect
+        reader.awaitWindowFocus()
+        if (menu || requested != findRequest || reader !== web) return@LaunchedEffect
+        findRequest = 0
+        reader.requestFocus(View.FOCUS_DOWN)
+        reader.evaluateJavascript("window.supermdFind?.(); true") {
+            reader.post {
+                reader.requestFocus(View.FOCUS_DOWN)
+                val hasHardwareKeyboard = activity.resources.configuration.keyboard != android.content.res.Configuration.KEYBOARD_NOKEYS
+                val showImeWithHardware = android.provider.Settings.Secure.getInt(activity.contentResolver, "show_ime_with_hard_keyboard", 0) == 1
+                val inputMethod = activity.getSystemService(android.content.Context.INPUT_METHOD_SERVICE) as? InputMethodManager
+                if (!hasHardwareKeyboard || showImeWithHardware) {
+                    inputMethod?.showSoftInput(reader, InputMethodManager.SHOW_IMPLICIT)
+                } else {
+                    // WebView.focus() can itself open the software keyboard
+                    // after an input receives focus. Honor the hardware-keyboard
+                    // preference even when DOM focus was restored natively.
+                    inputMethod?.hideSoftInputFromWindow(reader.windowToken, 0)
+                }
+            }
+        }
     }
     var readerReady by remember { mutableStateOf(false) }
     var readerGeneration by remember { mutableIntStateOf(0) }
@@ -264,9 +609,312 @@ private object NoMotionScheme : MotionScheme {
         model.attachReaderOpenHandler(handler)
         onDispose { if (handler != null) model.detachReaderOpenHandler(handler) }
     }
+    DisposableEffect(activity, model, readerReady, web, state.tabs, state.activeId) {
+        val bridge: ((JSONObject, (Any?, String?) -> Unit) -> Unit)? = if (!readerReady || web == null) null else bridge@{ incoming, reply ->
+            val request = JSONObject(incoming.toString())
+            val globallyQualified = request.optString("tabId")
+            val rawTabId = if (globallyQualified.isNotBlank()) activity.localAgentTabId(globallyQualified) else null
+            if (globallyQualified.isNotBlank() && rawTabId == null) { reply(null, "This tab belongs to a different device or workspace"); return@bridge }
+            if (rawTabId != null) request.put("tabId", rawTabId)
+            request.optString("expectedRevision").takeIf { it.isNotBlank() }?.let { request.put("expectedRevision", it.lowercase()) }
+            fun canonicalTabId(note: Note): String = "tab:${activity.agentConfigForThisWindow()?.deviceId ?: "local"}:${activity.agentWorkspaceKey}:${note.id}"
+            fun sendAgentReply(targetId: String, result: Any?, error: String?) {
+                val current = model.state.value.tabs.firstOrNull { it.id == targetId }
+                val knownConflict = error?.takeIf { message ->
+                    message.contains("revision conflict", ignoreCase = true) ||
+                        message.contains("changed since the supplied revision", ignoreCase = true) ||
+                        message.contains("changed since the expected revision", ignoreCase = true)
+                }
+                if (knownConflict != null && current != null) {
+                    reply(null, JSONObject().put("error", knownConflict).put("currentRevision", activity.agentRevision(current.content))
+                        .put("sourceLength", activity.agentSourceLength(current.content)).toString())
+                } else reply(result, error)
+            }
+            fun withSelectedTab(snapshotSafeWhenInactive: Boolean = false, action: suspend () -> Unit) {
+                val target = request.optString("tabId").takeIf { it.isNotBlank() }
+                if (target == null) { scope.launch { action() }; return }
+                val snapshot = model.state.value.tabs.firstOrNull { it.id == target }
+                if (snapshot == null) { reply(null, "The requested tab is not open on this device"); return }
+                val suppliedRevision = request.optString("expectedRevision").takeIf { it.isNotBlank() }
+                if (suppliedRevision != null && !activity.agentRevision(snapshot.content).equals(suppliedRevision, ignoreCase = true)) {
+                    sendAgentReply(target, null, "Revision conflict: the note changed; read it again before editing")
+                    return
+                }
+                if (model.state.value.activeId != target && snapshotSafeWhenInactive) {
+                    if (request.optString("action") !in setOf("read_tab", "search_tab", "outline_tab", "list_diagrams", "get_diagram", "patch_tab")) {
+                        reply(null, "This Android action requires the requested tab to be active")
+                        return
+                    }
+                    val contentBytes = snapshot.content.toByteArray(Charsets.UTF_8)
+                    if (contentBytes.size > MAX_AGENT_SNAPSHOT_BYTES) { reply(null, "This document exceeds Android's 2 MiB inactive-tab snapshot limit; activate it and retry"); return }
+                    val compute = JSONObject().put("requestId", request.optString("requestId"))
+                        .put("action", request.optString("action")).put("tabId", target).put("content", snapshot.content)
+                    listOf("expectedRevision", "operations", "offset", "limit", "query", "context", "heading", "view", "diagramId", "caseSensitive", "wholeWord", "regex", "excludeDiagrams")
+                        .forEach { key -> if (request.has(key)) compute.put(key, request.get(key)) }
+                    if (request.has("expectedRevision")) compute.put("expectedRevision", request.getString("expectedRevision").lowercase())
+                    activity.dispatchAgentCompute(web!!, compute) { raw, error ->
+                        if (error != null) { reply(null, error); return@dispatchAgentCompute }
+                        val result = raw as? JSONObject
+                        if (result == null) { reply(null, "Android could not read the computed document result"); return@dispatchAgentCompute }
+                        val snapshotRevision = activity.agentRevision(snapshot.content)
+                        val actionName = request.optString("action")
+                        if (result.optString("tabId") != target) {
+                            reply(null, "The document result did not match the captured Android note snapshot")
+                            return@dispatchAgentCompute
+                        }
+                        if (request.optString("action") == "patch_tab") {
+                            val patchedContent = result.optString("patchedContent", "")
+                            if (!result.optString("baseRevision").equals(snapshotRevision, ignoreCase = true) ||
+                                result.optInt("baseSourceLength", -1) != activity.agentSourceLength(snapshot.content) ||
+                                result.optInt("sourceLength", -1) != activity.agentSourceLength(patchedContent) ||
+                                !request.optString("expectedRevision").equals(snapshotRevision, ignoreCase = true)) {
+                            sendAgentReply(target, null, "Revision conflict: the note changed; read it again before editing")
+                                return@dispatchAgentCompute
+                            }
+                            scope.launch {
+                                runCatching {
+                                    model.commitAgentSnapshotPatch(target, snapshotRevision, patchedContent, result.optString("revision"))
+                                }.onFailure { sendAgentReply(target, null, it.message ?: "Could not save the inactive-tab patch") }
+                                    .onSuccess { result.remove("patchedContent"); result.put("tabId", canonicalTabId(snapshot)); reply(result, null) }
+                            }
+                        } else {
+                            if (!result.optString("revision").equals(snapshotRevision, ignoreCase = true) || result.optInt("sourceLength", -1) != activity.agentSourceLength(snapshot.content)) {
+                                reply(null, "The document revision changed while Android was reading it; retry")
+                            } else {
+                                result.put("tabId", canonicalTabId(snapshot))
+                                reply(result, null)
+                            }
+                        }
+                    }
+                } else if (model.state.value.activeId != target) {
+                    reply(null, "The requested tab is inactive. Activate it in Super MD before using this Android reader action.")
+                } else scope.launch { action() }
+            }
+            when (request.optString("action")) {
+                "list_tabs" -> {
+                    val tabs = org.json.JSONArray()
+                    val liveState = model.state.value
+                    liveState.tabs.take(100).forEach { note ->
+                        val id = canonicalTabId(note)
+                        tabs.put(JSONObject().put("id", id).put("tabId", id).put("name", note.name).put("saved", !note.dirty)
+                            .put("active", note.id == liveState.activeId).put("mode", if (note.id == liveState.activeId) liveState.mode else "live")
+                            .put("path", note.uri ?: note.id).put("uri", note.uri ?: JSONObject.NULL)
+                            .put("revision", activity.agentRevision(note.content)))
+                    }
+                    reply(JSONObject().put("tabs", tabs), null)
+                }
+                "document_action" -> when (request.optString("documentAction")) {
+                    "create" -> {
+                        val options = request.optJSONObject("options")
+                        val title = request.optString("titleHint").takeIf { it.isNotBlank() }
+                            ?: request.optString("filename").takeIf { it.isNotBlank() }
+                        val format = request.optString("format").takeIf { it.isNotBlank() }
+                            ?: if (title?.endsWith(".smd", ignoreCase = true) == true) "smd" else "md"
+                        model.newNote(title, request.optString("content").takeIf { request.has("content") },
+                            options?.optBoolean("background", false) == true, format) { created ->
+                            if (created == null) reply(null, "Super MD could not create a tab")
+                            else {
+                                val updated = model.state.value.tabs.firstOrNull { it.id == created.id } ?: created
+                                reply(JSONObject().put("tabId", canonicalTabId(updated)).put("name", updated.name)
+                                    .put("path", updated.uri ?: updated.id).put("uri", updated.uri ?: JSONObject.NULL)
+                                    .put("active", updated.id == model.state.value.activeId).put("format", if (updated.portable) "smd" else "md")
+                                    .put("revision", activity.agentRevision(updated.content)), null)
+                            }
+                        }
+                    }
+                    "activate" -> {
+                        val target = request.optString("tabId")
+                        if (model.state.value.tabs.none { it.id == target }) reply(null, "The requested tab is not open on this device")
+                        else {
+                            model.select(target)
+                            scope.launch {
+                                val selected = kotlinx.coroutines.withTimeoutOrNull(5_000) { model.state.first { it.activeId == target } }
+                                if (selected == null) reply(null, "Could not activate the requested open tab")
+                                else {
+                                    // ActiveId changes before the WebView's React tree has necessarily received
+                                    // supermdLoad for the new tab. Do not report activation complete until the
+                                    // live reader has acknowledged this exact native snapshot; otherwise an
+                                    // immediate close can safely fail its own flush while JS still holds the
+                                    // previous tab. The close barrier remains mandatory after this handshake.
+                                    val readerReady = model.awaitReaderSnapshot(target)
+                                    if (!readerReady) reply(null, "The requested tab is still loading in the reader; retry activation shortly")
+                                    else {
+                                        val note = model.state.value.tabs.firstOrNull { it.id == target }
+                                        if (note == null || model.state.value.activeId != target) reply(null, "The requested tab is no longer open")
+                                        else reply(JSONObject().put("tabId", canonicalTabId(note)).put("name", note.name)
+                                            .put("path", note.uri ?: note.id).put("uri", note.uri ?: JSONObject.NULL).put("active", true)
+                                            .put("revision", activity.agentRevision(note.content)), null)
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    "save" -> {
+                        val target = request.optString("tabId")
+                        val options = request.optJSONObject("options")
+                        val requestedFormat = request.optString("format").takeIf { it.isNotBlank() }
+                        if (options?.optBoolean("saveAs", false) == true) {
+                            val note = model.state.value.tabs.firstOrNull { it.id == target }
+                            if (note == null) reply(null, "The requested tab is not open on this device")
+                            else if (requestedFormat != null && requestedFormat != (if (note.portable) "smd" else "md"))
+                                reply(null, "Android Save As preserves this note's ${if (note.portable) "smd" else "md"} format; converting formats is not supported")
+                            else if (!activity.agentRevision(note.content).equals(request.optString("expectedRevision"), ignoreCase = true))
+                                sendAgentReply(target, null, "Revision conflict: the note changed; read it again before saving")
+                            else {
+                                model.busy(true)
+                                scope.launch {
+                                    runCatching { model.saveAgentAs(target, request.getString("expectedRevision"), request.getString("filename")) }
+                                        .onFailure { error -> model.fail("Could not save as: ${error.message}"); sendAgentReply(target, null, error.message ?: "Could not save as") }
+                                        .onSuccess { (path, name) ->
+                                            val saved = model.state.value.tabs.firstOrNull { it.id == target }
+                                            if (saved == null) reply(null, "The note closed while it was saving")
+                                            else reply(JSONObject().put("tabId", canonicalTabId(saved)).put("name", name).put("path", path).put("uri", path)
+                                                .put("active", saved.id == model.state.value.activeId).put("revision", activity.agentRevision(saved.content))
+                                                .put("saved", !saved.dirty).put("savedAs", true), null)
+                                        }
+                                }
+                            }
+                        }
+                        else {
+                            val note = model.state.value.tabs.firstOrNull { it.id == target }
+                            if (note == null) reply(null, "The requested tab is not open on this device")
+                            else if (requestedFormat != null && requestedFormat != (if (note.portable) "smd" else "md"))
+                                reply(null, "Android save preserves this note's ${if (note.portable) "smd" else "md"} format; converting formats is not supported")
+                            else if (!activity.agentRevision(note.content).equals(request.optString("expectedRevision"), ignoreCase = true))
+                                sendAgentReply(target, null, "Revision conflict: the note changed; read it again before saving")
+                            else if (note.portable) {
+                                model.busy(true)
+                                scope.launch {
+                                    runCatching { model.saveAgentPortable(target, request.getString("expectedRevision")) }
+                                        .onFailure { error -> sendAgentReply(target, null, model.reportDocumentSaveFailure(target, error, "Could not save portable note: ${error.message}")) }
+                                        .onSuccess {
+                                            val saved = model.state.value.tabs.firstOrNull { it.id == target }
+                                            if (saved == null) reply(null, "The note closed while it was saving")
+                                            else reply(JSONObject().put("tabId", canonicalTabId(saved)).put("name", saved.name)
+                                                .put("path", saved.uri ?: saved.id).put("uri", saved.uri ?: JSONObject.NULL)
+                                                .put("active", saved.id == model.state.value.activeId).put("revision", activity.agentRevision(saved.content))
+                                                .put("saved", !saved.dirty), null)
+                                        }
+                                }
+                            }
+                            else model.save(noteId = target, expectedRevision = request.optString("expectedRevision")) { error ->
+                                if (error != null) sendAgentReply(target, null, error)
+                                else {
+                                    val saved = model.state.value.tabs.firstOrNull { it.id == target }
+                                    if (saved == null) reply(null, "The note closed while it was saving")
+                                    else reply(JSONObject().put("tabId", canonicalTabId(saved)).put("name", saved.name)
+                                        .put("path", saved.uri ?: saved.id).put("uri", saved.uri ?: JSONObject.NULL)
+                                        .put("active", saved.id == model.state.value.activeId).put("revision", activity.agentRevision(saved.content))
+                                        .put("saved", !saved.dirty), null)
+                                }
+                            }
+                        }
+                    }
+                    "close" -> {
+                        val target = request.optString("tabId")
+                        val note = model.state.value.tabs.firstOrNull { it.id == target }
+                        val discard = request.optJSONObject("options")?.optBoolean("discardChanges", false) == true
+                        if (note == null) reply(null, "The requested tab is not open on this device")
+                        else if (!activity.agentRevision(note.content).equals(request.optString("expectedRevision"), ignoreCase = true)) sendAgentReply(target, null, "Revision conflict: the note changed since the supplied revision; it remains open")
+                        else if (note.dirty && !discard) reply(null, "The note has unsaved changes. Set options.discardChanges=true to close it; Android will retain its recovery copy.")
+                        else {
+                            model.close(target, request.getString("expectedRevision"), refuseDirty = true, discardChanges = discard) { error ->
+                                if (error != null) sendAgentReply(target, null, error)
+                                else {
+                                    val current = model.state.value
+                                    reply(JSONObject().put("closed", true).put("activeTabId", canonicalTabId(current.active))
+                                        .put("tabId", canonicalTabId(current.active)).put("name", current.active.name)
+                                        .put("path", current.active.uri ?: current.active.id).put("uri", current.active.uri ?: JSONObject.NULL)
+                                        .put("revision", activity.agentRevision(current.active.content)), null)
+                                }
+                            }
+                        }
+                    }
+                    "open" -> { reply(null, "Use Super MD's Open action on Android, then retry the device request.") }
+                    "job_status" -> reply(activity.agentExportJob(request.optString("jobId")) ?: JSONObject().put("jobId", request.optString("jobId")).put("phase", "unknown"), null)
+                    "export_chunk" -> scope.launch {
+                        try { reply(activity.readAgentExportChunk(request.getString("jobId"), request.optLong("offset", 0L), request.optInt("limit", 262_144)), null) }
+                        catch (error: Exception) { reply(null, error.message ?: "Could not read this export chunk") }
+                    }
+                    else -> {
+                        val action = when (request.optString("documentAction")) {
+                            "latexfix" -> if (request.optJSONObject("options")?.has("repairIndices") == true) "latex_apply" else "latex_review"
+                            "outline" -> "outline_tab"
+                            "snapshot" -> "snapshot"
+                            else -> request.optString("documentAction")
+                        }
+                        if (request.optString("documentAction") in setOf("latexfix", "latex_apply") && action == "latex_apply" && !request.has("repairIndices"))
+                            request.optJSONObject("options")?.takeIf { it.has("repairIndices") }?.let { request.put("repairIndices", it.getJSONArray("repairIndices")) }
+                        request.optJSONObject("options")?.let { options ->
+                            listOf("offset", "limit").forEach { field -> if (!request.has(field) && options.has(field)) request.put(field, options.get(field)) }
+                        }
+                        if (request.optString("documentAction") == "export") {
+                            val options = request.optJSONObject("options")
+                            val requestedName = request.optString("filename").takeIf { it.isNotBlank() } ?: options?.optString("filename").orEmpty()
+                            val filename = requestedName.takeIf { it.isNotBlank() }?.let { it.substringAfterLast('/').substringAfterLast('\\').replace(Regex("[\\u0000-\\u001f\\u007f]"), "").take(240) }
+                                ?.takeIf { it.isNotBlank() }
+                            val exportFormat = request.optString("format").takeIf { it.isNotBlank() } ?: options?.optString("format", "pdf") ?: "pdf"
+                            request.put("action", "export_document").put("format", exportFormat)
+                            if (filename != null) request.put("filename", filename)
+                            options?.remove("filename")
+                            options?.remove("format")
+                        }
+                        else request.put("action", action)
+                        if (request.optString("action") == "snapshot") withSelectedTab { runCatching { activity.captureAgentViewport(web!!, request.optInt("width", 1200)) }.onSuccess { reply(it, null) }.onFailure { reply(null, it.message ?: "Could not capture the reading viewport") } }
+                        else withSelectedTab { activity.dispatchAgentRequest(web!!, request) { result, error -> sendAgentReply(request.optString("tabId"), result, error) } }
+                    }
+                }
+                "render_tab" -> withSelectedTab { runCatching { activity.captureAgentViewport(web!!, request.optInt("width", 1200), request.optString("imageFormat", "png")) }.onSuccess { reply(it, null) }.onFailure { reply(null, it.message ?: "Could not capture the reading viewport") } }
+                "get_diagram", "get_diagram_image", "list_diagrams" -> withSelectedTab(snapshotSafeWhenInactive = true) { activity.dispatchAgentRequest(web!!, request) { result, error -> sendAgentReply(request.optString("tabId"), result, error) } }
+                "replace_tab_asset" -> withSelectedTab {
+                    val flush = JSONObject(request.toString()).put("action", "flush_current")
+                    activity.dispatchAgentRequest(web!!, flush) { _, flushError ->
+                        if (flushError != null) reply(null, flushError)
+                        else scope.launch {
+                            runCatching {
+                                model.replacePortableAsset(
+                                    request.getString("tabId"), request.getString("assetName"),
+                                    request.getString("assetPath"), request.getString("expectedRevision"),
+                                )
+                            }.onSuccess {
+                                if (it.optBoolean("changed")) web?.evaluateJavascript("window.dispatchEvent(new Event('supermd-assets-changed'))", null)
+                                reply(it, null)
+                            }
+                                .onFailure { sendAgentReply(request.optString("tabId"), null, it.message ?: "Could not replace the portable image") }
+                        }
+                    }
+                }
+                "asset_action" -> withSelectedTab {
+                    val flush = JSONObject(request.toString()).put("action", "flush_current")
+                    activity.dispatchAgentRequest(web!!, flush) { _, flushError ->
+                        if (flushError != null) reply(null, flushError)
+                        else scope.launch {
+                            runCatching { model.agentAssetAction(request) }
+                                .onSuccess {
+                                    if (request.optString("assetAction") == "attach") web?.evaluateJavascript("window.dispatchEvent(new Event('supermd-assets-changed'))", null)
+                                    reply(it, null)
+                                }
+                                .onFailure { sendAgentReply(request.optString("tabId"), null, it.message ?: "Could not use the portable image asset") }
+                        }
+                    }
+                }
+                "read_tab", "search_tab", "patch_tab", "get_context", "outline_tab", "latex_review", "latex_apply" -> withSelectedTab(snapshotSafeWhenInactive = request.optString("action") in setOf("read_tab", "search_tab", "patch_tab", "outline_tab")) { activity.dispatchAgentRequest(web!!, request) { result, error -> sendAgentReply(request.optString("tabId"), result, error) } }
+                else -> reply(null, "This action is not supported by the Android live reader.")
+            }
+        }
+        activity.setAgentRequestHandlers(bridge, null)
+        onDispose { activity.setAgentRequestHandlers(null, null) }
+    }
     var folderRelative by remember { mutableStateOf("") }
     var hinge by remember { mutableStateOf<FoldingFeature?>(null) }
     val recent by model.recent.collectAsStateWithLifecycle()
+    val accessRequest by model.documentAccessRequests.collectAsStateWithLifecycle()
+    var accessPickerShowing by rememberSaveable { mutableStateOf(false) }
+    val accessPicker = rememberLauncherForActivityResult(RestoreDocumentAccess()) { uri ->
+        accessPickerShowing = false
+        val request = model.documentAccessRequests.value
+        if (uri != null && request != null) model.restoreDocumentAccess(request, uri) else model.dismissDocumentAccess()
+    }
     var imageCallback by remember { mutableStateOf<android.webkit.ValueCallback<Array<android.net.Uri>>?>(null) }
     var imageNote by remember { mutableStateOf("") }
     DisposableEffect(model, activity) {
@@ -287,13 +935,60 @@ private object NoMotionScheme : MotionScheme {
     val save = rememberLauncherForActivityResult(NoteDestination("text/markdown", model::noteLocation)) { it?.let { uri -> model.save(uri) } }
     val folder = rememberLauncherForActivityResult(ActivityResultContracts.OpenDocumentTree()) { it?.let { uri -> folderRelative = ""; model.setFolder(uri) } }
     val pdf = rememberLauncherForActivityResult(NoteDestination("application/pdf", model::noteLocation)) { uri ->
-        if (uri != null) { model.setPdfDestination(uri); model.busy(true); web?.evaluateJavascript("window.supermdExport?.(${state.pdf})", null) ?: model.fail("The reader is not ready. Open the note again.") }
+        if (uri != null) { readerPdfOwnsProgress = true; model.setPdfDestination(uri); model.busy(true); web?.evaluateJavascript("window.supermdExport?.(${state.pdf})", null) ?: model.fail("The reader is not ready. Open the note again.") }
     }
     val portable = rememberLauncherForActivityResult(NoteDestination("application/vnd.supermd.smd", model::noteLocation)) { uri ->
         if (uri != null) { model.setPortableDestination(uri); model.busy(true); web?.evaluateJavascript("window.supermdPortable?.(false)", null) ?: model.fail("The reader is not ready") }
     }
+    var pendingAgentExport by remember { mutableStateOf<JSONObject?>(null) }
+    DisposableEffect(activity, model, state.active.name, state.pdf) {
+        activity.setAgentExportHandler { args ->
+            check(pendingAgentExport == null) { "Finish the current export before starting another" }
+            val safeArgs = JSONObject(args.toString())
+            pendingAgentExport = safeArgs
+            val jobId = args.optString("requestId")
+            val format = args.optString("format", "pdf")
+            check(format in setOf("pdf", "smd", "md")) { "Unsupported export format" }
+            val requestedName = args.optString("filename").takeIf { it.isNotBlank() }
+                ?: args.optString("id").takeIf { it.isNotBlank() } ?: state.active.name.substringBeforeLast('.')
+            activity.updateAgentExportJob(jobId, "preparing")
+            model.busy(true)
+            scope.launch {
+                try {
+                    val pdfOptions = JSONObject(state.pdf)
+                    val provided = safeArgs.optJSONObject("options") ?: JSONObject()
+                    listOf("pageSize", "margin", "fontSize", "lineHeight", "paragraphSpacing", "fontFamily", "pageNumbers", "themed")
+                        .forEach { key -> if (provided.has(key)) pdfOptions.put(key, provided.get(key)) }
+                    val (uri, filename) = model.writeAgentExport(
+                        safeArgs.getString("content"), safeArgs.optJSONObject("assets") ?: JSONObject(),
+                        format, requestedName, pdfOptions.toString(),
+                    )
+                    activity.completeAgentExport(jobId, uri, filename, format)
+                    model.busy(false)
+                } catch (error: Exception) {
+                    activity.updateAgentExportJob(jobId, "failed", error.message ?: "Export failed")
+                    model.fail("Agent export failed: ${error.message}")
+                } finally { pendingAgentExport = null }
+            }
+        }
+        onDispose { activity.setAgentExportHandler(null) }
+    }
+    DisposableEffect(activity, open, save, model) {
+        activity.setAgentUiHandler { request, reply ->
+            if (request.optString("action") != "document_action") false
+            else when (request.optString("documentAction")) {
+                "open" -> if (request.optJSONObject("options")?.optBoolean("background", false) == true) {
+                    reply(null, "Background file picking is unavailable on Android; open the file in Super MD first")
+                    true
+                } else { open.launch(arrayOf("text/*", "application/octet-stream", "application/vnd.supermd.smd", "application/vnd.supermd.fmd", "application/gzip", "application/x-gzip")); reply(JSONObject().put("accepted", true).put("message", "Choose a file in Android's document picker"), null); true }
+                "save" -> false
+                else -> false
+            }
+        }
+        onDispose { activity.setAgentUiHandler(null) }
+    }
     DisposableEffect(portable, state.active.name) { model.requestPortable = { portable.launch(state.active.name.substringBeforeLast('.') + ".smd") }; onDispose { model.requestPortable = null } }
-    val saveAction: () -> Unit = { if (state.active.uri == null) save.launch(state.active.name.substringBeforeLast('.') + ".md") else if (state.active.portable) { model.busy(true); web?.evaluateJavascript("window.supermdPortable?.(true)", null) ?: model.fail("The reader is not ready") } else model.save(); Unit }
+    val saveAction: () -> Unit = { if (model.requestWriteAccessIfBlocked(state.active.id, explicit = true)) Unit else if (state.active.uri == null) save.launch(state.active.name.substringBeforeLast('.') + ".md") else if (state.active.portable) { model.busy(true); web?.evaluateJavascript("window.supermdPortable?.(true)", null) ?: model.fail("The reader is not ready") } else model.save(); Unit }
     LaunchedEffect(state.message) { state.message?.let { snackbar.showSnackbar(it); model.dismissMessage() } }
     val immersive = (state.fullscreen || !readingChromeVisible || state.readerOverlay) && !settings
     LaunchedEffect(immersive, dark) {
@@ -310,11 +1005,11 @@ private object NoMotionScheme : MotionScheme {
         val wide = displayIsLarge && maxWidth >= 720.dp && maxHeight >= 400.dp
         val actualMode = if (!wide && state.mode == "split") "live" else state.mode
         val readerContent=remember {arrayOfNulls<String>(1)}
-        LaunchedEffect(readerReady, state.active, actualMode, dark, state.fullscreen, state.font, state.size, state.widthPercent,state.lineHeight,state.spellCheck,state.grammarCheck,state.restorePosition,state.centerLock,state.imageAppearance,state.svgAppearance,state.imageContrast,state.fullDocumentAccessibility,state.customTheme,state.patternKind,state.patternOpacity,state.patternSize,state.patternSpacing,tokens, hinge, motion) {
+        LaunchedEffect(readerReady, state.active, actualMode, dark, state.fullscreen, state.font, state.size, state.widthPercent,state.lineHeight,state.spellCheck,state.grammarCheck,state.latexAutofix,state.restorePosition,state.centerLock,state.imageAppearance,state.svgAppearance,state.imageContrast,state.fullDocumentAccessibility,state.customTheme,state.patternKind,state.patternOpacity,state.patternSize,state.patternSpacing,tokens, hinge, motion) {
             if (!readerReady) readerNote[0] = null
             if (readerReady) {
                 val note = state.active
-                val payload = JSONObject().put("id", note.id).put("editProtocol", 1).apply { if (readerNote[0] == note.id && (readerContent[0] === note.content || model.readerEcho[note.id] === note.content)) put("contentUnchanged", true) else put("content", note.content) }.put("path", note.uri ?: note.id).put("mode", actualMode).put("dark", dark).put("fullscreen", state.fullscreen).put("font", state.font).put("size", state.size).put("widthPercent",state.widthPercent).put("lineHeight",state.lineHeight).put("spellCheck",state.spellCheck).put("grammarCheck",state.grammarCheck).put("restorePosition",state.restorePosition).put("centerLock",state.centerLock).put("imageAppearance",state.imageAppearance).put("svgAppearance",state.svgAppearance).put("imageContrast",state.imageContrast).put("fullDocumentAccessibility",state.fullDocumentAccessibility).put("colors", tokens).put("zoom", state.zoom).put("motion", motion)
+                val payload = JSONObject().put("id", note.id).put("editProtocol", 1).apply { if (readerNote[0] == note.id && (readerContent[0] === note.content || model.readerEcho[note.id] === note.content)) put("contentUnchanged", true) else put("content", note.content) }.put("path", note.uri ?: note.id).put("mode", actualMode).put("dark", dark).put("fullscreen", state.fullscreen).put("font", state.font).put("size", state.size).put("widthPercent",state.widthPercent).put("lineHeight",state.lineHeight).put("spellCheck",state.spellCheck).put("grammarCheck",state.grammarCheck).put("latexAutofix",state.latexAutofix).put("restorePosition",state.restorePosition).put("centerLock",state.centerLock).put("imageAppearance",state.imageAppearance).put("svgAppearance",state.svgAppearance).put("imageContrast",state.imageContrast).put("fullDocumentAccessibility",state.fullDocumentAccessibility).put("colors", tokens).put("zoom", state.zoom).put("motion", motion)
                 payload.put("readingLocation",model.readingLocation(note.uri))
                 payload.put("customStyle",themeStyle(themeDocument(state.customTheme),if(state.fullscreen)state.fullscreenTheme else state.theme,dark,state.patternKind,state.patternOpacity,state.patternSize,state.patternSpacing))
                 web?.evaluateJavascript("document.documentElement.dataset.platform='android';window.supermdLoad?.($payload)", null)
@@ -356,7 +1051,7 @@ private object NoMotionScheme : MotionScheme {
                 Column(Modifier.fillMaxHeight().themeArtwork(state,"sidebar").safeDrawingPadding().padding(horizontal = 16.dp)) {
                     Text("Your files", style = MaterialTheme.typography.headlineSmall, modifier = Modifier.padding(vertical = 20.dp))
                     SingleChoiceSegmentedButtonRow(Modifier.fillMaxWidth().padding(bottom=12.dp)) {listOf("folder" to "Folder","contents" to "Contents").forEachIndexed {index,entry->SegmentedButton(selected=sidebarSection==entry.first,onClick={sidebarSection=entry.first},shape=SegmentedButtonDefaults.itemShape(index,2),colors=SegmentedButtonDefaults.colors(activeContainerColor=palette.primary,activeContentColor=palette.onPrimary)){Text(entry.second)}}}
-                    Button(onClick = { open.launch(arrayOf("text/*", "application/octet-stream", "application/vnd.supermd.smd", "application/vnd.supermd.fmd")); scope.launch { drawer.close() } }, shapes = ButtonDefaults.shapes(), modifier = Modifier.fillMaxWidth()) { Icon(Icons.Rounded.Description, null); Spacer(Modifier.width(8.dp)); Text("Open note") }
+                    Button(onClick = { open.launch(arrayOf("text/*", "application/octet-stream", "application/vnd.supermd.smd", "application/vnd.supermd.fmd", "application/gzip", "application/x-gzip")); scope.launch { drawer.close() } }, shapes = ButtonDefaults.shapes(), modifier = Modifier.fillMaxWidth()) { Icon(Icons.Rounded.Description, null); Spacer(Modifier.width(8.dp)); Text("Open note") }
                     FilledTonalButton(onClick = { folder.launch(state.folder?.let(android.net.Uri::parse)) }, modifier = Modifier.fillMaxWidth()) { Icon(Icons.Rounded.FolderOpen, null); Spacer(Modifier.width(8.dp)); Text("Open folder") }
                     if (state.folder != null) TextButton(onClick = { folderRelative = ""; model.closeFolder() }) { Icon(Icons.Rounded.Close, null); Text("Close folder", Modifier.padding(start = 8.dp)) }
                     Text("No vault. No hidden metadata.", style = MaterialTheme.typography.bodySmall, color = palette.onSurfaceVariant, modifier = Modifier.padding(vertical = 12.dp))
@@ -388,7 +1083,7 @@ private object NoMotionScheme : MotionScheme {
                         .graphicsLayer {translationY=-size.height*(1f-chromeReveal);alpha=chromeReveal}
                         .then(if(chromeShown) Modifier else Modifier.clearAndSetSemantics {})
                         .background(palette.surfaceContainerLow).themeArtwork(state,"toolbar")) {
-                        TopAppBar(windowInsets=WindowInsets.statusBarsIgnoringVisibility.union(WindowInsets.displayCutout).only(WindowInsetsSides.Top+WindowInsetsSides.Horizontal), colors = TopAppBarDefaults.topAppBarColors(containerColor = Color.Transparent), title = { Column { Text(state.active.name, maxLines = 1, overflow = TextOverflow.Ellipsis, style = MaterialTheme.typography.titleMedium); Text(if (state.active.dirty) "Draft recovered automatically" else if (state.active.uri != null) "Saved" else "Local draft", style = MaterialTheme.typography.labelSmall, color = palette.onSurfaceVariant) } }, navigationIcon = { IconButton(onClick = { if (state.fullscreen) contentsShown=true else { scope.launch { drawer.open() }; state.folder?.let { if (state.files.isEmpty()) model.listFolder(android.net.Uri.parse(it), "") } } }) { Icon(painterResource(if(state.fullscreen) R.drawable.symbol_contents else R.drawable.symbol_sidebar), if(state.fullscreen) "Show contents" else "Open files") } }, actions = {
+                        TopAppBar(windowInsets=WindowInsets.statusBarsIgnoringVisibility.union(WindowInsets.displayCutout).only(WindowInsetsSides.Top+WindowInsetsSides.Horizontal), colors = TopAppBarDefaults.topAppBarColors(containerColor = Color.Transparent), title = { Column { Text(state.active.name, maxLines = 1, overflow = TextOverflow.Ellipsis, style = MaterialTheme.typography.titleMedium); Text(if (model.documentWriteNeedsAccess(state.active.id)) "Local draft · restore file access" else if (state.active.dirty) "Draft recovered automatically" else if (state.active.uri != null) "Saved" else "Local draft", style = MaterialTheme.typography.labelSmall, color = palette.onSurfaceVariant) } }, navigationIcon = { IconButton(onClick = { if (state.fullscreen) contentsShown=true else { scope.launch { drawer.open() }; state.folder?.let { if (state.files.isEmpty()) model.listFolder(android.net.Uri.parse(it), "") } } }) { Icon(painterResource(if(state.fullscreen) R.drawable.symbol_contents else R.drawable.symbol_sidebar), if(state.fullscreen) "Show contents" else "Open files") } }, actions = {
                             IconButton(onClick = saveAction) { Icon(painterResource(R.drawable.symbol_save), "Save note") }
                             IconButton(onClick = { sharing = false; exporting = true }, enabled = readerReady && !state.busy) { Icon(painterResource(R.drawable.symbol_export), "Export") }
                             StudyIcon(if(state.fullscreen) "Exit fullscreen" else "Fullscreen study", if(state.fullscreen) R.drawable.symbol_fullscreen_exit else R.drawable.symbol_fullscreen) { model.fullscreen(!state.fullscreen) }
@@ -398,9 +1093,9 @@ private object NoMotionScheme : MotionScheme {
                                 DropdownMenuItem(text = { Text("Share note") }, enabled = readerReady && !state.busy, onClick = { menu = false; sharing = true; exporting = true }, leadingIcon = { Icon(painterResource(R.drawable.symbol_share), null) })
                                 DropdownMenuItem(text = { Text("Insert image or link") }, onClick = { menu = false; web?.evaluateJavascript("window.supermdMedia?.()", null) }, leadingIcon = { Icon(painterResource(R.drawable.symbol_image), null) })
                                 DropdownMenuItem(text = { Text("Fix LaTeX") }, onClick = { menu = false; web?.evaluateJavascript("window.supermdRepairMath?.()", null) }, leadingIcon = { Icon(painterResource(R.drawable.symbol_bug), null) })
-                                DropdownMenuItem(text = { Text("Find in note") }, onClick = { menu = false; web?.evaluateJavascript("window.supermdFind?.()", null) }, leadingIcon = { Icon(painterResource(R.drawable.symbol_search), null) })
+                                DropdownMenuItem(text = { Text("Find in note") }, onClick = { menu = false; activity.openReaderFind?.invoke() }, leadingIcon = { Icon(painterResource(R.drawable.symbol_search), null) })
                                 DropdownMenuItem(text = {Text("Rename note")},onClick = {menu=false;renaming=true},leadingIcon={Icon(painterResource(R.drawable.symbol_rename),null)})
-                                DropdownMenuItem(text = { Text("Settings") }, onClick = { menu = false; settings = true }, leadingIcon = { Icon(painterResource(R.drawable.symbol_settings), null) })
+                                DropdownMenuItem(text = { Text("Settings") }, onClick = { menu = false; settingsSection = null; settings = true }, leadingIcon = { Icon(painterResource(R.drawable.symbol_settings), null) })
                             } }
                         })
                         if(!state.fullscreen) NoteTabs(state.tabs, state.active.id, motion, model::select, model::close, model::reorder, model::newNote)
@@ -419,7 +1114,7 @@ private object NoMotionScheme : MotionScheme {
                         layoutParams = ViewGroup.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT)
                         clipChildren = true
                         clipToPadding = true
-                        addView(WebView(context).apply {
+                        addView(SelectionReaderWebView(context, model).apply {
                             // Percentage-height HTML needs MATCH_PARENT, not
                             // WRAP_CONTENT. The native container also confines
                             // WebView's accelerated drawing to the reading pane.
@@ -427,11 +1122,12 @@ private object NoMotionScheme : MotionScheme {
                             web = this
                             setOnKeyListener { _, _, event -> activity.handleShortcut(event) }
                             setBackgroundColor(AndroidColor.TRANSPARENT)
-                            configureReader(this, model, scope, ready = { if (web === this) readerReady = true }, rendererGone = { failedView ->
+                            configureReader(this, model, scope, ready = { if (web === this) readerReady = true }, onAgentReply = activity::deliverAgentReply, onAgentExport = activity::requestAgentExport, rendererGone = { failedView ->
                                 val wasCurrent = web === failedView
                                 retireAndDestroyReader(failedView)
                                 if (wasCurrent) {
                                     readerReady = false
+                                    readerPdfOwnsProgress = false
                                     readerNote[0] = null
                                     readerGeneration++
                                     web = null
@@ -520,16 +1216,16 @@ private object NoMotionScheme : MotionScheme {
                         frame.removeAllViews()
                     }) }
                     SnackbarHost(snackbar, Modifier.align(Alignment.BottomCenter).safeDrawingPadding())
-                    if (state.busy || !readerReady) Surface(color = palette.surface.copy(alpha = .96f), modifier = Modifier.fillMaxSize()) { Column(Modifier.fillMaxSize(), verticalArrangement = Arrangement.Center, horizontalAlignment = Alignment.CenterHorizontally) { if(motion) LoadingIndicator() else Icon(Icons.Rounded.Description,null,Modifier.size(48.dp),tint=palette.primary); Spacer(Modifier.height(16.dp)); Text(if(state.busy) "Preparing your document…" else "Opening your workspace…") } }
+                    if (shouldShowNativeBusyOverlay(state.busy, readerReady, readerPdfOwnsProgress)) Surface(color = palette.surface.copy(alpha = .96f), modifier = Modifier.fillMaxSize()) { Column(Modifier.fillMaxSize(), verticalArrangement = Arrangement.Center, horizontalAlignment = Alignment.CenterHorizontally) { if(motion) LoadingIndicator() else Icon(Icons.Rounded.Description,null,Modifier.size(48.dp),tint=palette.primary); Spacer(Modifier.height(16.dp)); Text(if(state.busy) "Preparing your document…" else "Opening your workspace…") } }
                 }
             }
         }
     }
     if (settings) {
-        BackHandler { settings = false }
+        BackHandler { if (settingsSection != null) settingsSection = null else { settings = false; settingsSection = null } }
         Surface(Modifier.fillMaxSize(), color = palette.surface) { Column(Modifier.fillMaxSize().safeDrawingPadding()) {
-            TopAppBar(title = { Text("Settings") }, navigationIcon = { IconButton(onClick = { settings = false }) { Icon(Icons.AutoMirrored.Rounded.ArrowBack, "Back") } })
-            Settings(state, model, activity, noteLocation, {noteFolder.launch(noteLocation.takeIf{it.isNotBlank()}?.let(android.net.Uri::parse))}, {model.recoverDeletedDraft();settings=false}, {themePicker.launch(arrayOf("application/json","text/plain","application/octet-stream"))}, {themeExport.launch("My theme.supermd-theme.json")}) {fontPicker.launch(arrayOf("font/ttf","font/otf","application/x-font-ttf","application/vnd.ms-opentype","application/octet-stream"))}
+            TopAppBar(title = { Text(settingsSection ?: "Settings") }, navigationIcon = { IconButton(onClick = { if (settingsSection != null) settingsSection = null else { settings = false; settingsSection = null } }) { Icon(Icons.AutoMirrored.Rounded.ArrowBack, "Back") } })
+            Settings(state, model, activity, noteLocation, settingsSection, { settingsSection = it }, {noteFolder.launch(noteLocation.takeIf{it.isNotBlank()}?.let(android.net.Uri::parse))}, {model.recoverDeletedDraft();settings=false;settingsSection=null}, {themePicker.launch(arrayOf("application/json","text/plain","application/octet-stream"))}, {themeExport.launch("My theme.supermd-theme.json")}, {settings=false;settingsSection=null;web?.evaluateJavascript("window.supermdThemeGuide?.()",null)}, readerReady) {fontPicker.launch(arrayOf("font/ttf","font/otf","application/x-font-ttf","application/vnd.ms-opentype","application/octet-stream"))}
         } }
     }
     // Long forms must not strand their primary action below a half-open sheet.
@@ -539,12 +1235,33 @@ private object NoMotionScheme : MotionScheme {
     }
     if (exporting) ModalBottomSheet(onDismissRequest = { exporting = false }, sheetState = rememberModalBottomSheetState(skipPartiallyExpanded = true)) { ExportSettings(state.pdf, model::pdf, sharing = sharing, fonts = state.customFonts) { format ->
         exporting = false
-        if (sharing) {
-            if (model.prepareShare(format)) when (format) { "pdf" -> web?.evaluateJavascript("window.supermdExport?.(${state.pdf})", null) ?: model.fail("The reader is not ready"); "smd" -> web?.evaluateJavascript("window.supermdPortable?.(false)", null) ?: model.fail("The reader is not ready"); "md" -> web?.evaluateJavascript("window.supermdExportMarkdown?.()", null) ?: model.fail("The reader is not ready") }
+        if (format in listOf("md", "mdzip")) {
+            val archive = format == "mdzip"
+            if (model.prepareMarkdownExport(sharing, archive)) web?.evaluateJavascript("window.supermdExportMarkdown?.($archive)", null) ?: model.fail("The reader is not ready")
+        } else if (sharing) {
+            if (model.prepareShare(format)) {
+                if (format == "pdf") readerPdfOwnsProgress = true
+                when (format) { "pdf" -> web?.evaluateJavascript("window.supermdExport?.(${state.pdf})", null) ?: model.fail("The reader is not ready"); "smd" -> web?.evaluateJavascript("window.supermdPortable?.(false)", null) ?: model.fail("The reader is not ready"); "md" -> web?.evaluateJavascript("window.supermdExportMarkdown?.()", null) ?: model.fail("The reader is not ready") }
+            }
         } else if (format == "smd") portable.launch(state.active.name.substringBeforeLast('.') + ".smd") else pdf.launch(state.active.name.substringBeforeLast('.') + ".pdf")
     } }
+    if (!accessPickerShowing) accessRequest?.let { request ->
+        AlertDialog(onDismissRequest = model::dismissDocumentAccess,
+            title = { Text(if (request.assetSource == null) "Restore file access" else "Allow linked file access") },
+            text = { Column(verticalArrangement = Arrangement.spacedBy(12.dp)) {
+                Text(request.name, style = MaterialTheme.typography.titleSmall)
+                Text(request.detail ?: if(request.assetSource == null) DOCUMENT_ACCESS_MESSAGE else LINKED_ASSET_ACCESS_MESSAGE)
+                if (request.assetSource == null && request.noteId == state.active.id) TextButton(onClick = {
+                    model.dismissDocumentAccess()
+                    if (state.active.portable) portable.launch(state.active.name.substringBeforeLast('.') + ".smd")
+                    else save.launch(state.active.name.substringBeforeLast('.') + ".md")
+                }) { Text("Save a copy instead") }
+            } },
+            confirmButton = { TextButton(onClick = { accessPickerShowing = true; accessPicker.launch(android.net.Uri.parse(request.uri)) }) { Text(if(request.assetSource == null) "Choose original file" else "Choose linked file") } },
+            dismissButton = { TextButton(onClick = model::dismissDocumentAccess) { Text("Not now") } })
+    }
     state.error?.let { AlertDialog(onDismissRequest = model::dismissError, title = { Text("Couldn't finish") }, text = { Text(it, Modifier.heightIn(max = 360.dp).verticalScroll(rememberScrollState())) }, confirmButton = { TextButton(onClick = model::dismissError) { Text("OK") } }) }
-    if (!state.welcomed) WelcomeSetup(state, model) { model.welcomeDone(); open.launch(arrayOf("text/*", "application/octet-stream", "application/vnd.supermd.smd", "application/vnd.supermd.fmd")) }
+    if (!state.welcomed) WelcomeSetup(state, model) { model.welcomeDone(); open.launch(arrayOf("text/*", "application/octet-stream", "application/vnd.supermd.smd", "application/vnd.supermd.fmd", "application/gzip", "application/x-gzip")) }
 }
 
 @Composable private fun WelcomeSetup(state: StudioState, model: StudioViewModel, open: () -> Unit) {
@@ -582,16 +1299,27 @@ internal class NoteDestination(private val mime: String, private val preferred: 
     }
 }
 
-@Composable private fun Settings(state: StudioState, model: StudioViewModel, activity:MainActivity, noteLocation: String, chooseNoteLocation: ()->Unit, recoverDraft:()->Unit, importTheme:()->Unit, exportTheme:()->Unit, importFont: ()->Unit) {
+@Composable private fun Settings(state: StudioState, model: StudioViewModel, activity:MainActivity, noteLocation: String, section: String?, onSection: (String?)->Unit, chooseNoteLocation: ()->Unit, recoverDraft:()->Unit, importTheme:()->Unit, exportTheme:()->Unit, showThemeGuide:()->Unit, themeGuideReady:Boolean, importFont: ()->Unit) {
     val update by model.updates.state.collectAsStateWithLifecycle()
     val scope=rememberCoroutineScope()
+    var confirmPythonCleanup by remember { mutableStateOf(false) }
+    if (confirmPythonCleanup) AlertDialog(
+        onDismissRequest = { confirmPythonCleanup = false },
+        title = { Text("Clear temporary Python results?") },
+        text = { Text("This deletes app-generated Python plots and execution previews. Saved notes, recovery drafts, exported files and installed Python are not deleted. Re-run a Python cell to regenerate missing previews.") },
+        confirmButton = { TextButton(onClick = { confirmPythonCleanup = false; model.clearPythonStorage() }) { Text("Clear results") } },
+        dismissButton = { TextButton(onClick = { confirmPythonCleanup = false }) { Text("Cancel") } },
+    )
     val downloadPermission=rememberLauncherForActivityResult(ActivityResultContracts.RequestPermission()){granted->
         if(update.ready) { if(granted)scope.launch{model.updates.saveToDownloads()} else model.updates.storagePermissionDenied() }
         else scope.launch{model.updates.download()}
     }
+    if (section == null) {
+        SettingsHome(onOpen = onSection)
+    } else {
     Column(Modifier.fillMaxWidth().verticalScroll(rememberScrollState()), horizontalAlignment = Alignment.CenterHorizontally) {
         Column(Modifier.widthIn(max = 760.dp).fillMaxWidth().padding(16.dp), verticalArrangement = Arrangement.spacedBy(16.dp)) {
-            SettingsSection("Appearance") {
+            if (section == "Appearance") SettingsGroup("Workspace appearance") {
                 Text("System follows your wallpaper colors. Fullscreen can have a different theme.", style = MaterialTheme.typography.bodyMedium, color = MaterialTheme.colorScheme.onSurfaceVariant)
                 Choice("Workspace theme", state.theme, listOf("system" to "System", "light" to "Light", "dark" to "Dark", "black" to "Pure black")) { model.appearance(theme = it) }
                 Choice("Fullscreen theme", state.fullscreenTheme, listOf("system" to "System", "light" to "Light", "dark" to "Dark", "black" to "Pure black")) { model.appearance(fullTheme = it) }
@@ -599,7 +1327,7 @@ internal class NoteDestination(private val mime: String, private val preferred: 
                 else Text("Colors follow your imported theme. Reset it to use the built-in accent picker.",style=MaterialTheme.typography.bodySmall)
                 Row(verticalAlignment = Alignment.CenterVertically) { Column(Modifier.weight(1f)) { Text("Expressive motion", style = MaterialTheme.typography.titleMedium); Text("Spring transitions and responsive controls", style = MaterialTheme.typography.bodySmall) }; Switch(checked = state.motion, onCheckedChange = { model.appearance(motion = it) }) }
             }
-            SettingsSection("Custom theme") {
+            if (section == "Appearance") SettingsGroup("Custom theme") {
                 Text(themeDocument(state.customTheme)?.optString("name")?:"Built-in appearance",style=MaterialTheme.typography.titleMedium)
                 Text("Theme files customize controls, colors, reading typography and background patterns. Reading font and text size remain yours. Invalid edits keep the last valid appearance.",style=MaterialTheme.typography.bodySmall)
                 FlowRow(horizontalArrangement=Arrangement.spacedBy(8.dp)){FilledTonalButton(onClick=importTheme){Text("Import theme…")};OutlinedButton(onClick=exportTheme){Text(if(state.customTheme.isBlank())"Export template…" else "Export theme…")};if(state.customTheme.isNotBlank())OutlinedButton(onClick={model.shareCustomTheme {send->runCatching {activity.startActivity(Intent.createChooser(send,"Share theme"))}.onFailure {model.fail("No app could share the theme: ${it.message}")}}}){Text("Share theme…")}}
@@ -624,15 +1352,12 @@ internal class NoteDestination(private val mime: String, private val preferred: 
                     TextButton(onClick=model::resetThemeBackground){Text("Use theme's background settings")}
                 }
                 Text("Edit the exported JSON with an editor or AI, then import it. Providers that support notifications update automatically; otherwise tap Reload.",style=MaterialTheme.typography.bodySmall)
-                TextButton(onClick={runCatching {activity.startActivity(Intent(Intent.ACTION_VIEW,android.net.Uri.parse("https://github.com/YashMahawa/super-md/blob/main/docs/THEMING.md")))}.onFailure {model.fail("No browser could open the theme guide. See docs/THEMING.md in the project repository.")}}){Text("Theme authoring guide")}
+                TextButton(enabled=themeGuideReady,onClick=showThemeGuide){Text("Theme authoring guide")}
             }
-            SettingsSection("Reading") {
+            if (section == "Reading & media") SettingsGroup("Reading") {
                 Row(verticalAlignment=Alignment.CenterVertically){Text("Continue from last reading position",Modifier.weight(1f));Switch(state.restorePosition,model::restorePosition)}
                 Row(verticalAlignment=Alignment.CenterVertically){Text("Full document accessibility",Modifier.weight(1f));Switch(state.fullDocumentAccessibility,model::fullDocumentAccessibility)}
                 Text("Keeps the complete document in the semantic tree for assistive technology and browser Find. Large notes may use substantially more memory.",style=MaterialTheme.typography.bodySmall,color=MaterialTheme.colorScheme.onSurfaceVariant)
-                OutlinedButton(onClick=recoverDraft) {Text("Recover latest deleted draft")}
-                Choice("On startup",state.startup,listOf("restore" to "Restore previous tabs","new" to "New blank note")){model.readingPreference("startup",it)}
-                Text("Unsaved drafts are recovered in either mode. Welcome is shown only on first use.",style=MaterialTheme.typography.bodySmall)
                 FontChoice("Reading font", if(state.font=="sans") "Manrope" else state.font, listOf("Manrope" to "Manrope", "roboto" to "Roboto", "noto" to "Noto Sans", "serif" to "Noto Serif", "mono" to "JetBrains Mono", "system" to "System")+state.customFonts.map {it to it}) { model.appearance(font = it) }
                 FilledTonalButton(onClick=importFont){Text("Import font…")}
                 Text("Text size · ${state.size.toInt()} px", style = MaterialTheme.typography.titleSmall, modifier = Modifier.padding(top = 16.dp))
@@ -642,11 +1367,8 @@ internal class NoteDestination(private val mime: String, private val preferred: 
                 Text("Vertical spacing · ${"%.2f".format(state.lineHeight)}",style=MaterialTheme.typography.titleSmall)
                 StudySlider(value=state.lineHeight,onCommit={model.reading(lineHeight=it)},valueRange=1.15f..2.2f)
                 Text("Width adapts to this window and fullscreen. Pinch text, images and plots independently.", style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
-                Row(verticalAlignment=Alignment.CenterVertically){Text("Autosave existing notes",Modifier.weight(1f));Switch(checked=state.autosave,onCheckedChange={model.reading(autosave=it)})}
-                Text("New note location",style=MaterialTheme.typography.titleSmall)
-                FilledTonalButton(onClick=chooseNoteLocation,modifier=Modifier.fillMaxWidth()){Icon(Icons.Rounded.FolderOpen,null);Text(if(noteLocation.isBlank())"Downloads" else android.net.Uri.decode(noteLocation.substringAfterLast('/')),Modifier.padding(start=8.dp),maxLines=1,overflow=TextOverflow.Ellipsis)}
             }
-            SettingsSection("Images & diagrams") {
+            if (section == "Reading & media") SettingsGroup("Images & diagrams") {
                 val choices=listOf("original" to "Original (off)","invert-dark" to "Invert in dark themes","auto" to "Auto adapt to theme","monochrome" to "Theme monochrome","contrast" to "Separate from theme")
                 Choice("Image appearance",state.imageAppearance,choices){model.readingPreference("imageAppearance",it)}
                 Choice("Diagram appearance (SVG, Mermaid & charts)",state.svgAppearance,choices){model.readingPreference("svgAppearance",it)}
@@ -654,18 +1376,33 @@ internal class NoteDestination(private val mime: String, private val preferred: 
                 StudySlider(value=state.imageContrast,onCommit=model::imageContrast,valueRange=1f..2f)
                 Text("Auto adapts neutral ink and paper, preserving readable colours. Theme monochrome recolours the whole image. Separation preserves original colours and adds a readable backing and edge. Original files and PDF exports are unchanged.",style=MaterialTheme.typography.bodySmall)
             }
-            SettingsSection("Writing assistance") {
+            if (section == "Files & startup") SettingsGroup("File handling") {
+                OutlinedButton(onClick=recoverDraft) {Text("Recover latest deleted draft")}
+                Choice("On startup",state.startup,listOf("restore" to "Restore previous tabs","new" to "New blank note")){model.readingPreference("startup",it)}
+                Text("Unsaved drafts are recovered in either mode. Welcome is shown only on first use.",style=MaterialTheme.typography.bodySmall)
+                Row(verticalAlignment=Alignment.CenterVertically){Text("Autosave existing notes",Modifier.weight(1f));Switch(checked=state.autosave,onCheckedChange={model.reading(autosave=it)})}
+                Text("New note location",style=MaterialTheme.typography.titleSmall)
+                FilledTonalButton(onClick=chooseNoteLocation,modifier=Modifier.fillMaxWidth()){Icon(Icons.Rounded.FolderOpen,null);Text(if(noteLocation.isBlank())"Downloads" else android.net.Uri.decode(noteLocation.substringAfterLast('/')),Modifier.padding(start=8.dp),maxLines=1,overflow=TextOverflow.Ellipsis)}
+            }
+            if (section == "Writing & shortcuts") SettingsGroup("Writing") {
                 Row(verticalAlignment=Alignment.CenterVertically){Text("Spell check",Modifier.weight(1f));Switch(checked=state.spellCheck,onCheckedChange={model.writing(spellCheck=it)})}
                 Row(verticalAlignment=Alignment.CenterVertically){Text("Grammar check",Modifier.weight(1f));Switch(checked=state.grammarCheck,onCheckedChange={model.writing(grammarCheck=it)})}
+                Row(verticalAlignment=Alignment.CenterVertically){Text("LaTeX autofix on paste",Modifier.weight(1f));Switch(checked=state.latexAutofix,onCheckedChange=model::latexAutofix)}
+                Text("Off by default. Repairs validated LaTeX errors in pasted text in Source and Live. Code, links and existing formula fragments are protected; Undo restores the paste.",style=MaterialTheme.typography.bodySmall,color=MaterialTheme.colorScheme.onSurfaceVariant)
                 Text("Offline English suggestions in Source and Live editing. Grammar checks repeated words and a/an. Code, links and LaTeX are excluded; no text is uploaded or automatically replaced.",style=MaterialTheme.typography.bodySmall,color=MaterialTheme.colorScheme.onSurfaceVariant)
             }
-            SettingsSection("Python & windows") {
+            if (section == "Writing & shortcuts") SettingsGroup("Selected text") {
+                Choice("Selection assistant", state.selectionAssistant, SelectionActions.assistants, model::selectionAssistant)
+                Text("Select text and use Search Google or Ask in the selection toolbar. Ask copies the text and opens the assistant for you to paste and review; it never submits a prompt automatically.",style=MaterialTheme.typography.bodySmall,color=MaterialTheme.colorScheme.onSurfaceVariant)
+            }
+            if (section == "Writing & shortcuts") SettingsGroup("Python & windows") {
                 Text("NumPy and Matplotlib run locally in a separate worker. Code runs only when you press Run; never automatically on open or export.", style = MaterialTheme.typography.bodyMedium)
                 Text("New window opens an independent workspace. Your device controls split-screen and desktop window placement. Hold and drag a tab to reorder it.", style = MaterialTheme.typography.bodyMedium)
                 Text("The monochrome icon follows your launcher's themed-icon setting.", style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
             }
-            SettingsSection("Storage & diagnostics") {
-                Text("Inspect app-owned storage sizes and file counts. This read-only report does not inspect Downloads or other documents, and never changes files.", style = MaterialTheme.typography.bodyMedium)
+            if (section == "Agent connection") SettingsGroup("Live Agent Access") { AgentAccessSettings(activity) }
+            if (section == "Storage") SettingsGroup("Storage diagnostics") {
+                Text("Inspect app-owned storage sizes and file counts. Clean only generated Python previews with confirmation; notes, exports and recovery are protected.", style = MaterialTheme.typography.bodyMedium)
                 FilledTonalButton(onClick = model::inspectStorage, enabled = !state.storageScanning) {
                     Text(if (state.storageScanning) "Inspecting…" else "Inspect storage")
                 }
@@ -676,12 +1413,17 @@ internal class NoteDestination(private val mime: String, private val preferred: 
                     Text("Execution results", style = MaterialTheme.typography.titleSmall, modifier = Modifier.padding(top = 8.dp))
                     StorageUsageLine(report.executionResults)
                     StorageUsageLine(report.legacyExecutionResults)
+                    OutlinedButton(
+                        onClick = { confirmPythonCleanup = true },
+                        enabled = !state.storageScanning && report.executionResults.files + report.legacyExecutionResults.files > 0,
+                    ) { Text("Clear temporary Python results…") }
+
                     Text("Other cache", style = MaterialTheme.typography.titleSmall, modifier = Modifier.padding(top = 8.dp))
                     StorageUsageLine(report.otherCache)
                     if (report.partial) Text("Some entries could not be measured or were skipped; totals may be incomplete. No files were changed.", color = MaterialTheme.colorScheme.onSurfaceVariant, style = MaterialTheme.typography.bodySmall)
                 }
             }
-            SettingsSection("About & updates") {
+            if (section == "Updates & about") SettingsGroup("About & updates") {
                 Text("Super MD ${BuildConfig.VERSION_NAME}",style=MaterialTheme.typography.titleMedium)
                 Text("© Yash Mahawar · MIT License",style=MaterialTheme.typography.bodySmall)
                 Row(verticalAlignment=Alignment.CenterVertically){Text("Check for updates on opening",Modifier.weight(1f));Switch(update.checkOnOpen,{model.updates.preference(checkOnOpen=it)})}
@@ -691,9 +1433,128 @@ internal class NoteDestination(private val mime: String, private val preferred: 
                 FilledTonalButton(onClick={scope.launch{model.updates.check()}},enabled=!update.checking){Text("Check for updates")}
                 if(update.version!=null)Button(onClick={if(update.ready)runCatching{model.updates.install(activity)}.onFailure{model.fail(it.message ?: "Could not open installer")} else if(Build.VERSION.SDK_INT<=28 && activity.checkSelfPermission(android.Manifest.permission.WRITE_EXTERNAL_STORAGE)!=android.content.pm.PackageManager.PERMISSION_GRANTED)downloadPermission.launch(android.Manifest.permission.WRITE_EXTERNAL_STORAGE) else scope.launch{model.updates.download()}},enabled=!update.checking){Text(if(update.ready)"Install update" else "Download update")}
                 if(update.ready && !update.publicCopy)TextButton(onClick={if(Build.VERSION.SDK_INT<=28 && activity.checkSelfPermission(android.Manifest.permission.WRITE_EXTERNAL_STORAGE)!=android.content.pm.PackageManager.PERMISSION_GRANTED)downloadPermission.launch(android.Manifest.permission.WRITE_EXTERNAL_STORAGE) else scope.launch{model.updates.saveToDownloads()}},enabled=!update.checking){Text("Save verified APK to Downloads")}
+                OutlinedButton(onClick = {
+                    runCatching { activity.startActivity(Intent(Intent.ACTION_VIEW, android.net.Uri.parse("https://github.com/YashMahawa/super-md/releases/latest"))) }
+                        .onFailure { model.fail("Could not open GitHub releases: " + it.message) }
+                }) { Text("Open latest release on GitHub") }
                 TextButton(onClick={activity.startActivity(Intent(android.provider.Settings.ACTION_APP_NOTIFICATION_SETTINGS).putExtra(android.provider.Settings.EXTRA_APP_PACKAGE,activity.packageName))}){Text("Update notification permissions")}
             }
         }
+    }
+    }
+}
+
+@Composable private fun AgentAccessSettings(activity: MainActivity) {
+    val scope = rememberCoroutineScope()
+    val saved = activity.agentAccessState.currentConfig()
+    var origin by remember { mutableStateOf(saved?.serverOrigin.orEmpty()) }
+    var message by remember { mutableStateOf("") }
+    var pendingPairingFile by remember { mutableStateOf<String?>(null) }
+    var pendingGuide by remember { mutableStateOf<String?>(null) }
+    var enabled by remember { mutableStateOf(activity.agentAccessState.enabled) }
+    fun revokeThen(action: () -> Unit) {
+        message = "Disconnecting and revoking previous device registrations…"
+        activity.revokeAgentAccess { confirmed ->
+            enabled = false
+            action()
+            if (!confirmed) message = "Local credentials were erased, but the relay could not confirm revocation. A previously copied device key may remain usable until the relay expires or restarts."
+        }
+    }
+    fun joinWorkspace(text: String) {
+        runCatching { activity.agentAccessState.joinPairingFile(text) }
+            .onSuccess { config -> enabled = false; origin = config.serverOrigin; activity.refreshAgentRelay(); message = "This Android device joined the workspace. Switch Live Agent Access on when you want it connected. Keep the pairing file private." }
+            .onFailure { message = "Could not join workspace: ${it.message}" }
+    }
+    val pairingExport = rememberLauncherForActivityResult(ActivityResultContracts.CreateDocument("application/json")) { uri ->
+        val raw = pendingPairingFile
+        pendingPairingFile = null
+        if (uri != null && raw != null) runCatching {
+            activity.contentResolver.openOutputStream(uri, "w")?.use { it.write(raw.toByteArray(Charsets.UTF_8)); it.flush() }
+                ?: error("Android could not write the pairing file")
+        }.onSuccess { message = "Trusted pairing file saved. Share it only with a device you trust." }
+            .onFailure { message = "Could not save pairing file: ${it.message}" }
+    }
+    fun createWorkspace() {
+        runCatching { activity.agentAccessState.createPairingFile(origin) }
+            .onSuccess { pendingPairingFile = it; origin = activity.agentAccessState.currentConfig()?.serverOrigin.orEmpty(); activity.refreshAgentRelay(); pairingExport.launch("SuperMD-pairing.json") }
+            .onFailure { message = "Could not create workspace: ${it.message}" }
+    }
+    val pairingImport = rememberLauncherForActivityResult(ActivityResultContracts.OpenDocument()) { uri ->
+        if (uri != null) scope.launch {
+            val raw = runCatching { withContext(Dispatchers.IO) {
+                activity.contentResolver.openInputStream(uri)?.use { input ->
+                    val bytes = ByteArray(8 * 1024 + 1); val count = input.read(bytes)
+                    require(count in 1..8 * 1024) { "Pairing file is empty or too large" }
+                    String(bytes, 0, count, Charsets.UTF_8)
+                } ?: error("The pairing file cannot be read")
+            } }
+            raw.onSuccess { text ->
+                if (activity.agentAccessState.currentConfig() != null) revokeThen { joinWorkspace(text) }
+                else joinWorkspace(text)
+            }
+                .onFailure { message = "Could not read pairing file: ${it.message}" }
+        }
+    }
+    val guideExport = rememberLauncherForActivityResult(ActivityResultContracts.CreateDocument("text/markdown")) { uri ->
+        val guide = pendingGuide
+        pendingGuide = null
+        if (uri != null && guide != null) runCatching {
+            activity.contentResolver.openOutputStream(uri, "w")?.use { it.write(guide.toByteArray(Charsets.UTF_8)); it.flush() }
+                ?: error("Android could not write the setup guide")
+        }.onFailure { message = "Could not save setup guide: ${it.message}" }
+    }
+    val config = activity.agentConfigForThisWindow() ?: activity.agentAccessState.currentConfig()
+    Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
+        Text("Enter your own Super MD relay server or import a trusted pairing file. Connect an AI client to currently open tabs on this device. Access is off by default; the relay does not store notes.", style = MaterialTheme.typography.bodyMedium)
+        OutlinedTextField(value = origin, onValueChange = { origin = it }, modifier = Modifier.fillMaxWidth(), singleLine = true,
+            label = { Text("HTTPS relay origin") }, placeholder = { Text("https://relay.example.com") })
+        Row(verticalAlignment = Alignment.CenterVertically) {
+            Column(Modifier.weight(1f)) {
+                Text("Live Agent Access", style = MaterialTheme.typography.titleSmall)
+                Text(if (enabled) "${activity.agentRelayState.name.lowercase().replaceFirstChar(Char::uppercase)} · reconnects while this app is open" else "Off · the device will not connect to the relay", style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+            }
+            Switch(checked = enabled, enabled = config != null, onCheckedChange = { checked ->
+                enabled = checked
+                activity.agentAccessState.setEnabled(checked)
+                activity.refreshAgentRelay()
+            })
+        }
+        FlowRow(horizontalArrangement = Arrangement.spacedBy(8.dp), verticalArrangement = Arrangement.spacedBy(6.dp)) {
+            FilledTonalButton(enabled = origin.isNotBlank(), onClick = {
+                if (activity.agentAccessState.currentConfig() != null) revokeThen(::createWorkspace) else createWorkspace()
+            }) { Text("Create workspace & export pairing file") }
+            OutlinedButton(onClick = { pairingImport.launch(arrayOf("application/json", "application/octet-stream", "text/plain")) }) { Text("Join from pairing file…") }
+            OutlinedButton(enabled = config != null, onClick = {
+                val file = activity.agentAccessState.currentPairingFile()
+                if (file == null) message = "Create or join a workspace first"
+                else { pendingPairingFile = file; pairingExport.launch("SuperMD-pairing.json") }
+            }) { Text("Export trusted pairing file…") }
+        }
+        if (config != null) {
+            FlowRow(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                TextButton(onClick = {
+                    val clipboard = activity.getSystemService(android.content.ClipboardManager::class.java)
+                    clipboard.setPrimaryClip(android.content.ClipData.newPlainText("Super MD MCP connector", config.mcpUrl))
+                    message = "Private MCP connector URL copied. Share it only with the intended AI client."
+                }) { Text("Copy private MCP URL") }
+                TextButton(onClick = {
+                    val skill = runCatching { activity.assets.open("web/super-md-agent-SKILL.md").bufferedReader().use { it.readText() } }.getOrNull()
+                    pendingGuide = AgentSetupGuide.instructions(config, skill)
+                    guideExport.launch("SuperMD-Live-Agent-setup.md")
+                }) { Text("Save setup instructions…") }
+            }
+        }
+        Text("The pairing file authorizes trusted devices; it is not for an AI client. Give the AI client only the private MCP URL. Each phone or open app window gets its own device key. Turning Live Agent Access off disconnects this app. Revoke removes this device from the relay and erases this device's credentials.", style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+        if (config != null) TextButton(onClick = {
+            message = "Disconnecting and revoking device registrations…"
+            activity.revokeAgentAccess { confirmed ->
+                enabled = false
+                message = if (confirmed) "Live Agent access revoked on this device and the relay confirmed removal."
+                    else "Local credentials were erased, but the relay could not confirm revocation. A previously copied device key may remain usable until the relay expires or restarts."
+                activity.refreshAgentRelay()
+            }
+        }) { Text("Revoke this device's Live Agent access") }
+        if (message.isNotBlank()) Text(message, style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.primary)
     }
 }
 
@@ -731,10 +1592,44 @@ internal class NoteDestination(private val mime: String, private val preferred: 
     }
 }
 
-@Composable private fun SettingsSection(title: String, content: @Composable ColumnScope.() -> Unit) {
+@Composable private fun SettingsHome(onOpen: (String?)->Unit) {
+    val categories = listOf(
+        "Appearance" to "Themes, colors, motion and custom theme files",
+        "Reading & media" to "Typography, reading layout, images and diagrams",
+        "Files & startup" to "Autosave, startup behavior, note location and recovery",
+        "Writing & shortcuts" to "Spelling, LaTeX, selected text and Python",
+        "Agent connection" to "Pair and manage local agent access",
+        "Storage" to "Inspect app-owned storage",
+        "Updates & about" to "Release updates, notifications and app details"
+    )
+    Column(Modifier.fillMaxWidth().verticalScroll(rememberScrollState()), horizontalAlignment = Alignment.CenterHorizontally) {
+        Column(Modifier.widthIn(max = 760.dp).fillMaxWidth().padding(16.dp), verticalArrangement = Arrangement.spacedBy(10.dp)) {
+            Text("Personalize Super MD", style = MaterialTheme.typography.headlineSmall)
+            Text("Choose a settings section", style = MaterialTheme.typography.bodyMedium, color = MaterialTheme.colorScheme.onSurfaceVariant)
+            Spacer(Modifier.height(4.dp))
+            categories.forEach { (title, description) ->
+                Surface(
+                    shape = RoundedCornerShape(24.dp),
+                    color = MaterialTheme.colorScheme.surfaceContainerLow,
+                    modifier = Modifier.fillMaxWidth().clickable { onOpen(title) }
+                ) {
+                    Row(Modifier.fillMaxWidth().padding(horizontal = 18.dp, vertical = 16.dp), verticalAlignment = Alignment.CenterVertically) {
+                        Column(Modifier.weight(1f)) {
+                            Text(title, style = MaterialTheme.typography.titleMedium)
+                            Text(description, style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                        }
+                        Icon(Icons.AutoMirrored.Rounded.ArrowBack, null, Modifier.size(20.dp).graphicsLayer(rotationZ = 180f), tint = MaterialTheme.colorScheme.onSurfaceVariant)
+                    }
+                }
+            }
+        }
+    }
+}
+
+@Composable private fun SettingsGroup(title: String, content: @Composable ColumnScope.() -> Unit) {
     Surface(shape = RoundedCornerShape(28.dp), color = MaterialTheme.colorScheme.surfaceContainerLow) {
-        Column(Modifier.fillMaxWidth().padding(20.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
-            Text(title, style = MaterialTheme.typography.titleLarge)
+        Column(Modifier.fillMaxWidth().padding(16.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
+            Text(title, style = MaterialTheme.typography.titleLarge, modifier = Modifier.padding(vertical = 4.dp))
             content()
         }
     }
@@ -767,29 +1662,42 @@ internal class NoteDestination(private val mime: String, private val preferred: 
 
 @Composable private fun ExportSettings(raw: String, onChange: (String) -> Unit, sharing: Boolean = false, fonts:List<String> = emptyList(), export: (String) -> Unit) {
     var format by rememberSaveable { mutableStateOf("pdf") }
+    var markdownZip by rememberSaveable { mutableStateOf(false) }
     var options by remember(raw) { mutableStateOf(JSONObject(raw)) }
     fun update(key: String, value: Any) { options = JSONObject(options.toString()).put(key, value); onChange(options.toString()) }
     Box(Modifier.fillMaxWidth(), contentAlignment = Alignment.TopCenter) {
         Column(Modifier.widthIn(max = 640.dp).fillMaxWidth()) {
             Column(Modifier.weight(1f, fill = false).fillMaxWidth().verticalScroll(rememberScrollState()).padding(horizontal = 24.dp)) {
                 Text(if (sharing) "Share your note" else "Export your note", style = MaterialTheme.typography.headlineSmall)
-                val formats = if (sharing) listOf("pdf" to "PDF", "md" to "Markdown", "smd" to "Portable SMD") else listOf("pdf" to "PDF document", "smd" to "Portable SMD")
-                SingleChoiceSegmentedButtonRow(Modifier.fillMaxWidth().padding(vertical = 16.dp)) {
-                    formats.forEachIndexed { index, (key, label) -> SegmentedButton(selected = format == key, onClick = { format = key }, shape = SegmentedButtonDefaults.itemShape(index, formats.size)) { Text(label) } }
+                val formats = listOf("pdf" to "PDF", "md" to "Markdown", "smd" to "Portable SMD", "mdzip" to "ZIP")
+                Column(Modifier.fillMaxWidth().padding(vertical = 12.dp)) {
+                    formats.chunked(2).forEach { row ->
+                        Row(Modifier.fillMaxWidth()) {
+                            row.forEach { (key, label) ->
+                                FilterChip(selected = format == key, onClick = { format = key }, label = { Text(label) }, modifier = Modifier.weight(1f).padding(horizontal = 4.dp))
+                            }
+                        }
+                    }
                 }
                 if (format == "pdf") {
                     Text("Vector equations, plots and real pagination. Typeset locally on this device.", style = MaterialTheme.typography.bodyMedium, modifier = Modifier.padding(bottom = 12.dp))
                     PdfOptions(options, fonts, ::update)
+                } else if (format == "mdzip") {
+                    Text("Obsidian-ready Markdown and images in one ZIP. Sliders become static figures; diagrams and charts become linked SVG images.", style = MaterialTheme.typography.bodyMedium)
                 } else if (format == "md") {
-                    Text("Editable Markdown text. For a single file that also includes images, choose Portable SMD.", style = MaterialTheme.typography.bodyMedium)
+                    Text("SVGs and diagram sources are embedded in the Markdown. Images and GIFs keep readable relative filenames.", style = MaterialTheme.typography.bodyMedium)
+                    Row(Modifier.fillMaxWidth().padding(top = 12.dp), verticalAlignment = Alignment.CenterVertically) {
+                        Column(Modifier.weight(1f)) { Text("Bundle as ZIP", style = MaterialTheme.typography.titleSmall); Text("Keep Markdown and all companion files together.", style = MaterialTheme.typography.bodySmall) }
+                        Switch(checked = markdownZip, onCheckedChange = { markdownZip = it })
+                    }
                 } else {
                     Text("Your Markdown and images in one editable file.", style = MaterialTheme.typography.titleMedium)
                     Text("Reopen it in Super MD to edit, drop in images, or select an image to replace or remove it. Source mode shows Markdown, never image bytes.", style = MaterialTheme.typography.bodyMedium, modifier = Modifier.padding(top = 12.dp))
                 }
             }
-            Button(onClick = { export(format) }, shapes = ButtonDefaults.shapes(), modifier = Modifier.fillMaxWidth().padding(horizontal = 24.dp, vertical = 16.dp)) {
+            Button(onClick = { export(if (format == "md" && markdownZip) "mdzip" else format) }, shapes = ButtonDefaults.shapes(), modifier = Modifier.fillMaxWidth().padding(horizontal = 24.dp, vertical = 16.dp)) {
                 Icon(painterResource(if (sharing) R.drawable.symbol_share else R.drawable.symbol_export), null)
-                Text(if (sharing) "Prepare & share" else "Choose destination & export", Modifier.padding(start = 8.dp))
+                Text(if (sharing) "Prepare & share" else if (format == "md") "Export Markdown" else "Choose destination & export", Modifier.padding(start = 8.dp))
             }
         }
     }

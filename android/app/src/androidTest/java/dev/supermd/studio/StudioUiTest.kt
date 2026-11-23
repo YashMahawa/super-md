@@ -20,6 +20,16 @@ class StudioUiTest {
     @get:Rule val compose = createAndroidComposeRule<MainActivity>()
     private var temporaryNoteState: StudioState? = null
     private var temporaryRestorePosition: Boolean? = null
+    private var temporaryImeSetting: Int? = null
+    private fun setShowImeWithHardware(enabled: Boolean) {
+        if (temporaryImeSetting == null) {
+            temporaryImeSetting = android.provider.Settings.Secure.getInt(compose.activity.contentResolver, "show_ime_with_hard_keyboard", 0)
+        }
+        shellOutput("settings put secure show_ime_with_hard_keyboard ${if (enabled) 1 else 0}")
+        compose.waitUntil(3_000) {
+            android.provider.Settings.Secure.getInt(compose.activity.contentResolver, "show_ime_with_hard_keyboard", 0) == if (enabled) 1 else 0
+        }
+    }
     @After fun restoreTemporaryNoteAndRecovery() {
         try {
             val before = temporaryNoteState ?: return
@@ -47,6 +57,15 @@ class StudioUiTest {
                 }.getOrDefault(false)
             }
         } finally {
+            temporaryImeSetting?.let { previous ->
+                runCatching { shellOutput("settings put secure show_ime_with_hard_keyboard $previous") }
+                temporaryImeSetting = null
+            }
+            runCatching {
+                val reader = web(compose.activity.window.decorView)
+                if (reader != null) (compose.activity.getSystemService(android.content.Context.INPUT_METHOD_SERVICE) as android.view.inputmethod.InputMethodManager)
+                    .hideSoftInputFromWindow(reader.windowToken, 0)
+            }
             temporaryRestorePosition?.let { previous ->
                 val model = androidx.lifecycle.ViewModelProvider(compose.activity)[StudioViewModel::class.java]
                 compose.runOnIdle { model.restorePosition(previous) }
@@ -56,6 +75,12 @@ class StudioUiTest {
         }
     }
     private fun web(view: View): WebView? = if (view is WebView) view else if (view is ViewGroup) (0 until view.childCount).firstNotNullOfOrNull { web(view.getChildAt(it)) } else null
+    private fun imeVisible(): Boolean {
+        val decor = compose.activity.window.decorView
+        val platformInsets = decor.rootWindowInsets ?: return false
+        return androidx.core.view.WindowInsetsCompat.toWindowInsetsCompat(platformInsets)
+            .isVisible(androidx.core.view.WindowInsetsCompat.Type.ime())
+    }
     /** Resolve touch input to this resumed activity, never an instrumentation helper root. */
     private fun activityRoot(): SemanticsNodeInteraction {
         compose.waitForIdle()
@@ -86,11 +111,12 @@ class StudioUiTest {
             useUnmergedTree = true,
         )
     }
-    private fun javascriptUntil(script: String, accepted: (String) -> Boolean): String {
+    private fun javascriptUntil(script: String, accepted: (String) -> Boolean): String = javascriptUntil(script, 60_000, accepted)
+    private fun javascriptUntil(script: String, timeoutMs: Long, accepted: (String) -> Boolean): String {
         val result = AtomicReference("")
         val inFlight=java.util.concurrent.atomic.AtomicBoolean(false)
         try {
-            compose.waitUntil(60_000) {
+            compose.waitUntil(timeoutMs) {
                 // Mutating checks (dismiss, click, navigate) must never enqueue a
                 // second evaluation before observing the first successful reply.
                 if(accepted(result.get()))return@waitUntil true
@@ -104,6 +130,19 @@ class StudioUiTest {
         }
         return result.get()
     }
+    private fun javascriptSnapshot(script: String): String {
+        val result = AtomicReference<String?>(null)
+        compose.activity.runOnUiThread {
+            web(compose.activity.window.decorView)?.evaluateJavascript(script) { result.set(it) }
+        }
+        compose.waitUntil(3_000) { result.get() != null }
+        return (org.json.JSONTokener(result.get()).nextValue() as? String)
+            ?: error("Expected JavaScript string result, got ${result.get()}")
+    }
+    private fun shellOutput(command: String): String {
+        val descriptor = androidx.test.platform.app.InstrumentationRegistry.getInstrumentation().uiAutomation.executeShellCommand(command)
+        return android.os.ParcelFileDescriptor.AutoCloseInputStream(descriptor).use { String(it.readBytes()) }
+    }
     private fun welcome() {
         repeat(2) { if (compose.onAllNodesWithText("Continue").fetchSemanticsNodes().isNotEmpty()) compose.onNodeWithText("Continue").performClick() }
         compose.onAllNodesWithText("Explore the sample").fetchSemanticsNodes().firstOrNull()?.let { compose.onNodeWithText("Explore the sample").performClick() }
@@ -115,6 +154,85 @@ class StudioUiTest {
         // setup must await that bridge handshake rather than race first render.
         compose.waitUntil(15_000) {
             compose.onAllNodes(hasContentDescription("Export") and isEnabled()).fetchSemanticsNodes().isNotEmpty()
+        }
+    }
+    @Test fun settingsUseDistinctCategoryPagesAndBackReturnsToSectionHome() {
+        welcome()
+        val model=androidx.lifecycle.ViewModelProvider(compose.activity)[StudioViewModel::class.java]
+        val originalTheme=model.state.value.theme
+        val originalStartup=model.state.value.startup
+        try {
+            compose.onNodeWithContentDescription("More actions").performClick()
+            compose.onNodeWithText("Settings").performClick()
+            compose.onNodeWithText("Appearance").performClick()
+            compose.onNodeWithText("Workspace theme").assertExists()
+            compose.onAllNodesWithText("On startup").assertCountEquals(0)
+            compose.onAllNodesWithText("Dark").onFirst().performClick()
+            compose.runOnIdle { assertEquals("dark",model.state.value.theme) }
+            compose.onNodeWithContentDescription("Back").performClick()
+            compose.onNodeWithText("Settings").assertExists()
+            compose.onAllNodesWithText("Workspace theme").assertCountEquals(0)
+            compose.onNodeWithText("Files & startup").performClick()
+            compose.onNodeWithText("On startup").assertExists()
+            compose.onAllNodesWithText("Workspace theme").assertCountEquals(0)
+            compose.onNodeWithText("New blank note").performClick()
+            compose.runOnIdle { assertEquals("new",model.state.value.startup) }
+            compose.onNodeWithContentDescription("Back").performClick()
+            compose.onNodeWithText("Appearance").assertExists()
+            compose.onAllNodesWithText("On startup").assertCountEquals(0)
+            compose.onNodeWithContentDescription("Back").performClick()
+        } finally {
+            compose.runOnIdle { model.appearance(theme=originalTheme);model.readingPreference("startup",originalStartup) }
+        }
+    }
+    @Test fun themeGuideOpensOfflineCopiesAndPasteAutofixIsOptIn() {
+        welcome()
+        val model=androidx.lifecycle.ViewModelProvider(compose.activity)[StudioViewModel::class.java]
+        temporaryNoteState=model.state.value
+        val original=model.state.value.active.content
+        val oldAutofix=model.state.value.latexAutofix
+        val prefs=compose.activity.getSharedPreferences("studio",0)
+        val clipboard = compose.activity.getSystemService(android.content.ClipboardManager::class.java)
+        try {
+            assertFalse(StudioState().latexAutofix)
+            clipboard.setPrimaryClip(android.content.ClipData.newPlainText("Super MD test", "theme-guide-copy-not-run"))
+            // mode() is asynchronous: it waits for a WebView reader barrier.
+            // Editing in the same idle callback can race that transition on
+            // slower Android 16 emulators and leave the editor with stale text.
+            compose.runOnIdle { model.latexAutofix(false); model.mode("editor") }
+            compose.waitUntil(15_000) { model.state.value.mode == "editor" }
+            javascriptUntil("!!document.querySelector('.cm-content')", { it == "true" })
+            compose.runOnIdle { model.edit(model.state.value.active.id, "Start here.") }
+            javascriptUntil("document.querySelector('.cm-content')?.textContent==='Start here.'",{it=="true"})
+            compose.onNodeWithContentDescription("More actions").performClick()
+            compose.onNodeWithText("Settings").performClick()
+            compose.onNodeWithText("Appearance").performClick()
+            compose.onNodeWithText("Theme authoring guide").performScrollTo().performClick()
+            javascriptUntil("!!document.querySelector('.theme-guide-dialog .markdown-body h1')",{it=="true"})
+            javascriptUntil("(()=>{const b=[...document.querySelectorAll('.theme-guide-dialog button')].find(b=>b.textContent==='Copy guide');return !!b&&!b.disabled})()",{it=="true"})
+            javascriptUntil("(()=>{const b=[...document.querySelectorAll('.theme-guide-dialog button')].find(b=>b.textContent==='Copy guide');if(!b||b.disabled)return false;b.click();return true})()",{it=="true"})
+            compose.waitUntil(5_000) {
+                runCatching {
+                    val text=clipboard.primaryClip?.getItemAt(0)?.text?.toString().orEmpty()
+                    text.startsWith("# Custom themes") && text.contains("pythonSourceMaxHeight")
+                }.getOrDefault(false)
+            }
+            val copied=AtomicReference("")
+            compose.runOnIdle {copied.set(clipboard.primaryClip?.getItemAt(0)?.text?.toString()?:"")}
+            assertTrue(copied.get().startsWith("# Custom themes"));assertTrue(copied.get().contains("pythonSourceMaxHeight"))
+            assertEquals("Start here.",model.state.value.active.content)
+            javascriptUntil("window.supermdDismiss()",{it=="true"})
+            javascriptUntil("!document.querySelector('.theme-guide-dialog')",{it=="true"})
+            compose.runOnIdle {model.latexAutofix(true);model.edit(model.state.value.active.id,"")}
+            assertTrue(prefs.getBoolean("latexAutofix",false))
+            javascriptUntil("document.querySelector('.cm-content')?.textContent===''",{it=="true"})
+            // Exercise the native payload and real CodeMirror paste handler,
+            // then verify the edit travelled back through the Android bridge.
+            javascriptUntil("(()=>{const c=document.querySelector('.cm-content');if(!c)return false;c.focus();return true})()",{it=="true"})
+            javascriptUntil("(()=>{const c=document.querySelector('.cm-content');const d=new DataTransfer();d.setData('text/plain',String.raw`\\[\\frac{a}{b}\\]`);c.dispatchEvent(new ClipboardEvent('paste',{bubbles:true,cancelable:true,clipboardData:d}));return true})()",{it=="true"})
+            compose.waitUntil(10_000){model.state.value.active.content=="$$\n\\frac{a}{b}\n$$"}
+        } finally {
+            compose.runOnIdle {model.latexAutofix(oldAutofix);model.edit(model.state.value.active.id,original)}
         }
     }
     @Test fun externalOpenActivatesNewAndAlreadyOpenFileTabs() {
@@ -431,10 +549,9 @@ class StudioUiTest {
             val colors=manualAccent("blue",true)
             val primary="#"+Integer.toHexString(colors.primary.toArgb()).substring(2)
             javascriptUntil("getComputedStyle(document.documentElement).getPropertyValue('--primary').trim()") {it.trim('"')==primary}
-            // The selected tab can push the add-tab item beyond the LazyRow
-            // viewport; scroll the real control into view before sampling its
-            // pixels instead of capturing an empty clipped rectangle.
-            compose.onNodeWithContentDescription("New tab").performScrollTo()
+            // The add-tab control is pinned outside the scrolling tab list and
+            // remains visible even when many tabs are open.
+            compose.onNodeWithContentDescription("New tab").assertExists()
             compose.waitUntil(5_000) {
                 val bounds = compose.onNodeWithContentDescription("New tab").fetchSemanticsNode().boundsInRoot
                 bounds.width > 0f && bounds.height > 0f
@@ -490,6 +607,95 @@ class StudioUiTest {
         javascriptUntil("document.querySelector('.reading-search output')?.textContent") {it=="\"0 / 1\""}
         javascriptUntil("(()=>{const b=document.querySelector('button[aria-label=\"Next match\"]');if(b&&!b.disabled)b.click();return document.querySelector('.reading-search output')?.textContent;})()") {it=="\"1 / 1\""}
         javascriptUntil("window.supermdDismiss?.()") {it=="true"}
+    }
+    @Test fun findFromMoreActionsAcceptsImmediateNativeTextInput() {
+        welcome()
+        setShowImeWithHardware(false)
+        val instrumentation=androidx.test.platform.app.InstrumentationRegistry.getInstrumentation()
+        val reader = requireNotNull(web(compose.activity.window.decorView))
+        // Control: compare Android's native key injection on a plain input in
+        // this same WebView/activity before exercising the React search field.
+        javascriptUntil("(()=>{const i=document.createElement('input');i.id='native-key-probe';i.type='text';i.style.cssText='position:fixed;top:2px;left:2px;z-index:999999';document.body.append(i);i.focus();return document.activeElement===i})()") { it == "true" }
+        shellOutput("input text focusneedle")
+        instrumentation.waitForIdleSync()
+        javascriptUntil("document.querySelector('#native-key-probe')?.value") { it != "null" && it != "\"\"" }
+        val plainInputTrace = javascriptSnapshot("(()=>{const i=document.querySelector('#native-key-probe');return JSON.stringify({value:i?.value??null,active:document.activeElement===i,selection:[i?.selectionStart,i?.selectionEnd]})})()")
+        android.util.Log.i("StudioUiTest", "Plain WebView input keyboard control: $plainInputTrace")
+        (compose.activity.getSystemService(android.content.Context.INPUT_METHOD_SERVICE) as android.view.inputmethod.InputMethodManager)
+            .hideSoftInputFromWindow(reader.windowToken, 0)
+        compose.waitUntil(2_000) { !imeVisible() }
+        javascriptUntil("(()=>{document.querySelector('#native-key-probe')?.remove();return !document.querySelector('#native-key-probe')})()") { it == "true" }
+        val model=androidx.lifecycle.ViewModelProvider(compose.activity)[StudioViewModel::class.java]
+        temporaryNoteState=model.state.value
+        val content="# Immediate Find Focus\n\nHardware typing should land here without tapping the search field. FocusNeedle appears in this paragraph.\n"
+        compose.runOnIdle {model.edit(model.state.value.active.id,content);model.mode("reader")}
+        javascriptUntil("document.querySelector('.android-reading')?.textContent.includes('FocusNeedle')") {it=="true"}
+        compose.onNodeWithContentDescription("More actions").performClick()
+        compose.onNodeWithText("Find in note").performClick()
+        javascriptUntil("(()=>{const input=document.querySelector('.reading-search input');return !!input&&document.activeElement===input})()") {it=="true"}
+        compose.waitUntil(3_000) { web(compose.activity.window.decorView)?.hasFocus() == true }
+        val nativeInputState = AtomicReference<org.json.JSONObject>()
+        androidx.test.platform.app.InstrumentationRegistry.getInstrumentation().runOnMainSync {
+            val imm = compose.activity.getSystemService(android.content.Context.INPUT_METHOD_SERVICE) as android.view.inputmethod.InputMethodManager
+            nativeInputState.set(org.json.JSONObject().put("webViewHasFocus", reader.hasFocus())
+                .put("windowHasFocus", reader.hasWindowFocus()).put("isTextEditor", reader.onCheckIsTextEditor())
+                .put("inputMethodActive", imm.isActive(reader)).put("imeVisible", imeVisible()))
+        }
+        javascriptUntil("(()=>{const i=document.querySelector('.reading-search input');if(!i)return false;window.__searchKeyTrace=[];for(const name of ['keydown','beforeinput','input'])i.addEventListener(name,e=>window.__searchKeyTrace.push({type:e.type,key:e.key??null,keyCode:e.keyCode??null,data:e.data??null,inputType:e.inputType??null,ctrl:e.ctrlKey??false,meta:e.metaKey??false,shift:e.shiftKey??false,start:i.selectionStart,end:i.selectionEnd,value:i.value}),true);return true})()") { it == "true" }
+        try {
+            // Android 15 emulator shell `input text` can deliver a whole string
+            // out of order (observed "ofcusneedle"), despite a focused WebView.
+            // Inject actual native key events in sequence, awaiting each DOM
+            // update; this still tests Android -> WebView -> React input.
+            val expectedQuery = "focusneedle"
+            for (index in expectedQuery.indices) {
+                val char = expectedQuery[index]
+                val key = android.view.KeyEvent.keyCodeFromString("KEYCODE_${char.uppercaseChar()}")
+                assertTrue("Missing Android key code for $char", key != android.view.KeyEvent.KEYCODE_UNKNOWN)
+                instrumentation.sendKeyDownUpSync(key)
+                val prefix = expectedQuery.substring(0, index + 1)
+                javascriptUntil("document.querySelector('.reading-search input')?.value", 3_000) {
+                    it == org.json.JSONObject.quote(prefix)
+                }
+            }
+            try {
+                javascriptUntil("document.querySelector('.reading-search input')?.value", 2_000) { it == "\"focusneedle\"" }
+            } catch (failure: AssertionError) {
+                val droppedState = javascriptSnapshot("(()=>{const i=document.querySelector('.reading-search input');return JSON.stringify({value:i?.value??null,active:document.activeElement===i,documentFocused:document.hasFocus(),selection:[i?.selectionStart,i?.selectionEnd],events:window.__searchKeyTrace??[],search:!!document.querySelector('.reading-search'),reader:!!document.querySelector('.android-reading'),modal:!!document.querySelector('[role=dialog]'),exportProgress:!!document.querySelector('.reader-export-progress')})})()")
+                val afterDrop = AtomicReference<org.json.JSONObject>()
+                instrumentation.runOnMainSync {
+                    val imm = compose.activity.getSystemService(android.content.Context.INPUT_METHOD_SERVICE) as android.view.inputmethod.InputMethodManager
+                    afterDrop.set(org.json.JSONObject().put("webViewHasFocus", reader.hasFocus()).put("windowHasFocus", reader.hasWindowFocus())
+                        .put("isTextEditor", reader.onCheckIsTextEditor()).put("inputMethodActive", imm.isActive(reader)).put("imeVisible", imeVisible()))
+                }
+                throw AssertionError("Native input text was dropped; state=${afterDrop.get()}; DOM=$droppedState; plain=$plainInputTrace", failure)
+            }
+        } finally {
+            listOf(android.view.KeyEvent.KEYCODE_SHIFT_LEFT, android.view.KeyEvent.KEYCODE_SHIFT_RIGHT,
+                android.view.KeyEvent.KEYCODE_CTRL_LEFT, android.view.KeyEvent.KEYCODE_CTRL_RIGHT,
+                android.view.KeyEvent.KEYCODE_ALT_LEFT, android.view.KeyEvent.KEYCODE_ALT_RIGHT,
+                android.view.KeyEvent.KEYCODE_META_LEFT, android.view.KeyEvent.KEYCODE_META_RIGHT).forEach { keyCode ->
+                instrumentation.sendKeySync(android.view.KeyEvent(android.view.KeyEvent.ACTION_UP, keyCode))
+            }
+        }
+        android.os.SystemClock.sleep(250)
+        val searchTrace = javascriptSnapshot("(()=>{const i=document.querySelector('.reading-search input');return JSON.stringify({value:i?.value??null,active:document.activeElement===i,selection:[i?.selectionStart,i?.selectionEnd],events:window.__searchKeyTrace??[]})})()")
+        android.util.Log.i("StudioUiTest", "React search keyboard trace: $searchTrace")
+        val query = org.json.JSONObject(searchTrace).optString("value")
+        assertEquals("React search must accept native hardware text without a field tap; state=${nativeInputState.get()}; trace=$searchTrace; plain=$plainInputTrace", "focusneedle", query)
+        javascriptUntil("(()=>{const input=document.querySelector('.reading-search input');return !!input&&document.activeElement===input&&input.selectionStart===input.selectionEnd&&input.selectionEnd===input.value.length})()") {it=="true"}
+    }
+    @Test fun findFromMoreActionsShowsImeWhenTouchInputIsRequested() {
+        welcome()
+        setShowImeWithHardware(true)
+        val model=androidx.lifecycle.ViewModelProvider(compose.activity)[StudioViewModel::class.java]
+        temporaryNoteState=model.state.value
+        compose.runOnIdle { model.mode("reader") }
+        compose.onNodeWithContentDescription("More actions").performClick()
+        compose.onNodeWithText("Find in note").performClick()
+        javascriptUntil("(()=>{const input=document.querySelector('.reading-search input');return !!input&&document.activeElement===input})()") {it=="true"}
+        compose.waitUntil(3_000) { web(compose.activity.window.decorView)?.hasFocus() == true }
+        compose.waitUntil(5_000) { imeVisible() }
     }
     @Test fun nativeSelectionAndHeadingLinksUseMagnifiedPageCoordinates() {
         welcome()
@@ -548,6 +754,37 @@ class StudioUiTest {
         }
         println("SELECTION AFTER POINTER: "+javascriptUntil("JSON.stringify({events:window.__selectionInput,selection:window.getSelection()?.toString(),range:(()=>{const p=[...document.querySelectorAll('.markdown-body p')].find(p=>p.textContent.includes('Alpha Bravo Charlie Delta'));const r=document.createRange();r.setStart(p.firstChild,6);r.setEnd(p.firstChild,11);const b=r.getBoundingClientRect();return {x:b.left+b.width/2,y:b.top+b.height/2,viewport:[innerWidth,innerHeight]}})()})") {it.contains("selection")})
         javascriptUntil("window.getSelection()?.toString()"){it=="\"Bravo\""}
+        // Inspect the real OS toolbar, including its overflow, without invoking
+        // an external search or submitting any synthetic text to a provider.
+        val automation=instrument.uiAutomation
+        val originalFlags=automation.serviceInfo.flags
+        automation.serviceInfo=automation.serviceInfo.apply {flags=flags or android.accessibilityservice.AccessibilityServiceInfo.FLAG_RETRIEVE_INTERACTIVE_WINDOWS}
+        try {
+            fun toolbarNodes():List<android.view.accessibility.AccessibilityNodeInfo> {
+                val result=mutableListOf<android.view.accessibility.AccessibilityNodeInfo>()
+                fun visit(node:android.view.accessibility.AccessibilityNodeInfo?) {
+                    if(node==null)return
+                    result.add(node)
+                    for(index in 0 until node.childCount)visit(node.getChild(index))
+                }
+                automation.windows.forEach {visit(it.root)}
+                return result
+            }
+            val ask="Ask ${SelectionActions.label(model.state.value.selectionAssistant)}…"
+            val seen=mutableSetOf<String>()
+            fun record(nodes:List<android.view.accessibility.AccessibilityNodeInfo>){seen.addAll(nodes.filter {it.isVisibleToUser}.mapNotNull {it.text?.toString()?.takeIf(String::isNotBlank)})}
+            fun complete()=seen.contains("Search Google")&&seen.contains(ask)
+            var nodes=toolbarNodes();record(nodes)
+            val deadline=android.os.SystemClock.uptimeMillis()+6_000
+            while(!complete()&&nodes.none {it.contentDescription?.toString()=="More options"}&&android.os.SystemClock.uptimeMillis()<deadline){android.os.SystemClock.sleep(50);nodes=toolbarNodes();record(nodes)}
+            // Expanding overflow can hide main-row actions, so retain the
+            // visible labels from both presentations instead of requiring all
+            // actions to occupy the same row on every device/OS version.
+            if(!complete())nodes.firstOrNull {it.contentDescription?.toString()=="More options"}?.performAction(android.view.accessibility.AccessibilityNodeInfo.ACTION_CLICK)
+            while(!complete()&&android.os.SystemClock.uptimeMillis()<deadline){android.os.SystemClock.sleep(50);nodes=toolbarNodes();record(nodes)}
+            assertTrue("Native selection toolbar is missing Search Google: ${seen.take(12)}",seen.contains("Search Google"))
+            assertTrue("Native selection toolbar is missing $ask: ${seen.take(12)}",seen.contains(ask))
+        } finally {automation.serviceInfo=automation.serviceInfo.apply {flags=originalFlags}}
         val headingNavigationProbe="""(()=>{const host=document.querySelector('.android-reading'),style=getComputedStyle(document.documentElement);if(!host)return false;if(!window.__headingNavigationFrames){window.getSelection()?.removeAllRanges();document.querySelector('a[href="#chapter-550"]')?.click();window.__headingNavigationFrames=0;const tick=()=>{window.__headingNavigationFrames++;if(window.__headingNavigationFrames<8)requestAnimationFrame(tick);};requestAnimationFrame(tick);return false;}if(window.__headingNavigationFrames<8)return false;const h=document.querySelector('h2#chapter-550');if(!h)return false;const r=h.getBoundingClientRect();return {headingTop:r.top,hostTop:host.getBoundingClientRect().top,scrollTop:host.scrollTop,maxScroll:host.scrollHeight-host.clientHeight,chromeInset:parseFloat(style.getPropertyValue('--native-chrome-inset'))||0,visibleInset:parseFloat(style.getPropertyValue('--native-visible-chrome-inset'))||0,viewportHeight:innerHeight};})()"""
         val headingLayout=org.json.JSONObject(javascriptUntil(headingNavigationProbe) {it.contains("headingTop")})
         val headingScreenY=nativeWebTop.get()+headingLayout.getDouble("headingTop")*nativeScale.get()
@@ -815,7 +1052,7 @@ ax.set_title("Matplotlib 3D figure")
             for(format in formats) {
                 compose.runOnIdle { assertTrue("Could not prepare $format share",model.prepareShare(format)) }
                 when(format) {
-                    "md" -> kotlinx.coroutines.runBlocking { model.shareMarkdown(content) }
+                    "md" -> kotlinx.coroutines.runBlocking { model.shareMarkdown(model.state.value.active.id, content, org.json.JSONObject(), false) }
                     "smd" -> kotlinx.coroutines.runBlocking { model.writePortable(id,content,org.json.JSONObject(),save=false,originalContent=content) }
                     "pdf" -> kotlinx.coroutines.runBlocking { model.export(content,model.state.value.pdf,org.json.JSONObject()) }
                 }
@@ -828,7 +1065,12 @@ ax.set_title("Matplotlib 3D figure")
                 val bytes=compose.activity.contentResolver.openInputStream(uri)!!.use { it.readBytes() }
                 when(format) {
                     "md" -> assertEquals(content,String(bytes,Charsets.UTF_8))
-                    "smd" -> assertTrue(String(bytes,Charsets.UTF_8).startsWith("{\"format\":\"supermd-smd\""))
+                    "smd" -> {
+                        assertTrue("Portable SMD must use the gzip wire header", bytes.size >= 2 &&
+                            bytes[0] == 0x1f.toByte() && bytes[1] == 0x8b.toByte())
+                        assertEquals(content, MediaStorage(compose.activity).portableMarkdown(
+                            java.io.ByteArrayInputStream(bytes)))
+                    }
                     "pdf" -> assertTrue(bytes.copyOfRange(0,5).contentEquals("%PDF-".toByteArray(Charsets.US_ASCII)))
                 }
             }
@@ -937,9 +1179,11 @@ ax.set_title("Matplotlib 3D figure")
         javascriptUntil("document.querySelector('.android-reading')?.textContent || document.querySelector('.live-document')?.textContent") { it.contains("Recoverable draft") }
         compose.waitUntil(10_000) { model.state.value.active.name == "Recoverable draft.md" }
         val recoverableId = model.state.value.active.id
-        compose.onNodeWithContentDescription("Close Recoverable draft.md").performClick()
         // Close commits the recoverable snapshot/index asynchronously after
         // the reader flush barrier. Do not race the reopen shortcut against it.
+        val closeBounds = compose.onNodeWithContentDescription("Close Recoverable draft.md").fetchSemanticsNode().boundsInRoot
+        assertTrue("The selected tab's close control must be visible before closing it: $closeBounds", closeBounds.width > 0f && closeBounds.height > 0f)
+        compose.onNodeWithContentDescription("Close Recoverable draft.md").performClick()
         compose.waitUntil(15_000) {
             model.state.value.tabs.none { it.id == recoverableId } &&
                 model.state.value.closedTabs.any { it.id == recoverableId }

@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import os
 import stat
+import shutil
 from pathlib import Path
 
 
@@ -17,11 +18,11 @@ MAX_ENTRIES = 20_000
 # they can contain private filenames, even though all roots are app-owned.
 CATEGORIES = (
     ("recovery", "Recovery", "preserved", ("closed-notes", "reader-conflicts"), ("recovery.json",)),
-    ("execution-results", "Python execution results", "preserved", ("derived-python",), ()),
+    ("execution-results", "Python execution results", "clearable", ("derived-python",), ()),
     ("python-runtime", "Managed Python runtime", "managed", ("python-env",), ()),
     ("fonts-themes", "Fonts and themes", "preserved", ("fonts",), ("theme.json", "theme-source.json")),
     ("workspace", "Workspace settings", "preserved", (), ("settings.json", "startup.json", "reading-positions.json")),
-    ("update-state", "Update verification state", "preserved", ("updates",), ()),
+    ("update-state", "Update verification state", "clearable", ("updates",), ()),
 )
 
 
@@ -158,3 +159,49 @@ def inspect_storage(root: str | os.PathLike[str], cancel_event=None, *,
         "scannedEntries": scanned,
         "categories": categories,
     }
+
+
+# Only these fixed, app-owned subtrees may be cleaned. Never accept paths from
+# a caller or perform a recursive scan of arbitrary user content.
+CLEANABLE = {
+    "execution-results": "derived-python",
+    "update-state": "updates",
+}
+
+
+def clear_storage_category(root: str | os.PathLike[str], category: str) -> dict:
+    """Remove a named disposable app-data subtree without following symlinks.
+
+    Notes, exports, recovery snapshots, fonts, settings and managed Python
+    runtimes do not appear in CLEANABLE. Only call after user confirmation.
+    """
+    if category not in CLEANABLE:
+        raise ValueError("This storage category is protected")
+    base = Path(root)
+    try:
+        root_stat = base.lstat()
+    except FileNotFoundError:
+        return {"category": category, "cleared": True}
+    if not stat.S_ISDIR(root_stat.st_mode) or stat.S_ISLNK(root_stat.st_mode) or getattr(base, "is_junction", lambda: False)():
+        raise ValueError("App storage root is not an ordinary directory")
+    target = base / CLEANABLE[category]
+    try:
+        entry = target.lstat()
+    except FileNotFoundError:
+        return {"category": category, "cleared": True}
+    if not stat.S_ISDIR(entry.st_mode) or stat.S_ISLNK(entry.st_mode) or getattr(target, "is_junction", lambda: False)():
+        raise ValueError("Refusing to clear a linked or non-directory target")
+    # POSIX implementations use descriptor-based removal. On Windows Python
+    # does not expose that capability, but Python 3.8+ rmtree does not follow
+    # directory junctions. Reject existing nested links/reparse points before
+    # deleting, and never accept caller-controlled directory names.
+    if not shutil.rmtree.avoids_symlink_attacks:
+        if os.name != "nt":
+            raise RuntimeError("Secure directory cleanup is unavailable on this platform")
+        for directory, folders, files in os.walk(target, followlinks=False):
+            for name in folders + files:
+                child = Path(directory) / name
+                if child.is_symlink() or getattr(child, "is_junction", lambda: False)():
+                    raise ValueError("Refusing to clear app data containing directory links")
+    shutil.rmtree(target)
+    return {"category": category, "cleared": True}

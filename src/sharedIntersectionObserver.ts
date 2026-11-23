@@ -2,6 +2,8 @@ type SharedRecord = {
   observer: IntersectionObserver;
   callbacks: Map<Element, (entry: IntersectionObserverEntry) => void>;
 };
+export type IntersectionCommit = (root:Element|Document|null, update:()=>void)=>void;
+const commits=new WeakMap<IntersectionCommit,number>();let nextCommit=0;
 
 // Share observers across windowed blocks and retire an observer when its last
 // target disconnects.
@@ -15,8 +17,10 @@ export function observeSharedIntersection(
   target: Element,
   callback: (entry: IntersectionObserverEntry) => void,
   options: IntersectionObserverInit = {},
+  commit?: IntersectionCommit,
 ): () => void {
-  const key = optionsKey(options);
+  if(commit&&!commits.has(commit))commits.set(commit,++nextCommit);
+  const key = optionsKey(options)+':'+(commit?commits.get(commit):0);
   const root = options.root ?? null;
   let roots = observers.get(key);
   if (!roots) observers.set(key, roots = new Map());
@@ -25,7 +29,8 @@ export function observeSharedIntersection(
   if (!record) {
     const callbacks = new Map<Element, (entry: IntersectionObserverEntry) => void>();
     const observer = new IntersectionObserver(entries => {
-      for (const entry of entries) callbacks.get(entry.target)?.(entry);
+      const update=()=>{for (const entry of entries) callbacks.get(entry.target)?.(entry);};
+      if(commit)commit(root,update);else update();
     }, options);
     record = { observer, callbacks };
     roots.set(root, record);

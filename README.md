@@ -19,7 +19,7 @@
 
 Super MD brings expressive native controls, focused reading, and interactive study tools to ordinary Markdown. Open a file or folder and get started—no vault, import process, account, or proprietary note database.
 
-Write in `.md`. Carry a note and its images together in `.smd`. Export a properly typeset PDF when it is time to share.
+Write in `.md`. Carry a note and its images together in a losslessly compressed `.smd`. Export a properly typeset PDF when it is time to share.
 
 ## See it in action
 
@@ -139,6 +139,27 @@ smd-engine export lesson.smd lesson.pdf
 
 See the [authoring guide](docs/AUTHORING.md) for supported syntax, runnable examples, portable-file limits, and GUI versus headless export capabilities.
 
+### Work with an agent in the same note
+
+Connect a local or remote MCP client to open tabs, including unsaved edits, on
+Android and desktop. Choose a connected device, read the current visible
+Markdown and diagram source, inspect a viewport snapshot, search a section, or
+apply a targeted edit with a revision check. Large SVG bodies and image bytes
+stay out of ordinary text responses.
+
+The desktop CLI creates and edits MD/SMD files, replaces individual assets, and
+exports documents without a custom Python script. Live access also offers the
+app's PDF controls and LaTeX repair. Settings provides connection and pairing
+instructions; see the [CLI and MCP guide](docs/AGENT-INTERFACE.md).
+Downloadable setup instructions also include an [agent skill](docs/skills/super-md/SKILL.md)
+with recipes for viewport screenshots, exact Markdown, original SVGs, diagram
+images and safe edits. Agents can attach new images to portable notes, while
+the live CLI can extract originals or save individual diagram images.
+
+Access is off by default. Local connections stay on loopback; cloud devices
+connect outward to an authenticated relay. Pairing files and connector URLs
+are private credentials. The relay keeps no document database.
+
 ### Built around local work
 
 Notes stay local. Folder access uses operating-system permissions, remote-image loading requires consent, and update checks can be disabled. Viewport-aware document rendering, bounded caches, and background workers are designed to keep large notes responsive without making a second note database. See [large-note performance](docs/LARGE-NOTE-PERFORMANCE.md) for implementation details and limits.
@@ -207,6 +228,8 @@ Get **[Super MD 0.6.6](https://github.com/YashMahawa/super-md/releases/tag/v0.6.
 
 Release checksums are included. macOS packages are ad-hoc signed, not notarized; Windows installers are not code-signed. Android installation requires the normal system approval. For Linux graphics or AppImage mounting issues, read [graphics diagnostics](docs/GRAPHICS-DIAGNOSTICS.md).
 
+On Fedora, including niri sessions, Super MD puts the window controls in its toolbar. Drag the empty space in the toolbar to move the window.
+
 Settings includes the installed version, update checks, and optional automatic downloads. Updates are verified before becoming installable; installation remains your choice. See [update behavior](docs/UPDATES.md).
 
 ## Build and contribute
@@ -235,20 +258,19 @@ desktop/.venv/bin/python desktop/main.py
 <summary>Useful desktop shortcuts</summary>
 
 Use Ctrl on Linux/Windows and Command on macOS where supported.
+View and change desktop bindings in Settings → Keyboard shortcuts.
 
 | Shortcut | Action |
 |---|---|
-| Ctrl/Command+N | New tab |
+| Ctrl/Command+T | New tab |
 | Ctrl/Command+W | Close tab |
 | Ctrl/Command+Shift+T | Reopen closed tab |
 | Ctrl/Command+Tab | Next tab |
-| Ctrl/Command+O / S / Shift+S | Open / Save / Save as |
-| Ctrl/Command+Shift+O | Open folder |
-| Ctrl/Command+B | Toggle sidebar |
+| Ctrl/Command+O / S | Open / Save |
 | Ctrl/Command+F | Find; Source also supports replace |
-| Ctrl/Command+Z / Y | Undo / Redo |
+| Ctrl/Command+Z / Y (Shift+Z on macOS) | Undo / Redo |
 | Ctrl/Command++ / − / 0 | Content zoom / reset |
-| Ctrl/Command+Shift+N | New window |
+| Ctrl/Command+N or Shift+N | New window |
 | F11 / Escape | Enter / leave fullscreen |
 
 </details>
@@ -256,3 +278,59 @@ Use Ctrl on Linux/Windows and Command on macOS where supported.
 ## License
 
 Super MD's original code is available under the [MIT License](LICENSE). Bundled libraries, fonts, and icons retain their own licenses and notices. See [desktop distribution notices](desktop/NOTICE.md) and [third-party UI licenses](public/third-party-ui-licenses.txt).
+
+## AI agents: CLI, MCP and authoring skill
+
+The desktop installation includes the CLI and MCP server; a separate Python install is unnecessary. Linux uses `super-md` (or `./Super-MD_VERSION_amd64.AppImage`), Windows uses `super-md-cli.exe` in the installation directory, and macOS uses `/Applications/Super MD.app/Contents/MacOS/super-md`.
+
+Install or update the Linux x86-64 executable in `~/.local/bin` with checksum verification and a backup of the previous binary:
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/YashMahawa/super-md/main/scripts/install-cli.py | python3
+```
+
+Ensure `~/.local/bin` is on PATH. The installer supports `--dry-run` and `--prefix` when downloaded and run as a script. For Windows and macOS, use the [published platform installer](https://github.com/YashMahawa/super-md/releases/latest); the CLI and MCP runtime are included.
+
+Install the complete bundled study-note skill:
+
+```sh
+super-md agent install-skill
+```
+
+The default destination is `~/.codex/skills/super-md` (or `$CODEX_HOME/skills/super-md`). Use `--destination PATH` for another agent's skill directory. `--replace` backs up an existing skill and preserves its local preferences. The package includes its reference guides and SVG example.
+
+Create and inspect notes without opening the application:
+
+```sh
+mkdir -p ./course
+super-md agent --root ./course create notes.smd --content-file ./course/draft.md
+super-md agent --root ./course preview notes.smd preview.png --width 1200 --height 900
+```
+
+`preview` uses the real offline Super MD reader, supports `--heading "Section title"` and `--dark`, and creates a new PNG. It never changes the note, executes Python, or fetches remote images.
+
+Start the background service and use the same tools as MCP:
+
+```sh
+super-md agent service start
+super-md agent service status
+super-md agent --root ./course call document_read --arguments-json '{"path":"notes.smd","limit":3000}'
+super-md agent --root ./course call document_view --arguments-json '{"path":"notes.smd","width":1200}' --output ./course/preview.png
+super-md agent service stop
+```
+
+`call TOOL` invokes the identical named MCP tool with its JSON arguments. Add `--live-sessions-dir PRIVATE_DIR` before `call` for live/background tabs. Image results go to `--output`, not base64 in the terminal. Existing bounded read/search/patch/assets/export and `agent live` commands remain available. Background mode retains live work after windows close; its tray menu offers Open, Recent notes and Quit. Quit waits for note flushes. On systems without a tray, use `service stop`.
+
+For Codex, register the bundled stdio server (use an absolute executable path if it is not on PATH):
+
+```sh
+codex mcp add super-md -- super-md agent mcp --root /absolute/path/to/course --transport stdio
+```
+
+For clients using JSON MCP configuration, use the installed executable and explicit note roots:
+
+```json
+{"mcpServers":{"super-md":{"command":"super-md","args":["agent","mcp","--root","/absolute/path/to/course","--transport","stdio"]}}}
+```
+
+For live/background sessions, `service start` reports the private sessions directory. Add `"--live-sessions-dir", "/returned/private/directory"` to the argument list. The local service is not a public network endpoint. See [the full agent interface](docs/AGENT-INTERFACE.md) and [skill installation guide](docs/skills/INSTALL.md).

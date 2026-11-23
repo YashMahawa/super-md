@@ -25,6 +25,8 @@ internal class ReaderBridge(
     private val scope: CoroutineScope,
     private val ready: () -> Unit,
     private val assetCapabilities: ReaderAssetCapabilities,
+    private val onAgentReply: (String, Any?, String?) -> Unit = { _, _, _ -> },
+    private val onAgentExport: (JSONObject) -> Unit = {},
 ) {
     private val retired = AtomicBoolean(false)
     private val capabilityLock = Any()
@@ -86,11 +88,34 @@ internal class ReaderBridge(
                     "reading_position" -> {model.readingPosition(args.getString("id"),args.getJSONObject("location"));true}
                     "zoom_changed" -> { model.readerZoom(args.getDouble("zoom").toFloat(), args.optBoolean("fullscreen", model.state.value.fullscreen)); true }
                     "reader_overlay_changed" -> { model.overlay(args.optBoolean("open"), args.optBoolean("image")); true }
+                    "copy_image_native" -> {
+                        val uri = withContext(Dispatchers.IO) {
+                            val body = args.opt("body") as? String ?: error("Clipboard image is invalid")
+                            require(args.optString("mimeType") == "image/png" && body.length <= 34_000_000) { "Clipboard image must be a PNG under 25 MB" }
+                            val bytes = android.util.Base64.decode(body, android.util.Base64.DEFAULT)
+                            require(bytes.size in 24..25_000_000 && bytes.take(8).toByteArray().contentEquals(byteArrayOf(-119,80,78,71,13,10,26,10))) { "Clipboard image is not a valid PNG" }
+                            val bounds = android.graphics.BitmapFactory.Options().apply { inJustDecodeBounds = true }
+                            android.graphics.BitmapFactory.decodeByteArray(bytes, 0, bytes.size, bounds)
+                            require(bounds.outWidth in 1..4096 && bounds.outHeight in 1..4096 && bounds.outWidth.toLong()*bounds.outHeight <= 16_000_000L) { "Clipboard image dimensions exceed the limit" }
+                            val folder = java.io.File(web.context.cacheDir, "share/clipboard-${UUID.randomUUID()}").apply { mkdirs() }
+                            val file = java.io.File(folder, "Diagram.png").apply { writeBytes(bytes) }
+                            androidx.core.content.FileProvider.getUriForFile(web.context, "${web.context.packageName}.share", file)
+                        }
+                        web.context.getSystemService(android.content.ClipboardManager::class.java).setPrimaryClip(android.content.ClipData.newUri(web.context.contentResolver, "Super MD diagram", uri))
+                        true
+                    }
+                    "copy_text" -> {
+                        val text=args.opt("text") as? String ?: error("Clipboard text is invalid")
+                        require(text.length<=2_000_000) {"Clipboard text is too large"}
+                        web.context.getSystemService(android.content.ClipboardManager::class.java).setPrimaryClip(android.content.ClipData.newPlainText("Super MD",text))
+                        true
+                    }
                     "document_outline" -> { model.outline(args.getString("id"), args.getJSONArray("headings")); true }
                     "load_font" -> withContext(Dispatchers.IO) {model.fonts.reader(args.getString("family"))}
                     "cache_python_output" -> cachePythonOutput(args)
                     "load_python_output" -> loadPythonOutput(args)
                     "load_asset" -> model.asset(args.getString("documentPath"), args.getString("source"))
+                    "load_text_asset" -> model.textAsset(args.getString("documentPath"), args.getString("source"))
                     "resolve_reader_asset" -> withContext(Dispatchers.IO) {
                         val source = args.getString("source")
                         val (noteId, asset) = model.resolveReaderAsset(args.getString("documentPath"), source)
@@ -105,16 +130,19 @@ internal class ReaderBridge(
                             .put("mime", capability.mime)
                     }
                     "import_images" -> withContext(Dispatchers.IO) { model.media.importJson(args.getJSONArray("images")) }
+                    "save_media_native" -> model.saveAgentMedia(args)
+                    "agent_export_native" -> { onAgentExport(args); JSONObject().put("accepted", true).put("jobId", args.optString("requestId")) }
                     "fetch_resource" -> withContext(Dispatchers.IO) { JSONObject().put("body", model.media.fetch(args.getString("url"), args.optBoolean("image"))) }
                     "request_fmd_export" -> { model.requestPortable?.invoke() ?: error("The file picker is not ready"); true }
                     "export_fmd_native" -> { model.writePortable(args.getString("id"), args.getString("content"), args.getJSONObject("assets"), args.optBoolean("save"), args.getString("originalContent")); true }
                     "run_python" -> runPython(args)
                     "export_pdf_native" -> exportPdf(args)
                     "cancel_export" -> cancelPdfExport(args)
-                    "export_markdown_native" -> { model.shareMarkdown(args.getString("content")); true }
+                    "export_markdown_native" -> { model.shareMarkdown(args.getString("id"), args.getString("content"), args.optJSONObject("assets") ?: JSONObject(), args.optBoolean("archive")); true }
                     "export_failed" -> {
                         val message = args.getString("error")
-                        if (isPdfExportCancellationMessage(message)) model.pdfExportCancelled() else model.fail(message)
+                        if (isPdfExportCancellationMessage(message)) model.pdfExportCancelled()
+                        else if (message !in listOf(DOCUMENT_ACCESS_MESSAGE, "Error: $DOCUMENT_ACCESS_MESSAGE", LINKED_ASSET_ACCESS_MESSAGE, "Error: $LINKED_ASSET_ACCESS_MESSAGE")) model.fail(message)
                         true
                     }
                     else -> error("Unknown document command")
@@ -122,11 +150,30 @@ internal class ReaderBridge(
                 val encoded = when(output) { null -> "null"; is JSONObject -> output.toString(); is String -> JSONObject.quote(output); else -> output.toString() }
                 web.post { if (!retired.get()) web.evaluateJavascript("window.supermdReply?.(${JSONObject.quote(id)},$encoded,null)", null) }
             } catch (error: Exception) {
+                val portableSave = command == "export_fmd_native" && runCatching { JSONObject(raw).optBoolean("save") }.getOrDefault(false)
+                val permissionFailure = portableSave && isDocumentAccessFailure(error)
+                val linkedFailure = command in listOf("load_asset", "load_text_asset", "resolve_reader_asset") && isDocumentAccessFailure(error) && run {
+                    val args = JSONObject(raw)
+                    model.reportLinkedAssetFailure(args.getString("documentPath"), args.getString("source"), error)
+                }
+                val message = if (linkedFailure) LINKED_ASSET_ACCESS_MESSAGE
+                    else if (permissionFailure) model.reportDocumentSaveFailure(JSONObject(raw).getString("id"), error, "Could not save portable note")
+                    else error.message ?: "Operation failed"
                 if (!retired.get() && error is PdfExportCancelledException) model.pdfExportCancelled()
-                else if (!retired.get() && command in listOf("export_pdf_native", "export_fmd_native", "export_markdown_native")) model.fail("Export failed: ${error.message}")
-                web.post { if (!retired.get()) web.evaluateJavascript("window.supermdReply?.(${JSONObject.quote(id)},null,${JSONObject.quote(error.message ?: "Operation failed")})", null) }
+                else if (!retired.get() && !permissionFailure && command in listOf("export_pdf_native", "export_fmd_native", "export_markdown_native")) model.fail("Export failed: $message")
+                web.post { if (!retired.get()) web.evaluateJavascript("window.supermdReply?.(${JSONObject.quote(id)},null,${JSONObject.quote(message)})", null) }
             }
         } }
+    }
+
+    /** A JS-only, request-ID-scoped callback for the outbound cloud relay. */
+    @JavascriptInterface fun agentReply(requestId: String, resultJson: String, error: String) {
+        if (retired.get() || requestId.length !in 1..96 || resultJson.length > 5_000_000 || error.length > 2048) return
+        val result = runCatching {
+            val value = org.json.JSONTokener(resultJson).nextValue()
+            if (value === JSONObject.NULL) null else value
+        }.getOrElse { null }
+        web.post { if (!retired.get()) onAgentReply(requestId, result, error.takeIf(String::isNotEmpty)) }
     }
 
     private suspend fun exportPdf(args: JSONObject): Boolean {
@@ -384,7 +431,7 @@ internal fun retireAndDestroyReader(web: WebView) {
     }
 }
 
-fun configureReader(web: WebView, model: StudioViewModel, scope: CoroutineScope, ready: () -> Unit, rendererGone: (WebView) -> Unit) {
+fun configureReader(web: WebView, model: StudioViewModel, scope: CoroutineScope, ready: () -> Unit, rendererGone: (WebView) -> Unit, onAgentReply: (String, Any?, String?) -> Unit = { _, _, _ -> }, onAgentExport: (JSONObject) -> Unit = {}) {
     web.settings.javaScriptEnabled = true
     web.settings.domStorageEnabled = true
     web.settings.allowFileAccess = false
@@ -404,7 +451,7 @@ fun configureReader(web: WebView, model: StudioViewModel, scope: CoroutineScope,
         .addPathHandler("/assets/", WebViewAssetLoader.AssetsPathHandler(web.context))
         .addPathHandler("/reader-assets/", assetPathHandler)
         .build()
-    val bridge = ReaderBridge(web, model, scope, ready, capabilities)
+    val bridge = ReaderBridge(web, model, scope, ready, capabilities, onAgentReply, onAgentExport)
     web.webViewClient = object : WebViewClient() {
         override fun onRenderProcessGone(view: WebView, detail: android.webkit.RenderProcessGoneDetail): Boolean {
             // Android says a WebView whose renderer exited cannot be reused.

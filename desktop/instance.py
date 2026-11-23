@@ -8,6 +8,7 @@ from PySide6.QtNetwork import QLocalServer, QLocalSocket
 
 class InstanceBroker(QObject):
     requested = Signal(str)
+    serviceRequested = Signal(str)
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -53,6 +54,10 @@ class InstanceBroker(QObject):
                     return
                 try:
                     request = json.loads(buffer.split(b"\n", 1)[0])
+                    if set(request)=={"service"} and request["service"] in ("start","status","quit"):
+                        socket.write(b"ok\n");socket.flush()
+                        self.serviceRequested.emit(request["service"])
+                        socket.disconnectFromServer();return
                     note = request["note"]
                     if set(request) != {"note"} or not isinstance(note, str) or "\0" in note:
                         raise ValueError("Invalid file-opening request")

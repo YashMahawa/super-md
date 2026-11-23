@@ -33,6 +33,18 @@ async function rerender(host: HTMLElement, markdown: string) {
 }
 
 describe("MarkdownPreview streamed local assets", () => {
+  it("refreshes replaced asset pixels without clearing the current image or editing Markdown", async () => {
+    const before=`https://appassets.androidplatform.net/reader-assets/${"1".repeat(32)}?v=${"a".repeat(64)}`;
+    const after=`https://appassets.androidplatform.net/reader-assets/${"2".repeat(32)}?v=${"b".repeat(64)}`;
+    invoke.mockResolvedValueOnce({url:before,mime:"image/png"});
+    const host=await render("![Raster](assets/a.png)");const image=host.querySelector("img");
+    let finish!:(value:unknown)=>void;invoke.mockImplementationOnce(()=>new Promise(resolve=>{finish=resolve;}));
+    await act(async()=>window.dispatchEvent(new Event("supermd-assets-changed")));
+    expect(image?.getAttribute("src")).toBe(before);
+    await act(async()=>finish({url:after,mime:"image/png"}));
+    expect(host.querySelector("img")).toBe(image);expect(image?.getAttribute("src")).toBe(after);
+    expect(invoke.mock.calls.every(([command])=>command==="resolve_reader_asset")).toBe(true);
+  });
   it("renders the scoped native raster URL without materializing base64", async () => {
     const url = `https://appassets.androidplatform.net/reader-assets/${"1".repeat(32)}?v=${"a".repeat(64)}`;
     invoke.mockResolvedValueOnce({ url, mime: "image/png" });
@@ -58,6 +70,28 @@ describe("MarkdownPreview streamed local assets", () => {
     const host = await render("![Raster](images/a.png)");
     expect(invoke).toHaveBeenNthCalledWith(2, "load_asset", { documentPath: "/notes/a.md", source: "images/a.png" });
     expect(host.querySelector("img")?.getAttribute("src")).toMatch(/^data:image\/png;base64,/);
+  });
+
+  it("retries only the matching failed asset after its folder access is restored", async () => {
+    const loads:string[]=[];
+    invoke.mockImplementation(async (command: string,args:any) => {
+      if(command==="resolve_reader_asset")throw new Error("Asset access is required");
+      if(command==="load_asset"){
+        loads.push(args.source);
+        if(args.source==="images/photo.png"&&loads.filter(source=>source===args.source).length===1)throw new Error("Choose the note folder permission");
+        return "data:image/png;base64,iVBORw0KGgo=";
+      }
+      return undefined;
+    });
+    const host=await render("![Photo](images/photo.png)\n\n![Other](images/other.png)");
+    expect(host.querySelector(".image-error")?.textContent).toContain("Choose the note folder permission");
+    expect(loads).toEqual(["images/photo.png","images/other.png"]);
+    await act(async()=>window.dispatchEvent(new CustomEvent("supermd-asset-access-restored",{detail:{documentPath:"/notes/a.md",source:"images/other.png"}})));
+    expect(loads).toEqual(["images/photo.png","images/other.png"]);
+    await act(async()=>window.dispatchEvent(new CustomEvent("supermd-asset-access-restored",{detail:{documentPath:"/notes/a.md",source:"images/photo.png"}})));
+    expect(loads).toEqual(["images/photo.png","images/other.png","images/photo.png"]);
+    expect(host.querySelector(".image-error")).toBeNull();
+    expect(host.querySelector("img")?.getAttribute("src")).toBe("data:image/png;base64,iVBORw0KGgo=");
   });
 
   it("does not carry one-time remote consent to a changed image source", async () => {

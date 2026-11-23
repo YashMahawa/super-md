@@ -1,6 +1,16 @@
 #set heading(numbering: none)
 #set text(fill: rgb("#202020"))
 #show heading: set text(weight: "bold")
+// Print hierarchy and whitespace stay distinct even in compact export presets.
+#show heading.where(level: 1): set text(size: 1.6em)
+#show heading.where(level: 2): set text(size: 1.35em)
+#show heading.where(level: 3): set text(size: 1.15em)
+#show heading: set block(above: 1.6em, below: .85em)
+#show table: set block(above: 1em, below: 1em)
+#set list(spacing: .42em, indent: 1.25em, body-indent: .38em)
+#set enum(spacing: .42em, indent: 1.25em, body-indent: .38em)
+// Allow long cell labels to wrap when generated fractional columns are narrow.
+#show table.cell: set text(hyphenate: true)
 #show raw: set text(font: "DejaVu Sans Mono", size: .86em)
 #show link: set text(fill: smd-link)
 #show table.cell.where(y: 0): set text(weight: "bold")
@@ -17,4 +27,10 @@
   let bounds = measure(pic)
   let width = calc.min(size.width, 170mm * (bounds.width / bounds.height))
   image(path, width: width)
+})
+// Compact export-only sequence cells: no card chrome or fixed empty stage.
+#let smd-step-image(path) = layout(size => {
+  let bounds = measure(image(path))
+  let width = calc.min(size.width, 90mm * (bounds.width / bounds.height))
+  align(center, image(path, width: width))
 })

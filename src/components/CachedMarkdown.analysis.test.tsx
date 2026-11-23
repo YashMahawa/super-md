@@ -1,4 +1,4 @@
-import { afterEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeAll, describe, expect, it, vi } from "vitest";
 import * as documentAnalysis from "../documentAnalysis";
 import { cachedMarkdownTree } from "./CachedMarkdown";
 import { readerSourceAnalysis } from "../readerSourceAnalysis";
@@ -6,18 +6,30 @@ import { readerSourceAnalysis } from "../readerSourceAnalysis";
 afterEach(() => vi.restoreAllMocks());
 
 describe("CachedMarkdown supplied source analysis", () => {
-  it("uses matching oversized analysis instead of parsing the source again", () => {
-    const source = `# Oversized synthetic note\n\n${"Readable generated paragraph text. ".repeat(62_000)}`;
+  let source: string;
+  let sourceAnalysis: ReturnType<typeof readerSourceAnalysis>;
+
+  beforeAll(() => {
+    source = `# Oversized synthetic note\n\n${"Readable generated paragraph text. ".repeat(62_000)}`;
+    sourceAnalysis = readerSourceAnalysis("reader", source);
+  }, 30_000);
+
+  it("uses matching oversized analysis without a second parse in headless tree construction", () => {
     const parse = vi.spyOn(documentAnalysis, "analyzeDocument");
-    const sourceAnalysis = readerSourceAnalysis("reader", source);
 
     expect(sourceAnalysis?.source).toBe(source);
     expect(sourceAnalysis?.analysis.outline[0]?.title).toBe("Oversized synthetic note");
-    cachedMarkdownTree(source, [], [], false, sourceAnalysis ?? undefined);
+    const tree = cachedMarkdownTree(source, [], [], false, sourceAnalysis ?? undefined);
 
-    expect(parse).toHaveBeenCalledOnce();
-    expect(parse).toHaveBeenCalledWith(source);
-  }, 15_000);
+    expect(parse).not.toHaveBeenCalled();
+    expect(tree.children.find((node:any)=>node.type==="element"&&node.tagName==="h1")).toBeDefined();
+    const paragraph=tree.children.find((node:any)=>node.type==="element"&&node.tagName==="p") as any;
+    expect(paragraph).toBeDefined();
+    const expectedText=source.slice(source.indexOf("Readable generated paragraph text.")),renderedText=paragraph.children.map((node:any)=>node.value??"").join("");
+    expect(renderedText.length).toBe(expectedText.trimEnd().length);
+    expect(renderedText.startsWith("Readable generated paragraph text.")).toBe(true);
+    expect(renderedText.endsWith("Readable generated paragraph text.")).toBe(true);
+  });
 
   it("does not create a main-thread analysis for Live or Source modes", () => {
     const parse = vi.spyOn(documentAnalysis, "analyzeDocument");

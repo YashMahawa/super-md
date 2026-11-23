@@ -52,5 +52,6 @@ class ExportFilenameTest {
         assertTrue(ExportFilename.hasExpectedHeader("%PDF-1.7".toByteArray(), NativeExportFormat.PDF))
         assertFalse(ExportFilename.hasExpectedHeader("{\"format\":\"supermd-fmd\"}".toByteArray(), NativeExportFormat.PORTABLE_SMD))
         assertTrue(ExportFilename.hasExpectedHeader("{\"format\":\"supermd-smd\",\"version\":1}".toByteArray(), NativeExportFormat.PORTABLE_SMD))
+        assertTrue(ExportFilename.hasExpectedHeader(byteArrayOf(0x1f.toByte(), 0x8b.toByte()), NativeExportFormat.PORTABLE_SMD))
     }
 }

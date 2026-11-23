@@ -41,6 +41,7 @@ class ChoiceFieldTest(unittest.TestCase):
 import QtQuick
 import QtQuick.Controls
 ApplicationWindow {
+    id: host
     width: 520; height: 480; visible: true
     property real fieldY: 220
     property real viewportHeight: 320
@@ -54,9 +55,9 @@ ApplicationWindow {
     function openMenu() { choice.revealChoices() }
     function closeMenu() { choice.popup.close() }
     Rectangle {
-        id: viewport; x: 40; y: 60; width: 440; height: viewportHeight
+        id: viewport; x: 40; y: 60; width: host.width - 80; height: viewportHeight
         ChoiceField {
-            id: choice; x: 12; y: fieldY; width: 416; viewportItem: viewport
+            id: choice; x: 12; y: fieldY; width: viewport.width - 24; viewportItem: viewport
             model: Array.from({length: 20}, (_, i) => "Font " + i)
             currentIndex: selected
         }
@@ -120,6 +121,21 @@ ApplicationWindow {
         self.assertTrue(menu["visible"])
         self.assertGreaterEqual(menu["y"], 66)
         self.assertLessEqual(menu["y"] + menu["height"], 264)
+
+    def test_wide_field_menu_stays_compact_and_inside_the_window(self):
+        for width, height in ((1366, 768), (1920, 1080), (2560, 1440)):
+            self.window.setProperty("width", width)
+            self.window.setProperty("height", height)
+            self.window.setProperty("viewportHeight", height - 120)
+            QTest.qWait(30)
+            QMetaObject.invokeMethod(self.window, "openMenu")
+            QTest.qWait(50)
+            menu = json.loads(self.window.property("geometry"))
+            self.assertTrue(menu["visible"])
+            self.assertEqual(menu["width"], 440)
+            self.assertGreaterEqual(menu["x"], 16)
+            self.assertLessEqual(menu["x"] + menu["width"], width - 16)
+            QMetaObject.invokeMethod(self.window, "closeMenu")
 
     def test_clicking_outside_dismisses_overlay_menu(self):
         self.open_menu()

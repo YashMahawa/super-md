@@ -49,7 +49,10 @@ ApplicationWindow {
         menu=entry.findChild(QObject,"recentContextMenu")
         self.assertIsNotNone(menu);self.assertTrue(menu.property("visible"));self.assertEqual(self.window.property("contextMenuCount"),1)
         self.assertTrue(all(not hint.property("visible") for hint in hints),"A path hint must disappear while the context menu is open")
-        content=menu.property("contentItem");p=content.mapToScene(QPointF(content.width()-14,content.height()/2))
+        # Leave the newly enabled hover state before sampling the base surface.
+        QTest.mouseMove(self.window,QPoint(460,15));QTest.qWait(30)
+        # Sample the base surface in its inset, outside the keyboard/hover item.
+        background=menu.property("background");p=background.mapToScene(QPointF(3,background.height()/2))
         color=self.window.grabWindow().pixelColor(round(p.x()),round(p.y()))
         self.assertEqual(color,QColor(self.palette.palette["surface-low"]),"The menu must cover the contrasting page beneath it")
         QTest.mouseClick(self.window,Qt.LeftButton,Qt.NoModifier,QPoint(460,350));QTest.qWait(100)

@@ -1,7 +1,7 @@
 import "./ExportProgressIndicator.css";
 
-/** A decorative Material 3 Expressive-inspired loading shape alongside the
- * native progress element, which remains the accessible source of progress. */
+/** One visible expressive shape; native progress remains available to assistive
+ * technology without a competing visual loading track. */
 export default function ExportProgressIndicator({ completed, total }: { completed?: number; total?: number }) {
   const determinate = Number.isFinite(total) && total! > 0 && Number.isFinite(completed);
   const max = determinate ? total! : undefined;

@@ -169,7 +169,8 @@ test('native two-finger deltas pan the magnified page in both directions without
   await expect.poll(()=>root.evaluate(el=>el.scrollLeft)).toBeGreaterThan(before.left+50);
   await page.evaluate(()=>window.supermdNativeWheel?.(-60,-100,{x:400,y:300},false));
   await expect(page.locator('.document-page')).toHaveAttribute('data-scale','2');
-  expect(await root.evaluate(el=>el.scrollLeft)).toBeLessThan(before.left+120);
+  // Native deltas are applied on the next display frame, including reversal.
+  await expect.poll(()=>root.evaluate(el=>el.scrollLeft)).toBeLessThan(before.left+120);
 });
 test('queued native snapshots cannot rewind an in-progress zoom, and both limits apply',async({page})=>{
   await page.addInitScript(()=>{window.SuperMD={post:(id)=>window.supermdReply?.(id,true,null)};});await page.goto('/android-reader.html');

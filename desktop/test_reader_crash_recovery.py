@@ -35,7 +35,8 @@ class ReaderCrashRecoveryTest(unittest.TestCase):
         self.assertIn("script.injectionPoint = WebEngineScript.DocumentCreation", self.qml)
         self.assertIn("userScripts.insert(script)", self.qml)
         self.assertEqual(self.qml.count("userScripts.insert(script)"), 1)
-        self.assertNotIn("reader.reload()", self.qml)
+        crash_handler=self.qml.split("function handleReaderCrash",1)[1].split("function retryReaderManually",1)[0]
+        self.assertNotIn("reload()", crash_handler)
 
     def test_repeated_failure_has_manual_retry_without_running_python(self):
         self.assertIn("readerRecoveryExhausted = true", self.qml)

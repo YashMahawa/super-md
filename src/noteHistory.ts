@@ -3,6 +3,7 @@
 export interface TextEdit {from:number;remove:number;insert:string}
 export type HistoryEntry=string|TextEdit[]; // Accept older window transfers.
 export interface NoteHistory {undo:HistoryEntry[];redo:HistoryEntry[];last:number}
+const MAX_HISTORY_EDITS=10_000;
 export function textEdit(before:string,after:string):TextEdit {
   if(after.startsWith(before))return {from:before.length,remove:0,insert:after.slice(before.length)};
   if(before.startsWith(after))return {from:after.length,remove:before.length-after.length,insert:''};
@@ -15,7 +16,10 @@ export function historyCost(entry:HistoryEntry):number {return typeof entry==='s
 export function historySize(history:NoteHistory):number {return [...history.undo,...history.redo].reduce((size,entry)=>size+historyCost(entry),0);}
 export function recordHistory(history:NoteHistory,before:string,after:string,now=Date.now()):void {
   const edit=textEdit(after,before),last=history.undo.at(-1);
-  if(now-history.last>600||Math.abs(after.length-before.length)>1||!Array.isArray(last))history.undo.push([edit]);
+  // Transferred history validation caps each edit group. Start another group
+  // before this one reaches that bound so long uninterrupted typing remains
+  // undoable after session restore.
+  if(now-history.last>600||Math.abs(after.length-before.length)>1||!Array.isArray(last)||last.length>=MAX_HISTORY_EDITS)history.undo.push([edit]);
   else {
     const prior=last.at(-1)!;
     if(!prior.insert&&!edit.insert&&edit.from===prior.from+prior.remove)prior.remove+=edit.remove;
@@ -40,5 +44,5 @@ export function replayHistory(history:NoteHistory,current:string,direction:'undo
 export function validHistory(value:unknown):value is NoteHistory {
   if(!value||typeof value!=='object')return false;
   const h=value as NoteHistory;
-  return [h.undo,h.redo].every(list=>Array.isArray(list)&&list.length<=60&&list.every(entry=>typeof entry==='string'||Array.isArray(entry)&&entry.length<=10_000&&entry.every(edit=>edit&&Number.isSafeInteger(edit.from)&&edit.from>=0&&Number.isSafeInteger(edit.remove)&&edit.remove>=0&&typeof edit.insert==='string')))&&historySize(h)<=4_000_000;
+  return [h.undo,h.redo].every(list=>Array.isArray(list)&&list.length<=60&&list.every(entry=>typeof entry==='string'||Array.isArray(entry)&&entry.length<=MAX_HISTORY_EDITS&&entry.every(edit=>edit&&Number.isSafeInteger(edit.from)&&edit.from>=0&&Number.isSafeInteger(edit.remove)&&edit.remove>=0&&typeof edit.insert==='string')))&&historySize(h)<=4_000_000;
 }

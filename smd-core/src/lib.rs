@@ -3,9 +3,10 @@ pub mod portable;
 pub mod theme;
 pub mod pdf_assets;
 mod math_compatibility;
+mod step_grid;
 use math_compatibility::compatible_math;
 use anyhow::{bail, Result};
-use pulldown_cmark::{CodeBlockKind, Event, Options, Parser, Tag, TagEnd};
+use pulldown_cmark::{Alignment, CodeBlockKind, Event, Options, Parser, Tag, TagEnd};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use typst_as_lib::{typst_kit_options::TypstKitFontOptions, TypstEngine};
@@ -25,7 +26,7 @@ pub struct PdfOptions {
 }
 impl Default for PdfOptions {
     fn default() -> Self {
-        Self { page_size: "a4".into(), margin: 18., font_size: 10., line_height: 1.45, paragraph_spacing: 1.2, font_family: "Libertinus Serif".into(), page_numbers: true, themed: false, theme_accent: "#386a57".into() }
+        Self { page_size: "a4".into(), margin: 14., font_size: 10.5, line_height: 1.4, paragraph_spacing: 0.65, font_family: "Manrope".into(), page_numbers: true, themed: false, theme_accent: "#386a57".into() }
     }
 }
 impl PdfOptions {
@@ -44,7 +45,29 @@ fn string(value: &str) -> String { serde_json::to_string(value).unwrap() }
 fn text(value: &str) -> String { format!("#text({})", string(value)) }
 
 pub fn image_sources(markdown: &str) -> Vec<String> {
-    Parser::new_ext(markdown, Options::all()).filter_map(|event| match event { Event::Start(Tag::Image { dest_url, .. }) => Some(dest_url.to_string()), _ => None }).collect()
+    let mut sources = Vec::new();
+    let mut events = Parser::new_ext(markdown, Options::all());
+    while let Some(event) = events.next() {
+        match event {
+            Event::Start(Tag::Image { dest_url, .. }) => sources.push(dest_url.to_string()),
+            Event::Start(Tag::CodeBlock(CodeBlockKind::Fenced(lang))) if ["smd-steps", "smd-step-grid"].contains(&lang.as_ref()) => {
+                let mut code = String::new();
+                for event in events.by_ref() {
+                    if event == Event::End(TagEnd::CodeBlock) { break; }
+                    if let Event::Text(value) = event { code.push_str(&value); }
+                }
+                if let Ok(deck) = serde_json::from_str::<serde_json::Value>(&code) {
+                    if let Some(steps) = deck.get("steps").and_then(|v| v.as_array()) {
+                        sources.extend(steps.iter().filter_map(|step| step.get("image").and_then(|v| v.as_str()).map(str::to_owned)));
+                        for step in steps { if let Some(body) = step.get("markdown").and_then(|v| v.as_str()) { sources.extend(image_sources(body)); } }
+
+                    }
+                }
+            },
+            _ => {},
+        }
+    }
+    sources
 }
 
 /// Normalize both Obsidian and Super MD callouts before parsing ordinary Markdown.
@@ -153,6 +176,10 @@ impl<'a> Renderer<'a> {
                             let mut code = String::new();
                             while let Some(e) = self.events.next() { if e == Event::End(close) { break; } if let Event::Text(v) = e { code.push_str(&v); } }
                             let lang = match kind { CodeBlockKind::Fenced(v) => v.to_string(), _ => String::new() };
+                            if ["smd-steps", "smd-step-grid"].contains(&lang.as_str()) {
+                                out.push_str(&step_grid::render(&code, self.assets)?);
+                                continue;
+                            }
                             if ["mermaid", "smd-chart"].contains(&lang.as_str()) { bail!("Export preparation did not render a {lang} block"); }
                             // Individual lines fit the available width while the
                             // enclosing block stays breakable across pages.
@@ -183,8 +210,8 @@ impl<'a> Renderer<'a> {
                             }
                             let widths = lengths.iter().zip(&counts).map(|(len, count)| format!("{:.2}fr,", ((*len as f64 / (*count).max(1) as f64).max(8.)).sqrt().min(12.))).collect::<String>();
                             let alignments = columns.iter().map(|column| match column {
-                                pulldown_cmark::Alignment::Center => "center,",
-                                pulldown_cmark::Alignment::Right => "right,",
+                                Alignment::Center => "center,",
+                                Alignment::Right => "right,",
                                 _ => "left,",
                             }).collect::<String>();
                             out.push_str(&format!("\n#table(columns: ({widths}), align: ({alignments}), inset: 6pt, stroke: .4pt + smd-line, fill: (x, y) => if y == 0 {{ smd-header-fill }} else {{ none }},\n"));
@@ -216,7 +243,7 @@ impl<'a> Renderer<'a> {
                                 let body = self.render(Some(TagEnd::Paragraph))? + "\n\n" + &self.render(Some(close))?;
                                 let accent = match kind.as_str() { "tip" | "hint" | "success" | "check" | "done" => "#14735b", "warning" | "caution" => "#946200", "danger" | "error" | "failure" | "fail" | "missing" => "#b3261e", _ => "#315d99" };
                                 let icon = match kind.as_str() {"tip"|"hint"=>"tip","warning"|"caution"=>"warning","danger"|"error"=>"error","success"|"check"|"done"=>"success","question"|"faq"=>"question","answer"|"solution"=>"answer","example"=>"example","quote"|"cite"=>"quote",_=>"info"};
-                                (format!("#text(weight: \"bold\", fill: rgb(\"{accent}\"))[#image(\"__smd_icon_{icon}.svg\", width: 11pt) #h(4pt) {}]\n\n{body}", text(&title)), accent)
+                                (format!("#block(sticky: true, below: 6pt)[#text(weight: \"bold\", fill: rgb(\"{accent}\"))[#box(image(\"__smd_icon_{icon}.svg\", width: 11pt)) #h(4pt) {}]]\n\n{body}", text(&title)), accent)
                             } else { (self.render(Some(close))?, "#315d99") };
                             out.push_str(&format!("\n#block(width: 100%, breakable: true, fill: if smd-themed {{ smd-callout-fill }} else {{ color.mix((white, 94%), (rgb(\"{accent}\"), 6%)) }}, stroke: (left: 2pt + rgb(\"{accent}\")), inset: 10pt, radius: 4pt)[{body}]\n\n"));
                         },
@@ -228,7 +255,7 @@ impl<'a> Renderer<'a> {
                             } else { None };
                             let body = self.render(Some(close))?;
                             match tag {
-                                Tag::Paragraph => out.push_str(&format!("{body}\n\n")),
+                                Tag::Paragraph => { if body.starts_with("#strong[") && body.ends_with(']') { out.push_str(&format!("#block(sticky: true, below: .35em)[{body}]\n\n")); } else { out.push_str(&format!("{body}\n\n")); } },
                                 Tag::Heading { level, .. } => out.push_str(&format!("\n#heading(level: {})[{body}] <smd-{}>\n\n", level as u8, heading.unwrap())),
                                 Tag::Emphasis => out.push_str(&format!("#emph[{body}]")),
                                 Tag::Strong => out.push_str(&format!("#strong[{body}]")),
@@ -249,6 +276,12 @@ impl<'a> Renderer<'a> {
         }
         Ok(out)
     }
+}
+
+pub(crate) fn render_fragment(markdown: &str, assets: &HashMap<String, Vec<u8>>) -> Result<String> {
+    let normalized = normalize_table_math(&normalize_callouts(markdown));
+    let events = Parser::new_ext(&normalized, Options::ENABLE_TABLES | Options::ENABLE_STRIKETHROUGH | Options::ENABLE_MATH).collect::<Vec<_>>();
+    Renderer { events: events.into_iter().peekable(), assets, footnotes: HashMap::new(), headings: HashMap::new(), heading_counts: HashMap::new() }.render(None)
 }
 
 pub fn source(markdown: &str, options: &PdfOptions, assets: &HashMap<String, Vec<u8>>) -> Result<String> {
@@ -286,7 +319,9 @@ pub fn source(markdown: &str, options: &PdfOptions, assets: &HashMap<String, Vec
 #let smd-line = if smd-themed {{ color.mix((white, 55%), (smd-accent, 45%)) }} else {{ rgb("#d6d6d6") }}
 #let smd-link = if smd-themed {{ color.mix((rgb("#202020"), 45%), (smd-accent, 55%)) }} else {{ rgb("#315d99") }}
 "##, string(accent));
-    Ok(format!("#import \"/mitex/standard.typ\": scope as mitex-scope\n#let smd-math-scope = mitex-scope + (sect: sym.inter,)\n{palette}#set page(paper: {}, margin: {}mm, fill: smd-paper)\n#set text(font: ({}, \"Libertinus Serif\", \"New Computer Modern\"), size: {}pt)\n#set par(leading: {}em, spacing: {}em)\n{template}\n{body}", string(paper), options.margin, string(&options.font_family), options.font_size, options.line_height - 0.7, options.paragraph_spacing))
+    // Typst collapses paragraph spacing against leading. Add leading so the
+    // export control specifies the visible gap instead of disappearing below it.
+    Ok(format!("#import \"/mitex/standard.typ\": scope as mitex-scope\n#let smd-math-scope = mitex-scope + (sect: sym.inter,)\n{palette}#set page(paper: {}, margin: {}mm, fill: smd-paper)\n#set text(font: ({}, \"Libertinus Serif\", \"New Computer Modern\"), size: {}pt)\n#set par(leading: {}em, spacing: {}em)\n{template}\n{body}", string(paper), options.margin, string(&options.font_family), options.font_size, options.line_height - 0.7, options.line_height - 0.7 + options.paragraph_spacing))
 }
 
 pub fn export(markdown: &str, options: &PdfOptions, assets: &HashMap<String, Vec<u8>>) -> Result<Vec<u8>> {
@@ -400,7 +435,7 @@ mod tests {
         let options=PdfOptions{font_size:6.,line_height:1.45,paragraph_spacing:1.2,..PdfOptions::default()};
         let md="# Compact\n\nFirst paragraph.\n\nSecond paragraph with $x^2$.";
         let text=source(md,&options,&HashMap::new()).unwrap();
-        assert!(text.contains("spacing: 1.2em"));
+        assert!(text.contains("spacing: 1.95em"));
         assert!(export(md,&options,&HashMap::new()).unwrap().starts_with(b"%PDF-"));
         let invalid=PdfOptions{paragraph_spacing:f32::NAN,..options};assert!(invalid.validate().is_err());
     }
@@ -527,7 +562,8 @@ P(A\cup B\cup C)=&P(A)+P(B)+P(C)\\
         if let Ok(output) = std::process::Command::new("pdftotext").arg("-bbox").arg(&path).arg("-").output() {
             for line in String::from_utf8_lossy(&output.stdout).lines().filter(|line| line.contains("<word ")) {
                 let x = line.split("xMax=\"").nth(1).unwrap().split('"').next().unwrap().parse::<f64>().unwrap();
-                assert!(x < 550., "Wide equation escaped the page: {line}");
+                let right_edge = (210. - PdfOptions::default().margin as f64) * 72. / 25.4;
+                assert!(x <= right_edge + 0.5, "Wide equation escaped the printable area: {line}");
             }
         }
     }
@@ -553,5 +589,21 @@ P(A\cup B\cup C)=&P(A)+P(B)+P(C)\\
                 }
             }
         }
+    }
+    #[test]
+    fn table_column_alignments_are_preserved_in_typst_source_and_pdf() {
+        let md = r"| Left | Center | Right | Unspecified |
+| :--- | :----: | ----: | ----------- |
+| L1   | C1     | R1    | U1          |
+| L2   | C2     | R2    | U2          |";
+        let src = source(md, &PdfOptions::default(), &HashMap::new()).unwrap();
+        assert!(src.contains("align: (left,center,right,left,)"), "Table must preserve column alignments: {src}");
+
+        let single_col_md = "| Single Center |\n| :---: |\n| Cell |";
+        let single_src = source(single_col_md, &PdfOptions::default(), &HashMap::new()).unwrap();
+        assert!(single_src.contains("align: (center,)"), "Single column table must have trailing comma in align tuple: {single_src}");
+
+        let pdf_bytes = export(md, &PdfOptions::default(), &HashMap::new()).unwrap();
+        assert!(pdf_bytes.starts_with(b"%PDF-"));
     }
 }
