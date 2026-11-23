@@ -47,13 +47,24 @@ def main(argv):
         raw=bytes(socket.readAll())
         while b'\n' not in raw and socket.waitForReadyRead(2000):raw+=bytes(socket.readAll())
         if b'\n' not in raw:raw+=bytes(socket.readAll())
+        if not raw and socket.state()==QLocalSocket.LocalSocketState.ConnectedState:
+            socket.waitForDisconnected(50)
         peer_closed=(
             socket.state() in (QLocalSocket.LocalSocketState.UnconnectedState,QLocalSocket.LocalSocketState.ClosingState)
-            or socket.error()==QLocalSocket.LocalSocketError.PeerClosedError
+            or socket.error() in (
+                QLocalSocket.LocalSocketError.PeerClosedError,
+                QLocalSocket.LocalSocketError.ConnectionError,
+                QLocalSocket.LocalSocketError.ServerNotFoundError,
+                QLocalSocket.LocalSocketError.ConnectionRefusedError,
+            )
         )
         socket.disconnectFromServer()
         if not raw:
             if peer_closed or startup_poll:return None
+            probe=QLocalSocket();probe.connectToServer(name)
+            still_listening=probe.waitForConnected(100)
+            probe.abort()
+            if not still_listening and not _instance_lock_held():return None
             raise ValueError('Existing Super MD instance did not respond to service request')
         line=raw.split(b'\n',1)[0].rstrip(b'\r')
         if line==b'ok':
@@ -96,7 +107,7 @@ def main(argv):
         while time.monotonic()<wait_deadline and (reply is None or (not reply.get('ok',False) and reply.get('error')=='Background service is unavailable')):
             time.sleep(.05);reply=request('start',startup_poll=True)
     if reply is not None and reply.get('stopping'):
-        stop_deadline=time.monotonic()+10
+        stop_deadline=time.monotonic()+15
         while time.monotonic()<stop_deadline:
             status=request('status',startup_poll=True)
             if status is None:reply=None;break
@@ -112,7 +123,7 @@ def main(argv):
     else:
         running=False;root.mkdir(parents=True,exist_ok=True)
         lock_probe=QLockFile(str(root/'native-instance.lock'));lock_probe.setStaleLockTime(0)
-        lock_deadline=time.monotonic()+10
+        lock_deadline=time.monotonic()+15
         while time.monotonic()<lock_deadline:
             if lock_probe.tryLock(100):
                 lock_probe.unlock();break

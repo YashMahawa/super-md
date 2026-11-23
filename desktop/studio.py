@@ -2132,8 +2132,6 @@ class Studio(QObject):
         if not self.ready:
             self._after_flush(operation)
             return
-        if self.flush_operation: return
-        self.flush_operation = operation
         bg = getattr(self.session, "background", None)
         hidden_cli_close = (
             action == "close_window"
@@ -2142,6 +2140,8 @@ class Studio(QObject):
             and getattr(self, "host_window", None) is not None
             and not self.host_window.isVisible()
         )
+        if self.flush_operation and not hidden_cli_close: return
+        self.flush_operation = operation
         self.flush_timer.start(1000 if hidden_cli_close else 5000)
         self.readerCall.emit(f"window.supermdFlush?.({json.dumps(operation)})")
 

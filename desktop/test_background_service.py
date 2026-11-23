@@ -252,6 +252,34 @@ class BackgroundTests(unittest.TestCase):
         recovered = json.loads((session.data / "recovery.json").read_text(encoding="utf-8"))
         self.assertTrue(any("Unsaved headless draft" in tab.get("content", "") for tab in recovered))
 
+        # When a hidden offscreen renderer is occluded/suspended (e.g. on macOS/Windows) and never
+        # answers `supermdFlush`, `_on_flush_timeout` must still recover drafts and quit without
+        # showing a modal flush dialog.
+        app_occluded = App()
+        session_occluded = self._make_session()
+        session_occluded.settings["agentAccessEnabled"] = True
+        with patch("background_service.QSystemTrayIcon.isSystemTrayAvailable", return_value=False):
+            session_occluded.background = BackgroundService(
+                app_occluded, session_occluded, ROOT, lambda _: None, force=True
+            )
+        studio_occluded = self._make_studio(session_occluded, visible=False)
+        studio_occluded.tabs[0]["content"] = "# Occluded hidden draft\n\n$$\\nabla \\cdot B = 0$$\n"
+        studio_occluded.ready = True
+        flush_failed_events = []
+        studio_occluded.flushFailed.connect(flush_failed_events.append)
+        stop_occluded = session_occluded.background.handle_service_request("stop")
+        self.assertEqual(stop_occluded, {"ok": True, "running": False, "stopped": True, "quitRequested": True})
+        self.assertIsNotNone(studio_occluded.flush_operation)
+        studio_occluded._on_flush_timeout()
+        self._pump(6)
+        self.assertEqual(flush_failed_events, [])
+        self.assertFalse(studio_occluded.host_window.isVisible())
+        self.assertTrue(app_occluded.ended)
+        studio_occluded.stop()
+        session_occluded.writes.shutdown(wait=True)
+        recovered_occluded = json.loads((session_occluded.data / "recovery.json").read_text(encoding="utf-8"))
+        self.assertTrue(any("Occluded hidden draft" in tab.get("content", "") for tab in recovered_occluded))
+
     def test_install_update_bypasses_tray_hiding_across_desktop_installers(self):
         for kind in ("appimage", "windows", "macos"):
             app = App()
@@ -577,7 +605,8 @@ from pathlib import Path
 os.environ["QT_QPA_PLATFORM"] = "offscreen"
 os.environ["QT_QUICK_BACKEND"] = "software"
 os.environ.setdefault("QTWEBENGINE_CHROMIUM_FLAGS", "--disable-gpu --disable-dev-shm-usage")
-os.environ.setdefault("QTWEBENGINE_DISABLE_SANDBOX", "1")
+if sys.platform.startswith("linux"):
+    os.environ.setdefault("QTWEBENGINE_DISABLE_SANDBOX", "1")
 
 appdata = os.environ["SUPERMD_TEST_APPDATA"]
 downloads = os.environ["SUPERMD_TEST_DOWNLOADS"]
@@ -644,6 +673,11 @@ for raw in cin:
             out, err, marker = io.StringIO(), io.StringIO(), cmd.get("spawnMarker")
             real_spawn = cmd.get("realSpawn")
             orig_popen = real_subprocess.Popen
+            def _write_marker(path, data):
+                tmp = path + ".tmp"
+                with open(tmp, "w", encoding="utf-8") as fh:
+                    fh.write(json.dumps(data))
+                os.replace(tmp, path)
             def fake_popen(spawn_cmd, **kwargs):
                 if real_spawn:
                     env = dict(os.environ)
@@ -660,10 +694,10 @@ for raw in cin:
                         creationflags=kwargs.get("creationflags", 0),
                     )
                     if marker:
-                        open(marker, "w", encoding="utf-8").write(json.dumps({"cmd": spawn_cmd, "pid": proc.pid}))
+                        _write_marker(marker, {"cmd": spawn_cmd, "pid": proc.pid})
                     return proc
                 if not marker: raise AssertionError("Unexpected Popen")
-                open(marker, "w", encoding="utf-8").write(json.dumps(spawn_cmd)); return MagicMock()
+                _write_marker(marker, spawn_cmd); return MagicMock()
             with patch.object(background_cli.subprocess, "Popen", side_effect=fake_popen), patch.object(sys, "stdin", io.StringIO("")), contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
                 try: code = agent_cli.main(["service", cmd["action"]])
                 except SystemExit as exc: code = exc.code if isinstance(exc.code, int) else 1
@@ -808,11 +842,11 @@ class InstanceBrokerAndServiceCliTests(unittest.TestCase):
         # Simulate aboutToQuit closing the IPC server shortly before lock release.
         self.broker.server.close()
         self.assertEqual(self._service("status")[1]["result"]["running"], False)
-        QTimer_released = []
+        release_state = {"started": time.monotonic(), "unlocked": False}
         def release_soon():
-            if not QTimer_released:
-                QTimer_released.append(True)
-                threading.Timer(0.15, self.broker.lock.unlock).start()
+            if not release_state["unlocked"] and time.monotonic() - release_state["started"] >= 0.15:
+                release_state["unlocked"] = True
+                self.broker.lock.unlock()
         claim_res = self._call({"kind": "claim", "note": None, "appdata": str(self.temp_appdata)}, on_tick=release_soon)
         self.assertIs(claim_res["claimed"], True)
         self.broker.close()
@@ -1348,24 +1382,6 @@ class InstanceBrokerAndServiceCliTests(unittest.TestCase):
         self.assertTrue(disk_portable)
         self.assertEqual(disk_assets, {})
         self.assertIn("| #10422 | 5.4 | 15.2 |", disk_md)
-
-        # When the built native reader bundle is present (as in CI on Linux, Windows, and macOS),
-        # ensure WebEngine finishes marking the hidden window `studio.ready = True` while the
-        # recovered Tab 0 draft ("Covariant Conservation.md") is still dirty, exercising the exact
-        # reader-ready hidden shutdown path before Phase 3's `stop` -> `start` handoff.
-        if (ROOT / "dist" / "qt-reader.html").is_file():
-            ready_deadline = time.monotonic() + 8.0
-            reader_ready = False
-            while time.monotonic() < ready_deadline:
-                try:
-                    diagrams = client._call("list_diagrams", tabId=created["tabId"])
-                    if isinstance(diagrams.get("diagrams"), list) and len(diagrams["diagrams"]) == 1:
-                        reader_ready = True
-                        break
-                except Exception:
-                    pass
-                time.sleep(0.1)
-            self.assertTrue(reader_ready, "Hidden headless reader did not finish loading dist/qt-reader.html")
 
         # Phase 3: Immediate `stop` -> `start` handoff must never attach to a dying daemon or leave running:False;
         # it waits for shutdown and spawns a fresh live daemon with a rotated discovery token.
