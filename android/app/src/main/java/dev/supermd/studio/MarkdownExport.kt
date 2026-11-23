@@ -42,7 +42,7 @@ internal class MarkdownExport(private val context: Context, val filename: String
                 val extension = path.substringAfterLast('.').lowercase()
                 require(extension in when(mime) {
                     "image/png" -> setOf("png"); "image/jpeg" -> setOf("jpg", "jpeg"); "image/gif" -> setOf("gif")
-                    "image/webp" -> setOf("webp"); "image/avif" -> setOf("avif"); "image/svg+xml" -> setOf("svg"); else -> emptySet()
+                    "image/webp" -> setOf("webp"); "image/avif" -> setOf("avif"); else -> emptySet()
                 }) { "Markdown image filename does not match its type" }
                 total += bytes.size
                 require(total <= 128L * 1024 * 1024) { "Markdown and assets exceed 128 MiB" }

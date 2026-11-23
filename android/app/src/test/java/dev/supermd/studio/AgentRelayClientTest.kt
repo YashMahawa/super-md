@@ -101,16 +101,6 @@ class AgentRelayClientTest {
             .put("expectedRevision", revision).put("options", JSONObject().put("saveAs", true).put("filename", "Draft.md").put("format", "md"))
         client.validateRequest(saveAs)
         assertEquals("Draft.md", saveAs.getString("filename"))
-        val mdzipExport = JSONObject().put("requestId", "export_zip_1").put("action", "document_action")
-            .put("documentAction", "export").put("tabId", "tab:device:workspace:1")
-            .put("expectedRevision", revision).put("options", JSONObject().put("format", "mdzip").put("filename", "Study.zip"))
-        client.validateRequest(mdzipExport)
-        assertEquals("mdzip", mdzipExport.getString("format"))
-        assertThrows(IllegalArgumentException::class.java) {
-            client.validateRequest(JSONObject().put("requestId", "save_zip_bad").put("action", "document_action")
-                .put("documentAction", "save").put("tabId", "tab:device:workspace:1")
-                .put("expectedRevision", revision).put("options", JSONObject().put("format", "mdzip")))
-        }
         client.validateRequest(JSONObject().put("requestId", "close_1").put("action", "document_action")
             .put("documentAction", "close").put("tabId", "tab:device:workspace:1")
             .put("expectedRevision", revision).put("options", JSONObject().put("discardChanges", true)))

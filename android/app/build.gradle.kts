@@ -1,52 +1,10 @@
-import java.util.Properties
-import org.gradle.api.artifacts.ExternalModuleDependency
-import org.gradle.process.CommandLineArgumentProvider
-
 plugins { id("com.android.application"); id("org.jetbrains.kotlin.plugin.compose"); id("com.chaquo.python") }
-
-val robolectricSdkCoords = listOf(
-    "org.robolectric:android-all-instrumented:5.0.2_r3-robolectric-r0-i7",
-    "org.robolectric:android-all-instrumented:9-robolectric-4913185-2-i7",
-    "org.robolectric:android-all-instrumented:15-robolectric-12650502-i7",
-)
-val robolectricSdkConfigs = robolectricSdkCoords.associateWith { coord ->
-    configurations.detachedConfiguration(
-        dependencies.create(coord).also { (it as ExternalModuleDependency).isTransitive = false }
-    )
-}
-
-val robolectricDepsFile = layout.buildDirectory.file("generated/robolectric/robolectric-deps.properties")
-val writeRobolectricDepsProperties by tasks.registering {
-    robolectricSdkConfigs.forEach { (coord, cfg) ->
-        inputs.files(cfg)
-        inputs.property("path:$coord", provider { cfg.singleFile.absolutePath })
-    }
-    outputs.file(robolectricDepsFile)
-    doLast {
-        val props = Properties()
-        for ((coord, cfg) in robolectricSdkConfigs) {
-            props.setProperty(coord, cfg.singleFile.absolutePath)
-        }
-        val out = robolectricDepsFile.get().asFile
-        out.parentFile.mkdirs()
-        out.outputStream().use { props.store(it, null) }
-    }
-}
-
 android {
     namespace = "dev.supermd.studio"
     compileSdk { version = release(37) }
     defaultConfig { applicationId = "dev.supermd.studio"; minSdk = 26; targetSdk = 36; versionCode = 1059; versionName = "0.6.34"; ndk { abiFilters += (System.getenv("SUPERMD_ABIS") ?: "arm64-v8a").split(',') }; testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner" }
     buildFeatures { compose = true; buildConfig = true }
     compileOptions { sourceCompatibility = JavaVersion.VERSION_17; targetCompatibility = JavaVersion.VERSION_17 }
-    testOptions {
-        unitTests.all { testTask ->
-            testTask.dependsOn(writeRobolectricDepsProperties)
-            testTask.jvmArgumentProviders.add(CommandLineArgumentProvider {
-                listOf("-Drobolectric-deps.properties=${robolectricDepsFile.get().asFile.absolutePath}")
-            })
-        }
-    }
     signingConfigs {
         create("distribution") {
             enableV1Signing = true

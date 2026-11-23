@@ -249,8 +249,8 @@ class LiveTabClient:
     def export_document(self, tab_id: str, format: str = "pdf", options: dict[str, Any] | None = None,
                         filename: str | None = None, expected_revision: str | None = None,
                         window_id: str | None = None) -> dict[str, Any]:
-        if format not in ("pdf", "smd", "md", "mdzip"):
-            raise LiveBridgeError("format must be pdf, smd, md, or mdzip")
+        if format not in ("pdf", "smd", "md"):
+            raise LiveBridgeError("format must be pdf, smd, or md")
         if not isinstance(expected_revision, str) or len(expected_revision) != 64:
             raise LiveBridgeError("expected_revision must be the current SHA-256 revision")
         if options is not None:
@@ -836,8 +836,8 @@ def _qt_bridge_class():
                         or len(set(indices)) != len(indices)):
                     raise ValueError("repairIndices must be up to 40 unique nonnegative repair indexes")
             elif action == "export_document":
-                if payload.get("format") not in ("pdf", "smd", "md", "mdzip"):
-                    raise ValueError("format must be pdf, smd, md, or mdzip")
+                if payload.get("format") not in ("pdf", "smd", "md"):
+                    raise ValueError("format must be pdf, smd, or md")
                 revision = payload.get("expectedRevision")
                 if not isinstance(revision, str) or len(revision) != 64 or any(c not in "0123456789abcdef" for c in revision):
                     raise ValueError("expectedRevision must be the current SHA-256 revision")

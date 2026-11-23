@@ -167,7 +167,6 @@ class LiveCLISubprocessTests(unittest.TestCase):
         image_path=Path(meta["path"]); self.assertEqual(image_path.suffix,".png"); self.assertEqual(image_path.read_bytes(),PNG)
         self.assertNotEqual(self.run_cli("snapshot",tab,image_path)[0],0)
         self.assertEqual(self.run_cli("export",tab,"pdf","--revision",updated)[1]["result"]["status"],"running")
-        self.assertEqual(self.run_cli("export",tab,"mdzip","--revision",updated)[1]["result"]["format"],"mdzip")
         job_id=self.run_cli("export",tab,"pdf","--revision",updated)[1]["result"]["jobId"]
         self.assertEqual(self.run_cli("job",job_id)[1]["result"]["status"],"completed")
         content=self.temp/"new.md"; content.write_text("# New note\n",encoding="utf-8")

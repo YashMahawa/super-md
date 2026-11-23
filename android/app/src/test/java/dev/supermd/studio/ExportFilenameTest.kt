@@ -53,11 +53,5 @@ class ExportFilenameTest {
         assertFalse(ExportFilename.hasExpectedHeader("{\"format\":\"supermd-fmd\"}".toByteArray(), NativeExportFormat.PORTABLE_SMD))
         assertTrue(ExportFilename.hasExpectedHeader("{\"format\":\"supermd-smd\",\"version\":1}".toByteArray(), NativeExportFormat.PORTABLE_SMD))
         assertTrue(ExportFilename.hasExpectedHeader(byteArrayOf(0x1f.toByte(), 0x8b.toByte()), NativeExportFormat.PORTABLE_SMD))
-        assertTrue(ExportFilename.hasExpectedHeader(byteArrayOf(0x50, 0x4b, 0x03, 0x04), NativeExportFormat.MARKDOWN_ZIP))
-        assertFalse(ExportFilename.hasExpectedHeader("# Not a zip".toByteArray(), NativeExportFormat.MARKDOWN_ZIP))
-        assertEquals(NativeExportFormat.MARKDOWN_ZIP, NativeExportFormat.fromShareFormat("mdzip"))
-        assertEquals("Study v2.zip", ExportFilename.suggestedName("Study v2.md", NativeExportFormat.MARKDOWN_ZIP))
-        assertTrue(ExportFilename.mimeMatches("application/zip", NativeExportFormat.MARKDOWN_ZIP))
-        assertFalse(ExportFilename.mimeMatches("text/markdown", NativeExportFormat.MARKDOWN_ZIP))
     }
 }

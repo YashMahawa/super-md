@@ -60,7 +60,7 @@ export function validateRpcRequest(value: unknown): RpcRequest {
   if (r.content !== undefined && (typeof r.content !== "string" || Buffer.byteLength(r.content) > MAX_TEXT_BYTES)) throw new Error("Invalid document content");
   if (r.options !== undefined && (!r.options || typeof r.options !== "object" || Array.isArray(r.options) || Buffer.byteLength(JSON.stringify(r.options)) > 16 * 1024)) throw new Error("Invalid action options");
   if (r.diagramId !== undefined && (typeof r.diagramId !== "string" || r.diagramId.length > 128)) throw new Error("Invalid diagram id");
-  if (r.format !== undefined && (typeof r.format !== "string" || !["pdf", "smd", "md", "mdzip"].includes(r.format))) throw new Error("Invalid export format");
+  if (r.format !== undefined && (typeof r.format !== "string" || !["pdf", "smd", "md"].includes(r.format))) throw new Error("Invalid export format");
   if (r.repairIndices !== undefined && (!Array.isArray(r.repairIndices) || r.repairIndices.length > 40 || r.repairIndices.some((n) => !Number.isInteger(n) || n < 0))) throw new Error("Invalid repair indices");
   if (r.jobId !== undefined && (typeof r.jobId !== "string" || r.jobId.length > 128)) throw new Error("Invalid job id");
   if (r.heading !== undefined && !(typeof r.heading === "string" && Buffer.byteLength(r.heading) <= 512 || typeof r.heading === "number" && Number.isSafeInteger(r.heading) && r.heading >= 0)) throw new Error("Invalid heading");

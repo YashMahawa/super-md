@@ -4,14 +4,12 @@ package dev.supermd.studio
 internal enum class NativeExportFormat(val extension: String, val mimeType: String) {
     PDF("pdf", "application/pdf"),
     MARKDOWN("md", "text/markdown"),
-    MARKDOWN_ZIP("zip", "application/zip"),
     PORTABLE_SMD("smd", "application/vnd.supermd.smd");
 
     companion object {
         fun fromMime(mime: String): NativeExportFormat = when (mime.substringBefore(';').trim().lowercase()) {
             "application/pdf" -> PDF
             "text/markdown", "text/x-markdown", "text/plain" -> MARKDOWN
-            "application/zip", "application/x-zip-compressed" -> MARKDOWN_ZIP
             "application/vnd.supermd.smd", "application/vnd.supermd.fmd" -> PORTABLE_SMD
             else -> error("Unsupported export MIME type")
         }
@@ -19,7 +17,6 @@ internal enum class NativeExportFormat(val extension: String, val mimeType: Stri
         fun fromShareFormat(format: String): NativeExportFormat = when (format) {
             "pdf" -> PDF
             "md" -> MARKDOWN
-            "mdzip", "zip" -> MARKDOWN_ZIP
             "smd" -> PORTABLE_SMD
             else -> error("Unsupported export format")
         }
@@ -68,7 +65,6 @@ internal object ExportFilename {
         return when (format) {
             NativeExportFormat.PDF -> actual in setOf("application/pdf", "application/x-pdf")
             NativeExportFormat.MARKDOWN -> actual in setOf("text/markdown", "text/x-markdown", "text/plain")
-            NativeExportFormat.MARKDOWN_ZIP -> actual in setOf("application/zip", "application/x-zip-compressed")
             // Portable notes may be reported as JSON or gzip by providers
             // instead of their custom extension MIME.
             NativeExportFormat.PORTABLE_SMD -> actual in setOf("application/vnd.supermd.smd", "application/vnd.supermd.fmd", "application/json", "application/gzip", "application/x-gzip", "text/json", "text/plain")
@@ -78,7 +74,6 @@ internal object ExportFilename {
     fun hasExpectedHeader(prefix: ByteArray, format: NativeExportFormat): Boolean = when (format) {
         NativeExportFormat.PDF -> prefix.startsWithAscii("%PDF-")
         NativeExportFormat.MARKDOWN -> true // Markdown is UTF-8 text and has no required magic prefix.
-        NativeExportFormat.MARKDOWN_ZIP -> prefix.size >= 4 && prefix[0] == 0x50.toByte() && prefix[1] == 0x4b.toByte() && prefix[2] == 0x03.toByte() && prefix[3] == 0x04.toByte()
         NativeExportFormat.PORTABLE_SMD -> prefix.size >= 2 && prefix[0] == 0x1f.toByte() && prefix[1] == 0x8b.toByte() || prefix.startsWithAscii("{\"format\":\"supermd-smd\"")
     }
 
@@ -155,7 +150,6 @@ internal object ExportDestinationPolicy {
     private fun mimeMatchesWithoutFilename(mime: String, format: NativeExportFormat): Boolean = when (format) {
         NativeExportFormat.PDF -> mime in setOf("application/pdf", "application/x-pdf")
         NativeExportFormat.MARKDOWN -> mime in setOf("text/markdown", "text/x-markdown", "text/plain")
-        NativeExportFormat.MARKDOWN_ZIP -> mime in setOf("application/zip", "application/x-zip-compressed")
         NativeExportFormat.PORTABLE_SMD -> mime in setOf("application/vnd.supermd.smd", "application/vnd.supermd.fmd")
     }
 }

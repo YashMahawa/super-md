@@ -2,7 +2,6 @@
 import { act, type ReactNode } from "react";
 import type { Root } from "react-dom/client";
 import { afterEach, beforeEach, expect, it, vi } from "vitest";
-import { agentRevision } from "./agentOperations";
 
 const { native, prepareMarkdown, readerTree } = vi.hoisted(() => {
   if (typeof document !== "undefined") {
@@ -77,13 +76,7 @@ afterEach(() => {
   localStorage.clear();
 });
 
-it("forwards note Python path for ZIP export and supports live agent mdzip export", async () => {
-  native.mockImplementation(async (command: string, args?: unknown) => {
-    if (command === "agent_export_native") {
-      return { jobId: "job-zip-1", status: "running", ...(args as object) };
-    }
-    return null;
-  });
+it("forwards the active note Python interpreter when preparing Markdown and Markdown ZIP exports", async () => {
   prepareMarkdown.mockResolvedValue({
     content: "# Study\n\n![Diagram](<image1.svg>)\n",
     assets: { "image1.svg": "data:image/svg+xml;base64,PHN2Zy8+" },
@@ -127,30 +120,16 @@ it("forwards note Python path for ZIP export and supports live agent mdzip expor
   });
 
   prepareMarkdown.mockClear();
-  const revision = await agentRevision(content);
-  const reply = await new Promise<{ result: unknown; error: string }>((resolve) => {
-    window.supermdAgentRequest!(
-      {
-        requestId: "req-mdzip-1",
-        action: "export_document",
-        tabId: "tab-1",
-        format: "mdzip",
-        filename: "Study",
-        expectedRevision: revision,
-      },
-      (result, error) => resolve({ result, error }),
-    );
-  });
-
-  expect(reply.error).toBe("");
+  native.mockClear();
+  await window.supermdExportMarkdown!(false);
   expect(prepareMarkdown).toHaveBeenCalledWith(content, "/vault/Study.md", {
-    compatible: true,
+    compatible: false,
     python: "/opt/venv/bin/python",
   });
-  expect(reply.result).toMatchObject({
-    jobId: "job-zip-1",
-    status: "running",
-    format: "mdzip",
-    filename: "Study",
+  expect(native).toHaveBeenCalledWith("export_markdown_native", {
+    id: "tab-1",
+    content: "# Study\n\n![Diagram](<image1.svg>)\n",
+    assets: { "image1.svg": "data:image/svg+xml;base64,PHN2Zy8+" },
+    archive: false,
   });
 });

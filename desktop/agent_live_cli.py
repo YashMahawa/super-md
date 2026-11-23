@@ -109,7 +109,7 @@ def _parser() -> argparse.ArgumentParser:
 
     export = sub.add_parser("export", help="Export an active tab; run activate first if needed")
     export.add_argument("tab")
-    export.add_argument("format", choices=("pdf", "smd", "md", "mdzip"))
+    export.add_argument("format", choices=("pdf", "smd", "md"))
     export.add_argument("--revision", required=True)
     export.add_argument("--filename")
     exp_options = export.add_mutually_exclusive_group()
@@ -240,7 +240,7 @@ def _download_export(live_client, raw_job_id: str, output: str) -> dict[str, Any
             filename, fmt, mime = chunk.get("filename"), chunk.get("format"), chunk.get("mimeType")
             total, expected_hash = chunk.get("bytes"), chunk.get("sha256")
             if (not isinstance(filename, str) or not filename or Path(filename).name != filename
-                    or fmt not in ("pdf", "smd", "md", "mdzip") or not isinstance(mime, str)
+                    or fmt not in ("pdf", "smd", "md") or not isinstance(mime, str)
                     or not isinstance(total, int) or isinstance(total, bool) or total < 0
                     or not isinstance(expected_hash, str) or not re.fullmatch(r"[0-9a-f]{64}", expected_hash)
                     or chunk.get("offset") != offset):

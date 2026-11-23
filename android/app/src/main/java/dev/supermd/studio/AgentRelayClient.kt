@@ -263,7 +263,7 @@ class AgentRelayClient(private val onState: (State) -> Unit = {}) {
         if (request.has("view")) require(request.getString("view") in setOf("source", "prose")) { "Invalid document view" }
         if (request.has("diagramId")) require(request.getString("diagramId").length in 1..100) { "Invalid diagram id" }
         if (request.has("jobId")) require(request.getString("jobId").length in 1..128) { "Invalid job id" }
-        if (request.has("format")) require(request.getString("format") in setOf("pdf", "smd", "md", "mdzip")) { "Invalid export format" }
+        if (request.has("format")) require(request.getString("format") in setOf("pdf", "smd", "md")) { "Invalid export format" }
         if (request.has("repairIndices")) {
             val indices = request.getJSONArray("repairIndices")
             val values = (0 until indices.length()).map { indices.optInt(it, -1) }

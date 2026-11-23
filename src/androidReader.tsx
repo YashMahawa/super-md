@@ -674,11 +674,11 @@ function Reader() {
           return response;
         }
         if(request.action==='export_document'){
-          const format=request.format;if(!['pdf','smd','md','mdzip'].includes(String(format)))throw Error('Export format must be pdf, smd, md or mdzip');
+          const format=request.format;if(!['pdf','smd','md'].includes(String(format)))throw Error('Export format must be pdf, smd or md');
           const suppliedOptions=request.options&&typeof request.options==='object'&&!Array.isArray(request.options)?request.options as Record<string,unknown>:{};
           const hasSection=Object.prototype.hasOwnProperty.call(suppliedOptions,'section'),section=hasSection?agentSectionForExport(note.content,suppliedOptions.section):undefined;
           const exportContent=section?.text??note.content,{section:_section,...exportOptions}=suppliedOptions;
-          const prepared=format==='pdf'?await preparePdf(exportContent,note.path,note.python||'embedded'):format==='smd'?await prepareFmd(exportContent,note.path):await prepareMarkdownExport(exportContent,note.path,{compatible:format==='mdzip',python:note.python||'embedded'});
+          const prepared=format==='pdf'?await preparePdf(exportContent,note.path,note.python||'embedded'):format==='smd'?await prepareFmd(exportContent,note.path):await prepareMarkdownExport(exportContent,note.path);
           if(reference.current?.id!==note.id||reference.current.content!==note.content)throw Error('Revision conflict: the note changed while preparing the export');
           const result=await invoke<Record<string,unknown>>('agent_export_native',{...prepared,id:note.id,expectedRevision:revision,requestId:request.requestId,format,filename:request.filename,options:exportOptions});
           return section?{...result,sectionStart:section.sectionStart,sectionEnd:section.sectionEnd,documentLength:section.documentLength}:result;

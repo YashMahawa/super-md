@@ -206,7 +206,7 @@ class MainActivity : ComponentActivity() {
     internal fun agentExportJob(jobId: String): JSONObject? = agentExportJobs[jobId]?.let { JSONObject(it.toString()) }
     internal suspend fun completeAgentExport(jobId: String, uri: android.net.Uri, fallbackName: String, format: String) = withContext(Dispatchers.IO) {
         require(agentExportJobs[jobId]?.optString("phase") in setOf("preparing", "saving")) { "This export job is not active in this app" }
-        require(format in setOf("pdf", "smd", "md", "mdzip")) { "Unsupported export format" }
+        require(format in setOf("pdf", "smd", "md")) { "Unsupported export format" }
         val (bytes, digest) = fingerprintAgentExport(uri)
         require(bytes > 0 || format == "md") { "The completed PDF or portable export is empty" }
         require(bytes <= MAX_AGENT_EXPORT_BYTES) { "Agent downloads are limited to 128 MiB per export" }
@@ -219,7 +219,7 @@ class MainActivity : ComponentActivity() {
         val filename = rawName.substringAfterLast('/').substringAfterLast('\\')
             .replace(Regex("[\\u0000-\\u001f\\u007f]"), "").take(256)
         require(filename.isNotBlank()) { "Android did not provide a valid export filename" }
-        val mimeType = when (format) { "pdf" -> "application/pdf"; "smd" -> "application/vnd.supermd.smd"; "mdzip" -> "application/zip"; else -> "text/markdown" }
+        val mimeType = when (format) { "pdf" -> "application/pdf"; "smd" -> "application/vnd.supermd.smd"; else -> "text/markdown" }
         val artifact = AgentExportArtifact(uri, filename, format, mimeType, bytes, digest, System.currentTimeMillis())
         agentExportArtifacts[jobId] = artifact
         agentExportJobs[jobId] = JSONObject().put("jobId", jobId).put("status", "completed").put("phase", "completed")
@@ -948,7 +948,7 @@ private object NoMotionScheme : MotionScheme {
             pendingAgentExport = safeArgs
             val jobId = args.optString("requestId")
             val format = args.optString("format", "pdf")
-            check(format in setOf("pdf", "smd", "md", "mdzip")) { "Unsupported export format" }
+            check(format in setOf("pdf", "smd", "md")) { "Unsupported export format" }
             val requestedName = args.optString("filename").takeIf { it.isNotBlank() }
                 ?: args.optString("id").takeIf { it.isNotBlank() } ?: state.active.name.substringBeforeLast('.')
             activity.updateAgentExportJob(jobId, "preparing")

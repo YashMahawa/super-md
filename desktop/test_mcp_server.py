@@ -244,9 +244,7 @@ class OfficialMCPClientTest(unittest.IsolatedAsyncioTestCase):
             def document_action(self, tab_id, action, **params):
                 self.actions.append((tab_id, action, params))
                 if action == "export_document":
-                    fmt = params.get("format", "pdf")
-                    ext = ".zip" if fmt == "mdzip" else f".{fmt}"
-                    return {"jobId": "job-1", "status": "running", "filename": f"Unsaved{ext}", "format": fmt}
+                    return {"jobId": "job-1", "status": "running", "filename": "Unsaved.pdf", "format": "pdf"}
                 if action == "job_status":
                     return {"jobId": params["job_id"], "status": "completed", "format": "pdf", "bytes": 100,
                             **({"tabId": "opened-tab", "revision": "f" * 64, "path": "/notes/open.md",
@@ -362,15 +360,6 @@ class OfficialMCPClientTest(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(live.actions[-1][2]["options"], {"section": "Unsaved"})
             status = await client.call_tool("document_action", {"action": "job_status", "job_id": job_id})
             self.assertEqual(status.structured_content["status"], "completed")
-            exported_zip = await client.call_tool("document_action", {"action": "export", "path": target,
-                                                                          "format": "mdzip", "expected_revision": "a" * 64,
-                                                                          "options": {"section": "Unsaved"}})
-            self.assertFalse(exported_zip.is_error, exported_zip.content)
-            self.assertEqual(exported_zip.structured_content["format"], "mdzip")
-            self.assertEqual(exported_zip.structured_content["filename"], "Unsaved.zip")
-            headless_zip = await client.call_tool("document_action", {"action": "export", "path": "replacement.svg",
-                                                                          "output_path": "out.zip", "format": "mdzip"})
-            self.assertTrue(headless_zip.is_error)
             created = await client.call_tool("document_action", {"action": "create_document", "content": "# New",
                                                                     "filename": "New.smd", "background": True})
             self.assertEqual(created.structured_content["tabId"], "new-tab")
