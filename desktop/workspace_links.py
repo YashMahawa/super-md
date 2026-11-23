@@ -9,11 +9,6 @@ import urllib.parse
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
 
-try:
-    from .agent_documents import _symlink_component
-except ImportError:
-    from agent_documents import _symlink_component
-
 NOTE_EXTENSIONS = (".md", ".smd", ".fmd", ".markdown", ".txt")
 _EXTENSION_PRIORITY = {ext: idx for idx, ext in enumerate(NOTE_EXTENSIONS)}
 _ENCODED_SEP = re.compile(r"%2f|%5c", re.IGNORECASE)
@@ -26,6 +21,43 @@ CACHE_TTL_SECONDS = 5.0
 
 class WorkspaceLinkError(ValueError):
     """User-facing non-destructive link resolution error."""
+
+
+def _is_link_or_junction(path: Path) -> bool:
+    try:
+        if path.is_symlink():
+            return True
+        is_junction = getattr(path, "is_junction", None)
+        if callable(is_junction) and is_junction():
+            return True
+    except OSError:
+        return False
+    return False
+
+
+def _is_entry_link_or_junction(entry: os.DirEntry[str]) -> bool:
+    try:
+        if entry.is_symlink():
+            return True
+        is_junction = getattr(entry, "is_junction", None)
+        if callable(is_junction) and is_junction():
+            return True
+    except OSError:
+        return True
+    return _is_link_or_junction(Path(entry.path))
+
+
+def _has_symlink_within(boundary: Path, candidate: Path) -> bool:
+    try:
+        rel = candidate.relative_to(boundary)
+    except ValueError:
+        return True
+    current = boundary
+    for part in rel.parts:
+        current = current / part
+        if _is_link_or_junction(current):
+            return True
+    return False
 
 
 @dataclass(frozen=True)
@@ -69,12 +101,13 @@ class WorkspaceLinkCache:
                 self._entries.clear()
                 return
             try:
-                key = str(Path(folder).resolve())
+                key = str(Path(os.path.abspath(Path(folder).expanduser())).resolve())
             except OSError:
                 key = str(folder)
             self._entries.pop(key, None)
 
-    def scan(self, boundary: Path) -> tuple[IndexedNote, ...]:
+    def scan(self, boundary: Path | str | os.PathLike[str]) -> tuple[IndexedNote, ...]:
+        boundary = _resolve_clean_directory(boundary, "workspace folder")
         key = str(boundary)
         now = time.monotonic()
         try:
@@ -112,7 +145,7 @@ class WorkspaceLinkCache:
                 if not name or name.startswith("."):
                     continue
                 try:
-                    if entry.is_symlink():
+                    if _is_entry_link_or_junction(entry):
                         continue
                     is_dir = entry.is_dir(follow_symlinks=False)
                     is_file = not is_dir and entry.is_file(follow_symlinks=False)
@@ -183,17 +216,51 @@ def _validate_target_syntax(raw_target: str) -> str:
     return cleaned
 
 
-def _resolve_clean_directory(raw_dir: Path, label: str) -> Path:
-    expanded = raw_dir.expanduser()
-    if _symlink_component(expanded):
+def _resolve_clean_directory(raw_dir: str | os.PathLike[str], label: str) -> Path:
+    supplied = Path(os.path.abspath(Path(raw_dir).expanduser()))
+    if _is_link_or_junction(supplied):
         raise WorkspaceLinkError(f"Symlink paths are not allowed for {label}.")
     try:
-        resolved = expanded.resolve(strict=True)
+        resolved = supplied.resolve(strict=True)
     except OSError as exc:
         raise WorkspaceLinkError(f"{label.capitalize()} is unavailable.") from exc
     if not resolved.is_dir():
         raise WorkspaceLinkError(f"{label.capitalize()} is not a folder.")
     return resolved
+
+
+def _resolve_note_directory(
+    note_raw: str | os.PathLike[str],
+    ws_boundary: Path | None,
+) -> Path:
+    note_supplied = Path(os.path.abspath(Path(note_raw).expanduser()))
+    if _is_link_or_junction(note_supplied):
+        raise WorkspaceLinkError("Symlink note paths are not allowed.")
+    parent_supplied = note_supplied.parent
+    if _is_link_or_junction(parent_supplied):
+        raise WorkspaceLinkError("Symlink note paths are not allowed.")
+    try:
+        note_dir = parent_supplied.resolve(strict=True)
+    except OSError as exc:
+        raise WorkspaceLinkError("Note folder is unavailable.") from exc
+    if not note_dir.is_dir():
+        raise WorkspaceLinkError("Note folder is not a folder.")
+
+    if ws_boundary is not None and (note_dir == ws_boundary or ws_boundary in note_dir.parents):
+        cur = parent_supplied
+        while True:
+            if _is_link_or_junction(cur):
+                raise WorkspaceLinkError("Symlink note paths are not allowed.")
+            try:
+                cur_resolved = cur.resolve(strict=True)
+            except OSError as exc:
+                raise WorkspaceLinkError("Note folder is unavailable.") from exc
+            if cur_resolved == ws_boundary:
+                break
+            if cur.parent == cur:
+                raise WorkspaceLinkError("Symlink note paths are not allowed.")
+            cur = cur.parent
+    return note_dir
 
 
 def _walk_within_boundary(base_dir: Path, rel_path: str, boundary: Path) -> Path:
@@ -210,7 +277,7 @@ def _walk_within_boundary(base_dir: Path, rel_path: str, boundary: Path) -> Path
             current = parent
         else:
             nxt = current / part
-            if nxt.is_symlink():
+            if _is_link_or_junction(nxt):
                 raise WorkspaceLinkError("Symlink note links are not allowed.")
             current = nxt
     if current != boundary and boundary not in current.parents:
@@ -225,7 +292,7 @@ def _probe_candidate(base_dir: Path, rel_path: str, boundary: Path) -> Path | No
     for candidate_rel in candidates:
         walked = _walk_within_boundary(base_dir, candidate_rel, boundary)
         try:
-            if walked.is_symlink():
+            if _is_link_or_junction(walked):
                 raise WorkspaceLinkError("Symlink note links are not allowed.")
             if walked.is_file() and walked.suffix.lower() in NOTE_EXTENSIONS:
                 resolved = walked.resolve(strict=True)
@@ -243,28 +310,32 @@ def resolve_workspace_link(
     target: str,
     *,
     wikilink: bool,
-    note_path: str,
-    workspace_folder: str,
+    note_path: str | os.PathLike[str] | None,
+    workspace_folder: str | os.PathLike[str] | None,
     cache: WorkspaceLinkCache,
 ) -> Path:
     """Resolve a relative Markdown link or [[wikilink]] safely within the workspace."""
     cleaned = _validate_target_syntax(target)
     is_explicit_relative = not wikilink or cleaned.startswith(("./", "../"))
+    has_note_path = bool(note_path and str(note_path))
+    has_workspace_folder = bool(workspace_folder and str(workspace_folder))
 
-    if not note_path and is_explicit_relative:
+    if not has_note_path and is_explicit_relative:
         raise WorkspaceLinkError("Save this draft before following relative note links.")
-    if not note_path and not workspace_folder:
+    if not has_note_path and not has_workspace_folder:
         raise WorkspaceLinkError("Save this draft or open a folder before following note links.")
 
-    note_dir: Path | None = None
-    if note_path:
-        note_file = Path(note_path).expanduser()
-        if _symlink_component(note_file):
-            raise WorkspaceLinkError("Symlink note paths are not allowed.")
-        note_dir = _resolve_clean_directory(note_file.parent, "note folder")
+    ws_boundary: Path | None = None
+    if has_workspace_folder:
+        assert workspace_folder is not None
+        ws_boundary = _resolve_clean_directory(workspace_folder, "workspace folder")
 
-    if workspace_folder:
-        ws_boundary = _resolve_clean_directory(Path(workspace_folder), "workspace folder")
+    note_dir: Path | None = None
+    if has_note_path:
+        assert note_path is not None
+        note_dir = _resolve_note_directory(note_path, ws_boundary)
+
+    if ws_boundary is not None:
         if note_dir is not None and note_dir != ws_boundary and ws_boundary not in note_dir.parents:
             boundary = note_dir
         else:
@@ -326,7 +397,7 @@ def resolve_workspace_link(
     matches.sort(key=lambda item: item[0])
     for _rank, winner in matches:
         candidate = winner.path
-        if _symlink_component(candidate):
+        if _has_symlink_within(boundary, candidate):
             continue
         try:
             resolved = candidate.resolve(strict=True)

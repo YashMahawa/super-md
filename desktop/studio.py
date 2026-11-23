@@ -770,6 +770,10 @@ class Studio(QObject):
         self.autosave_timer.stop()
         self.flush_timer.stop()
         self.external_timer.stop()
+        for watcher in (self.note_watcher, self.palette_watcher, self.custom_theme_watcher):
+            watched_paths = watcher.files() + watcher.directories()
+            if watched_paths:
+                watcher.removePaths(watched_paths)
         self._recover()
         self.session.reader_assets.revoke_owner(self.window_id)
         self._retired = True
@@ -3284,7 +3288,15 @@ class Studio(QObject):
                 doc_ref = args.get("documentPath", "")
                 if not isinstance(raw_target, str) or len(raw_target) > 4096 or not isinstance(raw_fragment, str) or len(raw_fragment) > 1024:
                     raise ValueError("Invalid workspace link")
-                source_tab = next((item for item in self.tabs if doc_ref and doc_ref in (item["id"], item["path"])), None) or tab
+                source_tab = next((item for item in self.tabs if doc_ref and doc_ref in (item["id"], item["path"])), None)
+                if source_tab is None and isinstance(doc_ref, str) and doc_ref:
+                    try:
+                        canonical_ref = str(local_path(doc_ref))
+                    except OSError:
+                        canonical_ref = ""
+                    if canonical_ref:
+                        source_tab = next((item for item in self.tabs if item["path"] == canonical_ref), None)
+                source_tab = source_tab or tab
                 note_path = source_tab["path"]
                 folder = self.folder
                 # Preserve unsaved edits in the current tab and durably snapshot recovery;
