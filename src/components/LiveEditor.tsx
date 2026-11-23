@@ -9,12 +9,14 @@ import type {ReaderAccessibilityPreference} from '../types';
 import WritingSuggestions from './WritingSuggestions';
 import {repairPastedMath} from '../mathRepair';
 import {editableBlockSpans,indentMarkdownSelection,isFirstLineCursor,isLastLineCursor} from '../liveBlockFlow';
+import {liveEditorCenterDelta,useTypewriterScroll} from '../typewriterScroll';
 const noTrustedHosts:string[]=[];
 export type {SourceBlock} from '../documentAnalysis';
 export function splitMarkdownBlocks(markdown:string):SourceBlock[]{return analyzeDocument(markdown).blocks;}
 
 interface Props extends WritingOptions,ReaderAccessibilityPreference {
   latexAutofix?:boolean;
+  typewriterScroll?:boolean;
   markdown:string;onChange:(value:string)=>void;documentPath:string|null;python:string;dark:boolean;
   trustedImageHosts?:string[];onTrustImageHost?:(host:string)=>void;
 }
@@ -32,11 +34,13 @@ interface Editing {
 
 /** One document render preserves references, footnote numbering, duplicate
  * heading IDs and loose lists. Substitute one original-source editing block. */
-export default function LiveEditor({markdown,onChange,documentPath,python,dark,trustedImageHosts=noTrustedHosts,onTrustImageHost,spellCheck=false,grammarCheck=false,latexAutofix=false,fullDocumentAccessibility=false}:Props){
+export default function LiveEditor({markdown,onChange,documentPath,python,dark,trustedImageHosts=noTrustedHosts,onTrustImageHost,spellCheck=false,grammarCheck=false,latexAutofix=false,typewriterScroll,fullDocumentAccessibility=false}:Props){
   const [editing,setEditing]=useState<Editing|null>(null);
   const editingRef=useRef(editing);editingRef.current=editing;
   const markdownRef=useRef(markdown);markdownRef.current=markdown;
-  const sessionCounter=useRef(0);
+  const activeTypewriter=useTypewriterScroll(typewriterScroll);
+  const sessionCounter=useRef(0),lastHandledSession=useRef(0);
+  const appliedTypewriter=useRef(false),typingFrame=useRef(0);
   const anchorTop=useRef<number|null>(null),editor=useRef<HTMLTextAreaElement>(null),rootRef=useRef<HTMLDivElement>(null);
   const pendingSelection=useRef<{start:number;end:number}|null>(null);
   const pendingBlockFocus=useRef<{offset:number}|'end'|null>(null);
@@ -76,7 +80,28 @@ export default function LiveEditor({markdown,onChange,documentPath,python,dark,t
   handlersRef.current={openBlock,appendTrailingBlock};
 
   useLayoutEffect(()=>{
+    const doc=rootRef.current;if(!doc)return;
+    const scroller=doc.closest<HTMLElement>('.android-reading,.reading-scroll,.preview-pane,.live-scroll');
+    const beforePad=Number.parseFloat(getComputedStyle(doc).paddingTop)||0;
+    const syncPad=()=>{
+      if(!scroller||scroller.clientHeight<=0)return;
+      doc.style.setProperty('--live-typewriter-pad',`${Math.max(24,Math.floor(scroller.clientHeight/2))}px`);
+    };
+    if(activeTypewriter){doc.dataset.typewriter='true';syncPad();}
+    else{delete doc.dataset.typewriter;doc.style.removeProperty('--live-typewriter-pad');}
+    const afterPad=Number.parseFloat(getComputedStyle(doc).paddingTop)||0;
+    if(appliedTypewriter.current!==activeTypewriter){
+      appliedTypewriter.current=activeTypewriter;
+      if(scroller&&afterPad!==beforePad)scroller.scrollTop=Math.max(0,scroller.scrollTop+(afterPad-beforePad));
+    }
+    if(!activeTypewriter||!scroller||typeof ResizeObserver==='undefined')return;
+    const observer=new ResizeObserver(syncPad);observer.observe(scroller);
+    return()=>observer.disconnect();
+  },[activeTypewriter]);
+
+  useLayoutEffect(()=>{
     if(!editing){
+      lastHandledSession.current=0;
       const target=pendingBlockFocus.current;
       if(target!==null){
         pendingBlockFocus.current=null;
@@ -88,30 +113,81 @@ export default function LiveEditor({markdown,onChange,documentPath,python,dark,t
       }
       return;
     }
-    window.dispatchEvent(new CustomEvent('supermd-live-edit-opened'));
+    const isNewSession=lastHandledSession.current!==editing.session;
+    lastHandledSession.current=editing.session;
+    if(isNewSession)window.dispatchEvent(new CustomEvent('supermd-live-edit-opened'));
     const area=editor.current;if(!area)return;
     const scroller=area.closest<HTMLElement>('.android-reading,.reading-scroll,.preview-pane,.live-scroll');
     const anchor=anchorTop.current;anchorTop.current=null;
     const sel=pendingSelection.current;pendingSelection.current=null;
-    area.focus({preventScroll:true});
+    if(isNewSession||document.activeElement!==area)area.focus({preventScroll:true});
     if(sel)area.setSelectionRange(Math.min(sel.start,area.value.length),Math.min(sel.end,area.value.length));
-    if(anchor===null){
-      if(scroller){
-        const box=area.getBoundingClientRect(),view=scroller.getBoundingClientRect();
-        if(view.height>0&&(box.bottom>view.bottom-24||box.top<view.top+24)){
-          scroller.scrollTop+=box.top<view.top+24?box.top-view.top-32:box.bottom-view.bottom+48;
+    if(!activeTypewriter){
+      if(!isNewSession)return;
+      if(anchor===null){
+        if(scroller){
+          const box=area.getBoundingClientRect(),view=scroller.getBoundingClientRect();
+          if(view.height>0&&(box.bottom>view.bottom-24||box.top<view.top+24)){
+            scroller.scrollTop+=box.top<view.top+24?box.top-view.top-32:box.bottom-view.bottom+48;
+          }
         }
+        return;
       }
-      return;
+      const hold=()=>{const delta=area.getBoundingClientRect().top-anchor;if(scroller&&Math.abs(delta)>.5)scroller.scrollTop+=delta;};
+      hold();
+      let frames=0,frame=0,stopped=false;const stop=()=>{stopped=true;};
+      const inputs=['wheel','touchstart','keydown'] as const;
+      inputs.forEach(name=>window.addEventListener(name,stop,{capture:true,passive:true}));
+      const tick=()=>{if(stopped||!area.isConnected)return;hold();if(++frames<24)frame=requestAnimationFrame(tick);};frame=requestAnimationFrame(tick);
+      return()=>{cancelAnimationFrame(frame);inputs.forEach(name=>window.removeEventListener(name,stop,{capture:true}));};
     }
-    const hold=()=>{const delta=area.getBoundingClientRect().top-anchor;if(scroller&&Math.abs(delta)>.5)scroller.scrollTop+=delta;};
-    hold();
-    let frames=0,frame=0,stopped=false;const stop=()=>{stopped=true;};
-    const inputs=['wheel','touchstart','keydown'] as const;
+    if(anchor!==null&&scroller){
+      const initialDelta=area.getBoundingClientRect().top-anchor;
+      if(Math.abs(initialDelta)>.5)scroller.scrollTop+=initialDelta;
+    }
+    if(!scroller)return;
+    const reducedMotion=document.documentElement.dataset.motion==='off'||document.documentElement.dataset.reduceMotion==='true'||(typeof window.matchMedia==='function'&&window.matchMedia('(prefers-reduced-motion: reduce)').matches);
+    if(reducedMotion){
+      const align=()=>{const delta=liveEditorCenterDelta(area,scroller,false);if(Math.abs(delta)>.5)scroller.scrollTop+=delta;};
+      align();
+      let frames=0,frame=0,stopped=false;const stop=()=>{stopped=true;};
+      const inputs=['wheel','touchstart'] as const;
+      inputs.forEach(name=>window.addEventListener(name,stop,{capture:true,passive:true}));
+      const tick=()=>{if(stopped||!area.isConnected)return;align();if(++frames<12)frame=requestAnimationFrame(tick);};frame=requestAnimationFrame(tick);
+      return()=>{cancelAnimationFrame(frame);inputs.forEach(name=>window.removeEventListener(name,stop,{capture:true}));};
+    }
+    let frames=0,frame=0,stopped=false,lastTime=performance.now();const stop=()=>{stopped=true;};
+    const inputs=['wheel','touchstart'] as const;
     inputs.forEach(name=>window.addEventListener(name,stop,{capture:true,passive:true}));
-    const tick=()=>{if(stopped||!area.isConnected)return;hold();if(++frames<24)frame=requestAnimationFrame(tick);};frame=requestAnimationFrame(tick);
+    const glide=(now:number)=>{
+      if(stopped||!area.isConnected)return;
+      const elapsed=Math.max(8,Math.min(50,now-lastTime));lastTime=now;
+      const delta=liveEditorCenterDelta(area,scroller,false);
+      if(Math.abs(delta)<=.75){
+        if(Math.abs(delta)>.1)scroller.scrollTop+=delta;
+        if(++frames<24)frame=requestAnimationFrame(glide);
+        return;
+      }
+      scroller.scrollTop+=delta*(1-Math.pow(.55,elapsed/(1000/60)));
+      if(++frames<36)frame=requestAnimationFrame(glide);
+    };
+    frame=requestAnimationFrame(glide);
     return()=>{cancelAnimationFrame(frame);inputs.forEach(name=>window.removeEventListener(name,stop,{capture:true}));};
-  },[editing?.session]);
+  },[editing?.session,activeTypewriter]);
+
+  useEffect(()=>()=>{if(typingFrame.current)cancelAnimationFrame(typingFrame.current);},[]);
+  const syncActiveCaretCenter=()=>{
+    if(!activeTypewriter)return;
+    if(typingFrame.current)cancelAnimationFrame(typingFrame.current);
+    typingFrame.current=requestAnimationFrame(()=>{
+      typingFrame.current=0;
+      const area=editor.current;if(!area||!area.isConnected)return;
+      const scroller=area.closest<HTMLElement>('.android-reading,.reading-scroll,.preview-pane,.live-scroll');
+      if(!scroller)return;
+      const delta=liveEditorCenterDelta(area,scroller,area.value.includes('\n'));
+      if(Math.abs(delta)>1)scroller.scrollTop+=delta;
+    });
+  };
 
   useEffect(()=>{
     const active=editingRef.current;
@@ -161,14 +237,15 @@ export default function LiveEditor({markdown,onChange,documentPath,python,dark,t
       const nextState={...active,text:'',syncedMarkdown:active.baseMarkdown};
       editingRef.current=nextState;setEditing(nextState);
       if(changed)onChange(active.baseMarkdown);
+      syncActiveCaretCenter();
       return;
     }
     const nextMarkdown=active.prefix+text+active.suffix;
     const nextState={...active,text,syncedMarkdown:nextMarkdown};
     editingRef.current=nextState;setEditing(nextState);
     onChange(nextMarkdown);
+    syncActiveCaretCenter();
   };
-
   const paste=(event:ClipboardEvent<HTMLTextAreaElement>)=>{
     if(!latexAutofix||!editing||event.defaultPrevented||event.clipboardData.files.length)return;
     const area=event.currentTarget,from=area.selectionStart,to=area.selectionEnd;
@@ -182,7 +259,6 @@ export default function LiveEditor({markdown,onChange,documentPath,python,dark,t
     // If unavailable, leave the original paste to the platform without loss.
     try {if(document.execCommand('insertText',false,repaired))event.preventDefault();}catch{/* Preserve native paste. */}
   };
-
   const onEditorKeyDown=(event:ReactKeyboardEvent<HTMLTextAreaElement>)=>{
     const active=editingRef.current;if(!active)return;
     const area=event.currentTarget;
@@ -247,7 +323,7 @@ export default function LiveEditor({markdown,onChange,documentPath,python,dark,t
 
   const textarea=()=>{
     const activeSession=editing!.session;
-    return <div className="live-active-block"><textarea ref={editor} data-source-start={editing!.prefix.length} spellCheck={false} value={editing!.text} style={{height:Math.max(120,editing!.text.split('\n').length*27+32)}} onPaste={paste} onChange={event=>update(event.target.value)} onKeyDown={onEditorKeyDown} onBlur={event=>{if(!event.currentTarget.isConnected)return;if(!event.relatedTarget||!event.currentTarget.parentElement?.contains(event.relatedTarget))setEditing(current=>current?.session===activeSession?null:current);}} aria-label="Edit Markdown block"/><WritingSuggestions text={editing!.text} spellCheck={spellCheck} grammarCheck={grammarCheck} onChange={update}/></div>;
+    return <div className="live-active-block"><textarea ref={editor} data-source-start={editing!.prefix.length} spellCheck={false} value={editing!.text} style={{height:Math.max(120,editing!.text.split('\n').length*27+32)}} onPaste={paste} onChange={event=>update(event.target.value)} onKeyUp={event=>{if(['ArrowUp','ArrowDown','PageUp','PageDown','Home','End'].includes(event.key))syncActiveCaretCenter();}} onKeyDown={onEditorKeyDown} onBlur={event=>{if(!event.currentTarget.isConnected)return;if(!event.relatedTarget||!event.currentTarget.parentElement?.contains(event.relatedTarget))setEditing(current=>current?.session===activeSession?null:current);}} aria-label="Edit Markdown block"/><WritingSuggestions text={editing!.text} spellCheck={spellCheck} grammarCheck={grammarCheck} onChange={update}/></div>;
   };
   const currentOffset=(offset:number)=>editing&&offset>=editing.baseSplitEnd?offset+editing.syncedMarkdown.length-editing.baseMarkdown.length:offset;
   const renderBlock=(entry:RenderedMarkdownBlock)=>{
