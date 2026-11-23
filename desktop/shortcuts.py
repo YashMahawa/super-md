@@ -40,6 +40,7 @@ def _definition_rows(platform: str) -> tuple[tuple[str, str, list[str]], ...]:
         ("zoom_in", "Zoom in", [f"{primary}++", f"{primary}+="]),
         ("zoom_out", "Zoom out", [f"{primary}+-"]),
         ("zoom_reset", "Reset zoom", [f"{primary}+0"]),
+        ("typewriter_scroll", "Toggle typewriter scrolling", [f"{primary}+Alt+T"]),
     )
 
 
