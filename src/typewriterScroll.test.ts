@@ -1,7 +1,10 @@
 // @vitest-environment jsdom
 import { beforeEach, describe, expect, it } from "vitest";
 import { Compartment, EditorSelection, EditorState, Transaction } from "@codemirror/state";
-import { EditorView } from "@codemirror/view";
+import { EditorView, keymap } from "@codemirror/view";
+import { deleteCharBackward, deleteCharForward, history, isolateHistory, redo, undo } from "@codemirror/commands";
+import { markdown, markdownLanguage } from "@codemirror/lang-markdown";
+import { editorKeyBindings } from "./components/Editor";
 import {
   TYPEWRITER_SHORTCUT,
   TYPEWRITER_STORAGE_KEY,
@@ -11,9 +14,24 @@ import {
   setTypewriterScroll,
   shouldCenterTypewriterTransaction,
   subscribeTypewriterScroll,
+  syncTypewriterFromStorage,
   toggleTypewriterScroll,
   typewriterScrollExtension,
 } from "./typewriterScroll";
+
+if (typeof Range !== "undefined") {
+  if (!Range.prototype.getClientRects) {
+    Range.prototype.getClientRects = () =>
+      ({
+        length: 0,
+        item: () => null,
+        [Symbol.iterator]: function* () {},
+      }) as unknown as DOMRectList;
+  }
+  if (!Range.prototype.getBoundingClientRect) {
+    Range.prototype.getBoundingClientRect = () => new DOMRect(0, 0, 0, 20);
+  }
+}
 
 describe("typewriterScroll store and shortcuts", () => {
   beforeEach(() => {
@@ -21,14 +39,37 @@ describe("typewriterScroll store and shortcuts", () => {
     setTypewriterScroll(false);
   });
 
-  it("defaults to false, notifies subscribers, and persists unless persist:false", () => {
+  it("defaults to false for both brand-new and existing users, persists opt-in state, and syncs across windows", () => {
+    localStorage.clear();
+    expect(syncTypewriterFromStorage()).toBe(false);
     expect(getTypewriterScroll()).toBe(false);
+
+    // Simulate an existing user upgrading from an earlier release with populated preferences but no editor.typewriter key.
+    localStorage.setItem("setup.complete", "true");
+    localStorage.setItem("theme.normal", "dark");
+    localStorage.setItem("autosave", "true");
+    localStorage.setItem("editor.size", "16");
+    localStorage.setItem("reader.font", "serif");
+    localStorage.setItem(
+      "workspace.tabs.browser",
+      JSON.stringify({ activeId: "t1", tabs: [{ id: "t1", name: "Notes.md", path: null, content: "# Existing", savedContent: "# Existing" }], recentlyClosed: [] }),
+    );
+    expect(syncTypewriterFromStorage()).toBe(false);
+    expect(getTypewriterScroll()).toBe(false);
+
+    // Invalid or non-boolean storage strings must never enable typewriter mode.
+    for (const invalid of ["yes", "1", "false", ""]) {
+      localStorage.setItem(TYPEWRITER_STORAGE_KEY, invalid);
+      expect(syncTypewriterFromStorage()).toBe(false);
+    }
+
     const events: boolean[] = [];
     const unsubscribe = subscribeTypewriterScroll(() => events.push(getTypewriterScroll()));
 
     expect(toggleTypewriterScroll()).toBe(true);
     expect(getTypewriterScroll()).toBe(true);
     expect(localStorage.getItem(TYPEWRITER_STORAGE_KEY)).toBe("true");
+    expect(syncTypewriterFromStorage()).toBe(true);
     expect(events).toEqual([true]);
 
     setTypewriterScroll(false, { persist: false });
@@ -36,9 +77,16 @@ describe("typewriterScroll store and shortcuts", () => {
     expect(localStorage.getItem(TYPEWRITER_STORAGE_KEY)).toBe("true");
     expect(events).toEqual([true, false]);
 
+    // Cross-window StorageEvent synchronization.
+    window.dispatchEvent(new StorageEvent("storage", { key: TYPEWRITER_STORAGE_KEY, newValue: "true" }));
+    expect(getTypewriterScroll()).toBe(true);
+    window.dispatchEvent(new StorageEvent("storage", { key: TYPEWRITER_STORAGE_KEY, newValue: "false" }));
+    expect(getTypewriterScroll()).toBe(false);
+    expect(events).toEqual([true, false, true, false]);
+
     unsubscribe();
     setTypewriterScroll(true);
-    expect(events).toEqual([true, false]);
+    expect(events).toEqual([true, false, true, false]);
   });
 
   it("recognizes Mod+Alt+T without clashing with Ctrl+Shift+T reopen tab", () => {
@@ -179,3 +227,319 @@ describe("liveEditorCenterDelta with custom line heights and scaling", () => {
     area.remove();
   });
 });
+
+describe("Document text, cursor, selection, IME composition, and undo/redo exact equivalence", () => {
+  it("produces identical document text and selection ranges across typing, multi-range selection, IME composition, and undo/redo with typewriter ON vs OFF", () => {
+    const realisticStudyMarkdown = [
+      "---",
+      "title: Electrodynamics & Unicode Field Notes",
+      "tags: [maxwell, 日本語, 中文, עברית, 🧪🔬🚀]",
+      "---",
+      "",
+      "# 1. Maxwell–Faraday Induction & Boundary Conditions",
+      "",
+      "Consider Cafe\u0301-frame flux linkage through surface $\\Sigma$ bounded by $\\partial\\Sigma$:",
+      "",
+      "$$",
+      "\\oint_{\\partial\\Sigma} \\mathbf{E} \\cdot d\\boldsymbol{\\ell} = -\\frac{d}{dt} \\iint_{\\Sigma} \\mathbf{B} \\cdot d\\mathbf{A}",
+      "$$",
+      "",
+      "| Law | Differential Form | Status |",
+      "| :--- | :---: | ---: |",
+      "| Gauss | $\\nabla \\cdot \\mathbf{E} = \\rho / \\varepsilon_0$ | Verified 🧪 |",
+      "| Ampère–Maxwell | $\\nabla \\times \\mathbf{B} = \\mu_0\\mathbf{J} + \\mu_0\\varepsilon_0\\partial_t\\mathbf{E}$ | Draft 🚀 |",
+      "",
+      "```python",
+      "def energy_density(E: float, B: float, eps0: float = 8.854e-12, mu0: float = 1.2566e-6) -> float:",
+      "    return 0.5 * (eps0 * E**2 + (B**2) / mu0)",
+      "```",
+      "",
+      "- [x] Check boundary continuity $\\hat{\\mathbf{n}} \\times (\\mathbf{E}_2 - \\mathbf{E}_1) = \\mathbf{0}$",
+      "- [ ] Add relativistic tensor $\\partial_\\mu F^{\\mu\\nu} = \\mu_0 J^\\nu$ notes",
+    ].join("\n");
+
+    const offHost = document.createElement("div");
+    const onHost = document.createElement("div");
+    document.body.append(offHost, onHost);
+
+    const offCompartment = new Compartment();
+    const onCompartment = new Compartment();
+
+    const makeView = (parent: HTMLElement, compartment: Compartment, enabled: boolean) =>
+      new EditorView({
+        parent,
+        state: EditorState.create({
+          doc: realisticStudyMarkdown,
+          extensions: [
+            history({ minDepth: 100 }),
+            markdown({ base: markdownLanguage }),
+            EditorView.lineWrapping,
+            EditorState.allowMultipleSelections.of(true),
+            keymap.of(editorKeyBindings("browser")),
+            compartment.of(typewriterScrollExtension(enabled)),
+          ],
+        }),
+      });
+
+    const offView = makeView(offHost, offCompartment, false);
+    const onView = makeView(onHost, onCompartment, true);
+
+    const snapshotRanges = (view: EditorView) =>
+      view.state.selection.ranges.map((range) => ({
+        anchor: range.anchor,
+        head: range.head,
+        from: range.from,
+        to: range.to,
+        assoc: range.assoc,
+      }));
+
+    const assertIdentical = (step: string) => {
+      expect(onView.state.doc.toString(), `doc mismatch at ${step}`).toBe(offView.state.doc.toString());
+      expect(onView.state.selection.toJSON(), `selection JSON mismatch at ${step}`).toEqual(offView.state.selection.toJSON());
+      expect(snapshotRanges(onView), `selection ranges mismatch at ${step}`).toEqual(snapshotRanges(offView));
+    };
+
+    const runBoth = (step: string, action: (view: EditorView) => void) => {
+      action(offView);
+      action(onView);
+      assertIdentical(step);
+    };
+
+    try {
+      assertIdentical("initial mount");
+
+      // 1. Type multiline Markdown + inline LaTeX inside prose, then delete backward & forward.
+      runBoth("move cursor into prose paragraph", (view) => {
+        const target = view.state.doc.toString().indexOf("bounded by $\\partial\\Sigma$:");
+        view.dispatch({
+          selection: EditorSelection.cursor(target + "bounded by $\\partial\\Sigma$:".length),
+          scrollIntoView: true,
+          userEvent: "select",
+        });
+      });
+
+      for (const ch of "\nWhere the induced EMF satisfies $\\mathcal{E} = -N\\,\\Delta\\Phi_B / \\Delta t$!X") {
+        runBoth(`type char ${JSON.stringify(ch)}`, (view) => {
+          const head = view.state.selection.main.head;
+          view.dispatch({
+            changes: { from: head, to: head, insert: ch },
+            selection: EditorSelection.cursor(head + ch.length),
+            userEvent: "input.type",
+          });
+        });
+      }
+
+      runBoth("deleteCharBackward on trailing X", (view) => {
+        expect(deleteCharBackward(view)).toBe(true);
+      });
+
+      runBoth("step left and deleteCharForward on !", (view) => {
+        const head = view.state.selection.main.head;
+        view.dispatch({ selection: EditorSelection.cursor(head - 1), scrollIntoView: true, userEvent: "select" });
+        expect(deleteCharForward(view)).toBe(true);
+      });
+
+      // 2. Forward selection, backward selection (anchor > head), and pointer selection.
+      runBoth("forward selection across table formula", (view) => {
+        const text = view.state.doc.toString();
+        const from = text.indexOf("Draft 🚀");
+        view.dispatch({
+          selection: EditorSelection.range(from, from + "Draft 🚀".length),
+          scrollIntoView: true,
+          userEvent: "select",
+        });
+      });
+
+      runBoth("replace forward selection with Verified", (view) => {
+        view.dispatch({
+          ...view.state.replaceSelection("Verified 🔬✅"),
+          scrollIntoView: true,
+          userEvent: "input.type",
+        });
+      });
+
+      runBoth("backward selection (anchor > head) inside Python block", (view) => {
+        const text = view.state.doc.toString();
+        const start = text.indexOf("eps0: float = 8.854e-12");
+        const end = start + "eps0: float = 8.854e-12".length;
+        view.dispatch({
+          selection: EditorSelection.range(end, start),
+          scrollIntoView: true,
+          userEvent: "select",
+        });
+      });
+
+      runBoth("pointer selection must also preserve identical range", (view) => {
+        const text = view.state.doc.toString();
+        const start = text.indexOf("0.5 * (eps0 * E**2");
+        view.dispatch({
+          selection: EditorSelection.range(start + 18, start),
+          scrollIntoView: true,
+          userEvent: "select.pointer",
+        });
+      });
+
+      // 3. Multi-cursor selection across 3 distinct regions (YAML, table, task list) + simultaneous edits.
+      runBoth("set 3-cursor selection", (view) => {
+        const text = view.state.doc.toString();
+        const p1 = text.indexOf("maxwell") + "maxwell".length;
+        const p2 = text.indexOf("Gauss") + "Gauss".length;
+        const p3 = text.indexOf("notes", text.lastIndexOf("- [ ]")) + "notes".length;
+        view.dispatch({
+          selection: EditorSelection.create(
+            [EditorSelection.cursor(p1), EditorSelection.cursor(p2), EditorSelection.cursor(p3)],
+            2,
+          ),
+          scrollIntoView: true,
+          userEvent: "select",
+        });
+      });
+
+      runBoth("simultaneous 3-cursor insert", (view) => {
+        view.dispatch({
+          ...view.state.changeByRange((range) => ({
+            changes: { from: range.from, to: range.to, insert: "_v2" },
+            range: EditorSelection.cursor(range.from + 3),
+          })),
+          scrollIntoView: true,
+          userEvent: "input.type",
+        });
+      });
+
+      runBoth("simultaneous 3-cursor backspace", (view) => {
+        expect(deleteCharBackward(view)).toBe(true);
+      });
+
+      // 4. Realistic multi-stage IME compositions (Japanese Kana->Kanji, Chinese Pinyin, dead-key accent, cancelled IME, emoji-adjacent replacement).
+      const runImeCycle = (label: string, stages: Array<{ text: string; caretOffset?: number }>) => {
+        let compStart = -1;
+        let prevLen = 0;
+        stages.forEach((stage, idx) => {
+          runBoth(`${label} stage ${idx + 1}: ${JSON.stringify(stage.text)}`, (view) => {
+            const from = idx === 0 ? view.state.selection.main.from : compStart;
+            const to = idx === 0 ? view.state.selection.main.to : compStart + prevLen;
+            const caret = from + (stage.caretOffset ?? stage.text.length);
+            view.dispatch({
+              changes: { from, to, insert: stage.text },
+              selection: EditorSelection.cursor(caret),
+              annotations: idx === 0 ? isolateHistory.of("before") : [],
+              scrollIntoView: true,
+              userEvent: "input.type.compose",
+            });
+          });
+          if (idx === 0) compStart = offView.state.selection.main.head - (stage.caretOffset ?? stage.text.length);
+          prevLen = stage.text.length;
+        });
+      };
+
+      runBoth("place cursor at end of document for IME", (view) => {
+        const end = view.state.doc.length;
+        view.dispatch({
+          selection: EditorSelection.cursor(end),
+          scrollIntoView: true,
+          userEvent: "select",
+        });
+        const nextEnd = view.state.doc.length;
+        view.dispatch({
+          changes: { from: nextEnd, insert: "\n\n## 2. Multilingual & IME Notes: " },
+          selection: EditorSelection.cursor(nextEnd + "\n\n## 2. Multilingual & IME Notes: ".length),
+          annotations: isolateHistory.of("before"),
+          userEvent: "input.type",
+        });
+      });
+
+      // Japanese Romaji -> Kana -> clause focus -> Kanji conversion
+      runImeCycle("Japanese IME", [
+        { text: "d" },
+        { text: "でん" },
+        { text: "でんじゆうどう", caretOffset: 3 },
+        { text: "電磁誘導の法則" },
+      ]);
+
+      runBoth("insert separator", (view) => {
+        const pos = view.state.selection.main.head;
+        view.dispatch({ changes: { from: pos, insert: " · " }, selection: EditorSelection.cursor(pos + 3), userEvent: "input.type" });
+      });
+
+      // Chinese Pinyin multi-syllable composition
+      runImeCycle("Chinese Pinyin IME", [
+        { text: "mai" },
+        { text: "maikesuowei" },
+        { text: "麦克斯韦方程组" },
+      ]);
+
+      // Dead-key accent composition ("´" -> "é")
+      runBoth("space before dead-key", (view) => {
+        const pos = view.state.selection.main.head;
+        view.dispatch({ changes: { from: pos, insert: " Amp" }, selection: EditorSelection.cursor(pos + 4), userEvent: "input.type" });
+      });
+      runImeCycle("Dead-key accent IME", [{ text: "´" }, { text: "è" }]);
+      runBoth("finish Ampère word", (view) => {
+        const pos = view.state.selection.main.head;
+        view.dispatch({ changes: { from: pos, insert: "re " }, selection: EditorSelection.cursor(pos + 3), userEvent: "input.type" });
+      });
+
+      // Cancelled IME composition (preedit inserted then cleared on Escape)
+      runImeCycle("Cancelled RTL IME", [{ text: "טיו" }, { text: "טיוטה" }, { text: "" }]);
+
+      // IME composition replacing a backward selection right after surrogate-pair emojis 🧪🔬🚀
+      runBoth("select backward adjacent to surrogate-pair emojis", (view) => {
+        const text = view.state.doc.toString();
+        const emojiIdx = text.indexOf("🧪🔬🚀");
+        const afterEmoji = emojiIdx + "🧪🔬🚀".length;
+        view.dispatch({
+          selection: EditorSelection.range(emojiIdx + "🧪🔬".length, emojiIdx),
+          scrollIntoView: true,
+          userEvent: "select",
+        });
+        expect(afterEmoji).toBeGreaterThan(emojiIdx);
+      });
+      runImeCycle("Emoji-replacing IME", [{ text: "じっけん" }, { text: "実験🧪" }]);
+
+      // 5. Toggle typewriter compartment off and back on mid-session on onView while offView stays off.
+      onView.dispatch({ effects: onCompartment.reconfigure(typewriterScrollExtension(false)) });
+      assertIdentical("after disabling typewriter compartment mid-session");
+      runBoth("type while compartment toggled off", (view) => {
+        const pos = view.state.selection.main.head;
+        view.dispatch({ changes: { from: pos, insert: " [sync]" }, selection: EditorSelection.cursor(pos + 7), userEvent: "input.type" });
+      });
+      onView.dispatch({ effects: onCompartment.reconfigure(typewriterScrollExtension(true)) });
+      assertIdentical("after re-enabling typewriter compartment mid-session");
+
+      // 6. Exhaustive undo() back to initial document and redo() forward, verifying doc + selection at every step.
+      const finalEditedDoc = offView.state.doc.toString();
+      expect(finalEditedDoc).not.toBe(realisticStudyMarkdown);
+
+      let undoCount = 0;
+      while (true) {
+        const offUndid = undo(offView);
+        const onUndid = undo(onView);
+        expect(onUndid, `undo return value mismatch at step ${undoCount + 1}`).toBe(offUndid);
+        assertIdentical(`undo step ${undoCount + 1}`);
+        if (!offUndid) break;
+        undoCount++;
+      }
+      expect(undoCount).toBeGreaterThanOrEqual(5);
+      expect(onView.state.doc.toString()).toBe(realisticStudyMarkdown);
+
+      let redoCount = 0;
+      while (true) {
+        const offRedid = redo(offView);
+        const onRedid = redo(onView);
+        expect(onRedid, `redo return value mismatch at step ${redoCount + 1}`).toBe(offRedid);
+        assertIdentical(`redo step ${redoCount + 1}`);
+        if (!offRedid) break;
+        redoCount++;
+      }
+      expect(redoCount).toBe(undoCount);
+      expect(onView.state.doc.toString()).toBe(finalEditedDoc);
+      expect(onView.state.selection.toJSON()).toEqual(offView.state.selection.toJSON());
+    } finally {
+      offView.destroy();
+      onView.destroy();
+      offHost.remove();
+      onHost.remove();
+    }
+  });
+});
+

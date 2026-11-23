@@ -88,6 +88,32 @@ class TypewriterScrollTest {
         idleUntil { !first.state.value.typewriterScroll }
     }
 
+    @Test fun existingUserPreferencesAndRecoverySnapshotDefaultTypewriterScrollOff() {
+        val prefs = app.getSharedPreferences("studio", Context.MODE_PRIVATE)
+        prefs.edit()
+            .putBoolean("welcomed", true)
+            .putBoolean("autosave", true)
+            .putString("theme", "dark")
+            .putString("font", "Noto Serif")
+            .remove("typewriterScroll")
+            .commit()
+        val key = "typewriter-existing-${System.nanoTime()}".also(workspaceKeys::add)
+        val workspaceDir = File(app.filesDir, "workspaces/$key").apply { mkdirs() }
+        val seededState = StudioState(
+            welcomed = true,
+            tabs = listOf(Note(id = "existing-note", name = "Existing.md", content = "# Existing note\n\nBody", saved = "# Existing note\n\nBody")),
+            activeId = "existing-note",
+        )
+        File(workspaceDir, "recovery.json").bufferedWriter().use { NoteRecovery.write(it, seededState) }
+
+        val store = ViewModelStore().also(stores::add)
+        val upgraded = StudioViewModel(app, key).also {
+            it.readerFlushRequester = { true }
+            store.put("model-${viewModels.size}".also(viewModels::add), it)
+        }
+        assertFalse("Existing users without typewriterScroll preference must start with it OFF", upgraded.state.value.typewriterScroll)
+    }
+
     @Test fun readerBridgeSyncsValidBooleanAndRejectsNonBooleanPayloads() {
         val model = newModel()
         val scripts = mutableListOf<String>()

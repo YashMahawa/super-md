@@ -29,6 +29,25 @@ function readStoredTypewriter(): boolean {
 let typewriterEnabled = readStoredTypewriter();
 const listeners = new Set<() => void>();
 
+export function syncTypewriterFromStorage(): boolean {
+  const next = readStoredTypewriter();
+  if (typewriterEnabled !== next) {
+    typewriterEnabled = next;
+    listeners.forEach((listener) => listener());
+  }
+  return typewriterEnabled;
+}
+
+if (typeof window !== "undefined" && typeof window.addEventListener === "function") {
+  window.addEventListener("storage", (event: StorageEvent) => {
+    if (event.key !== null && event.key !== TYPEWRITER_STORAGE_KEY) return;
+    const next = event.key === null ? readStoredTypewriter() : event.newValue === "true";
+    if (typewriterEnabled === next) return;
+    typewriterEnabled = next;
+    listeners.forEach((listener) => listener());
+  });
+}
+
 export function getTypewriterScroll(): boolean {
   return typewriterEnabled;
 }
@@ -87,30 +106,79 @@ export function centerCursorEffect(state: EditorState) {
 
 const typewriterTheme = EditorView.theme({
   "&.cm-editor .cm-scroller": {
+    boxSizing: "border-box",
     paddingTop: "var(--cm-typewriter-pad, 50vh)",
     paddingBottom: "var(--cm-typewriter-pad, 50vh)",
   },
 });
 
+interface ViewCenterTracker {
+  view: EditorView;
+  centered: boolean;
+  centeredScrollTop: number;
+}
+
+const viewCenterTrackers = new WeakMap<EditorState, ViewCenterTracker>();
+
 const typewriterPaddingPlugin = ViewPlugin.fromClass(
   class {
     private observer: ResizeObserver | null = null;
     private lastPad = -1;
+    private readonly tracker: ViewCenterTracker;
 
     constructor(private readonly view: EditorView) {
+      this.tracker = {
+        view,
+        centered: false,
+        centeredScrollTop: view.scrollDOM.scrollTop,
+      };
+      viewCenterTrackers.set(view.state, this.tracker);
       this.syncPadding();
       if (typeof ResizeObserver !== "undefined") {
-        this.observer = new ResizeObserver(() => this.syncPadding());
-        this.observer.observe(this.view.scrollDOM);
+        this.observer = new ResizeObserver(() => {
+          this.tracker.centered = false;
+          this.syncPadding();
+        });
+        this.observer.observe(this.view.dom);
       }
     }
 
     update(update: ViewUpdate) {
-      if (update.geometryChanged) this.syncPadding();
+      viewCenterTrackers.set(update.state, this.tracker);
+      if ((!this.observer || this.lastPad < 0) && update.geometryChanged) {
+        this.tracker.centered = false;
+        this.syncPadding();
+      }
+      let centeredInUpdate = false;
+      let invalidated = false;
+      for (const tr of update.transactions) {
+        if (hasExplicitScrollEffect(tr)) {
+          if (shouldCenterTypewriterTransaction(tr)) centeredInUpdate = true;
+          else invalidated = true;
+        } else if (tr.isUserEvent("select.pointer")) {
+          invalidated = true;
+        }
+        for (const effect of tr.effects) {
+          if ((effect as unknown as { type: unknown; value?: { y?: string } }).type === scrollIntoViewEffectProbe.type) {
+            if ((effect as unknown as { value?: { y?: string } }).value?.y === "center") centeredInUpdate = true;
+            else invalidated = true;
+          }
+        }
+      }
+      if (invalidated && !centeredInUpdate) {
+        this.tracker.centered = false;
+      } else if (centeredInUpdate) {
+        this.view.requestMeasure({
+          read: () => {
+            this.tracker.centeredScrollTop = this.view.scrollDOM.scrollTop;
+            this.tracker.centered = true;
+          },
+        });
+      }
     }
 
     syncPadding() {
-      const height = this.view.scrollDOM.clientHeight;
+      const height = this.view.dom.clientHeight || this.view.scrollDOM.clientHeight;
       if (height <= 0) return;
       const half = Math.max(24, Math.floor(height / 2));
       if (half === this.lastPad) return;
@@ -121,6 +189,7 @@ const typewriterPaddingPlugin = ViewPlugin.fromClass(
     destroy() {
       this.observer?.disconnect();
       this.observer = null;
+      this.tracker.centered = false;
       this.view.dom.style.removeProperty("--cm-typewriter-pad");
     }
   }
@@ -128,6 +197,22 @@ const typewriterPaddingPlugin = ViewPlugin.fromClass(
 
 const typewriterTransactionExtender = EditorState.transactionExtender.of((tr) => {
   if (!shouldCenterTypewriterTransaction(tr)) return null;
+  const tracker = viewCenterTrackers.get(tr.startState);
+  if (tracker && tracker.centered) {
+    const scrollDrifted = Math.abs(tracker.view.scrollDOM.scrollTop - tracker.centeredScrollTop) > 2;
+    if (!scrollDrifted) {
+      const oldHead = tr.startState.selection.main.head;
+      const newHead = tr.state.selection.main.head;
+      const oldLine = tr.startState.doc.lineAt(oldHead);
+      const newLine = tr.state.doc.lineAt(newHead);
+      if (
+        oldLine.number === newLine.number &&
+        ((oldHead - oldLine.from) >> 4) === ((newHead - newLine.from) >> 4)
+      ) {
+        return null;
+      }
+    }
+  }
   return { effects: centerCursorEffect(tr.state) };
 });
 

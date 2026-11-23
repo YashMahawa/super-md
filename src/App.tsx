@@ -549,8 +549,22 @@ export default function App() {
 
   const title = tabTitle(activeTab);
   const location = useMemo(() => path ? path.split(/[\\/]/).slice(0, -1).join("/") : "New document", [path]);
-  const lineCount = useMemo(() => content.split("\n").length, [content]);
-  const wordCount = useMemo(() => content.trim() ? content.trim().split(/\s+/).length : 0, [content]);
+  const lineCount = useMemo(() => {
+    if (view !== "split") return 1;
+    let lines = 1;
+    for (let i = 0; i < content.length; i++) if (content.charCodeAt(i) === 10) lines++;
+    return lines;
+  }, [content, view]);
+  const wordCount = useMemo(() => {
+    if (view !== "reader" && view !== "split") return 0;
+    let words = 0, inWord = false;
+    for (let i = 0; i < content.length; i++) {
+      const code = content.charCodeAt(i);
+      if (code === 32 || (code >= 9 && code <= 13) || (code >= 160 && /\s/.test(String.fromCharCode(code)))) inWord = false;
+      else if (!inWord) { inWord = true; words++; }
+    }
+    return words;
+  }, [content, view]);
   const choosePython = async () => {
     const selected = await invoke<string | null>("choose_python");
     if (selected) { setPython(selected); localStorage.setItem("python", selected); }

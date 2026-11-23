@@ -217,6 +217,7 @@ class Session(QObject):
         # an explicit, persisted opt-in made through its connect switch.
         self.settings["agentAccessEnabled"] = False
         self.settings["cloudAgentEnabled"] = self.settings.get("cloudAgentEnabled") is True
+        self.settings["typewriterScroll"] = self.settings.get("typewriterScroll") is True
         shortcuts, _ = normalize_shortcuts(self.settings.get("shortcuts"))
         self.settings["shortcuts"] = shortcuts or default_shortcuts()
         try:

@@ -191,7 +191,7 @@ function Reader() {
       // Native omits content it received from this reader, unchanged since.
       const {contentUnchanged,...rest}=incoming as ReaderState&{contentUnchanged?:boolean};
       if(contentUnchanged&&(!old||old.id!==rest.id))return;
-      const next=(contentUnchanged?{...rest,content:old!.content}:rest) as ReaderState;
+      const next=({...rest,content:contentUnchanged?old!.content:rest.content,typewriterScroll:rest.typewriterScroll===true}) as ReaderState;
       if(old&&(old.id!==next.id||old.mode!==next.mode||old.fullscreen!==next.fullscreen)){nativeScroll.clear();gapSelection.current?.end();}
       const draft=edits.current!.unacknowledged(next.id);
       if(draft!==undefined&&next.content!==draft&&!contentUnchanged){
@@ -241,7 +241,7 @@ function Reader() {
         void invoke("zoom_changed",{zoom:loaded.zoom,fullscreen:true});
       }
       if(old && !sameViewport){window.clearTimeout(zoomTimer.current);cancelAnimationFrame(zoomFrame.current);zoomFrame.current=0;zoomTarget.current=null;}
-      const load = () => { if (typeof loaded.typewriterScroll === "boolean") setTypewriterScroll(loaded.typewriterScroll, { persist: false }); reference.current=loaded;setState(loaded); zoomReference.current = loaded.zoom; };
+      const load = () => { setTypewriterScroll(loaded.typewriterScroll === true, { persist: false }); reference.current=loaded;setState(loaded); zoomReference.current = loaded.zoom; };
       const typewriterChanged = Boolean(old?.typewriterScroll) !== Boolean(loaded.typewriterScroll);
       if (old?.id === next.id && old.mode === next.mode && !typewriterChanged) anchored(load); else load();
     };
@@ -600,7 +600,20 @@ function Reader() {
     if(content===previous.content)return;
     if(!replaying.current){
       const history=histories.current.get(previous.id)||{undo:[],redo:[],last:0},now=Date.now();
-      recordHistory(history,previous.content,content,now);
+      const single=changes?.length===1?changes[0]:undefined;
+      if(single&&single.from>=0&&single.to>=single.from&&single.to<=previous.content.length){
+        const edit={from:single.from,remove:single.insert.length,insert:previous.content.slice(single.from,single.to)};
+        const last=history.undo.at(-1);
+        if(now-history.last>600||Math.abs(content.length-previous.content.length)>1||!Array.isArray(last)||last.length>=10_000)history.undo.push([edit]);
+        else{
+          const prior=last.at(-1)!;
+          if(!prior.insert&&!edit.insert&&edit.from===prior.from+prior.remove)prior.remove+=edit.remove;
+          else if(!prior.remove&&!edit.remove&&edit.from+edit.insert.length===prior.from){prior.from=edit.from;prior.insert=edit.insert+prior.insert;}
+          else last.push(edit);
+        }
+        history.redo=[];history.last=now;
+        while(history.undo.length>1&&(history.undo.length>60||historySize(history)>2_000_000))history.undo.shift();
+      }else recordHistory(history,previous.content,content,now);
       histories.current.delete(previous.id);histories.current.set(previous.id,history);
       trimHistories(previous.id);
     }

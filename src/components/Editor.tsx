@@ -110,6 +110,8 @@ export default function Editor({ sessionId = "default", value, onChange, dark, f
   typewriterHandlers.set(sessionId,onTypewriterChange);
   const host = useRef<HTMLDivElement>(null);
   const view = useRef<EditorView | null>(null);
+  const lastKnownDoc = useRef<{ doc: EditorState["doc"]; text: string; depth: number } | null>(null);
+  const pendingEchoes = useRef<Array<{ text: string; time: number }>>([]);
   const changeHandler = useRef(onChange);
   changeHandler.current = onChange;
   callbacks.set(sessionId, onChange);
@@ -141,7 +143,7 @@ export default function Editor({ sessionId = "default", value, onChange, dark, f
   statusHandlers.set(sessionId, describeSelection);
   const editorTheme = () => [ ...(dark ? [syntaxHighlighting(oneDarkHighlightStyle)] : []), EditorView.theme({
     "&": { height: "100%", background: "var(--surface)", color: "var(--text)" },
-    ".cm-scroller": { fontFamily: "var(--mono)", fontSize: "calc(var(--editor-size) * var(--workspace-scale, 1))", lineHeight: "var(--editor-leading)", padding: focusMode ? "8vh 0 36vh" : "24px 0 38vh", scrollbarWidth: "thin", scrollbarColor: "var(--outline) transparent" },
+    ".cm-scroller": { fontFamily: "var(--mono)", fontSize: "calc(var(--editor-size) * var(--workspace-scale, 1))", lineHeight: "var(--editor-leading)", boxSizing: "border-box", padding: focusMode ? "8vh 0 36vh" : "24px 0 38vh", scrollbarWidth: "thin", scrollbarColor: "var(--outline) transparent" },
     ".cm-content": { maxWidth: focusMode ? "var(--reading-max-width, none)" : "none", margin: focusMode ? "0 auto" : "0", padding: "0 24px", caretColor: "var(--primary)" },
     ".cm-line": { padding: "0 4px" },
     ".cm-gutters": { background: "var(--surface)", border: "0", color: "var(--muted)", paddingRight: "8px" },
@@ -202,7 +204,15 @@ export default function Editor({ sessionId = "default", value, onChange, dark, f
           if (update.docChanged) {
             const changes:SourceChange[]=[];
             update.changes.iterChanges((from,to,_fromB,_toB,insert)=>changes.push({from,to,insert:insert.toString()}));
-            callbacks.get(sessionId)?.(update.state.doc.toString(),changes);
+            const prevKnown = lastKnownDoc.current?.doc === update.startState.doc ? lastKnownDoc.current : undefined;
+            const canSlice = prevKnown !== undefined && changes.length === 1 && prevKnown.depth < 32;
+            const nextText = canSlice
+              ? prevKnown.text.slice(0, changes[0].from) + changes[0].insert + prevKnown.text.slice(changes[0].to)
+              : update.state.doc.toString();
+            lastKnownDoc.current = { doc: update.state.doc, text: nextText, depth: canSlice ? prevKnown.depth + 1 : 0 };
+            if (pendingEchoes.current.length >= 64) pendingEchoes.current.shift();
+            pendingEchoes.current.push({ text: nextText, time: performance.now() });
+            callbacks.get(sessionId)?.(nextText,changes);
           }
           if (update.docChanged || update.selectionSet) statusHandlers.get(sessionId)?.(update.state);
         }),
@@ -217,6 +227,8 @@ export default function Editor({ sessionId = "default", value, onChange, dark, f
       } catch { /* Invalid/oversized optional view state must not block the note. */ }
     }
     view.current = new EditorView({ state, parent: host.current });
+    lastKnownDoc.current = { doc: view.current.state.doc, text: value, depth: 0 };
+    pendingEchoes.current.length = 0;
     visibleEditors.set(sessionId, view.current);
     if (cached && state === cached.state && cached.typewriterActive !== initialTypewriter) {
       view.current.dispatch({ effects: typewriter.current.reconfigure(typewriterScrollExtension(initialTypewriter)) });
@@ -256,13 +268,25 @@ export default function Editor({ sessionId = "default", value, onChange, dark, f
   useEffect(() => {
     const instance = view.current;
     if (!instance) return;
-    const previous = instance.state.doc.toString();
-    if (previous === value) return;
+    const previous = lastKnownDoc.current?.doc === instance.state.doc ? lastKnownDoc.current.text : instance.state.doc.toString();
+    lastKnownDoc.current = { doc: instance.state.doc, text: previous, depth: lastKnownDoc.current?.doc === instance.state.doc ? lastKnownDoc.current.depth : 0 };
+    if (previous === value) {
+      pendingEchoes.current.length = 0;
+      return;
+    }
+    const cutoff = performance.now() - 2000;
+    const echoIndex = pendingEchoes.current.findIndex((entry) => entry.time >= cutoff && entry.text === value);
+    if (echoIndex !== -1) {
+      pendingEchoes.current.splice(0, echoIndex + 1);
+      return;
+    }
+    pendingEchoes.current.length = 0;
     let from = 0;
     while (from < previous.length && from < value.length && previous[from] === value[from]) from++;
     let oldEnd = previous.length, newEnd = value.length;
     while (oldEnd > from && newEnd > from && previous[oldEnd - 1] === value[newEnd - 1]) { oldEnd--; newEnd--; }
     instance.dispatch({ changes: { from, to: oldEnd, insert: value.slice(from, newEnd) },annotations:Transaction.addToHistory.of(false) });
+    lastKnownDoc.current = { doc: instance.state.doc, text: value, depth: 0 };
   }, [value]);
 
   useEffect(() => {
@@ -320,8 +344,8 @@ export default function Editor({ sessionId = "default", value, onChange, dark, f
       <span className="source-language">Markdown</span>
       <span ref={position} className="source-position">Ln 1, Col 1</span>
       <span className="source-status-spacer" />
-      <button type="button" aria-pressed={activeTypewriter} title="Toggle typewriter scrolling (Ctrl+Alt+T)" onClick={() => { const next = !activeTypewriter; setTypewriterScroll(next, { persist: !onTypewriterChange }); onTypewriterChange?.(next); }}>Typewriter</button>
-      <button type="button" aria-pressed={wrap} title="Toggle line wrapping" onClick={() => setWrap(current => !current)}>Wrap lines</button>
+      <button type="button" aria-pressed={activeTypewriter} title="Toggle typewriter scrolling (Ctrl+Alt+T)" onMouseDown={(event) => event.preventDefault()} onClick={() => { const next = !activeTypewriter; setTypewriterScroll(next, { persist: !onTypewriterChange }); onTypewriterChange?.(next); }}>Typewriter</button>
+      <button type="button" aria-pressed={wrap} title="Toggle line wrapping" onMouseDown={(event) => event.preventDefault()} onClick={() => setWrap(current => !current)}>Wrap lines</button>
       <span className="source-encoding">UTF-8</span>
     </footer>
   </div>;

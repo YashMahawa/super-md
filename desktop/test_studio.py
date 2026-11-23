@@ -70,6 +70,7 @@ class StudioTest(unittest.TestCase):
         self.assertFalse(json.loads(loads[-1])['latexAutofix'])
 
     def test_typewriter_scroll_is_opt_in_validated_and_synced_with_reader(self):
+        import tempfile
         studio=self.studio;loads=[];replies=[];studio.readerLoad.connect(loads.append);studio.ready=True
         studio.replied.connect(lambda identifier,value,error:replies.append((identifier,value,error)))
         self.assertFalse(studio.settings['typewriterScroll'])
@@ -85,6 +86,48 @@ class StudioTest(unittest.TestCase):
         self.assertFalse(json.loads(loads[-1])['typewriterScroll'])
         studio.post('tw2','typewriter_scroll',json.dumps({'enabled':'yes'}))
         self.assertTrue(replies[-1][2])
+
+        with tempfile.TemporaryDirectory(prefix='supermd-tw-persist-') as app_root:
+            qt_data = Path(app_root) / 'qt-studio'
+            qt_data.mkdir(parents=True, exist_ok=True)
+            # Existing user upgrading from pre-typewriter settings.json must default to False.
+            atomic_json(qt_data / 'settings.json', {'settings': {'welcomed': True, 'autosave': True, 'theme': 'dark'}, 'pinned': [], 'recent': []})
+            with patch('studio.QStandardPaths.writableLocation', return_value=app_root):
+                upgraded_session = Session(False)
+                upgraded_studio = QuietStudio(False, upgraded_session)
+                try:
+                    self.assertIs(upgraded_studio.settings['typewriterScroll'], False)
+                    upgraded_studio.setting('typewriterScroll', 'true')
+                    self.assertIs(upgraded_studio.settings['typewriterScroll'], True)
+                finally:
+                    upgraded_studio.stop()
+                    upgraded_studio.pool.shutdown(wait=True)
+                    upgraded_session.writes.shutdown(wait=True)
+
+                # Restarting Session from disk restores persisted typewriterScroll=True.
+                restored_session = Session(False)
+                restored_studio = QuietStudio(False, restored_session)
+                try:
+                    self.assertIs(restored_studio.settings['typewriterScroll'], True)
+                    restored_studio.post('tw-off', 'typewriter_scroll', json.dumps({'enabled': False}))
+                    self.assertIs(restored_studio.settings['typewriterScroll'], False)
+                finally:
+                    restored_studio.stop()
+                    restored_studio.pool.shutdown(wait=True)
+                    restored_session.writes.shutdown(wait=True)
+
+                # Restarting after disabling restores False; corrupted non-bool on disk also normalizes to False.
+                disabled_session = Session(False)
+                try:
+                    self.assertIs(disabled_session.settings['typewriterScroll'], False)
+                finally:
+                    disabled_session.writes.shutdown(wait=True)
+                atomic_json(qt_data / 'settings.json', {'settings': {'welcomed': True, 'typewriterScroll': 'yes'}, 'pinned': [], 'recent': []})
+                corrupted_session = Session(False)
+                try:
+                    self.assertIs(corrupted_session.settings['typewriterScroll'], False)
+                finally:
+                    corrupted_session.writes.shutdown(wait=True)
 
     def test_theme_guide_opens_in_reader_and_copies_without_editing_note(self):
         studio=self.studio;calls=[];replies=[];studio.readerCall.connect(calls.append)
