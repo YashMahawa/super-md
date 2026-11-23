@@ -30,3 +30,36 @@ it("keeps answer disclosure interactive and Python source in one box", async () 
   expect(host.querySelector("textarea")).toBeNull();
   act(() => root.unmount()); host.remove();
 });
+it("preserves the latest blurred textarea selection for supermd-insertion-point and clears it on external edits", async () => {
+  const host = document.createElement("div"); document.body.append(host); const root = createRoot(host);
+  let doc = "# Heading\n\nMiddle block\n\nLast block";
+  const rerender = async (next: string) => {
+    doc = next;
+    await act(async () => root.render(<LiveEditor markdown={doc} documentPath={null} dark={false} python="" onChange={(val) => { doc = val; }} />));
+  };
+  await rerender(doc);
+  const paragraphs = host.querySelectorAll("p");
+  act(() => paragraphs[0]!.dispatchEvent(new MouseEvent("dblclick", { bubbles: true })));
+  const area = host.querySelector("textarea")!;
+  expect(area.value).toBe("Middle block");
+  act(() => {
+    area.focus();
+    area.setSelectionRange(6, 12);
+    area.dispatchEvent(new Event("select", { bubbles: true }));
+    area.blur();
+  });
+  expect(host.querySelector("textarea")).toBeNull();
+
+  const queryInsertion = (extra: Record<string, unknown> = {}) => {
+    const detail: { point?: { from: number; to: number }; x?: number; y?: number } = { ...extra };
+    window.dispatchEvent(new CustomEvent("supermd-insertion-point", { detail }));
+    return detail.point;
+  };
+  expect(queryInsertion()).toEqual({ from: 17, to: 23 });
+  expect(queryInsertion({ x: 30, y: 40 })).toBeUndefined();
+
+  await rerender("# Externally replaced note");
+  expect(queryInsertion()).toBeUndefined();
+  act(() => root.unmount()); host.remove();
+});
+
