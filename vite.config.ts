@@ -11,7 +11,7 @@ export function buildHtmlEntries(mode: string) {
     : { app: "index.html", ...nativeReaderEntries };
 }
 
-function renderSandboxDocument(iifeScript: string): string {
+export function renderSandboxDocument(iifeScript: string): string {
   const escaped = iifeScript
     .replace(/\r\n?/g, "\n")
     .replace(/\0/g, "\uFFFD")
@@ -113,7 +113,7 @@ function mermaidSandboxPlugin(): Plugin {
   };
 }
 
-function htmlCspPlugin(): Plugin {
+export function htmlCspPlugin(): Plugin {
   let isServe = false;
   return {
     name: "supermd-html-csp",
@@ -137,13 +137,14 @@ function htmlCspPlugin(): Plugin {
         while ((match = scriptPattern.exec(html)) !== null) {
           const body = match[1] ?? "";
           if (body.trim()) {
-            const digest = createHash("sha256").update(body, "utf8").digest("base64");
+            const normalized = body.replace(/\r\n?/g, "\n").replace(/\0/g, "\uFFFD");
+            const digest = createHash("sha256").update(normalized, "utf8").digest("base64");
             inlineHashes.push(`'sha256-${digest}'`);
           }
         }
         return html.replace(
-          /(<meta\s+http-equiv=["']Content-Security-Policy["']\s+content=["'])([^"']+)(["'])/i,
-          (_full, prefix: string, content: string, suffix: string) => {
+          /(<meta\s+http-equiv=["']Content-Security-Policy["']\s+content=(["']))([\s\S]*?)(\2)/i,
+          (_full, prefix: string, _quote: string, content: string, suffix: string) => {
             let updated = content;
             if (inlineHashes.length > 0) {
               updated = updated.replace(/script-src\s+([^;]+)/i, (_m, sources: string) =>
