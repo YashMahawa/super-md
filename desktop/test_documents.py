@@ -9,6 +9,26 @@ from pathlib import Path
 from documents import atomic_write, atomic_json, bundle, compressed_bundle, materialize_assets, open_note, validate, write_portable
 
 class DocumentsTest(unittest.TestCase):
+    def test_windows_sharing_lock_retries_atomic_replace_without_touching_old_note(self):
+        import documents
+        from unittest.mock import patch
+        with tempfile.TemporaryDirectory() as directory:
+            target=Path(directory)/"existing.smd"
+            target.write_bytes(b"old note")
+            actual_replace=os.replace
+            calls=[]
+            def temporarily_locked(source, destination):
+                calls.append((source,destination))
+                if len(calls)<=2:
+                    error=PermissionError("sharing violation")
+                    error.winerror=32
+                    raise error
+                actual_replace(source,destination)
+            with patch.object(documents.os,"name","nt"), patch.object(documents.os,"replace",side_effect=temporarily_locked):
+                write_portable(target,"# safe",{})
+            self.assertEqual(len(calls),3)
+            self.assertEqual(open_note(target),("# safe",{},True))
+
     def test_portable_envelopes_are_detected_independently_of_filename(self):
         with tempfile.TemporaryDirectory() as directory:
             for name in ("shared", "note.txt", "note.json", "note.md", "note.SMD", "note.FMD"):

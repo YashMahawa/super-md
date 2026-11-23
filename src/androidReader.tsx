@@ -27,6 +27,7 @@ import type { ExportOptions,ReaderAccessibilityPreference } from "./types";
 import { clampPreviewZoom } from "./zoom";
 import MediaTools from "./components/MediaTools";
 import { prepareFmd } from "./documentMedia";
+import { prepareMarkdownExport } from "./markdownExport";
 import ImageViewer from "./components/ImageViewer";
 import MathRepairPanel from "./components/MathRepairPanel";
 import ThemeGuideDialog from "./components/ThemeGuideDialog";
@@ -54,7 +55,7 @@ interface PdfExportStatus {id:string;phase:'preparing'|'typesetting'|'publishing
 interface NoteView { editor?: PortableEditorSession; history?:NoteHistory; top?: number; rendered?: ReturnType<typeof exportRenderedViews> }
 interface ReaderState extends ReaderAccessibilityPreference { id: string; content: string; path: string | null; mode: "live" | "editor" | "reader" | "split"; dark: boolean; fullscreen: boolean; font: string; size: number; latexAutofix?:boolean;spellCheck?:boolean; grammarCheck?:boolean; width?: number; widthPercent?:number; lineHeight?:number; colors: Record<string, string>; zoom: number; motion?: boolean; python?: string; viewState?: NoteView }
 declare global { interface Window {supermdAgentRequest?:(request:Record<string,unknown>,callback?:(result:unknown,error:string)=>void)=>void;supermdAgentCompute?:(request:Record<string,unknown>,callback:(result:unknown,error:string)=>void)=>void;supermdThemeGuide?:()=>void;supermdDismiss?:()=>boolean;supermdSetZoom?:(zoom:number,requestedAt?:number)=>void;supermdHeading?:(id:string,offset?:number)=>void;supermdHistory?:(direction:"undo"|"redo")=>void;supermdNativeWheel?:(dx:number,dy:number,point:Point,held:boolean,modifier?:boolean)=>void;} }
-declare global { interface Window { supermdLoad?: (state: ReaderState) => void; supermdExport?: (options: ExportOptions) => void; supermdExportMarkdown?: () => void; supermdFind?: () => void; supermdPortable?: (save: boolean) => void; supermdZoomBy?: (factor:number,focus?:Point)=>void; supermdResetZoom?: ()=>void; supermdRepairMath?: ()=>void; supermdFlush?: (operation:Record<string,string>)=>void } }
+declare global { interface Window { supermdLoad?: (state: ReaderState) => void; supermdExport?: (options: ExportOptions) => void; supermdExportMarkdown?: (archive?: boolean) => void; supermdFind?: () => void; supermdPortable?: (save: boolean) => void; supermdZoomBy?: (factor:number,focus?:Point)=>void; supermdResetZoom?: ()=>void; supermdRepairMath?: ()=>void; supermdFlush?: (operation:Record<string,string>)=>void } }
 declare global { interface Window {supermdChromeInset?:(height:number)=>void} }
 declare global { interface Window {supermdSavePosition?:()=>void} }
 declare global {interface Window {supermdExportPhase?:(id:string,phase:'typesetting'|'publishing')=>void}}
@@ -273,6 +274,8 @@ function Reader() {
       markScrollInput();
       const target=document.elementFromPoint(point.x,point.y),canvas=target?.closest(".interactive-chart svg,.image-viewer-canvas");
       if(target?.closest('.theme-guide-dialog')){const body=target.closest<HTMLElement>('.theme-guide-body');if(!held&&body)nativeScroll.scroll(body,dx,dy);return;}
+      const slideNotes=target?.closest<HTMLElement>('.step-viewer .step-cards-notes');
+      if(slideNotes){nativeScroll.scroll(slideNotes,dx,dy);return;}
       const editor=target?.closest<HTMLTextAreaElement>('textarea');
       if(editor){nativeScroll.scroll(editor,dx,dy);return;}
       if(held&&(modifier||canvas||(!selectingText.current&&!window.getSelection()?.toString()))){gapSelection.current?.cancelStationary();if(canvas?.matches("svg"))canvas.dispatchEvent(new WheelEvent("wheel",{bubbles:true,cancelable:true,ctrlKey:true,deltaY:dy,clientX:point.x,clientY:point.y}));else window.supermdZoomBy?.(Math.exp(-dy*.002),point);return;}
@@ -331,12 +334,14 @@ function Reader() {
       catch (error) { await invoke("export_failed", { error: owner.controller.signal.aborted||(error instanceof Error&&error.message==='PDF export cancelled')?'PDF export cancelled':String(error) }); }
       finally{if(exportOwner.current?.id===owner.id){exportOwner.current=null;setPdfExport(null);}}
     };
-    window.supermdExportMarkdown = async () => {
+    window.supermdExportMarkdown = async (archive = false) => {
       const current = reference.current; if (!current) return;
       try {
         if((current as ReaderState&{editProtocol?:number}).editProtocol===1)await edits.current!.flush(current.id);
         const latest=reference.current;if(!latest||latest.id!==current.id)throw new Error('The export note changed');
-        await invoke("export_markdown_native", {id: latest.id, content: latest.content}); }
+        const prepared=await prepareMarkdownExport(latest.content,latest.path,{compatible:archive});
+        if(reference.current?.id!==latest.id||reference.current.content!==latest.content)throw new Error('The note changed while preparing the Markdown export');
+        await invoke("export_markdown_native", {id: latest.id, content: prepared.content, assets: prepared.assets, archive}); }
       catch (error) { await invoke("export_failed", {error: String(error)}); }
     };
     void invoke("reader_ready");
@@ -673,13 +678,13 @@ function Reader() {
           const suppliedOptions=request.options&&typeof request.options==='object'&&!Array.isArray(request.options)?request.options as Record<string,unknown>:{};
           const hasSection=Object.prototype.hasOwnProperty.call(suppliedOptions,'section'),section=hasSection?agentSectionForExport(note.content,suppliedOptions.section):undefined;
           const exportContent=section?.text??note.content,{section:_section,...exportOptions}=suppliedOptions;
-          const prepared=format==='pdf'?await preparePdf(exportContent,note.path,note.python||'embedded'):format==='smd'?await prepareFmd(exportContent,note.path):{content:exportContent};
+          const prepared=format==='pdf'?await preparePdf(exportContent,note.path,note.python||'embedded'):format==='smd'?await prepareFmd(exportContent,note.path):await prepareMarkdownExport(exportContent,note.path);
           if(reference.current?.id!==note.id||reference.current.content!==note.content)throw Error('Revision conflict: the note changed while preparing the export');
           const result=await invoke<Record<string,unknown>>('agent_export_native',{...prepared,id:note.id,expectedRevision:revision,requestId:request.requestId,format,filename:request.filename,options:exportOptions});
           return section?{...result,sectionStart:section.sectionStart,sectionEnd:section.sectionEnd,documentLength:section.documentLength}:result;
         }
         throw Error('Unsupported live reader action');
-      })().then(result=>reply(result),error=>reply(null,error instanceof Error?error.message:'Agent request failed')).finally(()=>{pending=false;});
+      })().then(result=>{pending=false;reply(result);},error=>{pending=false;reply(null,error instanceof Error?error.message:'Agent request failed');});
     };
     return()=>{disposed=true;delete window.supermdAgentRequest;delete window.supermdAgentCompute;};
   },[update]);

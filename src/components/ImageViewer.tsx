@@ -30,6 +30,8 @@ export default function ImageViewer() {
       const target = event.target instanceof Element ? event.target.closest<HTMLImageElement>(".markdown-body img") : null;
       if (!target?.currentSrc) return;
       event.preventDefault(); event.stopImmediatePropagation();
+      const slide=target.closest('.step-cards');
+      if(slide){slide.dispatchEvent(new Event('supermd-step-expand'));return;}
       source.current=target;
       setImage({ src: target.currentSrc, alt: target.alt || "Image", presentation:presentation(target), owner: target.closest("[data-note-image-source]") }); fit();
     };

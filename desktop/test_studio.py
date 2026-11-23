@@ -17,6 +17,19 @@ class QuietStudio(Studio):
         self.system_dark = True
 
 class StudioTest(unittest.TestCase):
+    def test_fedora_uses_toolbar_frame_across_desktops(self):
+        for distro, desktop, frame, controls in (
+            ("fedora", "niri", True, True),
+            ("fedora", "GNOME", True, True),
+            ("debian", "niri", False, True),
+            ("debian", "GNOME", False, False),
+        ):
+            with self.subTest(distro=distro, desktop=desktop), patch("studio.sys.platform", "linux"), patch(
+                "studio.platform.freedesktop_os_release", return_value={"ID": distro}
+            ), patch.dict(os.environ, {"XDG_CURRENT_DESKTOP": desktop}):
+                self.assertEqual(self.studio.fedoraWindowFrame, frame)
+                self.assertEqual(self.studio.showToolbarWindowControls, controls)
+
     def test_agent_pdf_options_match_gui_limits_and_remembered_preferences(self):
         import hashlib
         studio = self.studio
@@ -70,6 +83,24 @@ class StudioTest(unittest.TestCase):
         for invalid in (42,None,'x'*2_000_001):
             studio.post('invalid','copy_text',json.dumps({'text':invalid}))
             self.assertTrue(replies[-1][2]);self.assertEqual(QGuiApplication.clipboard().text(),guide)
+        self.assertEqual(studio._current()['content'],original)
+
+    def test_copy_image_writes_real_pixels_and_rejects_invalid_data_without_changing_note(self):
+        import base64
+        from PySide6.QtCore import QBuffer, QByteArray, QIODevice
+        from PySide6.QtGui import QImage, QColor
+        image=QImage(8,6,QImage.Format_ARGB32);image.fill(QColor("#1688dd"))
+        raw=QByteArray();buffer=QBuffer(raw);buffer.open(QIODevice.WriteOnly);image.save(buffer,"PNG")
+        studio=self.studio;original=studio._current()['content'];replies=[]
+        studio.replied.connect(lambda identifier,value,error:replies.append((identifier,value,error)))
+        body=base64.b64encode(bytes(raw)).decode()
+        studio.post('copy-image','copy_image_native',json.dumps({'body':body,'mimeType':'image/png'}))
+        copied=QGuiApplication.clipboard().image()
+        self.assertEqual((copied.width(),copied.height()),(8,6))
+        self.assertEqual(copied.pixelColor(2,2).name(),'#1688dd')
+        self.assertEqual(replies[-1],('copy-image','true',''))
+        studio.post('bad-image','copy_image_native',json.dumps({'body':'aGVsbG8=','mimeType':'image/png'}))
+        self.assertTrue(replies[-1][2]);self.assertEqual(QGuiApplication.clipboard().image().pixelColor(2,2).name(),'#1688dd')
         self.assertEqual(studio._current()['content'],original)
 
     def test_reader_patches_commit_in_order_and_reject_external_changes(self):
@@ -807,9 +838,12 @@ class StudioTest(unittest.TestCase):
 
         self.studio.exportTo(selected,"md")
         self.assertEqual(self.studio.pending_export,str(markdown))
-        self.studio.post("markdown-export","export_markdown_native",json.dumps({"id":self.studio.active,"content":"Final Markdown"}))
+        gif="R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7"
+        markdown_content="![Loop](images/loop.gif)"
+        self.studio.post("markdown-export","export_markdown_native",json.dumps({"id":self.studio.active,"content":markdown_content,"assets":{"images/loop.gif":"data:image/gif;base64,"+gif}}))
         self.await_idle()
-        self.assertEqual(markdown.read_text(encoding="utf-8"),"Final Markdown")
+        self.assertEqual(markdown.read_text(encoding="utf-8"),markdown_content)
+        self.assertEqual((markdown.parent/"images"/"loop.gif").read_bytes(),__import__("base64").b64decode(gif))
 
         self.studio.exportTo(selected,"smd")
         self.assertEqual(self.studio.pending_export,str(portable))
@@ -820,8 +854,33 @@ class StudioTest(unittest.TestCase):
         self.assertTrue(is_portable)
         self.assertEqual(content,"Portable Markdown")
         self.assertEqual(assets,{})
-        self.assertEqual(markdown.read_text(encoding="utf-8"),"Final Markdown")
+        self.assertEqual(markdown.read_text(encoding="utf-8"),markdown_content)
         self.assertFalse(Path(str(base)+".smd.md").exists())
+
+    def test_markdown_zip_export_preserves_raster_paths(self):
+        import base64, zipfile
+        base=self.studio.data/"Markdown bundle"
+        selected=QUrl.fromLocalFile(str(base)).toString()
+        target=Path(str(base)+".zip")
+        gif="R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7"
+        self.studio.exportTo(selected,"mdzip")
+        self.assertEqual(self.studio.pending_export,str(target))
+        self.studio.post("markdown-zip","export_markdown_native",json.dumps({"id":self.studio.active,"content":"![Loop](media/loop.gif)","assets":{"media/loop.gif":"data:image/gif;base64,"+gif},"archive":True}))
+        self.await_idle()
+        with zipfile.ZipFile(target) as archive:
+            self.assertEqual(archive.namelist(),["Markdown bundle.md","media/loop.gif"])
+            self.assertEqual(archive.read("media/loop.gif"),base64.b64decode(gif))
+
+    def test_markdown_export_never_overwrites_the_original_note(self):
+        source=self.studio.data/"original.md"
+        original=b"# Original note\n![Photo](images/photo.gif)\n"
+        source.write_bytes(original)
+        self.studio._current()["path"]=str(source)
+        self.studio.exportTo(QUrl.fromLocalFile(str(source)).toString(),"md")
+        self.studio.post("same-path","export_markdown_native",json.dumps({"id":self.studio.active,"content":"replacement","assets":{"images/photo.gif":"data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7"}}))
+        self.await_idle()
+        self.assertEqual(source.read_bytes(),original)
+        self.assertFalse((self.studio.data/"images"/"photo.gif").exists())
 
     def test_export_rejects_mismatched_suffixes_and_unconfirmed_appended_overwrite(self):
         calls=[]
@@ -869,10 +928,12 @@ class StudioTest(unittest.TestCase):
 
     def test_export_dialog_tracks_selected_format_suffix_and_filters(self):
         qml=(Path(__file__).parent/"qml"/"Main.qml").read_text(encoding="utf-8")
-        self.assertIn('defaultSuffix: exportFormat',qml)
-        self.assertIn('exportFormat === "pdf" ? ["PDF (*.pdf)"] : exportFormat === "md" ? ["Markdown (*.md)"] : ["Portable Super MD (*.smd)"]',qml)
-        choice=next(line for line in qml.splitlines() if "currentIndex: outputFormat === \"pdf\"" in line)
-        self.assertIn('onActivated: outputFormat = currentIndex === 0 ? "pdf" : currentIndex === 1 ? "smd" : "md"',choice)
+        self.assertIn('defaultSuffix: exportFormat === "mdzip" ? "zip" : exportFormat',qml)
+        for expected in ('PDF (*.pdf)', 'Markdown (*.md)', 'Markdown bundle (*.zip)', 'Portable Super MD (*.smd)'):
+            self.assertIn(expected,qml)
+        self.assertIn('property var availableFormats: ["pdf", "smd", "md", "mdzip"]',qml)
+        self.assertIn('availableFormats.indexOf(outputFormat)',qml)
+        self.assertIn('onActivated: outputFormat = exportDialog.availableFormats[currentIndex]',qml)
 
     def test_external_refresh_does_not_overwrite_a_draft(self):
         studio=self.studio;path=studio.data / "external.md"

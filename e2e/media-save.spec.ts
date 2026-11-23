@@ -4,7 +4,7 @@ test('media menu exports light PNG and original-colour SVG without editing the n
     (window as any).savedMedia=[];(window as any).noteChanges=[];
     window.SuperMD={post:(id,command,args)=>{
       const data=JSON.parse(args);
-      if(command==='save_media_native')(window as any).savedMedia.push(data);
+      if(command==='save_media_native'||command==='copy_image_native')(window as any).savedMedia.push({...data,command});
       if(command==='document_changed')(window as any).noteChanges.push(data);
       queueMicrotask(()=>window.supermdReply?.(id,command==='save_media_native'?{filename:data.filename}:true,null));
     }};
@@ -23,9 +23,36 @@ test('media menu exports light PNG and original-colour SVG without editing the n
   await page.keyboard.press('Escape');await diagram.click({button:'right'});await menu.getByRole('menuitem',{name:'Save as SVG',exact:true}).click();
   await expect.poll(()=>page.evaluate(()=>(window as any).savedMedia.length)).toBe(2);
   const svg=await page.evaluate(()=>atob((window as any).savedMedia[1].body));expect(svg).toContain('#1688dd');expect(svg).not.toContain('#ef99ad');
+  await page.keyboard.press('Escape');await diagram.click({button:'right'});
+  await menu.getByRole('menuitem',{name:'Copy image',exact:true}).click();
+  await expect.poll(()=>page.evaluate(()=>(window as any).savedMedia.length)).toBe(3);
+  const copied=await page.evaluate(()=>(window as any).savedMedia[2]);
+  expect(copied.command).toBe('copy_image_native');expect(copied.mimeType).toBe('image/png');expect(copied.body).toMatch(/^iVBOR/);
+  await expect(menu).toContainText('Image copied');
   await page.keyboard.press('Escape');
   // Touch-and-hold uses the same menu without activating the image viewer.
   const box=(await diagram.boundingBox())!;
   await diagram.dispatchEvent('pointerdown',{pointerType:'touch',clientX:box.x+box.width/2,clientY:box.y+box.height/2});await page.waitForTimeout(600);await diagram.dispatchEvent('pointerup',{pointerType:'touch'});await expect(menu).toBeVisible();
   await expect(page.getByRole('dialog',{name:'Image viewer'})).toHaveCount(0);
+});
+
+test('agents retrieve an unselected slider frame and its native copy menu without advancing the slider',async({page})=>{
+ await page.addInitScript(()=>{(window as any).copied=[];window.SuperMD={post:(id,command,raw)=>{if(command==='copy_image_native')(window as any).copied.push(JSON.parse(raw));queueMicrotask(()=>window.supermdReply?.(id,true,null));}};});
+ await page.goto('/android-reader.html');await page.waitForFunction(()=>!!window.supermdLoad);
+ const deck={title:'Tree insertion',steps:[{label:'Root',diagram:{values:[8]}},{label:'Children',diagram:{values:[8,4,12]}}]};
+ await page.evaluate(content=>window.supermdLoad?.({id:'frames',path:null,content,mode:'reader',dark:false,colors:{},font:'Manrope',size:16,zoom:100}),'```smd-steps\n'+JSON.stringify(deck)+'\n```');
+ const card=page.locator('.step-cards');await expect(card.locator('.step-cards-step-title')).toHaveText('Root');
+ const result=await page.evaluate(async()=>{
+  const request=(value:Record<string,unknown>)=>new Promise<any>((resolve,reject)=>window.supermdAgentRequest?.(value,(result,error)=>error?reject(Error(error)):resolve(result)));
+  const list=await request({action:'list_diagrams'});const second=list.diagrams.find((d:any)=>d.stepLabel==='Children');
+  const pixels=await request({action:'get_diagram_image',diagramId:second.id,expectedRevision:list.revision,width:800});
+  return {list,pixels};
+ });
+ expect(result.list.total).toBe(2);expect(result.list.diagrams[1].deckTitle).toBe('Tree insertion');
+ expect(result.pixels.mime_type).toBe('image/png');expect(result.pixels.data).toMatch(/^iVBOR/);
+ await expect(card.locator('.step-cards-step-title')).toHaveText('Root');
+ await card.locator('.step-cards-inline-figure .inline-diagram').click({button:'right'});
+ await page.getByRole('menuitem',{name:'Copy image',exact:true}).click();
+ await expect.poll(()=>page.evaluate(()=>(window as any).copied.length)).toBe(1);
+ await expect(card.locator('.step-cards-step-title')).toHaveText('Root');
 });

@@ -10,6 +10,7 @@ import ipaddress
 import math
 import mimetypes
 import os
+import platform
 import shutil
 import re
 import secrets
@@ -26,15 +27,16 @@ import uuid
 from pathlib import Path
 from network_tls import client_context
 from PySide6.QtCore import QObject, Property, Signal, Slot, QStandardPaths, QTimer, QUrl, QFileSystemWatcher, QProcess, Qt, QPointF, QRect, QMetaObject, QBuffer, QByteArray, QIODevice
-from PySide6.QtGui import QDesktopServices, QFontDatabase, QGuiApplication, QCursor
+from PySide6.QtGui import QDesktopServices, QFontDatabase, QGuiApplication, QCursor, QImage
 from documents import atomic_write, atomic_json, bundle, image_data, materialize_assets, open_note, write_portable, MIMES, MAX_IMAGE
+from markdown_export import write_markdown_export, write_markdown_zip
 from theme import detect_system_dark, read_system_palette, system_palette_paths, tokens
 from fonts import FontStore
 from python_outputs import PythonOutputs
 from reader_edits import ReaderEdits
 from closed_notes import ClosedNoteStore
 from reader_assets import ReaderAssetStore, note_file_path, resolve_source
-from storage_inspector import inspect_storage
+from storage_inspector import inspect_storage, clear_storage_category
 from latest_writes import LatestWriteExecutor
 import updates
 import app_integration
@@ -47,7 +49,7 @@ from selection_actions import ASSISTANTS, selection_target
 from shortcuts import DEFINITIONS as SHORTCUT_DEFINITIONS, capture_sequence, default_shortcuts, native_label, normalize_shortcuts, parse_sequence
 
 ROOT = Path(sys._MEIPASS)/"resources" if getattr(sys,"frozen",False) else Path(__file__).resolve().parent.parent
-DEFAULT_PDF = {"pageSize": "a4", "margin": 18, "fontSize": 10.5, "lineHeight": 1.55, "paragraphSpacing": 1.35, "fontFamily": "Manrope", "pageNumbers": True, "themed": False}
+DEFAULT_PDF = {"pageSize": "a4", "margin": 14, "fontSize": 10.5, "lineHeight": 1.4, "paragraphSpacing": 0.65, "fontFamily": "Manrope", "pageNumbers": True, "themed": False}
 DEFAULTS = {"theme": "system", "fullTheme": "black", "motion": True, "font": "Manrope", "size": 18, "width": 0, "widthPercent":90, "lineHeight":1.65, "autosave":True, "normalZoom": 100, "fullZoom": 100, "python": "", "pdf": DEFAULT_PDF, "welcomed": False}
 DEFAULTS.update(widthMigrated=True, window={"width":1320,"height":880,"maximized":False}, spellCheck=False, grammarCheck=False, readingMode="live", newNoteLocation="", accent="system", checkUpdates=True, autoUpdate=False)
 DEFAULTS.update(restorePosition=True, centerLock=True, startup="restore", imageAppearance="original", svgAppearance="original", imageContrast=1.25, fullDocumentAccessibility=False)
@@ -130,7 +132,7 @@ def local_path(value: str) -> Path:
     return Path(url.toLocalFile() if url.isLocalFile() else value).expanduser().resolve()
 
 def export_destination(value: str, format: str) -> Path:
-    suffixes = {"pdf": ".pdf", "smd": ".smd", "md": ".md"}
+    suffixes = {"pdf": ".pdf", "smd": ".smd", "md": ".md", "mdzip": ".zip"}
     # These are known payload extensions, not merely dotted stem names.  In
     # particular, .fmd is an older portable format and must not be silently
     # rewritten as .fmd.pdf/.fmd.smd.
@@ -140,6 +142,7 @@ def export_destination(value: str, format: str) -> Path:
         ".md": "md",
         ".markdown": "md",
         ".txt": "md",
+        ".zip": "mdzip",
     }
     if format not in suffixes:
         raise ValueError("Unsupported export format")
@@ -210,10 +213,10 @@ class Session(QObject):
             self.pinned = list(dict.fromkeys(p for p in stored.get("pinned",[]) if isinstance(p,str)))[:10]
             self.recent = list(dict.fromkeys(self.pinned + [p for p in stored.get("recent",[]) if isinstance(p,str)]))[:10]
         except (OSError,ValueError,KeyError,TypeError,AttributeError): pass
-        # The authenticated live bridge is explicitly enabled per app run;
-        # stale saved preferences must never start a new network listener.
+        # Local MCP access remains session-only. Cloud relay reconnection is
+        # an explicit, persisted opt-in made through its connect switch.
         self.settings["agentAccessEnabled"] = False
-        self.settings["cloudAgentEnabled"] = False
+        self.settings["cloudAgentEnabled"] = self.settings.get("cloudAgentEnabled") is True
         shortcuts, _ = normalize_shortcuts(self.settings.get("shortcuts"))
         self.settings["shortcuts"] = shortcuts or default_shortcuts()
         try:
@@ -333,6 +336,8 @@ class Studio(QObject):
         self.update_running=False
         self._storage_report = json.dumps({"status":"idle","cancelled":False,"truncated":False,"scannedEntries":0,"categories":[]})
         self.storage_busy = False
+        self.storage_cleanup_busy = False
+        self.storage_cleanup_status = ""
         self._storage_cancel_event = None
         self.python_status=""
         self.python_choices=[]
@@ -450,6 +455,32 @@ class Studio(QObject):
             restore_generation = self._activation_generation
             QTimer.singleShot(0,lambda:[self._open_note(path, explicit=False, activation_generation=restore_generation) for path in self._startup_order])
         self._refresh_theme()
+        # Only the first real desktop window may restore the user's opted-in
+        # cloud connection. The cloud client handles network retry/backoff.
+        if not isolated and len(self.session.windows) == 1 and self.settings.get("cloudAgentEnabled"):
+            QTimer.singleShot(0, self._restore_cloud_connection)
+
+    def _restore_cloud_connection(self):
+        if self.retired or not self.settings.get("cloudAgentEnabled") or self._cloud_revocation_pending:
+            return
+        bridge = getattr(self.session, "agent_bridge", None)
+        if bridge is None or bridge.cloudClient.enabled:
+            return
+        try:
+            try:
+                from .agent_cloud import read_cloud_config
+            except ImportError:
+                from agent_cloud import read_cloud_config
+            config = read_cloud_config(self._agent_cloud_config_path)
+            was_enabled = bridge.enabled
+            bridge.start_cloud(config)
+            self._cloud_started_local_bridge = not was_enabled
+            self._agent_cloud_error = ""
+        except Exception as error:
+            # Keep the opt-in on transient errors so the user can retry without
+            # re-pairing. Invalid pairing is surfaced, never silently replaced.
+            self._agent_cloud_error = f"Cloud auto-connect failed: {str(error)[:140]}"
+        self._emit(False)
 
     @property
     def recent(self): return self.session.recent
@@ -1077,6 +1108,10 @@ class Studio(QObject):
             if not skill_path.is_file() and not getattr(sys, "frozen", False):
                 skill_path = ROOT / "docs" / "skills" / "super-md" / "SKILL.md"
             skill = skill_path.read_text(encoding="utf-8")
+            if skill_path.parent.name == "super-md":
+                # The source-tree router needs its connection reference flattened
+                # into this standalone private setup export.
+                skill += "\n\n" + (skill_path.parent / "references" / "agent-connection.md").read_text(encoding="utf-8")
             guide = (skill + "\n\n# Connection for this installation\n\n"
                      "This local MCP server can inspect and revise tabs that are open in this Super MD app session. "
                      "It runs over stdio and reads the private, temporary discovery directory shown below.\n\n"
@@ -1143,6 +1178,38 @@ class Studio(QObject):
 
     @Property(bool,notify=changed)
     def storageBusy(self):return self.storage_busy
+
+    @Property(bool,notify=changed)
+    def storageCleanupBusy(self):return self.storage_cleanup_busy
+
+    @Property(str,notify=changed)
+    def storageCleanupStatus(self):return self.storage_cleanup_status
+
+    @Slot(str)
+    def clearStorageCategory(self, category):
+        if category not in ("execution-results", "update-state"):
+            self.storage_cleanup_status = "This storage category is protected."
+            self._emit(False)
+            return
+        if self.retired or self.storage_busy or self.storage_cleanup_busy or (category == "update-state" and (self.update_running or self.update_path)):
+            self.storage_cleanup_status = "Cleanup is unavailable while storage or updates are in use."
+            self._emit(False)
+            return
+        self.storage_cleanup_busy = True
+        self.storage_cleanup_status = ""
+        self._emit(False)
+        def done(result,error):
+            self.storage_cleanup_busy = False
+            self.storage_cleanup_status = ("Cleanup failed; app files were not intentionally changed." if error or not result else "Temporary app data cleared. Notes and recovery preserved.")
+            self._emit(False)
+            self.inspectStorage()
+        self._submit(lambda:clear_storage_category(self.data,category),done,False)
+
+    @Slot()
+    def openLatestGitHubRelease(self):
+        if not QDesktopServices.openUrl(QUrl(updates.REPO + "/releases/latest")):
+            self.message = "Could not open the latest GitHub release in your browser."
+        self._emit(False)
 
     @Slot()
     def inspectStorage(self):
@@ -1239,6 +1306,11 @@ class Studio(QObject):
                 return updates.release_info(updates.bounded_json(updates.API),self.appVersion,linux_kind=linux_kind),None
             except Exception as failure:return None,failure
         self._submit(check,lambda result,error:done(*(result or (None,error))),False)
+
+    @Property(bool,notify=changed)
+    def backgroundEnabled(self):
+        service=getattr(self.session,"background",None)
+        return bool(service and service.enabled and not service.quitting)
 
     @Property(str,notify=changed)
     def pythonStatus(self): return self.python_status
@@ -1451,9 +1523,19 @@ class Studio(QObject):
         return preferred + sorted(set(QFontDatabase.families()) - set(preferred))
 
     @Property(bool, constant=True)
-    def captionlessDesktop(self):
+    def fedoraWindowFrame(self):
+        if not sys.platform.startswith("linux"):
+            return False
+        try:
+            return platform.freedesktop_os_release().get("ID") == "fedora"
+        except OSError:
+            return False
+
+    @Property(bool, constant=True)
+    def showToolbarWindowControls(self):
         desktop = os.environ.get("XDG_CURRENT_DESKTOP", "").lower()
-        return sys.platform.startswith("linux") and any(name in desktop for name in ("hyprland", "sway", "river", "niri"))
+        return self.fedoraWindowFrame or (sys.platform.startswith("linux") and
+            any(name in desktop for name in ("hyprland", "sway", "river", "niri")))
 
     @Slot()
     def chooseFont(self): self.fontPickerRequested.emit()
@@ -2092,7 +2174,8 @@ class Studio(QObject):
 
     @Slot(str, result=QUrl)
     def defaultExportLocation(self, format):
-        return self.defaultSaveLocation(Path(self._current()["name"]).stem + "." + format)
+        suffix = "zip" if format == "mdzip" else format
+        return self.defaultSaveLocation(Path(self._current()["name"]).stem + "." + suffix)
 
     @Slot(str)
     def closeTab(self, id):
@@ -2201,7 +2284,7 @@ class Studio(QObject):
             self.message = str(error)
             self._emit(False)
             return
-        if format == "md": self.readerCall.emit("window.supermdExportMarkdown?.()")
+        if format in ("md", "mdzip"): self.readerCall.emit(f"window.supermdExportMarkdown?.({str(format == 'mdzip').lower()})")
         elif format == "smd": self.readerCall.emit("window.supermdPortable?.(false)")
         else: self.readerCall.emit(f"window.supermdExport?.({json.dumps(self.settings['pdf'])})")
 
@@ -2881,6 +2964,9 @@ class Studio(QObject):
             return
         if self._agent_viewport_revision(tab_id) != revision:
             raise ValueError("The live tab changed before its viewport was captured")
+        if self.host_window is not None and not self.host_window.isVisible():
+            self._capture_background_preview(request_id,tab_id,revision,context,args)
+            return
         bounds = context.get("viewport")
         if not isinstance(bounds, dict):
             raise ValueError("Reader viewport bounds are unavailable")
@@ -2915,6 +3001,25 @@ class Studio(QObject):
         # Some software Qt backends do not emit frameSwapped for an unchanged
         # exposed window. Try a bounded capture after 200 ms in that case.
         QTimer.singleShot(200, lambda rid=request_id: self._agent_viewport_fallback(rid))
+
+    def _capture_background_preview(self, request_id, tab_id, revision, context, args):
+        from offline_view import render_live_snapshot
+        tab=next(t for t in self.tabs if t["id"]==tab_id)
+        content,assets,path=tab["content"],copy.deepcopy(tab.get("assets",{})),tab.get("path","")
+        width=max(320,min(1600,int(args.get("width",1200))))
+        heading=context.get("reading",{}).get("heading") or None
+        view={"dark":self._dark(),"colors":self._colors(),"font":self.settings["font"],"size":self.settings["size"],"svgAppearance":self.settings["svgAppearance"],"lineHeight":self.settings["lineHeight"]}
+        def done(body,error):
+            bridge=getattr(self.session,"agent_bridge",None)
+            if bridge is None:return
+            if error:bridge.complete(request_id,None,str(error),window_id=self.window_id);return
+            if self._agent_viewport_revision(tab_id)!=revision:
+                bridge.complete(request_id,None,"The note changed during background preview; retry",window_id=self.window_id);return
+            image=QImage.fromData(body,"PNG")
+            mime="image/jpeg" if args.get("imageFormat")=="jpeg" else "image/png"
+            encoded=QByteArray();buffer=QBuffer(encoded);buffer.open(QIODevice.WriteOnly);image.save(buffer,"JPEG" if mime=="image/jpeg" else "PNG")
+            bridge.complete(request_id,{"tabId":tab_id,"revision":revision,"mime_type":mime,"data":base64.b64encode(bytes(encoded)).decode(),"width":image.width(),"height":image.height(),"context":context,"renderedFrom":"background-preview"},window_id=self.window_id)
+        self._submit(lambda:render_live_snapshot(content,assets,path,width=width,heading=heading,view=view),done,False)
 
     def _clear_agent_viewport_capture(self, pending):
         if self._agent_viewport_capture is not pending:
@@ -3051,6 +3156,23 @@ class Studio(QObject):
                 if self.fullscreen: self.chromeRequested.emit(action)
                 self.replied.emit(id,"true",""); return
             if command == "reader_overlay_changed": self.reader_overlay = bool(args.get("open")); self.image_overlay = bool(args.get("image")); self._emit(False); self.replied.emit(id,"true",""); return
+            if command == "copy_image_native":
+                body = args.get("body")
+                if args.get("mimeType") != "image/png" or not isinstance(body, str) or len(body) > 34_000_000:
+                    raise ValueError("Clipboard image must be a PNG under 25 MB")
+                try:
+                    data = base64.b64decode(body, validate=True)
+                except (ValueError, base64.binascii.Error):
+                    raise ValueError("Clipboard image is not valid base64") from None
+                if not data.startswith(b"\x89PNG\r\n\x1a\n") or len(data) < 24 or len(data) > 25_000_000:
+                    raise ValueError("Clipboard image is not a valid PNG")
+                width, height = int.from_bytes(data[16:20], "big"), int.from_bytes(data[20:24], "big")
+                if not 0 < width <= 4096 or not 0 < height <= 4096 or width * height > 16_000_000:
+                    raise ValueError("Clipboard image dimensions exceed the limit")
+                image = QImage.fromData(data, "PNG")
+                if image.isNull(): raise ValueError("Clipboard PNG could not be decoded")
+                QGuiApplication.clipboard().setImage(image)
+                self.replied.emit(id, "true", ""); return
             if command == "copy_text":
                 text=args.get("text")
                 if not isinstance(text,str) or len(text)>2_000_000:raise ValueError("Clipboard text is too large or invalid")
@@ -3175,7 +3297,7 @@ class Studio(QObject):
             # PDF bytes in an SMD file (or overwrite a portable note with text).
             expected_suffixes = {
                 "export_pdf_native": (".pdf",),
-                "export_markdown_native": (".md", ".markdown", ".txt"),
+                "export_markdown_native": (".md", ".markdown", ".txt", ".zip"),
                 "export_fmd_native": (".smd",),
             }
             if command in expected_suffixes and not (command == "export_fmd_native" and args.get("save")):
@@ -3194,6 +3316,7 @@ class Studio(QObject):
                 return {"path": str(path)}
             def work():
                 if command == "load_asset": return self._asset(captured,args["source"])
+                if command == "load_text_asset": return {"text": self._text_asset(captured,args["source"])}
                 if command == "load_font": return self.session.font_store.reader(args["family"])
                 if command == "cache_python_output":
                     if context and args["result"].get("provenance",{}).get("verified") is False:raise ValueError("Legacy output cannot be promoted to verified output")
@@ -3228,8 +3351,12 @@ class Studio(QObject):
                             return {**result,"provenance":{"verified":False,"unsaved":True,"reason":f"Could not save execution output: {error}"}}
                     return result
                 if command == "export_markdown_native":
-                    if not output or not isinstance(args["content"], str) or len(args["content"].encode()) > 20_000_000: raise ValueError("Choose a Markdown destination for a note under 20 MB")
-                    atomic_write(Path(output), args["content"].encode())
+                    if not output: raise ValueError("Choose a Markdown destination")
+                    if not isinstance(args.get("archive", False), bool): raise ValueError("archive must be a boolean")
+                    if captured.get("path") and Path(output).resolve() == Path(captured["path"]).resolve():
+                        raise ValueError("Markdown export must not overwrite the original note")
+                    if args.get("archive", False): write_markdown_zip(Path(output), args.get("content"), args.get("assets", {}))
+                    else: write_markdown_export(Path(output), args.get("content"), args.get("assets", {}))
                     return export_result(output)
                 if command == "export_fmd_native":
                     target = Path(captured["path"]) if args.get("save") else Path(output)
@@ -3393,6 +3520,22 @@ class Studio(QObject):
         mime = MIMES.get(path.suffix[1:].lower())
         if not mime: raise ValueError("Unsupported image type")
         return f"data:{mime};base64,{base64.b64encode(path.read_bytes()).decode()}"
+
+    def _text_asset(self, tab, source):
+        if not isinstance(source, str) or len(source) > 4096 or Path(source).suffix.lower() not in (".mmd", ".mermaid"):
+            raise ValueError("Only local .mmd or .mermaid source files can be inlined")
+        if not tab.get("path"): raise ValueError("Save this note to resolve relative diagram source files")
+        root = Path(tab["path"]).parent.resolve()
+        relative = urllib.parse.unquote(source.split("#", 1)[0].split("?", 1)[0])
+        requested = root / relative
+        current = root
+        for part in Path(relative).parts:
+            current = current / part
+            if current.is_symlink(): raise ValueError("Diagram source symlink paths are not allowed")
+        path = requested.resolve(strict=True)
+        if not path.is_relative_to(root) or not path.is_file(): raise ValueError("Diagram source is outside the note folder")
+        if path.stat().st_size > 2_000_000: raise ValueError("Diagram source exceeds 2 MB")
+        return path.read_text(encoding="utf-8")
 
     def _fetch(self, args):
         url = args["url"]

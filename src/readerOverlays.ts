@@ -7,5 +7,5 @@ export function setReaderOverlay(kind:string,open:boolean) {
   if(open)overlays.add(kind);else overlays.delete(kind);
   const present=overlays.size>0;
   document.documentElement.dataset.readerOverlay=String(present);
-  if(previous!==present || kind==="image")void invoke("reader_overlay_changed",{open:present,image:overlays.has("image")}).catch(()=>{});
+  if(previous!==present || kind==="image" || kind==="step-viewer")void invoke("reader_overlay_changed",{open:present,image:overlays.has("image")||overlays.has("step-viewer")}).catch(()=>{});
 }

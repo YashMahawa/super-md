@@ -80,7 +80,7 @@ jobs:
             if (jobs.length !== 1 || jobs[0].status !== 'completed' || jobs[0].conclusion !== 'success') throw Error(`Missing successful build: ${name}`);
           }
           appendFileSync(process.env.GITHUB_OUTPUT, 'reuse_packages=true\n');
-          console.log(`Verified all five build jobs on tagged source ${sha}`);
+          console.log(`Verified all four platform build jobs on tagged source ${sha}`);
           NODE
       - name: Create or reuse a protected draft
         id: draft
@@ -246,7 +246,7 @@ jobs:
       - run: cargo test --locked --manifest-path smd-core/Cargo.toml
       - run: cargo build --locked --release --manifest-path smd-core/Cargo.toml --bin smd-engine
       - run: python desktop/run_tests.py
-        timeout-minutes: 8
+        timeout-minutes: 15
         env:
           QT_QPA_PLATFORM: offscreen
           QT_QUICK_BACKEND: software

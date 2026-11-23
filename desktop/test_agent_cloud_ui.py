@@ -37,6 +37,44 @@ class CloudRevocationUITests(unittest.TestCase):
             self.assertEqual(studio.cloudRelayOrigin, "")
             self.assertEqual(studio.cloudConnectorUrl, "")
         finally:self.dispose(session,studio)
+    def test_cloud_autoconnect_reuses_existing_pairing_without_rotating_credentials(self):
+        from unittest.mock import Mock
+        session, studio, config = self.make_studio()
+        bridge = Mock()
+        bridge.enabled = False
+        bridge.cloudClient.enabled = False
+        session.agent_bridge = bridge
+        try:
+            studio.settings["cloudAgentEnabled"] = True
+            studio._restore_cloud_connection()
+            bridge.start_cloud.assert_called_once()
+            self.assertEqual(bridge.start_cloud.call_args.args[0]["deviceId"], config["deviceId"])
+            self.assertEqual(agent_cloud.read_cloud_config(studio._agent_cloud_config_path)["connectorKey"],
+                             config["connectorKey"])
+            self.assertTrue(studio._cloud_started_local_bridge)
+            self.assertEqual(studio._agent_cloud_error, "")
+            studio.settings["cloudAgentEnabled"] = False
+            studio._restore_cloud_connection()
+            bridge.start_cloud.assert_called_once()
+        finally:
+            self.dispose(session, studio)
+
+    def test_cloud_autoconnect_missing_pairing_shows_error_without_creating_new_pairing(self):
+        from unittest.mock import Mock
+        session, studio, _ = self.make_studio()
+        bridge = Mock()
+        bridge.cloudClient.enabled = False
+        session.agent_bridge = bridge
+        try:
+            studio._agent_cloud_config_path.unlink()
+            studio.settings["cloudAgentEnabled"] = True
+            studio._restore_cloud_connection()
+            bridge.start_cloud.assert_not_called()
+            self.assertIn("Cloud auto-connect failed", studio.cloudAgentStatus)
+            self.assertFalse(studio.cloudAgentConfigured)
+        finally:
+            self.dispose(session, studio)
+
     def test_explicit_revoke_runs_off_ui_thread_then_erases_config(self):
         session,studio,config=self.make_studio(); started=threading.Event(); release=threading.Event(); errors=[]
         def revoke(value,timeout):

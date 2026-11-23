@@ -192,18 +192,25 @@ class StudioUiTest {
         val original=model.state.value.active.content
         val oldAutofix=model.state.value.latexAutofix
         val prefs=compose.activity.getSharedPreferences("studio",0)
+        val clipboard = compose.activity.getSystemService(android.content.ClipboardManager::class.java)
         try {
             assertFalse(StudioState().latexAutofix)
-            compose.runOnIdle {model.latexAutofix(false);model.mode("editor");model.edit(model.state.value.active.id,"Start here.")}
+            clipboard.setPrimaryClip(android.content.ClipData.newPlainText("Super MD test", "theme-guide-copy-not-run"))
+            // mode() is asynchronous: it waits for a WebView reader barrier.
+            // Editing in the same idle callback can race that transition on
+            // slower Android 16 emulators and leave the editor with stale text.
+            compose.runOnIdle { model.latexAutofix(false); model.mode("editor") }
+            compose.waitUntil(15_000) { model.state.value.mode == "editor" }
+            javascriptUntil("!!document.querySelector('.cm-content')", { it == "true" })
+            compose.runOnIdle { model.edit(model.state.value.active.id, "Start here.") }
             javascriptUntil("document.querySelector('.cm-content')?.textContent==='Start here.'",{it=="true"})
             compose.onNodeWithContentDescription("More actions").performClick()
             compose.onNodeWithText("Settings").performClick()
             compose.onNodeWithText("Appearance").performClick()
             compose.onNodeWithText("Theme authoring guide").performScrollTo().performClick()
             javascriptUntil("!!document.querySelector('.theme-guide-dialog .markdown-body h1')",{it=="true"})
-            javascriptUntil("(()=>{const b=[...document.querySelectorAll('.theme-guide-dialog button')].find(b=>b.textContent==='Copy guide');if(b)b.click();return true})()",{it=="true"})
-            javascriptUntil("document.querySelector('.theme-guide-dialog')?.textContent.includes('Copied')",{it=="true"})
-            val clipboard = compose.activity.getSystemService(android.content.ClipboardManager::class.java)
+            javascriptUntil("(()=>{const b=[...document.querySelectorAll('.theme-guide-dialog button')].find(b=>b.textContent==='Copy guide');return !!b&&!b.disabled})()",{it=="true"})
+            javascriptUntil("(()=>{const b=[...document.querySelectorAll('.theme-guide-dialog button')].find(b=>b.textContent==='Copy guide');if(!b||b.disabled)return false;b.click();return true})()",{it=="true"})
             compose.waitUntil(5_000) {
                 runCatching {
                     val text=clipboard.primaryClip?.getItemAt(0)?.text?.toString().orEmpty()
@@ -636,8 +643,21 @@ class StudioUiTest {
         }
         javascriptUntil("(()=>{const i=document.querySelector('.reading-search input');if(!i)return false;window.__searchKeyTrace=[];for(const name of ['keydown','beforeinput','input'])i.addEventListener(name,e=>window.__searchKeyTrace.push({type:e.type,key:e.key??null,keyCode:e.keyCode??null,data:e.data??null,inputType:e.inputType??null,ctrl:e.ctrlKey??false,meta:e.metaKey??false,shift:e.shiftKey??false,start:i.selectionStart,end:i.selectionEnd,value:i.value}),true);return true})()") { it == "true" }
         try {
-            shellOutput("input text focusneedle")
-            instrumentation.waitForIdleSync()
+            // Android 15 emulator shell `input text` can deliver a whole string
+            // out of order (observed "ofcusneedle"), despite a focused WebView.
+            // Inject actual native key events in sequence, awaiting each DOM
+            // update; this still tests Android -> WebView -> React input.
+            val expectedQuery = "focusneedle"
+            for (index in expectedQuery.indices) {
+                val char = expectedQuery[index]
+                val key = android.view.KeyEvent.keyCodeFromString("KEYCODE_${char.uppercaseChar()}")
+                assertTrue("Missing Android key code for $char", key != android.view.KeyEvent.KEYCODE_UNKNOWN)
+                instrumentation.sendKeyDownUpSync(key)
+                val prefix = expectedQuery.substring(0, index + 1)
+                javascriptUntil("document.querySelector('.reading-search input')?.value", 3_000) {
+                    it == org.json.JSONObject.quote(prefix)
+                }
+            }
             try {
                 javascriptUntil("document.querySelector('.reading-search input')?.value", 2_000) { it == "\"focusneedle\"" }
             } catch (failure: AssertionError) {
@@ -1032,7 +1052,7 @@ ax.set_title("Matplotlib 3D figure")
             for(format in formats) {
                 compose.runOnIdle { assertTrue("Could not prepare $format share",model.prepareShare(format)) }
                 when(format) {
-                    "md" -> kotlinx.coroutines.runBlocking { model.shareMarkdown(content) }
+                    "md" -> kotlinx.coroutines.runBlocking { model.shareMarkdown(model.state.value.active.id, content, org.json.JSONObject(), false) }
                     "smd" -> kotlinx.coroutines.runBlocking { model.writePortable(id,content,org.json.JSONObject(),save=false,originalContent=content) }
                     "pdf" -> kotlinx.coroutines.runBlocking { model.export(content,model.state.value.pdf,org.json.JSONObject()) }
                 }

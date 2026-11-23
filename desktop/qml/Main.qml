@@ -14,7 +14,7 @@ ApplicationWindow {
     minimumWidth: 760
     minimumHeight: 520
     visible: false
-    flags: windowModes.immersive ? Qt.Window | Qt.FramelessWindowHint : Qt.platform.os === "osx" || Qt.platform.os === "windows" ? Qt.Window | Qt.ExpandedClientAreaHint | Qt.NoTitleBarBackgroundHint : Qt.Window
+    flags: (studio.fedoraWindowFrame || windowModes.immersive) ? Qt.Window | Qt.FramelessWindowHint : Qt.platform.os === "osx" || Qt.platform.os === "windows" ? Qt.Window | Qt.ExpandedClientAreaHint | Qt.NoTitleBarBackgroundHint : Qt.Window
     title: viewState.name + " - Super MD"
     property var viewState: JSON.parse(studio.snapshot)
     property var reader: readerLoader.item
@@ -47,6 +47,26 @@ ApplicationWindow {
         id: windowModes
         host: window
         onFullscreenChanged: { window.chromeAwake = !fullscreen; chromeIdle.stop(); studio.setFullscreen(fullscreen) }
+    }
+    Repeater {
+        parent: Overlay.overlay
+        model: studio.fedoraWindowFrame && window.visibility === Window.Windowed
+            ? [Qt.LeftEdge, Qt.RightEdge, Qt.TopEdge, Qt.BottomEdge,
+               Qt.LeftEdge | Qt.TopEdge, Qt.RightEdge | Qt.TopEdge,
+               Qt.LeftEdge | Qt.BottomEdge, Qt.RightEdge | Qt.BottomEdge] : []
+        delegate: MouseArea {
+            required property int modelData
+            readonly property int horizontalEdge: modelData & (Qt.LeftEdge | Qt.RightEdge)
+            readonly property int verticalEdge: modelData & (Qt.TopEdge | Qt.BottomEdge)
+            width: horizontalEdge ? 5 : parent.width
+            height: verticalEdge ? 5 : parent.height
+            x: modelData & Qt.RightEdge ? parent.width - width : 0
+            y: modelData & Qt.BottomEdge ? parent.height - height : 0
+            z: -1
+            cursorShape: !horizontalEdge ? Qt.SizeVerCursor : !verticalEdge ? Qt.SizeHorCursor
+                : (horizontalEdge === Qt.LeftEdge) === (verticalEdge === Qt.TopEdge) ? Qt.SizeFDiagCursor : Qt.SizeBDiagCursor
+            onPressed: window.startSystemResize(modelData)
+        }
     }
     function runDocumentScript(script) {
         if (!reader) return
@@ -226,7 +246,11 @@ ApplicationWindow {
 
     Connections {
         target: studio
-        function onAllowClose() { flushDialog.close(); closeDialog.close(); intentionalShutdown = true; closingAllowed = true; window.close() }
+        function onAllowClose() {
+            flushDialog.close(); closeDialog.close()
+            if (studio.backgroundEnabled) { window.hide(); return }
+            intentionalShutdown = true; closingAllowed = true; window.close()
+        }
         function onFlushFailed(canClose) { if(!closingAllowed && !closeDialog.visible) { flushDialog.canClose = canClose; flushDialog.open() } }
         function onCloseRequested(name) { flushDialog.close(); closeDialog.title = "Save changes to " + name + "?"; if(!closeDialog.visible) closeDialog.open() }
         function onSaveRequested(name) { saveDialog.selectedFile = studio.defaultSaveLocation(name); saveDialog.open() }
@@ -319,23 +343,37 @@ ApplicationWindow {
                 ActionButton { glyph: "FloppyDisk"; ToolTip.text: "Save note (" + window.shortcutLabels.save + ")"; onClicked: studio.saveSafely(); enabled: !viewState.busy }
                 ActionButton { glyph: "Undo"; ToolTip.text: "Undo (" + window.shortcutLabels.undo + ")"; onClicked: studio.command("undo") }
                 ActionButton { glyph: "Redo"; ToolTip.text: "Redo (" + window.shortcutLabels.redo + ")"; onClicked: studio.command("redo") }
-                Item { Layout.fillWidth: true }
+                Item {
+                    Layout.fillWidth: true
+                    Layout.fillHeight: true
+                    DragHandler {
+                        enabled: studio.fedoraWindowFrame
+                        target: null
+                        onActiveChanged: if (active) window.startSystemMove()
+                    }
+                    TapHandler {
+                        enabled: studio.fedoraWindowFrame
+                        onDoubleTapped: window.visibility === Window.Maximized ? window.showNormal() : window.showMaximized()
+                    }
+                }
                 ActionButton { glyph: "MagnifyingGlass"; ToolTip.text: "Find in note (" + window.shortcutLabels.find + ")"; onClicked: window.openFind() }
                 ActionButton { visible: window.width >= 1060; glyph: "Image"; ToolTip.text: "Insert image or link"; onClicked: studio.command("insert") }
                 ActionButton { visible: window.width >= 1060; glyph: "Bug"; ToolTip.text: "Fix LaTeX"; onClicked: studio.command("repair") }
                 ActionButton { visible: window.width >= 1060; glyph: "ShareNetwork"; ToolTip.text: "Share note"; onClicked: window.showExport(true) }
                 ActionButton {
                     visible: window.width < 1060; glyph: "More"; ToolTip.text: "More note actions"; onClicked: noteActions.popup()
-                    Menu {
+                    NoteContextMenu {
                         id: noteActions
-                        MenuItem { text: "Insert image or link"; onTriggered: studio.command("insert") }
-                        MenuItem { text: "Fix LaTeX"; onTriggered: studio.command("repair") }
-                        MenuItem { text: "Share note"; onTriggered: window.showExport(true) }
+                        objectName: "compactNoteActions"
+                        implicitWidth: 250
+                        NoteMenuItem { text: "Insert image or link"; icon.source: "../icons/Image.svg"; onTriggered: studio.command("insert") }
+                        NoteMenuItem { text: "Fix LaTeX"; icon.source: "../icons/Bug.svg"; onTriggered: studio.command("repair") }
+                        NoteMenuItem { text: "Share note"; icon.source: "../icons/ShareNetwork.svg"; onTriggered: window.showExport(true) }
                     }
                 }
                 ActionButton { text: window.width < 1060 ? "" : "Export"; glyph: "Export"; ToolTip.text: "Export note"; prominent: true; enabled: !viewState.busy; onClicked: window.showExport(false) }
                 ActionButton { glyph: "GearSix"; ToolTip.text: "Settings"; onClicked: settingsOpen = !settingsOpen }
-                WindowControls { visible: studio.captionlessDesktop; host: window; colors: viewState.colors; Layout.preferredWidth: 124; Layout.preferredHeight: 36; Layout.alignment: Qt.AlignVCenter; onCloseRequested: studio.closeWindowSafely() }
+                WindowControls { visible: studio.showToolbarWindowControls; host: window; colors: viewState.colors; Layout.preferredWidth: 124; Layout.preferredHeight: 36; Layout.alignment: Qt.AlignVCenter; onCloseRequested: studio.closeWindowSafely() }
             }
         }
         TabStrip {
@@ -615,8 +653,8 @@ ApplicationWindow {
             objectName: "exportDestination"
             title: "Export note"
             fileMode: FileDialog.SaveFile
-            defaultSuffix: exportFormat
-            nameFilters: exportFormat === "pdf" ? ["PDF (*.pdf)"] : exportFormat === "md" ? ["Markdown (*.md)"] : ["Portable Super MD (*.smd)"]
+            defaultSuffix: exportFormat === "mdzip" ? "zip" : exportFormat
+            nameFilters: exportFormat === "pdf" ? ["PDF (*.pdf)"] : exportFormat === "md" ? ["Markdown (*.md)"] : exportFormat === "mdzip" ? ["Markdown bundle (*.zip)"] : ["Portable Super MD (*.smd)"]
             onAccepted: { studio.exportTo(selectedFile.toString(), exportFormat); destroy() }
             onRejected: destroy()
         }
@@ -624,15 +662,16 @@ ApplicationWindow {
     AppDialog {
         id: exportDialog
         objectName: "exportDialog"
+        property var availableFormats: ["pdf", "smd", "md", "mdzip"]
         title: sharing ? "Share note" : "Export note"
         width: Math.min(window.width - 48, Math.max(500, Math.min(720, window.width * .44)))
-        height: outputFormat === "pdf" ? Math.min(window.height - 48, Math.max(620, Math.min(900, window.height * .9))) : Math.min(window.height - 48, 390)
+        height: Math.min(window.height - 48, Math.max(460, Math.min(900, window.height * .85)))
         standardButtons: Dialog.Cancel
         ColumnLayout {
             anchors.fill: parent
             spacing: 16 * exportDialog.uiScale
             Label { text: sharing ? "Choose a format. Sharing availability depends on your desktop." : "PDF preserves the layout. Portable SMD includes editable Markdown and images."; wrapMode: Text.WordWrap; Layout.fillWidth: true }
-            ChoiceField { Layout.fillWidth: true; Layout.minimumHeight: 48 * exportDialog.uiScale; font: exportDialog.font; visible: model.length > 1; model: sharing ? ["PDF", "Portable SMD", "Markdown"] : viewState.portable ? ["PDF"] : ["PDF", "Portable SMD"]; currentIndex: outputFormat === "pdf" ? 0 : outputFormat === "smd" ? 1 : 2; onActivated: outputFormat = currentIndex === 0 ? "pdf" : currentIndex === 1 ? "smd" : "md" }
+            ChoiceField { Layout.fillWidth: true; Layout.minimumHeight: 48 * exportDialog.uiScale; font: exportDialog.font; visible: model.length > 1; model: exportDialog.availableFormats.map(format => format === "pdf" ? "PDF" : format === "smd" ? "Portable SMD" : format === "md" ? "Markdown" : "Markdown ZIP"); currentIndex: Math.max(0, exportDialog.availableFormats.indexOf(outputFormat)); onActivated: outputFormat = exportDialog.availableFormats[currentIndex] }
             ScrollView {
                 id: exportScroll
                 Layout.fillWidth: true
@@ -644,7 +683,7 @@ ApplicationWindow {
                 ColumnLayout {
                     width: exportScroll.availableWidth
                     PdfControls { objectName: "exportPdfControls"; uiScale: exportDialog.uiScale; controlFont: exportDialog.font; ownerPopup: exportDialog; visible: outputFormat === "pdf"; Layout.fillWidth: true; viewportItem: exportScroll.contentItem; options: viewState.settings.pdf; onEdited: options => studio.setting("pdf", JSON.stringify(options)) }
-                    Label { visible: outputFormat !== "pdf"; Layout.fillWidth: true; wrapMode: Text.WordWrap; text: outputFormat === "md" ? "Editable Markdown text. Choose portable SMD to include images in one file." : "A portable .smd keeps the editable Markdown and images together. Source mode never shows embedded image bytes." }
+                    Label { visible: outputFormat !== "pdf"; Layout.fillWidth: true; wrapMode: Text.WordWrap; text: outputFormat === "md" ? "Editable Markdown with raster images beside the file. Vector diagrams are embedded as SVG source." : outputFormat === "mdzip" ? "Obsidian-ready Markdown and images in one ZIP. Sliders become static figures; diagrams and charts become linked SVG images." : "A portable .smd keeps the editable Markdown and images together. Source mode never shows embedded image bytes." }
                 }
             }
             ActionButton { text: sharing ? "Prepare share copy" : "Choose destination"; font: exportDialog.font; prominent: true; Layout.fillWidth: true; Layout.minimumHeight: 44 * exportDialog.uiScale; onClicked: window.chooseExportDestination() }
@@ -694,6 +733,14 @@ ApplicationWindow {
         anchors.fill: parent
         padding: 40
         background: Rectangle { color: window.color }
+        WindowControls {
+            visible: studio.fedoraWindowFrame
+            anchors.right: parent.right
+            anchors.top: parent.top
+            host: window
+            colors: viewState.colors
+            onCloseRequested: studio.closeWindowSafely()
+        }
         ColumnLayout {
             anchors.centerIn: parent
             width: Math.min(600, parent.width - 40)

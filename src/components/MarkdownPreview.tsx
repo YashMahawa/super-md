@@ -7,6 +7,9 @@ import rehypeKatex from "rehype-katex";
 import rehypeHighlight from "rehype-highlight";
 import { visit } from "unist-util-visit";
 import InteractiveChart from "./InteractiveChart";
+import StepCards from "./StepCards";
+import InlineDiagram,{parseDiagramSource} from "./InlineDiagram";
+import {parseBinaryTreeSource} from "./BinaryTree";
 import PythonCell from "./PythonCell";
 import SvgDiagram from "./SvgDiagram";
 import { remarkSvgBlocks } from "../svgBlocks";
@@ -111,11 +114,22 @@ function AssetImage({ src = "", alt = "", documentPath, trustedImageHosts, onTru
   const imageElement=useRef<HTMLImageElement>(null);
   const [sizedSource,setSizedSource]=useState('');
   const [assetEpoch,setAssetEpoch]=useState(0);
+  const [permissionRetry,setPermissionRetry]=useState(0);
   useEffect(()=>{
     const changed=()=>setAssetEpoch(value=>value+1);
     window.addEventListener('supermd-assets-changed',changed);
     return()=>window.removeEventListener('supermd-assets-changed',changed);
   },[]);
+  useEffect(()=>{
+    const restored=(event:Event)=>{
+      if(!error||isRemote||embedded)return;
+      const detail=(event as CustomEvent<{documentPath?:unknown;source?:unknown}>).detail;
+      if(!detail||String(detail.documentPath??'')!==(documentPath??'')||detail.source!==src)return;
+      commitMediaLayout(mediaElement.current,()=>{setError('');setResolved('');setPermissionRetry(value=>value+1);});
+    };
+    window.addEventListener('supermd-asset-access-restored',restored);
+    return()=>window.removeEventListener('supermd-asset-access-restored',restored);
+  },[documentPath,embedded,error,isRemote,src]);
   const svgBacking=useMemo(()=>svgDataBackdrop(resolved),[resolved]);
   const appearance=useContext(DocumentAppearance);
   const adaptsSvg=appearance?.svgAppearance==='auto'||appearance?.svgAppearance==='monochrome';
@@ -151,7 +165,7 @@ function AssetImage({ src = "", alt = "", documentPath, trustedImageHosts, onTru
       }
     })();
     return () => { active = false; };
-  }, [documentPath, embedded, isRemote, src, allowed, assetEpoch]);
+  }, [documentPath, embedded, isRemote, src, allowed, assetEpoch, permissionRetry]);
   useEffect(()=>{
     if(!resolved||error||isRemote&&!allowed)return;
     const svg=resolved.startsWith('data:image/svg+xml');
@@ -161,7 +175,7 @@ function AssetImage({ src = "", alt = "", documentPath, trustedImageHosts, onTru
   if (error) return <span ref={mediaElement} className="image-error" role="img" aria-label={alt || "Image unavailable"}>Image unavailable: {alt || src}<small>{error}</small></span>;
   if (!resolved) return <span ref={mediaElement} className="image-loading" role="status">Loading image…</span>;
   const sizing=sizedSource!==resolved;
-  return <span ref={mediaElement} className={`note-image ${resolved.startsWith('data:image/svg+xml')?'note-image--diagram':''} ${sizing?'image-loading':''} ${selected ? "is-selected" : ""}`} style={sizing?{width:'100%',boxSizing:'border-box'}:undefined} data-note-image-source={src} tabIndex={0} aria-label={`Image controls: ${alt || "Image"}`} onFocus={() => setSelected(true)} onBlur={(event) => { if (!event.currentTarget.contains(event.relatedTarget)) setSelected(false); }} onClick={(event) => { event.stopPropagation(); setSelected(true); event.currentTarget.focus(); }} onKeyDown={(event) => { if (event.key === "Escape") { setSelected(false); event.stopPropagation(); } }}>
+  return <span ref={mediaElement} className={`note-image ${resolved.startsWith('data:image/svg+xml')?'note-image--diagram':''} ${sizing?'image-loading':''} ${selected ? "is-selected" : ""}`} style={sizing?{width:'100%',boxSizing:'border-box'}:undefined} data-note-image-source={src} tabIndex={0} aria-label={`Image: ${alt || "Image"}`} onBlur={(event) => { if (!event.currentTarget.contains(event.relatedTarget)) setSelected(false); }} onContextMenu={(event) => { event.preventDefault(); event.stopPropagation(); setSelected(true); event.currentTarget.focus(); }} onKeyDown={(event) => { if (event.key === "Escape") { setSelected(false); event.stopPropagation(); } }}>
     {sizing&&<span role="status">Loading image…</span>}
     <img ref={imageElement} draggable={false} data-media-adapted={adaptsSvg&&svgBacking?'true':undefined} data-media-kind={resolved.startsWith('data:image/svg+xml')?'svg':'image'} data-light-ink={svgBacking==='#222026'?'true':undefined} style={{...(svgBacking?{'--svg-contrast-backing':svgBacking}:{}),...(sizing?{position:'absolute',height:0,visibility:'hidden'}:{})} as React.CSSProperties} src={adaptedSource} alt={alt} loading="lazy" decoding="async" onLoad={()=>{if(sizedSource!==resolved)commitMediaLayout(imageElement.current,()=>setSizedSource(resolved));}} onError={() => commitMediaLayout(imageElement.current,()=>setError("The image could not be decoded or loaded."))} />
     {selected && <span className="image-edit-tools" role="toolbar" aria-label="Selected image"><button onClick={(event) => { event.stopPropagation(); window.dispatchEvent(new CustomEvent("supermd-image-edit", { detail: { action: "replace", image: event.currentTarget.closest("[data-note-image-source]") } })); }}>Replace</button><button onClick={(event) => { event.stopPropagation(); window.dispatchEvent(new CustomEvent("supermd-image-edit", { detail: { action: "remove", image: event.currentTarget.closest("[data-note-image-source]") } })); }}>Remove</button></span>}
@@ -208,6 +222,9 @@ function MarkdownPreview({ markdown, documentPath, python, dark, trustedImageHos
             const pythonCell=['python','py'].includes(language||'')?analysis.pythonCells.find(cell=>cell.source===source&&cell.offset===offset):undefined;
             const context=documentPath&&pythonCell?{document:documentPath,cell:String(pythonCell.ordinal),interpreter:python||'embedded'}:undefined;
             const protectedBlock = (block: ReactNode) => <CodeBlockBoundary key={`${language}:${source}`} source={source}>{block}</CodeBlockBoundary>;
+            if (language === "smd-tree") return protectedBlock(<InlineDiagram diagram={parseBinaryTreeSource(source)}/>);
+            if (language === "smd-diagram") return protectedBlock(<InlineDiagram diagram={parseDiagramSource(source)}/>);
+            if (language === "smd-steps") return protectedBlock(<StepCards source={source} renderImage={(src,alt)=><AssetImage src={src} alt={alt} documentPath={documentPath} trustedImageHosts={trustedImageHosts} onTrustImageHost={onTrustImageHost}/>} renderChart={chartSource=><ThemedChart source={chartSource} dark={dark}/>} renderMarkdown={text=><MarkdownPreview markdown={text} documentPath={documentPath} python={python} dark={dark} trustedImageHosts={trustedImageHosts} onTrustImageHost={onTrustImageHost}/>} />);
             if (language === "smd-chart") return protectedBlock(<ThemedChart source={source} dark={dark} />);
             if (language === "svg") return protectedBlock(<ThemedSvg source={source} dark={dark} />);
             if (language === "mermaid") return protectedBlock(<Suspense fallback={<span className="image-loading" role="status">Loading diagram…</span>}><ThemedMermaid source={source} dark={dark} /></Suspense>);

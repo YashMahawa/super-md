@@ -35,7 +35,7 @@ if (root / "LICENSE").exists():
     data.append((str(root / "LICENSE"), "resources/licenses"))
 data += collect_data_files("PySide6", includes=["**/LICENSE*", "**/COPYING*", "**/licenses/**"])
 data += collect_data_files("certifi", includes=["cacert.pem"])
-hidden = ["PySide6.QtWebEngineCore", "PySide6.QtWebChannel", "PySide6.QtNetwork", "certifi"]
+hidden = ["PySide6.QtWebEngineWidgets", "PySide6.QtWidgets", "PySide6.QtWebEngineCore", "PySide6.QtWebChannel", "PySide6.QtNetwork", "certifi"]
 # The SDK loads transports and validators lazily. Bundle these once in the
 # shared onedir runtime; CLI startup still avoids importing the SDK or Qt.
 hidden += collect_submodules("mcp", filter=lambda name: name != "mcp.__main__" and name != "mcp.cli" and not name.startswith("mcp.cli."))

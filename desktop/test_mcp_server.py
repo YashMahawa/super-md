@@ -337,9 +337,22 @@ class OfficialMCPClientTest(unittest.IsolatedAsyncioTestCase):
             asset = await client.call_tool("document_assets", {"path": target, "action": "extract",
                                                                  "asset_name": "assets/diagram.svg",
                                                                  "expected_revision": "a" * 64})
-            svg_block = next(block for block in asset.content if isinstance(block, ImageContent))
-            self.assertEqual(svg_block.mime_type, "image/svg+xml")
-            self.assertEqual(base64.b64decode(svg_block.data), b"<svg xmlns='http://www.w3.org/2000/svg'></svg>")
+            self.assertFalse(asset.is_error, asset.content)
+            self.assertFalse(any(isinstance(block, ImageContent) for block in asset.content))
+            svg_page = json.loads(asset.content[0].text)
+            self.assertEqual(svg_page["mime_type"], "image/svg+xml")
+            self.assertEqual(svg_page["source"], "<svg xmlns='http://www.w3.org/2000/svg'></svg>")
+            self.assertIsNone(svg_page["next_offset"])
+            first_page = await client.call_tool("document_assets", {"path": target, "action": "extract",
+                "asset_name": "assets/diagram.svg", "expected_revision": "a" * 64,
+                "source_offset": 0, "source_limit": 12})
+            self.assertFalse(first_page.is_error, first_page.content)
+            first = json.loads(first_page.content[0].text)
+            self.assertEqual(first["source"], "<svg xmlns='")
+            second_page = await client.call_tool("document_assets", {"path": target, "action": "extract",
+                "asset_name": "assets/diagram.svg", "expected_revision": "a" * 64,
+                "source_offset": first["next_offset"], "source_limit": 12000})
+            self.assertEqual(first["source"] + json.loads(second_page.content[0].text)["source"], svg_page["source"])
             exported = await client.call_tool("document_action", {"action": "export", "path": target,
                                                                      "format": "pdf", "expected_revision": "a" * 64,
                                                                      "options": {"section": "Unsaved"}})

@@ -282,7 +282,10 @@ test('long-held outside release keeps later mouse selections active at fractiona
       for(let step=1;step<=30;step++){
         const fraction=step/30;await page.mouse.move(points.start.x+(points.end.x-points.start.x)*fraction,points.start.y+(points.end.y-points.start.y)*fraction);await page.waitForTimeout(40);
       }
-      if(releaseOutside){await page.mouse.move(2190,1172);await page.waitForTimeout(50);}
+      // Exit horizontally at the current row. A diagonal move into the
+      // bottom-right browser edge triggers native page auto-scroll and pushes
+      // the next target against the top edge, conflating two gestures.
+      if(releaseOutside){await page.mouse.move(await page.evaluate(()=>window.innerWidth+8),points.end.y);await page.waitForTimeout(50);}
       await page.mouse.up();
     };
     await slowDrag(await pointsFor(first),1200);

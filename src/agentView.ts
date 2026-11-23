@@ -3,16 +3,28 @@ import {agentCharLength} from './agentOperations';
 import type {ExportableMedia} from './mediaExport';
 import {mediaAt} from './mediaExport';
 import {invoke} from './nativeBridge';
-export interface AgentDiagram {id:string;kind:string;source:string;start:number;end:number;url?:string;label?:string}
+import {parseStepDeck} from './components/StepCards';
+import {parseDiagramSource} from './components/InlineDiagram';
+import {parseBinaryTreeSource} from './components/BinaryTree';
+import {stepDiagramSvg} from './stepPdf';
+export interface AgentDiagram {id:string;kind:string;source:string;start:number;end:number;url?:string;label?:string;deckTitle?:string;stepLabel?:string;stepIndex?:number;stepCount?:number}
 /** Stable for this source revision; IDs avoid transmitting large artwork. */
 export function agentDiagrams(source:string):AgentDiagram[]{
   const result:AgentDiagram[]=[],tree=analyzeDocument(source).tree;
   const definitions=new Map<string,string>();
   const definitionsIn=(node:any)=>{if(node.type==='definition')definitions.set(node.identifier,node.url);for(const child of node.children??[])definitionsIn(child);};definitionsIn(tree);
   const walk=(node:any)=>{
-    if(node.type==='code'&&['svg','mermaid','smd-chart'].includes(node.lang)&&node.position){
+    if(node.type==='code'&&['svg','mermaid','smd-chart','smd-tree','smd-diagram'].includes(node.lang)&&node.position){
       const start=agentCharLength(source.slice(0,node.position.start.offset));
       result.push({id:`diagram:${start}`,kind:node.lang,source:node.value,start:node.position.start.offset,end:node.position.end.offset});
+    }
+    if(node.type==='code'&&node.lang==='smd-steps'&&node.position){
+      const deck=parseStepDeck(node.value),offset=agentCharLength(source.slice(0,node.position.start.offset));
+      deck?.steps.forEach((step,index)=>{
+        if(!step.image&&!step.diagram&&!step.chart)return;
+        const kind=step.image?'image':step.diagram?'smd-diagram':'smd-chart';
+        result.push({id:`diagram:step:${offset}:${index}`,kind,source:step.image?JSON.stringify({image:step.image,alt:step.alt||step.label}):step.diagram?JSON.stringify(step.diagram):step.chart!,start:node.position.start.offset,end:node.position.end.offset,...(step.image?{url:step.image}:{}),label:`${deck.title} — ${step.label}`,deckTitle:deck.title,stepLabel:step.label,stepIndex:index,stepCount:deck.steps.length});
+      });
     }
     if(['image','imageReference'].includes(node.type)&&node.position){
       const url=node.type==='image'?node.url:definitions.get(node.identifier);
@@ -23,7 +35,7 @@ export function agentDiagrams(source:string):AgentDiagram[]{
   walk(tree);return result;
 }
 export function diagramMetadata(source:string,diagram:AgentDiagram){
-  return {id:diagram.id,kind:diagram.kind,sourceStart:agentCharLength(source.slice(0,diagram.start)),sourceEnd:agentCharLength(source.slice(0,diagram.end)),sourceChars:agentCharLength(diagram.source),preview:diagram.kind==='svg'?'SVG drawing':diagram.kind==='image'?diagram.label:diagram.source.slice(0,160),...(diagram.url?{assetReference:diagram.url.startsWith('data:')?'(embedded image)':diagram.url.slice(0,512)}:{})};
+  return {id:diagram.id,kind:diagram.kind,sourceStart:agentCharLength(source.slice(0,diagram.start)),sourceEnd:agentCharLength(source.slice(0,diagram.end)),sourceChars:agentCharLength(diagram.source),preview:diagram.label||(diagram.kind==='svg'?'SVG drawing':diagram.source.slice(0,160)),...(diagram.deckTitle?{deckTitle:diagram.deckTitle,stepLabel:diagram.stepLabel,stepIndex:diagram.stepIndex,stepCount:diagram.stepCount}:{}),...(diagram.url?{assetReference:diagram.url.startsWith('data:')?'(embedded image)':diagram.url.slice(0,512)}:{})};
 }
 export async function diagramMedia(diagram:AgentDiagram,documentPath:string|null=null):Promise<ExportableMedia>{
   if(diagram.kind==='image'){
@@ -38,6 +50,11 @@ export async function diagramMedia(diagram:AgentDiagram,documentPath:string|null
       return {label:diagram.label||'Image',svg:()=>svg};
     }
     return {label:diagram.label||'Image',uri:()=>uri};
+  }
+  if(diagram.kind==='smd-tree'||diagram.kind==='smd-diagram'){
+    const parsed=diagram.kind==='smd-tree'?parseBinaryTreeSource(diagram.source):parseDiagramSource(diagram.source);
+    if(!parsed)throw Error('Invalid diagram source');
+    return {label:diagram.label||parsed.title||'Diagram',svg:()=>stepDiagramSvg(parsed)};
   }
   if(diagram.kind==='svg')return {label:'SVG drawing',svg:()=>diagram.source};
   if(diagram.kind==='mermaid'){const {renderMermaid}=await import('./mermaidRenderer');return {label:'Mermaid diagram',svg:()=>renderMermaid(diagram.source,false)};}

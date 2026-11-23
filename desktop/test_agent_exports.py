@@ -39,6 +39,13 @@ class AgentExportsTest(unittest.TestCase):
     def tearDown(self):
         self.temp.cleanup()
 
+    def test_sequence_assets_are_included_but_code_examples_are_not(self):
+        from agent_exports import _image_destinations
+        deck = json.dumps({"title": "Process", "steps": [{"label": "One", "image": "assets/one.svg"}, {"label": "Two", "image": "assets/two.svg"}]})
+        markdown = "```smd-steps\n" + deck + "\n```\n\n![Normal](three.svg)"
+        self.assertEqual(_image_destinations(markdown), ["three.svg", "assets/one.svg", "assets/two.svg"])
+        self.assertEqual(_image_destinations("````text\n" + markdown + "\n````"), [])
+
     def test_pdf_options_cover_all_desktop_controls_and_reject_invalid_values(self):
         options = validate_pdf_options({"pageSize": "letter", "margin": 22, "fontSize": 12,
                                         "lineHeight": 1.6, "paragraphSpacing": 1.2,

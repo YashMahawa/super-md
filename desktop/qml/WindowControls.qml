@@ -1,9 +1,7 @@
 import QtQuick
 import QtQuick.Controls
 
-// Captionless Linux compositors still get normal minimize/maximize/close
-// actions. Never replace Qt.Window with FramelessWindowHint: native tiling,
-// resizing and window-manager shortcuts must continue working.
+// The host owns the window frame and the unsaved-note close flow.
 Item {
     id: control
     required property var host

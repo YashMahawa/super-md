@@ -104,6 +104,26 @@ def compressed_bundle(markdown: str, assets: dict[str, str]) -> bytes:
         raise ValueError("Compressed SMD exceeds 120 MB")
     return data
 
+def _replace_with_windows_sharing_retry(source: str, target: Path) -> None:
+    """Preserve atomic replacement despite brief Windows AV/indexer file locks.
+
+    Only transient sharing/access-denied errors are retried, for at most one
+    second. Other errors fail immediately and the caller cleans up its temp.
+    """
+    if os.name != "nt":
+        os.replace(source, target)
+        return
+    import time
+    deadline = time.monotonic() + 1.0
+    while True:
+        try:
+            os.replace(source, target)
+            return
+        except PermissionError as error:
+            if getattr(error, "winerror", None) not in (5, 32) or time.monotonic() >= deadline:
+                raise
+            time.sleep(0.04)
+
 def write_portable(path: Path, markdown: str, assets: dict[str, str]) -> None:
     """Atomically save the unchanged v1 JSON envelope in deterministic gzip."""
     value = bundle(markdown, assets)
@@ -117,7 +137,7 @@ def write_portable(path: Path, markdown: str, assets: dict[str, str]) -> None:
                 raise ValueError("Compressed SMD exceeds 120 MB")
             raw.flush()
             os.fsync(raw.fileno())
-        os.replace(temporary, path)
+        _replace_with_windows_sharing_retry(temporary, path)
     finally:
         if os.path.exists(temporary):
             os.unlink(temporary)
@@ -176,7 +196,7 @@ def atomic_write(path: Path, data: bytes) -> None:
             file.write(data)
             file.flush()
             os.fsync(file.fileno())
-        os.replace(temporary, path)
+        _replace_with_windows_sharing_retry(temporary, path)
     finally:
         if os.path.exists(temporary):
             os.unlink(temporary)
@@ -190,7 +210,7 @@ def atomic_json(path: Path, value) -> None:
                 os.fchmod(file.fileno(),stat.S_IMODE(path.stat().st_mode))
             json.dump(value,file,ensure_ascii=False)
             file.flush();os.fsync(file.fileno())
-        os.replace(temporary,path)
+        _replace_with_windows_sharing_retry(temporary,path)
     finally:
         if os.path.exists(temporary):os.unlink(temporary)
 

@@ -26,6 +26,26 @@ class AgentSetupInstructionsTests(unittest.TestCase):
             self.assertIn("get_context", text)
             self.assertNotIn("pairingKey", text)
 
+    def test_source_fallback_exports_connection_reference_without_a_build(self):
+        import studio
+        import shutil
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source = Path(studio.__file__).resolve().parent.parent / "docs" / "skills" / "super-md"
+            shutil.copytree(source, root / "docs" / "skills" / "super-md")
+            destination = root / "agent guide.md"
+            setup = json.dumps({"command": "/apps/super-md", "args": ["agent", "mcp"]})
+            proxy = SimpleNamespace(agentAccessEnabled=True, agentSetupInstructions=setup,
+                                    cloudAgentConfigured=False, _emit=lambda *args: None)
+            with patch.object(studio, "ROOT", root):
+                Studio.saveAgentSetupInstructions(proxy, str(destination))
+            self.assertEqual(proxy._agent_error, "")
+            text = destination.read_text(encoding="utf-8")
+            self.assertTrue(text.startswith("---\nname: super-md\n"))
+            for required in [setup, "diagram-image", "asset_action", "get_context"]:
+                self.assertIn(required, text)
+            self.assertNotIn("pairingKey", text)
+
     @unittest.skipUnless(os.name == "posix", "venv Python symlinks require POSIX")
     def test_source_python_symlink_retains_its_virtual_environment(self):
         with tempfile.TemporaryDirectory() as directory:
