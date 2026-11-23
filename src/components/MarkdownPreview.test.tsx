@@ -97,4 +97,32 @@ describe("executable Python cells", () => {
     expect(html).toContain('class="python-cell"');
     expect(html).toContain("Run");
   });
+
+  it("renders smd-chart point arrays, NumPy [[1, 2]] cells, and inline/fenced Obsidian examples without mutating code", () => {
+    const markdown = [
+      "Documenting `[[Project Notes]]` and `![[diagram.png]]` alongside [[Note|real prose]].",
+      "",
+      "```smd-chart",
+      '{"title":"Sample curve","series":[{"points":[[0,1],[1,2]]}]}',
+      "```",
+      "",
+      "```python",
+      "arr = [[1, 2]]",
+      "```",
+      "",
+      "```markdown",
+      ":::callout tip Example",
+      ":::",
+      "```",
+    ].join("\n");
+    const html = renderToStaticMarkup(<MarkdownPreview markdown={markdown} documentPath={null} python="python3" dark={false} />);
+    expect(html).not.toContain("chart-warning");
+    expect(html).not.toContain("render-error");
+    expect(html).toContain("Sample curve");
+    expect(html).toContain("<code>[[Project Notes]]</code>");
+    expect(html).toContain("<code>![[diagram.png]]</code>");
+    expect(html).toContain('href="Note.md"');
+    expect(html).toContain('arr = [[<span class="hljs-number">1</span>, <span class="hljs-number">2</span>]]');
+    expect(html).toContain(":::callout tip Example");
+  });
 });
