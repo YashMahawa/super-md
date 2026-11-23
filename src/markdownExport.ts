@@ -15,12 +15,15 @@ const MIME_EXT: Record<string, string> = {
 };
 
 function refs(markdown: string): ImageRef[] {
+  const frontmatterEnd = markdown.match(/^---\r?\n(?:[\s\S]*?\r?\n)?---(?:\r?\n|$)/)?.[0].length ?? 0;
   const tree = unified().use(remarkParse).use(remarkGfm).use(remarkMath).use(remarkObsidianMath).parse(markdown);
   const definitions = new Map<string, any>();
   const result: ImageRef[] = [];
-  visit(tree, "definition", (node: any) => { definitions.set(node.identifier, node); });
+  visit(tree, "definition", (node: any) => {
+    if (node.position && node.position.start.offset >= frontmatterEnd) definitions.set(node.identifier, node);
+  });
   visit(tree, (node: any) => {
-    if (!node.position) return;
+    if (!node.position || node.position.start.offset < frontmatterEnd) return;
     if (node.type === "image") result.push({ source: node.url, start: node.position.start.offset, end: node.position.end.offset, image: true });
     if (node.type === "imageReference") {
       const definition = definitions.get(node.identifier);
@@ -89,10 +92,10 @@ function sourceFenceBlock(source: string, language: "svg" | "mermaid"): string {
  * written beside the exported Markdown by the native host; remote URLs remain
  * untouched and are never fetched as a side effect of export.
  */
-export async function prepareMarkdownExport(markdown: string, documentPath: string | null, options: {compatible?:boolean} = {}) {
+export async function prepareMarkdownExport(markdown: string, documentPath: string | null, options: {compatible?:boolean;python?:string} = {}) {
   if(options.compatible){
     const {compatibleMarkdown}=await import('./compatibleMarkdown');
-    markdown=await compatibleMarkdown(markdown,documentPath);
+    markdown=await compatibleMarkdown(markdown,documentPath,options.python);
   }
   const assets: Record<string, string> = {};
   const edits: Array<{ start: number; end: number; value: string }> = [];
@@ -154,13 +157,16 @@ export async function prepareMarkdownExport(markdown: string, documentPath: stri
     }
     const relative = cleanRelativePath(ref.source);
     const generatedKey = relative ?? ref.source;
-    const path = ref.source.startsWith("data:") || !relative || APP_GENERATED.test(relative)
+    const renamed = ref.source.startsWith("data:") || !relative || APP_GENERATED.test(relative);
+    const path = renamed
       ? allocateGeneratedPath(generatedKey, MIME_EXT[resolved.mime]) : relative;
     if (assets[path] && assets[path] !== resolved.dataUrl) throw Error(`Markdown asset path collision: ${path}`);
     if (!assets[path]) assets[path] = resolved.dataUrl;
-    if ((ref.image && path !== ref.source) || options.compatible && !ref.image && resolved.mime === "image/svg+xml") {
-      const label = ref.source.startsWith("data:") ? "Image" : ref.source.split("/").pop() || "Image";
-      const altMatch = markdown.slice(ref.start, ref.end).match(/^!\[([^\]]*)\]/);
+    if ((ref.image && renamed) || options.compatible && !ref.image && resolved.mime === "image/svg+xml") {
+      const slice = markdown.slice(ref.start, ref.end);
+      const wikilinkAlt = /^!\[\[[^\]|]+(?:\|([^\]]+))?\]\]$/.exec(slice);
+      const altMatch = wikilinkAlt ? [slice, wikilinkAlt[1] ?? ""] : slice.match(/^!\[([^\]]*)\]/);
+      const label = ref.source.startsWith("data:") ? "Image" : (relative ?? ref.source).split("/").pop() || "Image";
       const alt = (altMatch?.[1] || label).replace(/[\[\]\\]/g, "\\$&").replace(/[\r\n]+/g, " ");
       edits.push({ start: ref.start, end: ref.end, value: `![${alt}](<${path}>)` });
     }
