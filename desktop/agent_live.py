@@ -1235,14 +1235,13 @@ def _qt_bridge_class():
                                     studio.agentRequest.emit(json.dumps(request, ensure_ascii=False, separators=(",", ":")))
                                     return True
                                 host_window = getattr(studio, "host_window", None)
-                                hidden_unready = (
+                                hidden_window = (
                                     host_window is not None
                                     and not host_window.isVisible()
-                                    and not getattr(studio, "ready", False)
                                 )
                                 if (pending["payload"]["action"] == "patch_tab"
                                         and pending["payload"].get("tabId") == studio.active
-                                        and not hidden_unready):
+                                        and not hidden_window):
                                     # Let the active reader apply through its editor/history path. Native
                                     # patches remain appropriate for inactive tabs, where no reader view
                                     # exists and switching tabs would disturb the user's current draft.

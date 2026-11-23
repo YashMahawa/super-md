@@ -605,8 +605,7 @@ from pathlib import Path
 os.environ["QT_QPA_PLATFORM"] = "offscreen"
 os.environ["QT_QUICK_BACKEND"] = "software"
 os.environ.setdefault("QTWEBENGINE_CHROMIUM_FLAGS", "--disable-gpu --disable-dev-shm-usage")
-if sys.platform.startswith("linux"):
-    os.environ.setdefault("QTWEBENGINE_DISABLE_SANDBOX", "1")
+os.environ.setdefault("QTWEBENGINE_DISABLE_SANDBOX", "1")
 
 appdata = os.environ["SUPERMD_TEST_APPDATA"]
 downloads = os.environ["SUPERMD_TEST_DOWNLOADS"]
@@ -651,13 +650,25 @@ sys.exit(desktop_main.main())
 
 
 _IPC_WORKER = """
-import contextlib, io, json, os, subprocess as real_subprocess, sys
+import contextlib, io, json, os, subprocess as real_subprocess, sys, threading, time
 from unittest.mock import MagicMock, patch
 from PySide6.QtCore import QCoreApplication, QStandardPaths
 app = QCoreApplication.instance() or QCoreApplication(["super-md"])
 orig = QStandardPaths.writableLocation
 import agent_cli, background_cli
 from instance import InstanceBroker
+_spawned_lock = threading.Lock()
+_spawned_procs = []
+def _reap_loop():
+    while True:
+        with _spawned_lock:
+            alive = []
+            for p in _spawned_procs:
+                if p.poll() is None:
+                    alive.append(p)
+            _spawned_procs[:] = alive
+        time.sleep(0.03)
+threading.Thread(target=_reap_loop, daemon=True).start()
 cin, cout = sys.stdin, sys.stdout
 for raw in cin:
     cmd = json.loads(raw)
@@ -684,6 +695,8 @@ for raw in cin:
                     env["SUPERMD_TEST_APPDATA"] = appdata
                     env["SUPERMD_TEST_DOWNLOADS"] = cmd["downloads"]
                     env["SUPERMD_TEST_DESKTOP_DIR"] = cmd["desktopDir"]
+                    for ek, ev in (cmd.get("extraEnv") or {}).items():
+                        env[str(ek)] = str(ev)
                     proc = orig_popen(
                         [sys.executable, "-u", "-c", cmd["daemonBootstrap"]],
                         stdin=kwargs.get("stdin"),
@@ -693,6 +706,8 @@ for raw in cin:
                         start_new_session=kwargs.get("start_new_session", False),
                         creationflags=kwargs.get("creationflags", 0),
                     )
+                    with _spawned_lock:
+                        _spawned_procs.append(proc)
                     if marker:
                         _write_marker(marker, {"cmd": spawn_cmd, "pid": proc.pid})
                     return proc
@@ -1424,6 +1439,7 @@ class InstanceBrokerAndServiceCliTests(unittest.TestCase):
             {"ok": True, "result": {"running": False, "action": "stop", "quitRequested": True}},
         )
 
+        from instance import is_process_exit_clear
         lock_probe = QLockFile(str(daemon_appdata / "native-instance.lock"))
         lock_probe.setStaleLockTime(0)
         deadline = time.monotonic() + 10.0
@@ -1432,8 +1448,9 @@ class InstanceBrokerAndServiceCliTests(unittest.TestCase):
             _, post_status = self._service_for_appdata(daemon_appdata, "status")
             if not post_status["result"]["running"] and lock_probe.tryLock(0):
                 lock_probe.unlock()
-                fully_stopped = True
-                break
+                if is_process_exit_clear(daemon_appdata):
+                    fully_stopped = True
+                    break
             time.sleep(0.05)
         self.assertTrue(fully_stopped, "Headless daemon did not exit and release lock promptly after service stop")
         self.assertEqual(list(sessions_dir.glob("*.json")), [])
@@ -1563,6 +1580,182 @@ class InstanceBrokerAndServiceCliTests(unittest.TestCase):
             self.assertFalse(err_payload["ok"])
             self.assertEqual(err_payload["error"]["type"], "ValueError")
             self.assertIn(expected_fragment, err_payload["error"]["message"])
+
+    def test_hidden_occluded_reader_live_ops_and_post_unlock_teardown_restart(self):
+        self.broker.close()
+        from instance import is_process_exit_clear
+
+        occluded_appdata = (self.temp_appdata / "Occluded Hidden Daemon & C++ Teardown").resolve()
+        occluded_downloads = (self.temp_appdata / "Occluded Downloads").resolve()
+        occluded_appdata.mkdir(parents=True, exist_ok=True)
+        occluded_downloads.mkdir(parents=True, exist_ok=True)
+        spawn_marker = occluded_appdata / "spawn.json"
+        ready_marker = occluded_appdata / "reader-ready.txt"
+        sim_singleton = occluded_appdata / "sim-cpp-singleton.lock"
+
+        def cleanup_daemon():
+            if not spawn_marker.is_file():
+                return
+            try:
+                pid = json.loads(spawn_marker.read_text(encoding="utf-8")).get("pid")
+            except Exception:
+                pid = None
+            if not pid:
+                return
+            try:
+                if os.name == "nt":
+                    subprocess.run(["taskkill", "/PID", str(pid), "/T", "/F"], capture_output=True, check=False)
+                else:
+                    import signal
+                    os.kill(pid, signal.SIGTERM)
+            except OSError:
+                pass
+
+        self.addCleanup(cleanup_daemon)
+
+        occluded_teardown_bootstrap = (
+            """
+import os, sys, time
+_dd = os.environ["SUPERMD_TEST_DESKTOP_DIR"]
+if _dd not in sys.path:
+    sys.path.insert(0, _dd)
+from instance import _try_lock_lifecycle
+_sim_fd = os.open(os.environ["SUPERMD_TEST_SIM_SINGLETON"], os.O_RDWR | os.O_CREAT, 0o600)
+_sim_fh = os.fdopen(_sim_fd, "r+b")
+if _sim_fh.seek(0, os.SEEK_END) == 0:
+    _sim_fh.write(b"\\0")
+    _sim_fh.flush()
+if not _try_lock_lifecycle(_sim_fh):
+    sys.stderr.write("FATAL: Previous daemon still tearing down C++ resources after broker.close()!\\n")
+    sys.exit(1)
+"""
+            + _HEADLESS_DAEMON_BOOTSTRAP.replace(
+                "from studio import Studio\nStudio._restore_update = lambda self: None",
+                """from PySide6.QtCore import QTimer
+from studio import Studio
+Studio._restore_update = lambda self: None
+_orig_init = Studio.__init__
+def _occluded_init(self, *args, **kwargs):
+    _orig_init(self, *args, **kwargs)
+    def _force_hidden_ready():
+        if getattr(self, "host_window", None) is not None and not self.host_window.isVisible():
+            self.ready = True
+            self._emit(False)
+            self.readerCall.emit("window.supermdAgentRequest = function(){}; window.supermdFlush = function(){};")
+            Path(os.environ["SUPERMD_TEST_READY_MARKER"]).write_text("ready", encoding="utf-8")
+    QTimer.singleShot(50, _force_hidden_ready)
+Studio.__init__ = _occluded_init
+_orig_post = Studio.post
+def _occluded_post(self, id, command, raw):
+    _orig_post(self, id, command, raw)
+    if command == "reader_ready" and getattr(self, "host_window", None) is not None and not self.host_window.isVisible():
+        self.readerCall.emit("window.supermdAgentRequest = function(){}; window.supermdFlush = function(){};")
+Studio.post = _occluded_post""",
+            ).replace(
+                "sys.exit(desktop_main.main())",
+                """rc = desktop_main.main()
+time.sleep(0.45)
+sys.exit(rc)""",
+            )
+        )
+
+        extra_env = {
+            "SUPERMD_TEST_SIM_SINGLETON": str(sim_singleton),
+            "SUPERMD_TEST_READY_MARKER": str(ready_marker),
+        }
+
+        code, start_payload = self._service_for_appdata(
+            occluded_appdata,
+            "start",
+            realSpawn=True,
+            downloads=str(occluded_downloads),
+            desktopDir=str(DESKTOP_DIR),
+            daemonBootstrap=occluded_teardown_bootstrap,
+            spawnMarker=str(spawn_marker),
+            extraEnv=extra_env,
+        )
+        self.assertEqual(code, 0, start_payload)
+        first_pid = json.loads(spawn_marker.read_text(encoding="utf-8"))["pid"]
+        sessions_dir = Path(start_payload["result"]["sessionsDirectory"])
+
+        ready_deadline = time.monotonic() + 10.0
+        while not ready_marker.is_file() and time.monotonic() < ready_deadline:
+            time.sleep(0.05)
+        self.assertTrue(ready_marker.is_file(), "Hidden daemon Studio did not enter forced ready state")
+
+        discovery_files = list(sessions_dir.glob("*.json"))
+        self.assertEqual(len(discovery_files), 1)
+        client = LiveTabClient(discovery_files[0], timeout=3.0)
+
+        listed = client.list_tabs()
+        self.assertGreaterEqual(len(listed["tabs"]), 1)
+        self.assertTrue(all(not tab.get("active") for tab in listed["tabs"]))
+
+        created = client._call(
+            "create_document",
+            title="Occluded Hidden Daemon Note",
+            content="# Occluded Hidden Note\n\n$$\\oint E \\cdot dl = -\\frac{d\\Phi_B}{dt}$$\n",
+            format="smd",
+            background=False,
+        )
+        read_back = client.read_tab(created["tabId"], view="source")
+        self.assertIn("\\Phi_B", read_back["markdown"])
+        patched = client._call(
+            "patch_tab",
+            tabId=created["tabId"],
+            expectedRevision=created["revision"],
+            operations=[{"type": "replace", "old": "# Occluded Hidden Note", "new": "# Occluded Hidden Note (Patched)"}],
+        )
+        self.assertTrue(patched["changed"])
+        saved = client._call(
+            "save_document",
+            tabId=created["tabId"],
+            expectedRevision=patched["revision"],
+            filename="occluded-note.smd",
+            saveAs=True,
+            format="smd",
+        )
+        self.assertTrue(Path(saved["path"]).is_file())
+
+        # Immediate `stop` -> `start` must wait for Daemon 1's post-broker.close() exit teardown (0.45s)
+        # before spawning Daemon 2, never colliding on exclusive process-lifetime OS resources.
+        code, stop_payload = self._service_for_appdata(occluded_appdata, "stop")
+        self.assertEqual(code, 0)
+        self.assertTrue(stop_payload["result"]["quitRequested"])
+
+        code, restart_payload = self._service_for_appdata(
+            occluded_appdata,
+            "start",
+            realSpawn=True,
+            downloads=str(occluded_downloads),
+            desktopDir=str(DESKTOP_DIR),
+            daemonBootstrap=occluded_teardown_bootstrap,
+            spawnMarker=str(spawn_marker),
+            extraEnv=extra_env,
+        )
+        self.assertEqual(
+            code,
+            0,
+            f"payload={restart_payload}; log={(occluded_appdata / 'background-service.log').read_text(encoding='utf-8', errors='replace') if (occluded_appdata / 'background-service.log').is_file() else ''}",
+        )
+        second_pid = json.loads(spawn_marker.read_text(encoding="utf-8"))["pid"]
+        self.assertNotEqual(second_pid, first_pid)
+
+        code, final_stop = self._service_for_appdata(occluded_appdata, "stop")
+        self.assertEqual(code, 0)
+        self.assertTrue(final_stop["result"]["quitRequested"])
+        lock_probe = QLockFile(str(occluded_appdata / "native-instance.lock"))
+        lock_probe.setStaleLockTime(0)
+        deadline = time.monotonic() + 10.0
+        stopped = False
+        while time.monotonic() < deadline:
+            if lock_probe.tryLock(0):
+                lock_probe.unlock()
+                if is_process_exit_clear(occluded_appdata):
+                    stopped = True
+                    break
+            time.sleep(0.05)
+        self.assertTrue(stopped, "Restarted daemon did not fully exit after final stop")
 
 
 if __name__ == "__main__":

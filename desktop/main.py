@@ -128,6 +128,8 @@ def main():
     broker = None if args.test_state else InstanceBroker(app)
     if broker and not broker.claim_or_forward(args.note):
         return 0
+    if broker:
+        broker.hold_process_exit_lock()
     channel = QFile(":/qtwebchannel/qwebchannel.js")
     if not channel.open(QIODevice.OpenModeFlag.ReadOnly):
         raise RuntimeError("Qt WebChannel runtime is unavailable")

@@ -39,6 +39,12 @@ def main(argv):
         if probe.tryLock(0):
             probe.unlock();return False
         return True
+    def _process_exit_clear():
+        try:
+            from .instance import is_process_exit_clear
+        except ImportError:
+            from instance import is_process_exit_clear
+        return is_process_exit_clear(root)
     def request(action,*,startup_poll=False):
         wire_action='quit' if action=='stop' else action
         socket=QLocalSocket();socket.connectToServer(name)
@@ -126,7 +132,9 @@ def main(argv):
         lock_deadline=time.monotonic()+15
         while time.monotonic()<lock_deadline:
             if lock_probe.tryLock(100):
-                lock_probe.unlock();break
+                lock_probe.unlock()
+                if _process_exit_clear():break
+                time.sleep(.05);continue
             probe=request('status',startup_poll=True)
             if probe is not None and probe.get('ok',False) and probe.get('running'):
                 running=True;break

@@ -85,11 +85,17 @@ ApplicationWindow {
         }
         const requestId = JSON.stringify(request.requestId || "")
         const failure = "window.SuperMD?.post(" + requestId + ", 'agent_result', JSON.stringify({requestId:" + requestId + ",error:'reader is unavailable'}))"
-        if (!window.reader || !viewState.readerReady) {
-            if (!window.visible && request.action === "flush_current") {
+        if (!window.visible) {
+            if (request.action === "flush_current") {
                 studio.post(request.requestId || "", "agent_result", JSON.stringify({requestId: request.requestId, result: {flushed: false}, error: ""}))
                 return
             }
+            if (request.action === "list_tabs") {
+                studio.post(request.requestId || "", "agent_result", JSON.stringify({requestId: request.requestId, result: {tabs: request.tabs || []}, error: ""}))
+                return
+            }
+        }
+        if (!window.reader || !viewState.readerReady) {
             studio.post(request.requestId || "", "agent_result", JSON.stringify({requestId: request.requestId, error: "Reader is not ready"}))
             return
         }

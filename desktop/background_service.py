@@ -53,7 +53,10 @@ class BackgroundService(QObject):
     def handle_window_visibility(self,studio,*,engines=None,studios=None,engine=None):
         window=getattr(studio,'host_window',None)
         if window is None or getattr(studio,'retired',False):return
-        if window.isVisible():self.restore_agent_access(studio);return
+        if window.isVisible():
+            if getattr(studio,'ready',False):
+                studio._last_reader_text=None;studio._emit(load=True)
+            self.restore_agent_access(studio);return
         has_other=any(other is not studio and not getattr(other,'retired',False) for other in getattr(self.session,'windows',{}).values())
         if not studio.backgroundEnabled or has_other:
             studio.stop()
