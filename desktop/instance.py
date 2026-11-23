@@ -26,15 +26,19 @@ class InstanceBroker(QObject):
         self.service_handler = handler
 
     def claim_or_forward(self, note):
-        if self.lock.tryLock(0):
+        def listen():
             QLocalServer.removeServer(self.name)  # Only the exclusive owner may remove a stale socket.
             if not self.server.listen(self.name):
                 self.lock.unlock()
                 raise RuntimeError("Unable to start the native application file-opening service")
             return True
+        if self.lock.tryLock(0):
+            return listen()
         socket = QLocalSocket()
         socket.connectToServer(self.name)
         if not socket.waitForConnected(2000):
+            if self.lock.tryLock(3000):
+                return listen()
             raise RuntimeError("Super MD is starting or busy. Please try opening the note again.")
         url = QUrl(note or "")
         local = url.toLocalFile() if url.isLocalFile() else note

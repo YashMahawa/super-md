@@ -1444,20 +1444,21 @@ class Studio(QObject):
             if error:self.update_status='Update installation failed: '+error;return
             path,prepared_kind=prepared
             if prepared_kind=='appimage':
-                self.session.update_installed=True
-                self.session.changed.emit()
+                self.session.update_installed=True;self.session.changed.emit()
                 self.update_status='Update installed. Close and reopen Super MD to use it. Your previous version and downloaded installer have been kept.'
             else:
                 opened=QProcess.startDetached(path,[]) if prepared_kind=='windows' else QDesktopServices.openUrl(QUrl.fromLocalFile(path))
                 if isinstance(opened,tuple):opened=opened[0]
                 if not opened:
                     self.update_status='Could not open the verified installer. It is still available in Downloads.'
-                elif prepared_kind in ('deb','rpm'):
-                    self.update_status='Package installer opened. Confirm the update there; Super MD will not request elevated permissions automatically.'
-                elif prepared_kind=='macos':
-                    self.update_status='Disk image opened. Drag Super MD into Applications and confirm replacement to update.'
                 else:
-                    self.update_status='Installer opened. Follow its instructions; the download is kept in Downloads.'
+                    self.session.update_installed=True;self.session.changed.emit()
+                    if prepared_kind in ('deb','rpm'):
+                        self.update_status='Package installer opened. Confirm the update there; Super MD will not request elevated permissions automatically.'
+                    elif prepared_kind=='macos':
+                        self.update_status='Disk image opened. Drag Super MD into Applications and confirm replacement to update.'
+                    else:
+                        self.update_status='Installer opened. Follow its instructions; the download is kept in Downloads.'
             self._emit(False)
         self._submit(prepare,done,False)
 
@@ -2109,7 +2110,10 @@ class Studio(QObject):
         operation,self.flush_operation = self.flush_operation,None
         self.flush_timer.stop()
         if not operation: return
-        if choice == "retry": self._flush(operation["action"],operation["target"])
+        if choice == "cancel" and operation["action"] == "close_window":
+            service = getattr(self.session, "background", None)
+            if service is not None: service.cancel_quit()
+        elif choice == "retry": self._flush(operation["action"],operation["target"])
         elif choice == "recover_close" and operation["action"] == "close_window":
             # Explicit emergency action: preserve the latest received drafts, not
             # a silent discard or a claim we can recover an unresponsive renderer.
@@ -2263,7 +2267,13 @@ class Studio(QObject):
 
     @Slot(str)
     def resolveClose(self, choice):
-        if choice == "cancel": self.pending_close = ""; return
+        if choice == "cancel":
+            was_window = self.pending_close == "window"
+            self.pending_close = ""
+            if was_window:
+                service = getattr(self.session, "background", None)
+                if service is not None: service.cancel_quit()
+            return
         if choice == "save": self.save(); return
         if choice == "discard":
             # For a single-tab close, "discard" confirms closing the dirty

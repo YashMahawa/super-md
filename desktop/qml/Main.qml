@@ -240,7 +240,7 @@ ApplicationWindow {
     color: viewState.colors.surface
     font.family: "Noto Sans"
     onClosing: function(close) {
-        if (!windowModes.fullscreen) studio.rememberWindow(visibility === Window.Maximized ? viewState.settings.window.width : width, visibility === Window.Maximized ? viewState.settings.window.height : height, visibility === Window.Maximized)
+        if (window.visible && !windowModes.fullscreen) studio.rememberWindow(visibility === Window.Maximized ? viewState.settings.window.width : width, visibility === Window.Maximized ? viewState.settings.window.height : height, visibility === Window.Maximized)
         close.accepted = closingAllowed; if (closingAllowed) intentionalShutdown = true; else studio.closeWindowSafely()
     }
 
@@ -251,8 +251,8 @@ ApplicationWindow {
             if (studio.backgroundEnabled && !studio.hasOtherOpenWindows()) { window.hide(); return }
             intentionalShutdown = true; closingAllowed = true; window.close()
         }
-        function onFlushFailed(canClose) { if(!closingAllowed && !closeDialog.visible) { flushDialog.canClose = canClose; flushDialog.open() } }
-        function onCloseRequested(name) { flushDialog.close(); closeDialog.title = "Save changes to " + name + "?"; if(!closeDialog.visible) closeDialog.open() }
+        function onFlushFailed(canClose) { if(!closingAllowed && !closeDialog.visible) { if (!window.visible) { window.show(); window.raise(); window.requestActivate() } flushDialog.canClose = canClose; flushDialog.open() } }
+        function onCloseRequested(name) { flushDialog.close(); closeDialog.title = "Save changes to " + name + "?"; if(!closeDialog.visible) { if (!window.visible) { window.show(); window.raise(); window.requestActivate() } closeDialog.open() } }
         function onSaveRequested(name) { saveDialog.selectedFile = studio.defaultSaveLocation(name); saveDialog.open() }
         function onNoteLocationPickerRequested() { noteFolderDialog.open() }
         function onExportRequested(format) { sharing = false; outputFormat = format; exportDialog.open() }

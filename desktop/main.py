@@ -50,6 +50,7 @@ import native_frame
 
 class StudioApplication(QApplication):
     openRequested = Signal(str)
+    reopenRequested = Signal()
 
     def event(self, event):
         # Native macOS open events target the application. Do not install a
@@ -60,6 +61,8 @@ class StudioApplication(QApplication):
             if path:
                 self.openRequested.emit(path)
                 return True
+        elif sys.platform == "darwin" and event.type() == QEvent.Type.ApplicationActivate:
+            self.reopenRequested.emit()
         return super().event(event)
 
 def main():
@@ -194,18 +197,12 @@ def main():
                 studio.reader_gestures = ReaderGestures(window, reader, studio.readerCall.emit)
         window.readerViewChanged.connect(attach_reader_gestures)
         attach_reader_gestures(window.findChild(QObject, "documentReader"))
-        def retire_window():
-            service = getattr(session, "background", None)
-            if service is not None:
-                service.handle_window_visibility(studio, engines=engines, studios=studios, engine=engine)
-                return
-            has_other_window = any(other is not studio and not other.retired for other in session.windows.values())
-            if not window.isVisible() and not studio.retired and (not studio.backgroundEnabled or has_other_window):
-                studio.stop()
-                if studio in studios: studios.remove(studio)
-                if engine in engines: engines.remove(engine)
-                engine.deleteLater()
-        window.visibleChanged.connect(lambda: QTimer.singleShot(0, retire_window))
+        window.visibleChanged.connect(
+            lambda: QTimer.singleShot(
+                0,
+                lambda: session.background.handle_window_visibility(studio, engines=engines, studios=studios, engine=engine),
+            )
+        )
         remembered = session.settings.get("window") or {}
         if not args.smoke and isinstance(remembered, dict):
             try:
@@ -490,8 +487,13 @@ def main():
     def open_from_service(note=None):
         hidden=next((studio for studio in studios if not studio.retired and getattr(studio,"host_window",None) is not None and not studio.host_window.isVisible()),None)
         if hidden is not None:
-            hidden.host_window.show();hidden.host_window.raise_();hidden.host_window.requestActivate()
-            if note:hidden.openNote(str(note))
+            remembered = session.settings.get("window") or {}
+            if isinstance(remembered, dict) and remembered.get("maximized"):
+                hidden.host_window.showMaximized()
+            else:
+                hidden.host_window.show()
+            hidden.host_window.raise_();hidden.host_window.requestActivate()
+            if note:hidden.openPath(str(note))
             return
         create_window(note)
     from background_service import BackgroundService
@@ -499,9 +501,15 @@ def main():
     create_window(args.note,show_window=not args.background)
     if args.agent_access:session.agent_bridge.start()
     if broker:
+        app.aboutToQuit.connect(broker.server.close)
         broker.requested.connect(lambda note: open_from_service(note or None))
         broker.set_service_handler(session.background.handle_service_request)
     app.openRequested.connect(open_from_service)
+    app.reopenRequested.connect(
+        lambda: open_from_service(None)
+        if session.background.enabled and not session.background.forced and not session.background.quitting and not session.quitting and not session.background.visible_windows()
+        else None
+    )
     if args.quit_after:
         QTimer.singleShot(args.quit_after, app.quit)
     status = app.exec()
