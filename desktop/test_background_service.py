@@ -222,6 +222,36 @@ class BackgroundTests(unittest.TestCase):
         self.assertFalse(studio.retired)
         self.assertTrue(session.agent_bridge.enabled and discovery.is_file())
 
+        # Even after WebEngine marks a hidden headless window `ready = True` with an unsaved draft,
+        # CLI `service stop` flushes/persists recovery state and quits without opening a modal close prompt.
+        studio.tabs[0]["content"] = "# Unsaved headless draft\n\n$$E = mc^2$$\n"
+        studio.ready = True
+        studio.readerCall.connect(
+            lambda js: studio.post(
+                "flush-1",
+                "document_flushed",
+                json.dumps(
+                    {
+                        "id": studio.tabs[0]["id"],
+                        "content": studio.tabs[0]["content"],
+                        "operation": studio.flush_operation,
+                    }
+                ),
+            )
+            if "supermdFlush" in js and studio.flush_operation
+            else None
+        )
+        stop_reply = session.background.handle_service_request("stop")
+        self._pump(6)
+        self.assertEqual(stop_reply, {"ok": True, "running": False, "stopped": True, "quitRequested": True})
+        self.assertEqual(studio.pending_close, "")
+        self.assertFalse(studio.host_window.isVisible())
+        self.assertTrue(app.ended)
+        studio.stop()
+        session.writes.shutdown(wait=True)
+        recovered = json.loads((session.data / "recovery.json").read_text(encoding="utf-8"))
+        self.assertTrue(any("Unsaved headless draft" in tab.get("content", "") for tab in recovered))
+
     def test_install_update_bypasses_tray_hiding_across_desktop_installers(self):
         for kind in ("appimage", "windows", "macos"):
             app = App()
@@ -426,12 +456,15 @@ class BackgroundTests(unittest.TestCase):
                 # even if legacy background-service.log and agent-sessions artifacts still exist on disk.
                 (appdata_agent / "background-service.log").write_text("legacy daemon started\n", encoding="utf-8")
                 (appdata_agent / "qt-studio" / "agent-sessions").mkdir(parents=True, exist_ok=True)
-                studio = QuietStudio(False, upgraded_session)
-                try:
-                    studio.setting("keepInBackground", "false")
-                finally:
-                    studio.stop()
-                    studio.pool.shutdown(wait=True, cancel_futures=True)
+                with patch.object(python_runtime, "discover", return_value=[]), patch.object(
+                    QuietStudio, "_restore_update", lambda _self: None
+                ):
+                    studio = QuietStudio(False, upgraded_session)
+                    try:
+                        studio.setting("keepInBackground", "false")
+                    finally:
+                        studio.stop()
+                        studio.pool.shutdown(wait=True, cancel_futures=True)
             finally:
                 upgraded_session.writes.shutdown(wait=True)
 
@@ -550,7 +583,11 @@ appdata = os.environ["SUPERMD_TEST_APPDATA"]
 downloads = os.environ["SUPERMD_TEST_DOWNLOADS"]
 desktop_dir = os.environ["SUPERMD_TEST_DESKTOP_DIR"]
 cache_dir = str(Path(appdata) / "cache")
+xdg_data_dir = str(Path(appdata) / "xdg-data")
 Path(cache_dir).mkdir(parents=True, exist_ok=True)
+Path(xdg_data_dir).mkdir(parents=True, exist_ok=True)
+os.environ["XDG_CACHE_HOME"] = cache_dir
+os.environ["XDG_DATA_HOME"] = xdg_data_dir
 if desktop_dir not in sys.path:
     sys.path.insert(0, desktop_dir)
 
@@ -574,6 +611,9 @@ def _patched_writable(kind):
 QStandardPaths.writableLocation = staticmethod(_patched_writable)
 QSystemTrayIcon.isSystemTrayAvailable = staticmethod(lambda: False)
 python_runtime.discover = lambda *_a, **_kw: []
+
+from studio import Studio
+Studio._restore_update = lambda self: None
 
 import main as desktop_main
 sys.argv = [str(Path(desktop_dir) / "main.py"), "--background", "--agent-access", "--safe-graphics"]
@@ -778,17 +818,25 @@ class InstanceBrokerAndServiceCliTests(unittest.TestCase):
         self.broker.close()
         self.assertEqual(self._service("stop")[1]["result"], {"running": False, "action": "stop", "quitRequested": False})
 
-        spawned, marker = [], self.temp_appdata / "spawned.json"
+        # Simulate cold start where InstanceBroker binds QLocalServer immediately in claim_or_forward(),
+        # then main.py blocks >2.0s initializing WebEngine/QML before entering app.exec().
+        spawned, cold_state, marker = [], {}, self.temp_appdata / "spawned.json"
         def bring_up_daemon():
             if marker.is_file() and not spawned:
                 spawned.append(json.loads(marker.read_text(encoding="utf-8")))
+                cold_state["bound_at"] = time.monotonic()
+                self.broker.server.newConnection.disconnect(self.broker.accept)
+                self.assertTrue(self.broker.claim_or_forward(None))
+            elif spawned and not cold_state.get("event_loop_ready") and time.monotonic() - cold_state["bound_at"] >= 2.4:
+                cold_state["event_loop_ready"] = True
                 self.session.settings["agentAccessEnabled"] = True
                 self.session.agent_bridge.start()
                 self.session.background.set_forced(True)
-                self.assertTrue(self.broker.claim_or_forward(None))
+                self.broker.server.newConnection.connect(self.broker.accept)
+                self.broker.accept()
 
-        res = self._call({"kind": "service", "action": "start", "appdata": str(self.temp_appdata), "spawnMarker": str(marker)}, on_tick=bring_up_daemon, timeout=10.0)
-        self.assertEqual(res["code"], 0)
+        res = self._call({"kind": "service", "action": "start", "appdata": str(self.temp_appdata), "spawnMarker": str(marker)}, on_tick=bring_up_daemon, timeout=12.0)
+        self.assertEqual(res["code"], 0, res)
         self.assertTrue(json.loads(res["stdout"])["result"]["running"])
         self.assertIn("--background", spawned[0])
         self.assertIn("--agent-access", spawned[0])
@@ -796,9 +844,11 @@ class InstanceBrokerAndServiceCliTests(unittest.TestCase):
     def _service_for_appdata(self, appdata: Path, action: str, **extra):
         res = self._call(
             {"kind": "service", "action": action, "appdata": str(appdata), **extra},
-            timeout=25.0 if extra.get("realSpawn") else 10.0,
+            timeout=45.0 if extra.get("realSpawn") else 10.0,
         )
-        self.assertTrue(res["stdout"].strip(), f"Empty CLI output; stderr={res['stderr']}")
+        log_path = appdata / "background-service.log"
+        log_tail = log_path.read_text(encoding="utf-8", errors="replace")[-2000:] if log_path.is_file() else ""
+        self.assertTrue(res["stdout"].strip(), f"Empty CLI output; stderr={res['stderr']}; log={log_tail}")
         return res["code"], json.loads(res["stdout"])
 
     def _dispatch_headless_live_request(self, studio, raw_request: str):
@@ -1083,6 +1133,8 @@ class InstanceBrokerAndServiceCliTests(unittest.TestCase):
             side_effect=lambda kind: str(daemon_appdata)
             if kind == QStandardPaths.AppDataLocation
             else self._orig_writable(kind),
+        ), patch.object(python_runtime, "discover", return_value=[]), patch.object(
+            QuietStudio, "_restore_update", lambda _self: None
         ):
             legacy_session = Session(False)
             legacy_session.settings["python"] = sys.executable
@@ -1126,10 +1178,12 @@ class InstanceBrokerAndServiceCliTests(unittest.TestCase):
                         sock.write(b"ok\n")
                         sock.flush()
                         sock.waitForBytesWritten(500)
+                        sock.disconnectFromServer()
                         if req["service"] == "quit":
                             legacy_session.agent_bridge.stop()
                             legacy_server.close()
                             QLocalServer.removeServer(legacy_socket_name)
+                        return
                     sock.disconnectFromServer()
 
                 sock.readyRead.connect(on_legacy_read)
@@ -1205,7 +1259,11 @@ class InstanceBrokerAndServiceCliTests(unittest.TestCase):
             daemonBootstrap=_HEADLESS_DAEMON_BOOTSTRAP,
             spawnMarker=str(spawn_marker),
         )
-        self.assertEqual(code, 0)
+        self.assertEqual(
+            code,
+            0,
+            f"payload={start_payload}; log={(daemon_appdata / 'background-service.log').read_text(encoding='utf-8', errors='replace') if (daemon_appdata / 'background-service.log').is_file() else ''}",
+        )
         self.assertTrue(start_payload["ok"] and start_payload["result"]["running"])
         sessions_dir = Path(start_payload["result"]["sessionsDirectory"])
         self.assertEqual(sessions_dir, expected_sessions_dir)
@@ -1291,6 +1349,24 @@ class InstanceBrokerAndServiceCliTests(unittest.TestCase):
         self.assertEqual(disk_assets, {})
         self.assertIn("| #10422 | 5.4 | 15.2 |", disk_md)
 
+        # When the built native reader bundle is present (as in CI on Linux, Windows, and macOS),
+        # ensure WebEngine finishes marking the hidden window `studio.ready = True` while the
+        # recovered Tab 0 draft ("Covariant Conservation.md") is still dirty, exercising the exact
+        # reader-ready hidden shutdown path before Phase 3's `stop` -> `start` handoff.
+        if (ROOT / "dist" / "qt-reader.html").is_file():
+            ready_deadline = time.monotonic() + 8.0
+            reader_ready = False
+            while time.monotonic() < ready_deadline:
+                try:
+                    diagrams = client._call("list_diagrams", tabId=created["tabId"])
+                    if isinstance(diagrams.get("diagrams"), list) and len(diagrams["diagrams"]) == 1:
+                        reader_ready = True
+                        break
+                except Exception:
+                    pass
+                time.sleep(0.1)
+            self.assertTrue(reader_ready, "Hidden headless reader did not finish loading dist/qt-reader.html")
+
         # Phase 3: Immediate `stop` -> `start` handoff must never attach to a dying daemon or leave running:False;
         # it waits for shutdown and spawns a fresh live daemon with a rotated discovery token.
         first_pid = spawn_info["pid"]
@@ -1313,7 +1389,11 @@ class InstanceBrokerAndServiceCliTests(unittest.TestCase):
             daemonBootstrap=_HEADLESS_DAEMON_BOOTSTRAP,
             spawnMarker=str(spawn_marker),
         )
-        self.assertEqual(code, 0)
+        self.assertEqual(
+            code,
+            0,
+            f"payload={restart_payload}; log={(daemon_appdata / 'background-service.log').read_text(encoding='utf-8', errors='replace') if (daemon_appdata / 'background-service.log').is_file() else ''}",
+        )
         self.assertTrue(restart_payload["ok"] and restart_payload["result"]["running"])
         restarted_info = json.loads(spawn_marker.read_text(encoding="utf-8"))
         self.assertNotEqual(restarted_info["pid"], first_pid)

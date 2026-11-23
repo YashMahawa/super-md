@@ -447,7 +447,7 @@ class Studio(QObject):
         self.flush_operation = None
         self.flush_timer = QTimer(self)
         self.flush_timer.setSingleShot(True)
-        self.flush_timer.timeout.connect(lambda:self.flushFailed.emit(bool(self.flush_operation and self.flush_operation["action"] == "close_window")))
+        self.flush_timer.timeout.connect(self._on_flush_timeout)
         self.recovery_timer = QTimer(self)
         self.recovery_timer.setSingleShot(True)
         self.recovery_timer.timeout.connect(self._recover)
@@ -2112,6 +2112,20 @@ class Studio(QObject):
             self._recover()
             QTimer.singleShot(0,self.allowClose.emit)
 
+    def _on_flush_timeout(self):
+        bg = getattr(self.session, "background", None)
+        if (
+            self.flush_operation
+            and self.flush_operation["action"] == "close_window"
+            and bg is not None
+            and getattr(bg, "_stopping_from_cli", False)
+            and getattr(self, "host_window", None) is not None
+            and not self.host_window.isVisible()
+        ):
+            self.resolveFlush("recover_close")
+            return
+        self.flushFailed.emit(bool(self.flush_operation and self.flush_operation["action"] == "close_window"))
+
     def _flush(self,action,target=""):
         if self.retired or action=="close_window" and self.pending_close:return
         operation = {"action":action,"target":target,"token":uuid.uuid4().hex}
@@ -2120,7 +2134,15 @@ class Studio(QObject):
             return
         if self.flush_operation: return
         self.flush_operation = operation
-        self.flush_timer.start(5000)
+        bg = getattr(self.session, "background", None)
+        hidden_cli_close = (
+            action == "close_window"
+            and bg is not None
+            and getattr(bg, "_stopping_from_cli", False)
+            and getattr(self, "host_window", None) is not None
+            and not self.host_window.isVisible()
+        )
+        self.flush_timer.start(1000 if hidden_cli_close else 5000)
         self.readerCall.emit(f"window.supermdFlush?.({json.dumps(operation)})")
 
     @Slot()
@@ -2293,7 +2315,6 @@ class Studio(QObject):
         if (
             bg is not None
             and getattr(bg, "_stopping_from_cli", False)
-            and not self.ready
             and getattr(self, "host_window", None) is not None
             and not self.host_window.isVisible()
         ):

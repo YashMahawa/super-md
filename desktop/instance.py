@@ -78,10 +78,12 @@ class InstanceBroker(QObject):
                             if self.service_handler is not None
                             else {"ok": False, "running": False, "error": "Background service is unavailable"}
                         )
-                        socket.write(json.dumps(reply, separators=(",", ":")).encode("utf-8") + b"\n")
-                        socket.flush()
-                        socket.waitForBytesWritten(500)
-                        socket.disconnectFromServer()
+                        if socket.state() == QLocalSocket.LocalSocketState.ConnectedState:
+                            socket.write(json.dumps(reply, separators=(",", ":")).encode("utf-8") + b"\n")
+                            socket.flush()
+                            if socket.state() == QLocalSocket.LocalSocketState.ConnectedState:
+                                socket.waitForBytesWritten(500)
+                            socket.disconnectFromServer()
                         return
                     note = request["note"]
                     if set(request) != {"note"} or not isinstance(note, str) or "\0" in note:
@@ -99,6 +101,15 @@ class InstanceBroker(QObject):
             QTimer.singleShot(5000, socket, socket.disconnectFromServer)
             read()
 
-    def close(self):
+    def stop_accepting(self):
         self.server.close()
+        while self.server.hasPendingConnections():
+            pending = self.server.nextPendingConnection()
+            if pending is not None:
+                pending.abort()
+        for child in self.findChildren(QLocalSocket):
+            child.abort()
+
+    def close(self):
+        self.stop_accepting()
         self.lock.unlock()

@@ -27,13 +27,19 @@ def main(argv):
     parser=argparse.ArgumentParser(description='Super MD background service')
     parser.add_argument('action',choices=['start','status','stop'])
     args=parser.parse_args(argv)
-    from PySide6.QtCore import QCoreApplication,QStandardPaths
+    from PySide6.QtCore import QCoreApplication,QLockFile,QStandardPaths
     from PySide6.QtNetwork import QLocalSocket
     app=QCoreApplication.instance() or QCoreApplication(['super-md'])
     app.setApplicationName('super-md');app.setOrganizationName('SuperMD')
     root=Path(QStandardPaths.writableLocation(QStandardPaths.AppDataLocation))
     name='supermd-qt-'+hashlib.sha256(str(root).encode()).hexdigest()[:20]
-    def request(action):
+    def _instance_lock_held():
+        if not root.exists():return False
+        probe=QLockFile(str(root/'native-instance.lock'));probe.setStaleLockTime(0)
+        if probe.tryLock(0):
+            probe.unlock();return False
+        return True
+    def request(action,*,startup_poll=False):
         wire_action='quit' if action=='stop' else action
         socket=QLocalSocket();socket.connectToServer(name)
         if not socket.waitForConnected(1000):return None
@@ -41,10 +47,13 @@ def main(argv):
         raw=bytes(socket.readAll())
         while b'\n' not in raw and socket.waitForReadyRead(2000):raw+=bytes(socket.readAll())
         if b'\n' not in raw:raw+=bytes(socket.readAll())
-        peer_closed=socket.state()==QLocalSocket.LocalSocketState.UnconnectedState
+        peer_closed=(
+            socket.state() in (QLocalSocket.LocalSocketState.UnconnectedState,QLocalSocket.LocalSocketState.ClosingState)
+            or socket.error()==QLocalSocket.LocalSocketError.PeerClosedError
+        )
         socket.disconnectFromServer()
         if not raw:
-            if peer_closed:return None
+            if peer_closed or startup_poll:return None
             raise ValueError('Existing Super MD instance did not respond to service request')
         line=raw.split(b'\n',1)[0].rstrip(b'\r')
         if line==b'ok':
@@ -55,7 +64,19 @@ def main(argv):
         except (UnicodeDecodeError,ValueError) as error:raise ValueError('Invalid response from Super MD instance') from error
         if not isinstance(reply,dict):raise ValueError('Invalid response from Super MD instance')
         return reply
-    reply=request(args.action)
+    if args.action=='start':
+        try:reply=request('start')
+        except ValueError:
+            if not _instance_lock_held():raise
+            reply=None;init_deadline=time.monotonic()+8
+            while time.monotonic()<init_deadline:
+                reply=request('start',startup_poll=True)
+                if reply is not None or not _instance_lock_held():break
+                time.sleep(.1)
+            if reply is None and _instance_lock_held():
+                reply=request('start')
+    else:
+        reply=request(args.action)
     if args.action=='status':
         if reply is not None and not reply.get('ok',False):
             if reply.get('error')=='Background service is unavailable':reply=None
@@ -71,16 +92,16 @@ def main(argv):
         print(json.dumps({'ok':True,'result':result}));return 0
     sessions_dir=str(root/'qt-studio'/'agent-sessions')
     if reply is not None and not reply.get('ok',False) and reply.get('error')=='Background service is unavailable':
-        wait_deadline=time.monotonic()+3
-        while time.monotonic()<wait_deadline and reply is not None and not reply.get('ok',False) and reply.get('error')=='Background service is unavailable':
-            time.sleep(.05);reply=request('start')
+        wait_deadline=time.monotonic()+5
+        while time.monotonic()<wait_deadline and (reply is None or (not reply.get('ok',False) and reply.get('error')=='Background service is unavailable')):
+            time.sleep(.05);reply=request('start',startup_poll=True)
     if reply is not None and reply.get('stopping'):
-        stop_deadline=time.monotonic()+5
+        stop_deadline=time.monotonic()+10
         while time.monotonic()<stop_deadline:
-            status=request('status')
+            status=request('status',startup_poll=True)
             if status is None:reply=None;break
             if not status.get('stopping') and status.get('running'):
-                reply=request('start');break
+                reply=request('start',startup_poll=True);break
             time.sleep(.05)
         if reply is not None and reply.get('stopping'):
             raise ValueError(reply.get('error') or 'Super MD is currently quitting; finish closing it before starting the background service.')
@@ -90,18 +111,31 @@ def main(argv):
         if reply.get('sessionsDirectory'):sessions_dir=str(reply['sessionsDirectory'])
     else:
         running=False;root.mkdir(parents=True,exist_ok=True)
-        flags=(subprocess.CREATE_NEW_PROCESS_GROUP|getattr(subprocess,'CREATE_NO_WINDOW',0)) if os.name=='nt' else 0
-        with (root/'background-service.log').open('ab') as log:
-            subprocess.Popen(_daemon_command(),stdin=subprocess.DEVNULL,stdout=log,stderr=log,start_new_session=os.name!='nt',creationflags=flags)
-        deadline=time.monotonic()+20
-        while time.monotonic()<deadline:
-            status=request('status')
-            if status is not None:
-                if status.get('ok',False):
-                    if status.get('running'):running=True;break
-                elif status.get('error')!='Background service is unavailable':
-                    raise ValueError(status.get('error') or 'Background service failed to start')
-            time.sleep(.2)
+        lock_probe=QLockFile(str(root/'native-instance.lock'));lock_probe.setStaleLockTime(0)
+        lock_deadline=time.monotonic()+10
+        while time.monotonic()<lock_deadline:
+            if lock_probe.tryLock(100):
+                lock_probe.unlock();break
+            probe=request('status',startup_poll=True)
+            if probe is not None and probe.get('ok',False) and probe.get('running'):
+                running=True;break
+        proc=None
+        if not running:
+            flags=(subprocess.CREATE_NEW_PROCESS_GROUP|getattr(subprocess,'CREATE_NO_WINDOW',0)) if os.name=='nt' else 0
+            with (root/'background-service.log').open('ab') as log:
+                proc=subprocess.Popen(_daemon_command(),stdin=subprocess.DEVNULL,stdout=log,stderr=log,start_new_session=os.name!='nt',creationflags=flags)
+            deadline=time.monotonic()+30
+            while time.monotonic()<deadline:
+                status=request('status',startup_poll=True)
+                if status is not None:
+                    if status.get('ok',False):
+                        if status.get('running'):running=True;break
+                    elif status.get('error')!='Background service is unavailable':
+                        raise ValueError(status.get('error') or 'Background service failed to start')
+                if proc is not None:
+                    exit_code=proc.poll()
+                    if type(exit_code) is int and exit_code!=0:break
+                time.sleep(.2)
         if not running:raise ValueError('Background service did not start; inspect its local log')
     result={'running':running,'action':args.action}
     if running:result['sessionsDirectory']=sessions_dir

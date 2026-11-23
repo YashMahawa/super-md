@@ -502,7 +502,7 @@ def main():
     create_window(args.note,show_window=not args.background)
     if args.agent_access:session.agent_bridge.start()
     if broker:
-        app.aboutToQuit.connect(broker.server.close)
+        app.aboutToQuit.connect(broker.stop_accepting)
         broker.requested.connect(lambda note: open_from_service(note or None))
         broker.set_service_handler(session.background.handle_service_request)
     app.openRequested.connect(open_from_service)
