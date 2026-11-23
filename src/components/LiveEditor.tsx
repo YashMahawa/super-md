@@ -10,6 +10,7 @@ import type {WritingOptions} from '../proofreading';
 import type {ReaderAccessibilityPreference} from '../types';
 import WritingSuggestions from './WritingSuggestions';
 import {repairPastedMath} from '../mathRepair';
+import {liveEditorCenterDelta,useTypewriterScroll} from '../typewriterScroll';
 const noTrustedHosts:string[]=[];
 const fullscreenInteractiveSelector='a,button,input,select,textarea,summary,details,img,.note-image,.interactive-chart,.inline-diagram,.svg-figure,.mermaid,.step-cards,.remote-image-card,.image-error,.code-container';
 export type {SourceBlock} from '../documentAnalysis';
@@ -91,6 +92,7 @@ function LiveBlockShell({windowed,estimate,text,headings,start,end,blockIndex,ac
 
 interface Props extends WritingOptions,ReaderAccessibilityPreference {
   latexAutofix?:boolean;
+  typewriterScroll?:boolean;
   markdown:string;onChange:(value:string)=>void;documentPath:string|null;python:string;dark:boolean;
   trustedImageHosts?:string[];onTrustImageHost?:(host:string)=>void;
 }
@@ -99,8 +101,10 @@ interface CloseAnchor {scroller:HTMLElement;element:HTMLElement;top:number}
 
 /** One document render preserves references, footnote numbering, duplicate
  * heading IDs and loose lists. Substitute one original-source editing block. */
-export default function LiveEditor({markdown,onChange,documentPath,python,dark,trustedImageHosts=noTrustedHosts,onTrustImageHost,spellCheck=false,grammarCheck=false,latexAutofix=false,fullDocumentAccessibility=false}:Props){
+export default function LiveEditor({markdown,onChange,documentPath,python,dark,trustedImageHosts=noTrustedHosts,onTrustImageHost,spellCheck=false,grammarCheck=false,latexAutofix=false,typewriterScroll,fullDocumentAccessibility=false}:Props){
   const [editing,setEditing]=useState<Editing|null>(null);
+  const activeTypewriter=useTypewriterScroll(typewriterScroll);
+  const docRef=useRef<HTMLDivElement>(null),appliedTypewriter=useRef(false),typingFrame=useRef(0);
   const anchorTop=useRef<number|null>(null),editor=useRef<HTMLTextAreaElement>(null);
   const closeAnchorRef=useRef<CloseAnchor|null>(null);
   const sessionRef=useRef(0);
@@ -155,6 +159,7 @@ export default function LiveEditor({markdown,onChange,documentPath,python,dark,t
   },[]);
 
   const closeEditor=useCallback((target?:Element|null,clientY?:number|null)=>{
+    if(typingFrame.current){cancelAnimationFrame(typingFrame.current);typingFrame.current=0;}
     captureCloseAnchor(target,clientY);
     setEditing(null);
   },[captureCloseAnchor]);
@@ -171,18 +176,90 @@ export default function LiveEditor({markdown,onChange,documentPath,python,dark,t
   };
 
   useLayoutEffect(()=>{
-    const area=editor.current;if(!area||anchorTop.current===null)return;
+    const doc=docRef.current;if(!doc)return;
+    const scroller=doc.closest<HTMLElement>('.android-reading,.reading-scroll,.preview-pane,.live-scroll');
+    const beforePad=Number.parseFloat(getComputedStyle(doc).paddingTop)||0;
+    const syncPad=()=>{
+      if(!scroller||scroller.clientHeight<=0)return;
+      doc.style.setProperty('--live-typewriter-pad',`${Math.max(24,Math.floor(scroller.clientHeight/2))}px`);
+    };
+    if(activeTypewriter){doc.dataset.typewriter='true';syncPad();}
+    else{delete doc.dataset.typewriter;doc.style.removeProperty('--live-typewriter-pad');}
+    const afterPad=Number.parseFloat(getComputedStyle(doc).paddingTop)||0;
+    if(appliedTypewriter.current!==activeTypewriter){
+      appliedTypewriter.current=activeTypewriter;
+      if(scroller&&afterPad!==beforePad)scroller.scrollTop=Math.max(0,scroller.scrollTop+(afterPad-beforePad));
+    }
+    if(!activeTypewriter||!scroller||typeof ResizeObserver==='undefined')return;
+    const observer=new ResizeObserver(syncPad);observer.observe(scroller);
+    return()=>observer.disconnect();
+  },[activeTypewriter]);
+  useLayoutEffect(()=>{
+    const area=editor.current;if(!area)return;
     const scroller=area.closest<HTMLElement>('.android-reading,.reading-scroll,.preview-pane,.live-scroll'),anchor=anchorTop.current;anchorTop.current=null;
-    let frames=0,frame=0,stopped=false,writingScroll=false;const stop=()=>{stopped=true;};
-    const hold=()=>{if(scroller?.matches('.android-reading'))refreshDocumentExtent(scroller);const delta=area.getBoundingClientRect().top-anchor;if(scroller&&Math.abs(delta)>.5){writingScroll=true;scroller.scrollTop+=delta;writingScroll=false;}};
-    hold();area.focus({preventScroll:true});
-    const onScroll=()=>{if(!writingScroll)stopped=true;};
-    const inputs=['wheel','touchstart','pointerdown','keydown','input'] as const;
+    if(!activeTypewriter){
+      if(anchor===null)return;
+      let frames=0,frame=0,stopped=false,writingScroll=false;const stop=()=>{stopped=true;};
+      const hold=()=>{if(scroller?.matches('.android-reading'))refreshDocumentExtent(scroller);const delta=area.getBoundingClientRect().top-anchor;if(scroller&&Math.abs(delta)>.5){writingScroll=true;scroller.scrollTop+=delta;writingScroll=false;}};
+      hold();area.focus({preventScroll:true});
+      const onScroll=()=>{if(!writingScroll)stopped=true;};
+      const inputs=['wheel','touchstart','pointerdown','keydown','input'] as const;
+      inputs.forEach(name=>window.addEventListener(name,stop,{capture:true,passive:true}));
+      scroller?.addEventListener('scroll',onScroll,{passive:true});
+      const tick=()=>{if(stopped||!area.isConnected)return;hold();if(++frames<24)frame=requestAnimationFrame(tick);};frame=requestAnimationFrame(tick);
+      return()=>{cancelAnimationFrame(frame);scroller?.removeEventListener('scroll',onScroll);inputs.forEach(name=>window.removeEventListener(name,stop,{capture:true}));};
+    }
+    if(anchor!==null&&scroller){
+      if(scroller.matches('.android-reading'))refreshDocumentExtent(scroller);
+      const initialDelta=area.getBoundingClientRect().top-anchor;
+      if(Math.abs(initialDelta)>.5)scroller.scrollTop+=initialDelta;
+    }
+    if(document.activeElement!==area)area.focus({preventScroll:true});
+    if(!scroller)return;
+    const reducedMotion=document.documentElement.dataset.motion==='off'||document.documentElement.dataset.reduceMotion==='true'||(typeof window.matchMedia==='function'&&window.matchMedia('(prefers-reduced-motion: reduce)').matches);
+    if(reducedMotion){
+      const align=()=>{if(scroller.matches('.android-reading'))refreshDocumentExtent(scroller);const delta=liveEditorCenterDelta(area,scroller,false);if(Math.abs(delta)>.5)scroller.scrollTop+=delta;};
+      align();
+      let frames=0,frame=0,stopped=false;const stop=()=>{stopped=true;};
+      const inputs=['wheel','touchstart'] as const;
+      inputs.forEach(name=>window.addEventListener(name,stop,{capture:true,passive:true}));
+      const tick=()=>{if(stopped||!area.isConnected)return;align();if(++frames<12)frame=requestAnimationFrame(tick);};frame=requestAnimationFrame(tick);
+      return()=>{cancelAnimationFrame(frame);inputs.forEach(name=>window.removeEventListener(name,stop,{capture:true}));};
+    }
+    let frames=0,frame=0,stopped=false,lastTime=performance.now();const stop=()=>{stopped=true;};
+    const inputs=['wheel','touchstart'] as const;
     inputs.forEach(name=>window.addEventListener(name,stop,{capture:true,passive:true}));
-    scroller?.addEventListener('scroll',onScroll,{passive:true});
-    const tick=()=>{if(stopped||!area.isConnected)return;hold();if(++frames<24)frame=requestAnimationFrame(tick);};frame=requestAnimationFrame(tick);
-    return()=>{cancelAnimationFrame(frame);scroller?.removeEventListener('scroll',onScroll);inputs.forEach(name=>window.removeEventListener(name,stop,{capture:true}));};
-  },[editing?.prefix]);
+    const glide=(now:number)=>{
+      if(stopped||!area.isConnected)return;
+      if(scroller.matches('.android-reading'))refreshDocumentExtent(scroller);
+      const elapsed=Math.max(8,Math.min(50,now-lastTime));lastTime=now;
+      const delta=liveEditorCenterDelta(area,scroller,false);
+      if(Math.abs(delta)<=.75){
+        if(Math.abs(delta)>.1)scroller.scrollTop+=delta;
+        if(++frames<24)frame=requestAnimationFrame(glide);
+        return;
+      }
+      scroller.scrollTop+=delta*(1-Math.pow(.55,elapsed/(1000/60)));
+      if(++frames<36)frame=requestAnimationFrame(glide);
+    };
+    frame=requestAnimationFrame(glide);
+    return()=>{cancelAnimationFrame(frame);inputs.forEach(name=>window.removeEventListener(name,stop,{capture:true}));};
+  },[editing?.prefix,activeTypewriter]);
+
+  useEffect(()=>()=>{if(typingFrame.current)cancelAnimationFrame(typingFrame.current);},[]);
+  const syncActiveCaretCenter=()=>{
+    if(!activeTypewriter)return;
+    if(typingFrame.current)cancelAnimationFrame(typingFrame.current);
+    typingFrame.current=requestAnimationFrame(()=>{
+      typingFrame.current=0;
+      const area=editor.current;if(!area||!area.isConnected)return;
+      const scroller=area.closest<HTMLElement>('.android-reading,.reading-scroll,.preview-pane,.live-scroll');
+      if(!scroller)return;
+      if(scroller.matches('.android-reading'))refreshDocumentExtent(scroller);
+      const delta=liveEditorCenterDelta(area,scroller,area.value.includes('\n'));
+      if(Math.abs(delta)>1)scroller.scrollTop+=delta;
+    });
+  };
 
   useLayoutEffect(()=>{
     if(editing)return;
@@ -265,7 +342,6 @@ export default function LiveEditor({markdown,onChange,documentPath,python,dark,t
       document.removeEventListener('click',onClick,true);
     };
   },[isEditing,closeEditor]);
-
   const renderedSource=editing?editing.prefix+editing.originalText+editing.suffix:markdown;
   const sourceAnalysis=useMemo(()=>({source:renderedSource,analysis:analyzeDocument(renderedSource)}),[renderedSource]);
   const blocks=sourceAnalysis.analysis.blocks;
@@ -308,7 +384,7 @@ export default function LiveEditor({markdown,onChange,documentPath,python,dark,t
 
   useEffect(()=>{if(editing&&markdown!==editing.prefix+editing.text+editing.suffix)closeEditor();},[markdown,editing,closeEditor]);
   const copy=(event:ClipboardEvent)=>{if((event.target as Element).closest('textarea'))return;const source=selectedMarkdown(window.getSelection(),markdown);if(source!==null){event.clipboardData.setData('text/plain',source);event.preventDefault();}};
-  const update=(text:string)=>{if(!editing)return;setEditing({...editing,text});onChange(editing.prefix+text+editing.suffix);};
+  const update=(text:string)=>{if(!editing)return;setEditing({...editing,text});onChange(editing.prefix+text+editing.suffix);syncActiveCaretCenter();};
   const paste=(event:ClipboardEvent<HTMLTextAreaElement>)=>{
     if(!latexAutofix||!editing||event.defaultPrevented||event.clipboardData.files.length)return;
     const area=event.currentTarget,from=area.selectionStart,to=area.selectionEnd;
@@ -322,7 +398,7 @@ export default function LiveEditor({markdown,onChange,documentPath,python,dark,t
     // If unavailable, leave the original paste to the platform without loss.
     try {if(document.execCommand('insertText',false,repaired))event.preventDefault();}catch{/* Preserve native paste. */}
   };
-  const textarea=()=> <div className="live-active-block"><textarea ref={editor} data-source-start={editing!.prefix.length} spellCheck={false} value={editing!.text} style={{height:Math.max(120,editing!.text.split('\n').length*27+32)}} onPaste={paste} onChange={event=>update(event.target.value)} onKeyDown={event=>{if(event.key==='Escape'){event.preventDefault();event.stopPropagation();closeEditor();}}} onBlur={event=>{
+  const textarea=()=> <div className="live-active-block"><textarea ref={editor} data-source-start={editing!.prefix.length} spellCheck={false} value={editing!.text} style={{height:Math.max(120,editing!.text.split('\n').length*27+32)}} onPaste={paste} onChange={event=>update(event.target.value)} onKeyUp={event=>{if(['ArrowUp','ArrowDown','PageUp','PageDown','Home','End'].includes(event.key))syncActiveCaretCenter();}} onKeyDown={event=>{if(event.key==='Escape'){event.preventDefault();event.stopPropagation();closeEditor();}}} onBlur={event=>{
     if(event.relatedTarget instanceof Node&&event.currentTarget.parentElement?.contains(event.relatedTarget))return;
     if(outsidePressRef.current.active){outsidePressRef.current.deferredClose=true;return;}
     closeEditor(event.relatedTarget instanceof Element?event.relatedTarget:null);
@@ -355,7 +431,7 @@ export default function LiveEditor({markdown,onChange,documentPath,python,dark,t
     setEditing(null);
     onChange(markdown.slice(0,from)+next.slice(start,nextEnd)+markdown.slice(to));
   };
-  return <div className="live-document" onCopy={copy} onDragStart={event=>{setSelectedMarkdownDrag(event.nativeEvent,renderedSource);}}>
+  return <div ref={docRef} className="live-document" onCopy={copy} onDragStart={event=>{setSelectedMarkdownDrag(event.nativeEvent,renderedSource);}}>
     {!renderedSource.trim()?(editing?textarea():<section className="live-block" tabIndex={0} role="group" aria-label="Editable block 1" onClick={event=>open(event.currentTarget,0,markdown.length,false)} onDoubleClick={event=>open(event.currentTarget,0,markdown.length,false)} onKeyDown={event=>{if(event.key==='Enter'||event.key==='F2'){event.preventDefault();open(event.currentTarget,0,markdown.length,false);}}}/> ):<MarkdownPreview markdown={renderedSource} onChange={previewChange} documentPath={documentPath} python={python} dark={dark} trustedImageHosts={trustedImageHosts} onTrustImageHost={onTrustImageHost} renderBlock={renderBlock} fullDocumentAccessibility={fullDocumentAccessibility} sourceAnalysis={sourceAnalysis}/>}
   </div>;
 }

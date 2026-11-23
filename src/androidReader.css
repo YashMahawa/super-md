@@ -58,6 +58,7 @@
 :root[data-platform="android"] .android-document .reading-search { position:fixed; top:calc(max(var(--native-safe-top,0px), env(safe-area-inset-top,0px)) + 10px); left:12px; right:12px; padding:8px; gap:6px; border-radius:28px; }
 :root[data-platform="android"] .reading-search input { min-height:44px; flex-basis:140px; }
 .android-reading .live-document { width:100%; max-width:none; padding:24px 0 40vh; }
+.android-reading .live-document[data-typewriter="true"] { padding-top:var(--live-typewriter-pad,45vh); padding-bottom:var(--live-typewriter-pad,45vh); }
 .android-reading .document-page .live-document > .markdown-body { padding:0; }
 .android-reading .live-block .markdown-body, .android-reading .live-active-block textarea { font-size:var(--reader-size); }
 .android-reading .live-block .markdown-body { width: 100%; max-width: none; padding: 0; }
