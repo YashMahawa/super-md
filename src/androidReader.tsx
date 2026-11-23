@@ -242,7 +242,8 @@ function Reader() {
       }
       if(old && !sameViewport){window.clearTimeout(zoomTimer.current);cancelAnimationFrame(zoomFrame.current);zoomFrame.current=0;zoomTarget.current=null;}
       const load = () => { if (typeof loaded.typewriterScroll === "boolean") setTypewriterScroll(loaded.typewriterScroll, { persist: false }); reference.current=loaded;setState(loaded); zoomReference.current = loaded.zoom; };
-      if (old?.id === next.id && old.mode === next.mode) anchored(load); else load();
+      const typewriterChanged = Boolean(old?.typewriterScroll) !== Boolean(loaded.typewriterScroll);
+      if (old?.id === next.id && old.mode === next.mode && !typewriterChanged) anchored(load); else load();
     };
     window.supermdHistory=direction=>{
       if(document.querySelector('.theme-guide-dialog'))return;

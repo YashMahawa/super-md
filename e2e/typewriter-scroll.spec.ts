@@ -155,3 +155,70 @@ test("status bar Typewriter toggle in web workspace immediately controls LiveEdi
   await page.keyboard.press("Escape");
   await expect(page.locator(".live-document")).not.toHaveAttribute("data-typewriter", "true");
 });
+
+test("native supermdLoad toggle keeps active line centered across frames and fits narrow Android phone status bar", async ({ page }) => {
+  await page.addInitScript(() => {
+    document.documentElement.dataset.platform = "android";
+    window.SuperMD = {
+      post: (id: string) => {
+        queueMicrotask(() => window.supermdReply?.(id, true, null));
+      },
+    };
+  });
+  await page.setViewportSize({ width: 390, height: 844 });
+  await page.goto("/android-reader.html");
+  await page.waitForFunction(() => typeof window.supermdLoad === "function");
+
+  const lines = Array.from({ length: 80 }, (_, i) => `Line ${i + 1}: Mobile study note entry ${i + 1}.`).join("\n");
+  const baseState = {
+    id: "tw-native-mobile",
+    content: lines,
+    path: null,
+    mode: "editor" as const,
+    dark: false,
+    fullscreen: false,
+    colors: {},
+    font: "Manrope",
+    size: 16,
+    zoom: 100,
+    typewriterScroll: false,
+  };
+
+  await page.evaluate((s) => window.supermdLoad?.(s), baseState);
+  const statusBar = page.locator(".source-editor-status");
+  const toggleBtn = page.getByRole("button", { name: "Typewriter", exact: true });
+  const wrapBtn = page.getByRole("button", { name: "Wrap lines", exact: true });
+  await expect(toggleBtn).toBeVisible();
+  await expect(wrapBtn).toBeVisible();
+
+  // Move cursor to the end of the document with a selection so the status bar has long Ln/Col/selected text on a 390px phone.
+  await page.locator(".cm-content").focus();
+  await page.keyboard.press("Control+End");
+  await page.keyboard.press("Shift+Home");
+  const layoutFit = await statusBar.evaluate((el) => {
+    const bar = el.getBoundingClientRect();
+    const buttons = Array.from(el.querySelectorAll("button")).map((b) => b.getBoundingClientRect());
+    return {
+      overflow: el.scrollWidth - el.clientWidth,
+      allButtonsInside: buttons.every((r) => r.left >= bar.left && r.right <= bar.right),
+    };
+  });
+  expect(layoutFit.overflow).toBeLessThanOrEqual(0);
+  expect(layoutFit.allButtonsInside).toBe(true);
+
+  await page.keyboard.press("End");
+  // Toggle typewriterScroll via native supermdLoad (simulating Qt Ctrl+Alt+T or Qt/Android Settings switch without DOM keydown).
+  await page.evaluate((s) => window.supermdLoad?.({ ...s, contentUnchanged: true, typewriterScroll: true } as any), baseState);
+  // Wait across multiple animation frames to verify captureScrollAnchor does not snap the centered cursor back.
+  await page.waitForTimeout(150);
+  await expect(toggleBtn).toHaveAttribute("aria-pressed", "true");
+
+  const centerError = await page.evaluate(() => {
+    const scroller = document.querySelector<HTMLElement>(".cm-scroller")!;
+    const active = document.querySelector<HTMLElement>(".cm-activeLine")!;
+    const sRect = scroller.getBoundingClientRect();
+    const aRect = active.getBoundingClientRect();
+    return Math.abs((aRect.top + aRect.height / 2) - (sRect.top + sRect.height / 2));
+  });
+  expect(centerError).toBeLessThan(28);
+});

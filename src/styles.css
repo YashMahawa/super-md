@@ -246,13 +246,13 @@ md-filled-button.primary-action, smd-expressive-button.primary-action { display:
 .source-editor-shell > .editor-host { flex: 1; height: auto; overflow: hidden; }
 .source-editor-status { display: flex; align-items: center; gap: 14px; flex-shrink: 0; min-height: 42px; padding: 4px 18px; color: var(--muted); background: var(--surface-low); font: 12px/1.4 "Manrope Variable", system-ui, sans-serif; }
 .source-language { color: var(--text); font-weight: 600; }
-.source-position { font-variant-numeric: tabular-nums; }
+.source-position { font-variant-numeric: tabular-nums; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .source-status-spacer { flex: 1; }
 .source-editor-status button { min-height: 32px; padding: 5px 12px; border-radius: 999px; color: var(--muted); background: transparent; font: inherit; white-space: nowrap; cursor: pointer; }
 .source-editor-status button[aria-pressed="true"] { color: var(--on-primary-container, var(--text)); background: var(--primary-container, var(--surface-high)); }
 .source-editor-status button:hover { background: var(--surface-high); color: var(--text); }
 .source-editor-status button:focus-visible { outline: 2px solid var(--primary); outline-offset: 2px; }
-@media (max-width: 480px) { .source-editor-status { gap: 8px; padding-inline: 10px; } .source-encoding { display: none; } }
+@media (max-width: 480px) { .source-editor-status { gap: 6px; padding-inline: 10px; } .source-encoding, .source-language { display: none; } .source-editor-status button { padding-inline: 9px; } }
 .cm-editor, .cm-scroller { height: 100%; }
 .cm-editor.cm-focused { outline: none; }
 .cm-panels { background: var(--surface-high) !important; color: var(--text) !important; border: 0 !important; padding: 8px; }

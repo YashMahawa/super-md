@@ -53,8 +53,9 @@ function toggleTypewriterFromView(editor: EditorView): boolean {
   for (const [id, activeView] of visibleEditors) {
     if (activeView === editor) {
       const next = !(typewriterStates.get(id) ?? getTypewriterScroll());
-      setTypewriterScroll(next);
-      typewriterHandlers.get(id)?.(next);
+      const handler = typewriterHandlers.get(id);
+      setTypewriterScroll(next, { persist: !handler });
+      handler?.(next);
       return true;
     }
   }
@@ -319,7 +320,7 @@ export default function Editor({ sessionId = "default", value, onChange, dark, f
       <span className="source-language">Markdown</span>
       <span ref={position} className="source-position">Ln 1, Col 1</span>
       <span className="source-status-spacer" />
-      <button type="button" aria-pressed={activeTypewriter} title="Toggle typewriter scrolling (Ctrl+Alt+T)" onClick={() => { const next = !activeTypewriter; setTypewriterScroll(next); onTypewriterChange?.(next); }}>Typewriter</button>
+      <button type="button" aria-pressed={activeTypewriter} title="Toggle typewriter scrolling (Ctrl+Alt+T)" onClick={() => { const next = !activeTypewriter; setTypewriterScroll(next, { persist: !onTypewriterChange }); onTypewriterChange?.(next); }}>Typewriter</button>
       <button type="button" aria-pressed={wrap} title="Toggle line wrapping" onClick={() => setWrap(current => !current)}>Wrap lines</button>
       <span className="source-encoding">UTF-8</span>
     </footer>

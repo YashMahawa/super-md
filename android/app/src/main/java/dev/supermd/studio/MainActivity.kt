@@ -1386,7 +1386,7 @@ internal class NoteDestination(private val mime: String, private val preferred: 
             }
             if (section == "Writing & shortcuts") SettingsGroup("Writing") {
                 Row(verticalAlignment=Alignment.CenterVertically){Text("Typewriter scrolling",Modifier.weight(1f));Switch(checked=state.typewriterScroll,onCheckedChange=model::typewriterScroll)}
-                Text("Vertically centers the active line in Source and Live while typing.",style=MaterialTheme.typography.bodySmall,color=MaterialTheme.colorScheme.onSurfaceVariant)
+                Text("Off by default. Vertically centers the active line in Source, Split and Live while typing.",style=MaterialTheme.typography.bodySmall,color=MaterialTheme.colorScheme.onSurfaceVariant)
                 Row(verticalAlignment=Alignment.CenterVertically){Text("Spell check",Modifier.weight(1f));Switch(checked=state.spellCheck,onCheckedChange={model.writing(spellCheck=it)})}
                 Row(verticalAlignment=Alignment.CenterVertically){Text("Grammar check",Modifier.weight(1f));Switch(checked=state.grammarCheck,onCheckedChange={model.writing(grammarCheck=it)})}
                 Row(verticalAlignment=Alignment.CenterVertically){Text("LaTeX autofix on paste",Modifier.weight(1f));Switch(checked=state.latexAutofix,onCheckedChange=model::latexAutofix)}
