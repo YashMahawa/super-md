@@ -5,13 +5,21 @@ import sys
 import unittest
 from pathlib import Path
 
+def suite_watchdog_seconds(system: str = sys.platform, machine: str = platform.machine()) -> int:
+    # macOS CI runs multiple isolated Qt WebEngine + Chromium probes (including
+    # five bounded 60-second mouse-selection probes and live reader/export E2E
+    # checks) plus hdiutil DMG packaging checks after hundreds of native tests.
+    # A four-minute suite watchdog kills macos-latest (arm64) right around 240s
+    # before the suite can finish, while 420s stays inside ci.yml's 8-minute
+    # step timeout so faulthandler still dumps stacks if a Qt driver stalls.
+    if system == "darwin":
+        return 720 if machine == "x86_64" else 420
+    return 240
+
+
 if __name__ == "__main__":
     faulthandler.enable()
-    # Intel macOS CI runs five bounded 60-second Qt mouse-selection probes
-    # after hundreds of native tests. A four-minute suite watchdog kills the
-    # process before those individual timeouts can report a real failure.
-    # Keep the per-probe assertions and timeout; only widen the suite budget.
-    suite_timeout = 720 if sys.platform == "darwin" and platform.machine() == "x86_64" else 240
+    suite_timeout = suite_watchdog_seconds()
     faulthandler.dump_traceback_later(suite_timeout, exit=True)
     try:
         suite=unittest.defaultTestLoader.discover(str(Path(__file__).parent),pattern="test_*.py")

@@ -60,12 +60,22 @@ def _mdzip_e2e_probe(directory: str) -> int:
     from PySide6.QtCore import QFile, QIODevice, QTimer, QUrl
     from PySide6.QtQml import QQmlApplicationEngine
     from PySide6.QtQuickControls2 import QQuickStyle
+    from PySide6.QtWebEngineCore import QWebEngineProfile, QWebEngineUrlScheme
     from PySide6.QtWebEngineQuick import QtWebEngineQuick
     from PySide6.QtWidgets import QApplication
     from agent_live import LiveTabClient, create_qt_bridge
+    from reader_assets import ReaderAssetSchemeHandler, SCHEME
     from studio import Session, Studio
 
     QQuickStyle.setStyle("Material")
+    scheme = QWebEngineUrlScheme(SCHEME.encode("ascii"))
+    scheme.setSyntax(QWebEngineUrlScheme.Syntax.Host)
+    scheme.setFlags(
+        QWebEngineUrlScheme.Flag.SecureScheme
+        | QWebEngineUrlScheme.Flag.CorsEnabled
+        | QWebEngineUrlScheme.Flag.LocalScheme
+    )
+    QWebEngineUrlScheme.registerScheme(scheme)
     QtWebEngineQuick.initialize()
     app = QApplication(["Super MD mdzip E2E test"])
 
@@ -85,6 +95,8 @@ def _mdzip_e2e_probe(directory: str) -> int:
     studio = Studio(True, session)
     session.agent_bridge = create_qt_bridge(session, session.data)
     bridge = session.agent_bridge
+    asset_handler = ReaderAssetSchemeHandler(session.reader_assets, app)
+    QWebEngineProfile.defaultProfile().installUrlSchemeHandler(SCHEME.encode("ascii"), asset_handler)
 
     tab = studio._current()
     tab["name"] = note_path.name
@@ -150,9 +162,9 @@ def _mdzip_e2e_probe(directory: str) -> int:
                 "ok": True,
                 "uiZip": str(ui_zip),
                 "liveZip": str(live_zip_holder.get("path", "")),
-            }, separators=(",", ":")))
+            }, separators=(",", ":")), flush=True)
         else:
-            print(json.dumps({"ok": False, "stage": state["stage"], "error": state["error"]}, separators=(",", ":")))
+            print(json.dumps({"ok": False, "stage": state["stage"], "error": state["error"]}, separators=(",", ":")), flush=True)
         app.exit(code)
 
     def run_live_export() -> None:
@@ -183,18 +195,18 @@ def _mdzip_e2e_probe(directory: str) -> int:
                         return
                     if job.get("status") in ("failed", "cancelled"):
                         raise RuntimeError(f"Live mdzip export job failed: {job}")
-                    time.sleep(0.05)
+                    time.sleep(0.02)
                 raise RuntimeError("Timed out waiting for live mdzip export job")
             except Exception as error:
                 live_zip_holder["error"] = str(error)
                 live_zip_holder["done"] = True
 
         threading.Thread(target=worker, daemon=True).start()
-        QTimer.singleShot(25, poll_live_export)
+        QTimer.singleShot(15, poll_live_export)
 
     def poll_live_export() -> None:
         if not live_zip_holder.get("done"):
-            QTimer.singleShot(25, poll_live_export)
+            QTimer.singleShot(15, poll_live_export)
             return
         if live_zip_holder.get("error"):
             state["error"] = str(live_zip_holder["error"])
@@ -208,7 +220,7 @@ def _mdzip_e2e_probe(directory: str) -> int:
                 state["error"] = f"Timed out waiting for UI mdzip export; message={studio.message!r}"
                 finish(2)
                 return
-            QTimer.singleShot(25, poll_ui_export)
+            QTimer.singleShot(15, poll_ui_export)
             return
         if not ui_zip.is_file():
             state["error"] = f"UI mdzip export did not produce {ui_zip}; message={studio.message!r}"
@@ -224,15 +236,15 @@ def _mdzip_e2e_probe(directory: str) -> int:
             state["stage"] = "ui_export"
             ui_deadline[0] = time.monotonic() + 20
             studio.exportTo(QUrl.fromLocalFile(str(ui_zip)).toString(), "mdzip")
-            QTimer.singleShot(25, poll_ui_export)
+            QTimer.singleShot(15, poll_ui_export)
             return
         if time.monotonic() > ready_deadline:
             state["error"] = "Timed out waiting for real Qt WebEngine reader readiness"
             finish(2)
             return
-        QTimer.singleShot(50, wait_ready)
+        QTimer.singleShot(25, wait_ready)
 
-    QTimer.singleShot(50, wait_ready)
+    QTimer.singleShot(25, wait_ready)
     QTimer.singleShot(60_000, lambda: (state.update(error=f"mdzip E2E probe timed out at {state['stage']}"), finish(2)))
     return app.exec()
 
