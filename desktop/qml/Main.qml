@@ -198,6 +198,7 @@ ApplicationWindow {
         case "zoom_in": window.runDocumentScript("window.supermdZoomBy?.(1.1)"); break
         case "zoom_out": window.runDocumentScript("window.supermdZoomBy?.(1/1.1)"); break
         case "zoom_reset": window.runDocumentScript("window.supermdResetZoom?.()"); break
+        case "typewriter_scroll": studio.setting("typewriterScroll", JSON.stringify(!viewState.settings.typewriterScroll)); break
         }
     }
     function focusReader() { if (reader) reader.forceActiveFocus() }
@@ -259,7 +260,10 @@ ApplicationWindow {
         function onAllowClose() {
             flushDialog.close(); closeDialog.close()
             if (studio.backgroundEnabled && !studio.hasOtherOpenWindows()) { window.hide(); return }
-            intentionalShutdown = true; closingAllowed = true; window.close()
+            intentionalShutdown = true; closingAllowed = true
+            readerRetryTimer.stop(); readerRecoveryRestoreTimer.stop(); readerStableTimer.stop()
+            readerLoader.active = false
+            window.close()
         }
         function onFlushFailed(canClose) { if(!closingAllowed && !closeDialog.visible) { if (!window.visible) { window.show(); window.raise(); window.requestActivate() } flushDialog.canClose = canClose; flushDialog.open() } }
         function onCloseRequested(name) { flushDialog.close(); closeDialog.title = "Save changes to " + name + "?"; if(!closeDialog.visible) { if (!window.visible) { window.show(); window.raise(); window.requestActivate() } closeDialog.open() } }

@@ -65,11 +65,12 @@ def main(argv):
             )
         )
         socket.disconnectFromServer()
+        socket.close()
         if not raw:
             if peer_closed or startup_poll:return None
             probe=QLocalSocket();probe.connectToServer(name)
             still_listening=probe.waitForConnected(100)
-            probe.abort()
+            probe.abort();probe.close()
             if not still_listening and not _instance_lock_held():return None
             raise ValueError('Existing Super MD instance did not respond to service request')
         line=raw.split(b'\n',1)[0].rstrip(b'\r')
@@ -83,15 +84,22 @@ def main(argv):
         return reply
     if args.action=='start':
         try:reply=request('start')
-        except ValueError:
-            if not _instance_lock_held():raise
-            reply=None;init_deadline=time.monotonic()+8
-            while time.monotonic()<init_deadline:
-                reply=request('start',startup_poll=True)
-                if reply is not None or not _instance_lock_held():break
-                time.sleep(.1)
-            if reply is None and _instance_lock_held():
-                reply=request('start')
+        except ValueError as error:
+            if 'Invalid response' in str(error):raise
+            if not _instance_lock_held():
+                probe=QLocalSocket();probe.connectToServer(name)
+                still_listening=probe.waitForConnected(100)
+                probe.abort();probe.close()
+                if still_listening:raise
+                reply=None
+            else:
+                reply=None;init_deadline=time.monotonic()+8
+                while time.monotonic()<init_deadline:
+                    reply=request('start',startup_poll=True)
+                    if reply is not None or not _instance_lock_held():break
+                    time.sleep(.1)
+                if reply is None and _instance_lock_held():
+                    reply=request('start')
     else:
         reply=request(args.action)
     if args.action=='status':

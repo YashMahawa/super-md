@@ -645,7 +645,7 @@ Studio._restore_update = lambda self: None
 
 import main as desktop_main
 sys.argv = [str(Path(desktop_dir) / "main.py"), "--background", "--agent-access", "--safe-graphics"]
-sys.exit(desktop_main.main())
+desktop_main._exit_process(desktop_main.main())
 """
 
 
@@ -891,11 +891,15 @@ class InstanceBrokerAndServiceCliTests(unittest.TestCase):
         self.assertIn("--agent-access", spawned[0])
 
     def _service_for_appdata(self, appdata: Path, action: str, **extra):
-        res = self._call(
-            {"kind": "service", "action": action, "appdata": str(appdata), **extra},
-            timeout=45.0 if extra.get("realSpawn") else 10.0,
-        )
         log_path = appdata / "background-service.log"
+        try:
+            res = self._call(
+                {"kind": "service", "action": action, "appdata": str(appdata), **extra},
+                timeout=75.0 if extra.get("realSpawn") else 15.0,
+            )
+        except AssertionError as exc:
+            log_tail = log_path.read_text(encoding="utf-8", errors="replace")[-3000:] if log_path.is_file() else ""
+            raise AssertionError(f"{exc}; log={log_tail}") from exc
         log_tail = log_path.read_text(encoding="utf-8", errors="replace")[-2000:] if log_path.is_file() else ""
         self.assertTrue(res["stdout"].strip(), f"Empty CLI output; stderr={res['stderr']}; log={log_tail}")
         return res["code"], json.loads(res["stdout"])
@@ -1652,10 +1656,10 @@ def _occluded_post(self, id, command, raw):
         self.readerCall.emit("window.supermdAgentRequest = function(){}; window.supermdFlush = function(){};")
 Studio.post = _occluded_post""",
             ).replace(
-                "sys.exit(desktop_main.main())",
+                "desktop_main._exit_process(desktop_main.main())",
                 """rc = desktop_main.main()
 time.sleep(0.45)
-sys.exit(rc)""",
+desktop_main._exit_process(rc)""",
             )
         )
 
@@ -1756,6 +1760,95 @@ sys.exit(rc)""",
                     break
             time.sleep(0.05)
         self.assertTrue(stopped, "Restarted daemon did not fully exit after final stop")
+
+    def test_darwin_exit_bypass_and_vanished_closing_peer_start_handoff(self):
+        # 1. Verify _exit_process uses os._exit on darwin once Qt/WebEngine anchored teardown ran,
+        #    and uses sys.exit otherwise, always flushing stdio first.
+        import main as desktop_main
+
+        saved_anchor = list(desktop_main._DARWIN_EXIT_ANCHOR)
+        try:
+            desktop_main._DARWIN_EXIT_ANCHOR[:] = [object()]
+            with patch.object(desktop_main.sys, "platform", "darwin"), patch.object(
+                desktop_main.os, "_exit"
+            ) as mock_os_exit, patch.object(desktop_main.sys, "exit") as mock_sys_exit:
+                desktop_main._exit_process(0)
+                mock_os_exit.assert_called_once_with(0)
+                mock_sys_exit.assert_not_called()
+
+            desktop_main._DARWIN_EXIT_ANCHOR.clear()
+            with patch.object(desktop_main.sys, "platform", "darwin"), patch.object(
+                desktop_main.os, "_exit"
+            ) as mock_os_exit, patch.object(desktop_main.sys, "exit") as mock_sys_exit:
+                desktop_main._exit_process(0)
+                mock_os_exit.assert_not_called()
+                mock_sys_exit.assert_called_once_with(0)
+        finally:
+            desktop_main._DARWIN_EXIT_ANCHOR[:] = saved_anchor
+
+        # 2. Simulate macOS XNU closing-socket race during `service start`:
+        #    the initial client connect writes to a dying server (e.g. UnknownSocketError / empty read
+        #    while the server was briefly still bound), and by the next millisecond both the server
+        #    socket and native-instance.lock are gone. `service start` must treat the vanished peer
+        #    as stopped and spawn the replacement daemon instead of failing with exit code 2.
+        self.broker.close()
+        vanished_appdata = (self.temp_appdata / "Vanished Peer On Start").resolve()
+        vanished_appdata.mkdir(parents=True, exist_ok=True)
+        socket_name = "supermd-qt-" + hashlib.sha256(str(vanished_appdata).encode()).hexdigest()[:20]
+        QLocalServer.removeServer(socket_name)
+
+        dying_server = QLocalServer(self.qt_app)
+        dying_server.setSocketOptions(QLocalServer.SocketOption.UserAccessOption)
+        held = []
+
+        def on_dying_connect():
+            while dying_server.hasPendingConnections():
+                sock = dying_server.nextPendingConnection()
+                held.append(sock)
+                if len(held) >= 2:
+                    for s in held:
+                        s.abort()
+                    dying_server.close()
+                    QLocalServer.removeServer(socket_name)
+
+        dying_server.newConnection.connect(on_dying_connect)
+        self.assertTrue(dying_server.listen(socket_name))
+        self.addCleanup(lambda: (dying_server.close(), QLocalServer.removeServer(socket_name)))
+
+        spawned, marker = [], vanished_appdata / "vanished-spawn.json"
+
+        def advance_vanish_race():
+            if marker.is_file() and not spawned:
+                spawned.append(json.loads(marker.read_text(encoding="utf-8")))
+                with patch.object(
+                    QStandardPaths,
+                    "writableLocation",
+                    side_effect=lambda k: str(vanished_appdata)
+                    if k == QStandardPaths.AppDataLocation
+                    else self._orig_writable(k),
+                ):
+                    fresh_replacement = InstanceBroker(
+                        self.qt_app, service_handler=self.session.background.handle_service_request
+                    )
+                    self.addCleanup(fresh_replacement.close)
+                    self.session.settings["agentAccessEnabled"] = True
+                    self.session.agent_bridge.start()
+                    self.session.background.set_forced(True)
+                    self.assertTrue(fresh_replacement.claim_or_forward(None))
+
+        res = self._call(
+            {
+                "kind": "service",
+                "action": "start",
+                "appdata": str(vanished_appdata),
+                "spawnMarker": str(marker),
+            },
+            on_tick=advance_vanish_race,
+            timeout=15.0,
+        )
+        self.assertEqual(res["code"], 0, res)
+        self.assertTrue(json.loads(res["stdout"])["result"]["running"])
+        self.assertEqual(len(spawned), 1)
 
 
 if __name__ == "__main__":

@@ -1,6 +1,6 @@
 """Tray-owned application lifetime; closing a window preserves its live note session when opted in."""
 from pathlib import Path
-from PySide6.QtCore import QObject, QTimer
+from PySide6.QtCore import QCoreApplication, QEvent, QObject, QTimer
 from PySide6.QtGui import QIcon
 from PySide6.QtWidgets import QSystemTrayIcon, QMenu
 
@@ -106,7 +106,7 @@ class BackgroundService(QObject):
                 if prefs_changed and hasattr(open_windows[0],'_preferences'):open_windows[0]._preferences()
                 self.disable()
                 return {'ok':True,'running':False,'stopped':running,'quitRequested':False}
-            self._cli_started_agent_access=False;self._stopping_from_cli=True
+            self._cli_started_agent_access=False;self._stopping_from_cli=True;self.quitting=True
             if bridge is not None:bridge.stop()
             self.disable();self.quit()
             return {'ok':True,'running':False,'stopped':True,'quitRequested':True}
@@ -126,15 +126,21 @@ class BackgroundService(QObject):
         self._clear_quit_handlers();self.quitting=False;self._stopping_from_cli=False;self.sync()
         if self.visible_windows():self.restore_agent_access()
         self._notify_windows()
+    def _finalize_quit(self):
+        if not self.quitting:return
+        if self.tray is not None:self.tray.hide()
+        self.app.setQuitOnLastWindowClosed(True)
+        QCoreApplication.sendPostedEvents(None,QEvent.Type.DeferredDelete)
+        self.app.quit()
     def quit(self):
         self._clear_quit_handlers();self.quitting=True
         owners=[s for s in self.session.windows.values() if not s.retired]
         self.waiting={s.window_id for s in owners}
-        if not owners:QTimer.singleShot(0,self.app.quit);return
+        if not owners:QTimer.singleShot(0,self._finalize_quit);return
         for studio in owners:
             key=studio.window_id
             def ready(key=key):
                 self.waiting.discard(key)
-                if not self.waiting:self._clear_quit_handlers();QTimer.singleShot(0,self.app.quit)
+                if not self.waiting:self._clear_quit_handlers();QTimer.singleShot(0,self._finalize_quit)
             studio.allowClose.connect(ready);self._quit_handlers.append((studio,ready))
             studio.closeWindowSafely()
