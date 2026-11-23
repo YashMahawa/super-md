@@ -58,6 +58,7 @@ import androidx.compose.ui.graphics.lerp
 import androidx.compose.ui.graphics.toArgb
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.LocalDensity
+import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.res.painterResource
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
@@ -76,6 +77,7 @@ import kotlinx.coroutines.delay
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
 import kotlinx.coroutines.flow.first
+import org.json.JSONArray
 import org.json.JSONObject
 import java.security.MessageDigest
 import java.util.concurrent.atomic.AtomicBoolean
@@ -123,6 +125,21 @@ class MainActivity : ComponentActivity() {
     val agentAccessState: AgentAccessState by lazy { AgentAccessState(this) }
     var agentRelayState by mutableStateOf(AgentRelayClient.State.DISCONNECTED)
         private set
+    var agentRelayRetrying by mutableStateOf(false)
+        private set
+    var agentAccessEnabled by mutableStateOf(false)
+        private set
+    internal var agentBackgroundGraceMillis: Long = DEFAULT_AGENT_BACKGROUND_GRACE_MILLIS
+    internal var agentConfigOverrideForTest: AgentAccessConfig? = null
+    internal var agentRelayCallFactoryForTest: okhttp3.Call.Factory? = null
+    internal var agentRelayWebSocketFactoryForTest: okhttp3.WebSocket.Factory? = null
+    private var activityStopped = false
+    private val relayGraceTimerOwner = Any()
+    private var relayGraceTimerActive = false
+    @Volatile private var currentReaderWebView: WebView? = null
+    private val backgroundDisconnectRunnable = Runnable {
+        if (activityStopped) disconnectRelayNow()
+    }
     @Volatile private var agentBridgeHandler: ((JSONObject, (Any?, String?) -> Unit) -> Unit)? = null
     @Volatile private var agentUiHandler: ((JSONObject, (Any?, String?) -> Unit) -> Boolean)? = null
     @Volatile private var agentExportHandler: ((JSONObject) -> Unit)? = null
@@ -131,7 +148,14 @@ class MainActivity : ComponentActivity() {
     private val pendingAgentReplies = java.util.concurrent.ConcurrentHashMap<String, (Any?, String?) -> Unit>()
     private val pendingAgentReplyTimeouts = java.util.concurrent.ConcurrentHashMap<String, Runnable>()
     private val agentMainHandler = Handler(Looper.getMainLooper())
-    private val agentRelayClient: AgentRelayClient by lazy { AgentRelayClient { agentRelayState = it } }
+    private val agentRelayClient: AgentRelayClient by lazy {
+        AgentRelayClient(
+            onState = { agentRelayState = it },
+            onRetrying = { agentRelayRetrying = it },
+            callFactory = agentRelayCallFactoryForTest,
+            webSocketFactory = agentRelayWebSocketFactoryForTest,
+        )
+    }
     private var relayIdentity: String? = null
     private var workspaceKey = "main"
     internal val agentWorkspaceKey: String get() = workspaceKey
@@ -142,6 +166,7 @@ class MainActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         workspaceKey = (savedInstanceState?.getString("workspace") ?: intent.getStringExtra("workspace") ?: "main").takeIf { it == "main" || runCatching { java.util.UUID.fromString(it) }.isSuccess } ?: "main"
+        syncAgentAccessUiState()
         enableEdgeToEdge()
         if (Build.VERSION.SDK_INT >= 28) window.attributes = window.attributes.apply { layoutInDisplayCutoutMode = if (Build.VERSION.SDK_INT >= 30) WindowManager.LayoutParams.LAYOUT_IN_DISPLAY_CUTOUT_MODE_ALWAYS else WindowManager.LayoutParams.LAYOUT_IN_DISPLAY_CUTOUT_MODE_SHORT_EDGES }
         // Create this task's workspace before RESUMED/lifecycle consumers can
@@ -169,9 +194,61 @@ class MainActivity : ComponentActivity() {
         model.retainDocumentAccess(uri)
         model.requestOpen(uri, relative)
     }
-    override fun onStop() { saveReaderPosition?.invoke(); model.flush(); agentRelayClient.disconnect(); relayIdentity = null; pendingAgentReplies.clear(); pendingAgentReplyTimeouts.values.forEach(agentMainHandler::removeCallbacks); pendingAgentReplyTimeouts.clear(); super.onStop() }
-    override fun onResume() { super.onResume(); model.refreshMetadata(); model.refreshExternal();model.reloadCustomTheme(); refreshAgentRelay() }
-    internal fun agentConfigForThisWindow(): AgentAccessConfig? = agentAccessState.configForWorkspace(workspaceKey)
+    internal fun syncAgentAccessUiState() {
+        agentAccessEnabled = agentAccessState.enabled && agentConfigForThisWindow() != null
+    }
+    internal fun attachCurrentReaderWebView(reader: WebView?) {
+        currentReaderWebView = reader
+    }
+    private fun setRelayGraceTimerLease(active: Boolean) {
+        if (relayGraceTimerActive == active) return
+        relayGraceTimerActive = active
+        val action = if (active) ReaderTimerOwners.process.acquire(relayGraceTimerOwner, true)
+        else ReaderTimerOwners.process.release(relayGraceTimerOwner)
+        val reader = currentReaderWebView ?: return
+        when (action) {
+            ReaderTimerOwners.GlobalAction.PAUSE -> reader.pauseTimers()
+            ReaderTimerOwners.GlobalAction.RESUME -> reader.resumeTimers()
+            ReaderTimerOwners.GlobalAction.NONE -> Unit
+        }
+    }
+    internal fun disconnectRelayNow() {
+        agentMainHandler.removeCallbacks(backgroundDisconnectRunnable)
+        setRelayGraceTimerLease(false)
+        agentRelayClient.disconnect()
+        relayIdentity = null
+        clearPendingAgentReplies()
+    }
+    override fun onStart() {
+        super.onStart()
+        activityStopped = false
+        agentMainHandler.removeCallbacks(backgroundDisconnectRunnable)
+        setRelayGraceTimerLease(false)
+        syncAgentAccessUiState()
+    }
+    override fun onStop() {
+        activityStopped = true
+        saveReaderPosition?.invoke()
+        model.flush()
+        val keepDuringGrace = !isChangingConfigurations && !isFinishing &&
+            agentAccessState.enabled && agentConfigForThisWindow() != null && agentBackgroundGraceMillis > 0L
+        if (keepDuringGrace) {
+            setRelayGraceTimerLease(true)
+            agentMainHandler.removeCallbacks(backgroundDisconnectRunnable)
+            agentMainHandler.postDelayed(backgroundDisconnectRunnable, agentBackgroundGraceMillis)
+        } else {
+            disconnectRelayNow()
+        }
+        super.onStop()
+    }
+    override fun onDestroy() {
+        activityStopped = true
+        disconnectRelayNow()
+        currentReaderWebView = null
+        super.onDestroy()
+    }
+    override fun onResume() { super.onResume(); activityStopped = false; agentMainHandler.removeCallbacks(backgroundDisconnectRunnable); setRelayGraceTimerLease(false); model.refreshMetadata(); model.refreshExternal();model.reloadCustomTheme(); syncAgentAccessUiState(); refreshAgentRelay() }
+    internal fun agentConfigForThisWindow(): AgentAccessConfig? = agentConfigOverrideForTest ?: agentAccessState.configForWorkspace(workspaceKey)
     internal fun localAgentTabId(value: String): String? {
         if (value.isBlank()) return null
         if (!value.startsWith("tab:")) return value.takeIf { ':' !in it }
@@ -275,16 +352,16 @@ class MainActivity : ComponentActivity() {
     internal fun revokeAgentAccess(completion: (serverRevoked: Boolean) -> Unit) {
         val configs = agentAccessState.allConfigs()
         agentAccessState.setEnabled(false)
-        agentRelayClient.disconnect()
-        relayIdentity = null
-        clearPendingAgentReplies()
-        if (configs.isEmpty()) { agentAccessState.revoke(); completion(true); return }
+        syncAgentAccessUiState()
+        disconnectRelayNow()
+        if (configs.isEmpty()) { agentAccessState.revoke(); syncAgentAccessUiState(); completion(true); return }
         val remaining = java.util.concurrent.atomic.AtomicInteger(configs.size)
         val allRevoked = java.util.concurrent.atomic.AtomicBoolean(true)
         configs.forEach { config -> agentRelayClient.revokeDevice(config) { revoked ->
             if (!revoked) allRevoked.set(false)
             if (remaining.decrementAndGet() == 0) {
                 agentAccessState.revoke()
+                syncAgentAccessUiState()
                 clearPendingAgentReplies()
                 completion(allRevoked.get())
             }
@@ -387,13 +464,14 @@ class MainActivity : ComponentActivity() {
         } finally { if (finalBitmap !== bitmap) finalBitmap.recycle(); bitmap.recycle() }
     }
     internal fun refreshAgentRelay() {
+        syncAgentAccessUiState()
         if (!agentAccessState.enabled) {
-            agentRelayClient.disconnect(); relayIdentity = null; clearPendingAgentReplies(); return
+            disconnectRelayNow(); return
         }
         val config = agentConfigForThisWindow()
-        if (config == null) { agentRelayClient.disconnect(); relayIdentity = null; clearPendingAgentReplies(); return }
+        if (config == null) { disconnectRelayNow(); return }
         val identity = "${config.groupId}:${config.deviceId}"
-        if (identity == relayIdentity && agentRelayState != AgentRelayClient.State.DISCONNECTED) return
+        if (identity == relayIdentity && (agentRelayState != AgentRelayClient.State.DISCONNECTED || agentRelayRetrying)) return
         relayIdentity = identity
         agentRelayClient.connect(config) { request, reply ->
             val ui = agentUiHandler
@@ -433,10 +511,27 @@ class MainActivity : ComponentActivity() {
         private const val OPEN_DISPATCHER_SESSION = "open_dispatcher_session"
         private const val MAX_AGENT_EXPORT_BYTES = 128L * 1024 * 1024
         private const val AGENT_EXPORT_LEASE_MILLIS = 10L * 60 * 1000
+        internal const val DEFAULT_AGENT_BACKGROUND_GRACE_MILLIS = 3L * 60L * 1000L
     }
     fun newWindow() {
         model.flush()
         startActivity(Intent(this, MainActivity::class.java).putExtra("workspace", java.util.UUID.randomUUID().toString()).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_MULTIPLE_TASK or Intent.FLAG_ACTIVITY_LAUNCH_ADJACENT))
+    }
+}
+
+internal data class AgentStatusPillUi(val visible: Boolean, val label: String, val stateKey: String)
+
+internal fun resolveAgentStatusPillUi(
+    accessEnabled: Boolean,
+    relayState: AgentRelayClient.State,
+    retrying: Boolean,
+): AgentStatusPillUi {
+    val visible = accessEnabled || relayState != AgentRelayClient.State.DISCONNECTED || retrying
+    return when {
+        relayState == AgentRelayClient.State.CONNECTED -> AgentStatusPillUi(visible, "AI connected", "connected")
+        retrying -> AgentStatusPillUi(visible, "AI retrying…", "retrying")
+        relayState == AgentRelayClient.State.CONNECTING -> AgentStatusPillUi(visible, "AI connecting…", "connecting")
+        else -> AgentStatusPillUi(visible, "AI offline", "offline")
     }
 }
 
@@ -555,6 +650,7 @@ private object NoMotionScheme : MotionScheme {
         }
     }
     DisposableEffect(activity, web) {
+        activity.attachCurrentReaderWebView(web)
         model.assetAccessRestored = { document, source ->
             web?.evaluateJavascript("window.dispatchEvent(new CustomEvent('supermd-asset-access-restored',{detail:{documentPath:${JSONObject.quote(document)},source:${JSONObject.quote(source)}}}))", null)
         }
@@ -564,7 +660,7 @@ private object NoMotionScheme : MotionScheme {
             menu = false
             findRequest++
         }
-        onDispose { activity.dismissDocument = null;activity.saveReaderPosition=null;activity.openReaderFind=null;model.assetAccessRestored=null }
+        onDispose { activity.attachCurrentReaderWebView(null); activity.dismissDocument = null;activity.saveReaderPosition=null;activity.openReaderFind=null;model.assetAccessRestored=null }
     }
     LaunchedEffect(findRequest, menu, web) {
         if (findRequest == 0 || menu) return@LaunchedEffect
@@ -1005,14 +1101,32 @@ private object NoMotionScheme : MotionScheme {
         val wide = displayIsLarge && maxWidth >= 720.dp && maxHeight >= 400.dp
         val actualMode = if (!wide && state.mode == "split") "live" else state.mode
         val readerContent=remember {arrayOfNulls<String>(1)}
+        val sentAgentSeq = remember { mutableStateMapOf<String, Long>() }
         LaunchedEffect(readerReady, state.active, actualMode, dark, state.fullscreen, state.font, state.size, state.widthPercent,state.lineHeight,state.spellCheck,state.grammarCheck,state.latexAutofix,state.restorePosition,state.centerLock,state.imageAppearance,state.svgAppearance,state.imageContrast,state.fullDocumentAccessibility,state.customTheme,state.patternKind,state.patternOpacity,state.patternSize,state.patternSpacing,tokens, hinge, motion) {
-            if (!readerReady) readerNote[0] = null
+            if (!readerReady) {
+                readerNote[0] = null
+                sentAgentSeq.clear()
+            }
             if (readerReady) {
                 val note = state.active
-                val payload = JSONObject().put("id", note.id).put("editProtocol", 1).apply { if (readerNote[0] == note.id && (readerContent[0] === note.content || model.readerEcho[note.id] === note.content)) put("contentUnchanged", true) else put("content", note.content) }.put("path", note.uri ?: note.id).put("mode", actualMode).put("dark", dark).put("fullscreen", state.fullscreen).put("font", state.font).put("size", state.size).put("widthPercent",state.widthPercent).put("lineHeight",state.lineHeight).put("spellCheck",state.spellCheck).put("grammarCheck",state.grammarCheck).put("latexAutofix",state.latexAutofix).put("restorePosition",state.restorePosition).put("centerLock",state.centerLock).put("imageAppearance",state.imageAppearance).put("svgAppearance",state.svgAppearance).put("imageContrast",state.imageContrast).put("fullDocumentAccessibility",state.fullDocumentAccessibility).put("colors", tokens).put("zoom", state.zoom).put("motion", motion)
+                val lastSeq = sentAgentSeq[note.id] ?: 0L
+                val unseenEdits = note.agentEdits.filter { it.seq > lastSeq }
+                val payload = JSONObject().put("id", note.id).put("editProtocol", 1).apply {
+                    if (readerNote[0] == note.id && (readerContent[0] === note.content || model.readerEcho[note.id] === note.content)) put("contentUnchanged", true)
+                    else put("content", note.content)
+                    if (note.agentUnreviewed) put("agentUnreviewed", true)
+                    if (unseenEdits.isNotEmpty()) {
+                        val editsJson = JSONArray()
+                        unseenEdits.forEach { step ->
+                            editsJson.put(JSONObject().put("seq", step.seq).put("before", step.before).put("after", step.after))
+                        }
+                        put("pendingAgentEdits", editsJson)
+                    }
+                }.put("path", note.uri ?: note.id).put("mode", actualMode).put("dark", dark).put("fullscreen", state.fullscreen).put("font", state.font).put("size", state.size).put("widthPercent",state.widthPercent).put("lineHeight",state.lineHeight).put("spellCheck",state.spellCheck).put("grammarCheck",state.grammarCheck).put("latexAutofix",state.latexAutofix).put("restorePosition",state.restorePosition).put("centerLock",state.centerLock).put("imageAppearance",state.imageAppearance).put("svgAppearance",state.svgAppearance).put("imageContrast",state.imageContrast).put("fullDocumentAccessibility",state.fullDocumentAccessibility).put("colors", tokens).put("zoom", state.zoom).put("motion", motion)
                 payload.put("readingLocation",model.readingLocation(note.uri))
                 payload.put("customStyle",themeStyle(themeDocument(state.customTheme),if(state.fullscreen)state.fullscreenTheme else state.theme,dark,state.patternKind,state.patternOpacity,state.patternSize,state.patternSpacing))
                 web?.evaluateJavascript("document.documentElement.dataset.platform='android';window.supermdLoad?.($payload)", null)
+                if (unseenEdits.isNotEmpty()) sentAgentSeq[note.id] = unseenEdits.maxOf { it.seq }
                 readerNote[0] = note.id
                 readerContent[0] = note.content
                 val hingeGap = if (hinge != null && actualMode == "split") hinge!!.bounds.width() / density.density else 0f
@@ -1083,7 +1197,35 @@ private object NoMotionScheme : MotionScheme {
                         .graphicsLayer {translationY=-size.height*(1f-chromeReveal);alpha=chromeReveal}
                         .then(if(chromeShown) Modifier else Modifier.clearAndSetSemantics {})
                         .background(palette.surfaceContainerLow).themeArtwork(state,"toolbar")) {
+                        val pillUi = resolveAgentStatusPillUi(
+                            accessEnabled = activity.agentAccessEnabled,
+                            relayState = activity.agentRelayState,
+                            retrying = activity.agentRelayRetrying,
+                        )
+                        val agentPillDotColor = when (pillUi.stateKey) {
+                            "connected" -> Color(0xff2e7d32)
+                            "retrying", "connecting" -> Color(0xffef6c00)
+                            else -> palette.error
+                        }
                         TopAppBar(windowInsets=WindowInsets.statusBarsIgnoringVisibility.union(WindowInsets.displayCutout).only(WindowInsetsSides.Top+WindowInsetsSides.Horizontal), colors = TopAppBarDefaults.topAppBarColors(containerColor = Color.Transparent), title = { Column { Text(state.active.name, maxLines = 1, overflow = TextOverflow.Ellipsis, style = MaterialTheme.typography.titleMedium); Text(if (model.documentWriteNeedsAccess(state.active.id)) "Local draft · restore file access" else if (state.active.dirty) "Draft recovered automatically" else if (state.active.uri != null) "Saved" else "Local draft", style = MaterialTheme.typography.labelSmall, color = palette.onSurfaceVariant) } }, navigationIcon = { IconButton(onClick = { if (state.fullscreen) contentsShown=true else { scope.launch { drawer.open() }; state.folder?.let { if (state.files.isEmpty()) model.listFolder(android.net.Uri.parse(it), "") } } }) { Icon(painterResource(if(state.fullscreen) R.drawable.symbol_contents else R.drawable.symbol_sidebar), if(state.fullscreen) "Show contents" else "Open files") } }, actions = {
+                            if (pillUi.visible) {
+                                Surface(
+                                    onClick = { menu = false; settingsSection = "Agent connection"; settings = true },
+                                    shape = RoundedCornerShape(999.dp),
+                                    color = if (pillUi.stateKey == "connected") palette.primaryContainer else palette.surfaceContainerHigh,
+                                    contentColor = if (pillUi.stateKey == "connected") palette.onPrimaryContainer else palette.onSurface,
+                                    modifier = Modifier.padding(end = 4.dp).testTag("agentStatusPill"),
+                                ) {
+                                    Row(
+                                        verticalAlignment = Alignment.CenterVertically,
+                                        horizontalArrangement = Arrangement.spacedBy(6.dp),
+                                        modifier = Modifier.padding(horizontal = 10.dp, vertical = 6.dp),
+                                    ) {
+                                        Box(Modifier.size(8.dp).background(agentPillDotColor, RoundedCornerShape(999.dp)))
+                                        Text(pillUi.label, style = MaterialTheme.typography.labelMedium, maxLines = 1)
+                                    }
+                                }
+                            }
                             IconButton(onClick = saveAction) { Icon(painterResource(R.drawable.symbol_save), "Save note") }
                             IconButton(onClick = { sharing = false; exporting = true }, enabled = readerReady && !state.busy) { Icon(painterResource(R.drawable.symbol_export), "Export") }
                             StudyIcon(if(state.fullscreen) "Exit fullscreen" else "Fullscreen study", if(state.fullscreen) R.drawable.symbol_fullscreen_exit else R.drawable.symbol_fullscreen) { model.fullscreen(!state.fullscreen) }
@@ -1099,6 +1241,43 @@ private object NoMotionScheme : MotionScheme {
                             } }
                         })
                         if(!state.fullscreen) NoteTabs(state.tabs, state.active.id, motion, model::select, model::close, model::reorder, model::newNote)
+                        val jumpNote = state.agentJumpTabId?.takeIf { it != state.active.id }?.let { jumpId -> state.tabs.firstOrNull { it.id == jumpId } }
+                        if (!state.fullscreen && jumpNote != null) {
+                            Surface(
+                                color = palette.secondaryContainer.copy(alpha = 0.85f),
+                                contentColor = palette.onSecondaryContainer,
+                                shape = RoundedCornerShape(14.dp),
+                                modifier = Modifier
+                                    .fillMaxWidth()
+                                    .padding(horizontal = 12.dp, vertical = 4.dp)
+                                    .testTag("agentJumpBanner"),
+                            ) {
+                                Row(
+                                    verticalAlignment = Alignment.CenterVertically,
+                                    modifier = Modifier.padding(start = 12.dp, end = 4.dp, top = 4.dp, bottom = 4.dp),
+                                ) {
+                                    Text(
+                                        "AI updated ${jumpNote.name} in background",
+                                        style = MaterialTheme.typography.labelLarge,
+                                        maxLines = 1,
+                                        overflow = TextOverflow.Ellipsis,
+                                        modifier = Modifier.weight(1f),
+                                    )
+                                    TextButton(
+                                        onClick = { model.select(jumpNote.id) },
+                                        modifier = Modifier.testTag("agentJumpButton"),
+                                    ) {
+                                        Text("Jump", fontWeight = FontWeight.SemiBold)
+                                    }
+                                    IconButton(
+                                        onClick = model::dismissAgentJump,
+                                        modifier = Modifier.size(36.dp).testTag("agentJumpDismiss"),
+                                    ) {
+                                        Icon(painterResource(R.drawable.symbol_close), "Dismiss agent notification", Modifier.size(18.dp))
+                                    }
+                                }
+                            }
+                        }
                         val modes = if (wide) listOf("live", "editor", "reader", "split") else listOf("live", "editor", "reader")
                         if(!state.fullscreen) Row(Modifier.fillMaxWidth().padding(horizontal = if (wide) 24.dp else 8.dp, vertical = 8.dp),verticalAlignment=Alignment.CenterVertically) {
                             SingleChoiceSegmentedButtonRow(Modifier.weight(1f)) { modes.forEachIndexed { index, mode -> SegmentedButton(selected = actualMode == mode, onClick = { model.mode(mode) }, colors = SegmentedButtonDefaults.colors(activeContainerColor = palette.primary, activeContentColor = palette.onPrimary), shape = SegmentedButtonDefaults.itemShape(index, modes.size)) { Text(when(mode) { "editor" -> "Source"; "reader" -> "Read"; "split" -> "Split"; else -> "Live" }) } } }
@@ -1129,6 +1308,7 @@ private object NoMotionScheme : MotionScheme {
                                     readerReady = false
                                     readerPdfOwnsProgress = false
                                     readerNote[0] = null
+                                    sentAgentSeq.clear()
                                     readerGeneration++
                                     web = null
                                     scope.launch {
@@ -1172,7 +1352,7 @@ private object NoMotionScheme : MotionScheme {
                                         val x=event.x/density.density;val y=event.y/density.density
                                         chromeTapJob[0]=scope.launch {
                                             if(tap)delay(260)
-                                            evaluateJavascript("(() => { const e=document.elementFromPoint($x,$y); return !!document.querySelector('.live-active-block textarea:focus') || !!window.getSelection()?.toString() || ${if(tap) "!!e?.closest('a,button,input,textarea,summary,img,.note-image,[data-independent-zoom],.interactive-chart,.media-dialog,.reading-search,.math-repair-panel')" else "false"}; })()") { interacting ->
+                                            evaluateJavascript("(() => { const e=document.elementFromPoint($x,$y); return !!document.querySelector('.live-active-block textarea:focus') || !!window.getSelection()?.toString() || ${if(tap) "!!e?.closest('a,button,input,textarea,summary,img,.note-image,[data-independent-zoom],.interactive-chart,.media-dialog,.reading-search,.math-repair-panel,.reader-agent-banner')" else "false"}; })()") { interacting ->
                                                 if(interacting!="true" && !gestureActive && completedEpoch==gestureEpoch) {
                                                     readingChromeAfterGesture(model.state.value.fullscreen, readingChromeVisible, show, tap)?.let { readingChromeVisible=it }
                                                 }

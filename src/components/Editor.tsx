@@ -171,7 +171,24 @@ export default function Editor({ sessionId = "default", value, onChange, dark, f
         appearance.current.of(editorTheme())
       ]
     };
-    let state = cached?.state.doc.toString() === value ? cached.state : EditorState.create(config);
+    let state: EditorState;
+    if (cached) {
+      const previous = cached.state.doc.toString();
+      if (previous === value) {
+        state = cached.state;
+      } else {
+        let from = 0;
+        while (from < previous.length && from < value.length && previous[from] === value[from]) from++;
+        let oldEnd = previous.length, newEnd = value.length;
+        while (oldEnd > from && newEnd > from && previous[oldEnd - 1] === value[newEnd - 1]) { oldEnd--; newEnd--; }
+        state = cached.state.update({
+          changes: { from, to: oldEnd, insert: value.slice(from, newEnd) },
+          annotations: [Transaction.addToHistory.of(false), isolateHistory.of("full")],
+        }).state;
+      }
+    } else {
+      state = EditorState.create(config);
+    }
     if (incoming) {
       try {
         const restored = EditorState.fromJSON(incoming.state, config, {history: historyField});

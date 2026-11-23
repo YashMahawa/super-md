@@ -29,8 +29,36 @@ import java.util.concurrent.atomic.AtomicBoolean
 // comparison, staging, write and saved-state updates across those windows.
 private val documentWrites = Mutex()
 
-data class Note(val id: String = UUID.randomUUID().toString(), val name: String = "Untitled.md", val uri: String? = null, val content: String = "", val saved: String = "", val relative: String? = null, val assetDirectory: String? = null) { val dirty get() = content != saved; val portable get() = assetDirectory != null }
+data class AgentEditStep(val seq: Long, val before: String, val after: String)
+data class Note(
+    val id: String = UUID.randomUUID().toString(),
+    val name: String = "Untitled.md",
+    val uri: String? = null,
+    val content: String = "",
+    val saved: String = "",
+    val relative: String? = null,
+    val assetDirectory: String? = null,
+    val agentStaged: Boolean = false,
+    val agentUnreviewed: Boolean = false,
+    val agentEdits: List<AgentEditStep> = emptyList(),
+) { val dirty get() = content != saved; val portable get() = assetDirectory != null }
 internal const val MAX_AGENT_SNAPSHOT_BYTES = 2 * 1024 * 1024
+internal const val MAX_AGENT_EDIT_STEPS = 60
+internal fun appendAgentEditSteps(
+    existing: List<AgentEditStep>,
+    nextSeq: Long,
+    before: String,
+    after: String,
+): List<AgentEditStep> {
+    if (before == after) return existing
+    val candidate = (existing + AgentEditStep(nextSeq, before, after)).takeLast(MAX_AGENT_EDIT_STEPS).toMutableList()
+    fun totalBytes(steps: List<AgentEditStep>): Long =
+        steps.sumOf { it.before.toByteArray(Charsets.UTF_8).size.toLong() + it.after.toByteArray(Charsets.UTF_8).size.toLong() }
+    while (candidate.size > 1 && totalBytes(candidate) > MAX_AGENT_SNAPSHOT_BYTES) {
+        candidate.removeAt(0)
+    }
+    return if (totalBytes(candidate) <= MAX_AGENT_SNAPSHOT_BYTES * 2L) candidate.toList() else emptyList()
+}
 internal enum class PortableSaveRecovery { ORIGINAL_INTACT, RESTORE_OUR_WRITE, LEAVE_CONCURRENT_BYTES }
 internal fun agentContentRevision(content: String): String = java.security.MessageDigest.getInstance("SHA-256")
     .digest(content.toByteArray(Charsets.UTF_8)).joinToString("") { "%02x".format(it) }
@@ -52,7 +80,7 @@ internal fun orderedRecents(notes:List<RecentNote>)=notes.distinctBy {it.uri}.so
 private fun renamedRelative(relative:String?,name:String)=relative?.let {val parent=it.substringBeforeLast('/',"");if(parent.isEmpty())name else "$parent/$name"}
 data class FileEntry(val name: String, val uri: String, val directory: Boolean, val relative: String)
 data class OutlineHeading(val id: String, val title: String, val level: Int, val offset: Int)
-data class StudioState(val latexAutofix:Boolean=false, val selectionAssistant:String="chatgpt", val centerLock:Boolean=true, val customTheme:String="", val patternKind:String="", val patternOpacity:Float=-1f, val patternSize:Float=0f, val patternSpacing:Float=0f, val restorePosition:Boolean=true, val fullDocumentAccessibility:Boolean=false, val startup:String="restore", val imageAppearance:String="original", val svgAppearance:String="original", val imageContrast:Float=1.25f, val spellCheck:Boolean = false, val grammarCheck:Boolean = false, val accent: String = "system", val widthPercent: Float = 100f, val lineHeight: Float = 1.65f, val autosave: Boolean = true, val customFonts: List<String> = emptyList(), val readerOverlay: Boolean = false, val zoomCommand: Long = 0, val tabs: List<Note> = listOf(Note(name = "Welcome.md", content = sample, saved = sample)), val closedTabs: List<Note> = emptyList(), val activeId: String = "", val mode: String = "live", val fullscreen: Boolean = false, val normalZoom: Float = 100f, val fullscreenZoom: Float = 100f, val theme: String = "system", val fullscreenTheme: String = "black", val motion: Boolean = true, val font: String = "Manrope", val size: Float = 15f, val folder: String? = null, val files: List<FileEntry> = emptyList(), val busy: Boolean = false, val message: String? = null, val error: String? = null, val welcomed: Boolean = false, val pdf: String = "{\"pageSize\":\"a4\",\"margin\":14,\"fontSize\":10.5,\"lineHeight\":1.4,\"paragraphSpacing\":0.65,\"fontFamily\":\"Manrope\",\"pageNumbers\":true}", val storageReport: StorageReport? = null, val storageScanning: Boolean = false) {
+data class StudioState(val latexAutofix:Boolean=false, val selectionAssistant:String="chatgpt", val centerLock:Boolean=true, val customTheme:String="", val patternKind:String="", val patternOpacity:Float=-1f, val patternSize:Float=0f, val patternSpacing:Float=0f, val restorePosition:Boolean=true, val fullDocumentAccessibility:Boolean=false, val startup:String="restore", val imageAppearance:String="original", val svgAppearance:String="original", val imageContrast:Float=1.25f, val spellCheck:Boolean = false, val grammarCheck:Boolean = false, val accent: String = "system", val widthPercent: Float = 100f, val lineHeight: Float = 1.65f, val autosave: Boolean = true, val customFonts: List<String> = emptyList(), val readerOverlay: Boolean = false, val zoomCommand: Long = 0, val tabs: List<Note> = listOf(Note(name = "Welcome.md", content = sample, saved = sample)), val closedTabs: List<Note> = emptyList(), val activeId: String = "", val agentJumpTabId: String? = null, val mode: String = "live", val fullscreen: Boolean = false, val normalZoom: Float = 100f, val fullscreenZoom: Float = 100f, val theme: String = "system", val fullscreenTheme: String = "black", val motion: Boolean = true, val font: String = "Manrope", val size: Float = 15f, val folder: String? = null, val files: List<FileEntry> = emptyList(), val busy: Boolean = false, val message: String? = null, val error: String? = null, val welcomed: Boolean = false, val pdf: String = "{\"pageSize\":\"a4\",\"margin\":14,\"fontSize\":10.5,\"lineHeight\":1.4,\"paragraphSpacing\":0.65,\"fontFamily\":\"Manrope\",\"pageNumbers\":true}", val storageReport: StorageReport? = null, val storageScanning: Boolean = false) {
     val active get() = tabs.find { it.id == activeId } ?: tabs.first()
     val zoom get() = if (fullscreen) fullscreenZoom else normalZoom
 }
@@ -303,6 +331,7 @@ class StudioViewModel(app: Application, val workspaceKey: String = "main") : And
     private val closingNoteIds = java.util.concurrent.ConcurrentHashMap.newKeySet<String>()
     private val closedNoteMutex = Mutex()
     private val mutable = MutableStateFlow(restore())
+    private var agentEditSeq: Long = mutable.value.tabs.flatMap { it.agentEdits }.maxOfOrNull { it.seq } ?: 0L
     private val viewModelRetired = AtomicBoolean(false)
     private val recoveryWriter = LatestRecoveryWriter<StudioState, RecoverySnapshotSignature>(
         scope = RecoveryWriterScope.scope,
@@ -508,14 +537,16 @@ class StudioViewModel(app: Application, val workspaceKey: String = "main") : And
     private val autosavePending = mutableSetOf<String>()
     private fun scheduleAutosave(id: String) {
         if (!mutable.value.autosave) return
-        if (mutable.value.tabs.firstOrNull { it.id == id }?.uri?.let(::writeIsBlocked) == true) return
+        val scheduledNote = mutable.value.tabs.firstOrNull { it.id == id }
+        if (scheduledNote?.agentStaged == true) return
+        if (scheduledNote?.uri?.let(::writeIsBlocked) == true) return
         autosavePending.add(id)
         if (autosaveJob?.isActive == true) return
         autosaveJob = viewModelScope.launch {
             while (autosavePending.isNotEmpty()) {
                 delay(900)
                 val next=autosavePending.first();autosavePending.remove(next)
-                var note=mutable.value.tabs.find { it.id==next && it.uri!=null && it.dirty } ?: continue
+                var note=mutable.value.tabs.find { it.id==next && it.uri!=null && it.dirty && !it.agentStaged } ?: continue
                 if (writeIsBlocked(note.uri!!)) continue
                 if (!mutable.value.autosave) continue
                 try {
@@ -524,7 +555,7 @@ class StudioViewModel(app: Application, val workspaceKey: String = "main") : And
                             mutable.value = mutable.value.copy(message = "Autosave paused because the reader could not confirm its latest edits.")
                             continue
                         }
-                        note = mutable.value.tabs.find { it.id == next && it.uri != null && it.dirty } ?: continue
+                        note = mutable.value.tabs.find { it.id == next && it.uri != null && it.dirty && !it.agentStaged } ?: continue
                     }
                     // Do not cancel an in-flight write when another keystroke or
                     // window transition arrives. Recovery remains an independent stream.
@@ -730,7 +761,7 @@ class StudioViewModel(app: Application, val workspaceKey: String = "main") : And
         prefs.edit().putString("readingPositions",old.toString()).apply()
     }
     private fun recoverySignature(state: StudioState) = RecoverySnapshotSignature(
-        state.tabs, state.closedTabs, state.activeId, state.mode, state.normalZoom, state.fullscreenZoom,
+        state.tabs, state.closedTabs, state.activeId, state.mode, state.normalZoom, state.fullscreenZoom, state.agentJumpTabId,
     )
     private fun schedulePersist() { recoveryWriter.schedule(mutable.value) }
     fun flush(): Job? = recoveryWriter.flush(mutable.value)
@@ -826,6 +857,33 @@ class StudioViewModel(app: Application, val workspaceKey: String = "main") : And
         }
     }
 
+    private fun clearStagedOnActivate(state: StudioState, targetId: String): StudioState = state.copy(
+        tabs = state.tabs.map { if (it.id == targetId && it.agentStaged) it.copy(agentStaged = false) else it },
+        agentJumpTabId = state.agentJumpTabId?.takeUnless { it == targetId || state.tabs.none { tab -> tab.id == it } },
+    )
+    private fun resumeAutosaveIfActivatedStaged(wasStaged: Boolean, targetId: String) {
+        if (!wasStaged) return
+        val note = mutable.value.tabs.firstOrNull { it.id == targetId } ?: return
+        if (note.dirty && note.uri != null) scheduleAutosave(targetId)
+    }
+    fun markAgentBannerShown(id: String) {
+        if (mutable.value.tabs.any { it.id == id && !it.agentUnreviewed }) {
+            change { s -> s.copy(tabs = s.tabs.map { if (it.id == id) it.copy(agentUnreviewed = true) else it }) }
+        }
+    }
+    fun dismissAgentBanner(id: String) {
+        if (mutable.value.tabs.any { it.id == id && it.agentUnreviewed } || mutable.value.agentJumpTabId == id) {
+            change { s ->
+                s.copy(
+                    tabs = s.tabs.map { if (it.id == id && it.agentUnreviewed) it.copy(agentUnreviewed = false) else it },
+                    agentJumpTabId = s.agentJumpTabId?.takeUnless { it == id },
+                )
+            }
+        }
+    }
+    fun dismissAgentJump() {
+        if (mutable.value.agentJumpTabId != null) change { it.copy(agentJumpTabId = null) }
+    }
     fun edit(id: String, content: String) { change { s -> s.copy(tabs = s.tabs.map { if (it.id == id) it.copy(content = content) else it }) }; scheduleAutosave(id) }
     /** Commit an inactive-note patch computed from an immutable reader snapshot. */
     internal suspend fun commitAgentSnapshotPatch(id: String, expectedRevision: String, patchedContent: String, patchedRevision: String) = documentWrites.withLock {
@@ -839,10 +897,27 @@ class StudioViewModel(app: Application, val workspaceKey: String = "main") : And
         require(actualPatchedRevision.equals(patchedRevision, ignoreCase = true)) { "The computed patch failed revision verification" }
         require(!closingNoteIds.contains(id)) { "The note is closing; retry the patch after it remains open" }
         if (note.content != patchedContent) {
+            val isInactive = mutable.value.active.id != id
             readerEcho.remove(id)
             readerEditProtocol.clear(id)
-            change { state -> state.copy(tabs = state.tabs.map { if (it.id == id) it.copy(content = patchedContent) else it }) }
-            scheduleAutosave(id)
+            val nextSeq = maxOf(agentEditSeq, note.agentEdits.maxOfOrNull { it.seq } ?: 0L) + 1L
+            agentEditSeq = nextSeq
+            val updatedEdits = appendAgentEditSteps(note.agentEdits, nextSeq, note.content, patchedContent)
+            change { state ->
+                state.copy(
+                    tabs = state.tabs.map {
+                        if (it.id == id) it.copy(
+                            content = patchedContent,
+                            agentStaged = if (isInactive) true else it.agentStaged,
+                            agentUnreviewed = true,
+                            agentEdits = updatedEdits,
+                        ) else it
+                    },
+                    agentJumpTabId = if (isInactive) id else state.agentJumpTabId,
+                )
+            }
+            recoveryWriter.flushAndAwait(mutable.value)
+            if (!isInactive) scheduleAutosave(id)
         }
     }
     fun newNote(titleHint: String? = null, content: String? = null, background: Boolean = false, format: String = "md", onCreated: ((Note?) -> Unit)? = null) {
@@ -884,10 +959,16 @@ class StudioViewModel(app: Application, val workspaceKey: String = "main") : And
         // that began earlier and is still waiting on I/O or the reader flush.
         openRequests.invalidate()
         viewModelScope.launch {
+            var wasStaged = false
             val accepted=performReaderBarrier(expectedActiveId) {
-                if(mutable.value.tabs.any {it.id==targetId})change {it.copy(activeId=targetId)}
+                val targetNote = mutable.value.tabs.firstOrNull { it.id == targetId }
+                if (targetNote != null) {
+                    wasStaged = targetNote.agentStaged
+                    change { clearStagedOnActivate(it.copy(activeId = targetId), targetId) }
+                }
             }
-            if(!accepted)readerBarrierFailed()
+            if (accepted) resumeAutosaveIfActivatedStaged(wasStaged, targetId)
+            else readerBarrierFailed()
         }
     }
     private var refreshJob:Job?=null
@@ -959,8 +1040,9 @@ class StudioViewModel(app: Application, val workspaceKey: String = "main") : And
                     change { state ->
                         val remaining = state.tabs.filterNot { it.id == id }
                         val next = remaining.ifEmpty { listOf(Note()) }
-                        state.copy(tabs = next, activeId = if (state.active.id == id) next.first().id else state.activeId,
-                            message = "Empty tab discarded")
+                        val nextActive = if (state.active.id == id) next.first().id else state.activeId
+                        clearStagedOnActivate(state.copy(tabs = next, activeId = nextActive,
+                            message = "Empty tab discarded"), nextActive)
                     }
                     closingNoteIds.remove(id)
                 } else preserve = true
@@ -972,11 +1054,15 @@ class StudioViewModel(app: Application, val workspaceKey: String = "main") : And
             }
             if (revisionError != null) { onComplete?.invoke(revisionError); return@launch }
             if (closeError != null) { onComplete?.invoke(closeError); return@launch }
+            val stagedBeforeClose = mutable.value.tabs.filter { it.agentStaged }.map { it.id }.toSet()
             if (preserve) closeAfterReaderBarrier(id)
             val afterClose = mutable.value
             if (afterClose.tabs.any { it.id == id }) {
                 onComplete?.invoke("The note could not be closed; it remains open")
                 return@launch
+            }
+            if (afterClose.active.id != activeId && afterClose.active.id in stagedBeforeClose) {
+                resumeAutosaveIfActivatedStaged(true, afterClose.active.id)
             }
             if (afterClose.active.id != activeId && !awaitReaderSnapshot(afterClose.active.id)) {
                 val message = "The note was closed and preserved, but the active reader is still loading; refresh the tabs before the next action."
@@ -1003,8 +1089,9 @@ class StudioViewModel(app: Application, val workspaceKey: String = "main") : And
                 change { state ->
                     val remaining = state.tabs.filterNot { it.id == id }
                     val next = remaining.ifEmpty { listOf(Note()) }
-                    state.copy(tabs = next, activeId = if (state.active.id == id) next.first().id else state.activeId,
-                        message = "Empty tab discarded")
+                    val nextActive = if (state.active.id == id) next.first().id else state.activeId
+                    clearStagedOnActivate(state.copy(tabs = next, activeId = nextActive,
+                        message = "Empty tab discarded"), nextActive)
                 }
                 return
             }
@@ -1031,9 +1118,10 @@ class StudioViewModel(app: Application, val workspaceKey: String = "main") : And
             change { state ->
                 val remaining = state.tabs.filterNot { it.id == id }
                 val next = remaining.ifEmpty { listOf(Note()) }
-                state.copy(tabs = next, closedTabs = (listOf(reference.placeholder()) + state.closedTabs.filterNot { it.id == id }).take(ClosedNoteStore.LIMIT),
-                    activeId = if (state.active.id == id) next.first().id else state.activeId,
-                    message = "Tab closed. Reopen from the menu to recover edits.")
+                val nextActive = if (state.active.id == id) next.first().id else state.activeId
+                clearStagedOnActivate(state.copy(tabs = next, closedTabs = (listOf(reference.placeholder()) + state.closedTabs.filterNot { it.id == id }).take(ClosedNoteStore.LIMIT),
+                    activeId = nextActive,
+                    message = "Tab closed. Reopen from the menu to recover edits."), nextActive)
             }
         } catch (error: Exception) {
             mutable.value = mutable.value.copy(message = "Could not preserve the closed note: ${error.message}")
@@ -1051,17 +1139,19 @@ class StudioViewModel(app: Application, val workspaceKey: String = "main") : And
         viewModelScope.launch {
             val note=try {if(reference==null)referenceNote else withContext(Dispatchers.IO){closedNoteStore.load(reference)}}
                 catch(error:Exception) {mutable.value=mutable.value.copy(message="Could not reopen the closed note: ${error.message}");return@launch}
+            var wasStaged = false
             val accepted = performReaderBarrier(expectedActiveId) {
                 if(mutable.value.closedTabs.none {it.id==referenceNote.id})return@performReaderBarrier
                 readerEcho.remove(note.id)
                 closedNoteRefs=closedNoteRefs.filterNot {it.id==note.id}
                 change { state ->
                     val existing=state.tabs.find {it.id==note.id}
+                    wasStaged = (existing ?: note).agentStaged
                     val tabs=if(existing==null)state.tabs+note else state.tabs
-                    state.copy(tabs=tabs,closedTabs=state.closedTabs.dropWhile {it.id==referenceNote.id}.filterNot {it.id==referenceNote.id},activeId=note.id)
+                    clearStagedOnActivate(state.copy(tabs=tabs,closedTabs=state.closedTabs.dropWhile {it.id==referenceNote.id}.filterNot {it.id==referenceNote.id},activeId=note.id), note.id)
                 }
             }
-            if(!accepted)readerBarrierFailed()
+            if(accepted)resumeAutosaveIfActivatedStaged(wasStaged, note.id) else readerBarrierFailed()
         }
     }
     fun recoverDeletedDraft() {
@@ -1077,14 +1167,18 @@ class StudioViewModel(app: Application, val workspaceKey: String = "main") : And
                 // draft. A failed snapshot read falls back to that durable source.
                 val restored=if(ref!=null)withContext(Dispatchers.IO){closedNoteStore.loadForRecovery(ref,note)}
                     else legacy?.takeIf {it.content.isNotEmpty() || it.saved.isNotEmpty() || it.assetDirectory!=null} ?: note
+                var wasStaged = false
                 val accepted=performReaderBarrier(expectedActiveId) {
                     closedNoteRefs=closedNoteRefs.filterNot {it.id==note.id}
                     change {s->
-                        if(s.tabs.any {it.id==note.id})s.copy(activeId=note.id,closedTabs=s.closedTabs.filter {it.id!=note.id})
+                        val existing = s.tabs.find { it.id == note.id }
+                        wasStaged = (existing ?: restored).agentStaged
+                        val updated = if(existing != null)s.copy(activeId=note.id,closedTabs=s.closedTabs.filter {it.id!=note.id})
                         else s.copy(tabs=s.tabs+restored,activeId=note.id,closedTabs=s.closedTabs.filter {it.id!=note.id})
+                        clearStagedOnActivate(updated, note.id)
                     }
                 }
-                if(!accepted)readerBarrierFailed()
+                if(accepted)resumeAutosaveIfActivatedStaged(wasStaged, note.id) else readerBarrierFailed()
             }
         }
     }
@@ -1166,13 +1260,17 @@ class StudioViewModel(app: Application, val workspaceKey: String = "main") : And
     fun busy(value: Boolean) { mutable.value = mutable.value.copy(busy = value) }
     private fun retainOpenedNote(note: Note, activate: Boolean) {
         val existing = mutable.value.tabs.find { it.uri != null && note.uri != null && sameDocumentUri(it.uri, note.uri) }
+        val targetId = existing?.id ?: note.id
+        val wasStaged = activate && (existing?.agentStaged == true || note.agentStaged)
         change { state ->
-            state.copy(
+            val updated = state.copy(
                 tabs = if (existing != null) state.tabs.map { if(it.id == existing.id) it.copy(uri = note.uri) else it } else state.tabs + note,
-                activeId = if (activate) existing?.id ?: note.id else state.activeId,
+                activeId = if (activate) targetId else state.activeId,
             )
+            if (activate) clearStagedOnActivate(updated, targetId) else updated
         }
-        mutable.value.tabs.firstOrNull { it.id == (existing?.id ?: note.id) }?.let(::remember)
+        if (activate) resumeAutosaveIfActivatedStaged(wasStaged, targetId)
+        mutable.value.tabs.firstOrNull { it.id == targetId }?.let(::remember)
     }
     fun open(uri: Uri, relative: String? = null): Job {
         val request = openRequests.begin()
@@ -1263,7 +1361,7 @@ class StudioViewModel(app: Application, val workspaceKey: String = "main") : And
                             require(current == note && current?.let { agentContentRevision(it.content).equals(expectedRevision, ignoreCase = true) } == true) {
                                 "The note changed while it was saving; the portable file was restored"
                             }
-                            change { state -> state.copy(tabs = state.tabs.map { if (it.id == id) it.copy(saved = note.content, uri = target.toString(), assetDirectory = opened.directory) else it }, busy = false, message = "Portable note saved") }
+                            change { state -> state.copy(tabs = state.tabs.map { if (it.id == id) it.copy(saved = note.content, uri = target.toString(), assetDirectory = opened.directory, agentStaged = false, agentUnreviewed = false) else it }, agentJumpTabId = state.agentJumpTabId?.takeUnless { it == id }, busy = false, message = "Portable note saved") }
                             mutable.value.tabs.firstOrNull { it.id == id }?.let(::remember)
                             openedDirectory = null
                         }
@@ -1326,7 +1424,7 @@ class StudioViewModel(app: Application, val workspaceKey: String = "main") : And
                     require(latest == note && latest?.let { agentContentRevision(it.content).equals(expectedRevision, ignoreCase = true) } == true) {
                         "The note changed while Save As was writing; the new copy was removed"
                     }
-                    change { state -> state.copy(tabs = state.tabs.map { if (it.id == id) it.copy(uri = destination.toString(), name = savedName, saved = note.content, assetDirectory = note.assetDirectory) else it }, busy = false, message = "Saved as $savedName") }
+                    change { state -> state.copy(tabs = state.tabs.map { if (it.id == id) it.copy(uri = destination.toString(), name = savedName, saved = note.content, assetDirectory = note.assetDirectory, agentStaged = false, agentUnreviewed = false) else it }, agentJumpTabId = state.agentJumpTabId?.takeUnless { it == id }, busy = false, message = "Saved as $savedName") }
                     mutable.value.tabs.firstOrNull { it.id == id }?.let(::remember)
                 }
             } catch (error: Exception) {
@@ -1417,7 +1515,7 @@ class StudioViewModel(app: Application, val workspaceKey: String = "main") : And
                 documentAccess.persist(destination)
                 destination to (DocumentFile.fromSingleUri(getApplication(), destination)?.name ?: note.name)
             }
-            change { s -> s.copy(busy = false, tabs = s.tabs.map { if (it.id == note.id) it.copy(uri = writtenTarget.toString(), name = savedName, saved = note.content, assetDirectory = null) else it }, message = "Saved") }
+            change { s -> s.copy(busy = false, tabs = s.tabs.map { if (it.id == note.id) it.copy(uri = writtenTarget.toString(), name = savedName, saved = note.content, assetDirectory = null, agentStaged = false, agentUnreviewed = false) else it }, agentJumpTabId = s.agentJumpTabId?.takeUnless { it == note.id }, message = "Saved") }
             mutable.value.tabs.find { it.id == note.id }?.let(::remember)
             onComplete?.invoke(null)
             }
@@ -1755,8 +1853,9 @@ class StudioViewModel(app: Application, val workspaceKey: String = "main") : And
             }
         }
     }
+    internal var imageSourcesExtractor: (String) -> String = { PdfEngine.imageSources(it) }
     private fun copyAttachments(note: Note, destination: Uri, destinationTree: Uri? = null) {
-        val sources = JSONArray(PdfEngine.imageSources(note.content))
+        val sources = JSONArray(imageSourcesExtractor(note.content))
         val local = (0 until sources.length()).map { sources.getString(it) }.distinct().mapNotNull { source -> media.local(source, note.assetDirectory)?.let { source to it } }
         if (local.isEmpty()) return
         val tree = destinationTree ?: mutable.value.folder?.let(Uri::parse) ?: error("Images need a containing folder permission. Choose a folder destination or export a single portable .smd file instead.")
@@ -1797,7 +1896,7 @@ class StudioViewModel(app: Application, val workspaceKey: String = "main") : And
             resolver.openOutputStream(destination, "wt")?.use { output -> staged.inputStream().use { it.copyTo(output) } } ?: error("Cannot write portable file")
             documentAccess.persist(destination)
             withContext(Dispatchers.Main) {
-                if (save) { change { s -> s.copy(tabs = s.tabs.map { if (it.id == id) it.copy(content = if (it.content == originalContent) content else it.content, saved = content, uri = destination.toString(), assetDirectory = opened!!.directory) else it }, busy = false, message = "Portable note saved") }; mutable.value.tabs.find { it.id == id }?.let(::remember) }
+                if (save) { change { s -> s.copy(tabs = s.tabs.map { if (it.id == id) it.copy(content = if (it.content == originalContent) content else it.content, saved = content, uri = destination.toString(), assetDirectory = opened!!.directory, agentStaged = false, agentUnreviewed = false) else it }, agentJumpTabId = s.agentJumpTabId?.takeUnless { it == id }, busy = false, message = "Portable note saved") }; mutable.value.tabs.find { it.id == id }?.let(::remember) }
                 else { portableOutput = null; portableDestinationIsNew = false; if (!finishShare(destination)) mutable.value = mutable.value.copy(busy = false, message = "Portable .smd exported") }
             }
         } finally { staged.delete() }

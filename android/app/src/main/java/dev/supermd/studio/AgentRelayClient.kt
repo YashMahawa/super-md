@@ -17,16 +17,24 @@ import kotlin.math.min
 import kotlin.random.Random
 
 /** Outbound-only WebSocket bridge from this app instance to the Super MD relay. */
-class AgentRelayClient(private val onState: (State) -> Unit = {}) {
+class AgentRelayClient(
+    private val onState: (State) -> Unit = {},
+    private val onRetrying: (Boolean) -> Unit = {},
+    callFactory: okhttp3.Call.Factory? = null,
+    webSocketFactory: WebSocket.Factory? = null,
+) {
     enum class State { DISCONNECTED, CONNECTING, CONNECTED }
 
     private val main = Handler(Looper.getMainLooper())
-    private val client = OkHttpClient.Builder().connectTimeout(12, TimeUnit.SECONDS)
+    private val defaultClient = OkHttpClient.Builder().connectTimeout(12, TimeUnit.SECONDS)
         .readTimeout(0, TimeUnit.MILLISECONDS).pingInterval(25, TimeUnit.SECONDS)
         .retryOnConnectionFailure(true).build()
+    private val calls: okhttp3.Call.Factory = callFactory ?: defaultClient
+    private val sockets: WebSocket.Factory = webSocketFactory ?: defaultClient
     @Volatile private var stopped = true
     @Volatile private var webSocket: WebSocket? = null
     @Volatile private var state = State.DISCONNECTED
+    @Volatile private var retrying = false
     private var config: AgentAccessConfig? = null
     private var handler: ((JSONObject, (Any?, String?) -> Unit) -> Unit)? = null
     private var retryAttempt = 0
@@ -52,17 +60,19 @@ class AgentRelayClient(private val onState: (State) -> Unit = {}) {
         webSocket?.close(1000, "Live Agent access disabled")
         webSocket = null
         synchronized(activeRequests) { activeRequests.clear() }
+        setRetrying(false)
         setState(State.DISCONNECTED)
     }
 
     fun currentState(): State = state
+    fun isRetrying(): Boolean = retrying
 
     /** Best-effort removal of a device registration; pairing credentials remain local until caller erases them. */
     fun revokeDevice(config: AgentAccessConfig, completion: (Boolean) -> Unit) {
         val body = JSONObject().put("groupId", config.groupId).put("pairingKey", config.pairingKey)
             .put("deviceId", config.deviceId).toString().toRequestBody(JSON_MEDIA_TYPE)
         val request = Request.Builder().url(config.serverOrigin.trimEnd('/') + "/device/revoke").post(body).build()
-        client.newCall(request).apply { timeout().timeout(15, TimeUnit.SECONDS) }.enqueue(object : okhttp3.Callback {
+        calls.newCall(request).apply { timeout().timeout(15, TimeUnit.SECONDS) }.enqueue(object : okhttp3.Callback {
             override fun onFailure(call: okhttp3.Call, error: java.io.IOException) { main.post { completion(false) } }
             override fun onResponse(call: okhttp3.Call, response: Response) { response.use { val success = it.isSuccessful; main.post { completion(success) } } }
         })
@@ -80,7 +90,7 @@ class AgentRelayClient(private val onState: (State) -> Unit = {}) {
             .toString().toRequestBody(JSON_MEDIA_TYPE)
         val request = Request.Builder().url(current.serverOrigin.trimEnd('/') + "/device/enroll")
             .post(body).build()
-        client.newCall(request).apply { timeout().timeout(15, TimeUnit.SECONDS) }.enqueue(object : okhttp3.Callback {
+        calls.newCall(request).apply { timeout().timeout(15, TimeUnit.SECONDS) }.enqueue(object : okhttp3.Callback {
             override fun onFailure(call: okhttp3.Call, error: java.io.IOException) { if (!stopped) scheduleReconnect() }
             override fun onResponse(call: okhttp3.Call, response: Response) {
                 response.use {
@@ -110,7 +120,7 @@ class AgentRelayClient(private val onState: (State) -> Unit = {}) {
 
     private fun openSocket(current: AgentAccessConfig) {
         val request = authenticatedWebSocketRequest(current)
-        webSocket = client.newWebSocket(request, object : WebSocketListener() {
+        webSocket = sockets.newWebSocket(request, object : WebSocketListener() {
             override fun onOpen(webSocket: WebSocket, response: Response) {
                 if (stopped) webSocket.close(1000, "Disabled")
             }
@@ -125,6 +135,7 @@ class AgentRelayClient(private val onState: (State) -> Unit = {}) {
                             require(message.getString("groupId") == current.groupId)
                             require(message.getString("deviceId") == current.deviceId)
                             retryAttempt = 0
+                            setRetrying(false)
                             setState(State.CONNECTED)
                         }
                         "request" -> acceptRequest(message, webSocket)
@@ -308,11 +319,17 @@ class AgentRelayClient(private val onState: (State) -> Unit = {}) {
 
     private fun scheduleReconnect() {
         if (stopped) return
+        setRetrying(true)
         setState(State.DISCONNECTED)
         val base = min(60_000L, 1_000L shl retryAttempt.coerceAtMost(6))
         retryAttempt += 1
         val delay = (base * Random.nextDouble(0.75, 1.25)).toLong()
         main.postAtTime({ if (!stopped) enroll() }, RETRY_TOKEN, android.os.SystemClock.uptimeMillis() + delay)
+    }
+
+    private fun setRetrying(value: Boolean) {
+        retrying = value
+        if (Looper.myLooper() == Looper.getMainLooper()) onRetrying(value) else main.post { onRetrying(value) }
     }
 
     private fun setState(value: State) {

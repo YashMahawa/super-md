@@ -370,6 +370,9 @@ class Studio(QObject):
         self.message = ("Closed-note recovery index could not be read; historical snapshots were left untouched. "+self.session.closed_note_error) if self.session.closed_note_error else ""
         self.ready = False
         self._last_reader_text = None
+        self._last_reader_agent_seq: dict[str, int] = {}
+        self._agent_edit_seq = 0
+        self._agent_jump_tab_id = ""
         self._export_jobs = ExportJobRegistry()
         self._agent_exports: dict[str, dict] = {}
         self._agent_owned_files: set[str] = getattr(self.session, "agent_owned_files", None) or set()
@@ -431,6 +434,17 @@ class Studio(QObject):
         self.tabs = [{**tab,"id":tab.get("id") or uuid.uuid4().hex} for tab in self.session.initial_recovery]
         for tab in self.tabs:
             tab.setdefault("saved_assets", copy.deepcopy(tab.get("assets", {})))
+            tab["agent_staged"] = bool(tab.get("agent_staged", False))
+            tab["agent_unreviewed"] = bool(tab.get("agent_unreviewed", False))
+            raw_edits = tab.get("agent_edits")
+            valid_edits = []
+            if isinstance(raw_edits, list):
+                for entry in raw_edits[-60:]:
+                    if isinstance(entry, dict) and isinstance(entry.get("seq"), int) and isinstance(entry.get("before"), str) and isinstance(entry.get("after"), str):
+                        valid_edits.append({"seq": entry["seq"], "before": entry["before"], "after": entry["after"]})
+                        if entry["seq"] > self._agent_edit_seq:
+                            self._agent_edit_seq = entry["seq"]
+            tab["agent_edits"] = valid_edits
         self._agent_open_paths.update(str(Path(tab["path"]).resolve()) for tab in self.tabs if tab.get("path"))
         self.session.initial_recovery = []
         self.session.drafts[self.window_id] = [dict(t) for t in self.tabs]
@@ -440,6 +454,7 @@ class Studio(QObject):
             self.tabs.insert(0,self._note("Untitled.md"))
         self.active = self.tabs[0]["id"]
         if self.settings["startup"]=="restore" and any(t["id"]==self.session.startup_active_id for t in self.tabs):self.active=self.session.startup_active_id
+        self._activate_tab_state(self._current())
         self._activation_generation = 0
         self._startup_placeholder_ids = {
             tab["id"] for tab in self.tabs
@@ -499,7 +514,67 @@ class Studio(QObject):
     def _note(self, name: str, content: str = "", path: str = "", saved: str = "", assets: dict | None = None, portable: bool = False):
         assets = assets or {}
         return {"id": uuid.uuid4().hex, "name": name, "content": content, "path": path, "saved": saved,
-                "assets": assets, "saved_assets": copy.deepcopy(assets), "portable": portable}
+                "assets": assets, "saved_assets": copy.deepcopy(assets), "portable": portable,
+                "agent_staged": False, "agent_unreviewed": False, "agent_edits": []}
+
+    def _append_agent_edit(self, tab: dict, before: str, after: str) -> None:
+        edits = list(tab.get("agent_edits") or [])
+        self._agent_edit_seq = max(self._agent_edit_seq, max((int(item.get("seq", 0)) for item in edits), default=0)) + 1
+        edits.append({"seq": self._agent_edit_seq, "before": before, "after": after})
+        if len(edits) > 60:
+            edits = edits[-60:]
+        while len(edits) > 1 and sum(len(item["before"].encode("utf-8")) + len(item["after"].encode("utf-8")) for item in edits) > 2_000_000:
+            edits.pop(0)
+        tab["agent_edits"] = edits
+
+    def _activate_tab_state(self, tab: dict | None) -> None:
+        if tab is None:
+            return
+        if self._agent_jump_tab_id == tab["id"]:
+            self._agent_jump_tab_id = ""
+        if tab.get("agent_staged"):
+            tab["agent_staged"] = False
+            if self.settings.get("autosave") and tab.get("path") and tab["content"] != tab["saved"]:
+                self.autosave_timer.start(900)
+
+    def _clear_agent_staging(self, tab: dict | None) -> None:
+        if tab is None:
+            return
+        tab["agent_staged"] = False
+        tab["agent_unreviewed"] = False
+        if self._agent_jump_tab_id == tab["id"]:
+            self._agent_jump_tab_id = ""
+
+    def _agent_connection_snapshot(self) -> dict:
+        bridge = getattr(self.session, "agent_bridge", None)
+        cloud_enabled = bool(bridge and bridge.cloudClient.enabled)
+        cloud_opt_in = bool(self.settings.get("cloudAgentEnabled"))
+        cloud_status = self.cloudAgentStatus
+        if self._cloud_revocation_pending:
+            return {"visible": True, "state": "connecting", "label": "Disconnecting…", "detail": cloud_status}
+        if cloud_enabled or (cloud_opt_in and self._agent_cloud_error):
+            if cloud_status == "Connected to relay":
+                return {"visible": True, "state": "connected", "label": "AI connected", "detail": cloud_status}
+            if cloud_status.startswith("Connecting"):
+                return {"visible": True, "state": "connecting", "label": "AI connecting…", "detail": cloud_status}
+            return {"visible": True, "state": "retrying", "label": "AI retrying…", "detail": cloud_status}
+        if bool(bridge and bridge.enabled):
+            return {"visible": True, "state": "local", "label": "AI live", "detail": self.agentAccessStatus}
+        return {"visible": False, "state": "off", "label": "", "detail": ""}
+
+    def _agent_jump_snapshot(self) -> dict | None:
+        if not self._agent_jump_tab_id or self._agent_jump_tab_id == self.active:
+            return None
+        target = next((t for t in self.tabs if t["id"] == self._agent_jump_tab_id), None)
+        if target is None:
+            return None
+        return {"id": target["id"], "name": target["name"]}
+
+    @Slot()
+    def dismissAgentJump(self):
+        if self._agent_jump_tab_id:
+            self._agent_jump_tab_id = ""
+            self._emit(False)
 
     @Property("QStringList",notify=changed)
     def pinnedRecent(self):return self.session.pinned
@@ -518,6 +593,14 @@ class Studio(QObject):
             reading_settings["customStyle"]=custom_theme.reader(self.session.custom_theme,self.settings["fullTheme" if self.fullscreen else "theme"],self._dark(),self.settings)
             payload={**reading_settings,"readingLocation":self.session.locations.get(tab["path"]),"id": tab["id"], "path": tab["path"] or tab["id"], "mode": self.mode, "dark": self._dark(), "fullscreen": self.fullscreen, "font": self.settings["font"], "size": self.settings["size"], "widthPercent": self.settings["widthPercent"], "lineHeight":self.settings["lineHeight"], "spellCheck":self.settings["spellCheck"], "grammarCheck":self.settings["grammarCheck"], "zoom": self.settings["fullZoom" if self.fullscreen else "normalZoom"], "motion": self.settings["motion"], "python": self.settings["python"], "colors": colors, "viewState": tab.pop("viewState", None)}
             payload["editProtocol"]=1
+            if tab.get("agent_unreviewed"):
+                payload["agentUnreviewed"] = True
+            edits = tab.get("agent_edits") or []
+            last_sent = self._last_reader_agent_seq.get(tab["id"], 0)
+            unseen_edits = [item for item in edits if isinstance(item, dict) and item.get("seq", 0) > last_sent]
+            if unseen_edits:
+                payload["pendingAgentEdits"] = unseen_edits
+                self._last_reader_agent_seq[tab["id"]] = unseen_edits[-1]["seq"]
             previous=self._last_reader_text
             if previous and previous[0]==tab["id"] and previous[1] is tab["content"]:payload["contentUnchanged"]=True
             else:payload["content"]=tab["content"]
@@ -781,7 +864,36 @@ class Studio(QObject):
     @Property(str, notify=changed)
     def snapshot(self):
         tab = self._current()
-        return json.dumps({"tabs": [{"id": t["id"], "name": t["name"], "path": t["path"], "dirty": t["content"] != t["saved"]} for t in self.tabs], "active": self.active, "name": tab["name"], "outline": tab.get("outline", []), "portable": tab["portable"], "folder": self.folder, "files": self.files, "recent": self.recent, "settings": self.settings, "mode": self.mode, "fullscreen": self.fullscreen, "readerOverlay": self.reader_overlay, "imageOverlay": self.image_overlay, "readerReady": self.ready, "dark": self._dark(), "zoom": self.settings["fullZoom" if self.fullscreen else "normalZoom"], "busy": self.busy > 0, "message": self.message, "colors": self._colors()})
+        return json.dumps({
+            "tabs": [{
+                "id": t["id"],
+                "name": t["name"],
+                "path": t["path"],
+                "dirty": t["content"] != t["saved"],
+                "agentEdited": bool(t["id"] != self.active and (t.get("agent_staged") or t.get("agent_unreviewed"))),
+            } for t in self.tabs],
+            "active": self.active,
+            "name": tab["name"],
+            "outline": tab.get("outline", []),
+            "portable": tab["portable"],
+            "folder": self.folder,
+            "files": self.files,
+            "recent": self.recent,
+            "settings": self.settings,
+            "mode": self.mode,
+            "fullscreen": self.fullscreen,
+            "readerOverlay": self.reader_overlay,
+            "imageOverlay": self.image_overlay,
+            "readerReady": self.ready,
+            "dark": self._dark(),
+            "zoom": self.settings["fullZoom" if self.fullscreen else "normalZoom"],
+            "busy": self.busy > 0,
+            "message": self.message,
+            "colors": self._colors(),
+            "agentConnection": self._agent_connection_snapshot(),
+            "agentJumpTab": self._agent_jump_snapshot(),
+            "activeAgentUnreviewed": bool(tab.get("agent_unreviewed")),
+        })
 
     @Property(bool, notify=changed)
     def agentAccessEnabled(self):
@@ -935,7 +1047,9 @@ class Studio(QObject):
 
     @Slot(str)
     def _cloud_status_changed(self, _status):
-        self._emit(False)
+        for window in list(self.session.windows.values()):
+            if not window.retired:
+                window._emit(False)
 
     @Slot(str, result=bool)
     def createAgentPairing(self, server_origin):
@@ -1704,8 +1818,8 @@ class Studio(QObject):
         entries=[entry for tabs in self.session.workspace.values() for entry in tabs]
         workspace={"paths":list(dict.fromkeys(t["path"] for t in entries if t["path"])),"tabs":entries,"active":self._current()["path"],"activeId":self.active}
         self.session.writes.submit_latest("startup",lambda:atomic_json(self.data/"startup.json",workspace),lambda error:self._notify_recovery_write("startup",error))
-        # Snapshot only unsaved tabs. Asset bytes stay in recovery, never in displayed source.
-        self.session.drafts[self.window_id] = [copy.deepcopy({key: value for key, value in t.items() if key != "viewState"}) for t in self.tabs if t["content"] != t["saved"] and (t["path"] or t["content"].strip() or t["assets"])]
+        # Snapshot only unsaved or agent-staged tabs. Asset bytes stay in recovery, never in displayed source.
+        self.session.drafts[self.window_id] = [copy.deepcopy({key: value for key, value in t.items() if key != "viewState"}) for t in self.tabs if (t["content"] != t["saved"] or t.get("agent_staged") or t.get("agent_unreviewed")) and (t["path"] or t["content"].strip() or t["assets"] or t.get("agent_staged") or t.get("agent_unreviewed"))]
         drafts = [tab for tabs in self.session.drafts.values() for tab in tabs]
         self.session.writes.submit_latest("recovery",lambda:atomic_json(self.data/"recovery.json",drafts),lambda error:self._notify_recovery_write("recovery",error))
 
@@ -1856,6 +1970,7 @@ class Studio(QObject):
             return
         if id!=self.active and any(t["id"] == id for t in self.tabs):
             self.active = id
+            self._activate_tab_state(self._current())
             self.recovery_timer.start(800)
             self._emit()
 
@@ -1892,10 +2007,14 @@ class Studio(QObject):
             if reference not in self.closed_tabs:return
             existing=next((t for t in self.tabs if note.get("path") and t["path"]==note["path"]),None)
             if existing:
-                if activation_generation==self._activation_generation:self.active=existing["id"]
+                if activation_generation==self._activation_generation:
+                    self.active=existing["id"]
+                    self._activate_tab_state(existing)
             else:
                 self.tabs.append(note)
-                if activation_generation==self._activation_generation:self.active=note["id"]
+                if activation_generation==self._activation_generation:
+                    self.active=note["id"]
+                    self._activate_tab_state(note)
             self.closed_tabs.remove(reference)
             self._recover();self._emit()
         def read_note():
@@ -2047,6 +2166,7 @@ class Studio(QObject):
             # state and the just-captured view snapshot in document_flushed.
             self.ready=False
             self._last_reader_text=None
+            self._last_reader_agent_seq.clear()
             self.reader_overlay=False
             self.image_overlay=False
             self._emit(False)
@@ -2122,6 +2242,8 @@ class Studio(QObject):
             target = next((t for t in self.tabs if t["id"] == id), None)
             if target:
                 target.update(path=str(path), name=path.name, saved=content, saved_assets=copy.deepcopy(assets), portable=portable)
+                if not automatic:
+                    self._clear_agent_staging(target)
                 if automatic and target["content"] != content: self.autosave_timer.start(900)
             self.message = "Autosaved" if automatic else "Saved"
             self._recover()
@@ -2140,7 +2262,7 @@ class Studio(QObject):
     def _autosave(self):
         if not self.settings["autosave"]: return
         for tab in self.tabs:
-            if tab["path"] and tab["content"] != tab["saved"] and tab["id"] not in self.saving:
+            if tab["path"] and tab["content"] != tab["saved"] and not tab.get("agent_staged") and tab["id"] not in self.saving:
                 self._save_text(tab,Path(tab["path"]),automatic=True)
 
     @Slot(str, str)
@@ -2229,9 +2351,13 @@ class Studio(QObject):
         self.tabs.pop(current_index)
         if not self.tabs:
             self.tabs.append(self._note("Untitled.md"))
+        if self._agent_jump_tab_id == id:
+            self._agent_jump_tab_id = ""
+        self._last_reader_agent_seq.pop(id, None)
         if self.active == id:
             self._activation_generation += 1
             self.active = self.tabs[min(current_index, len(self.tabs)-1)]["id"]
+            self._activate_tab_state(self._current())
         self._recover()
         self._emit()
 
@@ -2490,13 +2616,23 @@ class Studio(QObject):
             if len(json.dumps(operations, ensure_ascii=False).encode("utf-8")) > 64_000:
                 raise ValueError("Patch operations exceed the 64 KB limit")
             from agent_documents import apply_patch_operations_detailed
-            edited, operation_results = apply_patch_operations_detailed(tab["content"], operations)
-            changed = edited != tab["content"]
+            previous = tab["content"]
+            edited, operation_results = apply_patch_operations_detailed(previous, operations)
+            changed = edited != previous
             if changed:
                 tab["content"] = edited
-                self.recovery_timer.start(800)
-                self.autosave_timer.start(900)
-                self._emit(load=tab_id == self.active)
+                self._append_agent_edit(tab, previous, edited)
+                tab["agent_unreviewed"] = True
+                if tab_id != self.active:
+                    tab["agent_staged"] = True
+                    self._agent_jump_tab_id = tab_id
+                    self.recovery_timer.stop()
+                    self._recover()
+                    self._emit(load=False)
+                else:
+                    self.recovery_timer.start(800)
+                    self.autosave_timer.start(900)
+                    self._emit(load=True)
             return {"tabId": tab_id, "windowId": self.window_id,
                     "revision": hashlib.sha256(edited.encode("utf-8")).hexdigest(),
                     "sourceLength": len(edited), "changed": changed,
@@ -2605,6 +2741,7 @@ class Studio(QObject):
             path_changed = not old_canonical_path or str(path) != old_canonical_path
             tab.update(path=str(path), name=path.name, saved=tab["content"], portable=fmt == "smd")
             tab["saved_assets"] = copy.deepcopy(tab["assets"])
+            self._clear_agent_staging(tab)
             self._agent_open_paths.add(str(path.resolve()))
             self._recover(); self._emit()
             return {"tabId": tab_id, "windowId": self.window_id, "path": str(path),
@@ -3149,7 +3286,23 @@ class Studio(QObject):
                 self.replied.emit(id, json.dumps({"cancelled": self._export_jobs.cancel(job_id)}), "")
                 return
             tab = self._current()
-            if command == "reader_ready": self.ready = True; self._last_reader_text=None; self._emit(); self.replied.emit(id,"true",""); return
+            if command == "reader_ready": self.ready = True; self._last_reader_text=None; self._last_reader_agent_seq.clear(); self._emit(); self.replied.emit(id,"true",""); return
+            if command == "agent_banner_shown":
+                target = next((t for t in self.tabs if t["id"] == args.get("id")), None)
+                if target and not target.get("agent_unreviewed"):
+                    target["agent_unreviewed"] = True
+                    self.recovery_timer.start(800)
+                    self._emit(False)
+                self.replied.emit(id, "true", "")
+                return
+            if command == "agent_banner_dismissed":
+                target = next((t for t in self.tabs if t["id"] == args.get("id")), None)
+                if target and target.get("agent_unreviewed"):
+                    target["agent_unreviewed"] = False
+                    self.recovery_timer.start(800)
+                    self._emit(False)
+                self.replied.emit(id, "true", "")
+                return
             if command == "reader_chrome":
                 action = args.get("action")
                 if action not in ("show", "hide", "toggle"): raise ValueError("Invalid reading chrome action")
@@ -3446,6 +3599,7 @@ class Studio(QObject):
                 if command == "export_fmd_native" and args.get("save") and target:
                     target.update(saved=args["originalContent"], assets=args["assets"])
                     target["saved_assets"] = copy.deepcopy(args["assets"])
+                    self._clear_agent_staging(target)
                     if target["content"] == args["originalContent"]: target["content"] = target["saved"] = args["content"]
                     self._recover()
                     if self.pending_close: self._finish_close()
@@ -3453,6 +3607,7 @@ class Studio(QObject):
                     if target["content"] == args["originalContent"]:
                         target.update(path=save_as,name=Path(save_as).name,content=args["content"],saved=args["content"],assets=args["assets"],portable=True)
                         target["saved_assets"] = copy.deepcopy(args["assets"])
+                        self._clear_agent_staging(target)
                         self._recover()
                         self._emit()
                         if self.pending_close: self._finish_close()
@@ -3506,6 +3661,7 @@ class Studio(QObject):
         # a renderer must not restore an older recovery snapshot or run cells.
         self.ready=False
         self._last_reader_text=None
+        self._last_reader_agent_seq.clear()
         self.reader_overlay=False
         self.image_overlay=False
         self._emit(False)
