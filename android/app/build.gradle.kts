@@ -20,10 +20,12 @@ android {
     // Compress native libraries for the normal download. Keep aligned ELF files;
     // Android extracts them at installation, rather than inflating APK size.
     packaging { jniLibs { useLegacyPackaging = true }; resources { excludes += "/META-INF/{AL2.0,LGPL2.1}" } }
+    lint { error += "ObsoleteSdkInt" }
 }
 kotlin { jvmToolchain(17) }
 chaquopy { defaultConfig { version = "3.13"; System.getenv("SUPERMD_BUILD_PYTHON")?.let { buildPython(it) }; pip { install("numpy"); install("matplotlib==3.8.4") } } }
 dependencies {
+    implementation("androidx.core:core-ktx:1.16.0")
     implementation(platform("androidx.compose:compose-bom:2025.09.00"))
     implementation("androidx.activity:activity-compose:1.10.1")
     implementation("androidx.compose.material3:material3:1.5.0-alpha29")
