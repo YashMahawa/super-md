@@ -132,6 +132,18 @@ ApplicationWindow {{
         }
         for action in actions:
             self.assertIsNotNone(self.named_item("shortcutRecorder_" + action["id"]))
+        for format_action in ("bold", "italic", "inline_code", "link", "heading", "list", "quote", "inline_math"):
+            self.assertIn(format_action, default_bindings)
+        self.assertIn("Italic", self.studio.setShortcut("bold", "Ctrl+I"))
+        self.assertEqual(self.studio.setShortcut("bold", "Ctrl+Alt+B"), "")
+        self.assertEqual(self.studio.shortcutSequences("bold"), ["Ctrl+Alt+B"])
+        self.assertEqual(self.studio.setShortcut("bold", ""), "")
+        self.assertEqual(self.studio.shortcutSequences("bold"), [])
+        emitted_calls = []
+        self.studio.readerCall.connect(emitted_calls.append)
+        self.studio.command("format_bold")
+        self.assertIn("window.supermdFormat?.('bold')", emitted_calls)
+        self.assertEqual(self.studio.resetShortcuts(), "")
         # Main.qml's Settings dialog is the single modal. Picking its shortcuts
         # category must not add another modal layer over the settings page.
         self.window.setProperty("modalDialogCount", 1)

@@ -233,7 +233,9 @@ old output. These plots are static figures, not live Python widgets.
 
 ## Links, images and export
 
-Pasting a URL opens an insertion choice with an editable fetched title. Supported
+Pasting an HTTP/HTTPS URL over selected prose wraps `[selected text](url)` inline,
+while pasting a URL elsewhere inserts the plain URL directly. Use **Insert image or
+link** for an insertion dialog with an editable fetched title. Supported
 YouTube links offer an optional thumbnail preview; insertion downloads the image
 as a local asset. Image URLs can also be inserted explicitly. Remote pictures in
 existing Markdown require loading/trust consent in the reader. Links remain

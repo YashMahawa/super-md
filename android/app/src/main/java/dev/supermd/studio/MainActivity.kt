@@ -120,6 +120,8 @@ class MainActivity : ComponentActivity() {
     var dismissDocument: (() -> Unit)? = null
     var saveReaderPosition: (() -> Unit)? = null
     var openReaderFind: (() -> Unit)? = null
+    var formatDocument: ((String) -> Unit)? = null
+    var canFormatEditor: (() -> Boolean)? = null
     val agentAccessState: AgentAccessState by lazy { AgentAccessState(this) }
     var agentRelayState by mutableStateOf(AgentRelayClient.State.DISCONNECTED)
         private set
@@ -405,6 +407,21 @@ class MainActivity : ComponentActivity() {
         }
     }
     fun handleShortcut(event: android.view.KeyEvent): Boolean {
+        if (event.action == android.view.KeyEvent.ACTION_DOWN) {
+            if (canFormatEditor?.invoke() == true) {
+                val formatAction = markdownFormatActionForKey(
+                    keyCode = event.keyCode,
+                    isCtrlPressed = event.isCtrlPressed,
+                    isShiftPressed = event.isShiftPressed,
+                    isAltPressed = event.isAltPressed,
+                    isMetaPressed = event.isMetaPressed,
+                )
+                if (formatAction != null) {
+                    if (event.repeatCount == 0) formatDocument?.invoke(formatAction)
+                    return true
+                }
+            }
+        }
         if (event.action == android.view.KeyEvent.ACTION_DOWN && event.repeatCount == 0) {
             if (event.keyCode == android.view.KeyEvent.KEYCODE_F11) { model.fullscreen(!model.state.value.fullscreen); return true }
             if (event.keyCode == android.view.KeyEvent.KEYCODE_ESCAPE && (model.state.value.fullscreen || model.state.value.readerOverlay)) { dismissDocument?.invoke() ?: model.fullscreen(false); return true }
@@ -1004,6 +1021,27 @@ private object NoMotionScheme : MotionScheme {
         val displayIsLarge = if (Build.VERSION.SDK_INT >= 30) activity.windowManager.maximumWindowMetrics.bounds.let { minOf(it.width(), it.height()) / density.density >= 600f } else activity.resources.configuration.smallestScreenWidthDp >= 600
         val wide = displayIsLarge && maxWidth >= 720.dp && maxHeight >= 400.dp
         val actualMode = if (!wide && state.mode == "split") "live" else state.mode
+        val imeVisible = WindowInsets.ime.getBottom(density) > 0
+        val modalOpen = settings || exporting || renaming || contentsShown || drawer.isOpen || (!accessPickerShowing && accessRequest != null) || state.error != null || !state.welcomed
+        val showFormattingBar = shouldShowKeyboardFormattingBar(actualMode, imeVisible, state.editorFocused, readerReady, state.readerOverlay, modalOpen)
+        val triggerFormat = rememberUpdatedState<(String) -> Unit> { action ->
+            val reader = web
+            if (reader != null && readerReady) {
+                if (!reader.hasFocus()) reader.requestFocus(View.FOCUS_DOWN)
+                reader.evaluateJavascript("window.supermdFormat?.(${JSONObject.quote(action)}); true", null)
+            }
+        }
+        val canFormatNow = rememberUpdatedState {
+            canTriggerHardwareFormatShortcut(actualMode, state.editorFocused, readerReady, state.readerOverlay, modalOpen)
+        }
+        DisposableEffect(activity) {
+            activity.formatDocument = { action -> triggerFormat.value(action) }
+            activity.canFormatEditor = { canFormatNow.value() }
+            onDispose {
+                activity.formatDocument = null
+                activity.canFormatEditor = null
+            }
+        }
         val readerContent=remember {arrayOfNulls<String>(1)}
         LaunchedEffect(readerReady, state.active, actualMode, dark, state.fullscreen, state.font, state.size, state.widthPercent,state.lineHeight,state.spellCheck,state.grammarCheck,state.latexAutofix,state.restorePosition,state.centerLock,state.imageAppearance,state.svgAppearance,state.imageContrast,state.fullDocumentAccessibility,state.customTheme,state.patternKind,state.patternOpacity,state.patternSize,state.patternSpacing,tokens, hinge, motion) {
             if (!readerReady) readerNote[0] = null
@@ -1109,114 +1147,120 @@ private object NoMotionScheme : MotionScheme {
                     }
                 // The reading surface is edge-to-edge in BOTH chrome states.
                 // Only controls receive safe insets, not the document width.
-                Box(Modifier.fillMaxSize()) {
-                    key(readerGeneration) { AndroidView(factory = { context -> FrameLayout(context).apply {
-                        layoutParams = ViewGroup.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT)
-                        clipChildren = true
-                        clipToPadding = true
-                        addView(SelectionReaderWebView(context, model).apply {
-                            // Percentage-height HTML needs MATCH_PARENT, not
-                            // WRAP_CONTENT. The native container also confines
-                            // WebView's accelerated drawing to the reading pane.
-                            layoutParams = FrameLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT)
-                            web = this
-                            setOnKeyListener { _, _, event -> activity.handleShortcut(event) }
-                            setBackgroundColor(AndroidColor.TRANSPARENT)
-                            configureReader(this, model, scope, ready = { if (web === this) readerReady = true }, onAgentReply = activity::deliverAgentReply, onAgentExport = activity::requestAgentExport, rendererGone = { failedView ->
-                                val wasCurrent = web === failedView
-                                retireAndDestroyReader(failedView)
-                                if (wasCurrent) {
-                                    readerReady = false
-                                    readerPdfOwnsProgress = false
-                                    readerNote[0] = null
-                                    readerGeneration++
-                                    web = null
-                                    scope.launch {
-                                        snackbar.showSnackbar("The reader restarted. Changes already received by Super MD were restored; an edit still in transit may be missing.")
+                Column(Modifier.fillMaxSize()) {
+                    Box(Modifier.fillMaxWidth().weight(1f)) {
+                        key(readerGeneration) { AndroidView(factory = { context -> FrameLayout(context).apply {
+                            layoutParams = ViewGroup.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT)
+                            clipChildren = true
+                            clipToPadding = true
+                            addView(SelectionReaderWebView(context, model).apply {
+                                // Percentage-height HTML needs MATCH_PARENT, not
+                                // WRAP_CONTENT. The native container also confines
+                                // WebView's accelerated drawing to the reading pane.
+                                layoutParams = FrameLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT)
+                                web = this
+                                setOnKeyListener { _, _, event -> activity.handleShortcut(event) }
+                                setBackgroundColor(AndroidColor.TRANSPARENT)
+                                configureReader(this, model, scope, ready = { if (web === this) readerReady = true }, onAgentReply = activity::deliverAgentReply, onAgentExport = activity::requestAgentExport, rendererGone = { failedView ->
+                                    val wasCurrent = web === failedView
+                                    retireAndDestroyReader(failedView)
+                                    if (wasCurrent) {
+                                        readerReady = false
+                                        readerPdfOwnsProgress = false
+                                        model.editorFocus(false)
+                                        readerNote[0] = null
+                                        readerGeneration++
+                                        web = null
+                                        scope.launch {
+                                            snackbar.showSnackbar("The reader restarted. Changes already received by Super MD were restored; an edit still in transit may be missing.")
+                                        }
                                     }
-                                }
-                            })
-                            var touchY=0f
-                            var downX=0f
-                            var downY=0f
-                            var downTime=0L
-                            var moved=false
-                            var multiTouch=false
-                            var chromeIntent:Boolean?=null
-                            var gestureEpoch=0L
-                            var gestureActive=false
-                            setOnTouchListener {_,event->
-                                if(event.actionMasked==android.view.MotionEvent.ACTION_DOWN) {
-                                    chromeTapJob[0]?.cancel()
-                                    gestureEpoch++
-                                    gestureActive=true
-                                    touchY=event.rawY
-                                    downX=event.x;downY=event.y;downTime=event.eventTime;moved=false
-                                    multiTouch=false
-                                    chromeIntent=null
-                                }
-                                if(event.actionMasked==android.view.MotionEvent.ACTION_POINTER_DOWN) {multiTouch=true;chromeIntent=null}
-                                if(event.actionMasked==android.view.MotionEvent.ACTION_MOVE && !multiTouch && event.pointerCount==1 && model.state.value.mode in listOf("live","reader") && !model.state.value.readerOverlay) {
-                                    if(kotlin.math.hypot(event.x-downX,event.y-downY)>8*density.density)moved=true
-                                    val travel=event.rawY-touchY
-                                    if(kotlin.math.abs(travel)>36*density.density){chromeIntent=travel>0;touchY=event.rawY}
-                                }
-                                // Never resize the viewport under an active
-                                // gesture, selection handle or live editor.
-                                if(event.actionMasked==android.view.MotionEvent.ACTION_UP && !multiTouch) {
-                                    gestureActive=false
-                                    val completedEpoch=gestureEpoch
-                                    val show=chromeIntent
-                                    val tap=!moved && event.eventTime-downTime<350 && model.state.value.mode in listOf("live","reader") && !model.state.value.readerOverlay
-                                    if(show!=null || tap) {
-                                        val x=event.x/density.density;val y=event.y/density.density
-                                        chromeTapJob[0]=scope.launch {
-                                            if(tap)delay(260)
-                                            evaluateJavascript("(() => { const e=document.elementFromPoint($x,$y); return !!document.querySelector('.live-active-block textarea:focus') || !!window.getSelection()?.toString() || ${if(tap) "!!e?.closest('a,button,input,textarea,summary,img,.note-image,[data-independent-zoom],.interactive-chart,.media-dialog,.reading-search,.math-repair-panel')" else "false"}; })()") { interacting ->
-                                                if(interacting!="true" && !gestureActive && completedEpoch==gestureEpoch) {
-                                                    readingChromeAfterGesture(model.state.value.fullscreen, readingChromeVisible, show, tap)?.let { readingChromeVisible=it }
+                                })
+                                var touchY=0f
+                                var downX=0f
+                                var downY=0f
+                                var downTime=0L
+                                var moved=false
+                                var multiTouch=false
+                                var chromeIntent:Boolean?=null
+                                var gestureEpoch=0L
+                                var gestureActive=false
+                                setOnTouchListener {_,event->
+                                    if(event.actionMasked==android.view.MotionEvent.ACTION_DOWN) {
+                                        chromeTapJob[0]?.cancel()
+                                        gestureEpoch++
+                                        gestureActive=true
+                                        touchY=event.rawY
+                                        downX=event.x;downY=event.y;downTime=event.eventTime;moved=false
+                                        multiTouch=false
+                                        chromeIntent=null
+                                    }
+                                    if(event.actionMasked==android.view.MotionEvent.ACTION_POINTER_DOWN) {multiTouch=true;chromeIntent=null}
+                                    if(event.actionMasked==android.view.MotionEvent.ACTION_MOVE && !multiTouch && event.pointerCount==1 && model.state.value.mode in listOf("live","reader") && !model.state.value.readerOverlay) {
+                                        if(kotlin.math.hypot(event.x-downX,event.y-downY)>8*density.density)moved=true
+                                        val travel=event.rawY-touchY
+                                        if(kotlin.math.abs(travel)>36*density.density){chromeIntent=travel>0;touchY=event.rawY}
+                                    }
+                                    // Never resize the viewport under an active
+                                    // gesture, selection handle or live editor.
+                                    if(event.actionMasked==android.view.MotionEvent.ACTION_UP && !multiTouch) {
+                                        gestureActive=false
+                                        val completedEpoch=gestureEpoch
+                                        val show=chromeIntent
+                                        val tap=!moved && event.eventTime-downTime<350 && model.state.value.mode in listOf("live","reader") && !model.state.value.readerOverlay
+                                        if(show!=null || tap) {
+                                            val x=event.x/density.density;val y=event.y/density.density
+                                            chromeTapJob[0]=scope.launch {
+                                                if(tap)delay(260)
+                                                evaluateJavascript("(() => { const e=document.elementFromPoint($x,$y); return !!document.querySelector('.live-active-block textarea:focus') || !!window.getSelection()?.toString() || ${if(tap) "!!e?.closest('a,button,input,textarea,summary,img,.note-image,[data-independent-zoom],.interactive-chart,.media-dialog,.reading-search,.math-repair-panel')" else "false"}; })()") { interacting ->
+                                                    if(interacting!="true" && !gestureActive && completedEpoch==gestureEpoch) {
+                                                        readingChromeAfterGesture(model.state.value.fullscreen, readingChromeVisible, show, tap)?.let { readingChromeVisible=it }
+                                                    }
                                                 }
                                             }
                                         }
                                     }
+                                    if(event.actionMasked==android.view.MotionEvent.ACTION_UP || event.actionMasked==android.view.MotionEvent.ACTION_CANCEL)gestureActive=false
+                                    false
                                 }
-                                if(event.actionMasked==android.view.MotionEvent.ACTION_UP || event.actionMasked==android.view.MotionEvent.ACTION_CANCEL)gestureActive=false
-                                false
-                            }
-                            webChromeClient = object : android.webkit.WebChromeClient() {
-                                override fun onShowFileChooser(view: WebView, callback: android.webkit.ValueCallback<Array<android.net.Uri>>, parameters: FileChooserParams): Boolean {
-                                    imageCallback?.onReceiveValue(null); imageCallback = callback; imageNote = model.state.value.active.id
-                                    imagePicker.launch(arrayOf("image/*")); return true
-                                }
-                            }
-                            setOnDragListener { _, event ->
-                                when(event.action) {
-                                    android.view.DragEvent.ACTION_DRAG_STARTED -> event.clipDescription?.let { it.hasMimeType("image/*") || it.hasMimeType("application/octet-stream") || it.hasMimeType("text/uri-list") } == true
-                                    android.view.DragEvent.ACTION_DROP -> {
-                                        val permissions = activity.requestDragAndDropPermissions(event)
-                                        val clip = event.clipData
-                                        val uris = (0 until (clip?.itemCount ?: 0)).mapNotNull { clip!!.getItemAt(it).uri }
-                                        if (uris.isNotEmpty()) {
-                                            val id = model.state.value.active.id
-                                            evaluateJavascript("window.supermdCaptureInsertion?.()", null)
-                                            model.importDropped(uris, id) { images -> permissions?.release(); images?.let { evaluateJavascript("window.supermdInsertImages?.($it)", null) } }
-                                        } else permissions?.release()
-                                        true
+                                webChromeClient = object : android.webkit.WebChromeClient() {
+                                    override fun onShowFileChooser(view: WebView, callback: android.webkit.ValueCallback<Array<android.net.Uri>>, parameters: FileChooserParams): Boolean {
+                                        imageCallback?.onReceiveValue(null); imageCallback = callback; imageNote = model.state.value.active.id
+                                        imagePicker.launch(arrayOf("image/*")); return true
                                     }
-                                    else -> true
                                 }
+                                setOnDragListener { _, event ->
+                                    when(event.action) {
+                                        android.view.DragEvent.ACTION_DRAG_STARTED -> event.clipDescription?.let { it.hasMimeType("image/*") || it.hasMimeType("application/octet-stream") || it.hasMimeType("text/uri-list") } == true
+                                        android.view.DragEvent.ACTION_DROP -> {
+                                            val permissions = activity.requestDragAndDropPermissions(event)
+                                            val clip = event.clipData
+                                            val uris = (0 until (clip?.itemCount ?: 0)).mapNotNull { clip!!.getItemAt(it).uri }
+                                            if (uris.isNotEmpty()) {
+                                                val id = model.state.value.active.id
+                                                evaluateJavascript("window.supermdCaptureInsertion?.()", null)
+                                                model.importDropped(uris, id) { images -> permissions?.release(); images?.let { evaluateJavascript("window.supermdInsertImages?.($it)", null) } }
+                                            } else permissions?.release()
+                                            true
+                                        }
+                                        else -> true
+                                    }
+                                }
+                            })
+                        } }, modifier = Modifier.fillMaxSize().clipToBounds(), onRelease = { frame ->
+                            val released = frame.getChildAt(0) as? WebView
+                            if (released != null) {
+                                if (web === released) { web = null; readerReady = false; model.editorFocus(false) }
+                                retireAndDestroyReader(released)
                             }
-                        })
-                    } }, modifier = Modifier.fillMaxSize().clipToBounds(), onRelease = { frame ->
-                        val released = frame.getChildAt(0) as? WebView
-                        if (released != null) {
-                            if (web === released) { web = null; readerReady = false }
-                            retireAndDestroyReader(released)
-                        }
-                        frame.removeAllViews()
-                    }) }
-                    SnackbarHost(snackbar, Modifier.align(Alignment.BottomCenter).safeDrawingPadding())
-                    if (shouldShowNativeBusyOverlay(state.busy, readerReady, readerPdfOwnsProgress)) Surface(color = palette.surface.copy(alpha = .96f), modifier = Modifier.fillMaxSize()) { Column(Modifier.fillMaxSize(), verticalArrangement = Arrangement.Center, horizontalAlignment = Alignment.CenterHorizontally) { if(motion) LoadingIndicator() else Icon(Icons.Rounded.Description,null,Modifier.size(48.dp),tint=palette.primary); Spacer(Modifier.height(16.dp)); Text(if(state.busy) "Preparing your document…" else "Opening your workspace…") } }
+                            frame.removeAllViews()
+                        }) }
+                        SnackbarHost(snackbar, Modifier.align(Alignment.BottomCenter).safeDrawingPadding())
+                        if (shouldShowNativeBusyOverlay(state.busy, readerReady, readerPdfOwnsProgress)) Surface(color = palette.surface.copy(alpha = .96f), modifier = Modifier.fillMaxSize()) { Column(Modifier.fillMaxSize(), verticalArrangement = Arrangement.Center, horizontalAlignment = Alignment.CenterHorizontally) { if(motion) LoadingIndicator() else Icon(Icons.Rounded.Description,null,Modifier.size(48.dp),tint=palette.primary); Spacer(Modifier.height(16.dp)); Text(if(state.busy) "Preparing your document…" else "Opening your workspace…") } }
+                    }
+                    if (showFormattingBar) {
+                        KeyboardFormattingBar(onFormat = { triggerFormat.value(it) })
+                    }
                 }
             }
         }

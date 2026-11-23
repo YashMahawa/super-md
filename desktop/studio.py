@@ -366,6 +366,7 @@ class Studio(QObject):
         self.fullscreen = False
         self.reader_overlay = False
         self.image_overlay = False
+        self.editor_focused = False
         self.busy = 0
         self.message = ("Closed-note recovery index could not be read; historical snapshots were left untouched. "+self.session.closed_note_error) if self.session.closed_note_error else ""
         self.ready = False
@@ -604,7 +605,7 @@ class Studio(QObject):
             return "Invalid key combination."
         candidate = copy.deepcopy(self.settings["shortcuts"])
         candidate[action] = [sequence] if sequence else []
-        validated, error = normalize_shortcuts(candidate)
+        validated, error = normalize_shortcuts(candidate, edited_action=action)
         if error: return error
         if validated == self.settings["shortcuts"]: return ""
         self.settings["shortcuts"] = validated
@@ -2290,7 +2291,21 @@ class Studio(QObject):
 
     @Slot(str)
     def command(self, action):
-        calls = {"find": "window.supermdFind?.()", "insert": "window.supermdMedia?.()", "repair": "window.supermdRepairMath?.()", "undo":"window.supermdHistory?.('undo')", "redo":"window.supermdHistory?.('redo')"}
+        calls = {
+            "find": "window.supermdFind?.()",
+            "insert": "window.supermdMedia?.()",
+            "repair": "window.supermdRepairMath?.()",
+            "undo": "window.supermdHistory?.('undo')",
+            "redo": "window.supermdHistory?.('redo')",
+            "format_bold": "window.supermdFormat?.('bold')",
+            "format_italic": "window.supermdFormat?.('italic')",
+            "format_inline_code": "window.supermdFormat?.('inline_code')",
+            "format_link": "window.supermdFormat?.('link')",
+            "format_heading": "window.supermdFormat?.('heading')",
+            "format_list": "window.supermdFormat?.('list')",
+            "format_quote": "window.supermdFormat?.('quote')",
+            "format_inline_math": "window.supermdFormat?.('inline_math')",
+        }
         if action in calls: self.readerCall.emit(calls[action])
         elif action == "window": self.newWindowRequested.emit()
 
@@ -3156,6 +3171,7 @@ class Studio(QObject):
                 if self.fullscreen: self.chromeRequested.emit(action)
                 self.replied.emit(id,"true",""); return
             if command == "reader_overlay_changed": self.reader_overlay = bool(args.get("open")); self.image_overlay = bool(args.get("image")); self._emit(False); self.replied.emit(id,"true",""); return
+            if command == "editor_focus_changed": self.editor_focused = bool(args.get("focused")); self.replied.emit(id,"true",""); return
             if command == "copy_image_native":
                 body = args.get("body")
                 if args.get("mimeType") != "image/png" or not isinstance(body, str) or len(body) > 34_000_000:

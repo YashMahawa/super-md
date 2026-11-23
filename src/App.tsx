@@ -476,10 +476,17 @@ export default function App() {
 
   useEffect(() => {
     const handler = (event: KeyboardEvent) => {
+      if (event.defaultPrevented) return;
       if (event.key === "F11") { event.preventDefault(); toggleFullscreen(); }
       if ((event.ctrlKey || event.metaKey) && event.key.toLowerCase() === "s") { event.preventDefault(); save(event.shiftKey); }
       if ((event.ctrlKey || event.metaKey) && event.key.toLowerCase() === "o") { event.preventDefault(); event.shiftKey ? chooseFolder() : open(); }
-      if ((event.ctrlKey || event.metaKey) && event.key.toLowerCase() === "b") { event.preventDefault(); setFolderVisible((visible) => !visible); }
+      if ((event.ctrlKey || event.metaKey) && !event.shiftKey && !event.altKey && event.key.toLowerCase() === "b") {
+        const target = event.target instanceof Element ? event.target : null;
+        if (!target?.closest(".cm-editor, .live-active-block")) {
+          event.preventDefault();
+          setFolderVisible((visible) => !visible);
+        }
+      }
       if ((event.ctrlKey || event.metaKey) && event.shiftKey && event.key.toLowerCase() === "n") { event.preventDefault(); openNewWindow(); }
       else if ((event.ctrlKey || event.metaKey) && event.key.toLowerCase() === "n") { event.preventDefault(); newDocument(); }
       if ((event.ctrlKey || event.metaKey) && event.key.toLowerCase() === "w") { event.preventDefault(); event.shiftKey ? closeWindow() : setDocuments((current) => closeTab(current, current.activeId)); }
@@ -565,6 +572,8 @@ export default function App() {
   };
   const format = (prefix: string, suffix?: string, block = false) =>
     window.dispatchEvent(new CustomEvent("supermd-format", { detail: { prefix, suffix, block } }));
+  const formatAction = (action: string) =>
+    window.dispatchEvent(new CustomEvent("supermd-format", { detail: { action } }));
 
   return (
     <MotionConfig reducedMotion={motionEnabled ? "never" : "always"}>
@@ -601,12 +610,12 @@ export default function App() {
       </div>}
       {!fullscreen && view === "editor" && <div className="formatbar" aria-label="Formatting tools">
         <span className="format-label">Insert</span>
-        <button onClick={() => format("## ", "", true)} title="Heading 2" aria-label="Heading 2"><TextHTwo size={18} /></button>
-        <button onClick={() => format("**") } title="Bold" aria-label="Bold"><TextB size={18} /></button>
-        <button onClick={() => format("_") } title="Italic" aria-label="Italic"><TextItalic size={18} /></button>
+        <button onClick={() => formatAction("heading")} title="Heading 2 · Ctrl+Shift+H" aria-label="Heading 2"><TextHTwo size={18} /></button>
+        <button onClick={() => formatAction("bold")} title="Bold · Ctrl+B" aria-label="Bold"><TextB size={18} /></button>
+        <button onClick={() => formatAction("italic")} title="Italic · Ctrl+I" aria-label="Italic"><TextItalic size={18} /></button>
         <span className="format-divider" />
-        <button onClick={() => format("`") } title="Inline code" aria-label="Inline code"><Code size={18} /></button>
-        <button onClick={() => format("$", "$") } title="Inline math" aria-label="Inline math"><FunctionIcon size={18} /></button>
+        <button onClick={() => formatAction("inline_code")} title="Inline code · Ctrl+E" aria-label="Inline code"><Code size={18} /></button>
+        <button onClick={() => formatAction("inline_math")} title="Inline math · Ctrl+Shift+M" aria-label="Inline math"><FunctionIcon size={18} /></button>
         <span className="format-divider" />
         <button className="format-text-button" onClick={() => format("\n:::callout note \"Note\"\nWrite here.\n:::\n", "", true)} title="Insert callout"><Note size={18} /><span>Callout</span></button>
         <button className="format-text-button" onClick={() => format("\n```smd-chart\n{\n  \"title\": \"Interactive graph\",\n  \"x\": { \"min\": -6.28, \"max\": 6.28 },\n  \"series\": [{ \"expression\": \"a * Math.sin(x)\" }],\n  \"sliders\": [{ \"name\": \"a\", \"min\": 0, \"max\": 3, \"step\": 0.1, \"value\": 1 }]\n}\n```\n", "", true)} title="Insert interactive graph"><ChartLine size={18} /><span>Graph</span></button>
