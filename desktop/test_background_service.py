@@ -5,7 +5,8 @@ from unittest.mock import patch
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
-from PySide6.QtCore import QEvent, QObject, QPointF, QStandardPaths, Qt, QUrl, Signal
+from PySide6.QtCore import QEvent, QLockFile, QObject, QPointF, QStandardPaths, Qt, QUrl, Signal
+from PySide6.QtNetwork import QLocalServer
 from PySide6.QtQml import QQmlComponent, QQmlEngine
 from PySide6.QtQuick import QQuickItem
 from PySide6.QtQuickControls2 import QQuickStyle
@@ -13,8 +14,10 @@ from PySide6.QtTest import QTest
 from PySide6.QtWidgets import QApplication
 
 import agent_cloud, agent_live, background_cli, mcp_server, python_runtime, updates
+from agent_live import LiveTabClient
 from agent_live_client import MultiSessionLiveClient
 from background_service import BackgroundService
+from documents import atomic_json, open_note, write_portable
 from instance import InstanceBroker
 from studio import ROOT, Session
 from test_studio import QuietStudio
@@ -219,6 +222,64 @@ class BackgroundTests(unittest.TestCase):
         self.assertFalse(studio.retired)
         self.assertTrue(session.agent_bridge.enabled and discovery.is_file())
 
+        # Even after WebEngine marks a hidden headless window `ready = True` with an unsaved draft,
+        # CLI `service stop` flushes/persists recovery state and quits without opening a modal close prompt.
+        studio.tabs[0]["content"] = "# Unsaved headless draft\n\n$$E = mc^2$$\n"
+        studio.ready = True
+        studio.readerCall.connect(
+            lambda js: studio.post(
+                "flush-1",
+                "document_flushed",
+                json.dumps(
+                    {
+                        "id": studio.tabs[0]["id"],
+                        "content": studio.tabs[0]["content"],
+                        "operation": studio.flush_operation,
+                    }
+                ),
+            )
+            if "supermdFlush" in js and studio.flush_operation
+            else None
+        )
+        stop_reply = session.background.handle_service_request("stop")
+        self._pump(6)
+        self.assertEqual(stop_reply, {"ok": True, "running": False, "stopped": True, "quitRequested": True})
+        self.assertEqual(studio.pending_close, "")
+        self.assertFalse(studio.host_window.isVisible())
+        self.assertTrue(app.ended)
+        studio.stop()
+        session.writes.shutdown(wait=True)
+        recovered = json.loads((session.data / "recovery.json").read_text(encoding="utf-8"))
+        self.assertTrue(any("Unsaved headless draft" in tab.get("content", "") for tab in recovered))
+
+        # When a hidden offscreen renderer is occluded/suspended (e.g. on macOS/Windows) and never
+        # answers `supermdFlush`, `_on_flush_timeout` must still recover drafts and quit without
+        # showing a modal flush dialog.
+        app_occluded = App()
+        session_occluded = self._make_session()
+        session_occluded.settings["agentAccessEnabled"] = True
+        with patch("background_service.QSystemTrayIcon.isSystemTrayAvailable", return_value=False):
+            session_occluded.background = BackgroundService(
+                app_occluded, session_occluded, ROOT, lambda _: None, force=True
+            )
+        studio_occluded = self._make_studio(session_occluded, visible=False)
+        studio_occluded.tabs[0]["content"] = "# Occluded hidden draft\n\n$$\\nabla \\cdot B = 0$$\n"
+        studio_occluded.ready = True
+        flush_failed_events = []
+        studio_occluded.flushFailed.connect(flush_failed_events.append)
+        stop_occluded = session_occluded.background.handle_service_request("stop")
+        self.assertEqual(stop_occluded, {"ok": True, "running": False, "stopped": True, "quitRequested": True})
+        self.assertIsNotNone(studio_occluded.flush_operation)
+        studio_occluded._on_flush_timeout()
+        self._pump(6)
+        self.assertEqual(flush_failed_events, [])
+        self.assertFalse(studio_occluded.host_window.isVisible())
+        self.assertTrue(app_occluded.ended)
+        studio_occluded.stop()
+        session_occluded.writes.shutdown(wait=True)
+        recovered_occluded = json.loads((session_occluded.data / "recovery.json").read_text(encoding="utf-8"))
+        self.assertTrue(any("Occluded hidden draft" in tab.get("content", "") for tab in recovered_occluded))
+
     def test_install_update_bypasses_tray_hiding_across_desktop_installers(self):
         for kind in ("appimage", "windows", "macos"):
             app = App()
@@ -368,15 +429,276 @@ class BackgroundTests(unittest.TestCase):
             )
             self.assertEqual(linux_cmd, [str(appimage.resolve()), "--background", "--agent-access"])
 
+    def test_upgrade_migration_preserves_legacy_background_and_agent_settings_without_opting_in_reader_only_users(self):
+        root_temp = Path(tempfile.mkdtemp(prefix="supermd-upgrade-")).resolve()
+        self.addCleanup(lambda: shutil.rmtree(root_temp, ignore_errors=True))
+        orig_writable = QStandardPaths.writableLocation
+
+        def make_env(profile_name: str) -> Path:
+            appdata = (root_temp / profile_name).resolve()
+            (appdata / "qt-studio").mkdir(parents=True, exist_ok=True)
+            return appdata
+
+        # 1. Pre-#41 user who had agentAccessEnabled:true in settings.json (no keepInBackground key),
+        #    Unicode note paths, widthPercent:80 legacy default, and custom PDF/font settings.
+        appdata_agent = make_env("Profile Α — Agent User (2026)")
+        pinned_note = str(appdata_agent / "Δ-field derivations (v2).smd")
+        recent_note = str(appdata_agent / "日本語ノート — 量子統計力学.md")
+        atomic_json(
+            appdata_agent / "qt-studio" / "settings.json",
+            {
+                "settings": {
+                    "font": "IBM Plex Serif",
+                    "size": 17.5,
+                    "widthPercent": 80,
+                    "agentAccessEnabled": True,
+                    "cloudAgentEnabled": False,
+                    "pdf": {"paperSize": "A4", "margins": "wide"},
+                },
+                "pinned": [pinned_note],
+                "recent": [pinned_note, recent_note],
+            },
+        )
+        with patch.object(
+            QStandardPaths,
+            "writableLocation",
+            side_effect=lambda k, p=appdata_agent: str(p) if k == QStandardPaths.AppDataLocation else orig_writable(k),
+        ):
+            upgraded_session = Session(False)
+            try:
+                self.assertIs(upgraded_session.settings["keepInBackground"], True)
+                self.assertIs(upgraded_session.settings["agentAccessEnabled"], False)
+                self.assertEqual(upgraded_session.settings["widthPercent"], 90)
+                self.assertEqual(upgraded_session.settings["font"], "IBM Plex Serif")
+                self.assertEqual(upgraded_session.settings["pdf"]["paperSize"], "A4")
+                self.assertEqual(upgraded_session.pinned, [pinned_note])
+                self.assertEqual(upgraded_session.recent, [pinned_note, recent_note])
+                persisted = json.loads((appdata_agent / "qt-studio" / "settings.json").read_text(encoding="utf-8"))
+                self.assertIs(persisted["settings"]["keepInBackground"], True)
+                app_stub = App()
+                with patch("background_service.QSystemTrayIcon.isSystemTrayAvailable", return_value=False):
+                    svc = BackgroundService(app_stub, upgraded_session, ROOT, lambda _: None, force=False)
+                self.assertTrue(svc.enabled and app_stub.keep)
+
+                # Once the upgraded user explicitly turns keepInBackground off, later launches respect False
+                # even if legacy background-service.log and agent-sessions artifacts still exist on disk.
+                (appdata_agent / "background-service.log").write_text("legacy daemon started\n", encoding="utf-8")
+                (appdata_agent / "qt-studio" / "agent-sessions").mkdir(parents=True, exist_ok=True)
+                with patch.object(python_runtime, "discover", return_value=[]), patch.object(
+                    QuietStudio, "_restore_update", lambda _self: None
+                ):
+                    studio = QuietStudio(False, upgraded_session)
+                    try:
+                        studio.setting("keepInBackground", "false")
+                    finally:
+                        studio.stop()
+                        studio.pool.shutdown(wait=True, cancel_futures=True)
+            finally:
+                upgraded_session.writes.shutdown(wait=True)
+
+            reopened_after_opt_out = Session(False)
+            try:
+                self.assertIs(reopened_after_opt_out.settings["keepInBackground"], False)
+            finally:
+                reopened_after_opt_out.writes.shutdown(wait=True)
+
+        # 2. Pre-#41 headless `super-md agent service start` user who never saved GUI settings.json,
+        #    leaving only <AppDataLocation>/background-service.log and qt-studio/agent-sessions/.
+        appdata_headless = make_env("Profile Β — Headless Service Only")
+        (appdata_headless / "background-service.log").write_text(
+            "Super MD: accelerated graphics unavailable; using software rendering.\n",
+            encoding="utf-8",
+        )
+        (appdata_headless / "qt-studio" / "agent-sessions").mkdir(parents=True, exist_ok=True)
+        self.assertFalse((appdata_headless / "qt-studio" / "settings.json").exists())
+        with patch.object(
+            QStandardPaths,
+            "writableLocation",
+            side_effect=lambda k, p=appdata_headless: str(p) if k == QStandardPaths.AppDataLocation else orig_writable(k),
+        ):
+            headless_upgraded = Session(False)
+            try:
+                self.assertIs(headless_upgraded.settings["keepInBackground"], True)
+                persisted_headless = json.loads(
+                    (appdata_headless / "qt-studio" / "settings.json").read_text(encoding="utf-8")
+                )
+                self.assertIs(persisted_headless["settings"]["keepInBackground"], True)
+            finally:
+                headless_upgraded.writes.shutdown(wait=True)
+
+        # 3. Pre-#41 cloud-paired user (cloudAgentEnabled:true + agent-cloud.json).
+        appdata_cloud = make_env("Profile Γ — Cloud Relay")
+        pairing = agent_cloud.new_pairing("https://relay.supermd.example")
+        agent_cloud.write_cloud_config(
+            appdata_cloud / "qt-studio" / "agent-cloud.json",
+            agent_cloud.device_config(pairing),
+        )
+        atomic_json(
+            appdata_cloud / "qt-studio" / "settings.json",
+            {"settings": {"cloudAgentEnabled": True, "theme": "dark"}, "recent": [], "pinned": []},
+        )
+        with patch.object(
+            QStandardPaths,
+            "writableLocation",
+            side_effect=lambda k, p=appdata_cloud: str(p) if k == QStandardPaths.AppDataLocation else orig_writable(k),
+        ):
+            cloud_upgraded = Session(False)
+            try:
+                self.assertIs(cloud_upgraded.settings["keepInBackground"], True)
+                self.assertIs(cloud_upgraded.settings["cloudAgentEnabled"], True)
+            finally:
+                cloud_upgraded.writes.shutdown(wait=True)
+
+        # 4. Pre-#41 ordinary reader-only user, malformed explicit keepInBackground values,
+        #    and corrupted settings.json preservation.
+        appdata_reader = make_env("Profile Δ — Reader Only")
+        atomic_json(
+            appdata_reader / "qt-studio" / "settings.json",
+            {
+                "settings": {
+                    "theme": "sepia",
+                    "font": "Literata",
+                    "agentAccessEnabled": False,
+                    "cloudAgentEnabled": False,
+                },
+                "recent": [recent_note],
+                "pinned": [],
+            },
+        )
+        with patch.object(
+            QStandardPaths,
+            "writableLocation",
+            side_effect=lambda k, p=appdata_reader: str(p) if k == QStandardPaths.AppDataLocation else orig_writable(k),
+        ):
+            reader_upgraded = Session(False)
+            try:
+                self.assertIs(reader_upgraded.settings["keepInBackground"], False)
+            finally:
+                reader_upgraded.writes.shutdown(wait=True)
+
+            for malformed in ("true", 1, ["true"], {"enabled": True}):
+                atomic_json(
+                    appdata_reader / "qt-studio" / "settings.json",
+                    {"settings": {"keepInBackground": malformed, "agentAccessEnabled": True}},
+                )
+                malformed_session = Session(False)
+                try:
+                    self.assertIs(malformed_session.settings["keepInBackground"], False)
+                finally:
+                    malformed_session.writes.shutdown(wait=True)
+
+            corrupt_bytes = b'{"settings": {"agentAccessEnabled": true, "broken": '
+            (appdata_reader / "qt-studio" / "settings.json").write_bytes(corrupt_bytes)
+            (appdata_reader / "background-service.log").write_text("daemon log\n", encoding="utf-8")
+            corrupt_session = Session(False)
+            try:
+                self.assertIs(corrupt_session.settings["keepInBackground"], True)
+                self.assertEqual((appdata_reader / "qt-studio" / "settings.json").read_bytes(), corrupt_bytes)
+            finally:
+                corrupt_session.writes.shutdown(wait=True)
+
+
+_HEADLESS_DAEMON_BOOTSTRAP = """
+import os, sys
+from pathlib import Path
+
+os.environ["QT_QPA_PLATFORM"] = "offscreen"
+os.environ["QT_QUICK_BACKEND"] = "software"
+os.environ.setdefault("QTWEBENGINE_CHROMIUM_FLAGS", "--disable-gpu --disable-dev-shm-usage")
+os.environ.setdefault("QTWEBENGINE_DISABLE_SANDBOX", "1")
+
+appdata = os.environ["SUPERMD_TEST_APPDATA"]
+downloads = os.environ["SUPERMD_TEST_DOWNLOADS"]
+desktop_dir = os.environ["SUPERMD_TEST_DESKTOP_DIR"]
+cache_dir = str(Path(appdata) / "cache")
+xdg_data_dir = str(Path(appdata) / "xdg-data")
+Path(cache_dir).mkdir(parents=True, exist_ok=True)
+Path(xdg_data_dir).mkdir(parents=True, exist_ok=True)
+os.environ["XDG_CACHE_HOME"] = cache_dir
+os.environ["XDG_DATA_HOME"] = xdg_data_dir
+if desktop_dir not in sys.path:
+    sys.path.insert(0, desktop_dir)
+
+import graphics_runtime
+graphics_runtime.configure(safe=True)
+
+from PySide6.QtCore import QStandardPaths
+from PySide6.QtWidgets import QSystemTrayIcon
+import python_runtime
+
+orig_writable = QStandardPaths.writableLocation
+def _patched_writable(kind):
+    if kind in (QStandardPaths.AppDataLocation, QStandardPaths.AppLocalDataLocation):
+        return appdata
+    if kind == QStandardPaths.DownloadLocation:
+        return downloads
+    if kind in (QStandardPaths.CacheLocation, QStandardPaths.GenericCacheLocation):
+        return cache_dir
+    return orig_writable(kind)
+
+QStandardPaths.writableLocation = staticmethod(_patched_writable)
+QSystemTrayIcon.isSystemTrayAvailable = staticmethod(lambda: False)
+python_runtime.discover = lambda *_a, **_kw: []
+
+from studio import Studio
+Studio._restore_update = lambda self: None
+
+def _record_headless_loader_state():
+    import json as _json
+    from PySide6.QtCore import QObject as _QObject
+    from PySide6.QtWidgets import QApplication as _QApp
+    app_inst = _QApp.instance()
+    if app_inst is None:
+        return
+    for widget in app_inst.allWindows():
+        loader = widget.findChild(_QObject, "documentReaderLoader")
+        if loader is not None:
+            (Path(appdata) / "headless-loader-state.json").write_text(
+                _json.dumps(
+                    {
+                        "visible": bool(widget.isVisible()),
+                        "windowEverShown": bool(widget.property("windowEverShown")),
+                        "readerActive": bool(loader.property("active")),
+                        "readerMounted": widget.findChild(_QObject, "documentReader") is not None,
+                    }
+                ),
+                encoding="utf-8",
+            )
+            break
+
+from PySide6.QtCore import QTimer as _HeadlessProbeTimer
+_orig_studio_init_probe = Studio.__init__
+def _probe_studio_init(self, *a, **kw):
+    _orig_studio_init_probe(self, *a, **kw)
+    _HeadlessProbeTimer.singleShot(0, _record_headless_loader_state)
+Studio.__init__ = _probe_studio_init
+
+import main as desktop_main
+sys.argv = [str(Path(desktop_dir) / "main.py"), "--background", "--agent-access", "--safe-graphics"]
+desktop_main._exit_process(desktop_main.main())
+"""
+
 
 _IPC_WORKER = """
-import contextlib, io, json, sys
+import contextlib, io, json, os, subprocess as real_subprocess, sys, threading, time
 from unittest.mock import MagicMock, patch
 from PySide6.QtCore import QCoreApplication, QStandardPaths
 app = QCoreApplication.instance() or QCoreApplication(["super-md"])
 orig = QStandardPaths.writableLocation
 import agent_cli, background_cli
 from instance import InstanceBroker
+_spawned_lock = threading.Lock()
+_spawned_procs = []
+def _reap_loop():
+    while True:
+        with _spawned_lock:
+            alive = []
+            for p in _spawned_procs:
+                if p.poll() is None:
+                    alive.append(p)
+            _spawned_procs[:] = alive
+        time.sleep(0.03)
+threading.Thread(target=_reap_loop, daemon=True).start()
 cin, cout = sys.stdin, sys.stdout
 for raw in cin:
     cmd = json.loads(raw)
@@ -390,12 +712,41 @@ for raw in cin:
             cout.write(json.dumps({"claimed": claimed}) + "\\n"); cout.flush()
         else:
             out, err, marker = io.StringIO(), io.StringIO(), cmd.get("spawnMarker")
-            def fake_popen(spawn_cmd, **_kw):
+            real_spawn = cmd.get("realSpawn")
+            orig_popen = real_subprocess.Popen
+            def _write_marker(path, data):
+                tmp = path + ".tmp"
+                with open(tmp, "w", encoding="utf-8") as fh:
+                    fh.write(json.dumps(data))
+                os.replace(tmp, path)
+            def fake_popen(spawn_cmd, **kwargs):
+                if real_spawn:
+                    env = dict(os.environ)
+                    env["SUPERMD_TEST_APPDATA"] = appdata
+                    env["SUPERMD_TEST_DOWNLOADS"] = cmd["downloads"]
+                    env["SUPERMD_TEST_DESKTOP_DIR"] = cmd["desktopDir"]
+                    for ek, ev in (cmd.get("extraEnv") or {}).items():
+                        env[str(ek)] = str(ev)
+                    proc = orig_popen(
+                        [sys.executable, "-u", "-c", cmd["daemonBootstrap"]],
+                        stdin=kwargs.get("stdin"),
+                        stdout=kwargs.get("stdout"),
+                        stderr=kwargs.get("stderr"),
+                        env=env,
+                        start_new_session=kwargs.get("start_new_session", False),
+                        creationflags=kwargs.get("creationflags", 0),
+                    )
+                    with _spawned_lock:
+                        _spawned_procs.append(proc)
+                    if marker:
+                        _write_marker(marker, {"cmd": spawn_cmd, "pid": proc.pid})
+                    return proc
                 if not marker: raise AssertionError("Unexpected Popen")
-                open(marker, "w", encoding="utf-8").write(json.dumps(spawn_cmd)); return MagicMock()
+                _write_marker(marker, spawn_cmd); return MagicMock()
             with patch.object(background_cli.subprocess, "Popen", side_effect=fake_popen), patch.object(sys, "stdin", io.StringIO("")), contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
                 try: code = agent_cli.main(["service", cmd["action"]])
                 except SystemExit as exc: code = exc.code if isinstance(exc.code, int) else 1
+                except Exception as exc: err.write(repr(exc)); code = 1
             cout.write(json.dumps({"code": code, "stdout": out.getvalue(), "stderr": err.getvalue()}) + "\\n"); cout.flush()
 """
 
@@ -410,7 +761,13 @@ class InstanceBrokerAndServiceCliTests(unittest.TestCase):
             [sys.executable, "-u", "-c", _IPC_WORKER],
             stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
             text=True, encoding="utf-8",
-            env={**os.environ, "QT_QPA_PLATFORM": "offscreen", "PYTHONPATH": str(DESKTOP_DIR)},
+            env={
+                **os.environ,
+                "QT_QPA_PLATFORM": "offscreen",
+                "PYTHONPATH": str(DESKTOP_DIR),
+                "PYTHONUTF8": "1",
+                "PYTHONIOENCODING": "utf-8",
+            },
         )
 
     @classmethod
@@ -433,6 +790,7 @@ class InstanceBrokerAndServiceCliTests(unittest.TestCase):
         self.temp_appdata = Path(tempfile.mkdtemp(prefix="supermd-ipc-")).resolve()
         self.addCleanup(lambda: shutil.rmtree(self.temp_appdata, ignore_errors=True))
         orig = QStandardPaths.writableLocation
+        self._orig_writable = orig
         patcher = patch.object(QStandardPaths, "writableLocation", side_effect=lambda k: str(self.temp_appdata) if k == QStandardPaths.AppDataLocation else orig(k))
         patcher.start()
         self.addCleanup(patcher.stop)
@@ -529,30 +887,1003 @@ class InstanceBrokerAndServiceCliTests(unittest.TestCase):
         # Simulate aboutToQuit closing the IPC server shortly before lock release.
         self.broker.server.close()
         self.assertEqual(self._service("status")[1]["result"]["running"], False)
-        QTimer_released = []
+        release_state = {"started": time.monotonic(), "unlocked": False}
         def release_soon():
-            if not QTimer_released:
-                QTimer_released.append(True)
-                threading.Timer(0.15, self.broker.lock.unlock).start()
+            if not release_state["unlocked"] and time.monotonic() - release_state["started"] >= 0.15:
+                release_state["unlocked"] = True
+                self.broker.lock.unlock()
         claim_res = self._call({"kind": "claim", "note": None, "appdata": str(self.temp_appdata)}, on_tick=release_soon)
         self.assertIs(claim_res["claimed"], True)
         self.broker.close()
         self.assertEqual(self._service("stop")[1]["result"], {"running": False, "action": "stop", "quitRequested": False})
 
-        spawned, marker = [], self.temp_appdata / "spawned.json"
+        # Simulate cold start where InstanceBroker binds QLocalServer immediately in claim_or_forward(),
+        # then main.py blocks >2.0s initializing WebEngine/QML before entering app.exec().
+        spawned, cold_state, marker = [], {}, self.temp_appdata / "spawned.json"
         def bring_up_daemon():
             if marker.is_file() and not spawned:
                 spawned.append(json.loads(marker.read_text(encoding="utf-8")))
+                cold_state["bound_at"] = time.monotonic()
+                self.broker.server.newConnection.disconnect(self.broker.accept)
+                self.assertTrue(self.broker.claim_or_forward(None))
+            elif spawned and not cold_state.get("event_loop_ready") and time.monotonic() - cold_state["bound_at"] >= 2.4:
+                cold_state["event_loop_ready"] = True
                 self.session.settings["agentAccessEnabled"] = True
                 self.session.agent_bridge.start()
                 self.session.background.set_forced(True)
-                self.assertTrue(self.broker.claim_or_forward(None))
+                self.broker.server.newConnection.connect(self.broker.accept)
+                self.broker.accept()
 
-        res = self._call({"kind": "service", "action": "start", "appdata": str(self.temp_appdata), "spawnMarker": str(marker)}, on_tick=bring_up_daemon, timeout=10.0)
-        self.assertEqual(res["code"], 0)
+        res = self._call({"kind": "service", "action": "start", "appdata": str(self.temp_appdata), "spawnMarker": str(marker)}, on_tick=bring_up_daemon, timeout=12.0)
+        self.assertEqual(res["code"], 0, res)
         self.assertTrue(json.loads(res["stdout"])["result"]["running"])
         self.assertIn("--background", spawned[0])
         self.assertIn("--agent-access", spawned[0])
+
+    def _service_for_appdata(self, appdata: Path, action: str, **extra):
+        log_path = appdata / "background-service.log"
+        try:
+            res = self._call(
+                {"kind": "service", "action": action, "appdata": str(appdata), **extra},
+                timeout=75.0 if extra.get("realSpawn") else 15.0,
+            )
+        except AssertionError as exc:
+            log_tail = log_path.read_text(encoding="utf-8", errors="replace")[-3000:] if log_path.is_file() else ""
+            raise AssertionError(f"{exc}; log={log_tail}") from exc
+        log_tail = log_path.read_text(encoding="utf-8", errors="replace")[-2000:] if log_path.is_file() else ""
+        self.assertTrue(res["stdout"].strip(), f"Empty CLI output; stderr={res['stderr']}; log={log_tail}")
+        return res["code"], json.loads(res["stdout"])
+
+    def _dispatch_headless_live_request(self, studio, raw_request: str):
+        req = json.loads(raw_request)
+        action = req.get("action")
+        bridge = studio.session.agent_bridge
+        if action == "list_tabs":
+            bridge.complete(req["requestId"], {"tabs": req.get("tabs", [])}, "", window_id=studio.window_id)
+        elif action == "flush_current":
+            bridge.complete(req["requestId"], {"ok": True}, "", window_id=studio.window_id)
+        else:
+            bridge.complete(req["requestId"], None, f"Unexpected headless request: {action}", window_id=studio.window_id)
+
+    def _live_call(self, client: LiveTabClient, action: str, **kwargs) -> dict:
+        holder, errs, done = {}, [], []
+        def run_client():
+            try:
+                holder["result"] = client._call(action, **kwargs)
+            except BaseException as exc:
+                errs.append(exc)
+            finally:
+                done.append(True)
+        worker = threading.Thread(target=run_client, daemon=True)
+        worker.start()
+        deadline = time.monotonic() + 8.0
+        while not done and time.monotonic() < deadline:
+            self.qt_app.processEvents()
+            time.sleep(0.005)
+        worker.join(timeout=1.0)
+        self.qt_app.processEvents()
+        if errs:
+            raise errs[0]
+        self.assertIn("result", holder, f"LiveTabClient({action}) timed out")
+        return holder["result"]
+
+    def test_cli_service_matrix_against_no_instance_with_unicode_appdata(self):
+        self.broker.close()
+        unicode_appdata = (self.temp_appdata / "Super MD — Ελληνικά & 日本語 (2026)").resolve()
+        unicode_appdata.mkdir(parents=True, exist_ok=True)
+
+        code, status_payload = self._service_for_appdata(unicode_appdata, "status")
+        self.assertEqual(code, 0)
+        self.assertEqual(status_payload, {"ok": True, "result": {"running": False, "action": "status"}})
+
+        code, stop_payload = self._service_for_appdata(unicode_appdata, "stop")
+        self.assertEqual(code, 0)
+        self.assertEqual(
+            stop_payload,
+            {"ok": True, "result": {"running": False, "action": "stop", "quitRequested": False}},
+        )
+
+        marker = unicode_appdata / "cold-spawn.json"
+        with patch.object(
+            QStandardPaths,
+            "writableLocation",
+            side_effect=lambda kind: str(unicode_appdata)
+            if kind == QStandardPaths.AppDataLocation
+            else self._orig_writable(kind),
+        ):
+            cold_broker = InstanceBroker(self.qt_app, service_handler=self.session.background.handle_service_request)
+            self.addCleanup(cold_broker.close)
+
+            def on_cold_tick():
+                if marker.is_file() and not cold_broker.server.isListening():
+                    self.session.settings["agentAccessEnabled"] = True
+                    self.session.agent_bridge.start()
+                    self.session.background.set_forced(True)
+                    self.assertTrue(cold_broker.claim_or_forward(None))
+
+            res = self._call(
+                {
+                    "kind": "service",
+                    "action": "start",
+                    "appdata": str(unicode_appdata),
+                    "spawnMarker": str(marker),
+                },
+                on_tick=on_cold_tick,
+                timeout=10.0,
+            )
+            self.assertEqual(res["code"], 0)
+            self.assertEqual(
+                json.loads(res["stdout"]),
+                {
+                    "ok": True,
+                    "result": {
+                        "running": True,
+                        "action": "start",
+                        "sessionsDirectory": str(unicode_appdata / "qt-studio" / "agent-sessions"),
+                    },
+                },
+            )
+            self.assertTrue((unicode_appdata / "background-service.log").is_file())
+
+    def test_cli_service_matrix_against_gui_instance_with_keep_in_background_off(self):
+        rich_draft = (
+            "# Navier–Stokes Regularity Notes (Draft)\n\n"
+            "$$\\partial_t u + (u \\cdot \\nabla)u = -\\nabla p + \\nu \\Delta u$$\n\n"
+            "| Regime | Reynolds $Re$ | Behavior |\n|---|---:|---|\n| Laminar | 120 | Stable |\n"
+        )
+        self.studio._current().update(
+            name="Navier-Stokes — Draft.md",
+            content=rich_draft,
+            saved="# Navier–Stokes Regularity Notes\n",
+        )
+        self.assertIs(self.session.settings["keepInBackground"], False)
+        self.assertFalse(self.session.background.enabled or self.session.agent_bridge.enabled)
+
+        code, status_payload = self._service("status")
+        self.assertEqual(code, 0)
+        self.assertEqual(
+            status_payload,
+            {"ok": True, "result": {"running": False, "action": "status", "agentAccess": False}},
+        )
+
+        code, start_payload = self._service("start")
+        self.assertEqual(code, 2)
+        self.assertFalse(start_payload["ok"])
+        self.assertEqual(start_payload["error"]["type"], "ValueError")
+        self.assertIn("Settings", start_payload["error"]["message"])
+        self.assertFalse(self.session.background.enabled or self.session.agent_bridge.enabled)
+
+        code, stop_payload = self._service("stop")
+        self.assertEqual(code, 0)
+        self.assertEqual(
+            stop_payload,
+            {"ok": True, "result": {"running": False, "action": "stop", "quitRequested": False}},
+        )
+        self.assertTrue(self.studio.host_window.isVisible() and not self.studio.retired)
+        self.assertEqual(self.studio._current()["content"], rich_draft)
+
+    def test_cli_service_matrix_against_gui_instance_with_keep_in_background_on(self):
+        portable_png = (
+            "data:image/png;base64,"
+            "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR4nGP4z8DwHwAFAAH/iZk9HQAAAABJRU5ErkJggg=="
+        )
+        portable_note = self.temp_appdata / "Spectroscopy — λ=532nm.smd"
+        markdown_body = (
+            "# Raman Spectroscopy Run (λ = 532 nm)\n\n"
+            "![Calibration peak](assets/peak-532nm.png)\n\n"
+            "$$I(\\omega) = I_0 \\frac{\\Gamma^2}{(\\omega - \\omega_0)^2 + \\Gamma^2}$$\n"
+        )
+        write_portable(portable_note, markdown_body, {"assets/peak-532nm.png": portable_png})
+        self.studio._current().update(
+            name=portable_note.name,
+            path=str(portable_note),
+            content=markdown_body + "\n- Unsaved baseline correction note\n",
+            saved=markdown_body,
+            assets={"assets/peak-532nm.png": portable_png},
+            saved_assets={"assets/peak-532nm.png": portable_png},
+            portable=True,
+        )
+
+        self.studio.setting("keepInBackground", "true")
+        self.assertIs(self.session.settings["keepInBackground"], True)
+        self.assertFalse(self.session.settings["agentAccessEnabled"] or self.session.agent_bridge.enabled)
+
+        code, status_before = self._service("status")
+        self.assertEqual(code, 0)
+        self.assertEqual(
+            status_before,
+            {"ok": True, "result": {"running": True, "action": "status", "agentAccess": False}},
+        )
+
+        code, start_payload = self._service("start")
+        self.assertEqual(code, 0)
+        self.assertEqual(
+            start_payload,
+            {
+                "ok": True,
+                "result": {
+                    "running": True,
+                    "action": "start",
+                    "sessionsDirectory": str(self.session.agent_bridge.discovery_dir),
+                },
+            },
+        )
+        self.assertTrue(self.session.agent_bridge.enabled and self.session.agent_bridge.discovery_path.is_file())
+
+        self.studio.host_window.hide()
+        self.session.background.handle_window_visibility(self.studio)
+        self.assertTrue(self.session.agent_bridge.enabled)
+
+        code, status_during = self._service("status")
+        self.assertEqual(code, 0)
+        self.assertEqual(
+            status_during,
+            {"ok": True, "result": {"running": True, "action": "status", "agentAccess": True}},
+        )
+
+        self.studio.host_window.show()
+        self.session.background.handle_window_visibility(self.studio)
+        code, stop_open = self._service("stop")
+        self.assertEqual(code, 0)
+        self.assertEqual(
+            stop_open,
+            {"ok": True, "result": {"running": False, "action": "stop", "quitRequested": False}},
+        )
+        self.assertFalse(
+            self.session.background.enabled
+            or self.session.settings["keepInBackground"]
+            or self.session.agent_bridge.enabled
+        )
+        self.assertTrue(self.studio.host_window.isVisible())
+        self.assertIn("Unsaved baseline correction", self.studio._current()["content"])
+
+        self.studio.setting("keepInBackground", "true")
+        self.studio.host_window.hide()
+        self.session.background.handle_window_visibility(self.studio)
+        code, hidden_status = self._service("status")
+        self.assertEqual(code, 0)
+        self.assertEqual(
+            hidden_status,
+            {"ok": True, "result": {"running": True, "action": "status", "agentAccess": False}},
+        )
+        with patch.object(self.studio, "closeWindowSafely", side_effect=self.studio.allowClose.emit):
+            code, hidden_stop = self._service("stop")
+            self.qt_app.processEvents()
+        self.assertEqual(code, 0)
+        self.assertEqual(
+            hidden_stop,
+            {"ok": True, "result": {"running": False, "action": "stop", "quitRequested": True}},
+        )
+        self.assertTrue(self.app_stub.ended)
+
+    def test_cli_service_matrix_and_migration_for_running_headless_background_agent_access_instance(self):
+        self.broker.close()
+        daemon_appdata = (self.temp_appdata / "Headless Daemon — Δt & 漢字").resolve()
+        daemon_downloads = (self.temp_appdata / "Exports — Δt").resolve()
+        daemon_appdata.mkdir(parents=True, exist_ok=True)
+        daemon_downloads.mkdir(parents=True, exist_ok=True)
+        spawn_marker = daemon_appdata / "real-daemon-spawn.json"
+
+        def cleanup_real_daemon():
+            if not spawn_marker.is_file():
+                return
+            try:
+                pid = json.loads(spawn_marker.read_text(encoding="utf-8")).get("pid")
+            except Exception:
+                pid = None
+            if not pid:
+                return
+            try:
+                if os.name == "nt":
+                    subprocess.run(["taskkill", "/PID", str(pid), "/T", "/F"], capture_output=True, check=False)
+                else:
+                    import signal
+                    os.kill(pid, signal.SIGTERM)
+            except OSError:
+                pass
+
+        self.addCleanup(cleanup_real_daemon)
+
+        # Phase 1: An ALREADY-RUNNING pre-#41 headless `--background --agent-access` daemon
+        # (pre-#41 `ok\n` IPC socket + live QtBridge + background-service.log + no keepInBackground in settings.json)
+        # continues serving the upgraded CLI (`status`, `start`, live note edits, `stop`) and migrates cleanly on restart.
+        (daemon_appdata / "background-service.log").write_text(
+            "Super MD pre-#41 headless background daemon started\n",
+            encoding="utf-8",
+        )
+        legacy_settings_payload = {
+            "settings": {
+                "font": "IBM Plex Sans",
+                "theme": "dark",
+                "widthPercent": 92,
+                "widthMigrated": True,
+            },
+            "recent": [],
+            "pinned": [],
+        }
+        (daemon_appdata / "qt-studio").mkdir(parents=True, exist_ok=True)
+        atomic_json(daemon_appdata / "qt-studio" / "settings.json", legacy_settings_payload)
+
+        legacy_socket_name = "supermd-qt-" + hashlib.sha256(str(daemon_appdata).encode()).hexdigest()[:20]
+        QLocalServer.removeServer(legacy_socket_name)
+        legacy_server = QLocalServer(self.qt_app)
+        legacy_server.setSocketOptions(QLocalServer.SocketOption.UserAccessOption)
+        legacy_wire_actions = []
+
+        with patch.object(
+            QStandardPaths,
+            "writableLocation",
+            side_effect=lambda kind: str(daemon_appdata)
+            if kind == QStandardPaths.AppDataLocation
+            else self._orig_writable(kind),
+        ), patch.object(python_runtime, "discover", return_value=[]), patch.object(
+            QuietStudio, "_restore_update", lambda _self: None
+        ):
+            legacy_session = Session(False)
+            legacy_session.settings["python"] = sys.executable
+            legacy_session.agent_bridge = agent_live.create_qt_bridge(legacy_session, legacy_session.data)
+            legacy_studio = QuietStudio(False, legacy_session)
+            legacy_studio.host_window = _VisibleHost(visible=False)
+            legacy_studio.tabs[0]["name"] = "Covariant Conservation.md"
+            legacy_studio.tabs[0]["content"] = "# Conservation Law\n\n$$\\nabla_\\mu T^{\\mu\\nu} = 0$$\n"
+            legacy_initial_revision = hashlib.sha256(
+                legacy_studio.tabs[0]["content"].encode("utf-8")
+            ).hexdigest()
+            legacy_studio.agentRequest.connect(
+                lambda raw, owner=legacy_studio: self._dispatch_headless_live_request(owner, raw)
+            )
+            legacy_session.agent_bridge.start()
+            # Restore authentic pre-#41 on-disk settings.json (no `keepInBackground` key yet while old process runs).
+            atomic_json(daemon_appdata / "qt-studio" / "settings.json", legacy_settings_payload)
+
+        def cleanup_legacy_headless():
+            legacy_server.close()
+            QLocalServer.removeServer(legacy_socket_name)
+            legacy_session.agent_bridge.stop()
+            legacy_studio.stop()
+            legacy_studio.pool.shutdown(wait=True, cancel_futures=True)
+            legacy_session.writes.shutdown(wait=True)
+
+        self.addCleanup(cleanup_legacy_headless)
+
+        def accept_legacy_headless():
+            while legacy_server.hasPendingConnections():
+                sock = legacy_server.nextPendingConnection()
+                buf = bytearray()
+
+                def on_legacy_read(sock=sock, buf=buf):
+                    buf.extend(bytes(sock.readAll()))
+                    if b"\n" not in buf:
+                        return
+                    req = json.loads(buf.split(b"\n", 1)[0])
+                    if set(req) == {"service"} and req["service"] in ("start", "status", "quit"):
+                        legacy_wire_actions.append(req["service"])
+                        sock.write(b"ok\n")
+                        sock.flush()
+                        sock.waitForBytesWritten(500)
+                        sock.disconnectFromServer()
+                        if req["service"] == "quit":
+                            legacy_session.agent_bridge.stop()
+                            legacy_server.close()
+                            QLocalServer.removeServer(legacy_socket_name)
+                        return
+                    sock.disconnectFromServer()
+
+                sock.readyRead.connect(on_legacy_read)
+                sock.disconnected.connect(sock.deleteLater)
+                on_legacy_read()
+
+        legacy_server.newConnection.connect(accept_legacy_headless)
+        self.assertTrue(legacy_server.listen(legacy_socket_name))
+
+        code, pre_upgrade_status = self._service_for_appdata(daemon_appdata, "status")
+        self.assertEqual(code, 0)
+        self.assertEqual(pre_upgrade_status, {"ok": True, "result": {"running": True, "action": "status"}})
+
+        # Upgraded CLI `service start` against running pre-#41 headless instance must NOT spawn a duplicate process.
+        code, pre_upgrade_start = self._service_for_appdata(daemon_appdata, "start")
+        self.assertEqual(code, 0)
+        self.assertFalse(spawn_marker.exists())
+        expected_sessions_dir = daemon_appdata / "qt-studio" / "agent-sessions"
+        self.assertEqual(
+            pre_upgrade_start,
+            {
+                "ok": True,
+                "result": {
+                    "running": True,
+                    "action": "start",
+                    "sessionsDirectory": str(expected_sessions_dir),
+                },
+            },
+        )
+
+        # Live agent operations continue uninterrupted against the running pre-#41 headless instance.
+        legacy_discovery_files = list(expected_sessions_dir.glob("*.json"))
+        self.assertEqual(len(legacy_discovery_files), 1)
+        legacy_live_client = self._live_call(
+            LiveTabClient(legacy_discovery_files[0]),
+            "patch_tab",
+            tabId=legacy_studio.tabs[0]["id"],
+            expectedRevision=legacy_initial_revision,
+            operations=[
+                {
+                    "type": "replace",
+                    "old": "$$\\nabla_\\mu T^{\\mu\\nu} = 0$$",
+                    "new": "$$\\nabla_\\mu T^{\\mu\\nu} = F^{\\nu\\lambda} J_\\lambda$$",
+                }
+            ],
+        )
+        self.assertTrue(legacy_live_client["changed"])
+        self.assertIn("F^{\\nu\\lambda} J_\\lambda", legacy_studio.tabs[0]["content"])
+
+        # Stopping the pre-#41 headless instance via upgraded CLI sends `"quit"` and revokes its discovery file.
+        code, pre_upgrade_stop = self._service_for_appdata(daemon_appdata, "stop")
+        self.assertEqual(code, 0)
+        self.assertEqual(
+            pre_upgrade_stop,
+            {"ok": True, "result": {"running": False, "action": "stop", "quitRequested": True}},
+        )
+        self.assertEqual(legacy_wire_actions, ["status", "start", "quit"])
+        self.assertEqual(list(expected_sessions_dir.glob("*.json")), [])
+        cleanup_legacy_headless()
+        self.assertNotIn(
+            "keepInBackground",
+            json.loads((daemon_appdata / "qt-studio" / "settings.json").read_text(encoding="utf-8"))["settings"],
+        )
+
+        # Phase 2: Post-upgrade `service start` spawns the real post-#41 headless `--background --agent-access` daemon,
+        # migrates persisted settings (`keepInBackground: True`), and serves live `.smd` agent operations.
+        code, start_payload = self._service_for_appdata(
+            daemon_appdata,
+            "start",
+            realSpawn=True,
+            downloads=str(daemon_downloads),
+            desktopDir=str(DESKTOP_DIR),
+            daemonBootstrap=_HEADLESS_DAEMON_BOOTSTRAP,
+            spawnMarker=str(spawn_marker),
+        )
+        self.assertEqual(
+            code,
+            0,
+            f"payload={start_payload}; log={(daemon_appdata / 'background-service.log').read_text(encoding='utf-8', errors='replace') if (daemon_appdata / 'background-service.log').is_file() else ''}",
+        )
+        self.assertTrue(start_payload["ok"] and start_payload["result"]["running"])
+        sessions_dir = Path(start_payload["result"]["sessionsDirectory"])
+        self.assertEqual(sessions_dir, expected_sessions_dir)
+        spawn_info = json.loads(spawn_marker.read_text(encoding="utf-8"))
+        self.assertIn("--background", spawn_info["cmd"])
+        self.assertIn("--agent-access", spawn_info["cmd"])
+        loader_state = json.loads((daemon_appdata / "headless-loader-state.json").read_text(encoding="utf-8"))
+        self.assertEqual(
+            loader_state,
+            {"visible": False, "windowEverShown": False, "readerActive": False, "readerMounted": False},
+        )
+        migrated_disk_settings = json.loads(
+            (daemon_appdata / "qt-studio" / "settings.json").read_text(encoding="utf-8")
+        )["settings"]
+        self.assertIs(migrated_disk_settings["keepInBackground"], True)
+        self.assertEqual(migrated_disk_settings["font"], "IBM Plex Sans")
+        self.assertEqual(migrated_disk_settings["theme"], "dark")
+
+        code, status_payload = self._service_for_appdata(daemon_appdata, "status")
+        self.assertEqual(code, 0)
+        self.assertEqual(
+            status_payload,
+            {"ok": True, "result": {"running": True, "action": "status", "agentAccess": True}},
+        )
+
+        code, second_start = self._service_for_appdata(daemon_appdata, "start")
+        self.assertEqual(code, 0)
+        self.assertEqual(
+            second_start,
+            {
+                "ok": True,
+                "result": {
+                    "running": True,
+                    "action": "start",
+                    "sessionsDirectory": str(sessions_dir),
+                },
+            },
+        )
+
+        discovery_files = list(sessions_dir.glob("*.json"))
+        self.assertEqual(len(discovery_files), 1)
+        client = LiveTabClient(discovery_files[0])
+        scientific_markdown = (
+            "# Magnetohydrodynamics Equilibrium — ∇×B = μ₀J\n\n"
+            "## Grad–Shafranov Formulation\n\n"
+            "$$\\Delta^* \\psi = -\\mu_0 R^2 \\frac{dp}{d\\psi} - F(\\psi)\\frac{dF}{d\\psi}$$\n\n"
+            "```mermaid\nflowchart LR\n  Plasma[Plasma Core] --> Limiter[Divertor Target]\n```\n\n"
+            "| Shot | $B_T$ (T) | $I_p$ (MA) |\n|---|---:|---:|\n| #10421 | 5.3 | 15.0 |\n"
+        )
+        created = client._call(
+            "create_document",
+            title="MHD Equilibrium — Iter",
+            content=scientific_markdown,
+            format="smd",
+            background=False,
+        )
+        self.assertEqual(created["format"], "smd")
+        self.assertTrue(created["isDirty"])
+        read_back = client.read_tab(created["tabId"], view="source")
+        self.assertIn("Grad–Shafranov Formulation", read_back["markdown"])
+
+        patched = client._call(
+            "patch_tab",
+            tabId=created["tabId"],
+            expectedRevision=created["revision"],
+            operations=[
+                {
+                    "type": "replace",
+                    "old": "| #10421 | 5.3 | 15.0 |",
+                    "new": "| #10421 | 5.3 | 15.0 |\n| #10422 | 5.4 | 15.2 |",
+                }
+            ],
+        )
+        self.assertTrue(patched["changed"])
+
+        saved = client._call(
+            "save_document",
+            tabId=created["tabId"],
+            expectedRevision=patched["revision"],
+            filename="mhd-equilibrium.smd",
+            saveAs=True,
+            format="smd",
+        )
+        saved_path = Path(saved["path"])
+        self.assertTrue(saved_path.is_file())
+        disk_md, disk_assets, disk_portable = open_note(saved_path)
+        self.assertTrue(disk_portable)
+        self.assertEqual(disk_assets, {})
+        self.assertIn("| #10422 | 5.4 | 15.2 |", disk_md)
+
+        # Phase 3: Immediate `stop` -> `start` handoff must never attach to a dying daemon or leave running:False;
+        # it waits for shutdown and spawns a fresh live daemon with a rotated discovery token.
+        first_pid = spawn_info["pid"]
+        first_discovery_name = discovery_files[0].name
+        code, stop_payload = self._service_for_appdata(daemon_appdata, "stop")
+        self.assertEqual(code, 0)
+        self.assertEqual(
+            stop_payload,
+            {"ok": True, "result": {"running": False, "action": "stop", "quitRequested": True}},
+        )
+        # Live discovery token must be revoked synchronously as soon as `service stop` returns.
+        self.assertEqual(list(sessions_dir.glob("*.json")), [])
+
+        code, restart_payload = self._service_for_appdata(
+            daemon_appdata,
+            "start",
+            realSpawn=True,
+            downloads=str(daemon_downloads),
+            desktopDir=str(DESKTOP_DIR),
+            daemonBootstrap=_HEADLESS_DAEMON_BOOTSTRAP,
+            spawnMarker=str(spawn_marker),
+        )
+        self.assertEqual(
+            code,
+            0,
+            f"payload={restart_payload}; log={(daemon_appdata / 'background-service.log').read_text(encoding='utf-8', errors='replace') if (daemon_appdata / 'background-service.log').is_file() else ''}",
+        )
+        self.assertTrue(restart_payload["ok"] and restart_payload["result"]["running"])
+        restarted_info = json.loads(spawn_marker.read_text(encoding="utf-8"))
+        self.assertNotEqual(restarted_info["pid"], first_pid)
+        restarted_discovery = list(sessions_dir.glob("*.json"))
+        self.assertEqual(len(restarted_discovery), 1)
+        self.assertNotEqual(restarted_discovery[0].name, first_discovery_name)
+
+        code, final_stop = self._service_for_appdata(daemon_appdata, "stop")
+        self.assertEqual(code, 0)
+        self.assertEqual(
+            final_stop,
+            {"ok": True, "result": {"running": False, "action": "stop", "quitRequested": True}},
+        )
+
+        from instance import is_process_exit_clear
+        lock_probe = QLockFile(str(daemon_appdata / "native-instance.lock"))
+        lock_probe.setStaleLockTime(0)
+        deadline = time.monotonic() + 10.0
+        fully_stopped = False
+        while time.monotonic() < deadline:
+            _, post_status = self._service_for_appdata(daemon_appdata, "status")
+            if not post_status["result"]["running"] and lock_probe.tryLock(0):
+                lock_probe.unlock()
+                if is_process_exit_clear(daemon_appdata):
+                    fully_stopped = True
+                    break
+            time.sleep(0.05)
+        self.assertTrue(fully_stopped, "Headless daemon did not exit and release lock promptly after service stop")
+        self.assertEqual(list(sessions_dir.glob("*.json")), [])
+        recovered_tabs = json.loads((daemon_appdata / "qt-studio" / "recovery.json").read_text(encoding="utf-8"))
+        self.assertTrue(any("F^{\\nu\\lambda} J_\\lambda" in tab.get("content", "") for tab in recovered_tabs))
+
+        with patch.object(
+            QStandardPaths,
+            "writableLocation",
+            side_effect=lambda kind: str(daemon_appdata)
+            if kind == QStandardPaths.AppDataLocation
+            else self._orig_writable(kind),
+        ):
+            reopened = Session(False)
+            try:
+                self.assertIs(reopened.settings["keepInBackground"], True)
+            finally:
+                reopened.writes.shutdown(wait=True)
+
+    def test_cli_service_matrix_against_legacy_ok_protocol_instance_and_malformed_replies(self):
+        self.broker.close()
+        legacy_appdata = (self.temp_appdata / "Legacy v0.4 Instance — Mixed Update").resolve()
+        legacy_appdata.mkdir(parents=True, exist_ok=True)
+        socket_name = "supermd-qt-" + hashlib.sha256(str(legacy_appdata).encode()).hexdigest()[:20]
+        QLocalServer.removeServer(socket_name)
+
+        received_wire_actions = []
+        held_sockets = []
+        reply_mode = {"kind": "legacy_ok"}
+        server = QLocalServer(self.qt_app)
+        server.setSocketOptions(QLocalServer.SocketOption.UserAccessOption)
+
+        def accept_legacy():
+            while server.hasPendingConnections():
+                sock = server.nextPendingConnection()
+                buf = bytearray()
+
+                def on_read(sock=sock, buf=buf):
+                    buf.extend(bytes(sock.readAll()))
+                    if b"\n" not in buf:
+                        return
+                    req = json.loads(buf.split(b"\n", 1)[0])
+                    mode = reply_mode["kind"]
+                    if mode == "legacy_ok":
+                        # Pre-#41 InstanceBroker contract: ONLY ("start", "status", "quit") are accepted.
+                        if set(req) == {"service"} and req["service"] in ("start", "status", "quit"):
+                            received_wire_actions.append(req["service"])
+                            sock.write(b"ok\n")
+                            sock.flush()
+                            sock.waitForBytesWritten(500)
+                        sock.disconnectFromServer()
+                    elif mode == "shutdown_close":
+                        sock.disconnectFromServer()
+                    elif mode == "hung":
+                        held_sockets.append(sock)
+                    elif mode == "garbage":
+                        sock.write(b"not-valid-json-and-not-ok\n")
+                        sock.flush()
+                        sock.waitForBytesWritten(500)
+                        sock.disconnectFromServer()
+                    elif mode == "json_array":
+                        sock.write(b"[1, 2, 3]\n")
+                        sock.flush()
+                        sock.waitForBytesWritten(500)
+                        sock.disconnectFromServer()
+
+                sock.readyRead.connect(on_read)
+                sock.disconnected.connect(sock.deleteLater)
+                on_read()
+
+        def cleanup_legacy_server():
+            for s in held_sockets:
+                try:
+                    s.disconnectFromServer()
+                except RuntimeError:
+                    pass
+            server.close()
+            QLocalServer.removeServer(socket_name)
+
+        server.newConnection.connect(accept_legacy)
+        self.assertTrue(server.listen(socket_name))
+        self.addCleanup(cleanup_legacy_server)
+
+        # 1. `status` against old-protocol instance replying `ok\n`
+        code, status_payload = self._service_for_appdata(legacy_appdata, "status")
+        self.assertEqual(code, 0)
+        self.assertEqual(status_payload, {"ok": True, "result": {"running": True, "action": "status"}})
+
+        # 2. `start` against old-protocol instance replying `ok\n` (no duplicate Popen)
+        code, start_payload = self._service_for_appdata(legacy_appdata, "start")
+        self.assertEqual(code, 0)
+        self.assertEqual(
+            start_payload,
+            {
+                "ok": True,
+                "result": {
+                    "running": True,
+                    "action": "start",
+                    "sessionsDirectory": str(legacy_appdata / "qt-studio" / "agent-sessions"),
+                },
+            },
+        )
+
+        # 3. `stop` against old-protocol instance sends wire action `"quit"` and parses `ok\n` cleanly
+        code, stop_payload = self._service_for_appdata(legacy_appdata, "stop")
+        self.assertEqual(code, 0)
+        self.assertEqual(
+            stop_payload,
+            {"ok": True, "result": {"running": False, "action": "stop", "quitRequested": True}},
+        )
+        self.assertEqual(received_wire_actions, ["status", "start", "quit"])
+
+        # 4. Shutting-down peer closing socket cleanly reports running:False; hung/malformed peers fail loudly.
+        reply_mode["kind"] = "shutdown_close"
+        code, closing_payload = self._service_for_appdata(legacy_appdata, "status")
+        self.assertEqual(code, 0)
+        self.assertEqual(closing_payload, {"ok": True, "result": {"running": False, "action": "status"}})
+
+        for broken_mode, expected_fragment in (
+            ("hung", "did not respond"),
+            ("garbage", "Invalid response"),
+            ("json_array", "Invalid response"),
+        ):
+            reply_mode["kind"] = broken_mode
+            code, err_payload = self._service_for_appdata(legacy_appdata, "status")
+            self.assertEqual(code, 2)
+            self.assertFalse(err_payload["ok"])
+            self.assertEqual(err_payload["error"]["type"], "ValueError")
+            self.assertIn(expected_fragment, err_payload["error"]["message"])
+
+    def test_hidden_occluded_reader_live_ops_and_post_unlock_teardown_restart(self):
+        self.broker.close()
+        from instance import is_process_exit_clear
+
+        occluded_appdata = (self.temp_appdata / "Occluded Hidden Daemon & C++ Teardown").resolve()
+        occluded_downloads = (self.temp_appdata / "Occluded Downloads").resolve()
+        occluded_appdata.mkdir(parents=True, exist_ok=True)
+        occluded_downloads.mkdir(parents=True, exist_ok=True)
+        spawn_marker = occluded_appdata / "spawn.json"
+        ready_marker = occluded_appdata / "reader-ready.txt"
+        sim_singleton = occluded_appdata / "sim-cpp-singleton.lock"
+
+        def cleanup_daemon():
+            if not spawn_marker.is_file():
+                return
+            try:
+                pid = json.loads(spawn_marker.read_text(encoding="utf-8")).get("pid")
+            except Exception:
+                pid = None
+            if not pid:
+                return
+            try:
+                if os.name == "nt":
+                    subprocess.run(["taskkill", "/PID", str(pid), "/T", "/F"], capture_output=True, check=False)
+                else:
+                    import signal
+                    os.kill(pid, signal.SIGTERM)
+            except OSError:
+                pass
+
+        self.addCleanup(cleanup_daemon)
+
+        occluded_teardown_bootstrap = (
+            """
+import os, sys, time
+_dd = os.environ["SUPERMD_TEST_DESKTOP_DIR"]
+if _dd not in sys.path:
+    sys.path.insert(0, _dd)
+from instance import _try_lock_lifecycle
+_sim_fd = os.open(os.environ["SUPERMD_TEST_SIM_SINGLETON"], os.O_RDWR | os.O_CREAT, 0o600)
+_sim_fh = os.fdopen(_sim_fd, "r+b")
+if _sim_fh.seek(0, os.SEEK_END) == 0:
+    _sim_fh.write(b"\\0")
+    _sim_fh.flush()
+if not _try_lock_lifecycle(_sim_fh):
+    sys.stderr.write("FATAL: Previous daemon still tearing down C++ resources after broker.close()!\\n")
+    sys.exit(1)
+"""
+            + _HEADLESS_DAEMON_BOOTSTRAP.replace(
+                "from studio import Studio\nStudio._restore_update = lambda self: None",
+                """from PySide6.QtCore import QTimer
+from studio import Studio
+Studio._restore_update = lambda self: None
+_orig_init = Studio.__init__
+def _occluded_init(self, *args, **kwargs):
+    _orig_init(self, *args, **kwargs)
+    def _force_hidden_ready():
+        if getattr(self, "host_window", None) is not None and not self.host_window.isVisible():
+            self.ready = True
+            self._emit(False)
+            self.readerCall.emit("window.supermdAgentRequest = function(){}; window.supermdFlush = function(){};")
+            Path(os.environ["SUPERMD_TEST_READY_MARKER"]).write_text("ready", encoding="utf-8")
+    QTimer.singleShot(50, _force_hidden_ready)
+Studio.__init__ = _occluded_init
+_orig_post = Studio.post
+def _occluded_post(self, id, command, raw):
+    _orig_post(self, id, command, raw)
+    if command == "reader_ready" and getattr(self, "host_window", None) is not None and not self.host_window.isVisible():
+        self.readerCall.emit("window.supermdAgentRequest = function(){}; window.supermdFlush = function(){};")
+Studio.post = _occluded_post""",
+            ).replace(
+                "desktop_main._exit_process(desktop_main.main())",
+                """rc = desktop_main.main()
+time.sleep(0.45)
+desktop_main._exit_process(rc)""",
+            )
+        )
+
+        extra_env = {
+            "SUPERMD_TEST_SIM_SINGLETON": str(sim_singleton),
+            "SUPERMD_TEST_READY_MARKER": str(ready_marker),
+        }
+
+        code, start_payload = self._service_for_appdata(
+            occluded_appdata,
+            "start",
+            realSpawn=True,
+            downloads=str(occluded_downloads),
+            desktopDir=str(DESKTOP_DIR),
+            daemonBootstrap=occluded_teardown_bootstrap,
+            spawnMarker=str(spawn_marker),
+            extraEnv=extra_env,
+        )
+        self.assertEqual(code, 0, start_payload)
+        first_pid = json.loads(spawn_marker.read_text(encoding="utf-8"))["pid"]
+        sessions_dir = Path(start_payload["result"]["sessionsDirectory"])
+
+        ready_deadline = time.monotonic() + 10.0
+        while not ready_marker.is_file() and time.monotonic() < ready_deadline:
+            time.sleep(0.05)
+        self.assertTrue(ready_marker.is_file(), "Hidden daemon Studio did not enter forced ready state")
+
+        discovery_files = list(sessions_dir.glob("*.json"))
+        self.assertEqual(len(discovery_files), 1)
+        client = LiveTabClient(discovery_files[0], timeout=3.0)
+
+        listed = client.list_tabs()
+        self.assertGreaterEqual(len(listed["tabs"]), 1)
+        self.assertTrue(all(not tab.get("active") for tab in listed["tabs"]))
+
+        created = client._call(
+            "create_document",
+            title="Occluded Hidden Daemon Note",
+            content="# Occluded Hidden Note\n\n$$\\oint E \\cdot dl = -\\frac{d\\Phi_B}{dt}$$\n",
+            format="smd",
+            background=False,
+        )
+        read_back = client.read_tab(created["tabId"], view="source")
+        self.assertIn("\\Phi_B", read_back["markdown"])
+        patched = client._call(
+            "patch_tab",
+            tabId=created["tabId"],
+            expectedRevision=created["revision"],
+            operations=[{"type": "replace", "old": "# Occluded Hidden Note", "new": "# Occluded Hidden Note (Patched)"}],
+        )
+        self.assertTrue(patched["changed"])
+        saved = client._call(
+            "save_document",
+            tabId=created["tabId"],
+            expectedRevision=patched["revision"],
+            filename="occluded-note.smd",
+            saveAs=True,
+            format="smd",
+        )
+        self.assertTrue(Path(saved["path"]).is_file())
+
+        # Immediate `stop` -> `start` must wait for Daemon 1's post-broker.close() exit teardown (0.45s)
+        # before spawning Daemon 2, never colliding on exclusive process-lifetime OS resources.
+        code, stop_payload = self._service_for_appdata(occluded_appdata, "stop")
+        self.assertEqual(code, 0)
+        self.assertTrue(stop_payload["result"]["quitRequested"])
+
+        code, restart_payload = self._service_for_appdata(
+            occluded_appdata,
+            "start",
+            realSpawn=True,
+            downloads=str(occluded_downloads),
+            desktopDir=str(DESKTOP_DIR),
+            daemonBootstrap=occluded_teardown_bootstrap,
+            spawnMarker=str(spawn_marker),
+            extraEnv=extra_env,
+        )
+        self.assertEqual(
+            code,
+            0,
+            f"payload={restart_payload}; log={(occluded_appdata / 'background-service.log').read_text(encoding='utf-8', errors='replace') if (occluded_appdata / 'background-service.log').is_file() else ''}",
+        )
+        second_pid = json.loads(spawn_marker.read_text(encoding="utf-8"))["pid"]
+        self.assertNotEqual(second_pid, first_pid)
+
+        code, final_stop = self._service_for_appdata(occluded_appdata, "stop")
+        self.assertEqual(code, 0)
+        self.assertTrue(final_stop["result"]["quitRequested"])
+        lock_probe = QLockFile(str(occluded_appdata / "native-instance.lock"))
+        lock_probe.setStaleLockTime(0)
+        deadline = time.monotonic() + 10.0
+        stopped = False
+        while time.monotonic() < deadline:
+            if lock_probe.tryLock(0):
+                lock_probe.unlock()
+                if is_process_exit_clear(occluded_appdata):
+                    stopped = True
+                    break
+            time.sleep(0.05)
+        self.assertTrue(stopped, "Restarted daemon did not fully exit after final stop")
+
+    def test_darwin_exit_bypass_and_vanished_closing_peer_start_handoff(self):
+        # 1. Verify _exit_process uses os._exit on darwin once Qt/WebEngine anchored teardown ran,
+        #    and uses sys.exit otherwise, always flushing stdio first.
+        import main as desktop_main
+
+        saved_anchor = list(desktop_main._DARWIN_EXIT_ANCHOR)
+        try:
+            desktop_main._DARWIN_EXIT_ANCHOR[:] = [object()]
+            with patch.object(desktop_main.sys, "platform", "darwin"), patch.object(
+                desktop_main.os, "_exit"
+            ) as mock_os_exit, patch.object(desktop_main.sys, "exit") as mock_sys_exit:
+                desktop_main._exit_process(0)
+                mock_os_exit.assert_called_once_with(0)
+                mock_sys_exit.assert_not_called()
+
+            desktop_main._DARWIN_EXIT_ANCHOR.clear()
+            with patch.object(desktop_main.sys, "platform", "darwin"), patch.object(
+                desktop_main.os, "_exit"
+            ) as mock_os_exit, patch.object(desktop_main.sys, "exit") as mock_sys_exit:
+                desktop_main._exit_process(0)
+                mock_os_exit.assert_not_called()
+                mock_sys_exit.assert_called_once_with(0)
+        finally:
+            desktop_main._DARWIN_EXIT_ANCHOR[:] = saved_anchor
+
+        # 2. Simulate macOS XNU closing-socket race during `service start`:
+        #    the initial client connect writes to a dying server (e.g. UnknownSocketError / empty read
+        #    while the server was briefly still bound), and by the next millisecond both the server
+        #    socket and native-instance.lock are gone. `service start` must treat the vanished peer
+        #    as stopped and spawn the replacement daemon instead of failing with exit code 2.
+        self.broker.close()
+        vanished_appdata = (self.temp_appdata / "Vanished Peer On Start").resolve()
+        vanished_appdata.mkdir(parents=True, exist_ok=True)
+        socket_name = "supermd-qt-" + hashlib.sha256(str(vanished_appdata).encode()).hexdigest()[:20]
+        QLocalServer.removeServer(socket_name)
+
+        dying_server = QLocalServer(self.qt_app)
+        dying_server.setSocketOptions(QLocalServer.SocketOption.UserAccessOption)
+        held = []
+
+        def on_dying_connect():
+            while dying_server.hasPendingConnections():
+                sock = dying_server.nextPendingConnection()
+                held.append(sock)
+                if len(held) >= 2:
+                    for s in held:
+                        s.abort()
+                    dying_server.close()
+                    QLocalServer.removeServer(socket_name)
+
+        dying_server.newConnection.connect(on_dying_connect)
+        self.assertTrue(dying_server.listen(socket_name))
+        self.addCleanup(lambda: (dying_server.close(), QLocalServer.removeServer(socket_name)))
+
+        spawned, marker = [], vanished_appdata / "vanished-spawn.json"
+
+        def advance_vanish_race():
+            if marker.is_file() and not spawned:
+                spawned.append(json.loads(marker.read_text(encoding="utf-8")))
+                with patch.object(
+                    QStandardPaths,
+                    "writableLocation",
+                    side_effect=lambda k: str(vanished_appdata)
+                    if k == QStandardPaths.AppDataLocation
+                    else self._orig_writable(k),
+                ):
+                    fresh_replacement = InstanceBroker(
+                        self.qt_app, service_handler=self.session.background.handle_service_request
+                    )
+                    self.addCleanup(fresh_replacement.close)
+                    self.session.settings["agentAccessEnabled"] = True
+                    self.session.agent_bridge.start()
+                    self.session.background.set_forced(True)
+                    self.assertTrue(fresh_replacement.claim_or_forward(None))
+
+        res = self._call(
+            {
+                "kind": "service",
+                "action": "start",
+                "appdata": str(vanished_appdata),
+                "spawnMarker": str(marker),
+            },
+            on_tick=advance_vanish_race,
+            timeout=15.0,
+        )
+        self.assertEqual(res["code"], 0, res)
+        self.assertTrue(json.loads(res["stdout"])["result"]["running"])
+        self.assertEqual(len(spawned), 1)
 
 
 if __name__ == "__main__":

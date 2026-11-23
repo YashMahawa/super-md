@@ -28,6 +28,8 @@ ApplicationWindow {
     onSettingsOpenChanged: settingsOpen ? settingsDialog.open() : settingsDialog.close()
     property bool closingAllowed: false
     property bool intentionalShutdown: false
+    property bool windowEverShown: false
+    onVisibleChanged: if (visible) windowEverShown = true
     property bool readerRecoveryPending: false
     property bool readerRecoveryLoading: false
     property bool readerRecoveryExhausted: false
@@ -85,6 +87,16 @@ ApplicationWindow {
         }
         const requestId = JSON.stringify(request.requestId || "")
         const failure = "window.SuperMD?.post(" + requestId + ", 'agent_result', JSON.stringify({requestId:" + requestId + ",error:'reader is unavailable'}))"
+        if (!window.visible) {
+            if (request.action === "flush_current") {
+                studio.post(request.requestId || "", "agent_result", JSON.stringify({requestId: request.requestId, result: {flushed: false}, error: ""}))
+                return
+            }
+            if (request.action === "list_tabs") {
+                studio.post(request.requestId || "", "agent_result", JSON.stringify({requestId: request.requestId, result: {tabs: request.tabs || []}, error: ""}))
+                return
+            }
+        }
         if (!window.reader || !viewState.readerReady) {
             studio.post(request.requestId || "", "agent_result", JSON.stringify({requestId: request.requestId, error: "Reader is not ready"}))
             return
@@ -188,6 +200,7 @@ ApplicationWindow {
         case "zoom_in": window.runDocumentScript("window.supermdZoomBy?.(1.1)"); break
         case "zoom_out": window.runDocumentScript("window.supermdZoomBy?.(1/1.1)"); break
         case "zoom_reset": window.runDocumentScript("window.supermdResetZoom?.()"); break
+        case "typewriter_scroll": studio.setting("typewriterScroll", JSON.stringify(!viewState.settings.typewriterScroll)); break
         }
     }
     function focusReader() { if (reader) reader.forceActiveFocus() }
@@ -485,7 +498,7 @@ ApplicationWindow {
                     objectName: "documentReaderLoader"
                     Layout.fillWidth: true
                     Layout.fillHeight: true
-                    active: true
+                    active: window.visible || window.windowEverShown
                     sourceComponent: readerComponent
                     onItemChanged: window.readerViewChanged(item)
                 }

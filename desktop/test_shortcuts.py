@@ -25,6 +25,7 @@ class ShortcutValidationTest(unittest.TestCase):
         self.assertEqual(defaults["new_note"], ["Ctrl+T"])
         self.assertEqual(defaults["undo"], ["Ctrl+Z"])
         self.assertEqual(defaults["redo"], ["Ctrl+Shift+Z"])
+        self.assertEqual(defaults["typewriter_scroll"], ["Ctrl+Alt+T"])
         self.assertEqual(defaults["fullscreen"], ["F11", "Meta+Ctrl+F"])
         self.assertTrue(native_label(defaults["copy"][0]))
         if sys.platform == "darwin":

@@ -128,6 +128,8 @@ def main():
     broker = None if args.test_state else InstanceBroker(app)
     if broker and not broker.claim_or_forward(args.note):
         return 0
+    if broker:
+        broker.hold_process_exit_lock()
     channel = QFile(":/qtwebchannel/qwebchannel.js")
     if not channel.open(QIODevice.OpenModeFlag.ReadOnly):
         raise RuntimeError("Qt WebChannel runtime is unavailable")
@@ -501,7 +503,7 @@ def main():
     create_window(args.note,show_window=not args.background)
     if args.agent_access:session.agent_bridge.start()
     if broker:
-        app.aboutToQuit.connect(broker.server.close)
+        app.aboutToQuit.connect(broker.stop_accepting)
         broker.requested.connect(lambda note: open_from_service(note or None))
         broker.set_service_handler(session.background.handle_service_request)
     app.openRequested.connect(open_from_service)
@@ -526,7 +528,26 @@ def main():
     session.writes.shutdown(wait=True)
     if broker:
         broker.close()
+    if sys.platform == "darwin":
+        _DARWIN_EXIT_ANCHOR.append(app)
     return status
 
+
+_DARWIN_EXIT_ANCHOR = []
+
+
+def _exit_process(status: int) -> None:
+    sys.stdout.flush()
+    sys.stderr.flush()
+    if sys.platform == "darwin" and _DARWIN_EXIT_ANCHOR:
+        # QtWebEngineCore's C++ singleton destruction inside Py_FinalizeEx can
+        # stall on macOS Mach/renderer threads after QApplication.exec()
+        # returns. All studio saves, recovery writes, agent sessions, QML
+        # engines, and single-instance locks are already flushed and closed.
+        os._exit(int(status))
+    else:
+        sys.exit(status)
+
+
 if __name__ == "__main__":
-    sys.exit(main())
+    _exit_process(main())
