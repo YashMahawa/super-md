@@ -1,4 +1,4 @@
-import { Children, isValidElement, lazy, memo, Suspense, useCallback, useContext, useEffect, useMemo, useRef, useState, type ReactNode } from "react";
+import { Children, isValidElement, lazy, memo, Suspense, useContext, useEffect, useMemo, useRef, useState, type ReactNode } from "react";
 import { invoke } from "../nativeBridge";
 import CachedMarkdown,{type MarkdownBlockRenderer} from "./CachedMarkdown";
 import remarkGfm from "remark-gfm";
@@ -198,7 +198,40 @@ function MarkdownPreview({ markdown, documentPath, python, dark, trustedImageHos
   useEffect(installMediaMenu,[]);
   const analysis=useMemo(()=>sourceAnalysis?.source===markdown?sourceAnalysis.analysis:analyzeDocument(markdown),[markdown,sourceAnalysis]);
   const tasks=onChange?analysis.tasks:[];
-  const renderImage = useCallback(({src,alt}:{src?:string;alt?:string})=><AssetImage src={src} alt={alt} documentPath={documentPath} trustedImageHosts={trustedImageHosts} onTrustImageHost={onTrustImageHost}/>,[documentPath,trustedImageHosts,onTrustImageHost]);
+  const stateRef=useRef({markdown,documentPath,python,dark,trustedImageHosts,onTrustImageHost,onChange,analysis,tasks});
+  stateRef.current={markdown,documentPath,python,dark,trustedImageHosts,onTrustImageHost,onChange,analysis,tasks};
+  const components=useMemo<Components>(()=>({
+    p: MarkdownParagraph,
+    input: ({node: _node,...props}) => <input {...props} disabled={!stateRef.current.onChange} onChange={()=>{}} />,
+    li: ({node,children,...props}) => <li {...props} className={Array.isArray(node?.properties.className)?node.properties.className.join(' '):undefined} onChange={event=>{const {tasks:currentTasks,onChange:handleChange,markdown:sourceText}=stateRef.current;const index=Number(node?.properties['data-task-index']);const offset=currentTasks[index];if(offset===undefined || !handleChange || !(event.target instanceof HTMLInputElement))return;handleChange(sourceText.slice(0,offset)+(event.target.checked?'x':' ')+sourceText.slice(offset+1));}}>{children}</li>,
+    img: ({src,alt}) => {const {documentPath:docPath,trustedImageHosts:hosts,onTrustImageHost:trustHost}=stateRef.current;return <AssetImage src={src} alt={alt} documentPath={docPath} trustedImageHosts={hosts} onTrustImageHost={trustHost}/>;},
+    a: ({node:_node,href,children,...props}) => <a {...props} href={href} target={href?.startsWith("#") ? undefined : "_blank"} rel="noreferrer" onClick={event => { if (navigateHeading(event.currentTarget)) { event.preventDefault(); event.stopPropagation(); } else event.currentTarget.dataset.visited='true'; }}>{children}</a>,
+    pre: ({ node, children }) => {
+      const {markdown:sourceText,documentPath:docPath,python:py,dark:isDark,trustedImageHosts:hosts,onTrustImageHost:trustHost,analysis:docAnalysis}=stateRef.current;
+      const child = Children.only(children) as React.ReactElement<{ className?: string; children?: ReactNode }>;
+      const language = child.props.className?.match(/language-([\w-]+)/)?.[1];
+      const source = textOf(child.props.children).replace(/\n$/, "");
+      const nodeData=node as {position?:{start?:{offset?:number};end?:{offset?:number}};properties?:Record<string,unknown>}|undefined;
+      const startOffset=nodeData?.properties?.['data-source-start']??nodeData?.position?.start?.offset;
+      const endOffset=nodeData?.properties?.['data-source-end']??nodeData?.position?.end?.offset;
+      const offset=Number(startOffset);
+      const pythonCell=['python','py'].includes(language||'')?docAnalysis.pythonCells.find(cell=>cell.source===source&&cell.offset===offset):undefined;
+      const context=docPath&&pythonCell?{document:docPath,cell:String(pythonCell.ordinal),interpreter:py||'embedded'}:undefined;
+      const protectedBlock = (block: ReactNode) => <CodeBlockBoundary key={`${language}:${source}`} source={source}>{block}</CodeBlockBoundary>;
+      if (language === "smd-tree") return protectedBlock(<InlineDiagram diagram={parseBinaryTreeSource(source)}/>);
+      if (language === "smd-diagram") return protectedBlock(<InlineDiagram diagram={parseDiagramSource(source)}/>);
+      if (language === "smd-steps") return protectedBlock(<StepCards source={source} renderImage={(src,alt)=><AssetImage src={src} alt={alt} documentPath={docPath} trustedImageHosts={hosts} onTrustImageHost={trustHost}/>} renderChart={chartSource=><ThemedChart source={chartSource} dark={isDark}/>} renderMarkdown={text=><MarkdownPreview markdown={text} documentPath={docPath} python={py} dark={isDark} trustedImageHosts={hosts} onTrustImageHost={trustHost}/>} />);
+      if (language === "smd-chart") return protectedBlock(<ThemedChart source={source} dark={isDark} />);
+      if (language === "svg") return protectedBlock(<ThemedSvg source={source} dark={isDark} />);
+      if (language === "mermaid") return protectedBlock(<Suspense fallback={<span className="image-loading" role="status">Loading diagram…</span>}><ThemedMermaid source={source} dark={isDark} /></Suspense>);
+      if (language === "python" || language === "py") return protectedBlock(<PythonCell source={source} python={py} context={context} highlighted={child.props.children} />);
+      const rawStart=Number(startOffset),rawEnd=Number(endOffset);
+      const lineBreak=Number.isFinite(rawStart)?sourceText.indexOf("\n",rawStart):-1;
+      const bodyStart=lineBreak>=0&&( !Number.isFinite(rawEnd)||lineBreak<rawEnd )?lineBreak+1:undefined;
+      const bodyEnd=bodyStart!==undefined?Math.min(Number.isFinite(rawEnd)?rawEnd:bodyStart+source.length,bodyStart+source.length):undefined;
+      return <div className="code-container" data-source-start={startOffset as number|undefined} data-source-end={endOffset as number|undefined}><CopyCode source={source}/><details className="code-disclosure" open={source.split("\n").length <= 12}><summary>{language || "Code"} <span>{source.split("\n").length} lines</span></summary><pre data-source-start={bodyStart} data-source-end={bodyEnd}>{children}</pre></details></div>;
+    }
+  }),[]);
   return (
     <article className="markdown-body" onCopy={event=>{if(event.currentTarget.closest('.live-document'))return;const source=selectedMarkdown(window.getSelection(),markdown);if(source!==null){event.clipboardData.setData("text/plain",source);event.preventDefault();}}} onDragStart={event=>{if(!event.currentTarget.closest('.live-document'))setSelectedMarkdownDrag(event.nativeEvent,markdown);}}>
       <CachedMarkdown
@@ -207,31 +240,7 @@ function MarkdownPreview({ markdown, documentPath, python, dark, trustedImageHos
         windowingEnabled={!fullDocumentAccessibility}
         remarkPlugins={[remarkGfm, remarkMath, remarkObsidianMath, remarkSvgBlocks, remarkCallouts, remarkHeadingIds, remarkTaskPositions,remarkSourcePositions]}
         rehypePlugins={[rehypeKatex, rehypeHighlight]}
-        components={{
-          p: MarkdownParagraph,
-          input: ({node: _node,...props}) => <input {...props} disabled={!onChange} onChange={()=>{}} />,
-          li: ({node,children,...props}) => <li {...props} className={Array.isArray(node?.properties.className)?node.properties.className.join(' '):undefined} onChange={event=>{const index=Number(node?.properties['data-task-index']);const offset=tasks[index];if(offset===undefined || !onChange || !(event.target instanceof HTMLInputElement))return;onChange(markdown.slice(0,offset)+(event.target.checked?'x':' ')+markdown.slice(offset+1));}}>{children}</li>,
-          img: renderImage,
-          a: ({node:_node,href,children,...props}) => <a {...props} href={href} target={href?.startsWith("#") ? undefined : "_blank"} rel="noreferrer" onClick={event => { if (navigateHeading(event.currentTarget)) { event.preventDefault(); event.stopPropagation(); } else event.currentTarget.dataset.visited='true'; }}>{children}</a>,
-          pre: ({ node, children }) => {
-            const child = Children.only(children) as React.ReactElement<{ className?: string; children?: ReactNode }>;
-            const language = child.props.className?.match(/language-([\w-]+)/)?.[1];
-            const source = textOf(child.props.children).replace(/\n$/, "");
-            const nodeData=node as {position?:{start?:{offset?:number}};properties?:Record<string,unknown>}|undefined;
-            const offset=Number(nodeData?.properties?.['data-source-start']??nodeData?.position?.start?.offset);
-            const pythonCell=['python','py'].includes(language||'')?analysis.pythonCells.find(cell=>cell.source===source&&cell.offset===offset):undefined;
-            const context=documentPath&&pythonCell?{document:documentPath,cell:String(pythonCell.ordinal),interpreter:python||'embedded'}:undefined;
-            const protectedBlock = (block: ReactNode) => <CodeBlockBoundary key={`${language}:${source}`} source={source}>{block}</CodeBlockBoundary>;
-            if (language === "smd-tree") return protectedBlock(<InlineDiagram diagram={parseBinaryTreeSource(source)}/>);
-            if (language === "smd-diagram") return protectedBlock(<InlineDiagram diagram={parseDiagramSource(source)}/>);
-            if (language === "smd-steps") return protectedBlock(<StepCards source={source} renderImage={(src,alt)=><AssetImage src={src} alt={alt} documentPath={documentPath} trustedImageHosts={trustedImageHosts} onTrustImageHost={onTrustImageHost}/>} renderChart={chartSource=><ThemedChart source={chartSource} dark={dark}/>} renderMarkdown={text=><MarkdownPreview markdown={text} documentPath={documentPath} python={python} dark={dark} trustedImageHosts={trustedImageHosts} onTrustImageHost={onTrustImageHost}/>} />);
-            if (language === "smd-chart") return protectedBlock(<ThemedChart source={source} dark={dark} />);
-            if (language === "svg") return protectedBlock(<ThemedSvg source={source} dark={dark} />);
-            if (language === "mermaid") return protectedBlock(<Suspense fallback={<span className="image-loading" role="status">Loading diagram…</span>}><ThemedMermaid source={source} dark={dark} /></Suspense>);
-            if (language === "python" || language === "py") return protectedBlock(<PythonCell source={source} python={python} context={context} highlighted={child.props.children} />);
-            return <div className="code-container"><CopyCode source={source}/><details className="code-disclosure" open={source.split("\n").length <= 12}><summary>{language || "Code"} <span>{source.split("\n").length} lines</span></summary><pre>{children}</pre></details></div>;
-          }
-        }}
+        components={components}
       >{markdown}</CachedMarkdown>
     </article>
   );

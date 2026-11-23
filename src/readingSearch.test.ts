@@ -1,5 +1,5 @@
 import {describe,it,expect} from "vitest";
-import {replaceSourceMatches,sourceMatches} from "./components/ReadingSearch";
+import {nextSearchIndex,replaceSourceMatches,sourceMatches} from "./components/ReadingSearch";
 describe("source search",()=>{
   it("finds offscreen source, preserves case and literal punctuation",()=>{
     const content="A.b\n"+"long note\n".repeat(3000)+"a.B";
@@ -9,5 +9,13 @@ describe("source search",()=>{
   it("replaces literal text, not replacement dollar expressions or regex",()=>{
     expect(replaceSourceMatches("$x$ and $X$","$x$","$1 \\alpha",false,1)).toBe("$x$ and $1 \\alpha");
     expect(replaceSourceMatches("same SAME same","same","new",true)).toBe("new SAME new");
+  });
+  it("wraps backward from unselected 0/N state directly to N/N and steps forward to 1/N",()=>{
+    expect(nextSearchIndex(-1,-1,5)).toBe(4);
+    expect(nextSearchIndex(-1,1,5)).toBe(0);
+    expect(nextSearchIndex(0,-1,5)).toBe(4);
+    expect(nextSearchIndex(4,1,5)).toBe(0);
+    expect(nextSearchIndex(-1,-1,1)).toBe(0);
+    expect(nextSearchIndex(-1,-1,0)).toBe(-1);
   });
 });

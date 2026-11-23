@@ -235,7 +235,7 @@ function Reader() {
     };
     window.supermdHistory=direction=>{
       if(document.querySelector('.theme-guide-dialog'))return;
-      if(document.activeElement instanceof HTMLInputElement||document.activeElement instanceof HTMLTextAreaElement){document.execCommand(direction);return;}
+      if((document.activeElement instanceof HTMLInputElement&&!["checkbox","radio","range","button"].includes(document.activeElement.type))||document.activeElement instanceof HTMLTextAreaElement){document.execCommand(direction);return;}
       const current=reference.current;if(!current)return;
       replaying.current=true;
       const history=histories.current.get(current.id);const next=history?replayHistory(history,current.content,direction):undefined;
@@ -498,7 +498,7 @@ function Reader() {
       if(document.querySelector(".image-viewer,.math-repair-panel,.reading-search,.media-dialog"))return;
       // Leave a Live textarea's native editing history intact; Source and Read
       // route through the same bounded note history on hardware keyboards.
-      if(event.target instanceof HTMLInputElement || event.target instanceof HTMLTextAreaElement)return;
+      if((event.target instanceof HTMLInputElement && !["checkbox","radio","range","button"].includes(event.target.type)) || event.target instanceof HTMLTextAreaElement)return;
       event.preventDefault();event.stopImmediatePropagation();window.supermdHistory?.(key==="y"||event.shiftKey?"redo":"undo");
     };
     document.addEventListener("keydown",find,true);
@@ -702,7 +702,7 @@ function Reader() {
     </section></div>}
     {editError&&<div role="alert" className="reader-edit-error">{editError}</div>}
     <MediaThemeFilters colors={state.colors} dark={state.dark}/>
-    {searching && <ReadingSearch content={state.content} close={()=>setSearching(false)} onChange={update} sourceSession={state.mode==="editor"||state.mode==="split"?state.id:undefined}/>}
+    {searching && <ReadingSearch content={state.content} close={()=>setSearching(false)} onChange={state.mode==="reader"?undefined:update} sourceSession={state.mode==="editor"||state.mode==="split"?state.id:undefined}/>}
     <ImageViewer />
     {repairing && <MathRepairPanel content={state.content} apply={update} close={()=>setRepairing(false)} />}
     <MediaTools key={state.id} documentId={state.id} content={state.content} documentPath={state.path} onInsert={(text, point) => { const content = reference.current!.content; const from = Math.min(point?.from ?? content.length, content.length); const to = Math.max(from, Math.min(point?.to ?? from, content.length)); update(content.slice(0, from) + text + content.slice(to)); }} onNotice={(error) => { void invoke("export_failed", { error }); }} />
