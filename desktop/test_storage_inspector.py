@@ -1,5 +1,6 @@
 import json
 import os
+import sys
 import tempfile
 import threading
 import time
@@ -150,6 +151,7 @@ class StorageInspectorTest(unittest.TestCase):
 
     def test_studio_runs_inspection_off_ui_path_and_publishes_safe_report(self):
         session = Session(True)
+        session.settings["python"] = sys.executable
         studio = Studio(True, session)
         report = inspect_storage(session.data)
         with patch.object(studio_module, "inspect_storage", return_value=report):

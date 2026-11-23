@@ -2,8 +2,8 @@ export const SANDBOX_CHANNEL = "supermd-mermaid-sandbox" as const;
 export const MAX_MERMAID_SOURCE_CHARS = 250_000;
 export const MAX_SANDBOX_SVG_CHARS = 2_000_000;
 export const MAX_SANDBOX_ERROR_CHARS = 4_096;
-export const DEFAULT_HANDSHAKE_TIMEOUT_MS = 5_000;
-export const DEFAULT_RENDER_TIMEOUT_MS = 8_000;
+export const DEFAULT_HANDSHAKE_TIMEOUT_MS = 20_000;
+export const DEFAULT_RENDER_TIMEOUT_MS = 20_000;
 
 export type SandboxReadyMessage = {
   channel: typeof SANDBOX_CHANNEL;

@@ -289,8 +289,18 @@ export class MermaidSandboxClient {
     if (source.length > MAX_MERMAID_SOURCE_CHARS) {
       throw new Error("Mermaid diagram source exceeds maximum size.");
     }
-    const frame = await this.ensureFrame();
-    await frame.ready;
+    let frame: FrameInstance | null = null;
+    try {
+      frame = await this.ensureFrame();
+      await frame.ready;
+    } catch (error) {
+      if (frame && !frame.disposed) {
+        this.destroyFrame(frame, error instanceof Error ? error : new Error("Mermaid sandbox handshake failed."));
+      }
+      const fresh = await this.ensureFrame();
+      await fresh.ready;
+      return this.dispatchRender(fresh, id, source, dark);
+    }
 
     if (frame.disposed || !frame.iframe.isConnected || !frame.iframe.contentWindow) {
       this.destroyFrame(frame, new Error("Mermaid sandbox frame crashed."));

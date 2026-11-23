@@ -13,6 +13,13 @@ from documents import atomic_json
 import updates
 
 class QuietStudio(Studio):
+    def __init__(self, isolated=False, session=None):
+        if isolated:
+            session = session or Session(True)
+            if not session.settings.get("python"):
+                session.settings["python"] = sys.executable
+        super().__init__(isolated, session)
+
     def _refresh_theme(self):
         self.system_dark = True
 
@@ -296,6 +303,30 @@ class StudioTest(unittest.TestCase):
         studio._choose_default_python()
         studio._submit(lambda:1,lambda *_:self.fail("Retired callback ran"))
         studio._complete((lambda *_:self.fail("Retired callback ran"),None,None,False))
+
+    def test_default_python_selection_and_refresh_publish_discovered_choices(self):
+        studio = self.studio
+        studio.settings["python"] = ""
+        choices = [{"path": sys.executable, "label": "Virtual environment 3.13.0", "detail": ".venv · numpy + matplotlib ready",
+                    "matplotlib": True, "managed": False, "venv": True, "venvModule": True}]
+        pending = []
+        with patch.object(studio, "_submit", side_effect=lambda action, done, *_: pending.append((action, done))), \
+             patch("python_runtime.preferred", return_value=sys.executable) as preferred, \
+             patch("python_runtime.discover", return_value=choices) as discover:
+            studio._choose_default_python()
+            action, done = pending.pop()
+            done(action(), None)
+            preferred.assert_called_once()
+            self.assertEqual(studio.settings["python"], sys.executable)
+
+            studio.refreshPython()
+            self.assertTrue(studio.pythonBusy)
+            action, done = pending.pop()
+            done(action(), None)
+            discover.assert_called_once()
+            self.assertFalse(studio.pythonBusy)
+            self.assertEqual(json.loads(studio.pythonChoices), choices)
+            self.assertEqual(studio.pythonStatus, "")
 
     def test_pinned_recents_are_first_and_never_evicted_by_recent_opens(self):
         studio=self.studio;studio.recent=["/notes/pinned.md"]

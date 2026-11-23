@@ -187,6 +187,68 @@ describe("Mermaid sandbox isolation and message channel", () => {
     client.dispose();
   });
 
+  it("recovers from a transient cold-boot handshake timeout and rejects persistent handshake failure", async () => {
+    let attempts = 0;
+    const flakyHandshakeClient = new MermaidSandboxClient({
+      handshakeTimeoutMs: 30,
+      resolveSandboxUrl: async () => "about:blank",
+      attachFrameHook: (iframe, hostWin) => {
+        attempts++;
+        if (attempts === 1) {
+          // Simulate cold-boot stall where the first iframe never posts ready.
+          return undefined;
+        }
+        queueMicrotask(() => {
+          hostWin.dispatchEvent(
+            new MessageEvent("message", {
+              data: { channel: SANDBOX_CHANNEL, type: "ready" },
+              origin: "null",
+              source: iframe.contentWindow,
+            }),
+          );
+        });
+        if (iframe.contentWindow) {
+          iframe.contentWindow.postMessage = ((msg: unknown) => {
+            const req = msg as Record<string, unknown>;
+            queueMicrotask(() => {
+              hostWin.dispatchEvent(
+                new MessageEvent("message", {
+                  data: {
+                    channel: SANDBOX_CHANNEL,
+                    type: "result",
+                    frameToken: req.frameToken,
+                    requestId: req.requestId,
+                    ok: true,
+                    svg: '<svg xmlns="http://www.w3.org/2000/svg"><text>Handshake recovered</text></svg>',
+                  },
+                  origin: "null",
+                  source: iframe.contentWindow,
+                }),
+              );
+            });
+          }) as typeof iframe.contentWindow.postMessage;
+        }
+        return undefined;
+      },
+    });
+
+    const svg = await flakyHandshakeClient.render("smd-boot", "gantt\n  title Boot", false);
+    expect(svg).toContain("Handshake recovered");
+    expect(attempts).toBe(2);
+    flakyHandshakeClient.dispose();
+
+    const deadHandshakeClient = new MermaidSandboxClient({
+      handshakeTimeoutMs: 25,
+      resolveSandboxUrl: async () => "about:blank",
+      attachFrameHook: () => undefined,
+    });
+    await expect(deadHandshakeClient.render("smd-dead", "gantt\n  title Dead", false)).rejects.toThrow(
+      /initialization timed out/i,
+    );
+    expect(deadHandshakeClient.activeIframe).toBeNull();
+    deadHandshakeClient.dispose();
+  });
+
   it("sanitizes DOMPurify bypasses and validates external resources in parent before caching", async () => {
     // GHSA-cg2g-xh64-v4q7 shadow-root template, GHSA-mrv2-3pqr-j5jr detached handler, GHSA-c6gr-qvv4-5v3f SMIL href
     const sanitized = sanitizeDiagram(
