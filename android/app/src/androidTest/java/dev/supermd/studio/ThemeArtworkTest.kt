@@ -64,13 +64,18 @@ class ThemeArtworkTest {
             compose.runOnIdle {state.value=state.value.copy(customTheme=raster.toString())};painted(25,0)
         }}finally{bitmap.recycle()}
     }
-    @Test fun portableThemeShareIncludesControlsWithoutChangingTheImportedFile() {
+    @Test fun portableThemeSharePreservesCanonicalThemeAndIsolatesArtworkFromPatternControls() {
         val original=theme("#ff0000")
         val state=StudioState(customTheme=original,patternKind="paws",patternOpacity=.08f,patternSize=30f,patternSpacing=96f)
+        val style=themeStyle(themeDocument(original),"dark",true,state.patternKind,state.patternOpacity,state.patternSize,state.patternSpacing)
+        assertEquals("paws",style.getJSONObject("background").getString("pattern"))
+        assertEquals(30.0,style.getJSONObject("background").getDouble("size"),.001)
+        assertEquals(.1,style.getJSONObject("artwork").getJSONObject("reader").getDouble("opacity"),.001)
+        val hiddenPattern=themeStyle(themeDocument(original),"dark",true,"none",0f,state.patternSize,state.patternSpacing)
+        assertEquals(.1,hiddenPattern.getJSONObject("artwork").getJSONObject("reader").getDouble("opacity"),.001)
         val output=JSONObject(themeForSharing(state));val selected=output.getJSONObject("variants").getJSONObject("dark")
-        assertEquals("paws",selected.getJSONObject("background").getString("pattern"))
-        assertEquals(30.0,selected.getJSONObject("background").getDouble("size"),.001)
-        assertEquals(.08,selected.getJSONObject("artwork").getJSONObject("reader").getDouble("opacity"),.001)
+        assertFalse(selected.has("background"))
+        assertEquals(.1,selected.getJSONObject("artwork").getJSONObject("reader").getDouble("opacity"),.001)
         assertEquals(.1,selected.getJSONObject("artwork").getJSONObject("sidebar").getDouble("opacity"),.001)
         assertEquals(original,state.customTheme)
         assertFalse(JSONObject(PdfEngine.validateTheme(output.toString())).has("error"))

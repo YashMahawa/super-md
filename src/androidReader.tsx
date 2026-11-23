@@ -690,7 +690,7 @@ function Reader() {
   },[update]);
   if (!state) return <div className="reader-loading" role="status"><span className="expressive-loading-shape" aria-hidden="true"/>Opening your workspace</div>;
   return <DocumentAppearance.Provider value={documentAppearance}><div className={`android-document mode-${state.mode}`}>
-    {themeGuide&&<ThemeGuideDialog close={()=>setThemeGuide(false)}/>}
+    {themeGuide&&<ThemeGuideDialog dark={state.dark} close={()=>setThemeGuide(false)}/>}
     {pdfExport&&<div className="reader-export-backdrop"><section className="reader-export-progress" role="dialog" aria-modal="true" aria-label="Exporting PDF" onKeyDown={event=>{if(event.key==='Escape'){event.preventDefault();event.stopPropagation();void cancelPdfExport();}}}>
       <h2>Exporting PDF</h2>
       <div className="reader-export-status">

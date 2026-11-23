@@ -110,6 +110,7 @@ internal class ReaderBridge(
                         web.context.getSystemService(android.content.ClipboardManager::class.java).setPrimaryClip(android.content.ClipData.newPlainText("Super MD",text))
                         true
                     }
+                    "apply_bundled_theme" -> model.applyBundledTheme(args.getString("id"))
                     "document_outline" -> { model.outline(args.getString("id"), args.getJSONArray("headings")); true }
                     "load_font" -> withContext(Dispatchers.IO) {model.fonts.reader(args.getString("family"))}
                     "cache_python_output" -> cachePythonOutput(args)

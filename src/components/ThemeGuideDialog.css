@@ -5,11 +5,18 @@
 .theme-guide-dialog h2 {font-size:1.3em;line-height:1.3;margin:0;}
 .theme-guide-dialog header p {font-size:.85em;color:var(--muted);margin:.35em 0 0;}
 .theme-guide-dialog>header button {padding:.65em 1em;border-radius:20px;background:var(--primary);color:var(--on-primary);min-height:44px;}
+.theme-guide-dialog>header .theme-guide-secondary {background:var(--surface-high);color:var(--text);}
 .theme-guide-dialog>header .theme-guide-close {background:var(--surface-high);color:var(--text);padding:0;width:44px;font-size:1.5em;}
+.theme-guide-presets {padding:12px 24px;background:var(--surface-low);border-bottom:1px solid var(--outline);}
+.theme-guide-presets>p {margin:0 0 8px;font-size:.85em;color:var(--muted);}
+.theme-guide-preset-list {display:flex;flex-wrap:wrap;gap:6px;max-height:148px;overflow:auto;}
+.theme-guide-preset-list button {padding:.4em .85em;border-radius:16px;background:var(--surface-high);color:var(--text);font-size:.88em;min-height:36px;}
+.theme-guide-preset-list button:hover:not(:disabled) {background:var(--primary-container,var(--surface-high));color:var(--on-primary-container,var(--text));}
 .theme-guide-body {min-height:0;overflow:auto;overscroll-behavior:contain;padding:clamp(16px,3vw,40px);}
 .theme-guide-body .markdown-body {width:100%;max-width:none;padding:0;font-size:1em;}
 .theme-guide-body .markdown-body>:first-child {margin-top:0;}
 .theme-guide-body .markdown-body :is(pre,table) {max-width:100%;}
 .theme-guide-body :focus-visible,.theme-guide-dialog button:focus-visible {outline:2px solid var(--primary);outline-offset:3px;}
 .theme-guide-error {margin:0;padding:8px 24px;color:var(--error);}
-@media(max-width:600px){.theme-guide-dialog {height:calc(100dvh - 24px);border-radius:22px;}.theme-guide-dialog>header {padding:14px;gap:8px;}.theme-guide-dialog>header>div {flex-basis:100%;}.theme-guide-dialog header p {display:none;}.theme-guide-dialog .theme-guide-close {margin-left:auto;}}
+.theme-guide-status {margin:0;padding:8px 24px;font-size:.9em;color:var(--primary);background:var(--surface-low);border-bottom:1px solid var(--outline);}
+@media(max-width:600px){.theme-guide-dialog {height:calc(100dvh - 24px);border-radius:22px;}.theme-guide-dialog>header {padding:14px;gap:8px;}.theme-guide-dialog>header>div {flex-basis:100%;}.theme-guide-dialog header p {display:none;}.theme-guide-dialog .theme-guide-close {margin-left:auto;}.theme-guide-presets {padding:10px 14px;}}
