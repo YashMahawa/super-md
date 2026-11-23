@@ -441,6 +441,7 @@ class Studio(QObject):
         self.active = self.tabs[0]["id"]
         if self.settings["startup"]=="restore" and any(t["id"]==self.session.startup_active_id for t in self.tabs):self.active=self.session.startup_active_id
         self._activation_generation = 0
+        self._pending_headings: dict[str, str] = {}
         self._startup_placeholder_ids = {
             tab["id"] for tab in self.tabs
             if tab["name"] == "Untitled.md" and not tab["path"] and not tab["content"] and not tab["saved"] and not tab["assets"]
@@ -517,6 +518,9 @@ class Studio(QObject):
             reading_settings={key:self.settings[key] for key in ("restorePosition","centerLock","imageAppearance","svgAppearance","imageContrast","fullDocumentAccessibility","latexAutofix")}
             reading_settings["customStyle"]=custom_theme.reader(self.session.custom_theme,self.settings["fullTheme" if self.fullscreen else "theme"],self._dark(),self.settings)
             payload={**reading_settings,"readingLocation":self.session.locations.get(tab["path"]),"id": tab["id"], "path": tab["path"] or tab["id"], "mode": self.mode, "dark": self._dark(), "fullscreen": self.fullscreen, "font": self.settings["font"], "size": self.settings["size"], "widthPercent": self.settings["widthPercent"], "lineHeight":self.settings["lineHeight"], "spellCheck":self.settings["spellCheck"], "grammarCheck":self.settings["grammarCheck"], "zoom": self.settings["fullZoom" if self.fullscreen else "normalZoom"], "motion": self.settings["motion"], "python": self.settings["python"], "colors": colors, "viewState": tab.pop("viewState", None)}
+            pending_heading = tab.pop("pendingHeading", None) or (self._pending_headings.pop(tab["path"], None) if tab.get("path") else None)
+            if pending_heading:
+                payload["pendingHeading"] = pending_heading
             payload["editProtocol"]=1
             previous=self._last_reader_text
             if previous and previous[0]==tab["id"] and previous[1] is tab["content"]:payload["contentUnchanged"]=True
@@ -1770,7 +1774,7 @@ class Studio(QObject):
         QTimer.singleShot(0, lambda: QMetaObject.invokeMethod(window, "focusReader", Qt.ConnectionType.QueuedConnection)
                           if generation == self._activation_generation and not self.retired else None)
 
-    def _open_note(self, value, *, explicit, activation_generation=None, completion_callback=None):
+    def _open_note(self, value, *, explicit, activation_generation=None, completion_callback=None, pending_heading=None):
         if self.retired:
             if completion_callback: completion_callback(None, "The document window is no longer available")
             return
@@ -1792,7 +1796,14 @@ class Studio(QObject):
             if restoring and activation_generation == self._activation_generation and str(path) == self.session.startup_active:
                 self._select_tab_from_open(found["id"], activation_generation)
             if explicit and activation_generation == self._activation_generation:
+                if pending_heading:
+                    found["pendingHeading"] = pending_heading
+                else:
+                    found.pop("pendingHeading", None)
+                was_active = self.active == found["id"]
                 self._select_tab_from_open(found["id"], activation_generation)
+                if was_active and pending_heading:
+                    self._emit()
                 self._focus_open_target(activation_generation)
             if completion_callback: completion_callback(found, None)
             return
@@ -1807,7 +1818,14 @@ class Studio(QObject):
             existing = next((tab for tab in self.tabs if tab["path"] == str(path)), None)
             if existing:
                 if explicit and activation_generation == self._activation_generation:
+                    if pending_heading:
+                        existing["pendingHeading"] = pending_heading
+                    else:
+                        existing.pop("pendingHeading", None)
+                    was_active = self.active == existing["id"]
                     self._select_tab_from_open(existing["id"], activation_generation)
+                    if was_active and pending_heading:
+                        self._emit()
                     self._focus_open_target(activation_generation)
                 if completion_callback: completion_callback(existing, None)
                 return
@@ -1829,6 +1847,8 @@ class Studio(QObject):
             self.settings["welcomed"] = True
             self.recent = [str(path)] + [p for p in self.recent if p != str(path)][:29]
             self._preferences()
+            if should_activate and pending_heading:
+                note["pendingHeading"] = pending_heading
             self.recovery_timer.start(800)
             self._emit()
             if explicit and should_activate:
@@ -3277,6 +3297,42 @@ class Studio(QObject):
                 self.settings["fullZoom" if args.get("fullscreen", self.fullscreen) else "normalZoom"] = max(40,min(300,args["zoom"]))
                 self.preference_timer.start(500)
                 self._emit(False); self.replied.emit(id,"true",""); return
+            if command == "open_relative_note":
+                document_ref = args.get("documentPath")
+                target_rel = args.get("target")
+                raw_heading = args.get("heading")
+                if raw_heading is not None and (not isinstance(raw_heading, str) or len(raw_heading) > 1024):
+                    raise ValueError("Invalid heading target")
+                heading = raw_heading.strip() if isinstance(raw_heading, str) and raw_heading.strip() else None
+                source_tab = next((item for item in self.tabs if document_ref in (item["id"], item["path"])), None) if isinstance(document_ref, str) and document_ref else None
+                if source_tab is None:
+                    source_tab = self._current() if not document_ref else None
+                if source_tab is None:
+                    raise ValueError("The note for this link is no longer open.")
+                try:
+                    resolved = self._resolve_relative_note(source_tab, target_rel)
+                except ValueError as error:
+                    self.message = str(error)
+                    self._emit(False)
+                    self.replied.emit(id, "null", str(error))
+                    return
+                if self.autosave_timer.isActive():
+                    self.autosave_timer.stop()
+                    self._autosave()
+                if self.recovery_timer.isActive():
+                    self.recovery_timer.stop()
+                    self._recover()
+                resolved_str = str(resolved)
+                self._pending_headings.pop(resolved_str, None)
+                def opened_callback(_opened, error):
+                    if error:
+                        self.message = str(error)
+                        self._emit(False)
+                        self.replied.emit(id, "null", str(error))
+                        return
+                    self.replied.emit(id, "true", "")
+                self._open_note(resolved_str, explicit=True, completion_callback=opened_callback, pending_heading=heading)
+                return
             if command == "export_failed": self.pending_export = self.pending_save_as = ""; self.message = args["error"]; self._emit(False); self.replied.emit(id,"true",""); return
             if command == "request_fmd_export": self.exportRequested.emit("smd"); self.replied.emit(id,"true",""); return
             context=args.get("context")
@@ -3536,6 +3592,54 @@ class Studio(QObject):
         if not path.is_relative_to(root) or not path.is_file(): raise ValueError("Diagram source is outside the note folder")
         if path.stat().st_size > 2_000_000: raise ValueError("Diagram source exceeds 2 MB")
         return path.read_text(encoding="utf-8")
+
+    def _resolve_relative_note(self, tab, target):
+        if not tab or not tab.get("path"):
+            raise ValueError("Save this note before opening linked notes.")
+        if not isinstance(target, str) or not target or len(target) > 4096 or "\x00" in target:
+            raise ValueError("Invalid relative note path.")
+        raw = target.split("#", 1)[0].split("?", 1)[0].strip()
+        if not raw or raw.startswith(("/", "\\")) or re.match(r"^[a-zA-Z][a-zA-Z0-9+.-]*:", raw):
+            raise ValueError("Invalid relative note path.")
+        if re.search(r"(?i)%2f|%5c|%00", raw):
+            raise ValueError("Encoded path separators are not allowed.")
+        decoded = urllib.parse.unquote(raw)
+        if not decoded or "\x00" in decoded or decoded.startswith(("/", "\\")) or re.match(r"^[a-zA-Z]:", decoded):
+            raise ValueError("Invalid relative note path.")
+        normalized = decoded.replace("\\", "/")
+        if Path(normalized).suffix.casefold() not in (".md", ".smd", ".markdown", ".fmd"):
+            raise ValueError("Only Markdown and Super MD notes can be opened from relative links.")
+        note_dir = Path(tab["path"]).parent.resolve()
+        workspace_dir = Path(self.folder).resolve() if self.folder else None
+        boundary = workspace_dir if workspace_dir is not None and (note_dir == workspace_dir or note_dir.is_relative_to(workspace_dir)) else note_dir
+        parts = normalized.split("/")
+        bases = [note_dir]
+        if boundary != note_dir and ".." not in parts:
+            bases.append(boundary)
+        last_missing = None
+        for base in bases:
+            current = base
+            for part in parts:
+                if part in ("", "."):
+                    continue
+                if part == "..":
+                    parent = current.parent
+                    if not (parent == boundary or parent.is_relative_to(boundary)):
+                        raise ValueError("Linked note is outside the authorized folder.")
+                    current = parent
+                else:
+                    current = current / part
+                    if current.is_symlink():
+                        raise ValueError("Linked note symlink paths are not allowed.")
+            try:
+                resolved = current.resolve(strict=True)
+            except FileNotFoundError as missing:
+                last_missing = missing
+                continue
+            if not resolved.is_relative_to(boundary) or not resolved.is_file():
+                raise ValueError("Linked note is outside the authorized folder.")
+            return resolved
+        raise ValueError(f"Linked note not found: {Path(normalized).name}") from last_missing
 
     def _fetch(self, args):
         url = args["url"]

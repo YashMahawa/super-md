@@ -85,12 +85,12 @@ describe('shared source analysis',()=>{
     expect(normalized.value).toContain('![Architecture](diagram.png)');
     expect(normalized.value).toContain('[section](#matrix-section)');
     expect(normalized.value).toContain('[ref](Reference.md)');
-    expect(normalized.value).toContain('| `[[Note]]` and `` `![[raw.png]]` `` | [Linked in table](Table Note.md) |');
+    expect(normalized.value).toContain('| `[[Note]]` and `` `![[raw.png]]` `` | [Linked in table](Table%20Note.md) |');
     expect(normalized.value).toContain('arr = np.array([[1, 2], [3, 4]])\nsingle = [[1, 2]]');
     expect(normalized.value).toContain('{"series":[{"points":[[0,1]]}]}');
     expect(normalized.value).toContain('if [[ -f "$FILE" ]]; then echo "![[not-image.png]]"; fi');
     expect(normalized.value).toContain('[[nodiscard]] int value();');
-    expect(normalized.value).toContain('- [ ] Verify `[[inline]]` before [task link](Task Note.md)');
+    expect(normalized.value).toContain('- [ ] Verify `[[inline]]` before [task link](Task%20Note.md)');
 
     const analysis=analyzeDocument(source);
     expect(analysis.pythonCells).toEqual([
@@ -131,11 +131,11 @@ describe('shared source analysis',()=>{
     expect(masked).toHaveLength(source.length);
     const normalized=normalizeMarkdownSource(source).value;
     expect(normalized).toContain('    indented = [[1, 2]]');
-    expect(normalized).toContain('[After Stray](After Stray.md)');
+    expect(normalized).toContain('[After Stray](After%20Stray.md)');
     expect(normalized).toContain('`[[inline_masked]]`');
-    expect(normalized).toContain('[After Inline](After Inline.md)');
-    expect(normalized).toContain('    lazy_continuation = [Lazy Link](Lazy Link.md)');
-    expect(normalized).toContain('    list_paragraph = [List Link](List Link.md)');
+    expect(normalized).toContain('[After Inline](After%20Inline.md)');
+    expect(normalized).toContain('    lazy_continuation = [Lazy Link](Lazy%20Link.md)');
+    expect(normalized).toContain('    list_paragraph = [List Link](List%20Link.md)');
     expect(normalized).toContain('        list_code = [[8, 9]]');
     expect(normalized).toContain('    after_heading_code = [[3, 4]]');
   });
@@ -144,7 +144,7 @@ describe('shared source analysis',()=>{
     expect(hasCallouts(infoBacktick)).toBe(true);
     const normInfo=normalizeMarkdownSource(infoBacktick).value;
     expect(normInfo).toContain('`[[inline_code]]`');
-    expect(normInfo).toContain('[Prose Link](Prose Link.md)');
+    expect(normInfo).toContain('[Prose Link](Prose%20Link.md)');
     expect(normInfo).toContain('> [!NOTE] Real\n> Body');
 
     const mismatched=[
@@ -164,7 +164,7 @@ describe('shared source analysis',()=>{
     expect(normMismatched).toContain('> still_fenced = [[3, 4]]');
     expect(normMismatched).toContain('> still_fenced_2 = [[5, 6]]');
     expect(normMismatched).toContain('> still_fenced_3 = [[7, 8]]');
-    expect(normMismatched).toContain('> [Quoted Prose](Quoted Prose.md)');
+    expect(normMismatched).toContain('> [Quoted Prose](Quoted%20Prose.md)');
 
     const calloutWithQuotedFence=[
       ':::callout note Outer',
@@ -180,11 +180,46 @@ describe('shared source analysis',()=>{
       ':::',
     ].join('\n');
     const normCallout=normalizeMarkdownSource(calloutWithQuotedFence).value;
-    expect(normCallout).toContain('> Still inside outer [Outer Link](Outer Link.md)');
-    expect(normCallout.trimEnd().endsWith('> Still inside outer [Outer Link](Outer Link.md)')).toBe(true);
+    expect(normCallout).toContain('> Still inside outer [Outer Link](Outer%20Link.md)');
+    expect(normCallout.trimEnd().endsWith('> Still inside outer [Outer Link](Outer%20Link.md)')).toBe(true);
 
     expect(hasCallouts('```markdown\n:::callout note Fenced\n:::\n```')).toBe(false);
     expect(hasCallouts('> ```markdown\n> :::callout note QuotedFenced\n> :::\n> ```')).toBe(false);
     expect(hasCallouts('---\ntitle: x\n---\n```md\n:::callout note Fenced\n:::\n```\n:::callout tip Real\nOk\n:::')).toBe(true);
+  });
+  it('normalizes spaced, aliased, portable, and section wikilinks while preserving sparse UTF-16 source offsets',()=>{
+    expect(normalizeMarkdownSource('[[Task Note]]').value).toBe('[Task Note](Task%20Note.md)');
+    expect(normalizeMarkdownSource('[[Lecture 2#Bayes Law|Bayes]]').value).toBe('[Bayes](Lecture%202.md#bayes-law)');
+    expect(normalizeMarkdownSource('[[Lecture 2#Bayes]]').value).toBe('[Lecture 2#Bayes](Lecture%202.md#bayes)');
+    expect(normalizeMarkdownSource('[[study.smd]]').value).toBe('[study.smd](study.smd)');
+    expect(normalizeMarkdownSource('[[Study Deck.smd#Card 1|First card]]').value).toBe('[First card](Study%20Deck.smd#card-1)');
+    expect(normalizeMarkdownSource('[[archive.fmd]]').value).toBe('[archive.fmd](archive.fmd)');
+    expect(normalizeMarkdownSource('[[notes.markdown#Intro]]').value).toBe('[notes.markdown#Intro](notes.markdown#intro)');
+    expect(normalizeMarkdownSource('[[   ]]').value).toBe('[[   ]]');
+    expect(normalizeMarkdownSource('Keep `[[Task Note]]` and `[[Lecture 2#Bayes Law|Bayes]]` literal.').value)
+      .toBe('Keep `[[Task Note]]` and `[[Lecture 2#Bayes Law|Bayes]]` literal.');
+
+    const source=[
+      '---',
+      'title: Study Index',
+      '---',
+      '# Study 🧠 Index',
+      '',
+      'Open [[Task Note]], [[Lecture 2#Bayes Law|Bayes]], and [[study.smd]].',
+      '',
+      '- [ ] Review after wikilinks',
+      '',
+      '## Follow-up Section',
+    ].join('\n');
+    const stage=normalizeMarkdownSource(source);
+    const tailMarker='## Follow-up Section';
+    expect(stage.originalOffset(stage.value.indexOf(tailMarker))).toBe(source.indexOf(tailMarker));
+    const analysis=analyzeDocument(source);
+    expect(analysis.tasks).toEqual([source.indexOf('[ ]')+1]);
+    expect(analysis.outline.map(item=>[item.id,item.offset])).toEqual([
+      ['study--index',source.indexOf('# Study 🧠 Index')],
+      ['follow-up-section',source.indexOf('## Follow-up Section')],
+    ]);
+    for(const block of analysis.blocks)expect(source.slice(block.start,block.end)).toBe(block.text);
   });
 });

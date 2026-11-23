@@ -297,6 +297,17 @@ function unmaskedRegexStage(source:string,ranges:Array<[number,number]>,regex:Re
   return {stage:replaceStage(source,edits),ranges:nextRanges};
 }
 
+function normalizeNoteWikilinkTarget(rawTarget:string):string|null {
+  const hash=rawTarget.indexOf('#');
+  const rawNote=(hash>=0?rawTarget.slice(0,hash):rawTarget).trim();
+  const rawHeading=hash>=0?rawTarget.slice(hash+1).trim():'';
+  if(!rawNote&&!rawHeading)return null;
+  if(!rawNote&&rawHeading)return `#${headingSlug(rawHeading)}`;
+  const notePath=/\.(?:md|smd|markdown|fmd)$/i.test(rawNote)?rawNote:`${rawNote}.md`;
+  const encoded=encodeURI(notePath);
+  return rawHeading?`${encoded}#${headingSlug(rawHeading)}`:encoded;
+}
+
 /** Render-only syntax normalization with a sparse offset map. Source positions
  * always address the original note, including frontmatter and wiki/callout edits. */
 export function normalizeMarkdownSource(markdown:string):Stage {
@@ -306,8 +317,8 @@ export function normalizeMarkdownSource(markdown:string):Stage {
   let ranges=unmaskedRangesFromMask(computeCodeMask(value));
   const addUnmasked=(regex:RegExp,replacement:(...args:any[])=>string)=>{const next=unmaskedRegexStage(value,ranges,regex,replacement);ranges=next.ranges;add(next.stage);};
   addUnmasked(/!\[\[([^\[\r\n\]|]+)(?:\|([^\r\n\]]+))?\]\]/g,(_all,path,label)=>`![${label??path}](${encodeURI(path)})`);
-  addUnmasked(/\[\[(#[^\[\r\n\]]+?)\]\]/g,(_all,target:string)=>{const [id,label]=target.split('|');return `[${label||id.slice(1)}](#${headingSlug(id.slice(1))})`;});
-  addUnmasked(/\[\[([^\[\r\n\]|]+)(?:\|([^\r\n\]]+))?\]\]/g,(_all,target,label)=>`[${label??target}](${target.endsWith('.md')?target:`${target}.md`})`);
+  addUnmasked(/\[\[(#[^\[\r\n\]]+?)\]\]/g,(_all,target:string)=>{const [id,...rest]=target.split('|');const label=rest.join('|');return `[${label||id.slice(1)}](#${headingSlug(id.slice(1))})`;});
+  addUnmasked(/\[\[([^\[\r\n\]|]+)(?:\|([^\r\n\]]+))?\]\]/g,(all,target:string,label?:string)=>{const dest=normalizeNoteWikilinkTarget(target);return dest===null?all:`[${label??target}](${dest})`;});
   const edits:Edit[]=[];let depth=0;
   for(const line of classifyMarkdownLines(value)){
     const text=value.slice(line.start,line.end),insideCode=line.kind==='fence'||line.kind==='indented';

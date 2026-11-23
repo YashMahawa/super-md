@@ -14,7 +14,7 @@ import PythonCell from "./PythonCell";
 import SvgDiagram from "./SvgDiagram";
 import { remarkSvgBlocks } from "../svgBlocks";
 import { remarkObsidianMath } from "../obsidianMath";
-import { navigateHeading, remarkHeadingIds } from "../documentNavigation";
+import { isLocalHref, navigateHeading, parseRelativeNoteLink, prepareRelativeNoteOpen, remarkHeadingIds, UNSAVED_RELATIVE_NOTE_NOTICE } from "../documentNavigation";
 import { selectedMarkdown, setSelectedMarkdownDrag } from "../copySource";
 import CopyCode from "./CopyCode";
 import CodeBlockBoundary from "./CodeBlockBoundary";
@@ -185,22 +185,33 @@ function AssetImage({ src = "", alt = "", documentPath, trustedImageHosts, onTru
 interface Props extends ReaderAccessibilityPreference {
   markdown: string;
   documentPath: string | null;
+  savedDocumentPath?: string | null;
   python: string;
   dark: boolean;
   trustedImageHosts?: string[];
   onTrustImageHost?: (host: string) => void;
   onChange?: (markdown:string)=>void;
+  onNotice?: (message: string) => void;
   renderBlock?:MarkdownBlockRenderer;
   sourceAnalysis?:SourceDocumentAnalysis;
 }
 
-function MarkdownPreview({ markdown, documentPath, python, dark, trustedImageHosts = EMPTY_TRUSTED_IMAGE_HOSTS, onTrustImageHost, onChange,renderBlock,fullDocumentAccessibility=false,sourceAnalysis }: Props) {
+function MarkdownPreview({ markdown, documentPath, savedDocumentPath, python, dark, trustedImageHosts = EMPTY_TRUSTED_IMAGE_HOSTS, onTrustImageHost, onChange, onNotice, renderBlock,fullDocumentAccessibility=false,sourceAnalysis }: Props) {
   useEffect(installMediaMenu,[]);
+  const [linkNotice, setLinkNotice] = useState("");
+  const resolvedNotePath = savedDocumentPath === undefined ? documentPath : savedDocumentPath;
+  useEffect(() => { setLinkNotice(""); }, [markdown, documentPath, savedDocumentPath]);
+  const reportLinkNotice = useCallback((rawMessage: string) => {
+    const clean = rawMessage.replace(/^Error:\s*/, "").trim() || "Could not open linked note.";
+    setLinkNotice(clean);
+    onNotice?.(clean);
+  }, [onNotice]);
   const analysis=useMemo(()=>sourceAnalysis?.source===markdown?sourceAnalysis.analysis:analyzeDocument(markdown),[markdown,sourceAnalysis]);
   const tasks=onChange?analysis.tasks:[];
   const renderImage = useCallback(({src,alt}:{src?:string;alt?:string})=><AssetImage src={src} alt={alt} documentPath={documentPath} trustedImageHosts={trustedImageHosts} onTrustImageHost={onTrustImageHost}/>,[documentPath,trustedImageHosts,onTrustImageHost]);
   return (
     <article className="markdown-body" onCopy={event=>{if(event.currentTarget.closest('.live-document'))return;const source=selectedMarkdown(window.getSelection(),markdown);if(source!==null){event.clipboardData.setData("text/plain",source);event.preventDefault();}}} onDragStart={event=>{if(!event.currentTarget.closest('.live-document'))setSelectedMarkdownDrag(event.nativeEvent,markdown);}}>
+      {linkNotice && <div role="status" className="reader-link-notice"><span>{linkNotice}</span><button type="button" aria-label="Dismiss notice" onClick={() => setLinkNotice("")}>Dismiss</button></div>}
       <CachedMarkdown
         sourceAnalysis={{source:markdown,analysis}}
         renderBlock={renderBlock}
@@ -212,7 +223,29 @@ function MarkdownPreview({ markdown, documentPath, python, dark, trustedImageHos
           input: ({node: _node,...props}) => <input {...props} disabled={!onChange} onChange={()=>{}} />,
           li: ({node,children,...props}) => <li {...props} className={Array.isArray(node?.properties.className)?node.properties.className.join(' '):undefined} onChange={event=>{const index=Number(node?.properties['data-task-index']);const offset=tasks[index];if(offset===undefined || !onChange || !(event.target instanceof HTMLInputElement))return;onChange(markdown.slice(0,offset)+(event.target.checked?'x':' ')+markdown.slice(offset+1));}}>{children}</li>,
           img: renderImage,
-          a: ({node:_node,href,children,...props}) => <a {...props} href={href} target={href?.startsWith("#") ? undefined : "_blank"} rel="noreferrer" onClick={event => { if (navigateHeading(event.currentTarget)) { event.preventDefault(); event.stopPropagation(); } else event.currentTarget.dataset.visited='true'; }}>{children}</a>,
+          a: ({node:_node,href,children,...props}) => <a {...props} href={href} target={isLocalHref(href) ? undefined : "_blank"} rel="noreferrer" onClick={event => {
+            if (navigateHeading(event.currentTarget)) { event.preventDefault(); event.stopPropagation(); return; }
+            const relativeNote = parseRelativeNoteLink(href);
+            if (relativeNote) {
+              event.preventDefault();
+              event.stopPropagation();
+              if (!resolvedNotePath) {
+                reportLinkNotice(UNSAVED_RELATIVE_NOTE_NOTICE);
+                return;
+              }
+              setLinkNotice("");
+              void (async () => {
+                try {
+                  await prepareRelativeNoteOpen();
+                  await invoke("open_relative_note", { documentPath: resolvedNotePath, target: relativeNote.target, ...(relativeNote.heading ? { heading: relativeNote.heading } : {}) });
+                } catch (error) {
+                  reportLinkNotice(error instanceof Error ? error.message : String(error));
+                }
+              })();
+              return;
+            }
+            event.currentTarget.dataset.visited='true';
+          }}>{children}</a>,
           pre: ({ node, children }) => {
             const child = Children.only(children) as React.ReactElement<{ className?: string; children?: ReactNode }>;
             const language = child.props.className?.match(/language-([\w-]+)/)?.[1];
@@ -224,7 +257,7 @@ function MarkdownPreview({ markdown, documentPath, python, dark, trustedImageHos
             const protectedBlock = (block: ReactNode) => <CodeBlockBoundary key={`${language}:${source}`} source={source}>{block}</CodeBlockBoundary>;
             if (language === "smd-tree") return protectedBlock(<InlineDiagram diagram={parseBinaryTreeSource(source)}/>);
             if (language === "smd-diagram") return protectedBlock(<InlineDiagram diagram={parseDiagramSource(source)}/>);
-            if (language === "smd-steps") return protectedBlock(<StepCards source={source} renderImage={(src,alt)=><AssetImage src={src} alt={alt} documentPath={documentPath} trustedImageHosts={trustedImageHosts} onTrustImageHost={onTrustImageHost}/>} renderChart={chartSource=><ThemedChart source={chartSource} dark={dark}/>} renderMarkdown={text=><MarkdownPreview markdown={text} documentPath={documentPath} python={python} dark={dark} trustedImageHosts={trustedImageHosts} onTrustImageHost={onTrustImageHost}/>} />);
+            if (language === "smd-steps") return protectedBlock(<StepCards source={source} renderImage={(src,alt)=><AssetImage src={src} alt={alt} documentPath={documentPath} trustedImageHosts={trustedImageHosts} onTrustImageHost={onTrustImageHost}/>} renderChart={chartSource=><ThemedChart source={chartSource} dark={dark}/>} renderMarkdown={text=><MarkdownPreview markdown={text} documentPath={documentPath} savedDocumentPath={savedDocumentPath} python={python} dark={dark} trustedImageHosts={trustedImageHosts} onTrustImageHost={onTrustImageHost} onNotice={onNotice}/>} />);
             if (language === "smd-chart") return protectedBlock(<ThemedChart source={source} dark={dark} />);
             if (language === "svg") return protectedBlock(<ThemedSvg source={source} dark={dark} />);
             if (language === "mermaid") return protectedBlock(<Suspense fallback={<span className="image-loading" role="status">Loading diagram…</span>}><ThemedMermaid source={source} dark={dark} /></Suspense>);

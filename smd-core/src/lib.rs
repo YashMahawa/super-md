@@ -45,8 +45,9 @@ fn string(value: &str) -> String { serde_json::to_string(value).unwrap() }
 fn text(value: &str) -> String { format!("#text({})", string(value)) }
 
 pub fn image_sources(markdown: &str) -> Vec<String> {
+    let normalized = normalize_callouts(markdown);
     let mut sources = Vec::new();
-    let mut events = Parser::new_ext(markdown, Options::all());
+    let mut events = Parser::new_ext(&normalized, Options::all());
     while let Some(event) = events.next() {
         match event {
             Event::Start(Tag::Image { dest_url, .. }) => sources.push(dest_url.to_string()),
@@ -70,7 +71,167 @@ pub fn image_sources(markdown: &str) -> Vec<String> {
     sources
 }
 
-/// Normalize both Obsidian and Super MD callouts before parsing ordinary Markdown.
+fn encode_uri(input: &str) -> String {
+    let mut out = String::with_capacity(input.len());
+    for byte in input.bytes() {
+        let keep = byte.is_ascii_alphanumeric()
+            || matches!(
+                byte,
+                b'-' | b'_' | b'.' | b'!' | b'~' | b'*' | b'\'' | b'(' | b')'
+                    | b';' | b',' | b'/' | b'?' | b':' | b'@' | b'&' | b'=' | b'+' | b'$' | b'#'
+            );
+        if keep {
+            out.push(byte as char);
+        } else {
+            out.push_str(&format!("%{:02X}", byte));
+        }
+    }
+    out
+}
+
+fn has_note_extension(path: &str) -> bool {
+    let lower = path.to_ascii_lowercase();
+    lower.ends_with(".md") || lower.ends_with(".smd") || lower.ends_with(".markdown") || lower.ends_with(".fmd")
+}
+
+fn normalize_note_wikilink_target(raw_target: &str) -> Option<String> {
+    let (raw_note, raw_heading) = match raw_target.split_once('#') {
+        Some((note, heading)) => (note.trim(), heading.trim()),
+        None => (raw_target.trim(), ""),
+    };
+    if raw_note.is_empty() && raw_heading.is_empty() {
+        return None;
+    }
+    if raw_note.is_empty() && !raw_heading.is_empty() {
+        return Some(format!("#{}", heading_slug(raw_heading)));
+    }
+    let note_path = if has_note_extension(raw_note) {
+        raw_note.to_string()
+    } else {
+        format!("{raw_note}.md")
+    };
+    let encoded = encode_uri(&note_path);
+    if raw_heading.is_empty() {
+        Some(encoded)
+    } else {
+        Some(format!("{encoded}#{}", heading_slug(raw_heading)))
+    }
+}
+
+fn rewrite_unmasked_wikilinks(slice: &str) -> String {
+    let mut out = String::with_capacity(slice.len());
+    let mut index = 0usize;
+    while index < slice.len() {
+        let rest = &slice[index..];
+        let (is_embed, inner_offset) = if rest.starts_with("![[") {
+            (true, 3usize)
+        } else if rest.starts_with("[[") {
+            (false, 2usize)
+        } else {
+            let ch = rest.chars().next().unwrap();
+            out.push(ch);
+            index += ch.len_utf8();
+            continue;
+        };
+        let after_open = &rest[inner_offset..];
+        if let Some(close_pos) = after_open.find("]]") {
+            let inner = &after_open[..close_pos];
+            if !inner.is_empty() && !inner.chars().any(|ch| matches!(ch, '\r' | '\n' | ']')) {
+                if !is_embed && inner.starts_with('#') && inner.len() > 1 && !inner.contains('[') {
+                    let (id, label) = match inner.split_once('|') {
+                        Some((left, right)) => (left, Some(right)),
+                        None => (inner, None),
+                    };
+                    let heading = &id[1..];
+                    let display = match label {
+                        Some(text) if !text.is_empty() => text,
+                        _ => heading,
+                    };
+                    out.push_str(&format!("[{display}](#{})", heading_slug(heading)));
+                    index += inner_offset + close_pos + 2;
+                    continue;
+                }
+                let parsed = match inner.split_once('|') {
+                    Some((target, label)) if !target.is_empty() && !label.is_empty() && !target.contains('[') => {
+                        Some((target, Some(label)))
+                    }
+                    None if !inner.contains('[') => Some((inner, None)),
+                    _ => None,
+                };
+                if let Some((target, label)) = parsed {
+                    if is_embed {
+                        if !target.trim().is_empty() {
+                            out.push_str(&format!("![{}]({})", label.unwrap_or(target), encode_uri(target)));
+                            index += inner_offset + close_pos + 2;
+                            continue;
+                        }
+                    } else if let Some(dest) = normalize_note_wikilink_target(target) {
+                        out.push_str(&format!("[{}]({dest})", label.unwrap_or(target)));
+                        index += inner_offset + close_pos + 2;
+                        continue;
+                    }
+                }
+            }
+        }
+        let ch = rest.chars().next().unwrap();
+        out.push(ch);
+        index += ch.len_utf8();
+    }
+    out
+}
+
+fn normalize_wikilinks_outside_code(input: &str) -> String {
+    if !input.contains("[[") {
+        return input.to_string();
+    }
+    let mut masked = vec![false; input.len()];
+    // Parse without ENABLE_TABLES so unescaped `|` inside `[[target|label]]`
+    // cannot split a GFM table row into excess columns and drop trailing `code` spans.
+    let options = Options::ENABLE_STRIKETHROUGH
+        | Options::ENABLE_TASKLISTS
+        | Options::ENABLE_MATH
+        | Options::ENABLE_FOOTNOTES;
+    let mut in_code_block = false;
+    for (event, range) in Parser::new_ext(input, options).into_offset_iter() {
+        let mark = match event {
+            Event::Start(Tag::CodeBlock(_)) => {
+                in_code_block = true;
+                true
+            }
+            Event::End(TagEnd::CodeBlock) => {
+                let was = in_code_block;
+                in_code_block = false;
+                was
+            }
+            Event::Code(_) => true,
+            _ => in_code_block,
+        };
+        if mark {
+            let end = range.end.min(masked.len());
+            let start = range.start.min(end);
+            masked[start..end].fill(true);
+        }
+    }
+    let mut output = String::with_capacity(input.len());
+    let mut cursor = 0usize;
+    while cursor < input.len() {
+        let is_masked = masked[cursor];
+        let mut next = cursor + 1;
+        while next < input.len() && (masked[next] == is_masked || !input.is_char_boundary(next)) {
+            next += 1;
+        }
+        let segment = &input[cursor..next];
+        if is_masked {
+            output.push_str(segment);
+        } else {
+            output.push_str(&rewrite_unmasked_wikilinks(segment));
+        }
+        cursor = next;
+    }
+    output
+}
+
+/// Normalize Obsidian/Super MD callouts and wikilinks outside code before parsing Markdown.
 pub fn normalize_callouts(input: &str) -> String {
     let mut output = String::new();
     let mut depth = 0usize;
@@ -79,7 +240,8 @@ pub fn normalize_callouts(input: &str) -> String {
         let body=line.trim_start_matches(' ');
         let code=body.chars().next().filter(|ch| matches!(ch,'`'|'~')).and_then(|ch| {
             let count=body.chars().take_while(|value| *value==ch).count();
-            (line.len()-body.len()<=3 && count>=3).then_some((ch,count))
+            let valid_open = !(fence.is_none() && ch == '`' && body[count..].contains('`'));
+            (line.len()-body.len()<=3 && count>=3 && valid_open).then_some((ch,count))
         });
         let inside_fence=fence.is_some();
         if let Some((ch,count))=code {
@@ -103,7 +265,7 @@ pub fn normalize_callouts(input: &str) -> String {
             depth-=1;output.push_str("> ".repeat(depth).trim_end());output.push('\n');
         } else { output.push_str(&"> ".repeat(depth));output.push_str(line);output.push('\n'); }
     }
-    output
+    normalize_wikilinks_outside_code(&output)
 }
 
 /// Protect complete math spans on actual table rows before GFM splits columns.
@@ -605,5 +767,46 @@ P(A\cup B\cup C)=&P(A)+P(B)+P(C)\\
 
         let pdf_bytes = export(md, &PdfOptions::default(), &HashMap::new()).unwrap();
         assert!(pdf_bytes.starts_with(b"%PDF-"));
+    }
+    #[test]
+    fn normalizes_wikilinks_outside_code_and_exports_clean_pdf_labels() {
+        let md = [
+            "# Bayes Overview",
+            "",
+            "Follow [[Task Note]], [[Lecture 2#Bayes Law|Bayes]], [[study.smd]], [Deck](study.smd), and [[#Bayes Overview|Back to overview]].",
+            "",
+            "| Link | Code |",
+            "| --- | --- |",
+            "| [[Lecture 2#Bayes|Bayes cell]] | `[[Task Note]]` and `` `![[raw.png]]` `` |",
+            "",
+            "```python",
+            "arr = [[1, 2], [3, 4]]",
+            "note = '[[Literal]]'",
+            "```",
+            "",
+        ].join("\n");
+        let normalized = normalize_callouts(&md);
+        assert!(normalized.contains("[Task Note](Task%20Note.md)"), "{normalized}");
+        assert!(normalized.contains("[Bayes](Lecture%202.md#bayes-law)"), "{normalized}");
+        assert!(normalized.contains("[study.smd](study.smd)"), "{normalized}");
+        assert!(normalized.contains("[Back to overview](#bayes-overview)"), "{normalized}");
+        assert!(normalized.contains("[Bayes cell](Lecture%202.md#bayes)"), "{normalized}");
+        assert!(normalized.contains("`[[Task Note]]`"), "{normalized}");
+        assert!(normalized.contains("`` `![[raw.png]]` ``"), "{normalized}");
+        assert!(normalized.contains("arr = [[1, 2], [3, 4]]"), "{normalized}");
+        assert!(normalized.contains("note = '[[Literal]]'"), "{normalized}");
+
+        let typst = source(&md, &PdfOptions::default(), &HashMap::new()).unwrap();
+        assert!(typst.contains("#text(\"Task Note\")"), "{typst}");
+        assert!(typst.contains("#text(\"Bayes\")"), "{typst}");
+        assert!(typst.contains("#text(\"Deck\")"), "{typst}");
+        assert!(typst.contains("#link(label(\"smd-bayes-overview\"))[#text(\"Back to overview\")]"), "{typst}");
+        assert!(!typst.contains("#text(\"[["), "No prose wikilink brackets in Typst output: {typst}");
+        assert!(!typst.contains("\\["), "No escaped brackets in Typst output: {typst}");
+        assert!(typst.contains("#raw(\"[[Task Note]]\")"), "{typst}");
+
+        let pdf = export(&md, &PdfOptions::default(), &HashMap::new()).unwrap();
+        assert!(pdf.starts_with(b"%PDF-"));
+        assert!(pdf.len() > 2_000);
     }
 }

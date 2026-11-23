@@ -116,6 +116,13 @@ internal class ReaderBridge(
                     "load_python_output" -> loadPythonOutput(args)
                     "load_asset" -> model.asset(args.getString("documentPath"), args.getString("source"))
                     "load_text_asset" -> model.textAsset(args.getString("documentPath"), args.getString("source"))
+                    "open_relative_note" -> {
+                        val heading = if (!args.has("heading") || args.isNull("heading")) null else {
+                            args.opt("heading") as? String ?: error("Invalid heading target")
+                        }
+                        model.openRelativeNote(args.getString("documentPath"), args.getString("target"), heading)
+                        true
+                    }
                     "resolve_reader_asset" -> withContext(Dispatchers.IO) {
                         val source = args.getString("source")
                         val (noteId, asset) = model.resolveReaderAsset(args.getString("documentPath"), source)
@@ -471,15 +478,49 @@ fun configureReader(web: WebView, model: StudioViewModel, scope: CoroutineScope,
         override fun onReceivedError(view: WebView, request: WebResourceRequest, error: android.webkit.WebResourceError) {
             if (request.isForMainFrame) model.fail("The document reader could not load. Please reopen the note.")
         }
-        override fun shouldOverrideUrlLoading(view: WebView, request: WebResourceRequest): Boolean {
-            // The bridge is available only in the bundled offline reader. Never
-            // navigate this WebView to a page from a note or external website.
-            if (request.url.host == "appassets.androidplatform.net" && request.url.path == "/assets/web/android-reader.html") return false
-            if (request.isForMainFrame && request.url.scheme in listOf("https", "http", "mailto")) runCatching { view.context.startActivity(Intent(Intent.ACTION_VIEW, request.url)) }
-            return true
-        }
+        override fun shouldOverrideUrlLoading(view: WebView, request: WebResourceRequest): Boolean =
+            handleReaderUrlOverride(view, request.url, request.isForMainFrame)
+        @Deprecated("Deprecated in Java")
+        override fun shouldOverrideUrlLoading(view: WebView, url: String): Boolean =
+            handleReaderUrlOverride(view, runCatching { android.net.Uri.parse(url) }.getOrNull(), isForMainFrame = true)
     }
     web.setTag(R.id.reader_bridge_tag, bridge)
     web.addJavascriptInterface(bridge, "SuperMD")
     web.loadUrl("https://appassets.androidplatform.net/assets/web/android-reader.html")
 }
+
+internal enum class ReaderNavigationDecision { ALLOW_READER, BLOCK_INTERNAL, OPEN_EXTERNAL }
+
+internal fun decideReaderNavigation(url: android.net.Uri?, isForMainFrame: Boolean): ReaderNavigationDecision {
+    if (url == null) return ReaderNavigationDecision.BLOCK_INTERNAL
+    // The bridge is available only in the bundled offline reader. Never
+    // navigate this WebView to a page from a note or external website, and
+    // never forward appassets.androidplatform.net URLs to an external browser.
+    if (url.host.equals("appassets.androidplatform.net", ignoreCase = true)) {
+        return if (url.scheme.equals("https", ignoreCase = true) && url.path == "/assets/web/android-reader.html") {
+            ReaderNavigationDecision.ALLOW_READER
+        } else {
+            ReaderNavigationDecision.BLOCK_INTERNAL
+        }
+    }
+    val scheme = url.scheme?.lowercase()
+    if (isForMainFrame && scheme in listOf("https", "http", "mailto")) {
+        return ReaderNavigationDecision.OPEN_EXTERNAL
+    }
+    return ReaderNavigationDecision.BLOCK_INTERNAL
+}
+
+private fun handleReaderUrlOverride(view: WebView, url: android.net.Uri?, isForMainFrame: Boolean): Boolean =
+    when (decideReaderNavigation(url, isForMainFrame)) {
+        ReaderNavigationDecision.ALLOW_READER -> false
+        ReaderNavigationDecision.OPEN_EXTERNAL -> {
+            if (url != null) runCatching {
+                val intent = Intent(Intent.ACTION_VIEW, url).apply {
+                    if (view.context !is android.app.Activity) addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+                }
+                view.context.startActivity(intent)
+            }
+            true
+        }
+        ReaderNavigationDecision.BLOCK_INTERNAL -> true
+    }

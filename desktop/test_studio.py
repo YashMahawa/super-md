@@ -1041,3 +1041,134 @@ class StudioTest(unittest.TestCase):
         studio.post("flush","document_flushed",json.dumps({"id":studio.active,"content":"Stale draft","operation":previous}))
         self.assertNotEqual(studio._current()["content"],"Stale draft")
         self.assertEqual(studio.flush_operation["action"],"save")
+
+    def test_open_relative_note_opens_contained_targets_and_emits_one_shot_pending_heading(self):
+        studio = self.studio
+        studio.ready = True
+        loads = []
+        replies = []
+        studio.readerLoad.connect(lambda raw: loads.append(json.loads(raw)))
+        studio.replied.connect(lambda req_id, value, err: replies.append((req_id, value, err)))
+
+        import tempfile
+        temp = tempfile.TemporaryDirectory()
+        self.addCleanup(temp.cleanup)
+        folder = Path(temp.name) / "workspace"
+        sub = folder / "sub"
+        sub.mkdir(parents=True)
+        index_note = folder / "Index.md"
+        task_note = folder / "Task Note.md"
+        lecture_note = folder / "Lecture 2.md"
+        deck_note = sub / "study.smd"
+        index_note.write_text("# Index\n\n[[Task Note]]\n", encoding="utf-8")
+        task_note.write_text("# Task Note\n\nBody\n", encoding="utf-8")
+        lecture_note.write_text("# Lecture 2\n\n## Bayes\n\nPosterior\n", encoding="utf-8")
+        deck_note.write_text("# Portable text deck\n", encoding="utf-8")
+
+        studio.openFolder(str(folder))
+        studio.openNote(str(index_note))
+        self._wait_for(lambda: studio._current()["path"] == str(index_note))
+        loads.clear()
+        replies.clear()
+
+        studio.post("rel-1", "open_relative_note", json.dumps({
+            "documentPath": str(index_note),
+            "target": "Task%20Note.md",
+        }))
+        self._wait_for(lambda: any(r[0] == "rel-1" for r in replies))
+        self.assertEqual(replies[-1], ("rel-1", "true", ""))
+        self.assertEqual(studio._current()["path"], str(task_note))
+        self.assertNotIn("pendingHeading", loads[-1])
+
+        loads.clear()
+        replies.clear()
+        studio.post("rel-2", "open_relative_note", json.dumps({
+            "documentPath": str(task_note),
+            "target": "Lecture%202.md",
+            "heading": "bayes",
+        }))
+        self._wait_for(lambda: any(r[0] == "rel-2" for r in replies))
+        self.assertEqual(replies[-1], ("rel-2", "true", ""))
+        self.assertEqual(studio._current()["path"], str(lecture_note))
+        self.assertEqual(loads[-1].get("pendingHeading"), "bayes")
+
+        # Subsequent emits must not re-send the one-shot pendingHeading.
+        loads.clear()
+        studio._emit()
+        self.assertNotIn("pendingHeading", loads[-1])
+
+        # Opening a subfolder .smd note and navigating back up within the authorized workspace folder succeeds.
+        replies.clear()
+        studio.post("rel-3", "open_relative_note", json.dumps({
+            "documentPath": str(lecture_note),
+            "target": "sub/study.smd",
+        }))
+        self._wait_for(lambda: any(r[0] == "rel-3" for r in replies))
+        self.assertEqual(replies[-1], ("rel-3", "true", ""))
+        self.assertEqual(studio._current()["path"], str(deck_note))
+
+        loads.clear()
+        replies.clear()
+        studio.post("rel-4", "open_relative_note", json.dumps({
+            "documentPath": str(deck_note),
+            "target": "../Lecture%202.md",
+            "heading": "bayes",
+        }))
+        self._wait_for(lambda: any(r[0] == "rel-4" for r in replies))
+        self.assertEqual(replies[-1], ("rel-4", "true", ""))
+        self.assertEqual(studio._current()["path"], str(lecture_note))
+        self.assertEqual(loads[-1].get("pendingHeading"), "bayes")
+
+    def test_open_relative_note_rejects_unsaved_notes_traversal_encoded_separators_null_bytes_and_symlinks(self):
+        studio = self.studio
+        studio.ready = True
+        replies = []
+        studio.replied.connect(lambda req_id, value, err: replies.append((req_id, value, err)))
+
+        # Unsaved note surfaces a status notice.
+        studio.newNote()
+        unsaved_id = studio.active
+        studio.post("unsaved", "open_relative_note", json.dumps({
+            "documentPath": unsaved_id,
+            "target": "Task%20Note.md",
+        }))
+        self.assertEqual(replies[-1][0], "unsaved")
+        self.assertIn("Save this note", replies[-1][2])
+        self.assertEqual(studio.message, "Save this note before opening linked notes.")
+
+        import tempfile
+        temp = tempfile.TemporaryDirectory()
+        self.addCleanup(temp.cleanup)
+        folder = Path(temp.name) / "guarded"
+        folder.mkdir(parents=True)
+        outside = Path(temp.name) / "outside.md"
+        outside.write_text("# Secret\n", encoding="utf-8")
+        inside = folder / "Inside.md"
+        inside.write_text("# Inside\n", encoding="utf-8")
+        symlink_note = folder / "Symlink.md"
+        symlink_note.symlink_to(outside)
+
+        studio.openNote(str(inside))
+        self._wait_for(lambda: studio._current()["path"] == str(inside))
+
+        for index, bad_target in enumerate([
+            "../outside.md",
+            "sub%2f..%2f..%2foutside.md",
+            "sub%5cnote.md",
+            "bad%00.md",
+            "bad\x00.md",
+            "/etc/passwd.md",
+            "Symlink.md",
+        ]):
+            replies.clear()
+            studio.message = ""
+            req = f"bad-{index}"
+            studio.post(req, "open_relative_note", json.dumps({
+                "documentPath": str(inside),
+                "target": bad_target,
+            }))
+            self.assertEqual(replies[-1][0], req)
+            self.assertEqual(replies[-1][1], "null")
+            self.assertTrue(bool(replies[-1][2]), f"Expected rejection for {bad_target}")
+            self.assertEqual(studio.message, replies[-1][2])
+            self.assertEqual(studio._current()["path"], str(inside))

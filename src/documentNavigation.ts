@@ -28,6 +28,49 @@ export function remarkHeadingIds() {
     });
   };
 }
+export interface RelativeNoteLink {
+  target: string;
+  heading?: string;
+}
+
+export const UNSAVED_RELATIVE_NOTE_NOTICE = "Save this note before opening linked notes.";
+const RELATIVE_NOTE_EXTENSION = /\.(?:md|smd|markdown|fmd)$/i;
+const EXTERNAL_OR_SCHEME_HREF = /^[a-zA-Z][a-zA-Z0-9+.-]*:/;
+let beforeRelativeNoteOpen: (() => Promise<void> | void) | null = null;
+
+export function registerBeforeRelativeNoteOpen(handler: (() => Promise<void> | void) | null): () => void {
+  beforeRelativeNoteOpen = handler;
+  return () => { if (beforeRelativeNoteOpen === handler) beforeRelativeNoteOpen = null; };
+}
+
+export async function prepareRelativeNoteOpen(): Promise<void> {
+  if (beforeRelativeNoteOpen) await beforeRelativeNoteOpen();
+}
+
+export function isLocalHref(href: string | undefined | null): boolean {
+  if (!href) return true;
+  const trimmed = href.trim();
+  if (!trimmed || trimmed.startsWith("#")) return true;
+  if (trimmed.startsWith("//") || EXTERNAL_OR_SCHEME_HREF.test(trimmed)) return false;
+  return true;
+}
+
+export function parseRelativeNoteLink(href: string | undefined | null): RelativeNoteLink | null {
+  if (!href) return null;
+  const trimmed = href.trim();
+  if (!trimmed || trimmed.startsWith("#") || trimmed.startsWith("//") || EXTERNAL_OR_SCHEME_HREF.test(trimmed)) return null;
+  const hashIndex = trimmed.indexOf("#");
+  const beforeHash = hashIndex >= 0 ? trimmed.slice(0, hashIndex) : trimmed;
+  const queryIndex = beforeHash.indexOf("?");
+  const target = (queryIndex >= 0 ? beforeHash.slice(0, queryIndex) : beforeHash).trim();
+  if (!target || !RELATIVE_NOTE_EXTENSION.test(target)) return null;
+  const rawHeading = hashIndex >= 0 ? trimmed.slice(hashIndex + 1).trim() : "";
+  if (!rawHeading) return { target };
+  let heading = rawHeading;
+  try { heading = decodeURIComponent(rawHeading); } catch { /* literal fragment */ }
+  return heading ? { target, heading } : { target };
+}
+
 export function navigateHeading(link: HTMLAnchorElement): boolean {
   const href = link.getAttribute("href"); if (!href?.startsWith("#")) return false;
   let target = href.slice(1); try { target = decodeURIComponent(target); } catch { /* literal fragment */ }

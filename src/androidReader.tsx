@@ -36,7 +36,7 @@ import {rememberWindowedScrollSource} from './windowedSearch';
 import ReadingSearch from "./components/ReadingSearch";
 import type { Point } from "./focalZoom";
 import { applyDocumentZoom,documentPoint,invalidateDocumentZoom,settleDocumentZoom,refreshDocumentExtent,enforceDocumentCenter } from "./documentZoom";
-import { documentOutline, navigateToHeading, cancelHeadingNavigation } from "./documentNavigation";
+import { documentOutline, headingSlug, navigateToHeading, cancelHeadingNavigation, registerBeforeRelativeNoteOpen } from "./documentNavigation";
 import { readerSourceAnalysis } from "./readerSourceAnalysis";
 import {OutlineWorkerClient} from './outlineWorker';
 import {recordHistory,replayHistory,historySize,validHistory,type NoteHistory} from './noteHistory';
@@ -59,7 +59,7 @@ declare global { interface Window { supermdLoad?: (state: ReaderState) => void; 
 declare global { interface Window {supermdChromeInset?:(height:number)=>void} }
 declare global { interface Window {supermdSavePosition?:()=>void} }
 declare global {interface Window {supermdExportPhase?:(id:string,phase:'typesetting'|'publishing')=>void}}
-interface ReaderState { centerLock?:boolean; customStyle?:CustomStyle; restorePosition?:boolean; readingLocation?:ReadingLocation|null; imageAppearance?:MediaAppearance; svgAppearance?:MediaAppearance; imageContrast?:number }
+interface ReaderState { centerLock?:boolean; customStyle?:CustomStyle; restorePosition?:boolean; readingLocation?:ReadingLocation|null; pendingHeading?:string|null; imageAppearance?:MediaAppearance; svgAppearance?:MediaAppearance; imageContrast?:number }
 /** Pure snapshot operations for native-owned inactive tabs. `content` is added
  * only by the trusted native router and is never accepted from MCP requests. */
 export async function computeAgentDocumentRequest(request:Record<string,unknown>):Promise<Record<string,unknown>> {
@@ -152,6 +152,16 @@ function Reader() {
     if(!selectingText.current)document.querySelectorAll<HTMLElement>('.android-reading').forEach(settleDocumentZoom);
   },240);};
   const modeOffset=useRef<number|null>(null);
+  const pendingHeadingRef=useRef<{id:string;heading:string}|null>(null);
+  const [headingJumpNonce,setHeadingJumpNonce]=useState(0);
+  useEffect(()=>registerBeforeRelativeNoteOpen(async()=>{
+    savePosition.current();
+    const current=reference.current;
+    if(!current)return;
+    if((current as ReaderState&{editProtocol?:number}).editProtocol===1&&edits.current!.unacknowledged(current.id)!==undefined){
+      await edits.current!.flush(current.id);
+    }
+  }),[]);
   const anchors = (focus?:Point) => Array.from(document.querySelectorAll<HTMLElement>(".android-reading,.cm-scroller")).filter(root=>{const r=root.getBoundingClientRect();return !focus || focus.x>=r.left&&focus.x<=r.right&&focus.y>=r.top&&focus.y<=r.bottom;}).map(root=>captureScrollAnchor(root,focus));
   const applyZoomStyle=(focus?:Point,previousFocus=focus,anchors?:Map<HTMLElement,Point|null>)=>{document.querySelector<HTMLElement>(".android-source")?.style.setProperty("--workspace-scale",String(zoomReference.current/100));document.querySelectorAll<HTMLElement>(".android-reading").forEach(root=>applyDocumentZoom(root,zoomReference.current,reference.current?.widthPercent??90,focus,previousFocus,anchors?.get(root),reference.current?.centerLock===true));};
   const anchored = (update:()=>void) => { const restore = anchors(); update(); requestAnimationFrame(()=>restore.forEach(callback=>callback())); };
@@ -178,7 +188,8 @@ function Reader() {
     window.supermdLoad = (incoming) => {
       const old = reference.current;
       // Native omits content it received from this reader, unchanged since.
-      const {contentUnchanged,...rest}=incoming as ReaderState&{contentUnchanged?:boolean};
+      const {contentUnchanged,pendingHeading,...rest}=incoming as ReaderState&{contentUnchanged?:boolean;pendingHeading?:string|null};
+      const requestedHeading=typeof pendingHeading==="string"&&pendingHeading.trim()?pendingHeading.trim():null;
       if(contentUnchanged&&(!old||old.id!==rest.id))return;
       const next=(contentUnchanged?{...rest,content:old!.content}:rest) as ReaderState;
       if(old&&(old.id!==next.id||old.mode!==next.mode||old.fullscreen!==next.fullscreen)){nativeScroll.clear();gapSelection.current?.end();}
@@ -200,7 +211,7 @@ function Reader() {
         const root=document.querySelector<HTMLElement>(".android-reading");
         modeOffset.current=old.mode==="editor"?(editorReadingOffset(old.id)??0):root?readingOffset(root):0;
       }
-      if(old&&[...new Set([...Object.keys(old),...Object.keys(next)])].every(key=>key==="zoom"&&old.fullscreen===next.fullscreen?true:key==="viewState"?!next.viewState:key==="colors"||key==="customStyle"?JSON.stringify((old as any)[key])===JSON.stringify((next as any)[key]):(old as any)[key]===(next as any)[key]))return;
+      if(!requestedHeading&&old&&[...new Set([...Object.keys(old),...Object.keys(next)])].every(key=>key==="zoom"&&old.fullscreen===next.fullscreen?true:key==="viewState"?!next.viewState:key==="colors"||key==="customStyle"?JSON.stringify((old as any)[key])===JSON.stringify((next as any)[key]):(old as any)[key]===(next as any)[key]))return;
       if (old && old.id !== next.id) {
         savePosition.current();
         noteViews.current.set(old.id, {top: document.querySelector<HTMLElement>(".android-reading")?.scrollTop ?? 0});
@@ -214,6 +225,11 @@ function Reader() {
         if(validHistory(history))histories.current.set(next.id,{undo:structuredClone(history.undo),redo:structuredClone(history.redo),last:0});
         trimHistories(next.id);
         noteViews.current.set(next.id, {top:next.viewState.top});
+      }
+      if(requestedHeading){
+        const cached=noteViews.current.get(next.id);
+        if(cached)cached.top=undefined;
+        pendingHeadingRef.current={id:next.id,heading:requestedHeading};
       }
       // Native snapshots may have been queued before the latest pinch frame.
       // Within one workspace mode the reader owns its gesture scale; explicit
@@ -230,8 +246,9 @@ function Reader() {
         void invoke("zoom_changed",{zoom:loaded.zoom,fullscreen:true});
       }
       if(old && !sameViewport){window.clearTimeout(zoomTimer.current);cancelAnimationFrame(zoomFrame.current);zoomFrame.current=0;zoomTarget.current=null;}
-      const load = () => { reference.current=loaded;setState(loaded); zoomReference.current = loaded.zoom; };
-      if (old?.id === next.id && old.mode === next.mode) anchored(load); else load();
+      const hasPendingHeading = Boolean(requestedHeading) || pendingHeadingRef.current?.id === next.id;
+      const load = () => { reference.current=loaded;setState(loaded); if(requestedHeading)setHeadingJumpNonce(value=>value+1); zoomReference.current = loaded.zoom; };
+      if (!hasPendingHeading && old?.id === next.id && old.mode === next.mode) anchored(load); else load();
     };
     window.supermdHistory=direction=>{
       if(document.querySelector('.theme-guide-dialog'))return;
@@ -440,6 +457,28 @@ function Reader() {
   useLayoutEffect(() => {
     if (!state) return;
     const startingInput=scrollInputVersion();
+    const pendingHeading=pendingHeadingRef.current?.id===state.id?pendingHeadingRef.current.heading:null;
+    if(pendingHeading){
+      pendingHeadingRef.current=null;
+      modeOffset.current=null;
+      let stopped=false;const stop=()=>{stopped=true;};
+      const inputs=["wheel","touchstart","pointerdown","keydown"] as const;
+      inputs.forEach(name=>window.addEventListener(name,stop,{capture:true,passive:true}));
+      const jump=()=>{
+        if(stopped||scrollInputVersion()!==startingInput)return;
+        if(state.mode==="editor"){
+          const match=documentOutline(state.content).find(entry=>entry.id===pendingHeading||entry.id===headingSlug(pendingHeading));
+          if(match)window.dispatchEvent(new CustomEvent("supermd-goto-offset",{detail:match.offset}));
+          return;
+        }
+        const host=document.querySelector<HTMLElement>(".android-reading");
+        if(host)navigateToHeading(host,pendingHeading);
+      };
+      jump();
+      const frame=requestAnimationFrame(()=>{jump();requestAnimationFrame(jump);});
+      const timers=[120,320,700].map(delay=>window.setTimeout(jump,delay));
+      return()=>{stopped=true;cancelAnimationFrame(frame);timers.forEach(window.clearTimeout);inputs.forEach(name=>window.removeEventListener(name,stop,{capture:true}));};
+    }
     const saved=state.restorePosition!==false?(state.readingLocation??loadReadingLocation(state.path===state.id?null:state.path)):undefined;
     const top = noteViews.current.get(state.id)?.top ?? (saved?.mode===state.mode&&Math.abs(saved.zoom-zoomReference.current)<1?saved.top:undefined);
     if(modeOffset.current!==null){
@@ -474,7 +513,7 @@ function Reader() {
     const frame=requestAnimationFrame(()=>{restore();requestAnimationFrame(restore);});
     const timers=[120,320,700].map(delay=>window.setTimeout(restore,delay));
     return()=>{stopped=true;cancelAnimationFrame(frame);timers.forEach(window.clearTimeout);inputs.forEach(name=>window.removeEventListener(name,stop,{capture:true}));};
-  }, [state?.id, state?.mode]);
+  }, [state?.id, state?.mode, headingJumpNonce]);
   useEffect(()=>{
     if(!state||state.restorePosition===false)return;
     const path=state.path===state.id?null:state.path;if(!path)return;
@@ -707,8 +746,8 @@ function Reader() {
     {repairing && <MathRepairPanel content={state.content} apply={update} close={()=>setRepairing(false)} />}
     <MediaTools key={state.id} documentId={state.id} content={state.content} documentPath={state.path} onInsert={(text, point) => { const content = reference.current!.content; const from = Math.min(point?.from ?? content.length, content.length); const to = Math.max(from, Math.min(point?.to ?? from, content.length)); update(content.slice(0, from) + text + content.slice(to)); }} onNotice={(error) => { void invoke("export_failed", { error }); }} />
     {(state.mode === "editor" || state.mode === "split") && <section className="android-source"><SourceEditor key={state.id} sessionId={state.id} value={state.content} onChange={update} dark={state.dark} focusMode={state.fullscreen} latexAutofix={state.latexAutofix} spellCheck={state.spellCheck} grammarCheck={state.grammarCheck} /></section>}
-    {state.mode === "live" && <section className="android-reading" data-full-document-accessibility={state.fullDocumentAccessibility ? "true" : undefined}><div className="reader-chrome-spacer" aria-hidden="true"/><div key={state.id} className="document-page-space"><div className="document-page"><LiveDocument key={state.id} latexAutofix={state.latexAutofix} spellCheck={state.spellCheck} grammarCheck={state.grammarCheck} markdown={state.content} onChange={update} documentPath={state.path} python={state.python || "embedded"} dark={false} trustedImageHosts={trustedHosts} onTrustImageHost={trustHost} fullDocumentAccessibility={state.fullDocumentAccessibility} /></div></div></section>}
-    {(state.mode === "reader" || state.mode === "split") && <section className="android-reading" data-full-document-accessibility={state.fullDocumentAccessibility ? "true" : undefined}><div className="reader-chrome-spacer" aria-hidden="true"/><div key={state.id} className="document-page-space"><div className="document-page"><DocumentPreview markdown={state.content} onChange={update} documentPath={state.path} python={state.python || "embedded"} dark={false} trustedImageHosts={trustedHosts} onTrustImageHost={trustHost} fullDocumentAccessibility={state.fullDocumentAccessibility} sourceAnalysis={readerAnalysis?.source===state.content?readerAnalysis:undefined} /></div></div></section>}
+    {state.mode === "live" && <section className="android-reading" data-full-document-accessibility={state.fullDocumentAccessibility ? "true" : undefined}><div className="reader-chrome-spacer" aria-hidden="true"/><div key={state.id} className="document-page-space"><div className="document-page"><LiveDocument key={state.id} latexAutofix={state.latexAutofix} spellCheck={state.spellCheck} grammarCheck={state.grammarCheck} markdown={state.content} onChange={update} documentPath={state.path} savedDocumentPath={state.path === state.id ? null : state.path} python={state.python || "embedded"} dark={false} trustedImageHosts={trustedHosts} onTrustImageHost={trustHost} fullDocumentAccessibility={state.fullDocumentAccessibility} /></div></div></section>}
+    {(state.mode === "reader" || state.mode === "split") && <section className="android-reading" data-full-document-accessibility={state.fullDocumentAccessibility ? "true" : undefined}><div className="reader-chrome-spacer" aria-hidden="true"/><div key={state.id} className="document-page-space"><div className="document-page"><DocumentPreview markdown={state.content} onChange={update} documentPath={state.path} savedDocumentPath={state.path === state.id ? null : state.path} python={state.python || "embedded"} dark={false} trustedImageHosts={trustedHosts} onTrustImageHost={trustHost} fullDocumentAccessibility={state.fullDocumentAccessibility} sourceAnalysis={readerAnalysis?.source===state.content?readerAnalysis:undefined} /></div></div></section>}
   </div></DocumentAppearance.Provider>;
 }
 createRoot(document.getElementById("root")!).render(<Reader />);
