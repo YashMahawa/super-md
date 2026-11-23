@@ -1356,6 +1356,13 @@ class StudioViewModel(app: Application, val workspaceKey: String = "main") : And
                 NativeExportFormat.MARKDOWN -> withContext(Dispatchers.IO) {
                     staged.writeText(content, Charsets.UTF_8)
                 }
+                NativeExportFormat.MARKDOWN_ZIP -> withContext(Dispatchers.IO) {
+                    val markdownName = filename.substringBeforeLast('.') + ".md"
+                    MarkdownExport(getApplication(), markdownName, content, assets).use { bundle ->
+                        staged.outputStream().use(bundle::writeZip)
+                    }
+                    verifyExportHeader(staged, nativeFormat)
+                }
             }
             val minimumSize = if (nativeFormat == NativeExportFormat.MARKDOWN) 0L else 1L
             require(staged.length() in minimumSize..(128L * 1024 * 1024)) { "Agent downloads are limited to 128 MiB per export" }

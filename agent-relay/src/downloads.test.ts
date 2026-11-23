@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import {createHash} from 'node:crypto';
 import {ExportDownloads,EXPORT_CHUNK_BYTES,MAX_DOWNLOAD_BYTES} from './downloads.js';
 const hash=(data:Buffer)=>createHash('sha256').update(data).digest('hex');
-const meta=(data:Buffer,format='pdf')=>({downloadable:true,status:'completed',filename:'Study notes 猫.'+format,format,bytes:data.length,sha256:hash(data)});
+const meta=(data:Buffer,format='pdf')=>({downloadable:true,status:'completed',filename:'Study notes 猫.'+(format==='mdzip'?'zip':format),format,bytes:data.length,sha256:hash(data)});
 
 test('only completed bounded exports receive expiring file capabilities',()=>{
  let now=1000;const downloads=new ExportDownloads(()=>now,100,2),data=Buffer.from('%PDF-1.7\n');
@@ -14,8 +14,9 @@ test('only completed bounded exports receive expiring file capabilities',()=>{
 });
 
 test('downloads stream bounded chunks and verify the complete artifact for every format',async()=>{
- for(const format of ['pdf','md','smd']){
+ for(const format of ['pdf','md','mdzip','smd']){
   const data=Buffer.alloc(EXPORT_CHUNK_BYTES+17,42),downloads=new ExportDownloads(),lease=downloads.issue('g','d','j',meta(data,format))!;
+  if(format==='mdzip')assert.equal(lease.mimeType,'application/zip');
   const chunks:Buffer[]=[],requests:number[]=[];
   for await(const chunk of downloads.stream(lease.token,async(info,offset,limit)=>{
    requests.push(limit);assert.equal(info.groupId,'g');assert.equal(info.jobId,'j');

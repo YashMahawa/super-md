@@ -146,6 +146,7 @@ class AgentSessionIntegrityTests(unittest.TestCase):
             ("résumé draft.pdf", "pdf", b"%PDF-1.7\n" + bytes(range(256)) * 3, "application/pdf"),
             ("note with spaces.smd", "smd", b"PK\x03\x04portable-notes", "application/x-supermd"),
             ("日本語.md", "md", "# Café 🧪\nbody\n".encode("utf-8"), "text/markdown"),
+            ("bundle archive.zip", "mdzip", b"PK\x03\x04markdown-zip", "application/zip"),
         ]
         for index, (filename, fmt, data, mime) in enumerate(artifacts):
             with self.subTest(format=fmt):
@@ -171,6 +172,56 @@ class AgentSessionIntegrityTests(unittest.TestCase):
                     self.assertEqual(chunk["nextOffset"], offset + len(part))
                     offset = chunk["nextOffset"]
                 self.assertEqual(b"".join(pieces), data)
+
+    def test_agent_export_native_mdzip_writes_complete_zip_archive_with_svg_assets(self):
+        import json
+        import zipfile
+
+        path = self.root / "Study.md"
+        source = "# Study\n\nLink [[Concept Note]]\n\n![Diagram](<image1.svg>)\n"
+        path.write_text(source, encoding="utf-8")
+        tab = self._tab_for(path)
+        revision = hashlib.sha256(source.encode("utf-8")).hexdigest()
+        svg_bytes = b'<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 20 20"><circle cx="10" cy="10" r="5"/></svg>'
+        svg_uri = "data:image/svg+xml;base64," + base64.b64encode(svg_bytes).decode("ascii")
+
+        replies = []
+        self.studio.replied.connect(lambda rid, payload, err: replies.append((rid, payload, err)))
+        self.studio._agent_export_native("req-mdzip-1", {
+            "id": tab["id"],
+            "format": "mdzip",
+            "expectedRevision": revision,
+            "filename": "Study",
+            "content": source,
+            "assets": {"image1.svg": svg_uri},
+            "options": {},
+        })
+        self.assertEqual(len(replies), 1)
+        started = json.loads(replies[0][1])
+        self.assertEqual(started["format"], "mdzip")
+        self.assertEqual(started["filename"], "Study.zip")
+        job_id = started["jobId"]
+
+        deadline = time.monotonic() + 5
+        while self.studio._agent_job_status(job_id)["status"] == "running" and time.monotonic() < deadline:
+            self.app.processEvents()
+            time.sleep(0.01)
+
+        status = self.studio._agent_job_status(job_id)
+        self.assertEqual(status["status"], "completed")
+        self.assertEqual(status["format"], "mdzip")
+        self.assertTrue(status["downloadable"])
+        zip_path = Path(status["path"])
+        self.assertEqual(zip_path.name, "Study.zip")
+        with zipfile.ZipFile(zip_path) as archive:
+            self.assertEqual(set(archive.namelist()), {"Study.md", "image1.svg"})
+            self.assertEqual(archive.read("Study.md").decode("utf-8"), source)
+            self.assertEqual(archive.read("image1.svg"), svg_bytes)
+
+        chunk = self.studio._agent_export_chunk(job_id, 0, 262_144)
+        self.assertEqual(chunk["mimeType"], "application/zip")
+        self.assertEqual(chunk["format"], "mdzip")
+        self.assertEqual(base64.b64decode(chunk["body"]), zip_path.read_bytes())
 
     def test_export_chunks_require_completed_export_and_unchanged_file(self):
         data = b"completed artifact"
