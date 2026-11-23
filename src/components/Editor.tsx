@@ -12,9 +12,20 @@ import {addPersonalWord,hasPersonalWord,normalizeDictionaryWord,subscribePersona
 import { search, searchKeymap, highlightSelectionMatches, openSearchPanel, SearchQuery, setSearchQuery } from "@codemirror/search";
 import { oneDarkHighlightStyle } from "@codemirror/theme-one-dark";
 import type {SourceChange} from '../readerEdits';
+import {
+  TYPEWRITER_SHORTCUT,
+  centerCursorEffect,
+  getTypewriterScroll,
+  setTypewriterScroll,
+  toggleTypewriterScroll,
+  typewriterScrollExtension,
+  useTypewriterScroll,
+} from "../typewriterScroll";
 
 interface Props extends WritingOptions {
   latexAutofix?:boolean;
+  typewriterScroll?:boolean;
+  onTypewriterChange?:(enabled:boolean)=>void;
   sessionId?: string;
   value: string;
   onChange: (value: string, changes?:SourceChange[]) => void;
@@ -22,7 +33,7 @@ interface Props extends WritingOptions {
   focusMode: boolean;
 }
 
-const sessions = new Map<string, { state: EditorState; top: number; appearance: Compartment; wrapping: Compartment; proofing:Compartment; wrapped: boolean }>();
+const sessions = new Map<string, { state: EditorState; top: number; appearance: Compartment; wrapping: Compartment; proofing:Compartment; typewriter: Compartment; wrapped: boolean; typewriterActive: boolean }>();
 function trimEditorSessions() {
   // Bound retained undo trees across tabs by text volume, not only tab count.
   // The native model still owns every note; evicting a view cannot lose text.
@@ -32,13 +43,15 @@ function trimEditorSessions() {
     sessions.delete(id); retained -= entry.state.doc.length;
     callbacks.delete(id); statusHandlers.delete(id);
     rangeHandlers.delete(id);
-    pasteSettings.delete(id);
+    pasteSettings.delete(id); typewriterHandlers.delete(id); typewriterStates.delete(id);
   }
 }
 const callbacks = new Map<string, (value: string,changes?:SourceChange[]) => void>();
 const pasteSettings=new Map<string,boolean>();
 const statusHandlers = new Map<string, (state: EditorState) => void>();
 const rangeHandlers = new Map<string, (range: { from: number; to: number }) => void>();
+const typewriterHandlers = new Map<string, ((enabled: boolean) => void) | undefined>();
+const typewriterStates = new Map<string, boolean>();
 const visibleEditors = new Map<string, EditorView>();
 
 function sourceProofreadingRange(editor: EditorView): { from: number; to: number } {
@@ -92,11 +105,25 @@ function unclosedDisplayMathBefore(state: EditorState, limit: number): boolean {
   }
   return count % 2 === 1;
 }
+function toggleTypewriterFromView(editor: EditorView): boolean {
+  for (const [id, activeView] of visibleEditors) {
+    if (activeView === editor) {
+      const next = !(typewriterStates.get(id) ?? getTypewriterScroll());
+      const handler = typewriterHandlers.get(id);
+      setTypewriterScroll(next, { persist: !handler });
+      handler?.(next);
+      return true;
+    }
+  }
+  toggleTypewriterScroll();
+  return true;
+}
 export function editorKeyBindings(host: string | undefined = typeof document === "undefined" ? undefined : document.documentElement.dataset.host): KeyBinding[] {
   // Qt owns application shortcuts and forwards undo/redo/find through native
   // commands. Android and browser builds retain CodeMirror's normal keymaps.
   const nativeShortcuts = host === "qt";
-  return [...defaultKeymap, ...(nativeShortcuts ? [] : historyKeymap), ...(nativeShortcuts ? [] : searchKeymap), ...foldKeymap, indentWithTab];
+  const typewriterBinding: KeyBinding[] = nativeShortcuts ? [] : [{ key: TYPEWRITER_SHORTCUT, run: toggleTypewriterFromView }];
+  return [...typewriterBinding, ...defaultKeymap, ...(nativeShortcuts ? [] : historyKeymap), ...(nativeShortcuts ? [] : searchKeymap), ...foldKeymap, indentWithTab];
 }
 export function editorReadingOffset(id:string):number|undefined {
   const view=visibleEditors.get(id);if(!view)return;
@@ -116,14 +143,14 @@ export function editorFindRange(id:string,from:number,to:number) {
   const view=visibleEditors.get(id);if(!view)return;
   view.dispatch({selection:{anchor:from,head:to},effects:EditorView.scrollIntoView(from,{y:"center"})});
 }
-export interface PortableEditorSession { state: unknown; top: number; wrapped: boolean }
+export interface PortableEditorSession { state: unknown; top: number; wrapped: boolean; typewriter?: boolean }
 const incomingSessions = new Map<string, PortableEditorSession>();
 const incomingWeights=new Map<string,number>();
 export function exportEditorSession(id: string): PortableEditorSession | undefined {
   const view = visibleEditors.get(id), cached = sessions.get(id);
   const state = view?.state || cached?.state;
   if (!state) return;
-  const result = {state: state.toJSON({history: historyField}), top: view?.scrollDOM.scrollTop ?? cached?.top ?? 0, wrapped: view?.lineWrapping ?? cached?.wrapped ?? true};
+  const result = {state: state.toJSON({history: historyField}), top: view?.scrollDOM.scrollTop ?? cached?.top ?? 0, wrapped: view?.lineWrapping ?? cached?.wrapped ?? true, typewriter: typewriterStates.get(id) ?? cached?.typewriterActive ?? getTypewriterScroll()};
   // View metadata is transient, bounded and never part of portable Markdown.
   if (JSON.stringify(result).length <= 2_000_000) return result;
 }
@@ -134,8 +161,9 @@ export function importEditorSession(id: string, data: PortableEditorSession | un
   incomingWeights.set(id,size);let retained=[...incomingWeights.values()].reduce((n,size)=>n+size,0);
   while(incomingSessions.size>40||retained>4_000_000){const first=incomingSessions.keys().next().value!;incomingSessions.delete(first);retained-=incomingWeights.get(first)||0;incomingWeights.delete(first);}
 }
-export default function Editor({ sessionId = "default", value, onChange, dark, focusMode,spellCheck=false,grammarCheck=false,latexAutofix=false }: Props) {
+export default function Editor({ sessionId = "default", value, onChange, dark, focusMode,spellCheck=false,grammarCheck=false,latexAutofix=false,typewriterScroll,onTypewriterChange }: Props) {
   pasteSettings.set(sessionId,latexAutofix);
+  typewriterHandlers.set(sessionId,onTypewriterChange);
   const host = useRef<HTMLDivElement>(null);
   const view = useRef<EditorView | null>(null);
   const changeHandler = useRef(onChange);
@@ -149,6 +177,11 @@ export default function Editor({ sessionId = "default", value, onChange, dark, f
   const [dictionaryRevision,setDictionaryRevision]=useState(0);
   rangeHandlers.set(sessionId,setProofRange);
   const filterSavedDiagnostics=(diagnostics:readonly Diagnostic[],state:EditorState)=>diagnostics.filter(d=>!(d.source==="Spelling"&&hasPersonalWord(state.sliceDoc(d.from,d.to))));
+  const typewriter = useRef(new Compartment());
+  const activeTypewriter = useTypewriterScroll(typewriterScroll);
+  const typewriterReference = useRef(activeTypewriter); typewriterReference.current = activeTypewriter;
+  typewriterStates.set(sessionId, activeTypewriter);
+  const appliedTypewriter = useRef(activeTypewriter);
   const writingExtension=()=>!spellCheck&&!grammarCheck?[]:linter(async editor=>{
     const {from,to}=sourceProofreadingRange(editor);
     lastLintedRange.current={from,to};
@@ -212,8 +245,12 @@ export default function Editor({ sessionId = "default", value, onChange, dark, f
     if (!host.current) return;
     const cached = sessions.get(sessionId);
     const incoming = incomingSessions.get(sessionId); incomingSessions.delete(sessionId);incomingWeights.delete(sessionId);
-    if (incoming) setWrap(incoming.wrapped);
-    if (cached) { appearance.current = cached.appearance; wrapping.current = cached.wrapping;proofing.current=cached.proofing; setWrap(cached.wrapped); }
+    if (incoming) {
+      setWrap(incoming.wrapped);
+      if (typeof incoming.typewriter === "boolean" && typewriterScroll === undefined) setTypewriterScroll(incoming.typewriter, { persist: false });
+    }
+    if (cached) { appearance.current = cached.appearance; wrapping.current = cached.wrapping;proofing.current=cached.proofing; typewriter.current = cached.typewriter; setWrap(cached.wrapped); }
+    const initialTypewriter = typeof incoming?.typewriter === "boolean" && typewriterScroll === undefined ? incoming.typewriter : activeTypewriter;
     const config = {
       doc: value,
       extensions: [
@@ -245,6 +282,7 @@ export default function Editor({ sessionId = "default", value, onChange, dark, f
         EditorState.allowMultipleSelections.of(true),
         wrapping.current.of(EditorView.lineWrapping),
         proofing.current.of(writingExtension()),
+        typewriter.current.of(typewriterScrollExtension(initialTypewriter)),
         EditorView.updateListener.of((update) => {
           if (update.docChanged) {
             const changes:SourceChange[]=[];
@@ -268,9 +306,14 @@ export default function Editor({ sessionId = "default", value, onChange, dark, f
     }
     view.current = new EditorView({ state, parent: host.current });
     visibleEditors.set(sessionId, view.current);
+    if (cached && state === cached.state && cached.typewriterActive !== initialTypewriter) {
+      view.current.dispatch({ effects: typewriter.current.reconfigure(typewriterScrollExtension(initialTypewriter)) });
+    }
+    appliedTypewriter.current = initialTypewriter;
     describeSelection(view.current.state);
     if (cached) view.current.scrollDOM.scrollTop = cached.top;
     if (incoming) view.current.scrollDOM.scrollTop = Math.max(0, incoming.top);
+    if (!cached && !incoming && initialTypewriter) view.current.dispatch({ effects: centerCursorEffect(view.current.state) });
     if (view.current.state.doc.length > PROOFREADING_MAX_CHARS) setProofRange(sourceProofreadingRange(view.current));
     let scrollTimer: ReturnType<typeof setTimeout> | undefined;
     const onScroll = () => {
@@ -291,7 +334,7 @@ export default function Editor({ sessionId = "default", value, onChange, dark, f
       clearTimeout(scrollTimer);
       view.current?.scrollDOM.removeEventListener("scroll", onScroll);
       visibleEditors.delete(sessionId);
-      if (view.current) { sessions.delete(sessionId); sessions.set(sessionId, { state: view.current.state, top: view.current.scrollDOM.scrollTop, appearance: appearance.current, wrapping: wrapping.current,proofing:proofing.current, wrapped: wrapReference.current }); trimEditorSessions(); view.current.destroy(); }
+      if (view.current) { sessions.delete(sessionId); sessions.set(sessionId, { state: view.current.state, top: view.current.scrollDOM.scrollTop, appearance: appearance.current, wrapping: wrapping.current,proofing:proofing.current, typewriter: typewriter.current, wrapped: wrapReference.current, typewriterActive: typewriterReference.current }); trimEditorSessions(); view.current.destroy(); }
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [sessionId]);
@@ -315,6 +358,22 @@ export default function Editor({ sessionId = "default", value, onChange, dark, f
     if(instance.state.doc.length>PROOFREADING_MAX_CHARS)setProofRange(sourceProofreadingRange(instance));
     instance.dispatch({effects:proofing.current.reconfigure(writingExtension())});
   },[spellCheck,grammarCheck,sessionId,dictionaryRevision]);
+  useEffect(() => {
+    const instance = view.current;
+    if (!instance || appliedTypewriter.current === activeTypewriter) return;
+    appliedTypewriter.current = activeTypewriter;
+    const beforePad = Number.parseFloat(getComputedStyle(instance.scrollDOM).paddingTop) || 0;
+    instance.dispatch({
+      effects: [
+        typewriter.current.reconfigure(typewriterScrollExtension(activeTypewriter)),
+        ...(activeTypewriter ? [centerCursorEffect(instance.state)] : []),
+      ],
+    });
+    if (!activeTypewriter) {
+      const afterPad = Number.parseFloat(getComputedStyle(instance.scrollDOM).paddingTop) || 0;
+      if (afterPad !== beforePad) instance.scrollDOM.scrollTop = Math.max(0, instance.scrollDOM.scrollTop + (afterPad - beforePad));
+    }
+  }, [activeTypewriter, sessionId]);
 
   useEffect(() => {
     const instance = view.current;
@@ -388,6 +447,7 @@ export default function Editor({ sessionId = "default", value, onChange, dark, f
       <span ref={position} className="source-position">Ln 1, Col 1</span>
       {showProofRange && <span className="source-proofreading-range" role="status">12,000-character range ({(clampedFrom + 1).toLocaleString("en-US")}–{clampedTo.toLocaleString("en-US")} of {value.length.toLocaleString("en-US")})</span>}
       <span className="source-status-spacer" />
+      <button type="button" aria-pressed={activeTypewriter} title="Toggle typewriter scrolling (Ctrl+Alt+T)" onClick={() => { const next = !activeTypewriter; setTypewriterScroll(next, { persist: !onTypewriterChange }); onTypewriterChange?.(next); }}>Typewriter</button>
       <button type="button" aria-pressed={wrap} title="Toggle line wrapping" onClick={() => setWrap(current => !current)}>Wrap lines</button>
       <span className="source-encoding">UTF-8</span>
     </footer>

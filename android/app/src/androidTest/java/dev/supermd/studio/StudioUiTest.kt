@@ -42,6 +42,7 @@ class StudioUiTest {
                 model.mode(before.mode)
                 model.zoom(before.normalZoom)
                 model.centerLock(before.centerLock)
+                model.typewriterScroll(before.typewriterScroll)
                 model.flush()
                 assertEquals(before.active.content, model.state.value.active.content)
             }
@@ -233,6 +234,37 @@ class StudioUiTest {
             compose.waitUntil(10_000){model.state.value.active.content=="$$\n\\frac{a}{b}\n$$"}
         } finally {
             compose.runOnIdle {model.latexAutofix(oldAutofix);model.edit(model.state.value.active.id,original)}
+        }
+    }
+    @Test fun typewriterScrollIsOptInAndSyncsBetweenSettingsAndReaderStatus() {
+        welcome()
+        val model = androidx.lifecycle.ViewModelProvider(compose.activity)[StudioViewModel::class.java]
+        temporaryNoteState = model.state.value
+        val oldTypewriter = model.state.value.typewriterScroll
+        val prefs = compose.activity.getSharedPreferences("studio", 0)
+        try {
+            assertFalse(StudioState().typewriterScroll)
+            compose.runOnIdle { model.typewriterScroll(false); model.mode("editor") }
+            compose.waitUntil(15_000) { model.state.value.mode == "editor" }
+            javascriptUntil("document.querySelector('.source-editor-status button')?.getAttribute('aria-pressed') === 'false'", { it == "true" })
+
+            compose.onNodeWithContentDescription("More actions").performClick()
+            compose.onNodeWithText("Settings").performClick()
+            compose.onNodeWithText("Writing & shortcuts").performClick()
+            compose.onNodeWithText("Typewriter scrolling").assertExists()
+            compose.onAllNodes(isToggleable()).onFirst().performClick()
+            compose.runOnIdle {
+                assertTrue(model.state.value.typewriterScroll)
+                assertTrue(prefs.getBoolean("typewriterScroll", false))
+            }
+            compose.onNodeWithContentDescription("Back").performClick()
+            compose.onNodeWithContentDescription("Back").performClick()
+
+            javascriptUntil("(()=>{const b=[...document.querySelectorAll('.source-editor-status button')].find(b=>b.textContent==='Typewriter');return b?.getAttribute('aria-pressed')==='true'})()", { it == "true" })
+            javascriptUntil("(()=>{const b=[...document.querySelectorAll('.source-editor-status button')].find(b=>b.textContent==='Typewriter');if(!b)return false;b.click();return true})()", { it == "true" })
+            compose.waitUntil(5_000) { !model.state.value.typewriterScroll && !prefs.getBoolean("typewriterScroll", true) }
+        } finally {
+            compose.runOnIdle { model.typewriterScroll(oldTypewriter) }
         }
     }
     @Test fun externalOpenActivatesNewAndAlreadyOpenFileTabs() {
