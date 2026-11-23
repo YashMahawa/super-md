@@ -62,8 +62,12 @@ export function buildSandboxCsp(scriptSha256Base64: string): string {
 }
 
 export function buildSandboxHtml(iifeScript: string, sha256OfEscapedScript: (escapedScript: string) => string): string {
-  // Escape closing script tags before hashing so the exact inline text bytes match the CSP digest.
-  const escaped = iifeScript.replace(/<\/(script)/gi, "<\\/$1");
+  // Match HTML5 input stream preprocessing (\r\n / \r -> \n, NUL -> U+FFFD) and escape
+  // closing script tags before hashing so inline script bytes match browser/Tauri CSP digests.
+  const escaped = iifeScript
+    .replace(/\r\n?/g, "\n")
+    .replace(/\0/g, "\uFFFD")
+    .replace(/<\/(script)/gi, "<\\/$1");
   const digest = sha256OfEscapedScript(escaped);
   const csp = buildSandboxCsp(digest);
   return `<!doctype html><html><head><meta charset="utf-8"><meta http-equiv="Content-Security-Policy" content="${csp}"></head><body style="margin:0;padding:0;overflow:hidden"><script>${escaped}</script></body></html>`;

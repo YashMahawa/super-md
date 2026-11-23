@@ -12,7 +12,10 @@ export function buildHtmlEntries(mode: string) {
 }
 
 function renderSandboxDocument(iifeScript: string): string {
-  const escaped = iifeScript.replace(/<\/(script)/gi, "<\\/$1");
+  const escaped = iifeScript
+    .replace(/\r\n?/g, "\n")
+    .replace(/\0/g, "\uFFFD")
+    .replace(/<\/(script)/gi, "<\\/$1");
   const digest = createHash("sha256").update(escaped, "utf8").digest("base64");
   const csp = [
     "default-src 'none'",
@@ -169,7 +172,13 @@ export default defineConfig(({mode}) => ({
   // Its equivalent table decoder also works in the offline writing worker.
   resolve: {alias:{"decode-named-character-reference":fileURLToPath(new URL("./node_modules/decode-named-character-reference/index.js",import.meta.url))}},
   clearScreen: false,
-  server: { port: 1420, strictPort: true },
+  server: {
+    port: 1420,
+    strictPort: true,
+    watch: {
+      ignored: ["**/src-tauri/target/**", "**/smd-core/target/**", "**/android/**/build/**", "**/desktop/.venv/**"],
+    },
+  },
   envPrefix: ["VITE_", "TAURI_"]
   ,build: { rollupOptions: { input: buildHtmlEntries(mode) } }
 }));

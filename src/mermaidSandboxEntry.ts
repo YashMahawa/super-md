@@ -1,3 +1,4 @@
+import "./mermaidSandboxInit";
 import mermaid from "mermaid";
 import { installMermaidSandboxWorker } from "./mermaidSandboxWorker";
 

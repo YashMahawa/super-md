@@ -120,7 +120,8 @@ test("renders complex fallback Mermaid diagrams in an opaque-origin sandbox with
     canReadSandboxDoc: false,
   });
 
-  // Also verify from inside the live sandbox frame via Playwright's frame handle that window.parent.SuperMD is unreachable.
+  // Also verify from inside the live sandbox frame via Playwright's frame handle that both
+  // window.parent.SuperMD and any frame-injected window.SuperMD (e.g. Android addJavascriptInterface) are unreachable.
   const childFrame = page.frames().find(f => f !== page.mainFrame());
   expect(childFrame).toBeDefined();
   const parentProbe = await childFrame!.evaluate(() => {
@@ -131,10 +132,21 @@ test("renders complex fallback Mermaid diagrams in an opaque-origin sandbox with
     } catch {
       parentBridge = "SecurityError";
     }
-    return { origin: window.origin, parentBridge };
+    const selfWin = window as unknown as Record<string, unknown>;
+    try {
+      selfWin.SuperMD = { restored: true };
+    } catch {
+      // Non-writable property in strict mode.
+    }
+    return {
+      origin: window.origin,
+      parentBridge,
+      selfBridge: typeof selfWin.SuperMD,
+    };
   });
   expect(parentProbe.origin).toBe("null");
   expect(["SecurityError", "unreachable"]).toContain(parentProbe.parentBridge);
+  expect(parentProbe.selfBridge).toBe("undefined");
   expect(externalRequests).toEqual([]);
 });
 

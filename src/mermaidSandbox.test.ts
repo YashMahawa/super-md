@@ -9,6 +9,7 @@ vi.mock("mermaid", () => ({ default: engine }));
 vi.mock("pele/lazy", () => fast);
 
 import { cachedMermaid, renderMermaid, sanitizeDiagram } from "./mermaidRenderer";
+import { scrubSandboxHostBridges } from "./mermaidSandboxBootstrap";
 import { MermaidSandboxClient, resetSharedMermaidSandbox } from "./mermaidSandboxHost";
 import {
   MAX_MERMAID_SOURCE_CHARS,
@@ -40,12 +41,39 @@ describe("Mermaid sandbox isolation and message channel", () => {
     expect(csp).toContain("child-src 'none'");
 
     let hashedInput = "";
-    const html = buildSandboxHtml("console.log('</script><script>evil()')", escaped => {
+    const html = buildSandboxHtml("console.log('a')\r\nconsole.log('</script><script>evil()')", escaped => {
       hashedInput = escaped;
       return "digest==";
     });
+    expect(hashedInput).not.toContain("\r");
     expect(hashedInput).not.toContain("</script>");
     expect(html).toContain(`<script>${hashedInput}</script>`);
+  });
+
+  it("scrubs and locks host-injected WebView and Tauri bridges inside the sandbox realm", () => {
+    const fakeScope: Record<string, unknown> = {
+      SuperMD: { post: vi.fn(), agentReply: vi.fn() },
+      qt: { webChannelTransport: {} },
+      QWebChannel: function FakeChannel() {},
+    };
+    Object.defineProperty(fakeScope, "__TAURI_INTERNALS__", {
+      value: { invoke: vi.fn(), postMessage: vi.fn(), plugins: { fs: true } },
+      writable: false,
+      configurable: false,
+    });
+
+    scrubSandboxHostBridges(fakeScope);
+
+    expect(fakeScope.SuperMD).toBeUndefined();
+    expect(fakeScope.qt).toBeUndefined();
+    expect(fakeScope.QWebChannel).toBeUndefined();
+    expect(Object.getOwnPropertyDescriptor(fakeScope, "SuperMD")?.configurable).toBe(false);
+    expect(Object.getOwnPropertyDescriptor(fakeScope, "SuperMD")?.writable).toBe(false);
+
+    const tauriInternals = fakeScope.__TAURI_INTERNALS__ as Record<string, unknown>;
+    expect(tauriInternals.invoke).toBeUndefined();
+    expect(tauriInternals.postMessage).toBeUndefined();
+    expect(tauriInternals.plugins).toBeUndefined();
   });
 
   it("mounts the sandboxed iframe outside document.body without allow-same-origin", async () => {
