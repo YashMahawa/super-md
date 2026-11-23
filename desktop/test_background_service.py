@@ -5,7 +5,7 @@ from unittest.mock import patch
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
-from PySide6.QtCore import QEvent, QLockFile, QObject, QPointF, QStandardPaths, Qt, QUrl, Signal
+from PySide6.QtCore import QEvent, QLockFile, QObject, QPointF, QStandardPaths, Qt, QTimer, QUrl, Signal
 from PySide6.QtNetwork import QLocalServer
 from PySide6.QtQml import QQmlComponent, QQmlEngine
 from PySide6.QtQuick import QQuickItem
@@ -394,6 +394,13 @@ class BackgroundTests(unittest.TestCase):
             toggle = find_named("keepInBackgroundSwitch")
             self.assertIsInstance(toggle, QQuickItem)
             self.assertFalse(bool(toggle.property("checked")))
+            scroll = find_named("settingsScroll")
+            if scroll is not None:
+                scroll_content = scroll.property("contentItem")
+                if scroll_content is not None:
+                    top = toggle.mapToItem(scroll_content, QPointF(0, 0)).y()
+                    scroll_content.setProperty("contentY", max(0.0, top - 48.0))
+                    QTest.qWait(40)
             with patch("background_service.QSystemTrayIcon.isSystemTrayAvailable", return_value=False):
                 pt = toggle.mapToScene(QPointF(toggle.width() / 2, toggle.height() / 2)).toPoint()
                 QTest.mouseClick(window, Qt.MouseButton.LeftButton, Qt.KeyboardModifier.NoModifier, pt)
@@ -672,7 +679,14 @@ threading.Thread(target=_reap_loop, daemon=True).start()
 cin, cout = sys.stdin, sys.stdout
 for raw in cin:
     cmd = json.loads(raw)
-    if cmd["kind"] == "quit": break
+    if cmd["kind"] == "quit":
+        with _spawned_lock:
+            lingering = list(_spawned_procs)
+        for p in lingering:
+            if p.poll() is None:
+                try: p.terminate()
+                except Exception: pass
+        break
     appdata = cmd["appdata"]
     with patch.object(QStandardPaths, "writableLocation", side_effect=lambda k, p=appdata: p if k == QStandardPaths.AppDataLocation else orig(k)):
         if cmd["kind"] == "claim":
@@ -1763,33 +1777,56 @@ desktop_main._exit_process(rc)""",
 
     def test_darwin_exit_bypass_and_vanished_closing_peer_start_handoff(self):
         # 1. Verify _exit_process uses os._exit on darwin once Qt/WebEngine anchored teardown ran,
-        #    and uses sys.exit otherwise, always flushing stdio first.
-        import main as desktop_main
-
-        saved_anchor = list(desktop_main._DARWIN_EXIT_ANCHOR)
-        try:
-            desktop_main._DARWIN_EXIT_ANCHOR[:] = [object()]
-            with patch.object(desktop_main.sys, "platform", "darwin"), patch.object(
-                desktop_main.os, "_exit"
-            ) as mock_os_exit, patch.object(desktop_main.sys, "exit") as mock_sys_exit:
-                desktop_main._exit_process(0)
-                mock_os_exit.assert_called_once_with(0)
-                mock_sys_exit.assert_not_called()
-
-            desktop_main._DARWIN_EXIT_ANCHOR.clear()
-            with patch.object(desktop_main.sys, "platform", "darwin"), patch.object(
-                desktop_main.os, "_exit"
-            ) as mock_os_exit, patch.object(desktop_main.sys, "exit") as mock_sys_exit:
-                desktop_main._exit_process(0)
-                mock_os_exit.assert_not_called()
-                mock_sys_exit.assert_called_once_with(0)
-        finally:
-            desktop_main._DARWIN_EXIT_ANCHOR[:] = saved_anchor
+        #    and uses sys.exit otherwise, always flushing stdio first. Run in a clean subprocess
+        #    because importing `main` loads QtWebEngineQuick, which must never be imported into a
+        #    shared process where QApplication was created without QtWebEngineQuick.initialize().
+        probe_script = "\n".join(
+            [
+                "import os, sys",
+                "from types import SimpleNamespace",
+                "from unittest.mock import MagicMock, patch",
+                f"sys.path.insert(0, {str(DESKTOP_DIR)!r})",
+                "import main as desktop_main",
+                "events = []",
+                "fake_app = MagicMock()",
+                "fake_app.sendPostedEvents.side_effect = lambda *_a: events.append('deferred_delete')",
+                "fake_studio = MagicMock()",
+                "fake_studio.stop.side_effect = lambda: events.append('studio_stop')",
+                "fake_session = SimpleNamespace(",
+                "    agent_bridge=MagicMock(stop=lambda: events.append('bridge_stop')),",
+                "    writes=MagicMock(shutdown=lambda wait=True: events.append(('writes_shutdown', wait))),",
+                "    background=None,",
+                ")",
+                "fake_broker = MagicMock()",
+                "fake_broker.close.side_effect = lambda: events.append('broker_close')",
+                "desktop_main._DARWIN_EXIT_ANCHOR.clear()",
+                "with patch.object(desktop_main.sys, 'platform', 'darwin'):",
+                "    desktop_main._run_teardown(fake_app, fake_session, [fake_studio], [MagicMock()], MagicMock(), fake_broker)",
+                "assert events == ['bridge_stop', 'studio_stop', ('writes_shutdown', True), 'broker_close'], events",
+                "assert desktop_main._DARWIN_EXIT_ANCHOR, 'Expected darwin exit anchor to hold teardown objects'",
+                "with patch.object(desktop_main.sys, 'platform', 'darwin'), patch.object(desktop_main.os, '_exit') as m_os, patch.object(desktop_main.sys, 'exit') as m_sys:",
+                "    desktop_main._exit_process(0)",
+                "    assert m_os.call_args_list == [((0,), {})], m_os.call_args_list",
+                "    assert not m_sys.called",
+                "desktop_main._DARWIN_EXIT_ANCHOR.clear()",
+                "with patch.object(desktop_main.sys, 'platform', 'darwin'), patch.object(desktop_main.os, '_exit') as m_os2, patch.object(desktop_main.sys, 'exit') as m_sys2:",
+                "    desktop_main._exit_process(0)",
+                "    assert not m_os2.called",
+                "    assert m_sys2.call_args_list == [((0,), {})], m_sys2.call_args_list",
+            ]
+        )
+        probe = subprocess.run(
+            [sys.executable, "-c", probe_script],
+            capture_output=True,
+            text=True,
+            timeout=20,
+        )
+        self.assertEqual(probe.returncode, 0, probe.stderr or probe.stdout)
 
         # 2. Simulate macOS XNU closing-socket race during `service start`:
         #    the initial client connect writes to a dying server (e.g. UnknownSocketError / empty read
-        #    while the server was briefly still bound), and by the next millisecond both the server
-        #    socket and native-instance.lock are gone. `service start` must treat the vanished peer
+        #    while the server was briefly still bound), and while that read fails both the server
+        #    socket and native-instance.lock vanish. `service start` must treat the vanished peer
         #    as stopped and spawn the replacement daemon instead of failing with exit code 2.
         self.broker.close()
         vanished_appdata = (self.temp_appdata / "Vanished Peer On Start").resolve()
@@ -1801,15 +1838,18 @@ desktop_main._exit_process(rc)""",
         dying_server.setSocketOptions(QLocalServer.SocketOption.UserAccessOption)
         held = []
 
+        def close_dying():
+            for s in held:
+                s.abort()
+            dying_server.close()
+            QLocalServer.removeServer(socket_name)
+
         def on_dying_connect():
             while dying_server.hasPendingConnections():
                 sock = dying_server.nextPendingConnection()
                 held.append(sock)
-                if len(held) >= 2:
-                    for s in held:
-                        s.abort()
-                    dying_server.close()
-                    QLocalServer.removeServer(socket_name)
+                if len(held) == 2:
+                    QTimer.singleShot(20, close_dying)
 
         dying_server.newConnection.connect(on_dying_connect)
         self.assertTrue(dying_server.listen(socket_name))

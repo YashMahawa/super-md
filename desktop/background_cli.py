@@ -87,12 +87,16 @@ def main(argv):
         except ValueError as error:
             if 'Invalid response' in str(error):raise
             if not _instance_lock_held():
-                probe=QLocalSocket();probe.connectToServer(name)
-                still_listening=probe.waitForConnected(100)
-                probe.abort();probe.close()
-                if still_listening:raise
+                vanish_deadline=time.monotonic()+.5
+                still_listening=True
+                while still_listening and not _instance_lock_held() and time.monotonic()<vanish_deadline:
+                    probe=QLocalSocket();probe.connectToServer(name)
+                    still_listening=probe.waitForConnected(100)
+                    probe.abort();probe.close()
+                    if still_listening:time.sleep(.05)
+                if still_listening and not _instance_lock_held():raise
                 reply=None
-            else:
+            if _instance_lock_held():
                 reply=None;init_deadline=time.monotonic()+8
                 while time.monotonic()<init_deadline:
                     reply=request('start',startup_poll=True)

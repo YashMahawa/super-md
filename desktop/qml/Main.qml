@@ -28,6 +28,7 @@ ApplicationWindow {
     onSettingsOpenChanged: settingsOpen ? settingsDialog.open() : settingsDialog.close()
     property bool closingAllowed: false
     property bool intentionalShutdown: false
+    property bool readerActivated: visible
     property bool readerRecoveryPending: false
     property bool readerRecoveryLoading: false
     property bool readerRecoveryExhausted: false
@@ -250,6 +251,12 @@ ApplicationWindow {
     Material.foreground: viewState.colors["on-surface"]
     color: viewState.colors.surface
     font.family: "Noto Sans"
+    onVisibleChanged: {
+        if (visible && !intentionalShutdown && !closingAllowed && !studio.retired && !readerRecoveryPending) {
+            readerActivated = true
+            if (!readerLoader.active) readerLoader.active = true
+        }
+    }
     onClosing: function(close) {
         if (window.visible && !windowModes.fullscreen) studio.rememberWindow(visibility === Window.Maximized ? viewState.settings.window.width : width, visibility === Window.Maximized ? viewState.settings.window.height : height, visibility === Window.Maximized)
         close.accepted = closingAllowed; if (closingAllowed) intentionalShutdown = true; else studio.closeWindowSafely()
@@ -262,7 +269,6 @@ ApplicationWindow {
             if (studio.backgroundEnabled && !studio.hasOtherOpenWindows()) { window.hide(); return }
             intentionalShutdown = true; closingAllowed = true
             readerRetryTimer.stop(); readerRecoveryRestoreTimer.stop(); readerStableTimer.stop()
-            readerLoader.active = false
             window.close()
         }
         function onFlushFailed(canClose) { if(!closingAllowed && !closeDialog.visible) { if (!window.visible) { window.show(); window.raise(); window.requestActivate() } flushDialog.canClose = canClose; flushDialog.open() } }
@@ -499,7 +505,7 @@ ApplicationWindow {
                     objectName: "documentReaderLoader"
                     Layout.fillWidth: true
                     Layout.fillHeight: true
-                    active: true
+                    active: window.readerActivated
                     sourceComponent: readerComponent
                     onItemChanged: window.readerViewChanged(item)
                 }

@@ -1,6 +1,6 @@
 """Tray-owned application lifetime; closing a window preserves its live note session when opted in."""
 from pathlib import Path
-from PySide6.QtCore import QCoreApplication, QEvent, QObject, QTimer
+from PySide6.QtCore import QObject, QTimer
 from PySide6.QtGui import QIcon
 from PySide6.QtWidgets import QSystemTrayIcon, QMenu
 
@@ -130,7 +130,6 @@ class BackgroundService(QObject):
         if not self.quitting:return
         if self.tray is not None:self.tray.hide()
         self.app.setQuitOnLastWindowClosed(True)
-        QCoreApplication.sendPostedEvents(None,QEvent.Type.DeferredDelete)
         self.app.quit()
     def quit(self):
         self._clear_quit_handlers();self.quitting=True

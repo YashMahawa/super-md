@@ -539,6 +539,28 @@ def _exit_process(status: int) -> None:
 
 def _run_teardown(app, session, studios, engines, asset_handler, broker):
     session.agent_bridge.stop()
+    for studio in list(studios):
+        studio.stop()
+        studio.pool.shutdown(wait=False, cancel_futures=True)
+    # Don't cancel a user's pending save or final recovery write.
+    session.writes.shutdown(wait=True)
+    if getattr(session, "background", None) is not None:
+        session.background._clear_quit_handlers()
+        session.background.open_window = None
+        if session.background.tray is not None:
+            session.background.tray.hide()
+    if broker:
+        broker.close()
+        broker.set_service_handler(None)
+    if sys.platform == "darwin":
+        # Anchor Qt/QML/WebEngine objects until _exit_process calls os._exit so
+        # C++ ~QQuickWebEngineView / ~StudioApplication destructors cannot
+        # deadlock on macOS Mach/Chromium threads after disk writes and instance
+        # locks are already flushed and closed.
+        _DARWIN_EXIT_ANCHOR.extend((app, session, list(studios), list(engines), asset_handler, broker))
+        studios.clear()
+        engines.clear()
+        return
     for engine in list(engines):
         for root_obj in engine.rootObjects():
             try:
@@ -547,36 +569,21 @@ def _run_teardown(app, session, studios, engines, asset_handler, broker):
                 root_obj.close()
             except RuntimeError:
                 pass
-    for studio in list(studios):
-        studio.stop()
-    # Destroy QML contexts while their Python backend objects are still alive.
-    for engine in list(engines):
         engine.deleteLater()
     engines.clear()
     app.sendPostedEvents(None, QEvent.Type.DeferredDelete)
-    app.processEvents()
     try:
         QWebEngineProfile.defaultProfile().removeUrlSchemeHandler(asset_handler)
     except RuntimeError:
         pass
     asset_handler.deleteLater()
-    app.sendPostedEvents(None, QEvent.Type.DeferredDelete)
     for studio in list(studios):
-        studio.pool.shutdown(wait=False, cancel_futures=True)
         studio.host_window = None
     studios.clear()
-    # Don't cancel a user's pending save or final recovery write.
-    session.writes.shutdown(wait=True)
     if getattr(session, "background", None) is not None:
-        session.background._clear_quit_handlers()
-        session.background.open_window = None
-        if session.background.tray is not None:
-            session.background.tray.hide()
         session.background.deleteLater()
         session.background = None
     if broker:
-        broker.close()
-        broker.set_service_handler(None)
         broker.deleteLater()
     for sig_name in ("aboutToQuit", "openRequested", "reopenRequested"):
         sig = getattr(app, sig_name, None)
@@ -586,8 +593,6 @@ def _run_teardown(app, session, studios, engines, asset_handler, broker):
             except (RuntimeError, TypeError):
                 pass
     app.sendPostedEvents(None, QEvent.Type.DeferredDelete)
-    if sys.platform == "darwin":
-        _DARWIN_EXIT_ANCHOR.append(app)
 
 
 if __name__ == "__main__":
