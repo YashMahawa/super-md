@@ -408,11 +408,15 @@ class MainActivity : ComponentActivity() {
         if (event.action == android.view.KeyEvent.ACTION_DOWN && event.repeatCount == 0) {
             if (event.keyCode == android.view.KeyEvent.KEYCODE_F11) { model.fullscreen(!model.state.value.fullscreen); return true }
             if (event.keyCode == android.view.KeyEvent.KEYCODE_ESCAPE && (model.state.value.fullscreen || model.state.value.readerOverlay)) { dismissDocument?.invoke() ?: model.fullscreen(false); return true }
+            if ((event.isCtrlPressed || event.isMetaPressed) && event.keyCode == android.view.KeyEvent.KEYCODE_S) {
+                if (event.isShiftPressed) model.beginSaveAs() else model.saveManual()
+                return true
+            }
             if (event.isCtrlPressed && event.keyCode == android.view.KeyEvent.KEYCODE_N) { newWindow(); return true }
             if (event.isCtrlPressed) {
                 when(event.keyCode) {
                     android.view.KeyEvent.KEYCODE_T -> { if(event.isShiftPressed)model.reopen() else model.newNote();return true }
-                    android.view.KeyEvent.KEYCODE_W -> { if(event.isShiftPressed)finish() else model.close(model.state.value.active.id);return true }
+                    android.view.KeyEvent.KEYCODE_W -> { if(event.isShiftPressed)finish() else model.requestClose(model.state.value.active.id);return true }
                     android.view.KeyEvent.KEYCODE_TAB -> { model.cycle(if(event.isShiftPressed)-1 else 1);return true }
                     android.view.KeyEvent.KEYCODE_PAGE_DOWN -> {model.cycle(1);return true}
                     android.view.KeyEvent.KEYCODE_PAGE_UP -> {model.cycle(-1);return true}
@@ -932,7 +936,8 @@ private object NoMotionScheme : MotionScheme {
     val themeExport = rememberLauncherForActivityResult(ActivityResultContracts.CreateDocument("application/json")) {it?.let {uri->model.exportCustomTheme(uri)}}
     var noteLocation by remember {mutableStateOf(model.noteLocation())}
     val noteFolder = rememberLauncherForActivityResult(ActivityResultContracts.OpenDocumentTree()) {it?.let {uri->runCatching{model.noteLocation(uri);noteLocation=uri.toString()}.onFailure{model.fail("Could not remember this folder: ${it.message}")}}}
-    val save = rememberLauncherForActivityResult(NoteDestination("text/markdown", model::noteLocation)) { it?.let { uri -> model.save(uri) } }
+    val save = rememberLauncherForActivityResult(NoteDestination("text/markdown", model::noteLocation)) { uri -> if (uri != null) model.save(uri) else model.cancelSaveAs() }
+    val portableSaveAs = rememberLauncherForActivityResult(NoteDestination("application/vnd.supermd.smd", model::noteLocation)) { uri -> if (uri != null) model.completePortableSaveAs(uri) else model.cancelSaveAs() }
     val folder = rememberLauncherForActivityResult(ActivityResultContracts.OpenDocumentTree()) { it?.let { uri -> folderRelative = ""; model.setFolder(uri) } }
     val pdf = rememberLauncherForActivityResult(NoteDestination("application/pdf", model::noteLocation)) { uri ->
         if (uri != null) { readerPdfOwnsProgress = true; model.setPdfDestination(uri); model.busy(true); web?.evaluateJavascript("window.supermdExport?.(${state.pdf})", null) ?: model.fail("The reader is not ready. Open the note again.") }
@@ -988,7 +993,22 @@ private object NoMotionScheme : MotionScheme {
         onDispose { activity.setAgentUiHandler(null) }
     }
     DisposableEffect(portable, state.active.name) { model.requestPortable = { portable.launch(state.active.name.substringBeforeLast('.') + ".smd") }; onDispose { model.requestPortable = null } }
-    val saveAction: () -> Unit = { if (model.requestWriteAccessIfBlocked(state.active.id, explicit = true)) Unit else if (state.active.uri == null) save.launch(state.active.name.substringBeforeLast('.') + ".md") else if (state.active.portable) { model.busy(true); web?.evaluateJavascript("window.supermdPortable?.(true)", null) ?: model.fail("The reader is not ready") } else model.save(); Unit }
+    DisposableEffect(save, portableSaveAs, model) {
+        model.requestSaveAs = { note ->
+            if (note.portable) portableSaveAs.launch(note.name.substringBeforeLast('.') + ".smd")
+            else save.launch(note.name.substringBeforeLast('.') + ".md")
+        }
+        onDispose { model.requestSaveAs = null }
+    }
+    DisposableEffect(web, readerReady, model) {
+        model.requestPortableWrite = if (readerReady && web != null) { saveInPlace ->
+            model.busy(true)
+            web?.evaluateJavascript("window.supermdPortable?.($saveInPlace)", null)
+            true
+        } else null
+        onDispose { model.requestPortableWrite = null }
+    }
+    val saveAction: () -> Unit = { model.saveManual() }
     LaunchedEffect(state.message) { state.message?.let { snackbar.showSnackbar(it); model.dismissMessage() } }
     val immersive = (state.fullscreen || !readingChromeVisible || state.readerOverlay) && !settings
     LaunchedEffect(immersive, dark) {
@@ -1024,7 +1044,7 @@ private object NoMotionScheme : MotionScheme {
         }
         val headings by model.headings.collectAsStateWithLifecycle()
         val imageOverlay by model.imageOverlay.collectAsStateWithLifecycle()
-        val chromeShown = !state.readerOverlay && !imageOverlay && readingChromeVisible
+        val chromeShown = !state.readerOverlay && !imageOverlay && (readingChromeVisible || state.activeConflicted)
         val chromeReveal by animateFloatAsState(if(chromeShown) 1f else 0f,
             animationSpec=tween(if(motion) 120 else 0),label="Reading chrome")
         LaunchedEffect(readerReady,chromeHeight) {
@@ -1083,12 +1103,15 @@ private object NoMotionScheme : MotionScheme {
                         .graphicsLayer {translationY=-size.height*(1f-chromeReveal);alpha=chromeReveal}
                         .then(if(chromeShown) Modifier else Modifier.clearAndSetSemantics {})
                         .background(palette.surfaceContainerLow).themeArtwork(state,"toolbar")) {
-                        TopAppBar(windowInsets=WindowInsets.statusBarsIgnoringVisibility.union(WindowInsets.displayCutout).only(WindowInsetsSides.Top+WindowInsetsSides.Horizontal), colors = TopAppBarDefaults.topAppBarColors(containerColor = Color.Transparent), title = { Column { Text(state.active.name, maxLines = 1, overflow = TextOverflow.Ellipsis, style = MaterialTheme.typography.titleMedium); Text(if (model.documentWriteNeedsAccess(state.active.id)) "Local draft · restore file access" else if (state.active.dirty) "Draft recovered automatically" else if (state.active.uri != null) "Saved" else "Local draft", style = MaterialTheme.typography.labelSmall, color = palette.onSurfaceVariant) } }, navigationIcon = { IconButton(onClick = { if (state.fullscreen) contentsShown=true else { scope.launch { drawer.open() }; state.folder?.let { if (state.files.isEmpty()) model.listFolder(android.net.Uri.parse(it), "") } } }) { Icon(painterResource(if(state.fullscreen) R.drawable.symbol_contents else R.drawable.symbol_sidebar), if(state.fullscreen) "Show contents" else "Open files") } }, actions = {
+                        TopAppBar(windowInsets=WindowInsets.statusBarsIgnoringVisibility.union(WindowInsets.displayCutout).only(WindowInsetsSides.Top+WindowInsetsSides.Horizontal), colors = TopAppBarDefaults.topAppBarColors(containerColor = Color.Transparent), title = { Column { Text(state.active.name, maxLines = 1, overflow = TextOverflow.Ellipsis, style = MaterialTheme.typography.titleMedium); Text(if (model.documentWriteNeedsAccess(state.active.id)) "Local draft · restore file access" else if (state.activeConflicted) "Changed on disk · autosave paused" else if (state.active.dirty) "Draft recovered automatically" else if (state.active.uri != null) "Saved" else "Local draft", style = MaterialTheme.typography.labelSmall, color = palette.onSurfaceVariant) } }, navigationIcon = { IconButton(onClick = { if (state.fullscreen) contentsShown=true else { scope.launch { drawer.open() }; state.folder?.let { if (state.files.isEmpty()) model.listFolder(android.net.Uri.parse(it), "") } } }) { Icon(painterResource(if(state.fullscreen) R.drawable.symbol_contents else R.drawable.symbol_sidebar), if(state.fullscreen) "Show contents" else "Open files") } }, actions = {
                             IconButton(onClick = saveAction) { Icon(painterResource(R.drawable.symbol_save), "Save note") }
                             IconButton(onClick = { sharing = false; exporting = true }, enabled = readerReady && !state.busy) { Icon(painterResource(R.drawable.symbol_export), "Export") }
                             StudyIcon(if(state.fullscreen) "Exit fullscreen" else "Fullscreen study", if(state.fullscreen) R.drawable.symbol_fullscreen_exit else R.drawable.symbol_fullscreen) { model.fullscreen(!state.fullscreen) }
                             StudyIcon(if(state.centerLock) "Centre locked · unlock horizontal movement" else "Lock document to centre",if(state.centerLock) R.drawable.symbol_lock else R.drawable.symbol_lock_open) { model.centerLock(!state.centerLock) }
                             Box { IconButton(onClick = { menu = true }) { Icon(Icons.Rounded.MoreVert, "More actions") }; DropdownMenu(expanded = menu, onDismissRequest = { menu = false }) {
+                                DropdownMenuItem(text = { Text("Reopen closed tab") }, enabled = state.closedTabs.isNotEmpty(), onClick = { menu = false; model.reopen() }, leadingIcon = { Icon(painterResource(R.drawable.symbol_undo), null) })
+                                DropdownMenuItem(text = { Text("Save as") }, enabled = !state.busy, onClick = { menu = false; model.beginSaveAs() }, leadingIcon = { Icon(painterResource(R.drawable.symbol_save), null) })
+                                HorizontalDivider()
                                 DropdownMenuItem(text = { Text("New window") }, onClick = { menu = false; activity.newWindow() }, leadingIcon = { Icon(painterResource(R.drawable.symbol_open_window), null) })
                                 DropdownMenuItem(text = { Text("Share note") }, enabled = readerReady && !state.busy, onClick = { menu = false; sharing = true; exporting = true }, leadingIcon = { Icon(painterResource(R.drawable.symbol_share), null) })
                                 DropdownMenuItem(text = { Text("Insert image or link") }, onClick = { menu = false; web?.evaluateJavascript("window.supermdMedia?.()", null) }, leadingIcon = { Icon(painterResource(R.drawable.symbol_image), null) })
@@ -1098,12 +1121,20 @@ private object NoMotionScheme : MotionScheme {
                                 DropdownMenuItem(text = { Text("Settings") }, onClick = { menu = false; settingsSection = null; settings = true }, leadingIcon = { Icon(painterResource(R.drawable.symbol_settings), null) })
                             } }
                         })
-                        if(!state.fullscreen) NoteTabs(state.tabs, state.active.id, motion, model::select, model::close, model::reorder, model::newNote)
+                        if(!state.fullscreen) NoteTabs(state.tabs, state.active.id, motion, model::select, model::requestClose, model::reorder, model::newNote)
                         val modes = if (wide) listOf("live", "editor", "reader", "split") else listOf("live", "editor", "reader")
                         if(!state.fullscreen) Row(Modifier.fillMaxWidth().padding(horizontal = if (wide) 24.dp else 8.dp, vertical = 8.dp),verticalAlignment=Alignment.CenterVertically) {
                             SingleChoiceSegmentedButtonRow(Modifier.weight(1f)) { modes.forEachIndexed { index, mode -> SegmentedButton(selected = actualMode == mode, onClick = { model.mode(mode) }, colors = SegmentedButtonDefaults.colors(activeContainerColor = palette.primary, activeContentColor = palette.onPrimary), shape = SegmentedButtonDefaults.itemShape(index, modes.size)) { Text(when(mode) { "editor" -> "Source"; "reader" -> "Read"; "split" -> "Split"; else -> "Live" }) } } }
                             IconButton(onClick={web?.evaluateJavascript("window.supermdHistory?.('undo')",null)},enabled=readerReady){Icon(Icons.Rounded.Undo,"Undo (Ctrl+Z)")}
                             IconButton(onClick={web?.evaluateJavascript("window.supermdHistory?.('redo')",null)},enabled=readerReady){Icon(Icons.Rounded.Redo,"Redo (Ctrl+Y)")}
+                        }
+                        if (state.activeConflicted) {
+                            ConflictBanner(
+                                busy = state.busy,
+                                onSaveAs = { model.beginSaveAs() },
+                                onReload = { model.reloadFromDisk() },
+                                onOverwrite = { model.saveManual(forceOverwrite = true) },
+                            )
                         }
                         HorizontalDivider(color = palette.outlineVariant.copy(alpha = .55f))
                     }
@@ -1253,12 +1284,44 @@ private object NoMotionScheme : MotionScheme {
                 Text(request.detail ?: if(request.assetSource == null) DOCUMENT_ACCESS_MESSAGE else LINKED_ASSET_ACCESS_MESSAGE)
                 if (request.assetSource == null && request.noteId == state.active.id) TextButton(onClick = {
                     model.dismissDocumentAccess()
-                    if (state.active.portable) portable.launch(state.active.name.substringBeforeLast('.') + ".smd")
-                    else save.launch(state.active.name.substringBeforeLast('.') + ".md")
+                    model.beginSaveAs()
                 }) { Text("Save a copy instead") }
             } },
             confirmButton = { TextButton(onClick = { accessPickerShowing = true; accessPicker.launch(android.net.Uri.parse(request.uri)) }) { Text(if(request.assetSource == null) "Choose original file" else "Choose linked file") } },
             dismissButton = { TextButton(onClick = model::dismissDocumentAccess) { Text("Not now") } })
+    }
+    state.pendingCloseNote?.let { note ->
+        AlertDialog(
+            onDismissRequest = model::dismissCloseConfirmation,
+            title = { Text("Save changes to ${note.name}?") },
+            text = { Text("Save your changes before closing, or discard them.") },
+            confirmButton = {
+                Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                    TextButton(onClick = { model.resolveCloseConfirmation("discard") }) { Text("Discard") }
+                    Button(onClick = { model.resolveCloseConfirmation("save") }) { Text("Save") }
+                }
+            },
+            dismissButton = {
+                TextButton(onClick = { model.resolveCloseConfirmation("cancel") }) { Text("Cancel") }
+            },
+        )
+    }
+    state.pendingSaveConflictNote?.let { note ->
+        AlertDialog(
+            onDismissRequest = model::dismissSaveConflict,
+            icon = { Icon(painterResource(R.drawable.symbol_warning), null, tint = MaterialTheme.colorScheme.error) },
+            title = { Text("${note.name} changed on disk") },
+            text = { Text("This note was modified outside Super MD since you opened or last saved it. Save a copy to keep both versions, or overwrite the file on disk.") },
+            confirmButton = {
+                Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                    TextButton(onClick = { model.resolveSaveConflict("overwrite") }) { Text("Overwrite") }
+                    Button(onClick = { model.resolveSaveConflict("save_as") }) { Text("Save as") }
+                }
+            },
+            dismissButton = {
+                TextButton(onClick = { model.resolveSaveConflict("cancel") }) { Text("Cancel") }
+            },
+        )
     }
     state.error?.let { AlertDialog(onDismissRequest = model::dismissError, title = { Text("Couldn't finish") }, text = { Text(it, Modifier.heightIn(max = 360.dp).verticalScroll(rememberScrollState())) }, confirmButton = { TextButton(onClick = model::dismissError) { Text("OK") } }) }
     if (!state.welcomed) WelcomeSetup(state, model) { model.welcomeDone(); open.launch(arrayOf("text/*", "application/octet-stream", "application/vnd.supermd.smd", "application/vnd.supermd.fmd", "application/gzip", "application/x-gzip")) }
@@ -1279,6 +1342,36 @@ private object NoMotionScheme : MotionScheme {
         } },
         confirmButton = { Button(onClick = { if (step < 2) step++ else model.welcomeDone() }) { Text(if (step < 2) "Continue" else "Explore the sample") } },
         dismissButton = { if (step > 0) TextButton(onClick = { if (step == 2) open() else step-- }) { Text(if (step == 2) "Open a note" else "Back") } })
+}
+
+@Composable private fun ConflictBanner(
+    busy: Boolean,
+    onSaveAs: () -> Unit,
+    onReload: () -> Unit,
+    onOverwrite: () -> Unit,
+) {
+    val palette = MaterialTheme.colorScheme
+    Surface(
+        color = palette.errorContainer,
+        contentColor = palette.onErrorContainer,
+        shape = RoundedCornerShape(16.dp),
+        modifier = Modifier.fillMaxWidth().padding(horizontal = 12.dp, vertical = 6.dp),
+    ) {
+        Column(Modifier.fillMaxWidth().padding(horizontal = 14.dp, vertical = 10.dp), verticalArrangement = Arrangement.spacedBy(6.dp)) {
+            Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(10.dp)) {
+                Icon(painterResource(R.drawable.symbol_warning), null, Modifier.size(20.dp), tint = palette.onErrorContainer)
+                Column(Modifier.weight(1f)) {
+                    Text("Changed on disk", style = MaterialTheme.typography.titleSmall)
+                    Text("This file was modified outside Super MD. Autosave is paused for this tab.", style = MaterialTheme.typography.bodySmall)
+                }
+            }
+            FlowRow(horizontalArrangement = Arrangement.spacedBy(8.dp), verticalArrangement = Arrangement.spacedBy(4.dp)) {
+                FilledTonalButton(onClick = onSaveAs, enabled = !busy) { Text("Save as") }
+                OutlinedButton(onClick = onReload, enabled = !busy) { Text("Reload from disk") }
+                TextButton(onClick = onOverwrite, enabled = !busy) { Text("Overwrite") }
+            }
+        }
+    }
 }
 
 @Composable private fun StudyIcon(label:String, resource:Int, action:()->Unit) {
