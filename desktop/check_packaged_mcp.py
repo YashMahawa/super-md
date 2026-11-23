@@ -68,7 +68,7 @@ async def verify(binary: Path) -> None:
         async with Client(params) as client:
             tools = await client.list_tools()
             names = {tool.name for tool in tools.tools}
-            if "document_inspect" not in names or len(names) > 9:
+            if "document_inspect" not in names or "view_current" not in names or len(names) > 10:
                 raise RuntimeError(f"Packaged MCP tool list is invalid: {sorted(names)}")
             result = await client.call_tool("document_inspect", {"path": note.name})
             if result.is_error or result.structured_content is None:

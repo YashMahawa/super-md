@@ -234,9 +234,39 @@ class OfficialMCPClientTest(unittest.IsolatedAsyncioTestCase):
             def patch_tab(self, tab_id, expected_revision, operations):
                 self.edits.append((tab_id, expected_revision, operations))
                 return {"revision": "b" * 64, "previous_revision": expected_revision, "saved": True}
-            def render_tab(self, tab_id, width=1600):
-                return {"data": base64.b64decode("iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO6pX+0AAAAASUVORK5CYII="), "mime_type": "image/png",
-                        "revision": "a" * 64, "width": width, "height": 1}
+            def render_tab(self, tab_id, width=1600, image_format="png"):
+                self.render_calls = getattr(self, "render_calls", [])
+                self.render_calls.append((tab_id, width, image_format))
+                rev = getattr(self, "render_revision", "a" * 64)
+                context = {
+                    "tabId": "tab",
+                    "revision": rev,
+                    "sourceLength": 42,
+                    "mode": "reader",
+                    "reading": {"offset": 0, "heading": "Current view", "visibleText": "Slide 3 notes visible"},
+                    "activeStep": {"deckTitle": "Walkthrough", "stepLabel": "Step 3", "stepIndex": 2,
+                                   "stepCount": 3, "activeStep": True, "expanded": True},
+                    "selection": {"text": "highlighted phrase"},
+                    "visibleSource": {"text": "# Current view", "start": 0, "end": 14,
+                                      "total_chars": 42, "next_offset": 14, "truncated": True},
+                    "diagrams": [
+                        {"id": "diagram:step:15:2", "kind": "smd-diagram", "sourceStart": 15, "sourceEnd": 40,
+                         "sourceChars": 25, "preview": "Walkthrough — Step 3", "deckTitle": "Walkthrough",
+                         "stepLabel": "Step 3", "stepIndex": 2, "stepCount": 3, "activeStep": True,
+                         "assetReference": "data:image/png;base64,secret"},
+                        {"id": "diagram:python:40:0", "kind": "python-figure", "sourceStart": 40, "sourceEnd": 42,
+                         "sourceChars": 2, "preview": "Python cell 1 — Figure 1",
+                         "assetReference": "(embedded image)"},
+                    ],
+                    "pythonCells": [{"ordinal": 0, "sourceStart": 40, "sourceEnd": 42, "ok": True,
+                                     "stdout": "42\n", "stderr": "", "figureIds": ["diagram:python:40:0"]}],
+                }
+                if image_format == "jpeg":
+                    jpeg_bytes = b"\xff\xd8\xff\xe0\x00\x10JFIF\x00\x01\x01\x00\x00\x01\x00\x01\x00\x00\xff\xd9"
+                    return {**context, "data": jpeg_bytes, "mime_type": "image/jpeg", "width": min(width, 640), "height": 360}
+                return {**context,
+                        "data": base64.b64decode("iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO6pX+0AAAAASUVORK5CYII="),
+                        "mime_type": "image/png", "width": 1, "height": 1}
             def get_tab_image(self, tab_id, asset_name, expected_revision):
                 return {"data": b"<svg xmlns='http://www.w3.org/2000/svg'></svg>",
                         "mime_type": "image/svg+xml", "asset": asset_name,
@@ -299,7 +329,8 @@ class OfficialMCPClientTest(unittest.IsolatedAsyncioTestCase):
         from mcp.types import ImageContent
         async with Client(server) as client:
             tools = await client.list_tools()
-            self.assertLessEqual(len(tools.tools), 9)
+            self.assertLessEqual(len(tools.tools), 10)
+            self.assertIn("view_current", {tool.name for tool in tools.tools})
             tabs = await client.call_tool("list_sessions", {})
             target = tabs.structured_content["sessions"][0]["target"]
             self.assertEqual(target, "tab:session:window:tab")
@@ -411,6 +442,37 @@ class OfficialMCPClientTest(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(image_block.mime_type, "image/png")
             context = await client.call_tool("document_action", {"action": "get_context", "path": target})
             self.assertEqual(context.structured_content["visibleSource"]["text"], "# Current view")
+            current_default = await client.call_tool("view_current", {})
+            self.assertFalse(current_default.is_error, current_default.content)
+            jpeg_block = next(block for block in current_default.content if isinstance(block, ImageContent))
+            self.assertEqual(jpeg_block.mime_type, "image/jpeg")
+            current_payload = json.loads(next(block.text for block in current_default.content if hasattr(block, "text")))
+            self.assertEqual(current_payload["target"], target)
+            self.assertEqual(current_payload["quality"], "standard")
+            self.assertEqual(current_payload["readingContextSource"], "viewport_capture")
+            self.assertEqual(current_payload["readingContext"]["activeStep"]["stepIndex"], 2)
+            self.assertEqual(current_payload["readingContext"]["activeStep"]["deckTitle"], "Walkthrough")
+            self.assertTrue(current_payload["readingContext"]["activeStep"]["activeStep"])
+            self.assertEqual(current_payload["readingContext"]["diagrams"][0]["stepIndex"], 2)
+            self.assertTrue(current_payload["readingContext"]["diagrams"][0]["activeStep"])
+            self.assertNotIn("assetReference", current_payload["readingContext"]["diagrams"][0])
+            self.assertEqual(current_payload["readingContext"]["pythonCells"][0]["figureIds"], ["diagram:python:40:0"])
+            current_high = await client.call_tool("view_current", {"includeImage": True, "quality": "high", "width": 800})
+            self.assertFalse(current_high.is_error, current_high.content)
+            png_block = next(block for block in current_high.content if isinstance(block, ImageContent))
+            self.assertEqual(png_block.mime_type, "image/png")
+            render_count_before = len(live.render_calls)
+            current_text_only = await client.call_tool("view_current", {"includeImage": False})
+            self.assertFalse(current_text_only.is_error, current_text_only.content)
+            self.assertFalse(any(isinstance(block, ImageContent) for block in current_text_only.content))
+            self.assertEqual(len(live.render_calls), render_count_before)
+            text_only_payload = json.loads(current_text_only.content[0].text)
+            self.assertEqual(text_only_payload["readingContextSource"], "context_read")
+            self.assertEqual(text_only_payload["readingContext"]["visibleSource"]["text"], "# Current view")
+            live.render_revision = "f" * 64
+            stale_current = await client.call_tool("view_current", {"path": target})
+            self.assertTrue(stale_current.is_error)
+            live.render_revision = "a" * 64
             review = await client.call_tool("document_action", {"action": "latex_review", "path": target})
             applied = await client.call_tool("document_action", {"action": "latex_apply", "path": target,
                                                                      "expected_revision": review.structured_content["revision"],
