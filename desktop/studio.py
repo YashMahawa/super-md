@@ -56,7 +56,7 @@ DEFAULTS.update(restorePosition=True, centerLock=True, startup="restore", imageA
 DEFAULTS.update(patternKind="",patternOpacity=-1,patternSize=0,patternSpacing=0)
 DEFAULTS.update(desktopIntegration=False)
 DEFAULTS.update(selectionAssistant="chatgpt")
-DEFAULTS.update(latexAutofix=False)
+DEFAULTS.update(latexAutofix=False, typewriterScroll=False)
 DEFAULTS.update(shortcuts=default_shortcuts())
 DEFAULTS.update(agentAccessEnabled=False, cloudAgentEnabled=False)
 
@@ -515,7 +515,7 @@ class Studio(QObject):
         if load and self.ready:
             tab = self._current()
             colors = self._colors()
-            reading_settings={key:self.settings[key] for key in ("restorePosition","centerLock","imageAppearance","svgAppearance","imageContrast","fullDocumentAccessibility","latexAutofix")}
+            reading_settings={key:self.settings[key] for key in ("restorePosition","centerLock","imageAppearance","svgAppearance","imageContrast","fullDocumentAccessibility","latexAutofix","typewriterScroll")}
             reading_settings["customStyle"]=custom_theme.reader(self.session.custom_theme,self.settings["fullTheme" if self.fullscreen else "theme"],self._dark(),self.settings)
             payload={**reading_settings,"readingLocation":self.session.locations.get(tab["path"]),"id": tab["id"], "path": tab["path"] or tab["id"], "mode": self.mode, "dark": self._dark(), "fullscreen": self.fullscreen, "font": self.settings["font"], "size": self.settings["size"], "widthPercent": self.settings["widthPercent"], "lineHeight":self.settings["lineHeight"], "spellCheck":self.settings["spellCheck"], "grammarCheck":self.settings["grammarCheck"], "zoom": self.settings["fullZoom" if self.fullscreen else "normalZoom"], "motion": self.settings["motion"], "python": self.settings["python"], "colors": colors, "viewState": tab.pop("viewState", None)}
             payload["editProtocol"]=1
@@ -2009,7 +2009,7 @@ class Studio(QObject):
         if key in ("imageAppearance","svgAppearance") and value not in ("original","invert-dark","auto","monochrome","contrast"):return
         if key in ("restorePosition","centerLock") and not isinstance(value,bool):return
         if key=="imageContrast" and (not isinstance(value,(int,float)) or isinstance(value,bool) or not math.isfinite(value) or not 1<=value<=2):return
-        if key in ("motion","welcomed","autosave","checkUpdates","autoUpdate","spellCheck","grammarCheck","latexAutofix","desktopIntegration","fullDocumentAccessibility") and not isinstance(value,bool): return
+        if key in ("motion","welcomed","autosave","checkUpdates","autoUpdate","spellCheck","grammarCheck","latexAutofix","typewriterScroll","desktopIntegration","fullDocumentAccessibility") and not isinstance(value,bool): return
         if key in ("font","python") and (not isinstance(value,str) or not value.strip() or len(value)>2048): return
         if key == "python":
             try: value = python_runtime.validate(value.strip())
@@ -3172,6 +3172,14 @@ class Studio(QObject):
                 self.replied.emit(id,"true",""); return
             if command == "reader_overlay_changed": self.reader_overlay = bool(args.get("open")); self.image_overlay = bool(args.get("image")); self._emit(False); self.replied.emit(id,"true",""); return
             if command == "editor_focus_changed": self.editor_focused = bool(args.get("focused")); self.replied.emit(id,"true",""); return
+            if command == "typewriter_scroll":
+                enabled = args.get("enabled")
+                if not isinstance(enabled, bool): raise ValueError("Invalid typewriter scroll value")
+                if self.settings["typewriterScroll"] != enabled:
+                    self.settings["typewriterScroll"] = enabled
+                    self._preferences()
+                    self._emit()
+                self.replied.emit(id, "true", ""); return
             if command == "copy_image_native":
                 body = args.get("body")
                 if args.get("mimeType") != "image/png" or not isinstance(body, str) or len(body) > 34_000_000:

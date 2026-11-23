@@ -16,12 +16,13 @@ describe("host editor keybindings",()=>{
     expect(keys).not.toContain("Mod-Shift-l");
     expect(keys).not.toContain("Mod-Shift-q");
     expect(keys).not.toContain("Mod-Shift-m");
+    expect(keys).not.toContain("Mod-Alt-t");
     expect(keys).toContain("Mod-a");
     expect(keys).toContain("ArrowLeft");
     expect(keys).toContain("Enter");
   });
 
-  it("keeps the ordinary editor history, search and Markdown formatting bindings on Android and web",()=>{
+  it("keeps the ordinary editor history, search, Markdown formatting, and typewriter bindings on Android and web",()=>{
     for(const host of ["android","desktop",undefined]){
       const keys=editorKeyBindings(host).map(binding=>binding.key).filter(Boolean);
       expect(keys).toContain("Mod-z");
@@ -35,6 +36,7 @@ describe("host editor keybindings",()=>{
       expect(keys).toContain("Mod-Shift-l");
       expect(keys).toContain("Mod-Shift-q");
       expect(keys).toContain("Mod-Shift-m");
+      expect(keys).toContain("Mod-Alt-t");
     }
   });
 });
