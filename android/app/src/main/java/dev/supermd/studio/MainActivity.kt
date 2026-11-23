@@ -59,11 +59,21 @@ import androidx.compose.ui.graphics.toArgb
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.res.painterResource
+import androidx.compose.ui.focus.FocusRequester
+import androidx.compose.ui.focus.focusRequester
+import androidx.compose.ui.input.key.Key
+import androidx.compose.ui.input.key.KeyEventType
+import androidx.compose.ui.input.key.key
+import androidx.compose.ui.input.key.onPreviewKeyEvent
+import androidx.compose.ui.input.key.type
+import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.viewinterop.AndroidView
+import androidx.compose.ui.window.Dialog
+import androidx.compose.ui.window.DialogProperties
 import androidx.core.view.WindowCompat
 import androidx.core.view.WindowInsetsCompat
 import androidx.core.view.WindowInsetsControllerCompat
@@ -407,16 +417,35 @@ class MainActivity : ComponentActivity() {
     fun handleShortcut(event: android.view.KeyEvent): Boolean {
         if (event.action == android.view.KeyEvent.ACTION_DOWN && event.repeatCount == 0) {
             if (event.keyCode == android.view.KeyEvent.KEYCODE_F11) { model.fullscreen(!model.state.value.fullscreen); return true }
-            if (event.keyCode == android.view.KeyEvent.KEYCODE_ESCAPE && (model.state.value.fullscreen || model.state.value.readerOverlay)) { dismissDocument?.invoke() ?: model.fullscreen(false); return true }
+            if (event.keyCode == android.view.KeyEvent.KEYCODE_ESCAPE) {
+                if (model.quickSwitcher.value.visible || model.folderSearch.value.visible) {
+                    model.cancelWorkspaceSearch()
+                    return true
+                }
+                if (model.state.value.fullscreen || model.state.value.readerOverlay) {
+                    dismissDocument?.invoke() ?: model.fullscreen(false)
+                    return true
+                }
+            }
+            val primaryMod = event.isCtrlPressed || event.isMetaPressed
+            if (primaryMod && !event.isAltPressed) {
+                if (event.keyCode == android.view.KeyEvent.KEYCODE_P && !event.isShiftPressed) {
+                    model.openQuickSwitcher()
+                    return true
+                }
+                if (event.keyCode == android.view.KeyEvent.KEYCODE_F) {
+                    if (event.isShiftPressed) model.openFolderSearch() else openReaderFind?.invoke()
+                    return true
+                }
+            }
             if (event.isCtrlPressed && event.keyCode == android.view.KeyEvent.KEYCODE_N) { newWindow(); return true }
             if (event.isCtrlPressed) {
                 when(event.keyCode) {
                     android.view.KeyEvent.KEYCODE_T -> { if(event.isShiftPressed)model.reopen() else model.newNote();return true }
-                    android.view.KeyEvent.KEYCODE_W -> { if(event.isShiftPressed)finish() else model.close(model.state.value.active.id);return true }
+                    android.view.KeyEvent.KEYCODE_W -> { if(event.isShiftPressed)finish() else if(model.state.value.tabs.isNotEmpty())model.close(model.state.value.active.id);return true }
                     android.view.KeyEvent.KEYCODE_TAB -> { model.cycle(if(event.isShiftPressed)-1 else 1);return true }
                     android.view.KeyEvent.KEYCODE_PAGE_DOWN -> {model.cycle(1);return true}
                     android.view.KeyEvent.KEYCODE_PAGE_UP -> {model.cycle(-1);return true}
-                    android.view.KeyEvent.KEYCODE_F -> {openReaderFind?.invoke();return true}
                 }
                 if(event.keyCode in android.view.KeyEvent.KEYCODE_1..android.view.KeyEvent.KEYCODE_9){model.tabNumber(event.keyCode-android.view.KeyEvent.KEYCODE_1+1);return true}
             }
@@ -908,6 +937,12 @@ private object NoMotionScheme : MotionScheme {
     var folderRelative by remember { mutableStateOf("") }
     var hinge by remember { mutableStateOf<FoldingFeature?>(null) }
     val recent by model.recent.collectAsStateWithLifecycle()
+    val quickSwitcher by model.quickSwitcher.collectAsStateWithLifecycle()
+    val folderSearch by model.folderSearch.collectAsStateWithLifecycle()
+    val drawerFilter by model.drawerFilter.collectAsStateWithLifecycle()
+    val filteredFiles by model.filteredFiles.collectAsStateWithLifecycle()
+    val drawerFiltering by model.drawerFiltering.collectAsStateWithLifecycle()
+    val seededFind by model.seededFind.collectAsStateWithLifecycle()
     val accessRequest by model.documentAccessRequests.collectAsStateWithLifecycle()
     var accessPickerShowing by rememberSaveable { mutableStateOf(false) }
     val accessPicker = rememberLauncherForActivityResult(RestoreDocumentAccess()) { uri ->
@@ -1005,14 +1040,21 @@ private object NoMotionScheme : MotionScheme {
         val wide = displayIsLarge && maxWidth >= 720.dp && maxHeight >= 400.dp
         val actualMode = if (!wide && state.mode == "split") "live" else state.mode
         val readerContent=remember {arrayOfNulls<String>(1)}
-        LaunchedEffect(readerReady, state.active, actualMode, dark, state.fullscreen, state.font, state.size, state.widthPercent,state.lineHeight,state.spellCheck,state.grammarCheck,state.latexAutofix,state.restorePosition,state.centerLock,state.imageAppearance,state.svgAppearance,state.imageContrast,state.fullDocumentAccessibility,state.customTheme,state.patternKind,state.patternOpacity,state.patternSize,state.patternSpacing,tokens, hinge, motion) {
+        LaunchedEffect(readerReady, state.active, actualMode, dark, state.fullscreen, state.font, state.size, state.widthPercent,state.lineHeight,state.spellCheck,state.grammarCheck,state.latexAutofix,state.restorePosition,state.centerLock,state.imageAppearance,state.svgAppearance,state.imageContrast,state.fullDocumentAccessibility,state.customTheme,state.patternKind,state.patternOpacity,state.patternSize,state.patternSpacing,tokens, hinge, motion, seededFind) {
             if (!readerReady) readerNote[0] = null
-            if (readerReady) {
+            if (readerReady && state.active.id.isNotEmpty()) {
                 val note = state.active
+                val matchingSeed = seededFind?.takeIf { model.activeMatchesSeedTarget(note, it) }
                 val payload = JSONObject().put("id", note.id).put("editProtocol", 1).apply { if (readerNote[0] == note.id && (readerContent[0] === note.content || model.readerEcho[note.id] === note.content)) put("contentUnchanged", true) else put("content", note.content) }.put("path", note.uri ?: note.id).put("mode", actualMode).put("dark", dark).put("fullscreen", state.fullscreen).put("font", state.font).put("size", state.size).put("widthPercent",state.widthPercent).put("lineHeight",state.lineHeight).put("spellCheck",state.spellCheck).put("grammarCheck",state.grammarCheck).put("latexAutofix",state.latexAutofix).put("restorePosition",state.restorePosition).put("centerLock",state.centerLock).put("imageAppearance",state.imageAppearance).put("svgAppearance",state.svgAppearance).put("imageContrast",state.imageContrast).put("fullDocumentAccessibility",state.fullDocumentAccessibility).put("colors", tokens).put("zoom", state.zoom).put("motion", motion)
                 payload.put("readingLocation",model.readingLocation(note.uri))
                 payload.put("customStyle",themeStyle(themeDocument(state.customTheme),if(state.fullscreen)state.fullscreenTheme else state.theme,dark,state.patternKind,state.patternOpacity,state.patternSize,state.patternSpacing))
+                if (matchingSeed != null) {
+                    payload.put("seededFind", JSONObject().put("query", matchingSeed.query).put("caseSensitive", matchingSeed.caseSensitive).put("nonce", matchingSeed.nonce))
+                }
                 web?.evaluateJavascript("document.documentElement.dataset.platform='android';window.supermdLoad?.($payload)", null)
+                if (matchingSeed != null) {
+                    model.consumeSeededFind(matchingSeed.nonce)
+                }
                 readerNote[0] = note.id
                 readerContent[0] = note.content
                 val hingeGap = if (hinge != null && actualMode == "split") hinge!!.bounds.width() / density.density else 0f
@@ -1053,14 +1095,94 @@ private object NoMotionScheme : MotionScheme {
                     SingleChoiceSegmentedButtonRow(Modifier.fillMaxWidth().padding(bottom=12.dp)) {listOf("folder" to "Folder","contents" to "Contents").forEachIndexed {index,entry->SegmentedButton(selected=sidebarSection==entry.first,onClick={sidebarSection=entry.first},shape=SegmentedButtonDefaults.itemShape(index,2),colors=SegmentedButtonDefaults.colors(activeContainerColor=palette.primary,activeContentColor=palette.onPrimary)){Text(entry.second)}}}
                     Button(onClick = { open.launch(arrayOf("text/*", "application/octet-stream", "application/vnd.supermd.smd", "application/vnd.supermd.fmd", "application/gzip", "application/x-gzip")); scope.launch { drawer.close() } }, shapes = ButtonDefaults.shapes(), modifier = Modifier.fillMaxWidth()) { Icon(Icons.Rounded.Description, null); Spacer(Modifier.width(8.dp)); Text("Open note") }
                     FilledTonalButton(onClick = { folder.launch(state.folder?.let(android.net.Uri::parse)) }, modifier = Modifier.fillMaxWidth()) { Icon(Icons.Rounded.FolderOpen, null); Spacer(Modifier.width(8.dp)); Text("Open folder") }
+                    Row(Modifier.fillMaxWidth().padding(top = 6.dp), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                        OutlinedButton(onClick = { scope.launch { drawer.close() }; model.openQuickSwitcher() }, modifier = Modifier.weight(1f)) {
+                            Icon(Icons.Rounded.SwapHoriz, null, Modifier.size(18.dp))
+                            Spacer(Modifier.width(4.dp))
+                            Text("Switch", maxLines = 1)
+                        }
+                        OutlinedButton(onClick = { scope.launch { drawer.close() }; model.openFolderSearch() }, modifier = Modifier.weight(1f)) {
+                            Icon(Icons.Rounded.Search, null, Modifier.size(18.dp))
+                            Spacer(Modifier.width(4.dp))
+                            Text("Search", maxLines = 1)
+                        }
+                    }
                     if (state.folder != null) TextButton(onClick = { folderRelative = ""; model.closeFolder() }) { Icon(Icons.Rounded.Close, null); Text("Close folder", Modifier.padding(start = 8.dp)) }
-                    Text("No vault. No hidden metadata.", style = MaterialTheme.typography.bodySmall, color = palette.onSurfaceVariant, modifier = Modifier.padding(vertical = 12.dp))
-                    if (folderRelative.isNotEmpty()) TextButton(onClick = { folderRelative = ""; state.folder?.let { model.listFolder(android.net.Uri.parse(it), "") } }) { Icon(Icons.AutoMirrored.Rounded.ArrowBack, null); Text("Folder root") }
+                    Text("No vault. No hidden metadata.", style = MaterialTheme.typography.bodySmall, color = palette.onSurfaceVariant, modifier = Modifier.padding(vertical = 8.dp))
                     if(sidebarSection=="contents") OutlinePanel(headings,state.active.id,Modifier.weight(1f)){heading->readingChromeVisible=false;web?.evaluateJavascript("window.supermdHeading?.(${JSONObject.quote(heading.id)},${heading.offset})",null);scope.launch{drawer.close()}}
-                    else LazyColumn(Modifier.weight(1f)) {
-                        items(state.files, key={"file:${it.uri}:${it.relative}"}) { entry ->
-                            val activate = { if (entry.directory) { folderRelative = entry.relative; model.listFolder(android.net.Uri.parse(entry.uri), entry.relative) } else { activity.requestOpen(android.net.Uri.parse(entry.uri), entry.relative); scope.launch { drawer.close() } }; Unit }
-                            ListItem(headlineContent = { Text(entry.name, maxLines = 1, overflow = TextOverflow.Ellipsis) }, leadingContent = { Icon(if (entry.directory) Icons.Rounded.Folder else Icons.Rounded.Description, null) }, modifier = Modifier.fillMaxWidth().clickable(onClick = activate), trailingContent = { Icon(if (entry.directory) Icons.Rounded.ChevronRight else Icons.AutoMirrored.Rounded.MenuBook, null) })
+                    else {
+                        if (state.folder != null) {
+                            OutlinedTextField(
+                                value = drawerFilter,
+                                onValueChange = model::setDrawerFilter,
+                                singleLine = true,
+                                placeholder = { Text("Filter files") },
+                                leadingIcon = { Icon(Icons.Rounded.Search, null) },
+                                trailingIcon = {
+                                    if (drawerFilter.isNotEmpty()) {
+                                        IconButton(onClick = { model.setDrawerFilter("") }) {
+                                            Icon(Icons.Rounded.Close, "Clear filter")
+                                        }
+                                    }
+                                },
+                                modifier = Modifier.fillMaxWidth().padding(bottom = 6.dp),
+                            )
+                        }
+                        if (folderRelative.isNotEmpty() && drawerFilter.isBlank()) {
+                            Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(4.dp), verticalAlignment = Alignment.CenterVertically) {
+                                TextButton(onClick = {
+                                    val parent = parentRelativePath(folderRelative)
+                                    folderRelative = parent
+                                    state.folder?.let { model.listFolder(android.net.Uri.parse(it), parent) }
+                                }) {
+                                    Icon(Icons.AutoMirrored.Rounded.ArrowBack, null)
+                                    Spacer(Modifier.width(4.dp))
+                                    Text("Parent folder")
+                                }
+                                TextButton(onClick = {
+                                    folderRelative = ""
+                                    state.folder?.let { model.listFolder(android.net.Uri.parse(it), "") }
+                                }) {
+                                    Icon(Icons.Rounded.FolderOpen, null)
+                                    Spacer(Modifier.width(4.dp))
+                                    Text("Folder root")
+                                }
+                            }
+                        }
+                        if (drawerFilter.isNotBlank()) {
+                            if (drawerFiltering) LinearProgressIndicator(Modifier.fillMaxWidth().padding(bottom = 4.dp))
+                            if (!drawerFiltering && filteredFiles.isEmpty()) {
+                                Text(
+                                    "No matching notes in folder",
+                                    style = MaterialTheme.typography.bodySmall,
+                                    color = palette.onSurfaceVariant,
+                                    modifier = Modifier.weight(1f).padding(vertical = 12.dp),
+                                )
+                            } else {
+                                LazyColumn(Modifier.weight(1f)) {
+                                    items(filteredFiles, key = { "filtered:${it.uri}:${it.relative}" }) { entry ->
+                                        val activate = {
+                                            activity.requestOpen(android.net.Uri.parse(entry.uri), entry.relative)
+                                            scope.launch { drawer.close() }
+                                            Unit
+                                        }
+                                        ListItem(
+                                            headlineContent = { Text(entry.name, maxLines = 1, overflow = TextOverflow.Ellipsis) },
+                                            supportingContent = if (entry.relative != entry.name) ({ Text(entry.relative, maxLines = 1, overflow = TextOverflow.Ellipsis) }) else null,
+                                            leadingContent = { Icon(Icons.Rounded.Description, null) },
+                                            modifier = Modifier.fillMaxWidth().clickable(onClick = activate),
+                                            trailingContent = { Icon(Icons.AutoMirrored.Rounded.MenuBook, null) },
+                                        )
+                                    }
+                                }
+                            }
+                        } else {
+                            LazyColumn(Modifier.weight(1f)) {
+                                items(state.files, key={"file:${it.uri}:${it.relative}"}) { entry ->
+                                    val activate = { if (entry.directory) { folderRelative = entry.relative; model.listFolder(android.net.Uri.parse(state.folder ?: entry.uri), entry.relative) } else { activity.requestOpen(android.net.Uri.parse(entry.uri), entry.relative); scope.launch { drawer.close() } }; Unit }
+                                    ListItem(headlineContent = { Text(entry.name, maxLines = 1, overflow = TextOverflow.Ellipsis) }, leadingContent = { Icon(if (entry.directory) Icons.Rounded.Folder else Icons.Rounded.Description, null) }, modifier = Modifier.fillMaxWidth().clickable(onClick = activate), trailingContent = { Icon(if (entry.directory) Icons.Rounded.ChevronRight else Icons.AutoMirrored.Rounded.MenuBook, null) })
+                                }
+                            }
                         }
                     }
                     HorizontalDivider(Modifier.padding(vertical=8.dp))
@@ -1083,12 +1205,18 @@ private object NoMotionScheme : MotionScheme {
                         .graphicsLayer {translationY=-size.height*(1f-chromeReveal);alpha=chromeReveal}
                         .then(if(chromeShown) Modifier else Modifier.clearAndSetSemantics {})
                         .background(palette.surfaceContainerLow).themeArtwork(state,"toolbar")) {
-                        TopAppBar(windowInsets=WindowInsets.statusBarsIgnoringVisibility.union(WindowInsets.displayCutout).only(WindowInsetsSides.Top+WindowInsetsSides.Horizontal), colors = TopAppBarDefaults.topAppBarColors(containerColor = Color.Transparent), title = { Column { Text(state.active.name, maxLines = 1, overflow = TextOverflow.Ellipsis, style = MaterialTheme.typography.titleMedium); Text(if (model.documentWriteNeedsAccess(state.active.id)) "Local draft · restore file access" else if (state.active.dirty) "Draft recovered automatically" else if (state.active.uri != null) "Saved" else "Local draft", style = MaterialTheme.typography.labelSmall, color = palette.onSurfaceVariant) } }, navigationIcon = { IconButton(onClick = { if (state.fullscreen) contentsShown=true else { scope.launch { drawer.open() }; state.folder?.let { if (state.files.isEmpty()) model.listFolder(android.net.Uri.parse(it), "") } } }) { Icon(painterResource(if(state.fullscreen) R.drawable.symbol_contents else R.drawable.symbol_sidebar), if(state.fullscreen) "Show contents" else "Open files") } }, actions = {
+                        TopAppBar(windowInsets=WindowInsets.statusBarsIgnoringVisibility.union(WindowInsets.displayCutout).only(WindowInsetsSides.Top+WindowInsetsSides.Horizontal), colors = TopAppBarDefaults.topAppBarColors(containerColor = Color.Transparent), title = { Column { Text(state.active.name, maxLines = 1, overflow = TextOverflow.Ellipsis, style = MaterialTheme.typography.titleMedium); Text(if (model.documentWriteNeedsAccess(state.active.id)) "Local draft · restore file access" else if (state.active.dirty) "Draft recovered automatically" else if (state.active.uri != null) "Saved" else "Local draft", style = MaterialTheme.typography.labelSmall, color = palette.onSurfaceVariant) } }, navigationIcon = { IconButton(onClick = { if (state.fullscreen) contentsShown=true else { scope.launch { drawer.open() }; state.folder?.let { if (state.files.isEmpty()) model.listFolder(android.net.Uri.parse(it), folderRelative) } } }) { Icon(painterResource(if(state.fullscreen) R.drawable.symbol_contents else R.drawable.symbol_sidebar), if(state.fullscreen) "Show contents" else "Open files") } }, actions = {
+                            if (wide) {
+                                IconButton(onClick = model::openQuickSwitcher) { Icon(Icons.Rounded.SwapHoriz, "Quick switcher (Ctrl+P)") }
+                                IconButton(onClick = { model.openFolderSearch() }) { Icon(painterResource(R.drawable.symbol_search), "Search across notes (Ctrl+Shift+F)") }
+                            }
                             IconButton(onClick = saveAction) { Icon(painterResource(R.drawable.symbol_save), "Save note") }
                             IconButton(onClick = { sharing = false; exporting = true }, enabled = readerReady && !state.busy) { Icon(painterResource(R.drawable.symbol_export), "Export") }
                             StudyIcon(if(state.fullscreen) "Exit fullscreen" else "Fullscreen study", if(state.fullscreen) R.drawable.symbol_fullscreen_exit else R.drawable.symbol_fullscreen) { model.fullscreen(!state.fullscreen) }
                             StudyIcon(if(state.centerLock) "Centre locked · unlock horizontal movement" else "Lock document to centre",if(state.centerLock) R.drawable.symbol_lock else R.drawable.symbol_lock_open) { model.centerLock(!state.centerLock) }
                             Box { IconButton(onClick = { menu = true }) { Icon(Icons.Rounded.MoreVert, "More actions") }; DropdownMenu(expanded = menu, onDismissRequest = { menu = false }) {
+                                DropdownMenuItem(text = { Text("Quick switcher") }, onClick = { menu = false; model.openQuickSwitcher() }, leadingIcon = { Icon(Icons.Rounded.SwapHoriz, null) })
+                                DropdownMenuItem(text = { Text("Search across notes") }, onClick = { menu = false; model.openFolderSearch() }, leadingIcon = { Icon(painterResource(R.drawable.symbol_search), null) })
                                 DropdownMenuItem(text = { Text("New window") }, onClick = { menu = false; activity.newWindow() }, leadingIcon = { Icon(painterResource(R.drawable.symbol_open_window), null) })
                                 DropdownMenuItem(text = { Text("Share note") }, enabled = readerReady && !state.busy, onClick = { menu = false; sharing = true; exporting = true }, leadingIcon = { Icon(painterResource(R.drawable.symbol_share), null) })
                                 DropdownMenuItem(text = { Text("Insert image or link") }, onClick = { menu = false; web?.evaluateJavascript("window.supermdMedia?.()", null) }, leadingIcon = { Icon(painterResource(R.drawable.symbol_image), null) })
@@ -1260,8 +1388,297 @@ private object NoMotionScheme : MotionScheme {
             confirmButton = { TextButton(onClick = { accessPickerShowing = true; accessPicker.launch(android.net.Uri.parse(request.uri)) }) { Text(if(request.assetSource == null) "Choose original file" else "Choose linked file") } },
             dismissButton = { TextButton(onClick = model::dismissDocumentAccess) { Text("Not now") } })
     }
+    if (quickSwitcher.visible) {
+        BackHandler { model.cancelWorkspaceSearch() }
+        QuickSwitcherModal(
+            state = quickSwitcher,
+            onQueryChange = model::updateQuickSwitcherQuery,
+            onSelect = model::selectQuickSwitcherItem,
+            onDismiss = model::cancelWorkspaceSearch,
+        )
+    }
+    if (folderSearch.visible) {
+        BackHandler { model.cancelWorkspaceSearch() }
+        FolderSearchModal(
+            state = folderSearch,
+            hasFolder = state.folder != null,
+            onUpdate = model::updateFolderSearch,
+            onSelect = model::openSearchMatch,
+            onDismiss = model::cancelWorkspaceSearch,
+        )
+    }
     state.error?.let { AlertDialog(onDismissRequest = model::dismissError, title = { Text("Couldn't finish") }, text = { Text(it, Modifier.heightIn(max = 360.dp).verticalScroll(rememberScrollState())) }, confirmButton = { TextButton(onClick = model::dismissError) { Text("OK") } }) }
     if (!state.welcomed) WelcomeSetup(state, model) { model.welcomeDone(); open.launch(arrayOf("text/*", "application/octet-stream", "application/vnd.supermd.smd", "application/vnd.supermd.fmd", "application/gzip", "application/x-gzip")) }
+}
+
+@Composable private fun QuickSwitcherModal(
+    state: QuickSwitcherState,
+    onQueryChange: (String) -> Unit,
+    onSelect: (QuickSwitcherItem) -> Unit,
+    onDismiss: () -> Unit,
+) {
+    val focusRequester = remember { FocusRequester() }
+    var selectedIndex by remember(state.items) { mutableIntStateOf(0) }
+    LaunchedEffect(Unit) { runCatching { focusRequester.requestFocus() } }
+    Dialog(
+        onDismissRequest = onDismiss,
+        properties = DialogProperties(usePlatformDefaultWidth = false),
+    ) {
+        Surface(
+            shape = RoundedCornerShape(28.dp),
+            color = MaterialTheme.colorScheme.surfaceContainerHigh,
+            tonalElevation = 6.dp,
+            modifier = Modifier
+                .widthIn(max = 560.dp)
+                .fillMaxWidth(0.94f)
+                .heightIn(max = 520.dp)
+                .onPreviewKeyEvent { event ->
+                    if (event.type != KeyEventType.KeyDown) return@onPreviewKeyEvent false
+                    when (event.key) {
+                        Key.Escape -> { onDismiss(); true }
+                        Key.DirectionDown -> {
+                            if (state.items.isNotEmpty()) selectedIndex = (selectedIndex + 1).coerceAtMost(state.items.lastIndex)
+                            true
+                        }
+                        Key.DirectionUp -> {
+                            if (state.items.isNotEmpty()) selectedIndex = (selectedIndex - 1).coerceAtLeast(0)
+                            true
+                        }
+                        Key.Enter, Key.NumPadEnter -> {
+                            state.items.getOrNull(selectedIndex)?.let(onSelect)
+                            true
+                        }
+                        else -> false
+                    }
+                },
+        ) {
+            Column(Modifier.padding(20.dp), verticalArrangement = Arrangement.spacedBy(10.dp)) {
+                Row(verticalAlignment = Alignment.CenterVertically) {
+                    Text("Quick switcher", style = MaterialTheme.typography.titleLarge, modifier = Modifier.weight(1f))
+                    TextButton(onClick = onDismiss) { Text("Close") }
+                }
+                OutlinedTextField(
+                    value = state.query,
+                    onValueChange = onQueryChange,
+                    singleLine = true,
+                    placeholder = { Text("Jump to open tab, pinned/recent note, or folder file…") },
+                    leadingIcon = { Icon(Icons.Rounded.Search, null) },
+                    trailingIcon = {
+                        if (state.query.isNotEmpty()) {
+                            IconButton(onClick = { onQueryChange("") }) {
+                                Icon(Icons.Rounded.Close, "Clear query")
+                            }
+                        }
+                    },
+                    modifier = Modifier.fillMaxWidth().focusRequester(focusRequester),
+                )
+                if (state.loading) LinearProgressIndicator(Modifier.fillMaxWidth())
+                if (!state.loading && state.items.isEmpty()) {
+                    Text(
+                        if (state.query.isBlank()) "No open, recent, or folder notes yet." else "No matching notes.",
+                        style = MaterialTheme.typography.bodyMedium,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        modifier = Modifier.padding(vertical = 16.dp),
+                    )
+                } else {
+                    LazyColumn(Modifier.weight(1f, fill = false), verticalArrangement = Arrangement.spacedBy(4.dp)) {
+                        items(state.items.size, key = { state.items[it].key }) { index ->
+                            val item = state.items[index]
+                            val selected = index == selectedIndex
+                            val badge = when {
+                                item.pinned -> "Pinned"
+                                item.dirty -> "Edited"
+                                item.isOpen -> "Open"
+                                item.isRecent -> "Recent"
+                                else -> null
+                            }
+                            Surface(
+                                shape = RoundedCornerShape(16.dp),
+                                color = if (selected) MaterialTheme.colorScheme.primaryContainer else Color.Transparent,
+                                modifier = Modifier.fillMaxWidth().clickable { onSelect(item) },
+                            ) {
+                                Row(
+                                    Modifier.fillMaxWidth().padding(horizontal = 14.dp, vertical = 10.dp),
+                                    verticalAlignment = Alignment.CenterVertically,
+                                    horizontalArrangement = Arrangement.spacedBy(10.dp),
+                                ) {
+                                    Icon(Icons.Rounded.Description, null, tint = MaterialTheme.colorScheme.primary)
+                                    Column(Modifier.weight(1f)) {
+                                        Text(item.name, style = MaterialTheme.typography.titleSmall, maxLines = 1, overflow = TextOverflow.Ellipsis)
+                                        Text(item.subtitle, style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant, maxLines = 1, overflow = TextOverflow.Ellipsis)
+                                    }
+                                    if (badge != null) {
+                                        Surface(
+                                            shape = RoundedCornerShape(999.dp),
+                                            color = MaterialTheme.colorScheme.secondaryContainer,
+                                        ) {
+                                            Text(
+                                                badge,
+                                                style = MaterialTheme.typography.labelSmall,
+                                                color = MaterialTheme.colorScheme.onSecondaryContainer,
+                                                modifier = Modifier.padding(horizontal = 8.dp, vertical = 3.dp),
+                                            )
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+@Composable private fun FolderSearchModal(
+    state: FolderSearchState,
+    hasFolder: Boolean,
+    onUpdate: (String, Boolean, Boolean) -> Unit,
+    onSelect: (FolderSearchMatch) -> Unit,
+    onDismiss: () -> Unit,
+) {
+    val focusRequester = remember { FocusRequester() }
+    var selectedIndex by remember(state.matches) { mutableIntStateOf(0) }
+    LaunchedEffect(Unit) { runCatching { focusRequester.requestFocus() } }
+    Dialog(
+        onDismissRequest = onDismiss,
+        properties = DialogProperties(usePlatformDefaultWidth = false),
+    ) {
+        Surface(
+            shape = RoundedCornerShape(28.dp),
+            color = MaterialTheme.colorScheme.surfaceContainerHigh,
+            tonalElevation = 6.dp,
+            modifier = Modifier
+                .widthIn(max = 680.dp)
+                .fillMaxWidth(0.95f)
+                .heightIn(max = 580.dp)
+                .onPreviewKeyEvent { event ->
+                    if (event.type != KeyEventType.KeyDown) return@onPreviewKeyEvent false
+                    when (event.key) {
+                        Key.Escape -> { onDismiss(); true }
+                        Key.DirectionDown -> {
+                            if (state.matches.isNotEmpty()) selectedIndex = (selectedIndex + 1).coerceAtMost(state.matches.lastIndex)
+                            true
+                        }
+                        Key.DirectionUp -> {
+                            if (state.matches.isNotEmpty()) selectedIndex = (selectedIndex - 1).coerceAtLeast(0)
+                            true
+                        }
+                        Key.Enter, Key.NumPadEnter -> {
+                            state.matches.getOrNull(selectedIndex)?.let(onSelect)
+                            true
+                        }
+                        else -> false
+                    }
+                },
+        ) {
+            Column(Modifier.padding(20.dp), verticalArrangement = Arrangement.spacedBy(10.dp)) {
+                Row(verticalAlignment = Alignment.CenterVertically) {
+                    Column(Modifier.weight(1f)) {
+                        Text("Search across notes", style = MaterialTheme.typography.titleLarge)
+                        Text(
+                            if (hasFolder) "Streams live tabs and folder notes (.md, .smd, .fmd, .markdown, .txt)"
+                            else "No folder open · searching open tabs and accessible recent notes",
+                            style = MaterialTheme.typography.bodySmall,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        )
+                    }
+                    TextButton(onClick = onDismiss) { Text("Close") }
+                }
+                OutlinedTextField(
+                    value = state.query,
+                    onValueChange = { onUpdate(it, state.caseSensitive, state.includeDiagrams) },
+                    singleLine = true,
+                    placeholder = { Text("Search text across notes…") },
+                    leadingIcon = { Icon(Icons.Rounded.Search, null) },
+                    trailingIcon = {
+                        if (state.query.isNotEmpty()) {
+                            IconButton(onClick = { onUpdate("", state.caseSensitive, state.includeDiagrams) }) {
+                                Icon(Icons.Rounded.Close, "Clear query")
+                            }
+                        }
+                    },
+                    modifier = Modifier.fillMaxWidth().focusRequester(focusRequester),
+                )
+                Row(
+                    Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.spacedBy(8.dp),
+                    verticalAlignment = Alignment.CenterVertically,
+                ) {
+                    FilterChip(
+                        selected = state.caseSensitive,
+                        onClick = { onUpdate(state.query, !state.caseSensitive, state.includeDiagrams) },
+                        label = { Text("Match case") },
+                    )
+                    FilterChip(
+                        selected = state.includeDiagrams,
+                        onClick = { onUpdate(state.query, state.caseSensitive, !state.includeDiagrams) },
+                        label = { Text("Diagrams") },
+                    )
+                    Spacer(Modifier.weight(1f))
+                    if (state.query.isNotEmpty()) {
+                        Text(
+                            if (state.scanning) "Scanning · ${state.matches.size} (${state.scannedFiles} files)…"
+                            else "${state.matches.size}${if (state.truncated) "+" else ""} in ${state.scannedFiles} files",
+                            style = MaterialTheme.typography.labelSmall,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        )
+                    }
+                }
+                if (state.scanning) LinearProgressIndicator(Modifier.fillMaxWidth())
+                if (state.query.isEmpty()) {
+                    Text(
+                        "Type to search Markdown prose across notes. Inline SVG, Mermaid, and chart blocks are skipped unless Diagrams is enabled.",
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        modifier = Modifier.padding(vertical = 12.dp),
+                    )
+                } else if (!state.scanning && state.matches.isEmpty()) {
+                    Text(
+                        "No matches found.",
+                        style = MaterialTheme.typography.bodyMedium,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        modifier = Modifier.padding(vertical = 16.dp),
+                    )
+                } else {
+                    LazyColumn(Modifier.weight(1f, fill = false), verticalArrangement = Arrangement.spacedBy(6.dp)) {
+                        items(state.matches.size, key = { state.matches[it].key }) { index ->
+                            val match = state.matches[index]
+                            val selected = index == selectedIndex
+                            Surface(
+                                shape = RoundedCornerShape(16.dp),
+                                color = if (selected) MaterialTheme.colorScheme.primaryContainer else MaterialTheme.colorScheme.surfaceContainerLow,
+                                modifier = Modifier.fillMaxWidth().clickable { onSelect(match) },
+                            ) {
+                                Column(Modifier.fillMaxWidth().padding(horizontal = 14.dp, vertical = 10.dp), verticalArrangement = Arrangement.spacedBy(4.dp)) {
+                                    Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                                        Text(match.relative, style = MaterialTheme.typography.labelLarge, maxLines = 1, overflow = TextOverflow.Ellipsis, modifier = Modifier.weight(1f))
+                                        if (match.dirty) {
+                                            Text("Edited", style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.primary)
+                                        }
+                                        Surface(shape = RoundedCornerShape(999.dp), color = MaterialTheme.colorScheme.secondaryContainer) {
+                                            Text(
+                                                "L${match.line}",
+                                                style = MaterialTheme.typography.labelSmall,
+                                                color = MaterialTheme.colorScheme.onSecondaryContainer,
+                                                modifier = Modifier.padding(horizontal = 8.dp, vertical = 2.dp),
+                                            )
+                                        }
+                                    }
+                                    Text(
+                                        match.snippet,
+                                        style = MaterialTheme.typography.bodySmall.copy(fontFamily = FontFamily.Monospace),
+                                        maxLines = 2,
+                                        overflow = TextOverflow.Ellipsis,
+                                    )
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
 }
 
 @Composable private fun WelcomeSetup(state: StudioState, model: StudioViewModel, open: () -> Unit) {
@@ -1396,6 +1813,7 @@ internal class NoteDestination(private val mime: String, private val preferred: 
                 Text("Select text and use Search Google or Ask in the selection toolbar. Ask copies the text and opens the assistant for you to paste and review; it never submits a prompt automatically.",style=MaterialTheme.typography.bodySmall,color=MaterialTheme.colorScheme.onSurfaceVariant)
             }
             if (section == "Writing & shortcuts") SettingsGroup("Python & windows") {
+                Text("Hardware keyboard shortcuts: Ctrl+P opens Quick switcher, Ctrl+Shift+F searches across notes, Ctrl+F finds in the current note, and Esc dismisses overlays.", style = MaterialTheme.typography.bodyMedium)
                 Text("NumPy and Matplotlib run locally in a separate worker. Code runs only when you press Run; never automatically on open or export.", style = MaterialTheme.typography.bodyMedium)
                 Text("New window opens an independent workspace. Your device controls split-screen and desktop window placement. Hold and drag a tab to reorder it.", style = MaterialTheme.typography.bodyMedium)
                 Text("The monochrome icon follows your launcher's themed-icon setting.", style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)

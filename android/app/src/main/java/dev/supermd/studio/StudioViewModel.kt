@@ -52,8 +52,16 @@ internal fun orderedRecents(notes:List<RecentNote>)=notes.distinctBy {it.uri}.so
 private fun renamedRelative(relative:String?,name:String)=relative?.let {val parent=it.substringBeforeLast('/',"");if(parent.isEmpty())name else "$parent/$name"}
 data class FileEntry(val name: String, val uri: String, val directory: Boolean, val relative: String)
 data class OutlineHeading(val id: String, val title: String, val level: Int, val offset: Int)
+private val EMPTY_NOTE = Note(id = "", name = "Super MD", content = "", saved = "")
+data class PendingSeededFind(
+    val query: String,
+    val caseSensitive: Boolean,
+    val nonce: Long = System.nanoTime(),
+    val targetTabId: String? = null,
+    val targetUri: String? = null,
+)
 data class StudioState(val latexAutofix:Boolean=false, val selectionAssistant:String="chatgpt", val centerLock:Boolean=true, val customTheme:String="", val patternKind:String="", val patternOpacity:Float=-1f, val patternSize:Float=0f, val patternSpacing:Float=0f, val restorePosition:Boolean=true, val fullDocumentAccessibility:Boolean=false, val startup:String="restore", val imageAppearance:String="original", val svgAppearance:String="original", val imageContrast:Float=1.25f, val spellCheck:Boolean = false, val grammarCheck:Boolean = false, val accent: String = "system", val widthPercent: Float = 100f, val lineHeight: Float = 1.65f, val autosave: Boolean = true, val customFonts: List<String> = emptyList(), val readerOverlay: Boolean = false, val zoomCommand: Long = 0, val tabs: List<Note> = listOf(Note(name = "Welcome.md", content = sample, saved = sample)), val closedTabs: List<Note> = emptyList(), val activeId: String = "", val mode: String = "live", val fullscreen: Boolean = false, val normalZoom: Float = 100f, val fullscreenZoom: Float = 100f, val theme: String = "system", val fullscreenTheme: String = "black", val motion: Boolean = true, val font: String = "Manrope", val size: Float = 15f, val folder: String? = null, val files: List<FileEntry> = emptyList(), val busy: Boolean = false, val message: String? = null, val error: String? = null, val welcomed: Boolean = false, val pdf: String = "{\"pageSize\":\"a4\",\"margin\":14,\"fontSize\":10.5,\"lineHeight\":1.4,\"paragraphSpacing\":0.65,\"fontFamily\":\"Manrope\",\"pageNumbers\":true}", val storageReport: StorageReport? = null, val storageScanning: Boolean = false) {
-    val active get() = tabs.find { it.id == activeId } ?: tabs.first()
+    val active get() = tabs.find { it.id == activeId } ?: tabs.firstOrNull() ?: EMPTY_NOTE
     val zoom get() = if (fullscreen) fullscreenZoom else normalZoom
 }
 val sample = """
@@ -246,6 +254,10 @@ class StudioViewModel(app: Application, val workspaceKey: String = "main") : And
     internal fun attachReaderOpenHandler(handler: OpenIntentDispatcher.Handler<Uri>?) = openIntentDispatcher.attach(handler)
     internal fun detachReaderOpenHandler(handler: OpenIntentDispatcher.Handler<Uri>) = openIntentDispatcher.detach(handler)
     private suspend fun performReaderBarrier(expectedActiveId: String, action: () -> Unit): Boolean = readerActionMutex.withLock {
+        if (mutable.value.tabs.isEmpty() && expectedActiveId.isEmpty()) {
+            action()
+            return@withLock true
+        }
         if (mutable.value.active.id != expectedActiveId) return@withLock false
         // A missing bridge is not an implicit flush acknowledgement. Only
         // proceed when the native snapshot is already the last acknowledged
@@ -452,8 +464,34 @@ class StudioViewModel(app: Application, val workspaceKey: String = "main") : And
             mutable.value.folder?.let {listFolder(Uri.parse(it),listedRelative)}
         }
     }
+    private val quickSwitcherMutable = MutableStateFlow(QuickSwitcherState())
+    val quickSwitcher = quickSwitcherMutable.asStateFlow()
+    private val folderSearchMutable = MutableStateFlow(FolderSearchState())
+    val folderSearch = folderSearchMutable.asStateFlow()
+    private val drawerFilterMutable = MutableStateFlow("")
+    val drawerFilter = drawerFilterMutable.asStateFlow()
+    private val filteredFilesMutable = MutableStateFlow<List<FileEntry>>(emptyList())
+    val filteredFiles = filteredFilesMutable.asStateFlow()
+    private val drawerFilteringMutable = MutableStateFlow(false)
+    val drawerFiltering = drawerFilteringMutable.asStateFlow()
+    private val seededFindMutable = MutableStateFlow<PendingSeededFind?>(null)
+    val seededFind = seededFindMutable.asStateFlow()
+    private var quickSwitcherJob: Job? = null
+    private var folderSearchJob: Job? = null
+    private var drawerFilterJob: Job? = null
+
     init { prefs.registerOnSharedPreferenceChangeListener(preferencesChanged);observeActive();observeCustomTheme();migrateLegacyClosedNotes();if(workspaceKey=="main")viewModelScope.launch{updates.restore();if(!BuildConfig.DEBUG && updates.state.value.checkOnOpen){kotlinx.coroutines.delay(6000);updates.check()}} }
-    override fun onCleared() { viewModelRetired.set(true); recoveryWriter.closeAfterLatest(mutable.value); prefs.unregisterOnSharedPreferenceChangeListener(preferencesChanged);resolver.unregisterContentObserver(documentObserver);resolver.unregisterContentObserver(themeObserver); super.onCleared() }
+    override fun onCleared() {
+        viewModelRetired.set(true)
+        quickSwitcherJob?.cancel()
+        folderSearchJob?.cancel()
+        drawerFilterJob?.cancel()
+        recoveryWriter.closeAfterLatest(mutable.value)
+        prefs.unregisterOnSharedPreferenceChangeListener(preferencesChanged)
+        resolver.unregisterContentObserver(documentObserver)
+        resolver.unregisterContentObserver(themeObserver)
+        super.onCleared()
+    }
     val state = mutable.asStateFlow()
     fun inspectStorage() {
         if (mutable.value.storageScanning) return
@@ -1188,7 +1226,10 @@ class StudioViewModel(app: Application, val workspaceKey: String = "main") : And
                     resolver.openInputStream(target)?.use { } ?: error("Document permission is unavailable; choose it again")
                     return@withContext existing.copy(uri = target.toString())
                 }
-                val name = DocumentFile.fromSingleUri(getApplication(), target)?.name ?: "Note.md"
+                val name = DocumentFile.fromSingleUri(getApplication(), target)?.name
+                    ?: target.takeIf { it.scheme.equals("file", ignoreCase = true) }?.path?.let { File(it).name }?.takeIf { it.isNotBlank() }
+                    ?: relative?.substringAfterLast('/')?.takeIf { it.isNotBlank() }
+                    ?: "Note.md"
                 resolver.openInputStream(target)?.use { stream ->
                     val buffered = stream.buffered()
                     buffered.mark(65536)
@@ -1429,12 +1470,16 @@ class StudioViewModel(app: Application, val workspaceKey: String = "main") : And
     }
     fun setFolder(uri: Uri) = viewModelScope.launch {
         try {
-            withContext(Dispatchers.IO) { resolver.takePersistableUriPermission(uri, Intent.FLAG_GRANT_READ_URI_PERMISSION or Intent.FLAG_GRANT_WRITE_URI_PERMISSION) }
+            if (uri.scheme == "content") {
+                withContext(Dispatchers.IO) { resolver.takePersistableUriPermission(uri, Intent.FLAG_GRANT_READ_URI_PERMISSION or Intent.FLAG_GRANT_WRITE_URI_PERMISSION) }
+            }
             windowPrefs.edit().putBoolean("folderMigrated", true).putString("folder", uri.toString()).apply()
+            setDrawerFilter("")
             change { it.copy(folder = uri.toString()) }; listFolder(uri, "")
         } catch (error: Exception) { fail("Could not open folder: ${error.message}") }
     }
     fun closeFolder() {
+        setDrawerFilter("")
         windowPrefs.edit().putBoolean("folderMigrated", true).remove("folder").apply()
         change { it.copy(folder = null, files = emptyList()) }
     }
@@ -1442,12 +1487,275 @@ class StudioViewModel(app: Application, val workspaceKey: String = "main") : And
         listedRelative=relative
         try {
             val entries = withContext(Dispatchers.IO) {
-                var folder = DocumentFile.fromTreeUri(getApplication(), Uri.parse(mutable.value.folder ?: uri.toString())) ?: error("Choose the folder again to restore access")
-                relative.split('/').filter { it.isNotEmpty() }.forEach { part -> folder = folder.findFile(part) ?: error("Folder disappeared") }
-                folder.listFiles().mapNotNull { f -> val name = f.name ?: return@mapNotNull null; if (name.startsWith('.')) return@mapNotNull null; if (f.isDirectory || name.substringAfterLast('.').lowercase() in listOf("md", "smd", "markdown", "fmd")) FileEntry(name, f.uri.toString(), f.isDirectory, (if (relative.isEmpty()) "" else "$relative/") + name) else null }.sortedWith(compareByDescending<FileEntry> { it.directory }.thenBy { it.name.lowercase() })
+                val rootUri = Uri.parse(mutable.value.folder ?: uri.toString())
+                if (rootUri.scheme == "file") {
+                    var folder = File(rootUri.path ?: error("Folder path unavailable"))
+                    relative.split('/').filter { it.isNotEmpty() }.forEach { part ->
+                        folder = File(folder, part).takeIf { it.exists() && !java.nio.file.Files.isSymbolicLink(it.toPath()) } ?: error("Folder disappeared")
+                    }
+                    folder.listFiles().orEmpty().mapNotNull { f ->
+                        val name = f.name
+                        if (name.startsWith('.') || java.nio.file.Files.isSymbolicLink(f.toPath())) return@mapNotNull null
+                        if (f.isDirectory || (f.isFile && isSearchableNoteName(name))) {
+                            FileEntry(name, Uri.fromFile(f).toString(), f.isDirectory, (if (relative.isEmpty()) "" else "$relative/") + name)
+                        } else null
+                    }.sortedWith(compareByDescending<FileEntry> { it.directory }.thenBy { it.name.lowercase() })
+                } else {
+                    var folder = DocumentFile.fromTreeUri(getApplication(), rootUri) ?: error("Choose the folder again to restore access")
+                    relative.split('/').filter { it.isNotEmpty() }.forEach { part -> folder = folder.findFile(part) ?: error("Folder disappeared") }
+                    folder.listFiles().mapNotNull { f ->
+                        val name = f.name ?: return@mapNotNull null
+                        if (name.startsWith('.') || f.isVirtual) return@mapNotNull null
+                        if (f.isDirectory || isSearchableNoteName(name)) {
+                            FileEntry(name, f.uri.toString(), f.isDirectory, (if (relative.isEmpty()) "" else "$relative/") + name)
+                        } else null
+                    }.sortedWith(compareByDescending<FileEntry> { it.directory }.thenBy { it.name.lowercase() })
+                }
             }
             mutable.value = mutable.value.copy(files = entries)
         } catch (error: Exception) { fail("Could not list folder: ${error.message}") }
+    }
+
+    fun setDrawerFilter(query: String) {
+        drawerFilterJob?.cancel()
+        drawerFilterJob = null
+        drawerFilterMutable.value = query
+        val trimmed = query.trim()
+        if (trimmed.isEmpty()) {
+            filteredFilesMutable.value = emptyList()
+            drawerFilteringMutable.value = false
+            return
+        }
+        drawerFilteringMutable.value = true
+        drawerFilterJob = viewModelScope.launch {
+            val folderUri = mutable.value.folder?.let(Uri::parse)
+            val matched = withContext(Dispatchers.IO) {
+                filterFolderEntries(resolveSearchRoot(getApplication(), folderUri), trimmed)
+            }
+            if (drawerFilterMutable.value == query) {
+                filteredFilesMutable.value = matched
+                drawerFilteringMutable.value = false
+            }
+        }
+    }
+
+    fun openQuickSwitcher() {
+        closeFolderSearch()
+        quickSwitcherJob?.cancel()
+        quickSwitcherMutable.value = QuickSwitcherState(visible = true, query = "", loading = true)
+        quickSwitcherJob = viewModelScope.launch {
+            if (mutable.value.tabs.isNotEmpty()) {
+                val activeId = mutable.value.active.id
+                if (activeId.isNotEmpty()) runCatching { readerFlushRequester?.invoke(activeId) }
+            }
+            val tabsSnapshot = mutable.value.tabs
+            val recentSnapshot = recentMutable.value
+            val folderUri = mutable.value.folder?.let(Uri::parse)
+            val ranked = withContext(Dispatchers.IO) {
+                rankQuickSwitcher("", tabsSnapshot, recentSnapshot, resolveSearchRoot(getApplication(), folderUri))
+            }
+            if (quickSwitcherMutable.value.visible && quickSwitcherMutable.value.query.isEmpty()) {
+                quickSwitcherMutable.value = quickSwitcherMutable.value.copy(items = ranked, loading = false)
+            }
+        }
+    }
+
+    fun updateQuickSwitcherQuery(query: String) {
+        quickSwitcherJob?.cancel()
+        quickSwitcherMutable.value = quickSwitcherMutable.value.copy(query = query, loading = true)
+        quickSwitcherJob = viewModelScope.launch {
+            val tabsSnapshot = mutable.value.tabs
+            val recentSnapshot = recentMutable.value
+            val folderUri = mutable.value.folder?.let(Uri::parse)
+            val ranked = withContext(Dispatchers.IO) {
+                rankQuickSwitcher(query, tabsSnapshot, recentSnapshot, resolveSearchRoot(getApplication(), folderUri))
+            }
+            if (quickSwitcherMutable.value.visible && quickSwitcherMutable.value.query == query) {
+                quickSwitcherMutable.value = quickSwitcherMutable.value.copy(items = ranked, loading = false)
+            }
+        }
+    }
+
+    fun closeQuickSwitcher() {
+        quickSwitcherJob?.cancel()
+        quickSwitcherJob = null
+        if (quickSwitcherMutable.value.visible || quickSwitcherMutable.value.loading) {
+            quickSwitcherMutable.value = QuickSwitcherState(visible = false)
+        }
+    }
+
+    fun selectQuickSwitcherItem(item: QuickSwitcherItem) {
+        closeQuickSwitcher()
+        val existing = mutable.value.tabs.firstOrNull { tab ->
+            (item.tabId != null && tab.id == item.tabId) ||
+                (!item.uri.isNullOrBlank() && !tab.uri.isNullOrBlank() && sameDocumentUri(tab.uri, item.uri))
+        }
+        if (existing != null) {
+            select(existing.id)
+        } else if (!item.uri.isNullOrBlank()) {
+            open(Uri.parse(item.uri), item.relative)
+        }
+    }
+
+    fun openFolderSearch(initialQuery: String? = null) {
+        closeQuickSwitcher()
+        folderSearchJob?.cancel()
+        val previous = folderSearchMutable.value
+        val nextQuery = initialQuery ?: previous.query
+        folderSearchMutable.value = previous.copy(
+            visible = true,
+            query = nextQuery,
+            scanning = nextQuery.isNotEmpty(),
+            matches = if (nextQuery == previous.query && nextQuery.isNotEmpty()) previous.matches else emptyList(),
+            scannedFiles = if (nextQuery == previous.query && nextQuery.isNotEmpty()) previous.scannedFiles else 0,
+            truncated = false,
+        )
+        folderSearchJob = viewModelScope.launch {
+            if (mutable.value.tabs.isNotEmpty()) {
+                val activeId = mutable.value.active.id
+                if (activeId.isNotEmpty()) runCatching { readerFlushRequester?.invoke(activeId) }
+            }
+            if (nextQuery.isNotEmpty()) {
+                runFolderSearchScan(nextQuery, previous.caseSensitive, previous.includeDiagrams)
+            }
+        }
+    }
+
+    fun updateFolderSearch(
+        query: String = folderSearchMutable.value.query,
+        caseSensitive: Boolean = folderSearchMutable.value.caseSensitive,
+        includeDiagrams: Boolean = folderSearchMutable.value.includeDiagrams,
+    ) {
+        folderSearchJob?.cancel()
+        folderSearchJob = null
+        val visible = folderSearchMutable.value.visible
+        if (query.isEmpty()) {
+            folderSearchMutable.value = FolderSearchState(
+                visible = visible,
+                query = "",
+                caseSensitive = caseSensitive,
+                includeDiagrams = includeDiagrams,
+                scanning = false,
+            )
+            return
+        }
+        folderSearchMutable.value = FolderSearchState(
+            visible = visible,
+            query = query,
+            caseSensitive = caseSensitive,
+            includeDiagrams = includeDiagrams,
+            scanning = true,
+        )
+        folderSearchJob = viewModelScope.launch {
+            runFolderSearchScan(query, caseSensitive, includeDiagrams)
+        }
+    }
+
+    private suspend fun runFolderSearchScan(
+        query: String,
+        caseSensitive: Boolean,
+        includeDiagrams: Boolean,
+    ) {
+        val tabsSnapshot = mutable.value.tabs
+        val recentSnapshot = recentMutable.value
+        val folderUri = mutable.value.folder?.let(Uri::parse)
+        val finalState = withContext(Dispatchers.IO) {
+            streamTextSearch(
+                query = query,
+                tabs = tabsSnapshot,
+                recents = recentSnapshot,
+                folderRoot = resolveSearchRoot(getApplication(), folderUri),
+                media = media,
+                openUriStream = { candidateUri ->
+                    val target = documentAccess.resolve(candidateUri, writing = false)
+                    if (target.scheme == "file") target.path?.let(::File)?.inputStream()
+                    else resolver.openInputStream(target)
+                },
+                caseSensitive = caseSensitive,
+                excludeDiagrams = !includeDiagrams,
+                onBatch = { batch, scannedFiles, truncated, done ->
+                    if (batch.isNotEmpty() || done) {
+                        withContext(Dispatchers.Main.immediate) {
+                            val current = folderSearchMutable.value
+                            if (current.visible &&
+                                current.query == query &&
+                                current.caseSensitive == caseSensitive &&
+                                current.includeDiagrams == includeDiagrams
+                            ) {
+                                folderSearchMutable.value = current.copy(
+                                    matches = current.matches + batch,
+                                    scannedFiles = scannedFiles,
+                                    truncated = truncated,
+                                    scanning = !done,
+                                )
+                            }
+                        }
+                    }
+                },
+            )
+        }
+        val current = folderSearchMutable.value
+        if (current.visible &&
+            current.query == query &&
+            current.caseSensitive == caseSensitive &&
+            current.includeDiagrams == includeDiagrams
+        ) {
+            folderSearchMutable.value = finalState.copy(visible = true)
+        }
+    }
+
+    fun closeFolderSearch() {
+        folderSearchJob?.cancel()
+        folderSearchJob = null
+        if (folderSearchMutable.value.visible || folderSearchMutable.value.scanning) {
+            folderSearchMutable.value = folderSearchMutable.value.copy(visible = false, scanning = false)
+        }
+    }
+
+    fun cancelWorkspaceSearch() {
+        closeQuickSwitcher()
+        closeFolderSearch()
+    }
+
+    fun openSearchMatch(match: FolderSearchMatch) {
+        val currentSearch = folderSearchMutable.value
+        val query = currentSearch.query
+        val caseSensitive = currentSearch.caseSensitive
+        closeFolderSearch()
+        val existing = mutable.value.tabs.firstOrNull { tab ->
+            (match.tabId != null && tab.id == match.tabId) ||
+                (!match.uri.isNullOrBlank() && !tab.uri.isNullOrBlank() && sameDocumentUri(tab.uri, match.uri))
+        }
+        if (query.isNotEmpty()) {
+            seededFindMutable.value = PendingSeededFind(
+                query = query,
+                caseSensitive = caseSensitive,
+                targetTabId = existing?.id ?: match.tabId,
+                targetUri = existing?.uri ?: match.uri,
+            )
+        }
+        if (existing != null) {
+            if (mutable.value.active.id == existing.id) {
+                viewModelScope.launch { performReaderBarrier(existing.id) { } }
+            } else {
+                select(existing.id)
+            }
+        } else if (!match.uri.isNullOrBlank()) {
+            open(Uri.parse(match.uri), match.relative)
+        }
+    }
+
+    fun consumeSeededFind(nonce: Long) {
+        if (seededFindMutable.value?.nonce == nonce) {
+            seededFindMutable.value = null
+        }
+    }
+
+    internal fun activeMatchesSeedTarget(note: Note, seed: PendingSeededFind): Boolean {
+        if (note.id.isEmpty()) return false
+        if (seed.targetTabId != null && note.id == seed.targetTabId) return true
+        if (!seed.targetUri.isNullOrBlank() && !note.uri.isNullOrBlank() && sameDocumentUri(note.uri, seed.targetUri)) return true
+        return false
     }
     private fun noteForAsset(document: String): Note = mutable.value.tabs.firstOrNull {
         it.id == document || it.uri?.let { uri -> sameDocumentUri(uri, document) } == true

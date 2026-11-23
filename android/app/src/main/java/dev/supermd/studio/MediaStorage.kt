@@ -423,6 +423,131 @@ class MediaStorage(private val context: Context) {
         }
         return markdown ?: error("Portable source is unavailable")
     }
+
+    /**
+     * Read searchable Markdown text from a note stream, detecting compressed or JSON
+     * portable (.smd/.fmd) envelopes by content rather than extension and returning
+     * before embedded base64 image assets are decoded or extracted to disk.
+     */
+    internal fun readSearchableNote(
+        input: InputStream,
+        maxPlainBytes: Int = 5_000_000,
+        maxPortableMarkdownBytes: Int = 20_000_000,
+    ): String? {
+        val buffered = if (input.markSupported()) input else BufferedInputStream(input, 65_536)
+        buffered.mark(65_536)
+        val prefix = ByteArray(32_768)
+        var prefixLen = 0
+        while (prefixLen < prefix.size) {
+            val count = buffered.read(prefix, prefixLen, prefix.size - prefixLen)
+            if (count <= 0) break
+            prefixLen += count
+        }
+        buffered.reset()
+        if (prefixLen == 0) return ""
+        val headBytes = prefix.copyOfRange(0, prefixLen)
+        val isGzip = portableGzipHeader(headBytes)
+        val headerPreview = if (!isGzip) {
+            runCatching { String(headBytes, Charsets.UTF_8).trimStart('\uFEFF', ' ', '\n', '\r', '\t') }.getOrDefault("")
+        } else ""
+        if (isGzip || portableEnvelopeHeader(headerPreview)) {
+            return runCatching {
+                val content = if (isGzip) StrictGzipInputStream(buffered) else buffered
+                val bounded = object : java.io.FilterInputStream(content) {
+                    var consumed = 0L
+                    override fun read(): Int {
+                        val value = super.read()
+                        if (value >= 0) require(++consumed <= 120_000_000L)
+                        return value
+                    }
+                    override fun read(buffer: ByteArray, offset: Int, length: Int): Int {
+                        val size = super.read(buffer, offset, length)
+                        if (size > 0) {
+                            consumed += size
+                            require(consumed <= 120_000_000L)
+                        }
+                        return size
+                    }
+                }
+                val limitedText = object : java.io.FilterReader(bounded.reader(Charsets.UTF_8)) {
+                    var quoted = false
+                    var escaped = false
+                    var tokenLength = 0
+                    override fun read(buffer: CharArray, offset: Int, size: Int): Int {
+                        val count = super.read(buffer, offset, size)
+                        for (i in offset until offset + maxOf(count, 0)) {
+                            val c = buffer[i]
+                            if (quoted) {
+                                require(++tokenLength <= 34_000_000) { "Portable token is too large" }
+                                if (escaped) escaped = false
+                                else if (c == '\\') escaped = true
+                                else if (c == '"') quoted = false
+                            } else if (c == '"') {
+                                quoted = true
+                                tokenLength = 0
+                            }
+                        }
+                        return count
+                    }
+                }
+                var format: String? = null
+                var version: Int? = null
+                var markdown: String? = null
+                JsonReader(limitedText.buffered()).use { reader ->
+                    reader.beginObject()
+                    while (reader.hasNext()) {
+                        when (reader.nextName()) {
+                            "format" -> {
+                                format = reader.nextString()
+                                if (format !in setOf("supermd-smd", "supermd-fmd")) return@use
+                            }
+                            "version" -> {
+                                version = reader.nextInt()
+                                if (version != 1) return@use
+                            }
+                            "markdown" -> {
+                                val source = reader.nextString()
+                                if (source.toByteArray(Charsets.UTF_8).size > maxPortableMarkdownBytes) return@use
+                                markdown = source
+                            }
+                            else -> {
+                                // Our writer places format, version, and markdown before assets.
+                                // Stop immediately before decompressing or scanning base64 image payloads.
+                                if (format in setOf("supermd-smd", "supermd-fmd") && version == 1 && markdown != null) {
+                                    return@use
+                                }
+                                reader.skipValue()
+                            }
+                        }
+                        if (format in setOf("supermd-smd", "supermd-fmd") && version == 1 && markdown != null) {
+                            return@use
+                        }
+                    }
+                }
+                if (format in setOf("supermd-smd", "supermd-fmd") && version == 1) markdown else null
+            }.getOrNull()
+        }
+        if (headBytes.any { it == 0.toByte() }) return null
+        return runCatching {
+            val output = java.io.ByteArrayOutputStream(minOf(prefixLen, 65_536))
+            val chunk = ByteArray(8_192)
+            while (true) {
+                val read = buffered.read(chunk)
+                if (read < 0) break
+                if (output.size() + read > maxPlainBytes) return null
+                for (i in 0 until read) {
+                    if (chunk[i] == 0.toByte()) return null
+                }
+                output.write(chunk, 0, read)
+            }
+            Charsets.UTF_8.newDecoder()
+                .onMalformedInput(java.nio.charset.CodingErrorAction.REPORT)
+                .onUnmappableCharacter(java.nio.charset.CodingErrorAction.REPORT)
+                .decode(java.nio.ByteBuffer.wrap(output.toByteArray()))
+                .toString()
+                .removePrefix("\uFEFF")
+        }.getOrNull()
+    }
     fun writeLocalPortable(output: java.io.OutputStream, markdown: String, directory: String?) {
         val sources=JSONArray(PdfEngine.imageSources(markdown))
         val files=(0 until sources.length()).map {sources.getString(it)}.distinct().filter {it.startsWith("assets/")}.map {source->source to (local(source,directory) ?: error("Save manually to resolve a new image: $source"))}
