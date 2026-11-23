@@ -10,13 +10,13 @@ import {parseDiagramSource} from './components/InlineDiagram';
 import {parseBinaryTreeSource} from './components/BinaryTree';
 import {stepDiagramSvg} from './stepPdf';
 import {svgImage} from './svgImage';
-import {normalizeMarkdownSource} from './markdownSource';
+import {hasCallouts,normalizeMarkdownSource} from './markdownSource';
 const svgUri=(source:string)=>'data:image/svg+xml;base64,'+btoa(Array.from(new TextEncoder().encode(svgImage(source)),v=>String.fromCharCode(v)).join(''));
 const label=(value:string)=>value.replace(/[\\[\]*_`]/g,'\\$&').replace(/[\r\n]+/g,' ');
 const image=(source:string,alt='Diagram')=>`![${label(alt)}](<${source}>)`;
 export async function compatibleMarkdown(markdown:string,documentPath:string|null,depth=0):Promise<string>{
  if(depth>5)throw Error('Nested step content is too deep to export.');
- if(/^:::callout\s/m.test(markdown)){
+ if(hasCallouts(markdown)){
   const front=markdown.match(/^---\r?\n[\s\S]*?\r?\n---\r?\n/)?.[0]||'';
   markdown=front+normalizeMarkdownSource(markdown).value;
  }
