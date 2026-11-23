@@ -87,6 +87,11 @@ internal class ReaderBridge(
                     "document_flushed" -> documentFlushed(args)
                     "reading_position" -> {model.readingPosition(args.getString("id"),args.getJSONObject("location"));true}
                     "zoom_changed" -> { model.readerZoom(args.getDouble("zoom").toFloat(), args.optBoolean("fullscreen", model.state.value.fullscreen)); true }
+                    "typewriter_scroll" -> {
+                        val enabled = args.opt("enabled") as? Boolean ?: error("Invalid typewriter scroll value")
+                        model.typewriterScroll(enabled)
+                        true
+                    }
                     "reader_overlay_changed" -> { model.overlay(args.optBoolean("open"), args.optBoolean("image")); true }
                     "copy_image_native" -> {
                         val uri = withContext(Dispatchers.IO) {

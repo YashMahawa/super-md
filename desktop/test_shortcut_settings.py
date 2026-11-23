@@ -265,6 +265,31 @@ ApplicationWindow {{
         self.assertFalse(reload_btn.isVisible())
         self.assertIsNotNone(self.named_item("deleteSavedTheme_" + saved_entry["id"]), "Saved imported themes remain available while a preset is active")
 
+    def test_writing_typewriter_scroll_switch_and_shortcut_row_sync_with_studio(self):
+        page = self.window.findChild(object, "settingsPage")
+        self.assertIsNotNone(page)
+        page.setProperty("section", "writing")
+        QTest.qWait(30)
+        switch = self.named_item("writingTypewriterScroll")
+        self.assertIsNotNone(switch)
+        self.assertTrue(switch.isVisible())
+        self.assertFalse(self.studio.settings["typewriterScroll"])
+        self.assertFalse(switch.property("checked"))
+        point = switch.mapToScene(QPointF(switch.width() / 2, switch.height() / 2)).toPoint()
+        QTest.mouseClick(self.window, Qt.MouseButton.LeftButton, Qt.KeyboardModifier.NoModifier, point)
+        QTest.qWait(40)
+        self.assertTrue(self.studio.settings["typewriterScroll"])
+        self.window.setProperty("viewState", json.loads(self.studio.snapshot))
+        QTest.qWait(20)
+        self.assertTrue(switch.property("checked"))
+        QTest.mouseClick(self.window, Qt.MouseButton.LeftButton, Qt.KeyboardModifier.NoModifier, point)
+        QTest.qWait(40)
+        self.assertFalse(self.studio.settings["typewriterScroll"])
+
+        self.choose_shortcut_settings()
+        recorder = self.named_item("shortcutRecorder_typewriter_scroll")
+        self.assertIsNotNone(recorder)
+        self.assertEqual(self.studio.shortcutSequences("typewriter_scroll"), ["Ctrl+Alt+T"])
 
 
 if __name__ == "__main__":

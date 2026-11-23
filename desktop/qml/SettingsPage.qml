@@ -226,6 +226,8 @@ Pane {
                     spacing: 16
                 Switch { objectName: "writingAutosave"; text: "Autosave existing notes"; checked: viewState.settings.autosave; onToggled: page.save("autosave", checked) }
                 Switch { text: "Continue from the last reading position"; checked: viewState.settings.restorePosition; onToggled: page.save("restorePosition", checked) }
+                Switch { objectName: "writingTypewriterScroll"; text: "Typewriter scrolling"; checked: viewState.settings.typewriterScroll === true; onToggled: page.save("typewriterScroll", checked) }
+                Label { text: "Off by default. Vertically centers the active line in Source, Split and Live while typing."; Layout.fillWidth: true; wrapMode: Text.WordWrap; color: viewState.colors.muted }
                 Label { text: "On startup" }
                 ChoiceField { Layout.fillWidth: true; model: ["Restore previous tabs","Open a new blank note"]; currentIndex: viewState.settings.startup === "new" ? 1 : 0; onActivated: page.save("startup", currentIndex === 1 ? "new" : "restore") }
                 Label { text: "Unsaved drafts are recovered in either mode. Welcome is shown only on first use."; Layout.fillWidth: true; wrapMode: Text.WordWrap; color: viewState.colors.muted }
