@@ -1,17 +1,22 @@
 """CI harness: preserve every native assertion and diagnose stalled Qt drivers."""
 import faulthandler
-import platform
 import sys
 import unittest
 from pathlib import Path
 
-if __name__ == "__main__":
-    faulthandler.enable()
-    # Intel macOS CI runs five bounded 60-second Qt mouse-selection probes
-    # after hundreds of native tests. A four-minute suite watchdog kills the
+
+def suite_watchdog_seconds(platform_name: str = sys.platform) -> int:
+    # macOS CI (both Intel x86_64 and Apple Silicon arm64) runs multiple
+    # bounded 60-second QtWebEngine subprocess probes after hundreds of native
+    # tests under software rendering. A four-minute suite watchdog kills the
     # process before those individual timeouts can report a real failure.
     # Keep the per-probe assertions and timeout; only widen the suite budget.
-    suite_timeout = 720 if sys.platform == "darwin" and platform.machine() == "x86_64" else 240
+    return 720 if platform_name == "darwin" else 360
+
+
+if __name__ == "__main__":
+    faulthandler.enable()
+    suite_timeout = suite_watchdog_seconds()
     faulthandler.dump_traceback_later(suite_timeout, exit=True)
     try:
         suite=unittest.defaultTestLoader.discover(str(Path(__file__).parent),pattern="test_*.py")
