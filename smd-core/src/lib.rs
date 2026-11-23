@@ -334,10 +334,10 @@ pub fn export(markdown: &str, options: &PdfOptions, assets: &HashMap<String, Vec
 }
 
 #[cfg(target_os = "android")]
-fn jni_string(mut env: jni::JNIEnv, value: &str) -> jni::sys::jstring {
+fn jni_string(env: jni::JNIEnv, value: &str) -> jni::sys::jstring {
     env.new_string(value)
         .or_else(|_| env.new_string(""))
-        .map(Into::into_raw)
+        .map(|s| s.into_raw())
         .unwrap_or(std::ptr::null_mut())
 }
 
