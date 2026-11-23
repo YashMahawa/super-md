@@ -28,7 +28,10 @@ from pathlib import Path
 from network_tls import client_context
 from PySide6.QtCore import QObject, Property, Signal, Slot, QStandardPaths, QTimer, QUrl, QFileSystemWatcher, QProcess, Qt, QPointF, QRect, QMetaObject, QBuffer, QByteArray, QIODevice
 from PySide6.QtGui import QDesktopServices, QFontDatabase, QGuiApplication, QCursor, QImage
-from documents import atomic_write, atomic_json, bundle, image_data, materialize_assets, open_note, write_portable, MIMES, MAX_IMAGE
+from documents import (
+    atomic_write, atomic_json, bundle, decode_base64_chunked, decode_base64_chunks,
+    encode_base64_chunked, image_data, materialize_assets, open_note, write_portable, MIMES, MAX_IMAGE,
+)
 from markdown_export import write_markdown_export, write_markdown_zip
 from theme import detect_system_dark, read_system_palette, system_palette_paths, tokens
 from fonts import FontStore
@@ -166,6 +169,26 @@ def _same_closed_revision(current: dict, captured: dict) -> bool:
     """Compare content-bearing fields after a background close snapshot."""
     return current == captured
 
+
+def _snapshot_tab_state(tab: dict, *, include_view_state: bool = True) -> dict:
+    """Snapshot tab metadata and asset dicts without walking immutable image strings."""
+    snapshot = {}
+    for key, value in tab.items():
+        if not include_view_state and key == "viewState":
+            continue
+        if key in ("assets", "saved_assets") and isinstance(value, dict):
+            snapshot[key] = dict(value)
+        elif key == "outline" and isinstance(value, list):
+            snapshot[key] = copy.deepcopy(value)
+        elif key == "viewState" and value is not None:
+            snapshot[key] = copy.deepcopy(value)
+        elif isinstance(value, (str, int, float, bool)) or value is None:
+            snapshot[key] = value
+        else:
+            snapshot[key] = copy.deepcopy(value)
+    return snapshot
+
+
 def _asset_identity(value):
     return id(value)
 
@@ -287,6 +310,7 @@ class Studio(QObject):
     chromeRequested = Signal(str)
     replied = Signal(str, str, str)
     completed = Signal(object)
+    backgroundWriteCompleted = Signal(object)
     saveRequested = Signal(str)
     closeRequested = Signal(str)
     allowClose = Signal()
@@ -316,7 +340,10 @@ class Studio(QObject):
         self.session.windows[self.window_id] = self
         self.host_window = None
         self._retired = False
+        self._write_callback_lock = threading.Lock()
+        self._pending_write_retirements: dict[str, Any] = {}
         self.completed.connect(self._complete)
+        self.backgroundWriteCompleted.connect(self._complete_background_write)
         self.data = self.session.data
         self.settings = self.session.settings
         self._agent_error = ""
@@ -430,7 +457,7 @@ class Studio(QObject):
         self.saving = set()
         self.tabs = [{**tab,"id":tab.get("id") or uuid.uuid4().hex} for tab in self.session.initial_recovery]
         for tab in self.tabs:
-            tab.setdefault("saved_assets", copy.deepcopy(tab.get("assets", {})))
+            tab.setdefault("saved_assets", dict(tab.get("assets", {})))
         self._agent_open_paths.update(str(Path(tab["path"]).resolve()) for tab in self.tabs if tab.get("path"))
         self.session.initial_recovery = []
         self.session.drafts[self.window_id] = [dict(t) for t in self.tabs]
@@ -497,9 +524,9 @@ class Studio(QObject):
         self._preferences()
 
     def _note(self, name: str, content: str = "", path: str = "", saved: str = "", assets: dict | None = None, portable: bool = False):
-        assets = assets or {}
+        assets = dict(assets) if assets else {}
         return {"id": uuid.uuid4().hex, "name": name, "content": content, "path": path, "saved": saved,
-                "assets": assets, "saved_assets": copy.deepcopy(assets), "portable": portable}
+                "assets": assets, "saved_assets": dict(assets), "portable": portable}
 
     @Property("QStringList",notify=changed)
     def pinnedRecent(self):return self.session.pinned
@@ -704,7 +731,7 @@ class Studio(QObject):
                 self.note_file_stamps[path]=stamp
                 content,assets,portable=result
                 if content==expected and assets==current["assets"]:return
-                current.update(content=content,saved=content,assets=assets,saved_assets=copy.deepcopy(assets),portable=portable)
+                current.update(content=content,saved=content,assets=assets,saved_assets=dict(assets),portable=portable)
                 self.message="Reloaded externally updated note"
                 self._emit(load=id==self.active)
             self._submit(lambda path=path:open_note(Path(path)),finished,False)
@@ -770,6 +797,14 @@ class Studio(QObject):
         self._recover()
         self.session.reader_assets.revoke_owner(self.window_id)
         self._retired = True
+        with self._write_callback_lock:
+            retired_callbacks = list(self._pending_write_retirements.values())
+            self._pending_write_retirements.clear()
+        for callback in retired_callbacks:
+            try:
+                callback()
+            except Exception:
+                pass
         self.session.windows.pop(self.window_id, None)
         if not self.session.quitting and self.session.windows:
             self.session.workspace.pop(self.window_id,None)
@@ -1481,7 +1516,7 @@ class Studio(QObject):
         if self.active == tab_id: self.active = self.tabs[min(old, len(self.tabs)-1)]["id"]
         # Update both owners before writing one recovery snapshot: never duplicate
         # or temporarily lose a dirty note in the durable recovery stream.
-        self.session.drafts[self.window_id] = [copy.deepcopy({key: value for key, value in t.items() if key != "viewState"}) for t in self.tabs if t["content"] != t["saved"] and (t["path"] or t["content"].strip())]
+        self.session.drafts[self.window_id] = [_snapshot_tab_state(t, include_view_state=False) for t in self.tabs if t["content"] != t["saved"] and (t["path"] or t["content"].strip())]
         target._recover()
         self._emit(); target._emit()
         if emptied: QTimer.singleShot(0, self.allowClose.emit)
@@ -1688,6 +1723,63 @@ class Studio(QObject):
         done(value, error)
         self._emit(False)
 
+    def _submit_write(self, action, done, *, on_retired=None):
+        token = uuid.uuid4().hex
+        invoked = False
+
+        def notify_retired():
+            nonlocal invoked
+            with self._write_callback_lock:
+                if invoked:
+                    return
+                invoked = True
+                self._pending_write_retirements.pop(token, None)
+            if on_retired is not None:
+                on_retired()
+
+        if self.retired or getattr(self.writes, "_shutdown", False):
+            notify_retired()
+            return False
+
+        if on_retired is not None:
+            with self._write_callback_lock:
+                self._pending_write_retirements[token] = notify_retired
+
+        try:
+            future = self.writes.submit(action)
+        except RuntimeError:
+            notify_retired()
+            return False
+
+        def completed(f):
+            if f.cancelled():
+                notify_retired()
+                return
+            try:
+                value, error = f.result(), None
+            except Exception as reason:
+                value, error = None, str(reason)
+            if self.retired:
+                notify_retired()
+                return
+            try:
+                self.backgroundWriteCompleted.emit((token, done, notify_retired, value, error))
+            except RuntimeError:
+                notify_retired()
+
+        future.add_done_callback(completed)
+        return True
+
+    @Slot(object)
+    def _complete_background_write(self, payload):
+        token, done, notify_retired, value, error = payload
+        if self.retired:
+            notify_retired()
+            return
+        with self._write_callback_lock:
+            self._pending_write_retirements.pop(token, None)
+        done(value, error)
+
     def _preferences(self,notify=True):
         if self.retired or getattr(self.writes, "_shutdown", False): return
         data = json.dumps({"settings": self.settings, "recent": self.recent, "pinned":self.session.pinned}).encode()
@@ -1705,7 +1797,7 @@ class Studio(QObject):
         workspace={"paths":list(dict.fromkeys(t["path"] for t in entries if t["path"])),"tabs":entries,"active":self._current()["path"],"activeId":self.active}
         self.session.writes.submit_latest("startup",lambda:atomic_json(self.data/"startup.json",workspace),lambda error:self._notify_recovery_write("startup",error))
         # Snapshot only unsaved tabs. Asset bytes stay in recovery, never in displayed source.
-        self.session.drafts[self.window_id] = [copy.deepcopy({key: value for key, value in t.items() if key != "viewState"}) for t in self.tabs if t["content"] != t["saved"] and (t["path"] or t["content"].strip() or t["assets"])]
+        self.session.drafts[self.window_id] = [_snapshot_tab_state(t, include_view_state=False) for t in self.tabs if t["content"] != t["saved"] and (t["path"] or t["content"].strip() or t["assets"])]
         drafts = [tab for tabs in self.session.drafts.values() for tab in tabs]
         self.session.writes.submit_latest("recovery",lambda:atomic_json(self.data/"recovery.json",drafts),lambda error:self._notify_recovery_write("recovery",error))
 
@@ -1901,7 +1993,7 @@ class Studio(QObject):
         def read_note():
             if reference.get("_closedSnapshot"):
                 return self.session.closed_note_store.load(reference)
-            return copy.deepcopy(reference)  # compatibility with old in-memory entries
+            return _snapshot_tab_state(reference)  # compatibility with old in-memory entries
         self._submit(read_note,finished,False,self.writes)
 
     @Slot(str)
@@ -2121,7 +2213,7 @@ class Studio(QObject):
             if error: return
             target = next((t for t in self.tabs if t["id"] == id), None)
             if target:
-                target.update(path=str(path), name=path.name, saved=content, saved_assets=copy.deepcopy(assets), portable=portable)
+                target.update(path=str(path), name=path.name, saved=content, saved_assets=dict(assets), portable=portable)
                 if automatic and target["content"] != content: self.autosave_timer.start(900)
             self.message = "Autosaved" if automatic else "Saved"
             self._recover()
@@ -2196,9 +2288,9 @@ class Studio(QObject):
         if removed["content"].strip() or removed["path"] or removed.get("assets"):
             if id in self._closing_tabs:return
             self._closing_tabs.add(id)
-            # Strings and encoded assets are immutable; deepcopy shares their
-            # bytes while snapshotting small mutable metadata/asset mappings.
-            captured=copy.deepcopy(removed)
+            # Strings and encoded assets are immutable; snapshot small mutable
+            # metadata/asset mappings without walking large base64 strings.
+            captured=_snapshot_tab_state(removed)
             def saved(reference,error):
                 self._closing_tabs.discard(id)
                 if error:
@@ -2533,84 +2625,7 @@ class Studio(QObject):
             revision = hashlib.sha256(content.encode("utf-8")).hexdigest()
             return self._agent_tab_result(note, active=not background, title=title)
         if action == "save_document":
-            tab_id = args.get("tabId")
-            tab = next((item for item in self.tabs if item["id"] == tab_id), None)
-            if not tab:
-                raise ValueError("Save requires a target tab that is still open")
-            if tab_id in self.saving:
-                raise ValueError("A save is already in progress for this tab; retry after it finishes")
-            revision = hashlib.sha256(tab["content"].encode("utf-8")).hexdigest()
-            if args.get("expectedRevision") != revision:
-                raise ValueError("Live tab revision changed; inspect it again before saving")
-            requested_format = args.get("format")
-            current_format = "smd" if tab.get("portable") or Path(tab.get("path") or tab["name"]).suffix.lower() == ".smd" else "md"
-            filename_suffix = Path(args.get("filename", "")).suffix.lower() if isinstance(args.get("filename", ""), str) else ""
-            filename_format = "smd" if filename_suffix == ".smd" else "md" if filename_suffix in (".md", ".markdown") else None
-            fmt = requested_format or (filename_format if args.get("saveAs") or args.get("filename") else None) or current_format
-            if fmt not in ("md", "smd"):
-                raise ValueError("Save format must be md or smd")
-            old_path = tab["path"]
-            try:
-                old_canonical_path = str(Path(old_path).resolve(strict=True)) if old_path else ""
-            except (OSError, RuntimeError):
-                old_canonical_path = ""
-            save_as = bool(args.get("saveAs", False)) or bool(args.get("filename"))
-            if not isinstance(args.get("saveAs", False), bool):
-                raise ValueError("saveAs must be a boolean")
-            same_format = tab.get("path") and current_format == fmt
-            created_new_path = False
-            if old_path and not save_as and same_format and fmt == current_format:
-                path = Path(old_path)
-                # Compare the full decoded note, including portable assets, with
-                # the tab's saved snapshot before replacing the existing file.
-                # This is the same external-change guard used by GUI autosave.
-                if path.is_file():
-                    disk_content, disk_assets, disk_portable = open_note(path)
-                    if (disk_content != tab["saved"] or disk_assets != tab.get("saved_assets", tab.get("assets", {})) or
-                            disk_portable != bool(tab.get("portable"))):
-                        raise ValueError("This file changed outside Super MD. Your edits remain in draft recovery; use save-as to keep both versions.")
-                else:
-                    raise ValueError("The saved file is no longer available; use save-as to create a new copy")
-            else:
-                if old_path and not save_as:
-                    raise ValueError("Saving in another format requires saveAs:true and a new filename")
-                path = self._agent_export_path(args.get("filename", ""), fmt, tab)
-                self._agent_owned_files.add(str(path.resolve()))
-                created_new_path = True
-                reservation_stat = path.stat(follow_symlinks=False)
-                reservation_identity = (reservation_stat.st_dev, reservation_stat.st_ino)
-            if not created_new_path:
-                reservation_identity = None
-            path = path.resolve()
-            try:
-                if fmt == "smd":
-                    write_portable(path, tab["content"], tab["assets"])
-                else:
-                    # Converting a portable note to Markdown must keep its
-                    # relative image references valid on disk. The helper
-                    # refuses to replace an unrelated image at that path.
-                    materialize_assets(path.parent, tab["assets"])
-                    atomic_write(path, tab["content"].encode("utf-8"))
-            except Exception:
-                if created_new_path:
-                    self._agent_owned_files.discard(str(path.resolve()))
-                    try:
-                        current_stat = path.stat(follow_symlinks=False)
-                        if (reservation_identity == (current_stat.st_dev, current_stat.st_ino)
-                                and current_stat.st_size == 0 and not path.is_symlink()):
-                            path.unlink()
-                    except OSError:
-                        pass
-                raise
-            path_changed = not old_canonical_path or str(path) != old_canonical_path
-            tab.update(path=str(path), name=path.name, saved=tab["content"], portable=fmt == "smd")
-            tab["saved_assets"] = copy.deepcopy(tab["assets"])
-            self._agent_open_paths.add(str(path.resolve()))
-            self._recover(); self._emit()
-            return {"tabId": tab_id, "windowId": self.window_id, "path": str(path),
-                    "filename": path.name, "revision": revision, "format": fmt, "isDirty": False,
-                    "pathChanged": path_changed, "oldPath": old_canonical_path or old_path,
-                    "newPath": str(path)}
+            return Studio._run_prepared_write_sync(self, Studio._prepare_save_document(self, args))
         if action == "activate_document":
             tab_id = args.get("tabId")
             tab = next((item for item in self.tabs if item["id"] == tab_id), None)
@@ -2735,19 +2750,194 @@ class Studio(QObject):
                 continue
         return False
 
-    def _attach_tab_asset_native(self, args):
-        """Attach a bounded local or relay-supplied image to a saved portable note."""
+    @staticmethod
+    def _run_prepared_write_sync(studio, prepared):
+        tab_id, work, finalize, _abort = prepared
+        saving = getattr(studio, "saving", None)
+        if saving is not None:
+            saving.add(tab_id)
+        try:
+            value = work()
+        except Exception as error:
+            if saving is not None:
+                saving.discard(tab_id)
+            finalize(None, str(error))
+            raise
+        if saving is not None:
+            saving.discard(tab_id)
+        return finalize(value, None)
+
+    def _agent_document_action_async(self, args, on_complete):
+        action = args.get("action")
+        if action == "save_document":
+            prepared = Studio._prepare_save_document(self, args)
+        elif action == "replace_tab_asset":
+            prepared = Studio._prepare_replace_tab_asset(self, args)
+        elif action == "asset_action" and args.get("assetAction") == "attach":
+            prepared = Studio._prepare_attach_tab_asset(self, args)
+        else:
+            result = self._agent_document_action(args)
+            on_complete(result, None)
+            return
+
+        tab_id, work, finalize, abort = prepared
+        if self.retired or getattr(self.writes, "_shutdown", False):
+            abort()
+            raise ValueError("The target desktop window was closed")
+
+        self.saving.add(tab_id)
+
+        def handle_done(value, error):
+            self.saving.discard(tab_id)
+            if error is not None:
+                finalize(None, error)
+                on_complete(None, error)
+                return
+            try:
+                result = finalize(value, None)
+            except Exception as failure:
+                on_complete(None, str(failure))
+                return
+            on_complete(result, None)
+
+        def handle_retired():
+            self.saving.discard(tab_id)
+            finalize(None, "The target desktop window was closed")
+            on_complete(None, "The target desktop window was closed")
+
+        if not self._submit_write(work, handle_done, on_retired=handle_retired):
+            abort()
+
+    def _prepare_save_document(self, args):
+        tab_id = args.get("tabId")
+        tab = next((item for item in self.tabs if item["id"] == tab_id), None)
+        if not tab:
+            raise ValueError("Save requires a target tab that is still open")
+        saving = getattr(self, "saving", None)
+        if saving is not None and tab_id in saving:
+            raise ValueError("A save is already in progress for this tab; retry after it finishes")
+        content_snapshot = tab["content"]
+        revision = hashlib.sha256(content_snapshot.encode("utf-8")).hexdigest()
+        if args.get("expectedRevision") != revision:
+            raise ValueError("Live tab revision changed; inspect it again before saving")
+        requested_format = args.get("format")
+        current_format = "smd" if tab.get("portable") or Path(tab.get("path") or tab["name"]).suffix.lower() == ".smd" else "md"
+        filename_suffix = Path(args.get("filename", "")).suffix.lower() if isinstance(args.get("filename", ""), str) else ""
+        filename_format = "smd" if filename_suffix == ".smd" else "md" if filename_suffix in (".md", ".markdown") else None
+        fmt = requested_format or (filename_format if args.get("saveAs") or args.get("filename") else None) or current_format
+        if fmt not in ("md", "smd"):
+            raise ValueError("Save format must be md or smd")
+        old_path = tab["path"]
+        try:
+            old_canonical_path = str(Path(old_path).resolve(strict=True)) if old_path else ""
+        except (OSError, RuntimeError):
+            old_canonical_path = ""
+        save_as = bool(args.get("saveAs", False)) or bool(args.get("filename"))
+        if not isinstance(args.get("saveAs", False), bool):
+            raise ValueError("saveAs must be a boolean")
+        same_format = tab.get("path") and current_format == fmt
+        saved_snapshot = tab["saved"]
+        assets_snapshot = dict(tab.get("assets", {}))
+        saved_assets_snapshot = dict(tab.get("saved_assets", assets_snapshot))
+        portable_snapshot = bool(tab.get("portable"))
+        created_new_path = False
+        reservation_identity = None
+        if old_path and not save_as and same_format and fmt == current_format:
+            path = Path(old_path)
+            if not path.is_file():
+                raise ValueError("The saved file is no longer available; use save-as to create a new copy")
+        else:
+            if old_path and not save_as:
+                raise ValueError("Saving in another format requires saveAs:true and a new filename")
+            path = self._agent_export_path(args.get("filename", ""), fmt, tab)
+            self._agent_owned_files.add(str(path.resolve()))
+            created_new_path = True
+            reservation_stat = path.stat(follow_symlinks=False)
+            reservation_identity = (reservation_stat.st_dev, reservation_stat.st_ino)
+        resolved_path = path.resolve()
+
+        def unlink_reserved():
+            if not created_new_path:
+                return
+            try:
+                current_stat = resolved_path.stat(follow_symlinks=False)
+                if (reservation_identity == (current_stat.st_dev, current_stat.st_ino)
+                        and current_stat.st_size == 0 and not resolved_path.is_symlink()):
+                    resolved_path.unlink()
+            except OSError:
+                pass
+
+        def abort():
+            unlink_reserved()
+            if created_new_path:
+                self._agent_owned_files.discard(str(resolved_path))
+
+        def work():
+            try:
+                if not created_new_path:
+                    # Compare the full decoded note, including portable assets, with
+                    # the tab's saved snapshot before replacing the existing file.
+                    if not path.is_file():
+                        raise ValueError("The saved file is no longer available; use save-as to create a new copy")
+                    disk_content, disk_assets, disk_portable = open_note(path)
+                    if (disk_content != saved_snapshot or disk_assets != saved_assets_snapshot or
+                            disk_portable != portable_snapshot):
+                        raise ValueError("This file changed outside Super MD. Your edits remain in draft recovery; use save-as to keep both versions.")
+                if fmt == "smd":
+                    write_portable(resolved_path, content_snapshot, assets_snapshot)
+                else:
+                    # Converting a portable note to Markdown must keep its
+                    # relative image references valid on disk. The helper
+                    # refuses to replace an unrelated image at that path.
+                    materialize_assets(resolved_path.parent, assets_snapshot)
+                    atomic_write(resolved_path, content_snapshot.encode("utf-8"))
+            except Exception:
+                unlink_reserved()
+                raise
+
+        def finalize(_value, error):
+            if error is not None:
+                unlink_reserved()
+                if created_new_path:
+                    self._agent_owned_files.discard(str(resolved_path))
+                return None
+            path_changed = not old_canonical_path or str(resolved_path) != old_canonical_path
+            target = next((item for item in self.tabs if item["id"] == tab_id), None)
+            is_dirty = False
+            if target is not None:
+                target.update(path=str(resolved_path), name=resolved_path.name, saved=content_snapshot, portable=fmt == "smd")
+                target["saved_assets"] = dict(assets_snapshot)
+                is_dirty = target["content"] != content_snapshot
+                if is_dirty and getattr(self, "settings", {}).get("autosave") and hasattr(self, "autosave_timer"):
+                    self.autosave_timer.start(900)
+            self._agent_open_paths.add(str(resolved_path))
+            self._recover()
+            self._emit()
+            return {"tabId": tab_id, "windowId": self.window_id, "path": str(resolved_path),
+                    "filename": resolved_path.name, "revision": revision, "format": fmt, "isDirty": is_dirty,
+                    "pathChanged": path_changed, "oldPath": old_canonical_path or old_path,
+                    "newPath": str(resolved_path)}
+
+        return tab_id, work, finalize, abort
+
+    def _prepare_attach_tab_asset(self, args):
+        """Prepare attaching a bounded local or relay-supplied image to a saved portable note."""
         tab_id = args.get("tabId")
         tab = next((item for item in self.tabs if item["id"] == tab_id), None)
         if not tab or tab_id != self.active:
             raise ValueError("Attaching an asset requires the target tab to be active")
-        revision = hashlib.sha256(tab["content"].encode("utf-8")).hexdigest()
+        saving = getattr(self, "saving", None)
+        if saving is not None and tab_id in saving:
+            raise ValueError("A save is already in progress for this tab; retry after it finishes")
+        content_snapshot = tab["content"]
+        revision = hashlib.sha256(content_snapshot.encode("utf-8")).hexdigest()
         if args.get("expectedRevision") != revision:
             raise ValueError("Live tab revision changed; inspect it again before attaching an asset")
         path = Path(tab.get("path") or "")
         if not tab.get("portable") or path.suffix.lower() != ".smd" or not path.is_file():
             raise ValueError("Attaching an asset requires a saved portable .smd note")
-        if tab["content"] != tab["saved"]:
+        saved_snapshot = tab["saved"]
+        if content_snapshot != saved_snapshot:
             raise ValueError("Save the note before attaching a portable asset")
 
         mime = args.get("mimeType")
@@ -2755,21 +2945,18 @@ class Studio(QObject):
         asset_path = args.get("assetPath")
         if (isinstance(body, str)) == (isinstance(asset_path, str) and bool(asset_path)):
             raise ValueError("Provide exactly one of base64 body or local assetPath")
-        if isinstance(body, str):
+        inline_mode = isinstance(body, str)
+        candidate = None
+        if inline_mode:
             if mime not in MIMES.values() or len(body) > (MAX_IMAGE * 4 // 3 + 8):
                 raise ValueError("Inline asset type or size is invalid")
-            try:
-                raw = base64.b64decode(body, validate=True)
-            except (ValueError, TypeError) as error:
-                raise ValueError("Asset body must be valid base64") from error
-            if not 1 <= len(raw) <= 1024 * 1024:
-                raise ValueError("Relay supplied assets are limited to 1 MiB")
             requested_name = args.get("assetName")
         else:
             roots = [path.parent]
-            if self.folder:
-                roots.append(Path(self.folder))
-            location = self.settings.get("newNoteLocation")
+            folder = getattr(self, "folder", "")
+            if folder:
+                roots.append(Path(folder))
+            location = getattr(self, "settings", {}).get("newNoteLocation")
             if location:
                 roots.append(Path(location))
             candidate = Path(asset_path).expanduser()
@@ -2787,48 +2974,128 @@ class Studio(QObject):
             mime = MIMES.get(extension)
             if mime is None:
                 raise ValueError("Asset type must be PNG, JPEG, SVG, GIF, WebP or AVIF")
-            raw = candidate.read_bytes()
             requested_name = args.get("assetName") or candidate.name
 
-        filename = requested_name.removeprefix("assets/") if isinstance(requested_name, str) else ""
-        if not re.fullmatch(r"[A-Za-z0-9._-]{1,150}", filename) or filename in (".", ".."):
-            raise ValueError("Asset name must be a simple filename")
-        extension = Path(filename).suffix.lower().lstrip(".")
-        if not extension:
-            extension = next((ext for ext, kind in MIMES.items() if kind == mime), "")
-            filename += "." + extension
-        if MIMES.get(extension) != mime:
-            raise ValueError("Asset name extension must match the image type")
-        signatures = {"image/png": raw.startswith(b"\x89PNG\r\n\x1a\n"),
-                      "image/jpeg": raw.startswith(b"\xff\xd8\xff"),
-                      "image/webp": len(raw) >= 12 and raw[:4] == b"RIFF" and raw[8:12] == b"WEBP",
-                      "image/gif": raw.startswith((b"GIF87a", b"GIF89a")),
-                      "image/avif": len(raw) >= 12 and raw[4:8] == b"ftyp" and b"avif" in raw[8:16],
-                      "image/svg+xml": b"<svg" in raw[:4096].lower()}
-        if not signatures.get(mime, False):
-            raise ValueError("Asset bytes do not match the declared image type")
-        asset_key = "assets/" + filename
-        assets = tab.get("assets", {})
-        if asset_key in assets:
-            raise ValueError("An asset with that name already exists")
-        disk_content, disk_assets, portable = open_note(path)
-        if not portable or disk_content != tab["saved"] or disk_assets != assets:
-            raise ValueError("The portable note changed on disk; reopen it before attaching an asset")
-        updated = dict(assets)
-        updated[asset_key] = f"data:{mime};base64," + base64.b64encode(raw).decode("ascii")
-        write_portable(path, tab["content"], updated)
-        tab["assets"] = updated
-        tab["saved"] = tab["content"]
-        tab["saved_assets"] = copy.deepcopy(updated)
-        self.session.reader_assets.revoke_tab(self.window_id, tab_id)
-        self.readerCall.emit("window.dispatchEvent(new Event('supermd-assets-changed'))")
-        self._recover(); self._emit()
-        record = {"name": asset_key, "mime": mime, "bytes": len(raw), "sha256": hashlib.sha256(raw).hexdigest()}
-        return {"tabId": tab_id, "assetName": asset_key, "asset": record, "mimeType": mime,
-                "bytes": len(raw), "sha256": record["sha256"], "revision": revision, "saved": True}
+        assets_snapshot = dict(tab.get("assets", {}))
+        saved_assets_snapshot = dict(tab.get("saved_assets", assets_snapshot))
 
-    def _save_media_native(self, args):
-        body, mime_type, filename = args.get("body"), args.get("mimeType"), args.get("filename", "")
+        def work():
+            if inline_mode:
+                try:
+                    raw = decode_base64_chunked(body)
+                except (ValueError, TypeError, base64.binascii.Error) as error:
+                    raise ValueError("Asset body must be valid base64") from error
+                if not 1 <= len(raw) <= 1024 * 1024:
+                    raise ValueError("Relay supplied assets are limited to 1 MiB")
+            else:
+                assert candidate is not None
+                raw = candidate.read_bytes()
+                if len(raw) > MAX_IMAGE:
+                    raise ValueError("Asset exceeds 25 MB")
+
+            filename = requested_name.removeprefix("assets/") if isinstance(requested_name, str) else ""
+            if not re.fullmatch(r"[A-Za-z0-9._-]{1,150}", filename) or filename in (".", ".."):
+                raise ValueError("Asset name must be a simple filename")
+            ext = Path(filename).suffix.lower().lstrip(".")
+            if not ext:
+                ext = next((item for item, kind in MIMES.items() if kind == mime), "")
+                filename += "." + ext
+            if MIMES.get(ext) != mime:
+                raise ValueError("Asset name extension must match the image type")
+            signatures = {"image/png": raw.startswith(b"\x89PNG\r\n\x1a\n"),
+                          "image/jpeg": raw.startswith(b"\xff\xd8\xff"),
+                          "image/webp": len(raw) >= 12 and raw[:4] == b"RIFF" and raw[8:12] == b"WEBP",
+                          "image/gif": raw.startswith((b"GIF87a", b"GIF89a")),
+                          "image/avif": len(raw) >= 12 and raw[4:8] == b"ftyp" and b"avif" in raw[8:16],
+                          "image/svg+xml": b"<svg" in raw[:4096].lower()}
+            if not signatures.get(mime, False):
+                raise ValueError("Asset bytes do not match the declared image type")
+            asset_key = "assets/" + filename
+            if asset_key in assets_snapshot:
+                raise ValueError("An asset with that name already exists")
+            disk_content, disk_assets, portable = open_note(path)
+            if not portable or disk_content != saved_snapshot or disk_assets != saved_assets_snapshot:
+                raise ValueError("The portable note changed on disk; reopen it before attaching an asset")
+            updated = dict(assets_snapshot)
+            updated[asset_key] = f"data:{mime};base64," + encode_base64_chunked(raw)
+            write_portable(path, content_snapshot, updated)
+            sha = hashlib.sha256(raw).hexdigest()
+            record = {"name": asset_key, "mime": mime, "bytes": len(raw), "sha256": sha}
+            return {"updated": updated, "result": {"tabId": tab_id, "assetName": asset_key, "asset": record,
+                                                   "mimeType": mime, "bytes": len(raw), "sha256": sha,
+                                                   "revision": revision, "saved": True}}
+
+        def finalize(value, error):
+            if error is not None:
+                return None
+            updated = value["updated"]
+            target = next((item for item in self.tabs if item["id"] == tab_id), None)
+            if target is not None:
+                extra = {k: v for k, v in target.get("assets", {}).items() if k not in assets_snapshot}
+                target["assets"] = {**updated, **extra} if extra else updated
+                target["saved"] = content_snapshot
+                target["saved_assets"] = dict(updated)
+                if target["content"] != content_snapshot and getattr(self, "settings", {}).get("autosave") and hasattr(self, "autosave_timer"):
+                    self.autosave_timer.start(900)
+            session = getattr(self, "session", None)
+            reader_assets = getattr(session, "reader_assets", None)
+            if reader_assets is not None:
+                reader_assets.revoke_tab(self.window_id, tab_id)
+            if hasattr(self, "readerCall"):
+                self.readerCall.emit("window.dispatchEvent(new Event('supermd-assets-changed'))")
+            if hasattr(self, "_recover"):
+                self._recover()
+            if hasattr(self, "_emit"):
+                self._emit()
+            return value["result"]
+
+        return tab_id, work, finalize, lambda: None
+
+    def _attach_tab_asset_native(self, args):
+        """Attach a bounded local or relay-supplied image to a saved portable note."""
+        return Studio._run_prepared_write_sync(self, Studio._prepare_attach_tab_asset(self, args))
+
+    @staticmethod
+    def _parse_media_envelope(raw: str):
+        if len(raw) > 524_288:
+            key_pos = raw.find('"body"')
+            if key_pos >= 0:
+                colon_pos = raw.find(":", key_pos + 6)
+                if colon_pos >= 0:
+                    q_open = raw.find('"', colon_pos + 1)
+                    if q_open >= 0 and raw[colon_pos + 1:q_open].strip() == "":
+                        q_close = raw.find('"', q_open + 1)
+                        if q_close > q_open + 262_144:
+                            try:
+                                parsed = json.loads(raw[:q_open + 1] + raw[q_close:])
+                                if isinstance(parsed, dict) and parsed.get("body") == "":
+                                    return parsed, raw, q_open + 1, q_close
+                            except ValueError:
+                                pass
+        parsed = json.loads(raw)
+        if not isinstance(parsed, dict):
+            raise ValueError("Invalid media payload")
+        body = parsed.get("body")
+        if not isinstance(body, str):
+            raise ValueError("Media data is invalid or exceeds 25 MB")
+        return parsed, body, 0, len(body)
+
+    @staticmethod
+    def _validate_and_write_media(args: dict, directory: Path, *, source_str: str | None = None,
+                                  body_start: int = 0, body_end: int | None = None) -> dict:
+        if not isinstance(args, dict):
+            raise ValueError("Invalid media payload")
+        mime_type, filename = args.get("mimeType"), args.get("filename", "")
+        if source_str is None:
+            body = args.get("body")
+            if not isinstance(body, str):
+                raise ValueError("Media data is invalid or exceeds 25 MB")
+            source_str = body
+            body_start = 0
+            body_end = len(body)
+        else:
+            assert body_end is not None
+        body_len = body_end - body_start
         extensions = {"image/png": ".png", "image/svg+xml": ".svg", "image/jpeg": ".jpg",
                       "image/webp": ".webp", "image/gif": ".gif", "image/avif": ".avif",
                       "text/plain": ".mmd"}
@@ -2836,63 +3103,126 @@ class Studio(QObject):
             raise ValueError("Unsupported media type")
         if not isinstance(filename, str) or len(filename) > 160 or any(char in filename for char in ("/", "\\", "\0")):
             raise ValueError("Media filename must be a short basename")
-        if not isinstance(body, str) or len(body) > 36_000_000:
+        if body_len <= 0 or body_len > 36_000_000:
             raise ValueError("Media data is invalid or exceeds 25 MB")
+        safe = re.sub(r"[^A-Za-z0-9._ -]", "", Path(str(filename)).stem).strip(" .")[:100] or "Super-MD-media"
+        extension = extensions[mime_type]
+        if not directory.is_dir():
+            raise ValueError("The media download folder is unavailable")
+
+        step = 262_144  # 256 KiB chars (multiple of 4)
+        first_end = min(body_start + step, body_end)
+        first_slice = source_str[body_start:first_end]
         try:
-            data = base64.b64decode(body, validate=True)
+            if first_end < body_end and "=" in first_slice:
+                raise base64.binascii.Error("Excess data after padding")
+            first_chunk = base64.b64decode(first_slice, validate=True)
         except (ValueError, base64.binascii.Error):
             raise ValueError("Media data is not valid base64") from None
-        if not data or len(data) > 25_000_000:
+        if not first_chunk or len(first_chunk) > 25_000_000:
             raise ValueError("Media data is empty or exceeds 25 MB")
-        signatures = {"image/png": data.startswith(b"\x89PNG\r\n\x1a\n"),
-                      "image/jpeg": data.startswith(b"\xff\xd8\xff"),
-                      "image/webp": len(data) >= 12 and data[:4] == b"RIFF" and data[8:12] == b"WEBP",
-                      "image/gif": data.startswith((b"GIF87a", b"GIF89a")),
-                      "image/avif": len(data) >= 12 and data[4:8] == b"ftyp" and b"avif" in data[8:16],
-                      "image/svg+xml": b"<svg" in data[:4096].lower(),
+        head = first_chunk[:4096]
+        signatures = {"image/png": head.startswith(b"\x89PNG\r\n\x1a\n"),
+                      "image/jpeg": head.startswith(b"\xff\xd8\xff"),
+                      "image/webp": len(head) >= 12 and head[:4] == b"RIFF" and head[8:12] == b"WEBP",
+                      "image/gif": head.startswith((b"GIF87a", b"GIF89a")),
+                      "image/avif": len(head) >= 12 and head[4:8] == b"ftyp" and b"avif" in head[8:16],
+                      "image/svg+xml": b"<svg" in head.lower(),
                       "text/plain": True}
         if not signatures[mime_type]:
             raise ValueError("Media bytes do not match the declared type")
-        safe = re.sub(r"[^A-Za-z0-9._ -]", "", Path(str(filename)).stem).strip(" .")[:100] or "Super-MD-media"
-        extension = extensions[mime_type]
-        directory = Path(self.settings.get("newNoteLocation") or QStandardPaths.writableLocation(QStandardPaths.DownloadLocation) or str(Path.home())).expanduser()
-        if not directory.is_dir():
-            raise ValueError("The media download folder is unavailable")
+
         for suffix in range(1, 10000):
             name = f"{safe}{'' if suffix == 1 else f' ({suffix})'}{extension}"
             path = directory / name
             try:
                 fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
-                with os.fdopen(fd, "wb") as stream:
-                    stream.write(data)
-                    stream.flush()
-                    os.fsync(stream.fileno())
-                return {"filename": name, "path": str(path), "bytes": len(data), "mimeType": mime_type}
             except FileExistsError:
                 continue
+            try:
+                total_bytes = len(first_chunk)
+                with os.fdopen(fd, "wb") as stream:
+                    stream.write(first_chunk)
+                    for offset in range(first_end, body_end, step):
+                        end = min(offset + step, body_end)
+                        chunk = source_str[offset:end]
+                        try:
+                            if end < body_end and "=" in chunk:
+                                raise base64.binascii.Error("Excess data after padding")
+                            piece = base64.b64decode(chunk, validate=True)
+                        except (ValueError, base64.binascii.Error):
+                            raise ValueError("Media data is not valid base64") from None
+                        total_bytes += len(piece)
+                        if total_bytes > 25_000_000:
+                            raise ValueError("Media data is empty or exceeds 25 MB")
+                        if piece:
+                            stream.write(piece)
+                    stream.flush()
+                    os.fsync(stream.fileno())
+                return {"filename": name, "path": str(path), "bytes": total_bytes, "mimeType": mime_type}
+            except Exception:
+                try:
+                    path.unlink(missing_ok=True)
+                except OSError:
+                    pass
+                raise
         raise ValueError("Could not find an unused media filename")
 
-    def _replace_tab_asset_native(self, args):
+    def _media_download_directory(self) -> Path:
+        directory = Path(self.settings.get("newNoteLocation") or QStandardPaths.writableLocation(QStandardPaths.DownloadLocation) or str(Path.home())).expanduser()
+        if not directory.is_dir():
+            raise ValueError("The media download folder is unavailable")
+        return directory
+
+    def _prepare_save_media(self, args):
+        directory = self._media_download_directory()
+        if not isinstance(args, dict):
+            raise ValueError("Invalid media payload")
+        # Validate lightweight envelope fields up front while keeping base64 decode and disk I/O in work().
+        extensions = {"image/png", "image/svg+xml", "image/jpeg", "image/webp", "image/gif", "image/avif", "text/plain"}
+        mime_type, filename, body = args.get("mimeType"), args.get("filename", ""), args.get("body")
+        if mime_type not in extensions:
+            raise ValueError("Unsupported media type")
+        if not isinstance(filename, str) or len(filename) > 160 or any(char in filename for char in ("/", "\\", "\0")):
+            raise ValueError("Media filename must be a short basename")
+        if not isinstance(body, str) or len(body) > 36_000_000:
+            raise ValueError("Media data is invalid or exceeds 25 MB")
+        snapshot = dict(args)
+        return lambda: Studio._validate_and_write_media(snapshot, directory)
+
+    def _save_media_native(self, args):
+        return self._prepare_save_media(args)()
+
+    def _prepare_replace_tab_asset(self, args):
         tab_id = args.get("tabId")
         tab = next((item for item in self.tabs if item["id"] == tab_id), None)
         if not tab or tab_id != self.active:
             raise ValueError("Asset replacement requires the target tab to be active")
-        current = hashlib.sha256(tab["content"].encode("utf-8")).hexdigest()
+        saving = getattr(self, "saving", None)
+        if saving is not None and tab_id in saving:
+            raise ValueError("A save is already in progress for this tab; retry after it finishes")
+        content_snapshot = tab["content"]
+        current = hashlib.sha256(content_snapshot.encode("utf-8")).hexdigest()
         if args.get("expectedRevision") != current:
             raise ValueError("Live tab revision changed; inspect it again before replacing an asset")
         path = Path(tab.get("path") or "")
         if not tab.get("portable") or path.suffix.lower() != ".smd" or not path.is_file():
             raise ValueError("Asset replacement requires a saved portable .smd note")
+        saved_snapshot = tab["saved"]
+        if content_snapshot != saved_snapshot:
+            raise ValueError("Save the note before replacing a portable asset")
         asset_id, asset_path_value = args.get("assetName"), args.get("assetPath")
-        assets = tab.get("assets", {})
-        asset_name = asset_id if asset_id in assets else next((name for name in assets
+        assets_snapshot = dict(tab.get("assets", {}))
+        saved_assets_snapshot = dict(tab.get("saved_assets", assets_snapshot))
+        asset_name = asset_id if asset_id in assets_snapshot else next((name for name in assets_snapshot
             if hashlib.sha256(name.encode("utf-8")).hexdigest() == asset_id), None)
         if not asset_name:
             raise ValueError("Asset ID is not present in the current note")
         roots = [path.parent]
-        if self.folder:
-            roots.append(Path(self.folder))
-        location = self.settings.get("newNoteLocation")
+        folder = getattr(self, "folder", "")
+        if folder:
+            roots.append(Path(folder))
+        location = getattr(self, "settings", {}).get("newNoteLocation")
         if location:
             roots.append(Path(location))
         candidate = Path(asset_path_value).expanduser()
@@ -2909,36 +3239,64 @@ class Studio(QObject):
         expected_mime = MIMES.get(asset_name.rsplit(".", 1)[-1].lower())
         if not mime or mime != expected_mime:
             raise ValueError("Replacement asset must keep the existing MIME type and extension")
-        raw = candidate.read_bytes()
-        signatures = {"image/png": raw.startswith(b"\x89PNG\r\n\x1a\n"),
-                      "image/jpeg": raw.startswith(b"\xff\xd8\xff"),
-                      "image/webp": len(raw) >= 12 and raw[:4] == b"RIFF" and raw[8:12] == b"WEBP",
-                      "image/gif": raw.startswith((b"GIF87a", b"GIF89a")),
-                      "image/avif": len(raw) >= 12 and raw[4:8] == b"ftyp" and b"avif" in raw[8:16],
-                      "image/svg+xml": b"<svg" in raw[:4096].lower()}
-        if not signatures.get(mime, False):
-            raise ValueError("Replacement asset bytes do not match the current MIME type")
-        old_mime, old_data = image_data(assets[asset_name])
-        if old_mime != mime:
-            raise ValueError("Stored asset MIME type does not match its extension")
-        if old_data == raw:
-            return {"tabId": tab_id, "assetName": asset_name, "revision": current, "changed": False}
-        updated = dict(assets)
-        updated[asset_name] = f"data:{mime};base64," + base64.b64encode(raw).decode("ascii")
-        disk_content, disk_assets, disk_portable = open_note(path)
-        if not disk_portable or disk_content != tab["saved"] or disk_assets != assets:
-            raise ValueError("The portable note changed on disk; reopen it before replacing an asset")
-        # The text revision is checked above; writing the existing open SMD is
-        # atomic and preserves every other asset and the exact Markdown string.
-        write_portable(path, tab["content"], updated)
-        tab["assets"] = updated
-        tab["saved"] = tab["content"]
-        tab["saved_assets"] = copy.deepcopy(updated)
-        self.session.reader_assets.revoke_tab(self.window_id, tab_id)
-        self.readerCall.emit("window.dispatchEvent(new Event('supermd-assets-changed'))")
-        self._recover(); self._emit()
-        return {"tabId": tab_id, "assetName": asset_name, "revision": current, "changed": True,
-                "bytes": len(raw), "mimeType": mime}
+
+        def work():
+            raw = candidate.read_bytes()
+            if len(raw) > MAX_IMAGE:
+                raise ValueError("Replacement asset exceeds 25 MB")
+            signatures = {"image/png": raw.startswith(b"\x89PNG\r\n\x1a\n"),
+                          "image/jpeg": raw.startswith(b"\xff\xd8\xff"),
+                          "image/webp": len(raw) >= 12 and raw[:4] == b"RIFF" and raw[8:12] == b"WEBP",
+                          "image/gif": raw.startswith((b"GIF87a", b"GIF89a")),
+                          "image/avif": len(raw) >= 12 and raw[4:8] == b"ftyp" and b"avif" in raw[8:16],
+                          "image/svg+xml": b"<svg" in raw[:4096].lower()}
+            if not signatures.get(mime, False):
+                raise ValueError("Replacement asset bytes do not match the current MIME type")
+            old_mime, old_data = image_data(assets_snapshot[asset_name])
+            if old_mime != mime:
+                raise ValueError("Stored asset MIME type does not match its extension")
+            if old_data == raw:
+                return {"changed": False, "result": {"tabId": tab_id, "assetName": asset_name, "revision": current, "changed": False}}
+            updated = dict(assets_snapshot)
+            updated[asset_name] = f"data:{mime};base64," + encode_base64_chunked(raw)
+            disk_content, disk_assets, disk_portable = open_note(path)
+            if not disk_portable or disk_content != saved_snapshot or disk_assets != saved_assets_snapshot:
+                raise ValueError("The portable note changed on disk; reopen it before replacing an asset")
+            # The text revision is checked above; writing the existing open SMD is
+            # atomic and preserves every other asset and the exact Markdown string.
+            write_portable(path, content_snapshot, updated)
+            return {"changed": True, "updated": updated, "result": {"tabId": tab_id, "assetName": asset_name, "revision": current,
+                                                                    "changed": True, "bytes": len(raw), "mimeType": mime}}
+
+        def finalize(value, error):
+            if error is not None:
+                return None
+            if value["changed"]:
+                updated = value["updated"]
+                target = next((item for item in self.tabs if item["id"] == tab_id), None)
+                if target is not None:
+                    extra = {k: v for k, v in target.get("assets", {}).items() if k not in assets_snapshot}
+                    target["assets"] = {**updated, **extra} if extra else updated
+                    target["saved"] = content_snapshot
+                    target["saved_assets"] = dict(updated)
+                    if target["content"] != content_snapshot and getattr(self, "settings", {}).get("autosave") and hasattr(self, "autosave_timer"):
+                        self.autosave_timer.start(900)
+                session = getattr(self, "session", None)
+                reader_assets = getattr(session, "reader_assets", None)
+                if reader_assets is not None:
+                    reader_assets.revoke_tab(self.window_id, tab_id)
+                if hasattr(self, "readerCall"):
+                    self.readerCall.emit("window.dispatchEvent(new Event('supermd-assets-changed'))")
+                if hasattr(self, "_recover"):
+                    self._recover()
+                if hasattr(self, "_emit"):
+                    self._emit()
+            return value["result"]
+
+        return tab_id, work, finalize, lambda: None
+
+    def _replace_tab_asset_native(self, args):
+        return Studio._run_prepared_write_sync(self, Studio._prepare_replace_tab_asset(self, args))
 
     def _agent_viewport_pending(self, request_id, tab_id):
         bridge = getattr(self.session, "agent_bridge", None)
@@ -3005,7 +3363,7 @@ class Studio(QObject):
     def _capture_background_preview(self, request_id, tab_id, revision, context, args):
         from offline_view import render_live_snapshot
         tab=next(t for t in self.tabs if t["id"]==tab_id)
-        content,assets,path=tab["content"],copy.deepcopy(tab.get("assets",{})),tab.get("path","")
+        content,assets,path=tab["content"],dict(tab.get("assets",{})),tab.get("path","")
         width=max(320,min(1600,int(args.get("width",1200))))
         heading=context.get("reading",{}).get("heading") or None
         view={"dark":self._dark(),"colors":self._colors(),"font":self.settings["font"],"size":self.settings["size"],"svgAppearance":self.settings["svgAppearance"],"lineHeight":self.settings["lineHeight"]}
@@ -3109,8 +3467,27 @@ class Studio(QObject):
 
     @Slot(str, str, str)
     def post(self, id, command, raw):
+        self._post(id, command, raw)
+
+    def _post(self, id, command, raw):
         if self.retired:return
         try:
+            if command == "save_media_native":
+                if not isinstance(raw, str) or len(raw) > 36_100_000:
+                    raise ValueError("Media data is invalid or exceeds 25 MB")
+                directory = self._media_download_directory()
+                def media_work():
+                    parsed, source_str, body_start, body_end = Studio._parse_media_envelope(raw)
+                    return Studio._validate_and_write_media(
+                        parsed, directory, source_str=source_str, body_start=body_start, body_end=body_end
+                    )
+                def media_done(result, error):
+                    if error:
+                        self.replied.emit(id, "null", error)
+                    else:
+                        self.replied.emit(id, json.dumps(result), "")
+                self._submit_write(media_work, media_done)
+                return
             args = json.loads(raw)
             if command == "agent_result":
                 bridge = getattr(self.session, "agent_bridge", None)
@@ -3136,10 +3513,6 @@ class Studio(QObject):
                 return
             if command == "agent_export_native":
                 self._agent_export_native(id, args)
-                return
-            if command == "save_media_native":
-                result = self._save_media_native(args)
-                self.replied.emit(id, json.dumps(result), "")
                 return
             agent_export_info = self._agent_exports.get(id)
             if command == "cancel_export":
@@ -3303,6 +3676,11 @@ class Studio(QObject):
             if command in expected_suffixes and not (command == "export_fmd_native" and args.get("save")):
                 if not output or Path(output).suffix.casefold() not in expected_suffixes[command]:
                     raise ValueError("The export destination does not match the requested file format; choose the destination again")
+            is_portable_tab_save = command == "export_fmd_native" and not agent_export_info and bool(args.get("save") or save_as)
+            if is_portable_tab_save:
+                if captured["id"] in self.saving:
+                    raise ValueError("A save is already in progress for this tab; retry after it finishes")
+                self.saving.add(captured["id"])
             python = self.settings["python"]
             export_job = None
             if command == "export_pdf_native":
@@ -3424,6 +3802,8 @@ class Studio(QObject):
                         self._export_jobs.discard(job.job_id, job)
                 raise ValueError(f"Unsupported command: {command}")
             def finished(result,error):
+                if is_portable_tab_save:
+                    self.saving.discard(captured["id"])
                 if command.startswith("export_") and self.pending_export == output: self.pending_export = ""
                 if error and self.pending_save_as == save_as: self.pending_save_as = ""
                 if error:
@@ -3445,14 +3825,14 @@ class Studio(QObject):
                 if command == "import_images" and target: target["assets"].update(captured["assets"])
                 if command == "export_fmd_native" and args.get("save") and target:
                     target.update(saved=args["originalContent"], assets=args["assets"])
-                    target["saved_assets"] = copy.deepcopy(args["assets"])
+                    target["saved_assets"] = dict(args["assets"])
                     if target["content"] == args["originalContent"]: target["content"] = target["saved"] = args["content"]
                     self._recover()
                     if self.pending_close: self._finish_close()
                 elif command == "export_fmd_native" and save_as and target:
                     if target["content"] == args["originalContent"]:
                         target.update(path=save_as,name=Path(save_as).name,content=args["content"],saved=args["content"],assets=args["assets"],portable=True)
-                        target["saved_assets"] = copy.deepcopy(args["assets"])
+                        target["saved_assets"] = dict(args["assets"])
                         self._recover()
                         self._emit()
                         if self.pending_close: self._finish_close()
@@ -3485,6 +3865,9 @@ class Studio(QObject):
                     self._agent_exports.pop(id, None)
                 if not agent_export_info:
                     self.replied.emit(id,json.dumps(result),"")
+            if is_portable_tab_save and (self.retired or getattr(self.writes, "_shutdown", False)):
+                self.saving.discard(captured["id"])
+                return
             self._submit(work,finished,command in ("run_python","export_fmd_native","export_pdf_native","export_markdown_native"),self.writes if command in ("export_fmd_native", "export_markdown_native") else None)
         except Exception as error:
             agent_export = self._agent_exports.pop(id, None)
