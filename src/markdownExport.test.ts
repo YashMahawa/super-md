@@ -168,6 +168,69 @@ it('keeps converted SVGs inside their enclosing callout and preserves frontmatte
  expect(result.content).toMatch(/^> !\[Diagram\]/m);
  expect(result.content).not.toContain(':::');
 });
+it('converts only body callout lines while preserving wikilinks, fenced callouts, frontmatter and untouched slices',async()=>{
+ native.mockResolvedValue(null);
+ const frontmatter='---\ntitle: Vault Note\nlinks:\n  - "[[Concept Note]]"\n---\n\n';
+ const bodyCallout=':::callout note Summary\nReview [[Concept Note]] and [[Topic#Part 1|Part 1]] before proceeding.\n:::\n\n';
+ const fencedCallout='```markdown\n:::callout warning Literal Example\nKeep [[Concept Note]] and [[Topic#Part 1|Part 1]] unchanged.\n:::\n```\n\n';
+ const untouchedTail='*   Untouched   spacing  with [[Concept Note]] & [[Topic#Part 1|Part 1]].\n\n~~~py\n# Unrun slice with [[Concept Note]]\nx = [1,  2,   3]\n~~~\n';
+ const source=frontmatter+bodyCallout+fencedCallout+'```smd-tree\n{"values":[4,2,6]}\n```\n\n'+untouchedTail;
+ const result=await prepareMarkdownExport(source,'/vault/Study.md',{compatible:true});
+ expect(result.content.startsWith(frontmatter)).toBe(true);
+ expect(result.content).toContain('> [!NOTE] Summary\n> Review [[Concept Note]] and [[Topic#Part 1|Part 1]] before proceeding.');
+ expect(result.content).toContain(fencedCallout);
+ expect(result.content.endsWith('\n\n'+untouchedTail)).toBe(true);
+ expect(result.content).not.toContain('[Concept Note](Concept Note.md)');
+ expect(Object.keys(result.assets)).toEqual(['image1.svg']);
+});
+it('joins multi-paragraph raw SVG markup with blank lines and still enforces SVG safety checks',async()=>{
+ const multiParagraphSvg='<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 40 40">\n  <g stroke="#222">\n\n    <circle cx="20" cy="20" r="10"/>\n\n  </g>\n</svg>';
+ const calloutSvg=':::callout tip Figure\n<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 20 20">\n\n  <rect x="2" y="2" width="16" height="16"/>\n</svg>\n:::';
+ const result=await prepareMarkdownExport(`# Shapes\n\n${multiParagraphSvg}\n\n${calloutSvg}\n`,'/notes/shapes.md',{compatible:true});
+ expect(Object.keys(result.assets)).toEqual(['image1.svg','image2.svg']);
+ expect(atob(result.assets['image1.svg'].split(',')[1])).toContain('<circle cx="20" cy="20" r="10"');
+ expect(atob(result.assets['image2.svg'].split(',')[1])).toContain('<rect x="2" y="2" width="16" height="16"');
+ expect(result.content).toMatch(/^> !\[Diagram\]\(<image2\.svg>\)$/m);
+ for(const unsafe of [
+  '<svg xmlns="http://www.w3.org/2000/svg"><script>alert(1)</script></svg>',
+  '<svg xmlns="http://www.w3.org/2000/svg" onload="alert(1)"><circle cx="5" cy="5" r="4"/></svg>',
+  '<svg xmlns="http://www.w3.org/2000/svg"><foreignObject><div>bad</div></foreignObject></svg>',
+  '<svg xmlns="http://www.w3.org/2000/svg"><image href="https://evil.example/x.png"/></svg>',
+ ]){
+  await expect(prepareMarkdownExport(unsafe,'/notes/unsafe.md',{compatible:true})).rejects.toThrow();
+ }
+});
+it('forwards custom Python interpreter and cell ordinals so duplicate cells keep distinct figures without running code',async()=>{
+ const fig0='data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg==';
+ const fig1='data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAIAAAACCAQAAADYv8WvAAAADklEQVR42mNk+M/AQAgAAwgB/7b5L2cAAAAASUVORK5CYII=';
+ const cellSource='import matplotlib.pyplot as plt\nplt.plot([1, 2])';
+ const unrunSlice='~~~python\n# Unrun third cell stays exact\nvalue = {"keep": "[[Concept Note]]"}\n~~~';
+ native.mockImplementation(async(command:string,args:any)=>{
+  if(command==='load_python_output'){
+   expect(args.context?.document).toBe('/notes/venv-study.smd');
+   expect(args.context?.interpreter).toBe('/opt/venv/bin/python');
+   if(args.source===cellSource&&args.context?.cell==='0'){
+    return {result:{ok:true,stdout:'first plot\n',stderr:'',images:[fig0]},provenance:{verified:true,document:'/notes/venv-study.smd',cell:'0',interpreter:'/opt/venv/bin/python'}};
+   }
+   if(args.source===cellSource&&args.context?.cell==='1'){
+    return {result:{ok:true,stdout:'second plot\n',stderr:'',images:[fig1]},provenance:{verified:true,document:'/notes/venv-study.smd',cell:'1',interpreter:'/opt/venv/bin/python'}};
+   }
+   return null;
+  }
+  throw Error(`Unexpected command ${command}`);
+ });
+ const source=`# Experiment\n\n\`\`\`python\n${cellSource}\n\`\`\`\n\nBetween cells.\n\n\`\`\`python\n${cellSource}\n\`\`\`\n\n${unrunSlice}\n`;
+ const snapshot=source;
+ const result=await prepareMarkdownExport(source,'/notes/venv-study.smd',{compatible:true,python:'/opt/venv/bin/python'});
+ expect(source).toBe(snapshot);
+ expect(Object.keys(result.assets)).toEqual(['image1.png','image2.png']);
+ expect(result.assets['image1.png']).toBe(fig0);
+ expect(result.assets['image2.png']).toBe(fig1);
+ expect(result.content.indexOf('first plot')).toBeLessThan(result.content.indexOf('second plot'));
+ expect(result.content.indexOf('image1.png')).toBeLessThan(result.content.indexOf('image2.png'));
+ expect(result.content).toContain(unrunSlice);
+ expect(native.mock.calls.every(([command])=>command!=='run_python')).toBe(true);
+});
 it('preserves fenced :::callout literals, Obsidian wikilinks and C++ [[nodiscard]] when no unfenced callouts exist',async()=>{
  const source=[
   'See [[Project Notes]] and `[[Project Notes]]` plus `![[diagram.png]]`.',
@@ -186,7 +249,7 @@ it('preserves fenced :::callout literals, Obsidian wikilinks and C++ [[nodiscard
  expect(result.content).toBe(source);
  expect(result.assets).toEqual({});
 });
-it('converts prose wikilinks and callouts while keeping code blocks and smd-chart point arrays intact in compatible exports',async()=>{
+it('converts callouts while keeping prose wikilinks, code blocks and smd-chart point arrays intact in compatible exports',async()=>{
  native.mockResolvedValue(null);
  const source=[
   ':::callout note Summary',
@@ -211,18 +274,66 @@ it('converts prose wikilinks and callouts while keeping code blocks and smd-char
   '```',
  ].join('\n');
  const result=await prepareMarkdownExport(source,null,{compatible:true});
- expect(result.content).toContain('> [!NOTE] Summary\n> Read [the guide](Guide.md).');
+ expect(result.content).toContain('> [!NOTE] Summary\n> Read [[Guide|the guide]].');
  expect(result.content).toContain('````markdown\n:::callout warning Literal\n:::\n````');
  expect(result.content).toContain('[[nodiscard]] bool ok();');
  expect(result.content).toContain('if [[ -n "$HOME" ]]; then echo ok; fi');
  expect(Object.keys(result.assets)).toHaveLength(1);
  expect(atob(Object.values(result.assets)[0].split(',')[1])).toContain('<svg');
 });
+it('preserves spaced/aliased Obsidian image embeds, URL-encoded paths and YAML frontmatter image metadata byte-for-byte',async()=>{
+ const pngA='data:image/png;base64,aGVsbG8=';
+ const pngB='data:image/png;base64,d29ybGQ=';
+ native.mockImplementation(async(command:string,args:any)=>{
+  if(command==='load_asset'&&args.source==='img.png')return pngA;
+  if(command==='load_asset'&&args.source==='DM%20Images/proof-method-guide.png')return pngB;
+  throw Error(`Unexpected call ${command} ${args?.source}`);
+ });
+ const source=[
+  '---',
+  'title: Discrete Math Vault',
+  'banner: "![[unbundled-frontmatter-banner.png]]"',
+  'related: "[[Proof Techniques]]"',
+  '---',
+  '',
+  'Overview for [[Proof Techniques]] and [[Guide|the guide]]:',
+  '',
+  '![[img.png]]',
+  '',
+  '![[DM Images/proof-method-guide.png|Proof Method Guide]]',
+  '',
+  '![Encoded Guide](DM%20Images/proof-method-guide.png)',
+  '',
+ ].join('\n');
+ const compatibleResult=await prepareMarkdownExport(source,'/vault/Discrete.md',{compatible:true});
+ expect(compatibleResult.content).toBe(source);
+ expect(compatibleResult.assets).toEqual({
+  'img.png':pngA,
+  'DM Images/proof-method-guide.png':pngB,
+ });
+ const plainResult=await prepareMarkdownExport(source,'/vault/Discrete.md');
+ expect(plainResult.content).toBe(source);
+ expect(plainResult.assets).toEqual({
+  'img.png':pngA,
+  'DM Images/proof-method-guide.png':pngB,
+ });
+});
+it('extracts clean alt text when renaming app-generated Obsidian image embeds',async()=>{
+ native.mockImplementation(async(command:string,args:any)=>{
+  if(command==='load_asset'&&args.source==='assets/import-abc123.png')return 'data:image/png;base64,aGVsbG8=';
+  if(command==='load_asset'&&args.source==='assets/image-def456.png')return 'data:image/png;base64,d29ybGQ=';
+  throw Error(`Unexpected call ${command} ${args?.source}`);
+ });
+ const source='![[assets/import-abc123.png|Custom Diagram]]\n\n![[assets/image-def456.png]]\n';
+ const result=await prepareMarkdownExport(source,'/vault/Generated.smd',{compatible:true});
+ expect(result.content).toBe('![Custom Diagram](<image1.png>)\n\n![image-def456.png](<image2.png>)\n');
+ expect(Object.keys(result.assets)).toEqual(['image1.png','image2.png']);
+});
 it('preserves all recognized YAML frontmatter variations intact in compatible Markdown exports and ignores YAML image literals',async()=>{
  native.mockReset();
  const variations=[
-  '\uFEFF---\ntitle: "![Not an image](missing.png)"\ntags: [a, b]\n---\n\n:::callout tip\nBody\n:::',
-  '---   \ntitle: Dot Closer\n...  \n\n:::callout note\nBody\n:::',
+  '\uFEFF---\ntitle: "![Not an image](missing.png)"\nbanner: "![[unbundled-bom-banner.png]]"\ntags: [a, b]\n---\n\n:::callout tip\nBody\n:::',
+  '---   \ntitle: Dot Closer\nbanner: "![[unbundled-dot-banner.png]]"\n...  \n\n:::callout note\nBody\n:::',
   '---\n---\n\n# After empty block',
   '---\ntitle: EOF Only\n---',
  ];
