@@ -23,10 +23,12 @@ interface Editing {prefix:string;text:string;suffix:string;originalText:string;p
  * heading IDs and loose lists. Substitute one original-source editing block. */
 export default function LiveEditor({markdown,onChange,documentPath,python,dark,trustedImageHosts=noTrustedHosts,onTrustImageHost,spellCheck=false,grammarCheck=false,latexAutofix=false,fullDocumentAccessibility=false}:Props){
   const [editing,setEditing]=useState<Editing|null>(null);
-  const anchorTop=useRef<number|null>(null),editor=useRef<HTMLTextAreaElement>(null);
+  const [caret,setCaret]=useState(0);
+  const anchorTop=useRef<number|null>(null),editor=useRef<HTMLTextAreaElement>(null),pendingSelection=useRef<{start:number;end:number}|null>(null);
   const open=(element:HTMLElement,start:number,end:number)=>{
     anchorTop.current=element.getBoundingClientRect().top;
     const text=markdown.slice(start,end),protectedBlock=sourceAnalysis.analysis.tree.children.some(node=>['code','math','html','definition'].includes(node.type)&&(node.position?.start.offset??-1)>=start&&(node.position?.end.offset??Infinity)<=end);
+    setCaret(0);
     setEditing({prefix:markdown.slice(0,start),text,suffix:markdown.slice(end),originalText:text,protectedBlock});
   };
   useLayoutEffect(()=>{
@@ -44,8 +46,36 @@ export default function LiveEditor({markdown,onChange,documentPath,python,dark,t
   const sourceAnalysis=useMemo(()=>({source:renderedSource,analysis:analyzeDocument(renderedSource)}),[renderedSource]);
   const blocks=sourceAnalysis.analysis.blocks;
   useEffect(()=>{if(editing&&markdown!==editing.prefix+editing.text+editing.suffix)setEditing(null);},[markdown,editing]);
+  useEffect(()=>{
+    if(!editing)return;
+    const syncCaret=()=>{const area=editor.current;if(area&&document.activeElement===area)setCaret(area.selectionStart);};
+    document.addEventListener('selectionchange',syncCaret);
+    return()=>document.removeEventListener('selectionchange',syncCaret);
+  },[Boolean(editing)]);
   const copy=(event:ClipboardEvent)=>{if((event.target as Element).closest('textarea'))return;const source=selectedMarkdown(window.getSelection(),markdown);if(source!==null){event.clipboardData.setData('text/plain',source);event.preventDefault();}};
   const update=(text:string)=>{if(!editing)return;setEditing({...editing,text});onChange(editing.prefix+text+editing.suffix);};
+  const handleSuggestionAction=(edit?:{from:number;to:number;insertLength:number})=>{
+    const area=editor.current;if(!area)return;
+    let start=area.selectionStart,end=area.selectionEnd;
+    if(edit){
+      const delta=edit.insertLength-(edit.to-edit.from);
+      const mapOffset=(pos:number)=>pos<=edit.from?pos:pos>=edit.to?pos+delta:edit.from+edit.insertLength;
+      start=mapOffset(start);end=mapOffset(end);
+      pendingSelection.current={start,end};
+      setCaret(start);
+    }
+    area.focus({preventScroll:true});
+    queueMicrotask(()=>{
+      const current=editor.current;if(!current||!current.isConnected)return;
+      current.focus({preventScroll:true});
+      if(pendingSelection.current){
+        const nextStart=Math.max(0,Math.min(current.value.length,pendingSelection.current.start));
+        const nextEnd=Math.max(nextStart,Math.min(current.value.length,pendingSelection.current.end));
+        pendingSelection.current=null;
+        current.setSelectionRange(nextStart,nextEnd);
+      }
+    });
+  };
   const paste=(event:ClipboardEvent<HTMLTextAreaElement>)=>{
     if(!latexAutofix||!editing||event.defaultPrevented||event.clipboardData.files.length)return;
     const area=event.currentTarget,from=area.selectionStart,to=area.selectionEnd;
@@ -59,7 +89,8 @@ export default function LiveEditor({markdown,onChange,documentPath,python,dark,t
     // If unavailable, leave the original paste to the platform without loss.
     try {if(document.execCommand('insertText',false,repaired))event.preventDefault();}catch{/* Preserve native paste. */}
   };
-  const textarea=()=> <div className="live-active-block"><textarea ref={editor} data-source-start={editing!.prefix.length} spellCheck={false} value={editing!.text} style={{height:Math.max(120,editing!.text.split('\n').length*27+32)}} onPaste={paste} onChange={event=>update(event.target.value)} onKeyDown={event=>{if(event.key==='Escape'){event.preventDefault();event.stopPropagation();setEditing(null);}}} onBlur={event=>{if(!event.relatedTarget||!event.currentTarget.parentElement?.contains(event.relatedTarget))setEditing(null);}} aria-label="Edit Markdown block"/><WritingSuggestions text={editing!.text} spellCheck={spellCheck} grammarCheck={grammarCheck} onChange={update}/></div>;
+  const syncTextareaCaret=(area:HTMLTextAreaElement)=>setCaret(area.selectionStart);
+  const textarea=()=> <div className="live-active-block"><textarea ref={editor} data-source-start={editing!.prefix.length} spellCheck={false} value={editing!.text} style={{height:Math.max(120,editing!.text.split('\n').length*27+32)}} onPaste={paste} onChange={event=>{syncTextareaCaret(event.target);update(event.target.value);}} onSelect={event=>syncTextareaCaret(event.currentTarget)} onKeyUp={event=>syncTextareaCaret(event.currentTarget)} onClick={event=>syncTextareaCaret(event.currentTarget)} onKeyDown={event=>{if(event.key==='Escape'){event.preventDefault();event.stopPropagation();setEditing(null);}}} onBlur={event=>{if(!event.relatedTarget||!event.currentTarget.parentElement?.contains(event.relatedTarget))setEditing(null);}} aria-label="Edit Markdown block"/><WritingSuggestions text={editing!.text} caret={caret} spellCheck={spellCheck} grammarCheck={grammarCheck} onChange={update} onAction={handleSuggestionAction}/></div>;
   const currentOffset=(offset:number)=>editing&&offset>=editing.prefix.length+editing.originalText.length?offset+editing.text.length-editing.originalText.length:offset;
   const renderBlock=(entry:RenderedMarkdownBlock)=>{
     const offset=entry.node.position?.start.offset;

@@ -246,6 +246,7 @@ md-filled-button.primary-action, smd-expressive-button.primary-action { display:
 .source-editor-status { display: flex; align-items: center; gap: 14px; flex-shrink: 0; min-height: 42px; padding: 4px 18px; color: var(--muted); background: var(--surface-low); font: 12px/1.4 "Manrope Variable", system-ui, sans-serif; }
 .source-language { color: var(--text); font-weight: 600; }
 .source-position { font-variant-numeric: tabular-nums; }
+.source-proofreading-range { padding: 2px 10px; border-radius: 999px; border: 1px solid var(--outline); background: var(--surface-high); color: var(--text); font-size: 11px; font-variant-numeric: tabular-nums; white-space: nowrap; }
 .source-status-spacer { flex: 1; }
 .source-editor-status button { min-height: 32px; padding: 5px 12px; border-radius: 999px; color: var(--muted); background: transparent; font: inherit; cursor: pointer; }
 .source-editor-status button[aria-pressed="true"] { color: var(--on-primary-container, var(--text)); background: var(--primary-container, var(--surface-high)); }
@@ -419,12 +420,17 @@ md-filled-button.primary-action, smd-expressive-button.primary-action { display:
 .python-cell .python-source { max-height: 28em; overflow: auto; }
 .python-cell .cell-toolbar .code-copy { position: static; margin-left: auto; margin-right: 8px; background: transparent; color: var(--text); }
 .writing-suggestions { padding: 12px 16px; background: var(--surface-high); border-top: 1px solid var(--outline); font: 14px/1.5 var(--md-ref-typeface-plain); }
-.writing-suggestions header { display: flex; justify-content: space-between; gap: 12px; font-weight: 650; }
+.writing-suggestions header { display: flex; align-items: center; justify-content: space-between; flex-wrap: wrap; gap: 8px 12px; font-weight: 650; }
 .writing-suggestions small { color: var(--muted); font-weight: 400; }
+.writing-suggestions-meta { display: inline-flex; align-items: center; flex-wrap: wrap; gap: 8px; font-variant-numeric: tabular-nums; }
+.proofreading-range-badge { padding: 2px 9px; border-radius: 999px; border: 1px solid var(--outline); background: var(--surface); color: var(--text); font-size: 12px; }
 .writing-suggestions > div { display: flex; align-items: center; flex-wrap: wrap; gap: 8px; padding-top: 8px; }
 .writing-suggestions > div > span { margin-right: auto; }
-.writing-suggestions button { padding: 5px 12px; background: var(--md-sys-color-primary-container); color: var(--md-sys-color-on-primary-container); border: 1px solid var(--outline); border-radius: 12px; }
+.writing-suggestions button { padding: 5px 12px; background: var(--md-sys-color-primary-container); color: var(--md-sys-color-on-primary-container); border: 1px solid var(--outline); border-radius: 12px; cursor: pointer; }
+.writing-suggestions button.suggestion-secondary { background: transparent; color: var(--muted); }
+.writing-suggestions button.suggestion-secondary:hover { background: var(--surface); color: var(--text); }
 .cm-tooltip-lint { background: var(--surface-high) !important; color: var(--text) !important; border: 1px solid var(--outline) !important; border-radius: 12px; padding: 8px; max-width: min(360px,80vw); }
+.cm-diagnosticAction { margin: 6px 6px 0 0 !important; padding: 4px 10px !important; border-radius: 999px !important; border: 1px solid var(--outline) !important; background: var(--surface) !important; color: var(--text) !important; cursor: pointer; }
 .cm-lintPoint-info, .cm-lintRange-info { text-decoration: underline wavy var(--primary); text-underline-offset: 4px; }
 .cell-toolbar { min-height: 48px; padding: 0 8px 0 16px; display: flex; align-items: center; justify-content: space-between; gap: 8px; color: var(--code-accent); background: transparent; border-bottom: 1px solid var(--code-border); font: 650 .8rem/1.4 var(--md-ref-typeface-plain,system-ui); }
 .cell-toolbar button { min-height: 36px; padding: 6px 16px; border-radius: 18px; background: var(--primary); color: var(--on-primary); font-weight: 650; transition: border-radius .18s cubic-bezier(.2,0,0,1), transform .12s ease; }

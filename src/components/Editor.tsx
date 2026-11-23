@@ -5,8 +5,10 @@ import { defaultKeymap, history, historyField, historyKeymap, indentWithTab, und
 import { markdown, markdownLanguage } from "@codemirror/lang-markdown";
 import { syntaxHighlighting, defaultHighlightStyle, foldGutter, foldKeymap, syntaxTree,syntaxTreeAvailable } from "@codemirror/language";
 import {repairPastedMath} from '../mathRepair';
-import {linter,type Diagnostic} from "@codemirror/lint";
+import {forEachDiagnostic,forceLinting,linter,setDiagnostics,type Action,type Diagnostic} from "@codemirror/lint";
 import {checkWriting,type WritingOptions} from "../proofreading";
+import {PROOFREADING_MAX_CHARS,computeWindowBounds} from "../proofreadingCore";
+import {addPersonalWord,hasPersonalWord,normalizeDictionaryWord,subscribePersonalDictionary} from "../personalDictionary";
 import { search, searchKeymap, highlightSelectionMatches, openSearchPanel, SearchQuery, setSearchQuery } from "@codemirror/search";
 import { oneDarkHighlightStyle } from "@codemirror/theme-one-dark";
 import type {SourceChange} from '../readerEdits';
@@ -29,13 +31,67 @@ function trimEditorSessions() {
     if (sessions.size<=1 || sessions.size <= 40 && retained <= 4_000_000) break;
     sessions.delete(id); retained -= entry.state.doc.length;
     callbacks.delete(id); statusHandlers.delete(id);
+    rangeHandlers.delete(id);
     pasteSettings.delete(id);
   }
 }
 const callbacks = new Map<string, (value: string,changes?:SourceChange[]) => void>();
 const pasteSettings=new Map<string,boolean>();
 const statusHandlers = new Map<string, (state: EditorState) => void>();
+const rangeHandlers = new Map<string, (range: { from: number; to: number }) => void>();
 const visibleEditors = new Map<string, EditorView>();
+
+function sourceProofreadingRange(editor: EditorView): { from: number; to: number } {
+  const docLen = editor.state.doc.length;
+  const vpFrom = editor.state.doc.lineAt(Math.max(0, editor.viewport.from - 500)).from;
+  const vpTo = Math.min(docLen, editor.viewport.to + 500);
+  if (vpTo - vpFrom <= PROOFREADING_MAX_CHARS) return { from: vpFrom, to: vpTo };
+  let focusPos = editor.state.selection.main.head;
+  const rect = editor.scrollDOM.getBoundingClientRect();
+  if (rect.height > 0 && editor.scrollDOM.scrollHeight > editor.scrollDOM.clientHeight + 4) {
+    const caretCoords = focusPos >= vpFrom && focusPos <= vpTo ? editor.coordsAtPos(focusPos) : null;
+    const caretVisible = Boolean(caretCoords && caretCoords.bottom >= rect.top - 48 && caretCoords.top <= rect.bottom + 48);
+    if (!caretVisible) {
+      const mid = editor.posAtCoords({ x: rect.left + 80, y: rect.top + rect.height * 0.5 });
+      if (mid !== null) focusPos = mid;
+      else {
+        const maxScroll = Math.max(1, editor.scrollDOM.scrollHeight - editor.scrollDOM.clientHeight);
+        const ratio = Math.max(0, Math.min(1, editor.scrollDOM.scrollTop / maxScroll));
+        focusPos = vpFrom + Math.round((vpTo - vpFrom) * ratio);
+      }
+    }
+  }
+  const sub = computeWindowBounds(editor.state.sliceDoc(vpFrom, vpTo), focusPos - vpFrom, PROOFREADING_MAX_CHARS);
+  return { from: vpFrom + sub.from, to: vpFrom + sub.to };
+}
+
+function unclosedDisplayMathBefore(state: EditorState, limit: number): boolean {
+  if (limit <= 0 || limit > 200_000) return false;
+  const codeSpans: Array<[number, number]> = [];
+  syntaxTree(state).iterate({
+    from: 0,
+    to: limit,
+    enter(node) {
+      if (["FencedCode", "CodeBlock", "InlineCode", "HTMLBlock", "HTMLTag"].includes(node.name)) {
+        codeSpans.push([node.from, node.to]);
+        return false;
+      }
+    }
+  });
+  const prefix = state.sliceDoc(0, limit);
+  let spanIndex = 0;
+  let count = 0;
+  for (let i = 0; i < prefix.length - 1; i++) {
+    while (spanIndex < codeSpans.length && codeSpans[spanIndex][1] <= i) spanIndex++;
+    if (spanIndex < codeSpans.length && codeSpans[spanIndex][0] <= i) {
+      i = codeSpans[spanIndex][1] - 1;
+      continue;
+    }
+    if (prefix[i] === "\\" && prefix[i + 1] === "$") { i++; continue; }
+    if (prefix[i] === "$" && prefix[i + 1] === "$") { count++; i++; }
+  }
+  return count % 2 === 1;
+}
 export function editorKeyBindings(host: string | undefined = typeof document === "undefined" ? undefined : document.documentElement.dataset.host): KeyBinding[] {
   // Qt owns application shortcuts and forwards undo/redo/find through native
   // commands. Android and browser builds retain CodeMirror's normal keymaps.
@@ -88,14 +144,43 @@ export default function Editor({ sessionId = "default", value, onChange, dark, f
   const appearance = useRef(new Compartment());
   const wrapping = useRef(new Compartment());
   const proofing=useRef(new Compartment());
+  const lastLintedRange=useRef<{from:number;to:number}>({from:0,to:0});
+  const [proofRange,setProofRange]=useState<{from:number;to:number}|null>(null);
+  const [dictionaryRevision,setDictionaryRevision]=useState(0);
+  rangeHandlers.set(sessionId,setProofRange);
+  const filterSavedDiagnostics=(diagnostics:readonly Diagnostic[],state:EditorState)=>diagnostics.filter(d=>!(d.source==="Spelling"&&hasPersonalWord(state.sliceDoc(d.from,d.to))));
   const writingExtension=()=>!spellCheck&&!grammarCheck?[]:linter(async editor=>{
-    const from=editor.state.doc.lineAt(Math.max(0,editor.viewport.from-500)).from;
-    const to=Math.min(editor.state.doc.length,from+12_000,editor.viewport.to+500);
+    const {from,to}=sourceProofreadingRange(editor);
+    lastLintedRange.current={from,to};
+    rangeHandlers.get(sessionId)?.({from,to});
     const blocked:Array<[number,number]>=[];
-    syntaxTree(editor.state).iterate({from,to,enter(node){if(["FencedCode","CodeBlock","InlineCode","HTMLBlock","HTMLTag","Link","Image","URL"].includes(node.name)){blocked.push([Math.max(0,node.from-from),node.to-from]);return false;}}});
-    const issues=await checkWriting(editor.state.sliceDoc(from,to),{spellCheck,grammarCheck},blocked);
-    return issues.map(issue=>({from:from+issue.from,to:from+issue.to,severity:"info",source:issue.kind==="spelling"?"Spelling":"Grammar",message:issue.message,actions:issue.replacements.map(replacement=>({name:`Use “${replacement}”`,apply(view,start,end){view.dispatch({changes:{from:start,to:end,insert:replacement}});}}))} satisfies Diagnostic));
-  },{delay:600,needsRefresh:update=>update.viewportChanged});
+    syntaxTree(editor.state).iterate({from,to,enter(node){if(["FencedCode","CodeBlock","InlineCode","HTMLBlock","HTMLTag","Link","Image","URL"].includes(node.name)){blocked.push([Math.max(0,node.from-from),Math.min(to-from,node.to-from)]);return false;}}});
+    const slice=editor.state.sliceDoc(from,to);
+    if(unclosedDisplayMathBefore(editor.state,from)){
+      const closeMath=slice.indexOf("$$");
+      blocked.push([0,closeMath===-1?slice.length:closeMath+2]);
+    }
+    const issues=await checkWriting(slice,{spellCheck,grammarCheck},blocked);
+    return issues.map(issue=>{
+      const validReplacements=issue.replacements.filter(r=>typeof r==="string"&&r.trim().length>0);
+      const actions:Action[]=validReplacements.map(replacement=>({name:`Use “${replacement}”`,apply(targetView,start,end){targetView.dispatch({changes:{from:start,to:end,insert:replacement}});}}));
+      const flaggedWord=issue.kind==="spelling"?(issue.word??slice.slice(issue.from,issue.to)):"";
+      if(flaggedWord&&normalizeDictionaryWord(flaggedWord)){
+        actions.push({
+          name:"Add to dictionary",
+          apply(targetView){
+            addPersonalWord(flaggedWord);
+            const kept:Diagnostic[]=[];
+            forEachDiagnostic(targetView.state,(d,dFrom,dTo)=>{
+              if(!(d.source==="Spelling"&&hasPersonalWord(targetView.state.sliceDoc(dFrom,dTo))))kept.push({...d,from:dFrom,to:dTo});
+            });
+            targetView.dispatch({...setDiagnostics(targetView.state,kept),annotations:Transaction.addToHistory.of(false)});
+          }
+        });
+      }
+      return {from:from+issue.from,to:from+issue.to,severity:"info",source:issue.kind==="spelling"?"Spelling":"Grammar",message:issue.message,actions} satisfies Diagnostic;
+    });
+  },{delay:600,markerFilter:filterSavedDiagnostics,tooltipFilter:filterSavedDiagnostics,needsRefresh:update=>update.viewportChanged||(update.selectionSet&&update.state.doc.length>PROOFREADING_MAX_CHARS)});
   const [wrap, setWrap] = useState(true);
   const wrapReference = useRef(wrap); wrapReference.current = wrap;
   const position = useRef<HTMLSpanElement>(null);
@@ -166,7 +251,10 @@ export default function Editor({ sessionId = "default", value, onChange, dark, f
             update.changes.iterChanges((from,to,_fromB,_toB,insert)=>changes.push({from,to,insert:insert.toString()}));
             callbacks.get(sessionId)?.(update.state.doc.toString(),changes);
           }
-          if (update.docChanged || update.selectionSet) statusHandlers.get(sessionId)?.(update.state);
+          if (update.docChanged || update.selectionSet || update.viewportChanged) {
+            if (update.docChanged || update.selectionSet) statusHandlers.get(sessionId)?.(update.state);
+            if (update.state.doc.length > PROOFREADING_MAX_CHARS) rangeHandlers.get(sessionId)?.(sourceProofreadingRange(update.view));
+          }
         }),
         appearance.current.of(editorTheme())
       ]
@@ -183,16 +271,50 @@ export default function Editor({ sessionId = "default", value, onChange, dark, f
     describeSelection(view.current.state);
     if (cached) view.current.scrollDOM.scrollTop = cached.top;
     if (incoming) view.current.scrollDOM.scrollTop = Math.max(0, incoming.top);
+    if (view.current.state.doc.length > PROOFREADING_MAX_CHARS) setProofRange(sourceProofreadingRange(view.current));
+    let scrollTimer: ReturnType<typeof setTimeout> | undefined;
+    const onScroll = () => {
+      const instance = view.current;
+      if (!instance || instance.state.doc.length <= PROOFREADING_MAX_CHARS) return;
+      const nextRange = sourceProofreadingRange(instance);
+      rangeHandlers.get(sessionId)?.(nextRange);
+      clearTimeout(scrollTimer);
+      scrollTimer = setTimeout(() => {
+        const current = view.current;
+        if (!current || current.state.doc.length <= PROOFREADING_MAX_CHARS) return;
+        const settled = sourceProofreadingRange(current);
+        if (settled.from !== lastLintedRange.current.from || settled.to !== lastLintedRange.current.to) forceLinting(current);
+      }, 600);
+    };
+    view.current.scrollDOM.addEventListener("scroll", onScroll, { passive: true });
     return () => {
+      clearTimeout(scrollTimer);
+      view.current?.scrollDOM.removeEventListener("scroll", onScroll);
       visibleEditors.delete(sessionId);
       if (view.current) { sessions.delete(sessionId); sessions.set(sessionId, { state: view.current.state, top: view.current.scrollDOM.scrollTop, appearance: appearance.current, wrapping: wrapping.current,proofing:proofing.current, wrapped: wrapReference.current }); trimEditorSessions(); view.current.destroy(); }
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [sessionId]);
 
+  useEffect(() => subscribePersonalDictionary(() => {
+    setDictionaryRevision(n => n + 1);
+    const instance = view.current;
+    if (!instance) return;
+    const kept: Diagnostic[] = [];
+    forEachDiagnostic(instance.state, (d, dFrom, dTo) => {
+      if (!(d.source === "Spelling" && hasPersonalWord(instance.state.sliceDoc(dFrom, dTo)))) kept.push({ ...d, from: dFrom, to: dTo });
+    });
+    instance.dispatch({ ...setDiagnostics(instance.state, kept), annotations: Transaction.addToHistory.of(false) });
+  }), []);
+
   useEffect(() => { view.current?.dispatch({ effects: appearance.current.reconfigure(editorTheme()) }); }, [dark, focusMode]);
   useEffect(() => { view.current?.dispatch({ effects: wrapping.current.reconfigure(wrap ? EditorView.lineWrapping : []) }); }, [wrap]);
-  useEffect(()=>{view.current?.dispatch({effects:proofing.current.reconfigure(writingExtension())});},[spellCheck,grammarCheck,sessionId]);
+  useEffect(()=>{
+    const instance=view.current;
+    if(!instance)return;
+    if(instance.state.doc.length>PROOFREADING_MAX_CHARS)setProofRange(sourceProofreadingRange(instance));
+    instance.dispatch({effects:proofing.current.reconfigure(writingExtension())});
+  },[spellCheck,grammarCheck,sessionId,dictionaryRevision]);
 
   useEffect(() => {
     const instance = view.current;
@@ -255,11 +377,16 @@ export default function Editor({ sessionId = "default", value, onChange, dark, f
     return () => window.removeEventListener("supermd-format", format);
   }, []);
 
+  const showProofRange = Boolean((spellCheck || grammarCheck) && value.length > PROOFREADING_MAX_CHARS);
+  const clampedFrom = showProofRange ? Math.max(0, Math.min(value.length - 1, proofRange?.from ?? 0)) : 0;
+  const clampedTo = showProofRange ? Math.max(clampedFrom + 1, Math.min(value.length, proofRange?.to ?? Math.min(value.length, PROOFREADING_MAX_CHARS))) : 0;
+
   return <div className="source-editor-shell">
     <div className="editor-host" ref={host} aria-label="Markdown editor" />
     <footer className="source-editor-status" aria-label="Source editor status">
       <span className="source-language">Markdown</span>
       <span ref={position} className="source-position">Ln 1, Col 1</span>
+      {showProofRange && <span className="source-proofreading-range" role="status">12,000-character range ({(clampedFrom + 1).toLocaleString("en-US")}–{clampedTo.toLocaleString("en-US")} of {value.length.toLocaleString("en-US")})</span>}
       <span className="source-status-spacer" />
       <button type="button" aria-pressed={wrap} title="Toggle line wrapping" onClick={() => setWrap(current => !current)}>Wrap lines</button>
       <span className="source-encoding">UTF-8</span>
