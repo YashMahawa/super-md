@@ -91,7 +91,7 @@ export async function computeAgentDocumentRequest(request:Record<string,unknown>
   if(action==='get_diagram_image')throw Error('Diagram image requests require the active reader view');
   throw Error('Unsupported snapshot agent action');
 }
-function Reader() {
+export function Reader() {
   const [state, setState] = useState<ReaderState | null>(null);
   const readerAnalysis=useMemo(()=>state?readerSourceAnalysis(state.mode,state.content):null,[state?.mode,state?.content]);
   const [repairing, setRepairing] = useState(false);
@@ -769,4 +769,5 @@ function Reader() {
     {(state.mode === "reader" || state.mode === "split") && <section className="android-reading" data-full-document-accessibility={state.fullDocumentAccessibility ? "true" : undefined}><div className="reader-chrome-spacer" aria-hidden="true"/><div key={state.id} className="document-page-space"><div className="document-page"><DocumentPreview markdown={state.content} onChange={update} documentPath={state.path} python={state.python || "embedded"} dark={false} trustedImageHosts={trustedHosts} onTrustImageHost={trustHost} fullDocumentAccessibility={state.fullDocumentAccessibility} sourceAnalysis={readerAnalysis?.source===state.content?readerAnalysis:undefined} /></div></div></section>}
   </div></DocumentAppearance.Provider>;
 }
-createRoot(document.getElementById("root")!).render(<Reader />);
+const rootElement = document.getElementById("root");
+if (rootElement) createRoot(rootElement).render(<Reader />);

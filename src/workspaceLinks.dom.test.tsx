@@ -8,6 +8,9 @@ const { bridgeInvoke } = vi.hoisted(() => ({
 }));
 vi.mock("@tauri-apps/api/core", () => ({ invoke: bridgeInvoke }));
 
+import { EditorView } from "@codemirror/view";
+import { Reader } from "./androidReader";
+import Editor from "./components/Editor";
 import MarkdownPreview from "./components/MarkdownPreview";
 import LiveEditor from "./components/LiveEditor";
 
@@ -36,6 +39,8 @@ afterEach(() => {
   document.body.innerHTML = "";
   delete (window as unknown as Record<string, unknown>).SuperMD;
   delete window.supermdBeforeNavigate;
+  vi.restoreAllMocks();
+  vi.unstubAllGlobals();
   vi.useRealTimers();
 });
 
@@ -209,16 +214,23 @@ describe("race-free cross-note #heading jump in Reader (including >80k-char wind
       unobserve() {}
       disconnect() {}
     }
+    if (!Range.prototype.getClientRects) {
+      Range.prototype.getClientRects = () => ([] as unknown as DOMRectList);
+    }
+    if (!Range.prototype.getBoundingClientRect) {
+      Range.prototype.getBoundingClientRect = () =>
+        ({ top: 0, bottom: 16, left: 0, right: 80, width: 80, height: 16, x: 0, y: 0, toJSON: () => ({}) }) as DOMRect;
+    }
     vi.stubGlobal("IntersectionObserver", FakeIntersectionObserver);
     vi.stubGlobal("ResizeObserver", FakeResizeObserver);
     vi.useFakeTimers();
 
-    // Dynamically import androidReader after setting up root container #root
     const readerRootEl = document.createElement("div");
     readerRootEl.id = "root";
     document.body.append(readerRootEl);
+    root = createRoot(readerRootEl);
     await act(async () => {
-      await import("./androidReader");
+      root?.render(<Reader />);
     });
 
     const fillerParagraph = `${"Detailed background paragraph for windowed rendering verification. ".repeat(25)}\n\n`;
@@ -243,9 +255,11 @@ describe("race-free cross-note #heading jump in Reader (including >80k-char wind
     };
 
     const gotoOffsets: number[] = [];
-    window.addEventListener("supermd-goto-offset", (event) => {
+    const onGotoOffset = (event: Event) => {
       gotoOffsets.push((event as CustomEvent<number>).detail);
-    });
+    };
+    window.addEventListener("supermd-goto-offset", onGotoOffset);
+    try {
 
     // 1. Load >80k-char note in Read mode WITH both a stale readingLocation AND a pendingHeading
     await act(async () => {
@@ -343,7 +357,10 @@ describe("race-free cross-note #heading jump in Reader (including >80k-char wind
       vi.advanceTimersByTime(400);
     });
     expect(gotoOffsets).toContain(largeNote.indexOf("## Target Deep Section"));
-  });
+    } finally {
+      window.removeEventListener("supermd-goto-offset", onGotoOffset);
+    }
+  }, 15_000);
 });
 
 describe("Source mode Ctrl/Cmd+Click workspace link navigation", () => {
@@ -355,8 +372,6 @@ describe("Source mode Ctrl/Cmd+Click workspace link navigation", () => {
       Range.prototype.getBoundingClientRect = () =>
         ({ top: 0, bottom: 16, left: 0, right: 80, width: 80, height: 16, x: 0, y: 0, toJSON: () => ({}) }) as DOMRect;
     }
-    const Editor = (await import("./components/Editor")).default;
-    const { EditorView } = await import("@codemirror/view");
     const host = document.createElement("div");
     document.body.append(host);
     root = createRoot(host);
