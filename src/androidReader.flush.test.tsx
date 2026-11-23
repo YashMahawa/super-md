@@ -33,14 +33,21 @@ vi.mock("./nativeBridge", () => ({ invoke: native }));
 vi.mock("./markdownExport", () => ({ prepareMarkdownExport: vi.fn() }));
 vi.mock("./preparePdf", () => ({ preparePdf: vi.fn() }));
 vi.mock("./documentMedia", () => ({ prepareFmd: vi.fn() }));
+let triggerEditorChange: ((value: string, changes?: Array<{ from: number; to: number; insert: string }>) => void) | null = null;
+let editorRenderCount = 0;
+
 vi.mock("./components/Editor", () => ({
-  default: ({ onChange }: { onChange: (value: string) => void }) => (
-    <button
-      type="button"
-      className="mock-editor-type"
-      onClick={() => onChange("# Tab 1\n\nUnsaved draft\n")}
-    />
-  ),
+  default: ({ onChange }: { value: string; onChange: (value: string, changes?: Array<{ from: number; to: number; insert: string }>) => void }) => {
+    editorRenderCount++;
+    triggerEditorChange = onChange;
+    return (
+      <button
+        type="button"
+        className="mock-editor-type"
+        onClick={() => onChange("# Tab 1\n\nUnsaved draft\n")}
+      />
+    );
+  },
   editorReadingOffset: () => 0,
   editorHistory: () => false,
   exportEditorSession: () => undefined,
@@ -79,6 +86,8 @@ async function mountReader(): Promise<HTMLDivElement> {
 beforeEach(() => {
   native.mockClear();
   native.mockImplementation(async () => ({ accepted: true, revision: 0 }));
+  editorRenderCount = 0;
+  triggerEditorChange = null;
   document.body.innerHTML = "";
   localStorage.clear();
 });
@@ -185,5 +194,66 @@ describe("androidReader supermdFlush handoff and conflict handling", () => {
       }),
     );
     expect(host.querySelector(".reader-edit-error")?.textContent).toContain("changed outside this edit session");
+  });
+
+  it("coalesces React re-renders during rapid >80k Source typing while keeping edit sync and supermdFlush immediate", async () => {
+    await mountReader();
+    const baseLarge = "# Large Note\n\n" + "Paragraph line for sustained typing benchmark.\n".repeat(2000);
+    expect(baseLarge.length).toBeGreaterThan(80_000);
+
+    await act(async () => {
+      window.supermdLoad!({
+        id: "large-tab",
+        content: baseLarge,
+        path: "/tmp/large.md",
+        mode: "editor",
+        dark: false,
+        fullscreen: false,
+        font: "sans",
+        size: 16,
+        colors: { primary: "#386a57" },
+        zoom: 100,
+        editProtocol: 1,
+      } as Parameters<NonNullable<Window["supermdLoad"]>>[0]);
+    });
+
+    const rendersAfterLoad = editorRenderCount;
+    let current = baseLarge;
+    for (let i = 0; i < 10; i++) {
+      const from = current.length;
+      const ch = String(i);
+      current += ch;
+      act(() => {
+        triggerEditorChange!(current, [{ from, to: from, insert: ch }]);
+      });
+    }
+
+    // During the 90ms typing burst window, Reader skips synchronous full-tree re-renders.
+    expect(editorRenderCount).toBe(rendersAfterLoad);
+
+    // Flushing immediately within the coalescing window still syncs all 10 typed characters.
+    native.mockClear();
+    await act(async () => {
+      window.supermdFlush!({ action: "android_flush", target: "large-tab", token: "token-large-burst" });
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+
+    const syncCalls = native.mock.calls.filter(([cmd]) => cmd === "document_patch" || cmd === "document_sync");
+    expect(syncCalls.length).toBeGreaterThan(0);
+    expect(native).toHaveBeenCalledWith(
+      "document_flushed",
+      expect.objectContaining({
+        id: "large-tab",
+        token: "token-large-burst",
+        content: current,
+      }),
+    );
+
+    // Waiting past the 90ms coalescing window commits the single deferred React state update.
+    await act(async () => {
+      await new Promise((resolve) => setTimeout(resolve, 120));
+    });
+    expect(editorRenderCount).toBe(rendersAfterLoad + 1);
   });
 });

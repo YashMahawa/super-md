@@ -1,10 +1,10 @@
 // @vitest-environment jsdom
 import { beforeEach, describe, expect, it } from "vitest";
-import { Compartment, EditorSelection, EditorState, Transaction } from "@codemirror/state";
+import { Compartment, EditorSelection, EditorState, Transaction, type TransactionSpec } from "@codemirror/state";
 import { EditorView, keymap } from "@codemirror/view";
 import { deleteCharBackward, deleteCharForward, history, isolateHistory, redo, undo } from "@codemirror/commands";
 import { markdown, markdownLanguage } from "@codemirror/lang-markdown";
-import { editorKeyBindings } from "./components/Editor";
+import { computeNextDocCache, createDocCache, editorKeyBindings } from "./components/Editor";
 import {
   TYPEWRITER_SHORTCUT,
   TYPEWRITER_STORAGE_KEY,
@@ -542,4 +542,70 @@ describe("Document text, cursor, selection, IME composition, and undo/redo exact
     }
   });
 });
+
+describe("Editor DocStringCache incremental large-note string updates", () => {
+  it("preserves exact doc.toString() parity and reuses prefix/suffix references across sustained edits, surrogate pairs, jumps, and multi-cursor updates", () => {
+    const emojiBlock = "🧪🔬🚀📚✨".repeat(120);
+    const largeInitial = Array.from({ length: 1200 }, (_, i) =>
+      i === 600 ? `Line ${i + 1}: ${emojiBlock}` : `Line ${i + 1}: Markdown study paragraph for incremental DocStringCache verification.`,
+    ).join("\n");
+    expect(largeInitial.length).toBeGreaterThan(80_000);
+
+    let state = EditorState.create({ doc: largeInitial });
+    let cache = createDocCache(state.doc, largeInitial);
+    expect(cache.text).toBe(largeInitial);
+
+    const applyAndCheck = (spec: TransactionSpec) => {
+      const tr = state.update(spec);
+      const changes: Array<{ from: number; to: number; insert: string }> = [];
+      tr.changes.iterChanges((from, to, _fromB, _toB, insert) => {
+        changes.push({ from, to, insert: insert.toString() });
+      });
+      cache = computeNextDocCache(cache, tr.startState.doc, tr.state.doc, changes);
+      state = tr.state;
+      expect(cache.text).toBe(state.doc.toString());
+      return cache;
+    };
+
+    // 1. First edit near emoji block opens a bounded middle window and splits prefix/suffix.
+    const emojiIndex = largeInitial.indexOf("🧪🔬🚀");
+    const first = applyAndCheck({ changes: { from: emojiIndex + 2, to: emojiIndex + 2, insert: "A" } });
+    expect(first.middle.length).toBeGreaterThan(0);
+    expect(first.middle.length).toBeLessThanOrEqual(1200);
+    const savedPrefix = first.prefix;
+    const savedSuffix = first.suffix;
+
+    // 2. Sequential typing reuses exact prefix & suffix string references without re-slicing the full document.
+    let cursor = emojiIndex + 3;
+    for (let i = 0; i < 60; i++) {
+      const next = applyAndCheck({ changes: { from: cursor, to: cursor, insert: "x" } });
+      expect(next.prefix).toBe(savedPrefix);
+      expect(next.suffix).toBe(savedSuffix);
+      cursor++;
+    }
+
+    // 3. Backspacing inside the active window also reuses prefix & suffix.
+    for (let i = 0; i < 15; i++) {
+      const next = applyAndCheck({ changes: { from: cursor - 1, to: cursor, insert: "" } });
+      expect(next.prefix).toBe(savedPrefix);
+      expect(next.suffix).toBe(savedSuffix);
+      cursor--;
+    }
+
+    // 4. Distant cursor jump re-windows cleanly around the new edit position.
+    const nearEnd = state.doc.length - 40;
+    const jumped = applyAndCheck({ changes: { from: nearEnd, to: nearEnd, insert: " [tail]" } });
+    expect(jumped.prefix).not.toBe(savedPrefix);
+    expect(jumped.middle).toContain(" [tail]");
+
+    // 5. Multi-cursor transaction falls back cleanly to exact document text.
+    applyAndCheck({
+      changes: [
+        { from: 10, to: 10, insert: "[head]" },
+        { from: state.doc.length - 10, to: state.doc.length - 10, insert: "[end]" },
+      ],
+    });
+  });
+});
+
 

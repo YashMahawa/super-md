@@ -123,10 +123,23 @@ const pickerCancelled = (error: unknown) => /cancelled|canceled/i.test(String(er
 export default function App() {
   const windowLabel = useMemo(() => "__TAURI_INTERNALS__" in window ? getCurrentWindow().label : "browser", []);
   const sessionKey = `workspace.tabs.${windowLabel}`;
-  const [documents, setDocuments] = useState<DocumentWorkspace>(() => readWorkspace(localStorage, sessionKey,
+  const [documents, setDocumentsState] = useState<DocumentWorkspace>(() => readWorkspace(localStorage, sessionKey,
     new URLSearchParams(window.location.search).has("window") ? initialWorkspace() : initialWorkspace(welcome, "Welcome.smd")));
   const documentsRef = useRef(documents);
-  documentsRef.current = documents;
+  const pendingWorkspaceRender = useRef(0);
+  if (!pendingWorkspaceRender.current) documentsRef.current = documents;
+  const setDocuments = useCallback((updater: DocumentWorkspace | ((current: DocumentWorkspace) => DocumentWorkspace)) => {
+    if (pendingWorkspaceRender.current) {
+      window.clearTimeout(pendingWorkspaceRender.current);
+      pendingWorkspaceRender.current = 0;
+    }
+    setDocumentsState((current) => {
+      const base = documentsRef.current !== current ? documentsRef.current : current;
+      const next = typeof updater === "function" ? updater(base) : updater;
+      documentsRef.current = next;
+      return next;
+    });
+  }, []);
   const activeTab = documents.tabs.find((tab) => tab.id === documents.activeId) ?? documents.tabs[0];
   const content = activeTab.content;
   const path = activeTab.path;
@@ -237,6 +250,13 @@ export default function App() {
     return () => window.clearTimeout(timer);
   }, [splitPercent]);
   useEffect(() => { localStorage.setItem("images.trustedHosts", JSON.stringify(trustedImageHosts)); }, [trustedImageHosts]);
+  useEffect(() => {
+    if (!pendingWorkspaceRender.current) return;
+    window.clearTimeout(pendingWorkspaceRender.current);
+    pendingWorkspaceRender.current = 0;
+    setDocumentsState(documentsRef.current);
+  }, [view, showSettings, showExport]);
+  useEffect(() => () => window.clearTimeout(pendingWorkspaceRender.current), []);
   useEffect(() => {
     const node = readingScrollRef.current;
     if (!node) return;
@@ -633,7 +653,26 @@ export default function App() {
       <div className="work-area" style={{ "--folder-width": `${folderWidth}px` } as React.CSSProperties}>
       {folderVisible && !fullscreen && <><FolderPanel root={folderRoot} activePath={path} onChoose={chooseFolder} onHide={() => setFolderVisible(false)} onOpen={openFolderFile} /><div className="folder-resizer" role="separator" aria-label="Resize folder sidebar" aria-orientation="vertical" tabIndex={0} onPointerDown={(e) => { folderDrag.current = true; e.currentTarget.setPointerCapture(e.pointerId); }} onPointerMove={(e) => { if (folderDrag.current) setFolderWidth(Math.max(180, Math.min(420, e.clientX))); }} onPointerUp={() => { folderDrag.current = false; }} onLostPointerCapture={() => { folderDrag.current = false; }} onKeyDown={(e) => { if (e.key === "ArrowLeft" || e.key === "ArrowRight") { e.preventDefault(); setFolderWidth((w) => Math.max(180, Math.min(420, w + (e.key === "ArrowRight" ? 10 : -10)))); } }} /></>}
       <main className="workspace" ref={workspaceRef} data-resizing={resizing || windowResizing} data-dragging-file={draggingFile} style={{ "--split-left": `${splitPercent}fr`, "--split-right": `${100 - splitPercent}fr`, "--workspace-scale": workspaceZoom / 100 } as React.CSSProperties}>
-        {(view === "editor" || view === "split") && <motion.section layout={false} initial={false} transition={motionEnabled && !resizing && !windowResizing ? spring.surface : { duration: 0 }} className="editor-pane" aria-label="Markdown source"><div className="pane-head"><span><PencilSimple size={15} /> Markdown</span>{view === "editor" ? <span className="zoom-controls" aria-label="Workspace zoom"><button onClick={() => zoomBy(-10)} aria-label="Zoom out"><Minus size={14} /></button><ZoomInput value={workspaceZoom} onChange={setZoom} /><button onClick={() => zoomBy(10)} aria-label="Zoom in"><Plus size={14} /></button></span> : <small>{lineCount} lines</small>}</div><Editor key={activeTab.id} sessionId={activeTab.id} value={content} onChange={(value) => setDocuments((current) => editTab(current, activeTab.id, value))} dark={dark} focusMode={focusMode} typewriterScroll={typewriterScroll} onTypewriterChange={setTypewriterScroll} /></motion.section>}
+        {(view === "editor" || view === "split") && <motion.section layout={false} initial={false} transition={motionEnabled && !resizing && !windowResizing ? spring.surface : { duration: 0 }} className="editor-pane" aria-label="Markdown source"><div className="pane-head"><span><PencilSimple size={15} /> Markdown</span>{view === "editor" ? <span className="zoom-controls" aria-label="Workspace zoom"><button onClick={() => zoomBy(-10)} aria-label="Zoom out"><Minus size={14} /></button><ZoomInput value={workspaceZoom} onChange={setZoom} /><button onClick={() => zoomBy(10)} aria-label="Zoom in"><Plus size={14} /></button></span> : <small>{lineCount} lines</small>}</div><Editor key={activeTab.id} sessionId={activeTab.id} value={content} onChange={(value) => {
+          const current = documentsRef.current;
+          const tab = current.tabs.find((item) => item.id === activeTab.id);
+          const next = editTab(current, activeTab.id, value);
+          documentsRef.current = next;
+          const dirtyChanged = tab ? isDirty(tab) !== (value !== tab.savedContent) : true;
+          if (view === "editor" && value.length > 80_000 && !dirtyChanged) {
+            window.clearTimeout(pendingWorkspaceRender.current);
+            pendingWorkspaceRender.current = window.setTimeout(() => {
+              pendingWorkspaceRender.current = 0;
+              setDocumentsState(documentsRef.current);
+            }, 120);
+          } else {
+            if (pendingWorkspaceRender.current) {
+              window.clearTimeout(pendingWorkspaceRender.current);
+              pendingWorkspaceRender.current = 0;
+            }
+            setDocumentsState(next);
+          }
+        }} dark={dark} focusMode={focusMode} typewriterScroll={typewriterScroll} onTypewriterChange={setTypewriterScroll} /></motion.section>}
         {view === "split" && <div className="pane-resizer" role="separator" aria-label="Resize editor and preview" aria-orientation="vertical" aria-valuemin={25} aria-valuemax={75} aria-valuenow={splitPercent} tabIndex={0} onPointerDown={onResizePointerDown} onPointerMove={onResizePointerMove} onPointerUp={onResizePointerUp} onLostPointerCapture={() => setResizing(false)} onDoubleClick={() => setSplitPercent(50)} onKeyDown={(event) => { if (event.key === "ArrowLeft" || event.key === "ArrowRight") { event.preventDefault(); setSplitPercent((current) => Math.max(25, Math.min(75, current + (event.key === "ArrowRight" ? 5 : -5)))); } }}><span /></div>}
         {(view === "reader" || view === "split") && <motion.section layout={false} initial={false} transition={motionEnabled && !resizing && !windowResizing ? spring.surface : { duration: 0 }} className="preview-pane" aria-label="Reading preview"><div className="pane-head"><span><BookOpen size={15} /> Preview</span><div className="preview-tools"><small>{wordCount} words</small><span className="zoom-controls" aria-label="Workspace zoom"><button onClick={() => zoomBy(-10)} title="Zoom out · Ctrl+-" aria-label="Zoom out"><Minus size={14} /></button><ZoomInput value={workspaceZoom} onChange={setZoom} /><button onClick={() => zoomBy(10)} title="Zoom in · Ctrl++" aria-label="Zoom in"><Plus size={14} /></button></span></div></div><div className="reading-scroll" ref={readingScrollRef}><div className="preview-page" style={{ width: previewLayoutWidth(previewViewportWidth, readerWidth, workspaceZoom), zoom: workspaceZoom / 100 }}><MarkdownPreview markdown={content} documentPath={path} python={python} dark={dark} trustedImageHosts={trustedImageHosts} onTrustImageHost={trustImageHost} /></div></div></motion.section>}
         {view === "live" && <motion.section layout={false} initial={false} transition={motionEnabled && !windowResizing ? spring.surface : { duration: 0 }} className="live-pane" aria-label="Live Markdown"><div className="pane-head"><span><Sparkle size={15} /> Live preview</span><span className="preview-tools"><small>Click content to edit</small><ZoomInput value={workspaceZoom} onChange={setZoom} /></span></div><div className="reading-scroll"><LiveEditor key={activeTab.id} markdown={content} onChange={(value) => setDocuments((current) => editTab(current, activeTab.id, value))} documentPath={path} python={python} dark={dark} trustedImageHosts={trustedImageHosts} onTrustImageHost={trustImageHost} typewriterScroll={typewriterScroll} /></div></motion.section>}

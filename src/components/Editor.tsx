@@ -105,12 +105,61 @@ export function importEditorSession(id: string, data: PortableEditorSession | un
   incomingWeights.set(id,size);let retained=[...incomingWeights.values()].reduce((n,size)=>n+size,0);
   while(incomingSessions.size>40||retained>4_000_000){const first=incomingSessions.keys().next().value!;incomingSessions.delete(first);retained-=incomingWeights.get(first)||0;incomingWeights.delete(first);}
 }
+export interface DocStringCache {
+  doc: EditorState["doc"];
+  text: string;
+  prefix: string;
+  middle: string;
+  suffix: string;
+}
+
+export function createDocCache(doc: EditorState["doc"], text: string): DocStringCache {
+  return text.length <= 4096
+    ? { doc, text, prefix: "", middle: text, suffix: "" }
+    : { doc, text, prefix: "", middle: "", suffix: text };
+}
+
+export function computeNextDocCache(
+  prev: DocStringCache | null,
+  startDoc: EditorState["doc"],
+  nextDoc: EditorState["doc"],
+  changes: SourceChange[],
+): DocStringCache {
+  if (prev && prev.doc === startDoc && changes.length === 1) {
+    const { from, to, insert } = changes[0];
+    const pLen = prev.prefix.length;
+    const mEnd = pLen + prev.middle.length;
+    if (
+      (prev.middle.length > 0 || (pLen === 0 && prev.suffix.length === 0)) &&
+      from >= pLen &&
+      to <= mEnd &&
+      prev.middle.length - (to - from) + insert.length <= 8192
+    ) {
+      const middle = prev.middle.slice(0, from - pLen) + insert + prev.middle.slice(to - pLen);
+      const text = pLen === 0 && prev.suffix.length === 0 ? middle : prev.prefix + middle + prev.suffix;
+      return { doc: nextDoc, text, prefix: prev.prefix, middle, suffix: prev.suffix };
+    }
+    if (nextDoc.length > 4096) {
+      const base = pLen === 0 && prev.middle.length === 0 ? prev.text : startDoc.toString();
+      let winStart = Math.max(0, from - 512);
+      if (winStart > 0 && base.charCodeAt(winStart) >= 0xdc00 && base.charCodeAt(winStart) <= 0xdfff) winStart--;
+      let winEnd = Math.min(base.length, to + 512);
+      if (winEnd < base.length && base.charCodeAt(winEnd) >= 0xdc00 && base.charCodeAt(winEnd) <= 0xdfff) winEnd++;
+      const prefix = base.slice(0, winStart);
+      const suffix = base.slice(winEnd);
+      const middle = base.slice(winStart, from) + insert + base.slice(to, winEnd);
+      return { doc: nextDoc, text: prefix + middle + suffix, prefix, middle, suffix };
+    }
+  }
+  return createDocCache(nextDoc, nextDoc.toString());
+}
+
 export default function Editor({ sessionId = "default", value, onChange, dark, focusMode,spellCheck=false,grammarCheck=false,latexAutofix=false,typewriterScroll,onTypewriterChange }: Props) {
   pasteSettings.set(sessionId,latexAutofix);
   typewriterHandlers.set(sessionId,onTypewriterChange);
   const host = useRef<HTMLDivElement>(null);
   const view = useRef<EditorView | null>(null);
-  const lastKnownDoc = useRef<{ doc: EditorState["doc"]; text: string; depth: number } | null>(null);
+  const lastKnownDoc = useRef<DocStringCache | null>(null);
   const pendingEchoes = useRef<Array<{ text: string; time: number }>>([]);
   const changeHandler = useRef(onChange);
   changeHandler.current = onChange;
@@ -204,12 +253,9 @@ export default function Editor({ sessionId = "default", value, onChange, dark, f
           if (update.docChanged) {
             const changes:SourceChange[]=[];
             update.changes.iterChanges((from,to,_fromB,_toB,insert)=>changes.push({from,to,insert:insert.toString()}));
-            const prevKnown = lastKnownDoc.current?.doc === update.startState.doc ? lastKnownDoc.current : undefined;
-            const canSlice = prevKnown !== undefined && changes.length === 1 && prevKnown.depth < 32;
-            const nextText = canSlice
-              ? prevKnown.text.slice(0, changes[0].from) + changes[0].insert + prevKnown.text.slice(changes[0].to)
-              : update.state.doc.toString();
-            lastKnownDoc.current = { doc: update.state.doc, text: nextText, depth: canSlice ? prevKnown.depth + 1 : 0 };
+            const nextKnown = computeNextDocCache(lastKnownDoc.current, update.startState.doc, update.state.doc, changes);
+            lastKnownDoc.current = nextKnown;
+            const nextText = nextKnown.text;
             if (pendingEchoes.current.length >= 64) pendingEchoes.current.shift();
             pendingEchoes.current.push({ text: nextText, time: performance.now() });
             callbacks.get(sessionId)?.(nextText,changes);
@@ -227,7 +273,7 @@ export default function Editor({ sessionId = "default", value, onChange, dark, f
       } catch { /* Invalid/oversized optional view state must not block the note. */ }
     }
     view.current = new EditorView({ state, parent: host.current });
-    lastKnownDoc.current = { doc: view.current.state.doc, text: value, depth: 0 };
+    lastKnownDoc.current = createDocCache(view.current.state.doc, value);
     pendingEchoes.current.length = 0;
     visibleEditors.set(sessionId, view.current);
     if (cached && state === cached.state && cached.typewriterActive !== initialTypewriter) {
@@ -268,8 +314,11 @@ export default function Editor({ sessionId = "default", value, onChange, dark, f
   useEffect(() => {
     const instance = view.current;
     if (!instance) return;
-    const previous = lastKnownDoc.current?.doc === instance.state.doc ? lastKnownDoc.current.text : instance.state.doc.toString();
-    lastKnownDoc.current = { doc: instance.state.doc, text: previous, depth: lastKnownDoc.current?.doc === instance.state.doc ? lastKnownDoc.current.depth : 0 };
+    const known = lastKnownDoc.current?.doc === instance.state.doc
+      ? lastKnownDoc.current
+      : createDocCache(instance.state.doc, instance.state.doc.toString());
+    lastKnownDoc.current = known;
+    const previous = known.text;
     if (previous === value) {
       pendingEchoes.current.length = 0;
       return;
@@ -282,11 +331,11 @@ export default function Editor({ sessionId = "default", value, onChange, dark, f
     }
     pendingEchoes.current.length = 0;
     let from = 0;
-    while (from < previous.length && from < value.length && previous[from] === value[from]) from++;
+    while (from < previous.length && from < value.length && previous.charCodeAt(from) === value.charCodeAt(from)) from++;
     let oldEnd = previous.length, newEnd = value.length;
-    while (oldEnd > from && newEnd > from && previous[oldEnd - 1] === value[newEnd - 1]) { oldEnd--; newEnd--; }
+    while (oldEnd > from && newEnd > from && previous.charCodeAt(oldEnd - 1) === value.charCodeAt(newEnd - 1)) { oldEnd--; newEnd--; }
     instance.dispatch({ changes: { from, to: oldEnd, insert: value.slice(from, newEnd) },annotations:Transaction.addToHistory.of(false) });
-    lastKnownDoc.current = { doc: instance.state.doc, text: value, depth: 0 };
+    lastKnownDoc.current = createDocCache(instance.state.doc, value);
   }, [value]);
 
   useEffect(() => {

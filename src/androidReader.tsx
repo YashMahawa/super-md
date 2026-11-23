@@ -96,6 +96,9 @@ function Reader() {
   const readerAnalysis=useMemo(()=>state?readerSourceAnalysis(state.mode,state.content):null,[state?.mode,state?.content]);
   const [repairing, setRepairing] = useState(false);
   const [searching,setSearching] = useState(false);
+  const overlayOpenRef = useRef(false);
+  overlayOpenRef.current = repairing || searching;
+  const pendingStateRender = useRef(0);
   const [pdfExport,setPdfExport]=useState<PdfExportStatus|null>(null);
   const exportOwner=useRef<{id:string;controller:AbortController;phase:PdfExportStatus['phase']}|null>(null);
   const cancelPdfExport=useCallback(async()=>{
@@ -117,11 +120,12 @@ function Reader() {
   const [trustedHosts,setTrustedHosts] = useState<string[]>([]);
   const documentAppearance=useMemo(()=>({dark:state?.dark??false,svgAppearance:state?.svgAppearance,ink:state?.colors.primary,text:state?.colors.text,colors:state?.colors}),[state?.dark,state?.svgAppearance,JSON.stringify(state?.colors)]);
   const trustHost = useCallback((host:string)=>setTrustedHosts(current=>current.includes(host)?current:[...current,host]),[]);
-  const reference = useRef(state); reference.current = state;
+  const reference = useRef(state); if (!pendingStateRender.current) reference.current = state;
   const changeTypewriter = useCallback((enabled: boolean) => {
     setTypewriterScroll(enabled, { persist: false });
     const current = reference.current;
     if (current && current.typewriterScroll !== enabled) {
+      if (pendingStateRender.current) { window.clearTimeout(pendingStateRender.current); pendingStateRender.current = 0; }
       const next = { ...current, typewriterScroll: enabled };
       reference.current = next;
       setState(next);
@@ -241,7 +245,11 @@ function Reader() {
         void invoke("zoom_changed",{zoom:loaded.zoom,fullscreen:true});
       }
       if(old && !sameViewport){window.clearTimeout(zoomTimer.current);cancelAnimationFrame(zoomFrame.current);zoomFrame.current=0;zoomTarget.current=null;}
-      const load = () => { setTypewriterScroll(loaded.typewriterScroll === true, { persist: false }); reference.current=loaded;setState(loaded); zoomReference.current = loaded.zoom; };
+      const load = () => {
+        if (pendingStateRender.current) { window.clearTimeout(pendingStateRender.current); pendingStateRender.current = 0; }
+        setTypewriterScroll(loaded.typewriterScroll === true, { persist: false });
+        reference.current=loaded;setState(loaded); zoomReference.current = loaded.zoom;
+      };
       const typewriterChanged = Boolean(old?.typewriterScroll) !== Boolean(loaded.typewriterScroll);
       if (old?.id === next.id && old.mode === next.mode && !typewriterChanged) anchored(load); else load();
     };
@@ -281,7 +289,7 @@ function Reader() {
     window.supermdSetZoom=(value,requestedAt)=>{if(requestedAt!==undefined&&requestedAt<zoomGestureAt.current)return;window.clearTimeout(zoomTimer.current);cancelAnimationFrame(zoomFrame.current);zoomFrame.current=0;zoomTarget.current=null;const next=clampPreviewZoom(value);if(Math.abs(next-zoomReference.current)<.01)return;cancelHeadingNavigation(document.querySelector('.android-reading'));zoomReference.current=next;applyZoomStyle();settleSelection();};
     window.supermdHeading=(id,offset)=>{markScrollInput();if(reference.current?.mode==="editor"){window.dispatchEvent(new CustomEvent("supermd-goto-offset",{detail:offset??0}));return;}const root=document.querySelector(".android-reading");if(root)navigateToHeading(root,id);};
     window.supermdResetZoom = () => { if (document.querySelector(".image-viewer")) { window.dispatchEvent(new Event("supermd-image-reset")); return; } window.supermdZoomBy?.(100/(zoomTarget.current??zoomReference.current)); };
-    window.supermdRepairMath = () => setRepairing(true);
+    window.supermdRepairMath = () => { if (pendingStateRender.current) { window.clearTimeout(pendingStateRender.current); pendingStateRender.current = 0; if (reference.current) setState(reference.current); } setRepairing(true); };
     window.supermdToggleTypewriter = () => changeTypewriter(!(reference.current?.typewriterScroll ?? false));
     window.supermdNativeWheel=(dx,dy,point,held,modifier=false)=>{
       markScrollInput();
@@ -330,7 +338,7 @@ function Reader() {
         await invoke("document_flushed",{id:current.id,content:latest?.id===current.id?latest.content:current.content,operation,viewId:id,viewState:view});
       })().catch(error=>setEditError(String(error)));
     };
-    window.supermdFind = () => {if(document.querySelector('.theme-guide-dialog'))return;flushSync(()=>setSearching(true));window.dispatchEvent(new Event("supermd-find-focus"));};
+    window.supermdFind = () => {if(document.querySelector('.theme-guide-dialog'))return;if(pendingStateRender.current){window.clearTimeout(pendingStateRender.current);pendingStateRender.current=0;}flushSync(()=>{if(reference.current)setState(reference.current);setSearching(true);});window.dispatchEvent(new Event("supermd-find-focus"));};
     window.supermdPortable = async (save) => {
       const current = reference.current; if (!current) return;
       try {
@@ -365,7 +373,7 @@ function Reader() {
       catch (error) { await invoke("export_failed", {error: String(error)}); }
     };
     void invoke("reader_ready");
-    return () => {nativeScroll.clear();cancelAnimationFrame(zoomFrame.current);window.clearTimeout(zoomTimer.current);delete window.supermdThemeGuide;delete window.supermdSavePosition;delete window.supermdChromeInset;delete window.supermdLoad; delete window.supermdExport; delete window.supermdExportMarkdown; delete window.supermdPortable; delete window.supermdZoomBy; delete window.supermdResetZoom; delete window.supermdRepairMath; delete window.supermdToggleTypewriter; delete window.supermdFlush; delete window.supermdSetZoom; delete window.supermdHeading; };
+    return () => {nativeScroll.clear();cancelAnimationFrame(zoomFrame.current);window.clearTimeout(zoomTimer.current);window.clearTimeout(pendingStateRender.current);delete window.supermdThemeGuide;delete window.supermdSavePosition;delete window.supermdChromeInset;delete window.supermdLoad; delete window.supermdExport; delete window.supermdExportMarkdown; delete window.supermdPortable; delete window.supermdZoomBy; delete window.supermdResetZoom; delete window.supermdRepairMath; delete window.supermdToggleTypewriter; delete window.supermdFlush; delete window.supermdSetZoom; delete window.supermdHeading; };
   }, []);
   useEffect(()=>{
     if(!state)return;
@@ -391,7 +399,7 @@ function Reader() {
         if(controller.signal.aborted||reference.current?.id!==id||reference.current.content!==content)return;
         void invoke('document_outline',{id,headings}).catch(()=>{});
       })();
-    },content.length>80_000?180:0);
+    },content.length>80_000?90:0);
     return()=>{window.clearTimeout(timer);controller.abort();if(workerBacked)outlineWorker.current?.cancel();};
   },[state?.id,state?.content,state?.mode,readerAnalysis]);
   useEffect(()=>()=>{outlineWorker.current?.dispose();outlineWorker.current=null;},[]);
@@ -609,7 +617,7 @@ function Reader() {
       const history=histories.current.get(previous.id)||{undo:[],redo:[],last:0},now=Date.now();
       const single=changes?.length===1?changes[0]:undefined;
       if(single&&single.from>=0&&single.to>=single.from&&single.to<=previous.content.length){
-        const edit={from:single.from,remove:single.insert.length,insert:previous.content.slice(single.from,single.to)};
+        const edit={from:single.from,remove:single.insert.length,insert:single.from===single.to?"":previous.content.slice(single.from,single.to)};
         const last=history.undo.at(-1);
         if(now-history.last>600||Math.abs(content.length-previous.content.length)>1||!Array.isArray(last)||last.length>=10_000)history.undo.push([edit]);
         else{
@@ -622,9 +630,23 @@ function Reader() {
         while(history.undo.length>1&&(history.undo.length>60||historySize(history)>2_000_000))history.undo.shift();
       }else recordHistory(history,previous.content,content,now);
       histories.current.delete(previous.id);histories.current.set(previous.id,history);
-      trimHistories(previous.id);
+      if(histories.current.size>1)trimHistories(previous.id);
     }
-    const next = { ...reference.current!, content }; setState(next); reference.current = next;
+    const next = { ...reference.current!, content };
+    reference.current = next;
+    if (next.mode === "editor" && content.length > 80_000 && !replaying.current && !overlayOpenRef.current) {
+      window.clearTimeout(pendingStateRender.current);
+      pendingStateRender.current = window.setTimeout(() => {
+        pendingStateRender.current = 0;
+        if (reference.current) setState(reference.current);
+      }, 90);
+    } else {
+      if (pendingStateRender.current) {
+        window.clearTimeout(pendingStateRender.current);
+        pendingStateRender.current = 0;
+      }
+      setState(next);
+    }
     // The bridge receives every edit immediately, so closing/rotating cannot lose
     // a pending debounced WebView update. Disk snapshots are debounced natively.
     window.clearTimeout(pendingChange.current);
