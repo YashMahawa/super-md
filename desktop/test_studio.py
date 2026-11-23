@@ -216,6 +216,7 @@ class StudioTest(unittest.TestCase):
         for window in self.windows:
             window.stop()
             window.pool.shutdown(wait=True,cancel_futures=True)
+            window._search_pool.shutdown(wait=True,cancel_futures=True)
         self.session.writes.shutdown(wait=True)
         self.app.processEvents()
 
@@ -1041,3 +1042,315 @@ class StudioTest(unittest.TestCase):
         studio.post("flush","document_flushed",json.dumps({"id":studio.active,"content":"Stale draft","operation":previous}))
         self.assertNotEqual(studio._current()["content"],"Stale draft")
         self.assertEqual(studio.flush_operation["action"],"save")
+
+    def _wait_until(self, predicate, timeout=4.0):
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            self.app.processEvents()
+            if predicate():
+                return
+            time.sleep(0.01)
+        self.app.processEvents()
+        self.assertTrue(predicate(), "Timed out waiting for condition")
+
+    def test_workspace_folder_and_expanded_subfolders_persist_across_restarts_tray_hides_and_multiwindow_shutdown(self):
+        import tempfile
+        with tempfile.TemporaryDirectory() as tmp:
+            root_a = Path(tmp) / "workspace-a"
+            sub_a = root_a / "math" / "algebra"
+            sub_a.mkdir(parents=True)
+            (root_a / "index.md").write_text("# Index\n")
+            (sub_a / "basis.md").write_text("# Basis\n")
+
+            root_b = Path(tmp) / "workspace-b"
+            sub_b = root_b / "physics"
+            sub_b.mkdir(parents=True)
+            (sub_b / "waves.md").write_text("# Waves\n")
+
+            # Open workspace A and expand nested subfolders in window 1.
+            self.studio.openFolder(str(root_a))
+            self.await_idle()
+            self.studio.toggleDirectory(str(root_a / "math"))
+            self.await_idle()
+            self.studio.toggleDirectory(str(sub_a))
+            self.await_idle()
+
+            # Tray hide preserves in-memory and persisted state (stop isn't called on hide,
+            # and persisted startup.json keeps folder + expanded).
+            self.flush()
+            persisted = json.loads((self.studio.data / "startup.json").read_text())
+            expected_expanded_a = {
+                str(root_a.resolve()),
+                str((root_a / "math").resolve()),
+                str(sub_a.resolve()),
+            }
+            win_entry = next(w for w in persisted["windows"] if w["windowId"] == self.studio.window_id)
+            self.assertEqual(win_entry["folder"], str(root_a.resolve()))
+            self.assertEqual(
+                set(win_entry["expanded"]),
+                expected_expanded_a,
+            )
+
+            # Open window 2 with workspace B and simulate multi-window tray quit
+            # (service.quitting=True before app.aboutToQuit sets session.quitting=True).
+            second = self.window()
+            second.openFolder(str(root_b))
+            self._wait_until(lambda: second.busy == 0)
+            second.toggleDirectory(str(sub_b))
+            self._wait_until(lambda: second.busy == 0)
+            self.flush()
+            expected_expanded_b = {str(root_b.resolve()), str(sub_b.resolve())}
+
+            class FakeService:
+                quitting = True
+
+            self.session.background = FakeService()
+            self.studio.stop()
+            second.stop()
+            self.flush()
+
+            # Restart with startup == "restore": both windows restore their workspace folders & expanded paths.
+            with patch("studio.tempfile.mkdtemp", return_value=str(self.studio.data)):
+                restored_session = Session(True)
+                w1 = w2 = None
+                try:
+                    w1 = QuietStudio(True, restored_session)
+                    self.assertTrue(restored_session.has_pending_startup_windows())
+                    w2 = QuietStudio(True, restored_session)
+                    self.assertFalse(restored_session.has_pending_startup_windows())
+                    self._wait_until(
+                        lambda: len(json.loads(w1.snapshot)["files"]) > 0
+                        and len(json.loads(w2.snapshot)["files"]) > 0
+                    )
+
+                    self.assertEqual(w1.folder, str(root_a.resolve()))
+                    self.assertEqual(w1.expanded, expected_expanded_a)
+                    w1_paths = {entry["path"] for entry in json.loads(w1.snapshot)["files"]}
+                    self.assertIn(str((sub_a / "basis.md").resolve()), w1_paths)
+
+                    self.assertEqual(w2.folder, str(root_b.resolve()))
+                    self.assertEqual(w2.expanded, expected_expanded_b)
+                    w2_paths = {entry["path"] for entry in json.loads(w2.snapshot)["files"]}
+                    self.assertIn(str((sub_b / "waves.md").resolve()), w2_paths)
+                finally:
+                    for w in (w1, w2):
+                        if w is not None:
+                            w.stop()
+                            w.pool.shutdown(wait=True, cancel_futures=True)
+                            w._search_pool.shutdown(wait=True, cancel_futures=True)
+                    restored_session.writes.shutdown(wait=True)
+
+            # When startup != "restore", workspace folders are NOT restored on launch.
+            self.session.settings["startup"] = "new"
+            atomic_json(self.studio.data / "settings.json", {"settings": self.session.settings})
+            with patch("studio.tempfile.mkdtemp", return_value=str(self.studio.data)):
+                fresh_session = Session(True)
+                fresh_win = None
+                try:
+                    fresh_win = QuietStudio(True, fresh_session)
+                    self.assertEqual(fresh_win.folder, "")
+                    self.assertEqual(fresh_win.expanded, set())
+                    self.assertFalse(fresh_session.has_pending_startup_windows())
+                finally:
+                    if fresh_win is not None:
+                        fresh_win.stop()
+                        fresh_win.pool.shutdown(wait=True, cancel_futures=True)
+                        fresh_win._search_pool.shutdown(wait=True, cancel_futures=True)
+                    fresh_session.writes.shutdown(wait=True)
+
+    def test_contextual_save_and_export_locations_prioritize_saved_parent_then_workspace_folder(self):
+        import tempfile
+        with tempfile.TemporaryDirectory() as tmp:
+            workspace_dir = Path(tmp) / "workspace"
+            saved_dir = Path(tmp) / "saved-notes"
+            fallback_dir = Path(tmp) / "configured-default"
+            workspace_dir.mkdir()
+            saved_dir.mkdir()
+            fallback_dir.mkdir()
+
+            studio = self.studio
+            studio.settings["newNoteLocation"] = str(fallback_dir)
+
+            # 1. No workspace open + unsaved note -> falls back to newNoteLocation.
+            studio.newNote()
+            studio._current()["name"] = "1.2 Linear Algebra.md"
+            self.assertEqual(
+                Path(QUrl(studio.defaultSaveLocation(studio._current()["name"])).toLocalFile()),
+                fallback_dir / "1.2 Linear Algebra.md",
+            )
+            self.assertEqual(
+                Path(QUrl(studio.defaultExportLocation("pdf")).toLocalFile()),
+                fallback_dir / "1.2 Linear Algebra.pdf",
+            )
+
+            # 2. Workspace open + unsaved note -> defaults to open workspace folder.
+            studio.openFolder(str(workspace_dir))
+            self.await_idle()
+            self.assertEqual(
+                Path(QUrl(studio.defaultSaveLocation(studio._current()["name"])).toLocalFile()),
+                workspace_dir.resolve() / "1.2 Linear Algebra.md",
+            )
+            self.assertEqual(
+                Path(QUrl(studio.defaultExportLocation("mdzip")).toLocalFile()),
+                workspace_dir.resolve() / "1.2 Linear Algebra.zip",
+            )
+
+            # 3. Active saved note -> defaults to saved note's parent directory even when another workspace is open.
+            saved_note = saved_dir / "2.4 Eigenvalues.smd"
+            saved_note.write_text("# Eigenvalues\n")
+            studio.openPath(str(saved_note))
+            self.await_idle()
+            self.assertEqual(
+                Path(QUrl(studio.defaultSaveLocation(studio._current()["name"])).toLocalFile()),
+                saved_note.resolve(),
+            )
+            self.assertEqual(
+                Path(QUrl(studio.defaultExportLocation("pdf")).toLocalFile()),
+                saved_dir.resolve() / "2.4 Eigenvalues.pdf",
+            )
+
+    def test_subfolder_search_scans_collapsed_subfolders_skips_hidden_and_symlinks_and_preserves_watchers(self):
+        import tempfile
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "vault"
+            (root / "courses" / "algebra").mkdir(parents=True)
+            (root / "empty-branch" / "sub").mkdir(parents=True)
+            (root / ".obsidian").mkdir(parents=True)
+            outside = Path(tmp) / "outside"
+            outside.mkdir()
+
+            (root / "readme.md").write_text("# Root\n")
+            (root / "courses" / "algebra" / "1.2 Linear Algebra.md").write_text("# LA\n")
+            (root / "courses" / "algebra" / "scratch.txt").write_text("plain text note\n")
+            (root / "empty-branch" / "other.md").write_text("# Unrelated\n")
+            (root / ".obsidian" / "linear-secret.md").write_text("hidden dir\n")
+            (root / ".linear-hidden.md").write_text("hidden file\n")
+            (outside / "linear-external.md").write_text("outside\n")
+            try:
+                (root / "linked-outside").symlink_to(outside, target_is_directory=True)
+                (root / "courses" / "linear-link.md").symlink_to(outside / "linear-external.md")
+            except OSError:
+                pass
+
+            studio = self.studio
+            studio.openFolder(str(root))
+            self.await_idle()
+
+            # Collapsed subfolders are NOT watched at rest.
+            watched_dirs_before = set(studio.note_watcher.directories())
+            expected_root_only = {str(root.resolve())}
+            self.assertIn(str(root.resolve()), watched_dirs_before)
+            self.assertNotIn(str((root / "courses").resolve()), watched_dirs_before)
+            self.assertEqual(studio.expanded, expected_root_only)
+
+            # Search across collapsed subfolders finds matching note & ancestor dirs only.
+            studio.setFolderFilter("linear")
+            self._wait_until(lambda: not studio.filter_timer.isActive() and not studio._folder_searching)
+            snap = json.loads(studio.snapshot)
+            names = [item["name"] for item in snap["files"]]
+            self.assertEqual(names, ["courses", "algebra", "1.2 Linear Algebra.md"])
+            self.assertEqual(studio.expanded, expected_root_only, "Search must not mutate expanded folder state")
+            self.assertEqual(
+                set(studio.note_watcher.directories()),
+                watched_dirs_before,
+                "Search must not add collapsed subdirectories to QFileSystemWatcher",
+            )
+
+            # Rapid queries cancel stale searches cleanly and converge on the latest filter.
+            studio.setFolderFilter("readme")
+            studio.setFolderFilter("scratch")
+            self._wait_until(lambda: not studio.filter_timer.isActive() and not studio._folder_searching)
+            snap = json.loads(studio.snapshot)
+            self.assertEqual([item["name"] for item in snap["files"]], ["courses", "algebra", "scratch.txt"])
+
+            # Zero matches produces an empty list while preserving folderFilter in snapshot.
+            studio.setFolderFilter("nonexistent-xyz")
+            self._wait_until(lambda: not studio.filter_timer.isActive() and not studio._folder_searching)
+            snap = json.loads(studio.snapshot)
+            self.assertEqual(snap["folderFilter"], "nonexistent-xyz")
+            self.assertEqual(snap["files"], [])
+
+            # Closing (or reopening) folder clears the active filter automatically.
+            studio.closeFolder()
+            self.assertEqual(studio.folder_filter, "")
+            self.assertEqual(json.loads(studio.snapshot)["folderFilter"], "")
+
+    def test_dotted_and_safe_note_renaming_case_only_rename_and_state_sync(self):
+        import tempfile
+        from studio import resolve_note_rename
+        # Pure validation checks for dotted titles, extensions, hidden names, and illegal characters.
+        self.assertEqual(resolve_note_rename("1.2 Linear Algebra", "Draft.md"), ("1.2 Linear Algebra.md", None))
+        self.assertEqual(resolve_note_rename("1.2 Linear Algebra.smd", "Draft.smd", portable=True), ("1.2 Linear Algebra.smd", None))
+        self.assertEqual(resolve_note_rename("Plain Note", "README", has_saved_target=True), ("Plain Note", None))
+        self.assertEqual(resolve_note_rename("2.0 Release", "notes.txt"), ("2.0 Release.txt", None))
+        for bad in ("", "   ", ".", "..", ".hidden", ".md", "   .md", "bad/name", "bad\\name", "a:b", "a*b", "a?b", 'a"b', "a<b>c", "a|b", "report.pdf"):
+            target, err = resolve_note_rename(bad, "Draft.md")
+            self.assertIsNone(target, f"Expected {bad!r} to be rejected")
+            self.assertTrue(err, f"Expected error message for {bad!r}")
+
+        with tempfile.TemporaryDirectory() as tmp:
+            folder = Path(tmp) / "notes"
+            folder.mkdir()
+            note_file = folder / "linear algebra.md"
+            other_file = folder / "existing.md"
+            note_file.write_text("# Linear Algebra\n")
+            other_file.write_text("# Existing\n")
+
+            studio = self.studio
+            studio.openFolder(str(folder))
+            self.await_idle()
+            studio.openPath(str(note_file))
+            self.await_idle()
+
+            old_path = str(note_file.resolve())
+            studio.pinRecent(old_path)
+            studio.session.locations[old_path] = {"top": 180, "ratio": 0.4}
+
+            # Invalid rename leaves note untouched and sets an error message.
+            studio.renameNote(studio.active, ".hidden")
+            self.assertEqual(studio._current()["path"], old_path)
+            self.assertIn("cannot start with a dot", studio.message)
+
+            # Collision with a distinct existing file is blocked.
+            studio.renameNote(studio.active, "existing")
+            self.await_idle()
+            self.assertEqual(studio._current()["path"], old_path)
+            self.assertIn("already exists", studio.message)
+
+            # Case-only rename succeeds (even when filesystem reports exists() + samefile() True).
+            real_exists = Path.exists
+            real_samefile = Path.samefile
+            case_target = folder.resolve() / "Linear Algebra.md"
+
+            def simulated_case_insensitive_exists(path_obj):
+                if path_obj == case_target:
+                    return True
+                return real_exists(path_obj)
+
+            def simulated_case_insensitive_samefile(path_obj, other_path):
+                if path_obj == Path(old_path) and Path(other_path) == case_target:
+                    return True
+                return real_samefile(path_obj, other_path)
+
+            with patch.object(Path, "exists", simulated_case_insensitive_exists), patch.object(
+                Path, "samefile", simulated_case_insensitive_samefile
+            ):
+                studio.renameNote(studio.active, "Linear Algebra")
+            self.await_idle()
+            self.assertEqual(Path(studio._current()["path"]).name, "Linear Algebra.md")
+
+            # Dotted title rename preserves .md and syncs pinned, recent, locations, workspace, and folder listing.
+            studio.renameNote(studio.active, "1.2 Linear Algebra")
+            self.await_idle()
+            expected_path = str((folder / "1.2 Linear Algebra.md").resolve())
+            self.assertEqual(studio._current()["path"], expected_path)
+            self.assertEqual(studio._current()["name"], "1.2 Linear Algebra.md")
+            self.assertIn(expected_path, studio.pinnedRecent)
+            self.assertNotIn(old_path, studio.pinnedRecent)
+            self.assertIn(expected_path, studio.recent)
+            self.assertNotIn(old_path, studio.recent)
+            self.assertEqual(studio.session.locations.get(expected_path), {"top": 180, "ratio": 0.4})
+            self.assertNotIn(old_path, studio.session.locations)
+            listed_names = [entry["name"] for entry in json.loads(studio.snapshot)["files"]]
+            self.assertIn("1.2 Linear Algebra.md", listed_names)
+

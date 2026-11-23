@@ -52,7 +52,7 @@ internal fun orderedRecents(notes:List<RecentNote>)=notes.distinctBy {it.uri}.so
 private fun renamedRelative(relative:String?,name:String)=relative?.let {val parent=it.substringBeforeLast('/',"");if(parent.isEmpty())name else "$parent/$name"}
 data class FileEntry(val name: String, val uri: String, val directory: Boolean, val relative: String)
 data class OutlineHeading(val id: String, val title: String, val level: Int, val offset: Int)
-data class StudioState(val latexAutofix:Boolean=false, val selectionAssistant:String="chatgpt", val centerLock:Boolean=true, val customTheme:String="", val patternKind:String="", val patternOpacity:Float=-1f, val patternSize:Float=0f, val patternSpacing:Float=0f, val restorePosition:Boolean=true, val fullDocumentAccessibility:Boolean=false, val startup:String="restore", val imageAppearance:String="original", val svgAppearance:String="original", val imageContrast:Float=1.25f, val spellCheck:Boolean = false, val grammarCheck:Boolean = false, val accent: String = "system", val widthPercent: Float = 100f, val lineHeight: Float = 1.65f, val autosave: Boolean = true, val customFonts: List<String> = emptyList(), val readerOverlay: Boolean = false, val zoomCommand: Long = 0, val tabs: List<Note> = listOf(Note(name = "Welcome.md", content = sample, saved = sample)), val closedTabs: List<Note> = emptyList(), val activeId: String = "", val mode: String = "live", val fullscreen: Boolean = false, val normalZoom: Float = 100f, val fullscreenZoom: Float = 100f, val theme: String = "system", val fullscreenTheme: String = "black", val motion: Boolean = true, val font: String = "Manrope", val size: Float = 15f, val folder: String? = null, val files: List<FileEntry> = emptyList(), val busy: Boolean = false, val message: String? = null, val error: String? = null, val welcomed: Boolean = false, val pdf: String = "{\"pageSize\":\"a4\",\"margin\":14,\"fontSize\":10.5,\"lineHeight\":1.4,\"paragraphSpacing\":0.65,\"fontFamily\":\"Manrope\",\"pageNumbers\":true}", val storageReport: StorageReport? = null, val storageScanning: Boolean = false) {
+data class StudioState(val latexAutofix:Boolean=false, val selectionAssistant:String="chatgpt", val centerLock:Boolean=true, val customTheme:String="", val patternKind:String="", val patternOpacity:Float=-1f, val patternSize:Float=0f, val patternSpacing:Float=0f, val restorePosition:Boolean=true, val fullDocumentAccessibility:Boolean=false, val startup:String="restore", val imageAppearance:String="original", val svgAppearance:String="original", val imageContrast:Float=1.25f, val spellCheck:Boolean = false, val grammarCheck:Boolean = false, val accent: String = "system", val widthPercent: Float = 100f, val lineHeight: Float = 1.65f, val autosave: Boolean = true, val customFonts: List<String> = emptyList(), val readerOverlay: Boolean = false, val zoomCommand: Long = 0, val tabs: List<Note> = listOf(Note(name = "Welcome.md", content = sample, saved = sample)), val closedTabs: List<Note> = emptyList(), val activeId: String = "", val mode: String = "live", val fullscreen: Boolean = false, val normalZoom: Float = 100f, val fullscreenZoom: Float = 100f, val theme: String = "system", val fullscreenTheme: String = "black", val motion: Boolean = true, val font: String = "Manrope", val size: Float = 15f, val folder: String? = null, val folderRelative: String = "", val files: List<FileEntry> = emptyList(), val busy: Boolean = false, val message: String? = null, val error: String? = null, val welcomed: Boolean = false, val pdf: String = "{\"pageSize\":\"a4\",\"margin\":14,\"fontSize\":10.5,\"lineHeight\":1.4,\"paragraphSpacing\":0.65,\"fontFamily\":\"Manrope\",\"pageNumbers\":true}", val storageReport: StorageReport? = null, val storageScanning: Boolean = false) {
     val active get() = tabs.find { it.id == activeId } ?: tabs.first()
     val zoom get() = if (fullscreen) fullscreenZoom else normalZoom
 }
@@ -302,6 +302,7 @@ class StudioViewModel(app: Application, val workspaceKey: String = "main") : And
         .getOrDefault(emptyList())
     private val closingNoteIds = java.util.concurrent.ConcurrentHashMap.newKeySet<String>()
     private val closedNoteMutex = Mutex()
+    private var listedRelative = ""
     private val mutable = MutableStateFlow(restore())
     private val viewModelRetired = AtomicBoolean(false)
     private val recoveryWriter = LatestRecoveryWriter<StudioState, RecoverySnapshotSignature>(
@@ -319,7 +320,11 @@ class StudioViewModel(app: Application, val workspaceKey: String = "main") : And
                 }
                 commitIfLatest {
                     check(temporary.renameTo(snapshot)) { "Could not replace recovery snapshot" }
-                    windowPrefs.edit().putBoolean("folderMigrated", true).putString("folder", state.folder).apply()
+                    windowPrefs.edit()
+                        .putBoolean("folderMigrated", true)
+                        .putString("folder", state.folder)
+                        .putString("folderRelative", if (state.folder != null) state.folderRelative else "")
+                        .apply()
                 }
             } finally {
                 temporary.delete()
@@ -401,7 +406,6 @@ class StudioViewModel(app: Application, val workspaceKey: String = "main") : And
             ready(Intent(Intent.ACTION_SEND).setType("application/json").putExtra(Intent.EXTRA_STREAM,uri).addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION).apply {clipData=android.content.ClipData.newUri(resolver,file.name,uri)})
         } catch(error:Exception){fail("Could not share theme: ${error.message}")}
     }
-    private var listedRelative=""
     private val deletedDrafts=DeletedDraftStore(File(app.filesDir,"deleted-drafts/$workspaceKey"))
     private val documentObserver=object:android.database.ContentObserver(android.os.Handler(android.os.Looper.getMainLooper())) {
         override fun onChange(selfChange:Boolean){refreshMetadata();refreshExternal()}
@@ -449,10 +453,10 @@ class StudioViewModel(app: Application, val workspaceKey: String = "main") : And
             if(discarded.isNotEmpty()||kept!=s.tabs) change {it.copy(tabs=kept.ifEmpty {listOf(Note())},closedTabs=(recovered+it.closedTabs).take(12),message=if(discarded.isNotEmpty())"File deleted. Its tab was closed; unsaved edits remain recoverable in Settings." else "Updated renamed note")}
             val recents=recentMutable.value.filter {it.uri !in removed}.map {note->metadata[note.uri]?.takeIf {it.isNotBlank()}?.let {note.copy(name=it,relative=renamedRelative(note.relative,it))} ?: note}
             if(recents!=recentMutable.value)storeRecent(recents)
-            mutable.value.folder?.let {listFolder(Uri.parse(it),listedRelative)}
+            mutable.value.folder?.let {listFolder(Uri.parse(it),mutable.value.folderRelative.ifEmpty { listedRelative })}
         }
     }
-    init { prefs.registerOnSharedPreferenceChangeListener(preferencesChanged);observeActive();observeCustomTheme();migrateLegacyClosedNotes();if(workspaceKey=="main")viewModelScope.launch{updates.restore();if(!BuildConfig.DEBUG && updates.state.value.checkOnOpen){kotlinx.coroutines.delay(6000);updates.check()}} }
+    init { prefs.registerOnSharedPreferenceChangeListener(preferencesChanged);observeActive();observeCustomTheme();migrateLegacyClosedNotes();mutable.value.folder?.let { listFolder(Uri.parse(it), mutable.value.folderRelative) };if(workspaceKey=="main")viewModelScope.launch{updates.restore();if(!BuildConfig.DEBUG && updates.state.value.checkOnOpen){kotlinx.coroutines.delay(6000);updates.check()}} }
     override fun onCleared() { viewModelRetired.set(true); recoveryWriter.closeAfterLatest(mutable.value); prefs.unregisterOnSharedPreferenceChangeListener(preferencesChanged);resolver.unregisterContentObserver(documentObserver);resolver.unregisterContentObserver(themeObserver); super.onCleared() }
     val state = mutable.asStateFlow()
     fun inspectStorage() {
@@ -683,7 +687,10 @@ class StudioViewModel(app: Application, val workspaceKey: String = "main") : And
 
     private fun change(block: (StudioState) -> StudioState) { mutable.value = block(mutable.value);observeActive(); schedulePersist() }
     private fun restore(): StudioState {
-        var s = StudioState(theme = prefs.getString("theme", "system")!!, fullscreenTheme = prefs.getString("fullTheme", "black")!!, motion = prefs.getBoolean("motion", true), welcomed = prefs.getBoolean("welcomed", false), font = prefs.getString("font", "Manrope")!!, size = prefs.getFloat("size", 15f), folder = windowPrefs.getString("folder", if (workspaceKey == "main" && !windowPrefs.getBoolean("folderMigrated", false)) prefs.getString("folder", null) else null), pdf = prefs.getString("pdf", null) ?: StudioState().pdf)
+        val restoredFolder = windowPrefs.getString("folder", if (workspaceKey == "main" && !windowPrefs.getBoolean("folderMigrated", false)) prefs.getString("folder", null) else null)
+        val restoredRelative = if (restoredFolder != null) normalizeFolderRelative(windowPrefs.getString("folderRelative", "") ?: "") else ""
+        listedRelative = restoredRelative
+        var s = StudioState(theme = prefs.getString("theme", "system")!!, fullscreenTheme = prefs.getString("fullTheme", "black")!!, motion = prefs.getBoolean("motion", true), welcomed = prefs.getBoolean("welcomed", false), font = prefs.getString("font", "Manrope")!!, size = prefs.getFloat("size", 15f), folder = restoredFolder, folderRelative = restoredRelative, pdf = prefs.getString("pdf", null) ?: StudioState().pdf)
         s = s.copy(spellCheck=prefs.getBoolean("spellCheck",false),grammarCheck=prefs.getBoolean("grammarCheck",false),accent = prefs.getString("accent","system")!!, widthPercent = prefs.getFloat("widthPercent",100f),lineHeight = prefs.getFloat("lineHeight",1.65f),autosave = prefs.getBoolean("autosave",true),customFonts = fonts.families)
         try {
             if (snapshot.isFile) s=snapshot.bufferedReader().use {NoteRecovery.read(it,s)}
@@ -1142,17 +1149,103 @@ class StudioViewModel(app: Application, val workspaceKey: String = "main") : And
         try { val family=withContext(Dispatchers.IO) {fonts.import(uri)};appearance(font=family);prefs.edit().putLong("fonts",System.currentTimeMillis()).apply();mutable.value=mutable.value.copy(customFonts=fonts.families,message="Imported $family for reading and PDF export") }
         catch(error: Exception) {fail("Could not import font: ${error.message}")}
     }
-    fun rename(id: String, requested: String) = viewModelScope.launch {
-        val note=mutable.value.tabs.find {it.id==id} ?: return@launch
-        try {
-            var name=requested.trim();require(name.isNotBlank() && name !in listOf(".","..") && !name.any {it=='/' || it=='\\' || it=='\u0000'}) {"Choose a filename without path separators"}
-            val extension=note.name.substringAfterLast('.',"md")
-            if(!name.contains('.'))name+=".$extension"
-            require(name.substringAfterLast('.').equals(extension,true)) {"Rename keeps the note format. Use Export to change formats."}
-            val uri=note.uri?.let {withContext(Dispatchers.IO) {DocumentsContract.renameDocument(resolver,Uri.parse(it),name)?.toString() ?: error("This provider does not support renaming. Use Save as instead.")}}
-            change {s->s.copy(tabs=s.tabs.map {if(it.id==id)it.copy(name=name,uri=uri,relative=it.relative?.let {r->r.substringBeforeLast('/',"").let {parent->if(parent.isEmpty())name else "$parent/$name"}}) else it})}
-            mutable.value.tabs.find {it.id==id}?.let(::remember)
-        } catch(error:Exception){fail("Could not rename note: ${error.message}")}
+    private fun migrateRenamedNoteMetadata(oldUri: String, newUri: String) {
+        if (oldUri == newUri) return
+        runCatching {
+            val positions = JSONObject(prefs.getString("readingPositions", "{}") ?: "{}")
+            val savedPosition = positions.optJSONObject(oldUri)
+            if (savedPosition != null) {
+                positions.remove(oldUri)
+                positions.put(newUri, savedPosition)
+                prefs.edit().putString("readingPositions", positions.toString()).apply()
+            }
+        }
+        runCatching {
+            val previous = JSONArray(prefs.getString("linkedAssetGrants", "[]") ?: "[]")
+            var changed = false
+            val updated = JSONArray()
+            for (i in 0 until previous.length()) {
+                val record = previous.optJSONObject(i) ?: continue
+                val doc = record.optString("document")
+                if (doc.isNotBlank() && sameDocumentUri(doc, oldUri)) {
+                    updated.put(JSONObject(record.toString()).put("document", newUri))
+                    changed = true
+                } else {
+                    updated.put(record)
+                }
+            }
+            if (changed) {
+                prefs.edit().putString("linkedAssetGrants", updated.toString()).apply()
+            }
+        }
+    }
+
+    fun rename(
+        id: String,
+        requested: String,
+        showGlobalError: Boolean = true,
+        onResult: (Boolean, String?) -> Unit = { _, _ -> },
+    ): Job = viewModelScope.launch {
+        val note = mutable.value.tabs.find { it.id == id }
+        if (note == null) {
+            onResult(false, "The note is no longer open.")
+            return@launch
+        }
+        when (val validation = resolveNoteRename(
+            requested = requested,
+            currentName = note.name,
+            portable = note.portable,
+            hasSavedTarget = note.uri != null,
+        )) {
+            is NoteRenameResult.Invalid -> {
+                if (showGlobalError) fail(validation.error)
+                onResult(false, validation.error)
+            }
+            is NoteRenameResult.Valid -> {
+                val name = validation.filename
+                if (note.uri == null) {
+                    change { s -> s.copy(tabs = s.tabs.map { if (it.id == id) it.copy(name = name) else it }) }
+                    onResult(true, null)
+                    return@launch
+                }
+                val oldUri = note.uri
+                if (name == note.name) {
+                    onResult(true, null)
+                    return@launch
+                }
+                try {
+                    val newUri = withContext(Dispatchers.IO) {
+                        val target = documentAccess.resolve(Uri.parse(oldUri), writing = true)
+                        val renamed = DocumentsContract.renameDocument(resolver, target, name)
+                            ?: error("This provider does not support renaming. Use Save as instead.")
+                        documentAccess.persist(renamed)
+                        renamed.toString()
+                    }
+                    clearDocumentAccessFailure(oldUri)
+                    clearDocumentAccessFailure(newUri)
+                    val updatedRelative = renamedRelative(note.relative, name)
+                    change { s ->
+                        s.copy(
+                            tabs = s.tabs.map { tab ->
+                                if (tab.id == id || (tab.uri != null && sameDocumentUri(tab.uri, oldUri))) {
+                                    tab.copy(name = name, uri = newUri, relative = renamedRelative(tab.relative, name))
+                                } else tab
+                            },
+                        )
+                    }
+                    storeRecent(renameRecentNotes(recentMutable.value, oldUri, newUri, name, updatedRelative, ::sameDocumentUri))
+                    migrateRenamedNoteMetadata(oldUri, newUri)
+                    mutable.value.folder?.let { listFolder(Uri.parse(it), mutable.value.folderRelative) }
+                    onResult(true, null)
+                } catch (cancelled: kotlinx.coroutines.CancellationException) {
+                    throw cancelled
+                } catch (error: Exception) {
+                    val msg = "Could not rename note: ${error.message}"
+                    if (showGlobalError) fail(msg)
+                    onResult(false, msg)
+                }
+            }
+        }
     }
     fun welcomeDone() { change { it.copy(welcomed = true) }; prefs.edit().putBoolean("welcomed", true).apply() }
     fun dismissMessage() { mutable.value = mutable.value.copy(message = null) }
@@ -1429,24 +1522,56 @@ class StudioViewModel(app: Application, val workspaceKey: String = "main") : And
     }
     fun setFolder(uri: Uri) = viewModelScope.launch {
         try {
-            withContext(Dispatchers.IO) { resolver.takePersistableUriPermission(uri, Intent.FLAG_GRANT_READ_URI_PERMISSION or Intent.FLAG_GRANT_WRITE_URI_PERMISSION) }
-            windowPrefs.edit().putBoolean("folderMigrated", true).putString("folder", uri.toString()).apply()
-            change { it.copy(folder = uri.toString()) }; listFolder(uri, "")
+            withContext(Dispatchers.IO) { documentAccess.persist(uri) }
+            listedRelative = ""
+            windowPrefs.edit().putBoolean("folderMigrated", true).putString("folder", uri.toString()).putString("folderRelative", "").apply()
+            change { it.copy(folder = uri.toString(), folderRelative = "") }; listFolder(uri, "")
         } catch (error: Exception) { fail("Could not open folder: ${error.message}") }
     }
     fun closeFolder() {
-        windowPrefs.edit().putBoolean("folderMigrated", true).remove("folder").apply()
-        change { it.copy(folder = null, files = emptyList()) }
+        listedRelative = ""
+        windowPrefs.edit().putBoolean("folderMigrated", true).remove("folder").remove("folderRelative").apply()
+        change { it.copy(folder = null, folderRelative = "", files = emptyList()) }
+    }
+    fun navigateFolderUp(): Boolean {
+        val folderUri = mutable.value.folder ?: return false
+        val current = normalizeFolderRelative(mutable.value.folderRelative)
+        if (current.isEmpty()) return false
+        val parent = parentFolderRelative(current)
+        listFolder(Uri.parse(folderUri), parent)
+        return true
     }
     fun listFolder(uri: Uri, relative: String) = viewModelScope.launch {
-        listedRelative=relative
+        val requestedRelative = normalizeFolderRelative(relative)
+        listedRelative = requestedRelative
+        mutable.value = mutable.value.copy(folderRelative = requestedRelative)
+        if (mutable.value.folder != null) {
+            windowPrefs.edit().putBoolean("folderMigrated", true).putString("folderRelative", requestedRelative).apply()
+        }
         try {
-            val entries = withContext(Dispatchers.IO) {
+            val (effectiveRelative, entries) = withContext(Dispatchers.IO) {
                 var folder = DocumentFile.fromTreeUri(getApplication(), Uri.parse(mutable.value.folder ?: uri.toString())) ?: error("Choose the folder again to restore access")
-                relative.split('/').filter { it.isNotEmpty() }.forEach { part -> folder = folder.findFile(part) ?: error("Folder disappeared") }
-                folder.listFiles().mapNotNull { f -> val name = f.name ?: return@mapNotNull null; if (name.startsWith('.')) return@mapNotNull null; if (f.isDirectory || name.substringAfterLast('.').lowercase() in listOf("md", "smd", "markdown", "fmd")) FileEntry(name, f.uri.toString(), f.isDirectory, (if (relative.isEmpty()) "" else "$relative/") + name) else null }.sortedWith(compareByDescending<FileEntry> { it.directory }.thenBy { it.name.lowercase() })
+                val resolvedParts = mutableListOf<String>()
+                for (part in requestedRelative.split('/').filter { it.isNotEmpty() }) {
+                    val next = folder.findFile(part)?.takeIf { it.isDirectory } ?: break
+                    folder = next
+                    resolvedParts += part
+                }
+                val actualRelative = resolvedParts.joinToString("/")
+                val items = folder.listFiles().mapNotNull { f ->
+                    val name = f.name ?: return@mapNotNull null
+                    if (name.startsWith('.')) return@mapNotNull null
+                    if (f.isDirectory || isSupportedFolderNoteFile(name)) {
+                        FileEntry(name, f.uri.toString(), f.isDirectory, (if (actualRelative.isEmpty()) "" else "$actualRelative/") + name)
+                    } else null
+                }.sortedWith(compareByDescending<FileEntry> { it.directory }.thenBy { it.name.lowercase() })
+                actualRelative to items
             }
-            mutable.value = mutable.value.copy(files = entries)
+            listedRelative = effectiveRelative
+            if (mutable.value.folder != null && effectiveRelative != requestedRelative) {
+                windowPrefs.edit().putBoolean("folderMigrated", true).putString("folderRelative", effectiveRelative).apply()
+            }
+            mutable.value = mutable.value.copy(folderRelative = effectiveRelative, files = entries)
         } catch (error: Exception) { fail("Could not list folder: ${error.message}") }
     }
     private fun noteForAsset(document: String): Note = mutable.value.tabs.firstOrNull {

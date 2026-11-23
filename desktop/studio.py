@@ -127,6 +127,70 @@ class PinnedHTTPSHandler(urllib.request.HTTPSHandler):
         pinned = public_address(request.full_url)
         return self.do_open(lambda host, **kwargs: _PinnedHTTPSConnection(host, pinned=pinned, **kwargs), request, context=client_context())
 
+KNOWN_NOTE_SUFFIXES = (".markdown", ".smd", ".fmd", ".md", ".txt")
+NON_NOTE_FORMAT_SUFFIXES = (".pdf", ".zip", ".html", ".htm", ".docx", ".json")
+_RESERVED_FILENAME_CHARS = set('/\\\x00:*?"<>|')
+
+
+def _matching_suffix(name: str, suffixes: tuple[str, ...]) -> str:
+    lower = name.casefold()
+    for suffix in suffixes:
+        if lower.endswith(suffix):
+            return name[len(name) - len(suffix):]
+    return ""
+
+
+def note_stem(name: str) -> str:
+    base = Path(name).name if ("/" in name or "\\" in name) else name
+    suffix = _matching_suffix(base, KNOWN_NOTE_SUFFIXES)
+    return base[:-len(suffix)] if suffix else base
+
+
+def resolve_note_rename(
+    requested: str,
+    current_name: str,
+    *,
+    portable: bool = False,
+    has_saved_target: bool = False,
+) -> tuple[str | None, str | None]:
+    trimmed = (requested or "").strip()
+    if not trimmed:
+        return None, "Enter a note name."
+    if any(ch in _RESERVED_FILENAME_CHARS or ord(ch) < 32 or ord(ch) == 127 for ch in trimmed):
+        return None, "Choose a filename without path separators or reserved characters."
+    if trimmed in (".", "..") or trimmed.startswith("."):
+        return None, "Note names cannot start with a dot or have an empty title."
+
+    if portable:
+        current_ext = _matching_suffix(current_name, (".fmd", ".smd")) or ".smd"
+    else:
+        matched_current = _matching_suffix(current_name, KNOWN_NOTE_SUFFIXES)
+        if matched_current:
+            current_ext = matched_current
+        elif has_saved_target:
+            current_ext = ""
+        else:
+            current_ext = ".md"
+
+    all_known_suffixes = tuple(sorted(KNOWN_NOTE_SUFFIXES + NON_NOTE_FORMAT_SUFFIXES, key=len, reverse=True))
+    typed_suffix = _matching_suffix(trimmed, all_known_suffixes)
+    if typed_suffix:
+        if typed_suffix.casefold() != current_ext.casefold():
+            return None, "Rename keeps the note format. Use Export to change formats."
+        stem = trimmed[:-len(typed_suffix)]
+        if not stem.strip() or stem in (".", "..") or stem.startswith("."):
+            return None, "Note names cannot start with a dot or have an empty title."
+        resolved = stem + typed_suffix
+    else:
+        resolved = trimmed + current_ext
+
+    if resolved.endswith(".") or resolved.endswith(" "):
+        return None, "Note names cannot end with a dot or space."
+    if len(resolved.encode("utf-8")) > 255:
+        return None, "Note name is too long."
+    return resolved, None
+
+
 def local_path(value: str) -> Path:
     url = QUrl(value)
     return Path(url.toLocalFile() if url.isLocalFile() else value).expanduser().resolve()
@@ -189,10 +253,15 @@ class Session(QObject):
         self.recent = []
         self.pinned = []
         self.workspace = {}
+        self.window_workspaces = {}
         self.startup_paths = []
         self.startup_active = ""
         self.startup_entries = []
         self.startup_active_id = ""
+        self.startup_folder = ""
+        self.startup_expanded = []
+        self.startup_windows = []
+        self._pending_startup_windows = []
         self.quitting = False
         self.locations = {}
         self.drafts = {}
@@ -222,9 +291,29 @@ class Session(QObject):
         try:
             workspace=json.loads((self.data/"startup.json").read_text(encoding="utf-8"))
             self.startup_paths=list(dict.fromkeys(p for p in workspace.get("paths",[]) if isinstance(p,str)))[:100]
-            self.startup_active=workspace.get("active","")
+            self.startup_active=workspace.get("active","") if isinstance(workspace.get("active"),str) else ""
             self.startup_entries=[entry for entry in workspace.get("tabs",[]) if isinstance(entry,dict) and isinstance(entry.get("id"),str) and isinstance(entry.get("path"),str)][:100]
-            self.startup_active_id=workspace.get("activeId","")
+            self.startup_active_id=workspace.get("activeId","") if isinstance(workspace.get("activeId"),str) else ""
+            self.startup_folder=workspace.get("folder","") if isinstance(workspace.get("folder"),str) else ""
+            self.startup_expanded=[p for p in workspace.get("expanded",[]) if isinstance(p,str)][:500] if isinstance(workspace.get("expanded"),list) else []
+            raw_windows=workspace.get("windows",[])
+            if isinstance(raw_windows,list):
+                for item in raw_windows[:20]:
+                    if not isinstance(item,dict):
+                        continue
+                    w_tabs=[entry for entry in item.get("tabs",[]) if isinstance(entry,dict) and isinstance(entry.get("id"),str) and isinstance(entry.get("path"),str)][:100]
+                    w_paths=list(dict.fromkeys(entry["path"] for entry in w_tabs if entry["path"]))[:100]
+                    w_folder=item.get("folder","") if isinstance(item.get("folder"),str) else ""
+                    w_expanded=[p for p in item.get("expanded",[]) if isinstance(p,str)][:500] if isinstance(item.get("expanded"),list) else []
+                    self.startup_windows.append({
+                        "tabs": w_tabs,
+                        "paths": w_paths,
+                        "active": item.get("active","") if isinstance(item.get("active"),str) else "",
+                        "activeId": item.get("activeId","") if isinstance(item.get("activeId"),str) else "",
+                        "folder": w_folder,
+                        "expanded": w_expanded,
+                    })
+            self._pending_startup_windows=list(self.startup_windows)
         except (OSError,ValueError,TypeError,AttributeError): pass
         try:
             locations=json.loads((self.data/"reading-positions.json").read_text(encoding="utf-8"))
@@ -241,12 +330,21 @@ class Session(QObject):
         # A crash can land after an active-tab recovery write but before the
         # small closed-tab index is refreshed. Prefer the active recovery entry.
         active_ids={entry.get("id") for entry in self.startup_entries if isinstance(entry,dict)}
+        for win_spec in self.startup_windows:
+            active_ids.update(entry.get("id") for entry in win_spec.get("tabs",[]) if isinstance(entry,dict))
         active_ids.update(tab.get("id") for tab in self.initial_recovery)
         kept=[ref for ref in self.closed_tabs if ref.get("id") not in active_ids]
         if kept != self.closed_tabs:
             self.closed_tabs=kept
             try:self.closed_note_store.save_index(kept)
             except OSError:pass
+
+    def is_quitting(self) -> bool:
+        background = getattr(self, "background", None)
+        return bool(self.quitting or (background is not None and getattr(background, "quitting", False)))
+
+    def has_pending_startup_windows(self) -> bool:
+        return bool(self.settings.get("startup", "restore") == "restore" and self._pending_startup_windows)
 
     def reader_asset_is_current(self, grant):
         return self.reader_asset_source_is_current(grant.owner_id, grant.tab_id, grant.source,
@@ -308,6 +406,7 @@ class Studio(QObject):
         self.setObjectName("studio")
         self._brand_svg = (ROOT/"public/brand-mark-fixed.svg").read_text(encoding="utf-8")
         self.pool = concurrent.futures.ThreadPoolExecutor(max_workers=3, thread_name_prefix="supermd")
+        self._search_pool = concurrent.futures.ThreadPoolExecutor(max_workers=1, thread_name_prefix="supermd-folder-search")
         self.session = session or Session(isolated)
         self.session.changed.connect(lambda:self._emit())
         self.session.locationChanged.connect(self._location_changed)
@@ -362,6 +461,13 @@ class Studio(QObject):
         self.folder = ""
         self.files: list[dict] = []
         self.expanded: set[str] = set()
+        self.folder_filter = ""
+        self._folder_searching = False
+        self._search_generation = 0
+        self._search_cancel: threading.Event | None = None
+        self.filter_timer = QTimer(self)
+        self.filter_timer.setSingleShot(True)
+        self.filter_timer.timeout.connect(self._start_subfolder_search)
         self.mode = self.settings.get("readingMode", "live")
         self.fullscreen = False
         self.reader_overlay = False
@@ -428,18 +534,33 @@ class Studio(QObject):
         self.preference_timer.timeout.connect(self._preferences)
         self.position_timer=QTimer(self);self.position_timer.setSingleShot(True);self.position_timer.timeout.connect(self._save_positions)
         self.saving = set()
-        self.tabs = [{**tab,"id":tab.get("id") or uuid.uuid4().hex} for tab in self.session.initial_recovery]
+        restore_enabled = self.settings.get("startup", "restore") == "restore"
+        if not restore_enabled:
+            self.session._pending_startup_windows.clear()
+            self.session.startup_folder = ""
+            self.session.startup_expanded = []
+            self.session.startup_paths = []
+            self.session.startup_entries = []
+        win_spec = self.session._pending_startup_windows.pop(0) if restore_enabled and self.session._pending_startup_windows else None
+        if win_spec is not None and self.session._pending_startup_windows:
+            spec_ids = {entry["id"] for entry in win_spec["tabs"]}
+            claimed = [tab for tab in self.session.initial_recovery if tab.get("id") in spec_ids]
+            self.session.initial_recovery = [tab for tab in self.session.initial_recovery if tab.get("id") not in spec_ids]
+        else:
+            claimed = list(self.session.initial_recovery)
+            self.session.initial_recovery = []
+        self.tabs = [{**tab,"id":tab.get("id") or uuid.uuid4().hex} for tab in claimed]
         for tab in self.tabs:
             tab.setdefault("saved_assets", copy.deepcopy(tab.get("assets", {})))
         self._agent_open_paths.update(str(Path(tab["path"]).resolve()) for tab in self.tabs if tab.get("path"))
-        self.session.initial_recovery = []
         self.session.drafts[self.window_id] = [dict(t) for t in self.tabs]
         if not self.tabs:
             self.tabs.append(self._note("Untitled.md") if self.settings["welcomed"] else self._note("Welcome.md", SAMPLE, saved=SAMPLE))
         elif self.settings["startup"]=="new":
             self.tabs.insert(0,self._note("Untitled.md"))
         self.active = self.tabs[0]["id"]
-        if self.settings["startup"]=="restore" and any(t["id"]==self.session.startup_active_id for t in self.tabs):self.active=self.session.startup_active_id
+        target_active_id = win_spec["activeId"] if win_spec is not None else self.session.startup_active_id
+        if restore_enabled and any(t["id"]==target_active_id for t in self.tabs):self.active=target_active_id
         self._activation_generation = 0
         self._startup_placeholder_ids = {
             tab["id"] for tab in self.tabs
@@ -447,13 +568,34 @@ class Studio(QObject):
         }
         self._restoring_paths=set()
         self._startup_order=[]
-        self._startup_entries=self.session.startup_entries
-        self.session.startup_entries=[]
-        if self.settings["startup"]=="restore" and self.session.startup_paths:
-            self._startup_order,self.session.startup_paths=self.session.startup_paths,[]
-            self._restoring_paths=set(self._startup_order)
+        if win_spec is not None:
+            self._startup_entries = list(win_spec["tabs"])
+            self._startup_active = win_spec["active"]
+            restore_paths = list(win_spec["paths"])
+            restore_folder = win_spec["folder"]
+            restore_expanded = list(win_spec["expanded"])
+            if not self.session._pending_startup_windows:
+                self.session.startup_paths = []
+                self.session.startup_entries = []
+                self.session.startup_folder = ""
+                self.session.startup_expanded = []
+        else:
+            self._startup_entries = self.session.startup_entries
+            self.session.startup_entries = []
+            self._startup_active = self.session.startup_active
+            restore_paths = list(self.session.startup_paths)
+            self.session.startup_paths = []
+            restore_folder = self.session.startup_folder
+            restore_expanded = list(self.session.startup_expanded)
+            self.session.startup_folder = ""
+            self.session.startup_expanded = []
+        if restore_enabled and restore_paths:
+            self._startup_order = restore_paths
+            self._restoring_paths = set(self._startup_order)
             restore_generation = self._activation_generation
             QTimer.singleShot(0,lambda:[self._open_note(path, explicit=False, activation_generation=restore_generation) for path in self._startup_order])
+        if restore_enabled and restore_folder:
+            self._restore_workspace_folder(restore_folder, restore_expanded)
         self._refresh_theme()
         # Only the first real desktop window may restore the user's opted-in
         # cloud connection. The cloud client handles network retry/backoff.
@@ -747,6 +889,7 @@ class Studio(QObject):
     def stop(self):
         if self.retired: return
         if self._storage_cancel_event is not None:self._storage_cancel_event.set()
+        self._cancel_subfolder_search()
         self._export_jobs.cancel_all()
         for agent_export in tuple(self._agent_exports.values()):
             try:
@@ -767,12 +910,15 @@ class Studio(QObject):
         self.autosave_timer.stop()
         self.flush_timer.stop()
         self.external_timer.stop()
+        self.filter_timer.stop()
         self._recover()
         self.session.reader_assets.revoke_owner(self.window_id)
         self._retired = True
+        self._search_pool.shutdown(wait=False, cancel_futures=True)
         self.session.windows.pop(self.window_id, None)
-        if not self.session.quitting and self.session.windows:
+        if not self.session.is_quitting() and self.session.windows:
             self.session.workspace.pop(self.window_id,None)
+            self.session.window_workspaces.pop(self.window_id,None)
             next(iter(self.session.windows.values()))._recover()
         if self.system_preferences.state() != QProcess.NotRunning:
             self.system_preferences.terminate()
@@ -781,7 +927,7 @@ class Studio(QObject):
     @Property(str, notify=changed)
     def snapshot(self):
         tab = self._current()
-        return json.dumps({"tabs": [{"id": t["id"], "name": t["name"], "path": t["path"], "dirty": t["content"] != t["saved"]} for t in self.tabs], "active": self.active, "name": tab["name"], "outline": tab.get("outline", []), "portable": tab["portable"], "folder": self.folder, "files": self.files, "recent": self.recent, "settings": self.settings, "mode": self.mode, "fullscreen": self.fullscreen, "readerOverlay": self.reader_overlay, "imageOverlay": self.image_overlay, "readerReady": self.ready, "dark": self._dark(), "zoom": self.settings["fullZoom" if self.fullscreen else "normalZoom"], "busy": self.busy > 0, "message": self.message, "colors": self._colors()})
+        return json.dumps({"tabs": [{"id": t["id"], "name": t["name"], "path": t["path"], "dirty": t["content"] != t["saved"]} for t in self.tabs], "active": self.active, "name": tab["name"], "outline": tab.get("outline", []), "portable": tab["portable"], "folder": self.folder, "folderFilter": self.folder_filter, "folderSearching": self._folder_searching, "files": self.files, "recent": self.recent, "settings": self.settings, "mode": self.mode, "fullscreen": self.fullscreen, "readerOverlay": self.reader_overlay, "imageOverlay": self.image_overlay, "readerReady": self.ready, "dark": self._dark(), "zoom": self.settings["fullZoom" if self.fullscreen else "normalZoom"], "busy": self.busy > 0, "message": self.message, "colors": self._colors()})
 
     @Property(bool, notify=changed)
     def agentAccessEnabled(self):
@@ -1700,9 +1846,38 @@ class Studio(QObject):
 
     def _recover(self):
         # Clean tabs need only paths, never another copy of their image bytes.
-        self.session.workspace[self.window_id]=[{"path":t["path"],"id":t["id"]} for t in self.tabs if t["path"] or t["content"]!=t["saved"]]
-        entries=[entry for tabs in self.session.workspace.values() for entry in tabs]
-        workspace={"paths":list(dict.fromkeys(t["path"] for t in entries if t["path"])),"tabs":entries,"active":self._current()["path"],"activeId":self.active}
+        window_tabs = [{"path":t["path"],"id":t["id"]} for t in self.tabs if t["path"] or t["content"]!=t["saved"]]
+        self.session.workspace[self.window_id] = window_tabs
+        self.session.window_workspaces[self.window_id] = {
+            "folder": self.folder,
+            "expanded": sorted(self.expanded) if self.folder else [],
+            "active": self._current()["path"],
+            "activeId": self.active,
+        }
+        entries = [entry for tabs in self.session.workspace.values() for entry in tabs]
+        windows_payload = []
+        for wid, w_tabs in self.session.workspace.items():
+            meta = self.session.window_workspaces.get(wid, {})
+            w_folder = meta.get("folder", "")
+            windows_payload.append({
+                "windowId": wid,
+                "tabs": w_tabs,
+                "active": meta.get("active", ""),
+                "activeId": meta.get("activeId", ""),
+                "folder": w_folder,
+                "expanded": meta.get("expanded", []) if w_folder else [],
+            })
+        primary_folder = windows_payload[0]["folder"] if windows_payload else self.folder
+        primary_expanded = windows_payload[0]["expanded"] if windows_payload else (sorted(self.expanded) if self.folder else [])
+        workspace = {
+            "paths": list(dict.fromkeys(t["path"] for t in entries if t["path"])),
+            "tabs": entries,
+            "active": self._current()["path"],
+            "activeId": self.active,
+            "folder": primary_folder,
+            "expanded": primary_expanded,
+            "windows": windows_payload,
+        }
         self.session.writes.submit_latest("startup",lambda:atomic_json(self.data/"startup.json",workspace),lambda error:self._notify_recovery_write("startup",error))
         # Snapshot only unsaved tabs. Asset bytes stay in recovery, never in displayed source.
         self.session.drafts[self.window_id] = [copy.deepcopy({key: value for key, value in t.items() if key != "viewState"}) for t in self.tabs if t["content"] != t["saved"] and (t["path"] or t["content"].strip() or t["assets"])]
@@ -1789,7 +1964,7 @@ class Studio(QObject):
         if found:
             self._agent_open_paths.add(str(path.resolve()))
             self._restoring_paths.discard(str(path))
-            if restoring and activation_generation == self._activation_generation and str(path) == self.session.startup_active:
+            if restoring and activation_generation == self._activation_generation and str(path) == (self._startup_active or self.session.startup_active):
                 self._select_tab_from_open(found["id"], activation_generation)
             if explicit and activation_generation == self._activation_generation:
                 self._select_tab_from_open(found["id"], activation_generation)
@@ -1823,7 +1998,8 @@ class Studio(QObject):
                 self.tabs.sort(key=lambda t:keys.index(t["path"] or t["id"]) if (t["path"] or t["id"]) in keys else -1)
             should_activate = (explicit and activation_generation == self._activation_generation)
             if restoring and activation_generation == self._activation_generation:
-                should_activate = str(path) == self.session.startup_active or not any(t["id"] == self.active for t in self.tabs)
+                target_active = self._startup_active or self.session.startup_active
+                should_activate = str(path) == target_active or not any(t["id"] == self.active for t in self.tabs)
             if should_activate:
                 self.active = note["id"]
             self.settings["welcomed"] = True
@@ -1904,6 +2080,177 @@ class Studio(QObject):
             return copy.deepcopy(reference)  # compatibility with old in-memory entries
         self._submit(read_note,finished,False,self.writes)
 
+    def _restore_workspace_folder(self, folder_path: str, expanded_paths: list[str] | None = None):
+        if not folder_path:
+            return
+        try:
+            candidate_root = Path(folder_path).expanduser()
+            if candidate_root.is_symlink():
+                return
+            root = candidate_root.resolve()
+        except OSError:
+            return
+        if not root.is_dir():
+            return
+        root_str = str(root)
+        valid_expanded = {root_str}
+        for raw in expanded_paths or []:
+            if not raw:
+                continue
+            try:
+                candidate = Path(raw).expanduser()
+                if candidate.is_symlink():
+                    continue
+                resolved = candidate.resolve()
+                if (resolved == root or root in resolved.parents) and resolved.is_dir():
+                    valid_expanded.add(str(resolved))
+            except OSError:
+                continue
+        self.folder = root_str
+        self.expanded = valid_expanded
+        self._watch_notes()
+        self._load_tree()
+
+    def _cancel_subfolder_search(self):
+        self.filter_timer.stop()
+        self._search_generation += 1
+        if self._search_cancel is not None:
+            self._search_cancel.set()
+            self._search_cancel = None
+        self._folder_searching = False
+
+    def _clear_folder_filter(self):
+        self._cancel_subfolder_search()
+        self.folder_filter = ""
+
+    @Slot(str)
+    def setFolderFilter(self, query):
+        if self.retired:
+            return
+        raw = str(query or "")
+        trimmed = raw.strip()
+        if raw == self.folder_filter and (not trimmed or self._folder_searching or self.filter_timer.isActive()):
+            return
+        self._cancel_subfolder_search()
+        self.folder_filter = raw
+        if not self.folder:
+            self.files = []
+            self._emit(False)
+            return
+        if not trimmed:
+            self._load_tree()
+            self._emit(False)
+            return
+        self._folder_searching = True
+        self._emit(False)
+        self.filter_timer.start(150)
+
+    def _start_subfolder_search(self):
+        if self.retired:
+            return
+        folder = self.folder
+        needle = self.folder_filter.strip().casefold()
+        if not folder or not needle:
+            self._folder_searching = False
+            if folder:
+                self._load_tree()
+            else:
+                self.files = []
+            self._emit(False)
+            return
+        self._search_generation += 1
+        generation = self._search_generation
+        cancel = threading.Event()
+        self._search_cancel = cancel
+        self._folder_searching = True
+
+        max_scanned = 25000
+        max_matched = 3000
+        max_depth = 32
+
+        def search():
+            scanned = 0
+            matched_total = 0
+
+            def walk_dir(dir_path: str, depth: int) -> list[dict] | None:
+                nonlocal scanned, matched_total
+                if cancel.is_set():
+                    return None
+                if depth > max_depth or scanned >= max_scanned or matched_total >= max_matched:
+                    return []
+                raw_entries = []
+                try:
+                    with os.scandir(dir_path) as it:
+                        for entry in it:
+                            if cancel.is_set():
+                                return None
+                            scanned += 1
+                            if scanned > max_scanned:
+                                break
+                            name = entry.name
+                            if name.startswith("."):
+                                continue
+                            try:
+                                if entry.is_symlink():
+                                    continue
+                                is_dir = entry.is_dir(follow_symlinks=False)
+                                is_file = False if is_dir else entry.is_file(follow_symlinks=False)
+                            except OSError:
+                                continue
+                            if is_dir or (is_file and Path(name).suffix.lower() in KNOWN_NOTE_SUFFIXES):
+                                raw_entries.append((is_dir, name, entry.path))
+                except OSError:
+                    return []
+                if cancel.is_set():
+                    return None
+                raw_entries.sort(key=lambda item: (not item[0], item[1].lower()))
+                collected: list[dict] = []
+                for is_dir, name, full_path in raw_entries:
+                    if cancel.is_set():
+                        return None
+                    if matched_total >= max_matched:
+                        break
+                    if is_dir:
+                        sub_matches = walk_dir(full_path, depth + 1)
+                        if sub_matches is None:
+                            return None
+                        if sub_matches:
+                            collected.append({
+                                "name": name,
+                                "path": full_path,
+                                "directory": True,
+                                "depth": depth,
+                                "expanded": True,
+                            })
+                            matched_total += 1
+                            remaining = max_matched - matched_total
+                            if remaining > 0:
+                                kept_sub = sub_matches[:remaining]
+                                collected.extend(kept_sub)
+                                matched_total += len(kept_sub)
+                    else:
+                        if needle in name.casefold():
+                            collected.append({
+                                "name": name,
+                                "path": full_path,
+                                "directory": False,
+                                "depth": depth,
+                                "expanded": False,
+                            })
+                            matched_total += 1
+                return collected
+
+            return walk_dir(folder, 0)
+
+        def finished(result, error):
+            if self.retired or cancel.is_set() or generation != self._search_generation or folder != self.folder:
+                return
+            self._folder_searching = False
+            if not error and result is not None:
+                self.files = result
+
+        self._submit(search, finished, False, executor=self._search_pool)
+
     @Slot(str)
     def openFolder(self, value):
         path = local_path(value)
@@ -1911,14 +2258,22 @@ class Studio(QObject):
             self.message = "Choose an existing local folder."
             self._emit(False)
             return
+        self._clear_folder_filter()
         self.folder = str(path)
         self.settings["welcomed"] = True
         self.expanded = {self.folder}
         self._preferences()
+        self._recover()
         self._emit(False)
         self._load_tree()
 
     def _load_tree(self):
+        if not self.folder:
+            self.files = []
+            return
+        if self.folder_filter.strip():
+            self._start_subfolder_search()
+            return
         folder, expanded = self.folder, set(self.expanded)
         def scan():
             entries = []
@@ -1933,27 +2288,34 @@ class Studio(QObject):
                     if child.name.startswith(".") or child.is_symlink():
                         continue
                     directory = child.is_dir()
-                    if directory or child.suffix.lower() in (".md", ".smd", ".fmd", ".markdown", ".txt"):
+                    if directory or child.suffix.lower() in KNOWN_NOTE_SUFFIXES:
                         entries.append({"name": child.name, "path": str(child), "directory": directory, "depth": depth, "expanded": str(child) in expanded})
                         if directory and str(child) in expanded:
                             visit(child, depth + 1)
             visit(folder, 0)
             return entries
         def finished(result, error):
-            if not error and folder == self.folder:
+            if not error and folder == self.folder and not self.folder_filter.strip():
                 self.files = result
         self._submit(scan, finished, False)
 
     @Slot(str)
     def toggleDirectory(self, path):
-        self.expanded.symmetric_difference_update({path})
+        if not self.folder:
+            return
+        resolved = str(local_path(path))
+        self.expanded.symmetric_difference_update({resolved})
+        self._recover()
+        self._emit(False)
         self._load_tree()
 
     @Slot()
     def closeFolder(self):
+        self._clear_folder_filter()
         self.folder = ""
         self.files = []
         self.expanded.clear()
+        self._recover()
         self._emit(False)
 
     @Slot(str)
@@ -2145,37 +2507,109 @@ class Studio(QObject):
 
     @Slot(str, str)
     def renameNote(self, id, name):
-        tab = next((t for t in self.tabs if t["id"] == id),None)
-        if not tab or id in self.saving: return
-        name = name.strip()
-        if not name or name in (".","..") or any(c in name for c in '/\\\x00'):
-            self.message = "Choose a filename without path separators."; self._emit(False); return
-        suffix = Path(tab["name"]).suffix or ".md"
-        if not Path(name).suffix: name += suffix
-        if Path(name).suffix.lower() != suffix.lower():
-            self.message = "Rename keeps the note format. Use Export to change formats."; self._emit(False); return
-        if not tab["path"]: tab["name"] = name; self._recover(); self._emit(False); return
-        before = Path(tab["path"]); after = before.with_name(name)
-        if before == after: return
+        tab = next((t for t in self.tabs if t["id"] == id), None)
+        if not tab or id in self.saving:
+            return
+        resolved, validation_error = resolve_note_rename(
+            name,
+            tab["name"],
+            portable=bool(tab.get("portable")),
+            has_saved_target=bool(tab.get("path")),
+        )
+        if validation_error:
+            self.message = validation_error
+            self._emit(False)
+            return
+        if not tab["path"]:
+            tab["name"] = resolved
+            self._recover()
+            self._emit(False)
+            return
+        before = Path(tab["path"])
+        after = before.with_name(resolved)
+        if before.name == after.name:
+            return
         def work():
-            if after.exists(): raise ValueError("A file with that name already exists.")
+            if after.exists():
+                same_target = False
+                try:
+                    same_target = before.samefile(after)
+                except OSError:
+                    same_target = False
+                if not same_target:
+                    raise ValueError("A file with that name already exists.")
             before.rename(after)
-        def finished(_,error):
-            if error: return
-            tab.update(path=str(after),name=name)
-            self.recent = [str(after) if p == str(before) else p for p in self.recent]
-            self._preferences(); self._recover(); self._emit(); self._load_tree()
-        self._submit(work,finished,executor=self.writes)
+        def finished(_, error):
+            if error:
+                return
+            old_path, new_path = str(before), str(after)
+            for window in tuple(self.session.windows.values()):
+                if window.retired:
+                    continue
+                for open_tab in window.tabs:
+                    if open_tab["path"] == old_path:
+                        open_tab.update(path=new_path, name=resolved)
+            self.session.pinned = [new_path if p == old_path else p for p in self.session.pinned]
+            self.recent = [new_path if p == old_path else p for p in self.recent]
+            location = self.session.locations.pop(old_path, None)
+            if location is not None:
+                self.session.locations[new_path] = location
+                self._save_positions()
+            for entries in self.session.workspace.values():
+                for entry in entries:
+                    if entry.get("path") == old_path:
+                        entry["path"] = new_path
+            if old_path in self._agent_open_paths:
+                self._agent_open_paths.discard(old_path)
+                self._agent_open_paths.add(str(after.resolve()))
+            if old_path in self._agent_owned_files:
+                self._agent_owned_files.discard(old_path)
+                self._agent_owned_files.add(str(after.resolve()))
+            self._watch_notes(force=True)
+            self._preferences()
+            self._recover()
+            self._emit()
+            if self.folder:
+                self._load_tree()
+        self._submit(work, finished, executor=self.writes)
 
-    @Slot(str,result=QUrl)
-    def defaultSaveLocation(self,name):
-        directory = self.settings.get("newNoteLocation") or QStandardPaths.writableLocation(QStandardPaths.DownloadLocation) or str(Path.home())
-        return QUrl.fromLocalFile(str(Path(directory)/Path(name).name))
+    def _contextual_save_directory(self) -> Path:
+        current_path = self._current().get("path") or ""
+        if current_path:
+            try:
+                parent = Path(current_path).expanduser().resolve().parent
+                if parent.is_dir():
+                    return parent
+            except OSError:
+                pass
+        if self.folder:
+            try:
+                folder_dir = Path(self.folder).expanduser().resolve()
+                if folder_dir.is_dir():
+                    return folder_dir
+            except OSError:
+                pass
+        configured = self.settings.get("newNoteLocation") or ""
+        if configured:
+            try:
+                configured_dir = Path(configured).expanduser()
+                if not configured_dir.exists() or configured_dir.is_dir():
+                    return configured_dir
+            except OSError:
+                pass
+        fallback = QStandardPaths.writableLocation(QStandardPaths.DownloadLocation) or str(Path.home())
+        return Path(fallback)
+
+    @Slot(str, result=QUrl)
+    def defaultSaveLocation(self, name):
+        directory = self._contextual_save_directory()
+        return QUrl.fromLocalFile(str(directory / Path(name).name))
 
     @Slot(str, result=QUrl)
     def defaultExportLocation(self, format):
         suffix = "zip" if format == "mdzip" else format
-        return self.defaultSaveLocation(Path(self._current()["name"]).stem + "." + suffix)
+        stem = note_stem(self._current()["name"]) or "Untitled"
+        return self.defaultSaveLocation(stem + "." + suffix)
 
     @Slot(str)
     def closeTab(self, id):

@@ -495,7 +495,7 @@ private object NoMotionScheme : MotionScheme {
     var readerPdfOwnsProgress by remember { mutableStateOf(false) }
     var menu by remember { mutableStateOf(false) }
     var findRequest by remember { mutableIntStateOf(0) }
-    var renaming by remember {mutableStateOf(false)}
+    var renaming by rememberSaveable {mutableStateOf(false)}
     var contentsShown by remember {mutableStateOf(false)}
     var sidebarSection by rememberSaveable {mutableStateOf("folder")}
     var readingChromeVisible by remember {mutableStateOf(true)}
@@ -905,7 +905,6 @@ private object NoMotionScheme : MotionScheme {
         activity.setAgentRequestHandlers(bridge, null)
         onDispose { activity.setAgentRequestHandlers(null, null) }
     }
-    var folderRelative by remember { mutableStateOf("") }
     var hinge by remember { mutableStateOf<FoldingFeature?>(null) }
     val recent by model.recent.collectAsStateWithLifecycle()
     val accessRequest by model.documentAccessRequests.collectAsStateWithLifecycle()
@@ -933,7 +932,7 @@ private object NoMotionScheme : MotionScheme {
     var noteLocation by remember {mutableStateOf(model.noteLocation())}
     val noteFolder = rememberLauncherForActivityResult(ActivityResultContracts.OpenDocumentTree()) {it?.let {uri->runCatching{model.noteLocation(uri);noteLocation=uri.toString()}.onFailure{model.fail("Could not remember this folder: ${it.message}")}}}
     val save = rememberLauncherForActivityResult(NoteDestination("text/markdown", model::noteLocation)) { it?.let { uri -> model.save(uri) } }
-    val folder = rememberLauncherForActivityResult(ActivityResultContracts.OpenDocumentTree()) { it?.let { uri -> folderRelative = ""; model.setFolder(uri) } }
+    val folder = rememberLauncherForActivityResult(ActivityResultContracts.OpenDocumentTree()) { it?.let { uri -> model.setFolder(uri) } }
     val pdf = rememberLauncherForActivityResult(NoteDestination("application/pdf", model::noteLocation)) { uri ->
         if (uri != null) { readerPdfOwnsProgress = true; model.setPdfDestination(uri); model.busy(true); web?.evaluateJavascript("window.supermdExport?.(${state.pdf})", null) ?: model.fail("The reader is not ready. Open the note again.") }
     }
@@ -950,7 +949,7 @@ private object NoMotionScheme : MotionScheme {
             val format = args.optString("format", "pdf")
             check(format in setOf("pdf", "smd", "md")) { "Unsupported export format" }
             val requestedName = args.optString("filename").takeIf { it.isNotBlank() }
-                ?: args.optString("id").takeIf { it.isNotBlank() } ?: state.active.name.substringBeforeLast('.')
+                ?: args.optString("id").takeIf { it.isNotBlank() } ?: noteStem(state.active.name).ifBlank { "Untitled" }
             activity.updateAgentExportJob(jobId, "preparing")
             model.busy(true)
             scope.launch {
@@ -987,14 +986,24 @@ private object NoMotionScheme : MotionScheme {
         }
         onDispose { activity.setAgentUiHandler(null) }
     }
-    DisposableEffect(portable, state.active.name) { model.requestPortable = { portable.launch(state.active.name.substringBeforeLast('.') + ".smd") }; onDispose { model.requestPortable = null } }
-    val saveAction: () -> Unit = { if (model.requestWriteAccessIfBlocked(state.active.id, explicit = true)) Unit else if (state.active.uri == null) save.launch(state.active.name.substringBeforeLast('.') + ".md") else if (state.active.portable) { model.busy(true); web?.evaluateJavascript("window.supermdPortable?.(true)", null) ?: model.fail("The reader is not ready") } else model.save(); Unit }
+    DisposableEffect(portable, state.active.name) { model.requestPortable = { portable.launch((noteStem(state.active.name).ifBlank { "Untitled" }) + ".smd") }; onDispose { model.requestPortable = null } }
+    val saveAction: () -> Unit = { if (model.requestWriteAccessIfBlocked(state.active.id, explicit = true)) Unit else if (state.active.uri == null) save.launch((noteStem(state.active.name).ifBlank { "Untitled" }) + ".md") else if (state.active.portable) { model.busy(true); web?.evaluateJavascript("window.supermdPortable?.(true)", null) ?: model.fail("The reader is not ready") } else model.save(); Unit }
     LaunchedEffect(state.message) { state.message?.let { snackbar.showSnackbar(it); model.dismissMessage() } }
     val immersive = (state.fullscreen || !readingChromeVisible || state.readerOverlay) && !settings
     LaunchedEffect(immersive, dark) {
         WindowCompat.getInsetsController(activity.window, activity.window.decorView).apply { isAppearanceLightStatusBars = !dark; isAppearanceLightNavigationBars = !dark; systemBarsBehavior = WindowInsetsControllerCompat.BEHAVIOR_SHOW_TRANSIENT_BARS_BY_SWIPE; if (immersive) hide(WindowInsetsCompat.Type.systemBars()) else show(WindowInsetsCompat.Type.systemBars()) }
     }
-    BackHandler(state.fullscreen || drawer.isOpen || state.readerOverlay) { if (drawer.isOpen) scope.launch { drawer.close() } else web?.evaluateJavascript("window.supermdDismiss?.() || false") {dismissed->if(dismissed!="true")model.fullscreen(false)} }
+    BackHandler(state.fullscreen || drawer.isOpen || state.readerOverlay) {
+        if (drawer.isOpen) {
+            if (sidebarSection == "folder" && state.folder != null && state.folderRelative.isNotEmpty() && model.navigateFolderUp()) {
+                Unit
+            } else {
+                scope.launch { drawer.close() }
+            }
+        } else {
+            web?.evaluateJavascript("window.supermdDismiss?.() || false") { dismissed -> if (dismissed != "true") model.fullscreen(false) }
+        }
+    }
     val palette = MaterialTheme.colorScheme
     val density = LocalDensity.current
     val tokens = remember(palette) { JSONObject().put("primary", hex(palette.primary)).put("on-primary", hex(palette.onPrimary)).put("primary-container",hex(palette.primaryContainer)).put("on-primary-container",hex(palette.onPrimaryContainer)).put("surface", hex(palette.surface)).put("surface-low", hex(palette.surfaceContainerLow)).put("surface-high", hex(palette.surfaceContainerHigh)).put("text", hex(palette.onSurface)).put("muted", hex(palette.onSurfaceVariant)).put("outline", hex(palette.outlineVariant)) }
@@ -1053,13 +1062,20 @@ private object NoMotionScheme : MotionScheme {
                     SingleChoiceSegmentedButtonRow(Modifier.fillMaxWidth().padding(bottom=12.dp)) {listOf("folder" to "Folder","contents" to "Contents").forEachIndexed {index,entry->SegmentedButton(selected=sidebarSection==entry.first,onClick={sidebarSection=entry.first},shape=SegmentedButtonDefaults.itemShape(index,2),colors=SegmentedButtonDefaults.colors(activeContainerColor=palette.primary,activeContentColor=palette.onPrimary)){Text(entry.second)}}}
                     Button(onClick = { open.launch(arrayOf("text/*", "application/octet-stream", "application/vnd.supermd.smd", "application/vnd.supermd.fmd", "application/gzip", "application/x-gzip")); scope.launch { drawer.close() } }, shapes = ButtonDefaults.shapes(), modifier = Modifier.fillMaxWidth()) { Icon(Icons.Rounded.Description, null); Spacer(Modifier.width(8.dp)); Text("Open note") }
                     FilledTonalButton(onClick = { folder.launch(state.folder?.let(android.net.Uri::parse)) }, modifier = Modifier.fillMaxWidth()) { Icon(Icons.Rounded.FolderOpen, null); Spacer(Modifier.width(8.dp)); Text("Open folder") }
-                    if (state.folder != null) TextButton(onClick = { folderRelative = ""; model.closeFolder() }) { Icon(Icons.Rounded.Close, null); Text("Close folder", Modifier.padding(start = 8.dp)) }
+                    if (state.folder != null) TextButton(onClick = { model.closeFolder() }) { Icon(Icons.Rounded.Close, null); Text("Close folder", Modifier.padding(start = 8.dp)) }
                     Text("No vault. No hidden metadata.", style = MaterialTheme.typography.bodySmall, color = palette.onSurfaceVariant, modifier = Modifier.padding(vertical = 12.dp))
-                    if (folderRelative.isNotEmpty()) TextButton(onClick = { folderRelative = ""; state.folder?.let { model.listFolder(android.net.Uri.parse(it), "") } }) { Icon(Icons.AutoMirrored.Rounded.ArrowBack, null); Text("Folder root") }
+                    if (sidebarSection == "folder" && state.folder != null && state.folderRelative.isNotEmpty()) {
+                        val parentRel = parentFolderRelative(state.folderRelative)
+                        TextButton(onClick = { model.navigateFolderUp() }) {
+                            Icon(Icons.AutoMirrored.Rounded.ArrowBack, "Navigate up")
+                            Spacer(Modifier.width(4.dp))
+                            Text(if (parentRel.isEmpty()) "Folder root" else parentRel.substringAfterLast('/'))
+                        }
+                    }
                     if(sidebarSection=="contents") OutlinePanel(headings,state.active.id,Modifier.weight(1f)){heading->readingChromeVisible=false;web?.evaluateJavascript("window.supermdHeading?.(${JSONObject.quote(heading.id)},${heading.offset})",null);scope.launch{drawer.close()}}
                     else LazyColumn(Modifier.weight(1f)) {
                         items(state.files, key={"file:${it.uri}:${it.relative}"}) { entry ->
-                            val activate = { if (entry.directory) { folderRelative = entry.relative; model.listFolder(android.net.Uri.parse(entry.uri), entry.relative) } else { activity.requestOpen(android.net.Uri.parse(entry.uri), entry.relative); scope.launch { drawer.close() } }; Unit }
+                            val activate = { if (entry.directory) { model.listFolder(android.net.Uri.parse(entry.uri), entry.relative) } else { activity.requestOpen(android.net.Uri.parse(entry.uri), entry.relative); scope.launch { drawer.close() } }; Unit }
                             ListItem(headlineContent = { Text(entry.name, maxLines = 1, overflow = TextOverflow.Ellipsis) }, leadingContent = { Icon(if (entry.directory) Icons.Rounded.Folder else Icons.Rounded.Description, null) }, modifier = Modifier.fillMaxWidth().clickable(onClick = activate), trailingContent = { Icon(if (entry.directory) Icons.Rounded.ChevronRight else Icons.AutoMirrored.Rounded.MenuBook, null) })
                         }
                     }
@@ -1083,7 +1099,7 @@ private object NoMotionScheme : MotionScheme {
                         .graphicsLayer {translationY=-size.height*(1f-chromeReveal);alpha=chromeReveal}
                         .then(if(chromeShown) Modifier else Modifier.clearAndSetSemantics {})
                         .background(palette.surfaceContainerLow).themeArtwork(state,"toolbar")) {
-                        TopAppBar(windowInsets=WindowInsets.statusBarsIgnoringVisibility.union(WindowInsets.displayCutout).only(WindowInsetsSides.Top+WindowInsetsSides.Horizontal), colors = TopAppBarDefaults.topAppBarColors(containerColor = Color.Transparent), title = { Column { Text(state.active.name, maxLines = 1, overflow = TextOverflow.Ellipsis, style = MaterialTheme.typography.titleMedium); Text(if (model.documentWriteNeedsAccess(state.active.id)) "Local draft · restore file access" else if (state.active.dirty) "Draft recovered automatically" else if (state.active.uri != null) "Saved" else "Local draft", style = MaterialTheme.typography.labelSmall, color = palette.onSurfaceVariant) } }, navigationIcon = { IconButton(onClick = { if (state.fullscreen) contentsShown=true else { scope.launch { drawer.open() }; state.folder?.let { if (state.files.isEmpty()) model.listFolder(android.net.Uri.parse(it), "") } } }) { Icon(painterResource(if(state.fullscreen) R.drawable.symbol_contents else R.drawable.symbol_sidebar), if(state.fullscreen) "Show contents" else "Open files") } }, actions = {
+                        TopAppBar(windowInsets=WindowInsets.statusBarsIgnoringVisibility.union(WindowInsets.displayCutout).only(WindowInsetsSides.Top+WindowInsetsSides.Horizontal), colors = TopAppBarDefaults.topAppBarColors(containerColor = Color.Transparent), title = { Column { Text(state.active.name, maxLines = 1, overflow = TextOverflow.Ellipsis, style = MaterialTheme.typography.titleMedium); Text(if (model.documentWriteNeedsAccess(state.active.id)) "Local draft · restore file access" else if (state.active.dirty) "Draft recovered automatically" else if (state.active.uri != null) "Saved" else "Local draft", style = MaterialTheme.typography.labelSmall, color = palette.onSurfaceVariant) } }, navigationIcon = { IconButton(onClick = { if (state.fullscreen) contentsShown=true else { scope.launch { drawer.open() }; state.folder?.let { if (state.files.isEmpty()) model.listFolder(android.net.Uri.parse(it), state.folderRelative) } } }) { Icon(painterResource(if(state.fullscreen) R.drawable.symbol_contents else R.drawable.symbol_sidebar), if(state.fullscreen) "Show contents" else "Open files") } }, actions = {
                             IconButton(onClick = saveAction) { Icon(painterResource(R.drawable.symbol_save), "Save note") }
                             IconButton(onClick = { sharing = false; exporting = true }, enabled = readerReady && !state.busy) { Icon(painterResource(R.drawable.symbol_export), "Export") }
                             StudyIcon(if(state.fullscreen) "Exit fullscreen" else "Fullscreen study", if(state.fullscreen) R.drawable.symbol_fullscreen_exit else R.drawable.symbol_fullscreen) { model.fullscreen(!state.fullscreen) }
@@ -1230,8 +1246,48 @@ private object NoMotionScheme : MotionScheme {
     }
     // Long forms must not strand their primary action below a half-open sheet.
     if (renaming) {
-        var name by remember(state.active.id) {mutableStateOf(state.active.name)}
-        AlertDialog(onDismissRequest={renaming=false},title={Text("Rename note")},text={OutlinedTextField(value=name,onValueChange={name=it},singleLine=true,label={Text("Note name")})},confirmButton={TextButton(onClick={model.rename(state.active.id,name);renaming=false},enabled=name.isNotBlank()){Text("Rename")}},dismissButton={TextButton(onClick={renaming=false}){Text("Cancel")}})
+        var name by rememberSaveable(state.active.id) { mutableStateOf(state.active.name) }
+        var renameError by rememberSaveable(state.active.id) { mutableStateOf<String?>(null) }
+        var renameSubmitting by remember { mutableStateOf(false) }
+        AlertDialog(
+            onDismissRequest = { if (!renameSubmitting) { renaming = false; renameError = null } },
+            title = { Text("Rename note") },
+            text = {
+                OutlinedTextField(
+                    value = name,
+                    onValueChange = { name = it; renameError = null },
+                    singleLine = true,
+                    isError = renameError != null,
+                    supportingText = renameError?.let { err -> { Text(err) } },
+                    label = { Text("Note name") },
+                )
+            },
+            confirmButton = {
+                TextButton(
+                    onClick = {
+                        if (!renameSubmitting) {
+                            renameSubmitting = true
+                            model.rename(state.active.id, name, showGlobalError = false) { ok, err ->
+                                renameSubmitting = false
+                                if (ok) {
+                                    renaming = false
+                                    renameError = null
+                                } else {
+                                    renameError = err
+                                }
+                            }
+                        }
+                    },
+                    enabled = !renameSubmitting,
+                ) { Text("Rename") }
+            },
+            dismissButton = {
+                TextButton(
+                    onClick = { renaming = false; renameError = null },
+                    enabled = !renameSubmitting,
+                ) { Text("Cancel") }
+            },
+        )
     }
     if (exporting) ModalBottomSheet(onDismissRequest = { exporting = false }, sheetState = rememberModalBottomSheetState(skipPartiallyExpanded = true)) { ExportSettings(state.pdf, model::pdf, sharing = sharing, fonts = state.customFonts) { format ->
         exporting = false
@@ -1243,7 +1299,7 @@ private object NoMotionScheme : MotionScheme {
                 if (format == "pdf") readerPdfOwnsProgress = true
                 when (format) { "pdf" -> web?.evaluateJavascript("window.supermdExport?.(${state.pdf})", null) ?: model.fail("The reader is not ready"); "smd" -> web?.evaluateJavascript("window.supermdPortable?.(false)", null) ?: model.fail("The reader is not ready"); "md" -> web?.evaluateJavascript("window.supermdExportMarkdown?.()", null) ?: model.fail("The reader is not ready") }
             }
-        } else if (format == "smd") portable.launch(state.active.name.substringBeforeLast('.') + ".smd") else pdf.launch(state.active.name.substringBeforeLast('.') + ".pdf")
+        } else if (format == "smd") portable.launch((noteStem(state.active.name).ifBlank { "Untitled" }) + ".smd") else pdf.launch((noteStem(state.active.name).ifBlank { "Untitled" }) + ".pdf")
     } }
     if (!accessPickerShowing) accessRequest?.let { request ->
         AlertDialog(onDismissRequest = model::dismissDocumentAccess,
