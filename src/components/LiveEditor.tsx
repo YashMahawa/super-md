@@ -1,4 +1,4 @@
-import {Fragment,useEffect,useLayoutEffect,useMemo,useRef,useState,type ClipboardEvent} from 'react';
+import {Fragment,useEffect,useLayoutEffect,useMemo,useRef,useState,type ClipboardEvent,type KeyboardEvent} from 'react';
 import MarkdownPreview from './MarkdownPreview';
 import WindowedBlock from './WindowedBlock';
 import type {RenderedMarkdownBlock} from './CachedMarkdown';
@@ -8,6 +8,7 @@ import type {WritingOptions} from '../proofreading';
 import type {ReaderAccessibilityPreference} from '../types';
 import WritingSuggestions from './WritingSuggestions';
 import {repairPastedMath} from '../mathRepair';
+import {handleLiveEditorKey} from '../liveEditorKeys';
 import {liveEditorCenterDelta,useTypewriterScroll} from '../typewriterScroll';
 const noTrustedHosts:string[]=[];
 export type {SourceBlock} from '../documentAnalysis';
@@ -27,7 +28,7 @@ export default function LiveEditor({markdown,onChange,documentPath,python,dark,t
   const [editing,setEditing]=useState<Editing|null>(null);
   const activeTypewriter=useTypewriterScroll(typewriterScroll);
   const docRef=useRef<HTMLDivElement>(null),appliedTypewriter=useRef(false),typingFrame=useRef(0);
-  const anchorTop=useRef<number|null>(null),editor=useRef<HTMLTextAreaElement>(null);
+  const anchorTop=useRef<number|null>(null),editor=useRef<HTMLTextAreaElement>(null),pendingSelection=useRef<{start:number;end:number}|null>(null);
   const open=(element:HTMLElement,start:number,end:number)=>{
     anchorTop.current=element.getBoundingClientRect().top;
     const text=markdown.slice(start,end),protectedBlock=sourceAnalysis.analysis.tree.children.some(node=>['code','math','html','definition'].includes(node.type)&&(node.position?.start.offset??-1)>=start&&(node.position?.end.offset??Infinity)<=end);
@@ -99,6 +100,10 @@ export default function LiveEditor({markdown,onChange,documentPath,python,dark,t
     frame=requestAnimationFrame(glide);
     return()=>{cancelAnimationFrame(frame);inputs.forEach(name=>window.removeEventListener(name,stop,{capture:true}));};
   },[editing?.prefix,activeTypewriter]);
+  useLayoutEffect(()=>{
+    const selection=pendingSelection.current;pendingSelection.current=null;
+    if(selection&&editor.current)editor.current.setSelectionRange(selection.start,selection.end);
+  },[editing]);
   useEffect(()=>()=>{if(typingFrame.current)cancelAnimationFrame(typingFrame.current);},[]);
   const syncActiveCaretCenter=()=>{
     if(!activeTypewriter)return;
@@ -131,7 +136,21 @@ export default function LiveEditor({markdown,onChange,documentPath,python,dark,t
     // If unavailable, leave the original paste to the platform without loss.
     try {if(document.execCommand('insertText',false,repaired))event.preventDefault();}catch{/* Preserve native paste. */}
   };
-  const textarea=()=> <div className="live-active-block"><textarea ref={editor} data-source-start={editing!.prefix.length} spellCheck={false} value={editing!.text} style={{height:Math.max(120,editing!.text.split('\n').length*27+32)}} onPaste={paste} onChange={event=>update(event.target.value)} onKeyUp={event=>{if(['ArrowUp','ArrowDown','PageUp','PageDown','Home','End'].includes(event.key))syncActiveCaretCenter();}} onKeyDown={event=>{if(event.key==='Escape'){event.preventDefault();event.stopPropagation();setEditing(null);}}} onBlur={event=>{if(!event.relatedTarget||!event.currentTarget.parentElement?.contains(event.relatedTarget))setEditing(null);}} aria-label="Edit Markdown block"/><WritingSuggestions text={editing!.text} spellCheck={spellCheck} grammarCheck={grammarCheck} onChange={update}/></div>;
+  const keyDown=(event:KeyboardEvent<HTMLTextAreaElement>)=>{
+    if(event.nativeEvent.isComposing||event.keyCode===229)return;
+    if(event.key==='Escape'){event.preventDefault();event.stopPropagation();setEditing(null);return;}
+    if(!editing)return;
+    const area=event.currentTarget,next=handleLiveEditorKey({
+      text:area.value,selectionStart:area.selectionStart,selectionEnd:area.selectionEnd,
+      key:event.key,shiftKey:event.shiftKey,ctrlKey:event.ctrlKey,metaKey:event.metaKey,altKey:event.altKey,
+      protectedBlock:editing.protectedBlock,
+    });
+    if(!next)return;
+    event.preventDefault();
+    if(next.text!==editing.text){pendingSelection.current={start:next.selectionStart,end:next.selectionEnd};update(next.text);}
+    else if(area.selectionStart!==next.selectionStart||area.selectionEnd!==next.selectionEnd)area.setSelectionRange(next.selectionStart,next.selectionEnd);
+  };
+  const textarea=()=> <div className="live-active-block"><textarea ref={editor} data-source-start={editing!.prefix.length} spellCheck={false} value={editing!.text} style={{height:Math.max(120,editing!.text.split('\n').length*27+32)}} onPaste={paste} onChange={event=>update(event.target.value)} onKeyUp={event=>{if(['ArrowUp','ArrowDown','PageUp','PageDown','Home','End'].includes(event.key))syncActiveCaretCenter();}} onKeyDown={keyDown} onBlur={event=>{if(!event.relatedTarget||!event.currentTarget.parentElement?.contains(event.relatedTarget))setEditing(null);}} aria-label="Edit Markdown block"/><WritingSuggestions text={editing!.text} spellCheck={spellCheck} grammarCheck={grammarCheck} onChange={update}/></div>;
   const currentOffset=(offset:number)=>editing&&offset>=editing.prefix.length+editing.originalText.length?offset+editing.text.length-editing.originalText.length:offset;
   const renderBlock=(entry:RenderedMarkdownBlock)=>{
     const offset=entry.node.position?.start.offset;
