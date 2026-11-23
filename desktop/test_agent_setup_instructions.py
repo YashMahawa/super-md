@@ -348,7 +348,7 @@ class AgentSetupInstructionsTests(unittest.TestCase):
                     self.assertEqual(code, 0)
                     payload = json.loads(buf.getvalue())
                     self.assertTrue(payload["ok"])
-                    self.assertEqual(Path(payload["result"]["installed"]), expected_dir)
+                    self.assertEqual(Path(payload["result"]["installed"]).resolve(), expected_dir.resolve())
                     for rel in (
                         "SKILL.md",
                         "references/study-notes.md",
@@ -370,21 +370,30 @@ class AgentSetupInstructionsTests(unittest.TestCase):
                 self.assertEqual(prefs.read_text(encoding="utf-8"), "Preferred notation: Dirac bra-ket\n")
 
     def test_persistent_local_agent_access_restores_across_sessions_with_fresh_token_and_respects_test_state(self):
+        import shutil
         import sys
-        from PySide6.QtCore import QStandardPaths, QUrl
+        from PySide6.QtCore import QEvent, QStandardPaths, QUrl
         from PySide6.QtGui import QGuiApplication
         from PySide6.QtQml import QQmlComponent, QQmlEngine
+        from PySide6.QtQuickControls2 import QQuickStyle
         from agent_live import create_qt_bridge
         from studio import Session, Studio
 
-        _app = QGuiApplication.instance() or QGuiApplication([])
+        if QGuiApplication.instance() is None:
+            QQuickStyle.setStyle("Material")
+        app = QGuiApplication.instance() or QGuiApplication([])
+
+        class QuietStudio(Studio):
+            def _refresh_theme(self):
+                self.system_dark = True
+
         with tempfile.TemporaryDirectory() as app_data_root:
             with patch.object(QStandardPaths, "writableLocation", return_value=app_data_root):
                 first = Session(isolated=False)
                 first.settings["python"] = sys.executable
                 self.assertFalse(first.settings["agentAccessEnabled"])
                 first.agent_bridge = create_qt_bridge(first, first.data)
-                studio1 = Studio(False, first)
+                studio1 = QuietStudio(True, first)
                 engine = QQmlEngine()
                 panel = None
                 try:
@@ -411,9 +420,14 @@ class AgentSetupInstructionsTests(unittest.TestCase):
                 finally:
                     if panel is not None:
                         panel.deleteLater()
+                    engine.deleteLater()
                     studio1.stop()
+                    studio1.pool.shutdown(wait=True, cancel_futures=True)
                     first.agent_bridge.stop()
                     first.writes.shutdown(wait=True)
+                    studio1.deleteLater()
+                    app.sendPostedEvents(None, QEvent.Type.DeferredDelete)
+                    app.processEvents()
                 self.assertFalse(first_discovery.exists())
 
                 isolated = Session(isolated=True)
@@ -422,12 +436,13 @@ class AgentSetupInstructionsTests(unittest.TestCase):
                     self.assertNotEqual(isolated.data, first.data)
                 finally:
                     isolated.writes.shutdown(wait=True)
+                    shutil.rmtree(isolated.data, ignore_errors=True)
 
                 second = Session(isolated=False)
                 second.settings["python"] = sys.executable
                 self.assertTrue(second.settings["agentAccessEnabled"])
                 second.agent_bridge = create_qt_bridge(second, second.data)
-                studio2 = Studio(False, second)
+                studio2 = QuietStudio(True, second)
                 try:
                     if second.settings.get("agentAccessEnabled"):
                         second.agent_bridge.start()
@@ -438,8 +453,12 @@ class AgentSetupInstructionsTests(unittest.TestCase):
                     self.assertTrue(second_discovery.is_file())
                 finally:
                     studio2.stop()
+                    studio2.pool.shutdown(wait=True, cancel_futures=True)
                     second.agent_bridge.stop()
                     second.writes.shutdown(wait=True)
+                    studio2.deleteLater()
+                    app.sendPostedEvents(None, QEvent.Type.DeferredDelete)
+                    app.processEvents()
                 self.assertFalse(second_discovery.exists())
 
 

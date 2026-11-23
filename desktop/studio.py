@@ -175,17 +175,44 @@ def _build_agent_skill_zip_bytes(root_dir: Path) -> bytes:
     return buffer.getvalue()
 
 
+_SYSTEM_PATH_ALIASES: tuple[tuple[str, str], ...] = (
+    (("/var", "/private/var"), ("/tmp", "/private/tmp"), ("/etc", "/private/etc"))
+    if sys.platform == "darwin"
+    else ()
+)
+
+
 def _validate_local_tab_asset_path(raw_path, note_path: Path, extra_roots: list[Path], *,
-                                   unavailable_message: str, outside_message: str) -> Path:
+                                   unavailable_message: str, outside_message: str,
+                                   _system_aliases: tuple[tuple[str, str], ...] | None = None) -> Path:
     if not isinstance(raw_path, str) or not 1 <= len(raw_path.strip()) <= 4096 or "\0" in raw_path:
         raise ValueError(unavailable_message)
     candidate = Path(raw_path).expanduser()
     if not candidate.is_absolute():
         candidate = note_path.parent / candidate
     absolute = Path(os.path.abspath(candidate))
-    roots = [note_path.parent, *extra_roots]
-    matched_symlink = False
-    for root in roots:
+
+    # On macOS /var and /tmp are system-provided symlinks into /private. Rewrite
+    # those known aliases before walking path components so temp-folder paths
+    # work when tab["path"] was resolved, while still rejecting symlinks inside
+    # user folders.
+    system_aliases = _SYSTEM_PATH_ALIASES if _system_aliases is None else _system_aliases
+    for raw_alias, raw_canonical in system_aliases:
+        alias = Path(raw_alias)
+        canonical = Path(raw_canonical)
+        try:
+            if (alias.is_symlink() and alias.resolve(strict=True) == canonical.resolve(strict=True)
+                    and (absolute == alias or alias in absolute.parents)):
+                absolute = canonical / absolute.relative_to(alias)
+                break
+        except (OSError, RuntimeError):
+            continue
+
+    canonical_roots: list[Path] = []
+    root_aliases: list[tuple[Path, Path]] = []
+    for root in (note_path.parent, *extra_roots):
+        if not root:
+            continue
         try:
             supplied_root = Path(os.path.abspath(Path(root).expanduser()))
             canonical_root = supplied_root.resolve(strict=True)
@@ -193,35 +220,36 @@ def _validate_local_tab_asset_path(raw_path, note_path: Path, extra_roots: list[
             continue
         if not canonical_root.is_dir():
             continue
-        base_root = None
+        if canonical_root not in canonical_roots:
+            canonical_roots.append(canonical_root)
+        if supplied_root != canonical_root:
+            pair = (supplied_root, canonical_root)
+            if pair not in root_aliases:
+                root_aliases.append(pair)
+    root_aliases.sort(key=lambda item: len(item[0].parts), reverse=True)
+
+    for supplied_root, canonical_root in root_aliases:
         if absolute == supplied_root or supplied_root in absolute.parents:
-            base_root = supplied_root
-        elif absolute == canonical_root or canonical_root in absolute.parents:
-            base_root = canonical_root
-        if base_root is None:
-            continue
-        current = base_root
-        for part in absolute.relative_to(base_root).parts:
-            current = current / part
-            if current.is_symlink():
-                matched_symlink = True
-                break
-        if matched_symlink:
-            raise ValueError(outside_message)
+            absolute = canonical_root / absolute.relative_to(supplied_root)
+            break
+
+    current = Path(absolute.anchor)
+    for part in absolute.parts[1:]:
+        current = current / part
         try:
-            resolved = absolute.resolve(strict=True)
-        except (OSError, RuntimeError) as error:
+            if current.is_symlink() or (hasattr(os.path, "isjunction") and os.path.isjunction(current)):
+                raise ValueError(outside_message)
+        except OSError as error:
             raise ValueError(unavailable_message) from error
-        if resolved.is_file() and (resolved == canonical_root or canonical_root in resolved.parents):
-            return resolved
-    if absolute.is_symlink():
-        raise ValueError(outside_message)
+
     try:
-        resolved_outside = absolute.resolve(strict=True)
+        resolved = absolute.resolve(strict=True)
     except (OSError, RuntimeError) as error:
         raise ValueError(unavailable_message) from error
-    if not resolved_outside.is_file():
+    if not resolved.is_file():
         raise ValueError(outside_message)
+    if any(resolved == canonical_root or canonical_root in resolved.parents for canonical_root in canonical_roots):
+        return resolved
     raise ValueError(outside_message)
 
 SAMPLE = """# A place to think\n\nWrite in Markdown. Read without distractions.\n\n> [!tip] Start with your notes\n> Open any note or folder. No vault, no import process.\n\n## Learn by exploring\n\n$$E = mc^2$$\n\n> [!answer]- Why does this matter?\n> Tap the heading to reveal an answer, then hide it to test yourself.\n\n```smd-chart\n{\"title\":\"A changing wave\",\"series\":[{\"name\":\"Sine\",\"expression\":\"sin(a*x)\",\"color\":\"#386a57\"},{\"name\":\"Cosine\",\"expression\":\"cos(a*x)\",\"color\":\"#bc6750\"}],\"sliders\":[{\"name\":\"a\",\"min\":0.2,\"max\":3,\"value\":1}]}\n```\n\n## Matplotlib in three dimensions\n\nRun a Python cell to generate a 3D figure, then save it in your note or PDF.\n\n```python\nimport numpy as np\nimport matplotlib.pyplot as plt\nx, y = np.meshgrid(np.linspace(-2, 2, 32), np.linspace(-2, 2, 32))\nfig = plt.figure()\nax = fig.add_subplot(111, projection=\"3d\")\nax.plot_surface(x, y, x*x + y*y, cmap=\"viridis\")\n```\n\n[Back to exploring](#learn-by-exploring)\n"""
@@ -899,6 +927,10 @@ class Studio(QObject):
         self.autosave_timer.stop()
         self.flush_timer.stop()
         self.external_timer.stop()
+        for watcher in (self.note_watcher, self.palette_watcher, self.custom_theme_watcher):
+            watched = watcher.files() + watcher.directories()
+            if watched:
+                watcher.removePaths(watched)
         self._recover()
         self.session.reader_assets.revoke_owner(self.window_id)
         self._retired = True

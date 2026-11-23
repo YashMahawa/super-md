@@ -1,6 +1,7 @@
 import importlib.util
 import json
 import os
+import shutil
 import sys
 import tempfile
 import unittest
@@ -523,7 +524,12 @@ class OfficialMCPClientTest(unittest.IsolatedAsyncioTestCase):
         session.settings["python"] = sys.executable
         bridge = create_qt_bridge(session, session.data)
         session.agent_bridge = bridge
-        studio = Studio(True, session)
+
+        class QuietStudio(Studio):
+            def _refresh_theme(self):
+                self.system_dark = True
+
+        studio = QuietStudio(True, session)
 
         def handle_native_request(raw):
             request = json.loads(raw)
@@ -569,14 +575,21 @@ class OfficialMCPClientTest(unittest.IsolatedAsyncioTestCase):
                 self.assertTrue(restored_sessions.structured_content["available"])
                 self.assertGreaterEqual(restored_sessions.structured_content["count"], 1)
         finally:
+            from PySide6.QtCore import QEvent
             studio.stop()
+            studio.pool.shutdown(wait=True, cancel_futures=True)
             bridge.stop()
             session.writes.shutdown(wait=True)
+            studio.deleteLater()
+            app.sendPostedEvents(None, QEvent.Type.DeferredDelete)
+            app.processEvents()
+            shutil.rmtree(session.data, ignore_errors=True)
 
     async def test_empty_mcp_roots_delegate_live_smd_asset_bounds_to_studio_and_reject_outside_paths(self):
         import asyncio
         import base64
         from mcp import Client
+        from PySide6.QtCore import QEvent
         from PySide6.QtGui import QGuiApplication
         from agent_live_client import MultiSessionLiveClient
         from agent_live import create_qt_bridge
@@ -585,6 +598,10 @@ class OfficialMCPClientTest(unittest.IsolatedAsyncioTestCase):
         from studio import Session, Studio
 
         app = QGuiApplication.instance() or QGuiApplication([])
+
+        class QuietStudio(Studio):
+            def _refresh_theme(self):
+                self.system_dark = True
 
         async def call_with_qt(coro):
             task = asyncio.create_task(coro)
@@ -617,7 +634,7 @@ class OfficialMCPClientTest(unittest.IsolatedAsyncioTestCase):
             session.settings["python"] = sys.executable
             bridge = create_qt_bridge(session, session.data)
             session.agent_bridge = bridge
-            studio = Studio(True, session)
+            studio = QuietStudio(True, session)
             note = studio._note(smd_path.name, markdown, str(smd_path.resolve()), markdown, {}, True)
             studio.tabs = [note]
             studio.active = note["id"]
@@ -702,8 +719,82 @@ class OfficialMCPClientTest(unittest.IsolatedAsyncioTestCase):
                 self.assertIn("rect width='8'", base64.b64decode(saved_assets["assets/diagram.svg"].split(",", 1)[1]).decode("utf-8"))
             finally:
                 studio.stop()
+                studio.pool.shutdown(wait=True, cancel_futures=True)
                 bridge.stop()
                 session.writes.shutdown(wait=True)
+                studio.deleteLater()
+                app.sendPostedEvents(None, QEvent.Type.DeferredDelete)
+                app.processEvents()
+                shutil.rmtree(session.data, ignore_errors=True)
+
+    @unittest.skipUnless(os.name == "posix", "POSIX symlinks required for system alias simulation")
+    def test_validate_local_tab_asset_path_handles_system_temp_aliases_and_rejects_symlinks(self):
+        from studio import _validate_local_tab_asset_path
+
+        with tempfile.TemporaryDirectory() as folder:
+            base = Path(folder).resolve(strict=True)
+            canonical_var = base / "private" / "var"
+            note_dir = canonical_var / "folders" / "note-folder"
+            outside_dir = canonical_var / "folders" / "outside-folder"
+            note_dir.mkdir(parents=True)
+            outside_dir.mkdir(parents=True)
+
+            alias_var = base / "var"
+            alias_var.symlink_to(canonical_var)
+
+            canonical_note = note_dir / "study.smd"
+            canonical_note.write_text("# Study\n", encoding="utf-8")
+            figure = note_dir / "figure.svg"
+            figure.write_bytes(b"<svg xmlns='http://www.w3.org/2000/svg'/>")
+            outside_svg = outside_dir / "secret.svg"
+            outside_svg.write_bytes(b"<svg xmlns='http://www.w3.org/2000/svg'/>")
+            escape_svg = note_dir / "escape.svg"
+            escape_svg.symlink_to(outside_svg)
+
+            alias_figure = alias_var / "folders" / "note-folder" / "figure.svg"
+            alias_outside = alias_var / "folders" / "outside-folder" / "secret.svg"
+            alias_escape = alias_var / "folders" / "note-folder" / "escape.svg"
+            system_aliases = ((str(alias_var), str(canonical_var)),)
+
+            resolved = _validate_local_tab_asset_path(
+                str(alias_figure),
+                canonical_note,
+                [],
+                unavailable_message="unavailable",
+                outside_message="outside",
+                _system_aliases=system_aliases,
+            )
+            self.assertEqual(resolved, figure.resolve(strict=True))
+
+            with self.assertRaisesRegex(ValueError, "outside"):
+                _validate_local_tab_asset_path(
+                    str(alias_outside),
+                    canonical_note,
+                    [],
+                    unavailable_message="unavailable",
+                    outside_message="outside",
+                    _system_aliases=system_aliases,
+                )
+
+            with self.assertRaisesRegex(ValueError, "outside"):
+                _validate_local_tab_asset_path(
+                    str(alias_escape),
+                    canonical_note,
+                    [],
+                    unavailable_message="unavailable",
+                    outside_message="outside",
+                    _system_aliases=system_aliases,
+                )
+
+            with self.assertRaisesRegex(ValueError, "unavailable"):
+                _validate_local_tab_asset_path(
+                    str(alias_var / "folders" / "note-folder" / "missing.svg"),
+                    canonical_note,
+                    [],
+                    unavailable_message="unavailable",
+                    outside_message="outside",
+                    _system_aliases=system_aliases,
+                )
 
 
 if __name__ == "__main__":
