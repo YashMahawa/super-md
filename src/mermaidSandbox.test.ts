@@ -35,6 +35,7 @@ describe("Mermaid sandbox isolation and message channel", () => {
     expect(csp).toContain("img-src data:");
     expect(csp).toContain("font-src data:");
     expect(csp).toContain("connect-src 'none'");
+    expect(csp).toContain("worker-src 'none'");
     expect(csp).toContain("frame-src 'none'");
     expect(csp).toContain("child-src 'none'");
 

@@ -232,6 +232,158 @@ class ReaderAssetTests(unittest.TestCase):
             self.assertIn("settings.localContentCanAccessFileUrls: false", qml_source)
             self.assertNotIn("settings.localContentCanAccessFileUrls: true", qml_source)
 
+    def test_production_main_qml_renders_fallback_mermaid_sandbox_and_rejects_untrusted_subframes(self):
+        import subprocess
+        import sys
+
+        desktop_dir = Path(__file__).resolve().parent
+        dist_dir = desktop_dir.parent / "dist"
+        if not (dist_dir / "qt-reader.html").is_file():
+            self.skipTest("dist/qt-reader.html is not built")
+
+        probe_code = """
+import json, os, sys, time
+from pathlib import Path
+os.environ["QT_QPA_PLATFORM"] = "offscreen"
+os.environ["QT_QUICK_BACKEND"] = "software"
+os.environ.setdefault("QTWEBENGINE_CHROMIUM_FLAGS", "--disable-gpu --disable-dev-shm-usage")
+os.environ.setdefault("QTWEBENGINE_DISABLE_SANDBOX", "1")
+from PySide6.QtCore import QFile, QIODevice, QMetaObject, QObject, QTimer, QUrl, Q_ARG, Slot
+from PySide6.QtGui import QDesktopServices
+from PySide6.QtQml import QQmlApplicationEngine
+from PySide6.QtQuickControls2 import QQuickStyle
+from PySide6.QtWebEngineCore import QWebEngineProfile
+from PySide6.QtWebEngineQuick import QtWebEngineQuick
+from PySide6.QtWidgets import QApplication
+from reader_assets import READER_SCHEME, ReaderBundleSchemeHandler, reader_bundle_url, register_reader_schemes
+from studio import ROOT, Session, Studio
+
+QQuickStyle.setStyle("Material")
+register_reader_schemes()
+QtWebEngineQuick.initialize()
+app = QApplication(["Super MD Main.qml Mermaid sandbox test"])
+opened_external = []
+
+class UrlCatcher(QObject):
+    @Slot(QUrl)
+    def handleUrl(self, url):
+        opened_external.append(url.toString())
+
+catcher = UrlCatcher()
+QDesktopServices.setUrlHandler("https", catcher, "handleUrl")
+QDesktopServices.setUrlHandler("http", catcher, "handleUrl")
+
+bundle_handler = ReaderBundleSchemeHandler(ROOT / "dist", app)
+QWebEngineProfile.defaultProfile().installUrlSchemeHandler(READER_SCHEME.encode("ascii"), bundle_handler)
+session = Session(True)
+studio = Studio(True, session)
+studio.settings["welcomed"] = True
+studio.mode = "reader"
+note = next(t for t in studio.tabs if t["id"] == studio.active)
+note["content"] = (
+    "# Qt Sandbox Check\\n\\n"
+    "```mermaid\\n"
+    "gantt\\n"
+    "  title Sandbox Schedule\\n"
+    "  dateFormat YYYY-MM-DD\\n"
+    "  Phase 1 :a1, 2026-09-01, 3d\\n"
+    "  Phase 2 :after a1, 2d\\n"
+    "```\\n"
+)
+note["saved"] = note["content"]
+
+channel = QFile(":/qtwebchannel/qwebchannel.js")
+if not channel.open(QIODevice.OpenModeFlag.ReadOnly):
+    raise RuntimeError("Qt WebChannel runtime is unavailable")
+channel_script = bytes(channel.readAll()).decode()
+
+engine = QQmlApplicationEngine()
+engine.rootContext().setContextProperty("studio", studio)
+engine.rootContext().setContextProperty("readerUrl", reader_bundle_url())
+engine.rootContext().setContextProperty("channelScript", channel_script)
+engine.rootContext().setContextProperty("brandUrl", QUrl.fromLocalFile(str(ROOT / "public" / "brand-mark-fixed.svg")))
+engine.load(QUrl.fromLocalFile(str(ROOT / "desktop" / "qml" / "Main.qml")))
+if not engine.rootObjects():
+    raise RuntimeError("Main.qml failed to load")
+window = engine.rootObjects()[0]
+studio.host_window = window
+window.show()
+
+deadline = time.monotonic() + 20.0
+probe_sent = False
+
+def poll():
+    global probe_sent
+    if studio.message.startswith("QML_SANDBOX:"):
+        payload = json.loads(studio.message.removeprefix("QML_SANDBOX:"))
+        payload["openedExternal"] = list(opened_external)
+        print("QML_SANDBOX_RESULT:" + json.dumps(payload), flush=True)
+        app.exit(0)
+        return
+    if time.monotonic() >= deadline:
+        print("QML_SANDBOX_TIMEOUT:" + json.dumps({"ready": studio.ready, "message": studio.message}), flush=True)
+        app.exit(2)
+        return
+    if studio.ready and not probe_sent:
+        script = '''(()=>{
+          const img = document.querySelector('.mermaid img');
+          const err = document.querySelector('.render-error,.image-error');
+          if (err) {
+            window.SuperMD?.post('q', 'export_failed', JSON.stringify({error: 'QML_SANDBOX:' + JSON.stringify({ok: false, error: err.textContent})}));
+            return;
+          }
+          if (!img || !img.complete || img.naturalWidth <= 0) return;
+          if (window.__probeSent) return;
+          window.__probeSent = true;
+          const svg = decodeURIComponent(img.src.split(',').slice(1).join(','));
+          const sandboxFrame = document.documentElement.querySelector('iframe[data-mermaid-sandbox]');
+          // Attempt untrusted subframe navigations; CSP + Main.qml must block without opening external browser.
+          const evil = document.createElement('iframe');
+          evil.src = 'https://evil.example/subframe';
+          document.documentElement.appendChild(evil);
+          setTimeout(() => {
+            evil.remove();
+            window.SuperMD?.post('q', 'export_failed', JSON.stringify({error: 'QML_SANDBOX:' + JSON.stringify({
+              ok: true,
+              naturalWidth: img.naturalWidth,
+              hasMermaidEngine: svg.includes('data-diagram-engine="mermaid"'),
+              sandboxAttr: sandboxFrame?.getAttribute('sandbox') ?? null,
+              inBody: sandboxFrame ? document.body.contains(sandboxFrame) : null
+            })}));
+          }, 150);
+        })()'''
+        QMetaObject.invokeMethod(window, "runDocumentScript", Q_ARG("QVariant", script))
+    QTimer.singleShot(200, poll)
+
+QTimer.singleShot(200, poll)
+code = app.exec()
+studio.stop()
+for eng in (engine,):
+    eng.deleteLater()
+studio.pool.shutdown(wait=False, cancel_futures=True)
+session.writes.shutdown(wait=True)
+QDesktopServices.unsetUrlHandler("https")
+QDesktopServices.unsetUrlHandler("http")
+sys.exit(code)
+"""
+        proc = subprocess.run(
+            [sys.executable, "-c", probe_code],
+            cwd=str(desktop_dir),
+            capture_output=True,
+            text=True,
+            timeout=35,
+        )
+        self.assertEqual(proc.returncode, 0, msg=f"stdout:\n{proc.stdout}\nstderr:\n{proc.stderr}")
+        marker = next((line for line in proc.stdout.splitlines() if line.startswith("QML_SANDBOX_RESULT:")), "")
+        self.assertTrue(marker, msg=proc.stdout)
+        result = json.loads(marker.removeprefix("QML_SANDBOX_RESULT:"))
+        self.assertTrue(result["ok"], msg=result)
+        self.assertGreater(result["naturalWidth"], 80)
+        self.assertTrue(result["hasMermaidEngine"])
+        self.assertEqual(result["sandboxAttr"], "allow-scripts")
+        self.assertIs(result["inBody"], False)
+        self.assertEqual(result["openedExternal"], [])
+
 
 if __name__ == "__main__":
     unittest.main()

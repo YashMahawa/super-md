@@ -431,14 +431,30 @@ internal fun retireAndDestroyReader(web: WebView) {
     }
 }
 
+private val MERMAID_SANDBOX_ASSET_PATH = Regex("^/assets/web/assets/mermaid-sandbox-[A-Za-z0-9_-]+\\.html$")
+
+internal fun isBundledReaderOrigin(url: Uri): Boolean =
+    url.scheme.equals("https", ignoreCase = true) &&
+        url.host.equals("appassets.androidplatform.net", ignoreCase = true) &&
+        url.port == -1 &&
+        url.userInfo == null
+
+internal fun shouldOverrideReaderNavigation(url: Uri, isForMainFrame: Boolean): Boolean {
+    if (isForMainFrame) {
+        return !(isBundledReaderOrigin(url) && url.path == "/assets/web/android-reader.html" && url.query == null)
+    }
+    if (url.toString() == "about:blank") return false
+    val path = url.path ?: return true
+    return !(isBundledReaderOrigin(url) && url.query == null && MERMAID_SANDBOX_ASSET_PATH.matches(path))
+}
+
 internal fun interceptReaderRequest(
     loader: WebViewAssetLoader,
     url: Uri,
     method: String = "GET",
 ): WebResourceResponse {
     val allowedMethod = method.equals("GET", ignoreCase = true) || method.equals("HEAD", ignoreCase = true)
-    val isAppAssetsHost = url.scheme.equals("https", ignoreCase = true) &&
-        url.host.equals("appassets.androidplatform.net", ignoreCase = true)
+    val isAppAssetsHost = isBundledReaderOrigin(url)
     val path = url.path ?: ""
     val isReaderPath = path.startsWith("/assets/") || path.startsWith("/reader-assets/")
     if (allowedMethod && isAppAssetsHost && isReaderPath) {
@@ -507,10 +523,12 @@ fun configureReader(web: WebView, model: StudioViewModel, scope: CoroutineScope,
             if (request.isForMainFrame) model.fail("The document reader could not load. Please reopen the note.")
         }
         override fun shouldOverrideUrlLoading(view: WebView, request: WebResourceRequest): Boolean {
-            // The bridge is available only in the bundled offline reader. Never
-            // navigate this WebView to a page from a note or external website.
-            if (request.url.host == "appassets.androidplatform.net" && request.url.path == "/assets/web/android-reader.html") return false
-            if (request.isForMainFrame && request.url.scheme in listOf("https", "http", "mailto")) runCatching { view.context.startActivity(Intent(Intent.ACTION_VIEW, request.url)) }
+            // The bridge is available only in the bundled offline reader. Allow only
+            // the main reader entrypoint and its opaque-origin Mermaid sandbox subframe.
+            if (!shouldOverrideReaderNavigation(request.url, request.isForMainFrame)) return false
+            if (request.isForMainFrame && request.url.scheme?.lowercase() in listOf("https", "http", "mailto")) {
+                runCatching { view.context.startActivity(Intent(Intent.ACTION_VIEW, request.url)) }
+            }
             return true
         }
     }

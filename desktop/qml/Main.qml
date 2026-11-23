@@ -573,10 +573,19 @@ ApplicationWindow {
                         }
                     }
                     onNavigationRequested: function(request) {
-                        if (window.readerRecoveryLoading && request.url.toString() === "about:blank") return
-                        if (request.url.toString().split("#")[0] !== readerUrl.toString()) {
+                        const target = request.url.toString()
+                        if (!request.isMainFrame) {
+                            if (target === "about:blank") return
+                            const readerBase = readerUrl.toString().replace(/\/[^/]*([?#].*)?$/, "")
+                            const rel = target.startsWith(readerBase) ? target.slice(readerBase.length) : ""
+                            if (/^\/assets\/mermaid-sandbox-[A-Za-z0-9_-]+\.html$/.test(rel) || rel === "/@mermaid-sandbox.html") return
                             request.reject()
-                            if (request.url.toString().startsWith("https://") || request.url.toString().startsWith("http://")) Qt.openUrlExternally(request.url)
+                            return
+                        }
+                        if (window.readerRecoveryLoading && target === "about:blank") return
+                        if (target.split("#")[0] !== readerUrl.toString()) {
+                            request.reject()
+                            if (target.startsWith("https://") || target.startsWith("http://")) Qt.openUrlExternally(request.url)
                         }
                     }
                     }

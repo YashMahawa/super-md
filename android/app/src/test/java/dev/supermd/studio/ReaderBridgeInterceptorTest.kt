@@ -3,7 +3,9 @@ package dev.supermd.studio
 import android.net.Uri
 import androidx.webkit.WebViewAssetLoader
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNotNull
+import org.junit.Assert.assertTrue
 import org.junit.Test
 import org.junit.runner.RunWith
 import org.robolectric.RobolectricTestRunner
@@ -74,5 +76,50 @@ class ReaderBridgeInterceptorTest {
         )
         assertEquals(404, missingBundled.statusCode)
         assertEquals("no-store", missingBundled.responseHeaders["Cache-Control"])
+    }
+
+    @Test
+    fun allowsMainReaderAndMermaidSandboxSubframeWhileOverridingUntrustedNavigations() {
+        assertFalse(
+            shouldOverrideReaderNavigation(
+                Uri.parse("https://appassets.androidplatform.net/assets/web/android-reader.html"),
+                isForMainFrame = true,
+            ),
+        )
+        assertFalse(
+            shouldOverrideReaderNavigation(
+                Uri.parse("https://appassets.androidplatform.net/assets/web/android-reader.html#section-1"),
+                isForMainFrame = true,
+            ),
+        )
+        assertFalse(
+            shouldOverrideReaderNavigation(
+                Uri.parse("https://appassets.androidplatform.net/assets/web/assets/mermaid-sandbox-jTIoFmLD.html"),
+                isForMainFrame = false,
+            ),
+        )
+        assertFalse(
+            shouldOverrideReaderNavigation(
+                Uri.parse("about:blank"),
+                isForMainFrame = false,
+            ),
+        )
+
+        for ((blockedUrl, mainFrame) in listOf(
+            "https://appassets.androidplatform.net/assets/web/assets/mermaid-sandbox-jTIoFmLD.html" to true,
+            "https://appassets.androidplatform.net/assets/web/android-reader.html" to false,
+            "https://appassets.androidplatform.net/assets/web/assets/mermaid-sandbox-jTIoFmLD.html?x=1" to false,
+            "https://appassets.androidplatform.net/assets/web/assets/other.html" to false,
+            "http://appassets.androidplatform.net/assets/web/assets/mermaid-sandbox-jTIoFmLD.html" to false,
+            "https://evil.example/subframe.html" to false,
+            "https://evil.example/page.html" to true,
+            "file:///etc/hosts" to false,
+            "data:text/html,<script>alert(1)</script>" to false,
+        )) {
+            assertTrue(
+                "Expected navigation override for $blockedUrl (mainFrame=$mainFrame)",
+                shouldOverrideReaderNavigation(Uri.parse(blockedUrl), isForMainFrame = mainFrame),
+            )
+        }
     }
 }

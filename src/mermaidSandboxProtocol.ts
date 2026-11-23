@@ -46,6 +46,7 @@ export function buildSandboxCsp(scriptSha256Base64: string): string {
     "img-src data:",
     "font-src data:",
     "connect-src 'none'",
+    "worker-src 'none'",
     "frame-src 'none'",
     "child-src 'none'",
     "object-src 'none'",

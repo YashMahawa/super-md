@@ -127,7 +127,7 @@ export class MermaidSandboxClient {
   private readonly renderTimeoutMs: number;
   private readonly resolveSandboxUrl: () => Promise<string>;
   private readonly attachFrameHook?: (iframe: HTMLIFrameElement, hostWindow: Window) => (() => void) | undefined;
-  private readonly loadVitestEngine: () => Promise<MermaidEngineLike>;
+  private readonly loadVitestEngine?: () => Promise<MermaidEngineLike>;
 
   constructor(options: MermaidSandboxClientOptions = {}) {
     this.hostWindow = options.hostWindow ?? window;
@@ -135,8 +135,7 @@ export class MermaidSandboxClient {
     this.renderTimeoutMs = options.renderTimeoutMs ?? DEFAULT_RENDER_TIMEOUT_MS;
     this.resolveSandboxUrl = options.resolveSandboxUrl ?? defaultResolveSandboxUrl;
     this.attachFrameHook = options.attachFrameHook;
-    this.loadVitestEngine =
-      options.loadVitestEngine ?? (async () => (await import("mermaid")).default as unknown as MermaidEngineLike);
+    this.loadVitestEngine = options.loadVitestEngine;
   }
 
   get activeIframe(): HTMLIFrameElement | null {
@@ -277,7 +276,9 @@ export class MermaidSandboxClient {
     if (this.attachFrameHook) {
       instance.disposeHook = this.attachFrameHook(iframe, this.hostWindow);
     } else if (import.meta.env.VITEST) {
-      instance.disposeHook = createVitestJsdomBridge(iframe, this.hostWindow, this.loadVitestEngine);
+      const loadEngine =
+        this.loadVitestEngine ?? (async () => (await import("mermaid")).default as unknown as MermaidEngineLike);
+      instance.disposeHook = createVitestJsdomBridge(iframe, this.hostWindow, loadEngine);
     }
 
     this.frame = instance;

@@ -21,6 +21,7 @@ function renderSandboxDocument(iifeScript: string): string {
     "img-src data:",
     "font-src data:",
     "connect-src 'none'",
+    "worker-src 'none'",
     "frame-src 'none'",
     "child-src 'none'",
     "object-src 'none'",
@@ -108,13 +109,24 @@ function mermaidSandboxPlugin(): Plugin {
   };
 }
 
-function devCspPreamblePlugin(): Plugin {
+function htmlCspPlugin(): Plugin {
+  let isServe = false;
   return {
-    name: "supermd-dev-csp-preamble",
-    apply: "serve",
+    name: "supermd-html-csp",
+    configResolved(config) {
+      isServe = config.command === "serve";
+    },
     transformIndexHtml: {
       order: "post",
-      handler(html) {
+      handler(html, ctx) {
+        if (process.env.TAURI_ENV_PLATFORM && ctx.filename.replace(/\\/g, "/").endsWith("/index.html")) {
+          // Tauri v2 injects its own authoritative CSP meta tag from tauri.conf.json
+          // (including runtime IPC script nonces and asset:/customprotocol: sources).
+          return html.replace(/\s*<meta\s+http-equiv=["']Content-Security-Policy["'][^>]*>/i, "");
+        }
+        if (!isServe) {
+          return html;
+        }
         const inlineHashes: string[] = [];
         const scriptPattern = /<script\b(?![^>]*\bsrc=)[^>]*>([\s\S]*?)<\/script>/gi;
         let match: RegExpExecArray | null;
@@ -147,7 +159,7 @@ function devCspPreamblePlugin(): Plugin {
 
 export default defineConfig(({mode}) => ({
   base: "./",
-  plugins: [react(), mermaidSandboxPlugin(), devCspPreamblePlugin()],
+  plugins: [react(), mermaidSandboxPlugin(), htmlCspPlugin()],
   // These imports are reached only through the lazy writing worker. Discover
   // them before serving a page so first use cannot trigger an optimizer reload
   // and discard the native reader's in-memory workspace.
