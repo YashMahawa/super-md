@@ -2,8 +2,13 @@ export const SANDBOX_CHANNEL = "supermd-mermaid-sandbox" as const;
 export const MAX_MERMAID_SOURCE_CHARS = 250_000;
 export const MAX_SANDBOX_SVG_CHARS = 2_000_000;
 export const MAX_SANDBOX_ERROR_CHARS = 4_096;
-export const DEFAULT_HANDSHAKE_TIMEOUT_MS = 20_000;
-export const DEFAULT_RENDER_TIMEOUT_MS = 20_000;
+export const DEFAULT_HANDSHAKE_TIMEOUT_MS = 15_000;
+export const DEFAULT_RENDER_TIMEOUT_MS = 15_000;
+
+export type SandboxPingMessage = {
+  channel: typeof SANDBOX_CHANNEL;
+  type: "ping";
+};
 
 export type SandboxReadyMessage = {
   channel: typeof SANDBOX_CHANNEL;
@@ -61,7 +66,13 @@ export function buildSandboxHtml(iifeScript: string, sha256OfEscapedScript: (esc
   const escaped = iifeScript.replace(/<\/(script)/gi, "<\\/$1");
   const digest = sha256OfEscapedScript(escaped);
   const csp = buildSandboxCsp(digest);
-  return `<!doctype html><html><head><meta charset="utf-8"><meta http-equiv="Content-Security-Policy" content="${csp}"></head><body><script>${escaped}</script></body></html>`;
+  return `<!doctype html><html><head><meta charset="utf-8"><meta http-equiv="Content-Security-Policy" content="${csp}"></head><body style="margin:0;padding:0;overflow:hidden"><script>${escaped}</script></body></html>`;
+}
+
+export function isSandboxPingMessage(value: unknown): value is SandboxPingMessage {
+  if (!value || typeof value !== "object") return false;
+  const candidate = value as Record<string, unknown>;
+  return candidate.channel === SANDBOX_CHANNEL && candidate.type === "ping";
 }
 
 export function isSandboxRenderRequest(value: unknown): value is SandboxRenderRequest {

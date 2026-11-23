@@ -459,7 +459,12 @@ internal fun interceptReaderRequest(
     val isReaderPath = path.startsWith("/assets/") || path.startsWith("/reader-assets/")
     if (allowedMethod && isAppAssetsHost && isReaderPath) {
         val loaded = loader.shouldInterceptRequest(url)
-        if (loaded != null && loaded.data != null) return loaded
+        if (loaded != null && loaded.data != null) {
+            if (loaded.mimeType?.startsWith("text/", ignoreCase = true) == true && loaded.encoding.isNullOrBlank()) {
+                loaded.encoding = "UTF-8"
+            }
+            return loaded
+        }
         if (path.startsWith("/assets/")) {
             return WebResourceResponse(
                 "text/plain",

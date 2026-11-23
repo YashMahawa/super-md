@@ -21,6 +21,7 @@ type FrameInstance = {
   iframe: HTMLIFrameElement;
   frameToken: string;
   ready: Promise<void>;
+  isReady: boolean;
   resolveReady: () => void;
   rejectReady: (error: Error) => void;
   handshakeTimer: ReturnType<typeof setTimeout>;
@@ -28,6 +29,7 @@ type FrameInstance = {
   disposeHook?: () => void;
   disposed: boolean;
   onMessage: (event: MessageEvent<unknown>) => void;
+  onLoad: () => void;
   onError: () => void;
 };
 
@@ -156,6 +158,7 @@ export class MermaidSandboxClient {
     }
     clearTimeout(target.handshakeTimer);
     this.hostWindow.removeEventListener("message", target.onMessage);
+    target.iframe.removeEventListener("load", target.onLoad);
     target.iframe.removeEventListener("error", target.onError);
     target.disposeHook?.();
     try {
@@ -194,8 +197,11 @@ export class MermaidSandboxClient {
     iframe.setAttribute("aria-hidden", "true");
     iframe.tabIndex = -1;
     iframe.dataset.mermaidSandbox = "true";
+    // Keep the 1x1 transparent frame inside the visual viewport so Chromium
+    // Blink never classifies the opaque-origin subframe as offscreen/throttled
+    // (which pauses cross-origin subframe layout/rAF on Android WebView).
     iframe.style.cssText =
-      "position:fixed;left:-100000px;top:0;width:1200px;height:800px;opacity:0;pointer-events:none;border:0";
+      "position:fixed;left:0;top:0;width:1px;height:1px;opacity:0;pointer-events:none;border:0;z-index:-2147483648;background:transparent;overflow:hidden";
 
     const frameToken = randomToken();
     let resolveReady!: () => void;
@@ -210,6 +216,7 @@ export class MermaidSandboxClient {
       iframe,
       frameToken,
       ready,
+      isReady: false,
       resolveReady,
       rejectReady,
       handshakeTimer: setTimeout(() => {
@@ -217,6 +224,14 @@ export class MermaidSandboxClient {
       }, this.handshakeTimeoutMs),
       activeRequest: null,
       disposed: false,
+      onLoad: () => {
+        if (instance.disposed || instance.isReady) return;
+        try {
+          instance.iframe.contentWindow?.postMessage({ channel: SANDBOX_CHANNEL, type: "ping" }, "*");
+        } catch {
+          // Handshake timer handles unresponsive frames.
+        }
+      },
       onError: () => {
         this.destroyFrame(instance, new Error("Mermaid sandbox frame failed to load."));
       },
@@ -233,6 +248,7 @@ export class MermaidSandboxClient {
         if (message.channel !== SANDBOX_CHANNEL) return;
 
         if (message.type === "ready") {
+          instance.isReady = true;
           clearTimeout(instance.handshakeTimer);
           instance.resolveReady();
           return;
@@ -268,6 +284,7 @@ export class MermaidSandboxClient {
     };
 
     this.hostWindow.addEventListener("message", instance.onMessage);
+    iframe.addEventListener("load", instance.onLoad);
     iframe.addEventListener("error", instance.onError);
     iframe.src = sandboxUrl;
     // Mount on document.documentElement, NEVER on document.body.

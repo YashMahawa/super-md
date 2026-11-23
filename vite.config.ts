@@ -29,7 +29,7 @@ function renderSandboxDocument(iifeScript: string): string {
     "form-action 'none'",
     "base-uri 'none'",
   ].join("; ");
-  return `<!doctype html><html><head><meta charset="utf-8"><meta http-equiv="Content-Security-Policy" content="${csp}"></head><body><script>${escaped}</script></body></html>`;
+  return `<!doctype html><html><head><meta charset="utf-8"><meta http-equiv="Content-Security-Policy" content="${csp}"></head><body style="margin:0;padding:0;overflow:hidden"><script>${escaped}</script></body></html>`;
 }
 
 function mermaidSandboxPlugin(): Plugin {
@@ -50,7 +50,8 @@ function mermaidSandboxPlugin(): Plugin {
           write: false,
           format: "iife",
           platform: "browser",
-          target: "es2022",
+          target: "es2020",
+          charset: "ascii",
           minify: true,
           alias: {
             "decode-named-character-reference": fileURLToPath(

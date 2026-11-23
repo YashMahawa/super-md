@@ -60,10 +60,19 @@ describe("Mermaid sandbox isolation and message channel", () => {
     expect(observedBodyCountDuringRender).toBe(0);
     expect(document.body.children.length).toBe(0);
 
-    const frame = document.documentElement.querySelector("iframe[data-mermaid-sandbox]");
+    const frame = document.documentElement.querySelector("iframe[data-mermaid-sandbox]") as HTMLIFrameElement | null;
     expect(frame).not.toBeNull();
     expect(frame?.getAttribute("sandbox")).toBe("allow-scripts");
     expect(frame?.getAttribute("sandbox")).not.toContain("allow-same-origin");
+    // Must stay inside the visual viewport (0,0,1x1,opacity:0) so Chromium Blink
+    // never render-throttles the opaque-origin subframe on Android WebView.
+    expect(frame?.style.position).toBe("fixed");
+    expect(frame?.style.left).toBe("0px");
+    expect(frame?.style.top).toBe("0px");
+    expect(frame?.style.width).toBe("1px");
+    expect(frame?.style.height).toBe("1px");
+    expect(frame?.style.opacity).toBe("0");
+    expect(frame?.style.pointerEvents).toBe("none");
   });
 
   it("ignores spoofed origins/sources and tears down the frame on correlation mismatch or oversized SVG", async () => {

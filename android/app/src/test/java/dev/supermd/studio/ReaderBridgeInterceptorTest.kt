@@ -76,6 +76,28 @@ class ReaderBridgeInterceptorTest {
         )
         assertEquals(404, missingBundled.statusCode)
         assertEquals("no-store", missingBundled.responseHeaders["Cache-Control"])
+
+        val fakeHtmlLoader = WebViewAssetLoader.Builder()
+            .addPathHandler("/assets/") { path ->
+                if (path == "web/android-reader.html") {
+                    android.webkit.WebResourceResponse(
+                        "text/html",
+                        null,
+                        ByteArrayInputStream("<!doctype html><html></html>".toByteArray(Charsets.UTF_8)),
+                    )
+                } else {
+                    null
+                }
+            }
+            .build()
+        val htmlResponse = interceptReaderRequest(
+            fakeHtmlLoader,
+            Uri.parse("https://appassets.androidplatform.net/assets/web/android-reader.html"),
+            "GET",
+        )
+        assertEquals("text/html", htmlResponse.mimeType)
+        assertEquals("UTF-8", htmlResponse.encoding)
+        htmlResponse.data.close()
     }
 
     @Test

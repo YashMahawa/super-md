@@ -3,6 +3,7 @@ import {
   MAX_SANDBOX_ERROR_CHARS,
   MAX_SANDBOX_SVG_CHARS,
   SANDBOX_CHANNEL,
+  isSandboxPingMessage,
   isSandboxRenderRequest,
   type SandboxReadyMessage,
   type SandboxRenderResult,
@@ -24,6 +25,11 @@ export function installMermaidSandboxWorker(
 ): () => void {
   let queue = Promise.resolve();
 
+  const sendReady = () => {
+    const ready: SandboxReadyMessage = { channel: SANDBOX_CHANNEL, type: "ready" };
+    parentTarget.postMessage(ready, "*");
+  };
+
   const reply = (payload: SandboxRenderResult) => {
     parentTarget.postMessage(payload, "*");
   };
@@ -31,6 +37,10 @@ export function installMermaidSandboxWorker(
   const onMessage = (event: MessageEvent<unknown>) => {
     if (event.source !== scopeWindow.parent && event.source !== (parentTarget as unknown)) return;
     const data = event.data;
+    if (isSandboxPingMessage(data)) {
+      sendReady();
+      return;
+    }
     if (!isSandboxRenderRequest(data)) return;
     const { frameToken, requestId, id, source, dark } = data;
     if (source.length > MAX_MERMAID_SOURCE_CHARS) {
@@ -51,10 +61,15 @@ export function installMermaidSandboxWorker(
         const body = doc.createElement("body");
         doc.documentElement.appendChild(body);
       }
+      doc.body.style.cssText = "margin:0;padding:0;overflow:hidden";
       const container = doc.createElement("div");
+      // Keep the measurement container inside the sandbox viewport without
+      // visibility:hidden so Chromium cross-origin subframe throttling never
+      // skips style/layout before Mermaid inspects getBBox() or offsetWidth.
       container.style.cssText =
-        "position:fixed;left:-100000px;top:0;width:1200px;visibility:hidden;pointer-events:none";
+        "position:fixed;left:0;top:0;width:1200px;height:800px;pointer-events:none";
       doc.body.appendChild(container);
+      void container.offsetWidth;
       try {
         const mermaid = await loadEngine();
         mermaid.initialize({
@@ -63,6 +78,8 @@ export function installMermaidSandboxWorker(
           securityLevel: "strict",
           htmlLabels: false,
           flowchart: { htmlLabels: false },
+          gantt: { useWidth: 1200 },
+          c4: { useWidth: 1200 },
           fontFamily: "Arial, sans-serif",
         });
         const rendered = await mermaid.render(id, source, container);
