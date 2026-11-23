@@ -934,6 +934,12 @@ private object NoMotionScheme : MotionScheme {
     val noteFolder = rememberLauncherForActivityResult(ActivityResultContracts.OpenDocumentTree()) {it?.let {uri->runCatching{model.noteLocation(uri);noteLocation=uri.toString()}.onFailure{model.fail("Could not remember this folder: ${it.message}")}}}
     val save = rememberLauncherForActivityResult(NoteDestination("text/markdown", model::noteLocation)) { it?.let { uri -> model.save(uri) } }
     val folder = rememberLauncherForActivityResult(ActivityResultContracts.OpenDocumentTree()) { it?.let { uri -> folderRelative = ""; model.setFolder(uri) } }
+    var workspaceFolderPickerShowing by rememberSaveable { mutableStateOf(false) }
+    val workspaceFolderPicker = rememberLauncherForActivityResult(ActivityResultContracts.OpenDocumentTree()) { uri ->
+        workspaceFolderPickerShowing = false
+        if (uri != null) { folderRelative = ""; model.grantWorkspaceFolderForLink(uri) }
+        else model.dismissWorkspaceFolderPrompt()
+    }
     val pdf = rememberLauncherForActivityResult(NoteDestination("application/pdf", model::noteLocation)) { uri ->
         if (uri != null) { readerPdfOwnsProgress = true; model.setPdfDestination(uri); model.busy(true); web?.evaluateJavascript("window.supermdExport?.(${state.pdf})", null) ?: model.fail("The reader is not ready. Open the note again.") }
     }
@@ -1005,14 +1011,19 @@ private object NoMotionScheme : MotionScheme {
         val wide = displayIsLarge && maxWidth >= 720.dp && maxHeight >= 400.dp
         val actualMode = if (!wide && state.mode == "split") "live" else state.mode
         val readerContent=remember {arrayOfNulls<String>(1)}
-        LaunchedEffect(readerReady, state.active, actualMode, dark, state.fullscreen, state.font, state.size, state.widthPercent,state.lineHeight,state.spellCheck,state.grammarCheck,state.latexAutofix,state.restorePosition,state.centerLock,state.imageAppearance,state.svgAppearance,state.imageContrast,state.fullDocumentAccessibility,state.customTheme,state.patternKind,state.patternOpacity,state.patternSize,state.patternSpacing,tokens, hinge, motion) {
+        LaunchedEffect(readerReady, state.active, state.pendingHeading, actualMode, dark, state.fullscreen, state.font, state.size, state.widthPercent,state.lineHeight,state.spellCheck,state.grammarCheck,state.latexAutofix,state.restorePosition,state.centerLock,state.imageAppearance,state.svgAppearance,state.imageContrast,state.fullDocumentAccessibility,state.customTheme,state.patternKind,state.patternOpacity,state.patternSize,state.patternSpacing,tokens, hinge, motion) {
             if (!readerReady) readerNote[0] = null
             if (readerReady) {
                 val note = state.active
+                val pendingHeading = state.pendingHeading?.takeIf { it.noteId == note.id }
                 val payload = JSONObject().put("id", note.id).put("editProtocol", 1).apply { if (readerNote[0] == note.id && (readerContent[0] === note.content || model.readerEcho[note.id] === note.content)) put("contentUnchanged", true) else put("content", note.content) }.put("path", note.uri ?: note.id).put("mode", actualMode).put("dark", dark).put("fullscreen", state.fullscreen).put("font", state.font).put("size", state.size).put("widthPercent",state.widthPercent).put("lineHeight",state.lineHeight).put("spellCheck",state.spellCheck).put("grammarCheck",state.grammarCheck).put("latexAutofix",state.latexAutofix).put("restorePosition",state.restorePosition).put("centerLock",state.centerLock).put("imageAppearance",state.imageAppearance).put("svgAppearance",state.svgAppearance).put("imageContrast",state.imageContrast).put("fullDocumentAccessibility",state.fullDocumentAccessibility).put("colors", tokens).put("zoom", state.zoom).put("motion", motion)
+                if (pendingHeading != null) {
+                    payload.put("pendingHeading", JSONObject().put("heading", pendingHeading.heading).put("token", pendingHeading.token))
+                }
                 payload.put("readingLocation",model.readingLocation(note.uri))
                 payload.put("customStyle",themeStyle(themeDocument(state.customTheme),if(state.fullscreen)state.fullscreenTheme else state.theme,dark,state.patternKind,state.patternOpacity,state.patternSize,state.patternSpacing))
                 web?.evaluateJavascript("document.documentElement.dataset.platform='android';window.supermdLoad?.($payload)", null)
+                if (pendingHeading != null) model.consumePendingHeading(pendingHeading.token)
                 readerNote[0] = note.id
                 readerContent[0] = note.content
                 val hingeGap = if (hinge != null && actualMode == "split") hinge!!.bounds.width() / density.density else 0f
@@ -1259,6 +1270,27 @@ private object NoMotionScheme : MotionScheme {
             } },
             confirmButton = { TextButton(onClick = { accessPickerShowing = true; accessPicker.launch(android.net.Uri.parse(request.uri)) }) { Text(if(request.assetSource == null) "Choose original file" else "Choose linked file") } },
             dismissButton = { TextButton(onClick = model::dismissDocumentAccess) { Text("Not now") } })
+    }
+    if (!workspaceFolderPickerShowing) state.folderAccessPrompt?.let { prompt ->
+        AlertDialog(
+            onDismissRequest = model::dismissWorkspaceFolderPrompt,
+            title = { Text("Allow folder access for note links") },
+            text = {
+                Column(verticalArrangement = Arrangement.spacedBy(12.dp)) {
+                    Text(prompt.noteName, style = MaterialTheme.typography.titleSmall)
+                    Text("Super MD needs permission for the folder containing this note to open linked notes like \"${prompt.target}\". Your current note and edits remain untouched.")
+                }
+            },
+            confirmButton = {
+                TextButton(onClick = {
+                    workspaceFolderPickerShowing = true
+                    workspaceFolderPicker.launch(prompt.initialUri)
+                }) { Text("Choose folder") }
+            },
+            dismissButton = {
+                TextButton(onClick = model::dismissWorkspaceFolderPrompt) { Text("Not now") }
+            },
+        )
     }
     state.error?.let { AlertDialog(onDismissRequest = model::dismissError, title = { Text("Couldn't finish") }, text = { Text(it, Modifier.heightIn(max = 360.dp).verticalScroll(rememberScrollState())) }, confirmButton = { TextButton(onClick = model::dismissError) { Text("OK") } }) }
     if (!state.welcomed) WelcomeSetup(state, model) { model.welcomeDone(); open.launch(arrayOf("text/*", "application/octet-stream", "application/vnd.supermd.smd", "application/vnd.supermd.fmd", "application/gzip", "application/x-gzip")) }

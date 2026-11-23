@@ -15,6 +15,7 @@ import SvgDiagram from "./SvgDiagram";
 import { remarkSvgBlocks } from "../svgBlocks";
 import { remarkObsidianMath } from "../obsidianMath";
 import { navigateHeading, remarkHeadingIds } from "../documentNavigation";
+import { classifyRenderedLink } from "../workspaceLinks";
 import { selectedMarkdown, setSelectedMarkdownDrag } from "../copySource";
 import CopyCode from "./CopyCode";
 import CodeBlockBoundary from "./CodeBlockBoundary";
@@ -212,7 +213,33 @@ function MarkdownPreview({ markdown, documentPath, python, dark, trustedImageHos
           input: ({node: _node,...props}) => <input {...props} disabled={!onChange} onChange={()=>{}} />,
           li: ({node,children,...props}) => <li {...props} className={Array.isArray(node?.properties.className)?node.properties.className.join(' '):undefined} onChange={event=>{const index=Number(node?.properties['data-task-index']);const offset=tasks[index];if(offset===undefined || !onChange || !(event.target instanceof HTMLInputElement))return;onChange(markdown.slice(0,offset)+(event.target.checked?'x':' ')+markdown.slice(offset+1));}}>{children}</li>,
           img: renderImage,
-          a: ({node:_node,href,children,...props}) => <a {...props} href={href} target={href?.startsWith("#") ? undefined : "_blank"} rel="noreferrer" onClick={event => { if (navigateHeading(event.currentTarget)) { event.preventDefault(); event.stopPropagation(); } else event.currentTarget.dataset.visited='true'; }}>{children}</a>,
+          a: ({node:_node,href,children,...props}) => {
+            const rawProps=props as Record<string,unknown>;
+            const wikilinkTarget=typeof rawProps['data-wikilink']==='string'?rawProps['data-wikilink']:undefined;
+            const wikilinkFragment=typeof rawProps['data-heading-fragment']==='string'?rawProps['data-heading-fragment']:undefined;
+            const classified=classifyRenderedLink(href,wikilinkTarget,wikilinkFragment);
+            const isExternal=classified.kind==='external';
+            return <a {...props} href={href} target={isExternal?'_blank':undefined} rel={isExternal?'noreferrer':undefined} onClick={event=>{
+              if(classified.kind==='same-note'){if(navigateHeading(event.currentTarget)){event.preventDefault();event.stopPropagation();}return;}
+              if(classified.kind==='workspace'){
+                event.preventDefault();event.stopPropagation();event.currentTarget.dataset.visited='true';
+                void (async()=>{
+                  try{await window.supermdBeforeNavigate?.();}catch{/* native host tracks edit state */}
+                  await invoke('open_workspace_link',{documentPath:documentPath||'',target:classified.target,fragment:classified.fragment,wikilink:classified.wikilink});
+                })().catch(()=>{});
+                return;
+              }
+              if(classified.kind==='external'){
+                event.currentTarget.dataset.visited='true';
+                if(typeof window!=='undefined'&&window.SuperMD){
+                  event.preventDefault();event.stopPropagation();
+                  void invoke('open_external_url',{url:classified.url}).catch(()=>{});
+                }
+                return;
+              }
+              event.preventDefault();event.stopPropagation();
+            }}>{children}</a>;
+          },
           pre: ({ node, children }) => {
             const child = Children.only(children) as React.ReactElement<{ className?: string; children?: ReactNode }>;
             const language = child.props.className?.match(/language-([\w-]+)/)?.[1];

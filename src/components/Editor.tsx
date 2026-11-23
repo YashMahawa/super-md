@@ -10,10 +10,14 @@ import {checkWriting,type WritingOptions} from "../proofreading";
 import { search, searchKeymap, highlightSelectionMatches, openSearchPanel, SearchQuery, setSearchQuery } from "@codemirror/search";
 import { oneDarkHighlightStyle } from "@codemirror/theme-one-dark";
 import type {SourceChange} from '../readerEdits';
+import {invoke} from '../nativeBridge';
+import {resolveHeadingOffset} from '../documentNavigation';
+import {findSourceLinkAtOffset} from '../workspaceLinks';
 
 interface Props extends WritingOptions {
   latexAutofix?:boolean;
   sessionId?: string;
+  documentPath?: string | null;
   value: string;
   onChange: (value: string, changes?:SourceChange[]) => void;
   dark: boolean;
@@ -78,10 +82,12 @@ export function importEditorSession(id: string, data: PortableEditorSession | un
   incomingWeights.set(id,size);let retained=[...incomingWeights.values()].reduce((n,size)=>n+size,0);
   while(incomingSessions.size>40||retained>4_000_000){const first=incomingSessions.keys().next().value!;incomingSessions.delete(first);retained-=incomingWeights.get(first)||0;incomingWeights.delete(first);}
 }
-export default function Editor({ sessionId = "default", value, onChange, dark, focusMode,spellCheck=false,grammarCheck=false,latexAutofix=false }: Props) {
+export default function Editor({ sessionId = "default", documentPath = null, value, onChange, dark, focusMode,spellCheck=false,grammarCheck=false,latexAutofix=false }: Props) {
   pasteSettings.set(sessionId,latexAutofix);
   const host = useRef<HTMLDivElement>(null);
   const view = useRef<EditorView | null>(null);
+  const documentPathRef = useRef(documentPath);
+  documentPathRef.current = documentPath;
   const changeHandler = useRef(onChange);
   changeHandler.current = onChange;
   callbacks.set(sessionId, onChange);
@@ -135,7 +141,49 @@ export default function Editor({ sessionId = "default", value, onChange, dark, f
         lineNumbers(),
         foldGutter(),
         history({ minDepth: 30 }),
-        EditorView.domEventHandlers({paste(event,editor){
+        EditorView.domEventHandlers({
+          mousedown(event, editor) {
+            if (event.button !== 0 || (!event.ctrlKey && !event.metaKey) || event.altKey || event.shiftKey) return false;
+            const pos = editor.posAtCoords({x: event.clientX, y: event.clientY});
+            if (pos === null) return false;
+            for (let node = syntaxTree(editor.state).resolveInner(pos, 0); node; node = node.parent!) {
+              if (['FencedCode', 'CodeBlock', 'InlineCode', 'HTMLBlock', 'Image'].includes(node.name)) return false;
+            }
+            const line = editor.state.doc.lineAt(pos);
+            const classified = findSourceLinkAtOffset(line.text, pos - line.from);
+            if (!classified || classified.kind === 'none') return false;
+            event.preventDefault();
+            if (classified.kind === 'same-note') {
+              const targetOffset = resolveHeadingOffset(editor.state.doc.toString(), classified.fragment);
+              if (targetOffset !== null) {
+                editor.dispatch({selection: {anchor: targetOffset}, effects: EditorView.scrollIntoView(targetOffset, {y: 'start'})});
+                editor.focus();
+              }
+              return true;
+            }
+            if (classified.kind === 'workspace') {
+              void (async () => {
+                try { await window.supermdBeforeNavigate?.(); } catch { /* native host tracks edit state */ }
+                await invoke('open_workspace_link', {
+                  documentPath: documentPathRef.current || '',
+                  target: classified.target,
+                  fragment: classified.fragment,
+                  wikilink: classified.wikilink,
+                });
+              })().catch(() => {});
+              return true;
+            }
+            if (classified.kind === 'external') {
+              if (typeof window !== 'undefined' && window.SuperMD) {
+                void invoke('open_external_url', {url: classified.url}).catch(() => {});
+              } else if (typeof window !== 'undefined') {
+                window.open(classified.url, '_blank', 'noopener,noreferrer');
+              }
+              return true;
+            }
+            return true;
+          },
+          paste(event,editor){
           if(!pasteSettings.get(sessionId)||event.defaultPrevented||event.clipboardData?.files.length)return false;
           const text=event.clipboardData?.getData('text/plain');if(!text||!/[\\$^]/.test(text))return false;
           let repaired:string|undefined;

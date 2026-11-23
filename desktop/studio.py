@@ -47,6 +47,7 @@ import file_events
 import custom_theme
 from selection_actions import ASSISTANTS, selection_target
 from shortcuts import DEFINITIONS as SHORTCUT_DEFINITIONS, capture_sequence, default_shortcuts, native_label, normalize_shortcuts, parse_sequence
+from workspace_links import WorkspaceLinkCache, WorkspaceLinkError, resolve_workspace_link
 
 ROOT = Path(sys._MEIPASS)/"resources" if getattr(sys,"frozen",False) else Path(__file__).resolve().parent.parent
 DEFAULT_PDF = {"pageSize": "a4", "margin": 14, "fontSize": 10.5, "lineHeight": 1.4, "paragraphSpacing": 0.65, "fontFamily": "Manrope", "pageNumbers": True, "themed": False}
@@ -247,6 +248,7 @@ class Session(QObject):
             self.closed_tabs=kept
             try:self.closed_note_store.save_index(kept)
             except OSError:pass
+        self.workspace_links = WorkspaceLinkCache()
 
     def reader_asset_is_current(self, grant):
         return self.reader_asset_source_is_current(grant.owner_id, grant.tab_id, grant.source,
@@ -516,7 +518,7 @@ class Studio(QObject):
             colors = self._colors()
             reading_settings={key:self.settings[key] for key in ("restorePosition","centerLock","imageAppearance","svgAppearance","imageContrast","fullDocumentAccessibility","latexAutofix")}
             reading_settings["customStyle"]=custom_theme.reader(self.session.custom_theme,self.settings["fullTheme" if self.fullscreen else "theme"],self._dark(),self.settings)
-            payload={**reading_settings,"readingLocation":self.session.locations.get(tab["path"]),"id": tab["id"], "path": tab["path"] or tab["id"], "mode": self.mode, "dark": self._dark(), "fullscreen": self.fullscreen, "font": self.settings["font"], "size": self.settings["size"], "widthPercent": self.settings["widthPercent"], "lineHeight":self.settings["lineHeight"], "spellCheck":self.settings["spellCheck"], "grammarCheck":self.settings["grammarCheck"], "zoom": self.settings["fullZoom" if self.fullscreen else "normalZoom"], "motion": self.settings["motion"], "python": self.settings["python"], "colors": colors, "viewState": tab.pop("viewState", None)}
+            payload={**reading_settings,"readingLocation":self.session.locations.get(tab["path"]),"pendingHeading":tab.pop("pendingHeading",None),"id": tab["id"], "path": tab["path"] or tab["id"], "mode": self.mode, "dark": self._dark(), "fullscreen": self.fullscreen, "font": self.settings["font"], "size": self.settings["size"], "widthPercent": self.settings["widthPercent"], "lineHeight":self.settings["lineHeight"], "spellCheck":self.settings["spellCheck"], "grammarCheck":self.settings["grammarCheck"], "zoom": self.settings["fullZoom" if self.fullscreen else "normalZoom"], "motion": self.settings["motion"], "python": self.settings["python"], "colors": colors, "viewState": tab.pop("viewState", None)}
             payload["editProtocol"]=1
             previous=self._last_reader_text
             if previous and previous[0]==tab["id"] and previous[1] is tab["content"]:payload["contentUnchanged"]=True
@@ -655,6 +657,7 @@ class Studio(QObject):
             if self.retired or error:return
             for old,new in result.items():self.session.locationChanged.emit(old,new or "")
             self._reload_changed_content(changed)
+            if self.folder:self.session.workspace_links.invalidate(self.folder)
             if self.folder and (self.folder in changed or set(self.expanded)&changed):self._load_tree()
         self._submit(lambda:file_events.reconcile(known,changed),reconciled,False)
 
@@ -1770,7 +1773,7 @@ class Studio(QObject):
         QTimer.singleShot(0, lambda: QMetaObject.invokeMethod(window, "focusReader", Qt.ConnectionType.QueuedConnection)
                           if generation == self._activation_generation and not self.retired else None)
 
-    def _open_note(self, value, *, explicit, activation_generation=None, completion_callback=None):
+    def _open_note(self, value, *, explicit, activation_generation=None, completion_callback=None, pending_heading=None):
         if self.retired:
             if completion_callback: completion_callback(None, "The document window is no longer available")
             return
@@ -1792,7 +1795,14 @@ class Studio(QObject):
             if restoring and activation_generation == self._activation_generation and str(path) == self.session.startup_active:
                 self._select_tab_from_open(found["id"], activation_generation)
             if explicit and activation_generation == self._activation_generation:
+                if pending_heading:
+                    found["pendingHeading"] = pending_heading
+                self.recent = [str(path)] + [p for p in self.recent if p != str(path)][:29]
+                self._preferences()
+                was_active = (found["id"] == self.active)
                 self._select_tab_from_open(found["id"], activation_generation)
+                if was_active and pending_heading:
+                    self._emit(True)
                 self._focus_open_target(activation_generation)
             if completion_callback: completion_callback(found, None)
             return
@@ -1807,11 +1817,20 @@ class Studio(QObject):
             existing = next((tab for tab in self.tabs if tab["path"] == str(path)), None)
             if existing:
                 if explicit and activation_generation == self._activation_generation:
+                    if pending_heading:
+                        existing["pendingHeading"] = pending_heading
+                    self.recent = [str(path)] + [p for p in self.recent if p != str(path)][:29]
+                    self._preferences()
+                    was_active = (existing["id"] == self.active)
                     self._select_tab_from_open(existing["id"], activation_generation)
+                    if was_active and pending_heading:
+                        self._emit(True)
                     self._focus_open_target(activation_generation)
                 if completion_callback: completion_callback(existing, None)
                 return
             note = self._note(path.name, content, str(path), content, assets, portable)
+            if explicit and activation_generation == self._activation_generation and pending_heading:
+                note["pendingHeading"] = pending_heading
             self._agent_open_paths.add(str(path.resolve()))
             if restoring:
                 if activation_generation == self._activation_generation:
@@ -1912,6 +1931,7 @@ class Studio(QObject):
             self._emit(False)
             return
         self.folder = str(path)
+        self.session.workspace_links.invalidate(self.folder)
         self.settings["welcomed"] = True
         self.expanded = {self.folder}
         self._preferences()
@@ -1951,6 +1971,8 @@ class Studio(QObject):
 
     @Slot()
     def closeFolder(self):
+        if self.folder:
+            self.session.workspace_links.invalidate(self.folder)
         self.folder = ""
         self.files = []
         self.expanded.clear()
@@ -2163,6 +2185,7 @@ class Studio(QObject):
         def finished(_,error):
             if error: return
             tab.update(path=str(after),name=name)
+            self.session.workspace_links.invalidate()
             self.recent = [str(after) if p == str(before) else p for p in self.recent]
             self._preferences(); self._recover(); self._emit(); self._load_tree()
         self._submit(work,finished,executor=self.writes)
@@ -3244,6 +3267,62 @@ class Studio(QObject):
                 self.autosave_timer.start(900)
                 self._emit(False)
                 self.replied.emit(id,"true",""); return
+            if command == "open_external_url":
+                url = args.get("url")
+                if not isinstance(url, str) or len(url) > 4096:
+                    raise ValueError("Invalid external URL")
+                parsed = urllib.parse.urlparse(url)
+                if parsed.scheme.lower() not in ("http", "https", "mailto"):
+                    raise ValueError("Unsupported external URL scheme")
+                QDesktopServices.openUrl(QUrl(url))
+                self.replied.emit(id, "true", "")
+                return
+            if command == "open_workspace_link":
+                raw_target = args.get("target")
+                raw_fragment = args.get("fragment", "")
+                wikilink = bool(args.get("wikilink", False))
+                doc_ref = args.get("documentPath", "")
+                if not isinstance(raw_target, str) or len(raw_target) > 4096 or not isinstance(raw_fragment, str) or len(raw_fragment) > 1024:
+                    raise ValueError("Invalid workspace link")
+                source_tab = next((item for item in self.tabs if doc_ref and doc_ref in (item["id"], item["path"])), None) or tab
+                note_path = source_tab["path"]
+                folder = self.folder
+                # Preserve unsaved edits in the current tab and durably snapshot recovery;
+                # if autosave is enabled for a saved text note, flush it immediately too.
+                self._recover()
+                if self.settings.get("autosave") and source_tab["path"] and source_tab["content"] != source_tab["saved"] and not source_tab["portable"]:
+                    self.autosave_timer.stop()
+                    self._autosave()
+                def resolve_work():
+                    return resolve_workspace_link(
+                        raw_target,
+                        wikilink=wikilink,
+                        note_path=note_path,
+                        workspace_folder=folder,
+                        cache=self.session.workspace_links,
+                    )
+                def resolve_done(resolved_path, error):
+                    if self.retired:
+                        self.replied.emit(id, "false", "")
+                        return
+                    if error:
+                        self.message = error
+                        self._emit(False)
+                        self.replied.emit(id, json.dumps({"opened": False, "message": error}), "")
+                        return
+                    fragment = raw_fragment.strip()
+                    heading_payload = {"heading": fragment, "token": uuid.uuid4().hex} if fragment else None
+                    def opened(opened_tab, open_error):
+                        if open_error or opened_tab is None:
+                            if open_error:
+                                self.message = open_error
+                                self._emit(False)
+                            self.replied.emit(id, json.dumps({"opened": False, "message": open_error or "Could not open note"}), "")
+                            return
+                        self.replied.emit(id, json.dumps({"opened": True, "id": opened_tab["id"], "path": opened_tab["path"]}), "")
+                    self._open_note(str(resolved_path), explicit=True, completion_callback=opened, pending_heading=heading_payload)
+                self._submit(resolve_work, resolve_done, False)
+                return
             if command == "resolve_reader_asset":
                 document = args.get("documentPath")
                 source = args.get("source")

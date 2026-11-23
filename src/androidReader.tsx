@@ -36,7 +36,7 @@ import {rememberWindowedScrollSource} from './windowedSearch';
 import ReadingSearch from "./components/ReadingSearch";
 import type { Point } from "./focalZoom";
 import { applyDocumentZoom,documentPoint,invalidateDocumentZoom,settleDocumentZoom,refreshDocumentExtent,enforceDocumentCenter } from "./documentZoom";
-import { documentOutline, navigateToHeading, cancelHeadingNavigation } from "./documentNavigation";
+import { documentOutline, navigateToHeading, cancelHeadingNavigation, resolveHeadingOffset } from "./documentNavigation";
 import { readerSourceAnalysis } from "./readerSourceAnalysis";
 import {OutlineWorkerClient} from './outlineWorker';
 import {recordHistory,replayHistory,historySize,validHistory,type NoteHistory} from './noteHistory';
@@ -57,9 +57,10 @@ interface ReaderState extends ReaderAccessibilityPreference { id: string; conten
 declare global { interface Window {supermdAgentRequest?:(request:Record<string,unknown>,callback?:(result:unknown,error:string)=>void)=>void;supermdAgentCompute?:(request:Record<string,unknown>,callback:(result:unknown,error:string)=>void)=>void;supermdThemeGuide?:()=>void;supermdDismiss?:()=>boolean;supermdSetZoom?:(zoom:number,requestedAt?:number)=>void;supermdHeading?:(id:string,offset?:number)=>void;supermdHistory?:(direction:"undo"|"redo")=>void;supermdNativeWheel?:(dx:number,dy:number,point:Point,held:boolean,modifier?:boolean)=>void;} }
 declare global { interface Window { supermdLoad?: (state: ReaderState) => void; supermdExport?: (options: ExportOptions) => void; supermdExportMarkdown?: (archive?: boolean) => void; supermdFind?: () => void; supermdPortable?: (save: boolean) => void; supermdZoomBy?: (factor:number,focus?:Point)=>void; supermdResetZoom?: ()=>void; supermdRepairMath?: ()=>void; supermdFlush?: (operation:Record<string,string>)=>void } }
 declare global { interface Window {supermdChromeInset?:(height:number)=>void} }
-declare global { interface Window {supermdSavePosition?:()=>void} }
+declare global { interface Window {supermdSavePosition?:()=>void;supermdBeforeNavigate?:()=>Promise<void>} }
 declare global {interface Window {supermdExportPhase?:(id:string,phase:'typesetting'|'publishing')=>void}}
-interface ReaderState { centerLock?:boolean; customStyle?:CustomStyle; restorePosition?:boolean; readingLocation?:ReadingLocation|null; imageAppearance?:MediaAppearance; svgAppearance?:MediaAppearance; imageContrast?:number }
+interface PendingHeadingNavigation { heading: string; token: string }
+interface ReaderState { centerLock?:boolean; customStyle?:CustomStyle; restorePosition?:boolean; readingLocation?:ReadingLocation|null; pendingHeading?:PendingHeadingNavigation|null; imageAppearance?:MediaAppearance; svgAppearance?:MediaAppearance; imageContrast?:number }
 /** Pure snapshot operations for native-owned inactive tabs. `content` is added
  * only by the trusted native router and is never accepted from MCP requests. */
 export async function computeAgentDocumentRequest(request:Record<string,unknown>):Promise<Record<string,unknown>> {
@@ -117,6 +118,9 @@ function Reader() {
   const documentAppearance=useMemo(()=>({dark:state?.dark??false,svgAppearance:state?.svgAppearance,ink:state?.colors.primary,text:state?.colors.text,colors:state?.colors}),[state?.dark,state?.svgAppearance,JSON.stringify(state?.colors)]);
   const trustHost = useCallback((host:string)=>setTrustedHosts(current=>current.includes(host)?current:[...current,host]),[]);
   const reference = useRef(state); reference.current = state;
+  const consumedHeadingToken = useRef<string | null>(null);
+  const suppressedRestoreToken = useRef<string | null>(null);
+  const suppressedRestoreKey = useRef<string | null>(null);
   const outlineWorker=useRef<OutlineWorkerClient|null>(null);
   const edits=useRef<ReaderEdits|null>(null);
   if(!edits.current)edits.current=new ReaderEdits((command,args)=>invoke(command,args));
@@ -194,13 +198,14 @@ function Reader() {
         if(draft===undefined&&(old?.id!==next.id||old?.content!==next.content))setEditError('');
       }
       if(old?.id===next.id)next.readingLocation=old.readingLocation;
+      if(old?.id===next.id&&!next.pendingHeading&&old.pendingHeading)next.pendingHeading=old.pendingHeading;
       if(old&&(old.id!==next.id||old.mode!==next.mode||old.fullscreen!==next.fullscreen))document.querySelectorAll('.android-reading').forEach(cancelHeadingNavigation);
       if(old&&(old.id!==next.id||old.mode!==next.mode)){const history=histories.current.get(next.id);if(history)history.last=0;}
       if(old&&old.id===next.id&&old.mode!==next.mode){
         const root=document.querySelector<HTMLElement>(".android-reading");
         modeOffset.current=old.mode==="editor"?(editorReadingOffset(old.id)??0):root?readingOffset(root):0;
       }
-      if(old&&[...new Set([...Object.keys(old),...Object.keys(next)])].every(key=>key==="zoom"&&old.fullscreen===next.fullscreen?true:key==="viewState"?!next.viewState:key==="colors"||key==="customStyle"?JSON.stringify((old as any)[key])===JSON.stringify((next as any)[key]):(old as any)[key]===(next as any)[key]))return;
+      if(old&&[...new Set([...Object.keys(old),...Object.keys(next)])].every(key=>key==="zoom"&&old.fullscreen===next.fullscreen?true:key==="viewState"?!next.viewState:key==="colors"||key==="customStyle"||key==="pendingHeading"?JSON.stringify((old as any)[key])===JSON.stringify((next as any)[key]):(old as any)[key]===(next as any)[key]))return;
       if (old && old.id !== next.id) {
         savePosition.current();
         noteViews.current.set(old.id, {top: document.querySelector<HTMLElement>(".android-reading")?.scrollTop ?? 0});
@@ -230,8 +235,10 @@ function Reader() {
         void invoke("zoom_changed",{zoom:loaded.zoom,fullscreen:true});
       }
       if(old && !sameViewport){window.clearTimeout(zoomTimer.current);cancelAnimationFrame(zoomFrame.current);zoomFrame.current=0;zoomTarget.current=null;}
+      const hasNewPendingHeading = Boolean(next.pendingHeading?.token && next.pendingHeading.token !== old?.pendingHeading?.token);
+      if (hasNewPendingHeading) modeOffset.current = null;
       const load = () => { reference.current=loaded;setState(loaded); zoomReference.current = loaded.zoom; };
-      if (old?.id === next.id && old.mode === next.mode) anchored(load); else load();
+      if (old?.id === next.id && old.mode === next.mode && !hasNewPendingHeading) anchored(load); else load();
     };
     window.supermdHistory=direction=>{
       if(document.querySelector('.theme-guide-dialog'))return;
@@ -267,7 +274,13 @@ function Reader() {
       window.clearTimeout(zoomTimer.current);const fullscreen=reference.current?.fullscreen;zoomTimer.current=window.setTimeout(()=>void invoke("zoom_changed",{zoom:target,fullscreen}),220);
     };
     window.supermdSetZoom=(value,requestedAt)=>{if(requestedAt!==undefined&&requestedAt<zoomGestureAt.current)return;window.clearTimeout(zoomTimer.current);cancelAnimationFrame(zoomFrame.current);zoomFrame.current=0;zoomTarget.current=null;const next=clampPreviewZoom(value);if(Math.abs(next-zoomReference.current)<.01)return;cancelHeadingNavigation(document.querySelector('.android-reading'));zoomReference.current=next;applyZoomStyle();settleSelection();};
-    window.supermdHeading=(id,offset)=>{markScrollInput();if(reference.current?.mode==="editor"){window.dispatchEvent(new CustomEvent("supermd-goto-offset",{detail:offset??0}));return;}const root=document.querySelector(".android-reading");if(root)navigateToHeading(root,id);};
+    window.supermdHeading=(id,offset)=>{markScrollInput();const current=reference.current;const resolvedOffset=offset??(current?resolveHeadingOffset(current.content,id)??undefined:undefined);if(current?.mode==="editor"){if(resolvedOffset!==undefined)window.dispatchEvent(new CustomEvent("supermd-goto-offset",{detail:resolvedOffset}));return;}if(current?.mode==="split"&&resolvedOffset!==undefined)window.dispatchEvent(new CustomEvent("supermd-goto-offset",{detail:resolvedOffset}));const root=document.querySelector(".android-reading");if(root)navigateToHeading(root,id);};
+    window.supermdBeforeNavigate=async()=>{
+      savePosition.current();
+      const current=reference.current;
+      if(!current)return;
+      if((current as ReaderState&{editProtocol?:number}).editProtocol===1)await edits.current!.flush(current.id);
+    };
     window.supermdResetZoom = () => { if (document.querySelector(".image-viewer")) { window.dispatchEvent(new Event("supermd-image-reset")); return; } window.supermdZoomBy?.(100/(zoomTarget.current??zoomReference.current)); };
     window.supermdRepairMath = () => setRepairing(true);
     window.supermdNativeWheel=(dx,dy,point,held,modifier=false)=>{
@@ -345,7 +358,7 @@ function Reader() {
       catch (error) { await invoke("export_failed", {error: String(error)}); }
     };
     void invoke("reader_ready");
-    return () => {nativeScroll.clear();cancelAnimationFrame(zoomFrame.current);window.clearTimeout(zoomTimer.current);delete window.supermdThemeGuide;delete window.supermdSavePosition;delete window.supermdChromeInset;delete window.supermdLoad; delete window.supermdExport; delete window.supermdExportMarkdown; delete window.supermdPortable; delete window.supermdZoomBy; delete window.supermdResetZoom; delete window.supermdRepairMath; delete window.supermdFlush; delete window.supermdSetZoom; delete window.supermdHeading; };
+    return () => {nativeScroll.clear();cancelAnimationFrame(zoomFrame.current);window.clearTimeout(zoomTimer.current);delete window.supermdThemeGuide;delete window.supermdSavePosition;delete window.supermdBeforeNavigate;delete window.supermdChromeInset;delete window.supermdLoad; delete window.supermdExport; delete window.supermdExportMarkdown; delete window.supermdPortable; delete window.supermdZoomBy; delete window.supermdResetZoom; delete window.supermdRepairMath; delete window.supermdFlush; delete window.supermdSetZoom; delete window.supermdHeading; };
   }, []);
   useEffect(()=>{
     if(!state)return;
@@ -439,6 +452,18 @@ function Reader() {
   }, [state?.id, state?.mode]);
   useLayoutEffect(() => {
     if (!state) return;
+    if (state.pendingHeading?.token && state.pendingHeading.token !== suppressedRestoreToken.current) {
+      suppressedRestoreToken.current = state.pendingHeading.token;
+      suppressedRestoreKey.current = `${state.id}:${state.mode}`;
+      noteViews.current.delete(state.id);
+      modeOffset.current = null;
+      markScrollInput();
+      const host = state.mode !== "editor" ? document.querySelector<HTMLElement>(".android-reading") : null;
+      if (host && !host.querySelector('[data-windowed-mounted="false"]')) {
+        navigateToHeading(host, state.pendingHeading.heading);
+      }
+      return;
+    }
     const startingInput=scrollInputVersion();
     const saved=state.restorePosition!==false?(state.readingLocation??loadReadingLocation(state.path===state.id?null:state.path)):undefined;
     const top = noteViews.current.get(state.id)?.top ?? (saved?.mode===state.mode&&Math.abs(saved.zoom-zoomReference.current)<1?saved.top:undefined);
@@ -460,6 +485,8 @@ function Reader() {
       window.setTimeout(()=>inputs.forEach(name=>window.removeEventListener(name,stop,{capture:true})),760);
       return()=>{stopped=true;timers.forEach(window.clearTimeout);};
     }
+    if (suppressedRestoreKey.current === `${state.id}:${state.mode}`) return;
+    suppressedRestoreKey.current = null;
     if(top===undefined&&!saved)return;
     let stopped=false;
     const stop=()=>{stopped=true;};
@@ -474,7 +501,38 @@ function Reader() {
     const frame=requestAnimationFrame(()=>{restore();requestAnimationFrame(restore);});
     const timers=[120,320,700].map(delay=>window.setTimeout(restore,delay));
     return()=>{stopped=true;cancelAnimationFrame(frame);timers.forEach(window.clearTimeout);inputs.forEach(name=>window.removeEventListener(name,stop,{capture:true}));};
-  }, [state?.id, state?.mode]);
+  }, [state?.id, state?.mode, state?.pendingHeading?.token]);
+  useEffect(() => {
+    if (!state?.pendingHeading?.token || state.pendingHeading.token === consumedHeadingToken.current) return;
+    consumedHeadingToken.current = state.pendingHeading.token;
+    const startingInput = scrollInputVersion();
+    const targetHeading = state.pendingHeading.heading;
+    const offset = resolveHeadingOffset(state.content, targetHeading);
+    let stopped = false;
+    const stop = () => { stopped = true; };
+    const inputs = ["wheel", "touchstart", "keydown", "pointerdown"] as const;
+    inputs.forEach(name => window.addEventListener(name, stop, {capture: true, passive: true}));
+    const applyEditorJump = () => {
+      if (stopped || scrollInputVersion() !== startingInput || offset === null) return;
+      window.dispatchEvent(new CustomEvent("supermd-goto-offset", {detail: offset}));
+    };
+    if (state.mode === "editor" || state.mode === "split") {
+      applyEditorJump();
+      requestAnimationFrame(() => { applyEditorJump(); requestAnimationFrame(applyEditorJump); });
+    }
+    const host = state.mode !== "editor" ? document.querySelector<HTMLElement>(".android-reading") : null;
+    if (host) navigateToHeading(host, targetHeading);
+    const timers = (state.mode === "editor" || state.mode === "split")
+      ? [120, 320].map(delay => window.setTimeout(applyEditorJump, delay))
+      : [];
+    const cleanupTimer = window.setTimeout(() => inputs.forEach(name => window.removeEventListener(name, stop, {capture: true})), 400);
+    return () => {
+      stopped = true;
+      timers.forEach(window.clearTimeout);
+      window.clearTimeout(cleanupTimer);
+      inputs.forEach(name => window.removeEventListener(name, stop, {capture: true}));
+    };
+  }, [state?.id, state?.mode, state?.pendingHeading?.token]);
   useEffect(()=>{
     if(!state||state.restorePosition===false)return;
     const path=state.path===state.id?null:state.path;if(!path)return;
@@ -706,7 +764,7 @@ function Reader() {
     <ImageViewer />
     {repairing && <MathRepairPanel content={state.content} apply={update} close={()=>setRepairing(false)} />}
     <MediaTools key={state.id} documentId={state.id} content={state.content} documentPath={state.path} onInsert={(text, point) => { const content = reference.current!.content; const from = Math.min(point?.from ?? content.length, content.length); const to = Math.max(from, Math.min(point?.to ?? from, content.length)); update(content.slice(0, from) + text + content.slice(to)); }} onNotice={(error) => { void invoke("export_failed", { error }); }} />
-    {(state.mode === "editor" || state.mode === "split") && <section className="android-source"><SourceEditor key={state.id} sessionId={state.id} value={state.content} onChange={update} dark={state.dark} focusMode={state.fullscreen} latexAutofix={state.latexAutofix} spellCheck={state.spellCheck} grammarCheck={state.grammarCheck} /></section>}
+    {(state.mode === "editor" || state.mode === "split") && <section className="android-source"><SourceEditor key={state.id} sessionId={state.id} documentPath={state.path} value={state.content} onChange={update} dark={state.dark} focusMode={state.fullscreen} latexAutofix={state.latexAutofix} spellCheck={state.spellCheck} grammarCheck={state.grammarCheck} /></section>}
     {state.mode === "live" && <section className="android-reading" data-full-document-accessibility={state.fullDocumentAccessibility ? "true" : undefined}><div className="reader-chrome-spacer" aria-hidden="true"/><div key={state.id} className="document-page-space"><div className="document-page"><LiveDocument key={state.id} latexAutofix={state.latexAutofix} spellCheck={state.spellCheck} grammarCheck={state.grammarCheck} markdown={state.content} onChange={update} documentPath={state.path} python={state.python || "embedded"} dark={false} trustedImageHosts={trustedHosts} onTrustImageHost={trustHost} fullDocumentAccessibility={state.fullDocumentAccessibility} /></div></div></section>}
     {(state.mode === "reader" || state.mode === "split") && <section className="android-reading" data-full-document-accessibility={state.fullDocumentAccessibility ? "true" : undefined}><div className="reader-chrome-spacer" aria-hidden="true"/><div key={state.id} className="document-page-space"><div className="document-page"><DocumentPreview markdown={state.content} onChange={update} documentPath={state.path} python={state.python || "embedded"} dark={false} trustedImageHosts={trustedHosts} onTrustImageHost={trustHost} fullDocumentAccessibility={state.fullDocumentAccessibility} sourceAnalysis={readerAnalysis?.source===state.content?readerAnalysis:undefined} /></div></div></section>}
   </div></DocumentAppearance.Provider>;

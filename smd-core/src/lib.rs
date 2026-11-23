@@ -103,7 +103,203 @@ pub fn normalize_callouts(input: &str) -> String {
             depth-=1;output.push_str("> ".repeat(depth).trim_end());output.push('\n');
         } else { output.push_str(&"> ".repeat(depth));output.push_str(line);output.push('\n'); }
     }
-    output
+    normalize_prose_links(&output)
+}
+
+fn encode_md_destination(value: &str) -> String {
+    let mut out = String::with_capacity(value.len());
+    for ch in value.chars() {
+        match ch {
+            ' ' => out.push_str("%20"),
+            '\t' => out.push_str("%09"),
+            '<' => out.push_str("%3C"),
+            '>' => out.push_str("%3E"),
+            '(' => out.push_str("%28"),
+            ')' => out.push_str("%29"),
+            _ => out.push(ch),
+        }
+    }
+    out
+}
+
+fn escape_md_link_label(label: &str) -> String {
+    let mut out = String::with_capacity(label.len());
+    for ch in label.chars() {
+        if matches!(ch, '[' | ']') { out.push('\\'); }
+        out.push(ch);
+    }
+    out
+}
+
+fn has_supported_note_extension(path: &str) -> bool {
+    let clean = path.split(['?', '#']).next().unwrap_or("").trim().to_ascii_lowercase();
+    [".md", ".smd", ".fmd", ".markdown", ".txt"].iter().any(|ext| clean.ends_with(ext))
+}
+
+fn format_wikilink_markdown(inner: &str) -> Option<String> {
+    if inner.is_empty() || inner.contains(['\r', '\n']) { return None; }
+    let (raw_left, raw_alias) = match inner.split_once('|') {
+        Some((left, alias)) => (left, Some(alias)),
+        None => (inner, None),
+    };
+    let cleaned_left = if raw_alias.is_some() && raw_left.ends_with('\\') { &raw_left[..raw_left.len() - 1] } else { raw_left };
+    let trimmed_left = cleaned_left.trim();
+    if trimmed_left.is_empty() { return None; }
+    if let Some(rest) = trimmed_left.strip_prefix('#') {
+        let fragment = rest.trim();
+        if fragment.is_empty() { return None; }
+        let label = raw_alias.map(str::trim).filter(|s| !s.is_empty()).unwrap_or(fragment);
+        return Some(format!("[{}](#{})", escape_md_link_label(label), heading_slug(fragment)));
+    }
+    let (target, fragment) = match trimmed_left.split_once('#') {
+        Some((t, f)) => (t.trim(), f.trim()),
+        None => (trimmed_left, ""),
+    };
+    if target.is_empty() { return None; }
+    let label = raw_alias.map(str::trim).filter(|s| !s.is_empty()).unwrap_or(trimmed_left);
+    let dest_path = if has_supported_note_extension(target) { target.to_string() } else { format!("{target}.md") };
+    let dest_frag = if fragment.is_empty() { String::new() } else { format!("#{}", encode_md_destination(fragment)) };
+    Some(format!("[{}]({}{})", escape_md_link_label(label), encode_md_destination(&dest_path), dest_frag))
+}
+
+fn is_likely_link_destination(dest: &str) -> bool {
+    let trimmed = dest.trim();
+    if trimmed.is_empty() || !trimmed.contains([' ', '\t']) { return false; }
+    let lower = trimmed.to_ascii_lowercase();
+    if lower.starts_with('#') || lower.starts_with("./") || lower.starts_with("../") || lower.starts_with('/') || lower.starts_with("http://") || lower.starts_with("https://") || lower.starts_with("mailto:") {
+        return true;
+    }
+    let clean = lower.split(['?', '#']).next().unwrap_or("").trim();
+    [".md", ".smd", ".fmd", ".markdown", ".txt", ".pdf"].iter().any(|ext| clean.ends_with(ext))
+}
+
+fn rewrite_prose_segment(segment: &str) -> String {
+    let mut after_wiki = String::with_capacity(segment.len());
+    let bytes = segment.as_bytes();
+    let mut i = 0usize;
+    while i < bytes.len() {
+        if i + 1 < bytes.len() && bytes[i] == b'[' && bytes[i + 1] == b'[' && (i == 0 || !matches!(bytes[i - 1], b'!' | b'\\')) {
+            let start = i + 2;
+            let mut end = start;
+            let mut found = None;
+            while end < bytes.len() && !matches!(bytes[end], b'\r' | b'\n' | b'[') {
+                if bytes[end] == b']' {
+                    if end + 1 < bytes.len() && bytes[end + 1] == b']' && end > start {
+                        found = Some(end);
+                    }
+                    break;
+                }
+                end += 1;
+            }
+            if let Some(close_idx) = found {
+                if let Some(formatted) = format_wikilink_markdown(&segment[start..close_idx]) {
+                    after_wiki.push_str(&formatted);
+                    i = close_idx + 2;
+                    continue;
+                }
+            }
+        }
+        let ch = segment[i..].chars().next().unwrap();
+        after_wiki.push(ch);
+        i += ch.len_utf8();
+    }
+
+    let mut out = String::with_capacity(after_wiki.len());
+    let wbytes = after_wiki.as_bytes();
+    let mut j = 0usize;
+    while j < wbytes.len() {
+        if wbytes[j] == b'[' && (j == 0 || !matches!(wbytes[j - 1], b'!' | b'\\')) {
+            let mut k = j + 1;
+            let mut escaped = false;
+            let mut label_close = None;
+            while k < wbytes.len() && !matches!(wbytes[k], b'\r' | b'\n') {
+                if escaped { escaped = false; k += 1; continue; }
+                if wbytes[k] == b'\\' { escaped = true; k += 1; continue; }
+                if wbytes[k] == b'[' { break; }
+                if wbytes[k] == b']' { label_close = Some(k); break; }
+                k += 1;
+            }
+            if let Some(close_bracket) = label_close {
+                if close_bracket + 1 < wbytes.len() && wbytes[close_bracket + 1] == b'(' {
+                    let dest_start = close_bracket + 2;
+                    let mut p = dest_start;
+                    let mut dest_close = None;
+                    while p < wbytes.len() && !matches!(wbytes[p], b'\r' | b'\n' | b'<' | b'>' | b'(') {
+                        if wbytes[p] == b')' { dest_close = Some(p); break; }
+                        p += 1;
+                    }
+                    if let Some(close_paren) = dest_close {
+                        let raw_inside = &after_wiki[dest_start..close_paren];
+                        let (dest_part, title_part) = split_optional_link_title(raw_inside);
+                        if is_likely_link_destination(dest_part) {
+                            out.push_str(&after_wiki[j..dest_start]);
+                            out.push_str(&encode_md_destination(dest_part));
+                            out.push_str(title_part);
+                            out.push(')');
+                            j = close_paren + 1;
+                            continue;
+                        }
+                    }
+                }
+            }
+        }
+        let ch = after_wiki[j..].chars().next().unwrap();
+        out.push(ch);
+        j += ch.len_utf8();
+    }
+    out
+}
+
+fn split_optional_link_title(inside: &str) -> (&str, &str) {
+    let trimmed = inside.trim_end_matches([' ', '\t']);
+    if let Some(quote) = trimmed.chars().last().filter(|c| matches!(c, '"' | '\'')) {
+        if let Some(open_pos) = trimmed[..trimmed.len() - 1].rfind(quote) {
+            if open_pos > 0 && matches!(trimmed.as_bytes()[open_pos - 1], b' ' | b'\t') {
+                let mut ws_start = open_pos - 1;
+                while ws_start > 0 && matches!(trimmed.as_bytes()[ws_start - 1], b' ' | b'\t') {
+                    ws_start -= 1;
+                }
+                return (&inside[..ws_start], &inside[ws_start..]);
+            }
+        }
+    }
+    (inside, "")
+}
+
+/// Normalize prose wikilinks and spaced Markdown link destinations while
+/// leaving fenced code, indented code, inline code, HTML, and math untouched.
+fn normalize_prose_links(input: &str) -> String {
+    if !input.contains("[[") && !input.contains("](") { return input.to_string(); }
+    let mut protected = Vec::new();
+    for (event, range) in Parser::new_ext(input, Options::ENABLE_MATH).into_offset_iter() {
+        if matches!(event, Event::Start(Tag::CodeBlock(_)) | Event::Code(_) | Event::InlineMath(_) | Event::DisplayMath(_) | Event::Html(_) | Event::InlineHtml(_)) {
+            protected.push(range);
+        }
+    }
+    protected.sort_by_key(|r| r.start);
+    let mut merged: Vec<std::ops::Range<usize>> = Vec::new();
+    for range in protected {
+        if let Some(last) = merged.last_mut() {
+            if range.start <= last.end {
+                last.end = last.end.max(range.end);
+                continue;
+            }
+        }
+        merged.push(range);
+    }
+    let mut out = String::with_capacity(input.len());
+    let mut cursor = 0usize;
+    for range in merged {
+        if cursor < range.start {
+            out.push_str(&rewrite_prose_segment(&input[cursor..range.start]));
+        }
+        out.push_str(&input[range.start..range.end]);
+        cursor = range.end;
+    }
+    if cursor < input.len() {
+        out.push_str(&rewrite_prose_segment(&input[cursor..]));
+    }
+    out
 }
 
 /// Protect complete math spans on actual table rows before GFM splits columns.
@@ -264,8 +460,19 @@ impl<'a> Renderer<'a> {
                                 Tag::Item => out.push_str(&format!("[{body}],\n")),
                                 Tag::Link { dest_url, .. } => out.push_str(&if let Some(fragment) = dest_url.strip_prefix('#') {
                                     let decoded = percent_encoding::percent_decode_str(fragment).decode_utf8_lossy();
-                                    let slug = heading_slug(&decoded);
-                                    if self.headings.contains_key(&slug) { format!("#link(label({}))[{body}]", string(&format!("smd-{slug}"))) } else { body }
+                                    let trimmed = decoded.trim();
+                                    let slug = heading_slug(trimmed);
+                                    let resolved = if self.headings.contains_key(trimmed) {
+                                        Some(trimmed.to_string())
+                                    } else if self.headings.contains_key(&slug) {
+                                        Some(slug)
+                                    } else if let Some((prefix, suffix)) = trimmed.rsplit_once('-') {
+                                        let numbered = format!("{}-{suffix}", heading_slug(prefix));
+                                        (suffix.chars().all(|c| c.is_ascii_digit()) && self.headings.contains_key(&numbered)).then_some(numbered)
+                                    } else {
+                                        None
+                                    };
+                                    if let Some(id) = resolved { format!("#link(label({}))[{body}]", string(&format!("smd-{id}"))) } else { body }
                                 } else if dest_url.starts_with("https:") || dest_url.starts_with("http:") || dest_url.starts_with("mailto:") { format!("#link({})[{body}]", string(&dest_url)) } else { body }),
                                 _ => out.push_str(&body),
                             }
@@ -605,5 +812,63 @@ P(A\cup B\cup C)=&P(A)+P(B)+P(C)\\
 
         let pdf_bytes = export(md, &PdfOptions::default(), &HashMap::new()).unwrap();
         assert!(pdf_bytes.starts_with(b"%PDF-"));
+    }
+
+    #[test]
+    fn wikilinks_and_cross_note_links_unwrap_while_web_and_same_note_links_remain_clickable() {
+        let md = [
+            "# Overview",
+            "",
+            "Jump to [[#Milestones|Q3 Milestones Section]] or [duplicate](#milestones-1) or [web](https://example.org/docs) or [email](mailto:team@example.org).",
+            "",
+            "Cross-note links: [[Project Plan#Milestones|Q3 Plan]], [[Subfolder Note]], [[Portable Note.smd#Intro|Portable Intro]], [API Spec](../my specs/api.md#Auth Flow).",
+            "",
+            "| Code | Link |",
+            "| --- | --- |",
+            "| `[[Literal Wiki]]` | [[Table Target\\|Table Alias]] |",
+            "",
+            "```cpp",
+            "[[nodiscard]] int compute() { return 7; }",
+            "```",
+            "",
+            "## Milestones",
+            "",
+            "First milestones section.",
+            "",
+            "## Milestones",
+            "",
+            "Second milestones section.",
+        ].join("\n");
+
+        let typst_src = source(&md, &PdfOptions::default(), &HashMap::new()).unwrap();
+        assert!(typst_src.contains("#link(label(\"smd-milestones\"))[#text(\"Q3 Milestones Section\")]"), "{typst_src}");
+        assert!(typst_src.contains("#link(label(\"smd-milestones-1\"))[#text(\"duplicate\")]"), "{typst_src}");
+        assert!(typst_src.contains("#link(\"https://example.org/docs\")[#text(\"web\")]"), "{typst_src}");
+        assert!(typst_src.contains("#link(\"mailto:team@example.org\")[#text(\"email\")]"), "{typst_src}");
+        assert!(typst_src.contains("#text(\"Q3 Plan\")"), "{typst_src}");
+        assert!(typst_src.contains("#text(\"Subfolder Note\")"), "{typst_src}");
+        assert!(typst_src.contains("#text(\"Portable Intro\")"), "{typst_src}");
+        assert!(typst_src.contains("#text(\"API Spec\")"), "{typst_src}");
+        assert!(typst_src.contains("#text(\"Table Alias\")"), "{typst_src}");
+        assert!(!typst_src.contains("Project%20Plan"), "{typst_src}");
+        assert!(!typst_src.contains("api.md"), "{typst_src}");
+        assert!(typst_src.contains("[[Literal Wiki]]"), "{typst_src}");
+        assert!(typst_src.contains("[[nodiscard]] int compute()"), "{typst_src}");
+
+        let pdf_bytes = export(&md, &PdfOptions::default(), &HashMap::new()).unwrap();
+        assert!(pdf_bytes.starts_with(b"%PDF-"));
+        let path = std::env::temp_dir().join("supermd-wikilink-pdf-test.pdf");
+        std::fs::write(&path, &pdf_bytes).unwrap();
+        if let Ok(output) = std::process::Command::new("pdftotext").arg(&path).arg("-").output() {
+            let extracted = String::from_utf8_lossy(&output.stdout);
+            assert!(extracted.contains("Q3 Plan"), "{extracted}");
+            assert!(extracted.contains("Subfolder Note"), "{extracted}");
+            assert!(extracted.contains("Portable Intro"), "{extracted}");
+            assert!(extracted.contains("API Spec"), "{extracted}");
+            assert!(extracted.contains("Table Alias"), "{extracted}");
+            assert!(!extracted.contains("[[Project Plan"), "{extracted}");
+            assert!(!extracted.contains("[[Subfolder Note]]"), "{extracted}");
+            assert!(!extracted.contains("api.md"), "{extracted}");
+        }
     }
 }

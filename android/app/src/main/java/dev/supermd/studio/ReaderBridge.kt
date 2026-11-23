@@ -116,6 +116,22 @@ internal class ReaderBridge(
                     "load_python_output" -> loadPythonOutput(args)
                     "load_asset" -> model.asset(args.getString("documentPath"), args.getString("source"))
                     "load_text_asset" -> model.textAsset(args.getString("documentPath"), args.getString("source"))
+                    "open_workspace_link" -> model.openWorkspaceLink(
+                        args.optString("documentPath", ""),
+                        args.getString("target"),
+                        args.optString("fragment", ""),
+                        args.optBoolean("wikilink", false),
+                    )
+                    "open_external_url" -> {
+                        val rawUrl = args.getString("url")
+                        require(rawUrl.length in 1..4096) { "Invalid external URL" }
+                        val uri = Uri.parse(rawUrl)
+                        require(classifyReaderNavigationUrl(uri, isForMainFrame = true) == ReaderUrlDecision.OPEN_EXTERNAL) {
+                            "Unsupported external URL"
+                        }
+                        runCatching { web.context.startActivity(Intent(Intent.ACTION_VIEW, uri)) }
+                        true
+                    }
                     "resolve_reader_asset" -> withContext(Dispatchers.IO) {
                         val source = args.getString("source")
                         val (noteId, asset) = model.resolveReaderAsset(args.getString("documentPath"), source)
@@ -473,10 +489,16 @@ fun configureReader(web: WebView, model: StudioViewModel, scope: CoroutineScope,
         }
         override fun shouldOverrideUrlLoading(view: WebView, request: WebResourceRequest): Boolean {
             // The bridge is available only in the bundled offline reader. Never
-            // navigate this WebView to a page from a note or external website.
-            if (request.url.host == "appassets.androidplatform.net" && request.url.path == "/assets/web/android-reader.html") return false
-            if (request.isForMainFrame && request.url.scheme in listOf("https", "http", "mailto")) runCatching { view.context.startActivity(Intent(Intent.ACTION_VIEW, request.url)) }
-            return true
+            // navigate this WebView to a page from a note or external website,
+            // and never send internal appassets.androidplatform.net paths to an external browser.
+            return when (classifyReaderNavigationUrl(request.url, request.isForMainFrame)) {
+                ReaderUrlDecision.ALLOW_READER -> false
+                ReaderUrlDecision.OPEN_EXTERNAL -> {
+                    runCatching { view.context.startActivity(Intent(Intent.ACTION_VIEW, request.url)) }
+                    true
+                }
+                ReaderUrlDecision.BLOCK_INTERNAL -> true
+            }
         }
     }
     web.setTag(R.id.reader_bridge_tag, bridge)

@@ -28,6 +28,23 @@ export function remarkHeadingIds() {
     });
   };
 }
+export function resolveHeadingOffset(markdown: string, rawTarget: string): number | null {
+  let target = rawTarget.replace(/^#/, '');
+  try { target = decodeURIComponent(target); } catch { /* literal fragment */ }
+  const trimmed = target.trim();
+  if (!trimmed) return null;
+  const outline = documentOutline(markdown);
+  const slug = headingSlug(trimmed);
+  const numbered = /^(.*)-(\d+)$/.exec(trimmed);
+  const numberedSlug = numbered ? `${headingSlug(numbered[1])}-${numbered[2]}` : '';
+  const lower = trimmed.toLowerCase();
+  const match = outline.find(entry => entry.id === trimmed)
+    || outline.find(entry => entry.id === slug)
+    || (numberedSlug ? outline.find(entry => entry.id === numberedSlug) : undefined)
+    || outline.find(entry => entry.title.trim().toLowerCase() === lower);
+  return match ? match.offset : null;
+}
+
 export function navigateHeading(link: HTMLAnchorElement): boolean {
   const href = link.getAttribute("href"); if (!href?.startsWith("#")) return false;
   let target = href.slice(1); try { target = decodeURIComponent(target); } catch { /* literal fragment */ }
@@ -35,11 +52,22 @@ export function navigateHeading(link: HTMLAnchorElement): boolean {
   if (!root) return false;
   return navigateToHeading(root,target);
 }
-export function navigateToHeading(root:Element,target:string):boolean {
+export function navigateToHeading(root:Element,rawTarget:string):boolean {
+  let target = rawTarget.replace(/^#/, '');
+  try { target = decodeURIComponent(target); } catch { /* literal fragment */ }
+  const slug = headingSlug(target);
+  const numbered = /^(.*)-(\d+)$/.exec(target);
+  const numberedSlug = numbered ? `${headingSlug(numbered[1])}-${numbered[2]}` : '';
   const headings = Array.from(root.querySelectorAll<HTMLElement>("[data-heading-key]"));
   const counts = new Map<string, number>();
   if(!root.querySelector('[data-windowed-block]'))for (const heading of headings) { const key = heading.dataset.headingKey!, count = counts.get(key) || 0; counts.set(key, count + 1); heading.id = key + (count ? `-${count}` : ""); }
-  const heading = headings.find(node => node.id === target) || Array.from(root.querySelectorAll<HTMLElement>('[id]')).find(node=>node.id===target) || headings.find(node => node.id === headingSlug(target));
+  const byId = Array.from(root.querySelectorAll<HTMLElement>('[id]'));
+  const heading = headings.find(node => node.id === target)
+    || byId.find(node => node.id === target)
+    || headings.find(node => node.id === slug)
+    || byId.find(node => node.id === slug)
+    || (numberedSlug ? headings.find(node => node.id === numberedSlug) || byId.find(node => node.id === numberedSlug) : undefined)
+    || headings.find(node => (node.textContent || '').trim().toLowerCase() === target.trim().toLowerCase());
   if (!heading) return true; // Broken local links must not escape into a browser.
   cancelHeadingNavigation(root);
   let observer:ResizeObserver|undefined,timer=0,frame=0;
