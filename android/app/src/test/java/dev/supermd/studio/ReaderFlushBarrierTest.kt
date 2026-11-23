@@ -30,6 +30,23 @@ class ReaderFlushBarrierTest {
         val accepted = barrier.register("token-4", "note-1")
         assertTrue(barrier.complete("token-4", "note-1", "native", "native", null))
         assertTrue(accepted.result.await())
+        assertEquals(ReaderFlushBarrier.Outcome.ACKNOWLEDGED, accepted.outcome.await())
+    }
+
+    @Test fun activeNoteMismatchIsDistinguishedFromMalformedAndTargetErrors() = runBlocking {
+        val barrier = ReaderFlushBarrier()
+
+        val mismatch = barrier.register("mismatch", "note-2")
+        assertFalse(barrier.complete("mismatch", "note-1", null, null, "The active note changed before its edit flush"))
+        assertEquals(ReaderFlushBarrier.Outcome.ACTIVE_NOTE_MISMATCH, mismatch.outcome.await())
+
+        val malformed = barrier.register("malformed", "note-2")
+        assertFalse(barrier.complete("malformed", "note-1", null, null, "Malformed flush acknowledgement", wellFormed = false))
+        assertEquals(ReaderFlushBarrier.Outcome.FAILED, malformed.outcome.await())
+
+        val targetError = barrier.register("target-error", "note-2")
+        assertFalse(barrier.complete("target-error", "note-2", null, "native", "Edit acknowledgement failed"))
+        assertEquals(ReaderFlushBarrier.Outcome.FAILED, targetError.outcome.await())
     }
 
     @Test fun retirementFailsAllPendingWaitersAndUnknownLateRepliesStayIgnored() = runBlocking {

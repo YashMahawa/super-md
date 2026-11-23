@@ -49,24 +49,43 @@ internal class ReaderBridge(
     /** Waits for the live reader to flush its acknowledged edit queue for this exact note. */
     suspend fun requestFlush(noteId: String, timeoutMillis: Long = 12_000): Boolean {
         if (retired.get() || noteId.isBlank()) return false
-        val request = flushBarrier.register(UUID.randomUUID().toString(), noteId)
-        try {
-            if (retired.get()) {
-                flushBarrier.cancel(request.token, request)
-                return false
+        return withTimeoutOrNull(timeoutMillis) {
+            while (!retired.get()) {
+                val request = flushBarrier.register(UUID.randomUUID().toString(), noteId)
+                val outcome = try {
+                    if (retired.get()) {
+                        flushBarrier.cancel(request.token, request)
+                        return@withTimeoutOrNull false
+                    }
+                    val script = "typeof window.supermdFlush==='function'?(window.supermdFlush({action:'android_flush',target:${JSONObject.quote(noteId)},token:${JSONObject.quote(request.token)}}),true):false"
+                    if (!web.post {
+                            if (retired.get()) flushBarrier.cancel(request.token, request)
+                            else web.evaluateJavascript(script) { value ->
+                                if (value == "false") flushBarrier.cancel(request.token, request)
+                            }
+                        }) {
+                        flushBarrier.cancel(request.token, request)
+                        return@withTimeoutOrNull false
+                    }
+                    request.outcome.await()
+                } finally {
+                    flushBarrier.cancel(request.token, request)
+                }
+                when (outcome) {
+                    ReaderFlushBarrier.Outcome.ACKNOWLEDGED -> return@withTimeoutOrNull true
+                    ReaderFlushBarrier.Outcome.FAILED -> return@withTimeoutOrNull false
+                    ReaderFlushBarrier.Outcome.ACTIVE_NOTE_MISMATCH -> {
+                        // Native activeId updates before Compose's LaunchedEffect delivers
+                        // supermdLoad for the newly selected/opened tab to WebView JS. Retry
+                        // briefly while this tab stays natively active; genuine flush errors
+                        // on the loaded target note report Outcome.FAILED and stop immediately.
+                        if (retired.get() || model.state.value.active.id != noteId) return@withTimeoutOrNull false
+                        kotlinx.coroutines.delay(20)
+                    }
+                }
             }
-            val script = "window.supermdFlush?.({action:'android_flush',target:${JSONObject.quote(noteId)},token:${JSONObject.quote(request.token)}})"
-            if (!web.post {
-                    if (retired.get()) flushBarrier.complete(request.token, "", null, null, "Reader retired")
-                    else web.evaluateJavascript(script, null)
-                }) {
-                flushBarrier.cancel(request.token, request)
-                return false
-            }
-            return withTimeoutOrNull(timeoutMillis) { request.result.await() } == true
-        } finally {
-            flushBarrier.cancel(request.token, request)
-        }
+            false
+        } == true
     }
 
     @JavascriptInterface fun post(id: String, command: String, raw: String) {
@@ -317,6 +336,7 @@ internal class ReaderBridge(
             content,
             current?.takeIf { model.state.value.active.id == it.id }?.content,
             if (wellFormed) error else "Malformed flush acknowledgement",
+            wellFormed = wellFormed,
         )
         return if (accepted) JSONObject().put("accepted", true)
         else JSONObject().put("accepted", false).put("reason", "conflict")
