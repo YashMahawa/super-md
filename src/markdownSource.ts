@@ -271,6 +271,21 @@ export function hasCallouts(markdown:string):boolean {
   return false;
 }
 
+export function normalizeCalloutBlocks(value:string,skipFrontmatter=true):Stage {
+  if(!/:::callout\s/i.test(value))return {value,originalOffset:offset=>offset};
+  const frontmatterEnd=skipFrontmatter?(value.match(/^---\r?\n[\s\S]*?\r?\n---(?:\r?\n|$)/)?.[0].length??0):0;
+  const body=frontmatterEnd?value.slice(frontmatterEnd):value;
+  const edits:Edit[]=[];let depth=0;
+  for(const line of classifyMarkdownLines(body)){
+    const text=body.slice(line.start,line.end),insideCode=line.kind==='fence'||line.kind==='indented';
+    const start=!insideCode&&CALLOUT_START.exec(text);
+    if(start){depth++;edits.push({start:frontmatterEnd+line.start,end:frontmatterEnd+line.end,text:`${'> '.repeat(depth)}[!${start[1].toUpperCase()}] ${start[2]?.replace(/^['"]|['"]$/g,'')||start[1]}`});}
+    else if(!insideCode&&text.trim()===':::'&&depth){depth--;edits.push({start:frontmatterEnd+line.start,end:frontmatterEnd+line.end,text:'> '.repeat(depth).trimEnd()});}
+    else if(depth)edits.push({start:frontmatterEnd+line.start,end:frontmatterEnd+line.start,text:'> '.repeat(depth)});
+  }
+  return replaceStage(value,edits);
+}
+
 function unmaskedRangesFromMask(mask:Uint8Array):Array<[number,number]> {
   const ranges:Array<[number,number]>=[];let start=-1;
   for(let i=0;i<mask.length;i++){
@@ -344,15 +359,7 @@ export function normalizeMarkdownSource(markdown:string, options:NormalizeMarkdo
   if(encodeLinks){
     addUnmasked(/(!?\[(?:\\.|\[[^\r\n\[\]]*\]|[^\[\]\r\n])*\]\()([^<>\r\n()]+?)((?:\s+(?:"[^"\r\n]*"|'[^'\r\n]*'))?)(\))/g,(all,open:string,dest:string,title:string,close:string)=>isLikelyInlineLinkDestination(dest)?`${open}${encodeMarkdownDestination(dest)}${title}${close}`:all);
   }
-  const edits:Edit[]=[];let depth=0;
-  for(const line of classifyMarkdownLines(value)){
-    const text=value.slice(line.start,line.end),insideCode=line.kind==='fence'||line.kind==='indented';
-    const start=!insideCode&&CALLOUT_START.exec(text);
-    if(start){depth++;edits.push({start:line.start,end:line.end,text:`${'> '.repeat(depth)}[!${start[1].toUpperCase()}] ${start[2]?.replace(/^['"]|['"]$/g,'')||start[1]}`});}
-    else if(!insideCode&&text.trim()===':::'&&depth){depth--;edits.push({start:line.start,end:line.end,text:'> '.repeat(depth).trimEnd()});}
-    else if(depth)edits.push({start:line.start,end:line.start,text:'> '.repeat(depth)});
-  }
-  add(replaceStage(value,edits));
+  add(normalizeCalloutBlocks(value,false));
   return {value,originalOffset(offset){for(let i=stages.length-1;i>=0;i--)offset=stages[i].originalOffset(offset);return offset;}};
 }
 export function normalizeCallouts(markdown:string):string{return normalizeMarkdownSource(markdown,{encodeLinkDestinations:true}).value;}
