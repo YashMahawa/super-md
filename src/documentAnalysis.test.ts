@@ -1,6 +1,6 @@
 import {describe,it,expect} from 'vitest';
 import {analyzeDocument} from './documentAnalysis';
-import {normalizeMarkdownSource} from './markdownSource';
+import {hasCallouts,maskCode,normalizeMarkdownSource} from './markdownSource';
 
 describe('shared source analysis',()=>{
   it('nests container callouts and keeps literal delimiters inside variable-length code fences',()=>{
@@ -46,5 +46,145 @@ describe('shared source analysis',()=>{
       {source:'print(2)',ordinal:0,offset:source.indexOf('```py\n')},
       {source:'print(1)',ordinal:1,offset:source.lastIndexOf('```python')},
     ]);
+  });
+  it('leaves NumPy arrays, smd-chart points, Bash [[ ... ]], C++ [[nodiscard]], and inline code untouched while converting prose wikilinks',()=>{
+    const source=[
+      '---\ntitle: Technical\n---',
+      '# Intro',
+      '',
+      'Embed ![[diagram.png|Architecture]] and link [[#Matrix Section|section]] plus [[Reference|ref]].',
+      '',
+      '| Syntax | Meaning |',
+      '|---|---|',
+      '| `[[Note]]` and `` `![[raw.png]]` `` | [[Table Note|Linked in table]] |',
+      '',
+      '```python',
+      'import numpy as np',
+      'arr = np.array([[1, 2], [3, 4]])',
+      'single = [[1, 2]]',
+      '```',
+      '',
+      '```smd-chart',
+      '{"series":[{"points":[[0,1]]}]}',
+      '```',
+      '',
+      '```bash',
+      'if [[ -f "$FILE" ]]; then echo "![[not-image.png]]"; fi',
+      '```',
+      '',
+      '~~~cpp',
+      '[[nodiscard]] int value();',
+      '~~~',
+      '',
+      '## Matrix Section',
+      '',
+      '- [ ] Verify `[[inline]]` before [[Task Note|task link]]',
+      '',
+    ].join('\n');
+    const normalized=normalizeMarkdownSource(source);
+    expect(normalized.value).toContain('![Architecture](diagram.png)');
+    expect(normalized.value).toContain('[section](#matrix-section)');
+    expect(normalized.value).toContain('[ref](Reference.md)');
+    expect(normalized.value).toContain('| `[[Note]]` and `` `![[raw.png]]` `` | [Linked in table](Table Note.md) |');
+    expect(normalized.value).toContain('arr = np.array([[1, 2], [3, 4]])\nsingle = [[1, 2]]');
+    expect(normalized.value).toContain('{"series":[{"points":[[0,1]]}]}');
+    expect(normalized.value).toContain('if [[ -f "$FILE" ]]; then echo "![[not-image.png]]"; fi');
+    expect(normalized.value).toContain('[[nodiscard]] int value();');
+    expect(normalized.value).toContain('- [ ] Verify `[[inline]]` before [task link](Task Note.md)');
+
+    const analysis=analyzeDocument(source);
+    expect(analysis.pythonCells).toEqual([
+      {
+        source:'import numpy as np\narr = np.array([[1, 2], [3, 4]])\nsingle = [[1, 2]]',
+        ordinal:0,
+        offset:source.indexOf('```python'),
+      },
+    ]);
+    expect(analysis.outline.map(h=>[h.id,h.offset])).toEqual([
+      ['intro',source.indexOf('# Intro')],
+      ['matrix-section',source.indexOf('## Matrix Section')],
+    ]);
+    expect(analysis.tasks).toEqual([source.indexOf('[ ]')+1]);
+    expect(analysis.blocks.map(b=>b.text).join('')).toBe(source);
+    for(const block of analysis.blocks)expect(source.slice(block.start,block.end)).toBe(block.text);
+  });
+  it('masks indented code outside paragraphs and lists while keeping lazy continuations, list paragraphs, and stray backtick wikilinks active',()=>{
+    const source=[
+      '    indented = [[1, 2]]',
+      '',
+      'Paragraph with stray ` backtick before [[After Stray]].',
+      '    lazy_continuation = [[Lazy Link]]',
+      '',
+      'Second paragraph with ``unmatched and `[[inline_masked]]` before [[After Inline]].',
+      '',
+      '- List item',
+      '',
+      '    list_paragraph = [[List Link]]',
+      '',
+      '        list_code = [[8, 9]]',
+      '',
+      '# Heading',
+      '    after_heading_code = [[3, 4]]',
+      '',
+    ].join('\n');
+    const masked=maskCode(source);
+    expect(masked).toHaveLength(source.length);
+    const normalized=normalizeMarkdownSource(source).value;
+    expect(normalized).toContain('    indented = [[1, 2]]');
+    expect(normalized).toContain('[After Stray](After Stray.md)');
+    expect(normalized).toContain('`[[inline_masked]]`');
+    expect(normalized).toContain('[After Inline](After Inline.md)');
+    expect(normalized).toContain('    lazy_continuation = [Lazy Link](Lazy Link.md)');
+    expect(normalized).toContain('    list_paragraph = [List Link](List Link.md)');
+    expect(normalized).toContain('        list_code = [[8, 9]]');
+    expect(normalized).toContain('    after_heading_code = [[3, 4]]');
+  });
+  it('rejects backtick fences with backticks in info strings, requires matching closing fences, and tracks blockquote fences in callouts',()=>{
+    const infoBacktick='```python `[[inline_code]]` [[Prose Link]]\n:::callout note Real\nBody\n:::\n';
+    expect(hasCallouts(infoBacktick)).toBe(true);
+    const normInfo=normalizeMarkdownSource(infoBacktick).value;
+    expect(normInfo).toContain('`[[inline_code]]`');
+    expect(normInfo).toContain('[Prose Link](Prose Link.md)');
+    expect(normInfo).toContain('> [!NOTE] Real\n> Body');
+
+    const mismatched=[
+      '> ````python',
+      '> a = [[1, 2]]',
+      '> ```',
+      '> still_fenced = [[3, 4]]',
+      '> ```` trailing-info',
+      '> still_fenced_2 = [[5, 6]]',
+      '> ~~~',
+      '> still_fenced_3 = [[7, 8]]',
+      '> ````   ',
+      '> [[Quoted Prose]]',
+    ].join('\n');
+    const normMismatched=normalizeMarkdownSource(mismatched).value;
+    expect(normMismatched).toContain('> a = [[1, 2]]');
+    expect(normMismatched).toContain('> still_fenced = [[3, 4]]');
+    expect(normMismatched).toContain('> still_fenced_2 = [[5, 6]]');
+    expect(normMismatched).toContain('> still_fenced_3 = [[7, 8]]');
+    expect(normMismatched).toContain('> [Quoted Prose](Quoted Prose.md)');
+
+    const calloutWithQuotedFence=[
+      ':::callout note Outer',
+      '```markdown',
+      '> ```',
+      ':::',
+      '```',
+      '> ```markdown',
+      '> :::callout tip InnerExample',
+      '> :::',
+      '> ```',
+      'Still inside outer [[Outer Link]]',
+      ':::',
+    ].join('\n');
+    const normCallout=normalizeMarkdownSource(calloutWithQuotedFence).value;
+    expect(normCallout).toContain('> Still inside outer [Outer Link](Outer Link.md)');
+    expect(normCallout.trimEnd().endsWith('> Still inside outer [Outer Link](Outer Link.md)')).toBe(true);
+
+    expect(hasCallouts('```markdown\n:::callout note Fenced\n:::\n```')).toBe(false);
+    expect(hasCallouts('> ```markdown\n> :::callout note QuotedFenced\n> :::\n> ```')).toBe(false);
+    expect(hasCallouts('---\ntitle: x\n---\n```md\n:::callout note Fenced\n:::\n```\n:::callout tip Real\nOk\n:::')).toBe(true);
   });
 });
