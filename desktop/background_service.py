@@ -8,7 +8,7 @@ class BackgroundService(QObject):
     def __init__(self,app,session,root,open_window,*,force=False):
         super().__init__(app);self.app=app;self.session=session;self.root=Path(root);self.open_window=open_window
         self.forced=bool(force);self.quitting=False;self.waiting=set();self._quit_handlers=[];self.enabled=False
-        self._cli_started_agent_access=False;self.tray=None;self.menu=None;self.recents=None
+        self._cli_started_agent_access=False;self._stopping_from_cli=False;self.tray=None;self.menu=None;self.recents=None
         changed=getattr(self.session,'changed',None)
         if changed is not None and hasattr(changed,'connect'):changed.connect(self.sync)
         self.sync()
@@ -67,11 +67,16 @@ class BackgroundService(QObject):
             if bridge is not None:bridge.stop()
     def handle_service_request(self,action:str)->dict:
         bridge,settings=getattr(self.session,'agent_bridge',None),getattr(self.session,'settings',None)
-        running=bool(self.enabled and not self.quitting)
-        agent_enabled=bool(bridge and bridge.enabled)
+        quitting=bool(self.quitting or getattr(self.session,'quitting',False))
+        running=bool(self.enabled and not quitting)
+        agent_enabled=bool(bridge and bridge.enabled and not quitting)
         if action=='status':
-            return {'ok':True,'running':running,'agentAccess':agent_enabled}
+            reply={'ok':True,'running':running,'agentAccess':agent_enabled}
+            if quitting:reply['stopping']=True
+            return reply
         if action=='start':
+            if quitting:
+                return {'ok':False,'stopping':True,'running':False,'agentAccess':False,'error':'Background service is stopping'}
             if getattr(self.session,'update_installed',False) is True:
                 return {'ok':False,'running':False,'agentAccess':agent_enabled,'error':'Super MD installed an update and must restart before starting the background service.'}
             keep=isinstance(settings,dict) and settings.get('keepInBackground') is True
@@ -84,6 +89,8 @@ class BackgroundService(QObject):
             if bridge is not None and not bridge.enabled:bridge.start()
             return {'ok':True,'running':bool(self.enabled and not self.quitting),'agentAccess':bool(bridge and bridge.enabled),'sessionsDirectory':str(bridge.discovery_dir) if bridge is not None else ''}
         if action in ('stop','quit'):
+            if quitting:
+                return {'ok':True,'running':False,'stopped':False,'quitRequested':True}
             open_windows=self.visible_windows()
             if open_windows:
                 prefs_changed=False
@@ -96,7 +103,7 @@ class BackgroundService(QObject):
                 if prefs_changed and hasattr(open_windows[0],'_preferences'):open_windows[0]._preferences()
                 self.disable()
                 return {'ok':True,'running':False,'stopped':running,'quitRequested':False}
-            self._cli_started_agent_access=False
+            self._cli_started_agent_access=False;self._stopping_from_cli=True
             if bridge is not None:bridge.stop()
             self.disable();self.quit()
             return {'ok':True,'running':False,'stopped':True,'quitRequested':True}
@@ -113,7 +120,7 @@ class BackgroundService(QObject):
         self._quit_handlers.clear();self.waiting.clear()
     def cancel_quit(self):
         if not self.quitting:return
-        self._clear_quit_handlers();self.quitting=False;self.sync()
+        self._clear_quit_handlers();self.quitting=False;self._stopping_from_cli=False;self.sync()
         if self.visible_windows():self.restore_agent_access()
         self._notify_windows()
     def quit(self):

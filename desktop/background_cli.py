@@ -57,15 +57,33 @@ def main(argv):
         return reply
     reply=request(args.action)
     if args.action=='status':
-        if reply is not None and not reply.get('ok',False):raise ValueError(reply.get('error') or 'Failed to query background service status')
+        if reply is not None and not reply.get('ok',False):
+            if reply.get('error')=='Background service is unavailable':reply=None
+            else:raise ValueError(reply.get('error') or 'Failed to query background service status')
         result={'running':bool(reply and reply.get('running')),'action':'status'}
         if reply is not None and 'agentAccess' in reply:result['agentAccess']=bool(reply['agentAccess'])
         print(json.dumps({'ok':True,'result':result}));return 0
     if args.action=='stop':
-        if reply is not None and not reply.get('ok',False):raise ValueError(reply.get('error') or 'Failed to stop background service')
+        if reply is not None and not reply.get('ok',False):
+            if reply.get('error')=='Background service is unavailable':reply=None
+            else:raise ValueError(reply.get('error') or 'Failed to stop background service')
         result={'running':bool(reply and reply.get('running')),'action':'stop','quitRequested':bool(reply and reply.get('quitRequested'))}
         print(json.dumps({'ok':True,'result':result}));return 0
     sessions_dir=str(root/'qt-studio'/'agent-sessions')
+    if reply is not None and not reply.get('ok',False) and reply.get('error')=='Background service is unavailable':
+        wait_deadline=time.monotonic()+3
+        while time.monotonic()<wait_deadline and reply is not None and not reply.get('ok',False) and reply.get('error')=='Background service is unavailable':
+            time.sleep(.05);reply=request('start')
+    if reply is not None and reply.get('stopping'):
+        stop_deadline=time.monotonic()+5
+        while time.monotonic()<stop_deadline:
+            status=request('status')
+            if status is None:reply=None;break
+            if not status.get('stopping') and status.get('running'):
+                reply=request('start');break
+            time.sleep(.05)
+        if reply is not None and reply.get('stopping'):
+            raise ValueError(reply.get('error') or 'Super MD is currently quitting; finish closing it before starting the background service.')
     if reply is not None:
         if not reply.get('ok',False):raise ValueError(reply.get('error') or 'Super MD refused to start background agent access')
         running=bool(reply.get('running',True))

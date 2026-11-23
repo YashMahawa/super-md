@@ -549,22 +549,31 @@ os.environ.setdefault("QTWEBENGINE_DISABLE_SANDBOX", "1")
 appdata = os.environ["SUPERMD_TEST_APPDATA"]
 downloads = os.environ["SUPERMD_TEST_DOWNLOADS"]
 desktop_dir = os.environ["SUPERMD_TEST_DESKTOP_DIR"]
+cache_dir = str(Path(appdata) / "cache")
+Path(cache_dir).mkdir(parents=True, exist_ok=True)
 if desktop_dir not in sys.path:
     sys.path.insert(0, desktop_dir)
 
+import graphics_runtime
+graphics_runtime.configure(safe=True)
+
 from PySide6.QtCore import QStandardPaths
 from PySide6.QtWidgets import QSystemTrayIcon
+import python_runtime
 
 orig_writable = QStandardPaths.writableLocation
 def _patched_writable(kind):
-    if kind == QStandardPaths.AppDataLocation:
+    if kind in (QStandardPaths.AppDataLocation, QStandardPaths.AppLocalDataLocation):
         return appdata
     if kind == QStandardPaths.DownloadLocation:
         return downloads
+    if kind in (QStandardPaths.CacheLocation, QStandardPaths.GenericCacheLocation):
+        return cache_dir
     return orig_writable(kind)
 
 QStandardPaths.writableLocation = staticmethod(_patched_writable)
 QSystemTrayIcon.isSystemTrayAvailable = staticmethod(lambda: False)
+python_runtime.discover = lambda *_a, **_kw: []
 
 import main as desktop_main
 sys.argv = [str(Path(desktop_dir) / "main.py"), "--background", "--agent-access", "--safe-graphics"]
@@ -792,6 +801,39 @@ class InstanceBrokerAndServiceCliTests(unittest.TestCase):
         self.assertTrue(res["stdout"].strip(), f"Empty CLI output; stderr={res['stderr']}")
         return res["code"], json.loads(res["stdout"])
 
+    def _dispatch_headless_live_request(self, studio, raw_request: str):
+        req = json.loads(raw_request)
+        action = req.get("action")
+        bridge = studio.session.agent_bridge
+        if action == "list_tabs":
+            bridge.complete(req["requestId"], {"tabs": req.get("tabs", [])}, "", window_id=studio.window_id)
+        elif action == "flush_current":
+            bridge.complete(req["requestId"], {"ok": True}, "", window_id=studio.window_id)
+        else:
+            bridge.complete(req["requestId"], None, f"Unexpected headless request: {action}", window_id=studio.window_id)
+
+    def _live_call(self, client: LiveTabClient, action: str, **kwargs) -> dict:
+        holder, errs, done = {}, [], []
+        def run_client():
+            try:
+                holder["result"] = client._call(action, **kwargs)
+            except BaseException as exc:
+                errs.append(exc)
+            finally:
+                done.append(True)
+        worker = threading.Thread(target=run_client, daemon=True)
+        worker.start()
+        deadline = time.monotonic() + 8.0
+        while not done and time.monotonic() < deadline:
+            self.qt_app.processEvents()
+            time.sleep(0.005)
+        worker.join(timeout=1.0)
+        self.qt_app.processEvents()
+        if errs:
+            raise errs[0]
+        self.assertIn("result", holder, f"LiveTabClient({action}) timed out")
+        return holder["result"]
+
     def test_cli_service_matrix_against_no_instance_with_unicode_appdata(self):
         self.broker.close()
         unicode_appdata = (self.temp_appdata / "Super MD — Ελληνικά & 日本語 (2026)").resolve()
@@ -1009,6 +1051,151 @@ class InstanceBrokerAndServiceCliTests(unittest.TestCase):
 
         self.addCleanup(cleanup_real_daemon)
 
+        # Phase 1: An ALREADY-RUNNING pre-#41 headless `--background --agent-access` daemon
+        # (pre-#41 `ok\n` IPC socket + live QtBridge + background-service.log + no keepInBackground in settings.json)
+        # continues serving the upgraded CLI (`status`, `start`, live note edits, `stop`) and migrates cleanly on restart.
+        (daemon_appdata / "background-service.log").write_text(
+            "Super MD pre-#41 headless background daemon started\n",
+            encoding="utf-8",
+        )
+        legacy_settings_payload = {
+            "settings": {
+                "font": "IBM Plex Sans",
+                "theme": "dark",
+                "widthPercent": 92,
+                "widthMigrated": True,
+            },
+            "recent": [],
+            "pinned": [],
+        }
+        (daemon_appdata / "qt-studio").mkdir(parents=True, exist_ok=True)
+        atomic_json(daemon_appdata / "qt-studio" / "settings.json", legacy_settings_payload)
+
+        legacy_socket_name = "supermd-qt-" + hashlib.sha256(str(daemon_appdata).encode()).hexdigest()[:20]
+        QLocalServer.removeServer(legacy_socket_name)
+        legacy_server = QLocalServer(self.qt_app)
+        legacy_server.setSocketOptions(QLocalServer.SocketOption.UserAccessOption)
+        legacy_wire_actions = []
+
+        with patch.object(
+            QStandardPaths,
+            "writableLocation",
+            side_effect=lambda kind: str(daemon_appdata)
+            if kind == QStandardPaths.AppDataLocation
+            else self._orig_writable(kind),
+        ):
+            legacy_session = Session(False)
+            legacy_session.settings["python"] = sys.executable
+            legacy_session.agent_bridge = agent_live.create_qt_bridge(legacy_session, legacy_session.data)
+            legacy_studio = QuietStudio(False, legacy_session)
+            legacy_studio.host_window = _VisibleHost(visible=False)
+            legacy_studio.tabs[0]["name"] = "Covariant Conservation.md"
+            legacy_studio.tabs[0]["content"] = "# Conservation Law\n\n$$\\nabla_\\mu T^{\\mu\\nu} = 0$$\n"
+            legacy_initial_revision = hashlib.sha256(
+                legacy_studio.tabs[0]["content"].encode("utf-8")
+            ).hexdigest()
+            legacy_studio.agentRequest.connect(
+                lambda raw, owner=legacy_studio: self._dispatch_headless_live_request(owner, raw)
+            )
+            legacy_session.agent_bridge.start()
+            # Restore authentic pre-#41 on-disk settings.json (no `keepInBackground` key yet while old process runs).
+            atomic_json(daemon_appdata / "qt-studio" / "settings.json", legacy_settings_payload)
+
+        def cleanup_legacy_headless():
+            legacy_server.close()
+            QLocalServer.removeServer(legacy_socket_name)
+            legacy_session.agent_bridge.stop()
+            legacy_studio.stop()
+            legacy_studio.pool.shutdown(wait=True, cancel_futures=True)
+            legacy_session.writes.shutdown(wait=True)
+
+        self.addCleanup(cleanup_legacy_headless)
+
+        def accept_legacy_headless():
+            while legacy_server.hasPendingConnections():
+                sock = legacy_server.nextPendingConnection()
+                buf = bytearray()
+
+                def on_legacy_read(sock=sock, buf=buf):
+                    buf.extend(bytes(sock.readAll()))
+                    if b"\n" not in buf:
+                        return
+                    req = json.loads(buf.split(b"\n", 1)[0])
+                    if set(req) == {"service"} and req["service"] in ("start", "status", "quit"):
+                        legacy_wire_actions.append(req["service"])
+                        sock.write(b"ok\n")
+                        sock.flush()
+                        sock.waitForBytesWritten(500)
+                        if req["service"] == "quit":
+                            legacy_session.agent_bridge.stop()
+                            legacy_server.close()
+                            QLocalServer.removeServer(legacy_socket_name)
+                    sock.disconnectFromServer()
+
+                sock.readyRead.connect(on_legacy_read)
+                sock.disconnected.connect(sock.deleteLater)
+                on_legacy_read()
+
+        legacy_server.newConnection.connect(accept_legacy_headless)
+        self.assertTrue(legacy_server.listen(legacy_socket_name))
+
+        code, pre_upgrade_status = self._service_for_appdata(daemon_appdata, "status")
+        self.assertEqual(code, 0)
+        self.assertEqual(pre_upgrade_status, {"ok": True, "result": {"running": True, "action": "status"}})
+
+        # Upgraded CLI `service start` against running pre-#41 headless instance must NOT spawn a duplicate process.
+        code, pre_upgrade_start = self._service_for_appdata(daemon_appdata, "start")
+        self.assertEqual(code, 0)
+        self.assertFalse(spawn_marker.exists())
+        expected_sessions_dir = daemon_appdata / "qt-studio" / "agent-sessions"
+        self.assertEqual(
+            pre_upgrade_start,
+            {
+                "ok": True,
+                "result": {
+                    "running": True,
+                    "action": "start",
+                    "sessionsDirectory": str(expected_sessions_dir),
+                },
+            },
+        )
+
+        # Live agent operations continue uninterrupted against the running pre-#41 headless instance.
+        legacy_discovery_files = list(expected_sessions_dir.glob("*.json"))
+        self.assertEqual(len(legacy_discovery_files), 1)
+        legacy_live_client = self._live_call(
+            LiveTabClient(legacy_discovery_files[0]),
+            "patch_tab",
+            tabId=legacy_studio.tabs[0]["id"],
+            expectedRevision=legacy_initial_revision,
+            operations=[
+                {
+                    "type": "replace",
+                    "old": "$$\\nabla_\\mu T^{\\mu\\nu} = 0$$",
+                    "new": "$$\\nabla_\\mu T^{\\mu\\nu} = F^{\\nu\\lambda} J_\\lambda$$",
+                }
+            ],
+        )
+        self.assertTrue(legacy_live_client["changed"])
+        self.assertIn("F^{\\nu\\lambda} J_\\lambda", legacy_studio.tabs[0]["content"])
+
+        # Stopping the pre-#41 headless instance via upgraded CLI sends `"quit"` and revokes its discovery file.
+        code, pre_upgrade_stop = self._service_for_appdata(daemon_appdata, "stop")
+        self.assertEqual(code, 0)
+        self.assertEqual(
+            pre_upgrade_stop,
+            {"ok": True, "result": {"running": False, "action": "stop", "quitRequested": True}},
+        )
+        self.assertEqual(legacy_wire_actions, ["status", "start", "quit"])
+        self.assertEqual(list(expected_sessions_dir.glob("*.json")), [])
+        cleanup_legacy_headless()
+        self.assertNotIn(
+            "keepInBackground",
+            json.loads((daemon_appdata / "qt-studio" / "settings.json").read_text(encoding="utf-8"))["settings"],
+        )
+
+        # Phase 2: Post-upgrade `service start` spawns the real post-#41 headless `--background --agent-access` daemon,
+        # migrates persisted settings (`keepInBackground: True`), and serves live `.smd` agent operations.
         code, start_payload = self._service_for_appdata(
             daemon_appdata,
             "start",
@@ -1021,10 +1208,16 @@ class InstanceBrokerAndServiceCliTests(unittest.TestCase):
         self.assertEqual(code, 0)
         self.assertTrue(start_payload["ok"] and start_payload["result"]["running"])
         sessions_dir = Path(start_payload["result"]["sessionsDirectory"])
-        self.assertEqual(sessions_dir, daemon_appdata / "qt-studio" / "agent-sessions")
+        self.assertEqual(sessions_dir, expected_sessions_dir)
         spawn_info = json.loads(spawn_marker.read_text(encoding="utf-8"))
         self.assertIn("--background", spawn_info["cmd"])
         self.assertIn("--agent-access", spawn_info["cmd"])
+        migrated_disk_settings = json.loads(
+            (daemon_appdata / "qt-studio" / "settings.json").read_text(encoding="utf-8")
+        )["settings"]
+        self.assertIs(migrated_disk_settings["keepInBackground"], True)
+        self.assertEqual(migrated_disk_settings["font"], "IBM Plex Sans")
+        self.assertEqual(migrated_disk_settings["theme"], "dark")
 
         code, status_payload = self._service_for_appdata(daemon_appdata, "status")
         self.assertEqual(code, 0)
@@ -1098,6 +1291,10 @@ class InstanceBrokerAndServiceCliTests(unittest.TestCase):
         self.assertEqual(disk_assets, {})
         self.assertIn("| #10422 | 5.4 | 15.2 |", disk_md)
 
+        # Phase 3: Immediate `stop` -> `start` handoff must never attach to a dying daemon or leave running:False;
+        # it waits for shutdown and spawns a fresh live daemon with a rotated discovery token.
+        first_pid = spawn_info["pid"]
+        first_discovery_name = discovery_files[0].name
         code, stop_payload = self._service_for_appdata(daemon_appdata, "stop")
         self.assertEqual(code, 0)
         self.assertEqual(
@@ -1106,6 +1303,30 @@ class InstanceBrokerAndServiceCliTests(unittest.TestCase):
         )
         # Live discovery token must be revoked synchronously as soon as `service stop` returns.
         self.assertEqual(list(sessions_dir.glob("*.json")), [])
+
+        code, restart_payload = self._service_for_appdata(
+            daemon_appdata,
+            "start",
+            realSpawn=True,
+            downloads=str(daemon_downloads),
+            desktopDir=str(DESKTOP_DIR),
+            daemonBootstrap=_HEADLESS_DAEMON_BOOTSTRAP,
+            spawnMarker=str(spawn_marker),
+        )
+        self.assertEqual(code, 0)
+        self.assertTrue(restart_payload["ok"] and restart_payload["result"]["running"])
+        restarted_info = json.loads(spawn_marker.read_text(encoding="utf-8"))
+        self.assertNotEqual(restarted_info["pid"], first_pid)
+        restarted_discovery = list(sessions_dir.glob("*.json"))
+        self.assertEqual(len(restarted_discovery), 1)
+        self.assertNotEqual(restarted_discovery[0].name, first_discovery_name)
+
+        code, final_stop = self._service_for_appdata(daemon_appdata, "stop")
+        self.assertEqual(code, 0)
+        self.assertEqual(
+            final_stop,
+            {"ok": True, "result": {"running": False, "action": "stop", "quitRequested": True}},
+        )
 
         lock_probe = QLockFile(str(daemon_appdata / "native-instance.lock"))
         lock_probe.setStaleLockTime(0)
@@ -1120,6 +1341,8 @@ class InstanceBrokerAndServiceCliTests(unittest.TestCase):
             time.sleep(0.05)
         self.assertTrue(fully_stopped, "Headless daemon did not exit and release lock promptly after service stop")
         self.assertEqual(list(sessions_dir.glob("*.json")), [])
+        recovered_tabs = json.loads((daemon_appdata / "qt-studio" / "recovery.json").read_text(encoding="utf-8"))
+        self.assertTrue(any("F^{\\nu\\lambda} J_\\lambda" in tab.get("content", "") for tab in recovered_tabs))
 
         with patch.object(
             QStandardPaths,
