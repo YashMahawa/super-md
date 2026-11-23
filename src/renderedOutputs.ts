@@ -4,6 +4,7 @@ export const chartValues = new Map<string, Record<string, number>>();
 export const chartZooms = new Map<string, number>();
 export const chartCenters = new Map<string, {x:number;y:number}>();
 export const chartGrids = new Map<string, boolean>();
+export const stepIndices = new Map<string, number>();
 export const pythonResults = new Map<string, PythonResult>();
 const scopedPythonResults = new Map<string, PythonResult>();
 const scopedPythonContexts = new Map<string, PythonContext>();
@@ -94,15 +95,15 @@ export function exportRenderedViews(content: string) {
     const source=scopedPythonSources.get(key),context=scopedPythonContexts.get(key);
     return source&&context&&content.includes(source)&&verifiedProvenance(value.provenance,context)?[[source,context,value] as [string,PythonContext,PythonResult]]:[];
   });
-  const result = {values:selected(chartValues), zooms:selected(chartZooms), centers:selected(chartCenters), grids:selected(chartGrids), python:selected(pythonResults),pythonScoped};
+  const result = {values:selected(chartValues), zooms:selected(chartZooms), centers:selected(chartCenters), grids:selected(chartGrids), steps:selected(stepIndices), python:selected(pythonResults),pythonScoped};
   // Avoid carrying huge derived images through the UI bridge. This is optional
   // runtime state, not source/assets, and never executes Python on restore.
   if (JSON.stringify(result).length > 8_000_000) {result.python = [];result.pythonScoped=[];}
   return result;
 }
-export function importRenderedViews(content: string, data: ReturnType<typeof exportRenderedViews> | undefined) {
+export function importRenderedViews(content: string, data: Partial<ReturnType<typeof exportRenderedViews>> | undefined) {
   if (!data) return;
-  const restore = <T,>(map: Map<string, T>, pairs: [string, T][], valid:(value:T)=>boolean) => {
+  const restore = <T,>(map: Map<string, T>, pairs: [string, T][] | undefined, valid:(value:T)=>boolean) => {
     if (!Array.isArray(pairs)) return;
     for (const pair of pairs.slice(0,map===pythonResults?60:5000)) if (Array.isArray(pair) && typeof pair[0] === "string" && content.includes(pair[0]) && valid(pair[1])) remember(map, pair[0], pair[1]);
   };
@@ -111,6 +112,7 @@ export function importRenderedViews(content: string, data: ReturnType<typeof exp
   restore(chartZooms, data.zooms, value => finite(value) && value >= .05 && value <= 64);
   restore(chartCenters, data.centers, value => !!value && finite(value.x) && finite(value.y));
   restore(chartGrids, data.grids, value => typeof value === "boolean");
+  restore(stepIndices, data.steps, value => typeof value === "number" && Number.isInteger(value) && value >= 0 && value < 40);
   if(Array.isArray(data.python))for(const pair of data.python.slice(0,60))if(Array.isArray(pair)&&typeof pair[0]==='string'&&content.includes(pair[0])&&validPython(pair[1]))rememberPythonOutput(pair[0],{...pair[1],provenance:{verified:false,reason:'Unscoped legacy output'}});
   if(Array.isArray(data.pythonScoped))for(const entry of data.pythonScoped.slice(0,60)){
     if(!Array.isArray(entry)||typeof entry[0]!=='string'||!content.includes(entry[0]))continue;
