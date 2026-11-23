@@ -25,6 +25,25 @@ describe('original media export',()=>{
     const original=document.elementFromPoint;document.elementFromPoint=vi.fn().mockReturnValue(image);const cleanup1=installMediaMenu(),cleanup2=installMediaMenu();
     expect(window.supermdMediaMenuAt?.(20,30)).toBe(true);expect(document.querySelectorAll('[role="menu"]')).toHaveLength(1);
     expect(document.querySelector('[role="menu"]')?.textContent).toContain('Save as SVG');
-    cleanup1();expect(window.supermdMediaMenuAt).toBeDefined();cleanup2();expect(document.querySelector('[role="menu"]')).toBeNull();expect(window.supermdMediaMenuAt).toBeUndefined();unreg();image.remove();document.elementFromPoint=original;
+    cleanup1();expect(window.supermdMediaMenuAt).toBeDefined();cleanup2();expect(window.supermdMediaMenuAt).toBeUndefined();expect(document.querySelector('[role="menu"]')).toBeNull();unreg();image.remove();document.elementFromPoint=original;
+  });
+  it('yields media export menu and contextmenu interception whenever text is selected',()=>{
+    const para=document.createElement('p');para.textContent='Selected equation context';
+    const image=document.createElement('img');document.body.append(para,image);
+    const unreg=registerMedia(image,{label:'diagram',svg:()=>'<svg xmlns="http://www.w3.org/2000/svg"/>'});
+    const original=document.elementFromPoint;document.elementFromPoint=vi.fn().mockReturnValue(image);
+    const cleanup=installMediaMenu();
+    const range=document.createRange(),selection=window.getSelection()!;
+    range.selectNodeContents(para);selection.removeAllRanges();selection.addRange(range);
+    expect(window.supermdMediaMenuAt?.(20,30)).toBe(false);
+    expect(document.querySelector('[role="menu"]')).toBeNull();
+    const selectedCtx=new MouseEvent('contextmenu',{bubbles:true,cancelable:true,clientX:20,clientY:30});
+    image.dispatchEvent(selectedCtx);
+    expect(selectedCtx.defaultPrevented).toBe(false);
+    expect(document.querySelector('[role="menu"]')).toBeNull();
+    selection.removeAllRanges();
+    expect(window.supermdMediaMenuAt?.(20,30)).toBe(true);
+    expect(document.querySelectorAll('[role="menu"]')).toHaveLength(1);
+    cleanup();unreg();para.remove();image.remove();document.elementFromPoint=original;
   });
 });

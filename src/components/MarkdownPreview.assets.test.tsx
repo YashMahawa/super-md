@@ -174,4 +174,38 @@ describe("MarkdownPreview streamed local assets", () => {
     expect(cell?.querySelector("img")?.getAttribute("src")).toBe(image);
     expect(cell?.getAttribute("data-output-pinned")).toBe("true");
   });
+
+  it("yields inline image edit tools on right-click when document text is selected", async () => {
+    const url = `https://appassets.androidplatform.net/reader-assets/${"1".repeat(32)}?v=${"a".repeat(64)}`;
+    invoke.mockResolvedValue({ url, mime: "image/png" });
+    const host = document.createElement("div");
+    document.body.append(host);
+    root = createRoot(host);
+    await act(async () => {
+      root?.render(<MarkdownPreview markdown={"Paragraph text to select\n\n![Photo](images/a.png)"} documentPath="/notes/a.md" python="" dark />);
+    });
+    const para = host.querySelector("p")!;
+    const noteImage = host.querySelector<HTMLElement>(".note-image")!;
+    const range = document.createRange();
+    range.selectNodeContents(para);
+    const selection = window.getSelection()!;
+    selection.removeAllRanges();
+    selection.addRange(range);
+
+    let event!: MouseEvent;
+    await act(async () => {
+      event = new MouseEvent("contextmenu", { bubbles: true, cancelable: true });
+      noteImage.dispatchEvent(event);
+    });
+    expect(event.defaultPrevented).toBe(false);
+    expect(host.querySelector(".image-edit-tools")).toBeNull();
+
+    selection.removeAllRanges();
+    await act(async () => {
+      event = new MouseEvent("contextmenu", { bubbles: true, cancelable: true });
+      noteImage.dispatchEvent(event);
+    });
+    expect(event.defaultPrevented).toBe(true);
+    expect(host.querySelector(".image-edit-tools")).not.toBeNull();
+  });
 });

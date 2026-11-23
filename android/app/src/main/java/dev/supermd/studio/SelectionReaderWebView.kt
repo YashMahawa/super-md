@@ -14,6 +14,9 @@ import android.webkit.WebView
 import android.widget.Toast
 import org.json.JSONTokener
 
+internal const val SELECTION_TEXT_SCRIPT =
+    "(() => typeof window.supermdSelectedText === 'function' ? window.supermdSelectedText() : (() => { const e=document.activeElement; return (e instanceof HTMLTextAreaElement || e instanceof HTMLInputElement) && (e.selectionEnd || 0) > (e.selectionStart || 0) ? e.value.slice(e.selectionStart || 0,e.selectionEnd || 0) : window.getSelection()?.toString() || ''; })())()"
+
 /** Adds to the OS selection toolbar while preserving WebView's native handles. */
 internal class SelectionReaderWebView(context: Context, private val model: StudioViewModel) : WebView(context) {
     private fun wrap(callback: ActionMode.Callback): ActionMode.Callback =
@@ -31,8 +34,9 @@ internal class SelectionReaderWebView(context: Context, private val model: Studi
         val noteId = model.state.value.active.id
         val provider = model.state.value.selectionAssistant
         // Read before finishing ActionMode, which can clear the native range.
-        // Textarea selection uses its own offsets rather than window.Selection.
-        evaluateJavascript("(() => { const e=document.activeElement; return e instanceof HTMLTextAreaElement || e instanceof HTMLInputElement ? e.value.slice(e.selectionStart || 0,e.selectionEnd || 0) : window.getSelection()?.toString() || ''; })()") { raw ->
+        // Prefer the reader's Markdown/LaTeX-aware selection extractor so Search
+        // Google and Ask match Copy across rendered math, tables, and editors.
+        evaluateJavascript(SELECTION_TEXT_SCRIPT) { raw ->
             if (getTag(R.id.reader_destroyed_tag) == true || model.state.value.active.id != noteId) return@evaluateJavascript
             try {
                 val text = runCatching { JSONTokener(raw).nextValue() as? String }.getOrNull().orEmpty().replace('\u2029','\n')
