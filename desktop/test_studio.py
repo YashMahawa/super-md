@@ -17,6 +17,19 @@ class QuietStudio(Studio):
         self.system_dark = True
 
 class StudioTest(unittest.TestCase):
+    def test_fedora_uses_toolbar_frame_across_desktops(self):
+        for distro, desktop, frame, controls in (
+            ("fedora", "niri", True, True),
+            ("fedora", "GNOME", True, True),
+            ("debian", "niri", False, True),
+            ("debian", "GNOME", False, False),
+        ):
+            with self.subTest(distro=distro, desktop=desktop), patch("studio.sys.platform", "linux"), patch(
+                "studio.platform.freedesktop_os_release", return_value={"ID": distro}
+            ), patch.dict(os.environ, {"XDG_CURRENT_DESKTOP": desktop}):
+                self.assertEqual(self.studio.fedoraWindowFrame, frame)
+                self.assertEqual(self.studio.showToolbarWindowControls, controls)
+
     def test_agent_pdf_options_match_gui_limits_and_remembered_preferences(self):
         import hashlib
         studio = self.studio

@@ -10,6 +10,7 @@ import ipaddress
 import math
 import mimetypes
 import os
+import platform
 import shutil
 import re
 import secrets
@@ -1522,9 +1523,19 @@ class Studio(QObject):
         return preferred + sorted(set(QFontDatabase.families()) - set(preferred))
 
     @Property(bool, constant=True)
-    def captionlessDesktop(self):
+    def fedoraWindowFrame(self):
+        if not sys.platform.startswith("linux"):
+            return False
+        try:
+            return platform.freedesktop_os_release().get("ID") == "fedora"
+        except OSError:
+            return False
+
+    @Property(bool, constant=True)
+    def showToolbarWindowControls(self):
         desktop = os.environ.get("XDG_CURRENT_DESKTOP", "").lower()
-        return sys.platform.startswith("linux") and any(name in desktop for name in ("hyprland", "sway", "river", "niri"))
+        return self.fedoraWindowFrame or (sys.platform.startswith("linux") and
+            any(name in desktop for name in ("hyprland", "sway", "river", "niri")))
 
     @Slot()
     def chooseFont(self): self.fontPickerRequested.emit()

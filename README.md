@@ -228,6 +228,8 @@ Get **[Super MD 0.6.6](https://github.com/YashMahawa/super-md/releases/tag/v0.6.
 
 Release checksums are included. macOS packages are ad-hoc signed, not notarized; Windows installers are not code-signed. Android installation requires the normal system approval. For Linux graphics or AppImage mounting issues, read [graphics diagnostics](docs/GRAPHICS-DIAGNOSTICS.md).
 
+On Fedora, including niri sessions, Super MD puts the window controls in its toolbar. Drag the empty space in the toolbar to move the window.
+
 Settings includes the installed version, update checks, and optional automatic downloads. Updates are verified before becoming installable; installation remains your choice. See [update behavior](docs/UPDATES.md).
 
 ## Build and contribute
