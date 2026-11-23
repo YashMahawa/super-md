@@ -8,12 +8,14 @@ import type {WritingOptions} from '../proofreading';
 import type {ReaderAccessibilityPreference} from '../types';
 import WritingSuggestions from './WritingSuggestions';
 import {repairPastedMath} from '../mathRepair';
+import {liveEditorCenterDelta,useTypewriterScroll} from '../typewriterScroll';
 const noTrustedHosts:string[]=[];
 export type {SourceBlock} from '../documentAnalysis';
 export function splitMarkdownBlocks(markdown:string):SourceBlock[]{return analyzeDocument(markdown).blocks;}
 
 interface Props extends WritingOptions,ReaderAccessibilityPreference {
   latexAutofix?:boolean;
+  typewriterScroll?:boolean;
   markdown:string;onChange:(value:string)=>void;documentPath:string|null;savedDocumentPath?:string|null;python:string;dark:boolean;
   trustedImageHosts?:string[];onTrustImageHost?:(host:string)=>void;onNotice?:(message:string)=>void;
 }
@@ -21,8 +23,10 @@ interface Editing {prefix:string;text:string;suffix:string;originalText:string;p
 
 /** One document render preserves references, footnote numbering, duplicate
  * heading IDs and loose lists. Substitute one original-source editing block. */
-export default function LiveEditor({markdown,onChange,documentPath,savedDocumentPath,python,dark,trustedImageHosts=noTrustedHosts,onTrustImageHost,onNotice,spellCheck=false,grammarCheck=false,latexAutofix=false,fullDocumentAccessibility=false}:Props){
+export default function LiveEditor({markdown,onChange,documentPath,savedDocumentPath,python,dark,trustedImageHosts=noTrustedHosts,onTrustImageHost,onNotice,spellCheck=false,grammarCheck=false,latexAutofix=false,typewriterScroll,fullDocumentAccessibility=false}:Props){
   const [editing,setEditing]=useState<Editing|null>(null);
+  const activeTypewriter=useTypewriterScroll(typewriterScroll);
+  const docRef=useRef<HTMLDivElement>(null),appliedTypewriter=useRef(false),typingFrame=useRef(0);
   const anchorTop=useRef<number|null>(null),editor=useRef<HTMLTextAreaElement>(null);
   const open=(element:HTMLElement,start:number,end:number)=>{
     anchorTop.current=element.getBoundingClientRect().top;
@@ -30,22 +34,90 @@ export default function LiveEditor({markdown,onChange,documentPath,savedDocument
     setEditing({prefix:markdown.slice(0,start),text,suffix:markdown.slice(end),originalText:text,protectedBlock});
   };
   useLayoutEffect(()=>{
-    const area=editor.current;if(!area||anchorTop.current===null)return;
+    const doc=docRef.current;if(!doc)return;
+    const scroller=doc.closest<HTMLElement>('.android-reading,.reading-scroll,.preview-pane,.live-scroll');
+    const beforePad=Number.parseFloat(getComputedStyle(doc).paddingTop)||0;
+    const syncPad=()=>{
+      if(!scroller||scroller.clientHeight<=0)return;
+      doc.style.setProperty('--live-typewriter-pad',`${Math.max(24,Math.floor(scroller.clientHeight/2))}px`);
+    };
+    if(activeTypewriter){doc.dataset.typewriter='true';syncPad();}
+    else{delete doc.dataset.typewriter;doc.style.removeProperty('--live-typewriter-pad');}
+    const afterPad=Number.parseFloat(getComputedStyle(doc).paddingTop)||0;
+    if(appliedTypewriter.current!==activeTypewriter){
+      appliedTypewriter.current=activeTypewriter;
+      if(scroller&&afterPad!==beforePad)scroller.scrollTop=Math.max(0,scroller.scrollTop+(afterPad-beforePad));
+    }
+    if(!activeTypewriter||!scroller||typeof ResizeObserver==='undefined')return;
+    const observer=new ResizeObserver(syncPad);observer.observe(scroller);
+    return()=>observer.disconnect();
+  },[activeTypewriter]);
+  useLayoutEffect(()=>{
+    const area=editor.current;if(!area)return;
     const scroller=area.closest<HTMLElement>('.android-reading,.reading-scroll,.preview-pane,.live-scroll'),anchor=anchorTop.current;anchorTop.current=null;
-    const hold=()=>{const delta=area.getBoundingClientRect().top-anchor;if(scroller&&Math.abs(delta)>.5)scroller.scrollTop+=delta;};
-    hold();area.focus({preventScroll:true});
-    let frames=0,frame=0,stopped=false;const stop=()=>{stopped=true;};
-    const inputs=['wheel','touchstart','keydown'] as const;
+    if(!activeTypewriter){
+      if(anchor===null)return;
+      const hold=()=>{const delta=area.getBoundingClientRect().top-anchor;if(scroller&&Math.abs(delta)>.5)scroller.scrollTop+=delta;};
+      hold();area.focus({preventScroll:true});
+      let frames=0,frame=0,stopped=false;const stop=()=>{stopped=true;};
+      const inputs=['wheel','touchstart','keydown'] as const;
+      inputs.forEach(name=>window.addEventListener(name,stop,{capture:true,passive:true}));
+      const tick=()=>{if(stopped||!area.isConnected)return;hold();if(++frames<24)frame=requestAnimationFrame(tick);};frame=requestAnimationFrame(tick);
+      return()=>{cancelAnimationFrame(frame);inputs.forEach(name=>window.removeEventListener(name,stop,{capture:true}));};
+    }
+    if(anchor!==null&&scroller){
+      const initialDelta=area.getBoundingClientRect().top-anchor;
+      if(Math.abs(initialDelta)>.5)scroller.scrollTop+=initialDelta;
+    }
+    if(document.activeElement!==area)area.focus({preventScroll:true});
+    if(!scroller)return;
+    const reducedMotion=document.documentElement.dataset.motion==='off'||document.documentElement.dataset.reduceMotion==='true'||(typeof window.matchMedia==='function'&&window.matchMedia('(prefers-reduced-motion: reduce)').matches);
+    if(reducedMotion){
+      const align=()=>{const delta=liveEditorCenterDelta(area,scroller,false);if(Math.abs(delta)>.5)scroller.scrollTop+=delta;};
+      align();
+      let frames=0,frame=0,stopped=false;const stop=()=>{stopped=true;};
+      const inputs=['wheel','touchstart'] as const;
+      inputs.forEach(name=>window.addEventListener(name,stop,{capture:true,passive:true}));
+      const tick=()=>{if(stopped||!area.isConnected)return;align();if(++frames<12)frame=requestAnimationFrame(tick);};frame=requestAnimationFrame(tick);
+      return()=>{cancelAnimationFrame(frame);inputs.forEach(name=>window.removeEventListener(name,stop,{capture:true}));};
+    }
+    let frames=0,frame=0,stopped=false,lastTime=performance.now();const stop=()=>{stopped=true;};
+    const inputs=['wheel','touchstart'] as const;
     inputs.forEach(name=>window.addEventListener(name,stop,{capture:true,passive:true}));
-    const tick=()=>{if(stopped||!area.isConnected)return;hold();if(++frames<24)frame=requestAnimationFrame(tick);};frame=requestAnimationFrame(tick);
+    const glide=(now:number)=>{
+      if(stopped||!area.isConnected)return;
+      const elapsed=Math.max(8,Math.min(50,now-lastTime));lastTime=now;
+      const delta=liveEditorCenterDelta(area,scroller,false);
+      if(Math.abs(delta)<=.75){
+        if(Math.abs(delta)>.1)scroller.scrollTop+=delta;
+        if(++frames<24)frame=requestAnimationFrame(glide);
+        return;
+      }
+      scroller.scrollTop+=delta*(1-Math.pow(.55,elapsed/(1000/60)));
+      if(++frames<36)frame=requestAnimationFrame(glide);
+    };
+    frame=requestAnimationFrame(glide);
     return()=>{cancelAnimationFrame(frame);inputs.forEach(name=>window.removeEventListener(name,stop,{capture:true}));};
-  },[editing?.prefix]);
+  },[editing?.prefix,activeTypewriter]);
+  useEffect(()=>()=>{if(typingFrame.current)cancelAnimationFrame(typingFrame.current);},[]);
+  const syncActiveCaretCenter=()=>{
+    if(!activeTypewriter)return;
+    if(typingFrame.current)cancelAnimationFrame(typingFrame.current);
+    typingFrame.current=requestAnimationFrame(()=>{
+      typingFrame.current=0;
+      const area=editor.current;if(!area||!area.isConnected)return;
+      const scroller=area.closest<HTMLElement>('.android-reading,.reading-scroll,.preview-pane,.live-scroll');
+      if(!scroller)return;
+      const delta=liveEditorCenterDelta(area,scroller,area.value.includes('\n'));
+      if(Math.abs(delta)>1)scroller.scrollTop+=delta;
+    });
+  };
   const renderedSource=editing?editing.prefix+editing.originalText+editing.suffix:markdown;
   const sourceAnalysis=useMemo(()=>({source:renderedSource,analysis:analyzeDocument(renderedSource)}),[renderedSource]);
   const blocks=sourceAnalysis.analysis.blocks;
   useEffect(()=>{if(editing&&markdown!==editing.prefix+editing.text+editing.suffix)setEditing(null);},[markdown,editing]);
   const copy=(event:ClipboardEvent)=>{if((event.target as Element).closest('textarea'))return;const source=selectedMarkdown(window.getSelection(),markdown);if(source!==null){event.clipboardData.setData('text/plain',source);event.preventDefault();}};
-  const update=(text:string)=>{if(!editing)return;setEditing({...editing,text});onChange(editing.prefix+text+editing.suffix);};
+  const update=(text:string)=>{if(!editing)return;setEditing({...editing,text});onChange(editing.prefix+text+editing.suffix);syncActiveCaretCenter();};
   const paste=(event:ClipboardEvent<HTMLTextAreaElement>)=>{
     if(!latexAutofix||!editing||event.defaultPrevented||event.clipboardData.files.length)return;
     const area=event.currentTarget,from=area.selectionStart,to=area.selectionEnd;
@@ -59,7 +131,7 @@ export default function LiveEditor({markdown,onChange,documentPath,savedDocument
     // If unavailable, leave the original paste to the platform without loss.
     try {if(document.execCommand('insertText',false,repaired))event.preventDefault();}catch{/* Preserve native paste. */}
   };
-  const textarea=()=> <div className="live-active-block"><textarea ref={editor} data-source-start={editing!.prefix.length} spellCheck={false} value={editing!.text} style={{height:Math.max(120,editing!.text.split('\n').length*27+32)}} onPaste={paste} onChange={event=>update(event.target.value)} onKeyDown={event=>{if(event.key==='Escape'){event.preventDefault();event.stopPropagation();setEditing(null);}}} onBlur={event=>{if(!event.relatedTarget||!event.currentTarget.parentElement?.contains(event.relatedTarget))setEditing(null);}} aria-label="Edit Markdown block"/><WritingSuggestions text={editing!.text} spellCheck={spellCheck} grammarCheck={grammarCheck} onChange={update}/></div>;
+  const textarea=()=> <div className="live-active-block"><textarea ref={editor} data-source-start={editing!.prefix.length} spellCheck={false} value={editing!.text} style={{height:Math.max(120,editing!.text.split('\n').length*27+32)}} onPaste={paste} onChange={event=>update(event.target.value)} onKeyUp={event=>{if(['ArrowUp','ArrowDown','PageUp','PageDown','Home','End'].includes(event.key))syncActiveCaretCenter();}} onKeyDown={event=>{if(event.key==='Escape'){event.preventDefault();event.stopPropagation();setEditing(null);}}} onBlur={event=>{if(!event.relatedTarget||!event.currentTarget.parentElement?.contains(event.relatedTarget))setEditing(null);}} aria-label="Edit Markdown block"/><WritingSuggestions text={editing!.text} spellCheck={spellCheck} grammarCheck={grammarCheck} onChange={update}/></div>;
   const currentOffset=(offset:number)=>editing&&offset>=editing.prefix.length+editing.originalText.length?offset+editing.text.length-editing.originalText.length:offset;
   const renderBlock=(entry:RenderedMarkdownBlock)=>{
     const offset=entry.node.position?.start.offset;
@@ -85,7 +157,7 @@ export default function LiveEditor({markdown,onChange,documentPath,savedDocument
     const from=currentOffset(start),to=currentOffset(end);setEditing(null);
     onChange(markdown.slice(0,from)+next.slice(start,nextEnd)+markdown.slice(to));
   };
-  return <div className="live-document" onCopy={copy} onDragStart={event=>{setSelectedMarkdownDrag(event.nativeEvent,renderedSource);}}>
+  return <div ref={docRef} className="live-document" onCopy={copy} onDragStart={event=>{setSelectedMarkdownDrag(event.nativeEvent,renderedSource);}}>
     {!renderedSource.trim()?(editing?textarea():<section className="live-block" tabIndex={0} role="group" aria-label="Editable block 1" onDoubleClick={event=>open(event.currentTarget,0,markdown.length)} onKeyDown={event=>{if(event.key==='Enter'||event.key==='F2'){event.preventDefault();open(event.currentTarget,0,markdown.length);}}}/> ):<MarkdownPreview markdown={renderedSource} onChange={previewChange} documentPath={documentPath} savedDocumentPath={savedDocumentPath} python={python} dark={dark} trustedImageHosts={trustedImageHosts} onTrustImageHost={onTrustImageHost} onNotice={onNotice} renderBlock={renderBlock} fullDocumentAccessibility={fullDocumentAccessibility} sourceAnalysis={sourceAnalysis}/>}
   </div>;
 }
