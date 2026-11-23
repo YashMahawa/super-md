@@ -40,7 +40,17 @@ for(const {platform,zoom,cold} of scrollCases){
         const delta=step<14?-520:520,bounds=root.getBoundingClientRect(),point={x:bounds.left+bounds.width*.5,y:bounds.top+bounds.height*.5};
         // Track text expected to remain visible AFTER this input, not an old
         // source line that legitimately leaves the viewport during a burst.
-        const caretAtPoint=(document as Document&{caretRangeFromPoint?:(x:number,y:number)=>Range|null}).caretRangeFromPoint;
+        const caretAtPoint=(x:number,y:number):Range|null=>{
+          if(typeof (document as Partial<Document>).caretPositionFromPoint==='function'){
+            const pos=document.caretPositionFromPoint(x,y);
+            if(!pos||pos.offsetNode.nodeType!==Node.TEXT_NODE)return null;
+            const range=document.createRange();
+            range.setStart(pos.offsetNode,Math.max(0,Math.min(pos.offset,(pos.offsetNode as CharacterData).length)));
+            range.collapse(true);
+            return range;
+          }
+          return (document as unknown as {caretRangeFromPoint?:(x:number,y:number)=>Range|null}).caretRangeFromPoint?.(x,y)??null;
+        };
         const probeY=delta<0?bounds.top+100:bounds.bottom-100;
         // One point can land in math, whitespace, or a block gap. Sample a
         // small grid around the same carried source band so each wheel step
@@ -49,7 +59,7 @@ for(const {platform,zoom,cold} of scrollCases){
         const probes=[] as Array<{range:Range;sourceNode:Node;sourceOffset:number;before:DOMRect;block:string|null}>;
         const sampled=new Map<Node,Set<number>>();
         for(const yOffset of [-18,0,18])for(const xFraction of [.35,.5,.65]){
-          const caret=caretAtPoint?.call(document,bounds.left+bounds.width*xFraction,probeY+yOffset);
+          const caret=caretAtPoint(bounds.left+bounds.width*xFraction,probeY+yOffset);
           if(!caret||!root.contains(caret.startContainer)||caret.startContainer.nodeType!==Node.TEXT_NODE)continue;
           const range=caret.cloneRange(),sourceNode=range.startContainer,sourceOffset=range.startOffset;
           if(sourceOffset>=(sourceNode.textContent?.length??0))continue;
