@@ -57,7 +57,7 @@ internal fun orderedRecents(notes:List<RecentNote>)=notes.distinctBy {it.uri}.so
 private fun renamedRelative(relative:String?,name:String)=relative?.let {val parent=it.substringBeforeLast('/',"");if(parent.isEmpty())name else "$parent/$name"}
 data class FileEntry(val name: String, val uri: String, val directory: Boolean, val relative: String)
 data class OutlineHeading(val id: String, val title: String, val level: Int, val offset: Int)
-data class StudioState(val latexAutofix:Boolean=false, val selectionAssistant:String="chatgpt", val centerLock:Boolean=true, val customTheme:String="", val patternKind:String="", val patternOpacity:Float=-1f, val patternSize:Float=0f, val patternSpacing:Float=0f, val restorePosition:Boolean=true, val fullDocumentAccessibility:Boolean=false, val startup:String="restore", val imageAppearance:String="original", val svgAppearance:String="original", val imageContrast:Float=1.25f, val spellCheck:Boolean = false, val grammarCheck:Boolean = false, val accent: String = "system", val widthPercent: Float = 100f, val lineHeight: Float = 1.65f, val autosave: Boolean = true, val customFonts: List<String> = emptyList(), val readerOverlay: Boolean = false, val zoomCommand: Long = 0, val tabs: List<Note> = listOf(Note(name = "Welcome.md", content = sample, saved = sample)), val closedTabs: List<Note> = emptyList(), val activeId: String = "", val mode: String = "live", val fullscreen: Boolean = false, val normalZoom: Float = 100f, val fullscreenZoom: Float = 100f, val theme: String = "system", val fullscreenTheme: String = "black", val motion: Boolean = true, val font: String = "Manrope", val size: Float = 15f, val folder: String? = null, val files: List<FileEntry> = emptyList(), val busy: Boolean = false, val message: String? = null, val error: String? = null, val welcomed: Boolean = false, val pdf: String = "{\"pageSize\":\"a4\",\"margin\":14,\"fontSize\":10.5,\"lineHeight\":1.4,\"paragraphSpacing\":0.65,\"fontFamily\":\"Manrope\",\"pageNumbers\":true}", val storageReport: StorageReport? = null, val storageScanning: Boolean = false, val conflictedTabIds: Set<String> = emptySet(), val pendingCloseNoteId: String? = null, val pendingSaveConflictNoteId: String? = null) {
+data class StudioState(val latexAutofix:Boolean=false, val typewriterScroll:Boolean=false, val selectionAssistant:String="chatgpt", val centerLock:Boolean=true, val customTheme:String="", val patternKind:String="", val patternOpacity:Float=-1f, val patternSize:Float=0f, val patternSpacing:Float=0f, val restorePosition:Boolean=true, val fullDocumentAccessibility:Boolean=false, val startup:String="restore", val imageAppearance:String="original", val svgAppearance:String="original", val imageContrast:Float=1.25f, val spellCheck:Boolean = false, val grammarCheck:Boolean = false, val accent: String = "system", val widthPercent: Float = 100f, val lineHeight: Float = 1.65f, val autosave: Boolean = true, val customFonts: List<String> = emptyList(), val readerOverlay: Boolean = false, val zoomCommand: Long = 0, val tabs: List<Note> = listOf(Note(name = "Welcome.md", content = sample, saved = sample)), val closedTabs: List<Note> = emptyList(), val activeId: String = "", val mode: String = "live", val fullscreen: Boolean = false, val normalZoom: Float = 100f, val fullscreenZoom: Float = 100f, val theme: String = "system", val fullscreenTheme: String = "black", val motion: Boolean = true, val font: String = "Manrope", val size: Float = 15f, val folder: String? = null, val files: List<FileEntry> = emptyList(), val busy: Boolean = false, val message: String? = null, val error: String? = null, val welcomed: Boolean = false, val pdf: String = "{\"pageSize\":\"a4\",\"margin\":14,\"fontSize\":10.5,\"lineHeight\":1.4,\"paragraphSpacing\":0.65,\"fontFamily\":\"Manrope\",\"pageNumbers\":true}", val storageReport: StorageReport? = null, val storageScanning: Boolean = false, val conflictedTabIds: Set<String> = emptySet(), val pendingCloseNoteId: String? = null, val pendingSaveConflictNoteId: String? = null) {
     val active get() = tabs.find { it.id == activeId } ?: tabs.first()
     val zoom get() = if (fullscreen) fullscreenZoom else normalZoom
     val activeConflicted get() = active.id in conflictedTabIds
@@ -374,6 +374,7 @@ class StudioViewModel(app: Application, val workspaceKey: String = "main") : And
     )
     private val preferencesChanged = android.content.SharedPreferences.OnSharedPreferenceChangeListener { _, key ->
         if(key=="latexAutofix")mutable.value=mutable.value.copy(latexAutofix=prefs.getBoolean("latexAutofix",false))
+        if(key=="typewriterScroll")mutable.value=mutable.value.copy(typewriterScroll=prefs.getBoolean("typewriterScroll",false))
         if(key=="selectionAssistant")mutable.value=mutable.value.copy(selectionAssistant=SelectionActions.provider(prefs.getString("selectionAssistant",null)))
         if(key=="customTheme")mutable.value=mutable.value.copy(customTheme=prefs.getString("customTheme","")?:"")
         if(key=="customThemeSource")observeCustomTheme()
@@ -737,7 +738,7 @@ class StudioViewModel(app: Application, val workspaceKey: String = "main") : And
         try {
             if (snapshot.isFile) s=snapshot.bufferedReader().use {NoteRecovery.read(it,s)}
         } catch (_: Exception) { s = s.copy(error = "The recovery snapshot could not be read. Your original files are untouched.") }
-        s=readingPreferences(s).copy(customTheme=prefs.getString("customTheme","")?:"",selectionAssistant=SelectionActions.provider(prefs.getString("selectionAssistant",null)),latexAutofix=prefs.getBoolean("latexAutofix",false))
+        s=readingPreferences(s).copy(customTheme=prefs.getString("customTheme","")?:"",selectionAssistant=SelectionActions.provider(prefs.getString("selectionAssistant",null)),latexAutofix=prefs.getBoolean("latexAutofix",false),typewriterScroll=prefs.getBoolean("typewriterScroll",false))
         if(s.welcomed) {
             val kept=s.tabs.filter {it.dirty || s.startup=="restore"&&!(it.uri==null&&it.name=="Welcome.md")}
             val tabs=if(s.startup=="new")listOf(Note())+kept else kept.ifEmpty {listOf(Note())}
@@ -1302,6 +1303,10 @@ class StudioViewModel(app: Application, val workspaceKey: String = "main") : And
     fun latexAutofix(enabled:Boolean) {
         change {it.copy(latexAutofix=enabled)}
         prefs.edit().putBoolean("latexAutofix",enabled).apply()
+    }
+    fun typewriterScroll(enabled:Boolean) {
+        change {it.copy(typewriterScroll=enabled)}
+        prefs.edit().putBoolean("typewriterScroll",enabled).apply()
     }
     fun overlay(open: Boolean, image: Boolean = false) { mutable.value=mutable.value.copy(readerOverlay=open); imageMutable.value=image }
     fun importFont(uri: Uri) = viewModelScope.launch {
