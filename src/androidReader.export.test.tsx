@@ -77,7 +77,7 @@ afterEach(() => {
   localStorage.clear();
 });
 
-it("forwards note Python path for ZIP export and supports live agent mdzip export", async () => {
+it("forwards the active note Python interpreter when preparing Markdown, Markdown ZIP, and live agent mdzip exports", async () => {
   native.mockImplementation(async (command: string, args?: unknown) => {
     if (command === "agent_export_native") {
       return { jobId: "job-zip-1", status: "running", ...(args as object) };
@@ -127,6 +127,21 @@ it("forwards note Python path for ZIP export and supports live agent mdzip expor
   });
 
   prepareMarkdown.mockClear();
+  native.mockClear();
+  await window.supermdExportMarkdown!(false);
+  expect(prepareMarkdown).toHaveBeenCalledWith(content, "/vault/Study.md", {
+    compatible: false,
+    python: "/opt/venv/bin/python",
+  });
+  expect(native).toHaveBeenCalledWith("export_markdown_native", {
+    id: "tab-1",
+    content: "# Study\n\n![Diagram](<image1.svg>)\n",
+    assets: { "image1.svg": "data:image/svg+xml;base64,PHN2Zy8+" },
+    archive: false,
+  });
+
+  prepareMarkdown.mockClear();
+  native.mockClear();
   const revision = await agentRevision(content);
   const reply = await new Promise<{ result: unknown; error: string }>((resolve) => {
     window.supermdAgentRequest!(

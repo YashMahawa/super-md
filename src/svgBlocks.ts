@@ -29,15 +29,15 @@ export function remarkSvgBlocks(this: unknown) {
         let svgNode = node;
         let headChildren: any[] | null = null;
         let text = node.type === "html" ? node.value : node.type === "paragraph" ? slice(node, node) : "";
-        if (node.type === "paragraph" && text && !/^\s*(?:<\?xml[^>]*\?>\s*)?<svg[\s>]/i.test(text) && /^\[![\w-]+\]/.test(text) && Array.isArray(node.children)) {
-          const childIdx = node.children.findIndex((c: any) => c.type === "html" && /^\s*(?:<\?xml[^>]*\?>\s*)?<svg[\s>]/i.test(c.value));
+        if (node.type === "paragraph" && text && !SVG_START.test(text) && /^(?:\[![\w-]+\]|:::callout\s)/i.test(text) && Array.isArray(node.children)) {
+          const childIdx = node.children.findIndex((c: any) => c.type === "html" && SVG_START.test(c.value));
           if (childIdx > 0) {
             svgNode = node.children[childIdx];
             headChildren = node.children.slice(0, childIdx);
             text = slice(svgNode, node);
           }
         }
-        if (!text || !/^\s*(?:<\?xml[^>]*\?>\s*)?<svg[\s>]/i.test(text)) continue;
+        if (!text || !SVG_START.test(text)) continue;
         // An SVG with blank lines splits into several blocks: join until </svg>.
         let end = index;
         while (end < children.length && !SVG_END.test(slice(svgNode, children[end]) || "")) end++;

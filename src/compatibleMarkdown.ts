@@ -50,7 +50,7 @@ export async function compatibleMarkdown(markdown:string,documentPath:string|nul
    // Reuse the checked static chart renderer. Never run code.
    const {preparePdf}=await import('./preparePdf');
    const prepared=await preparePdf('```smd-chart\n'+node.value+'\n```',documentPath,python);
-   value=prepared.content;
+   value=prepared.content.replace(/\r?\n$/,'');
    if(/```json/.test(value))throw Error('This retired 3D chart has no static snapshot; replace it with a figure before sharing.');
    for(const [name,body] of Object.entries(prepared.assets)){
     const ext=name.split('.').pop();const mime=ext==='svg'?'svg+xml':ext==='jpg'?'jpeg':'png';

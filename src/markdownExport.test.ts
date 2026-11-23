@@ -281,6 +281,43 @@ it('converts callouts while keeping prose wikilinks, code blocks and smd-chart p
  expect(Object.keys(result.assets)).toHaveLength(1);
  expect(atob(Object.values(result.assets)[0].split(',')[1])).toContain('<svg');
 });
+it('preserves spaced/aliased Obsidian image embeds, URL-encoded paths and YAML frontmatter image metadata byte-for-byte',async()=>{
+ const pngA='data:image/png;base64,aGVsbG8=';
+ const pngB='data:image/png;base64,d29ybGQ=';
+ native.mockImplementation(async(command:string,args:any)=>{
+  if(command==='load_asset'&&args.source==='img.png')return pngA;
+  if(command==='load_asset'&&args.source==='DM%20Images/proof-method-guide.png')return pngB;
+  throw Error(`Unexpected call ${command} ${args?.source}`);
+ });
+ const source=[
+  '---',
+  'title: Discrete Math Vault',
+  'banner: "![[unbundled-frontmatter-banner.png]]"',
+  'related: "[[Proof Techniques]]"',
+  '---',
+  '',
+  'Overview for [[Proof Techniques]] and [[Guide|the guide]]:',
+  '',
+  '![[img.png]]',
+  '',
+  '![[DM Images/proof-method-guide.png|Proof Method Guide]]',
+  '',
+  '![Encoded Guide](DM%20Images/proof-method-guide.png)',
+  '',
+ ].join('\n');
+ const compatibleResult=await prepareMarkdownExport(source,'/vault/Discrete.md',{compatible:true});
+ expect(compatibleResult.content).toBe(source);
+ expect(compatibleResult.assets).toEqual({
+  'img.png':pngA,
+  'DM Images/proof-method-guide.png':pngB,
+ });
+ const plainResult=await prepareMarkdownExport(source,'/vault/Discrete.md');
+ expect(plainResult.content).toBe(source);
+ expect(plainResult.assets).toEqual({
+  'img.png':pngA,
+  'DM Images/proof-method-guide.png':pngB,
+ });
+});
 it('preserves realistic notes with [[wikilinks]], ![[img.png]], spaced aliased embeds, fenced [[x]] code and callouts byte-for-byte while bundling assets',async()=>{
  const pngA='data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg==';
  const pngB='data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAIAAAACCAQAAADYv8WvAAAADklEQVR42mNk+M/AQAgAAwgB/7b5L2cAAAAASUVORK5CYII=';
@@ -324,14 +361,14 @@ it('preserves realistic notes with [[wikilinks]], ![[img.png]], spaced aliased e
   'DM Images/proof-method-guide.png':pngB,
  });
 });
-it('extracts optional pipe alt text cleanly when renaming app-generated Obsidian embeds',async()=>{
- const png='data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg==';
- native.mockResolvedValue(png);
- const result=await prepareMarkdownExport(
-  '![[assets/import-abc123.png|Custom Diagram]]\n\n![[assets/import-def456.png]]\n',
-  '/vault/Note.md',
-  {compatible:true},
- );
- expect(result.content).toBe('![Custom Diagram](<image1.png>)\n\n![import-def456.png](<image2.png>)\n');
+it('extracts clean alt text when renaming app-generated Obsidian image embeds',async()=>{
+ native.mockImplementation(async(command:string,args:any)=>{
+  if(command==='load_asset'&&args.source==='assets/import-abc123.png')return 'data:image/png;base64,aGVsbG8=';
+  if(command==='load_asset'&&args.source==='assets/image-def456.png')return 'data:image/png;base64,d29ybGQ=';
+  throw Error(`Unexpected call ${command} ${args?.source}`);
+ });
+ const source='![[assets/import-abc123.png|Custom Diagram]]\n\n![[assets/image-def456.png]]\n';
+ const result=await prepareMarkdownExport(source,'/vault/Generated.smd',{compatible:true});
+ expect(result.content).toBe('![Custom Diagram](<image1.png>)\n\n![image-def456.png](<image2.png>)\n');
  expect(Object.keys(result.assets)).toEqual(['image1.png','image2.png']);
 });

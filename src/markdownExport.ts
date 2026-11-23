@@ -15,12 +15,15 @@ const MIME_EXT: Record<string, string> = {
 };
 
 function refs(markdown: string): ImageRef[] {
+  const frontmatterEnd = markdown.match(/^---\r?\n(?:[\s\S]*?\r?\n)?---(?:\r?\n|$)/)?.[0].length ?? 0;
   const tree = unified().use(remarkParse).use(remarkGfm).use(remarkMath).use(remarkObsidianMath).parse(markdown);
   const definitions = new Map<string, any>();
   const result: ImageRef[] = [];
-  visit(tree, "definition", (node: any) => { definitions.set(node.identifier, node); });
+  visit(tree, "definition", (node: any) => {
+    if (node.position && node.position.start.offset >= frontmatterEnd) definitions.set(node.identifier, node);
+  });
   visit(tree, (node: any) => {
-    if (!node.position) return;
+    if (!node.position || node.position.start.offset < frontmatterEnd) return;
     if (node.type === "image") result.push({ source: node.url, start: node.position.start.offset, end: node.position.end.offset, image: true });
     if (node.type === "imageReference") {
       const definition = definitions.get(node.identifier);
