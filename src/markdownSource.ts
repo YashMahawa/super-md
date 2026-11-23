@@ -1,5 +1,6 @@
 import {visit} from 'unist-util-visit';
 import {headingSlug} from './headingSlug';
+import {parseFrontmatter} from './frontmatter';
 
 interface Edit {start:number;end:number;text:string}
 interface Stage {value:string;originalOffset:(offset:number)=>number}
@@ -21,13 +22,7 @@ function replaceStage(source:string,edits:Edit[]):Stage {
     return edit.from+Math.min(offset-edit.start,edit.to-edit.from);
   }};
 }
-function regexStage(source:string,regex:RegExp,replacement:(...args:any[])=>string):Stage {
-  const edits:Edit[]=[];
-  source.replace(regex,(...args:any[])=>{const start=args[args.length-2] as number;edits.push({start,end:start+args[0].length,text:replacement(...args)});return args[0];});
-  return replaceStage(source,edits);
-}
 
-const FRONTMATTER=/^---\r?\n[\s\S]*?\r?\n---\r?\n/;
 const CALLOUT_START=/^:::callout\s+([\w-]+)(?:\s+(.+))?\s*$/i;
 const THEMATIC_BREAK=/^(?:(?:\*[ \t]*){3,}|(?:-[ \t]*){3,}|(?:_[ \t]*){3,})$/;
 const TABLE_DELIMITER=/^(?:\|[ \t]*:?-+:?[ \t]*(?:\|[ \t]*:?-+:?[ \t]*)*\|?|:?-+:?[ \t]*(?:\|[ \t]*:?-+:?[ \t]*)+\|?)[ \t]*$/;
@@ -264,7 +259,7 @@ export function maskCode(markdown:string):string {
 }
 
 export function hasCallouts(markdown:string):boolean {
-  const body=markdown.replace(FRONTMATTER,'');
+  const fm=parseFrontmatter(markdown),body=fm?markdown.slice(fm.end):markdown;
   for(const line of classifyMarkdownLines(body)){
     if(line.kind!=='fence'&&line.kind!=='indented'&&CALLOUT_START.test(body.slice(line.start,line.end)))return true;
   }
@@ -302,7 +297,9 @@ function unmaskedRegexStage(source:string,ranges:Array<[number,number]>,regex:Re
 export function normalizeMarkdownSource(markdown:string):Stage {
   const stages:Stage[]=[];let value=markdown;
   const add=(stage:Stage)=>{stages.push(stage);value=stage.value;};
-  add(regexStage(value,FRONTMATTER,()=>''));
+  const fm=parseFrontmatter(value);
+  if(fm)add(replaceStage(value,[{start:0,end:fm.end,text:''}]));
+  else if(value.startsWith('\uFEFF'))add(replaceStage(value,[{start:0,end:1,text:''}]));
   let ranges=unmaskedRangesFromMask(computeCodeMask(value));
   const addUnmasked=(regex:RegExp,replacement:(...args:any[])=>string)=>{const next=unmaskedRegexStage(value,ranges,regex,replacement);ranges=next.ranges;add(next.stage);};
   addUnmasked(/!\[\[([^\[\r\n\]|]+)(?:\|([^\r\n\]]+))?\]\]/g,(_all,path,label)=>`![${label??path}](${encodeURI(path)})`);

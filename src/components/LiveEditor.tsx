@@ -10,7 +10,7 @@ import WritingSuggestions from './WritingSuggestions';
 import {repairPastedMath} from '../mathRepair';
 const noTrustedHosts:string[]=[];
 export type {SourceBlock} from '../documentAnalysis';
-export function splitMarkdownBlocks(markdown:string):SourceBlock[]{return analyzeDocument(markdown).blocks;}
+export function splitMarkdownBlocks(markdown:string):SourceBlock[]{return analyzeDocument(markdown).bodyBlocks;}
 
 interface Props extends WritingOptions,ReaderAccessibilityPreference {
   latexAutofix?:boolean;
@@ -42,10 +42,12 @@ export default function LiveEditor({markdown,onChange,documentPath,python,dark,t
   },[editing?.prefix]);
   const renderedSource=editing?editing.prefix+editing.originalText+editing.suffix:markdown;
   const sourceAnalysis=useMemo(()=>({source:renderedSource,analysis:analyzeDocument(renderedSource)}),[renderedSource]);
-  const blocks=sourceAnalysis.analysis.blocks;
+  const blocks=sourceAnalysis.analysis.bodyBlocks;
+  const frontmatter=sourceAnalysis.analysis.frontmatter;
+  const hasBodyNodes=sourceAnalysis.analysis.tree.children.some(node=>node.position?.start.offset!==undefined);
   useEffect(()=>{if(editing&&markdown!==editing.prefix+editing.text+editing.suffix)setEditing(null);},[markdown,editing]);
   const copy=(event:ClipboardEvent)=>{if((event.target as Element).closest('textarea'))return;const source=selectedMarkdown(window.getSelection(),markdown);if(source!==null){event.clipboardData.setData('text/plain',source);event.preventDefault();}};
-  const update=(text:string)=>{if(!editing)return;setEditing({...editing,text});onChange(editing.prefix+text+editing.suffix);};
+  const update=(text:string)=>{if(!editing)return;const needsNewline=Boolean(frontmatter)&&editing.prefix.length===frontmatter!.end&&editing.prefix.length>0&&!editing.prefix.endsWith('\n')&&text.length>0;const prefix=needsNewline?editing.prefix+'\n':editing.prefix;setEditing({...editing,prefix,text});onChange(prefix+text+editing.suffix);};
   const paste=(event:ClipboardEvent<HTMLTextAreaElement>)=>{
     if(!latexAutofix||!editing||event.defaultPrevented||event.clipboardData.files.length)return;
     const area=event.currentTarget,from=area.selectionStart,to=area.selectionEnd;
@@ -86,6 +88,9 @@ export default function LiveEditor({markdown,onChange,documentPath,python,dark,t
     onChange(markdown.slice(0,from)+next.slice(start,nextEnd)+markdown.slice(to));
   };
   return <div className="live-document" onCopy={copy} onDragStart={event=>{setSelectedMarkdownDrag(event.nativeEvent,renderedSource);}}>
-    {!renderedSource.trim()?(editing?textarea():<section className="live-block" tabIndex={0} role="group" aria-label="Editable block 1" onDoubleClick={event=>open(event.currentTarget,0,markdown.length)} onKeyDown={event=>{if(event.key==='Enter'||event.key==='F2'){event.preventDefault();open(event.currentTarget,0,markdown.length);}}}/> ):<MarkdownPreview markdown={renderedSource} onChange={previewChange} documentPath={documentPath} python={python} dark={dark} trustedImageHosts={trustedImageHosts} onTrustImageHost={onTrustImageHost} renderBlock={renderBlock} fullDocumentAccessibility={fullDocumentAccessibility} sourceAnalysis={sourceAnalysis}/>}
+    {!frontmatter&&!renderedSource.trim()?(editing?textarea():<section className="live-block" tabIndex={0} role="group" aria-label="Editable block 1" onDoubleClick={event=>open(event.currentTarget,0,markdown.length)} onKeyDown={event=>{if(event.key==='Enter'||event.key==='F2'){event.preventDefault();open(event.currentTarget,0,markdown.length);}}}/> ):<>
+      <MarkdownPreview markdown={renderedSource} onChange={previewChange} documentPath={documentPath} python={python} dark={dark} trustedImageHosts={trustedImageHosts} onTrustImageHost={onTrustImageHost} renderBlock={renderBlock} fullDocumentAccessibility={fullDocumentAccessibility} sourceAnalysis={sourceAnalysis}/>
+      {!hasBodyNodes&&(editing?textarea():<section className="live-block" data-source-start={blocks[0].start} data-source-end={markdown.length} tabIndex={0} role="group" aria-label="Editable block 1" onDoubleClick={event=>open(event.currentTarget,blocks[0].start,markdown.length)} onKeyDown={event=>{if(event.key==='Enter'||event.key==='F2'){event.preventDefault();open(event.currentTarget,blocks[0].start,markdown.length);}}}/> )}
+    </>}
   </div>;
 }

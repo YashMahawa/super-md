@@ -5,6 +5,7 @@ import remarkGfm from "remark-gfm";
 import remarkMath from "remark-math";
 import { visit } from "unist-util-visit";
 import { invoke } from "./nativeBridge";
+import { maskFrontmatter } from "./frontmatter";
 import { remarkObsidianMath } from "./obsidianMath";
 
 type ImageRef = { source: string; start: number; end: number; image: boolean; definition?: { start: number; end: number } };
@@ -15,7 +16,7 @@ const MIME_EXT: Record<string, string> = {
 };
 
 function refs(markdown: string): ImageRef[] {
-  const tree = unified().use(remarkParse).use(remarkGfm).use(remarkMath).use(remarkObsidianMath).parse(markdown);
+  const tree = unified().use(remarkParse).use(remarkGfm).use(remarkMath).use(remarkObsidianMath).parse(maskFrontmatter(markdown));
   const definitions = new Map<string, any>();
   const result: ImageRef[] = [];
   visit(tree, "definition", (node: any) => { definitions.set(node.identifier, node); });

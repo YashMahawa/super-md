@@ -13,7 +13,7 @@ export function readingMatches(host: Element, query: string, caseSensitive=false
   let text="", node:Node|null, block:Element|null=null;
   while ((node=walker.nextNode())) {
     const parent=node.parentElement;
-    if (!parent || parent.closest("button,input,textarea,svg,annotation,.katex-mathml,.chart-controls,.chart-toolbar,.chart-legend,.image-edit-tools")) continue;
+    if (!parent || parent.closest("button,input,textarea,svg,annotation,.katex-mathml,.chart-controls,.chart-toolbar,.chart-legend,.image-edit-tools,[data-frontmatter-properties],.document-properties")) continue;
     const nextBlock=parent.closest("p,h1,h2,h3,h4,li,pre,td,summary");
     if (block !== nextBlock) {text+="\n";block=nextBlock;}
     const value=node.textContent||"";

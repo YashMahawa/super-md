@@ -18,6 +18,7 @@ import { navigateHeading, remarkHeadingIds } from "../documentNavigation";
 import { selectedMarkdown, setSelectedMarkdownDrag } from "../copySource";
 import CopyCode from "./CopyCode";
 import CodeBlockBoundary from "./CodeBlockBoundary";
+import DocumentProperties from "./DocumentProperties";
 import {DocumentAppearance} from '../documentAppearance';
 import {svgDataBackdrop} from '../svgImage';
 import {adaptSvgData} from '../svgTheme';
@@ -201,6 +202,7 @@ function MarkdownPreview({ markdown, documentPath, python, dark, trustedImageHos
   const renderImage = useCallback(({src,alt}:{src?:string;alt?:string})=><AssetImage src={src} alt={alt} documentPath={documentPath} trustedImageHosts={trustedImageHosts} onTrustImageHost={onTrustImageHost}/>,[documentPath,trustedImageHosts,onTrustImageHost]);
   return (
     <article className="markdown-body" onCopy={event=>{if(event.currentTarget.closest('.live-document'))return;const source=selectedMarkdown(window.getSelection(),markdown);if(source!==null){event.clipboardData.setData("text/plain",source);event.preventDefault();}}} onDragStart={event=>{if(!event.currentTarget.closest('.live-document'))setSelectedMarkdownDrag(event.nativeEvent,markdown);}}>
+      {analysis.frontmatter?.properties && <DocumentProperties properties={analysis.frontmatter.properties} />}
       <CachedMarkdown
         sourceAnalysis={{source:markdown,analysis}}
         renderBlock={renderBlock}

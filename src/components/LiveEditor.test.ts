@@ -31,4 +31,14 @@ describe("live Markdown blocks", () => {
     expect((live.match(/href=/g)||[]).length).toBe((read.match(/href=/g)||[]).length);
     expect(live).toContain('First source.');expect(live).toContain('Second source.');
   });
+  it('excludes YAML frontmatter from splitMarkdownBlocks across delimiter variations',()=>{
+    const prefix='\uFEFF---  \ntitle: Isolated\ntags: [one]\n...\n\n';
+    const body='# First Heading\n\nParagraph text.';
+    const source=prefix+body;
+    const blocks=splitMarkdownBlocks(source);
+    expect(blocks[0].start).toBe(prefix.length);
+    expect(blocks[0].text).toBe('# First Heading\n\n');
+    expect(blocks[0].text).not.toContain('Isolated');
+    expect(source.slice(0,blocks[0].start)+blocks.map(b=>b.text).join('')).toBe(source);
+  });
 });

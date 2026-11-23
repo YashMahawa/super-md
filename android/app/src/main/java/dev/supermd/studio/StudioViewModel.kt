@@ -1196,7 +1196,7 @@ class StudioViewModel(app: Application, val workspaceKey: String = "main") : And
                     val header = if (count > 0) String(prefix, 0, count, Charsets.UTF_8).trimStart('\uFEFF', ' ', '\n', '\r', '\t') else ""
                     val portable = portableGzipHeader(prefix.copyOfRange(0, maxOf(count, 0))) || portableEnvelopeHeader(header)
                     if (portable) { val opened = media.openFmd(buffered); Note(name = name, uri = target.toString(), content = opened.markdown, saved = opened.markdown, relative = relative, assetDirectory = opened.directory) }
-                    else { val content = readLimited(buffered, 20_000_000).toString(Charsets.UTF_8); Note(name = name, uri = target.toString(), content = content, saved = content, relative = relative) }
+                    else { val content = readLimited(buffered, 20_000_000).toString(Charsets.UTF_8).removePrefix("\uFEFF"); Note(name = name, uri = target.toString(), content = content, saved = content, relative = relative) }
                 } ?: error("Document permission is unavailable; choose it again")
             }
             if (note.uri?.let { documentAccess.hasWriteGrant(Uri.parse(it)) } == true) clearDocumentAccessFailure(uri.toString())

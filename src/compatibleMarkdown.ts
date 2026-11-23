@@ -11,16 +11,18 @@ import {parseBinaryTreeSource} from './components/BinaryTree';
 import {stepDiagramSvg} from './stepPdf';
 import {svgImage} from './svgImage';
 import {hasCallouts,normalizeMarkdownSource} from './markdownSource';
+import {maskFrontmatter,parseFrontmatter} from './frontmatter';
 const svgUri=(source:string)=>'data:image/svg+xml;base64,'+btoa(Array.from(new TextEncoder().encode(svgImage(source)),v=>String.fromCharCode(v)).join(''));
 const label=(value:string)=>value.replace(/[\\[\]*_`]/g,'\\$&').replace(/[\r\n]+/g,' ');
 const image=(source:string,alt='Diagram')=>`![${label(alt)}](<${source}>)`;
 export async function compatibleMarkdown(markdown:string,documentPath:string|null,depth=0):Promise<string>{
  if(depth>5)throw Error('Nested step content is too deep to export.');
  if(hasCallouts(markdown)){
-  const front=markdown.match(/^---\r?\n[\s\S]*?\r?\n---\r?\n/)?.[0]||'';
-  markdown=front+normalizeMarkdownSource(markdown).value;
+  const front=parseFrontmatter(markdown)?.raw||'';
+  const body=normalizeMarkdownSource(markdown).value;
+  markdown=front+(front&&!front.endsWith('\n')&&body?'\n':'')+body;
  }
- const tree=unified().use(remarkParse).use(remarkGfm).use(remarkMath).use(remarkObsidianMath).parse(markdown);
+ const tree=unified().use(remarkParse).use(remarkGfm).use(remarkMath).use(remarkObsidianMath).parse(maskFrontmatter(markdown));
  const blocks:any[]=[];
  visit(tree,(node:any)=>{if(node.position&&(node.type==='code'||node.type==='html'&&/^\s*<svg\b/i.test(node.value)))blocks.push(node);});
  const edits:Array<{start:number;end:number;value:string}>=[];

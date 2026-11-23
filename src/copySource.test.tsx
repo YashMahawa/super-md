@@ -57,3 +57,40 @@ it("preserves table structure, quotes, separators and checkboxes when copying",(
   const range=document.createRange();range.selectNodeContents(host);const selection=window.getSelection()!;selection.removeAllRanges();selection.addRange(range);
   expect(selectedMarkdown(selection)).toBe('| Model | Value |\n| --- | --- |\n| **Coin** | Heads \\| tails |\n\n> A quoted note\n\n\n---\n\n- [x] Complete');selection.removeAllRanges();host.remove();
 });
+it("excludes document properties header labels and badges from copied Markdown and reader search",()=>{
+  const markdown="---\ntitle: Hidden Header Title\nauthor: Emmy Noether\ndate: 2026-03-15\ntags: [algebra, invariants]\n...\n\n# Opening Section\n\nFirst **important** sentence.";
+  const host=document.createElement("div");
+  host.innerHTML=renderToStaticMarkup(<MarkdownPreview markdown={markdown} documentPath={null} python="" dark={false}/>);
+  document.body.append(host);
+  const article=host.querySelector(".markdown-body")!;
+  const header=host.querySelector("[data-frontmatter-properties]")!;
+  expect(header.textContent).toContain("Hidden Header Title");
+  expect(header.textContent).toContain("Author");
+  expect(header.textContent).toContain("invariants");
+
+  const selection=window.getSelection()!;
+  const fullRange=document.createRange();
+  fullRange.selectNodeContents(article);
+  selection.removeAllRanges();
+  selection.addRange(fullRange);
+  const copied=selectedMarkdown(selection,markdown);
+  expect(copied).toContain("# Opening Section");
+  expect(copied).toContain("First **important** sentence.");
+  expect(copied).not.toContain("Hidden Header Title");
+  expect(copied).not.toContain("Emmy Noether");
+  expect(copied).not.toContain("Author");
+  expect(copied).not.toContain("invariants");
+  expect(copied?.replace(/\n{3,}/g,"\n\n")).toBe("# Opening Section\n\nFirst **important** sentence.");
+
+  const headerOnly=document.createRange();
+  headerOnly.selectNodeContents(header);
+  selection.removeAllRanges();
+  selection.addRange(headerOnly);
+  expect(selectedMarkdown(selection,markdown)).toBe("");
+
+  expect(readingMatches(article,"Hidden Header Title")).toEqual([]);
+  expect(readingMatches(article,"Author")).toEqual([]);
+  expect(readingMatches(article,"important").map(r=>r.toString())).toEqual(["important"]);
+  selection.removeAllRanges();
+  host.remove();
+});
