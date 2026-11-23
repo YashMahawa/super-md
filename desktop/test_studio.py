@@ -13,6 +13,12 @@ from documents import atomic_json
 import updates
 
 class QuietStudio(Studio):
+    def __init__(self, isolated=False, session=None):
+        session = session or Session(isolated)
+        if not session.settings.get("python"):
+            session.settings["python"] = sys.executable
+        super().__init__(isolated, session)
+
     def _refresh_theme(self):
         self.system_dark = True
 
@@ -94,7 +100,7 @@ class StudioTest(unittest.TestCase):
             atomic_json(qt_data / 'settings.json', {'settings': {'welcomed': True, 'autosave': True, 'theme': 'dark'}, 'pinned': [], 'recent': []})
             with patch('studio.QStandardPaths.writableLocation', return_value=app_root):
                 upgraded_session = Session(False)
-                upgraded_studio = QuietStudio(False, upgraded_session)
+                upgraded_studio = QuietStudio(True, upgraded_session)
                 try:
                     self.assertIs(upgraded_studio.settings['typewriterScroll'], False)
                     upgraded_studio.setting('typewriterScroll', 'true')
@@ -106,7 +112,7 @@ class StudioTest(unittest.TestCase):
 
                 # Restarting Session from disk restores persisted typewriterScroll=True.
                 restored_session = Session(False)
-                restored_studio = QuietStudio(False, restored_session)
+                restored_studio = QuietStudio(True, restored_session)
                 try:
                     self.assertIs(restored_studio.settings['typewriterScroll'], True)
                     restored_studio.post('tw-off', 'typewriter_scroll', json.dumps({'enabled': False}))

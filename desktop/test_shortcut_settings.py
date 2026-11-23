@@ -4,6 +4,7 @@ import os
 import sys
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 os.environ.setdefault("QT_QUICK_BACKEND", "software")
@@ -56,6 +57,20 @@ class ShortcutSettingsSmokeTest(unittest.TestCase):
         cls.app = QGuiApplication.instance() or QGuiApplication(["shortcut settings smoke"])
 
     def setUp(self):
+        discover_patch = patch(
+            "studio.python_runtime.discover",
+            return_value=[{
+                "path": sys.executable,
+                "label": "System Python",
+                "detail": f"{sys.executable} · numpy + matplotlib ready",
+                "matplotlib": True,
+                "managed": False,
+                "venv": False,
+                "venvModule": True,
+            }],
+        )
+        discover_patch.start()
+        self.addCleanup(discover_patch.stop)
         self.session = Session(True)
         self.studio = QuietStudio(True, self.session)
         self.engine = QQmlEngine()
