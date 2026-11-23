@@ -1,19 +1,25 @@
 import { useEffect, useRef, useState } from "react";
 import { imageMarkdown, imageRanges, importImageFiles, importImageUrl, linkDetails, markdownLabel, safeHostname, type ImportedImage, type LinkDetails } from "../documentMedia";
 import { invoke } from "../nativeBridge";
+import { alignRangeToCurrentSource } from "../revisionEdit";
 
 export interface InsertionPoint { from: number; to: number }
-function insertionPoint(): InsertionPoint | undefined {
+interface CapturedPoint extends InsertionPoint { baseSource: string }
+function insertionPoint(currentSource: string): CapturedPoint | undefined {
   const request = { point: undefined as InsertionPoint | undefined };
   window.dispatchEvent(new CustomEvent("supermd-insertion-point", { detail: request }));
   const text = document.activeElement;
   if (text instanceof HTMLTextAreaElement && text.dataset.sourceStart) {
-    const start = Number(text.dataset.sourceStart); return { from: start + text.selectionStart, to: start + text.selectionEnd };
+    const start = Number(text.dataset.sourceStart); return { from: start + text.selectionStart, to: start + text.selectionEnd, baseSource: currentSource };
   }
-  return request.point;
+  return request.point ? { ...request.point, baseSource: currentSource } : undefined;
+}
+function resolveCapturedPoint(captured: CapturedPoint | undefined, currentSource: string): InsertionPoint | undefined | null {
+  if (!captured) return undefined;
+  return alignRangeToCurrentSource(captured.baseSource, currentSource, captured.from, captured.to);
 }
 declare global { interface Window { supermdInsertImages?: (images: ImportedImage[]) => void; supermdMedia?: () => void; supermdCaptureInsertion?: () => void } }
-export default function MediaTools({ documentId, content, documentPath, onInsert, onNotice }: { documentId: string; content: string; documentPath: string | null; onInsert: (text: string, point?: InsertionPoint) => void; onNotice: (message: string) => void }) {
+export default function MediaTools({ documentId, content, renderedContent, documentPath, onInsert, onNotice }: { documentId: string; content: string; renderedContent?: string; documentPath: string | null; onInsert: (text: string, point?: InsertionPoint) => void; onNotice: (message: string) => void }) {
   const [open, setOpen] = useState(false); const [url, setUrl] = useState(""); const [imageMode, setImageMode] = useState(false);
   const [details, setDetails] = useState<LinkDetails | null>(null); const [thumbnail, setThumbnail] = useState(false);
   const [thumbnailPreview,setThumbnailPreview] = useState("");
@@ -21,21 +27,24 @@ export default function MediaTools({ documentId, content, documentPath, onInsert
   const [busy, setBusy] = useState(false); const [fetching, setFetching] = useState(false); const [error, setError] = useState("");
   const [replacement, setReplacement] = useState(false);
   const [removed, setRemoved] = useState<{ from: number; text: string; expected: string } | null>(null);
-  const target = useRef<InsertionPoint | undefined>(undefined); const targetSource = useRef<string | null>(null); const replacing = useRef(false); const mounted = useRef(true); const reference = useRef({ onInsert, onNotice, content }); reference.current = { onInsert, onNotice, content };
-  // Keep a full-source guard only while an actual replacement is pending.
-  // Otherwise this ref can retain a huge obsolete document after every edit.
-  useEffect(() => { if (!open) targetSource.current = null; }, [open]);
+  const target = useRef<CapturedPoint | undefined>(undefined); const replacing = useRef(false); const mounted = useRef(true);
+  const reference = useRef({ onInsert, onNotice, content, renderedContent: renderedContent ?? content });
+  reference.current = { onInsert, onNotice, content, renderedContent: renderedContent ?? content };
+  // Release captured source references once the dialog closes so large notes
+  // are never retained beyond an active insertion/replacement dialog.
+  useEffect(() => { if (!open) target.current = undefined; }, [open]);
   useEffect(() => { if (removed && content !== removed.expected) setRemoved(null); }, [content, removed]);
   const commitImages = (images: ImportedImage[]) => {
     if (!images.length) return;
-    if (replacing.current && reference.current.content !== targetSource.current) { reference.current.onNotice("The note changed while importing. Select the image again to replace it safely."); return; }
-    reference.current.onInsert((replacing.current ? "" : "\n\n") + images.map(imageMarkdown).join("\n\n") + (replacing.current ? "" : "\n"), target.current); setOpen(false);
+    const aligned = resolveCapturedPoint(target.current, reference.current.content);
+    if (aligned === null || (replacing.current && !aligned)) { reference.current.onNotice("The note changed while importing. Select the image again to replace it safely."); return; }
+    reference.current.onInsert((replacing.current ? "" : "\n\n") + images.map(imageMarkdown).join("\n\n") + (replacing.current ? "" : "\n"), aligned); setOpen(false);
   };
-  const show = (value = "") => { target.current = insertionPoint(); replacing.current = false; setReplacement(false); setUrl(value); setImageMode(false); setDetails(null); setError(""); setThumbnail(false); setOpen(true); };
+  const show = (value = "") => { target.current = insertionPoint(reference.current.content); replacing.current = false; setReplacement(false); setUrl(value); setImageMode(false); setDetails(null); setError(""); setThumbnail(false); setOpen(true); };
   useEffect(() => {
     mounted.current = true;
     window.supermdMedia = () => show();
-    window.supermdCaptureInsertion = () => { target.current = insertionPoint(); replacing.current = false; };
+    window.supermdCaptureInsertion = () => { target.current = insertionPoint(reference.current.content); replacing.current = false; };
     window.supermdInsertImages = commitImages;
     const editImage = (event: Event) => {
       const { action, image } = (event as CustomEvent<{ action: string; image: HTMLElement }>).detail;
@@ -44,21 +53,25 @@ export default function MediaTools({ documentId, content, documentPath, onInsert
       const root = block || image.closest(".workspace,.android-document"); if (!root) return;
       const source = image.dataset.noteImageSource;
       const normalize = (url: string) => { try { return decodeURI(url); } catch { return url; } };
-      const candidates = imageRanges(reference.current.content).filter((range) => normalize(range.source) === normalize(source || "") && (!block || range.from >= Number(block.dataset.sourceStart) && range.to <= Number(block.dataset.sourceEnd)));
+      const baseSource = reference.current.renderedContent;
+      const blockStart = block ? Number(block.dataset.renderedStart ?? block.dataset.sourceStart) : -Infinity;
+      const blockEnd = block ? Number(block.dataset.renderedEnd ?? block.dataset.sourceEnd) : Infinity;
+      const candidates = imageRanges(baseSource).filter((range) => normalize(range.source) === normalize(source || "") && (!block || range.from >= blockStart && range.to <= blockEnd));
       const siblings = Array.from(root.querySelectorAll<HTMLElement>("[data-note-image-source]")).filter((node) => normalize(node.dataset.noteImageSource || "") === normalize(source || ""));
-      const range = candidates[siblings.indexOf(image)];
-      if (!range) { reference.current.onNotice("Couldn't locate this image in the source. Use Source mode to edit its reference."); return; }
-      target.current = { from: range.from, to: range.to };
+      const baseRange = candidates[siblings.indexOf(image)];
+      if (!baseRange) { reference.current.onNotice("Couldn't locate this image in the source. Use Source mode to edit its reference."); return; }
+      const aligned = alignRangeToCurrentSource(baseSource, reference.current.content, baseRange.from, baseRange.to);
+      if (!aligned) { reference.current.onNotice("The note changed while updating the preview. Wait a moment or edit this image in Source mode."); return; }
       if (action === "remove") {
-        const current = reference.current.content; setRemoved({ from: range.from, text: current.slice(range.from, range.to), expected: current.slice(0, range.from) + current.slice(range.to) });
-        reference.current.onInsert("", target.current);
-      } else { replacing.current = true; targetSource.current = reference.current.content; setReplacement(true); setImageMode(true); setUrl(""); setDetails(null); setError(""); setOpen(true); }
+        const current = reference.current.content; setRemoved({ from: aligned.from, text: current.slice(aligned.from, aligned.to), expected: current.slice(0, aligned.from) + current.slice(aligned.to) });
+        reference.current.onInsert("", aligned);
+      } else { replacing.current = true; target.current = { from: aligned.from, to: aligned.to, baseSource: reference.current.content }; setReplacement(true); setImageMode(true); setUrl(""); setDetails(null); setError(""); setOpen(true); }
     };
     const paste = (event: ClipboardEvent) => {
       const element = event.target as Element;
       if (!element.closest?.(".workspace,.android-document") || element.closest(".media-scrim,.cm-search,.theme-guide-dialog")) return;
       const files = Array.from(event.clipboardData?.files || []).filter((f) => /^image\//.test(f.type));
-      if (files.length) { event.preventDefault(); const point = insertionPoint(); void importImageFiles(files).then((images) => { if (mounted.current) reference.current.onInsert("\n\n" + images.map(imageMarkdown).join("\n\n") + "\n", point); }).catch((e) => reference.current.onNotice(String(e))); return; }
+      if (files.length) { event.preventDefault(); const captured = insertionPoint(reference.current.content); void importImageFiles(files).then((images) => { if (!mounted.current) return; const aligned = resolveCapturedPoint(captured, reference.current.content); if (aligned === null) { reference.current.onNotice("The note changed around the cursor while importing. Paste the image again."); return; } reference.current.onInsert("\n\n" + images.map(imageMarkdown).join("\n\n") + "\n", aligned); }).catch((e) => reference.current.onNotice(String(e))); return; }
       const pasted = event.clipboardData?.getData("text/plain").trim() || "";
       if (/^https?:\/\/\S+$/.test(pasted)) { event.preventDefault(); show(pasted); }
     };
@@ -90,9 +103,12 @@ export default function MediaTools({ documentId, content, documentPath, onInsert
       const files = Array.from(event.dataTransfer?.files || []).filter((f) => /^image\//.test(f.type) || /\.svg$/i.test(f.name));
       if (!files.length) return;
       event.preventDefault(); event.stopPropagation();
-      const end = element.closest<HTMLElement>(".live-block")?.dataset.sourceEnd;
-      const point = end ? { from: Number(end), to: Number(end) } : insertionPoint();
-      void importImageFiles(files).then((images) => { if (mounted.current) reference.current.onInsert("\n\n" + images.map(imageMarkdown).join("\n\n") + "\n", point); }).catch((e) => reference.current.onNotice(String(e)));
+      const liveBlock = element.closest<HTMLElement>(".live-block");
+      const renderedEnd = liveBlock?.dataset.renderedEnd ?? liveBlock?.dataset.sourceEnd;
+      const captured: CapturedPoint | undefined = renderedEnd !== undefined
+        ? { from: Number(renderedEnd), to: Number(renderedEnd), baseSource: liveBlock?.dataset.renderedEnd !== undefined ? reference.current.renderedContent : reference.current.content }
+        : insertionPoint(reference.current.content);
+      void importImageFiles(files).then((images) => { if (!mounted.current) return; const aligned = resolveCapturedPoint(captured, reference.current.content); if (aligned === null) { reference.current.onNotice("The note changed while importing the dropped image. Drop it again."); return; } reference.current.onInsert("\n\n" + images.map(imageMarkdown).join("\n\n") + "\n", aligned); }).catch((e) => reference.current.onNotice(String(e)));
     };
     const over = (event: DragEvent) => { if ((event.target as Element).closest?.(".workspace,.android-document") && Array.from(event.dataTransfer?.types || []).includes("Files")) event.preventDefault(); };
     document.addEventListener("paste", paste, true); document.addEventListener("dragstart", dragStart, true); document.addEventListener("dragend", dragEnd, true); document.addEventListener("drop", drop, true); document.addEventListener("dragover", over); window.addEventListener("supermd-image-edit", editImage);
@@ -114,14 +130,15 @@ export default function MediaTools({ documentId, content, documentPath, onInsert
     return ()=>{active=false;};
   },[open,imageMode,thumbnail,details?.thumbnail]);
   const insert = async () => {
-    setBusy(true); setError(""); const point = target.current;
+    setBusy(true); setError(""); const captured = target.current;
     try {
       let text: string;
       if (imageMode) text = (replacement ? "" : "\n\n") + imageMarkdown(await importImageUrl(url)) + (replacement ? "" : "\n");
       else { const info = details || { url, title: safeHostname(url) }; text = `[${markdownLabel(info.title)}](<${info.url.replace(/>/g, "%3E")}>)`; if (thumbnail && info.thumbnail) text += "\n\n" + imageMarkdown(await importImageUrl(info.thumbnail)); }
       if (mounted.current) {
-        if (replacement && reference.current.content !== targetSource.current) throw new Error("The note changed while importing. Select the image again to replace it safely.");
-        onInsert(text, point); setOpen(false);
+        const aligned = resolveCapturedPoint(captured, reference.current.content);
+        if (aligned === null || (replacement && !aligned)) throw new Error("The note changed while importing. Select the image again to replace it safely.");
+        onInsert(text, aligned); setOpen(false);
       }
     } catch (e) { if (mounted.current) setError(String(e)); } finally { if (mounted.current) setBusy(false); }
   };
@@ -141,6 +158,6 @@ export default function MediaTools({ documentId, content, documentPath, onInsert
     <small>Titles are fetched only when you paste or enter a web link here. Images are downloaded on insertion, so PDF and portable-file export can work offline.</small>
     {error && <p role="alert">{error}</p>}
     <footer><button disabled={busy || !/^https?:\/\/\S+$/.test(url)} className="primary-action" onClick={insert}>{busy ? "Preparing…" : replacement ? "Replace image" : imageMode ? "Insert image" : "Insert link"}</button></footer>
-    {url && !imageMode && <button disabled={busy} onClick={() => { onInsert(url, target.current); setOpen(false); }}>Paste plain URL instead</button>}
+    {url && !imageMode && <button disabled={busy} onClick={() => { const aligned = resolveCapturedPoint(target.current, reference.current.content); if (aligned === null) { setError("The note changed while editing. Try inserting the link again."); return; } onInsert(url, aligned); setOpen(false); }}>Paste plain URL instead</button>}
   </section></div>;
 }

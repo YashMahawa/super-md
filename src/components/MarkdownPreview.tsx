@@ -190,14 +190,16 @@ interface Props extends ReaderAccessibilityPreference {
   trustedImageHosts?: string[];
   onTrustImageHost?: (host: string) => void;
   onChange?: (markdown:string)=>void;
+  onToggleTask?: (baseSource:string,offset:number,checked:boolean)=>boolean;
   renderBlock?:MarkdownBlockRenderer;
   sourceAnalysis?:SourceDocumentAnalysis;
 }
 
-function MarkdownPreview({ markdown, documentPath, python, dark, trustedImageHosts = EMPTY_TRUSTED_IMAGE_HOSTS, onTrustImageHost, onChange,renderBlock,fullDocumentAccessibility=false,sourceAnalysis }: Props) {
+function MarkdownPreview({ markdown, documentPath, python, dark, trustedImageHosts = EMPTY_TRUSTED_IMAGE_HOSTS, onTrustImageHost, onChange, onToggleTask, renderBlock, fullDocumentAccessibility=false, sourceAnalysis }: Props) {
   useEffect(installMediaMenu,[]);
   const analysis=useMemo(()=>sourceAnalysis?.source===markdown?sourceAnalysis.analysis:analyzeDocument(markdown),[markdown,sourceAnalysis]);
-  const tasks=onChange?analysis.tasks:[];
+  const interactiveTasks=Boolean(onChange||onToggleTask);
+  const tasks=interactiveTasks?analysis.tasks:[];
   const renderImage = useCallback(({src,alt}:{src?:string;alt?:string})=><AssetImage src={src} alt={alt} documentPath={documentPath} trustedImageHosts={trustedImageHosts} onTrustImageHost={onTrustImageHost}/>,[documentPath,trustedImageHosts,onTrustImageHost]);
   return (
     <article className="markdown-body" onCopy={event=>{if(event.currentTarget.closest('.live-document'))return;const source=selectedMarkdown(window.getSelection(),markdown);if(source!==null){event.clipboardData.setData("text/plain",source);event.preventDefault();}}} onDragStart={event=>{if(!event.currentTarget.closest('.live-document'))setSelectedMarkdownDrag(event.nativeEvent,markdown);}}>
@@ -209,8 +211,8 @@ function MarkdownPreview({ markdown, documentPath, python, dark, trustedImageHos
         rehypePlugins={[rehypeKatex, rehypeHighlight]}
         components={{
           p: MarkdownParagraph,
-          input: ({node: _node,...props}) => <input {...props} disabled={!onChange} onChange={()=>{}} />,
-          li: ({node,children,...props}) => <li {...props} className={Array.isArray(node?.properties.className)?node.properties.className.join(' '):undefined} onChange={event=>{const index=Number(node?.properties['data-task-index']);const offset=tasks[index];if(offset===undefined || !onChange || !(event.target instanceof HTMLInputElement))return;onChange(markdown.slice(0,offset)+(event.target.checked?'x':' ')+markdown.slice(offset+1));}}>{children}</li>,
+          input: ({node: _node,...props}) => <input {...props} disabled={!interactiveTasks} onChange={()=>{}} />,
+          li: ({node,children,...props}) => <li {...props} className={Array.isArray(node?.properties.className)?node.properties.className.join(' '):undefined} onChange={event=>{const index=Number(node?.properties['data-task-index']);const offset=tasks[index];if(offset===undefined || !interactiveTasks || !(event.target instanceof HTMLInputElement))return;const checked=event.target.checked;if(onToggleTask){if(!onToggleTask(markdown,offset,checked))event.target.checked=!checked;return;}onChange?.(markdown.slice(0,offset)+(checked?'x':' ')+markdown.slice(offset+1));}}>{children}</li>,
           img: renderImage,
           a: ({node:_node,href,children,...props}) => <a {...props} href={href} target={href?.startsWith("#") ? undefined : "_blank"} rel="noreferrer" onClick={event => { if (navigateHeading(event.currentTarget)) { event.preventDefault(); event.stopPropagation(); } else event.currentTarget.dataset.visited='true'; }}>{children}</a>,
           pre: ({ node, children }) => {

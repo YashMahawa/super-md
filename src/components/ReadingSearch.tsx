@@ -46,7 +46,7 @@ export function sourceMatches(content:string,query:string,caseSensitive=false):A
   for(const match of content.matchAll(regex)){matches.push({from:match.index!,to:match.index!+match[0].length});if(matches.length>=5000)break;}
   return matches;
 }
-export default function ReadingSearch({content,close,onChange,sourceSession}:{content:string;close:()=>void;onChange?:(content:string)=>void;sourceSession?:string}) {
+export default function ReadingSearch({content,renderedRevision,close,onChange,sourceSession}:{content:string;renderedRevision?:string;close:()=>void;onChange?:(content:string)=>void;sourceSession?:string}) {
   const [query,setQuery]=useState(()=>window.getSelection()?.toString().slice(0,200)||"");
   const [matches,setMatches]=useState<Range[]>([]),[index,setIndex]=useState(-1);
   const [caseSensitive,setCaseSensitive]=useState(false),[replacing,setReplacing]=useState(false),[replacement,setReplacement]=useState("");
@@ -97,7 +97,7 @@ export default function ReadingSearch({content,close,onChange,sourceSession}:{co
     if(sourceSession)editorFindQuery(sourceSession,query,caseSensitive);
     const frame=requestAnimationFrame(()=>{const host=document.querySelector(".android-reading")||document.querySelector(".markdown-body");setWindowed(host?windowedMatches(host,query,caseSensitive):null);const result=host?readingMatches(host,query,caseSensitive):[];setMatches(result);setIndex(-1);if(registry&&HighlightClass)registry.set("smd-search",new HighlightClass(...result));});
     return()=>{cancelAnimationFrame(frame);registry?.delete("smd-search");registry?.delete("smd-search-current");if(sourceSession)editorFindQuery(sourceSession,"",false);};
-  },[query,content,caseSensitive,sourceSession,replacing]);
+  },[query,content,renderedRevision,caseSensitive,sourceSession,replacing]);
   useEffect(()=>{if(!windowed&&registry&&HighlightClass){registry.delete("smd-search-current");if(index>=0&&matches[index])registry.set("smd-search-current",new HighlightClass(matches[index]));}},[index,matches,windowed]);
   useEffect(()=>{
     const host=document.querySelector('.android-reading');if(!host||!windowed||!query)return;

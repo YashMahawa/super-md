@@ -10,10 +10,51 @@ import {remarkSourceSyntax} from './markdownSource';
 import {headingSlug} from './headingSlug';
 
 export interface SourceBlock {start:number;end:number;text:string}
+export interface SourceBlockRange {start:number;end:number}
 export interface OutlineEntry {id:string;title:string;level:number;offset:number}
 export interface PythonCellSource {source:string;ordinal:number;offset:number}
 export interface DocumentAnalysis {tree:Root;blocks:SourceBlock[];outline:OutlineEntry[];tasks:number[];pythonCells:PythonCellSource[]}
+export interface CompactDocumentAnalysis {tree:Root;blockRanges:SourceBlockRange[];outline:OutlineEntry[];tasks:number[];pythonCells:PythonCellSource[]}
 export interface SourceDocumentAnalysis {source:string;analysis:DocumentAnalysis}
+
+function createLazySourceBlock(source:string,start:number,end:number):SourceBlock {
+  let sliced:string|undefined;
+  return {
+    start,
+    end,
+    get text():string {
+      return sliced ?? (sliced=source.slice(start,end));
+    },
+  };
+}
+
+/** Strip duplicate block source slices before posting analysis across threads. */
+export function toCompactAnalysis(analysis:DocumentAnalysis):CompactDocumentAnalysis {
+  return {
+    tree:analysis.tree,
+    blockRanges:analysis.blocks.map(({start,end})=>({start,end})),
+    outline:analysis.outline,
+    tasks:analysis.tasks,
+    pythonCells:analysis.pythonCells,
+  };
+}
+
+/** Reattach lazy source-backed blocks on the UI thread without copying slices. */
+export function hydrateDocumentAnalysis(source:string,compact:CompactDocumentAnalysis):SourceDocumentAnalysis {
+  const blocks=compact.blockRanges.length
+    ? compact.blockRanges.map(({start,end})=>createLazySourceBlock(source,start,end))
+    : [createLazySourceBlock(source,0,source.length)];
+  return {
+    source,
+    analysis:{
+      tree:compact.tree,
+      blocks,
+      outline:compact.outline,
+      tasks:compact.tasks,
+      pythonCells:compact.pythonCells,
+    },
+  };
+}
 const processor=unified().use(remarkParse).use(remarkSourceSyntax).use(remarkGfm).use(remarkMath).use(remarkObsidianMath).use(remarkSvgBlocks);
 const cache=new Map<string,{value:DocumentAnalysis;weight:number}>();let retained=0;
 const LIMIT=8_000_000;

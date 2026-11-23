@@ -1,5 +1,5 @@
-import {describe,it,expect} from 'vitest';
-import {analyzeDocument} from './documentAnalysis';
+import {describe,it,expect,vi} from 'vitest';
+import {analyzeDocument,hydrateDocumentAnalysis,toCompactAnalysis} from './documentAnalysis';
 import {hasCallouts,maskCode,normalizeMarkdownSource} from './markdownSource';
 
 describe('shared source analysis',()=>{
@@ -186,5 +186,35 @@ describe('shared source analysis',()=>{
     expect(hasCallouts('```markdown\n:::callout note Fenced\n:::\n```')).toBe(false);
     expect(hasCallouts('> ```markdown\n> :::callout note QuotedFenced\n> :::\n> ```')).toBe(false);
     expect(hasCallouts('---\ntitle: x\n---\n```md\n:::callout note Fenced\n:::\n```\n:::callout tip Real\nOk\n:::')).toBe(true);
+  });
+  it('hydrates compact worker analysis lazily without eager block text duplication',()=>{
+    const source='# Heading\n\n- [ ] Task item\n\n```python\nprint(42)\n```\n\nParagraph text.\n';
+    const full=analyzeDocument(source);
+    const compact=toCompactAnalysis(full);
+    for(const range of compact.blockRanges){
+      expect('text' in range).toBe(false);
+    }
+    const sliceSpy=vi.spyOn(String.prototype,'slice');
+    sliceSpy.mockClear();
+    const hydrated=hydrateDocumentAnalysis(source,compact);
+    const callsOnHydrate=sliceSpy.mock.calls.length;
+    const firstRead=hydrated.analysis.blocks[0].text;
+    const callsAfterFirstRead=sliceSpy.mock.calls.length;
+    const secondRead=hydrated.analysis.blocks[0].text;
+    const callsAfterSecondRead=sliceSpy.mock.calls.length;
+    sliceSpy.mockRestore();
+
+    expect(callsOnHydrate).toBe(0);
+    expect(callsAfterFirstRead).toBe(1);
+    expect(callsAfterSecondRead).toBe(1);
+    expect(firstRead).toBe(full.blocks[0].text);
+    expect(secondRead).toBe(full.blocks[0].text);
+    expect(hydrated.source).toBe(source);
+    expect(hydrated.analysis.outline).toEqual(full.outline);
+    expect(hydrated.analysis.tasks).toEqual(full.tasks);
+    expect(hydrated.analysis.pythonCells).toEqual(full.pythonCells);
+    expect(hydrated.analysis.tree).toEqual(full.tree);
+    expect(hydrated.analysis.blocks).toHaveLength(full.blocks.length);
+    expect(hydrated.analysis.blocks.map(block=>block.text).join('')).toBe(source);
   });
 });

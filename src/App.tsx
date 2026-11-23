@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { open as pickMobileDocument, save as chooseMobileDocument } from "@tauri-apps/plugin-dialog";
 import { readTextFile, writeTextFile } from "@tauri-apps/plugin-fs";
@@ -6,7 +6,7 @@ import { getCurrentWindow } from "@tauri-apps/api/window";
 import { WebviewWindow } from "@tauri-apps/api/webviewWindow";
 import { AnimatePresence, motion, MotionConfig, useReducedMotion } from "motion/react";
 import { ArrowsOut, BookOpen, Browsers, ChartLine, Code, Columns, Crosshair, FilePdf, FloppyDisk, FolderOpen, Function as FunctionIcon, GearSix, MagnifyingGlass, Minus, Note, SidebarSimple, PencilSimple, Plus, Sparkle, TextB, TextHTwo, TextItalic, X } from "@phosphor-icons/react";
-import Editor from "./components/Editor";
+import Editor, { editorReadingOffset } from "./components/Editor";
 import BrandMark from "./components/BrandMark";
 import LiveEditor from "./components/LiveEditor";
 import MarkdownPreview from "./components/MarkdownPreview";
@@ -21,6 +21,13 @@ import { imageMarkdown, prepareFmd, type ImportedImage } from "./documentMedia";
 import { recordRecent } from "./recentFiles";
 import ZoomInput from "./components/ZoomInput";
 import { MaterialButton, MaterialIconButton, MaterialSelect, MaterialSlider, MaterialSwitch, materialThemes } from "./components/MaterialControls";
+import { useDocumentAnalysis } from "./documentAnalysisWorker";
+import type { OutlineEntry } from "./documentAnalysis";
+import { applyAlignedTaskToggle } from "./revisionEdit";
+import { readingOffset, revealReadingOffset } from "./readingPosition";
+import { loadReadingLocation, saveReadingLocation } from "./readingLocations";
+import { cancelHeadingNavigation, navigateToHeading } from "./documentNavigation";
+import { markScrollInput, scrollInputVersion } from "./scrollAnchor";
 
 const welcome = `# Super MD
 
@@ -119,6 +126,28 @@ const android = /Android/i.test(navigator.userAgent);
 const compactViewport = () => (typeof window.matchMedia === "function" && window.matchMedia("(max-width: 760px)").matches);
 const pickerCancelled = (error: unknown) => /cancelled|canceled/i.test(String(error));
 
+function countLines(text: string): number {
+  let lines = 1;
+  let at = text.indexOf("\n");
+  while (at !== -1) {
+    lines++;
+    at = text.indexOf("\n", at + 1);
+  }
+  return lines;
+}
+
+function countWords(text: string): number {
+  let words = 0;
+  let inWord = false;
+  for (let i = 0; i < text.length; i++) {
+    const code = text.charCodeAt(i);
+    const whitespace = code === 32 || (code >= 9 && code <= 13) || code === 160;
+    if (whitespace) inWord = false;
+    else if (!inWord) { inWord = true; words++; }
+  }
+  return words;
+}
+
 export default function App() {
   const windowLabel = useMemo(() => "__TAURI_INTERNALS__" in window ? getCurrentWindow().label : "browser", []);
   const sessionKey = `workspace.tabs.${windowLabel}`;
@@ -132,6 +161,10 @@ export default function App() {
   const dirty = isDirty(activeTab);
   const [mobileUi, setMobileUi] = useState(compactViewport);
   const [view, setView] = useState<ViewMode>(() => compactViewport() ? "live" : "split");
+  const { pinnedAnalysis, outline, isReady: previewReady } = useDocumentAnalysis(activeTab.id, content, view);
+  const modeOffsetRef = useRef<{ tabId: string; offset: number } | null>(null);
+  const tabOffsetsRef = useRef(new Map<string, number>());
+  const pendingHeadingRef = useRef<{ tabId: string; view: ViewMode; headingId: string; offset: number; input: number } | null>(null);
   const [focusMode, setFocusMode] = useState(false);
   const [fullscreen, setFullscreen] = useState(false);
   const [normalTheme, setNormalTheme] = useState<ThemeMode>(() => storedTheme("theme.normal", "system"));
@@ -209,13 +242,73 @@ export default function App() {
   }, [fullscreen]);
   const zoomBy = useCallback((step: number) => setZoom((current) => current + step), [setZoom]);
   const trustImageHost = useCallback((host: string) => setTrustedImageHosts((current) => current.includes(host) ? current : [...current, host]), []);
+  const captureActiveOffset = useCallback((tabId: string, currentView: ViewMode): number => {
+    if (currentView === "editor") return editorReadingOffset(tabId) ?? 0;
+    const scroller = readingScrollRef.current;
+    if (currentView === "split") {
+      if (scroller && scroller.scrollTop > 0) return readingOffset(scroller);
+      return editorReadingOffset(tabId) ?? (scroller ? readingOffset(scroller) : 0);
+    }
+    return scroller ? readingOffset(scroller) : 0;
+  }, []);
+
+  const switchView = useCallback((nextView: ViewMode) => {
+    setView((currentView) => {
+      if (currentView === nextView) return currentView;
+      const tab = documentsRef.current.tabs.find((item) => item.id === documentsRef.current.activeId) ?? documentsRef.current.tabs[0];
+      if (tab) {
+        const offset = captureActiveOffset(tab.id, currentView);
+        modeOffsetRef.current = { tabId: tab.id, offset };
+        tabOffsetsRef.current.set(tab.id, offset);
+      }
+      pendingHeadingRef.current = null;
+      if (readingScrollRef.current) cancelHeadingNavigation(readingScrollRef.current);
+      return nextView;
+    });
+  }, [captureActiveOffset]);
+
+  const selectTab = useCallback((nextId: string) => {
+    setDocuments((current) => {
+      if (current.activeId === nextId) return current;
+      const active = current.tabs.find((item) => item.id === current.activeId);
+      if (active) tabOffsetsRef.current.set(active.id, captureActiveOffset(active.id, view));
+      pendingHeadingRef.current = null;
+      if (readingScrollRef.current) cancelHeadingNavigation(readingScrollRef.current);
+      return { ...current, activeId: nextId };
+    });
+  }, [captureActiveOffset, view]);
+
+  const navigateOutlineHeading = useCallback((entry: OutlineEntry) => {
+    markScrollInput();
+    if (view === "editor") {
+      pendingHeadingRef.current = null;
+      window.dispatchEvent(new CustomEvent("supermd-goto-offset", { detail: entry.offset }));
+      return;
+    }
+    if (view === "split") {
+      window.dispatchEvent(new CustomEvent("supermd-goto-offset", { detail: entry.offset }));
+    }
+    const scroller = readingScrollRef.current;
+    if (scroller && previewReady) {
+      pendingHeadingRef.current = null;
+      navigateToHeading(scroller, entry.id);
+    } else {
+      pendingHeadingRef.current = { tabId: activeTab.id, view, headingId: entry.id, offset: entry.offset, input: scrollInputVersion() };
+    }
+  }, [activeTab.id, previewReady, view]);
+
+  useEffect(() => {
+    window.supermdHeading = (id, offset = 0) => navigateOutlineHeading({ id, title: id, level: 1, offset });
+    return () => { delete window.supermdHeading; };
+  }, [navigateOutlineHeading]);
+
   useEffect(() => {
     if (typeof window.matchMedia !== "function") return;
     const query = window.matchMedia("(max-width: 760px)");
-    const onChange = () => { setMobileUi(query.matches); if (query.matches) setView((current) => current === "split" ? "live" : current); };
+    const onChange = () => { setMobileUi(query.matches); if (query.matches) switchView(view === "split" ? "live" : view); };
     query.addEventListener("change", onChange);
     return () => query.removeEventListener("change", onChange);
-  }, []);
+  }, [switchView, view]);
 
   useEffect(() => {
     if (android) document.documentElement.dataset.platform = "android";
@@ -237,13 +330,87 @@ export default function App() {
   useEffect(() => { localStorage.setItem("images.trustedHosts", JSON.stringify(trustedImageHosts)); }, [trustedImageHosts]);
   useEffect(() => {
     const node = readingScrollRef.current;
-    if (!node) return;
+    if (!node || !previewReady) return;
     const measure = () => setPreviewViewportWidth(node.clientWidth);
     measure();
     const observer = new ResizeObserver(measure);
     observer.observe(node);
     return () => observer.disconnect();
-  }, [view]);
+  }, [view, activeTab.id, previewReady]);
+
+  useLayoutEffect(() => {
+    if (!previewReady) return;
+    if (pendingHeadingRef.current?.tabId === activeTab.id && pendingHeadingRef.current.view === view) {
+      modeOffsetRef.current = null;
+      return;
+    }
+    const startingInput = scrollInputVersion();
+    const saved = path ? loadReadingLocation(path) : null;
+    let targetOffset: number | undefined;
+    if (modeOffsetRef.current?.tabId === activeTab.id) {
+      targetOffset = modeOffsetRef.current.offset;
+      modeOffsetRef.current = null;
+    } else if (tabOffsetsRef.current.has(activeTab.id)) {
+      targetOffset = tabOffsetsRef.current.get(activeTab.id);
+    } else if (saved) {
+      targetOffset = saved.offset;
+    }
+    if (targetOffset === undefined) return;
+    let stopped = false;
+    const stop = () => { stopped = true; };
+    const inputs = ["wheel", "touchstart", "pointerdown", "keydown"] as const;
+    inputs.forEach((name) => window.addEventListener(name, stop, { capture: true, passive: true }));
+    const apply = () => {
+      if (stopped || scrollInputVersion() !== startingInput) return;
+      if (view === "editor" || view === "split") {
+        window.dispatchEvent(new CustomEvent("supermd-goto-offset", { detail: targetOffset }));
+      }
+      if (view !== "editor") {
+        const host = readingScrollRef.current;
+        if (host) revealReadingOffset(host, targetOffset);
+      }
+    };
+    const frame = requestAnimationFrame(() => { apply(); requestAnimationFrame(apply); });
+    const timers = [120, 320, 700].map((delay) => window.setTimeout(apply, delay));
+    return () => {
+      stopped = true;
+      cancelAnimationFrame(frame);
+      timers.forEach(window.clearTimeout);
+      inputs.forEach((name) => window.removeEventListener(name, stop, { capture: true }));
+    };
+  }, [activeTab.id, path, previewReady, view]);
+
+  useLayoutEffect(() => {
+    if (!previewReady) return;
+    const pending = pendingHeadingRef.current;
+    if (!pending) return;
+    pendingHeadingRef.current = null;
+    if (pending.tabId !== activeTab.id || pending.view !== view || pending.input !== scrollInputVersion()) return;
+    const host = readingScrollRef.current;
+    if (host) navigateToHeading(host, pending.headingId);
+  }, [activeTab.id, previewReady, view]);
+
+  useEffect(() => {
+    if (!previewReady) return;
+    const root = view === "editor" ? document.querySelector<HTMLElement>(".editor-pane .cm-scroller") : readingScrollRef.current;
+    if (!root) return;
+    let timer = 0;
+    const persist = () => {
+      if (!root.isConnected) return;
+      const offset = captureActiveOffset(activeTab.id, view);
+      tabOffsetsRef.current.set(activeTab.id, offset);
+      if (path) saveReadingLocation(path, { top: root.scrollTop, offset, zoom: zoomRef.current, mode: view });
+    };
+    const onScroll = () => { window.clearTimeout(timer); timer = window.setTimeout(persist, 600); };
+    root.addEventListener("scroll", onScroll, { passive: true });
+    window.addEventListener("pagehide", persist);
+    return () => {
+      window.clearTimeout(timer);
+      persist();
+      root.removeEventListener("scroll", onScroll);
+      window.removeEventListener("pagehide", persist);
+    };
+  }, [activeTab.id, captureActiveOffset, path, previewReady, view]);
 
   useEffect(() => {
     const inWorkspace = (target: EventTarget | null, x?: number, y?: number) =>
@@ -544,10 +711,20 @@ export default function App() {
     } else ["--primary", "--on-primary", "--surface", "--surface-low", "--surface-high", "--text", "--muted", "--outline"].forEach((name) => root.style.removeProperty(name));
   }, [activeTheme, caelestia, fullscreen]);
 
+  const togglePreviewTask = useCallback((baseSource: string, offset: number, checked: boolean): boolean => {
+    const tab = documentsRef.current.tabs.find((item) => item.id === documentsRef.current.activeId);
+    if (!tab) return false;
+    const aligned = applyAlignedTaskToggle(baseSource, tab.content, offset, checked);
+    if (!aligned) return false;
+    setDocuments((current) => editTab(current, tab.id, aligned.content));
+    return true;
+  }, []);
+
   const title = tabTitle(activeTab);
   const location = useMemo(() => path ? path.split(/[\\/]/).slice(0, -1).join("/") : "New document", [path]);
-  const lineCount = useMemo(() => content.split("\n").length, [content]);
-  const wordCount = useMemo(() => content.trim() ? content.trim().split(/\s+/).length : 0, [content]);
+  const lineCount = useMemo(() => countLines(content), [content]);
+  const previewSource = pinnedAnalysis?.source ?? content;
+  const wordCount = useMemo(() => countWords(previewSource), [previewSource]);
   const choosePython = async () => {
     const selected = await invoke<string | null>("choose_python");
     if (selected) { setPython(selected); localStorage.setItem("python", selected); }
@@ -583,7 +760,7 @@ export default function App() {
         </nav>
         <nav className="right-actions" aria-label="View and export">
           <div className="segmented" aria-label="View mode">
-            {(mobileUi ? ["live", "editor", "reader"] : ["editor", "live", "split", "reader"] as ViewMode[]).map((mode) => <button key={mode} className={view === mode ? "active" : ""} onClick={() => setView(mode as ViewMode)} title={`${mode[0].toUpperCase()}${mode.slice(1)} view`} aria-label={`${mode} view`} aria-pressed={view === mode}>{view === mode && <motion.i className="segment-indicator" layoutId="view-indicator" transition={motionEnabled ? spring.selector : { duration: 0 }} />}{mode === "editor" ? <PencilSimple size={17} /> : mode === "split" ? <Columns size={17} /> : mode === "live" ? <Sparkle size={17} /> : <BookOpen size={17} />}<span>{mode === "editor" && mobileUi ? "Source" : mode === "reader" && mobileUi ? "Read" : mode}</span></button>)}
+            {(mobileUi ? ["live", "editor", "reader"] : ["editor", "live", "split", "reader"] as ViewMode[]).map((mode) => <button key={mode} className={view === mode ? "active" : ""} onClick={() => switchView(mode as ViewMode)} title={`${mode[0].toUpperCase()}${mode.slice(1)} view`} aria-label={`${mode} view`} aria-pressed={view === mode}>{view === mode && <motion.i className="segment-indicator" layoutId="view-indicator" transition={motionEnabled ? spring.selector : { duration: 0 }} />}{mode === "editor" ? <PencilSimple size={17} /> : mode === "split" ? <Columns size={17} /> : mode === "live" ? <Sparkle size={17} /> : <BookOpen size={17} />}<span>{mode === "editor" && mobileUi ? "Source" : mode === "reader" && mobileUi ? "Read" : mode}</span></button>)}
           </div>
           <MaterialIconButton motion={motionEnabled} selected={focusMode} onClick={() => setFocusMode((value) => !value)} title="Focus mode" label="Focus mode"><Crosshair size={20} /></MaterialIconButton>
           <MaterialIconButton motion={motionEnabled} onClick={toggleFullscreen} title="Fullscreen · F11" label="Fullscreen"><ArrowsOut size={20} /></MaterialIconButton>
@@ -593,7 +770,7 @@ export default function App() {
       </header>}
       {!fullscreen && <div className="tab-strip" role="tablist" aria-label="Open documents">
         <div className="tab-scroll">{documents.tabs.map((tab) => <div key={tab.id} className={`document-tab ${tab.id === documents.activeId ? "selected" : ""}`} role="presentation">
-          <button role="tab" aria-selected={tab.id === documents.activeId} title={tab.path ?? tab.name} onClick={() => setDocuments((current) => ({ ...current, activeId: tab.id }))} onAuxClick={(event) => { if (event.button === 1) setDocuments((current) => closeTab(current, tab.id)); }}><span className={`tab-dot ${isDirty(tab) ? "dirty" : ""}`} /><span className="tab-name">{tabTitle(tab)}</span></button>
+          <button role="tab" aria-selected={tab.id === documents.activeId} title={tab.path ?? tab.name} onClick={() => selectTab(tab.id)} onAuxClick={(event) => { if (event.button === 1) setDocuments((current) => closeTab(current, tab.id)); }}><span className={`tab-dot ${isDirty(tab) ? "dirty" : ""}`} /><span className="tab-name">{tabTitle(tab)}</span></button>
           <button className="tab-close" onClick={() => setDocuments((current) => closeTab(current, tab.id))} title={`Close ${tabTitle(tab)}`} aria-label={`Close ${tabTitle(tab)}`}><X size={14} /></button>
         </div>)}</div>
         <button className="tab-add" onClick={newDocument} title="New tab · Ctrl+N" aria-label="New tab"><Plus size={17} /></button>
@@ -614,12 +791,12 @@ export default function App() {
       </div>}
       {fullscreen && <div className="fullscreen-controls" aria-label="Fullscreen controls"><button onClick={() => zoomBy(-10)} title="Zoom out"><Minus size={16} /></button><ZoomInput value={workspaceZoom} onChange={setZoom} /><button onClick={() => zoomBy(10)} title="Zoom in"><Plus size={16} /></button><span /><button onClick={toggleFullscreen} title="Leave fullscreen · F11"><ArrowsOut size={17} /></button></div>}
       <div className="work-area" style={{ "--folder-width": `${folderWidth}px` } as React.CSSProperties}>
-      {folderVisible && !fullscreen && <><FolderPanel root={folderRoot} activePath={path} onChoose={chooseFolder} onHide={() => setFolderVisible(false)} onOpen={openFolderFile} /><div className="folder-resizer" role="separator" aria-label="Resize folder sidebar" aria-orientation="vertical" tabIndex={0} onPointerDown={(e) => { folderDrag.current = true; e.currentTarget.setPointerCapture(e.pointerId); }} onPointerMove={(e) => { if (folderDrag.current) setFolderWidth(Math.max(180, Math.min(420, e.clientX))); }} onPointerUp={() => { folderDrag.current = false; }} onLostPointerCapture={() => { folderDrag.current = false; }} onKeyDown={(e) => { if (e.key === "ArrowLeft" || e.key === "ArrowRight") { e.preventDefault(); setFolderWidth((w) => Math.max(180, Math.min(420, w + (e.key === "ArrowRight" ? 10 : -10)))); } }} /></>}
+      {folderVisible && !fullscreen && <><FolderPanel root={folderRoot} activePath={path} outline={outline} onHeading={navigateOutlineHeading} onChoose={chooseFolder} onHide={() => setFolderVisible(false)} onOpen={openFolderFile} /><div className="folder-resizer" role="separator" aria-label="Resize folder sidebar" aria-orientation="vertical" tabIndex={0} onPointerDown={(e) => { folderDrag.current = true; e.currentTarget.setPointerCapture(e.pointerId); }} onPointerMove={(e) => { if (folderDrag.current) setFolderWidth(Math.max(180, Math.min(420, e.clientX))); }} onPointerUp={() => { folderDrag.current = false; }} onLostPointerCapture={() => { folderDrag.current = false; }} onKeyDown={(e) => { if (e.key === "ArrowLeft" || e.key === "ArrowRight") { e.preventDefault(); setFolderWidth((w) => Math.max(180, Math.min(420, w + (e.key === "ArrowRight" ? 10 : -10)))); } }} /></>}
       <main className="workspace" ref={workspaceRef} data-resizing={resizing || windowResizing} data-dragging-file={draggingFile} style={{ "--split-left": `${splitPercent}fr`, "--split-right": `${100 - splitPercent}fr`, "--workspace-scale": workspaceZoom / 100 } as React.CSSProperties}>
         {(view === "editor" || view === "split") && <motion.section layout={false} initial={false} transition={motionEnabled && !resizing && !windowResizing ? spring.surface : { duration: 0 }} className="editor-pane" aria-label="Markdown source"><div className="pane-head"><span><PencilSimple size={15} /> Markdown</span>{view === "editor" ? <span className="zoom-controls" aria-label="Workspace zoom"><button onClick={() => zoomBy(-10)} aria-label="Zoom out"><Minus size={14} /></button><ZoomInput value={workspaceZoom} onChange={setZoom} /><button onClick={() => zoomBy(10)} aria-label="Zoom in"><Plus size={14} /></button></span> : <small>{lineCount} lines</small>}</div><Editor key={activeTab.id} sessionId={activeTab.id} value={content} onChange={(value) => setDocuments((current) => editTab(current, activeTab.id, value))} dark={dark} focusMode={focusMode} /></motion.section>}
         {view === "split" && <div className="pane-resizer" role="separator" aria-label="Resize editor and preview" aria-orientation="vertical" aria-valuemin={25} aria-valuemax={75} aria-valuenow={splitPercent} tabIndex={0} onPointerDown={onResizePointerDown} onPointerMove={onResizePointerMove} onPointerUp={onResizePointerUp} onLostPointerCapture={() => setResizing(false)} onDoubleClick={() => setSplitPercent(50)} onKeyDown={(event) => { if (event.key === "ArrowLeft" || event.key === "ArrowRight") { event.preventDefault(); setSplitPercent((current) => Math.max(25, Math.min(75, current + (event.key === "ArrowRight" ? 5 : -5)))); } }}><span /></div>}
-        {(view === "reader" || view === "split") && <motion.section layout={false} initial={false} transition={motionEnabled && !resizing && !windowResizing ? spring.surface : { duration: 0 }} className="preview-pane" aria-label="Reading preview"><div className="pane-head"><span><BookOpen size={15} /> Preview</span><div className="preview-tools"><small>{wordCount} words</small><span className="zoom-controls" aria-label="Workspace zoom"><button onClick={() => zoomBy(-10)} title="Zoom out · Ctrl+-" aria-label="Zoom out"><Minus size={14} /></button><ZoomInput value={workspaceZoom} onChange={setZoom} /><button onClick={() => zoomBy(10)} title="Zoom in · Ctrl++" aria-label="Zoom in"><Plus size={14} /></button></span></div></div><div className="reading-scroll" ref={readingScrollRef}><div className="preview-page" style={{ width: previewLayoutWidth(previewViewportWidth, readerWidth, workspaceZoom), zoom: workspaceZoom / 100 }}><MarkdownPreview markdown={content} documentPath={path} python={python} dark={dark} trustedImageHosts={trustedImageHosts} onTrustImageHost={trustImageHost} /></div></div></motion.section>}
-        {view === "live" && <motion.section layout={false} initial={false} transition={motionEnabled && !windowResizing ? spring.surface : { duration: 0 }} className="live-pane" aria-label="Live Markdown"><div className="pane-head"><span><Sparkle size={15} /> Live preview</span><span className="preview-tools"><small>Click content to edit</small><ZoomInput value={workspaceZoom} onChange={setZoom} /></span></div><div className="reading-scroll"><LiveEditor key={activeTab.id} markdown={content} onChange={(value) => setDocuments((current) => editTab(current, activeTab.id, value))} documentPath={path} python={python} dark={dark} trustedImageHosts={trustedImageHosts} onTrustImageHost={trustImageHost} /></div></motion.section>}
+        {(view === "reader" || view === "split") && <motion.section layout={false} initial={false} transition={motionEnabled && !resizing && !windowResizing ? spring.surface : { duration: 0 }} className="preview-pane" aria-label="Reading preview"><div className="pane-head"><span><BookOpen size={15} /> Preview</span><div className="preview-tools"><small>{wordCount} words</small><span className="zoom-controls" aria-label="Workspace zoom"><button onClick={() => zoomBy(-10)} title="Zoom out · Ctrl+-" aria-label="Zoom out"><Minus size={14} /></button><ZoomInput value={workspaceZoom} onChange={setZoom} /><button onClick={() => zoomBy(10)} title="Zoom in · Ctrl++" aria-label="Zoom in"><Plus size={14} /></button></span></div></div><div className="reading-scroll" ref={readingScrollRef}>{pinnedAnalysis ? <div className="preview-page" style={{ width: previewLayoutWidth(previewViewportWidth, readerWidth, workspaceZoom), zoom: workspaceZoom / 100 }}><MarkdownPreview markdown={pinnedAnalysis.source} onToggleTask={togglePreviewTask} sourceAnalysis={pinnedAnalysis} documentPath={path} python={python} dark={dark} trustedImageHosts={trustedImageHosts} onTrustImageHost={trustImageHost} /></div> : <div className="reader-loading" role="status"><span className="expressive-loading-shape" aria-hidden="true"/>Preparing preview</div>}</div></motion.section>}
+        {view === "live" && <motion.section layout={false} initial={false} transition={motionEnabled && !windowResizing ? spring.surface : { duration: 0 }} className="live-pane" aria-label="Live Markdown"><div className="pane-head"><span><Sparkle size={15} /> Live preview</span><span className="preview-tools"><small>Click content to edit</small><ZoomInput value={workspaceZoom} onChange={setZoom} /></span></div><div className="reading-scroll" ref={readingScrollRef}>{pinnedAnalysis ? <LiveEditor key={activeTab.id} sessionId={activeTab.id} markdown={content} sourceAnalysis={pinnedAnalysis} onChange={(value) => setDocuments((current) => editTab(current, activeTab.id, value))} documentPath={path} python={python} dark={dark} trustedImageHosts={trustedImageHosts} onTrustImageHost={trustImageHost} /> : <div className="reader-loading" role="status"><span className="expressive-loading-shape" aria-hidden="true"/>Preparing preview</div>}</div></motion.section>}
       </main></div>
       <AnimatePresence>{notice && <motion.div key="notice" className="snackbar" initial={motionEnabled ? { opacity: 0, y: 18, x: "-50%", scale: .94 } : false} animate={{ opacity: 1, y: 0, x: "-50%", scale: 1 }} exit={motionEnabled ? { opacity: 0, y: 12, x: "-50%", scale: .96 } : { opacity: 0 }} transition={motionEnabled ? spring.surface : { duration: 0 }}>{notice}</motion.div>}</AnimatePresence>
       <AnimatePresence>{showSettings && <motion.div key="settings" className="scrim" initial={motionEnabled ? { opacity: 0 } : false} animate={{ opacity: 1 }} exit={{ opacity: 0 }} transition={{ duration: motionEnabled ? .24 : 0 }} onMouseDown={() => setShowSettings(false)}><motion.aside className="sheet" role="dialog" aria-modal="true" aria-label="Settings" initial={motionEnabled ? { opacity: 0, y: 40, scale: .9, borderRadius: 44 } : false} animate={{ opacity: 1, y: 0, scale: 1, borderRadius: 28 }} exit={motionEnabled ? { opacity: 0, y: 18, scale: .96 } : { opacity: 0 }} transition={motionEnabled ? spring.sheet : { duration: 0 }} onMouseDown={(event) => event.stopPropagation()}>
@@ -661,7 +838,7 @@ export default function App() {
         <MaterialButton className="primary-action" motion={motionEnabled} onClick={exportPdf} disabled={exporting}>{exporting ? exportFormat === "pdf" ? "Typesetting…" : "Packing images…" : "Choose destination & export"}</MaterialButton>
       </motion.aside></motion.div>}</AnimatePresence>
       {showWelcome && <WelcomeSetup theme={normalTheme} onTheme={setNormalTheme} readerFont={readerFont} onReaderFont={setReaderFont} motionEnabled={motionEnabled} onMotion={(enabled) => setReduceMotion(!enabled)} onFinish={(openFile) => { localStorage.setItem("setup.complete", "true"); localStorage.removeItem("setup.started"); setShowWelcome(false); if (openFile) window.setTimeout(() => open(), 100); }} />}
-      <MediaTools key={activeTab.id} documentId={activeTab.id} content={content} documentPath={path} onInsert={insertMedia} onNotice={flash} />
+      <MediaTools key={activeTab.id} documentId={activeTab.id} content={content} renderedContent={pinnedAnalysis?.source} documentPath={path} onInsert={insertMedia} onNotice={flash} />
     </div>
     </MotionConfig>
   );
