@@ -10,7 +10,15 @@ export const looksLikeSvg = (text: string) => SVG_START.test(text) && SVG_END.te
 export function remarkSvgBlocks(this: unknown) {
   return (tree: any, file: { value?: unknown }) => {
     const source = typeof file?.value === "string" ? file.value : "";
-    const slice = (first: any, last: any) => first?.position && last?.position && source ? source.slice(first.position.start.offset, last.position.end.offset) : "";
+    const slice = (first: any, last: any) => {
+      if (!first?.position || !last?.position || !source) return "";
+      const start = first.position.start.offset;
+      const prefix = source.slice(source.lastIndexOf("\n", start - 1) + 1, start);
+      const raw = source.slice(start, last.position.end.offset);
+      if (!prefix || !/^[ >\t]*>[ >\t]*$/.test(prefix)) return raw;
+      const quotePrefix = prefix.replace(/[ \t]+$/, "").replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+      return raw.replace(new RegExp(`(\\r?\\n)${quotePrefix}[ \\t]?`, "g"), "$1");
+    };
     visit(tree, "code", (node: any) => {
       if ((!node.lang || ["xml", "html", "svg+xml", "image/svg+xml"].includes(String(node.lang).toLowerCase())) && looksLikeSvg(node.value)) node.lang = "svg";
     });
@@ -18,15 +26,33 @@ export function remarkSvgBlocks(this: unknown) {
       const children = parent.children;
       for (let index = 0; index < children.length; index++) {
         const node = children[index];
-        const text = node.type === "html" ? node.value : node.type === "paragraph" ? slice(node, node) : "";
-        if (!text || !/^\s*(?:<\?xml[^>]*\?>\s*)?<svg[\s>]/i.test(text)) continue;
+        let svgNode = node;
+        let headChildren: any[] | null = null;
+        let text = node.type === "html" ? node.value : node.type === "paragraph" ? slice(node, node) : "";
+        if (node.type === "paragraph" && text && !SVG_START.test(text) && /^(?:\[![\w-]+\]|:::callout\s)/i.test(text) && Array.isArray(node.children)) {
+          const childIdx = node.children.findIndex((c: any) => c.type === "html" && SVG_START.test(c.value));
+          if (childIdx > 0) {
+            svgNode = node.children[childIdx];
+            headChildren = node.children.slice(0, childIdx);
+            text = slice(svgNode, node);
+          }
+        }
+        if (!text || !SVG_START.test(text)) continue;
         // An SVG with blank lines splits into several blocks: join until </svg>.
         let end = index;
-        while (end < children.length && !SVG_END.test(slice(node, children[end]) || "")) end++;
+        while (end < children.length && !SVG_END.test(slice(svgNode, children[end]) || "")) end++;
         if (end >= children.length) continue;
-        const value = slice(node, children[end]);
+        const value = slice(svgNode, children[end]);
         if (!looksLikeSvg(value)) continue;
-        children.splice(index, end - index + 1, { type: "code", lang: "svg", value: value.trim(), position: { start: node.position.start, end: children[end].position.end } });
+        const codeNode = { type: "code", lang: "svg", value: value.trim(), position: { start: svgNode.position.start, end: children[end].position.end } };
+        if (headChildren) {
+          const lastHead = headChildren[headChildren.length - 1];
+          const trimmedHead = lastHead?.type === "text" ? [...headChildren.slice(0, -1), { ...lastHead, value: lastHead.value.replace(/\r?\n[ \t]*$/, "") }] : headChildren;
+          children.splice(index, end - index + 1, { ...node, children: trimmedHead, position: { start: node.position.start, end: lastHead.position?.end ?? svgNode.position.start } }, codeNode);
+          index++;
+        } else {
+          children.splice(index, end - index + 1, codeNode);
+        }
       }
       return undefined;
     });
