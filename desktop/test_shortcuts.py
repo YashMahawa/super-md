@@ -8,6 +8,7 @@ from shortcuts import capture_sequence, default_shortcuts, native_label, normali
 class ShortcutValidationTest(unittest.TestCase):
     def test_default_bindings_are_valid_and_have_platform_native_labels(self):
         defaults = default_shortcuts()
+        self.assertEqual(defaults["save_as"], ["Ctrl+Shift+S"])
         normalized, error = normalize_shortcuts(defaults)
         self.assertEqual(error, "")
         self.assertEqual(normalized, defaults)

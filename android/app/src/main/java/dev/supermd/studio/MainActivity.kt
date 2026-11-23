@@ -120,6 +120,8 @@ class MainActivity : ComponentActivity() {
     var dismissDocument: (() -> Unit)? = null
     var saveReaderPosition: (() -> Unit)? = null
     var openReaderFind: (() -> Unit)? = null
+    var saveNote: (() -> Unit)? = null
+    var saveNoteAs: (() -> Unit)? = null
     val agentAccessState: AgentAccessState by lazy { AgentAccessState(this) }
     var agentRelayState by mutableStateOf(AgentRelayClient.State.DISCONNECTED)
         private set
@@ -411,6 +413,7 @@ class MainActivity : ComponentActivity() {
             if (event.isCtrlPressed && event.keyCode == android.view.KeyEvent.KEYCODE_N) { newWindow(); return true }
             if (event.isCtrlPressed) {
                 when(event.keyCode) {
+                    android.view.KeyEvent.KEYCODE_S -> { if(event.isShiftPressed) saveNoteAs?.invoke() else saveNote?.invoke(); return true }
                     android.view.KeyEvent.KEYCODE_T -> { if(event.isShiftPressed)model.reopen() else model.newNote();return true }
                     android.view.KeyEvent.KEYCODE_W -> { if(event.isShiftPressed)finish() else model.close(model.state.value.active.id);return true }
                     android.view.KeyEvent.KEYCODE_TAB -> { model.cycle(if(event.isShiftPressed)-1 else 1);return true }
@@ -909,6 +912,7 @@ private object NoMotionScheme : MotionScheme {
     var hinge by remember { mutableStateOf<FoldingFeature?>(null) }
     val recent by model.recent.collectAsStateWithLifecycle()
     val accessRequest by model.documentAccessRequests.collectAsStateWithLifecycle()
+    val saveConflict by model.saveConflict.collectAsStateWithLifecycle()
     var accessPickerShowing by rememberSaveable { mutableStateOf(false) }
     val accessPicker = rememberLauncherForActivityResult(RestoreDocumentAccess()) { uri ->
         accessPickerShowing = false
@@ -939,6 +943,7 @@ private object NoMotionScheme : MotionScheme {
     }
     val portable = rememberLauncherForActivityResult(NoteDestination("application/vnd.supermd.smd", model::noteLocation)) { uri ->
         if (uri != null) { model.setPortableDestination(uri); model.busy(true); web?.evaluateJavascript("window.supermdPortable?.(false)", null) ?: model.fail("The reader is not ready") }
+        else model.cancelPortableSaveAs()
     }
     var pendingAgentExport by remember { mutableStateOf<JSONObject?>(null) }
     DisposableEffect(activity, model, state.active.name, state.pdf) {
@@ -987,8 +992,35 @@ private object NoMotionScheme : MotionScheme {
         }
         onDispose { activity.setAgentUiHandler(null) }
     }
-    DisposableEffect(portable, state.active.name) { model.requestPortable = { portable.launch(state.active.name.substringBeforeLast('.') + ".smd") }; onDispose { model.requestPortable = null } }
-    val saveAction: () -> Unit = { if (model.requestWriteAccessIfBlocked(state.active.id, explicit = true)) Unit else if (state.active.uri == null) save.launch(state.active.name.substringBeforeLast('.') + ".md") else if (state.active.portable) { model.busy(true); web?.evaluateJavascript("window.supermdPortable?.(true)", null) ?: model.fail("The reader is not ready") } else model.save(); Unit }
+    DisposableEffect(portable, state.active.name) { model.requestPortable = { model.cancelPortableSaveAs(); portable.launch(state.active.name.substringBeforeLast('.') + ".smd") }; onDispose { model.requestPortable = null } }
+    val launchSaveAsPicker: (Note) -> Unit = { note ->
+        if (note.portable) {
+            model.beginPortableSaveAs(note.id)
+            portable.launch(note.name.substringBeforeLast('.') + ".smd")
+        } else {
+            save.launch(note.name.substringBeforeLast('.') + ".md")
+        }
+    }
+    val saveAsAction: () -> Unit = {
+        if (!state.busy) model.prepareSaveAs(state.active.id, launchSaveAsPicker)
+    }
+    val saveAction: () -> Unit = {
+        if (model.requestWriteAccessIfBlocked(state.active.id, explicit = true)) Unit
+        else if (state.active.uri == null) model.prepareSaveAs(state.active.id, launchSaveAsPicker)
+        else if (state.active.portable) { model.busy(true); web?.evaluateJavascript("window.supermdPortable?.(true)", null) ?: model.fail("The reader is not ready") }
+        else model.save()
+        Unit
+    }
+    SideEffect {
+        activity.saveNote = saveAction
+        activity.saveNoteAs = saveAsAction
+    }
+    DisposableEffect(activity) {
+        onDispose {
+            activity.saveNote = null
+            activity.saveNoteAs = null
+        }
+    }
     LaunchedEffect(state.message) { state.message?.let { snackbar.showSnackbar(it); model.dismissMessage() } }
     val immersive = (state.fullscreen || !readingChromeVisible || state.readerOverlay) && !settings
     LaunchedEffect(immersive, dark) {
@@ -1005,16 +1037,18 @@ private object NoMotionScheme : MotionScheme {
         val wide = displayIsLarge && maxWidth >= 720.dp && maxHeight >= 400.dp
         val actualMode = if (!wide && state.mode == "split") "live" else state.mode
         val readerContent=remember {arrayOfNulls<String>(1)}
+        val readerAssetDir=remember {arrayOfNulls<String>(1)}
         LaunchedEffect(readerReady, state.active, actualMode, dark, state.fullscreen, state.font, state.size, state.widthPercent,state.lineHeight,state.spellCheck,state.grammarCheck,state.latexAutofix,state.restorePosition,state.centerLock,state.imageAppearance,state.svgAppearance,state.imageContrast,state.fullDocumentAccessibility,state.customTheme,state.patternKind,state.patternOpacity,state.patternSize,state.patternSpacing,tokens, hinge, motion) {
-            if (!readerReady) readerNote[0] = null
+            if (!readerReady) { readerNote[0] = null; readerAssetDir[0] = null }
             if (readerReady) {
                 val note = state.active
-                val payload = JSONObject().put("id", note.id).put("editProtocol", 1).apply { if (readerNote[0] == note.id && (readerContent[0] === note.content || model.readerEcho[note.id] === note.content)) put("contentUnchanged", true) else put("content", note.content) }.put("path", note.uri ?: note.id).put("mode", actualMode).put("dark", dark).put("fullscreen", state.fullscreen).put("font", state.font).put("size", state.size).put("widthPercent",state.widthPercent).put("lineHeight",state.lineHeight).put("spellCheck",state.spellCheck).put("grammarCheck",state.grammarCheck).put("latexAutofix",state.latexAutofix).put("restorePosition",state.restorePosition).put("centerLock",state.centerLock).put("imageAppearance",state.imageAppearance).put("svgAppearance",state.svgAppearance).put("imageContrast",state.imageContrast).put("fullDocumentAccessibility",state.fullDocumentAccessibility).put("colors", tokens).put("zoom", state.zoom).put("motion", motion)
+                val payload = JSONObject().put("id", note.id).put("editProtocol", 1).apply { if (readerNote[0] == note.id && readerAssetDir[0] == note.assetDirectory && (readerContent[0] === note.content || model.readerEcho[note.id] === note.content)) put("contentUnchanged", true) else put("content", note.content) }.put("path", note.uri ?: note.id).put("mode", actualMode).put("dark", dark).put("fullscreen", state.fullscreen).put("font", state.font).put("size", state.size).put("widthPercent",state.widthPercent).put("lineHeight",state.lineHeight).put("spellCheck",state.spellCheck).put("grammarCheck",state.grammarCheck).put("latexAutofix",state.latexAutofix).put("restorePosition",state.restorePosition).put("centerLock",state.centerLock).put("imageAppearance",state.imageAppearance).put("svgAppearance",state.svgAppearance).put("imageContrast",state.imageContrast).put("fullDocumentAccessibility",state.fullDocumentAccessibility).put("colors", tokens).put("zoom", state.zoom).put("motion", motion)
                 payload.put("readingLocation",model.readingLocation(note.uri))
                 payload.put("customStyle",themeStyle(themeDocument(state.customTheme),if(state.fullscreen)state.fullscreenTheme else state.theme,dark,state.patternKind,state.patternOpacity,state.patternSize,state.patternSpacing))
                 web?.evaluateJavascript("document.documentElement.dataset.platform='android';window.supermdLoad?.($payload)", null)
                 readerNote[0] = note.id
                 readerContent[0] = note.content
+                readerAssetDir[0] = note.assetDirectory
                 val hingeGap = if (hinge != null && actualMode == "split") hinge!!.bounds.width() / density.density else 0f
                 web?.evaluateJavascript("document.querySelector('.android-document')?.style.setProperty('gap','${hingeGap}px')", null)
             }
@@ -1043,6 +1077,31 @@ private object NoMotionScheme : MotionScheme {
             if(readerReady) web?.evaluateJavascript("document.documentElement.style.setProperty('--native-safe-top','${safeTop}px')",null)
         }
         if(contentsShown) AlertDialog(onDismissRequest={contentsShown=false},title={Text("Contents")},text={OutlinePanel(headings,state.active.id){heading->readingChromeVisible=false;web?.evaluateJavascript("window.supermdHeading?.(${JSONObject.quote(heading.id)},${heading.offset})",null);contentsShown=false}},confirmButton={TextButton(onClick={contentsShown=false}){Text("Close")}})
+        saveConflict?.let { conflict ->
+            AlertDialog(
+                onDismissRequest = model::dismissSaveConflict,
+                title = { Text("${conflict.name} changed outside Super MD") },
+                text = {
+                    Column(verticalArrangement = Arrangement.spacedBy(12.dp)) {
+                        Text("Another app or sync client modified this file on disk. Save a copy to keep both versions, overwrite the disk file with your edits, or reload the disk version (your local draft will be archived in closed-note recovery).")
+                        FlowRow(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(8.dp, Alignment.End)) {
+                            TextButton(onClick = model::resolveConflictReload) { Text("Reload") }
+                            TextButton(onClick = {
+                                model.resolveConflictOverwrite {
+                                    web?.evaluateJavascript("window.supermdPortable?.(true)", null) ?: model.fail("The reader is not ready")
+                                }
+                            }) { Text("Overwrite") }
+                        }
+                    }
+                },
+                dismissButton = {
+                    TextButton(onClick = model::dismissSaveConflict) { Text("Cancel") }
+                },
+                confirmButton = {
+                    Button(onClick = { model.resolveConflictSaveCopy(launchSaveAsPicker) }) { Text("Save a copy") }
+                },
+            )
+        }
         // Closed-drawer drag recognition steals diagonal scrolls and pinch
         // gestures from WebView. Opening is deliberate (menu button); dragging
         // still dismisses an already-open drawer.
@@ -1089,6 +1148,7 @@ private object NoMotionScheme : MotionScheme {
                             StudyIcon(if(state.fullscreen) "Exit fullscreen" else "Fullscreen study", if(state.fullscreen) R.drawable.symbol_fullscreen_exit else R.drawable.symbol_fullscreen) { model.fullscreen(!state.fullscreen) }
                             StudyIcon(if(state.centerLock) "Centre locked · unlock horizontal movement" else "Lock document to centre",if(state.centerLock) R.drawable.symbol_lock else R.drawable.symbol_lock_open) { model.centerLock(!state.centerLock) }
                             Box { IconButton(onClick = { menu = true }) { Icon(Icons.Rounded.MoreVert, "More actions") }; DropdownMenu(expanded = menu, onDismissRequest = { menu = false }) {
+                                DropdownMenuItem(text = { Text("Save as") }, enabled = !state.busy, onClick = { menu = false; saveAsAction() }, leadingIcon = { Icon(painterResource(R.drawable.symbol_save), null) })
                                 DropdownMenuItem(text = { Text("New window") }, onClick = { menu = false; activity.newWindow() }, leadingIcon = { Icon(painterResource(R.drawable.symbol_open_window), null) })
                                 DropdownMenuItem(text = { Text("Share note") }, enabled = readerReady && !state.busy, onClick = { menu = false; sharing = true; exporting = true }, leadingIcon = { Icon(painterResource(R.drawable.symbol_share), null) })
                                 DropdownMenuItem(text = { Text("Insert image or link") }, onClick = { menu = false; web?.evaluateJavascript("window.supermdMedia?.()", null) }, leadingIcon = { Icon(painterResource(R.drawable.symbol_image), null) })
@@ -1253,8 +1313,7 @@ private object NoMotionScheme : MotionScheme {
                 Text(request.detail ?: if(request.assetSource == null) DOCUMENT_ACCESS_MESSAGE else LINKED_ASSET_ACCESS_MESSAGE)
                 if (request.assetSource == null && request.noteId == state.active.id) TextButton(onClick = {
                     model.dismissDocumentAccess()
-                    if (state.active.portable) portable.launch(state.active.name.substringBeforeLast('.') + ".smd")
-                    else save.launch(state.active.name.substringBeforeLast('.') + ".md")
+                    saveAsAction()
                 }) { Text("Save a copy instead") }
             } },
             confirmButton = { TextButton(onClick = { accessPickerShowing = true; accessPicker.launch(android.net.Uri.parse(request.uri)) }) { Text(if(request.assetSource == null) "Choose original file" else "Choose linked file") } },
