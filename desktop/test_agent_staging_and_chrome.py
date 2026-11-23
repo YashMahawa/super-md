@@ -9,6 +9,7 @@ import textwrap
 import time
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 os.environ.setdefault("QT_QUICK_BACKEND", "software")
@@ -107,12 +108,12 @@ class DesktopAgentStagingAndChromeTests(unittest.TestCase):
         cls.app = QGuiApplication.instance() or QGuiApplication(["Super MD desktop agent staging tests"])
 
     def make_studio(self, root: Path | None = None):
-        session = Session(True)
         if root is not None:
-            session.data = root
+            with patch("studio.tempfile.mkdtemp", return_value=str(root)):
+                session = Session(True)
+        else:
+            session = Session(True)
         studio = QuietStudio(True, session)
-        if root is not None:
-            studio.data = root
         studio.settings["welcomed"] = True
         studio.settings["autosave"] = True
         studio._emit(False)
@@ -246,6 +247,7 @@ ApplicationWindow {{
             studio.settings["agentAccessEnabled"] = True
             studio._emit(False)
             self.app.processEvents()
+            QTest.qWait(20)
             self.assertTrue(pill.property("visible"))
 
             # Clicking the pill opens Settings directly to the "agents" section
@@ -391,12 +393,16 @@ ApplicationWindow {{
                 self.assertFalse(bg_tab["agent_staged"])
                 self.assertTrue(bg_tab["agent_unreviewed"])
                 self.assertFalse(jump_bar.property("visible"))
-                self.assertTrue(reader_loads)
-                load_payload = reader_loads[-1]
+                bg_loads = [item for item in reader_loads if item.get("id") == bg_tab["id"]]
+                self.assertTrue(bg_loads)
+                load_payload = bg_loads[0]
                 self.assertEqual(load_payload["id"], bg_tab["id"])
                 self.assertTrue(load_payload["agentUnreviewed"])
                 self.assertEqual(len(load_payload["pendingAgentEdits"]), 1)
                 self.assertIn("Staged AI text.", load_payload["pendingAgentEdits"][0]["after"])
+                for follow_up in bg_loads[1:]:
+                    self.assertTrue(follow_up.get("agentUnreviewed"))
+                    self.assertNotIn("pendingAgentEdits", follow_up)
 
                 # Now that the user opened the tab, autosave resumes and writes to disk
                 studio._autosave()
