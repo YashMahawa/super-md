@@ -23,7 +23,7 @@ import {svgDataBackdrop} from '../svgImage';
 import {adaptSvgData} from '../svgTheme';
 import {analyzeDocument} from '../documentAnalysis';
 import type {SourceDocumentAnalysis} from '../documentAnalysis';
-import {resolveReaderRasterAsset} from '../readerAssets';
+import {isSvgAssetPath,resolveReaderRasterAsset} from '../readerAssets';
 import {commitMediaLayout} from '../mediaLayout';
 import {registerMedia,installMediaMenu} from '../mediaExport';
 import type {ReaderAccessibilityPreference} from '../types';
@@ -155,7 +155,7 @@ function AssetImage({ src = "", alt = "", documentPath, trustedImageHosts, onTru
     if (!documentPath && !/^assets\/import-[\w-]+\./.test(src)) { queueMicrotask(()=>fail("Save this document to resolve relative images.")); return ()=>{active=false;}; }
     (async () => {
       try {
-        const streamed = documentPath ? await resolveReaderRasterAsset(documentPath, src) : null;
+        const streamed = documentPath && !isSvgAssetPath(src) ? await resolveReaderRasterAsset(documentPath, src) : null;
         if (!active) return;
         if (streamed) { commitMediaLayout(mediaElement.current,()=>setResolved(streamed)); return; }
         const value = await invoke<string>("load_asset", { documentPath: documentPath || "", source: src });
