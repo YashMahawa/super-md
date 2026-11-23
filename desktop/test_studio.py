@@ -1050,10 +1050,7 @@ class StudioTest(unittest.TestCase):
         studio.readerLoad.connect(lambda raw: loads.append(json.loads(raw)))
         studio.replied.connect(lambda req_id, value, err: replies.append((req_id, value, err)))
 
-        import tempfile
-        temp = tempfile.TemporaryDirectory()
-        self.addCleanup(temp.cleanup)
-        folder = Path(temp.name) / "workspace"
+        folder = studio.data / "workspace"
         sub = folder / "sub"
         sub.mkdir(parents=True)
         index_note = folder / "Index.md"
@@ -1067,29 +1064,37 @@ class StudioTest(unittest.TestCase):
 
         studio.openFolder(str(folder))
         studio.openNote(str(index_note))
-        self._wait_for(lambda: studio._current()["path"] == str(index_note))
+        self._wait_for(lambda: studio._current()["path"] == str(index_note.resolve()))
         loads.clear()
         replies.clear()
 
         studio.post("rel-1", "open_relative_note", json.dumps({
-            "documentPath": str(index_note),
+            "documentPath": str(index_note.resolve()),
             "target": "Task%20Note.md",
         }))
         self._wait_for(lambda: any(r[0] == "rel-1" for r in replies))
         self.assertEqual(replies[-1], ("rel-1", "true", ""))
-        self.assertEqual(studio._current()["path"], str(task_note))
+        self.assertEqual(studio._current()["path"], str(task_note.resolve()))
         self.assertNotIn("pendingHeading", loads[-1])
 
         loads.clear()
         replies.clear()
+        noncanonical_task_ref = str(task_note.parent) + os.sep + "." + os.sep + task_note.name
+        alias_root = studio.data / "workspace-alias"
+        try:
+            alias_root.symlink_to(folder, target_is_directory=True)
+            noncanonical_task_ref = str(alias_root / task_note.name)
+        except OSError as error:
+            if getattr(error, "winerror", None) != 1314:
+                raise
         studio.post("rel-2", "open_relative_note", json.dumps({
-            "documentPath": str(task_note),
+            "documentPath": noncanonical_task_ref,
             "target": "Lecture%202.md",
             "heading": "bayes",
         }))
         self._wait_for(lambda: any(r[0] == "rel-2" for r in replies))
         self.assertEqual(replies[-1], ("rel-2", "true", ""))
-        self.assertEqual(studio._current()["path"], str(lecture_note))
+        self.assertEqual(studio._current()["path"], str(lecture_note.resolve()))
         self.assertEqual(loads[-1].get("pendingHeading"), "bayes")
 
         # Subsequent emits must not re-send the one-shot pendingHeading.
@@ -1100,23 +1105,23 @@ class StudioTest(unittest.TestCase):
         # Opening a subfolder .smd note and navigating back up within the authorized workspace folder succeeds.
         replies.clear()
         studio.post("rel-3", "open_relative_note", json.dumps({
-            "documentPath": str(lecture_note),
+            "documentPath": str(lecture_note.resolve()),
             "target": "sub/study.smd",
         }))
         self._wait_for(lambda: any(r[0] == "rel-3" for r in replies))
         self.assertEqual(replies[-1], ("rel-3", "true", ""))
-        self.assertEqual(studio._current()["path"], str(deck_note))
+        self.assertEqual(studio._current()["path"], str(deck_note.resolve()))
 
         loads.clear()
         replies.clear()
         studio.post("rel-4", "open_relative_note", json.dumps({
-            "documentPath": str(deck_note),
+            "documentPath": str(deck_note.resolve()),
             "target": "../Lecture%202.md",
             "heading": "bayes",
         }))
         self._wait_for(lambda: any(r[0] == "rel-4" for r in replies))
         self.assertEqual(replies[-1], ("rel-4", "true", ""))
-        self.assertEqual(studio._current()["path"], str(lecture_note))
+        self.assertEqual(studio._current()["path"], str(lecture_note.resolve()))
         self.assertEqual(loads[-1].get("pendingHeading"), "bayes")
 
     def test_open_relative_note_rejects_unsaved_notes_traversal_encoded_separators_null_bytes_and_symlinks(self):
@@ -1136,39 +1141,64 @@ class StudioTest(unittest.TestCase):
         self.assertIn("Save this note", replies[-1][2])
         self.assertEqual(studio.message, "Save this note before opening linked notes.")
 
-        import tempfile
-        temp = tempfile.TemporaryDirectory()
-        self.addCleanup(temp.cleanup)
-        folder = Path(temp.name) / "guarded"
+        sandbox = studio.data / "containment"
+        folder = sandbox / "guarded"
         folder.mkdir(parents=True)
-        outside = Path(temp.name) / "outside.md"
+        outside = sandbox / "outside.md"
         outside.write_text("# Secret\n", encoding="utf-8")
         inside = folder / "Inside.md"
         inside.write_text("# Inside\n", encoding="utf-8")
         symlink_note = folder / "Symlink.md"
-        symlink_note.symlink_to(outside)
+        has_symlink = False
+        try:
+            symlink_note.symlink_to(outside)
+            has_symlink = True
+        except OSError as error:
+            if getattr(error, "winerror", None) != 1314:
+                raise
 
         studio.openNote(str(inside))
-        self._wait_for(lambda: studio._current()["path"] == str(inside))
+        self._wait_for(lambda: studio._current()["path"] == str(inside.resolve()))
 
-        for index, bad_target in enumerate([
+        bad_targets = [
             "../outside.md",
             "sub%2f..%2f..%2foutside.md",
             "sub%5cnote.md",
             "bad%00.md",
             "bad\x00.md",
             "/etc/passwd.md",
-            "Symlink.md",
-        ]):
+        ]
+        if has_symlink:
+            bad_targets.append("Symlink.md")
+
+        for index, bad_target in enumerate(bad_targets):
             replies.clear()
             studio.message = ""
             req = f"bad-{index}"
             studio.post(req, "open_relative_note", json.dumps({
-                "documentPath": str(inside),
+                "documentPath": str(inside.resolve()),
                 "target": bad_target,
             }))
             self.assertEqual(replies[-1][0], req)
             self.assertEqual(replies[-1][1], "null")
             self.assertTrue(bool(replies[-1][2]), f"Expected rejection for {bad_target}")
             self.assertEqual(studio.message, replies[-1][2])
-            self.assertEqual(studio._current()["path"], str(inside))
+            self.assertEqual(studio._current()["path"], str(inside.resolve()))
+
+        if not has_symlink:
+            replies.clear()
+            studio.message = ""
+            with patch.object(Path, "is_symlink", autospec=True, side_effect=lambda p: p.name == "MockLink.md"):
+                studio.post("bad-mock-link", "open_relative_note", json.dumps({
+                    "documentPath": str(inside.resolve()),
+                    "target": "MockLink.md",
+                }))
+            self.assertEqual(replies[-1][0], "bad-mock-link")
+            self.assertEqual(replies[-1][1], "null")
+            self.assertIn("symlink", replies[-1][2])
+
+        self.assertTrue(studio.note_watcher.files() or studio.note_watcher.directories())
+        studio.stop()
+        self.assertEqual(studio.note_watcher.files(), [])
+        self.assertEqual(studio.note_watcher.directories(), [])
+

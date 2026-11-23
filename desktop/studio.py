@@ -771,6 +771,10 @@ class Studio(QObject):
         self.autosave_timer.stop()
         self.flush_timer.stop()
         self.external_timer.stop()
+        for watcher in (self.note_watcher, self.palette_watcher, self.custom_theme_watcher):
+            watched = watcher.files() + watcher.directories()
+            if watched:
+                watcher.removePaths(watched)
         self._recover()
         self.session.reader_assets.revoke_owner(self.window_id)
         self._retired = True
@@ -3305,6 +3309,13 @@ class Studio(QObject):
                     raise ValueError("Invalid heading target")
                 heading = raw_heading.strip() if isinstance(raw_heading, str) and raw_heading.strip() else None
                 source_tab = next((item for item in self.tabs if document_ref in (item["id"], item["path"])), None) if isinstance(document_ref, str) and document_ref else None
+                if source_tab is None and isinstance(document_ref, str) and document_ref and "\x00" not in document_ref:
+                    try:
+                        if QUrl(document_ref).isLocalFile() or Path(document_ref).is_absolute():
+                            canonical_ref = str(local_path(document_ref))
+                            source_tab = next((item for item in self.tabs if item["path"] == canonical_ref), None)
+                    except OSError:
+                        pass
                 if source_tab is None:
                     source_tab = self._current() if not document_ref else None
                 if source_tab is None:
@@ -3629,13 +3640,19 @@ class Studio(QObject):
                     current = parent
                 else:
                     current = current / part
-                    if current.is_symlink():
+                    try:
+                        is_link = current.is_symlink() or getattr(current, "is_junction", lambda: False)()
+                    except OSError as invalid:
+                        raise ValueError("Invalid relative note path.") from invalid
+                    if is_link:
                         raise ValueError("Linked note symlink paths are not allowed.")
             try:
                 resolved = current.resolve(strict=True)
             except FileNotFoundError as missing:
                 last_missing = missing
                 continue
+            except OSError as invalid:
+                raise ValueError("Invalid relative note path.") from invalid
             if not resolved.is_relative_to(boundary) or not resolved.is_file():
                 raise ValueError("Linked note is outside the authorized folder.")
             return resolved
