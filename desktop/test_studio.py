@@ -13,6 +13,12 @@ from documents import atomic_json
 import updates
 
 class QuietStudio(Studio):
+    def __init__(self, isolated: bool = False, session: Session | None = None):
+        session = session or Session(isolated)
+        if not session.settings.get("python"):
+            session.settings["python"] = sys.executable
+        super().__init__(isolated, session)
+
     def _refresh_theme(self):
         self.system_dark = True
 
