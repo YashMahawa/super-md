@@ -4,12 +4,15 @@ pub mod theme;
 pub mod pdf_assets;
 mod math_compatibility;
 mod step_grid;
+mod typesetter;
+#[doc(hidden)]
+pub use typesetter::{diagnostics, COMEMO_EVICT_MAX_AGE, CUSTOM_FONT_CACHE_MAX_BYTES, CUSTOM_FONT_CACHE_MAX_ENTRIES};
+pub(crate) use typesetter::{is_font_asset, validate_asset_path};
 use math_compatibility::compatible_math;
 use anyhow::{bail, Result};
 use pulldown_cmark::{Alignment, CodeBlockKind, Event, Options, Parser, Tag, TagEnd};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
-use typst_as_lib::{typst_kit_options::TypstKitFontOptions, TypstEngine};
 
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", default)]
@@ -194,7 +197,8 @@ impl<'a> Renderer<'a> {
                         Tag::Image { dest_url, .. } => {
                             let _alt = self.render(Some(close))?;
                             let key = dest_url.to_string();
-                            if !self.assets.contains_key(&key) { bail!("Image unavailable for PDF: {key}"); }
+                            validate_asset_path(&key)?;
+                            if is_font_asset(&key) || !self.assets.contains_key(&key) { bail!("Image unavailable for PDF: {key}"); }
                             out.push_str(&format!("#smd-image({})", string(&key)));
                         },
                         Tag::Table(columns) => {
@@ -303,7 +307,7 @@ pub fn source(markdown: &str, options: &PdfOptions, assets: &HashMap<String, Vec
     }
     renderer.footnotes = definitions.footnotes;
     let body = renderer.render(None)?;
-    let template = if options.page_numbers { include_str!("document.typ").to_string() } else { include_str!("document.typ").lines().filter(|line| !line.starts_with("#set page(footer:")).collect::<Vec<_>>().join("\n") };
+    let template: &str = if options.page_numbers { include_str!("document.typ") } else { &typesetter::UNNUMBERED_DOCUMENT_TEMPLATE };
     let paper=match options.page_size.as_str() {"letter"=>"us-letter","legal"=>"us-legal","tabloid"=>"us-tabloid","executive"=>"us-executive",other=>other};
     // MiTeX's bundled conversion spec still emits Typst's former `sect`
     // intersection name. Typst 0.15 calls it `inter`. Scope aliases preserve
@@ -326,38 +330,15 @@ pub fn source(markdown: &str, options: &PdfOptions, assets: &HashMap<String, Vec
 
 pub fn export(markdown: &str, options: &PdfOptions, assets: &HashMap<String, Vec<u8>>) -> Result<Vec<u8>> {
     let source = source(markdown, options, assets)?;
-    let engine = TypstEngine::builder()
-        .main_file(source)
-        .fonts([
-            include_bytes!("../fonts/NotoSans-Regular.ttf").as_slice(),
-            include_bytes!("../fonts/NotoSans-Bold.ttf").as_slice(),
-            include_bytes!("../fonts/NotoSans-Italic.ttf").as_slice(),
-            include_bytes!("../fonts/NotoSans-BoldItalic.ttf").as_slice(),
-            include_bytes!("../fonts/Manrope.ttf").as_slice(),
-            include_bytes!("../fonts/Roboto.ttf").as_slice(),
-            include_bytes!("../fonts/NotoSerif.ttf").as_slice(),
-            include_bytes!("../fonts/JetBrainsMono.ttf").as_slice(),
-            include_bytes!("../fonts/NotoEmoji.ttf").as_slice(),
-        ].into_iter().chain(assets.iter().filter(|(name,_)| name.starts_with("__font_") && (name.ends_with(".ttf") || name.ends_with(".otf"))).map(|(_,bytes)| bytes.as_slice())))
-        .search_fonts_with(TypstKitFontOptions::default().include_system_fonts(!cfg!(target_os="android")).include_embedded_fonts(true))
-        .with_static_file_resolver(assets.iter().map(|(k,v)| (k.as_str(), v.as_slice())).chain([
-            ("__smd_icon_tip.svg",include_bytes!("../../desktop/icons/CalloutTip.svg").as_slice()),
-            ("__smd_icon_warning.svg",include_bytes!("../../desktop/icons/CalloutWarning.svg").as_slice()),
-            ("__smd_icon_info.svg",include_bytes!("../../desktop/icons/CalloutInfo.svg").as_slice()),
-            ("__smd_icon_error.svg",include_bytes!("../../desktop/icons/CalloutError.svg").as_slice()),
-            ("__smd_icon_success.svg",include_bytes!("../../desktop/icons/CalloutSuccess.svg").as_slice()),
-            ("__smd_icon_question.svg",include_bytes!("../../desktop/icons/CalloutQuestion.svg").as_slice()),
-            ("__smd_icon_answer.svg",include_bytes!("../../desktop/icons/CalloutAnswer.svg").as_slice()),
-            ("__smd_icon_example.svg",include_bytes!("../../desktop/icons/CalloutExample.svg").as_slice()),
-            ("__smd_icon_quote.svg",include_bytes!("../../desktop/icons/CalloutQuote.svg").as_slice()),
-        ]))
-        .with_static_source_file_resolver([
-            ("mitex/standard.typ", include_str!("mitex/standard.typ")),
-            ("mitex/prelude.typ", include_str!("mitex/prelude.typ")),
-        ])
-        .build();
-    let document = engine.compile().output.map_err(|errors| anyhow::anyhow!("PDF typesetting failed: {errors:?}"))?;
-    typst_pdf::pdf(&document, &Default::default()).map(|v| v.to_vec()).map_err(|e| anyhow::anyhow!("PDF encoding failed: {e:?}"))
+    typesetter::export_typst(source, options, assets)
+}
+
+#[cfg(target_os = "android")]
+fn jni_string(mut env: jni::JNIEnv, value: &str) -> jni::sys::jstring {
+    env.new_string(value)
+        .or_else(|_| env.new_string(""))
+        .map(Into::into_raw)
+        .unwrap_or(std::ptr::null_mut())
 }
 
 #[cfg(target_os = "android")]
@@ -365,8 +346,14 @@ pub fn export(markdown: &str, options: &PdfOptions, assets: &HashMap<String, Vec
 pub extern "system" fn Java_dev_supermd_studio_PdfEngine_validateTheme(
     mut env: jni::JNIEnv, _class: jni::objects::JClass, input: jni::objects::JString,
 ) -> jni::sys::jstring {
-    let result = match env.get_string(&input) { Ok(value)=>theme::response(&String::from(value)), Err(_)=>"{\"error\":\"Invalid theme input\"}".into() };
-    env.new_string(result).expect("Theme response").into_raw()
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        match env.get_string(&input) {
+            Ok(value) => theme::response(&String::from(value)),
+            Err(_) => "{\"error\":\"Invalid theme input\"}".into(),
+        }
+    }))
+    .unwrap_or_else(|_| "{\"error\":\"Theme validation failed\"}".into());
+    jni_string(env, &result)
 }
 
 #[cfg(target_os = "android")]
@@ -374,13 +361,18 @@ pub extern "system" fn Java_dev_supermd_studio_PdfEngine_validateTheme(
 pub extern "system" fn Java_dev_supermd_studio_PdfEngine_fontFamilies(
     mut env: jni::JNIEnv, _class: jni::objects::JClass, path: jni::objects::JString,
 ) -> jni::sys::jstring {
-    let result = (|| -> Result<Vec<String>> {
-        let path: String = env.get_string(&path)?.into();
-        if std::fs::metadata(&path)?.len()>20_000_000 { bail!("Font exceeds 20 MB"); }
-        let bytes=typst::foundations::Bytes::new(std::fs::read(path)?);
-        Ok(typst::text::Font::iter(bytes).map(|font| font.info().family.clone()).collect())
-    })();
-    env.new_string(serde_json::to_string(&result.unwrap_or_default()).unwrap()).unwrap().into_raw()
+    let payload = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let families = (|| -> Result<Vec<String>> {
+            let path: String = env.get_string(&path)?.into();
+            if std::fs::metadata(&path)?.len() > 20_000_000 { bail!("Font exceeds 20 MB"); }
+            let bytes = typst::foundations::Bytes::new(std::fs::read(path)?);
+            Ok(typst::text::Font::iter(bytes).map(|font| font.info().family.clone()).collect())
+        })()
+        .unwrap_or_default();
+        serde_json::to_string(&families).unwrap_or_else(|_| "[]".into())
+    }))
+    .unwrap_or_else(|_| "[]".into());
+    jni_string(env, &payload)
 }
 
 #[cfg(target_os = "android")]
@@ -388,8 +380,14 @@ pub extern "system" fn Java_dev_supermd_studio_PdfEngine_fontFamilies(
 pub extern "system" fn Java_dev_supermd_studio_PdfEngine_imageSources(
     mut env: jni::JNIEnv, _class: jni::objects::JClass, markdown: jni::objects::JString,
 ) -> jni::sys::jstring {
-    let markdown: String = env.get_string(&markdown).expect("Markdown string").into();
-    env.new_string(serde_json::to_string(&image_sources(&markdown)).unwrap()).unwrap().into_raw()
+    let payload = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        match env.get_string(&markdown) {
+            Ok(value) => serde_json::to_string(&image_sources(&String::from(value))).unwrap_or_else(|_| "[]".into()),
+            Err(_) => "[]".into(),
+        }
+    }))
+    .unwrap_or_else(|_| "[]".into());
+    jni_string(env, &payload)
 }
 
 #[cfg(target_os = "android")]
@@ -398,17 +396,21 @@ pub extern "system" fn Java_dev_supermd_studio_PdfEngine_export(
     mut env: jni::JNIEnv, _class: jni::objects::JClass, markdown: jni::objects::JString,
     options: jni::objects::JString, asset_dir: jni::objects::JString, output: jni::objects::JString,
 ) -> jni::sys::jstring {
-    let result = (|| -> Result<()> {
-        let markdown: String = env.get_string(&markdown)?.into();
-        let options: String = env.get_string(&options)?.into();
-        let asset_dir: String = env.get_string(&asset_dir)?.into();
-        let output: String = env.get_string(&output)?.into();
-        let options: PdfOptions = serde_json::from_str(&options)?;
-        let assets = pdf_assets::load_referenced_assets(&markdown, std::path::Path::new(&asset_dir))?;
-        std::fs::write(&output, export(&markdown, &options, &assets)?)?;
-        Ok(())
-    })();
-    env.new_string(result.err().map(|e| format!("{e:#}")).unwrap_or_default()).unwrap().into_raw()
+    let message = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let result = (|| -> Result<()> {
+            let markdown: String = env.get_string(&markdown)?.into();
+            let options: String = env.get_string(&options)?.into();
+            let asset_dir: String = env.get_string(&asset_dir)?.into();
+            let output: String = env.get_string(&output)?.into();
+            let options: PdfOptions = serde_json::from_str(&options)?;
+            let assets = pdf_assets::load_referenced_assets(&markdown, std::path::Path::new(&asset_dir))?;
+            std::fs::write(&output, export(&markdown, &options, &assets)?)?;
+            Ok(())
+        })();
+        result.err().map(|e| format!("{e:#}")).unwrap_or_default()
+    }))
+    .unwrap_or_else(|_| "PDF export failed unexpectedly".into());
+    jni_string(env, &message)
 }
 
 #[cfg(test)]
