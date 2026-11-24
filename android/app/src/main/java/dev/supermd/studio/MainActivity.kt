@@ -1261,7 +1261,7 @@ private object NoMotionScheme : MotionScheme {
         var name by remember(state.active.id) {mutableStateOf(state.active.name)}
         AlertDialog(onDismissRequest={renaming=false},title={Text("Rename note")},text={OutlinedTextField(value=name,onValueChange={name=it},singleLine=true,label={Text("Note name")})},confirmButton={TextButton(onClick={model.rename(state.active.id,name);renaming=false},enabled=name.isNotBlank()){Text("Rename")}},dismissButton={TextButton(onClick={renaming=false}){Text("Cancel")}})
     }
-    if (exporting) ModalBottomSheet(onDismissRequest = { exporting = false }, sheetState = rememberModalBottomSheetState(skipPartiallyExpanded = true)) { ExportSettings(state.pdf, model::pdf, sharing = sharing, fonts = state.customFonts, noteLocation = noteLocation) { format ->
+    if (exporting) ModalBottomSheet(onDismissRequest = { exporting = false }, sheetState = rememberBottomSheetState(initialValue = SheetValue.Hidden, enabledValues = setOf(SheetValue.Hidden, SheetValue.Expanded))) { ExportSettings(state.pdf, model::pdf, sharing = sharing, fonts = state.customFonts, noteLocation = noteLocation) { format ->
         exporting = false
         if (format in listOf("md", "mdzip")) {
             val archive = format == "mdzip"
@@ -1426,7 +1426,7 @@ private object NoMotionScheme : MotionScheme {
     onDismiss: () -> Unit,
     onNavigate: (OutlineHeading) -> Unit,
 ) {
-    ModalBottomSheet(onDismissRequest = onDismiss, sheetState = rememberModalBottomSheetState(skipPartiallyExpanded = true)) {
+    ModalBottomSheet(onDismissRequest = onDismiss, sheetState = rememberBottomSheetState(initialValue = SheetValue.Hidden, enabledValues = setOf(SheetValue.Hidden, SheetValue.Expanded))) {
         ContentsSheetContent(headings = headings, noteId = noteId, motion = motion, onNavigate = onNavigate)
     }
 }
@@ -1490,12 +1490,13 @@ private object NoMotionScheme : MotionScheme {
         }
         items(state.files, key = { "file:${it.uri}:${it.relative}" }) { entry ->
             ListItem(
-                headlineContent = { Text(entry.name, maxLines = 1, overflow = TextOverflow.Ellipsis) },
                 leadingContent = { Icon(if (entry.directory) Icons.Rounded.Folder else Icons.Rounded.Description, null) },
                 trailingContent = { Icon(if (entry.directory) Icons.Rounded.ChevronRight else Icons.AutoMirrored.Rounded.MenuBook, null) },
                 colors = ListItemDefaults.colors(containerColor = Color.Transparent),
                 modifier = Modifier.fillMaxWidth().heightIn(min = 48.dp).clickable { onActivateEntry(entry) },
-            )
+            ) {
+                Text(entry.name, maxLines = 1, overflow = TextOverflow.Ellipsis)
+            }
         }
         if (recent.isNotEmpty()) {
             item(key = "recent-header") {
@@ -1842,7 +1843,7 @@ internal class NoteDestination(private val mime: String, private val preferred: 
                 if (matches.isEmpty()) Text("No matching fonts", color = MaterialTheme.colorScheme.onSurfaceVariant)
                 LazyColumn(Modifier.heightIn(max = 340.dp)) {
                     items(matches, key = {it.first}) { (key, name) ->
-                        ListItem(headlineContent = {Text(name)}, trailingContent = {if (key == value) Icon(Icons.Rounded.Check, "Selected")}, colors = ListItemDefaults.colors(containerColor = if (key == value) MaterialTheme.colorScheme.primaryContainer else Color.Transparent), modifier = Modifier.clickable {change(key); opened = false})
+                        ListItem(trailingContent = {if (key == value) Icon(Icons.Rounded.Check, "Selected")}, colors = ListItemDefaults.colors(containerColor = if (key == value) MaterialTheme.colorScheme.primaryContainer else Color.Transparent), modifier = Modifier.clickable {change(key); opened = false}) {Text(name)}
                     }
                 }
             }
