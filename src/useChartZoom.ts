@@ -17,7 +17,7 @@ export function useChartZoom(source: string) {
   const pointer = useRef<Point>({x:.5,y:.5});
   const locate = (point: Point) => {
     const svg = host.current?.querySelector("svg"), rect=svg?.getBoundingClientRect();
-    if (!rect) return {x:.5,y:.5};
+    if (!rect || !rect.width || !rect.height) return {x:.5,y:.5};
     // Match the line plot's padded data rectangle, rather than its axis labels.
     const x=(point.x-rect.left)/rect.width, y=(point.y-rect.top)/rect.height;
     const width=svg?.viewBox.baseVal.width||760,height=svg?.viewBox.baseVal.height||360,left=Number(svg?.getAttribute("data-plot-left")||56);
@@ -34,7 +34,7 @@ export function useChartZoom(source: string) {
     change(chartZooms.get(source) ?? 1);
     const element = host.current?.querySelector("svg"); if (!element) return;
     let distance = 0, frame = 0, pending = value.current, focus={x:.5,y:.5}, held=false;
-    let midpoint:Point|null=null, drag:Point|null=null,panFrame=0;
+    let midpoint:Point|null=null, drag:Point|null=null, dragOrigin:Point|null=null, dragging=false, panFrame=0;
     const pan = (dx:number,dy:number)=>{
       const rect=element.getBoundingClientRect();
       const width=element.viewBox.baseVal.width||760,height=element.viewBox.baseVal.height||360;
@@ -44,8 +44,8 @@ export function useChartZoom(source: string) {
       centerRef.current=next;remember(chartCenters,source,next);
       if(!panFrame)panFrame=requestAnimationFrame(()=>{panFrame=0;setCenter(centerRef.current);});
     };
-    const press = (event:PointerEvent)=>{if(event.pointerType==="mouse" && event.button===0){held=true;drag={x:event.clientX,y:event.clientY};element.setPointerCapture(event.pointerId);event.preventDefault();}};
-    const release = ()=>{held=false;drag=null;};
+    const press = (event:PointerEvent)=>{if(event.pointerType==="mouse" && event.button===0){held=true;drag={x:event.clientX,y:event.clientY};dragOrigin=drag;dragging=false;element.setPointerCapture(event.pointerId);event.preventDefault();}};
+    const release = ()=>{held=false;drag=null;dragOrigin=null;dragging=false;};
     const span = (touches: TouchList) => Math.hypot(touches[0].clientX - touches[1].clientX, touches[0].clientY - touches[1].clientY);
     const update = (next: number, point: Point) => {
       pending = next; focus=point;
@@ -84,7 +84,16 @@ export function useChartZoom(source: string) {
       if (hovered ? hovered !== element : !element.contains(document.activeElement)) return;
       event.preventDefault(); change(value.current * (event as CustomEvent<number>).detail,pointer.current);
     };
-    const track = (event: PointerEvent) => { pointer.current=locate({x:event.clientX,y:event.clientY});if(drag && held && event.pointerType==="mouse"){pan(event.clientX-drag.x,event.clientY-drag.y);drag={x:event.clientX,y:event.clientY};event.preventDefault();} };
+    const track = (event: PointerEvent) => {
+      pointer.current=locate({x:event.clientX,y:event.clientY});
+      if(drag && held && event.pointerType==="mouse"){
+        if(!dragging && dragOrigin && Math.hypot(event.clientX-dragOrigin.x,event.clientY-dragOrigin.y)<3)return;
+        dragging=true;
+        pan(event.clientX-drag.x,event.clientY-drag.y);
+        drag={x:event.clientX,y:event.clientY};
+        event.preventDefault();
+      }
+    };
     const nativePan=(event:Event)=>{const detail=(event as CustomEvent<{dx:number;dy:number}>).detail;event.preventDefault();pan(-detail.dx,-detail.dy);};
     element.addEventListener("supermd-canvas-pan",nativePan);
     element.addEventListener("pointermove",track);
