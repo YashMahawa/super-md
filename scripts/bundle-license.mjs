@@ -5,7 +5,17 @@ import { copyFileSync,readFileSync,writeFileSync } from "node:fs";
 // license after bundling instead of maintaining a second notice by hand.
 copyFileSync(new URL("../LICENSE", import.meta.url), new URL("../dist/LICENSE.txt", import.meta.url));
 copyFileSync(new URL("../docs/THEMING.md", import.meta.url), new URL("../dist/THEMING.md", import.meta.url));
-writeFileSync(new URL("../dist/super-md-agent-SKILL.md", import.meta.url), "---\nname: super-md\ndescription: Connect an AI agent to Super MD to inspect and edit open notes.\n---\n\n# Super MD agent guide\n\nFor illustrated study-note authoring, install the complete super-md-skill.zip beside this file, or copy docs/skills/super-md from the project repository. The following is the connection guide, not the complete authoring skill.\n\n" + readFileSync(new URL("../docs/skills/super-md/references/agent-connection.md", import.meta.url), "utf8"));
+const skillDir = new URL("../docs/skills/super-md/", import.meta.url);
+const bundledSkill = readFileSync(new URL("SKILL.md", skillDir), "utf8")
+  .trimEnd()
+  .replaceAll("(references/study-notes.md)", "(#exam-ready-study-notes)")
+  .replaceAll("(references/visual-authoring.md)", "(#diagram-and-interaction-guide)")
+  .replaceAll("(references/agent-connection.md)", "(#agent-connection)")
+  + "\n\n" + readFileSync(new URL("references/study-notes.md", skillDir), "utf8").trim()
+  + "\n\n" + readFileSync(new URL("references/visual-authoring.md", skillDir), "utf8").trim()
+  + "\n\n# Agent connection\n\n" + readFileSync(new URL("references/agent-connection.md", skillDir), "utf8").trim()
+  + "\n";
+writeFileSync(new URL("../dist/super-md-agent-SKILL.md", import.meta.url), bundledSkill);
 // Preserve Pele's complete MIT and embedded Lucide ISC notices offline.
 copyFileSync(new URL('../node_modules/pele/LICENSE',import.meta.url),new URL('../dist/DIAGRAM-RENDERER-LICENSES.txt',import.meta.url));
 // Ship the complete notices with the offline dictionary and grammar libraries.

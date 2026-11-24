@@ -33,7 +33,8 @@ pub fn render(source: &str, assets: &HashMap<String, Vec<u8>>) -> Result<String>
             out.push_str(&format!("[#set text(size: .94em)\n#set par(spacing: 3pt, leading: .28em)\n#block(below: 3pt)[#strong[{}]]\n", text(&step.label)));
             if step.markdown.is_some() && step.image.is_some() { out.push_str("#grid(columns: (1fr, 1fr), gutter: 10pt, ["); }
             if let Some(image) = &step.image {
-                if !assets.contains_key(image) { bail!("Image unavailable for PDF step: {image}"); }
+                crate::validate_asset_path(image)?;
+                if crate::is_font_asset(image) || !assets.contains_key(image) { bail!("Image unavailable for PDF step: {image}"); }
                 out.push_str(&format!("#smd-step-image({})\n", string(image)));
             }
             if let Some(markdown) = &step.markdown {

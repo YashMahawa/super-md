@@ -12,7 +12,7 @@ class InstanceBroker(QObject):
 
     def __init__(self, parent=None):
         super().__init__(parent)
-        root = Path(QStandardPaths.writableLocation(QStandardPaths.AppDataLocation))
+        root = Path(QStandardPaths.writableLocation(QStandardPaths.StandardLocation.AppDataLocation))
         root.mkdir(parents=True, exist_ok=True)
         self.lock = QLockFile(str(root / "native-instance.lock"))
         self.lock.setStaleLockTime(0)

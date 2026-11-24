@@ -604,7 +604,9 @@ class StudioUiTest {
         compose.onNodeWithContentDescription("Save note").assertExists()
         compose.onNodeWithContentDescription("More actions").performClick()
         compose.onNodeWithText("Open note").assertIsNotDisplayed() // closed drawer, not an overflow item
-        for(removed in listOf("New tab","New note","Reopen closed tab","Save as Markdown","Find in note"))compose.onAllNodesWithText(removed).assertCountEquals(0)
+        for(removed in listOf("New tab","New note","Save as Markdown","Find in note"))compose.onAllNodesWithText(removed).assertCountEquals(0)
+        compose.onNodeWithText("Reopen closed tab").assertExists()
+        compose.onNodeWithText("Save as").assertExists()
         compose.onNodeWithText("New window").assertExists()
         androidx.test.platform.app.InstrumentationRegistry.getInstrumentation().sendKeyDownUpSync(android.view.KeyEvent.KEYCODE_BACK)
         compose.waitForIdle()
@@ -1214,6 +1216,7 @@ ax.set_title("Matplotlib 3D figure")
         val closeBounds = compose.onNodeWithContentDescription("Close Recoverable draft.md").fetchSemanticsNode().boundsInRoot
         assertTrue("The selected tab's close control must be visible before closing it: $closeBounds", closeBounds.width > 0f && closeBounds.height > 0f)
         compose.onNodeWithContentDescription("Close Recoverable draft.md").performClick()
+        compose.onNodeWithText("Discard").performClick()
         compose.waitUntil(15_000) {
             model.state.value.tabs.none { it.id == recoverableId } &&
                 model.state.value.closedTabs.any { it.id == recoverableId }
@@ -1229,6 +1232,7 @@ ax.set_title("Matplotlib 3D figure")
         compose.onNodeWithContentDescription("Close Recoverable draft.md").assertExists()
         compose.runOnIdle { assertEquals("# Recoverable draft", model.state.value.active.content) }
         compose.onNodeWithContentDescription("Close Recoverable draft.md").performClick()
+        compose.onNodeWithText("Discard").performClick()
         if (compose.activity.resources.configuration.smallestScreenWidthDp < 600) {
             compose.runOnIdle { compose.activity.requestedOrientation = android.content.pm.ActivityInfo.SCREEN_ORIENTATION_LANDSCAPE }
             compose.waitUntil(10_000) { compose.activity.resources.configuration.orientation == android.content.res.Configuration.ORIENTATION_LANDSCAPE }

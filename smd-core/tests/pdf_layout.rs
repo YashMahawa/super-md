@@ -43,9 +43,12 @@ fn staged_pdf_assets_include_only_referenced_images_and_custom_fonts() {
     let result=(|| {
         std::fs::write(temp.join("used.svg"),b"<svg/>").unwrap();
         std::fs::write(temp.join("__font_custom.ttf"),b"font").unwrap();
+        std::fs::write(temp.join("__font_UPPER.OTF"),b"otf-font").unwrap();
+        std::fs::write(temp.join("__font_Mixed.Ttf"),b"ttf-font").unwrap();
         let ignored=std::fs::File::create(temp.join("unrelated.bin")).unwrap();ignored.set_len(500_000_000).unwrap();
         let assets=smd_core::pdf_assets::load_referenced_assets("![used](used.svg)",&temp).unwrap();
-        assert_eq!(assets.len(),2);assert_eq!(assets["used.svg"],b"<svg/>");assert_eq!(assets["__font_custom.ttf"],b"font");
+        assert_eq!(assets.len(),4);assert_eq!(assets["used.svg"],b"<svg/>");assert_eq!(assets["__font_custom.ttf"],b"font");
+        assert_eq!(assets["__font_UPPER.OTF"],b"otf-font");assert_eq!(assets["__font_Mixed.Ttf"],b"ttf-font");
         let oversized=std::fs::File::create(temp.join("too-big.png")).unwrap();oversized.set_len(smd_core::portable::MAX_IMAGE as u64+1).unwrap();
         assert!(smd_core::pdf_assets::load_referenced_assets("![bad](too-big.png)",&temp).is_err());
     })();

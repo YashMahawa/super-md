@@ -137,7 +137,7 @@ internal class ReaderBridge(
                             .put("url", "${ReaderAssetPathHandler.URL_PREFIX}${capability.token}?v=${capability.fingerprint}")
                             .put("mime", capability.mime)
                     }
-                    "import_images" -> withContext(Dispatchers.IO) { model.media.importJson(args.getJSONArray("images")) }
+                    "import_images" -> withContext(Dispatchers.IO) { model.media.importJson(args.getJSONArray("images")) }.also { model.markAssetsDirty(model.state.value.active.id) }
                     "save_media_native" -> model.saveAgentMedia(args)
                     "agent_export_native" -> { onAgentExport(args); JSONObject().put("accepted", true).put("jobId", args.optString("requestId")) }
                     "fetch_resource" -> withContext(Dispatchers.IO) { JSONObject().put("body", model.media.fetch(args.getString("url"), args.optBoolean("image"))) }
