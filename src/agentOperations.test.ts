@@ -234,8 +234,20 @@ describe('live agent document operations',()=>{
     expect(batch.text).toBe(expected);
     expect(batch.operations).toEqual(stepSummaries);
 
+    const longLeft='x'+'😀'.repeat(40)+'\ud83d',longRight='y😀'+'z'.repeat(80)+'\r\n';
+    const peeled=applyAgentPatchesDetailed(longLeft,[
+      {type:'lines',start_line:2,end_line:2,text:'\ude00mid\n'+longRight},
+      {type:'insert',line:2,text:'ins\n'},
+      {type:'replace',old:'mid',new:'MID'},
+    ]);
+    expect(peeled.text).toBe('x'+'😀'.repeat(41)+'MID\nins\n'+longRight);
+    expect(peeled.operations.map(item=>[item.startOffset,item.endOffset,item.deltaChars])).toEqual([[42,42,88],[46,46,4],[42,45,0]]);
+
     const nearCap='😀'.repeat(4_999_999)+'a\ud83d'; // 19,999,996 + 1 + 3 = 20,000,000 UTF-8 bytes
     expect(applyAgentPatches(nearCap,[{type:'replace',old:'a',new:'b'}]).length).toBe(nearCap.length);
+    const detailedNearCap=applyAgentPatchesDetailed(nearCap,[{type:'replace',old:'a',new:'b'}]);
+    expect(detailedNearCap.operations[0]).toEqual({operationIndex:0,type:'replace',startOffset:4_999_999,endOffset:5_000_000,deltaChars:0});
     expect(()=>applyAgentPatches(nearCap,[{type:'lines',start_line:2,end_line:2,text:'\ude00'}])).toThrow('exceeds 20 MB');
+    expect(()=>applyAgentPatchesDetailed(nearCap,[{type:'lines',start_line:2,end_line:2,text:'\ude00'}])).toThrow('exceeds 20 MB');
   });
 });

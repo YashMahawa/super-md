@@ -2,12 +2,12 @@
  * offsets are Unicode code points, matching the Python CLI (not UTF-16). */
 import {analyzeDocument} from './documentAnalysis';
 export type AgentPatch = {type:'replace';old:string;new:string;count?:1|'all';expectedCount?:number} | {type:'lines';start_line:number;end_line:number;text:string} | {type:'insert';line:number;text:string};
-const encoder=new TextEncoder();
+const encoder=new TextEncoder(),utf8Scratch=new Uint8Array(65_536);
 const CHECKPOINT_SHIFT=9,CHECKPOINT_STRIDE=1<<CHECKPOINT_SHIFT,MAX_INDEX_ENTRIES=8,MAX_INDEX_UTF16_UNITS=24_000_000;
 type SvgSpan={start:number;end:number;startUtf16:number;endUtf16:number;line_start:number;line_end:number};
 type UnicodeIndex={codePoints:number;utf16AtCp:Uint32Array;outline?:AgentHeading[];svgSpans?:SvgSpan[];diagramSpans?:Array<{start:number;end:number}>};
 const unicodeCache=new Map<string,UnicodeIndex>();let unicodeCacheUnits=0;
-const WORD_CHAR_RE=/[\p{L}\p{N}_]/u;
+const WORD_CHAR_RE=/[\p{L}\p{N}_]/u,LINE_BREAK_RE=/\r\n|[\r\n\v\f\x85\u2028\u2029]/g;
 
 function isSurrogatePairAt(text:string,index:number,end=text.length):boolean {
   if(index+1>=end)return false;
@@ -15,47 +15,36 @@ function isSurrogatePairAt(text:string,index:number,end=text.length):boolean {
   const low=text.charCodeAt(index+1);return low>=0xdc00&&low<=0xdfff;
 }
 export function countCodePointsRange(text:string,from=0,to=text.length):number {
-  let size=0;
-  for(let i=from;i<to;i++){
-    const code=text.charCodeAt(i);
-    if(code>=0xd800&&code<=0xdbff&&i+1<to){const low=text.charCodeAt(i+1);if(low>=0xdc00&&low<=0xdfff)i++;}
-    size++;
+  if(to<=from)return 0;
+  let pairs=0,i=from;const last=to-1;
+  while(i<last){
+    const pair=((((text.charCodeAt(i)&0xfc00)^0xd800)-1)&(((text.charCodeAt(i+1)&0xfc00)^0xdc00)-1))>>>31;
+    pairs+=pair;i+=1+pair;
   }
-  return size;
+  return to-from-pairs;
 }
-function utf8ByteLengthRange(text:string,from=0,to=text.length):number {
-  let bytes=0;
-  for(let i=from;i<to;i++){
-    const code=text.charCodeAt(i);
-    if(code<0x80)bytes+=1;
-    else if(code<0x800)bytes+=2;
-    else if(code>=0xd800&&code<=0xdbff&&i+1<to){const low=text.charCodeAt(i+1);if(low>=0xdc00&&low<=0xdfff){bytes+=4;i++;}else bytes+=3;}
-    else bytes+=3;
+function utf8ByteLength(text:string):number {
+  const length=text.length;
+  if(!length)return 0;
+  if(length<=21_845)return encoder.encodeInto(text,utf8Scratch).written;
+  let pos=0,bytes=0;
+  while(pos<length){
+    let end=Math.min(length,pos+21_845);
+    if(end<length&&isSurrogatePairAt(text,end-1,length))end--;
+    bytes+=encoder.encodeInto(text.slice(pos,end),utf8Scratch).written;
+    pos=end;
   }
   return bytes;
-}
-function measureText(text:string):{chars:number;bytes:number} {
-  let chars=0,bytes=0;const length=text.length;
-  for(let i=0;i<length;i++){
-    const code=text.charCodeAt(i);
-    if(code<0x80)bytes+=1;
-    else if(code<0x800)bytes+=2;
-    else if(code>=0xd800&&code<=0xdbff&&i+1<length){const low=text.charCodeAt(i+1);if(low>=0xdc00&&low<=0xdfff){bytes+=4;i++;}else bytes+=3;}
-    else bytes+=3;
-    chars++;
-  }
-  return {chars,bytes};
 }
 function unicodeIndex(text:string):UnicodeIndex {
   const cached=unicodeCache.get(text);
   if(cached){unicodeCache.delete(text);unicodeCache.set(text,cached);return cached;}
   const slots=new Uint32Array((text.length>>>CHECKPOINT_SHIFT)+1);
-  let slotCount=0,cp=0;const length=text.length;
-  for(let i=0;i<length;i++){
+  let slotCount=0,cp=0;const length=text.length,last=length-1;
+  for(let i=0;i<length;){
     if((cp&(CHECKPOINT_STRIDE-1))===0)slots[slotCount++]=i;
-    const code=text.charCodeAt(i);
-    if(code>=0xd800&&code<=0xdbff&&i+1<length){const low=text.charCodeAt(i+1);if(low>=0xdc00&&low<=0xdfff)i++;}
-    cp++;
+    const pair=i<last?((((text.charCodeAt(i)&0xfc00)^0xd800)-1)&(((text.charCodeAt(i+1)&0xfc00)^0xdc00)-1))>>>31:0;
+    i+=1+pair;cp++;
   }
   const built:UnicodeIndex={codePoints:cp,utf16AtCp:slotCount===slots.length?slots:slots.subarray(0,slotCount)};
   if(length<=MAX_INDEX_UTF16_UNITS){
@@ -126,37 +115,60 @@ function trailingLineBreak(text:string):string {
   return len>=2&&text.charCodeAt(len-2)===0x0d&&text.charCodeAt(len-1)===0x0a?'\r\n':text.slice(len-1);
 }
 type LineRecord={text:string;chars:number;bytes:number};
+function lineChars(record:LineRecord):number {return record.chars>=0?record.chars:(record.chars=countCodePointsRange(record.text,0,record.text.length));}
+function lineBytes(record:LineRecord):number {return record.bytes>=0?record.bytes:(record.bytes=utf8ByteLength(record.text));}
 function splitLineRecords(text:string):LineRecord[] {
-  const records:LineRecord[]=[];let index=0;const length=text.length;
-  while(index<length){
-    let cursor=index,chars=0,bytes=0;
-    while(cursor<length){
-      const code=text.charCodeAt(cursor);if(isLineBreakCode(code))break;
-      if(code<0x80)bytes+=1;
-      else if(code<0x800)bytes+=2;
-      else if(code>=0xd800&&code<=0xdbff&&cursor+1<length){const low=text.charCodeAt(cursor+1);if(low>=0xdc00&&low<=0xdfff){bytes+=4;cursor++;}else bytes+=3;}
-      else bytes+=3;
-      chars++;cursor++;
-    }
-    if(cursor<length){
-      const breakCode=text.charCodeAt(cursor);
-      if(breakCode===0x0d&&cursor+1<length&&text.charCodeAt(cursor+1)===0x0a){chars+=2;bytes+=2;cursor+=2;}
-      else{chars+=1;bytes+=breakCode<0x80?1:breakCode<0x800?2:3;cursor+=1;}
-    }
-    records.push({text:text.slice(index,cursor),chars,bytes});index=cursor;
+  if(!text)return [];
+  const records:LineRecord[]=[];
+  LINE_BREAK_RE.lastIndex=0;
+  let index=0,match:RegExpExecArray|null;
+  while((match=LINE_BREAK_RE.exec(text))){
+    const end=match.index+match[0].length;
+    records.push({text:text.slice(index,end),chars:-1,bytes:-1});
+    index=end;
+  }
+  if(index<text.length)records.push({text:text.slice(index),chars:-1,bytes:-1});
+  return records;
+}
+function peelLeft(text:string):{prefix:string;stub:string} {
+  if(text.length<=64)return {prefix:'',stub:text};
+  let cut=text.length-2;
+  if(isSurrogatePairAt(text,cut-1,text.length))cut--;
+  return {prefix:text.slice(0,cut),stub:text.slice(cut)};
+}
+function peelRight(text:string):{stub:string;suffix:string} {
+  if(text.length<=64)return {stub:text,suffix:''};
+  let cut=2;
+  if(isSurrogatePairAt(text,cut-1,text.length))cut++;
+  return {stub:text.slice(0,cut),suffix:text.slice(cut)};
+}
+function spliceSplit(leftPrefix:string,leftStub:string,middle:string,rightStub:string,rightSuffix:string,leftRec:LineRecord|null,rightRec:LineRecord|null):LineRecord[] {
+  const records=splitLineRecords(middle);
+  if(leftPrefix){
+    const first=records[0];
+    const chars=leftRec&&leftRec.chars>=0?leftRec.chars-countCodePointsRange(leftStub,0,leftStub.length)+lineChars(first):-1;
+    const bytes=leftRec&&leftRec.bytes>=0?leftRec.bytes-utf8ByteLength(leftStub)+lineBytes(first):-1;
+    records[0]={text:leftPrefix+first.text,chars,bytes};
+  }
+  if(rightSuffix){
+    const lastIdx=records.length-1,last=records[lastIdx];
+    const chars=rightRec&&rightRec.chars>=0&&(last.chars>=0||lastIdx>0||!leftPrefix)?lineChars(last)+rightRec.chars-countCodePointsRange(rightStub,0,rightStub.length):-1;
+    const bytes=rightRec&&rightRec.bytes>=0&&(last.bytes>=0||lastIdx>0||!leftPrefix)?lineBytes(last)+rightRec.bytes-utf8ByteLength(rightStub):-1;
+    records[lastIdx]={text:last.text+rightSuffix,chars,bytes};
   }
   return records;
 }
-function boundaryDelta(leftGuard:string,oldBody:string,newBody:string,rightGuard:string):{deltaChars:number;deltaBytes:number} {
+function boundaryDelta(leftGuard:string,oldBody:string,newBody:string,rightGuard:string,includeChars:boolean):{deltaChars:number;deltaBytes:number} {
   const oldWin=leftGuard+oldBody+rightGuard,newWin=leftGuard+newBody+rightGuard;
-  const oldStats=measureText(oldWin),newStats=measureText(newWin);
-  return {deltaChars:newStats.chars-oldStats.chars,deltaBytes:newStats.bytes-oldStats.bytes};
+  const deltaBytes=utf8ByteLength(newWin)-utf8ByteLength(oldWin);
+  const deltaChars=includeChars?countCodePointsRange(newWin,0,newWin.length)-countCodePointsRange(oldWin,0,oldWin.length):0;
+  return {deltaChars,deltaBytes};
 }
 export type AgentPatchSummary={operationIndex:number;type:AgentPatch['type'];startOffset:number;endOffset:number;deltaChars:number};
-export function applyAgentPatchesDetailed(source:string,operations:unknown):{text:string;applied:number;operations:AgentPatchSummary[]} {
-  if(!Array.isArray(operations)||operations.length<1||operations.length>100||utf8ByteLengthRange(JSON.stringify(operations))>64_000)throw Error('Provide 1–100 patch operations within 64 KB');
+function patchDocument(source:string,operations:unknown,includeSummaries:boolean):{text:string;applied:number;operations:AgentPatchSummary[]} {
+  if(!Array.isArray(operations)||operations.length<1||operations.length>100||utf8ByteLength(JSON.stringify(operations))>64_000)throw Error('Provide 1–100 patch operations within 64 KB');
   let edited:string|null=source,lineTable:LineRecord[]|null=null;
-  let totalChars=-1,totalBytes=-1;
+  let totalBytes=-1;
   const summaries:AgentPatchSummary[]=[];
   for(const [operationIndex,operation] of operations.entries()){
     const fail=(message:string):never=>{throw Error(`operations[${operationIndex}]: ${message}`);};
@@ -173,38 +185,41 @@ export function applyAgentPatchesDetailed(source:string,operations:unknown):{tex
       if(count!==1&&count!=='all')fail("replace.count must be 1 or 'all'");
       if(expectedCount!==undefined&&(typeof expectedCount!=='number'||!Number.isInteger(expectedCount)||expectedCount<1))fail('replace.expectedCount must be a positive integer');
       if(edited===null)edited=lineTable!.map(item=>item.text).join('');
-      if(totalBytes<0){const initial=measureText(edited);totalChars=initial.chars;totalBytes=initial.bytes;}
+      if(totalBytes<0)totalBytes=utf8ByteLength(edited);
       if(count===1){
         const first=edited.indexOf(old);
         let occurrences=first>=0?1:0;
         if(first>=0){let cursor=first+old.length;while((cursor=edited.indexOf(old,cursor))>=0){occurrences++;cursor+=old.length;}}
         if(occurrences!==1||(expectedCount!==undefined&&occurrences!==expectedCount))fail(`Exact replacement expected ${expectedCount??'one'} match; found ${occurrences}`);
         const uEnd=first+old.length;
+        const delta=boundaryDelta(first>0?edited.slice(first-1,first):'',old,replacement,uEnd<edited.length?edited.slice(uEnd,uEnd+1):'',includeSummaries);
+        deltaChars=delta.deltaChars;deltaBytes=delta.deltaBytes;
+        if(totalBytes+deltaBytes>20_000_000)fail('Edited Markdown exceeds 20 MB');
         if(lineTable!==null){
           let lineIdx=0,lineUtf16Start=0,prefixCp=0;
           while(lineIdx<lineTable.length-1&&lineUtf16Start+lineTable[lineIdx].text.length<=first){
-            lineUtf16Start+=lineTable[lineIdx].text.length;prefixCp+=lineTable[lineIdx].chars;lineIdx++;
+            lineUtf16Start+=lineTable[lineIdx].text.length;if(includeSummaries)prefixCp+=lineChars(lineTable[lineIdx]);lineIdx++;
           }
           const firstLine=lineIdx,firstLineOffset=first-lineUtf16Start;
-          startOffset=prefixCp+countCodePointsRange(lineTable[firstLine].text,0,firstLineOffset);
-          endOffset=startOffset+countCodePointsRange(old,0,old.length);
+          if(includeSummaries){
+            startOffset=prefixCp+countCodePointsRange(lineTable[firstLine].text,0,firstLineOffset);
+            endOffset=startOffset+countCodePointsRange(old,0,old.length);
+          }
           let endLine=firstLine,endLineUtf16Start=lineUtf16Start;
           while(endLine<lineTable.length-1&&endLineUtf16Start+lineTable[endLine].text.length<uEnd){
             endLineUtf16Start+=lineTable[endLine].text.length;endLine++;
           }
           const head=lineTable[firstLine].text.slice(0,firstLineOffset),tail=lineTable[endLine].text.slice(uEnd-endLineUtf16Start);
-          const windowStart=Math.max(0,firstLine-1),windowEnd=Math.min(lineTable.length,endLine+2);
-          const reSplit=(firstLine>windowStart?lineTable[windowStart].text:'')+head+replacement+tail+(windowEnd>endLine+1?lineTable[windowEnd-1].text:'');
-          const newRecords=splitLineRecords(reSplit);
-          for(let i=windowStart;i<windowEnd;i++){deltaChars-=lineTable[i].chars;deltaBytes-=lineTable[i].bytes;}
-          for(const item of newRecords){deltaChars+=item.chars;deltaBytes+=item.bytes;}
+          const usePrev=!head.length&&firstLine>0,useNext=!tail.length&&endLine+1<lineTable.length;
+          const windowStart=usePrev?firstLine-1:firstLine,windowEnd=useNext?endLine+2:endLine+1;
+          const leftLine=usePrev?lineTable[windowStart].text:head,rightLine=useNext?lineTable[windowEnd-1].text:tail;
+          const leftPeeled=peelLeft(leftLine),rightPeeled=peelRight(rightLine);
+          const newRecords=spliceSplit(leftPeeled.prefix,leftPeeled.stub,leftPeeled.stub+replacement+rightPeeled.stub,rightPeeled.stub,rightPeeled.suffix,usePrev?lineTable[windowStart]:null,useNext?lineTable[windowEnd-1]:null);
           if(newRecords.length<=4096)lineTable.splice(windowStart,windowEnd-windowStart,...newRecords);
           else lineTable=lineTable.slice(0,windowStart).concat(newRecords,lineTable.slice(windowEnd));
-        }else{
-          startOffset=totalChars===edited.length?first:countCodePointsRange(edited,0,first);
+        }else if(includeSummaries){
+          startOffset=countCodePointsRange(edited,0,first);
           endOffset=startOffset+countCodePointsRange(old,0,old.length);
-          const delta=boundaryDelta(first>0?edited.slice(first-1,first):'',old,replacement,uEnd<edited.length?edited.slice(uEnd,uEnd+1):'');
-          deltaChars=delta.deltaChars;deltaBytes=delta.deltaBytes;
         }
         edited=edited.slice(0,first)+replacement+edited.slice(uEnd);
       }else{
@@ -213,9 +228,8 @@ export function applyAgentPatchesDetailed(source:string,operations:unknown):{tex
         while((cursor=edited.indexOf(old,cursor))>=0){positions.push(cursor);cursor+=old.length;}
         const occurrences=positions.length;
         if(!occurrences||(expectedCount!==undefined&&occurrences!==expectedCount))fail(`Exact replacement expected ${expectedCount??'at least one'} match; found ${occurrences}`);
-        const first=positions[0],lastMatchEnd=positions[occurrences-1]+old.length;
-        if(totalChars===edited.length){startOffset=first;endOffset=lastMatchEnd;}
-        else{
+        if(includeSummaries){
+          const first=positions[0],lastMatchEnd=positions[occurrences-1]+old.length;
           startOffset=countCodePointsRange(edited,0,first);
           let spanChars=countCodePointsRange(edited,first,lastMatchEnd);
           if(first>0&&lastMatchEnd>first&&isSurrogatePairAt(edited,first-1))spanChars--;
@@ -229,11 +243,12 @@ export function applyAgentPatchesDetailed(source:string,operations:unknown):{tex
             groupIdx++;
           }
           const groupEnd=positions[groupIdx]+old.length;
-          const delta=boundaryDelta(groupStart>0?edited.slice(groupStart-1,groupStart):'',edited.slice(groupStart,groupEnd),groupNew,groupEnd<edited.length?edited.slice(groupEnd,groupEnd+1):'');
+          const delta=boundaryDelta(groupStart>0?edited.slice(groupStart-1,groupStart):'',edited.slice(groupStart,groupEnd),groupNew,groupEnd<edited.length?edited.slice(groupEnd,groupEnd+1):'',includeSummaries);
           deltaChars+=delta.deltaChars;deltaBytes+=delta.deltaBytes;
           for(let m=idx;m<=groupIdx;m++){pieces.push(edited.slice(prevEnd,positions[m]),replacement);prevEnd=positions[m]+old.length;}
           idx=groupIdx+1;
         }
+        if(totalBytes+deltaBytes>20_000_000)fail('Edited Markdown exceeds 20 MB');
         pieces.push(edited.slice(prevEnd));
         edited=pieces.join('');
       }
@@ -242,8 +257,8 @@ export function applyAgentPatchesDetailed(source:string,operations:unknown):{tex
       const lineKey=isInsert?'line':'start_line',lineValue=op[lineKey];
       if(typeof lineValue!=='number'||!Number.isInteger(lineValue))fail(`${isInsert?'insert.line':'lines.start_line'} must be an integer`);
       if(lineTable===null){
+        if(totalBytes<0)totalBytes=utf8ByteLength(edited!);
         lineTable=splitLineRecords(edited!);
-        if(totalBytes<0){totalChars=0;totalBytes=0;for(const item of lineTable){totalChars+=item.chars;totalBytes+=item.bytes;}}
       }
       const lineCount=lineTable.length,start=lineValue as number;
       if(start<1||start>lineCount+1)fail(`${isInsert?'insert.line':'lines.start_line'} must be between 1 and ${lineCount+1}`);
@@ -251,31 +266,44 @@ export function applyAgentPatchesDetailed(source:string,operations:unknown):{tex
       if(!isInsert){const endValue=op.end_line;if(typeof endValue!=='number'||!Number.isInteger(endValue))fail('lines.end_line must be an integer');end=endValue as number;if(end<start||end>lineCount+1)fail(`lines.end_line must be between ${start} and ${lineCount+1}`);}
       if(typeof op.text!=='string')fail(`${isInsert?'insert':'lines'}.text must be text`);
       const spliceStart=start-1,spliceEnd=isInsert?spliceStart:Math.min(end,lineCount);
-      for(let i=0;i<spliceStart;i++)startOffset+=lineTable[i].chars;
-      endOffset=startOffset;
-      if(!isInsert)for(let i=spliceStart;i<spliceEnd;i++)endOffset+=lineTable[i].chars;
+      if(includeSummaries){
+        for(let i=0;i<spliceStart;i++)startOffset+=lineChars(lineTable[i]);
+        endOffset=startOffset;
+        if(!isInsert)for(let i=spliceStart;i<spliceEnd;i++)endOffset+=lineChars(lineTable[i]);
+      }
       let replacement=op.text as string;
       if(isInsert&&start===lineCount+1&&lineCount&&!endsWithLineBreak(lineTable[lineCount-1].text)){
         replacement=(lineCount>=2?trailingLineBreak(lineTable[0].text):'\n')+replacement;
       }
       if(replacement&&!endsWithLineBreak(replacement)&&!isInsert&&end<=lineCount&&endsWithLineBreak(lineTable[end-1].text))replacement+='\n';
       const windowStart=Math.max(0,spliceStart-1),windowEnd=Math.min(lineCount,spliceEnd+1);
-      const reSplit=(spliceStart>windowStart?lineTable[windowStart].text:'')+replacement+(windowEnd>spliceEnd?lineTable[windowEnd-1].text:'');
-      const newRecords=splitLineRecords(reSplit);
-      for(let i=windowStart;i<windowEnd;i++){deltaChars-=lineTable[i].chars;deltaBytes-=lineTable[i].bytes;}
-      for(const item of newRecords){deltaChars+=item.chars;deltaBytes+=item.bytes;}
+      const hasLeft=spliceStart>windowStart,hasRight=windowEnd>spliceEnd;
+      const leftPeeled=peelLeft(hasLeft?lineTable[windowStart].text:''),rightPeeled=peelRight(hasRight?lineTable[windowEnd-1].text:'');
+      const middle=leftPeeled.stub+replacement+rightPeeled.stub;
+      let oldBytes=utf8ByteLength(leftPeeled.stub)+utf8ByteLength(rightPeeled.stub);
+      for(let i=spliceStart;i<spliceEnd;i++)oldBytes+=lineBytes(lineTable[i]);
+      deltaBytes=utf8ByteLength(middle)-oldBytes;
+      if(totalBytes+deltaBytes>20_000_000)fail('Edited Markdown exceeds 20 MB');
+      if(includeSummaries){
+        let oldChars=countCodePointsRange(leftPeeled.stub,0,leftPeeled.stub.length)+countCodePointsRange(rightPeeled.stub,0,rightPeeled.stub.length);
+        for(let i=spliceStart;i<spliceEnd;i++)oldChars+=lineChars(lineTable[i]);
+        deltaChars=countCodePointsRange(middle,0,middle.length)-oldChars;
+      }
+      const newRecords=spliceSplit(leftPeeled.prefix,leftPeeled.stub,middle,rightPeeled.stub,rightPeeled.suffix,hasLeft?lineTable[windowStart]:null,hasRight?lineTable[windowEnd-1]:null);
       if(newRecords.length<=4096)lineTable.splice(windowStart,windowEnd-windowStart,...newRecords);
       else lineTable=lineTable.slice(0,windowStart).concat(newRecords,lineTable.slice(windowEnd));
       edited=null;
     }else fail("Patch type must be 'replace', 'lines' or 'insert'");
-    totalChars+=deltaChars;totalBytes+=deltaBytes;
-    if(totalBytes>20_000_000)fail('Edited Markdown exceeds 20 MB');
-    summaries.push({operationIndex,type:kind as AgentPatch['type'],startOffset,endOffset,deltaChars});
+    totalBytes+=deltaBytes;
+    if(includeSummaries)summaries.push({operationIndex,type:kind as AgentPatch['type'],startOffset,endOffset,deltaChars});
   }
   const finalText=edited??lineTable!.map(item=>item.text).join('');
-  return {text:finalText,applied:summaries.length,operations:summaries};
+  return {text:finalText,applied:operations.length,operations:summaries};
 }
-export function applyAgentPatches(source:string,operations:unknown):string{return applyAgentPatchesDetailed(source,operations).text;}
+export function applyAgentPatchesDetailed(source:string,operations:unknown):{text:string;applied:number;operations:AgentPatchSummary[]} {
+  return patchDocument(source,operations,true);
+}
+export function applyAgentPatches(source:string,operations:unknown):string{return patchDocument(source,operations,false).text;}
 export type AgentHeading={index:number;level:number;title:string;line:number;start:number;sectionStart:number;sectionEnd:number};
 function outlineWithLength(source:string):{headings:AgentHeading[];documentLength:number} {
   const idx=source.length>=CHECKPOINT_STRIDE?unicodeIndex(source):null;
