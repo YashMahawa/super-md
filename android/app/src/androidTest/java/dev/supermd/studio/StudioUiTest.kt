@@ -604,7 +604,7 @@ class StudioUiTest {
         compose.onNodeWithContentDescription("Save note").assertExists()
         compose.onNodeWithContentDescription("More actions").performClick()
         compose.onNodeWithText("Open note").assertIsNotDisplayed() // closed drawer, not an overflow item
-        for(removed in listOf("New tab","New note","Reopen closed tab","Save as Markdown"))compose.onAllNodesWithText(removed).assertCountEquals(0)
+        for(removed in listOf("New tab","New note","Reopen closed tab","Save as Markdown","Find in note"))compose.onAllNodesWithText(removed).assertCountEquals(0)
         compose.onNodeWithText("New window").assertExists()
         androidx.test.platform.app.InstrumentationRegistry.getInstrumentation().sendKeyDownUpSync(android.view.KeyEvent.KEYCODE_BACK)
         compose.waitForIdle()
@@ -662,8 +662,7 @@ class StudioUiTest {
         val content="# Immediate Find Focus\n\nHardware typing should land here without tapping the search field. FocusNeedle appears in this paragraph.\n"
         compose.runOnIdle {model.edit(model.state.value.active.id,content);model.mode("reader")}
         javascriptUntil("document.querySelector('.android-reading')?.textContent.includes('FocusNeedle')") {it=="true"}
-        compose.onNodeWithContentDescription("More actions").performClick()
-        compose.onNodeWithText("Find in note").performClick()
+        compose.onNodeWithContentDescription("Find in note").performClick()
         javascriptUntil("(()=>{const input=document.querySelector('.reading-search input');return !!input&&document.activeElement===input})()") {it=="true"}
         compose.waitUntil(3_000) { web(compose.activity.window.decorView)?.hasFocus() == true }
         val nativeInputState = AtomicReference<org.json.JSONObject>()
@@ -723,8 +722,7 @@ class StudioUiTest {
         val model=androidx.lifecycle.ViewModelProvider(compose.activity)[StudioViewModel::class.java]
         temporaryNoteState=model.state.value
         compose.runOnIdle { model.mode("reader") }
-        compose.onNodeWithContentDescription("More actions").performClick()
-        compose.onNodeWithText("Find in note").performClick()
+        compose.onNodeWithContentDescription("Find in note").performClick()
         javascriptUntil("(()=>{const input=document.querySelector('.reading-search input');return !!input&&document.activeElement===input})()") {it=="true"}
         compose.waitUntil(3_000) { web(compose.activity.window.decorView)?.hasFocus() == true }
         compose.waitUntil(5_000) { imeVisible() }
@@ -755,7 +753,7 @@ class StudioUiTest {
         assertTrue("Caret geometry must resolve inside the intended text: $point",point.optString("word").contains("Alpha Bravo Charlie Delta"))
         assertTrue(point.getInt("offset") in 6..11)
         assertTrue("Selection target must be below the native toolbar overlay: point=$point",point.getDouble("y")>point.getDouble("chromeInset")+8)
-        val nativeControlsBottom=listOf("Save note","Export","More actions","Undo (Ctrl+Z)","Redo (Ctrl+Y)")
+        val nativeControlsBottom=listOf("Find in note","Save note","Export","More actions","Show contents","Fullscreen study")
             .maxOf { compose.onNodeWithContentDescription(it).fetchSemanticsNode().boundsInRoot.bottom }
         val nativePoint=AtomicReference(androidx.compose.ui.geometry.Offset.Zero)
         val nativeGeometry=AtomicReference("")
@@ -929,7 +927,7 @@ ax.set_title("Matplotlib 3D figure")
         val model=androidx.lifecycle.ViewModelProvider(compose.activity)[StudioViewModel::class.java]
         temporaryNoteState = model.state.value
         val original="Given \\frac{a}{b} = c, continue."
-        compose.runOnIdle {model.edit(model.state.value.active.id,original);model.mode("reader")}
+        compose.runOnIdle {model.edit(model.state.value.active.id,original);model.mode("live")}
         javascriptUntil("document.querySelector('.markdown-body')?.textContent") {it.contains("Given")}
         compose.onNodeWithContentDescription("More actions").performClick();compose.onNodeWithText("Fix LaTeX").performClick()
         javascriptUntil("(()=>{const b=document.querySelector('.math-repair-panel footer button');if(b&&!b.disabled)b.click();return document.querySelectorAll('.katex').length;})()") {it=="1"}
@@ -1176,7 +1174,7 @@ ax.set_title("Matplotlib 3D figure")
         val paletteIcon = android.graphics.Color.parseColor(org.json.JSONArray("[${javascriptUntil("getComputedStyle(document.documentElement).getPropertyValue('--muted')") { it.startsWith("\"#") }}]").getString(0))
         assertTrue("Reader must not overpaint the native toolbar", kotlin.math.abs(android.graphics.Color.red(nativeIcon) - android.graphics.Color.red(paletteIcon)) < 15 && kotlin.math.abs(android.graphics.Color.green(nativeIcon) - android.graphics.Color.green(paletteIcon)) < 15 && kotlin.math.abs(android.graphics.Color.blue(nativeIcon) - android.graphics.Color.blue(paletteIcon)) < 15)
         val normalScale = javascriptUntil("document.querySelector('.document-page')?.dataset.scale") { it.isNotBlank() && it != "null" && it != "\"\"" }
-        compose.onNodeWithContentDescription("Show contents").assertDoesNotExist()
+        compose.onNodeWithContentDescription("Show contents").assertIsDisplayed()
         compose.onNodeWithContentDescription("Fullscreen study").performClick()
         javascriptUntil("document.documentElement.dataset.fullscreen") { it == "\"true\"" }
         javascriptUntil("document.querySelector('.document-page')?.dataset.scale") { it == normalScale }

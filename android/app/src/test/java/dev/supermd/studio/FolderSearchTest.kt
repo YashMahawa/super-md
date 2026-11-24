@@ -1,7 +1,29 @@
 package dev.supermd.studio
 
 import android.net.Uri
+import android.os.Looper
 import android.util.Base64
+import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.height
+import androidx.compose.foundation.layout.width
+import androidx.compose.material3.MaterialTheme
+import androidx.compose.material3.Surface
+import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.setValue
+import androidx.compose.ui.Modifier
+import androidx.compose.ui.test.assertHeightIsAtLeast
+import androidx.compose.ui.test.assertIsDisplayed
+import androidx.compose.ui.test.hasClickAction
+import androidx.compose.ui.test.hasText
+import androidx.compose.ui.test.junit4.v2.createComposeRule
+import androidx.compose.ui.test.onNodeWithContentDescription
+import androidx.compose.ui.test.onNodeWithText
+import androidx.compose.ui.test.performClick
+import androidx.compose.ui.unit.dp
+import java.io.ByteArrayOutputStream
+import java.io.File
+import java.nio.file.Files
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.Dispatchers
@@ -11,18 +33,20 @@ import kotlinx.coroutines.launch
 import kotlinx.coroutines.runBlocking
 import org.json.JSONObject
 import org.junit.Assert.*
+import org.junit.Rule
 import org.junit.Test
 import org.junit.runner.RunWith
 import org.robolectric.RobolectricTestRunner
 import org.robolectric.RuntimeEnvironment
 import org.robolectric.Shadows.shadowOf
-import android.os.Looper
-import java.io.ByteArrayOutputStream
-import java.io.File
-import java.nio.file.Files
+import org.robolectric.annotation.Config
+import org.robolectric.annotation.GraphicsMode
 
 @RunWith(RobolectricTestRunner::class)
+@Config(sdk = [35])
+@GraphicsMode(GraphicsMode.Mode.NATIVE)
 class FolderSearchTest {
+    @get:Rule val composeRule = createComposeRule()
 
     @Test
     fun portableBundlesDetectedByContentWithoutDecodingOrExtractingImages() = runBlocking {
@@ -323,5 +347,101 @@ class FolderSearchTest {
             vm.cancelWorkspaceSearch()
             tempRoot.deleteRecursively()
         }
+    }
+
+    @Test
+    fun composeChromeAndDrawerExposeQuickSwitcherFolderSearchFilterAndParentNavigation() {
+        var menuOpen by mutableStateOf(false)
+        var quickSwitcherClicks = 0
+        var folderSearchClicks = 0
+        var parentClicks = 0
+        var rootClicks = 0
+        var filterText by mutableStateOf("")
+        val filtered = listOf(
+            FileEntry("relativity-summary.md", "content://folder/rel", directory = false, relative = "physics/modern/relativity-summary.md"),
+        )
+        val state = StudioState(
+            folder = "content://folder/root",
+            files = listOf(FileEntry("modern", "content://folder/modern", directory = true, relative = "physics/modern")),
+        )
+
+        composeRule.setContent {
+            MaterialTheme {
+                Surface(Modifier.width(360.dp).height(800.dp)) {
+                    Column {
+                        StudioTopBar(
+                            noteName = "Notes.md",
+                            statusLabel = "Saved",
+                            fullscreen = false,
+                            wide = false,
+                            actualMode = "reader",
+                            centerLock = true,
+                            readerReady = true,
+                            busy = false,
+                            menuExpanded = menuOpen,
+                            onMenuExpandedChange = { menuOpen = it },
+                            onNavigateIcon = {},
+                            onQuickSwitcher = { quickSwitcherClicks++ },
+                            onFolderSearch = { folderSearchClicks++ },
+                            onFind = {},
+                            onSave = {},
+                            onExport = {},
+                            onToggleFullscreen = {},
+                            onToggleCenterLock = {},
+                            onNewWindow = {},
+                            onShare = {},
+                            onInsertMedia = {},
+                            onFixLatex = {},
+                            onRename = {},
+                            onSettings = {},
+                        )
+                        FilesDrawerContent(
+                            state = state,
+                            recent = emptyList(),
+                            folderRelative = "physics/modern",
+                            drawerFilter = filterText,
+                            onDrawerFilterChange = { filterText = it },
+                            filteredFiles = filtered,
+                            drawerFiltering = false,
+                            onOpenNote = {},
+                            onOpenFolder = {},
+                            onCloseFolder = {},
+                            onParentFolder = { parentClicks++ },
+                            onFolderRoot = { rootClicks++ },
+                            onQuickSwitcher = { quickSwitcherClicks++ },
+                            onFolderSearch = { folderSearchClicks++ },
+                            onActivateEntry = {},
+                            onClearRecent = {},
+                            onOpenRecent = {},
+                            onPinRecent = {},
+                        )
+                    }
+                }
+            }
+        }
+
+        // TopBar overflow menu includes Quick switcher and Search across notes
+        composeRule.onNodeWithContentDescription("More actions").performClick()
+        composeRule.onNodeWithText("Quick switcher").assertIsDisplayed().performClick()
+        assertEquals(1, quickSwitcherClicks)
+        composeRule.onNodeWithContentDescription("More actions").performClick()
+        composeRule.onNodeWithText("Search across notes").assertIsDisplayed().performClick()
+        assertEquals(1, folderSearchClicks)
+
+        // FilesDrawerContent exposes Switch, Search, Parent folder, and Folder root >= 48dp
+        composeRule.onNode(hasText("Switch") and hasClickAction()).assertIsDisplayed().assertHeightIsAtLeast(48.dp).performClick()
+        assertEquals(2, quickSwitcherClicks)
+        composeRule.onNode(hasText("Search") and hasClickAction()).assertIsDisplayed().assertHeightIsAtLeast(48.dp).performClick()
+        assertEquals(2, folderSearchClicks)
+        composeRule.onNode(hasText("Parent folder") and hasClickAction()).assertIsDisplayed().assertHeightIsAtLeast(48.dp).performClick()
+        assertEquals(1, parentClicks)
+        composeRule.onNode(hasText("Folder root") and hasClickAction()).assertIsDisplayed().assertHeightIsAtLeast(48.dp).performClick()
+        assertEquals(1, rootClicks)
+
+        // Filtering swaps directory listing for nested matching files with relative path subtitle
+        composeRule.runOnIdle { filterText = "relativity" }
+        composeRule.onNodeWithText("relativity-summary.md").assertIsDisplayed().assertHeightIsAtLeast(48.dp)
+        composeRule.onNodeWithText("physics/modern/relativity-summary.md").assertIsDisplayed()
+        composeRule.onAllNodes(hasText("Parent folder")).also { assertEquals(0, it.fetchSemanticsNodes().size) }
     }
 }
