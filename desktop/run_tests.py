@@ -7,15 +7,11 @@ from pathlib import Path
 
 if __name__ == "__main__":
     faulthandler.enable()
-    # macOS CI runs multiple software-rendered QtWebEngine subprocess probes
-    # (five mouse-selection probes plus live viewport, preview, context-menu,
-    # and typewriter checks) after hundreds of native tests. Keep per-probe
-    # assertions and timeouts intact while giving arm64 macOS 420s (inside
-    # ci.yml's 8-minute step budget) and Intel macOS 720s.
-    if sys.platform == "darwin":
-        suite_timeout = 720 if platform.machine() == "x86_64" else 420
-    else:
-        suite_timeout = 240
+    # macOS CI runs multiple bounded 60-second Qt WebEngine subprocess probes
+    # after hundreds of native tests. Keep per-probe assertions and timeouts
+    # intact while giving arm64 macOS 420s (within ci.yml's 8-minute step budget)
+    # and Intel macOS 720s.
+    suite_timeout = 720 if sys.platform == "darwin" and platform.machine() == "x86_64" else (420 if sys.platform == "darwin" else 240)
     faulthandler.dump_traceback_later(suite_timeout, exit=True)
     try:
         suite=unittest.defaultTestLoader.discover(str(Path(__file__).parent),pattern="test_*.py")

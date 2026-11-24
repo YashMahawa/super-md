@@ -39,6 +39,7 @@ def _probe(screenshot_path: str | None = None) -> int:
         session = Session(True)
         session.settings["python"] = sys.executable
         session.settings["welcomed"] = True
+        session.settings["python"] = sys.executable
         session.settings["newNoteLocation"] = temp_dir
         studio = Studio(True, session)
         tab = studio.tabs[0]

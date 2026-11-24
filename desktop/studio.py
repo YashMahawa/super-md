@@ -336,7 +336,7 @@ class Session(QObject):
     locationChanged = Signal(str,str)
     def __init__(self,isolated=False):
         super().__init__()
-        self.data = Path(tempfile.mkdtemp(prefix="supermd-test-")) if isolated else Path(QStandardPaths.writableLocation(QStandardPaths.AppDataLocation))/"qt-studio"
+        self.data = Path(tempfile.mkdtemp(prefix="supermd-test-")) if isolated else Path(QStandardPaths.writableLocation(QStandardPaths.StandardLocation.AppDataLocation))/"qt-studio"
         self.data=self.data.resolve()
         self.data.mkdir(parents=True,exist_ok=True)
         self.font_store = FontStore(self.data)
@@ -450,6 +450,8 @@ class Studio(QObject):
     replied = Signal(str, str, str)
     completed = Signal(object)
     saveRequested = Signal(str)
+    saveAsRequested = Signal(str)
+    saveConflictRequested = Signal(str)
     closeRequested = Signal(str)
     allowClose = Signal()
     newWindowRequested = Signal()
@@ -575,6 +577,8 @@ class Studio(QObject):
         self.pending_close = ""
         self.pending_export = ""
         self.pending_save_as = ""
+        self.pending_save_as_tab = ""
+        self._force_overwrite_ids: set[str] = set()
         self.flush_operation = None
         self.flush_timer = QTimer(self)
         self.flush_timer.setSingleShot(True)
@@ -593,6 +597,8 @@ class Studio(QObject):
         self.tabs = [{**tab,"id":tab.get("id") or uuid.uuid4().hex} for tab in self.session.initial_recovery]
         for tab in self.tabs:
             tab.setdefault("saved_assets", copy.deepcopy(tab.get("assets", {})))
+            tab.setdefault("assets_dirty", False)
+            tab.setdefault("conflict", False)
         self._agent_open_paths.update(str(Path(tab["path"]).resolve()) for tab in self.tabs if tab.get("path"))
         self.session.initial_recovery = []
         self.session.drafts[self.window_id] = [dict(t) for t in self.tabs]
@@ -661,7 +667,17 @@ class Studio(QObject):
     def _note(self, name: str, content: str = "", path: str = "", saved: str = "", assets: dict | None = None, portable: bool = False):
         assets = assets or {}
         return {"id": uuid.uuid4().hex, "name": name, "content": content, "path": path, "saved": saved,
-                "assets": assets, "saved_assets": copy.deepcopy(assets), "portable": portable}
+                "assets": assets, "saved_assets": copy.deepcopy(assets), "assets_dirty": False,
+                "portable": portable, "conflict": False}
+
+    def _is_dirty(self, tab: dict) -> bool:
+        if tab.get("content") != tab.get("saved"):
+            return True
+        if tab.get("assets_dirty"):
+            return True
+        if tab.get("path") and "saved_assets" in tab and tab.get("assets", {}) != tab.get("saved_assets", {}):
+            return True
+        return False
 
     @Property("QStringList",notify=changed)
     def pinnedRecent(self):return self.session.pinned
@@ -842,10 +858,10 @@ class Studio(QObject):
             self.recent=[path for path in self.recent if path!=old]
             for tab in list(self.tabs):
                 if tab["path"]!=old:continue
-                if tab["content"]!=tab["saved"]:
-                    draft={**tab,"path":"","name":"Recovered "+tab["name"],"saved":""}
+                if self._is_dirty(tab):
+                    draft={**tab,"path":"","name":"Recovered "+tab["name"],"saved":"","conflict":False}
                     self.session.drafts.setdefault("deleted-notes",[]).append(draft)
-                    tab.update(path="",name=draft["name"])
+                    tab.update(path="",name=draft["name"],conflict=False)
                 self._remove_tab(tab["id"])
             self.message="File deleted: "+Path(old).name+". Its tab was closed; unsaved changes remain recoverable."
         self._preferences();self._recover();self._emit()
@@ -855,19 +871,26 @@ class Studio(QObject):
         for tab in self.tabs:
             path=tab["path"]
             if not path or not ({path,str(Path(path).parent)} & changed) or tab["id"] in self.saving:continue
-            if tab["content"]!=tab["saved"]:continue  # Never clobber a local draft.
+            was_dirty=self._is_dirty(tab)
             try:
-                stat=Path(path).stat();stamp=(stat.st_mtime_ns,stat.st_size)
+                stat_result=Path(path).stat();stamp=(stat_result.st_mtime_ns,stat_result.st_size)
             except OSError:continue
-            if self.note_file_stamps.get(path)==stamp:continue
+            if not was_dirty and self.note_file_stamps.get(path)==stamp:continue
             id,expected=tab["id"],tab["saved"]
-            def finished(result,error,id=id,expected=expected,path=path,stamp=stamp):
+            def finished(result,error,id=id,expected=expected,path=path,stamp=stamp,was_dirty=was_dirty):
                 current=next((note for note in self.tabs if note["id"]==id),None)
-                if error or not current or current["content"]!=expected:return
+                if error or not current:return
                 self.note_file_stamps[path]=stamp
                 content,assets,portable=result
+                if was_dirty or self._is_dirty(current) or current.get("conflict"):
+                    if content!=current["saved"] or assets!=current.get("saved_assets",{}):
+                        current["conflict"]=True
+                        self.message="This file changed outside Super MD. Autosave is paused for this tab."
+                        self._emit(False)
+                    return
+                if current["content"]!=expected:return
                 if content==expected and assets==current["assets"]:return
-                current.update(content=content,saved=content,assets=assets,saved_assets=copy.deepcopy(assets),portable=portable)
+                current.update(content=content,saved=content,assets=assets,saved_assets=copy.deepcopy(assets),assets_dirty=False,portable=portable,conflict=False)
                 self.message="Reloaded externally updated note"
                 self._emit(load=id==self.active)
             self._submit(lambda path=path:open_note(Path(path)),finished,False)
@@ -941,14 +964,14 @@ class Studio(QObject):
         if not self.session.quitting and self.session.windows:
             self.session.workspace.pop(self.window_id,None)
             next(iter(self.session.windows.values()))._recover()
-        if self.system_preferences.state() != QProcess.NotRunning:
+        if self.system_preferences.state() != QProcess.ProcessState.NotRunning:
             self.system_preferences.terminate()
             self.system_preferences.waitForFinished(300)
 
     @Property(str, notify=changed)
     def snapshot(self):
         tab = self._current()
-        return json.dumps({"tabs": [{"id": t["id"], "name": t["name"], "path": t["path"], "dirty": t["content"] != t["saved"]} for t in self.tabs], "active": self.active, "name": tab["name"], "outline": tab.get("outline", []), "portable": tab["portable"], "folder": self.folder, "files": self.files, "recent": self.recent, "settings": self.settings, "mode": self.mode, "fullscreen": self.fullscreen, "readerOverlay": self.reader_overlay, "imageOverlay": self.image_overlay, "readerReady": self.ready, "dark": self._dark(), "zoom": self.settings["fullZoom" if self.fullscreen else "normalZoom"], "busy": self.busy > 0, "message": self.message, "colors": self._colors()})
+        return json.dumps({"tabs": [{"id": t["id"], "name": t["name"], "path": t["path"], "dirty": self._is_dirty(t), "conflict": bool(t.get("conflict"))} for t in self.tabs], "active": self.active, "name": tab["name"], "outline": tab.get("outline", []), "portable": tab["portable"], "conflict": bool(tab.get("conflict")), "closedCount": len(self.closed_tabs), "folder": self.folder, "files": self.files, "recent": self.recent, "settings": self.settings, "mode": self.mode, "fullscreen": self.fullscreen, "readerOverlay": self.reader_overlay, "imageOverlay": self.image_overlay, "readerReady": self.ready, "dark": self._dark(), "zoom": self.settings["fullZoom" if self.fullscreen else "normalZoom"], "busy": self.busy > 0, "message": self.message, "colors": self._colors()})
 
     @Property(bool, notify=changed)
     def agentAccessEnabled(self):
@@ -1482,7 +1505,7 @@ class Studio(QObject):
             self.update_running=False
             if error:self.update_status="Update download failed: "+error;return
             self.update_path=path;self.update_status="Verified update ready. Save your work, then open the installer."
-        downloads=Path(QStandardPaths.writableLocation(QStandardPaths.DownloadLocation) or str(Path.home()/'Downloads'))/'Super MD Updates'
+        downloads=Path(QStandardPaths.writableLocation(QStandardPaths.StandardLocation.DownloadLocation) or str(Path.home()/'Downloads'))/'Super MD Updates'
         self._submit(lambda:updates.download(info,downloads,self.data/'updates'),done,False)
 
     @Slot()
@@ -1914,12 +1937,12 @@ class Studio(QObject):
 
     def _recover(self):
         # Clean tabs need only paths, never another copy of their image bytes.
-        self.session.workspace[self.window_id]=[{"path":t["path"],"id":t["id"]} for t in self.tabs if t["path"] or t["content"]!=t["saved"]]
+        self.session.workspace[self.window_id]=[{"path":t["path"],"id":t["id"]} for t in self.tabs if t["path"] or self._is_dirty(t)]
         entries=[entry for tabs in self.session.workspace.values() for entry in tabs]
         workspace={"paths":list(dict.fromkeys(t["path"] for t in entries if t["path"])),"tabs":entries,"active":self._current()["path"],"activeId":self.active}
         self.session.writes.submit_latest("startup",lambda:atomic_json(self.data/"startup.json",workspace),lambda error:self._notify_recovery_write("startup",error))
         # Snapshot only unsaved tabs. Asset bytes stay in recovery, never in displayed source.
-        self.session.drafts[self.window_id] = [copy.deepcopy({key: value for key, value in t.items() if key != "viewState"}) for t in self.tabs if t["content"] != t["saved"] and (t["path"] or t["content"].strip() or t["assets"])]
+        self.session.drafts[self.window_id] = [copy.deepcopy({key: value for key, value in t.items() if key != "viewState"}) for t in self.tabs if self._is_dirty(t) and (t["path"] or t["content"].strip() or t["assets"])]
         drafts = [tab for tabs in self.session.drafts.values() for tab in tabs]
         self.session.writes.submit_latest("recovery",lambda:atomic_json(self.data/"recovery.json",drafts),lambda error:self._notify_recovery_write("recovery",error))
 
@@ -2114,19 +2137,30 @@ class Studio(QObject):
         if not self.closed_tabs:return
         self._activation_generation += 1
         activation_generation=self._activation_generation
-        reference=self.closed_tabs[-1]
+        reference=self.closed_tabs[0]
         def finished(note,error):
             if error:
                 self.message="Could not reopen the closed note: "+error
                 self._emit(False);return
             if reference not in self.closed_tabs:return
+            note.setdefault("saved_assets", copy.deepcopy(note.get("assets", {})))
+            note.setdefault("assets_dirty", False)
+            note.setdefault("conflict", False)
+            next_refs=[item for item in self.closed_tabs if item is not reference]
+            try:self.session.closed_note_store.save_index(next_refs)
+            except Exception as failure:
+                self.message="Could not update closed-note recovery: "+str(failure)
+                self._emit(False);return
             existing=next((t for t in self.tabs if note.get("path") and t["path"]==note["path"]),None)
             if existing:
                 if activation_generation==self._activation_generation:self.active=existing["id"]
             else:
                 self.tabs.append(note)
+                if note.get("path"):
+                    try:self._agent_open_paths.add(str(Path(note["path"]).resolve()))
+                    except OSError:pass
                 if activation_generation==self._activation_generation:self.active=note["id"]
-            self.closed_tabs.remove(reference)
+            self.closed_tabs[:]=next_refs
             self._recover();self._emit()
         def read_note():
             if reference.get("_closedSnapshot"):
@@ -2265,16 +2299,27 @@ class Studio(QObject):
 
     @Slot()
     def save(self):
+        self._save_current(False)
+
+    def _save_current(self, force_overwrite: bool = False):
         tab = self._current()
         if not tab["path"]:
             self.saveRequested.emit(tab["name"])
-        elif tab["portable"]:
+        elif not force_overwrite and tab.get("conflict"):
+            self.saveConflictRequested.emit(tab["name"])
+        elif tab["portable"] and self.ready:
+            if force_overwrite:
+                self._force_overwrite_ids.add(tab["id"])
+            else:
+                self._force_overwrite_ids.discard(tab["id"])
             self.readerCall.emit("window.supermdPortable?.(true)")
         else:
-            self._save_text(tab, Path(tab["path"]))
+            self._save_text(tab, Path(tab["path"]), automatic=False, force_overwrite=force_overwrite, force_portable=bool(tab["portable"]))
 
     def _after_flush(self,operation):
         if operation["action"] == "save": self.save()
+        elif operation["action"] == "save_as": self.saveAsRequested.emit(self._current()["name"])
+        elif operation["action"] == "overwrite_conflict": self._save_current(True)
         elif operation["action"] == "reload_reader":
             # The renderer has acknowledged all edits. Reopen it from native
             # state and the just-captured view snapshot in document_flushed.
@@ -2311,6 +2356,9 @@ class Studio(QObject):
     def saveSafely(self): self._flush("save")
 
     @Slot()
+    def saveAsSafely(self): self._flush("save_as")
+
+    @Slot()
     def reloadReaderSafely(self):
         if not self.ready or self.retired or self.busy or self.flush_operation: return
         self._flush("reload_reader")
@@ -2336,44 +2384,145 @@ class Studio(QObject):
     @Slot(str)
     def saveAs(self, value):
         path = local_path(value)
-        if path.suffix.lower() == ".smd":
+        tab = self._current()
+        if path.suffix.lower() == ".smd" and self.ready:
             self.pending_export = str(path)
             self.pending_save_as = str(path)
+            self.pending_save_as_tab = tab["id"]
             self.readerCall.emit("window.supermdPortable?.(false)")
         else:
-            self._save_text(self._current(), path)
+            self._save_text(tab, path, automatic=False, force_overwrite=True, force_portable=path.suffix.lower() == ".smd")
 
-    def _save_text(self, tab, path, automatic=False):
+    @Slot(str)
+    def resolveConflict(self, choice):
+        if choice == "cancel":
+            self.pending_close = ""
+            return
+        if choice == "save_as":
+            self.saveAsSafely()
+            return
+        if choice == "overwrite":
+            self._flush("overwrite_conflict")
+            return
+        if choice == "reload":
+            tab = self._current()
+            if not tab.get("path"):
+                return
+            tab_id = tab["id"]
+            path = Path(tab["path"])
+            def done(result, error):
+                if error:
+                    return
+                target = next((t for t in self.tabs if t["id"] == tab_id), None)
+                if not target:
+                    return
+                content, assets, portable = result
+                try:
+                    st = path.stat()
+                    self.note_file_stamps[str(path)] = (st.st_mtime_ns, st.st_size)
+                except OSError:
+                    pass
+                self.reader_edits.clear(tab_id)
+                self.session.reader_assets.revoke_tab(self.window_id, tab_id)
+                if tab_id == self.active:
+                    self._last_reader_text = None
+                target.update(
+                    content=content,
+                    saved=content,
+                    assets=assets,
+                    saved_assets=copy.deepcopy(assets),
+                    assets_dirty=False,
+                    portable=portable,
+                    conflict=False,
+                )
+                self.message = "Reloaded note from disk"
+                self._recover()
+                self._emit(load=tab_id == self.active)
+            self._submit(lambda: open_note(path), done, True)
+
+    def _save_text(self, tab, path, automatic=False, force_overwrite=False, force_portable=False):
         id, content, assets = tab["id"], tab["content"], dict(tab["assets"])
         expected, original_path = tab["saved"], tab["path"]
-        portable = tab["portable"] and str(path) == original_path
+        expected_assets = copy.deepcopy(tab.get("saved_assets", {}))
+        try:
+            same_path = bool(original_path) and Path(path).resolve() == Path(original_path).resolve()
+        except OSError:
+            same_path = str(path) == original_path
+        portable = bool(force_portable or path.suffix.lower() == ".smd" or (tab["portable"] and same_path))
         if id in self.saving: return
         self.saving.add(id)
-        def finished(_, error):
+        def finished(outcome, error):
             self.saving.discard(id)
             if error: return
             target = next((t for t in self.tabs if t["id"] == id), None)
+            if isinstance(outcome, dict) and outcome.get("_conflict"):
+                if target:
+                    target["conflict"] = True
+                if automatic:
+                    self.message = outcome["message"]
+                    self._emit(False)
+                else:
+                    self.message = "This file changed on disk since you opened or last saved it."
+                    self._emit(False)
+                    if target:
+                        self.saveConflictRequested.emit(target["name"])
+                return
+            if isinstance(outcome, dict) and outcome.get("stamp"):
+                self.note_file_stamps[str(path)] = outcome["stamp"]
             if target:
-                target.update(path=str(path), name=path.name, saved=content, saved_assets=copy.deepcopy(assets), portable=portable)
-                if automatic and target["content"] != content: self.autosave_timer.start(900)
+                target.update(
+                    path=str(path),
+                    name=path.name,
+                    saved=content,
+                    saved_assets=copy.deepcopy(assets),
+                    assets_dirty=False,
+                    portable=portable,
+                    conflict=False,
+                )
+                try:
+                    self._agent_open_paths.add(str(Path(path).resolve()))
+                except OSError:
+                    pass
+                if str(path) != original_path:
+                    self.recent = [str(path)] + [p for p in self.recent if p != str(path)][:29]
+                    self._preferences()
+                if automatic and self._is_dirty(target): self.autosave_timer.start(900)
             self.message = "Autosaved" if automatic else "Saved"
             self._recover()
             self._emit()
             if self.pending_close:
                 self._finish_close()
         def write():
-            if automatic and (not path.exists() or open_note(path)[0] != expected):
-                raise ValueError("Autosave paused: this file changed outside Super MD. Your edits remain in draft recovery; use Save as to keep both versions.")
+            if automatic or (not force_overwrite and same_path):
+                changed_on_disk = False
+                if not path.exists():
+                    changed_on_disk = bool(automatic)
+                else:
+                    try:
+                        disk_content, disk_assets, _ = open_note(path)
+                        changed_on_disk = disk_content != expected or (portable and disk_assets != expected_assets)
+                    except Exception:
+                        changed_on_disk = True
+                if changed_on_disk:
+                    return {
+                        "_conflict": True,
+                        "message": "Autosave paused: this file changed outside Super MD. Your edits remain in draft recovery; use Save as to keep both versions.",
+                    }
             if portable: write_portable(path,content,assets)
             else:
                 materialize_assets(path.parent,assets)
                 atomic_write(path,content.encode())
+            try:
+                st = path.stat()
+                return {"stamp": (st.st_mtime_ns, st.st_size)}
+            except OSError:
+                return {}
         self._submit(write, finished,busy=not automatic,executor=self.writes)
 
     def _autosave(self):
         if not self.settings["autosave"]: return
         for tab in self.tabs:
-            if tab["path"] and tab["content"] != tab["saved"] and tab["id"] not in self.saving:
+            if tab["path"] and self._is_dirty(tab) and not tab.get("conflict") and tab["id"] not in self.saving:
                 self._save_text(tab,Path(tab["path"]),automatic=True)
 
     @Slot(str, str)
@@ -2403,8 +2552,17 @@ class Studio(QObject):
 
     @Slot(str,result=QUrl)
     def defaultSaveLocation(self,name):
-        directory = self.settings.get("newNoteLocation") or QStandardPaths.writableLocation(QStandardPaths.DownloadLocation) or str(Path.home())
+        directory = self.settings.get("newNoteLocation") or QStandardPaths.writableLocation(QStandardPaths.StandardLocation.DownloadLocation) or str(Path.home())
         return QUrl.fromLocalFile(str(Path(directory)/Path(name).name))
+
+    @Slot(str,result=QUrl)
+    def defaultSaveAsLocation(self,name):
+        current_path = self._current().get("path")
+        if current_path:
+            parent = Path(current_path).parent
+            if parent.is_dir():
+                return QUrl.fromLocalFile(str(parent / Path(name).name))
+        return self.defaultSaveLocation(name)
 
     @Slot(str, result=QUrl)
     def defaultExportLocation(self, format):
@@ -2417,7 +2575,7 @@ class Studio(QObject):
         if not tab:
             return
         self._activation_generation += 1
-        if tab["content"] != tab["saved"] and (tab["path"] or tab["content"].strip() or tab["assets"]):
+        if self._is_dirty(tab) and (tab["path"] or tab["content"].strip() or tab["assets"]):
             self.pending_close = id
             self.selectTab(id)
             self.closeRequested.emit(tab["name"])
@@ -2471,7 +2629,7 @@ class Studio(QObject):
 
     @Slot(result=bool)
     def requestWindowClose(self):
-        dirty = next((t for t in self.tabs if t["content"] != t["saved"] and (t["path"] or t["content"].strip() or t["assets"])), None)
+        dirty = next((t for t in self.tabs if self._is_dirty(t) and (t["path"] or t["content"].strip() or t["assets"])), None)
         if dirty:
             self.pending_close = "window"
             self.selectTab(dirty["id"])
@@ -2491,7 +2649,19 @@ class Studio(QObject):
                 self.pending_close=""
                 if action:self._remove_tab(action)
                 return
-            self._current()["saved"] = self._current()["content"]
+            current = self._current()
+            if current["content"].strip() or current["path"] or current.get("assets"):
+                captured = copy.deepcopy(current)
+                try:
+                    reference = self.session.closed_note_store.save(captured)
+                    next_refs = ([reference] + self.closed_tabs)[:ClosedNoteStore.LIMIT]
+                    self.session.closed_note_store.save_index(next_refs)
+                    self.closed_tabs[:] = next_refs
+                except Exception as failure:
+                    self.message = "Could not preserve the closed note: " + str(failure)
+            current["saved"] = current["content"]
+            current["saved_assets"] = copy.deepcopy(current.get("assets", {}))
+            current["assets_dirty"] = False
             self._finish_close()
 
     def _finish_close(self):
@@ -2537,7 +2707,7 @@ class Studio(QObject):
         stem = "".join(char for char in stem if char.isalnum() or char in " ._()-").strip(" .")[:100]
         if not stem or stem in (".", ".."):
             stem = "Super MD export"
-        directory = Path(self.settings.get("newNoteLocation") or QStandardPaths.writableLocation(QStandardPaths.DownloadLocation) or str(Path.home())).expanduser()
+        directory = Path(self.settings.get("newNoteLocation") or QStandardPaths.writableLocation(QStandardPaths.StandardLocation.DownloadLocation) or str(Path.home())).expanduser()
         if not directory.is_dir():
             raise ValueError("The configured export folder is unavailable")
         for index in range(1, 10_001):
@@ -2886,7 +3056,7 @@ class Studio(QObject):
                 return self._agent_tab_result(existing, active=not background)
             candidate = Path(filename).expanduser()
             if not candidate.is_absolute():
-                directory = Path(self.settings.get("newNoteLocation") or QStandardPaths.writableLocation(QStandardPaths.DownloadLocation) or str(Path.home())).expanduser()
+                directory = Path(self.settings.get("newNoteLocation") or QStandardPaths.writableLocation(QStandardPaths.StandardLocation.DownloadLocation) or str(Path.home())).expanduser()
                 candidate = directory / candidate.name
             if not self._agent_path_allowed(candidate):
                 raise ValueError("The file is outside the approved agent note roots")
@@ -3087,7 +3257,7 @@ class Studio(QObject):
             raise ValueError("Media bytes do not match the declared type")
         safe = re.sub(r"[^A-Za-z0-9._ -]", "", Path(str(filename)).stem).strip(" .")[:100] or "Super-MD-media"
         extension = extensions[mime_type]
-        directory = Path(self.settings.get("newNoteLocation") or QStandardPaths.writableLocation(QStandardPaths.DownloadLocation) or str(Path.home())).expanduser()
+        directory = Path(self.settings.get("newNoteLocation") or QStandardPaths.writableLocation(QStandardPaths.StandardLocation.DownloadLocation) or str(Path.home())).expanduser()
         if not directory.is_dir():
             raise ValueError("The media download folder is unavailable")
         for suffix in range(1, 10000):
@@ -3250,7 +3420,7 @@ class Studio(QObject):
                 bridge.complete(request_id,None,"The note changed during background preview; retry",window_id=self.window_id);return
             image=QImage.fromData(body,"PNG")
             mime="image/jpeg" if args.get("imageFormat")=="jpeg" else "image/png"
-            encoded=QByteArray();buffer=QBuffer(encoded);buffer.open(QIODevice.WriteOnly);image.save(buffer,"JPEG" if mime=="image/jpeg" else "PNG")
+            encoded=QByteArray();buffer=QBuffer(encoded);buffer.open(QIODevice.OpenModeFlag.WriteOnly);image.save(buffer,"JPEG" if mime=="image/jpeg" else "PNG")
             bridge.complete(request_id,{"tabId":tab_id,"revision":revision,"mime_type":mime,"data":base64.b64encode(bytes(encoded)).decode(),"width":image.width(),"height":image.height(),"context":context,"renderedFrom":"background-preview"},window_id=self.window_id)
         self._submit(lambda:render_live_snapshot(content,assets,path,width=width,heading=heading,view=view),done,False)
 
@@ -3582,7 +3752,7 @@ class Studio(QObject):
                 self.settings["fullZoom" if args.get("fullscreen", self.fullscreen) else "normalZoom"] = max(40,min(300,args["zoom"]))
                 self.preference_timer.start(500)
                 self._emit(False); self.replied.emit(id,"true",""); return
-            if command == "export_failed": self.pending_export = self.pending_save_as = ""; self.message = args["error"]; self._emit(False); self.replied.emit(id,"true",""); return
+            if command == "export_failed": self.pending_export = self.pending_save_as = self.pending_save_as_tab = ""; self.message = args["error"]; self._emit(False); self.replied.emit(id,"true",""); return
             if command == "request_fmd_export": self.exportRequested.emit("smd"); self.replied.emit(id,"true",""); return
             context=args.get("context")
             if context is not None:
@@ -3595,8 +3765,13 @@ class Studio(QObject):
             if context and context["document"] not in (tab["id"],tab["path"]):raise ValueError("Python output belongs to another note")
             captured = dict(tab)
             captured["assets"] = dict(tab["assets"])
+            captured["saved_assets"] = copy.deepcopy(tab.get("saved_assets", {}))
             output = self.pending_export
             save_as = self.pending_save_as
+            save_as_tab = self.pending_save_as_tab
+            force_portable_overwrite = bool(command == "export_fmd_native" and args.get("save") and captured["id"] in self._force_overwrite_ids)
+            if command == "export_fmd_native" and args.get("save"):
+                self._force_overwrite_ids.discard(captured["id"])
             # Preparation is asynchronous. Recheck the actual writer, not just
             # the dialog choice, so a stale/cross-format callback cannot put
             # PDF bytes in an SMD file (or overwrite a portable note with text).
@@ -3664,9 +3839,22 @@ class Studio(QObject):
                     else: write_markdown_export(Path(output), args.get("content"), args.get("assets", {}))
                     return export_result(output)
                 if command == "export_fmd_native":
-                    target = Path(captured["path"]) if args.get("save") else Path(output)
-                    write_portable(target,args["content"],args["assets"])
-                    return export_result(target)
+                    target_path = Path(captured["path"]) if args.get("save") else Path(output)
+                    if args.get("save") and not force_portable_overwrite and target_path.exists():
+                        try:
+                            disk_content, disk_assets, _ = open_note(target_path)
+                            if disk_content != captured["saved"] or disk_assets != captured.get("saved_assets", {}):
+                                return {"_conflict": True}
+                        except Exception:
+                            return {"_conflict": True}
+                    write_portable(target_path,args["content"],args["assets"])
+                    result_data = export_result(target_path)
+                    try:
+                        st = target_path.stat()
+                        result_data["_stamp"] = (st.st_mtime_ns, st.st_size)
+                    except OSError:
+                        pass
+                    return result_data
                 if command == "export_pdf_native":
                     job = export_job
                     assert job is not None
@@ -3730,7 +3918,9 @@ class Studio(QObject):
                 raise ValueError(f"Unsupported command: {command}")
             def finished(result,error):
                 if command.startswith("export_") and self.pending_export == output: self.pending_export = ""
-                if error and self.pending_save_as == save_as: self.pending_save_as = ""
+                if error and self.pending_save_as == save_as:
+                    self.pending_save_as = ""
+                    self.pending_save_as_tab = ""
                 if error:
                     if agent_export_info:
                         record = self._agent_job_records.get(agent_export_info.get("jobId"))
@@ -3746,23 +3936,61 @@ class Studio(QObject):
                     if not agent_export_info:
                         self.replied.emit(id,"null",error)
                     return
+                if command == "export_fmd_native" and isinstance(result, dict) and result.get("_conflict"):
+                    target_tab = next((t for t in self.tabs if t["id"] == captured["id"]), None)
+                    if target_tab:
+                        target_tab["conflict"] = True
+                        self.message = "This file changed on disk since you opened or last saved it."
+                        self._emit(False)
+                        self.saveConflictRequested.emit(target_tab["name"])
+                    self.replied.emit(id, json.dumps({"saved": False, "conflict": True}), "")
+                    return
+                stamp = result.pop("_stamp", None) if isinstance(result, dict) else None
+                if stamp and isinstance(result, dict) and result.get("path"):
+                    self.note_file_stamps[str(result["path"])] = stamp
                 target = next((t for t in self.tabs if t["id"] == captured["id"]),None)
-                if command == "import_images" and target: target["assets"].update(captured["assets"])
+                if command == "import_images" and target:
+                    target["assets"].update(captured["assets"])
+                    target["assets_dirty"] = True
+                    self.recovery_timer.start(800)
+                    self.autosave_timer.start(900)
+                    self._emit(False)
                 if command == "export_fmd_native" and args.get("save") and target:
-                    target.update(saved=args["originalContent"], assets=args["assets"])
+                    target.update(saved=args["originalContent"], assets=args["assets"], assets_dirty=False, conflict=False)
                     target["saved_assets"] = copy.deepcopy(args["assets"])
                     if target["content"] == args["originalContent"]: target["content"] = target["saved"] = args["content"]
+                    self.message = "Saved"
                     self._recover()
+                    self._emit()
                     if self.pending_close: self._finish_close()
-                elif command == "export_fmd_native" and save_as and target:
-                    if target["content"] == args["originalContent"]:
-                        target.update(path=save_as,name=Path(save_as).name,content=args["content"],saved=args["content"],assets=args["assets"],portable=True)
-                        target["saved_assets"] = copy.deepcopy(args["assets"])
+                elif command == "export_fmd_native" and save_as:
+                    save_target = next((t for t in self.tabs if t["id"] == (save_as_tab or captured["id"])), target)
+                    if save_target:
+                        new_content = args["content"] if save_target["content"] == args.get("originalContent", save_target["content"]) else save_target["content"]
+                        save_target.update(
+                            path=save_as,
+                            name=Path(save_as).name,
+                            content=new_content,
+                            saved=args["content"],
+                            assets=args["assets"],
+                            assets_dirty=False,
+                            portable=True,
+                            conflict=False,
+                        )
+                        save_target["saved_assets"] = copy.deepcopy(args["assets"])
+                        try:
+                            self._agent_open_paths.add(str(Path(save_as).resolve()))
+                        except OSError:
+                            pass
+                        self.recent = [save_as] + [p for p in self.recent if p != save_as][:29]
+                        self._preferences()
+                        self.message = "Saved"
                         self._recover()
                         self._emit()
                         if self.pending_close: self._finish_close()
                     self.pending_save_as = ""
-                if command.startswith("export_"): self.message = f"Exported {Path(result['path']).name}"
+                    self.pending_save_as_tab = ""
+                elif command.startswith("export_"): self.message = f"Exported {Path(result['path']).name}"
                 if agent_export_info:
                     record = self._agent_job_records.get(agent_export_info.get("jobId"))
                     if record:

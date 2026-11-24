@@ -13,11 +13,10 @@ from documents import atomic_json
 import updates
 
 class QuietStudio(Studio):
-    def __init__(self, isolated=False, session=None):
-        if isolated:
-            session = session or Session(True)
-            if not session.settings.get("python"):
-                session.settings["python"] = sys.executable
+    def __init__(self, isolated: bool = False, session: Session | None = None):
+        session = session or Session(isolated)
+        if not session.settings.get("python"):
+            session.settings["python"] = sys.executable
         super().__init__(isolated, session)
 
     def _refresh_theme(self):
@@ -130,8 +129,8 @@ class StudioTest(unittest.TestCase):
         import base64
         from PySide6.QtCore import QBuffer, QByteArray, QIODevice
         from PySide6.QtGui import QImage, QColor
-        image=QImage(8,6,QImage.Format_ARGB32);image.fill(QColor("#1688dd"))
-        raw=QByteArray();buffer=QBuffer(raw);buffer.open(QIODevice.WriteOnly);image.save(buffer,"PNG")
+        image=QImage(8,6,QImage.Format.Format_ARGB32);image.fill(QColor("#1688dd"))
+        raw=QByteArray();buffer=QBuffer(raw);buffer.open(QIODevice.OpenModeFlag.WriteOnly);image.save(buffer,"PNG")
         studio=self.studio;original=studio._current()['content'];replies=[]
         studio.replied.connect(lambda identifier,value,error:replies.append((identifier,value,error)))
         body=base64.b64encode(bytes(raw)).decode()
@@ -1082,3 +1081,239 @@ class StudioTest(unittest.TestCase):
         studio.post("flush","document_flushed",json.dumps({"id":studio.active,"content":"Stale draft","operation":previous}))
         self.assertNotEqual(studio._current()["content"],"Stale draft")
         self.assertEqual(studio.flush_operation["action"],"save")
+
+    def test_reopen_closed_tab_restores_most_recent_first_and_persists_across_restart(self):
+        studio = self.studio
+        first = studio._current()
+        first.update(name="First.md", content="First note", saved="First note")
+        first_id = first["id"]
+        studio.newNote()
+        second = studio._current()
+        second.update(name="Second.md", content="Second note", saved="Second note")
+        second_id = second["id"]
+        studio.newNote()
+        studio._current().update(name="Stay.md", content="Stay open", saved="Stay open")
+
+        studio.closeTab(first_id)
+        self._wait_for(lambda: all(t["id"] != first_id for t in studio.tabs))
+        studio.closeTab(second_id)
+        self._wait_for(lambda: all(t["id"] != second_id for t in studio.tabs))
+        self.assertEqual(json.loads(studio.snapshot)["closedCount"], 2)
+
+        studio.reopenTab()
+        self._wait_for(lambda: studio.active == second_id)
+        self.assertEqual(studio._current()["content"], "Second note")
+        self.assertEqual(json.loads(studio.snapshot)["closedCount"], 1)
+
+        # Simulate an app restart reading closed-notes/index.json from the same data dir.
+        restarted_store = studio.session.closed_note_store.__class__(studio.session.closed_note_store.root)
+        persisted_refs = restarted_store.load_index_strict()
+        self.assertEqual(len(persisted_refs), 1)
+        self.assertEqual(persisted_refs[0]["id"], first_id)
+
+        studio.reopenTab()
+        self._wait_for(lambda: studio.active == first_id)
+        self.assertEqual(studio._current()["content"], "First note")
+        persisted_after = restarted_store.load_index_strict()
+        self.assertEqual(persisted_after, [])
+
+    def test_window_close_discard_preserves_closed_tab_snapshot(self):
+        studio = self.studio
+        note = studio._current()
+        note.update(name="WindowDraft.md", content="Unsaved window draft", saved="")
+        note_id = note["id"]
+        self.assertFalse(studio.requestWindowClose())
+        studio.resolveClose("discard")
+        self.assertEqual(len(studio.closed_tabs), 1)
+        restored = studio.session.closed_note_store.load(studio.closed_tabs[0])
+        self.assertEqual(restored["id"], note_id)
+        self.assertEqual(restored["content"], "Unsaved window draft")
+
+    def test_proactive_conflict_detection_pauses_autosave_for_md_and_smd(self):
+        from documents import write_portable
+        studio = self.studio
+        md_path = studio.data / "conflict.md"
+        md_path.write_text("base md", encoding="utf-8")
+        md_tab = studio._current()
+        md_tab.update(name="conflict.md", path=str(md_path), content="local md draft", saved="base md")
+        studio._emit(False)
+
+        md_path.write_text("external md change", encoding="utf-8")
+        studio._external_note_changed(str(md_path))
+        studio.external_timer.stop()
+        studio._refresh_external_notes()
+        self._wait_for(lambda: bool(md_tab.get("conflict")))
+        self.assertTrue(json.loads(studio.snapshot)["conflict"])
+        self.assertEqual(md_tab["content"], "local md draft")
+
+        # Autosave must stay paused for the conflicted tab while non-conflicted tabs still autosave.
+        clean_other_path = studio.data / "other.md"
+        clean_other_path.write_text("other base", encoding="utf-8")
+        studio.newNote()
+        other_tab = studio._current()
+        other_tab.update(name="other.md", path=str(clean_other_path), content="other draft", saved="other base")
+        studio._autosave()
+        self._wait_for(lambda: not studio.saving)
+        self.assertEqual(md_path.read_text(encoding="utf-8"), "external md change")
+        self.assertEqual(clean_other_path.read_text(encoding="utf-8"), "other draft")
+
+        # Portable .smd external asset-only change on a dirty tab must also flag conflict and pause autosave.
+        svg_a = "data:image/svg+xml;base64,PHN2Zy8+"
+        svg_b = "data:image/svg+xml;base64,PHN2ZyBpZD0iYiIvPg=="
+        smd_path = studio.data / "portable.smd"
+        write_portable(smd_path, "base smd", {"assets/a.svg": svg_a})
+        studio.newNote()
+        smd_tab = studio._current()
+        smd_tab.update(
+            name="portable.smd",
+            path=str(smd_path),
+            content="local smd draft",
+            saved="base smd",
+            assets={"assets/a.svg": svg_a},
+            saved_assets={"assets/a.svg": svg_a},
+            portable=True,
+        )
+        studio._emit(False)
+        write_portable(smd_path, "base smd", {"assets/a.svg": svg_b})
+        studio._external_note_changed(str(smd_path))
+        studio.external_timer.stop()
+        studio._refresh_external_notes()
+        self._wait_for(lambda: bool(smd_tab.get("conflict")))
+        self.assertTrue(json.loads(studio.snapshot)["conflict"])
+
+    def test_guarded_manual_save_and_conflict_resolution_for_md_and_smd(self):
+        from documents import open_note, write_portable
+        studio = self.studio
+        conflicts = []
+        studio.saveConflictRequested.connect(conflicts.append)
+
+        md_path = studio.data / "guarded.md"
+        md_path.write_text("v1", encoding="utf-8")
+        tab = studio._current()
+        tab.update(name="guarded.md", path=str(md_path), content="my local draft", saved="v1")
+
+        # External modification before watcher even runs: manual Save must detect and block overwrite!
+        md_path.write_text("external v2", encoding="utf-8")
+        studio.save()
+        self._wait_for(lambda: len(conflicts) == 1)
+        self.assertEqual(conflicts, ["guarded.md"])
+        self.assertTrue(tab["conflict"])
+        self.assertEqual(md_path.read_text(encoding="utf-8"), "external v2")
+
+        # Repeating Save while already flagged immediately re-requests conflict resolution without writing.
+        studio.save()
+        self.assertEqual(conflicts, ["guarded.md", "guarded.md"])
+        self.assertEqual(md_path.read_text(encoding="utf-8"), "external v2")
+
+        # Choosing Overwrite writes the draft and clears conflict.
+        studio.resolveConflict("overwrite")
+        self._wait_for(lambda: not tab["conflict"] and not studio.saving)
+        self.assertEqual(md_path.read_text(encoding="utf-8"), "my local draft")
+        self.assertEqual(tab["saved"], "my local draft")
+
+        # Modify externally again, edit locally, then choose Reload from disk.
+        md_path.write_text("disk v3", encoding="utf-8")
+        tab["content"] = "discardable draft"
+        studio.save()
+        self._wait_for(lambda: tab["conflict"])
+        studio.resolveConflict("reload")
+        self._wait_for(lambda: not tab["conflict"] and studio.busy == 0)
+        self.assertEqual(tab["content"], "disk v3")
+        self.assertEqual(tab["saved"], "disk v3")
+
+        # Guarded manual Save on live portable .smd (ready=True) also blocks external changes.
+        svg_a = "data:image/svg+xml;base64,PHN2Zy8+"
+        svg_b = "data:image/svg+xml;base64,PHN2ZyBpZD0iYiIvPg=="
+        smd_path = studio.data / "guarded.smd"
+        write_portable(smd_path, "smd v1", {"assets/a.svg": svg_a})
+        studio.newNote()
+        smd_tab = studio._current()
+        smd_tab.update(
+            name="guarded.smd",
+            path=str(smd_path),
+            content="smd local",
+            saved="smd v1",
+            assets={"assets/a.svg": svg_a},
+            saved_assets={"assets/a.svg": svg_a},
+            portable=True,
+        )
+        studio.ready = True
+        write_portable(smd_path, "smd external", {"assets/a.svg": svg_b})
+        conflicts.clear()
+        studio.post(
+            "portable-save",
+            "export_fmd_native",
+            json.dumps({
+                "id": smd_tab["id"],
+                "save": True,
+                "content": "smd local",
+                "originalContent": "smd local",
+                "assets": {"assets/a.svg": svg_a},
+            }),
+        )
+        self._wait_for(lambda: len(conflicts) == 1)
+        self.assertEqual(conflicts, ["guarded.smd"])
+        self.assertTrue(smd_tab["conflict"])
+        self.assertEqual(open_note(smd_path)[:2], ("smd external", {"assets/a.svg": svg_b}))
+
+    def test_save_as_rebinds_tab_saves_assets_and_clears_conflict(self):
+        from documents import open_note, write_portable
+        studio = self.studio
+        svg_a = "data:image/svg+xml;base64,PHN2Zy8+"
+        orig_md = studio.data / "orig.md"
+        orig_md.write_text("disk md", encoding="utf-8")
+        tab = studio._current()
+        tab.update(
+            name="orig.md",
+            path=str(orig_md),
+            content="draft with ![pic](assets/a.svg)",
+            saved="old md",
+            assets={"assets/a.svg": svg_a},
+            conflict=True,
+        )
+        copy_md = studio.data / "saved-copy.md"
+        studio.saveAs(str(copy_md))
+        self._wait_for(lambda: not studio.saving and tab["path"] == str(copy_md))
+        self.assertEqual(tab["name"], "saved-copy.md")
+        self.assertFalse(tab["conflict"])
+        self.assertFalse(json.loads(studio.snapshot)["conflict"])
+        self.assertFalse(studio._is_dirty(tab))
+        self.assertEqual(copy_md.read_text(encoding="utf-8"), "draft with ![pic](assets/a.svg)")
+        self.assertTrue((studio.data / "assets" / "a.svg").is_file())
+        self.assertEqual(orig_md.read_text(encoding="utf-8"), "disk md")
+
+        # Now test Save As on an already-saved conflicted .smd via live reader bridge.
+        orig_smd = studio.data / "orig.smd"
+        write_portable(orig_smd, "external smd", {})
+        studio.newNote()
+        smd_tab = studio._current()
+        smd_tab.update(
+            name="orig.smd",
+            path=str(orig_smd),
+            content="portable draft ![pic](assets/a.svg)",
+            saved="base smd",
+            assets={"assets/a.svg": svg_a},
+            saved_assets={"assets/a.svg": svg_a},
+            portable=True,
+            conflict=True,
+        )
+        studio.ready = True
+        copy_smd = studio.data / "rebound.smd"
+        studio.saveAs(str(copy_smd))
+        studio.post(
+            "portable-save-as",
+            "export_fmd_native",
+            json.dumps({
+                "id": smd_tab["id"],
+                "save": False,
+                "content": smd_tab["content"],
+                "originalContent": smd_tab["content"],
+                "assets": {"assets/a.svg": svg_a},
+            }),
+        )
+        self._wait_for(lambda: smd_tab["path"] == str(copy_smd) and studio.busy == 0)
+        self.assertEqual(smd_tab["name"], "rebound.smd")
+        self.assertFalse(smd_tab["conflict"])
+        self.assertFalse(studio._is_dirty(smd_tab))
+        self.assertEqual(open_note(copy_smd), ("portable draft ![pic](assets/a.svg)", {"assets/a.svg": svg_a}, True))
+        self.assertEqual(open_note(orig_smd), ("external smd", {}, True))
