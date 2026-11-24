@@ -285,13 +285,14 @@ md-filled-button.primary-action, smd-expressive-button.primary-action { display:
 .markdown-body input[type="checkbox"] { accent-color:var(--primary);width:1.1em;height:1.1em;vertical-align:middle;cursor:pointer; }
 .markdown-body img { max-width: 100%; height: auto; border-radius: 12px; display: block; margin: 1.5em auto; border: 1px solid var(--outline); }
 .image-loading, .image-error { display: block; margin: 1.4em 0; padding: 18px 20px; border-radius: 12px; background: var(--surface-low); color: var(--muted); font-size: .82em; }
-.image-error { border: 1px solid var(--error); color: var(--error); }
+.image-error { display: flex; align-items: center; justify-content: space-between; flex-wrap: wrap; gap: 12px 16px; border: 1px solid var(--error); color: var(--error); }
+.image-error > span:first-child { min-width: 0; flex: 1 1 200px; }
 .image-error small { display: block; margin-top: 8px; opacity: .75; overflow-wrap: anywhere; }
 .remote-image-card { display: flex; align-items: center; justify-content: space-between; gap: 16px; margin: 1.4em 0; padding: 16px; border: 1px dashed var(--outline); border-radius: 14px; background: var(--surface-low); font-size: .8em; }
 .remote-image-card > span:first-child { display: grid; gap: 4px; }
 .remote-image-card small { color: var(--muted); }
-.remote-image-actions { display: flex; flex-wrap: wrap; gap: 6px; }
-.remote-image-actions button { padding: 7px 10px; background: var(--surface-high); font-size: .82em; font-weight: 700; }
+.remote-image-actions, .image-error-actions { display: flex; flex-wrap: wrap; gap: 6px; }
+.remote-image-actions button, .image-error-actions button { padding: 7px 10px; background: var(--surface-high); color: var(--text); font-size: .82em; font-weight: 700; }
 .markdown-body table { width: 100%; display: block; overflow-x: auto; border-collapse: collapse; margin: 1.4em 0; }
 .markdown-body th, .markdown-body td { padding: 9px 12px; border: 1px solid var(--outline); text-align: left; min-width: 90px; }
 .markdown-body th { background: var(--surface-high); }
