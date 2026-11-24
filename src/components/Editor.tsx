@@ -77,6 +77,11 @@ export function editorReadingOffset(id:string):number|undefined {
   const rect=view.scrollDOM.getBoundingClientRect();
   return view.posAtCoords({x:rect.left+80,y:rect.top+16})??view.viewport.from;
 }
+export function editorSelectedText(id:string):string|null {
+  const view=visibleEditors.get(id);if(!view)return null;
+  const main=view.state.selection.main;
+  return main.empty?null:view.state.sliceDoc(main.from,main.to);
+}
 export function editorHistory(id:string,direction:"undo"|"redo"):boolean {const view=visibleEditors.get(id);return !!view && (direction==="undo"?undo(view):redo(view));}
 export function cachedEditorHistory(id:string,direction:'undo'|'redo',content:string):string|undefined {
   const cached=sessions.get(id);if(!cached||cached.state.doc.toString()!==content)return;

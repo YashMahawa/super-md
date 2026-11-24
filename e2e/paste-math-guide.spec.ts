@@ -3,12 +3,13 @@ import {readFileSync} from 'node:fs';
 
 async function setup(page:Page,mode:'editor'|'live'|'reader',latexAutofix?:boolean,content='Start here.'){
   await page.addInitScript(mode=>{
-    (window as any).pastedDocument='';(window as any).copiedGuide='';
+    (window as any).pastedDocument='';(window as any).copiedGuide='';(window as any).appliedThemes=[];
     if(mode==='reader')Object.defineProperty(navigator,'clipboard',{configurable:true,value:{writeText:async()=>{throw new Error('Exercise native clipboard fallback');}}});
     window.SuperMD={post:(id,command,raw)=>{
       const args=JSON.parse(raw);
       if(command==='document_changed')(window as any).pastedDocument=args.content;
       if(command==='copy_text')(window as any).copiedGuide=args.text;
+      if(command==='apply_bundled_theme')(window as any).appliedThemes.push(args.id);
       queueMicrotask(()=>window.supermdReply?.(id,true,null));
     }};
   },mode);
@@ -87,3 +88,22 @@ test('theme guide fits a phone in light colours and image drops cannot edit the 
   await page.screenshot({path:'/tmp/supermd-theme-guide-light-phone.png'});
   await dialog.getByRole('button',{name:'Close theme guide'}).click();await expect(dialog).toHaveCount(0);
 });
+
+test('theme guide intercepts bundled preset links and opens the bundled preset browser without navigating away',async({page})=>{
+  await page.setViewportSize({width:1280,height:860});await setup(page,'reader');
+  await page.evaluate(()=>window.supermdThemeGuide?.());
+  const dialog=page.getByRole('dialog',{name:'Theme styling guide'});await expect(dialog).toBeVisible();
+  await dialog.getByRole('link',{name:'Study desk example'}).click();
+  await expect.poll(()=>page.evaluate(()=>(window as any).appliedThemes)).toEqual(['study-desk']);
+  await expect(dialog.getByText('Applied Study desk')).toBeVisible();
+  expect(page.url()).toContain('/android-reader.html');
+  await dialog.getByRole('link',{name:'public/themes'}).first().click();
+  const presetsRegion=dialog.getByRole('region',{name:'Bundled theme presets'});
+  await expect(presetsRegion).toBeVisible();
+  await expect(presetsRegion.getByRole('button')).toHaveCount(16);
+  await presetsRegion.getByRole('button',{name:'Lazy Sunday cats'}).click();
+  await expect.poll(()=>page.evaluate(()=>(window as any).appliedThemes)).toEqual(['study-desk','lazy-sunday-cats']);
+  await expect(dialog.getByText('Applied Lazy Sunday cats')).toBeVisible();
+  await page.screenshot({path:'/tmp/supermd-theme-guide-presets.png'});
+});
+
