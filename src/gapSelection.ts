@@ -1,8 +1,9 @@
+import {caretRangeAtPoint} from './caretPoint';
 import type {Point} from './focalZoom';
 
 const controls='a,button,input,textarea,select,summary,.cm-editor,.interactive-chart,.note-image,.image-viewer,[data-independent-zoom]';
 function caretAt(root:HTMLElement,point:Point):Range|null {
-  const range=(root.ownerDocument as Document&{caretRangeFromPoint?:(x:number,y:number)=>Range|null}).caretRangeFromPoint?.(point.x,point.y);
+  const range=caretRangeAtPoint(root.ownerDocument,point.x,point.y);
   if(!range||range.startContainer.nodeType!==Node.TEXT_NODE||!root.contains(range.startContainer)||range.startContainer.parentElement?.closest(controls+',.katex-mathml,annotation'))return null;
   return range;
 }

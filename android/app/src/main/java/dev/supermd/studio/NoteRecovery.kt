@@ -18,6 +18,7 @@ internal object NoteRecovery {
                     .name("uri").value(note.uri ?: "").name("content").value(note.content)
                     .name("relative").value(note.relative ?: "").name("assetDirectory").value(note.assetDirectory ?: "")
                 if(note.saved!=note.content)json.name("saved").value(note.saved)
+                if(note.assetsDirty)json.name("assetsDirty").value(true)
                 if(note.agentStaged)json.name("agentStaged").value(true)
                 if(note.agentUnreviewed)json.name("agentUnreviewed").value(true)
                 if(note.agentEdits.isNotEmpty()) {
@@ -67,16 +68,10 @@ internal object NoteRecovery {
                 }
             }
             json.endArray()
-            val bounded = steps.takeLast(MAX_AGENT_EDIT_STEPS).toMutableList()
-            fun totalBytes(items: List<AgentEditStep>): Long =
-                items.sumOf { it.before.toByteArray(Charsets.UTF_8).size.toLong() + it.after.toByteArray(Charsets.UTF_8).size.toLong() }
-            while (bounded.size > 1 && totalBytes(bounded) > MAX_AGENT_SNAPSHOT_BYTES) {
-                bounded.removeAt(0)
-            }
-            return if (totalBytes(bounded) <= MAX_AGENT_SNAPSHOT_BYTES * 2L) bounded else emptyList()
+            return boundAgentEditSteps(steps)
         }
         fun note(): Note {
-            var id="";var name="";var uri:String?=null;var content="";var saved:String?=null;var relative:String?=null;var assets:String?=null
+            var id="";var name="";var uri:String?=null;var content="";var saved:String?=null;var relative:String?=null;var assets:String?=null;var assetsDirty=false
             var agentStaged=false;var agentUnreviewed=false;var agentEdits:List<AgentEditStep> = emptyList()
             json.beginObject()
             while(json.hasNext()) {
@@ -86,6 +81,7 @@ internal object NoteRecovery {
                     "id"->id=json.nextString();"name"->name=json.nextString();"uri"->uri=json.nextString().takeIf{it.isNotBlank()}
                     "content"->content=json.nextString();"saved"->saved=json.nextString()
                     "relative"->relative=json.nextString().takeIf{it.isNotBlank()};"assetDirectory"->assets=json.nextString().takeIf{it.isNotBlank()}
+                    "assetsDirty"->assetsDirty=json.nextBoolean()
                     "agentStaged"->agentStaged=json.nextBoolean()
                     "agentUnreviewed"->agentUnreviewed=json.nextBoolean()
                     "agentEdits"->agentEdits=editSteps()
@@ -93,7 +89,19 @@ internal object NoteRecovery {
                 }
             }
             json.endObject();require(id.isNotBlank()&&name.isNotBlank()) {"Invalid recovery note"}
-            return Note(id,name,uri,content,saved?.takeUnless{it==content}?:content,relative,assets,agentStaged,agentUnreviewed,agentEdits)
+            return Note(
+                id = id,
+                name = name,
+                uri = uri,
+                content = content,
+                saved = saved?.takeUnless { it == content } ?: content,
+                relative = relative,
+                assetDirectory = assets,
+                assetsDirty = assetsDirty,
+                agentStaged = agentStaged,
+                agentUnreviewed = agentUnreviewed,
+                agentEdits = agentEdits,
+            )
         }
         fun notes(): List<Note> {val result=mutableListOf<Note>();json.beginArray();while(json.hasNext())result.add(note());json.endArray();return result}
         var state=defaults

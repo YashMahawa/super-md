@@ -48,17 +48,17 @@ def server():
             path = "/org/freedesktop/portal/desktop/request/test/" + str(len(names))
             request = Request()
             requests.append(request)
-            assert bus.registerObject(path, request, QDBusConnection.ExportAllSignals)
-            url = QUrl.fromLocalFile("/tmp/" + name).toString(QUrl.FullyEncoded)
+            assert bus.registerObject(path, request, QDBusConnection.RegisterOption.ExportAllSignals)
+            url = QUrl.fromLocalFile("/tmp/" + name).toString(QUrl.ComponentFormattingOption.FullyEncoded)
             QTimer.singleShot(50, lambda: request.Response.emit(0, {"uris": [url]}))
             return QDBusObjectPath(path)
 
     portal = Portal()
     assert bus.registerService("org.freedesktop.portal.Desktop")
     assert bus.registerObject("/org/freedesktop/portal/desktop", portal,
-                              QDBusConnection.ExportAllSlots | QDBusConnection.ExportAllProperties)
+                              QDBusConnection.RegisterOption.ExportAllSlots | QDBusConnection.RegisterOption.ExportAllProperties)
     child = QProcess()
-    child.setProcessChannelMode(QProcess.SeparateChannels)
+    child.setProcessChannelMode(QProcess.ProcessChannelMode.SeparateChannels)
     def finished(code, _status):
         output = bytes(child.readAllStandardOutput()).decode()
         error = bytes(child.readAllStandardError()).decode()

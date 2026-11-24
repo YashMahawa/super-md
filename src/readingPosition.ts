@@ -1,9 +1,10 @@
 /** Source offsets survive switching between reflowed reading and source views. */
+import {caretRangeAtPoint} from "./caretPoint";
 import {revealWindowed} from "./windowedSearch";
 export function readingOffset(root:HTMLElement):number {
   const top=root.getBoundingClientRect().top+16;
   const bounds=root.getBoundingClientRect();
-  const caret=(document as Document&{caretRangeFromPoint?:(x:number,y:number)=>Range|null}).caretRangeFromPoint?.(bounds.left+bounds.width*.5,top);
+  const caret=caretRangeAtPoint(root.ownerDocument,bounds.left+bounds.width*.5,top);
   const element=caret?.startContainer.nodeType===Node.ELEMENT_NODE?caret.startContainer as Element:caret?.startContainer.parentElement;
   const hit=element?.closest<HTMLElement>('.live-block,[data-source-start]');
   if(hit&&root.contains(hit))return Number((hit.closest<HTMLElement>('.live-block')||hit).dataset.sourceStart)||0;

@@ -9,7 +9,6 @@ import textwrap
 import time
 import unittest
 from pathlib import Path
-from unittest.mock import patch
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 os.environ.setdefault("QT_QUICK_BACKEND", "software")
@@ -108,11 +107,7 @@ class DesktopAgentStagingAndChromeTests(unittest.TestCase):
         cls.app = QGuiApplication.instance() or QGuiApplication(["Super MD desktop agent staging tests"])
 
     def make_studio(self, root: Path | None = None):
-        if root is not None:
-            with patch("studio.tempfile.mkdtemp", return_value=str(root)):
-                session = Session(True)
-        else:
-            session = Session(True)
+        session = Session(True, data=root)
         studio = QuietStudio(True, session)
         studio.settings["welcomed"] = True
         studio.settings["autosave"] = True

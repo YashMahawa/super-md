@@ -10,6 +10,7 @@ import {checkWriting,type WritingOptions} from "../proofreading";
 import { search, searchKeymap, highlightSelectionMatches, openSearchPanel, SearchQuery, setSearchQuery } from "@codemirror/search";
 import { oneDarkHighlightStyle } from "@codemirror/theme-one-dark";
 import type {SourceChange} from '../readerEdits';
+import { textEdit } from "../noteHistory";
 import {
   TYPEWRITER_SHORTCUT,
   centerCursorEffect,
@@ -73,6 +74,11 @@ export function editorReadingOffset(id:string):number|undefined {
   const view=visibleEditors.get(id);if(!view)return;
   const rect=view.scrollDOM.getBoundingClientRect();
   return view.posAtCoords({x:rect.left+80,y:rect.top+16})??view.viewport.from;
+}
+export function editorSelectedText(id:string):string|null {
+  const view=visibleEditors.get(id);if(!view)return null;
+  const main=view.state.selection.main;
+  return main.empty?null:view.state.sliceDoc(main.from,main.to);
 }
 export function editorHistory(id:string,direction:"undo"|"redo"):boolean {const view=visibleEditors.get(id);return !!view && (direction==="undo"?undo(view):redo(view));}
 export function cachedEditorHistory(id:string,direction:'undo'|'redo',content:string):string|undefined {
@@ -217,12 +223,9 @@ export default function Editor({ sessionId = "default", value, onChange, dark, f
       if (previous === value) {
         state = cached.state;
       } else {
-        let from = 0;
-        while (from < previous.length && from < value.length && previous[from] === value[from]) from++;
-        let oldEnd = previous.length, newEnd = value.length;
-        while (oldEnd > from && newEnd > from && previous[oldEnd - 1] === value[newEnd - 1]) { oldEnd--; newEnd--; }
+        const edit = textEdit(previous, value);
         state = cached.state.update({
-          changes: { from, to: oldEnd, insert: value.slice(from, newEnd) },
+          changes: { from: edit.from, to: edit.from + edit.remove, insert: edit.insert },
           annotations: [Transaction.addToHistory.of(false), isolateHistory.of("full")],
         }).state;
       }

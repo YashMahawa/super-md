@@ -1,8 +1,15 @@
 // @vitest-environment jsdom
 import {afterEach,expect,it,vi} from 'vitest';
 import {captureScrollAnchor,markScrollInput} from './scrollAnchor';
+const originalCaretPosition=Object.getOwnPropertyDescriptor(document,'caretPositionFromPoint');
 const originalCaret=Object.getOwnPropertyDescriptor(document,'caretRangeFromPoint');
-afterEach(()=>{vi.restoreAllMocks();document.body.replaceChildren();if(originalCaret)Object.defineProperty(document,'caretRangeFromPoint',originalCaret);else Reflect.deleteProperty(document,'caretRangeFromPoint');});
+afterEach(()=>{
+  vi.restoreAllMocks();
+  document.body.replaceChildren();
+  if(originalCaretPosition)Object.defineProperty(document,'caretPositionFromPoint',originalCaretPosition);else Reflect.deleteProperty(document,'caretPositionFromPoint');
+  if(originalCaret)Object.defineProperty(document,'caretRangeFromPoint',originalCaret);else Reflect.deleteProperty(document,'caretRangeFromPoint');
+  Reflect.deleteProperty(Range.prototype,'getBoundingClientRect');
+});
 it('does not restore an old anchor over newer native or browser scroll input',()=>{
   const root=document.createElement('div');document.body.append(root);root.scrollTop=200;
   const restore=captureScrollAnchor(root);markScrollInput();root.scrollTop=450;restore();expect(root.scrollTop).toBe(450);
@@ -20,4 +27,20 @@ it('does not mistake a live Range retargeted from removed loading text for its o
   const restore=captureScrollAnchor(root);text.remove();
   expect(range.startContainer).toBe(label);expect(range.startContainer.isConnected).toBe(true);expect(text.isConnected).toBe(false);
   restore();expect(root.scrollTop).toBe(700);
+});
+it('captures and restores a standard caretPositionFromPoint text anchor without calling caretRangeFromPoint',()=>{
+  const root=document.createElement('div'),paragraph=document.createElement('p');
+  paragraph.textContent='Anchored line';root.append(paragraph);document.body.append(root);root.scrollTop=320;
+  const text=paragraph.firstChild!;
+  let lineTop=150;
+  Object.defineProperty(Range.prototype,'getBoundingClientRect',{configurable:true,value:function(this:Range){return {top:this.startContainer===text?lineTop:0,height:this.startContainer===text?18:0,left:24};}});
+  const legacySpy=vi.fn();
+  Object.defineProperty(document,'caretPositionFromPoint',{configurable:true,value:vi.fn(()=>({offsetNode:text,offset:2,getClientRect:()=>null}))});
+  Object.defineProperty(document,'caretRangeFromPoint',{configurable:true,value:legacySpy});
+  vi.spyOn(root,'getBoundingClientRect').mockReturnValue({top:0,left:0,width:800,height:600} as DOMRect);
+  const restore=captureScrollAnchor(root);
+  expect(legacySpy).not.toHaveBeenCalled();
+  lineTop=410;
+  restore();
+  expect(root.scrollTop).toBe(580);
 });

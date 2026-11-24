@@ -96,7 +96,6 @@ class AgentStagingAndGraceTest {
         workspaceKeys += key
         val model = StudioViewModel(app, key)
         model.readerFlushRequester = { true }
-        model.imageSourcesExtractor = { "[]" }
         val store = ViewModelStore().apply {
             val put = ViewModelStore::class.java.getDeclaredMethod("put", String::class.java, androidx.lifecycle.ViewModel::class.java)
             put.isAccessible = true
