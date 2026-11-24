@@ -9,12 +9,18 @@ import {mediaBytes} from './mediaExport';
 import { memo, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import "@fontsource-variable/manrope";
 import "@fontsource-variable/jetbrains-mono";
+import "@fontsource-variable/jetbrains-mono/wght-italic.css";
 import "@fontsource-variable/roboto";
+import "@fontsource-variable/roboto/wght-italic.css";
+import "@fontsource-variable/noto-sans";
+import "@fontsource-variable/noto-sans/wght-italic.css";
 import "@fontsource-variable/noto-serif";
+import "@fontsource-variable/noto-serif/wght-italic.css";
 import "katex/dist/katex.min.css";
 import "./styles.css";
 import "./androidReader.css";
 import "./customTheme.css";
+import { isBuiltinReaderFont, resolveReaderFontStack } from "./readerFonts";
 import Editor, { editorReadingOffset, editorHistory, exportEditorSession, importEditorSession, type PortableEditorSession } from "./components/Editor";
 import {readingOffset,revealReadingOffset} from "./readingPosition";
 import { exportRenderedViews, importRenderedViews } from "./renderedOutputs";
@@ -398,8 +404,7 @@ function Reader() {
     const root = document.documentElement; root.dataset.theme = state.dark ? "dark" : "light"; root.dataset.motion = state.motion === false ? "off" : "on";root.dataset.fullscreen=String(state.fullscreen);
     root.style.setProperty("--reader-size", `${state.size}px`);
     root.style.setProperty("--editor-size", `${Math.max(12, Math.min(24, state.size - 2))}px`);
-    const fonts: Record<string,string> = {sans:"Manrope,'Manrope Variable', sans-serif",serif:"'Noto Serif','Noto Serif Variable', Georgia, serif",mono:"'JetBrains Mono','JetBrains Mono Variable', monospace",Manrope:"Manrope,'Manrope Variable',sans-serif","JetBrains Mono":"'JetBrains Mono','JetBrains Mono Variable',monospace","Noto Sans":"'Noto Sans',sans-serif","Noto Serif":"'Noto Serif','Noto Serif Variable',serif",Roboto:"Roboto,'Roboto Variable',sans-serif",roboto:"Roboto,'Roboto Variable',sans-serif",noto:"'Noto Sans',sans-serif",system:"system-ui,sans-serif"};
-    root.style.setProperty("--reader-font",fonts[state.font] || `${JSON.stringify(state.font)}, sans-serif`);
+    root.style.setProperty("--reader-font", resolveReaderFontStack(state.font));
     root.style.setProperty("--reader-width",`${state.widthPercent??90}%`);
     root.style.setProperty("--reading-max-width",`${state.widthPercent??90}%`);
     root.style.setProperty("--reader-leading",String(state.lineHeight??1.65));
@@ -436,7 +441,7 @@ function Reader() {
     return()=>document.removeEventListener('scroll',lock,true);
   },[]);
   useEffect(()=>{
-    if(!state || ["sans","serif","mono","noto","roboto","system","Manrope","Roboto","Noto Sans","Noto Serif","JetBrains Mono"].includes(state.font) || !window.SuperMD || typeof FontFace==="undefined")return;
+    if(!state || isBuiltinReaderFont(state.font) || !window.SuperMD || typeof FontFace==="undefined")return;
     const family=state.font;
     if(!loadedFonts.current.has(family)){
       const loading=invoke<{family:string;data:string}>("load_font",{family}).then(async value=>{const face=new FontFace(value.family,`url(${value.data})`);await face.load();const restore=anchors();document.fonts.add(face);restore.forEach(callback=>callback());return face;});
