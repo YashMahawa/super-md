@@ -59,6 +59,11 @@ function diagramPresentation(svg:SVGSVGElement):CSSProperties {
   return style.filter&&style.filter!=="none"?{filter:style.filter}:{};
 }
 
+function samePresentation(a:CSSProperties,b:CSSProperties):boolean {
+  const ka=Object.keys(a) as (keyof CSSProperties)[],kb=Object.keys(b) as (keyof CSSProperties)[];
+  return ka.length===kb.length&&ka.every(k=>a[k]===b[k]);
+}
+
 export default function ImageViewer() {
   const [image, setImage] = useState<{ src: string; alt: string; presentation:CSSProperties; owner: HTMLElement | null; liveBlock: HTMLElement | null } | null>(null);
   const [zoom, setZoom] = useState(100), [pan, setPan] = useState({ x: 0, y: 0 });
@@ -129,32 +134,23 @@ export default function ImageViewer() {
       const diagramSvg = element.closest<SVGSVGElement>(".markdown-body .inline-diagram svg") ?? diagramFigure?.querySelector<SVGSVGElement>("svg") ?? null;
       if (!diagramSvg) return;
       const liveBlock = diagramSvg.closest<HTMLElement>(".live-block");
-      const showDiagram = (block: HTMLElement | null) => {
+      const showDiagram = (block: HTMLElement | null): boolean => {
         const slide = diagramSvg.closest(".step-cards");
-        if (slide) { slide.dispatchEvent(new Event("supermd-step-expand")); return; }
+        if (slide) { slide.dispatchEvent(new Event("supermd-step-expand")); return true; }
         try {
           const src = inlineDiagramDataUrl(diagramSvg);
           source.current = diagramSvg;
           const label = diagramSvg.getAttribute("aria-label") || diagramFigure?.getAttribute("aria-label") || "Diagram";
           setImage({ src, alt: label, presentation: diagramPresentation(diagramSvg), owner: null, liveBlock: block }); fit();
-        } catch { /* Malformed SVG stays inline without crashing the reader. */ }
+          return true;
+        } catch {
+          /* Malformed SVG stays inline without crashing the reader. */
+          return false;
+        }
       };
       if (!liveBlock) {
-        const slide = diagramSvg.closest(".step-cards");
-        if (slide) {
-          event.preventDefault(); event.stopImmediatePropagation();
-          cancelPending();
-          slide.dispatchEvent(new Event("supermd-step-expand"));
-          return;
-        }
-        try {
-          const src = inlineDiagramDataUrl(diagramSvg);
-          event.preventDefault(); event.stopImmediatePropagation();
-          cancelPending();
-          source.current = diagramSvg;
-          const label = diagramSvg.getAttribute("aria-label") || diagramFigure?.getAttribute("aria-label") || "Diagram";
-          setImage({ src, alt: label, presentation: diagramPresentation(diagramSvg), owner: null, liveBlock: null }); fit();
-        } catch { /* Malformed SVG stays inline without crashing the reader. */ }
+        cancelPending();
+        if (showDiagram(null)) { event.preventDefault(); event.stopImmediatePropagation(); }
         return;
       }
       event.preventDefault(); event.stopImmediatePropagation();
@@ -202,12 +198,12 @@ export default function ImageViewer() {
       if(target instanceof SVGSVGElement){
         try {
           const src=inlineDiagramDataUrl(target),style=diagramPresentation(target);
-          setImage(previous=>previous&&(previous.src!==src||JSON.stringify(previous.presentation)!==JSON.stringify(style))?{...previous,src,presentation:style}:previous);
+          setImage(previous=>previous&&(previous.src!==src||!samePresentation(previous.presentation,style))?{...previous,src,presentation:style}:previous);
         } catch { /* Keep previous valid snapshot. */ }
         return;
       }
       const src=target.currentSrc||target.src,style=presentation(target);
-      setImage(previous=>previous&&(previous.src!==src||JSON.stringify(previous.presentation)!==JSON.stringify(style))?{...previous,src,presentation:style}:previous);
+      setImage(previous=>previous&&(previous.src!==src||!samePresentation(previous.presentation,style))?{...previous,src,presentation:style}:previous);
     };
     // Appearance changes should affect an already-open viewer too, without
     // resetting its magnification or moving the image under the person's hand.

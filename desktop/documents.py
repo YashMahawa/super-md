@@ -9,6 +9,7 @@ import re
 import stat
 import tempfile
 import threading
+import time
 import zlib
 from pathlib import Path
 
@@ -43,7 +44,9 @@ def decode_base64_chunked(encoded: str, max_bytes: int | None = None) -> bytes:
         return decoded
     parts: list[bytes] = []
     decoded_len = 0
-    for offset in range(0, total_chars, _B64_DECODE_CHUNK):
+    for idx, offset in enumerate(range(0, total_chars, _B64_DECODE_CHUNK)):
+        if idx:
+            time.sleep(0)
         chunk = encoded[offset:offset + _B64_DECODE_CHUNK]
         if offset + _B64_DECODE_CHUNK < total_chars and "=" in chunk:
             raise base64.binascii.Error("Excess data after padding")
@@ -56,14 +59,17 @@ def decode_base64_chunked(encoded: str, max_bytes: int | None = None) -> bytes:
     return b"".join(parts)
 
 
-def encode_base64_chunked(raw: bytes) -> str:
+def encode_base64_chunked(raw: bytes, prefix: str = "") -> str:
     """Encode bytes to ASCII base64 in 3-byte-aligned slices so large payloads yield the GIL."""
     if len(raw) <= _B64_ENCODE_CHUNK:
-        return base64.b64encode(raw).decode("ascii")
-    return "".join(
-        base64.b64encode(raw[offset:offset + _B64_ENCODE_CHUNK]).decode("ascii")
-        for offset in range(0, len(raw), _B64_ENCODE_CHUNK)
-    )
+        encoded = base64.b64encode(raw).decode("ascii")
+        return prefix + encoded if prefix else encoded
+    parts: list[str] = [prefix] if prefix else []
+    for idx, offset in enumerate(range(0, len(raw), _B64_ENCODE_CHUNK)):
+        if idx:
+            time.sleep(0)
+        parts.append(base64.b64encode(raw[offset:offset + _B64_ENCODE_CHUNK]).decode("ascii"))
+    return "".join(parts)
 
 
 def _validate_base64_len(encoded: str, max_bytes: int) -> int:
@@ -71,7 +77,9 @@ def _validate_base64_len(encoded: str, max_bytes: int) -> int:
     if total_chars == 0:
         return 0
     decoded_len = 0
-    for offset in range(0, total_chars, _B64_DECODE_CHUNK):
+    for idx, offset in enumerate(range(0, total_chars, _B64_DECODE_CHUNK)):
+        if idx:
+            time.sleep(0)
         chunk = encoded[offset:offset + _B64_DECODE_CHUNK]
         if offset + _B64_DECODE_CHUNK < total_chars and "=" in chunk:
             raise ValueError("Expected a base64 image")
@@ -263,7 +271,9 @@ def _write_gzip_json(target, value: dict) -> None:
                 if (isinstance(name, str) and _SAFE_ASSET_NAME.fullmatch(name)
                         and _is_cached_validated_asset(data)):
                     write_bytes((b"" if first else b",") + b'"' + name.encode("ascii") + b'":"')
-                    for offset in range(0, len(data), _B64_DECODE_CHUNK):
+                    for idx, offset in enumerate(range(0, len(data), _B64_DECODE_CHUNK)):
+                        if idx:
+                            time.sleep(0)
                         write_bytes(data[offset:offset + _B64_DECODE_CHUNK].encode("ascii"))
                     write_bytes(b'"')
                 else:
@@ -303,7 +313,6 @@ def _replace_with_windows_sharing_retry(source: str, target: Path) -> None:
     if os.name != "nt":
         os.replace(source, target)
         return
-    import time
     deadline = time.monotonic() + 1.0
     while True:
         try:
@@ -418,6 +427,59 @@ def atomic_write(path: Path, data: bytes) -> None:
         if os.path.exists(temporary):
             os.unlink(temporary)
 
+def _write_asset_map_json(file, mapping: dict) -> None:
+    file.write("{")
+    first = True
+    for name, data in mapping.items():
+        if not first:
+            file.write(", ")
+        first = False
+        if isinstance(name, str) and _SAFE_ASSET_NAME.fullmatch(name) and _is_cached_validated_asset(data):
+            file.write(f'"{name}": "')
+            for idx, offset in enumerate(range(0, len(data), _B64_DECODE_CHUNK)):
+                if idx:
+                    time.sleep(0)
+                file.write(data[offset:offset + _B64_DECODE_CHUNK])
+            file.write('"')
+        else:
+            json.dump(name, file, ensure_ascii=False)
+            file.write(": ")
+            json.dump(data, file, ensure_ascii=False)
+    file.write("}")
+
+
+def _dump_json_yielding(file, value) -> None:
+    if isinstance(value, list) and any(
+        isinstance(item, dict) and any(isinstance(item.get(k), dict) and item.get(k) for k in ("assets", "saved_assets"))
+        for item in value
+    ):
+        file.write("[")
+        for idx, item in enumerate(value):
+            if idx:
+                file.write(", ")
+            if isinstance(item, dict) and any(isinstance(item.get(k), dict) and item.get(k) for k in ("assets", "saved_assets")):
+                file.write("{")
+                first_key = True
+                for key, sub in item.items():
+                    if not isinstance(key, (str, int, float, bool)) and key is not None:
+                        raise TypeError(f"keys must be str, int, float, bool or None, not {type(key).__name__}")
+                    if not first_key:
+                        file.write(", ")
+                    first_key = False
+                    json.dump(key if isinstance(key, str) else ("null" if key is None else str(key).lower() if isinstance(key, bool) else str(key)), file, ensure_ascii=False)
+                    file.write(": ")
+                    if key in ("assets", "saved_assets") and isinstance(sub, dict):
+                        _write_asset_map_json(file, sub)
+                    else:
+                        json.dump(sub, file, ensure_ascii=False)
+                file.write("}")
+            else:
+                json.dump(item, file, ensure_ascii=False)
+        file.write("]")
+        return
+    json.dump(value, file, ensure_ascii=False)
+
+
 def atomic_json(path: Path, value) -> None:
     """Write ordered recovery without full-workspace JSON + UTF-8 copies."""
     handle, temporary = tempfile.mkstemp(prefix=f".{path.name}.", suffix=".tmp", dir=path.parent)
@@ -425,7 +487,7 @@ def atomic_json(path: Path, value) -> None:
         with os.fdopen(handle, "w", encoding="utf-8", errors="backslashreplace") as file:
             if path.exists() and hasattr(os,"fchmod"):
                 os.fchmod(file.fileno(),stat.S_IMODE(path.stat().st_mode))
-            json.dump(value,file,ensure_ascii=False)
+            _dump_json_yielding(file, value)
             file.flush();os.fsync(file.fileno())
         _replace_with_windows_sharing_retry(temporary,path)
     finally:
