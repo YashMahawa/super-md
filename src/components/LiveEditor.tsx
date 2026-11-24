@@ -13,7 +13,7 @@ import {handleLiveEditorKey} from '../liveEditorKeys';
 import {liveEditorCenterDelta,useTypewriterScroll} from '../typewriterScroll';
 const noTrustedHosts:string[]=[];
 export type {SourceBlock} from '../documentAnalysis';
-export function splitMarkdownBlocks(markdown:string):SourceBlock[]{return analyzeDocument(markdown).blocks;}
+export function splitMarkdownBlocks(markdown:string):SourceBlock[]{return analyzeDocument(markdown).bodyBlocks;}
 
 interface Props extends WritingOptions,ReaderAccessibilityPreference {
   latexAutofix?:boolean;
@@ -62,7 +62,9 @@ export default function LiveEditor({markdown,onChange,documentPath,python,dark,t
 
   const renderedSource=editing?editing.baseMarkdown:markdown;
   const sourceAnalysis=useMemo(()=>({source:renderedSource,analysis:analyzeDocument(renderedSource)}),[renderedSource]);
-  const blocks=sourceAnalysis.analysis.blocks;
+  const blocks=sourceAnalysis.analysis.bodyBlocks;
+  const frontmatter=sourceAnalysis.analysis.frontmatter;
+  const hasBodyNodes=sourceAnalysis.analysis.tree.children.some(node=>node.position?.start.offset!==undefined);
 
   const openBlock=(element:HTMLElement|null,start:number,end:number,baseDoc=editingRef.current?editingRef.current.syncedMarkdown:markdownRef.current,selection?:{start:number;end:number})=>{
     anchorTop.current=element?element.getBoundingClientRect().top:null;
@@ -86,7 +88,13 @@ export default function LiveEditor({markdown,onChange,documentPath,python,dark,t
     const active=editingRef.current;
     if(active?.insertAfter==='end'){editor.current?.focus({preventScroll:true});return;}
     const baseDoc=active?active.syncedMarkdown:markdownRef.current;
-    if(!baseDoc.trim()){openBlock(rootRef.current?.querySelector<HTMLElement>('.live-block')??null,0,baseDoc.length,baseDoc,{start:0,end:0});return;}
+    const analysis=baseDoc===sourceAnalysis.source?sourceAnalysis.analysis:analyzeDocument(baseDoc);
+    const bodyHasNodes=analysis.tree.children.some(node=>node.position?.start.offset!==undefined);
+    if(!baseDoc.trim()||!bodyHasNodes){
+      const start=analysis.bodyBlocks[0]?.start??0;
+      openBlock(rootRef.current?.querySelector<HTMLElement>('.live-block')??null,start,baseDoc.length,baseDoc,{start:0,end:0});
+      return;
+    }
     const insertPos=baseDoc.replace(/[ \t]*\n+$/,'').length;
     openInsertedBlock(baseDoc,insertPos,'end');
   };
@@ -249,7 +257,7 @@ export default function LiveEditor({markdown,onChange,documentPath,python,dark,t
     };
     const onContainerDoubleClick=(event:MouseEvent)=>{
       const target=event.target instanceof Element?event.target:null;
-      if(!target||target.closest('.live-block,.live-active-block,a,button,input,select,textarea,.reading-search,.image-viewer'))return;
+      if(!target||target.closest('.live-block,.live-active-block,a,button,input,select,textarea,.reading-search,.image-viewer,[data-frontmatter-properties],.document-properties'))return;
       const doc=editingRef.current?editingRef.current.syncedMarkdown:markdownRef.current;
       if(!doc.trim())return;
       const allBlocks=root.querySelectorAll<HTMLElement>('.live-block');
@@ -284,18 +292,21 @@ export default function LiveEditor({markdown,onChange,documentPath,python,dark,t
       syncActiveCaretCenter();
       return;
     }
-    const nextMarkdown=active.prefix+text+active.suffix,base=active.prefix.length;
+    const needsNewline=Boolean(frontmatter)&&active.prefix.length===frontmatter!.end&&active.prefix.length>0&&!active.prefix.endsWith('\n')&&text.length>0;
+    const prefix=needsNewline?active.prefix+'\n':active.prefix;
+    const nextMarkdown=prefix+text+active.suffix,base=prefix.length;
     if(selectionStart!==undefined&&selectionEnd!==undefined){
       const from=Math.max(0,Math.min(base+selectionStart,nextMarkdown.length));
       const to=Math.max(from,Math.min(base+selectionEnd,nextMarkdown.length));
       savedSelection.current={from,to,markdown:nextMarkdown};
     }else if(savedSelection.current){
+      const delta=prefix.length-active.prefix.length;
       const max=base+text.length;
-      const from=Math.max(base,Math.min(savedSelection.current.from,max));
-      const to=Math.max(from,Math.min(savedSelection.current.to,max));
+      const from=Math.max(base,Math.min(savedSelection.current.from+delta,max));
+      const to=Math.max(from,Math.min(savedSelection.current.to+delta,max));
       savedSelection.current={from,to,markdown:nextMarkdown};
     }
-    const nextState={...active,text,syncedMarkdown:nextMarkdown};
+    const nextState={...active,prefix,text,syncedMarkdown:nextMarkdown};
     editingRef.current=nextState;setEditing(nextState);
     onChange(nextMarkdown);
     syncActiveCaretCenter();
@@ -447,9 +458,9 @@ export default function LiveEditor({markdown,onChange,documentPath,python,dark,t
     onChange(currentDoc.slice(0,from)+next.slice(start,nextEnd)+currentDoc.slice(to));
   };
   return <div ref={rootRef} className="live-document" onCopy={copy} onDragStart={event=>{setSelectedMarkdownDrag(event.nativeEvent,renderedSource);}}>
-    {!renderedSource.trim()?(editing?textarea():<section className="live-block" data-source-start={0} data-source-end={markdown.length} tabIndex={0} role="group" aria-label="Editable block 1" onDoubleClick={event=>openBlock(event.currentTarget,0,markdown.length)} onKeyDown={event=>{if(event.key==='Enter'||event.key==='F2'){event.preventDefault();openBlock(event.currentTarget,0,markdown.length);}}}/> ):<>
+    {!frontmatter&&!renderedSource.trim()?(editing?textarea():<section className="live-block" data-source-start={0} data-source-end={markdown.length} tabIndex={0} role="group" aria-label="Editable block 1" onDoubleClick={event=>openBlock(event.currentTarget,0,markdown.length)} onKeyDown={event=>{if(event.key==='Enter'||event.key==='F2'){event.preventDefault();openBlock(event.currentTarget,0,markdown.length);}}}/> ):<>
       <MarkdownPreview markdown={renderedSource} onChange={previewChange} documentPath={documentPath} python={python} dark={dark} trustedImageHosts={trustedImageHosts} onTrustImageHost={onTrustImageHost} renderBlock={renderBlock} fullDocumentAccessibility={fullDocumentAccessibility} sourceAnalysis={sourceAnalysis}/>
-      {editing?.insertAfter==='end'&&<section className="live-block" role="group" aria-label="New Markdown block">{textarea()}</section>}
+      {!hasBodyNodes?(editing?textarea():<section className="live-block" data-source-start={blocks[0].start} data-source-end={markdown.length} tabIndex={0} role="group" aria-label="Editable block 1" onDoubleClick={event=>openBlock(event.currentTarget,blocks[0].start,markdown.length)} onKeyDown={event=>{if(event.key==='Enter'||event.key==='F2'){event.preventDefault();openBlock(event.currentTarget,blocks[0].start,markdown.length);}}}/> ):editing?.insertAfter==='end'&&<section className="live-block" role="group" aria-label="New Markdown block">{textarea()}</section>}
     </>}
   </div>;
 }
