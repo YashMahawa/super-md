@@ -74,11 +74,10 @@ export function editorReadingOffset(id:string):number|undefined {
   const rect=view.scrollDOM.getBoundingClientRect();
   return view.posAtCoords({x:rect.left+80,y:rect.top+16})??view.viewport.from;
 }
-export function editorSelectionText(id:string):string {
-  const view=visibleEditors.get(id);
-  if(!view)return '';
+export function editorSelectedText(id:string):string|null {
+  const view=visibleEditors.get(id);if(!view)return null;
   const main=view.state.selection.main;
-  return main.empty?'':view.state.sliceDoc(main.from,main.to);
+  return main.empty?null:view.state.sliceDoc(main.from,main.to);
 }
 export interface EditorViewContext {
   scroller:HTMLElement;
@@ -107,8 +106,7 @@ export function editorViewContext(id:string):EditorViewContext|undefined {
   }
   const offset=visibleStart;
   const visibleText=view.state.sliceDoc(visibleStart,visibleEnd).trim().slice(0,2000);
-  const main=view.state.selection.main;
-  const selectionText=main.empty?'':view.state.sliceDoc(main.from,main.to);
+  const selectionText=editorSelectedText(id)??'';
   const scrollFraction=scroller.scrollTop/Math.max(1,scroller.scrollHeight-scroller.clientHeight);
   return {scroller,offset,visibleStart,visibleEnd,scrollFraction,visibleText,selectionText};
 }

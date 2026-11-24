@@ -29,7 +29,12 @@ import java.util.concurrent.atomic.AtomicBoolean
 // comparison, staging, write and saved-state updates across those windows.
 private val documentWrites = Mutex()
 
-data class Note(val id: String = UUID.randomUUID().toString(), val name: String = "Untitled.md", val uri: String? = null, val content: String = "", val saved: String = "", val relative: String? = null, val assetDirectory: String? = null) { val dirty get() = content != saved; val portable get() = assetDirectory != null }
+data class Note(val id: String = UUID.randomUUID().toString(), val name: String = "Untitled.md", val uri: String? = null, val content: String = "", val saved: String = "", val relative: String? = null, val assetDirectory: String? = null, val assetsDirty: Boolean = false) {
+    val dirty get() = content != saved || assetsDirty
+    val portable get() = assetDirectory != null
+    val requiresCloseConfirmation get() = if (uri == null) (content.isNotBlank() || assetsDirty) && dirty else dirty
+}
+private class ExternalConflictDetectedException : RuntimeException()
 internal const val MAX_AGENT_SNAPSHOT_BYTES = 2 * 1024 * 1024
 internal enum class PortableSaveRecovery { ORIGINAL_INTACT, RESTORE_OUR_WRITE, LEAVE_CONCURRENT_BYTES }
 internal fun agentContentRevision(content: String): String = java.security.MessageDigest.getInstance("SHA-256")
@@ -52,9 +57,12 @@ internal fun orderedRecents(notes:List<RecentNote>)=notes.distinctBy {it.uri}.so
 private fun renamedRelative(relative:String?,name:String)=relative?.let {val parent=it.substringBeforeLast('/',"");if(parent.isEmpty())name else "$parent/$name"}
 data class FileEntry(val name: String, val uri: String, val directory: Boolean, val relative: String)
 data class OutlineHeading(val id: String, val title: String, val level: Int, val offset: Int)
-data class StudioState(val latexAutofix:Boolean=false, val typewriterScroll:Boolean=false, val selectionAssistant:String="chatgpt", val centerLock:Boolean=true, val customTheme:String="", val patternKind:String="", val patternOpacity:Float=-1f, val patternSize:Float=0f, val patternSpacing:Float=0f, val restorePosition:Boolean=true, val fullDocumentAccessibility:Boolean=false, val startup:String="restore", val imageAppearance:String="original", val svgAppearance:String="original", val imageContrast:Float=1.25f, val spellCheck:Boolean = false, val grammarCheck:Boolean = false, val accent: String = "system", val widthPercent: Float = 100f, val lineHeight: Float = 1.65f, val autosave: Boolean = true, val customFonts: List<String> = emptyList(), val readerOverlay: Boolean = false, val zoomCommand: Long = 0, val tabs: List<Note> = listOf(Note(name = "Welcome.md", content = sample, saved = sample)), val closedTabs: List<Note> = emptyList(), val activeId: String = "", val mode: String = "live", val fullscreen: Boolean = false, val normalZoom: Float = 100f, val fullscreenZoom: Float = 100f, val theme: String = "system", val fullscreenTheme: String = "black", val motion: Boolean = true, val font: String = "Manrope", val size: Float = 15f, val folder: String? = null, val files: List<FileEntry> = emptyList(), val busy: Boolean = false, val message: String? = null, val error: String? = null, val welcomed: Boolean = false, val pdf: String = "{\"pageSize\":\"a4\",\"margin\":14,\"fontSize\":10.5,\"lineHeight\":1.4,\"paragraphSpacing\":0.65,\"fontFamily\":\"Manrope\",\"pageNumbers\":true}", val storageReport: StorageReport? = null, val storageScanning: Boolean = false) {
+data class StudioState(val latexAutofix:Boolean=false, val typewriterScroll:Boolean=false, val selectionAssistant:String="chatgpt", val centerLock:Boolean=true, val customTheme:String="", val patternKind:String="", val patternOpacity:Float=-1f, val patternSize:Float=0f, val patternSpacing:Float=0f, val restorePosition:Boolean=true, val fullDocumentAccessibility:Boolean=false, val startup:String="restore", val imageAppearance:String="original", val svgAppearance:String="original", val imageContrast:Float=1.25f, val spellCheck:Boolean = false, val grammarCheck:Boolean = false, val accent: String = "system", val widthPercent: Float = 100f, val lineHeight: Float = 1.65f, val autosave: Boolean = true, val customFonts: List<String> = emptyList(), val readerOverlay: Boolean = false, val zoomCommand: Long = 0, val tabs: List<Note> = listOf(Note(name = "Welcome.md", content = sample, saved = sample)), val closedTabs: List<Note> = emptyList(), val activeId: String = "", val mode: String = "live", val fullscreen: Boolean = false, val normalZoom: Float = 100f, val fullscreenZoom: Float = 100f, val theme: String = "system", val fullscreenTheme: String = "black", val motion: Boolean = true, val font: String = "Manrope", val size: Float = 15f, val folder: String? = null, val files: List<FileEntry> = emptyList(), val busy: Boolean = false, val message: String? = null, val error: String? = null, val welcomed: Boolean = false, val pdf: String = "{\"pageSize\":\"a4\",\"margin\":14,\"fontSize\":10.5,\"lineHeight\":1.4,\"paragraphSpacing\":0.65,\"fontFamily\":\"Manrope\",\"pageNumbers\":true}", val storageReport: StorageReport? = null, val storageScanning: Boolean = false, val conflictedTabIds: Set<String> = emptySet(), val pendingCloseNoteId: String? = null, val pendingSaveConflictNoteId: String? = null) {
     val active get() = tabs.find { it.id == activeId } ?: tabs.first()
     val zoom get() = if (fullscreen) fullscreenZoom else normalZoom
+    val activeConflicted get() = active.id in conflictedTabIds
+    val pendingCloseNote get() = pendingCloseNoteId?.let { id -> tabs.find { it.id == id } }
+    val pendingSaveConflictNote get() = pendingSaveConflictNoteId?.let { id -> tabs.find { it.id == id } }
 }
 val sample = """
 # A clear place to think
@@ -248,6 +256,37 @@ class StudioViewModel(app: Application, val workspaceKey: String = "main") : And
     private val recentMutable = MutableStateFlow(loadRecent())
     val recent = recentMutable.asStateFlow()
     var requestPortable: (() -> Unit)? = null
+    var requestSaveAs: ((Note) -> Unit)? = null
+    var requestPortableWrite: ((Boolean) -> Boolean)? = null
+    private val savedPortableAssets = java.util.concurrent.ConcurrentHashMap<String, JSONObject>()
+    private var closeAfterSaveNoteId: String? = null
+    private var portableForceOverwrite = false
+    private var portableSaveAsNoteId: String? = null
+    private fun recordPortableBaseline(id: String, directory: String?) {
+        if (directory == null) savedPortableAssets.remove(id)
+        else runCatching { media.portableAssets(directory) }.getOrNull()?.let { savedPortableAssets[id] = it }
+    }
+    private fun baselinePortableAssets(note: Note): JSONObject =
+        savedPortableAssets[note.id] ?: runCatching { media.portableAssets(note.assetDirectory) }.getOrDefault(JSONObject()).also {
+            if (note.assetDirectory != null && !note.assetsDirty) savedPortableAssets[note.id] = it
+        }
+    private fun diskMatchesBaseline(target: Uri, note: Note): Boolean =
+        if (note.portable) {
+            val disk = resolver.openInputStream(target)?.use(media::openFmd) ?: error("Cannot read the current portable note")
+            try {
+                disk.markdown == note.saved && portableAssetsMatch(baselinePortableAssets(note), media.portableAssets(disk.directory))
+            } finally {
+                File(getApplication<Application>().filesDir, "portable-assets/${disk.directory}").deleteRecursively()
+            }
+        } else {
+            val current = resolver.openInputStream(target)?.use { readLimited(it, 20_000_000).toString(Charsets.UTF_8).removePrefix("\uFEFF") }
+                ?: error("Cannot read the current note")
+            current == note.saved.removePrefix("\uFEFF")
+        }
+    fun markAssetsDirty(id: String) {
+        change { s -> s.copy(tabs = s.tabs.map { if (it.id == id && !it.assetsDirty) it.copy(assetsDirty = true) else it }) }
+        scheduleAutosave(id)
+    }
     @Volatile internal var readerFlushRequester: (suspend (String) -> Boolean)? = null
     private val readerActionMutex = Mutex()
     private val openRequests = OpenRequestGate()
@@ -424,7 +463,7 @@ class StudioViewModel(app: Application, val workspaceKey: String = "main") : And
     private val deletedDrafts=DeletedDraftStore(File(app.filesDir,"deleted-drafts/$workspaceKey"))
     private val documentObserver=object:android.database.ContentObserver(android.os.Handler(android.os.Looper.getMainLooper())) {
         override fun onChange(selfChange:Boolean){readerFolderIndex.clear();refreshMetadata();refreshExternal()}
-        override fun onChange(selfChange:Boolean,uri:Uri?){if(uri==null||mutable.value.tabs.none {it.uri==uri.toString()})readerFolderIndex.clear();refreshMetadata();if(uri==null||uri.toString()==mutable.value.active.uri)refreshExternal()}
+        override fun onChange(selfChange:Boolean,uri:Uri?){if(uri==null||mutable.value.tabs.none{it.uri!=null&&sameDocumentUri(it.uri,uri.toString())})readerFolderIndex.clear();refreshMetadata();if(uri==null||mutable.value.tabs.any{it.uri!=null&&sameDocumentUri(it.uri,uri.toString())})refreshExternal()}
     }
     private fun observeActive() {
         val uris=(mutable.value.tabs.mapNotNull {it.uri}+recentMutable.value.map {it.uri}+listOfNotNull(mutable.value.folder)).toSet()
@@ -471,7 +510,7 @@ class StudioViewModel(app: Application, val workspaceKey: String = "main") : And
             mutable.value.folder?.let {listFolder(Uri.parse(it),listedRelative)}
         }
     }
-    init { prefs.registerOnSharedPreferenceChangeListener(preferencesChanged);observeActive();observeCustomTheme();migrateLegacyClosedNotes();if(workspaceKey=="main")viewModelScope.launch{updates.restore();if(!BuildConfig.DEBUG && updates.state.value.checkOnOpen){kotlinx.coroutines.delay(6000);updates.check()}} }
+    init { mutable.value.tabs.filter { it.portable && it.uri != null && !it.assetsDirty }.forEach { recordPortableBaseline(it.id, it.assetDirectory) }; prefs.registerOnSharedPreferenceChangeListener(preferencesChanged);observeActive();observeCustomTheme();migrateLegacyClosedNotes();if(workspaceKey=="main")viewModelScope.launch{updates.restore();if(!BuildConfig.DEBUG && updates.state.value.checkOnOpen){kotlinx.coroutines.delay(6000);updates.check()}} }
     override fun onCleared() { viewModelRetired.set(true); invalidateAllNoteAssets(); recoveryWriter.closeAfterLatest(mutable.value); prefs.unregisterOnSharedPreferenceChangeListener(preferencesChanged);resolver.unregisterContentObserver(documentObserver);resolver.unregisterContentObserver(themeObserver); super.onCleared() }
     val state = mutable.asStateFlow()
     fun inspectStorage() {
@@ -523,18 +562,24 @@ class StudioViewModel(app: Application, val workspaceKey: String = "main") : And
             if (title.isNotEmpty()) change { s -> s.copy(tabs = s.tabs.map { if (it.id == id) it.copy(name = title + if (it.portable) ".smd" else ".md") else it }) }
         }
     }
+    private fun resolveDisplayName(target: Uri): String? =
+        DocumentFile.fromSingleUri(getApplication(), target)?.name?.takeIf(String::isNotBlank)
+            ?: target.takeIf { it.scheme == "file" }?.lastPathSegment?.takeIf(String::isNotBlank)
+
     private var autosaveJob: Job? = null
     private val autosavePending = mutableSetOf<String>()
     private fun scheduleAutosave(id: String) {
-        if (!mutable.value.autosave) return
+        if (!mutable.value.autosave || id in mutable.value.conflictedTabIds) return
         if (mutable.value.tabs.firstOrNull { it.id == id }?.uri?.let(::writeIsBlocked) == true) return
         autosavePending.add(id)
         if (autosaveJob?.isActive == true) return
         autosaveJob = viewModelScope.launch {
             while (autosavePending.isNotEmpty()) {
                 delay(900)
-                val next=autosavePending.first();autosavePending.remove(next)
+                val next = autosavePending.firstOrNull() ?: break
+                autosavePending.remove(next)
                 var note=mutable.value.tabs.find { it.id==next && it.uri!=null && it.dirty } ?: continue
+                if (note.id in mutable.value.conflictedTabIds) continue
                 if (writeIsBlocked(note.uri!!)) continue
                 if (!mutable.value.autosave) continue
                 try {
@@ -544,18 +589,18 @@ class StudioViewModel(app: Application, val workspaceKey: String = "main") : And
                             continue
                         }
                         note = mutable.value.tabs.find { it.id == next && it.uri != null && it.dirty } ?: continue
+                        if (note.id in mutable.value.conflictedTabIds) continue
                     }
                     // Do not cancel an in-flight write when another keystroke or
                     // window transition arrives. Recovery remains an independent stream.
                     withContext(kotlinx.coroutines.NonCancellable) {
                         documentWrites.withLock {
                         if (closingNoteIds.contains(note.id) || mutable.value.tabs.none {
-                                it.id == note.id && it.uri == note.uri && it.content == note.content
+                                it.id == note.id && it.uri == note.uri && it.content == note.content && it.assetsDirty == note.assetsDirty
                             }) return@withLock
                         val writtenTarget = withContext(Dispatchers.IO) {
                             val target=documentAccess.resolve(Uri.parse(note.uri), writing = true)
-                            val previous=resolver.openInputStream(target)?.use { if(note.portable) media.portableMarkdown(it) else readLimited(it,20_000_000).toString(Charsets.UTF_8).removePrefix("\uFEFF") } ?: error("Writing permission is unavailable")
-                            require(previous==note.saved) {"This file changed outside Super MD. Use Save as to keep both versions; your draft is safe."}
+                            if (!diskMatchesBaseline(target, note)) throw ExternalConflictDetectedException()
                             val staged=File(getApplication<Application>().cacheDir,"autosave-${UUID.randomUUID()}.tmp")
                             try {
                                 staged.outputStream().use { if(note.portable) media.writeLocalPortable(it,note.content,note.assetDirectory) else it.write(note.content.toByteArray()) }
@@ -564,11 +609,15 @@ class StudioViewModel(app: Application, val workspaceKey: String = "main") : And
                             } finally {staged.delete()}
                             target
                         }
-                        change { s->s.copy(tabs=s.tabs.map { if(it.id==note.id)it.copy(saved=note.content,uri=writtenTarget.toString()) else it }) }
+                        if (note.portable) recordPortableBaseline(note.id, note.assetDirectory)
+                        change { s->s.copy(tabs=s.tabs.map { if(it.id==note.id)it.copy(saved=note.content,assetsDirty=false,uri=writtenTarget.toString()) else it }, conflictedTabIds=s.conflictedTabIds-note.id) }
                         mutable.value.tabs.firstOrNull { it.id == note.id }?.let(::remember)
-                        if(mutable.value.tabs.any {it.id==note.id && it.dirty})autosavePending.add(note.id)
+                        if(mutable.value.tabs.any {it.id==note.id && it.dirty && it.id !in mutable.value.conflictedTabIds})autosavePending.add(note.id)
                         }
                     }
+                } catch (_: ExternalConflictDetectedException) {
+                    autosavePending.remove(note.id)
+                    change { s -> s.copy(conflictedTabIds = s.conflictedTabIds + note.id, message = "This file changed on disk. Autosave is paused for this tab.") }
                 } catch(error:Exception) {if(isDocumentAccessFailure(error))requestDocumentAccess(note.uri!!,note,writing=true) else fail("Autosave paused: ${error.message}")}
             }
         }
@@ -932,14 +981,69 @@ class StudioViewModel(app: Application, val workspaceKey: String = "main") : And
     private var refreshJob:Job?=null
     fun refreshExternal() {
         refreshJob?.cancel()
-        val note=mutable.value.active
-        if(note.uri==null || note.dirty || note.portable)return
-        refreshJob=viewModelScope.launch {
+        val candidates = mutable.value.tabs.filter { it.uri != null }
+        if (candidates.isEmpty()) return
+        refreshJob = viewModelScope.launch {
             delay(200)
-            val text=runCatching{withContext(Dispatchers.IO){resolver.openInputStream(Uri.parse(note.uri))?.use{readLimited(it,20_000_000).toString(Charsets.UTF_8)}}}.getOrNull() ?: return@launch
-            if(text==note.content)return@launch
-            invalidateNoteAssets(note.id)
-            change {s->s.copy(tabs=s.tabs.map{if(it.id==note.id && it.content==note.content && !it.dirty)it.copy(content=text,saved=text)else it})}
+            val snapshotTabs = mutable.value.tabs.filter { it.uri != null }
+            val newlyConflicted = mutableSetOf<String>()
+            val cleanUpdates = mutableMapOf<String, Triple<String, String?, JSONObject?>>()
+            withContext(Dispatchers.IO) {
+                for (note in snapshotTabs) {
+                    val target = runCatching { documentAccess.resolve(Uri.parse(note.uri!!)) }.getOrNull() ?: continue
+                    if (note.dirty) {
+                        if (note.id !in mutable.value.conflictedTabIds) {
+                            val matches = runCatching { diskMatchesBaseline(target, note) }.getOrNull()
+                            if (matches == false) newlyConflicted.add(note.id)
+                        }
+                    } else if (note.id !in mutable.value.conflictedTabIds) {
+                        if (note.portable) {
+                            val disk = runCatching { resolver.openInputStream(target)?.use(media::openFmd) }.getOrNull() ?: continue
+                            val diskAssets = runCatching { media.portableAssets(disk.directory) }.getOrDefault(JSONObject())
+                            if (disk.markdown == note.content && portableAssetsMatch(baselinePortableAssets(note), diskAssets)) {
+                                File(getApplication<Application>().filesDir, "portable-assets/${disk.directory}").deleteRecursively()
+                            } else {
+                                cleanUpdates[note.id] = Triple(disk.markdown, disk.directory, diskAssets)
+                            }
+                        } else {
+                            val text = runCatching { resolver.openInputStream(target)?.use { readLimited(it, 20_000_000).toString(Charsets.UTF_8) } }.getOrNull() ?: continue
+                            if (text != note.content) cleanUpdates[note.id] = Triple(text, null, null)
+                        }
+                    }
+                }
+            }
+            if (newlyConflicted.isEmpty() && cleanUpdates.isEmpty()) return@launch
+            newlyConflicted.forEach { autosavePending.remove(it) }
+            val obsoletePortableDirs = mutableListOf<String>()
+            cleanUpdates.forEach { (id, update) ->
+                val current = mutable.value.tabs.find { it.id == id }
+                if (current != null && !current.dirty && id !in mutable.value.conflictedTabIds) {
+                    invalidateNoteAssets(id)
+                    readerEcho.remove(id)
+                    clearReaderEditProtocol(id)
+                    if (update.second != null && update.third != null) {
+                        savedPortableAssets[id] = update.third!!
+                        if (current.assetDirectory != null && current.assetDirectory != update.second) obsoletePortableDirs.add(current.assetDirectory)
+                    }
+                } else if (update.second != null) {
+                    obsoletePortableDirs.add(update.second!!)
+                }
+            }
+            if (obsoletePortableDirs.isNotEmpty()) {
+                withContext(Dispatchers.IO) { obsoletePortableDirs.forEach { File(getApplication<Application>().filesDir, "portable-assets/$it").deleteRecursively() } }
+            }
+            change { s ->
+                s.copy(
+                    tabs = s.tabs.map { tab ->
+                        val update = cleanUpdates[tab.id]
+                        if (update != null && !tab.dirty && tab.id !in s.conflictedTabIds) {
+                            tab.copy(content = update.first, saved = update.first, assetDirectory = update.second ?: tab.assetDirectory, assetsDirty = false)
+                        } else tab
+                    },
+                    conflictedTabIds = s.conflictedTabIds + newlyConflicted,
+                    message = if (newlyConflicted.isNotEmpty()) "This file changed on disk. Autosave is paused for this tab." else s.message,
+                )
+            }
         }
     }
     fun reorder(id: String, index: Int) = change { it.copy(tabs = reorderedNotes(it.tabs, id, index)) }
@@ -975,6 +1079,41 @@ class StudioViewModel(app: Application, val workspaceKey: String = "main") : And
             mutable.value=mutable.value.copy(message="Older closed-note recovery could not be updated; the notes remain available. ${error.message}")
         } finally {if(locked)closedNoteMutex.unlock()}
     }
+    fun requestClose(id: String) {
+        openRequests.invalidate()
+        viewModelScope.launch {
+            val activeId = mutable.value.active.id
+            if (id == activeId && !performReaderBarrier(activeId) { }) {
+                readerBarrierFailed()
+                return@launch
+            }
+            val note = mutable.value.tabs.find { it.id == id } ?: return@launch
+            if (note.requiresCloseConfirmation) {
+                change { state -> state.copy(activeId = if (state.tabs.any { it.id == id }) id else state.activeId, pendingCloseNoteId = id) }
+            } else {
+                close(id)
+            }
+        }
+    }
+    fun dismissCloseConfirmation() {
+        closeAfterSaveNoteId = null
+        mutable.value = mutable.value.copy(pendingCloseNoteId = null)
+    }
+    fun resolveCloseConfirmation(choice: String) {
+        val id = mutable.value.pendingCloseNoteId ?: return
+        mutable.value = mutable.value.copy(pendingCloseNoteId = null)
+        when (choice) {
+            "discard" -> {
+                closeAfterSaveNoteId = null
+                close(id, discardChanges = true)
+            }
+            "save" -> {
+                closeAfterSaveNoteId = id
+                saveManual(noteId = id)
+            }
+            else -> closeAfterSaveNoteId = null
+        }
+    }
     fun close(id: String, expectedRevision: String? = null, refuseDirty: Boolean = false, discardChanges: Boolean = false, onComplete: ((String?) -> Unit)? = null) {
         openRequests.invalidate()
         viewModelScope.launch {
@@ -996,10 +1135,29 @@ class StudioViewModel(app: Application, val workspaceKey: String = "main") : And
                 if (note.uri == null && note.content.isBlank() && note.assetDirectory == null) {
                     readerEcho.remove(id)
                     clearReaderEditProtocol(id)
+                    autosavePending.remove(id)
                     change { state ->
                         val remaining = state.tabs.filterNot { it.id == id }
                         val next = remaining.ifEmpty { listOf(Note()) }
                         state.copy(tabs = next, activeId = if (state.active.id == id) next.first().id else state.activeId,
+                            conflictedTabIds = state.conflictedTabIds - id,
+                            pendingCloseNoteId = state.pendingCloseNoteId?.takeUnless { it == id },
+                            pendingSaveConflictNoteId = state.pendingSaveConflictNoteId?.takeUnless { it == id },
+                            message = "Empty tab discarded")
+                    }
+                    closingNoteIds.remove(id)
+                } else if (note.uri == null && note.content.isBlank() && !note.assetsDirty && runCatching { media.portableAssets(note.assetDirectory).length() == 0 }.getOrDefault(false)) {
+                    readerEcho.remove(id)
+                    clearReaderEditProtocol(id)
+                    autosavePending.remove(id)
+                    savedPortableAssets.remove(id)
+                    change { state ->
+                        val remaining = state.tabs.filterNot { it.id == id }
+                        val next = remaining.ifEmpty { listOf(Note()) }
+                        state.copy(tabs = next, activeId = if (state.active.id == id) next.first().id else state.activeId,
+                            conflictedTabIds = state.conflictedTabIds - id,
+                            pendingCloseNoteId = state.pendingCloseNoteId?.takeUnless { it == id },
+                            pendingSaveConflictNoteId = state.pendingSaveConflictNoteId?.takeUnless { it == id },
                             message = "Empty tab discarded")
                     }
                     closingNoteIds.remove(id)
@@ -1068,11 +1226,15 @@ class StudioViewModel(app: Application, val workspaceKey: String = "main") : And
             closedNoteRefs = nextRefs
             readerEcho.remove(id)
             clearReaderEditProtocol(id)
+            autosavePending.remove(id)
             change { state ->
                 val remaining = state.tabs.filterNot { it.id == id }
                 val next = remaining.ifEmpty { listOf(Note()) }
                 state.copy(tabs = next, closedTabs = (listOf(reference.placeholder()) + state.closedTabs.filterNot { it.id == id }).take(ClosedNoteStore.LIMIT),
                     activeId = if (state.active.id == id) next.first().id else state.activeId,
+                    conflictedTabIds = state.conflictedTabIds - id,
+                    pendingCloseNoteId = state.pendingCloseNoteId?.takeUnless { it == id },
+                    pendingSaveConflictNoteId = state.pendingSaveConflictNoteId?.takeUnless { it == id },
                     message = "Tab closed. Reopen from the menu to recover edits.")
             }
         } catch (error: Exception) {
@@ -1091,10 +1253,13 @@ class StudioViewModel(app: Application, val workspaceKey: String = "main") : And
         viewModelScope.launch {
             val note=try {if(reference==null)referenceNote else withContext(Dispatchers.IO){closedNoteStore.load(reference)}}
                 catch(error:Exception) {mutable.value=mutable.value.copy(message="Could not reopen the closed note: ${error.message}");return@launch}
+            var updatedRefs: List<ClosedNoteReference>? = null
             val accepted = performReaderBarrier(expectedActiveId) {
                 if(mutable.value.closedTabs.none {it.id==referenceNote.id})return@performReaderBarrier
                 readerEcho.remove(note.id)
+                if (note.portable && note.uri != null && !note.assetsDirty) recordPortableBaseline(note.id, note.assetDirectory)
                 closedNoteRefs=closedNoteRefs.filterNot {it.id==note.id}
+                updatedRefs = closedNoteRefs
                 change { state ->
                     val existing=state.tabs.find {it.id==note.id}
                     val tabs=if(existing==null)state.tabs+note else state.tabs
@@ -1102,6 +1267,7 @@ class StudioViewModel(app: Application, val workspaceKey: String = "main") : And
                 }
             }
             if(!accepted)readerBarrierFailed()
+            else updatedRefs?.let { refs -> withContext(Dispatchers.IO) { runCatching { closedNoteStore.saveIndex(refs) } } }
         }
     }
     fun recoverDeletedDraft() {
@@ -1232,14 +1398,14 @@ class StudioViewModel(app: Application, val workspaceKey: String = "main") : And
                     resolver.openInputStream(target)?.use { } ?: error("Document permission is unavailable; choose it again")
                     return@withContext existing.copy(uri = target.toString())
                 }
-                val name = DocumentFile.fromSingleUri(getApplication(), target)?.name ?: "Note.md"
+                val name = resolveDisplayName(target) ?: "Note.md"
                 resolver.openInputStream(target)?.use { stream ->
                     val buffered = stream.buffered()
                     buffered.mark(65536)
                     val prefix = ByteArray(32768); val count = buffered.read(prefix); buffered.reset()
                     val header = if (count > 0) String(prefix, 0, count, Charsets.UTF_8).trimStart('\uFEFF', ' ', '\n', '\r', '\t') else ""
                     val portable = portableGzipHeader(prefix.copyOfRange(0, maxOf(count, 0))) || portableEnvelopeHeader(header)
-                    if (portable) { val opened = media.openFmd(buffered); Note(name = name, uri = target.toString(), content = opened.markdown, saved = opened.markdown, relative = relative, assetDirectory = opened.directory) }
+                    if (portable) { val opened = media.openFmd(buffered); Note(name = name, uri = target.toString(), content = opened.markdown, saved = opened.markdown, relative = relative, assetDirectory = opened.directory).also { recordPortableBaseline(it.id, opened.directory) } }
                     else { val content = readLimited(buffered, 20_000_000).toString(Charsets.UTF_8); Note(name = name, uri = target.toString(), content = content, saved = content, relative = relative) }
                 } ?: error("Document permission is unavailable; choose it again")
             }
@@ -1307,7 +1473,8 @@ class StudioViewModel(app: Application, val workspaceKey: String = "main") : And
                             require(current == note && current?.let { agentContentRevision(it.content).equals(expectedRevision, ignoreCase = true) } == true) {
                                 "The note changed while it was saving; the portable file was restored"
                             }
-                            change { state -> state.copy(tabs = state.tabs.map { if (it.id == id) it.copy(saved = note.content, uri = target.toString(), assetDirectory = opened.directory) else it }, busy = false, message = "Portable note saved") }
+                            recordPortableBaseline(id, opened.directory)
+                            change { state -> state.copy(tabs = state.tabs.map { if (it.id == id) it.copy(saved = note.content, assetsDirty = false, uri = target.toString(), assetDirectory = opened.directory) else it }, conflictedTabIds = state.conflictedTabIds - id, busy = false, message = "Portable note saved") }
                             mutable.value.tabs.firstOrNull { it.id == id }?.let(::remember)
                             openedDirectory = null
                         }
@@ -1370,7 +1537,8 @@ class StudioViewModel(app: Application, val workspaceKey: String = "main") : And
                     require(latest == note && latest?.let { agentContentRevision(it.content).equals(expectedRevision, ignoreCase = true) } == true) {
                         "The note changed while Save As was writing; the new copy was removed"
                     }
-                    change { state -> state.copy(tabs = state.tabs.map { if (it.id == id) it.copy(uri = destination.toString(), name = savedName, saved = note.content, assetDirectory = note.assetDirectory) else it }, busy = false, message = "Saved as $savedName") }
+                    if (note.portable) recordPortableBaseline(id, note.assetDirectory)
+                    change { state -> state.copy(tabs = state.tabs.map { if (it.id == id) it.copy(uri = destination.toString(), name = savedName, saved = note.content, assetsDirty = false, assetDirectory = note.assetDirectory) else it }, conflictedTabIds = state.conflictedTabIds - id, pendingSaveConflictNoteId = state.pendingSaveConflictNoteId?.takeUnless { it == id }, busy = false, message = "Saved as $savedName") }
                     mutable.value.tabs.firstOrNull { it.id == id }?.let(::remember)
                 }
             } catch (error: Exception) {
@@ -1411,61 +1579,258 @@ class StudioViewModel(app: Application, val workspaceKey: String = "main") : And
             return uri to savedName
         } finally { staged.delete() }
     }
-    fun save(uri: Uri? = null, noteId: String? = null, expectedRevision: String? = null, onComplete: ((String?) -> Unit)? = null) = viewModelScope.launch {
+    private fun collectNativePortableAssets(note: Note): JSONObject {
+        val assets = JSONObject(media.portableAssets(note.assetDirectory).toString())
+        val sources = JSONArray(markdownImageSourcesJson(note.content))
+        for (i in 0 until sources.length()) {
+            val source = sources.getString(i)
+            if (!assets.has(source)) {
+                media.local(source, note.assetDirectory)?.let { assets.put(source, media.data(it)) }
+            }
+        }
+        return assets
+    }
+    fun cancelSaveAs() {
+        portableSaveAsNoteId = null
+        portableForceOverwrite = false
+        closeAfterSaveNoteId = null
+    }
+    fun beginSaveAs(noteId: String = mutable.value.active.id) {
+        if (mutable.value.busy) return
+        viewModelScope.launch {
+            if (noteId != mutable.value.active.id && mutable.value.tabs.any { it.id == noteId }) {
+                val prevActive = mutable.value.active.id
+                if (!performReaderBarrier(prevActive) { change { it.copy(activeId = noteId) } }) {
+                    readerBarrierFailed()
+                    closeAfterSaveNoteId = null
+                    return@launch
+                }
+            } else if (!performReaderBarrier(noteId) { }) {
+                readerBarrierFailed()
+                closeAfterSaveNoteId = null
+                return@launch
+            }
+            val note = mutable.value.tabs.find { it.id == noteId } ?: return@launch
+            val picker = requestSaveAs
+            if (picker != null) picker(note) else closeAfterSaveNoteId = null
+        }
+    }
+    fun completePortableSaveAs(uri: Uri, noteId: String = portableSaveAsNoteId ?: mutable.value.active.id) {
+        portableOutput = uri
+        portableDestinationIsNew = true
+        portableSaveAsNoteId = noteId
+        portableForceOverwrite = true
+        if (requestPortableWrite?.invoke(false) == true) return
+        if (readerStateIsNativeAuthoritative(noteId)) {
+            viewModelScope.launch {
+                busy(true)
+                try {
+                    val note = mutable.value.tabs.find { it.id == noteId } ?: error("The note is no longer open")
+                    val assets = withContext(Dispatchers.IO) { collectNativePortableAssets(note) }
+                    writePortable(note.id, note.content, assets, save = false, originalContent = note.content)
+                } catch (error: Exception) {
+                    portableSaveAsNoteId = null
+                    closeAfterSaveNoteId = null
+                    fail("Could not save portable note: ${error.message}")
+                }
+            }
+        } else {
+            portableSaveAsNoteId = null
+            closeAfterSaveNoteId = null
+            fail("The reader is not ready")
+        }
+    }
+    fun saveManual(noteId: String = mutable.value.active.id, forceOverwrite: Boolean = false) {
+        if (mutable.value.busy) return
+        if (requestWriteAccessIfBlocked(noteId, explicit = true)) {
+            closeAfterSaveNoteId = null
+            return
+        }
+        viewModelScope.launch {
+            if (noteId != mutable.value.active.id && mutable.value.tabs.any { it.id == noteId }) {
+                val prevActive = mutable.value.active.id
+                if (!performReaderBarrier(prevActive) { change { it.copy(activeId = noteId) } }) {
+                    readerBarrierFailed()
+                    closeAfterSaveNoteId = null
+                    return@launch
+                }
+            } else if (!performReaderBarrier(noteId) { }) {
+                readerBarrierFailed()
+                closeAfterSaveNoteId = null
+                return@launch
+            }
+            val note = mutable.value.tabs.find { it.id == noteId } ?: return@launch
+            if (note.uri == null) {
+                if (note.portable) portableSaveAsNoteId = note.id
+                val picker = requestSaveAs
+                if (picker != null) picker(note) else {
+                    portableSaveAsNoteId = null
+                    closeAfterSaveNoteId = null
+                }
+                return@launch
+            }
+            if (!forceOverwrite && note.id in mutable.value.conflictedTabIds) {
+                mutable.value = mutable.value.copy(pendingSaveConflictNoteId = note.id)
+                return@launch
+            }
+            if (note.portable) {
+                portableSaveAsNoteId = null
+                portableForceOverwrite = forceOverwrite
+                if (requestPortableWrite?.invoke(true) == true) return@launch
+                if (readerStateIsNativeAuthoritative(note.id)) {
+                    busy(true)
+                    try {
+                        val assets = withContext(Dispatchers.IO) { collectNativePortableAssets(note) }
+                        writePortable(note.id, note.content, assets, save = true, originalContent = note.content)
+                    } catch (error: Exception) {
+                        portableForceOverwrite = false
+                        closeAfterSaveNoteId = null
+                        reportDocumentSaveFailure(note.id, error, "Could not save portable note: ${error.message}")
+                    }
+                } else {
+                    portableForceOverwrite = false
+                    closeAfterSaveNoteId = null
+                    fail("The reader is not ready")
+                }
+            } else {
+                save(uri = null, noteId = note.id, forceOverwrite = forceOverwrite, manualGuard = true)
+            }
+        }
+    }
+    fun dismissSaveConflict() {
+        closeAfterSaveNoteId = null
+        mutable.value = mutable.value.copy(pendingSaveConflictNoteId = null)
+    }
+    fun resolveSaveConflict(choice: String) {
+        val id = mutable.value.pendingSaveConflictNoteId ?: mutable.value.active.id
+        mutable.value = mutable.value.copy(pendingSaveConflictNoteId = null)
+        when (choice) {
+            "overwrite" -> saveManual(noteId = id, forceOverwrite = true)
+            "save_as" -> beginSaveAs(noteId = id)
+            else -> closeAfterSaveNoteId = null
+        }
+    }
+    fun reloadFromDisk(id: String = mutable.value.active.id) = viewModelScope.launch {
+        val note = mutable.value.tabs.find { it.id == id } ?: return@launch
+        val rawUri = note.uri ?: return@launch
+        try {
+            val reloaded = withContext(Dispatchers.IO) {
+                val target = documentAccess.resolve(Uri.parse(rawUri))
+                resolver.openInputStream(target)?.use { stream ->
+                    if (note.portable) {
+                        val opened = media.openFmd(stream)
+                        Note(id = note.id, name = note.name, uri = target.toString(), content = opened.markdown, saved = opened.markdown, relative = note.relative, assetDirectory = opened.directory, assetsDirty = false)
+                    } else {
+                        val text = readLimited(stream, 20_000_000).toString(Charsets.UTF_8)
+                        Note(id = note.id, name = note.name, uri = target.toString(), content = text, saved = text, relative = note.relative, assetsDirty = false)
+                    }
+                } ?: error("Document permission is unavailable; choose it again")
+            }
+            autosavePending.remove(id)
+            invalidateNoteAssets(id)
+            readerEcho.remove(id)
+            clearReaderEditProtocol(id)
+            if (reloaded.portable) {
+                recordPortableBaseline(id, reloaded.assetDirectory)
+                if (note.assetDirectory != null && note.assetDirectory != reloaded.assetDirectory) {
+                    withContext(Dispatchers.IO) { File(getApplication<Application>().filesDir, "portable-assets/${note.assetDirectory}").deleteRecursively() }
+                }
+            }
+            change { state ->
+                state.copy(
+                    tabs = state.tabs.map { if (it.id == id) reloaded else it },
+                    conflictedTabIds = state.conflictedTabIds - id,
+                    pendingSaveConflictNoteId = state.pendingSaveConflictNoteId?.takeUnless { it == id },
+                    message = "Reloaded from disk",
+                )
+            }
+        } catch (error: Exception) {
+            if (isDocumentAccessFailure(error)) requestDocumentAccess(rawUri, note, writing = false, explicit = true)
+            else fail("Could not reload note: ${error.message}")
+        }
+    }
+    fun save(uri: Uri? = null, noteId: String? = null, expectedRevision: String? = null, forceOverwrite: Boolean = false, manualGuard: Boolean = false, onComplete: ((String?) -> Unit)? = null) = viewModelScope.launch {
         val requestedNoteId = noteId ?: mutable.value.active.id
         if (uri == null && requestWriteAccessIfBlocked(requestedNoteId, explicit = onComplete == null)) {
+            closeAfterSaveNoteId = null
             onComplete?.invoke(DOCUMENT_ACCESS_MESSAGE)
             return@launch
         }
         if (requestedNoteId != mutable.value.active.id) {
+            closeAfterSaveNoteId = null
             onComplete?.invoke("Select the target note before saving it on Android")
             return@launch
         }
         // Save As keeps its explicit destination, while ordinary Save resolves
         // the current URI only after it owns the document-write lock.
         if (uri == null && mutable.value.tabs.find { it.id == requestedNoteId }?.uri == null) {
+            closeAfterSaveNoteId = null
             onComplete?.invoke("This note has no saved location; Save As requires the Android file picker")
             return@launch
         }
         if (!performReaderBarrier(requestedNoteId) { }) {
+            closeAfterSaveNoteId = null
             readerBarrierFailed()
             onComplete?.invoke("The note draft could not be synchronized before saving")
             return@launch
         }
         busy(true)
         try {
+            var shouldCloseAfterSave = false
             documentWrites.withLock {
             val note = mutable.value.tabs.find { it.id == requestedNoteId }
             if (closingNoteIds.contains(requestedNoteId) || note == null) {
+                closeAfterSaveNoteId = null
                 mutable.value = mutable.value.copy(busy = false, message = "Save canceled because the note was closed before the write began.")
                 onComplete?.invoke("The note was closed before saving")
                 return@withLock
             }
             if (expectedRevision != null && !java.security.MessageDigest.getInstance("SHA-256")
                     .digest(note.content.toByteArray(Charsets.UTF_8)).joinToString("") { "%02x".format(it) }.equals(expectedRevision, ignoreCase = true)) {
+                closeAfterSaveNoteId = null
                 mutable.value = mutable.value.copy(busy = false)
                 onComplete?.invoke("The note changed since the supplied revision; no changes were saved")
                 return@withLock
             }
             val target = uri ?: note.uri?.let(Uri::parse)
             if (target == null) {
+                closeAfterSaveNoteId = null
                 mutable.value = mutable.value.copy(busy = false, message = "Save canceled because the note no longer has a destination.")
                 onComplete?.invoke("The note no longer has a saved destination")
                 return@withLock
             }
+            val guardDisk = uri == null && !forceOverwrite && (manualGuard || expectedRevision != null)
             val (writtenTarget, savedName) = withContext(Dispatchers.IO) {
                 require(!note.portable || uri != null) { "Use portable save for this SMD file" }
                 val destination = if (uri != null) prepareExportDestination(target, NativeExportFormat.MARKDOWN, allowRename = true) else documentAccess.resolve(target, writing = true)
+                if (guardDisk && !diskMatchesBaseline(destination, note)) throw ExternalConflictDetectedException()
                 copyAttachments(note, destination)
                 resolver.openOutputStream(destination, "wt")?.use { it.write(note.content.toByteArray()) } ?: error("Writing permission is unavailable; use Save as")
                 documentAccess.persist(destination)
-                destination to (DocumentFile.fromSingleUri(getApplication(), destination)?.name ?: note.name)
+                destination to (resolveDisplayName(destination) ?: ExportFilename.suggestedName(note.name, NativeExportFormat.MARKDOWN))
             }
-            change { s -> s.copy(busy = false, tabs = s.tabs.map { if (it.id == note.id) it.copy(uri = writtenTarget.toString(), name = savedName, saved = note.content, assetDirectory = null) else it }, message = "Saved") }
+            savedPortableAssets.remove(note.id)
+            autosavePending.remove(note.id)
+            change { s -> s.copy(busy = false, tabs = s.tabs.map { if (it.id == note.id) it.copy(uri = writtenTarget.toString(), name = savedName, saved = note.content, assetsDirty = false, assetDirectory = null) else it }, conflictedTabIds = s.conflictedTabIds - note.id, pendingSaveConflictNoteId = s.pendingSaveConflictNoteId?.takeUnless { it == note.id }, message = "Saved") }
             mutable.value.tabs.find { it.id == note.id }?.let(::remember)
+            if (closeAfterSaveNoteId == note.id) {
+                closeAfterSaveNoteId = null
+                shouldCloseAfterSave = true
+            }
             onComplete?.invoke(null)
             }
+            if (shouldCloseAfterSave) close(requestedNoteId)
+        } catch (_: ExternalConflictDetectedException) {
+            autosavePending.remove(requestedNoteId)
+            if (manualGuard) {
+                change { s -> s.copy(busy = false, conflictedTabIds = s.conflictedTabIds + requestedNoteId, pendingSaveConflictNoteId = requestedNoteId) }
+            } else {
+                closeAfterSaveNoteId = null
+                change { s -> s.copy(busy = false, conflictedTabIds = s.conflictedTabIds + requestedNoteId, message = "This file changed on disk. Autosave is paused for this tab.") }
+            }
+            onComplete?.invoke("The note changed on disk; resolve the conflict or Save As before saving")
         } catch (error: Exception) {
+            closeAfterSaveNoteId = null
             val message = if (uri == null) reportDocumentSaveFailure(requestedNoteId, error, "Could not save note: ${error.message}")
                 else "Could not save note: ${error.message}".also(::fail)
             onComplete?.invoke(message)
@@ -1599,7 +1964,7 @@ class StudioViewModel(app: Application, val workspaceKey: String = "main") : And
             val revision = java.security.MessageDigest.getInstance("SHA-256").digest(note.content.toByteArray(Charsets.UTF_8)).joinToString("") { "%02x".format(it) }
             require(revision == expectedRevision) { "The document changed; read it again before replacing an image" }
             require(note.portable && note.uri != null && note.saved == note.content) { "Image replacement requires a saved, unchanged portable .smd note" }
-            val sourceList = JSONArray(PdfEngine.imageSources(note.content))
+            val sourceList = JSONArray(markdownImageSourcesJson(note.content))
             val linkedAssets = (0 until sourceList.length()).map { sourceList.getString(it) }.distinct().filter(media::validKey)
             val resolvedAssetName = linkedAssets.firstOrNull { source ->
                 source == assetName || java.security.MessageDigest.getInstance("SHA-256").digest(source.toByteArray(Charsets.UTF_8)).joinToString("") { byte -> "%02x".format(byte) } == assetName
@@ -1626,7 +1991,7 @@ class StudioViewModel(app: Application, val workspaceKey: String = "main") : And
                 val disk = resolver.openInputStream(noteUri)?.use(media::openFmd) ?: error("Cannot read the current portable note")
                 diskAssets = disk.directory
                 require(disk.markdown == note.saved) { "The portable note's Markdown changed on disk; reopen it before replacement" }
-                val sources = JSONArray(PdfEngine.imageSources(note.content))
+                val sources = JSONArray(markdownImageSourcesJson(note.content))
                 (0 until sources.length()).map { sources.getString(it) }.distinct().filter(media::validKey).forEach { source ->
                     val currentFile = media.local(source, note.assetDirectory) ?: error("An open image is missing: $source")
                     val diskFile = media.local(source, disk.directory) ?: error("The saved note no longer contains image $source")
@@ -1650,7 +2015,8 @@ class StudioViewModel(app: Application, val workspaceKey: String = "main") : And
                     ?: error("Cannot save the updated portable note")
                 withContext(Dispatchers.Main) {
                     invalidateNoteAssets(id)
-                    change { state -> state.copy(tabs = state.tabs.map { if (it.id == id) it.copy(saved = it.content) else it }, busy = false, message = "Portable image replaced") }
+                    recordPortableBaseline(id, note.assetDirectory)
+                    change { state -> state.copy(tabs = state.tabs.map { if (it.id == id) it.copy(saved = it.content, assetsDirty = false) else it }, conflictedTabIds = state.conflictedTabIds - id, busy = false, message = "Portable image replaced") }
                     mutable.value.tabs.find { it.id == id }?.let(::remember)
                 }
                 backupAsset.delete()
@@ -1762,10 +2128,11 @@ class StudioViewModel(app: Application, val workspaceKey: String = "main") : And
                         && matchesAssetWriteSnapshot(latest, mutable.value.activeId, note) && latest.assetDirectory == directory
                     if (!matches) return@withContext false
                     invalidateNoteAssets(id)
+                    recordPortableBaseline(id, writtenDirectory)
                     change { state -> state.copy(tabs = state.tabs.map {
                         if (it.id == id && it.content == writtenSource && it.uri == note.uri && it.assetDirectory == directory)
-                            it.copy(saved = writtenSource, assetDirectory = writtenDirectory) else it
-                    }, busy = false, message = "Portable image attached") }
+                            it.copy(saved = writtenSource, assetsDirty = false, assetDirectory = writtenDirectory) else it
+                    }, conflictedTabIds = state.conflictedTabIds - id, busy = false, message = "Portable image attached") }
                     mutable.value.tabs.find { it.id == id }?.let(::remember)
                     true
                 }
@@ -1840,7 +2207,7 @@ class StudioViewModel(app: Application, val workspaceKey: String = "main") : And
         }
     }
     private fun copyAttachments(note: Note, destination: Uri, destinationTree: Uri? = null) {
-        val sources = JSONArray(PdfEngine.imageSources(note.content))
+        val sources = JSONArray(markdownImageSourcesJson(note.content))
         val local = (0 until sources.length()).map { sources.getString(it) }.distinct().mapNotNull { source -> media.local(source, note.assetDirectory)?.let { source to it } }
         if (local.isEmpty()) return
         val tree = destinationTree ?: mutable.value.folder?.let(Uri::parse) ?: error("Images need a containing folder permission. Choose a folder destination or export a single portable .smd file instead.")
@@ -1867,29 +2234,79 @@ class StudioViewModel(app: Application, val workspaceKey: String = "main") : And
         readerFolderIndex.clear()
     }
     var portableOutput: Uri? = null
-    suspend fun writePortable(id: String, content: String, assets: JSONObject, save: Boolean, originalContent: String) = withContext(Dispatchers.IO) { documentWrites.withLock {
-        val note = mutable.value.tabs.find { it.id == id } ?: error("The note is no longer open")
-        val target = if (save) note.uri?.let { documentAccess.resolve(Uri.parse(it), writing = true) } else portableOutput
-        require(target != null) { "Choose a portable file destination" }
-        val destination = if (save) target else prepareExportDestination(target, NativeExportFormat.PORTABLE_SMD, allowRename = portableDestinationIsNew)
-        val staged = File(getApplication<Application>().cacheDir, "fmd-${UUID.randomUUID()}.tmp")
-        try {
-            staged.outputStream().use { media.writeFmd(it, content, assets) }
-            verifyExportHeader(staged, NativeExportFormat.PORTABLE_SMD)
-            // Extract assets independently so a saved draft can immediately resolve
-            // new portable references without carrying binary data in its state.
-            val opened = if (save) staged.inputStream().use(media::openFmd) else null
-            resolver.openOutputStream(destination, "wt")?.use { output -> staged.inputStream().use { it.copyTo(output) } } ?: error("Cannot write portable file")
-            documentAccess.persist(destination)
-            withContext(Dispatchers.Main) {
-                if (save) { change { s -> s.copy(tabs = s.tabs.map { if (it.id == id) it.copy(content = if (it.content == originalContent) content else it.content, saved = content, uri = destination.toString(), assetDirectory = opened!!.directory) else it }, busy = false, message = "Portable note saved") }; mutable.value.tabs.find { it.id == id }?.let(::remember) }
-                else { portableOutput = null; portableDestinationIsNew = false; if (!finishShare(destination)) mutable.value = mutable.value.copy(busy = false, message = "Portable .smd exported") }
+    suspend fun writePortable(id: String, content: String, assets: JSONObject, save: Boolean, originalContent: String) {
+        var closeTargetId: String? = null
+        withContext(Dispatchers.IO) { documentWrites.withLock {
+            val rebindId = if (!save) portableSaveAsNoteId else null
+            val effectiveId = rebindId ?: id
+            val note = mutable.value.tabs.find { it.id == effectiveId } ?: error("The note is no longer open")
+            val target = if (save) note.uri?.let { documentAccess.resolve(Uri.parse(it), writing = true) } else portableOutput
+            require(target != null) { "Choose a portable file destination" }
+            val force = portableForceOverwrite
+            portableForceOverwrite = false
+            if (save && !force && !diskMatchesBaseline(target, note)) {
+                autosavePending.remove(effectiveId)
+                withContext(Dispatchers.Main) {
+                    change { s -> s.copy(busy = false, conflictedTabIds = s.conflictedTabIds + effectiveId, pendingSaveConflictNoteId = effectiveId) }
+                }
+                return@withLock
             }
-        } finally { staged.delete() }
-        }
+            val destination = if (save) target else prepareExportDestination(target, NativeExportFormat.PORTABLE_SMD, allowRename = portableDestinationIsNew)
+            val staged = File(getApplication<Application>().cacheDir, "fmd-${UUID.randomUUID()}.tmp")
+            try {
+                staged.outputStream().use { media.writeFmd(it, content, assets) }
+                verifyExportHeader(staged, NativeExportFormat.PORTABLE_SMD)
+                // Extract assets independently so a saved draft can immediately resolve
+                // new portable references without carrying binary data in its state.
+                val rebinding = save || rebindId != null
+                val opened = if (rebinding) staged.inputStream().use(media::openFmd) else null
+                resolver.openOutputStream(destination, "wt")?.use { output -> staged.inputStream().use { it.copyTo(output) } } ?: error("Cannot write portable file")
+                documentAccess.persist(destination)
+                val savedName = if (rebindId != null) {
+                    resolveDisplayName(destination) ?: ExportFilename.suggestedName(note.name, NativeExportFormat.PORTABLE_SMD)
+                } else note.name
+                withContext(Dispatchers.Main) {
+                    if (rebinding) {
+                        portableOutput = null
+                        portableDestinationIsNew = false
+                        portableSaveAsNoteId = null
+                        autosavePending.remove(effectiveId)
+                        recordPortableBaseline(effectiveId, opened!!.directory)
+                        change { s ->
+                            s.copy(
+                                tabs = s.tabs.map {
+                                    if (it.id == effectiveId) it.copy(
+                                        name = if (rebindId != null) savedName else it.name,
+                                        content = if (it.content == originalContent) content else it.content,
+                                        saved = content,
+                                        assetsDirty = false,
+                                        uri = destination.toString(),
+                                        assetDirectory = opened.directory,
+                                    ) else it
+                                },
+                                conflictedTabIds = s.conflictedTabIds - effectiveId,
+                                pendingSaveConflictNoteId = s.pendingSaveConflictNoteId?.takeUnless { it == effectiveId },
+                                busy = false,
+                                message = if (rebindId != null) "Saved" else "Portable note saved",
+                            )
+                        }
+                        mutable.value.tabs.find { it.id == effectiveId }?.let(::remember)
+                        if (closeAfterSaveNoteId == effectiveId) {
+                            closeAfterSaveNoteId = null
+                            closeTargetId = effectiveId
+                        }
+                    } else {
+                        portableOutput = null
+                        portableDestinationIsNew = false
+                        if (!finishShare(destination)) mutable.value = mutable.value.copy(busy = false, message = "Portable .smd exported")
+                    }
+                }
+            } finally { staged.delete() }
+        } }
+        closeTargetId?.let { close(it) }
     }
     fun importDropped(uris: List<Uri>, id: String, result: (JSONArray?) -> Unit) = viewModelScope.launch {
-        try { val images = withContext(Dispatchers.IO) { media.importUris(uris) }; if (mutable.value.active.id == id) result(images) else { val insertion = (0 until images.length()).joinToString("\n\n") { i -> val image = images.getJSONObject(i); "![${image.getString("alt").replace("[", "\\[").replace("]", "\\]")}](<${image.getString("source")}>)" }; val note = mutable.value.tabs.find { it.id == id }; if (note != null) edit(id, note.content + "\n\n" + insertion + "\n"); result(null) } }
+        try { val images = withContext(Dispatchers.IO) { media.importUris(uris) }; markAssetsDirty(id); if (mutable.value.active.id == id) result(images) else { val insertion = (0 until images.length()).joinToString("\n\n") { i -> val image = images.getJSONObject(i); "![${image.getString("alt").replace("[", "\\[").replace("]", "\\]")}](<${image.getString("source")}>)" }; val note = mutable.value.tabs.find { it.id == id }; if (note != null) edit(id, note.content + "\n\n" + insertion + "\n"); result(null) } }
         catch (error: Exception) { fail("Could not insert image: ${error.message}"); result(null) }
     }
     internal suspend fun export(
@@ -1924,6 +2341,24 @@ class StudioViewModel(app: Application, val workspaceKey: String = "main") : And
         } finally { staging.deleteRecursively() }
     }
 }
+internal fun markdownImageSourcesJson(markdown: String): String = try {
+    PdfEngine.imageSources(markdown)
+} catch (_: UnsatisfiedLinkError) {
+    fallbackMarkdownImageSourcesJson(markdown)
+} catch (_: NoClassDefFoundError) {
+    fallbackMarkdownImageSourcesJson(markdown)
+}
+
+private fun fallbackMarkdownImageSourcesJson(markdown: String): String {
+    val result = JSONArray()
+    val pattern = Regex("""!\[(?:\\.|[^\]])*]\(\s*(?:<([^>\r\n]+)>|([^\s)\r\n]+))(?:\s+(?:"[^"]*"|'[^']*'))?\s*\)""")
+    pattern.findAll(markdown).forEach { match ->
+        val source = (match.groupValues[1].ifEmpty { match.groupValues[2] }).trim()
+        if (source.isNotEmpty()) result.put(source)
+    }
+    return result.toString()
+}
+
 object PdfEngine {
     init { System.loadLibrary("smd_core") }
     @JvmStatic external fun export(markdown: String, options: String, assets: String, output: String): String

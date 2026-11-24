@@ -1,6 +1,6 @@
 import { AnimatePresence, motion } from "motion/react";
 import { useEffect, useRef, useState } from "react";
-import { ArrowLeft, ArrowRight, BookOpen, FilePdf, FolderOpen, Sparkle } from "@phosphor-icons/react";
+import { ArrowLeftIcon, ArrowRightIcon, BookOpenIcon, FilePdfIcon, FolderOpenIcon, SparkleIcon } from "@phosphor-icons/react";
 import type { ThemeMode } from "../types";
 import BrandMark from "./BrandMark";
 import { MaterialSelect, MaterialSwitch, materialThemes } from "./MaterialControls";
@@ -16,9 +16,9 @@ interface Props {
 }
 
 const pages = [
-  { eyebrow: "A better place to think", title: "Welcome to Super MD", description: "Beautiful notes, living diagrams, and PDFs that are actually typeset. Your files stay ordinary and portable—no vault required.", icon: BookOpen },
-  { eyebrow: "Make it yours", title: "Set your reading mood", description: "Choose a look that feels right. Your fullscreen theme can be set separately in Settings whenever you like.", icon: Sparkle },
-  { eyebrow: "Ready when you are", title: "Start with a clear page", description: "Open an existing Markdown or Obsidian note, or begin with the guided sample. Export later with the built-in typesetter, not a screenshot of the screen.", icon: FilePdf },
+  { eyebrow: "A better place to think", title: "Welcome to Super MD", description: "Beautiful notes, living diagrams, and PDFs that are actually typeset. Your files stay ordinary and portable—no vault required.", icon: BookOpenIcon },
+  { eyebrow: "Make it yours", title: "Set your reading mood", description: "Choose a look that feels right. Your fullscreen theme can be set separately in Settings whenever you like.", icon: SparkleIcon },
+  { eyebrow: "Ready when you are", title: "Start with a clear page", description: "Open an existing Markdown or Obsidian note, or begin with the guided sample. Export later with the built-in typesetter, not a screenshot of the screen.", icon: FilePdfIcon },
 ];
 
 export default function WelcomeSetup({ theme, onTheme, readerFont, onReaderFont, motionEnabled, onMotion, onFinish }: Props) {
@@ -43,9 +43,9 @@ export default function WelcomeSetup({ theme, onTheme, readerFont, onReaderFont,
           <h1>{item.title}</h1><p>{item.description}</p>
           {page === 0 && <div className="welcome-feature-grid"><span>Math & code</span><span>Interactive charts</span><span>Callout boxes</span><span>Real PDF layout</span></div>}
           {page === 1 && <div className="welcome-customize"><MaterialSelect label="App theme" motion={motionEnabled} value={theme} options={materialThemes} onChange={value => onTheme(value as ThemeMode)} /><MaterialSelect label="Reading font" motion={motionEnabled} value={readerFont} options={[{ value: "sans", label: "Noto Sans · clean" }, { value: "humanist", label: "Manrope · expressive" }, { value: "serif", label: "System serif · book" }]} onChange={onReaderFont} /><label className="welcome-switch"><span>Smooth expressive motion</span><MaterialSwitch label="Smooth expressive motion" motion={motionEnabled} checked={motionEnabled} onChange={onMotion} /></label></div>}
-          {page === 2 && <div className="welcome-choices"><button onClick={() => onFinish(true)}><FolderOpen size={20} /> Open a note</button><button onClick={() => onFinish(false)}><BookOpen size={20} /> Explore the sample</button></div>}
+          {page === 2 && <div className="welcome-choices"><button onClick={() => onFinish(true)}><FolderOpenIcon size={20} /> Open a note</button><button onClick={() => onFinish(false)}><BookOpenIcon size={20} /> Explore the sample</button></div>}
         </motion.div></AnimatePresence>
-        <div className="welcome-footer"><button className="welcome-back" onClick={() => setPage((value) => Math.max(0, value - 1))} disabled={page === 0}><ArrowLeft size={18} /> Back</button>{page < pages.length - 1 && <button className="welcome-next" onClick={() => setPage((value) => value + 1)}>Continue <ArrowRight size={18} /></button>}</div>
+        <div className="welcome-footer"><button className="welcome-back" onClick={() => setPage((value) => Math.max(0, value - 1))} disabled={page === 0}><ArrowLeftIcon size={18} /> Back</button>{page < pages.length - 1 && <button className="welcome-next" onClick={() => setPage((value) => value + 1)}>Continue <ArrowRightIcon size={18} /></button>}</div>
       </div>
     </div>
   </div>;

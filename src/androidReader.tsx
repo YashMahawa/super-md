@@ -21,7 +21,8 @@ import "./styles.css";
 import "./androidReader.css";
 import "./customTheme.css";
 import { isBuiltinReaderFont, resolveReaderFontStack } from "./readerFonts";
-import Editor, { editorReadingOffset, editorSelectionText, editorViewContext, editorHistory, exportEditorSession, importEditorSession, type PortableEditorSession } from "./components/Editor";
+import Editor, { editorReadingOffset, editorSelectedText, editorViewContext, editorHistory, exportEditorSession, importEditorSession, type PortableEditorSession } from "./components/Editor";
+import { extractSelectedText } from "./copySource";
 import {readingOffset,revealReadingOffset} from "./readingPosition";
 import { exportRenderedViews, importRenderedViews, inspectCachedPythonOutput, safePythonFigure } from "./renderedOutputs";
 import { analyzeDocument } from "./documentAnalysis";
@@ -193,6 +194,7 @@ function Reader() {
       scroller.scrollBy({left:reading&&reference.current?.centerLock?0:dx,top:dy,behavior:'instant'});
     });
     window.supermdSavePosition=()=>savePosition.current();
+    window.supermdSelectedText=()=>extractSelectedText({source:reference.current?.content,editorSelection:()=>reference.current?editorSelectedText(reference.current.id):null});
     window.supermdChromeInset=height=>{
       const top=Math.max(0,Math.min(480,Number.isFinite(height)?height:0));
       const html=document.documentElement;
@@ -381,7 +383,7 @@ function Reader() {
       catch (error) { await invoke("export_failed", {error: String(error)}); }
     };
     void invoke("reader_ready");
-    return () => {nativeScroll.clear();cancelAnimationFrame(zoomFrame.current);window.clearTimeout(zoomTimer.current);delete window.supermdThemeGuide;delete window.supermdSavePosition;delete window.supermdChromeInset;delete window.supermdLoad; delete window.supermdExport; delete window.supermdExportMarkdown; delete window.supermdPortable; delete window.supermdZoomBy; delete window.supermdResetZoom; delete window.supermdRepairMath; delete window.supermdToggleTypewriter; delete window.supermdFlush; delete window.supermdSetZoom; delete window.supermdHeading; };
+    return () => {nativeScroll.clear();cancelAnimationFrame(zoomFrame.current);window.clearTimeout(zoomTimer.current);delete window.supermdSelectedText;delete window.supermdThemeGuide;delete window.supermdSavePosition;delete window.supermdChromeInset;delete window.supermdLoad; delete window.supermdExport; delete window.supermdExportMarkdown; delete window.supermdPortable; delete window.supermdZoomBy; delete window.supermdResetZoom; delete window.supermdRepairMath; delete window.supermdToggleTypewriter; delete window.supermdFlush; delete window.supermdSetZoom; delete window.supermdHeading; };
   }, []);
   useEffect(()=>{
     if(!state)return;
@@ -689,7 +691,7 @@ function Reader() {
             selectionText=editorCtx.selectionText||window.getSelection()?.toString()||'';
           }else{
             offset=editorReadingOffset(note.id)??0;
-            selectionText=editorSelectionText(note.id)||window.getSelection()?.toString()||'';
+            selectionText=editorSelectedText(note.id)||window.getSelection()?.toString()||'';
             visibleText=note.content.slice(offset,offset+2000).trim();
           }
           heading=headingAtOffset(offset);
@@ -738,7 +740,7 @@ function Reader() {
           scrollFraction=host?host.scrollTop/Math.max(1,host.scrollHeight-host.clientHeight):0;
           visibleText=visibleParts.join('\n').slice(0,2000);
           if(note.mode==='split'){
-            selectionText=editorSelectionText(note.id)||window.getSelection()?.toString()||'';
+            selectionText=editorSelectedText(note.id)||window.getSelection()?.toString()||'';
           }else if(note.mode==='live'&&activeTextarea&&activeTextarea.selectionEnd>activeTextarea.selectionStart){
             selectionText=activeTextarea.value.slice(activeTextarea.selectionStart,activeTextarea.selectionEnd);
           }else{
