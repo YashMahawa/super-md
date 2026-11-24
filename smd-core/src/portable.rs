@@ -103,7 +103,10 @@ impl PortableDocument {
 /// reformatted. Reference-style images are replaced at their rendered use site.
 pub fn pack(markdown: &str, mut load: impl FnMut(&str) -> Result<String>) -> Result<PortableDocument> {
     use pulldown_cmark::{Event, Options, Parser, Tag, TagEnd};
-    let mut events = Parser::new_ext(markdown, Options::all()).into_offset_iter();
+    let fm_end = crate::frontmatter::parse_frontmatter(markdown).map(|fm| fm.end).unwrap_or(0);
+    let body = &markdown[fm_end..];
+    let options = Options::ENABLE_TABLES | Options::ENABLE_FOOTNOTES | Options::ENABLE_STRIKETHROUGH | Options::ENABLE_TASKLISTS | Options::ENABLE_MATH;
+    let mut events = Parser::new_ext(body, options).into_offset_iter();
     let mut assets = BTreeMap::new(); let mut shared = BTreeMap::<String, String>::new(); let mut edits = Vec::new();
     while let Some((event, range)) = events.next() {
         if let Event::Start(Tag::Image { dest_url, title, .. }) = event {
@@ -116,7 +119,7 @@ pub fn pack(markdown: &str, mut load: impl FnMut(&str) -> Result<String>) -> Res
             };
             let label = alt.replace('\\', "\\\\").replace('[', "\\[").replace(']', "\\]");
             let title = if title.is_empty() { String::new() } else { format!(" \"{}\"", title.replace('\\', "\\\\").replace('"', "\\\"").replace('\n', " ")) };
-            edits.push((range, format!("![{label}](<{name}>{title})")));
+            edits.push(((range.start + fm_end)..(range.end + fm_end), format!("![{label}](<{name}>{title})")));
         }
     }
     let mut content = markdown.to_string();

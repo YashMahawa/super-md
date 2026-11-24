@@ -1,4 +1,4 @@
-import {useEffect,useMemo,useRef,useState, type CSSProperties, type KeyboardEvent, type ReactNode} from "react";
+import {useEffect,useId,useMemo,useRef,useState, type CSSProperties, type KeyboardEvent, type ReactNode} from "react";
 import {createPortal} from "react-dom";
 import {setReaderOverlay} from "../readerOverlays";
 import {zoomTranslation,type Point} from "../focalZoom";
@@ -46,8 +46,9 @@ export function parseStepDeck(source:string):StepDeck|null {
 }
 
 /** One diagram at a time; keyboard, buttons and native range slider. */
-export default function StepCards({source,renderImage,renderChart,renderMarkdown}:{source:string;renderImage:(src:string,alt:string)=>ReactNode;renderChart?:(source:string)=>ReactNode;renderMarkdown?:(source:string)=>ReactNode}) {
+export default function StepCards({source,renderImage,renderChart,renderMarkdown,sourceStart,sourceEnd}:{source:string;renderImage:(src:string,alt:string)=>ReactNode;renderChart?:(source:string)=>ReactNode;renderMarkdown?:(source:string)=>ReactNode;sourceStart?:number;sourceEnd?:number}) {
   const deck=useMemo(()=>parseStepDeck(source),[source]);
+  const deckInstanceId=useId();
   const [index,setIndex]=useState(0);
   const hovered=useRef(false);
   const region=useRef<HTMLElement>(null);
@@ -172,7 +173,7 @@ export default function StepCards({source,renderImage,renderChart,renderMarkdown
   };
   if(!deck)return <section className="step-cards step-cards-error" role="alert">Invalid step cards. Use a fenced <code>smd-steps</code> block with a title and 2–40 labeled steps.</section>;
   const step=deck.steps[current];
-  const card=<section className={"step-cards"+(!step.markdown?" is-visual-only":"")+(!step.image&&!step.diagram&&!step.chart?" has-no-visual":"")+(expanded?" is-expanded":"")} style={{...(fitWidth?{'--step-image-fit-width':`${fitWidth}px`}:{}),...(figureHeight?{'--step-figure-height':`${figureHeight}px`}:{}),'--step-viewer-transform':`translate(${pan.x}px,${pan.y}px) scale(${zoom/100})`} as CSSProperties} role="region" tabIndex={0} aria-label={deck.title+": interactive steps"} ref={region} onPointerEnter={()=>{hovered.current=true;}} onPointerLeave={()=>{hovered.current=false;}} onKeyDown={onKeyDown} data-step-count={count}>
+  const card=<section className={"step-cards"+(!step.markdown?" is-visual-only":"")+(!step.image&&!step.diagram&&!step.chart?" has-no-visual":"")+(expanded?" is-expanded":"")} style={{...(fitWidth?{'--step-image-fit-width':`${fitWidth}px`}:{}),...(figureHeight?{'--step-figure-height':`${figureHeight}px`}:{}),'--step-viewer-transform':`translate(${pan.x}px,${pan.y}px) scale(${zoom/100})`} as CSSProperties} role="region" tabIndex={0} aria-label={deck.title+": interactive steps"} ref={region} onPointerEnter={()=>{hovered.current=true;}} onPointerLeave={()=>{hovered.current=false;}} onKeyDown={onKeyDown} data-step-deck-id={deckInstanceId} data-deck-title={deck.title} data-step-index={current} data-step-label={step.label} data-step-count={count} data-source-start={sourceStart} data-source-end={sourceEnd}>
     <div className="step-cards-layout">
     <div className={'step-cards-stage'+(expanded?' image-viewer-canvas':'')} ref={figureRef} onClick={event=>{if(!expanded&&event.target instanceof Element&&event.target.closest('.step-cards-inline-figure svg')){const live=region.current?.closest('.live-block');if(!live){enlarge();return;}if(openTimer.current){window.clearTimeout(openTimer.current);openTimer.current=0;}if(event.detail>1)return;openTimer.current=window.setTimeout(()=>{openTimer.current=0;if(region.current?.isConnected&&!live.querySelector('textarea'))enlarge();},180);}}}
       onPointerDown={event=>{
@@ -215,5 +216,5 @@ export default function StepCards({source,renderImage,renderChart,renderMarkdown
   </section>;
   const liveBlock=expanded?liveBlockRef.current:(region.current?.closest<HTMLElement>('.live-block')??null);
   const editSource=()=>{skipRestoreFocus.current=true;setExpanded(false);if(liveBlock?.isConnected)liveBlock.dispatchEvent(new CustomEvent('supermd-edit-block',{bubbles:true}));};
-  return expanded?<><div className="step-cards-placeholder" style={{height:placeholderHeight}}/>{createPortal(<div className="image-viewer step-viewer markdown-body" data-independent-zoom role="dialog" aria-modal="true" aria-label="Slide viewer"><div className="step-viewer-toolbar"><output aria-label="Slide image zoom">{Math.round(zoom)}%</output><button aria-label="Fit slide image" onClick={fit}>Fit</button>{liveBlock?.isConnected&&<button type="button" onClick={editSource}>Edit source</button>}<button className="step-viewer-close" aria-label="Close slide viewer" onClick={()=>setExpanded(false)}>Close</button></div>{card}</div>,document.body)}</>:card;
+  return expanded?<><div className="step-cards-placeholder" style={{height:placeholderHeight}} data-step-deck-id={deckInstanceId} data-deck-title={deck.title} data-step-index={current} data-step-label={step.label} data-step-count={count} data-source-start={sourceStart} data-source-end={sourceEnd}/>{createPortal(<div className="image-viewer step-viewer markdown-body" data-independent-zoom role="dialog" aria-modal="true" aria-label="Slide viewer"><div className="step-viewer-toolbar"><output aria-label="Slide image zoom">{Math.round(zoom)}%</output><button aria-label="Fit slide image" onClick={fit}>Fit</button>{liveBlock?.isConnected&&<button type="button" onClick={editSource}>Edit source</button>}<button className="step-viewer-close" aria-label="Close slide viewer" onClick={()=>setExpanded(false)}>Close</button></div>{card}</div>,document.body)}</>:card;
 }
