@@ -1,16 +1,22 @@
 """CI harness: preserve every native assertion and diagnose stalled Qt drivers."""
 import faulthandler
+import platform
 import sys
 import unittest
 from pathlib import Path
 
-def suite_watchdog_seconds(platform_name: str = sys.platform) -> int:
-    # macOS CI (both Intel x86_64 and Apple Silicon arm64) runs multiple
-    # bounded 60-second Qt WebEngine subprocess probes after hundreds of native
-    # tests under software rendering. A four-minute suite watchdog kills the
-    # process before those individual timeouts can report a real failure.
-    # Keep the per-probe assertions and timeout; only widen the suite budget.
-    return 720 if platform_name == "darwin" else 360
+def suite_watchdog_seconds(platform_name: str = sys.platform, machine: str | None = None) -> int:
+    """Return the faulthandler watchdog timeout in seconds.
+
+    macOS CI steps allow 8 minutes (480s) on arm64 (`macos-latest`) because the
+    60+ Qt Quick / WebEngine test files take ~4 minutes in software/offscreen
+    mode. Keep arm64 at 420s so faulthandler still dumps Python tracebacks
+    before the GitHub Actions step timeout if a Qt driver genuinely stalls.
+    """
+    resolved_machine = platform.machine() if machine is None else machine
+    if platform_name == "darwin":
+        return 720 if resolved_machine == "x86_64" else 420
+    return 240
 
 
 if __name__ == "__main__":

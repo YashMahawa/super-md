@@ -73,20 +73,26 @@ class RunTestsWatchdogTest(unittest.TestCase):
         self.assertTrue(x64_exit)
         self.assertTrue(linux_exit)
         self.assertTrue(win_exit)
-        self.assertEqual(arm64_timeout, 720)
+        self.assertEqual(arm64_timeout, 420)
         self.assertEqual(x64_timeout, 720)
-        self.assertGreaterEqual(linux_timeout, 240)
-        self.assertGreaterEqual(win_timeout, 240)
+        self.assertEqual(linux_timeout, 240)
+        self.assertEqual(win_timeout, 240)
 
     def test_workflow_step_timeouts_exceed_faulthandler_watchdog(self) -> None:
-        macos_watchdog, _ = _captured_watchdog_timeout("darwin", "arm64")
-        for workflow in ("ci.yml", "release.yml"):
-            minutes = _workflow_desktop_test_timeout_minutes(REPO_ROOT / ".github" / "workflows" / workflow)
-            self.assertGreater(
-                minutes * 60,
-                macos_watchdog,
-                f"{workflow} timeout-minutes ({minutes}m = {minutes * 60}s) must exceed faulthandler watchdog ({macos_watchdog}s)",
-            )
+        arm64_watchdog, _ = _captured_watchdog_timeout("darwin", "arm64")
+        x64_watchdog, _ = _captured_watchdog_timeout("darwin", "x86_64")
+        ci_minutes = _workflow_desktop_test_timeout_minutes(REPO_ROOT / ".github" / "workflows" / "ci.yml")
+        release_minutes = _workflow_desktop_test_timeout_minutes(REPO_ROOT / ".github" / "workflows" / "release.yml")
+        self.assertGreater(
+            ci_minutes * 60,
+            arm64_watchdog,
+            f"ci.yml timeout-minutes ({ci_minutes}m = {ci_minutes * 60}s) must exceed arm64 watchdog ({arm64_watchdog}s)",
+        )
+        self.assertGreater(
+            release_minutes * 60,
+            x64_watchdog,
+            f"release.yml timeout-minutes ({release_minutes}m = {release_minutes * 60}s) must exceed x86_64 watchdog ({x64_watchdog}s)",
+        )
 
 
 if __name__ == "__main__":
