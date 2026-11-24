@@ -1,3 +1,4 @@
+import {caretRangeAtPoint} from "./caretPoint";
 let inputVersion=0;
 export function markScrollInput():void {inputVersion++;}
 export function scrollInputVersion():number {return inputVersion;}
@@ -5,7 +6,7 @@ if(typeof document!=='undefined')for(const name of ['wheel','touchstart','touchm
 export function captureScrollAnchor(root: HTMLElement, focus?:{x:number;y:number}): () => void {
   const capturedInput=inputVersion;
   const bounds = root.getBoundingClientRect(), y = focus?.y ?? bounds.top + Math.min(bounds.height * .35, 180), x = focus?.x ?? bounds.left + bounds.width * .45;
-  const caret = (document as Document & { caretRangeFromPoint?: (x:number,y:number)=>Range|null }).caretRangeFromPoint?.(x,y);
+  const caret = caretRangeAtPoint(root.ownerDocument,x,y);
   const range = caret && root.contains(caret.startContainer) ? caret.cloneRange() : null;
   if(range?.startContainer.nodeType===Node.TEXT_NODE && range.startOffset<(range.startContainer.textContent?.length??0))range.setEnd(range.startContainer,range.startOffset+1);
   const rangeNode=range?.startContainer,rangeOffset=range?.startOffset;

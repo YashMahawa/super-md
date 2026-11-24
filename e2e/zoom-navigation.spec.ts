@@ -141,7 +141,12 @@ test('Android settled zoom hit testing selects the word at the displayed locatio
   await expect(page.locator('.document-page')).toHaveAttribute('data-selection-scale','1.75');
   const hit=await page.locator('.markdown-body p').first().evaluate(el=>{
     const text=el.firstChild!;const range=document.createRange();range.setStart(text,6);range.setEnd(text,11);const r=range.getBoundingClientRect();
-    const caret=document.caretRangeFromPoint(r.left+r.width*.5,r.top+r.height*.5);
+    const x=r.left+r.width*.5,y=r.top+r.height*.5;
+    if(typeof (document as Partial<Document>).caretPositionFromPoint==='function'){
+      const pos=document.caretPositionFromPoint(x,y);
+      return {text:pos?.offsetNode.textContent,offset:pos?.offset,width:r.width,top:r.top};
+    }
+    const caret=(document as unknown as {caretRangeFromPoint?:(x:number,y:number)=>Range|null}).caretRangeFromPoint?.(x,y);
     return {text:caret?.startContainer.textContent,offset:caret?.startOffset,width:r.width,top:r.top};
   });
   expect(hit.text).toBe('Alpha Bravo Charlie Delta');expect(hit.offset).toBeGreaterThanOrEqual(6);expect(hit.offset).toBeLessThanOrEqual(11);

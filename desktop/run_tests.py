@@ -7,11 +7,11 @@ from pathlib import Path
 
 if __name__ == "__main__":
     faulthandler.enable()
-    # Intel macOS CI runs five bounded 60-second Qt mouse-selection probes
+    # macOS CI runs multiple bounded 60-second Qt WebEngine subprocess probes
     # after hundreds of native tests. A four-minute suite watchdog kills the
     # process before those individual timeouts can report a real failure.
     # Keep the per-probe assertions and timeout; only widen the suite budget.
-    suite_timeout = 720 if sys.platform == "darwin" and platform.machine() == "x86_64" else 240
+    suite_timeout = 720 if sys.platform == "darwin" and platform.machine() == "x86_64" else (420 if sys.platform == "darwin" else 240)
     faulthandler.dump_traceback_later(suite_timeout, exit=True)
     try:
         suite=unittest.defaultTestLoader.discover(str(Path(__file__).parent),pattern="test_*.py")
