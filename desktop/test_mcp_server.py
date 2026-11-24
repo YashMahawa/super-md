@@ -858,6 +858,43 @@ class OfficialMCPClientTest(unittest.IsolatedAsyncioTestCase):
                     _system_aliases=system_aliases,
                 )
 
+            # Simulate Windows 8.3 short-path ancestors (e.g. RUNNER~1 -> runneradmin) where
+            # tab["path"] is canonical, os.path.abspath preserves RUNNER~1, is_symlink() is False
+            # on the 8.3 segment, and Path.resolve(strict=True) expands to the canonical root.
+            short_user = base / "RUNNER~1"
+            short_user.symlink_to(canonical_var)
+            orig_is_symlink = Path.is_symlink
+            with patch.object(Path, "is_symlink", lambda self_path: False if self_path == short_user else orig_is_symlink(self_path)):
+                resolved_short = _validate_local_tab_asset_path(
+                    str(short_user / "folders" / "note-folder" / "figure.svg"),
+                    canonical_note,
+                    [],
+                    unavailable_message="unavailable",
+                    outside_message="outside",
+                    _system_aliases=(),
+                )
+                self.assertEqual(resolved_short, figure.resolve(strict=True))
+
+                with self.assertRaisesRegex(ValueError, "outside"):
+                    _validate_local_tab_asset_path(
+                        str(short_user / "folders" / "outside-folder" / "secret.svg"),
+                        canonical_note,
+                        [],
+                        unavailable_message="unavailable",
+                        outside_message="outside",
+                        _system_aliases=(),
+                    )
+
+                with self.assertRaisesRegex(ValueError, "outside"):
+                    _validate_local_tab_asset_path(
+                        str(short_user / "folders" / "note-folder" / "escape.svg"),
+                        canonical_note,
+                        [],
+                        unavailable_message="unavailable",
+                        outside_message="outside",
+                        _system_aliases=(),
+                    )
+
 
 if __name__ == "__main__":
     unittest.main()

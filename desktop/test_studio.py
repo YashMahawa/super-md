@@ -1185,6 +1185,7 @@ class StudioTest(unittest.TestCase):
 
         bad_targets = [
             "../outside.md",
+            "../missing-outside.md",
             "sub%2f..%2f..%2foutside.md",
             "sub%5cnote.md",
             "bad%00.md",
@@ -1205,6 +1206,8 @@ class StudioTest(unittest.TestCase):
             self.assertEqual(replies[-1][0], req)
             self.assertEqual(replies[-1][1], "null")
             self.assertTrue(bool(replies[-1][2]), f"Expected rejection for {bad_target}")
+            if bad_target.startswith("../"):
+                self.assertIn("outside the authorized folder", replies[-1][2])
             self.assertEqual(studio.message, replies[-1][2])
             self.assertEqual(studio._current()["path"], str(inside.resolve()))
 

@@ -246,9 +246,6 @@ def _validate_local_tab_asset_path(raw_path, note_path: Path, extra_roots: list[
         except OSError as error:
             raise ValueError(unavailable_message) from error
 
-    if canonical_roots and not any(absolute == canonical_root or canonical_root in absolute.parents for canonical_root in canonical_roots):
-        raise ValueError(outside_message)
-
     try:
         resolved = absolute.resolve(strict=True)
     except (OSError, RuntimeError) as error:
@@ -724,7 +721,6 @@ class Studio(QObject):
         self.active = self.tabs[0]["id"]
         if self.settings["startup"]=="restore" and any(t["id"]==self.session.startup_active_id for t in self.tabs):self.active=self.session.startup_active_id
         self._activation_generation = 0
-        self._pending_headings: dict[str, str] = {}
         self._startup_placeholder_ids = {
             tab["id"] for tab in self.tabs
             if tab["name"] == "Untitled.md" and not tab["path"] and not tab["content"] and not tab["saved"] and not tab["assets"]
@@ -819,7 +815,7 @@ class Studio(QObject):
             reading_settings={key:self.settings[key] for key in ("restorePosition","centerLock","imageAppearance","svgAppearance","imageContrast","fullDocumentAccessibility","latexAutofix","typewriterScroll")}
             reading_settings["customStyle"]=custom_theme.reader(self.session.custom_theme,self.settings["fullTheme" if self.fullscreen else "theme"],self._dark(),self.settings)
             payload={**reading_settings,"readingLocation":self.session.locations.get(tab["path"]),"id": tab["id"], "path": tab["path"] or tab["id"], "mode": self.mode, "dark": self._dark(), "fullscreen": self.fullscreen, "font": self.settings["font"], "size": self.settings["size"], "widthPercent": self.settings["widthPercent"], "lineHeight":self.settings["lineHeight"], "spellCheck":self.settings["spellCheck"], "grammarCheck":self.settings["grammarCheck"], "zoom": self.settings["fullZoom" if self.fullscreen else "normalZoom"], "motion": self.settings["motion"], "python": self.settings["python"], "colors": colors, "viewState": tab.pop("viewState", None)}
-            pending_heading = tab.pop("pendingHeading", None) or (self._pending_headings.pop(tab["path"], None) if tab.get("path") else None)
+            pending_heading = tab.pop("pendingHeading", None)
             if pending_heading:
                 payload["pendingHeading"] = pending_heading
             payload["editProtocol"]=1
@@ -2391,22 +2387,24 @@ class Studio(QObject):
         elif activation_generation is None:
             activation_generation = self._activation_generation
         restoring = not explicit and str(path) in self._restoring_paths
+        def activate_existing(target_tab):
+            if explicit and activation_generation == self._activation_generation:
+                if pending_heading:
+                    target_tab["pendingHeading"] = pending_heading
+                else:
+                    target_tab.pop("pendingHeading", None)
+                was_active = self.active == target_tab["id"]
+                self._select_tab_from_open(target_tab["id"], activation_generation)
+                if was_active and pending_heading:
+                    self._emit()
+                self._focus_open_target(activation_generation)
         found = next((t for t in self.tabs if t["path"] == str(path)), None)
         if found:
             self._agent_open_paths.add(str(path.resolve()))
             self._restoring_paths.discard(str(path))
             if restoring and activation_generation == self._activation_generation and str(path) == self.session.startup_active:
                 self._select_tab_from_open(found["id"], activation_generation)
-            if explicit and activation_generation == self._activation_generation:
-                if pending_heading:
-                    found["pendingHeading"] = pending_heading
-                else:
-                    found.pop("pendingHeading", None)
-                was_active = self.active == found["id"]
-                self._select_tab_from_open(found["id"], activation_generation)
-                if was_active and pending_heading:
-                    self._emit()
-                self._focus_open_target(activation_generation)
+            activate_existing(found)
             if completion_callback: completion_callback(found, None)
             return
         def finished(result, error):
@@ -2419,16 +2417,7 @@ class Studio(QObject):
             # Keep one tab and let only an explicit, still-current request focus it.
             existing = next((tab for tab in self.tabs if tab["path"] == str(path)), None)
             if existing:
-                if explicit and activation_generation == self._activation_generation:
-                    if pending_heading:
-                        existing["pendingHeading"] = pending_heading
-                    else:
-                        existing.pop("pendingHeading", None)
-                    was_active = self.active == existing["id"]
-                    self._select_tab_from_open(existing["id"], activation_generation)
-                    if was_active and pending_heading:
-                        self._emit()
-                    self._focus_open_target(activation_generation)
+                activate_existing(existing)
                 if completion_callback: completion_callback(existing, None)
                 return
             note = self._note(path.name, content, str(path), content, assets, portable)
@@ -4344,7 +4333,6 @@ class Studio(QObject):
                     self.recovery_timer.stop()
                     self._recover()
                 resolved_str = str(resolved)
-                self._pending_headings.pop(resolved_str, None)
                 def opened_callback(_opened, error):
                     if error:
                         self.message = str(error)
@@ -4722,6 +4710,10 @@ class Studio(QObject):
         note_dir = note_path.parent.resolve()
         workspace_dir = Path(self.folder).resolve() if self.folder else None
         in_workspace = workspace_dir is not None and (note_dir == workspace_dir or note_dir.is_relative_to(workspace_dir))
+        auth_root = workspace_dir if in_workspace else note_dir
+        lexical = Path(os.path.abspath(note_dir / normalized))
+        if not (lexical == auth_root or auth_root in lexical.parents):
+            raise ValueError("Linked note is outside the authorized folder.")
         extra_roots = [Path(self.folder)] if in_workspace else []
         candidates = [note_path.parent / normalized]
         if in_workspace and workspace_dir != note_dir and ".." not in normalized.split("/"):
