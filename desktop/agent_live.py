@@ -1287,7 +1287,12 @@ def _qt_bridge_class():
                         target = next((tab for tab in studio.tabs if tab["id"] == payload.get("tabId")), None)
                         if target is None:
                             raise ValueError("The requested live tab is no longer open")
-                        request = {**payload, "requestId": parent_id, "_snapshot": True, "content": target["content"]}
+                        if payload.get("tabId") == studio.active:
+                            request = {**payload, "requestId": parent_id}
+                        else:
+                            request = {**payload, "requestId": parent_id, "_snapshot": True,
+                                       "content": target["content"], "path": target.get("path", ""),
+                                       "python": studio.settings.get("python", "embedded")}
                         encoded = json.dumps(request, ensure_ascii=False, separators=(",", ":"))
                         with self._lock:
                             parent_entry = self._pending.get(parent_id)
