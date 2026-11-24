@@ -335,7 +335,7 @@ class Session(QObject):
     locationChanged = Signal(str,str)
     def __init__(self,isolated=False):
         super().__init__()
-        self.data = Path(tempfile.mkdtemp(prefix="supermd-test-")) if isolated else Path(QStandardPaths.writableLocation(QStandardPaths.AppDataLocation))/"qt-studio"
+        self.data = Path(tempfile.mkdtemp(prefix="supermd-test-")) if isolated else Path(QStandardPaths.writableLocation(QStandardPaths.StandardLocation.AppDataLocation))/"qt-studio"
         self.data=self.data.resolve()
         self.data.mkdir(parents=True,exist_ok=True)
         self.font_store = FontStore(self.data)
@@ -938,7 +938,7 @@ class Studio(QObject):
         if not self.session.quitting and self.session.windows:
             self.session.workspace.pop(self.window_id,None)
             next(iter(self.session.windows.values()))._recover()
-        if self.system_preferences.state() != QProcess.NotRunning:
+        if self.system_preferences.state() != QProcess.ProcessState.NotRunning:
             self.system_preferences.terminate()
             self.system_preferences.waitForFinished(300)
 
@@ -1479,7 +1479,7 @@ class Studio(QObject):
             self.update_running=False
             if error:self.update_status="Update download failed: "+error;return
             self.update_path=path;self.update_status="Verified update ready. Save your work, then open the installer."
-        downloads=Path(QStandardPaths.writableLocation(QStandardPaths.DownloadLocation) or str(Path.home()/'Downloads'))/'Super MD Updates'
+        downloads=Path(QStandardPaths.writableLocation(QStandardPaths.StandardLocation.DownloadLocation) or str(Path.home()/'Downloads'))/'Super MD Updates'
         self._submit(lambda:updates.download(info,downloads,self.data/'updates'),done,False)
 
     @Slot()
@@ -2380,7 +2380,7 @@ class Studio(QObject):
 
     @Slot(str,result=QUrl)
     def defaultSaveLocation(self,name):
-        directory = self.settings.get("newNoteLocation") or QStandardPaths.writableLocation(QStandardPaths.DownloadLocation) or str(Path.home())
+        directory = self.settings.get("newNoteLocation") or QStandardPaths.writableLocation(QStandardPaths.StandardLocation.DownloadLocation) or str(Path.home())
         return QUrl.fromLocalFile(str(Path(directory)/Path(name).name))
 
     @Slot(str, result=QUrl)
@@ -2514,7 +2514,7 @@ class Studio(QObject):
         stem = "".join(char for char in stem if char.isalnum() or char in " ._()-").strip(" .")[:100]
         if not stem or stem in (".", ".."):
             stem = "Super MD export"
-        directory = Path(self.settings.get("newNoteLocation") or QStandardPaths.writableLocation(QStandardPaths.DownloadLocation) or str(Path.home())).expanduser()
+        directory = Path(self.settings.get("newNoteLocation") or QStandardPaths.writableLocation(QStandardPaths.StandardLocation.DownloadLocation) or str(Path.home())).expanduser()
         if not directory.is_dir():
             raise ValueError("The configured export folder is unavailable")
         for index in range(1, 10_001):
@@ -2863,7 +2863,7 @@ class Studio(QObject):
                 return self._agent_tab_result(existing, active=not background)
             candidate = Path(filename).expanduser()
             if not candidate.is_absolute():
-                directory = Path(self.settings.get("newNoteLocation") or QStandardPaths.writableLocation(QStandardPaths.DownloadLocation) or str(Path.home())).expanduser()
+                directory = Path(self.settings.get("newNoteLocation") or QStandardPaths.writableLocation(QStandardPaths.StandardLocation.DownloadLocation) or str(Path.home())).expanduser()
                 candidate = directory / candidate.name
             if not self._agent_path_allowed(candidate):
                 raise ValueError("The file is outside the approved agent note roots")
@@ -3064,7 +3064,7 @@ class Studio(QObject):
             raise ValueError("Media bytes do not match the declared type")
         safe = re.sub(r"[^A-Za-z0-9._ -]", "", Path(str(filename)).stem).strip(" .")[:100] or "Super-MD-media"
         extension = extensions[mime_type]
-        directory = Path(self.settings.get("newNoteLocation") or QStandardPaths.writableLocation(QStandardPaths.DownloadLocation) or str(Path.home())).expanduser()
+        directory = Path(self.settings.get("newNoteLocation") or QStandardPaths.writableLocation(QStandardPaths.StandardLocation.DownloadLocation) or str(Path.home())).expanduser()
         if not directory.is_dir():
             raise ValueError("The media download folder is unavailable")
         for suffix in range(1, 10000):
@@ -3227,7 +3227,7 @@ class Studio(QObject):
                 bridge.complete(request_id,None,"The note changed during background preview; retry",window_id=self.window_id);return
             image=QImage.fromData(body,"PNG")
             mime="image/jpeg" if args.get("imageFormat")=="jpeg" else "image/png"
-            encoded=QByteArray();buffer=QBuffer(encoded);buffer.open(QIODevice.WriteOnly);image.save(buffer,"JPEG" if mime=="image/jpeg" else "PNG")
+            encoded=QByteArray();buffer=QBuffer(encoded);buffer.open(QIODevice.OpenModeFlag.WriteOnly);image.save(buffer,"JPEG" if mime=="image/jpeg" else "PNG")
             bridge.complete(request_id,{"tabId":tab_id,"revision":revision,"mime_type":mime,"data":base64.b64encode(bytes(encoded)).decode(),"width":image.width(),"height":image.height(),"context":context,"renderedFrom":"background-preview"},window_id=self.window_id)
         self._submit(lambda:render_live_snapshot(content,assets,path,width=width,heading=heading,view=view),done,False)
 
