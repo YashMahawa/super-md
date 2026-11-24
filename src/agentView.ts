@@ -7,16 +7,29 @@ import {parseStepDeck} from './components/StepCards';
 import {parseDiagramSource} from './components/InlineDiagram';
 import {parseBinaryTreeSource} from './components/BinaryTree';
 import {stepDiagramSvg} from './stepPdf';
-export interface AgentDiagram {id:string;kind:string;source:string;start:number;end:number;url?:string;label?:string;deckTitle?:string;stepLabel?:string;stepIndex?:number;stepCount?:number}
+import {inspectCachedPythonOutput,safePythonFigure} from './renderedOutputs';
+export interface AgentDiagram {id:string;kind:string;source:string;start:number;end:number;url?:string;label?:string;deckTitle?:string;stepLabel?:string;stepIndex?:number;stepCount?:number;activeStep?:boolean}
+export interface AgentDiagramOptions {documentPath?:string|null;python?:string}
 /** Stable for this source revision; IDs avoid transmitting large artwork. */
-export function agentDiagrams(source:string):AgentDiagram[]{
-  const result:AgentDiagram[]=[],tree=analyzeDocument(source).tree;
+export function agentDiagrams(source:string,options?:AgentDiagramOptions):AgentDiagram[]{
+  const result:AgentDiagram[]=[],analysis=analyzeDocument(source),tree=analysis.tree;
   const definitions=new Map<string,string>();
   const definitionsIn=(node:any)=>{if(node.type==='definition')definitions.set(node.identifier,node.url);for(const child of node.children??[])definitionsIn(child);};definitionsIn(tree);
+  let pythonOrdinal=0;
   const walk=(node:any)=>{
     if(node.type==='code'&&['svg','mermaid','smd-chart','smd-tree','smd-diagram'].includes(node.lang)&&node.position){
       const start=agentCharLength(source.slice(0,node.position.start.offset));
       result.push({id:`diagram:${start}`,kind:node.lang,source:node.value,start:node.position.start.offset,end:node.position.end.offset});
+    }
+    if(node.type==='code'&&['python','py'].includes(String(node.lang||'').toLowerCase())&&node.position){
+      const cellIndex=pythonOrdinal++;
+      const offset=agentCharLength(source.slice(0,node.position.start.offset));
+      const pyCell=analysis.pythonCells.find(cell=>cell.offset===node.position.start.offset&&cell.source===String(node.value||''));
+      const duplicateOrdinal=pyCell?.ordinal??0;
+      const cached=inspectCachedPythonOutput(node.value,{...(options!==undefined?{document:options.documentPath??null}:{}),cell:String(duplicateOrdinal),interpreter:options?.python});
+      cached?.images.filter(safePythonFigure).slice(0,16).forEach((figure,index)=>{
+        result.push({id:`diagram:python:${offset}:${index}`,kind:'python-figure',url:figure,label:`Python cell ${cellIndex+1} — Figure ${index+1}`,source:node.value,start:node.position.start.offset,end:node.position.end.offset});
+      });
     }
     if(node.type==='code'&&node.lang==='smd-steps'&&node.position){
       const deck=parseStepDeck(node.value),offset=agentCharLength(source.slice(0,node.position.start.offset));
@@ -35,10 +48,10 @@ export function agentDiagrams(source:string):AgentDiagram[]{
   walk(tree);return result;
 }
 export function diagramMetadata(source:string,diagram:AgentDiagram){
-  return {id:diagram.id,kind:diagram.kind,sourceStart:agentCharLength(source.slice(0,diagram.start)),sourceEnd:agentCharLength(source.slice(0,diagram.end)),sourceChars:agentCharLength(diagram.source),preview:diagram.label||(diagram.kind==='svg'?'SVG drawing':diagram.source.slice(0,160)),...(diagram.deckTitle?{deckTitle:diagram.deckTitle,stepLabel:diagram.stepLabel,stepIndex:diagram.stepIndex,stepCount:diagram.stepCount}:{}),...(diagram.url?{assetReference:diagram.url.startsWith('data:')?'(embedded image)':diagram.url.slice(0,512)}:{})};
+  return {id:diagram.id,kind:diagram.kind,sourceStart:agentCharLength(source.slice(0,diagram.start)),sourceEnd:agentCharLength(source.slice(0,diagram.end)),sourceChars:agentCharLength(diagram.source),preview:diagram.label||(diagram.kind==='svg'?'SVG drawing':diagram.source.slice(0,160)),...(diagram.deckTitle?{deckTitle:diagram.deckTitle,stepLabel:diagram.stepLabel,stepIndex:diagram.stepIndex,stepCount:diagram.stepCount}:{}),...(diagram.activeStep!==undefined?{activeStep:diagram.activeStep}:{}),...(diagram.url?{assetReference:diagram.url.startsWith('data:')?'(embedded image)':diagram.url.slice(0,512)}:{})};
 }
 export async function diagramMedia(diagram:AgentDiagram,documentPath:string|null=null):Promise<ExportableMedia>{
-  if(diagram.kind==='image'){
+  if(diagram.kind==='image'||diagram.kind==='python-figure'){
     for(const element of document.querySelectorAll<HTMLElement>('[data-note-image-source]')){
       if(element.dataset.noteImageSource===diagram.url){const loaded=mediaAt(element.querySelector('img'));if(loaded)return loaded;}
     }

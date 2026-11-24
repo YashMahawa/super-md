@@ -106,3 +106,60 @@ test("desktop captured reading context retains sourceLength and corrected pagina
   assert.deepEqual(captured.capturedReadingContext?.visibleSource, { text: "captured", start: 1_019_040, end: 1_019_048, total_chars: 1_431_884, next_offset: 1_019_048, truncated: true });
   assert.deepEqual(captured.captureContext.sourceRange, { start: 1_019_040, end: 1_019_048, total_chars: 1_431_884, next_offset: 1_019_048, truncated: true });
 });
+
+test("boundedDiagrams and viewportContexts preserve StepCards active slide metadata and pythonCells while rejecting base64 assetReference", () => {
+  const revision = "e".repeat(64);
+  const captured = viewportContexts({
+    tabId: "deck-note",
+    revision,
+    sourceLength: 500,
+    mode: "reader",
+    reading: { offset: 12, heading: "Clustering", visibleText: "K-means — Step 3: Converge\nCentroids stabilize." },
+    activeStep: { deckTitle: "K-means", stepLabel: "Step 3: Converge", stepIndex: 2, stepCount: 3, activeStep: true, expanded: true },
+    visibleSource: { text: "# Clustering", start: 0, end: 12, total_chars: 500, next_offset: 12, truncated: true },
+    diagrams: [
+      { id: "diagram:step:14:0", kind: "image", sourceStart: 14, sourceEnd: 120, sourceChars: 40, preview: "K-means — Step 1", deckTitle: "K-means", stepLabel: "Step 1", stepIndex: 0, stepCount: 3, activeStep: false, assetReference: "assets/step1.png" },
+      { id: "diagram:step:14:2", kind: "smd-diagram", sourceStart: 14, sourceEnd: 120, sourceChars: 64, preview: "K-means — Step 3: Converge", deckTitle: "K-means", stepLabel: "Step 3: Converge", stepIndex: 2, stepCount: 3, activeStep: true, assetReference: "image/png;base64,AAAA" },
+      { id: "diagram:python:200:0", kind: "python-figure", sourceStart: 200, sourceEnd: 260, sourceChars: 50, preview: "Python cell 1 — Figure 1", assetReference: "(embedded image)" },
+    ],
+    pythonCells: [
+      { ordinal: 0, sourceStart: 200, sourceEnd: 260, ok: true, stdout: "loss=0.02\n", stderr: "", figureIds: ["diagram:python:200:0", "evil:not-a-python-diagram"] },
+    ],
+  }, "window:desktop:deck-note", revision);
+
+  assert.equal(captured.hasCoherentCapturedSource, true);
+  assert.deepEqual(captured.capturedReadingContext?.activeStep, {
+    deckTitle: "K-means",
+    stepLabel: "Step 3: Converge",
+    stepIndex: 2,
+    stepCount: 3,
+    activeStep: true,
+    expanded: true,
+  });
+  const diagrams = captured.capturedReadingContext?.diagrams as Array<Record<string, unknown>>;
+  assert.equal(diagrams.length, 3);
+  assert.deepEqual(diagrams[0], {
+    id: "diagram:step:14:0",
+    kind: "image",
+    sourceStart: 14,
+    sourceEnd: 120,
+    sourceChars: 40,
+    preview: "K-means — Step 1",
+    deckTitle: "K-means",
+    stepLabel: "Step 1",
+    stepIndex: 0,
+    stepCount: 3,
+    activeStep: false,
+    assetReference: "assets/step1.png",
+  });
+  assert.equal(diagrams[1]?.stepIndex, 2);
+  assert.equal(diagrams[1]?.deckTitle, "K-means");
+  assert.equal(diagrams[1]?.stepLabel, "Step 3: Converge");
+  assert.equal(diagrams[1]?.stepCount, 3);
+  assert.equal(diagrams[1]?.activeStep, true);
+  assert.equal(diagrams[1]?.assetReference, undefined, "base64, strings in assetReference are rejected");
+  assert.equal(diagrams[2]?.assetReference, "(embedded image)");
+  assert.deepEqual(captured.capturedReadingContext?.pythonCells, [
+    { ordinal: 0, sourceStart: 200, sourceEnd: 260, ok: true, stdout: "loss=0.02\n", stderr: "", figureIds: ["diagram:python:200:0"] },
+  ]);
+});

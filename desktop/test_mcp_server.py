@@ -1,6 +1,7 @@
 import importlib.util
 import json
 import os
+import shutil
 import sys
 import tempfile
 import unittest
@@ -234,9 +235,39 @@ class OfficialMCPClientTest(unittest.IsolatedAsyncioTestCase):
             def patch_tab(self, tab_id, expected_revision, operations):
                 self.edits.append((tab_id, expected_revision, operations))
                 return {"revision": "b" * 64, "previous_revision": expected_revision, "saved": True}
-            def render_tab(self, tab_id, width=1600):
-                return {"data": base64.b64decode("iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO6pX+0AAAAASUVORK5CYII="), "mime_type": "image/png",
-                        "revision": "a" * 64, "width": width, "height": 1}
+            def render_tab(self, tab_id, width=1600, image_format="png"):
+                self.render_calls = getattr(self, "render_calls", [])
+                self.render_calls.append((tab_id, width, image_format))
+                rev = getattr(self, "render_revision", "a" * 64)
+                context = {
+                    "tabId": "tab",
+                    "revision": rev,
+                    "sourceLength": 42,
+                    "mode": "reader",
+                    "reading": {"offset": 0, "heading": "Current view", "visibleText": "Slide 3 notes visible"},
+                    "activeStep": {"deckTitle": "Walkthrough", "stepLabel": "Step 3", "stepIndex": 2,
+                                   "stepCount": 3, "activeStep": True, "expanded": True},
+                    "selection": {"text": "highlighted phrase"},
+                    "visibleSource": {"text": "# Current view", "start": 0, "end": 14,
+                                      "total_chars": 42, "next_offset": 14, "truncated": True},
+                    "diagrams": [
+                        {"id": "diagram:step:15:2", "kind": "smd-diagram", "sourceStart": 15, "sourceEnd": 40,
+                         "sourceChars": 25, "preview": "Walkthrough — Step 3", "deckTitle": "Walkthrough",
+                         "stepLabel": "Step 3", "stepIndex": 2, "stepCount": 3, "activeStep": True,
+                         "assetReference": "data:image/png;base64,secret"},
+                        {"id": "diagram:python:40:0", "kind": "python-figure", "sourceStart": 40, "sourceEnd": 42,
+                         "sourceChars": 2, "preview": "Python cell 1 — Figure 1",
+                         "assetReference": "(embedded image)"},
+                    ],
+                    "pythonCells": [{"ordinal": 0, "sourceStart": 40, "sourceEnd": 42, "ok": True,
+                                     "stdout": "42\n", "stderr": "", "figureIds": ["diagram:python:40:0"]}],
+                }
+                if image_format == "jpeg":
+                    jpeg_bytes = b"\xff\xd8\xff\xe0\x00\x10JFIF\x00\x01\x01\x00\x00\x01\x00\x01\x00\x00\xff\xd9"
+                    return {**context, "data": jpeg_bytes, "mime_type": "image/jpeg", "width": min(width, 640), "height": 360}
+                return {**context,
+                        "data": base64.b64decode("iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO6pX+0AAAAASUVORK5CYII="),
+                        "mime_type": "image/png", "width": 1, "height": 1}
             def get_tab_image(self, tab_id, asset_name, expected_revision):
                 return {"data": b"<svg xmlns='http://www.w3.org/2000/svg'></svg>",
                         "mime_type": "image/svg+xml", "asset": asset_name,
@@ -299,7 +330,8 @@ class OfficialMCPClientTest(unittest.IsolatedAsyncioTestCase):
         from mcp.types import ImageContent
         async with Client(server) as client:
             tools = await client.list_tools()
-            self.assertLessEqual(len(tools.tools), 9)
+            self.assertLessEqual(len(tools.tools), 10)
+            self.assertIn("view_current", {tool.name for tool in tools.tools})
             tabs = await client.call_tool("list_sessions", {})
             target = tabs.structured_content["sessions"][0]["target"]
             self.assertEqual(target, "tab:session:window:tab")
@@ -411,6 +443,37 @@ class OfficialMCPClientTest(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(image_block.mime_type, "image/png")
             context = await client.call_tool("document_action", {"action": "get_context", "path": target})
             self.assertEqual(context.structured_content["visibleSource"]["text"], "# Current view")
+            current_default = await client.call_tool("view_current", {})
+            self.assertFalse(current_default.is_error, current_default.content)
+            jpeg_block = next(block for block in current_default.content if isinstance(block, ImageContent))
+            self.assertEqual(jpeg_block.mime_type, "image/jpeg")
+            current_payload = json.loads(next(block.text for block in current_default.content if hasattr(block, "text")))
+            self.assertEqual(current_payload["target"], target)
+            self.assertEqual(current_payload["quality"], "standard")
+            self.assertEqual(current_payload["readingContextSource"], "viewport_capture")
+            self.assertEqual(current_payload["readingContext"]["activeStep"]["stepIndex"], 2)
+            self.assertEqual(current_payload["readingContext"]["activeStep"]["deckTitle"], "Walkthrough")
+            self.assertTrue(current_payload["readingContext"]["activeStep"]["activeStep"])
+            self.assertEqual(current_payload["readingContext"]["diagrams"][0]["stepIndex"], 2)
+            self.assertTrue(current_payload["readingContext"]["diagrams"][0]["activeStep"])
+            self.assertNotIn("assetReference", current_payload["readingContext"]["diagrams"][0])
+            self.assertEqual(current_payload["readingContext"]["pythonCells"][0]["figureIds"], ["diagram:python:40:0"])
+            current_high = await client.call_tool("view_current", {"includeImage": True, "quality": "high", "width": 800})
+            self.assertFalse(current_high.is_error, current_high.content)
+            png_block = next(block for block in current_high.content if isinstance(block, ImageContent))
+            self.assertEqual(png_block.mime_type, "image/png")
+            render_count_before = len(live.render_calls)
+            current_text_only = await client.call_tool("view_current", {"includeImage": False})
+            self.assertFalse(current_text_only.is_error, current_text_only.content)
+            self.assertFalse(any(isinstance(block, ImageContent) for block in current_text_only.content))
+            self.assertEqual(len(live.render_calls), render_count_before)
+            text_only_payload = json.loads(current_text_only.content[0].text)
+            self.assertEqual(text_only_payload["readingContextSource"], "context_read")
+            self.assertEqual(text_only_payload["readingContext"]["visibleSource"]["text"], "# Current view")
+            live.render_revision = "f" * 64
+            stale_current = await client.call_tool("view_current", {"path": target})
+            self.assertTrue(stale_current.is_error)
+            live.render_revision = "a" * 64
             review = await client.call_tool("document_action", {"action": "latex_review", "path": target})
             applied = await client.call_tool("document_action", {"action": "latex_apply", "path": target,
                                                                      "expected_revision": review.structured_content["revision"],
@@ -490,6 +553,310 @@ class OfficialMCPClientTest(unittest.IsolatedAsyncioTestCase):
             finally:
                 uv_server.should_exit = True
                 thread.join(timeout=5)
+
+    async def test_disabled_live_access_reports_available_false_and_reason_in_sessions_and_devices(self):
+        import asyncio
+        from mcp import Client
+        from PySide6.QtGui import QGuiApplication
+        from agent_live_client import MultiSessionLiveClient
+        from agent_live import create_qt_bridge
+        from mcp_server import build_mcp_server
+        from studio import Session, Studio
+
+        app = QGuiApplication.instance() or QGuiApplication([])
+
+        async def call_with_qt(coro):
+            task = asyncio.create_task(coro)
+            while not task.done():
+                app.processEvents()
+                await asyncio.sleep(0.01)
+            return await task
+
+        with tempfile.TemporaryDirectory() as offline_root:
+            no_live_server, _ = build_mcp_server([offline_root], live_client=None)
+            async with Client(no_live_server) as client:
+                sessions = await client.call_tool("list_sessions", {})
+                self.assertFalse(sessions.structured_content["available"])
+                self.assertTrue(sessions.structured_content.get("reason"))
+                devices = await client.call_tool("document_action", {"action": "list_devices"})
+                self.assertFalse(devices.structured_content["available"])
+                self.assertTrue(devices.structured_content.get("reason"))
+
+        session = Session(isolated=True)
+        session.settings["python"] = sys.executable
+        bridge = create_qt_bridge(session, session.data)
+        session.agent_bridge = bridge
+
+        class QuietStudio(Studio):
+            def _refresh_theme(self):
+                self.system_dark = True
+
+        studio = QuietStudio(True, session)
+
+        def handle_native_request(raw):
+            request = json.loads(raw)
+            try:
+                if request["action"] == "flush_current":
+                    result = {"flushed": True}
+                elif request["action"] == "asset_action":
+                    result = studio._attach_tab_asset_native(request)
+                else:
+                    result = studio._agent_document_action(request)
+                bridge.complete(request["requestId"], result, window_id=studio.window_id)
+            except Exception as error:
+                bridge.complete(request["requestId"], None, str(error), window_id=studio.window_id)
+
+        studio.agentRequest.connect(handle_native_request)
+        try:
+            studio.setAgentAccessEnabled(True)
+            live_client = MultiSessionLiveClient(bridge.discovery_dir)
+            server, _ = build_mcp_server([], live_client=live_client)
+            async with Client(server) as client:
+                on_sessions = await call_with_qt(client.call_tool("list_sessions", {}))
+                self.assertTrue(on_sessions.structured_content["available"])
+                self.assertGreaterEqual(on_sessions.structured_content["count"], 1)
+
+                on_devices = await call_with_qt(client.call_tool("document_action", {"action": "list_devices"}))
+                self.assertTrue(on_devices.structured_content["available"])
+                self.assertTrue(on_devices.structured_content["devices"][0]["available"])
+
+                studio.setAgentAccessEnabled(False)
+                disabled_sessions = await call_with_qt(client.call_tool("list_sessions", {}))
+                self.assertFalse(disabled_sessions.structured_content["available"])
+                self.assertEqual(disabled_sessions.structured_content["count"], 0)
+                self.assertIn("Live Agent Access", disabled_sessions.structured_content["reason"])
+
+                disabled_devices = await call_with_qt(client.call_tool("document_action", {"action": "list_devices"}))
+                self.assertFalse(disabled_devices.structured_content["available"])
+                self.assertFalse(disabled_devices.structured_content["devices"][0]["available"])
+                self.assertEqual(disabled_devices.structured_content["count"], 0)
+                self.assertIn("Live Agent Access", disabled_devices.structured_content["reason"])
+
+                studio.setAgentAccessEnabled(True)
+                restored_sessions = await call_with_qt(client.call_tool("list_sessions", {}))
+                self.assertTrue(restored_sessions.structured_content["available"])
+                self.assertGreaterEqual(restored_sessions.structured_content["count"], 1)
+        finally:
+            from PySide6.QtCore import QEvent
+            studio.stop()
+            studio.pool.shutdown(wait=True, cancel_futures=True)
+            bridge.stop()
+            session.writes.shutdown(wait=True)
+            studio.deleteLater()
+            app.sendPostedEvents(None, QEvent.Type.DeferredDelete)
+            app.processEvents()
+            shutil.rmtree(session.data, ignore_errors=True)
+
+    async def test_empty_mcp_roots_delegate_live_smd_asset_bounds_to_studio_and_reject_outside_paths(self):
+        import asyncio
+        import base64
+        from mcp import Client
+        from PySide6.QtCore import QEvent
+        from PySide6.QtGui import QGuiApplication
+        from agent_live_client import MultiSessionLiveClient
+        from agent_live import create_qt_bridge
+        from documents import open_note, write_portable
+        from mcp_server import build_mcp_server
+        from studio import Session, Studio
+
+        app = QGuiApplication.instance() or QGuiApplication([])
+
+        class QuietStudio(Studio):
+            def _refresh_theme(self):
+                self.system_dark = True
+
+        async def call_with_qt(coro):
+            task = asyncio.create_task(coro)
+            while not task.done():
+                app.processEvents()
+                await asyncio.sleep(0.01)
+            return await task
+
+        with tempfile.TemporaryDirectory() as folder:
+            base = Path(folder)
+            note_dir = base / "note-folder"
+            outside_dir = base / "outside-folder"
+            note_dir.mkdir()
+            outside_dir.mkdir()
+            smd_path = note_dir / "study.smd"
+            markdown = "# Study note\n"
+            write_portable(smd_path, markdown, {})
+
+            first_svg = note_dir / "figure.svg"
+            first_svg.write_bytes(b"<svg xmlns='http://www.w3.org/2000/svg'><circle r='4'/></svg>")
+            replacement_svg = note_dir / "figure-v2.svg"
+            replacement_svg.write_bytes(b"<svg xmlns='http://www.w3.org/2000/svg'><rect width='8' height='8'/></svg>")
+            outside_svg = outside_dir / "secret.svg"
+            outside_svg.write_bytes(b"<svg xmlns='http://www.w3.org/2000/svg'><path d='M0 0'/></svg>")
+            if os.name == "posix":
+                escape_link = note_dir / "escape.svg"
+                escape_link.symlink_to(outside_svg)
+
+            session = Session(isolated=True)
+            session.settings["python"] = sys.executable
+            bridge = create_qt_bridge(session, session.data)
+            session.agent_bridge = bridge
+            studio = QuietStudio(True, session)
+            note = studio._note(smd_path.name, markdown, str(smd_path.resolve()), markdown, {}, True)
+            studio.tabs = [note]
+            studio.active = note["id"]
+            studio.mode = "live"
+
+            def handle_native_request(raw):
+                request = json.loads(raw)
+                try:
+                    if request["action"] == "flush_current":
+                        result = {"flushed": True}
+                    elif request["action"] == "asset_action":
+                        result = studio._attach_tab_asset_native(request)
+                    else:
+                        result = studio._agent_document_action(request)
+                    bridge.complete(request["requestId"], result, window_id=studio.window_id)
+                except Exception as error:
+                    bridge.complete(request["requestId"], None, str(error), window_id=studio.window_id)
+
+            studio.agentRequest.connect(handle_native_request)
+            try:
+                studio.setAgentAccessEnabled(True)
+
+                live_client = MultiSessionLiveClient(bridge.discovery_dir)
+                server, _ = build_mcp_server([], live_client=live_client)
+                async with Client(server) as client:
+                    sessions = await call_with_qt(client.call_tool("list_sessions", {}))
+                    smd_entry = next(item for item in sessions.structured_content["sessions"] if item.get("path") == str(smd_path.resolve()))
+                    target = smd_entry["target"]
+                    revision = smd_entry["revision"]
+
+                    closed_call = await call_with_qt(client.call_tool("document_inspect", {"path": str(smd_path)}))
+                    self.assertTrue(closed_call.is_error)
+
+                    outside_attach = await call_with_qt(client.call_tool("document_attach_asset", {
+                        "path": target,
+                        "asset_path": str(outside_svg),
+                        "expected_revision": revision,
+                    }))
+                    self.assertTrue(outside_attach.is_error)
+
+                    if os.name == "posix":
+                        symlink_attach = await call_with_qt(client.call_tool("document_attach_asset", {
+                            "path": target,
+                            "asset_path": str(escape_link),
+                            "expected_revision": revision,
+                        }))
+                        self.assertTrue(symlink_attach.is_error)
+
+                    attached = await call_with_qt(client.call_tool("document_attach_asset", {
+                        "path": target,
+                        "asset_path": str(first_svg),
+                        "expected_revision": revision,
+                        "name": "diagram.svg",
+                    }))
+                    self.assertFalse(attached.is_error, attached.content[0].text if attached.content else "")
+                    self.assertEqual(attached.structured_content["asset"]["name"], "assets/diagram.svg")
+
+                    outside_replace = await call_with_qt(client.call_tool("document_assets", {
+                        "path": target,
+                        "action": "replace",
+                        "asset_id": "assets/diagram.svg",
+                        "asset_path": str(outside_svg),
+                        "expected_revision": revision,
+                    }))
+                    self.assertTrue(outside_replace.is_error)
+
+                    replaced = await call_with_qt(client.call_tool("document_assets", {
+                        "path": target,
+                        "action": "replace",
+                        "asset_id": "assets/diagram.svg",
+                        "asset_path": str(replacement_svg),
+                        "expected_revision": revision,
+                    }))
+                    self.assertFalse(replaced.is_error, replaced.content[0].text if replaced.content else "")
+                    replacement_status = (replaced.structured_content if replaced.structured_content is not None
+                                          else json.loads(replaced.content[0].text))
+                    self.assertTrue(replacement_status["changed"])
+                    self.assertTrue(replacement_status["saved"])
+
+                _, saved_assets, _ = open_note(smd_path)
+                self.assertIn("assets/diagram.svg", saved_assets)
+                self.assertIn("rect width='8'", base64.b64decode(saved_assets["assets/diagram.svg"].split(",", 1)[1]).decode("utf-8"))
+            finally:
+                studio.stop()
+                studio.pool.shutdown(wait=True, cancel_futures=True)
+                bridge.stop()
+                session.writes.shutdown(wait=True)
+                studio.deleteLater()
+                app.sendPostedEvents(None, QEvent.Type.DeferredDelete)
+                app.processEvents()
+                shutil.rmtree(session.data, ignore_errors=True)
+
+    @unittest.skipUnless(os.name == "posix", "POSIX symlinks required for system alias simulation")
+    def test_validate_local_tab_asset_path_handles_system_temp_aliases_and_rejects_symlinks(self):
+        from studio import _validate_local_tab_asset_path
+
+        with tempfile.TemporaryDirectory() as folder:
+            base = Path(folder).resolve(strict=True)
+            canonical_var = base / "private" / "var"
+            note_dir = canonical_var / "folders" / "note-folder"
+            outside_dir = canonical_var / "folders" / "outside-folder"
+            note_dir.mkdir(parents=True)
+            outside_dir.mkdir(parents=True)
+
+            alias_var = base / "var"
+            alias_var.symlink_to(canonical_var)
+
+            canonical_note = note_dir / "study.smd"
+            canonical_note.write_text("# Study\n", encoding="utf-8")
+            figure = note_dir / "figure.svg"
+            figure.write_bytes(b"<svg xmlns='http://www.w3.org/2000/svg'/>")
+            outside_svg = outside_dir / "secret.svg"
+            outside_svg.write_bytes(b"<svg xmlns='http://www.w3.org/2000/svg'/>")
+            escape_svg = note_dir / "escape.svg"
+            escape_svg.symlink_to(outside_svg)
+
+            alias_figure = alias_var / "folders" / "note-folder" / "figure.svg"
+            alias_outside = alias_var / "folders" / "outside-folder" / "secret.svg"
+            alias_escape = alias_var / "folders" / "note-folder" / "escape.svg"
+            system_aliases = ((str(alias_var), str(canonical_var)),)
+
+            resolved = _validate_local_tab_asset_path(
+                str(alias_figure),
+                canonical_note,
+                [],
+                unavailable_message="unavailable",
+                outside_message="outside",
+                _system_aliases=system_aliases,
+            )
+            self.assertEqual(resolved, figure.resolve(strict=True))
+
+            with self.assertRaisesRegex(ValueError, "outside"):
+                _validate_local_tab_asset_path(
+                    str(alias_outside),
+                    canonical_note,
+                    [],
+                    unavailable_message="unavailable",
+                    outside_message="outside",
+                    _system_aliases=system_aliases,
+                )
+
+            with self.assertRaisesRegex(ValueError, "outside"):
+                _validate_local_tab_asset_path(
+                    str(alias_escape),
+                    canonical_note,
+                    [],
+                    unavailable_message="unavailable",
+                    outside_message="outside",
+                    _system_aliases=system_aliases,
+                )
+
+            with self.assertRaisesRegex(ValueError, "unavailable"):
+                _validate_local_tab_asset_path(
+                    str(alias_var / "folders" / "note-folder" / "missing.svg"),
+                    canonical_note,
+                    [],
+                    unavailable_message="unavailable",
+                    outside_message="outside",
+                    _system_aliases=system_aliases,
+                )
 
 
 if __name__ == "__main__":

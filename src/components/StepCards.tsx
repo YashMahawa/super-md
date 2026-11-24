@@ -1,4 +1,4 @@
-import {useEffect,useMemo,useRef,useState, type CSSProperties, type KeyboardEvent, type ReactNode} from "react";
+import {useEffect,useId,useLayoutEffect,useMemo,useRef,useState, type CSSProperties, type KeyboardEvent, type ReactNode} from "react";
 import {createPortal} from "react-dom";
 import {setReaderOverlay} from "../readerOverlays";
 import {zoomTranslation,type Point} from "../focalZoom";
@@ -53,8 +53,9 @@ function nearbySteps(target:number,count:number):Set<number> {
 }
 
 /** One diagram at a time; keyboard, buttons and native range slider. */
-export default function StepCards({source,renderImage,renderChart,renderMarkdown}:{source:string;renderImage:(src:string,alt:string)=>ReactNode;renderChart?:(source:string)=>ReactNode;renderMarkdown?:(source:string)=>ReactNode}) {
+export default function StepCards({source,renderImage,renderChart,renderMarkdown,sourceStart,sourceEnd}:{source:string;renderImage:(src:string,alt:string)=>ReactNode;renderChart?:(source:string)=>ReactNode;renderMarkdown?:(source:string)=>ReactNode;sourceStart?:number;sourceEnd?:number}) {
   const deck=useMemo(()=>parseStepDeck(source),[source]);
+  const deckInstanceId=useId();
   const count=deck?.steps.length??0;
   const [index,setIndex]=useState(()=>{const saved=stepIndices.get(source);return count&&saved!==undefined?Math.max(0,Math.min(saved,count-1)):0;});
   const hovered=useRef(false);
@@ -65,6 +66,7 @@ export default function StepCards({source,renderImage,renderChart,renderMarkdown
   const [expanded,setExpanded]=useState(false);
   const [placeholderHeight,setPlaceholderHeight]=useState(0);
   const openTimer=useRef(0);
+  const restoreFocusFrame=useRef(0);
   const skipRestoreFocus=useRef(false);
   const liveBlockRef=useRef<HTMLElement|null>(null);
   const expandedRef=useRef(expanded);expandedRef.current=expanded;
@@ -157,8 +159,10 @@ export default function StepCards({source,renderImage,renderChart,renderMarkdown
     window.addEventListener('supermd-live-edit-opened',onLiveOpen);
     return()=>{cancelOpen();node?.removeEventListener('supermd-step-expand',open);node?.removeEventListener('dblclick',cancelOpen);window.removeEventListener('supermd-live-edit-opened',onLiveOpen);};
   },[expanded]);
-  useEffect(()=>{
+  useEffect(()=>()=>{if(restoreFocusFrame.current)cancelAnimationFrame(restoreFocusFrame.current);},[]);
+  useLayoutEffect(()=>{
     if(!expanded)return;
+    if(restoreFocusFrame.current){cancelAnimationFrame(restoreFocusFrame.current);restoreFocusFrame.current=0;}
     setReaderOverlay('step-viewer',true);
     document.querySelector<HTMLButtonElement>('.step-viewer-close')?.focus();
     const key=(event:globalThis.KeyboardEvent)=>{
@@ -186,7 +190,7 @@ export default function StepCards({source,renderImage,renderChart,renderMarkdown
     document.addEventListener('keydown',key,true);
     window.addEventListener('supermd-image-zoom',native);window.addEventListener('supermd-image-reset',reset);
     surface?.addEventListener('wheel',wheel,{passive:false});surface?.addEventListener('supermd-canvas-pan',nativePan);
-    return()=>{document.removeEventListener('keydown',key,true);window.removeEventListener('supermd-image-zoom',native);window.removeEventListener('supermd-image-reset',reset);surface?.removeEventListener('wheel',wheel);surface?.removeEventListener('supermd-canvas-pan',nativePan);setReaderOverlay('step-viewer',false);if(skipRestoreFocus.current)skipRestoreFocus.current=false;else requestAnimationFrame(()=>region.current?.focus({preventScroll:true}));};
+    return()=>{document.removeEventListener('keydown',key,true);window.removeEventListener('supermd-image-zoom',native);window.removeEventListener('supermd-image-reset',reset);surface?.removeEventListener('wheel',wheel);surface?.removeEventListener('supermd-canvas-pan',nativePan);setReaderOverlay('step-viewer',false);if(skipRestoreFocus.current)skipRestoreFocus.current=false;else restoreFocusFrame.current=requestAnimationFrame(()=>{restoreFocusFrame.current=0;region.current?.focus({preventScroll:true});});};
   },[expanded]);
   useEffect(()=>{
     const key=(event:globalThis.KeyboardEvent)=>{
@@ -206,7 +210,7 @@ export default function StepCards({source,renderImage,renderChart,renderMarkdown
   const step=deck.steps[current];
   const hasVisual=Boolean(step.image||step.diagram||step.chart);
   const enlargeButton=!expanded?<button type="button" className="step-cards-enlarge" aria-label="Enlarge slide" onClick={enlarge}>⤢</button>:null;
-  const card=<section className={"step-cards"+(!step.markdown?" is-visual-only":"")+(!hasVisual?" has-no-visual":"")+(expanded?" is-expanded":"")} style={{...(fitWidth?{'--step-image-fit-width':`${fitWidth}px`}:{}),...(figureHeight?{'--step-figure-height':`${figureHeight}px`}:{}),'--step-viewer-transform':`translate(${pan.x}px,${pan.y}px) scale(${zoom/100})`} as CSSProperties} role="region" tabIndex={0} aria-label={deck.title+": interactive steps"} ref={region} onPointerEnter={()=>{hovered.current=true;}} onPointerLeave={()=>{hovered.current=false;}} onKeyDown={onKeyDown} data-step-count={count}>
+  const card=<section className={"step-cards"+(!step.markdown?" is-visual-only":"")+(!hasVisual?" has-no-visual":"")+(expanded?" is-expanded":"")} style={{...(fitWidth?{'--step-image-fit-width':`${fitWidth}px`}:{}),...(figureHeight?{'--step-figure-height':`${figureHeight}px`}:{}),'--step-viewer-transform':`translate(${pan.x}px,${pan.y}px) scale(${zoom/100})`} as CSSProperties} role="region" tabIndex={0} aria-label={deck.title+": interactive steps"} ref={region} onPointerEnter={()=>{hovered.current=true;}} onPointerLeave={()=>{hovered.current=false;}} onKeyDown={onKeyDown} data-step-deck-id={deckInstanceId} data-deck-title={deck.title} data-step-index={current} data-step-label={step.label} data-step-count={count} data-source-start={sourceStart} data-source-end={sourceEnd}>
     <div className="step-cards-layout">
     {!hasVisual&&enlargeButton}
     <div className={'step-cards-stage'+(expanded&&zoomableVisual?' image-viewer-canvas':'')} ref={figureRef} onClick={event=>{if(!expanded&&event.target instanceof Element&&event.target.closest('.step-cards-inline-figure svg')){const live=region.current?.closest('.live-block');if(!live){enlarge();return;}if(openTimer.current){window.clearTimeout(openTimer.current);openTimer.current=0;}if(event.detail>1)return;openTimer.current=window.setTimeout(()=>{openTimer.current=0;if(region.current?.isConnected&&!live.querySelector('textarea'))enlarge();},180);}}} onDoubleClick={()=>{if(expanded&&zoomableVisual)fit();}}
@@ -250,5 +254,5 @@ export default function StepCards({source,renderImage,renderChart,renderMarkdown
   </section>;
   const liveBlock=expanded?liveBlockRef.current:(region.current?.closest<HTMLElement>('.live-block')??null);
   const editSource=()=>{skipRestoreFocus.current=true;setExpanded(false);if(liveBlock?.isConnected)liveBlock.dispatchEvent(new CustomEvent('supermd-edit-block',{bubbles:true}));};
-  return expanded?<><div className="step-cards-placeholder" data-output-pinned="true" style={{height:placeholderHeight}}/>{createPortal(<div className="image-viewer step-viewer markdown-body" data-independent-zoom role="dialog" aria-modal="true" aria-label="Slide viewer"><div className="step-viewer-toolbar">{zoomableVisual&&<><output aria-label="Slide image zoom">{Math.round(zoom)}%</output><button type="button" aria-label="Fit slide image" onClick={fit}>Fit</button></>}{liveBlock?.isConnected&&<button type="button" onClick={editSource}>Edit source</button>}<button type="button" className="step-viewer-close" aria-label="Close slide viewer" onClick={()=>setExpanded(false)}>Close</button></div>{card}</div>,document.body)}</>:card;
+  return expanded?<><div className="step-cards-placeholder" data-output-pinned="true" style={{height:placeholderHeight}} data-step-deck-id={deckInstanceId} data-deck-title={deck.title} data-step-index={current} data-step-label={step.label} data-step-count={count} data-source-start={sourceStart} data-source-end={sourceEnd}/>{createPortal(<div className="image-viewer step-viewer markdown-body" data-independent-zoom role="dialog" aria-modal="true" aria-label="Slide viewer"><div className="step-viewer-toolbar">{zoomableVisual&&<><output aria-label="Slide image zoom">{Math.round(zoom)}%</output><button type="button" aria-label="Fit slide image" onClick={fit}>Fit</button></>}{liveBlock?.isConnected&&<button type="button" onClick={editSource}>Edit source</button>}<button type="button" className="step-viewer-close" aria-label="Close slide viewer" onClick={()=>setExpanded(false)}>Close</button></div>{card}</div>,document.body)}</>:card;
 }

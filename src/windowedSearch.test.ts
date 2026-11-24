@@ -2,7 +2,7 @@
 import {afterEach,expect,it,vi} from 'vitest';
 import {commitWindowedLayout,captureWindowedScrollAnchor,rememberWindowedScrollSource} from './windowedSearch';
 import {markScrollInput} from './scrollAnchor';
-afterEach(()=>{document.body.replaceChildren();vi.restoreAllMocks();Reflect.deleteProperty(Range.prototype,'getBoundingClientRect');Reflect.deleteProperty(document,'caretRangeFromPoint');});
+afterEach(()=>{document.body.replaceChildren();vi.restoreAllMocks();Reflect.deleteProperty(Range.prototype,'getBoundingClientRect');Reflect.deleteProperty(document,'caretPositionFromPoint');Reflect.deleteProperty(document,'caretRangeFromPoint');});
 function fixture(placeholder=false){
   const root=document.createElement('main');root.className='android-reading';root.scrollTop=700;
   const before=document.createElement('section'),anchor=document.createElement('section');
@@ -79,4 +79,20 @@ it('clears the retained source when a document is replaced',()=>{
   vi.mocked(document.elementFromPoint).mockReturnValue(earlier);
   vi.spyOn(earlier,'getBoundingClientRect').mockReturnValue(new DOMRect(0,50,800,50));
   const restore=captureWindowedScrollAnchor(root);grow();restore();expect(root.scrollTop).toBe(620);
+});
+it.each([-80,80])('keeps surviving text via standard caretPositionFromPoint after a %ipx input without calling caretRangeFromPoint',delta=>{
+  const {root,anchor,grow}=fixture(),text=document.createTextNode('Surviving standard caret text');anchor.append(text);
+  Object.defineProperty(Range.prototype,'getBoundingClientRect',{configurable:true,value:()=>anchor.getBoundingClientRect()});
+  const legacySpy=vi.fn();
+  Object.defineProperty(document,'caretPositionFromPoint',{configurable:true,value:vi.fn(()=>({offsetNode:text,offset:0,getClientRect:()=>null}))});
+  Object.defineProperty(document,'caretRangeFromPoint',{configurable:true,value:legacySpy});
+  markScrollInput();rememberWindowedScrollSource(root,delta);
+  expect(legacySpy).not.toHaveBeenCalled();
+  root.scrollTop+=delta;
+  const top=anchor.getBoundingClientRect().top;
+  const earlier=anchor.previousElementSibling as HTMLElement;
+  vi.mocked(document.elementFromPoint).mockReturnValue(earlier);
+  vi.spyOn(earlier,'getBoundingClientRect').mockReturnValue(new DOMRect(0,50,800,50));
+  const restore=captureWindowedScrollAnchor(root,earlier);grow();restore();
+  expect(root.scrollTop).toBe(1000+delta);expect(anchor.getBoundingClientRect().top).toBe(top);
 });
