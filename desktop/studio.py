@@ -5,6 +5,7 @@ import concurrent.futures
 import copy
 import hashlib
 import http.client
+import io
 import json
 import ipaddress
 import math
@@ -24,6 +25,7 @@ import time
 import urllib.parse
 import urllib.request
 import uuid
+import zipfile
 from pathlib import Path
 from network_tls import client_context
 from PySide6.QtCore import QObject, Property, Signal, Slot, QStandardPaths, QTimer, QUrl, QFileSystemWatcher, QProcess, Qt, QPointF, QRect, QMetaObject, QBuffer, QByteArray, QIODevice
@@ -60,7 +62,31 @@ DEFAULTS.update(latexAutofix=False, typewriterScroll=False)
 DEFAULTS.update(shortcuts=default_shortcuts())
 DEFAULTS.update(agentAccessEnabled=False, cloudAgentEnabled=False)
 
-def agent_mcp_setup_config(discovery_dir, *, executable=None, frozen=None, platform=None, cli_script=None):
+def _normalize_mcp_roots(roots) -> list[str]:
+    if not roots:
+        return []
+    normalized: list[str] = []
+    seen: set[str] = set()
+    for candidate in roots:
+        if candidate is None:
+            continue
+        raw = str(candidate).strip()
+        if not raw or "\0" in raw:
+            continue
+        try:
+            resolved = Path(raw).expanduser().resolve(strict=True)
+        except (OSError, RuntimeError, ValueError):
+            continue
+        if not resolved.is_dir():
+            continue
+        key = str(resolved)
+        if key not in seen:
+            seen.add(key)
+            normalized.append(key)
+    return normalized
+
+
+def agent_mcp_setup_config(discovery_dir, *, roots=None, executable=None, frozen=None, platform=None, cli_script=None):
     """Return a directly executable, absolute MCP stdio command for this install."""
     frozen = getattr(sys, "frozen", False) if frozen is None else bool(frozen)
     # Resolving a source venv's Python symlink would bypass that environment
@@ -89,8 +115,142 @@ def agent_mcp_setup_config(discovery_dir, *, executable=None, frozen=None, platf
         script = Path(cli_script or Path(__file__).with_name("agent_cli.py")).expanduser().resolve()
         command = str(executable_path)
         args = [str(script), "mcp"]
+    for root_path in _normalize_mcp_roots(roots):
+        args.extend(["--root", root_path])
     args.extend(["--live-sessions-dir", str(Path(discovery_dir).expanduser().resolve()), "--transport", "stdio"])
     return {"command": command, "args": args}
+
+
+_REQUIRED_SKILL_PACKAGE_FILES = (
+    "SKILL.md",
+    "references/study-notes.md",
+    "references/visual-authoring.md",
+    "references/agent-connection.md",
+    "assets/study-visual-example.svg",
+)
+
+
+def _bundle_agent_skill_markdown(skill_dir: Path) -> str:
+    router = (skill_dir / "SKILL.md").read_text(encoding="utf-8").rstrip()
+    router = (router
+              .replace("(references/study-notes.md)", "(#exam-ready-study-notes)")
+              .replace("(references/visual-authoring.md)", "(#diagram-and-interaction-guide)")
+              .replace("(references/agent-connection.md)", "(#agent-connection)"))
+    study_notes = (skill_dir / "references" / "study-notes.md").read_text(encoding="utf-8").strip()
+    visual_authoring = (skill_dir / "references" / "visual-authoring.md").read_text(encoding="utf-8").strip()
+    connection = (skill_dir / "references" / "agent-connection.md").read_text(encoding="utf-8").strip()
+    return (f"{router}\n\n{study_notes}\n\n{visual_authoring}\n\n"
+            f"# Agent connection\n\n{connection}\n")
+
+
+def _build_agent_skill_zip_bytes(root_dir: Path) -> bytes:
+    dist_zip = root_dir / "dist" / "super-md-skill.zip"
+    if dist_zip.is_file():
+        raw = dist_zip.read_bytes()
+        with zipfile.ZipFile(io.BytesIO(raw), "r") as archive:
+            names = set(archive.namelist())
+            if any(name.endswith("/local-preferences.md") or name == "local-preferences.md" for name in names):
+                raise ValueError("Skill archive must not contain local-preferences.md")
+            if all(f"super-md/{rel}" in names for rel in _REQUIRED_SKILL_PACKAGE_FILES):
+                return raw
+    if getattr(sys, "frozen", False):
+        raise FileNotFoundError("Bundled super-md-skill.zip is missing from this installation")
+    source_dir = root_dir / "dist" / "super-md-skill"
+    if not source_dir.is_dir():
+        source_dir = root_dir / "docs" / "skills" / "super-md"
+    for rel in _REQUIRED_SKILL_PACKAGE_FILES:
+        if not (source_dir / rel).is_file():
+            raise FileNotFoundError(f"Missing required skill file: {rel}")
+    buffer = io.BytesIO()
+    with zipfile.ZipFile(buffer, "w", compression=zipfile.ZIP_STORED) as archive:
+        for file_path in sorted(source_dir.rglob("*")):
+            rel_parts = file_path.relative_to(source_dir).parts
+            if any(part.startswith(".") or part == "local-preferences.md" for part in rel_parts):
+                continue
+            if file_path.is_file() and not file_path.is_symlink():
+                info = zipfile.ZipInfo("super-md/" + "/".join(rel_parts))
+                info.date_time = (1980, 1, 1, 0, 0, 0)
+                info.compress_type = zipfile.ZIP_STORED
+                archive.writestr(info, file_path.read_bytes())
+    return buffer.getvalue()
+
+
+_SYSTEM_PATH_ALIASES: tuple[tuple[str, str], ...] = (
+    (("/var", "/private/var"), ("/tmp", "/private/tmp"), ("/etc", "/private/etc"))
+    if sys.platform == "darwin"
+    else ()
+)
+
+
+def _validate_local_tab_asset_path(raw_path, note_path: Path, extra_roots: list[Path], *,
+                                   unavailable_message: str, outside_message: str,
+                                   _system_aliases: tuple[tuple[str, str], ...] | None = None) -> Path:
+    if not isinstance(raw_path, str) or not 1 <= len(raw_path.strip()) <= 4096 or "\0" in raw_path:
+        raise ValueError(unavailable_message)
+    candidate = Path(raw_path).expanduser()
+    if not candidate.is_absolute():
+        candidate = note_path.parent / candidate
+    absolute = Path(os.path.abspath(candidate))
+
+    # On macOS /var and /tmp are system-provided symlinks into /private. Rewrite
+    # those known aliases before walking path components so temp-folder paths
+    # work when tab["path"] was resolved, while still rejecting symlinks inside
+    # user folders.
+    system_aliases = _SYSTEM_PATH_ALIASES if _system_aliases is None else _system_aliases
+    for raw_alias, raw_canonical in system_aliases:
+        alias = Path(raw_alias)
+        canonical = Path(raw_canonical)
+        try:
+            if (alias.is_symlink() and alias.resolve(strict=True) == canonical.resolve(strict=True)
+                    and (absolute == alias or alias in absolute.parents)):
+                absolute = canonical / absolute.relative_to(alias)
+                break
+        except (OSError, RuntimeError):
+            continue
+
+    canonical_roots: list[Path] = []
+    root_aliases: list[tuple[Path, Path]] = []
+    for root in (note_path.parent, *extra_roots):
+        if not root:
+            continue
+        try:
+            supplied_root = Path(os.path.abspath(Path(root).expanduser()))
+            canonical_root = supplied_root.resolve(strict=True)
+        except (OSError, RuntimeError):
+            continue
+        if not canonical_root.is_dir():
+            continue
+        if canonical_root not in canonical_roots:
+            canonical_roots.append(canonical_root)
+        if supplied_root != canonical_root:
+            pair = (supplied_root, canonical_root)
+            if pair not in root_aliases:
+                root_aliases.append(pair)
+    root_aliases.sort(key=lambda item: len(item[0].parts), reverse=True)
+
+    for supplied_root, canonical_root in root_aliases:
+        if absolute == supplied_root or supplied_root in absolute.parents:
+            absolute = canonical_root / absolute.relative_to(supplied_root)
+            break
+
+    current = Path(absolute.anchor)
+    for part in absolute.parts[1:]:
+        current = current / part
+        try:
+            if current.is_symlink() or (hasattr(os.path, "isjunction") and os.path.isjunction(current)):
+                raise ValueError(outside_message)
+        except OSError as error:
+            raise ValueError(unavailable_message) from error
+
+    try:
+        resolved = absolute.resolve(strict=True)
+    except (OSError, RuntimeError) as error:
+        raise ValueError(unavailable_message) from error
+    if not resolved.is_file():
+        raise ValueError(outside_message)
+    if any(resolved == canonical_root or canonical_root in resolved.parents for canonical_root in canonical_roots):
+        return resolved
+    raise ValueError(outside_message)
 
 SAMPLE = """# A place to think\n\nWrite in Markdown. Read without distractions.\n\n> [!tip] Start with your notes\n> Open any note or folder. No vault, no import process.\n\n## Learn by exploring\n\n$$E = mc^2$$\n\n> [!answer]- Why does this matter?\n> Tap the heading to reveal an answer, then hide it to test yourself.\n\n```smd-chart\n{\"title\":\"A changing wave\",\"series\":[{\"name\":\"Sine\",\"expression\":\"sin(a*x)\",\"color\":\"#386a57\"},{\"name\":\"Cosine\",\"expression\":\"cos(a*x)\",\"color\":\"#bc6750\"}],\"sliders\":[{\"name\":\"a\",\"min\":0.2,\"max\":3,\"value\":1}]}\n```\n\n## Matplotlib in three dimensions\n\nRun a Python cell to generate a 3D figure, then save it in your note or PDF.\n\n```python\nimport numpy as np\nimport matplotlib.pyplot as plt\nx, y = np.meshgrid(np.linspace(-2, 2, 32), np.linspace(-2, 2, 32))\nfig = plt.figure()\nax = fig.add_subplot(111, projection=\"3d\")\nax.plot_surface(x, y, x*x + y*y, cmap=\"viridis\")\n```\n\n[Back to exploring](#learn-by-exploring)\n"""
 
@@ -213,9 +373,9 @@ class Session(QObject):
             self.pinned = list(dict.fromkeys(p for p in stored.get("pinned",[]) if isinstance(p,str)))[:10]
             self.recent = list(dict.fromkeys(self.pinned + [p for p in stored.get("recent",[]) if isinstance(p,str)]))[:10]
         except (OSError,ValueError,KeyError,TypeError,AttributeError): pass
-        # Local MCP access remains session-only. Cloud relay reconnection is
-        # an explicit, persisted opt-in made through its connect switch.
-        self.settings["agentAccessEnabled"] = False
+        # Local MCP access and cloud relay reconnection are explicit, persisted
+        # opt-ins; each desktop launch mints a fresh temporary loopback token.
+        self.settings["agentAccessEnabled"] = self.settings.get("agentAccessEnabled") is True
         self.settings["cloudAgentEnabled"] = self.settings.get("cloudAgentEnabled") is True
         shortcuts, _ = normalize_shortcuts(self.settings.get("shortcuts"))
         self.settings["shortcuts"] = shortcuts or default_shortcuts()
@@ -771,6 +931,10 @@ class Studio(QObject):
         self.autosave_timer.stop()
         self.flush_timer.stop()
         self.external_timer.stop()
+        for watcher in (self.note_watcher, self.palette_watcher, self.custom_theme_watcher):
+            watched = watcher.files() + watcher.directories()
+            if watched:
+                watcher.removePaths(watched)
         self._recover()
         self.session.reader_assets.revoke_owner(self.window_id)
         self._retired = True
@@ -799,14 +963,38 @@ class Studio(QObject):
             return self._agent_error
         if not bridge or not bridge.enabled:
             return "Off · no live tabs are exposed"
-        return "On for this app session · loopback only"
+        return "On · loopback only (fresh token each launch)"
+
+    def _agent_mcp_roots(self) -> list[str]:
+        windows = [self]
+        if hasattr(self, "session") and hasattr(self.session, "windows"):
+            windows.extend(window for window in self.session.windows.values()
+                           if window is not self and not getattr(window, "retired", False))
+        candidates: list[str | Path] = []
+        for window in windows:
+            folder = getattr(window, "folder", "")
+            if folder:
+                candidates.append(folder)
+        location = self.settings.get("newNoteLocation") if isinstance(getattr(self, "settings", None), dict) else None
+        if location:
+            candidates.append(location)
+        for window in windows:
+            for tab in getattr(window, "tabs", ()):
+                tab_path = tab.get("path") if isinstance(tab, dict) else None
+                if isinstance(tab_path, str) and tab_path:
+                    candidates.append(Path(tab_path).parent)
+        return _normalize_mcp_roots(candidates)
 
     @Property(str, notify=changed)
     def agentSetupInstructions(self):
         bridge = getattr(self.session, "agent_bridge", None)
         if not bridge or not bridge.enabled:
             return "Enable live agent access to prepare the local MCP server configuration."
-        return json.dumps(agent_mcp_setup_config(bridge.discovery_dir), ensure_ascii=False, indent=2)
+        return json.dumps(
+            agent_mcp_setup_config(bridge.discovery_dir, roots=self._agent_mcp_roots()),
+            ensure_ascii=False,
+            indent=2,
+        )
 
     @Property(str, notify=changed)
     def agentAccessTabsSummary(self):
@@ -1096,7 +1284,14 @@ class Studio(QObject):
 
     @Slot()
     def copyAgentSetupInstructions(self):
+        if not self.agentAccessEnabled:
+            self._agent_error = "Enable live agent access before copying its MCP configuration."
+            self._emit(False)
+            return
         QGuiApplication.clipboard().setText(self.agentSetupInstructions)
+        self._agent_error = ""
+        self.message = "MCP server configuration copied to clipboard"
+        self._emit(False)
 
     @Slot(str)
     def saveAgentSetupInstructions(self, destination):
@@ -1109,13 +1304,12 @@ class Studio(QObject):
             if path.suffix.casefold() != ".md":
                 path = path.with_suffix(".md")
             skill_path = ROOT / "dist" / "super-md-agent-SKILL.md"
-            if not skill_path.is_file() and not getattr(sys, "frozen", False):
-                skill_path = ROOT / "docs" / "skills" / "super-md" / "SKILL.md"
-            skill = skill_path.read_text(encoding="utf-8")
-            if skill_path.parent.name == "super-md":
-                # The source-tree router needs its connection reference flattened
-                # into this standalone private setup export.
-                skill += "\n\n" + (skill_path.parent / "references" / "agent-connection.md").read_text(encoding="utf-8")
+            if skill_path.is_file():
+                skill = skill_path.read_text(encoding="utf-8").rstrip()
+            elif not getattr(sys, "frozen", False):
+                skill = _bundle_agent_skill_markdown(ROOT / "docs" / "skills" / "super-md").rstrip()
+            else:
+                raise FileNotFoundError("Bundled super-md-agent-SKILL.md is missing")
             guide = (skill + "\n\n# Connection for this installation\n\n"
                      "This local MCP server can inspect and revise tabs that are open in this Super MD app session. "
                      "It runs over stdio and reads the private, temporary discovery directory shown below.\n\n"
@@ -1134,6 +1328,23 @@ class Studio(QObject):
         except (OSError, ValueError, TypeError) as error:
             self._agent_error = f"Could not save setup guide ({type(error).__name__})."
             self._emit(False)
+
+    @Slot(str, result=bool)
+    def exportAgentSkill(self, destination):
+        try:
+            path = local_path(destination)
+            if path.suffix.casefold() != ".zip":
+                path = path.with_suffix(".zip")
+            raw = _build_agent_skill_zip_bytes(ROOT)
+            atomic_write(path, raw)
+            self._agent_error = ""
+            self.message = f"Skill package saved to {path}"
+            self._emit(False)
+            return True
+        except (OSError, ValueError, TypeError, zipfile.BadZipFile) as error:
+            self._agent_error = f"Could not save skill package ({type(error).__name__})."
+            self._emit(False)
+            return False
 
     @Property(bool,notify=changed)
     def readerFullscreen(self):return self.fullscreen
@@ -2771,21 +2982,19 @@ class Studio(QObject):
                 raise ValueError("Relay supplied assets are limited to 1 MiB")
             requested_name = args.get("assetName")
         else:
-            roots = [path.parent]
-            if self.folder:
-                roots.append(Path(self.folder))
-            location = self.settings.get("newNoteLocation")
+            extra_roots: list[Path] = []
+            if getattr(self, "folder", ""):
+                extra_roots.append(Path(self.folder))
+            location = self.settings.get("newNoteLocation") if isinstance(getattr(self, "settings", None), dict) else None
             if location:
-                roots.append(Path(location))
-            candidate = Path(asset_path).expanduser()
-            try:
-                candidate = candidate.resolve(strict=True)
-            except OSError as error:
-                raise ValueError("Asset file is unavailable") from error
-            if (not candidate.is_file()
-                    or not any(candidate == root.resolve() or root.resolve() in candidate.parents
-                               for root in roots if root.exists())):
-                raise ValueError("Asset must be inside the current note folder or a configured folder")
+                extra_roots.append(Path(location))
+            candidate = _validate_local_tab_asset_path(
+                asset_path,
+                path,
+                extra_roots,
+                unavailable_message="Asset file is unavailable",
+                outside_message="Asset must be inside the current note folder or a configured folder",
+            )
             if candidate.stat().st_size > MAX_IMAGE:
                 raise ValueError("Asset exceeds 25 MB")
             extension = candidate.suffix.lower().lstrip(".")
@@ -2894,19 +3103,19 @@ class Studio(QObject):
             if hashlib.sha256(name.encode("utf-8")).hexdigest() == asset_id), None)
         if not asset_name:
             raise ValueError("Asset ID is not present in the current note")
-        roots = [path.parent]
-        if self.folder:
-            roots.append(Path(self.folder))
-        location = self.settings.get("newNoteLocation")
+        extra_roots: list[Path] = []
+        if getattr(self, "folder", ""):
+            extra_roots.append(Path(self.folder))
+        location = self.settings.get("newNoteLocation") if isinstance(getattr(self, "settings", None), dict) else None
         if location:
-            roots.append(Path(location))
-        candidate = Path(asset_path_value).expanduser()
-        try:
-            candidate = candidate.resolve(strict=True)
-        except OSError as error:
-            raise ValueError("Replacement asset file is unavailable") from error
-        if not candidate.is_file() or not any(candidate == root.resolve() or root.resolve() in candidate.parents for root in roots if root.exists()):
-            raise ValueError("Replacement asset must be inside the current note folder or a configured folder")
+            extra_roots.append(Path(location))
+        candidate = _validate_local_tab_asset_path(
+            asset_path_value,
+            path,
+            extra_roots,
+            unavailable_message="Replacement asset file is unavailable",
+            outside_message="Replacement asset must be inside the current note folder or a configured folder",
+        )
         if candidate.stat().st_size > MAX_IMAGE:
             raise ValueError("Replacement asset exceeds 25 MB")
         extension = candidate.suffix.lower().lstrip(".")
@@ -2927,7 +3136,8 @@ class Studio(QObject):
         if old_mime != mime:
             raise ValueError("Stored asset MIME type does not match its extension")
         if old_data == raw:
-            return {"tabId": tab_id, "assetName": asset_name, "revision": current, "changed": False}
+            return {"tabId": tab_id, "assetName": asset_name, "asset": asset_name, "assetId": asset_name,
+                    "revision": current, "changed": False, "saved": False}
         updated = dict(assets)
         updated[asset_name] = f"data:{mime};base64," + base64.b64encode(raw).decode("ascii")
         disk_content, disk_assets, disk_portable = open_note(path)
@@ -2942,8 +3152,8 @@ class Studio(QObject):
         self.session.reader_assets.revoke_tab(self.window_id, tab_id)
         self.readerCall.emit("window.dispatchEvent(new Event('supermd-assets-changed'))")
         self._recover(); self._emit()
-        return {"tabId": tab_id, "assetName": asset_name, "revision": current, "changed": True,
-                "bytes": len(raw), "mimeType": mime}
+        return {"tabId": tab_id, "assetName": asset_name, "asset": asset_name, "assetId": asset_name,
+                "revision": current, "changed": True, "saved": True, "bytes": len(raw), "mimeType": mime}
 
     def _agent_viewport_pending(self, request_id, tab_id):
         bridge = getattr(self.session, "agent_bridge", None)
