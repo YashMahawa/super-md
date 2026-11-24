@@ -114,7 +114,7 @@ export default function InteractiveChart({source,dark=false,appearance,colors:th
     return {x:px(found.x),y:py(found.y),coordinates:[found.x,found.y],label:labels[found.series],color:colors[found.series],guide};
   };
   const moved=plot.zoom!==1||plot.center.x!==0||plot.center.y!==0;
-  return <figure ref={plot.host} className="interactive-chart" data-plot-zoom={plot.zoom} data-center-x={plot.center.x} data-center-y={plot.center.y}>
+  return <figure ref={plot.host} className="interactive-chart" data-plot-zoom={plot.zoom} data-center-x={plot.center.x} data-center-y={plot.center.y} onDoubleClick={moved?event=>{if(!(event.target as Element).closest('button,input')){event.stopPropagation();plot.reset();}}:undefined}>
     {spec.title && <figcaption>{spec.title}</figcaption>}
     <div className="chart-toolbar">
       <div className="chart-legend" role="list" aria-label="Equations">{spec.series.map((series,index)=><span role="listitem" key={index} style={{"--series-color":colors[index]} as CSSProperties}><i aria-hidden="true"/>{labels[index]}{series.name&&series.expression?<small>y = {series.expression.replace(/\bMath\./g,"")}</small>:null}</span>)}</div>
@@ -124,7 +124,7 @@ export default function InteractiveChart({source,dark=false,appearance,colors:th
         <button type="button" aria-pressed={grid} title="Grid" onClick={()=>{remember(chartGrids,source,!grid);setGrid(!grid);}}>Grid</button>
       </div>
     </div>
-    <div data-independent-zoom onDoubleClick={moved?plot.reset:undefined}>
+    <div data-independent-zoom>
       <svg ref={svgRef} viewBox={`0 0 ${width} ${height}`} data-media-kind="diagram" data-media-adapted={appearance==='auto'||appearance==='monochrome'?'true':undefined} data-plot-left={left} role="img" aria-label={spec.title||`Graph of ${labels.join(", ")}`}>
         <defs><clipPath id={clipId}><rect x={left} y={top} width={plotWidth} height={plotHeight}/></clipPath></defs>
         {axisTicks(xMin,xMax,Math.max(2,Math.min(8,Math.floor(plotWidth/90)))).map(x=><g key={`x${x}`}>{grid && <line className="chart-grid" x1={px(x)} x2={px(x)} y1={top} y2={height-bottom}/>}<text className="chart-tick" x={px(x)} y={height-bottom+20} textAnchor="middle">{axisNumber(x)}</text></g>)}
