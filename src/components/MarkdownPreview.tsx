@@ -20,7 +20,7 @@ import {svgDataBackdrop} from '../svgImage';
 import {adaptSvgData} from '../svgTheme';
 import {analyzeDocument} from '../documentAnalysis';
 import type {SourceDocumentAnalysis} from '../documentAnalysis';
-import {resolveReaderRasterAsset} from '../readerAssets';
+import {isSvgAssetPath,resolveReaderRasterAsset} from '../readerAssets';
 import {commitMediaLayout} from '../mediaLayout';
 import {registerMedia,installMediaMenu} from '../mediaExport';
 import type {ReaderAccessibilityPreference} from '../types';
@@ -99,7 +99,7 @@ export const DIAGRAM_PLAIN_TEXT_LANGUAGES = ["svg", "mermaid", "smd-tree", "smd-
 export const PREVIEW_REMARK_PLUGINS: PluggableList = [remarkCallouts, remarkHeadingIds, remarkTaskPositions, remarkSourcePositions];
 export const PREVIEW_REHYPE_PLUGINS: PluggableList = [rehypeKatex, [rehypeHighlight, { plainText: [...DIAGRAM_PLAIN_TEXT_LANGUAGES] }]];
 
-function AssetImage({ src = "", alt = "", documentPath, trustedImageHosts, onTrustImageHost }: { src?: string; alt?: string; documentPath: string | null; trustedImageHosts: string[]; onTrustImageHost?: (host: string) => void }) {
+function AssetImage({ src = "", alt = "", documentPath, trustedImageHosts, onTrustImageHost, editable = false }: { src?: string; alt?: string; documentPath: string | null; trustedImageHosts: string[]; onTrustImageHost?: (host: string) => void; editable?: boolean }) {
   const isRemote = /^https?:\/\//i.test(src);
   const embedded = /^(data:|blob:)/i.test(src);
   let host = "";
@@ -110,7 +110,6 @@ function AssetImage({ src = "", alt = "", documentPath, trustedImageHosts, onTru
   const [allowedOnceSource, setAllowedOnceSource] = useState<string | null>(null);
   const [resolved, setResolved] = useState(embedded ? src : "");
   const [error, setError] = useState("");
-  const [selected, setSelected] = useState(false);
   const mediaElement=useRef<HTMLSpanElement>(null);
   const imageElement=useRef<HTMLImageElement>(null);
   const [sizedSource,setSizedSource]=useState('');
@@ -156,7 +155,7 @@ function AssetImage({ src = "", alt = "", documentPath, trustedImageHosts, onTru
     if (!documentPath && !/^assets\/import-[\w-]+\./.test(src)) { queueMicrotask(()=>fail("Save this document to resolve relative images.")); return ()=>{active=false;}; }
     (async () => {
       try {
-        const streamed = documentPath ? await resolveReaderRasterAsset(documentPath, src) : null;
+        const streamed = documentPath && !isSvgAssetPath(src) ? await resolveReaderRasterAsset(documentPath, src) : null;
         if (!active) return;
         if (streamed) { commitMediaLayout(mediaElement.current,()=>setResolved(streamed)); return; }
         const value = await invoke<string>("load_asset", { documentPath: documentPath || "", source: src });
@@ -172,14 +171,14 @@ function AssetImage({ src = "", alt = "", documentPath, trustedImageHosts, onTru
     const svg=resolved.startsWith('data:image/svg+xml');
     return registerMedia(imageElement.current,{label:alt||'Image',uri:()=>resolved,...(svg?{svg:()=>{const comma=resolved.indexOf(',');return resolved.slice(0,comma).includes(';base64')?new TextDecoder().decode(Uint8Array.from(atob(resolved.slice(comma+1)),value=>value.charCodeAt(0))):decodeURIComponent(resolved.slice(comma+1));}}:{})});
   },[resolved,error,isRemote,allowed,alt]);
-  if (isRemote && !allowed) return <span ref={mediaElement} className="remote-image-card" role="group" aria-label={`Remote image from ${host}`}><span><strong>{alt || "Remote image"}</strong><small>{host} · blocked until you choose to load it</small></span><span className="remote-image-actions"><button onClick={() => setAllowedOnceSource(src)}>Load image</button>{onTrustImageHost && <button onClick={() => onTrustImageHost(host)}>Trust domain</button>}</span></span>;
-  if (error) return <span ref={mediaElement} className="image-error" role="img" aria-label={alt || "Image unavailable"}>Image unavailable: {alt || src}<small>{error}</small></span>;
+  const readonlyAttr = editable ? undefined : "true";
+  if (isRemote && !allowed) return <span ref={mediaElement} className="remote-image-card" data-note-image-source={src} data-note-image-readonly={readonlyAttr} role="group" aria-label={`Remote image from ${host}`}><span><strong>{alt || "Remote image"}</strong><small>{host} · blocked until you choose to load it</small></span><span className="remote-image-actions"><button type="button" onClick={() => setAllowedOnceSource(src)}>Load image</button>{onTrustImageHost && <button type="button" onClick={() => onTrustImageHost(host)}>Trust domain</button>}</span></span>;
+  if (error) return <span ref={mediaElement} className="image-error" data-note-image-source={src} data-note-image-readonly={readonlyAttr} role={editable ? "group" : "img"} aria-label={alt || "Image unavailable"}><span>Image unavailable: {alt || src}<small>{error}</small></span>{editable && <span className="image-error-actions"><button type="button" onClick={(event) => { event.stopPropagation(); window.dispatchEvent(new CustomEvent("supermd-image-edit", { detail: { action: "replace", image: event.currentTarget.closest("[data-note-image-source]") } })); }}>Replace</button><button type="button" onClick={(event) => { event.stopPropagation(); window.dispatchEvent(new CustomEvent("supermd-image-edit", { detail: { action: "remove", image: event.currentTarget.closest("[data-note-image-source]") } })); }}>Remove</button></span>}</span>;
   if (!resolved) return <span ref={mediaElement} className="image-loading" role="status">Loading image…</span>;
   const sizing=sizedSource!==resolved;
-  return <span ref={mediaElement} className={`note-image ${resolved.startsWith('data:image/svg+xml')?'note-image--diagram':''} ${sizing?'image-loading':''} ${selected ? "is-selected" : ""}`} style={sizing?{width:'100%',boxSizing:'border-box'}:undefined} data-note-image-source={src} tabIndex={0} aria-label={`Image: ${alt || "Image"}`} onBlur={(event) => { if (!event.currentTarget.contains(event.relatedTarget)) setSelected(false); }} onContextMenu={(event) => { event.preventDefault(); event.stopPropagation(); setSelected(true); event.currentTarget.focus(); }} onKeyDown={(event) => { if (event.key === "Escape") { setSelected(false); event.stopPropagation(); } }}>
+  return <span ref={mediaElement} className={`note-image ${resolved.startsWith('data:image/svg+xml')?'note-image--diagram':''} ${sizing?'image-loading':''}`} style={sizing?{width:'100%',boxSizing:'border-box'}:undefined} data-note-image-source={src} data-note-image-readonly={readonlyAttr} tabIndex={0} aria-label={`Image: ${alt || "Image"}`}>
     {sizing&&<span role="status">Loading image…</span>}
     <img ref={imageElement} draggable={false} data-media-adapted={adaptsSvg&&svgBacking?'true':undefined} data-media-kind={resolved.startsWith('data:image/svg+xml')?'svg':'image'} data-light-ink={svgBacking==='#222026'?'true':undefined} style={{...(svgBacking?{'--svg-contrast-backing':svgBacking}:{}),...(sizing?{position:'absolute',height:0,visibility:'hidden'}:{})} as React.CSSProperties} src={adaptedSource} alt={alt} loading="lazy" decoding="async" onLoad={()=>{if(sizedSource!==resolved)commitMediaLayout(imageElement.current,()=>setSizedSource(resolved));}} onError={() => commitMediaLayout(imageElement.current,()=>setError("The image could not be decoded or loaded."))} />
-    {selected && <span className="image-edit-tools" role="toolbar" aria-label="Selected image"><button onClick={(event) => { event.stopPropagation(); window.dispatchEvent(new CustomEvent("supermd-image-edit", { detail: { action: "replace", image: event.currentTarget.closest("[data-note-image-source]") } })); }}>Replace</button><button onClick={(event) => { event.stopPropagation(); window.dispatchEvent(new CustomEvent("supermd-image-edit", { detail: { action: "remove", image: event.currentTarget.closest("[data-note-image-source]") } })); }}>Remove</button></span>}
   </span>;
 }
 
@@ -199,7 +198,8 @@ function MarkdownPreview({ markdown, documentPath, python, dark, trustedImageHos
   useEffect(installMediaMenu,[]);
   const analysis=useMemo(()=>sourceAnalysis?.source===markdown?sourceAnalysis.analysis:analyzeDocument(markdown),[markdown,sourceAnalysis]);
   const tasks=onChange?analysis.tasks:[];
-  const renderImage = useCallback(({src,alt}:{src?:string;alt?:string})=><AssetImage src={src} alt={alt} documentPath={documentPath} trustedImageHosts={trustedImageHosts} onTrustImageHost={onTrustImageHost}/>,[documentPath,trustedImageHosts,onTrustImageHost]);
+  const editable = Boolean(onChange);
+  const renderImage = useCallback(({src,alt}:{src?:string;alt?:string})=><AssetImage src={src} alt={alt} documentPath={documentPath} trustedImageHosts={trustedImageHosts} onTrustImageHost={onTrustImageHost} editable={editable}/>,[documentPath,trustedImageHosts,onTrustImageHost,editable]);
   return (
     <article className="markdown-body" onCopy={event=>{if(event.currentTarget.closest('.live-document'))return;const source=selectedMarkdown(window.getSelection(),markdown);if(source!==null){event.clipboardData.setData("text/plain",source);event.preventDefault();}}} onDragStart={event=>{if(!event.currentTarget.closest('.live-document'))setSelectedMarkdownDrag(event.nativeEvent,markdown);}}>
       <CachedMarkdown
@@ -218,19 +218,22 @@ function MarkdownPreview({ markdown, documentPath, python, dark, trustedImageHos
             const child = Children.only(children) as React.ReactElement<{ className?: string; children?: ReactNode }>;
             const language = child.props.className?.match(/language-([\w-]+)/)?.[1];
             const source = textOf(child.props.children).replace(/\n$/, "");
-            const nodeData=node as {position?:{start?:{offset?:number}};properties?:Record<string,unknown>}|undefined;
+            const nodeData=node as {position?:{start?:{offset?:number};end?:{offset?:number}};properties?:Record<string,unknown>}|undefined;
             const offset=Number(nodeData?.properties?.['data-source-start']??nodeData?.position?.start?.offset);
+            const endOffset=Number(nodeData?.properties?.['data-source-end']??nodeData?.position?.end?.offset);
+            const hasRange=Number.isInteger(offset)&&Number.isInteger(endOffset)&&offset>=0&&endOffset>offset;
+            const srcStart=hasRange?offset:undefined,srcEnd=hasRange?endOffset:undefined;
             const pythonCell=['python','py'].includes(language||'')?analysis.pythonCells.find(cell=>cell.source===source&&cell.offset===offset):undefined;
             const context=documentPath&&pythonCell?{document:documentPath,cell:String(pythonCell.ordinal),interpreter:python||'embedded'}:undefined;
             const protectedBlock = (block: ReactNode) => <CodeBlockBoundary key={`${language}:${source}`} source={source}>{block}</CodeBlockBoundary>;
             if (language === "smd-tree") return protectedBlock(<InlineDiagram diagram={parseBinaryTreeSource(source)}/>);
             if (language === "smd-diagram") return protectedBlock(<InlineDiagram diagram={parseDiagramSource(source)}/>);
-            if (language === "smd-steps") return protectedBlock(<StepCards source={source} renderImage={(src,alt)=><AssetImage src={src} alt={alt} documentPath={documentPath} trustedImageHosts={trustedImageHosts} onTrustImageHost={onTrustImageHost}/>} renderChart={chartSource=><ThemedChart source={chartSource} dark={dark}/>} renderMarkdown={text=><MarkdownPreview markdown={text} documentPath={documentPath} python={python} dark={dark} trustedImageHosts={trustedImageHosts} onTrustImageHost={onTrustImageHost}/>} />);
+            if (language === "smd-steps") return protectedBlock(<StepCards source={source} sourceStart={srcStart} sourceEnd={srcEnd} renderImage={(src,alt)=><AssetImage src={src} alt={alt} documentPath={documentPath} trustedImageHosts={trustedImageHosts} onTrustImageHost={onTrustImageHost}/>} renderChart={chartSource=><ThemedChart source={chartSource} dark={dark}/>} renderMarkdown={text=><MarkdownPreview markdown={text} documentPath={documentPath} python={python} dark={dark} trustedImageHosts={trustedImageHosts} onTrustImageHost={onTrustImageHost}/>} />);
             if (language === "smd-chart") return protectedBlock(<ThemedChart source={source} dark={dark} />);
             if (language === "svg") return protectedBlock(<ThemedSvg source={source} dark={dark} />);
             if (language === "mermaid") return protectedBlock(<Suspense fallback={<span className="image-loading" role="status">Loading diagram…</span>}><ThemedMermaid source={source} dark={dark} /></Suspense>);
-            if (language === "python" || language === "py") return protectedBlock(<PythonCell source={source} python={python} context={context} highlighted={child.props.children} />);
-            return <div className="code-container"><CopyCode source={source}/><details className="code-disclosure" open={source.split("\n").length <= 12}><summary>{language || "Code"} <span>{source.split("\n").length} lines</span></summary><pre>{children}</pre></details></div>;
+            if (language === "python" || language === "py") return protectedBlock(<PythonCell source={source} python={python} context={context} sourceStart={srcStart} sourceEnd={srcEnd} highlighted={child.props.children} />);
+            return <div className="code-container" data-source-start={srcStart} data-source-end={srcEnd}><CopyCode source={source}/><details className="code-disclosure" open={source.split("\n").length <= 12}><summary>{language || "Code"} <span>{source.split("\n").length} lines</span></summary><pre>{children}</pre></details></div>;
           }
         }}
       >{markdown}</CachedMarkdown>

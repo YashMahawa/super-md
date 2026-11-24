@@ -312,16 +312,22 @@ function unmaskedRegexStage(source:string,ranges:Array<[number,number]>,regex:Re
   return {stage:replaceStage(source,edits),ranges:nextRanges};
 }
 
-function computeCodeAndMathMask(source:string):Uint8Array {
-  const mask=computeCodeMask(source);
-  const escaped=(at:number)=>{let slashes=0;for(let j=at-1;j>=0&&!mask[j]&&source[j]==='\\';j--)slashes++;return (slashes&1)===1;};
+function isUnmaskedEscaped(source:string,mask:Uint8Array,at:number):boolean {
+  let slashes=0;
+  for(let j=at-1;j>=0&&!mask[j]&&source[j]==='\\';j--)slashes++;
+  return (slashes&1)===1;
+}
+
+function stripPercentComments(source:string):Stage {
+  if(!source.includes('%%'))return {value:source,originalOffset:offset=>offset};
+  const mask=computeCodeMask(source),edits:Edit[]=[];
   for(let i=0;i<source.length;){
-    if(mask[i]||source[i]!=='$'||escaped(i)){i++;continue;}
+    if(mask[i]||source[i]!=='$'||isUnmaskedEscaped(source,mask,i)){i++;continue;}
     if(source[i+1]==='$'&&!mask[i+1]){
       if(source[i+2]==='$'){while(i<source.length&&source[i]==='$')i++;continue;}
       let close=-1;
       for(let j=i+2;j+1<source.length;j++){
-        if(!mask[j]&&!mask[j+1]&&source[j]==='$'&&source[j+1]==='$'&&source[j+2]!=='$'&&!escaped(j)){close=j;break;}
+        if(!mask[j]&&!mask[j+1]&&source[j]==='$'&&source[j+1]==='$'&&source[j+2]!=='$'&&!isUnmaskedEscaped(source,mask,j)){close=j;break;}
       }
       if(close>=0){mask.fill(1,i,close+2);i=close+2;}else i+=2;
       continue;
@@ -334,22 +340,11 @@ function computeCodeAndMathMask(source:string):Uint8Array {
         let k=j+1;while(k<source.length&&(source[k]===' '||source[k]==='\t'||source[k]==='\r'))k++;
         if(source[k]==='\n')break;
       }
-      if(!mask[j]&&source[j]==='$'&&source[j+1]!=='$'&&!escaped(j)&&!/\s/.test(source[j-1])&&!/\d/.test(source[j+1]||'')){close=j;break;}
+      if(!mask[j]&&source[j]==='$'&&source[j+1]!=='$'&&!isUnmaskedEscaped(source,mask,j)&&!/\s/.test(source[j-1])&&!/\d/.test(source[j+1]||'')){close=j;break;}
     }
     if(close>=0){mask.fill(1,i,close+1);i=close+1;}else i++;
   }
-  return mask;
-}
-
-function stripPercentComments(source:string):Stage {
-  if(!source.includes('%%'))return {value:source,originalOffset:offset=>offset};
-  const mask=computeCodeAndMathMask(source),edits:Edit[]=[];
-  const isDelim=(at:number)=>{
-    if(at+1>=source.length||source[at]!=='%'||source[at+1]!=='%'||mask[at]||mask[at+1])return false;
-    let slashes=0;
-    for(let j=at-1;j>=0&&!mask[j]&&source[j]==='\\';j--)slashes++;
-    return (slashes&1)===0;
-  };
+  const isDelim=(at:number)=>at+1<source.length&&source[at]==='%'&&source[at+1]==='%'&&!mask[at]&&!mask[at+1]&&!isUnmaskedEscaped(source,mask,at);
   for(let i=0;i+1<source.length;){
     if(!isDelim(i)){i++;continue;}
     let close=-1;

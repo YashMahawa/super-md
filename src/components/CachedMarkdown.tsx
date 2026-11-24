@@ -211,35 +211,43 @@ function scanBlockNode(current:any,parentTag:string|null,state:{hasMath:boolean;
   }
 }
 
+const RARE_URL_PROPS=["cite","poster","longDesc","action"] as const;
 function sanitizeElementUrls(node:any):void {
-  for(const key of ["href","src","cite","poster","longDesc","action"]){
-    if(typeof node.properties?.[key]!=="string")continue;
-    const url=node.properties[key];
-    node.properties[key]=node.tagName==="img"&&key==="src"&&/^data:image\/(?:png|jpeg|gif|webp|avif|svg\+xml);base64,/i.test(url)?url:defaultUrlTransform(url);
+  const props=node.properties;
+  if(!props)return;
+  if(typeof props.href==="string")props.href=defaultUrlTransform(props.href);
+  if(typeof props.src==="string"){
+    const url=props.src;
+    props.src=node.tagName==="img"&&/^data:image\/(?:png|jpeg|gif|webp|avif|svg\+xml);base64,/i.test(url)?url:defaultUrlTransform(url);
+  }
+  if(props.cite!==undefined||props.poster!==undefined||props.longDesc!==undefined||props.action!==undefined){
+    for(const key of RARE_URL_PROPS)if(typeof props[key]==="string")props[key]=defaultUrlTransform(props[key]);
   }
 }
 
-function sanitizeHastChildren(children:any[],addWeight:(node:any)=>void):any[] {
-  let hasRaw=false;
+function sanitizeHastChildren(children:any[]):number {
+  let weight=0,hasRaw=false;
   for(let i=0;i<children.length;i++)if(children[i]?.type==="raw"){hasRaw=true;break;}
   if(!hasRaw){
     for(let i=0;i<children.length;i++){
       const child=children[i];
-      addWeight(child);
+      weight+=160+(typeof child.value==="string"?child.value.length*2:0);
       if(child.type==="element"){
         sanitizeElementUrls(child);
-        if(Array.isArray(child.children))child.children=sanitizeHastChildren(child.children,addWeight);
+        if(Array.isArray(child.children))weight+=sanitizeHastChildren(child.children);
       }
     }
-    return children;
+    return weight;
   }
   const tokens:any[]=[];
-  for(const child of children){
-    addWeight(child);
+  for(let i=0;i<children.length;i++){
+    const child=children[i];
+    weight+=160+(typeof child.value==="string"?child.value.length*2:0);
     if(child.type==="raw"){
-      const raw=String(child.value??""),parts=raw.split(RAW_HTML_TOKEN).filter(Boolean);
-      for(const part of parts){
-        if(part.startsWith("<!--")&&part.endsWith("-->"))continue;
+      const raw=String(child.value??""),parts=raw.split(RAW_HTML_TOKEN);
+      for(let p=0;p<parts.length;p++){
+        const part=parts[p];
+        if(!part||(part.startsWith("<!--")&&part.endsWith("-->")))continue;
         if(BR_HTML_TAG.test(part)){tokens.push({type:"element",tagName:"br",properties:{},children:[]});continue;}
         const open=OPEN_HTML_TAG.exec(part);
         if(open&&!part.slice(0,-1).trimEnd().endsWith("/")){tokens.push({type:"__open",tag:open[1].toLowerCase(),raw:part});continue;}
@@ -251,7 +259,7 @@ function sanitizeHastChildren(children:any[],addWeight:(node:any)=>void):any[] {
     }
     if(child.type==="element"){
       sanitizeElementUrls(child);
-      if(Array.isArray(child.children))child.children=sanitizeHastChildren(child.children,addWeight);
+      if(Array.isArray(child.children))weight+=sanitizeHastChildren(child.children);
     }
     tokens.push(child);
   }
@@ -275,13 +283,12 @@ function sanitizeHastChildren(children:any[],addWeight:(node:any)=>void):any[] {
     emit(token);
   }
   while(stack.length){const unclosed=stack.pop()!;emit({type:"text",value:unclosed.raw});for(const c of unclosed.children)emit(c);}
-  return out;
+  children.splice(0,children.length,...out);
+  return weight;
 }
 
 function sanitizeAndMeasureHast(tree:Root,baseWeight=0):number {
-  let weight=baseWeight+160;
-  tree.children=sanitizeHastChildren(tree.children,(node:any)=>{weight+=160+(typeof node.value==="string"?node.value.length*2:0);});
-  return weight;
+  return baseWeight+160+sanitizeHastChildren(tree.children);
 }
 
 function measureHastWeight(node:any):number {

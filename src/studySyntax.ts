@@ -1,6 +1,11 @@
 const SKIP_TYPES = new Set(['code', 'inlineCode', 'math', 'inlineMath', 'html', 'definition', 'yaml']);
 const CONTAINER_TYPES = new Set(['paragraph', 'heading', 'tableCell', 'emphasis', 'strong', 'delete', 'link', 'linkReference', 'highlight', 'subscript', 'superscript']);
 const ASCII_PUNCT = /^[!"#$%&'()*+,\-./:;<=>?@[\\\]^_`{|}~]$/;
+const SPAN_META: Record<DelimKind, { type: string; hName: string }> = {
+  '==': { type: 'highlight', hName: 'mark' },
+  '~': { type: 'subscript', hName: 'sub' },
+  '^': { type: 'superscript', hName: 'sup' },
+};
 
 type DelimKind = '==' | '~' | '^';
 type Piece =
@@ -23,39 +28,31 @@ function computeEscapedMask(value: string, source: string, position: any): Uint8
   let r = 0, v = 0;
   while (r < raw.length && v < value.length) {
     if (raw[r] === '\\' && r + 1 < raw.length && ASCII_PUNCT.test(raw[r + 1]) && raw[r + 1] === value[v]) {
-      mask[v] = 1;
+      mask[v++] = 1;
       r += 2;
-      v++;
-      continue;
-    }
-    if (raw[r] === value[v]) {
+    } else if (raw[r] === value[v]) {
       r++;
       v++;
-      continue;
+    } else {
+      return null;
     }
-    return null;
   }
   return v === value.length && r === raw.length ? mask : null;
 }
 
-function nodePlainText(node: any): string {
-  if (node.type === 'break') return '\n';
-  if (typeof node.value === 'string') return node.value;
-  return Array.isArray(node.children) ? node.children.map(nodePlainText).join('') : '';
+function hasDisallowedBreak(node: any, rejectSpaces: boolean): boolean {
+  if (node.type === 'break') return true;
+  if (typeof node.value === 'string') return rejectSpaces ? /\s/.test(node.value) : /[\r\n]/.test(node.value);
+  return Array.isArray(node.children) && node.children.some((c: any) => hasDisallowedBreak(c, rejectSpaces));
 }
 
 function spanValid(delim: DelimKind, slice: Piece[]): boolean {
-  if (!slice.length) return false;
-  const checkSpace = delim !== '==';
-  for (const piece of slice) {
-    if (piece.kind === 'text') {
-      if (checkSpace ? /\s/.test(piece.value) : /[\r\n]/.test(piece.value)) return false;
-    } else if (piece.kind === 'node') {
-      if (piece.node.type === 'break') return false;
-      if (checkSpace && /\s/.test(nodePlainText(piece.node))) return false;
-    }
-  }
-  return true;
+  const rejectSpaces = delim !== '==';
+  return slice.length > 0 && !slice.some(piece =>
+    piece.kind === 'text'
+      ? (rejectSpaces ? /\s/.test(piece.value) : /[\r\n]/.test(piece.value))
+      : piece.kind === 'node' && hasDisallowedBreak(piece.node, rejectSpaces),
+  );
 }
 
 function piecesToNodes(pieces: Piece[]): any[] {
@@ -63,16 +60,16 @@ function piecesToNodes(pieces: Piece[]): any[] {
   for (const piece of pieces) {
     if (piece.kind === 'node') {
       out.push(piece.node);
+      continue;
+    }
+    const value = piece.kind === 'delim' ? piece.delim : piece.value;
+    if (!value) continue;
+    const prev = out[out.length - 1];
+    if (prev?.type === 'text') {
+      prev.value += value;
+      delete prev.position;
     } else {
-      const value = piece.kind === 'delim' ? piece.delim : piece.value;
-      if (!value) continue;
-      const prev = out[out.length - 1];
-      if (prev?.type === 'text') {
-        prev.value += value;
-        delete prev.position;
-      } else {
-        out.push(piece.kind === 'text' && piece.position ? { type: 'text', value, position: piece.position } : { type: 'text', value });
-      }
+      out.push(piece.kind === 'text' && piece.position ? { type: 'text', value, position: piece.position } : { type: 'text', value });
     }
   }
   return out;
@@ -98,12 +95,6 @@ function tokenizeChildren(children: any[], source: string): Piece[] {
     const nextBoundary = !nextSibling ? '' : nextSibling.type === 'break' ? '\n' : 'x';
 
     let buf = '', i = 0, split = false;
-    const flush = () => {
-      if (buf) {
-        pieces.push({ kind: 'text', value: buf });
-        buf = '';
-      }
-    };
     while (i < s.length) {
       const ch = s[i];
       if (!escaped?.[i] && (ch === '=' || ch === '~' || ch === '^')) {
@@ -115,7 +106,7 @@ function tokenizeChildren(children: any[], source: string): Piece[] {
           const canOpen = Boolean(after) && !/\s/.test(after);
           const canClose = Boolean(before) && !/\s/.test(before);
           if (canOpen || canClose) {
-            flush();
+            if (buf) { pieces.push({ kind: 'text', value: buf }); buf = ''; }
             split = true;
             pieces.push({ kind: 'delim', delim: (ch === '=' ? '==' : ch) as DelimKind, canOpen, canClose });
             i += run;
@@ -129,16 +120,13 @@ function tokenizeChildren(children: any[], source: string): Piece[] {
       buf += ch;
       i++;
     }
-    if (!split) {
-      pieces.push({ kind: 'text', value: s, position: child.position });
-    } else {
-      flush();
-    }
+    if (!split) pieces.push({ kind: 'text', value: s, position: child.position });
+    else if (buf) pieces.push({ kind: 'text', value: buf });
   }
   return pieces;
 }
 
-function matchPieces(pieces: Piece[]): { changed: boolean; nodes: any[] } {
+function matchPieces(pieces: Piece[]): any[] | null {
   const working: Piece[] = [];
   const openers: Array<{ pos: number; delim: DelimKind }> = [];
   let changed = false;
@@ -160,15 +148,10 @@ function matchPieces(pieces: Piece[]): { changed: boolean; nodes: any[] } {
     if (matchedIndex >= 0) {
       const opener = openers[matchedIndex];
       openers.length = matchedIndex;
-      const inner = piecesToNodes(working.splice(opener.pos + 1));
-      const meta = piece.delim === '=='
-        ? { type: 'highlight', hName: 'mark' }
-        : piece.delim === '~'
-          ? { type: 'subscript', hName: 'sub' }
-          : { type: 'superscript', hName: 'sup' };
+      const meta = SPAN_META[piece.delim];
       working[opener.pos] = {
         kind: 'node',
-        node: { type: meta.type, data: { hName: meta.hName }, children: inner },
+        node: { type: meta.type, data: { hName: meta.hName }, children: piecesToNodes(working.splice(opener.pos + 1)) },
       };
       changed = true;
     } else {
@@ -177,21 +160,29 @@ function matchPieces(pieces: Piece[]): { changed: boolean; nodes: any[] } {
       if (piece.canOpen) openers.push({ pos, delim: piece.delim });
     }
   }
-  return { changed, nodes: changed ? piecesToNodes(working) : [] };
+  return changed ? piecesToNodes(working) : null;
 }
 
 function transformNode(node: any, source: string): void {
-  if (!node || SKIP_TYPES.has(node.type) || !Array.isArray(node.children)) return;
-  if (isAutolinkLiteral(node)) return;
-
-  if (CONTAINER_TYPES.has(node.type) && node.children.some((c: any) => c.type === 'text' && /[=~^]/.test(c.value))) {
-    const pieces = tokenizeChildren(node.children, source);
-    if (pieces.some(p => p.kind === 'delim')) {
-      const matched = matchPieces(pieces);
-      if (matched.changed) node.children = matched.nodes;
+  if (!node || SKIP_TYPES.has(node.type) || !Array.isArray(node.children) || isAutolinkLiteral(node)) return;
+  if (CONTAINER_TYPES.has(node.type)) {
+    let hasCandidate = false;
+    for (let i = 0; i < node.children.length; i++) {
+      const c = node.children[i];
+      if (c.type === 'text' && /[=~^]/.test(c.value)) { hasCandidate = true; break; }
+    }
+    if (hasCandidate) {
+      const pieces = tokenizeChildren(node.children, source);
+      let hasDelim = false;
+      for (let i = 0; i < pieces.length; i++) if (pieces[i].kind === 'delim') { hasDelim = true; break; }
+      const matched = hasDelim ? matchPieces(pieces) : null;
+      if (matched) node.children = matched;
     }
   }
-  for (const child of node.children) transformNode(child, source);
+  for (let i = 0; i < node.children.length; i++) {
+    const child = node.children[i];
+    if (child?.children) transformNode(child, source);
+  }
 }
 
 /** Parse `==highlight==`, `~subscript~`, and `^superscript^` spans outside code
@@ -199,6 +190,7 @@ function transformNode(node: any, source: string): void {
 export function remarkStudySyntax(this: unknown) {
   return (tree: any, file?: { value?: unknown }) => {
     const source = typeof file?.value === 'string' ? file.value : '';
+    if (source && !/==|[~^]/.test(source)) return;
     transformNode(tree, source);
   };
 }

@@ -13,6 +13,7 @@ import android.os.Environment
 import android.provider.MediaStore
 import androidx.core.app.NotificationCompat
 import androidx.core.content.FileProvider
+import androidx.core.content.pm.PackageInfoCompat
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.asStateFlow
@@ -55,7 +56,11 @@ internal fun officialAsset(raw:String):String {
 }
 internal fun releaseChecksum(text:String,name:String):String = text.lineSequence().mapNotNull {Regex("([a-fA-F0-9]{64})\\s+\\*?(.+)").matchEntire(it)}.firstOrNull{it.groupValues[2]==name}?.groupValues?.get(1)?.lowercase() ?: error("Release checksum is missing")
 
-class AppUpdates(private val app:Application) {
+class AppUpdates internal constructor(
+    private val app:Application,
+    private val openConnection:(URL)->HttpURLConnection,
+) {
+    constructor(app:Application):this(app,{it.openConnection() as HttpURLConnection})
     private val prefs=app.getSharedPreferences("studio-updates",0)
     private val mutable=MutableStateFlow(UpdateState(automatic=prefs.getBoolean("automatic",false),checkOnOpen=prefs.getBoolean("checkOnOpen",true)))
     val state=mutable.asStateFlow()
@@ -175,7 +180,7 @@ class AppUpdates(private val app:Application) {
         repeat(6){
             val url=URL(next)
             require(url.protocol=="https" && url.host in setOf("api.github.com","github.com","release-assets.githubusercontent.com","objects.githubusercontent.com")){"Untrusted update redirect"}
-            val connection=(url.openConnection() as HttpURLConnection).apply{connectTimeout=15000;readTimeout=30000;instanceFollowRedirects=false;setRequestProperty("User-Agent","Super-MD-updater")}
+            val connection=openConnection(url).apply{connectTimeout=15000;readTimeout=30000;instanceFollowRedirects=false;setRequestProperty("User-Agent","Super-MD-updater")}
             if(connection.responseCode in 300..399){val location=connection.getHeaderField("Location") ?: error("Missing redirect");next=URL(url,location).toString();connection.disconnect()}
             else {require(connection.responseCode==200){"Update server returned ${connection.responseCode}"};return connection}
         }
@@ -231,10 +236,8 @@ class AppUpdates(private val app:Application) {
                     try {conn.inputStream.use{input->temporary.outputStream().use{output->val buffer=ByteArray(256*1024);while(true){val n=input.read(buffer);if(n<0)break;count+=n;require(count<=info.size);digest.update(buffer,0,n);output.write(buffer,0,n)}}}}finally{conn.disconnect()}
                     val actual=digest.digest().joinToString(""){"%02x".format(it)}
                     require(count==info.size && actual==expected){"APK checksum mismatch"}
-                    verifyUpgrade(temporary)
+                    val versionCode=verifyUpgrade(temporary,info)
                     val destination=File(folder,info.name);require(temporary.renameTo(destination)){"Could not stage APK"}
-                    @Suppress("DEPRECATION") val archive=app.packageManager.getPackageArchiveInfo(destination.absolutePath,0) ?: error("Invalid staged APK")
-                    @Suppress("DEPRECATION") val versionCode=if(Build.VERSION.SDK_INT>=28)archive.longVersionCode else archive.versionCode.toLong()
                     val saved=JSONObject().put("version",info.version).put("name",info.name).put("url",info.url).put("sums",info.sums).put("size",info.size).put("sha256",expected).put("versionCode",versionCode)
                     saveReceipt(saved)
                     // Downloads publishing is not required for safe installation.
@@ -268,17 +271,33 @@ class AppUpdates(private val app:Application) {
     fun storagePermissionDenied() {
         mutable.value=mutable.value.copy(publicCopy=false,status="Android storage permission was denied. The verified APK is still ready to install privately; you can grant storage access and retry saving a Downloads copy.")
     }
-    @Suppress("DEPRECATION") private fun verifyUpgrade(file:File,expected:UpdateRelease?=release) {
-        val pm=app.packageManager;val flags=if(Build.VERSION.SDK_INT>=28)PackageManager.GET_SIGNING_CERTIFICATES else PackageManager.GET_SIGNATURES
-        val incoming=pm.getPackageArchiveInfo(file.absolutePath,flags) ?: error("Invalid APK package")
-        val installed=pm.getPackageInfo(app.packageName,flags)
+    internal fun verifyUpgrade(file:File,expected:UpdateRelease?=release):Long {
+        val pm=app.packageManager
+        val (incoming,installed)=if(Build.VERSION.SDK_INT>=Build.VERSION_CODES.TIRAMISU) {
+            val flags=PackageManager.PackageInfoFlags.of(PackageManager.GET_SIGNING_CERTIFICATES.toLong())
+            (pm.getPackageArchiveInfo(file.absolutePath,flags) ?: error("Invalid APK package")) to pm.getPackageInfo(app.packageName,flags)
+        }else {
+            val flags=if(Build.VERSION.SDK_INT>=Build.VERSION_CODES.P)PackageManager.GET_SIGNING_CERTIFICATES else {
+                @Suppress("DEPRECATION")
+                PackageManager.GET_SIGNATURES
+            }
+            @Suppress("DEPRECATION") val archive=pm.getPackageArchiveInfo(file.absolutePath,flags) ?: error("Invalid APK package")
+            @Suppress("DEPRECATION") val current=pm.getPackageInfo(app.packageName,flags)
+            archive to current
+        }
         require(incoming.packageName==app.packageName && incoming.versionName==expected?.version){"APK identity mismatch"}
         require((incoming.applicationInfo?.flags ?: error("Missing APK application info")) and android.content.pm.ApplicationInfo.FLAG_DEBUGGABLE == 0){"Refusing a debug APK"}
-        val code=if(Build.VERSION.SDK_INT>=28)incoming.longVersionCode else incoming.versionCode.toLong()
-        val oldCode=if(Build.VERSION.SDK_INT>=28)installed.longVersionCode else installed.versionCode.toLong()
+        val code=PackageInfoCompat.getLongVersionCode(incoming)
+        val oldCode=PackageInfoCompat.getLongVersionCode(installed)
         require(code>oldCode){"APK is not an upgrade"}
-        fun signatures(info:android.content.pm.PackageInfo)=if(Build.VERSION.SDK_INT>=28)info.signingInfo?.apkContentsSigners?.toList() else info.signatures?.toList()
-        require(signatures(incoming)?.toSet()==signatures(installed)?.toSet() && !signatures(incoming).isNullOrEmpty()){ "APK upgrade certificate mismatch" }
+        fun signatures(info:android.content.pm.PackageInfo):List<android.content.pm.Signature>? {
+            if(Build.VERSION.SDK_INT>=Build.VERSION_CODES.P)return info.signingInfo?.apkContentsSigners?.toList()
+            @Suppress("DEPRECATION")
+            return info.signatures?.toList()
+        }
+        val incomingSignatures=signatures(incoming)
+        require(!incomingSignatures.isNullOrEmpty() && incomingSignatures.toSet()==signatures(installed)?.toSet()){ "APK upgrade certificate mismatch" }
+        return code
     }
     fun install(activity:android.app.Activity) {
         val file=readyFile ?: return
