@@ -1,10 +1,9 @@
 import { Children, isValidElement, lazy, memo, Suspense, useCallback, useContext, useEffect, useMemo, useRef, useState, type ReactNode } from "react";
 import { invoke } from "../nativeBridge";
 import CachedMarkdown,{type MarkdownBlockRenderer} from "./CachedMarkdown";
-import remarkGfm from "remark-gfm";
-import remarkMath from "remark-math";
 import rehypeKatex from "rehype-katex";
 import rehypeHighlight from "rehype-highlight";
+import type { PluggableList } from "unified";
 import { visit } from "unist-util-visit";
 import InteractiveChart from "./InteractiveChart";
 import StepCards from "./StepCards";
@@ -12,8 +11,6 @@ import InlineDiagram,{parseDiagramSource} from "./InlineDiagram";
 import {parseBinaryTreeSource} from "./BinaryTree";
 import PythonCell from "./PythonCell";
 import SvgDiagram from "./SvgDiagram";
-import { remarkSvgBlocks } from "../svgBlocks";
-import { remarkObsidianMath } from "../obsidianMath";
 import { navigateHeading, remarkHeadingIds } from "../documentNavigation";
 import { selectedMarkdown, setSelectedMarkdownDrag } from "../copySource";
 import CopyCode from "./CopyCode";
@@ -98,6 +95,10 @@ export function remarkCallouts() {
     node.data = { hName: collapsible ? "details" : "aside", hProperties: { ...(collapsible ? {open:match[2] === "+"} : {}), className: `callout callout-${type}`, "data-callout-type": type } };
   });
 }
+
+export const DIAGRAM_PLAIN_TEXT_LANGUAGES = ["svg", "mermaid", "smd-tree", "smd-diagram", "smd-steps", "smd-chart"] as const;
+export const PREVIEW_REMARK_PLUGINS: PluggableList = [remarkCallouts, remarkHeadingIds, remarkTaskPositions, remarkSourcePositions];
+export const PREVIEW_REHYPE_PLUGINS: PluggableList = [rehypeKatex, [rehypeHighlight, { plainText: [...DIAGRAM_PLAIN_TEXT_LANGUAGES] }]];
 
 function AssetImage({ src = "", alt = "", documentPath, trustedImageHosts, onTrustImageHost }: { src?: string; alt?: string; documentPath: string | null; trustedImageHosts: string[]; onTrustImageHost?: (host: string) => void }) {
   const isRemote = /^https?:\/\//i.test(src);
@@ -207,8 +208,8 @@ function MarkdownPreview({ markdown, documentPath, python, dark, trustedImageHos
         sourceAnalysis={{source:markdown,analysis}}
         renderBlock={renderBlock}
         windowingEnabled={!fullDocumentAccessibility}
-        remarkPlugins={[remarkGfm, remarkMath, remarkObsidianMath, remarkSvgBlocks, remarkCallouts, remarkHeadingIds, remarkTaskPositions,remarkSourcePositions]}
-        rehypePlugins={[rehypeKatex, rehypeHighlight]}
+        remarkPlugins={PREVIEW_REMARK_PLUGINS}
+        rehypePlugins={PREVIEW_REHYPE_PLUGINS}
         components={{
           p: MarkdownParagraph,
           input: ({node: _node,...props}) => <input {...props} disabled={!onChange} onChange={()=>{}} />,
