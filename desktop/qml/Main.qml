@@ -189,6 +189,10 @@ ApplicationWindow {
         case "zoom_out": window.runDocumentScript("window.supermdZoomBy?.(1/1.1)"); break
         case "zoom_reset": window.runDocumentScript("window.supermdResetZoom?.()"); break
         case "typewriter_scroll": studio.setting("typewriterScroll", JSON.stringify(!viewState.settings.typewriterScroll)); break
+        case "new_folder_note": sidebar = true; sidebarSection = "folder"; folderSidebar.triggerNewFolderNote(); break
+        case "new_subfolder": sidebar = true; sidebarSection = "folder"; folderSidebar.triggerNewSubfolder(); break
+        case "rename_entry": folderSidebar.triggerRenameSelectedOrActive(); break
+        case "trash_entry": folderSidebar.triggerTrashSelectedOrActive(); break
         }
     }
     function focusReader() { if (reader) reader.forceActiveFocus() }
@@ -400,32 +404,13 @@ ApplicationWindow {
                 spacing: 12
                 Label { text: sidebarSection === "folder" ? "Your files" : "Contents"; font.pixelSize: 22; font.weight: Font.DemiBold }
                 ModeGroup { Layout.fillWidth: true; choices: [{key:"folder",label:"Folder"},{key:"contents",label:"Contents"}]; selected: sidebarSection; onChosen: key => sidebarSection = key }
-                ActionButton { visible: sidebarSection === "folder"; text: "Open folder"; glyph: "FolderOpen"; tonal: true; Layout.fillWidth: true; onClicked: studio.chooseFolder() }
-                RowLayout {
-                    visible: sidebarSection === "folder" && !!viewState.folder
-                    Layout.fillWidth: true
-                    Label { text: viewState.folder.split("/").pop(); Layout.fillWidth: true; elide: Text.ElideMiddle }
-                    ActionButton { glyph: "X"; compact: true; Accessible.name: "Close folder"; ToolTip.text: "Close folder (notes stay open)"; onClicked: studio.closeFolder() }
-                }
-                TextField { id: filter; visible: sidebarSection === "folder" && !!viewState.folder; Layout.fillWidth: true; placeholderText: "Filter files"; selectByMouse: true }
-                ListView {
+                FolderSidebar {
+                    id: folderSidebar
                     visible: sidebarSection === "folder"
                     Layout.fillWidth: true
                     Layout.fillHeight: true
-                    clip: true
-                    model: viewState.files
-                    delegate: ItemDelegate {
-                        id: fileEntry
-                        required property var modelData
-                        width: ListView.view.width - 20
-                        height: visible ? 42 : 0
-                        visible: !filter.text || modelData.directory || modelData.name.toLowerCase().includes(filter.text.toLowerCase())
-                        leftPadding: 8 + modelData.depth * 16
-                        text: (modelData.directory ? (modelData.expanded ? "▾ " : "▸ ") : "") + modelData.name
-                        onClicked: modelData.directory ? studio.toggleDirectory(modelData.path) : studio.openNote(modelData.path)
-                        Hint { requested: fileEntry.hovered; text: modelData.path }
-                    }
-                    ScrollBar.vertical: ExpressiveScrollBar { }
+                    viewState: window.viewState
+                    shortcutLabels: window.shortcutLabels
                 }
                 OutlineList { visible: sidebarSection === "contents"; Layout.fillWidth: true; Layout.fillHeight: true; entries: viewState.outline || []; noteId: viewState.active }
                 Rectangle { Layout.fillWidth: true; height: 1; color: viewState.colors.outline }

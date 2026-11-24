@@ -1,0 +1,314 @@
+"""Validation, boundary checks, lazy subfolder listing, and linked-asset helpers for open folders."""
+from __future__ import annotations
+
+import os
+import re
+import urllib.parse
+from pathlib import Path
+
+try:
+    from . import documents, markdown_prepare
+except ImportError:
+    import documents
+    import markdown_prepare
+
+NOTE_SUFFIXES = (".md", ".smd", ".fmd", ".markdown", ".txt")
+PLAIN_MARKDOWN_SUFFIXES = (".md", ".markdown", ".txt")
+KNOWN_FORMAT_SUFFIXES = frozenset({".md", ".markdown", ".txt", ".smd", ".fmd", ".pdf", ".zip", ".html", ".docx"})
+
+
+def validate_entry_name(raw_name: str, *, is_directory: bool, current_ext: str = "") -> str:
+    """Validate a note or folder name, preserving note extensions unless a matching one is supplied."""
+    if not isinstance(raw_name, str):
+        raise ValueError("Choose a valid name.")
+    name = raw_name.strip()
+    if (
+        not name
+        or name in (".", "..")
+        or name.startswith(".")
+        or any(ch in name for ch in "/\\\x00")
+        or any(ord(ch) < 32 for ch in name)
+    ):
+        raise ValueError("Choose a visible name without path separators.")
+    if len(name) > 240:
+        raise ValueError("Choose a shorter name.")
+    if is_directory:
+        return name
+
+    ext = current_ext or ".md"
+    if not ext.startswith("."):
+        ext = "." + ext
+    if len(name) > len(ext) and name.lower().endswith(ext.lower()):
+        stem = name[: -len(ext)].strip()
+        if not stem or stem in (".", ".."):
+            raise ValueError("Choose a valid note name.")
+        return name
+
+    supplied_suffix = Path(name).suffix.lower()
+    if supplied_suffix and supplied_suffix in (KNOWN_FORMAT_SUFFIXES - {ext.lower()}):
+        raise ValueError("Rename keeps the note format. Use Export to change formats.")
+    return name + ext
+
+
+def _check_no_symlinks_under(base: Path, target: Path) -> None:
+    try:
+        rel_parts = target.relative_to(base).parts
+    except ValueError:
+        return
+    current = base
+    for part in rel_parts:
+        current = current / part
+        if current.is_symlink():
+            raise ValueError("Symlinks are not allowed inside the open folder.")
+
+
+def resolve_within_open_folder(
+    open_root: str | os.PathLike[str],
+    target: str | os.PathLike[str],
+    *,
+    allow_root: bool = False,
+    must_exist: bool = True,
+) -> Path:
+    """Resolve *target* inside *open_root*, rejecting symlinks and paths outside the open folder."""
+    root_str = str(open_root or "").strip()
+    target_str = str(target or "").strip()
+    if not root_str or not target_str:
+        raise ValueError("Open a folder first.")
+    raw_root = Path(root_str)
+    if raw_root.is_symlink():
+        raise ValueError("Symlinks are not allowed inside the open folder.")
+    try:
+        root = raw_root.resolve(strict=True)
+    except OSError as error:
+        raise ValueError("The open folder is no longer available.") from error
+    if not root.is_dir():
+        raise ValueError("The open folder is no longer available.")
+
+    raw_target = Path(target_str)
+    if not raw_target.is_absolute():
+        raise ValueError("Folder entry path must be an absolute path inside the open folder.")
+    if raw_target.is_symlink():
+        raise ValueError("Symlinks are not allowed inside the open folder.")
+
+    _check_no_symlinks_under(raw_root, raw_target)
+    _check_no_symlinks_under(root, raw_target)
+
+    try:
+        resolved = raw_target.resolve(strict=must_exist)
+    except OSError as error:
+        raise ValueError("The selected item is no longer available.") from error
+
+    if resolved == root:
+        if not allow_root:
+            raise ValueError("Cannot modify the open folder itself.")
+        return resolved
+    if not resolved.is_relative_to(root):
+        raise ValueError("Paths outside the open folder are not allowed.")
+
+    _check_no_symlinks_under(root, resolved)
+    return resolved
+
+
+def ancestor_directories_in_folder(open_root: Path, target_dir: Path) -> set[str]:
+    """Return *open_root* and every ancestor directory down to *target_dir* for tree expansion."""
+    root = open_root.resolve(strict=False)
+    current = target_dir.resolve(strict=False)
+    expanded = {str(root)}
+    if current == root or current.is_relative_to(root):
+        while current != root and current.is_relative_to(root):
+            expanded.add(str(current))
+            current = current.parent
+    return expanded
+
+
+def matches_path_prefix(candidate: str, target: str, *, is_directory: bool) -> bool:
+    """Return True when *candidate* is *target* or (for directories) a descendant of *target*."""
+    if not candidate or not target:
+        return False
+    if candidate == target:
+        return True
+    if not is_directory:
+        return False
+    prefix = target.rstrip("/\\") + os.sep
+    return candidate.startswith(prefix)
+
+
+def remap_path_prefix(candidate: str, old_path: str, new_path: str, *, is_directory: bool) -> str:
+    """Rewrite *candidate* when *old_path* (file or folder) moves/renames to *new_path*."""
+    if not candidate:
+        return candidate
+    if candidate == old_path:
+        return new_path
+    if is_directory:
+        prefix = old_path.rstrip("/\\") + os.sep
+        if candidate.startswith(prefix):
+            return new_path.rstrip("/\\") + os.sep + candidate[len(prefix):]
+    return candidate
+
+
+def _decode_relative_asset_ref(raw_source: str) -> str | None:
+    if not raw_source:
+        return None
+    trimmed = raw_source.strip()
+    if not trimmed or trimmed.startswith(("/", "\\")) or re.match(r"^[a-z][a-z\d+.-]*:", trimmed, re.I):
+        return None
+    decoded = urllib.parse.unquote(trimmed.split("#", 1)[0].split("?", 1)[0]).strip()
+    if not decoded or "\\" in decoded or "\0" in decoded or decoded.startswith("/"):
+        return None
+    parts = [part for part in decoded.split("/") if part and part != "."]
+    if not parts or any(any(ord(ch) < 32 for ch in part) for part in parts):
+        return None
+    return "/".join(parts)
+
+
+def linked_local_images(
+    note_path: Path,
+    markdown: str,
+    open_root: Path,
+    target_dir: Path,
+) -> list[tuple[str, Path, Path]]:
+    """Find relative local images/diagrams in a plain Markdown note that would break on move."""
+    if note_path.suffix.lower() not in PLAIN_MARKDOWN_SUFFIXES:
+        return []
+    root = open_root.resolve(strict=True)
+    source_dir = note_path.parent.resolve(strict=True)
+    dest_dir = target_dir.resolve(strict=True)
+    if source_dir == dest_dir:
+        return []
+
+    found: list[tuple[str, Path, Path]] = []
+    seen: set[str] = set()
+    for ref in markdown_prepare._references(markdown or ""):
+        rel = _decode_relative_asset_ref(ref.source)
+        if not rel or rel in seen:
+            continue
+        src_candidate = source_dir / rel
+        try:
+            src_file = resolve_within_open_folder(root, src_candidate, allow_root=False, must_exist=True)
+        except ValueError:
+            continue
+        if not src_file.is_file():
+            continue
+        dst_candidate = dest_dir / rel
+        try:
+            dst_file = resolve_within_open_folder(root, dst_candidate, allow_root=False, must_exist=False)
+        except ValueError:
+            # Relative path (such as ../image.png) would escape the open root at destination: warn user.
+            seen.add(rel)
+            found.append((rel, src_file, dst_candidate))
+            continue
+        if dst_file == src_file:
+            continue
+        if dst_file.exists() and dst_file.is_file():
+            try:
+                if dst_file.stat().st_size == src_file.stat().st_size and dst_file.read_bytes() == src_file.read_bytes():
+                    continue
+            except OSError:
+                pass
+        seen.add(rel)
+        found.append((rel, src_file, dst_file))
+    return found
+
+
+def copy_linked_local_images(items: list[tuple[str, Path, Path]], open_root: Path) -> None:
+    """Safely copy relative local images/diagrams to their relative destinations inside *open_root*."""
+    if not items:
+        return
+    root = open_root.resolve(strict=True)
+    staged: list[tuple[Path, bytes]] = []
+    total_bytes = 0
+    for rel, src_file, dst_candidate in items:
+        dst_file = resolve_within_open_folder(root, dst_candidate, allow_root=False, must_exist=False)
+        size = src_file.stat().st_size
+        if size > documents.MAX_IMAGE:
+            raise ValueError(f"Linked asset exceeds 25 MB: {src_file.name}")
+        total_bytes += size
+        if total_bytes > 110_000_000:
+            raise ValueError("Linked assets exceed the total copy size limit.")
+        payload = src_file.read_bytes()
+        if dst_file.exists():
+            if not dst_file.is_file() or dst_file.read_bytes() != payload:
+                raise FileExistsError(f"A different file already exists at {rel}.")
+            continue
+        staged.append((dst_file, payload))
+
+    created: list[Path] = []
+    try:
+        for dst_file, payload in staged:
+            parent = dst_file.parent
+            parent.mkdir(parents=True, exist_ok=True)
+            resolve_within_open_folder(root, parent, allow_root=True, must_exist=True)
+            documents.atomic_write(dst_file, payload)
+            created.append(dst_file)
+    except Exception:
+        for path in created:
+            try:
+                path.unlink(missing_ok=True)
+            except OSError:
+                pass
+        raise
+
+
+def list_subfolders_lazy(
+    open_root: Path,
+    expanded_dirs: set[str],
+    exclude_subtree: Path | None = None,
+) -> list[dict]:
+    """List the open root and lazily expanded subdirectories for the Move-to-folder picker."""
+    root = open_root.resolve(strict=True)
+    excluded = exclude_subtree.resolve(strict=False) if exclude_subtree is not None else None
+
+    def has_visible_subdirs(directory: Path) -> bool:
+        try:
+            for child in directory.iterdir():
+                if child.name.startswith(".") or child.is_symlink():
+                    continue
+                if child.is_dir():
+                    resolved_child = child.resolve(strict=False)
+                    if excluded is not None and (resolved_child == excluded or resolved_child.is_relative_to(excluded)):
+                        continue
+                    return True
+        except OSError:
+            return False
+        return False
+
+    rows: list[dict] = [
+        {
+            "name": root.name or str(root),
+            "path": str(root),
+            "depth": 0,
+            "expanded": True,
+            "hasChildren": has_visible_subdirs(root),
+            "isRoot": True,
+        }
+    ]
+
+    def visit(directory: Path, depth: int) -> None:
+        try:
+            children = sorted(directory.iterdir(), key=lambda p: p.name.lower())
+        except OSError:
+            return
+        for child in children:
+            if len(rows) >= 1500:
+                return
+            if child.name.startswith(".") or child.is_symlink() or not child.is_dir():
+                continue
+            resolved_child = child.resolve(strict=False)
+            if excluded is not None and (resolved_child == excluded or resolved_child.is_relative_to(excluded)):
+                continue
+            is_expanded = str(resolved_child) in expanded_dirs
+            rows.append(
+                {
+                    "name": child.name,
+                    "path": str(resolved_child),
+                    "depth": depth,
+                    "expanded": is_expanded,
+                    "hasChildren": has_visible_subdirs(resolved_child),
+                    "isRoot": False,
+                }
+            )
+            if is_expanded:
+                visit(resolved_child, depth + 1)
+
+    visit(root, 1)
+    return rows

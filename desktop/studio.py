@@ -26,9 +26,10 @@ import urllib.request
 import uuid
 from pathlib import Path
 from network_tls import client_context
-from PySide6.QtCore import QObject, Property, Signal, Slot, QStandardPaths, QTimer, QUrl, QFileSystemWatcher, QProcess, Qt, QPointF, QRect, QMetaObject, QBuffer, QByteArray, QIODevice
+from PySide6.QtCore import QObject, Property, Signal, Slot, QStandardPaths, QTimer, QUrl, QFile, QFileSystemWatcher, QProcess, Qt, QPointF, QRect, QMetaObject, QBuffer, QByteArray, QIODevice
 from PySide6.QtGui import QDesktopServices, QFontDatabase, QGuiApplication, QCursor, QImage
 from documents import atomic_write, atomic_json, bundle, image_data, materialize_assets, open_note, write_portable, MIMES, MAX_IMAGE
+import folder_ops
 from markdown_export import write_markdown_export, write_markdown_zip
 from theme import detect_system_dark, read_system_palette, system_palette_paths, tokens
 from fonts import FontStore
@@ -298,6 +299,8 @@ class Studio(QObject):
     themePickerRequested = Signal()
     themeExportRequested = Signal()
     noteLocationPickerRequested = Signal()
+    moveTargetsLoaded = Signal(str)
+    moveImagesPromptRequested = Signal(str, str, int, bool)
     flushFailed = Signal(bool)
     pythonProgress = Signal(str)
     agentRequest = Signal(str)
@@ -1640,6 +1643,12 @@ class Studio(QObject):
             self.settings["newNoteLocation"] = str(directory)
             self._preferences(); self._emit(False)
 
+    @Slot()
+    def clearNoteLocation(self):
+        if self.settings.get("newNoteLocation"):
+            self.settings["newNoteLocation"] = ""
+            self._preferences(); self._emit(False)
+
     @Slot(str)
     def importFont(self,value):
         try:
@@ -2059,6 +2068,7 @@ class Studio(QObject):
         elif operation["action"] == "detach_tab":
             if self._can_move(): self.detachedWindowRequested.emit(self.window_id, operation["target"])
         elif operation["action"] == "close_tab": self.closeTab(operation["target"])
+        elif operation["action"] == "trash_entry": self._trash_entry_now(operation["target"])
         elif operation["action"] == "close_window" and self.requestWindowClose():
             self._recover()
             QTimer.singleShot(0,self.allowClose.emit)
@@ -2143,33 +2153,560 @@ class Studio(QObject):
             if tab["path"] and tab["content"] != tab["saved"] and tab["id"] not in self.saving:
                 self._save_text(tab,Path(tab["path"]),automatic=True)
 
+    def _sync_path_change(self, old_path: str, new_path: str, *, is_dir: bool, message: str = ""):
+        for win in list(self.session.windows.values()):
+            if win.retired:
+                continue
+            for tab in win.tabs:
+                if tab["path"] and folder_ops.matches_path_prefix(tab["path"], old_path, is_directory=is_dir):
+                    updated = folder_ops.remap_path_prefix(tab["path"], old_path, new_path, is_directory=is_dir)
+                    tab.update(path=updated, name=Path(updated).name)
+        remapped_agent = {
+            folder_ops.remap_path_prefix(p, old_path, new_path, is_directory=is_dir)
+            for p in self._agent_open_paths
+        }
+        self._agent_open_paths.clear()
+        self._agent_open_paths.update(remapped_agent)
+        for loc_key in list(self.session.locations.keys()):
+            if folder_ops.matches_path_prefix(loc_key, old_path, is_directory=is_dir):
+                value = self.session.locations.pop(loc_key)
+                self.session.locations[folder_ops.remap_path_prefix(loc_key, old_path, new_path, is_directory=is_dir)] = value
+        self.session.pinned = list(dict.fromkeys(
+            folder_ops.remap_path_prefix(p, old_path, new_path, is_directory=is_dir)
+            for p in self.session.pinned
+        ))
+        self.recent = [
+            folder_ops.remap_path_prefix(p, old_path, new_path, is_directory=is_dir)
+            for p in self.recent
+        ]
+        for entries in self.session.workspace.values():
+            for entry in entries:
+                if entry.get("path") and folder_ops.matches_path_prefix(entry["path"], old_path, is_directory=is_dir):
+                    entry["path"] = folder_ops.remap_path_prefix(entry["path"], old_path, new_path, is_directory=is_dir)
+        self.session.startup_paths = [
+            folder_ops.remap_path_prefix(p, old_path, new_path, is_directory=is_dir)
+            for p in self.session.startup_paths
+        ]
+        if self.session.startup_active:
+            self.session.startup_active = folder_ops.remap_path_prefix(
+                self.session.startup_active, old_path, new_path, is_directory=is_dir
+            )
+        for entry in self.session.startup_entries:
+            if entry.get("path") and folder_ops.matches_path_prefix(entry["path"], old_path, is_directory=is_dir):
+                entry["path"] = folder_ops.remap_path_prefix(entry["path"], old_path, new_path, is_directory=is_dir)
+        if message:
+            self.message = message
+        self._save_positions()
+        self._preferences(notify=False)
+        for win in list(self.session.windows.values()):
+            if win.retired:
+                continue
+            win.expanded = {
+                folder_ops.remap_path_prefix(p, old_path, new_path, is_directory=is_dir)
+                for p in win.expanded
+            }
+            win._watch_notes(force=True)
+            win._recover()
+            if win.folder:
+                win._load_tree()
+            win._emit()
+
+    @Slot(str)
+    def notifyMessage(self, text):
+        self.message = str(text or "")
+        self._emit(False)
+
+    @Slot(str, str, str)
+    def createFolderNote(self, parent_path, name, fmt="md"):
+        if not self.folder:
+            self.message = "Open a folder first."
+            self._emit(False)
+            return
+        kind = (fmt or "md").strip().lower().lstrip(".")
+        if kind not in ("md", "smd"):
+            self.message = "Choose Markdown (.md) or portable Super MD (.smd)."
+            self._emit(False)
+            return
+        try:
+            target_dir = folder_ops.resolve_within_open_folder(self.folder, parent_path or self.folder, allow_root=True, must_exist=True)
+            if not target_dir.is_dir():
+                raise ValueError("Choose an existing target folder.")
+            filename = folder_ops.validate_entry_name(name, is_directory=False, current_ext="." + kind)
+            target = target_dir / filename
+            folder_ops.resolve_within_open_folder(self.folder, target, allow_root=False, must_exist=False)
+        except ValueError as error:
+            self.message = str(error)
+            self._emit(False)
+            return
+        self._activation_generation += 1
+        generation = self._activation_generation
+
+        def work():
+            if target.exists() or target.is_symlink():
+                raise ValueError("An item with that name already exists.")
+            if kind == "smd":
+                write_portable(target, "", {})
+            else:
+                atomic_write(target, b"")
+            return str(target.resolve(strict=True))
+
+        def finished(created_path, error):
+            if error or not created_path:
+                return
+            created = Path(created_path)
+            for win in list(self.session.windows.values()):
+                if not win.retired and win.folder:
+                    try:
+                        win_root = Path(win.folder).resolve(strict=False)
+                        if created.is_relative_to(win_root):
+                            win.expanded.update(folder_ops.ancestor_directories_in_folder(win_root, created.parent))
+                            win._load_tree()
+                    except OSError:
+                        pass
+            existing = next((t for t in self.tabs if t["path"] == created_path), None)
+            if existing is None:
+                note = self._note(created.name, "", created_path, "", {}, kind == "smd")
+                self._agent_open_paths.add(created_path)
+                self.tabs.append(note)
+            else:
+                note = existing
+            if generation == self._activation_generation:
+                self.active = note["id"]
+            self.settings["welcomed"] = True
+            self.recent = [created_path] + [p for p in self.recent if p != created_path][:29]
+            self.message = f"Created {created.name}"
+            self._watch_notes(force=True)
+            self._preferences()
+            self.recovery_timer.start(800)
+            self._emit()
+            if generation == self._activation_generation:
+                self._focus_open_target(generation)
+
+        self._submit(work, finished, executor=self.writes)
+
+    @Slot(str, str)
+    def createSubfolder(self, parent_path, name):
+        if not self.folder:
+            self.message = "Open a folder first."
+            self._emit(False)
+            return
+        try:
+            target_dir = folder_ops.resolve_within_open_folder(self.folder, parent_path or self.folder, allow_root=True, must_exist=True)
+            if not target_dir.is_dir():
+                raise ValueError("Choose an existing target folder.")
+            dirname = folder_ops.validate_entry_name(name, is_directory=True)
+            target = target_dir / dirname
+            folder_ops.resolve_within_open_folder(self.folder, target, allow_root=False, must_exist=False)
+        except ValueError as error:
+            self.message = str(error)
+            self._emit(False)
+            return
+
+        def work():
+            if target.exists() or target.is_symlink():
+                raise ValueError("An item with that name already exists.")
+            target.mkdir(parents=False, exist_ok=False)
+            return str(target.resolve(strict=True))
+
+        def finished(created_dir, error):
+            if error or not created_dir:
+                return
+            created = Path(created_dir)
+            for win in list(self.session.windows.values()):
+                if not win.retired and win.folder:
+                    try:
+                        win_root = Path(win.folder).resolve(strict=False)
+                        if created.is_relative_to(win_root):
+                            win.expanded.update(folder_ops.ancestor_directories_in_folder(win_root, created))
+                            win._load_tree()
+                    except OSError:
+                        pass
+            self.message = f"Created folder {created.name}"
+            self._emit(False)
+
+        self._submit(work, finished, executor=self.writes)
+
+    @Slot(str, str)
+    def renameEntry(self, entry_path, name):
+        if not self.folder:
+            self.message = "Open a folder first."
+            self._emit(False)
+            return
+        try:
+            before = folder_ops.resolve_within_open_folder(self.folder, entry_path, allow_root=False, must_exist=True)
+            is_dir = before.is_dir()
+            final_name = folder_ops.validate_entry_name(
+                name,
+                is_directory=is_dir,
+                current_ext="" if is_dir else (before.suffix or ".md"),
+            )
+            after = before.with_name(final_name)
+            if after != before:
+                folder_ops.resolve_within_open_folder(self.folder, after, allow_root=False, must_exist=False)
+        except ValueError as error:
+            self.message = str(error)
+            self._emit(False)
+            return
+        if after == before:
+            return
+        for win in list(self.session.windows.values()):
+            for tab in win.tabs:
+                if tab["id"] in win.saving and folder_ops.matches_path_prefix(tab["path"], str(before), is_directory=is_dir):
+                    self.message = "Wait for the current save to finish."
+                    self._emit(False)
+                    return
+
+        def work():
+            if after.is_symlink():
+                raise ValueError("Symlinks are not allowed inside the open folder.")
+            if after.exists():
+                same_inode = False
+                if before.name.casefold() == final_name.casefold():
+                    try:
+                        same_inode = os.path.samestat(before.stat(), after.stat())
+                    except OSError:
+                        same_inode = False
+                if not same_inode:
+                    raise ValueError("An item with that name already exists.")
+            before.rename(after)
+            return str(before), str(after.resolve(strict=True)), is_dir
+
+        def finished(result, error):
+            if error or not result:
+                return
+            old_str, new_str, was_dir = result
+            self._sync_path_change(old_str, new_str, is_dir=was_dir, message=f"Renamed to {Path(new_str).name}")
+
+        self._submit(work, finished, executor=self.writes)
+
+    @Slot(str, str)
+    def loadMoveTargets(self, exclude_path="", expanded_json="[]"):
+        if not self.folder:
+            self.moveTargetsLoaded.emit("[]")
+            return
+        open_root_str = self.folder
+
+        def scan():
+            root = Path(open_root_str).resolve(strict=True)
+            try:
+                expanded = set(json.loads(expanded_json or "[]"))
+            except (TypeError, ValueError):
+                expanded = set()
+            excluded = None
+            if exclude_path:
+                try:
+                    candidate = folder_ops.resolve_within_open_folder(root, exclude_path, allow_root=False, must_exist=True)
+                    if candidate.is_dir():
+                        excluded = candidate
+                except ValueError:
+                    excluded = None
+            return json.dumps(folder_ops.list_subfolders_lazy(root, expanded, excluded))
+
+        def finished(payload, error):
+            if not error and payload is not None:
+                self.moveTargetsLoaded.emit(payload)
+
+        self._submit(scan, finished, busy=False)
+
+    @Slot(str, str)
+    def requestMoveEntry(self, source_path, target_dir):
+        if not self.folder:
+            self.message = "Open a folder first."
+            self._emit(False)
+            return
+        try:
+            root = Path(self.folder).resolve(strict=True)
+            source = folder_ops.resolve_within_open_folder(root, source_path, allow_root=False, must_exist=True)
+            dest_dir = folder_ops.resolve_within_open_folder(root, target_dir or self.folder, allow_root=True, must_exist=True)
+            if not dest_dir.is_dir():
+                raise ValueError("Choose an existing destination folder.")
+            is_dir = source.is_dir()
+            if is_dir and (dest_dir == source or dest_dir.is_relative_to(source)):
+                raise ValueError("Cannot move a folder into itself.")
+            if source.parent == dest_dir:
+                return
+            dest_path = dest_dir / source.name
+            folder_ops.resolve_within_open_folder(root, dest_path, allow_root=False, must_exist=False)
+            if dest_path.exists() or dest_path.is_symlink():
+                raise ValueError("An item with that name already exists in the destination folder.")
+        except (OSError, ValueError) as error:
+            self.message = str(error)
+            self._emit(False)
+            return
+
+        if is_dir or source.suffix.lower() not in folder_ops.PLAIN_MARKDOWN_SUFFIXES:
+            self.moveEntry(str(source), str(dest_dir), "move_only")
+            return
+
+        open_tab = next(
+            (t for w in self.session.windows.values() if not w.retired for t in w.tabs if t["path"] == str(source)),
+            None,
+        )
+        captured_markdown = open_tab["content"] if open_tab is not None else None
+
+        def inspect_assets():
+            markdown = captured_markdown if captured_markdown is not None else source.read_text(encoding="utf-8", errors="replace")
+            linked = folder_ops.linked_local_images(source, markdown, root, dest_dir)
+            can_copy = True
+            for _, _, dst in linked:
+                try:
+                    folder_ops.resolve_within_open_folder(root, dst, allow_root=False, must_exist=False)
+                except ValueError:
+                    can_copy = False
+                    break
+            return len(linked), can_copy
+
+        def inspected(result, error):
+            if error or result is None:
+                return
+            count, can_copy = result
+            if count > 0:
+                self.moveImagesPromptRequested.emit(str(source), str(dest_dir), count, can_copy)
+            else:
+                self.moveEntry(str(source), str(dest_dir), "move_only")
+
+        self._submit(inspect_assets, inspected, executor=self.writes)
+
+    @Slot(str, str, str)
+    def moveEntry(self, source_path, target_dir, image_action="move_only"):
+        if not self.folder:
+            self.message = "Open a folder first."
+            self._emit(False)
+            return
+        if image_action not in ("copy", "move_only"):
+            self.message = "Choose a valid move option."
+            self._emit(False)
+            return
+        try:
+            root = Path(self.folder).resolve(strict=True)
+            source = folder_ops.resolve_within_open_folder(root, source_path, allow_root=False, must_exist=True)
+            dest_dir = folder_ops.resolve_within_open_folder(root, target_dir or self.folder, allow_root=True, must_exist=True)
+            if not dest_dir.is_dir():
+                raise ValueError("Choose an existing destination folder.")
+            is_dir = source.is_dir()
+            if is_dir and (dest_dir == source or dest_dir.is_relative_to(source)):
+                raise ValueError("Cannot move a folder into itself.")
+            if source.parent == dest_dir:
+                return
+            dest_path = dest_dir / source.name
+            folder_ops.resolve_within_open_folder(root, dest_path, allow_root=False, must_exist=False)
+        except (OSError, ValueError) as error:
+            self.message = str(error)
+            self._emit(False)
+            return
+
+        for win in list(self.session.windows.values()):
+            for tab in win.tabs:
+                if tab["id"] in win.saving and folder_ops.matches_path_prefix(tab["path"], str(source), is_directory=is_dir):
+                    self.message = "Wait for the current save to finish."
+                    self._emit(False)
+                    return
+
+        open_tab = next(
+            (t for w in self.session.windows.values() if not w.retired for t in w.tabs if t["path"] == str(source)),
+            None,
+        )
+        captured_markdown = open_tab["content"] if open_tab is not None else None
+
+        def work():
+            if dest_path.exists() or dest_path.is_symlink():
+                raise ValueError("An item with that name already exists in the destination folder.")
+            if image_action == "copy" and not is_dir and source.suffix.lower() in folder_ops.PLAIN_MARKDOWN_SUFFIXES:
+                markdown = captured_markdown if captured_markdown is not None else source.read_text(encoding="utf-8", errors="replace")
+                items = folder_ops.linked_local_images(source, markdown, root, dest_dir)
+                folder_ops.copy_linked_local_images(items, root)
+            shutil.move(str(source), str(dest_path))
+            return str(source), str(dest_path.resolve(strict=True)), is_dir, str(dest_dir)
+
+        def finished(result, error):
+            if error or not result:
+                return
+            old_str, new_str, was_dir, dest_dir_str = result
+            for win in list(self.session.windows.values()):
+                if not win.retired and win.folder:
+                    try:
+                        win_root = Path(win.folder).resolve(strict=False)
+                        if Path(dest_dir_str).is_relative_to(win_root) or Path(dest_dir_str) == win_root:
+                            win.expanded.update(folder_ops.ancestor_directories_in_folder(win_root, Path(dest_dir_str)))
+                    except OSError:
+                        pass
+            self._sync_path_change(old_str, new_str, is_dir=was_dir, message=f"Moved {Path(new_str).name}")
+
+        self._submit(work, finished, executor=self.writes)
+
+    @Slot(str)
+    def trashEntry(self, entry_path):
+        if not self.folder:
+            self.message = "Open a folder first."
+            self._emit(False)
+            return
+        try:
+            target = folder_ops.resolve_within_open_folder(self.folder, entry_path, allow_root=False, must_exist=True)
+        except ValueError as error:
+            self.message = str(error)
+            self._emit(False)
+            return
+        is_dir = target.is_dir()
+        current_path = self._current()["path"]
+        if self.ready and current_path and folder_ops.matches_path_prefix(current_path, str(target), is_directory=is_dir):
+            self._flush("trash_entry", str(target))
+            return
+        self._trash_entry_now(str(target))
+
+    def _trash_entry_now(self, entry_path: str):
+        if not self.folder:
+            self.message = "Open a folder first."
+            self._emit(False)
+            return
+        try:
+            target = folder_ops.resolve_within_open_folder(self.folder, entry_path, allow_root=False, must_exist=True)
+        except ValueError as error:
+            self.message = str(error)
+            self._emit(False)
+            return
+        is_dir = target.is_dir()
+        target_str = str(target)
+
+        dirty_snapshots: list[dict] = []
+        deleted_drafts: list[dict] = []
+        seen_ids: set[str] = set()
+        for win in list(self.session.windows.values()):
+            if win.retired:
+                continue
+            for tab in win.tabs:
+                if not tab["path"] or not folder_ops.matches_path_prefix(tab["path"], target_str, is_directory=is_dir):
+                    continue
+                if tab["id"] in win.saving:
+                    self.message = "Wait for the current save to finish."
+                    self._emit(False)
+                    return
+                if tab["content"] != tab["saved"] and tab["id"] not in seen_ids:
+                    seen_ids.add(tab["id"])
+                    detached = copy.deepcopy(tab)
+                    detached["path"] = ""
+                    detached["saved"] = ""
+                    dirty_snapshots.append(detached)
+                    deleted_drafts.append({**detached, "name": "Recovered " + tab["name"]})
+
+        existing_closed = list(self.closed_tabs)
+
+        def work():
+            saved_refs: list[dict] = []
+            for snapshot in dirty_snapshots:
+                saved_refs.append(self.session.closed_note_store.save(snapshot))
+            next_refs = (saved_refs + existing_closed)[: ClosedNoteStore.LIMIT] if saved_refs else None
+            if next_refs is not None:
+                self.session.closed_note_store.save_index(next_refs)
+            qfile = QFile(target_str)
+            if not qfile.moveToTrash():
+                raise OSError(qfile.errorString() or f"Could not move {target.name} to system Trash.")
+            return next_refs
+
+        def finished(next_refs, error):
+            if error:
+                return
+            if next_refs is not None:
+                self.closed_tabs[:] = next_refs
+            if deleted_drafts:
+                self.session.drafts.setdefault("deleted-notes", []).extend(deleted_drafts)
+            for loc_key in list(self.session.locations.keys()):
+                if folder_ops.matches_path_prefix(loc_key, target_str, is_directory=is_dir):
+                    self.session.locations.pop(loc_key, None)
+            self.session.pinned = [
+                p for p in self.session.pinned
+                if not folder_ops.matches_path_prefix(p, target_str, is_directory=is_dir)
+            ]
+            self.recent = [
+                p for p in self.recent
+                if not folder_ops.matches_path_prefix(p, target_str, is_directory=is_dir)
+            ]
+            self._agent_open_paths.difference_update({
+                p for p in list(self._agent_open_paths)
+                if folder_ops.matches_path_prefix(p, target_str, is_directory=is_dir)
+            })
+            for entries in self.session.workspace.values():
+                entries[:] = [
+                    entry for entry in entries
+                    if not (entry.get("path") and folder_ops.matches_path_prefix(entry["path"], target_str, is_directory=is_dir))
+                ]
+            self.session.startup_paths = [
+                p for p in self.session.startup_paths
+                if not folder_ops.matches_path_prefix(p, target_str, is_directory=is_dir)
+            ]
+            if self.session.startup_active and folder_ops.matches_path_prefix(self.session.startup_active, target_str, is_directory=is_dir):
+                self.session.startup_active = ""
+            self.session.startup_entries = [
+                entry for entry in self.session.startup_entries
+                if not (entry.get("path") and folder_ops.matches_path_prefix(entry["path"], target_str, is_directory=is_dir))
+            ]
+            for win in list(self.session.windows.values()):
+                if win.retired:
+                    continue
+                win.expanded = {
+                    p for p in win.expanded
+                    if not folder_ops.matches_path_prefix(p, target_str, is_directory=is_dir)
+                }
+                to_close = [
+                    tab["id"] for tab in win.tabs
+                    if tab["path"] and folder_ops.matches_path_prefix(tab["path"], target_str, is_directory=is_dir)
+                ]
+                for tab_id in to_close:
+                    win._finish_remove_tab(tab_id)
+                win._watch_notes(force=True)
+                win._recover()
+                if win.folder:
+                    win._load_tree()
+                win._emit()
+            self.message = f"Moved to Trash: {target.name}" + (" (unsaved edits preserved in closed notes)" if dirty_snapshots else "")
+            self._save_positions()
+            self._preferences()
+            self._emit(False)
+
+        self._submit(work, finished, executor=self.writes)
+
     @Slot(str, str)
     def renameNote(self, id, name):
         tab = next((t for t in self.tabs if t["id"] == id),None)
         if not tab or id in self.saving: return
-        name = name.strip()
-        if not name or name in (".","..") or any(c in name for c in '/\\\x00'):
-            self.message = "Choose a filename without path separators."; self._emit(False); return
-        suffix = Path(tab["name"]).suffix or ".md"
-        if not Path(name).suffix: name += suffix
-        if Path(name).suffix.lower() != suffix.lower():
-            self.message = "Rename keeps the note format. Use Export to change formats."; self._emit(False); return
-        if not tab["path"]: tab["name"] = name; self._recover(); self._emit(False); return
-        before = Path(tab["path"]); after = before.with_name(name)
+        try:
+            final_name = folder_ops.validate_entry_name(
+                name,
+                is_directory=False,
+                current_ext=Path(tab["name"]).suffix or ".md",
+            )
+        except ValueError as error:
+            self.message = str(error); self._emit(False); return
+        if not tab["path"]: tab["name"] = final_name; self._recover(); self._emit(False); return
+        before = Path(tab["path"]); after = before.with_name(final_name)
         if before == after: return
+        if self.folder:
+            try:
+                resolved_before = before.resolve(strict=False)
+                resolved_root = Path(self.folder).resolve(strict=False)
+                if resolved_before.is_relative_to(resolved_root):
+                    self.renameEntry(str(before), final_name)
+                    return
+            except OSError:
+                pass
         def work():
-            if after.exists(): raise ValueError("A file with that name already exists.")
+            if after.is_symlink(): raise ValueError("Symlinks are not allowed.")
+            if after.exists():
+                same_inode = False
+                if before.name.casefold() == final_name.casefold():
+                    try: same_inode = os.path.samestat(before.stat(), after.stat())
+                    except OSError: same_inode = False
+                if not same_inode:
+                    raise ValueError("A file with that name already exists.")
             before.rename(after)
         def finished(_,error):
             if error: return
-            tab.update(path=str(after),name=name)
-            self.recent = [str(after) if p == str(before) else p for p in self.recent]
-            self._preferences(); self._recover(); self._emit(); self._load_tree()
+            self._sync_path_change(str(before), str(after), is_dir=False, message=f"Renamed to {final_name}")
         self._submit(work,finished,executor=self.writes)
 
     @Slot(str,result=QUrl)
     def defaultSaveLocation(self,name):
-        directory = self.settings.get("newNoteLocation") or QStandardPaths.writableLocation(QStandardPaths.DownloadLocation) or str(Path.home())
+        open_folder = self.folder if (self.folder and Path(self.folder).is_dir()) else ""
+        directory = self.settings.get("newNoteLocation") or open_folder or QStandardPaths.writableLocation(QStandardPaths.DownloadLocation) or str(Path.home())
         return QUrl.fromLocalFile(str(Path(directory)/Path(name).name))
 
     @Slot(str, result=QUrl)
