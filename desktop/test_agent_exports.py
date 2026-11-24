@@ -205,6 +205,52 @@ class AgentExportsTest(unittest.TestCase):
         self.assertEqual((self.root / "extracted.svg").read_bytes(), svg)
         self.assertEqual(source.read_bytes(), original_source)
 
+    def test_pdf_export_embeds_custom_fonts_with_uppercase_ttf_and_otf_extensions(self):
+        repo_root = Path(__file__).resolve().parent.parent
+        raw_ttf = (repo_root / "smd-core" / "fonts" / "NotoSans-Regular.ttf").read_bytes()
+
+        def rename_sfnt(raw: bytes, family: str, postscript: str) -> bytes:
+            num_tables = struct.unpack(">H", raw[4:6])[0]
+            entries = [
+                (1, family), (2, "Regular"), (3, postscript),
+                (4, f"{family} Regular"), (6, postscript),
+                (16, family), (17, "Regular"),
+            ]
+            header_len = 6 + len(entries) * 12
+            records = bytearray()
+            strings = bytearray()
+            for name_id, value in entries:
+                encoded = value.encode("utf-16-be")
+                records += struct.pack(">6H", 3, 1, 0x0409, name_id, len(encoded), len(strings))
+                strings += encoded
+            name_table = struct.pack(">3H", 0, len(entries), header_len) + bytes(records) + bytes(strings)
+            padded_table = name_table + b"\x00" * ((4 - len(name_table) % 4) % 4)
+            checksum = sum(struct.unpack(f">{len(padded_table) // 4}I", padded_table)) & 0xFFFFFFFF
+            out = bytearray(raw)
+            out += b"\x00" * ((4 - len(out) % 4) % 4)
+            offset = len(out)
+            out += padded_table
+            for idx in range(num_tables):
+                rec = 12 + idx * 16
+                if out[rec:rec + 4] == b"name":
+                    out[rec + 4:rec + 16] = struct.pack(">3I", checksum, offset, len(name_table))
+                    break
+            return bytes(out)
+
+        font_dir = self.root / "custom-fonts"
+        font_dir.mkdir()
+        (font_dir / "HeadlineFace.TTF").write_bytes(rename_sfnt(raw_ttf, "AgentUpperTtf", "AgentUpperTtf-Regular"))
+        (font_dir / "SecondaryFace.OTF").write_bytes(rename_sfnt(raw_ttf, "AgentUpperOtf", "AgentUpperOtf-Regular"))
+
+        (self.root / "fonts-note.md").write_text("# Custom Font Export\n\nBody text.\n", encoding="utf-8")
+        ttf_opts = {**DEFAULT_PDF_OPTIONS, "fontFamily": "AgentUpperTtf"}
+        export_pdf(self.store, "fonts-note.md", "ttf.pdf", options=ttf_opts, font_dir=font_dir, engine=self.engine)
+        self.assertIn(b"AgentUpperTtf-Regular", (self.root / "ttf.pdf").read_bytes())
+
+        otf_opts = {**DEFAULT_PDF_OPTIONS, "fontFamily": "AgentUpperOtf"}
+        export_pdf(self.store, "fonts-note.md", "otf.pdf", options=otf_opts, font_dir=font_dir, engine=self.engine)
+        self.assertIn(b"AgentUpperOtf-Regular", (self.root / "otf.pdf").read_bytes())
+
 
 if __name__ == "__main__":
     unittest.main()
