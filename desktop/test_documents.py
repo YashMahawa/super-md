@@ -147,31 +147,43 @@ class DocumentsTest(unittest.TestCase):
 
     def test_structural_envelope_validation_defers_base64_decode_and_enforces_limits(self):
         import documents
+        import gzip
         from unittest.mock import patch
         from documents import decode_note_bytes, validate_envelope
 
         png = b"\x89PNG\r\n\x1a\n" + b"p" * 128
         assets = {"assets/pic.png": "data:image/png;base64," + base64.b64encode(png).decode("ascii")}
-        packed = compressed_bundle("# Heading\n\n![pic](assets/pic.png)\n", assets)
+        packed = gzip.compress(
+            json.dumps({"format": "supermd-smd", "version": 1, "markdown": "# Heading\n\n![pic](assets/pic.png)\n", "assets": assets}).encode("utf-8")
+        )
 
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             smd = root / "note.smd"
             smd.write_bytes(packed)
             json_smd = root / "plain-json.smd"
-            json_smd.write_text(json.dumps(bundle("# JSON note\n", assets)), encoding="utf-8")
+            json_smd.write_text(
+                json.dumps({"format": "supermd-smd", "version": 1, "markdown": "# JSON note\n", "assets": assets}),
+                encoding="utf-8",
+            )
 
             with patch("documents.base64.b64decode", wraps=base64.b64decode) as spy:
-                text, loaded_assets, portable = open_note(smd)
+                text, loaded_assets, portable = open_note(smd, decode_assets=False)
                 self.assertTrue(portable)
                 self.assertEqual(loaded_assets, assets)
-                self.assertEqual(decode_note_bytes(packed, smd), (text, assets, True))
-                self.assertEqual(open_note(json_smd), ("# JSON note\n", assets, True))
-                write_portable(smd, "# Updated\n", loaded_assets, validate_assets=False)
-                write_portable(smd, "# Updated again\n", loaded_assets, validated_assets=loaded_assets)
-                self.assertEqual(open_note(smd)[0], "# Updated again\n")
+                self.assertEqual(decode_note_bytes(packed, smd, decode_assets=False), (text, assets, True))
+                self.assertEqual(open_note(json_smd, decode_assets=False), ("# JSON note\n", assets, True))
                 self.assertEqual(spy.call_count, 0)
 
+                # Structurally checked assets are NOT yet payload-validated, so first save validates once,
+                # and subsequent saves/opens skip re-decoding.
+                write_portable(smd, "# Updated\n", loaded_assets, validated_assets=loaded_assets)
+                self.assertEqual(spy.call_count, 1)
+                write_portable(smd, "# Updated again\n", loaded_assets, validated_assets=loaded_assets)
+                self.assertEqual(open_note(smd)[0], "# Updated again\n")
+                self.assertEqual(spy.call_count, 1)
+
+                spy.reset_mock()
                 # Exact 25 MB encoded bound passes structural validation; 25 MB + 1 byte fails.
                 exact_25mb_len = (documents.MAX_IMAGE // 3) * 4 + 4  # 33,333,336 chars -> 25,000,000 bytes with '=='
                 exact_25mb = "A" * (exact_25mb_len - 2) + "=="
@@ -211,24 +223,65 @@ class DocumentsTest(unittest.TestCase):
                         validate_envelope(invalid_envelope)
                 self.assertEqual(spy.call_count, 0)
 
-            # Untrusted validation entry points continue to run full base64.b64decode(..., validate=True).
-            malformed = {"assets/bad.png": "data:image/png;base64,@@@@"}
-            validate_envelope({"format": "supermd-smd", "version": 1, "markdown": "", "assets": malformed})
-            with self.assertRaises(ValueError):
-                validate({"format": "supermd-smd", "version": 1, "markdown": "", "assets": malformed})
-            with self.assertRaises(ValueError):
-                bundle("", malformed)
-            with self.assertRaises(ValueError):
-                write_portable(root / "bad.smd", "", malformed)
-            with self.assertRaises(ValueError):
-                write_portable(root / "bad2.smd", "", {**assets, **malformed}, validated_assets=assets)
-            with self.assertRaises(ValueError):
-                materialize_assets(root / "out", malformed)
+    def test_corrupted_portable_note_rejected_on_open_and_cannot_be_rewritten(self):
+        import gzip
+        from documents import decode_note_bytes, validate_envelope
+
+        png = b"\x89PNG\r\n\x1a\n" + b"v" * 64
+        valid_assets = {"assets/ok.png": "data:image/png;base64," + base64.b64encode(png).decode("ascii")}
+        bundle("# Prime valid asset\n", valid_assets)
+
+        malformed = {"assets/bad.png": "data:image/png;base64,@@@@"}
+        corrupted_envelope = {
+            "format": "supermd-smd",
+            "version": 1,
+            "markdown": "# Damaged archive\n\n![bad](assets/bad.png)\n",
+            "assets": malformed,
+        }
+        # Framing check passes (4-char aligned, valid header), but payload is invalid base64.
+        validate_envelope(corrupted_envelope)
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            bad_gzip_bytes = gzip.compress(json.dumps(corrupted_envelope).encode("utf-8"))
             bad_smd = root / "corrupt-b64.smd"
-            write_portable(bad_smd, "# text", malformed, validate_assets=False)
-            self.assertEqual(open_note(bad_smd)[0], "# text")
+            bad_smd.write_bytes(bad_gzip_bytes)
+
+            bad_json_bytes = json.dumps(corrupted_envelope).encode("utf-8")
+            bad_json_smd = root / "corrupt-json.smd"
+            bad_json_smd.write_bytes(bad_json_bytes)
+
+            # Normal open_note and decode_note_bytes reject damaged archives just like main.
             with self.assertRaises(ValueError):
-                open_note(bad_smd, decode_assets=True)
+                open_note(bad_smd)
+            with self.assertRaises(ValueError):
+                decode_note_bytes(bad_gzip_bytes, bad_smd)
+            with self.assertRaises(ValueError):
+                open_note(bad_json_smd)
+            with self.assertRaises(ValueError):
+                decode_note_bytes(bad_json_bytes, bad_json_smd)
+
+            # Structural-only open returns saved_assets for conflict checks without tainting normal opens or saves.
+            md, struct_assets, is_portable = open_note(bad_smd, decode_assets=False)
+            self.assertEqual(md, corrupted_envelope["markdown"])
+            self.assertTrue(is_portable)
+            with self.assertRaises(ValueError):
+                open_note(bad_smd)
+
+            # Passing structurally checked assets via validated_assets must NEVER bypass payload validation.
+            with self.assertRaises(ValueError):
+                validate(corrupted_envelope)
+            with self.assertRaises(ValueError):
+                bundle("# Edited\n", struct_assets, validated_assets=struct_assets)
+            with self.assertRaises(ValueError):
+                compressed_bundle("# Edited\n", struct_assets, validated_assets=struct_assets)
+            with self.assertRaises(ValueError):
+                write_portable(bad_smd, "# Edited\n", struct_assets, validated_assets=struct_assets)
+            with self.assertRaises(ValueError):
+                write_portable(root / "mixed.smd", "# Mixed\n", {**valid_assets, **struct_assets}, validated_assets={**valid_assets, **struct_assets})
+            with self.assertRaises(ValueError):
+                materialize_assets(root / "out", struct_assets)
+            self.assertEqual(bad_smd.read_bytes(), bad_gzip_bytes)
 
     def test_repeat_portable_saves_skip_repeat_base64_decoding_and_preserve_caps(self):
         import documents

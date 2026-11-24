@@ -569,16 +569,35 @@ class AgentDocumentsTest(unittest.TestCase):
             self.assertEqual(gzip_spy.call_count, 1)
             self.assertEqual(b64_spy.call_count, 45)
 
-        # Malformed base64 and stale revisions are rejected by read_asset and extract_asset.
+        # Malformed base64 and stale revisions are rejected by read_asset, extract_asset, and mutations.
+        import gzip
         bad_note = self.root / "bad_b64.smd"
-        documents.write_portable(bad_note, "# Bad\n", {"assets/bad.png": "data:image/png;base64,@@@@"}, validate_assets=False)
-        bad_rev = hashlib.sha256(bad_note.read_bytes()).hexdigest()
+        bad_bytes = gzip.compress(json.dumps({
+            "format": "supermd-smd",
+            "version": 1,
+            "markdown": "# Bad\n",
+            "assets": {"assets/bad.png": "data:image/png;base64,@@@@"},
+        }).encode("utf-8"))
+        bad_note.write_bytes(bad_bytes)
+        bad_rev = hashlib.sha256(bad_bytes).hexdigest()
+        self.assertEqual(self.store.read("bad_b64.smd")["text"], "# Bad\n")
         with self.assertRaises(RevisionConflict):
             self.store.read_asset("bad_b64.smd", "assets/bad.png", expected_revision="0" * 64)
         with self.assertRaises(AgentDocumentError):
             self.store.read_asset("bad_b64.smd", "assets/bad.png", expected_revision=bad_rev)
         with self.assertRaises(AgentDocumentError):
             self.store.extract_asset("bad_b64.smd", "assets/bad.png", "never.png", expected_revision=bad_rev)
+        with self.assertRaises(AgentDocumentError):
+            self.store.patch(
+                "bad_b64.smd",
+                expected_revision=bad_rev,
+                operations=[{"type": "replace", "old": "# Bad", "new": "# Rewritten"}],
+            )
+        valid_png = self.root / "extra.png"
+        valid_png.write_bytes(b"\x89PNG\r\n\x1a\nvalid")
+        with self.assertRaises(AgentDocumentError):
+            self.store.attach_asset("bad_b64.smd", "extra.png", expected_revision=bad_rev)
+        self.assertEqual(bad_note.read_bytes(), bad_bytes)
 
     def test_envelope_cache_invalidation_mutations_and_lru_byte_budget(self):
         import documents

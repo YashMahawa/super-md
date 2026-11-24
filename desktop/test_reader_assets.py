@@ -210,7 +210,9 @@ class ReaderAssetTests(unittest.TestCase):
 
                 with patch.object(documents.base64, "b64decode", wraps=base64.b64decode) as b64_spy:
                     content, loaded_assets, portable = documents.open_note(smd_path)
-                    self.assertEqual(b64_spy.call_count, 0)
+                    # Normal cold open payload-validates embedded assets once.
+                    self.assertEqual(b64_spy.call_count, 2)
+                    b64_spy.reset_mock()
                     tab = studio._current()
                     tab.update(
                         path=str(smd_path), name=smd_path.name, content=content, saved=content,
@@ -324,7 +326,7 @@ class ReaderAssetTests(unittest.TestCase):
                     self.assertEqual(b64_spy.call_count, 0)
 
                     # External Markdown edit pauses autosave without decoding images or overwriting disk.
-                    documents.write_portable(note, "# External change\n", loaded_assets, validate_assets=False)
+                    documents.write_portable(note, "# External change\n", loaded_assets)
                     tab["content"] = "# Local draft\n"
                     studio._save_text(tab, note, automatic=True)
                     wait_for_save()
@@ -351,6 +353,54 @@ class ReaderAssetTests(unittest.TestCase):
                         wait_for_save()
                         self.assertEqual(note.read_bytes(), damaged)
                     self.assertEqual(b64_spy.call_count, 0)
+
+                # Damaged .smd with invalid base64 image is rejected on Studio open and cannot be rewritten by save.
+                import gzip
+                corrupt_smd = root / "corrupt-image.smd"
+                corrupt_bytes = gzip.compress(json.dumps({
+                    "format": "supermd-smd",
+                    "version": 1,
+                    "markdown": "# Corrupted image\n\n![](assets/bad.png)\n",
+                    "assets": {"assets/bad.png": "data:image/png;base64,@@@@"},
+                }).encode("utf-8"))
+                corrupt_smd.write_bytes(corrupt_bytes)
+
+                def run_sync(action, done, *_a, **_kw):
+                    try:
+                        done(action(), None)
+                    except Exception as err:
+                        done(None, str(err))
+
+                with patch.object(studio, "_submit", side_effect=run_sync):
+                    studio._open_note(str(corrupt_smd), explicit=True)
+                    self.assertFalse(any(t.get("path") == str(corrupt_smd) for t in studio.tabs))
+
+                    _, struct_bad_assets, _ = documents.open_note(corrupt_smd, decode_assets=False)
+                    bad_tab = studio._current()
+                    bad_tab.update(
+                        path=str(corrupt_smd),
+                        name=corrupt_smd.name,
+                        content="# Attempted edit\n",
+                        saved="# Corrupted image\n\n![](assets/bad.png)\n",
+                        assets=dict(struct_bad_assets),
+                        saved_assets=dict(struct_bad_assets),
+                        portable=True,
+                    )
+                    studio._save_text(bad_tab, corrupt_smd, automatic=False)
+                    self.assertEqual(corrupt_smd.read_bytes(), corrupt_bytes)
+                    self.assertNotEqual(bad_tab["saved"], "# Attempted edit\n")
+
+                    replies = []
+                    studio.replied.connect(lambda identifier, value, error: replies.append((identifier, value, error)))
+                    studio.post("save-fmd", "export_fmd_native", json.dumps({
+                        "save": True,
+                        "id": bad_tab["id"],
+                        "content": "# Attempted export save\n",
+                        "originalContent": "# Attempted export save\n",
+                        "assets": dict(struct_bad_assets),
+                    }))
+                    self.assertEqual(corrupt_smd.read_bytes(), corrupt_bytes)
+                    self.assertTrue(replies and replies[-1][2])
         finally:
             studio.stop()
             studio.pool.shutdown(wait=True, cancel_futures=True)

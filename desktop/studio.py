@@ -2849,7 +2849,7 @@ class Studio(QObject):
                     changed_on_disk = bool(automatic)
                 else:
                     try:
-                        disk_content, disk_assets, _ = open_note(path)
+                        disk_content, disk_assets, _ = open_note(path, decode_assets=False)
                         changed_on_disk = disk_content != expected or (portable and disk_assets != expected_assets)
                     except Exception:
                         changed_on_disk = True
@@ -4403,7 +4403,7 @@ class Studio(QObject):
                     target_path = Path(captured["path"]) if args.get("save") else Path(output)
                     if args.get("save") and not force_portable_overwrite and target_path.exists():
                         try:
-                            disk_content, disk_assets, _ = open_note(target_path)
+                            disk_content, disk_assets, _ = open_note(target_path, decode_assets=False)
                             if disk_content != captured["saved"] or disk_assets != captured.get("saved_assets", {}):
                                 return {"_conflict": True}
                         except Exception:

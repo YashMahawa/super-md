@@ -449,9 +449,17 @@ class DocumentStore:
             after_stat = self._try_stat_key(path)
             if (cached is not None and before_stat is not None and after_stat == before_stat
                     and len(raw) == cached.raw_size and digest_bytes(raw) == cached.revision):
+                if cached.portable:
+                    try:
+                        documents.validate({
+                            "format": "supermd-smd", "version": 1,
+                            "markdown": cached.text, "assets": cached.assets,
+                        })
+                    except ValueError as exc:
+                        raise AgentDocumentError(str(exc)) from exc
                 return cached.text, dict(cached.assets), cached.portable, raw
             try:
-                text, assets, portable = documents.decode_note_bytes(raw, path, decode_assets=False)
+                text, assets, portable = documents.decode_note_bytes(raw, path)
             except (ValueError, OSError, UnicodeError) as exc:
                 raise AgentDocumentError(str(exc)) from exc
             stable = before_stat is not None and after_stat == before_stat and len(raw) == before_stat[3]
@@ -552,7 +560,7 @@ class DocumentStore:
         if path.exists():
             raise RevisionConflict("A file already exists at this path; creation never overwrites")
         portable = path.suffix.lower() == ".smd"
-        data = _serialize(path, content, {}, portable=portable, validate_assets=False)
+        data = _serialize(path, content, {}, portable=portable)
         revision = digest_bytes(data)
         with _path_lock(path):
             if path.exists():
@@ -577,7 +585,7 @@ class DocumentStore:
             edited, operation_results = apply_patch_operations_detailed(entry.text, operations)
             if len(edited.encode("utf-8")) > 20_000_000:
                 raise AgentDocumentError("Edited Markdown exceeds the 20 MB limit")
-            data = _serialize(path, edited, entry.assets, portable=entry.portable, validate_assets=False)
+            data = _serialize(path, edited, entry.assets, portable=entry.portable)
             # Recheck immediately before atomic replace to catch ordinary
             # external writers that do not participate in our lock protocol.
             if digest_bytes(self._read_raw(path)) != expected_revision:
@@ -653,7 +661,8 @@ class DocumentStore:
         elif documents.MIMES.get(named_ext) != mime:
             raise AgentDocumentError("Asset name extension must match the image type")
         asset_key = "assets/" + filename
-        data_url = f"data:{mime};base64," + base64.b64encode(raw_asset).decode("ascii")
+        data_url = f"data:{mime};base64," + documents.encode_base64_chunked(raw_asset)
+        documents._cache_validated_asset(data_url, mime, len(raw_asset))
         with _path_lock(path):
             entry = self._load_entry(path)
             if entry.revision != expected_revision:
@@ -664,7 +673,7 @@ class DocumentStore:
                 raise AgentDocumentError(f"An asset named {asset_key} already exists; choose another name")
             updated = dict(entry.assets)
             updated[asset_key] = data_url
-            data = _serialize(path, entry.text, updated, portable=True, validate_assets=False)
+            data = _serialize(path, entry.text, updated, portable=True)
             if digest_bytes(self._read_raw(path)) != expected_revision:
                 with self._cache_lock:
                     self._invalidate_path_locked(path, entry.stat_key)
@@ -717,8 +726,10 @@ class DocumentStore:
                 return {"path": self.display_path(path), "asset": _asset_record(asset_name, old_mime, len(old_data), old_sha),
                         "previous_revision": revision, "revision": revision, "saved": False, "changed": False}
             updated = dict(entry.assets)
-            updated[asset_name] = f"data:{mime};base64," + base64.b64encode(raw_asset).decode("ascii")
-            data = _serialize(path, entry.text, updated, portable=True, validate_assets=False)
+            new_url = f"data:{mime};base64," + documents.encode_base64_chunked(raw_asset)
+            documents._cache_validated_asset(new_url, mime, len(raw_asset))
+            updated[asset_name] = new_url
+            data = _serialize(path, entry.text, updated, portable=True)
             if digest_bytes(self._read_raw(path)) != expected_revision:
                 with self._cache_lock:
                     self._invalidate_path_locked(path, entry.stat_key)
@@ -1113,18 +1124,11 @@ def _elide_svg_page(text: str, start: int, end: int, spans: list[dict] | None = 
     return "".join(pieces), omissions
 
 
-def _serialize(
-    path: Path,
-    text: str,
-    assets: dict[str, str],
-    *,
-    portable: bool | None = None,
-    validate_assets: bool = True,
-) -> bytes:
+def _serialize(path: Path, text: str, assets: dict[str, str], *, portable: bool | None = None) -> bytes:
     use_portable = (path.suffix.lower() == ".smd") if portable is None else portable
     if use_portable:
         try:
-            return documents.compressed_bundle(text, assets, validate_assets=validate_assets)
+            return documents.compressed_bundle(text, assets)
         except ValueError as exc:
             raise AgentDocumentError(str(exc)) from exc
     if assets:

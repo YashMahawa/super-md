@@ -638,12 +638,18 @@ class OfficialMCPClientTest(unittest.IsolatedAsyncioTestCase):
                     self.assertEqual(len(doc_decode_calls), 0)
 
                 # Malformed base64, invalid PNG magic bytes, and non-SVG XML are rejected on extract.
+                import gzip
                 bad_note = root / "malformed.smd"
-                documents.write_portable(bad_note, "# Bad\n", {
-                    "assets/bad_b64.png": "data:image/png;base64,@@@@",
-                    "assets/fake_magic.png": "data:image/png;base64," + base64.b64encode(b"not-a-png").decode("ascii"),
-                    "assets/not_svg.svg": "data:image/svg+xml;base64," + base64.b64encode(b"<html></html>").decode("ascii"),
-                }, validate_assets=False)
+                bad_note.write_bytes(gzip.compress(json.dumps({
+                    "format": "supermd-smd",
+                    "version": 1,
+                    "markdown": "# Bad\n",
+                    "assets": {
+                        "assets/bad_b64.png": "data:image/png;base64,@@@@",
+                        "assets/fake_magic.png": "data:image/png;base64," + base64.b64encode(b"not-a-png").decode("ascii"),
+                        "assets/not_svg.svg": "data:image/svg+xml;base64," + base64.b64encode(b"<html></html>").decode("ascii"),
+                    },
+                }).encode("utf-8")))
                 bad_rev = hashlib.sha256(bad_note.read_bytes()).hexdigest()
                 for bad_asset in ("assets/bad_b64.png", "assets/fake_magic.png", "assets/not_svg.svg"):
                     res = await client.call_tool("document_assets", {
