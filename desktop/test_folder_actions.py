@@ -1,6 +1,7 @@
 import json
 import os
 import shutil
+import sys
 import tempfile
 import time
 import unittest
@@ -17,9 +18,13 @@ from PySide6.QtTest import QTest
 
 from documents import open_note
 from folder_ops import (
+    canonical_path_str,
     linked_local_images,
     list_subfolders_lazy,
+    normalize_path_key,
+    normalized_relpath,
     resolve_within_open_folder,
+    same_path,
     validate_entry_name,
 )
 from shortcuts import DEFINITIONS
@@ -39,7 +44,7 @@ class FolderActionsDesktopTest(unittest.TestCase):
         cls.app = QGuiApplication.instance() or QGuiApplication(["Super MD folder tests"])
 
     def setUp(self):
-        self.temp_dir = Path(tempfile.mkdtemp(prefix="supermd-folder-test-")).resolve()
+        self.temp_dir = Path(canonical_path_str(tempfile.mkdtemp(prefix="supermd-folder-test-")))
         self.xdg_data = self.temp_dir / "xdg-data"
         self.xdg_data.mkdir(parents=True, exist_ok=True)
         self._prev_xdg = os.environ.get("XDG_DATA_HOME")
@@ -56,6 +61,11 @@ class FolderActionsDesktopTest(unittest.TestCase):
         self.studio = self._new_window()
 
     def tearDown(self):
+        trashed_paths = [
+            getattr(win, "_last_trashed_path", "")
+            for win in self.windows
+            if getattr(win, "_last_trashed_path", "")
+        ]
         for win in self.windows:
             win.stop()
             win.pool.shutdown(wait=True, cancel_futures=True)
@@ -65,6 +75,14 @@ class FolderActionsDesktopTest(unittest.TestCase):
             os.environ.pop("XDG_DATA_HOME", None)
         else:
             os.environ["XDG_DATA_HOME"] = self._prev_xdg
+        if sys.platform == "darwin":
+            for trashed in trashed_paths:
+                trashed_p = Path(trashed)
+                if trashed_p.exists() and not same_path(trashed_p, Path.home()):
+                    if trashed_p.is_dir():
+                        shutil.rmtree(trashed_p, ignore_errors=True)
+                    else:
+                        trashed_p.unlink(missing_ok=True)
         shutil.rmtree(self.temp_dir, ignore_errors=True)
         shutil.rmtree(self.session.data, ignore_errors=True)
 
@@ -72,6 +90,15 @@ class FolderActionsDesktopTest(unittest.TestCase):
         win = QuietStudio(True, self.session)
         self.windows.append(win)
         return win
+
+    def _norm(self, path: str | os.PathLike[str]) -> str:
+        return normalize_path_key(path)
+
+    def _norm_list(self, paths) -> list[str]:
+        return [normalize_path_key(p) for p in paths]
+
+    def _rel_posix(self, path: str | os.PathLike[str]) -> str:
+        return normalized_relpath(path, self.open_root)
 
     def _wait_for(self, predicate, timeout=5.0):
         deadline = time.monotonic() + timeout
@@ -100,7 +127,7 @@ class FolderActionsDesktopTest(unittest.TestCase):
         self.studio.openFolder(str(self.open_root))
         self.assertEqual(self.studio.settings["newNoteLocation"], "")
         folder_default = Path(QUrl(self.studio.defaultSaveLocation("Draft Idea.md")).toLocalFile())
-        self.assertEqual(folder_default.parent.resolve(), self.open_root.resolve())
+        self.assertEqual(self._norm(folder_default.parent), self._norm(self.open_root))
         self.assertEqual(folder_default.name, "Draft Idea.md")
 
         # With explicit newNoteLocation -> honors newNoteLocation over open_folder
@@ -108,48 +135,48 @@ class FolderActionsDesktopTest(unittest.TestCase):
         configured_dir.mkdir()
         self.studio.setNoteLocation(str(configured_dir))
         explicit_default = Path(QUrl(self.studio.defaultSaveLocation("Draft Idea.md")).toLocalFile())
-        self.assertEqual(explicit_default.parent.resolve(), configured_dir.resolve())
+        self.assertEqual(self._norm(explicit_default.parent), self._norm(configured_dir))
         self.assertEqual(explicit_default.name, "Draft Idea.md")
 
         # Clearing newNoteLocation returns defaultSaveLocation to open_folder
         self.studio.clearNoteLocation()
         self.assertEqual(self.studio.settings["newNoteLocation"], "")
         restored_default = Path(QUrl(self.studio.defaultSaveLocation("Draft Idea.md")).toLocalFile())
-        self.assertEqual(restored_default.parent.resolve(), self.open_root.resolve())
+        self.assertEqual(self._norm(restored_default.parent), self._norm(self.open_root))
 
     def test_create_md_smd_and_subfolder_auto_opens_and_expands_parent(self):
         self.studio.openFolder(str(self.open_root))
-        self._wait_for(lambda: self.studio.folder == str(self.open_root))
+        self._wait_for(lambda: same_path(self.studio.folder, self.open_root))
 
         # Create subfolder at root
         self.studio.createSubfolder(str(self.open_root), "Research")
-        research_dir = (self.open_root / "Research").resolve()
-        self._wait_for(lambda: research_dir.is_dir())
+        research_dir = Path(canonical_path_str(self.open_root / "Research"))
+        self._wait_for(lambda: research_dir.is_dir() and self.studio.busy == 0 and self._norm(research_dir) in self._norm_list(self.studio.expanded))
 
         # Collapse Research first so we verify note creation expands its parent folder
-        self.studio.expanded.discard(str(research_dir))
-        self.studio._load_tree()
-        self._wait_for(lambda: str(research_dir) not in self.studio.expanded)
+        self.studio.toggleDirectory(str(research_dir))
+        self._wait_for(lambda: self._norm(research_dir) not in self._norm_list(self.studio.expanded))
 
         # Create Markdown note inside subfolder -> auto-opens in active tab & expands Research
         self.studio.createFolderNote(str(research_dir), "Quantum Notes", "md")
-        md_file = (research_dir / "Quantum Notes.md").resolve()
+        md_file = Path(canonical_path_str(research_dir / "Quantum Notes.md"))
         self._wait_for(
             lambda: md_file.is_file()
-            and self.studio._current()["path"] == str(md_file)
+            and self.studio.busy == 0
+            and same_path(self.studio._current()["path"], md_file)
             and any(entry["name"] == "Quantum Notes.md" for entry in self.studio.files)
         )
         self.assertEqual(self.studio._current()["name"], "Quantum Notes.md")
         self.assertFalse(self.studio._current()["portable"])
-        self.assertIn(str(research_dir), self.studio.expanded)
-        visible_names = [entry["name"] for entry in self.studio.files]
-        self.assertIn("Research", visible_names)
-        self.assertIn("Quantum Notes.md", visible_names)
+        self.assertIn(self._norm(research_dir), self._norm_list(self.studio.expanded))
+        visible_rels = [self._rel_posix(entry["path"]) for entry in self.studio.files]
+        self.assertIn("Research", visible_rels)
+        self.assertIn("Research/Quantum Notes.md", visible_rels)
 
         # Create Portable (.smd) note inside nested subfolder
         self.studio.createFolderNote(str(research_dir), "Portable Study", "smd")
-        smd_file = (research_dir / "Portable Study.smd").resolve()
-        self._wait_for(lambda: smd_file.is_file() and self.studio._current()["path"] == str(smd_file))
+        smd_file = Path(canonical_path_str(research_dir / "Portable Study.smd"))
+        self._wait_for(lambda: smd_file.is_file() and self.studio.busy == 0 and same_path(self.studio._current()["path"], smd_file))
         self.assertEqual(self.studio._current()["name"], "Portable Study.smd")
         self.assertTrue(self.studio._current()["portable"])
         markdown, assets, is_portable = open_note(smd_file)
@@ -178,7 +205,7 @@ class FolderActionsDesktopTest(unittest.TestCase):
         (self.open_root / "Second.md").write_text("# Second\n", encoding="utf-8")
         self.studio.openFolder(str(self.open_root))
         self.studio.renameEntry(str(self.open_root / "Second.md"), "First")
-        self._wait_for(lambda: "already exists" in self.studio.message.lower())
+        self._wait_for(lambda: self.studio.busy == 0 and "already exists" in self.studio.message.lower())
         self.assertTrue((self.open_root / "Second.md").is_file())
 
     def test_rename_closed_or_open_items_and_folders_syncs_all_workspace_state(self):
@@ -192,13 +219,15 @@ class FolderActionsDesktopTest(unittest.TestCase):
         other_win = self._new_window()
         self.studio.openFolder(str(self.open_root))
         other_win.openFolder(str(self.open_root))
+        self.studio.toggleDirectory(str(sub))
+        self._wait_for(lambda: "Projects/Backlog.md" in [self._rel_posix(f["path"]) for f in self.studio.files])
 
         # Open Roadmap.md in both windows, pin it, and record reading position + startup entry
         self.studio.openNote(str(open_note_file))
         other_win.openNote(str(open_note_file))
-        resolved_open = str(open_note_file.resolve())
-        self._wait_for(lambda: self.studio._current()["path"] == resolved_open)
-        self._wait_for(lambda: other_win._current()["path"] == resolved_open)
+        resolved_open = canonical_path_str(open_note_file)
+        self._wait_for(lambda: same_path(self.studio._current()["path"], resolved_open))
+        self._wait_for(lambda: same_path(other_win._current()["path"], resolved_open))
         self.studio.pinRecent(resolved_open)
         self.session.locations[resolved_open] = {
             "top": 120.0,
@@ -210,32 +239,45 @@ class FolderActionsDesktopTest(unittest.TestCase):
         self.session.startup_active = resolved_open
 
         # Record closed_note_file in recents & pins too
-        resolved_closed = str(closed_note_file.resolve())
+        resolved_closed = canonical_path_str(closed_note_file)
         self.studio.recent = [resolved_closed] + self.studio.recent
         self.studio.pinRecent(resolved_closed)
 
         # 1. Rename closed note without typing extension
         self.studio.renameEntry(str(closed_note_file), "Sprint Backlog")
-        renamed_closed = (sub / "Sprint Backlog.md").resolve()
-        self._wait_for(lambda: renamed_closed.is_file() and not closed_note_file.exists())
-        self.assertIn(str(renamed_closed), self.session.pinned)
-        self.assertIn(str(renamed_closed), self.studio.recent)
-        self.assertNotIn(resolved_closed, self.studio.recent)
+        renamed_closed = Path(canonical_path_str(sub / "Sprint Backlog.md"))
+        self._wait_for(
+            lambda: renamed_closed.is_file()
+            and not closed_note_file.exists()
+            and self.studio.busy == 0
+            and self._norm(renamed_closed) in self._norm_list(self.session.pinned)
+            and "Projects/Sprint Backlog.md" in [self._rel_posix(f["path"]) for f in self.studio.files]
+        )
+        self.assertIn(self._norm(renamed_closed), self._norm_list(self.session.pinned))
+        self.assertIn(self._norm(renamed_closed), self._norm_list(self.studio.recent))
+        self.assertNotIn(self._norm(resolved_closed), self._norm_list(self.studio.recent))
+        self.assertIn("Projects/Sprint Backlog.md", [self._rel_posix(f["path"]) for f in self.studio.files])
 
         # 2. Rename parent folder "Projects" -> "Archive" and verify open tabs across windows, recents, pins, reading positions, and workspace entries
         self.studio.renameEntry(str(sub), "Archive")
-        new_sub = (self.open_root / "Archive").resolve()
-        new_open_path = str((new_sub / "Roadmap.md").resolve())
-        new_closed_path = str((new_sub / "Sprint Backlog.md").resolve())
-        self._wait_for(lambda: self.studio._current()["path"] == new_open_path)
-        self._wait_for(lambda: other_win._current()["path"] == new_open_path)
-        self.assertIn(new_open_path, self.session.pinned)
-        self.assertIn(new_closed_path, self.session.pinned)
-        self.assertIn(new_open_path, self.studio.recent)
-        self.assertIn(new_open_path, self.session.locations)
-        self.assertNotIn(resolved_open, self.session.locations)
-        self.assertEqual(self.session.startup_paths, [new_open_path])
-        self.assertEqual(self.session.startup_active, new_open_path)
+        new_sub = Path(canonical_path_str(self.open_root / "Archive"))
+        new_open_path = canonical_path_str(new_sub / "Roadmap.md")
+        new_closed_path = canonical_path_str(new_sub / "Sprint Backlog.md")
+        self._wait_for(
+            lambda: self.studio.busy == 0
+            and same_path(self.studio._current()["path"], new_open_path)
+            and same_path(other_win._current()["path"], new_open_path)
+            and "Archive/Sprint Backlog.md" in [self._rel_posix(f["path"]) for f in self.studio.files]
+        )
+        self.assertIn(self._norm(new_open_path), self._norm_list(self.session.pinned))
+        self.assertIn(self._norm(new_closed_path), self._norm_list(self.session.pinned))
+        self.assertIn(self._norm(new_open_path), self._norm_list(self.studio.recent))
+        self.assertIn(self._norm(new_open_path), self._norm_list(self.session.locations.keys()))
+        self.assertNotIn(self._norm(resolved_open), self._norm_list(self.session.locations.keys()))
+        self.assertEqual(self._norm_list(self.session.startup_paths), [self._norm(new_open_path)])
+        self.assertEqual(self._norm(self.session.startup_active), self._norm(new_open_path))
+        self.assertIn("Archive/Roadmap.md", [self._rel_posix(f["path"]) for f in self.studio.files])
+        self.assertIn("Archive/Sprint Backlog.md", [self._rel_posix(f["path"]) for f in self.studio.files])
 
     def test_move_blocks_self_descendant_and_handles_linked_local_images(self):
         assets_dir = self.open_root / "assets"
@@ -254,7 +296,7 @@ class FolderActionsDesktopTest(unittest.TestCase):
 
         self.studio.openFolder(str(self.open_root))
         self.studio.openNote(str(note_path))
-        self._wait_for(lambda: self.studio._current()["path"] == str(note_path.resolve()))
+        self._wait_for(lambda: same_path(self.studio._current()["path"], note_path))
 
         # Block moving folder into itself or its descendant
         self.studio.requestMoveEntry(str(parent_folder), str(parent_folder))
@@ -268,7 +310,7 @@ class FolderActionsDesktopTest(unittest.TestCase):
         self.assertEqual([item["name"] for item in lazy_targets], [self.open_root.name, "assets"])
         lazy_unexpanded = list_subfolders_lazy(self.open_root, set())
         self.assertEqual([item["name"] for item in lazy_unexpanded], [self.open_root.name, "2026", "assets"])
-        lazy_expanded = list_subfolders_lazy(self.open_root, {str(parent_folder.resolve())})
+        lazy_expanded = list_subfolders_lazy(self.open_root, {canonical_path_str(parent_folder)})
         self.assertIn("Q4", [item["name"] for item in lazy_expanded])
 
         # Requesting move of Report.md into 2026/Q4 prompts about linked local image
@@ -288,9 +330,9 @@ class FolderActionsDesktopTest(unittest.TestCase):
 
         # Confirming move with image_action="copy" copies assets/chart.png to 2026/Q4/assets/chart.png and updates open tab
         self.studio.moveEntry(str(note_path), str(child_folder), "copy")
-        moved_note = (child_folder / "Report.md").resolve()
+        moved_note = Path(canonical_path_str(child_folder / "Report.md"))
         copied_chart = child_folder / "assets" / "chart.png"
-        self._wait_for(lambda: moved_note.is_file() and self.studio._current()["path"] == str(moved_note))
+        self._wait_for(lambda: moved_note.is_file() and self.studio.busy == 0 and same_path(self.studio._current()["path"], moved_note))
         self.assertTrue(copied_chart.is_file())
         self.assertEqual(copied_chart.read_bytes(), chart_png.read_bytes())
 
@@ -301,7 +343,15 @@ class FolderActionsDesktopTest(unittest.TestCase):
         outside_file.write_text("top secret", encoding="utf-8")
 
         escape_link = self.open_root / "escape"
-        escape_link.symlink_to(outside_dir, target_is_directory=True)
+        try:
+            escape_link.symlink_to(outside_dir, target_is_directory=True)
+        except OSError as exc:
+            if os.name == "nt" and getattr(exc, "winerror", None) == 1314:
+                import subprocess
+
+                subprocess.run(["cmd", "/c", "mklink", "/J", str(escape_link), str(outside_dir)], check=True)
+            else:
+                raise
 
         with self.assertRaises(ValueError):
             resolve_within_open_folder(self.open_root, escape_link)
@@ -321,23 +371,47 @@ class FolderActionsDesktopTest(unittest.TestCase):
 
         self.studio.openFolder(str(self.open_root))
         self.studio.openNote(str(dirty_note))
-        resolved_dirty = str(dirty_note.resolve())
-        self._wait_for(lambda: self.studio._current()["path"] == resolved_dirty)
+        resolved_dirty = canonical_path_str(dirty_note)
+        self._wait_for(lambda: same_path(self.studio._current()["path"], resolved_dirty))
         tab_id = self.studio.active
         self.studio.pinRecent(resolved_dirty)
         self.studio._current()["content"] = "Saved baseline\n\nImportant unsaved paragraph!\n"
         self.studio._emit()
 
         # Trash the parent folder containing the dirty open note
+        resolved_sub = canonical_path_str(sub)
         self.studio.trashEntry(str(sub))
-        self._wait_for(lambda: not sub.exists() and all(t["id"] != tab_id for t in self.studio.tabs))
+        self._wait_for(
+            lambda: not sub.exists()
+            and self.studio.busy == 0
+            and all(t["id"] != tab_id for t in self.studio.tabs)
+            and bool(self.studio._last_trashed_source)
+        )
 
-        # Verify file went to freedesktop system Trash ($XDG_DATA_HOME/Trash), never inside open_root
-        trash_files = list((self.xdg_data / "Trash" / "files").glob("*"))
-        self.assertTrue(len(trash_files) >= 1)
+        # Verify OS-native Trash handled the item and zero hidden/.trash artifacts exist in open_root
+        self.assertEqual(self._norm(self.studio._last_trashed_source), self._norm(resolved_sub))
+        self.assertEqual(self.studio.message, "Moved to Trash: Drafts (unsaved edits preserved in closed notes)")
+        self.assertFalse(sub.exists())
+        self.assertFalse(dirty_note.exists())
+        if sys.platform.startswith("linux"):
+            trash_files = list((self.xdg_data / "Trash" / "files").glob("*"))
+            self.assertTrue(len(trash_files) >= 1)
+            self.assertTrue(bool(self.studio._last_trashed_path))
+            self.assertTrue(Path(self.studio._last_trashed_path).exists())
+            self.assertFalse(same_path(Path(self.studio._last_trashed_path).parent, self.open_root))
+        elif sys.platform == "darwin":
+            self.assertTrue(bool(self.studio._last_trashed_path))
+            trashed_dest = Path(self.studio._last_trashed_path)
+            self.assertTrue(trashed_dest.exists())
+            self.assertFalse(normalize_path_key(trashed_dest).startswith(normalize_path_key(self.open_root) + "/"))
+        else:
+            if self.studio._last_trashed_path:
+                self.assertFalse(
+                    normalize_path_key(self.studio._last_trashed_path).startswith(normalize_path_key(self.open_root) + "/")
+                )
         self._assert_no_hidden_or_vault_artifacts()
-        self.assertNotIn(resolved_dirty, self.studio.recent)
-        self.assertNotIn(resolved_dirty, self.session.pinned)
+        self.assertNotIn(self._norm(resolved_dirty), self._norm_list(self.studio.recent))
+        self.assertNotIn(self._norm(resolved_dirty), self._norm_list(self.session.pinned))
 
         # Reopen closed tab recovers the full unsaved draft detached from the deleted path
         self.assertTrue(len(self.studio.closed_tabs) >= 1)

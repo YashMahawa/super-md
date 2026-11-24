@@ -55,6 +55,8 @@ internal fun FolderDrawerHeader(
     onNavigateRelative: (String) -> Unit,
     onRequestCreate: (CreateFolderRequest) -> Unit,
     onCloseFolder: () -> Unit,
+    canReopenClosedNote: Boolean = false,
+    onReopenClosedNote: () -> Unit = {},
 ) {
     var createMenuOpen by remember { mutableStateOf(false) }
     val rootLabel = remember(folderUriRaw) { friendlyTreeFolderLabel(folderUriRaw) }
@@ -98,6 +100,14 @@ internal fun FolderDrawerHeader(
                             maxLines = 1,
                             overflow = TextOverflow.Ellipsis,
                         )
+                    }
+                }
+                if (canReopenClosedNote) {
+                    IconButton(
+                        onClick = onReopenClosedNote,
+                        modifier = Modifier.size(36.dp),
+                    ) {
+                        Icon(Icons.Rounded.Restore, contentDescription = "Reopen closed note")
                     }
                 }
                 Box {

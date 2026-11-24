@@ -28,7 +28,14 @@ import java.util.concurrent.atomic.AtomicBoolean
 // SAF documents can be shared by independent Android activities. Serialize
 // comparison, staging, write and saved-state updates across those windows.
 private val documentWrites = Mutex()
-private val activeStudioViewModels = java.util.concurrent.CopyOnWriteArraySet<StudioViewModel>()
+private val activeStudioViewModels: MutableSet<StudioViewModel> =
+    java.util.Collections.synchronizedSet(java.util.Collections.newSetFromMap(java.util.WeakHashMap()))
+
+private fun liveStudioViewModels(current: StudioViewModel): List<StudioViewModel> =
+    synchronized(activeStudioViewModels) {
+        val snapshot = activeStudioViewModels.filter { !it.viewModelRetired.get() }
+        if (snapshot.any { it === current } || current.viewModelRetired.get()) snapshot else snapshot + current
+    }
 
 private data class UriRemap(
     val oldUri: String,
@@ -312,7 +319,7 @@ class StudioViewModel(app: Application, val workspaceKey: String = "main") : And
     private val closingNoteIds = java.util.concurrent.ConcurrentHashMap.newKeySet<String>()
     private val closedNoteMutex = Mutex()
     private val mutable = MutableStateFlow(restore())
-    private val viewModelRetired = AtomicBoolean(false)
+    internal val viewModelRetired = AtomicBoolean(false)
     private val recoveryWriter = LatestRecoveryWriter<StudioState, RecoverySnapshotSignature>(
         scope = RecoveryWriterScope.scope,
         debounceMillis = 1_200,
@@ -463,7 +470,7 @@ class StudioViewModel(app: Application, val workspaceKey: String = "main") : And
         }
     }
     init { activeStudioViewModels.add(this); prefs.registerOnSharedPreferenceChangeListener(preferencesChanged);observeActive();observeCustomTheme();migrateLegacyClosedNotes();if(workspaceKey=="main")viewModelScope.launch{updates.restore();if(!BuildConfig.DEBUG && updates.state.value.checkOnOpen){kotlinx.coroutines.delay(6000);updates.check()}} }
-    override fun onCleared() { activeStudioViewModels.remove(this); viewModelRetired.set(true); recoveryWriter.closeAfterLatest(mutable.value); prefs.unregisterOnSharedPreferenceChangeListener(preferencesChanged);resolver.unregisterContentObserver(documentObserver);resolver.unregisterContentObserver(themeObserver); super.onCleared() }
+    override fun onCleared() { activeStudioViewModels.remove(this); viewModelRetired.set(true); readerFlushRequester = null; recoveryWriter.closeAfterLatest(mutable.value); prefs.unregisterOnSharedPreferenceChangeListener(preferencesChanged);resolver.unregisterContentObserver(documentObserver);resolver.unregisterContentObserver(themeObserver); super.onCleared() }
     val state = mutable.asStateFlow()
     fun inspectStorage() {
         if (mutable.value.storageScanning) return
@@ -1525,7 +1532,7 @@ class StudioViewModel(app: Application, val workspaceKey: String = "main") : And
                 ?: return
             result.putIfAbsent(rawUri, rel)
         }
-        activeStudioViewModels.forEach { vm ->
+        liveStudioViewModels(this).forEach { vm ->
             vm.mutable.value.tabs.forEach { tab -> record(tab.uri, tab.relative) }
         }
         recentMutable.value.forEach { recent -> record(recent.uri, recent.relative) }
@@ -1670,7 +1677,7 @@ class StudioViewModel(app: Application, val workspaceKey: String = "main") : And
             storeRecent(updatedRecents)
         }
 
-        activeStudioViewModels.forEach { vm ->
+        liveStudioViewModels(this).forEach { vm ->
             vm.change { currentState ->
                 val nextTabs = currentState.tabs.map { tab ->
                     val tabUri = tab.uri
@@ -2128,7 +2135,8 @@ class StudioViewModel(app: Application, val workspaceKey: String = "main") : And
             }
 
             // Flush any active affected reader tab before capturing dirty state.
-            for (vm in activeStudioViewModels) {
+            val targetViewModels = liveStudioViewModels(this@StudioViewModel)
+            for (vm in targetViewModels) {
                 val activeTab = vm.mutable.value.active
                 if (tabMatchesDeletion(activeTab)) {
                     if (!vm.performReaderBarrier(activeTab.id) { }) {
@@ -2147,7 +2155,7 @@ class StudioViewModel(app: Application, val workspaceKey: String = "main") : And
             closedNoteMutex.withLock {
                 documentWrites.withLock {
                     // 1. Preserve every dirty open tab into closed-note recovery & deleted-drafts BEFORE deleting.
-                    for (vm in activeStudioViewModels) {
+                    for (vm in liveStudioViewModels(this@StudioViewModel)) {
                         val matchingTabs = vm.mutable.value.tabs.filter(::tabMatchesDeletion)
                         matchingTabs.mapNotNull { it.uri }.forEach(removedUris::add)
                         val dirtyTabs = matchingTabs.filter { it.dirty }
@@ -2203,7 +2211,7 @@ class StudioViewModel(app: Application, val workspaceKey: String = "main") : And
                 storeRecent(filteredRecents)
             }
 
-            for (vm in activeStudioViewModels) {
+            for (vm in liveStudioViewModels(this@StudioViewModel)) {
                 val (savedRefs, closedMatching) = archivedByVm[vm] ?: (emptyList<ClosedNoteReference>() to emptyList())
                 val closedIds = closedMatching.map { it.id }.toSet()
                 closedIds.forEach { id ->

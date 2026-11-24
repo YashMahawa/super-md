@@ -113,13 +113,18 @@ internal fun validateFolderEntryName(
     val expected = currentExtension.trimStart('.').lowercase().ifEmpty { "md" }
     val dot = trimmed.lastIndexOf('.')
     if (dot < 0) return "$trimmed.$expected"
-    val stem = trimmed.substring(0, dot).trim()
+    val stem = trimmed.substring(0, dot)
+    val cleanStem = stem.trim()
     val supplied = trimmed.substring(dot + 1)
-    require(stem.isNotEmpty() && stem != "." && stem != "..") { "Enter a valid note name" }
-    require(supplied.equals(expected, ignoreCase = true)) {
+    if (supplied.equals(expected, ignoreCase = true)) {
+        require(cleanStem.isNotEmpty() && cleanStem != "." && cleanStem != "..") { "Enter a valid note name" }
+        return "$stem.$expected"
+    }
+    val knownFormats = setOf("md", "markdown", "txt", "smd", "fmd", "pdf", "zip", "html", "docx")
+    require(supplied.lowercase() !in (knownFormats - expected)) {
         "Rename keeps the .$expected format. Use Export to change formats."
     }
-    return "$stem.$expected"
+    return "$trimmed.$expected"
 }
 
 private val FENCED_CODE_REGEX = Regex("(?m)^[ ]{0,3}(`{3,}|~{3,})[^\\n]*\\n[\\s\\S]*?(?:^[ ]{0,3}\\1[ \\t]*$|\\z)")

@@ -1066,6 +1066,8 @@ private object NoMotionScheme : MotionScheme {
                             onNavigateRelative = { rel -> model.listFolder(android.net.Uri.parse(state.folder!!), rel) },
                             onRequestCreate = { req -> createFolderRequest = req },
                             onCloseFolder = model::closeFolder,
+                            canReopenClosedNote = state.closedTabs.isNotEmpty(),
+                            onReopenClosedNote = { model.reopen(); scope.launch { drawer.close() } },
                         )
                     } else if (state.folder != null) {
                         TextButton(onClick = model::closeFolder) { Icon(Icons.Rounded.Close, null); Text("Close folder", Modifier.padding(start = 8.dp)) }
@@ -1117,9 +1119,6 @@ private object NoMotionScheme : MotionScheme {
                             StudyIcon(if(state.centerLock) "Centre locked · unlock horizontal movement" else "Lock document to centre",if(state.centerLock) R.drawable.symbol_lock else R.drawable.symbol_lock_open) { model.centerLock(!state.centerLock) }
                             Box { IconButton(onClick = { menu = true }) { Icon(Icons.Rounded.MoreVert, "More actions") }; DropdownMenu(expanded = menu, onDismissRequest = { menu = false }) {
                                 DropdownMenuItem(text = { Text("New window") }, onClick = { menu = false; activity.newWindow() }, leadingIcon = { Icon(painterResource(R.drawable.symbol_open_window), null) })
-                                if (state.closedTabs.isNotEmpty()) {
-                                    DropdownMenuItem(text = { Text("Reopen closed tab") }, onClick = { menu = false; model.reopen() }, leadingIcon = { Icon(Icons.Rounded.Restore, null) })
-                                }
                                 DropdownMenuItem(text = { Text("Share note") }, enabled = readerReady && !state.busy, onClick = { menu = false; sharing = true; exporting = true }, leadingIcon = { Icon(painterResource(R.drawable.symbol_share), null) })
                                 DropdownMenuItem(text = { Text("Insert image or link") }, onClick = { menu = false; web?.evaluateJavascript("window.supermdMedia?.()", null) }, leadingIcon = { Icon(painterResource(R.drawable.symbol_image), null) })
                                 DropdownMenuItem(text = { Text("Fix LaTeX") }, onClick = { menu = false; web?.evaluateJavascript("window.supermdRepairMath?.()", null) }, leadingIcon = { Icon(painterResource(R.drawable.symbol_bug), null) })

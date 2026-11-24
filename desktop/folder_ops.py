@@ -50,6 +50,72 @@ def validate_entry_name(raw_name: str, *, is_directory: bool, current_ext: str =
     return name + ext
 
 
+def _is_link_or_junction(path: Path) -> bool:
+    if path.is_symlink():
+        return True
+    is_junction = getattr(path, "is_junction", None)
+    return bool(callable(is_junction) and is_junction())
+
+
+def strip_extended_length_prefix(raw: str) -> str:
+    """Strip Win32 extended-length path prefixes (\\\\?\\) while preserving standard paths."""
+    if os.name == "nt":
+        if raw.startswith("\\\\?\\UNC\\"):
+            return "\\\\" + raw[8:]
+        if raw.startswith("\\\\?\\"):
+            return raw[4:]
+    return raw
+
+
+def canonical_path_str(path: str | os.PathLike[str]) -> str:
+    """Return a resolved, normalized path string without Win32 \\\\?\\ prefixes."""
+    raw = strip_extended_length_prefix(str(path or "").strip())
+    if not raw:
+        return ""
+    try:
+        resolved = Path(raw).resolve(strict=False)
+        return os.path.normpath(strip_extended_length_prefix(str(resolved)))
+    except OSError:
+        return os.path.normpath(raw)
+
+
+def normalize_path_key(path: str | os.PathLike[str]) -> str:
+    """Return an OS-normalized comparison key using forward slashes and platform case rules."""
+    canon = canonical_path_str(path)
+    if not canon:
+        return ""
+    key = os.path.normcase(canon)
+    if os.name == "nt":
+        key = key.replace("\\", "/")
+    while len(key) > 1 and key.endswith("/") and not (os.name == "nt" and len(key) == 3 and key[1] == ":"):
+        key = key[:-1]
+    return key
+
+
+def same_path(left: str | os.PathLike[str], right: str | os.PathLike[str]) -> bool:
+    """Return True when two paths refer to the same normalized location."""
+    left_key = normalize_path_key(left)
+    right_key = normalize_path_key(right)
+    return bool(left_key and right_key and left_key == right_key)
+
+
+def normalized_relpath(path: str | os.PathLike[str], root: str | os.PathLike[str]) -> str:
+    """Return a POSIX-separated relative path from *root* to *path* across all platforms."""
+    canon_path = Path(canonical_path_str(path))
+    canon_root = Path(canonical_path_str(root))
+    try:
+        return canon_path.relative_to(canon_root).as_posix()
+    except ValueError:
+        path_key = normalize_path_key(canon_path)
+        root_key = normalize_path_key(canon_root)
+        if path_key == root_key:
+            return "."
+        prefix = root_key if root_key.endswith("/") else root_key + "/"
+        if path_key.startswith(prefix) and len(canon_path.parts) > len(canon_root.parts):
+            return Path(*canon_path.parts[len(canon_root.parts):]).as_posix()
+        raise
+
+
 def _check_no_symlinks_under(base: Path, target: Path) -> None:
     try:
         rel_parts = target.relative_to(base).parts
@@ -58,7 +124,7 @@ def _check_no_symlinks_under(base: Path, target: Path) -> None:
     current = base
     for part in rel_parts:
         current = current / part
-        if current.is_symlink():
+        if _is_link_or_junction(current):
             raise ValueError("Symlinks are not allowed inside the open folder.")
 
 
@@ -70,15 +136,15 @@ def resolve_within_open_folder(
     must_exist: bool = True,
 ) -> Path:
     """Resolve *target* inside *open_root*, rejecting symlinks and paths outside the open folder."""
-    root_str = str(open_root or "").strip()
-    target_str = str(target or "").strip()
+    root_str = strip_extended_length_prefix(str(open_root or "").strip())
+    target_str = strip_extended_length_prefix(str(target or "").strip())
     if not root_str or not target_str:
         raise ValueError("Open a folder first.")
     raw_root = Path(root_str)
-    if raw_root.is_symlink():
+    if _is_link_or_junction(raw_root):
         raise ValueError("Symlinks are not allowed inside the open folder.")
     try:
-        root = raw_root.resolve(strict=True)
+        root = Path(strip_extended_length_prefix(str(raw_root.resolve(strict=True))))
     except OSError as error:
         raise ValueError("The open folder is no longer available.") from error
     if not root.is_dir():
@@ -87,22 +153,22 @@ def resolve_within_open_folder(
     raw_target = Path(target_str)
     if not raw_target.is_absolute():
         raise ValueError("Folder entry path must be an absolute path inside the open folder.")
-    if raw_target.is_symlink():
+    if _is_link_or_junction(raw_target):
         raise ValueError("Symlinks are not allowed inside the open folder.")
 
     _check_no_symlinks_under(raw_root, raw_target)
     _check_no_symlinks_under(root, raw_target)
 
     try:
-        resolved = raw_target.resolve(strict=must_exist)
+        resolved = Path(strip_extended_length_prefix(str(raw_target.resolve(strict=must_exist))))
     except OSError as error:
         raise ValueError("The selected item is no longer available.") from error
 
-    if resolved == root:
+    if same_path(resolved, root):
         if not allow_root:
             raise ValueError("Cannot modify the open folder itself.")
         return resolved
-    if not resolved.is_relative_to(root):
+    if not matches_path_prefix(str(resolved), str(root), is_directory=True):
         raise ValueError("Paths outside the open folder are not allowed.")
 
     _check_no_symlinks_under(root, resolved)
@@ -111,38 +177,50 @@ def resolve_within_open_folder(
 
 def ancestor_directories_in_folder(open_root: Path, target_dir: Path) -> set[str]:
     """Return *open_root* and every ancestor directory down to *target_dir* for tree expansion."""
-    root = open_root.resolve(strict=False)
-    current = target_dir.resolve(strict=False)
+    root = Path(canonical_path_str(open_root))
+    current = Path(canonical_path_str(target_dir))
     expanded = {str(root)}
-    if current == root or current.is_relative_to(root):
-        while current != root and current.is_relative_to(root):
+    if same_path(current, root) or matches_path_prefix(str(current), str(root), is_directory=True):
+        while not same_path(current, root) and matches_path_prefix(str(current), str(root), is_directory=True):
             expanded.add(str(current))
+            if current.parent == current:
+                break
             current = current.parent
     return expanded
 
 
 def matches_path_prefix(candidate: str, target: str, *, is_directory: bool) -> bool:
     """Return True when *candidate* is *target* or (for directories) a descendant of *target*."""
-    if not candidate or not target:
+    cand_key = normalize_path_key(candidate)
+    targ_key = normalize_path_key(target)
+    if not cand_key or not targ_key:
         return False
-    if candidate == target:
+    if cand_key == targ_key:
         return True
     if not is_directory:
         return False
-    prefix = target.rstrip("/\\") + os.sep
-    return candidate.startswith(prefix)
+    prefix = targ_key if targ_key.endswith("/") else targ_key + "/"
+    return cand_key.startswith(prefix)
 
 
 def remap_path_prefix(candidate: str, old_path: str, new_path: str, *, is_directory: bool) -> str:
     """Rewrite *candidate* when *old_path* (file or folder) moves/renames to *new_path*."""
     if not candidate:
         return candidate
-    if candidate == old_path:
-        return new_path
+    cand_key = normalize_path_key(candidate)
+    old_key = normalize_path_key(old_path)
+    new_canon = canonical_path_str(new_path)
+    if not cand_key or not old_key or not new_canon:
+        return candidate
+    if cand_key == old_key:
+        return new_canon
     if is_directory:
-        prefix = old_path.rstrip("/\\") + os.sep
-        if candidate.startswith(prefix):
-            return new_path.rstrip("/\\") + os.sep + candidate[len(prefix):]
+        prefix = old_key if old_key.endswith("/") else old_key + "/"
+        if cand_key.startswith(prefix):
+            cand_parts = Path(canonical_path_str(candidate)).parts
+            old_parts = Path(canonical_path_str(old_path)).parts
+            if len(cand_parts) > len(old_parts):
+                return str(Path(new_canon).joinpath(*cand_parts[len(old_parts):]))
     return candidate
 
 
@@ -255,17 +333,24 @@ def list_subfolders_lazy(
     exclude_subtree: Path | None = None,
 ) -> list[dict]:
     """List the open root and lazily expanded subdirectories for the Move-to-folder picker."""
-    root = open_root.resolve(strict=True)
-    excluded = exclude_subtree.resolve(strict=False) if exclude_subtree is not None else None
+    root = Path(strip_extended_length_prefix(str(open_root.resolve(strict=True))))
+    excluded = Path(canonical_path_str(exclude_subtree)) if exclude_subtree is not None else None
+    expanded_keys = {normalize_path_key(item) for item in expanded_dirs if item}
+
+    def is_excluded(candidate: Path) -> bool:
+        return excluded is not None and (
+            same_path(candidate, excluded)
+            or matches_path_prefix(str(candidate), str(excluded), is_directory=True)
+        )
 
     def has_visible_subdirs(directory: Path) -> bool:
         try:
             for child in directory.iterdir():
-                if child.name.startswith(".") or child.is_symlink():
+                if child.name.startswith(".") or _is_link_or_junction(child):
                     continue
                 if child.is_dir():
-                    resolved_child = child.resolve(strict=False)
-                    if excluded is not None and (resolved_child == excluded or resolved_child.is_relative_to(excluded)):
+                    resolved_child = Path(canonical_path_str(child))
+                    if is_excluded(resolved_child):
                         continue
                     return True
         except OSError:
@@ -291,12 +376,12 @@ def list_subfolders_lazy(
         for child in children:
             if len(rows) >= 1500:
                 return
-            if child.name.startswith(".") or child.is_symlink() or not child.is_dir():
+            if child.name.startswith(".") or _is_link_or_junction(child) or not child.is_dir():
                 continue
-            resolved_child = child.resolve(strict=False)
-            if excluded is not None and (resolved_child == excluded or resolved_child.is_relative_to(excluded)):
+            resolved_child = Path(canonical_path_str(child))
+            if is_excluded(resolved_child):
                 continue
-            is_expanded = str(resolved_child) in expanded_dirs
+            is_expanded = normalize_path_key(resolved_child) in expanded_keys
             rows.append(
                 {
                     "name": child.name,

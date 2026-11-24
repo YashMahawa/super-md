@@ -130,7 +130,8 @@ class PinnedHTTPSHandler(urllib.request.HTTPSHandler):
 
 def local_path(value: str) -> Path:
     url = QUrl(value)
-    return Path(url.toLocalFile() if url.isLocalFile() else value).expanduser().resolve()
+    resolved = Path(url.toLocalFile() if url.isLocalFile() else value).expanduser().resolve()
+    return Path(folder_ops.strip_extended_length_prefix(str(resolved)))
 
 def export_destination(value: str, format: str) -> Path:
     suffixes = {"pdf": ".pdf", "smd": ".smd", "md": ".md", "mdzip": ".zip"}
@@ -365,6 +366,8 @@ class Studio(QObject):
         self.folder = ""
         self.files: list[dict] = []
         self.expanded: set[str] = set()
+        self._last_trashed_source = ""
+        self._last_trashed_path = ""
         self.mode = self.settings.get("readingMode", "live")
         self.fullscreen = False
         self.reader_overlay = False
@@ -493,9 +496,14 @@ class Studio(QObject):
 
     @Slot(str)
     def pinRecent(self,path):
-        if path not in self.recent:return
-        if path in self.session.pinned:self.session.pinned.remove(path)
-        else:self.session.pinned.append(path)
+        matched_recent = next((item for item in self.recent if folder_ops.same_path(item, path)), None)
+        if matched_recent is None:
+            return
+        matched_pinned = next((item for item in self.session.pinned if folder_ops.same_path(item, matched_recent)), None)
+        if matched_pinned is not None:
+            self.session.pinned = [item for item in self.session.pinned if not folder_ops.same_path(item, matched_recent)]
+        else:
+            self.session.pinned.append(matched_recent)
         self.recent=self.recent
         self._preferences()
 
@@ -644,6 +652,29 @@ class Studio(QObject):
         watched=set(self.note_watcher.files()+self.note_watcher.directories())
         if watched-targets:self.note_watcher.removePaths(list(watched-targets))
         if targets-watched:self.note_watcher.addPaths(list(targets-watched))
+
+    def _suspend_watches_for_prefix(self, target_path: str, *, is_dir: bool):
+        parent_str = folder_ops.canonical_path_str(Path(target_path).parent)
+        for win in list(self.session.windows.values()):
+            if win.retired:
+                continue
+            watched = list(win.note_watcher.files() + win.note_watcher.directories())
+            to_remove = [
+                watched_path
+                for watched_path in watched
+                if folder_ops.matches_path_prefix(watched_path, target_path, is_directory=is_dir)
+                or (parent_str and folder_ops.same_path(watched_path, parent_str))
+            ]
+            if to_remove:
+                win.note_watcher.removePaths(to_remove)
+                win.note_watch_paths = None
+            if win.external_paths:
+                win.external_paths = {
+                    ext_path
+                    for ext_path in win.external_paths
+                    if not folder_ops.matches_path_prefix(ext_path, target_path, is_directory=is_dir)
+                    and not (parent_str and folder_ops.same_path(ext_path, parent_str))
+                }
 
     def _external_note_changed(self,path):
         if self.retired:return
@@ -1836,7 +1867,8 @@ class Studio(QObject):
             if should_activate:
                 self.active = note["id"]
             self.settings["welcomed"] = True
-            self.recent = [str(path)] + [p for p in self.recent if p != str(path)][:29]
+            canon_note_path = folder_ops.canonical_path_str(path)
+            self.recent = [canon_note_path] + [p for p in self.recent if not folder_ops.same_path(p, canon_note_path)][:29]
             self._preferences()
             self.recovery_timer.start(800)
             self._emit()
@@ -1920,7 +1952,7 @@ class Studio(QObject):
             self.message = "Choose an existing local folder."
             self._emit(False)
             return
-        self.folder = str(path)
+        self.folder = folder_ops.canonical_path_str(path)
         self.settings["welcomed"] = True
         self.expanded = {self.folder}
         self._preferences()
@@ -1929,6 +1961,7 @@ class Studio(QObject):
 
     def _load_tree(self):
         folder, expanded = self.folder, set(self.expanded)
+        expanded_keys = {folder_ops.normalize_path_key(item) for item in expanded if item}
         def scan():
             entries = []
             def visit(path, depth):
@@ -1939,23 +1972,33 @@ class Studio(QObject):
                 for child in children:
                     if len(entries) >= 3000:
                         return
-                    if child.name.startswith(".") or child.is_symlink():
+                    if child.name.startswith(".") or folder_ops._is_link_or_junction(child):
                         continue
                     directory = child.is_dir()
                     if directory or child.suffix.lower() in (".md", ".smd", ".fmd", ".markdown", ".txt"):
-                        entries.append({"name": child.name, "path": str(child), "directory": directory, "depth": depth, "expanded": str(child) in expanded})
-                        if directory and str(child) in expanded:
+                        child_str = folder_ops.canonical_path_str(child)
+                        is_expanded = folder_ops.normalize_path_key(child_str) in expanded_keys
+                        entries.append({"name": child.name, "path": child_str, "directory": directory, "depth": depth, "expanded": is_expanded})
+                        if directory and is_expanded:
                             visit(child, depth + 1)
             visit(folder, 0)
             return entries
         def finished(result, error):
-            if not error and folder == self.folder:
+            if not error and folder_ops.same_path(folder, self.folder):
                 self.files = result
         self._submit(scan, finished, False)
 
     @Slot(str)
     def toggleDirectory(self, path):
-        self.expanded.symmetric_difference_update({path})
+        canon = folder_ops.canonical_path_str(path)
+        if not canon:
+            return
+        existing = [item for item in self.expanded if folder_ops.same_path(item, canon)]
+        if existing:
+            for item in existing:
+                self.expanded.discard(item)
+        else:
+            self.expanded.add(canon)
         self._load_tree()
 
     @Slot()
@@ -2242,13 +2285,13 @@ class Studio(QObject):
         generation = self._activation_generation
 
         def work():
-            if target.exists() or target.is_symlink():
+            if target.exists() or folder_ops._is_link_or_junction(target):
                 raise ValueError("An item with that name already exists.")
             if kind == "smd":
                 write_portable(target, "", {})
             else:
                 atomic_write(target, b"")
-            return str(target.resolve(strict=True))
+            return folder_ops.canonical_path_str(target.resolve(strict=True))
 
         def finished(created_path, error):
             if error or not created_path:
@@ -2257,13 +2300,13 @@ class Studio(QObject):
             for win in list(self.session.windows.values()):
                 if not win.retired and win.folder:
                     try:
-                        win_root = Path(win.folder).resolve(strict=False)
-                        if created.is_relative_to(win_root):
+                        win_root = Path(folder_ops.canonical_path_str(win.folder))
+                        if folder_ops.matches_path_prefix(created_path, str(win_root), is_directory=True):
                             win.expanded.update(folder_ops.ancestor_directories_in_folder(win_root, created.parent))
                             win._load_tree()
                     except OSError:
                         pass
-            existing = next((t for t in self.tabs if t["path"] == created_path), None)
+            existing = next((t for t in self.tabs if folder_ops.same_path(t["path"], created_path)), None)
             if existing is None:
                 note = self._note(created.name, "", created_path, "", {}, kind == "smd")
                 self._agent_open_paths.add(created_path)
@@ -2273,7 +2316,7 @@ class Studio(QObject):
             if generation == self._activation_generation:
                 self.active = note["id"]
             self.settings["welcomed"] = True
-            self.recent = [created_path] + [p for p in self.recent if p != created_path][:29]
+            self.recent = [created_path] + [p for p in self.recent if not folder_ops.same_path(p, created_path)][:29]
             self.message = f"Created {created.name}"
             self._watch_notes(force=True)
             self._preferences()
@@ -2303,10 +2346,10 @@ class Studio(QObject):
             return
 
         def work():
-            if target.exists() or target.is_symlink():
+            if target.exists() or folder_ops._is_link_or_junction(target):
                 raise ValueError("An item with that name already exists.")
             target.mkdir(parents=False, exist_ok=False)
-            return str(target.resolve(strict=True))
+            return folder_ops.canonical_path_str(target.resolve(strict=True))
 
         def finished(created_dir, error):
             if error or not created_dir:
@@ -2315,8 +2358,8 @@ class Studio(QObject):
             for win in list(self.session.windows.values()):
                 if not win.retired and win.folder:
                     try:
-                        win_root = Path(win.folder).resolve(strict=False)
-                        if created.is_relative_to(win_root):
+                        win_root = Path(folder_ops.canonical_path_str(win.folder))
+                        if folder_ops.matches_path_prefix(created_dir, str(win_root), is_directory=True):
                             win.expanded.update(folder_ops.ancestor_directories_in_folder(win_root, created))
                             win._load_tree()
                     except OSError:
@@ -2356,8 +2399,10 @@ class Studio(QObject):
                     self._emit(False)
                     return
 
+        self._suspend_watches_for_prefix(str(before), is_dir=is_dir)
+
         def work():
-            if after.is_symlink():
+            if folder_ops._is_link_or_junction(after):
                 raise ValueError("Symlinks are not allowed inside the open folder.")
             if after.exists():
                 same_inode = False
@@ -2369,10 +2414,13 @@ class Studio(QObject):
                 if not same_inode:
                     raise ValueError("An item with that name already exists.")
             before.rename(after)
-            return str(before), str(after.resolve(strict=True)), is_dir
+            return folder_ops.canonical_path_str(before), folder_ops.canonical_path_str(after.resolve(strict=True)), is_dir
 
         def finished(result, error):
             if error or not result:
+                for win in list(self.session.windows.values()):
+                    if not win.retired:
+                        win._watch_notes(force=True)
                 return
             old_str, new_str, was_dir = result
             self._sync_path_change(old_str, new_str, is_dir=was_dir, message=f"Renamed to {Path(new_str).name}")
@@ -2421,13 +2469,13 @@ class Studio(QObject):
             if not dest_dir.is_dir():
                 raise ValueError("Choose an existing destination folder.")
             is_dir = source.is_dir()
-            if is_dir and (dest_dir == source or dest_dir.is_relative_to(source)):
+            if is_dir and (folder_ops.same_path(dest_dir, source) or folder_ops.matches_path_prefix(str(dest_dir), str(source), is_directory=True)):
                 raise ValueError("Cannot move a folder into itself.")
-            if source.parent == dest_dir:
+            if folder_ops.same_path(source.parent, dest_dir):
                 return
             dest_path = dest_dir / source.name
             folder_ops.resolve_within_open_folder(root, dest_path, allow_root=False, must_exist=False)
-            if dest_path.exists() or dest_path.is_symlink():
+            if dest_path.exists() or folder_ops._is_link_or_junction(dest_path):
                 raise ValueError("An item with that name already exists in the destination folder.")
         except (OSError, ValueError) as error:
             self.message = str(error)
@@ -2439,7 +2487,7 @@ class Studio(QObject):
             return
 
         open_tab = next(
-            (t for w in self.session.windows.values() if not w.retired for t in w.tabs if t["path"] == str(source)),
+            (t for w in self.session.windows.values() if not w.retired for t in w.tabs if folder_ops.same_path(t["path"], source)),
             None,
         )
         captured_markdown = open_tab["content"] if open_tab is not None else None
@@ -2503,30 +2551,39 @@ class Studio(QObject):
                     return
 
         open_tab = next(
-            (t for w in self.session.windows.values() if not w.retired for t in w.tabs if t["path"] == str(source)),
+            (t for w in self.session.windows.values() if not w.retired for t in w.tabs if folder_ops.same_path(t["path"], source)),
             None,
         )
         captured_markdown = open_tab["content"] if open_tab is not None else None
+        self._suspend_watches_for_prefix(str(source), is_dir=is_dir)
 
         def work():
-            if dest_path.exists() or dest_path.is_symlink():
+            if dest_path.exists() or folder_ops._is_link_or_junction(dest_path):
                 raise ValueError("An item with that name already exists in the destination folder.")
             if image_action == "copy" and not is_dir and source.suffix.lower() in folder_ops.PLAIN_MARKDOWN_SUFFIXES:
                 markdown = captured_markdown if captured_markdown is not None else source.read_text(encoding="utf-8", errors="replace")
                 items = folder_ops.linked_local_images(source, markdown, root, dest_dir)
                 folder_ops.copy_linked_local_images(items, root)
             shutil.move(str(source), str(dest_path))
-            return str(source), str(dest_path.resolve(strict=True)), is_dir, str(dest_dir)
+            return (
+                folder_ops.canonical_path_str(source),
+                folder_ops.canonical_path_str(dest_path.resolve(strict=True)),
+                is_dir,
+                folder_ops.canonical_path_str(dest_dir),
+            )
 
         def finished(result, error):
             if error or not result:
+                for win in list(self.session.windows.values()):
+                    if not win.retired:
+                        win._watch_notes(force=True)
                 return
             old_str, new_str, was_dir, dest_dir_str = result
             for win in list(self.session.windows.values()):
                 if not win.retired and win.folder:
                     try:
-                        win_root = Path(win.folder).resolve(strict=False)
-                        if Path(dest_dir_str).is_relative_to(win_root) or Path(dest_dir_str) == win_root:
+                        win_root = Path(folder_ops.canonical_path_str(win.folder))
+                        if folder_ops.same_path(dest_dir_str, win_root) or folder_ops.matches_path_prefix(dest_dir_str, str(win_root), is_directory=True):
                             win.expanded.update(folder_ops.ancestor_directories_in_folder(win_root, Path(dest_dir_str)))
                     except OSError:
                         pass
@@ -2589,6 +2646,7 @@ class Studio(QObject):
                     deleted_drafts.append({**detached, "name": "Recovered " + tab["name"]})
 
         existing_closed = list(self.closed_tabs)
+        self._suspend_watches_for_prefix(target_str, is_dir=is_dir)
 
         def work():
             saved_refs: list[dict] = []
@@ -2598,13 +2656,22 @@ class Studio(QObject):
             if next_refs is not None:
                 self.session.closed_note_store.save_index(next_refs)
             qfile = QFile(target_str)
+            before_qname = qfile.fileName()
             if not qfile.moveToTrash():
                 raise OSError(qfile.errorString() or f"Could not move {target.name} to system Trash.")
-            return next_refs
+            after_qname = qfile.fileName()
+            trashed_dest = after_qname if after_qname and after_qname != before_qname else ""
+            return next_refs, trashed_dest
 
-        def finished(next_refs, error):
-            if error:
+        def finished(result, error):
+            if error or result is None:
+                for win in list(self.session.windows.values()):
+                    if not win.retired:
+                        win._watch_notes(force=True)
                 return
+            next_refs, trashed_dest = result
+            self._last_trashed_source = target_str
+            self._last_trashed_path = trashed_dest
             if next_refs is not None:
                 self.closed_tabs[:] = next_refs
             if deleted_drafts:
@@ -2688,8 +2755,9 @@ class Studio(QObject):
                     return
             except OSError:
                 pass
+        self._suspend_watches_for_prefix(str(before), is_dir=False)
         def work():
-            if after.is_symlink(): raise ValueError("Symlinks are not allowed.")
+            if folder_ops._is_link_or_junction(after): raise ValueError("Symlinks are not allowed.")
             if after.exists():
                 same_inode = False
                 if before.name.casefold() == final_name.casefold():
@@ -2699,8 +2767,12 @@ class Studio(QObject):
                     raise ValueError("A file with that name already exists.")
             before.rename(after)
         def finished(_,error):
-            if error: return
-            self._sync_path_change(str(before), str(after), is_dir=False, message=f"Renamed to {final_name}")
+            if error:
+                for win in list(self.session.windows.values()):
+                    if not win.retired:
+                        win._watch_notes(force=True)
+                return
+            self._sync_path_change(folder_ops.canonical_path_str(before), folder_ops.canonical_path_str(after), is_dir=False, message=f"Renamed to {final_name}")
         self._submit(work,finished,executor=self.writes)
 
     @Slot(str,result=QUrl)

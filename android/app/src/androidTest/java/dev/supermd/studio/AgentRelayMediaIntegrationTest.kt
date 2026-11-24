@@ -177,8 +177,11 @@ class AgentRelayMediaIntegrationTest {
 
     private fun waitUntil(timeoutMs: Long, condition: () -> Boolean) {
         val deadline = System.currentTimeMillis() + timeoutMs
+        val mainHandler = android.os.Handler(android.os.Looper.getMainLooper())
         while (!condition() && System.currentTimeMillis() < deadline) {
-            androidx.test.platform.app.InstrumentationRegistry.getInstrumentation().waitForIdleSync()
+            val pump = CountDownLatch(1)
+            mainHandler.post { pump.countDown() }
+            pump.await(200, TimeUnit.MILLISECONDS)
             Thread.sleep(20)
         }
         assertTrue("Condition timed out", condition())
