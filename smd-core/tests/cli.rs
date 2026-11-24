@@ -103,3 +103,70 @@ fn inline_data_images_export_and_pack_but_remote_images_never_download_implicitl
     let output=w.run(&["export","remote.md","remote.pdf"]);
     assert!(!output.status.success());assert!(String::from_utf8_lossy(&output.stderr).contains("explicit download"));assert!(!w.file("remote.pdf").exists());
 }
+
+#[test]
+fn unpack_extracts_markdown_and_assets_and_aborts_before_writing_on_collision_or_symlink() {
+    let w = Workspace::new();
+    let svg_a = b"<svg xmlns=\"http://www.w3.org/2000/svg\" width=\"24\" height=\"24\"><rect width=\"24\" height=\"24\" fill=\"#386a57\"/></svg>";
+    let svg_b = b"<svg xmlns=\"http://www.w3.org/2000/svg\" width=\"24\" height=\"24\"><circle cx=\"12\" cy=\"12\" r=\"9\" fill=\"#6750a4\"/></svg>";
+    fs::write(w.file("first.svg"), svg_a).unwrap();
+    fs::write(w.file("second.svg"), svg_b).unwrap();
+    fs::write(w.file("lesson.md"), "# Lesson\n\n![First](first.svg)\n\n![Second](second.svg)\n").unwrap();
+    assert!(success(w.run(&["--help"])).contains("unpack NOTE OUTPUT_DIR"));
+    success(w.run(&["pack", "lesson.md", "lesson.smd"]));
+
+    let unpacked_stdout = success(w.run(&["unpack", "lesson.smd", "unpacked"]));
+    assert!(!unpacked_stdout.contains("base64"));
+    let summary: serde_json::Value = serde_json::from_str(&unpacked_stdout).unwrap();
+    assert_eq!(summary["assets"], 2);
+    let unpacked_md = fs::read_to_string(w.file("unpacked/lesson.md")).unwrap();
+    assert!(unpacked_md.contains("# Lesson"));
+    assert!(unpacked_md.contains("assets/image-1.svg"));
+    assert!(unpacked_md.contains("assets/image-2.svg"));
+    assert_eq!(fs::read(w.file("unpacked/assets/image-1.svg")).unwrap(), svg_a);
+    assert_eq!(fs::read(w.file("unpacked/assets/image-2.svg")).unwrap(), svg_b);
+
+    // Repeating unpack into the same directory fails without modifying existing files.
+    fs::write(w.file("unpacked/lesson.md"), "user edited markdown").unwrap();
+    assert!(!w.run(&["unpack", "lesson.smd", "unpacked"]).status.success());
+    assert_eq!(fs::read_to_string(w.file("unpacked/lesson.md")).unwrap(), "user edited markdown");
+
+    // Pre-existing Markdown file aborts before creating assets/ or writing any image.
+    fs::create_dir(w.file("collide-md")).unwrap();
+    fs::write(w.file("collide-md/lesson.md"), "keep existing md").unwrap();
+    assert!(!w.run(&["unpack", "lesson.smd", "collide-md"]).status.success());
+    assert_eq!(fs::read_to_string(w.file("collide-md/lesson.md")).unwrap(), "keep existing md");
+    assert!(!w.file("collide-md/assets").exists());
+
+    // Pre-existing second asset aborts before writing image-1.svg or lesson.md.
+    fs::create_dir_all(w.file("collide-asset/assets")).unwrap();
+    fs::write(w.file("collide-asset/assets/image-2.svg"), b"keep existing asset").unwrap();
+    assert!(!w.run(&["unpack", "lesson.smd", "collide-asset"]).status.success());
+    assert_eq!(fs::read(w.file("collide-asset/assets/image-2.svg")).unwrap(), b"keep existing asset");
+    assert!(!w.file("collide-asset/assets/image-1.svg").exists());
+    assert!(!w.file("collide-asset/lesson.md").exists());
+
+    // Plain Markdown notes are rejected without creating the destination folder.
+    assert!(!w.run(&["unpack", "lesson.md", "plain-out"]).status.success());
+    assert!(!w.file("plain-out").exists());
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::symlink;
+        let outside = w.file("outside");
+        fs::create_dir(&outside).unwrap();
+
+        let link_root = w.file("symlink-out");
+        symlink(&outside, &link_root).unwrap();
+        assert!(!w.run(&["unpack", "lesson.smd", "symlink-out"]).status.success());
+        assert!(!w.run(&["unpack", "lesson.smd", "symlink-out/nested"]).status.success());
+        assert!(fs::read_dir(&outside).unwrap().next().is_none());
+
+        let nested = w.file("with-symlink-assets");
+        fs::create_dir(&nested).unwrap();
+        symlink(&outside, nested.join("assets")).unwrap();
+        assert!(!w.run(&["unpack", "lesson.smd", "with-symlink-assets"]).status.success());
+        assert!(!nested.join("lesson.md").exists());
+        assert!(fs::read_dir(&outside).unwrap().next().is_none());
+    }
+}

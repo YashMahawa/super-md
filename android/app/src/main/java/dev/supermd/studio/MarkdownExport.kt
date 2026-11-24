@@ -10,9 +10,90 @@ import androidx.documentfile.provider.DocumentFile
 import org.json.JSONObject
 import java.io.File
 import java.io.OutputStream
+import java.io.StringReader
+import java.nio.ByteBuffer
+import java.nio.charset.CharacterCodingException
+import java.nio.charset.CodingErrorAction
 import java.util.UUID
 import java.util.zip.ZipEntry
 import java.util.zip.ZipOutputStream
+import javax.xml.parsers.DocumentBuilderFactory
+import org.w3c.dom.Element
+import org.xml.sax.ErrorHandler
+import org.xml.sax.InputSource
+import org.xml.sax.SAXParseException
+
+private val forbiddenSvgElements = setOf("script", "foreignobject", "iframe", "object", "embed")
+private val allowedSvgHref = Regex("^(?:#|data:image/)", RegexOption.IGNORE_CASE)
+private val externalSvgUrl = Regex("url\\(\\s*['\"]?(?:https?:|//|file:|javascript:)", RegexOption.IGNORE_CASE)
+private val externalSvgStyle = Regex("url\\(\\s*['\"]?(?:https?:|//|file:|javascript:)|@import", RegexOption.IGNORE_CASE)
+private val svgEntityDecl = Regex("<!ENTITY\\b", RegexOption.IGNORE_CASE)
+
+internal fun requireSafeSvg(bytes: ByteArray) {
+    val source = try {
+        Charsets.UTF_8.newDecoder()
+            .onMalformedInput(CodingErrorAction.REPORT)
+            .onUnmappableCharacter(CodingErrorAction.REPORT)
+            .decode(ByteBuffer.wrap(bytes))
+            .toString()
+    } catch (_: CharacterCodingException) {
+        throw IllegalArgumentException("This SVG is not valid UTF-8")
+    }
+    require(!svgEntityDecl.containsMatchIn(source)) { "SVG XML entities are not allowed" }
+    val document = try {
+        val factory = DocumentBuilderFactory.newInstance().apply {
+            isNamespaceAware = true
+            isExpandEntityReferences = false
+            isValidating = false
+            runCatching { setFeature("http://javax.xml.XMLConstants/feature/secure-processing", true) }
+            runCatching { setFeature("http://xml.org/sax/features/external-general-entities", false) }
+            runCatching { setFeature("http://xml.org/sax/features/external-parameter-entities", false) }
+            runCatching { setFeature("http://apache.org/xml/features/nonvalidating/load-external-dtd", false) }
+        }
+        val builder = factory.newDocumentBuilder().apply {
+            setEntityResolver { _, _ -> InputSource(StringReader("")) }
+            setErrorHandler(object : ErrorHandler {
+                override fun warning(exception: SAXParseException) = Unit
+                override fun error(exception: SAXParseException) { throw exception }
+                override fun fatalError(exception: SAXParseException) { throw exception }
+            })
+        }
+        builder.parse(InputSource(StringReader(source)))
+    } catch (error: Exception) {
+        throw IllegalArgumentException("This SVG is not valid XML", error)
+    }
+    val root = document.documentElement ?: throw IllegalArgumentException("This SVG is not valid XML")
+    val rootName = (root.localName ?: root.tagName.substringAfter(':')).lowercase()
+    require(rootName == "svg") { "This SVG is not valid XML" }
+    val stack = ArrayDeque<Element>().apply { add(root) }
+    while (stack.isNotEmpty()) {
+        val element = stack.removeLast()
+        val tag = (element.localName ?: element.tagName.substringAfter(':')).lowercase()
+        require(tag !in forbiddenSvgElements) { "SVG must be a self-contained image, without scripts or embedded HTML" }
+        val attributes = element.attributes
+        for (i in 0 until attributes.length) {
+            val attr = attributes.item(i)
+            val fullName = attr.nodeName
+            val local = (attr.localName ?: fullName.substringAfter(':')).lowercase()
+            val value = attr.nodeValue.orEmpty().trim()
+            require(!fullName.startsWith("on", ignoreCase = true) && !local.startsWith("on")) { "SVG event handlers are not allowed" }
+            if ((fullName.equals("href", ignoreCase = true) || fullName.equals("xlink:href", ignoreCase = true) ||
+                    (local == "href" && !fullName.startsWith("xmlns", ignoreCase = true))) && !allowedSvgHref.containsMatchIn(value)
+            ) {
+                throw IllegalArgumentException("External SVG resources must be embedded first")
+            }
+            require(!externalSvgUrl.containsMatchIn(value)) { "External SVG resources must be embedded first" }
+        }
+        if (tag == "style") {
+            require(!externalSvgStyle.containsMatchIn(element.textContent.orEmpty())) { "External SVG styles are not allowed" }
+        }
+        val children = element.childNodes
+        for (i in children.length - 1 downTo 0) {
+            val child = children.item(i)
+            if (child is Element) stack.add(child)
+        }
+    }
+}
 
 internal fun markdownAssetPath(raw: String): String {
     val path = Uri.decode(raw)
@@ -39,10 +120,12 @@ internal class MarkdownExport(private val context: Context, val filename: String
                 val path = markdownAssetPath(raw)
                 require(names.add(path.lowercase())) { "Conflicting Markdown asset names" }
                 val (mime, bytes) = media.decodePortableImage(assets.getString(raw))
+                media.requirePortableImage(mime, bytes)
+                if (mime == "image/svg+xml") requireSafeSvg(bytes)
                 val extension = path.substringAfterLast('.').lowercase()
                 require(extension in when(mime) {
                     "image/png" -> setOf("png"); "image/jpeg" -> setOf("jpg", "jpeg"); "image/gif" -> setOf("gif")
-                    "image/webp" -> setOf("webp"); "image/avif" -> setOf("avif"); else -> emptySet()
+                    "image/webp" -> setOf("webp"); "image/avif" -> setOf("avif"); "image/svg+xml" -> setOf("svg"); else -> emptySet()
                 }) { "Markdown image filename does not match its type" }
                 total += bytes.size
                 require(total <= 128L * 1024 * 1024) { "Markdown and assets exceed 128 MiB" }

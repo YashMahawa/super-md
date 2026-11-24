@@ -9,7 +9,7 @@ import remarkParse from "remark-parse";
 afterEach(() => native.mockReset());
 
 describe("plain Markdown export assets", () => {
-  it("inlines referenced SVG and preserves local raster paths and GIF bytes", async () => {
+  it("preserves referenced SVG and local raster paths and exact bytes", async () => {
     native.mockImplementation(async (_command: string, args: any) => {
       if (args.source === "diagrams/flow.svg") return "data:image/svg+xml;base64,PHN2Zz48dGV4dD5mbG93PC90ZXh0Pjwvc3ZnPg==";
       if (args.source === "images/loop.gif") return "data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7";
@@ -19,12 +19,13 @@ describe("plain Markdown export assets", () => {
       "# Keep\n\n![Flow](diagrams/flow.svg)\n\n![Loop](images/loop.gif)\n\n```mermaid\ngraph TD; A-->B\n```\n",
       "/notes/source.smd",
     );
-    expect(result.content).toContain("```svg\n<svg><text>flow</text></svg>\n```");
+    expect(result.content).toContain("![Flow](diagrams/flow.svg)");
+    expect(result.content).not.toContain("```svg");
     expect(result.content).toContain("![Loop](images/loop.gif)");
     expect(result.content).toContain("```mermaid\ngraph TD; A-->B\n```");
-    expect(result.assets["images/loop.gif"]).toMatch(/^data:image\/gif;base64,/);
+    expect(result.assets["diagrams/flow.svg"]).toBe("data:image/svg+xml;base64,PHN2Zz48dGV4dD5mbG93PC90ZXh0Pjwvc3ZnPg==");
     expect(result.assets["images/loop.gif"]).toBe("data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7");
-    expect(Object.keys(result.assets)).toEqual(["images/loop.gif"]);
+    expect(Object.keys(result.assets)).toEqual(["diagrams/flow.svg", "images/loop.gif"]);
     expect(native).toHaveBeenCalledTimes(2);
   });
 
@@ -82,23 +83,47 @@ describe("plain Markdown export assets", () => {
     expect(result.assets["media/cover.jpeg"]).toMatch(/^data:image\/jpeg;base64,/);
   });
 
-  it("inlines reference-style SVG at the image use and keeps the remaining source valid", async () => {
-    native.mockResolvedValue("data:image/svg+xml;base64,PHN2Zz48cGF0aC8+PC9zdmc+");
-    const result = await prepareMarkdownExport("![Diagram][d]\n\n[d]: assets/image-a1b2c3.svg\n", "/notes/source.md");
-    expect(result.content).toContain("```svg\n<svg><path/></svg>\n```");
+  it("rewrites reference-style generated SVG to a companion SVG asset and removes the generated definition", async () => {
+    native.mockImplementation(async (_command: string, args: any) => {
+      if (args.source === "image1.svg") return "data:image/svg+xml;base64,PHN2Zz48Y2lyY2xlLz48L3N2Zz4=";
+      if (args.source === "assets/image-a1b2c3.svg") return "data:image/svg+xml;base64,PHN2Zz48cGF0aC8+PC9zdmc+";
+      throw Error(`unexpected asset ${args.source}`);
+    });
+    const result = await prepareMarkdownExport(
+      "![Existing](image1.svg)\n\n![Diagram][d]\n\n[d]: assets/image-a1b2c3.svg\n",
+      "/notes/source.md",
+    );
+    expect(result.content).toContain("![Existing](image1.svg)");
+    expect(result.content).toContain("![Diagram](<image2.svg>)");
     expect(result.content).not.toContain("image-a1b2c3");
-    expect(result.assets).toEqual({});
+    expect(result.content).not.toContain("```svg");
+    expect(result.assets).toEqual({
+      "image1.svg": "data:image/svg+xml;base64,PHN2Zz48Y2lyY2xlLz48L3N2Zz4=",
+      "image2.svg": "data:image/svg+xml;base64,PHN2Zz48cGF0aC8+PC9zdmc+",
+    });
   });
 
-  it("wraps inline prose SVG references in actual block fences", async () => {
+  it("keeps inline prose SVG references as linked SVG assets instead of code fences and rejects unsafe SVGs", async () => {
     native.mockResolvedValue("data:image/svg+xml;base64,PHN2Zz48cGF0aC8+PC9zdmc+");
-    const result = await prepareMarkdownExport("Before the figure ![Diagram](diagram.svg) after the figure.\n", "/notes/source.md");
+    const source = "Before the figure ![Diagram](diagram.svg) after the figure.\n";
+    const result = await prepareMarkdownExport(source, "/notes/source.md");
+    expect(result.content).toBe(source);
+    expect(result.assets).toEqual({ "diagram.svg": "data:image/svg+xml;base64,PHN2Zz48cGF0aC8+PC9zdmc+" });
     const tree = unified().use(remarkParse).parse(result.content);
-    const codes = (tree.children as any[]).filter(node => node.type === "code");
-    expect(codes).toHaveLength(1);
-    expect(codes[0].lang).toBe("svg");
-    expect((tree.children as any[]).some(node => node.type === "paragraph" && JSON.stringify(node).includes("Before the figure"))).toBe(true);
-    expect((tree.children as any[]).some(node => node.type === "paragraph" && JSON.stringify(node).includes("after the figure"))).toBe(true);
+    expect((tree.children as any[]).filter(node => node.type === "code")).toHaveLength(0);
+
+    for (const unsafeSvg of [
+      "<svg xmlns=\"http://www.w3.org/2000/svg\"><script>alert(1)</script></svg>",
+      "<svg xmlns=\"http://www.w3.org/2000/svg\" onload=\"alert(1)\"><path/></svg>",
+      "<svg xmlns=\"http://www.w3.org/2000/svg\"><foreignObject><div>html</div></foreignObject></svg>",
+      "<svg xmlns=\"http://www.w3.org/2000/svg\"><image href=\"https://evil.example/a.png\"/></svg>",
+      "<svg xmlns=\"http://www.w3.org/2000/svg\"><style>@import url('https://evil.example/a.css');</style></svg>",
+    ]) {
+      const encoded = `data:image/svg+xml;base64,${btoa(unsafeSvg)}`;
+      native.mockResolvedValueOnce(encoded);
+      await expect(prepareMarkdownExport("![Bad](diagram.svg)", "/notes/source.md")).rejects.toThrow();
+      await expect(prepareMarkdownExport(`![Bad](${encoded})`, "/notes/source.md")).rejects.toThrow();
+    }
   });
 
   it("inlines local Mermaid source referenced by image, link, and reference syntax", async () => {

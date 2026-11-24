@@ -133,3 +133,124 @@ it("forwards the active note Python interpreter when preparing Markdown and Mark
     archive: false,
   });
 });
+
+it("bundles companion assets and supports archive mode for agent export_document requests", async () => {
+  prepareMarkdown.mockResolvedValue({
+    content: "# Study\n\n![Diagram](<image1.svg>)\n",
+    assets: { "image1.svg": "data:image/svg+xml;base64,PHN2Zy8+" },
+  });
+  native.mockImplementation(async (command: string, args?: any) => {
+    if (command === "agent_export_native") return { accepted: true, jobId: args?.requestId };
+    return null;
+  });
+
+  const host = document.createElement("div");
+  document.body.append(host);
+  root = readerTree.mountRoot!(host);
+  await act(async () => {
+    root?.render(readerTree.element);
+  });
+
+  const content = "# Study\n\n![Diagram](diagram.svg)\n";
+  await act(async () => {
+    window.supermdLoad!({
+      id: "tab-agent",
+      content,
+      path: "/vault/Study.md",
+      mode: "reader",
+      dark: false,
+      fullscreen: false,
+      font: "sans",
+      size: 16,
+      colors: { primary: "#386a57" },
+      zoom: 100,
+      python: "/opt/venv/bin/python",
+    });
+  });
+
+  const runAgent = (request: Record<string, unknown>) =>
+    new Promise<any>((resolve, reject) => {
+      window.supermdAgentRequest!(request as any, (result: unknown, error?: string | null) =>
+        error ? reject(new Error(error)) : resolve(result),
+      );
+    });
+
+  const context = await runAgent({ action: "get_context", tabId: "tab-agent" });
+
+  await runAgent({
+    action: "export_document",
+    tabId: "tab-agent",
+    expectedRevision: context.revision,
+    requestId: "job-md",
+    format: "md",
+    filename: "Study.md",
+    options: { pageSize: "a4" },
+  });
+  expect(prepareMarkdown).toHaveBeenCalledWith(content, "/vault/Study.md", {
+    compatible: false,
+    python: "/opt/venv/bin/python",
+  });
+  expect(native).toHaveBeenCalledWith("agent_export_native", {
+    id: "tab-agent",
+    expectedRevision: context.revision,
+    requestId: "job-md",
+    format: "md",
+    filename: "Study.md",
+    content: "# Study\n\n![Diagram](<image1.svg>)\n",
+    assets: { "image1.svg": "data:image/svg+xml;base64,PHN2Zy8+" },
+    options: { pageSize: "a4" },
+  });
+
+  prepareMarkdown.mockClear();
+  native.mockClear();
+  await runAgent({
+    action: "export_document",
+    tabId: "tab-agent",
+    expectedRevision: context.revision,
+    requestId: "job-mdzip",
+    format: "md",
+    filename: "Study.zip",
+    options: { archive: true },
+  });
+  expect(prepareMarkdown).toHaveBeenCalledWith(content, "/vault/Study.md", {
+    compatible: true,
+    python: "/opt/venv/bin/python",
+  });
+  expect(native).toHaveBeenCalledWith("agent_export_native", {
+    id: "tab-agent",
+    expectedRevision: context.revision,
+    requestId: "job-mdzip",
+    format: "mdzip",
+    archive: true,
+    filename: "Study.zip",
+    content: "# Study\n\n![Diagram](<image1.svg>)\n",
+    assets: { "image1.svg": "data:image/svg+xml;base64,PHN2Zy8+" },
+    options: {},
+  });
+
+  prepareMarkdown.mockClear();
+  native.mockClear();
+  await runAgent({
+    action: "export_document",
+    tabId: "tab-agent",
+    expectedRevision: context.revision,
+    requestId: "job-direct-mdzip",
+    format: "mdzip",
+    filename: "Bundle",
+  });
+  expect(prepareMarkdown).toHaveBeenCalledWith(content, "/vault/Study.md", {
+    compatible: true,
+    python: "/opt/venv/bin/python",
+  });
+  expect(native).toHaveBeenCalledWith("agent_export_native", {
+    id: "tab-agent",
+    expectedRevision: context.revision,
+    requestId: "job-direct-mdzip",
+    format: "mdzip",
+    archive: true,
+    filename: "Bundle",
+    content: "# Study\n\n![Diagram](<image1.svg>)\n",
+    assets: { "image1.svg": "data:image/svg+xml;base64,PHN2Zy8+" },
+    options: {},
+  });
+});

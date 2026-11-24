@@ -1341,7 +1341,19 @@ class StudioViewModel(app: Application, val workspaceKey: String = "main") : And
             destination.toString() to savedName
         }
     }
-    internal suspend fun writeAgentExport(content: String, assets: JSONObject, format: String, requestedFilename: String, rawPdfOptions: String): Pair<Uri, String> {
+    internal suspend fun writeAgentExport(content: String, assets: JSONObject, format: String, requestedFilename: String, rawPdfOptions: String, archive: Boolean = format == "mdzip"): Pair<Uri, String> {
+        val isMarkdownArchive = archive || format == "mdzip"
+        if (format == "md" || isMarkdownArchive) {
+            val trimmedName = if (isMarkdownArchive && requestedFilename.endsWith(".zip", ignoreCase = true)) {
+                requestedFilename.dropLast(4)
+            } else requestedFilename
+            val mdFilename = ExportFilename.suggestedName(trimmedName, NativeExportFormat.MARKDOWN)
+            return withContext(Dispatchers.IO) {
+                MarkdownExport(getApplication(), mdFilename, content, assets).use { bundle ->
+                    bundle.save(noteLocation(), isMarkdownArchive)
+                }
+            }
+        }
         val nativeFormat = NativeExportFormat.fromShareFormat(format)
         val filename = ExportFilename.suggestedName(requestedFilename, nativeFormat)
         val staged = File(getApplication<Application>().cacheDir, "agent-export-${UUID.randomUUID()}.${nativeFormat.extension}")
@@ -1358,12 +1370,9 @@ class StudioViewModel(app: Application, val workspaceKey: String = "main") : And
                     staged.outputStream().use { media.writeFmd(it, content, assets) }
                     verifyExportHeader(staged, nativeFormat)
                 }
-                NativeExportFormat.MARKDOWN -> withContext(Dispatchers.IO) {
-                    staged.writeText(content, Charsets.UTF_8)
-                }
+                NativeExportFormat.MARKDOWN -> error("Markdown exports are handled via MarkdownExport")
             }
-            val minimumSize = if (nativeFormat == NativeExportFormat.MARKDOWN) 0L else 1L
-            require(staged.length() in minimumSize..(128L * 1024 * 1024)) { "Agent downloads are limited to 128 MiB per export" }
+            require(staged.length() in 1L..(128L * 1024 * 1024)) { "Agent downloads are limited to 128 MiB per export" }
             val (uri, savedName) = withContext(Dispatchers.IO) {
                 media.writeAgentDocument(filename, nativeFormat.mimeType, noteLocation()) { _, output ->
                     staged.inputStream().use { it.copyTo(output) }
