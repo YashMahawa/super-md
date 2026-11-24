@@ -140,19 +140,11 @@ jobs:
       - run: npx tsc -b --pretty false
       - name: Build the relay for cross-platform Qt/MCP integration tests
         run: npm ci --prefix agent-relay && npm run build --prefix agent-relay
-      - name: Wait for same-run frontend artifacts for this checkout
+      - name: Wait for and download same-run frontend artifacts for this checkout
         shell: bash
         env:
           GH_TOKEN: ${{ github.token }}
-        run: node scripts/wait-native-frontend-artifacts.mjs "$NATIVE_FRONTEND_SOURCE_SHA"
-      - uses: actions/download-artifact@v4
-        with:
-          name: native-frontend-dist-${{ steps.source.outputs.sha }}
-          path: dist
-      - uses: actions/download-artifact@v4
-        with:
-          name: native-frontend-manifest-${{ steps.source.outputs.sha }}
-          path: ${{ runner.temp }}
+        run: node scripts/wait-native-frontend-artifacts.mjs "$NATIVE_FRONTEND_SOURCE_SHA" --dist-dir dist --manifest-dir "$RUNNER_TEMP"
       - name: Verify exact-source frontend artifact
         shell: bash
         run: node scripts/native-frontend-artifact.mjs verify dist "$RUNNER_TEMP/native-frontend-manifest.json"
@@ -393,19 +385,11 @@ jobs:
           cache-on-failure: true
       - run: npm ci
       - run: npx tsc -b --pretty false
-      - name: Wait for same-run frontend artifacts for this checkout
+      - name: Wait for and download same-run frontend artifacts for this checkout
         shell: bash
         env:
           GH_TOKEN: ${{ github.token }}
-        run: node scripts/wait-native-frontend-artifacts.mjs "$NATIVE_FRONTEND_SOURCE_SHA"
-      - uses: actions/download-artifact@v4
-        with:
-          name: native-frontend-dist-${{ steps.source.outputs.sha }}
-          path: dist
-      - uses: actions/download-artifact@v4
-        with:
-          name: native-frontend-manifest-${{ steps.source.outputs.sha }}
-          path: ${{ runner.temp }}
+        run: node scripts/wait-native-frontend-artifacts.mjs "$NATIVE_FRONTEND_SOURCE_SHA" --dist-dir dist --manifest-dir "$RUNNER_TEMP"
       - name: Verify exact-source frontend artifact
         shell: bash
         run: node scripts/native-frontend-artifact.mjs verify dist "$RUNNER_TEMP/native-frontend-manifest.json"
