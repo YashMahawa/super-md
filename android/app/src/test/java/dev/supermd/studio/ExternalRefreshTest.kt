@@ -105,10 +105,12 @@ class ExternalRefreshTest {
         provider.fileFor(dirtyMd).writeText("# External edit must not clobber dirty tab\n")
         app.contentResolver.notifyChange(inactiveSmd, null)
         app.contentResolver.notifyChange(inactiveMd, null)
+        app.contentResolver.notifyChange(dirtyMd, null)
 
         await {
             model.state.value.tabs.single { it.id == inactiveSmdId }.content == "# Portable two\n" &&
                 model.state.value.tabs.single { it.id == inactiveMdId }.content == "# Background two\n" &&
+                dirtyId in model.state.value.conflictedTabIds &&
                 !portableDir(firstPortableDir).exists()
         }
         val refreshedSmd = model.state.value.tabs.single { it.id == inactiveSmdId }
@@ -215,9 +217,9 @@ class ExternalRefreshTest {
                 !portableDir(secondPortableDir).exists()
         }
 
-        // Selecting a dirty tab must preserve its unsaved local draft.
+        // Selecting a dirty tab must preserve its unsaved local draft while surfacing conflict state.
         model.select(dirtyMdId)
-        await { model.state.value.activeId == dirtyMdId }
+        await { model.state.value.activeId == dirtyMdId && model.state.value.activeConflicted }
         assertEquals("# Local dirty draft\n", model.state.value.tabs.single { it.id == dirtyMdId }.content)
     }
 

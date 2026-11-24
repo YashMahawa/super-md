@@ -15,6 +15,7 @@ it("keeps absolute values and conditional probabilities inside table cells with 
   expect(table.children.every((r:any)=>r.children.length===2)).toBe(true);
   const formula=table.children[1].children[0].children[0];
   expect(formula.type).toBe("inlineMath");expect(formula.value).toBe(String.raw`P(|X_n-X|>\varepsilon)\to0`);
+  expect(formula.data?.hChildren?.[0]?.value).toBe(String.raw`P(|X_n-X|>\varepsilon)\to0`);
   expect(source.slice(formula.position.start.offset,formula.position.end.offset)).toBe(String.raw`$P(|X_n-X|>\varepsilon)\to0$`);
 });
 it("does not rewrite non-tables, escaped pipes or code",()=>{

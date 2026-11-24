@@ -46,9 +46,9 @@ QtObject {id: exportDialog; function close() {}}
     def tearDown(self):
         self.window.close()
         self.window.deleteLater()
-        self.app.sendPostedEvents(None, QEvent.DeferredDelete)
+        self.app.sendPostedEvents(None, QEvent.Type.DeferredDelete)
         self.engine.deleteLater()
-        self.app.sendPostedEvents(None, QEvent.DeferredDelete)
+        self.app.sendPostedEvents(None, QEvent.Type.DeferredDelete)
     def test_each_export_gets_fresh_chooser_and_captured_format(self):
         for format in ("pdf", "smd", "md", "smd", "pdf"):
             self.window.setProperty("outputFormat", format)
@@ -62,7 +62,7 @@ QtObject {id: exportDialog; function close() {}}
             # Options changing/closing must not change an outstanding chooser.
             self.window.setProperty("outputFormat", "pdf" if format != "pdf" else "smd")
             QMetaObject.invokeMethod(chooser, "accepted")
-            self.app.sendPostedEvents(None, QEvent.DeferredDelete)
+            self.app.sendPostedEvents(None, QEvent.Type.DeferredDelete)
             self.assertEqual(self.backend.exports[-1], ("/tmp/Quiz 2 Ω literal%20." + format, format))
             self.assertIsNone(self.window.findChild(QObject, "exportDestination"))
     def test_requested_portable_format_is_not_reset_when_options_finish_opening(self):

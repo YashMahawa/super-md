@@ -19,6 +19,7 @@ def _definition_rows(platform: str) -> tuple[tuple[str, str, list[str]], ...]:
         ("new_note", "New note", [f"{primary}+T"]),
         ("open", "Open note", [f"{primary}+O"]),
         ("save", "Save note", [f"{primary}+S"]),
+        ("save_as", "Save as", [f"{primary}+Shift+S"]),
         ("undo", "Undo", [f"{primary}+Z"]),
         ("redo", "Redo", redo),
         ("copy", "Copy", [f"{primary}+C"]),
