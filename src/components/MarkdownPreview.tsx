@@ -1,10 +1,11 @@
-import { Children, isValidElement, lazy, memo, Suspense, useCallback, useContext, useEffect, useMemo, useRef, useState, type ReactNode } from "react";
+import { Children, createContext, isValidElement, lazy, memo, Suspense, useContext, useEffect, useMemo, useRef, useState, type ReactNode, type RefObject } from "react";
 import { invoke } from "../nativeBridge";
 import CachedMarkdown,{type MarkdownBlockRenderer} from "./CachedMarkdown";
 import remarkGfm from "remark-gfm";
 import remarkMath from "remark-math";
 import rehypeKatex from "rehype-katex";
 import rehypeHighlight from "rehype-highlight";
+import type { PluggableList } from "unified";
 import { visit } from "unist-util-visit";
 import InteractiveChart from "./InteractiveChart";
 import StepCards from "./StepCards";
@@ -22,7 +23,7 @@ import {DocumentAppearance} from '../documentAppearance';
 import {svgDataBackdrop} from '../svgImage';
 import {adaptSvgData} from '../svgTheme';
 import {analyzeDocument} from '../documentAnalysis';
-import type {SourceDocumentAnalysis} from '../documentAnalysis';
+import type {PythonCellSource, SourceDocumentAnalysis} from '../documentAnalysis';
 import {resolveReaderRasterAsset} from '../readerAssets';
 import {commitMediaLayout} from '../mediaLayout';
 import {registerMedia,installMediaMenu} from '../mediaExport';
@@ -194,47 +195,169 @@ interface Props extends ReaderAccessibilityPreference {
   sourceAnalysis?:SourceDocumentAnalysis;
 }
 
+interface MarkdownPreviewLiveState {
+  markdown: string;
+  tasks: number[];
+  onChange?: (markdown: string) => void;
+  pythonCells: PythonCellSource[];
+}
+
+interface MarkdownPreviewContextValue {
+  documentPath: string | null;
+  python: string;
+  dark: boolean;
+  trustedImageHosts: string[];
+  onTrustImageHost?: (host: string) => void;
+  editable: boolean;
+  liveStateRef: RefObject<MarkdownPreviewLiveState>;
+}
+
+const EMPTY_TASKS: number[] = [];
+const EMPTY_PYTHON_CELLS: PythonCellSource[] = [];
+const NOOP = () => {};
+const DEFAULT_LIVE_STATE: RefObject<MarkdownPreviewLiveState> = {
+  current: { markdown: "", tasks: EMPTY_TASKS, onChange: undefined, pythonCells: EMPTY_PYTHON_CELLS },
+};
+const MarkdownPreviewContext = createContext<MarkdownPreviewContextValue>({
+  documentPath: null,
+  python: "",
+  dark: false,
+  trustedImageHosts: EMPTY_TRUSTED_IMAGE_HOSTS,
+  onTrustImageHost: undefined,
+  editable: false,
+  liveStateRef: DEFAULT_LIVE_STATE,
+});
+
+const REMARK_PLUGINS: PluggableList = [
+  remarkGfm,
+  remarkMath,
+  remarkObsidianMath,
+  remarkSvgBlocks,
+  remarkCallouts,
+  remarkHeadingIds,
+  remarkTaskPositions,
+  remarkSourcePositions,
+];
+const REHYPE_PLUGINS: PluggableList = [rehypeKatex, rehypeHighlight];
+
+const MarkdownInput: Components['input'] = ({ node: _node, ...props }) => {
+  const { editable } = useContext(MarkdownPreviewContext);
+  return <input {...props} disabled={!editable} onChange={NOOP} />;
+};
+
+const MarkdownListItem: Components['li'] = ({ node, children, ...props }) => {
+  const { liveStateRef } = useContext(MarkdownPreviewContext);
+  return (
+    <li
+      {...props}
+      className={Array.isArray(node?.properties.className) ? node.properties.className.join(' ') : undefined}
+      onChange={event => {
+        const { tasks, onChange, markdown } = liveStateRef.current;
+        const index = Number(node?.properties['data-task-index']);
+        const offset = tasks[index];
+        if (offset === undefined || !onChange || !(event.target instanceof HTMLInputElement)) return;
+        onChange(markdown.slice(0, offset) + (event.target.checked ? 'x' : ' ') + markdown.slice(offset + 1));
+      }}
+    >
+      {children}
+    </li>
+  );
+};
+
+const MarkdownImage: Components['img'] = ({ src, alt }) => {
+  const { documentPath, trustedImageHosts, onTrustImageHost } = useContext(MarkdownPreviewContext);
+  return <AssetImage src={src} alt={alt} documentPath={documentPath} trustedImageHosts={trustedImageHosts} onTrustImageHost={onTrustImageHost} />;
+};
+
+const MarkdownLink: Components['a'] = ({ node: _node, href, children, ...props }) => (
+  <a
+    {...props}
+    href={href}
+    target={href?.startsWith("#") ? undefined : "_blank"}
+    rel="noreferrer"
+    onClick={event => {
+      if (navigateHeading(event.currentTarget)) {
+        event.preventDefault();
+        event.stopPropagation();
+      } else {
+        event.currentTarget.dataset.visited = 'true';
+      }
+    }}
+  >
+    {children}
+  </a>
+);
+
+const MarkdownPre: Components['pre'] = ({ node, children }) => {
+  const { documentPath, python, dark, trustedImageHosts, onTrustImageHost, liveStateRef } = useContext(MarkdownPreviewContext);
+  const child = Children.only(children) as React.ReactElement<{ className?: string; children?: ReactNode }>;
+  const language = child.props.className?.match(/language-([\w-]+)/)?.[1];
+  const source = textOf(child.props.children).replace(/\n$/, "");
+  const nodeData = node as { position?: { start?: { offset?: number } }; properties?: Record<string, unknown> } | undefined;
+  const offset = Number(nodeData?.properties?.['data-source-start'] ?? nodeData?.position?.start?.offset);
+  const pythonCell = ['python', 'py'].includes(language || '')
+    ? liveStateRef.current.pythonCells.find(cell => cell.source === source && cell.offset === offset)
+    : undefined;
+  const context = documentPath && pythonCell
+    ? { document: documentPath, cell: String(pythonCell.ordinal), interpreter: python || 'embedded' }
+    : undefined;
+  const protectedBlock = (block: ReactNode) => <CodeBlockBoundary key={`${language}:${source}`} source={source}>{block}</CodeBlockBoundary>;
+  if (language === "smd-tree") return protectedBlock(<InlineDiagram diagram={parseBinaryTreeSource(source)} />);
+  if (language === "smd-diagram") return protectedBlock(<InlineDiagram diagram={parseDiagramSource(source)} />);
+  if (language === "smd-steps") return protectedBlock(
+    <StepCards
+      source={source}
+      renderImage={(src, alt) => <AssetImage src={src} alt={alt} documentPath={documentPath} trustedImageHosts={trustedImageHosts} onTrustImageHost={onTrustImageHost} />}
+      renderChart={chartSource => <ThemedChart source={chartSource} dark={dark} />}
+      renderMarkdown={text => <MemoizedMarkdownPreview markdown={text} documentPath={documentPath} python={python} dark={dark} trustedImageHosts={trustedImageHosts} onTrustImageHost={onTrustImageHost} />}
+    />
+  );
+  if (language === "smd-chart") return protectedBlock(<ThemedChart source={source} dark={dark} />);
+  if (language === "svg") return protectedBlock(<ThemedSvg source={source} dark={dark} />);
+  if (language === "mermaid") return protectedBlock(<Suspense fallback={<span className="image-loading" role="status">Loading diagram…</span>}><ThemedMermaid source={source} dark={dark} /></Suspense>);
+  if (language === "python" || language === "py") return protectedBlock(<PythonCell source={source} python={python} context={context} highlighted={child.props.children} />);
+  return <div className="code-container"><CopyCode source={source} /><details className="code-disclosure" open={source.split("\n").length <= 12}><summary>{language || "Code"} <span>{source.split("\n").length} lines</span></summary><pre>{children}</pre></details></div>;
+};
+
+const MARKDOWN_COMPONENTS: Components = {
+  p: MarkdownParagraph,
+  input: MarkdownInput,
+  li: MarkdownListItem,
+  img: MarkdownImage,
+  a: MarkdownLink,
+  pre: MarkdownPre,
+};
+
 function MarkdownPreview({ markdown, documentPath, python, dark, trustedImageHosts = EMPTY_TRUSTED_IMAGE_HOSTS, onTrustImageHost, onChange,renderBlock,fullDocumentAccessibility=false,sourceAnalysis }: Props) {
   useEffect(installMediaMenu,[]);
   const analysis=useMemo(()=>sourceAnalysis?.source===markdown?sourceAnalysis.analysis:analyzeDocument(markdown),[markdown,sourceAnalysis]);
-  const tasks=onChange?analysis.tasks:[];
-  const renderImage = useCallback(({src,alt}:{src?:string;alt?:string})=><AssetImage src={src} alt={alt} documentPath={documentPath} trustedImageHosts={trustedImageHosts} onTrustImageHost={onTrustImageHost}/>,[documentPath,trustedImageHosts,onTrustImageHost]);
+  const editable=Boolean(onChange);
+  const tasks=editable?analysis.tasks:EMPTY_TASKS;
+  const liveStateRef=useRef<MarkdownPreviewLiveState>({markdown,tasks,onChange,pythonCells:analysis.pythonCells});
+  liveStateRef.current={markdown,tasks,onChange,pythonCells:analysis.pythonCells};
+  const previewContext=useMemo<MarkdownPreviewContextValue>(
+    ()=>({documentPath,python,dark,trustedImageHosts,onTrustImageHost,editable,liveStateRef}),
+    [documentPath,python,dark,trustedImageHosts,onTrustImageHost,editable],
+  );
+  const resolvedSourceAnalysis=useMemo(
+    ()=>sourceAnalysis?.source===markdown?sourceAnalysis:{source:markdown,analysis},
+    [markdown,analysis,sourceAnalysis],
+  );
   return (
-    <article className="markdown-body" onCopy={event=>{if(event.currentTarget.closest('.live-document'))return;const source=selectedMarkdown(window.getSelection(),markdown);if(source!==null){event.clipboardData.setData("text/plain",source);event.preventDefault();}}} onDragStart={event=>{if(!event.currentTarget.closest('.live-document'))setSelectedMarkdownDrag(event.nativeEvent,markdown);}}>
-      <CachedMarkdown
-        sourceAnalysis={{source:markdown,analysis}}
-        renderBlock={renderBlock}
-        windowingEnabled={!fullDocumentAccessibility}
-        remarkPlugins={[remarkGfm, remarkMath, remarkObsidianMath, remarkSvgBlocks, remarkCallouts, remarkHeadingIds, remarkTaskPositions,remarkSourcePositions]}
-        rehypePlugins={[rehypeKatex, rehypeHighlight]}
-        components={{
-          p: MarkdownParagraph,
-          input: ({node: _node,...props}) => <input {...props} disabled={!onChange} onChange={()=>{}} />,
-          li: ({node,children,...props}) => <li {...props} className={Array.isArray(node?.properties.className)?node.properties.className.join(' '):undefined} onChange={event=>{const index=Number(node?.properties['data-task-index']);const offset=tasks[index];if(offset===undefined || !onChange || !(event.target instanceof HTMLInputElement))return;onChange(markdown.slice(0,offset)+(event.target.checked?'x':' ')+markdown.slice(offset+1));}}>{children}</li>,
-          img: renderImage,
-          a: ({node:_node,href,children,...props}) => <a {...props} href={href} target={href?.startsWith("#") ? undefined : "_blank"} rel="noreferrer" onClick={event => { if (navigateHeading(event.currentTarget)) { event.preventDefault(); event.stopPropagation(); } else event.currentTarget.dataset.visited='true'; }}>{children}</a>,
-          pre: ({ node, children }) => {
-            const child = Children.only(children) as React.ReactElement<{ className?: string; children?: ReactNode }>;
-            const language = child.props.className?.match(/language-([\w-]+)/)?.[1];
-            const source = textOf(child.props.children).replace(/\n$/, "");
-            const nodeData=node as {position?:{start?:{offset?:number}};properties?:Record<string,unknown>}|undefined;
-            const offset=Number(nodeData?.properties?.['data-source-start']??nodeData?.position?.start?.offset);
-            const pythonCell=['python','py'].includes(language||'')?analysis.pythonCells.find(cell=>cell.source===source&&cell.offset===offset):undefined;
-            const context=documentPath&&pythonCell?{document:documentPath,cell:String(pythonCell.ordinal),interpreter:python||'embedded'}:undefined;
-            const protectedBlock = (block: ReactNode) => <CodeBlockBoundary key={`${language}:${source}`} source={source}>{block}</CodeBlockBoundary>;
-            if (language === "smd-tree") return protectedBlock(<InlineDiagram diagram={parseBinaryTreeSource(source)}/>);
-            if (language === "smd-diagram") return protectedBlock(<InlineDiagram diagram={parseDiagramSource(source)}/>);
-            if (language === "smd-steps") return protectedBlock(<StepCards source={source} renderImage={(src,alt)=><AssetImage src={src} alt={alt} documentPath={documentPath} trustedImageHosts={trustedImageHosts} onTrustImageHost={onTrustImageHost}/>} renderChart={chartSource=><ThemedChart source={chartSource} dark={dark}/>} renderMarkdown={text=><MarkdownPreview markdown={text} documentPath={documentPath} python={python} dark={dark} trustedImageHosts={trustedImageHosts} onTrustImageHost={onTrustImageHost}/>} />);
-            if (language === "smd-chart") return protectedBlock(<ThemedChart source={source} dark={dark} />);
-            if (language === "svg") return protectedBlock(<ThemedSvg source={source} dark={dark} />);
-            if (language === "mermaid") return protectedBlock(<Suspense fallback={<span className="image-loading" role="status">Loading diagram…</span>}><ThemedMermaid source={source} dark={dark} /></Suspense>);
-            if (language === "python" || language === "py") return protectedBlock(<PythonCell source={source} python={python} context={context} highlighted={child.props.children} />);
-            return <div className="code-container"><CopyCode source={source}/><details className="code-disclosure" open={source.split("\n").length <= 12}><summary>{language || "Code"} <span>{source.split("\n").length} lines</span></summary><pre>{children}</pre></details></div>;
-          }
-        }}
-      >{markdown}</CachedMarkdown>
-    </article>
+    <MarkdownPreviewContext.Provider value={previewContext}>
+      <article className="markdown-body" onCopy={event=>{if(event.currentTarget.closest('.live-document'))return;const source=selectedMarkdown(window.getSelection(),markdown);if(source!==null){event.clipboardData.setData("text/plain",source);event.preventDefault();}}} onDragStart={event=>{if(!event.currentTarget.closest('.live-document'))setSelectedMarkdownDrag(event.nativeEvent,markdown);}}>
+        <CachedMarkdown
+          sourceAnalysis={resolvedSourceAnalysis}
+          renderBlock={renderBlock}
+          windowingEnabled={!fullDocumentAccessibility}
+          remarkPlugins={REMARK_PLUGINS}
+          rehypePlugins={REHYPE_PLUGINS}
+          components={MARKDOWN_COMPONENTS}
+        >{markdown}</CachedMarkdown>
+      </article>
+    </MarkdownPreviewContext.Provider>
   );
 }
 
-export default memo(MarkdownPreview);
+const MemoizedMarkdownPreview = memo(MarkdownPreview);
+export default MemoizedMarkdownPreview;
