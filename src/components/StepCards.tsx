@@ -56,6 +56,10 @@ export default function StepCards({source,renderImage,renderChart,renderMarkdown
   const [fitWidth,setFitWidth]=useState<number|null>(null);
   const [expanded,setExpanded]=useState(false);
   const [placeholderHeight,setPlaceholderHeight]=useState(0);
+  const openTimer=useRef(0);
+  const skipRestoreFocus=useRef(false);
+  const liveBlockRef=useRef<HTMLElement|null>(null);
+  const expandedRef=useRef(expanded);expandedRef.current=expanded;
   const navigation=useRef<(next:number)=>void>(()=>{});
   const [zoom,setZoom]=useState(100),[pan,setPan]=useState<Point>({x:0,y:0});
   const zoomRef=useRef(100),panRef=useRef<Point>({x:0,y:0});
@@ -110,12 +114,16 @@ export default function StepCards({source,renderImage,renderChart,renderMarkdown
     setIndex(target);
   };
   navigation.current=go;
-  const enlarge=()=>{if(!expanded){setPlaceholderHeight(region.current?.getBoundingClientRect().height??0);setExpanded(true);}};
+  const enlarge=()=>{if(!expandedRef.current){liveBlockRef.current=region.current?.closest<HTMLElement>('.live-block')??null;setPlaceholderHeight(region.current?.getBoundingClientRect().height??0);setExpanded(true);}};
   useEffect(()=>{
     const node=region.current;
-    const open=()=>enlarge();
+    const cancelOpen=()=>{if(openTimer.current){window.clearTimeout(openTimer.current);openTimer.current=0;}};
+    const open=()=>{cancelOpen();enlarge();};
+    const onLiveOpen=()=>{cancelOpen();if(expandedRef.current&&liveBlockRef.current){skipRestoreFocus.current=true;setExpanded(false);}};
     node?.addEventListener('supermd-step-expand',open);
-    return()=>node?.removeEventListener('supermd-step-expand',open);
+    node?.addEventListener('dblclick',cancelOpen);
+    window.addEventListener('supermd-live-edit-opened',onLiveOpen);
+    return()=>{cancelOpen();node?.removeEventListener('supermd-step-expand',open);node?.removeEventListener('dblclick',cancelOpen);window.removeEventListener('supermd-live-edit-opened',onLiveOpen);};
   },[expanded]);
   useEffect(()=>{
     if(!expanded)return;
@@ -146,7 +154,7 @@ export default function StepCards({source,renderImage,renderChart,renderMarkdown
     document.addEventListener('keydown',key,true);
     window.addEventListener('supermd-image-zoom',native);window.addEventListener('supermd-image-reset',reset);
     surface?.addEventListener('wheel',wheel,{passive:false});surface?.addEventListener('supermd-canvas-pan',nativePan);
-    return()=>{document.removeEventListener('keydown',key,true);window.removeEventListener('supermd-image-zoom',native);window.removeEventListener('supermd-image-reset',reset);surface?.removeEventListener('wheel',wheel);surface?.removeEventListener('supermd-canvas-pan',nativePan);setReaderOverlay('step-viewer',false);requestAnimationFrame(()=>region.current?.focus({preventScroll:true}));};
+    return()=>{document.removeEventListener('keydown',key,true);window.removeEventListener('supermd-image-zoom',native);window.removeEventListener('supermd-image-reset',reset);surface?.removeEventListener('wheel',wheel);surface?.removeEventListener('supermd-canvas-pan',nativePan);setReaderOverlay('step-viewer',false);if(skipRestoreFocus.current)skipRestoreFocus.current=false;else requestAnimationFrame(()=>region.current?.focus({preventScroll:true}));};
   },[expanded]);
   useEffect(()=>{
     const key=(event:globalThis.KeyboardEvent)=>{
@@ -166,7 +174,7 @@ export default function StepCards({source,renderImage,renderChart,renderMarkdown
   const step=deck.steps[current];
   const card=<section className={"step-cards"+(!step.markdown?" is-visual-only":"")+(!step.image&&!step.diagram&&!step.chart?" has-no-visual":"")+(expanded?" is-expanded":"")} style={{...(fitWidth?{'--step-image-fit-width':`${fitWidth}px`}:{}),...(figureHeight?{'--step-figure-height':`${figureHeight}px`}:{}),'--step-viewer-transform':`translate(${pan.x}px,${pan.y}px) scale(${zoom/100})`} as CSSProperties} role="region" tabIndex={0} aria-label={deck.title+": interactive steps"} ref={region} onPointerEnter={()=>{hovered.current=true;}} onPointerLeave={()=>{hovered.current=false;}} onKeyDown={onKeyDown} data-step-count={count}>
     <div className="step-cards-layout">
-    <div className={'step-cards-stage'+(expanded?' image-viewer-canvas':'')} ref={figureRef} onClick={event=>{if(!expanded&&event.target instanceof Element&&event.target.closest('.step-cards-inline-figure svg'))enlarge();}}
+    <div className={'step-cards-stage'+(expanded?' image-viewer-canvas':'')} ref={figureRef} onClick={event=>{if(!expanded&&event.target instanceof Element&&event.target.closest('.step-cards-inline-figure svg')){const live=region.current?.closest('.live-block');if(!live){enlarge();return;}if(openTimer.current){window.clearTimeout(openTimer.current);openTimer.current=0;}if(event.detail>1)return;openTimer.current=window.setTimeout(()=>{openTimer.current=0;if(region.current?.isConnected&&!live.querySelector('textarea'))enlarge();},180);}}}
       onPointerDown={event=>{
         if(!expanded||step.chart||event.button!==0)return;
         event.currentTarget.setPointerCapture(event.pointerId);pointers.current.set(event.pointerId,{x:event.clientX,y:event.clientY});
@@ -205,5 +213,7 @@ export default function StepCards({source,renderImage,renderChart,renderMarkdown
       <span className="step-cards-progress" aria-label={"Step "+(current+1)+" of "+count}>{current+1} / {count}</span>
     </footer>
   </section>;
-  return expanded?<><div className="step-cards-placeholder" style={{height:placeholderHeight}}/>{createPortal(<div className="image-viewer step-viewer markdown-body" data-independent-zoom role="dialog" aria-modal="true" aria-label="Slide viewer"><div className="step-viewer-toolbar"><output aria-label="Slide image zoom">{Math.round(zoom)}%</output><button aria-label="Fit slide image" onClick={fit}>Fit</button><button className="step-viewer-close" aria-label="Close slide viewer" onClick={()=>setExpanded(false)}>Close</button></div>{card}</div>,document.body)}</>:card;
+  const liveBlock=expanded?liveBlockRef.current:(region.current?.closest<HTMLElement>('.live-block')??null);
+  const editSource=()=>{skipRestoreFocus.current=true;setExpanded(false);if(liveBlock?.isConnected)liveBlock.dispatchEvent(new CustomEvent('supermd-edit-block',{bubbles:true}));};
+  return expanded?<><div className="step-cards-placeholder" style={{height:placeholderHeight}}/>{createPortal(<div className="image-viewer step-viewer markdown-body" data-independent-zoom role="dialog" aria-modal="true" aria-label="Slide viewer"><div className="step-viewer-toolbar"><output aria-label="Slide image zoom">{Math.round(zoom)}%</output><button aria-label="Fit slide image" onClick={fit}>Fit</button>{liveBlock?.isConnected&&<button type="button" onClick={editSource}>Edit source</button>}<button className="step-viewer-close" aria-label="Close slide viewer" onClick={()=>setExpanded(false)}>Close</button></div>{card}</div>,document.body)}</>:card;
 }

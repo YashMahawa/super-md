@@ -27,6 +27,7 @@ if [[ -n "${GITHUB_STEP_SUMMARY:-}" ]]; then
   printf '\n### Android release build phase timings\n\n| Phase | Seconds |\n| --- | ---: |\n' >> "$GITHUB_STEP_SUMMARY"
 fi
 run_phase "vite-build" nice -n 10 taskset -c "$build_cpus" npm run build:native
+run_phase "verify-reader-assets" node scripts/report-web-assets.mjs dist --verify-native --public-root public
 run_phase "jni-rust-build" nice -n 10 taskset -c "$build_cpus" cargo rustc --locked --release --target aarch64-linux-android --manifest-path smd-core/Cargo.toml --lib -- -C link-arg=-Wl,-z,max-page-size=16384
 stage_android_assets() {
 mkdir -p android/app/src/main/jniLibs/arm64-v8a android/app/src/main/assets/web
