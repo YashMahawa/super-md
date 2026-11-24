@@ -200,4 +200,47 @@ describe("MarkdownPreview streamed local assets", () => {
     expect(cell?.querySelector("img")?.getAttribute("src")).toBe(image);
     expect(cell?.getAttribute("data-output-pinned")).toBe("true");
   });
+
+  it("yields editable note-image context menu actions when document text is selected", async () => {
+    const url = `https://appassets.androidplatform.net/reader-assets/${"1".repeat(32)}?v=${"a".repeat(64)}`;
+    invoke.mockResolvedValue({ url, mime: "image/png" });
+    const host = document.createElement("div");
+    host.className = "workspace";
+    document.body.append(host);
+    root = createRoot(host);
+    await act(async () => {
+      root?.render(<MarkdownPreview markdown={"Paragraph text to select\n\n![Photo](images/a.png)"} documentPath="/notes/a.md" python="" dark onChange={vi.fn()} />);
+    });
+    const para = host.querySelector("p")!;
+    const img = host.querySelector<HTMLImageElement>(".note-image img")!;
+    const originalFromPoint = document.elementFromPoint;
+    document.elementFromPoint = vi.fn(() => img);
+    try {
+      const range = document.createRange();
+      range.selectNodeContents(para);
+      const selection = window.getSelection()!;
+      selection.removeAllRanges();
+      selection.addRange(range);
+
+      let event!: MouseEvent;
+      await act(async () => {
+        event = new MouseEvent("contextmenu", { bubbles: true, cancelable: true, clientX: 20, clientY: 30 });
+        img.dispatchEvent(event);
+      });
+      expect(event.defaultPrevented).toBe(false);
+      expect(document.querySelector(".media-save-menu")).toBeNull();
+
+      selection.removeAllRanges();
+      await act(async () => {
+        event = new MouseEvent("contextmenu", { bubbles: true, cancelable: true, clientX: 20, clientY: 30 });
+        img.dispatchEvent(event);
+      });
+      expect(event.defaultPrevented).toBe(true);
+      const menuItems = Array.from(document.querySelectorAll(".media-save-menu [role='menuitem']")).map(el => el.textContent);
+      expect(menuItems).toEqual(["Copy image", "Save as PNG", "Save original image", "Replace image", "Remove image"]);
+      document.dispatchEvent(new KeyboardEvent("keydown", { key: "Escape", bubbles: true, cancelable: true }));
+    } finally {
+      document.elementFromPoint = originalFromPoint;
+    }
+  });
 });
