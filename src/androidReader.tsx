@@ -2,7 +2,7 @@ import { createRoot } from "react-dom/client";
 import {flushSync} from 'react-dom';
 import {createGapSelection,type GapSelection} from './gapSelection';
 import {FrameScrollQueue,zoomFrameStep} from './frameMotion';
-import {agentCharLength,agentOutlinePage,agentRead,agentRevision,agentSearch,agentSectionForExport,applyAgentPatchesDetailed} from './agentOperations';
+import {agentCharLength,agentCodePointOffset,agentOutlinePage,agentRead,agentRevision,agentSearch,agentSectionForExport,applyAgentPatchesDetailed} from './agentOperations';
 import {suggestMathRepairs,applyMathRepairs} from './mathRepair';
 import {agentDiagrams,diagramMetadata,diagramMedia,visibleSourceRange} from './agentView';
 import {mediaBytes} from './mediaExport';
@@ -655,8 +655,9 @@ function Reader() {
           const visibleText=visible.map(element=>{const copy=element.cloneNode(true) as HTMLElement;copy.querySelectorAll('.katex-mathml,button,script,style').forEach(node=>node.remove());return copy.textContent?.trim()??'';}).join('\n').slice(0,2000);
           const range=host?visibleSourceRange(host,note.content):null,offset=range?.start??(host?(note.mode==='editor'?(editorReadingOffset(note.id)??0):readingOffset(host)):0);
           const requestedContextLimit=typeof request.limit==='number'&&Number.isFinite(request.limit)?Math.max(1,Math.min(12000,Math.floor(request.limit))):6000;
-          const sourceOffset=agentCharLength(note.content.slice(0,offset)),sourceLimit=Math.max(1,Math.min(requestedContextLimit,agentCharLength(note.content.slice(offset,range?.end??offset+requestedContextLimit))));
-          const diagrams=agentDiagrams(note.content).filter(item=>range?item.end>range.start&&item.start<range.end:item.start>=offset&&item.start<offset+requestedContextLimit);
+          const visibleRange=range??{start:offset,end:Math.min(note.content.length,offset+requestedContextLimit)};
+          const sourceOffset=agentCodePointOffset(note.content,offset),sourceLimit=Math.max(1,Math.min(requestedContextLimit,agentCharLength(note.content.slice(offset,visibleRange.end))));
+          const diagrams=agentDiagrams(note.content,visibleRange).filter(item=>range?item.end>range.start&&item.start<range.end:item.start>=offset&&item.start<offset+requestedContextLimit);
           const visiblePage=agentRead(range?note.content.slice(0,range.end):note.content,sourceOffset,sourceLimit);
           // The viewport bounds the page text, not the document's pagination.
           const visibleSource={...visiblePage,total_chars:base.sourceLength,next_offset:visiblePage.end<base.sourceLength?visiblePage.end:null,truncated:visiblePage.end<base.sourceLength};

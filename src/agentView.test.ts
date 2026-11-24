@@ -31,3 +31,43 @@ it('indexes every slider frame by title and step without mounting or changing th
  const frame=await diagramMedia(diagrams[1]);expect(await frame.svg!()).toContain('>3</text>');
  expect(source).toContain('Reasoning only');
 });
+
+it('scopes diagram lookup to a UTF-16 viewport range while preserving document-wide image definitions and code-point IDs',()=>{
+  const source=[
+    '[early-art]: assets/early.svg',
+    '',
+    '```mermaid',
+    'graph LR; Early-->Skip',
+    '```',
+    '',
+    '😀\ud83d Section before viewport',
+    '',
+    '![Early ref][early-art]',
+    '',
+    '```svg',
+    '<svg xmlns="http://www.w3.org/2000/svg"><rect width="10" height="10"/></svg>',
+    '```',
+    '',
+    '![Late ref][late-art]',
+    '',
+    '```mermaid',
+    'graph TD; Late-->Skip',
+    '```',
+    '',
+    '[late-art]: data:image/png;base64,iVBORw0KGgo=',
+  ].join('\n');
+  const full=agentDiagrams(source);
+  expect(full).toHaveLength(5);
+  const rangeStart=source.indexOf('![Early ref]');
+  const rangeEnd=source.indexOf('```mermaid\ngraph TD; Late');
+  const scoped=agentDiagrams(source,{start:rangeStart,end:rangeEnd});
+  expect(scoped.map(item=>item.id)).toEqual(full.slice(1,4).map(item=>item.id));
+  const scopedMeta=scoped.map(item=>diagramMetadata(source,item));
+  const fullMeta=full.slice(1,4).map(item=>diagramMetadata(source,item));
+  expect(scopedMeta).toEqual(fullMeta);
+  expect(scopedMeta[0].assetReference).toBe('assets/early.svg');
+  expect(scopedMeta[2].assetReference).toBe('(embedded image)');
+  expect(scopedMeta[1].sourceStart).toBe(Array.from(source.slice(0,scoped[1].start)).length);
+  expect(scopedMeta[1].sourceEnd).toBe(Array.from(source.slice(0,scoped[1].end)).length);
+  expect(agentDiagrams(source,{start:rangeStart,end:rangeStart})).toEqual([]);
+});
