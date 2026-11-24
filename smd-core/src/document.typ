@@ -22,11 +22,33 @@
   let factor = if natural.width > 0pt { calc.min(1, size.width / natural.width) } else { 1 }
   scale(x: factor * 100%, y: factor * 100%, reflow: true, body)
 })
-#let smd-image(path) = layout(size => {
+#let smd-code(body) = block(width: 100%, breakable: true, fill: smd-code-fill, inset: 8pt, {
+  set par(spacing: 0pt, leading: .3em)
+  show linebreak: none
+  show raw.line: line => block(height: 1.2em, above: 0pt, below: 0pt, smd-fit(if line.text == "" { " " } else { line }))
+  body
+})
+#let smd-vector(render) = layout(size => {
+  let bounds = measure(render(auto))
+  let width = if bounds.height > 0pt { calc.min(size.width, 170mm * (bounds.width / bounds.height)) } else { size.width }
+  render(width)
+})
+#let smd-image(path, width: none, zoom: none) = layout(size => {
   let pic = image(path)
   let bounds = measure(pic)
-  let width = calc.min(size.width, 170mm * (bounds.width / bounds.height))
-  image(path, width: width)
+  let base = if width == none {
+    if zoom == none {
+      if bounds.height > 0pt { 170mm * (bounds.width / bounds.height) } else { size.width }
+    } else {
+      bounds.width
+    }
+  } else if type(width) == ratio {
+    size.width * width
+  } else {
+    width
+  }
+  let target = if zoom == none { base } else { base * zoom }
+  image(path, width: calc.min(size.width, target))
 })
 // Compact export-only sequence cells: no card chrome or fixed empty stage.
 #let smd-step-image(path) = layout(size => {

@@ -31,6 +31,10 @@ MAX_EXPORT_REQUEST = 120_000_000
 _INLINE_IMAGE = re.compile(r"!\[(?:\\.|[^\]\n])*\]\(\s*(?:<([^>\n]+)>|([^\s)]+))")
 _IMAGE_LABEL = re.compile(r"!\[(?:\\.|[^\]\n])*\](?:\s*\[([^\]\n]*)\])?")
 _REFERENCE = re.compile(r"(?m)^ {0,3}\[([^\]\n]+)\]:\s*(?:<([^>\n]+)>|(\S+))")
+_OBSIDIAN_IMAGE = re.compile(r"!\[\[([^\[\r\n\]|]+)(?:\|[^\r\n\]]+)?\]\]")
+_HTML_COMMENT = re.compile(r"<!--[\s\S]*?-->")
+_HTML_IMG_SRC = re.compile(r"<img\b[^>]*?\bsrc\s*=\s*(?:\"([^\"]+)\"|'([^']+)'|([^\s>\"']+))", re.IGNORECASE)
+_INLINE_CODE = re.compile(r"(`+)(?!`)(.*?)(?<!`)\1(?!`)")
 _FENCE = re.compile(r"^\s{0,3}(`{3,}|~{3,})")
 
 
@@ -88,10 +92,10 @@ def _clean_markdown_images(markdown: str) -> str:
                 fence_char = None
             kept.append("\n" if line.endswith("\n") else "")
         elif fence_char is None:
-            kept.append(line)
+            kept.append(_INLINE_CODE.sub(" ", line))
         else:
             kept.append("\n" if line.endswith("\n") else "")
-    return "".join(kept)
+    return _HTML_COMMENT.sub("", "".join(kept))
 
 
 def _image_destinations(markdown: str) -> list[str]:
@@ -101,6 +105,8 @@ def _image_destinations(markdown: str) -> list[str]:
         label = " ".join(match.group(1).casefold().split())
         references[label] = match.group(2) or match.group(3)
     sources = [match.group(1) or match.group(2) for match in _INLINE_IMAGE.finditer(visible)]
+    sources.extend(match.group(1) for match in _OBSIDIAN_IMAGE.finditer(visible))
+    sources.extend(match.group(1) or match.group(2) or match.group(3) for match in _HTML_IMG_SRC.finditer(visible))
     for match in _IMAGE_LABEL.finditer(visible):
         label = match.group(1) or re.search(r"!\[([^\]]*)\]", match.group(0)).group(1)
         normalized = " ".join(label.casefold().split())
@@ -124,7 +130,13 @@ def _image_destinations(markdown: str) -> list[str]:
                     deck = json.loads("\n".join(body))
                     steps = deck.get("steps", []) if isinstance(deck, dict) else []
                     if isinstance(steps, list):
-                        sources.extend(step["image"] for step in steps if isinstance(step, dict) and isinstance(step.get("image"), str))
+                        for step in steps:
+                            if not isinstance(step, dict):
+                                continue
+                            if isinstance(step.get("image"), str):
+                                sources.append(step["image"])
+                            if isinstance(step.get("markdown"), str):
+                                sources.extend(_image_destinations(step["markdown"]))
                 except (ValueError, TypeError):
                     pass  # The native renderer reports invalid step JSON.
             marker = None

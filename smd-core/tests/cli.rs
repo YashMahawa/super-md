@@ -103,3 +103,57 @@ fn inline_data_images_export_and_pack_but_remote_images_never_download_implicitl
     let output=w.run(&["export","remote.md","remote.pdf"]);
     assert!(!output.status.success());assert!(String::from_utf8_lossy(&output.stderr).contains("explicit download"));assert!(!w.file("remote.pdf").exists());
 }
+
+#[test]
+fn cli_export_renders_vector_diagrams_sized_images_multiline_code_and_page_breaks() {
+    let w = Workspace::new();
+    let badge = b"<svg xmlns=\"http://www.w3.org/2000/svg\" width=\"120\" height=\"40\"><rect width=\"120\" height=\"40\" fill=\"#386a57\"/></svg>";
+    fs::write(w.file("badge.svg"), badge).unwrap();
+    let note = [
+        "# CLI Complete Export",
+        "",
+        "![[badge.svg|180]]",
+        "",
+        "<img src=\"badge.svg\" width=\"120px\" />",
+        "",
+        "```smd-tree",
+        r#"{"values":["8","4","12"]}"#,
+        "```",
+        "",
+        "```smd-diagram",
+        r#"{"width":240,"height":100,"nodes":[{"id":"a","label":"A","x":60,"y":50},{"id":"b","label":"B","x":180,"y":50}],"edges":[{"from":"a","to":"b"}]}"#,
+        "```",
+        "",
+        "```svg",
+        "<svg viewBox=\"0 0 80 30\"><rect width=\"80\" height=\"30\" fill=\"#2463b3\"/></svg>",
+        "```",
+        "",
+        "\\newpage",
+        "",
+        "SECOND_CLI_PAGE",
+        "",
+        "```python",
+        "def doc():",
+        "    \"\"\"line one",
+        "    line two\"\"\"",
+        "    return 1",
+        "```",
+    ].join("\n");
+    fs::write(w.file("rich.md"), note).unwrap();
+    success(w.run(&["export", "rich.md", "rich.pdf"]));
+    pdf(&w.file("rich.pdf"));
+    if let Ok(out) = Command::new("pdftotext").arg(w.file("rich.pdf")).arg("-").output() {
+        assert!(out.status.success());
+        let text = String::from_utf8_lossy(&out.stdout);
+        let pages: Vec<&str> = text.split('\u{000c}').filter(|p| !p.trim().is_empty()).collect();
+        assert!(pages.len() >= 2);
+        let last = pages.last().unwrap();
+        assert!(last.contains("SECOND_CLI_PAGE"));
+        assert!(last.contains("line two"));
+        assert!(!pages[0].contains("SECOND_CLI_PAGE"));
+    }
+
+    fs::write(w.file("unsafe.md"), "```svg\n<svg xmlns=\"http://www.w3.org/2000/svg\"><script>alert(1)</script></svg>\n```").unwrap();
+    assert!(!w.run(&["export", "unsafe.md", "unsafe.pdf"]).status.success());
+    assert!(!w.file("unsafe.pdf").exists());
+}

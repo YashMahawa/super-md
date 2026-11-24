@@ -45,6 +45,21 @@ const MarkdownParagraph:Components['p']=({node,children,...props})=>{
 function remarkTaskPositions() {
   return (tree:unknown)=>{let index=0;visit(tree as never,'listItem',(node:any)=>{if(typeof node.checked==='boolean')node.data={...node.data,hProperties:{...node.data?.hProperties,'data-task-index':index++}};});};
 }
+function remarkImageAttributes() {
+  return (tree:unknown)=>visit(tree as never,(parent:any)=>{
+    if(!Array.isArray(parent.children))return;
+    for(let i=0;i<parent.children.length-1;i++){
+      const current=parent.children[i],next=parent.children[i+1];
+      if((current?.type==='image'||current?.type==='imageReference')&&next?.type==='text'&&typeof next.value==='string'){
+        const stripped=next.value.replace(/^\{[^}\r\n]*\b(?:width|zoom)\s*=\s*[^}\r\n]+\}/i,'');
+        if(stripped!==next.value){
+          if(stripped)parent.children[i+1]={...next,value:stripped};
+          else parent.children.splice(i+1,1);
+        }
+      }
+    }
+  });
+}
 function remarkSourcePositions(){return (tree:unknown)=>visit(tree as never,(node:any)=>{
   if(!node.position||!node.children)return;
   node.data={...node.data,hProperties:{...node.data?.hProperties,"data-source-start":node.position.start.offset,"data-source-end":node.position.end.offset}};
@@ -205,7 +220,7 @@ function MarkdownPreview({ markdown, documentPath, python, dark, trustedImageHos
         sourceAnalysis={{source:markdown,analysis}}
         renderBlock={renderBlock}
         windowingEnabled={!fullDocumentAccessibility}
-        remarkPlugins={[remarkGfm, remarkMath, remarkObsidianMath, remarkSvgBlocks, remarkCallouts, remarkHeadingIds, remarkTaskPositions,remarkSourcePositions]}
+        remarkPlugins={[remarkGfm, remarkMath, remarkObsidianMath, remarkSvgBlocks, remarkImageAttributes, remarkCallouts, remarkHeadingIds, remarkTaskPositions,remarkSourcePositions]}
         rehypePlugins={[rehypeKatex, rehypeHighlight]}
         components={{
           p: MarkdownParagraph,

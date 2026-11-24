@@ -15,7 +15,81 @@ import { svgImage } from "./svgImage";
 import { remarkObsidianMath } from "./obsidianMath";
 import { remarkSvgBlocks } from "./svgBlocks";
 import {parseStepDeck} from "./components/StepCards";
+import {parseDiagramSource} from "./components/InlineDiagram";
+import {parseBinaryTreeSource} from "./components/BinaryTree";
 import {stepDiagramSvg} from "./stepPdf";
+
+function htmlAttr(tag: string, name: string): string | undefined {
+  const match = new RegExp(`(?:^|\\s)${name}\\s*=\\s*(?:"([^"]*)"|'([^']*)'|([^\\s>"']+))`, "i").exec(tag);
+  return match ? (match[1] ?? match[2] ?? match[3] ?? "").trim() : undefined;
+}
+
+function parseHtmlImgTag(tag: string): { url: string; alt: string; title?: string; attrs: string } | null {
+  const src = htmlAttr(tag, "src");
+  if (!src) return null;
+  const alt = htmlAttr(tag, "alt") || "Image";
+  const title = htmlAttr(tag, "title") || undefined;
+  const style = htmlAttr(tag, "style") || "";
+  const styleWidth = /(?:^|;)\s*width\s*:\s*([^;]+)/i.exec(style)?.[1]?.trim();
+  const attrWidth = htmlAttr(tag, "width");
+  const width = (styleWidth || attrWidth || "").replace(/^['"]|['"]$/g, "").trim();
+  const zoom = (/(?:^|;)\s*zoom\s*:\s*([^;]+)/i.exec(style)?.[1] || "").replace(/^['"]|['"]$/g, "").trim();
+  const parts: string[] = [];
+  if (width && /^\d+(?:\.\d+)?(?:%|px|pt|mm|cm|in)?$/i.test(width)) parts.push(`width=${width}`);
+  if (zoom && /^\d+(?:\.\d+)?%?$/i.test(zoom)) parts.push(`zoom=${zoom}`);
+  return { url: src, alt, ...(title ? { title } : {}), attrs: parts.length ? `{${parts.join(" ")}}` : "" };
+}
+
+function liftHtmlImages(tree: any): void {
+  visit(tree, (parent: any) => {
+    if (!Array.isArray(parent.children)) return;
+    const blockParent = parent.type === "root" || parent.type === "blockquote" || parent.type === "listItem";
+    const nextChildren: any[] = [];
+    let changed = false;
+    for (const child of parent.children) {
+      if (child?.type !== "html" || typeof child.value !== "string") {
+        nextChildren.push(child);
+        continue;
+      }
+      const withoutComments = child.value.replace(/<!--[\s\S]*?-->/g, "");
+      if (!/<img\b/i.test(withoutComments)) {
+        nextChildren.push(child);
+        continue;
+      }
+      if (blockParent) {
+        const stripped = withoutComments
+          .replace(/<\/?(?:p|div|center|figure)\b[^>]*>/gi, "")
+          .replace(/<img\b[^>]*>/gi, "")
+          .trim();
+        const tags = [...withoutComments.matchAll(/<img\b[^>]*>/gi)].map(m => parseHtmlImgTag(m[0])).filter((v): v is NonNullable<typeof v> => v !== null);
+        if (tags.length && !stripped && !/(?:page-break|break-(?:after|before))\s*:/i.test(withoutComments)) {
+          changed = true;
+          for (const img of tags) {
+            nextChildren.push({
+              type: "paragraph",
+              children: [
+                { type: "image", url: img.url, alt: img.alt, ...(img.title ? { title: img.title } : {}) },
+                ...(img.attrs ? [{ type: "text", value: img.attrs }] : []),
+              ],
+            });
+          }
+          continue;
+        }
+      } else {
+        const tagMatch = /^\s*(<img\b[^>]*>)\s*$/i.exec(withoutComments);
+        const parsed = tagMatch ? parseHtmlImgTag(tagMatch[1]) : null;
+        if (parsed) {
+          changed = true;
+          nextChildren.push({ type: "image", url: parsed.url, alt: parsed.alt, ...(parsed.title ? { title: parsed.title } : {}) });
+          if (parsed.attrs) nextChildren.push({ type: "text", value: parsed.attrs });
+          continue;
+        }
+      }
+      nextChildren.push(child);
+    }
+    if (changed) parent.children = nextChildren;
+  });
+}
 
 function data(blob: Blob): Promise<string> {
   return new Promise((resolve, reject) => { const reader = new FileReader(); reader.onload = () => resolve(String(reader.result)); reader.onerror = () => reject(reader.error); reader.readAsDataURL(blob); });
@@ -67,6 +141,7 @@ export async function preparePdf(markdown: string, documentPath: string | null, 
   const normalized = normalizeCallouts(markdown);
   // parse() runs no transformers: lift raw <svg> markup into svg blocks here.
   const tree = remarkSvgBlocks()(processor.parse(normalized), { value: normalized });
+  liftHtmlImages(tree);
   const work: Array<()=>Promise<void>> = []; const assets: Record<string, string> = {}; let count = 0;
   const referenceDefinitions=new Map<string,any>();
   visit(tree,"definition",(node:any)=>{if(!referenceDefinitions.has(node.identifier))referenceDefinitions.set(node.identifier,node);});
@@ -118,7 +193,7 @@ export async function preparePdf(markdown: string, documentPath: string | null, 
       if(definition){node.type="image";node.url=definition.url;node.title=definition.title;delete node.identifier;delete node.label;delete node.referenceType;}
     }
     if(node.type==='code'&&['python','py'].includes(String(node.lang||'').toLowerCase()))node.lang=String(node.lang).toLowerCase();
-    const exportCell = node.type === "code" && ["mermaid", "svg", "smd-chart", "python", "py"].includes(node.lang);
+    const exportCell = node.type === "code" && ["mermaid", "svg", "smd-chart", "smd-tree", "smd-diagram", "python", "py"].includes(node.lang);
     let pythonContext: {document:string;cell:string;interpreter:string}|undefined;
     if(node.type==='code'&&['python','py'].includes(String(node.lang||'').toLowerCase())){
       const source=String(node.value||''),ordinal=pythonOrdinals.get(source)||0;pythonOrdinals.set(source,ordinal+1);
@@ -149,8 +224,14 @@ export async function preparePdf(markdown: string, documentPath: string | null, 
         // source. Never turn it into executable Python or block the whole PDF.
         try {if(JSON.parse(node.value)?.mode==="surface3d"){node.lang="json";return;}} catch { /* Normal chart validation below reports malformed input. */ }
       }
-      if (["mermaid", "smd-chart", "svg"].includes(node.lang)) {
-        const svg = node.lang === "svg" ? svgImage(node.value) : node.lang === "mermaid" ? await renderMermaid(node.value, false, signal) : (() => {
+      if (["mermaid", "smd-chart", "svg", "smd-tree", "smd-diagram"].includes(node.lang)) {
+        let diagramAlt = "Diagram";
+        const svg = node.lang === "svg" ? svgImage(node.value) : node.lang === "mermaid" ? await renderMermaid(node.value, false, signal) : (node.lang === "smd-tree" || node.lang === "smd-diagram") ? (() => {
+          const diagram = node.lang === "smd-tree" ? parseBinaryTreeSource(node.value) : parseDiagramSource(node.value);
+          if (!diagram) throw new Error("Invalid diagram; fix it before exporting.");
+          diagramAlt = diagram.title || "Diagram";
+          return svgImage(stepDiagramSvg(diagram));
+        })() : (() => {
           const html = renderToStaticMarkup(<InteractiveChart source={node.value} />);
           const parsed = new DOMParser().parseFromString(html, "text/html");
           const warning = parsed.querySelector(".chart-warning, .render-error");
@@ -196,7 +277,7 @@ export async function preparePdf(markdown: string, documentPath: string | null, 
         // makes remark-stringify treat the entire root as phrasing and join
         // headings, tables and callouts without their blank-line separators.
         node.type = "paragraph";
-        node.children = [{ type: "image", url: add(url, `diagram-${++count}.svg`), alt: "Diagram" }];
+        node.children = [{ type: "image", url: add(url, `diagram-${++count}.svg`), alt: diagramAlt }];
         delete node.value; delete node.lang; delete node.meta;
       } else {
         const output = await pythonOutput(node.value,pythonContext);

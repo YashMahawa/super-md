@@ -320,7 +320,11 @@ export function normalizeMarkdownSource(markdown:string):Stage {
   add(regexStage(value,FRONTMATTER,()=>''));
   let ranges=unmaskedRangesFromMask(computeCodeMask(value));
   const addUnmasked=(regex:RegExp,replacement:(...args:any[])=>string)=>{const next=unmaskedRegexStage(value,ranges,regex,replacement);ranges=next.ranges;add(next.stage);};
-  addUnmasked(/!\[\[([^\[\r\n\]|]+)(?:\|([^\r\n\]]+))?\]\]/g,(_all,path,label)=>`![${label??path}](${encodeURI(path)})`);
+  addUnmasked(/!\[\[([^\[\r\n\]|]+)(?:\|([^\r\n\]]+))?\]\]/g,(_all,path:string,spec?:string)=>{
+    const sized=spec&&/^(?:(.*)\|)?\s*(0*[1-9]\d*(?:\.\d+)?)\s*(?:x\s*\d+(?:\.\d+)?\s*)?$/i.exec(spec);
+    const alt=sized?(sized[1]?.trim()||path):(spec??path);
+    return `![${alt}](${encodeURI(path)})${sized?`{width=${sized[2]}}`:''}`;
+  });
   addUnmasked(/\[\[(#[^\[\r\n\]]+?)\]\]/g,(_all,target:string)=>{const [id,label]=target.split('|');return `[${label||id.slice(1)}](#${headingSlug(id.slice(1))})`;});
   addUnmasked(/\[\[([^\[\r\n\]|]+)(?:\|([^\r\n\]]+))?\]\]/g,(_all,target,label)=>`[${label??target}](${target.endsWith('.md')?target:`${target}.md`})`);
   add(normalizeCalloutBlocks(value,false));

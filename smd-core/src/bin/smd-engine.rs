@@ -103,8 +103,9 @@ fn run() -> Result<()> {
                 let bytes = if let Some(data) = note.as_ref().and_then(|n| n.assets.get(&source)) { portable::image_bytes(data)?.1 }
                 else if source.starts_with("data:") { portable::image_bytes(&source)?.1 }
                 else {
-                    if source.contains("://") { bail!("Remote image requires explicit download in the app: {source}"); }
-                    let file = root.join(percent_encoding::percent_decode_str(&source).decode_utf8()?.as_ref()).canonicalize()?;
+                    if source.contains("://") || source.starts_with("//") { bail!("Remote image requires explicit download in the app: {source}"); }
+                    let local_part = source.split('#').next().unwrap_or(&source).split('?').next().unwrap_or(&source);
+                    let file = root.join(percent_encoding::percent_decode_str(local_part).decode_utf8()?.as_ref()).canonicalize()?;
                     if !file.starts_with(&root) { bail!("Image is outside the note folder"); }
                     if std::fs::metadata(&file)?.len() > portable::MAX_IMAGE as u64 { bail!("Image exceeds 25 MB"); }
                     std::fs::read(file)?
