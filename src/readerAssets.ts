@@ -47,12 +47,25 @@ export function approvedReaderRasterUrl(value: NativeReaderAsset): string | null
   return url.href;
 }
 
+export function isSvgAssetPath(source: string): boolean {
+  if (!source) return false;
+  const rawPath = source.split(/[?#]/, 1)[0].trim();
+  if (!rawPath) return false;
+  let decoded = rawPath;
+  try {
+    decoded = decodeURIComponent(rawPath);
+  } catch {
+    // Keep rawPath when percent-encoding is malformed.
+  }
+  return decoded.trim().toLowerCase().endsWith(".svg");
+}
+
 /**
  * Resolve a local image to Android's streamed asset endpoint. `null` signals
  * the caller to use the legacy data-URL loader (for SVG and unsupported hosts).
  */
 export function resolveReaderRasterAsset(documentPath: string, source: string): Promise<string | null> {
-  if (!documentPath || !source) return Promise.resolve(null);
+  if (!documentPath || !source || isSvgAssetPath(source)) return Promise.resolve(null);
   const key = JSON.stringify([documentPath, source]);
   const existing = inFlight.get(key);
   if (existing) return existing;
