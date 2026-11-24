@@ -155,9 +155,6 @@ button:focus-visible { outline: 2px solid var(--primary); outline-offset: 2px; }
 button:active { transform: scale(.97); }
 button.active { color: var(--primary); background: color-mix(in srgb, var(--primary) 14%, var(--surface)); }
 button:disabled { opacity: .5; cursor: default; }
-.toolbar-button { display: inline-flex; align-items: center; justify-content: center; gap: 8px; min-height: 36px; padding: 8px 10px; color: var(--muted); font-size: .79rem; font-weight: 690; white-space: nowrap; }
-.toolbar-button:hover { color: var(--text); }
-.toolbar-button.icon-only { width: 36px; padding: 8px; }
 .segmented { display: flex; gap: 3px; padding: 4px; border-radius: 999px; background: var(--surface-high); }
 .segmented button { position: relative; isolation: isolate; display: inline-flex; align-items: center; justify-content: center; gap: 7px; min-height: 36px; border-radius: 999px; padding: 8px 12px; color: var(--muted); font-size: .75rem; font-weight: 700; text-transform: capitalize; transition: background-color .18s var(--standard), color .18s var(--standard), border-radius .25s var(--expressive), transform .25s var(--expressive); }
 .segmented button:active { border-radius: 12px; }
@@ -170,7 +167,7 @@ smd-slider { width: 100%; min-height: 56px; }
 smd-switch { flex-shrink: 0; }
 smd-select { display: block; width: 100%; min-width: 0; margin: 16px 0; }
 .form-grid smd-select { align-self: end; margin: 15px 0; }
-md-filled-button.primary-action, smd-expressive-button.primary-action { display: block; width: 100%; margin-top: 18px; padding: 8px 0; background: var(--surface-low); position: sticky; bottom: 0; }
+smd-expressive-button.primary-action { display: block; width: 100%; margin-top: 18px; padding: 8px 0; background: var(--surface-low); position: sticky; bottom: 0; }
 .export-formats { position: relative; width: 100%; border-radius: 999px; }
 .export-formats button { flex: 1; min-height: 44px; }
 .export-format-indicator { position: absolute; top: 3px; bottom: 3px; left: 3px; width: calc(50% - 3px); background: var(--primary); border-radius: 999px; pointer-events: none; }
@@ -214,7 +211,6 @@ md-filled-button.primary-action, smd-expressive-button.primary-action { display:
 .preview-tools, .zoom-controls { display: flex; align-items: center; gap: 8px; }
 .zoom-controls { gap: 1px; padding: 2px; border-radius: 999px; background: var(--surface-low); }
 .zoom-controls button { min-width: 26px; height: 25px; display: grid; place-items: center; padding: 3px; border-radius: 7px; color: var(--muted); font-size: .69rem; font-weight: 750; }
-.zoom-controls .zoom-value { min-width: 45px; color: var(--text); }
 .reading-scroll { min-height: 0; overflow: auto; overscroll-behavior: contain; scrollbar-width: thin; scrollbar-color: var(--outline) transparent; }
 .reading-scroll,.live-pane,.android-reading,.cm-scroller { overflow-anchor: none; }
 .markdown-body [data-heading-key] { scroll-margin-top: 24px; }
@@ -403,13 +399,6 @@ md-filled-button.primary-action, smd-expressive-button.primary-action { display:
 .chart-controls input[type="range"]::-moz-range-progress { height: 16px; border-radius: 8px; background: var(--primary); }
 .chart-controls input[type="range"]::-moz-range-thumb { width: 4px; height: 44px; border: 0; border-radius: 2px; background: var(--primary); box-shadow: 0 0 0 6px var(--surface-low); }
 .chart-controls input[type="range"]:focus-visible { outline: 2px solid var(--primary); outline-offset: 3px; border-radius: 12px; }
-.chart-view-actions { display:flex; flex-wrap:wrap; align-items:center; gap:8px; margin:8px 0 16px; }
-.chart-view-actions button { background:var(--surface-high); padding:10px 16px; }
-.chart-view-actions label { display:flex; align-items:center; gap:12px; font-size:13px; }
-.chart-view-actions label input { width:120px; accent-color:var(--primary); }
-.chart-view-actions output { min-width:44px; font-size:13px; font-variant-numeric:tabular-nums; }
-.chart-view-actions button[aria-pressed="true"] { background:var(--primary); color:var(--on-primary); }
-.chart-view-actions small { color:var(--muted); line-height:1.5; }
 .chart-warning { display: block; margin: 8px 4px; color: var(--error); font-size: .8em; }
 .mermaid { padding: 18px; overflow: auto; border-radius: 14px; background: var(--surface); }
 .mermaid svg { max-width: 100%; height: auto; display: block; margin: auto; }
@@ -509,13 +498,13 @@ button.primary-action { width: 100%; margin-top: 18px; padding: 13px; background
 @media (max-width: 1320px) {
   .topbar { gap: 10px; padding: 0 14px; }
   .brand { flex-basis: 190px; max-width: 270px; }
-  .topbar .toolbar-button span, .topbar .segmented button span { display: none; }
+  .topbar .segmented button span { display: none; }
   .topbar .file-actions smd-expressive-button > span { display: none; }
   .topbar .segmented button { width: 34px; padding: 7px; }
 }
 @media (max-width: 900px) {
   .brand { flex: 1 1 150px; }
-  .document-identity small, .save-state, .file-actions .icon-only { display: none; }
+  .document-identity small, .save-state { display: none; }
   .file-actions { padding-left: 0; }
   .file-actions smd-icon-button[aria-label="New window"], .file-actions smd-icon-button[aria-label="New document"], .file-actions smd-icon-button[aria-label="Open folder"] { display: none; }
   .export-action span { display: none; }
@@ -528,7 +517,6 @@ button.primary-action { width: 100%; margin-top: 18px; padding: 13px; background
   :root[data-platform="android"] .right-actions { grid-column: 1 / -1; grid-row: 2; width: 100%; justify-content: space-between; margin: 0; }
   :root[data-platform="android"] .segmented button { min-width: 80px; }
   :root[data-platform="android"] .segmented button span { display: inline; }
-  :root[data-platform="android"] .toolbar-button { min-width: 40px; min-height: 40px; }
   :root[data-platform="android"] .live-document { width: min(var(--reader-width), calc(100% - 88px)); }
 }
 @media (max-width: 760px) {
@@ -547,7 +535,6 @@ button.primary-action { width: 100%; margin-top: 18px; padding: 13px; background
   .right-actions button[aria-label="Focus mode"], .right-actions button[aria-label="Fullscreen"] { display: none; }
   .topbar .segmented button span { display: inline; }
   .topbar .segmented button { width: auto; min-width: 65px; }
-  .toolbar-button span { display: none; }
   .tab-strip { padding: 4px 10px; }
   .tab-reopen { padding-inline: 5px; }
   .live-document { width: calc(100% - 56px); padding-top: 25px; }
@@ -634,12 +621,8 @@ button.code-copy:active { border-radius:10px; }
 .image-viewer header strong { flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap; }
 .image-viewer header button { flex:none; }
 .image-viewer footer { font:14px/1.5 var(--md-ref-typeface-plain,system-ui);gap:12px; }
-.image-zoom-control { display:flex;align-items:center;gap:16px;flex:1 1 280px;max-width:560px;min-width:220px; }
-.image-zoom-control smd-slider { flex:1;min-width:100px; }
-.image-zoom-control output { min-width:48px;font-variant-numeric:tabular-nums; }
 .image-viewer footer button,.image-viewer header button { min-height:44px;padding:10px 18px;border-radius:24px;background:var(--surface-high);color:var(--text); }
 .chart-grid { stroke:var(--outline);stroke-width:.7;opacity:.55; }
-.chart-coordinate { color:var(--muted);font-variant-numeric:tabular-nums; }
 .graph-probe[hidden] { display:none; }
 
 /* Interactive graphs: Material 3 Expressive surfaces, GeoGebra-like probing. */
@@ -758,7 +741,6 @@ button.code-copy:active { border-radius:10px; }
 .step-cards.has-no-visual .step-cards-stage { display:none; }
 .step-cards.has-no-visual .step-cards-layout { display:block; }
 .step-cards.has-no-visual .step-cards-notes { max-height:68dvh; }
-.sr-only { position:absolute!important; width:1px!important; height:1px!important; padding:0!important; margin:-1px!important; overflow:hidden!important; clip:rect(0,0,0,0)!important; white-space:nowrap!important; border:0!important; }
 .android-reading .document-page .step-cards-description .markdown-body { width:100%; max-width:none; margin:0; padding:0; min-height:0; }
 .step-viewer.image-viewer { width:100%; height:100dvh; max-width:none; margin:0; padding:50px 12px 8px; display:flex; font-size:var(--reader-size,16px); }
 .step-viewer-toolbar { position:absolute; right:12px; left:12px; top:4px; z-index:5; display:flex; align-items:center; gap:10px; font-size:14px; }
