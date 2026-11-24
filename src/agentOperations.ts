@@ -72,7 +72,7 @@ export function agentOutline(source:string):AgentHeading[] {
     else if(!fence){const heading=/^ {0,3}(#{1,6})[\t ]+(.+?)\s*#*\s*$/.exec(part);if(heading)headings.push({index:headings.length,level:heading[1].length,title:heading[2].slice(0,300),line,start:position});}
     position+=agentCharLength(part);
   }
-  const sectionEnds=headings.map(()=>agentCharLength(source)),stack:number[]=[];
+  const sectionEnds=new Array<number>(headings.length).fill(position),stack:number[]=[];
   for(const heading of headings){
     while(stack.length&&headings[stack[stack.length-1]].level>=heading.level)sectionEnds[stack.pop()!]=heading.start;
     stack.push(heading.index);
@@ -122,7 +122,8 @@ export function agentSectionForExport(source:string,selector:unknown){
   return {...section,text:needed.length?`${section.text}${section.text&&!/[\r\n]$/.test(section.text)?'\n':''}\n${needed.join('\n')}\n`:section.text};
 }
 type SvgSpan={start:number;end:number;line_start:number;line_end:number};
-function svgSpans(source:string):SvgSpan[] {
+function svgSpans(source:string,includeInteractive=false):SvgSpan[] {
+  if(!source.includes('```')&&!source.includes('~~~'))return [];
   const spans:SvgSpan[]=[];let position=0,lineNumber=1;
   let open:{marker:string;length:number;start:number;lineStart:number;svg:boolean;probe:string}|null=null;
   for(const part of lines(source)){
@@ -130,7 +131,11 @@ function svgSpans(source:string):SvgSpan[] {
     const fence=/^ {0,3}(`{3,}|~{3,})/.exec(body);
     if(fence){
       const marker=fence[1][0],length=fence[1].length;
-      if(!open){const language=body.slice(fence[0].length).trim().split(/\s+/,1)[0]?.toLowerCase()??'';open={marker,length,start:position+agentCharLength(part),lineStart:lineNumber+1,svg:['svg','svg+xml','image/svg+xml'].includes(language),probe:''};}
+      if(!open){
+        const language=body.slice(fence[0].length).trim().split(/\s+/,1)[0]?.toLowerCase()??'';
+        const tagged=['svg','svg+xml','image/svg+xml'].includes(language)||(includeInteractive&&['mermaid','smd-chart'].includes(language));
+        open={marker,length,start:position+agentCharLength(part),lineStart:lineNumber+1,svg:tagged,probe:''};
+      }
       else if(marker===open.marker&&length>=open.length){if(open.svg||open.probe.trimStart().toLowerCase().startsWith('<svg'))spans.push({start:open.start,end:position,line_start:open.lineStart,line_end:Math.max(open.lineStart,lineNumber-1)});open=null;}
       position+=agentCharLength(part);lineNumber++;continue;
     }
@@ -140,10 +145,10 @@ function svgSpans(source:string):SvgSpan[] {
   if(open&&(open.svg||open.probe.trimStart().toLowerCase().startsWith('<svg')))spans.push({start:open.start,end:position,line_start:open.lineStart,line_end:Math.max(open.lineStart,lineNumber-1)});
   return spans;
 }
-function elideSvgPage(source:string,start:number,end:number,page:string) {
+function elideSvgPage(source:string,start:number,end:number,page:string,spans:SvgSpan[]) {
   const omissions:Array<{source_start:number;source_end:number;line_start:number;line_end:number;omitted_chars:number;omitted_lines:number}>=[];
   const pieces:string[]=[];let cursor=start;
-  for(const span of svgSpans(source)){
+  for(const span of spans){
     const left=Math.max(start,span.start),right=Math.min(end,span.end);if(left>=right)continue;
     pieces.push(source.slice(agentUtf16Offset(source,cursor),agentUtf16Offset(source,left)));
     const item={source_start:span.start,source_end:span.end,line_start:span.line_start,line_end:span.line_end,
@@ -154,9 +159,9 @@ function elideSvgPage(source:string,start:number,end:number,page:string) {
   pieces.push(source.slice(agentUtf16Offset(source,cursor),agentUtf16Offset(source,end)));
   return {text:pieces.join(''),svg_omissions:omissions};
 }
-function prosePageEnd(source:string,start:number,limit:number,maxEnd:number) {
+function prosePageEnd(spans:SvgSpan[],start:number,limit:number,maxEnd:number) {
   let cursor=start,remaining=limit;
-  for(const span of svgSpans(source)){
+  for(const span of spans){
     if(span.end<=cursor||span.start>=maxEnd)continue;
     if(span.start>cursor){const available=Math.min(span.start,maxEnd)-cursor,take=Math.min(available,remaining);cursor+=take;remaining-=take;if(!remaining)return cursor;}
     // SVG source is replaced by a small marker, so consume it without using
@@ -173,23 +178,15 @@ export function agentRead(source:string,offset:unknown=0,limit:unknown=12_000,he
   if(requestedOffset>sectionEnd)throw Error(`offset must be within the selected section (sectionEnd ${sectionEnd})`);
   const start=heading===undefined?requestedOffset:Math.max(sectionStart,requestedOffset);
   const end=sectionEnd;
-  const count=boundedInt(limit,12_000,1,12_000),finish=view==='prose'?prosePageEnd(source,start,count,end):Math.min(end,start+count);
+  const count=boundedInt(limit,12_000,1,12_000);
+  const spans=view==='prose'?svgSpans(source):[];
+  const finish=view==='prose'?prosePageEnd(spans,start,count,end):Math.min(end,start+count);
   const exact=source.slice(agentUtf16Offset(source,start),agentUtf16Offset(source,finish));
-  const viewResult=view==='prose'?elideSvgPage(source,start,finish,exact):{text:exact,svg_omissions:[] as Array<{source_start:number;source_end:number;line_start:number;line_end:number;omitted_chars:number;omitted_lines:number}>};
+  const viewResult=view==='prose'?elideSvgPage(source,start,finish,exact,spans):{text:exact,svg_omissions:[] as Array<{source_start:number;source_end:number;line_start:number;line_end:number;omitted_chars:number;omitted_lines:number}>};
   return {...viewResult,start,end:finish,total_chars:sectionEnd-sectionStart,next_offset:finish<sectionEnd?finish:null,truncated:finish<sectionEnd,view,returned_chars:agentCharLength(viewResult.text),sectionStart,sectionEnd,documentLength};
 }
 type SearchOptions={offset?:unknown;caseSensitive?:unknown;wholeWord?:unknown;regex?:unknown;excludeDiagrams?:unknown};
 type SearchMatch={offset:number;line:number;text:string;matchOffset:number;matchLength:number;snippetOffset:number};
-function searchDiagramSpans(source:string):Array<{start:number;end:number}>{
-  const spans=svgSpans(source).map(span=>({start:span.start,end:span.end}));let position=0,open:{marker:string;length:number;start:number;enabled:boolean}|null=null;
-  for(const part of lines(source)){
-    const body=part.replace(/[\r\n\v\f\x85\u2028\u2029]+$/u,'');const fence=/^ {0,3}(`{3,}|~{3,})/.exec(body);
-    if(fence){const marker=fence[1][0],length=fence[1].length;if(!open){const language=body.slice(fence[0].length).trim().split(/\s+/,1)[0]?.toLowerCase()??'';open={marker,length,start:position+agentCharLength(part),enabled:['svg','svg+xml','image/svg+xml','mermaid','smd-chart'].includes(language)};}
-      else if(marker===open.marker&&length>=open.length){if(open.enabled)spans.push({start:open.start,end:position});open=null;}}
-    position+=agentCharLength(part);
-  }
-  if(open?.enabled)spans.push({start:open.start,end:agentCharLength(source)});return spans.filter((span,index)=>spans.findIndex(other=>other.start===span.start&&other.end===span.end)===index).sort((a,b)=>a.start-b.start);
-}
 function safeRegex(query:string):RegExp{
   let inClass=false,escaped=false;
   for(const ch of query){if(escaped){if(/[1-9]/.test(ch)||ch==='k')throw Error('regex supports no backreferences');if(!inClass&&(ch==='b'||ch==='B'))throw Error('regex supports no zero-width word-boundary assertions');escaped=false;continue;}
@@ -207,13 +204,15 @@ export function agentSearch(source:string,query:unknown,limit:unknown=10,context
   if(!useRegex&&!caseSensitive)for(const point of source)normalized+=point.toLowerCase();
   const normalizedQuery=!useRegex&&!caseSensitive?Array.from(query).map(ch=>ch.toLowerCase()).join(''):query;
   const matcher=useRegex?safeRegex(query):new RegExp(normalizedQuery.replace(/[.*+?^${}()|[\]\\]/g,'\\$&'),'gu');
-  const spans=excludeDiagrams?searchDiagramSpans(source).map(item=>({start:agentCharLength(source.slice(0,item.start)),end:agentCharLength(source.slice(0,item.end))})):[];
-  const matches:SearchMatch[]=[];let totalMatches=0,remainingMatches=0;const isWord=(value:string|undefined)=>value!==undefined&&/[\p{L}\p{N}_]/u.test(value);
+  const spans=excludeDiagrams?svgSpans(source,true):[];
+  const matches:SearchMatch[]=[];let totalMatches=0,remainingMatches=0,spanIndex=0;const isWord=(value:string|undefined)=>value!==undefined&&/[\p{L}\p{N}_]/u.test(value);
   const fromSource=(startCp:number,endCp:number)=>{const left=agentUtf16Offset(source,startCp),right=agentUtf16Offset(source,endCp);return {left,right};};
   const accept=(startCp:number,endCp:number)=>{
     if(endCp<=startCp)return false;
     if(wholeWord&&(isWord(sourcePoints[startCp-1])||isWord(sourcePoints[endCp])))return false;
-    if(spans.some(span=>startCp<span.end&&endCp>span.start))return false;
+    while(spanIndex<spans.length&&spans[spanIndex].end<=startCp)spanIndex++;
+    const span=spans[spanIndex];
+    if(span&&startCp<span.end&&endCp>span.start)return false;
     totalMatches++;
     if(startCp<offset)return true;
     remainingMatches++;

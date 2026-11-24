@@ -44,6 +44,18 @@ describe('live agent document operations',()=>{
   it('does not leak fenced artwork into an outline',()=>{
     expect(agentOutline('# Intro\n\n```svg\n# Not a heading\n```\n\n## Later\n').map(heading=>[heading.title,heading.line])).toEqual([['Intro',1],['Later',7]]);
   });
+  it('keeps Unicode offsets when filtering diagram bodies from agent search',()=>{
+    const prefix='😀'.repeat(80)+'\n';
+    const before='needle before\n';
+    const diagrams='```svg\n<svg>needle</svg>\n```\n~~~mermaid\nneedle\n~~~\n';
+    const source=prefix+before+diagrams+'needle after';
+    const result=agentSearch(source,'needle',10,0,{excludeDiagrams:true});
+    expect(result.totalMatches).toBe(2);
+    expect(result.matches.map(match=>[match.offset,match.line])).toEqual([
+      [Array.from(prefix).length,2],
+      [Array.from(prefix+before+diagrams).length,9],
+    ]);
+  });
   it('resolves exact titles, slugs and numbered prefixes to paginated nested sections',()=>{
     const source='😀 Preamble\n# Intro\n\n## 7.4 Methods\nA paragraph with details.\n### Nested\nNested content stays in the parent section.\n## 7.40 Other\nOther section.\n';
     const start=Array.from(source.slice(0,source.indexOf('## 7.4 Methods'))).length;
