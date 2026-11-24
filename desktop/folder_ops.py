@@ -4,7 +4,7 @@ from __future__ import annotations
 import os
 import re
 import urllib.parse
-from pathlib import Path
+from pathlib import Path, PurePath, PurePosixPath, PureWindowsPath
 
 try:
     from . import documents, markdown_prepare
@@ -67,13 +67,17 @@ def strip_extended_length_prefix(raw: str) -> str:
     return raw
 
 
+def _pure_path(raw: str) -> PurePath:
+    return PureWindowsPath(raw) if os.name == "nt" else PurePosixPath(raw)
+
+
 def canonical_path_str(path: str | os.PathLike[str]) -> str:
     """Return a resolved, normalized path string without Win32 \\\\?\\ prefixes."""
     raw = strip_extended_length_prefix(str(path or "").strip())
     if not raw:
         return ""
     try:
-        resolved = Path(raw).resolve(strict=False)
+        resolved = os.path.realpath(raw)
         return os.path.normpath(strip_extended_length_prefix(str(resolved)))
     except OSError:
         return os.path.normpath(raw)
@@ -101,18 +105,18 @@ def same_path(left: str | os.PathLike[str], right: str | os.PathLike[str]) -> bo
 
 def normalized_relpath(path: str | os.PathLike[str], root: str | os.PathLike[str]) -> str:
     """Return a POSIX-separated relative path from *root* to *path* across all platforms."""
-    canon_path = Path(canonical_path_str(path))
-    canon_root = Path(canonical_path_str(root))
+    canon_path = _pure_path(canonical_path_str(path))
+    canon_root = _pure_path(canonical_path_str(root))
     try:
         return canon_path.relative_to(canon_root).as_posix()
     except ValueError:
-        path_key = normalize_path_key(canon_path)
-        root_key = normalize_path_key(canon_root)
+        path_key = normalize_path_key(str(canon_path))
+        root_key = normalize_path_key(str(canon_root))
         if path_key == root_key:
             return "."
         prefix = root_key if root_key.endswith("/") else root_key + "/"
         if path_key.startswith(prefix) and len(canon_path.parts) > len(canon_root.parts):
-            return Path(*canon_path.parts[len(canon_root.parts):]).as_posix()
+            return PurePosixPath(*canon_path.parts[len(canon_root.parts):]).as_posix()
         raise
 
 
@@ -217,10 +221,10 @@ def remap_path_prefix(candidate: str, old_path: str, new_path: str, *, is_direct
     if is_directory:
         prefix = old_key if old_key.endswith("/") else old_key + "/"
         if cand_key.startswith(prefix):
-            cand_parts = Path(canonical_path_str(candidate)).parts
-            old_parts = Path(canonical_path_str(old_path)).parts
+            cand_parts = _pure_path(canonical_path_str(candidate)).parts
+            old_parts = _pure_path(canonical_path_str(old_path)).parts
             if len(cand_parts) > len(old_parts):
-                return str(Path(new_canon).joinpath(*cand_parts[len(old_parts):]))
+                return str(_pure_path(new_canon).joinpath(*cand_parts[len(old_parts):]))
     return candidate
 
 
@@ -248,10 +252,10 @@ def linked_local_images(
     """Find relative local images/diagrams in a plain Markdown note that would break on move."""
     if note_path.suffix.lower() not in PLAIN_MARKDOWN_SUFFIXES:
         return []
-    root = open_root.resolve(strict=True)
-    source_dir = note_path.parent.resolve(strict=True)
-    dest_dir = target_dir.resolve(strict=True)
-    if source_dir == dest_dir:
+    root = Path(strip_extended_length_prefix(str(open_root.resolve(strict=True))))
+    source_dir = Path(strip_extended_length_prefix(str(note_path.parent.resolve(strict=True))))
+    dest_dir = Path(strip_extended_length_prefix(str(target_dir.resolve(strict=True))))
+    if same_path(source_dir, dest_dir):
         return []
 
     found: list[tuple[str, Path, Path]] = []
@@ -275,7 +279,7 @@ def linked_local_images(
             seen.add(rel)
             found.append((rel, src_file, dst_candidate))
             continue
-        if dst_file == src_file:
+        if same_path(dst_file, src_file):
             continue
         if dst_file.exists() and dst_file.is_file():
             try:
@@ -292,7 +296,7 @@ def copy_linked_local_images(items: list[tuple[str, Path, Path]], open_root: Pat
     """Safely copy relative local images/diagrams to their relative destinations inside *open_root*."""
     if not items:
         return
-    root = open_root.resolve(strict=True)
+    root = Path(strip_extended_length_prefix(str(open_root.resolve(strict=True))))
     staged: list[tuple[Path, bytes]] = []
     total_bytes = 0
     for rel, src_file, dst_candidate in items:

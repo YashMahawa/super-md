@@ -75,7 +75,7 @@ class FolderActionsDesktopTest(unittest.TestCase):
             os.environ.pop("XDG_DATA_HOME", None)
         else:
             os.environ["XDG_DATA_HOME"] = self._prev_xdg
-        if sys.platform == "darwin":
+        if sys.platform in ("darwin", "win32"):
             for trashed in trashed_paths:
                 trashed_p = Path(trashed)
                 if trashed_p.exists() and not same_path(trashed_p, Path.home()):
@@ -276,6 +276,14 @@ class FolderActionsDesktopTest(unittest.TestCase):
         self.assertNotIn(self._norm(resolved_open), self._norm_list(self.session.locations.keys()))
         self.assertEqual(self._norm_list(self.session.startup_paths), [self._norm(new_open_path)])
         self.assertEqual(self._norm(self.session.startup_active), self._norm(new_open_path))
+        workspace_paths = [
+            self._norm(entry["path"])
+            for entries in self.session.workspace.values()
+            for entry in entries
+            if entry.get("path")
+        ]
+        self.assertIn(self._norm(new_open_path), workspace_paths)
+        self.assertNotIn(self._norm(resolved_open), workspace_paths)
         self.assertIn("Archive/Roadmap.md", [self._rel_posix(f["path"]) for f in self.studio.files])
         self.assertIn("Archive/Sprint Backlog.md", [self._rel_posix(f["path"]) for f in self.studio.files])
 
@@ -404,11 +412,33 @@ class FolderActionsDesktopTest(unittest.TestCase):
             trashed_dest = Path(self.studio._last_trashed_path)
             self.assertTrue(trashed_dest.exists())
             self.assertFalse(normalize_path_key(trashed_dest).startswith(normalize_path_key(self.open_root) + "/"))
-        else:
+        elif os.name == "nt":
+            import ctypes
+            import ctypes.wintypes
+
+            class _SHQUERYRBINFO(ctypes.Structure):
+                _pack_ = 1 if ctypes.sizeof(ctypes.c_void_p) == 4 else 8
+                _fields_ = [
+                    ("cbSize", ctypes.wintypes.DWORD),
+                    ("i64Size", ctypes.c_int64),
+                    ("i64NumItems", ctypes.c_int64),
+                ]
+
+            rb_info = _SHQUERYRBINFO(cbSize=ctypes.sizeof(_SHQUERYRBINFO))
+            hr = ctypes.windll.shell32.SHQueryRecycleBinW(str(self.open_root), ctypes.byref(rb_info))
+            self.assertEqual(hr, 0)
+            self.assertGreaterEqual(rb_info.i64NumItems, 1)
             if self.studio._last_trashed_path:
+                trashed_dest = Path(self.studio._last_trashed_path)
+                self.assertTrue(trashed_dest.exists())
                 self.assertFalse(
-                    normalize_path_key(self.studio._last_trashed_path).startswith(normalize_path_key(self.open_root) + "/")
+                    normalize_path_key(trashed_dest).startswith(normalize_path_key(self.open_root) + "/")
                 )
+        else:
+            self.assertTrue(bool(self.studio._last_trashed_path))
+            trashed_dest = Path(self.studio._last_trashed_path)
+            self.assertTrue(trashed_dest.exists())
+            self.assertFalse(normalize_path_key(trashed_dest).startswith(normalize_path_key(self.open_root) + "/"))
         self._assert_no_hidden_or_vault_artifacts()
         self.assertNotIn(self._norm(resolved_dirty), self._norm_list(self.studio.recent))
         self.assertNotIn(self._norm(resolved_dirty), self._norm_list(self.session.pinned))
@@ -484,6 +514,51 @@ ApplicationWindow {
         self.app.sendPostedEvents(None, QEvent.Type.DeferredDelete)
         engine.deleteLater()
         self.app.sendPostedEvents(None, QEvent.Type.DeferredDelete)
+
+    def test_windows_path_normalization_handles_extended_prefixes_and_separators(self):
+        import ntpath
+        from unittest.mock import patch
+        import folder_ops
+
+        with (
+            patch.object(folder_ops.os, "name", "nt"),
+            patch.object(folder_ops.os.path, "realpath", ntpath.normpath),
+            patch.object(folder_ops.os.path, "normpath", ntpath.normpath),
+            patch.object(folder_ops.os.path, "normcase", ntpath.normcase),
+            patch.object(folder_ops.os, "sep", "\\"),
+        ):
+            self.assertEqual(
+                folder_ops.strip_extended_length_prefix(r"\\?\C:\Users\Runner\Notes\Projects\Sprint Backlog.md"),
+                r"C:\Users\Runner\Notes\Projects\Sprint Backlog.md",
+            )
+            self.assertEqual(
+                folder_ops.strip_extended_length_prefix(r"\\?\UNC\server\share\Notes\Sprint Backlog.md"),
+                r"\\server\share\Notes\Sprint Backlog.md",
+            )
+            self.assertTrue(
+                folder_ops.matches_path_prefix(
+                    r"\\?\c:\Users\Runner\Notes\Projects\Sprint Backlog.md",
+                    r"C:/Users/Runner/Notes/Projects",
+                    is_directory=True,
+                )
+            )
+            self.assertEqual(
+                folder_ops.normalized_relpath(
+                    r"\\?\c:\Users\Runner\Notes\Projects\Sprint Backlog.md",
+                    r"C:\Users\Runner\Notes",
+                ),
+                "Projects/Sprint Backlog.md",
+            )
+            remapped = folder_ops.remap_path_prefix(
+                r"\\?\c:\Users\Runner\Notes\Projects\Sprint Backlog.md",
+                r"C:\Users\Runner\Notes\Projects",
+                r"C:\Users\Runner\Notes\Archive",
+                is_directory=True,
+            )
+            self.assertEqual(
+                folder_ops.normalize_path_key(remapped),
+                "c:/users/runner/notes/archive/sprint backlog.md",
+            )
 
 
 if __name__ == "__main__":

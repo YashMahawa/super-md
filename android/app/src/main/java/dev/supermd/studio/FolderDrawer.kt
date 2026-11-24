@@ -223,6 +223,7 @@ internal fun LazyListScope.folderFileItems(
                 },
                 modifier = Modifier
                     .fillMaxWidth()
+                    .heightIn(min = 48.dp)
                     .combinedClickable(
                         onClick = { onActivate(entry) },
                         onLongClick = {

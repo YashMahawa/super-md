@@ -1827,7 +1827,7 @@ class Studio(QObject):
         restoring = not explicit and str(path) in self._restoring_paths
         found = next((t for t in self.tabs if t["path"] == str(path)), None)
         if found:
-            self._agent_open_paths.add(str(path.resolve()))
+            self._agent_open_paths.add(folder_ops.canonical_path_str(path))
             self._restoring_paths.discard(str(path))
             if restoring and activation_generation == self._activation_generation and str(path) == self.session.startup_active:
                 self._select_tab_from_open(found["id"], activation_generation)
@@ -1852,7 +1852,7 @@ class Studio(QObject):
                 if completion_callback: completion_callback(existing, None)
                 return
             note = self._note(path.name, content, str(path), content, assets, portable)
-            self._agent_open_paths.add(str(path.resolve()))
+            self._agent_open_paths.add(folder_ops.canonical_path_str(path))
             if restoring:
                 if activation_generation == self._activation_generation:
                     self.tabs=[t for t in self.tabs if t["id"] not in self._startup_placeholder_ids]
@@ -1960,6 +1960,8 @@ class Studio(QObject):
         self._load_tree()
 
     def _load_tree(self):
+        self._tree_generation = getattr(self, "_tree_generation", 0) + 1
+        generation = self._tree_generation
         folder, expanded = self.folder, set(self.expanded)
         expanded_keys = {folder_ops.normalize_path_key(item) for item in expanded if item}
         def scan():
@@ -1984,7 +1986,7 @@ class Studio(QObject):
             visit(folder, 0)
             return entries
         def finished(result, error):
-            if not error and folder_ops.same_path(folder, self.folder):
+            if not error and generation == getattr(self, "_tree_generation", 0) and folder_ops.same_path(folder, self.folder):
                 self.files = result
         self._submit(scan, finished, False)
 
@@ -2003,6 +2005,7 @@ class Studio(QObject):
 
     @Slot()
     def closeFolder(self):
+        self._tree_generation = getattr(self, "_tree_generation", 0) + 1
         self.folder = ""
         self.files = []
         self.expanded.clear()
@@ -2384,13 +2387,13 @@ class Studio(QObject):
                 current_ext="" if is_dir else (before.suffix or ".md"),
             )
             after = before.with_name(final_name)
-            if after != before:
+            if not folder_ops.same_path(after, before):
                 folder_ops.resolve_within_open_folder(self.folder, after, allow_root=False, must_exist=False)
         except ValueError as error:
             self.message = str(error)
             self._emit(False)
             return
-        if after == before:
+        if before.name == final_name:
             return
         for win in list(self.session.windows.values()):
             for tab in win.tabs:
@@ -2435,7 +2438,7 @@ class Studio(QObject):
         open_root_str = self.folder
 
         def scan():
-            root = Path(open_root_str).resolve(strict=True)
+            root = Path(folder_ops.strip_extended_length_prefix(str(Path(open_root_str).resolve(strict=True))))
             try:
                 expanded = set(json.loads(expanded_json or "[]"))
             except (TypeError, ValueError):
@@ -2463,7 +2466,7 @@ class Studio(QObject):
             self._emit(False)
             return
         try:
-            root = Path(self.folder).resolve(strict=True)
+            root = Path(folder_ops.strip_extended_length_prefix(str(Path(self.folder).resolve(strict=True))))
             source = folder_ops.resolve_within_open_folder(root, source_path, allow_root=False, must_exist=True)
             dest_dir = folder_ops.resolve_within_open_folder(root, target_dir or self.folder, allow_root=True, must_exist=True)
             if not dest_dir.is_dir():
@@ -2526,15 +2529,15 @@ class Studio(QObject):
             self._emit(False)
             return
         try:
-            root = Path(self.folder).resolve(strict=True)
+            root = Path(folder_ops.strip_extended_length_prefix(str(Path(self.folder).resolve(strict=True))))
             source = folder_ops.resolve_within_open_folder(root, source_path, allow_root=False, must_exist=True)
             dest_dir = folder_ops.resolve_within_open_folder(root, target_dir or self.folder, allow_root=True, must_exist=True)
             if not dest_dir.is_dir():
                 raise ValueError("Choose an existing destination folder.")
             is_dir = source.is_dir()
-            if is_dir and (dest_dir == source or dest_dir.is_relative_to(source)):
+            if is_dir and (folder_ops.same_path(dest_dir, source) or folder_ops.matches_path_prefix(str(dest_dir), str(source), is_directory=True)):
                 raise ValueError("Cannot move a folder into itself.")
-            if source.parent == dest_dir:
+            if folder_ops.same_path(source.parent, dest_dir):
                 return
             dest_path = dest_dir / source.name
             folder_ops.resolve_within_open_folder(root, dest_path, allow_root=False, must_exist=False)
@@ -2745,16 +2748,10 @@ class Studio(QObject):
             self.message = str(error); self._emit(False); return
         if not tab["path"]: tab["name"] = final_name; self._recover(); self._emit(False); return
         before = Path(tab["path"]); after = before.with_name(final_name)
-        if before == after: return
-        if self.folder:
-            try:
-                resolved_before = before.resolve(strict=False)
-                resolved_root = Path(self.folder).resolve(strict=False)
-                if resolved_before.is_relative_to(resolved_root):
-                    self.renameEntry(str(before), final_name)
-                    return
-            except OSError:
-                pass
+        if before.name == final_name: return
+        if self.folder and folder_ops.matches_path_prefix(str(before), self.folder, is_directory=True):
+            self.renameEntry(str(before), final_name)
+            return
         self._suspend_watches_for_prefix(str(before), is_dir=False)
         def work():
             if folder_ops._is_link_or_junction(after): raise ValueError("Symlinks are not allowed.")
