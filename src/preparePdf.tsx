@@ -14,6 +14,8 @@ import { analyzeDocument } from "./documentAnalysis";
 import { svgImage } from "./svgImage";
 import { remarkObsidianMath } from "./obsidianMath";
 import { remarkSvgBlocks } from "./svgBlocks";
+import { maskCode } from "./markdownSource";
+import { remarkSingleTildeStringify } from "./studySyntax";
 import {parseStepDeck} from "./components/StepCards";
 import {stepDiagramSvg} from "./stepPdf";
 
@@ -63,7 +65,7 @@ export async function preparePdf(markdown: string, documentPath: string | null, 
   try {
   checkCurrent();
   report({ phase: "prepare", completed: 0, total: 1 });
-  const processor = unified().use(remarkParse).use(remarkGfm).use(remarkMath).use(remarkObsidianMath).use(remarkStringify);
+  const processor = unified().use(remarkParse).use(remarkGfm, { singleTilde: false }).use(remarkSingleTildeStringify).use(remarkMath).use(remarkObsidianMath).use(remarkStringify);
   const normalized = normalizeCallouts(markdown);
   // parse() runs no transformers: lift raw <svg> markup into svg blocks here.
   const tree = remarkSvgBlocks()(processor.parse(normalized), { value: normalized });
@@ -245,7 +247,12 @@ export async function preparePdf(markdown: string, documentPath: string | null, 
   checkCurrent();
   // The marker is an extension, not a normal bracketed link. Stringify escapes
   // its opening bracket; restore only explicit blockquote callout prefixes.
-  const content = processor.stringify(tree).replace(/^([\t ]*>[\t ]*)\\(\[![\w-]+\][+-]?)/gm, "$1$2");
+  const rawContent = processor.stringify(tree).replace(/^([\t ]*>[\t ]*)\\(\[![\w-]+\][+-]?)/gm, "$1$2");
+  const codeMask = maskCode(rawContent);
+  const content = rawContent.replace(
+    /^([\t ]*(?:>[\t ]*)*(?:(?:[-+*]|\d+[.)])[\t ]+(?:\[[ xX]\][\t ]+)?)?)\\(==(?=[^=\s\r\n].*==))/gm,
+    (full, prefix: string, marker: string, offset: number) => codeMask[offset + prefix.length] === " " ? full : prefix + marker,
+  );
   checkCurrent();
   return { content, assets };
   } finally {

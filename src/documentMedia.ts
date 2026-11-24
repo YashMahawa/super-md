@@ -13,7 +13,7 @@ export const markdownLabel = (value: string) => value.replace(/[\\[\]]/g, "\\$&"
 export const imageMarkdown = (image: ImportedImage) => `![${markdownLabel(image.alt)}](<${image.source.replace(/>/g, "%3E")}>)`;
 export interface ImageRange { from: number; to: number; source: string }
 export function imageRanges(markdown: string): ImageRange[] {
-  const tree = unified().use(remarkParse).use(remarkGfm).use(remarkMath).use(remarkObsidianMath).parse(markdown);
+  const tree = unified().use(remarkParse).use(remarkGfm, { singleTilde: false }).use(remarkMath).use(remarkObsidianMath).parse(markdown);
   const definitions = new Map<string, string>(); const result: ImageRange[] = [];
   visit(tree, "definition", (node: any) => { definitions.set(node.identifier, node.url); });
   visit(tree, (node: any) => {
@@ -66,7 +66,7 @@ export async function importImageFiles(files: File[]): Promise<ImportedImage[]> 
 // FMD keeps interactive source blocks intact. Only image URLs are rewritten;
 // their bytes live in the envelope, never in the displayed Markdown editor.
 export async function prepareFmd(markdown: string, documentPath: string | null) {
-  const processor = unified().use(remarkParse).use(remarkGfm).use(remarkMath).use(remarkObsidianMath);
+  const processor = unified().use(remarkParse).use(remarkGfm, { singleTilde: false }).use(remarkMath).use(remarkObsidianMath);
   const tree = processor.parse(markdown);
   const assets: Record<string, string> = {}; const work: Promise<void>[] = [];
   const shared = new Map<string, Promise<string>>();

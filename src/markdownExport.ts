@@ -16,7 +16,7 @@ const MIME_EXT: Record<string, string> = {
 
 function refs(markdown: string): ImageRef[] {
   const frontmatterEnd = markdown.match(/^---\r?\n(?:[\s\S]*?\r?\n)?---(?:\r?\n|$)/)?.[0].length ?? 0;
-  const tree = unified().use(remarkParse).use(remarkGfm).use(remarkMath).use(remarkObsidianMath).parse(markdown);
+  const tree = unified().use(remarkParse).use(remarkGfm, { singleTilde: false }).use(remarkMath).use(remarkObsidianMath).parse(markdown);
   const definitions = new Map<string, any>();
   const result: ImageRef[] = [];
   visit(tree, "definition", (node: any) => {

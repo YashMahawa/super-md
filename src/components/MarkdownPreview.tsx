@@ -14,6 +14,7 @@ import PythonCell from "./PythonCell";
 import SvgDiagram from "./SvgDiagram";
 import { remarkSvgBlocks } from "../svgBlocks";
 import { remarkObsidianMath } from "../obsidianMath";
+import { remarkStudySyntax } from "../studySyntax";
 import { navigateHeading, remarkHeadingIds } from "../documentNavigation";
 import { selectedMarkdown, setSelectedMarkdownDrag } from "../copySource";
 import CopyCode from "./CopyCode";
@@ -205,7 +206,7 @@ function MarkdownPreview({ markdown, documentPath, python, dark, trustedImageHos
         sourceAnalysis={{source:markdown,analysis}}
         renderBlock={renderBlock}
         windowingEnabled={!fullDocumentAccessibility}
-        remarkPlugins={[remarkGfm, remarkMath, remarkObsidianMath, remarkSvgBlocks, remarkCallouts, remarkHeadingIds, remarkTaskPositions,remarkSourcePositions]}
+        remarkPlugins={[[remarkGfm, { singleTilde: false }], remarkMath, remarkObsidianMath, remarkSvgBlocks, remarkStudySyntax, remarkCallouts, remarkHeadingIds, remarkTaskPositions,remarkSourcePositions]}
         rehypePlugins={[rehypeKatex, rehypeHighlight]}
         components={{
           p: MarkdownParagraph,

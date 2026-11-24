@@ -15,22 +15,68 @@ import {analyzeDocument,type SourceDocumentAnalysis} from '../documentAnalysis';
 // unbounded collection of whole documents or screenshots.
 const cache=new Map<string,{tree:Root;weight:number}>();let retained=0;
 const LIMIT=24_000_000;
+const RAW_HTML_TOKEN=/(<!--[\s\S]*?-->|<\/?(?:br|mark|sub|sup|kbd|u)(?:\s+(?:[^>"']|"[^"]*"|'[^']*')*)?\s*\/?>)/gi;
+const BR_HTML_TAG=/^<br(?:\s+(?:[^>"']|"[^"]*"|'[^']*')*)?\s*\/?>$/i;
+const OPEN_HTML_TAG=/^<(mark|sub|sup|kbd|u)(?:\s+(?:[^>"']|"[^"]*"|'[^']*')*)?>$/i;
+const CLOSE_HTML_TAG=/^<\/(mark|sub|sup|kbd|u)\s*>$/i;
+
+function sanitizeHastChildren(children:any[],addWeight:(node:any)=>void):any[] {
+  const tokens:any[]=[];
+  for(const child of children){
+    addWeight(child);
+    if(child.type==="raw"){
+      const raw=String(child.value??""),parts=raw.split(RAW_HTML_TOKEN).filter(Boolean),single=parts.length===1;
+      for(const part of parts){
+        if(part.startsWith("<!--")&&part.endsWith("-->"))continue;
+        if(BR_HTML_TAG.test(part)){tokens.push({type:"element",tagName:"br",properties:{},children:[],...(single&&child.position?{position:child.position}:{})});continue;}
+        const open=OPEN_HTML_TAG.exec(part);
+        if(open&&!part.slice(0,-1).trimEnd().endsWith("/")){tokens.push({type:"__open",tag:open[1].toLowerCase(),raw:part,...(single&&child.position?{position:child.position}:{})});continue;}
+        const close=CLOSE_HTML_TAG.exec(part);
+        if(close){tokens.push({type:"__close",tag:close[1].toLowerCase(),raw:part});continue;}
+        tokens.push({type:"text",value:part,...(single&&child.position?{position:child.position}:{})});
+      }
+      continue;
+    }
+    if(child.type==="element"){
+      for(const key of ["href","src","cite","poster","longDesc","action"]){
+        if(typeof child.properties?.[key]!=="string")continue;
+        const url=child.properties[key];
+        child.properties[key]=child.tagName==="img"&&key==="src"&&/^data:image\/(?:png|jpeg|gif|webp|avif|svg\+xml);base64,/i.test(url)?url:defaultUrlTransform(url);
+      }
+      if(Array.isArray(child.children))child.children=sanitizeHastChildren(child.children,addWeight);
+    }
+    tokens.push(child);
+  }
+  const out:any[]=[],stack:Array<{tag:string;raw:string;position?:any;children:any[]}>=[];
+  const emit=(item:any)=>{
+    const target=stack.length?stack[stack.length-1].children:out,prev=target[target.length-1];
+    if(item.type==="text"&&prev?.type==="text"&&!prev.position&&!item.position)prev.value+=item.value;
+    else target.push(item);
+  };
+  for(const token of tokens){
+    if(token.type==="__open"){stack.push({tag:token.tag,raw:token.raw,position:token.position,children:[]});continue;}
+    if(token.type==="__close"){
+      let match=-1;
+      for(let s=stack.length-1;s>=0;s--)if(stack[s].tag===token.tag){match=s;break;}
+      if(match<0){emit({type:"text",value:token.raw});continue;}
+      while(stack.length-1>match){const unclosed=stack.pop()!;emit({type:"text",value:unclosed.raw,...(unclosed.position?{position:unclosed.position}:{})});for(const c of unclosed.children)emit(c);}
+      const paired=stack.pop()!;
+      emit({type:"element",tagName:paired.tag,properties:{},children:paired.children,...(paired.position?{position:paired.position}:{})});
+      continue;
+    }
+    emit(token);
+  }
+  while(stack.length){const unclosed=stack.pop()!;emit({type:"text",value:unclosed.raw,...(unclosed.position?{position:unclosed.position}:{})});for(const c of unclosed.children)emit(c);}
+  return out;
+}
+
 export function cachedMarkdownTree(source:string,remarkPlugins:PluggableList,rehypePlugins:PluggableList,deferred=false,sourceAnalysis?:SourceDocumentAnalysis):Root {
   const key=(deferred?'deferred:':'full:')+source;
   const hit=cache.get(key);if(hit){cache.delete(key);cache.set(key,hit);return hit.tree;}
   const processor=unified().use(remarkParse).use(remarkPlugins).use(remarkRehype,{allowDangerousHtml:true}).use(rehypePlugins);
   const analysis=sourceAnalysis?.source===source?sourceAnalysis.analysis:analyzeDocument(source);
   const tree=processor.runSync(structuredClone(analysis.tree),source) as Root;let weight=source.length*2;
-  visit(tree,(node:any,index,parent:any)=>{
-    weight+=160+(typeof node.value==="string"?node.value.length*2:0);
-    if(node.type==="raw"&&parent&&index!==undefined){parent.children[index]={type:"text",value:node.value};return;}
-    if(node.type!=="element")return;
-    for(const key of ["href","src","cite","poster","longDesc","action"]){
-      if(typeof node.properties[key]!=="string")continue;
-      const url=node.properties[key];
-      node.properties[key]=node.tagName==="img"&&key==="src"&&/^data:image\/(?:png|jpeg|gif|webp|avif|svg\+xml);base64,/i.test(url)?url:defaultUrlTransform(url);
-    }
-  });
+  tree.children=sanitizeHastChildren(tree.children,(node:any)=>{weight+=160+(typeof node.value==="string"?node.value.length*2:0);});
   if(weight<=LIMIT){cache.set(key,{tree,weight});retained+=weight;while(retained>LIMIT||cache.size>512){const first=cache.keys().next().value!;retained-=cache.get(first)!.weight;cache.delete(first);}}
   return tree;
 }

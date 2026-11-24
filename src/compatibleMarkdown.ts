@@ -21,7 +21,7 @@ export async function compatibleMarkdown(markdown:string,documentPath:string|nul
  if(depth>5)throw Error('Nested step content is too deep to export.');
  markdown=normalizeCalloutBlocks(markdown).value;
  const frontmatterEnd=markdown.match(/^---\r?\n[\s\S]*?\r?\n---(?:\r?\n|$)/)?.[0].length??0;
- const processor=unified().use(remarkParse).use(remarkGfm).use(remarkMath).use(remarkObsidianMath);
+ const processor=unified().use(remarkParse).use(remarkGfm,{singleTilde:false}).use(remarkMath).use(remarkObsidianMath);
  const tree=remarkSvgBlocks()(processor.parse(markdown),{value:markdown});
  const blocks:any[]=[];
  visit(tree,(node:any)=>{if(node.position&&node.position.start.offset>=frontmatterEnd&&(node.type==='code'||node.type==='html'&&looksLikeSvg(node.value)))blocks.push(node);});

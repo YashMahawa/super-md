@@ -312,12 +312,62 @@ function unmaskedRegexStage(source:string,ranges:Array<[number,number]>,regex:Re
   return {stage:replaceStage(source,edits),ranges:nextRanges};
 }
 
+function computeCodeAndMathMask(source:string):Uint8Array {
+  const mask=computeCodeMask(source);
+  const escaped=(at:number)=>{let slashes=0;for(let j=at-1;j>=0&&!mask[j]&&source[j]==='\\';j--)slashes++;return (slashes&1)===1;};
+  for(let i=0;i<source.length;){
+    if(mask[i]||source[i]!=='$'||escaped(i)){i++;continue;}
+    if(source[i+1]==='$'&&!mask[i+1]){
+      if(source[i+2]==='$'){while(i<source.length&&source[i]==='$')i++;continue;}
+      let close=-1;
+      for(let j=i+2;j+1<source.length;j++){
+        if(!mask[j]&&!mask[j+1]&&source[j]==='$'&&source[j+1]==='$'&&source[j+2]!=='$'&&!escaped(j)){close=j;break;}
+      }
+      if(close>=0){mask.fill(1,i,close+2);i=close+2;}else i+=2;
+      continue;
+    }
+    const next=source[i+1];
+    if(!next||/\s/.test(next)){i++;continue;}
+    let close=-1;
+    for(let j=i+1;j<source.length;j++){
+      if(source[j]==='\n'){
+        let k=j+1;while(k<source.length&&(source[k]===' '||source[k]==='\t'||source[k]==='\r'))k++;
+        if(source[k]==='\n')break;
+      }
+      if(!mask[j]&&source[j]==='$'&&source[j+1]!=='$'&&!escaped(j)&&!/\s/.test(source[j-1])&&!/\d/.test(source[j+1]||'')){close=j;break;}
+    }
+    if(close>=0){mask.fill(1,i,close+1);i=close+1;}else i++;
+  }
+  return mask;
+}
+
+function stripPercentComments(source:string):Stage {
+  if(!source.includes('%%'))return {value:source,originalOffset:offset=>offset};
+  const mask=computeCodeAndMathMask(source),edits:Edit[]=[];
+  const isDelim=(at:number)=>{
+    if(at+1>=source.length||source[at]!=='%'||source[at+1]!=='%'||mask[at]||mask[at+1])return false;
+    let slashes=0;
+    for(let j=at-1;j>=0&&!mask[j]&&source[j]==='\\';j--)slashes++;
+    return (slashes&1)===0;
+  };
+  for(let i=0;i+1<source.length;){
+    if(!isDelim(i)){i++;continue;}
+    let close=-1;
+    for(let j=i+2;j+1<source.length;j++){if(isDelim(j)){close=j;break;}}
+    if(close<0)break;
+    edits.push({start:i,end:close+2,text:''});
+    i=close+2;
+  }
+  return edits.length?replaceStage(source,edits):{value:source,originalOffset:offset=>offset};
+}
+
 /** Render-only syntax normalization with a sparse offset map. Source positions
  * always address the original note, including frontmatter and wiki/callout edits. */
 export function normalizeMarkdownSource(markdown:string):Stage {
   const stages:Stage[]=[];let value=markdown;
   const add=(stage:Stage)=>{stages.push(stage);value=stage.value;};
   add(regexStage(value,FRONTMATTER,()=>''));
+  add(stripPercentComments(value));
   let ranges=unmaskedRangesFromMask(computeCodeMask(value));
   const addUnmasked=(regex:RegExp,replacement:(...args:any[])=>string)=>{const next=unmaskedRegexStage(value,ranges,regex,replacement);ranges=next.ranges;add(next.stage);};
   addUnmasked(/!\[\[([^\[\r\n\]|]+)(?:\|([^\r\n\]]+))?\]\]/g,(_all,path,label)=>`![${label??path}](${encodeURI(path)})`);
