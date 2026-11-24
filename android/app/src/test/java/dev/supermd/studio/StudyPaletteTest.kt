@@ -5,6 +5,21 @@ import androidx.compose.ui.graphics.luminance
 import org.junit.Assert.*
 import org.junit.Test
 class StudyPaletteTest {
+    @Test fun warmPreviewKeepsReadingContrastAndDefaultsOff() {
+        val initial = StudioState()
+        assertFalse(initial.previewWarmTheme)
+        assertFalse(initial.previewSerifReading)
+        assertFalse(initial.previewCompactToolbar)
+        assertFalse(initial.previewWorkspaceSave)
+        for (dark in listOf(false, true)) {
+            val colors = warmPreviewColors(dark)
+            for (surface in listOf(colors.surface, colors.surfaceContainerLow, colors.surfaceContainerHigh)) {
+                assertTrue(contrast(colors.onSurface, surface) >= 4.5f)
+                assertTrue(contrast(colors.onSurfaceVariant, surface) >= 4.5f)
+            }
+        }
+    }
+
     @Test fun manualAccentsReplaceEveryOemRoleInBothModes() {
         for(dark in listOf(false,true)) for(name in listOf("blue","violet","rose","amber")) {
             val first=accentColors(lightColorScheme(primary=Color.Red,secondary=Color.Green),name,dark)

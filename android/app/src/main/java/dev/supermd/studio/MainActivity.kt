@@ -452,10 +452,11 @@ class MainActivity : ComponentActivity() {
     val dark = theme == "dark" || theme == "black" || (theme == "system" && systemDark)
     val context = LocalContext.current
     val custom=remember(state.customTheme){themeDocument(state.customTheme)}
-    val colors = remember(context,dark,theme,state.accent,custom) {
+    val colors = remember(context,dark,theme,state.accent,custom,state.previewWarmTheme) {
         var base = when { Build.VERSION.SDK_INT >= 31 -> if (dark) dynamicDarkColorScheme(context) else dynamicLightColorScheme(context); dark -> darkColorScheme(primary = Color(0xffb2c8ff), secondary = Color(0xffbcc6dc)); else -> lightColorScheme(primary = Color(0xff42669e), onPrimary = Color.White, primaryContainer = Color(0xffd7e3ff), onPrimaryContainer = Color(0xff162c4c), secondary = Color(0xff56647c), surface = Color(0xfff7f9fd), background = Color(0xfff7f9fd), surfaceContainerLow = Color(0xfff0f3fa), surfaceContainerHigh = Color(0xffe5ebf5)) }
         base=accentColors(base,custom?.optString("accent")?:state.accent,dark)
         if (!dark) base = studyLightColors(base)
+        if (state.previewWarmTheme && custom == null && theme != "black") base = warmPreviewColors(dark)
         if (theme == "black") base = manualAccent("neutral",true).copy(primary=Color(0xffdedede),onPrimary=Color(0xff1a1a1a),primaryContainer=Color(0xff343434),onPrimaryContainer=Color(0xfff0f0f0),background=Color.Black,surface=Color.Black,surfaceContainer=Color(0xff171717),surfaceContainerLow=Color(0xff101010),surfaceContainerHigh=Color(0xff242424))
         customThemeColors(base,custom,theme,dark)
     }
@@ -936,7 +937,7 @@ private object NoMotionScheme : MotionScheme {
     val themeExport = rememberLauncherForActivityResult(ActivityResultContracts.CreateDocument("application/json")) {it?.let {uri->model.exportCustomTheme(uri)}}
     var noteLocation by remember {mutableStateOf(model.noteLocation())}
     val noteFolder = rememberLauncherForActivityResult(ActivityResultContracts.OpenDocumentTree()) {it?.let {uri->runCatching{model.noteLocation(uri);noteLocation=uri.toString()}.onFailure{model.fail("Could not remember this folder: ${it.message}")}}}
-    val save = rememberLauncherForActivityResult(NoteDestination("text/markdown", model::noteLocation)) { it?.let { uri -> model.save(uri) } }
+    val save = rememberLauncherForActivityResult(NoteDestination("text/markdown", model::newNoteSaveLocation)) { it?.let { uri -> model.save(uri) } }
     val folder = rememberLauncherForActivityResult(ActivityResultContracts.OpenDocumentTree()) { it?.let { uri -> folderRelative = ""; model.setFolder(uri) } }
     val pdf = rememberLauncherForActivityResult(NoteDestination("application/pdf", model::noteLocation)) { uri ->
         if (uri != null) { readerPdfOwnsProgress = true; model.setPdfDestination(uri); model.busy(true); web?.evaluateJavascript("window.supermdExport?.(${state.pdf})", null) ?: model.fail("The reader is not ready. Open the note again.") }
@@ -1009,13 +1010,15 @@ private object NoMotionScheme : MotionScheme {
         val wide = displayIsLarge && maxWidth >= 720.dp && maxHeight >= 400.dp
         val actualMode = if (!wide && state.mode == "split") "live" else state.mode
         val readerContent=remember {arrayOfNulls<String>(1)}
-        LaunchedEffect(readerReady, state.active, actualMode, dark, state.fullscreen, state.font, state.size, state.widthPercent,state.lineHeight,state.spellCheck,state.grammarCheck,state.latexAutofix,state.typewriterScroll,state.restorePosition,state.centerLock,state.imageAppearance,state.svgAppearance,state.imageContrast,state.fullDocumentAccessibility,state.customTheme,state.patternKind,state.patternOpacity,state.patternSize,state.patternSpacing,tokens, hinge, motion) {
+        val readingFont = if (state.previewSerifReading) "serif" else state.font
+        LaunchedEffect(readerReady, state.active, actualMode, dark, state.fullscreen, readingFont, state.size, state.widthPercent,state.lineHeight,state.spellCheck,state.grammarCheck,state.latexAutofix,state.typewriterScroll,state.restorePosition,state.centerLock,state.imageAppearance,state.svgAppearance,state.imageContrast,state.fullDocumentAccessibility,state.customTheme,state.patternKind,state.patternOpacity,state.patternSize,state.patternSpacing,tokens, hinge, motion) {
             if (!readerReady) readerNote[0] = null
             if (readerReady) {
                 val note = state.active
                 val payload = JSONObject().put("id", note.id).put("editProtocol", 1).apply { if (readerNote[0] == note.id && (readerContent[0] === note.content || model.readerEcho[note.id] === note.content)) put("contentUnchanged", true) else put("content", note.content) }.put("path", note.uri ?: note.id).put("mode", actualMode).put("dark", dark).put("fullscreen", state.fullscreen).put("font", state.font).put("size", state.size).put("widthPercent",state.widthPercent).put("lineHeight",state.lineHeight).put("spellCheck",state.spellCheck).put("grammarCheck",state.grammarCheck).put("latexAutofix",state.latexAutofix).put("typewriterScroll",state.typewriterScroll).put("restorePosition",state.restorePosition).put("centerLock",state.centerLock).put("imageAppearance",state.imageAppearance).put("svgAppearance",state.svgAppearance).put("imageContrast",state.imageContrast).put("fullDocumentAccessibility",state.fullDocumentAccessibility).put("colors", tokens).put("zoom", state.zoom).put("motion", motion)
                 payload.put("readingLocation",model.readingLocation(note.uri))
                 payload.put("customStyle",themeStyle(themeDocument(state.customTheme),if(state.fullscreen)state.fullscreenTheme else state.theme,dark,state.patternKind,state.patternOpacity,state.patternSize,state.patternSpacing))
+                payload.put("font", readingFont)
                 web?.evaluateJavascript("document.documentElement.dataset.platform='android';window.supermdLoad?.($payload)", null)
                 readerNote[0] = note.id
                 readerContent[0] = note.content
@@ -1117,6 +1120,7 @@ private object NoMotionScheme : MotionScheme {
                             onFixLatex = { web?.evaluateJavascript("window.supermdRepairMath?.()", null) },
                             onRename = { renaming = true },
                             onSettings = { settingsSection = null; settings = true },
+                            compact = state.previewCompactToolbar && !wide && !state.fullscreen,
                         )
                         if(!state.fullscreen) NoteTabs(state.tabs, state.active.id, motion, model::select, model::close, model::reorder, model::newNote)
                         if(!state.fullscreen) StudioModeBar(
@@ -1333,6 +1337,7 @@ private object NoMotionScheme : MotionScheme {
     onFixLatex: () -> Unit,
     onRename: () -> Unit,
     onSettings: () -> Unit,
+    compact: Boolean = false,
 ) {
     val palette = MaterialTheme.colorScheme
     TopAppBar(
@@ -1350,9 +1355,9 @@ private object NoMotionScheme : MotionScheme {
             }
         },
         actions = {
-            StudyIcon("Find in note", R.drawable.symbol_search, enabled = readerReady, action = onFind)
+            if (!compact) StudyIcon("Find in note", R.drawable.symbol_search, enabled = readerReady, action = onFind)
             IconButton(onClick = onSave, modifier = Modifier.size(48.dp)) { Icon(painterResource(R.drawable.symbol_save), "Save note") }
-            IconButton(onClick = onExport, enabled = readerReady && !busy, modifier = Modifier.size(48.dp)) { Icon(painterResource(R.drawable.symbol_export), "Export") }
+            if (!compact) IconButton(onClick = onExport, enabled = readerReady && !busy, modifier = Modifier.size(48.dp)) { Icon(painterResource(R.drawable.symbol_export), "Export") }
             if (fullscreen || (wide && actualMode != "reader")) {
                 StudyIcon(if (fullscreen) "Exit fullscreen" else "Fullscreen study", if (fullscreen) R.drawable.symbol_fullscreen_exit else R.drawable.symbol_fullscreen, action = onToggleFullscreen)
                 StudyIcon(if (centerLock) "Centre locked · unlock horizontal movement" else "Lock document to centre", if (centerLock) R.drawable.symbol_lock else R.drawable.symbol_lock_open, action = onToggleCenterLock)
@@ -1360,6 +1365,10 @@ private object NoMotionScheme : MotionScheme {
             Box {
                 IconButton(onClick = { onMenuExpandedChange(true) }, modifier = Modifier.size(48.dp)) { Icon(Icons.Rounded.MoreVert, "More actions") }
                 DropdownMenu(expanded = menuExpanded, onDismissRequest = { onMenuExpandedChange(false) }) {
+                    if (compact) {
+                        DropdownMenuItem(text = { Text("Find in note") }, enabled = readerReady, onClick = { onMenuExpandedChange(false); onFind() }, leadingIcon = { Icon(painterResource(R.drawable.symbol_search), null) })
+                        DropdownMenuItem(text = { Text("Export") }, enabled = readerReady && !busy, onClick = { onMenuExpandedChange(false); onExport() }, leadingIcon = { Icon(painterResource(R.drawable.symbol_export), null) })
+                    }
                     DropdownMenuItem(text = { Text("New window") }, onClick = { onMenuExpandedChange(false); onNewWindow() }, leadingIcon = { Icon(painterResource(R.drawable.symbol_open_window), null) })
                     DropdownMenuItem(text = { Text("Share note") }, enabled = readerReady && !busy, onClick = { onMenuExpandedChange(false); onShare() }, leadingIcon = { Icon(painterResource(R.drawable.symbol_share), null) })
                     DropdownMenuItem(text = { Text("Insert image or link") }, onClick = { onMenuExpandedChange(false); onInsertMedia() }, leadingIcon = { Icon(painterResource(R.drawable.symbol_image), null) })
@@ -1567,6 +1576,14 @@ internal class NoteDestination(private val mime: String, private val preferred: 
                 if(state.customTheme.isBlank())Choice("Theme color",state.accent,listOf("system" to "System","blue" to "Blue","violet" to "Violet","rose" to "Rose","amber" to "Amber")){model.appearance(accent=it)}
                 else Text("Colors follow your imported theme. Reset it to use the built-in accent picker.",style=MaterialTheme.typography.bodySmall)
                 Row(verticalAlignment = Alignment.CenterVertically) { Column(Modifier.weight(1f)) { Text("Expressive motion", style = MaterialTheme.typography.titleMedium); Text("Spring transitions and responsive controls", style = MaterialTheme.typography.bodySmall) }; Switch(checked = state.motion, onCheckedChange = { model.appearance(motion = it) }) }
+                Row(verticalAlignment = Alignment.CenterVertically) {
+                    Text("Preview warm built-in colors", Modifier.weight(1f))
+                    Switch(state.previewWarmTheme, { model.previewPreference("previewWarmTheme", it) }, enabled = state.customTheme.isBlank() || state.previewWarmTheme)
+                }
+                Row(verticalAlignment = Alignment.CenterVertically) {
+                    Text("Preview compact phone toolbar", Modifier.weight(1f))
+                    Switch(state.previewCompactToolbar, { model.previewPreference("previewCompactToolbar", it) })
+                }
             }
             if (section == "Appearance") SettingsGroup("Custom theme") {
                 Text(themeDocument(state.customTheme)?.optString("name")?:"Built-in appearance",style=MaterialTheme.typography.titleMedium)
@@ -1600,6 +1617,10 @@ internal class NoteDestination(private val mime: String, private val preferred: 
                 Row(verticalAlignment=Alignment.CenterVertically){Text("Full document accessibility",Modifier.weight(1f));Switch(state.fullDocumentAccessibility,model::fullDocumentAccessibility)}
                 Text("Keeps the complete document in the semantic tree for assistive technology and browser Find. Large notes may use substantially more memory.",style=MaterialTheme.typography.bodySmall,color=MaterialTheme.colorScheme.onSurfaceVariant)
                 FontChoice("Reading font", if(state.font=="sans") "Manrope" else state.font, listOf("Manrope" to "Manrope", "roboto" to "Roboto", "noto" to "Noto Sans", "serif" to "Noto Serif", "mono" to "JetBrains Mono", "system" to "System")+state.customFonts.map {it to it}) { model.appearance(font = it) }
+                Row(verticalAlignment = Alignment.CenterVertically) {
+                    Text("Preview serif reading typography", Modifier.weight(1f))
+                    Switch(state.previewSerifReading, { model.previewPreference("previewSerifReading", it) })
+                }
                 FilledTonalButton(onClick=importFont){Text("Import font…")}
                 Text("Text size · ${state.size.toInt()} px", style = MaterialTheme.typography.titleSmall, modifier = Modifier.padding(top = 16.dp))
                 StudySlider(value = state.size, onCommit = { model.appearance(size = it) }, valueRange = 6f..32f)
@@ -1624,6 +1645,10 @@ internal class NoteDestination(private val mime: String, private val preferred: 
                 Row(verticalAlignment=Alignment.CenterVertically){Text("Autosave existing notes",Modifier.weight(1f));Switch(checked=state.autosave,onCheckedChange={model.reading(autosave=it)})}
                 Text("New note location",style=MaterialTheme.typography.titleSmall)
                 FilledTonalButton(onClick=chooseNoteLocation,modifier=Modifier.fillMaxWidth()){Icon(Icons.Rounded.FolderOpen,null);Text(if(noteLocation.isBlank())"Downloads" else android.net.Uri.decode(noteLocation.substringAfterLast('/')),Modifier.padding(start=8.dp),maxLines=1,overflow=TextOverflow.Ellipsis)}
+                Row(verticalAlignment = Alignment.CenterVertically) {
+                    Text("Try saving new notes in the open folder", Modifier.weight(1f))
+                    Switch(state.previewWorkspaceSave, { model.previewPreference("previewWorkspaceSave", it) })
+                }
             }
             if (section == "Writing & shortcuts") SettingsGroup("Writing") {
                 Row(verticalAlignment=Alignment.CenterVertically){Text("Typewriter scrolling",Modifier.weight(1f));Switch(checked=state.typewriterScroll,onCheckedChange=model::typewriterScroll)}

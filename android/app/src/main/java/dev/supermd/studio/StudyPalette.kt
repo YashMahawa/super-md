@@ -32,3 +32,15 @@ internal fun studyLightColors(base: ColorScheme): ColorScheme {
 internal fun accentColors(base:ColorScheme,name:String,dark:Boolean):ColorScheme {
     return if(name=="system") base else manualAccent(name,dark)
 }
+
+internal fun warmPreviewColors(dark: Boolean): ColorScheme {
+    val base = manualAccent("amber", dark)
+    val paper = if (dark) Color(0xff211916) else Color(0xfffcf2e5)
+    val low = if (dark) Color(0xff2b211c) else Color(0xfff5e8d7)
+    val high = if (dark) Color(0xff392b24) else Color(0xffeedbc5)
+    val text = if (dark) Color(0xfff6e7da) else Color(0xff37261b)
+    val muted = if (dark) Color(0xffd6bbab) else Color(0xff684e3e)
+    return base.copy(surface = paper, background = paper, surfaceContainerLow = low,
+        surfaceContainer = low, surfaceContainerHigh = high, surfaceContainerHighest = high,
+        onSurface = text, onBackground = text, onSurfaceVariant = muted)
+}

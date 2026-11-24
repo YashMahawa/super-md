@@ -106,7 +106,9 @@ class CompactChromeAndSheetsTest {
     @Test
     fun compactTopBarPromotesFindAndReclaimsAtLeast48DpForTitle() {
         var findClicks = 0
+        var exportClicks = 0
         var menuOpen by mutableStateOf(false)
+        var compact by mutableStateOf(false)
         val noteTitle = "Quantum Statistical Mechanics Lecture Notes.md"
 
         composeRule.setContent {
@@ -128,7 +130,7 @@ class CompactChromeAndSheetsTest {
                                 onNavigateIcon = {},
                                 onFind = { findClicks++ },
                                 onSave = {},
-                                onExport = {},
+                                onExport = { exportClicks++ },
                                 onToggleFullscreen = {},
                                 onToggleCenterLock = {},
                                 onNewWindow = {},
@@ -137,6 +139,7 @@ class CompactChromeAndSheetsTest {
                                 onFixLatex = {},
                                 onRename = {},
                                 onSettings = {},
+                                compact = compact,
                             )
                         }
                         // Prior 6-icon compact TopAppBar baseline for horizontal title width comparison
@@ -194,6 +197,17 @@ class CompactChromeAndSheetsTest {
         composeRule.onNodeWithContentDescription("More actions").performClick()
         composeRule.onNodeWithText("Settings").assertIsDisplayed()
         composeRule.onAllNodes(hasText("Find in note")).also { assertEquals(0, it.fetchSemanticsNodes().size) }
+
+        composeRule.runOnIdle { menuOpen = false; compact = true }
+        composeRule.onAllNodes(hasContentDescription("Find in note")).also { assertEquals(0, it.fetchSemanticsNodes().size) }
+        composeRule.onAllNodes(hasContentDescription("Export")).also { assertEquals(0, it.fetchSemanticsNodes().size) }
+        composeRule.onNodeWithContentDescription("Save note").assertIsDisplayed()
+        composeRule.onNodeWithContentDescription("More actions").performClick()
+        composeRule.onNodeWithText("Find in note").performClick()
+        assertEquals(2, findClicks)
+        composeRule.onNodeWithContentDescription("More actions").performClick()
+        composeRule.onNodeWithText("Export").performClick()
+        assertEquals(1, exportClicks)
     }
 
     @Test
