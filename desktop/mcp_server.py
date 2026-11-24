@@ -8,6 +8,7 @@ from __future__ import annotations
 import argparse
 import hmac
 import base64
+import inspect
 import json
 import os
 import re
@@ -201,11 +202,23 @@ def build_mcp_server(roots: list[str], live_client=None):
                 "next_offset": end if end < len(source) else None,
                 "truncated": end < len(source)}, ensure_ascii=False))]
 
+    live_unavailable_reason = (
+        "Live Agent Access is disabled or Super MD is not running. "
+        "Ask the user to open Super MD and enable Live Agent Access in Settings → AI agents."
+    )
+
+    def resolve_live_asset_path(raw_path: str) -> str:
+        if not isinstance(raw_path, str) or not 1 <= len(raw_path.strip()) <= 4096 or "\0" in raw_path:
+            raise AgentDocumentError("asset_path must be a non-empty file path")
+        if store.roots:
+            return str(store.resolve(raw_path))
+        return str(Path(raw_path).expanduser())
+
     @server.tool()
     def list_sessions() -> dict[str, Any]:
         """List currently open desktop tabs, including unsaved source and revision IDs."""
         if live_client is None:
-            return {"sessions": [], "count": 0, "available": False}
+            return {"sessions": [], "count": 0, "available": False, "reason": live_unavailable_reason}
         response = live_call("list_tabs")
         tabs = response.get("tabs", response.get("sessions", [])) if isinstance(response, dict) else response
         if not isinstance(tabs, list) or len(tabs) > 200:
@@ -226,8 +239,19 @@ def build_mcp_server(roots: list[str], live_client=None):
             if isinstance(tab.get("sourceLength"), int):
                 row["sourceLength"] = tab["sourceLength"]
             sessions.append(row)
-        return {"sessions": sessions[:32], "count": len(sessions), "truncated": len(sessions) > 32,
-                "available": True}
+        available = (response["available"]
+                     if isinstance(response, dict) and isinstance(response.get("available"), bool)
+                     else bool(sessions))
+        result: dict[str, Any] = {
+            "sessions": sessions[:32],
+            "count": len(sessions),
+            "truncated": len(sessions) > 32,
+            "available": available,
+        }
+        if not available:
+            reason = response.get("reason") if isinstance(response, dict) and isinstance(response.get("reason"), str) else ""
+            result["reason"] = reason[:500] if reason else live_unavailable_reason
+        return result
 
     @server.tool()
     def document_inspect(path: str) -> dict[str, Any]:
@@ -533,7 +557,7 @@ def build_mcp_server(roots: list[str], live_client=None):
             return bounded_result(result, 24_000)
         if action == "list_devices":
             if live_client is None:
-                return {"devices": [], "count": 0, "available": False}
+                return {"devices": [], "count": 0, "available": False, "reason": live_unavailable_reason}
             result = live_call("list_devices")
             if not isinstance(result, dict):
                 raise AgentDocumentError("Device list is unavailable")
@@ -588,14 +612,19 @@ def build_mcp_server(roots: list[str], live_client=None):
             if tab_id is not None:
                 if not asset_id and not asset_name:
                     raise AgentDocumentError("replace requires asset_id from document_assets")
-                resolved_asset_path = str(store.resolve(asset_path))
+                resolved_asset_path = resolve_live_asset_path(asset_path)
                 result = live_call("document_action", tab_id, "replace_tab_asset",
                                    asset_name=asset_id or asset_name, asset_path=resolved_asset_path,
                                    expected_revision=expected_revision)
                 if not isinstance(result, dict):
                     raise AgentDocumentError("Live bridge returned invalid asset replacement status")
                 status = {key: result[key] for key in
-                          ("asset", "assetId", "revision", "previous_revision", "saved", "changed") if key in result}
+                          ("asset", "assetName", "assetId", "revision", "previous_revision", "saved", "changed", "bytes", "mimeType")
+                          if key in result}
+                if "asset" not in status and "assetName" in result:
+                    status["asset"] = result["assetName"]
+                if "saved" not in status and "changed" in result:
+                    status["saved"] = bool(result["changed"])
                 status["target"] = path
                 return bounded_result(status)
             return store.replace_asset(path, asset_id or asset_name or "", asset_path,
@@ -636,7 +665,7 @@ def build_mcp_server(roots: list[str], live_client=None):
         """Embed one bounded image file in a portable SMD note."""
         tab_id = live_id(path)
         if tab_id is not None:
-            asset_path = str(store.resolve(asset_path))
+            asset_path = resolve_live_asset_path(asset_path)
             if not re.fullmatch(r"[0-9a-f]{64}", expected_revision):
                 raise AgentDocumentError("expected_revision must be the SHA-256 from the current tab")
             result = live_call("attach_tab", tab_id, asset_path=asset_path,
@@ -694,6 +723,376 @@ def build_mcp_server(roots: list[str], live_client=None):
                     if key in image}
         metadata["target"] = path
         return as_image_blocks(image.get("data"), image.get("mime_type", ""), metadata)
+
+    def _bounded_text(value: Any, limit: int) -> str | None:
+        return value[:limit] if isinstance(value, str) else None
+
+    def _safe_int(value: Any) -> int | None:
+        return value if isinstance(value, int) and not isinstance(value, bool) else None
+
+    def _normalize_reading_context(context: dict[str, Any]) -> dict[str, Any]:
+        source_length = _safe_int(context.get("sourceLength"))
+        visible_source = context.get("visibleSource")
+        if source_length is None or source_length < 0 or not isinstance(visible_source, dict):
+            return dict(context)
+        start = _safe_int(visible_source.get("start"))
+        end = _safe_int(visible_source.get("end"))
+        if start is None or end is None or start < 0 or end < start or end > source_length:
+            return dict(context)
+        updated = dict(context)
+        updated["visibleSource"] = {
+            **visible_source,
+            "total_chars": source_length,
+            "next_offset": end if end < source_length else None,
+            "truncated": end < source_length,
+        }
+        return updated
+
+    def _bounded_diagrams(value: Any) -> list[dict[str, Any]] | None:
+        if not isinstance(value, list):
+            return None
+        items: list[dict[str, Any]] = []
+        for raw in value[:30]:
+            if not isinstance(raw, dict):
+                continue
+            item: dict[str, Any] = {}
+            for key in ("id", "kind"):
+                text = _bounded_text(raw.get(key), 128)
+                if text is not None:
+                    item[key] = text
+            for key in ("sourceStart", "sourceEnd", "sourceChars"):
+                num = _safe_int(raw.get(key))
+                if num is not None:
+                    item[key] = num
+            preview = _bounded_text(raw.get("preview"), 160)
+            if preview is not None:
+                item["preview"] = preview
+            deck_title = _bounded_text(raw.get("deckTitle"), 200)
+            if deck_title is not None:
+                item["deckTitle"] = deck_title
+            step_label = _bounded_text(raw.get("stepLabel"), 200)
+            if step_label is not None:
+                item["stepLabel"] = step_label
+            step_index = _safe_int(raw.get("stepIndex"))
+            if step_index is not None and step_index >= 0:
+                item["stepIndex"] = step_index
+            step_count = _safe_int(raw.get("stepCount"))
+            if step_count is not None and step_count >= 1:
+                item["stepCount"] = step_count
+            if isinstance(raw.get("activeStep"), bool):
+                item["activeStep"] = raw["activeStep"]
+            asset_ref = _bounded_text(raw.get("assetReference"), 512)
+            if (asset_ref is not None and not asset_ref.lower().startswith("data:")
+                    and "base64," not in asset_ref.lower()):
+                item["assetReference"] = asset_ref
+            items.append(item)
+        return items
+
+    def _bounded_active_step(value: Any) -> dict[str, Any] | None:
+        if not isinstance(value, dict):
+            return None
+        deck_title = _bounded_text(value.get("deckTitle"), 200)
+        step_index = _safe_int(value.get("stepIndex"))
+        step_count = _safe_int(value.get("stepCount"))
+        if deck_title is None or step_index is None or step_index < 0 or step_count is None or step_count < 1:
+            return None
+        result: dict[str, Any] = {
+            "deckTitle": deck_title,
+            "stepIndex": step_index,
+            "stepCount": step_count,
+            "activeStep": value.get("activeStep") is not False,
+        }
+        step_label = _bounded_text(value.get("stepLabel"), 200)
+        if step_label is not None:
+            result["stepLabel"] = step_label
+        if isinstance(value.get("expanded"), bool):
+            result["expanded"] = value["expanded"]
+        return result
+
+    def _bounded_python_cells(value: Any) -> list[dict[str, Any]] | None:
+        if not isinstance(value, list):
+            return None
+        cells: list[dict[str, Any]] = []
+        for raw in value[:8]:
+            if not isinstance(raw, dict) or not isinstance(raw.get("ok"), bool):
+                continue
+            entry: dict[str, Any] = {"ok": raw["ok"]}
+            for key in ("ordinal", "sourceStart", "sourceEnd"):
+                num = _safe_int(raw.get(key))
+                if num is not None and num >= 0:
+                    entry[key] = num
+            stdout = _bounded_text(raw.get("stdout"), 500)
+            if stdout is not None:
+                entry["stdout"] = stdout
+            if raw.get("stdoutTruncated") is True or (isinstance(raw.get("stdout"), str) and len(raw["stdout"]) > 500):
+                entry["stdoutTruncated"] = True
+            stderr = _bounded_text(raw.get("stderr"), 500)
+            if stderr is not None:
+                entry["stderr"] = stderr
+            if raw.get("stderrTruncated") is True or (isinstance(raw.get("stderr"), str) and len(raw["stderr"]) > 500):
+                entry["stderrTruncated"] = True
+            if isinstance(raw.get("figureIds"), list):
+                entry["figureIds"] = [
+                    fid for fid in raw["figureIds"]
+                    if isinstance(fid, str) and fid.startswith("diagram:python:") and len(fid) <= 128
+                ][:16]
+            cells.append(entry)
+        return cells or None
+
+    def _viewport_contexts(image: dict[str, Any], tab_id: str,
+                           expected_revision: str) -> tuple[dict[str, Any], dict[str, Any] | None]:
+        nested = image.get("context") if isinstance(image.get("context"), dict) else None
+        metadata = image.get("metadata") if isinstance(image.get("metadata"), dict) else None
+        source = nested if nested is not None else image
+        raw_tab_id = source.get("tabId") if isinstance(source.get("tabId"), str) and source.get("tabId") else (
+            metadata.get("tabId") if metadata and isinstance(metadata.get("tabId"), str) else None
+        )
+        source_revision = source.get("revision")
+        revision_matches = not isinstance(source_revision, str) or source_revision == expected_revision
+        capture_ctx: dict[str, Any] = {
+            "tabId": tab_id,
+            "revision": expected_revision,
+            "contextRevisionMatches": revision_matches,
+        }
+        if raw_tab_id and raw_tab_id != tab_id:
+            capture_ctx["nativeTabId"] = raw_tab_id
+        if isinstance(source_revision, str) and source_revision != expected_revision:
+            capture_ctx["contextRevision"] = source_revision
+        mode = _bounded_text(source.get("mode", metadata.get("mode") if metadata else None), 64)
+        if mode is not None:
+            capture_ctx["mode"] = mode
+        zoom = source.get("zoom", metadata.get("zoom") if metadata else None)
+        if isinstance(zoom, (int, float)) and not isinstance(zoom, bool):
+            capture_ctx["zoom"] = zoom
+        raw_reading = source.get("reading", metadata.get("reading") if metadata else None)
+        if isinstance(raw_reading, dict):
+            reading: dict[str, Any] = {}
+            for key in ("offset", "scrollFraction"):
+                val = raw_reading.get(key)
+                if isinstance(val, (int, float)) and not isinstance(val, bool):
+                    reading[key] = val
+            heading = _bounded_text(raw_reading.get("heading"), 300)
+            if heading is not None:
+                reading["heading"] = heading
+            vis_text = _bounded_text(raw_reading.get("visibleText"), 2000)
+            if vis_text is not None:
+                reading["visibleText"] = vis_text
+            capture_ctx["reading"] = reading
+        raw_selection = source.get("selection", metadata.get("selection") if metadata else None)
+        if isinstance(raw_selection, dict):
+            sel_text = _bounded_text(raw_selection.get("text"), 2000)
+            capture_ctx["selection"] = {} if sel_text is None else {"text": sel_text}
+        raw_viewport = source.get("viewport", metadata.get("viewport") if metadata else None)
+        if isinstance(raw_viewport, dict):
+            vp = {
+                key: raw_viewport[key]
+                for key in ("x", "y", "width", "height", "viewportWidth", "viewportHeight", "devicePixelRatio")
+                if isinstance(raw_viewport.get(key), (int, float)) and not isinstance(raw_viewport.get(key), bool)
+            }
+            capture_ctx["viewport"] = vp
+        active_step = _bounded_active_step(source.get("activeStep", metadata.get("activeStep") if metadata else None))
+        if active_step is not None:
+            capture_ctx["activeStep"] = active_step
+        source_length = _safe_int(source.get("sourceLength"))
+        normalized_src = source.get("visibleSource")
+        if source_length is not None and source_length >= 0 and isinstance(normalized_src, dict):
+            normalized_src = _normalize_reading_context({"sourceLength": source_length, "visibleSource": normalized_src}).get("visibleSource")
+        visible_source: dict[str, Any] | None = None
+        preview_truncated = False
+        if isinstance(normalized_src, dict) and isinstance(normalized_src.get("text"), str):
+            text_chars = normalized_src["text"]
+            returned_text = text_chars[:12_000]
+            preview_truncated = len(text_chars) > len(returned_text)
+            visible_source = {"text": returned_text}
+            source_range: dict[str, Any] = {}
+            if preview_truncated:
+                visible_source["previewTruncated"] = True
+                source_range["previewTruncated"] = True
+            start = _safe_int(normalized_src.get("start"))
+            for key in ("start", "end", "total_chars", "next_offset", "truncated", "view"):
+                alt = normalized_src.get("totalChars") if key == "total_chars" else (
+                    normalized_src.get("nextOffset") if key == "next_offset" else None
+                )
+                field = normalized_src[key] if key in normalized_src else alt
+                if key in ("end", "next_offset") and preview_truncated:
+                    if start is not None:
+                        visible_source[key] = start + len(returned_text)
+                        source_range[key] = start + len(returned_text)
+                elif key == "truncated" and preview_truncated:
+                    visible_source[key] = True
+                    source_range[key] = True
+                elif (_safe_int(field) is not None or isinstance(field, bool)
+                        or (key == "next_offset" and field is None)
+                        or (key == "view" and isinstance(field, str))):
+                    visible_source[key] = field
+                    source_range[key] = field
+            if source_range:
+                capture_ctx["sourceRange"] = source_range
+        diagrams = _bounded_diagrams(source.get("diagrams"))
+        python_cells = _bounded_python_cells(source.get("pythonCells"))
+        coherent = (revision_matches and visible_source is not None and not preview_truncated
+                    and isinstance(source_revision, str) and source_revision == expected_revision)
+        captured_reading: dict[str, Any] | None = None
+        if coherent and visible_source is not None:
+            captured_reading = {**capture_ctx, "visibleSource": visible_source}
+            if source_length is not None and source_length >= 0:
+                captured_reading["sourceLength"] = source_length
+            if diagrams is not None:
+                captured_reading["diagrams"] = diagrams
+            if python_cells is not None:
+                captured_reading["pythonCells"] = python_cells
+        return capture_ctx, captured_reading
+
+    @server.tool()
+    def view_current(path: str | None = None, tabId: str | None = None,
+                     deviceId: str | None = None, width: int | None = None,
+                     quality: str = "standard", includeImage: bool = True,
+                     include_image: bool | None = None) -> list[Any]:
+        """Use FIRST for the current Super MD page or highlighted text. Returns readingContext JSON and an optional viewport image."""
+        if quality not in ("standard", "high"):
+            raise AgentDocumentError("quality must be 'standard' or 'high'")
+        want_image = includeImage if include_image is None else include_image
+        if not isinstance(want_image, bool):
+            raise AgentDocumentError("includeImage must be a boolean")
+        if width is not None and (not isinstance(width, int) or isinstance(width, bool) or not 64 <= width <= 1600):
+            raise AgentDocumentError("width must be between 64 and 1,600 pixels")
+        if deviceId is not None:
+            if not isinstance(deviceId, str) or not deviceId or len(deviceId) > 128:
+                raise AgentDocumentError("deviceId must be a valid device identifier")
+            if deviceId != "local":
+                raise AgentDocumentError("Local MCP server only serves deviceId 'local'")
+
+        requested = path if path is not None else tabId
+        if requested is not None:
+            if not isinstance(requested, str) or not requested.strip() or len(requested) > 512:
+                raise AgentDocumentError("view_current requires a valid open tab target")
+            resolved_tab = live_id(requested) if requested.startswith("tab:") else requested
+            if not resolved_tab:
+                raise AgentDocumentError("view_current requires an open desktop tab target")
+            target = requested if requested.startswith("tab:") else f"tab:{resolved_tab}"
+        else:
+            listed = live_call("list_tabs")
+            raw_tabs = listed.get("tabs", listed.get("sessions", [])) if isinstance(listed, dict) else listed
+            if not isinstance(raw_tabs, list):
+                raise AgentDocumentError("Live bridge returned an invalid tab list")
+            valid_tabs = [t for t in raw_tabs if isinstance(t, dict) and isinstance(t.get("id"), str) and t["id"]]
+            active_tabs = [t for t in valid_tabs if t.get("active") is True]
+            chosen = (active_tabs[0] if len(active_tabs) == 1
+                      else valid_tabs[0] if len(active_tabs) == 0 and len(valid_tabs) == 1
+                      else None)
+            if chosen is None:
+                if len(active_tabs) > 1 or len(valid_tabs) > 1:
+                    raise AgentDocumentError(
+                        "Could not choose a tab safely: provide path or tabId when multiple tabs are open or active")
+                raise AgentDocumentError("No open tab was returned by the desktop app")
+            resolved_tab = str(chosen["id"])[:300]
+            target = f"tab:{resolved_tab}"
+
+        raw_context = live_call("document_action", resolved_tab, "get_context", limit=4000)
+        if not isinstance(raw_context, dict):
+            raise AgentDocumentError("Live bridge returned invalid reading context")
+        revision = raw_context.get("revision")
+        if not isinstance(revision, str) or not re.fullmatch(r"[0-9a-f]{64}", revision):
+            raise AgentDocumentError("The app returned invalid reading context for the selected tab")
+        normalized = _normalize_reading_context(raw_context)
+        if "diagrams" in normalized:
+            bounded_diags = _bounded_diagrams(normalized.get("diagrams"))
+            if bounded_diags is not None:
+                normalized["diagrams"] = bounded_diags
+        if "activeStep" in normalized:
+            bounded_step = _bounded_active_step(normalized.get("activeStep"))
+            if bounded_step is not None:
+                normalized["activeStep"] = bounded_step
+            else:
+                normalized.pop("activeStep", None)
+        if "pythonCells" in normalized:
+            bounded_cells = _bounded_python_cells(normalized.get("pythonCells"))
+            if bounded_cells is not None:
+                normalized["pythonCells"] = bounded_cells
+            else:
+                normalized.pop("pythonCells", None)
+        raw_ctx_tab = normalized.get("tabId")
+        reading_context = dict(normalized)
+        if isinstance(raw_ctx_tab, str) and raw_ctx_tab and raw_ctx_tab != resolved_tab:
+            reading_context["nativeTabId"] = raw_ctx_tab
+        reading_context["tabId"] = resolved_tab
+        reading_context["target"] = target
+
+        image_block = None
+        preview_info: dict[str, Any] | None = None
+        capture_context: dict[str, Any] | None = None
+        final_reading_context = reading_context
+        reading_context_source = "context_read"
+        aligned: bool | None = None
+
+        if want_image:
+            edge = width if width is not None else (1600 if quality == "high" else 1000)
+            desired_format = "png" if quality == "high" else "jpeg"
+            render_cb = getattr(live_client, "render_tab", None)
+            supports_format = False
+            if callable(render_cb):
+                try:
+                    params = inspect.signature(render_cb).parameters
+                    supports_format = "image_format" in params or any(
+                        p.kind == inspect.Parameter.VAR_KEYWORD for p in params.values()
+                    )
+                except (TypeError, ValueError):
+                    supports_format = False
+            if supports_format:
+                image = live_call("render_tab", resolved_tab, width=edge, image_format=desired_format)
+            else:
+                image = live_call("render_tab", resolved_tab, width=edge)
+            if not isinstance(image, dict):
+                raise AgentDocumentError("Live renderer returned invalid image data")
+            if image.get("revision") != revision:
+                raise RevisionConflict(
+                    "The reading tab changed while its viewport was being captured; request the current view again")
+            rendered_width, rendered_height = image.get("width"), image.get("height")
+            if (not isinstance(rendered_width, int) or isinstance(rendered_width, bool)
+                    or not isinstance(rendered_height, int) or isinstance(rendered_height, bool)
+                    or not 1 <= rendered_width <= edge or not 1 <= rendered_height <= 8192):
+                raise AgentDocumentError("Live renderer returned dimensions outside the requested viewport bounds")
+            mime_type = image.get("mime_type", "")
+            raw_bytes = image.get("data")
+            verified_blocks = as_image_blocks(raw_bytes, mime_type, {"revision": revision})
+            image_block = next(block for block in verified_blocks if isinstance(block, ImageContent))
+            preview_info = {
+                "mimeType": mime_type,
+                "byteLength": len(raw_bytes),
+                "width": rendered_width,
+                "height": rendered_height,
+                "previewOnly": mime_type == "image/jpeg",
+            }
+            capture_context, captured_reading = _viewport_contexts(image, resolved_tab, revision)
+            if captured_reading is not None:
+                final_reading_context = {**captured_reading, "target": target}
+                reading_context_source = "viewport_capture"
+                aligned = True
+            else:
+                init_offset = reading_context.get("reading", {}).get("offset") if isinstance(reading_context.get("reading"), dict) else None
+                cap_offset = capture_context.get("reading", {}).get("offset") if isinstance(capture_context.get("reading"), dict) else None
+                if isinstance(init_offset, (int, float)) and isinstance(cap_offset, (int, float)):
+                    aligned = capture_context.get("contextRevisionMatches") is True and init_offset == cap_offset
+
+        payload: dict[str, Any] = {
+            "deviceId": "local",
+            "target": target,
+            "tabId": resolved_tab,
+            "revision": revision,
+            "quality": quality,
+            "readingContext": final_reading_context,
+            "readingContextSource": reading_context_source,
+        }
+        if aligned is not None:
+            payload["readingContextAlignedWithCapture"] = aligned
+        if capture_context is not None:
+            payload["captureContext"] = capture_context
+        if preview_info is not None:
+            payload["imagePreview"] = preview_info
+        text = json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
+        if len(text.encode("utf-8")) > 48 * 1024:
+            raise AgentDocumentError("The current reading context exceeds the bounded response size")
+        return ([image_block] if image_block is not None else []) + [TextContent(type="text", text=text)]
 
     return server, store
 

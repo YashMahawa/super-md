@@ -268,6 +268,7 @@ class LiveCLISubprocessTests(unittest.TestCase):
 
         self.bridge.stop()
         session=Session(True)
+        session.settings["python"]=sys.executable
         session.settings["newNoteLocation"]=str(self.temp)
         studio=Studio(True,session)
         note_path=self.temp/"Attached note.smd"

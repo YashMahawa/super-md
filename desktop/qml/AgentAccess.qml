@@ -22,7 +22,7 @@ ColumnLayout {
     }
     Switch {
         objectName: "liveAgentAccessSwitch"
-        text: "Allow access to open tabs for this app session"
+        text: "Allow local AI agent access to open tabs"
         checked: panel.hostStudio.agentAccessEnabled
         onToggled: panel.hostStudio.setAgentAccessEnabled(checked)
     }
@@ -43,7 +43,7 @@ ColumnLayout {
         Layout.fillWidth: true
         wrapMode: Text.WordWrap
         color: panel.viewState.colors.muted
-        text: "Off by default. When enabled, a temporary bearer token is stored in a private app-session file and a server listens only on this computer's loopback interface. Disabling access revokes the token and closes the bridge."
+        text: "Off by default. When enabled, Super MD restores local access on launch with a fresh temporary bearer token in a private directory and listens only on this computer's loopback interface. Turning access off or closing Super MD revokes the token and closes the bridge."
     }
     ActionButton {
         objectName: "copyLiveAgentSetup"
@@ -60,6 +60,13 @@ ColumnLayout {
         tonal: true
         enabled: panel.hostStudio.agentAccessEnabled
         onClicked: setupGuideDialog.open()
+    }
+    ActionButton {
+        objectName: "exportAgentSkill"
+        text: "Export skill package (.zip)…"
+        glyph: "DownloadSimple"
+        tonal: true
+        onClicked: skillArchiveDialog.open()
     }
     Label {
         Layout.fillWidth: true
@@ -140,5 +147,14 @@ ColumnLayout {
         nameFilters: ["Markdown guide (*.md)"]
         defaultSuffix: "md"
         onAccepted: panel.hostStudio.saveAgentSetupInstructions(selectedFile)
+    }
+    FileDialog {
+        id: skillArchiveDialog
+        objectName: "exportAgentSkillDialog"
+        fileMode: FileDialog.SaveFile
+        title: "Export Super MD skill package"
+        nameFilters: ["ZIP archive (*.zip)"]
+        defaultSuffix: "zip"
+        onAccepted: panel.hostStudio.exportAgentSkill(selectedFile)
     }
 }

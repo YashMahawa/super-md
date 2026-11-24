@@ -182,14 +182,6 @@ internal fun LazyListScope.folderFileItems(
 
         Box(Modifier.fillMaxWidth()) {
             ListItem(
-                headlineContent = {
-                    Text(
-                        text = entry.name,
-                        maxLines = 1,
-                        overflow = TextOverflow.Ellipsis,
-                        fontWeight = if (isActive) FontWeight.SemiBold else FontWeight.Normal,
-                    )
-                },
                 leadingContent = {
                     Icon(
                         imageVector = if (entry.directory) Icons.Rounded.Folder else Icons.Rounded.Description,
@@ -231,7 +223,14 @@ internal fun LazyListScope.folderFileItems(
                             menuExpanded = true
                         },
                     ),
-            )
+            ) {
+                Text(
+                    text = entry.name,
+                    maxLines = 1,
+                    overflow = TextOverflow.Ellipsis,
+                    fontWeight = if (isActive) FontWeight.SemiBold else FontWeight.Normal,
+                )
+            }
 
             DropdownMenu(
                 expanded = menuExpanded,

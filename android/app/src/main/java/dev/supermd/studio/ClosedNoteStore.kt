@@ -73,6 +73,7 @@ internal class ClosedNoteStore(
                     writeString(out, note.id); writeString(out, note.name); writeNullable(out, note.uri)
                     writeString(out, note.content); writeString(out, note.saved)
                     writeNullable(out, note.relative); writeNullable(out, note.assetDirectory)
+                    if (note.assetsDirty) out.writeBoolean(true)
                     out.flush(); raw.fd.sync()
                 }
             }
@@ -86,10 +87,14 @@ internal class ClosedNoteStore(
         require(file.isFile) { "The closed-note snapshot is unavailable" }
         return DataInputStream(BufferedInputStream(FileInputStream(file))).use { input ->
             require(input.readInt() == SNAPSHOT_MAGIC && input.readInt() == VERSION) { "Invalid closed-note snapshot" }
+            val id = readString(input); val name = readString(input); val uri = readNullable(input)
+            val content = readString(input); val saved = readString(input)
+            val relative = readNullable(input); val assetDirectory = readNullable(input)
+            val assetsDirty = try { input.readBoolean() } catch (_: java.io.EOFException) { false }
             val note = Note(
-                id = readString(input), name = readString(input), uri = readNullable(input),
-                content = readString(input), saved = readString(input),
-                relative = readNullable(input), assetDirectory = readNullable(input),
+                id = id, name = name, uri = uri,
+                content = content, saved = saved,
+                relative = relative, assetDirectory = assetDirectory, assetsDirty = assetsDirty,
             )
             require(note.id == reference.id) { "Closed-note snapshot identity mismatch" }
             note

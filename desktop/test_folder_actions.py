@@ -77,12 +77,15 @@ class FolderActionsDesktopTest(unittest.TestCase):
             os.environ["XDG_DATA_HOME"] = self._prev_xdg
         if sys.platform in ("darwin", "win32"):
             for trashed in trashed_paths:
-                trashed_p = Path(trashed)
-                if trashed_p.exists() and not same_path(trashed_p, Path.home()):
-                    if trashed_p.is_dir():
-                        shutil.rmtree(trashed_p, ignore_errors=True)
-                    else:
-                        trashed_p.unlink(missing_ok=True)
+                try:
+                    trashed_p = Path(trashed)
+                    if trashed_p.exists() and not same_path(trashed_p, Path.home()):
+                        if trashed_p.is_dir():
+                            shutil.rmtree(trashed_p, ignore_errors=True)
+                        else:
+                            trashed_p.unlink(missing_ok=True)
+                except OSError:
+                    pass
         shutil.rmtree(self.temp_dir, ignore_errors=True)
         shutil.rmtree(self.session.data, ignore_errors=True)
 
@@ -290,7 +293,7 @@ class FolderActionsDesktopTest(unittest.TestCase):
     def test_move_blocks_self_descendant_and_handles_linked_local_images(self):
         assets_dir = self.open_root / "assets"
         assets_dir.mkdir()
-        img = QImage(4, 4, QImage.Format_ARGB32)
+        img = QImage(4, 4, QImage.Format.Format_ARGB32)
         img.fill(QColor("#22aa66"))
         chart_png = assets_dir / "chart.png"
         self.assertTrue(img.save(str(chart_png), "PNG"))
@@ -410,30 +413,50 @@ class FolderActionsDesktopTest(unittest.TestCase):
         elif sys.platform == "darwin":
             self.assertTrue(bool(self.studio._last_trashed_path))
             trashed_dest = Path(self.studio._last_trashed_path)
-            self.assertTrue(trashed_dest.exists())
-            self.assertFalse(normalize_path_key(trashed_dest).startswith(normalize_path_key(self.open_root) + "/"))
+            trashed_key = normalize_path_key(trashed_dest)
+            self.assertTrue(
+                any(seg in trashed_key for seg in ("/.trash/", "/.trashes/")),
+                f"Expected macOS Trash destination, got: {trashed_dest}",
+            )
+            self.assertFalse(trashed_key.startswith(normalize_path_key(self.open_root) + "/"))
+            try:
+                trashed_exists = trashed_dest.exists()
+            except PermissionError:
+                # macOS TCC restricts stat() inside ~/.Trash without Full Disk Access,
+                # confirming resultingItemURL points inside the system Trash folder.
+                trashed_exists = True
+            self.assertTrue(trashed_exists)
         elif os.name == "nt":
             import ctypes
             import ctypes.wintypes
 
             class _SHQUERYRBINFO(ctypes.Structure):
-                _pack_ = 1 if ctypes.sizeof(ctypes.c_void_p) == 4 else 8
+                if ctypes.sizeof(ctypes.c_void_p) == 4:
+                    _pack_ = 1
                 _fields_ = [
                     ("cbSize", ctypes.wintypes.DWORD),
                     ("i64Size", ctypes.c_int64),
                     ("i64NumItems", ctypes.c_int64),
                 ]
 
+            sh_query_rb = ctypes.windll.shell32.SHQueryRecycleBinW
+            sh_query_rb.argtypes = [ctypes.wintypes.LPCWSTR, ctypes.POINTER(_SHQUERYRBINFO)]
+            sh_query_rb.restype = ctypes.c_long
             rb_info = _SHQUERYRBINFO(cbSize=ctypes.sizeof(_SHQUERYRBINFO))
-            hr = ctypes.windll.shell32.SHQueryRecycleBinW(str(self.open_root), ctypes.byref(rb_info))
+            drive_root = self.open_root.anchor or str(self.open_root)
+            hr = sh_query_rb(drive_root, ctypes.byref(rb_info))
             self.assertEqual(hr, 0)
             self.assertGreaterEqual(rb_info.i64NumItems, 1)
             if self.studio._last_trashed_path:
                 trashed_dest = Path(self.studio._last_trashed_path)
-                self.assertTrue(trashed_dest.exists())
                 self.assertFalse(
                     normalize_path_key(trashed_dest).startswith(normalize_path_key(self.open_root) + "/")
                 )
+                try:
+                    trashed_exists = trashed_dest.exists()
+                except PermissionError:
+                    trashed_exists = True
+                self.assertTrue(trashed_exists)
         else:
             self.assertTrue(bool(self.studio._last_trashed_path))
             trashed_dest = Path(self.studio._last_trashed_path)

@@ -1,5 +1,6 @@
 /** Original media stays out of DOM attributes, and is released when unmounted. */
 import {invoke} from './nativeBridge';
+import {hasSelectedText} from './copySource';
 import {svgImage} from './svgImage';
 import {adaptSvg} from './svgTheme';
 export type ExportableMedia={label:string;svg?:()=>string|Promise<string>;uri?:()=>string;source?:{text:string;extension:'mmd'}};
@@ -93,18 +94,19 @@ export function installMediaMenu():()=>void {
     let menu:HTMLDivElement|undefined,timer:number|undefined,origin:{x:number;y:number}|undefined;
     const close=()=>{menu?.remove();menu=undefined;};
     const open=(x:number,y:number)=>{
-      const hit=document.elementFromPoint(x,y);
+      if(hasSelectedText())return false;
+      const hit=typeof document.elementFromPoint==='function'?document.elementFromPoint(x,y):null;
       const media=mediaAt(hit),editable=editableNoteImageAt(hit);
       if(!media&&!editable)return false;
       close();const panel=document.createElement('div');menu=panel;panel.className='media-save-menu';panel.setAttribute('role','menu');panel.setAttribute('aria-label','Save image or diagram');
       const title=document.createElement('div');title.className='media-save-title';title.textContent='Image';panel.append(title);
       if(media){
         const copy=document.createElement('button');copy.type='button';copy.textContent='Copy image';copy.setAttribute('role','menuitem');
-        copy.onclick=()=>{panel.querySelectorAll('button').forEach(item=>item.disabled=true);void copyMedia(media).then(()=>{title.textContent='Image copied';window.setTimeout(close,1200);},error=>{title.textContent=String(error instanceof Error?error.message:error);panel.querySelectorAll('button').forEach(item=>item.disabled=false);});};panel.append(copy);
+        copy.onclick=()=>{panel.querySelectorAll('button').forEach(item=>item.disabled=true);void copyMedia(media).then(()=>{title.textContent='Image copied';window.setTimeout(()=>{if(menu===panel)close();},1200);},error=>{title.textContent=String(error instanceof Error?error.message:error);panel.querySelectorAll('button').forEach(item=>item.disabled=false);});};panel.append(copy);
         const options:Array<['png'|'svg'|'original'|'source',string]>=[['png','Save as PNG']];
         if(media.svg)options.push(['svg','Save as SVG']);else options.push(['original','Save original image']);
         if(media.source)options.push(['source','Save Mermaid source']);
-        for(const [format,label] of options){const button=document.createElement('button');button.type='button';button.textContent=label;button.setAttribute('role','menuitem');button.onclick=()=>{panel.querySelectorAll('button').forEach(item=>item.disabled=true);void saveMedia(media,format).then(result=>{title.textContent=`Saved ${result.filename}`;window.setTimeout(close,1800);},error=>{title.textContent=String(error instanceof Error?error.message:error);panel.querySelectorAll('button').forEach(item=>item.disabled=false);});};panel.append(button);}
+        for(const [format,label] of options){const button=document.createElement('button');button.type='button';button.textContent=label;button.setAttribute('role','menuitem');button.onclick=()=>{panel.querySelectorAll('button').forEach(item=>item.disabled=true);void saveMedia(media,format).then(result=>{title.textContent=`Saved ${result.filename}`;window.setTimeout(()=>{if(menu===panel)close();},1800);},error=>{title.textContent=String(error instanceof Error?error.message:error);panel.querySelectorAll('button').forEach(item=>item.disabled=false);});};panel.append(button);}
       }
       if(editable){
         for(const [action,label] of [['replace','Replace image'],['remove','Remove image']] as const){
@@ -120,7 +122,7 @@ export function installMediaMenu():()=>void {
     const outside=(event:Event)=>{if(menu&&!menu.contains(event.target as Node))close();};
     const key=(event:KeyboardEvent)=>{if(menu&&event.key==='Escape'){event.preventDefault();event.stopImmediatePropagation();close();}};
     const cancel=()=>{if(timer!==undefined)clearTimeout(timer);timer=undefined;origin=undefined;};
-    const down=(event:PointerEvent)=>{outside(event);const target=event.target instanceof Element?event.target:null;if(event.pointerType!=='touch'||(!mediaAt(target)&&!editableNoteImageAt(target)))return;origin={x:event.clientX,y:event.clientY};timer=window.setTimeout(()=>{timer=undefined;if(origin)open(origin.x,origin.y);},550);};
+    const down=(event:PointerEvent)=>{outside(event);const target=event.target instanceof Element?event.target:null;if(event.pointerType!=='touch'||hasSelectedText()||(!mediaAt(target)&&!editableNoteImageAt(target)))return;origin={x:event.clientX,y:event.clientY};timer=window.setTimeout(()=>{timer=undefined;if(origin)open(origin.x,origin.y);},550);};
     const move=(event:PointerEvent)=>{if(origin&&Math.hypot(event.clientX-origin.x,event.clientY-origin.y)>12)cancel();};
     const click=(event:MouseEvent)=>{if(menu&&!menu.contains(event.target as Node)){event.preventDefault();event.stopPropagation();}};
     document.addEventListener('contextmenu',context,true);document.addEventListener('pointerdown',down,true);document.addEventListener('pointermove',move,true);document.addEventListener('pointerup',cancel,true);document.addEventListener('pointercancel',cancel,true);document.addEventListener('keydown',key,true);document.addEventListener('click',click,true);

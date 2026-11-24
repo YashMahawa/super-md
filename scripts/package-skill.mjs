@@ -4,7 +4,10 @@ import {fileURLToPath} from 'node:url';
 const root=fileURLToPath(new URL('../',import.meta.url));
 const source=path.join(root,'docs/skills/super-md');
 const destination=path.join(root,'dist');mkdirSync(destination,{recursive:true});
-cpSync(source,path.join(destination,'super-md-skill'),{recursive:true});
+cpSync(source,path.join(destination,'super-md-skill'),{
+ recursive:true,
+ filter:(item)=>{const base=path.basename(item);return base!=='local-preferences.md'&&!base.startsWith('.');}
+});
 const entries=[];
 function walk(dir,prefix='super-md'){
  for(const entry of readdirSync(dir,{withFileTypes:true}).sort((a,b)=>a.name.localeCompare(b.name))){

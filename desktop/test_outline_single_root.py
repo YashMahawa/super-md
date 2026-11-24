@@ -51,7 +51,7 @@ Item {
 
     def rows(self):
         self.app.processEvents()
-        return QMetaObject.invokeMethod(self.window, "readRows", Qt.DirectConnection, Q_RETURN_ARG("QVariant")).toVariant()
+        return QMetaObject.invokeMethod(self.window, "readRows", Qt.ConnectionType.DirectConnection, Q_RETURN_ARG("QVariant")).toVariant()
 
     def test_single_root_at_non_one_level_exposes_children_without_expanding_nested_sections(self):
         self.window.setProperty("headings", [
@@ -103,7 +103,7 @@ Item {
             {"id": f"child-{i}", "title": "Child", "level": 2, "offset": i*20+10})])
         self.rows()
         self.window.setProperty("scrollPosition", 700.0)
-        QMetaObject.invokeMethod(self.window, "toggleHeading", Qt.DirectConnection, Q_ARG("QVariant", "section-16"))
+        QMetaObject.invokeMethod(self.window, "toggleHeading", Qt.ConnectionType.DirectConnection, Q_ARG("QVariant", "section-16"))
         self.app.processEvents()
         self.assertAlmostEqual(self.window.property("scrollPosition"), 700.0)
         self.window.setProperty("currentNote", "another")

@@ -36,6 +36,9 @@ class AgentRelayMediaIntegrationTest {
         val initialAssets = JSONObject().put("assets/original.svg", media.portableImageData("image/svg+xml", originalSvg))
         noteFile.outputStream().use { media.writeFmd(it, originalMarkdown, initialAssets) }
         val uri = Uri.fromFile(noteFile)
+        val prefs = app.getSharedPreferences("studio", 0)
+        val oldWelcomed = prefs.getBoolean("welcomed", false)
+        prefs.edit().putBoolean("welcomed", true).commit()
         val launch = Intent(app, MainActivity::class.java).putExtra("workspace", workspace)
             .setDataAndType(uri, "application/octet-stream")
             .addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION or Intent.FLAG_GRANT_WRITE_URI_PERMISSION)
@@ -174,6 +177,7 @@ class AgentRelayMediaIntegrationTest {
             originalAutosave?.let { autosave -> runCatching { tryOnActivity(workspace) { model?.reading(autosave = autosave) } } }
             runCatching { tryOnActivity(workspace) { model?.state?.value?.tabs?.mapNotNull { it.assetDirectory }?.let(assetDirectories::addAll) } }
             scenario.close()
+            if (oldWelcomed) prefs.edit().putBoolean("welcomed", true).commit() else prefs.edit().remove("welcomed").commit()
             assetDirectories.forEach { File(app.filesDir, "portable-assets/$it").deleteRecursively() }
             noteFile.delete()
             File(app.filesDir, "workspaces/$workspace.json").delete()

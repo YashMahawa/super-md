@@ -1,11 +1,69 @@
 """Bounded theme data, validated by the same engine as Android."""
 import json
 import copy
+import re
 import subprocess
+from pathlib import Path
 from material_color_utilities import get_contrast_ratio
 MAX_THEME = 2 * 1024 * 1024
 
+BUNDLED_PRESETS = (
+    ("apricot-glow", "Apricot glow"),
+    ("avengers-assembly", "Avengers Assembly"),
+    ("avengers-ink", "Avengers Ink"),
+    ("blueprint", "Blueprint"),
+    ("catnap-paws", "Catnap paws"),
+    ("copper-grid", "Copper grid"),
+    ("doctor-doom", "Doctor Doom"),
+    ("gotham-midnight", "Gotham Midnight"),
+    ("ink-dots", "Ink dots"),
+    ("iron-man-reactor", "Iron Man Reactor"),
+    ("lazy-sunday-cats", "Lazy Sunday cats"),
+    ("midnight-paws", "Midnight paws"),
+    ("plum-linen", "Plum linen"),
+    ("rose-paper", "Rose paper"),
+    ("spider-city", "Spider City"),
+    ("study-desk", "Study desk"),
+)
+_PRESET_ID_RE = re.compile(r"^[a-z0-9-]+$")
+
 TEMPLATE = {"format":"supermd-theme","version":1,"name":"My theme","accent":"violet","variants":{"light":{"colors":{},"background":{"pattern":"dots","color":"#7255a5","opacity":0.05,"spacing":24,"angle":0}},"dark":{"colors":{},"background":{"pattern":"dots","color":"#d4bbfc","opacity":0.04,"spacing":24,"angle":0}}},"metrics":{"controlRadius":22,"contentRadius":16,"paragraphSpacing":1.2,"codePadding":18,"headingWeight":700,"headingTracking":-0.02,"textTracking":0,"tableBorderWidth":1}}
+
+def bundled_themes_dir(root=None):
+    base = Path(root) if root else Path(__file__).resolve().parent.parent
+    for candidate in (base / "dist" / "themes", base / "public" / "themes"):
+        if candidate.is_dir() and any(candidate.glob("*.supermd-theme.json")):
+            return candidate
+    return base / "dist" / "themes"
+
+def bundled_themes(root=None):
+    directory = bundled_themes_dir(root)
+    known = {preset_id: name for preset_id, name in BUNDLED_PRESETS}
+    result = []
+    for preset_id, name in BUNDLED_PRESETS:
+        filename = f"{preset_id}.supermd-theme.json"
+        if not directory.is_dir() or (directory / filename).is_file():
+            result.append({"id": preset_id, "name": name, "filename": filename})
+    if directory.is_dir():
+        for path in sorted(directory.glob("*.supermd-theme.json")):
+            preset_id = path.name[:-len(".supermd-theme.json")]
+            if preset_id in known or not _PRESET_ID_RE.match(preset_id):
+                continue
+            try:
+                raw_name = json.loads(path.read_text(encoding="utf-8-sig")).get("name")
+                name = raw_name if isinstance(raw_name, str) and raw_name.strip() else preset_id.replace("-", " ").title()
+            except (OSError, ValueError, TypeError):
+                name = preset_id.replace("-", " ").title()
+            result.append({"id": preset_id, "name": name, "filename": path.name})
+    return result
+
+def bundled_theme_path(preset_id, root=None):
+    if not isinstance(preset_id, str) or not _PRESET_ID_RE.match(preset_id):
+        raise ValueError("Unknown bundled theme")
+    path = bundled_themes_dir(root) / f"{preset_id}.supermd-theme.json"
+    if not path.is_file():
+        raise ValueError(f"Bundled theme '{preset_id}' is missing")
+    return path
 
 def validate(engine, raw):
     if len(raw.encode("utf-8"))>MAX_THEME:raise ValueError("Theme exceeds 2 MB")
@@ -51,10 +109,21 @@ def artwork(theme, selected):
         if image.startswith("asset:"):item["image"]=(theme or {}).get("assets",{}).get(image[6:],"")
     return result
 
+def has_background_override(overrides):
+    if not isinstance(overrides, dict):
+        return False
+    return (
+        bool(overrides.get("patternKind"))
+        or overrides.get("patternOpacity", -1) >= 0
+        or overrides.get("patternSize", 0) > 0
+        or overrides.get("patternSpacing", 0) > 0
+    )
+
 def reader(theme, mode, dark, overrides=None, resolve_assets=True):
     selected=variant(theme,mode,dark)
-    background=selected.get("background")
-    if theme and overrides:
+    source_background=selected.get("background")
+    background=dict(source_background) if isinstance(source_background,dict) else None
+    if theme and has_background_override(overrides):
         background=dict(background or {"pattern":"none","color":selected.get("colors",{}).get("primary","#82708e")})
         if overrides.get("patternKind"):background["pattern"]=overrides["patternKind"]
         for key,default in (("opacity",-1),("size",0),("spacing",0)):
@@ -64,13 +133,7 @@ def reader(theme, mode, dark, overrides=None, resolve_assets=True):
     if resolve_assets:
         # The reader does not need duplicate copies of native chrome assets.
         images=artwork(theme,{"artwork":{"reader":images["reader"]} if "reader" in images else {}})
-    if "reader" in images and overrides and overrides.get("patternOpacity",-1)>=0:images["reader"]["opacity"]=overrides["patternOpacity"]
     return {"colors":selected.get("colors",{}),"background":background,"artwork":images,"metrics":(theme or {}).get("metrics",{})}
 
-def for_sharing(theme,overrides):
-    document=copy.deepcopy(theme or TEMPLATE)
-    for mode,selected in document.get("variants",{}).items():
-        style=reader(document,mode,mode!="light",overrides,resolve_assets=False)
-        selected["background"]=style["background"]
-        if style["artwork"]:selected["artwork"]=style["artwork"]
-    return document
+def for_sharing(theme, overrides=None):
+    return copy.deepcopy(theme or TEMPLATE)

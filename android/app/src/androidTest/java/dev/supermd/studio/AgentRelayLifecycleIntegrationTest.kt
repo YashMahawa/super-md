@@ -39,6 +39,9 @@ class AgentRelayLifecycleIntegrationTest {
         val export = File(app.cacheDir, "agent-export-${UUID.randomUUID()}.smd")
         val emptyMarkdown = File(app.cacheDir, "agent-export-${UUID.randomUUID()}.md").apply { writeBytes(byteArrayOf()) }
         export.outputStream().use { media.writeFmd(it, "# Downloaded portable note\n", JSONObject().put("assets/photo.svg", media.portableImageData("image/svg+xml", svg))) }
+        val prefs = app.getSharedPreferences("studio", 0)
+        val oldWelcomed = prefs.getBoolean("welcomed", false)
+        prefs.edit().putBoolean("welcomed", true).commit()
         val scenario = ActivityScenario.launch<MainActivity>(Intent(app, MainActivity::class.java).putExtra("workspace", workspace))
         val handler = AtomicReference<((JSONObject, (Any?, String?) -> Unit) -> Unit)?>(null)
         val ownerRef = AtomicReference<MainActivity?>(null)
@@ -116,6 +119,7 @@ class AgentRelayLifecycleIntegrationTest {
         } finally {
             extractedDirectory?.let { File(app.filesDir, "portable-assets/$it").deleteRecursively() }
             scenario.close()
+            if (oldWelcomed) prefs.edit().putBoolean("welcomed", true).commit() else prefs.edit().remove("welcomed").commit()
             export.delete()
             emptyMarkdown.delete()
             File(app.filesDir, "workspaces/$workspace.json").delete()
@@ -126,6 +130,9 @@ class AgentRelayLifecycleIntegrationTest {
     @Test fun backgroundCreateInactivePatchActivateAndRevisionGuardedClosePreserveRecovery() {
         val app = ApplicationProvider.getApplicationContext<Application>()
         val workspace = UUID.randomUUID().toString()
+        val prefs = app.getSharedPreferences("studio", 0)
+        val oldWelcomed = prefs.getBoolean("welcomed", false)
+        prefs.edit().putBoolean("welcomed", true).commit()
         val scenario = ActivityScenario.launch<MainActivity>(Intent(app, MainActivity::class.java).putExtra("workspace", workspace))
         var model: StudioViewModel? = null
         var originalAutosave: Boolean? = null
@@ -143,9 +150,12 @@ class AgentRelayLifecycleIntegrationTest {
             assertEquals(initial.id, model!!.state.value.activeId)
             val focusContent = "# Agent focus fixture\n\nVisible focused paragraph with emoji 😀 and math \$E = mc^2\$.\n\n```svg\n<svg xmlns=\"http://www.w3.org/2000/svg\" width=\"12\" height=\"12\"><rect width=\"12\" height=\"12\" fill=\"#3478f6\"/></svg>\n```\n"
             runOnActivity(workspace) { model!!.edit(initial.id, focusContent) }
-            waitUntil(60_000) {
-                readerJavascript(workspace, """(()=>{const a=document.querySelector('.markdown-body'),i=a?.querySelector('.svg-diagram');if(!a?.innerText.includes('Visible focused paragraph with emoji 😀')||!i?.complete||document.fonts.status!=='loaded')return false;if(window.__agentLifecycleFixtureStable===undefined){window.__agentLifecycleFixtureStable=false;requestAnimationFrame(()=>requestAnimationFrame(()=>window.__agentLifecycleFixtureStable=true));return false}return window.__agentLifecycleFixtureStable===true})()""") == "true"
-            }
+            readerJavascriptUntil(
+                workspace,
+                60_000,
+                """(()=>{const a=document.querySelector('.markdown-body'),i=a?.querySelector('.svg-diagram');if(!a?.innerText.includes('Visible focused paragraph with emoji 😀')||!i?.complete||document.fonts.status!=='loaded')return false;if(window.__agentLifecycleFixtureStable===undefined){window.__agentLifecycleFixtureStable=false;requestAnimationFrame(()=>requestAnimationFrame(()=>window.__agentLifecycleFixtureStable=true));return false}return window.__agentLifecycleFixtureStable===true})()""",
+                "true",
+            )
             assertTrue("Reader did not acknowledge the focused fixture", runBlocking { model!!.readerFlushRequester?.invoke(initial.id) == true })
             assertEquals(focusContent, model!!.state.value.tabs.first { it.id == initial.id }.content)
             val visibleDraft = evaluateReaderText(workspace)
@@ -236,6 +246,7 @@ class AgentRelayLifecycleIntegrationTest {
             originalAutosave?.let { autosave -> runCatching { tryOnActivity(workspace) { model?.reading(autosave = autosave) } } }
             runCatching { tryOnActivity(workspace) { model?.state?.value?.let { state -> (state.tabs + state.closedTabs).mapNotNull { it.assetDirectory }.let(assetDirectories::addAll) } } }
             scenario.close()
+            if (oldWelcomed) prefs.edit().putBoolean("welcomed", true).commit() else prefs.edit().remove("welcomed").commit()
             assetDirectories.forEach { File(app.filesDir, "portable-assets/$it").deleteRecursively() }
             File(app.filesDir, "workspaces/$workspace.json").delete()
             File(app.filesDir, "workspaces/$workspace").deleteRecursively()
@@ -251,6 +262,10 @@ class AgentRelayLifecycleIntegrationTest {
         val media = MediaStorage(app)
         val input = File(app.cacheDir, "portable-save-${UUID.randomUUID()}.smd")
         input.outputStream().use { media.writeFmd(it, markdown, JSONObject().put("assets/original.svg", media.portableImageData("image/svg+xml", sourceSvg))) }
+        val prefs = app.getSharedPreferences("studio", 0)
+        val oldWelcomed = prefs.getBoolean("welcomed", false)
+        val previousNoteLocation = prefs.getString("newNoteLocation", null)
+        prefs.edit().putBoolean("welcomed", true).commit()
         val scenario = ActivityScenario.launch<MainActivity>(Intent(app, MainActivity::class.java).putExtra("workspace", workspace)
             .setDataAndType(Uri.fromFile(input), "application/octet-stream")
             .addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION or Intent.FLAG_GRANT_WRITE_URI_PERMISSION))
@@ -259,8 +274,6 @@ class AgentRelayLifecycleIntegrationTest {
         val handler = AtomicReference<((JSONObject, (Any?, String?) -> Unit) -> Unit)?>(null)
         var outputUri: Uri? = null
         val assetDirectories = mutableSetOf<String>()
-        val prefs = app.getSharedPreferences("studio", 0)
-        val previousNoteLocation = prefs.getString("newNoteLocation", null)
         try {
             runOnActivity(workspace) { owner ->
                 model = ViewModelProvider(owner)[StudioViewModel::class.java]
@@ -323,6 +336,7 @@ class AgentRelayLifecycleIntegrationTest {
             originalAutosave?.let { autosave -> runCatching { tryOnActivity(workspace) { model?.reading(autosave = autosave) } } }
             if (previousNoteLocation != null) prefs.edit().putString("newNoteLocation", previousNoteLocation).commit()
             else prefs.edit().remove("newNoteLocation").commit()
+            if (oldWelcomed) prefs.edit().putBoolean("welcomed", true).commit() else prefs.edit().remove("welcomed").commit()
             outputUri?.let { uri -> runCatching { app.contentResolver.delete(uri, null, null) } }
             assetDirectories.forEach { File(app.filesDir, "portable-assets/$it").deleteRecursively() }
             runCatching { tryOnActivity(workspace) { model?.state?.value?.tabs?.mapNotNull { it.assetDirectory }?.forEach { File(app.filesDir, "portable-assets/$it").deleteRecursively() } } }
@@ -423,6 +437,24 @@ class AgentRelayLifecycleIntegrationTest {
             Thread.sleep(20)
         }
         assertTrue("Condition timed out", condition())
+    }
+
+    private fun readerJavascriptUntil(workspace: String, timeoutMs: Long, script: String, expected: String) {
+        val result = AtomicReference<String?>(null)
+        val evaluating = AtomicBoolean(false)
+        waitUntil(timeoutMs) {
+            if (result.get() == expected) return@waitUntil true
+            if (evaluating.compareAndSet(false, true)) {
+                val dispatched = tryOnActivity(workspace) { owner ->
+                    findWebView(owner.window.decorView)?.evaluateJavascript(script) { value ->
+                        result.set(value)
+                        evaluating.set(false)
+                    } ?: run { evaluating.set(false) }
+                }
+                if (!dispatched) evaluating.set(false)
+            }
+            result.get() == expected
+        }
     }
 
     private fun evaluateReaderText(workspace: String): String {
