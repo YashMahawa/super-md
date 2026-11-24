@@ -17,11 +17,11 @@ import { addTab, closeTab, editTab, initialWorkspace, isDirty, markTabSaved, ope
 import type { DocumentData, ExportOptions, ThemeMode, ViewMode } from "./types";
 import { clampPreviewZoom, previewLayoutWidth, zoomShortcut } from "./zoom";
 import MediaTools, { type InsertionPoint } from "./components/MediaTools";
+import ImageViewer from "./components/ImageViewer";
 import { imageMarkdown, prepareFmd, type ImportedImage } from "./documentMedia";
 import { recordRecent } from "./recentFiles";
 import ZoomInput from "./components/ZoomInput";
 import ReadingSearch from "./components/ReadingSearch";
-import ImageViewer from "./components/ImageViewer";
 import { MaterialButton, MaterialIconButton, MaterialSelect, MaterialSlider, MaterialSwitch, materialThemes } from "./components/MaterialControls";
 import { isTypewriterShortcutEvent, setTypewriterScroll, toggleTypewriterScroll, useTypewriterScroll } from "./typewriterScroll";
 
