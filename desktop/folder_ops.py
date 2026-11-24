@@ -1,4 +1,4 @@
-"""Validation, boundary checks, lazy subfolder listing, and linked-asset helpers for open folders."""
+"""Naming, boundary checks, lazy subfolder listing, linked-asset helpers, and Trash verification."""
 from __future__ import annotations
 
 import os
@@ -9,15 +9,35 @@ from pathlib import Path, PurePath, PurePosixPath, PureWindowsPath
 try:
     from . import documents, markdown_prepare
 except ImportError:
-    import documents
-    import markdown_prepare
+    import documents  # type: ignore[no-redef]
+    import markdown_prepare  # type: ignore[no-redef]
 
-NOTE_SUFFIXES = (".md", ".smd", ".fmd", ".markdown", ".txt")
+NOTE_SUFFIXES = (".markdown", ".smd", ".fmd", ".md", ".txt")
 PLAIN_MARKDOWN_SUFFIXES = (".md", ".markdown", ".txt")
 KNOWN_FORMAT_SUFFIXES = frozenset({".md", ".markdown", ".txt", ".smd", ".fmd", ".pdf", ".zip", ".html", ".docx"})
+_WINDOWS_PATH_RE = re.compile(r"^([a-zA-Z]:[\\/]|\\\\)")
 
 
-def validate_entry_name(raw_name: str, *, is_directory: bool, current_ext: str = "") -> str:
+# --- Naming & format helpers ---
+
+def note_stem(name: str) -> str:
+    """Strip a known note suffix without truncating dotted stems such as '1.2 Linear Algebra.md'."""
+    leaf = Path(str(name or "")).name
+    lower = leaf.lower()
+    for suffix in NOTE_SUFFIXES:
+        if len(leaf) > len(suffix) and lower.endswith(suffix):
+            return leaf[: -len(suffix)]
+    suffix = Path(leaf).suffix
+    return leaf[: -len(suffix)] if suffix and len(leaf) > len(suffix) else leaf
+
+
+def validate_entry_name(
+    raw_name: str,
+    *,
+    is_directory: bool,
+    current_ext: str = "",
+    has_saved_target: bool = False,
+) -> str:
     """Validate a note or folder name, preserving note extensions unless a matching one is supplied."""
     if not isinstance(raw_name, str):
         raise ValueError("Choose a valid name.")
@@ -26,13 +46,20 @@ def validate_entry_name(raw_name: str, *, is_directory: bool, current_ext: str =
         not name
         or name in (".", "..")
         or name.startswith(".")
-        or any(ch in name for ch in "/\\\x00")
+        or name.endswith(".")
+        or any(ch in name for ch in '/\\:*?"<>|\x00')
         or any(ord(ch) < 32 for ch in name)
     ):
-        raise ValueError("Choose a visible name without path separators.")
+        raise ValueError("Choose a visible name without path separators or reserved characters.")
     if len(name) > 240:
         raise ValueError("Choose a shorter name.")
     if is_directory:
+        return name
+
+    if has_saved_target and not current_ext:
+        supplied_suffix = Path(name).suffix.lower()
+        if supplied_suffix and supplied_suffix in KNOWN_FORMAT_SUFFIXES:
+            raise ValueError("Rename keeps the note format. Use Export to change formats.")
         return name
 
     ext = current_ext or ".md"
@@ -40,7 +67,7 @@ def validate_entry_name(raw_name: str, *, is_directory: bool, current_ext: str =
         ext = "." + ext
     if len(name) > len(ext) and name.lower().endswith(ext.lower()):
         stem = name[: -len(ext)].strip()
-        if not stem or stem in (".", ".."):
+        if not stem or stem in (".", "..") or stem.endswith("."):
             raise ValueError("Choose a valid note name.")
         return name
 
@@ -49,6 +76,8 @@ def validate_entry_name(raw_name: str, *, is_directory: bool, current_ext: str =
         raise ValueError("Rename keeps the note format. Use Export to change formats.")
     return name + ext
 
+
+# --- Path normalization & open-folder boundary ---
 
 def _is_link_or_junction(path: Path) -> bool:
     if path.is_symlink():
@@ -59,16 +88,15 @@ def _is_link_or_junction(path: Path) -> bool:
 
 def strip_extended_length_prefix(raw: str) -> str:
     """Strip Win32 extended-length path prefixes (\\\\?\\) while preserving standard paths."""
-    if os.name == "nt":
-        if raw.startswith("\\\\?\\UNC\\"):
-            return "\\\\" + raw[8:]
-        if raw.startswith("\\\\?\\"):
-            return raw[4:]
+    if raw.startswith("\\\\?\\UNC\\"):
+        return "\\\\" + raw[8:]
+    if raw.startswith("\\\\?\\"):
+        return raw[4:]
     return raw
 
 
 def _pure_path(raw: str) -> PurePath:
-    return PureWindowsPath(raw) if os.name == "nt" else PurePosixPath(raw)
+    return PureWindowsPath(raw) if (os.name == "nt" or _WINDOWS_PATH_RE.match(raw)) else PurePosixPath(raw)
 
 
 def canonical_path_str(path: str | os.PathLike[str]) -> str:
@@ -77,8 +105,7 @@ def canonical_path_str(path: str | os.PathLike[str]) -> str:
     if not raw:
         return ""
     try:
-        resolved = os.path.realpath(raw)
-        return os.path.normpath(strip_extended_length_prefix(str(resolved)))
+        return os.path.normpath(strip_extended_length_prefix(str(os.path.realpath(raw))))
     except OSError:
         return os.path.normpath(raw)
 
@@ -97,9 +124,7 @@ def normalize_path_key(path: str | os.PathLike[str]) -> str:
 
 
 def same_path(left: str | os.PathLike[str], right: str | os.PathLike[str]) -> bool:
-    """Return True when two paths refer to the same normalized location."""
-    left_key = normalize_path_key(left)
-    right_key = normalize_path_key(right)
+    left_key, right_key = normalize_path_key(left), normalize_path_key(right)
     return bool(left_key and right_key and left_key == right_key)
 
 
@@ -110,8 +135,7 @@ def normalized_relpath(path: str | os.PathLike[str], root: str | os.PathLike[str
     try:
         return canon_path.relative_to(canon_root).as_posix()
     except ValueError:
-        path_key = normalize_path_key(str(canon_path))
-        root_key = normalize_path_key(str(canon_root))
+        path_key, root_key = normalize_path_key(str(canon_path)), normalize_path_key(str(canon_root))
         if path_key == root_key:
             return "."
         prefix = root_key if root_key.endswith("/") else root_key + "/"
@@ -159,7 +183,6 @@ def resolve_within_open_folder(
         raise ValueError("Folder entry path must be an absolute path inside the open folder.")
     if _is_link_or_junction(raw_target):
         raise ValueError("Symlinks are not allowed inside the open folder.")
-
     _check_no_symlinks_under(raw_root, raw_target)
     _check_no_symlinks_under(root, raw_target)
 
@@ -167,71 +190,57 @@ def resolve_within_open_folder(
         resolved = Path(strip_extended_length_prefix(str(raw_target.resolve(strict=must_exist))))
     except OSError as error:
         raise ValueError("The selected item is no longer available.") from error
-
     if same_path(resolved, root):
         if not allow_root:
             raise ValueError("Cannot modify the open folder itself.")
         return resolved
     if not matches_path_prefix(str(resolved), str(root), is_directory=True):
         raise ValueError("Paths outside the open folder are not allowed.")
-
     _check_no_symlinks_under(root, resolved)
     return resolved
 
 
 def ancestor_directories_in_folder(open_root: Path, target_dir: Path) -> set[str]:
-    """Return *open_root* and every ancestor directory down to *target_dir* for tree expansion."""
     root = Path(canonical_path_str(open_root))
     current = Path(canonical_path_str(target_dir))
     expanded = {str(root)}
-    if same_path(current, root) or matches_path_prefix(str(current), str(root), is_directory=True):
-        while not same_path(current, root) and matches_path_prefix(str(current), str(root), is_directory=True):
-            expanded.add(str(current))
-            if current.parent == current:
-                break
-            current = current.parent
+    while not same_path(current, root) and matches_path_prefix(str(current), str(root), is_directory=True):
+        expanded.add(str(current))
+        if current.parent == current:
+            break
+        current = current.parent
     return expanded
 
 
 def matches_path_prefix(candidate: str, target: str, *, is_directory: bool) -> bool:
-    """Return True when *candidate* is *target* or (for directories) a descendant of *target*."""
-    cand_key = normalize_path_key(candidate)
-    targ_key = normalize_path_key(target)
+    cand_key, targ_key = normalize_path_key(candidate), normalize_path_key(target)
     if not cand_key or not targ_key:
         return False
     if cand_key == targ_key:
         return True
-    if not is_directory:
-        return False
-    prefix = targ_key if targ_key.endswith("/") else targ_key + "/"
-    return cand_key.startswith(prefix)
+    return is_directory and cand_key.startswith(targ_key if targ_key.endswith("/") else targ_key + "/")
 
 
 def remap_path_prefix(candidate: str, old_path: str, new_path: str, *, is_directory: bool) -> str:
-    """Rewrite *candidate* when *old_path* (file or folder) moves/renames to *new_path*."""
     if not candidate:
         return candidate
-    cand_key = normalize_path_key(candidate)
-    old_key = normalize_path_key(old_path)
-    new_canon = canonical_path_str(new_path)
+    cand_key, old_key, new_canon = normalize_path_key(candidate), normalize_path_key(old_path), canonical_path_str(new_path)
     if not cand_key or not old_key or not new_canon:
         return candidate
     if cand_key == old_key:
         return new_canon
-    if is_directory:
-        prefix = old_key if old_key.endswith("/") else old_key + "/"
-        if cand_key.startswith(prefix):
-            cand_parts = _pure_path(canonical_path_str(candidate)).parts
-            old_parts = _pure_path(canonical_path_str(old_path)).parts
-            if len(cand_parts) > len(old_parts):
-                return str(_pure_path(new_canon).joinpath(*cand_parts[len(old_parts):]))
+    if is_directory and cand_key.startswith(old_key if old_key.endswith("/") else old_key + "/"):
+        cand_parts = _pure_path(canonical_path_str(candidate)).parts
+        old_parts = _pure_path(canonical_path_str(old_path)).parts
+        if len(cand_parts) > len(old_parts):
+            return str(_pure_path(new_canon).joinpath(*cand_parts[len(old_parts):]))
     return candidate
 
 
+# --- Linked Markdown asset inspection & copy ---
+
 def _decode_relative_asset_ref(raw_source: str) -> str | None:
-    if not raw_source:
-        return None
-    trimmed = raw_source.strip()
+    trimmed = (raw_source or "").strip()
     if not trimmed or trimmed.startswith(("/", "\\")) or re.match(r"^[a-z][a-z\d+.-]*:", trimmed, re.I):
         return None
     decoded = urllib.parse.unquote(trimmed.split("#", 1)[0].split("?", 1)[0]).strip()
@@ -243,12 +252,7 @@ def _decode_relative_asset_ref(raw_source: str) -> str | None:
     return "/".join(parts)
 
 
-def linked_local_images(
-    note_path: Path,
-    markdown: str,
-    open_root: Path,
-    target_dir: Path,
-) -> list[tuple[str, Path, Path]]:
+def linked_local_images(note_path: Path, markdown: str, open_root: Path, target_dir: Path) -> list[tuple[str, Path, Path]]:
     """Find relative local images/diagrams in a plain Markdown note that would break on move."""
     if note_path.suffix.lower() not in PLAIN_MARKDOWN_SUFFIXES:
         return []
@@ -264,9 +268,8 @@ def linked_local_images(
         rel = _decode_relative_asset_ref(ref.source)
         if not rel or rel in seen:
             continue
-        src_candidate = source_dir / rel
         try:
-            src_file = resolve_within_open_folder(root, src_candidate, allow_root=False, must_exist=True)
+            src_file = resolve_within_open_folder(root, source_dir / rel, allow_root=False, must_exist=True)
         except ValueError:
             continue
         if not src_file.is_file():
@@ -275,13 +278,12 @@ def linked_local_images(
         try:
             dst_file = resolve_within_open_folder(root, dst_candidate, allow_root=False, must_exist=False)
         except ValueError:
-            # Relative path (such as ../image.png) would escape the open root at destination: warn user.
             seen.add(rel)
             found.append((rel, src_file, dst_candidate))
             continue
         if same_path(dst_file, src_file):
             continue
-        if dst_file.exists() and dst_file.is_file():
+        if dst_file.is_file():
             try:
                 if dst_file.stat().st_size == src_file.stat().st_size and dst_file.read_bytes() == src_file.read_bytes():
                     continue
@@ -317,9 +319,8 @@ def copy_linked_local_images(items: list[tuple[str, Path, Path]], open_root: Pat
     created: list[Path] = []
     try:
         for dst_file, payload in staged:
-            parent = dst_file.parent
-            parent.mkdir(parents=True, exist_ok=True)
-            resolve_within_open_folder(root, parent, allow_root=True, must_exist=True)
+            dst_file.parent.mkdir(parents=True, exist_ok=True)
+            resolve_within_open_folder(root, dst_file.parent, allow_root=True, must_exist=True)
             documents.atomic_write(dst_file, payload)
             created.append(dst_file)
     except Exception:
@@ -330,6 +331,8 @@ def copy_linked_local_images(items: list[tuple[str, Path, Path]], open_root: Pat
                 pass
         raise
 
+
+# --- Lazy Move-to-folder picker ---
 
 def list_subfolders_lazy(
     open_root: Path,
@@ -342,35 +345,28 @@ def list_subfolders_lazy(
     expanded_keys = {normalize_path_key(item) for item in expanded_dirs if item}
 
     def is_excluded(candidate: Path) -> bool:
-        return excluded is not None and (
-            same_path(candidate, excluded)
-            or matches_path_prefix(str(candidate), str(excluded), is_directory=True)
-        )
+        return excluded is not None and matches_path_prefix(str(candidate), str(excluded), is_directory=True)
 
     def has_visible_subdirs(directory: Path) -> bool:
         try:
-            for child in directory.iterdir():
-                if child.name.startswith(".") or _is_link_or_junction(child):
-                    continue
-                if child.is_dir():
-                    resolved_child = Path(canonical_path_str(child))
-                    if is_excluded(resolved_child):
-                        continue
-                    return True
+            return any(
+                not child.name.startswith(".")
+                and not _is_link_or_junction(child)
+                and child.is_dir()
+                and not is_excluded(Path(canonical_path_str(child)))
+                for child in directory.iterdir()
+            )
         except OSError:
             return False
-        return False
 
-    rows: list[dict] = [
-        {
-            "name": root.name or str(root),
-            "path": str(root),
-            "depth": 0,
-            "expanded": True,
-            "hasChildren": has_visible_subdirs(root),
-            "isRoot": True,
-        }
-    ]
+    rows: list[dict] = [{
+        "name": root.name or str(root),
+        "path": str(root),
+        "depth": 0,
+        "expanded": True,
+        "hasChildren": has_visible_subdirs(root),
+        "isRoot": True,
+    }]
 
     def visit(directory: Path, depth: int) -> None:
         try:
@@ -386,18 +382,47 @@ def list_subfolders_lazy(
             if is_excluded(resolved_child):
                 continue
             is_expanded = normalize_path_key(resolved_child) in expanded_keys
-            rows.append(
-                {
-                    "name": child.name,
-                    "path": str(resolved_child),
-                    "depth": depth,
-                    "expanded": is_expanded,
-                    "hasChildren": has_visible_subdirs(resolved_child),
-                    "isRoot": False,
-                }
-            )
+            rows.append({
+                "name": child.name,
+                "path": str(resolved_child),
+                "depth": depth,
+                "expanded": is_expanded,
+                "hasChildren": has_visible_subdirs(resolved_child),
+                "isRoot": False,
+            })
             if is_expanded:
                 visit(resolved_child, depth + 1)
 
     visit(root, 1)
     return rows
+
+
+# --- Portable OS Trash verification ---
+
+def is_system_trash_destination(trashed_path: str | os.PathLike[str], open_root: str | os.PathLike[str]) -> bool:
+    """Return True when *trashed_path* is inside an OS Trash / Recycle Bin outside *open_root*."""
+    raw_trashed = strip_extended_length_prefix(str(trashed_path or "").strip())
+    raw_root = strip_extended_length_prefix(str(open_root or "").strip())
+    if not raw_trashed or not raw_root:
+        return False
+
+    trashed_parts = [p.lower() for p in _pure_path(raw_trashed).parts]
+    root_parts = [p.lower() for p in _pure_path(raw_root).parts]
+    if len(trashed_parts) < 2 or not root_parts:
+        return False
+    if trashed_parts[: len(root_parts)] == root_parts:
+        return False
+    if bool(_WINDOWS_PATH_RE.match(raw_trashed)) == bool(_WINDOWS_PATH_RE.match(raw_root)):
+        if matches_path_prefix(raw_trashed, raw_root, is_directory=True):
+            return False
+
+    non_leaf = trashed_parts[:-1]
+    if ".trash" in non_leaf or ".trashes" in non_leaf:
+        return True
+    if "$recycle.bin" in non_leaf or "recycler" in non_leaf:
+        return True
+    for idx in range(len(trashed_parts) - 2):
+        seg = trashed_parts[idx]
+        if trashed_parts[idx + 1] == "files" and (seg in ("trash", ".trash") or seg.startswith(".trash-")):
+            return True
+    return False

@@ -8,9 +8,6 @@ import androidx.lifecycle.ViewModelProvider
 import androidx.test.core.app.ActivityScenario
 import androidx.test.core.app.ApplicationProvider
 import androidx.test.ext.junit.runners.AndroidJUnit4
-import androidx.test.platform.app.InstrumentationRegistry
-import androidx.test.runner.lifecycle.ActivityLifecycleMonitorRegistry
-import androidx.test.runner.lifecycle.Stage
 import org.json.JSONArray
 import org.json.JSONObject
 import org.junit.Assert.*
@@ -36,9 +33,6 @@ class AgentRelayMediaIntegrationTest {
         val initialAssets = JSONObject().put("assets/original.svg", media.portableImageData("image/svg+xml", originalSvg))
         noteFile.outputStream().use { media.writeFmd(it, originalMarkdown, initialAssets) }
         val uri = Uri.fromFile(noteFile)
-        val prefs = app.getSharedPreferences("studio", 0)
-        val oldWelcomed = prefs.getBoolean("welcomed", false)
-        prefs.edit().putBoolean("welcomed", true).commit()
         val launch = Intent(app, MainActivity::class.java).putExtra("workspace", workspace)
             .setDataAndType(uri, "application/octet-stream")
             .addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION or Intent.FLAG_GRANT_WRITE_URI_PERMISSION)
@@ -48,17 +42,17 @@ class AgentRelayMediaIntegrationTest {
         val assetDirectories = mutableSetOf<String>()
         try {
             val handler = AtomicReference<((JSONObject, (Any?, String?) -> Unit) -> Unit)?>(null)
-            runOnActivity(workspace) { owner ->
+            scenario.onActivity { owner ->
                 model = ViewModelProvider(owner)[StudioViewModel::class.java]
                 originalAutosave = model!!.state.value.autosave
                 model!!.reading(autosave = false)
             }
-            waitUntil(60_000) {
+            waitUntil(20_000) {
                 val current = model?.state?.value
                 current?.autosave == false && current.active.uri == uri.toString() && current.active.content == originalMarkdown
             }
-            waitUntil(60_000) {
-                tryOnActivity(workspace) { owner ->
+            waitUntil(20_000) {
+                scenario.onActivity { owner ->
                     val field = MainActivity::class.java.getDeclaredField("agentBridgeHandler").apply { isAccessible = true }
                     @Suppress("UNCHECKED_CAST")
                     handler.set(field.get(owner) as? ((JSONObject, (Any?, String?) -> Unit) -> Unit))
@@ -67,15 +61,12 @@ class AgentRelayMediaIntegrationTest {
             }
             val readerReady = AtomicReference<String?>(null)
             val evaluating = java.util.concurrent.atomic.AtomicBoolean(false)
-            waitUntil(60_000) {
+            waitUntil(20_000) {
                 if (readerReady.get() == "true") return@waitUntil true
-                if (evaluating.compareAndSet(false, true)) {
-                    val dispatched = tryOnActivity(workspace) { owner ->
-                        findWebView(owner.window.decorView)?.evaluateJavascript(
-                            "!!window.supermdAgentRequest && document.readyState === 'complete'",
-                        ) { ready -> readerReady.set(ready); evaluating.set(false) } ?: run { evaluating.set(false) }
-                    }
-                    if (!dispatched) evaluating.set(false)
+                if (evaluating.compareAndSet(false, true)) scenario.onActivity { owner ->
+                    findWebView(owner.window.decorView)?.evaluateJavascript(
+                        "!!window.supermdAgentRequest && document.readyState === 'complete'",
+                    ) { ready -> readerReady.set(ready); evaluating.set(false) } ?: run { evaluating.set(false) }
                 }
                 readerReady.get() == "true"
             }
@@ -89,10 +80,10 @@ class AgentRelayMediaIntegrationTest {
                 val result = AtomicReference<Pair<Any?, String?>>()
                 val request = JSONObject(fields.toString()).put("requestId", "media_${UUID.randomUUID().toString().replace("-", "")}")
                     .put("action", action).put("tabId", note.id)
-                runOnActivity(workspace) {
+                scenario.onActivity {
                     handler.get()!!.invoke(request) { value, error -> result.set(value to error); latch.countDown() }
                 }
-                assertTrue("Native relay handler did not reply to $action", latch.await(30, TimeUnit.SECONDS))
+                assertTrue("Native relay handler did not reply to $action", latch.await(20, TimeUnit.SECONDS))
                 return result.get()
             }
 
@@ -174,10 +165,9 @@ class AgentRelayMediaIntegrationTest {
                 assertArrayEquals(modelSvg, media.decodePortableImage(diskAssets.getString("assets/model.svg")).second)
             } finally { File(app.filesDir, "portable-assets/${onDisk.directory}").deleteRecursively() }
         } finally {
-            originalAutosave?.let { autosave -> runCatching { tryOnActivity(workspace) { model?.reading(autosave = autosave) } } }
-            runCatching { tryOnActivity(workspace) { model?.state?.value?.tabs?.mapNotNull { it.assetDirectory }?.let(assetDirectories::addAll) } }
+            originalAutosave?.let { autosave -> runCatching { scenario.onActivity { model?.reading(autosave = autosave) } } }
+            runCatching { scenario.onActivity { model?.state?.value?.tabs?.mapNotNull { it.assetDirectory }?.let(assetDirectories::addAll) } }
             scenario.close()
-            if (oldWelcomed) prefs.edit().putBoolean("welcomed", true).commit() else prefs.edit().remove("welcomed").commit()
             assetDirectories.forEach { File(app.filesDir, "portable-assets/$it").deleteRecursively() }
             noteFile.delete()
             File(app.filesDir, "workspaces/$workspace.json").delete()
@@ -185,49 +175,10 @@ class AgentRelayMediaIntegrationTest {
         }
     }
 
-    private fun findActivity(workspace: String): MainActivity? {
-        val monitor = ActivityLifecycleMonitorRegistry.getInstance()
-        for (stage in listOf(Stage.RESUMED, Stage.STARTED, Stage.CREATED)) {
-            val match = monitor.getActivitiesInStage(stage)
-                .filterIsInstance<MainActivity>()
-                .firstOrNull { !it.isFinishing && !it.isDestroyed && it.intent?.getStringExtra("workspace") == workspace }
-            if (match != null) return match
-        }
-        return null
-    }
-
-    private fun tryOnActivity(workspace: String, action: (MainActivity) -> Unit): Boolean {
-        var ran = false
-        InstrumentationRegistry.getInstrumentation().runOnMainSync {
-            val activity = findActivity(workspace)
-            if (activity != null) {
-                action(activity)
-                ran = true
-            }
-        }
-        return ran
-    }
-
-    private fun runOnActivity(workspace: String, action: (MainActivity) -> Unit) {
-        waitUntil(60_000) {
-            var present = false
-            InstrumentationRegistry.getInstrumentation().runOnMainSync {
-                present = findActivity(workspace) != null
-            }
-            present
-        }
-        InstrumentationRegistry.getInstrumentation().runOnMainSync {
-            action(requireNotNull(findActivity(workspace)) { "MainActivity for workspace $workspace unavailable" })
-        }
-    }
-
     private fun waitUntil(timeoutMs: Long, condition: () -> Boolean) {
         val deadline = System.currentTimeMillis() + timeoutMs
-        val mainHandler = android.os.Handler(android.os.Looper.getMainLooper())
         while (!condition() && System.currentTimeMillis() < deadline) {
-            val pump = CountDownLatch(1)
-            mainHandler.post { pump.countDown() }
-            pump.await(200, TimeUnit.MILLISECONDS)
+            androidx.test.platform.app.InstrumentationRegistry.getInstrumentation().waitForIdleSync()
             Thread.sleep(20)
         }
         assertTrue("Condition timed out", condition())

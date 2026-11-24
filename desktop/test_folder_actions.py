@@ -6,6 +6,7 @@ import tempfile
 import time
 import unittest
 from pathlib import Path
+from typing import Any
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 os.environ.setdefault("QT_QUICK_BACKEND", "software")
@@ -19,10 +20,12 @@ from PySide6.QtTest import QTest
 from documents import open_note
 from folder_ops import (
     canonical_path_str,
+    is_system_trash_destination,
     linked_local_images,
     list_subfolders_lazy,
     normalize_path_key,
     normalized_relpath,
+    note_stem,
     resolve_within_open_folder,
     same_path,
     validate_entry_name,
@@ -37,6 +40,8 @@ class QuietStudio(Studio):
 
 
 class FolderActionsDesktopTest(unittest.TestCase):
+    app: Any = None
+
     @classmethod
     def setUpClass(cls):
         if QGuiApplication.instance() is None:
@@ -147,6 +152,12 @@ class FolderActionsDesktopTest(unittest.TestCase):
         restored_default = Path(QUrl(self.studio.defaultSaveLocation("Draft Idea.md")).toLocalFile())
         self.assertEqual(self._norm(restored_default.parent), self._norm(self.open_root))
 
+        # Dotted note titles preserve full stem on defaultExportLocation
+        self.studio._current()["name"] = "1.2 Linear Algebra.md"
+        self.assertEqual(note_stem("1.2 Linear Algebra.md"), "1.2 Linear Algebra")
+        pdf_default = Path(QUrl(self.studio.defaultExportLocation("pdf")).toLocalFile())
+        self.assertEqual(pdf_default.name, "1.2 Linear Algebra.pdf")
+
     def test_create_md_smd_and_subfolder_auto_opens_and_expands_parent(self):
         self.studio.openFolder(str(self.open_root))
         self._wait_for(lambda: same_path(self.studio.folder, self.open_root))
@@ -193,8 +204,9 @@ class FolderActionsDesktopTest(unittest.TestCase):
         self.assertEqual(validate_entry_name("Lecture 1.MD", is_directory=False, current_ext=".md"), "Lecture 1.MD")
         self.assertEqual(validate_entry_name("Bundle", is_directory=False, current_ext=".smd"), "Bundle.smd")
         self.assertEqual(validate_entry_name("2026.04 Summary", is_directory=False, current_ext=".md"), "2026.04 Summary.md")
+        self.assertEqual(validate_entry_name("README", is_directory=False, current_ext="", has_saved_target=True), "README")
 
-        for bad in ("", "   ", ".", "..", "a/b", "a\\b", "bad\x00name", ".hidden"):
+        for bad in ("", "   ", ".", "..", "a/b", "a\\b", "bad\x00name", ".hidden", "bad:name", "trailing."):
             with self.assertRaises(ValueError):
                 validate_entry_name(bad, is_directory=False, current_ext=".md")
             with self.assertRaises(ValueError):
@@ -407,18 +419,15 @@ class FolderActionsDesktopTest(unittest.TestCase):
         if sys.platform.startswith("linux"):
             trash_files = list((self.xdg_data / "Trash" / "files").glob("*"))
             self.assertTrue(len(trash_files) >= 1)
-            self.assertTrue(bool(self.studio._last_trashed_path))
+            self.assertTrue(is_system_trash_destination(self.studio._last_trashed_path, self.open_root))
             self.assertTrue(Path(self.studio._last_trashed_path).exists())
             self.assertFalse(same_path(Path(self.studio._last_trashed_path).parent, self.open_root))
         elif sys.platform == "darwin":
-            self.assertTrue(bool(self.studio._last_trashed_path))
-            trashed_dest = Path(self.studio._last_trashed_path)
-            trashed_key = normalize_path_key(trashed_dest)
             self.assertTrue(
-                any(seg in trashed_key for seg in ("/.trash/", "/.trashes/")),
-                f"Expected macOS Trash destination, got: {trashed_dest}",
+                is_system_trash_destination(self.studio._last_trashed_path, self.open_root),
+                f"Expected macOS Trash destination, got: {self.studio._last_trashed_path}",
             )
-            self.assertFalse(trashed_key.startswith(normalize_path_key(self.open_root) + "/"))
+            trashed_dest = Path(self.studio._last_trashed_path)
             try:
                 trashed_exists = trashed_dest.exists()
             except PermissionError:
@@ -448,23 +457,21 @@ class FolderActionsDesktopTest(unittest.TestCase):
             self.assertEqual(hr, 0)
             self.assertGreaterEqual(rb_info.i64NumItems, 1)
             if self.studio._last_trashed_path:
+                self.assertTrue(is_system_trash_destination(self.studio._last_trashed_path, self.open_root))
                 trashed_dest = Path(self.studio._last_trashed_path)
-                self.assertFalse(
-                    normalize_path_key(trashed_dest).startswith(normalize_path_key(self.open_root) + "/")
-                )
                 try:
                     trashed_exists = trashed_dest.exists()
                 except PermissionError:
                     trashed_exists = True
                 self.assertTrue(trashed_exists)
         else:
-            self.assertTrue(bool(self.studio._last_trashed_path))
+            self.assertTrue(is_system_trash_destination(self.studio._last_trashed_path, self.open_root))
             trashed_dest = Path(self.studio._last_trashed_path)
             self.assertTrue(trashed_dest.exists())
-            self.assertFalse(normalize_path_key(trashed_dest).startswith(normalize_path_key(self.open_root) + "/"))
         self._assert_no_hidden_or_vault_artifacts()
         self.assertNotIn(self._norm(resolved_dirty), self._norm_list(self.studio.recent))
         self.assertNotIn(self._norm(resolved_dirty), self._norm_list(self.session.pinned))
+        self.assertTrue(any("Important unsaved paragraph!" in d["content"] for d in self.session.drafts.get("deleted-notes", [])))
 
         # Reopen closed tab recovers the full unsaved draft detached from the deleted path
         self.assertTrue(len(self.studio.closed_tabs) >= 1)
@@ -472,6 +479,17 @@ class FolderActionsDesktopTest(unittest.TestCase):
         self._wait_for(lambda: self.studio._current()["id"] == tab_id)
         self.assertIn("Important unsaved paragraph!", self.studio._current()["content"])
         self.assertEqual(self.studio._current()["path"], "")
+
+        # Verify portable Trash path classifier across macOS, Linux, Windows, and in-folder traps
+        self.assertTrue(is_system_trash_destination("/Users/runner/.Trash/Drafts", "/Users/runner/work/notes"))
+        self.assertTrue(is_system_trash_destination("/Volumes/External/.Trashes/501/Drafts", "/Volumes/External/notes"))
+        self.assertTrue(is_system_trash_destination("/home/runner/.local/share/Trash/files/Drafts", "/home/runner/notes"))
+        self.assertTrue(is_system_trash_destination("/mnt/data/.Trash-1000/files/Drafts", "/mnt/data/notes"))
+        self.assertTrue(is_system_trash_destination(r"C:\$Recycle.Bin\S-1-5-21-1000\Drafts", r"C:\Users\runner\notes"))
+        self.assertFalse(is_system_trash_destination("/Users/runner/work/notes/.Trash/Drafts", "/Users/runner/work/notes"))
+        self.assertFalse(is_system_trash_destination("/home/runner/notes/.trash/Drafts", "/home/runner/notes"))
+        self.assertFalse(is_system_trash_destination("/home/runner/notes/Trash/files/Drafts", "/home/runner/notes"))
+        self.assertFalse(is_system_trash_destination("", "/Users/runner/work/notes"))
 
     def test_customizable_shortcuts_and_folder_sidebar_qml_component_load_cleanly(self):
         shortcut_ids = {item["id"] for item in DEFINITIONS}

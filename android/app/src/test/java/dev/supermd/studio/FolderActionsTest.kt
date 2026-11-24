@@ -177,10 +177,16 @@ class FolderActionsTest {
 
     @Test
     fun renameValidatesExtensionsAndSynchronizesTabsAcrossWindowsRecentsPinsAndReadingPositions() {
-        // Unit validation checks
+        // Unit validation & noteStem checks
+        assertEquals("1.2 Linear Algebra", noteStem("1.2 Linear Algebra.md"))
+        assertEquals("Study", noteStem("Study.smd"))
+        assertTrue(isSupportedFolderNoteFile("1.2 Linear Algebra.md"))
+        assertFalse(isSupportedFolderNoteFile(".hidden.md"))
+        assertFalse(isSupportedFolderNoteFile("README"))
         assertEquals("Summary.md", validateFolderEntryName("Summary", isDirectory = false, currentExtension = "md"))
         assertEquals("Summary.md", validateFolderEntryName("Summary.MD", isDirectory = false, currentExtension = "md"))
-        for (invalid in listOf("", "  ", ".", "..", "sub/file", "sub\\file", "bad\u0000name", ".hidden", "Summary.smd")) {
+        assertEquals("README", validateFolderEntryName("README", isDirectory = false, currentExtension = "", hasSavedTarget = true))
+        for (invalid in listOf("", "  ", ".", "..", "sub/file", "sub\\file", "bad\u0000name", ".hidden", "bad:name", "trailing.", "Summary.smd")) {
             val result = runCatching { validateFolderEntryName(invalid, isDirectory = false, currentExtension = "md") }
             assertTrue("Expected '$invalid' to fail validation", result.isFailure)
         }
@@ -215,7 +221,16 @@ class FolderActionsTest {
         )
         assertNotNull(mainWindow.readingLocation(openUri.toString()))
 
-        // Duplicate rename is rejected
+        // Duplicate rename is rejected both globally and via inline dialog callback
+        var inlineOutcome: Pair<Boolean, String?>? = null
+        mainWindow.renameFolderEntry(closedUri, "Course/Week2.md", isDirectory = false, requested = "Week1", showGlobalError = false) { ok, err ->
+            inlineOutcome = ok to err
+        }
+        await { inlineOutcome != null }
+        assertEquals(false, inlineOutcome?.first)
+        assertTrue(inlineOutcome?.second?.contains("already exists") == true)
+        assertNull(mainWindow.state.value.error)
+
         mainWindow.renameFolderEntry(closedUri, "Course/Week2.md", isDirectory = false, requested = "Week1")
         await(debugInfo = { "dup: err=${mainWindow.state.value.error}" }) {
             mainWindow.state.value.error?.contains("already exists") == true
@@ -349,9 +364,29 @@ class FolderActionsTest {
         assertNull(model.state.value.active.uri)
     }
 
-    private fun newModel(): StudioViewModel {
+    @Test
+    fun folderRelativePersistsAcrossWorkspaceRestoreAndNavigatesUpCleanly() {
+        File(rootDir, "Sem1/Unit2").mkdirs()
+        File(rootDir, "Sem1/Unit2/Notes.md").writeText("# Unit 2\n")
+        val key = "folder-persist-${System.nanoTime()}".also(workspaceKeys::add)
+        val first = newModel(key)
+        first.setFolder(treeUri)
+        await { first.state.value.folder == treeUri.toString() }
+        first.listFolder(treeUri, "Sem1/Unit2")
+        await { first.state.value.folderRelative == "Sem1/Unit2" && first.state.value.files.any { it.name == "Notes.md" } }
+
+        val restored = newModel(key)
+        await { restored.state.value.folderRelative == "Sem1/Unit2" && restored.state.value.files.any { it.name == "Notes.md" } }
+        assertTrue(restored.navigateFolderUp())
+        await { restored.state.value.folderRelative == "Sem1" }
+        assertTrue(restored.navigateFolderUp())
+        await { restored.state.value.folderRelative == "" }
+        assertFalse(restored.navigateFolderUp())
+    }
+
+    private fun newModel(explicitKey: String? = null): StudioViewModel {
         val store = ViewModelStore().also(viewModels::add)
-        val key = "folder-actions-${System.nanoTime()}".also(workspaceKeys::add)
+        val key = explicitKey ?: "folder-actions-${System.nanoTime()}".also(workspaceKeys::add)
         val model = StudioViewModel(app, key)
         model.readerFlushRequester = { true }
         store.put("model", model)

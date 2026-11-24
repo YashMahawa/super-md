@@ -2565,6 +2565,7 @@ class Studio(QObject):
         self.settings["welcomed"] = True
         self.expanded = {self.folder}
         self._preferences()
+        self._recover()
         self._emit(False)
         self._load_tree()
 
@@ -2574,7 +2575,7 @@ class Studio(QObject):
         folder, expanded = self.folder, set(self.expanded)
         expanded_keys = {folder_ops.normalize_path_key(item) for item in expanded if item}
         def scan():
-            entries = []
+            entries: list[dict[str, object]] = []
             def visit(path, depth):
                 try:
                     children = sorted(Path(path).iterdir(), key=lambda p: (not p.is_dir(), p.name.lower()))
@@ -2610,6 +2611,8 @@ class Studio(QObject):
                 self.expanded.discard(item)
         else:
             self.expanded.add(canon)
+        self._recover()
+        self._emit(False)
         self._load_tree()
 
     @Slot()
@@ -2618,6 +2621,7 @@ class Studio(QObject):
         self.folder = ""
         self.files = []
         self.expanded.clear()
+        self._recover()
         self._emit(False)
 
     @Slot(str)
@@ -2931,12 +2935,10 @@ class Studio(QObject):
                 if tab["path"] and folder_ops.matches_path_prefix(tab["path"], old_path, is_directory=is_dir):
                     updated = folder_ops.remap_path_prefix(tab["path"], old_path, new_path, is_directory=is_dir)
                     tab.update(path=updated, name=Path(updated).name)
-        remapped_agent = {
-            folder_ops.remap_path_prefix(p, old_path, new_path, is_directory=is_dir)
-            for p in self._agent_open_paths
-        }
-        self._agent_open_paths.clear()
-        self._agent_open_paths.update(remapped_agent)
+        for path_set in (self._agent_open_paths, self._agent_owned_files):
+            remapped = {folder_ops.remap_path_prefix(p, old_path, new_path, is_directory=is_dir) for p in path_set}
+            path_set.clear()
+            path_set.update(remapped)
         for loc_key in list(self.session.locations.keys()):
             if folder_ops.matches_path_prefix(loc_key, old_path, is_directory=is_dir):
                 value = self.session.locations.pop(loc_key)
@@ -2945,14 +2947,17 @@ class Studio(QObject):
             folder_ops.remap_path_prefix(p, old_path, new_path, is_directory=is_dir)
             for p in self.session.pinned
         ))
-        self.recent = [
-            folder_ops.remap_path_prefix(p, old_path, new_path, is_directory=is_dir)
-            for p in self.recent
-        ]
+        self.recent = [folder_ops.remap_path_prefix(p, old_path, new_path, is_directory=is_dir) for p in self.recent]
         for entries in self.session.workspace.values():
             for entry in entries:
                 if entry.get("path") and folder_ops.matches_path_prefix(entry["path"], old_path, is_directory=is_dir):
                     entry["path"] = folder_ops.remap_path_prefix(entry["path"], old_path, new_path, is_directory=is_dir)
+        for ws in getattr(self.session, "window_workspaces", {}).values():
+            if isinstance(ws, dict):
+                if ws.get("folder") and folder_ops.matches_path_prefix(ws["folder"], old_path, is_directory=is_dir):
+                    ws["folder"] = folder_ops.remap_path_prefix(ws["folder"], old_path, new_path, is_directory=is_dir)
+                if isinstance(ws.get("expanded"), list):
+                    ws["expanded"] = [folder_ops.remap_path_prefix(p, old_path, new_path, is_directory=is_dir) for p in ws["expanded"]]
         self.session.startup_paths = [
             folder_ops.remap_path_prefix(p, old_path, new_path, is_directory=is_dir)
             for p in self.session.startup_paths
@@ -3108,7 +3113,8 @@ class Studio(QObject):
             final_name = folder_ops.validate_entry_name(
                 name,
                 is_directory=is_dir,
-                current_ext="" if is_dir else (before.suffix or ".md"),
+                current_ext="" if is_dir else before.suffix,
+                has_saved_target=True,
             )
             after = before.with_name(final_name)
             if not folder_ops.same_path(after, before):
@@ -3183,12 +3189,11 @@ class Studio(QObject):
 
         self._submit(scan, finished, busy=False)
 
-    @Slot(str, str)
-    def requestMoveEntry(self, source_path, target_dir):
+    def _resolve_move_paths(self, source_path: str, target_dir: str) -> tuple[Path, Path, Path, Path, bool] | None:
         if not self.folder:
             self.message = "Open a folder first."
             self._emit(False)
-            return
+            return None
         try:
             root = Path(folder_ops.strip_extended_length_prefix(str(Path(self.folder).resolve(strict=True))))
             source = folder_ops.resolve_within_open_folder(root, source_path, allow_root=False, must_exist=True)
@@ -3199,16 +3204,25 @@ class Studio(QObject):
             if is_dir and (folder_ops.same_path(dest_dir, source) or folder_ops.matches_path_prefix(str(dest_dir), str(source), is_directory=True)):
                 raise ValueError("Cannot move a folder into itself.")
             if folder_ops.same_path(source.parent, dest_dir):
-                return
+                return None
             dest_path = dest_dir / source.name
             folder_ops.resolve_within_open_folder(root, dest_path, allow_root=False, must_exist=False)
-            if dest_path.exists() or folder_ops._is_link_or_junction(dest_path):
-                raise ValueError("An item with that name already exists in the destination folder.")
+            return root, source, dest_dir, dest_path, is_dir
         except (OSError, ValueError) as error:
             self.message = str(error)
             self._emit(False)
-            return
+            return None
 
+    @Slot(str, str)
+    def requestMoveEntry(self, source_path, target_dir):
+        resolved = self._resolve_move_paths(source_path, target_dir)
+        if resolved is None:
+            return
+        root, source, dest_dir, dest_path, is_dir = resolved
+        if dest_path.exists() or folder_ops._is_link_or_junction(dest_path):
+            self.message = "An item with that name already exists in the destination folder."
+            self._emit(False)
+            return
         if is_dir or source.suffix.lower() not in folder_ops.PLAIN_MARKDOWN_SUFFIXES:
             self.moveEntry(str(source), str(dest_dir), "move_only")
             return
@@ -3244,31 +3258,14 @@ class Studio(QObject):
 
     @Slot(str, str, str)
     def moveEntry(self, source_path, target_dir, image_action="move_only"):
-        if not self.folder:
-            self.message = "Open a folder first."
-            self._emit(False)
-            return
         if image_action not in ("copy", "move_only"):
             self.message = "Choose a valid move option."
             self._emit(False)
             return
-        try:
-            root = Path(folder_ops.strip_extended_length_prefix(str(Path(self.folder).resolve(strict=True))))
-            source = folder_ops.resolve_within_open_folder(root, source_path, allow_root=False, must_exist=True)
-            dest_dir = folder_ops.resolve_within_open_folder(root, target_dir or self.folder, allow_root=True, must_exist=True)
-            if not dest_dir.is_dir():
-                raise ValueError("Choose an existing destination folder.")
-            is_dir = source.is_dir()
-            if is_dir and (folder_ops.same_path(dest_dir, source) or folder_ops.matches_path_prefix(str(dest_dir), str(source), is_directory=True)):
-                raise ValueError("Cannot move a folder into itself.")
-            if folder_ops.same_path(source.parent, dest_dir):
-                return
-            dest_path = dest_dir / source.name
-            folder_ops.resolve_within_open_folder(root, dest_path, allow_root=False, must_exist=False)
-        except (OSError, ValueError) as error:
-            self.message = str(error)
-            self._emit(False)
+        resolved = self._resolve_move_paths(source_path, target_dir)
+        if resolved is None:
             return
+        root, source, dest_dir, dest_path, is_dir = resolved
 
         for win in list(self.session.windows.values()):
             for tab in win.tabs:
@@ -3416,15 +3413,22 @@ class Studio(QObject):
                 p for p in self.recent
                 if not folder_ops.matches_path_prefix(p, target_str, is_directory=is_dir)
             ]
-            self._agent_open_paths.difference_update({
-                p for p in list(self._agent_open_paths)
-                if folder_ops.matches_path_prefix(p, target_str, is_directory=is_dir)
-            })
+            for path_set in (self._agent_open_paths, self._agent_owned_files):
+                path_set.difference_update({
+                    p for p in list(path_set)
+                    if folder_ops.matches_path_prefix(p, target_str, is_directory=is_dir)
+                })
             for entries in self.session.workspace.values():
                 entries[:] = [
                     entry for entry in entries
                     if not (entry.get("path") and folder_ops.matches_path_prefix(entry["path"], target_str, is_directory=is_dir))
                 ]
+            for ws in getattr(self.session, "window_workspaces", {}).values():
+                if isinstance(ws, dict):
+                    if ws.get("folder") and folder_ops.matches_path_prefix(ws["folder"], target_str, is_directory=is_dir):
+                        ws["folder"] = ""
+                    if isinstance(ws.get("expanded"), list):
+                        ws["expanded"] = [p for p in ws["expanded"] if not folder_ops.matches_path_prefix(p, target_str, is_directory=is_dir)]
             self.session.startup_paths = [
                 p for p in self.session.startup_paths
                 if not folder_ops.matches_path_prefix(p, target_str, is_directory=is_dir)
@@ -3465,10 +3469,12 @@ class Studio(QObject):
         tab = next((t for t in self.tabs if t["id"] == id),None)
         if not tab or id in self.saving: return
         try:
+            has_saved = bool(tab.get("path"))
             final_name = folder_ops.validate_entry_name(
                 name,
                 is_directory=False,
-                current_ext=Path(tab["name"]).suffix or ".md",
+                current_ext=Path(tab["name"]).suffix if has_saved else (Path(tab["name"]).suffix or ".md"),
+                has_saved_target=has_saved,
             )
         except ValueError as error:
             self.message = str(error); self._emit(False); return
@@ -3516,7 +3522,7 @@ class Studio(QObject):
     @Slot(str, result=QUrl)
     def defaultExportLocation(self, format):
         suffix = "zip" if format == "mdzip" else format
-        return self.defaultSaveLocation(Path(self._current()["name"]).stem + "." + suffix)
+        return self.defaultSaveLocation((folder_ops.note_stem(self._current()["name"]) or "Untitled") + "." + suffix)
 
     @Slot(str)
     def closeTab(self, id):

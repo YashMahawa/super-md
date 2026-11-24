@@ -961,7 +961,7 @@ private object NoMotionScheme : MotionScheme {
             val format = args.optString("format", "pdf")
             check(format in setOf("pdf", "smd", "md")) { "Unsupported export format" }
             val requestedName = args.optString("filename").takeIf { it.isNotBlank() }
-                ?: args.optString("id").takeIf { it.isNotBlank() } ?: state.active.name.substringBeforeLast('.')
+                ?: args.optString("id").takeIf { it.isNotBlank() } ?: noteStem(state.active.name).ifBlank { "Untitled" }
             activity.updateAgentExportJob(jobId, "preparing")
             model.busy(true)
             scope.launch {
@@ -998,11 +998,12 @@ private object NoMotionScheme : MotionScheme {
         }
         onDispose { activity.setAgentUiHandler(null) }
     }
-    DisposableEffect(portable, state.active.name) { model.requestPortable = { portable.launch(state.active.name.substringBeforeLast('.') + ".smd") }; onDispose { model.requestPortable = null } }
+    DisposableEffect(portable, state.active.name) { model.requestPortable = { portable.launch(noteStem(state.active.name).ifBlank { "Untitled" } + ".smd") }; onDispose { model.requestPortable = null } }
     DisposableEffect(save, portableSaveAs, model) {
         model.requestSaveAs = { note ->
-            if (note.portable) portableSaveAs.launch(note.name.substringBeforeLast('.') + ".smd")
-            else save.launch(note.name.substringBeforeLast('.') + ".md")
+            val stem = noteStem(note.name).ifBlank { "Untitled" }
+            if (note.portable) portableSaveAs.launch("$stem.smd")
+            else save.launch("$stem.md")
         }
         onDispose { model.requestSaveAs = null }
     }
@@ -1020,7 +1021,13 @@ private object NoMotionScheme : MotionScheme {
     LaunchedEffect(immersive, dark) {
         WindowCompat.getInsetsController(activity.window, activity.window.decorView).apply { isAppearanceLightStatusBars = !dark; isAppearanceLightNavigationBars = !dark; systemBarsBehavior = WindowInsetsControllerCompat.BEHAVIOR_SHOW_TRANSIENT_BARS_BY_SWIPE; if (immersive) hide(WindowInsetsCompat.Type.systemBars()) else show(WindowInsetsCompat.Type.systemBars()) }
     }
-    BackHandler(contentsShown || state.fullscreen || drawer.isOpen || state.readerOverlay) { if (contentsShown) contentsShown = false else if (drawer.isOpen) scope.launch { drawer.close() } else web?.evaluateJavascript("window.supermdDismiss?.() || false") {dismissed->if(dismissed!="true")model.fullscreen(false)} }
+    BackHandler(contentsShown || state.fullscreen || drawer.isOpen || state.readerOverlay) {
+        if (contentsShown) contentsShown = false
+        else if (drawer.isOpen) {
+            if (state.folder != null && state.folderRelative.isNotEmpty() && model.navigateFolderUp()) Unit
+            else scope.launch { drawer.close() }
+        } else web?.evaluateJavascript("window.supermdDismiss?.() || false") { dismissed -> if (dismissed != "true") model.fullscreen(false) }
+    }
     val palette = MaterialTheme.colorScheme
     val density = LocalDensity.current
     val tokens = remember(palette) { JSONObject().put("primary", hex(palette.primary)).put("on-primary", hex(palette.onPrimary)).put("primary-container",hex(palette.primaryContainer)).put("on-primary-container",hex(palette.onPrimaryContainer)).put("surface", hex(palette.surface)).put("surface-low", hex(palette.surfaceContainerLow)).put("surface-high", hex(palette.surfaceContainerHigh)).put("text", hex(palette.onSurface)).put("muted", hex(palette.onSurfaceVariant)).put("outline", hex(palette.outlineVariant)) }
@@ -1311,8 +1318,41 @@ private object NoMotionScheme : MotionScheme {
     )
     // Long forms must not strand their primary action below a half-open sheet.
     if (renaming) {
-        var name by remember(state.active.id) {mutableStateOf(state.active.name)}
-        AlertDialog(onDismissRequest={renaming=false},title={Text("Rename note")},text={OutlinedTextField(value=name,onValueChange={name=it},singleLine=true,label={Text("Note name")})},confirmButton={TextButton(onClick={model.rename(state.active.id,name);renaming=false},enabled=name.isNotBlank()){Text("Rename")}},dismissButton={TextButton(onClick={renaming=false}){Text("Cancel")}})
+        val initialStem = remember(state.active.id, state.active.name) {
+            if (isSupportedFolderNoteFile(state.active.name)) noteStem(state.active.name) else state.active.name
+        }
+        var name by remember(state.active.id) { mutableStateOf(initialStem) }
+        var renameError by remember(state.active.id) { mutableStateOf<String?>(null) }
+        var renameBusy by remember(state.active.id) { mutableStateOf(false) }
+        AlertDialog(
+            onDismissRequest = { if (!renameBusy) renaming = false },
+            title = { Text("Rename note") },
+            text = {
+                OutlinedTextField(
+                    value = name,
+                    onValueChange = { name = it; renameError = null },
+                    enabled = !renameBusy,
+                    singleLine = true,
+                    isError = renameError != null,
+                    label = { Text("Note name") },
+                    supportingText = renameError?.let { err -> { Text(err, color = MaterialTheme.colorScheme.error) } },
+                )
+            },
+            confirmButton = {
+                TextButton(
+                    onClick = {
+                        renameBusy = true
+                        renameError = null
+                        model.rename(state.active.id, name, showGlobalError = false) { ok, err ->
+                            renameBusy = false
+                            if (ok) renaming = false else renameError = err
+                        }
+                    },
+                    enabled = !renameBusy && name.isNotBlank(),
+                ) { Text("Rename") }
+            },
+            dismissButton = { TextButton(enabled = !renameBusy, onClick = { renaming = false }) { Text("Cancel") } },
+        )
     }
     if (exporting) ModalBottomSheet(onDismissRequest = { exporting = false }, sheetState = rememberBottomSheetState(initialValue = SheetValue.Hidden, enabledValues = setOf(SheetValue.Hidden, SheetValue.Expanded))) { ExportSettings(state.pdf, model::pdf, sharing = sharing, fonts = state.customFonts, noteLocation = noteLocation) { format ->
         exporting = false
@@ -1324,7 +1364,10 @@ private object NoMotionScheme : MotionScheme {
                 if (format == "pdf") readerPdfOwnsProgress = true
                 when (format) { "pdf" -> web?.evaluateJavascript("window.supermdExport?.(${state.pdf})", null) ?: model.fail("The reader is not ready"); "smd" -> web?.evaluateJavascript("window.supermdPortable?.(false)", null) ?: model.fail("The reader is not ready") }
             }
-        } else if (format == "smd") portable.launch(state.active.name.substringBeforeLast('.') + ".smd") else pdf.launch(state.active.name.substringBeforeLast('.') + ".pdf")
+        } else {
+            val stem = noteStem(state.active.name).ifBlank { "Untitled" }
+            if (format == "smd") portable.launch("$stem.smd") else pdf.launch("$stem.pdf")
+        }
     } }
     if (!accessPickerShowing) accessRequest?.let { request ->
         AlertDialog(onDismissRequest = model::dismissDocumentAccess,
