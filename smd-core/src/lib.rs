@@ -2,6 +2,7 @@
 pub mod portable;
 pub mod theme;
 pub mod pdf_assets;
+pub mod frontmatter;
 mod math_compatibility;
 mod step_grid;
 mod typesetter;
@@ -48,9 +49,11 @@ fn string(value: &str) -> String { serde_json::to_string(value).unwrap() }
 fn text(value: &str) -> String { format!("#text({})", string(value)) }
 
 pub fn image_sources(markdown: &str) -> Vec<String> {
-    let normalized = normalize_callouts(markdown);
+    let body = frontmatter::strip_frontmatter(markdown);
+    let normalized = normalize_callouts_body(body);
     let mut sources = Vec::new();
-    let mut events = Parser::new_ext(&normalized, Options::all());
+    let options = Options::ENABLE_TABLES | Options::ENABLE_FOOTNOTES | Options::ENABLE_STRIKETHROUGH | Options::ENABLE_TASKLISTS | Options::ENABLE_MATH;
+    let mut events = Parser::new_ext(&normalized, options);
     while let Some(event) = events.next() {
         match event {
             Event::Start(Tag::Image { dest_url, .. }) => sources.push(dest_url.to_string()),
@@ -236,6 +239,19 @@ fn normalize_wikilinks_outside_code(input: &str) -> String {
 
 /// Normalize Obsidian/Super MD callouts and wikilinks outside code before parsing Markdown.
 pub fn normalize_callouts(input: &str) -> String {
+    if let Some(fm) = frontmatter::parse_frontmatter(input) {
+        let rest = &input[fm.end..];
+        let mut out = fm.raw.to_string();
+        if !out.ends_with('\n') && !rest.is_empty() {
+            out.push('\n');
+        }
+        out.push_str(&normalize_callouts_body(rest));
+        return out;
+    }
+    normalize_callouts_body(input)
+}
+
+fn normalize_callouts_body(input: &str) -> String {
     let mut output = String::new();
     let mut depth = 0usize;
     let mut fence: Option<(char,usize)> = None;
@@ -445,14 +461,19 @@ impl<'a> Renderer<'a> {
 }
 
 pub(crate) fn render_fragment(markdown: &str, assets: &HashMap<String, Vec<u8>>) -> Result<String> {
-    let normalized = normalize_table_math(&normalize_callouts(markdown));
+    let body = frontmatter::strip_frontmatter(markdown);
+    let normalized = normalize_table_math(&normalize_callouts_body(body));
     let events = Parser::new_ext(&normalized, Options::ENABLE_TABLES | Options::ENABLE_STRIKETHROUGH | Options::ENABLE_MATH).collect::<Vec<_>>();
     Renderer { events: events.into_iter().peekable(), assets, footnotes: HashMap::new(), headings: HashMap::new(), heading_counts: HashMap::new() }.render(None)
 }
 
 pub fn source(markdown: &str, options: &PdfOptions, assets: &HashMap<String, Vec<u8>>) -> Result<String> {
     options.validate()?;
-    let normalized = normalize_table_math(&normalize_callouts(markdown));
+    let (doc_metadata, raw_body) = match frontmatter::parse_frontmatter(markdown) {
+        Some(fm) => (fm.metadata.typst_set_document(), &markdown[fm.end..]),
+        None => (String::new(), markdown.strip_prefix('\u{feff}').unwrap_or(markdown)),
+    };
+    let normalized = normalize_table_math(&normalize_callouts_body(raw_body));
     let events = Parser::new_ext(&normalized, Options::ENABLE_TABLES | Options::ENABLE_STRIKETHROUGH | Options::ENABLE_TASKLISTS | Options::ENABLE_MATH | Options::ENABLE_FOOTNOTES).collect::<Vec<_>>();
     let mut headings = HashMap::new(); let mut current = None::<String>;
     for event in &events { match event {
@@ -487,7 +508,7 @@ pub fn source(markdown: &str, options: &PdfOptions, assets: &HashMap<String, Vec
 "##, string(accent));
     // Typst collapses paragraph spacing against leading. Add leading so the
     // export control specifies the visible gap instead of disappearing below it.
-    Ok(format!("#import \"/mitex/standard.typ\": scope as mitex-scope\n#let smd-math-scope = mitex-scope + (sect: sym.inter,)\n{palette}#set page(paper: {}, margin: {}mm, fill: smd-paper)\n#set text(font: ({}, \"Libertinus Serif\", \"New Computer Modern\"), size: {}pt)\n#set par(leading: {}em, spacing: {}em)\n{template}\n{body}", string(paper), options.margin, string(&options.font_family), options.font_size, options.line_height - 0.7, options.line_height - 0.7 + options.paragraph_spacing))
+    Ok(format!("#import \"/mitex/standard.typ\": scope as mitex-scope\n#let smd-math-scope = mitex-scope + (sect: sym.inter,)\n{palette}{doc_metadata}#set page(paper: {}, margin: {}mm, fill: smd-paper)\n#set text(font: ({}, \"Libertinus Serif\", \"New Computer Modern\"), size: {}pt)\n#set par(leading: {}em, spacing: {}em)\n{template}\n{body}", string(paper), options.margin, string(&options.font_family), options.font_size, options.line_height - 0.7, options.line_height - 0.7 + options.paragraph_spacing))
 }
 
 pub fn export(markdown: &str, options: &PdfOptions, assets: &HashMap<String, Vec<u8>>) -> Result<Vec<u8>> {
@@ -1006,5 +1027,36 @@ P(A\cup B\cup C)=&P(A)+P(B)+P(C)\\
         let pdf = export(&md, &PdfOptions::default(), &HashMap::new()).unwrap();
         assert!(pdf.starts_with(b"%PDF-"));
         assert!(pdf.len() > 2_000);
+    }
+
+    #[test]
+    fn frontmatter_omits_yaml_from_page_body_and_populates_pdf_properties() {
+        let note = "\u{feff}---  \ntitle: \"Relativistic Quantum Theory\"\nauthor:\n  - Paul Dirac\n  - Emmy Noether\ndescription: \"Spinors, symmetries, and conservation laws\"\ntags: [spinors, symmetry]\ndate: 2026-03-15\n...  \n\n# Spinor Algebra\n\nBody text.\n";
+        let typst_src = source(note, &PdfOptions::default(), &HashMap::new()).unwrap();
+        assert!(!typst_src.contains("#line(length: 100%"), "YAML delimiter leaked as horizontal rule: {typst_src}");
+        assert!(!typst_src.contains("#heading(level: 2"), "YAML block leaked as setext level-2 heading: {typst_src}");
+        assert!(!typst_src.contains("#text(\"title:"), "raw YAML key leaked into rendered body: {typst_src}");
+        assert_eq!(typst_src.matches("title:").count(), 1);
+        assert!(typst_src.contains("#set document(title: \"Relativistic Quantum Theory\", author: (\"Paul Dirac\", \"Emmy Noether\",), description: \"Spinors, symmetries, and conservation laws\", keywords: (\"spinors\", \"symmetry\",), date: datetime(year: 2026, month: 3, day: 15))"));
+
+        let pdf_bytes = export(note, &PdfOptions::default(), &HashMap::new()).unwrap();
+        assert!(pdf_bytes.starts_with(b"%PDF-"));
+        let corpus = format!("{}\n{}", String::from_utf8_lossy(&pdf_bytes), decompress_pdf_streams(&pdf_bytes));
+        assert!(corpus.contains("Relativistic Quantum Theory"), "PDF metadata missing title");
+        assert!(corpus.contains("Paul Dirac"), "PDF metadata missing first author");
+        assert!(corpus.contains("Emmy Noether"), "PDF metadata missing second author");
+        assert!(corpus.contains("Spinors, symmetries, and conservation laws"), "PDF metadata missing description");
+        assert!(corpus.contains("spinors"), "PDF metadata missing keyword");
+        assert!(corpus.contains("2026-03-15") || corpus.contains("D:20260315"), "PDF metadata missing date");
+
+        // Malformed or unclosed YAML and freeform dates still export valid PDFs safely.
+        for fallback in [
+            "---\ntitle: Unclosed frontmatter\n\n# Still Exports\n",
+            "---\ntitle: Freeform Date\ndate: Spring 2026\n---\n\n# Valid PDF\n",
+            "---\n---\n\n# Empty Frontmatter\n",
+        ] {
+            let bytes = export(fallback, &PdfOptions::default(), &HashMap::new()).unwrap();
+            assert!(bytes.starts_with(b"%PDF-"));
+        }
     }
 }
