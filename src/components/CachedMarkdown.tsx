@@ -8,7 +8,7 @@ import rehypeHighlight from "rehype-highlight";
 import {defaultUrlTransform,type Components} from "react-markdown";
 import {visit} from "unist-util-visit";
 import type {Root} from "hast";
-import {useMemo,type ReactNode} from "react";
+import {memo,useMemo,type ReactNode} from "react";
 import WindowedBlock,{useWindowing} from "./WindowedBlock";
 import {analyzeDocument,type SourceDocumentAnalysis} from '../documentAnalysis';
 
@@ -366,7 +366,6 @@ export function cachedMarkdownTree(source:string,remarkPlugins:PluggableList,reh
   }
   return tree;
 }
-
 function resolveDeferredBlockTree(node:any,plugins:PluggableList):Root {
   if(!plugins.length||typeof node!=="object"||node===null)return {type:"root",children:[node]} as Root;
   const profile=getRehypeProfile(plugins);
@@ -419,21 +418,44 @@ function resolveDeferredBlockTree(node:any,plugins:PluggableList):Root {
   return expanded;
 }
 
-export interface RenderedMarkdownBlock {node:any;index:number;content:ReactNode;text:string;headings:Array<{id:string;key:string}>;estimate:number;windowed:boolean}
+export interface RenderedMarkdownBlock {key:string;node:any;index:number;content:ReactNode;text:string;headings:Array<{id:string;key:string}>;estimate:number;windowed:boolean}
 export type MarkdownBlockRenderer=(block:RenderedMarkdownBlock)=>ReactNode;
 export default function CachedMarkdown({children,remarkPlugins,rehypePlugins,components,renderBlock,windowingEnabled=true,sourceAnalysis}:{children:string;remarkPlugins:PluggableList;rehypePlugins:PluggableList;components:Components;renderBlock?:MarkdownBlockRenderer;windowingEnabled?:boolean;sourceAnalysis?:SourceDocumentAnalysis}){
   const supportsWindowing=useWindowing(),windowing=windowingEnabled&&supportsWindowing&&children.length>80_000;
   const tree=cachedMarkdownTree(children,remarkPlugins,windowing?[]:rehypePlugins,windowing,sourceAnalysis);
-  const blocks=useMemo(()=>windowing||renderBlock?tree.children.filter(node=>node.type!=='text'||node.value.trim()).map((node:any,index)=>{const text=plainText(node);return {node,index,text,headings:headingsOf(node),estimate:Math.min(1200,Math.max(80,text.length/65*30+(node.tagName==='pre'?220:40)))};}):[],[tree,windowing,!!renderBlock]);
-  if(renderBlock)return <>{blocks.map(block=>renderBlock({...block,windowed:windowing,content:windowing?<DeferredMarkdown node={block.node} plugins={rehypePlugins} components={components}/>:toJsxRuntime({type:'root',children:[block.node]},{Fragment,jsx,jsxs,components,ignoreInvalidStyle:true,passKeys:true,passNode:true})}))}</>;
-  if(!windowing)return toJsxRuntime(tree,{Fragment,jsx,jsxs,components,ignoreInvalidStyle:true,passKeys:true,passNode:true});
-  return <>{blocks.map(block=><WindowedBlock key={block.index} enabled estimate={block.estimate} text={block.text} headings={block.headings} data-source-start={block.node.properties?.['data-source-start']??block.node.position?.start.offset} data-source-end={block.node.properties?.['data-source-end']??block.node.position?.end.offset}><DeferredMarkdown node={block.node} plugins={rehypePlugins} components={components}/></WindowedBlock>)}</>;
+  const hasBlockView=Boolean(renderBlock);
+  const blocks=useMemo<RenderedMarkdownBlock[]>(()=>{
+    if(!windowing&&!hasBlockView)return [];
+    const counts=new Map<string,number>();
+    return tree.children.filter(node=>node.type!=='text'||node.value.trim()).map((node:any,index)=>{
+      const kind=blockKind(node),ordinal=counts.get(kind)??0;
+      counts.set(kind,ordinal+1);
+      const key=`${kind}-${ordinal}`;
+      const text=plainText(node);
+      const content=windowing
+        ?<DeferredMarkdown node={node} plugins={rehypePlugins} components={components}/>
+        :toJsxRuntime({type:'root',children:[node]},{Fragment,jsx,jsxs,components,ignoreInvalidStyle:true,passKeys:true,passNode:true});
+      return {key,node,index,text,content,headings:headingsOf(node),estimate:Math.min(1200,Math.max(80,text.length/65*30+(node.tagName==='pre'?220:40))),windowed:windowing};
+    });
+  },[tree,windowing,hasBlockView,rehypePlugins,components]);
+  const fullContent=useMemo(()=>!hasBlockView&&!windowing?toJsxRuntime(tree,{Fragment,jsx,jsxs,components,ignoreInvalidStyle:true,passKeys:true,passNode:true}):null,[tree,windowing,hasBlockView,components]);
+  if(renderBlock)return <>{blocks.map(block=>renderBlock(block))}</>;
+  if(!windowing)return fullContent;
+  return <>{blocks.map(block=><WindowedBlock key={block.key} enabled estimate={block.estimate} text={block.text} headings={block.headings} data-source-start={block.node.properties?.['data-source-start']??block.node.position?.start.offset} data-source-end={block.node.properties?.['data-source-end']??block.node.position?.end.offset}>{block.content}</WindowedBlock>)}</>;
+}
+function blockKind(node:any):string {
+  if(node.type!=='element')return String(node.type||'node');
+  if(node.tagName==='pre'){
+    const lang=highlightLanguage(node.children?.[0]?.properties?.className);
+    return lang?`pre:${lang}`:'pre';
+  }
+  return String(node.tagName);
 }
 function plainText(node:any):string {return node.type==='text'?node.value:(node.children||[]).map(plainText).join('')+(/^(p|li|pre|h[1-6])$/.test(node.tagName||'')?'\n':'');}
 function headingsOf(node:any):Array<{id:string;key:string}> {const result:Array<{id:string;key:string}>=[];visit(node,(entry:any)=>{if(entry.type==='element'&&entry.properties?.id)result.push({id:String(entry.properties.id),key:String(entry.properties['data-heading-key']??entry.properties.id)});});return result;}
-function DeferredMarkdown({node,plugins,components}:{node:any;plugins:PluggableList;components:Components}) {
+const DeferredMarkdown=memo(function DeferredMarkdown({node,plugins,components}:{node:any;plugins:PluggableList;components:Components}) {
   // Expanded KaTeX/highlighting trees are cached alongside their parent document
   // entry, while plain prose and diagram blocks render directly without cloning.
   const tree=useMemo(()=>resolveDeferredBlockTree(node,plugins),[node,plugins]);
   return toJsxRuntime(tree,{Fragment,jsx,jsxs,components,ignoreInvalidStyle:true,passKeys:true,passNode:true});
-}
+});

@@ -7,6 +7,7 @@ import remarkMath from "remark-math";
 import { SKIP, visit } from "unist-util-visit";
 import InteractiveChart from "./components/InteractiveChart";
 import { normalizeCallouts } from "./components/MarkdownPreview";
+import { parseFrontmatter } from "./frontmatter";
 import { invoke } from "./nativeBridge";
 import { renderMermaid } from "./mermaidRenderer";
 import { pythonOutput } from "./renderedOutputs";
@@ -66,6 +67,7 @@ export async function preparePdf(markdown: string, documentPath: string | null, 
   checkCurrent();
   report({ phase: "prepare", completed: 0, total: 1 });
   const processor = unified().use(remarkParse).use(remarkGfm, { singleTilde: false }).use(remarkSingleTildeStringify).use(remarkMath).use(remarkObsidianMath).use(remarkStringify);
+  const front = parseFrontmatter(markdown)?.raw || "";
   const normalized = normalizeCallouts(markdown);
   // parse() runs no transformers: lift raw <svg> markup into svg blocks here.
   const tree = remarkSvgBlocks()(processor.parse(normalized), { value: normalized });
@@ -247,12 +249,13 @@ export async function preparePdf(markdown: string, documentPath: string | null, 
   checkCurrent();
   // The marker is an extension, not a normal bracketed link. Stringify escapes
   // its opening bracket; restore only explicit blockquote callout prefixes.
-  const rawContent = processor.stringify(tree).replace(/^([\t ]*>[\t ]*)\\(\[![\w-]+\][+-]?)/gm, "$1$2");
-  const codeMask = maskCode(rawContent);
-  const content = rawContent.replace(
+  const rawBody = processor.stringify(tree).replace(/^([\t ]*>[\t ]*)\\(\[![\w-]+\][+-]?)/gm, "$1$2");
+  const codeMask = maskCode(rawBody);
+  const body = rawBody.replace(
     /^([\t ]*(?:>[\t ]*)*(?:(?:[-+*]|\d+[.)])[\t ]+(?:\[[ xX]\][\t ]+)?)?)\\(==(?=[^=\s\r\n].*==))/gm,
     (full, prefix: string, marker: string, offset: number) => codeMask[offset + prefix.length] === " " ? full : prefix + marker,
   );
+  const content = front ? (body ? `${front}${front.endsWith("\n") ? "" : "\n"}\n${body}` : front) : body;
   checkCurrent();
   return { content, assets };
   } finally {

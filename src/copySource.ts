@@ -17,6 +17,7 @@ export function selectedMarkdown(selection: Selection | null, source?:string): s
   const startElement=elementAt(range.startContainer), endElement=elementAt(range.endContainer);
   if (!startElement?.closest(".markdown-body,.live-document") || !endElement?.closest(".markdown-body,.live-document")) return null;
   if (startElement.closest("textarea,input,.cm-editor") || endElement.closest("textarea,input,.cm-editor")) return null;
+  if (elementAt(range.commonAncestorContainer)?.closest("[data-frontmatter-properties],.document-properties")) return "";
   const atomicAt=(node:Node)=>{
     const el=elementAt(node);
     return el?.closest(".katex-display") || el?.closest(".katex") || el?.closest('[data-windowed-mounted="false"]');
@@ -63,7 +64,7 @@ export function selectedMarkdown(selection: Selection | null, source?:string): s
       const from=Number(node.getAttribute('data-source-start')),to=Number(node.getAttribute('data-source-end'));
       if(Number.isFinite(from)&&Number.isFinite(to)&&to>from)return source.slice(from,to)+'\n\n';
     }
-    if(node.matches("button,.image-edit-tools,.katex-mathml"))return "";
+    if(node.matches("button,.image-edit-tools,.katex-mathml,[data-frontmatter-properties],.document-properties"))return "";
     if(node.matches(".katex-display,.katex")){const tex=node.querySelector('annotation[encoding="application/x-tex"]')?.textContent;if(tex)return node.matches(".katex-display")?`\n$$\n${tex}\n$$\n`:`$${tex}$`;}
     if(node.tagName==="TABLE"){
       const rows=Array.from(node.querySelectorAll("tr")).filter(row=>row.closest("table")===node).map(row=>Array.from(row.children).filter(cell=>/^(TH|TD)$/.test(cell.tagName)).map(cell=>Array.from(cell.childNodes).map(child=>serialize(child,true)).join("").trim().replace(/\n+/g,"<br>"))).filter(row=>row.length>0);
