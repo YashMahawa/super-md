@@ -251,6 +251,83 @@ class AgentExportsTest(unittest.TestCase):
         export_pdf(self.store, "fonts-note.md", "otf.pdf", options=otf_opts, font_dir=font_dir, engine=self.engine)
         self.assertIn(b"AgentUpperOtf-Regular", (self.root / "otf.pdf").read_bytes())
 
+    def test_pdf_and_markdown_exports_handle_yaml_frontmatter_variations_and_populate_pdf_properties(self):
+        from frontmatter import frontmatter_end, mask_frontmatter, strip_frontmatter
+        from markdown_prepare import prepare_markdown_export
+
+        for raw, expected_body in (
+            ("\ufeff---\ntitle: BOM\n---\nBody", "Body"),
+            ("---  \ntitle: Dots\n...  \nBody", "Body"),
+            ("---\n---\nBody", "Body"),
+            ("---\ntitle: EOF\n---", ""),
+        ):
+            self.assertGreater(frontmatter_end(raw), 0)
+            self.assertEqual(strip_frontmatter(raw), expected_body)
+            self.assertEqual(len(mask_frontmatter(raw)), len(raw))
+
+        for non_fm in (
+            "---\ntitle: Unclosed\n\n# Body",
+            "+++\ntitle = 'TOML'\n+++\n# Body",
+            "---\nPlain sentence between thematic breaks.\n---\n",
+        ):
+            self.assertEqual(frontmatter_end(non_fm), 0)
+
+        note = (
+            "\ufeff---  \n"
+            'title: "Hamiltonian Systems"\n'
+            'author: "William Rowan Hamilton"\n'
+            'description: "Phase space and ![not-an-image](missing.png) plus ```mermaid"\n'
+            "tags: [mechanics, symplectic]\n"
+            "date: 2026-03-15\n"
+            "...  \n\n"
+            "# Phase Space\n\n"
+            "Canonical coordinates $(q, p)$.\n"
+        )
+        (self.root / "hamilton.md").write_text(note, encoding="utf-8")
+        prepared_md, prepared_assets = prepare_markdown_export(self.store, "hamilton.md", note, {})
+        self.assertEqual(prepared_assets, {})
+        self.assertEqual(prepared_md, note)
+
+        stdout = io.StringIO()
+        with contextlib.redirect_stdout(stdout):
+            status = agent_cli_main([
+                "--root", str(self.root), "export", "hamilton.md", "pdf", "hamilton.pdf",
+                "--engine", str(self.engine),
+            ])
+        self.assertEqual(status, 0)
+        pdf_bytes = (self.root / "hamilton.pdf").read_bytes()
+        self.assertTrue(pdf_bytes.startswith(b"%PDF-"))
+
+        corpus = pdf_bytes.decode("latin1")
+        idx = 0
+        while (pos := pdf_bytes.find(b"stream", idx)) != -1:
+            start = pos + 6
+            if pdf_bytes[start:start + 2] == b"\r\n":
+                start += 2
+            elif pdf_bytes[start:start + 1] == b"\n":
+                start += 1
+            else:
+                idx = start
+                continue
+            end = pdf_bytes.find(b"endstream", start)
+            if end == -1:
+                break
+            chunk = pdf_bytes[start:end].rstrip(b"\r\n")
+            try:
+                corpus += "\n" + zlib.decompress(chunk).decode("utf-8", errors="replace")
+            except zlib.error:
+                pass
+            idx = end + 9
+
+        for expected in (
+            "Hamiltonian Systems",
+            "William Rowan Hamilton",
+            "Phase space and ![not-an-image](missing.png)",
+            "symplectic",
+        ):
+            self.assertIn(expected, corpus)
+        self.assertTrue("2026-03-15" in corpus or "D:20260315" in corpus)
+
 
 if __name__ == "__main__":
     unittest.main()

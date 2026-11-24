@@ -16,9 +16,11 @@ from typing import Any
 try:
     from . import documents
     from .agent_documents import AgentDocumentError, DocumentStore, RevisionConflict, _symlink_component
+    from .frontmatter import strip_frontmatter
 except ImportError:
     import documents
     from agent_documents import AgentDocumentError, DocumentStore, RevisionConflict, _symlink_component
+    from frontmatter import strip_frontmatter
 
 DEFAULT_PDF_OPTIONS = {
     "pageSize": "a4", "margin": 14, "fontSize": 10.5, "lineHeight": 1.4,
@@ -99,6 +101,7 @@ def _clean_markdown_images(markdown: str) -> str:
 
 
 def _image_destinations(markdown: str) -> list[str]:
+    markdown = strip_frontmatter(markdown)
     visible = _clean_markdown_images(markdown)
     references = {}
     for match in _REFERENCE.finditer(visible):
@@ -147,6 +150,7 @@ def _image_destinations(markdown: str) -> list[str]:
 
 
 def _contains_unsupported_diagrams(markdown: str) -> bool:
+    markdown = strip_frontmatter(markdown)
     fence_char = None
     fence_size = 0
     for line in markdown.splitlines():
