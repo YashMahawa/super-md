@@ -3,6 +3,7 @@ package dev.supermd.studio
 import android.net.Uri
 import android.os.Looper
 import android.util.Base64
+import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.Job
 import org.json.JSONObject
 import org.junit.Assert.assertArrayEquals
@@ -138,9 +139,18 @@ class PortableAgentSaveSafetyTest {
 
             // 3. Updating Markdown + asset externally with rapid consecutive refresh notifications adopts the latest archive without leaking.
             file.outputStream().use { model.media.writeFmd(it, "# Version 2\n\n![Fig](assets/fig.svg)\n", svgAssets("assets/fig.svg", svgA)) }
+            val cancelEnteredIo = CompletableDeferred<Unit>()
+            val cancelHoldIo = CompletableDeferred<Unit>()
+            model.refreshExternalIoObserver = {
+                cancelEnteredIo.complete(Unit)
+                cancelHoldIo.await()
+            }
             model.refreshExternal()
-            pumpMainLooper(210)
+            val supersededRefreshJob = model.refreshJob!!
+            awaitCondition { cancelEnteredIo.isCompleted }
+            model.refreshExternalIoObserver = null
             model.refreshExternal()
+            awaitJob(supersededRefreshJob)
             awaitJob(model.refreshJob!!)
 
             val reloadedDir = model.state.value.active.assetDirectory!!
@@ -155,9 +165,17 @@ class PortableAgentSaveSafetyTest {
 
             // 4. Local edits arriving after refresh starts abort adoption and delete any temporary extracted directory.
             file.outputStream().use { model.media.writeFmd(it, "# Version 3\n\n![Fig](assets/fig.svg)\n", svgAssets("assets/fig.svg", svgB)) }
+            val editEnteredIo = CompletableDeferred<Unit>()
+            val editReleaseIo = CompletableDeferred<Unit>()
+            model.refreshExternalIoObserver = {
+                editEnteredIo.complete(Unit)
+                editReleaseIo.await()
+            }
             model.refreshExternal()
-            pumpMainLooper(210)
+            awaitCondition { editEnteredIo.isCompleted }
             model.edit(noteId, "# Unsaved local draft\n")
+            model.refreshExternalIoObserver = null
+            editReleaseIo.complete(Unit)
             awaitJob(model.refreshJob!!)
 
             assertEquals("# Unsaved local draft\n", model.state.value.active.content)
@@ -167,6 +185,7 @@ class PortableAgentSaveSafetyTest {
                 bundlesRoot.listFiles()?.map { it.name }?.toSet().orEmpty() == baselineDirs + reloadedDir
             }
         } finally {
+            model.refreshExternalIoObserver = null
             model.detachReaderCapabilities(capabilities)
             val openDirs = model.state.value.tabs.mapNotNull { it.assetDirectory }
             store.clear()
