@@ -26,8 +26,7 @@ test('splits a long coalesced typing run before transfer validation rejects it',
   const restored=replayHistory(h,afterFirstRedo!,'redo');
   expect(restored).toBe(content);
   expect(validHistory(h)).toBe(true);
-// Keep the full 10,025-keystroke split workload under coverage and CI load.
-},30_000);
+});
 test('replacement/deletion and legacy transferred snapshots remain reversible',()=>{
   const h:NoteHistory={undo:[],redo:[],last:0};const original='😀 A note with $x^2$';const changed='😀 A note with $y^3$';
   recordHistory(h,original,changed,1000);recordHistory(h,changed,'😀 A note',2000);

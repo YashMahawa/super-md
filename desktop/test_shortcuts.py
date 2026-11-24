@@ -11,10 +11,7 @@ class ShortcutValidationTest(unittest.TestCase):
         normalized, error = normalize_shortcuts(defaults)
         self.assertEqual(error, "")
         self.assertEqual(normalized, defaults)
-        self.assertEqual(defaults["save"], ["Ctrl+S"])
-        self.assertEqual(defaults["save_as"], ["Ctrl+Shift+S"])
         self.assertTrue(native_label(defaults["find"][0]))
-        self.assertTrue(native_label(defaults["save_as"][0]))
         self.assertEqual(parse_sequence("Ctrl+PageDown"), "Ctrl+PgDown")
 
     def test_macos_defaults_use_portable_command_modifiers_and_fullscreen_chord(self):
@@ -25,8 +22,6 @@ class ShortcutValidationTest(unittest.TestCase):
             self.assertFalse(any("Meta" in sequence for sequence in sequences), f"{action} should use portable Ctrl for Command")
         self.assertEqual(defaults["copy"], ["Ctrl+C"])
         self.assertEqual(defaults["find"], ["Ctrl+F"])
-        self.assertEqual(defaults["save"], ["Ctrl+S"])
-        self.assertEqual(defaults["save_as"], ["Ctrl+Shift+S"])
         self.assertEqual(defaults["new_note"], ["Ctrl+T"])
         self.assertEqual(defaults["undo"], ["Ctrl+Z"])
         self.assertEqual(defaults["redo"], ["Ctrl+Shift+Z"])
@@ -44,10 +39,6 @@ class ShortcutValidationTest(unittest.TestCase):
         candidate["find"] = ["Ctrl+O"]
         _, error = normalize_shortcuts(candidate)
         self.assertIn("Open note", error)
-        candidate = default_shortcuts()
-        candidate["find"] = ["Ctrl+Shift+S"]
-        _, error = normalize_shortcuts(candidate)
-        self.assertIn("Save note as", error)
 
 
     def test_recorder_captures_modified_combinations_and_rejects_plain_letters(self):

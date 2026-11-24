@@ -168,7 +168,6 @@ ApplicationWindow {
         case "new_note": studio.newNote(); break
         case "open": openDialog.open(); break
         case "save": studio.saveSafely(); break
-        case "save_as": studio.saveAsSafely(); break
         case "undo": studio.command("undo"); break
         case "redo": studio.command("redo"); break
         case "copy": window.nativeReaderEditAction("copy"); break
@@ -368,7 +367,6 @@ ApplicationWindow {
                         id: noteActions
                         objectName: "compactNoteActions"
                         implicitWidth: 250
-                        NoteMenuItem { text: "Save note as"; icon.source: "../icons/FloppyDisk.svg"; onTriggered: studio.saveAsSafely() }
                         NoteMenuItem { text: "Insert image or link"; icon.source: "../icons/Image.svg"; onTriggered: studio.command("insert") }
                         NoteMenuItem { text: "Fix LaTeX"; icon.source: "../icons/Bug.svg"; onTriggered: studio.command("repair") }
                         NoteMenuItem { text: "Share note"; icon.source: "../icons/ShareNetwork.svg"; onTriggered: window.showExport(true) }
@@ -526,8 +524,6 @@ ApplicationWindow {
                         NoteMenuItem { text: "Paste"; actionVisible: Boolean(readerContextMenu.editFlags & ContextMenuRequest.CanPaste); onTriggered: window.reader.triggerWebAction(WebEngineView.Paste) }
                         NoteMenuItem { text: "Copy link address"; actionVisible: readerContextMenu.hasLink; onTriggered: window.reader.triggerWebAction(WebEngineView.CopyLinkToClipboard) }
                         NoteMenuItem { text: "Select all"; onTriggered: window.reader.triggerWebAction(WebEngineView.SelectAll) }
-                        MenuSeparator {}
-                        NoteMenuItem { text: "Save note as"; icon.source: "../icons/FloppyDisk.svg"; enabled: viewState.readerReady && !viewState.busy; onTriggered: studio.saveAsSafely() }
                         MenuSeparator {}
                         NoteMenuItem { objectName: "reloadMenuItem"; text: "Reload"; enabled: viewState.readerReady && !viewState.busy; onTriggered: studio.reloadReaderSafely() }
                         MenuSeparator { visible: readerContextMenu.selectionText.trim().length > 0; height: visible ? implicitHeight : 0 }
