@@ -28,7 +28,7 @@ from pathlib import Path
 from network_tls import client_context
 from PySide6.QtCore import QObject, Property, Signal, Slot, QStandardPaths, QTimer, QUrl, QFileSystemWatcher, QProcess, Qt, QPointF, QRect, QMetaObject, QBuffer, QByteArray, QIODevice
 from PySide6.QtGui import QDesktopServices, QFontDatabase, QGuiApplication, QCursor, QImage
-from documents import atomic_write, atomic_json, bundle, image_data, materialize_assets, open_note, write_portable, MIMES, MAX_IMAGE
+from documents import atomic_write, atomic_json, bundle, image_data, materialize_assets, open_note, read_note_markdown, write_portable, MIMES, MAX_IMAGE
 from markdown_export import write_markdown_export, write_markdown_zip
 from theme import detect_system_dark, read_system_palette, system_palette_paths, tokens
 from fonts import FontStore
@@ -704,7 +704,11 @@ class Studio(QObject):
                 self.note_file_stamps[path]=stamp
                 content,assets,portable=result
                 if content==expected and assets==current["assets"]:return
-                current.update(content=content,saved=content,assets=assets,saved_assets=copy.deepcopy(assets),portable=portable)
+                old_assets=current["assets"]
+                assets_changed=assets!=old_assets
+                merged_assets={k:old_assets[k] if old_assets.get(k)==v else v for k,v in assets.items()}
+                current.update(content=content,saved=content,assets=merged_assets,saved_assets=copy.deepcopy(merged_assets),portable=portable)
+                if assets_changed:self.session.reader_assets.revoke_tab(self.window_id, id)
                 self.message="Reloaded externally updated note"
                 self._emit(load=id==self.active)
             self._submit(lambda path=path:open_note(Path(path)),finished,False)
@@ -2112,6 +2116,7 @@ class Studio(QObject):
 
     def _save_text(self, tab, path, automatic=False):
         id, content, assets = tab["id"], tab["content"], dict(tab["assets"])
+        saved_assets = dict(tab.get("saved_assets", assets))
         expected, original_path = tab["saved"], tab["path"]
         portable = tab["portable"] and str(path) == original_path
         if id in self.saving: return
@@ -2129,9 +2134,9 @@ class Studio(QObject):
             if self.pending_close:
                 self._finish_close()
         def write():
-            if automatic and (not path.exists() or open_note(path)[0] != expected):
+            if automatic and (not path.exists() or read_note_markdown(path) != expected):
                 raise ValueError("Autosave paused: this file changed outside Super MD. Your edits remain in draft recovery; use Save as to keep both versions.")
-            if portable: write_portable(path,content,assets)
+            if portable: write_portable(path,content,assets,validated_assets=saved_assets)
             else:
                 materialize_assets(path.parent,assets)
                 atomic_write(path,content.encode())
@@ -3263,8 +3268,10 @@ class Studio(QObject):
                 captured = dict(tab)
                 captured["assets"] = dict(tab["assets"])
                 owner_id, tab_id = self.window_id, tab["id"]
+                embedded = captured["assets"].get(source)
+                cached = self.session.reader_assets.resolve_cached(owner_id, tab_id, source, embedded) if embedded is not None else None
                 def work():
-                    return resolve_source(captured, source)
+                    return cached if cached is not None else resolve_source(captured, source)
                 def finished(resolved, error):
                     current = next((item for item in self.tabs if item["id"] == tab_id), None)
                     if error:
@@ -3272,6 +3279,7 @@ class Studio(QObject):
                     elif current is None or not self.session.reader_asset_source_is_current(
                             owner_id, tab_id, source, _asset_identity(resolved.get("embedded_data")) if resolved.get("embedded_data") else 0,
                             resolved.get("path", "")):
+                        self.session.reader_assets.evict_source(owner_id, tab_id, source)
                         self.replied.emit(id, "null", "The note or image changed while it was being resolved")
                     else:
                         try:
@@ -3452,15 +3460,24 @@ class Studio(QObject):
                 target = next((t for t in self.tabs if t["id"] == captured["id"]),None)
                 if command == "import_images" and target: target["assets"].update(captured["assets"])
                 if command == "export_fmd_native" and args.get("save") and target:
-                    target.update(saved=args["originalContent"], assets=args["assets"])
-                    target["saved_assets"] = copy.deepcopy(args["assets"])
+                    old_assets = target.get("assets", {})
+                    if old_assets != args["assets"]:
+                        self.session.reader_assets.revoke_tab(self.window_id, target["id"])
+                    merged_assets = {k: old_assets[k] if old_assets.get(k) == v else v for k, v in args["assets"].items()}
+                    target.update(saved=args["originalContent"], assets=merged_assets)
+                    target["saved_assets"] = copy.deepcopy(merged_assets)
                     if target["content"] == args["originalContent"]: target["content"] = target["saved"] = args["content"]
                     self._recover()
                     if self.pending_close: self._finish_close()
                 elif command == "export_fmd_native" and save_as and target:
                     if target["content"] == args["originalContent"]:
-                        target.update(path=save_as,name=Path(save_as).name,content=args["content"],saved=args["content"],assets=args["assets"],portable=True)
-                        target["saved_assets"] = copy.deepcopy(args["assets"])
+                        old_assets = target.get("assets", {})
+                        path_changed = target.get("path") != save_as
+                        if old_assets != args["assets"] or path_changed:
+                            self.session.reader_assets.revoke_tab(self.window_id, target["id"])
+                        merged_assets = args["assets"] if path_changed else {k: old_assets[k] if old_assets.get(k) == v else v for k, v in args["assets"].items()}
+                        target.update(path=save_as,name=Path(save_as).name,content=args["content"],saved=args["content"],assets=merged_assets,portable=True)
+                        target["saved_assets"] = copy.deepcopy(merged_assets)
                         self._recover()
                         self._emit()
                         if self.pending_close: self._finish_close()

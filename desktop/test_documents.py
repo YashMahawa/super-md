@@ -145,4 +145,90 @@ class DocumentsTest(unittest.TestCase):
             atomic_write(path,b"new")
             self.assertEqual(stat.S_IMODE(path.stat().st_mode),0o640)
 
+    def test_structural_envelope_validation_defers_base64_decode_and_enforces_limits(self):
+        import documents
+        from unittest.mock import patch
+        from documents import decode_note_bytes, read_note_markdown, validate_envelope
+
+        png = b"\x89PNG\r\n\x1a\n" + b"p" * 128
+        assets = {"assets/pic.png": "data:image/png;base64," + base64.b64encode(png).decode("ascii")}
+        packed = compressed_bundle("# Heading\n\n![pic](assets/pic.png)\n", assets)
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            smd = root / "note.smd"
+            smd.write_bytes(packed)
+            json_smd = root / "plain-json.smd"
+            json_smd.write_text(json.dumps(bundle("# JSON note\n", assets)), encoding="utf-8")
+
+            with patch("documents.base64.b64decode", wraps=base64.b64decode) as spy:
+                text, loaded_assets, portable = open_note(smd)
+                self.assertTrue(portable)
+                self.assertEqual(loaded_assets, assets)
+                self.assertEqual(read_note_markdown(smd), text)
+                self.assertEqual(decode_note_bytes(packed, smd), (text, assets, True))
+                self.assertEqual(open_note(json_smd), ("# JSON note\n", assets, True))
+                write_portable(smd, "# Updated\n", loaded_assets, validate_assets=False)
+                write_portable(smd, "# Updated again\n", loaded_assets, validated_assets=loaded_assets)
+                self.assertEqual(read_note_markdown(smd), "# Updated again\n")
+                self.assertEqual(spy.call_count, 0)
+
+                # Exact 25 MB encoded bound passes structural validation; 25 MB + 1 byte fails.
+                exact_25mb_len = (documents.MAX_IMAGE // 3) * 4 + 4  # 33,333,336 chars -> 25,000,000 bytes with '=='
+                exact_25mb = "A" * (exact_25mb_len - 2) + "=="
+                over_25mb = "A" * (exact_25mb_len - 1) + "="  # 25,000,001 bytes
+                validate_envelope({
+                    "format": "supermd-smd", "version": 1, "markdown": "ok",
+                    "assets": {"assets/max.png": "data:image/png;base64," + exact_25mb},
+                })
+                for invalid_envelope in (
+                    {"format": "other", "version": 1, "markdown": "", "assets": {}},
+                    {"format": "supermd-smd", "version": True, "markdown": "", "assets": {}},
+                    {"format": "supermd-smd", "version": 1, "markdown": "", "assets": {}, "extra": 1},
+                    {"format": "supermd-smd", "version": 1, "markdown": "x" * (documents.MAX_MARKDOWN + 1), "assets": {}},
+                    {"format": "supermd-smd", "version": 1, "markdown": "", "assets": {
+                        f"assets/a{i}.png": "data:image/png;base64,eA==" for i in range(documents.MAX_ASSETS + 1)
+                    }},
+                    {"format": "supermd-smd", "version": 1, "markdown": "", "assets": {
+                        "assets/../escape.png": "data:image/png;base64,eA=="
+                    }},
+                    {"format": "supermd-smd", "version": 1, "markdown": "", "assets": {
+                        "assets/mismatch.png": "data:image/jpeg;base64,eA=="
+                    }},
+                    {"format": "supermd-smd", "version": 1, "markdown": "", "assets": {
+                        "assets/unaligned.png": "data:image/png;base64,ABC"
+                    }},
+                    {"format": "supermd-smd", "version": 1, "markdown": "", "assets": {
+                        "assets/triplepad.png": "data:image/png;base64,A==="
+                    }},
+                    {"format": "supermd-smd", "version": 1, "markdown": "", "assets": {
+                        "assets/huge.png": "data:image/png;base64," + over_25mb
+                    }},
+                    {"format": "supermd-smd", "version": 1, "markdown": "", "assets": {
+                        f"assets/part{i}.png": "data:image/png;base64," + exact_25mb for i in range(4)
+                    }},
+                ):
+                    with self.assertRaises(ValueError):
+                        validate_envelope(invalid_envelope)
+                self.assertEqual(spy.call_count, 0)
+
+            # Untrusted validation entry points continue to run full base64.b64decode(..., validate=True).
+            malformed = {"assets/bad.png": "data:image/png;base64,@@@@"}
+            validate_envelope({"format": "supermd-smd", "version": 1, "markdown": "", "assets": malformed})
+            with self.assertRaises(ValueError):
+                validate({"format": "supermd-smd", "version": 1, "markdown": "", "assets": malformed})
+            with self.assertRaises(ValueError):
+                bundle("", malformed)
+            with self.assertRaises(ValueError):
+                write_portable(root / "bad.smd", "", malformed)
+            with self.assertRaises(ValueError):
+                write_portable(root / "bad2.smd", "", {**assets, **malformed}, validated_assets=assets)
+            with self.assertRaises(ValueError):
+                materialize_assets(root / "out", malformed)
+            bad_smd = root / "corrupt-b64.smd"
+            write_portable(bad_smd, "# text", malformed, validate_assets=False)
+            self.assertEqual(read_note_markdown(bad_smd), "# text")
+            with self.assertRaises(ValueError):
+                open_note(bad_smd, decode_assets=True)
+
 if __name__ == "__main__": unittest.main()
