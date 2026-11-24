@@ -32,6 +32,16 @@ describe("live Markdown blocks", () => {
     expect((live.match(/href=/g)||[]).length).toBe((read.match(/href=/g)||[]).length);
     expect(live).toContain('First source.');expect(live).toContain('Second source.');
   });
+  it('excludes YAML frontmatter from splitMarkdownBlocks across delimiter variations',()=>{
+    const prefix='\uFEFF---  \ntitle: Isolated\ntags: [one]\n...\n\n';
+    const body='# First Heading\n\nParagraph text.';
+    const source=prefix+body;
+    const blocks=splitMarkdownBlocks(source);
+    expect(blocks[0].start).toBe(prefix.length);
+    expect(blocks[0].text).toBe('# First Heading\n\n');
+    expect(blocks[0].text).not.toContain('Isolated');
+    expect(source.slice(0,blocks[0].start)+blocks.map(b=>b.text).join('')).toBe(source);
+  });
 });
 
 describe("CommonMark block flow helpers", () => {
@@ -101,5 +111,11 @@ describe("CommonMark block flow helpers", () => {
     expect(spans).toHaveLength(2);
     expect(doc.slice(spans[0].start, spans[0].end)).toBe("# One");
     expect(doc.slice(spans[1].start, spans[1].end)).toBe("Paragraph[^1]");
+
+    const withFrontmatter = "\uFEFF---  \ntitle: Metadata\n...\n\n# First\n\nSecond";
+    const fmSpans = editableBlockSpans(withFrontmatter);
+    expect(fmSpans).toHaveLength(2);
+    expect(withFrontmatter.slice(fmSpans[0].start, fmSpans[0].end)).toBe("# First");
+    expect(withFrontmatter.slice(fmSpans[1].start, fmSpans[1].end)).toBe("Second");
   });
 });

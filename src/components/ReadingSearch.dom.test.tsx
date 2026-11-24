@@ -127,4 +127,48 @@ describe("ReadingSearch DOM behavior", () => {
     act(() => root.unmount());
     host.remove();
   });
+
+  it("maps body matches accurately across YAML frontmatter when toggling Replace in source", async () => {
+    const host = document.createElement("div");
+    document.body.append(host);
+    const root = createRoot(host);
+    let current = "---\ntitle: Alpha Study\n---\n\n# Heading\n\nAlpha body.";
+    const changes: string[] = [];
+
+    await act(async () => {
+      root.render(
+        <div className="android-document">
+          <ReadingSearch content={current} close={() => {}} onChange={(next) => { current = next; changes.push(next); }} />
+          <section className="android-reading">
+            <LiveEditor markdown={current} onChange={(next) => { current = next; }} documentPath={null} python="" dark={false} />
+          </section>
+        </div>
+      );
+    });
+    await act(async () => { await new Promise((resolve) => requestAnimationFrame(() => resolve(undefined))); });
+
+    const searchInput = host.querySelector<HTMLInputElement>('input[aria-label="Find in note"]')!;
+    act(() => setInputValue(searchInput, "Alpha"));
+    await act(async () => { await new Promise((resolve) => requestAnimationFrame(() => resolve(undefined))); });
+
+    // Body search ignores rendered YAML properties, counting only the 1 body match.
+    expect(host.querySelector("output")?.textContent).toBe("0 / 1");
+    const nextButton = host.querySelector<HTMLButtonElement>('button[aria-label="Next match"]')!;
+    act(() => nextButton.click());
+    expect(host.querySelector("output")?.textContent).toBe("1 / 1");
+
+    // Toggling Replace in source maps that active body match to source match 2 / 2 (after frontmatter title).
+    const replaceToggle = host.querySelector<HTMLButtonElement>('button[aria-label="Replace in source"]')!;
+    act(() => replaceToggle.click());
+    expect(host.querySelector("output")?.textContent).toBe("2 / 2");
+
+    const replaceInput = host.querySelector<HTMLInputElement>('input[aria-label="Replacement text"]')!;
+    const buttons = Array.from(host.querySelectorAll<HTMLButtonElement>(".search-replace button"));
+    act(() => setInputValue(replaceInput, "Beta"));
+    act(() => buttons[0].click());
+    expect(changes.at(-1)).toBe("---\ntitle: Alpha Study\n---\n\n# Heading\n\nBeta body.");
+
+    act(() => root.unmount());
+    host.remove();
+  });
 });

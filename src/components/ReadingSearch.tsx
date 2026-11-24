@@ -22,7 +22,7 @@ export function readingMatches(host: Element, query: string, caseSensitive=false
   let text="", node:Node|null, block:Element|null=null;
   while ((node=walker.nextNode())) {
     const parent=node.parentElement;
-    if (!parent || parent.closest("button,input,textarea,svg,annotation,.katex-mathml,.chart-controls,.chart-toolbar,.chart-legend,.image-edit-tools")) continue;
+    if (!parent || parent.closest("button,input,textarea,svg,annotation,.katex-mathml,.chart-controls,.chart-toolbar,.chart-legend,.image-edit-tools,[data-frontmatter-properties],.document-properties")) continue;
     const nextBlock=parent.closest("p,h1,h2,h3,h4,li,pre,td,summary");
     if (block !== nextBlock) {text+="\n";block=nextBlock;}
     const value=node.textContent||"";
@@ -114,39 +114,35 @@ function deepestSourceOwner(root:Element,from:number,to:number):HTMLElement|null
   }
   return best;
 }
-function mapSourceRangeToDomRange(scope:HTMLElement,target:SourceRange,allSourceRanges:SourceRange[],content:string,query:string,caseSensitive:boolean):Range|null {
-  const owner=deepestSourceOwner(scope,target.from,target.to);if(!owner)return null;
-  const visible=visibleSourceSpan(owner,content);
-  if(!visible||target.from<visible.start||target.to>visible.end)return null;
+function sameRange(a:Range,b:Range):boolean {
+  return a.startContainer===b.startContainer&&a.startOffset===b.startOffset&&a.endContainer===b.endContainer&&a.endOffset===b.endOffset;
+}
+function directOwnerMatches(owner:HTMLElement,visible:{start:number;end:number},allSourceRanges:SourceRange[],query:string,caseSensitive:boolean):{directSource:SourceRange[];directDom:Range[]} {
   const childSpans=Array.from(owner.querySelectorAll<HTMLElement>("[data-source-start][data-source-end]")).map(sourceBounds).filter((item):item is {start:number;end:number}=>item!==null);
   const directSource=allSourceRanges.filter(item=>item.from>=visible.start&&item.to<=visible.end&&!childSpans.some(child=>child.start<=item.from&&item.to<=child.end));
-  const ordinal=directSource.findIndex(item=>item.from===target.from&&item.to===target.to);
-  if(ordinal<0)return null;
-  const directDom=readingMatches(owner,query,caseSensitive).filter(range=>{
-    if(owner.matches(".code-container")&&range.startContainer.parentElement?.closest("summary"))return false;
-    const rangeOwner=range.startContainer.parentElement?.closest<HTMLElement>("[data-source-start][data-source-end]");
-    return !rangeOwner||rangeOwner===owner||!owner.contains(rangeOwner);
-  });
-  return directDom[ordinal]??null;
-}
-function mapDomRangeToSourceIndex(range:Range,allSourceRanges:SourceRange[],content:string,query:string,caseSensitive:boolean):number {
-  const owner=range.startContainer.parentElement?.closest<HTMLElement>("[data-source-start][data-source-end]");
-  if(!owner)return -1;
-  const visible=visibleSourceSpan(owner,content);if(!visible)return -1;
   const directDom=readingMatches(owner,query,caseSensitive).filter(candidate=>{
     if(owner.matches(".code-container")&&candidate.startContainer.parentElement?.closest("summary"))return false;
     const candidateOwner=candidate.startContainer.parentElement?.closest<HTMLElement>("[data-source-start][data-source-end]");
     return !candidateOwner||candidateOwner===owner||!owner.contains(candidateOwner);
   });
-  const ordinal=directDom.findIndex(candidate=>candidate.startContainer===range.startContainer&&candidate.startOffset===range.startOffset&&candidate.endContainer===range.endContainer&&candidate.endOffset===range.endOffset);
-  if(ordinal<0)return -1;
-  const childSpans=Array.from(owner.querySelectorAll<HTMLElement>("[data-source-start][data-source-end]")).map(sourceBounds).filter((item):item is {start:number;end:number}=>item!==null);
-  const directSource=allSourceRanges.filter(item=>item.from>=visible.start&&item.to<=visible.end&&!childSpans.some(child=>child.start<=item.from&&item.to<=child.end));
-  const target=directSource[ordinal];if(!target)return -1;
-  return allSourceRanges.findIndex(item=>item.from===target.from&&item.to===target.to);
+  return {directSource,directDom};
 }
-function sameRange(a:Range,b:Range):boolean {
-  return a.startContainer===b.startContainer&&a.startOffset===b.startOffset&&a.endContainer===b.endContainer&&a.endOffset===b.endOffset;
+function mapSourceRangeToDomRange(scope:HTMLElement,target:SourceRange,allSourceRanges:SourceRange[],content:string,query:string,caseSensitive:boolean):Range|null {
+  const owner=deepestSourceOwner(scope,target.from,target.to);if(!owner)return null;
+  const visible=visibleSourceSpan(owner,content);
+  if(!visible||target.from<visible.start||target.to>visible.end)return null;
+  const {directSource,directDom}=directOwnerMatches(owner,visible,allSourceRanges,query,caseSensitive);
+  const ordinal=directSource.findIndex(item=>item.from===target.from&&item.to===target.to);
+  return ordinal>=0?directDom[ordinal]??null:null;
+}
+function mapDomRangeToSourceIndex(range:Range,allSourceRanges:SourceRange[],content:string,query:string,caseSensitive:boolean):number {
+  const owner=range.startContainer.parentElement?.closest<HTMLElement>("[data-source-start][data-source-end]");
+  if(!owner)return -1;
+  const visible=visibleSourceSpan(owner,content);if(!visible)return -1;
+  const {directSource,directDom}=directOwnerMatches(owner,visible,allSourceRanges,query,caseSensitive);
+  const ordinal=directDom.findIndex(candidate=>sameRange(candidate,range));
+  const target=ordinal>=0?directSource[ordinal]:undefined;
+  return target?allSourceRanges.findIndex(item=>item.from===target.from&&item.to===target.to):-1;
 }
 function revealMountedBlock(element:HTMLElement):void {
   if(element.closest('[data-windowed-mounted="false"]'))flushSync(()=>revealWindowed(element));
@@ -244,7 +240,8 @@ export default function ReadingSearch({content,close,onChange,sourceSession}:{co
       let domRange=block?mapSourceRangeToDomRange(block,range,sourceRanges,content,query,caseSensitive):null;
       const opened=openDisclosuresFor(domRange?.startContainer.parentElement??block,block,range);
       if(opened&&block)domRange=mapSourceRangeToDomRange(block,range,sourceRanges,content,query,caseSensitive);
-      const fallback=(block?deepestSourceOwner(block,range.from,range.to):null)??block;
+      const frontmatterHeader=!block?host?.querySelector<HTMLElement>("[data-frontmatter-properties],.document-properties")??null:null;
+      const fallback=(block?deepestSourceOwner(block,range.from,range.to):frontmatterHeader)??block;
       scrollTargetIntoView(host,domRange,fallback);
       syncHighlights(host,domRange);
       setIndex(next);
@@ -252,7 +249,8 @@ export default function ReadingSearch({content,close,onChange,sourceSession}:{co
         const liveHost=findReadingHost();
         const liveBlock=liveHost?findContainingBlock(liveHost,range.from,range.to):null;
         const liveRange=liveBlock?mapSourceRangeToDomRange(liveBlock,range,sourceRanges,content,query,caseSensitive):null;
-        scrollTargetIntoView(liveHost,liveRange,liveBlock);
+        const liveFallback=liveBlock??liveHost?.querySelector<HTMLElement>("[data-frontmatter-properties],.document-properties")??null;
+        scrollTargetIntoView(liveHost,liveRange,liveFallback);
         syncHighlights(liveHost,liveRange);
       });
       return;

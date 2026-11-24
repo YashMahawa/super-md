@@ -4,6 +4,7 @@ import remarkGfm from "remark-gfm";
 import remarkMath from "remark-math";
 import { visit } from "unist-util-visit";
 import { invoke } from "./nativeBridge";
+import { maskFrontmatter } from "./frontmatter";
 import { remarkObsidianMath } from "./obsidianMath";
 
 export interface ImportedImage { source: string; alt: string }
@@ -13,7 +14,7 @@ export const markdownLabel = (value: string) => value.replace(/[\\[\]]/g, "\\$&"
 export const imageMarkdown = (image: ImportedImage) => `![${markdownLabel(image.alt)}](<${image.source.replace(/>/g, "%3E")}>)`;
 export interface ImageRange { from: number; to: number; source: string }
 export function imageRanges(markdown: string): ImageRange[] {
-  const tree = unified().use(remarkParse).use(remarkGfm).use(remarkMath).use(remarkObsidianMath).parse(markdown);
+  const tree = unified().use(remarkParse).use(remarkGfm).use(remarkMath).use(remarkObsidianMath).parse(maskFrontmatter(markdown));
   const definitions = new Map<string, string>(); const result: ImageRange[] = [];
   visit(tree, "definition", (node: any) => { definitions.set(node.identifier, node.url); });
   visit(tree, (node: any) => {
@@ -67,7 +68,7 @@ export async function importImageFiles(files: File[]): Promise<ImportedImage[]> 
 // their bytes live in the envelope, never in the displayed Markdown editor.
 export async function prepareFmd(markdown: string, documentPath: string | null) {
   const processor = unified().use(remarkParse).use(remarkGfm).use(remarkMath).use(remarkObsidianMath);
-  const tree = processor.parse(markdown);
+  const tree = processor.parse(maskFrontmatter(markdown));
   const assets: Record<string, string> = {}; const work: Promise<void>[] = [];
   const shared = new Map<string, Promise<string>>();
   const edits: Array<{ start: number; end: number; value: string }> = [];
