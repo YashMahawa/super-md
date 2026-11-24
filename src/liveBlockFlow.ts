@@ -287,7 +287,7 @@ export function editableBlockSpans(markdown: string, existing?: DocumentAnalysis
   for (let i = 0; i < nodes.length; i++) {
     const node = nodes[i];
     if (NON_EDITABLE_NODE_TYPES.has(node.type)) continue;
-    const block = analysis.blocks[i];
+    const block = analysis.bodyBlocks[i];
     if (!block) continue;
     spans.push({
       blockStart: block.start,
