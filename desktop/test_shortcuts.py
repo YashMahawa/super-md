@@ -11,6 +11,8 @@ class ShortcutValidationTest(unittest.TestCase):
         normalized, error = normalize_shortcuts(defaults)
         self.assertEqual(error, "")
         self.assertEqual(normalized, defaults)
+        self.assertEqual(defaults["save"], ["Ctrl+S"])
+        self.assertEqual(defaults["save_as"], ["Ctrl+Shift+S"])
         self.assertTrue(native_label(defaults["find"][0]))
         self.assertEqual(parse_sequence("Ctrl+PageDown"), "Ctrl+PgDown")
 
@@ -20,6 +22,8 @@ class ShortcutValidationTest(unittest.TestCase):
             if action == "fullscreen":
                 continue
             self.assertFalse(any("Meta" in sequence for sequence in sequences), f"{action} should use portable Ctrl for Command")
+        self.assertEqual(defaults["save"], ["Ctrl+S"])
+        self.assertEqual(defaults["save_as"], ["Ctrl+Shift+S"])
         self.assertEqual(defaults["copy"], ["Ctrl+C"])
         self.assertEqual(defaults["bold"], ["Ctrl+B"])
         self.assertEqual(defaults["italic"], ["Ctrl+I"])
@@ -56,11 +60,11 @@ class ShortcutValidationTest(unittest.TestCase):
     def test_recorder_captures_modified_combinations_and_rejects_plain_letters(self):
         from PySide6.QtCore import Qt
 
-        sequence, error = capture_sequence(int(Qt.Key_F), int(Qt.ControlModifier.value))
+        sequence, error = capture_sequence(int(Qt.Key.Key_F), int(Qt.KeyboardModifier.ControlModifier.value))
         self.assertEqual((sequence, error), ("Ctrl+F", ""))
-        sequence, error = capture_sequence(int(Qt.Key_F11), int(Qt.NoModifier.value))
+        sequence, error = capture_sequence(int(Qt.Key.Key_F11), int(Qt.KeyboardModifier.NoModifier.value))
         self.assertEqual((sequence, error), ("F11", ""))
-        sequence, error = capture_sequence(int(Qt.Key_A), int(Qt.NoModifier.value))
+        sequence, error = capture_sequence(int(Qt.Key.Key_A), int(Qt.KeyboardModifier.NoModifier.value))
         self.assertEqual(sequence, "")
         self.assertIn("Use Ctrl", error)
 

@@ -9,7 +9,7 @@ pub fn load_referenced_assets(markdown: &str, directory: &Path) -> Result<HashMa
     for entry in fs::read_dir(directory)? {
         let entry = entry?;
         let name = entry.file_name().to_string_lossy().into_owned();
-        let font = name.starts_with("__font_") && (name.ends_with(".ttf") || name.ends_with(".otf"));
+        let font = crate::is_font_asset(&name);
         if !font && !referenced.contains(&name) { continue; }
         // Staging assets must be regular local files, never links to unrelated
         // storage. Inspect limits before allocating, then bound the actual read
