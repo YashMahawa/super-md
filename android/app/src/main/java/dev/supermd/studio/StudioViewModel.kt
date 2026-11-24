@@ -1132,21 +1132,8 @@ class StudioViewModel(app: Application, val workspaceKey: String = "main") : And
                     return@performReaderBarrier
                 }
                 if (!closingNoteIds.add(id)) return@performReaderBarrier
-                if (note.uri == null && note.content.isBlank() && note.assetDirectory == null) {
-                    readerEcho.remove(id)
-                    clearReaderEditProtocol(id)
-                    autosavePending.remove(id)
-                    change { state ->
-                        val remaining = state.tabs.filterNot { it.id == id }
-                        val next = remaining.ifEmpty { listOf(Note()) }
-                        state.copy(tabs = next, activeId = if (state.active.id == id) next.first().id else state.activeId,
-                            conflictedTabIds = state.conflictedTabIds - id,
-                            pendingCloseNoteId = state.pendingCloseNoteId?.takeUnless { it == id },
-                            pendingSaveConflictNoteId = state.pendingSaveConflictNoteId?.takeUnless { it == id },
-                            message = "Empty tab discarded")
-                    }
-                    closingNoteIds.remove(id)
-                } else if (note.uri == null && note.content.isBlank() && !note.assetsDirty && runCatching { media.portableAssets(note.assetDirectory).length() == 0 }.getOrDefault(false)) {
+                val emptyPortable = note.assetDirectory != null && !note.assetsDirty && runCatching { media.portableAssets(note.assetDirectory).length() == 0 }.getOrDefault(false)
+                if (note.uri == null && note.content.isBlank() && (note.assetDirectory == null || emptyPortable)) {
                     readerEcho.remove(id)
                     clearReaderEditProtocol(id)
                     autosavePending.remove(id)
@@ -1616,8 +1603,7 @@ class StudioViewModel(app: Application, val workspaceKey: String = "main") : And
         }
     }
     fun completePortableSaveAs(uri: Uri, noteId: String = portableSaveAsNoteId ?: mutable.value.active.id) {
-        portableOutput = uri
-        portableDestinationIsNew = true
+        setPortableDestination(uri)
         portableSaveAsNoteId = noteId
         portableForceOverwrite = true
         if (requestPortableWrite?.invoke(false) == true) return
@@ -1785,8 +1771,7 @@ class StudioViewModel(app: Application, val workspaceKey: String = "main") : And
                 onComplete?.invoke("The note was closed before saving")
                 return@withLock
             }
-            if (expectedRevision != null && !java.security.MessageDigest.getInstance("SHA-256")
-                    .digest(note.content.toByteArray(Charsets.UTF_8)).joinToString("") { "%02x".format(it) }.equals(expectedRevision, ignoreCase = true)) {
+            if (expectedRevision != null && !agentContentRevision(note.content).equals(expectedRevision, ignoreCase = true)) {
                 closeAfterSaveNoteId = null
                 mutable.value = mutable.value.copy(busy = false)
                 onComplete?.invoke("The note changed since the supplied revision; no changes were saved")
@@ -1964,7 +1949,7 @@ class StudioViewModel(app: Application, val workspaceKey: String = "main") : And
             val revision = java.security.MessageDigest.getInstance("SHA-256").digest(note.content.toByteArray(Charsets.UTF_8)).joinToString("") { "%02x".format(it) }
             require(revision == expectedRevision) { "The document changed; read it again before replacing an image" }
             require(note.portable && note.uri != null && note.saved == note.content) { "Image replacement requires a saved, unchanged portable .smd note" }
-            val sourceList = JSONArray(markdownImageSourcesJson(note.content))
+            val sourceList = JSONArray(PdfEngine.imageSources(note.content))
             val linkedAssets = (0 until sourceList.length()).map { sourceList.getString(it) }.distinct().filter(media::validKey)
             val resolvedAssetName = linkedAssets.firstOrNull { source ->
                 source == assetName || java.security.MessageDigest.getInstance("SHA-256").digest(source.toByteArray(Charsets.UTF_8)).joinToString("") { byte -> "%02x".format(byte) } == assetName
@@ -1991,7 +1976,7 @@ class StudioViewModel(app: Application, val workspaceKey: String = "main") : And
                 val disk = resolver.openInputStream(noteUri)?.use(media::openFmd) ?: error("Cannot read the current portable note")
                 diskAssets = disk.directory
                 require(disk.markdown == note.saved) { "The portable note's Markdown changed on disk; reopen it before replacement" }
-                val sources = JSONArray(markdownImageSourcesJson(note.content))
+                val sources = JSONArray(PdfEngine.imageSources(note.content))
                 (0 until sources.length()).map { sources.getString(it) }.distinct().filter(media::validKey).forEach { source ->
                     val currentFile = media.local(source, note.assetDirectory) ?: error("An open image is missing: $source")
                     val diskFile = media.local(source, disk.directory) ?: error("The saved note no longer contains image $source")
@@ -2341,7 +2326,7 @@ class StudioViewModel(app: Application, val workspaceKey: String = "main") : And
         } finally { staging.deleteRecursively() }
     }
 }
-internal fun markdownImageSourcesJson(markdown: String): String = try {
+private fun markdownImageSourcesJson(markdown: String): String = try {
     PdfEngine.imageSources(markdown)
 } catch (_: UnsatisfiedLinkError) {
     fallbackMarkdownImageSourcesJson(markdown)

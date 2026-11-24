@@ -5,7 +5,7 @@ import unittest
 from pathlib import Path
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
-from PySide6.QtCore import QEvent, QObject, QUrl, QPointF, QMetaObject
+from PySide6.QtCore import QEvent, QObject, QUrl, QPointF, QMetaObject, Qt
 from PySide6.QtGui import QGuiApplication, QColor
 from PySide6.QtQml import QQmlEngine, QQmlComponent
 from PySide6.QtQuickControls2 import QQuickStyle
@@ -110,22 +110,21 @@ ApplicationWindow {
         self.assertIsNotNone(button)
         self.assertIsNotNone(reopen)
         self.assertIsNotNone(save_as)
-        from PySide6.QtCore import Qt
         for width in (840, 1280):
             self.window.setProperty("width", width)
             QTest.qWait(40)
             self.assertTrue(button.property("visible"), f"More button must stay visible at width={width}")
-            QTest.mouseClick(self.window, Qt.LeftButton, Qt.NoModifier, button.mapToScene(QPointF(button.width()/2, button.height()/2)).toPoint())
+            QTest.mouseClick(self.window, Qt.MouseButton.LeftButton, Qt.KeyboardModifier.NoModifier, button.mapToScene(QPointF(button.width()/2, button.height()/2)).toPoint())
             QTest.qWait(80)
             self.assertTrue(reopen.property("visible"), f"Reopen closed tab must be visible at width={width}")
             self.assertEqual(reopen.property("text"), "Reopen closed tab")
             self.assertTrue(save_as.property("visible"), f"Save as must be visible at width={width}")
             self.assertEqual(save_as.property("text"), "Save as")
-            QTest.mouseClick(self.window, Qt.LeftButton, Qt.NoModifier, reopen.mapToScene(QPointF(60, reopen.height()/2)).toPoint())
+            QTest.mouseClick(self.window, Qt.MouseButton.LeftButton, Qt.KeyboardModifier.NoModifier, reopen.mapToScene(QPointF(60, reopen.height()/2)).toPoint())
             QTest.qWait(40)
-            QTest.mouseClick(self.window, Qt.LeftButton, Qt.NoModifier, button.mapToScene(QPointF(button.width()/2, button.height()/2)).toPoint())
+            QTest.mouseClick(self.window, Qt.MouseButton.LeftButton, Qt.KeyboardModifier.NoModifier, button.mapToScene(QPointF(button.width()/2, button.height()/2)).toPoint())
             QTest.qWait(80)
-            QTest.mouseClick(self.window, Qt.LeftButton, Qt.NoModifier, save_as.mapToScene(QPointF(60, save_as.height()/2)).toPoint())
+            QTest.mouseClick(self.window, Qt.MouseButton.LeftButton, Qt.KeyboardModifier.NoModifier, save_as.mapToScene(QPointF(60, save_as.height()/2)).toPoint())
             QTest.qWait(40)
         self.assertEqual(self.palette.reopened, 2)
         self.assertEqual(self.palette.saved_as, 2)
