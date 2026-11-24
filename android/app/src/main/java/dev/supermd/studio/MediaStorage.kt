@@ -465,7 +465,7 @@ class MediaStorage(private val context: Context) {
         return markdown ?: error("Portable source is unavailable")
     }
     fun writeLocalPortable(output: java.io.OutputStream, markdown: String, directory: String?) {
-        val sources=JSONArray(PdfEngine.imageSources(markdown))
+        val sources=JSONArray(markdownImageSourcesJson(markdown))
         val files=(0 until sources.length()).map {sources.getString(it)}.distinct().filter {it.startsWith("assets/")}.map {source->source to (local(source,directory) ?: error("Save manually to resolve a new image: $source"))}
         require(files.size<=512 && files.sumOf {it.second.length()}<=75_000_000 && markdown.toByteArray().size<=20_000_000)
         val boundedCompressed=object:java.io.FilterOutputStream(output){var bytes=0L;override fun write(value:Int){require(++bytes<=120_000_000);out.write(value)};override fun write(buffer:ByteArray,offset:Int,length:Int){require(bytes+length<=120_000_000);out.write(buffer,offset,length);bytes+=length}}
