@@ -3,7 +3,7 @@ import { mkdir, mkdtemp, rm, writeFile } from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
 import test from 'node:test';
-import { inventory, verifyNativeResources } from './report-web-assets.mjs';
+import { inventory, MAX_READER_FONT_BYTES, verifyNativeResources, verifyReaderFontBudget } from './report-web-assets.mjs';
 
 test('traces reader entrypoints through local JS and CSS without treating app assets as reachable', async () => {
   const root = await mkdtemp(path.join(os.tmpdir(), 'supermd-assets-'));
@@ -62,6 +62,42 @@ test('verifies generated notices and every public help, font, license, and theme
     assert.equal(result.publicFileCount, 4);
     await rm(path.join(dist, 'fonts/reader.ttf'));
     await assert.rejects(verifyNativeResources(dist, publicRoot), /fonts\/reader\.ttf/);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test('enforces .woff2-only font assets and reachable reader font byte budgets', async () => {
+  const root = await mkdtemp(path.join(os.tmpdir(), 'supermd-font-budget-'));
+  try {
+    await mkdir(path.join(root, 'assets'));
+    await writeFile(path.join(root, 'android-reader.html'), '<link rel="stylesheet" href="./assets/reader.css">');
+    await writeFile(path.join(root, 'qt-reader.html'), '<link rel="stylesheet" href="./assets/reader.css">');
+    await writeFile(path.join(root, 'assets/reader.css'), '@font-face{font-family:"Manrope Variable";src:url("./manrope.woff2") format("woff2")}');
+    await writeFile(path.join(root, 'assets/manrope.woff2'), 'woff2-binary-payload');
+
+    const cleanReport = await inventory(root);
+    const check = verifyReaderFontBudget(cleanReport);
+    assert.equal(check.readerFontCount, 1);
+    assert.equal(check.readerFontBytes, 20);
+    assert.equal(check.maxReaderFontBytes, MAX_READER_FONT_BYTES);
+
+    assert.throws(() => verifyReaderFontBudget(cleanReport, { maxBytes: 10 }), /exceed budget/);
+
+    await writeFile(path.join(root, 'assets/legacy.ttf'), 'ttf');
+    const withUnreachedTtf = await inventory(root);
+    assert.throws(() => verifyReaderFontBudget(withUnreachedTtf), /forbidden \.ttf\/\.woff font assets.*legacy\.ttf/);
+    await rm(path.join(root, 'assets/legacy.ttf'));
+
+    await writeFile(path.join(root, 'assets/legacy-math.woff'), 'woff');
+    const withUnreachedWoff = await inventory(root);
+    assert.throws(() => verifyReaderFontBudget(withUnreachedWoff), /forbidden \.ttf\/\.woff font assets.*legacy-math\.woff/);
+    await rm(path.join(root, 'assets/legacy-math.woff'));
+
+    await writeFile(path.join(root, 'assets/reader.css'), '@font-face{font-family:"Custom";src:url("./custom.otf") format("opentype")}');
+    await writeFile(path.join(root, 'assets/custom.otf'), 'otf');
+    const withReachableOtf = await inventory(root);
+    assert.throws(() => verifyReaderFontBudget(withReachableOtf), /\.woff2 only.*custom\.otf/);
   } finally {
     await rm(root, { recursive: true, force: true });
   }

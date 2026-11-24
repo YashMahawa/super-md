@@ -64,6 +64,8 @@ def build():
                 "commit": subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=ROOT, text=True).strip(),
                 "dirty": bool(subprocess.check_output(["git", "status", "--porcelain"], cwd=ROOT, text=True).strip())}
     (ROOT / "desktop/build-info.json").write_text(json.dumps(identity))
+    phase("verify-reader-assets", lambda: run("node", ROOT / "scripts/report-web-assets.mjs",
+        ROOT / "dist", "--verify-native", "--public-root", ROOT / "public", cwd=ROOT))
     phase("pyinstaller", lambda: run(sys.executable, "-m", "PyInstaller", "--noconfirm", "--distpath", OUTPUT,
         "--workpath", ROOT / "desktop/build", ROOT / "desktop/super-md.spec", cwd=ROOT))
     if sys.platform.startswith("linux"):
