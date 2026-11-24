@@ -66,8 +66,10 @@ packages the native desktop app locally. Run
 `node scripts/report-web-assets.mjs dist --verify-native --public-root public`
 for a compact summary or add `--output PATH` to save the full file inventory.
 The verifier requires both native HTML entries, generated legal notices and
-every file from `public/`. It follows static HTML, JS and CSS references and
-lists fonts, bytes, and files the static scan did not reach.
+every file from `public/`. It follows static HTML, JS and CSS references,
+lists fonts, bytes, and files the static scan did not reach, and enforces that
+native reader bundles ship `.woff2`-only web fonts within the configured
+reachable reader font byte budget.
 
 This report is an investigation aid, not a pruning manifest. Runtime-generated
 URLs or assets loaded through APIs may not be visible to static tracing. No
