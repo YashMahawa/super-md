@@ -115,6 +115,23 @@ class StudioViewModel(app: Application, val workspaceKey: String = "main") : And
     private val blockedDocumentWrites = mutableSetOf<String>()
     private val promptedDocumentAccess = mutableSetOf<String>()
     private val promptedAssetAccess = mutableSetOf<String>()
+    internal val readerFolderIndex = ReaderFolderIndex()
+    private val readerCapabilities = java.util.concurrent.CopyOnWriteArraySet<ReaderAssetCapabilities>()
+    internal fun attachReaderCapabilities(capabilities: ReaderAssetCapabilities) { readerCapabilities += capabilities }
+    internal fun detachReaderCapabilities(capabilities: ReaderAssetCapabilities) { readerCapabilities -= capabilities }
+    internal fun invalidateNoteAssets(noteId: String) {
+        readerFolderIndex.clearNote(noteId)
+        readerCapabilities.forEach { it.clearNote(noteId) }
+    }
+    internal fun invalidateAllNoteAssets() {
+        readerFolderIndex.clear()
+        readerCapabilities.forEach { it.clear() }
+    }
+    internal fun matchesReaderAssetNote(noteId: String, target: ReaderAssetTarget? = null): Boolean {
+        val note = mutable.value.tabs.firstOrNull { it.id == noteId } ?: return false
+        if (target == null) return true
+        return note.uri == target.noteUri && note.relative == target.noteRelative && note.assetDirectory == target.assetDirectory
+    }
     var assetAccessRestored: ((String, String) -> Unit)? = null
     fun retainDocumentAccess(uri: Uri) = documentAccess.persist(uri)
     fun dismissDocumentAccess() { accessRequestsMutable.value = null }
@@ -187,6 +204,7 @@ class StudioViewModel(app: Application, val workspaceKey: String = "main") : And
                 }
                 rememberLinkedAsset(note, request.assetSource, chosen)
                 promptedAssetAccess.remove("${note.id}\n${request.assetSource}")
+                invalidateNoteAssets(note.id)
                 accessRequestsMutable.value = null
                 mutable.value = mutable.value.copy(message = "Linked file access restored. You can retry the export.")
                 assetAccessRestored?.invoke(note.uri ?: note.id, request.assetSource)
@@ -405,8 +423,8 @@ class StudioViewModel(app: Application, val workspaceKey: String = "main") : And
     private var listedRelative=""
     private val deletedDrafts=DeletedDraftStore(File(app.filesDir,"deleted-drafts/$workspaceKey"))
     private val documentObserver=object:android.database.ContentObserver(android.os.Handler(android.os.Looper.getMainLooper())) {
-        override fun onChange(selfChange:Boolean){refreshMetadata();refreshExternal()}
-        override fun onChange(selfChange:Boolean,uri:Uri?){refreshMetadata();if(uri==null||uri.toString()==mutable.value.active.uri)refreshExternal()}
+        override fun onChange(selfChange:Boolean){readerFolderIndex.clear();refreshMetadata();refreshExternal()}
+        override fun onChange(selfChange:Boolean,uri:Uri?){if(uri==null||mutable.value.tabs.none {it.uri==uri.toString()})readerFolderIndex.clear();refreshMetadata();if(uri==null||uri.toString()==mutable.value.active.uri)refreshExternal()}
     }
     private fun observeActive() {
         val uris=(mutable.value.tabs.mapNotNull {it.uri}+recentMutable.value.map {it.uri}+listOfNotNull(mutable.value.folder)).toSet()
@@ -454,7 +472,7 @@ class StudioViewModel(app: Application, val workspaceKey: String = "main") : And
         }
     }
     init { prefs.registerOnSharedPreferenceChangeListener(preferencesChanged);observeActive();observeCustomTheme();migrateLegacyClosedNotes();if(workspaceKey=="main")viewModelScope.launch{updates.restore();if(!BuildConfig.DEBUG && updates.state.value.checkOnOpen){kotlinx.coroutines.delay(6000);updates.check()}} }
-    override fun onCleared() { viewModelRetired.set(true); recoveryWriter.closeAfterLatest(mutable.value); prefs.unregisterOnSharedPreferenceChangeListener(preferencesChanged);resolver.unregisterContentObserver(documentObserver);resolver.unregisterContentObserver(themeObserver); super.onCleared() }
+    override fun onCleared() { viewModelRetired.set(true); invalidateAllNoteAssets(); recoveryWriter.closeAfterLatest(mutable.value); prefs.unregisterOnSharedPreferenceChangeListener(preferencesChanged);resolver.unregisterContentObserver(documentObserver);resolver.unregisterContentObserver(themeObserver); super.onCleared() }
     val state = mutable.asStateFlow()
     fun inspectStorage() {
         if (mutable.value.storageScanning) return
@@ -682,7 +700,27 @@ class StudioViewModel(app: Application, val workspaceKey: String = "main") : And
         }
     }
 
-    private fun change(block: (StudioState) -> StudioState) { mutable.value = block(mutable.value);observeActive(); schedulePersist() }
+    private fun syncNoteAssetScopes(previous: StudioState, next: StudioState) {
+        val nextById = next.tabs.associateBy { it.id }
+        previous.tabs.forEach { old ->
+            val current = nextById[old.id]
+            if (current == null || old.uri != current.uri || old.relative != current.relative || old.assetDirectory != current.assetDirectory) {
+                invalidateNoteAssets(old.id)
+            }
+        }
+        if (previous.folder != next.folder) {
+            if (next.folder == null) invalidateAllNoteAssets() else readerFolderIndex.clear()
+        }
+    }
+
+    private fun change(block: (StudioState) -> StudioState) {
+        val previous = mutable.value
+        val next = block(previous)
+        mutable.value = next
+        syncNoteAssetScopes(previous, next)
+        observeActive()
+        schedulePersist()
+    }
     private fun restore(): StudioState {
         var s = StudioState(theme = prefs.getString("theme", "system")!!, fullscreenTheme = prefs.getString("fullTheme", "black")!!, motion = prefs.getBoolean("motion", true), welcomed = prefs.getBoolean("welcomed", false), font = prefs.getString("font", "Manrope")!!, size = prefs.getFloat("size", 15f), folder = windowPrefs.getString("folder", if (workspaceKey == "main" && !windowPrefs.getBoolean("folderMigrated", false)) prefs.getString("folder", null) else null), pdf = prefs.getString("pdf", null) ?: StudioState().pdf)
         s = s.copy(spellCheck=prefs.getBoolean("spellCheck",false),grammarCheck=prefs.getBoolean("grammarCheck",false),accent = prefs.getString("accent","system")!!, widthPercent = prefs.getFloat("widthPercent",100f),lineHeight = prefs.getFloat("lineHeight",1.65f),autosave = prefs.getBoolean("autosave",true),customFonts = fonts.families)
@@ -900,6 +938,7 @@ class StudioViewModel(app: Application, val workspaceKey: String = "main") : And
             delay(200)
             val text=runCatching{withContext(Dispatchers.IO){resolver.openInputStream(Uri.parse(note.uri))?.use{readLimited(it,20_000_000).toString(Charsets.UTF_8)}}}.getOrNull() ?: return@launch
             if(text==note.content)return@launch
+            invalidateNoteAssets(note.id)
             change {s->s.copy(tabs=s.tabs.map{if(it.id==note.id && it.content==note.content && !it.dirty)it.copy(content=text,saved=text)else it})}
         }
     }
@@ -1113,7 +1152,7 @@ class StudioViewModel(app: Application, val workspaceKey: String = "main") : And
     fun pdf(value: String) { change { it.copy(pdf = value) }; prefs.edit().putString("pdf", value).apply() }
     fun noteLocation(): String = prefs.getString("newNoteLocation", "") ?: ""
     internal suspend fun saveAgentMedia(args: JSONObject): JSONObject = withContext(Dispatchers.IO) {
-        media.saveAgentMedia(args, noteLocation())
+        media.saveAgentMedia(args, noteLocation()).also { readerFolderIndex.clear() }
     }
     fun noteLocation(uri: Uri) {
         getApplication<Application>().contentResolver.takePersistableUriPermission(uri, Intent.FLAG_GRANT_READ_URI_PERMISSION or Intent.FLAG_GRANT_WRITE_URI_PERMISSION)
@@ -1460,62 +1499,96 @@ class StudioViewModel(app: Application, val workspaceKey: String = "main") : And
     } ?: error("The asset's document is no longer open")
 
     /** Resolves only an already granted tree or an individually user-selected linked file. */
-    private fun linkedAssetFile(note: Note, source: String): DocumentFile {
-        require(source.length in 1..4096 && !Regex("^[a-zA-Z][a-zA-Z0-9+.-]*:").containsMatchIn(source) && !source.startsWith("//")) { "Choose a relative asset path" }
-        linkedAssetUri(note, source)?.let { uri ->
-            return DocumentFile.fromSingleUri(getApplication(), uri) ?: throw LinkedAssetAccessRequiredException()
-        }
+    private fun resolveLinkedAssetUri(note: Note, source: String): Uri {
+        validateRelativeAssetSource(source)
+        note.relative?.let { readerAssetPathParts(it.substringBeforeLast('/', ""), source) }
+        linkedAssetUri(note, source)?.let { return it }
         val noteUri = note.uri?.let(Uri::parse) ?: throw LinkedAssetAccessRequiredException()
         val documentId = runCatching { DocumentsContract.getDocumentId(noteUri) }.getOrDefault("")
         val folderUri = resolver.persistedUriPermissions.filter { it.isReadPermission && DocumentsContract.isTreeUri(it.uri) && it.uri.authority == noteUri.authority }.mapNotNull { permission ->
             val root = runCatching { DocumentsContract.getTreeDocumentId(permission.uri) }.getOrNull() ?: return@mapNotNull null
             if (documentId.startsWith("$root/") || root.endsWith(':') && documentId.startsWith(root)) root to permission.uri else null
         }.maxByOrNull { it.first.length }?.second ?: throw LinkedAssetAccessRequiredException()
-        var file = DocumentFile.fromTreeUri(getApplication(), folderUri) ?: throw LinkedAssetAccessRequiredException()
         val rootId = DocumentsContract.getTreeDocumentId(folderUri)
         val relative = documentId.takeIf { it.startsWith("$rootId/") }?.removePrefix("$rootId/")
             ?: documentId.takeIf { rootId.endsWith(':') && it.startsWith(rootId) }?.removePrefix(rootId)?.trimStart('/')
             ?: throw LinkedAssetAccessRequiredException()
         val parts = readerAssetPathParts(relative.substringBeforeLast('/', ""), source)
-        for (part in parts) file = file.findFile(part) ?: throw LinkedAssetAccessRequiredException()
-        require(file.isFile) { "Linked file is not a regular file" }
-        return file
+        return readerFolderIndex.resolve(resolver, note.id, folderUri, rootId, parts).uri
     }
+
     suspend fun textAsset(document: String, source: String): JSONObject = withContext(Dispatchers.IO) {
         require(Uri.decode(source).substringBefore('?').substringBefore('#').substringAfterLast('.').lowercase() in setOf("mmd", "mermaid")) { "Choose a Mermaid source file" }
-        val file = linkedAssetFile(noteForAsset(document), source)
-        val bytes = resolver.openInputStream(file.uri)?.use { readLimited(it, 2_000_000) } ?: error("Cannot read diagram source")
+        val uri = resolveLinkedAssetUri(noteForAsset(document), source)
+        querySafAssetMetadata(resolver, uri)
+        val bytes = resolver.openInputStream(uri)?.use { readLimited(it, 2_000_000) } ?: error("Cannot read diagram source")
         val text = Charsets.UTF_8.newDecoder().onMalformedInput(java.nio.charset.CodingErrorAction.REPORT)
             .decode(java.nio.ByteBuffer.wrap(bytes)).toString()
         JSONObject().put("text", text)
     }
+
     suspend fun asset(document: String, source: String): String = withContext(Dispatchers.IO) {
         val note = noteForAsset(document)
-        media.local(source, note.assetDirectory)?.let { return@withContext media.data(it) }
-        val file = linkedAssetFile(note, source)
-        val bytes = resolver.openInputStream(file.uri)?.use { readLimited(it, 25_000_000) } ?: error("Cannot read image")
-        val mime = media.imageMime(file.name ?: source.substringAfterLast('/'), resolver.getType(file.uri))
+        media.localTarget(source, note.assetDirectory, note.uri, note.relative)?.let { return@withContext media.data(it.file) }
+        val uri = resolveLinkedAssetUri(note, source)
+        val meta = querySafAssetMetadata(resolver, uri)
+        if (meta.size >= 0L) require(meta.size <= BoundedAssetInputStream.MAX_READER_ASSET_BYTES) { "Image exceeds 25 MB" }
+        val bytes = resolver.openInputStream(uri)?.use { readLimited(it, 25_000_000) } ?: error("Cannot read image")
+        val mime = media.imageMime(meta.displayName ?: Uri.decode(source).substringAfterLast('/'), meta.mimeType)
         "data:$mime;base64," + Base64.encodeToString(bytes, Base64.NO_WRAP)
     }
+
     internal fun resolveReaderAsset(document: String, source: String): Pair<String, ReaderAssetSource> {
         val note = noteForAsset(document)
-        media.local(source, note.assetDirectory)?.let { return note.id to media.readerAsset(it) }
-        val file = linkedAssetFile(note, source)
-        val size = file.length()
-        require(size <= BoundedAssetInputStream.MAX_READER_ASSET_BYTES) { "Image exceeds 25 MB" }
-        val uri = file.uri
+        media.localTarget(source, note.assetDirectory, note.uri, note.relative)?.let { return note.id to media.readerAsset(it) }
+        val uri = resolveLinkedAssetUri(note, source)
+        val meta = querySafAssetMetadata(resolver, uri)
+        if (meta.size >= 0L) require(meta.size <= BoundedAssetInputStream.MAX_READER_ASSET_BYTES) { "Image exceeds 25 MB" }
         val open = { resolver.openInputStream(uri) ?: error("Cannot read image") }
-        val mime = media.imageMime(file.name ?: source.substringAfterLast('/'), resolver.getType(uri))
-        val fingerprint = readerAssetFingerprint("${note.id}|$source|$uri", size, file.lastModified(), open)
-        return note.id to ReaderAssetSource(mime, fingerprint, size, open)
+        val mime = media.imageMime(meta.displayName ?: Uri.decode(source).substringAfterLast('/'), meta.mimeType)
+        val identity = "${note.id}|$source|$uri"
+        val fingerprint = readerAssetFingerprint(identity, meta.size, meta.lastModified, open)
+        val target = ReaderAssetTarget.SafDocument(uri, identity, note.uri, note.relative, note.assetDirectory)
+        return note.id to ReaderAssetSource(mime, fingerprint, meta.size, open, target)
     }
 
-    /** Revalidates open-note ownership and the source fingerprint on every stream request. */
+    /** Revalidates open-note ownership and target metadata without repeating folder path walks. */
+    internal fun openReaderAsset(capability: ReaderAssetCapability): OpenReaderAsset {
+        val target = capability.target
+            ?: return openReaderAsset(capability.noteId, capability.source, capability.fingerprint)
+        val note = mutable.value.tabs.find { it.id == capability.noteId } ?: error("The image's document is no longer open")
+        require(note.uri == target.noteUri && note.relative == target.noteRelative && note.assetDirectory == target.assetDirectory) {
+            "The image's document moved; reload the document image"
+        }
+        return when (target) {
+            is ReaderAssetTarget.LocalFile -> {
+                val current = media.readerAsset(target)
+                require(current.fingerprint == capability.fingerprint && current.mime == capability.mime) {
+                    "The image changed; reload the document image"
+                }
+                require(current.size <= BoundedAssetInputStream.MAX_READER_ASSET_BYTES) { "Image exceeds 25 MB" }
+                OpenReaderAsset(current.mime, current.fingerprint, current.open())
+            }
+            is ReaderAssetTarget.SafDocument -> {
+                val meta = querySafAssetMetadata(resolver, target.uri) { IllegalStateException("Image not found") }
+                if (meta.size >= 0L) require(meta.size <= BoundedAssetInputStream.MAX_READER_ASSET_BYTES) { "Image exceeds 25 MB" }
+                val mime = media.imageMime(meta.displayName ?: Uri.decode(capability.source).substringAfterLast('/'), meta.mimeType)
+                val open = { resolver.openInputStream(target.uri) ?: error("Cannot read image") }
+                val currentFingerprint = readerAssetFingerprint(target.identity, meta.size, meta.lastModified, open)
+                require(currentFingerprint == capability.fingerprint && mime == capability.mime) {
+                    "The image changed; reload the document image"
+                }
+                OpenReaderAsset(mime, currentFingerprint, open())
+            }
+        }
+    }
+
+    /** Fallback when opening a capability created without a retained target. */
     internal fun openReaderAsset(noteId: String, source: String, expectedFingerprint: String): OpenReaderAsset {
         val note = mutable.value.tabs.find { it.id == noteId } ?: error("The image's document is no longer open")
         val (_, current) = resolveReaderAsset(note.id, source)
         require(current.fingerprint == expectedFingerprint) { "The image changed; reload the document image" }
-        require(current.size <= BoundedAssetInputStream.MAX_READER_ASSET_BYTES) { "Image exceeds 25 MB" }
+        if (current.size >= 0L) require(current.size <= BoundedAssetInputStream.MAX_READER_ASSET_BYTES) { "Image exceeds 25 MB" }
         return OpenReaderAsset(current.mime, current.fingerprint, current.open())
     }
 
@@ -1563,16 +1636,21 @@ class StudioViewModel(app: Application, val workspaceKey: String = "main") : And
                 require((media.local(resolvedAssetName, disk.directory) ?: error("The saved note no longer contains this image")).readBytes().contentEquals(backup)) {
                     "The portable note's image changed on disk; reopen it before replacement"
                 }
+                val previousModified = target.lastModified()
                 val stagedAssetStream = temporaryAsset.outputStream()
                 stagedAssetStream.use { it.write(incomingBytes); it.fd.sync() }
                 check(target.renameTo(backupAsset)) { "Could not safely stage the current image" }
                 check(temporaryAsset.renameTo(target)) { backupAsset.renameTo(target); error("Could not stage the replacement image") }
                 replaced = true
+                if (!backup.contentEquals(incomingBytes) && target.lastModified() == previousModified && previousModified > 0L) {
+                    target.setLastModified(maxOf(System.currentTimeMillis(), previousModified + 1_000L))
+                }
                 stagedNote.outputStream().use { media.writeLocalPortable(it, note.content, note.assetDirectory) }
                 verifyExportHeader(stagedNote, NativeExportFormat.PORTABLE_SMD)
                 resolver.openOutputStream(noteUri, "wt")?.use { output -> stagedNote.inputStream().use { it.copyTo(output) } }
                     ?: error("Cannot save the updated portable note")
                 withContext(Dispatchers.Main) {
+                    invalidateNoteAssets(id)
                     change { state -> state.copy(tabs = state.tabs.map { if (it.id == id) it.copy(saved = it.content) else it }, busy = false, message = "Portable image replaced") }
                     mutable.value.tabs.find { it.id == id }?.let(::remember)
                 }
@@ -1684,6 +1762,7 @@ class StudioViewModel(app: Application, val workspaceKey: String = "main") : And
                     val matches = latest != null && latest.content == writtenSource
                         && matchesAssetWriteSnapshot(latest, mutable.value.activeId, note) && latest.assetDirectory == directory
                     if (!matches) return@withContext false
+                    invalidateNoteAssets(id)
                     change { state -> state.copy(tabs = state.tabs.map {
                         if (it.id == id && it.content == writtenSource && it.uri == note.uri && it.assetDirectory == directory)
                             it.copy(saved = writtenSource, assetDirectory = writtenDirectory) else it
@@ -1786,6 +1865,7 @@ class StudioViewModel(app: Application, val workspaceKey: String = "main") : And
                 resolver.openOutputStream(target.uri, "wt")?.use { output -> file.inputStream().use { it.copyTo(output) } } ?: error("Cannot write image")
             }
         }
+        readerFolderIndex.clear()
     }
     var portableOutput: Uri? = null
     suspend fun writePortable(id: String, content: String, assets: JSONObject, save: Boolean, originalContent: String) = withContext(Dispatchers.IO) { documentWrites.withLock {
