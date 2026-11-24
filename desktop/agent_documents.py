@@ -15,6 +15,7 @@ import stat
 import tempfile
 import threading
 import unicodedata
+from collections import OrderedDict
 from contextlib import contextmanager
 from pathlib import Path
 from typing import Iterator
@@ -32,6 +33,8 @@ MAX_ASSET_BYTES = documents.MAX_IMAGE
 _HEADING = re.compile(r"^(#{1,6})[ \t]+(.+?)[ \t]*#*[ \t]*$")
 _FENCE = re.compile(r"^\s{0,3}(`{3,}|~{3,})")
 _LOCK_GUARD = threading.Lock()
+_PORTABLE_CACHE_BYTES = 48 * 1024 * 1024
+_PORTABLE_CACHE_ENTRIES = 8
 
 
 class AgentDocumentError(ValueError):
@@ -184,6 +187,9 @@ class DocumentStore:
                 aliases.append((supplied, root))
         self.roots = tuple(normalized)
         self._root_aliases = tuple(sorted(aliases, key=lambda pair: len(pair[0].parts), reverse=True))
+        self._portable_cache: OrderedDict[Path, tuple[bytes, str, dict[str, str], int]] = OrderedDict()
+        self._portable_cache_size = 0
+        self._portable_cache_lock = threading.Lock()
 
     def resolve(self, value: str | os.PathLike[str], *, must_exist: bool = True) -> Path:
         """Resolve a caller path under one configured root; reject symlinks."""
@@ -231,10 +237,33 @@ class DocumentStore:
 
     def _load(self, path: Path) -> tuple[str, dict[str, str], bool, bytes]:
         raw = self._read_raw(path)
+        # Always read the current bytes first. File timestamps can be preserved
+        # by external editors, while the revision must describe this exact read.
+        if len(raw) <= _PORTABLE_CACHE_BYTES:
+            with self._portable_cache_lock:
+                cached = self._portable_cache.get(path)
+                if cached is not None and cached[0] == raw:
+                    self._portable_cache.move_to_end(path)
+                    return cached[1], dict(cached[2]), True, raw
         try:
             text, assets, portable = documents.decode_note_bytes(raw, path)
         except (ValueError, OSError, UnicodeError) as exc:
             raise AgentDocumentError(str(exc)) from exc
+        if portable:
+            # Asset data URLs and filenames are ASCII after validation. Account
+            # for the worst-case Python Unicode storage for the note body.
+            weight = len(raw) + 4 * len(text) + sum(len(name) + len(data) + 256 for name, data in assets.items())
+            if weight <= _PORTABLE_CACHE_BYTES:
+                with self._portable_cache_lock:
+                    previous = self._portable_cache.pop(path, None)
+                    if previous is not None:
+                        self._portable_cache_size -= previous[3]
+                    while (self._portable_cache_size + weight > _PORTABLE_CACHE_BYTES
+                           or len(self._portable_cache) >= _PORTABLE_CACHE_ENTRIES):
+                        _, evicted = self._portable_cache.popitem(last=False)
+                        self._portable_cache_size -= evicted[3]
+                    self._portable_cache[path] = (raw, text, dict(assets), weight)
+                    self._portable_cache_size += weight
         return text, assets, portable, raw
 
     def inspect(self, path_value: str) -> dict:
@@ -243,9 +272,10 @@ class DocumentStore:
             text, assets, portable, raw = self._load(path)
         outline = outline_source(text)
         headings = outline["headings"]
+        revision = digest_bytes(raw)
         return {
             "path": self.display_path(path), "format": "smd" if portable or path.suffix.lower() == ".smd" else "markdown",
-            "portable": portable, "revision": digest_bytes(raw), "sha256": digest_bytes(raw),
+            "portable": portable, "revision": revision, "sha256": revision,
             "bytes": len(raw), "characters": len(text), "lines": len(text.splitlines()),
             "heading_count": outline["total"], "headings": headings,
             "headings_truncated": outline["truncated"], "next_heading_offset": outline["nextOffset"],

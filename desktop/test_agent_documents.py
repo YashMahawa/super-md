@@ -7,14 +7,40 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
+import documents
 from agent_documents import AgentDocumentError, DocumentStore, RevisionConflict, _headings, diagram_spans, outline_source, resolve_heading, search_source, section_source
 from documents import atomic_write, compressed_bundle
 
 
 class AgentDocumentsTest(unittest.TestCase):
+    def test_portable_cache_reuses_validated_assets_and_checks_exact_file_bytes(self):
+        path = self.root / "cached.smd"
+        assets = {"assets/figure.svg": "data:image/svg+xml;base64,PHN2Zy8+"}
+
+        def write(markdown):
+            path.write_text(json.dumps(documents.bundle(markdown, assets)), encoding="utf-8")
+
+        write("# One\n")
+        original = path.stat()
+        with patch.object(documents, "decode_note_bytes", wraps=documents.decode_note_bytes) as decode:
+            first = self.store.read(path.name, view="source")
+            _, caller_assets, _, _ = self.store._load(path)
+            caller_assets.clear()
+            self.assertEqual(self.store.assets(path.name)["total"], 1)
+            self.assertEqual(self.store.outline(path.name)["revision"], first["revision"])
+            self.assertEqual(decode.call_count, 1)
+
+            write("# Two\n")
+            self.assertEqual(path.stat().st_size, original.st_size)
+            os.utime(path, ns=(original.st_atime_ns, original.st_mtime_ns))
+            second = self.store.read(path.name, view="source")
+            self.assertEqual(second["text"], "# Two\n")
+            self.assertNotEqual(second["revision"], first["revision"])
+            self.assertEqual(decode.call_count, 2)
+
     def test_source_and_revision_use_one_snapshot_during_external_replacement(self):
-        from unittest.mock import patch
         path = self.root / "changing.md"
         original = b"# Original snapshot\n"
         path.write_bytes(original)
