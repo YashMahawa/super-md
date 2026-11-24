@@ -377,9 +377,7 @@ export default function CachedMarkdown({children,remarkPlugins,rehypePlugins,com
 function blockKind(node:any):string {
   if(node.type!=='element')return String(node.type||'node');
   if(node.tagName==='pre'){
-    const classes=node.children?.[0]?.properties?.className;
-    const classList=Array.isArray(classes)?classes.join(' '):typeof classes==='string'?classes:'';
-    const lang=classList.match(/(?:^|\s)language-([\w-]+)/)?.[1];
+    const lang=highlightLanguage(node.children?.[0]?.properties?.className);
     return lang?`pre:${lang}`:'pre';
   }
   return String(node.tagName);

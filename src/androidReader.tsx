@@ -9,13 +9,20 @@ import {mediaBytes} from './mediaExport';
 import { memo, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import "@fontsource-variable/manrope";
 import "@fontsource-variable/jetbrains-mono";
+import "@fontsource-variable/jetbrains-mono/wght-italic.css";
 import "@fontsource-variable/roboto";
+import "@fontsource-variable/roboto/wght-italic.css";
+import "@fontsource-variable/noto-sans";
+import "@fontsource-variable/noto-sans/wght-italic.css";
 import "@fontsource-variable/noto-serif";
+import "@fontsource-variable/noto-serif/wght-italic.css";
 import "katex/dist/katex.min.css";
 import "./styles.css";
 import "./androidReader.css";
 import "./customTheme.css";
-import Editor, { editorReadingOffset, editorHistory, exportEditorSession, importEditorSession, type PortableEditorSession } from "./components/Editor";
+import { isBuiltinReaderFont, resolveReaderFontStack } from "./readerFonts";
+import Editor, { editorReadingOffset, editorSelectedText, editorHistory, exportEditorSession, importEditorSession, type PortableEditorSession } from "./components/Editor";
+import { extractSelectedText } from "./copySource";
 import {readingOffset,revealReadingOffset} from "./readingPosition";
 import { exportRenderedViews, importRenderedViews } from "./renderedOutputs";
 import LiveEditor from "./components/LiveEditor";
@@ -60,20 +67,22 @@ function isTextEntryField(target: EventTarget | null): boolean {
 interface PdfExportStatus {id:string;phase:'preparing'|'typesetting'|'publishing';completed:number;total:number;cancelRequested?:boolean}
 
 interface NoteView { editor?: PortableEditorSession; history?:NoteHistory; top?: number; rendered?: ReturnType<typeof exportRenderedViews> }
-interface ReaderState extends ReaderAccessibilityPreference { id: string; content: string; path: string | null; mode: "live" | "editor" | "reader" | "split"; dark: boolean; fullscreen: boolean; font: string; size: number; latexAutofix?:boolean; typewriterScroll?:boolean; spellCheck?:boolean; grammarCheck?:boolean; width?: number; widthPercent?:number; lineHeight?:number; colors: Record<string, string>; zoom: number; motion?: boolean; python?: string; viewState?: NoteView }
+interface ReaderState extends ReaderAccessibilityPreference { id: string; content: string; path: string | null; mode: "live" | "editor" | "reader" | "split"; dark: boolean; fullscreen: boolean; font: string; size: number; editProtocol?: number; latexAutofix?:boolean; typewriterScroll?:boolean; spellCheck?:boolean; grammarCheck?:boolean; width?: number; widthPercent?:number; lineHeight?:number; colors: Record<string, string>; zoom: number; motion?: boolean; python?: string; viewState?: NoteView }
 declare global { interface Window {supermdAgentRequest?:(request:Record<string,unknown>,callback?:(result:unknown,error:string)=>void)=>void;supermdAgentCompute?:(request:Record<string,unknown>,callback:(result:unknown,error:string)=>void)=>void;supermdThemeGuide?:()=>void;supermdDismiss?:()=>boolean;supermdSetZoom?:(zoom:number,requestedAt?:number)=>void;supermdHeading?:(id:string,offset?:number)=>void;supermdHistory?:(direction:"undo"|"redo")=>void;supermdNativeWheel?:(dx:number,dy:number,point:Point,held:boolean,modifier?:boolean)=>void;supermdToggleTypewriter?:()=>void;} }
 declare global { interface Window { supermdLoad?: (state: ReaderState) => void; supermdExport?: (options: ExportOptions) => void; supermdExportMarkdown?: (archive?: boolean) => void; supermdFind?: () => void; supermdPortable?: (save: boolean) => void; supermdZoomBy?: (factor:number,focus?:Point)=>void; supermdResetZoom?: ()=>void; supermdRepairMath?: ()=>void; supermdFlush?: (operation:Record<string,string>)=>void } }
 declare global { interface Window {supermdChromeInset?:(height:number)=>void} }
 declare global { interface Window {supermdSavePosition?:()=>void} }
 declare global {interface Window {supermdExportPhase?:(id:string,phase:'typesetting'|'publishing')=>void}}
 interface ReaderState { centerLock?:boolean; customStyle?:CustomStyle; restorePosition?:boolean; readingLocation?:ReadingLocation|null; imageAppearance?:MediaAppearance; svgAppearance?:MediaAppearance; imageContrast?:number }
-/** Pure snapshot operations for native-owned inactive tabs. `content` is added
- * only by the trusted native router and is never accepted from MCP requests. */
-export async function computeAgentDocumentRequest(request:Record<string,unknown>):Promise<Record<string,unknown>> {
-  const content=request.content,tabId=request.tabId,action=request.action;
-  if(typeof content!=='string'||typeof tabId!=='string')throw Error('Native document snapshot is required');
-  const revision=await agentRevision(content),sourceLength=agentCharLength(content),base={tabId,revision,sourceLength};
-  if(request.expectedRevision!==undefined&&request.expectedRevision!==revision)throw Error('Revision conflict: the note changed; read it again before editing');
+type AgentDocumentBase={tabId:string;revision:string;sourceLength:number};
+function resolveAgentDiagram(content:string,revision:string,request:Record<string,unknown>){
+  if(request.expectedRevision!==revision)throw Error('A current expectedRevision is required to retrieve this diagram');
+  const diagram=agentDiagrams(content).find(item=>item.id===request.diagramId);if(!diagram)throw Error('Diagram not found in this revision');
+  return diagram;
+}
+function readAgentDocument(content:string,base:AgentDocumentBase,request:Record<string,unknown>):Record<string,unknown>|null{
+  if(request.expectedRevision!==undefined&&request.expectedRevision!==base.revision)throw Error('Revision conflict: the note changed; read it again before editing');
+  const action=request.action;
   if(action==='read_tab')return {...base,...agentRead(content,request.offset,request.limit,request.heading,request.view)};
   if(action==='outline_tab')return {...base,...agentOutlinePage(content,request.offset,request.limit)};
   if(action==='search_tab')return {...base,...agentSearch(content,request.query,request.limit,request.context,{offset:request.offset,caseSensitive:request.caseSensitive,wholeWord:request.wholeWord,regex:request.regex,excludeDiagrams:request.excludeDiagrams})};
@@ -85,10 +94,18 @@ export async function computeAgentDocumentRequest(request:Record<string,unknown>
     const end=Math.min(diagrams.length,offset+limit);return {...base,diagrams:diagrams.slice(offset,end).map(item=>diagramMetadata(content,item)),total:diagrams.length,nextOffset:end<diagrams.length?end:null,truncated:end<diagrams.length};
   }
   if(action==='get_diagram'){
-    if(request.expectedRevision!==revision)throw Error('A current expectedRevision is required to retrieve this diagram');
-    const diagram=agentDiagrams(content).find(item=>item.id===request.diagramId);if(!diagram)throw Error('Diagram not found in this revision');
-    return {...base,...diagramMetadata(content,diagram),...agentRead(diagram.source,request.offset,request.limit,undefined,'source'),sourceLength};
+    const diagram=resolveAgentDiagram(content,base.revision,request);
+    return {...base,...diagramMetadata(content,diagram),...agentRead(diagram.source,request.offset,request.limit,undefined,'source')};
   }
+  return null;
+}
+/** Pure snapshot operations for native-owned inactive tabs. `content` is added
+ * only by the trusted native router and is never accepted from MCP requests. */
+export async function computeAgentDocumentRequest(request:Record<string,unknown>):Promise<Record<string,unknown>> {
+  const content=request.content,tabId=request.tabId,action=request.action;
+  if(typeof content!=='string'||typeof tabId!=='string')throw Error('Native document snapshot is required');
+  const revision=await agentRevision(content),sourceLength=agentCharLength(content),base={tabId,revision,sourceLength};
+  const readResult=readAgentDocument(content,base,request);if(readResult)return readResult;
   if(action==='patch_tab'){
     if(typeof request.expectedRevision!=='string'||request.expectedRevision!==revision)throw Error('A current expectedRevision is required to edit a tab');
     const patch=applyAgentPatchesDetailed(content,request.operations);
@@ -179,6 +196,7 @@ function Reader() {
       scroller.scrollBy({left:reading&&reference.current?.centerLock?0:dx,top:dy,behavior:'instant'});
     });
     window.supermdSavePosition=()=>savePosition.current();
+    window.supermdSelectedText=()=>extractSelectedText({source:reference.current?.content,editorSelection:()=>reference.current?editorSelectedText(reference.current.id):null});
     window.supermdChromeInset=height=>{
       const top=Math.max(0,Math.min(480,Number.isFinite(height)?height:0));
       const html=document.documentElement;
@@ -204,7 +222,7 @@ function Reader() {
         next.content=draft;
         setEditError('A native update arrived while edits were awaiting acknowledgement. Your editor draft has been kept. Save or close will wait for a verified edit session.');
       }
-      if((next as ReaderState&{editProtocol?:number}).editProtocol===1){
+      if(next.editProtocol===1){
         edits.current!.open(next.id,next.content);
         // Retiring an untouched stale baseline also retires its reader-only
         // warning. Never hide an error while an unacknowledged draft remains.
@@ -308,7 +326,7 @@ function Reader() {
       if(operation.action==='android_flush'){
         void (async()=>{
           if(current.id!==operation.target)throw new Error('The active note changed before its edit flush');
-          if((current as ReaderState&{editProtocol?:number}).editProtocol===1)await edits.current!.flush(current.id);
+          if(current.editProtocol===1)await edits.current!.flush(current.id);
           const latest=reference.current;
           if(!latest||latest.id!==operation.target)throw new Error('The active note changed during its edit flush');
           await invoke('document_flushed',{id:latest.id,token:operation.token,content:latest.content});
@@ -323,18 +341,23 @@ function Reader() {
       else if (operation.action === "detach_tab") id = operation.target;
       const view = operation.action === "move_tab" || operation.action === "detach_tab" || operation.action === "reload_reader" ? {editor:exportEditorSession(id),history:histories.current.get(id), ...(id === current.id ? {top:document.querySelector<HTMLElement>(".android-reading")?.scrollTop ?? 0,rendered:exportRenderedViews(current.content)} : noteViews.current.get(id))} : undefined;
       void (async()=>{
-        if((current as ReaderState&{editProtocol?:number}).editProtocol===1)await edits.current!.flush(current.id);
+        if(current.editProtocol===1)await edits.current!.flush(current.id);
         // Snapshot after the acknowledgement barrier, including edits made while waiting.
         const latest=reference.current;
         await invoke("document_flushed",{id:current.id,content:latest?.id===current.id?latest.content:current.content,operation,viewId:id,viewState:view});
       })().catch(error=>setEditError(String(error)));
     };
     window.supermdFind = () => {if(document.querySelector('.theme-guide-dialog'))return;flushSync(()=>setSearching(true));window.dispatchEvent(new Event("supermd-find-focus"));};
+    const flushExportNote = async (current: ReaderState) => {
+      if (current.editProtocol === 1) await edits.current!.flush(current.id);
+      const latest = reference.current;
+      if (!latest || latest.id !== current.id) throw new Error('The export note changed');
+      return latest;
+    };
     window.supermdPortable = async (save) => {
       const current = reference.current; if (!current) return;
       try {
-        if((current as ReaderState&{editProtocol?:number}).editProtocol===1)await edits.current!.flush(current.id);
-        const latest=reference.current;if(!latest||latest.id!==current.id)throw new Error('The export note changed');
+        const latest = await flushExportNote(current);
         const prepared = await prepareFmd(latest.content, latest.path); await invoke("export_fmd_native", { ...prepared, originalContent: latest.content, id: latest.id, save }); }
       catch (error) { await invoke("export_failed", { error: String(error) }); }
     };
@@ -344,8 +367,7 @@ function Reader() {
       const owner={id:crypto.randomUUID(),controller:new AbortController(),phase:'preparing' as PdfExportStatus['phase']};
       exportOwner.current=owner;setPdfExport({id:owner.id,phase:'preparing',completed:0,total:0});
       try {
-        if((current as ReaderState&{editProtocol?:number}).editProtocol===1)await edits.current!.flush(current.id);
-        const latest=reference.current;if(!latest||latest.id!==current.id)throw new Error('The export note changed');
+        const latest = await flushExportNote(current);
         const prepared = await preparePdf(latest.content, latest.path, latest.python || "embedded",{signal:owner.controller.signal,onProgress:progress=>setPdfExport(value=>value?.id===owner.id?{...value,completed:progress.completed,total:progress.total}:value)});
         owner.controller.signal.throwIfAborted();
         owner.phase='typesetting';setPdfExport({id:owner.id,phase:'typesetting',completed:0,total:0});
@@ -356,15 +378,14 @@ function Reader() {
     window.supermdExportMarkdown = async (archive = false) => {
       const current = reference.current; if (!current) return;
       try {
-        if((current as ReaderState&{editProtocol?:number}).editProtocol===1)await edits.current!.flush(current.id);
-        const latest=reference.current;if(!latest||latest.id!==current.id)throw new Error('The export note changed');
+        const latest = await flushExportNote(current);
         const prepared=await prepareMarkdownExport(latest.content,latest.path,{compatible:archive,python:latest.python||"embedded"});
         if(reference.current?.id!==latest.id||reference.current.content!==latest.content)throw new Error('The note changed while preparing the Markdown export');
         await invoke("export_markdown_native", {id: latest.id, content: prepared.content, assets: prepared.assets, archive}); }
       catch (error) { await invoke("export_failed", {error: String(error)}); }
     };
     void invoke("reader_ready");
-    return () => {nativeScroll.clear();cancelAnimationFrame(zoomFrame.current);window.clearTimeout(zoomTimer.current);delete window.supermdThemeGuide;delete window.supermdSavePosition;delete window.supermdChromeInset;delete window.supermdLoad; delete window.supermdExport; delete window.supermdExportMarkdown; delete window.supermdPortable; delete window.supermdZoomBy; delete window.supermdResetZoom; delete window.supermdRepairMath; delete window.supermdToggleTypewriter; delete window.supermdFlush; delete window.supermdSetZoom; delete window.supermdHeading; };
+    return () => {nativeScroll.clear();cancelAnimationFrame(zoomFrame.current);window.clearTimeout(zoomTimer.current);delete window.supermdSelectedText;delete window.supermdThemeGuide;delete window.supermdSavePosition;delete window.supermdChromeInset;delete window.supermdLoad; delete window.supermdExport; delete window.supermdExportMarkdown; delete window.supermdPortable; delete window.supermdZoomBy; delete window.supermdResetZoom; delete window.supermdRepairMath; delete window.supermdToggleTypewriter; delete window.supermdFlush; delete window.supermdSetZoom; delete window.supermdHeading; };
   }, []);
   useEffect(()=>{
     if(!state)return;
@@ -403,8 +424,7 @@ function Reader() {
     const root = document.documentElement; root.dataset.theme = state.dark ? "dark" : "light"; root.dataset.motion = state.motion === false ? "off" : "on";root.dataset.fullscreen=String(state.fullscreen);
     root.style.setProperty("--reader-size", `${state.size}px`);
     root.style.setProperty("--editor-size", `${Math.max(12, Math.min(24, state.size - 2))}px`);
-    const fonts: Record<string,string> = {sans:"Manrope,'Manrope Variable', sans-serif",serif:"'Noto Serif','Noto Serif Variable', Georgia, serif",mono:"'JetBrains Mono','JetBrains Mono Variable', monospace",Manrope:"Manrope,'Manrope Variable',sans-serif","JetBrains Mono":"'JetBrains Mono','JetBrains Mono Variable',monospace","Noto Sans":"'Noto Sans',sans-serif","Noto Serif":"'Noto Serif','Noto Serif Variable',serif",Roboto:"Roboto,'Roboto Variable',sans-serif",roboto:"Roboto,'Roboto Variable',sans-serif",noto:"'Noto Sans',sans-serif",system:"system-ui,sans-serif"};
-    root.style.setProperty("--reader-font",fonts[state.font] || `${JSON.stringify(state.font)}, sans-serif`);
+    root.style.setProperty("--reader-font", resolveReaderFontStack(state.font));
     root.style.setProperty("--reader-width",`${state.widthPercent??90}%`);
     root.style.setProperty("--reading-max-width",`${state.widthPercent??90}%`);
     root.style.setProperty("--reader-leading",String(state.lineHeight??1.65));
@@ -441,7 +461,7 @@ function Reader() {
     return()=>document.removeEventListener('scroll',lock,true);
   },[]);
   useEffect(()=>{
-    if(!state || ["sans","serif","mono","noto","roboto","system","Manrope","Roboto","Noto Sans","Noto Serif","JetBrains Mono"].includes(state.font) || !window.SuperMD || typeof FontFace==="undefined")return;
+    if(!state || isBuiltinReaderFont(state.font) || !window.SuperMD || typeof FontFace==="undefined")return;
     const family=state.font;
     if(!loadedFonts.current.has(family)){
       const loading=invoke<{family:string;data:string}>("load_font",{family}).then(async value=>{const face=new FontFace(value.family,`url(${value.data})`);await face.load();const restore=anchors();document.fonts.add(face);restore.forEach(callback=>callback());return face;});
@@ -614,7 +634,7 @@ function Reader() {
     // The bridge receives every edit immediately, so closing/rotating cannot lose
     // a pending debounced WebView update. Disk snapshots are debounced natively.
     window.clearTimeout(pendingChange.current);
-    const delivery=(next as ReaderState&{editProtocol?:number}).editProtocol===1?edits.current!.change(next.id,content,changes):invoke("document_changed",{id:next.id,content});
+    const delivery=next.editProtocol===1?edits.current!.change(next.id,content,changes):invoke("document_changed",{id:next.id,content});
     void delivery.then(()=>setEditError(''),error=>setEditError(String(error)));
   }, []);
   useEffect(()=>{
@@ -626,7 +646,7 @@ function Reader() {
       pending=true;
       void (async()=>{
         const current=reference.current;if(!current)throw Error('The reader is not ready');
-        if((current as ReaderState&{editProtocol?:number}).editProtocol===1)await edits.current!.flush(current.id);
+        if(current.editProtocol===1)await edits.current!.flush(current.id);
         const note=reference.current;if(!note||note.id!==current.id)throw Error('The active tab changed; refresh the tab list');
         const revision=await agentRevision(note.content);
         if(reference.current?.id!==note.id||reference.current.content!==note.content)throw Error('The note changed while reading; retry');
@@ -637,22 +657,10 @@ function Reader() {
           return {tabs:tabs.map(item=>{const tab=item as Record<string,unknown>;return tab.id===note.id?{...tab,...base,id:note.id}:tab;})};
         }
         if(request.tabId!==undefined&&request.tabId!==note.id)throw Error('Select this tab before requesting its live reader');
-        if(request.expectedRevision!==undefined&&request.expectedRevision!==revision)throw Error('Revision conflict: the note changed; read it again before editing');
-        if(request.action==='read_tab')return {...base,...agentRead(note.content,request.offset,request.limit,request.heading,request.view)};
-        if(request.action==='outline_tab')return {...base,...agentOutlinePage(note.content,request.offset,request.limit)};
-        if(request.action==='search_tab')return {...base,...agentSearch(note.content,request.query,request.limit,request.context,{offset:request.offset,caseSensitive:request.caseSensitive,wholeWord:request.wholeWord,regex:request.regex,excludeDiagrams:request.excludeDiagrams})};
-        if(request.action==='list_diagrams'){
-          const diagrams=agentDiagrams(note.content),offset=request.offset===undefined?0:request.offset,limit=request.limit===undefined?80:request.limit;
-          if(typeof offset!=='number'||!Number.isInteger(offset)||offset<0)throw Error('diagram offset must be a nonnegative integer');
-          if(typeof limit!=='number'||!Number.isInteger(limit)||limit<1||limit>80)throw Error('diagram limit must be 1–80');
-          if(offset>diagrams.length)throw Error(`diagram offset must be between 0 and ${diagrams.length}`);
-          const end=Math.min(diagrams.length,offset+limit);return {...base,diagrams:diagrams.slice(offset,end).map(item=>diagramMetadata(note.content,item)),total:diagrams.length,nextOffset:end<diagrams.length?end:null,truncated:end<diagrams.length};
-        }
-        if(request.action==='get_diagram'||request.action==='get_diagram_image'){
-          if(request.expectedRevision!==revision)throw Error('A current expectedRevision is required to retrieve this diagram');
-          const diagram=agentDiagrams(note.content).find(item=>item.id===request.diagramId);if(!diagram)throw Error('Diagram not found in this revision');
-          if(request.action==='get_diagram')return {...base,...diagramMetadata(note.content,diagram),...agentRead(diagram.source,request.offset,request.limit,undefined,'source')};
-          const imageFormat=request.action==='get_diagram_image'&&request.imageFormat==='jpeg'?'jpeg':'png';
+        const readResult=readAgentDocument(note.content,base,request);if(readResult)return readResult;
+        if(request.action==='get_diagram_image'){
+          const diagram=resolveAgentDiagram(note.content,revision,request);
+          const imageFormat=request.imageFormat==='jpeg'?'jpeg':'png';
           const image=await mediaBytes(await diagramMedia(diagram,note.path),imageFormat,typeof request.width==='number'?Math.min(1600,Math.max(64,Math.round(request.width))):1600);return {...base,diagramId:diagram.id,mime_type:image.mimeType,data:image.body,width:image.width,height:image.height};
         }
         if(request.action==='get_context'){
@@ -693,7 +701,7 @@ function Reader() {
           if(reference.current?.id!==note.id||reference.current.content!==note.content)throw Error('Revision conflict: typing changed the note before the edit');
           const history=histories.current.get(note.id);if(history)history.last=0;
           update(content);const nextHistory=histories.current.get(note.id);if(nextHistory)nextHistory.last=0;
-          if((note as ReaderState&{editProtocol?:number}).editProtocol===1)await edits.current!.flush(note.id);
+          if(note.editProtocol===1)await edits.current!.flush(note.id);
           const response:{tabId:string;revision:string;changed:boolean;applied:number;operations?:unknown[]}={tabId:note.id,revision:await agentRevision(content),changed:content!==note.content,applied};
           if(patchOperations)response.operations=patchOperations;
           return response;
@@ -715,7 +723,7 @@ function Reader() {
   },[update]);
   if (!state) return <div className="reader-loading" role="status"><span className="expressive-loading-shape" aria-hidden="true"/>Opening your workspace</div>;
   return <DocumentAppearance.Provider value={documentAppearance}><div className={`android-document mode-${state.mode}`}>
-    {themeGuide&&<ThemeGuideDialog close={()=>setThemeGuide(false)}/>}
+    {themeGuide&&<ThemeGuideDialog dark={state.dark} close={()=>setThemeGuide(false)}/>}
     {pdfExport&&<div className="reader-export-backdrop"><section className="reader-export-progress" role="dialog" aria-modal="true" aria-label="Exporting PDF" onKeyDown={event=>{if(event.key==='Escape'){event.preventDefault();event.stopPropagation();void cancelPdfExport();}}}>
       <h2>Exporting PDF</h2>
       <div className="reader-export-status">
