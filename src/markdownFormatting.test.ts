@@ -180,6 +180,14 @@ describe("applyMarkdownUrlPaste & protected contexts", () => {
     expect(applyMarkdownUrlPaste(frontmatter, [{ anchor: 25, head: 29 }], url)?.doc).toBe(
       "---\ntitle: selected\n---\n\n[Body](https://example.com/new) prose",
     );
+
+    const dottedFrontmatter = "\uFEFF---  \ntitle: selected\n...\n\nBody prose";
+    const dottedStart = dottedFrontmatter.indexOf("selected");
+    const dottedBody = dottedFrontmatter.indexOf("Body");
+    expect(applyMarkdownUrlPaste(dottedFrontmatter, [{ anchor: dottedStart, head: dottedStart + 8 }], url)).toBeNull();
+    expect(applyMarkdownUrlPaste(dottedFrontmatter, [{ anchor: dottedBody, head: dottedBody + 4 }], url)?.doc).toBe(
+      "\uFEFF---  \ntitle: selected\n...\n\n[Body](https://example.com/new) prose",
+    );
   });
 });
 

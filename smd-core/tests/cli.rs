@@ -103,3 +103,78 @@ fn inline_data_images_export_and_pack_but_remote_images_never_download_implicitl
     let output=w.run(&["export","remote.md","remote.pdf"]);
     assert!(!output.status.success());assert!(String::from_utf8_lossy(&output.stderr).contains("explicit download"));assert!(!w.file("remote.pdf").exists());
 }
+
+fn inflate_pdf_streams(bytes: &[u8]) -> String {
+    use std::io::Read;
+    let mut text = String::from_utf8_lossy(bytes).into_owned();
+    let mut pos = 0usize;
+    while let Some(rel) = bytes[pos..].windows(6).position(|w| w == b"stream") {
+        let mut s = pos + rel + 6;
+        if bytes.get(s) == Some(&b'\r') && bytes.get(s + 1) == Some(&b'\n') {
+            s += 2;
+        } else if bytes.get(s) == Some(&b'\n') {
+            s += 1;
+        } else {
+            pos = s;
+            continue;
+        }
+        let Some(end_rel) = bytes[s..].windows(9).position(|w| w == b"endstream") else {
+            break;
+        };
+        let raw = &bytes[s..s + end_rel];
+        let trimmed = raw.strip_suffix(b"\r\n").or_else(|| raw.strip_suffix(b"\n")).unwrap_or(raw);
+        let mut out = Vec::new();
+        if flate2::read::ZlibDecoder::new(trimmed).read_to_end(&mut out).is_ok() {
+            text.push('\n');
+            text.push_str(&String::from_utf8_lossy(&out));
+        }
+        pos = s + end_rel + 9;
+    }
+    text
+}
+
+#[test]
+fn cli_and_in_app_prepared_pdf_exports_produce_identical_pdf_properties_and_omit_frontmatter() {
+    let w = Workspace::new();
+    let raw_note = "\u{feff}---  \ntitle: \"Analytical Mechanics\"\nauthor: \"Joseph-Louis Lagrange\"\ndescription: \"Variational principles and Euler-Lagrange equations\"\nkeywords: [mechanics, calculus-of-variations]\ndate: 2026-05-20\n...\n\n# Action Principle\n\n$$\\delta S = 0$$\n";
+    fs::write(w.file("mechanics.md"), raw_note).unwrap();
+    success(w.run(&["export", "mechanics.md", "cli.pdf"]));
+    pdf(&w.file("cli.pdf"));
+
+    // Simulate in-app preparePdf output sent over export-json.
+    let prepared_note = "\u{feff}---  \ntitle: \"Analytical Mechanics\"\nauthor: \"Joseph-Louis Lagrange\"\ndescription: \"Variational principles and Euler-Lagrange equations\"\nkeywords: [mechanics, calculus-of-variations]\ndate: 2026-05-20\n...\n\n# Action Principle\n\n$$\n\\delta S = 0\n$$\n";
+    let request = serde_json::json!({
+        "content": prepared_note,
+        "assets": {},
+        "options": {}
+    });
+    let mut child = Command::new(env!("CARGO_BIN_EXE_smd-engine"))
+        .current_dir(&w.0)
+        .args(["export-json", "app.pdf"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    child.stdin.take().unwrap().write_all(request.to_string().as_bytes()).unwrap();
+    success(child.wait_with_output().unwrap());
+    pdf(&w.file("app.pdf"));
+
+    let cli_bytes = fs::read(w.file("cli.pdf")).unwrap();
+    let app_bytes = fs::read(w.file("app.pdf")).unwrap();
+    let cli_corpus = inflate_pdf_streams(&cli_bytes);
+    let app_corpus = inflate_pdf_streams(&app_bytes);
+
+    for expected in [
+        "Analytical Mechanics",
+        "Joseph-Louis Lagrange",
+        "Variational principles and Euler-Lagrange equations",
+        "calculus-of-variations",
+    ] {
+        assert!(cli_corpus.contains(expected), "CLI PDF missing {expected}");
+        assert!(app_corpus.contains(expected), "App PDF missing {expected}");
+    }
+    assert!(cli_corpus.contains("2026-05-20") || cli_corpus.contains("D:20260520"));
+    assert!(app_corpus.contains("2026-05-20") || app_corpus.contains("D:20260520"));
+    assert_eq!(cli_bytes, app_bytes, "CLI and in-app PDF exports with deterministic date must have identical metadata and bytes");
+}

@@ -12,6 +12,7 @@ test("formatting actions toggle cleanly and undo in a single step across Source,
   });
   await page.setViewportSize({ width: 1200, height: 800 });
   await page.goto("/android-reader.html");
+  await page.waitForFunction(() => typeof window.supermdLoad === "function");
 
   const initialDoc = "Fourier transform\n\nSecond paragraph";
   await page.evaluate((content) => {
@@ -144,6 +145,7 @@ test("URL paste wraps selected prose inline without dialog and pastes plain URL 
   });
   await page.setViewportSize({ width: 1100, height: 760 });
   await page.goto("/android-reader.html");
+  await page.waitForFunction(() => typeof window.supermdLoad === "function");
 
   const doc = "Read the documentation here.\n\n```python\nendpoint = \"replace_me\"\n```";
   await page.evaluate((content) => {

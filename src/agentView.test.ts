@@ -1,6 +1,8 @@
 // @vitest-environment jsdom
-import {describe,it,expect} from 'vitest';
+import {describe,it,expect,vi} from 'vitest';
 import {agentDiagrams,diagramMetadata,visibleSourceRange,diagramMedia} from './agentView';
+import {pythonResults,rememberPythonOutput,retainVisiblePython} from './renderedOutputs';
+import * as nativeBridge from './nativeBridge';
 describe('structured reader context',()=>{
   it('exposes exact diagram source with compact revision-relative references',()=>{
     const source='# 😀 Notes\n\n```mermaid\ngraph TD; A-->B\n```\n\n```svg\n<svg xmlns="http://www.w3.org/2000/svg"/>\n```';
@@ -30,4 +32,51 @@ it('indexes every slider frame by title and step without mounting or changing th
  expect(metadata[1].preview).toBe('K-means — Update');
  const frame=await diagramMedia(diagrams[1]);expect(await frame.svg!()).toContain('>3</text>');
  expect(source).toContain('Reasoning only');
+});
+
+it('indexes cached Matplotlib SVG and PNG figures per document without executing Python',async()=>{
+ pythonResults.clear();
+ const invokeSpy=vi.spyOn(nativeBridge,'invoke');
+ const svgB64=btoa('<svg xmlns="http://www.w3.org/2000/svg" width="60" height="30"><circle cx="15" cy="15" r="10"/></svg>');
+ const svgData=`data:image/svg+xml;base64,${svgB64}`;
+ const pngData='data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+a44kAAAAASUVORK5CYII=';
+ const code='import matplotlib.pyplot as plt\nplt.plot([1, 2], [3, 4])';
+ const unrun='raise RuntimeError("must never run during inspection")';
+ const source=`# Figures\n\n\`\`\`python\n${code}\n\`\`\`\n\n\`\`\`python\n${unrun}\n\`\`\``;
+
+ expect(agentDiagrams(source,{documentPath:'/notes/a.md',python:'embedded'})).toEqual([]);
+
+ const ctxA={document:'/notes/a.md',cell:'0',interpreter:'embedded'};
+ const resultA={
+  ok:true,
+  stdout:'loss=0.1\n',
+  stderr:'',
+  images:[svgData,pngData],
+  provenance:{verified:true,document:'/notes/a.md',cell:'0',interpreter:'embedded'},
+ };
+ rememberPythonOutput(code,resultA,ctxA);
+ const releaseVisible=retainVisiblePython(code,resultA,ctxA);
+
+ const diagramsA=agentDiagrams(source,{documentPath:'/notes/a.md',python:'embedded'});
+ expect(diagramsA).toHaveLength(2);
+ expect(diagramsA.map(d=>d.id)).toEqual(['diagram:python:11:0','diagram:python:11:1']);
+ expect(diagramsA.map(d=>d.kind)).toEqual(['python-figure','python-figure']);
+ expect(diagramsA[0].source).toBe(code);
+
+ const metaA=diagramsA.map(d=>diagramMetadata(source,d));
+ expect(metaA[0].assetReference).toBe('(embedded image)');
+ expect(JSON.stringify(metaA)).not.toContain(svgB64);
+ expect(JSON.stringify(metaA)).not.toContain('base64,');
+
+ expect(agentDiagrams(source,{documentPath:'/notes/b.md',python:'embedded'})).toEqual([]);
+
+ const mediaSvg=await diagramMedia(diagramsA[0]);
+ expect(await mediaSvg.svg!()).toContain('<circle cx="15" cy="15" r="10"/>');
+ const mediaPng=await diagramMedia(diagramsA[1]);
+ expect(await mediaPng.uri!()).toBe(pngData);
+
+ expect(invokeSpy).not.toHaveBeenCalledWith('run_python',expect.anything());
+ releaseVisible();
+ invokeSpy.mockRestore();
+ pythonResults.clear();
 });

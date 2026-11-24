@@ -652,14 +652,12 @@ export function isProtectedMarkdownSelection(doc: string, from: number, to: numb
   const slice = doc.slice(windowStart, windowEnd);
   const localFrom = from - windowStart;
   const localTo = to - windowStart;
-  if (windowStart === 0) {
-    const frontmatter = slice.match(/^---\r?\n[\s\S]*?\r?\n---(?:\r?\n|$)/);
-    if (frontmatter && localFrom < frontmatter[0].length) return true;
-  }
   if (maskCode(slice).slice(localFrom, localTo) !== selected) return true;
+  const analysis = analyzeDocument(slice);
+  if (windowStart === 0 && analysis.frontmatter && localFrom < analysis.frontmatter.end) return true;
 
   let protectedByAst = false;
-  visit(analyzeDocument(slice).tree, (node: any) => {
+  visit(analysis.tree, (node: any) => {
     if (protectedByAst || !PROTECTED_AST_TYPES.has(node.type) || !node.position) return;
     const start = node.position.start.offset;
     const end = node.position.end.offset;
