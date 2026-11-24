@@ -11,7 +11,7 @@
 :root[data-custom-code-bg] .android-reading .markdown-body pre:where(:not(.cell-output pre,.python-cell pre)) {background:var(--custom-code-bg);}
 :root[data-custom-code-text] .android-reading .markdown-body pre:where(:not(.cell-output pre,.python-cell pre)) {color:var(--custom-code-text);}
 :root[data-custom-code-border] .android-reading .markdown-body pre {border-color:var(--custom-code-border);}
-:root[data-custom-radius] .android-reading .markdown-body :is(pre,.callout,.code-cell,.interactive-chart,.svg-figure,img) {border-radius:var(--custom-radius);}
+:root[data-custom-radius] .android-reading .markdown-body :is(pre,.callout,.interactive-chart,.svg-figure,img) {border-radius:var(--custom-radius);}
 :root[data-custom-table-border-width] .android-reading .markdown-body :is(th,td) {border-width:var(--custom-table-border-width);}
 :root[data-custom-callout-tip] .android-reading .markdown-body :is(.callout-tip,.callout-success,.callout-check) {--callout-accent:var(--custom-callout-tip);}
 :root[data-custom-callout-warning] .android-reading .markdown-body :is(.callout-warning,.callout-caution) {--callout-accent:var(--custom-callout-warning);}

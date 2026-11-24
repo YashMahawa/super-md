@@ -9,9 +9,12 @@ import sys
 import textwrap
 import time
 import unittest
+import urllib.parse
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
 MAIN_QML = ROOT / "qml" / "Main.qml"
 
 
@@ -50,7 +53,7 @@ def _probe():
     os.environ.setdefault("QT_QUICK_BACKEND", "software")
     os.environ.setdefault("QTWEBENGINE_CHROMIUM_FLAGS", "--disable-gpu --disable-dev-shm-usage")
 
-    from PySide6.QtCore import QEvent, QPoint, QPointF, QUrl, Qt, QObject, Property, Slot
+    from PySide6.QtCore import QEvent, QMetaObject, QPoint, QPointF, QUrl, Qt, QObject, Property, Slot
     from PySide6.QtGui import QGuiApplication
     from PySide6.QtWidgets import QApplication
     from PySide6.QtQml import QQmlComponent, QQmlEngine
@@ -97,6 +100,39 @@ ApplicationWindow {{
     property bool copyHandled: false
     property bool nativeCopyShortcutTriggered: false
     property string domSelectionText: ""
+    property bool mediaPageReady: false
+    property bool mediaSelectionPrepared: false
+    property bool mediaSelectionCleared: false
+    property int diagramX: 0
+    property int diagramY: 0
+    property int chartX: 0
+    property int chartY: 0
+    property int copiedCount: 0
+    property int mediaMenuCalls: 0
+    function prepareMediaSelection() {{
+        readerView.runJavaScript("(function(){{const r=document.createRange();r.selectNodeContents(document.getElementById('math'));const s=window.getSelection();s.removeAllRanges();s.addRange(r);const box=document.getElementById('diagram').getBoundingClientRect();const cbox=document.getElementById('chartLabel').getBoundingClientRect();return {{x:Math.round(box.left+box.width/2),y:Math.round(box.top+box.height/2),cx:Math.round(cbox.left+cbox.width/2),cy:Math.round(cbox.top+cbox.height/2)}};}})()", function(res) {{
+            if (res) {{
+                window.diagramX = res.x
+                window.diagramY = res.y
+                window.chartX = res.cx
+                window.chartY = res.cy
+                window.mediaSelectionPrepared = true
+            }}
+        }})
+    }}
+    function clearMediaSelection() {{
+        readerView.runJavaScript("window.getSelection().removeAllRanges(); true", function(ok) {{
+            if (ok) window.mediaSelectionCleared = true
+        }})
+    }}
+    function syncMediaCounts() {{
+        readerView.runJavaScript("({{copied: window.copiedCount || 0, media: window.mediaMenuCalls || 0}})", function(res) {{
+            if (res) {{
+                window.copiedCount = res.copied
+                window.mediaMenuCalls = res.media
+            }}
+        }})
+    }}
     function nativeReaderEditAction(action) {{
         {edit_action.split("{", 1)[1].rsplit("}", 1)[0]}
     }}
@@ -121,6 +157,9 @@ ApplicationWindow {{
             if (loadRequest.status === WebEngineView.LoadSucceededStatus) {{
                 runJavaScript("document.readyState === 'complete' && !!document.getElementById('content')", function(ready) {{
                     if (ready) window.pageReady = true
+                }})
+                runJavaScript("document.readyState === 'complete' && !!document.getElementById('diagram')", function(ready) {{
+                    if (ready) window.mediaPageReady = true
                 }})
             }}
         }}
@@ -170,7 +209,7 @@ ApplicationWindow {{
         QTest.qWait(30)
         window.readDocumentSelection()
         QTest.qWait(40)
-        QTest.keyClick(window, Qt.Key_C, Qt.KeyboardModifier.ControlModifier)
+        QTest.keyClick(window, Qt.Key.Key_C, Qt.KeyboardModifier.ControlModifier)
         deadline = time.monotonic() + 3
         while QGuiApplication.clipboard().text() == "clipboard sentinel" and time.monotonic() < deadline:
             QTest.qWait(25)
@@ -179,7 +218,7 @@ ApplicationWindow {{
             raise AssertionError(f"Native Ctrl+C did not reach the rendered copy handler: clipboard={copied_from_key!r}, shortcut={window.property('nativeCopyShortcutTriggered')!r}, selected={window.property('domSelectionText')!r}, webengineSelected={selected_text_property!r}")
         window.clearDocumentSelection()
         QTest.qWait(40)
-        QTest.keyClick(window, Qt.Key_C, Qt.KeyboardModifier.ControlModifier)
+        QTest.keyClick(window, Qt.Key.Key_C, Qt.KeyboardModifier.ControlModifier)
         QTest.qWait(80)
         if QGuiApplication.clipboard().text() != copied_from_key:
             raise AssertionError("Ctrl+C without a DOM selection changed the clipboard")
@@ -273,26 +312,127 @@ ApplicationWindow {{
         for name,action in [('googleMenuItem','google'),('assistantMenuItem','assistant')]:
             deadline=time.monotonic()+3
             while menu.property('visible') and time.monotonic()<deadline:QTest.qWait(20)
-            QTest.mouseClick(window,Qt.RightButton,Qt.NoModifier,context_point)
+            QTest.mouseClick(window,Qt.MouseButton.RightButton,Qt.KeyboardModifier.NoModifier,context_point)
             deadline=time.monotonic()+3
             while not menu.property('visible') and time.monotonic()<deadline:QTest.qWait(20)
             item=window.findChild(QObject,name)
             if not item or not item.property('visible'):raise AssertionError(f'{name} was not available for selected text')
-            QTest.mouseClick(window,Qt.LeftButton,Qt.NoModifier,item.mapToScene(QPointF(item.width()/2,item.height()/2)).toPoint())
+            QTest.mouseClick(window,Qt.MouseButton.LeftButton,Qt.KeyboardModifier.NoModifier,item.mapToScene(QPointF(item.width()/2,item.height()/2)).toPoint())
             deadline=time.monotonic()+3
             while (not palette.selection_actions or palette.selection_actions[-1][0]!=action) and time.monotonic()<deadline:QTest.qWait(20)
             if not palette.selection_actions or palette.selection_actions[-1]!=(action,menu.property('selectionText')):
                 raise AssertionError(f'{action} did not receive the exact selected text: {palette.selection_actions!r}')
         deadline=time.monotonic()+3
         while menu.property('visible') and time.monotonic()<deadline:QTest.qWait(20)
-        QTest.mouseClick(window,Qt.RightButton,Qt.NoModifier,context_point)
+        QTest.mouseClick(window,Qt.MouseButton.RightButton,Qt.KeyboardModifier.NoModifier,context_point)
         deadline=time.monotonic()+3
         while not menu.property('visible') and time.monotonic()<deadline:QTest.qWait(20)
         reload_item=window.findChild(QObject,"reloadMenuItem")
         if reload_item is None:raise AssertionError("Could not locate the safe Reload menu action")
         reload_point=reload_item.mapToScene(QPointF(reload_item.width()/2,reload_item.height()/2)).toPoint()
-        QTest.mouseClick(window,Qt.LeftButton,Qt.NoModifier,reload_point)
+        QTest.mouseClick(window,Qt.MouseButton.LeftButton,Qt.KeyboardModifier.NoModifier,reload_point)
         if palette.reload_requests!=1:raise AssertionError("Reload did not route through the safe native flush action")
+
+        # Phase 2 (in the same isolated WebEngine process): verify source-aware
+        # selection extraction (`window.supermdSelectedText`) and media context
+        # menu yielding (`window.supermdMediaMenuAt`) when right-clicking over
+        # an unselected image or chart SVG while math/table text is selected.
+        deadline = time.monotonic() + 3
+        while menu.property("visible") and time.monotonic() < deadline:
+            QTest.qWait(20)
+        palette.selection_actions.clear()
+        media_html = (
+            "<html><body style='margin:0;background:white;color:black;font:20px sans-serif'>"
+            "<p id='math' style='margin:16px'>Rendered math $P(A|B) = |x|$</p>"
+            "<img id='diagram' draggable='false' width='220' height='110' style='display:block;margin:16px;background:#336699' "
+            "src='data:image/svg+xml;utf8,<svg xmlns=%22http://www.w3.org/2000/svg%22 width=%22220%22 height=%22110%22><rect width=%22220%22 height=%22110%22 fill=%22%23336699%22/></svg>'/>"
+            "<figure class='interactive-chart' style='margin:16px'><svg id='chartSvg' width='220' height='90' style='user-select:none;-webkit-user-select:none'>"
+            "<text id='chartLabel' x='20' y='50' font-size='20'>AxisTick</text></svg></figure>"
+            "<script>"
+            "window.mediaMenuCalls=0;window.copiedCount=0;"
+            "window.supermdSelectedText=function(){const s=window.getSelection();return s&&!s.isCollapsed?'| Expr | Value |\\n| --- | --- |\\n| $P(A|B)$ | $|x|$ |':''};"
+            "window.supermdMediaMenuAt=function(x,y){if(window.supermdSelectedText().trim().length>0)return false;const el=document.elementFromPoint(x,y);if(el&&(el.id==='diagram'||el.closest('#chartSvg'))){window.mediaMenuCalls++;return true;}return false;};"
+            "document.addEventListener('copy',function(e){window.copiedCount++;e.clipboardData.setData('text/plain',window.supermdSelectedText());e.preventDefault();});"
+            "</script></body></html>"
+        )
+        reader.setProperty("url", QUrl("data:text/html;charset=utf-8," + urllib.parse.quote(media_html)))
+        deadline = time.monotonic() + 10
+        while not window.property("mediaPageReady") and time.monotonic() < deadline:
+            QTest.qWait(25)
+        if not window.property("mediaPageReady"):
+            raise AssertionError("Media selection WebEngine page did not become ready")
+
+        QMetaObject.invokeMethod(window, "prepareMediaSelection")
+        deadline = time.monotonic() + 5
+        while not window.property("mediaSelectionPrepared") and time.monotonic() < deadline:
+            QTest.qWait(20)
+        if not window.property("mediaSelectionPrepared"):
+            raise AssertionError("Failed to prepare selection in media WebEngine page")
+        diagram_pt = QPoint(int(window.property("diagramX")), int(window.property("diagramY")))
+        chart_pt = QPoint(int(window.property("chartX")), int(window.property("chartY")))
+
+        QTest.mouseClick(window, Qt.MouseButton.RightButton, Qt.KeyboardModifier.NoModifier, diagram_pt)
+        deadline = time.monotonic() + 5
+        while not menu.property("visible") and time.monotonic() < deadline:
+            QTest.qWait(20)
+        if not menu.property("visible"):
+            raise AssertionError("Selection context menu did not open when right-clicking diagram with active selection")
+        QTest.qWait(60)
+
+        expected_table = "| Expr | Value |\n| --- | --- |\n| $P(A|B)$ | $|x|$ |"
+        if menu.property("selectionText") != expected_table:
+            raise AssertionError(f"Unexpected selectionText over diagram: {menu.property('selectionText')!r}")
+
+        copy_item = window.findChild(QObject, "copyMenuItem")
+        google_item = window.findChild(QObject, "googleMenuItem")
+        ask_item = window.findChild(QObject, "assistantMenuItem")
+        if not copy_item.property("enabled"):
+            raise AssertionError("Copy was not enabled when right-clicking over image with active selection")
+        if not google_item.property("visible") or not ask_item.property("visible"):
+            raise AssertionError("Search Google / Ask were not visible when right-clicking over image with active selection")
+
+        ask_pt = ask_item.mapToScene(QPointF(ask_item.width() / 2, ask_item.height() / 2)).toPoint()
+        QTest.mouseClick(window, Qt.MouseButton.LeftButton, Qt.KeyboardModifier.NoModifier, ask_pt)
+        deadline = time.monotonic() + 3
+        while not palette.selection_actions and time.monotonic() < deadline:
+            QTest.qWait(20)
+        if palette.selection_actions != [("assistant", expected_table)]:
+            raise AssertionError(f"Ask action received wrong payload: {palette.selection_actions!r}")
+
+        # Re-open over chart SVG text label while selection remains active and trigger Copy
+        deadline = time.monotonic() + 3
+        while menu.property("visible") and time.monotonic() < deadline:
+            QTest.qWait(20)
+        QTest.mouseClick(window, Qt.MouseButton.RightButton, Qt.KeyboardModifier.NoModifier, chart_pt)
+        deadline = time.monotonic() + 3
+        while not menu.property("visible") and time.monotonic() < deadline:
+            QTest.qWait(20)
+        if menu.property("selectionText") != expected_table:
+            raise AssertionError(f"Unexpected selectionText over chart SVG: {menu.property('selectionText')!r}")
+        copy_pt = copy_item.mapToScene(QPointF(copy_item.width() / 2, copy_item.height() / 2)).toPoint()
+        QTest.mouseClick(window, Qt.MouseButton.LeftButton, Qt.KeyboardModifier.NoModifier, copy_pt)
+
+        deadline = time.monotonic() + 3
+        while int(window.property("copiedCount")) < 1 and time.monotonic() < deadline:
+            QMetaObject.invokeMethod(window, "syncMediaCounts")
+            QTest.qWait(30)
+        if int(window.property("copiedCount")) < 1:
+            raise AssertionError("Copy action over media did not invoke reader copy listener")
+
+        # Clear selection, then right-click #diagram -> media menu handles it and readerContextMenu stays closed
+        QMetaObject.invokeMethod(window, "clearMediaSelection")
+        deadline = time.monotonic() + 3
+        while not window.property("mediaSelectionCleared") and time.monotonic() < deadline:
+            QTest.qWait(20)
+        QTest.mouseClick(window, Qt.MouseButton.RightButton, Qt.KeyboardModifier.NoModifier, diagram_pt)
+        deadline = time.monotonic() + 3
+        while int(window.property("mediaMenuCalls")) < 1 and time.monotonic() < deadline:
+            QMetaObject.invokeMethod(window, "syncMediaCounts")
+            QTest.qWait(25)
+        if int(window.property("mediaMenuCalls")) != 1:
+            raise AssertionError(f"Expected media menu to handle unselected diagram right-click, got {window.property('mediaMenuCalls')}")
+        if menu.property("visible"):
+            raise AssertionError("readerContextMenu opened despite supermdMediaMenuAt returning true")
     finally:
         window.close()
         window.deleteLater()
@@ -318,6 +458,16 @@ class WebEngineContextMenuTest(unittest.TestCase):
         self.assertIn("Ctrl+C", default_shortcuts()["copy"])
         self.assertIn("reader.triggerWebAction(WebEngineView.Copy)", _production_reader_edit_action())
 
+    def test_run_tests_watchdog_budget_covers_macos_arm64_within_ci_step_timeout(self):
+        if str(ROOT) not in sys.path:
+            sys.path.insert(0, str(ROOT))
+        import run_tests
+        self.assertEqual(run_tests.suite_watchdog_seconds("darwin", "arm64"), 420)
+        self.assertLess(run_tests.suite_watchdog_seconds("darwin", "arm64"), 480)
+        self.assertEqual(run_tests.suite_watchdog_seconds("darwin", "x86_64"), 720)
+        self.assertEqual(run_tests.suite_watchdog_seconds("linux", "x86_64"), 240)
+        self.assertEqual(run_tests.suite_watchdog_seconds("win32", "AMD64"), 240)
+
     def test_real_webengine_right_click_menu_in_isolated_process(self):
         env = os.environ.copy()
         env.setdefault("QT_QPA_PLATFORM", "offscreen")
@@ -329,7 +479,7 @@ class WebEngineContextMenuTest(unittest.TestCase):
             env=env,
             capture_output=True,
             text=True,
-            timeout=30,
+            timeout=45,
         )
         self.assertEqual(result.returncode, 0,
                          f"WebEngine child probe failed ({result.returncode})\nstdout:\n{result.stdout}\nstderr:\n{result.stderr}")

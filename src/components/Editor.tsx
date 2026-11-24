@@ -74,6 +74,11 @@ export function editorReadingOffset(id:string):number|undefined {
   const rect=view.scrollDOM.getBoundingClientRect();
   return view.posAtCoords({x:rect.left+80,y:rect.top+16})??view.viewport.from;
 }
+export function editorSelectedText(id:string):string|null {
+  const view=visibleEditors.get(id);if(!view)return null;
+  const main=view.state.selection.main;
+  return main.empty?null:view.state.sliceDoc(main.from,main.to);
+}
 export function editorHistory(id:string,direction:"undo"|"redo"):boolean {const view=visibleEditors.get(id);return !!view && (direction==="undo"?undo(view):redo(view));}
 export function cachedEditorHistory(id:string,direction:'undo'|'redo',content:string):string|undefined {
   const cached=sessions.get(id);if(!cached||cached.state.doc.toString()!==content)return;
@@ -280,7 +285,28 @@ export default function Editor({ sessionId = "default", value, onChange, dark, f
   }, []);
 
   useEffect(() => {
-    const point = (event: Event) => { const instance = view.current; if (instance) (event as CustomEvent).detail.point = { from: instance.state.selection.main.from, to: instance.state.selection.main.to }; };
+    const point = (event: Event) => {
+      const instance = view.current;
+      if (!instance) return;
+      const detail = (event as CustomEvent<{ point?: { from: number; to: number }; x?: number; y?: number; coords?: { x: number; y: number } }>).detail;
+      if (!detail) return;
+      const x = typeof detail.x === "number" ? detail.x : detail.coords?.x;
+      const y = typeof detail.y === "number" ? detail.y : detail.coords?.y;
+      if (typeof x === "number" && typeof y === "number" && Number.isFinite(x) && Number.isFinite(y)) {
+        const bounds = instance.dom.getBoundingClientRect();
+        const inBounds = (bounds.width === 0 && bounds.height === 0) || (x >= bounds.left && x <= bounds.right && y >= bounds.top && y <= bounds.bottom);
+        if (inBounds) {
+          const at = instance.posAtCoords({ x, y });
+          if (at !== null) {
+            detail.point = { from: at, to: at };
+            return;
+          }
+        } else if (document.querySelector(".android-reading")) {
+          return;
+        }
+      }
+      detail.point = { from: instance.state.selection.main.from, to: instance.state.selection.main.to };
+    };
     window.addEventListener("supermd-insertion-point", point);
     return () => window.removeEventListener("supermd-insertion-point", point);
   }, []);

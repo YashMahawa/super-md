@@ -10,13 +10,16 @@ function presentation(target:HTMLImageElement):CSSProperties {
 }
 
 export default function ImageViewer() {
-  const [image, setImage] = useState<{ src: string; alt: string; presentation:CSSProperties; owner: HTMLElement | null } | null>(null);
+  const [image, setImage] = useState<{ src: string; alt: string; presentation:CSSProperties; owner: HTMLElement | null; liveBlock: HTMLElement | null } | null>(null);
   const [zoom, setZoom] = useState(100), [pan, setPan] = useState({ x: 0, y: 0 });
   const pointers = useRef(new Map<number, Point>()), gesture = useRef({ distance: 0, center: {x:0,y:0} });
   const zoomRef = useRef(zoom); zoomRef.current = zoom;
   const panRef = useRef(pan); panRef.current = pan;
   const canvas = useRef<HTMLDivElement>(null);
   const source=useRef<HTMLImageElement|null>(null);
+  const openTimer=useRef(0);
+  const skipRestoreFocus=useRef(false);
+  const imageRef=useRef(image);imageRef.current=image;
   const translate = (next: Point) => { panRef.current = next; setPan(next); };
   const scale = (value: number, focus?: Point) => {
     const bounds = canvas.current?.getBoundingClientRect();
@@ -26,17 +29,66 @@ export default function ImageViewer() {
   };
   const fit = () => { zoomRef.current = 100; setZoom(100); translate({x:0,y:0}); };
   useEffect(() => {
+    const cancelPending = () => {
+      if (openTimer.current) {
+        window.clearTimeout(openTimer.current);
+        openTimer.current = 0;
+      }
+    };
+    const showForTarget = (target: HTMLImageElement, liveBlock: HTMLElement | null) => {
+      const src = target.currentSrc || target.getAttribute("src") || "";
+      if (!src) return;
+      const slide = target.closest(".step-cards");
+      if (slide) { slide.dispatchEvent(new Event("supermd-step-expand")); return; }
+      source.current = target;
+      setImage({ src, alt: target.alt || "Image", presentation: presentation(target), owner: target.closest("[data-note-image-source]"), liveBlock });
+      fit();
+    };
     const open = (event: MouseEvent) => {
+      if (event.button !== 0) return;
       const target = event.target instanceof Element ? event.target.closest<HTMLImageElement>(".markdown-body img") : null;
-      if (!target?.currentSrc) return;
+      const src = target?.currentSrc || target?.getAttribute("src") || "";
+      if (!target || !src) return;
+      const liveBlock = target.closest<HTMLElement>(".live-block");
       event.preventDefault(); event.stopImmediatePropagation();
-      const slide=target.closest('.step-cards');
-      if(slide){slide.dispatchEvent(new Event('supermd-step-expand'));return;}
-      source.current=target;
-      setImage({ src: target.currentSrc, alt: target.alt || "Image", presentation:presentation(target), owner: target.closest("[data-note-image-source]") }); fit();
+      if (!liveBlock) {
+        cancelPending();
+        showForTarget(target, null);
+        return;
+      }
+      cancelPending();
+      if (event.detail > 1) return;
+      openTimer.current = window.setTimeout(() => {
+        openTimer.current = 0;
+        if (!target.isConnected || !liveBlock.isConnected || liveBlock.querySelector("textarea")) return;
+        showForTarget(target, liveBlock);
+      }, 180);
+    };
+    const onDoubleClick = (event: MouseEvent) => {
+      const target = event.target instanceof Element ? event.target : null;
+      if (!target?.closest(".live-block")) return;
+      cancelPending();
+      if (imageRef.current?.liveBlock) {
+        skipRestoreFocus.current = true;
+        setImage(null);
+      }
+    };
+    const onLiveEditOpened = () => {
+      cancelPending();
+      if (imageRef.current?.liveBlock) {
+        skipRestoreFocus.current = true;
+        setImage(null);
+      }
     };
     document.addEventListener("click", open, true);
-    return () => document.removeEventListener("click", open, true);
+    document.addEventListener("dblclick", onDoubleClick, true);
+    window.addEventListener("supermd-live-edit-opened", onLiveEditOpened);
+    return () => {
+      cancelPending();
+      document.removeEventListener("click", open, true);
+      document.removeEventListener("dblclick", onDoubleClick, true);
+      window.removeEventListener("supermd-live-edit-opened", onLiveEditOpened);
+    };
   }, []);
   useEffect(() => { setReaderOverlay("image",!!image);return()=>setReaderOverlay("image",false); }, [!!image]);
   useEffect(()=>{
@@ -63,7 +115,7 @@ export default function ImageViewer() {
     const key = (event: KeyboardEvent) => {
       if (event.key === "Escape") { event.preventDefault(); event.stopImmediatePropagation(); setImage(null); }
       if ((event.ctrlKey || event.metaKey) && ["+", "=", "-", "0"].includes(event.key)) { event.preventDefault(); event.stopImmediatePropagation(); scale(event.key === "0" ? 100 : zoomRef.current + (event.key === "-" ? -10 : 10)); }
-      if (event.key === "Tab") { const controls = Array.from(document.querySelectorAll<HTMLElement>(".image-viewer button,.image-viewer smd-slider")); const active = document.activeElement; if (event.shiftKey && active === controls[0]) { event.preventDefault(); controls.at(-1)?.focus(); } else if (!event.shiftKey && active === controls.at(-1)) { event.preventDefault(); controls[0]?.focus(); } }
+      if (event.key === "Tab") { const controls = Array.from(document.querySelectorAll<HTMLElement>(".image-viewer button")); const active = document.activeElement; if (event.shiftKey && active === controls[0]) { event.preventDefault(); controls.at(-1)?.focus(); } else if (!event.shiftKey && active === controls.at(-1)) { event.preventDefault(); controls[0]?.focus(); } }
     };
     const native = (event: Event) => { const detail = (event as CustomEvent<number | {factor:number;point?:Point}>).detail; scale(zoomRef.current * (typeof detail === "number" ? detail : detail.factor), typeof detail === "number" ? undefined : detail.point); };
     const reset = fit;
@@ -74,10 +126,16 @@ export default function ImageViewer() {
     surface?.addEventListener("wheel",wheel,{passive:false});
     document.addEventListener("keydown", key, true); window.addEventListener("supermd-image-zoom", native);
     window.addEventListener("supermd-image-reset",reset);
-    return () => { surface?.removeEventListener("supermd-canvas-pan",nativePan);surface?.removeEventListener("wheel",wheel); window.removeEventListener("supermd-image-reset",reset); document.removeEventListener("keydown", key, true); window.removeEventListener("supermd-image-zoom", native); previous?.focus({ preventScroll: true }); pointers.current.clear(); };
+    return () => { surface?.removeEventListener("supermd-canvas-pan",nativePan);surface?.removeEventListener("wheel",wheel); window.removeEventListener("supermd-image-reset",reset); document.removeEventListener("keydown", key, true); window.removeEventListener("supermd-image-zoom", native); if (skipRestoreFocus.current) skipRestoreFocus.current = false; else previous?.focus({ preventScroll: true }); pointers.current.clear(); };
   }, [!!image]);
   if (!image) return null;
   const edit = (action: string) => { if (image.owner) window.dispatchEvent(new CustomEvent("supermd-image-edit", { detail: { action, image: image.owner } })); setImage(null); };
+  const editSource = () => {
+    const block = image.liveBlock;
+    skipRestoreFocus.current = true;
+    setImage(null);
+    if (block?.isConnected) block.dispatchEvent(new CustomEvent("supermd-edit-block", { bubbles: true }));
+  };
   return <section className="image-viewer" data-independent-zoom role="dialog" aria-modal="true" aria-label="Image viewer">
     <header><strong>{image.alt}</strong><button onClick={() => setImage(null)} aria-label="Close image viewer">Close</button></header>
     <div className="image-viewer-canvas" ref={canvas} onPointerDown={event => {
@@ -91,6 +149,6 @@ export default function ImageViewer() {
     }} onPointerUp={event => pointers.current.delete(event.pointerId)} onPointerCancel={event => pointers.current.delete(event.pointerId)}>
       <img draggable={false} src={image.src} alt={image.alt} style={{ ...image.presentation, transform: `translate(${pan.x}px,${pan.y}px) scale(${zoom/100})` }} />
     </div>
-    <footer><output aria-label="Image zoom">{Math.round(zoom)}%</output>{image.owner && <><button onClick={() => edit("replace")}>Replace</button><button onClick={() => edit("remove")}>Remove</button></>}</footer>
+    <footer><output aria-label="Image zoom">{Math.round(zoom)}%</output>{image.liveBlock?.isConnected && <button type="button" onClick={editSource}>Edit source</button>}{image.owner && <><button onClick={() => edit("replace")}>Replace</button><button onClick={() => edit("remove")}>Remove</button></>}</footer>
   </section>;
 }
