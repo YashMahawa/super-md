@@ -1311,7 +1311,7 @@ class StudioViewModel(app: Application, val workspaceKey: String = "main") : And
                                         val diskAssets = runCatching { media.portableAssets(opened.directory) }.getOrDefault(JSONObject())
                                         Triple(opened.markdown, opened.directory, diskAssets)
                                     } else {
-                                        Triple(readLimited(buffered, 20_000_000).toString(Charsets.UTF_8), null, null)
+                                        Triple(readLimited(buffered, 20_000_000).toString(Charsets.UTF_8).removePrefix("\uFEFF"), null, null)
                                     }
                                 }
                             }.getOrNull() ?: continue
@@ -1323,7 +1323,7 @@ class StudioViewModel(app: Application, val workspaceKey: String = "main") : And
                             val unchanged = if (diskDir != null) {
                                 diskText == recheck.saved && recheck.assetDirectory != null && portableAssetsMatch(baselinePortableAssets(latest), diskAssets!!)
                             } else {
-                                recheck.assetDirectory == null && (diskText == recheck.saved || diskText.removePrefix("\uFEFF") == recheck.saved)
+                                recheck.assetDirectory == null && (diskText == recheck.saved || diskText == recheck.saved.removePrefix("\uFEFF"))
                             }
                             if (unchanged) continue
                             val oldDirectory = recheck.assetDirectory
@@ -1739,7 +1739,7 @@ class StudioViewModel(app: Application, val workspaceKey: String = "main") : And
                     val header = if (count > 0) String(prefix, 0, count, Charsets.UTF_8).trimStart('\uFEFF', ' ', '\n', '\r', '\t') else ""
                     val portable = portableGzipHeader(prefix.copyOfRange(0, maxOf(count, 0))) || portableEnvelopeHeader(header)
                     if (portable) { val opened = media.openFmd(buffered); Note(name = name, uri = target.toString(), content = opened.markdown, saved = opened.markdown, relative = relative, assetDirectory = opened.directory).also { recordPortableBaseline(it.id, opened.directory) } }
-                    else { val content = readLimited(buffered, 20_000_000).toString(Charsets.UTF_8); Note(name = name, uri = target.toString(), content = content, saved = content, relative = relative) }
+                    else { val content = readLimited(buffered, 20_000_000).toString(Charsets.UTF_8).removePrefix("\uFEFF"); Note(name = name, uri = target.toString(), content = content, saved = content, relative = relative) }
                 } ?: error("Document permission is unavailable; choose it again")
             }
             if (note.uri?.let { documentAccess.hasWriteGrant(Uri.parse(it)) } == true) clearDocumentAccessFailure(uri.toString())
@@ -2054,7 +2054,7 @@ class StudioViewModel(app: Application, val workspaceKey: String = "main") : And
                         val opened = media.openFmd(stream)
                         Note(id = note.id, name = note.name, uri = target.toString(), content = opened.markdown, saved = opened.markdown, relative = note.relative, assetDirectory = opened.directory, assetsDirty = false)
                     } else {
-                        val text = readLimited(stream, 20_000_000).toString(Charsets.UTF_8)
+                        val text = readLimited(stream, 20_000_000).toString(Charsets.UTF_8).removePrefix("\uFEFF")
                         Note(id = note.id, name = note.name, uri = target.toString(), content = text, saved = text, relative = note.relative, assetsDirty = false)
                     }
                 } ?: error("Document permission is unavailable; choose it again")
