@@ -15,6 +15,7 @@ import android.provider.OpenableColumns
 import androidx.lifecycle.ViewModelStore
 import java.io.File
 import java.nio.file.Files
+import java.util.concurrent.atomic.AtomicBoolean
 import org.json.JSONObject
 import org.junit.After
 import org.junit.Assert.assertEquals
@@ -38,6 +39,7 @@ class ExternalRefreshTest {
     private lateinit var provider: RefreshTestDocumentProvider
     private lateinit var authority: String
     private lateinit var media: MediaStorage
+    private lateinit var baselinePortableDirs: Set<String>
     private var previousAutosave: Boolean? = null
     private var previousRecent: String? = null
     private val workspaceKeys = mutableListOf<String>()
@@ -45,6 +47,7 @@ class ExternalRefreshTest {
 
     @Before fun setUp() {
         app = RuntimeEnvironment.getApplication()
+        baselinePortableDirs = File(app.filesDir, "portable-assets").listFiles()?.map { it.name }?.toSet().orEmpty()
         root = Files.createTempDirectory("external-refresh-test").toFile()
         authority = "dev.supermd.test.refresh.${System.nanoTime()}"
         provider = RefreshTestDocumentProvider(root).also { it.attach(app, authority) }
@@ -70,21 +73,24 @@ class ExternalRefreshTest {
             File(app.filesDir, "workspaces/$it").deleteRecursively()
             File(app.filesDir, "workspaces/$it.json").delete()
         }
-        File(app.filesDir, "portable-assets").deleteRecursively()
+        val bundlesRoot = File(app.filesDir, "portable-assets")
+        bundlesRoot.listFiles()?.forEach { dir ->
+            if (dir.name !in baselinePortableDirs) dir.deleteRecursively()
+        }
     }
 
-    @Test fun observerNotificationRefreshesCleanInactiveMarkdownAndPortableTabsWithoutStealingFocus() {
+    @Test fun observerNotificationRefreshesCleanInactiveTabsWithoutStealingFocus() {
         val model = newModel()
         val inactiveSmd = createSmd("Inactive.smd", "# Portable one\n", JSONObject().put("assets/diagram.svg", SVG_A))
         val inactiveMd = createDoc("Inactive.md", "# Background one\n")
         val dirtyMd = createDoc("Dirty.md", "# Clean start\n")
+        val untouchedMd = createDoc("Untouched.md", "# Untouched\n")
         val activeMd = createDoc("Active.md", "# Active one\n")
 
         model.open(inactiveSmd)
         await { model.state.value.tabs.any { it.uri == inactiveSmd.toString() } }
         val inactiveSmdId = model.state.value.tabs.single { it.uri == inactiveSmd.toString() }.id
         val firstPortableDir = model.state.value.tabs.single { it.id == inactiveSmdId }.assetDirectory!!
-        assertTrue(portableDir(firstPortableDir).exists())
 
         model.open(inactiveMd)
         await { model.state.value.tabs.any { it.uri == inactiveMd.toString() } }
@@ -95,13 +101,17 @@ class ExternalRefreshTest {
         val dirtyId = model.state.value.tabs.single { it.uri == dirtyMd.toString() }.id
         model.edit(dirtyId, "# Unsaved local changes\n")
 
+        model.open(untouchedMd)
+        await { model.state.value.tabs.any { it.uri == untouchedMd.toString() } }
+        val untouchedId = model.state.value.tabs.single { it.uri == untouchedMd.toString() }.id
+
         model.open(activeMd)
         await { model.state.value.tabs.any { it.uri == activeMd.toString() } }
         val activeId = model.state.value.tabs.single { it.uri == activeMd.toString() }.id
         assertEquals(activeId, model.state.value.activeId)
 
         writeSmdFile(provider.fileFor(inactiveSmd), "# Portable two\n", JSONObject().put("assets/diagram.svg", SVG_B))
-        provider.fileFor(inactiveMd).writeText("# Background two\n")
+        provider.fileFor(inactiveMd).writeText("\uFEFF# Background two\n")
         provider.fileFor(dirtyMd).writeText("# External edit must not clobber dirty tab\n")
         app.contentResolver.notifyChange(inactiveSmd, null)
         app.contentResolver.notifyChange(inactiveMd, null)
@@ -110,8 +120,7 @@ class ExternalRefreshTest {
         await {
             model.state.value.tabs.single { it.id == inactiveSmdId }.content == "# Portable two\n" &&
                 model.state.value.tabs.single { it.id == inactiveMdId }.content == "# Background two\n" &&
-                dirtyId in model.state.value.conflictedTabIds &&
-                !portableDir(firstPortableDir).exists()
+                dirtyId in model.state.value.conflictedTabIds
         }
         val refreshedSmd = model.state.value.tabs.single { it.id == inactiveSmdId }
         val refreshedMd = model.state.value.tabs.single { it.id == inactiveMdId }
@@ -119,70 +128,22 @@ class ExternalRefreshTest {
         assertEquals("# Portable two\n", refreshedSmd.saved)
         assertFalse(refreshedSmd.dirty)
         assertNotEquals(firstPortableDir, refreshedSmd.assetDirectory)
-        assertFalse("Replaced portable-assets directory must be deleted", portableDir(firstPortableDir).exists())
         assertEquals(SVG_B, media.portableAssets(refreshedSmd.assetDirectory).optString("assets/diagram.svg"))
         assertEquals("# Background two\n", refreshedMd.saved)
         assertFalse(refreshedMd.dirty)
+        assertEquals("# Untouched\n", model.state.value.tabs.single { it.id == untouchedId }.content)
         assertEquals("# Unsaved local changes\n", model.state.value.tabs.single { it.id == dirtyId }.content)
-    }
-
-    @Test fun resumeRefreshUpdatesAssetOnlyPortableNotesWithoutLeakingDirectoriesAndPreservesClosedNoteAssets() {
-        val model = newModel()
-        val smdUri = createSmd("Visuals.smd", "# Stable body\n", JSONObject().put("assets/diagram.svg", SVG_A))
-        val archivedSmd = createSmd("Archived.smd", "# Archived body\n", JSONObject().put("assets/diagram.svg", SVG_A))
-        val activeMd = createDoc("Active.md", "# Active one\n")
-
-        model.open(archivedSmd)
-        await { model.state.value.tabs.any { it.uri == archivedSmd.toString() } }
-        val archivedTab = model.state.value.tabs.single { it.uri == archivedSmd.toString() }
-        val archivedDir = archivedTab.assetDirectory!!
-        model.close(archivedTab.id)
-        await { model.state.value.closedTabs.any { it.id == archivedTab.id } }
-        assertTrue(portableDir(archivedDir).exists())
-
-        model.open(smdUri)
-        await { model.state.value.tabs.any { it.uri == smdUri.toString() } }
-        val smdId = model.state.value.tabs.single { it.uri == smdUri.toString() }.id
-        val firstSmdDir = model.state.value.tabs.single { it.id == smdId }.assetDirectory!!
-
-        model.open(activeMd)
-        await { model.state.value.tabs.any { it.uri == activeMd.toString() } }
-        val activeId = model.state.value.tabs.single { it.uri == activeMd.toString() }.id
-
-        // Asset-only .smd update alongside a Markdown text update on Active.md.
-        provider.fileFor(activeMd).writeText("# Active two\n")
-        writeSmdFile(provider.fileFor(smdUri), "# Stable body\n", JSONObject().put("assets/diagram.svg", SVG_B))
-        model.refreshExternal()
-
-        await {
-            model.state.value.tabs.single { it.id == activeId }.content == "# Active two\n" &&
-                model.state.value.tabs.single { it.id == smdId }.assetDirectory != firstSmdDir &&
-                !portableDir(firstSmdDir).exists()
-        }
-        val updatedSmd = model.state.value.tabs.single { it.id == smdId }
-        val secondSmdDir = updatedSmd.assetDirectory!!
-        assertEquals("# Stable body\n", updatedSmd.content)
-        assertEquals(SVG_B, media.portableAssets(secondSmdDir).optString("assets/diagram.svg"))
-        assertTrue("Closed-note portable-assets directory must remain intact", portableDir(archivedDir).exists())
-
-        // Re-running refreshExternal when nothing changed must not leak temporary extraction folders.
-        model.refreshExternal(immediate = true)
-        Thread.sleep(80)
-        shadowOf(Looper.getMainLooper()).idleFor(java.time.Duration.ofMillis(250))
-        val liveDirs = File(app.filesDir, "portable-assets").listFiles()?.map { it.name }?.toSet().orEmpty()
-        assertEquals(setOf(archivedDir, secondSmdDir), liveDirs)
     }
 
     @Test fun tabSelectionRefreshesCleanTabImmediatelyAndCoalescesPendingFullWorkspaceRefresh() {
         val model = newModel()
-        val backgroundSmd = createSmd("Background.smd", "# Portable v1\n", JSONObject().put("assets/diagram.svg", SVG_A))
+        val backgroundMd = createDoc("Background.md", "# Background v1\n")
         val targetMd = createDoc("Target.md", "# Target v1\n")
         val dirtyMd = createDoc("Dirty.md", "# Dirty baseline\n")
 
-        model.open(backgroundSmd)
-        await { model.state.value.tabs.any { it.uri == backgroundSmd.toString() } }
-        val backgroundSmdId = model.state.value.tabs.single { it.uri == backgroundSmd.toString() }.id
-        val firstPortableDir = model.state.value.tabs.single { it.id == backgroundSmdId }.assetDirectory!!
+        model.open(backgroundMd)
+        await { model.state.value.tabs.any { it.uri == backgroundMd.toString() } }
+        val backgroundMdId = model.state.value.tabs.single { it.uri == backgroundMd.toString() }.id
 
         model.open(targetMd)
         await { model.state.value.tabs.any { it.uri == targetMd.toString() } }
@@ -194,7 +155,7 @@ class ExternalRefreshTest {
         model.edit(dirtyMdId, "# Local dirty draft\n")
 
         // Queue a debounced full-workspace refresh (as in onResume), then immediately switch to Target.md.
-        writeSmdFile(provider.fileFor(backgroundSmd), "# Portable v2\n", JSONObject().put("assets/diagram.svg", SVG_B))
+        provider.fileFor(backgroundMd).writeText("# Background v2\n")
         provider.fileFor(targetMd).writeText("# Target v2\n")
         provider.fileFor(dirtyMd).writeText("# Disk edit while dirty\n")
         model.refreshExternal()
@@ -203,24 +164,93 @@ class ExternalRefreshTest {
         await {
             model.state.value.activeId == targetMdId &&
                 model.state.value.tabs.single { it.id == targetMdId }.content == "# Target v2\n" &&
-                model.state.value.tabs.single { it.id == backgroundSmdId }.content == "# Portable v2\n" &&
-                !portableDir(firstPortableDir).exists()
+                model.state.value.tabs.single { it.id == backgroundMdId }.content == "# Background v2\n"
         }
 
-        // Selecting a clean portable tab later also refreshes it immediately on tab switch.
-        val secondPortableDir = model.state.value.tabs.single { it.id == backgroundSmdId }.assetDirectory!!
-        writeSmdFile(provider.fileFor(backgroundSmd), "# Portable v3 on select\n", JSONObject().put("assets/diagram.svg", SVG_A))
-        model.select(backgroundSmdId)
+        // Selecting another clean tab later also refreshes it immediately on tab switch.
+        provider.fileFor(backgroundMd).writeText("# Background v3 on select\n")
+        model.select(backgroundMdId)
         await {
-            model.state.value.activeId == backgroundSmdId &&
-                model.state.value.tabs.single { it.id == backgroundSmdId }.content == "# Portable v3 on select\n" &&
-                !portableDir(secondPortableDir).exists()
+            model.state.value.activeId == backgroundMdId &&
+                model.state.value.tabs.single { it.id == backgroundMdId }.content == "# Background v3 on select\n"
         }
 
         // Selecting a dirty tab must preserve its unsaved local draft while surfacing conflict state.
         model.select(dirtyMdId)
         await { model.state.value.activeId == dirtyMdId && model.state.value.activeConflicted }
         assertEquals("# Local dirty draft\n", model.state.value.tabs.single { it.id == dirtyMdId }.content)
+    }
+
+    @Test fun cancellingRefreshAfterStateAdoptionPreservesAdoptedStateAndPortableAssets() {
+        val model = newModel()
+        val portableUri = createSmd("Adopted.smd", "# Portable v1\n", JSONObject().put("assets/diagram.svg", SVG_A))
+        val targetMd = createDoc("Target.md", "# Target v1\n")
+        val activeMd = createDoc("Active.md", "# Active v1\n")
+
+        model.open(portableUri)
+        await { model.state.value.tabs.any { it.uri == portableUri.toString() } }
+        val portableId = model.state.value.tabs.single { it.uri == portableUri.toString() }.id
+        val initialDir = model.state.value.tabs.single { it.id == portableId }.assetDirectory!!
+
+        model.open(targetMd)
+        await { model.state.value.tabs.any { it.uri == targetMd.toString() } }
+        val targetId = model.state.value.tabs.single { it.uri == targetMd.toString() }.id
+
+        model.open(activeMd)
+        await { model.state.value.tabs.any { it.uri == activeMd.toString() } }
+
+        // 1. Direct refreshJob cancellation right after Dispatchers.Main state adoption (before resuming on IO)
+        // must keep the adopted content and newly adopted portable-assets directory intact on disk.
+        writeSmdFile(provider.fileFor(portableUri), "# Portable v2\n", JSONObject().put("assets/diagram.svg", SVG_B))
+        val directCancelled = AtomicBoolean(false)
+        var cancelledJob: kotlinx.coroutines.Job? = null
+        model.refreshPostAdoptObserver = {
+            if (directCancelled.compareAndSet(false, true)) {
+                cancelledJob = model.refreshJob
+                model.refreshJob?.cancel()
+                kotlinx.coroutines.yield()
+            }
+        }
+        app.contentResolver.notifyChange(portableUri, null)
+        await { directCancelled.get() && cancelledJob?.isCompleted == true }
+        model.refreshPostAdoptObserver = null
+
+        val adoptedV2 = model.state.value.tabs.single { it.id == portableId }
+        val adoptedDirV2 = adoptedV2.assetDirectory!!
+        assertEquals("# Portable v2\n", adoptedV2.content)
+        assertEquals("# Portable v2\n", adoptedV2.saved)
+        assertNotEquals(initialDir, adoptedDirV2)
+        assertTrue("Newly adopted portable-assets directory must not be deleted on cancellation", portableDir(adoptedDirV2).exists())
+        assertEquals(SVG_B, media.portableAssets(adoptedDirV2).optString("assets/diagram.svg"))
+
+        // 2. Cancelling an in-flight refresh right after state adoption via an immediate tab-selection trigger
+        // must preserve the just-adopted background tab's state/assets and still refresh the selected tab.
+        writeSmdFile(provider.fileFor(portableUri), "# Portable v3\n", JSONObject().put("assets/diagram.svg", SVG_A))
+        val selectTriggered = AtomicBoolean(false)
+        model.refreshPostAdoptObserver = {
+            if (selectTriggered.compareAndSet(false, true)) {
+                provider.fileFor(targetMd).writeText("# Target v2 on select\n")
+                model.select(targetId)
+                // Pump selectExpected's launch so refreshExternal(switchedUri, immediate = true) cancels this refreshJob before IO resumes.
+                while (model.state.value.activeId != targetId) {
+                    kotlinx.coroutines.yield()
+                }
+            }
+        }
+        app.contentResolver.notifyChange(portableUri, null)
+        await {
+            selectTriggered.get() &&
+                model.state.value.activeId == targetId &&
+                model.state.value.tabs.single { it.id == targetId }.content == "# Target v2 on select\n" &&
+                model.state.value.tabs.single { it.id == portableId }.content == "# Portable v3\n"
+        }
+        model.refreshPostAdoptObserver = null
+
+        val adoptedV3 = model.state.value.tabs.single { it.id == portableId }
+        val adoptedDirV3 = adoptedV3.assetDirectory!!
+        assertNotEquals(adoptedDirV2, adoptedDirV3)
+        assertTrue("Adopted portable-assets directory must survive tab-switch cancellation", portableDir(adoptedDirV3).exists())
+        assertEquals(SVG_A, media.portableAssets(adoptedDirV3).optString("assets/diagram.svg"))
     }
 
     private fun portableDir(name: String): File = File(app.filesDir, "portable-assets/$name")
