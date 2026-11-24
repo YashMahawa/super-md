@@ -13,6 +13,12 @@ except ImportError:
     from agent_live import LiveTabClient, read_discovery
 
 
+UNAVAILABLE_REASON = (
+    "Live Agent Access is disabled or Super MD is not running. "
+    "Ask the user to open Super MD and enable Live Agent Access in Settings → AI agents."
+)
+
+
 class MultiSessionLiveClient:
     """Resolve global ``session:window:tab`` ids without exposing bridge tokens."""
 
@@ -67,7 +73,14 @@ class MultiSessionLiveClient:
         return rows
 
     def list_tabs(self) -> dict[str, Any]:
-        return {"tabs": self._refresh()}
+        tabs = self._refresh()
+        with self._lock:
+            session_count = len(self._sessions)
+        available = session_count > 0
+        result: dict[str, Any] = {"tabs": tabs, "available": available, "sessionCount": session_count}
+        if not available:
+            result["reason"] = UNAVAILABLE_REASON
+        return result
 
     def _route(self, tab_id: str) -> tuple[LiveTabClient, str, str]:
         # MCP document targets are exposed as ``tab:<session>:<window>:<tab>``;
@@ -218,9 +231,26 @@ class MultiSessionLiveClient:
 
     def list_devices(self) -> dict[str, Any]:
         """Report the connected local host as an actionable device without private tokens."""
-        return {"devices": [{"id": "local", "name": "This computer",
-                              "platform": platform.system().lower(), "available": True,
-                              "sessionCount": len(self._refresh())}], "count": 1}
+        self._refresh()
+        with self._lock:
+            session_count = len(self._sessions)
+        available = session_count > 0
+        device: dict[str, Any] = {
+            "id": "local",
+            "name": "This computer",
+            "platform": platform.system().lower(),
+            "available": available,
+            "sessionCount": session_count,
+        }
+        result: dict[str, Any] = {
+            "devices": [device],
+            "count": 1 if available else 0,
+            "available": available,
+        }
+        if not available:
+            device["reason"] = UNAVAILABLE_REASON
+            result["reason"] = UNAVAILABLE_REASON
+        return result
 
     def attach_tab(self, tab_id: str, *, asset_path: str, expected_revision: str, name: str | None = None):
         client, local_id, window_id = self._route(tab_id)
