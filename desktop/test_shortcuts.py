@@ -44,11 +44,11 @@ class ShortcutValidationTest(unittest.TestCase):
     def test_recorder_captures_modified_combinations_and_rejects_plain_letters(self):
         from PySide6.QtCore import Qt
 
-        sequence, error = capture_sequence(int(Qt.Key_F), int(Qt.ControlModifier.value))
+        sequence, error = capture_sequence(int(Qt.Key.Key_F), int(Qt.KeyboardModifier.ControlModifier.value))
         self.assertEqual((sequence, error), ("Ctrl+F", ""))
-        sequence, error = capture_sequence(int(Qt.Key_F11), int(Qt.NoModifier.value))
+        sequence, error = capture_sequence(int(Qt.Key.Key_F11), int(Qt.KeyboardModifier.NoModifier.value))
         self.assertEqual((sequence, error), ("F11", ""))
-        sequence, error = capture_sequence(int(Qt.Key_A), int(Qt.NoModifier.value))
+        sequence, error = capture_sequence(int(Qt.Key.Key_A), int(Qt.KeyboardModifier.NoModifier.value))
         self.assertEqual(sequence, "")
         self.assertIn("Use Ctrl", error)
 

@@ -4,6 +4,7 @@ import os
 import sys
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 os.environ.setdefault("QT_QUICK_BACKEND", "software")
@@ -56,6 +57,9 @@ class ShortcutSettingsSmokeTest(unittest.TestCase):
         cls.app = QGuiApplication.instance() or QGuiApplication(["shortcut settings smoke"])
 
     def setUp(self):
+        self._discover_patch = patch("python_runtime.discover", return_value=[])
+        self._discover_patch.start()
+        self.addCleanup(self._discover_patch.stop)
         self.session = Session(True)
         self.studio = QuietStudio(True, self.session)
         self.engine = QQmlEngine()
@@ -155,7 +159,7 @@ ApplicationWindow {{
         QTest.qWait(20)
         self.assertTrue(recorder.property("recording"), "Clicking a shortcut row must start key capture")
         self.assertTrue(self.window.property("capturingShortcut"))
-        QTest.keyClick(self.window, Qt.Key_K, Qt.KeyboardModifier.ControlModifier | Qt.KeyboardModifier.AltModifier)
+        QTest.keyClick(self.window, Qt.Key.Key_K, Qt.KeyboardModifier.ControlModifier | Qt.KeyboardModifier.AltModifier)
         QTest.qWait(40)
         self.assertFalse(self.window.property("capturingShortcut"))
         self.assertEqual(self.studio.shortcutSequences("find"), ["Ctrl+Alt+K"])
@@ -202,20 +206,20 @@ ApplicationWindow {{
         field = self.named_item("nativeTextField")
         self.assertIsNotNone(field)
         field.forceActiveFocus()
-        QTest.keyClick(self.window, Qt.Key_A, Qt.KeyboardModifier.ControlModifier)
+        QTest.keyClick(self.window, Qt.Key.Key_A, Qt.KeyboardModifier.ControlModifier)
         QGuiApplication.clipboard().setText("clipboard sentinel")
-        QTest.keyClick(self.window, Qt.Key_C, Qt.KeyboardModifier.ControlModifier)
+        QTest.keyClick(self.window, Qt.Key.Key_C, Qt.KeyboardModifier.ControlModifier)
         QTest.qWait(40)
         self.assertFalse(self.window.property("copyShortcutTriggered"), "The app-level reader copy action must yield to native text inputs")
         self.assertEqual(QGuiApplication.clipboard().text(), "native clipboard", "Ctrl+C must copy the selected QML field text")
 
     def test_application_shortcuts_stay_inside_settings_modal(self):
         self.window.setProperty("modalDialogCount", 1)
-        QTest.keyClick(self.window, Qt.Key_N, Qt.KeyboardModifier.ControlModifier)
+        QTest.keyClick(self.window, Qt.Key.Key_N, Qt.KeyboardModifier.ControlModifier)
         QTest.qWait(40)
         self.assertFalse(self.window.property("newNoteShortcutTriggered"), "A modal settings dialog must disable background app actions")
         self.window.setProperty("modalDialogCount", 0)
-        QTest.keyClick(self.window, Qt.Key_N, Qt.KeyboardModifier.ControlModifier)
+        QTest.keyClick(self.window, Qt.Key.Key_N, Qt.KeyboardModifier.ControlModifier)
         QTest.qWait(40)
         self.assertTrue(self.window.property("newNoteShortcutTriggered"), "The app action should reactivate when the modal closes")
 

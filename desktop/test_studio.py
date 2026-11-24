@@ -13,6 +13,12 @@ from documents import atomic_json
 import updates
 
 class QuietStudio(Studio):
+    def __init__(self, isolated: bool = False, session: Session | None = None):
+        session = session or Session(isolated)
+        if not session.settings.get("python"):
+            session.settings["python"] = sys.executable
+        super().__init__(isolated, session)
+
     def _refresh_theme(self):
         self.system_dark = True
 
@@ -106,8 +112,8 @@ class StudioTest(unittest.TestCase):
         import base64
         from PySide6.QtCore import QBuffer, QByteArray, QIODevice
         from PySide6.QtGui import QImage, QColor
-        image=QImage(8,6,QImage.Format_ARGB32);image.fill(QColor("#1688dd"))
-        raw=QByteArray();buffer=QBuffer(raw);buffer.open(QIODevice.WriteOnly);image.save(buffer,"PNG")
+        image=QImage(8,6,QImage.Format.Format_ARGB32);image.fill(QColor("#1688dd"))
+        raw=QByteArray();buffer=QBuffer(raw);buffer.open(QIODevice.OpenModeFlag.WriteOnly);image.save(buffer,"PNG")
         studio=self.studio;original=studio._current()['content'];replies=[]
         studio.replied.connect(lambda identifier,value,error:replies.append((identifier,value,error)))
         body=base64.b64encode(bytes(raw)).decode()
@@ -1060,16 +1066,31 @@ class StudioTest(unittest.TestCase):
         self.assertEqual(studio.flush_operation["action"],"save")
 
     def test_isolated_windows_skip_startup_python_discovery_while_desktop_windows_schedule_it(self):
+        import shutil
+
+        class UnconfiguredStudio(Studio):
+            def _refresh_theme(self):
+                self.system_dark = True
+
         with patch("studio.python_runtime.preferred", return_value="/mock/python3") as preferred:
-            isolated_window = self.window()
-            self.app.processEvents()
-            preferred.assert_not_called()
-            self.assertEqual(isolated_window.settings.get("python", ""), "")
+            isolated_session = Session(True)
+            try:
+                isolated_window = UnconfiguredStudio(True, isolated_session)
+                try:
+                    self.app.processEvents()
+                    preferred.assert_not_called()
+                    self.assertEqual(isolated_window.settings.get("python", ""), "")
+                finally:
+                    isolated_window.stop()
+                    isolated_window.pool.shutdown(wait=True, cancel_futures=True)
+            finally:
+                isolated_session.writes.shutdown(wait=True)
+                shutil.rmtree(isolated_session.data, ignore_errors=True)
 
             desktop_session = Session(True)
             try:
-                with patch.object(QuietStudio, "_restore_update"):
-                    desktop_window = QuietStudio(False, desktop_session)
+                with patch.object(UnconfiguredStudio, "_restore_update"):
+                    desktop_window = UnconfiguredStudio(False, desktop_session)
                     try:
                         self.app.processEvents()
                         self._wait_for(lambda: desktop_session.settings.get("python") == "/mock/python3")
@@ -1079,4 +1100,5 @@ class StudioTest(unittest.TestCase):
                         desktop_window.pool.shutdown(wait=True, cancel_futures=True)
             finally:
                 desktop_session.writes.shutdown(wait=True)
+                shutil.rmtree(desktop_session.data, ignore_errors=True)
 
