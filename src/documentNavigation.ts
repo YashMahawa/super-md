@@ -5,6 +5,8 @@ export {headingSlug} from './headingSlug';
 export type {OutlineEntry} from './documentAnalysis';
 import {revealWindowed} from "./windowedSearch";
 import {applyDocumentZoom,invalidateDocumentZoom,refreshDocumentExtent} from './documentZoom';
+import {invoke} from './nativeBridge';
+import {safeDecodeURIComponent,type ClassifiedRenderedLink} from './workspaceLinks';
 const jumps=new WeakMap<Element,{stop:()=>void}>();
 /** A user's zoom/pan wins over the settling frames of a preceding link jump. */
 export function cancelHeadingNavigation(root:Element|null):void {
@@ -28,16 +30,35 @@ export function remarkHeadingIds() {
     });
   };
 }
-export function resolveHeadingOffset(markdown: string, rawTarget: string): number | null {
-  let target = rawTarget.replace(/^#/, '');
-  try { target = decodeURIComponent(target); } catch { /* literal fragment */ }
+function parseHeadingTarget(rawTarget: string) {
+  const target = safeDecodeURIComponent(rawTarget.replace(/^#/, ''));
   const trimmed = target.trim();
-  if (!trimmed) return null;
-  const outline = documentOutline(markdown);
   const slug = headingSlug(trimmed);
   const numbered = /^(.*)-(\d+)$/.exec(trimmed);
   const numberedSlug = numbered ? `${headingSlug(numbered[1])}-${numbered[2]}` : '';
-  const lower = trimmed.toLowerCase();
+  return { target, trimmed, slug, numberedSlug, lower: trimmed.toLowerCase() };
+}
+export function navigateWorkspaceLink(link: Extract<ClassifiedRenderedLink, {kind: 'workspace'}>, documentPath?: string | null): void {
+  void (async () => {
+    try { await window.supermdBeforeNavigate?.(); } catch { /* native host tracks edit state */ }
+    await invoke('open_workspace_link', { documentPath: documentPath || '', target: link.target, fragment: link.fragment, wikilink: link.wikilink });
+  })().catch(() => {});
+}
+export function navigateExternalLink(url: string, openBrowserFallback = false): boolean {
+  if (typeof window !== 'undefined' && window.SuperMD) {
+    void invoke('open_external_url', { url }).catch(() => {});
+    return true;
+  }
+  if (openBrowserFallback && typeof window !== 'undefined') {
+    window.open(url, '_blank', 'noopener,noreferrer');
+    return true;
+  }
+  return false;
+}
+export function resolveHeadingOffset(markdown: string, rawTarget: string): number | null {
+  const { trimmed, slug, numberedSlug, lower } = parseHeadingTarget(rawTarget);
+  if (!trimmed) return null;
+  const outline = documentOutline(markdown);
   const match = outline.find(entry => entry.id === trimmed)
     || outline.find(entry => entry.id === slug)
     || (numberedSlug ? outline.find(entry => entry.id === numberedSlug) : undefined)
@@ -47,27 +68,21 @@ export function resolveHeadingOffset(markdown: string, rawTarget: string): numbe
 
 export function navigateHeading(link: HTMLAnchorElement): boolean {
   const href = link.getAttribute("href"); if (!href?.startsWith("#")) return false;
-  let target = href.slice(1); try { target = decodeURIComponent(target); } catch { /* literal fragment */ }
   const root = link.closest(".reading-scroll,.live-pane,.android-reading") || link.closest(".markdown-body")?.parentElement;
-  if (!root) return false;
-  return navigateToHeading(root,target);
+  return root ? navigateToHeading(root, href) : false;
 }
 export function navigateToHeading(root:Element,rawTarget:string):boolean {
-  let target = rawTarget.replace(/^#/, '');
-  try { target = decodeURIComponent(target); } catch { /* literal fragment */ }
-  const slug = headingSlug(target);
-  const numbered = /^(.*)-(\d+)$/.exec(target);
-  const numberedSlug = numbered ? `${headingSlug(numbered[1])}-${numbered[2]}` : '';
+  const { target, trimmed, slug, numberedSlug, lower } = parseHeadingTarget(rawTarget);
   const headings = Array.from(root.querySelectorAll<HTMLElement>("[data-heading-key]"));
   const counts = new Map<string, number>();
   if(!root.querySelector('[data-windowed-block]'))for (const heading of headings) { const key = heading.dataset.headingKey!, count = counts.get(key) || 0; counts.set(key, count + 1); heading.id = key + (count ? `-${count}` : ""); }
   const byId = Array.from(root.querySelectorAll<HTMLElement>('[id]'));
-  const heading = headings.find(node => node.id === target)
-    || byId.find(node => node.id === target)
+  const heading = headings.find(node => node.id === target || node.id === trimmed)
+    || byId.find(node => node.id === target || node.id === trimmed)
     || headings.find(node => node.id === slug)
     || byId.find(node => node.id === slug)
     || (numberedSlug ? headings.find(node => node.id === numberedSlug) || byId.find(node => node.id === numberedSlug) : undefined)
-    || headings.find(node => (node.textContent || '').trim().toLowerCase() === target.trim().toLowerCase());
+    || headings.find(node => (node.textContent || '').trim().toLowerCase() === lower);
   if (!heading) return true; // Broken local links must not escape into a browser.
   cancelHeadingNavigation(root);
   let observer:ResizeObserver|undefined,timer=0,frame=0;

@@ -23,23 +23,6 @@ class QuietStudio(Studio):
         self.system_dark = True
 
 class StudioTest(unittest.TestCase):
-    def test_empty_python_setting_chooses_preferred_interpreter_in_background(self):
-        session = Session(True)
-        self.assertEqual(session.settings["python"], "")
-        with patch("python_runtime.preferred", return_value=sys.executable) as preferred:
-            studio = Studio(True, session)
-            try:
-                studio._refresh_theme = lambda: None
-                deadline = time.monotonic() + 3
-                while not studio.settings.get("python") and time.monotonic() < deadline:
-                    self.app.processEvents()
-                    time.sleep(0.005)
-                self.assertEqual(studio.settings["python"], sys.executable)
-                preferred.assert_called_once()
-            finally:
-                studio.stop()
-                studio.pool.shutdown(wait=True, cancel_futures=True)
-                session.writes.shutdown(wait=True)
     def test_fedora_uses_toolbar_frame_across_desktops(self):
         for distro, desktop, frame, controls in (
             ("fedora", "niri", True, True),

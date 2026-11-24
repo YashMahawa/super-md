@@ -10,8 +10,7 @@ import {checkWriting,type WritingOptions} from "../proofreading";
 import { search, searchKeymap, highlightSelectionMatches, openSearchPanel, SearchQuery, setSearchQuery } from "@codemirror/search";
 import { oneDarkHighlightStyle } from "@codemirror/theme-one-dark";
 import type {SourceChange} from '../readerEdits';
-import {invoke} from '../nativeBridge';
-import {resolveHeadingOffset} from '../documentNavigation';
+import {navigateExternalLink,navigateWorkspaceLink,resolveHeadingOffset} from '../documentNavigation';
 import {findSourceLinkAtOffset} from '../workspaceLinks';
 import {
   TYPEWRITER_SHORTCUT,
@@ -199,23 +198,11 @@ export default function Editor({ sessionId = "default", documentPath = null, val
               return true;
             }
             if (classified.kind === 'workspace') {
-              void (async () => {
-                try { await window.supermdBeforeNavigate?.(); } catch { /* native host tracks edit state */ }
-                await invoke('open_workspace_link', {
-                  documentPath: documentPathRef.current || '',
-                  target: classified.target,
-                  fragment: classified.fragment,
-                  wikilink: classified.wikilink,
-                });
-              })().catch(() => {});
+              navigateWorkspaceLink(classified, documentPathRef.current);
               return true;
             }
             if (classified.kind === 'external') {
-              if (typeof window !== 'undefined' && window.SuperMD) {
-                void invoke('open_external_url', {url: classified.url}).catch(() => {});
-              } else if (typeof window !== 'undefined') {
-                window.open(classified.url, '_blank', 'noopener,noreferrer');
-              }
+              navigateExternalLink(classified.url, true);
               return true;
             }
             return true;

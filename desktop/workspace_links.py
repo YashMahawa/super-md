@@ -28,19 +28,14 @@ def _is_link_or_junction(path: Path) -> bool:
         if path.is_symlink():
             return True
         is_junction = getattr(path, "is_junction", None)
-        if callable(is_junction) and is_junction():
-            return True
+        return bool(callable(is_junction) and is_junction())
     except OSError:
         return False
-    return False
 
 
 def _is_entry_link_or_junction(entry: os.DirEntry[str]) -> bool:
     try:
         if entry.is_symlink():
-            return True
-        is_junction = getattr(entry, "is_junction", None)
-        if callable(is_junction) and is_junction():
             return True
     except OSError:
         return True
@@ -49,11 +44,11 @@ def _is_entry_link_or_junction(entry: os.DirEntry[str]) -> bool:
 
 def _has_symlink_within(boundary: Path, candidate: Path) -> bool:
     try:
-        rel = candidate.relative_to(boundary)
+        parts = candidate.relative_to(boundary).parts
     except ValueError:
         return True
     current = boundary
-    for part in rel.parts:
+    for part in parts:
         current = current / part
         if _is_link_or_junction(current):
             return True
@@ -292,8 +287,6 @@ def _probe_candidate(base_dir: Path, rel_path: str, boundary: Path) -> Path | No
     for candidate_rel in candidates:
         walked = _walk_within_boundary(base_dir, candidate_rel, boundary)
         try:
-            if _is_link_or_junction(walked):
-                raise WorkspaceLinkError("Symlink note links are not allowed.")
             if walked.is_file() and walked.suffix.lower() in NOTE_EXTENSIONS:
                 resolved = walked.resolve(strict=True)
                 if resolved != boundary and boundary not in resolved.parents:

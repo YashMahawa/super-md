@@ -1,6 +1,6 @@
 import {headingSlug} from './headingSlug';
 
-export const NOTE_EXTENSIONS = ['.md', '.smd', '.fmd', '.markdown', '.txt'] as const;
+const NOTE_EXTENSIONS = ['.md', '.smd', '.fmd', '.markdown', '.txt'] as const;
 
 const ASSET_OR_NOTE_EXT = /\.(?:md|smd|fmd|markdown|txt|png|jpe?g|svg|gif|webp|avif|pdf|mmd|mermaid)(?:[?#]|$)/i;
 
@@ -12,7 +12,7 @@ export function safeDecodeURIComponent(value: string): string {
   }
 }
 
-export function hasSupportedNoteExtension(target: string): boolean {
+function hasSupportedNoteExtension(target: string): boolean {
   const clean = target.split(/[?#]/, 1)[0].trim().toLowerCase();
   return NOTE_EXTENSIONS.some(ext => clean.endsWith(ext));
 }
@@ -127,13 +127,6 @@ export function classifyRenderedLink(href: string | undefined, wikilinkTarget?: 
     return fragment ? {kind: 'same-note', fragment} : {kind: 'none'};
   }
   return {kind: 'workspace', target, fragment, wikilink: false};
-}
-
-export function shouldKeepLinkInPdf(url: string | undefined): boolean {
-  if (!url) return false;
-  const trimmed = url.trim();
-  if (trimmed.startsWith('#') && trimmed.length > 1) return true;
-  return /^(?:https?:|mailto:)/i.test(trimmed);
 }
 
 function isEscapedOrImageAt(lineText: string, bracketIndex: number): boolean {

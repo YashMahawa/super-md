@@ -12,7 +12,6 @@ import {
   findSourceLinkAtOffset,
   formatWikilinkMarkdown,
   parseWikilinkParts,
-  shouldKeepLinkInPdf,
 } from "./workspaceLinks";
 
 describe("workspaceLinks helpers", () => {
@@ -102,10 +101,6 @@ describe("workspaceLinks helpers", () => {
       kind: "blocked",
       url: "file:///etc/passwd",
     });
-    expect(shouldKeepLinkInPdf("https://example.org")).toBe(true);
-    expect(shouldKeepLinkInPdf("mailto:a@b.org")).toBe(true);
-    expect(shouldKeepLinkInPdf("#intro")).toBe(true);
-    expect(shouldKeepLinkInPdf("Other%20Note.md#intro")).toBe(false);
   });
 });
 

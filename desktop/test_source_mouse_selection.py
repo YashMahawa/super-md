@@ -40,7 +40,6 @@ def _probe(mode: str, zoom: float = 95.59963715447921, fullscreen: bool = False)
         target_text = NOTE_TEXT
         content = "# Mouse selection probe\n" + target_text + "\nSecond line after the selection.\n"
         session = Session(True)
-        session.settings["python"] = sys.executable
         session.settings["welcomed"] = True
         session.settings["python"] = sys.executable
         session.settings["newNoteLocation"] = temp_dir

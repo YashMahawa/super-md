@@ -37,7 +37,6 @@ def _probe(screenshot_path: str | None = None) -> int:
     with tempfile.TemporaryDirectory(prefix="supermd-typewriter-qt-") as temp_dir:
         lines = "\n".join(f"Line {i + 1}: Long-form study note paragraph {i + 1}." for i in range(90))
         session = Session(True)
-        session.settings["python"] = sys.executable
         session.settings["welcomed"] = True
         session.settings["python"] = sys.executable
         session.settings["newNoteLocation"] = temp_dir

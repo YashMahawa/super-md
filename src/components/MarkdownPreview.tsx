@@ -11,7 +11,7 @@ import InlineDiagram,{parseDiagramSource} from "./InlineDiagram";
 import {parseBinaryTreeSource} from "./BinaryTree";
 import PythonCell from "./PythonCell";
 import SvgDiagram from "./SvgDiagram";
-import { navigateHeading, remarkHeadingIds } from "../documentNavigation";
+import { navigateExternalLink, navigateHeading, navigateWorkspaceLink, remarkHeadingIds } from "../documentNavigation";
 import { classifyRenderedLink } from "../workspaceLinks";
 import { selectedMarkdown, setSelectedMarkdownDrag } from "../copySource";
 import CopyCode from "./CopyCode";
@@ -224,18 +224,12 @@ function MarkdownPreview({ markdown, documentPath, python, dark, trustedImageHos
               if(classified.kind==='same-note'){if(navigateHeading(event.currentTarget)){event.preventDefault();event.stopPropagation();}return;}
               if(classified.kind==='workspace'){
                 event.preventDefault();event.stopPropagation();event.currentTarget.dataset.visited='true';
-                void (async()=>{
-                  try{await window.supermdBeforeNavigate?.();}catch{/* native host tracks edit state */}
-                  await invoke('open_workspace_link',{documentPath:documentPath||'',target:classified.target,fragment:classified.fragment,wikilink:classified.wikilink});
-                })().catch(()=>{});
+                navigateWorkspaceLink(classified,documentPath);
                 return;
               }
               if(classified.kind==='external'){
                 event.currentTarget.dataset.visited='true';
-                if(typeof window!=='undefined'&&window.SuperMD){
-                  event.preventDefault();event.stopPropagation();
-                  void invoke('open_external_url',{url:classified.url}).catch(()=>{});
-                }
+                if(navigateExternalLink(classified.url)){event.preventDefault();event.stopPropagation();}
                 return;
               }
               event.preventDefault();event.stopPropagation();

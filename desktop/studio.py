@@ -2022,22 +2022,24 @@ class Studio(QObject):
         elif activation_generation is None:
             activation_generation = self._activation_generation
         restoring = not explicit and str(path) in self._restoring_paths
+        def activate_existing(target_tab):
+            if explicit and activation_generation == self._activation_generation:
+                if pending_heading:
+                    target_tab["pendingHeading"] = pending_heading
+                self.recent = [str(path)] + [p for p in self.recent if p != str(path)][:29]
+                self._preferences()
+                was_active = (target_tab["id"] == self.active)
+                self._select_tab_from_open(target_tab["id"], activation_generation)
+                if was_active and pending_heading:
+                    self._emit(True)
+                self._focus_open_target(activation_generation)
         found = next((t for t in self.tabs if t["path"] == str(path)), None)
         if found:
             self._agent_open_paths.add(str(path.resolve()))
             self._restoring_paths.discard(str(path))
             if restoring and activation_generation == self._activation_generation and str(path) == self.session.startup_active:
                 self._select_tab_from_open(found["id"], activation_generation)
-            if explicit and activation_generation == self._activation_generation:
-                if pending_heading:
-                    found["pendingHeading"] = pending_heading
-                self.recent = [str(path)] + [p for p in self.recent if p != str(path)][:29]
-                self._preferences()
-                was_active = (found["id"] == self.active)
-                self._select_tab_from_open(found["id"], activation_generation)
-                if was_active and pending_heading:
-                    self._emit(True)
-                self._focus_open_target(activation_generation)
+            activate_existing(found)
             if completion_callback: completion_callback(found, None)
             return
         def finished(result, error):
@@ -2050,16 +2052,7 @@ class Studio(QObject):
             # Keep one tab and let only an explicit, still-current request focus it.
             existing = next((tab for tab in self.tabs if tab["path"] == str(path)), None)
             if existing:
-                if explicit and activation_generation == self._activation_generation:
-                    if pending_heading:
-                        existing["pendingHeading"] = pending_heading
-                    self.recent = [str(path)] + [p for p in self.recent if p != str(path)][:29]
-                    self._preferences()
-                    was_active = (existing["id"] == self.active)
-                    self._select_tab_from_open(existing["id"], activation_generation)
-                    if was_active and pending_heading:
-                        self._emit(True)
-                    self._focus_open_target(activation_generation)
+                activate_existing(existing)
                 if completion_callback: completion_callback(existing, None)
                 return
             note = self._note(path.name, content, str(path), content, assets, portable)

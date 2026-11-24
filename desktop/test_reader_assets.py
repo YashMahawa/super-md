@@ -1,7 +1,6 @@
 import base64
 import json
 import os
-import sys
 import tempfile
 import unittest
 from pathlib import Path
@@ -132,7 +131,6 @@ class ReaderAssetTests(unittest.TestCase):
 
     def test_studio_resolver_returns_a_live_note_scoped_capability(self):
         session = Session(True)
-        session.settings["python"] = sys.executable
         studio = Studio(True, session)
         try:
             tab = studio._current()
@@ -167,7 +165,6 @@ class ReaderAssetTests(unittest.TestCase):
 
     def test_studio_resolver_uses_legacy_fallback_when_capability_capacity_is_full(self):
         session = Session(True)
-        session.settings["python"] = sys.executable
         studio = Studio(True, session)
         try:
             tab = studio._current()

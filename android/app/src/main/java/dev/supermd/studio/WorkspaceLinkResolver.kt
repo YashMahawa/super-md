@@ -151,53 +151,31 @@ internal fun extractRelativeFromDocId(rootId: String, documentId: String): Strin
     else -> null
 }
 
+internal fun isExplicitRelativeWorkspaceTarget(rawTarget: String, wikilink: Boolean): Boolean =
+    !wikilink ||
+        rawTarget.startsWith("./") ||
+        rawTarget.startsWith("../") ||
+        rawTarget.startsWith(".\\") ||
+        rawTarget.startsWith("..\\")
+
 /**
  * Resolves a workspace-relative path against `parentRelative` without allowing
  * absolute paths, URL schemes, encoded path separators, or `..` escapes above the folder root.
  */
-internal fun workspaceRelativePathParts(parentRelative: String, rawTarget: String): List<String> {
-    val trimmed = rawTarget.trim()
-    if (trimmed.isEmpty() || trimmed.length > 4096) {
-        throw WorkspaceLinkException("Invalid note link.")
+internal fun workspaceRelativePathParts(parentRelative: String, rawTarget: String): List<String> =
+    try {
+        readerAssetPathParts(parentRelative.replace('\\', '/').trim('/'), rawTarget.trim())
+    } catch (_: IllegalStateException) {
+        throw WorkspaceLinkException("Links cannot navigate outside the open folder.")
+    } catch (error: IllegalArgumentException) {
+        throw WorkspaceLinkException(
+            if (error.message?.contains("Encoded path separators") == true) {
+                "Encoded path separators are not allowed in note links."
+            } else {
+                "Invalid note link."
+            },
+        )
     }
-    if (trimmed.startsWith('/') || trimmed.startsWith('\\') || trimmed.contains('\u0000')) {
-        throw WorkspaceLinkException("Absolute note paths are not supported.")
-    }
-    if (Regex("^[a-zA-Z][a-zA-Z0-9+.-]*:").containsMatchIn(trimmed) || trimmed.startsWith("//")) {
-        throw WorkspaceLinkException("External URLs cannot be opened as workspace notes.")
-    }
-    if (Regex("(?i)%2f|%5c").containsMatchIn(trimmed)) {
-        throw WorkspaceLinkException("Encoded path separators are not allowed in note links.")
-    }
-    val decoded = Uri.decode(trimmed)
-    if (decoded.isBlank() || decoded.contains('\u0000') || decoded.startsWith('/') || decoded.startsWith('\\')) {
-        throw WorkspaceLinkException("Invalid note link.")
-    }
-    val stack = ArrayDeque<String>()
-    if (parentRelative.isNotBlank()) {
-        for (segment in parentRelative.replace('\\', '/').split('/')) {
-            if (segment.isNotEmpty() && segment != ".") {
-                stack.addLast(segment)
-            }
-        }
-    }
-    for (segment in decoded.replace('\\', '/').split('/')) {
-        when (segment) {
-            "", "." -> Unit
-            ".." -> {
-                if (stack.isEmpty()) {
-                    throw WorkspaceLinkException("Links cannot navigate outside the open folder.")
-                }
-                stack.removeLast()
-            }
-            else -> stack.addLast(segment)
-        }
-    }
-    if (stack.isEmpty()) {
-        throw WorkspaceLinkException("Invalid note link.")
-    }
-    return stack.toList()
-}
 
 private fun extensionPriority(extLower: String): Int {
     val idx = WORKSPACE_NOTE_EXTENSIONS.indexOf(extLower)
@@ -285,13 +263,7 @@ internal class WorkspaceLinkCache(
         if (cleaned.isEmpty()) {
             throw WorkspaceLinkException("Link target is empty.")
         }
-        val explicitRelative = !wikilink ||
-            cleaned.startsWith("./") ||
-            cleaned.startsWith("../") ||
-            cleaned.startsWith(".\\") ||
-            cleaned.startsWith("..\\")
-
-        if (explicitRelative) {
+        if (isExplicitRelativeWorkspaceTarget(cleaned, wikilink)) {
             if (noteRelative == null) {
                 throw WorkspaceLinkException("Choose the folder containing this note to follow relative links.")
             }

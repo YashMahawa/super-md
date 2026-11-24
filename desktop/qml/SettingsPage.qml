@@ -21,19 +21,7 @@ Pane {
         if (host) host.capturingShortcut = false
     }
     function save(key, value) { studio.setting(key, JSON.stringify(value)) }
-    function ensurePythonChoices() {
-        if (section === "python" && (!ownerPopup || ownerPopup.visible) && !studio.pythonBusy && JSON.parse(studio.pythonChoices).length === 0) {
-            studio.refreshPython()
-        }
-    }
-    onSectionChanged: {
-        if (settingsScroll) settingsScroll.contentItem.contentY = 0
-        ensurePythonChoices()
-    }
-    Connections {
-        target: page.ownerPopup
-        function onVisibleChanged() { page.ensurePythonChoices() }
-    }
+    onSectionChanged: if (settingsScroll) settingsScroll.contentItem.contentY = 0
     function formatBytes(value) {
         if (value < 1024) return value + " B"
         if (value < 1024 * 1024) return (value / 1024).toFixed(1) + " KB"
@@ -56,7 +44,7 @@ Pane {
         onAccepted: studio.clearStorageCategory(page.pendingCleanup)
         contentItem: Label { width: 360; wrapMode: Text.WordWrap; text: page.pendingCleanup === "execution-results" ? "Remove app-generated Python result previews. Saved notes, exported images and recovery data will not be touched. This cannot be undone." : "Remove cached update verification/download state. Installed versions and Downloads outside app storage remain unchanged. This cannot be undone." }
     }
-    Component.onCompleted: ensurePythonChoices()
+    Component.onCompleted: studio.refreshPython()
     ColumnLayout {
         anchors.fill: parent
         anchors.margins: 28
