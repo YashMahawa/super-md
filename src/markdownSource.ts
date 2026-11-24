@@ -332,6 +332,24 @@ export function normalizeMarkdownSource(markdown:string):Stage {
 }
 export function normalizeCallouts(markdown:string):string{return normalizeMarkdownSource(markdown).value;}
 
+export function remarkImageAttributes() {
+  return (tree:any)=>{
+    visit(tree,(parent:any)=>{
+      if(!Array.isArray(parent.children))return;
+      for(let i=0;i<parent.children.length-1;i++){
+        const current=parent.children[i],next=parent.children[i+1];
+        if((current?.type==='image'||current?.type==='imageReference')&&next?.type==='text'&&typeof next.value==='string'){
+          const stripped=next.value.replace(/^\{[^}\r\n]*\b(?:width|zoom)\s*=\s*[^}\r\n]+\}/i,'');
+          if(stripped!==next.value){
+            if(stripped)parent.children[i+1]={...next,value:stripped};
+            else parent.children.splice(i+1,1);
+          }
+        }
+      }
+    });
+  };
+}
+
 export function remarkSourceSyntax(this:any){
   const parser=this.parser;
   this.parser=(source:string,file:any)=>{

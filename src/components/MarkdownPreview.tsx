@@ -1,10 +1,9 @@
 import { Children, isValidElement, lazy, memo, Suspense, useCallback, useContext, useEffect, useMemo, useRef, useState, type ReactNode } from "react";
 import { invoke } from "../nativeBridge";
 import CachedMarkdown,{type MarkdownBlockRenderer} from "./CachedMarkdown";
-import remarkGfm from "remark-gfm";
-import remarkMath from "remark-math";
 import rehypeKatex from "rehype-katex";
 import rehypeHighlight from "rehype-highlight";
+import type { PluggableList } from "unified";
 import { visit } from "unist-util-visit";
 import InteractiveChart from "./InteractiveChart";
 import StepCards from "./StepCards";
@@ -12,8 +11,6 @@ import InlineDiagram,{parseDiagramSource} from "./InlineDiagram";
 import {parseBinaryTreeSource} from "./BinaryTree";
 import PythonCell from "./PythonCell";
 import SvgDiagram from "./SvgDiagram";
-import { remarkSvgBlocks } from "../svgBlocks";
-import { remarkObsidianMath } from "../obsidianMath";
 import { navigateHeading, remarkHeadingIds } from "../documentNavigation";
 import { selectedMarkdown, setSelectedMarkdownDrag } from "../copySource";
 import CopyCode from "./CopyCode";
@@ -44,21 +41,6 @@ const MarkdownParagraph:Components['p']=({node,children,...props})=>{
 };
 function remarkTaskPositions() {
   return (tree:unknown)=>{let index=0;visit(tree as never,'listItem',(node:any)=>{if(typeof node.checked==='boolean')node.data={...node.data,hProperties:{...node.data?.hProperties,'data-task-index':index++}};});};
-}
-function remarkImageAttributes() {
-  return (tree:unknown)=>visit(tree as never,(parent:any)=>{
-    if(!Array.isArray(parent.children))return;
-    for(let i=0;i<parent.children.length-1;i++){
-      const current=parent.children[i],next=parent.children[i+1];
-      if((current?.type==='image'||current?.type==='imageReference')&&next?.type==='text'&&typeof next.value==='string'){
-        const stripped=next.value.replace(/^\{[^}\r\n]*\b(?:width|zoom)\s*=\s*[^}\r\n]+\}/i,'');
-        if(stripped!==next.value){
-          if(stripped)parent.children[i+1]={...next,value:stripped};
-          else parent.children.splice(i+1,1);
-        }
-      }
-    }
-  });
 }
 function remarkSourcePositions(){return (tree:unknown)=>visit(tree as never,(node:any)=>{
   if(!node.position||!node.children)return;
@@ -112,6 +94,10 @@ export function remarkCallouts() {
     node.data = { hName: collapsible ? "details" : "aside", hProperties: { ...(collapsible ? {open:match[2] === "+"} : {}), className: `callout callout-${type}`, "data-callout-type": type } };
   });
 }
+
+export const DIAGRAM_PLAIN_TEXT_LANGUAGES = ["svg", "mermaid", "smd-tree", "smd-diagram", "smd-steps", "smd-chart"] as const;
+export const PREVIEW_REMARK_PLUGINS: PluggableList = [remarkCallouts, remarkHeadingIds, remarkTaskPositions, remarkSourcePositions];
+export const PREVIEW_REHYPE_PLUGINS: PluggableList = [rehypeKatex, [rehypeHighlight, { plainText: [...DIAGRAM_PLAIN_TEXT_LANGUAGES] }]];
 
 function AssetImage({ src = "", alt = "", documentPath, trustedImageHosts, onTrustImageHost }: { src?: string; alt?: string; documentPath: string | null; trustedImageHosts: string[]; onTrustImageHost?: (host: string) => void }) {
   const isRemote = /^https?:\/\//i.test(src);
@@ -220,8 +206,8 @@ function MarkdownPreview({ markdown, documentPath, python, dark, trustedImageHos
         sourceAnalysis={{source:markdown,analysis}}
         renderBlock={renderBlock}
         windowingEnabled={!fullDocumentAccessibility}
-        remarkPlugins={[remarkGfm, remarkMath, remarkObsidianMath, remarkSvgBlocks, remarkImageAttributes, remarkCallouts, remarkHeadingIds, remarkTaskPositions,remarkSourcePositions]}
-        rehypePlugins={[rehypeKatex, rehypeHighlight]}
+        remarkPlugins={PREVIEW_REMARK_PLUGINS}
+        rehypePlugins={PREVIEW_REHYPE_PLUGINS}
         components={{
           p: MarkdownParagraph,
           input: ({node: _node,...props}) => <input {...props} disabled={!onChange} onChange={()=>{}} />,
