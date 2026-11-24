@@ -5,7 +5,7 @@ from unittest.mock import patch
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
-from PySide6.QtCore import QEvent, QLockFile, QObject, QPointF, QStandardPaths, Qt, QTimer, QUrl, Signal
+from PySide6.QtCore import QEvent, QEventLoop, QLockFile, QObject, QPointF, QStandardPaths, Qt, QTimer, QUrl, Signal
 from PySide6.QtNetwork import QLocalServer
 from PySide6.QtQml import QQmlComponent, QQmlEngine
 from PySide6.QtQuick import QQuickItem
@@ -88,7 +88,8 @@ class BackgroundTests(unittest.TestCase):
 
     def _pump(self, rounds=8):
         for _ in range(rounds):
-            QTest.qWait(5)
+            self.qt_app.processEvents(QEventLoop.ProcessEventsFlag.AllEvents, 5)
+            time.sleep(0.002)
 
     def _make_session(self):
         session = Session(True)
@@ -823,9 +824,10 @@ class InstanceBrokerAndServiceCliTests(unittest.TestCase):
         deadline = time.monotonic() + timeout
         while thread.is_alive() and time.monotonic() < deadline:
             if on_tick: on_tick()
-            QTest.qWait(5)
+            self.qt_app.processEvents(QEventLoop.ProcessEventsFlag.AllEvents, 5)
+            time.sleep(0.002)
         thread.join(timeout=1)
-        QTest.qWait(5)
+        self.qt_app.processEvents(QEventLoop.ProcessEventsFlag.AllEvents, 5)
         if errors: raise errors[0]
         self.assertIn("data", reply, "IPC worker timed out")
         return reply["data"]
@@ -950,9 +952,10 @@ class InstanceBrokerAndServiceCliTests(unittest.TestCase):
         worker.start()
         deadline = time.monotonic() + 8.0
         while not done and time.monotonic() < deadline:
-            QTest.qWait(5)
+            self.qt_app.processEvents(QEventLoop.ProcessEventsFlag.AllEvents, 5)
+            time.sleep(0.002)
         worker.join(timeout=1.0)
-        QTest.qWait(5)
+        self.qt_app.processEvents(QEventLoop.ProcessEventsFlag.AllEvents, 5)
         if errs:
             raise errs[0]
         self.assertIn("result", holder, f"LiveTabClient({action}) timed out")
@@ -1816,19 +1819,24 @@ desktop_main._exit_process(rc)""",
                 "fake_broker = MagicMock()",
                 "fake_broker.close.side_effect = lambda: events.append('broker_close')",
                 "fake_handler = MagicMock()",
-                "with patch.object(desktop_main.QWebEngineProfile, 'defaultProfile') as m_profile:",
+                "with patch.object(desktop_main, 'sys', SimpleNamespace(platform='linux', stdout=sys.stdout, stderr=sys.stderr, exit=MagicMock())) as m_linux_sys, patch.object(desktop_main.QWebEngineProfile, 'defaultProfile') as m_profile:",
                 "    desktop_main._run_teardown(fake_app, fake_session, [fake_studio], [fake_engine], fake_handler, fake_broker, reader_profile_initialized=False)",
                 "    assert not m_profile.called, 'Headless teardown must not initialize QWebEngineProfile.defaultProfile()'",
-                "assert events == ['bridge_stop', 'studio_stop', ('writes_shutdown', True), 'engine_delete', 'deferred_delete', 'broker_close', 'deferred_delete'], events",
-                "events.clear()",
-                "with patch.object(desktop_main.QWebEngineProfile, 'defaultProfile') as m_profile2:",
-                "    desktop_main._run_teardown(fake_app, fake_session, [], [], fake_handler, None, reader_profile_initialized=True)",
-                "    m_profile2.return_value.removeUrlSchemeHandler.assert_called_once_with(fake_handler)",
-                "assert desktop_main._TEARDOWN_COMPLETED is True",
-                "with patch.object(desktop_main, 'sys', SimpleNamespace(platform='linux', stdout=sys.stdout, stderr=sys.stderr, exit=MagicMock())) as m_linux_sys:",
+                "    assert events == ['bridge_stop', 'studio_stop', ('writes_shutdown', True), 'broker_close', 'engine_delete', 'deferred_delete', 'deferred_delete'], events",
                 "    desktop_main._exit_process(0)",
                 "    assert m_linux_sys.exit.call_args_list == [((0,), {})], m_linux_sys.exit.call_args_list",
-                "with patch.object(desktop_main, 'sys', SimpleNamespace(platform='darwin', stdout=sys.stdout, stderr=sys.stderr, exit=MagicMock())) as m_darwin_sys, patch.object(desktop_main.os, '_exit') as m_os_exit:",
+                "events.clear()",
+                "with patch.object(desktop_main, 'sys', SimpleNamespace(platform='linux', stdout=sys.stdout, stderr=sys.stderr, exit=MagicMock())), patch.object(desktop_main.QWebEngineProfile, 'defaultProfile') as m_profile2:",
+                "    desktop_main._run_teardown(fake_app, fake_session, [], [], fake_handler, None, reader_profile_initialized=True)",
+                "    m_profile2.return_value.removeUrlSchemeHandler.assert_called_once_with(fake_handler)",
+                "events.clear()",
+                "desktop_main._DARWIN_EXIT_ANCHOR.clear()",
+                "with patch.object(desktop_main, 'sys', SimpleNamespace(platform='darwin', stdout=sys.stdout, stderr=sys.stderr, exit=MagicMock())) as m_darwin_sys, patch.object(desktop_main.QWebEngineProfile, 'defaultProfile') as m_profile_darwin, patch.object(desktop_main.os, '_exit') as m_os_exit:",
+                "    desktop_main._run_teardown(fake_app, fake_session, [fake_studio], [fake_engine], fake_handler, fake_broker, reader_profile_initialized=False)",
+                "    assert not m_profile_darwin.called, 'Darwin headless teardown must not initialize QWebEngineProfile.defaultProfile()'",
+                "    assert events == ['bridge_stop', 'studio_stop', ('writes_shutdown', True), 'broker_close'], events",
+                "    assert desktop_main._DARWIN_EXIT_ANCHOR, 'Expected darwin exit anchor to hold teardown objects'",
+                "    assert desktop_main._TEARDOWN_COMPLETED is True",
                 "    desktop_main._exit_process(0)",
                 "    assert m_os_exit.call_args_list == [((0,), {})], m_os_exit.call_args_list",
                 "    assert not m_darwin_sys.exit.called",

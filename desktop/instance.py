@@ -72,7 +72,7 @@ class InstanceBroker(QObject):
     def __init__(self, parent=None, *, service_handler=None):
         super().__init__(parent)
         self.service_handler = service_handler
-        root = Path(QStandardPaths.writableLocation(QStandardPaths.AppDataLocation))
+        root = Path(QStandardPaths.writableLocation(QStandardPaths.AppDataLocation)).resolve()
         root.mkdir(parents=True, exist_ok=True)
         self.root = root
         self.lock = QLockFile(str(root / "native-instance.lock"))
@@ -83,7 +83,7 @@ class InstanceBroker(QObject):
         self.server.newConnection.connect(self.accept)
         self._should_listen = False
         self._listen_watchdog = QTimer(self)
-        self._listen_watchdog.setInterval(100)
+        self._listen_watchdog.setInterval(25)
         self._listen_watchdog.timeout.connect(self._ensure_listening)
 
     def hold_process_exit_lock(self, timeout: float = 15.0) -> None:
@@ -156,6 +156,14 @@ class InstanceBroker(QObject):
         if socket is None:
             raise RuntimeError("Super MD is starting or busy. Please try opening the note again.")
         if not open_existing:
+            # Exchange a read-only status ping before closing so BSD/macOS XNU never sees an
+            # unread, already-closed client socket in ::accept() (ECONNABORTED / QTBUG-27239).
+            socket.write(b'{"service":"status"}\n')
+            socket.flush()
+            socket.waitForBytesWritten(500)
+            ack = bytes(socket.readAll())
+            while b"\n" not in ack and socket.waitForReadyRead(500):
+                ack += bytes(socket.readAll())
             socket.disconnectFromServer()
             return False
         url = QUrl(note or "")

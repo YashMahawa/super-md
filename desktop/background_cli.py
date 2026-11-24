@@ -31,7 +31,7 @@ def main(argv):
     from PySide6.QtNetwork import QLocalSocket
     app=QCoreApplication.instance() or QCoreApplication(['super-md'])
     app.setApplicationName('super-md');app.setOrganizationName('SuperMD')
-    root=Path(QStandardPaths.writableLocation(QStandardPaths.AppDataLocation))
+    root=Path(QStandardPaths.writableLocation(QStandardPaths.AppDataLocation)).resolve()
     name='supermd-qt-'+hashlib.sha256(str(root).encode()).hexdigest()[:20]
     def _instance_lock_held():
         if not root.exists():return False
@@ -103,9 +103,18 @@ def main(argv):
                     if reply is not None or not _instance_lock_held():break
                     time.sleep(.1)
                 if reply is None and _instance_lock_held():
-                    reply=request('start')
+                    probe=QLocalSocket();probe.connectToServer(name)
+                    still_listening=probe.waitForConnected(100)
+                    if still_listening:
+                        probe.disconnectFromServer()
+                        reply=request('start')
     else:
         reply=request(args.action)
+        if reply is None and _instance_lock_held():
+            retry_deadline=time.monotonic()+.35
+            while reply is None and _instance_lock_held() and time.monotonic()<retry_deadline:
+                time.sleep(.05)
+                reply=request(args.action)
     if args.action=='status':
         if reply is not None and not reply.get('ok',False):
             if reply.get('error')=='Background service is unavailable':reply=None
