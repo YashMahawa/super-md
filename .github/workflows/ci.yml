@@ -42,6 +42,10 @@ jobs:
           node-version: 22
           cache: npm
       - run: npm ci
+      - name: Reject deprecated Phosphor icon references
+        run: |
+          node --test scripts/verify-phosphor-icons.test.mjs
+          node scripts/verify-phosphor-icons.mjs
       - run: npm run build:native
       - name: Inventory required native reader resources
         run: node scripts/report-web-assets.mjs dist --verify-native --public-root public --output "$RUNNER_TEMP/reader-assets-report.json"
@@ -138,6 +142,7 @@ jobs:
           cache-on-failure: true
       - run: npm ci
       - run: npx tsc -b --pretty false
+      - run: node scripts/verify-phosphor-icons.mjs
       - name: Build the relay for cross-platform Qt/MCP integration tests
         run: npm ci --prefix agent-relay && npm run build --prefix agent-relay
       - name: Wait for and download same-run frontend artifacts for this checkout
@@ -158,6 +163,7 @@ jobs:
             ${{ runner.temp }}/reader-assets-report.json
             ${{ runner.temp }}/python-wheel-inventory.json
       - run: node --test scripts/release-guards.test.mjs
+      - run: node --test scripts/verify-phosphor-icons.test.mjs
       - run: npx vitest run
       - run: npm run test:pdf
       - run: cargo build --locked --release --manifest-path smd-core/Cargo.toml --bin smd-engine

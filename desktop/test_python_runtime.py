@@ -48,16 +48,19 @@ class PythonRuntimeTest(unittest.TestCase):
         os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
         from unittest.mock import patch
         from PySide6.QtGui import QGuiApplication
-        from studio import Session
-        from test_studio import QuietStudio
+        from studio import Session, Studio
 
         app = QGuiApplication.instance() or QGuiApplication(["python runtime test"])
         session = Session(True)
-        with patch.object(QuietStudio, "_choose_default_python") as choose_default:
-            isolated_window = QuietStudio(True, session)
+        with (
+            patch.object(Studio, "_refresh_theme", lambda self: setattr(self, "system_dark", True)),
+            patch.object(Studio, "_restore_update"),
+            patch.object(Studio, "_choose_default_python") as choose_default,
+        ):
+            isolated_window = Studio(True, session)
             app.processEvents()
             choose_default.assert_not_called()
-            production_window = QuietStudio(False, session)
+            production_window = Studio(False, session)
             try:
                 app.processEvents()
                 choose_default.assert_called_once()

@@ -11,6 +11,8 @@ class ShortcutValidationTest(unittest.TestCase):
         normalized, error = normalize_shortcuts(defaults)
         self.assertEqual(error, "")
         self.assertEqual(normalized, defaults)
+        self.assertEqual(defaults["save"], ["Ctrl+S"])
+        self.assertEqual(defaults["save_as"], ["Ctrl+Shift+S"])
         self.assertTrue(native_label(defaults["find"][0]))
         self.assertEqual(defaults["replace"], ["Ctrl+H"])
         self.assertIn("F3", defaults["find_next"])
@@ -23,6 +25,8 @@ class ShortcutValidationTest(unittest.TestCase):
             if action == "fullscreen":
                 continue
             self.assertFalse(any("Meta" in sequence for sequence in sequences), f"{action} should use portable Ctrl for Command")
+        self.assertEqual(defaults["save"], ["Ctrl+S"])
+        self.assertEqual(defaults["save_as"], ["Ctrl+Shift+S"])
         self.assertEqual(defaults["copy"], ["Ctrl+C"])
         self.assertEqual(defaults["find"], ["Ctrl+F"])
         self.assertEqual(defaults["replace"], ["Ctrl+H"])

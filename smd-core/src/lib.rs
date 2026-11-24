@@ -184,15 +184,15 @@ impl<'a> Renderer<'a> {
                                 continue;
                             }
                             if ["mermaid", "smd-chart"].contains(&lang.as_str()) { bail!("Export preparation did not render a {lang} block"); }
-                            // Individual lines fit the available width while the
-                            // enclosing block stays breakable across pages.
-                            out.push_str("\n#block(width: 100%, breakable: true, fill: smd-code-fill, inset: 8pt)[\n");
-                            // Each fit is a block-level layout. Adding a separate
-                            // linebreak after it creates empty paragraphs and
-                            // wastes most of a page on short snippets.
-                            out.push_str("#set par(spacing: 0pt, leading: .3em)\n");
-                            for line in code.lines() { out.push_str(&format!("#block(height: 1.2em, above: 0pt, below: 0pt)[#smd-fit(raw({}, lang: {}))]\n", string(if line.is_empty() { " " } else { line }), string(&lang))); }
-                            out.push_str("]\n\n");
+                            // Highlight the whole block once and fit individual
+                            // synthesized lines inside a breakable container.
+                            let code_arg = if code.is_empty() {
+                                "none".into()
+                            } else {
+                                string(code.strip_suffix("\r\n").or_else(|| code.strip_suffix('\n')).unwrap_or(&code))
+                            };
+                            let lang_arg = if lang.is_empty() { "none".into() } else { string(&lang) };
+                            out.push_str(&format!("\n#smd-code({code_arg}, lang: {lang_arg})\n\n"));
                         },
                         Tag::Image { dest_url, .. } => {
                             let _alt = self.render(Some(close))?;
@@ -591,6 +591,202 @@ P(A\cup B\cup C)=&P(A)+P(B)+P(C)\\
                 }
             }
         }
+    }
+    fn decompress_pdf_streams(pdf: &[u8]) -> String {
+        use std::io::Read;
+        let mut out = String::new();
+        let mut cursor = 0;
+        while let Some(pos) = pdf[cursor..].windows(6).position(|w| w == b"stream") {
+            let mut start = cursor + pos + 6;
+            if pdf.get(start) == Some(&b'\r') { start += 1; }
+            if pdf.get(start) == Some(&b'\n') { start += 1; } else { cursor = start; continue; }
+            let Some(end_rel) = pdf[start..].windows(9).position(|w| w == b"endstream") else { break };
+            let mut end = start + end_rel;
+            while end > start && matches!(pdf[end - 1], b'\r' | b'\n') { end -= 1; }
+            let mut decoded = Vec::new();
+            if flate2::read::ZlibDecoder::new(&pdf[start..end]).read_to_end(&mut decoded).is_ok() {
+                if let Ok(text) = String::from_utf8(decoded) {
+                    out.push_str(&text);
+                    out.push('\n');
+                }
+            }
+            cursor = start + end_rel + 9;
+        }
+        out
+    }
+    #[test]
+    fn code_blocks_preserve_multiline_syntax_highlighting() {
+        let string_only = "```python\nprint(\"\"\"\ndef inside_multiline_string(): return 42\n\"\"\")\n```\n";
+        let with_real_def = "```python\nprint(\"\"\"\ndef inside_multiline_string(): return 42\n\"\"\")\ndef real_function(): return 42\n```\n";
+        let rendered = source(with_real_def, &PdfOptions::default(), &HashMap::new()).unwrap();
+        assert_eq!(rendered.matches("\n#smd-code(").count(), 1, "Expected one #smd-code call for the block: {rendered}");
+
+        let string_streams = decompress_pdf_streams(&export(string_only, &PdfOptions::default(), &HashMap::new()).unwrap());
+        let real_def_streams = decompress_pdf_streams(&export(with_real_def, &PdfOptions::default(), &HashMap::new()).unwrap());
+        // Typst Light highlights strings in #198810 and keywords in #d73948 via PDF `scn` color operators.
+        let has_scn = |streams: &str, target: [f64; 3]| {
+            streams.lines().any(|line| {
+                let Some(rest) = line.split("/c1 cs ").nth(1) else { return false };
+                let parts: Vec<&str> = rest.split_whitespace().collect();
+                parts.len() >= 4 && parts[3] == "scn" && (0..3).all(|i| parts[i].parse::<f64>().is_ok_and(|v| (v - target[i]).abs() < 0.01))
+            })
+        };
+        let string_green = [0x19 as f64 / 255., 0x88 as f64 / 255., 0x10 as f64 / 255.];
+        let keyword_red = [0xd7 as f64 / 255., 0x39 as f64 / 255., 0x48 as f64 / 255.];
+        assert!(has_scn(&string_streams, string_green), "Multi-line Python string must emit string highlight color:\n{string_streams}");
+        assert!(!has_scn(&string_streams, keyword_red), "Keywords inside a multi-line string must not highlight as keywords:\n{string_streams}");
+        assert!(has_scn(&real_def_streams, keyword_red), "Code after closing triple quotes must resume keyword highlighting:\n{real_def_streams}");
+    }
+    #[test]
+    fn code_blocks_preserve_blank_lines_trailing_newlines_and_empty_fences() {
+        // Empty tagged and untagged fences pass `none`.
+        let empty_md = "```python\n```\n\n```\n```\n\nAFTER-EMPTY\n";
+        let empty_src = source(empty_md, &PdfOptions::default(), &HashMap::new()).unwrap();
+        assert!(empty_src.contains("#smd-code(none, lang: \"python\")"), "{empty_src}");
+        assert!(empty_src.contains("#smd-code(none, lang: none)"), "{empty_src}");
+        assert!(export(empty_md, &PdfOptions::default(), &HashMap::new()).unwrap().starts_with(b"%PDF-"));
+
+        // Single blank line fence passes `""`, not `none`.
+        let one_blank_src = source("```python\n\n```\n\nMARKER", &PdfOptions::default(), &HashMap::new()).unwrap();
+        assert!(one_blank_src.contains("#smd-code(\"\", lang: \"python\")"), "{one_blank_src}");
+
+        // LF, CRLF (both normalized through `source` and direct `Renderer` events), and unclosed EOF fences
+        // strip at most one trailing newline without dropping intentional trailing blank lines.
+        let lf_src = source("```rust\nlet a = 1;\nlet b = 2;\n```\n", &PdfOptions::default(), &HashMap::new()).unwrap();
+        let crlf_src = source("```rust\r\nlet a = 1;\r\nlet b = 2;\r\n```\r\n", &PdfOptions::default(), &HashMap::new()).unwrap();
+        let eof_src = source("```rust\nlet a = 1;\nlet b = 2;", &PdfOptions::default(), &HashMap::new()).unwrap();
+        let trailing_blank_src = source("```rust\nlet a = 1;\nlet b = 2;\n\n```\n", &PdfOptions::default(), &HashMap::new()).unwrap();
+        assert!(lf_src.contains("#smd-code(\"let a = 1;\\nlet b = 2;\", lang: \"rust\")"), "{lf_src}");
+        assert!(crlf_src.contains("#smd-code(\"let a = 1;\\nlet b = 2;\", lang: \"rust\")"), "{crlf_src}");
+        assert!(eof_src.contains("#smd-code(\"let a = 1;\\nlet b = 2;\", lang: \"rust\")"), "{eof_src}");
+        assert!(trailing_blank_src.contains("#smd-code(\"let a = 1;\\nlet b = 2;\\n\", lang: \"rust\")"), "{trailing_blank_src}");
+
+        let raw_crlf_events = vec![
+            Event::Start(Tag::CodeBlock(CodeBlockKind::Fenced("rust".into()))),
+            Event::Text("let a = 1;\r\nlet b = 2;\r\n".into()),
+            Event::End(TagEnd::CodeBlock),
+        ];
+        let raw_crlf_out = Renderer {
+            events: raw_crlf_events.into_iter().peekable(),
+            assets: &HashMap::new(),
+            footnotes: HashMap::new(),
+            headings: HashMap::new(),
+            heading_counts: HashMap::new(),
+        }.render(None).unwrap();
+        assert_eq!(raw_crlf_out.trim(), "#smd-code(\"let a = 1;\\r\\nlet b = 2;\", lang: \"rust\")");
+
+        let bbox_word_attr = |md: &str, needle: &str, attr: &str| -> Option<f64> {
+            let path = std::env::temp_dir().join(format!("supermd-code-y-{}-{needle}-{attr}.pdf", std::process::id()));
+            std::fs::write(&path, export(md, &PdfOptions::default(), &HashMap::new()).unwrap()).unwrap();
+            let output = std::process::Command::new("pdftotext").arg("-bbox").arg(&path).arg("-").output();
+            let _ = std::fs::remove_file(&path);
+            let output = output.ok().filter(|out| out.status.success())?;
+            let xml = String::from_utf8_lossy(&output.stdout);
+            let prefix = format!("{attr}=\"");
+            xml.lines()
+                .find(|line| line.contains("<word ") && line.contains(needle))
+                .map(|line| line.split(&prefix).nth(1).unwrap().split('"').next().unwrap().parse::<f64>().unwrap())
+        };
+        let bbox_word_y = |md: &str, needle: &str| bbox_word_attr(md, needle, "yMin");
+        let row_pt = 1.2 * PdfOptions::default().font_size as f64;
+        if let (Some(empty_y), Some(blank_y)) = (
+            bbox_word_y("```python\n```\n\nMARKER", "MARKER"),
+            bbox_word_y("```python\n\n```\n\nMARKER", "MARKER"),
+        ) {
+            let delta = blank_y - empty_y;
+            assert!((delta - row_pt).abs() < 0.3, "Single blank line must add 1.2em ({row_pt}pt) over empty fence, got {delta}pt");
+        }
+        if let (Some(lf_y), Some(crlf_y), Some(trailing_y)) = (
+            bbox_word_y("```rust\nlet a = 1;\nlet b = 2;\n```\n\nMARKER", "MARKER"),
+            bbox_word_y("```rust\r\nlet a = 1;\r\nlet b = 2;\r\n```\r\n\r\nMARKER", "MARKER"),
+            bbox_word_y("```rust\nlet a = 1;\nlet b = 2;\n\n```\n\nMARKER", "MARKER"),
+        ) {
+            assert!((lf_y - crlf_y).abs() < 0.1, "LF and CRLF fences must produce identical height");
+            assert!(((trailing_y - lf_y) - row_pt).abs() < 0.3, "Intentional trailing blank line must keep 1.2em height");
+        }
+        let spaced_md = "```python\nALPHA = 1\n\nBETA = 2\n\n\nGAMMA = 3\n```\n";
+        if let (Some(alpha_y), Some(beta_y), Some(gamma_y)) = (
+            bbox_word_y(spaced_md, "ALPHA"),
+            bbox_word_y(spaced_md, "BETA"),
+            bbox_word_y(spaced_md, "GAMMA"),
+        ) {
+            assert!(((beta_y - alpha_y) - 2.0 * row_pt).abs() < 0.3, "One blank line must advance 2 * 1.2em");
+            assert!(((gamma_y - beta_y) - 3.0 * row_pt).abs() < 0.3, "Two blank lines must advance 3 * 1.2em");
+        }
+        let indent_md = "```python\nOUTER = 1\n    INNER = 2\n```\n";
+        if let (Some(outer_x), Some(inner_x)) = (
+            bbox_word_attr(indent_md, "OUTER", "xMin"),
+            bbox_word_attr(indent_md, "INNER", "xMin"),
+        ) {
+            assert!(inner_x > outer_x + 12.0, "Leading spaces on synthesized raw lines must be preserved (outer {outer_x}pt, inner {inner_x}pt)");
+        }
+    }
+    #[test]
+    fn untagged_and_wide_code_lines_fit_within_printable_width_without_scaling_normal_lines() {
+        let untagged_md = "```\nfenced untagged\n```\n\n    indented line one\n    indented line two\n";
+        let untagged_src = source(untagged_md, &PdfOptions::default(), &HashMap::new()).unwrap();
+        assert!(untagged_src.contains("#smd-code(\"fenced untagged\", lang: none)"), "{untagged_src}");
+        assert!(untagged_src.contains("#smd-code(\"indented line one\\nindented line two\", lang: none)"), "{untagged_src}");
+        assert_eq!(
+            untagged_src.lines().filter(|l| l.starts_with("#smd-code(") && l.ends_with(", lang: none)")).count(),
+            2,
+            "Untagged fenced and indented blocks must pass lang: none: {untagged_src}"
+        );
+        assert!(!untagged_src.contains("lang: \"\""));
+        assert!(export(untagged_md, &PdfOptions::default(), &HashMap::new()).unwrap().starts_with(b"%PDF-"));
+
+        // Normal-width code block must not emit non-identity horizontal/vertical scaling matrices in content stream,
+        // while an over-wide line scales down to fit the printable width.
+        let has_fractional_cm = |pdf: &[u8]| -> bool {
+            decompress_pdf_streams(pdf).lines().any(|line| {
+                let Some(before_cm) = line.split(" cm").next() else { return false };
+                let parts: Vec<&str> = before_cm.split_whitespace().collect();
+                if parts.len() < 6 { return false; }
+                let Some(sx) = parts[parts.len() - 6].parse::<f64>().ok() else { return false };
+                let Some(sy) = parts[parts.len() - 3].parse::<f64>().ok() else { return false };
+                sx > 0.0 && sx < 0.99 && (sx - sy.abs()).abs() < 0.01
+            })
+        };
+        let normal_pdf = export("```python\nnormal_value = 1\n```\n", &PdfOptions::default(), &HashMap::new()).unwrap();
+        assert!(!has_fractional_cm(&normal_pdf), "Normal-width code lines must skip scale() in #smd-fit");
+
+        let wide_line = format!("wide_value = '{}' # WIDE-TAIL", "W".repeat(160));
+        let wide_md = format!("```python\nnormal_value = 1\n{wide_line}\nafter_wide = 2\n```\n");
+        let wide_pdf = export(&wide_md, &PdfOptions::default(), &HashMap::new()).unwrap();
+        assert!(wide_pdf.starts_with(b"%PDF-"));
+        assert!(has_fractional_cm(&wide_pdf), "Over-wide code line must apply scale() in #smd-fit");
+
+        let path = std::env::temp_dir().join(format!("supermd-wide-code-{}.pdf", std::process::id()));
+        std::fs::write(&path, &wide_pdf).unwrap();
+        if let Ok(output) = std::process::Command::new("pdftotext").arg(&path).arg("-").output() {
+            if output.status.success() {
+                let text = String::from_utf8_lossy(&output.stdout);
+                assert!(text.contains("WIDE-TAIL"), "Wide line tail must remain present");
+            }
+        }
+        if let Ok(output) = std::process::Command::new("pdftotext").arg("-bbox").arg(&path).arg("-").output() {
+            if output.status.success() {
+                let xml = String::from_utf8_lossy(&output.stdout);
+                assert!(xml.contains("WIDE-TAIL"), "Wide line tail must remain present");
+                let word_height = |needle: &str| -> f64 {
+                    let line = xml.lines().find(|l| l.contains("<word ") && l.contains(needle)).unwrap();
+                    let y_min: f64 = line.split("yMin=\"").nth(1).unwrap().split('"').next().unwrap().parse().unwrap();
+                    let y_max: f64 = line.split("yMax=\"").nth(1).unwrap().split('"').next().unwrap().parse().unwrap();
+                    y_max - y_min
+                };
+                let normal_h = word_height("normal_value");
+                let after_h = word_height("after_wide");
+                let wide_h = word_height("WIDE-TAIL");
+                assert!((normal_h - after_h).abs() < 0.05, "Normal lines must share unscaled glyph height");
+                assert!(wide_h < normal_h * 0.8, "Over-wide line must scale down (normal {normal_h}pt, wide {wide_h}pt)");
+                let right_edge = (210. - PdfOptions::default().margin as f64) * 72. / 25.4;
+                for word in xml.lines().filter(|line| line.contains("<word ")) {
+                    let x = word.split("xMax=\"").nth(1).unwrap().split('"').next().unwrap().parse::<f64>().unwrap();
+                    assert!(x <= right_edge + 0.5, "Wide code line escaped printable width: {word}");
+                }
+            }
+        }
+        let _ = std::fs::remove_file(path);
     }
     #[test]
     fn table_column_alignments_are_preserved_in_typst_source_and_pdf() {

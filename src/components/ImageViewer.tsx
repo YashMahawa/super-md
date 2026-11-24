@@ -115,7 +115,7 @@ export default function ImageViewer() {
     const key = (event: KeyboardEvent) => {
       if (event.key === "Escape") { event.preventDefault(); event.stopImmediatePropagation(); setImage(null); }
       if ((event.ctrlKey || event.metaKey) && ["+", "=", "-", "0"].includes(event.key)) { event.preventDefault(); event.stopImmediatePropagation(); scale(event.key === "0" ? 100 : zoomRef.current + (event.key === "-" ? -10 : 10)); }
-      if (event.key === "Tab") { const controls = Array.from(document.querySelectorAll<HTMLElement>(".image-viewer button,.image-viewer smd-slider")); const active = document.activeElement; if (event.shiftKey && active === controls[0]) { event.preventDefault(); controls.at(-1)?.focus(); } else if (!event.shiftKey && active === controls.at(-1)) { event.preventDefault(); controls[0]?.focus(); } }
+      if (event.key === "Tab") { const controls = Array.from(document.querySelectorAll<HTMLElement>(".image-viewer button")); const active = document.activeElement; if (event.shiftKey && active === controls[0]) { event.preventDefault(); controls.at(-1)?.focus(); } else if (!event.shiftKey && active === controls.at(-1)) { event.preventDefault(); controls[0]?.focus(); } }
     };
     const native = (event: Event) => { const detail = (event as CustomEvent<number | {factor:number;point?:Point}>).detail; scale(zoomRef.current * (typeof detail === "number" ? detail : detail.factor), typeof detail === "number" ? undefined : detail.point); };
     const reset = fit;
