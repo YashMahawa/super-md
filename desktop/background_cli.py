@@ -68,10 +68,6 @@ def main(argv):
         socket.disconnectFromServer()
         if not raw:
             if peer_closed or startup_poll:return None
-            probe=QLocalSocket();probe.connectToServer(name)
-            still_listening=probe.waitForConnected(100)
-            if still_listening:probe.disconnectFromServer()
-            if not still_listening and not _instance_lock_held():return None
             raise ValueError('Existing Super MD instance did not respond to service request')
         line=raw.split(b'\n',1)[0].rstrip(b'\r')
         if line==b'ok':
@@ -92,7 +88,11 @@ def main(argv):
                 while still_listening and not _instance_lock_held() and time.monotonic()<vanish_deadline:
                     probe=QLocalSocket();probe.connectToServer(name)
                     still_listening=probe.waitForConnected(100)
-                    if still_listening:probe.disconnectFromServer()
+                    if still_listening:
+                        probe.write(b'{"service":"status"}\n');probe.flush();probe.waitForBytesWritten(100)
+                        ack=bytes(probe.readAll())
+                        while b'\n' not in ack and probe.waitForReadyRead(100):ack+=bytes(probe.readAll())
+                        probe.disconnectFromServer()
                     if still_listening:time.sleep(.05)
                 if still_listening and not _instance_lock_held():raise
                 reply=None
@@ -103,11 +103,7 @@ def main(argv):
                     if reply is not None or not _instance_lock_held():break
                     time.sleep(.1)
                 if reply is None and _instance_lock_held():
-                    probe=QLocalSocket();probe.connectToServer(name)
-                    still_listening=probe.waitForConnected(100)
-                    if still_listening:
-                        probe.disconnectFromServer()
-                        reply=request('start')
+                    reply=request('start')
     else:
         reply=request(args.action)
         if reply is None and _instance_lock_held():

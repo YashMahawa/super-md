@@ -558,7 +558,6 @@ def main():
 
 
 _TEARDOWN_COMPLETED = False
-_DARWIN_EXIT_ANCHOR = []
 
 
 def _exit_process(status: int) -> None:
@@ -582,24 +581,6 @@ def _run_teardown(app, session, studios, engines, asset_handler, broker, *, read
         session.background.open_window = None
         if session.background.tray is not None:
             session.background.tray.hide()
-    if broker:
-        broker.close()
-        broker.set_service_handler(None)
-    global _TEARDOWN_COMPLETED
-    if sys.platform == "darwin":
-        if reader_profile_initialized:
-            try:
-                QWebEngineProfile.defaultProfile().removeUrlSchemeHandler(asset_handler)
-            except RuntimeError:
-                pass
-        # Anchor Qt/QML/WebEngine objects until _exit_process calls os._exit so
-        # post-CFRunLoop C++ ~QQmlApplicationEngine / ~StudioApplication destructors
-        # cannot stall on macOS Mach/GCD queues after disk writes and locks are closed.
-        _DARWIN_EXIT_ANCHOR.extend((app, session, list(studios), list(engines), asset_handler, broker))
-        studios.clear()
-        engines.clear()
-        _TEARDOWN_COMPLETED = True
-        return
     for engine in list(engines):
         for root_obj in engine.rootObjects():
             try:
@@ -624,6 +605,8 @@ def _run_teardown(app, session, studios, engines, asset_handler, broker, *, read
         session.background.deleteLater()
         session.background = None
     if broker:
+        broker.close()
+        broker.set_service_handler(None)
         broker.deleteLater()
     for sig_name in ("aboutToQuit", "openRequested", "reopenRequested"):
         sig = getattr(app, sig_name, None)
@@ -633,6 +616,7 @@ def _run_teardown(app, session, studios, engines, asset_handler, broker, *, read
             except (RuntimeError, TypeError):
                 pass
     app.sendPostedEvents(None, QEvent.Type.DeferredDelete)
+    global _TEARDOWN_COMPLETED
     _TEARDOWN_COMPLETED = True
 
 

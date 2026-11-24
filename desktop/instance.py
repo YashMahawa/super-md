@@ -146,7 +146,7 @@ class InstanceBroker(QObject):
         while time.monotonic() < deadline:
             candidate = QLocalSocket()
             candidate.connectToServer(self.name)
-            if candidate.waitForConnected(200):
+            if candidate.waitForConnected(400):
                 socket = candidate
                 break
             if candidate.state() != QLocalSocket.LocalSocketState.UnconnectedState:
