@@ -10,9 +10,11 @@ from pathlib import Path
 try:
     from . import documents
     from .agent_documents import AgentDocumentError, _symlink_component
+    from .frontmatter import mask_frontmatter
 except ImportError:
     import documents
     from agent_documents import AgentDocumentError, _symlink_component
+    from frontmatter import mask_frontmatter
 
 _GENERATED = re.compile(r"^assets/(?:import|image)-[a-z0-9-]+\.(?:png|jpe?g|svg|gif|webp|avif)$", re.I)
 _MIME_EXT = {value: key for key, value in documents.MIMES.items()}
@@ -36,6 +38,7 @@ class _Ref:
 
 
 def _mask_code(markdown: str) -> str:
+    markdown = mask_frontmatter(markdown)
     chars = list(markdown)
     offset = 0
     fence_char = ""

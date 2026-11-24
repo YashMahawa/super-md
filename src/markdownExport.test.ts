@@ -354,4 +354,20 @@ it('extracts clean alt text when renaming app-generated Obsidian image embeds',a
  expect(result.content).toBe('![Custom Diagram](<image1.png>)\n\n![image-def456.png](<image2.png>)\n');
  expect(Object.keys(result.assets)).toEqual(['image1.png','image2.png']);
 });
+it('preserves all recognized YAML frontmatter variations intact in compatible Markdown exports and ignores YAML image literals',async()=>{
+ native.mockReset();
+ const variations=[
+  '\uFEFF---\ntitle: "![Not an image](missing.png)"\nbanner: "![[unbundled-bom-banner.png]]"\ntags: [a, b]\n---\n\n:::callout tip\nBody\n:::',
+  '---   \ntitle: Dot Closer\nbanner: "![[unbundled-dot-banner.png]]"\n...  \n\n:::callout note\nBody\n:::',
+  '---\n---\n\n# After empty block',
+  '---\ntitle: EOF Only\n---',
+ ];
+ for(const source of variations){
+  const front=source.includes('Body')?source.split('\n\n:::callout')[0]:source.split('\n\n#')[0];
+  const result=await prepareMarkdownExport(source,'/notes/test.md',{compatible:true});
+  expect(result.content.startsWith(front)).toBe(true);
+  expect(result.assets).toEqual({});
+ }
+ expect(native).not.toHaveBeenCalled();
+});
 
