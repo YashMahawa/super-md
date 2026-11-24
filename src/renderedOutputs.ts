@@ -37,10 +37,33 @@ function unpackPython(value:unknown,context?:PythonContext):PythonResult|undefin
   const provenance=context?verifiedProvenance(envelope.provenance??bodyProvenance,context):undefined;
   return {...body,provenance:provenance??{verified:false,reason:'Legacy saved output; document and runtime were not recorded'}};
 }
+export const safePythonFigure = (image: unknown): image is string =>
+  typeof image === "string" && image.length <= 12_000_000 && /^data:image\/(?:svg\+xml|png|jpeg);base64,[A-Za-z0-9+/]+=*$/.test(image.slice(0, 64) + (image.length > 64 ? image.slice(-8) : ""));
 export function cachedPythonOutput(source:string,context?:PythonContext):PythonResult|undefined {
   if(context)return scopedPythonResults.get(storageKey(source,context));
   const result=pythonResults.get(source);
   return result&&!result.provenance?{...result,provenance:{verified:false,reason:'Unscoped legacy output'}}:result;
+}
+export function inspectCachedPythonOutput(source:string,options?:{document?:string|null;cell?:string;interpreter?:string}):PythonResult|undefined {
+  if(options?.document){
+    const context:PythonContext={document:options.document,cell:options.cell||'0',interpreter:options.interpreter||'embedded'};
+    const key=storageKey(source,context);
+    for(const entry of visiblePython)if(entry.source===source&&storageKey(entry.source,entry.context)===key)return entry.result;
+    return scopedPythonResults.get(key);
+  }
+  for(const entry of visiblePython){
+    if(entry.source!==source)continue;
+    if(!entry.context)return entry.result;
+    if(options?.document===undefined&&(!options?.cell||entry.context.cell===options.cell)&&(!options?.interpreter||entry.context.interpreter===options.interpreter))return entry.result;
+  }
+  const unscoped=cachedPythonOutput(source);
+  if(unscoped||options?.document!==undefined)return unscoped;
+  for(const [key,value] of scopedPythonResults){
+    if(scopedPythonSources.get(key)!==source)continue;
+    const context=scopedPythonContexts.get(key);
+    if(context&&(!options?.cell||context.cell===options.cell)&&(!options?.interpreter||context.interpreter===options.interpreter))return value;
+  }
+  return undefined;
 }
 export function rememberPythonOutput(source:string,result:PythonResult,context?:PythonContext):void {
   if(context){const key=storageKey(source,context);scopedPythonContexts.set(key,context);scopedPythonSources.set(key,source);remember(scopedPythonResults,key,result);if(!scopedPythonResults.has(key)){scopedPythonContexts.delete(key);scopedPythonSources.delete(key);forgetPythonStored(key);}}
