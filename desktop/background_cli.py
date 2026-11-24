@@ -10,7 +10,7 @@ def main(argv):
     from PySide6.QtNetwork import QLocalSocket
     app=QCoreApplication.instance() or QCoreApplication(['super-md'])
     app.setApplicationName('super-md');app.setOrganizationName('SuperMD')
-    root=Path(QStandardPaths.writableLocation(QStandardPaths.AppDataLocation))
+    root=Path(QStandardPaths.writableLocation(QStandardPaths.StandardLocation.AppDataLocation))
     name='supermd-qt-'+hashlib.sha256(str(root).encode()).hexdigest()[:20]
     def request(action):
         socket=QLocalSocket();socket.connectToServer(name)
