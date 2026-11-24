@@ -230,4 +230,114 @@ class DocumentsTest(unittest.TestCase):
             with self.assertRaises(ValueError):
                 open_note(bad_smd, decode_assets=True)
 
+    def test_repeat_portable_saves_skip_repeat_base64_decoding_and_preserve_caps(self):
+        import documents
+        from unittest.mock import patch
+
+        png = (
+            b"\x89PNG\r\n\x1a\n"
+            + b"\x00\x00\x00\rIHDR\x00\x00\x00\x01\x00\x00\x00\x01\x08\x02\x00\x00\x00\x90wS\xde"
+            + b"\x00\x00\x00\x0cIDATx\x9cc\xf8\xcf\xc0\x00\x00\x03\x01\x01\x00\xc9\xfe\x92\xef"
+            + b"\x00\x00\x00\x00IEND\xaeB`\x82"
+        )
+        svg = b"<svg xmlns='http://www.w3.org/2000/svg'><rect width='10' height='10'/></svg>"
+        # Construct fresh string instances not yet in _VALIDATED_ASSETS.
+        png_url = "".join(["data:image/png;base64,", base64.b64encode(png).decode("ascii")])
+        svg_url = "".join(["data:image/svg+xml;base64,", base64.b64encode(svg).decode("ascii")])
+        assets = {"assets/one.png": png_url, "assets/two.svg": svg_url}
+
+        real_b64decode = base64.b64decode
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "repeat.smd"
+            with patch("documents.base64.b64decode", wraps=real_b64decode) as spy:
+                write_portable(path, "# First save\n", assets)
+                self.assertEqual(spy.call_count, 2)
+
+                spy.reset_mock()
+                write_portable(path, "# Second save with unchanged images\n", assets)
+                compressed_bundle("# Third save in memory\n", assets)
+                self.assertEqual(spy.call_count, 0)
+
+                extra_svg = "".join(["data:image/svg+xml;base64,", base64.b64encode(b"<svg><circle r='4'/></svg>").decode("ascii")])
+                updated = {**assets, "assets/three.svg": extra_svg}
+                spy.reset_mock()
+                write_portable(path, "# Fourth save adding one image\n", updated)
+                self.assertEqual(spy.call_count, 1)
+
+            # Extension mismatch and 75 MB aggregate limit must still fail on cached payloads.
+            with self.assertRaisesRegex(ValueError, "MIME does not match"):
+                bundle("# Bad ext", {"assets/wrong.jpg": png_url})
+
+            chunk_20mb = b"\x89PNG\r\n\x1a\n" + (b"\xab\xcd\xef\x01" * 5_000_000)
+            cached_20mb = "data:image/png;base64," + base64.b64encode(chunk_20mb).decode("ascii")
+            bundle("# Single 20 MB ok", {"assets/a.png": cached_20mb})
+            with self.assertRaisesRegex(ValueError, "Assets exceed 75 MB"):
+                bundle("# Four 20 MB copies exceed 75 MB", {f"assets/{i}.png": cached_20mb for i in range(4)})
+
+    def test_balanced_gzip_opens_across_desktop_and_cli_readers_and_speeds_up_repeat_saves(self):
+        import gzip
+        import time
+        import agent_documents
+        from documents import decode_note_bytes
+
+        # Structured diagram payload representative of embedded SVG/PNG figures (~6 MB).
+        pattern = (b"<svg xmlns='http://www.w3.org/2000/svg'>" + b"<rect x='1' y='2' width='30' height='40'/>" * 12_000 + b"</svg>")
+        assets = {
+            f"assets/diagram-{idx}.svg": "data:image/svg+xml;base64," + base64.b64encode(pattern + f"<!--{idx}-->".encode()).decode("ascii")
+            for idx in range(10)
+        }
+        markdown = "# Portable Archive Compatibility\n\n" + "\n".join(f"![Diagram {i}](assets/diagram-{i}.svg)" for i in range(10)) + "\n"
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            legacy_path = root / "legacy-lvl9.smd"
+            fast_path = root / "balanced.smd"
+
+            # Warm OS directory page cache, then time legacy level-9 + uncached decode save.
+            envelope = {"format": "supermd-smd", "version": 1, "markdown": markdown, "assets": assets}
+            t0 = time.perf_counter()
+            for raw_url in assets.values():
+                base64.b64decode(raw_url.split(",", 1)[1], validate=True)
+            class _LegacyWriter:
+                def write(self, text):
+                    stream.write(text.encode("utf-8"))
+                    return len(text)
+
+            with legacy_path.open("wb") as handle:
+                with gzip.GzipFile(fileobj=handle, mode="wb", filename="", mtime=0, compresslevel=9) as stream:
+                    json.dump(envelope, _LegacyWriter(), ensure_ascii=False, separators=(",", ":"))
+                handle.flush()
+                os.fsync(handle.fileno())
+            legacy_ms = (time.perf_counter() - t0) * 1000
+
+            # Prime validation once (as happens when opening or first saving the note), then time repeat save.
+            write_portable(fast_path, markdown, assets)
+            t1 = time.perf_counter()
+            write_portable(fast_path, markdown + "\nUpdated paragraph.\n", assets)
+            fast_ms = (time.perf_counter() - t1) * 1000
+
+            self.assertLess(fast_ms, legacy_ms * 0.60,
+                            f"Expected >=40% save-time reduction vs compresslevel=9 (got {fast_ms:.1f} ms vs {legacy_ms:.1f} ms)")
+
+            raw_bytes = fast_path.read_bytes()
+            self.assertEqual(raw_bytes[:2], b"\x1f\x8b")
+            # mtime bytes [4:8] in RFC 1952 header must be 0 for deterministic output.
+            self.assertEqual(raw_bytes[4:8], b"\x00\x00\x00\x00")
+
+            expected_md = markdown + "\nUpdated paragraph.\n"
+            self.assertEqual(open_note(fast_path), (expected_md, assets, True))
+            self.assertEqual(decode_note_bytes(raw_bytes, fast_path), (expected_md, assets, True))
+
+            # Verify CLI / offline DocumentStore readers read identical Markdown and image bytes.
+            workspace = agent_documents.DocumentStore([root])
+            inspected = workspace.inspect(str(fast_path))
+            self.assertEqual(inspected["format"], "smd")
+            self.assertEqual(inspected["asset_count"], 10)
+            read_back = workspace.read(str(fast_path), view="source", limit=12_000)
+            self.assertEqual(read_back["text"], expected_md)
+            listed = workspace.assets(str(fast_path))
+            self.assertEqual(listed["total"], 10)
+            extracted = workspace.read_asset(str(fast_path), "assets/diagram-0.svg", expected_revision=inspected["revision"])
+            self.assertEqual(extracted["data"], pattern + b"<!--0-->")
+
 if __name__ == "__main__": unittest.main()
