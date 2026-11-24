@@ -116,6 +116,7 @@ internal class ReaderBridge(
                         web.context.getSystemService(android.content.ClipboardManager::class.java).setPrimaryClip(android.content.ClipData.newPlainText("Super MD",text))
                         true
                     }
+                    "apply_bundled_theme" -> model.applyBundledTheme(args.getString("id"))
                     "document_outline" -> { model.outline(args.getString("id"), args.getJSONArray("headings")); true }
                     "load_font" -> withContext(Dispatchers.IO) {model.fonts.reader(args.getString("family"))}
                     "cache_python_output" -> cachePythonOutput(args)
@@ -489,9 +490,6 @@ fun configureReader(web: WebView, model: StudioViewModel, scope: CoroutineScope,
         }
         override fun shouldOverrideUrlLoading(view: WebView, request: WebResourceRequest): Boolean =
             handleReaderUrlOverride(view, request.url, request.isForMainFrame)
-        @Deprecated("Deprecated in Java")
-        override fun shouldOverrideUrlLoading(view: WebView, url: String): Boolean =
-            handleReaderUrlOverride(view, runCatching { android.net.Uri.parse(url) }.getOrNull(), isForMainFrame = true)
     }
     web.setTag(R.id.reader_bridge_tag, bridge)
     web.addJavascriptInterface(bridge, "SuperMD")

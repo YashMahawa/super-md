@@ -1225,6 +1225,100 @@ class StudioTest(unittest.TestCase):
         self.assertEqual(studio.note_watcher.files(), [])
         self.assertEqual(studio.note_watcher.directories(), [])
 
+    def test_bundled_presets_saved_themes_override_resets_and_clean_exports(self):
+        import custom_theme
+        studio=self.studio;second=self.window()
+        self.assertEqual(len(studio.bundledThemes),16)
+        alpha={**custom_theme.TEMPLATE,"name":"Theme Alpha","variants":{"dark":{"colors":{"surface":"#191524"},"artwork":{"reader":{"image":"data:image/svg+xml;base64,PHN2Zy8+","opacity":.14,"fit":"cover"}}}}}
+        beta={**custom_theme.TEMPLATE,"name":"Theme Beta","variants":{"dark":{"colors":{"surface":"#14211d"},"background":{"pattern":"grid","color":"#78b09c","opacity":.07,"size":24,"spacing":32}}}}
+        source_a=studio.data/"alpha.supermd-theme.json";source_a.write_text(json.dumps(alpha))
+        source_b=studio.data/"beta.supermd-theme.json";source_b.write_text(json.dumps(beta))
+
+        def run_sync(call):
+            pending=[]
+            with patch.object(studio,"_engine",return_value=Path("unused-theme-engine")),patch.object(studio,"_submit",side_effect=lambda action,done,*_:pending.append((action,done))),patch("custom_theme.read",side_effect=lambda _,p:json.loads(Path(p).read_text())):
+                call()
+                while pending:
+                    action,done=pending.pop(0);done(action(),None)
+
+        studio.setting("patternKind",'"paws"');studio.setting("patternOpacity","0.12")
+        run_sync(lambda:studio.importCustomTheme(str(source_a)))
+        self.assertEqual(studio.customThemeName,"Theme Alpha");self.assertEqual(second.customThemeName,"Theme Alpha")
+        self.assertEqual(studio.activeThemeKind,"saved");self.assertTrue(studio.customThemeHasSource)
+        self.assertIn(str(source_a),studio.custom_theme_watcher.files())
+        self.assertEqual(studio.settings["patternKind"],"");self.assertEqual(studio.settings["patternOpacity"],-1)
+        # Omitted background stays None in reader style when no override is set; reader artwork opacity is never exposed as pattern opacity
+        self.assertIsNone(custom_theme.reader(studio.session.custom_theme,"dark",True,studio.settings)["background"])
+        self.assertEqual(studio.themeBackground,{"pattern":"none","opacity":.06,"size":24,"spacing":24})
+        studio.setting("patternOpacity","0.02")
+        self.assertEqual(custom_theme.reader(studio.session.custom_theme,"dark",True,studio.settings)["artwork"]["reader"]["opacity"],.14)
+
+        # Importing a second theme retains the first across restarts and clears overrides
+        run_sync(lambda:studio.importCustomTheme(str(source_b)))
+        self.assertEqual(studio.customThemeName,"Theme Beta")
+        self.assertEqual([item["name"] for item in studio.savedThemes],["Theme Alpha","Theme Beta"])
+        self.assertEqual(studio.settings["patternOpacity"],-1)
+        self.assertIn(str(source_b),studio.custom_theme_watcher.files())
+        self.assertNotIn(str(source_a),studio.custom_theme_watcher.files())
+
+        # Selecting a bundled preset or applying via reader guide clears overrides and pauses external file watching
+        studio.setting("patternKind",'"dots"');studio.setting("patternSize","36")
+        replies=[];studio.replied.connect(lambda identifier,value,error:replies.append((identifier,value,error)))
+        run_sync(lambda:studio.post("guide-preset","apply_bundled_theme",json.dumps({"id":"study-desk"})))
+        self.assertEqual((replies[-1][0],json.loads(replies[-1][1]),replies[-1][2]),("guide-preset",{"id":"study-desk","name":"Study desk"},""))
+        self.assertEqual(studio.activeThemeKind,"preset");self.assertEqual(studio.activeThemeId,"study-desk")
+        self.assertEqual(studio.customThemeName,"Study desk");self.assertEqual(second.customThemeName,"Study desk")
+        self.assertFalse(studio.customThemeHasSource);self.assertEqual(studio.custom_theme_watcher.files(),[])
+        self.assertEqual((studio.settings["patternKind"],studio.settings["patternSize"]),("",0))
+
+        # Clean export never bakes viewing-only overrides into active themes or starter templates
+        studio.setting("patternKind",'"paws"');studio.setting("patternOpacity","0.15")
+        exported_preset=studio.data/"exported-preset.json"
+        studio.exportCustomTheme(str(exported_preset))
+        self.assertNotEqual(json.loads(exported_preset.read_text())["variants"]["dark"].get("background",{}).get("pattern"),"paws")
+
+        # Switching back to Theme Alpha across a restarted Session restores saved library & persisted overrides on startup
+        self.flush()
+        alpha_id=next(item["id"] for item in studio.savedThemes if item["name"]=="Theme Alpha")
+        run_sync(lambda:studio.selectSavedTheme(alpha_id))
+        self.assertEqual(studio.customThemeName,"Theme Alpha")
+        self.assertTrue(studio.customThemeHasSource);self.assertIn(str(source_a),studio.custom_theme_watcher.files())
+        self.assertEqual(studio.settings["patternKind"],"")
+        studio.setting("patternKind",'"grid"')
+        self.flush()
+
+        restarted_session=Session(True,data=studio.data)
+        self.assertEqual([item["name"] for item in restarted_session.saved_themes],["Theme Alpha","Theme Beta"])
+        self.assertEqual(restarted_session.active_theme_kind,"saved")
+        self.assertEqual(restarted_session.settings["patternKind"],"grid")
+        restarted_session.writes.shutdown(wait=True)
+
+        # Deleting active saved theme keeps user's source file on disk and resets to Built-in while retaining Theme Beta
+        studio.deleteSavedTheme(alpha_id)
+        self.assertTrue(source_a.is_file())
+        self.assertEqual(studio.activeThemeKind,"builtin");self.assertEqual(studio.customThemeName,"Built-in appearance")
+        self.assertEqual([item["name"] for item in studio.savedThemes],["Theme Beta"])
+        self.assertEqual(studio.settings["patternKind"],"")
+        exported_template=studio.data/"starter-template.json"
+        studio.setting("patternKind",'"paws"')
+        studio.exportCustomTheme(str(exported_template))
+        self.assertEqual(json.loads(exported_template.read_text()),custom_theme.TEMPLATE)
+
+    def test_legacy_single_theme_migrates_into_saved_theme_library(self):
+        import custom_theme
+        legacy_dir=self.studio.data/"legacy-workspace";legacy_dir.mkdir(parents=True)
+        source=legacy_dir/"external.supermd-theme.json";source.write_text("{}")
+        atomic_json(legacy_dir/"theme.json",{**custom_theme.TEMPLATE,"name":"Legacy Imported"})
+        atomic_json(legacy_dir/"theme-source.json",{"path":str(source)})
+        migrated=Session(True,data=legacy_dir)
+        try:
+            self.assertEqual(migrated.active_theme_kind,"saved")
+            self.assertEqual(len(migrated.saved_themes),1)
+            self.assertEqual(migrated.saved_themes[0]["name"],"Legacy Imported")
+            self.assertEqual(migrated.saved_themes[0]["source"],str(source))
+        finally:
+            migrated.writes.shutdown(wait=True)
+
     def test_reopen_closed_tab_restores_most_recent_first_and_persists_across_restart(self):
         studio = self.studio
         first = studio._current()

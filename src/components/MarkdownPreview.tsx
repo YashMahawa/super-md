@@ -251,19 +251,22 @@ function MarkdownPreview({ markdown, documentPath, savedDocumentPath, python, da
             const child = Children.only(children) as React.ReactElement<{ className?: string; children?: ReactNode }>;
             const language = child.props.className?.match(/language-([\w-]+)/)?.[1];
             const source = textOf(child.props.children).replace(/\n$/, "");
-            const nodeData=node as {position?:{start?:{offset?:number}};properties?:Record<string,unknown>}|undefined;
+            const nodeData=node as {position?:{start?:{offset?:number};end?:{offset?:number}};properties?:Record<string,unknown>}|undefined;
             const offset=Number(nodeData?.properties?.['data-source-start']??nodeData?.position?.start?.offset);
+            const endOffset=Number(nodeData?.properties?.['data-source-end']??nodeData?.position?.end?.offset);
+            const hasRange=Number.isInteger(offset)&&Number.isInteger(endOffset)&&offset>=0&&endOffset>offset;
+            const srcStart=hasRange?offset:undefined,srcEnd=hasRange?endOffset:undefined;
             const pythonCell=['python','py'].includes(language||'')?analysis.pythonCells.find(cell=>cell.source===source&&cell.offset===offset):undefined;
             const context=documentPath&&pythonCell?{document:documentPath,cell:String(pythonCell.ordinal),interpreter:python||'embedded'}:undefined;
             const protectedBlock = (block: ReactNode) => <CodeBlockBoundary key={`${language}:${source}`} source={source}>{block}</CodeBlockBoundary>;
             if (language === "smd-tree") return protectedBlock(<InlineDiagram diagram={parseBinaryTreeSource(source)}/>);
             if (language === "smd-diagram") return protectedBlock(<InlineDiagram diagram={parseDiagramSource(source)}/>);
-            if (language === "smd-steps") return protectedBlock(<StepCards source={source} renderImage={(src,alt)=><AssetImage src={src} alt={alt} documentPath={documentPath} trustedImageHosts={trustedImageHosts} onTrustImageHost={onTrustImageHost}/>} renderChart={chartSource=><ThemedChart source={chartSource} dark={dark}/>} renderMarkdown={text=><MarkdownPreview markdown={text} documentPath={documentPath} savedDocumentPath={savedDocumentPath} python={python} dark={dark} trustedImageHosts={trustedImageHosts} onTrustImageHost={onTrustImageHost} onNotice={onNotice}/>} />);
+            if (language === "smd-steps") return protectedBlock(<StepCards source={source} sourceStart={srcStart} sourceEnd={srcEnd} renderImage={(src,alt)=><AssetImage src={src} alt={alt} documentPath={documentPath} trustedImageHosts={trustedImageHosts} onTrustImageHost={onTrustImageHost}/>} renderChart={chartSource=><ThemedChart source={chartSource} dark={dark}/>} renderMarkdown={text=><MarkdownPreview markdown={text} documentPath={documentPath} savedDocumentPath={savedDocumentPath} python={python} dark={dark} trustedImageHosts={trustedImageHosts} onTrustImageHost={onTrustImageHost} onNotice={onNotice}/>} />);
             if (language === "smd-chart") return protectedBlock(<ThemedChart source={source} dark={dark} />);
             if (language === "svg") return protectedBlock(<ThemedSvg source={source} dark={dark} />);
             if (language === "mermaid") return protectedBlock(<Suspense fallback={<span className="image-loading" role="status">Loading diagram…</span>}><ThemedMermaid source={source} dark={dark} /></Suspense>);
-            if (language === "python" || language === "py") return protectedBlock(<PythonCell source={source} python={python} context={context} highlighted={child.props.children} />);
-            return <div className="code-container"><CopyCode source={source}/><details className="code-disclosure" open={source.split("\n").length <= 12}><summary>{language || "Code"} <span>{source.split("\n").length} lines</span></summary><pre>{children}</pre></details></div>;
+            if (language === "python" || language === "py") return protectedBlock(<PythonCell source={source} python={python} context={context} sourceStart={srcStart} sourceEnd={srcEnd} highlighted={child.props.children} />);
+            return <div className="code-container" data-source-start={srcStart} data-source-end={srcEnd}><CopyCode source={source}/><details className="code-disclosure" open={source.split("\n").length <= 12}><summary>{language || "Code"} <span>{source.split("\n").length} lines</span></summary><pre>{children}</pre></details></div>;
           }
         }}
       >{markdown}</CachedMarkdown>

@@ -337,9 +337,9 @@ class Session(QObject):
     """One ordered persistence stream for every native window in the application."""
     changed = Signal()
     locationChanged = Signal(str,str)
-    def __init__(self,isolated=False):
+    def __init__(self,isolated=False,data=None):
         super().__init__()
-        self.data = Path(tempfile.mkdtemp(prefix="supermd-test-")) if isolated else Path(QStandardPaths.writableLocation(QStandardPaths.StandardLocation.AppDataLocation))/"qt-studio"
+        self.data = Path(data) if data is not None else (Path(tempfile.mkdtemp(prefix="supermd-test-")) if isolated else Path(QStandardPaths.writableLocation(QStandardPaths.StandardLocation.AppDataLocation))/"qt-studio")
         self.data=self.data.resolve()
         self.data.mkdir(parents=True,exist_ok=True)
         self.font_store = FontStore(self.data)
@@ -365,8 +365,11 @@ class Session(QObject):
         self.theme_epoch = 0
         self.theme_revision = 0
         self.theme_source = ""
-        try:self.theme_source=json.loads((self.data/"theme-source.json").read_text(encoding="utf-8")).get("path","")
-        except (OSError,ValueError,AttributeError):pass
+        self.active_theme_kind = "builtin"
+        self.active_theme_id = ""
+        self.saved_themes = []
+        self.theme_restored = False
+        self._load_theme_library()
         self.initial_recovery = []
         try:
             stored = json.loads((self.data/"settings.json").read_text(encoding="utf-8"))
@@ -411,6 +414,70 @@ class Session(QObject):
             self.closed_tabs=kept
             try:self.closed_note_store.save_index(kept)
             except OSError:pass
+
+    def _load_theme_library(self):
+        library_path = self.data / "theme-library.json"
+        themes_dir = self.data / "themes"
+        if library_path.is_file():
+            try:
+                raw = json.loads(library_path.read_text(encoding="utf-8"))
+                saved = []
+                for item in raw.get("saved", []):
+                    if not isinstance(item, dict):
+                        continue
+                    entry_id = item.get("id", "")
+                    name = item.get("name", "")
+                    source = item.get("source", "")
+                    if (
+                        isinstance(entry_id, str)
+                        and re.fullmatch(r"[0-9a-f]{8,64}", entry_id)
+                        and isinstance(name, str)
+                        and name.strip()
+                        and isinstance(source, str)
+                        and (themes_dir / f"{entry_id}.json").is_file()
+                    ):
+                        saved.append({"id": entry_id, "name": name, "source": source})
+                self.saved_themes = saved
+                active = raw.get("active", {}) if isinstance(raw.get("active"), dict) else {}
+                kind = active.get("kind", "builtin")
+                active_id = active.get("id", "") if isinstance(active.get("id"), str) else ""
+                if kind == "saved":
+                    matched = next((item for item in saved if item["id"] == active_id), None)
+                    if matched is not None:
+                        self.active_theme_kind = "saved"
+                        self.active_theme_id = matched["id"]
+                        self.theme_source = matched["source"]
+                elif kind == "preset" and active_id:
+                    self.active_theme_kind = "preset"
+                    self.active_theme_id = active_id
+                    self.theme_source = ""
+            except (OSError, ValueError, TypeError, AttributeError):
+                pass
+            return
+        legacy_source = ""
+        try:
+            legacy_source = json.loads((self.data / "theme-source.json").read_text(encoding="utf-8")).get("path", "")
+            if not isinstance(legacy_source, str):
+                legacy_source = ""
+        except (OSError, ValueError, AttributeError):
+            legacy_source = ""
+        legacy_theme = self.data / "theme.json"
+        if legacy_theme.is_file():
+            try:
+                parsed = json.loads(legacy_theme.read_text(encoding="utf-8"))
+                name = parsed.get("name") if isinstance(parsed, dict) and isinstance(parsed.get("name"), str) and parsed.get("name").strip() else "Imported theme"
+                entry_id = uuid.uuid4().hex
+                themes_dir.mkdir(parents=True, exist_ok=True)
+                atomic_json(themes_dir / f"{entry_id}.json", parsed)
+                self.saved_themes = [{"id": entry_id, "name": name, "source": legacy_source}]
+                self.active_theme_kind = "saved"
+                self.active_theme_id = entry_id
+                self.theme_source = legacy_source
+                atomic_json(library_path, {"active": {"kind": "saved", "id": entry_id}, "saved": self.saved_themes})
+            except (OSError, ValueError, TypeError):
+                self.theme_source = legacy_source
+        else:
+            self.theme_source = legacy_source
 
     def reader_asset_is_current(self, grant):
         return self.reader_asset_source_is_current(grant.owner_id, grant.tab_id, grant.source,
@@ -533,6 +600,8 @@ class Studio(QObject):
         self.reader_overlay = False
         self.image_overlay = False
         self.busy = 0
+        self._message = ""
+        self._message_revision = 0
         self.message = ("Closed-note recovery index could not be read; historical snapshots were left untouched. "+self.session.closed_note_error) if self.session.closed_note_error else ""
         self.ready = False
         self._last_reader_text = None
@@ -565,7 +634,7 @@ class Studio(QObject):
         self.custom_theme_stamp=None
         self.custom_theme_watcher.fileChanged.connect(lambda *_:self.custom_theme_timer.start())
         self.custom_theme_watcher.directoryChanged.connect(lambda *_:self.custom_theme_timer.start())
-        QTimer.singleShot(0,self.reloadCustomTheme)
+        QTimer.singleShot(0,self._restore_custom_theme)
         self.system_preferences = QProcess(self)
         if sys.platform.startswith("linux") and shutil.which("gsettings"):
             self.system_preferences.readyReadStandardOutput.connect(self._system_setting_changed)
@@ -659,6 +728,14 @@ class Studio(QObject):
     @recent.setter
     def recent(self,value): self.session.recent = list(dict.fromkeys(self.session.pinned + value))[:10]
 
+    @property
+    def message(self): return getattr(self, "_message", "")
+
+    @message.setter
+    def message(self, value):
+        self._message = value
+        if value: self._message_revision = getattr(self, "_message_revision", 0) + 1
+
     @Slot(str)
     def pinRecent(self,path):
         if path not in self.recent:return
@@ -737,6 +814,22 @@ class Studio(QObject):
     @Property(bool,notify=changed)
     def customThemeActive(self):return self.session.custom_theme is not None
 
+    @Property("QVariantList",constant=True)
+    def bundledThemes(self):return custom_theme.bundled_themes(ROOT)
+
+    @Property("QVariantList",notify=changed)
+    def savedThemes(self):return copy.deepcopy(self.session.saved_themes)
+
+    @Property(str,notify=changed)
+    def activeThemeKind(self):return self.session.active_theme_kind
+
+    @Property(str,notify=changed)
+    def activeThemeId(self):return self.session.active_theme_id
+
+    @Property(bool,notify=changed)
+    def customThemeHasSource(self):
+        return self.session.custom_theme is not None and self.session.active_theme_kind != "preset" and bool(self.session.theme_source)
+
     @Property("QVariantMap",notify=changed)
     def themeArtwork(self):
         selected=custom_theme.variant(self.session.custom_theme,self.settings["fullTheme" if self.fullscreen else "theme"],self._dark())
@@ -745,7 +838,7 @@ class Studio(QObject):
     @Property("QVariantMap",notify=changed)
     def themeBackground(self):
         style=custom_theme.reader(self.session.custom_theme,self.settings["theme"],self._dark(),self.settings)
-        return {"pattern":"none","size":24,"spacing":24,**(style["background"] or {}),"opacity":style["artwork"].get("reader",{}).get("opacity",(style["background"] or {}).get("opacity",.06))}
+        return {"pattern":"none","opacity":.06,"size":24,"spacing":24,**(style["background"] or {})}
 
     @Slot()
     def resetThemeBackground(self):
@@ -976,7 +1069,7 @@ class Studio(QObject):
     @Property(str, notify=changed)
     def snapshot(self):
         tab = self._current()
-        return json.dumps({"tabs": [{"id": t["id"], "name": t["name"], "path": t["path"], "dirty": self._is_dirty(t), "conflict": bool(t.get("conflict"))} for t in self.tabs], "active": self.active, "name": tab["name"], "outline": tab.get("outline", []), "portable": tab["portable"], "conflict": bool(tab.get("conflict")), "closedCount": len(self.closed_tabs), "folder": self.folder, "files": self.files, "recent": self.recent, "settings": self.settings, "mode": self.mode, "fullscreen": self.fullscreen, "readerOverlay": self.reader_overlay, "imageOverlay": self.image_overlay, "readerReady": self.ready, "dark": self._dark(), "zoom": self.settings["fullZoom" if self.fullscreen else "normalZoom"], "busy": self.busy > 0, "message": self.message, "colors": self._colors()})
+        return json.dumps({"tabs": [{"id": t["id"], "name": t["name"], "path": t["path"], "dirty": self._is_dirty(t), "conflict": bool(t.get("conflict"))} for t in self.tabs], "active": self.active, "name": tab["name"], "outline": tab.get("outline", []), "portable": tab["portable"], "conflict": bool(tab.get("conflict")), "closedCount": len(self.closed_tabs), "folder": self.folder, "files": self.files, "recent": self.recent, "settings": self.settings, "mode": self.mode, "fullscreen": self.fullscreen, "readerOverlay": self.reader_overlay, "imageOverlay": self.image_overlay, "readerReady": self.ready, "dark": self._dark(), "zoom": self.settings["fullZoom" if self.fullscreen else "normalZoom"], "busy": self.busy > 0, "message": self.message, "messageRevision": getattr(self, "_message_revision", 0), "colors": self._colors()})
 
     @Property(bool, notify=changed)
     def agentAccessEnabled(self):
@@ -1791,60 +1884,217 @@ class Studio(QObject):
     @Slot()
     def openThemeGuide(self):self.readerCall.emit("window.supermdThemeGuide?.()")
 
+    def _save_theme_library(self):
+        atomic_json(
+            self.data / "theme-library.json",
+            {
+                "active": {"kind": self.session.active_theme_kind, "id": self.session.active_theme_id},
+                "saved": self.session.saved_themes,
+            },
+        )
+
+    def _clear_theme_background_overrides(self):
+        changed = any(
+            self.settings.get(key) != default
+            for key, default in (("patternKind", ""), ("patternOpacity", -1), ("patternSize", 0), ("patternSpacing", 0))
+        )
+        self.settings.update(patternKind="", patternOpacity=-1, patternSize=0, patternSpacing=0)
+        if changed:
+            self._preferences(False)
+
     def _watch_custom_theme(self):
         watcher=self.custom_theme_watcher
         paths=watcher.files()+watcher.directories()
         if paths:watcher.removePaths(paths)
-        source=Path(self.session.theme_source) if self.session.theme_source else None
+        source=Path(self.session.theme_source) if self.session.active_theme_kind!="preset" and self.session.theme_source else None
         self.custom_theme_stamp=custom_theme.stamp(source) if source else None
         if source:
             watcher.addPaths([str(path) for path in (source,source.parent) if path.exists()])
 
     def _custom_theme_event(self):
-        if self.retired or not self.session.theme_source:return
+        if self.retired or self.session.active_theme_kind=="preset" or not self.session.theme_source:return
         value=custom_theme.stamp(Path(self.session.theme_source))
         if value==self.custom_theme_stamp:return
         self.custom_theme_stamp=value
         self.reloadCustomTheme()
 
+    def _restore_custom_theme(self):
+        if self.retired:
+            return
+        self._watch_custom_theme()
+        if self.session.theme_restored:
+            return
+        self.session.theme_restored = True
+        kind = self.session.active_theme_kind
+        cached = self.data / "theme.json"
+        if kind == "preset":
+            try:
+                target = cached if cached.is_file() else custom_theme.bundled_theme_path(self.session.active_theme_id, ROOT)
+            except ValueError:
+                return
+            self._load_custom_theme(target, mode="restore")
+            return
+        if kind == "saved":
+            saved_file = self.data / "themes" / f"{self.session.active_theme_id}.json"
+            primary = saved_file if saved_file.is_file() else cached
+            source = Path(self.session.theme_source) if self.session.theme_source else None
+            follow = source if source and source.is_file() and source != primary else None
+            if primary.is_file():
+                self._load_custom_theme(primary, mode="restore", follow_source=follow)
+            elif follow:
+                self._load_custom_theme(follow, mode="restore")
+            return
+        source = Path(self.session.theme_source) if self.session.theme_source else cached
+        if not source.is_file():
+            source = cached
+        if self.session.custom_theme is None and cached.is_file() and cached != source:
+            self._load_custom_theme(cached, mode="restore", follow_source=source)
+        elif source.is_file():
+            self._load_custom_theme(source, mode="restore")
+
     @Slot(str)
-    def importCustomTheme(self,value):self._load_custom_theme(local_path(value))
+    def importCustomTheme(self,value):self._load_custom_theme(local_path(value),mode="import")
+
+    @Slot(str)
+    def selectBundledTheme(self,preset_id):self._apply_bundled_theme(preset_id)
+
+    def _apply_bundled_theme(self,preset_id,callback=None):
+        if not isinstance(preset_id,str) or not preset_id:
+            if callback:callback(None,"Unknown bundled theme")
+            return
+        if preset_id=="builtin":
+            self.resetCustomTheme()
+            if callback:callback({"id":"builtin","name":"Built-in appearance"},"")
+            return
+        try:
+            path=custom_theme.bundled_theme_path(preset_id,ROOT)
+        except ValueError as error:
+            self.message="Theme not applied: "+str(error);self._emit(False)
+            if callback:callback(None,str(error))
+            return
+        self._load_custom_theme(path,mode="preset",preset_id=preset_id,callback=callback)
+
+    @Slot(str)
+    def selectSavedTheme(self,entry_id):
+        entry=next((item for item in self.session.saved_themes if item["id"]==entry_id),None)
+        if entry is None:return
+        path=self.data/"themes"/f"{entry_id}.json"
+        if not path.is_file():
+            self.message="Saved theme is unavailable.";self._emit(False);return
+        self._load_custom_theme(path,mode="saved",entry_id=entry_id)
+
+    @Slot(str)
+    def deleteSavedTheme(self,entry_id):
+        entry=next((item for item in self.session.saved_themes if item["id"]==entry_id),None)
+        if entry is None:return
+        self.session.saved_themes=[item for item in self.session.saved_themes if item["id"]!=entry_id]
+        (self.data/"themes"/f"{entry_id}.json").unlink(missing_ok=True)
+        was_active=self.session.active_theme_kind=="saved" and self.session.active_theme_id==entry_id
+        if was_active:
+            self.session.theme_epoch+=1
+            self.session.custom_theme=None
+            self.session.theme_source=""
+            self.session.active_theme_kind="builtin"
+            self.session.active_theme_id=""
+            self.session.theme_revision+=1
+            for filename in ("theme.json","theme-source.json"):(self.data/filename).unlink(missing_ok=True)
+            self._clear_theme_background_overrides()
+            for window in self.session.windows.values():window._watch_custom_theme()
+        try:self._save_theme_library()
+        except OSError:pass
+        self.message="Removed "+entry["name"]
+        self.session.changed.emit()
 
     @Slot()
     def reloadCustomTheme(self):
-        if self.retired:return
+        if self.retired or self.session.active_theme_kind=="preset":return
+        if self.session.active_theme_kind=="saved" and not self.session.theme_source:return
         source=Path(self.session.theme_source) if self.session.theme_source else self.data/"theme.json"
         if not source.is_file():source=self.data/"theme.json"
         self._watch_custom_theme()
         cached=self.data/"theme.json"
-        if self.session.custom_theme is None and cached.is_file() and cached!=source:self._load_custom_theme(cached,False,source)
-        elif source.is_file():self._load_custom_theme(source,False)
+        if self.session.custom_theme is None and cached.is_file() and cached!=source:self._load_custom_theme(cached,mode="restore",follow_source=source,clear_overrides_on_follow=True)
+        elif source.is_file():self._load_custom_theme(source,mode="reload")
 
-    def _load_custom_theme(self,path,importing=True,follow_source=None):
+    def _load_custom_theme(self,path,mode="import",follow_source=None,preset_id="",entry_id="",callback=None,clear_overrides_on_follow=False):
         self.session.theme_epoch+=1
         epoch=self.session.theme_epoch
         try:engine=self._engine()
-        except ValueError as error:self.message=str(error);self._emit(False);return
+        except ValueError as error:
+            self.message=str(error);self._emit(False)
+            if callback:callback(None,str(error))
+            return
         def finished(value,error):
-            if epoch!=self.session.theme_epoch:return
+            if epoch!=self.session.theme_epoch:
+                if callback:callback(None,"Superseded by newer theme selection")
+                return
             if error:
                 self.message="Theme not applied: "+str(error);self._emit(False)
-                if follow_source:self._load_custom_theme(follow_source,False)
+                if callback:callback(None,str(error))
+                if follow_source:self._load_custom_theme(follow_source,mode="reload" if clear_overrides_on_follow else "restore")
                 return
             try:
-                if importing:
-                    self.session.theme_source=str(path)
-                    atomic_json(self.data/"theme-source.json",{"path":str(path)})
                 changed=value!=self.session.custom_theme
-                if changed:atomic_json(self.data/"theme.json",value)
+                if mode=="import":
+                    source_str=str(path)
+                    existing=next((item for item in self.session.saved_themes if item.get("source")==source_str),None)
+                    if existing is not None:
+                        target_id=existing["id"]
+                        existing["name"]=value["name"]
+                    else:
+                        target_id=uuid.uuid4().hex
+                        self.session.saved_themes.append({"id":target_id,"name":value["name"],"source":source_str})
+                    (self.data/"themes").mkdir(parents=True,exist_ok=True)
+                    atomic_json(self.data/"themes"/f"{target_id}.json",value)
+                    self.session.active_theme_kind="saved"
+                    self.session.active_theme_id=target_id
+                    self.session.theme_source=source_str
+                    atomic_json(self.data/"theme-source.json",{"path":source_str})
+                    atomic_json(self.data/"theme.json",value)
+                    self._save_theme_library()
+                    self._clear_theme_background_overrides()
+                elif mode=="preset":
+                    self.session.active_theme_kind="preset"
+                    self.session.active_theme_id=preset_id
+                    self.session.theme_source=""
+                    (self.data/"theme-source.json").unlink(missing_ok=True)
+                    atomic_json(self.data/"theme.json",value)
+                    self._save_theme_library()
+                    self._clear_theme_background_overrides()
+                elif mode=="saved":
+                    entry=next((item for item in self.session.saved_themes if item["id"]==entry_id),None)
+                    source_str=entry.get("source","") if entry else ""
+                    if entry is not None:entry["name"]=value["name"]
+                    self.session.active_theme_kind="saved"
+                    self.session.active_theme_id=entry_id
+                    self.session.theme_source=source_str
+                    if source_str:atomic_json(self.data/"theme-source.json",{"path":source_str})
+                    else:(self.data/"theme-source.json").unlink(missing_ok=True)
+                    atomic_json(self.data/"theme.json",value)
+                    self._save_theme_library()
+                    self._clear_theme_background_overrides()
+                elif mode=="reload":
+                    if self.session.active_theme_kind=="saved" and self.session.active_theme_id:
+                        (self.data/"themes").mkdir(parents=True,exist_ok=True)
+                        atomic_json(self.data/"themes"/f"{self.session.active_theme_id}.json",value)
+                        entry=next((item for item in self.session.saved_themes if item["id"]==self.session.active_theme_id),None)
+                        if entry is not None:entry["name"]=value["name"]
+                        self._save_theme_library()
+                    if changed:atomic_json(self.data/"theme.json",value)
+                    self._clear_theme_background_overrides()
+                else:
+                    if changed:atomic_json(self.data/"theme.json",value)
                 self.session.custom_theme=value
                 if changed:self.session.theme_revision+=1
                 for window in self.session.windows.values():window._watch_custom_theme()
-                if changed or importing:
+                if mode in ("import","preset","saved","reload") or (mode!="restore" and changed):
                     self.message="Applied "+value["name"]
-                    self.session.changed.emit()
-            except OSError as failure:self.message="Could not save theme: "+str(failure);self._emit(False)
-            if follow_source:self._load_custom_theme(follow_source,False)
+                self.session.changed.emit()
+                if callback:callback({"id":preset_id or entry_id or self.session.active_theme_id,"name":value["name"]},"")
+            except OSError as failure:
+                self.message="Could not save theme: "+str(failure);self._emit(False)
+                if callback:callback(None,str(failure))
+            if follow_source:self._load_custom_theme(follow_source,mode="reload" if clear_overrides_on_follow else "restore")
         def read():
             try:return custom_theme.read(engine,path),None
             except Exception as failure:return None,str(failure)
@@ -1854,20 +2104,25 @@ class Studio(QObject):
     def resetCustomTheme(self):
         self.session.theme_epoch+=1
         self.session.custom_theme=None;self.session.theme_source=""
+        self.session.active_theme_kind="builtin";self.session.active_theme_id=""
         self.session.theme_revision+=1
         for filename in ("theme.json","theme-source.json"):(self.data/filename).unlink(missing_ok=True)
+        try:self._save_theme_library()
+        except OSError:pass
+        self._clear_theme_background_overrides()
         for window in self.session.windows.values():window._watch_custom_theme()
         self.session.changed.emit()
 
     @Slot()
     def editCustomTheme(self):
-        source=Path(self.session.theme_source) if self.session.theme_source else self.data/"theme.json"
+        if self.session.active_theme_kind=="preset" or not self.session.theme_source:return
+        source=Path(self.session.theme_source)
         if source.is_file():QDesktopServices.openUrl(QUrl.fromLocalFile(str(source)))
 
     @Slot(str)
     def exportCustomTheme(self,value):
         try:
-            atomic_json(local_path(value),custom_theme.for_sharing(self.session.custom_theme,self.settings))
+            atomic_json(local_path(value),custom_theme.for_sharing(self.session.custom_theme))
             self.message="Theme exported. Edit the JSON and import it to apply."
         except OSError as error:self.message=str(error)
         self._emit(False)
@@ -3589,6 +3844,12 @@ class Studio(QObject):
                 text=args.get("text")
                 if not isinstance(text,str) or len(text)>2_000_000:raise ValueError("Clipboard text is too large or invalid")
                 QGuiApplication.clipboard().setText(text);self.replied.emit(id,"true","");return
+            if command == "apply_bundled_theme":
+                preset_id=args.get("id")
+                if not isinstance(preset_id,str) or not preset_id:
+                    raise ValueError("Invalid bundled theme id")
+                self._apply_bundled_theme(preset_id,lambda result,error:self.replied.emit(id,json.dumps(result) if not error else "null",error or ""))
+                return
             if command == "reading_position":
                 target=next((t for t in self.tabs if t["id"]==args.get("id")),None);location=args.get("location")
                 if target and target["path"] and self.settings["restorePosition"] and isinstance(location,dict):

@@ -223,6 +223,52 @@ ApplicationWindow {{
         QTest.qWait(40)
         self.assertTrue(self.window.property("newNoteShortcutTriggered"), "The app action should reactivate when the modal closes")
 
+    def test_appearance_settings_expose_bundled_presets_saved_themes_and_scoped_file_actions(self):
+        import custom_theme
+        from unittest.mock import patch
+        page = self.window.findChild(object, "settingsPage")
+        self.assertIsNotNone(page)
+        page.setProperty("section", "appearance")
+        QTest.qWait(30)
+        preset_choice = self.named_item("bundledThemeChoice")
+        self.assertIsNotNone(preset_choice)
+        self.assertEqual(preset_choice.property("count"), 17, "Built-in appearance plus 16 bundled presets must be selectable")
+        edit_btn = self.named_item("editThemeFile")
+        reload_btn = self.named_item("reloadThemeFile")
+        self.assertIsNotNone(edit_btn)
+        self.assertIsNotNone(reload_btn)
+        self.assertFalse(edit_btn.isVisible())
+        self.assertFalse(reload_btn.isVisible())
+
+        source = self.studio.data / "imported-ui.supermd-theme.json"
+        source.write_text(json.dumps({**custom_theme.TEMPLATE, "name": "UI Imported"}))
+        pending = []
+        with patch.object(self.studio, "_engine", return_value=Path("unused-theme-engine")), patch.object(
+            self.studio, "_submit", side_effect=lambda action, done, *_: pending.append((action, done))
+        ), patch("custom_theme.read", side_effect=lambda _, p: json.loads(Path(p).read_text())):
+            self.studio.importCustomTheme(str(source))
+            while pending:
+                action, done = pending.pop(0)
+                done(action(), None)
+        QTest.qWait(40)
+        self.assertTrue(edit_btn.isVisible())
+        self.assertTrue(reload_btn.isVisible())
+        saved_entry = self.studio.savedThemes[0]
+        self.assertIsNotNone(self.named_item("deleteSavedTheme_" + saved_entry["id"]))
+
+        pending = []
+        with patch.object(self.studio, "_engine", return_value=Path("unused-theme-engine")), patch.object(
+            self.studio, "_submit", side_effect=lambda action, done, *_: pending.append((action, done))
+        ), patch("custom_theme.read", side_effect=lambda _, p: json.loads(Path(p).read_text())):
+            self.studio.selectBundledTheme("study-desk")
+            while pending:
+                action, done = pending.pop(0)
+                done(action(), None)
+        QTest.qWait(40)
+        self.assertFalse(edit_btn.isVisible(), "Bundled presets must hide external file edit/reload actions")
+        self.assertFalse(reload_btn.isVisible())
+        self.assertIsNotNone(self.named_item("deleteSavedTheme_" + saved_entry["id"]), "Saved imported themes remain available while a preset is active")
+
     def test_writing_typewriter_scroll_switch_and_shortcut_row_sync_with_studio(self):
         page = self.window.findChild(object, "settingsPage")
         self.assertIsNotNone(page)
