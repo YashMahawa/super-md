@@ -3,6 +3,8 @@ import remarkParse from "remark-parse";
 import remarkGfm from "remark-gfm";
 import remarkMath from "remark-math";
 import { visit } from "unist-util-visit";
+import { safeParseUrl } from "./documentMedia";
+import { maskCode } from "./markdownSource";
 import { remarkObsidianMath } from "./obsidianMath";
 
 export const FORMAT_ACTIONS = [
@@ -34,6 +36,12 @@ export interface MarkdownEditResult {
   changes: TextChangeSpec[];
   ranges: SelectionRange[];
   mainIndex: number;
+}
+
+export function notifyHistoryBoundary(): void {
+  if (typeof window !== "undefined") {
+    window.dispatchEvent(new Event("supermd-history-boundary"));
+  }
 }
 
 export function normalizeFormatAction(raw: unknown): FormatAction | null {
@@ -82,13 +90,8 @@ export function parseStandaloneHttpUrl(raw: string): string | null {
   if (typeof raw !== "string") return null;
   const trimmed = raw.trim();
   if (!trimmed || /[\s\r\n]/.test(trimmed) || !/^https?:\/\/\S+$/i.test(trimmed)) return null;
-  try {
-    const parsed = new URL(trimmed);
-    if ((parsed.protocol !== "http:" && parsed.protocol !== "https:") || !parsed.hostname) return null;
-    return trimmed;
-  } catch {
-    return null;
-  }
+  const parsed = safeParseUrl(trimmed);
+  return parsed && (parsed.protocol === "http:" || parsed.protocol === "https:") && parsed.hostname ? trimmed : null;
 }
 
 function escapeLinkLabel(label: string): string {
@@ -653,6 +656,7 @@ export function isProtectedMarkdownSelection(doc: string, from: number, to: numb
   const slice = doc.slice(windowStart, windowEnd);
   const localFrom = from - windowStart;
   const localTo = to - windowStart;
+  if (maskCode(slice).slice(localFrom, localTo) !== selected) return true;
 
   let protectedByAst = false;
   const checkTree = (withMath: boolean) => {
@@ -681,10 +685,6 @@ export function isProtectedMarkdownSelection(doc: string, from: number, to: numb
   const lineBefore = before.slice(lineStart);
   const nextNl = after.indexOf("\n");
   const lineAfter = nextNl === -1 ? after : after.slice(0, nextNl);
-
-  // Unclosed fenced code block (` ``` ` or ` ~~~ `) above selection
-  const fenceLines = before.match(/^[ \t]{0,3}(`{3,}|~{3,})/gm);
-  if (fenceLines && fenceLines.length % 2 === 1) return true;
 
   // Unclosed display math `$$` or `\[ ... \]` / `\( ... \)`
   if (((before.match(/(?<![\\$])\$\$(?!\$)/g)?.length ?? 0) % 2) === 1) return true;

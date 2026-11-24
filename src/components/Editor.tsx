@@ -8,6 +8,7 @@ import { repairPastedMath } from '../mathRepair';
 import {
   applyMarkdownUrlPaste,
   normalizeFormatAction,
+  notifyHistoryBoundary,
   parseStandaloneHttpUrl,
   toggleMarkdownFormat,
   type FormatAction,
@@ -67,12 +68,6 @@ interface SelectionTransition {
   afterSelection: EditorSelection;
 }
 const selectionHistories = new Map<string, SelectionTransition[]>();
-
-function notifyHistoryBoundary() {
-  if (typeof window !== "undefined") {
-    window.dispatchEvent(new Event("supermd-history-boundary"));
-  }
-}
 
 export function applyEditorFormat(editor: EditorView, action: FormatAction): boolean {
   const currentRanges = editor.state.selection.ranges.map((r) => ({ anchor: r.anchor, head: r.head }));

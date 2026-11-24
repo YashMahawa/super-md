@@ -9,6 +9,9 @@ export function setReaderOverlay(kind:string,open:boolean) {
   document.documentElement.dataset.readerOverlay=String(present);
   if(previous!==present || kind==="image" || kind==="step-viewer")void invoke("reader_overlay_changed",{open:present,image:overlays.has("image")||overlays.has("step-viewer")}).catch(()=>{});
 }
+export function hasReaderOverlay():boolean {
+  return overlays.size>0||document.documentElement.dataset.readerOverlay==="true"||!!document.querySelector(".media-save-menu,.theme-guide-dialog,.media-dialog,.image-viewer,.math-repair-panel,.reading-search,.reader-export-backdrop");
+}
 export function dismissReaderOverlay():boolean {
   const element=document.querySelector(".media-save-menu")||document.querySelector(".theme-guide-dialog")||document.querySelector(".media-dialog,.image-viewer,.math-repair-panel,.reading-search,.cm-search,.live-active-block textarea");
   if(!element)return false;

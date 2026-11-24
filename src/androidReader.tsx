@@ -26,7 +26,7 @@ import { preparePdf } from "./preparePdf";
 import type { ExportOptions,ReaderAccessibilityPreference } from "./types";
 import { clampPreviewZoom } from "./zoom";
 import MediaTools from "./components/MediaTools";
-import { dismissReaderOverlay } from "./readerOverlays";
+import { dismissReaderOverlay, hasReaderOverlay } from "./readerOverlays";
 import { prepareFmd } from "./documentMedia";
 import { prepareMarkdownExport } from "./markdownExport";
 import ImageViewer from "./components/ImageViewer";
@@ -271,7 +271,7 @@ function Reader() {
       replaying.current=false;
     };
     window.supermdFormat=action=>{
-      if(document.querySelector('.theme-guide-dialog,.image-viewer,.math-repair-panel,.reading-search,.media-dialog'))return false;
+      if(hasReaderOverlay())return false;
       const active=document.activeElement;
       if(active instanceof HTMLElement&&active.closest('.cm-panels,.cm-search'))return false;
       const current=reference.current;if(!current||current.mode==="reader")return false;
@@ -557,7 +557,7 @@ function Reader() {
   const syncEditorFocus=useCallback(()=>{
     const current=reference.current;
     let focused=false;
-    if(current&&current.mode!=="reader"&&!document.querySelector(".theme-guide-dialog,.image-viewer,.math-repair-panel,.reading-search,.media-dialog")){
+    if(current&&current.mode!=="reader"&&!hasReaderOverlay()){
       const active=document.activeElement;
       if(active instanceof HTMLElement&&!active.closest(".cm-panels,.cm-search")){
         if(current.mode==="live")focused=active.matches(".live-active-block textarea");
@@ -566,7 +566,7 @@ function Reader() {
     }
     if(editorFocusReported.current!==focused){
       editorFocusReported.current=focused;
-      void invoke("editor_focus_changed",{focused}).catch(()=>{});
+      if(document.documentElement.dataset.host!=="qt")void invoke("editor_focus_changed",{focused}).catch(()=>{});
     }
   },[]);
   useEffect(()=>{

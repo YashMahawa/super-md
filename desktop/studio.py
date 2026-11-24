@@ -366,7 +366,6 @@ class Studio(QObject):
         self.fullscreen = False
         self.reader_overlay = False
         self.image_overlay = False
-        self.editor_focused = False
         self.busy = 0
         self.message = ("Closed-note recovery index could not be read; historical snapshots were left untouched. "+self.session.closed_note_error) if self.session.closed_note_error else ""
         self.ready = False
@@ -3171,7 +3170,7 @@ class Studio(QObject):
                 if self.fullscreen: self.chromeRequested.emit(action)
                 self.replied.emit(id,"true",""); return
             if command == "reader_overlay_changed": self.reader_overlay = bool(args.get("open")); self.image_overlay = bool(args.get("image")); self._emit(False); self.replied.emit(id,"true",""); return
-            if command == "editor_focus_changed": self.editor_focused = bool(args.get("focused")); self.replied.emit(id,"true",""); return
+            if command == "editor_focus_changed": self.replied.emit(id,"true",""); return
             if command == "typewriter_scroll":
                 enabled = args.get("enabled")
                 if not isinstance(enabled, bool): raise ValueError("Invalid typewriter scroll value")

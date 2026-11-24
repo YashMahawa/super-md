@@ -12,6 +12,7 @@ import {
   applyMarkdownUrlPaste,
   formatActionFromKeyEvent,
   normalizeFormatAction,
+  notifyHistoryBoundary,
   parseStandaloneHttpUrl,
   toggleMarkdownFormat,
   type FormatAction,
@@ -39,12 +40,6 @@ export function formatActiveLiveBlock(rawAction: string): boolean {
 
 export function replayActiveLiveBlockHistory(direction: "undo" | "redo"): boolean {
   return !!activeLiveHistoryHandler && activeLiveHistoryHandler(direction);
-}
-
-function notifyHistoryBoundary() {
-  if (typeof window !== "undefined") {
-    window.dispatchEvent(new Event("supermd-history-boundary"));
-  }
 }
 
 interface Props extends WritingOptions,ReaderAccessibilityPreference {
