@@ -1,5 +1,121 @@
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
+use std::io::Read;
 use smd_core::{source,export,PdfOptions};
+
+fn count_pdf_pages(pdf: &[u8]) -> usize {
+    let mut count = 0;
+    for needle in [b"/Type /Page".as_slice(), b"/Type/Page".as_slice()] {
+        let mut pos = 0;
+        while let Some(rel) = pdf[pos..].windows(needle.len()).position(|w| w == needle) {
+            let after = pos + rel + needle.len();
+            if !pdf.get(after).is_some_and(|b| b.is_ascii_alphanumeric()) {
+                count += 1;
+            }
+            pos = after;
+        }
+    }
+    count
+}
+
+fn decompress_pdf_streams(pdf: &[u8]) -> Vec<String> {
+    let mut streams = Vec::new();
+    let mut pos = 0;
+    while let Some(rel) = pdf[pos..].windows(6).position(|w| w == b"stream") {
+        let mut data_start = pos + rel + 6;
+        if pdf.get(data_start) == Some(&b'\r') {
+            data_start += 1;
+        }
+        if pdf.get(data_start) != Some(&b'\n') {
+            pos = data_start;
+            continue;
+        }
+        data_start += 1;
+        let Some(end_rel) = pdf[data_start..].windows(9).position(|w| w == b"endstream") else {
+            break;
+        };
+        let mut data_end = data_start + end_rel;
+        if data_end > data_start && pdf[data_end - 1] == b'\n' {
+            data_end -= 1;
+        }
+        if data_end > data_start && pdf[data_end - 1] == b'\r' {
+            data_end -= 1;
+        }
+        let mut decoded = Vec::new();
+        if flate2::read::ZlibDecoder::new(&pdf[data_start..data_end]).read_to_end(&mut decoded).is_ok() {
+            streams.push(String::from_utf8_lossy(&decoded).into_owned());
+        }
+        pos = data_start + end_rel + 9;
+    }
+    streams
+}
+
+fn read_ppm_pages(ppm_dir: &std::path::Path) -> BTreeMap<usize, Vec<u8>> {
+    let mut pages = BTreeMap::new();
+    if let Ok(entries) = std::fs::read_dir(ppm_dir) {
+        for entry in entries.flatten() {
+            let name = entry.file_name().to_string_lossy().into_owned();
+            // Poppler writes page-1.ppm / page-01.ppm; Xpdf on Windows writes page-000001.ppm.
+            if let Some(stem) = name.strip_prefix("page-").and_then(|s| s.strip_suffix(".ppm")) {
+                if let Ok(num) = stem.parse::<usize>() {
+                    if let Ok(bytes) = std::fs::read(entry.path()) {
+                        pages.insert(num, bytes);
+                    }
+                }
+            }
+        }
+    }
+    pages
+}
+
+fn require_poppler() -> bool {
+    cfg!(target_os = "linux") && std::env::var_os("SUPERMD_TEST_NON_POPPLER").is_none()
+}
+
+fn parse_p6_ppm(ppm: &[u8]) -> Option<(usize, usize, &[u8])> {
+    if !ppm.starts_with(b"P6") {
+        return None;
+    }
+    let mut i = 2usize;
+    let mut tokens: Vec<usize> = Vec::with_capacity(3);
+    while tokens.len() < 3 && i < ppm.len() {
+        while i < ppm.len() {
+            if ppm[i] == b'#' {
+                while i < ppm.len() && ppm[i] != b'\n' {
+                    i += 1;
+                }
+            } else if ppm[i].is_ascii_whitespace() {
+                i += 1;
+            } else {
+                break;
+            }
+        }
+        let start = i;
+        while i < ppm.len() && ppm[i].is_ascii_digit() {
+            i += 1;
+        }
+        if start == i {
+            return None;
+        }
+        tokens.push(std::str::from_utf8(&ppm[start..i]).ok()?.parse().ok()?);
+    }
+    if tokens.len() != 3 {
+        return None;
+    }
+    let (w, h, maxval) = (tokens[0], tokens[1], tokens[2]);
+    if maxval != 255 || w == 0 || h == 0 {
+        return None;
+    }
+    let pixel_bytes = w.checked_mul(h)?.checked_mul(3)?;
+    if i >= ppm.len() || !ppm[i].is_ascii_whitespace() {
+        return None;
+    }
+    let header_end = if ppm[i] == b'\r' && ppm.get(i + 1) == Some(&b'\n') && ppm.len() == i + 2 + pixel_bytes {
+        i + 2
+    } else {
+        i + 1
+    };
+    (ppm.len() >= header_end + pixel_bytes).then(|| (w, h, &ppm[header_end..header_end + pixel_bytes]))
+}
 
 #[test]
 fn nested_callouts_and_literal_code_delimiters_match_the_reader_contract() {
@@ -113,72 +229,95 @@ fn multiline_python_docstrings_render_as_one_raw_block_and_keep_syntax_colors() 
     assert!(generated.contains("block: true, lang: \"python\""), "{generated}");
 
     let pdf = export(&markdown, &PdfOptions::default(), &HashMap::new()).unwrap();
+    assert_eq!(count_pdf_pages(&pdf), 1);
+    let streams = decompress_pdf_streams(&pdf).join("\n");
+    assert!(
+        streams.matches("0.45490196 0.45490196 0.4862745 scn").count() >= 4,
+        "Expected comment slate highlight across all docstring lines: {streams}"
+    );
+    assert!(
+        streams.matches("0.09803922 0.53333336 0.0627451 scn").count() >= 4,
+        "Expected string green highlight across all multiline string lines: {streams}"
+    );
+
     let path = std::env::temp_dir().join(format!("supermd-multiline-code-{}.pdf", std::process::id()));
     std::fs::write(&path, &pdf).unwrap();
-    if let Ok(out) = std::process::Command::new("pdftotext").arg("-bbox").arg(&path).arg("-").output() {
-        assert!(out.status.success());
-        let xml = String::from_utf8_lossy(&out.stdout);
-        for token in ["compute", "FIRST_DOC_LINE", "MIDDLE_DOC_LINE", "LAST_DOC_LINE", "MIDDLE_STR_LINE", "plain_identifier"] {
-            assert!(xml.contains(token), "Missing token {token} in PDF text");
+    if let Ok(out) = std::process::Command::new("pdftotext").arg(&path).arg("-").output() {
+        if require_poppler() {
+            assert!(out.status.success());
         }
-        let x_of = |needle: &str| -> f64 {
-            let line = xml.lines().find(|l| l.contains("<word ") && l.contains(needle)).unwrap();
-            line.split("xMin=\"").nth(1).unwrap().split('"').next().unwrap().parse().unwrap()
-        };
-        assert!(x_of("MIDDLE_DOC_LINE") > x_of("def") + 8.0, "Leading indentation must be preserved");
-    }
-    let ppm_prefix = std::env::temp_dir().join(format!("supermd-multiline-ppm-{}", std::process::id()));
-    if let (Ok(bbox_out), Ok(ppm_out)) = (
-        std::process::Command::new("pdftotext").arg("-bbox").arg(&path).arg("-").output(),
-        std::process::Command::new("pdftoppm")
-            .args(["-r", "144", &path.to_string_lossy(), &ppm_prefix.to_string_lossy()])
-            .output(),
-    ) {
-        if bbox_out.status.success() && ppm_out.status.success() {
-            let xml = String::from_utf8_lossy(&bbox_out.stdout);
-            let ppm_path = format!("{}-1.ppm", ppm_prefix.display());
-            if let Ok(ppm) = std::fs::read(&ppm_path) {
-                let header_end = ppm.windows(4).position(|w| w == b"255\n").map(|p| p + 4).unwrap_or(0);
-                let header = String::from_utf8_lossy(&ppm[..header_end]);
-                let dims: Vec<usize> = header.split_whitespace().skip(1).take(2).map(|s| s.parse().unwrap()).collect();
-                let img_w = dims[0];
-                let pixels = &ppm[header_end..];
-                let darkest_glyph_rgb = |needle: &str| -> [u8; 3] {
-                    let word = xml.lines().find(|l| l.contains("<word ") && l.contains(needle)).unwrap();
-                    let attr = |name: &str| -> f64 {
-                        word.split(&format!("{name}=\"")).nth(1).unwrap().split('"').next().unwrap().parse().unwrap()
-                    };
-                    let x0 = (attr("xMin") * 2.0).floor() as usize;
-                    let x1 = (attr("xMax") * 2.0).ceil() as usize;
-                    let y0 = (attr("yMin") * 2.0).floor() as usize;
-                    let y1 = (attr("yMax") * 2.0).ceil() as usize;
-                    let mut best = [255u8, 255, 255];
-                    for y in y0..y1 {
-                        for x in x0..x1 {
-                            let i = (y * img_w + x) * 3;
-                            let rgb = [pixels[i], pixels[i + 1], pixels[i + 2]];
-                            if (rgb[0] as u16 + rgb[1] as u16 + rgb[2] as u16)
-                                < (best[0] as u16 + best[1] as u16 + best[2] as u16)
-                            {
-                                best = rgb;
-                            }
-                        }
-                    }
-                    best
-                };
-                let doc1 = darkest_glyph_rgb("FIRST_DOC_LINE");
-                let doc2 = darkest_glyph_rgb("MIDDLE_DOC_LINE");
-                let str1 = darkest_glyph_rgb("FIRST_STR_LINE");
-                let str2 = darkest_glyph_rgb("MIDDLE_STR_LINE");
-                let ident = darkest_glyph_rgb("plain_identifier");
-                // Middle docstring line matches first docstring line (comment slate) and is lighter than #202020 identifier ink.
-                assert!(doc1[0].abs_diff(doc2[0]) <= 6 && doc2[0] > ident[0] + 50, "Docstring continuation lost highlight color: doc1={doc1:?} doc2={doc2:?} ident={ident:?}");
-                // Middle multiline string line matches first string line (green) rather than #202020 identifier ink.
-                assert!(str1[1].abs_diff(str2[1]) <= 6 && str2[1] > str2[0] + 60, "Multiline string continuation lost green highlight color: str1={str1:?} str2={str2:?}");
-                let _ = std::fs::remove_file(&ppm_path);
+        if out.status.success() {
+            let plain = String::from_utf8_lossy(&out.stdout);
+            for token in ["compute", "FIRST_DOC_LINE", "MIDDLE_DOC_LINE", "LAST_DOC_LINE", "MIDDLE_STR_LINE", "plain_identifier"] {
+                assert!(plain.contains(token), "Missing token {token} in PDF text");
             }
         }
     }
+    let ppm_dir = std::env::temp_dir().join(format!("supermd-multiline-ppm-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&ppm_dir);
+    std::fs::create_dir_all(&ppm_dir).unwrap();
+    let ppm_prefix = ppm_dir.join("page");
+    let bbox_res = std::process::Command::new("pdftotext").arg("-bbox").arg(&path).arg("-").output();
+    let ppm_res = std::process::Command::new("pdftoppm")
+        .args(["-r", "144", &path.to_string_lossy(), &ppm_prefix.to_string_lossy()])
+        .output();
+    if require_poppler() {
+        assert!(bbox_res.as_ref().is_ok_and(|o| o.status.success()), "Poppler pdftotext -bbox must succeed on Linux CI");
+        assert!(ppm_res.as_ref().is_ok_and(|o| o.status.success()), "Poppler pdftoppm must succeed on Linux CI");
+    }
+    if let Ok(bbox_out) = bbox_res {
+        if bbox_out.status.success() {
+            let xml = String::from_utf8_lossy(&bbox_out.stdout);
+            if xml.contains("<word ") {
+                let x_of = |needle: &str| -> f64 {
+                    let line = xml.lines().find(|l| l.contains("<word ") && l.contains(needle)).unwrap();
+                    line.split("xMin=\"").nth(1).unwrap().split('"').next().unwrap().parse().unwrap()
+                };
+                assert!(x_of("MIDDLE_DOC_LINE") > x_of("def") + 8.0, "Leading indentation must be preserved");
+                if ppm_res.is_ok_and(|o| o.status.success()) {
+                    let pages = read_ppm_pages(&ppm_dir);
+                    if require_poppler() {
+                        assert!(pages.contains_key(&1), "Expected rendered PPM page 1");
+                    }
+                    if let Some((img_w, _img_h, pixels)) = pages.get(&1).and_then(|raw| parse_p6_ppm(raw)) {
+                        let darkest_glyph_rgb = |needle: &str| -> [u8; 3] {
+                            let word = xml.lines().find(|l| l.contains("<word ") && l.contains(needle)).unwrap();
+                            let attr = |name: &str| -> f64 {
+                                word.split(&format!("{name}=\"")).nth(1).unwrap().split('"').next().unwrap().parse().unwrap()
+                            };
+                            let x0 = (attr("xMin") * 2.0).floor() as usize;
+                            let x1 = (attr("xMax") * 2.0).ceil() as usize;
+                            let y0 = (attr("yMin") * 2.0).floor() as usize;
+                            let y1 = (attr("yMax") * 2.0).ceil() as usize;
+                            let mut best = [255u8, 255, 255];
+                            for y in y0..y1 {
+                                for x in x0..x1 {
+                                    let i = (y * img_w + x) * 3;
+                                    let rgb = [pixels[i], pixels[i + 1], pixels[i + 2]];
+                                    if (rgb[0] as u16 + rgb[1] as u16 + rgb[2] as u16)
+                                        < (best[0] as u16 + best[1] as u16 + best[2] as u16)
+                                    {
+                                        best = rgb;
+                                    }
+                                }
+                            }
+                            best
+                        };
+                        let doc1 = darkest_glyph_rgb("FIRST_DOC_LINE");
+                        let doc2 = darkest_glyph_rgb("MIDDLE_DOC_LINE");
+                        let str1 = darkest_glyph_rgb("FIRST_STR_LINE");
+                        let str2 = darkest_glyph_rgb("MIDDLE_STR_LINE");
+                        let ident = darkest_glyph_rgb("plain_identifier");
+                        // Middle docstring line matches first docstring line (comment slate) and is lighter than #202020 identifier ink.
+                        assert!(doc1[0].abs_diff(doc2[0]) <= 6 && doc2[0] > ident[0] + 50, "Docstring continuation lost highlight color: doc1={doc1:?} doc2={doc2:?} ident={ident:?}");
+                        // Middle multiline string line matches first string line (green) rather than #202020 identifier ink.
+                        assert!(str1[1].abs_diff(str2[1]) <= 6 && str2[1] > str2[0] + 60, "Multiline string continuation lost green highlight color: str1={str1:?} str2={str2:?}");
+                    }
+                }
+            }
+        }
+    }
+    let _ = std::fs::remove_dir_all(&ppm_dir);
     let _ = std::fs::remove_file(&path);
 }
 
@@ -222,56 +361,89 @@ fn explicit_image_widths_and_zoom_scale_and_clamp_without_changing_unsized_portr
     assert!(!generated.contains("{width="), "{generated}");
 
     let pdf = export(&md, &PdfOptions::default(), &assets).unwrap();
-    let path = std::env::temp_dir().join(format!("supermd-image-widths-{}.pdf", std::process::id()));
-    let ppm_prefix = std::env::temp_dir().join(format!("supermd-image-widths-ppm-{}", std::process::id()));
-    std::fs::write(&path, &pdf).unwrap();
-    if let Ok(out) = std::process::Command::new("pdftoppm")
-        .args(["-r", "72", &path.to_string_lossy(), &ppm_prefix.to_string_lossy()])
-        .output()
-    {
-        assert!(out.status.success());
-        let band_widths = |page_num: usize| -> Vec<usize> {
-            let ppm_path = format!("{}-{page_num}.ppm", ppm_prefix.display());
-            let ppm = std::fs::read(&ppm_path).unwrap();
-            let _ = std::fs::remove_file(&ppm_path);
-            let header_end = ppm.windows(4).position(|w| w == b"255\n").unwrap() + 4;
-            let header = String::from_utf8_lossy(&ppm[..header_end]);
-            let dims: Vec<usize> = header.split_whitespace().skip(1).take(2).map(|s| s.parse().unwrap()).collect();
-            let (w, h) = (dims[0], dims[1]);
-            let pixels = &ppm[header_end..];
-            let mut bands = Vec::new();
-            let mut current_max = 0usize;
-            for y in 0..h {
-                let row = &pixels[y * w * 3 .. (y + 1) * w * 3];
-                let green_cols: Vec<usize> = row
-                    .chunks_exact(3)
-                    .enumerate()
-                    .filter(|(_, rgb)| rgb[1] > 120 && rgb[0] < 60)
-                    .map(|(x, _)| x)
-                    .collect();
-                if let (Some(&first), Some(&last)) = (green_cols.first(), green_cols.last()) {
-                    current_max = current_max.max(last - first + 1);
-                } else if current_max > 0 {
-                    bands.push(current_max);
-                    current_max = 0;
-                }
-            }
-            if current_max > 0 {
-                bands.push(current_max);
-            }
-            bands
-        };
-        // At 72 DPI (1px == 1pt): 90pt, 120pt, 150pt, 200pt, ~258pt (50% of 182mm), ~516pt (clamped to 182mm).
-        let page1 = band_widths(1);
-        assert_eq!(page1.len(), 6, "Expected 6 green bars on page 1, got {page1:?}");
-        for (actual, expected) in page1.into_iter().zip([90usize, 120, 150, 200, 258, 516]) {
-            assert!(actual.abs_diff(expected) <= 3, "Expected ~{expected}pt width, got {actual}pt");
-        }
-        // Unsized 40x160 portrait keeps 170mm * (40/160) = 42.5mm (~120.5pt), never full 516pt width.
-        let page2 = band_widths(2);
-        assert_eq!(page2.len(), 1, "Expected 1 portrait bar on page 2, got {page2:?}");
-        assert!(page2[0].abs_diff(120) <= 3, "Expected ~120pt portrait width, got {}pt", page2[0]);
+    assert_eq!(count_pdf_pages(&pdf), 2);
+    let stream_clip_widths: Vec<Vec<f64>> = decompress_pdf_streams(&pdf)
+        .into_iter()
+        .filter(|s| s.contains("0 0.65882355 0.34901962 scn"))
+        .map(|s| {
+            s.lines()
+                .filter_map(|line| {
+                    let rest = line.strip_prefix("q ")?;
+                    let nums: Vec<f64> = rest
+                        .split_whitespace()
+                        .filter_map(|tok| tok.parse::<f64>().ok())
+                        .collect();
+                    (line.ends_with(" l") && nums.len() == 8 && (nums[1] - nums[3]).abs() < 1e-3)
+                        .then_some((nums[2] - nums[0]).abs())
+                })
+                .collect()
+        })
+        .collect();
+    assert_eq!(stream_clip_widths.len(), 2, "Expected 2 page streams with green SVG figures: {stream_clip_widths:?}");
+    assert_eq!(stream_clip_widths[0].len(), 6, "Expected 6 sized bars on page 1: {:?}", stream_clip_widths[0]);
+    for (actual, expected) in stream_clip_widths[0].iter().zip([90.0f64, 120.0, 150.0, 200.0, 257.95, 515.91]) {
+        assert!((actual - expected).abs() <= 1.5, "Expected ~{expected}pt PDF clip width, got {actual}pt");
     }
+    assert_eq!(stream_clip_widths[1].len(), 1, "Expected 1 portrait bar on page 2: {:?}", stream_clip_widths[1]);
+    assert!((stream_clip_widths[1][0] - 120.47).abs() <= 1.5, "Expected ~120.5pt portrait clip width, got {}pt", stream_clip_widths[1][0]);
+
+    let path = std::env::temp_dir().join(format!("supermd-image-widths-{}.pdf", std::process::id()));
+    let ppm_dir = std::env::temp_dir().join(format!("supermd-image-widths-ppm-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&ppm_dir);
+    std::fs::create_dir_all(&ppm_dir).unwrap();
+    let ppm_prefix = ppm_dir.join("page");
+    std::fs::write(&path, &pdf).unwrap();
+    let ppm_res = std::process::Command::new("pdftoppm")
+        .args(["-r", "72", &path.to_string_lossy(), &ppm_prefix.to_string_lossy()])
+        .output();
+    if require_poppler() {
+        assert!(ppm_res.as_ref().is_ok_and(|o| o.status.success()), "Poppler pdftoppm must succeed on Linux CI");
+    }
+    if let Ok(out) = ppm_res {
+        if out.status.success() {
+            let pages = read_ppm_pages(&ppm_dir);
+            if require_poppler() {
+                assert_eq!(pages.len(), 2, "Expected 2 rendered PPM pages");
+            }
+            if let (Some(ppm1), Some(ppm2)) = (pages.get(&1), pages.get(&2)) {
+                let band_widths = |ppm: &[u8]| -> Vec<usize> {
+                    let (w, h, pixels) = parse_p6_ppm(ppm).expect("Valid binary P6 PPM");
+                    let mut bands = Vec::new();
+                    let mut current_max = 0usize;
+                    for y in 0..h {
+                        let row = &pixels[y * w * 3 .. (y + 1) * w * 3];
+                        let green_cols: Vec<usize> = row
+                            .chunks_exact(3)
+                            .enumerate()
+                            .filter(|(_, rgb)| rgb[1] > 120 && rgb[0] < 60)
+                            .map(|(x, _)| x)
+                            .collect();
+                        if let (Some(&first), Some(&last)) = (green_cols.first(), green_cols.last()) {
+                            current_max = current_max.max(last - first + 1);
+                        } else if current_max > 0 {
+                            bands.push(current_max);
+                            current_max = 0;
+                        }
+                    }
+                    if current_max > 0 {
+                        bands.push(current_max);
+                    }
+                    bands
+                };
+                // At 72 DPI (1px == 1pt): 90pt, 120pt, 150pt, 200pt, ~258pt (50% of 182mm), ~516pt (clamped to 182mm).
+                let page1 = band_widths(ppm1);
+                assert_eq!(page1.len(), 6, "Expected 6 green bars on page 1, got {page1:?}");
+                for (actual, expected) in page1.into_iter().zip([90usize, 120, 150, 200, 258, 516]) {
+                    assert!(actual.abs_diff(expected) <= 3, "Expected ~{expected}pt width, got {actual}pt");
+                }
+                // Unsized 40x160 portrait keeps 170mm * (40/160) = 42.5mm (~120.5pt), never full 516pt width.
+                let page2 = band_widths(ppm2);
+                assert_eq!(page2.len(), 1, "Expected 1 portrait bar on page 2, got {page2:?}");
+                assert!(page2[0].abs_diff(120) <= 3, "Expected ~120pt portrait width, got {}pt", page2[0]);
+            }
+        }
+    }
+    let _ = std::fs::remove_dir_all(&ppm_dir);
     let _ = std::fs::remove_file(&path);
 }
 
@@ -306,20 +478,25 @@ fn manual_page_breaks_split_pages_while_code_literals_stay_intact() {
     let generated = source(&md, &PdfOptions::default(), &HashMap::new()).unwrap();
     assert_eq!(generated.matches("#pagebreak()").count(), 4, "{generated}");
     let pdf = export(&md, &PdfOptions::default(), &HashMap::new()).unwrap();
+    assert_eq!(count_pdf_pages(&pdf), 5, "Expected 5 PDF page objects");
     let path = std::env::temp_dir().join(format!("supermd-pagebreaks-{}.pdf", std::process::id()));
     std::fs::write(&path, &pdf).unwrap();
     if let Ok(out) = std::process::Command::new("pdftotext").arg(&path).arg("-").output() {
-        assert!(out.status.success());
-        let text = String::from_utf8_lossy(&out.stdout);
-        let pages: Vec<&str> = text.split('\u{000c}').filter(|p| !p.trim().is_empty()).collect();
-        assert_eq!(pages.len(), 5, "Expected exactly 5 pages, got {}: {pages:?}", pages.len());
-        assert!(pages[0].contains("PAGE_ONE_MARKER"));
-        assert!(pages[1].contains("PAGE_TWO_MARKER"));
-        assert!(pages[2].contains("PAGE_THREE_MARKER"));
-        assert!(pages[3].contains("PAGE_FOUR_MARKER"));
-        assert!(pages[4].contains("PAGE_FIVE_MARKER"));
-        assert!(pages[4].contains("\\newpage"));
-        assert!(pages[4].contains("{{< pagebreak >}}"));
+        if require_poppler() {
+            assert!(out.status.success());
+        }
+        if out.status.success() {
+            let text = String::from_utf8_lossy(&out.stdout);
+            let pages: Vec<&str> = text.split('\u{000c}').filter(|p| !p.trim().is_empty()).collect();
+            assert_eq!(pages.len(), 5, "Expected exactly 5 pages, got {}: {pages:?}", pages.len());
+            assert!(pages[0].contains("PAGE_ONE_MARKER"));
+            assert!(pages[1].contains("PAGE_TWO_MARKER"));
+            assert!(pages[2].contains("PAGE_THREE_MARKER"));
+            assert!(pages[3].contains("PAGE_FOUR_MARKER"));
+            assert!(pages[4].contains("PAGE_FIVE_MARKER"));
+            assert!(pages[4].contains("\\newpage"));
+            assert!(pages[4].contains("{{< pagebreak >}}"));
+        }
     }
     let _ = std::fs::remove_file(&path);
 }

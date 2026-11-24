@@ -142,15 +142,31 @@ fn cli_export_renders_vector_diagrams_sized_images_multiline_code_and_page_break
     fs::write(w.file("rich.md"), note).unwrap();
     success(w.run(&["export", "rich.md", "rich.pdf"]));
     pdf(&w.file("rich.pdf"));
+    let pdf_bytes = fs::read(w.file("rich.pdf")).unwrap();
+    let page_objects: usize = [b"/Type /Page".as_slice(), b"/Type/Page".as_slice()]
+        .into_iter()
+        .map(|needle| {
+            pdf_bytes
+                .windows(needle.len())
+                .enumerate()
+                .filter(|(i, win)| *win == needle && !pdf_bytes.get(i + needle.len()).is_some_and(|b| b.is_ascii_alphanumeric()))
+                .count()
+        })
+        .sum();
+    assert!(page_objects >= 2, "Expected at least 2 PDF pages, got {page_objects}");
     if let Ok(out) = Command::new("pdftotext").arg(w.file("rich.pdf")).arg("-").output() {
-        assert!(out.status.success());
-        let text = String::from_utf8_lossy(&out.stdout);
-        let pages: Vec<&str> = text.split('\u{000c}').filter(|p| !p.trim().is_empty()).collect();
-        assert!(pages.len() >= 2);
-        let last = pages.last().unwrap();
-        assert!(last.contains("SECOND_CLI_PAGE"));
-        assert!(last.contains("line two"));
-        assert!(!pages[0].contains("SECOND_CLI_PAGE"));
+        if cfg!(target_os = "linux") && std::env::var_os("SUPERMD_TEST_NON_POPPLER").is_none() {
+            assert!(out.status.success());
+        }
+        if out.status.success() {
+            let text = String::from_utf8_lossy(&out.stdout);
+            let pages: Vec<&str> = text.split('\u{000c}').filter(|p| !p.trim().is_empty()).collect();
+            assert!(pages.len() >= 2);
+            let last = pages.last().unwrap();
+            assert!(last.contains("SECOND_CLI_PAGE"));
+            assert!(last.contains("line two"));
+            assert!(!pages[0].contains("SECOND_CLI_PAGE"));
+        }
     }
 
     fs::write(w.file("unsafe.md"), "```svg\n<svg xmlns=\"http://www.w3.org/2000/svg\"><script>alert(1)</script></svg>\n```").unwrap();
