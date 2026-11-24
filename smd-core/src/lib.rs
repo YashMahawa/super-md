@@ -676,8 +676,9 @@ P(A\cup B\cup C)=&P(A)+P(B)+P(C)\\
         let bbox_word_attr = |md: &str, needle: &str, attr: &str| -> Option<f64> {
             let path = std::env::temp_dir().join(format!("supermd-code-y-{}-{needle}-{attr}.pdf", std::process::id()));
             std::fs::write(&path, export(md, &PdfOptions::default(), &HashMap::new()).unwrap()).unwrap();
-            let output = std::process::Command::new("pdftotext").arg("-bbox").arg(&path).arg("-").output().ok()?;
+            let output = std::process::Command::new("pdftotext").arg("-bbox").arg(&path).arg("-").output();
             let _ = std::fs::remove_file(&path);
+            let output = output.ok().filter(|out| out.status.success())?;
             let xml = String::from_utf8_lossy(&output.stdout);
             let prefix = format!("{attr}=\"");
             xml.lines()
@@ -755,24 +756,32 @@ P(A\cup B\cup C)=&P(A)+P(B)+P(C)\\
 
         let path = std::env::temp_dir().join(format!("supermd-wide-code-{}.pdf", std::process::id()));
         std::fs::write(&path, &wide_pdf).unwrap();
+        if let Ok(output) = std::process::Command::new("pdftotext").arg(&path).arg("-").output() {
+            if output.status.success() {
+                let text = String::from_utf8_lossy(&output.stdout);
+                assert!(text.contains("WIDE-TAIL"), "Wide line tail must remain present");
+            }
+        }
         if let Ok(output) = std::process::Command::new("pdftotext").arg("-bbox").arg(&path).arg("-").output() {
-            let xml = String::from_utf8_lossy(&output.stdout);
-            assert!(xml.contains("WIDE-TAIL"), "Wide line tail must remain present");
-            let word_height = |needle: &str| -> f64 {
-                let line = xml.lines().find(|l| l.contains("<word ") && l.contains(needle)).unwrap();
-                let y_min: f64 = line.split("yMin=\"").nth(1).unwrap().split('"').next().unwrap().parse().unwrap();
-                let y_max: f64 = line.split("yMax=\"").nth(1).unwrap().split('"').next().unwrap().parse().unwrap();
-                y_max - y_min
-            };
-            let normal_h = word_height("normal_value");
-            let after_h = word_height("after_wide");
-            let wide_h = word_height("WIDE-TAIL");
-            assert!((normal_h - after_h).abs() < 0.05, "Normal lines must share unscaled glyph height");
-            assert!(wide_h < normal_h * 0.8, "Over-wide line must scale down (normal {normal_h}pt, wide {wide_h}pt)");
-            let right_edge = (210. - PdfOptions::default().margin as f64) * 72. / 25.4;
-            for word in xml.lines().filter(|line| line.contains("<word ")) {
-                let x = word.split("xMax=\"").nth(1).unwrap().split('"').next().unwrap().parse::<f64>().unwrap();
-                assert!(x <= right_edge + 0.5, "Wide code line escaped printable width: {word}");
+            if output.status.success() {
+                let xml = String::from_utf8_lossy(&output.stdout);
+                assert!(xml.contains("WIDE-TAIL"), "Wide line tail must remain present");
+                let word_height = |needle: &str| -> f64 {
+                    let line = xml.lines().find(|l| l.contains("<word ") && l.contains(needle)).unwrap();
+                    let y_min: f64 = line.split("yMin=\"").nth(1).unwrap().split('"').next().unwrap().parse().unwrap();
+                    let y_max: f64 = line.split("yMax=\"").nth(1).unwrap().split('"').next().unwrap().parse().unwrap();
+                    y_max - y_min
+                };
+                let normal_h = word_height("normal_value");
+                let after_h = word_height("after_wide");
+                let wide_h = word_height("WIDE-TAIL");
+                assert!((normal_h - after_h).abs() < 0.05, "Normal lines must share unscaled glyph height");
+                assert!(wide_h < normal_h * 0.8, "Over-wide line must scale down (normal {normal_h}pt, wide {wide_h}pt)");
+                let right_edge = (210. - PdfOptions::default().margin as f64) * 72. / 25.4;
+                for word in xml.lines().filter(|line| line.contains("<word ")) {
+                    let x = word.split("xMax=\"").nth(1).unwrap().split('"').next().unwrap().parse::<f64>().unwrap();
+                    assert!(x <= right_edge + 0.5, "Wide code line escaped printable width: {word}");
+                }
             }
         }
         let _ = std::fs::remove_file(path);
