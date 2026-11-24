@@ -20,7 +20,13 @@ class ReaderAssetPathTest {
         assertEquals(listOf("notes", "photo.png"), readerAssetPathParts("notes/images", "../photo.png"))
         assertThrows(IllegalStateException::class.java) { readerAssetPathParts("", "../outside.png") }
         assertThrows(IllegalArgumentException::class.java) { readerAssetPathParts("", "images%2f..%2foutside.png") }
+        assertThrows(IllegalArgumentException::class.java) { readerAssetPathParts("", "images%5coutside.png") }
         assertThrows(IllegalArgumentException::class.java) { readerAssetPathParts("", "/etc/passwd") }
+        assertThrows(IllegalArgumentException::class.java) { readerAssetPathParts("", "//cdn.example/photo.png") }
+        assertThrows(IllegalArgumentException::class.java) { readerAssetPathParts("", "file:///etc/passwd") }
+        assertThrows(IllegalArgumentException::class.java) { readerAssetPathParts("", "content://media/external/images/1") }
+        assertThrows(IllegalArgumentException::class.java) { readerAssetPathParts("", "images/photo\u0000.png") }
+        assertThrows(IllegalArgumentException::class.java) { readerAssetPathParts("", "images/photo%00.png") }
     }
 
     @Test fun importedSymlinkCannotEscapeAttachmentRootAndMimeIsAllowlisted() {
@@ -39,6 +45,7 @@ class ReaderAssetPathTest {
                 return
             }
             assertNull(storage.local(source, null))
+            assertThrows(IllegalArgumentException::class.java) { storage.localTarget(source, null) }
             assertEquals("image/png", storage.imageMime("photo.png", "image/png"))
             assertThrows(IllegalArgumentException::class.java) { storage.imageMime("photo.png", "image/x-unknown") }
             assertThrows(IllegalStateException::class.java) { storage.imageMime("photo.unknown", null) }
@@ -84,5 +91,6 @@ class ReaderAssetPathTest {
         assertEquals("no-store", response.responseHeaders["Cache-Control"])
         assertEquals(-1, response.data.read())
         assertEquals(1, opens)
+        assertEquals(0, capabilities.size())
     }
 }
