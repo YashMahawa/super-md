@@ -1,5 +1,5 @@
 import {analyzeDocument} from './documentAnalysis';
-import {agentCharLength} from './agentOperations';
+import {agentCharLength,agentCodePointOffset} from './agentOperations';
 import type {ExportableMedia} from './mediaExport';
 import {mediaAt} from './mediaExport';
 import {invoke} from './nativeBridge';
@@ -15,11 +15,11 @@ export function agentDiagrams(source:string):AgentDiagram[]{
   const definitionsIn=(node:any)=>{if(node.type==='definition')definitions.set(node.identifier,node.url);for(const child of node.children??[])definitionsIn(child);};definitionsIn(tree);
   const walk=(node:any)=>{
     if(node.type==='code'&&['svg','mermaid','smd-chart','smd-tree','smd-diagram'].includes(node.lang)&&node.position){
-      const start=agentCharLength(source.slice(0,node.position.start.offset));
+      const start=agentCodePointOffset(source,node.position.start.offset);
       result.push({id:`diagram:${start}`,kind:node.lang,source:node.value,start:node.position.start.offset,end:node.position.end.offset});
     }
     if(node.type==='code'&&node.lang==='smd-steps'&&node.position){
-      const deck=parseStepDeck(node.value),offset=agentCharLength(source.slice(0,node.position.start.offset));
+      const deck=parseStepDeck(node.value),offset=agentCodePointOffset(source,node.position.start.offset);
       deck?.steps.forEach((step,index)=>{
         if(!step.image&&!step.diagram&&!step.chart)return;
         const kind=step.image?'image':step.diagram?'smd-diagram':'smd-chart';
@@ -28,14 +28,14 @@ export function agentDiagrams(source:string):AgentDiagram[]{
     }
     if(['image','imageReference'].includes(node.type)&&node.position){
       const url=node.type==='image'?node.url:definitions.get(node.identifier);
-      if(url)result.push({id:`diagram:image:${agentCharLength(source.slice(0,node.position.start.offset))}`,kind:'image',url,label:node.alt||'Image',source:source.slice(node.position.start.offset,node.position.end.offset),start:node.position.start.offset,end:node.position.end.offset});
+      if(url)result.push({id:`diagram:image:${agentCodePointOffset(source,node.position.start.offset)}`,kind:'image',url,label:node.alt||'Image',source:source.slice(node.position.start.offset,node.position.end.offset),start:node.position.start.offset,end:node.position.end.offset});
     }
     for(const child of node.children??[])walk(child);
   };
   walk(tree);return result;
 }
 export function diagramMetadata(source:string,diagram:AgentDiagram){
-  return {id:diagram.id,kind:diagram.kind,sourceStart:agentCharLength(source.slice(0,diagram.start)),sourceEnd:agentCharLength(source.slice(0,diagram.end)),sourceChars:agentCharLength(diagram.source),preview:diagram.label||(diagram.kind==='svg'?'SVG drawing':diagram.source.slice(0,160)),...(diagram.deckTitle?{deckTitle:diagram.deckTitle,stepLabel:diagram.stepLabel,stepIndex:diagram.stepIndex,stepCount:diagram.stepCount}:{}),...(diagram.url?{assetReference:diagram.url.startsWith('data:')?'(embedded image)':diagram.url.slice(0,512)}:{})};
+  return {id:diagram.id,kind:diagram.kind,sourceStart:agentCodePointOffset(source,diagram.start),sourceEnd:agentCodePointOffset(source,diagram.end),sourceChars:agentCharLength(diagram.source),preview:diagram.label||(diagram.kind==='svg'?'SVG drawing':diagram.source.slice(0,160)),...(diagram.deckTitle?{deckTitle:diagram.deckTitle,stepLabel:diagram.stepLabel,stepIndex:diagram.stepIndex,stepCount:diagram.stepCount}:{}),...(diagram.url?{assetReference:diagram.url.startsWith('data:')?'(embedded image)':diagram.url.slice(0,512)}:{})};
 }
 export async function diagramMedia(diagram:AgentDiagram,documentPath:string|null=null):Promise<ExportableMedia>{
   if(diagram.kind==='image'){

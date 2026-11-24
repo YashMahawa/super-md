@@ -3,11 +3,69 @@
 import {analyzeDocument} from './documentAnalysis';
 export type AgentPatch = {type:'replace';old:string;new:string;count?:1|'all';expectedCount?:number} | {type:'lines';start_line:number;end_line:number;text:string} | {type:'insert';line:number;text:string};
 const encoder=new TextEncoder();
-export function agentCharLength(text:string):number {let size=0;for(const _ of text)size++;return size;}
+const checkpointStride=512;
+const maxIndexedCodeUnits=8_000_000;
+const unicodeOffsets=new Map<string,{points:number;checkpoints:number[]}>();
+let retainedCodeUnits=0;
+
+function codePointWidth(text:string,index:number,end=text.length):number {
+  return index+1<end&&text.codePointAt(index)!>0xffff?2:1;
+}
+function codePointCount(text:string,start:number,end:number):number {
+  let count=0;
+  while(start<end){start+=codePointWidth(text,start,end);count++;}
+  return count;
+}
+function offsetIndex(text:string) {
+  const cached=unicodeOffsets.get(text);
+  if(cached){unicodeOffsets.delete(text);unicodeOffsets.set(text,cached);return cached;}
+  let points=0,index=0;
+  const checkpoints=[0];
+  while(index<text.length){
+    index+=codePointWidth(text,index);
+    if(++points%checkpointStride===0)checkpoints.push(index);
+  }
+  const result={points,checkpoints};
+  if(text.length<=maxIndexedCodeUnits){
+    while(retainedCodeUnits+text.length>maxIndexedCodeUnits||unicodeOffsets.size>=8){
+      const first=unicodeOffsets.keys().next().value!;
+      retainedCodeUnits-=first.length;
+      unicodeOffsets.delete(first);
+    }
+    unicodeOffsets.set(text,result);
+    retainedCodeUnits+=text.length;
+  }
+  return result;
+}
+export function agentCharLength(text:string):number {
+  return text.length>=checkpointStride&&text.length<=maxIndexedCodeUnits?offsetIndex(text).points:codePointCount(text,0,text.length);
+}
 export function agentUtf16Offset(text:string,offset:number):number {
   if(!Number.isInteger(offset)||offset<0)throw Error('offset must be a non-negative Unicode character offset');
-  let chars=0,index=0;while(index<text.length&&chars<offset){index+=text.codePointAt(index)!>0xffff?2:1;chars++;}
+  if(!offset)return 0;
+  let chars=0,index=0;
+  if(text.length>=checkpointStride&&text.length<=maxIndexedCodeUnits){
+    const {points,checkpoints}=offsetIndex(text);
+    if(offset>points)throw Error('offset is beyond the document');
+    if(points===text.length)return offset;
+    const section=Math.floor(offset/checkpointStride);
+    chars=section*checkpointStride;
+    index=checkpoints[section];
+  }
+  while(index<text.length&&chars<offset){index+=codePointWidth(text,index);chars++;}
   if(chars!==offset)throw Error('offset is beyond the document');return index;
+}
+export function agentCodePointOffset(text:string,utf16Offset:number):number {
+  if(text.length<checkpointStride||text.length>maxIndexedCodeUnits)return codePointCount(text,0,utf16Offset);
+  const {points,checkpoints}=offsetIndex(text);
+  if(points===text.length)return utf16Offset;
+  let first=0,last=checkpoints.length-1;
+  while(first<last){
+    const middle=Math.ceil((first+last)/2);
+    if(checkpoints[middle]<=utf16Offset)first=middle;
+    else last=middle-1;
+  }
+  return first*checkpointStride+codePointCount(text,checkpoints[first],utf16Offset);
 }
 export async function agentRevision(text:string):Promise<string> {
   const hash=await crypto.subtle.digest('SHA-256',encoder.encode(text));

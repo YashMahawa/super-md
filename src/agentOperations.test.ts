@@ -1,10 +1,21 @@
 import {describe,it,expect} from 'vitest';
-import {applyAgentPatches,applyAgentPatchesDetailed,agentRead,agentSearch,agentOutline,agentOutlinePage,agentSection,agentSectionForExport} from './agentOperations';
+import {applyAgentPatches,applyAgentPatchesDetailed,agentRead,agentSearch,agentOutline,agentOutlinePage,agentSection,agentSectionForExport,agentCodePointOffset,agentUtf16Offset} from './agentOperations';
 describe('live agent document operations',()=>{
   it('uses Unicode code points without splitting emoji',()=>{
     expect(agentRead('α😀z',1,1).text).toBe('😀');
     expect(agentSearch('😀 prefix\nword 😀 word','word',2,0).matches.map(match=>[match.offset,match.line])).toEqual([[9,2],[16,2]]);
     expect(agentSearch('😀x','x',1,1).matches[0]).toMatchObject({offset:1,matchOffset:1,matchLength:1,snippetOffset:0,text:'😀x'});
+  });
+  it('round-trips indexed offsets at astral and isolated surrogate boundaries',()=>{
+    const source='a'.repeat(510)+'😀\ud800'+'b😀'.repeat(2500)+'\udc00';
+    const points=Array.from(source);
+    for(const offset of [0,510,511,512,513,1024,points.length-1,points.length]){
+      const utf16=points.slice(0,offset).join('').length;
+      expect(agentUtf16Offset(source,offset)).toBe(utf16);
+      expect(agentCodePointOffset(source,utf16)).toBe(offset);
+    }
+    expect(agentCodePointOffset(source,511)).toBe(511);
+    expect(()=>agentUtf16Offset(source,points.length+1)).toThrow('beyond');
   });
   it('elides fenced SVG in prose reads while keeping exact Unicode source offsets available',()=>{
     const svg='<svg>😀'+('<path/>'.repeat(20_000))+'</svg>';
