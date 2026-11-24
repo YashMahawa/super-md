@@ -1,6 +1,6 @@
 import { useEffect, useRef, useState } from "react";
 import { setReaderOverlay } from "../readerOverlays";
-import {ArrowUp,ArrowDown,X,TextAa,ArrowsClockwise} from "@phosphor-icons/react";
+import {ArrowUpIcon,ArrowDownIcon,XIcon,TextAaIcon,ArrowsClockwiseIcon} from "@phosphor-icons/react";
 import {editorFindQuery,editorFindRange} from "./Editor";
 import {windowedMatches,revealWindowed,type WindowedMatch} from "../windowedSearch";
 import {cancelHeadingNavigation} from '../documentNavigation';
@@ -108,11 +108,11 @@ export default function ReadingSearch({content,close,onChange,sourceSession}:{co
   return <aside className="reading-search" data-independent-zoom role="search" aria-label="Find in note">
     <input ref={input} aria-label="Find in note" role="searchbox" type="text" inputMode="search" autoCapitalize="none" autoCorrect="off" spellCheck={false} placeholder="Find in this note" value={query} onChange={event=>setQuery(event.target.value)} onKeyDown={event=>{if(event.key==="Enter"){event.preventDefault();move(event.shiftKey?-1:1);}}}/>
     <output aria-live="polite" title={count>=5000?'Showing the first 5,000 matches. Narrow your search to find later results.':undefined}>{count ? `${index<0 ? 0 : index+1} / ${count}${count>=5000?'+':''}` : query ? "No matches" : ""}</output>
-    <button className="search-icon" aria-label="Previous match" disabled={!count} onClick={()=>move(-1)} title="Previous match (Shift+Enter)"><ArrowUp size={20} weight="bold"/></button>
-    <button className="search-icon" aria-label="Next match" disabled={!count} onClick={()=>move(1)} title="Next match (Enter)"><ArrowDown size={20} weight="bold"/></button>
-    <button className="search-icon" aria-pressed={caseSensitive} onClick={()=>setCaseSensitive(!caseSensitive)} title="Match case" aria-label="Match case"><TextAa size={20} weight="bold"/></button>
-    {onChange&&<button className="search-icon" aria-pressed={replacing} onClick={()=>setReplacing(!replacing)} title="Replace in source" aria-label="Replace in source"><ArrowsClockwise size={20} weight="bold"/></button>}
-    <button className="search-icon" onClick={close} title="Close search (Esc)" aria-label="Close search"><X size={20} weight="bold"/></button>
+    <button className="search-icon" aria-label="Previous match" disabled={!count} onClick={()=>move(-1)} title="Previous match (Shift+Enter)"><ArrowUpIcon size={20} weight="bold"/></button>
+    <button className="search-icon" aria-label="Next match" disabled={!count} onClick={()=>move(1)} title="Next match (Enter)"><ArrowDownIcon size={20} weight="bold"/></button>
+    <button className="search-icon" aria-pressed={caseSensitive} onClick={()=>setCaseSensitive(!caseSensitive)} title="Match case" aria-label="Match case"><TextAaIcon size={20} weight="bold"/></button>
+    {onChange&&<button className="search-icon" aria-pressed={replacing} onClick={()=>setReplacing(!replacing)} title="Replace in source" aria-label="Replace in source"><ArrowsClockwiseIcon size={20} weight="bold"/></button>}
+    <button className="search-icon" onClick={close} title="Close search (Esc)" aria-label="Close search"><XIcon size={20} weight="bold"/></button>
     {replacing&&onChange&&<div className="search-replace"><input aria-label="Replacement text" placeholder="Replace with" value={replacement} onChange={e=>setReplacement(e.target.value)}/><button disabled={!query} onClick={()=>onChange(replaceSourceMatches(content,query,replacement,caseSensitive,Math.max(0,index)))}>Replace</button><button disabled={!query} onClick={()=>onChange(replaceSourceMatches(content,query,replacement,caseSensitive))}>Replace all</button><small>Replaces literal text in Markdown source.</small></div>}
   </aside>;
 }
