@@ -29,6 +29,7 @@ instead of retrying the same failed pixel request. Older relays without
 
 | Task | Local MCP | Cloud MCP |
 |---|---|---|
+| Current page or highlighted text (use first) | `view_current(path=TARGET?, includeImage=True, width?, quality?)` | `view_current(deviceId?, tabId?, includeImage=true, width?, quality?)` |
 | Discover devices/tabs | `document_action(action="list_devices")`, `list_sessions()` | `list_devices()`, `list_tabs(deviceId)` |
 | Visible Markdown, selection, position and diagram references | `document_action(action="get_context", path=TARGET)` | `document_action(documentAction="get_context", deviceId, tabId)` |
 | Actual current viewport pixels | `document_view(path=TARGET, width=1200)` | `render_tab(deviceId, tabId, width=1200)` |
@@ -47,13 +48,21 @@ Desktop close can return `status:"closing"` while its recovery snapshot is
 written. Refresh the tab/session list until that target disappears before
 assuming its replacement tab has focus; do not send the close again.
 
-For “explain what I am looking at”, read context and take a viewport screenshot.
+For “explain what I am looking at”, call `view_current` on either the local MCP
+server or the cloud relay (falling back to `get_context` plus `document_view` /
+`render_tab` only on older servers without `view_current`). `view_current` and
+`get_context` report mode-aware visible text and selections across Reader,
+Source, Split, and Live `<textarea>` modes, active `StepCards` and portaled
+`.step-viewer` slides (`deckTitle`, `stepLabel`, `stepIndex`, `stepCount`,
+`activeStep`), and bounded `pythonCells` (`stdout`, `stderr`, `ok`, `figureIds`)
+for already-executed cells without running code.
 Use the returned visible source offsets to fetch exact Markdown if needed;
 visible text alone is not necessarily exact Markdown. Fetch the relevant
 diagram's source for reasoning/editing and its preview for visual inspection. A
 viewport screenshot shows the current theme, zoom and scroll position; a
-diagram preview shows that diagram alone. Neither is a substitute for original
-editable SVG/Mermaid source.
+diagram preview shows that diagram alone (including cached
+`diagram:python:<offset>:<index>` Matplotlib figures). Neither is a substitute
+for original editable SVG/Mermaid source.
 
 Request only relevant pages and media. Ordinary reads omit large fenced SVG
 bodies; choose `view="source"` for exact source and follow the returned cursor,
@@ -71,9 +80,9 @@ page `document_action(documentAction="outline", tabId,
 options:{offset:0,limit:80})`; each page contains up to 80 headings with their
 `sectionStart`/`sectionEnd` bounds, plus `nextOffset` and `documentLength` metadata.
 
-## Retrieve a slider frame directly
+## Retrieve a slider frame or cached Python figure directly
 
-In builds with slider-frame indexing, `list_diagrams`/cloud `diagram_action(diagramAction="list")` includes each visual frame, with `deckTitle`, `stepLabel`, zero-based `stepIndex`, `stepCount`, readable `preview` and `assetReference` when backed by an image. List bounded metadata once, select the process/step by these fields, then request `get_diagram_image`/cloud `diagram_action(diagramAction="image")` using that frame's ID and current revision. This does not advance the slider or require opening every frame. Text-only steps are not diagrams. Standalone declarative trees and diagrams are indexed too.
+In builds with slider-frame and Python-figure indexing, `list_diagrams`/cloud `diagram_action(diagramAction="list")` includes each visual slide frame (`deckTitle`, `stepLabel`, zero-based `stepIndex`, `stepCount`, `activeStep` in `get_context`/`view_current`, readable `preview`, and `assetReference` when backed by an image) as well as cached Matplotlib figures (`diagram:python:<offset>:<index>`). List bounded metadata once, select the frame or figure by these fields, then request `get_diagram_image`/local `document_view(path=TARGET, diagram_id=ID, expected_revision=REV)`/cloud `diagram_action(diagramAction="image")` using that ID and current revision. This does not advance the slider, execute unrun Python cells, or require opening every frame. Text-only steps are reported via `activeStep` and `reading.visibleText` in `get_context`/`view_current` rather than as diagrams. Standalone declarative trees and diagrams are indexed too.
 
 For the live CLI, use `super-md agent live --sessions-dir PRIVATE_DIR diagrams TAB --limit 80`; select the returned frame ID, then `super-md agent live --sessions-dir PRIVATE_DIR diagram-image TAB FRAME_ID OUTPUT.png --revision REV --width 1600`. Use the existing private discovery directory from setup; never print its credentials. Follow `nextOffset` for long listings. For original SVG instead of raster previews, use the listed `assetReference` with asset source/extract; read declarative frame source using `diagram TAB FRAME_ID --revision REV`. IDs are revision-relative: refresh after edits. On older installations that omit slider frames, inspect only the relevant `smd-steps` block and extract its exact image asset, rather than reading the entire note or repeatedly rendering the viewport.
 
