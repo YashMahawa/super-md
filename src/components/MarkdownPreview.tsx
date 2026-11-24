@@ -1,10 +1,9 @@
 import { Children, isValidElement, lazy, memo, Suspense, useContext, useEffect, useMemo, useRef, useState, type ReactNode } from "react";
 import { invoke } from "../nativeBridge";
 import CachedMarkdown,{type MarkdownBlockRenderer} from "./CachedMarkdown";
-import remarkGfm from "remark-gfm";
-import remarkMath from "remark-math";
 import rehypeKatex from "rehype-katex";
 import rehypeHighlight from "rehype-highlight";
+import type { PluggableList } from "unified";
 import { visit } from "unist-util-visit";
 import InteractiveChart from "./InteractiveChart";
 import StepCards from "./StepCards";
@@ -12,8 +11,6 @@ import InlineDiagram,{parseDiagramSource} from "./InlineDiagram";
 import {parseBinaryTreeSource} from "./BinaryTree";
 import PythonCell from "./PythonCell";
 import SvgDiagram from "./SvgDiagram";
-import { remarkSvgBlocks } from "../svgBlocks";
-import { remarkObsidianMath } from "../obsidianMath";
 import { navigateHeading, remarkHeadingIds } from "../documentNavigation";
 import { selectedMarkdown, setSelectedMarkdownDrag } from "../copySource";
 import CopyCode from "./CopyCode";
@@ -23,7 +20,7 @@ import {svgDataBackdrop} from '../svgImage';
 import {adaptSvgData} from '../svgTheme';
 import {analyzeDocument} from '../documentAnalysis';
 import type {SourceDocumentAnalysis} from '../documentAnalysis';
-import {resolveReaderRasterAsset} from '../readerAssets';
+import {isSvgAssetPath,resolveReaderRasterAsset} from '../readerAssets';
 import {commitMediaLayout} from '../mediaLayout';
 import {registerMedia,installMediaMenu} from '../mediaExport';
 import type {ReaderAccessibilityPreference} from '../types';
@@ -98,7 +95,11 @@ export function remarkCallouts() {
   });
 }
 
-function AssetImage({ src = "", alt = "", documentPath, trustedImageHosts, onTrustImageHost }: { src?: string; alt?: string; documentPath: string | null; trustedImageHosts: string[]; onTrustImageHost?: (host: string) => void }) {
+export const DIAGRAM_PLAIN_TEXT_LANGUAGES = ["svg", "mermaid", "smd-tree", "smd-diagram", "smd-steps", "smd-chart"] as const;
+export const PREVIEW_REMARK_PLUGINS: PluggableList = [remarkCallouts, remarkHeadingIds, remarkTaskPositions, remarkSourcePositions];
+export const PREVIEW_REHYPE_PLUGINS: PluggableList = [rehypeKatex, [rehypeHighlight, { plainText: [...DIAGRAM_PLAIN_TEXT_LANGUAGES] }]];
+
+function AssetImage({ src = "", alt = "", documentPath, trustedImageHosts, onTrustImageHost, editable = false }: { src?: string; alt?: string; documentPath: string | null; trustedImageHosts: string[]; onTrustImageHost?: (host: string) => void; editable?: boolean }) {
   const isRemote = /^https?:\/\//i.test(src);
   const embedded = /^(data:|blob:)/i.test(src);
   let host = "";
@@ -109,7 +110,6 @@ function AssetImage({ src = "", alt = "", documentPath, trustedImageHosts, onTru
   const [allowedOnceSource, setAllowedOnceSource] = useState<string | null>(null);
   const [resolved, setResolved] = useState(embedded ? src : "");
   const [error, setError] = useState("");
-  const [selected, setSelected] = useState(false);
   const mediaElement=useRef<HTMLSpanElement>(null);
   const imageElement=useRef<HTMLImageElement>(null);
   const [sizedSource,setSizedSource]=useState('');
@@ -155,7 +155,7 @@ function AssetImage({ src = "", alt = "", documentPath, trustedImageHosts, onTru
     if (!documentPath && !/^assets\/import-[\w-]+\./.test(src)) { queueMicrotask(()=>fail("Save this document to resolve relative images.")); return ()=>{active=false;}; }
     (async () => {
       try {
-        const streamed = documentPath ? await resolveReaderRasterAsset(documentPath, src) : null;
+        const streamed = documentPath && !isSvgAssetPath(src) ? await resolveReaderRasterAsset(documentPath, src) : null;
         if (!active) return;
         if (streamed) { commitMediaLayout(mediaElement.current,()=>setResolved(streamed)); return; }
         const value = await invoke<string>("load_asset", { documentPath: documentPath || "", source: src });
@@ -171,14 +171,14 @@ function AssetImage({ src = "", alt = "", documentPath, trustedImageHosts, onTru
     const svg=resolved.startsWith('data:image/svg+xml');
     return registerMedia(imageElement.current,{label:alt||'Image',uri:()=>resolved,...(svg?{svg:()=>{const comma=resolved.indexOf(',');return resolved.slice(0,comma).includes(';base64')?new TextDecoder().decode(Uint8Array.from(atob(resolved.slice(comma+1)),value=>value.charCodeAt(0))):decodeURIComponent(resolved.slice(comma+1));}}:{})});
   },[resolved,error,isRemote,allowed,alt]);
-  if (isRemote && !allowed) return <span ref={mediaElement} className="remote-image-card" role="group" aria-label={`Remote image from ${host}`}><span><strong>{alt || "Remote image"}</strong><small>{host} · blocked until you choose to load it</small></span><span className="remote-image-actions"><button onClick={() => setAllowedOnceSource(src)}>Load image</button>{onTrustImageHost && <button onClick={() => onTrustImageHost(host)}>Trust domain</button>}</span></span>;
-  if (error) return <span ref={mediaElement} className="image-error" role="img" aria-label={alt || "Image unavailable"}>Image unavailable: {alt || src}<small>{error}</small></span>;
+  const readonlyAttr = editable ? undefined : "true";
+  if (isRemote && !allowed) return <span ref={mediaElement} className="remote-image-card" data-note-image-source={src} data-note-image-readonly={readonlyAttr} role="group" aria-label={`Remote image from ${host}`}><span><strong>{alt || "Remote image"}</strong><small>{host} · blocked until you choose to load it</small></span><span className="remote-image-actions"><button type="button" onClick={() => setAllowedOnceSource(src)}>Load image</button>{onTrustImageHost && <button type="button" onClick={() => onTrustImageHost(host)}>Trust domain</button>}</span></span>;
+  if (error) return <span ref={mediaElement} className="image-error" data-note-image-source={src} data-note-image-readonly={readonlyAttr} role={editable ? "group" : "img"} aria-label={alt || "Image unavailable"}><span>Image unavailable: {alt || src}<small>{error}</small></span>{editable && <span className="image-error-actions"><button type="button" onClick={(event) => { event.stopPropagation(); window.dispatchEvent(new CustomEvent("supermd-image-edit", { detail: { action: "replace", image: event.currentTarget.closest("[data-note-image-source]") } })); }}>Replace</button><button type="button" onClick={(event) => { event.stopPropagation(); window.dispatchEvent(new CustomEvent("supermd-image-edit", { detail: { action: "remove", image: event.currentTarget.closest("[data-note-image-source]") } })); }}>Remove</button></span>}</span>;
   if (!resolved) return <span ref={mediaElement} className="image-loading" role="status">Loading image…</span>;
   const sizing=sizedSource!==resolved;
-  return <span ref={mediaElement} className={`note-image ${resolved.startsWith('data:image/svg+xml')?'note-image--diagram':''} ${sizing?'image-loading':''} ${selected ? "is-selected" : ""}`} style={sizing?{width:'100%',boxSizing:'border-box'}:undefined} data-note-image-source={src} tabIndex={0} aria-label={`Image: ${alt || "Image"}`} onBlur={(event) => { if (!event.currentTarget.contains(event.relatedTarget)) setSelected(false); }} onContextMenu={(event) => { event.preventDefault(); event.stopPropagation(); setSelected(true); event.currentTarget.focus(); }} onKeyDown={(event) => { if (event.key === "Escape") { setSelected(false); event.stopPropagation(); } }}>
+  return <span ref={mediaElement} className={`note-image ${resolved.startsWith('data:image/svg+xml')?'note-image--diagram':''} ${sizing?'image-loading':''}`} style={sizing?{width:'100%',boxSizing:'border-box'}:undefined} data-note-image-source={src} data-note-image-readonly={readonlyAttr} tabIndex={0} aria-label={`Image: ${alt || "Image"}`}>
     {sizing&&<span role="status">Loading image…</span>}
     <img ref={imageElement} draggable={false} data-media-adapted={adaptsSvg&&svgBacking?'true':undefined} data-media-kind={resolved.startsWith('data:image/svg+xml')?'svg':'image'} data-light-ink={svgBacking==='#222026'?'true':undefined} style={{...(svgBacking?{'--svg-contrast-backing':svgBacking}:{}),...(sizing?{position:'absolute',height:0,visibility:'hidden'}:{})} as React.CSSProperties} src={adaptedSource} alt={alt} loading="lazy" decoding="async" onLoad={()=>{if(sizedSource!==resolved)commitMediaLayout(imageElement.current,()=>setSizedSource(resolved));}} onError={() => commitMediaLayout(imageElement.current,()=>setError("The image could not be decoded or loaded."))} />
-    {selected && <span className="image-edit-tools" role="toolbar" aria-label="Selected image"><button onClick={(event) => { event.stopPropagation(); window.dispatchEvent(new CustomEvent("supermd-image-edit", { detail: { action: "replace", image: event.currentTarget.closest("[data-note-image-source]") } })); }}>Replace</button><button onClick={(event) => { event.stopPropagation(); window.dispatchEvent(new CustomEvent("supermd-image-edit", { detail: { action: "remove", image: event.currentTarget.closest("[data-note-image-source]") } })); }}>Remove</button></span>}
   </span>;
 }
 
@@ -198,13 +198,14 @@ function MarkdownPreview({ markdown, documentPath, python, dark, trustedImageHos
   useEffect(installMediaMenu,[]);
   const analysis=useMemo(()=>sourceAnalysis?.source===markdown?sourceAnalysis.analysis:analyzeDocument(markdown),[markdown,sourceAnalysis]);
   const tasks=onChange?analysis.tasks:[];
-  const stateRef=useRef({markdown,documentPath,python,dark,trustedImageHosts,onTrustImageHost,onChange,analysis,tasks});
-  stateRef.current={markdown,documentPath,python,dark,trustedImageHosts,onTrustImageHost,onChange,analysis,tasks};
+  const editable = Boolean(onChange);
+  const stateRef=useRef({markdown,documentPath,python,dark,trustedImageHosts,onTrustImageHost,onChange,editable,analysis,tasks});
+  stateRef.current={markdown,documentPath,python,dark,trustedImageHosts,onTrustImageHost,onChange,editable,analysis,tasks};
   const components=useMemo<Components>(()=>({
     p: MarkdownParagraph,
     input: ({node: _node,...props}) => <input {...props} disabled={!stateRef.current.onChange} onChange={()=>{}} />,
     li: ({node,children,...props}) => <li {...props} className={Array.isArray(node?.properties.className)?node.properties.className.join(' '):undefined} onChange={event=>{const {tasks:currentTasks,onChange:handleChange,markdown:sourceText}=stateRef.current;const index=Number(node?.properties['data-task-index']);const offset=currentTasks[index];if(offset===undefined || !handleChange || !(event.target instanceof HTMLInputElement))return;handleChange(sourceText.slice(0,offset)+(event.target.checked?'x':' ')+sourceText.slice(offset+1));}}>{children}</li>,
-    img: ({src,alt}) => {const {documentPath:docPath,trustedImageHosts:hosts,onTrustImageHost:trustHost}=stateRef.current;return <AssetImage src={src} alt={alt} documentPath={docPath} trustedImageHosts={hosts} onTrustImageHost={trustHost}/>;},
+    img: ({src,alt}) => {const {documentPath:docPath,trustedImageHosts:hosts,onTrustImageHost:trustHost,editable:isEditable}=stateRef.current;return <AssetImage src={src} alt={alt} documentPath={docPath} trustedImageHosts={hosts} onTrustImageHost={trustHost} editable={isEditable}/>;},
     a: ({node:_node,href,children,...props}) => <a {...props} href={href} target={href?.startsWith("#") ? undefined : "_blank"} rel="noreferrer" onClick={event => { if (navigateHeading(event.currentTarget)) { event.preventDefault(); event.stopPropagation(); } else event.currentTarget.dataset.visited='true'; }}>{children}</a>,
     pre: ({ node, children }) => {
       const {markdown:sourceText,documentPath:docPath,python:py,dark:isDark,trustedImageHosts:hosts,onTrustImageHost:trustHost,analysis:docAnalysis}=stateRef.current;
@@ -238,8 +239,8 @@ function MarkdownPreview({ markdown, documentPath, python, dark, trustedImageHos
         sourceAnalysis={{source:markdown,analysis}}
         renderBlock={renderBlock}
         windowingEnabled={!fullDocumentAccessibility}
-        remarkPlugins={[remarkGfm, remarkMath, remarkObsidianMath, remarkSvgBlocks, remarkCallouts, remarkHeadingIds, remarkTaskPositions,remarkSourcePositions]}
-        rehypePlugins={[rehypeKatex, rehypeHighlight]}
+        remarkPlugins={PREVIEW_REMARK_PLUGINS}
+        rehypePlugins={PREVIEW_REHYPE_PLUGINS}
         components={components}
       >{markdown}</CachedMarkdown>
     </article>
