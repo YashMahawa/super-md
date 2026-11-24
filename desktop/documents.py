@@ -31,8 +31,8 @@ _B64_DECODE_CHUNK = 262_144    # 256 KiB chars (multiple of 4)
 _B64_ENCODE_CHUNK = 196_608    # 192 KiB bytes (multiple of 3)
 
 
-def decode_base64_chunks(encoded: str, max_bytes: int | None = None) -> list[bytes]:
-    """Strictly decode base64 into bounded byte chunks without joining a monolithic buffer."""
+def decode_base64_chunked(encoded: str, max_bytes: int | None = None) -> bytes:
+    """Strictly decode base64 in bounded slices so large images never monopolize the GIL."""
     if not isinstance(encoded, str):
         raise ValueError("Expected a base64 string")
     total_chars = len(encoded)
@@ -40,7 +40,7 @@ def decode_base64_chunks(encoded: str, max_bytes: int | None = None) -> list[byt
         decoded = base64.b64decode(encoded, validate=True)
         if max_bytes is not None and len(decoded) > max_bytes:
             raise ValueError(f"Decoded data exceeds {max_bytes} bytes")
-        return [decoded] if decoded else []
+        return decoded
     parts: list[bytes] = []
     decoded_len = 0
     for offset in range(0, total_chars, _B64_DECODE_CHUNK):
@@ -53,15 +53,7 @@ def decode_base64_chunks(encoded: str, max_bytes: int | None = None) -> list[byt
             raise ValueError(f"Decoded data exceeds {max_bytes} bytes")
         if piece:
             parts.append(piece)
-    return parts
-
-
-def decode_base64_chunked(encoded: str, max_bytes: int | None = None) -> bytes:
-    """Strictly decode base64 in bounded slices so large images never monopolize the GIL."""
-    parts = decode_base64_chunks(encoded, max_bytes=max_bytes)
-    if not parts:
-        return b""
-    return parts[0] if len(parts) == 1 else b"".join(parts)
+    return b"".join(parts)
 
 
 def encode_base64_chunked(raw: bytes) -> str:

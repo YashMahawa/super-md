@@ -2,7 +2,7 @@
 import {afterEach,expect,it} from "vitest";
 import {renderToStaticMarkup} from "react-dom/server";
 import MarkdownPreview from "./components/MarkdownPreview";
-import {selectedMarkdown,setSelectedMarkdownDrag} from "./copySource";
+import {extractSelectedText,hasSelectedText,selectedMarkdown,setSelectedMarkdownDrag} from "./copySource";
 import {readingMatches} from "./components/ReadingSearch";
 afterEach(()=>{
   window.getSelection()?.removeAllRanges();
@@ -75,4 +75,96 @@ it("preserves table structure, quotes, separators and checkboxes when copying",(
   const host=document.createElement("article");host.className="markdown-body";host.innerHTML='<table><thead><tr><th>Model</th><th>Value</th></tr></thead><tbody><tr><td><strong>Coin</strong></td><td>Heads | tails</td></tr></tbody></table><blockquote><p>A quoted note</p></blockquote><hr><ul><li><input type="checkbox" checked>Complete</li></ul>';document.body.append(host);
   const range=document.createRange();range.selectNodeContents(host);const selection=window.getSelection()!;selection.removeAllRanges();selection.addRange(range);
   expect(selectedMarkdown(selection)).toBe('| Model | Value |\n| --- | --- |\n| **Coin** | Heads \\| tails |\n\n> A quoted note\n\n\n---\n\n- [x] Complete');selection.removeAllRanges();host.remove();
+});
+it("serializes partial table row and multi-cell selections as pipe-delimited Markdown",()=>{
+  const md="| Name | Complexity | Space |\n| --- | --- | --- |\n| Merge | $O(n \\log n)$ | $O(n)$ |\n| Heap | $O(n \\log n)$ | $O(1)$ |\n| Quick | $O(n^2)$ | $O(\\log n)$ |";
+  const host=document.createElement("div");host.innerHTML=renderToStaticMarkup(<MarkdownPreview markdown={md} documentPath={null} python="" dark={false}/>);document.body.append(host);
+  const selection=window.getSelection()!,range=document.createRange();
+  const headRow=host.querySelector("thead tr")!;
+  const bodyRows=host.querySelectorAll("tbody tr");
+
+  // Header + first body row, with browser boundary endpoint resting at start of second body row
+  range.setStart(headRow,0);range.setEnd(bodyRows[1],0);selection.removeAllRanges();selection.addRange(range);
+  expect(selectedMarkdown(selection)).toBe("| Name | Complexity | Space |\n| --- | --- | --- |\n| Merge | $O(n \\log n)$ | $O(n)$ |");
+
+  // Multi-row selection within tbody
+  range.setStartBefore(bodyRows[0]);range.setEndAfter(bodyRows[1]);selection.removeAllRanges();selection.addRange(range);
+  expect(selectedMarkdown(selection)).toBe("| Merge | $O(n \\log n)$ | $O(n)$ |\n| --- | --- | --- |\n| Heap | $O(n \\log n)$ | $O(1)$ |");
+
+  // Multi-cell selection within a single row, with boundary endpoint resting at start of third cell
+  const cells=bodyRows[2].querySelectorAll("td");
+  range.setStart(cells[0],0);range.setEnd(cells[2],0);selection.removeAllRanges();selection.addRange(range);
+  expect(selectedMarkdown(selection)).toBe("| Quick | $O(n^2)$ |\n| --- | --- |");
+
+  // Single-cell selection remains plain cell Markdown rather than a 1x1 table
+  range.selectNodeContents(cells[1]);selection.removeAllRanges();selection.addRange(range);
+  expect(selectedMarkdown(selection)).toBe("$O(n^2)$");
+  selection.removeAllRanges();host.remove();
+});
+it("preserves unescaped pipes in inline math and code spans while escaping literal table cell pipes",()=>{
+  const md="| Expression | Norm | Code | Notes |\n| --- | --- | --- | --- |\n| $P(A|B)$ | $|x| + |y|$ | `a \\| b` | Heads \\| tails |";
+  const host=document.createElement("div");host.innerHTML=renderToStaticMarkup(<MarkdownPreview markdown={md} documentPath={null} python="" dark={false}/>);document.body.append(host);
+  const selection=window.getSelection()!,range=document.createRange();
+  range.selectNodeContents(host.firstElementChild!);selection.removeAllRanges();selection.addRange(range);
+  expect(selectedMarkdown(selection)).toBe("| Expression | Norm | Code | Notes |\n| --- | --- | --- | --- |\n| $P(A|B)$ | $|x| + |y|$ | `a | b` | Heads \\| tails |");
+
+  const cells=host.querySelectorAll("tbody td");
+  range.setStartBefore(cells[0]);range.setEndAfter(cells[3]);selection.removeAllRanges();selection.addRange(range);
+  expect(selectedMarkdown(selection)).toBe("| $P(A|B)$ | $|x| + |y|$ | `a | b` | Heads \\| tails |\n| --- | --- | --- | --- |");
+
+  // Selecting text inside the literal-pipe cell alone does not escape pipes outside table row context
+  range.selectNodeContents(cells[3]);selection.removeAllRanges();selection.addRange(range);
+  expect(selectedMarkdown(selection)).toBe("Heads | tails");
+  selection.removeAllRanges();host.remove();
+});
+it("extracts source-aware text across rendered math, offscreen blocks, live textareas, inputs, and editor fallback",()=>{
+  const md="Inline $\\alpha + |x|$ and display:\n\n$$\\int_0^1 x^2\\,dx$$";
+  const host=document.createElement("div");host.className="live-document";
+  host.innerHTML=renderToStaticMarkup(<MarkdownPreview markdown={md} documentPath={null} python="" dark={false}/>);
+  const area=document.createElement("textarea");area.value="Raw **live** $a|b$ block";
+  const input=document.createElement("input");input.value="Search query field";
+  host.append(area,input);document.body.append(host);
+
+  const selection=window.getSelection()!,range=document.createRange();
+  // Partial selection starting inside KaTeX rendered glyphs expands to clean LaTeX source matching Copy
+  const katexHtml=host.querySelector(".katex .katex-html")!;
+  const displayKatex=host.querySelector(".katex-display .katex-html")!;
+  range.setStart(katexHtml,0);range.setEnd(displayKatex,1);selection.removeAllRanges();selection.addRange(range);
+  const extractedMath=extractSelectedText({source:md});
+  expect(extractedMath).toBe(selectedMarkdown(selection,md));
+  expect(extractedMath).toContain("$\\alpha + |x|$ and display:");
+  expect(extractedMath).toContain("$$\n\\int_0^1 x^2\\,dx\n$$");
+  expect(hasSelectedText()).toBe(true);
+
+  // Active textarea inside .live-document returns raw textarea slice instead of DOM selection
+  area.focus();area.setSelectionRange(4,18);
+  expect(extractSelectedText({source:md})).toBe("**live** $a|b$");
+  expect(hasSelectedText()).toBe(true);
+  area.setSelectionRange(2,2);
+
+  // Active input returns raw input slice
+  input.focus();input.setSelectionRange(0,12);
+  expect(extractSelectedText({source:md})).toBe("Search query");
+  input.setSelectionRange(0,0);input.blur();
+
+  // Offscreen unmounted virtualized block alone uses source offsets
+  selection.removeAllRanges();
+  const offscreenDoc="Header\n\n$$E = mc^2$$\n\nFooter";
+  const vhost=document.createElement("article");vhost.className="markdown-body";
+  vhost.innerHTML='<section data-windowed-mounted="false" data-source-start="8" data-source-end="20">placeholder</section>';
+  document.body.append(vhost);
+  range.selectNodeContents(vhost.firstElementChild!);selection.addRange(range);
+  expect(extractSelectedText({source:offscreenDoc})).toBe("$$E = mc^2$$");
+
+  // CodeMirror fallback when DOM selection is empty and focus is inside .cm-editor
+  selection.removeAllRanges();
+  expect(hasSelectedText()).toBe(false);
+  const cmEditor=document.createElement("div");cmEditor.className="cm-editor";cmEditor.tabIndex=-1;document.body.append(cmEditor);
+  cmEditor.focus();
+  expect(extractSelectedText({source:offscreenDoc,editorSelection:()=>"editor $x_1$ slice"})).toBe("editor $x_1$ slice");
+  cmEditor.remove();
+  window.supermdSelectedText=()=>"from global hook";
+  expect(hasSelectedText()).toBe(true);
+  delete window.supermdSelectedText;
+  vhost.remove();host.remove();
 });

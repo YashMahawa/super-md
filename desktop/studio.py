@@ -31,7 +31,7 @@ from network_tls import client_context
 from PySide6.QtCore import QObject, Property, Signal, Slot, QStandardPaths, QTimer, QUrl, QFileSystemWatcher, QProcess, Qt, QPointF, QRect, QMetaObject, QBuffer, QByteArray, QIODevice
 from PySide6.QtGui import QDesktopServices, QFontDatabase, QGuiApplication, QCursor, QImage
 from documents import (
-    atomic_write, atomic_json, bundle, decode_base64_chunked, decode_base64_chunks,
+    atomic_write, atomic_json, bundle, decode_base64_chunked,
     encode_base64_chunked, image_data, materialize_assets, open_note, write_portable, MIMES, MAX_IMAGE,
 )
 from markdown_export import write_markdown_export, write_markdown_zip
@@ -352,13 +352,30 @@ def _snapshot_tab_state(tab: dict, *, include_view_state: bool = True) -> dict:
 def _asset_identity(value):
     return id(value)
 
+
+def _matches_media_signature(mime: str, data: bytes) -> bool:
+    head = data[:4096]
+    if mime == "image/png":
+        return head.startswith(b"\x89PNG\r\n\x1a\n")
+    if mime == "image/jpeg":
+        return head.startswith(b"\xff\xd8\xff")
+    if mime == "image/webp":
+        return len(head) >= 12 and head[:4] == b"RIFF" and head[8:12] == b"WEBP"
+    if mime == "image/gif":
+        return head.startswith((b"GIF87a", b"GIF89a"))
+    if mime == "image/avif":
+        return len(head) >= 12 and head[4:8] == b"ftyp" and b"avif" in head[8:16]
+    if mime == "image/svg+xml":
+        return b"<svg" in head.lower()
+    return mime == "text/plain"
+
 class Session(QObject):
     """One ordered persistence stream for every native window in the application."""
     changed = Signal()
     locationChanged = Signal(str,str)
-    def __init__(self,isolated=False):
+    def __init__(self,isolated=False,data=None):
         super().__init__()
-        self.data = Path(tempfile.mkdtemp(prefix="supermd-test-")) if isolated else Path(QStandardPaths.writableLocation(QStandardPaths.StandardLocation.AppDataLocation))/"qt-studio"
+        self.data = Path(data) if data is not None else (Path(tempfile.mkdtemp(prefix="supermd-test-")) if isolated else Path(QStandardPaths.writableLocation(QStandardPaths.StandardLocation.AppDataLocation))/"qt-studio")
         self.data=self.data.resolve()
         self.data.mkdir(parents=True,exist_ok=True)
         self.font_store = FontStore(self.data)
@@ -384,8 +401,11 @@ class Session(QObject):
         self.theme_epoch = 0
         self.theme_revision = 0
         self.theme_source = ""
-        try:self.theme_source=json.loads((self.data/"theme-source.json").read_text(encoding="utf-8")).get("path","")
-        except (OSError,ValueError,AttributeError):pass
+        self.active_theme_kind = "builtin"
+        self.active_theme_id = ""
+        self.saved_themes = []
+        self.theme_restored = False
+        self._load_theme_library()
         self.initial_recovery = []
         try:
             stored = json.loads((self.data/"settings.json").read_text(encoding="utf-8"))
@@ -431,6 +451,70 @@ class Session(QObject):
             try:self.closed_note_store.save_index(kept)
             except OSError:pass
 
+    def _load_theme_library(self):
+        library_path = self.data / "theme-library.json"
+        themes_dir = self.data / "themes"
+        if library_path.is_file():
+            try:
+                raw = json.loads(library_path.read_text(encoding="utf-8"))
+                saved = []
+                for item in raw.get("saved", []):
+                    if not isinstance(item, dict):
+                        continue
+                    entry_id = item.get("id", "")
+                    name = item.get("name", "")
+                    source = item.get("source", "")
+                    if (
+                        isinstance(entry_id, str)
+                        and re.fullmatch(r"[0-9a-f]{8,64}", entry_id)
+                        and isinstance(name, str)
+                        and name.strip()
+                        and isinstance(source, str)
+                        and (themes_dir / f"{entry_id}.json").is_file()
+                    ):
+                        saved.append({"id": entry_id, "name": name, "source": source})
+                self.saved_themes = saved
+                active = raw.get("active", {}) if isinstance(raw.get("active"), dict) else {}
+                kind = active.get("kind", "builtin")
+                active_id = active.get("id", "") if isinstance(active.get("id"), str) else ""
+                if kind == "saved":
+                    matched = next((item for item in saved if item["id"] == active_id), None)
+                    if matched is not None:
+                        self.active_theme_kind = "saved"
+                        self.active_theme_id = matched["id"]
+                        self.theme_source = matched["source"]
+                elif kind == "preset" and active_id:
+                    self.active_theme_kind = "preset"
+                    self.active_theme_id = active_id
+                    self.theme_source = ""
+            except (OSError, ValueError, TypeError, AttributeError):
+                pass
+            return
+        legacy_source = ""
+        try:
+            legacy_source = json.loads((self.data / "theme-source.json").read_text(encoding="utf-8")).get("path", "")
+            if not isinstance(legacy_source, str):
+                legacy_source = ""
+        except (OSError, ValueError, AttributeError):
+            legacy_source = ""
+        legacy_theme = self.data / "theme.json"
+        if legacy_theme.is_file():
+            try:
+                parsed = json.loads(legacy_theme.read_text(encoding="utf-8"))
+                name = parsed.get("name") if isinstance(parsed, dict) and isinstance(parsed.get("name"), str) and parsed.get("name").strip() else "Imported theme"
+                entry_id = uuid.uuid4().hex
+                themes_dir.mkdir(parents=True, exist_ok=True)
+                atomic_json(themes_dir / f"{entry_id}.json", parsed)
+                self.saved_themes = [{"id": entry_id, "name": name, "source": legacy_source}]
+                self.active_theme_kind = "saved"
+                self.active_theme_id = entry_id
+                self.theme_source = legacy_source
+                atomic_json(library_path, {"active": {"kind": "saved", "id": entry_id}, "saved": self.saved_themes})
+            except (OSError, ValueError, TypeError):
+                self.theme_source = legacy_source
+        else:
+            self.theme_source = legacy_source
+
     def reader_asset_is_current(self, grant):
         return self.reader_asset_source_is_current(grant.owner_id, grant.tab_id, grant.source,
                                                    grant.embedded_identity, grant.path)
@@ -472,6 +556,8 @@ class Studio(QObject):
     completed = Signal(object)
     backgroundWriteCompleted = Signal(object)
     saveRequested = Signal(str)
+    saveAsRequested = Signal(str)
+    saveConflictRequested = Signal(str)
     closeRequested = Signal(str)
     allowClose = Signal()
     newWindowRequested = Signal()
@@ -554,6 +640,8 @@ class Studio(QObject):
         self.reader_overlay = False
         self.image_overlay = False
         self.busy = 0
+        self._message = ""
+        self._message_revision = 0
         self.message = ("Closed-note recovery index could not be read; historical snapshots were left untouched. "+self.session.closed_note_error) if self.session.closed_note_error else ""
         self.ready = False
         self._last_reader_text = None
@@ -586,7 +674,7 @@ class Studio(QObject):
         self.custom_theme_stamp=None
         self.custom_theme_watcher.fileChanged.connect(lambda *_:self.custom_theme_timer.start())
         self.custom_theme_watcher.directoryChanged.connect(lambda *_:self.custom_theme_timer.start())
-        QTimer.singleShot(0,self.reloadCustomTheme)
+        QTimer.singleShot(0,self._restore_custom_theme)
         self.system_preferences = QProcess(self)
         if sys.platform.startswith("linux") and shutil.which("gsettings"):
             self.system_preferences.readyReadStandardOutput.connect(self._system_setting_changed)
@@ -600,6 +688,8 @@ class Studio(QObject):
         self.pending_close = ""
         self.pending_export = ""
         self.pending_save_as = ""
+        self.pending_save_as_tab = ""
+        self._force_overwrite_ids: set[str] = set()
         self.flush_operation = None
         self.flush_timer = QTimer(self)
         self.flush_timer.setSingleShot(True)
@@ -618,6 +708,8 @@ class Studio(QObject):
         self.tabs = [{**tab,"id":tab.get("id") or uuid.uuid4().hex} for tab in self.session.initial_recovery]
         for tab in self.tabs:
             tab.setdefault("saved_assets", dict(tab.get("assets", {})))
+            tab.setdefault("assets_dirty", False)
+            tab.setdefault("conflict", False)
         self._agent_open_paths.update(str(Path(tab["path"]).resolve()) for tab in self.tabs if tab.get("path"))
         self.session.initial_recovery = []
         self.session.drafts[self.window_id] = [dict(t) for t in self.tabs]
@@ -675,6 +767,14 @@ class Studio(QObject):
     @recent.setter
     def recent(self,value): self.session.recent = list(dict.fromkeys(self.session.pinned + value))[:10]
 
+    @property
+    def message(self): return getattr(self, "_message", "")
+
+    @message.setter
+    def message(self, value):
+        self._message = value
+        if value: self._message_revision = getattr(self, "_message_revision", 0) + 1
+
     @Slot(str)
     def pinRecent(self,path):
         if path not in self.recent:return
@@ -686,7 +786,17 @@ class Studio(QObject):
     def _note(self, name: str, content: str = "", path: str = "", saved: str = "", assets: dict | None = None, portable: bool = False):
         assets = dict(assets) if assets else {}
         return {"id": uuid.uuid4().hex, "name": name, "content": content, "path": path, "saved": saved,
-                "assets": assets, "saved_assets": dict(assets), "portable": portable}
+                "assets": assets, "saved_assets": dict(assets), "assets_dirty": False,
+                "portable": portable, "conflict": False}
+
+    def _is_dirty(self, tab: dict) -> bool:
+        if tab.get("content") != tab.get("saved"):
+            return True
+        if tab.get("assets_dirty"):
+            return True
+        if tab.get("path") and "saved_assets" in tab and tab.get("assets", {}) != tab.get("saved_assets", {}):
+            return True
+        return False
 
     @Property("QStringList",notify=changed)
     def pinnedRecent(self):return self.session.pinned
@@ -740,6 +850,22 @@ class Studio(QObject):
     @Property(bool,notify=changed)
     def customThemeActive(self):return self.session.custom_theme is not None
 
+    @Property("QVariantList",constant=True)
+    def bundledThemes(self):return custom_theme.bundled_themes(ROOT)
+
+    @Property("QVariantList",notify=changed)
+    def savedThemes(self):return copy.deepcopy(self.session.saved_themes)
+
+    @Property(str,notify=changed)
+    def activeThemeKind(self):return self.session.active_theme_kind
+
+    @Property(str,notify=changed)
+    def activeThemeId(self):return self.session.active_theme_id
+
+    @Property(bool,notify=changed)
+    def customThemeHasSource(self):
+        return self.session.custom_theme is not None and self.session.active_theme_kind != "preset" and bool(self.session.theme_source)
+
     @Property("QVariantMap",notify=changed)
     def themeArtwork(self):
         selected=custom_theme.variant(self.session.custom_theme,self.settings["fullTheme" if self.fullscreen else "theme"],self._dark())
@@ -748,7 +874,7 @@ class Studio(QObject):
     @Property("QVariantMap",notify=changed)
     def themeBackground(self):
         style=custom_theme.reader(self.session.custom_theme,self.settings["theme"],self._dark(),self.settings)
-        return {"pattern":"none","size":24,"spacing":24,**(style["background"] or {}),"opacity":style["artwork"].get("reader",{}).get("opacity",(style["background"] or {}).get("opacity",.06))}
+        return {"pattern":"none","opacity":.06,"size":24,"spacing":24,**(style["background"] or {})}
 
     @Slot()
     def resetThemeBackground(self):
@@ -866,10 +992,10 @@ class Studio(QObject):
             self.recent=[path for path in self.recent if path!=old]
             for tab in list(self.tabs):
                 if tab["path"]!=old:continue
-                if tab["content"]!=tab["saved"]:
-                    draft={**tab,"path":"","name":"Recovered "+tab["name"],"saved":""}
+                if self._is_dirty(tab):
+                    draft={**tab,"path":"","name":"Recovered "+tab["name"],"saved":"","conflict":False}
                     self.session.drafts.setdefault("deleted-notes",[]).append(draft)
-                    tab.update(path="",name=draft["name"])
+                    tab.update(path="",name=draft["name"],conflict=False)
                 self._remove_tab(tab["id"])
             self.message="File deleted: "+Path(old).name+". Its tab was closed; unsaved changes remain recoverable."
         self._preferences();self._recover();self._emit()
@@ -879,19 +1005,26 @@ class Studio(QObject):
         for tab in self.tabs:
             path=tab["path"]
             if not path or not ({path,str(Path(path).parent)} & changed) or tab["id"] in self.saving:continue
-            if tab["content"]!=tab["saved"]:continue  # Never clobber a local draft.
+            was_dirty=self._is_dirty(tab)
             try:
-                stat=Path(path).stat();stamp=(stat.st_mtime_ns,stat.st_size)
+                stat_result=Path(path).stat();stamp=(stat_result.st_mtime_ns,stat_result.st_size)
             except OSError:continue
-            if self.note_file_stamps.get(path)==stamp:continue
+            if not was_dirty and self.note_file_stamps.get(path)==stamp:continue
             id,expected=tab["id"],tab["saved"]
-            def finished(result,error,id=id,expected=expected,path=path,stamp=stamp):
+            def finished(result,error,id=id,expected=expected,path=path,stamp=stamp,was_dirty=was_dirty):
                 current=next((note for note in self.tabs if note["id"]==id),None)
-                if error or not current or current["content"]!=expected:return
+                if error or not current:return
                 self.note_file_stamps[path]=stamp
                 content,assets,portable=result
+                if was_dirty or self._is_dirty(current) or current.get("conflict"):
+                    if content!=current["saved"] or assets!=current.get("saved_assets",{}):
+                        current["conflict"]=True
+                        self.message="This file changed outside Super MD. Autosave is paused for this tab."
+                        self._emit(False)
+                    return
+                if current["content"]!=expected:return
                 if content==expected and assets==current["assets"]:return
-                current.update(content=content,saved=content,assets=assets,saved_assets=dict(assets),portable=portable)
+                current.update(content=content,saved=content,assets=assets,saved_assets=dict(assets),assets_dirty=False,portable=portable,conflict=False)
                 self.message="Reloaded externally updated note"
                 self._emit(load=id==self.active)
             self._submit(lambda path=path:open_note(Path(path)),finished,False)
@@ -980,7 +1113,7 @@ class Studio(QObject):
     @Property(str, notify=changed)
     def snapshot(self):
         tab = self._current()
-        return json.dumps({"tabs": [{"id": t["id"], "name": t["name"], "path": t["path"], "dirty": t["content"] != t["saved"]} for t in self.tabs], "active": self.active, "name": tab["name"], "outline": tab.get("outline", []), "portable": tab["portable"], "folder": self.folder, "files": self.files, "recent": self.recent, "settings": self.settings, "mode": self.mode, "fullscreen": self.fullscreen, "readerOverlay": self.reader_overlay, "imageOverlay": self.image_overlay, "readerReady": self.ready, "dark": self._dark(), "zoom": self.settings["fullZoom" if self.fullscreen else "normalZoom"], "busy": self.busy > 0, "message": self.message, "colors": self._colors()})
+        return json.dumps({"tabs": [{"id": t["id"], "name": t["name"], "path": t["path"], "dirty": self._is_dirty(t), "conflict": bool(t.get("conflict"))} for t in self.tabs], "active": self.active, "name": tab["name"], "outline": tab.get("outline", []), "portable": tab["portable"], "conflict": bool(tab.get("conflict")), "closedCount": len(self.closed_tabs), "folder": self.folder, "files": self.files, "recent": self.recent, "settings": self.settings, "mode": self.mode, "fullscreen": self.fullscreen, "readerOverlay": self.reader_overlay, "imageOverlay": self.image_overlay, "readerReady": self.ready, "dark": self._dark(), "zoom": self.settings["fullZoom" if self.fullscreen else "normalZoom"], "busy": self.busy > 0, "message": self.message, "messageRevision": getattr(self, "_message_revision", 0), "colors": self._colors()})
 
     @Property(bool, notify=changed)
     def agentAccessEnabled(self):
@@ -1727,7 +1860,7 @@ class Studio(QObject):
         if self.active == tab_id: self.active = self.tabs[min(old, len(self.tabs)-1)]["id"]
         # Update both owners before writing one recovery snapshot: never duplicate
         # or temporarily lose a dirty note in the durable recovery stream.
-        self.session.drafts[self.window_id] = [_snapshot_tab_state(t, include_view_state=False) for t in self.tabs if t["content"] != t["saved"] and (t["path"] or t["content"].strip())]
+        self.session.drafts[self.window_id] = [_snapshot_tab_state(t, include_view_state=False) for t in self.tabs if self._is_dirty(t) and (t["path"] or t["content"].strip() or t["assets"])]
         target._recover()
         self._emit(); target._emit()
         if emptied: QTimer.singleShot(0, self.allowClose.emit)
@@ -1795,60 +1928,217 @@ class Studio(QObject):
     @Slot()
     def openThemeGuide(self):self.readerCall.emit("window.supermdThemeGuide?.()")
 
+    def _save_theme_library(self):
+        atomic_json(
+            self.data / "theme-library.json",
+            {
+                "active": {"kind": self.session.active_theme_kind, "id": self.session.active_theme_id},
+                "saved": self.session.saved_themes,
+            },
+        )
+
+    def _clear_theme_background_overrides(self):
+        changed = any(
+            self.settings.get(key) != default
+            for key, default in (("patternKind", ""), ("patternOpacity", -1), ("patternSize", 0), ("patternSpacing", 0))
+        )
+        self.settings.update(patternKind="", patternOpacity=-1, patternSize=0, patternSpacing=0)
+        if changed:
+            self._preferences(False)
+
     def _watch_custom_theme(self):
         watcher=self.custom_theme_watcher
         paths=watcher.files()+watcher.directories()
         if paths:watcher.removePaths(paths)
-        source=Path(self.session.theme_source) if self.session.theme_source else None
+        source=Path(self.session.theme_source) if self.session.active_theme_kind!="preset" and self.session.theme_source else None
         self.custom_theme_stamp=custom_theme.stamp(source) if source else None
         if source:
             watcher.addPaths([str(path) for path in (source,source.parent) if path.exists()])
 
     def _custom_theme_event(self):
-        if self.retired or not self.session.theme_source:return
+        if self.retired or self.session.active_theme_kind=="preset" or not self.session.theme_source:return
         value=custom_theme.stamp(Path(self.session.theme_source))
         if value==self.custom_theme_stamp:return
         self.custom_theme_stamp=value
         self.reloadCustomTheme()
 
+    def _restore_custom_theme(self):
+        if self.retired:
+            return
+        self._watch_custom_theme()
+        if self.session.theme_restored:
+            return
+        self.session.theme_restored = True
+        kind = self.session.active_theme_kind
+        cached = self.data / "theme.json"
+        if kind == "preset":
+            try:
+                target = cached if cached.is_file() else custom_theme.bundled_theme_path(self.session.active_theme_id, ROOT)
+            except ValueError:
+                return
+            self._load_custom_theme(target, mode="restore")
+            return
+        if kind == "saved":
+            saved_file = self.data / "themes" / f"{self.session.active_theme_id}.json"
+            primary = saved_file if saved_file.is_file() else cached
+            source = Path(self.session.theme_source) if self.session.theme_source else None
+            follow = source if source and source.is_file() and source != primary else None
+            if primary.is_file():
+                self._load_custom_theme(primary, mode="restore", follow_source=follow)
+            elif follow:
+                self._load_custom_theme(follow, mode="restore")
+            return
+        source = Path(self.session.theme_source) if self.session.theme_source else cached
+        if not source.is_file():
+            source = cached
+        if self.session.custom_theme is None and cached.is_file() and cached != source:
+            self._load_custom_theme(cached, mode="restore", follow_source=source)
+        elif source.is_file():
+            self._load_custom_theme(source, mode="restore")
+
     @Slot(str)
-    def importCustomTheme(self,value):self._load_custom_theme(local_path(value))
+    def importCustomTheme(self,value):self._load_custom_theme(local_path(value),mode="import")
+
+    @Slot(str)
+    def selectBundledTheme(self,preset_id):self._apply_bundled_theme(preset_id)
+
+    def _apply_bundled_theme(self,preset_id,callback=None):
+        if not isinstance(preset_id,str) or not preset_id:
+            if callback:callback(None,"Unknown bundled theme")
+            return
+        if preset_id=="builtin":
+            self.resetCustomTheme()
+            if callback:callback({"id":"builtin","name":"Built-in appearance"},"")
+            return
+        try:
+            path=custom_theme.bundled_theme_path(preset_id,ROOT)
+        except ValueError as error:
+            self.message="Theme not applied: "+str(error);self._emit(False)
+            if callback:callback(None,str(error))
+            return
+        self._load_custom_theme(path,mode="preset",preset_id=preset_id,callback=callback)
+
+    @Slot(str)
+    def selectSavedTheme(self,entry_id):
+        entry=next((item for item in self.session.saved_themes if item["id"]==entry_id),None)
+        if entry is None:return
+        path=self.data/"themes"/f"{entry_id}.json"
+        if not path.is_file():
+            self.message="Saved theme is unavailable.";self._emit(False);return
+        self._load_custom_theme(path,mode="saved",entry_id=entry_id)
+
+    @Slot(str)
+    def deleteSavedTheme(self,entry_id):
+        entry=next((item for item in self.session.saved_themes if item["id"]==entry_id),None)
+        if entry is None:return
+        self.session.saved_themes=[item for item in self.session.saved_themes if item["id"]!=entry_id]
+        (self.data/"themes"/f"{entry_id}.json").unlink(missing_ok=True)
+        was_active=self.session.active_theme_kind=="saved" and self.session.active_theme_id==entry_id
+        if was_active:
+            self.session.theme_epoch+=1
+            self.session.custom_theme=None
+            self.session.theme_source=""
+            self.session.active_theme_kind="builtin"
+            self.session.active_theme_id=""
+            self.session.theme_revision+=1
+            for filename in ("theme.json","theme-source.json"):(self.data/filename).unlink(missing_ok=True)
+            self._clear_theme_background_overrides()
+            for window in self.session.windows.values():window._watch_custom_theme()
+        try:self._save_theme_library()
+        except OSError:pass
+        self.message="Removed "+entry["name"]
+        self.session.changed.emit()
 
     @Slot()
     def reloadCustomTheme(self):
-        if self.retired:return
+        if self.retired or self.session.active_theme_kind=="preset":return
+        if self.session.active_theme_kind=="saved" and not self.session.theme_source:return
         source=Path(self.session.theme_source) if self.session.theme_source else self.data/"theme.json"
         if not source.is_file():source=self.data/"theme.json"
         self._watch_custom_theme()
         cached=self.data/"theme.json"
-        if self.session.custom_theme is None and cached.is_file() and cached!=source:self._load_custom_theme(cached,False,source)
-        elif source.is_file():self._load_custom_theme(source,False)
+        if self.session.custom_theme is None and cached.is_file() and cached!=source:self._load_custom_theme(cached,mode="restore",follow_source=source,clear_overrides_on_follow=True)
+        elif source.is_file():self._load_custom_theme(source,mode="reload")
 
-    def _load_custom_theme(self,path,importing=True,follow_source=None):
+    def _load_custom_theme(self,path,mode="import",follow_source=None,preset_id="",entry_id="",callback=None,clear_overrides_on_follow=False):
         self.session.theme_epoch+=1
         epoch=self.session.theme_epoch
         try:engine=self._engine()
-        except ValueError as error:self.message=str(error);self._emit(False);return
+        except ValueError as error:
+            self.message=str(error);self._emit(False)
+            if callback:callback(None,str(error))
+            return
         def finished(value,error):
-            if epoch!=self.session.theme_epoch:return
+            if epoch!=self.session.theme_epoch:
+                if callback:callback(None,"Superseded by newer theme selection")
+                return
             if error:
                 self.message="Theme not applied: "+str(error);self._emit(False)
-                if follow_source:self._load_custom_theme(follow_source,False)
+                if callback:callback(None,str(error))
+                if follow_source:self._load_custom_theme(follow_source,mode="reload" if clear_overrides_on_follow else "restore")
                 return
             try:
-                if importing:
-                    self.session.theme_source=str(path)
-                    atomic_json(self.data/"theme-source.json",{"path":str(path)})
                 changed=value!=self.session.custom_theme
-                if changed:atomic_json(self.data/"theme.json",value)
+                if mode=="import":
+                    source_str=str(path)
+                    existing=next((item for item in self.session.saved_themes if item.get("source")==source_str),None)
+                    if existing is not None:
+                        target_id=existing["id"]
+                        existing["name"]=value["name"]
+                    else:
+                        target_id=uuid.uuid4().hex
+                        self.session.saved_themes.append({"id":target_id,"name":value["name"],"source":source_str})
+                    (self.data/"themes").mkdir(parents=True,exist_ok=True)
+                    atomic_json(self.data/"themes"/f"{target_id}.json",value)
+                    self.session.active_theme_kind="saved"
+                    self.session.active_theme_id=target_id
+                    self.session.theme_source=source_str
+                    atomic_json(self.data/"theme-source.json",{"path":source_str})
+                    atomic_json(self.data/"theme.json",value)
+                    self._save_theme_library()
+                    self._clear_theme_background_overrides()
+                elif mode=="preset":
+                    self.session.active_theme_kind="preset"
+                    self.session.active_theme_id=preset_id
+                    self.session.theme_source=""
+                    (self.data/"theme-source.json").unlink(missing_ok=True)
+                    atomic_json(self.data/"theme.json",value)
+                    self._save_theme_library()
+                    self._clear_theme_background_overrides()
+                elif mode=="saved":
+                    entry=next((item for item in self.session.saved_themes if item["id"]==entry_id),None)
+                    source_str=entry.get("source","") if entry else ""
+                    if entry is not None:entry["name"]=value["name"]
+                    self.session.active_theme_kind="saved"
+                    self.session.active_theme_id=entry_id
+                    self.session.theme_source=source_str
+                    if source_str:atomic_json(self.data/"theme-source.json",{"path":source_str})
+                    else:(self.data/"theme-source.json").unlink(missing_ok=True)
+                    atomic_json(self.data/"theme.json",value)
+                    self._save_theme_library()
+                    self._clear_theme_background_overrides()
+                elif mode=="reload":
+                    if self.session.active_theme_kind=="saved" and self.session.active_theme_id:
+                        (self.data/"themes").mkdir(parents=True,exist_ok=True)
+                        atomic_json(self.data/"themes"/f"{self.session.active_theme_id}.json",value)
+                        entry=next((item for item in self.session.saved_themes if item["id"]==self.session.active_theme_id),None)
+                        if entry is not None:entry["name"]=value["name"]
+                        self._save_theme_library()
+                    if changed:atomic_json(self.data/"theme.json",value)
+                    self._clear_theme_background_overrides()
+                else:
+                    if changed:atomic_json(self.data/"theme.json",value)
                 self.session.custom_theme=value
                 if changed:self.session.theme_revision+=1
                 for window in self.session.windows.values():window._watch_custom_theme()
-                if changed or importing:
+                if mode in ("import","preset","saved","reload") or (mode!="restore" and changed):
                     self.message="Applied "+value["name"]
-                    self.session.changed.emit()
-            except OSError as failure:self.message="Could not save theme: "+str(failure);self._emit(False)
-            if follow_source:self._load_custom_theme(follow_source,False)
+                self.session.changed.emit()
+                if callback:callback({"id":preset_id or entry_id or self.session.active_theme_id,"name":value["name"]},"")
+            except OSError as failure:
+                self.message="Could not save theme: "+str(failure);self._emit(False)
+                if callback:callback(None,str(failure))
+            if follow_source:self._load_custom_theme(follow_source,mode="reload" if clear_overrides_on_follow else "restore")
         def read():
             try:return custom_theme.read(engine,path),None
             except Exception as failure:return None,str(failure)
@@ -1858,20 +2148,25 @@ class Studio(QObject):
     def resetCustomTheme(self):
         self.session.theme_epoch+=1
         self.session.custom_theme=None;self.session.theme_source=""
+        self.session.active_theme_kind="builtin";self.session.active_theme_id=""
         self.session.theme_revision+=1
         for filename in ("theme.json","theme-source.json"):(self.data/filename).unlink(missing_ok=True)
+        try:self._save_theme_library()
+        except OSError:pass
+        self._clear_theme_background_overrides()
         for window in self.session.windows.values():window._watch_custom_theme()
         self.session.changed.emit()
 
     @Slot()
     def editCustomTheme(self):
-        source=Path(self.session.theme_source) if self.session.theme_source else self.data/"theme.json"
+        if self.session.active_theme_kind=="preset" or not self.session.theme_source:return
+        source=Path(self.session.theme_source)
         if source.is_file():QDesktopServices.openUrl(QUrl.fromLocalFile(str(source)))
 
     @Slot(str)
     def exportCustomTheme(self,value):
         try:
-            atomic_json(local_path(value),custom_theme.for_sharing(self.session.custom_theme,self.settings))
+            atomic_json(local_path(value),custom_theme.for_sharing(self.session.custom_theme))
             self.message="Theme exported. Edit the JSON and import it to apply."
         except OSError as error:self.message=str(error)
         self._emit(False)
@@ -2003,12 +2298,12 @@ class Studio(QObject):
 
     def _recover(self):
         # Clean tabs need only paths, never another copy of their image bytes.
-        self.session.workspace[self.window_id]=[{"path":t["path"],"id":t["id"]} for t in self.tabs if t["path"] or t["content"]!=t["saved"]]
+        self.session.workspace[self.window_id]=[{"path":t["path"],"id":t["id"]} for t in self.tabs if t["path"] or self._is_dirty(t)]
         entries=[entry for tabs in self.session.workspace.values() for entry in tabs]
         workspace={"paths":list(dict.fromkeys(t["path"] for t in entries if t["path"])),"tabs":entries,"active":self._current()["path"],"activeId":self.active}
         self.session.writes.submit_latest("startup",lambda:atomic_json(self.data/"startup.json",workspace),lambda error:self._notify_recovery_write("startup",error))
         # Snapshot only unsaved tabs. Asset bytes stay in recovery, never in displayed source.
-        self.session.drafts[self.window_id] = [_snapshot_tab_state(t, include_view_state=False) for t in self.tabs if t["content"] != t["saved"] and (t["path"] or t["content"].strip() or t["assets"])]
+        self.session.drafts[self.window_id] = [_snapshot_tab_state(t, include_view_state=False) for t in self.tabs if self._is_dirty(t) and (t["path"] or t["content"].strip() or t["assets"])]
         drafts = [tab for tabs in self.session.drafts.values() for tab in tabs]
         self.session.writes.submit_latest("recovery",lambda:atomic_json(self.data/"recovery.json",drafts),lambda error:self._notify_recovery_write("recovery",error))
 
@@ -2187,19 +2482,30 @@ class Studio(QObject):
         if not self.closed_tabs:return
         self._activation_generation += 1
         activation_generation=self._activation_generation
-        reference=self.closed_tabs[-1]
+        reference=self.closed_tabs[0]
         def finished(note,error):
             if error:
                 self.message="Could not reopen the closed note: "+error
                 self._emit(False);return
             if reference not in self.closed_tabs:return
+            note.setdefault("saved_assets", dict(note.get("assets", {})))
+            note.setdefault("assets_dirty", False)
+            note.setdefault("conflict", False)
+            next_refs=[item for item in self.closed_tabs if item is not reference]
+            try:self.session.closed_note_store.save_index(next_refs)
+            except Exception as failure:
+                self.message="Could not update closed-note recovery: "+str(failure)
+                self._emit(False);return
             existing=next((t for t in self.tabs if note.get("path") and t["path"]==note["path"]),None)
             if existing:
                 if activation_generation==self._activation_generation:self.active=existing["id"]
             else:
                 self.tabs.append(note)
+                if note.get("path"):
+                    try:self._agent_open_paths.add(str(Path(note["path"]).resolve()))
+                    except OSError:pass
                 if activation_generation==self._activation_generation:self.active=note["id"]
-            self.closed_tabs.remove(reference)
+            self.closed_tabs[:]=next_refs
             self._recover();self._emit()
         def read_note():
             if reference.get("_closedSnapshot"):
@@ -2335,16 +2641,27 @@ class Studio(QObject):
 
     @Slot()
     def save(self):
+        self._save_current(False)
+
+    def _save_current(self, force_overwrite: bool = False):
         tab = self._current()
         if not tab["path"]:
             self.saveRequested.emit(tab["name"])
-        elif tab["portable"]:
+        elif not force_overwrite and tab.get("conflict"):
+            self.saveConflictRequested.emit(tab["name"])
+        elif tab["portable"] and self.ready:
+            if force_overwrite:
+                self._force_overwrite_ids.add(tab["id"])
+            else:
+                self._force_overwrite_ids.discard(tab["id"])
             self.readerCall.emit("window.supermdPortable?.(true)")
         else:
-            self._save_text(tab, Path(tab["path"]))
+            self._save_text(tab, Path(tab["path"]), automatic=False, force_overwrite=force_overwrite, force_portable=bool(tab["portable"]))
 
     def _after_flush(self,operation):
         if operation["action"] == "save": self.save()
+        elif operation["action"] == "save_as": self.saveAsRequested.emit(self._current()["name"])
+        elif operation["action"] == "overwrite_conflict": self._save_current(True)
         elif operation["action"] == "reload_reader":
             # The renderer has acknowledged all edits. Reopen it from native
             # state and the just-captured view snapshot in document_flushed.
@@ -2381,6 +2698,9 @@ class Studio(QObject):
     def saveSafely(self): self._flush("save")
 
     @Slot()
+    def saveAsSafely(self): self._flush("save_as")
+
+    @Slot()
     def reloadReaderSafely(self):
         if not self.ready or self.retired or self.busy or self.flush_operation: return
         self._flush("reload_reader")
@@ -2406,44 +2726,145 @@ class Studio(QObject):
     @Slot(str)
     def saveAs(self, value):
         path = local_path(value)
-        if path.suffix.lower() == ".smd":
+        tab = self._current()
+        if path.suffix.lower() == ".smd" and self.ready:
             self.pending_export = str(path)
             self.pending_save_as = str(path)
+            self.pending_save_as_tab = tab["id"]
             self.readerCall.emit("window.supermdPortable?.(false)")
         else:
-            self._save_text(self._current(), path)
+            self._save_text(tab, path, automatic=False, force_overwrite=True, force_portable=path.suffix.lower() == ".smd")
 
-    def _save_text(self, tab, path, automatic=False):
+    @Slot(str)
+    def resolveConflict(self, choice):
+        if choice == "cancel":
+            self.pending_close = ""
+            return
+        if choice == "save_as":
+            self.saveAsSafely()
+            return
+        if choice == "overwrite":
+            self._flush("overwrite_conflict")
+            return
+        if choice == "reload":
+            tab = self._current()
+            if not tab.get("path"):
+                return
+            tab_id = tab["id"]
+            path = Path(tab["path"])
+            def done(result, error):
+                if error:
+                    return
+                target = next((t for t in self.tabs if t["id"] == tab_id), None)
+                if not target:
+                    return
+                content, assets, portable = result
+                try:
+                    st = path.stat()
+                    self.note_file_stamps[str(path)] = (st.st_mtime_ns, st.st_size)
+                except OSError:
+                    pass
+                self.reader_edits.clear(tab_id)
+                self.session.reader_assets.revoke_tab(self.window_id, tab_id)
+                if tab_id == self.active:
+                    self._last_reader_text = None
+                target.update(
+                    content=content,
+                    saved=content,
+                    assets=assets,
+                    saved_assets=dict(assets),
+                    assets_dirty=False,
+                    portable=portable,
+                    conflict=False,
+                )
+                self.message = "Reloaded note from disk"
+                self._recover()
+                self._emit(load=tab_id == self.active)
+            self._submit(lambda: open_note(path), done, True)
+
+    def _save_text(self, tab, path, automatic=False, force_overwrite=False, force_portable=False):
         id, content, assets = tab["id"], tab["content"], dict(tab["assets"])
         expected, original_path = tab["saved"], tab["path"]
-        portable = tab["portable"] and str(path) == original_path
+        expected_assets = dict(tab.get("saved_assets", {}))
+        try:
+            same_path = bool(original_path) and Path(path).resolve() == Path(original_path).resolve()
+        except OSError:
+            same_path = str(path) == original_path
+        portable = bool(force_portable or path.suffix.lower() == ".smd" or (tab["portable"] and same_path))
         if id in self.saving: return
         self.saving.add(id)
-        def finished(_, error):
+        def finished(outcome, error):
             self.saving.discard(id)
             if error: return
             target = next((t for t in self.tabs if t["id"] == id), None)
+            if isinstance(outcome, dict) and outcome.get("_conflict"):
+                if target:
+                    target["conflict"] = True
+                if automatic:
+                    self.message = outcome["message"]
+                    self._emit(False)
+                else:
+                    self.message = "This file changed on disk since you opened or last saved it."
+                    self._emit(False)
+                    if target:
+                        self.saveConflictRequested.emit(target["name"])
+                return
+            if isinstance(outcome, dict) and outcome.get("stamp"):
+                self.note_file_stamps[str(path)] = outcome["stamp"]
             if target:
-                target.update(path=str(path), name=path.name, saved=content, saved_assets=dict(assets), portable=portable)
-                if automatic and target["content"] != content: self.autosave_timer.start(900)
+                target.update(
+                    path=str(path),
+                    name=path.name,
+                    saved=content,
+                    saved_assets=dict(assets),
+                    assets_dirty=False,
+                    portable=portable,
+                    conflict=False,
+                )
+                try:
+                    self._agent_open_paths.add(str(Path(path).resolve()))
+                except OSError:
+                    pass
+                if str(path) != original_path:
+                    self.recent = [str(path)] + [p for p in self.recent if p != str(path)][:29]
+                    self._preferences()
+                if automatic and self._is_dirty(target): self.autosave_timer.start(900)
             self.message = "Autosaved" if automatic else "Saved"
             self._recover()
             self._emit()
             if self.pending_close:
                 self._finish_close()
         def write():
-            if automatic and (not path.exists() or open_note(path)[0] != expected):
-                raise ValueError("Autosave paused: this file changed outside Super MD. Your edits remain in draft recovery; use Save as to keep both versions.")
+            if automatic or (not force_overwrite and same_path):
+                changed_on_disk = False
+                if not path.exists():
+                    changed_on_disk = bool(automatic)
+                else:
+                    try:
+                        disk_content, disk_assets, _ = open_note(path)
+                        changed_on_disk = disk_content != expected or (portable and disk_assets != expected_assets)
+                    except Exception:
+                        changed_on_disk = True
+                if changed_on_disk:
+                    return {
+                        "_conflict": True,
+                        "message": "Autosave paused: this file changed outside Super MD. Your edits remain in draft recovery; use Save as to keep both versions.",
+                    }
             if portable: write_portable(path,content,assets)
             else:
                 materialize_assets(path.parent,assets)
                 atomic_write(path,content.encode())
+            try:
+                st = path.stat()
+                return {"stamp": (st.st_mtime_ns, st.st_size)}
+            except OSError:
+                return {}
         self._submit(write, finished,busy=not automatic,executor=self.writes)
 
     def _autosave(self):
         if not self.settings["autosave"]: return
         for tab in self.tabs:
-            if tab["path"] and tab["content"] != tab["saved"] and tab["id"] not in self.saving:
+            if tab["path"] and self._is_dirty(tab) and not tab.get("conflict") and tab["id"] not in self.saving:
                 self._save_text(tab,Path(tab["path"]),automatic=True)
 
     @Slot(str, str)
@@ -2475,6 +2896,15 @@ class Studio(QObject):
         directory = self.settings.get("newNoteLocation") or QStandardPaths.writableLocation(QStandardPaths.StandardLocation.DownloadLocation) or str(Path.home())
         return QUrl.fromLocalFile(str(Path(directory)/Path(name).name))
 
+    @Slot(str,result=QUrl)
+    def defaultSaveAsLocation(self,name):
+        current_path = self._current().get("path")
+        if current_path:
+            parent = Path(current_path).parent
+            if parent.is_dir():
+                return QUrl.fromLocalFile(str(parent / Path(name).name))
+        return self.defaultSaveLocation(name)
+
     @Slot(str, result=QUrl)
     def defaultExportLocation(self, format):
         suffix = "zip" if format == "mdzip" else format
@@ -2486,7 +2916,7 @@ class Studio(QObject):
         if not tab:
             return
         self._activation_generation += 1
-        if tab["content"] != tab["saved"] and (tab["path"] or tab["content"].strip() or tab["assets"]):
+        if self._is_dirty(tab) and (tab["path"] or tab["content"].strip() or tab["assets"]):
             self.pending_close = id
             self.selectTab(id)
             self.closeRequested.emit(tab["name"])
@@ -2540,7 +2970,7 @@ class Studio(QObject):
 
     @Slot(result=bool)
     def requestWindowClose(self):
-        dirty = next((t for t in self.tabs if t["content"] != t["saved"] and (t["path"] or t["content"].strip() or t["assets"])), None)
+        dirty = next((t for t in self.tabs if self._is_dirty(t) and (t["path"] or t["content"].strip() or t["assets"])), None)
         if dirty:
             self.pending_close = "window"
             self.selectTab(dirty["id"])
@@ -2560,7 +2990,19 @@ class Studio(QObject):
                 self.pending_close=""
                 if action:self._remove_tab(action)
                 return
-            self._current()["saved"] = self._current()["content"]
+            current = self._current()
+            if current["content"].strip() or current["path"] or current.get("assets"):
+                captured = _snapshot_tab_state(current)
+                try:
+                    reference = self.session.closed_note_store.save(captured)
+                    next_refs = ([reference] + self.closed_tabs)[:ClosedNoteStore.LIMIT]
+                    self.session.closed_note_store.save_index(next_refs)
+                    self.closed_tabs[:] = next_refs
+                except Exception as failure:
+                    self.message = "Could not preserve the closed note: " + str(failure)
+            current["saved"] = current["content"]
+            current["saved_assets"] = dict(current.get("assets", {}))
+            current["assets_dirty"] = False
             self._finish_close()
 
     def _finish_close(self):
@@ -2856,7 +3298,7 @@ class Studio(QObject):
             discard = args.get("discardChanges", False)
             if not isinstance(discard, bool):
                 raise ValueError("discardChanges must be a boolean")
-            if tab["content"] != tab["saved"] and not discard:
+            if Studio._is_dirty(self, tab) and not discard:
                 raise ValueError("The document has unsaved changes; pass discardChanges:true to close and preserve it in closed-note recovery")
             self._remove_tab(tab_id)
             if any(item["id"] == tab_id for item in self.tabs):
@@ -2918,7 +3360,7 @@ class Studio(QObject):
         fmt = "smd" if tab.get("portable") or Path(path or tab["name"]).suffix.lower() == ".smd" else "md"
         return {"tabId": tab["id"], "windowId": self.window_id, "revision": hashlib.sha256(content.encode("utf-8")).hexdigest(),
                 "path": path, "title": title or tab["name"], "active": self.active == tab["id"] if active is None else active,
-                "sourceLength": len(content), "format": fmt, "isDirty": content != tab["saved"]}
+                "sourceLength": len(content), "format": fmt, "isDirty": Studio._is_dirty(self, tab)}
 
     def _agent_path_allowed(self, path: Path) -> bool:
         """Check open targets against user-selected note roots and session paths."""
@@ -3102,23 +3544,37 @@ class Studio(QObject):
                     # refuses to replace an unrelated image at that path.
                     materialize_assets(resolved_path.parent, assets_snapshot)
                     atomic_write(resolved_path, content_snapshot.encode("utf-8"))
+                try:
+                    st = resolved_path.stat()
+                    return (st.st_mtime_ns, st.st_size)
+                except OSError:
+                    return None
             except Exception:
                 unlink_reserved()
                 raise
 
-        def finalize(_value, error):
+        def finalize(stamp, error):
             if error is not None:
                 unlink_reserved()
                 if created_new_path:
                     self._agent_owned_files.discard(str(resolved_path))
                 return None
+            if stamp and hasattr(self, "note_file_stamps"):
+                self.note_file_stamps[str(resolved_path)] = stamp
             path_changed = not old_canonical_path or str(resolved_path) != old_canonical_path
             target = next((item for item in self.tabs if item["id"] == tab_id), None)
             is_dirty = False
             if target is not None:
-                target.update(path=str(resolved_path), name=resolved_path.name, saved=content_snapshot, portable=fmt == "smd")
-                target["saved_assets"] = dict(assets_snapshot)
-                is_dirty = target["content"] != content_snapshot
+                target.update(
+                    path=str(resolved_path),
+                    name=resolved_path.name,
+                    saved=content_snapshot,
+                    saved_assets=dict(assets_snapshot),
+                    assets_dirty=False,
+                    portable=fmt == "smd",
+                    conflict=False,
+                )
+                is_dirty = Studio._is_dirty(self, target)
                 if is_dirty and getattr(self, "settings", {}).get("autosave") and hasattr(self, "autosave_timer"):
                     self.autosave_timer.start(900)
             self._agent_open_paths.add(str(resolved_path))
@@ -3130,6 +3586,40 @@ class Studio(QObject):
                     "newPath": str(resolved_path)}
 
         return tab_id, work, finalize, abort
+
+    def _extra_asset_roots(self) -> list[Path]:
+        roots: list[Path] = []
+        if getattr(self, "folder", ""):
+            roots.append(Path(self.folder))
+        location = self.settings.get("newNoteLocation") if isinstance(getattr(self, "settings", None), dict) else None
+        if location:
+            roots.append(Path(location))
+        return roots
+
+    def _apply_saved_tab_assets(self, tab_id: str, path: Path, content_snapshot: str,
+                                assets_snapshot: dict, updated: dict, stamp=None) -> None:
+        if stamp and hasattr(self, "note_file_stamps"):
+            self.note_file_stamps[str(path)] = stamp
+        target = next((item for item in self.tabs if item["id"] == tab_id), None)
+        if target is not None:
+            extra = {k: v for k, v in target.get("assets", {}).items() if k not in assets_snapshot}
+            target["assets"] = {**updated, **extra} if extra else updated
+            target["saved"] = content_snapshot
+            target["saved_assets"] = dict(updated)
+            target["assets_dirty"] = bool(extra)
+            target["conflict"] = False
+            if Studio._is_dirty(self, target) and getattr(self, "settings", {}).get("autosave") and hasattr(self, "autosave_timer"):
+                self.autosave_timer.start(900)
+        session = getattr(self, "session", None)
+        reader_assets = getattr(session, "reader_assets", None)
+        if reader_assets is not None:
+            reader_assets.revoke_tab(self.window_id, tab_id)
+        if hasattr(self, "readerCall"):
+            self.readerCall.emit("window.dispatchEvent(new Event('supermd-assets-changed'))")
+        if hasattr(self, "_recover"):
+            self._recover()
+        if hasattr(self, "_emit"):
+            self._emit()
 
     def _prepare_attach_tab_asset(self, args):
         """Prepare attaching a bounded local or relay-supplied image to a saved portable note."""
@@ -3148,7 +3638,7 @@ class Studio(QObject):
         if not tab.get("portable") or path.suffix.lower() != ".smd" or not path.is_file():
             raise ValueError("Attaching an asset requires a saved portable .smd note")
         saved_snapshot = tab["saved"]
-        if content_snapshot != saved_snapshot:
+        if Studio._is_dirty(self, tab):
             raise ValueError("Save the note before attaching a portable asset")
 
         mime = args.get("mimeType")
@@ -3163,16 +3653,10 @@ class Studio(QObject):
                 raise ValueError("Inline asset type or size is invalid")
             requested_name = args.get("assetName")
         else:
-            extra_roots: list[Path] = []
-            if getattr(self, "folder", ""):
-                extra_roots.append(Path(self.folder))
-            location = self.settings.get("newNoteLocation") if isinstance(getattr(self, "settings", None), dict) else None
-            if location:
-                extra_roots.append(Path(location))
             candidate = _validate_local_tab_asset_path(
                 asset_path,
                 path,
-                extra_roots,
+                Studio._extra_asset_roots(self),
                 unavailable_message="Asset file is unavailable",
                 outside_message="Asset must be inside the current note folder or a configured folder",
             )
@@ -3210,13 +3694,7 @@ class Studio(QObject):
                 filename += "." + ext
             if MIMES.get(ext) != mime:
                 raise ValueError("Asset name extension must match the image type")
-            signatures = {"image/png": raw.startswith(b"\x89PNG\r\n\x1a\n"),
-                          "image/jpeg": raw.startswith(b"\xff\xd8\xff"),
-                          "image/webp": len(raw) >= 12 and raw[:4] == b"RIFF" and raw[8:12] == b"WEBP",
-                          "image/gif": raw.startswith((b"GIF87a", b"GIF89a")),
-                          "image/avif": len(raw) >= 12 and raw[4:8] == b"ftyp" and b"avif" in raw[8:16],
-                          "image/svg+xml": b"<svg" in raw[:4096].lower()}
-            if not signatures.get(mime, False):
+            if not _matches_media_signature(mime, raw):
                 raise ValueError("Asset bytes do not match the declared image type")
             asset_key = "assets/" + filename
             if asset_key in assets_snapshot:
@@ -3227,34 +3705,24 @@ class Studio(QObject):
             updated = dict(assets_snapshot)
             updated[asset_key] = f"data:{mime};base64," + encode_base64_chunked(raw)
             write_portable(path, content_snapshot, updated)
+            try:
+                st = path.stat()
+                stamp = (st.st_mtime_ns, st.st_size)
+            except OSError:
+                stamp = None
             sha = hashlib.sha256(raw).hexdigest()
             record = {"name": asset_key, "mime": mime, "bytes": len(raw), "sha256": sha}
-            return {"updated": updated, "result": {"tabId": tab_id, "assetName": asset_key, "asset": record,
-                                                   "mimeType": mime, "bytes": len(raw), "sha256": sha,
-                                                   "revision": revision, "saved": True}}
+            return {"updated": updated, "stamp": stamp,
+                    "result": {"tabId": tab_id, "assetName": asset_key, "asset": record,
+                               "mimeType": mime, "bytes": len(raw), "sha256": sha,
+                               "revision": revision, "saved": True}}
 
         def finalize(value, error):
             if error is not None:
                 return None
-            updated = value["updated"]
-            target = next((item for item in self.tabs if item["id"] == tab_id), None)
-            if target is not None:
-                extra = {k: v for k, v in target.get("assets", {}).items() if k not in assets_snapshot}
-                target["assets"] = {**updated, **extra} if extra else updated
-                target["saved"] = content_snapshot
-                target["saved_assets"] = dict(updated)
-                if target["content"] != content_snapshot and getattr(self, "settings", {}).get("autosave") and hasattr(self, "autosave_timer"):
-                    self.autosave_timer.start(900)
-            session = getattr(self, "session", None)
-            reader_assets = getattr(session, "reader_assets", None)
-            if reader_assets is not None:
-                reader_assets.revoke_tab(self.window_id, tab_id)
-            if hasattr(self, "readerCall"):
-                self.readerCall.emit("window.dispatchEvent(new Event('supermd-assets-changed'))")
-            if hasattr(self, "_recover"):
-                self._recover()
-            if hasattr(self, "_emit"):
-                self._emit()
+            Studio._apply_saved_tab_assets(
+                self, tab_id, path, content_snapshot, assets_snapshot, value["updated"], value.get("stamp")
+            )
             return value["result"]
 
         return tab_id, work, finalize, lambda: None
@@ -3329,15 +3797,7 @@ class Studio(QObject):
             raise ValueError("Media data is not valid base64") from None
         if not first_chunk or len(first_chunk) > 25_000_000:
             raise ValueError("Media data is empty or exceeds 25 MB")
-        head = first_chunk[:4096]
-        signatures = {"image/png": head.startswith(b"\x89PNG\r\n\x1a\n"),
-                      "image/jpeg": head.startswith(b"\xff\xd8\xff"),
-                      "image/webp": len(head) >= 12 and head[:4] == b"RIFF" and head[8:12] == b"WEBP",
-                      "image/gif": head.startswith((b"GIF87a", b"GIF89a")),
-                      "image/avif": len(head) >= 12 and head[4:8] == b"ftyp" and b"avif" in head[8:16],
-                      "image/svg+xml": b"<svg" in head.lower(),
-                      "text/plain": True}
-        if not signatures[mime_type]:
+        if not _matches_media_signature(mime_type, first_chunk):
             raise ValueError("Media bytes do not match the declared type")
 
         for suffix in range(1, 10000):
@@ -3382,24 +3842,8 @@ class Studio(QObject):
             raise ValueError("The media download folder is unavailable")
         return directory
 
-    def _prepare_save_media(self, args):
-        directory = self._media_download_directory()
-        if not isinstance(args, dict):
-            raise ValueError("Invalid media payload")
-        # Validate lightweight envelope fields up front while keeping base64 decode and disk I/O in work().
-        extensions = {"image/png", "image/svg+xml", "image/jpeg", "image/webp", "image/gif", "image/avif", "text/plain"}
-        mime_type, filename, body = args.get("mimeType"), args.get("filename", ""), args.get("body")
-        if mime_type not in extensions:
-            raise ValueError("Unsupported media type")
-        if not isinstance(filename, str) or len(filename) > 160 or any(char in filename for char in ("/", "\\", "\0")):
-            raise ValueError("Media filename must be a short basename")
-        if not isinstance(body, str) or len(body) > 36_000_000:
-            raise ValueError("Media data is invalid or exceeds 25 MB")
-        snapshot = dict(args)
-        return lambda: Studio._validate_and_write_media(snapshot, directory)
-
     def _save_media_native(self, args):
-        return self._prepare_save_media(args)()
+        return Studio._validate_and_write_media(args, self._media_download_directory())
 
     def _prepare_replace_tab_asset(self, args):
         tab_id = args.get("tabId")
@@ -3417,7 +3861,7 @@ class Studio(QObject):
         if not tab.get("portable") or path.suffix.lower() != ".smd" or not path.is_file():
             raise ValueError("Asset replacement requires a saved portable .smd note")
         saved_snapshot = tab["saved"]
-        if content_snapshot != saved_snapshot:
+        if Studio._is_dirty(self, tab):
             raise ValueError("Save the note before replacing a portable asset")
         asset_id, asset_path_value = args.get("assetName"), args.get("assetPath")
         assets_snapshot = dict(tab.get("assets", {}))
@@ -3426,16 +3870,10 @@ class Studio(QObject):
             if hashlib.sha256(name.encode("utf-8")).hexdigest() == asset_id), None)
         if not asset_name:
             raise ValueError("Asset ID is not present in the current note")
-        extra_roots: list[Path] = []
-        if getattr(self, "folder", ""):
-            extra_roots.append(Path(self.folder))
-        location = self.settings.get("newNoteLocation") if isinstance(getattr(self, "settings", None), dict) else None
-        if location:
-            extra_roots.append(Path(location))
         candidate = _validate_local_tab_asset_path(
             asset_path_value,
             path,
-            extra_roots,
+            Studio._extra_asset_roots(self),
             unavailable_message="Replacement asset file is unavailable",
             outside_message="Replacement asset must be inside the current note folder or a configured folder",
         )
@@ -3451,13 +3889,7 @@ class Studio(QObject):
             raw = candidate.read_bytes()
             if len(raw) > MAX_IMAGE:
                 raise ValueError("Replacement asset exceeds 25 MB")
-            signatures = {"image/png": raw.startswith(b"\x89PNG\r\n\x1a\n"),
-                          "image/jpeg": raw.startswith(b"\xff\xd8\xff"),
-                          "image/webp": len(raw) >= 12 and raw[:4] == b"RIFF" and raw[8:12] == b"WEBP",
-                          "image/gif": raw.startswith((b"GIF87a", b"GIF89a")),
-                          "image/avif": len(raw) >= 12 and raw[4:8] == b"ftyp" and b"avif" in raw[8:16],
-                          "image/svg+xml": b"<svg" in raw[:4096].lower()}
-            if not signatures.get(mime, False):
+            if not _matches_media_signature(mime, raw):
                 raise ValueError("Replacement asset bytes do not match the current MIME type")
             old_mime, old_data = image_data(assets_snapshot[asset_name])
             if old_mime != mime:
@@ -3474,7 +3906,12 @@ class Studio(QObject):
             # The text revision is checked above; writing the existing open SMD is
             # atomic and preserves every other asset and the exact Markdown string.
             write_portable(path, content_snapshot, updated)
-            return {"changed": True, "updated": updated,
+            try:
+                st = path.stat()
+                stamp = (st.st_mtime_ns, st.st_size)
+            except OSError:
+                stamp = None
+            return {"changed": True, "updated": updated, "stamp": stamp,
                     "result": {"tabId": tab_id, "assetName": asset_name, "asset": asset_name, "assetId": asset_name,
                                "revision": current, "changed": True, "saved": True, "bytes": len(raw),
                                "mimeType": mime}}
@@ -3483,25 +3920,9 @@ class Studio(QObject):
             if error is not None:
                 return None
             if value["changed"]:
-                updated = value["updated"]
-                target = next((item for item in self.tabs if item["id"] == tab_id), None)
-                if target is not None:
-                    extra = {k: v for k, v in target.get("assets", {}).items() if k not in assets_snapshot}
-                    target["assets"] = {**updated, **extra} if extra else updated
-                    target["saved"] = content_snapshot
-                    target["saved_assets"] = dict(updated)
-                    if target["content"] != content_snapshot and getattr(self, "settings", {}).get("autosave") and hasattr(self, "autosave_timer"):
-                        self.autosave_timer.start(900)
-                session = getattr(self, "session", None)
-                reader_assets = getattr(session, "reader_assets", None)
-                if reader_assets is not None:
-                    reader_assets.revoke_tab(self.window_id, tab_id)
-                if hasattr(self, "readerCall"):
-                    self.readerCall.emit("window.dispatchEvent(new Event('supermd-assets-changed'))")
-                if hasattr(self, "_recover"):
-                    self._recover()
-                if hasattr(self, "_emit"):
-                    self._emit()
+                Studio._apply_saved_tab_assets(
+                    self, tab_id, path, content_snapshot, assets_snapshot, value["updated"], value.get("stamp")
+                )
             return value["result"]
 
         return tab_id, work, finalize, lambda: None
@@ -3769,6 +4190,12 @@ class Studio(QObject):
                 text=args.get("text")
                 if not isinstance(text,str) or len(text)>2_000_000:raise ValueError("Clipboard text is too large or invalid")
                 QGuiApplication.clipboard().setText(text);self.replied.emit(id,"true","");return
+            if command == "apply_bundled_theme":
+                preset_id=args.get("id")
+                if not isinstance(preset_id,str) or not preset_id:
+                    raise ValueError("Invalid bundled theme id")
+                self._apply_bundled_theme(preset_id,lambda result,error:self.replied.emit(id,json.dumps(result) if not error else "null",error or ""))
+                return
             if command == "reading_position":
                 target=next((t for t in self.tabs if t["id"]==args.get("id")),None);location=args.get("location")
                 if target and target["path"] and self.settings["restorePosition"] and isinstance(location,dict):
@@ -3869,7 +4296,7 @@ class Studio(QObject):
                 self.settings["fullZoom" if args.get("fullscreen", self.fullscreen) else "normalZoom"] = max(40,min(300,args["zoom"]))
                 self.preference_timer.start(500)
                 self._emit(False); self.replied.emit(id,"true",""); return
-            if command == "export_failed": self.pending_export = self.pending_save_as = ""; self.message = args["error"]; self._emit(False); self.replied.emit(id,"true",""); return
+            if command == "export_failed": self.pending_export = self.pending_save_as = self.pending_save_as_tab = ""; self.message = args["error"]; self._emit(False); self.replied.emit(id,"true",""); return
             if command == "request_fmd_export": self.exportRequested.emit("smd"); self.replied.emit(id,"true",""); return
             context=args.get("context")
             if context is not None:
@@ -3882,8 +4309,13 @@ class Studio(QObject):
             if context and context["document"] not in (tab["id"],tab["path"]):raise ValueError("Python output belongs to another note")
             captured = dict(tab)
             captured["assets"] = dict(tab["assets"])
+            captured["saved_assets"] = dict(tab.get("saved_assets", {}))
             output = self.pending_export
             save_as = self.pending_save_as
+            save_as_tab = self.pending_save_as_tab
+            force_portable_overwrite = bool(command == "export_fmd_native" and args.get("save") and captured["id"] in self._force_overwrite_ids)
+            if command == "export_fmd_native" and args.get("save"):
+                self._force_overwrite_ids.discard(captured["id"])
             # Preparation is asynchronous. Recheck the actual writer, not just
             # the dialog choice, so a stale/cross-format callback cannot put
             # PDF bytes in an SMD file (or overwrite a portable note with text).
@@ -3895,11 +4327,12 @@ class Studio(QObject):
             if command in expected_suffixes and not (command == "export_fmd_native" and args.get("save")):
                 if not output or Path(output).suffix.casefold() not in expected_suffixes[command]:
                     raise ValueError("The export destination does not match the requested file format; choose the destination again")
+            saving_tab_id = (save_as_tab or captured["id"]) if (command == "export_fmd_native" and save_as) else captured["id"]
             is_portable_tab_save = command == "export_fmd_native" and not agent_export_info and bool(args.get("save") or save_as)
             if is_portable_tab_save:
-                if captured["id"] in self.saving:
+                if saving_tab_id in self.saving:
                     raise ValueError("A save is already in progress for this tab; retry after it finishes")
-                self.saving.add(captured["id"])
+                self.saving.add(saving_tab_id)
             python = self.settings["python"]
             export_job = None
             if command == "export_pdf_native":
@@ -3956,9 +4389,22 @@ class Studio(QObject):
                     else: write_markdown_export(Path(output), args.get("content"), args.get("assets", {}))
                     return export_result(output)
                 if command == "export_fmd_native":
-                    target = Path(captured["path"]) if args.get("save") else Path(output)
-                    write_portable(target,args["content"],args["assets"])
-                    return export_result(target)
+                    target_path = Path(captured["path"]) if args.get("save") else Path(output)
+                    if args.get("save") and not force_portable_overwrite and target_path.exists():
+                        try:
+                            disk_content, disk_assets, _ = open_note(target_path)
+                            if disk_content != captured["saved"] or disk_assets != captured.get("saved_assets", {}):
+                                return {"_conflict": True}
+                        except Exception:
+                            return {"_conflict": True}
+                    write_portable(target_path,args["content"],args["assets"])
+                    result_data = export_result(target_path)
+                    try:
+                        st = target_path.stat()
+                        result_data["_stamp"] = (st.st_mtime_ns, st.st_size)
+                    except OSError:
+                        pass
+                    return result_data
                 if command == "export_pdf_native":
                     job = export_job
                     assert job is not None
@@ -4022,9 +4468,11 @@ class Studio(QObject):
                 raise ValueError(f"Unsupported command: {command}")
             def finished(result,error):
                 if is_portable_tab_save:
-                    self.saving.discard(captured["id"])
+                    self.saving.discard(saving_tab_id)
                 if command.startswith("export_") and self.pending_export == output: self.pending_export = ""
-                if error and self.pending_save_as == save_as: self.pending_save_as = ""
+                if error and self.pending_save_as == save_as:
+                    self.pending_save_as = ""
+                    self.pending_save_as_tab = ""
                 if error:
                     if agent_export_info:
                         record = self._agent_job_records.get(agent_export_info.get("jobId"))
@@ -4040,23 +4488,66 @@ class Studio(QObject):
                     if not agent_export_info:
                         self.replied.emit(id,"null",error)
                     return
+                if command == "export_fmd_native" and isinstance(result, dict) and result.get("_conflict"):
+                    target_tab = next((t for t in self.tabs if t["id"] == captured["id"]), None)
+                    if target_tab:
+                        target_tab["conflict"] = True
+                        self.message = "This file changed on disk since you opened or last saved it."
+                        self._emit(False)
+                        self.saveConflictRequested.emit(target_tab["name"])
+                    self.replied.emit(id, json.dumps({"saved": False, "conflict": True}), "")
+                    return
+                stamp = result.pop("_stamp", None) if isinstance(result, dict) else None
+                if stamp and isinstance(result, dict) and result.get("path"):
+                    self.note_file_stamps[str(result["path"])] = stamp
                 target = next((t for t in self.tabs if t["id"] == captured["id"]),None)
-                if command == "import_images" and target: target["assets"].update(captured["assets"])
+                if command == "import_images" and target:
+                    target["assets"].update(captured["assets"])
+                    target["assets_dirty"] = True
+                    self.recovery_timer.start(800)
+                    self.autosave_timer.start(900)
+                    self._emit(False)
                 if command == "export_fmd_native" and args.get("save") and target:
-                    target.update(saved=args["originalContent"], assets=args["assets"])
-                    target["saved_assets"] = dict(args["assets"])
+                    target.update(
+                        saved=args["originalContent"],
+                        assets=args["assets"],
+                        saved_assets=dict(args["assets"]),
+                        assets_dirty=False,
+                        conflict=False,
+                    )
                     if target["content"] == args["originalContent"]: target["content"] = target["saved"] = args["content"]
+                    self.message = "Saved"
                     self._recover()
+                    self._emit()
                     if self.pending_close: self._finish_close()
-                elif command == "export_fmd_native" and save_as and target:
-                    if target["content"] == args["originalContent"]:
-                        target.update(path=save_as,name=Path(save_as).name,content=args["content"],saved=args["content"],assets=args["assets"],portable=True)
-                        target["saved_assets"] = dict(args["assets"])
+                elif command == "export_fmd_native" and save_as:
+                    save_target = next((t for t in self.tabs if t["id"] == (save_as_tab or captured["id"])), target)
+                    if save_target:
+                        new_content = args["content"] if save_target["content"] == args.get("originalContent", save_target["content"]) else save_target["content"]
+                        save_target.update(
+                            path=save_as,
+                            name=Path(save_as).name,
+                            content=new_content,
+                            saved=args["content"],
+                            assets=args["assets"],
+                            saved_assets=dict(args["assets"]),
+                            assets_dirty=False,
+                            portable=True,
+                            conflict=False,
+                        )
+                        try:
+                            self._agent_open_paths.add(str(Path(save_as).resolve()))
+                        except OSError:
+                            pass
+                        self.recent = [save_as] + [p for p in self.recent if p != save_as][:29]
+                        self._preferences()
+                        self.message = "Saved"
                         self._recover()
                         self._emit()
                         if self.pending_close: self._finish_close()
                     self.pending_save_as = ""
-                if command.startswith("export_"): self.message = f"Exported {Path(result['path']).name}"
+                    self.pending_save_as_tab = ""
+                elif command.startswith("export_"): self.message = f"Exported {Path(result['path']).name}"
                 if agent_export_info:
                     record = self._agent_job_records.get(agent_export_info.get("jobId"))
                     if record:
@@ -4085,7 +4576,7 @@ class Studio(QObject):
                 if not agent_export_info:
                     self.replied.emit(id,json.dumps(result),"")
             if is_portable_tab_save and (self.retired or getattr(self.writes, "_shutdown", False)):
-                self.saving.discard(captured["id"])
+                self.saving.discard(saving_tab_id)
                 return
             self._submit(work,finished,command in ("run_python","export_fmd_native","export_pdf_native","export_markdown_native"),self.writes if command in ("export_fmd_native", "export_markdown_native") else None)
         except Exception as error:
