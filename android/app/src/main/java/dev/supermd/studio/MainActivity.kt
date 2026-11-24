@@ -1233,12 +1233,15 @@ private object NoMotionScheme : MotionScheme {
                                 when(event.action) {
                                     android.view.DragEvent.ACTION_DRAG_STARTED -> event.clipDescription?.let { it.hasMimeType("image/*") || it.hasMimeType("application/octet-stream") || it.hasMimeType("text/uri-list") } == true
                                     android.view.DragEvent.ACTION_DROP -> {
+                                        if (model.state.value.readerOverlay || model.state.value.busy) return@setOnDragListener true
                                         val permissions = activity.requestDragAndDropPermissions(event)
                                         val clip = event.clipData
                                         val uris = (0 until (clip?.itemCount ?: 0)).mapNotNull { clip!!.getItemAt(it).uri }
                                         if (uris.isNotEmpty()) {
                                             val id = model.state.value.active.id
-                                            evaluateJavascript("window.supermdCaptureInsertion?.()", null)
+                                            val x = event.x / density.density
+                                            val y = event.y / density.density
+                                            evaluateJavascript("window.supermdCaptureInsertion?.($x,$y)", null)
                                             model.importDropped(uris, id) { images -> permissions?.release(); images?.let { evaluateJavascript("window.supermdInsertImages?.($it)", null) } }
                                         } else permissions?.release()
                                         true
@@ -1705,6 +1708,7 @@ internal class NoteDestination(private val mime: String, private val preferred: 
     var message by remember { mutableStateOf("") }
     var pendingPairingFile by remember { mutableStateOf<String?>(null) }
     var pendingGuide by remember { mutableStateOf<String?>(null) }
+    var pendingSkillArchive by remember { mutableStateOf<ByteArray?>(null) }
     var enabled by remember { mutableStateOf(activity.agentAccessState.enabled) }
     fun revokeThen(action: () -> Unit) {
         message = "Disconnecting and revoking previous device registrations…"
@@ -1755,7 +1759,17 @@ internal class NoteDestination(private val mime: String, private val preferred: 
         if (uri != null && guide != null) runCatching {
             activity.contentResolver.openOutputStream(uri, "w")?.use { it.write(guide.toByteArray(Charsets.UTF_8)); it.flush() }
                 ?: error("Android could not write the setup guide")
-        }.onFailure { message = "Could not save setup guide: ${it.message}" }
+        }.onSuccess { message = "Setup instructions saved." }
+            .onFailure { message = "Could not save setup guide: ${it.message}" }
+    }
+    val skillExport = rememberLauncherForActivityResult(ActivityResultContracts.CreateDocument("application/zip")) { uri ->
+        val archive = pendingSkillArchive
+        pendingSkillArchive = null
+        if (uri != null && archive != null) runCatching {
+            activity.contentResolver.openOutputStream(uri, "w")?.use { it.write(archive); it.flush() }
+                ?: error("Android could not write the skill package")
+        }.onSuccess { message = "Skill package saved." }
+            .onFailure { message = "Could not save skill package: ${it.message}" }
     }
     val config = activity.agentConfigForThisWindow() ?: activity.agentAccessState.currentConfig()
     Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
@@ -1783,6 +1797,11 @@ internal class NoteDestination(private val mime: String, private val preferred: 
                 if (file == null) message = "Create or join a workspace first"
                 else { pendingPairingFile = file; pairingExport.launch("SuperMD-pairing.json") }
             }) { Text("Export trusted pairing file…") }
+            OutlinedButton(onClick = {
+                runCatching { activity.assets.open("web/super-md-skill.zip").use { it.readBytes() } }
+                    .onSuccess { bytes -> pendingSkillArchive = bytes; skillExport.launch("super-md-skill.zip") }
+                    .onFailure { message = "Could not load skill package: ${it.message}" }
+            }) { Text("Export skill package (.zip)…") }
         }
         if (config != null) {
             FlowRow(horizontalArrangement = Arrangement.spacedBy(8.dp)) {

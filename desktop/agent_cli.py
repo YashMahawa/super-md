@@ -121,9 +121,15 @@ def main(argv: list[str] | None = None) -> int:
     if argv and argv[0] in ("install-skill", "service"):
         try:
             if argv[0] == "install-skill":
-                from install_skill import main as extension_main
+                try:
+                    from .install_skill import main as extension_main
+                except ImportError:
+                    from install_skill import main as extension_main
             else:
-                from background_cli import main as extension_main
+                try:
+                    from .background_cli import main as extension_main
+                except ImportError:
+                    from background_cli import main as extension_main
             return extension_main(argv[1:])
         except (ValueError, OSError, ImportError) as error:
             _emit({"ok": False, "error": {"type": type(error).__name__, "message": str(error)[:1000]}})
