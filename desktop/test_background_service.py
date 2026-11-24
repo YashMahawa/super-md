@@ -88,8 +88,7 @@ class BackgroundTests(unittest.TestCase):
 
     def _pump(self, rounds=8):
         for _ in range(rounds):
-            self.qt_app.processEvents()
-            time.sleep(0.005)
+            QTest.qWait(5)
 
     def _make_session(self):
         session = Session(True)
@@ -692,13 +691,18 @@ for raw in cin:
     with patch.object(QStandardPaths, "writableLocation", side_effect=lambda k, p=appdata: p if k == QStandardPaths.AppDataLocation else orig(k)):
         if cmd["kind"] == "claim":
             broker = InstanceBroker()
-            claimed = broker.claim_or_forward(cmd.get("note"))
+            claimed = broker.claim_or_forward(
+                cmd.get("note"),
+                defer_listen=bool(cmd.get("deferListen", False)),
+                open_existing=bool(cmd.get("openExisting", True)),
+            )
             if claimed: broker.close()
             cout.write(json.dumps({"claimed": claimed}) + "\\n"); cout.flush()
         else:
             out, err, marker = io.StringIO(), io.StringIO(), cmd.get("spawnMarker")
             real_spawn = cmd.get("realSpawn")
             orig_popen = real_subprocess.Popen
+            call_procs = []
             def _write_marker(path, data):
                 tmp = path + ".tmp"
                 with open(tmp, "w", encoding="utf-8") as fh:
@@ -721,17 +725,21 @@ for raw in cin:
                         start_new_session=kwargs.get("start_new_session", False),
                         creationflags=kwargs.get("creationflags", 0),
                     )
-                    with _spawned_lock:
-                        _spawned_procs.append(proc)
+                    call_procs.append(proc)
                     if marker:
                         _write_marker(marker, {"cmd": spawn_cmd, "pid": proc.pid})
                     return proc
                 if not marker: raise AssertionError("Unexpected Popen")
                 _write_marker(marker, spawn_cmd); return MagicMock()
-            with patch.object(background_cli.subprocess, "Popen", side_effect=fake_popen), patch.object(sys, "stdin", io.StringIO("")), contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
-                try: code = agent_cli.main(["service", cmd["action"]])
-                except SystemExit as exc: code = exc.code if isinstance(exc.code, int) else 1
-                except Exception as exc: err.write(repr(exc)); code = 1
+            try:
+                with patch.object(background_cli.subprocess, "Popen", side_effect=fake_popen), patch.object(sys, "stdin", io.StringIO("")), contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+                    try: code = agent_cli.main(["service", cmd["action"]])
+                    except SystemExit as exc: code = exc.code if isinstance(exc.code, int) else 1
+                    except Exception as exc: err.write(repr(exc)); code = 1
+            finally:
+                if call_procs:
+                    with _spawned_lock:
+                        _spawned_procs.extend(call_procs)
             cout.write(json.dumps({"code": code, "stdout": out.getvalue(), "stderr": err.getvalue()}) + "\\n"); cout.flush()
 """
 
@@ -815,10 +823,9 @@ class InstanceBrokerAndServiceCliTests(unittest.TestCase):
         deadline = time.monotonic() + timeout
         while thread.is_alive() and time.monotonic() < deadline:
             if on_tick: on_tick()
-            self.qt_app.processEvents()
-            time.sleep(0.005)
+            QTest.qWait(5)
         thread.join(timeout=1)
-        self.qt_app.processEvents()
+        QTest.qWait(5)
         if errors: raise errors[0]
         self.assertIn("data", reply, "IPC worker timed out")
         return reply["data"]
@@ -943,10 +950,9 @@ class InstanceBrokerAndServiceCliTests(unittest.TestCase):
         worker.start()
         deadline = time.monotonic() + 8.0
         while not done and time.monotonic() < deadline:
-            self.qt_app.processEvents()
-            time.sleep(0.005)
+            QTest.qWait(5)
         worker.join(timeout=1.0)
-        self.qt_app.processEvents()
+        QTest.qWait(5)
         if errs:
             raise errs[0]
         self.assertIn("result", holder, f"LiveTabClient({action}) timed out")
@@ -1861,21 +1867,25 @@ desktop_main._exit_process(rc)""",
 
             # Duplicate --background launch while primary finishes QML startup and calls start_listening():
             # open_existing=False must return False without emitting `requested` to pop a visible window.
-            QTimer.singleShot(120, deferred_broker.start_listening)
-            dup_result = {}
+            deferred_state = {"started_at": time.monotonic(), "listening": False}
 
-            def run_dup_bg():
-                dup = InstanceBroker()
-                dup_result["claimed"] = dup.claim_or_forward(None, defer_listen=True, open_existing=False)
+            def start_deferred_soon():
+                if not deferred_state["listening"] and time.monotonic() - deferred_state["started_at"] >= 0.12:
+                    deferred_state["listening"] = True
+                    deferred_broker.start_listening()
 
-            dup_thread = threading.Thread(target=run_dup_bg, daemon=True)
-            dup_thread.start()
-            dup_deadline = time.monotonic() + 4.0
-            while dup_thread.is_alive() and time.monotonic() < dup_deadline:
-                self.qt_app.processEvents()
-                time.sleep(0.01)
-            dup_thread.join(timeout=1.0)
-            self.assertIs(dup_result.get("claimed"), False)
+            dup_res = self._call(
+                {
+                    "kind": "claim",
+                    "note": None,
+                    "appdata": str(deferred_appdata),
+                    "deferListen": True,
+                    "openExisting": False,
+                },
+                on_tick=start_deferred_soon,
+                timeout=8.0,
+            )
+            self.assertIs(dup_res.get("claimed"), False)
             self.assertTrue(deferred_broker.server.isListening())
             self.assertEqual(forwarded_notes, [])
 
@@ -1907,8 +1917,12 @@ desktop_main._exit_process(rc)""",
         dying_server = QLocalServer(self.qt_app)
         dying_server.setSocketOptions(QLocalServer.SocketOption.UserAccessOption)
         held = []
+        dying_state = {"second_at": None, "closed": False}
 
         def close_dying():
+            if dying_state["closed"]:
+                return
+            dying_state["closed"] = True
             for s in held:
                 s.abort()
             dying_server.close()
@@ -1918,7 +1932,8 @@ desktop_main._exit_process(rc)""",
             while dying_server.hasPendingConnections():
                 sock = dying_server.nextPendingConnection()
                 held.append(sock)
-                if len(held) == 2:
+                if len(held) == 2 and dying_state["second_at"] is None:
+                    dying_state["second_at"] = time.monotonic()
                     QTimer.singleShot(20, close_dying)
 
         dying_server.newConnection.connect(on_dying_connect)
@@ -1928,6 +1943,8 @@ desktop_main._exit_process(rc)""",
         spawned, marker = [], vanished_appdata / "vanished-spawn.json"
 
         def advance_vanish_race():
+            if dying_state["second_at"] is not None and not dying_state["closed"] and time.monotonic() - dying_state["second_at"] >= 0.02:
+                close_dying()
             if marker.is_file() and not spawned:
                 spawned.append(json.loads(marker.read_text(encoding="utf-8")))
                 with patch.object(

@@ -253,7 +253,7 @@ ApplicationWindow {
     font.family: "Noto Sans"
     function activateReaderIfNeeded() {
         if (intentionalShutdown || closingAllowed || studio.retired || readerRecoveryPending) return
-        studio.ensureReaderProfile()
+        if (typeof studio.ensureReaderProfile === "function") studio.ensureReaderProfile()
         readerActivated = true
         if (!readerLoader.active) readerLoader.active = true
     }
@@ -317,7 +317,7 @@ ApplicationWindow {
         repeat: false
         onTriggered: {
             if (!window.intentionalShutdown && !window.closingAllowed && !studio.retired && readerLoader) {
-                studio.ensureReaderProfile()
+                if (typeof studio.ensureReaderProfile === "function") studio.ensureReaderProfile()
                 readerLoader.active = true
             }
         }

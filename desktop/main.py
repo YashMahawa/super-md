@@ -221,7 +221,9 @@ def main():
         window.visibleChanged.connect(
             lambda: QTimer.singleShot(
                 0,
-                lambda: session.background.handle_window_visibility(studio, engines=engines, studios=studios, engine=engine),
+                lambda: session.background.handle_window_visibility(studio, engines=engines, studios=studios, engine=engine)
+                if getattr(session, "background", None) is not None
+                else None,
             )
         )
         remembered = session.settings.get("window") or {}
@@ -535,7 +537,7 @@ def main():
     app.openRequested.connect(open_from_service)
     app.reopenRequested.connect(
         lambda: open_from_service(None)
-        if session.background.enabled and not session.background.forced and not session.background.quitting and not session.quitting and not session.background.visible_windows()
+        if getattr(session, "background", None) is not None and session.background.enabled and not session.background.forced and not session.background.quitting and not session.quitting and not session.background.visible_windows()
         else None
     )
     if args.quit_after:

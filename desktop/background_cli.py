@@ -87,7 +87,7 @@ def main(argv):
         except ValueError as error:
             if 'Invalid response' in str(error):raise
             if not _instance_lock_held():
-                vanish_deadline=time.monotonic()+.5
+                vanish_deadline=time.monotonic()+1.5
                 still_listening=True
                 while still_listening and not _instance_lock_held() and time.monotonic()<vanish_deadline:
                     probe=QLocalSocket();probe.connectToServer(name)
