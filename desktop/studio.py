@@ -572,10 +572,12 @@ class Studio(QObject):
         self.python_choices=[]
         self.python_busy=False
         self.pythonProgress.connect(self._python_progress)
+        self._default_python_pending_persist = False
         if not self.settings.get("python"):
             self._choose_default_python(persist=False)
             if self.settings.get("python"):
-                QTimer.singleShot(0, lambda: self._preferences(False))
+                self._default_python_pending_persist = True
+                QTimer.singleShot(0, self._persist_default_python)
         if not isolated and len(self.session.windows)==1:QTimer.singleShot(0,self._restore_update)
         self.tabs: list[dict] = []
         self.closed_tabs = self.session.closed_tabs
@@ -1657,6 +1659,10 @@ class Studio(QObject):
     def _python_folders(self):
         return [p for p in [self.folder, *(str(Path(t["path"]).parent) for t in self.tabs if t.get("path"))] if p]
 
+    def _persist_default_python(self):
+        if self._default_python_pending_persist:
+            self._preferences(False)
+
     def _choose_default_python(self, persist: bool = True):
         if self.retired or self.settings.get("python"):
             return
@@ -2185,6 +2191,7 @@ class Studio(QObject):
         self._emit(False)
 
     def _preferences(self,notify=True):
+        self._default_python_pending_persist = False
         if self.retired or getattr(self.writes, "_shutdown", False): return
         data = json.dumps({"settings": self.settings, "recent": self.recent, "pinned":self.session.pinned}).encode()
         self._submit(lambda: atomic_write(self.data / "settings.json", data), lambda *_: None, False,self.writes)
@@ -3791,7 +3798,9 @@ class Studio(QObject):
                 self.replied.emit(id, json.dumps({"cancelled": self._export_jobs.cancel(job_id)}), "")
                 return
             tab = self._current()
-            if command == "reader_ready": self.ready = True; self._last_reader_text=None; self._emit(); self.replied.emit(id,"true",""); return
+            if command == "reader_ready":
+                self._persist_default_python()
+                self.ready = True; self._last_reader_text=None; self._emit(); self.replied.emit(id,"true",""); return
             if command == "reader_chrome":
                 action = args.get("action")
                 if action not in ("show", "hide", "toggle"): raise ValueError("Invalid reading chrome action")
