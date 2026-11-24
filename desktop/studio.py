@@ -49,7 +49,7 @@ import file_events
 import custom_theme
 from selection_actions import ASSISTANTS, selection_target
 from shortcuts import DEFINITIONS as SHORTCUT_DEFINITIONS, capture_sequence, default_shortcuts, native_label, normalize_shortcuts, parse_sequence
-from workspace_search import filter_folder_tree, rank_quick_switcher, stream_text_search, walk_folder_notes
+from workspace_search import canonical_note_key, filter_folder_tree, rank_quick_switcher, stream_text_search, walk_folder_notes
 
 ROOT = Path(sys._MEIPASS)/"resources" if getattr(sys,"frozen",False) else Path(__file__).resolve().parent.parent
 DEFAULT_PDF = {"pageSize": "a4", "margin": 14, "fontSize": 10.5, "lineHeight": 1.4, "paragraphSpacing": 0.65, "fontFamily": "Manrope", "pageNumbers": True, "themed": False}
@@ -618,6 +618,7 @@ class Studio(QObject):
         self._folder_search_truncated = False
         self._folder_search_generation = 0
         self._folder_search_cancel: threading.Event | None = None
+        self._folder_search_tabs_sig: list[tuple[str, str, bool]] | None = None
         self._pending_seeded_find: dict | None = None
         self.mode = self.settings.get("readingMode", "live")
         self.fullscreen = False
@@ -677,7 +678,7 @@ class Studio(QObject):
         self.flush_operation = None
         self.flush_timer = QTimer(self)
         self.flush_timer.setSingleShot(True)
-        self.flush_timer.timeout.connect(lambda:self.flushFailed.emit(bool(self.flush_operation and self.flush_operation["action"] == "close_window")))
+        self.flush_timer.timeout.connect(self._on_flush_timeout)
         self.recovery_timer = QTimer(self)
         self.recovery_timer.setSingleShot(True)
         self.recovery_timer.timeout.connect(self._recover)
@@ -1125,13 +1126,19 @@ class Studio(QObject):
 
     @Property("QVariantMap", notify=workspaceSearchChanged)
     def folderSearchState(self):
+        sync_pending = bool(
+            self._folder_search_open
+            and self._folder_search_query.strip()
+            and self.flush_operation
+            and self.flush_operation.get("action") == "sync_for_search"
+        )
         return {
             "open": self._folder_search_open,
             "query": self._folder_search_query,
             "caseSensitive": self._folder_search_case_sensitive,
             "includeDiagrams": self._folder_search_include_diagrams,
             "matches": self._folder_search_matches,
-            "scanning": self._folder_search_scanning,
+            "scanning": self._folder_search_scanning or sync_pending,
             "scannedFiles": self._folder_search_scanned_files,
             "truncated": self._folder_search_truncated,
             "hasFolder": bool(self.folder),
@@ -1148,12 +1155,12 @@ class Studio(QObject):
             }
             for t in self.tabs
         ]
-        pinned_set = set(self.session.pinned)
+        pinned_keys = {canonical_note_key(p) for p in self.session.pinned if p}
         recent_snap = [
             {
                 "path": p,
                 "name": Path(p).name,
-                "pinned": p in pinned_set,
+                "pinned": canonical_note_key(p) in pinned_keys,
             }
             for p in self.recent
             if p
@@ -1184,6 +1191,10 @@ class Studio(QObject):
             self._folder_search_matches = []
             self._folder_search_scanned_files = 0
             self._folder_search_truncated = False
+            self._folder_search_tabs_sig = None
+            if self.flush_operation and self.flush_operation.get("action") == "sync_for_search":
+                self.flush_operation = None
+                self.flush_timer.stop()
 
     def _refresh_quick_switcher(self):
         if self.retired or not self._quick_switcher_open:
@@ -1304,11 +1315,14 @@ class Studio(QObject):
             return
         self._cancel_quick_switcher(close=True)
         self._folder_search_open = True
-        self.workspaceSearchChanged.emit()
+        self._folder_search_tabs_sig = None
         if self.ready and self.tabs and not self.flush_operation:
             self._flush("sync_for_search")
-        elif self._folder_search_query.strip():
-            self._start_folder_search()
+            self.workspaceSearchChanged.emit()
+        else:
+            self.workspaceSearchChanged.emit()
+            if self._folder_search_query.strip():
+                self._start_folder_search()
 
     @Slot(str, bool, bool)
     def updateFolderSearch(self, query: str, case_sensitive: bool = False, include_diagrams: bool = False):
@@ -1333,11 +1347,13 @@ class Studio(QObject):
         query = self._folder_search_query
         if not query or not query.strip():
             self._folder_search_scanning = False
+            self._folder_search_tabs_sig = None
             self.workspaceSearchChanged.emit()
             return
         cancel_event = threading.Event()
         self._folder_search_cancel = cancel_event
         self._folder_search_scanning = True
+        self._folder_search_tabs_sig = [(t["id"], t["content"], self._is_dirty(t)) for t in self.tabs]
         self.workspaceSearchChanged.emit()
 
         tabs_snap, recent_snap, folder_path, active_id = self._search_snapshots()
@@ -2947,7 +2963,11 @@ class Studio(QObject):
         elif operation["action"] == "overwrite_conflict": self._save_current(True)
         elif operation["action"] == "sync_for_search":
             if self._folder_search_open and self._folder_search_query.strip():
-                self._start_folder_search()
+                current_sig = [(t["id"], t["content"], self._is_dirty(t)) for t in self.tabs]
+                if current_sig != self._folder_search_tabs_sig:
+                    self._start_folder_search()
+                else:
+                    self.workspaceSearchChanged.emit()
         elif operation["action"] == "open_quick_item":
             request = json.loads(operation["target"])
             tab_id = request.get("tabId") or ""
@@ -3010,6 +3030,13 @@ class Studio(QObject):
         elif operation["action"] == "close_window" and self.requestWindowClose():
             self._recover()
             QTimer.singleShot(0,self.allowClose.emit)
+
+    def _on_flush_timeout(self):
+        if self.flush_operation and self.flush_operation.get("action") == "sync_for_search":
+            self.flush_operation = None
+            self.workspaceSearchChanged.emit()
+            return
+        self.flushFailed.emit(bool(self.flush_operation and self.flush_operation["action"] == "close_window"))
 
     def _flush(self,action,target=""):
         if self.retired or action=="close_window" and self.pending_close:return

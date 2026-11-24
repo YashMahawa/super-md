@@ -191,13 +191,22 @@ AppDialog {
         }
     }
 
-    onOpened: {
+    onAboutToShow: {
         queryField.text = stateData.query || ""
         selectedIndex = 0
         Qt.callLater(function() {
+            if (!dialog.visible) return
             queryField.forceActiveFocus()
-            queryField.selectAll()
+            if (queryField.text === (dialog.stateData.query || "")) {
+                queryField.selectAll()
+            }
         })
+    }
+
+    onOpened: {
+        if (!queryField.activeFocus) {
+            queryField.forceActiveFocus()
+        }
     }
 
     onClosed: {

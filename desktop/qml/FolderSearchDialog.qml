@@ -260,15 +260,24 @@ AppDialog {
         }
     }
 
-    onOpened: {
+    onAboutToShow: {
         searchField.text = stateData.query || ""
         matchCaseButton.checked = !!stateData.caseSensitive
         includeDiagramsButton.checked = !!stateData.includeDiagrams
         selectedIndex = 0
         Qt.callLater(function() {
+            if (!dialog.visible) return
             searchField.forceActiveFocus()
-            searchField.selectAll()
+            if (searchField.text === (dialog.stateData.query || "")) {
+                searchField.selectAll()
+            }
         })
+    }
+
+    onOpened: {
+        if (!searchField.activeFocus) {
+            searchField.forceActiveFocus()
+        }
     }
 
     onClosed: {

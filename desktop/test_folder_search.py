@@ -16,7 +16,6 @@ from unittest.mock import patch
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 os.environ.setdefault("QT_QUICK_BACKEND", "software")
-os.environ.setdefault("QTWEBENGINE_DISABLE_SANDBOX", "1")
 
 from PySide6.QtCore import QCoreApplication
 from PySide6.QtGui import QGuiApplication
@@ -57,6 +56,7 @@ def _webengine_e2e_probe() -> int:
     os.environ.setdefault("QTWEBENGINE_CHROMIUM_FLAGS", "--disable-gpu --disable-dev-shm-usage")
 
     from PySide6.QtCore import QFile, QIODevice, QMetaObject, QObject, QUrl, Qt, Q_ARG
+    from PySide6.QtGui import QKeySequence
     from PySide6.QtQml import QQmlApplicationEngine
     from PySide6.QtQuick import QQuickItem, QQuickWindow  # noqa: F401
     from PySide6.QtQuickControls2 import QQuickStyle
@@ -74,7 +74,8 @@ def _webengine_e2e_probe() -> int:
     from test_studio import QuietStudio
 
     with tempfile.TemporaryDirectory(prefix="supermd-search-e2e-") as temp_dir:
-        folder = Path(temp_dir) / "notes"
+        resolved_temp = Path(temp_dir).resolve()
+        folder = resolved_temp / "notes"
         (folder / "research" / "deep").mkdir(parents=True)
         (folder / "empty_dir" / "sub_empty").mkdir(parents=True)
 
@@ -91,7 +92,7 @@ def _webengine_e2e_probe() -> int:
         session = Session(True)
         session.settings["python"] = sys.executable
         session.settings["welcomed"] = True
-        session.settings["newNoteLocation"] = temp_dir
+        session.settings["newNoteLocation"] = str(resolved_temp)
         studio = QuietStudio(True, session)
         studio.openFolder(str(folder))
         _wait_until(lambda: len(studio.files) > 0)
@@ -119,15 +120,36 @@ def _webengine_e2e_probe() -> int:
         studio.host_window = window
         window.resize(1280, 800)
         window.show()
+        window.raise_()
+        window.requestActivate()
+        QTest.qWaitForWindowActive(window, 2000)
         QTest.qWait(120)
 
         quick_dialog = window.findChild(QObject, "quickSwitcherDialog")
         search_dialog = window.findChild(QObject, "folderSearchDialog")
         assert quick_dialog is not None and search_dialog is not None
 
+        def send_window_shortcut(action_id: str) -> None:
+            assert _wait_until(lambda: int(window.property("modalDialogCount") or 0) == 0), (
+                f"Expected modalDialogCount==0 before {action_id}, got {window.property('modalDialogCount')}"
+            )
+            window.raise_()
+            window.requestActivate()
+            QTest.qWaitForWindowActive(window, 1000)
+            app.processEvents()
+            seq = QKeySequence.fromString(
+                studio.shortcutSequences(action_id)[0],
+                QKeySequence.SequenceFormat.PortableText,
+            )
+            combo = seq[0]
+            QTest.keyClick(window, combo.key(), combo.keyboardModifiers())
+
         # 1. Trigger Ctrl+P with zero open tabs -> opens Quick Switcher with pinned note first.
-        QTest.keyClick(window, Qt.Key.Key_P, Qt.KeyboardModifier.ControlModifier)
-        assert _wait_until(lambda: bool(quick_dialog.property("visible")) and not studio.quickSwitcherState["loading"])
+        send_window_shortcut("quick_switcher")
+        assert _wait_until(
+            lambda: bool(quick_dialog.property("opened")) and not studio.quickSwitcherState["loading"],
+            timeout=8.0,
+        ), f"Quick Switcher did not open: visible={quick_dialog.property('visible')} state={studio.quickSwitcherState}"
         items = studio.quickSwitcherState["items"]
         assert len(items) >= 2, f"Expected items in quick switcher, got {items}"
         assert items[0]["name"] == "quantum-field.smd" and items[0]["pinned"], f"Pinned note must be first: {items}"
@@ -135,46 +157,70 @@ def _webengine_e2e_probe() -> int:
         # Filter to alpha in <= 3 keystrokes and press Enter to open it.
         quick_input = window.findChild(QObject, "quickSwitcherInput")
         assert quick_input is not None
+        window.requestActivate()
         quick_input.forceActiveFocus()
+        assert _wait_until(lambda: bool(quick_input.property("activeFocus"))), "quickSwitcherInput did not gain focus"
         for key in (Qt.Key.Key_A, Qt.Key.Key_L, Qt.Key.Key_P):
             QTest.keyClick(window, key)
-        assert _wait_until(lambda: len(studio.quickSwitcherState["items"]) >= 1 and studio.quickSwitcherState["items"][0]["name"] == "alpha.md")
+        assert _wait_until(
+            lambda: len(studio.quickSwitcherState["items"]) >= 1
+            and studio.quickSwitcherState["items"][0]["name"] == "alpha.md",
+            timeout=8.0,
+        ), f"Quick Switcher did not filter to alpha.md: text={quick_input.property('text')!r} state={studio.quickSwitcherState}"
         QTest.keyClick(window, Qt.Key.Key_Return)
-        assert _wait_until(lambda: not bool(quick_dialog.property("visible")) and len(studio.tabs) == 1 and studio._current()["name"] == "alpha.md")
+        assert _wait_until(
+            lambda: not bool(quick_dialog.property("visible"))
+            and int(window.property("modalDialogCount") or 0) == 0
+            and len(studio.tabs) == 1
+            and studio._current()["name"] == "alpha.md",
+            timeout=8.0,
+        ), f"Quick Switcher Return did not open alpha.md: tabs={studio.tabs}"
 
         # Wait for WebEngine reader_ready handshake.
-        assert _wait_until(lambda: studio.ready, timeout=15.0), "WebEngine reader did not become ready"
+        assert _wait_until(lambda: studio.ready, timeout=20.0), "WebEngine reader did not become ready"
 
         # 2. Press Ctrl+Shift+F -> open FolderSearchDialog, then Escape -> dismisses and cancels.
-        QTest.keyClick(window, Qt.Key.Key_F, Qt.KeyboardModifier.ControlModifier | Qt.KeyboardModifier.ShiftModifier)
-        assert _wait_until(lambda: bool(search_dialog.property("visible")))
+        send_window_shortcut("search_folder")
+        assert _wait_until(lambda: bool(search_dialog.property("opened")), timeout=8.0), (
+            f"FolderSearchDialog did not open: visible={search_dialog.property('visible')} state={studio.folderSearchState}"
+        )
         search_input = window.findChild(QObject, "folderSearchInput")
         assert search_input is not None
+        window.requestActivate()
         search_input.forceActiveFocus()
+        assert _wait_until(lambda: bool(search_input.property("activeFocus"))), "folderSearchInput did not gain focus"
         QTest.keyClick(window, Qt.Key.Key_Escape)
-        assert _wait_until(lambda: not bool(search_dialog.property("visible")) and not studio.folderSearchState["scanning"])
+        assert _wait_until(
+            lambda: not bool(search_dialog.property("visible"))
+            and int(window.property("modalDialogCount") or 0) == 0
+            and not studio.folderSearchState["scanning"],
+            timeout=8.0,
+        ), f"Escape did not close FolderSearchDialog: visible={search_dialog.property('visible')} modal={window.property('modalDialogCount')}"
 
         # 3. Reopen Ctrl+Shift+F, search "AuroraSignal", select match -> opens .smd note with ReadingSearch seeded and highlighting!
-        QTest.keyClick(window, Qt.Key.Key_F, Qt.KeyboardModifier.ControlModifier | Qt.KeyboardModifier.ShiftModifier)
-        assert _wait_until(lambda: bool(search_dialog.property("visible")))
+        send_window_shortcut("search_folder")
+        assert _wait_until(lambda: bool(search_dialog.property("opened")), timeout=8.0), "FolderSearchDialog did not reopen"
+        window.requestActivate()
         search_input.forceActiveFocus()
+        assert _wait_until(lambda: bool(search_input.property("activeFocus"))), "folderSearchInput did not regain focus"
         search_input.setProperty("text", "AuroraSignal")
         assert _wait_until(
             lambda: not studio.folderSearchState["scanning"] and len(studio.folderSearchState["matches"]) == 2,
-            timeout=8.0,
+            timeout=10.0,
         ), f"Expected 2 non-diagram matches for AuroraSignal, got {studio.folderSearchState}"
         # Mermaid block on lines 3-6 must be skipped; prose matches start at line 8!
         lines = [m["line"] for m in studio.folderSearchState["matches"]]
         assert lines == [8, 9], f"Expected matches only on prose lines [8, 9], got {lines}"
 
+        search_input.forceActiveFocus()
         QTest.keyClick(window, Qt.Key.Key_Return)
         assert _wait_until(
             lambda: not bool(search_dialog.property("visible")) and studio._current()["name"] == "quantum-field.smd",
-            timeout=8.0,
-        )
+            timeout=10.0,
+        ), f"Return in FolderSearchDialog did not open quantum-field.smd: current={studio._current()['name']!r} state={studio.folderSearchState}"
 
         def eval_reader(js_expr: str) -> dict:
-            deadline = time.monotonic() + 12.0
+            deadline = time.monotonic() + 15.0
             req = uuid.uuid4().hex
             wrapped = (
                 "(()=>{try{const val=(" + js_expr + ");"
@@ -206,14 +252,18 @@ def _webengine_e2e_probe() -> int:
                 " highlighted: typeof CSS !== 'undefined' && CSS.highlights?.has('smd-search')})"
             ).get("value")
             == {"open": True, "query": "AuroraSignal", "status": "1 / 2", "highlighted": True},
-            timeout=10.0,
+            timeout=15.0,
         ), "Expected seeded in-note ReadingSearch highlighting 2 matches"
 
+        print(json.dumps({"ok": True, "lines": lines}), flush=True)
+        window.setProperty("closingAllowed", True)
+        window.setProperty("intentionalShutdown", True)
         window.close()
+        del engine
         studio.stop()
-        studio.pool.shutdown(wait=True)
-        session.writes.shutdown(wait=True)
-    return 0
+        studio.pool.shutdown(wait=False, cancel_futures=True)
+        session.writes.shutdown(wait=False)
+    os._exit(0)
 
 
 class WorkspaceSearchDesktopTest(unittest.TestCase):
@@ -223,7 +273,7 @@ class WorkspaceSearchDesktopTest(unittest.TestCase):
 
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory(prefix="supermd-folder-search-")
-        self.root = Path(self.temp.name)
+        self.root = Path(self.temp.name).resolve()
         self.session = Session(True)
         self.session.settings["python"] = sys.executable
         self.studio = QuietStudio(True, self.session)
@@ -328,7 +378,7 @@ class WorkspaceSearchDesktopTest(unittest.TestCase):
 
         outside = tempfile.TemporaryDirectory(prefix="supermd-outside-")
         self.addCleanup(outside.cleanup)
-        outside_note = Path(outside.name) / "external.md"
+        outside_note = Path(outside.name).resolve() / "external.md"
         outside_note.write_text("SecretNeedle and RecentNeedle", encoding="utf-8")
 
         symlink_note = self.root / "linked.md"
@@ -433,12 +483,81 @@ class WorkspaceSearchDesktopTest(unittest.TestCase):
         self.studio.openFolderSearchMatch("", str(target), "Needle", True)
         self.assertEqual(self.studio.flush_operation["action"], "open_search_match")
 
+    def test_sync_for_search_preserves_matches_when_unchanged_and_rescans_when_flushed_edits_arrive(self):
+        note = self.root / "synced.md"
+        note.write_text("# Synced\n\nDiskMatch line.\n", encoding="utf-8")
+        self.studio.openFolder(str(self.root))
+        self.assertTrue(_wait_until(lambda: len(self.studio.files) > 0))
+        tab = self.studio.tabs[0]
+        tab["content"] = "# Draft\n\nBaselineToken here.\n"
+        tab["saved"] = tab["content"]
+        self.studio.ready = True
+
+        self.studio.openFolderSearch()
+        op = self.studio.flush_operation
+        self.assertIsNotNone(op)
+        self.assertEqual(op["action"], "sync_for_search")
+
+        # User types query before WebEngine responds to sync_for_search: scanning stays True until flush resolves.
+        self.studio.updateFolderSearch("DiskMatch", False, False)
+        self.assertTrue(_wait_until(lambda: len(self.studio.folderSearchState["matches"]) == 1))
+        self.assertTrue(self.studio.folderSearchState["scanning"])
+
+        # Unchanged flush arrives: existing matches stay intact without wiping list, and scanning becomes False.
+        self.studio.post(
+            "flush-1",
+            "document_flushed",
+            json.dumps({"operation": op, "id": tab["id"], "content": tab["content"]}),
+        )
+        self.assertTrue(_wait_until(lambda: not self.studio.folderSearchState["scanning"]))
+        self.assertEqual(len(self.studio.folderSearchState["matches"]), 1)
+        self.assertEqual(self.studio.folderSearchState["matches"][0]["name"], "synced.md")
+
+        # Reopen and search for a token that arrives only when WebEngine flushes unacknowledged live edits.
+        self.studio.closeFolderSearch()
+        self.studio.openFolderSearch()
+        op2 = self.studio.flush_operation
+        self.assertIsNotNone(op2)
+        self.studio.updateFolderSearch("NewlyFlushedToken", False, False)
+        self.assertTrue(_wait_until(lambda: not self.studio._folder_search_scanning))
+        self.assertEqual(self.studio.folderSearchState["matches"], [])
+        self.assertTrue(self.studio.folderSearchState["scanning"])
+
+        self.studio.post(
+            "flush-2",
+            "document_flushed",
+            json.dumps({"operation": op2, "id": tab["id"], "content": "# Draft\n\nNewlyFlushedToken in live buffer.\n"}),
+        )
+        self.assertTrue(
+            _wait_until(
+                lambda: not self.studio.folderSearchState["scanning"]
+                and len(self.studio.folderSearchState["matches"]) == 1
+            )
+        )
+        self.assertEqual(self.studio.folderSearchState["matches"][0]["line"], 3)
+        self.assertTrue(self.studio.folderSearchState["matches"][0]["dirty"])
+
     def test_qml_and_webengine_quick_switcher_escape_and_seeded_reader_search(self):
+        if "--webengine-probe" in sys.argv:
+            raise unittest.SkipTest("probe subprocess only")
+        root = Path(__file__).resolve().parent
+        if not (root.parent / "dist" / "qt-reader.html").is_file():
+            raise unittest.SkipTest("dist/qt-reader.html not built")
+        env = dict(
+            os.environ,
+            QT_QPA_PLATFORM="offscreen",
+            QT_QUICK_BACKEND="software",
+            QTWEBENGINE_DISABLE_SANDBOX="1",
+            QTWEBENGINE_CHROMIUM_FLAGS="--disable-gpu --disable-dev-shm-usage",
+        )
         completed = subprocess.run(
-            [sys.executable, __file__, "--webengine-probe"],
-            cwd=str(Path(__file__).resolve().parent),
+            [sys.executable, str(Path(__file__).resolve()), "--webengine-probe"],
+            cwd=str(root),
+            env=env,
             capture_output=True,
             text=True,
+            encoding="utf-8",
+            errors="strict",
             timeout=90,
         )
         self.assertEqual(
@@ -446,6 +565,8 @@ class WorkspaceSearchDesktopTest(unittest.TestCase):
             0,
             f"WebEngine E2E probe failed:\nSTDOUT:\n{completed.stdout}\nSTDERR:\n{completed.stderr}",
         )
+        lines = [ln for ln in completed.stdout.splitlines() if ln.startswith("{")]
+        self.assertTrue(lines and json.loads(lines[-1]).get("ok"), completed.stdout)
 
 
 if __name__ == "__main__":
