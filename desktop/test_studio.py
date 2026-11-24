@@ -106,8 +106,8 @@ class StudioTest(unittest.TestCase):
         import base64
         from PySide6.QtCore import QBuffer, QByteArray, QIODevice
         from PySide6.QtGui import QImage, QColor
-        image=QImage(8,6,QImage.Format_ARGB32);image.fill(QColor("#1688dd"))
-        raw=QByteArray();buffer=QBuffer(raw);buffer.open(QIODevice.WriteOnly);image.save(buffer,"PNG")
+        image=QImage(8,6,QImage.Format.Format_ARGB32);image.fill(QColor("#1688dd"))
+        raw=QByteArray();buffer=QBuffer(raw);buffer.open(QIODevice.OpenModeFlag.WriteOnly);image.save(buffer,"PNG")
         studio=self.studio;original=studio._current()['content'];replies=[]
         studio.replied.connect(lambda identifier,value,error:replies.append((identifier,value,error)))
         body=base64.b64encode(bytes(raw)).decode()
