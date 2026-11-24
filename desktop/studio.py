@@ -2042,6 +2042,13 @@ class Studio(QObject):
 
     def _after_flush(self,operation):
         if operation["action"] == "save": self.save()
+        elif operation["action"] == "save_as":
+            target_id = operation.get("target") or self.active
+            tab = next((t for t in self.tabs if t["id"] == target_id), None)
+            if tab:
+                if tab["id"] != self.active:
+                    self.selectTab(tab["id"])
+                self.saveRequested.emit(tab["name"])
         elif operation["action"] == "reload_reader":
             # The renderer has acknowledged all edits. Reopen it from native
             # state and the just-captured view snapshot in document_flushed.
@@ -2078,6 +2085,10 @@ class Studio(QObject):
     def saveSafely(self): self._flush("save")
 
     @Slot()
+    @Slot(str)
+    def saveAsSafely(self, id=""): self._flush("save_as", id)
+
+    @Slot()
     def reloadReaderSafely(self):
         if not self.ready or self.retired or self.busy or self.flush_operation: return
         self._flush("reload_reader")
@@ -2108,12 +2119,15 @@ class Studio(QObject):
             self.pending_save_as = str(path)
             self.readerCall.emit("window.supermdPortable?.(false)")
         else:
-            self._save_text(self._current(), path)
+            self._save_text(self._current(), path, save_as=True)
 
-    def _save_text(self, tab, path, automatic=False):
+    def _save_text(self, tab, path, automatic=False, save_as=False):
         id, content, assets = tab["id"], tab["content"], dict(tab["assets"])
         expected, original_path = tab["saved"], tab["path"]
-        portable = tab["portable"] and str(path) == original_path
+        expected_assets = copy.deepcopy(tab.get("saved_assets", assets))
+        expected_portable = bool(tab.get("portable"))
+        had_disk_identity = bool(self.note_identities.get(str(path)))
+        portable = expected_portable and not save_as and str(path) == original_path
         if id in self.saving: return
         self.saving.add(id)
         def finished(_, error):
@@ -2129,8 +2143,18 @@ class Studio(QObject):
             if self.pending_close:
                 self._finish_close()
         def write():
-            if automatic and (not path.exists() or open_note(path)[0] != expected):
-                raise ValueError("Autosave paused: this file changed outside Super MD. Your edits remain in draft recovery; use Save as to keep both versions.")
+            if not save_as:
+                prefix = "Autosave paused" if automatic else "Save paused"
+                warning = f"{prefix}: this file changed outside Super MD. Your edits remain in draft recovery; use Save as to keep both versions."
+                has_baseline = automatic or bool(expected) or bool(expected_assets) or expected_portable or had_disk_identity
+                if path.exists():
+                    if not path.is_file():
+                        raise ValueError(warning)
+                    disk_content, disk_assets, disk_portable = open_note(path)
+                    if disk_content != expected or disk_assets != expected_assets or disk_portable != expected_portable:
+                        raise ValueError(warning)
+                elif has_baseline:
+                    raise ValueError(warning)
             if portable: write_portable(path,content,assets)
             else:
                 materialize_assets(path.parent,assets)
@@ -3298,6 +3322,7 @@ class Studio(QObject):
             if context and context["document"] not in (tab["id"],tab["path"]):raise ValueError("Python output belongs to another note")
             captured = dict(tab)
             captured["assets"] = dict(tab["assets"])
+            captured["saved_assets"] = copy.deepcopy(tab.get("saved_assets", tab["assets"]))
             output = self.pending_export
             save_as = self.pending_save_as
             # Preparation is asynchronous. Recheck the actual writer, not just
@@ -3367,7 +3392,18 @@ class Studio(QObject):
                     else: write_markdown_export(Path(output), args.get("content"), args.get("assets", {}))
                     return export_result(output)
                 if command == "export_fmd_native":
-                    target = Path(captured["path"]) if args.get("save") else Path(output)
+                    if args.get("save"):
+                        warning = "Save paused: this file changed outside Super MD. Your edits remain in draft recovery; use Save as to keep both versions."
+                        if not captured.get("path"):
+                            raise ValueError(warning)
+                        target = Path(captured["path"])
+                        if not target.is_file():
+                            raise ValueError(warning)
+                        disk_content, disk_assets, disk_portable = open_note(target)
+                        if disk_content != captured["saved"] or disk_assets != captured.get("saved_assets", {}) or not disk_portable:
+                            raise ValueError(warning)
+                    else:
+                        target = Path(output)
                     write_portable(target,args["content"],args["assets"])
                     return export_result(target)
                 if command == "export_pdf_native":

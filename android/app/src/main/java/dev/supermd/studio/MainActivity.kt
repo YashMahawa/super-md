@@ -120,6 +120,8 @@ class MainActivity : ComponentActivity() {
     var dismissDocument: (() -> Unit)? = null
     var saveReaderPosition: (() -> Unit)? = null
     var openReaderFind: (() -> Unit)? = null
+    var saveNote: (() -> Unit)? = null
+    var saveNoteAs: (() -> Unit)? = null
     val agentAccessState: AgentAccessState by lazy { AgentAccessState(this) }
     var agentRelayState by mutableStateOf(AgentRelayClient.State.DISCONNECTED)
         private set
@@ -411,6 +413,7 @@ class MainActivity : ComponentActivity() {
             if (event.isCtrlPressed && event.keyCode == android.view.KeyEvent.KEYCODE_N) { newWindow(); return true }
             if (event.isCtrlPressed) {
                 when(event.keyCode) {
+                    android.view.KeyEvent.KEYCODE_S -> { if (event.isShiftPressed) saveNoteAs?.invoke() else saveNote?.invoke(); return true }
                     android.view.KeyEvent.KEYCODE_T -> { if(event.isShiftPressed)model.reopen() else model.newNote();return true }
                     android.view.KeyEvent.KEYCODE_W -> { if(event.isShiftPressed)finish() else model.close(model.state.value.active.id);return true }
                     android.view.KeyEvent.KEYCODE_TAB -> { model.cycle(if(event.isShiftPressed)-1 else 1);return true }
@@ -940,6 +943,9 @@ private object NoMotionScheme : MotionScheme {
     val portable = rememberLauncherForActivityResult(NoteDestination("application/vnd.supermd.smd", model::noteLocation)) { uri ->
         if (uri != null) { model.setPortableDestination(uri); model.busy(true); web?.evaluateJavascript("window.supermdPortable?.(false)", null) ?: model.fail("The reader is not ready") }
     }
+    val portableSaveAs = rememberLauncherForActivityResult(NoteDestination("application/vnd.supermd.smd", model::noteLocation)) { uri ->
+        if (uri != null) { model.setPortableDestination(uri, saveAs = true); model.busy(true); web?.evaluateJavascript("window.supermdPortable?.(false)", null) ?: model.fail("The reader is not ready") }
+    }
     var pendingAgentExport by remember { mutableStateOf<JSONObject?>(null) }
     DisposableEffect(activity, model, state.active.name, state.pdf) {
         activity.setAgentExportHandler { args ->
@@ -988,7 +994,22 @@ private object NoMotionScheme : MotionScheme {
         onDispose { activity.setAgentUiHandler(null) }
     }
     DisposableEffect(portable, state.active.name) { model.requestPortable = { portable.launch(state.active.name.substringBeforeLast('.') + ".smd") }; onDispose { model.requestPortable = null } }
-    val saveAction: () -> Unit = { if (model.requestWriteAccessIfBlocked(state.active.id, explicit = true)) Unit else if (state.active.uri == null) save.launch(state.active.name.substringBeforeLast('.') + ".md") else if (state.active.portable) { model.busy(true); web?.evaluateJavascript("window.supermdPortable?.(true)", null) ?: model.fail("The reader is not ready") } else model.save(); Unit }
+    val saveAsAction: () -> Unit = {
+        if (!state.busy) {
+            if (state.active.portable) {
+                if (readerReady) portableSaveAs.launch(state.active.name.substringBeforeLast('.') + ".smd")
+                else model.fail("The reader is not ready")
+            } else save.launch(state.active.name.substringBeforeLast('.') + ".md")
+        }
+    }
+    val saveAction: () -> Unit = { if (model.requestWriteAccessIfBlocked(state.active.id, explicit = true)) Unit else if (state.active.uri == null) saveAsAction() else if (state.active.portable) { model.busy(true); web?.evaluateJavascript("window.supermdPortable?.(true)", null) ?: model.fail("The reader is not ready") } else model.save(); Unit }
+    val latestSaveAction by androidx.compose.runtime.rememberUpdatedState(saveAction)
+    val latestSaveAsAction by androidx.compose.runtime.rememberUpdatedState(saveAsAction)
+    DisposableEffect(activity) {
+        activity.saveNote = { latestSaveAction() }
+        activity.saveNoteAs = { latestSaveAsAction() }
+        onDispose { activity.saveNote = null; activity.saveNoteAs = null }
+    }
     LaunchedEffect(state.message) { state.message?.let { snackbar.showSnackbar(it); model.dismissMessage() } }
     val immersive = (state.fullscreen || !readingChromeVisible || state.readerOverlay) && !settings
     LaunchedEffect(immersive, dark) {
@@ -1089,6 +1110,7 @@ private object NoMotionScheme : MotionScheme {
                             StudyIcon(if(state.fullscreen) "Exit fullscreen" else "Fullscreen study", if(state.fullscreen) R.drawable.symbol_fullscreen_exit else R.drawable.symbol_fullscreen) { model.fullscreen(!state.fullscreen) }
                             StudyIcon(if(state.centerLock) "Centre locked · unlock horizontal movement" else "Lock document to centre",if(state.centerLock) R.drawable.symbol_lock else R.drawable.symbol_lock_open) { model.centerLock(!state.centerLock) }
                             Box { IconButton(onClick = { menu = true }) { Icon(Icons.Rounded.MoreVert, "More actions") }; DropdownMenu(expanded = menu, onDismissRequest = { menu = false }) {
+                                DropdownMenuItem(text = { Text("Save as") }, enabled = !state.busy && (!state.active.portable || readerReady), onClick = { menu = false; saveAsAction() }, leadingIcon = { Icon(painterResource(R.drawable.symbol_save), null) })
                                 DropdownMenuItem(text = { Text("New window") }, onClick = { menu = false; activity.newWindow() }, leadingIcon = { Icon(painterResource(R.drawable.symbol_open_window), null) })
                                 DropdownMenuItem(text = { Text("Share note") }, enabled = readerReady && !state.busy, onClick = { menu = false; sharing = true; exporting = true }, leadingIcon = { Icon(painterResource(R.drawable.symbol_share), null) })
                                 DropdownMenuItem(text = { Text("Insert image or link") }, onClick = { menu = false; web?.evaluateJavascript("window.supermdMedia?.()", null) }, leadingIcon = { Icon(painterResource(R.drawable.symbol_image), null) })

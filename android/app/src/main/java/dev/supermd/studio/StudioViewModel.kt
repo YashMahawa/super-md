@@ -558,11 +558,12 @@ class StudioViewModel(app: Application, val workspaceKey: String = "main") : And
     var outputUri: Uri? = null
     private var pdfDestinationIsNew = false
     private var portableDestinationIsNew = false
+    private var portableSaveAs = false
     var shareReady: ((Intent) -> Unit)? = null
     private var shareFile: File? = null
 
     internal fun setPdfDestination(uri: Uri) { outputUri = uri; pdfDestinationIsNew = true }
-    internal fun setPortableDestination(uri: Uri) { portableOutput = uri; portableDestinationIsNew = true }
+    internal fun setPortableDestination(uri: Uri, saveAs: Boolean = false) { portableOutput = uri; portableDestinationIsNew = true; portableSaveAs = saveAs }
 
     fun prepareShare(format: String): Boolean {
         if (mutable.value.busy || format !in listOf("pdf", "smd", "md", "mdzip")) return false
@@ -574,7 +575,7 @@ class StudioViewModel(app: Application, val workspaceKey: String = "main") : And
         busy(true)
         when (format) {
             "pdf" -> { outputUri = Uri.fromFile(file); pdfDestinationIsNew = false }
-            "smd" -> { portableOutput = Uri.fromFile(file); portableDestinationIsNew = false }
+            "smd" -> { portableOutput = Uri.fromFile(file); portableDestinationIsNew = false; portableSaveAs = false }
         }
         return true
     }
@@ -895,11 +896,61 @@ class StudioViewModel(app: Application, val workspaceKey: String = "main") : And
     fun refreshExternal() {
         refreshJob?.cancel()
         val note=mutable.value.active
-        if(note.uri==null || note.dirty || note.portable)return
+        if(note.uri==null || note.dirty)return
         refreshJob=viewModelScope.launch {
             delay(200)
-            val text=runCatching{withContext(Dispatchers.IO){resolver.openInputStream(Uri.parse(note.uri))?.use{readLimited(it,20_000_000).toString(Charsets.UTF_8)}}}.getOrNull() ?: return@launch
+            if (note.portable) {
+                var opened: MediaStorage.Opened? = null
+                var adopted = false
+                try {
+                    val unchanged = withContext(Dispatchers.IO) {
+                        val parsed = runCatching {
+                            resolver.openInputStream(documentAccess.resolve(Uri.parse(note.uri)))?.use(media::openFmd)
+                        }.getOrNull() ?: return@withContext true
+                        opened = parsed
+                        parsed.markdown == note.content &&
+                            runCatching { portableAssetsMatch(media.portableAssets(note.assetDirectory), media.portableAssets(parsed.directory)) }.getOrDefault(false)
+                    }
+                    val parsed = opened ?: return@launch
+                    if (unchanged) return@launch
+                    val current = mutable.value.tabs.find { it.id == note.id }
+                    if (current == null || current.dirty || current.content != note.content || current.uri != note.uri || current.assetDirectory != note.assetDirectory) {
+                        return@launch
+                    }
+                    val oldDirectory = current.assetDirectory
+                    adopted = true
+                    readerEcho.remove(note.id)
+                    clearReaderEditProtocol(note.id)
+                    change { s ->
+                        s.copy(tabs = s.tabs.map {
+                            if (it.id == note.id && it.content == note.content && !it.dirty && it.uri == note.uri && it.assetDirectory == note.assetDirectory)
+                                it.copy(content = parsed.markdown, saved = parsed.markdown, assetDirectory = parsed.directory)
+                            else it
+                        })
+                    }
+                    if (mutable.value.tabs.none { it.id == note.id && it.assetDirectory == parsed.directory }) {
+                        adopted = false
+                        return@launch
+                    }
+                    if (oldDirectory != null && oldDirectory != parsed.directory && mutable.value.tabs.none { it.assetDirectory == oldDirectory }) {
+                        withContext(Dispatchers.IO) {
+                            File(getApplication<Application>().filesDir, "portable-assets/$oldDirectory").deleteRecursively()
+                        }
+                    }
+                } finally {
+                    val unused = opened?.directory?.takeIf { !adopted }
+                    if (unused != null) {
+                        withContext(kotlinx.coroutines.NonCancellable + Dispatchers.IO) {
+                            File(getApplication<Application>().filesDir, "portable-assets/$unused").deleteRecursively()
+                        }
+                    }
+                }
+                return@launch
+            }
+            val text=runCatching{withContext(Dispatchers.IO){resolver.openInputStream(documentAccess.resolve(Uri.parse(note.uri)))?.use{readLimited(it,20_000_000).toString(Charsets.UTF_8)}}}.getOrNull() ?: return@launch
             if(text==note.content)return@launch
+            readerEcho.remove(note.id)
+            clearReaderEditProtocol(note.id)
             change {s->s.copy(tabs=s.tabs.map{if(it.id==note.id && it.content==note.content && !it.dirty)it.copy(content=text,saved=text)else it})}
         }
     }
@@ -1417,10 +1468,22 @@ class StudioViewModel(app: Application, val workspaceKey: String = "main") : And
             val (writtenTarget, savedName) = withContext(Dispatchers.IO) {
                 require(!note.portable || uri != null) { "Use portable save for this SMD file" }
                 val destination = if (uri != null) prepareExportDestination(target, NativeExportFormat.MARKDOWN, allowRename = true) else documentAccess.resolve(target, writing = true)
+                if (uri == null) {
+                    val previous = try {
+                        resolver.openInputStream(destination)?.use { readLimited(it, 20_000_000).toString(Charsets.UTF_8).removePrefix("\uFEFF") }
+                    } catch (missing: java.io.FileNotFoundException) {
+                        if (isDocumentAccessFailure(missing)) throw missing
+                        null
+                    } ?: error("This file changed outside Super MD. Use Save as to keep both versions; your draft is safe.")
+                    require(previous == note.saved) { "This file changed outside Super MD. Use Save as to keep both versions; your draft is safe." }
+                }
                 copyAttachments(note, destination)
                 resolver.openOutputStream(destination, "wt")?.use { it.write(note.content.toByteArray()) } ?: error("Writing permission is unavailable; use Save as")
                 documentAccess.persist(destination)
-                destination to (DocumentFile.fromSingleUri(getApplication(), destination)?.name ?: note.name)
+                val resolvedName = DocumentFile.fromSingleUri(getApplication(), destination)?.name
+                    ?: destination.lastPathSegment?.substringAfterLast('/')?.takeIf { destination.scheme == "file" && it.isNotBlank() }
+                    ?: note.name
+                destination to resolvedName
             }
             change { s -> s.copy(busy = false, tabs = s.tabs.map { if (it.id == note.id) it.copy(uri = writtenTarget.toString(), name = savedName, saved = note.content, assetDirectory = null) else it }, message = "Saved") }
             mutable.value.tabs.find { it.id == note.id }?.let(::remember)
@@ -1761,6 +1824,7 @@ class StudioViewModel(app: Application, val workspaceKey: String = "main") : And
         }
     }
     private fun copyAttachments(note: Note, destination: Uri, destinationTree: Uri? = null) {
+        if (!note.content.contains("assets/")) return
         val sources = JSONArray(PdfEngine.imageSources(note.content))
         val local = (0 until sources.length()).map { sources.getString(it) }.distinct().mapNotNull { source -> media.local(source, note.assetDirectory)?.let { source to it } }
         if (local.isEmpty()) return
@@ -1788,24 +1852,82 @@ class StudioViewModel(app: Application, val workspaceKey: String = "main") : And
     }
     var portableOutput: Uri? = null
     suspend fun writePortable(id: String, content: String, assets: JSONObject, save: Boolean, originalContent: String) = withContext(Dispatchers.IO) { documentWrites.withLock {
-        val note = mutable.value.tabs.find { it.id == id } ?: error("The note is no longer open")
-        val target = if (save) note.uri?.let { documentAccess.resolve(Uri.parse(it), writing = true) } else portableOutput
-        require(target != null) { "Choose a portable file destination" }
-        val destination = if (save) target else prepareExportDestination(target, NativeExportFormat.PORTABLE_SMD, allowRename = portableDestinationIsNew)
-        val staged = File(getApplication<Application>().cacheDir, "fmd-${UUID.randomUUID()}.tmp")
+        val savingAs = !save && portableSaveAs
         try {
-            staged.outputStream().use { media.writeFmd(it, content, assets) }
-            verifyExportHeader(staged, NativeExportFormat.PORTABLE_SMD)
-            // Extract assets independently so a saved draft can immediately resolve
-            // new portable references without carrying binary data in its state.
-            val opened = if (save) staged.inputStream().use(media::openFmd) else null
-            resolver.openOutputStream(destination, "wt")?.use { output -> staged.inputStream().use { it.copyTo(output) } } ?: error("Cannot write portable file")
-            documentAccess.persist(destination)
-            withContext(Dispatchers.Main) {
-                if (save) { change { s -> s.copy(tabs = s.tabs.map { if (it.id == id) it.copy(content = if (it.content == originalContent) content else it.content, saved = content, uri = destination.toString(), assetDirectory = opened!!.directory) else it }, busy = false, message = "Portable note saved") }; mutable.value.tabs.find { it.id == id }?.let(::remember) }
-                else { portableOutput = null; portableDestinationIsNew = false; if (!finishShare(destination)) mutable.value = mutable.value.copy(busy = false, message = "Portable .smd exported") }
+            val note = mutable.value.tabs.find { it.id == id } ?: error("The note is no longer open")
+            val target = if (save) note.uri?.let { documentAccess.resolve(Uri.parse(it), writing = true) } else portableOutput
+            require(target != null) { "Choose a portable file destination" }
+            val destination = if (save) target else prepareExportDestination(target, NativeExportFormat.PORTABLE_SMD, allowRename = portableDestinationIsNew)
+            val staged = File(getApplication<Application>().cacheDir, "fmd-${UUID.randomUUID()}.tmp")
+            var diskDirectory: String? = null
+            var openedDirectory: String? = null
+            try {
+                if (save) {
+                    val baselineAssets = media.portableAssets(note.assetDirectory)
+                    val disk = try {
+                        resolver.openInputStream(destination)?.use(media::openFmd)
+                    } catch (missing: java.io.FileNotFoundException) {
+                        if (isDocumentAccessFailure(missing)) throw missing
+                        null
+                    } ?: error("This file changed outside Super MD. Use Save as to keep both versions; your draft is safe.")
+                    diskDirectory = disk.directory
+                    require(disk.markdown == note.saved && portableAssetsMatch(baselineAssets, media.portableAssets(disk.directory))) {
+                        "This file changed outside Super MD. Use Save as to keep both versions; your draft is safe."
+                    }
+                }
+                staged.outputStream().use { media.writeFmd(it, content, assets) }
+                verifyExportHeader(staged, NativeExportFormat.PORTABLE_SMD)
+                // Extract assets independently so a saved draft can immediately resolve
+                // new portable references without carrying binary data in its state.
+                val opened = if (save || savingAs) staged.inputStream().use(media::openFmd).also { openedDirectory = it.directory } else null
+                resolver.openOutputStream(destination, "wt")?.use { output -> staged.inputStream().use { it.copyTo(output) } } ?: error("Cannot write portable file")
+                documentAccess.persist(destination)
+                val savedName = if (savingAs) (DocumentFile.fromSingleUri(getApplication(), destination)?.name
+                    ?: destination.lastPathSegment?.substringAfterLast('/')?.takeIf { destination.scheme == "file" && it.isNotBlank() }
+                    ?: note.name) else note.name
+                withContext(Dispatchers.Main) {
+                    if (save || savingAs) {
+                        val oldDirectory = mutable.value.tabs.find { it.id == id }?.assetDirectory
+                        if (savingAs) { portableOutput = null; portableDestinationIsNew = false; portableSaveAs = false }
+                        change { s ->
+                            s.copy(
+                                tabs = s.tabs.map {
+                                    if (it.id == id) it.copy(
+                                        name = savedName,
+                                        content = if (it.content == originalContent) content else it.content,
+                                        saved = content,
+                                        uri = destination.toString(),
+                                        assetDirectory = opened!!.directory,
+                                    ) else it
+                                },
+                                busy = false,
+                                message = if (savingAs) "Saved as $savedName" else "Portable note saved",
+                            )
+                        }
+                        openedDirectory = null
+                        mutable.value.tabs.find { it.id == id }?.let(::remember)
+                        if (oldDirectory != null && oldDirectory != opened!!.directory && mutable.value.tabs.none { it.assetDirectory == oldDirectory }) {
+                            withContext(Dispatchers.IO) {
+                                File(getApplication<Application>().filesDir, "portable-assets/$oldDirectory").deleteRecursively()
+                            }
+                        }
+                    } else {
+                        portableOutput = null; portableDestinationIsNew = false
+                        if (!finishShare(destination)) mutable.value = mutable.value.copy(busy = false, message = "Portable .smd exported")
+                    }
+                }
+            } finally {
+                staged.delete()
+                diskDirectory?.let { File(getApplication<Application>().filesDir, "portable-assets/$it").deleteRecursively() }
+                openedDirectory?.let { File(getApplication<Application>().filesDir, "portable-assets/$it").deleteRecursively() }
             }
-        } finally { staged.delete() }
+        } finally {
+            if (savingAs) {
+                portableOutput = null
+                portableDestinationIsNew = false
+                portableSaveAs = false
+            }
+        }
         }
     }
     fun importDropped(uris: List<Uri>, id: String, result: (JSONArray?) -> Unit) = viewModelScope.launch {
