@@ -13,6 +13,18 @@ describe("portable media", () => {
     expect(ranges.map((range) => md.slice(range.from, range.to))).toEqual(["![First](a.png)", "![Second](a.png)", "![Reference][p]", "![[diagram.svg|Diagram]]"]);
     expect(ranges.map((range) => range.source)).toEqual(["a.png", "a.png", "proof.svg", "diagram.svg"]);
   });
+  it("ignores image syntax inside YAML frontmatter variations while preserving body offsets", async () => {
+    native.mockReset().mockResolvedValue("data:image/png;base64,aGVsbG8=");
+    const md = '\uFEFF---  \ntitle: "![Fake](missing.png)"\nsummary: "![[also-fake.png]]"\n...\n\n![Real](real.png)';
+    const ranges = imageRanges(md);
+    expect(ranges).toHaveLength(1);
+    expect(md.slice(ranges[0].from, ranges[0].to)).toBe("![Real](real.png)");
+    const packed = await prepareFmd(md, "/notes/a.md");
+    expect(native).toHaveBeenCalledTimes(1);
+    expect(native).toHaveBeenCalledWith("load_asset", { documentPath: "/notes/a.md", source: "real.png" });
+    expect(packed.content.startsWith('\uFEFF---  \ntitle: "![Fake](missing.png)"\nsummary: "![[also-fake.png]]"\n...\n\n')).toBe(true);
+    native.mockReset();
+  });
   it("preserves source, callouts, frontmatter and interactive code without exposing bytes", async () => {
     native.mockResolvedValue("data:image/svg+xml;base64,PHN2Zy8+");
     const md = '---\ntitle: Keep me\n---\n\n> [!TIP] Learn\n> Keep this.\n\n![Proof](images/proof.svg)\n\n![Again](images/proof.svg)\n\n```mermaid\nA --> B\n```\n\n```python\nprint("![Not an attachment](fake.png)")\n```';
