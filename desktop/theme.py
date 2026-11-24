@@ -65,7 +65,7 @@ def generated(seed,dark):
 
 ACCENTS={"blue":"#386aaf","green":"#386a57","violet":"#7255a5","rose":"#a34569","amber":"#996300"}
 
-def tokens(mode,system_dark,system_colors=None,system_mode=None,accent="system"):
+def tokens(mode,system_dark,system_colors=None,system_mode=None,accent="system",*,warm_preview=False):
     colors = system_colors or {}
     dark = mode in ("dark","black") or mode == "system" and system_dark is not False
     seed = colors.get("primary_paletteKeyColor",colors.get("primary", "#386aaf")) if accent=="system" else ACCENTS.get(accent,ACCENTS["blue"])
@@ -85,6 +85,13 @@ def tokens(mode,system_dark,system_colors=None,system_mode=None,accent="system")
         result["surface-high"] = blend(blend(result["surface-high"], result["primary-container"], .7),result["primary"],.16)
         result["text"] = blend(result["text"], result["surface"], .08)
         result["outline"] = blend(result["outline"], result["text"], .24)
+    if warm_preview:
+        if dark:
+            result.update({"surface":"#211916", "surface-low":"#2b211c", "surface-high":"#392b24",
+                           "text":"#f6e7da", "muted":"#d6bbab", "outline":"#766054"})
+        else:
+            result.update({"surface":"#fcf2e5", "surface-low":"#f5e8d7", "surface-high":"#eedbc5",
+                           "text":"#37261b", "muted":"#684e3e", "outline":"#a48976"})
     if any(get_contrast_ratio(result["primary"],result[background]) < 4.5 for background in ("surface","surface-low","surface-high")):
         result["primary"] = scheme["primary"]
         result["on-primary"] = scheme["on_primary"]

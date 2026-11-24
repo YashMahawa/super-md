@@ -17,6 +17,49 @@ class QuietStudio(Studio):
         self.system_dark = True
 
 class StudioTest(unittest.TestCase):
+    def test_appearance_previews_restore_selected_palette_and_reading_font(self):
+        studio = self.studio
+        studio.setting("theme", json.dumps("light"))
+        studio.setting("accent", json.dumps("blue"))
+        studio.setting("font", json.dumps("Roboto"))
+        initial_palette = studio._colors()
+        studio.ready = True
+        payloads = []
+        studio.readerLoad.connect(lambda encoded: payloads.append(json.loads(encoded)))
+
+        studio.setting("previewWarmTheme", "true")
+        self.assertEqual(payloads[-1]["colors"]["surface"], "#fcf2e5")
+        studio.setting("previewSerifReading", "true")
+        self.assertEqual(payloads[-1]["font"], "Noto Serif")
+        self.assertEqual(studio.settings["font"], "Roboto")
+        self.assertEqual(studio.settings["accent"], "blue")
+
+        studio.setting("previewWarmTheme", "false")
+        studio.setting("previewSerifReading", "false")
+        self.assertEqual(payloads[-1]["colors"], initial_palette)
+        self.assertEqual(payloads[-1]["font"], "Roboto")
+
+    def test_workspace_save_preview_only_changes_the_new_note_picker(self):
+        studio = self.studio
+        destination = studio.data / "configured"
+        workspace = studio.data / "workspace"
+        workspace.mkdir()
+        studio.settings["newNoteLocation"] = str(destination)
+        studio.folder = str(workspace)
+
+        def suggested():
+            return Path(studio.newNoteSaveLocation("Untitled.md").toLocalFile())
+
+        self.assertEqual(suggested(), destination / "Untitled.md")
+        studio.setting("previewWorkspaceSave", "true")
+        self.assertEqual(suggested(), workspace / "Untitled.md")
+        self.assertEqual(Path(studio.defaultExportLocation("pdf").toLocalFile()).parent, destination)
+        self.assertTrue(studio.settings["autosave"])
+        workspace.rmdir()
+        self.assertEqual(suggested(), destination / "Untitled.md")
+        studio.setting("previewWorkspaceSave", "false")
+        self.assertEqual(suggested(), destination / "Untitled.md")
+
     def test_fedora_uses_toolbar_frame_across_desktops(self):
         for distro, desktop, frame, controls in (
             ("fedora", "niri", True, True),

@@ -111,6 +111,7 @@ Pane {
                 ChoiceField { Layout.fillWidth: true; enabled:!studio.customThemeActive; model: ["System accent", "Blue", "Violet", "Rose", "Amber"]; currentIndex: ["system","blue","violet","rose","amber"].indexOf(viewState.settings.accent); onActivated: page.save("accent",["system","blue","violet","rose","amber"][currentIndex]) }
                 Label { text: studio.customThemeActive ? "The imported theme supplies its palette. Reset to built-in below to use this accent picker." : "System uses your desktop accent when available; otherwise app blue. Choose a color independently of light or dark mode."; Layout.fillWidth: true; wrapMode: Text.WordWrap; color: viewState.colors.muted }
                 Switch { text: "Expressive motion"; checked: viewState.settings.motion; onToggled: page.save("motion", checked) }
+                Switch { text: "Preview warm built-in colors"; enabled: !studio.customThemeActive || checked; checked: viewState.settings.previewWarmTheme === true; onToggled: page.save("previewWarmTheme", checked) }
                 Label { text: "Custom theme"; font.pixelSize:22; font.weight:Font.DemiBold; Layout.topMargin:12 }
                 Label { text:studio.customThemeName; textFormat:Text.PlainText; Layout.fillWidth:true; font.weight:Font.DemiBold }
                 Label { text:"Editable theme files style controls, reading colors, typography and background patterns. Your reading font and text size remain yours. Invalid edits keep the last valid theme."; Layout.fillWidth:true; wrapMode:Text.WordWrap; color:viewState.colors.muted }
@@ -154,6 +155,7 @@ Pane {
                 Label { text: "Reading"; font.pixelSize: 22; font.weight: Font.DemiBold; Layout.topMargin: 12 }
                 Label { text: "Reading font" }
                 FontField { objectName: "readingFontChoice"; ownerPopup: page.ownerPopup; viewportItem: settingsScroll.contentItem; Accessible.name: "Reading font"; Layout.fillWidth: true; families: studio.fonts; value: viewState.settings.font; onChosen: family => page.save("font", family) }
+                Switch { text: "Preview serif reading typography"; checked: viewState.settings.previewSerifReading === true; onToggled: page.save("previewSerifReading", checked) }
                 ActionButton { text:"Import font…";glyph:"Plus";onClicked:studio.chooseFont() }
                 Label { text:"TTF and OTF fonts stay private to the app and also appear in PDF export and sharing."; Layout.fillWidth:true;wrapMode:Text.WordWrap;color:viewState.colors.muted }
                 Label { text: "Text size: " + Math.round(viewState.settings.size) + " px" }
@@ -179,6 +181,7 @@ Pane {
                 Label { text: "Unsaved drafts are recovered in either mode. Welcome is shown only on first use."; Layout.fillWidth: true; wrapMode: Text.WordWrap; color: viewState.colors.muted }
                 Label { text: "New note location"; font.weight: Font.DemiBold }
                 ActionButton { Layout.fillWidth: true; text: viewState.settings.newNoteLocation || "Downloads"; glyph: "FolderOpen"; tonal: true; onClicked: studio.chooseNoteLocation(); ToolTip.text: viewState.settings.newNoteLocation || "Downloads" }
+                Switch { text: "Try saving new notes in the open folder"; checked: viewState.settings.previewWorkspaceSave === true; onToggled: page.save("previewWorkspaceSave", checked) }
                 Label { text: "New notes stay recoverable until you choose a file. Empty untitled notes are discarded."; Layout.fillWidth: true; wrapMode: Text.WordWrap; color: viewState.colors.muted }
                 Label { text: "Writing assistance"; font.pixelSize: 22; font.weight: Font.DemiBold; Layout.topMargin: 12 }
                 Switch { text: "Spell check"; checked: viewState.settings.spellCheck; onToggled: page.save("spellCheck", checked) }

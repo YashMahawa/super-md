@@ -52,6 +52,7 @@ ROOT = Path(sys._MEIPASS)/"resources" if getattr(sys,"frozen",False) else Path(_
 DEFAULT_PDF = {"pageSize": "a4", "margin": 14, "fontSize": 10.5, "lineHeight": 1.4, "paragraphSpacing": 0.65, "fontFamily": "Manrope", "pageNumbers": True, "themed": False}
 DEFAULTS = {"theme": "system", "fullTheme": "black", "motion": True, "font": "Manrope", "size": 18, "width": 0, "widthPercent":90, "lineHeight":1.65, "autosave":True, "normalZoom": 100, "fullZoom": 100, "python": "", "pdf": DEFAULT_PDF, "welcomed": False}
 DEFAULTS.update(widthMigrated=True, window={"width":1320,"height":880,"maximized":False}, spellCheck=False, grammarCheck=False, readingMode="live", newNoteLocation="", accent="system", checkUpdates=True, autoUpdate=False)
+DEFAULTS.update(previewWarmTheme=False, previewSerifReading=False, previewWorkspaceSave=False)
 DEFAULTS.update(restorePosition=True, centerLock=True, startup="restore", imageAppearance="original", svgAppearance="original", imageContrast=1.25, fullDocumentAccessibility=False)
 DEFAULTS.update(patternKind="",patternOpacity=-1,patternSize=0,patternSpacing=0)
 DEFAULTS.update(desktopIntegration=False)
@@ -519,7 +520,8 @@ class Studio(QObject):
             colors = self._colors()
             reading_settings={key:self.settings[key] for key in ("restorePosition","centerLock","imageAppearance","svgAppearance","imageContrast","fullDocumentAccessibility","latexAutofix","typewriterScroll")}
             reading_settings["customStyle"]=custom_theme.reader(self.session.custom_theme,self.settings["fullTheme" if self.fullscreen else "theme"],self._dark(),self.settings)
-            payload={**reading_settings,"readingLocation":self.session.locations.get(tab["path"]),"id": tab["id"], "path": tab["path"] or tab["id"], "mode": self.mode, "dark": self._dark(), "fullscreen": self.fullscreen, "font": self.settings["font"], "size": self.settings["size"], "widthPercent": self.settings["widthPercent"], "lineHeight":self.settings["lineHeight"], "spellCheck":self.settings["spellCheck"], "grammarCheck":self.settings["grammarCheck"], "zoom": self.settings["fullZoom" if self.fullscreen else "normalZoom"], "motion": self.settings["motion"], "python": self.settings["python"], "colors": colors, "viewState": tab.pop("viewState", None)}
+            font = "Noto Serif" if self.settings["previewSerifReading"] is True else self.settings["font"]
+            payload={**reading_settings,"readingLocation":self.session.locations.get(tab["path"]),"id": tab["id"], "path": tab["path"] or tab["id"], "mode": self.mode, "dark": self._dark(), "fullscreen": self.fullscreen, "font": font, "size": self.settings["size"], "widthPercent": self.settings["widthPercent"], "lineHeight":self.settings["lineHeight"], "spellCheck":self.settings["spellCheck"], "grammarCheck":self.settings["grammarCheck"], "zoom": self.settings["fullZoom" if self.fullscreen else "normalZoom"], "motion": self.settings["motion"], "python": self.settings["python"], "colors": colors, "viewState": tab.pop("viewState", None)}
             payload["editProtocol"]=1
             previous=self._last_reader_text
             if previous and previous[0]==tab["id"] and previous[1] is tab["content"]:payload["contentUnchanged"]=True
@@ -531,10 +533,12 @@ class Studio(QObject):
         # Scheme generation is costly and QML reads colors from many bindings.
         theme = self.settings["fullTheme" if self.fullscreen else "theme"]
         selected=self.session.custom_theme
-        key = (theme,self.system_dark,json.dumps(self.system_colors,sort_keys=True),self.system_mode,self.settings["accent"],self.session.theme_revision)
+        warm_preview = self.settings["previewWarmTheme"] is True and not selected and theme != "black"
+        accent = selected["accent"] if selected else "amber" if warm_preview else self.settings["accent"]
+        key = (theme,self.system_dark,json.dumps(self.system_colors,sort_keys=True),self.system_mode,accent,self.session.theme_revision,warm_preview)
         if getattr(self,"_token_key",None) != key:
             self._token_key = key
-            dark,colors=tokens(theme,self.system_dark,self.system_colors,self.system_mode,selected["accent"] if selected else self.settings["accent"])
+            dark,colors=tokens(theme,self.system_dark,self.system_colors,self.system_mode,accent,warm_preview=warm_preview)
             self._token_value = (dark,custom_theme.palette(colors,custom_theme.variant(selected,theme,dark).get("colors",{}))) if selected else (dark,colors)
         return self._token_value
 
@@ -2016,6 +2020,7 @@ class Studio(QObject):
         if key in ("restorePosition","centerLock") and not isinstance(value,bool):return
         if key=="imageContrast" and (not isinstance(value,(int,float)) or isinstance(value,bool) or not math.isfinite(value) or not 1<=value<=2):return
         if key in ("motion","welcomed","autosave","checkUpdates","autoUpdate","spellCheck","grammarCheck","latexAutofix","typewriterScroll","desktopIntegration","fullDocumentAccessibility") and not isinstance(value,bool): return
+        if key in ("previewWarmTheme", "previewSerifReading", "previewWorkspaceSave") and not isinstance(value, bool): return
         if key in ("font","python") and (not isinstance(value,str) or not value.strip() or len(value)>2048): return
         if key == "python":
             try: value = python_runtime.validate(value.strip())
@@ -2178,6 +2183,12 @@ class Studio(QObject):
     def defaultSaveLocation(self,name):
         directory = self.settings.get("newNoteLocation") or QStandardPaths.writableLocation(QStandardPaths.DownloadLocation) or str(Path.home())
         return QUrl.fromLocalFile(str(Path(directory)/Path(name).name))
+
+    @Slot(str, result=QUrl)
+    def newNoteSaveLocation(self, name):
+        if self.settings["previewWorkspaceSave"] is True and self.folder and Path(self.folder).is_dir():
+            return QUrl.fromLocalFile(str(Path(self.folder) / Path(name).name))
+        return self.defaultSaveLocation(name)
 
     @Slot(str, result=QUrl)
     def defaultExportLocation(self, format):

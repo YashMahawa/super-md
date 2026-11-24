@@ -254,7 +254,7 @@ ApplicationWindow {
         }
         function onFlushFailed(canClose) { if(!closingAllowed && !closeDialog.visible) { flushDialog.canClose = canClose; flushDialog.open() } }
         function onCloseRequested(name) { flushDialog.close(); closeDialog.title = "Save changes to " + name + "?"; if(!closeDialog.visible) closeDialog.open() }
-        function onSaveRequested(name) { saveDialog.selectedFile = studio.defaultSaveLocation(name); saveDialog.open() }
+        function onSaveRequested(name) { saveDialog.selectedFile = studio.newNoteSaveLocation(name); saveDialog.open() }
         function onNoteLocationPickerRequested() { noteFolderDialog.open() }
         function onExportRequested(format) { sharing = false; outputFormat = format; exportDialog.open() }
         function onFolderPickerRequested() { folderDialog.open() }
