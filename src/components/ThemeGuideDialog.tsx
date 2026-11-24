@@ -1,12 +1,14 @@
 import {useEffect,useRef,useState} from 'react';
 import MarkdownPreview from './MarkdownPreview';
+import {BUNDLED_THEMES,parseBundledThemeHref} from '../bundledThemes';
 import {copyText} from '../copyText';
+import {invoke} from '../nativeBridge';
 import {setReaderOverlay} from '../readerOverlays';
 import './ThemeGuideDialog.css';
 
-export default function ThemeGuideDialog({close}:{close:()=>void}) {
-  const [source,setSource]=useState<string|null>(null),[error,setError]=useState(''),[copied,setCopied]=useState(false);
-  const dialog=useRef<HTMLElement>(null),body=useRef<HTMLDivElement>(null),copyTimer=useRef(0),closeRef=useRef(close);closeRef.current=close;
+export default function ThemeGuideDialog({close,dark=false}:{close:()=>void;dark?:boolean}) {
+  const [source,setSource]=useState<string|null>(null),[error,setError]=useState(''),[copied,setCopied]=useState(false),[presetsOpen,setPresetsOpen]=useState(false),[status,setStatus]=useState(''),[applyingId,setApplyingId]=useState('');
+  const dialog=useRef<HTMLElement>(null),body=useRef<HTMLDivElement>(null),presetsPanel=useRef<HTMLDivElement>(null),copyTimer=useRef(0),closeRef=useRef(close);closeRef.current=close;
   useEffect(()=>{
     let current=true;
     void import('../../docs/THEMING.md?raw').then(module=>{if(current)setSource(module.default);},()=>{if(current)setError('The bundled theme guide could not be loaded.');});
@@ -34,18 +36,50 @@ export default function ThemeGuideDialog({close}:{close:()=>void}) {
       setError('');setCopied(true);clearTimeout(copyTimer.current);copyTimer.current=window.setTimeout(()=>setCopied(false),1800);
     } catch {setError('Could not copy the guide. Select the text to copy it manually.');}
   };
+  const applyPreset=async(id:string)=>{
+    const preset=BUNDLED_THEMES.find(entry=>entry.id===id);
+    if(!preset||applyingId)return;
+    setApplyingId(id);setError('');
+    try {
+      const result=await invoke<{name?:string}|boolean>('apply_bundled_theme',{id});
+      const label=typeof result==='object'&&result&&typeof result.name==='string'?result.name:preset.name;
+      setStatus(`Applied ${label}`);
+    } catch(reason){
+      setError(reason instanceof Error?reason.message:'Could not apply bundled theme.');
+    } finally {setApplyingId('');}
+  };
+  const openPresetBrowser=()=>{
+    setPresetsOpen(true);
+    requestAnimationFrame(()=>presetsPanel.current?.querySelector<HTMLButtonElement>('button:not(:disabled)')?.focus({preventScroll:true}));
+  };
   return <div className="theme-guide-scrim" onClick={event=>{if(event.target===event.currentTarget)close();}}>
     <section ref={dialog} className="theme-guide-dialog" data-independent-zoom role="dialog" aria-modal="true" aria-labelledby="theme-guide-title">
       <header><div><h2 id="theme-guide-title">Theme styling guide</h2><p>Design a theme yourself, or copy this guide for your AI assistant.</p></div>
+        <button type="button" className="theme-guide-secondary" aria-expanded={presetsOpen} onClick={()=>presetsOpen?setPresetsOpen(false):openPresetBrowser()}>{presetsOpen?'Hide presets':'Bundled presets'}</button>
         <button type="button" onClick={()=>void copy()} disabled={source===null}>{copied?'Copied':'Copy guide'}</button>
         <button type="button" className="theme-guide-close" aria-label="Close theme guide" onClick={close}>×</button>
       </header>
       {!!error&&<p className="theme-guide-error" role="alert">{error}</p>}
+      {!!status&&!error&&<p className="theme-guide-status" role="status">{status}</p>}
+      {presetsOpen&&<div ref={presetsPanel} className="theme-guide-presets" role="region" aria-label="Bundled theme presets">
+        <p>Choose a bundled preset to apply across Super MD:</p>
+        <div className="theme-guide-preset-list">
+          {BUNDLED_THEMES.map(preset=><button key={preset.id} type="button" disabled={applyingId===preset.id} onClick={()=>void applyPreset(preset.id)}>{preset.name}</button>)}
+        </div>
+      </div>}
       <div ref={body} className="theme-guide-body" tabIndex={0} aria-label="Theme guide content" onClickCapture={event=>{
-        const link=(event.target as Element).closest<HTMLAnchorElement>('a[href^="#"]');
-        if(link){event.preventDefault();event.stopPropagation();try {const id=decodeURIComponent(link.hash.slice(1));body.current?.querySelector<HTMLElement>('#'+CSS.escape(id))?.scrollIntoView({block:'start'});}catch{/* Ignore invalid fragment URLs. */}}
+        const link=(event.target as Element).closest<HTMLAnchorElement>('a[href]');
+        if(!link)return;
+        const href=link.getAttribute('href')||'';
+        if(href.startsWith('#')){event.preventDefault();event.stopPropagation();try {const id=decodeURIComponent(href.slice(1));body.current?.querySelector<HTMLElement>('#'+CSS.escape(id))?.scrollIntoView({block:'start'});}catch{/* Ignore invalid fragment URLs. */}return;}
+        const bundled=parseBundledThemeHref(href);
+        if(bundled){
+          event.preventDefault();event.stopPropagation();
+          if(bundled.kind==='preset')void applyPreset(bundled.id);
+          else openPresetBrowser();
+        }
       }}>
-        {source===null?<p role="status">Loading theme guide…</p>:<MarkdownPreview markdown={source} documentPath={null} python="" dark={false} fullDocumentAccessibility/>}
+        {source===null?<p role="status">Loading theme guide…</p>:<MarkdownPreview markdown={source} documentPath={null} python="" dark={dark} fullDocumentAccessibility/>}
       </div>
     </section>
   </div>;
