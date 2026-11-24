@@ -49,9 +49,10 @@ def main(argv):
         wire_action='quit' if action=='stop' else action
         socket=QLocalSocket();socket.connectToServer(name)
         if not socket.waitForConnected(1000):return None
-        socket.write(json.dumps({'service':wire_action}).encode('utf-8')+b'\n');socket.waitForBytesWritten(1000)
+        socket.write(json.dumps({'service':wire_action}).encode('utf-8')+b'\n');socket.flush();socket.waitForBytesWritten(1000)
+        read_timeout=3000 if startup_poll else 2000
         raw=bytes(socket.readAll())
-        while b'\n' not in raw and socket.waitForReadyRead(2000):raw+=bytes(socket.readAll())
+        while b'\n' not in raw and socket.waitForReadyRead(read_timeout):raw+=bytes(socket.readAll())
         if b'\n' not in raw:raw+=bytes(socket.readAll())
         if not raw and socket.state()==QLocalSocket.LocalSocketState.ConnectedState:
             socket.waitForDisconnected(50)
@@ -65,12 +66,11 @@ def main(argv):
             )
         )
         socket.disconnectFromServer()
-        socket.close()
         if not raw:
             if peer_closed or startup_poll:return None
             probe=QLocalSocket();probe.connectToServer(name)
             still_listening=probe.waitForConnected(100)
-            probe.abort();probe.close()
+            if still_listening:probe.disconnectFromServer()
             if not still_listening and not _instance_lock_held():return None
             raise ValueError('Existing Super MD instance did not respond to service request')
         line=raw.split(b'\n',1)[0].rstrip(b'\r')
@@ -92,7 +92,7 @@ def main(argv):
                 while still_listening and not _instance_lock_held() and time.monotonic()<vanish_deadline:
                     probe=QLocalSocket();probe.connectToServer(name)
                     still_listening=probe.waitForConnected(100)
-                    probe.abort();probe.close()
+                    if still_listening:probe.disconnectFromServer()
                     if still_listening:time.sleep(.05)
                 if still_listening and not _instance_lock_held():raise
                 reply=None
@@ -148,8 +148,17 @@ def main(argv):
                 if _process_exit_clear():lock_cleared=True;break
                 time.sleep(.05);continue
             probe=request('status',startup_poll=True)
-            if probe is not None and probe.get('ok',False) and probe.get('running'):
-                running=True;break
+            if probe is not None and probe.get('ok',False):
+                if probe.get('running'):
+                    running=True;break
+                if not probe.get('stopping'):
+                    started=request('start',startup_poll=True)
+                    if started is not None:
+                        if not started.get('ok',False):
+                            raise ValueError(started.get('error') or 'Super MD refused to start background agent access')
+                        running=bool(started.get('running',True))
+                        if started.get('sessionsDirectory'):sessions_dir=str(started['sessionsDirectory'])
+                        break
         if not running and not lock_cleared:
             raise ValueError('Background service did not start; previous instance is still shutting down')
         proc=None

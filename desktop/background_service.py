@@ -108,7 +108,7 @@ class BackgroundService(QObject):
                 return {'ok':True,'running':False,'stopped':running,'quitRequested':False}
             self._cli_started_agent_access=False;self._stopping_from_cli=True;self.quitting=True
             if bridge is not None:bridge.stop()
-            self.disable();self.quit()
+            self.disable();self._notify_windows();self.quit()
             return {'ok':True,'running':False,'stopped':True,'quitRequested':True}
         return {'ok':False,'running':running,'error':f'Unsupported service action: {action}'}
     def rebuild_recent(self):
@@ -132,7 +132,7 @@ class BackgroundService(QObject):
         self.app.setQuitOnLastWindowClosed(True)
         self.app.quit()
     def quit(self):
-        self._clear_quit_handlers();self.quitting=True
+        self._clear_quit_handlers();self.quitting=True;self._notify_windows()
         owners=[s for s in self.session.windows.values() if not s.retired]
         self.waiting={s.window_id for s in owners}
         if not owners:QTimer.singleShot(0,self._finalize_quit);return

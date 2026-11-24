@@ -125,11 +125,21 @@ def main():
         QFontDatabase.addApplicationFont(str(file))
     app.setFont(QFont("Noto Sans",11))
     app.setWindowIcon(QIcon(str(ROOT / "public" / "brand-mark-fixed.svg")))
+    global _TEARDOWN_COMPLETED
+    _TEARDOWN_COMPLETED = False
     broker = None if args.test_state else InstanceBroker(app)
-    if broker and not broker.claim_or_forward(args.note):
+    if broker and not broker.claim_or_forward(
+        args.note,
+        defer_listen=True,
+        open_existing=not (args.background and not args.note),
+    ):
         return 0
     if broker:
-        broker.hold_process_exit_lock()
+        try:
+            broker.hold_process_exit_lock()
+        except BaseException:
+            broker.close()
+            raise
     channel = QFile(":/qtwebchannel/qwebchannel.js")
     if not channel.open(QIODevice.OpenModeFlag.ReadOnly):
         raise RuntimeError("Qt WebChannel runtime is unavailable")
@@ -509,13 +519,19 @@ def main():
             return
         create_window(note)
     from background_service import BackgroundService
-    session.background=BackgroundService(app,session,ROOT,open_from_service,force=args.background)
-    create_window(args.note,show_window=not args.background)
-    if args.agent_access:session.agent_bridge.start()
-    if broker:
-        app.aboutToQuit.connect(broker.stop_accepting)
-        broker.requested.connect(lambda note: open_from_service(note or None))
-        broker.set_service_handler(session.background.handle_service_request)
+    try:
+        session.background=BackgroundService(app,session,ROOT,open_from_service,force=args.background)
+        create_window(args.note,show_window=not args.background)
+        if args.agent_access:session.agent_bridge.start()
+        if broker:
+            app.aboutToQuit.connect(broker.stop_accepting)
+            broker.requested.connect(lambda note: open_from_service(note or None))
+            broker.set_service_handler(session.background.handle_service_request)
+            broker.start_listening()
+    except BaseException:
+        if broker:
+            broker.close()
+        raise
     app.openRequested.connect(open_from_service)
     app.reopenRequested.connect(
         lambda: open_from_service(None)
@@ -537,10 +553,16 @@ def main():
     return status
 
 
+_TEARDOWN_COMPLETED = False
+
+
 def _exit_process(status: int) -> None:
     sys.stdout.flush()
     sys.stderr.flush()
-    sys.exit(status)
+    if sys.platform == "darwin" and _TEARDOWN_COMPLETED:
+        os._exit(int(status))
+    else:
+        sys.exit(status)
 
 
 def _run_teardown(app, session, studios, engines, asset_handler, broker, *, reader_profile_initialized=False):
@@ -590,6 +612,8 @@ def _run_teardown(app, session, studios, engines, asset_handler, broker, *, read
             except (RuntimeError, TypeError):
                 pass
     app.sendPostedEvents(None, QEvent.Type.DeferredDelete)
+    global _TEARDOWN_COMPLETED
+    _TEARDOWN_COMPLETED = True
 
 
 if __name__ == "__main__":

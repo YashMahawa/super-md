@@ -611,6 +611,7 @@ from pathlib import Path
 
 os.environ["QT_QPA_PLATFORM"] = "offscreen"
 os.environ["QT_QUICK_BACKEND"] = "software"
+os.environ["QML_DISABLE_DISK_CACHE"] = "1"
 os.environ.setdefault("QTWEBENGINE_CHROMIUM_FLAGS", "--disable-gpu --disable-dev-shm-usage")
 os.environ.setdefault("QTWEBENGINE_DISABLE_SANDBOX", "1")
 
@@ -1692,7 +1693,11 @@ desktop_main._exit_process(rc)""",
             spawnMarker=str(spawn_marker),
             extraEnv=extra_env,
         )
-        self.assertEqual(code, 0, start_payload)
+        self.assertEqual(
+            code,
+            0,
+            f"payload={start_payload}; log={(occluded_appdata / 'background-service.log').read_text(encoding='utf-8', errors='replace') if (occluded_appdata / 'background-service.log').is_file() else ''}",
+        )
         first_pid = json.loads(spawn_marker.read_text(encoding="utf-8"))["pid"]
         sessions_dir = Path(start_payload["result"]["sessionsDirectory"])
 
@@ -1813,9 +1818,17 @@ desktop_main._exit_process(rc)""",
                 "with patch.object(desktop_main.QWebEngineProfile, 'defaultProfile') as m_profile2:",
                 "    desktop_main._run_teardown(fake_app, fake_session, [], [], fake_handler, None, reader_profile_initialized=True)",
                 "    m_profile2.return_value.removeUrlSchemeHandler.assert_called_once_with(fake_handler)",
-                "with patch.object(desktop_main.sys, 'exit') as m_sys:",
+                "assert desktop_main._TEARDOWN_COMPLETED is True",
+                "with patch.object(desktop_main, 'sys', SimpleNamespace(platform='linux', stdout=sys.stdout, stderr=sys.stderr, exit=MagicMock())) as m_linux_sys:",
                 "    desktop_main._exit_process(0)",
-                "    assert m_sys.call_args_list == [((0,), {})], m_sys.call_args_list",
+                "    assert m_linux_sys.exit.call_args_list == [((0,), {})], m_linux_sys.exit.call_args_list",
+                "with patch.object(desktop_main, 'sys', SimpleNamespace(platform='darwin', stdout=sys.stdout, stderr=sys.stderr, exit=MagicMock())) as m_darwin_sys, patch.object(desktop_main.os, '_exit') as m_os_exit:",
+                "    desktop_main._exit_process(0)",
+                "    assert m_os_exit.call_args_list == [((0,), {})], m_os_exit.call_args_list",
+                "    assert not m_darwin_sys.exit.called",
+                "    desktop_main._TEARDOWN_COMPLETED = False",
+                "    desktop_main._exit_process(0)",
+                "    assert m_darwin_sys.exit.call_args_list == [((0,), {})], m_darwin_sys.exit.call_args_list",
             ]
         )
         probe = subprocess.run(
@@ -1825,6 +1838,60 @@ desktop_main._exit_process(rc)""",
             timeout=20,
         )
         self.assertEqual(probe.returncode, 0, probe.stderr or probe.stdout)
+
+        # 1b. Verify deferred start_listening(), open_existing=False duplicate --background suppression,
+        #     and automatic _ensure_listening() recovery when BSD/macOS XNU ECONNABORTED drops QLocalServer
+        #     (errorString non-empty) without reopening an intentionally closed server (errorString empty).
+        deferred_appdata = (self.temp_appdata / "Deferred Broker And XNU Recovery").resolve()
+        deferred_appdata.mkdir(parents=True, exist_ok=True)
+        with patch.object(
+            QStandardPaths,
+            "writableLocation",
+            side_effect=lambda k: str(deferred_appdata)
+            if k == QStandardPaths.AppDataLocation
+            else self._orig_writable(k),
+        ):
+            deferred_broker = InstanceBroker(self.qt_app, service_handler=self.session.background.handle_service_request)
+            self.addCleanup(deferred_broker.close)
+            forwarded_notes = []
+            deferred_broker.requested.connect(forwarded_notes.append)
+            self.assertTrue(deferred_broker.claim_or_forward(None, defer_listen=True))
+            self.assertFalse(deferred_broker.server.isListening())
+            self.assertTrue(deferred_broker.lock.isLocked())
+
+            # Duplicate --background launch while primary finishes QML startup and calls start_listening():
+            # open_existing=False must return False without emitting `requested` to pop a visible window.
+            QTimer.singleShot(120, deferred_broker.start_listening)
+            dup_result = {}
+
+            def run_dup_bg():
+                dup = InstanceBroker()
+                dup_result["claimed"] = dup.claim_or_forward(None, defer_listen=True, open_existing=False)
+
+            dup_thread = threading.Thread(target=run_dup_bg, daemon=True)
+            dup_thread.start()
+            dup_deadline = time.monotonic() + 4.0
+            while dup_thread.is_alive() and time.monotonic() < dup_deadline:
+                self.qt_app.processEvents()
+                time.sleep(0.01)
+            dup_thread.join(timeout=1.0)
+            self.assertIs(dup_result.get("claimed"), False)
+            self.assertTrue(deferred_broker.server.isListening())
+            self.assertEqual(forwarded_notes, [])
+
+            # Simulate BSD/macOS XNU QLocalServerPrivate::closeServer() after ECONNABORTED (errorString non-empty):
+            # _ensure_listening() must re-bind the server automatically while self.lock remains held.
+            deferred_broker.server.close()
+            self.assertFalse(deferred_broker.server.isListening())
+            with patch.object(deferred_broker.server, "errorString", return_value="QLocalServer::accept: Software caused connection abort"):
+                deferred_broker._ensure_listening()
+            self.assertTrue(deferred_broker.server.isListening())
+
+            # Intentional server.close() (empty errorString) must stay closed until stop_accepting/close.
+            deferred_broker.server.close()
+            deferred_broker._ensure_listening()
+            self.assertFalse(deferred_broker.server.isListening())
+            deferred_broker.close()
 
         # 2. Simulate macOS XNU closing-socket race during `service start`:
         #    the initial client connect writes to a dying server (e.g. UnknownSocketError / empty read

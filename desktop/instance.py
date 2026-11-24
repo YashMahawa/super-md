@@ -81,6 +81,10 @@ class InstanceBroker(QObject):
         self.server = QLocalServer(self)
         self.server.setSocketOptions(QLocalServer.SocketOption.UserAccessOption)
         self.server.newConnection.connect(self.accept)
+        self._should_listen = False
+        self._listen_watchdog = QTimer(self)
+        self._listen_watchdog.setInterval(100)
+        self._listen_watchdog.timeout.connect(self._ensure_listening)
 
     def hold_process_exit_lock(self, timeout: float = 15.0) -> None:
         self.root.mkdir(parents=True, exist_ok=True)
@@ -107,24 +111,57 @@ class InstanceBroker(QObject):
     def set_service_handler(self, handler):
         self.service_handler = handler
 
-    def claim_or_forward(self, note):
-        def listen():
-            QLocalServer.removeServer(self.name)  # Only the exclusive owner may remove a stale socket.
-            if not self.server.listen(self.name):
-                self.lock.unlock()
-                raise RuntimeError("Unable to start the native application file-opening service")
+    def start_listening(self) -> bool:
+        self._should_listen = True
+        if self.server.isListening():
+            if not self._listen_watchdog.isActive():
+                self._listen_watchdog.start()
             return True
+        QLocalServer.removeServer(self.name)  # Only the exclusive owner may remove a stale socket.
+        if not self.server.listen(self.name):
+            self._should_listen = False
+            self._listen_watchdog.stop()
+            self.lock.unlock()
+            raise RuntimeError("Unable to start the native application file-opening service")
+        if not self._listen_watchdog.isActive():
+            self._listen_watchdog.start()
+        return True
+
+    def _ensure_listening(self) -> None:
+        if not self._should_listen or self.server.isListening() or not self.lock.isLocked():
+            return
+        if not self.server.errorString():
+            return
+        # On BSD/macOS (XNU), an aborted client socket in the backlog makes ::accept() return
+        # ECONNABORTED, causing Qt's QLocalServerPrivate::_q_onNewConnection to call setError()
+        # and closeServer() (QTBUG-27239). Re-bind automatically while we still own self.lock.
+        QLocalServer.removeServer(self.name)
+        self.server.listen(self.name)
+
+    def claim_or_forward(self, note, *, defer_listen: bool = False, open_existing: bool = True):
         if self.lock.tryLock(0):
-            return listen()
-        socket = QLocalSocket()
-        socket.connectToServer(self.name)
-        if not socket.waitForConnected(2000):
-            if self.lock.tryLock(3000):
-                return listen()
+            return True if defer_listen else self.start_listening()
+        socket = None
+        deadline = time.monotonic() + 5.0
+        while time.monotonic() < deadline:
+            candidate = QLocalSocket()
+            candidate.connectToServer(self.name)
+            if candidate.waitForConnected(200):
+                socket = candidate
+                break
+            if candidate.state() != QLocalSocket.LocalSocketState.UnconnectedState:
+                candidate.abort()
+            if self.lock.tryLock(100):
+                return True if defer_listen else self.start_listening()
+        if socket is None:
             raise RuntimeError("Super MD is starting or busy. Please try opening the note again.")
+        if not open_existing:
+            socket.disconnectFromServer()
+            return False
         url = QUrl(note or "")
         local = url.toLocalFile() if url.isLocalFile() else note
         socket.write(json.dumps({"note": str(Path(local).resolve()) if local else ""}).encode() + b"\n")
+        socket.flush()
         socket.waitForBytesWritten(1000)
         raw = bytes(socket.readAll())
         while b"\n" not in raw and socket.waitForReadyRead(2000):
@@ -132,6 +169,7 @@ class InstanceBroker(QObject):
         if b"\n" not in raw:
             raw += bytes(socket.readAll())
         if raw != b"ok\n":
+            socket.disconnectFromServer()
             raise RuntimeError("The existing Super MD process did not acknowledge the new window")
         socket.disconnectFromServer()
         return False
@@ -184,13 +222,19 @@ class InstanceBroker(QObject):
             read()
 
     def stop_accepting(self):
+        self._should_listen = False
+        self._listen_watchdog.stop()
         self.server.close()
         while self.server.hasPendingConnections():
             pending = self.server.nextPendingConnection()
             if pending is not None:
-                pending.abort()
+                pending.disconnectFromServer()
+                if pending.state() != QLocalSocket.LocalSocketState.UnconnectedState:
+                    pending.abort()
         for child in self.findChildren(QLocalSocket):
-            child.abort()
+            child.disconnectFromServer()
+            if child.state() != QLocalSocket.LocalSocketState.UnconnectedState:
+                child.abort()
 
     def close(self):
         self.stop_accepting()
