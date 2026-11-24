@@ -36,7 +36,7 @@ def _probe(directory: str) -> int:
     from agent_live import create_qt_bridge
     from studio import Session, Studio
     temp=Path(directory); temp.mkdir(parents=True,exist_ok=True)
-    session=Session(True); session.settings["newNoteLocation"]=str(temp); session.settings["python"]=sys.executable
+    session=Session(True); session.settings["python"]=sys.executable; session.settings["newNoteLocation"]=str(temp)
     studio=Studio(True,session); session.agent_bridge=create_qt_bridge(session,session.data); bridge=session.agent_bridge
     svg_body="<svg xmlns=\"http://www.w3.org/2000/svg\">\n"+"\n".join(f"<path id=\"svg-{index}\" d=\"M0 {index}L10 {index}\"/>" for index in range(2200))+"\n</svg>"
     mermaid='graph TD; A["Σ 😀"]-->B'

@@ -41,8 +41,8 @@ def _probe(mode: str, zoom: float = 95.59963715447921, fullscreen: bool = False)
         content = "# Mouse selection probe\n" + target_text + "\nSecond line after the selection.\n"
         session = Session(True)
         session.settings["welcomed"] = True
-        session.settings["newNoteLocation"] = temp_dir
         session.settings["python"] = sys.executable
+        session.settings["newNoteLocation"] = temp_dir
         studio = Studio(True, session)
         studio.settings["normalZoom"] = zoom
         studio.settings["fullZoom"] = zoom

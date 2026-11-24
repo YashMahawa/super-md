@@ -19,22 +19,31 @@
 // code remain vectors and selectable text; the UI's zoom cannot affect PDF layout.
 #let smd-fit(body) = layout(size => {
   let natural = measure(body)
-  let factor = if natural.width > 0pt { calc.min(1, size.width / natural.width) } else { 1 }
-  scale(x: factor * 100%, y: factor * 100%, reflow: true, body)
+  if natural.width > size.width and natural.width > 0pt {
+    let factor = size.width / natural.width
+    scale(x: factor * 100%, y: factor * 100%, reflow: true, body)
+  } else {
+    body
+  }
 })
-#let smd-code(body) = block(width: 100%, breakable: true, fill: smd-code-fill, inset: 8pt, {
-  set par(spacing: 0pt, leading: .3em)
-  show linebreak: none
-  show raw.line: line => block(height: 1.2em, above: 0pt, below: 0pt, smd-fit(if line.text == "" { " " } else { line }))
-  body
-})
-#let smd-vector(render) = layout(size => {
-  let bounds = measure(render(auto))
-  let width = if bounds.height > 0pt { calc.min(size.width, 170mm * (bounds.width / bounds.height)) } else { size.width }
-  render(width)
-})
-#let smd-image(path, width: none, zoom: none) = layout(size => {
-  let pic = image(path)
+// Highlight each code block once, then fit synthesized lines individually while
+// keeping the outer 1.2em row height and breakable pagination across pages.
+#let smd-code(code, lang: none) = context {
+  let line-height = 1.2em.to-absolute()
+  block(width: 100%, breakable: true, fill: smd-code-fill, inset: 8pt, {
+    set par(spacing: 0pt, leading: .3em)
+    show raw.where(block: true): it => {
+      for line in it.lines {
+        block(height: line-height, above: 0pt, below: 0pt, smd-fit(line))
+      }
+    }
+    if code != none {
+      raw(code, block: true, lang: lang)
+    }
+  })
+}
+#let smd-image(src, width: none, zoom: none, format: auto) = layout(size => {
+  let pic = image(src, format: format)
   let bounds = measure(pic)
   let base = if width == none {
     if zoom == none {
@@ -48,7 +57,7 @@
     width
   }
   let target = if zoom == none { base } else { base * zoom }
-  image(path, width: calc.min(size.width, target))
+  image(src, format: format, width: calc.min(size.width, target))
 })
 // Compact export-only sequence cells: no card chrome or fixed empty stage.
 #let smd-step-image(path) = layout(size => {

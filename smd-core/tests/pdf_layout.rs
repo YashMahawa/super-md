@@ -190,7 +190,7 @@ fn standalone_tree_diagram_and_svg_blocks_export_as_vectors_and_reject_unsafe_ma
         "```",
     ].join("\n");
     let generated = source(&markdown, &PdfOptions::default(), &HashMap::new()).unwrap();
-    assert_eq!(generated.matches("image(bytes(").count(), 3, "{generated}");
+    assert_eq!(generated.matches("#smd-image(bytes(").count(), 3, "{generated}");
     assert_eq!(generated.matches("format: \"svg\"").count(), 3, "{generated}");
     assert!(!generated.contains("\"values\""));
     let pdf = export(&markdown, &PdfOptions::default(), &HashMap::new()).unwrap();
@@ -227,9 +227,9 @@ fn multiline_python_docstrings_render_as_one_raw_block_and_keep_syntax_colors() 
         "```",
     ].join("\n");
     let generated = source(&markdown, &PdfOptions::default(), &HashMap::new()).unwrap();
-    assert!(generated.contains("show raw.line:"), "{generated}");
-    assert_eq!(generated.matches("raw(").count(), 1, "Fenced code must emit one block raw() call: {generated}");
-    assert!(generated.contains("block: true, lang: \"python\""), "{generated}");
+    assert!(generated.contains("show raw.where(block: true):"), "{generated}");
+    assert_eq!(generated.matches("\n#smd-code(").count(), 1, "Fenced code must emit one #smd-code() call: {generated}");
+    assert!(generated.contains(", lang: \"python\")"), "{generated}");
 
     let pdf = export(&markdown, &PdfOptions::default(), &HashMap::new()).unwrap();
     assert_eq!(count_pdf_pages(&pdf), 1);

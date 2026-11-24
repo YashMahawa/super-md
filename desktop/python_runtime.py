@@ -210,24 +210,14 @@ def candidates(managed: Path, folders: list[str] = ()) -> list[Path]:
             found.append(Path(located))
     if not frozen():
         found.append(Path(sys.executable))
-    unique: list[Path] = []
-    seen_paths: set[str] = set()
-    seen_targets: set[tuple[str, str]] = set()
+    unique, seen = [], set()
     for path in found:
         sibling = Path(str(path).replace("/sbin/", "/bin/"))
         if sibling != path and sibling.is_file():
             path = sibling  # Merged-/usr systems list python under sbin first on PATH.
-        if not path.is_file() or not NAME.match(path.name):
-            continue
-        abs_key = os.path.normcase(os.path.abspath(path))
-        # Within a single bin/ directory, python, python3 and python3.x often
-        # symlink to the same binary. Deduplicate by (parent, realpath) so we
-        # probe once per prefix while preserving separate virtualenvs that
-        # symlink to a shared base interpreter from distinct bin/ directories.
-        target_key = (os.path.normcase(os.path.abspath(path.parent)), os.path.normcase(os.path.realpath(path)))
-        if abs_key not in seen_paths and target_key not in seen_targets:
-            seen_paths.add(abs_key)
-            seen_targets.add(target_key)
+        key = os.path.normcase(os.path.abspath(path))
+        if key not in seen and path.is_file() and NAME.match(path.name):
+            seen.add(key)
             unique.append(path)
     return unique
 
@@ -261,13 +251,6 @@ def discover(managed: Path, folders: list[str] = ()) -> list[dict]:
 def preferred(managed: Path) -> str:
     if bundled_available():
         return BUNDLED
-    if managed.is_dir():
-        for candidate in _bin(managed):
-            if candidate.is_file():
-                info = probe(str(candidate))
-                if info and info["matplotlib"] and info["numpy"]:
-                    return str(candidate)
-                break
     for item in discover(managed):
         if item["matplotlib"]:
             return item["path"]

@@ -491,7 +491,14 @@ def main():
     from background_service import BackgroundService
     session.background=BackgroundService(app,session,ROOT,open_from_service,force=args.background)
     create_window(args.note,show_window=not args.background)
-    if args.agent_access:session.agent_bridge.start()
+    if session.settings.get("agentAccessEnabled"):
+        try:
+            session.agent_bridge.start()
+        except Exception as error:
+            session.settings["agentAccessEnabled"] = False
+            for studio in studios:
+                studio._agent_error = f"Could not enable live agent access ({type(error).__name__})."
+                studio._emit(False)
     if broker:
         broker.requested.connect(lambda note: open_from_service(note or None))
     if broker:
