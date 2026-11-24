@@ -15,6 +15,9 @@ const javascriptReferences = [
   /\bnew\s+URL\(\s*["']([^"']+)["']\s*,\s*import\.meta\.url\s*\)/g,
 ];
 const cssReferences = /(?:url\(\s*["']?|@import\s+["'])([^"')]+)["']?\s*\)?/gi;
+const fontExtensions = /\.(?:woff2?|ttf|otf|eot)$/i;
+const forbiddenDistFonts = /\.(?:ttf|woff)$/i;
+export const MAX_READER_FONT_BYTES = 3_200_000;
 
 function localReference(value) {
   const target = value.trim();
@@ -68,6 +71,8 @@ export async function inventory(root) {
   const sizes = {};
   for (const file of files) sizes[file] = (await stat(path.join(base, file))).size;
   const readerReachable = new Set(Object.values(reachedByEntry).flat());
+  const readerFonts = [...readerReachable].filter(file => fontExtensions.test(file)).sort();
+  const readerFontBytes = readerFonts.reduce((sum, file) => sum + sizes[file], 0);
   return {
     warning: 'Static reachability is an inventory aid only. Dynamic URLs and runtime asset discovery can be missed; nothing is safe to prune from this report alone.',
     entries: reachedByEntry,
@@ -78,8 +83,40 @@ export async function inventory(root) {
       totalBytes: Object.values(sizes).reduce((sum, size) => sum + size, 0),
       readerReachableCount: readerReachable.size,
       readerReachableBytes: [...readerReachable].reduce((sum, file) => sum + sizes[file], 0),
-      readerFonts: [...readerReachable].filter(file => /\.(?:woff2?|ttf|otf)$/i.test(file)),
+      readerFontBytes,
+      readerFonts,
     },
+  };
+}
+
+export function verifyReaderFontBudget(report, { maxBytes = MAX_READER_FONT_BYTES } = {}) {
+  if (!Number.isFinite(maxBytes) || maxBytes <= 0) {
+    throw new Error(`Invalid reader font byte budget: ${maxBytes}`);
+  }
+  const legacyDistFonts = (report.files || [])
+    .map(file => file.path)
+    .filter(filePath => forbiddenDistFonts.test(filePath));
+  if (legacyDistFonts.length) {
+    throw new Error(`Build output contains forbidden .ttf/.woff font assets: ${legacyDistFonts.join(', ')}`);
+  }
+  const readerFonts = report.totals?.readerFonts || [];
+  if (!readerFonts.length) {
+    throw new Error('Native reader bundle did not resolve any reachable .woff2 font assets');
+  }
+  const nonWoff2ReaderFonts = readerFonts.filter(filePath => !/\.woff2$/i.test(filePath));
+  if (nonWoff2ReaderFonts.length) {
+    throw new Error(`Reachable reader fonts must use .woff2 only: ${nonWoff2ReaderFonts.join(', ')}`);
+  }
+  const readerFontBytes = report.totals?.readerFontBytes ?? (report.files || [])
+    .filter(file => file.readerReachable && fontExtensions.test(file.path))
+    .reduce((sum, file) => sum + file.bytes, 0);
+  if (readerFontBytes > maxBytes) {
+    throw new Error(`Reachable reader font bytes (${readerFontBytes}) exceed budget (${maxBytes})`);
+  }
+  return {
+    readerFontCount: readerFonts.length,
+    readerFontBytes,
+    maxReaderFontBytes: maxBytes,
   };
 }
 
@@ -122,10 +159,15 @@ async function main() {
   const result = await inventory(root);
   if (outAt >= 0) await writeFile(args[outAt + 1], `${JSON.stringify(result, null, 2)}\n`);
   const publicAt = args.indexOf('--public-root');
+  const maxFontAt = args.indexOf('--max-font-bytes');
+  const maxBytes = maxFontAt >= 0 ? Number(args[maxFontAt + 1]) : MAX_READER_FONT_BYTES;
   const verification = args.includes('--verify-native') ? await verifyNativeResources(root, publicAt >= 0 ? args[publicAt + 1] : 'public') : undefined;
+  const fontBudgetCheck = (args.includes('--verify-native') || args.includes('--verify-fonts'))
+    ? verifyReaderFontBudget(result, { maxBytes })
+    : undefined;
   const { readerFonts, ...totals } = result.totals;
   const requiredResourceCheck = verification && { checkedCount: verification.checkedCount, publicFileCount: verification.publicFileCount };
-  console.log(JSON.stringify({ ...totals, readerFontCount: readerFonts.length, unresolvedReferences: Object.fromEntries(Object.entries(result.unresolvedReferences).map(([entry, refs]) => [entry, refs.length])), requiredResourceCheck }, null, 2));
+  console.log(JSON.stringify({ ...totals, readerFontCount: readerFonts.length, unresolvedReferences: Object.fromEntries(Object.entries(result.unresolvedReferences).map(([entry, refs]) => [entry, refs.length])), requiredResourceCheck, fontBudgetCheck }, null, 2));
 }
 
 if (import.meta.url === pathToFileURL(process.argv[1] || '').href) {
