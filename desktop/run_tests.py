@@ -4,10 +4,9 @@ import sys
 import unittest
 from pathlib import Path
 
-
 def suite_watchdog_seconds(platform_name: str = sys.platform) -> int:
     # macOS CI (both Intel x86_64 and Apple Silicon arm64) runs multiple
-    # bounded 60-second QtWebEngine subprocess probes after hundreds of native
+    # bounded 60-second Qt WebEngine subprocess probes after hundreds of native
     # tests under software rendering. A four-minute suite watchdog kills the
     # process before those individual timeouts can report a real failure.
     # Keep the per-probe assertions and timeout; only widen the suite budget.
