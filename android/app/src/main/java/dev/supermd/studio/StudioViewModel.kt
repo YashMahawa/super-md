@@ -1215,7 +1215,7 @@ class StudioViewModel(app: Application, val workspaceKey: String = "main") : And
             state.closedTabs.any { it.assetDirectory == directory } ||
             closedNoteRefs.any { it.assetDirectory == directory }
     }
-    private var refreshJob: Job? = null
+    internal var refreshJob: Job? = null
     fun refreshExternal() {
         data class CleanExternalUpdate(
             val snapshot: Note,
@@ -1267,7 +1267,6 @@ class StudioViewModel(app: Application, val workspaceKey: String = "main") : And
                     }
                 }
                 if (newlyConflicted.isEmpty() && cleanUpdates.isEmpty()) return@launch
-                newlyConflicted.forEach { autosavePending.remove(it) }
                 val adoptableUpdates = mutableMapOf<String, CleanExternalUpdate>()
                 cleanUpdates.forEach { (id, update) ->
                     val current = mutable.value.tabs.find { it.id == id }
@@ -1286,8 +1285,18 @@ class StudioViewModel(app: Application, val workspaceKey: String = "main") : And
                         if (update.directory != null && update.assets != null) {
                             savedPortableAssets[id] = update.assets
                         }
+                    } else if (
+                        current != null &&
+                        current.dirty &&
+                        id !in mutable.value.conflictedTabIds &&
+                        current.uri == update.snapshot.uri &&
+                        current.saved == update.snapshot.saved &&
+                        current.assetDirectory == update.snapshot.assetDirectory
+                    ) {
+                        newlyConflicted.add(id)
                     }
                 }
+                newlyConflicted.forEach { autosavePending.remove(it) }
                 if (newlyConflicted.isEmpty() && adoptableUpdates.isEmpty()) return@launch
                 val previousPortableDirs = adoptableUpdates.mapNotNull { (id, update) ->
                     val oldDir = update.snapshot.assetDirectory

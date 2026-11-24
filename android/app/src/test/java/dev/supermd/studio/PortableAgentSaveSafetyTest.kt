@@ -21,6 +21,7 @@ import java.io.File
 import java.nio.file.Files
 import java.time.Duration
 import java.util.UUID
+import java.util.concurrent.TimeUnit
 
 @RunWith(RobolectricTestRunner::class)
 @Config(sdk = [35])
@@ -40,32 +41,23 @@ class PortableAgentSaveSafetyTest {
     private fun svgAssets(name: String, bytes: ByteArray): JSONObject =
         JSONObject().put(name, "data:image/svg+xml;base64," + Base64.encodeToString(bytes, Base64.NO_WRAP))
 
-    private fun newTestModel(): StudioViewModel {
-        val app = RuntimeEnvironment.getApplication()
-        return StudioViewModel(app, UUID.randomUUID().toString()).apply {
-            reading(autosave = false)
-            readerFlushRequester = { true }
-        }
-    }
-
-    private fun pumpMainLooper(advanceMs: Long = 20) {
+    private fun pumpMainLooper(advanceMs: Long = 25) {
         shadowOf(Looper.getMainLooper()).idleFor(Duration.ofMillis(advanceMs))
-        shadowOf(Looper.getMainLooper()).idle()
     }
 
     private fun awaitJob(job: Job, timeoutMs: Long = 5_000) {
-        val deadline = System.currentTimeMillis() + timeoutMs
-        while (!job.isCompleted && System.currentTimeMillis() < deadline) {
-            pumpMainLooper(20)
+        val deadlineNs = System.nanoTime() + TimeUnit.MILLISECONDS.toNanos(timeoutMs)
+        while (!job.isCompleted && System.nanoTime() < deadlineNs) {
+            pumpMainLooper(25)
             Thread.sleep(10)
         }
-        pumpMainLooper(20)
+        pumpMainLooper(25)
         assertTrue("Job did not complete within ${timeoutMs}ms", job.isCompleted)
     }
 
     private fun awaitCondition(timeoutMs: Long = 5_000, predicate: () -> Boolean) {
-        val deadline = System.currentTimeMillis() + timeoutMs
-        while (!predicate() && System.currentTimeMillis() < deadline) {
+        val deadlineNs = System.nanoTime() + TimeUnit.MILLISECONDS.toNanos(timeoutMs)
+        while (!predicate() && System.nanoTime() < deadlineNs) {
             pumpMainLooper(25)
             Thread.sleep(15)
         }
@@ -99,7 +91,17 @@ class PortableAgentSaveSafetyTest {
         val bundlesRoot = File(app.filesDir, "portable-assets")
         val baselineDirs = bundlesRoot.listFiles()?.map { it.name }?.toSet().orEmpty()
         val tempDir = Files.createTempDirectory("android-smd-refresh").toFile()
-        val model = newTestModel()
+        val workspaceKey = "test-${UUID.randomUUID()}"
+        val store = androidx.lifecycle.ViewModelStore()
+        val factory = object : androidx.lifecycle.ViewModelProvider.Factory {
+            @Suppress("UNCHECKED_CAST")
+            override fun <T : androidx.lifecycle.ViewModel> create(modelClass: Class<T>): T =
+                StudioViewModel(app, workspaceKey).apply {
+                    reading(autosave = false)
+                    readerFlushRequester = { true }
+                } as T
+        }
+        val model = androidx.lifecycle.ViewModelProvider(store, factory)[StudioViewModel::class.java]
         val capabilities = ReaderAssetCapabilities()
         model.attachReaderCapabilities(capabilities)
         try {
@@ -113,8 +115,7 @@ class PortableAgentSaveSafetyTest {
 
             // 1. Refreshing an unchanged .smd archive keeps the current directory and cleans up its temporary extraction.
             model.refreshExternal()
-            Thread.sleep(280)
-            pumpMainLooper(300)
+            awaitJob(model.refreshJob!!)
             assertEquals(initialDir, model.state.value.active.assetDirectory)
             awaitCondition {
                 bundlesRoot.listFiles()?.map { it.name }?.toSet().orEmpty() == baselineDirs + initialDir
@@ -124,9 +125,10 @@ class PortableAgentSaveSafetyTest {
             val staleCapability = capabilities.register(noteId, "assets/fig.svg", "image/svg+xml", "fp-1")!!
             file.outputStream().use { model.media.writeFmd(it, "# Version 1\n\n![Fig](assets/fig.svg)\n", svgAssets("assets/fig.svg", svgB)) }
             model.refreshExternal()
-            awaitCondition { model.state.value.active.assetDirectory != initialDir }
+            awaitJob(model.refreshJob!!)
 
             val assetUpdatedDir = model.state.value.active.assetDirectory!!
+            assertNotEquals(initialDir, assetUpdatedDir)
             assertArrayEquals(svgB, model.media.local("assets/fig.svg", assetUpdatedDir)!!.readBytes())
             assertNull(capabilities.lookup(staleCapability.token) { true })
             awaitCondition {
@@ -137,12 +139,13 @@ class PortableAgentSaveSafetyTest {
             // 3. Updating Markdown + asset externally with rapid consecutive refresh notifications adopts the latest archive without leaking.
             file.outputStream().use { model.media.writeFmd(it, "# Version 2\n\n![Fig](assets/fig.svg)\n", svgAssets("assets/fig.svg", svgA)) }
             model.refreshExternal()
-            Thread.sleep(220)
+            pumpMainLooper(210)
             model.refreshExternal()
-            awaitCondition { model.state.value.active.content == "# Version 2\n\n![Fig](assets/fig.svg)\n" }
+            awaitJob(model.refreshJob!!)
 
             val reloadedDir = model.state.value.active.assetDirectory!!
             assertNotEquals(assetUpdatedDir, reloadedDir)
+            assertEquals("# Version 2\n\n![Fig](assets/fig.svg)\n", model.state.value.active.content)
             assertEquals("# Version 2\n\n![Fig](assets/fig.svg)\n", model.state.value.active.saved)
             assertArrayEquals(svgA, model.media.local("assets/fig.svg", reloadedDir)!!.readBytes())
             awaitCondition {
@@ -153,21 +156,23 @@ class PortableAgentSaveSafetyTest {
             // 4. Local edits arriving after refresh starts abort adoption and delete any temporary extracted directory.
             file.outputStream().use { model.media.writeFmd(it, "# Version 3\n\n![Fig](assets/fig.svg)\n", svgAssets("assets/fig.svg", svgB)) }
             model.refreshExternal()
-            Thread.sleep(220)
+            pumpMainLooper(210)
             model.edit(noteId, "# Unsaved local draft\n")
-            Thread.sleep(250)
-            pumpMainLooper(300)
+            awaitJob(model.refreshJob!!)
 
             assertEquals("# Unsaved local draft\n", model.state.value.active.content)
             assertEquals(reloadedDir, model.state.value.active.assetDirectory)
+            assertTrue(noteId in model.state.value.conflictedTabIds)
             awaitCondition {
                 bundlesRoot.listFiles()?.map { it.name }?.toSet().orEmpty() == baselineDirs + reloadedDir
             }
         } finally {
             model.detachReaderCapabilities(capabilities)
-            model.state.value.tabs.mapNotNull { it.assetDirectory }.forEach {
-                File(bundlesRoot, it).deleteRecursively()
-            }
+            val openDirs = model.state.value.tabs.mapNotNull { it.assetDirectory }
+            store.clear()
+            openDirs.forEach { File(bundlesRoot, it).deleteRecursively() }
+            File(app.filesDir, "workspaces/$workspaceKey.json").deleteRecursively()
+            File(app.filesDir, "workspaces/$workspaceKey").deleteRecursively()
             tempDir.deleteRecursively()
         }
     }
