@@ -1,11 +1,7 @@
-import { unified } from "unified";
-import remarkParse from "remark-parse";
-import remarkGfm from "remark-gfm";
-import remarkMath from "remark-math";
 import { visit } from "unist-util-visit";
+import { analyzeDocument } from "./documentAnalysis";
 import { safeParseUrl } from "./documentMedia";
 import { maskCode } from "./markdownSource";
-import { remarkObsidianMath } from "./obsidianMath";
 
 export const FORMAT_ACTIONS = [
   "bold",
@@ -656,26 +652,21 @@ export function isProtectedMarkdownSelection(doc: string, from: number, to: numb
   const slice = doc.slice(windowStart, windowEnd);
   const localFrom = from - windowStart;
   const localTo = to - windowStart;
+  if (windowStart === 0) {
+    const frontmatter = slice.match(/^---\r?\n[\s\S]*?\r?\n---(?:\r?\n|$)/);
+    if (frontmatter && localFrom < frontmatter[0].length) return true;
+  }
   if (maskCode(slice).slice(localFrom, localTo) !== selected) return true;
 
   let protectedByAst = false;
-  const checkTree = (withMath: boolean) => {
-    const parser = withMath
-      ? unified().use(remarkParse).use(remarkGfm).use(remarkMath).use(remarkObsidianMath)
-      : unified().use(remarkParse).use(remarkGfm);
-    const tree = parser.parse(slice);
-    visit(tree, (node: any) => {
-      if (protectedByAst || !PROTECTED_AST_TYPES.has(node.type) || !node.position) return;
-      const start = node.position.start.offset;
-      const end = node.position.end.offset;
-      if (typeof start === "number" && typeof end === "number" && start < localTo && end > localFrom) {
-        protectedByAst = true;
-      }
-    });
-  };
-  checkTree(false);
-  if (protectedByAst) return true;
-  checkTree(true);
+  visit(analyzeDocument(slice).tree, (node: any) => {
+    if (protectedByAst || !PROTECTED_AST_TYPES.has(node.type) || !node.position) return;
+    const start = node.position.start.offset;
+    const end = node.position.end.offset;
+    if (typeof start === "number" && typeof end === "number" && start < localTo && end > localFrom) {
+      protectedByAst = true;
+    }
+  });
   if (protectedByAst) return true;
 
   // Guard unclosed fences, math, inline code, HTML tags, and partial link/image syntax.

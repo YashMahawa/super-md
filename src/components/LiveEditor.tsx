@@ -18,6 +18,7 @@ import {
   type FormatAction,
 } from '../markdownFormatting';
 import {editableBlockSpans,indentMarkdownSelection,isFirstLineCursor,isLastLineCursor} from '../liveBlockFlow';
+import {handleLiveEditorKey} from '../liveEditorKeys';
 import {liveEditorCenterDelta,useTypewriterScroll} from '../typewriterScroll';
 const noTrustedHosts:string[]=[];
 export type {SourceBlock} from '../documentAnalysis';
@@ -236,7 +237,6 @@ export default function LiveEditor({markdown,onChange,documentPath,python,dark,t
     frame=requestAnimationFrame(glide);
     return()=>{cancelAnimationFrame(frame);inputs.forEach(name=>window.removeEventListener(name,stop,{capture:true}));};
   },[editing?.session,activeTypewriter]);
-
   useEffect(()=>()=>{if(typingFrame.current)cancelAnimationFrame(typingFrame.current);},[]);
   const syncActiveCaretCenter=useCallback(()=>{
     if(!activeTypewriterRef.current)return;
@@ -263,7 +263,7 @@ export default function LiveEditor({markdown,onChange,documentPath,python,dark,t
     area.setSelectionRange(start,end,direction);
     lastSelection.current={start,end,direction};
     rememberSelection(area,editingRef.current);
-  },[editing?.text]);
+  },[editing]);
 
   useEffect(()=>{
     const active=editingRef.current;
@@ -487,44 +487,60 @@ export default function LiveEditor({markdown,onChange,documentPath,python,dark,t
     const caret=from+repaired.length;
     commitDiscreteBlockEdit(nextBlockText,caret,caret);
   };
+  const applyInlineBlockEdit=(
+    area:HTMLTextAreaElement,
+    active:Editing,
+    replaceFrom:number,
+    replaceTo:number,
+    replacement:string,
+    nextValue:string,
+    nextStart:number,
+    nextEnd:number,
+    direction:"forward"|"backward"|"none"="none",
+  )=>{
+    const origStart=area.selectionStart,origEnd=area.selectionEnd;
+    const origDirection=area.selectionDirection||"none";
+    if(nextValue!==area.value){
+      blockHistory.current.undo.push({
+        text:active.text,
+        start:origStart,
+        end:origEnd,
+        direction:origDirection,
+      });
+      while(blockHistory.current.undo.length>60)blockHistory.current.undo.shift();
+      blockHistory.current.redo=[];
+      blockHistory.current.last=0;
+      pendingSelection.current={start:nextStart,end:nextEnd,direction};
+      notifyHistoryBoundary();
+      suppressHistoryPush.current=true;
+      area.setSelectionRange(replaceFrom,replaceTo);
+      let applied=false;
+      try{
+        applied=replacement.length>0?document.execCommand('insertText',false,replacement):document.execCommand('delete',false);
+      }catch{applied=false;}
+      suppressHistoryPush.current=false;
+      if(!applied||area.value!==nextValue){
+        update(nextValue,nextStart,nextEnd);
+        area.value=nextValue;
+      }else if(editingRef.current?.text!==nextValue){
+        update(nextValue,nextStart,nextEnd);
+      }
+      notifyHistoryBoundary();
+    }
+    area.setSelectionRange(nextStart,nextEnd,direction);
+    lastSelection.current={start:nextStart,end:nextEnd,direction};
+    rememberSelection(area,editingRef.current);
+    area.focus({preventScroll:true});
+  };
   const onEditorKeyDown=(event:ReactKeyboardEvent<HTMLTextAreaElement>)=>{
+    if(event.nativeEvent.isComposing||event.keyCode===229)return;
     const active=editingRef.current;if(!active)return;
     const area=event.currentTarget;
     if(event.key==='Tab'&&!event.ctrlKey&&!event.metaKey&&!event.altKey){
       event.preventDefault();event.stopPropagation();
-      const origStart=area.selectionStart,origEnd=area.selectionEnd;
       const direction=area.selectionDirection||"none";
-      const result=indentMarkdownSelection(area.value,origStart,origEnd,event.shiftKey);
-      if(result.value!==area.value){
-        blockHistory.current.undo.push({
-          text:active.text,
-          start:origStart,
-          end:origEnd,
-          direction,
-        });
-        while(blockHistory.current.undo.length>60)blockHistory.current.undo.shift();
-        blockHistory.current.redo=[];
-        blockHistory.current.last=0;
-        notifyHistoryBoundary();
-        suppressHistoryPush.current=true;
-        area.setSelectionRange(result.lineStart,result.blockEnd);
-        let applied=false;
-        try{
-          applied=result.replacement.length>0?document.execCommand('insertText',false,result.replacement):document.execCommand('delete',false);
-        }catch{applied=false;}
-        suppressHistoryPush.current=false;
-        if(!applied||area.value!==result.value){
-          update(result.value,result.selectionStart,result.selectionEnd);
-          area.value=result.value;
-        }else if(editingRef.current?.text!==result.value){
-          update(result.value);
-        }
-        notifyHistoryBoundary();
-      }
-      area.setSelectionRange(result.selectionStart,result.selectionEnd,direction);
-      lastSelection.current={start:result.selectionStart,end:result.selectionEnd,direction};
-      rememberSelection(area,editingRef.current);
-      area.focus({preventScroll:true});
+      const result=indentMarkdownSelection(area.value,area.selectionStart,area.selectionEnd,event.shiftKey);
+      applyInlineBlockEdit(area,active,result.lineStart,result.blockEnd,result.replacement,result.value,result.selectionStart,result.selectionEnd,direction);
       return;
     }
     if(event.key==='Escape'){
@@ -543,6 +559,21 @@ export default function LiveEditor({markdown,onChange,documentPath,python,dark,t
       const afterSpan=spans.filter(span=>span.end<=insertPos).at(-1);
       openInsertedBlock(committed,insertPos,afterSpan?afterSpan.blockStart:'end');
       return;
+    }
+    if(event.key==='Enter'&&!event.ctrlKey&&!event.metaKey&&!event.altKey&&!event.shiftKey){
+      const next=handleLiveEditorKey({
+        text:area.value,selectionStart:area.selectionStart,selectionEnd:area.selectionEnd,
+        key:event.key,shiftKey:event.shiftKey,ctrlKey:event.ctrlKey,metaKey:event.metaKey,altKey:event.altKey,
+        isComposing:event.nativeEvent.isComposing,protectedBlock:active.protectedBlock,
+      });
+      if(next){
+        event.preventDefault();event.stopPropagation();
+        let diffStart=0,prevEnd=area.value.length,nextEnd=next.text.length;
+        while(diffStart<prevEnd&&diffStart<nextEnd&&area.value[diffStart]===next.text[diffStart])diffStart++;
+        while(prevEnd>diffStart&&nextEnd>diffStart&&area.value[prevEnd-1]===next.text[nextEnd-1]){prevEnd--;nextEnd--;}
+        applyInlineBlockEdit(area,active,diffStart,prevEnd,next.text.slice(diffStart,nextEnd),next.text,next.selectionStart,next.selectionEnd);
+        return;
+      }
     }
     if(!event.ctrlKey&&!event.metaKey&&!event.altKey&&!event.shiftKey){
       if(event.key==='ArrowUp'&&isFirstLineCursor(area.value,area.selectionStart,area.selectionEnd)){

@@ -171,6 +171,15 @@ describe("applyMarkdownUrlPaste & protected contexts", () => {
 
     const imageAlt = "![selected](assets/pic.png)";
     expect(applyMarkdownUrlPaste(imageAlt, [{ anchor: 2, head: 10 }], url)).toBeNull();
+
+    const wikilink = "See [[Note|selected]] in vault";
+    expect(applyMarkdownUrlPaste(wikilink, [{ anchor: 11, head: 19 }], url)).toBeNull();
+
+    const frontmatter = "---\ntitle: selected\n---\n\nBody prose";
+    expect(applyMarkdownUrlPaste(frontmatter, [{ anchor: 11, head: 19 }], url)).toBeNull();
+    expect(applyMarkdownUrlPaste(frontmatter, [{ anchor: 25, head: 29 }], url)?.doc).toBe(
+      "---\ntitle: selected\n---\n\n[Body](https://example.com/new) prose",
+    );
   });
 });
 

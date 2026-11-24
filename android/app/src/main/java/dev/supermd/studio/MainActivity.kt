@@ -1704,18 +1704,79 @@ internal class NoteDestination(private val mime: String, private val preferred: 
                 Choice("Workspace theme", state.theme, listOf("system" to "System", "light" to "Light", "dark" to "Dark", "black" to "Pure black")) { model.appearance(theme = it) }
                 Choice("Fullscreen theme", state.fullscreenTheme, listOf("system" to "System", "light" to "Light", "dark" to "Dark", "black" to "Pure black")) { model.appearance(fullTheme = it) }
                 if(state.customTheme.isBlank())Choice("Theme color",state.accent,listOf("system" to "System","blue" to "Blue","violet" to "Violet","rose" to "Rose","amber" to "Amber")){model.appearance(accent=it)}
-                else Text("Colors follow your imported theme. Reset it to use the built-in accent picker.",style=MaterialTheme.typography.bodySmall)
+                else Text("Colors follow your active custom theme. Reset it to use the built-in accent picker.",style=MaterialTheme.typography.bodySmall)
                 Row(verticalAlignment = Alignment.CenterVertically) { Column(Modifier.weight(1f)) { Text("Expressive motion", style = MaterialTheme.typography.titleMedium); Text("Spring transitions and responsive controls", style = MaterialTheme.typography.bodySmall) }; Switch(checked = state.motion, onCheckedChange = { model.appearance(motion = it) }) }
             }
             if (section == "Appearance") SettingsGroup("Custom theme") {
-                Text(themeDocument(state.customTheme)?.optString("name")?:"Built-in appearance",style=MaterialTheme.typography.titleMedium)
-                Text("Theme files customize controls, colors, reading typography and background patterns. Reading font and text size remain yours. Invalid edits keep the last valid appearance.",style=MaterialTheme.typography.bodySmall)
+                val activeThemeName = themeDocument(state.customTheme)?.optString("name") ?: "Built-in appearance"
+                val bundledPresets = remember { bundledThemes(activity.assets) }
+                val presetChoices = remember(bundledPresets) { listOf("builtin" to "Built-in appearance") + bundledPresets.map { it.id to it.name } }
+                Text(activeThemeName,style=MaterialTheme.typography.titleMedium)
+                Text("Choose a bundled preset or import your own JSON theme to customize controls, colors, reading typography and background patterns. Reading font and text size remain yours.",style=MaterialTheme.typography.bodySmall)
+                ThemePresetChoice(
+                    label = "Theme preset",
+                    activeKind = state.activeThemeKind,
+                    activeId = state.activeThemeId,
+                    activeName = activeThemeName,
+                    choices = presetChoices,
+                    change = model::selectBundledTheme,
+                )
+                if (state.savedThemes.isNotEmpty()) {
+                    Text("Saved imported themes", style = MaterialTheme.typography.titleSmall, modifier = Modifier.padding(top = 8.dp, bottom = 4.dp))
+                    Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                        state.savedThemes.forEach { entry ->
+                            val selected = state.activeThemeKind == "saved" && state.activeThemeId == entry.id
+                            Surface(
+                                shape = RoundedCornerShape(18.dp),
+                                color = if (selected) MaterialTheme.colorScheme.primaryContainer else MaterialTheme.colorScheme.surfaceContainerHigh,
+                                modifier = Modifier.fillMaxWidth().clickable { model.selectSavedTheme(entry.id) },
+                            ) {
+                                Row(
+                                    modifier = Modifier.fillMaxWidth().padding(start = 14.dp, end = 6.dp, top = 6.dp, bottom = 6.dp),
+                                    verticalAlignment = Alignment.CenterVertically,
+                                ) {
+                                    Icon(
+                                        imageVector = if (selected) Icons.Rounded.Check else Icons.Rounded.FolderOpen,
+                                        contentDescription = null,
+                                        tint = if (selected) MaterialTheme.colorScheme.onPrimaryContainer else MaterialTheme.colorScheme.onSurfaceVariant,
+                                        modifier = Modifier.size(20.dp),
+                                    )
+                                    Column(Modifier.weight(1f).padding(horizontal = 12.dp)) {
+                                        Text(
+                                            entry.name,
+                                            style = MaterialTheme.typography.bodyLarge,
+                                            fontWeight = FontWeight.Medium,
+                                            color = if (selected) MaterialTheme.colorScheme.onPrimaryContainer else MaterialTheme.colorScheme.onSurface,
+                                            maxLines = 1,
+                                            overflow = TextOverflow.Ellipsis,
+                                        )
+                                        if (entry.sourceUri.isNotBlank()) {
+                                            Text(
+                                                "Linked external file",
+                                                style = MaterialTheme.typography.bodySmall,
+                                                color = if (selected) MaterialTheme.colorScheme.onPrimaryContainer else MaterialTheme.colorScheme.onSurfaceVariant,
+                                                maxLines = 1,
+                                                overflow = TextOverflow.Ellipsis,
+                                            )
+                                        }
+                                    }
+                                    IconButton(onClick = { model.deleteSavedTheme(entry.id) }) {
+                                        Icon(
+                                            imageVector = Icons.Rounded.Close,
+                                            contentDescription = "Remove ${entry.name}",
+                                            tint = if (selected) MaterialTheme.colorScheme.onPrimaryContainer else MaterialTheme.colorScheme.onSurfaceVariant,
+                                        )
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
                 FlowRow(horizontalArrangement=Arrangement.spacedBy(8.dp)){FilledTonalButton(onClick=importTheme){Text("Import theme…")};OutlinedButton(onClick=exportTheme){Text(if(state.customTheme.isBlank())"Export template…" else "Export theme…")};if(state.customTheme.isNotBlank())OutlinedButton(onClick={model.shareCustomTheme {send->runCatching {activity.startActivity(Intent.createChooser(send,"Share theme"))}.onFailure {model.fail("No app could share the theme: ${it.message}")}}}){Text("Share theme…")}}
-                if(state.customTheme.isNotBlank())FlowRow(horizontalArrangement=Arrangement.spacedBy(8.dp)){TextButton(onClick=model::reloadCustomTheme){Text("Reload file")};TextButton(onClick=model::resetCustomTheme){Text("Reset to built-in")}}
+                if(state.customTheme.isNotBlank())FlowRow(horizontalArrangement=Arrangement.spacedBy(8.dp)){if(state.customThemeSource.isNotBlank())TextButton(onClick=model::reloadCustomTheme){Text("Reload file")};TextButton(onClick=model::resetCustomTheme){Text("Reset to built-in")}}
                 if(state.customTheme.isNotBlank()) {
                     val themeAppearance=themeStyle(themeDocument(state.customTheme),state.theme,when(state.theme){"dark","black"->true;"light"->false;else->androidx.compose.foundation.isSystemInDarkTheme()},state.patternKind,state.patternOpacity,state.patternSize,state.patternSpacing)
                     val background=themeAppearance.optJSONObject("background")?:JSONObject()
-                    if(state.patternOpacity<0f)themeAppearance.optJSONObject("artwork")?.optJSONObject("reader")?.let {background.put("opacity",it.optDouble("opacity",.06))}
                     Text("Reading background",style=MaterialTheme.typography.titleMedium)
                     Choice("Pattern",background.optString("pattern","none"),listOf("none" to "None","paws" to "Cat paws","dots" to "Dots","grid" to "Grid","diagonal" to "Diagonal","gradient" to "Gradient")){model.readingPreference("patternKind",it)}
                     Text("Visibility · ${(background.optDouble("opacity",.06)*100).toInt()}%")
@@ -1966,28 +2027,56 @@ internal class NoteDestination(private val mime: String, private val preferred: 
     }
 }
 
-@Composable private fun FontChoice(label: String, value: String, choices: List<Pair<String,String>>, change: (String) -> Unit) {
+@Composable private fun SearchableChoice(
+    label: String,
+    selectedKey: String,
+    summary: String,
+    choices: List<Pair<String, String>>,
+    searchLabel: String,
+    emptyLabel: String,
+    topPadding: androidx.compose.ui.unit.Dp = 12.dp,
+    change: (String) -> Unit,
+) {
     var opened by remember { mutableStateOf(false) }
-    Text(label, style = MaterialTheme.typography.titleSmall, modifier = Modifier.padding(top = 12.dp, bottom = 6.dp))
+    Text(label, style = MaterialTheme.typography.titleSmall, modifier = Modifier.padding(top = topPadding, bottom = 6.dp))
     FilledTonalButton(onClick = { opened = true }, modifier = Modifier.fillMaxWidth()) {
-        Text(choices.find {it.first == value}?.second ?: value, Modifier.weight(1f), maxLines = 1, overflow = TextOverflow.Ellipsis)
+        Text(summary, Modifier.weight(1f), maxLines = 1, overflow = TextOverflow.Ellipsis)
         Icon(Icons.Rounded.ExpandMore, null)
     }
     if (opened) {
         var query by remember { mutableStateOf("") }
-        val matches = remember(query, choices) {choices.distinctBy {it.first}.filter {it.second.contains(query.trim(), ignoreCase = true)}}
-        AlertDialog(onDismissRequest = {opened = false}, title = {Text(label)}, text = {
+        val matches = remember(query, choices) { choices.distinctBy { it.first }.filter { it.second.contains(query.trim(), ignoreCase = true) } }
+        AlertDialog(onDismissRequest = { opened = false }, title = { Text(label) }, text = {
             Column(verticalArrangement = Arrangement.spacedBy(12.dp)) {
-                OutlinedTextField(value = query, onValueChange = {query = it}, singleLine = true, label = {Text("Search fonts")}, leadingIcon = {Icon(Icons.Rounded.Search, null)}, modifier = Modifier.fillMaxWidth())
-                if (matches.isEmpty()) Text("No matching fonts", color = MaterialTheme.colorScheme.onSurfaceVariant)
+                OutlinedTextField(value = query, onValueChange = { query = it }, singleLine = true, label = { Text(searchLabel) }, leadingIcon = { Icon(Icons.Rounded.Search, null) }, modifier = Modifier.fillMaxWidth())
+                if (matches.isEmpty()) Text(emptyLabel, color = MaterialTheme.colorScheme.onSurfaceVariant)
                 LazyColumn(Modifier.heightIn(max = 340.dp)) {
-                    items(matches, key = {it.first}) { (key, name) ->
-                        ListItem(trailingContent = {if (key == value) Icon(Icons.Rounded.Check, "Selected")}, colors = ListItemDefaults.colors(containerColor = if (key == value) MaterialTheme.colorScheme.primaryContainer else Color.Transparent), modifier = Modifier.clickable {change(key); opened = false}) {Text(name)}
+                    items(matches, key = { it.first }) { (key, name) ->
+                        val selected = key == selectedKey
+                        ListItem(trailingContent = { if (selected) Icon(Icons.Rounded.Check, "Selected") }, colors = ListItemDefaults.colors(containerColor = if (selected) MaterialTheme.colorScheme.primaryContainer else Color.Transparent), modifier = Modifier.clickable { change(key); opened = false }) { Text(name) }
                     }
                 }
             }
-        }, confirmButton = {TextButton(onClick = {opened = false}) {Text("Cancel")}})
+        }, confirmButton = { TextButton(onClick = { opened = false }) { Text("Cancel") } })
     }
+}
+
+@Composable private fun ThemePresetChoice(label: String, activeKind: String, activeId: String, activeName: String, choices: List<Pair<String,String>>, change: (String) -> Unit) {
+    val selectedKey = when (activeKind) {
+        "preset" -> activeId
+        "saved" -> ""
+        else -> "builtin"
+    }
+    val summary = when (activeKind) {
+        "saved" -> "Imported · $activeName"
+        "preset" -> choices.find { it.first == activeId }?.second ?: activeName
+        else -> "Built-in appearance"
+    }
+    SearchableChoice(label, selectedKey, summary, choices, "Search themes", "No matching themes", topPadding = 8.dp, change = change)
+}
+
+@Composable private fun FontChoice(label: String, value: String, choices: List<Pair<String,String>>, change: (String) -> Unit) {
+    SearchableChoice(label, value, choices.find { it.first == value }?.second ?: value, choices, "Search fonts", "No matching fonts", change = change)
 }
 
 @Composable private fun SettingsHome(onOpen: (String?)->Unit) {
