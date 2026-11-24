@@ -148,7 +148,7 @@ class DocumentsTest(unittest.TestCase):
     def test_structural_envelope_validation_defers_base64_decode_and_enforces_limits(self):
         import documents
         from unittest.mock import patch
-        from documents import decode_note_bytes, read_note_markdown, validate_envelope
+        from documents import decode_note_bytes, validate_envelope
 
         png = b"\x89PNG\r\n\x1a\n" + b"p" * 128
         assets = {"assets/pic.png": "data:image/png;base64," + base64.b64encode(png).decode("ascii")}
@@ -165,12 +165,11 @@ class DocumentsTest(unittest.TestCase):
                 text, loaded_assets, portable = open_note(smd)
                 self.assertTrue(portable)
                 self.assertEqual(loaded_assets, assets)
-                self.assertEqual(read_note_markdown(smd), text)
                 self.assertEqual(decode_note_bytes(packed, smd), (text, assets, True))
                 self.assertEqual(open_note(json_smd), ("# JSON note\n", assets, True))
                 write_portable(smd, "# Updated\n", loaded_assets, validate_assets=False)
                 write_portable(smd, "# Updated again\n", loaded_assets, validated_assets=loaded_assets)
-                self.assertEqual(read_note_markdown(smd), "# Updated again\n")
+                self.assertEqual(open_note(smd)[0], "# Updated again\n")
                 self.assertEqual(spy.call_count, 0)
 
                 # Exact 25 MB encoded bound passes structural validation; 25 MB + 1 byte fails.
@@ -227,7 +226,7 @@ class DocumentsTest(unittest.TestCase):
                 materialize_assets(root / "out", malformed)
             bad_smd = root / "corrupt-b64.smd"
             write_portable(bad_smd, "# text", malformed, validate_assets=False)
-            self.assertEqual(read_note_markdown(bad_smd), "# text")
+            self.assertEqual(open_note(bad_smd)[0], "# text")
             with self.assertRaises(ValueError):
                 open_note(bad_smd, decode_assets=True)
 

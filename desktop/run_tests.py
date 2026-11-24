@@ -5,22 +5,23 @@ import sys
 import unittest
 from pathlib import Path
 
-def suite_timeout_seconds(platform_name: str | None = None, machine: str | None = None) -> int:
-    # macOS CI runs five bounded 60-second Qt mouse-selection probes plus
-    # several WebEngine subprocess tests after hundreds of native tests. A
-    # four-minute suite watchdog kills the process before per-probe timeouts
-    # can report a real failure. Keep Apple Silicon within ci.yml's 8-minute
-    # step budget so faulthandler still flushes tracebacks on a true hang.
-    active_platform = sys.platform if platform_name is None else platform_name
-    active_machine = platform.machine() if machine is None else machine
-    if active_platform == "darwin":
-        return 720 if active_machine == "x86_64" else 420
+def suite_watchdog_seconds(platform_name: str = sys.platform, machine: str | None = None) -> int:
+    """Return the faulthandler watchdog timeout in seconds.
+
+    macOS CI steps allow 8 minutes (480s) on arm64 (`macos-latest`) because the
+    60+ Qt Quick / WebEngine test files take ~4 minutes in software/offscreen
+    mode. Keep arm64 at 420s so faulthandler still dumps Python tracebacks
+    before the GitHub Actions step timeout if a Qt driver genuinely stalls.
+    """
+    resolved_machine = platform.machine() if machine is None else machine
+    if platform_name == "darwin":
+        return 720 if resolved_machine == "x86_64" else 420
     return 240
 
 
 if __name__ == "__main__":
     faulthandler.enable()
-    suite_timeout = suite_timeout_seconds()
+    suite_timeout = suite_watchdog_seconds()
     faulthandler.dump_traceback_later(suite_timeout, exit=True)
     try:
         suite=unittest.defaultTestLoader.discover(str(Path(__file__).parent),pattern="test_*.py")

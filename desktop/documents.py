@@ -229,11 +229,6 @@ def open_note(path: Path, *, decode_assets: bool = False) -> tuple[str, dict[str
         return value["markdown"], value["assets"], True
     return _decode_text_note(path.read_text(encoding="utf-8-sig"), path, decode_assets=decode_assets)
 
-def read_note_markdown(path: Path) -> str:
-    """Read on-disk Markdown with structural envelope checks and zero asset decoding."""
-    markdown, _, _ = open_note(path, decode_assets=False)
-    return markdown
-
 def decode_note_bytes(raw: bytes, path: Path, *, decode_assets: bool = False) -> tuple[str, dict[str, str], bool]:
     """Decode the exact snapshot used for an agent's revision, without rereading."""
     if len(raw) > MAX_FILE:

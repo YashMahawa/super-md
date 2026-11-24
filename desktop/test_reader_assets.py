@@ -1,6 +1,7 @@
 import base64
 import json
 import os
+import sys
 import tempfile
 import unittest
 from pathlib import Path
@@ -131,6 +132,7 @@ class ReaderAssetTests(unittest.TestCase):
 
     def test_studio_resolver_returns_a_live_note_scoped_capability(self):
         session = Session(True)
+        session.settings["python"] = sys.executable
         studio = Studio(True, session)
         try:
             tab = studio._current()
@@ -165,6 +167,7 @@ class ReaderAssetTests(unittest.TestCase):
 
     def test_studio_resolver_uses_legacy_fallback_when_capability_capacity_is_full(self):
         session = Session(True)
+        session.settings["python"] = sys.executable
         studio = Studio(True, session)
         try:
             tab = studio._current()
@@ -188,6 +191,7 @@ class ReaderAssetTests(unittest.TestCase):
         import documents
 
         session = Session(True)
+        session.settings["python"] = sys.executable
         studio = Studio(True, session)
         try:
             with tempfile.TemporaryDirectory() as directory:
@@ -284,6 +288,7 @@ class ReaderAssetTests(unittest.TestCase):
         import documents
 
         session = Session(True)
+        session.settings["python"] = sys.executable
         studio = Studio(True, session)
         try:
             with tempfile.TemporaryDirectory() as directory:
@@ -310,7 +315,7 @@ class ReaderAssetTests(unittest.TestCase):
                     studio._save_text(tab, note, automatic=True)
                     wait_for_save()
                     self.assertEqual(tab["saved"], "# Autosaved edit\n")
-                    self.assertEqual(documents.read_note_markdown(note), "# Autosaved edit\n")
+                    self.assertEqual(documents.open_note(note)[0], "# Autosaved edit\n")
 
                     tab["content"] = "# Manual save edit\n"
                     studio._save_text(tab, note, automatic=False)
@@ -323,7 +328,7 @@ class ReaderAssetTests(unittest.TestCase):
                     tab["content"] = "# Local draft\n"
                     studio._save_text(tab, note, automatic=True)
                     wait_for_save()
-                    self.assertEqual(documents.read_note_markdown(note), "# External change\n")
+                    self.assertEqual(documents.open_note(note)[0], "# External change\n")
                     self.assertIn("Autosave paused", studio.message)
 
                     # Truncated/concatenated GZIP and invalid envelopes on disk also fail autosave without decoding images.

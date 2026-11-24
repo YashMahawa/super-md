@@ -393,12 +393,11 @@ class DocumentStore:
     def _entry_asset_metadata(self, entry: _CachedEnvelope, *, offset: int = 0, limit: int = 50) -> list[dict]:
         result = []
         for name in list(entry.assets.keys())[offset:offset + limit]:
-            asset_id = hashlib.sha256(name.encode("utf-8")).hexdigest()
             try:
                 mime, payload, sha256 = self._decode_entry_asset(entry, name)
-                result.append({"id": asset_id, "name": name, "mime": mime, "bytes": len(payload), "sha256": sha256})
+                result.append(_asset_record(name, mime, len(payload), sha256))
             except (ValueError, TypeError):
-                result.append({"id": asset_id, "name": name, "mime": None, "bytes": None, "sha256": None, "invalid": True})
+                result.append(_asset_record(name, invalid=True))
         return result
 
     def _record_written_snapshot(
@@ -679,9 +678,7 @@ class DocumentStore:
                 path, old_stat=entry.stat_key, text=entry.text, assets=updated,
                 portable=True, data=data, revision=new_revision, prior_decoded=prior_decoded,
             )
-        record = {"id": hashlib.sha256(asset_key.encode("utf-8")).hexdigest(), "name": asset_key,
-                  "mime": mime, "bytes": len(raw_asset), "sha256": asset_sha}
-        return {"path": self.display_path(path), "asset": record,
+        return {"path": self.display_path(path), "asset": _asset_record(asset_key, mime, len(raw_asset), asset_sha),
                 "previous_revision": expected_revision, "revision": new_revision, "saved": True}
 
     def replace_asset(self, path_value: str, asset_id: str, asset_path_value: str, *,
@@ -716,12 +713,9 @@ class DocumentStore:
                 raise AgentDocumentError(str(exc)) from exc
             if old_mime != mime:
                 raise AgentDocumentError("Asset reference MIME type is inconsistent with its extension")
-            record_id = hashlib.sha256(asset_name.encode("utf-8")).hexdigest()
             if old_data == raw_asset:
-                record = {"id": record_id, "name": asset_name, "mime": old_mime,
-                          "bytes": len(old_data), "sha256": old_sha}
-                return {"path": self.display_path(path), "asset": record, "previous_revision": revision,
-                        "revision": revision, "saved": False, "changed": False}
+                return {"path": self.display_path(path), "asset": _asset_record(asset_name, old_mime, len(old_data), old_sha),
+                        "previous_revision": revision, "revision": revision, "saved": False, "changed": False}
             updated = dict(entry.assets)
             updated[asset_name] = f"data:{mime};base64," + base64.b64encode(raw_asset).decode("ascii")
             data = _serialize(path, entry.text, updated, portable=True, validate_assets=False)
@@ -739,8 +733,7 @@ class DocumentStore:
                 path, old_stat=entry.stat_key, text=entry.text, assets=updated,
                 portable=True, data=data, revision=new_revision, prior_decoded=prior_decoded,
             )
-        record = {"id": record_id, "name": asset_name, "mime": mime, "bytes": len(raw_asset), "sha256": new_sha}
-        return {"path": self.display_path(path), "asset": record,
+        return {"path": self.display_path(path), "asset": _asset_record(asset_name, mime, len(raw_asset), new_sha),
                 "previous_revision": revision, "revision": new_revision, "saved": True, "changed": True}
 
     def extract_asset(self, path_value: str, asset_name: str, output_value: str, *,
@@ -777,16 +770,34 @@ class DocumentStore:
         return str(path)
 
 
+def _asset_record(
+    name: str,
+    mime: str | None = None,
+    size: int | None = None,
+    sha256: str | None = None,
+    *,
+    invalid: bool = False,
+) -> dict:
+    record = {
+        "id": hashlib.sha256(name.encode("utf-8")).hexdigest(),
+        "name": name,
+        "mime": mime,
+        "bytes": size,
+        "sha256": sha256,
+    }
+    if invalid:
+        record["invalid"] = True
+    return record
+
+
 def _asset_metadata(assets: dict[str, str], *, offset: int = 0, limit: int = 50) -> list[dict]:
     result = []
     for name, data in list(assets.items())[offset:offset + limit]:
         try:
             mime, payload = documents.image_data(data)
-            result.append({"id": hashlib.sha256(name.encode("utf-8")).hexdigest(), "name": name,
-                           "mime": mime, "bytes": len(payload), "sha256": digest_bytes(payload)})
+            result.append(_asset_record(name, mime, len(payload), digest_bytes(payload)))
         except (ValueError, TypeError):
-            result.append({"id": hashlib.sha256(name.encode("utf-8")).hexdigest(), "name": name,
-                           "mime": None, "bytes": None, "sha256": None, "invalid": True})
+            result.append(_asset_record(name, invalid=True))
     return result
 
 
