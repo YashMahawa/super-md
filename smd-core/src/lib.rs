@@ -891,7 +891,9 @@ spanning lines -->
 
 ==Highlighted concept== with H~2~O, x^2^, ~~deprecated~~, %%SECRET_INLINE_COMMENT%%<!-- SECRET_INLINE_HTML --> and Press <kbd onclick="evil()">Ctrl</kbd>+<kbd>S</kbd>, <mark style="color:red">marked</mark>, <u>underlined</u>, CO<sub>2</sub>, 10<sup>-6</sup>.<br>Second line.
 
-Spaced ~not sub~ and ^not sup^, comparison if a == b and c == d, escaped \~lit\~ and \==lit==, URL [https://example.edu/~alice/notes~1](https://example.edu/~alice/notes~1), unmatched <mark>rawmark, and inline <script>alert(1)</script>.
+\==Literal markup\=\= beside ==Active highlight==, \=\=Inline literal\=\=, H\~2\~O and \~lit\~ beside ~sub~, x\^2\^ beside ^sup^, \%%KEPT_PERCENT\%%, and approx ~5 minutes to boil H~2~O.
+
+Spaced ~not sub~ and ^not sup^, comparison if a == b and c == d, escaped \==rawlit==, URL [https://example.edu/~alice/notes~1](https://example.edu/~alice/notes~1), unmatched <mark>rawmark, and inline <script>alert(1)</script>.
 
 <script>window.pwn = 1</script>
 
@@ -914,9 +916,14 @@ $$
 
         let typst_src = source(md, &PdfOptions::default(), &HashMap::new()).unwrap();
         assert!(typst_src.contains("#sub[#text(\"2\")]"), "Expected Typst #sub: {typst_src}");
+        assert!(typst_src.contains("#sub[#text(\"sub\")]"), "Expected ~sub~ -> #sub: {typst_src}");
+        assert!(!typst_src.contains("#sub[#text(\"lit\")]"), "Escaped \\~lit\\~ must not become #sub: {typst_src}");
         assert!(typst_src.contains("#super[#text(\"2\")]"), "Expected Typst #super: {typst_src}");
+        assert!(typst_src.contains("#super[#text(\"sup\")]"), "Expected ^sup^ -> #super: {typst_src}");
         assert!(typst_src.contains("#super[#text(\"-6\")]"), "Expected HTML <sup> -> #super: {typst_src}");
-        assert!(typst_src.contains("#highlight(fill: smd-highlight"), "Expected Typst #highlight: {typst_src}");
+        assert!(typst_src.contains("#highlight(fill: smd-highlight, radius: 2pt, extent: 1pt)[#text(\"Active highlight\")]"), "Expected unescaped highlight: {typst_src}");
+        assert!(!typst_src.contains("[#text(\"Literal markup\")]"), "Escaped \\=\\=Literal markup\\=\\= must stay literal: {typst_src}");
+        assert!(!typst_src.contains("[#text(\"rawlit\")]"), "Escaped \\==rawlit== must stay literal: {typst_src}");
         assert!(typst_src.contains("#underline[#text(\"underlined\")]"), "Expected Typst #underline: {typst_src}");
         assert!(typst_src.contains("#box(fill: smd-code-fill"), "Expected Typst #box for <kbd>: {typst_src}");
         assert!(typst_src.contains("#strike[#text(\"deprecated\")]"), "Expected Typst #strike for ~~...~~: {typst_src}");
@@ -927,6 +934,7 @@ $$
         assert!(!typst_src.contains("SECRET_INLINE_COMMENT"));
         assert!(!typst_src.contains("SECRET_INLINE_HTML"));
         assert!(!typst_src.contains("onclick"));
+        assert!(typst_src.contains("KEPT_PERCENT"));
         assert!(typst_src.contains("KEPT_INLINE_CODE"));
         assert!(typst_src.contains("%%timeit total = 1 + 1"));
         assert!(typst_src.contains("<script>"));
@@ -941,6 +949,10 @@ $$
                 if let Ok(output) = std::process::Command::new("pdftotext").arg(&path).arg("-").output() {
                     let extracted = String::from_utf8_lossy(&output.stdout);
                     assert!(extracted.contains("Highlighted concept"));
+                    assert!(extracted.contains("==Literal markup== beside Active highlight"), "Expected literal escaped == beside active highlight: {extracted}");
+                    assert!(extracted.contains("H~2~O and ~lit~ beside sub"), "Expected literal escaped tildes beside subscript: {extracted}");
+                    assert!(extracted.contains("x^2^ beside sup"), "Expected literal escaped carets beside superscript: {extracted}");
+                    assert!(extracted.contains("%%KEPT_PERCENT%%"), "Expected escaped percent comment preserved: {extracted}");
                     assert!(extracted.contains("underlined"));
                     assert!(extracted.contains("Ctrl"));
                     assert!(extracted.contains("~not sub~"));

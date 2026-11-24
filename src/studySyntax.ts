@@ -1,6 +1,7 @@
 const SKIP_TYPES = new Set(['code', 'inlineCode', 'math', 'inlineMath', 'html', 'definition', 'yaml']);
 const CONTAINER_TYPES = new Set(['paragraph', 'heading', 'tableCell', 'emphasis', 'strong', 'delete', 'link', 'linkReference', 'highlight', 'subscript', 'superscript']);
-const ASCII_PUNCT = /^[!"#$%&'()*+,\-./:;<=>?@[\\\]^_`{|}~]$/;
+const ESCAPED_TEXT_TYPE = '__studyEscaped';
+const FULL_PHRASING_SPANS = ['autolink', 'destinationLiteral', 'destinationRaw', 'reference', 'titleQuote', 'titleApostrophe'];
 const SPAN_META: Record<DelimKind, { type: string; hName: string }> = {
   '==': { type: 'highlight', hName: 'mark' },
   '~': { type: 'subscript', hName: 'sub' },
@@ -10,34 +11,17 @@ const SPAN_META: Record<DelimKind, { type: string; hName: string }> = {
 type DelimKind = '==' | '~' | '^';
 type Piece =
   | { kind: 'node'; node: any }
-  | { kind: 'text'; value: string; position?: any }
+  | { kind: 'text'; value: string; escaped?: boolean; position?: any }
   | { kind: 'delim'; delim: DelimKind; canOpen: boolean; canClose: boolean };
+
+function copyPoint(d: any) {
+  return { line: d.line, column: d.column, offset: d.offset };
+}
 
 function isAutolinkLiteral(node: any): boolean {
   if (node.type !== 'link' || node.children?.length !== 1 || node.children[0]?.type !== 'text') return false;
   const text = node.children[0].value;
   return node.url === text || node.url === `mailto:${text}` || node.url === `http://${text}`;
-}
-
-function computeEscapedMask(value: string, source: string, position: any): Uint8Array | null {
-  const start = position?.start?.offset, end = position?.end?.offset;
-  if (typeof start !== 'number' || typeof end !== 'number' || end <= start || end > source.length) return null;
-  const raw = source.slice(start, end);
-  if (!raw.includes('\\')) return null;
-  const mask = new Uint8Array(value.length);
-  let r = 0, v = 0;
-  while (r < raw.length && v < value.length) {
-    if (raw[r] === '\\' && r + 1 < raw.length && ASCII_PUNCT.test(raw[r + 1]) && raw[r + 1] === value[v]) {
-      mask[v++] = 1;
-      r += 2;
-    } else if (raw[r] === value[v]) {
-      r++;
-      v++;
-    } else {
-      return null;
-    }
-  }
-  return v === value.length && r === raw.length ? mask : null;
 }
 
 function hasDisallowedBreak(node: any, rejectSpaces: boolean): boolean {
@@ -62,6 +46,10 @@ function piecesToNodes(pieces: Piece[]): any[] {
       out.push(piece.node);
       continue;
     }
+    if (piece.kind === 'text' && piece.escaped) {
+      out.push(piece.position ? { type: ESCAPED_TEXT_TYPE, value: piece.value, position: piece.position } : { type: ESCAPED_TEXT_TYPE, value: piece.value });
+      continue;
+    }
     const value = piece.kind === 'delim' ? piece.delim : piece.value;
     if (!value) continue;
     const prev = out[out.length - 1];
@@ -75,10 +63,46 @@ function piecesToNodes(pieces: Piece[]): any[] {
   return out;
 }
 
-function tokenizeChildren(children: any[], source: string): Piece[] {
+function normalizeEscapedChildren(children: any[]): void {
+  let hasEscaped = false;
+  for (let i = 0; i < children.length; i++) {
+    if (children[i]?.type === ESCAPED_TEXT_TYPE) { hasEscaped = true; break; }
+  }
+  if (!hasEscaped) return;
+  let write = 0;
+  for (let i = 0; i < children.length; i++) {
+    const child = children[i];
+    const isTextLike = child?.type === 'text' || child?.type === ESCAPED_TEXT_TYPE;
+    if (child?.type === ESCAPED_TEXT_TYPE) child.type = 'text';
+    const prev = write > 0 ? children[write - 1] : null;
+    if (isTextLike && prev?.type === 'text') {
+      prev.value += child.value;
+      if (prev.position && child.position?.end) prev.position = { start: prev.position.start, end: child.position.end };
+      else delete prev.position;
+    } else {
+      children[write++] = child;
+    }
+  }
+  children.length = write;
+}
+
+function siblingBoundary(sibling: any, front: boolean): string {
+  if (!sibling) return '';
+  if (sibling.type === 'break') return '\n';
+  if (sibling.type === 'text' || sibling.type === ESCAPED_TEXT_TYPE) {
+    return front ? (sibling.value[0] || '') : sibling.value.slice(-1);
+  }
+  return 'x';
+}
+
+function tokenizeChildren(children: any[]): Piece[] {
   const pieces: Piece[] = [];
   for (let idx = 0; idx < children.length; idx++) {
     const child = children[idx];
+    if (child.type === ESCAPED_TEXT_TYPE) {
+      pieces.push({ kind: 'text', value: child.value, escaped: true, position: child.position });
+      continue;
+    }
     if (child.type !== 'text') {
       pieces.push({ kind: 'node', node: child });
       continue;
@@ -88,18 +112,15 @@ function tokenizeChildren(children: any[], source: string): Piece[] {
       pieces.push({ kind: 'text', value: s, position: child.position });
       continue;
     }
-    const escaped = source ? computeEscapedMask(s, source, child.position) : null;
-    const prevSibling = idx > 0 ? children[idx - 1] : null;
-    const nextSibling = idx + 1 < children.length ? children[idx + 1] : null;
-    const prevBoundary = !prevSibling ? '' : prevSibling.type === 'break' ? '\n' : 'x';
-    const nextBoundary = !nextSibling ? '' : nextSibling.type === 'break' ? '\n' : 'x';
+    const prevBoundary = siblingBoundary(idx > 0 ? children[idx - 1] : null, false);
+    const nextBoundary = siblingBoundary(idx + 1 < children.length ? children[idx + 1] : null, true);
 
     let buf = '', i = 0, split = false;
     while (i < s.length) {
       const ch = s[i];
-      if (!escaped?.[i] && (ch === '=' || ch === '~' || ch === '^')) {
+      if (ch === '=' || ch === '~' || ch === '^') {
         let run = 1;
-        while (i + run < s.length && s[i + run] === ch && !escaped?.[i + run]) run++;
+        while (i + run < s.length && s[i + run] === ch) run++;
         if ((ch === '=' && run === 2) || ((ch === '~' || ch === '^') && run === 1)) {
           const before = i > 0 ? s[i - 1] : prevBoundary;
           const after = i + run < s.length ? s[i + run] : nextBoundary;
@@ -163,16 +184,16 @@ function matchPieces(pieces: Piece[]): any[] | null {
   return changed ? piecesToNodes(working) : null;
 }
 
-function transformNode(node: any, source: string): void {
-  if (!node || SKIP_TYPES.has(node.type) || !Array.isArray(node.children) || isAutolinkLiteral(node)) return;
-  if (CONTAINER_TYPES.has(node.type)) {
+function transformNode(node: any): void {
+  if (!node || SKIP_TYPES.has(node.type) || !Array.isArray(node.children)) return;
+  if (CONTAINER_TYPES.has(node.type) && !isAutolinkLiteral(node)) {
     let hasCandidate = false;
     for (let i = 0; i < node.children.length; i++) {
       const c = node.children[i];
       if (c.type === 'text' && /[=~^]/.test(c.value)) { hasCandidate = true; break; }
     }
     if (hasCandidate) {
-      const pieces = tokenizeChildren(node.children, source);
+      const pieces = tokenizeChildren(node.children);
       let hasDelim = false;
       for (let i = 0; i < pieces.length; i++) if (pieces[i].kind === 'delim') { hasDelim = true; break; }
       const matched = hasDelim ? matchPieces(pieces) : null;
@@ -181,34 +202,124 @@ function transformNode(node: any, source: string): void {
   }
   for (let i = 0; i < node.children.length; i++) {
     const child = node.children[i];
-    if (child?.children) transformNode(child, source);
+    if (child?.children) transformNode(child);
   }
+  normalizeEscapedChildren(node.children);
 }
 
-/** Parse `==highlight==`, `~subscript~`, and `^superscript^` spans outside code
- * and math nodes while keeping spaces rejected in sub/sup and unmatched markers literal. */
-export function remarkStudySyntax(this: unknown) {
-  return (tree: any, file?: { value?: unknown }) => {
-    const source = typeof file?.value === 'string' ? file.value : '';
-    if (source && !/==|[~^]/.test(source)) return;
-    transformNode(tree, source);
+function studySyntaxFromMarkdown() {
+  return {
+    enter: {
+      characterEscape(this: any, token: any) {
+        this.data.studyEscStart = token.start;
+        this.config.enter.data.call(this, token);
+      },
+      characterReference(this: any, token: any) {
+        this.config.enter.data.call(this, token);
+        const tail = this.stack[this.stack.length - 1];
+        this.data.studyRefStart = token.start;
+        this.data.studyRefOffset = tail.value.length;
+        this.data.studyRefEnd = tail.position.end;
+      },
+    },
+    exit: {
+      characterEscapeValue(this: any, token: any) {
+        const ch = this.sliceSerialize(token);
+        const parent = this.stack[this.stack.length - 2];
+        if ((ch === '=' || ch === '~' || ch === '^') && parent && parent.type !== 'fragment') {
+          const tail = this.stack.pop();
+          const end = copyPoint(token.end);
+          if (!tail.value) {
+            tail.type = ESCAPED_TEXT_TYPE;
+            tail.value = ch;
+            tail.position.end = end;
+          } else {
+            parent.children.push({
+              type: ESCAPED_TEXT_TYPE,
+              value: ch,
+              position: { start: copyPoint(this.data.studyEscStart || token.start), end },
+            });
+          }
+        } else {
+          this.config.exit.data.call(this, token);
+        }
+        this.data.studyEscStart = undefined;
+      },
+      characterReference(this: any, token: any) {
+        const tail = this.stack.pop();
+        const parent = this.stack[this.stack.length - 1];
+        const offset: number = this.data.studyRefOffset ?? tail.value.length;
+        const added: string = tail.value.slice(offset);
+        const end = copyPoint(token.end);
+        if ((added === '=' || added === '~' || added === '^') && parent && parent.type !== 'fragment') {
+          if (!offset) {
+            tail.type = ESCAPED_TEXT_TYPE;
+            tail.position.end = end;
+          } else {
+            tail.value = tail.value.slice(0, offset);
+            tail.position.end = this.data.studyRefEnd;
+            parent.children.push({
+              type: ESCAPED_TEXT_TYPE,
+              value: added,
+              position: { start: copyPoint(this.data.studyRefStart || token.start), end },
+            });
+          }
+        } else {
+          tail.position.end = end;
+        }
+        this.data.studyRefStart = this.data.studyRefOffset = this.data.studyRefEnd = undefined;
+      },
+    },
+    transforms: [
+      (tree: any) => {
+        transformNode(tree);
+      },
+    ],
   };
 }
 
-/** When `remarkGfm` runs with `{ singleTilde: false }`, `mdast-util-gfm-strikethrough`
- * still escapes every single `~` in `remark-stringify`. Restrict tilde escaping to `~~`
- * pairs so `H~2~O` survives `preparePdf` intact for `smd-core` subscript typesetting. */
-export function remarkSingleTildeStringify(this: any) {
-  const extensions = this.data().toMarkdownExtensions || [];
-  for (const ext of extensions) {
-    for (const sub of ext.extensions || [ext]) {
-      if (Array.isArray(sub.unsafe)) {
-        sub.unsafe = sub.unsafe.flatMap((entry: any) =>
-          entry.character === '~' && entry.inConstruct === 'phrasing'
-            ? [{ ...entry, after: '~' }, { ...entry, before: '~' }]
-            : [entry],
-        );
-      }
-    }
-  }
+function makeSpanHandler(construct: string, marker: DelimKind) {
+  const edge = marker[0];
+  const handle: any = (node: any, _: any, state: any, info: any) => {
+    const tracker = state.createTracker(info);
+    const exit = state.enter(construct);
+    let value = tracker.move(marker);
+    value += state.containerPhrasing(node, {
+      ...tracker.current(),
+      before: edge,
+      after: edge,
+    });
+    value += tracker.move(marker);
+    exit();
+    return value;
+  };
+  handle.peek = () => edge;
+  return handle;
+}
+
+function studySyntaxToMarkdown() {
+  return {
+    unsafe: [
+      { character: '=', after: '=', inConstruct: 'phrasing', notInConstruct: FULL_PHRASING_SPANS },
+      { character: '=', before: '=', inConstruct: 'phrasing', notInConstruct: FULL_PHRASING_SPANS },
+      { character: '~', inConstruct: 'phrasing', notInConstruct: FULL_PHRASING_SPANS },
+      { character: '^', inConstruct: 'phrasing', notInConstruct: FULL_PHRASING_SPANS },
+      { character: '%', after: '%', inConstruct: 'phrasing', notInConstruct: FULL_PHRASING_SPANS },
+    ],
+    handlers: {
+      highlight: makeSpanHandler('highlight', '=='),
+      subscript: makeSpanHandler('subscript', '~'),
+      superscript: makeSpanHandler('superscript', '^'),
+    },
+  };
+}
+
+/** Parse and stringify `==highlight==`, `~subscript~`, and `^superscript^` spans
+ * outside code and math while preserving explicit backslash/entity escapes. */
+export function remarkStudySyntax(this: any) {
+  const data = this.data();
+  const fromMarkdownExtensions = data.fromMarkdownExtensions || (data.fromMarkdownExtensions = []);
+  const toMarkdownExtensions = data.toMarkdownExtensions || (data.toMarkdownExtensions = []);
+  fromMarkdownExtensions.push(studySyntaxFromMarkdown());
+  toMarkdownExtensions.push(studySyntaxToMarkdown());
 }

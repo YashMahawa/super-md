@@ -15,8 +15,7 @@ import { analyzeDocument } from "./documentAnalysis";
 import { svgImage } from "./svgImage";
 import { remarkObsidianMath } from "./obsidianMath";
 import { remarkSvgBlocks } from "./svgBlocks";
-import { maskCode } from "./markdownSource";
-import { remarkSingleTildeStringify } from "./studySyntax";
+import { remarkStudySyntax } from "./studySyntax";
 import {parseStepDeck} from "./components/StepCards";
 import {stepDiagramSvg} from "./stepPdf";
 
@@ -66,7 +65,7 @@ export async function preparePdf(markdown: string, documentPath: string | null, 
   try {
   checkCurrent();
   report({ phase: "prepare", completed: 0, total: 1 });
-  const processor = unified().use(remarkParse).use(remarkGfm, { singleTilde: false }).use(remarkSingleTildeStringify).use(remarkMath).use(remarkObsidianMath).use(remarkStringify);
+  const processor = unified().use(remarkParse).use(remarkGfm, { singleTilde: false }).use(remarkMath).use(remarkObsidianMath).use(remarkStudySyntax).use(remarkStringify);
   const front = parseFrontmatter(markdown)?.raw || "";
   const normalized = normalizeCallouts(markdown);
   // parse() runs no transformers: lift raw <svg> markup into svg blocks here.
@@ -249,12 +248,7 @@ export async function preparePdf(markdown: string, documentPath: string | null, 
   checkCurrent();
   // The marker is an extension, not a normal bracketed link. Stringify escapes
   // its opening bracket; restore only explicit blockquote callout prefixes.
-  const rawBody = processor.stringify(tree).replace(/^([\t ]*>[\t ]*)\\(\[![\w-]+\][+-]?)/gm, "$1$2");
-  const codeMask = maskCode(rawBody);
-  const body = rawBody.replace(
-    /^([\t ]*(?:>[\t ]*)*(?:(?:[-+*]|\d+[.)])[\t ]+(?:\[[ xX]\][\t ]+)?)?)\\(==(?=[^=\s\r\n].*==))/gm,
-    (full, prefix: string, marker: string, offset: number) => codeMask[offset + prefix.length] === " " ? full : prefix + marker,
-  );
+  const body = processor.stringify(tree).replace(/^([\t ]*>[\t ]*)\\(\[![\w-]+\][+-]?)/gm, "$1$2");
   const content = front ? (body ? `${front}${front.endsWith("\n") ? "" : "\n"}\n${body}` : front) : body;
   checkCurrent();
   return { content, assets };

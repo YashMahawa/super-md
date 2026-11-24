@@ -417,9 +417,9 @@ where
                 let children = build_nodes(iter, source, Some(close));
                 if children.is_empty() || children.iter().any(|n| has_break(n, true)) {
                     let marker = if is_sub { "~" } else { "^" };
-                    out.push(Node::Text(CowStr::from(marker), true));
+                    out.push(Node::Text(CowStr::from(marker), false));
                     out.extend(children);
-                    out.push(Node::Text(CowStr::from(marker), true));
+                    out.push(Node::Text(CowStr::from(marker), false));
                 } else {
                     out.push(Node::Group { start: Event::Start(tag), end: Event::End(close), children, phrasing: true });
                 }
@@ -443,8 +443,25 @@ where
             }
             Event::InlineHtml(html) | Event::Html(html) => tokenize_raw_html(&html, &mut out),
             Event::Text(value) => {
-                let escaped = range.end > range.start + value.len() && source.as_bytes().get(range.start) == Some(&b'\\');
-                out.push(Node::Text(value, escaped));
+                let bytes = source.as_bytes();
+                let mut slashes = 0usize;
+                let mut k = range.start;
+                while k > 0 && bytes[k - 1] == b'\\' {
+                    slashes += 1;
+                    k -= 1;
+                }
+                let escaped_head = slashes % 2 == 1 || (range.end > range.start + value.len() && bytes.get(range.start) == Some(&b'&'));
+                if escaped_head {
+                    if let Some(ch) = value.chars().next() {
+                        let split = ch.len_utf8();
+                        if split < value.len() {
+                            out.push(Node::Text(CowStr::from(value[..split].to_string()), true));
+                            out.push(Node::Text(CowStr::from(value[split..].to_string()), false));
+                            continue;
+                        }
+                    }
+                }
+                out.push(Node::Text(value, escaped_head));
             }
             other => out.push(Node::Leaf(other)),
         }
