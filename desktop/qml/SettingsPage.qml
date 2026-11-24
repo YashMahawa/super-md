@@ -14,14 +14,26 @@ Pane {
     property string pendingCleanup: ""
     property var shortcutLabels: JSON.parse(studio.shortcutLabels)
     signal back()
+    property bool pythonScanned: false
     readonly property bool pythonReady: JSON.parse(studio.pythonChoices).some(choice => choice.matplotlib)
     readonly property var storageSummary: JSON.parse(studio.storageReport)
+    function refreshPythonIfNeeded() {
+        if (visible && section === "python" && !pythonScanned) {
+            pythonScanned = true
+            studio.refreshPython()
+        }
+    }
     onVisibleChanged: if (!visible) {
         const host = page.Window.window
         if (host) host.capturingShortcut = false
+    } else {
+        refreshPythonIfNeeded()
     }
     function save(key, value) { studio.setting(key, JSON.stringify(value)) }
-    onSectionChanged: if (settingsScroll) settingsScroll.contentItem.contentY = 0
+    onSectionChanged: {
+        if (settingsScroll) settingsScroll.contentItem.contentY = 0
+        refreshPythonIfNeeded()
+    }
     function formatBytes(value) {
         if (value < 1024) return value + " B"
         if (value < 1024 * 1024) return (value / 1024).toFixed(1) + " KB"
@@ -44,7 +56,7 @@ Pane {
         onAccepted: studio.clearStorageCategory(page.pendingCleanup)
         contentItem: Label { width: 360; wrapMode: Text.WordWrap; text: page.pendingCleanup === "execution-results" ? "Remove app-generated Python result previews. Saved notes, exported images and recovery data will not be touched. This cannot be undone." : "Remove cached update verification/download state. Installed versions and Downloads outside app storage remain unchanged. This cannot be undone." }
     }
-    Component.onCompleted: studio.refreshPython()
+    Component.onCompleted: refreshPythonIfNeeded()
     ColumnLayout {
         anchors.fill: parent
         anchors.margins: 28

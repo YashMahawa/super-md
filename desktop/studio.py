@@ -503,7 +503,7 @@ class Studio(QObject):
         self.python_choices=[]
         self.python_busy=False
         self.pythonProgress.connect(self._python_progress)
-        if not self.settings.get("python"): QTimer.singleShot(0,self._choose_default_python)
+        if not isolated and not self.settings.get("python"): QTimer.singleShot(0,self._choose_default_python)
         if not isolated and len(self.session.windows)==1:QTimer.singleShot(0,self._restore_update)
         self.tabs: list[dict] = []
         self.closed_tabs = self.session.closed_tabs

@@ -44,6 +44,38 @@ class PythonRuntimeTest(unittest.TestCase):
         self.assertTrue(any(os.path.samefile(path, sys.executable) for path in paths if os.path.exists(path)))
         self.assertTrue(all(python_runtime.NAME.match(Path(path).name) for path in paths))
 
+    def test_isolated_studio_windows_skip_background_default_python_discovery(self):
+        os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+        from unittest.mock import patch
+        from PySide6.QtGui import QGuiApplication
+        from studio import Session
+        from test_studio import QuietStudio
+
+        app = QGuiApplication.instance() or QGuiApplication(["python runtime test"])
+        session = Session(True)
+        with patch.object(QuietStudio, "_choose_default_python") as choose_default:
+            isolated_window = QuietStudio(True, session)
+            app.processEvents()
+            choose_default.assert_not_called()
+            production_window = QuietStudio(False, session)
+            try:
+                app.processEvents()
+                choose_default.assert_called_once()
+            finally:
+                production_window.stop()
+                production_window.pool.shutdown(wait=True, cancel_futures=True)
+                isolated_window.stop()
+                isolated_window.pool.shutdown(wait=True, cancel_futures=True)
+                session.writes.shutdown(wait=True)
+
+    def test_suite_watchdog_budget_covers_macos_arm64_and_intel_runners(self):
+        import run_tests
+
+        self.assertEqual(run_tests.suite_timeout_for("darwin", "arm64"), 420)
+        self.assertEqual(run_tests.suite_timeout_for("darwin", "x86_64"), 720)
+        self.assertEqual(run_tests.suite_timeout_for("linux", "x86_64"), 240)
+        self.assertEqual(run_tests.suite_timeout_for("win32", "AMD64"), 240)
+
 
 if __name__ == "__main__":
     unittest.main()
