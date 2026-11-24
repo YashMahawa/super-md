@@ -314,6 +314,81 @@ class StudioTest(unittest.TestCase):
         studio._submit(lambda:1,lambda *_:self.fail("Retired callback ran"))
         studio._complete((lambda *_:self.fail("Retired callback ran"),None,None,False))
 
+    def test_startup_populates_default_python_before_reader_load_without_probing(self):
+        with (
+            patch("python_runtime.probe", side_effect=AssertionError("startup must not probe Python")),
+            patch("python_runtime.discover", side_effect=AssertionError("startup must not discover Python")),
+        ):
+            fresh_session = Session(True)
+            self.addCleanup(lambda: fresh_session.writes.shutdown(wait=True))
+            self.assertEqual(fresh_session.settings["python"], "")
+            fresh_studio = QuietStudio(True, fresh_session)
+            self.windows.append(fresh_studio)
+            self.assertFalse(fresh_studio.pythonBusy)
+            self.assertTrue(fresh_studio.settings["python"])
+            loads = []
+            fresh_studio.readerLoad.connect(loads.append)
+            fresh_studio.post("ready", "reader_ready", "{}")
+            self.assertEqual(json.loads(loads[-1])["python"], fresh_studio.settings["python"])
+            self.app.processEvents()
+            fresh_session.writes.flush(timeout=3)
+            stored = json.loads((fresh_session.data / "settings.json").read_text(encoding="utf-8"))
+            self.assertEqual(stored["settings"]["python"], fresh_studio.settings["python"])
+
+            saved_session = Session(True)
+            self.addCleanup(lambda: saved_session.writes.shutdown(wait=True))
+            saved_session.settings["python"] = sys.executable
+            saved_studio = QuietStudio(True, saved_session)
+            self.windows.append(saved_studio)
+            self.assertFalse(saved_studio.pythonBusy)
+            self.assertEqual(saved_studio.settings["python"], sys.executable)
+            self.app.processEvents()
+
+    def test_concurrent_refresh_python_and_preferred_share_single_discover_run(self):
+        import concurrent.futures
+        import threading
+        import python_runtime
+
+        studio = self.studio
+        started = threading.Event()
+        release = threading.Event()
+        probe_calls = 0
+        lock = threading.Lock()
+
+        def controlled_probe(executable, timeout=6):
+            nonlocal probe_calls
+            with lock:
+                probe_calls += 1
+            started.set()
+            release.wait(5)
+            return {
+                "version": "3.12.0",
+                "prefix": sys.prefix,
+                "venv": True,
+                "matplotlib": True,
+                "numpy": True,
+                "venvModule": True,
+            }
+
+        with (
+            patch("python_runtime.bundled_available", return_value=False),
+            patch("python_runtime.candidates", return_value=[Path(sys.executable)]),
+            patch("python_runtime.probe", side_effect=controlled_probe),
+        ):
+            studio.refreshPython()
+            self.assertTrue(studio.pythonBusy)
+            self.assertTrue(started.wait(2))
+            with concurrent.futures.ThreadPoolExecutor(max_workers=1) as caller:
+                preferred_future = caller.submit(python_runtime.preferred, studio.data / "python-env")
+                time.sleep(0.05)
+                release.set()
+                chosen = preferred_future.result(timeout=5)
+            self._wait_for(lambda: not studio.pythonBusy)
+
+        self.assertEqual(probe_calls, 1)
+        self.assertEqual(chosen, sys.executable)
+        self.assertEqual([item["path"] for item in studio.python_choices], [sys.executable])
+
     def test_pinned_recents_are_first_and_never_evicted_by_recent_opens(self):
         studio=self.studio;studio.recent=["/notes/pinned.md"]
         studio.pinRecent("/notes/pinned.md")
