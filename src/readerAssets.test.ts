@@ -2,7 +2,7 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 
 const { nativeInvoke } = vi.hoisted(() => ({ nativeInvoke: vi.fn() }));
 vi.mock("./nativeBridge", () => ({ invoke: nativeInvoke }));
-import { approvedReaderRasterUrl, resolveReaderRasterAsset } from "./readerAssets";
+import { approvedReaderRasterUrl, isSvgAssetPath, resolveReaderRasterAsset } from "./readerAssets";
 
 const TOKEN = "0123456789abcdef0123456789abcdef";
 const FINGERPRINT = "a".repeat(64);
@@ -13,6 +13,23 @@ const response = (url: unknown = URL, mime: unknown = "image/png") => ({ url, mi
 afterEach(() => { nativeInvoke.mockReset(); vi.unstubAllGlobals(); });
 
 describe("Android streamed reader assets", () => {
+  it("detects SVG asset paths across case, query, fragment, and percent encoding", () => {
+    expect(isSvgAssetPath("images/diagram.svg")).toBe(true);
+    expect(isSvgAssetPath("images/DIAGRAM.SVG")).toBe(true);
+    expect(isSvgAssetPath("images/diagram.svg?theme=dark#node")).toBe(true);
+    expect(isSvgAssetPath("images/my%20diagram.SVG")).toBe(true);
+    expect(isSvgAssetPath("images/photo.png")).toBe(false);
+    expect(isSvgAssetPath("images/photo.png?format=.svg")).toBe(false);
+    expect(isSvgAssetPath("")).toBe(false);
+  });
+
+  it("skips native raster streaming resolution for SVG paths", async () => {
+    await expect(resolveReaderRasterAsset("/notes/a.md", "images/a.svg")).resolves.toBeNull();
+    await expect(resolveReaderRasterAsset("/notes/a.md", "images/A.SVG?v=1")).resolves.toBeNull();
+    await expect(resolveReaderRasterAsset("/notes/a.md", "images/diagram.svg#dark")).resolves.toBeNull();
+    expect(nativeInvoke).not.toHaveBeenCalled();
+  });
+
   it("accepts only exact, fingerprinted reader capability URLs and raster MIME", () => {
     expect(approvedReaderRasterUrl(response())).toBe(URL);
     expect(approvedReaderRasterUrl(response(URL, "image/SVG+xml"))).toBeNull();
@@ -70,7 +87,7 @@ describe("Android streamed reader assets", () => {
     nativeInvoke.mockResolvedValueOnce(response(URL, "image/svg+xml"));
     nativeInvoke.mockResolvedValueOnce({ url: "https://evil.example/image.png", mime: "image/png" });
     nativeInvoke.mockRejectedValueOnce(new Error("unsupported"));
-    await expect(resolveReaderRasterAsset("/notes/a.md", "images/a.svg")).resolves.toBeNull();
+    await expect(resolveReaderRasterAsset("/notes/a.md", "images/disguised.png")).resolves.toBeNull();
     await expect(resolveReaderRasterAsset("/notes/a.md", "images/a.png")).resolves.toBeNull();
     await expect(resolveReaderRasterAsset("/notes/a.md", "images/a.webp")).resolves.toBeNull();
     await expect(resolveReaderRasterAsset("", "assets/import-image.png")).resolves.toBeNull();

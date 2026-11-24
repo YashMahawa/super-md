@@ -26,6 +26,7 @@ import { preparePdf } from "./preparePdf";
 import type { ExportOptions,ReaderAccessibilityPreference } from "./types";
 import { clampPreviewZoom } from "./zoom";
 import MediaTools from "./components/MediaTools";
+import { dismissReaderOverlay } from "./readerOverlays";
 import { prepareFmd } from "./documentMedia";
 import { prepareMarkdownExport } from "./markdownExport";
 import ImageViewer from "./components/ImageViewer";
@@ -190,7 +191,7 @@ function Reader() {
       requestAnimationFrame(()=>{restore.forEach(callback=>callback());applyZoomStyle();settleSelection();});
     };
     window.supermdThemeGuide=()=>setThemeGuide(true);
-    window.supermdDismiss=()=>{const element=document.querySelector(".theme-guide-dialog")||document.querySelector(".image-viewer,.math-repair-panel,.reading-search,.cm-search,.live-active-block textarea");if(!element)return false;const target=element.matches("textarea")?element:document.activeElement||document;target.dispatchEvent(new KeyboardEvent("keydown",{key:"Escape",bubbles:true,cancelable:true}));if(element.matches("textarea"))(element as HTMLElement).blur();return true;};
+    window.supermdDismiss=dismissReaderOverlay;
     window.supermdLoad = (incoming) => {
       const old = reference.current;
       // Native omits content it received from this reader, unchanged since.
