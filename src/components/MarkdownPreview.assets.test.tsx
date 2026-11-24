@@ -6,6 +6,7 @@ import { createRoot, type Root } from "react-dom/client";
 const { invoke } = vi.hoisted(() => ({ invoke: vi.fn() }));
 vi.mock("../nativeBridge", () => ({ invoke }));
 import MarkdownPreview from "./MarkdownPreview";
+import { DocumentAppearance } from "../documentAppearance";
 
 Object.assign(globalThis, { IS_REACT_ACT_ENVIRONMENT: true });
 let root: Root | null = null;
@@ -54,14 +55,39 @@ describe("MarkdownPreview streamed local assets", () => {
     expect(host.querySelector("img")?.getAttribute("src")).toBe(url);
   });
 
-  it("preserves the legacy SVG data loader for structural recoloring", async () => {
+  it("preserves the legacy SVG data loader without invoking resolve_reader_asset", async () => {
     const svg = "data:image/svg+xml;base64,PHN2Zz48L3N2Zz4=";
-    invoke.mockRejectedValueOnce(new Error("SVG images use the safe data loader"));
     invoke.mockResolvedValueOnce(svg);
     const host = await render("![Vector](images/a.svg)");
-    expect(invoke).toHaveBeenNthCalledWith(1, "resolve_reader_asset", { documentPath: "/notes/a.md", source: "images/a.svg" });
-    expect(invoke).toHaveBeenNthCalledWith(2, "load_asset", { documentPath: "/notes/a.md", source: "images/a.svg" });
+    expect(invoke).toHaveBeenCalledTimes(1);
+    expect(invoke).toHaveBeenCalledWith("load_asset", { documentPath: "/notes/a.md", source: "images/a.svg" });
+    expect(invoke).not.toHaveBeenCalledWith("resolve_reader_asset", expect.anything());
     expect(host.querySelector("img")?.getAttribute("src")).toBe(svg);
+  });
+
+  it("adapts linked SVG assets to reader theme without calling resolve_reader_asset", async () => {
+    const rawSvg = '<svg viewBox="0 0 10 10"><path d="M0 0h5" stroke="#000"/><circle r="2" fill="white"/></svg>';
+    const svgData = `data:image/svg+xml;base64,${Buffer.from(rawSvg, "utf8").toString("base64")}`;
+    invoke.mockResolvedValueOnce(svgData);
+    const host = document.createElement("div");
+    document.body.append(host);
+    root = createRoot(host);
+    await act(async () => {
+      root?.render(
+        <DocumentAppearance.Provider value={{ dark: true, svgAppearance: "auto", ink: "#e6e0e9", text: "#e6e0e9" }}>
+          <MarkdownPreview markdown="![Diagram](diagrams/flow.SVG?mode=auto)" documentPath="/notes/a.md" python="" dark />
+        </DocumentAppearance.Provider>,
+      );
+    });
+    expect(invoke).toHaveBeenCalledTimes(1);
+    expect(invoke).toHaveBeenCalledWith("load_asset", { documentPath: "/notes/a.md", source: "diagrams/flow.SVG?mode=auto" });
+    expect(invoke).not.toHaveBeenCalledWith("resolve_reader_asset", expect.anything());
+    const wrapper = host.querySelector<HTMLElement>(".note-image");
+    const img = host.querySelector<HTMLImageElement>("img");
+    expect(wrapper?.classList.contains("note-image--diagram")).toBe(true);
+    expect(img?.getAttribute("data-media-kind")).toBe("svg");
+    expect(img?.getAttribute("data-media-adapted")).toBe("true");
+    expect(decodeURIComponent(img?.getAttribute("src") ?? "")).not.toContain('stroke="#000"');
   });
 
   it("falls back if a native response is malformed or outside the approved origin", async () => {
