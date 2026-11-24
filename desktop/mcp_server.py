@@ -201,11 +201,23 @@ def build_mcp_server(roots: list[str], live_client=None):
                 "next_offset": end if end < len(source) else None,
                 "truncated": end < len(source)}, ensure_ascii=False))]
 
+    live_unavailable_reason = (
+        "Live Agent Access is disabled or Super MD is not running. "
+        "Ask the user to open Super MD and enable Live Agent Access in Settings → AI agents."
+    )
+
+    def resolve_live_asset_path(raw_path: str) -> str:
+        if not isinstance(raw_path, str) or not 1 <= len(raw_path.strip()) <= 4096 or "\0" in raw_path:
+            raise AgentDocumentError("asset_path must be a non-empty file path")
+        if store.roots:
+            return str(store.resolve(raw_path))
+        return str(Path(raw_path).expanduser())
+
     @server.tool()
     def list_sessions() -> dict[str, Any]:
         """List currently open desktop tabs, including unsaved source and revision IDs."""
         if live_client is None:
-            return {"sessions": [], "count": 0, "available": False}
+            return {"sessions": [], "count": 0, "available": False, "reason": live_unavailable_reason}
         response = live_call("list_tabs")
         tabs = response.get("tabs", response.get("sessions", [])) if isinstance(response, dict) else response
         if not isinstance(tabs, list) or len(tabs) > 200:
@@ -226,8 +238,19 @@ def build_mcp_server(roots: list[str], live_client=None):
             if isinstance(tab.get("sourceLength"), int):
                 row["sourceLength"] = tab["sourceLength"]
             sessions.append(row)
-        return {"sessions": sessions[:32], "count": len(sessions), "truncated": len(sessions) > 32,
-                "available": True}
+        available = (response["available"]
+                     if isinstance(response, dict) and isinstance(response.get("available"), bool)
+                     else bool(sessions))
+        result: dict[str, Any] = {
+            "sessions": sessions[:32],
+            "count": len(sessions),
+            "truncated": len(sessions) > 32,
+            "available": available,
+        }
+        if not available:
+            reason = response.get("reason") if isinstance(response, dict) and isinstance(response.get("reason"), str) else ""
+            result["reason"] = reason[:500] if reason else live_unavailable_reason
+        return result
 
     @server.tool()
     def document_inspect(path: str) -> dict[str, Any]:
@@ -533,7 +556,7 @@ def build_mcp_server(roots: list[str], live_client=None):
             return bounded_result(result, 24_000)
         if action == "list_devices":
             if live_client is None:
-                return {"devices": [], "count": 0, "available": False}
+                return {"devices": [], "count": 0, "available": False, "reason": live_unavailable_reason}
             result = live_call("list_devices")
             if not isinstance(result, dict):
                 raise AgentDocumentError("Device list is unavailable")
@@ -588,14 +611,19 @@ def build_mcp_server(roots: list[str], live_client=None):
             if tab_id is not None:
                 if not asset_id and not asset_name:
                     raise AgentDocumentError("replace requires asset_id from document_assets")
-                resolved_asset_path = str(store.resolve(asset_path))
+                resolved_asset_path = resolve_live_asset_path(asset_path)
                 result = live_call("document_action", tab_id, "replace_tab_asset",
                                    asset_name=asset_id or asset_name, asset_path=resolved_asset_path,
                                    expected_revision=expected_revision)
                 if not isinstance(result, dict):
                     raise AgentDocumentError("Live bridge returned invalid asset replacement status")
                 status = {key: result[key] for key in
-                          ("asset", "assetId", "revision", "previous_revision", "saved", "changed") if key in result}
+                          ("asset", "assetName", "assetId", "revision", "previous_revision", "saved", "changed", "bytes", "mimeType")
+                          if key in result}
+                if "asset" not in status and "assetName" in result:
+                    status["asset"] = result["assetName"]
+                if "saved" not in status and "changed" in result:
+                    status["saved"] = bool(result["changed"])
                 status["target"] = path
                 return bounded_result(status)
             return store.replace_asset(path, asset_id or asset_name or "", asset_path,
@@ -636,7 +664,7 @@ def build_mcp_server(roots: list[str], live_client=None):
         """Embed one bounded image file in a portable SMD note."""
         tab_id = live_id(path)
         if tab_id is not None:
-            asset_path = str(store.resolve(asset_path))
+            asset_path = resolve_live_asset_path(asset_path)
             if not re.fullmatch(r"[0-9a-f]{64}", expected_revision):
                 raise AgentDocumentError("expected_revision must be the SHA-256 from the current tab")
             result = live_call("attach_tab", tab_id, asset_path=asset_path,

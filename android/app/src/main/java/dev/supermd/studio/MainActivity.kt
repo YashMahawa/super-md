@@ -336,7 +336,6 @@ class MainActivity : ComponentActivity() {
     internal fun agentSourceLength(value: String): Int = value.codePointCount(0, value.length)
     internal suspend fun captureAgentViewport(reader: WebView, requestedWidth: Int, imageFormat: String = "png"): JSONObject {
         require(imageFormat in setOf("png", "jpeg")) { "Unsupported viewport image format" }
-        check(Build.VERSION.SDK_INT >= 26) { "Viewport snapshots require Android 8 or newer" }
         check(reader.width > 0 && reader.height > 0 && reader.isAttachedToWindow) { "The live reading viewport is unavailable" }
         val context = kotlinx.coroutines.suspendCancellableCoroutine<JSONObject> { continuation ->
             val requestId = "snapshot_context_${java.util.UUID.randomUUID()}"
@@ -1262,7 +1261,7 @@ private object NoMotionScheme : MotionScheme {
         var name by remember(state.active.id) {mutableStateOf(state.active.name)}
         AlertDialog(onDismissRequest={renaming=false},title={Text("Rename note")},text={OutlinedTextField(value=name,onValueChange={name=it},singleLine=true,label={Text("Note name")})},confirmButton={TextButton(onClick={model.rename(state.active.id,name);renaming=false},enabled=name.isNotBlank()){Text("Rename")}},dismissButton={TextButton(onClick={renaming=false}){Text("Cancel")}})
     }
-    if (exporting) ModalBottomSheet(onDismissRequest = { exporting = false }, sheetState = rememberModalBottomSheetState(skipPartiallyExpanded = true)) { ExportSettings(state.pdf, model::pdf, sharing = sharing, fonts = state.customFonts, noteLocation = noteLocation) { format ->
+    if (exporting) ModalBottomSheet(onDismissRequest = { exporting = false }, sheetState = rememberBottomSheetState(initialValue = SheetValue.Hidden, enabledValues = setOf(SheetValue.Hidden, SheetValue.Expanded))) { ExportSettings(state.pdf, model::pdf, sharing = sharing, fonts = state.customFonts, noteLocation = noteLocation) { format ->
         exporting = false
         if (format in listOf("md", "mdzip")) {
             val archive = format == "mdzip"
@@ -1427,7 +1426,7 @@ private object NoMotionScheme : MotionScheme {
     onDismiss: () -> Unit,
     onNavigate: (OutlineHeading) -> Unit,
 ) {
-    ModalBottomSheet(onDismissRequest = onDismiss, sheetState = rememberModalBottomSheetState(skipPartiallyExpanded = true)) {
+    ModalBottomSheet(onDismissRequest = onDismiss, sheetState = rememberBottomSheetState(initialValue = SheetValue.Hidden, enabledValues = setOf(SheetValue.Hidden, SheetValue.Expanded))) {
         ContentsSheetContent(headings = headings, noteId = noteId, motion = motion, onNavigate = onNavigate)
     }
 }
@@ -1491,12 +1490,13 @@ private object NoMotionScheme : MotionScheme {
         }
         items(state.files, key = { "file:${it.uri}:${it.relative}" }) { entry ->
             ListItem(
-                headlineContent = { Text(entry.name, maxLines = 1, overflow = TextOverflow.Ellipsis) },
                 leadingContent = { Icon(if (entry.directory) Icons.Rounded.Folder else Icons.Rounded.Description, null) },
                 trailingContent = { Icon(if (entry.directory) Icons.Rounded.ChevronRight else Icons.AutoMirrored.Rounded.MenuBook, null) },
                 colors = ListItemDefaults.colors(containerColor = Color.Transparent),
                 modifier = Modifier.fillMaxWidth().heightIn(min = 48.dp).clickable { onActivateEntry(entry) },
-            )
+            ) {
+                Text(entry.name, maxLines = 1, overflow = TextOverflow.Ellipsis)
+            }
         }
         if (recent.isNotEmpty()) {
             item(key = "recent-header") {
@@ -1694,6 +1694,7 @@ internal class NoteDestination(private val mime: String, private val preferred: 
     var message by remember { mutableStateOf("") }
     var pendingPairingFile by remember { mutableStateOf<String?>(null) }
     var pendingGuide by remember { mutableStateOf<String?>(null) }
+    var pendingSkillArchive by remember { mutableStateOf<ByteArray?>(null) }
     var enabled by remember { mutableStateOf(activity.agentAccessState.enabled) }
     fun revokeThen(action: () -> Unit) {
         message = "Disconnecting and revoking previous device registrations…"
@@ -1744,7 +1745,17 @@ internal class NoteDestination(private val mime: String, private val preferred: 
         if (uri != null && guide != null) runCatching {
             activity.contentResolver.openOutputStream(uri, "w")?.use { it.write(guide.toByteArray(Charsets.UTF_8)); it.flush() }
                 ?: error("Android could not write the setup guide")
-        }.onFailure { message = "Could not save setup guide: ${it.message}" }
+        }.onSuccess { message = "Setup instructions saved." }
+            .onFailure { message = "Could not save setup guide: ${it.message}" }
+    }
+    val skillExport = rememberLauncherForActivityResult(ActivityResultContracts.CreateDocument("application/zip")) { uri ->
+        val archive = pendingSkillArchive
+        pendingSkillArchive = null
+        if (uri != null && archive != null) runCatching {
+            activity.contentResolver.openOutputStream(uri, "w")?.use { it.write(archive); it.flush() }
+                ?: error("Android could not write the skill package")
+        }.onSuccess { message = "Skill package saved." }
+            .onFailure { message = "Could not save skill package: ${it.message}" }
     }
     val config = activity.agentConfigForThisWindow() ?: activity.agentAccessState.currentConfig()
     Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
@@ -1772,6 +1783,11 @@ internal class NoteDestination(private val mime: String, private val preferred: 
                 if (file == null) message = "Create or join a workspace first"
                 else { pendingPairingFile = file; pairingExport.launch("SuperMD-pairing.json") }
             }) { Text("Export trusted pairing file…") }
+            OutlinedButton(onClick = {
+                runCatching { activity.assets.open("web/super-md-skill.zip").use { it.readBytes() } }
+                    .onSuccess { bytes -> pendingSkillArchive = bytes; skillExport.launch("super-md-skill.zip") }
+                    .onFailure { message = "Could not load skill package: ${it.message}" }
+            }) { Text("Export skill package (.zip)…") }
         }
         if (config != null) {
             FlowRow(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
@@ -1827,7 +1843,7 @@ internal class NoteDestination(private val mime: String, private val preferred: 
                 if (matches.isEmpty()) Text("No matching fonts", color = MaterialTheme.colorScheme.onSurfaceVariant)
                 LazyColumn(Modifier.heightIn(max = 340.dp)) {
                     items(matches, key = {it.first}) { (key, name) ->
-                        ListItem(headlineContent = {Text(name)}, trailingContent = {if (key == value) Icon(Icons.Rounded.Check, "Selected")}, colors = ListItemDefaults.colors(containerColor = if (key == value) MaterialTheme.colorScheme.primaryContainer else Color.Transparent), modifier = Modifier.clickable {change(key); opened = false})
+                        ListItem(trailingContent = {if (key == value) Icon(Icons.Rounded.Check, "Selected")}, colors = ListItemDefaults.colors(containerColor = if (key == value) MaterialTheme.colorScheme.primaryContainer else Color.Transparent), modifier = Modifier.clickable {change(key); opened = false}) {Text(name)}
                     }
                 }
             }

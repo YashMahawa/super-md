@@ -209,7 +209,7 @@ ApplicationWindow {{
         QTest.qWait(30)
         window.readDocumentSelection()
         QTest.qWait(40)
-        QTest.keyClick(window, Qt.Key_C, Qt.KeyboardModifier.ControlModifier)
+        QTest.keyClick(window, Qt.Key.Key_C, Qt.KeyboardModifier.ControlModifier)
         deadline = time.monotonic() + 3
         while QGuiApplication.clipboard().text() == "clipboard sentinel" and time.monotonic() < deadline:
             QTest.qWait(25)
@@ -218,7 +218,7 @@ ApplicationWindow {{
             raise AssertionError(f"Native Ctrl+C did not reach the rendered copy handler: clipboard={copied_from_key!r}, shortcut={window.property('nativeCopyShortcutTriggered')!r}, selected={window.property('domSelectionText')!r}, webengineSelected={selected_text_property!r}")
         window.clearDocumentSelection()
         QTest.qWait(40)
-        QTest.keyClick(window, Qt.Key_C, Qt.KeyboardModifier.ControlModifier)
+        QTest.keyClick(window, Qt.Key.Key_C, Qt.KeyboardModifier.ControlModifier)
         QTest.qWait(80)
         if QGuiApplication.clipboard().text() != copied_from_key:
             raise AssertionError("Ctrl+C without a DOM selection changed the clipboard")
@@ -312,25 +312,25 @@ ApplicationWindow {{
         for name,action in [('googleMenuItem','google'),('assistantMenuItem','assistant')]:
             deadline=time.monotonic()+3
             while menu.property('visible') and time.monotonic()<deadline:QTest.qWait(20)
-            QTest.mouseClick(window,Qt.RightButton,Qt.NoModifier,context_point)
+            QTest.mouseClick(window,Qt.MouseButton.RightButton,Qt.KeyboardModifier.NoModifier,context_point)
             deadline=time.monotonic()+3
             while not menu.property('visible') and time.monotonic()<deadline:QTest.qWait(20)
             item=window.findChild(QObject,name)
             if not item or not item.property('visible'):raise AssertionError(f'{name} was not available for selected text')
-            QTest.mouseClick(window,Qt.LeftButton,Qt.NoModifier,item.mapToScene(QPointF(item.width()/2,item.height()/2)).toPoint())
+            QTest.mouseClick(window,Qt.MouseButton.LeftButton,Qt.KeyboardModifier.NoModifier,item.mapToScene(QPointF(item.width()/2,item.height()/2)).toPoint())
             deadline=time.monotonic()+3
             while (not palette.selection_actions or palette.selection_actions[-1][0]!=action) and time.monotonic()<deadline:QTest.qWait(20)
             if not palette.selection_actions or palette.selection_actions[-1]!=(action,menu.property('selectionText')):
                 raise AssertionError(f'{action} did not receive the exact selected text: {palette.selection_actions!r}')
         deadline=time.monotonic()+3
         while menu.property('visible') and time.monotonic()<deadline:QTest.qWait(20)
-        QTest.mouseClick(window,Qt.RightButton,Qt.NoModifier,context_point)
+        QTest.mouseClick(window,Qt.MouseButton.RightButton,Qt.KeyboardModifier.NoModifier,context_point)
         deadline=time.monotonic()+3
         while not menu.property('visible') and time.monotonic()<deadline:QTest.qWait(20)
         reload_item=window.findChild(QObject,"reloadMenuItem")
         if reload_item is None:raise AssertionError("Could not locate the safe Reload menu action")
         reload_point=reload_item.mapToScene(QPointF(reload_item.width()/2,reload_item.height()/2)).toPoint()
-        QTest.mouseClick(window,Qt.LeftButton,Qt.NoModifier,reload_point)
+        QTest.mouseClick(window,Qt.MouseButton.LeftButton,Qt.KeyboardModifier.NoModifier,reload_point)
         if palette.reload_requests!=1:raise AssertionError("Reload did not route through the safe native flush action")
 
         # Phase 2 (in the same isolated WebEngine process): verify source-aware
@@ -371,7 +371,7 @@ ApplicationWindow {{
         diagram_pt = QPoint(int(window.property("diagramX")), int(window.property("diagramY")))
         chart_pt = QPoint(int(window.property("chartX")), int(window.property("chartY")))
 
-        QTest.mouseClick(window, Qt.RightButton, Qt.NoModifier, diagram_pt)
+        QTest.mouseClick(window, Qt.MouseButton.RightButton, Qt.KeyboardModifier.NoModifier, diagram_pt)
         deadline = time.monotonic() + 5
         while not menu.property("visible") and time.monotonic() < deadline:
             QTest.qWait(20)
@@ -392,7 +392,7 @@ ApplicationWindow {{
             raise AssertionError("Search Google / Ask were not visible when right-clicking over image with active selection")
 
         ask_pt = ask_item.mapToScene(QPointF(ask_item.width() / 2, ask_item.height() / 2)).toPoint()
-        QTest.mouseClick(window, Qt.LeftButton, Qt.NoModifier, ask_pt)
+        QTest.mouseClick(window, Qt.MouseButton.LeftButton, Qt.KeyboardModifier.NoModifier, ask_pt)
         deadline = time.monotonic() + 3
         while not palette.selection_actions and time.monotonic() < deadline:
             QTest.qWait(20)
@@ -403,14 +403,14 @@ ApplicationWindow {{
         deadline = time.monotonic() + 3
         while menu.property("visible") and time.monotonic() < deadline:
             QTest.qWait(20)
-        QTest.mouseClick(window, Qt.RightButton, Qt.NoModifier, chart_pt)
+        QTest.mouseClick(window, Qt.MouseButton.RightButton, Qt.KeyboardModifier.NoModifier, chart_pt)
         deadline = time.monotonic() + 3
         while not menu.property("visible") and time.monotonic() < deadline:
             QTest.qWait(20)
         if menu.property("selectionText") != expected_table:
             raise AssertionError(f"Unexpected selectionText over chart SVG: {menu.property('selectionText')!r}")
         copy_pt = copy_item.mapToScene(QPointF(copy_item.width() / 2, copy_item.height() / 2)).toPoint()
-        QTest.mouseClick(window, Qt.LeftButton, Qt.NoModifier, copy_pt)
+        QTest.mouseClick(window, Qt.MouseButton.LeftButton, Qt.KeyboardModifier.NoModifier, copy_pt)
 
         deadline = time.monotonic() + 3
         while int(window.property("copiedCount")) < 1 and time.monotonic() < deadline:
@@ -424,7 +424,7 @@ ApplicationWindow {{
         deadline = time.monotonic() + 3
         while not window.property("mediaSelectionCleared") and time.monotonic() < deadline:
             QTest.qWait(20)
-        QTest.mouseClick(window, Qt.RightButton, Qt.NoModifier, diagram_pt)
+        QTest.mouseClick(window, Qt.MouseButton.RightButton, Qt.KeyboardModifier.NoModifier, diagram_pt)
         deadline = time.monotonic() + 3
         while int(window.property("mediaMenuCalls")) < 1 and time.monotonic() < deadline:
             QMetaObject.invokeMethod(window, "syncMediaCounts")

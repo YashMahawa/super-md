@@ -1,9 +1,15 @@
 // @vitest-environment jsdom
-import {expect,it} from "vitest";
+import {afterEach,expect,it} from "vitest";
 import {renderToStaticMarkup} from "react-dom/server";
 import MarkdownPreview from "./components/MarkdownPreview";
 import {extractSelectedText,hasSelectedText,selectedMarkdown,setSelectedMarkdownDrag} from "./copySource";
 import {readingMatches} from "./components/ReadingSearch";
+afterEach(()=>{
+  window.getSelection()?.removeAllRanges();
+  Reflect.deleteProperty(document,"caretPositionFromPoint");
+  Reflect.deleteProperty(document,"caretRangeFromPoint");
+  document.body.replaceChildren();
+});
 it('retains ordered-list start values, item overrides and partial-list selection',()=>{
   const host=document.createElement('article');host.className='markdown-body';host.innerHTML='<ol start="4"><li>Fourth</li><li value="9">Ninth</li><li>Tenth</li></ol>';document.body.append(host);
   const range=document.createRange(),selection=window.getSelection()!;range.selectNodeContents(host);selection.removeAllRanges();selection.addRange(range);
@@ -35,7 +41,20 @@ it("puts the selected Markdown source on a rendered text drag without cancelling
   expect(payload.get("text/plain")).toBe("Alpha **bold** and [a link](https://example.test) with $x^2$.");
   expect(payload.has('text/html')).toBe(false);expect(payload.has('text/uri-list')).toBe(false);
   expect(drag.defaultPrevented).toBe(false);
-  selection.removeAllRanges();Reflect.deleteProperty(document,"caretPositionFromPoint");host.remove();
+});
+it("falls back to legacy caretRangeFromPoint when caretPositionFromPoint is unavailable",()=>{
+  const host=document.createElement("article");host.className="markdown-body";host.innerHTML='<p>Alpha <strong>bold</strong> and <a href="https://example.test">a link</a>.</p>';document.body.append(host);
+  const para=host.querySelector("p")!,range=document.createRange(),selection=window.getSelection()!;
+  range.selectNodeContents(para);selection.removeAllRanges();selection.addRange(range);
+  const payload=new Map<string,string>([["text/html","<strong>rendered</strong>"]]),transfer={setData:(type:string,value:string)=>payload.set(type,value),clearData:(type:string)=>payload.delete(type)} as unknown as DataTransfer;
+  const drag=new Event("dragstart",{bubbles:true,cancelable:true});Object.defineProperty(drag,"dataTransfer",{value:transfer});Object.defineProperty(drag,"target",{value:para});
+  Object.defineProperty(drag,"clientX",{value:12});Object.defineProperty(drag,"clientY",{value:16});
+  const pointRange=document.createRange();pointRange.setStart(para.firstChild!,3);pointRange.collapse(true);
+  Reflect.deleteProperty(document,"caretPositionFromPoint");
+  Object.defineProperty(document,"caretRangeFromPoint",{configurable:true,value:()=>pointRange});
+  expect(setSelectedMarkdownDrag(drag as DragEvent)).toBe(true);
+  expect(payload.get("text/plain")).toBe("Alpha **bold** and [a link](https://example.test).");
+  expect(payload.has("text/html")).toBe(false);
 });
 it("leaves collapsed link drags and editable text drags alone",()=>{
   const host=document.createElement("article");host.className="markdown-body";host.innerHTML='<p><a href="https://example.test">link</a></p><textarea>source text</textarea>';document.body.append(host);
