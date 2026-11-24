@@ -64,6 +64,69 @@ it("keeps answer disclosure interactive and Python source in one box", async () 
   expect(host.querySelector("textarea")).toBeNull();
   act(() => root.unmount()); host.remove();
 });
+it("isolates YAML frontmatter when double-clicking, navigating with ArrowUp, or inserting with Cmd+Enter", async () => {
+  const host = document.createElement("div"); document.body.append(host); const root = createRoot(host);
+  let current = "\uFEFF---  \ntitle: Protected Metadata\nauthor: Paul Dirac\ntags: [quantum]\n...\n\n# Opening Heading\n\nBody paragraph.";
+  const renderDoc = () => root.render(<LiveEditor markdown={current} documentPath={null} dark python="" onChange={(next: string) => { current = next; renderDoc(); }} />);
+  await act(async () => renderDoc());
+  expect(host.querySelector('[data-frontmatter-properties="true"]')?.textContent).toContain("Protected Metadata");
+  act(() => host.querySelector("h1")!.dispatchEvent(new MouseEvent("dblclick", { bubbles: true })));
+  const area = host.querySelector("textarea")!;
+  expect(area).not.toBeNull();
+  expect(area.value).toBe("# Opening Heading");
+  expect(area.value).not.toContain("Protected Metadata");
+  expect(area.value).not.toContain("---");
+
+  const setter = Object.getOwnPropertyDescriptor(HTMLTextAreaElement.prototype, "value")!.set!;
+  act(() => {
+    setter.call(area, "# Updated Heading");
+    area.dispatchEvent(new Event("input", { bubbles: true }));
+  });
+  expect(current).toBe("\uFEFF---  \ntitle: Protected Metadata\nauthor: Paul Dirac\ntags: [quantum]\n...\n\n# Updated Heading\n\nBody paragraph.");
+
+  // ArrowDown to second block, then ArrowUp back to first block must still exclude YAML frontmatter.
+  area.setSelectionRange(area.value.length, area.value.length);
+  act(() => { area.dispatchEvent(new KeyboardEvent("keydown", { key: "ArrowDown", bubbles: true, cancelable: true })); });
+  const secondArea = host.querySelector("textarea")!;
+  expect(secondArea.value).toBe("Body paragraph.");
+  secondArea.setSelectionRange(0, 0);
+  act(() => { secondArea.dispatchEvent(new KeyboardEvent("keydown", { key: "ArrowUp", bubbles: true, cancelable: true })); });
+  const firstAgain = host.querySelector("textarea")!;
+  expect(firstAgain.value).toBe("# Updated Heading");
+  expect(firstAgain.value).not.toContain("Protected Metadata");
+
+  // Ctrl+Enter below first block inserts cleanly without touching frontmatter.
+  act(() => { firstAgain.dispatchEvent(new KeyboardEvent("keydown", { key: "Enter", ctrlKey: true, bubbles: true, cancelable: true })); });
+  const inserted = host.querySelector("textarea")!;
+  expect(inserted.value).toBe("");
+  act(() => {
+    setter.call(inserted, "Inserted after heading");
+    inserted.dispatchEvent(new Event("input", { bubbles: true }));
+  });
+  expect(current).toBe("\uFEFF---  \ntitle: Protected Metadata\nauthor: Paul Dirac\ntags: [quantum]\n...\n\n# Updated Heading\n\nInserted after heading\n\nBody paragraph.");
+
+  act(() => root.unmount()); host.remove();
+});
+it("renders properties and an editable empty body block for frontmatter-only notes", async () => {
+  const host = document.createElement("div"); document.body.append(host); const root = createRoot(host);
+  const edit = vi.fn();
+  const note = "---\ntitle: Frontmatter Only\n---";
+  await act(async () => root.render(<LiveEditor markdown={note} documentPath={null} dark python="" onChange={edit} />));
+  expect(host.querySelector('[data-frontmatter-properties="true"]')?.textContent).toContain("Frontmatter Only");
+  const block = host.querySelector('[aria-label="Editable block 1"]')!;
+  expect(block).not.toBeNull();
+  act(() => block.dispatchEvent(new MouseEvent("dblclick", { bubbles: true })));
+  const area = host.querySelector("textarea")!;
+  expect(area.value).toBe("");
+  const setter = Object.getOwnPropertyDescriptor(HTMLTextAreaElement.prototype, "value")!.set!;
+  act(() => {
+    setter.call(area, "# First Body Line");
+    area.dispatchEvent(new Event("input", { bubbles: true }));
+  });
+  expect(edit).toHaveBeenCalledWith("---\ntitle: Frontmatter Only\n---\n# First Body Line");
+  act(() => root.unmount()); host.remove();
+});
+
 it("preserves the latest blurred textarea selection for supermd-insertion-point and clears it on external edits", async () => {
   const host = document.createElement("div"); document.body.append(host); const root = createRoot(host);
   let doc = "# Heading\n\nMiddle block\n\nLast block";

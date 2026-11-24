@@ -236,4 +236,55 @@ describe("local image preview", () => {
     await act(async () => checkbox.click());
     expect(emitted).toBe(checked);
   });
+
+  it("renders zero raw YAML lines across BOM, empty blocks, trailing spaces, dot closers, and EOF closers", async () => {
+    const host = document.createElement("div"); document.body.append(host); root = createRoot(host);
+    const variations = [
+      "\uFEFF---\ntitle: BOM Note\nauthor: Ada Lovelace\ndate: 2026-03-15\ntags: [math, engines]\n---\n\n# Analytical Engine",
+      "---   \ntitle: Dot Closer\ndescription: Clean metadata\n...  \n\nBody paragraph.",
+      "---\n---\n\nBody after empty dashes.",
+      "---\n...\n\nBody after empty dots.",
+      "---\ntitle: Metadata Only\ntags:\n  - solo\n---",
+    ];
+    for (const sample of variations) {
+      await act(async () => root?.render(<MarkdownPreview markdown={sample} documentPath={null} python="" dark />));
+      expect(host.querySelectorAll("hr")).toHaveLength(0);
+      expect(host.textContent).not.toContain("---");
+      expect(host.textContent).not.toContain("title:");
+      expect(host.textContent).not.toContain("tags:");
+    }
+  });
+
+  it("renders a read-only properties header only when recognized metadata exists and falls back safely on malformed YAML", async () => {
+    const host = document.createElement("div"); document.body.append(host); root = createRoot(host);
+    const rich = "\uFEFF---\ntitle: Electrodynamics\nauthor:\n  - name: James Clerk Maxwell\ndate: 2026-04-01\ndescription: Field equations\ntags: [physics, fields]\naliases: [EM Notes]\n...\n\n# Gauss's Law";
+    await act(async () => root?.render(<MarkdownPreview markdown={rich} documentPath={null} python="" dark />));
+    const header = host.querySelector('[data-frontmatter-properties="true"]');
+    expect(header).not.toBeNull();
+    expect(header?.textContent).toContain("Electrodynamics");
+    expect(header?.textContent).toContain("James Clerk Maxwell");
+    expect(header?.textContent).toContain("2026-04-01");
+    expect(header?.textContent).toContain("Field equations");
+    expect(header?.textContent).toContain("physics");
+    expect(header?.textContent).toContain("EM Notes");
+
+    await act(async () => root?.render(<MarkdownPreview markdown={"---\ncssclasses: [wide]\n---\n\n# Plain"} documentPath={null} python="" dark />));
+    expect(host.querySelector('[data-frontmatter-properties="true"]')).toBeNull();
+    expect(host.querySelector("h1")?.textContent).toBe("Plain");
+
+    await act(async () => root?.render(<MarkdownPreview markdown={"---\ntitle: \"Unclosed quote\n---\n\n# Fallback"} documentPath={null} python="" dark />));
+    expect(host.querySelector('[data-frontmatter-properties="true"]')).toBeNull();
+    expect(host.querySelector("h1")?.textContent).toBe("Fallback");
+  });
+
+  it("preserves exact task checkbox source offsets across BOM, dot closer, and CRLF frontmatter", async () => {
+    const host = document.createElement("div"); document.body.append(host); root = createRoot(host);
+    const markdown = "\uFEFF---  \r\ntitle: \"Checklist\"\r\ntags: [ops]\r\n...\r\n\r\n- [ ] Verify BOM + dot closer\r\n- [x] Done\r\n";
+    const change = vi.fn();
+    await act(async () => root?.render(<MarkdownPreview markdown={markdown} onChange={change} documentPath={null} python="" dark />));
+    const boxes = host.querySelectorAll<HTMLInputElement>("input[type=checkbox]");
+    expect(boxes).toHaveLength(2);
+    await act(async () => boxes[0].click());
+    expect(change).toHaveBeenCalledWith(markdown.replace("- [ ] Verify", "- [x] Verify"));
+  });
 });

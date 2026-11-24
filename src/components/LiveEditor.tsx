@@ -14,7 +14,7 @@ import {liveEditorCenterDelta,useTypewriterScroll} from '../typewriterScroll';
 const noTrustedHosts:string[]=[];
 const CARET_KEYS=new Set(['ArrowUp','ArrowDown','PageUp','PageDown','Home','End']);
 export type {SourceBlock} from '../documentAnalysis';
-export function splitMarkdownBlocks(markdown:string):SourceBlock[]{return analyzeDocument(markdown).blocks;}
+export function splitMarkdownBlocks(markdown:string):SourceBlock[]{return analyzeDocument(markdown).bodyBlocks;}
 
 interface Props extends WritingOptions,ReaderAccessibilityPreference {
   latexAutofix?:boolean;
@@ -95,6 +95,7 @@ interface LiveEditorState {
   draftText:string;
   renderedSource:string;
   sourceAnalysis:SourceDocumentAnalysis;
+  frontmatter:SourceDocumentAnalysis['analysis']['frontmatter'];
 }
 
 /** One document render preserves references, footnote numbering, duplicate
@@ -114,9 +115,11 @@ export default function LiveEditor({markdown,onChange,documentPath,python,dark,t
 
   const renderedSource=editing?editing.baseMarkdown:markdown;
   const sourceAnalysis=useMemo(()=>({source:renderedSource,analysis:analyzeDocument(renderedSource)}),[renderedSource]);
-  const blocks=sourceAnalysis.analysis.blocks;
-  const latestRef=useRef<LiveEditorState>({markdown,onChange,latexAutofix,activeTypewriter,editing,draftText,renderedSource,sourceAnalysis});
-  latestRef.current={markdown,onChange,latexAutofix,activeTypewriter,editing,draftText,renderedSource,sourceAnalysis};
+  const blocks=sourceAnalysis.analysis.bodyBlocks;
+  const frontmatter=sourceAnalysis.analysis.frontmatter;
+  const hasBodyNodes=sourceAnalysis.analysis.tree.children.some(node=>node.position?.start.offset!==undefined);
+  const latestRef=useRef<LiveEditorState>({markdown,onChange,latexAutofix,activeTypewriter,editing,draftText,renderedSource,sourceAnalysis,frontmatter});
+  latestRef.current={markdown,onChange,latexAutofix,activeTypewriter,editing,draftText,renderedSource,sourceAnalysis,frontmatter};
 
   const rememberSelection=useCallback((area:HTMLTextAreaElement|null,current:EditingSession|null=latestRef.current.editing)=>{
     if(!area||!current)return;
@@ -169,10 +172,16 @@ export default function LiveEditor({markdown,onChange,documentPath,python,dark,t
   },[]);
 
   const appendTrailingBlock=useCallback(()=>{
-    const {editing:active,markdown:latestMarkdown}=latestRef.current;
+    const {editing:active,markdown:latestMarkdown,sourceAnalysis:latestAnalysis}=latestRef.current;
     if(active?.insertAfter==='end'){editor.current?.focus({preventScroll:true});return;}
     const baseDoc=active?syncedMarkdownRef.current:latestMarkdown;
-    if(!baseDoc.trim()){openDocBlock(rootRef.current?.querySelector<HTMLElement>('.live-block')??null,0,baseDoc.length,baseDoc,{start:0,end:0});return;}
+    const analysis=baseDoc===latestAnalysis.source?latestAnalysis.analysis:analyzeDocument(baseDoc);
+    const bodyHasNodes=analysis.tree.children.some(node=>node.position?.start.offset!==undefined);
+    if(!baseDoc.trim()||!bodyHasNodes){
+      const start=analysis.bodyBlocks[0]?.start??0;
+      openDocBlock(rootRef.current?.querySelector<HTMLElement>('.live-block')??null,start,baseDoc.length,baseDoc,{start:0,end:0});
+      return;
+    }
     const insertPos=baseDoc.replace(/[ \t]*\n+$/,'').length;
     openInsertedBlock(baseDoc,insertPos,'end');
   },[openDocBlock,openInsertedBlock]);
@@ -335,7 +344,7 @@ export default function LiveEditor({markdown,onChange,documentPath,python,dark,t
     };
     const onContainerDoubleClick=(event:MouseEvent)=>{
       const target=event.target instanceof Element?event.target:null;
-      if(!target||target.closest('.live-block,.live-active-block,a,button,input,select,textarea,.reading-search,.image-viewer'))return;
+      if(!target||target.closest('.live-block,.live-active-block,a,button,input,select,textarea,.reading-search,.image-viewer,[data-frontmatter-properties],.document-properties'))return;
       const doc=latestRef.current.editing?syncedMarkdownRef.current:latestRef.current.markdown;
       if(!doc.trim())return;
       const allBlocks=root.querySelectorAll<HTMLElement>('.live-block');
@@ -382,7 +391,7 @@ export default function LiveEditor({markdown,onChange,documentPath,python,dark,t
   },[]);
 
   const update=useCallback((text:string,selectionStart?:number,selectionEnd?:number)=>{
-    const {editing:active,onChange:emitChange}=latestRef.current;
+    const {editing:active,onChange:emitChange,frontmatter:currentFrontmatter}=latestRef.current;
     if(!active)return;
     latestRef.current.draftText=text;
     setDraftText(text);
@@ -395,16 +404,24 @@ export default function LiveEditor({markdown,onChange,documentPath,python,dark,t
       syncActiveCaretCenter();
       return;
     }
-    const nextMarkdown=active.prefix+text+active.suffix,base=active.prefix.length;
+    const needsNewline=Boolean(currentFrontmatter)&&active.prefix.length===currentFrontmatter!.end&&active.prefix.length>0&&!active.prefix.endsWith('\n')&&text.length>0;
+    const prefix=needsNewline?active.prefix+'\n':active.prefix;
+    const nextMarkdown=prefix+text+active.suffix,base=prefix.length;
     if(selectionStart!==undefined&&selectionEnd!==undefined){
       const from=Math.max(0,Math.min(base+selectionStart,nextMarkdown.length));
       const to=Math.max(from,Math.min(base+selectionEnd,nextMarkdown.length));
       savedSelection.current={from,to,markdown:nextMarkdown};
     }else if(savedSelection.current){
+      const delta=prefix.length-active.prefix.length;
       const max=base+text.length;
-      const from=Math.max(base,Math.min(savedSelection.current.from,max));
-      const to=Math.max(from,Math.min(savedSelection.current.to,max));
+      const from=Math.max(base,Math.min(savedSelection.current.from+delta,max));
+      const to=Math.max(from,Math.min(savedSelection.current.to+delta,max));
       savedSelection.current={from,to,markdown:nextMarkdown};
+    }
+    if(prefix!==active.prefix){
+      const nextSession={...active,prefix};
+      latestRef.current.editing=nextSession;
+      setEditing(nextSession);
     }
     syncedMarkdownRef.current=nextMarkdown;
     emitChange(nextMarkdown);
@@ -587,9 +604,9 @@ export default function LiveEditor({markdown,onChange,documentPath,python,dark,t
 
   return <ActiveDraftContext.Provider value={activeDraftValue}>
     <div ref={rootRef} className="live-document" onCopy={copy} onDragStart={dragStart}>
-      {!renderedSource.trim()?(editing?<ActiveBlockEditor/>:<section className="live-block" data-source-start={0} data-source-end={markdown.length} tabIndex={0} role="group" aria-label="Editable block 1" onDoubleClick={event=>openDocBlock(event.currentTarget,0,latestRef.current.markdown.length,latestRef.current.markdown)} onKeyDown={event=>{if(event.key==='Enter'||event.key==='F2'){event.preventDefault();openDocBlock(event.currentTarget,0,latestRef.current.markdown.length,latestRef.current.markdown);}}}/> ):<>
+      {!frontmatter&&!renderedSource.trim()?(editing?<ActiveBlockEditor/>:<section className="live-block" data-source-start={0} data-source-end={markdown.length} tabIndex={0} role="group" aria-label="Editable block 1" onDoubleClick={event=>openDocBlock(event.currentTarget,0,latestRef.current.markdown.length,latestRef.current.markdown)} onKeyDown={event=>{if(event.key==='Enter'||event.key==='F2'){event.preventDefault();openDocBlock(event.currentTarget,0,latestRef.current.markdown.length,latestRef.current.markdown);}}}/> ):<>
         <MarkdownPreview markdown={renderedSource} onChange={previewChange} documentPath={documentPath} python={python} dark={dark} trustedImageHosts={trustedImageHosts} onTrustImageHost={onTrustImageHost} renderBlock={renderBlock} fullDocumentAccessibility={fullDocumentAccessibility} sourceAnalysis={sourceAnalysis}/>
-        {editing?.insertAfter==='end'&&<section className="live-block" role="group" aria-label="New Markdown block"><ActiveBlockEditor/></section>}
+        {!hasBodyNodes?(editing?<ActiveBlockEditor/>:<section className="live-block" data-source-start={blocks[0].start} data-source-end={markdown.length} tabIndex={0} role="group" aria-label="Editable block 1" onDoubleClick={event=>openDocBlock(event.currentTarget,blocks[0].start,latestRef.current.markdown.length,latestRef.current.markdown)} onKeyDown={event=>{if(event.key==='Enter'||event.key==='F2'){event.preventDefault();openDocBlock(event.currentTarget,blocks[0].start,latestRef.current.markdown.length,latestRef.current.markdown);}}}/> ):editing?.insertAfter==='end'&&<section className="live-block" role="group" aria-label="New Markdown block"><ActiveBlockEditor/></section>}
       </>}
     </div>
   </ActiveDraftContext.Provider>;

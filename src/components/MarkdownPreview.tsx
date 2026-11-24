@@ -15,6 +15,7 @@ import { navigateHeading, remarkHeadingIds } from "../documentNavigation";
 import { selectedMarkdown, setSelectedMarkdownDrag } from "../copySource";
 import CopyCode from "./CopyCode";
 import CodeBlockBoundary from "./CodeBlockBoundary";
+import DocumentProperties from "./DocumentProperties";
 import {DocumentAppearance} from '../documentAppearance';
 import {svgDataBackdrop} from '../svgImage';
 import {adaptSvgData} from '../svgTheme';
@@ -280,8 +281,12 @@ const MarkdownPre: Components['pre'] = ({ node, children }) => {
   const child = Children.only(children) as React.ReactElement<{ className?: string; children?: ReactNode }>;
   const language = child.props.className?.match(/language-([\w-]+)/)?.[1];
   const source = textOf(child.props.children).replace(/\n$/, "");
-  const nodeData = node as { position?: { start?: { offset?: number } }; properties?: Record<string, unknown> } | undefined;
+  const nodeData = node as { position?: { start?: { offset?: number }; end?: { offset?: number } }; properties?: Record<string, unknown> } | undefined;
   const offset = Number(nodeData?.properties?.['data-source-start'] ?? nodeData?.position?.start?.offset);
+  const endOffset = Number(nodeData?.properties?.['data-source-end'] ?? nodeData?.position?.end?.offset);
+  const hasRange = Number.isInteger(offset) && Number.isInteger(endOffset) && offset >= 0 && endOffset > offset;
+  const srcStart = hasRange ? offset : undefined;
+  const srcEnd = hasRange ? endOffset : undefined;
   const pythonCell = ['python', 'py'].includes(language || '')
     ? liveStateRef.current.pythonCells.find(cell => cell.source === source && cell.offset === offset)
     : undefined;
@@ -294,6 +299,8 @@ const MarkdownPre: Components['pre'] = ({ node, children }) => {
   if (language === "smd-steps") return protectedBlock(
     <StepCards
       source={source}
+      sourceStart={srcStart}
+      sourceEnd={srcEnd}
       renderImage={(src, alt) => <AssetImage src={src} alt={alt} documentPath={documentPath} trustedImageHosts={trustedImageHosts} onTrustImageHost={onTrustImageHost} />}
       renderChart={chartSource => <ThemedChart source={chartSource} dark={dark} />}
       renderMarkdown={text => <MemoizedMarkdownPreview markdown={text} documentPath={documentPath} python={python} dark={dark} trustedImageHosts={trustedImageHosts} onTrustImageHost={onTrustImageHost} />}
@@ -302,8 +309,8 @@ const MarkdownPre: Components['pre'] = ({ node, children }) => {
   if (language === "smd-chart") return protectedBlock(<ThemedChart source={source} dark={dark} />);
   if (language === "svg") return protectedBlock(<ThemedSvg source={source} dark={dark} />);
   if (language === "mermaid") return protectedBlock(<Suspense fallback={<span className="image-loading" role="status">Loading diagram…</span>}><ThemedMermaid source={source} dark={dark} /></Suspense>);
-  if (language === "python" || language === "py") return protectedBlock(<PythonCell source={source} python={python} context={context} highlighted={child.props.children} />);
-  return <div className="code-container"><CopyCode source={source} /><details className="code-disclosure" open={source.split("\n").length <= 12}><summary>{language || "Code"} <span>{source.split("\n").length} lines</span></summary><pre>{children}</pre></details></div>;
+  if (language === "python" || language === "py") return protectedBlock(<PythonCell source={source} python={python} context={context} sourceStart={srcStart} sourceEnd={srcEnd} highlighted={child.props.children} />);
+  return <div className="code-container" data-source-start={srcStart} data-source-end={srcEnd}><CopyCode source={source} /><details className="code-disclosure" open={source.split("\n").length <= 12}><summary>{language || "Code"} <span>{source.split("\n").length} lines</span></summary><pre>{children}</pre></details></div>;
 };
 
 const MARKDOWN_COMPONENTS: Components = {
@@ -333,6 +340,7 @@ function MarkdownPreview({ markdown, documentPath, python, dark, trustedImageHos
   return (
     <MarkdownPreviewContext.Provider value={previewContext}>
       <article className="markdown-body" onCopy={event=>{if(event.currentTarget.closest('.live-document'))return;const source=selectedMarkdown(window.getSelection(),markdown);if(source!==null){event.clipboardData.setData("text/plain",source);event.preventDefault();}}} onDragStart={event=>{if(!event.currentTarget.closest('.live-document'))setSelectedMarkdownDrag(event.nativeEvent,markdown);}}>
+        {analysis.frontmatter?.properties && <DocumentProperties properties={analysis.frontmatter.properties} />}
         <CachedMarkdown
           sourceAnalysis={resolvedSourceAnalysis}
           renderBlock={renderBlock}

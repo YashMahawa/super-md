@@ -50,6 +50,8 @@ vi.mock("./components/Editor", () => ({
     return <div className="mock-editor" />;
   },
   editorReadingOffset: () => 0,
+  editorSelectedText: () => null,
+  editorViewContext: () => undefined,
   editorHistory: () => false,
   exportEditorSession: () => undefined,
   importEditorSession: () => {},
