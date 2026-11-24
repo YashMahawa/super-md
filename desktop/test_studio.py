@@ -1058,3 +1058,25 @@ class StudioTest(unittest.TestCase):
         studio.post("flush","document_flushed",json.dumps({"id":studio.active,"content":"Stale draft","operation":previous}))
         self.assertNotEqual(studio._current()["content"],"Stale draft")
         self.assertEqual(studio.flush_operation["action"],"save")
+
+    def test_isolated_windows_skip_startup_python_discovery_while_desktop_windows_schedule_it(self):
+        with patch("studio.python_runtime.preferred", return_value="/mock/python3") as preferred:
+            isolated_window = self.window()
+            self.app.processEvents()
+            preferred.assert_not_called()
+            self.assertEqual(isolated_window.settings.get("python", ""), "")
+
+            desktop_session = Session(True)
+            try:
+                with patch.object(QuietStudio, "_restore_update"):
+                    desktop_window = QuietStudio(False, desktop_session)
+                    try:
+                        self.app.processEvents()
+                        self._wait_for(lambda: desktop_session.settings.get("python") == "/mock/python3")
+                        preferred.assert_called_once_with(desktop_session.data / "python-env")
+                    finally:
+                        desktop_window.stop()
+                        desktop_window.pool.shutdown(wait=True, cancel_futures=True)
+            finally:
+                desktop_session.writes.shutdown(wait=True)
+
