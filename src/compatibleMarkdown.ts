@@ -11,6 +11,7 @@ import {parseBinaryTreeSource} from './components/BinaryTree';
 import {stepDiagramSvg} from './stepPdf';
 import {svgImage} from './svgImage';
 import {normalizeCalloutBlocks} from './markdownSource';
+import {maskFrontmatter,parseFrontmatter} from './frontmatter';
 import {looksLikeSvg,remarkSvgBlocks} from './svgBlocks';
 import {pythonOutput} from './renderedOutputs';
 const svgUri=(source:string)=>'data:image/svg+xml;base64,'+btoa(Array.from(new TextEncoder().encode(svgImage(source)),v=>String.fromCharCode(v)).join(''));
@@ -20,9 +21,10 @@ const codeFence=(text:string)=>'`'.repeat(Math.max(3,...Array.from(text.matchAll
 export async function compatibleMarkdown(markdown:string,documentPath:string|null,python='embedded',depth=0):Promise<string>{
  if(depth>5)throw Error('Nested step content is too deep to export.');
  markdown=normalizeCalloutBlocks(markdown).value;
- const frontmatterEnd=markdown.match(/^---\r?\n[\s\S]*?\r?\n---(?:\r?\n|$)/)?.[0].length??0;
+ const frontmatterEnd=parseFrontmatter(markdown)?.end??0;
+ const masked=maskFrontmatter(markdown);
  const processor=unified().use(remarkParse).use(remarkGfm).use(remarkMath).use(remarkObsidianMath);
- const tree=remarkSvgBlocks()(processor.parse(markdown),{value:markdown});
+ const tree=remarkSvgBlocks()(processor.parse(masked),{value:masked});
  const blocks:any[]=[];
  visit(tree,(node:any)=>{if(node.position&&node.position.start.offset>=frontmatterEnd&&(node.type==='code'||node.type==='html'&&looksLikeSvg(node.value)))blocks.push(node);});
  const pythonOrdinals=new Map<string,number>();
