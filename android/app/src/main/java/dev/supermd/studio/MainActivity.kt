@@ -1250,12 +1250,15 @@ private object NoMotionScheme : MotionScheme {
                                 when(event.action) {
                                     android.view.DragEvent.ACTION_DRAG_STARTED -> event.clipDescription?.let { it.hasMimeType("image/*") || it.hasMimeType("application/octet-stream") || it.hasMimeType("text/uri-list") } == true
                                     android.view.DragEvent.ACTION_DROP -> {
+                                        if (model.state.value.readerOverlay || model.state.value.busy) return@setOnDragListener true
                                         val permissions = activity.requestDragAndDropPermissions(event)
                                         val clip = event.clipData
                                         val uris = (0 until (clip?.itemCount ?: 0)).mapNotNull { clip!!.getItemAt(it).uri }
                                         if (uris.isNotEmpty()) {
                                             val id = model.state.value.active.id
-                                            evaluateJavascript("window.supermdCaptureInsertion?.()", null)
+                                            val x = event.x / density.density
+                                            val y = event.y / density.density
+                                            evaluateJavascript("window.supermdCaptureInsertion?.($x,$y)", null)
                                             model.importDropped(uris, id) { images -> permissions?.release(); images?.let { evaluateJavascript("window.supermdInsertImages?.($it)", null) } }
                                         } else permissions?.release()
                                         true

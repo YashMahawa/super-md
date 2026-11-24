@@ -305,13 +305,56 @@ class MediaStorage(private val context: Context) {
         return null
     }
 
+    internal fun localTarget(
+        source: String,
+        directory: String?,
+        noteUri: String? = null,
+        noteRelative: String? = null,
+    ): ReaderAssetTarget.LocalFile? {
+        if (!validKey(source)) return null
+        val name = source.substringAfter('/')
+        if (directory != null && Regex("[a-f0-9-]{36}").matches(directory)) {
+            val candidate = File(bundles, "$directory/$name")
+            val resolved = containedFile(bundles, candidate)
+            if (resolved != null) {
+                return ReaderAssetTarget.LocalFile(bundles, resolved, noteUri, noteRelative, directory)
+            }
+            require(!java.nio.file.Files.exists(candidate.toPath(), java.nio.file.LinkOption.NOFOLLOW_LINKS)) {
+                "Image escapes app storage"
+            }
+        }
+        if (source.startsWith("assets/import-")) {
+            val candidate = File(attachments, name)
+            val resolved = containedFile(attachments, candidate)
+            if (resolved != null) {
+                return ReaderAssetTarget.LocalFile(attachments, resolved, noteUri, noteRelative, directory)
+            }
+            require(!java.nio.file.Files.exists(candidate.toPath(), java.nio.file.LinkOption.NOFOLLOW_LINKS)) {
+                "Image escapes app storage"
+            }
+        }
+        return null
+    }
+
     internal fun readerAsset(file: File): ReaderAssetSource {
         val canonical = file.canonicalFile
         require(canonical.isFile) { "Image not found" }
-        require(canonical.length() <= BoundedAssetInputStream.MAX_READER_ASSET_BYTES) { "Image exceeds 25 MB" }
+        val size = canonical.length()
+        require(size <= BoundedAssetInputStream.MAX_READER_ASSET_BYTES) { "Image exceeds 25 MB" }
         val mime = imageMime(canonical.name, null)
         val open = { canonical.inputStream() }
-        return ReaderAssetSource(mime, readerAssetFingerprint(canonical.path, canonical.length(), canonical.lastModified(), open), canonical.length(), open)
+        return ReaderAssetSource(mime, readerAssetFingerprint(canonical.path, size, canonical.lastModified(), open), size, open)
+    }
+
+    internal fun readerAsset(target: ReaderAssetTarget.LocalFile): ReaderAssetSource {
+        val canonical = containedFile(target.root, target.file) ?: error("Image not found")
+        require(canonical.path == target.file.path && canonical.isFile) { "Image not found" }
+        val size = canonical.length()
+        require(size <= BoundedAssetInputStream.MAX_READER_ASSET_BYTES) { "Image exceeds 25 MB" }
+        val mime = imageMime(canonical.name, null)
+        val open = { canonical.inputStream() }
+        val fingerprint = readerAssetFingerprint(canonical.path, size, canonical.lastModified(), open)
+        return ReaderAssetSource(mime, fingerprint, size, open, target)
     }
 
     internal fun imageMime(name: String, providerMime: String?): String {
