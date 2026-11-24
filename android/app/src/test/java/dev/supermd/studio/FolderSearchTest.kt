@@ -12,10 +12,13 @@ import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.test.assertHeightIsAtLeast
 import androidx.compose.ui.test.assertIsDisplayed
+import androidx.compose.ui.test.hasAnyAncestor
 import androidx.compose.ui.test.hasClickAction
 import androidx.compose.ui.test.hasText
+import androidx.compose.ui.test.isPopup
 import androidx.compose.ui.test.junit4.v2.createComposeRule
 import androidx.compose.ui.test.onNodeWithContentDescription
 import androidx.compose.ui.test.onNodeWithText
@@ -49,6 +52,76 @@ class FolderSearchTest {
     @get:Rule val composeRule = createComposeRule()
 
     @Test
+    fun unicodeCaseNormalizationAndSurrogateUtf16OffsetsHighlightExactSourceSpans() = runBlocking {
+        val app = RuntimeEnvironment.getApplication()
+        val media = MediaStorage(app)
+
+        val folded = foldWithOffsets("İstanbul: note")
+        assertEquals("i\u0307stanbul: note", folded.text)
+        assertEquals(0, folded.starts[0])
+        assertEquals(0, folded.starts[1])
+        assertEquals(1, folded.ends[1])
+
+        val longPrefix = "İstanbul 📓 ".repeat(8)
+        val content = listOf(
+            "İstanbul: note",
+            "📓 note",
+            "İstanbul 📓: NOTE",
+            "Straße: note",
+            "${longPrefix}target NOTE after unicode prefix " + "x".repeat(90),
+        ).joinToString("\n")
+
+        val openTab = Note(
+            id = "tab-unicode",
+            name = "unicode.md",
+            content = content,
+            saved = content,
+        )
+        val result = streamTextSearch(
+            query = "note",
+            tabs = listOf(openTab),
+            recents = emptyList(),
+            folderRoot = null,
+            media = media,
+            openUriStream = { null },
+            caseSensitive = false,
+        )
+        assertEquals(listOf(1, 2, 3, 4, 5), result.matches.map { it.line })
+
+        val (istanbul, emoji, both, strasse, longMatch) = result.matches
+        assertEquals("İstanbul: note", istanbul.snippet)
+        assertEquals(10, istanbul.matchStart)
+        assertEquals(14, istanbul.matchEnd)
+        assertEquals("note", istanbul.snippet.substring(istanbul.matchStart, istanbul.matchEnd))
+
+        assertEquals("📓 note", emoji.snippet)
+        assertEquals(3, emoji.matchStart)
+        assertEquals(7, emoji.matchEnd)
+        assertEquals("note", emoji.snippet.substring(emoji.matchStart, emoji.matchEnd))
+
+        assertEquals("İstanbul 📓: NOTE", both.snippet)
+        assertEquals(13, both.matchStart)
+        assertEquals(17, both.matchEnd)
+        assertEquals("NOTE", both.snippet.substring(both.matchStart, both.matchEnd))
+
+        assertEquals("Straße: note", strasse.snippet)
+        assertEquals(8, strasse.matchStart)
+        assertEquals(12, strasse.matchEnd)
+        assertEquals("note", strasse.snippet.substring(strasse.matchStart, strasse.matchEnd))
+
+        assertEquals("NOTE", longMatch.snippet.substring(longMatch.matchStart, longMatch.matchEnd))
+        for (m in result.matches) {
+            val annotated = buildHighlightedSnippet(m.snippet, m.matchStart, m.matchEnd, Color.Blue)
+            assertEquals(1, annotated.spanStyles.size)
+            val span = annotated.spanStyles.single()
+            assertEquals(
+                m.snippet.substring(m.matchStart, m.matchEnd).lowercase(),
+                annotated.text.substring(span.start, span.end).lowercase(),
+            )
+        }
+    }
+
+    @Test
     fun portableBundlesDetectedByContentWithoutDecodingOrExtractingImages() = runBlocking {
         val app = RuntimeEnvironment.getApplication()
         val media = MediaStorage(app)
@@ -66,9 +139,7 @@ class FolderSearchTest {
             media.writeFmd(smdOut, "# Experiment\n\nObserved MuonLifetime clearly.\n", validAssets)
 
             val smdFile = File(tempRoot, "experiment.smd").apply { writeBytes(smdOut.toByteArray()) }
-            // Gzipped portable bundle disguised with a .txt extension must still be detected by content.
             File(tempRoot, "disguised-bundle.txt").writeBytes(smdFile.readBytes())
-            // Plain JSON portable envelope whose asset payload would fail Base64/image validation if decoded.
             File(tempRoot, "legacy.fmd").writeText(
                 JSONObject()
                     .put("format", "supermd-fmd")
@@ -174,82 +245,30 @@ class FolderSearchTest {
     }
 
     @Test
-    fun quickSwitcherWorksWithZeroOpenTabsShowsPinnedRecentFirstAndFuzzyRanksInThreeKeys() = runBlocking {
-        val app = RuntimeEnvironment.getApplication()
-        assertEquals("", StudioState(tabs = emptyList()).active.id)
-
-        val tempRoot = Files.createTempDirectory("supermd-android-qs-").toFile()
-        try {
-            val nestedDir = File(tempRoot, "courses/spring").apply { mkdirs() }
-            val pinnedFile = File(tempRoot, "pinned.md").apply { writeText("# Pinned\n") }
-            val recentFile = File(tempRoot, "recent.md").apply { writeText("# Recent\n") }
-            val lectureFile = File(nestedDir, "QuantumMechanicsLecture.smd").apply { writeText("# QML\n") }
-
-            val recents = listOf(
-                RecentNote("recent.md", Uri.fromFile(recentFile).toString(), "recent.md", pinned = false),
-                RecentNote("pinned.md", Uri.fromFile(pinnedFile).toString(), "pinned.md", pinned = true),
-            )
-            val rootNode = resolveSearchRoot(app, Uri.fromFile(tempRoot))
-
-            val emptyQuery = rankQuickSwitcher("", emptyList(), recents, rootNode)
-            assertEquals(listOf("pinned.md", "recent.md", "QuantumMechanicsLecture.smd"), emptyQuery.map { it.name })
-            assertTrue(emptyQuery.first().pinned)
-
-            val fuzzy = rankQuickSwitcher("qml", emptyList(), recents, rootNode)
-            assertTrue(fuzzy.isNotEmpty())
-            assertEquals("QuantumMechanicsLecture.smd", fuzzy.first().name)
-            assertEquals("courses/spring/QuantumMechanicsLecture.smd", fuzzy.first().relative)
-        } finally {
-            tempRoot.deleteRecursively()
-        }
-    }
-
-    @Test
-    fun recursiveDrawerFilterSkipsDotfilesSymlinksEmptyFoldersAndWritesZeroDiskIndex() = runBlocking {
-        val app = RuntimeEnvironment.getApplication()
-        val tempRoot = Files.createTempDirectory("supermd-android-filter-").toFile()
-        val externalDir = Files.createTempDirectory("supermd-android-ext-").toFile()
-        try {
-            File(tempRoot, "empty_a/empty_b").mkdirs()
-            File(tempRoot, "unmatched").apply { mkdirs(); File(this, "other.md").writeText("# Other") }
-            File(tempRoot, ".hidden").apply { mkdirs(); File(this, "relativity-secret.md").writeText("# Hidden") }
-            File(tempRoot, ".relativity-dotfile.md").writeText("# Hidden dotfile")
-            val externalTarget = File(externalDir, "relativity-symlink.md").apply { writeText("# External") }
-            Files.createSymbolicLink(File(tempRoot, "relativity-symlink.md").toPath(), externalTarget.toPath())
-
-            val deepDir = File(tempRoot, "physics/modern").apply { mkdirs() }
-            File(deepDir, "relativity-summary.txt").writeText("Special relativity notes")
-
-            val snapshotBefore = tempRoot.walkTopDown().map { it.relativeTo(tempRoot).path }.sorted().toList()
-            val rootNode = resolveSearchRoot(app, Uri.fromFile(tempRoot))
-            val filtered = filterFolderEntries(rootNode, "relativity")
-            val snapshotAfter = tempRoot.walkTopDown().map { it.relativeTo(tempRoot).path }.sorted().toList()
-
-            assertEquals("Search/filter must write zero cached index files", snapshotBefore, snapshotAfter)
-            assertEquals(1, filtered.size)
-            assertFalse("Filtered results must contain zero directory rows", filtered.any { it.directory })
-            assertEquals("relativity-summary.txt", filtered.single().name)
-            assertEquals("physics/modern/relativity-summary.txt", filtered.single().relative)
-        } finally {
-            tempRoot.deleteRecursively()
-            externalDir.deleteRecursively()
-        }
-    }
-
-    @Test
-    fun parentRelativePathStepsUpOneLevelAlongsideFolderRoot() {
-        assertEquals("courses/spring", parentRelativePath("courses/spring/week1"))
-        assertEquals("courses", parentRelativePath("courses/spring"))
-        assertEquals("", parentRelativePath("courses"))
-        assertEquals("", parentRelativePath(""))
-    }
-
-    @Test
-    fun noFolderFallbackAndImmediateCoroutineCancellation() = runBlocking {
+    fun dotfilesSymlinksSkippedNoFolderFallbackAndImmediateCoroutineCancellation() = runBlocking {
         val app = RuntimeEnvironment.getApplication()
         val media = MediaStorage(app)
         val tempRoot = Files.createTempDirectory("supermd-android-cancel-").toFile()
+        val externalDir = Files.createTempDirectory("supermd-android-ext-").toFile()
         try {
+            File(tempRoot, ".hidden").apply { mkdirs(); File(this, "secret.md").writeText("HiddenSecret") }
+            File(tempRoot, ".dotnote.md").writeText("HiddenSecret")
+            val externalTarget = File(externalDir, "symlink.md").apply { writeText("HiddenSecret") }
+            Files.createSymbolicLink(File(tempRoot, "linked.md").toPath(), externalTarget.toPath())
+
+            val snapshotBefore = tempRoot.walkTopDown().map { it.relativeTo(tempRoot).path }.sorted().toList()
+            val hiddenRes = streamTextSearch(
+                query = "HiddenSecret",
+                tabs = emptyList(),
+                recents = emptyList(),
+                folderRoot = resolveSearchRoot(app, Uri.fromFile(tempRoot)),
+                media = media,
+                openUriStream = { uri -> File(uri.path!!).inputStream() },
+            )
+            val snapshotAfter = tempRoot.walkTopDown().map { it.relativeTo(tempRoot).path }.sorted().toList()
+            assertTrue(hiddenRes.matches.isEmpty())
+            assertEquals("Search must write zero cached index files", snapshotBefore, snapshotAfter)
+
             val recentNote = File(tempRoot, "recent-note.md").apply {
                 writeText("# Recent\n\nNoFolderNeedle inside recent note.\n")
             }
@@ -269,7 +288,6 @@ class FolderSearchTest {
             )
             assertEquals(setOf("Draft.md", "recent-note.md"), noFolderRes.matches.map { it.name }.toSet())
 
-            // Populate 60 files and cancel the coroutine as soon as the first streamed batch arrives.
             for (i in 0 until 60) {
                 File(tempRoot, "batch_%03d.md".format(i)).writeText("Line $i CancelTarget\n")
             }
@@ -301,6 +319,7 @@ class FolderSearchTest {
             assertTrue("Cancellation must stop scan before reading all 60 files (scanned $scannedAtCancel)", scannedAtCancel < 60)
         } finally {
             tempRoot.deleteRecursively()
+            externalDir.deleteRecursively()
         }
     }
 
@@ -311,7 +330,7 @@ class FolderSearchTest {
         val vm = StudioViewModel(app, "search-vm-test")
         try {
             val sub = File(tempRoot, "notes/sub").apply { mkdirs() }
-            val noteFile = File(sub, "target.md").apply {
+            File(sub, "target.md").apply {
                 writeText("# Target\n\nUniqueSeedPhrase appears here.\n")
             }
             vm.setFolder(Uri.fromFile(tempRoot))
@@ -350,19 +369,49 @@ class FolderSearchTest {
     }
 
     @Test
-    fun composeChromeAndDrawerExposeQuickSwitcherFolderSearchFilterAndParentNavigation() {
+    fun composeChromeDrawerAndFolderSearchModalRenderHighlightedMatches() {
         var menuOpen by mutableStateOf(false)
-        var quickSwitcherClicks = 0
+        var modalOpen by mutableStateOf(true)
         var folderSearchClicks = 0
-        var parentClicks = 0
-        var rootClicks = 0
-        var filterText by mutableStateOf("")
-        val filtered = listOf(
-            FileEntry("relativity-summary.md", "content://folder/rel", directory = false, relative = "physics/modern/relativity-summary.md"),
-        )
+        var selectedMatch: FolderSearchMatch? = null
         val state = StudioState(
             folder = "content://folder/root",
             files = listOf(FileEntry("modern", "content://folder/modern", directory = true, relative = "physics/modern")),
+        )
+        val searchState = FolderSearchState(
+            visible = true,
+            query = "note",
+            matches = listOf(
+                FolderSearchMatch(
+                    key = "u1",
+                    tabId = "t1",
+                    uri = null,
+                    name = "unicode.md",
+                    relative = "unicode.md",
+                    line = 1,
+                    column = 11,
+                    snippet = "İstanbul: note",
+                    matchStart = 10,
+                    matchEnd = 14,
+                    dirty = true,
+                    isOpen = true,
+                ),
+                FolderSearchMatch(
+                    key = "u2",
+                    tabId = "t1",
+                    uri = null,
+                    name = "unicode.md",
+                    relative = "unicode.md",
+                    line = 2,
+                    column = 4,
+                    snippet = "📓 note",
+                    matchStart = 3,
+                    matchEnd = 7,
+                    dirty = false,
+                    isOpen = true,
+                ),
+            ),
+            scannedFiles = 1,
         )
 
         composeRule.setContent {
@@ -381,7 +430,6 @@ class FolderSearchTest {
                             menuExpanded = menuOpen,
                             onMenuExpandedChange = { menuOpen = it },
                             onNavigateIcon = {},
-                            onQuickSwitcher = { quickSwitcherClicks++ },
                             onFolderSearch = { folderSearchClicks++ },
                             onFind = {},
                             onSave = {},
@@ -399,16 +447,10 @@ class FolderSearchTest {
                             state = state,
                             recent = emptyList(),
                             folderRelative = "physics/modern",
-                            drawerFilter = filterText,
-                            onDrawerFilterChange = { filterText = it },
-                            filteredFiles = filtered,
-                            drawerFiltering = false,
                             onOpenNote = {},
                             onOpenFolder = {},
                             onCloseFolder = {},
-                            onParentFolder = { parentClicks++ },
-                            onFolderRoot = { rootClicks++ },
-                            onQuickSwitcher = { quickSwitcherClicks++ },
+                            onFolderRoot = {},
                             onFolderSearch = { folderSearchClicks++ },
                             onActivateEntry = {},
                             onClearRecent = {},
@@ -416,32 +458,30 @@ class FolderSearchTest {
                             onPinRecent = {},
                         )
                     }
+                    if (modalOpen) {
+                        FolderSearchModal(
+                            state = searchState,
+                            hasFolder = true,
+                            onUpdate = { _, _, _ -> },
+                            onSelect = { selectedMatch = it },
+                            onDismiss = { modalOpen = false },
+                        )
+                    }
                 }
             }
         }
 
-        // TopBar overflow menu includes Quick switcher and Search across notes
-        composeRule.onNodeWithContentDescription("More actions").performClick()
-        composeRule.onNodeWithText("Quick switcher").assertIsDisplayed().performClick()
-        assertEquals(1, quickSwitcherClicks)
-        composeRule.onNodeWithContentDescription("More actions").performClick()
-        composeRule.onNodeWithText("Search across notes").assertIsDisplayed().performClick()
+        composeRule.onNodeWithText("İstanbul: note").assertIsDisplayed()
+        composeRule.onNodeWithText("📓 note").performClick()
+        assertEquals("u2", selectedMatch?.key)
+        composeRule.onNodeWithText("Close").performClick()
+        assertFalse(modalOpen)
+
+        composeRule.onNode(hasText("Search across notes") and hasClickAction()).assertIsDisplayed().assertHeightIsAtLeast(48.dp).performClick()
         assertEquals(1, folderSearchClicks)
 
-        // FilesDrawerContent exposes Switch, Search, Parent folder, and Folder root >= 48dp
-        composeRule.onNode(hasText("Switch") and hasClickAction()).assertIsDisplayed().assertHeightIsAtLeast(48.dp).performClick()
-        assertEquals(2, quickSwitcherClicks)
-        composeRule.onNode(hasText("Search") and hasClickAction()).assertIsDisplayed().assertHeightIsAtLeast(48.dp).performClick()
+        composeRule.onNodeWithContentDescription("More actions").performClick()
+        composeRule.onNode(hasText("Search across notes") and hasAnyAncestor(isPopup())).assertIsDisplayed().performClick()
         assertEquals(2, folderSearchClicks)
-        composeRule.onNode(hasText("Parent folder") and hasClickAction()).assertIsDisplayed().assertHeightIsAtLeast(48.dp).performClick()
-        assertEquals(1, parentClicks)
-        composeRule.onNode(hasText("Folder root") and hasClickAction()).assertIsDisplayed().assertHeightIsAtLeast(48.dp).performClick()
-        assertEquals(1, rootClicks)
-
-        // Filtering swaps directory listing for nested matching files with relative path subtitle
-        composeRule.runOnIdle { filterText = "relativity" }
-        composeRule.onNodeWithText("relativity-summary.md").assertIsDisplayed().assertHeightIsAtLeast(48.dp)
-        composeRule.onNodeWithText("physics/modern/relativity-summary.md").assertIsDisplayed()
-        composeRule.onAllNodes(hasText("Parent folder")).also { assertEquals(0, it.fetchSemanticsNodes().size) }
     }
 }

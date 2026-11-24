@@ -82,4 +82,29 @@ describe("ReadingSearch seeded cross-note handoff", () => {
       root.unmount();
     });
   });
+
+  it("preserves exact UTF-16 highlight and source offsets on İstanbul: note and 📓 note", async () => {
+    host.innerHTML = "<p>İstanbul: note</p><p>📓 note</p>";
+    const onClose = vi.fn();
+    const root = createRoot(searchContainer);
+    const flushFrame = async () => {
+      await act(async () => {
+        await new Promise<void>(resolve => requestAnimationFrame(() => resolve()));
+      });
+    };
+
+    const seed: ReadingSearchSeed = { query: "note", caseSensitive: false, nonce: 10 };
+    await act(async () => {
+      root.render(<ReadingSearch content={"İstanbul: note\n\n📓 note"} close={onClose} seed={seed} />);
+    });
+    await flushFrame();
+
+    const ranges = highlights.get("smd-search")?.ranges ?? [];
+    expect(ranges.map(r => r.toString())).toEqual(["note", "note"]);
+    expect(highlights.get("smd-search-current")?.ranges[0]?.toString()).toBe("note");
+
+    await act(async () => {
+      root.unmount();
+    });
+  });
 });

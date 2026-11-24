@@ -52,7 +52,7 @@ import file_events
 import custom_theme
 from selection_actions import ASSISTANTS, selection_target
 from shortcuts import DEFINITIONS as SHORTCUT_DEFINITIONS, capture_sequence, default_shortcuts, native_label, normalize_shortcuts, parse_sequence
-from workspace_search import canonical_note_key, filter_folder_tree, rank_quick_switcher, stream_text_search, walk_folder_notes
+from workspace_search import canonical_note_key, stream_text_search
 
 ROOT = Path(sys._MEIPASS)/"resources" if getattr(sys,"frozen",False) else Path(__file__).resolve().parent.parent
 DEFAULT_PDF = {"pageSize": "a4", "margin": 14, "fontSize": 10.5, "lineHeight": 1.4, "paragraphSpacing": 0.65, "fontFamily": "Manrope", "pageNumbers": True, "themed": False}
@@ -551,7 +551,6 @@ class Studio(QObject):
     shortcutsChanged = Signal()
     workspaceSearchChanged = Signal()
     workspaceSearchBatch = Signal(int, object, int, bool, bool)
-    quickSwitcherFinished = Signal(int, str, object)
     readerLoad = Signal(str)
     readerCall = Signal(str)
     readerReloadRequested = Signal()
@@ -584,7 +583,6 @@ class Studio(QObject):
         self.pool = concurrent.futures.ThreadPoolExecutor(max_workers=3, thread_name_prefix="supermd")
         self._search_pool = concurrent.futures.ThreadPoolExecutor(max_workers=2, thread_name_prefix="supermd-search")
         self.workspaceSearchBatch.connect(self._on_workspace_search_batch)
-        self.quickSwitcherFinished.connect(self._on_quick_switcher_finished)
         self.session = session or Session(isolated)
         self.session.changed.connect(lambda:self._emit())
         self.session.locationChanged.connect(self._location_changed)
@@ -642,16 +640,6 @@ class Studio(QObject):
         self.folder = ""
         self.files: list[dict] = []
         self.expanded: set[str] = set()
-        self.sidebar_filter = ""
-        self._tree_generation = 0
-        self._tree_cancel_event: threading.Event | None = None
-        self._quick_switcher_open = False
-        self._quick_switcher_query = ""
-        self._quick_switcher_items: list[dict] = []
-        self._quick_switcher_loading = False
-        self._quick_switcher_generation = 0
-        self._quick_switcher_cancel: threading.Event | None = None
-        self._quick_switcher_folder_cache: tuple[str, list[dict]] | None = None
         self._folder_search_open = False
         self._folder_search_query = ""
         self._folder_search_case_sensitive = False
@@ -1114,8 +1102,6 @@ class Studio(QObject):
     def stop(self):
         if self.retired: return
         if self._storage_cancel_event is not None:self._storage_cancel_event.set()
-        if self._tree_cancel_event is not None:self._tree_cancel_event.set()
-        if self._quick_switcher_cancel is not None:self._quick_switcher_cancel.set()
         if self._folder_search_cancel is not None:self._folder_search_cancel.set()
         self._search_pool.shutdown(wait=False, cancel_futures=True)
         self._export_jobs.cancel_all()
@@ -1164,17 +1150,7 @@ class Studio(QObject):
     @Property(str, notify=changed)
     def snapshot(self):
         tab = self._current()
-        return json.dumps({"tabs": [{"id": t["id"], "name": t["name"], "path": t["path"], "dirty": self._is_dirty(t), "conflict": bool(t.get("conflict"))} for t in self.tabs], "active": self.active if self.tabs else "", "name": tab["name"], "outline": tab.get("outline", []), "portable": tab["portable"], "conflict": bool(tab.get("conflict")), "closedCount": len(self.closed_tabs), "folder": self.folder, "files": self.files, "sidebarFilter": self.sidebar_filter, "recent": self.recent, "settings": self.settings, "mode": self.mode, "fullscreen": self.fullscreen, "readerOverlay": self.reader_overlay, "imageOverlay": self.image_overlay, "readerReady": self.ready, "dark": self._dark(), "zoom": self.settings["fullZoom" if self.fullscreen else "normalZoom"], "busy": self.busy > 0, "message": self.message, "messageRevision": getattr(self, "_message_revision", 0), "colors": self._colors()})
-
-    @Property("QVariantMap", notify=workspaceSearchChanged)
-    def quickSwitcherState(self):
-        return {
-            "open": self._quick_switcher_open,
-            "query": self._quick_switcher_query,
-            "items": self._quick_switcher_items,
-            "loading": self._quick_switcher_loading,
-            "hasFolder": bool(self.folder),
-        }
+        return json.dumps({"tabs": [{"id": t["id"], "name": t["name"], "path": t["path"], "dirty": self._is_dirty(t), "conflict": bool(t.get("conflict"))} for t in self.tabs], "active": self.active if self.tabs else "", "name": tab["name"], "outline": tab.get("outline", []), "portable": tab["portable"], "conflict": bool(tab.get("conflict")), "closedCount": len(self.closed_tabs), "folder": self.folder, "files": self.files, "recent": self.recent, "settings": self.settings, "mode": self.mode, "fullscreen": self.fullscreen, "readerOverlay": self.reader_overlay, "imageOverlay": self.image_overlay, "readerReady": self.ready, "dark": self._dark(), "zoom": self.settings["fullZoom" if self.fullscreen else "normalZoom"], "busy": self.busy > 0, "message": self.message, "messageRevision": getattr(self, "_message_revision", 0), "colors": self._colors()})
 
     @Property("QVariantMap", notify=workspaceSearchChanged)
     def folderSearchState(self):
@@ -1220,18 +1196,6 @@ class Studio(QObject):
         folder_path = Path(self.folder) if self.folder else None
         return tabs_snap, recent_snap, folder_path, self.active
 
-    def _cancel_quick_switcher(self, close: bool = False):
-        if self._quick_switcher_cancel is not None:
-            self._quick_switcher_cancel.set()
-            self._quick_switcher_cancel = None
-        self._quick_switcher_generation += 1
-        self._quick_switcher_loading = False
-        if close:
-            self._quick_switcher_open = False
-            self._quick_switcher_query = ""
-            self._quick_switcher_items = []
-            self._quick_switcher_folder_cache = None
-
     def _cancel_folder_search(self, close: bool = False):
         if self._folder_search_cancel is not None:
             self._folder_search_cancel.set()
@@ -1248,124 +1212,10 @@ class Studio(QObject):
                 self.flush_operation = None
                 self.flush_timer.stop()
 
-    def _refresh_quick_switcher(self):
-        if self.retired or not self._quick_switcher_open:
-            return
-        if self._quick_switcher_cancel is not None:
-            self._quick_switcher_cancel.set()
-        self._quick_switcher_generation += 1
-        generation = self._quick_switcher_generation
-        cancel_event = threading.Event()
-        self._quick_switcher_cancel = cancel_event
-        query = self._quick_switcher_query
-        tabs_snap, recent_snap, folder_path, active_id = self._search_snapshots()
-        cached_entries = (
-            self._quick_switcher_folder_cache[1]
-            if self._quick_switcher_folder_cache is not None and self._quick_switcher_folder_cache[0] == self.folder
-            else None
-        )
-        if folder_path is None or cached_entries is not None:
-            self._quick_switcher_loading = False
-            self._quick_switcher_items = rank_quick_switcher(
-                query,
-                tabs_snap,
-                recent_snap,
-                folder_path,
-                active_id=active_id,
-                cancel_event=cancel_event,
-                folder_entries=cached_entries or [],
-            )
-            self.workspaceSearchChanged.emit()
-            return
-
-        # Render immediate matches from pinned/recent/open tabs first, then fold in folder walk off the UI thread.
-        self._quick_switcher_loading = True
-        self._quick_switcher_items = rank_quick_switcher(
-            query,
-            tabs_snap,
-            recent_snap,
-            folder_path,
-            active_id=active_id,
-            cancel_event=cancel_event,
-            folder_entries=[],
-        )
-        self.workspaceSearchChanged.emit()
-        folder_str = self.folder
-
-        def worker():
-            entries = walk_folder_notes(folder_path, cancel_event=cancel_event)
-            if cancel_event.is_set() or self.retired:
-                return
-            ranked = rank_quick_switcher(
-                query,
-                tabs_snap,
-                recent_snap,
-                folder_path,
-                active_id=active_id,
-                cancel_event=cancel_event,
-                folder_entries=entries,
-            )
-            if cancel_event.is_set() or self.retired:
-                return
-            self.quickSwitcherFinished.emit(generation, folder_str, (entries, ranked))
-
-        try:
-            self._search_pool.submit(worker)
-        except RuntimeError:
-            self._quick_switcher_loading = False
-            self.workspaceSearchChanged.emit()
-
-    def _on_quick_switcher_finished(self, generation: int, folder_str: str, payload):
-        if self.retired or not self._quick_switcher_open:
-            return
-        entries, ranked = payload
-        if folder_str == self.folder:
-            self._quick_switcher_folder_cache = (folder_str, entries)
-        if generation != self._quick_switcher_generation:
-            if folder_str == self.folder:
-                self._refresh_quick_switcher()
-            return
-        self._quick_switcher_loading = False
-        self._quick_switcher_items = ranked
-        self.workspaceSearchChanged.emit()
-
-    @Slot()
-    def openQuickSwitcher(self):
-        if self.retired:
-            return
-        self._cancel_folder_search(close=True)
-        self._quick_switcher_open = True
-        self._quick_switcher_query = ""
-        self._quick_switcher_folder_cache = None
-        self._refresh_quick_switcher()
-
-    @Slot(str)
-    def setQuickSwitcherQuery(self, query: str):
-        if not self._quick_switcher_open:
-            return
-        self._quick_switcher_query = query if isinstance(query, str) else ""
-        self._refresh_quick_switcher()
-
-    @Slot()
-    def closeQuickSwitcher(self):
-        if not self._quick_switcher_open and not self._quick_switcher_loading:
-            return
-        self._cancel_quick_switcher(close=True)
-        self.workspaceSearchChanged.emit()
-
-    @Slot(str, str)
-    def activateQuickSwitcherItem(self, tab_id: str, path: str):
-        if self.retired:
-            return
-        self._cancel_quick_switcher(close=True)
-        self.workspaceSearchChanged.emit()
-        self._flush("open_quick_item", json.dumps({"tabId": tab_id or "", "path": path or ""}))
-
     @Slot()
     def openFolderSearch(self):
         if self.retired:
             return
-        self._cancel_quick_switcher(close=True)
         self._folder_search_open = True
         self._folder_search_tabs_sig = None
         if self.ready and self.tabs and not self.flush_operation:
@@ -1456,8 +1306,7 @@ class Studio(QObject):
 
     @Slot()
     def cancelWorkspaceSearch(self):
-        changed = self._quick_switcher_open or self._quick_switcher_loading or self._folder_search_open or self._folder_search_scanning
-        self._cancel_quick_switcher(close=True)
+        changed = self._folder_search_open or self._folder_search_scanning
         self._cancel_folder_search(close=True)
         if changed:
             self.workspaceSearchChanged.emit()
@@ -2883,8 +2732,6 @@ class Studio(QObject):
             self._emit(False)
             return
         self.folder = str(path)
-        self.sidebar_filter = ""
-        self._quick_switcher_folder_cache = None
         self.settings["welcomed"] = True
         self.expanded = {self.folder}
         self._preferences()
@@ -2892,34 +2739,16 @@ class Studio(QObject):
         self._load_tree()
 
     def _load_tree(self):
-        if self._tree_cancel_event is not None:
-            self._tree_cancel_event.set()
-            self._tree_cancel_event = None
-        self._tree_generation += 1
-        generation = self._tree_generation
-        if not self.folder:
-            self.files = []
-            self._emit(False)
-            return
-        folder = self.folder
-        expanded = set(self.expanded)
-        filter_query = self.sidebar_filter
-        cancel_event = threading.Event()
-        self._tree_cancel_event = cancel_event
-
+        folder, expanded = self.folder, set(self.expanded)
         def scan():
-            if filter_query.strip():
-                return filter_folder_tree(Path(folder), filter_query, cancel_event=cancel_event)
             entries = []
             def visit(path, depth):
-                if cancel_event.is_set():
-                    return
                 try:
                     children = sorted(Path(path).iterdir(), key=lambda p: (not p.is_dir(), p.name.lower()))
                 except OSError:
                     return
                 for child in children:
-                    if cancel_event.is_set() or len(entries) >= 3000:
+                    if len(entries) >= 3000:
                         return
                     if child.name.startswith(".") or child.is_symlink():
                         continue
@@ -2930,41 +2759,21 @@ class Studio(QObject):
                             visit(child, depth + 1)
             visit(folder, 0)
             return entries
-
         def finished(result, error):
-            if not error and folder == self.folder and generation == self._tree_generation and not cancel_event.is_set():
+            if not error and folder == self.folder:
                 self.files = result
-                self._emit(False)
         self._submit(scan, finished, False)
 
     @Slot(str)
-    def setSidebarFilter(self, query):
-        cleaned = query if isinstance(query, str) else ""
-        if cleaned == self.sidebar_filter:
-            return
-        self.sidebar_filter = cleaned
-        if self.folder:
-            self._load_tree()
-        else:
-            self._emit(False)
-
-    @Slot(str)
     def toggleDirectory(self, path):
-        if self.sidebar_filter.strip():
-            return
         self.expanded.symmetric_difference_update({path})
         self._load_tree()
 
     @Slot()
     def closeFolder(self):
-        if self._tree_cancel_event is not None:
-            self._tree_cancel_event.set()
-            self._tree_cancel_event = None
         self.folder = ""
         self.files = []
-        self.sidebar_filter = ""
         self.expanded.clear()
-        self._quick_switcher_folder_cache = None
         self._emit(False)
 
     @Slot(str)
@@ -3077,19 +2886,6 @@ class Studio(QObject):
                     self._start_folder_search()
                 else:
                     self.workspaceSearchChanged.emit()
-        elif operation["action"] == "open_quick_item":
-            request = json.loads(operation["target"])
-            tab_id = request.get("tabId") or ""
-            path = request.get("path") or ""
-            existing = next((t for t in self.tabs if tab_id and t["id"] == tab_id), None)
-            if existing is None and path:
-                resolved = os.path.normcase(str(Path(path).resolve(strict=False)))
-                existing = next((t for t in self.tabs if t.get("path") and os.path.normcase(str(Path(t["path"]).resolve(strict=False))) == resolved), None)
-            if existing is not None:
-                self.selectTab(existing["id"])
-                self._focus_open_target(self._activation_generation)
-            elif path:
-                self._open_note(path, explicit=True)
         elif operation["action"] == "open_search_match":
             request = json.loads(operation["target"])
             tab_id = request.get("tabId") or ""

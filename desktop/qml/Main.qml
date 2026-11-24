@@ -167,7 +167,6 @@ ApplicationWindow {
         case "new_window": studio.command("window"); break
         case "new_note": studio.newNote(); break
         case "open": openDialog.open(); break
-        case "quick_switcher": studio.openQuickSwitcher(); break
         case "save": studio.saveSafely(); break
         case "save_as": studio.saveAsSafely(); break
         case "undo": studio.command("undo"); break
@@ -275,8 +274,6 @@ ApplicationWindow {
         function onChromeRequested(action) { window.chromeAwake = action === "toggle" ? !window.chromeAwake : action === "show"; if(window.chromeAwake) chromeIdle.restart(); else { chromeIdle.stop(); window.focusReader() } }
         function onAgentRequest(payload) { window.routeAgentRequest(payload) }
         function onWorkspaceSearchChanged() {
-            if (studio.quickSwitcherState.open && !quickSwitcherDialog.visible) quickSwitcherDialog.open()
-            else if (!studio.quickSwitcherState.open && quickSwitcherDialog.visible) quickSwitcherDialog.close()
             if (studio.folderSearchState.open && !folderSearchDialog.visible) folderSearchDialog.open()
             else if (!studio.folderSearchState.open && folderSearchDialog.visible) folderSearchDialog.close()
         }
@@ -369,7 +366,6 @@ ApplicationWindow {
                     }
                 }
                 ActionButton { glyph: "MagnifyingGlass"; ToolTip.text: "Find in note (" + window.shortcutLabels.find + ")"; onClicked: window.openFind() }
-                ActionButton { objectName: "quickSwitcherButton"; visible: window.width >= 1060; glyph: "Contents"; ToolTip.text: "Quick switcher (" + (window.shortcutLabels.quick_switcher || "Ctrl+P") + ")"; onClicked: studio.openQuickSwitcher() }
                 ActionButton { objectName: "folderSearchButton"; visible: window.width >= 1060; text: window.width < 1260 ? "" : "Search notes"; glyph: "MagnifyingGlass"; ToolTip.text: "Search across notes (" + (window.shortcutLabels.search_folder || "Ctrl+Shift+F") + ")"; onClicked: studio.openFolderSearch() }
                 ActionButton { visible: window.width >= 1060; glyph: "Image"; ToolTip.text: "Insert image or link"; onClicked: studio.command("insert") }
                 ActionButton { visible: window.width >= 1060; glyph: "Bug"; ToolTip.text: "Fix LaTeX"; onClicked: studio.command("repair") }
@@ -382,7 +378,6 @@ ApplicationWindow {
                         implicitWidth: 250
                         NoteMenuItem { objectName: "reopenClosedTabAction"; text: "Reopen closed tab"; icon.source: "../icons/Undo.svg"; enabled: typeof viewState !== "undefined" ? Boolean(viewState.closedCount) : true; onTriggered: studio.reopenTab() }
                         NoteMenuItem { objectName: "saveAsAction"; text: "Save as"; icon.source: "../icons/FloppyDisk.svg"; enabled: typeof viewState !== "undefined" ? !viewState.busy : true; onTriggered: studio.saveAsSafely() }
-                        NoteMenuItem { text: "Quick switcher"; actionVisible: window.width < 1060; icon.source: "../icons/Contents.svg"; onTriggered: studio.openQuickSwitcher() }
                         NoteMenuItem { text: "Search across notes"; actionVisible: window.width < 1060; icon.source: "../icons/MagnifyingGlass.svg"; onTriggered: studio.openFolderSearch() }
                         NoteMenuItem { text: "Insert image or link"; actionVisible: window.width < 1060; icon.source: "../icons/Image.svg"; onTriggered: studio.command("insert") }
                         NoteMenuItem { text: "Fix LaTeX"; actionVisible: window.width < 1060; icon.source: "../icons/Bug.svg"; onTriggered: studio.command("repair") }
@@ -418,32 +413,15 @@ ApplicationWindow {
                 Label { text: sidebarSection === "folder" ? "Your files" : "Contents"; font.pixelSize: 22; font.weight: Font.DemiBold }
                 ModeGroup { Layout.fillWidth: true; choices: [{key:"folder",label:"Folder"},{key:"contents",label:"Contents"}]; selected: sidebarSection; onChosen: key => sidebarSection = key }
                 ActionButton { visible: sidebarSection === "folder"; text: "Open folder"; glyph: "FolderOpen"; tonal: true; Layout.fillWidth: true; onClicked: studio.chooseFolder() }
-                RowLayout {
-                    visible: sidebarSection === "folder"
-                    Layout.fillWidth: true
-                    spacing: 6
-                    ActionButton { objectName: "sidebarQuickSwitcherButton"; text: "Switch"; glyph: "Contents"; compact: true; tonal: true; Layout.fillWidth: true; ToolTip.text: "Quick switcher (" + (window.shortcutLabels.quick_switcher || "Ctrl+P") + ")"; onClicked: studio.openQuickSwitcher() }
-                    ActionButton { objectName: "sidebarFolderSearchButton"; text: "Search"; glyph: "MagnifyingGlass"; compact: true; tonal: true; Layout.fillWidth: true; ToolTip.text: "Search across notes (" + (window.shortcutLabels.search_folder || "Ctrl+Shift+F") + ")"; onClicked: studio.openFolderSearch() }
-                }
+                ActionButton { objectName: "sidebarFolderSearchButton"; visible: sidebarSection === "folder"; text: "Search across notes"; glyph: "MagnifyingGlass"; compact: true; tonal: true; Layout.fillWidth: true; ToolTip.text: "Search across notes (" + (window.shortcutLabels.search_folder || "Ctrl+Shift+F") + ")"; onClicked: studio.openFolderSearch() }
                 RowLayout {
                     visible: sidebarSection === "folder" && !!viewState.folder
                     Layout.fillWidth: true
                     Label { text: viewState.folder.split("/").pop(); Layout.fillWidth: true; elide: Text.ElideMiddle }
                     ActionButton { glyph: "X"; compact: true; Accessible.name: "Close folder"; ToolTip.text: "Close folder (notes stay open)"; onClicked: studio.closeFolder() }
                 }
-                TextField {
-                    id: filter
-                    objectName: "sidebarFilterField"
-                    visible: sidebarSection === "folder" && !!viewState.folder
-                    Layout.fillWidth: true
-                    placeholderText: "Filter files"
-                    selectByMouse: true
-                    text: viewState.sidebarFilter || ""
-                    onTextChanged: if (text !== (viewState.sidebarFilter || "")) studio.setSidebarFilter(text)
-                }
+                TextField { id: filter; visible: sidebarSection === "folder" && !!viewState.folder; Layout.fillWidth: true; placeholderText: "Filter files"; selectByMouse: true }
                 ListView {
-                    id: sidebarFileList
-                    objectName: "sidebarFileList"
                     visible: sidebarSection === "folder"
                     Layout.fillWidth: true
                     Layout.fillHeight: true
@@ -453,17 +431,12 @@ ApplicationWindow {
                         id: fileEntry
                         required property var modelData
                         width: ListView.view.width - 20
-                        height: 42
+                        height: visible ? 42 : 0
+                        visible: !filter.text || modelData.directory || modelData.name.toLowerCase().includes(filter.text.toLowerCase())
                         leftPadding: 8 + modelData.depth * 16
                         text: (modelData.directory ? (modelData.expanded ? "▾ " : "▸ ") : "") + modelData.name
                         onClicked: modelData.directory ? studio.toggleDirectory(modelData.path) : studio.openNote(modelData.path)
                         Hint { requested: fileEntry.hovered; text: modelData.path }
-                    }
-                    Label {
-                        visible: !!viewState.folder && (viewState.sidebarFilter || "").trim().length > 0 && viewState.files.length === 0
-                        anchors.centerIn: parent
-                        text: "No matching notes"
-                        color: viewState.colors.muted
                     }
                     ScrollBar.vertical: ExpressiveScrollBar { }
                 }
@@ -891,12 +864,10 @@ ApplicationWindow {
             Label { text: "Optional per-user launcher and Open With support. Your default apps are unchanged."; visible: studio.desktopIntegrationAvailable; Layout.fillWidth: true; wrapMode: Text.WordWrap; opacity: .7 }
             RowLayout {
                 ActionButton { text: "Open note"; prominent: true; onClicked: { studio.setting("welcomed", "true"); openDialog.open() } }
-                ActionButton { text: "Quick switcher"; tonal: true; onClicked: studio.openQuickSwitcher() }
                 ActionButton { text: "Explore a sample"; onClicked: studio.setting("welcomed", "true") }
             }
             Label { text: "PDFs are typeset locally. Python runs only when you choose Run."; Layout.fillWidth: true; wrapMode: Text.WordWrap; opacity: .7 }
         }
     }
-    QuickSwitcherDialog { id: quickSwitcherDialog }
     FolderSearchDialog { id: folderSearchDialog }
 }

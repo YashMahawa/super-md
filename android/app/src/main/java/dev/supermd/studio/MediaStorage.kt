@@ -447,29 +447,39 @@ class MediaStorage(private val context: Context) {
             writer.endObject().endObject()
         }
     }
-    fun portableMarkdown(input: InputStream): String {
+    fun portableMarkdown(input: InputStream, stopAfterMarkdown: Boolean = false, maxMarkdownBytes: Int = 20_000_000): String {
         // Our envelope puts source before assets. Never load image bytes merely
         // to check whether a portable note's source changed externally.
         val sniff=if(input.markSupported())input else BufferedInputStream(input)
         sniff.mark(2);val gzip=sniff.read()==0x1f&&sniff.read()==0x8b;sniff.reset()
         val content=if(gzip)StrictGzipInputStream(sniff) else sniff
         val bounded=object:java.io.FilterInputStream(content){var consumed=0L;override fun read():Int {val value=super.read();if(value>=0)require(++consumed<=120_000_000);return value};override fun read(buffer:ByteArray,offset:Int,length:Int):Int {val size=super.read(buffer,offset,length);if(size>0){consumed+=size;require(consumed<=120_000_000)};return size}}
-        val limitedText=object:java.io.FilterReader(bounded.reader()){var quoted=false;var escaped=false;var tokenLength=0;override fun read(buffer:CharArray,offset:Int,size:Int):Int{val count=super.read(buffer,offset,size);for(i in offset until offset+maxOf(count,0)){val c=buffer[i];if(quoted){require(++tokenLength<=34_000_000){"Portable token is too large"};if(escaped)escaped=false else if(c=='\\')escaped=true else if(c=='\"')quoted=false}else if(c=='\"'){quoted=true;tokenLength=0}};return count}}
-        var markdown:String?=null
-        JsonReader(limitedText.buffered()).use {reader->
+        val limitedText=object:java.io.FilterReader(bounded.reader(Charsets.UTF_8)){var quoted=false;var escaped=false;var tokenLength=0;override fun read(buffer:CharArray,offset:Int,size:Int):Int{val count=super.read(buffer,offset,size);for(i in offset until offset+maxOf(count,0)){val c=buffer[i];if(quoted){require(++tokenLength<=34_000_000){"Portable token is too large"};if(escaped)escaped=false else if(c=='\\')escaped=true else if(c=='\"')quoted=false}else if(c=='\"'){quoted=true;tokenLength=0}};return count}}
+        var format: String? = null
+        var version: Int? = null
+        var markdown: String? = null
+        JsonReader(limitedText.buffered()).use { reader ->
             reader.beginObject()
-            while(reader.hasNext()){val name=reader.nextName();if(name=="markdown"){val source=reader.nextString();require(source.toByteArray().size<=20_000_000);markdown=source}else reader.skipValue()}
+            while (reader.hasNext()) {
+                when (reader.nextName()) {
+                    "format" -> { format = reader.nextString(); require(!stopAfterMarkdown || format in setOf("supermd-smd", "supermd-fmd")) }
+                    "version" -> { version = reader.nextInt(); require(!stopAfterMarkdown || version == 1) }
+                    "markdown" -> { val source = reader.nextString(); require(source.toByteArray(Charsets.UTF_8).size <= maxMarkdownBytes); markdown = source }
+                    else -> reader.skipValue()
+                }
+                if (stopAfterMarkdown && format in setOf("supermd-smd", "supermd-fmd") && version == 1 && markdown != null) {
+                    return markdown!!
+                }
+            }
             reader.endObject()
-            require(reader.peek()==android.util.JsonToken.END_DOCUMENT) { "Unexpected data after the portable envelope" }
+            if (!stopAfterMarkdown) {
+                require(reader.peek() == android.util.JsonToken.END_DOCUMENT) { "Unexpected data after the portable envelope" }
+            }
         }
+        if (stopAfterMarkdown) require(format in setOf("supermd-smd", "supermd-fmd") && version == 1)
         return markdown ?: error("Portable source is unavailable")
     }
 
-    /**
-     * Read searchable Markdown text from a note stream, detecting compressed or JSON
-     * portable (.smd/.fmd) envelopes by content rather than extension and returning
-     * before embedded base64 image assets are decoded or extracted to disk.
-     */
     internal fun readSearchableNote(
         input: InputStream,
         maxPlainBytes: Int = 5_000_000,
@@ -492,99 +502,16 @@ class MediaStorage(private val context: Context) {
             runCatching { String(headBytes, Charsets.UTF_8).trimStart('\uFEFF', ' ', '\n', '\r', '\t') }.getOrDefault("")
         } else ""
         if (isGzip || portableEnvelopeHeader(headerPreview)) {
-            return runCatching {
-                val content = if (isGzip) StrictGzipInputStream(buffered) else buffered
-                val bounded = object : java.io.FilterInputStream(content) {
-                    var consumed = 0L
-                    override fun read(): Int {
-                        val value = super.read()
-                        if (value >= 0) require(++consumed <= 120_000_000L)
-                        return value
-                    }
-                    override fun read(buffer: ByteArray, offset: Int, length: Int): Int {
-                        val size = super.read(buffer, offset, length)
-                        if (size > 0) {
-                            consumed += size
-                            require(consumed <= 120_000_000L)
-                        }
-                        return size
-                    }
-                }
-                val limitedText = object : java.io.FilterReader(bounded.reader(Charsets.UTF_8)) {
-                    var quoted = false
-                    var escaped = false
-                    var tokenLength = 0
-                    override fun read(buffer: CharArray, offset: Int, size: Int): Int {
-                        val count = super.read(buffer, offset, size)
-                        for (i in offset until offset + maxOf(count, 0)) {
-                            val c = buffer[i]
-                            if (quoted) {
-                                require(++tokenLength <= 34_000_000) { "Portable token is too large" }
-                                if (escaped) escaped = false
-                                else if (c == '\\') escaped = true
-                                else if (c == '"') quoted = false
-                            } else if (c == '"') {
-                                quoted = true
-                                tokenLength = 0
-                            }
-                        }
-                        return count
-                    }
-                }
-                var format: String? = null
-                var version: Int? = null
-                var markdown: String? = null
-                JsonReader(limitedText.buffered()).use { reader ->
-                    reader.beginObject()
-                    while (reader.hasNext()) {
-                        when (reader.nextName()) {
-                            "format" -> {
-                                format = reader.nextString()
-                                if (format !in setOf("supermd-smd", "supermd-fmd")) return@use
-                            }
-                            "version" -> {
-                                version = reader.nextInt()
-                                if (version != 1) return@use
-                            }
-                            "markdown" -> {
-                                val source = reader.nextString()
-                                if (source.toByteArray(Charsets.UTF_8).size > maxPortableMarkdownBytes) return@use
-                                markdown = source
-                            }
-                            else -> {
-                                // Our writer places format, version, and markdown before assets.
-                                // Stop immediately before decompressing or scanning base64 image payloads.
-                                if (format in setOf("supermd-smd", "supermd-fmd") && version == 1 && markdown != null) {
-                                    return@use
-                                }
-                                reader.skipValue()
-                            }
-                        }
-                        if (format in setOf("supermd-smd", "supermd-fmd") && version == 1 && markdown != null) {
-                            return@use
-                        }
-                    }
-                }
-                if (format in setOf("supermd-smd", "supermd-fmd") && version == 1) markdown else null
-            }.getOrNull()
+            return runCatching { portableMarkdown(buffered, stopAfterMarkdown = true, maxMarkdownBytes = maxPortableMarkdownBytes) }.getOrNull()
         }
         if (headBytes.any { it == 0.toByte() }) return null
         return runCatching {
-            val output = java.io.ByteArrayOutputStream(minOf(prefixLen, 65_536))
-            val chunk = ByteArray(8_192)
-            while (true) {
-                val read = buffered.read(chunk)
-                if (read < 0) break
-                if (output.size() + read > maxPlainBytes) return null
-                for (i in 0 until read) {
-                    if (chunk[i] == 0.toByte()) return null
-                }
-                output.write(chunk, 0, read)
-            }
+            val raw = readLimited(buffered, maxPlainBytes)
+            if (raw.any { it == 0.toByte() }) return null
             Charsets.UTF_8.newDecoder()
                 .onMalformedInput(java.nio.charset.CodingErrorAction.REPORT)
                 .onUnmappableCharacter(java.nio.charset.CodingErrorAction.REPORT)
-                .decode(java.nio.ByteBuffer.wrap(output.toByteArray()))
+                .decode(java.nio.ByteBuffer.wrap(raw))
                 .toString()
                 .removePrefix("\uFEFF")
         }.getOrNull()

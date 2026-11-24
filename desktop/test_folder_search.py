@@ -1,4 +1,4 @@
-"""Unit and headless Qt/WebEngine tests for Quick Switcher, streaming cross-note search, and recursive sidebar filtering."""
+"""Unit and headless Qt/WebEngine tests for streaming cross-note search and Unicode UTF-16 snippet offsets."""
 from __future__ import annotations
 
 import base64
@@ -17,18 +17,19 @@ from unittest.mock import patch
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 os.environ.setdefault("QT_QUICK_BACKEND", "software")
 
-from PySide6.QtCore import QCoreApplication
+from PySide6.QtCore import QCoreApplication, QMetaObject, QObject, QUrl, Qt, Q_ARG, Q_RETURN_ARG
 from PySide6.QtGui import QGuiApplication
+from PySide6.QtQml import QQmlApplicationEngine
+from PySide6.QtQuickControls2 import QQuickStyle
 
 import documents
 from shortcuts import default_shortcuts, native_label, normalize_shortcuts
 from studio import Session
 from test_studio import QuietStudio
 from workspace_search import (
-    filter_folder_tree,
-    mask_diagram_spans,
-    rank_quick_switcher,
+    fold_with_offsets,
     stream_text_search,
+    utf16_offset,
 )
 
 TINY_PNG = (
@@ -77,7 +78,6 @@ def _webengine_e2e_probe() -> int:
         resolved_temp = Path(temp_dir).resolve()
         folder = resolved_temp / "notes"
         (folder / "research" / "deep").mkdir(parents=True)
-        (folder / "empty_dir" / "sub_empty").mkdir(parents=True)
 
         plain_note = folder / "alpha.md"
         plain_note.write_text("# Alpha\n\nPlain markdown paragraph.\n", encoding="utf-8")
@@ -96,13 +96,6 @@ def _webengine_e2e_probe() -> int:
         studio = QuietStudio(True, session)
         studio.openFolder(str(folder))
         _wait_until(lambda: len(studio.files) > 0)
-
-        # Start with ZERO open tabs to verify AC1 (Ctrl+P works with zero open tabs).
-        studio.tabs.clear()
-        studio.active = ""
-        studio.recent = [str(plain_note), str(portable_note)]
-        session.pinned = [str(portable_note)]
-        studio._emit(False)
 
         channel = QFile(":/qtwebchannel/qwebchannel.js")
         if not channel.open(QIODevice.OpenModeFlag.ReadOnly):
@@ -125,9 +118,8 @@ def _webengine_e2e_probe() -> int:
         QTest.qWaitForWindowActive(window, 2000)
         QTest.qWait(120)
 
-        quick_dialog = window.findChild(QObject, "quickSwitcherDialog")
         search_dialog = window.findChild(QObject, "folderSearchDialog")
-        assert quick_dialog is not None and search_dialog is not None
+        assert search_dialog is not None
 
         def send_window_shortcut(action_id: str) -> None:
             assert _wait_until(lambda: int(window.property("modalDialogCount") or 0) == 0), (
@@ -144,42 +136,10 @@ def _webengine_e2e_probe() -> int:
             combo = seq[0]
             QTest.keyClick(window, combo.key(), combo.keyboardModifiers())
 
-        # 1. Trigger Ctrl+P with zero open tabs -> opens Quick Switcher with pinned note first.
-        send_window_shortcut("quick_switcher")
-        assert _wait_until(
-            lambda: bool(quick_dialog.property("opened")) and not studio.quickSwitcherState["loading"],
-            timeout=8.0,
-        ), f"Quick Switcher did not open: visible={quick_dialog.property('visible')} state={studio.quickSwitcherState}"
-        items = studio.quickSwitcherState["items"]
-        assert len(items) >= 2, f"Expected items in quick switcher, got {items}"
-        assert items[0]["name"] == "quantum-field.smd" and items[0]["pinned"], f"Pinned note must be first: {items}"
-
-        # Filter to alpha in <= 3 keystrokes and press Enter to open it.
-        quick_input = window.findChild(QObject, "quickSwitcherInput")
-        assert quick_input is not None
-        window.requestActivate()
-        quick_input.forceActiveFocus()
-        assert _wait_until(lambda: bool(quick_input.property("activeFocus"))), "quickSwitcherInput did not gain focus"
-        for key in (Qt.Key.Key_A, Qt.Key.Key_L, Qt.Key.Key_P):
-            QTest.keyClick(window, key)
-        assert _wait_until(
-            lambda: len(studio.quickSwitcherState["items"]) >= 1
-            and studio.quickSwitcherState["items"][0]["name"] == "alpha.md",
-            timeout=8.0,
-        ), f"Quick Switcher did not filter to alpha.md: text={quick_input.property('text')!r} state={studio.quickSwitcherState}"
-        QTest.keyClick(window, Qt.Key.Key_Return)
-        assert _wait_until(
-            lambda: not bool(quick_dialog.property("visible"))
-            and int(window.property("modalDialogCount") or 0) == 0
-            and len(studio.tabs) == 1
-            and studio._current()["name"] == "alpha.md",
-            timeout=8.0,
-        ), f"Quick Switcher Return did not open alpha.md: tabs={studio.tabs}"
-
         # Wait for WebEngine reader_ready handshake.
         assert _wait_until(lambda: studio.ready, timeout=20.0), "WebEngine reader did not become ready"
 
-        # 2. Press Ctrl+Shift+F -> open FolderSearchDialog, then Escape -> dismisses and cancels.
+        # 1. Press Ctrl+Shift+F -> open FolderSearchDialog, then Escape -> dismisses and cancels.
         send_window_shortcut("search_folder")
         assert _wait_until(lambda: bool(search_dialog.property("opened")), timeout=8.0), (
             f"FolderSearchDialog did not open: visible={search_dialog.property('visible')} state={studio.folderSearchState}"
@@ -197,7 +157,7 @@ def _webengine_e2e_probe() -> int:
             timeout=8.0,
         ), f"Escape did not close FolderSearchDialog: visible={search_dialog.property('visible')} modal={window.property('modalDialogCount')}"
 
-        # 3. Reopen Ctrl+Shift+F, search "AuroraSignal", select match -> opens .smd note with ReadingSearch seeded and highlighting!
+        # 2. Reopen Ctrl+Shift+F, search "AuroraSignal", select match -> opens .smd note with ReadingSearch seeded and highlighting!
         send_window_shortcut("search_folder")
         assert _wait_until(lambda: bool(search_dialog.property("opened")), timeout=8.0), "FolderSearchDialog did not reopen"
         window.requestActivate()
@@ -269,6 +229,7 @@ def _webengine_e2e_probe() -> int:
 class WorkspaceSearchDesktopTest(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
+        QQuickStyle.setStyle("Material")
         cls.app = QGuiApplication.instance() or QGuiApplication(["Workspace search desktop tests"])
 
     def setUp(self):
@@ -284,21 +245,95 @@ class WorkspaceSearchDesktopTest(unittest.TestCase):
         self.session.writes.shutdown(wait=True)
         self.temp.cleanup()
 
-    def test_shortcuts_register_ctrl_p_and_ctrl_shift_f_portably_and_customize(self):
+    def test_shortcuts_register_ctrl_shift_f_portably_and_customize(self):
         for plat in ("linux", "win32", "darwin"):
             defaults = default_shortcuts(plat)
-            self.assertEqual(defaults["quick_switcher"], ["Ctrl+P"])
             self.assertEqual(defaults["search_folder"], ["Ctrl+Shift+F"])
         self.assertEqual(
-            native_label("Ctrl+P"),
-            "⌘P" if sys.platform == "darwin" else "Ctrl+P",
+            native_label("Ctrl+Shift+F"),
+            "⇧⌘F" if sys.platform == "darwin" else "Ctrl+Shift+F",
         )
-        self.assertEqual(self.studio.setShortcut("quick_switcher", "Ctrl+K"), "")
-        self.assertEqual(self.studio.shortcutSequences("quick_switcher"), ["Ctrl+K"])
-        validated, err = normalize_shortcuts({"quick_switcher": ["Ctrl+O"]})
+        self.assertEqual(self.studio.setShortcut("search_folder", "Ctrl+Shift+K"), "")
+        self.assertEqual(self.studio.shortcutSequences("search_folder"), ["Ctrl+Shift+K"])
+        validated, err = normalize_shortcuts({"search_folder": ["Ctrl+O"]})
         self.assertIsNone(validated)
         self.assertIn("Open note", err)
         self.assertIn("Save note", self.studio.setShortcut("search_folder", "Ctrl+S"))
+
+    def test_unicode_casefold_expansion_and_astral_utf16_snippet_highlighting_in_qml(self):
+        folded, starts, ends = fold_with_offsets("İstanbul: note")
+        self.assertEqual(folded, "i\u0307stanbul: note")
+        self.assertEqual(starts[:2], [0, 0])
+        self.assertEqual(ends[:2], [1, 1])
+        self.assertEqual(utf16_offset("📓 note", 2), 3)
+        self.assertEqual(utf16_offset("📓 note", 6), 7)
+
+        long_prefix = "İstanbul 📓 " * 8
+        markdown = "\n".join([
+            "İstanbul: note",
+            "📓 note",
+            "İstanbul 📓: NOTE",
+            "Straße: note",
+            f"{long_prefix}target NOTE after unicode prefix " + ("x" * 90),
+        ])
+        tabs = [{
+            "id": "tab-u",
+            "name": "unicode.md",
+            "path": "",
+            "content": markdown,
+            "dirty": True,
+        }]
+        res = stream_text_search("note", tabs, [], None, case_sensitive=False)
+        self.assertEqual([m["line"] for m in res["matches"]], [1, 2, 3, 4, 5])
+
+        m_istanbul, m_emoji, m_both, m_strasse, m_long = res["matches"]
+        # Line 1: "İstanbul: note" -> UTF-16 [10, 14)
+        self.assertEqual((m_istanbul["snippet"], m_istanbul["matchStart"], m_istanbul["matchEnd"]), ("İstanbul: note", 10, 14))
+        self.assertEqual(m_istanbul["column"], 11)
+        # Line 2: "📓 note" -> U+1F4D3 takes 2 UTF-16 code units + space = 3 -> [3, 7)
+        self.assertEqual((m_emoji["snippet"], m_emoji["matchStart"], m_emoji["matchEnd"]), ("📓 note", 3, 7))
+        self.assertEqual(m_emoji["column"], 4)
+        # Line 3: "İstanbul 📓: NOTE" -> 9 + 2 + 2 = 13 -> [13, 17)
+        self.assertEqual((m_both["snippet"], m_both["matchStart"], m_both["matchEnd"]), ("İstanbul 📓: NOTE", 13, 17))
+        # Line 4: "Straße: note" -> 'ß' expands to "ss" in casefold, original UTF-16 [8, 12)
+        self.assertEqual((m_strasse["snippet"], m_strasse["matchStart"], m_strasse["matchEnd"]), ("Straße: note", 8, 12))
+
+        # Verify actual QML JS String.prototype.slice highlighting inside FolderSearchDialog.qml!
+        qml_root = Path(__file__).resolve().parent / "qml"
+        engine = QQmlApplicationEngine()
+        engine.rootContext().setContextProperty("studio", self.studio)
+        engine.rootContext().setContextProperty("readerUrl", QUrl("about:blank"))
+        engine.rootContext().setContextProperty("channelScript", "")
+        engine.rootContext().setContextProperty("brandUrl", QUrl("about:blank"))
+        engine.load(QUrl.fromLocalFile(str(qml_root / "Main.qml")))
+        self.assertTrue(engine.rootObjects(), "Main.qml must load for QML UTF-16 slice verification")
+        try:
+            window = engine.rootObjects()[0]
+            dialog = window.findChild(QObject, "folderSearchDialog")
+            self.assertIsNotNone(dialog)
+
+            def qml_highlight(match_dict: dict) -> str:
+                return QMetaObject.invokeMethod(
+                    dialog,
+                    "highlightedSnippet",
+                    Qt.ConnectionType.DirectConnection,
+                    Q_RETURN_ARG("QVariant"),
+                    Q_ARG("QVariant", match_dict["snippet"]),
+                    Q_ARG("QVariant", match_dict["matchStart"]),
+                    Q_ARG("QVariant", match_dict["matchEnd"]),
+                )
+
+            self.assertIn("<b>note</b>", qml_highlight(m_istanbul))
+            self.assertNotIn("<b>ote</b>", qml_highlight(m_istanbul))
+            self.assertIn("<b>note</b>", qml_highlight(m_emoji))
+            self.assertNotIn("<b> not</b>", qml_highlight(m_emoji))
+            self.assertIn("<b>NOTE</b>", qml_highlight(m_both))
+            self.assertIn("<b>note</b>", qml_highlight(m_strasse))
+            self.assertIn("<b>NOTE</b>", qml_highlight(m_long))
+        finally:
+            for obj in engine.rootObjects():
+                obj.deleteLater()
+            del engine
 
     def test_portable_smd_and_renamed_bundle_search_never_decodes_embedded_images(self):
         smd_path = self.root / "heavy-images.smd"
@@ -310,7 +345,6 @@ class WorkspaceSearchDesktopTest(unittest.TestCase):
             "# Lab Report\n\n Measured PlanckConstant accurately.\n",
             {"assets/photo.png": TINY_PNG},
         )
-        # Copy gzipped .smd bytes to a .txt extension to verify content-based detection.
         renamed_bundle.write_bytes(smd_path.read_bytes())
         plain_json_fmd.write_text(
             json.dumps({
@@ -393,7 +427,6 @@ class WorkspaceSearchDesktopTest(unittest.TestCase):
         after_entries = sorted(p.relative_to(self.root).as_posix() for p in self.root.rglob("*"))
         self.assertEqual(before_entries, after_entries, "Search must write zero cached index files to disk")
 
-        # Without an open folder, scan open tabs and recent notes without permission prompts.
         no_folder_res = stream_text_search(
             "RecentNeedle",
             [{"id": "t1", "name": "Untitled.md", "path": "", "content": "RecentNeedle in unsaved draft", "dirty": True}],
@@ -401,56 +434,6 @@ class WorkspaceSearchDesktopTest(unittest.TestCase):
             None,
         )
         self.assertEqual({m["name"] for m in no_folder_res["matches"]}, {"Untitled.md", "external.md"})
-
-    def test_quick_switcher_empty_pinned_recent_order_and_fuzzy_ranking(self):
-        (self.root / "courses" / "spring").mkdir(parents=True)
-        pinned_file = self.root / "pinned.md"
-        recent_file = self.root / "recent.md"
-        nested_file = self.root / "courses" / "spring" / "QuantumMechanicsLecture.smd"
-        for f in (pinned_file, recent_file, nested_file):
-            f.write_text("# Note\n", encoding="utf-8")
-
-        recent = [
-            {"path": str(recent_file), "name": "recent.md", "pinned": False},
-            {"path": str(pinned_file), "name": "pinned.md", "pinned": True},
-        ]
-        # Zero open tabs!
-        empty_ranked = rank_quick_switcher("", [], recent, self.root)
-        self.assertEqual([item["name"] for item in empty_ranked[:2]], ["pinned.md", "recent.md"])
-
-        # 3-keystroke acronym/subsequence match on nested collapsed file
-        fuzzy_ranked = rank_quick_switcher("qml", [], recent, self.root)
-        self.assertGreaterEqual(len(fuzzy_ranked), 1)
-        self.assertEqual(fuzzy_ranked[0]["name"], "QuantumMechanicsLecture.smd")
-        self.assertEqual(fuzzy_ranked[0]["relative"], "courses/spring/QuantumMechanicsLecture.smd")
-
-    def test_recursive_sidebar_filter_finds_collapsed_subfolders_and_hides_empty_folders(self):
-        (self.root / "collapsed_a" / "nested_b").mkdir(parents=True)
-        (self.root / "empty_folder" / "empty_child").mkdir(parents=True)
-        (self.root / "unmatched_folder").mkdir()
-        (self.root / "unmatched_folder" / "other.md").write_text("# Other", encoding="utf-8")
-        target = self.root / "collapsed_a" / "nested_b" / "relativity-summary.smd"
-        documents.write_portable(target, "# Relativity", {})
-
-        self.studio.openFolder(str(self.root))
-        self.assertTrue(_wait_until(lambda: len(self.studio.files) > 0))
-        # Before filtering, collapsed_a is NOT expanded, so relativity-summary.smd is not in studio.files.
-        self.assertNotIn("relativity-summary.smd", [f["name"] for f in self.studio.files])
-
-        self.studio.setSidebarFilter("relativity")
-        self.assertTrue(
-            _wait_until(lambda: any(f["name"] == "relativity-summary.smd" for f in self.studio.files))
-        )
-        names = [(f["name"], f["directory"], f["depth"]) for f in self.studio.files]
-        self.assertEqual(
-            names,
-            [
-                ("collapsed_a", True, 0),
-                ("nested_b", True, 1),
-                ("relativity-summary.smd", False, 2),
-            ],
-            "Only ancestor directories with matching descendants may appear; zero empty/unmatched folders",
-        )
 
     def test_cancellation_stops_in_flight_scan_immediately(self):
         for i in range(60):
@@ -498,12 +481,10 @@ class WorkspaceSearchDesktopTest(unittest.TestCase):
         self.assertIsNotNone(op)
         self.assertEqual(op["action"], "sync_for_search")
 
-        # User types query before WebEngine responds to sync_for_search: scanning stays True until flush resolves.
         self.studio.updateFolderSearch("DiskMatch", False, False)
         self.assertTrue(_wait_until(lambda: len(self.studio.folderSearchState["matches"]) == 1))
         self.assertTrue(self.studio.folderSearchState["scanning"])
 
-        # Unchanged flush arrives: existing matches stay intact without wiping list, and scanning becomes False.
         self.studio.post(
             "flush-1",
             "document_flushed",
@@ -513,7 +494,6 @@ class WorkspaceSearchDesktopTest(unittest.TestCase):
         self.assertEqual(len(self.studio.folderSearchState["matches"]), 1)
         self.assertEqual(self.studio.folderSearchState["matches"][0]["name"], "synced.md")
 
-        # Reopen and search for a token that arrives only when WebEngine flushes unacknowledged live edits.
         self.studio.closeFolderSearch()
         self.studio.openFolderSearch()
         op2 = self.studio.flush_operation
@@ -537,7 +517,7 @@ class WorkspaceSearchDesktopTest(unittest.TestCase):
         self.assertEqual(self.studio.folderSearchState["matches"][0]["line"], 3)
         self.assertTrue(self.studio.folderSearchState["matches"][0]["dirty"])
 
-    def test_qml_and_webengine_quick_switcher_escape_and_seeded_reader_search(self):
+    def test_qml_and_webengine_folder_search_escape_and_seeded_reader_search(self):
         if "--webengine-probe" in sys.argv:
             raise unittest.SkipTest("probe subprocess only")
         root = Path(__file__).resolve().parent

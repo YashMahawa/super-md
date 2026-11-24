@@ -752,21 +752,11 @@ class StudioViewModel(app: Application, val workspaceKey: String = "main") : And
             mutable.value.folder?.let {listFolder(Uri.parse(it),listedRelative)}
         }
     }
-    private val quickSwitcherMutable = MutableStateFlow(QuickSwitcherState())
-    val quickSwitcher = quickSwitcherMutable.asStateFlow()
     private val folderSearchMutable = MutableStateFlow(FolderSearchState())
     val folderSearch = folderSearchMutable.asStateFlow()
-    private val drawerFilterMutable = MutableStateFlow("")
-    val drawerFilter = drawerFilterMutable.asStateFlow()
-    private val filteredFilesMutable = MutableStateFlow<List<FileEntry>>(emptyList())
-    val filteredFiles = filteredFilesMutable.asStateFlow()
-    private val drawerFilteringMutable = MutableStateFlow(false)
-    val drawerFiltering = drawerFilteringMutable.asStateFlow()
     private val seededFindMutable = MutableStateFlow<PendingSeededFind?>(null)
     val seededFind = seededFindMutable.asStateFlow()
-    private var quickSwitcherJob: Job? = null
     private var folderSearchJob: Job? = null
-    private var drawerFilterJob: Job? = null
 
     init {
         mutable.value.tabs.filter { it.portable && it.uri != null && !it.assetsDirty }.forEach { recordPortableBaseline(it.id, it.assetDirectory) }
@@ -784,9 +774,7 @@ class StudioViewModel(app: Application, val workspaceKey: String = "main") : And
     }
     override fun onCleared() {
         viewModelRetired.set(true)
-        quickSwitcherJob?.cancel()
         folderSearchJob?.cancel()
-        drawerFilterJob?.cancel()
         invalidateAllNoteAssets()
         recoveryWriter.closeAfterLatest(mutable.value)
         prefs.unregisterOnSharedPreferenceChangeListener(preferencesChanged)
@@ -2128,12 +2116,10 @@ class StudioViewModel(app: Application, val workspaceKey: String = "main") : And
                 withContext(Dispatchers.IO) { resolver.takePersistableUriPermission(uri, Intent.FLAG_GRANT_READ_URI_PERMISSION or Intent.FLAG_GRANT_WRITE_URI_PERMISSION) }
             }
             windowPrefs.edit().putBoolean("folderMigrated", true).putString("folder", uri.toString()).apply()
-            setDrawerFilter("")
             change { it.copy(folder = uri.toString()) }; listFolder(uri, "")
         } catch (error: Exception) { fail("Could not open folder: ${error.message}") }
     }
     fun closeFolder() {
-        setDrawerFilter("")
         windowPrefs.edit().putBoolean("folderMigrated", true).remove("folder").apply()
         change { it.copy(folder = null, files = emptyList()) }
     }
@@ -2170,89 +2156,7 @@ class StudioViewModel(app: Application, val workspaceKey: String = "main") : And
         } catch (error: Exception) { fail("Could not list folder: ${error.message}") }
     }
 
-    fun setDrawerFilter(query: String) {
-        drawerFilterJob?.cancel()
-        drawerFilterJob = null
-        drawerFilterMutable.value = query
-        val trimmed = query.trim()
-        if (trimmed.isEmpty()) {
-            filteredFilesMutable.value = emptyList()
-            drawerFilteringMutable.value = false
-            return
-        }
-        drawerFilteringMutable.value = true
-        drawerFilterJob = viewModelScope.launch {
-            val folderUri = mutable.value.folder?.let(Uri::parse)
-            val matched = withContext(Dispatchers.IO) {
-                filterFolderEntries(resolveSearchRoot(getApplication(), folderUri), trimmed)
-            }
-            if (drawerFilterMutable.value == query) {
-                filteredFilesMutable.value = matched
-                drawerFilteringMutable.value = false
-            }
-        }
-    }
-
-    fun openQuickSwitcher() {
-        closeFolderSearch()
-        quickSwitcherJob?.cancel()
-        quickSwitcherMutable.value = QuickSwitcherState(visible = true, query = "", loading = true)
-        quickSwitcherJob = viewModelScope.launch {
-            if (mutable.value.tabs.isNotEmpty()) {
-                val activeId = mutable.value.active.id
-                if (activeId.isNotEmpty()) runCatching { readerFlushRequester?.invoke(activeId) }
-            }
-            val tabsSnapshot = mutable.value.tabs
-            val recentSnapshot = recentMutable.value
-            val folderUri = mutable.value.folder?.let(Uri::parse)
-            val ranked = withContext(Dispatchers.IO) {
-                rankQuickSwitcher("", tabsSnapshot, recentSnapshot, resolveSearchRoot(getApplication(), folderUri))
-            }
-            if (quickSwitcherMutable.value.visible && quickSwitcherMutable.value.query.isEmpty()) {
-                quickSwitcherMutable.value = quickSwitcherMutable.value.copy(items = ranked, loading = false)
-            }
-        }
-    }
-
-    fun updateQuickSwitcherQuery(query: String) {
-        quickSwitcherJob?.cancel()
-        quickSwitcherMutable.value = quickSwitcherMutable.value.copy(query = query, loading = true)
-        quickSwitcherJob = viewModelScope.launch {
-            val tabsSnapshot = mutable.value.tabs
-            val recentSnapshot = recentMutable.value
-            val folderUri = mutable.value.folder?.let(Uri::parse)
-            val ranked = withContext(Dispatchers.IO) {
-                rankQuickSwitcher(query, tabsSnapshot, recentSnapshot, resolveSearchRoot(getApplication(), folderUri))
-            }
-            if (quickSwitcherMutable.value.visible && quickSwitcherMutable.value.query == query) {
-                quickSwitcherMutable.value = quickSwitcherMutable.value.copy(items = ranked, loading = false)
-            }
-        }
-    }
-
-    fun closeQuickSwitcher() {
-        quickSwitcherJob?.cancel()
-        quickSwitcherJob = null
-        if (quickSwitcherMutable.value.visible || quickSwitcherMutable.value.loading) {
-            quickSwitcherMutable.value = QuickSwitcherState(visible = false)
-        }
-    }
-
-    fun selectQuickSwitcherItem(item: QuickSwitcherItem) {
-        closeQuickSwitcher()
-        val existing = mutable.value.tabs.firstOrNull { tab ->
-            (item.tabId != null && tab.id == item.tabId) ||
-                (!item.uri.isNullOrBlank() && !tab.uri.isNullOrBlank() && sameDocumentUri(tab.uri, item.uri))
-        }
-        if (existing != null) {
-            select(existing.id)
-        } else if (!item.uri.isNullOrBlank()) {
-            open(Uri.parse(item.uri), item.relative)
-        }
-    }
-
     fun openFolderSearch(initialQuery: String? = null) {
-        closeQuickSwitcher()
         folderSearchJob?.cancel()
         val previous = folderSearchMutable.value
         val nextQuery = initialQuery ?: previous.query
@@ -2311,6 +2215,7 @@ class StudioViewModel(app: Application, val workspaceKey: String = "main") : And
         includeDiagrams: Boolean,
     ) {
         val tabsSnapshot = mutable.value.tabs
+        val activeTabId = mutable.value.active.id
         val recentSnapshot = recentMutable.value
         val folderUri = mutable.value.folder?.let(Uri::parse)
         val finalState = withContext(Dispatchers.IO) {
@@ -2325,6 +2230,7 @@ class StudioViewModel(app: Application, val workspaceKey: String = "main") : And
                     if (target.scheme == "file") target.path?.let(::File)?.inputStream()
                     else resolver.openInputStream(target)
                 },
+                activeTabId = activeTabId,
                 caseSensitive = caseSensitive,
                 excludeDiagrams = !includeDiagrams,
                 onBatch = { batch, scannedFiles, truncated, done ->
@@ -2367,7 +2273,6 @@ class StudioViewModel(app: Application, val workspaceKey: String = "main") : And
     }
 
     fun cancelWorkspaceSearch() {
-        closeQuickSwitcher()
         closeFolderSearch()
     }
 

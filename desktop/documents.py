@@ -409,260 +409,134 @@ _PORTABLE_FORMATS = ("supermd-smd", "supermd-fmd")
 _PORTABLE_ENVELOPE_RE = re.compile(r'^\ufeff?\s*\{\s*"format"\s*:\s*"supermd-(?:smd|fmd)"')
 
 
-def is_portable_gzip(head: bytes) -> bool:
-    return head.startswith(GZIP_MAGIC)
+def _read_bounded_utf8_stream(path: Path, *, is_gzip: bool):
+    import codecs
+    utf8 = codecs.getincrementaldecoder("utf-8")(errors="strict")
+    if not is_gzip:
+        total = 0
+        with path.open("rb") as source:
+            while chunk := source.read(65536):
+                total += len(chunk)
+                if total > MAX_FILE:
+                    raise ValueError("Portable note exceeds size limit")
+                yield utf8.decode(chunk, final=False)
+            tail = utf8.decode(b"", final=True)
+            if tail:
+                yield tail
+        return
+    decoder = zlib.decompressobj(16 + zlib.MAX_WBITS)
+    compressed_total = inflated_total = 0
+    with path.open("rb") as source:
+        while chunk := source.read(32768):
+            compressed_total += len(chunk)
+            if compressed_total > MAX_FILE:
+                raise ValueError("Compressed portable note exceeds size limit")
+            pending = chunk
+            while pending:
+                decoded = decoder.decompress(pending, min(65536, MAX_FILE - inflated_total + 1))
+                inflated_total += len(decoded)
+                if inflated_total > MAX_FILE or decoder.unused_data or (decoder.unconsumed_tail and not decoded):
+                    raise ValueError("Invalid or oversized compressed portable stream")
+                if decoded:
+                    yield utf8.decode(decoded, final=False)
+                pending = decoder.unconsumed_tail
+        tail_bytes = decoder.flush(65536)
+        inflated_total += len(tail_bytes)
+        if inflated_total > MAX_FILE:
+            raise ValueError("Inflated portable note exceeds size limit")
+        tail_text = utf8.decode(tail_bytes, final=True)
+        if tail_text:
+            yield tail_text
 
 
-def is_portable_envelope(text_head: str) -> bool:
-    return bool(_PORTABLE_ENVELOPE_RE.match(text_head))
-
-
-def _extract_portable_markdown_from_chunks(chunks, max_markdown_bytes: int = MAX_SEARCH_MARKDOWN_BYTES) -> str | None:
-    """Stream-parse a v1 portable JSON envelope and return its markdown without decoding assets."""
+def _extract_portable_markdown(chunks, max_markdown_bytes: int = MAX_SEARCH_MARKDOWN_BYTES) -> str | None:
+    """Extract `markdown` from a v1 portable JSON envelope and stop before `assets` payloads."""
     decoder = json.JSONDecoder()
     iterator = iter(chunks)
     buf = ""
     idx = 0
 
-    def compact() -> None:
+    def pull(min_extra: int = 1) -> bool:
         nonlocal buf, idx
         if idx > 65536:
             buf = buf[idx:]
             idx = 0
-
-    def pull() -> bool:
-        nonlocal buf
+        added = 0
+        pieces: list[str] = []
         for piece in iterator:
             if piece:
-                buf += piece
-                return True
-        return False
+                pieces.append(piece)
+                added += len(piece)
+                if added >= min_extra:
+                    break
+        if not pieces:
+            return False
+        buf += "".join(pieces)
+        return True
 
-    def skip_ws() -> bool:
+    def decode_next():
         nonlocal idx
         while True:
             while idx < len(buf) and buf[idx] in " \t\r\n":
                 idx += 1
-            compact()
-            if idx < len(buf):
-                return True
-            if not pull():
-                return False
+            if idx >= len(buf) and not pull():
+                raise ValueError("Unexpected EOF in portable JSON")
+            try:
+                val, idx = decoder.raw_decode(buf, idx)
+                return val
+            except json.JSONDecodeError:
+                if not pull(max(65536, len(buf) - idx)):
+                    raise
 
-    def find_string_end(start_quote: int, max_chars: int | None = None) -> int:
-        pos = start_quote + 1
-        while True:
-            while pos < len(buf):
-                if max_chars is not None and pos - start_quote > max_chars:
-                    raise ValueError("Portable string exceeds maximum searchable size")
-                ch = buf[pos]
-                if ch == "\\":
-                    if pos + 1 >= len(buf):
-                        if not pull():
-                            raise ValueError("Unterminated escape in portable JSON")
-                    pos += 2
-                    continue
-                if ch == '"':
-                    return pos
-                pos += 1
-            if not pull():
-                raise ValueError("Unterminated string in portable JSON")
-
-    def read_string(max_chars: int | None = None) -> str:
-        nonlocal idx
-        if not skip_ws() or buf[idx] != '"':
-            raise ValueError("Expected JSON string")
-        find_string_end(idx, max_chars=max_chars)
-        value, end = decoder.raw_decode(buf, idx)
-        idx = end
-        compact()
-        return value
-
-    def read_primitive():
-        nonlocal idx
-        if not skip_ws():
-            raise ValueError("Unexpected EOF in JSON value")
-        if buf[idx] == '"':
-            return read_string()
-        pos = idx
-        while True:
-            while pos < len(buf) and buf[pos] not in " \t\r\n,}]":
-                pos += 1
-            if pos < len(buf) or not pull():
-                break
-        value, end = decoder.raw_decode(buf, idx)
-        idx = end
-        compact()
-        return value
-
-    def skip_value() -> None:
-        nonlocal buf, idx
-        if not skip_ws():
-            raise ValueError("Unexpected EOF while skipping JSON value")
-        ch = buf[idx]
-        if ch == '"':
-            idx += 1
-            esc = False
-            while True:
-                while idx < len(buf):
-                    c = buf[idx]
-                    idx += 1
-                    if esc:
-                        esc = False
-                    elif c == "\\":
-                        esc = True
-                    elif c == '"':
-                        compact()
-                        return
-                compact()
-                if not pull():
-                    raise ValueError("Unterminated string while skipping JSON value")
-        if ch in "{[":
-            depth = 0
-            in_str = False
-            esc = False
-            while True:
-                while idx < len(buf):
-                    c = buf[idx]
-                    idx += 1
-                    if in_str:
-                        if esc:
-                            esc = False
-                        elif c == "\\":
-                            esc = True
-                        elif c == '"':
-                            in_str = False
-                    else:
-                        if c == '"':
-                            in_str = True
-                        elif c in "{[":
-                            depth += 1
-                        elif c in "}]":
-                            depth -= 1
-                            if depth == 0:
-                                compact()
-                                return
-                compact()
-                if not pull():
-                    raise ValueError("Unterminated container while skipping JSON value")
-        while True:
-            while idx < len(buf) and buf[idx] not in " \t\r\n,}]":
-                idx += 1
-            compact()
-            if idx < len(buf) or not pull():
-                return
-
-    if not skip_ws():
+    if not pull():
         return None
-    if buf[idx] == "\ufeff":
+    while idx < len(buf) and buf[idx] in "\ufeff \t\r\n":
         idx += 1
-        if not skip_ws():
-            return None
-    if buf[idx] != "{":
+    if idx >= len(buf) or buf[idx] != "{":
         return None
     idx += 1
-
-    fmt = None
-    version = None
-    markdown = None
-
-    if not skip_ws():
-        return None
-    if buf[idx] == "}":
-        return None
-
+    fmt = version = markdown = None
     while True:
-        key = read_string(max_chars=256)
-        if not skip_ws() or buf[idx] != ":":
-            raise ValueError("Expected ':' in portable JSON object")
+        while idx < len(buf) and buf[idx] in " \t\r\n":
+            idx += 1
+        if idx >= len(buf) and not pull():
+            return None
+        if buf[idx] == "}":
+            break
+        key = decode_next()
+        if not isinstance(key, str):
+            return None
+        while idx < len(buf) and buf[idx] in " \t\r\n":
+            idx += 1
+        if (idx >= len(buf) and not pull()) or buf[idx] != ":":
+            return None
         idx += 1
+        val = decode_next()
         if key == "format":
-            fmt = read_primitive()
-            if fmt not in _PORTABLE_FORMATS:
+            if val not in _PORTABLE_FORMATS:
                 return None
+            fmt = val
         elif key == "version":
-            version = read_primitive()
-            if version is True or version != 1:
+            if isinstance(val, bool) or val != 1:
                 return None
+            version = val
         elif key == "markdown":
-            if not skip_ws() or buf[idx] != '"':
+            if not isinstance(val, str) or len(val.encode("utf-8")) > max_markdown_bytes:
                 return None
-            markdown = read_string(max_chars=max_markdown_bytes * 2 + 64)
-            if len(markdown.encode("utf-8")) > max_markdown_bytes:
-                return None
-        else:
-            skip_value()
-
+            markdown = val
         if fmt in _PORTABLE_FORMATS and version == 1 and isinstance(markdown, str):
             return markdown
-
-        if not skip_ws():
+        while idx < len(buf) and buf[idx] in " \t\r\n":
+            idx += 1
+        if idx >= len(buf) and not pull():
             return None
         sep = buf[idx]
         idx += 1
-        compact()
         if sep == "}":
             break
         if sep != ",":
-            raise ValueError("Expected ',' or '}' in portable JSON object")
-
-    if fmt in _PORTABLE_FORMATS and version == 1 and isinstance(markdown, str):
-        return markdown
-    return None
-
-
-def _iter_gzip_utf8_chunks(path: Path, max_compressed: int = MAX_FILE, max_inflated: int = MAX_FILE):
-    import codecs
-    decoder = zlib.decompressobj(16 + zlib.MAX_WBITS)
-    utf8 = codecs.getincrementaldecoder("utf-8")(errors="strict")
-    compressed_total = 0
-    inflated_total = 0
-    with path.open("rb") as source:
-        while chunk := source.read(32 * 1024):
-            compressed_total += len(chunk)
-            if compressed_total > max_compressed:
-                raise ValueError("Compressed portable note exceeds size limit")
-            pending = chunk
-            while pending:
-                remaining = max_inflated - inflated_total
-                if remaining <= 0:
-                    raise ValueError("Inflated portable note exceeds size limit")
-                decoded = decoder.decompress(pending, min(64 * 1024, remaining + 1))
-                inflated_total += len(decoded)
-                if inflated_total > max_inflated:
-                    raise ValueError("Inflated portable note exceeds size limit")
-                if decoded:
-                    yield utf8.decode(decoded, final=False)
-                if decoder.unused_data:
-                    raise ValueError("Concatenated or trailing gzip stream")
-                pending = decoder.unconsumed_tail
-                if pending and not decoded:
-                    raise ValueError("Inflated portable note exceeds size limit")
-        tail = decoder.flush(64 * 1024)
-        if tail:
-            inflated_total += len(tail)
-            if inflated_total > max_inflated:
-                raise ValueError("Inflated portable note exceeds size limit")
-            yield utf8.decode(tail, final=True)
-        else:
-            final_text = utf8.decode(b"", final=True)
-            if final_text:
-                yield final_text
-
-
-def _iter_file_utf8_chunks(path: Path, max_bytes: int = MAX_FILE):
-    import codecs
-    utf8 = codecs.getincrementaldecoder("utf-8")(errors="strict")
-    total = 0
-    with path.open("rb") as source:
-        while chunk := source.read(64 * 1024):
-            total += len(chunk)
-            if total > max_bytes:
-                raise ValueError("Portable note exceeds size limit")
-            yield utf8.decode(chunk, final=False)
-        final_text = utf8.decode(b"", final=True)
-        if final_text:
-            yield final_text
+            return None
+    return markdown if fmt in _PORTABLE_FORMATS and version == 1 and isinstance(markdown, str) else None
 
 
 def read_searchable_markdown(path: Path, max_text_bytes: int = MAX_SEARCH_MARKDOWN_BYTES) -> str | None:
@@ -673,36 +547,36 @@ def read_searchable_markdown(path: Path, max_text_bytes: int = MAX_SEARCH_MARKDO
         info = path.stat()
         if not stat.S_ISREG(info.st_mode) or info.st_size > MAX_FILE:
             return None
+        stat_key = (info.st_dev, info.st_ino, info.st_size, info.st_mtime_ns)
+        with _VALIDATED_LOCK:
+            cached = _RECENT_PORTABLE_FILES.get(stat_key)
+        if cached is not None and len(cached[1].encode("utf-8")) <= max_text_bytes:
+            return cached[1]
         with path.open("rb") as handle:
             head = handle.read(8192)
     except OSError:
         return None
-
     if not head:
         return ""
-
-    if is_portable_gzip(head):
+    if head.startswith(GZIP_MAGIC):
         try:
-            return _extract_portable_markdown_from_chunks(_iter_gzip_utf8_chunks(path), max_markdown_bytes=max_text_bytes)
+            return _extract_portable_markdown(_read_bounded_utf8_stream(path, is_gzip=True), max_text_bytes)
         except (ValueError, json.JSONDecodeError, UnicodeDecodeError, zlib.error, OSError, EOFError):
             return None
-
     if b"\x00" in head:
         return None
-
     head_text = head.decode("utf-8-sig", errors="replace")
     if head_text.lstrip().startswith("{"):
         try:
-            extracted = _extract_portable_markdown_from_chunks(_iter_file_utf8_chunks(path), max_markdown_bytes=max_text_bytes)
+            extracted = _extract_portable_markdown(_read_bounded_utf8_stream(path, is_gzip=False), max_text_bytes)
         except (ValueError, json.JSONDecodeError, UnicodeDecodeError, OSError):
-            if re.search(r'"format"\s*:\s*"supermd-(?:smd|fmd)"', head_text):
+            if _PORTABLE_ENVELOPE_RE.match(head_text):
                 return None
         else:
             if extracted is not None:
                 return extracted
-            if is_portable_envelope(head_text):
+            if _PORTABLE_ENVELOPE_RE.match(head_text):
                 return None
-
     if info.st_size > max_text_bytes:
         return None
     try:
