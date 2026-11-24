@@ -45,7 +45,7 @@ ApplicationWindow {
         self.assertIsNotNone(entry)
         hints=[o for o in entry.findChildren(QObject) if o.metaObject().indexOfProperty("requested")>=0 and o.property("visible")]
         self.assertEqual(len(hints),1,"Only one file-path tooltip may be visible")
-        QTest.mouseClick(self.window,Qt.RightButton,Qt.NoModifier,QPoint(120,40));QTest.qWait(150)
+        QTest.mouseClick(self.window,Qt.MouseButton.RightButton,Qt.KeyboardModifier.NoModifier,QPoint(120,40));QTest.qWait(150)
         menu=entry.findChild(QObject,"recentContextMenu")
         self.assertIsNotNone(menu);self.assertTrue(menu.property("visible"));self.assertEqual(self.window.property("contextMenuCount"),1)
         self.assertTrue(all(not hint.property("visible") for hint in hints),"A path hint must disappear while the context menu is open")
@@ -55,5 +55,5 @@ ApplicationWindow {
         background=menu.property("background");p=background.mapToScene(QPointF(3,background.height()/2))
         color=self.window.grabWindow().pixelColor(round(p.x()),round(p.y()))
         self.assertEqual(color,QColor(self.palette.palette["surface-low"]),"The menu must cover the contrasting page beneath it")
-        QTest.mouseClick(self.window,Qt.LeftButton,Qt.NoModifier,QPoint(460,350));QTest.qWait(100)
+        QTest.mouseClick(self.window,Qt.MouseButton.LeftButton,Qt.KeyboardModifier.NoModifier,QPoint(460,350));QTest.qWait(100)
         self.assertFalse(menu.property("visible"));self.assertEqual(self.window.property("contextMenuCount"),0)
