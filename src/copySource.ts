@@ -1,3 +1,5 @@
+import { caretRangeAtPoint } from "./caretPoint";
+
 /** Serialize the selected rendered fragment as Markdown, not KaTeX's duplicated
  * visual glyphs. Expand selection endpoints inside math to the original formula. */
 export function selectedMarkdown(selection: Selection | null, source?:string): string | null {
@@ -98,17 +100,8 @@ export function setSelectedMarkdownDrag(event: Pick<DragEvent,"target"|"dataTran
   // dragstart can also fire for an unselected link while an older text
   // selection remains elsewhere in the same paragraph. Resolve the pointer to
   // its caret and only replace text when dragging actually began in selection.
-  const doc=target.ownerDocument as Document&{
-    caretPositionFromPoint?:(x:number,y:number)=>{offsetNode:Node;offset:number}|null;
-    caretRangeFromPoint?:(x:number,y:number)=>Range|null;
-  };
-  const caret=doc.caretPositionFromPoint?.(event.clientX,event.clientY);
-  if(caret){
-    if(!selection.getRangeAt(0).isPointInRange(caret.offsetNode,caret.offset))return false;
-  }else{
-    const pointRange=doc.caretRangeFromPoint?.(event.clientX,event.clientY);
-    if(!pointRange||!selection.getRangeAt(0).isPointInRange(pointRange.startContainer,pointRange.startOffset))return false;
-  }
+  const pointRange=caretRangeAtPoint(target.ownerDocument,event.clientX,event.clientY);
+  if(!pointRange||!selection.getRangeAt(0).isPointInRange(pointRange.startContainer,pointRange.startOffset))return false;
   const endpointRoot=(node:Node)=>{
     const element=node instanceof Element?node:node.parentElement;
     return element?.closest(".live-document")||element?.closest(".markdown-body");
