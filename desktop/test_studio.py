@@ -13,6 +13,12 @@ from documents import atomic_json
 import updates
 
 class QuietStudio(Studio):
+    def __init__(self, isolated: bool = False, session: Session | None = None):
+        session = session or Session(isolated)
+        if not session.settings.get("python"):
+            session.settings["python"] = sys.executable
+        super().__init__(isolated, session)
+
     def _refresh_theme(self):
         self.system_dark = True
 
@@ -313,6 +319,20 @@ class StudioTest(unittest.TestCase):
         studio._choose_default_python()
         studio._submit(lambda:1,lambda *_:self.fail("Retired callback ran"))
         studio._complete((lambda *_:self.fail("Retired callback ran"),None,None,False))
+
+    def test_default_python_selection_populates_empty_setting(self):
+        session=Session(True)
+        self.assertEqual(session.settings["python"],"")
+        with patch("studio.python_runtime.preferred",return_value=sys.executable) as preferred:
+            studio=Studio(True,session)
+            studio._refresh_theme=lambda:None
+            self.windows.append(studio)
+            deadline=time.monotonic()+2
+            while not session.settings.get("python") and time.monotonic()<deadline:
+                self.app.processEvents()
+                time.sleep(.005)
+        preferred.assert_called_once_with(session.data/"python-env")
+        self.assertEqual(session.settings["python"],sys.executable)
 
     def test_pinned_recents_are_first_and_never_evicted_by_recent_opens(self):
         studio=self.studio;studio.recent=["/notes/pinned.md"]

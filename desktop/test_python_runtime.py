@@ -4,6 +4,7 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 import python_runtime
 
@@ -43,6 +44,55 @@ class PythonRuntimeTest(unittest.TestCase):
             paths = [str(path) for path in python_runtime.candidates(Path(folder, "managed"), [folder])]
         self.assertTrue(any(os.path.samefile(path, sys.executable) for path in paths if os.path.exists(path)))
         self.assertTrue(all(python_runtime.NAME.match(Path(path).name) for path in paths))
+
+    @unittest.skipIf(os.name == "nt", "POSIX symlink layout test")
+    def test_candidates_deduplicates_same_bin_symlinks_while_keeping_distinct_venvs(self):
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            base_bin = root / "base" / "bin"
+            base_bin.mkdir(parents=True)
+            real_python = base_bin / "python3.12"
+            real_python.write_text("#!/bin/sh\n", encoding="utf-8")
+            real_python.chmod(0o755)
+            (base_bin / "python3").symlink_to("python3.12")
+            (base_bin / "python").symlink_to("python3")
+
+            venv_a = root / "proj-a" / ".venv" / "bin"
+            venv_b = root / "proj-b" / ".venv" / "bin"
+            for venv_bin in (venv_a, venv_b):
+                venv_bin.mkdir(parents=True)
+                (venv_bin / "python3").symlink_to(real_python)
+                (venv_bin / "python").symlink_to("python3")
+
+            managed = root / "managed"
+            managed_bin = managed / "bin"
+            managed_bin.mkdir(parents=True)
+            (managed_bin / "python3").symlink_to(real_python)
+            (managed_bin / "python").symlink_to("python3")
+
+            found = python_runtime.candidates(managed, [str(root / "proj-a"), str(root / "proj-b")])
+            by_parent = {}
+            for candidate in found:
+                if candidate.parent in (managed_bin, venv_a, venv_b):
+                    by_parent.setdefault(candidate.parent, []).append(candidate.name)
+            self.assertEqual(by_parent[managed_bin], ["python3"])
+            self.assertEqual(by_parent[venv_a], ["python3"])
+            self.assertEqual(by_parent[venv_b], ["python3"])
+
+    def test_preferred_uses_ready_managed_environment_without_full_discovery(self):
+        with tempfile.TemporaryDirectory() as folder:
+            managed = Path(folder, "python-env")
+            candidate = python_runtime._bin(managed)[0]
+            candidate.parent.mkdir(parents=True, exist_ok=True)
+            candidate.write_text("", encoding="utf-8")
+            with patch("python_runtime.bundled_available", return_value=False), patch(
+                "python_runtime.probe", return_value={"matplotlib": True, "numpy": True}
+            ) as probe_mock, patch(
+                "python_runtime.discover", side_effect=AssertionError("discover() should not run when managed env is ready")
+            ):
+                chosen = python_runtime.preferred(managed)
+        self.assertEqual(chosen, str(candidate))
+        probe_mock.assert_called_once_with(str(candidate))
 
 
 if __name__ == "__main__":
