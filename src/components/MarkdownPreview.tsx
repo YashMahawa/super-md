@@ -213,24 +213,24 @@ function MarkdownPreview({ markdown, documentPath, python, dark, trustedImageHos
       const language = child.props.className?.match(/language-([\w-]+)/)?.[1];
       const source = textOf(child.props.children).replace(/\n$/, "");
       const nodeData=node as {position?:{start?:{offset?:number};end?:{offset?:number}};properties?:Record<string,unknown>}|undefined;
-      const startOffset=nodeData?.properties?.['data-source-start']??nodeData?.position?.start?.offset;
-      const endOffset=nodeData?.properties?.['data-source-end']??nodeData?.position?.end?.offset;
-      const offset=Number(startOffset);
+      const offset=Number(nodeData?.properties?.['data-source-start']??nodeData?.position?.start?.offset);
+      const endOffset=Number(nodeData?.properties?.['data-source-end']??nodeData?.position?.end?.offset);
+      const hasRange=Number.isInteger(offset)&&Number.isInteger(endOffset)&&offset>=0&&endOffset>offset;
+      const srcStart=hasRange?offset:undefined,srcEnd=hasRange?endOffset:undefined;
       const pythonCell=['python','py'].includes(language||'')?docAnalysis.pythonCells.find(cell=>cell.source===source&&cell.offset===offset):undefined;
       const context=docPath&&pythonCell?{document:docPath,cell:String(pythonCell.ordinal),interpreter:py||'embedded'}:undefined;
       const protectedBlock = (block: ReactNode) => <CodeBlockBoundary key={`${language}:${source}`} source={source}>{block}</CodeBlockBoundary>;
       if (language === "smd-tree") return protectedBlock(<InlineDiagram diagram={parseBinaryTreeSource(source)}/>);
       if (language === "smd-diagram") return protectedBlock(<InlineDiagram diagram={parseDiagramSource(source)}/>);
-      if (language === "smd-steps") return protectedBlock(<StepCards source={source} renderImage={(src,alt)=><AssetImage src={src} alt={alt} documentPath={docPath} trustedImageHosts={hosts} onTrustImageHost={trustHost}/>} renderChart={chartSource=><ThemedChart source={chartSource} dark={isDark}/>} renderMarkdown={text=><MarkdownPreview markdown={text} documentPath={docPath} python={py} dark={isDark} trustedImageHosts={hosts} onTrustImageHost={trustHost}/>} />);
+      if (language === "smd-steps") return protectedBlock(<StepCards source={source} sourceStart={srcStart} sourceEnd={srcEnd} renderImage={(src,alt)=><AssetImage src={src} alt={alt} documentPath={docPath} trustedImageHosts={hosts} onTrustImageHost={trustHost}/>} renderChart={chartSource=><ThemedChart source={chartSource} dark={isDark}/>} renderMarkdown={text=><MarkdownPreview markdown={text} documentPath={docPath} python={py} dark={isDark} trustedImageHosts={hosts} onTrustImageHost={trustHost}/>} />);
       if (language === "smd-chart") return protectedBlock(<ThemedChart source={source} dark={isDark} />);
       if (language === "svg") return protectedBlock(<ThemedSvg source={source} dark={isDark} />);
       if (language === "mermaid") return protectedBlock(<Suspense fallback={<span className="image-loading" role="status">Loading diagram…</span>}><ThemedMermaid source={source} dark={isDark} /></Suspense>);
-      if (language === "python" || language === "py") return protectedBlock(<PythonCell source={source} python={py} context={context} highlighted={child.props.children} />);
-      const rawStart=Number(startOffset),rawEnd=Number(endOffset);
-      const lineBreak=Number.isFinite(rawStart)?sourceText.indexOf("\n",rawStart):-1;
-      const bodyStart=lineBreak>=0&&( !Number.isFinite(rawEnd)||lineBreak<rawEnd )?lineBreak+1:undefined;
-      const bodyEnd=bodyStart!==undefined?Math.min(Number.isFinite(rawEnd)?rawEnd:bodyStart+source.length,bodyStart+source.length):undefined;
-      return <div className="code-container" data-source-start={startOffset as number|undefined} data-source-end={endOffset as number|undefined}><CopyCode source={source}/><details className="code-disclosure" open={source.split("\n").length <= 12}><summary>{language || "Code"} <span>{source.split("\n").length} lines</span></summary><pre data-source-start={bodyStart} data-source-end={bodyEnd}>{children}</pre></details></div>;
+      if (language === "python" || language === "py") return protectedBlock(<PythonCell source={source} python={py} context={context} sourceStart={srcStart} sourceEnd={srcEnd} highlighted={child.props.children} />);
+      const lineBreak=srcStart!==undefined?sourceText.indexOf("\n",srcStart):-1;
+      const bodyStart=lineBreak>=0&&(srcEnd===undefined||lineBreak<srcEnd)?lineBreak+1:undefined;
+      const bodyEnd=bodyStart!==undefined?Math.min(srcEnd??bodyStart+source.length,bodyStart+source.length):undefined;
+      return <div className="code-container" data-source-start={srcStart} data-source-end={srcEnd}><CopyCode source={source}/><details className="code-disclosure" open={source.split("\n").length <= 12}><summary>{language || "Code"} <span>{source.split("\n").length} lines</span></summary><pre data-source-start={bodyStart} data-source-end={bodyEnd}>{children}</pre></details></div>;
     }
   }),[]);
   return (

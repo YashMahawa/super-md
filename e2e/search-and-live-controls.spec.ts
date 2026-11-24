@@ -30,6 +30,7 @@ test("Read mode hides Replace, Previous wraps 0/N to N/N in standard and large v
     window.SuperMD = { post: (id, command, raw) => (window as any).onDocChange(id, command, raw) };
   });
   await page.goto("/android-reader.html");
+  await page.waitForFunction(() => typeof window.supermdLoad === "function");
 
   const baseState = {
     id: "search-spec",
@@ -152,6 +153,7 @@ test("Live mode Edit block works via mouse, keyboard, and touch on media, diagra
 
   await page.addInitScript(() => { window.SuperMD = { post: () => {} }; });
   await page.goto("/android-reader.html");
+  await page.waitForFunction(() => typeof window.supermdLoad === "function");
   await page.evaluate((content) => window.supermdLoad?.({ id: "live-blocks", content, path: null, mode: "live", dark: false, fullscreen: false, colors: {}, font: "Manrope", size: 18, zoom: 100 }), note);
 
   // 1. Image block: single click opens ImageViewer; Edit block opens Markdown source; Escape closes ImageViewer before editor/search.
@@ -237,6 +239,7 @@ test("Changing a block's line count in Live mode and clicking a checkbox, link, 
     };
   });
   await page.goto("/android-reader.html");
+  await page.waitForFunction(() => typeof window.supermdLoad === "function");
   await page.evaluate((text) => window.supermdLoad?.({ id: "stable-close", content: text, path: null, mode: "live", dark: false, fullscreen: false, colors: {}, font: "Manrope", size: 18, zoom: 100 }), content);
 
   const editableHeading = page.getByRole("heading", { name: "Editable Section" });

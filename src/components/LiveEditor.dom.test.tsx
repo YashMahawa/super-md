@@ -10,6 +10,10 @@ function pointerEvent(type: string, init: MouseEventInit & { pointerId?: number;
   const event = new MouseEvent(type, init);
   return Object.assign(event, { pointerId: init.pointerId ?? 1, pointerType: init.pointerType ?? "mouse" });
 }
+function StatefulLiveEditor({ initial, onEdit, typewriterScroll }: { initial: string; onEdit?: (next: string) => void; typewriterScroll?: boolean }) {
+  const [markdown, setMarkdown] = useState(initial);
+  return <LiveEditor markdown={markdown} documentPath={null} dark={false} python="" typewriterScroll={typewriterScroll} onChange={(next) => { setMarkdown(next); onEdit?.(next); }} />;
+}
 it("has no edit icons; single clicks select and double clicks edit, not links", async () => {
   const host = document.createElement("div"); document.body.append(host); const root = createRoot(host); const edit = vi.fn();
   await act(async () => root.render(<LiveEditor markdown={'# Clear notes\n\n[Video](https://youtube.com)'} documentPath={null} dark python="" onChange={edit} />));
@@ -402,4 +406,125 @@ it("toggles scroll centering immediately in LiveEditor when clicking Editor stat
   host.remove();
   delete document.documentElement.dataset.reduceMotion;
   setTypewriterScroll(false);
+});
+it("continues and clears list, task, and quote markers on Enter and indents/outdents lists with Tab and Shift+Tab without losing focus", async () => {
+  document.documentElement.dataset.reduceMotion = "true";
+  const host = document.createElement("div");
+  host.className = "reading-scroll";
+  Object.defineProperty(host, "clientHeight", { value: 400, configurable: true });
+  host.getBoundingClientRect = () => ({ top: 0, bottom: 400, left: 0, right: 800, width: 800, height: 400, x: 0, y: 0, toJSON: () => ({}) });
+  document.body.append(host);
+  const root = createRoot(host);
+  const edits: string[] = [];
+  const initial = "- [x] Done task\n\n> [!answer]\n\nPlain paragraph\n\n```ts\n- literal code\n```";
+  await act(async () => root.render(<StatefulLiveEditor initial={initial} onEdit={(v) => edits.push(v)} typewriterScroll />));
+
+  // Open task list block
+  act(() => host.querySelector("li")!.dispatchEvent(new MouseEvent("dblclick", { bubbles: true })));
+  const area = host.querySelector<HTMLTextAreaElement>("textarea")!;
+  area.focus();
+  area.setSelectionRange(area.value.length, area.value.length);
+  expect(document.activeElement).toBe(area);
+
+  // IME composition Enter is ignored
+  const imeEnter = new KeyboardEvent("keydown", { key: "Enter", bubbles: true, cancelable: true, isComposing: true });
+  act(() => { area.dispatchEvent(imeEnter); });
+  expect(imeEnter.defaultPrevented).toBe(false);
+  expect(area.value).toBe("- [x] Done task");
+
+  // Enter continues task with unchecked checkbox, restores selection, and centers typewriter scroll
+  area.getBoundingClientRect = () => ({ top: 320, bottom: 460, left: 20, right: 780, width: 760, height: 140, x: 20, y: 320, toJSON: () => ({}) });
+  host.scrollTop = 100;
+  const enter1 = new KeyboardEvent("keydown", { key: "Enter", bubbles: true, cancelable: true });
+  act(() => { area.dispatchEvent(enter1); });
+  expect(enter1.defaultPrevented).toBe(true);
+  expect(area.value).toBe("- [x] Done task\n- [ ] ");
+  expect(area.selectionStart).toBe(area.value.length);
+  expect(area.selectionEnd).toBe(area.value.length);
+  expect(document.activeElement).toBe(area);
+  await act(async () => { await new Promise((resolve) => requestAnimationFrame(resolve)); });
+  expect(host.scrollTop).toBeGreaterThan(100);
+
+  // Multi-line selection Tab and Shift+Tab preserve selection range and focus
+  area.setSelectionRange(0, area.value.length);
+  act(() => { area.dispatchEvent(new KeyboardEvent("keydown", { key: "Tab", bubbles: true, cancelable: true })); });
+  expect(area.value).toBe("  - [x] Done task\n  - [ ] ");
+  expect(area.selectionStart).toBe(0);
+  expect(area.selectionEnd).toBe(area.value.length);
+  act(() => { area.dispatchEvent(new KeyboardEvent("keydown", { key: "Tab", shiftKey: true, bubbles: true, cancelable: true })); });
+  expect(area.value).toBe("- [x] Done task\n- [ ] ");
+  area.setSelectionRange(area.value.length, area.value.length);
+
+  // Tab indents second task item and caps nested indentation at one level without losing focus
+  const tab1 = new KeyboardEvent("keydown", { key: "Tab", bubbles: true, cancelable: true });
+  act(() => { area.dispatchEvent(tab1); });
+  expect(tab1.defaultPrevented).toBe(true);
+  expect(area.value).toBe("- [x] Done task\n  - [ ] ");
+  expect(area.selectionStart).toBe(area.value.length);
+  expect(document.activeElement).toBe(area);
+
+  const tab2 = new KeyboardEvent("keydown", { key: "Tab", bubbles: true, cancelable: true });
+  act(() => { area.dispatchEvent(tab2); });
+  expect(tab2.defaultPrevented).toBe(true);
+  expect(area.value).toBe("- [x] Done task\n  - [ ] ");
+  expect(document.activeElement).toBe(area);
+
+  // Shift+Tab outdents back to root; a second Shift+Tab at root prevents blur without removing marker
+  const shiftTab1 = new KeyboardEvent("keydown", { key: "Tab", shiftKey: true, bubbles: true, cancelable: true });
+  act(() => { area.dispatchEvent(shiftTab1); });
+  expect(shiftTab1.defaultPrevented).toBe(true);
+  expect(area.value).toBe("- [x] Done task\n- [ ] ");
+  expect(document.activeElement).toBe(area);
+
+  const shiftTabRoot = new KeyboardEvent("keydown", { key: "Tab", shiftKey: true, bubbles: true, cancelable: true });
+  act(() => { area.dispatchEvent(shiftTabRoot); });
+  expect(shiftTabRoot.defaultPrevented).toBe(true);
+  expect(area.value).toBe("- [x] Done task\n- [ ] ");
+  expect(document.activeElement).toBe(area);
+
+  // Enter on empty task marker clears it cleanly
+  const enterClear = new KeyboardEvent("keydown", { key: "Enter", bubbles: true, cancelable: true });
+  act(() => { area.dispatchEvent(enterClear); });
+  expect(enterClear.defaultPrevented).toBe(true);
+  expect(area.value).toBe("- [x] Done task\n");
+  expect(area.selectionStart).toBe(area.value.length);
+
+  // Escape dismisses the active textarea
+  act(() => { area.dispatchEvent(new KeyboardEvent("keydown", { key: "Escape", bubbles: true, cancelable: true })); });
+  expect(host.querySelector("textarea")).toBeNull();
+  expect(edits.at(-1)).toContain("- [x] Done task\n");
+
+  // Open callout blockquote: Enter continues with "> " without repeating "[!answer]", and Escape closes
+  const blocks = host.querySelectorAll<HTMLElement>(".live-block");
+  act(() => blocks[1].dispatchEvent(new MouseEvent("dblclick", { bubbles: true })));
+  const quoteArea = host.querySelector<HTMLTextAreaElement>("textarea")!;
+  quoteArea.focus();
+  quoteArea.setSelectionRange(quoteArea.value.length, quoteArea.value.length);
+  act(() => { quoteArea.dispatchEvent(new KeyboardEvent("keydown", { key: "Enter", bubbles: true, cancelable: true })); });
+  expect(quoteArea.value).toBe("> [!answer]\n> ");
+  act(() => { quoteArea.dispatchEvent(new KeyboardEvent("keydown", { key: "Escape", bubbles: true, cancelable: true })); });
+  expect(host.querySelector("textarea")).toBeNull();
+
+  // Open plain paragraph: Tab/Shift+Tab indents and outdents in-place while retaining focus
+  act(() => host.querySelectorAll<HTMLElement>(".live-block")[2].dispatchEvent(new MouseEvent("dblclick", { bubbles: true })));
+  const paraArea = host.querySelector<HTMLTextAreaElement>("textarea")!;
+  const paraTab = new KeyboardEvent("keydown", { key: "Tab", bubbles: true, cancelable: true });
+  act(() => { paraArea.dispatchEvent(paraTab); });
+  expect(paraTab.defaultPrevented).toBe(true);
+  expect(paraArea.value).toBe("  Plain paragraph");
+  act(() => { paraArea.dispatchEvent(new KeyboardEvent("keydown", { key: "Tab", shiftKey: true, bubbles: true, cancelable: true })); });
+  expect(paraArea.value).toBe("Plain paragraph");
+  act(() => { paraArea.dispatchEvent(new KeyboardEvent("keydown", { key: "Escape", bubbles: true, cancelable: true })); });
+
+  // Open protected code block: Enter remains literal (not prevented as a list continuation)
+  act(() => host.querySelectorAll<HTMLElement>(".live-block")[3].dispatchEvent(new MouseEvent("dblclick", { bubbles: true })));
+  const codeArea = host.querySelector<HTMLTextAreaElement>("textarea")!;
+  codeArea.setSelectionRange(codeArea.value.indexOf("code") + 4, codeArea.value.indexOf("code") + 4);
+  const codeEnter = new KeyboardEvent("keydown", { key: "Enter", bubbles: true, cancelable: true });
+  act(() => { codeArea.dispatchEvent(codeEnter); });
+  expect(codeEnter.defaultPrevented).toBe(false);
+
+  act(() => root.unmount());
+  host.remove();
+  delete document.documentElement.dataset.reduceMotion;
 });

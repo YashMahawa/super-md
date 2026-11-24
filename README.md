@@ -295,9 +295,11 @@ Install the complete bundled study-note skill:
 
 ```sh
 super-md agent install-skill
+super-md agent install-skill --agent claude
+super-md agent install-skill --agent cursor
 ```
 
-The default destination is `~/.codex/skills/super-md` (or `$CODEX_HOME/skills/super-md`). Use `--destination PATH` for another agent's skill directory. `--replace` backs up an existing skill and preserves its local preferences. The package includes its reference guides and SVG example.
+The default destination is `~/.codex/skills/super-md` (or `$CODEX_HOME/skills/super-md`). Pass `--agent` (`codex`, `claude`, `cursor`, `gemini`, or `agents`) or `--destination PATH` for another agent's skill directory. `--replace` backs up an existing skill and preserves its local preferences. The package includes its reference guides and SVG example, and can also be exported as `super-md-skill.zip` from Settings → AI agent access.
 
 Create and inspect notes without opening the application:
 
