@@ -168,7 +168,6 @@ ApplicationWindow {
         case "new_note": studio.newNote(); break
         case "open": openDialog.open(); break
         case "save": studio.saveSafely(); break
-        case "save_as": studio.saveAsSafely(); break
         case "undo": studio.command("undo"); break
         case "redo": studio.command("redo"); break
         case "copy": window.nativeReaderEditAction("copy"); break
@@ -249,13 +248,12 @@ ApplicationWindow {
     Connections {
         target: studio
         function onAllowClose() {
-            flushDialog.close(); closeDialog.close(); conflictDialog.close()
+            flushDialog.close(); closeDialog.close()
             if (studio.backgroundEnabled) { window.hide(); return }
             intentionalShutdown = true; closingAllowed = true; window.close()
         }
-        function onFlushFailed(canClose) { if(!closingAllowed && !closeDialog.visible && !conflictDialog.visible) { flushDialog.canClose = canClose; flushDialog.open() } }
+        function onFlushFailed(canClose) { if(!closingAllowed && !closeDialog.visible) { flushDialog.canClose = canClose; flushDialog.open() } }
         function onCloseRequested(name) { flushDialog.close(); closeDialog.title = "Save changes to " + name + "?"; if(!closeDialog.visible) closeDialog.open() }
-        function onConflictRequested(name) { flushDialog.close(); closeDialog.close(); conflictDialog.noteName = name; if(!conflictDialog.visible) conflictDialog.open() }
         function onSaveRequested(name) { saveDialog.selectedFile = studio.defaultSaveLocation(name); saveDialog.open() }
         function onNoteLocationPickerRequested() { noteFolderDialog.open() }
         function onExportRequested(format) { sharing = false; outputFormat = format; exportDialog.open() }
@@ -344,7 +342,6 @@ ApplicationWindow {
                 ActionButton { glyph: "FolderOpen"; ToolTip.text: "Open folder"; Accessible.name: "Open folder"; onClicked: studio.chooseFolder() }
                 ActionButton { text: window.width < 1060 ? "" : "Open note"; glyph: "File"; ToolTip.text: "Open note (" + window.shortcutLabels.open + ")"; onClicked: openDialog.open() }
                 ActionButton { glyph: "FloppyDisk"; ToolTip.text: "Save note (" + window.shortcutLabels.save + ")"; onClicked: studio.saveSafely(); enabled: !viewState.busy }
-                ActionButton { visible: window.width >= 1060; objectName: "toolbarSaveAsButton"; glyph: "DownloadSimple"; ToolTip.text: "Save note as (" + window.shortcutLabels.save_as + ")"; Accessible.name: "Save note as"; onClicked: studio.saveAsSafely(); enabled: !viewState.busy }
                 ActionButton { glyph: "Undo"; ToolTip.text: "Undo (" + window.shortcutLabels.undo + ")"; onClicked: studio.command("undo") }
                 ActionButton { glyph: "Redo"; ToolTip.text: "Redo (" + window.shortcutLabels.redo + ")"; onClicked: studio.command("redo") }
                 Item {
@@ -370,7 +367,6 @@ ApplicationWindow {
                         id: noteActions
                         objectName: "compactNoteActions"
                         implicitWidth: 250
-                        NoteMenuItem { text: "Save note as"; icon.source: "../icons/FloppyDisk.svg"; onTriggered: studio.saveAsSafely() }
                         NoteMenuItem { text: "Insert image or link"; icon.source: "../icons/Image.svg"; onTriggered: studio.command("insert") }
                         NoteMenuItem { text: "Fix LaTeX"; icon.source: "../icons/Bug.svg"; onTriggered: studio.command("repair") }
                         NoteMenuItem { text: "Share note"; icon.source: "../icons/ShareNetwork.svg"; onTriggered: window.showExport(true) }
@@ -600,7 +596,6 @@ ApplicationWindow {
                 onContentsRequested: contentsPopup.open()
                 onExitRequested: windowModes.setFullscreen(false)
                 onSaveRequested: studio.saveSafely()
-                onSaveAsRequested: studio.saveAsSafely()
                 onExportRequested: window.showExport(false)
             }
             Rectangle {
@@ -651,7 +646,7 @@ ApplicationWindow {
     FileDialog { id: openDialog; title: "Open note"; nameFilters: ["Notes (*.md *.smd *.fmd *.markdown *.txt)", "All files (*)"]; onAccepted: studio.openNote(selectedFile.toString()) }
     FolderDialog { id: folderDialog; title: "Open folder"; onAccepted: studio.openFolder(selectedFolder.toString()) }
     FolderDialog { id: noteFolderDialog; title: "Default location for new notes"; onAccepted: studio.setNoteLocation(selectedFolder.toString()) }
-    FileDialog { id: saveDialog; objectName: "saveDialog"; title: "Save note"; fileMode: FileDialog.SaveFile; nameFilters: viewState.portable ? ["Portable Super MD (*.smd)", "Markdown (*.md)"] : ["Markdown (*.md)", "Portable Super MD (*.smd)"]; onAccepted: studio.saveAs(selectedFile.toString()); onRejected: studio.resolveClose("cancel") }
+    FileDialog { id: saveDialog; title: "Save note"; fileMode: FileDialog.SaveFile; nameFilters: viewState.portable ? ["Portable Super MD (*.smd)"] : ["Markdown (*.md)", "Portable Super MD (*.smd)"]; onAccepted: studio.saveAs(selectedFile.toString()); onRejected: studio.resolveClose("cancel") }
     Component {
         id: exportDestinationComponent
         FileDialog {
@@ -712,33 +707,6 @@ ApplicationWindow {
                 ActionButton { text: "Cancel"; onClicked: { closeDialog.close(); studio.resolveClose("cancel") } }
                 ActionButton { text: "Discard"; onClicked: { closeDialog.close(); studio.resolveClose("discard") } }
                 ActionButton { text: "Save"; prominent: true; onClicked: { closeDialog.close(); studio.resolveClose("save") } }
-            }
-        }
-    }
-    AppDialog {
-        id: conflictDialog
-        objectName: "conflictDialog"
-        property string noteName: ""
-        title: noteName ? (noteName + " changed outside Super MD") : "File changed outside Super MD"
-        width: Math.min(540, window.width - 48)
-        closePolicy: Popup.NoAutoClose
-        onRejected: studio.resolveConflict("cancel")
-        ColumnLayout {
-            width: parent.width
-            spacing: 20
-            Label {
-                text: "Another app or sync client modified this file on disk. Save a copy to keep both versions, overwrite the disk file with your edits, or reload the disk version (your local draft will be archived in closed-note recovery)."
-                Layout.fillWidth: true
-                wrapMode: Text.WordWrap
-            }
-            RowLayout {
-                Layout.fillWidth: true
-                spacing: 8
-                ActionButton { objectName: "conflictCancelButton"; text: "Cancel"; onClicked: { conflictDialog.close(); studio.resolveConflict("cancel") } }
-                Item { Layout.fillWidth: true }
-                ActionButton { objectName: "conflictReloadButton"; text: "Reload"; onClicked: { conflictDialog.close(); studio.resolveConflict("reload") } }
-                ActionButton { objectName: "conflictOverwriteButton"; text: "Overwrite"; onClicked: { conflictDialog.close(); studio.resolveConflict("overwrite") } }
-                ActionButton { objectName: "conflictSaveCopyButton"; text: "Save a copy"; prominent: true; onClicked: { conflictDialog.close(); studio.resolveConflict("save_copy") } }
             }
         }
     }

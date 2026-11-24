@@ -108,7 +108,6 @@ ScrollView {
                 NoteContextMenu {
                     id: tabMenu
                     objectName: "tabContextMenu"
-                    NoteMenuItem { text: "Save note as"; icon.source: "../icons/FloppyDisk.svg"; onTriggered: studio.saveAsSafely(tab.modelData.id) }
                     NoteMenuItem { text: "Rename note"; icon.source: "../icons/Rename.svg"; onTriggered: strip.openRename(tab.modelData.id, tab.modelData.name) }
                     NoteMenuItem { text: "Undo"; enabled: tab.modelData.id===strip.viewState.active; onTriggered:studio.command("undo") }
                     NoteMenuItem { text: "Redo"; enabled: tab.modelData.id===strip.viewState.active; onTriggered:studio.command("redo") }

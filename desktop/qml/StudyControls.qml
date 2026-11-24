@@ -14,13 +14,12 @@ Rectangle {
     property var colors: studio.palette
     property bool motion: studio.motionEnabled
     readonly property bool hovered: barHover.hovered
-    readonly property bool focusWithin: contents.visualFocus || save.visualFocus || saveAs.visualFocus || exportNote.visualFocus || exit.visualFocus || centerLock.visualFocus
+    readonly property bool focusWithin: contents.visualFocus || save.visualFocus || exportNote.visualFocus || exit.visualFocus || centerLock.visualFocus
     readonly property bool shown: awake || hovered || focusWithin
     signal contentsRequested()
     signal exitRequested()
     signal centerLockRequested()
     signal saveRequested()
-    signal saveAsRequested()
     signal exportRequested()
     color: colors["surface-low"]
     opacity: shown ? 1 : 0
@@ -39,7 +38,6 @@ Rectangle {
         }
         Label { text: controls.noteName; Layout.fillWidth: true; elide: Text.ElideRight; color: controls.colors.text; font.pixelSize: 14; font.weight: Font.Medium }
         ActionButton { id: save; glyph: "FloppyDisk"; compact: true; enabled: controls.ready; ToolTip.text: "Save note (" + (controls.shortcutLabels.save || "Ctrl+S") + ")"; onClicked: controls.saveRequested() }
-        ActionButton { id: saveAs; objectName: "studySaveAsButton"; glyph: "DownloadSimple"; compact: true; enabled: controls.ready; ToolTip.text: "Save note as (" + (controls.shortcutLabels.save_as || "Ctrl+Shift+S") + ")"; onClicked: controls.saveAsRequested() }
         ActionButton { id: exportNote; glyph: "Export"; compact: true; enabled: controls.ready; ToolTip.text: "Export note"; onClicked: controls.exportRequested() }
         ActionButton {
             id: exit; objectName: "studyExitButton"

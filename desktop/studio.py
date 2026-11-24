@@ -288,7 +288,6 @@ class Studio(QObject):
     replied = Signal(str, str, str)
     completed = Signal(object)
     saveRequested = Signal(str)
-    conflictRequested = Signal(str)
     closeRequested = Signal(str)
     allowClose = Signal()
     newWindowRequested = Signal()
@@ -414,9 +413,6 @@ class Studio(QObject):
         self.pending_close = ""
         self.pending_export = ""
         self.pending_save_as = ""
-        self._save_dialog_tab_id = ""
-        self.pending_conflict = None
-        self._force_portable_overwrite_id = ""
         self.flush_operation = None
         self.flush_timer = QTimer(self)
         self.flush_timer.setSingleShot(True)
@@ -2038,27 +2034,14 @@ class Studio(QObject):
     def save(self):
         tab = self._current()
         if not tab["path"]:
-            self._save_dialog_tab_id = tab["id"]
             self.saveRequested.emit(tab["name"])
         elif tab["portable"]:
             self.readerCall.emit("window.supermdPortable?.(true)")
         else:
             self._save_text(tab, Path(tab["path"]))
 
-    @Slot()
-    @Slot(str)
-    def requestSaveAs(self, id=""):
-        tab = (next((t for t in self.tabs if t["id"] == id), None) if id else None) or self._current()
-        if not tab:
-            return
-        if tab["id"] != self.active:
-            self.selectTab(tab["id"])
-        self._save_dialog_tab_id = tab["id"]
-        self.saveRequested.emit(tab["name"])
-
     def _after_flush(self,operation):
         if operation["action"] == "save": self.save()
-        elif operation["action"] == "save_as": self.requestSaveAs(operation["target"])
         elif operation["action"] == "reload_reader":
             # The renderer has acknowledged all edits. Reopen it from native
             # state and the just-captured view snapshot in document_flushed.
@@ -2095,10 +2078,6 @@ class Studio(QObject):
     def saveSafely(self): self._flush("save")
 
     @Slot()
-    @Slot(str)
-    def saveAsSafely(self, id=""): self._flush("save_as", id)
-
-    @Slot()
     def reloadReaderSafely(self):
         if not self.ready or self.retired or self.busy or self.flush_operation: return
         self._flush("reload_reader")
@@ -2121,61 +2100,37 @@ class Studio(QObject):
             self._recover()
             self.allowClose.emit()
 
-    def _disk_diverged(self, path: Path, expected: str, expected_assets: dict, expected_portable: bool) -> bool:
-        if not path.exists():
-            return bool(expected or expected_assets)
-        disk_content, disk_assets, disk_portable = open_note(path)
-        return disk_content != expected or disk_assets != expected_assets or disk_portable != expected_portable
-
     @Slot(str)
     def saveAs(self, value):
         path = local_path(value)
-        target_id, self._save_dialog_tab_id = self._save_dialog_tab_id, ""
-        tab = (next((t for t in self.tabs if t["id"] == target_id), None) if target_id else None) or self._current()
-        if tab["id"] != self.active:
-            self.selectTab(tab["id"])
         if path.suffix.lower() == ".smd":
             self.pending_export = str(path)
             self.pending_save_as = str(path)
             self.readerCall.emit("window.supermdPortable?.(false)")
         else:
-            self._save_text(tab, path, force_overwrite=True, rebind=True)
+            self._save_text(self._current(), path)
 
-    def _save_text(self, tab, path, automatic=False, force_overwrite=False, rebind=False):
+    def _save_text(self, tab, path, automatic=False):
         id, content, assets = tab["id"], tab["content"], dict(tab["assets"])
         expected, original_path = tab["saved"], tab["path"]
-        expected_assets = copy.deepcopy(tab.get("saved_assets", tab.get("assets", {})))
-        expected_portable = bool(tab.get("portable"))
-        portable = False if rebind else (tab["portable"] and str(path) == original_path)
+        portable = tab["portable"] and str(path) == original_path
         if id in self.saving: return
         self.saving.add(id)
-        def finished(result, error):
+        def finished(_, error):
             self.saving.discard(id)
             if error: return
-            if isinstance(result, dict) and result.get("conflict"):
-                target = next((t for t in self.tabs if t["id"] == id), None)
-                if target:
-                    self.pending_conflict = {"id": id, "mode": "text", "path": str(path)}
-                    self.message = "File changed outside Super MD. Choose how to save or reload."
-                    self.conflictRequested.emit(target["name"])
-                return
             target = next((t for t in self.tabs if t["id"] == id), None)
             if target:
                 target.update(path=str(path), name=path.name, saved=content, saved_assets=copy.deepcopy(assets), portable=portable)
                 if automatic and target["content"] != content: self.autosave_timer.start(900)
-            if rebind or str(path) != original_path:
-                self.recent = [str(path)] + [p for p in self.recent if p != str(path)]
-                self._preferences()
             self.message = "Autosaved" if automatic else "Saved"
             self._recover()
             self._emit()
             if self.pending_close:
                 self._finish_close()
         def write():
-            if automatic and (not path.exists() or self._disk_diverged(path, expected, expected_assets, expected_portable)):
+            if automatic and (not path.exists() or open_note(path)[0] != expected):
                 raise ValueError("Autosave paused: this file changed outside Super MD. Your edits remain in draft recovery; use Save as to keep both versions.")
-            if not automatic and not force_overwrite and not rebind and self._disk_diverged(path, expected, expected_assets, expected_portable):
-                return {"conflict": True}
             if portable: write_portable(path,content,assets)
             else:
                 materialize_assets(path.parent,assets)
@@ -2214,11 +2169,7 @@ class Studio(QObject):
 
     @Slot(str,result=QUrl)
     def defaultSaveLocation(self,name):
-        tab = (next((t for t in self.tabs if t["id"] == self._save_dialog_tab_id), None) if self._save_dialog_tab_id else None) or self._current()
-        if tab.get("path") and not str(name).endswith(".supermd-theme.json"):
-            directory = str(Path(tab["path"]).parent)
-        else:
-            directory = self.settings.get("newNoteLocation") or QStandardPaths.writableLocation(QStandardPaths.DownloadLocation) or str(Path.home())
+        directory = self.settings.get("newNoteLocation") or QStandardPaths.writableLocation(QStandardPaths.DownloadLocation) or str(Path.home())
         return QUrl.fromLocalFile(str(Path(directory)/Path(name).name))
 
     @Slot(str, result=QUrl)
@@ -2296,10 +2247,7 @@ class Studio(QObject):
 
     @Slot(str)
     def resolveClose(self, choice):
-        if choice == "cancel":
-            self._save_dialog_tab_id = ""
-            self.pending_close = ""
-            return
+        if choice == "cancel": self.pending_close = ""; return
         if choice == "save": self.save(); return
         if choice == "discard":
             # For a single-tab close, "discard" confirms closing the dirty
@@ -2311,105 +2259,6 @@ class Studio(QObject):
                 return
             self._current()["saved"] = self._current()["content"]
             self._finish_close()
-
-    @Slot(str)
-    def resolveConflict(self, choice):
-        conflict, self.pending_conflict = self.pending_conflict, None
-        if choice == "cancel" or not conflict:
-            self.pending_close = ""
-            return
-        tab = next((t for t in self.tabs if t["id"] == conflict["id"]), None)
-        if not tab:
-            self.pending_close = ""
-            return
-        if choice == "save_copy":
-            self.requestSaveAs(tab["id"])
-            return
-        if not tab.get("path"):
-            self.pending_close = ""
-            return
-        if choice == "overwrite":
-            if conflict.get("mode") == "portable":
-                if tab["content"] == conflict.get("originalContent") and tab["id"] not in self.saving:
-                    tab_id = tab["id"]
-                    target_path = Path(tab["path"])
-                    content = conflict["content"]
-                    orig_content = conflict["originalContent"]
-                    assets = copy.deepcopy(conflict["assets"])
-                    self.saving.add(tab_id)
-                    def overwrite_done(_, error):
-                        self.saving.discard(tab_id)
-                        if error:
-                            return
-                        current = next((t for t in self.tabs if t["id"] == tab_id), None)
-                        if current:
-                            current.update(saved=orig_content, assets=assets, saved_assets=copy.deepcopy(assets), portable=True)
-                            if current["content"] == orig_content:
-                                current["content"] = current["saved"] = content
-                        self.message = "Saved"
-                        self._recover()
-                        self._emit()
-                        if self.pending_close:
-                            self._finish_close()
-                    self._submit(lambda: write_portable(target_path, content, assets), overwrite_done, busy=True, executor=self.writes)
-                else:
-                    self._force_portable_overwrite_id = tab["id"]
-                    if tab["id"] != self.active:
-                        self.selectTab(tab["id"])
-                    self.readerCall.emit("window.supermdPortable?.(true)")
-            else:
-                self._save_text(tab, Path(tab["path"]), force_overwrite=True)
-            return
-        if choice == "reload":
-            if tab["id"] in self.saving:
-                self.pending_close = ""
-                return
-            tab_id = tab["id"]
-            target_path = Path(tab["path"])
-            archived = copy.deepcopy({k: v for k, v in tab.items() if k != "viewState"})
-            archived.update(
-                id=uuid.uuid4().hex,
-                path="",
-                saved="",
-                name=tab["name"] if tab["name"].startswith("Recovered ") else "Recovered " + tab["name"],
-            )
-            self.saving.add(tab_id)
-            def reload_work():
-                reference = self.session.closed_note_store.save(archived)
-                disk = open_note(target_path)
-                stat_info = target_path.stat()
-                return reference, disk, (stat_info.st_mtime_ns, stat_info.st_size)
-            def reload_done(value, error):
-                self.saving.discard(tab_id)
-                self.pending_close = ""
-                if error:
-                    return
-                reference, (disk_content, disk_assets, disk_portable), stamp = value
-                next_refs = ([reference] + self.closed_tabs)[:ClosedNoteStore.LIMIT]
-                try:
-                    self.session.closed_note_store.save_index(next_refs)
-                except Exception as failure:
-                    self.message = "Could not update closed-note recovery: " + str(failure)
-                    return
-                self.closed_tabs[:] = next_refs
-                current = next((t for t in self.tabs if t["id"] == tab_id), None)
-                if not current:
-                    return
-                self.note_file_stamps[str(target_path)] = stamp
-                self.reader_edits.clear(tab_id)
-                current.update(
-                    content=disk_content,
-                    saved=disk_content,
-                    assets=disk_assets,
-                    saved_assets=copy.deepcopy(disk_assets),
-                    portable=disk_portable,
-                )
-                if tab_id == self.active:
-                    self._last_reader_text = None
-                self.message = "Reloaded external changes; local draft saved to closed notes"
-                self._recover()
-                self._emit(load=tab_id == self.active)
-            self._submit(reload_work, reload_done, busy=True, executor=self.writes)
 
     def _finish_close(self):
         action = self.pending_close
@@ -3451,13 +3300,6 @@ class Studio(QObject):
             captured["assets"] = dict(tab["assets"])
             output = self.pending_export
             save_as = self.pending_save_as
-            force_portable_overwrite = bool(
-                command == "export_fmd_native"
-                and args.get("save")
-                and self._force_portable_overwrite_id == captured["id"]
-            )
-            if force_portable_overwrite:
-                self._force_portable_overwrite_id = ""
             # Preparation is asynchronous. Recheck the actual writer, not just
             # the dialog choice, so a stale/cross-format callback cannot put
             # PDF bytes in an SMD file (or overwrite a portable note with text).
@@ -3526,13 +3368,6 @@ class Studio(QObject):
                     return export_result(output)
                 if command == "export_fmd_native":
                     target = Path(captured["path"]) if args.get("save") else Path(output)
-                    if args.get("save") and not force_portable_overwrite and self._disk_diverged(
-                        target,
-                        captured["saved"],
-                        captured.get("saved_assets", {}),
-                        bool(captured.get("portable", True)),
-                    ):
-                        return {"conflict": True}
                     write_portable(target,args["content"],args["assets"])
                     return export_result(target)
                 if command == "export_pdf_native":
@@ -3614,47 +3449,23 @@ class Studio(QObject):
                     if not agent_export_info:
                         self.replied.emit(id,"null",error)
                     return
-                if command == "export_fmd_native" and isinstance(result, dict) and result.get("conflict"):
-                    target = next((t for t in self.tabs if t["id"] == captured["id"]), None)
-                    if target:
-                        self.pending_conflict = {
-                            "id": captured["id"],
-                            "mode": "portable",
-                            "path": str(Path(captured["path"])),
-                            "content": args["content"],
-                            "originalContent": args.get("originalContent", captured["content"]),
-                            "assets": copy.deepcopy(args["assets"]),
-                        }
-                        self.message = "File changed outside Super MD. Choose how to save or reload."
-                        self.conflictRequested.emit(target["name"])
-                    if not agent_export_info:
-                        self.replied.emit(id, json.dumps(result), "")
-                    return
                 target = next((t for t in self.tabs if t["id"] == captured["id"]),None)
                 if command == "import_images" and target: target["assets"].update(captured["assets"])
                 if command == "export_fmd_native" and args.get("save") and target:
-                    original_content = args.get("originalContent", target["content"])
-                    target.update(saved=original_content, assets=args["assets"])
+                    target.update(saved=args["originalContent"], assets=args["assets"])
                     target["saved_assets"] = copy.deepcopy(args["assets"])
-                    if target["content"] == original_content: target["content"] = target["saved"] = args["content"]
-                    self.message = "Saved"
+                    if target["content"] == args["originalContent"]: target["content"] = target["saved"] = args["content"]
                     self._recover()
                     if self.pending_close: self._finish_close()
                 elif command == "export_fmd_native" and save_as and target:
-                    original_content = args.get("originalContent", target["content"])
-                    target.update(path=save_as,name=Path(save_as).name,saved=args["content"],assets=args["assets"],portable=True)
-                    target["saved_assets"] = copy.deepcopy(args["assets"])
-                    if target["content"] == original_content:
-                        target["content"] = args["content"]
-                    self.recent = [save_as] + [p for p in self.recent if p != save_as]
-                    self._preferences()
-                    self.message = "Saved"
-                    self._recover()
-                    self._emit()
-                    if self.pending_close and target["content"] == target["saved"]:
-                        self._finish_close()
+                    if target["content"] == args["originalContent"]:
+                        target.update(path=save_as,name=Path(save_as).name,content=args["content"],saved=args["content"],assets=args["assets"],portable=True)
+                        target["saved_assets"] = copy.deepcopy(args["assets"])
+                        self._recover()
+                        self._emit()
+                        if self.pending_close: self._finish_close()
                     self.pending_save_as = ""
-                elif command.startswith("export_"): self.message = f"Exported {Path(result['path']).name}"
+                if command.startswith("export_"): self.message = f"Exported {Path(result['path']).name}"
                 if agent_export_info:
                     record = self._agent_job_records.get(agent_export_info.get("jobId"))
                     if record:
