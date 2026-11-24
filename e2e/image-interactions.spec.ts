@@ -69,3 +69,128 @@ test('viewer close restores focus without opening image edit tools, including sl
     await expect(owner.getByRole('button',{name:/Image options/})).toHaveCount(0);
   }
 });
+
+test('context menu and broken-image blocks support Replace and Remove while preserving overlay handoff and supermdDismiss', async ({ page }) => {
+  await page.addInitScript(() => {
+    const validSvg = 'data:image/svg+xml;base64,' + btoa('<svg xmlns="http://www.w3.org/2000/svg" width="240" height="100"><rect width="240" height="100" fill="#6486b2"/></svg>');
+    window.SuperMD = {
+      post: (id, command, args) => {
+        const parsed = args ? JSON.parse(args) : {};
+        queueMicrotask(() => {
+          if (command === 'load_asset') {
+            if (parsed.source === 'assets/missing.png') window.supermdReply?.(id, null, 'Asset file not found on disk.');
+            else window.supermdReply?.(id, validSvg, null);
+            return;
+          }
+          if (command === 'fetch_resource') {
+            window.supermdReply?.(id, { body: parsed.image ? validSvg : '<title>Field Notes</title>' }, null);
+            return;
+          }
+          if (command === 'import_images') {
+            window.supermdReply?.(id, [{ source: 'assets/import-replaced.svg', alt: 'Updated diagram' }], null);
+            return;
+          }
+          window.supermdReply?.(id, true, null);
+        });
+      },
+    };
+  });
+  await page.goto('/android-reader.html');
+  await page.waitForFunction(() => typeof window.supermdLoad === 'function');
+
+  const steps = { title: 'Deck', steps: [{ label: 'One', image: 'assets/frame.svg' }, { label: 'Two', image: 'assets/frame.svg' }] };
+  const initialContent = `# Lab notebook\n\n![Diagram](assets/pic.svg)\n\n![Broken](assets/missing.png)\n\n\`\`\`smd-steps\n${JSON.stringify(steps)}\n\`\`\`\n`;
+  await page.evaluate((content) => {
+    window.supermdLoad?.({ id: 'image-workflows', content, path: '/notes/lab.md', mode: 'reader', dark: false, fullscreen: false, colors: {}, font: 'Manrope', size: 15, zoom: 100 });
+  }, initialContent);
+
+  const noteImage = page.locator('.media-paragraph .note-image img');
+  await expect(noteImage).toBeVisible();
+  const brokenCard = page.locator('.image-error[data-note-image-source="assets/missing.png"]');
+  await expect(brokenCard).toBeVisible();
+  await expect(brokenCard).toHaveAttribute('role', 'group');
+  await expect(brokenCard.getByRole('button', { name: 'Replace' })).toBeVisible();
+  await expect(brokenCard.getByRole('button', { name: 'Remove' })).toBeVisible();
+
+  // Slider frames keep save/copy items without Replace or Remove.
+  await page.locator('.step-cards-figure.is-current .note-image img').click({ button: 'right' });
+  const menu = page.getByRole('menu', { name: 'Save image or diagram' });
+  await expect(menu).toBeVisible();
+  await expect(menu.getByRole('menuitem', { name: 'Copy image' })).toBeVisible();
+  await expect(menu.getByRole('menuitem', { name: 'Replace image' })).toHaveCount(0);
+  await expect(menu.getByRole('menuitem', { name: 'Remove image' })).toHaveCount(0);
+  expect(await page.evaluate(() => window.supermdDismiss?.())).toBe(true);
+  await expect(menu).toHaveCount(0);
+
+  // ImageViewer -> MediaTools Replace handoff keeps dataset.readerOverlay continuously active.
+  await noteImage.click();
+  await expect(page.getByRole('dialog', { name: 'Image viewer' })).toBeVisible();
+  await page.evaluate(() => {
+    (window as any).__overlayMutations = [];
+    const obs = new MutationObserver(() => (window as any).__overlayMutations.push(document.documentElement.dataset.readerOverlay ?? null));
+    obs.observe(document.documentElement, { attributes: true, attributeFilter: ['data-reader-overlay'] });
+    (window as any).__overlayObserver = obs;
+  });
+  await page.locator('.image-viewer footer').getByRole('button', { name: 'Replace' }).click();
+  await expect(page.getByRole('dialog', { name: 'Insert image or link' })).toBeVisible();
+  const overlayHistory = await page.evaluate(() => {
+    (window as any).__overlayObserver?.disconnect();
+    return { current: document.documentElement.dataset.readerOverlay, mutations: (window as any).__overlayMutations };
+  });
+  expect(overlayHistory.current).toBe('true');
+  expect(overlayHistory.mutations).not.toContain('false');
+  expect(overlayHistory.mutations).not.toContain(null);
+  expect(await page.evaluate(() => window.supermdDismiss?.())).toBe(true);
+  await expect(page.getByRole('dialog', { name: 'Insert image or link' })).toHaveCount(0);
+  expect(await page.evaluate(() => document.documentElement.dataset.readerOverlay)).toBe('false');
+
+  // Context menu on editable note image replaces it via Enter submit.
+  await noteImage.click({ button: 'right' });
+  await expect(menu.getByRole('menuitem', { name: 'Replace image' })).toBeVisible();
+  await expect(menu.getByRole('menuitem', { name: 'Remove image' })).toBeVisible();
+  await menu.getByRole('menuitem', { name: 'Replace image' }).click();
+  const urlInput = page.getByLabel('Web address');
+  await urlInput.fill('https://example.com/updated.svg');
+  await urlInput.press('Enter');
+  await expect(page.getByRole('dialog', { name: 'Insert image or link' })).toHaveCount(0);
+  await expect(page.locator('.media-paragraph .note-image[data-note-image-source="assets/import-replaced.svg"] img')).toBeVisible();
+
+  // Broken image supports both shared media menu and inline Remove/Undo/Replace controls.
+  const brokenBox = (await brokenCard.boundingBox())!;
+  expect(await page.evaluate(({ x, y }) => window.supermdMediaMenuAt?.(x, y), { x: brokenBox.x + 16, y: brokenBox.y + 16 })).toBe(true);
+  await expect(menu.getByRole('menuitem', { name: 'Replace image' })).toBeVisible();
+  await expect(menu.getByRole('menuitem', { name: 'Remove image' })).toBeVisible();
+  await page.keyboard.press('Escape');
+  await expect(menu).toHaveCount(0);
+
+  await brokenCard.getByRole('button', { name: 'Remove' }).click();
+  await expect(brokenCard).toHaveCount(0);
+  await expect(page.locator('.media-undo')).toBeVisible();
+  await page.locator('.media-undo').getByRole('button', { name: 'Undo', exact: true }).click();
+  await expect(brokenCard).toBeVisible();
+
+  await brokenCard.getByRole('button', { name: 'Replace' }).click();
+  await page.getByLabel('Web address').fill('https://example.com/repaired.svg');
+  await page.getByLabel('Web address').press('Enter');
+  await expect(brokenCard).toHaveCount(0);
+  await expect(page.locator('.note-image[data-note-image-source="assets/import-replaced.svg"]')).toHaveCount(2);
+
+  // Live mode preserves blurred textarea cursor offset when native toolbar opens supermdMedia().
+  await page.evaluate(() => {
+    window.supermdLoad?.({ id: 'live-cursor', content: '# Notes\n\nInsert here please\n\nFinal line', path: '/notes/live.md', mode: 'live', dark: false, fullscreen: false, colors: {}, font: 'Manrope', size: 15, zoom: 100 });
+  });
+  await page.getByText('Insert here please').dblclick();
+  const textarea = page.getByRole('textbox', { name: 'Edit Markdown block' });
+  await expect(textarea).toBeVisible();
+  await textarea.evaluate((el: HTMLTextAreaElement) => {
+    el.setSelectionRange(7, 7);
+    el.dispatchEvent(new Event('select', { bubbles: true }));
+    el.blur();
+  });
+  await expect(textarea).toHaveCount(0);
+  await page.evaluate(() => window.supermdMedia?.());
+  await page.getByLabel('Web address').fill('https://example.com/field-notes');
+  await page.getByRole('button', { name: 'Paste plain URL instead' }).click();
+  await expect(page.getByText('Insert https://example.com/field-noteshere please')).toBeVisible();
+  await expect(page.getByText('Final line', { exact: true })).toBeVisible();
+});

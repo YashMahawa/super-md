@@ -81,6 +81,13 @@ export async function saveMedia(media:ExportableMedia,format:'png'|'svg'|'origin
 
 let users=0,uninstall:(()=>void)|undefined;
 declare global {interface Window {supermdMediaMenuAt?:(x:number,y:number)=>boolean;}}
+function editableNoteImageAt(element:Element|null):HTMLElement|null {
+  const owner=element?.closest<HTMLElement>('[data-note-image-source]');
+  if(!owner||!owner.dataset.noteImageSource||owner.dataset.noteImageReadonly==='true')return null;
+  if(owner.closest('.step-cards,.theme-guide-dialog'))return null;
+  if(!owner.closest('.live-block,.workspace,.android-document'))return null;
+  return owner;
+}
 /** One delegated menu works for windowed documents without retaining images. */
 export function installMediaMenu():()=>void {
   users++;if(users===1){
@@ -89,23 +96,33 @@ export function installMediaMenu():()=>void {
     const open=(x:number,y:number)=>{
       if(hasSelectedText())return false;
       const hit=typeof document.elementFromPoint==='function'?document.elementFromPoint(x,y):null;
-      const media=mediaAt(hit);if(!media)return false;
+      const media=mediaAt(hit),editable=editableNoteImageAt(hit);
+      if(!media&&!editable)return false;
       close();const panel=document.createElement('div');menu=panel;panel.className='media-save-menu';panel.setAttribute('role','menu');panel.setAttribute('aria-label','Save image or diagram');
       const title=document.createElement('div');title.className='media-save-title';title.textContent='Image';panel.append(title);
-      const copy=document.createElement('button');copy.type='button';copy.textContent='Copy image';copy.setAttribute('role','menuitem');
-      copy.onclick=()=>{panel.querySelectorAll('button').forEach(item=>item.disabled=true);void copyMedia(media).then(()=>{title.textContent='Image copied';window.setTimeout(()=>{if(menu===panel)close();},1200);},error=>{title.textContent=String(error instanceof Error?error.message:error);panel.querySelectorAll('button').forEach(item=>item.disabled=false);});};panel.append(copy);
-      const options:Array<['png'|'svg'|'original'|'source',string]>=[['png','Save as PNG']];
-      if(media.svg)options.push(['svg','Save as SVG']);else options.push(['original','Save original image']);
-      if(media.source)options.push(['source','Save Mermaid source']);
-      for(const [format,label] of options){const button=document.createElement('button');button.type='button';button.textContent=label;button.setAttribute('role','menuitem');button.onclick=()=>{panel.querySelectorAll('button').forEach(item=>item.disabled=true);void saveMedia(media,format).then(result=>{title.textContent=`Saved ${result.filename}`;window.setTimeout(()=>{if(menu===panel)close();},1800);},error=>{title.textContent=String(error instanceof Error?error.message:error);panel.querySelectorAll('button').forEach(item=>item.disabled=false);});};panel.append(button);}
+      if(media){
+        const copy=document.createElement('button');copy.type='button';copy.textContent='Copy image';copy.setAttribute('role','menuitem');
+        copy.onclick=()=>{panel.querySelectorAll('button').forEach(item=>item.disabled=true);void copyMedia(media).then(()=>{title.textContent='Image copied';window.setTimeout(()=>{if(menu===panel)close();},1200);},error=>{title.textContent=String(error instanceof Error?error.message:error);panel.querySelectorAll('button').forEach(item=>item.disabled=false);});};panel.append(copy);
+        const options:Array<['png'|'svg'|'original'|'source',string]>=[['png','Save as PNG']];
+        if(media.svg)options.push(['svg','Save as SVG']);else options.push(['original','Save original image']);
+        if(media.source)options.push(['source','Save Mermaid source']);
+        for(const [format,label] of options){const button=document.createElement('button');button.type='button';button.textContent=label;button.setAttribute('role','menuitem');button.onclick=()=>{panel.querySelectorAll('button').forEach(item=>item.disabled=true);void saveMedia(media,format).then(result=>{title.textContent=`Saved ${result.filename}`;window.setTimeout(()=>{if(menu===panel)close();},1800);},error=>{title.textContent=String(error instanceof Error?error.message:error);panel.querySelectorAll('button').forEach(item=>item.disabled=false);});};panel.append(button);}
+      }
+      if(editable){
+        for(const [action,label] of [['replace','Replace image'],['remove','Remove image']] as const){
+          const button=document.createElement('button');button.type='button';button.textContent=label;button.setAttribute('role','menuitem');
+          button.onclick=()=>{close();window.dispatchEvent(new CustomEvent('supermd-image-edit',{detail:{action,image:editable}}));};
+          panel.append(button);
+        }
+      }
       document.body.append(panel);const box=panel.getBoundingClientRect();panel.style.left=`${Math.max(8,Math.min(x,innerWidth-box.width-8))}px`;panel.style.top=`${Math.max(8,Math.min(y,innerHeight-box.height-8))}px`;panel.querySelector('button')?.focus();return true;
     };
     window.supermdMediaMenuAt=open;
     const context=(event:MouseEvent)=>{if(open(event.clientX,event.clientY)){event.preventDefault();event.stopPropagation();}};
     const outside=(event:Event)=>{if(menu&&!menu.contains(event.target as Node))close();};
-    const key=(event:KeyboardEvent)=>{if(event.key==='Escape')close();};
+    const key=(event:KeyboardEvent)=>{if(menu&&event.key==='Escape'){event.preventDefault();event.stopImmediatePropagation();close();}};
     const cancel=()=>{if(timer!==undefined)clearTimeout(timer);timer=undefined;origin=undefined;};
-    const down=(event:PointerEvent)=>{outside(event);if(event.pointerType!=='touch'||hasSelectedText()||!mediaAt(event.target as Element))return;origin={x:event.clientX,y:event.clientY};timer=window.setTimeout(()=>{timer=undefined;if(origin)open(origin.x,origin.y);},550);};
+    const down=(event:PointerEvent)=>{outside(event);const target=event.target instanceof Element?event.target:null;if(event.pointerType!=='touch'||hasSelectedText()||(!mediaAt(target)&&!editableNoteImageAt(target)))return;origin={x:event.clientX,y:event.clientY};timer=window.setTimeout(()=>{timer=undefined;if(origin)open(origin.x,origin.y);},550);};
     const move=(event:PointerEvent)=>{if(origin&&Math.hypot(event.clientX-origin.x,event.clientY-origin.y)>12)cancel();};
     const click=(event:MouseEvent)=>{if(menu&&!menu.contains(event.target as Node)){event.preventDefault();event.stopPropagation();}};
     document.addEventListener('contextmenu',context,true);document.addEventListener('pointerdown',down,true);document.addEventListener('pointermove',move,true);document.addEventListener('pointerup',cancel,true);document.addEventListener('pointercancel',cancel,true);document.addEventListener('keydown',key,true);document.addEventListener('click',click,true);

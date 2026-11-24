@@ -44,6 +44,20 @@ export default function LiveEditor({markdown,onChange,documentPath,python,dark,t
   const anchorTop=useRef<number|null>(null),editor=useRef<HTMLTextAreaElement>(null),rootRef=useRef<HTMLDivElement>(null);
   const pendingSelection=useRef<{start:number;end:number}|null>(null);
   const pendingBlockFocus=useRef<{offset:number}|'end'|null>(null);
+  const savedSelection=useRef<{from:number;to:number;markdown:string}|null>(null);
+
+  const rememberSelection=(area:HTMLTextAreaElement|null,current=editingRef.current)=>{
+    if(!area||!current)return;
+    if(current.insertAfter!==undefined&&area.value===''){
+      const doc=current.baseMarkdown,pos=Math.max(0,Math.min(current.baseSplitEnd,doc.length));
+      savedSelection.current={from:pos,to:pos,markdown:doc};
+      return;
+    }
+    const base=current.prefix.length,doc=current.prefix+area.value+current.suffix;
+    const from=Math.max(0,Math.min(base+area.selectionStart,doc.length));
+    const to=Math.max(from,Math.min(base+area.selectionEnd,doc.length));
+    savedSelection.current={from,to,markdown:doc};
+  };
 
   const renderedSource=editing?editing.baseMarkdown:markdown;
   const sourceAnalysis=useMemo(()=>({source:renderedSource,analysis:analyzeDocument(renderedSource)}),[renderedSource]);
@@ -122,6 +136,7 @@ export default function LiveEditor({markdown,onChange,documentPath,python,dark,t
     const sel=pendingSelection.current;pendingSelection.current=null;
     if(isNewSession||document.activeElement!==area)area.focus({preventScroll:true});
     if(sel)area.setSelectionRange(Math.min(sel.start,area.value.length),Math.min(sel.end,area.value.length));
+    rememberSelection(area,editing);
     if(!activeTypewriter){
       if(!isNewSession)return;
       if(anchor===null){
@@ -188,11 +203,30 @@ export default function LiveEditor({markdown,onChange,documentPath,python,dark,t
       if(Math.abs(delta)>1)scroller.scrollTop+=delta;
     });
   };
-
   useEffect(()=>{
     const active=editingRef.current;
     if(active&&markdown!==active.syncedMarkdown)setEditing(null);
+    if(savedSelection.current&&savedSelection.current.markdown!==markdown)savedSelection.current=null;
   },[markdown]);
+
+  useEffect(()=>{
+    const point=(event:Event)=>{
+      const detail=(event as CustomEvent<{point?:{from:number;to:number};x?:number;y?:number;coords?:{x:number;y:number}}>).detail;
+      if(!detail||detail.point!==undefined)return;
+      const x=typeof detail.x==='number'?detail.x:detail.coords?.x;
+      const y=typeof detail.y==='number'?detail.y:detail.coords?.y;
+      if(typeof x==='number'&&typeof y==='number'&&Number.isFinite(x)&&Number.isFinite(y))return;
+      const currentMarkdown=markdownRef.current,currentEditing=editingRef.current;
+      if(editor.current&&currentEditing)rememberSelection(editor.current,currentEditing);
+      const saved=savedSelection.current;
+      if(!saved||saved.markdown!==currentMarkdown){savedSelection.current=null;return;}
+      const from=Math.max(0,Math.min(saved.from,currentMarkdown.length));
+      const to=Math.max(from,Math.min(saved.to,currentMarkdown.length));
+      detail.point={from,to};
+    };
+    window.addEventListener('supermd-insertion-point',point);
+    return()=>window.removeEventListener('supermd-insertion-point',point);
+  },[]);
 
   useEffect(()=>{
     const root=rootRef.current;if(!root)return;
@@ -230,17 +264,29 @@ export default function LiveEditor({markdown,onChange,documentPath,python,dark,t
   },[]);
 
   const copy=(event:ClipboardEvent)=>{if((event.target as Element).closest('textarea'))return;const source=selectedMarkdown(window.getSelection(),markdown);if(source!==null){event.clipboardData.setData('text/plain',source);event.preventDefault();}};
-  const update=(text:string)=>{
+  const update=(text:string,selectionStart?:number,selectionEnd?:number)=>{
     const active=editingRef.current;if(!active)return;
     if(active.insertAfter!==undefined&&text===''){
       const changed=active.syncedMarkdown!==active.baseMarkdown;
       const nextState={...active,text:'',syncedMarkdown:active.baseMarkdown};
+      const pos=Math.max(0,Math.min(active.baseSplitEnd,active.baseMarkdown.length));
+      savedSelection.current={from:pos,to:pos,markdown:active.baseMarkdown};
       editingRef.current=nextState;setEditing(nextState);
       if(changed)onChange(active.baseMarkdown);
       syncActiveCaretCenter();
       return;
     }
-    const nextMarkdown=active.prefix+text+active.suffix;
+    const nextMarkdown=active.prefix+text+active.suffix,base=active.prefix.length;
+    if(selectionStart!==undefined&&selectionEnd!==undefined){
+      const from=Math.max(0,Math.min(base+selectionStart,nextMarkdown.length));
+      const to=Math.max(from,Math.min(base+selectionEnd,nextMarkdown.length));
+      savedSelection.current={from,to,markdown:nextMarkdown};
+    }else if(savedSelection.current){
+      const max=base+text.length;
+      const from=Math.max(base,Math.min(savedSelection.current.from,max));
+      const to=Math.max(from,Math.min(savedSelection.current.to,max));
+      savedSelection.current={from,to,markdown:nextMarkdown};
+    }
     const nextState={...active,text,syncedMarkdown:nextMarkdown};
     editingRef.current=nextState;setEditing(nextState);
     onChange(nextMarkdown);
@@ -273,15 +319,17 @@ export default function LiveEditor({markdown,onChange,documentPath,python,dark,t
           applied=result.replacement.length>0?document.execCommand('insertText',false,result.replacement):document.execCommand('delete',false);
         }catch{applied=false;}
         if(!applied||area.value!==result.value){
-          update(result.value);
+          update(result.value,result.selectionStart,result.selectionEnd);
           area.value=result.value;
         }
       }
       area.setSelectionRange(result.selectionStart,result.selectionEnd,direction);
+      rememberSelection(area,editingRef.current);
       area.focus({preventScroll:true});
       return;
     }
     if(event.key==='Escape'){
+      rememberSelection(area,active);
       event.preventDefault();event.stopPropagation();
       pendingBlockFocus.current=active.insertAfter!==undefined&&active.text===''?(active.insertAfter==='end'?'end':{offset:active.insertAfter}):{offset:active.prefix.length};
       setEditing(null);
@@ -323,7 +371,8 @@ export default function LiveEditor({markdown,onChange,documentPath,python,dark,t
 
   const textarea=()=>{
     const activeSession=editing!.session;
-    return <div className="live-active-block"><textarea ref={editor} data-source-start={editing!.prefix.length} spellCheck={false} value={editing!.text} style={{height:Math.max(120,editing!.text.split('\n').length*27+32)}} onPaste={paste} onChange={event=>update(event.target.value)} onKeyUp={event=>{if(['ArrowUp','ArrowDown','PageUp','PageDown','Home','End'].includes(event.key))syncActiveCaretCenter();}} onKeyDown={onEditorKeyDown} onBlur={event=>{if(!event.currentTarget.isConnected)return;if(!event.relatedTarget||!event.currentTarget.parentElement?.contains(event.relatedTarget))setEditing(current=>current?.session===activeSession?null:current);}} aria-label="Edit Markdown block"/><WritingSuggestions text={editing!.text} spellCheck={spellCheck} grammarCheck={grammarCheck} onChange={update}/></div>;
+    const sourceStart=editing!.insertAfter!==undefined&&editing!.text===''?editing!.baseSplitEnd:editing!.prefix.length;
+    return <div className="live-active-block"><textarea ref={editor} data-source-start={sourceStart} spellCheck={false} value={editing!.text} style={{height:Math.max(120,editing!.text.split('\n').length*27+32)}} onPaste={paste} onFocus={event=>rememberSelection(event.currentTarget)} onSelect={event=>rememberSelection(event.currentTarget)} onPointerUp={event=>rememberSelection(event.currentTarget)} onChange={event=>update(event.target.value,event.target.selectionStart,event.target.selectionEnd)} onKeyUp={event=>{rememberSelection(event.currentTarget);if(['ArrowUp','ArrowDown','PageUp','PageDown','Home','End'].includes(event.key))syncActiveCaretCenter();}} onKeyDown={onEditorKeyDown} onBlur={event=>{if(!event.currentTarget.isConnected)return;if(editingRef.current?.session===activeSession)rememberSelection(event.currentTarget,editingRef.current);if(!event.relatedTarget||!event.currentTarget.parentElement?.contains(event.relatedTarget))setEditing(current=>current?.session===activeSession?null:current);}} aria-label="Edit Markdown block"/><WritingSuggestions text={editing!.text} spellCheck={spellCheck} grammarCheck={grammarCheck} onChange={text=>update(text)}/></div>;
   };
   const currentOffset=(offset:number)=>editing&&offset>=editing.baseSplitEnd?offset+editing.syncedMarkdown.length-editing.baseMarkdown.length:offset;
   const renderBlock=(entry:RenderedMarkdownBlock)=>{
@@ -354,7 +403,7 @@ export default function LiveEditor({markdown,onChange,documentPath,python,dark,t
     onChange(currentDoc.slice(0,from)+next.slice(start,nextEnd)+currentDoc.slice(to));
   };
   return <div ref={rootRef} className="live-document" onCopy={copy} onDragStart={event=>{setSelectedMarkdownDrag(event.nativeEvent,renderedSource);}}>
-    {!renderedSource.trim()?(editing?textarea():<section className="live-block" tabIndex={0} role="group" aria-label="Editable block 1" onDoubleClick={event=>openBlock(event.currentTarget,0,markdown.length)} onKeyDown={event=>{if(event.key==='Enter'||event.key==='F2'){event.preventDefault();openBlock(event.currentTarget,0,markdown.length);}}}/> ):<>
+    {!renderedSource.trim()?(editing?textarea():<section className="live-block" data-source-start={0} data-source-end={markdown.length} tabIndex={0} role="group" aria-label="Editable block 1" onDoubleClick={event=>openBlock(event.currentTarget,0,markdown.length)} onKeyDown={event=>{if(event.key==='Enter'||event.key==='F2'){event.preventDefault();openBlock(event.currentTarget,0,markdown.length);}}}/> ):<>
       <MarkdownPreview markdown={renderedSource} onChange={previewChange} documentPath={documentPath} python={python} dark={dark} trustedImageHosts={trustedImageHosts} onTrustImageHost={onTrustImageHost} renderBlock={renderBlock} fullDocumentAccessibility={fullDocumentAccessibility} sourceAnalysis={sourceAnalysis}/>
       {editing?.insertAfter==='end'&&<section className="live-block" role="group" aria-label="New Markdown block">{textarea()}</section>}
     </>}
