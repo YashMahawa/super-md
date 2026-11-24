@@ -13,6 +13,7 @@ os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 from PySide6.QtCore import QCoreApplication
 from PySide6.QtGui import QGuiApplication
 
+from documents import compressed_bundle
 from studio import Session
 from test_studio import QuietStudio
 from workspace_links import WorkspaceLinkCache, WorkspaceLinkError, resolve_workspace_link
@@ -404,6 +405,66 @@ class StudioWorkspaceLinkIntegrationTest(unittest.TestCase):
             self.assertEqual(open_url.call_count, 1)
         bad_reply = next(r for r in replies if r[0] == "ext-bad")
         self.assertIn("Unsupported external URL scheme", bad_reply[2])
+
+    def test_opens_portable_smd_bundles_noncanonical_doc_refs_and_rejects_bookmark_aliases(self):
+        vault = (self.studio.data / "portable-vault").resolve()
+        vault.mkdir(parents=True, exist_ok=True)
+        index_note = vault / "Index.md"
+        index_note.write_text("# Index\n\n- [Deck](sub/study.smd#key-theorem)\n", encoding="utf-8")
+        sub = vault / "sub"
+        sub.mkdir()
+        portable_smd = sub / "study.smd"
+        portable_smd.write_bytes(
+            compressed_bundle("# Portable Deck\n\n## Key Theorem\n\nProof body.\n", {})
+        )
+
+        if os.name == "posix" and hasattr(os, "getxattr"):
+            bookmark_alias = vault / "AliasNote.md"
+            bookmark_alias.write_bytes(b"book\x00\x00\x00\x00mark\x00\x00\x00\x00# Hidden\n")
+            with self.assertRaisesRegex(WorkspaceLinkError, "Symlink|not found"):
+                resolve_workspace_link(
+                    "AliasNote.md",
+                    wikilink=False,
+                    note_path=index_note,
+                    workspace_folder=vault,
+                    cache=self.session.workspace_links,
+                )
+
+        studio = self.studio
+        studio.ready = True
+        loads = []
+        replies = []
+        studio.readerLoad.connect(lambda raw: loads.append(json.loads(raw)))
+        studio.replied.connect(lambda req_id, res, err: replies.append((req_id, res, err)))
+
+        studio.openFolder(str(vault))
+        studio.openNote(str(index_note))
+        self._wait_until(lambda: studio._current()["path"] == str(index_note))
+
+        noncanonical_ref = str(index_note)
+        alias_root = self.studio.data / "vault-alias"
+        if _try_create_link(alias_root, vault, target_is_directory=True):
+            noncanonical_ref = str(alias_root / index_note.name)
+
+        loads.clear()
+        replies.clear()
+        studio.post(
+            "portable-link",
+            "open_relative_note",
+            json.dumps({
+                "documentPath": noncanonical_ref,
+                "target": "sub/study.smd",
+                "heading": "key-theorem",
+            }),
+        )
+        self._wait_until(lambda: any(r[0] == "portable-link" for r in replies))
+        reply = json.loads(next(r[1] for r in replies if r[0] == "portable-link"))
+        self.assertTrue(reply["opened"])
+        self.assertEqual(studio._current()["path"], str(portable_smd))
+        self.assertTrue(studio._current()["portable"])
+        self.assertIn("# Portable Deck", studio._current()["content"])
+        portable_loads = [item for item in loads if item["path"] == str(portable_smd)]
+        self.assertEqual(portable_loads[0]["pendingHeading"]["heading"], "key-theorem")
 
 
 if __name__ == "__main__":

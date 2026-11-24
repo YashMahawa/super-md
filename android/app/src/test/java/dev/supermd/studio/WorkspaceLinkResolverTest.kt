@@ -209,6 +209,129 @@ class WorkspaceLinkResolverTest {
         assertTrue(sameDocument(Uri.parse(model.recent.value.first().uri), standaloneIndexUri))
     }
 
+    @Test
+    fun standaloneContainmentReaderBridgeBarrierLocalFileAndAlignedRankingWorkEndToEnd() {
+        // 1. Desktop-aligned workspace ranking: exact case > same directory > shallower depth > extension priority
+        File(root, "Archive").mkdirs()
+        File(root, "Archive/Topic.md").writeText("# Shallow Topic\n")
+        File(root, "Specs/Deep").mkdirs()
+        File(root, "Specs/Deep/topic.md").writeText("# Lowercase Same-Branch\n")
+        File(root, "Specs/Sibling.smd").writeText("# Sibling SMD\n")
+        File(root, "Archive/Sibling.md").writeText("# Other Dir MD\n")
+
+        val treeUri = DocumentsContract.buildTreeDocumentUri(authority, "vault")
+        val cache = WorkspaceLinkCache(lister = ContentResolverTreeLister(app))
+        // Exact case match ("Topic") beats lowercase ("topic")
+        assertEquals(
+            "Archive/Topic.md",
+            cache.resolve(treeUri, noteRelative = "Specs/Deep/Sub.md", rawTarget = "Topic", wikilink = true).relative,
+        )
+        // Same-directory match ("Specs/Sibling.smd") beats other-directory match ("Archive/Sibling.md") when case matches
+        assertEquals(
+            "Specs/Sibling.smd",
+            cache.resolve(treeUri, noteRelative = "Specs/Sub Note.md", rawTarget = "Sibling", wikilink = true).relative,
+        )
+
+        // 2. Standalone content:// note WITHOUT folder tree rejects ../, %2f, %00, and non-note extensions BEFORE prompting
+        val model = newModel()
+        val standaloneIndexUri = DocumentsContract.buildDocumentUri(authority, "vault/Index.md")
+        grantReadWrite(standaloneIndexUri)
+        model.open(standaloneIndexUri)
+        await { model.state.value.tabs.any { it.uri == standaloneIndexUri.toString() } }
+
+        for (blocked in listOf("../outside.md", "Specs%2fSub Note.md", "bad%00.md", "diagram.png")) {
+            val res = runBlocking {
+                model.openWorkspaceLink(standaloneIndexUri.toString(), blocked, "", wikilink = false)
+            }
+            assertFalse("Expected blocked target $blocked to fail", res.getBoolean("opened"))
+            assertFalse("Blocked target $blocked must not prompt for folder access", res.optBoolean("promptedFolderAccess"))
+            assertNull(model.state.value.folderAccessPrompt)
+        }
+
+        // 3. Local file:// note resolves sibling note cleanly and rejects symlink escapes
+        val localIndex = Uri.fromFile(File(root, "Index.md"))
+        model.open(localIndex)
+        await { model.state.value.tabs.any { it.uri == localIndex.toString() } }
+        val localRes = runBlocking {
+            model.openWorkspaceLink(localIndex.toString(), "Specs/Sub Note.md", "Deep Section", wikilink = false)
+        }
+        assertTrue(localRes.getBoolean("opened"))
+        assertEquals("Deep Section", model.state.value.pendingHeading?.heading)
+
+        // 4. ReaderBridge routes open_workspace_link, flushes active reader via readerFlushRequester, and launches external URLs safely
+        val flushedIds = mutableListOf<String>()
+        model.readerFlushRequester = { id -> flushedIds.add(id); true }
+        grantReadWrite(treeUri)
+        app.contentResolver.takePersistableUriPermission(
+            treeUri,
+            Intent.FLAG_GRANT_READ_URI_PERMISSION or Intent.FLAG_GRANT_WRITE_URI_PERMISSION,
+        )
+        model.setFolder(treeUri)
+        await { model.state.value.folder == treeUri.toString() }
+        model.open(standaloneIndexUri)
+        await { model.state.value.active.uri != null && sameDocument(Uri.parse(model.state.value.active.uri), standaloneIndexUri) }
+        val activeBeforeBridge = model.state.value.active.id
+        flushedIds.clear()
+
+        val webView = object : android.webkit.WebView(app) {
+            override fun post(action: Runnable?): Boolean =
+                action?.let { android.os.Handler(Looper.getMainLooper()).post(it) } ?: false
+        }
+        val scope = kotlinx.coroutines.CoroutineScope(kotlinx.coroutines.SupervisorJob() + kotlinx.coroutines.Dispatchers.Main.immediate)
+        try {
+            configureReader(webView, model, scope, ready = {}, rendererGone = {})
+            val bridge = webView.getTag(R.id.reader_bridge_tag) as ReaderBridge
+            val client = shadowOf(webView).webViewClient
+
+            // Internal appassets note navigation is blocked without launching an external browser
+            shadowOf(app).clearNextStartedActivities()
+            val internalReq = object : android.webkit.WebResourceRequest {
+                override fun getUrl(): Uri = Uri.parse("https://appassets.androidplatform.net/assets/web/Specs/Sub%20Note.md")
+                override fun isForMainFrame(): Boolean = true
+                override fun isRedirect(): Boolean = false
+                override fun hasGesture(): Boolean = true
+                override fun getMethod(): String = "GET"
+                override fun getRequestHeaders(): Map<String, String> = emptyMap()
+            }
+            assertTrue(client.shouldOverrideUrlLoading(webView, internalReq))
+            assertNull(shadowOf(app).nextStartedActivity)
+
+            // External https navigation launches ACTION_VIEW with FLAG_ACTIVITY_NEW_TASK on Application context
+            val externalReq = object : android.webkit.WebResourceRequest {
+                override fun getUrl(): Uri = Uri.parse("https://example.org/reference")
+                override fun isForMainFrame(): Boolean = true
+                override fun isRedirect(): Boolean = false
+                override fun hasGesture(): Boolean = true
+                override fun getMethod(): String = "GET"
+                override fun getRequestHeaders(): Map<String, String> = emptyMap()
+            }
+            assertTrue(client.shouldOverrideUrlLoading(webView, externalReq))
+            val started = shadowOf(app).nextStartedActivity
+            assertNotNull(started)
+            assertEquals(Intent.ACTION_VIEW, started.action)
+            assertEquals(Uri.parse("https://example.org/reference"), started.data)
+            assertTrue((started.flags and Intent.FLAG_ACTIVITY_NEW_TASK) != 0)
+
+            // Bridge post("open_workspace_link") flushes reader edits before switching tabs
+            bridge.post(
+                "bridge-1",
+                "open_workspace_link",
+                org.json.JSONObject()
+                    .put("documentPath", standaloneIndexUri.toString())
+                    .put("target", "Sub Note")
+                    .put("fragment", "Deep Section")
+                    .put("wikilink", true)
+                    .toString(),
+            )
+            await { model.state.value.active.name == "Sub Note.md" }
+            assertTrue(flushedIds.contains(activeBeforeBridge))
+            assertEquals("Deep Section", model.state.value.pendingHeading?.heading)
+        } finally {
+            retireAndDestroyReader(webView)
+            scope.coroutineContext[kotlinx.coroutines.Job]?.cancel()
+        }
+    }
+
     private fun grantReadWrite(uri: Uri) {
         app.grantUriPermission(
             app.packageName,

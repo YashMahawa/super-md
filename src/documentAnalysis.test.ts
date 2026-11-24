@@ -1,6 +1,6 @@
 import {describe,it,expect} from 'vitest';
 import {analyzeDocument} from './documentAnalysis';
-import {hasCallouts,maskCode,normalizeMarkdownSource} from './markdownSource';
+import {hasCallouts,maskCode,normalizeCallouts,normalizeMarkdownSource} from './markdownSource';
 
 describe('shared source analysis',()=>{
   it('nests container callouts and keeps literal delimiters inside variable-length code fences',()=>{
@@ -186,5 +186,43 @@ describe('shared source analysis',()=>{
     expect(hasCallouts('```markdown\n:::callout note Fenced\n:::\n```')).toBe(false);
     expect(hasCallouts('> ```markdown\n> :::callout note QuotedFenced\n> :::\n> ```')).toBe(false);
     expect(hasCallouts('---\ntitle: x\n---\n```md\n:::callout note Fenced\n:::\n```\n:::callout tip Real\nOk\n:::')).toBe(true);
+  });
+
+  it('normalizes spaced, aliased, portable, and section wikilinks while preserving sparse UTF-16 source offsets',()=>{
+    const source=[
+      '---',
+      'title: Spaced Wikilinks',
+      '---',
+      '# Course Hub 🚀',
+      '',
+      'Read [[Task Note]], [[Lecture 2#Bayes Law|Bayes 🧪]], [[study.smd]], [[legacy.fmd|Legacy Deck]], and [[#Course Hub 🚀|top]].',
+      '',
+      '![[DM Images/proof diagram.svg|Proof Diagram]]',
+      '',
+      '- [ ] Complete [[Task Note|first task]]',
+      '',
+      '## Follow-up Section',
+      '',
+      '- [x] Review `[[Task Note]]` and $P([[A]]) = 1$',
+      '',
+    ].join('\n');
+
+    const encoded=normalizeCallouts(source);
+    expect(encoded).toContain('[Task Note](Task%20Note.md)');
+    expect(encoded).toContain('[Bayes 🧪](Lecture%202.md#bayes-law)');
+    expect(encoded).toContain('[study.smd](study.smd)');
+    expect(encoded).toContain('[Legacy Deck](legacy.fmd)');
+    expect(encoded).toContain('[top](#course-hub)');
+    expect(encoded).toContain('![Proof Diagram](DM%20Images/proof%20diagram.svg)');
+    expect(encoded).toContain('`[[Task Note]]`');
+    expect(encoded).toContain('$P([[A]]) = 1$');
+
+    const analysis=analyzeDocument(source);
+    expect(analysis.tasks).toEqual([source.indexOf('[ ]')+1,source.indexOf('[x]')+1]);
+    expect(analysis.outline.map(item=>[item.id,item.offset])).toEqual([
+      ['course-hub',source.indexOf('# Course Hub 🚀')],
+      ['follow-up-section',source.indexOf('## Follow-up Section')],
+    ]);
+    for(const block of analysis.blocks)expect(source.slice(block.start,block.end)).toBe(block.text);
   });
 });

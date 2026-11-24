@@ -1,4 +1,4 @@
-import { Children, createContext, isValidElement, lazy, memo, Suspense, useContext, useEffect, useMemo, useRef, useState, type ReactNode, type RefObject } from "react";
+import { Children, createContext, isValidElement, lazy, memo, Suspense, useCallback, useContext, useEffect, useMemo, useRef, useState, type ReactNode, type RefObject } from "react";
 import { invoke } from "../nativeBridge";
 import CachedMarkdown,{type MarkdownBlockRenderer} from "./CachedMarkdown";
 import rehypeKatex from "rehype-katex";
@@ -192,6 +192,7 @@ interface Props extends ReaderAccessibilityPreference {
   trustedImageHosts?: string[];
   onTrustImageHost?: (host: string) => void;
   onChange?: (markdown:string)=>void;
+  onNotice?: (message: string) => void;
   renderBlock?:MarkdownBlockRenderer;
   sourceAnalysis?:SourceDocumentAnalysis;
 }
@@ -209,6 +210,7 @@ interface MarkdownPreviewContextValue {
   dark: boolean;
   trustedImageHosts: string[];
   onTrustImageHost?: (host: string) => void;
+  onNotice?: (message: string) => void;
   editable: boolean;
   liveStateRef: RefObject<MarkdownPreviewLiveState>;
 }
@@ -259,7 +261,7 @@ const MarkdownImage: Components['img'] = ({ src, alt }) => {
 };
 
 const MarkdownLink: Components['a'] = ({ node: _node, href, children, ...props }) => {
-  const { documentPath } = useContext(MarkdownPreviewContext);
+  const { documentPath, onNotice } = useContext(MarkdownPreviewContext);
   const rawProps = props as Record<string, unknown>;
   const wikilinkTarget = typeof rawProps['data-wikilink'] === 'string' ? rawProps['data-wikilink'] : undefined;
   const wikilinkFragment = typeof rawProps['data-heading-fragment'] === 'string' ? rawProps['data-heading-fragment'] : undefined;
@@ -283,7 +285,11 @@ const MarkdownLink: Components['a'] = ({ node: _node, href, children, ...props }
           event.preventDefault();
           event.stopPropagation();
           event.currentTarget.dataset.visited = 'true';
-          navigateWorkspaceLink(classified, documentPath);
+          if (!documentPath && (typeof window === 'undefined' || !window.SuperMD)) {
+            onNotice?.('Save this note before opening linked notes.');
+            return;
+          }
+          navigateWorkspaceLink(classified, documentPath, onNotice);
           return;
         }
         if (classified.kind === 'external') {
@@ -349,16 +355,22 @@ const MARKDOWN_COMPONENTS: Components = {
   pre: MarkdownPre,
 };
 
-function MarkdownPreview({ markdown, documentPath, python, dark, trustedImageHosts = EMPTY_TRUSTED_IMAGE_HOSTS, onTrustImageHost, onChange,renderBlock,fullDocumentAccessibility=false,sourceAnalysis }: Props) {
+function MarkdownPreview({ markdown, documentPath, python, dark, trustedImageHosts = EMPTY_TRUSTED_IMAGE_HOSTS, onTrustImageHost, onChange, onNotice, renderBlock, fullDocumentAccessibility=false, sourceAnalysis }: Props) {
   useEffect(installMediaMenu,[]);
+  const [linkNotice, setLinkNotice] = useState<string | null>(null);
+  useEffect(() => { setLinkNotice(null); }, [documentPath, markdown]);
+  const reportNotice = useCallback((message: string) => {
+    setLinkNotice(message);
+    onNotice?.(message);
+  }, [onNotice]);
   const analysis=useMemo(()=>sourceAnalysis?.source===markdown?sourceAnalysis.analysis:analyzeDocument(markdown),[markdown,sourceAnalysis]);
   const editable=Boolean(onChange);
   const tasks=editable?analysis.tasks:EMPTY_TASKS;
   const liveStateRef=useRef<MarkdownPreviewLiveState>({markdown,tasks,onChange,pythonCells:analysis.pythonCells});
   liveStateRef.current={markdown,tasks,onChange,pythonCells:analysis.pythonCells};
   const previewContext=useMemo<MarkdownPreviewContextValue>(
-    ()=>({documentPath,python,dark,trustedImageHosts,onTrustImageHost,editable,liveStateRef}),
-    [documentPath,python,dark,trustedImageHosts,onTrustImageHost,editable],
+    ()=>({documentPath,python,dark,trustedImageHosts,onTrustImageHost,onNotice:reportNotice,editable,liveStateRef}),
+    [documentPath,python,dark,trustedImageHosts,onTrustImageHost,reportNotice,editable],
   );
   const resolvedSourceAnalysis=useMemo(
     ()=>sourceAnalysis?.source===markdown?sourceAnalysis:{source:markdown,analysis},
@@ -367,6 +379,7 @@ function MarkdownPreview({ markdown, documentPath, python, dark, trustedImageHos
   return (
     <MarkdownPreviewContext.Provider value={previewContext}>
       <article className="markdown-body" onCopy={event=>{if(event.currentTarget.closest('.live-document'))return;const source=selectedMarkdown(window.getSelection(),markdown);if(source!==null){event.clipboardData.setData("text/plain",source);event.preventDefault();}}} onDragStart={event=>{if(!event.currentTarget.closest('.live-document'))setSelectedMarkdownDrag(event.nativeEvent,markdown);}}>
+        {linkNotice && <div role="status" className="reader-link-notice">{linkNotice}</div>}
         {analysis.frontmatter?.properties && <DocumentProperties properties={analysis.frontmatter.properties} />}
         <CachedMarkdown
           sourceAnalysis={resolvedSourceAnalysis}

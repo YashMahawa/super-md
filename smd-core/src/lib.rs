@@ -51,8 +51,9 @@ fn text(value: &str) -> String { format!("#text({})", string(value)) }
 pub fn image_sources(markdown: &str) -> Vec<String> {
     let mut sources = Vec::new();
     let body = frontmatter::strip_frontmatter(markdown);
+    let normalized = normalize_callouts_body(body);
     let options = Options::ENABLE_TABLES | Options::ENABLE_FOOTNOTES | Options::ENABLE_STRIKETHROUGH | Options::ENABLE_TASKLISTS | Options::ENABLE_MATH;
-    let mut events = Parser::new_ext(body, options);
+    let mut events = Parser::new_ext(&normalized, options);
     while let Some(event) = events.next() {
         match event {
             Event::Start(Tag::Image { dest_url, .. }) => sources.push(dest_url.to_string()),
@@ -104,7 +105,7 @@ fn normalize_callouts_body(input: &str) -> String {
         if let Some((ch,count))=code {
             if let Some((marker,length))=fence {
                 if ch==marker && count>=length && body[count..].trim().is_empty() { fence=None; }
-            } else { fence=Some((ch,count)); }
+            } else if ch != '`' || !body[count..].contains('`') { fence=Some((ch,count)); }
         }
         let start=if !inside_fence && code.is_none() {
             line.strip_prefix(":::callout").filter(|spec| spec.chars().next().is_some_and(char::is_whitespace))
@@ -177,8 +178,28 @@ fn format_wikilink_markdown(inner: &str) -> Option<String> {
     if target.is_empty() { return None; }
     let label = raw_alias.map(str::trim).filter(|s| !s.is_empty()).unwrap_or(trimmed_left);
     let dest_path = if has_supported_note_extension(target) { target.to_string() } else { format!("{target}.md") };
-    let dest_frag = if fragment.is_empty() { String::new() } else { format!("#{}", encode_md_destination(fragment)) };
+    let slug_frag = if fragment.is_empty() { String::new() } else { heading_slug(fragment) };
+    let dest_frag = if fragment.is_empty() {
+        String::new()
+    } else if !slug_frag.is_empty() {
+        format!("#{slug_frag}")
+    } else {
+        format!("#{}", encode_md_destination(fragment))
+    };
     Some(format!("[{}]({}{})", escape_md_link_label(label), encode_md_destination(&dest_path), dest_frag))
+}
+
+fn format_image_wikilink_markdown(inner: &str) -> Option<String> {
+    if inner.is_empty() || inner.contains(['\r', '\n']) { return None; }
+    let (raw_left, raw_alias) = match inner.split_once('|') {
+        Some((left, alias)) => (left, Some(alias)),
+        None => (inner, None),
+    };
+    let cleaned_left = if raw_alias.is_some() && raw_left.ends_with('\\') { &raw_left[..raw_left.len() - 1] } else { raw_left };
+    let target = cleaned_left.trim();
+    if target.is_empty() { return None; }
+    let label = raw_alias.map(str::trim).filter(|s| !s.is_empty()).unwrap_or(target);
+    Some(format!("![{}]({})", escape_md_link_label(label), encode_md_destination(target)))
 }
 
 fn is_likely_link_destination(dest: &str) -> bool {
@@ -197,6 +218,27 @@ fn rewrite_prose_segment(segment: &str) -> String {
     let bytes = segment.as_bytes();
     let mut i = 0usize;
     while i < bytes.len() {
+        if i + 2 < bytes.len() && bytes[i] == b'!' && bytes[i + 1] == b'[' && bytes[i + 2] == b'[' && (i == 0 || bytes[i - 1] != b'\\') {
+            let start = i + 3;
+            let mut end = start;
+            let mut found = None;
+            while end < bytes.len() && !matches!(bytes[end], b'\r' | b'\n' | b'[') {
+                if bytes[end] == b']' {
+                    if end + 1 < bytes.len() && bytes[end + 1] == b']' && end > start {
+                        found = Some(end);
+                    }
+                    break;
+                }
+                end += 1;
+            }
+            if let Some(close_idx) = found {
+                if let Some(formatted) = format_image_wikilink_markdown(&segment[start..close_idx]) {
+                    after_wiki.push_str(&formatted);
+                    i = close_idx + 2;
+                    continue;
+                }
+            }
+        }
         if i + 1 < bytes.len() && bytes[i] == b'[' && bytes[i + 1] == b'[' && (i == 0 || !matches!(bytes[i - 1], b'!' | b'\\')) {
             let start = i + 2;
             let mut end = start;

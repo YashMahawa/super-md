@@ -158,6 +158,70 @@ internal fun isExplicitRelativeWorkspaceTarget(rawTarget: String, wikilink: Bool
         rawTarget.startsWith(".\\") ||
         rawTarget.startsWith("..\\")
 
+private val ENCODED_NUL_REGEX = Regex("%00", RegexOption.IGNORE_CASE)
+
+internal fun sanitizeWorkspaceLinkTarget(rawTarget: String): String {
+    val cleaned = rawTarget.trim().substringBefore('#').substringBefore('?').trim()
+    if (cleaned.isEmpty()) {
+        throw WorkspaceLinkException("Link target is empty.")
+    }
+    if (cleaned.contains('\u0000') || ENCODED_NUL_REGEX.containsMatchIn(cleaned)) {
+        throw WorkspaceLinkException("Invalid note link.")
+    }
+    return cleaned
+}
+
+internal fun resolveLocalFileWorkspaceLink(
+    sourceUri: Uri,
+    rawTarget: String,
+    wikilink: Boolean,
+): WorkspaceResolvedNote? {
+    if (sourceUri.scheme != "file") return null
+    val rawPath = sourceUri.path ?: return null
+    val sourceFile = java.io.File(rawPath)
+    if (java.nio.file.Files.isSymbolicLink(sourceFile.toPath())) {
+        throw WorkspaceLinkException("Symlink note links are not allowed.")
+    }
+    val parentDir = runCatching { sourceFile.canonicalFile.parentFile }.getOrNull()?.takeIf { it.isDirectory } ?: return null
+    val cleaned = sanitizeWorkspaceLinkTarget(rawTarget)
+    val parts = workspaceRelativePathParts("", cleaned)
+    val relCandidate = parts.joinToString("/")
+    val (_, rawExt) = splitNameAndExt(parts.last())
+    val candidates = if (rawExt in WORKSPACE_NOTE_EXTENSIONS) {
+        listOf(relCandidate)
+    } else if (!wikilink && rawExt.isNotEmpty()) {
+        throw WorkspaceLinkException("Unsupported note extension: .$rawExt")
+    } else {
+        WORKSPACE_NOTE_EXTENSIONS.map { "$relCandidate.$it" }
+    }
+    for (candidateRel in candidates) {
+        var cur = parentDir
+        var blockedSymlink = false
+        for (segment in candidateRel.split('/')) {
+            val next = java.io.File(cur, segment)
+            if (java.nio.file.Files.isSymbolicLink(next.toPath())) {
+                blockedSymlink = true
+                break
+            }
+            cur = next
+        }
+        if (blockedSymlink) throw WorkspaceLinkException("Symlink note links are not allowed.")
+        if (!cur.isFile) continue
+        val resolved = runCatching { cur.canonicalFile }.getOrNull() ?: continue
+        val boundaryPath = parentDir.toPath()
+        val resolvedPath = resolved.toPath()
+        if (!resolvedPath.startsWith(boundaryPath)) {
+            throw WorkspaceLinkException("Links cannot navigate outside the open folder.")
+        }
+        return WorkspaceResolvedNote(
+            uri = Uri.fromFile(resolved),
+            name = resolved.name,
+            relative = boundaryPath.relativize(resolvedPath).toString().replace('\\', '/'),
+        )
+    }
+    throw WorkspaceLinkException("Note not found: ${Uri.decode(cleaned)}")
+}
+
 /**
  * Resolves a workspace-relative path against `parentRelative` without allowing
  * absolute paths, URL schemes, encoded path separators, or `..` escapes above the folder root.
@@ -207,10 +271,12 @@ internal class WorkspaceLinkCache(
         val uri: Uri,
         val documentId: String,
         val name: String,
+        val stem: String,
         val stemLower: String,
         val extLower: String,
         val relative: String,
         val relativeLower: String,
+        val relativeWithoutExt: String,
         val relativeWithoutExtLower: String,
         val depth: Int,
     )
@@ -259,23 +325,25 @@ internal class WorkspaceLinkCache(
         rawTarget: String,
         wikilink: Boolean,
     ): WorkspaceResolvedNote {
-        val cleaned = rawTarget.trim().substringBefore('#').substringBefore('?').trim()
-        if (cleaned.isEmpty()) {
-            throw WorkspaceLinkException("Link target is empty.")
-        }
+        val cleaned = sanitizeWorkspaceLinkTarget(rawTarget)
+        val noteParentDir = noteRelative?.let { if ('/' in it) it.substringBeforeLast('/') else "" }
         if (isExplicitRelativeWorkspaceTarget(cleaned, wikilink)) {
             if (noteRelative == null) {
                 throw WorkspaceLinkException("Choose the folder containing this note to follow relative links.")
             }
-            val parentRelative = noteRelative.substringBeforeLast('/', "")
+            val parentRelative = noteParentDir ?: ""
             val parts = workspaceRelativePathParts(parentRelative, cleaned)
+            val (_, explicitExt) = splitNameAndExt(parts.last())
+            if (!wikilink && explicitExt.isNotEmpty() && explicitExt !in WORKSPACE_NOTE_EXTENSIONS) {
+                throw WorkspaceLinkException("Unsupported note extension: .$explicitExt")
+            }
             val candidateRel = parts.joinToString("/")
             val index = ensureIndexed(treeUri)
             resolveRelativeCandidate(index, candidateRel)?.let { return it }
             throw WorkspaceLinkException("Note not found: ${Uri.decode(cleaned)}")
         }
 
-        // Wikilink resolution (basename or subpath inside the granted folder)
+        // Wikilink resolution (sibling, root, or ranked basename/subpath inside the granted folder)
         val parts = workspaceRelativePathParts("", cleaned)
         val normalizedQuery = parts.joinToString("/")
         val queryLower = normalizedQuery.lowercase()
@@ -283,8 +351,13 @@ internal class WorkspaceLinkCache(
         val hasKnownNoteExt = queryExt in WORKSPACE_NOTE_EXTENSIONS
         val index = ensureIndexed(treeUri)
 
+        if (noteParentDir != null) {
+            val siblingRel = if (noteParentDir.isEmpty()) normalizedQuery else "$noteParentDir/$normalizedQuery"
+            resolveRelativeCandidate(index, siblingRel, exactOnly = true)?.let { return it }
+        }
+
         if (parts.size > 1) {
-            resolveRelativeCandidate(index, normalizedQuery)?.let { return it }
+            resolveRelativeCandidate(index, normalizedQuery, exactOnly = true)?.let { return it }
             val suffixMatches = index.entries.filter { entry ->
                 if (hasKnownNoteExt) {
                     entry.relativeLower.endsWith("/$queryLower")
@@ -293,11 +366,18 @@ internal class WorkspaceLinkCache(
                         entry.relativeWithoutExtLower.endsWith("/$queryLower")
                 }
             }
-            pickBestMatch(suffixMatches)?.let { return it.toResolved() }
+            pickBestMatch(suffixMatches, noteParentDir) { entry ->
+                if (hasKnownNoteExt) {
+                    entry.relative == normalizedQuery || entry.relative.endsWith("/$normalizedQuery")
+                } else {
+                    entry.relativeWithoutExt == normalizedQuery || entry.relativeWithoutExt.endsWith("/$normalizedQuery")
+                }
+            }?.let { return it.toResolved() }
             throw WorkspaceLinkException("Note not found in folder: ${Uri.decode(cleaned)}")
         }
 
-        val targetNameLower = parts.single().lowercase()
+        val targetSegment = parts.single()
+        val targetNameLower = targetSegment.lowercase()
         val matches = index.entries.filter { entry ->
             if (hasKnownNoteExt) {
                 entry.name.lowercase() == targetNameLower
@@ -305,27 +385,46 @@ internal class WorkspaceLinkCache(
                 entry.stemLower == targetNameLower || entry.name.lowercase() == targetNameLower
             }
         }
-        pickBestMatch(matches)?.let { return it.toResolved() }
+        pickBestMatch(matches, noteParentDir) { entry ->
+            if (hasKnownNoteExt) entry.name == targetSegment else entry.stem == targetSegment
+        }?.let { return it.toResolved() }
         throw WorkspaceLinkException("Note not found in folder: ${Uri.decode(cleaned)}")
     }
 
-    private fun resolveRelativeCandidate(index: CachedTree, candidateRel: String): WorkspaceResolvedNote? {
+    private fun resolveRelativeCandidate(
+        index: CachedTree,
+        candidateRel: String,
+        exactOnly: Boolean = false,
+    ): WorkspaceResolvedNote? {
         index.byRelativeExact[candidateRel]?.let { return it.toResolved() }
-        index.byRelativeLower[candidateRel.lowercase()]?.let { return it.toResolved() }
+        if (!exactOnly) {
+            index.byRelativeLower[candidateRel.lowercase()]?.let { return it.toResolved() }
+        }
         val (_, ext) = splitNameAndExt(candidateRel.substringAfterLast('/'))
         if (ext !in WORKSPACE_NOTE_EXTENSIONS) {
             for (noteExt in WORKSPACE_NOTE_EXTENSIONS) {
                 val withExt = "$candidateRel.$noteExt"
                 index.byRelativeExact[withExt]?.let { return it.toResolved() }
-                index.byRelativeLower[withExt.lowercase()]?.let { return it.toResolved() }
+                if (!exactOnly) {
+                    index.byRelativeLower[withExt.lowercase()]?.let { return it.toResolved() }
+                }
             }
         }
         return null
     }
 
-    private fun pickBestMatch(matches: List<IndexedEntry>): IndexedEntry? =
+    private fun pickBestMatch(
+        matches: List<IndexedEntry>,
+        noteParentDir: String?,
+        exactCasePredicate: (IndexedEntry) -> Boolean,
+    ): IndexedEntry? =
         matches.minWithOrNull(
-            compareBy<IndexedEntry> { it.depth }
+            compareBy<IndexedEntry> { if (exactCasePredicate(it)) 0 else 1 }
+                .thenBy { entry ->
+                    val entryDir = if ('/' in entry.relative) entry.relative.substringBeforeLast('/') else ""
+                    if (noteParentDir != null && entryDir == noteParentDir) 0 else 1
+                }
+                .thenBy { it.depth }
                 .thenBy { extensionPriority(it.extLower) }
                 .thenBy { it.relativeLower },
         )
@@ -380,10 +479,12 @@ internal class WorkspaceLinkCache(
                         uri = child.uri,
                         documentId = child.documentId,
                         name = name,
+                        stem = stem,
                         stemLower = stem.lowercase(),
                         extLower = ext,
                         relative = relative,
                         relativeLower = relativeLower,
+                        relativeWithoutExt = withoutExt,
                         relativeWithoutExtLower = withoutExt.lowercase(),
                         depth = depth,
                     )

@@ -123,12 +123,16 @@ internal class ReaderBridge(
                     "load_python_output" -> loadPythonOutput(args)
                     "load_asset" -> model.asset(args.getString("documentPath"), args.getString("source"))
                     "load_text_asset" -> model.textAsset(args.getString("documentPath"), args.getString("source"))
-                    "open_workspace_link" -> model.openWorkspaceLink(
-                        args.optString("documentPath", ""),
-                        args.getString("target"),
-                        args.optString("fragment", ""),
-                        args.optBoolean("wikilink", false),
-                    )
+                    "open_workspace_link", "open_relative_note" -> {
+                        val fragment = args.optString("fragment", "").ifEmpty { args.optString("heading", "") }
+                        val wikilink = if (command == "open_workspace_link") args.optBoolean("wikilink", false) else false
+                        model.openWorkspaceLink(
+                            args.optString("documentPath", ""),
+                            args.getString("target"),
+                            fragment,
+                            wikilink,
+                        )
+                    }
                     "open_external_url" -> {
                         val rawUrl = args.getString("url")
                         require(rawUrl.length in 1..4096) { "Invalid external URL" }
@@ -136,7 +140,7 @@ internal class ReaderBridge(
                         require(classifyReaderNavigationUrl(uri, isForMainFrame = true) == ReaderUrlDecision.OPEN_EXTERNAL) {
                             "Unsupported external URL"
                         }
-                        runCatching { web.context.startActivity(Intent(Intent.ACTION_VIEW, uri)) }
+                        launchExternalReaderUri(web.context, uri)
                         true
                     }
                     "resolve_reader_asset" -> withContext(Dispatchers.IO) {
@@ -504,7 +508,7 @@ fun configureReader(web: WebView, model: StudioViewModel, scope: CoroutineScope,
             return when (classifyReaderNavigationUrl(request.url, request.isForMainFrame)) {
                 ReaderUrlDecision.ALLOW_READER -> false
                 ReaderUrlDecision.OPEN_EXTERNAL -> {
-                    runCatching { view.context.startActivity(Intent(Intent.ACTION_VIEW, request.url)) }
+                    launchExternalReaderUri(view.context, request.url)
                     true
                 }
                 ReaderUrlDecision.BLOCK_INTERNAL -> true
@@ -514,4 +518,11 @@ fun configureReader(web: WebView, model: StudioViewModel, scope: CoroutineScope,
     web.setTag(R.id.reader_bridge_tag, bridge)
     web.addJavascriptInterface(bridge, "SuperMD")
     web.loadUrl("https://appassets.androidplatform.net/assets/web/android-reader.html")
+}
+
+private fun launchExternalReaderUri(context: android.content.Context, uri: Uri) {
+    val intent = Intent(Intent.ACTION_VIEW, uri).apply {
+        if (context !is android.app.Activity) addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+    }
+    runCatching { context.startActivity(intent) }
 }

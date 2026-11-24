@@ -75,8 +75,9 @@ export function formatWikilinkMarkdown(rawInner: string, encodeDestinations = fa
   }
   const destPath = hasSupportedNoteExtension(parsed.target) ? parsed.target : `${parsed.target}.md`;
   const formattedPath = encodeDestinations ? encodeMarkdownDestination(destPath) : destPath;
+  const slugFragment = encodeDestinations && parsed.fragment ? headingSlug(parsed.fragment) : '';
   const formattedFragment = parsed.fragment
-    ? `#${encodeDestinations ? encodeMarkdownDestination(parsed.fragment) : parsed.fragment}`
+    ? `#${encodeDestinations ? (slugFragment || encodeMarkdownDestination(parsed.fragment)) : parsed.fragment}`
     : '';
   return `[${escapeLinkLabel(parsed.label)}](${formattedPath}${formattedFragment})`;
 }
@@ -127,6 +128,18 @@ export function classifyRenderedLink(href: string | undefined, wikilinkTarget?: 
     return fragment ? {kind: 'same-note', fragment} : {kind: 'none'};
   }
   return {kind: 'workspace', target, fragment, wikilink: false};
+}
+
+export function isLocalHref(href: string | undefined): boolean {
+  const classified = classifyRenderedLink(href);
+  return classified.kind === 'same-note' || classified.kind === 'workspace';
+}
+
+export function parseRelativeNoteLink(href: string | undefined): {target: string; heading?: string} | null {
+  const classified = classifyRenderedLink(href);
+  if (classified.kind !== 'workspace' || !hasSupportedNoteExtension(classified.target)) return null;
+  const rawTarget = (href!.split('#', 1)[0] ?? '').split('?', 1)[0];
+  return classified.fragment ? {target: rawTarget, heading: classified.fragment} : {target: rawTarget};
 }
 
 function isEscapedOrImageAt(lineText: string, bracketIndex: number): boolean {

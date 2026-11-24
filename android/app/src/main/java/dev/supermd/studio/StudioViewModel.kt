@@ -1685,8 +1685,9 @@ class StudioViewModel(app: Application, val workspaceKey: String = "main") : And
         val candidates = if (sourceUri != null) candidateWorkspaceTrees(sourceUri) else emptyList()
         val resolvedResult = try {
             withContext(Dispatchers.IO) {
+                val cleaned = sanitizeWorkspaceLinkTarget(trimmedTarget)
                 if (sourceUri == null) {
-                    return@withContext workspaceLinks.resolve(openFolder!!, noteRelative = null, rawTarget = trimmedTarget, wikilink = true)
+                    return@withContext workspaceLinks.resolve(openFolder!!, noteRelative = null, rawTarget = cleaned, wikilink = true)
                 }
                 for (candidate in candidates) {
                     val rel = workspaceLinks.noteRelativeInTree(
@@ -1695,11 +1696,24 @@ class StudioViewModel(app: Application, val workspaceKey: String = "main") : And
                         knownRelative = sourceNote.relative.takeIf { candidate.toString() == stateSnapshot.folder },
                     )
                     if (rel != null) {
-                        return@withContext workspaceLinks.resolve(candidate, noteRelative = rel, rawTarget = trimmedTarget, wikilink = wikilink)
+                        return@withContext workspaceLinks.resolve(candidate, noteRelative = rel, rawTarget = cleaned, wikilink = wikilink)
                     }
                 }
                 if (!explicitRelative && openFolder != null) {
-                    return@withContext workspaceLinks.resolve(openFolder, noteRelative = null, rawTarget = trimmedTarget, wikilink = true)
+                    return@withContext workspaceLinks.resolve(openFolder, noteRelative = null, rawTarget = cleaned, wikilink = true)
+                }
+                // Validate lexical containment upfront even when no folder tree is granted yet,
+                // so escaped ../, encoded separators, schemes, and unsupported extensions fail immediately.
+                val standaloneParts = workspaceRelativePathParts("", cleaned)
+                val (_, standaloneExt) = standaloneParts.last().let { seg ->
+                    val dot = seg.lastIndexOf('.')
+                    if (dot <= 0 || dot == seg.lastIndex) seg to "" else seg.substring(0, dot) to seg.substring(dot + 1).lowercase()
+                }
+                if (!wikilink && standaloneExt.isNotEmpty() && standaloneExt !in WORKSPACE_NOTE_EXTENSIONS) {
+                    throw WorkspaceLinkException("Unsupported note extension: .$standaloneExt")
+                }
+                if (sourceUri.scheme == "file") {
+                    return@withContext resolveLocalFileWorkspaceLink(sourceUri, cleaned, wikilink)
                 }
                 null
             }

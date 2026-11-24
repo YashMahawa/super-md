@@ -38,6 +38,14 @@ internal fun sameDocument(left: Uri, right: Uri): Boolean {
 }
 
 internal class DocumentAccess(private val context: Context) {
+    fun hasReadGrant(uri: Uri): Boolean {
+        if (uri.scheme != "content") return true
+        val read = Intent.FLAG_GRANT_READ_URI_PERMISSION
+        fun granted(candidate: Uri) = context.checkUriPermission(candidate, Process.myPid(), Process.myUid(), read) == PackageManager.PERMISSION_GRANTED
+        if (granted(uri)) return true
+        val resolved = resolve(uri, writing = false)
+        return resolved != uri && granted(resolved)
+    }
     fun hasWriteGrant(uri: Uri) = uri.scheme == "content" && context.checkUriPermission(uri, Process.myPid(), Process.myUid(), Intent.FLAG_GRANT_WRITE_URI_PERMISSION) == PackageManager.PERMISSION_GRANTED
     fun persist(uri: Uri) {
         if (uri.scheme == "content") persistDocumentGrants { context.contentResolver.takePersistableUriPermission(uri, it) }

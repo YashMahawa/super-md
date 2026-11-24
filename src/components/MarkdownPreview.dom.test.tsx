@@ -288,3 +288,88 @@ describe("local image preview", () => {
     expect(change).toHaveBeenCalledWith(markdown.replace("- [ ] Verify", "- [x] Verify"));
   });
 });
+
+describe("relative note and workspace link notices", () => {
+  it("omits target=_blank on local anchors and routes relative note and wikilink clicks through open_workspace_link", async () => {
+    const host = document.createElement("div");
+    document.body.append(host);
+    root = createRoot(host);
+    const markdown = [
+      "[External](https://example.org/docs)",
+      "[Section](#overview)",
+      "[Lecture 2](lecture-2.md)",
+      "[Deck](study.smd)",
+      "[[Task Note]]",
+      "[[Lecture 2#Bayes Law|Bayes]]",
+    ].join("\n\n");
+    await act(async () => {
+      root?.render(<MarkdownPreview markdown={markdown} documentPath="/notes/index.md" python="" dark={false} fullDocumentAccessibility />);
+    });
+    const links = Array.from(host.querySelectorAll("a"));
+    expect(links).toHaveLength(6);
+    expect(links[0].getAttribute("target")).toBe("_blank");
+    for (const localLink of links.slice(1)) {
+      expect(localLink.hasAttribute("target")).toBe(false);
+    }
+
+    for (const [index, expected] of [
+      [2, { documentPath: "/notes/index.md", target: "lecture-2.md", fragment: "", wikilink: false }],
+      [3, { documentPath: "/notes/index.md", target: "study.smd", fragment: "", wikilink: false }],
+      [4, { documentPath: "/notes/index.md", target: "Task Note", fragment: "", wikilink: true }],
+      [5, { documentPath: "/notes/index.md", target: "Lecture 2", fragment: "Bayes Law", wikilink: true }],
+    ] as const) {
+      loadAsset.mockClear();
+      const click = new MouseEvent("click", { bubbles: true, cancelable: true });
+      await act(async () => {
+        links[index].dispatchEvent(click);
+      });
+      expect(click.defaultPrevented).toBe(true);
+      expect(loadAsset).toHaveBeenCalledWith("open_workspace_link", expected);
+    }
+  });
+
+  it("surfaces an in-app status notice when clicking a workspace link in an unsaved standalone preview", async () => {
+    const host = document.createElement("div");
+    document.body.append(host);
+    root = createRoot(host);
+    const notices: string[] = [];
+    await act(async () => {
+      root?.render(<MarkdownPreview markdown="Open [[Task Note]]" documentPath={null} onNotice={msg => notices.push(msg)} python="" dark={false} fullDocumentAccessibility />);
+    });
+    const anchor = host.querySelector("a")!;
+    const click = new MouseEvent("click", { bubbles: true, cancelable: true });
+    await act(async () => {
+      anchor.dispatchEvent(click);
+    });
+    expect(click.defaultPrevented).toBe(true);
+    expect(loadAsset).not.toHaveBeenCalledWith("open_workspace_link", expect.anything());
+    expect(host.querySelector('[role="status"].reader-link-notice')?.textContent).toContain("Save this note before opening linked notes.");
+    expect(notices).toEqual(["Save this note before opening linked notes."]);
+  });
+
+  it("surfaces a safe status notice when open_workspace_link blocks an escaped path", async () => {
+    loadAsset.mockImplementationOnce(async (command: string) => {
+      if (command === "open_workspace_link") return { opened: false, message: "Linked note is outside the authorized folder." } as never;
+      return true as never;
+    });
+    const host = document.createElement("div");
+    document.body.append(host);
+    root = createRoot(host);
+    await act(async () => {
+      root?.render(<MarkdownPreview markdown="[Secret](../outside.md)" documentPath="/notes/index.md" python="" dark={false} fullDocumentAccessibility />);
+    });
+    const anchor = host.querySelector("a")!;
+    const click = new MouseEvent("click", { bubbles: true, cancelable: true });
+    await act(async () => {
+      anchor.dispatchEvent(click);
+    });
+    expect(click.defaultPrevented).toBe(true);
+    expect(loadAsset).toHaveBeenCalledWith("open_workspace_link", {
+      documentPath: "/notes/index.md",
+      target: "../outside.md",
+      fragment: "",
+      wikilink: false,
+    });
+    expect(host.querySelector('[role="status"].reader-link-notice')?.textContent).toContain("Linked note is outside the authorized folder.");
+  });
+});

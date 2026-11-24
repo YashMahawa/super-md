@@ -47,10 +47,10 @@ describe("workspaceLinks helpers", () => {
       "[Read this](My Note.md#Deep Dive)",
     );
     expect(formatWikilinkMarkdown("My Note#Deep Dive|Read this", true)).toBe(
-      "[Read this](My%20Note.md#Deep%20Dive)",
+      "[Read this](My%20Note.md#deep-dive)",
     );
     expect(formatWikilinkMarkdown("Bundle.smd#Part 1", true)).toBe(
-      "[Bundle.smd#Part 1](Bundle.smd#Part%201)",
+      "[Bundle.smd#Part 1](Bundle.smd#part-1)",
     );
     expect(formatWikilinkMarkdown("Portable.fmd", true)).toBe(
       "[Portable.fmd](Portable.fmd)",
@@ -141,7 +141,7 @@ describe("markdownSource offset preservation and syntax protection", () => {
     expect(normalized).toContain("[[Code Wikilink]]");
     expect(normalized).toContain("`[[Literal]]`");
     expect(normalized).toContain("$a + [[x]] = b$");
-    expect(normalized).toContain("[alias](My%20Spaced%20Note.md#Section%20Two)");
+    expect(normalized).toContain("[alias](My%20Spaced%20Note.md#section-two)");
     expect(normalized).toContain("[API Spec](../my%20specs/api%20doc.md#Auth%20Flow)");
   });
 
@@ -200,7 +200,7 @@ describe("markdownSource offset preservation and syntax protection", () => {
     ].join("\n");
 
     const prepared = await preparePdf(markdown, "/vault/Index.md");
-    expect(prepared.content).toContain("[Q3 Plan](Project%20Plan.md#Milestones)");
+    expect(prepared.content).toContain("[Q3 Plan](Project%20Plan.md#milestones)");
     expect(prepared.content).toContain("[API Spec](../my%20specs/api.md#Auth%20Flow)");
     expect(prepared.content).toContain("[Website](https://example.org/docs)");
     expect(prepared.content).toContain("[Email](mailto:team@example.org)");

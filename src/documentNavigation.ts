@@ -6,7 +6,8 @@ export type {OutlineEntry} from './documentAnalysis';
 import {revealWindowed} from "./windowedSearch";
 import {applyDocumentZoom,invalidateDocumentZoom,refreshDocumentExtent} from './documentZoom';
 import {invoke} from './nativeBridge';
-import {safeDecodeURIComponent,type ClassifiedRenderedLink} from './workspaceLinks';
+import {isLocalHref,parseRelativeNoteLink,safeDecodeURIComponent,type ClassifiedRenderedLink} from './workspaceLinks';
+export {isLocalHref,parseRelativeNoteLink};
 const jumps=new WeakMap<Element,{stop:()=>void}>();
 /** A user's zoom/pan wins over the settling frames of a preceding link jump. */
 export function cancelHeadingNavigation(root:Element|null):void {
@@ -38,11 +39,27 @@ function parseHeadingTarget(rawTarget: string) {
   const numberedSlug = numbered ? `${headingSlug(numbered[1])}-${numbered[2]}` : '';
   return { target, trimmed, slug, numberedSlug, lower: trimmed.toLowerCase() };
 }
-export function navigateWorkspaceLink(link: Extract<ClassifiedRenderedLink, {kind: 'workspace'}>, documentPath?: string | null): void {
+export function navigateWorkspaceLink(
+  link: Extract<ClassifiedRenderedLink, {kind: 'workspace'}>,
+  documentPath?: string | null,
+  onNotice?: (message: string) => void,
+): void {
   void (async () => {
     try { await window.supermdBeforeNavigate?.(); } catch { /* native host tracks edit state */ }
-    await invoke('open_workspace_link', { documentPath: documentPath || '', target: link.target, fragment: link.fragment, wikilink: link.wikilink });
-  })().catch(() => {});
+    const result = await invoke<{opened?: boolean; message?: string} | boolean>('open_workspace_link', {
+      documentPath: documentPath || '',
+      target: link.target,
+      fragment: link.fragment,
+      wikilink: link.wikilink,
+    });
+    if (result && typeof result === 'object' && result.opened === false && typeof result.message === 'string' && result.message) {
+      onNotice?.(result.message);
+    }
+  })().catch(error => {
+    const raw = error instanceof Error ? error.message : String(error ?? '');
+    const cleaned = raw.replace(/^Error:\s*/i, '').trim();
+    if (cleaned) onNotice?.(cleaned);
+  });
 }
 export function navigateExternalLink(url: string, openBrowserFallback = false): boolean {
   if (typeof window !== 'undefined' && window.SuperMD) {

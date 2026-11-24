@@ -104,6 +104,39 @@ fn inline_data_images_export_and_pack_but_remote_images_never_download_implicitl
     assert!(!output.status.success());assert!(String::from_utf8_lossy(&output.stderr).contains("explicit download"));assert!(!w.file("remote.pdf").exists());
 }
 
+#[test]
+fn cli_export_normalizes_spaced_aliased_portable_and_section_wikilinks_without_corrupting_code() {
+    let w = Workspace::new();
+    fs::create_dir(w.file("DM Images")).unwrap();
+    let svg = b"<svg xmlns=\"http://www.w3.org/2000/svg\" width=\"24\" height=\"24\"><rect width=\"24\" height=\"24\" fill=\"#386a57\"/></svg>";
+    fs::write(w.file("DM Images/proof.svg"), svg).unwrap();
+    let markdown = [
+        "# Probability Notes",
+        "",
+        "Study [[Task Note]], [[Lecture 2#Bayes Law|Bayes]], [[study.smd]], [Deck](study.smd), and [[#Probability Notes|Top]].",
+        "",
+        "![[DM Images/proof.svg|Proof Diagram]]",
+        "",
+        "Keep `[[Task Note]]` and:",
+        "",
+        "```python",
+        "grid = [[1, 0], [0, 1]]",
+        "```",
+    ].join("\n");
+    fs::write(w.file("lecture.md"), markdown).unwrap();
+    success(w.run(&["export", "lecture.md", "lecture.pdf"]));
+    pdf(&w.file("lecture.pdf"));
+    if let Ok(output) = Command::new("pdftotext").arg(w.file("lecture.pdf")).arg("-").output() {
+        if output.status.success() {
+            let extracted = String::from_utf8_lossy(&output.stdout);
+            assert!(extracted.contains("Study Task Note, Bayes, study.smd, Deck, and Top."), "{extracted}");
+            assert!(!extracted.contains("\\["), "{extracted}");
+            assert!(extracted.contains("Keep [[Task Note]]"), "{extracted}");
+            assert!(extracted.contains("grid = [[1, 0], [0, 1]]"), "{extracted}");
+        }
+    }
+}
+
 fn inflate_pdf_streams(bytes: &[u8]) -> String {
     use std::io::Read;
     let mut text = String::from_utf8_lossy(bytes).into_owned();

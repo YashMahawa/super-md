@@ -23,14 +23,35 @@ class WorkspaceLinkError(ValueError):
     """User-facing non-destructive link resolution error."""
 
 
+def _is_macos_alias_file(path: Path) -> bool:
+    if os.name != "posix" or not hasattr(os, "getxattr"):
+        return False
+    try:
+        finder_info = os.getxattr(path, "com.apple.FinderInfo", follow_symlinks=False)
+        if len(finder_info) >= 10 and (finder_info[8] & 0x80):
+            return True
+    except OSError:
+        pass
+    try:
+        if path.is_file():
+            with path.open("rb") as handle:
+                if handle.read(16) == b"book\x00\x00\x00\x00mark\x00\x00\x00\x00":
+                    return True
+    except OSError:
+        pass
+    return False
+
+
 def _is_link_or_junction(path: Path) -> bool:
     try:
         if path.is_symlink():
             return True
         is_junction = getattr(path, "is_junction", None)
-        return bool(callable(is_junction) and is_junction())
+        if callable(is_junction) and is_junction():
+            return True
     except OSError:
         return False
+    return _is_macos_alias_file(path)
 
 
 def _is_entry_link_or_junction(entry: os.DirEntry[str]) -> bool:
@@ -280,7 +301,7 @@ def _walk_within_boundary(base_dir: Path, rel_path: str, boundary: Path) -> Path
     return current
 
 
-def _probe_candidate(base_dir: Path, rel_path: str, boundary: Path) -> Path | None:
+def _probe_candidate(base_dir: Path, rel_path: str, boundary: Path, *, exact_case: bool = False) -> Path | None:
     candidates = [rel_path] if _has_supported_note_extension(rel_path) else [
         *(f"{rel_path}{ext}" for ext in NOTE_EXTENSIONS),
     ]
@@ -289,6 +310,8 @@ def _probe_candidate(base_dir: Path, rel_path: str, boundary: Path) -> Path | No
         try:
             if walked.is_file() and walked.suffix.lower() in NOTE_EXTENSIONS:
                 resolved = walked.resolve(strict=True)
+                if exact_case and resolved.name != walked.name:
+                    continue
                 if resolved != boundary and boundary not in resolved.parents:
                     raise WorkspaceLinkError("Link points outside the allowed folder.")
                 return resolved
@@ -347,11 +370,11 @@ def resolve_workspace_link(
     # Wikilink resolution:
     # 1. Relative to current note folder (if saved) and workspace root.
     if note_dir is not None:
-        direct = _probe_candidate(note_dir, cleaned, boundary)
+        direct = _probe_candidate(note_dir, cleaned, boundary, exact_case=True)
         if direct is not None:
             return direct
     if note_dir != boundary:
-        from_root = _probe_candidate(boundary, cleaned, boundary)
+        from_root = _probe_candidate(boundary, cleaned, boundary, exact_case=True)
         if from_root is not None:
             return from_root
 

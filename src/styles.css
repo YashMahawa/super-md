@@ -782,3 +782,4 @@ button.code-copy:active { border-radius:10px; }
  .step-viewer .is-visual-only .step-cards-notes { position:absolute; top:4px; left:4px; z-index:2; max-width:calc(100% - 8px); pointer-events:none; }
  .step-viewer .is-visual-only .step-cards-legacy-note { pointer-events:auto; }
 }
+.reader-link-notice { margin:0 0 12px; padding:8px 12px; border:1px solid var(--outline,rgba(128,128,128,.3)); border-radius:8px; background:var(--surface-low,rgba(128,128,128,.08)); color:var(--text,inherit); font-size:.9em; line-height:1.45; }

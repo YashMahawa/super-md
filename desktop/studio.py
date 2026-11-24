@@ -4289,10 +4289,14 @@ class Studio(QObject):
                 QDesktopServices.openUrl(QUrl(url))
                 self.replied.emit(id, "true", "")
                 return
-            if command == "open_workspace_link":
+            if command in ("open_workspace_link", "open_relative_note"):
                 raw_target = args.get("target")
-                raw_fragment = args.get("fragment", "")
-                wikilink = bool(args.get("wikilink", False))
+                raw_fragment = args.get("fragment")
+                if not raw_fragment:
+                    raw_fragment = args.get("heading", "")
+                if raw_fragment is None:
+                    raw_fragment = ""
+                wikilink = bool(args.get("wikilink", False)) if command == "open_workspace_link" else False
                 doc_ref = args.get("documentPath", "")
                 if not isinstance(raw_target, str) or len(raw_target) > 4096 or not isinstance(raw_fragment, str) or len(raw_fragment) > 1024:
                     raise ValueError("Invalid workspace link")
