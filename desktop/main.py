@@ -141,7 +141,13 @@ def main():
     session.agent_bridge = create_qt_bridge(session, session.data)
     app.aboutToQuit.connect(session.agent_bridge.stop)
     asset_handler = ReaderAssetSchemeHandler(session.reader_assets, app)
-    QWebEngineProfile.defaultProfile().installUrlSchemeHandler(SCHEME.encode("ascii"), asset_handler)
+    reader_profile_ready = {"initialized": False}
+    def ensure_reader_profile():
+        if reader_profile_ready["initialized"]:
+            return
+        reader_profile_ready["initialized"] = True
+        QWebEngineProfile.defaultProfile().installUrlSchemeHandler(SCHEME.encode("ascii"), asset_handler)
+    session.ensure_reader_profile = ensure_reader_profile
     def detach_window(source_id, tab_id):
         source = session.windows.get(source_id)
         if not source or not source._can_move(): return
@@ -160,6 +166,8 @@ def main():
             destination.tabs, destination.active = welcome, active
             QTimer.singleShot(0, destination.allowClose.emit)
     def create_window(note=None, *, show_window=True):
+        if show_window:
+            ensure_reader_profile()
         engine = QQmlApplicationEngine()
         studio = Studio(args.test_state,session)
         if args.smoke:
@@ -490,6 +498,7 @@ def main():
     def open_from_service(note=None):
         hidden=next((studio for studio in studios if not studio.retired and getattr(studio,"host_window",None) is not None and not studio.host_window.isVisible()),None)
         if hidden is not None:
+            ensure_reader_profile()
             remembered = session.settings.get("window") or {}
             if isinstance(remembered, dict) and remembered.get("maximized"):
                 hidden.host_window.showMaximized()
@@ -516,28 +525,25 @@ def main():
     if args.quit_after:
         QTimer.singleShot(args.quit_after, app.quit)
     status = app.exec()
-    _run_teardown(app, session, studios, engines, asset_handler, broker)
+    _run_teardown(
+        app,
+        session,
+        studios,
+        engines,
+        asset_handler,
+        broker,
+        reader_profile_initialized=reader_profile_ready["initialized"],
+    )
     return status
-
-
-_DARWIN_EXIT_ANCHOR = []
 
 
 def _exit_process(status: int) -> None:
     sys.stdout.flush()
     sys.stderr.flush()
-    if sys.platform == "darwin" and _DARWIN_EXIT_ANCHOR:
-        # QtWebEngineCore's C++ singleton destruction inside Py_FinalizeEx can
-        # deadlock on macOS Mach/renderer threads after QApplication.exec()
-        # returns (especially for offscreen/hidden WebEngineView hosts).
-        # All studio saves, recovery writes, agent sessions, QML engines,
-        # and single-instance locks are already flushed and closed in main().
-        os._exit(int(status))
-    else:
-        sys.exit(status)
+    sys.exit(status)
 
 
-def _run_teardown(app, session, studios, engines, asset_handler, broker):
+def _run_teardown(app, session, studios, engines, asset_handler, broker, *, reader_profile_initialized=False):
     session.agent_bridge.stop()
     for studio in list(studios):
         studio.stop()
@@ -549,18 +555,6 @@ def _run_teardown(app, session, studios, engines, asset_handler, broker):
         session.background.open_window = None
         if session.background.tray is not None:
             session.background.tray.hide()
-    if broker:
-        broker.close()
-        broker.set_service_handler(None)
-    if sys.platform == "darwin":
-        # Anchor Qt/QML/WebEngine objects until _exit_process calls os._exit so
-        # C++ ~QQuickWebEngineView / ~StudioApplication destructors cannot
-        # deadlock on macOS Mach/Chromium threads after disk writes and instance
-        # locks are already flushed and closed.
-        _DARWIN_EXIT_ANCHOR.extend((app, session, list(studios), list(engines), asset_handler, broker))
-        studios.clear()
-        engines.clear()
-        return
     for engine in list(engines):
         for root_obj in engine.rootObjects():
             try:
@@ -572,10 +566,11 @@ def _run_teardown(app, session, studios, engines, asset_handler, broker):
         engine.deleteLater()
     engines.clear()
     app.sendPostedEvents(None, QEvent.Type.DeferredDelete)
-    try:
-        QWebEngineProfile.defaultProfile().removeUrlSchemeHandler(asset_handler)
-    except RuntimeError:
-        pass
+    if reader_profile_initialized:
+        try:
+            QWebEngineProfile.defaultProfile().removeUrlSchemeHandler(asset_handler)
+        except RuntimeError:
+            pass
     asset_handler.deleteLater()
     for studio in list(studios):
         studio.host_window = None
@@ -584,6 +579,8 @@ def _run_teardown(app, session, studios, engines, asset_handler, broker):
         session.background.deleteLater()
         session.background = None
     if broker:
+        broker.close()
+        broker.set_service_handler(None)
         broker.deleteLater()
     for sig_name in ("aboutToQuit", "openRequested", "reopenRequested"):
         sig = getattr(app, sig_name, None)

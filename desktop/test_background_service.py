@@ -1775,14 +1775,16 @@ desktop_main._exit_process(rc)""",
             time.sleep(0.05)
         self.assertTrue(stopped, "Restarted daemon did not fully exit after final stop")
 
-    def test_darwin_exit_bypass_and_vanished_closing_peer_start_handoff(self):
-        # 1. Verify _exit_process uses os._exit on darwin once Qt/WebEngine anchored teardown ran,
-        #    and uses sys.exit otherwise, always flushing stdio first. Run in a clean subprocess
-        #    because importing `main` loads QtWebEngineQuick, which must never be imported into a
-        #    shared process where QApplication was created without QtWebEngineQuick.initialize().
+    def test_lazy_reader_profile_teardown_and_vanished_closing_peer_start_handoff(self):
+        # 1. Verify _run_teardown never touches QWebEngineProfile.defaultProfile() when a headless
+        #    background daemon never initialized a visible reader window (avoiding macOS persistent
+        #    profile lock contention and WebEngineContext teardown stalls), removes the scheme handler
+        #    when reader_profile_initialized=True, releases the broker after QML teardown, and exits
+        #    cleanly via sys.exit after flushing stdio. Run in an isolated subprocess because importing
+        #    `main` loads QtWebEngineQuick.
         probe_script = "\n".join(
             [
-                "import os, sys",
+                "import sys",
                 "from types import SimpleNamespace",
                 "from unittest.mock import MagicMock, patch",
                 f"sys.path.insert(0, {str(DESKTOP_DIR)!r})",
@@ -1792,6 +1794,9 @@ desktop_main._exit_process(rc)""",
                 "fake_app.sendPostedEvents.side_effect = lambda *_a: events.append('deferred_delete')",
                 "fake_studio = MagicMock()",
                 "fake_studio.stop.side_effect = lambda: events.append('studio_stop')",
+                "fake_engine = MagicMock()",
+                "fake_engine.rootObjects.return_value = []",
+                "fake_engine.deleteLater.side_effect = lambda: events.append('engine_delete')",
                 "fake_session = SimpleNamespace(",
                 "    agent_bridge=MagicMock(stop=lambda: events.append('bridge_stop')),",
                 "    writes=MagicMock(shutdown=lambda wait=True: events.append(('writes_shutdown', wait))),",
@@ -1799,20 +1804,18 @@ desktop_main._exit_process(rc)""",
                 ")",
                 "fake_broker = MagicMock()",
                 "fake_broker.close.side_effect = lambda: events.append('broker_close')",
-                "desktop_main._DARWIN_EXIT_ANCHOR.clear()",
-                "with patch.object(desktop_main.sys, 'platform', 'darwin'):",
-                "    desktop_main._run_teardown(fake_app, fake_session, [fake_studio], [MagicMock()], MagicMock(), fake_broker)",
-                "assert events == ['bridge_stop', 'studio_stop', ('writes_shutdown', True), 'broker_close'], events",
-                "assert desktop_main._DARWIN_EXIT_ANCHOR, 'Expected darwin exit anchor to hold teardown objects'",
-                "with patch.object(desktop_main.sys, 'platform', 'darwin'), patch.object(desktop_main.os, '_exit') as m_os, patch.object(desktop_main.sys, 'exit') as m_sys:",
+                "fake_handler = MagicMock()",
+                "with patch.object(desktop_main.QWebEngineProfile, 'defaultProfile') as m_profile:",
+                "    desktop_main._run_teardown(fake_app, fake_session, [fake_studio], [fake_engine], fake_handler, fake_broker, reader_profile_initialized=False)",
+                "    assert not m_profile.called, 'Headless teardown must not initialize QWebEngineProfile.defaultProfile()'",
+                "assert events == ['bridge_stop', 'studio_stop', ('writes_shutdown', True), 'engine_delete', 'deferred_delete', 'broker_close', 'deferred_delete'], events",
+                "events.clear()",
+                "with patch.object(desktop_main.QWebEngineProfile, 'defaultProfile') as m_profile2:",
+                "    desktop_main._run_teardown(fake_app, fake_session, [], [], fake_handler, None, reader_profile_initialized=True)",
+                "    m_profile2.return_value.removeUrlSchemeHandler.assert_called_once_with(fake_handler)",
+                "with patch.object(desktop_main.sys, 'exit') as m_sys:",
                 "    desktop_main._exit_process(0)",
-                "    assert m_os.call_args_list == [((0,), {})], m_os.call_args_list",
-                "    assert not m_sys.called",
-                "desktop_main._DARWIN_EXIT_ANCHOR.clear()",
-                "with patch.object(desktop_main.sys, 'platform', 'darwin'), patch.object(desktop_main.os, '_exit') as m_os2, patch.object(desktop_main.sys, 'exit') as m_sys2:",
-                "    desktop_main._exit_process(0)",
-                "    assert not m_os2.called",
-                "    assert m_sys2.call_args_list == [((0,), {})], m_sys2.call_args_list",
+                "    assert m_sys.call_args_list == [((0,), {})], m_sys.call_args_list",
             ]
         )
         probe = subprocess.run(

@@ -141,15 +141,17 @@ def main(argv):
     else:
         running=False;root.mkdir(parents=True,exist_ok=True)
         lock_probe=QLockFile(str(root/'native-instance.lock'));lock_probe.setStaleLockTime(0)
-        lock_deadline=time.monotonic()+15
+        lock_deadline=time.monotonic()+20;lock_cleared=False
         while time.monotonic()<lock_deadline:
             if lock_probe.tryLock(100):
                 lock_probe.unlock()
-                if _process_exit_clear():break
+                if _process_exit_clear():lock_cleared=True;break
                 time.sleep(.05);continue
             probe=request('status',startup_poll=True)
             if probe is not None and probe.get('ok',False) and probe.get('running'):
                 running=True;break
+        if not running and not lock_cleared:
+            raise ValueError('Background service did not start; previous instance is still shutting down')
         proc=None
         if not running:
             flags=(subprocess.CREATE_NEW_PROCESS_GROUP|getattr(subprocess,'CREATE_NO_WINDOW',0)) if os.name=='nt' else 0
@@ -165,7 +167,11 @@ def main(argv):
                         raise ValueError(status.get('error') or 'Background service failed to start')
                 if proc is not None:
                     exit_code=proc.poll()
-                    if type(exit_code) is int and exit_code!=0:break
+                    if type(exit_code) is int:
+                        status=request('status',startup_poll=True)
+                        if status is not None and status.get('ok',False) and status.get('running'):
+                            running=True
+                        break
                 time.sleep(.2)
         if not running:raise ValueError('Background service did not start; inspect its local log')
     result={'running':running,'action':args.action}

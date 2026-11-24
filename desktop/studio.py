@@ -2149,6 +2149,12 @@ class Studio(QObject):
     def saveSafely(self): self._flush("save")
 
     @Slot()
+    def ensureReaderProfile(self):
+        callback = getattr(self.session, "ensure_reader_profile", None)
+        if callable(callback):
+            callback()
+
+    @Slot()
     def reloadReaderSafely(self):
         if not self.ready or self.retired or self.busy or self.flush_operation: return
         self._flush("reload_reader")

@@ -28,7 +28,7 @@ ApplicationWindow {
     onSettingsOpenChanged: settingsOpen ? settingsDialog.open() : settingsDialog.close()
     property bool closingAllowed: false
     property bool intentionalShutdown: false
-    property bool readerActivated: visible
+    property bool readerActivated: false
     property bool readerRecoveryPending: false
     property bool readerRecoveryLoading: false
     property bool readerRecoveryExhausted: false
@@ -251,11 +251,14 @@ ApplicationWindow {
     Material.foreground: viewState.colors["on-surface"]
     color: viewState.colors.surface
     font.family: "Noto Sans"
+    function activateReaderIfNeeded() {
+        if (intentionalShutdown || closingAllowed || studio.retired || readerRecoveryPending) return
+        studio.ensureReaderProfile()
+        readerActivated = true
+        if (!readerLoader.active) readerLoader.active = true
+    }
     onVisibleChanged: {
-        if (visible && !intentionalShutdown && !closingAllowed && !studio.retired && !readerRecoveryPending) {
-            readerActivated = true
-            if (!readerLoader.active) readerLoader.active = true
-        }
+        if (visible) activateReaderIfNeeded()
     }
     onClosing: function(close) {
         if (window.visible && !windowModes.fullscreen) studio.rememberWindow(visibility === Window.Maximized ? viewState.settings.window.width : width, visibility === Window.Maximized ? viewState.settings.window.height : height, visibility === Window.Maximized)
@@ -269,6 +272,7 @@ ApplicationWindow {
             if (studio.backgroundEnabled && !studio.hasOtherOpenWindows()) { window.hide(); return }
             intentionalShutdown = true; closingAllowed = true
             readerRetryTimer.stop(); readerRecoveryRestoreTimer.stop(); readerStableTimer.stop()
+            if (readerLoader.active) readerLoader.active = false
             window.close()
         }
         function onFlushFailed(canClose) { if(!closingAllowed && !closeDialog.visible) { if (!window.visible) { window.show(); window.raise(); window.requestActivate() } flushDialog.canClose = canClose; flushDialog.open() } }
@@ -313,6 +317,7 @@ ApplicationWindow {
         repeat: false
         onTriggered: {
             if (!window.intentionalShutdown && !window.closingAllowed && !studio.retired && readerLoader) {
+                studio.ensureReaderProfile()
                 readerLoader.active = true
             }
         }
