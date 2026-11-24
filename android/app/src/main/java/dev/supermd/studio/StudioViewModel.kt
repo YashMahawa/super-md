@@ -2112,9 +2112,7 @@ class StudioViewModel(app: Application, val workspaceKey: String = "main") : And
     }
     fun setFolder(uri: Uri) = viewModelScope.launch {
         try {
-            if (uri.scheme == "content") {
-                withContext(Dispatchers.IO) { resolver.takePersistableUriPermission(uri, Intent.FLAG_GRANT_READ_URI_PERMISSION or Intent.FLAG_GRANT_WRITE_URI_PERMISSION) }
-            }
+            withContext(Dispatchers.IO) { resolver.takePersistableUriPermission(uri, Intent.FLAG_GRANT_READ_URI_PERMISSION or Intent.FLAG_GRANT_WRITE_URI_PERMISSION) }
             windowPrefs.edit().putBoolean("folderMigrated", true).putString("folder", uri.toString()).apply()
             change { it.copy(folder = uri.toString()) }; listFolder(uri, "")
         } catch (error: Exception) { fail("Could not open folder: ${error.message}") }
@@ -2127,30 +2125,9 @@ class StudioViewModel(app: Application, val workspaceKey: String = "main") : And
         listedRelative=relative
         try {
             val entries = withContext(Dispatchers.IO) {
-                val rootUri = Uri.parse(mutable.value.folder ?: uri.toString())
-                if (rootUri.scheme == "file") {
-                    var folder = File(rootUri.path ?: error("Folder path unavailable"))
-                    relative.split('/').filter { it.isNotEmpty() }.forEach { part ->
-                        folder = File(folder, part).takeIf { it.exists() && !java.nio.file.Files.isSymbolicLink(it.toPath()) } ?: error("Folder disappeared")
-                    }
-                    folder.listFiles().orEmpty().mapNotNull { f ->
-                        val name = f.name
-                        if (name.startsWith('.') || java.nio.file.Files.isSymbolicLink(f.toPath())) return@mapNotNull null
-                        if (f.isDirectory || (f.isFile && isSearchableNoteName(name))) {
-                            FileEntry(name, Uri.fromFile(f).toString(), f.isDirectory, (if (relative.isEmpty()) "" else "$relative/") + name)
-                        } else null
-                    }.sortedWith(compareByDescending<FileEntry> { it.directory }.thenBy { it.name.lowercase() })
-                } else {
-                    var folder = DocumentFile.fromTreeUri(getApplication(), rootUri) ?: error("Choose the folder again to restore access")
-                    relative.split('/').filter { it.isNotEmpty() }.forEach { part -> folder = folder.findFile(part) ?: error("Folder disappeared") }
-                    folder.listFiles().mapNotNull { f ->
-                        val name = f.name ?: return@mapNotNull null
-                        if (name.startsWith('.') || f.isVirtual) return@mapNotNull null
-                        if (f.isDirectory || isSearchableNoteName(name)) {
-                            FileEntry(name, f.uri.toString(), f.isDirectory, (if (relative.isEmpty()) "" else "$relative/") + name)
-                        } else null
-                    }.sortedWith(compareByDescending<FileEntry> { it.directory }.thenBy { it.name.lowercase() })
-                }
+                var folder = DocumentFile.fromTreeUri(getApplication(), Uri.parse(mutable.value.folder ?: uri.toString())) ?: error("Choose the folder again to restore access")
+                relative.split('/').filter { it.isNotEmpty() }.forEach { part -> folder = folder.findFile(part) ?: error("Folder disappeared") }
+                folder.listFiles().mapNotNull { f -> val name = f.name ?: return@mapNotNull null; if (name.startsWith('.')) return@mapNotNull null; if (f.isDirectory || name.substringAfterLast('.').lowercase() in listOf("md", "smd", "markdown", "fmd")) FileEntry(name, f.uri.toString(), f.isDirectory, (if (relative.isEmpty()) "" else "$relative/") + name) else null }.sortedWith(compareByDescending<FileEntry> { it.directory }.thenBy { it.name.lowercase() })
             }
             mutable.value = mutable.value.copy(files = entries)
         } catch (error: Exception) { fail("Could not list folder: ${error.message}") }

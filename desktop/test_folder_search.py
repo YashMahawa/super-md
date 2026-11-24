@@ -330,6 +330,15 @@ class WorkspaceSearchDesktopTest(unittest.TestCase):
             self.assertIn("<b>NOTE</b>", qml_highlight(m_both))
             self.assertIn("<b>note</b>", qml_highlight(m_strasse))
             self.assertIn("<b>NOTE</b>", qml_highlight(m_long))
+
+            cs_res = stream_text_search("note", tabs, [], None, case_sensitive=True)
+            self.assertEqual([m["line"] for m in cs_res["matches"]], [1, 2, 4])
+            self.assertEqual((cs_res["matches"][0]["matchStart"], cs_res["matches"][0]["matchEnd"]), (10, 14))
+            self.assertEqual((cs_res["matches"][1]["matchStart"], cs_res["matches"][1]["matchEnd"]), (3, 7))
+            self.assertIn("<b>note</b>", qml_highlight(cs_res["matches"][1]))
+
+            emoji_q = stream_text_search("📓", tabs, [], None, case_sensitive=False)
+            self.assertIn("<b>📓</b>", qml_highlight(emoji_q["matches"][0]))
         finally:
             for obj in engine.rootObjects():
                 obj.deleteLater()

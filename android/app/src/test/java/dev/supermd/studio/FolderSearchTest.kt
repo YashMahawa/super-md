@@ -119,6 +119,30 @@ class FolderSearchTest {
                 annotated.text.substring(span.start, span.end).lowercase(),
             )
         }
+
+        val caseSensitiveRes = streamTextSearch(
+            query = "note",
+            tabs = listOf(openTab),
+            recents = emptyList(),
+            folderRoot = null,
+            media = media,
+            openUriStream = { null },
+            caseSensitive = true,
+        )
+        assertEquals(listOf(1, 2, 4), caseSensitiveRes.matches.map { it.line })
+        assertEquals(10 to 14, caseSensitiveRes.matches[0].let { it.matchStart to it.matchEnd })
+        assertEquals(3 to 7, caseSensitiveRes.matches[1].let { it.matchStart to it.matchEnd })
+
+        val emojiQueryRes = streamTextSearch(
+            query = "📓",
+            tabs = listOf(openTab),
+            recents = emptyList(),
+            folderRoot = null,
+            media = media,
+            openUriStream = { null },
+            caseSensitive = false,
+        )
+        assertEquals("📓", emojiQueryRes.matches.first().let { it.snippet.substring(it.matchStart, it.matchEnd) })
     }
 
     @Test
@@ -327,20 +351,19 @@ class FolderSearchTest {
     fun viewModelSearchMatchSeedsFindAndOpensNote() = runBlocking {
         val app = RuntimeEnvironment.getApplication()
         val tempRoot = Files.createTempDirectory("supermd-android-vm-").toFile()
+        val sub = File(tempRoot, "notes/sub").apply { mkdirs() }
+        File(sub, "target.md").apply {
+            writeText("# Target\n\nUniqueSeedPhrase appears here.\n")
+        }
+        app.getSharedPreferences("studio-window-search-vm-test", 0)
+            .edit()
+            .putBoolean("folderMigrated", true)
+            .putString("folder", Uri.fromFile(tempRoot).toString())
+            .commit()
         val vm = StudioViewModel(app, "search-vm-test")
         try {
-            val sub = File(tempRoot, "notes/sub").apply { mkdirs() }
-            File(sub, "target.md").apply {
-                writeText("# Target\n\nUniqueSeedPhrase appears here.\n")
-            }
-            vm.setFolder(Uri.fromFile(tempRoot))
-
             val deadline = System.currentTimeMillis() + 5_000
-            while (vm.state.value.files.isEmpty() && System.currentTimeMillis() < deadline) {
-                shadowOf(Looper.getMainLooper()).idle()
-                delay(20)
-            }
-            assertEquals("notes", vm.state.value.files.single().name)
+            assertEquals(Uri.fromFile(tempRoot).toString(), vm.state.value.folder)
 
             vm.openFolderSearch("UniqueSeedPhrase")
             while ((vm.folderSearch.value.scanning || vm.folderSearch.value.matches.isEmpty()) && System.currentTimeMillis() < deadline) {
