@@ -250,4 +250,18 @@ describe('live agent document operations',()=>{
     expect(()=>applyAgentPatches(nearCap,[{type:'lines',start_line:2,end_line:2,text:'\ude00'}])).toThrow('exceeds 20 MB');
     expect(()=>applyAgentPatchesDetailed(nearCap,[{type:'lines',start_line:2,end_line:2,text:'\ude00'}])).toThrow('exceeds 20 MB');
   });
+  it('bounds prose SVG elision to maxEnd without leaking off-screen text',()=>{
+    const svg='<svg xmlns="http://www.w3.org/2000/svg"><rect width="12" height="12"/></svg>';
+    const doc=`# 😀 Visible\n\n\`\`\`svg\n${svg}\n\`\`\`\n\n## Offscreen\n\nHidden trailing paragraph.`;
+    const viewportEndUtf16=doc.indexOf('\n\n## Offscreen');
+    const viewportEndCp=agentCodePointOffset(doc,viewportEndUtf16);
+    const bounded=agentRead(doc,0,6000,undefined,'prose',viewportEndCp);
+    const sliced=agentRead(doc.slice(0,viewportEndUtf16),0,6000);
+    expect(bounded.text).toBe(sliced.text);
+    expect(bounded.end).toBe(viewportEndCp);
+    expect(bounded.svg_omissions).toEqual(sliced.svg_omissions);
+    expect(bounded.text).not.toContain('Offscreen');
+    const empty=agentRead(doc,viewportEndCp,1,undefined,'prose',viewportEndCp);
+    expect(empty).toMatchObject({view:'prose',text:'',start:viewportEndCp,end:viewportEndCp,returned_chars:0,svg_omissions:[]});
+  });
 });

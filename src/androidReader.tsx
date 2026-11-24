@@ -871,14 +871,9 @@ function Reader() {
         walkPython(analysis.tree);
 
         const splitRangeEnd=!!range&&range.end>0&&range.end<note.content.length&&note.content.charCodeAt(range.end-1)>=0xd800&&note.content.charCodeAt(range.end-1)<=0xdbff&&note.content.charCodeAt(range.end)>=0xdc00&&note.content.charCodeAt(range.end)<=0xdfff;
-        let visiblePage;
-        if(splitRangeEnd){
-          visiblePage=agentRead(note.content.slice(0,range!.end),sourceOffset,sourceLimit);
-        }else{
-          const rangeEndCp=range?agentCodePointOffset(note.content,range.end):base.sourceLength;
-          const boundedLimit=range?Math.min(requestedContextLimit,Math.max(0,rangeEndCp-sourceOffset)):sourceLimit;
-          visiblePage=boundedLimit>0?agentRead(note.content,sourceOffset,boundedLimit):{view:'source' as const,text:'',start:sourceOffset,end:sourceOffset,returned_chars:0,total_chars:rangeEndCp,next_offset:null,truncated:false};
-        }
+        const visiblePage=splitRangeEnd
+          ?agentRead(note.content.slice(0,range!.end),sourceOffset,sourceLimit)
+          :agentRead(note.content,sourceOffset,sourceLimit,undefined,'prose',range?Math.max(sourceOffset,agentCodePointOffset(note.content,range.end)):undefined);
         // The viewport bounds the page text, not the document's pagination.
         const visibleSource={...visiblePage,total_chars:base.sourceLength,next_offset:visiblePage.end<base.sourceLength?visiblePage.end:null,truncated:visiblePage.end<base.sourceLength};
         const portalViewer=primaryDeck?.expanded?document.querySelector<HTMLElement>('.step-viewer'):null;

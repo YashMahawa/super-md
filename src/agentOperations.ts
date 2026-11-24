@@ -459,11 +459,12 @@ function prosePageEnd(start:number,limit:number,maxEnd:number,spans:SvgSpan[]) {
   }
   return Math.min(maxEnd,cursor+remaining);
 }
-export function agentRead(source:string,offset:unknown=0,limit:unknown=12_000,heading?:unknown,view:unknown='prose') {
+export function agentRead(source:string,offset:unknown=0,limit:unknown=12_000,heading?:unknown,view:unknown='prose',maxEnd?:number) {
   if(view!=='prose'&&view!=='source')throw Error('view must be prose or source');
   const documentLength=agentCharLength(source);let sectionStart=0,sectionEnd=documentLength;
   const requestedOffset=boundedInt(offset,0,0,documentLength);
   if(heading!==undefined){const section=agentSection(source,heading);sectionStart=section.sectionStart;sectionEnd=section.sectionEnd;}
+  if(maxEnd!==undefined)sectionEnd=Math.min(sectionEnd,Math.max(sectionStart,maxEnd));
   if(requestedOffset>sectionEnd)throw Error(`offset must be within the selected section (sectionEnd ${sectionEnd})`);
   const start=heading===undefined?requestedOffset:Math.max(sectionStart,requestedOffset);
   const end=sectionEnd;
