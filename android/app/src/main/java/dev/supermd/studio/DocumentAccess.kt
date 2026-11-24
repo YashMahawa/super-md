@@ -38,21 +38,29 @@ internal fun sameDocument(left: Uri, right: Uri): Boolean {
 }
 
 internal class DocumentAccess(private val context: Context) {
-    fun hasWriteGrant(uri: Uri) = uri.scheme == "content" && context.checkUriPermission(uri, Process.myPid(), Process.myUid(), Intent.FLAG_GRANT_WRITE_URI_PERMISSION) == PackageManager.PERMISSION_GRANTED
+    private fun granted(candidate: Uri, modes: Int): Boolean =
+        context.checkUriPermission(candidate, Process.myPid(), Process.myUid(), modes) == PackageManager.PERMISSION_GRANTED
+
+    private fun persistedTreeGrants(uri: Uri, id: String, writing: Boolean) =
+        context.contentResolver.persistedUriPermissions.filter { grant ->
+            if (!DocumentsContract.isTreeUri(grant.uri) || grant.uri.authority != uri.authority || !grant.isReadPermission || writing && !grant.isWritePermission) return@filter false
+            val root = runCatching { DocumentsContract.getTreeDocumentId(grant.uri) }.getOrNull() ?: return@filter false
+            id == root || id.startsWith(root.trimEnd('/') + "/") || root.endsWith(":") && id.startsWith(root)
+        }
+
+    fun hasWriteGrant(uri: Uri) = uri.scheme == "content" && granted(uri, Intent.FLAG_GRANT_WRITE_URI_PERMISSION)
+
     fun hasReadGrant(uri: Uri): Boolean {
         if (uri.scheme != "content") return true
         val read = Intent.FLAG_GRANT_READ_URI_PERMISSION
-        if (context.checkUriPermission(uri, Process.myPid(), Process.myUid(), read) == PackageManager.PERMISSION_GRANTED) return true
+        if (granted(uri, read)) return true
         val resolved = resolve(uri, writing = false)
-        if (resolved != uri && context.checkUriPermission(resolved, Process.myPid(), Process.myUid(), read) == PackageManager.PERMISSION_GRANTED) return true
+        if (resolved != uri && granted(resolved, read)) return true
         if (context.contentResolver.persistedUriPermissions.any { it.isReadPermission && sameDocument(it.uri, uri) }) return true
         val id = runCatching { DocumentsContract.getDocumentId(uri) }.getOrNull() ?: return false
-        return context.contentResolver.persistedUriPermissions.any { grant ->
-            if (!DocumentsContract.isTreeUri(grant.uri) || grant.uri.authority != uri.authority || !grant.isReadPermission) return@any false
-            val root = runCatching { DocumentsContract.getTreeDocumentId(grant.uri) }.getOrNull() ?: return@any false
-            id == root || id.startsWith(root.trimEnd('/') + "/") || root.endsWith(":") && id.startsWith(root)
-        }
+        return persistedTreeGrants(uri, id, writing = false).isNotEmpty()
     }
+
     fun persist(uri: Uri) {
         if (uri.scheme == "content") persistDocumentGrants { context.contentResolver.takePersistableUriPermission(uri, it) }
     }
@@ -62,16 +70,9 @@ internal class DocumentAccess(private val context: Context) {
         if (uri.scheme != "content") return uri
         val read = Intent.FLAG_GRANT_READ_URI_PERMISSION
         val write = Intent.FLAG_GRANT_WRITE_URI_PERMISSION
-        fun granted(candidate: Uri, modes: Int) = context.checkUriPermission(candidate, Process.myPid(), Process.myUid(), modes) == PackageManager.PERMISSION_GRANTED
         if (granted(uri, read or write)) return uri
         val id = runCatching { DocumentsContract.getDocumentId(uri) }.getOrNull() ?: return uri
-        val candidates = context.contentResolver.persistedUriPermissions.mapNotNull { grant ->
-            if (!DocumentsContract.isTreeUri(grant.uri) || grant.uri.authority != uri.authority || !grant.isReadPermission || writing && !grant.isWritePermission) return@mapNotNull null
-            val root = runCatching { DocumentsContract.getTreeDocumentId(grant.uri) }.getOrNull() ?: return@mapNotNull null
-            val contained = id == root || id.startsWith(root.trimEnd('/') + "/") || root.endsWith(":") && id.startsWith(root)
-            if (!contained) return@mapNotNull null
-            DocumentsContract.buildDocumentUriUsingTree(grant.uri, id)
-        }
+        val candidates = persistedTreeGrants(uri, id, writing).map { DocumentsContract.buildDocumentUriUsingTree(it.uri, id) }
         candidates.firstOrNull { granted(it, read or write) }?.let { return it }
         if (!writing && granted(uri, read)) return uri
         return candidates.firstOrNull { granted(it, if (writing) write else read) } ?: uri

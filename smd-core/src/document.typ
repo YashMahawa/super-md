@@ -19,9 +19,29 @@
 // code remain vectors and selectable text; the UI's zoom cannot affect PDF layout.
 #let smd-fit(body) = layout(size => {
   let natural = measure(body)
-  let factor = if natural.width > 0pt { calc.min(1, size.width / natural.width) } else { 1 }
-  scale(x: factor * 100%, y: factor * 100%, reflow: true, body)
+  if natural.width > size.width and natural.width > 0pt {
+    let factor = size.width / natural.width
+    scale(x: factor * 100%, y: factor * 100%, reflow: true, body)
+  } else {
+    body
+  }
 })
+// Highlight each code block once, then fit synthesized lines individually while
+// keeping the outer 1.2em row height and breakable pagination across pages.
+#let smd-code(code, lang: none) = context {
+  let line-height = 1.2em.to-absolute()
+  block(width: 100%, breakable: true, fill: smd-code-fill, inset: 8pt, {
+    set par(spacing: 0pt, leading: .3em)
+    show raw.where(block: true): it => {
+      for line in it.lines {
+        block(height: line-height, above: 0pt, below: 0pt, smd-fit(line))
+      }
+    }
+    if code != none {
+      raw(code, block: true, lang: lang)
+    }
+  })
+}
 #let smd-image(path) = layout(size => {
   let pic = image(path)
   let bounds = measure(pic)

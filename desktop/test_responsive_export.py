@@ -67,7 +67,7 @@ function chooseExportDestination() {}
             self.assertFalse(dialog.property('visible'))
         finally:
             if window:window.close();window.deleteLater()
-            self.app.sendPostedEvents(None,QEvent.DeferredDelete);engine.deleteLater();self.app.sendPostedEvents(None,QEvent.DeferredDelete)
+            self.app.sendPostedEvents(None,QEvent.Type.DeferredDelete);engine.deleteLater();self.app.sendPostedEvents(None,QEvent.Type.DeferredDelete)
             self.studio.stop();self.studio.pool.shutdown(wait=True);self.studio.session.writes.shutdown(wait=True)
 
 if __name__=='__main__':unittest.main()

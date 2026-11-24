@@ -283,12 +283,40 @@ private class RelativeNoteProvider(private val root: File) : ContentProvider() {
     }
 
     override fun query(uri: Uri, projection: Array<out String>?, selection: String?, selectionArgs: Array<out String>?, sortOrder: String?): Cursor {
+        val segments = uri.pathSegments
+        val childrenIndex = segments.indexOf("children")
+        if (childrenIndex > 0) {
+            checkGranted(uri)
+            val parentId = segments[childrenIndex - 1]
+            val dir = File(root, parentId)
+            if (!dir.isDirectory) throw java.io.FileNotFoundException(uri.toString())
+            val columns = projection?.toList() ?: listOf(
+                DocumentsContract.Document.COLUMN_DOCUMENT_ID,
+                DocumentsContract.Document.COLUMN_DISPLAY_NAME,
+                DocumentsContract.Document.COLUMN_MIME_TYPE,
+            )
+            return MatrixCursor(columns.toTypedArray()).apply {
+                dir.listFiles()?.sortedBy { it.name }?.forEach { child ->
+                    val childId = "${parentId.trimEnd('/')}/${child.name}"
+                    addRow(columns.map { col ->
+                        when (col) {
+                            DocumentsContract.Document.COLUMN_DOCUMENT_ID -> childId
+                            DocumentsContract.Document.COLUMN_DISPLAY_NAME, OpenableColumns.DISPLAY_NAME -> child.name
+                            DocumentsContract.Document.COLUMN_MIME_TYPE -> if (child.isDirectory) DocumentsContract.Document.MIME_TYPE_DIR else "text/markdown"
+                            OpenableColumns.SIZE -> child.length()
+                            else -> null
+                        }
+                    }.toTypedArray<Any?>())
+                }
+            }
+        }
         val file = resolveFile(uri)
         if (!file.exists()) throw java.io.FileNotFoundException(uri.toString())
         val columns = projection?.toList() ?: listOf(OpenableColumns.DISPLAY_NAME, OpenableColumns.SIZE)
         return MatrixCursor(columns.toTypedArray()).apply {
             addRow(columns.map { col ->
                 when (col) {
+                    DocumentsContract.Document.COLUMN_DOCUMENT_ID -> DocumentsContract.getDocumentId(uri)
                     OpenableColumns.DISPLAY_NAME -> file.name
                     OpenableColumns.SIZE -> file.length()
                     DocumentsContract.Document.COLUMN_MIME_TYPE -> if (file.isDirectory) DocumentsContract.Document.MIME_TYPE_DIR else "text/markdown"
