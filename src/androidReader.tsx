@@ -51,6 +51,11 @@ import {isTypewriterShortcutEvent,setTypewriterScroll} from './typewriterScroll'
 const DocumentPreview = memo(MarkdownPreview);
 const LiveDocument = memo(LiveEditor);
 const SourceEditor = memo(Editor);
+function isTextEntryField(target: EventTarget | null): boolean {
+  if (target instanceof HTMLTextAreaElement) return true;
+  if (!(target instanceof HTMLInputElement)) return false;
+  return !/^(?:checkbox|radio|range|button|submit|reset|file|color|image|hidden)$/i.test(target.type);
+}
 interface PdfExportStatus {id:string;phase:'preparing'|'typesetting'|'publishing';completed:number;total:number;cancelRequested?:boolean}
 
 interface NoteView { editor?: PortableEditorSession; history?:NoteHistory; top?: number; rendered?: ReturnType<typeof exportRenderedViews> }
@@ -247,7 +252,7 @@ function Reader() {
     };
     window.supermdHistory=direction=>{
       if(document.querySelector('.theme-guide-dialog'))return;
-      if(document.activeElement instanceof HTMLInputElement||document.activeElement instanceof HTMLTextAreaElement){document.execCommand(direction);return;}
+      if(isTextEntryField(document.activeElement)){document.execCommand(direction);return;}
       const current=reference.current;if(!current)return;
       replaying.current=true;
       const history=histories.current.get(current.id);const next=history?replayHistory(history,current.content,direction):undefined;
@@ -511,7 +516,7 @@ function Reader() {
       if(document.querySelector(".image-viewer,.math-repair-panel,.reading-search,.media-dialog"))return;
       // Leave a Live textarea's native editing history intact; Source and Read
       // route through the same bounded note history on hardware keyboards.
-      if(event.target instanceof HTMLInputElement || event.target instanceof HTMLTextAreaElement)return;
+      if(isTextEntryField(event.target))return;
       event.preventDefault();event.stopImmediatePropagation();window.supermdHistory?.(key==="y"||event.shiftKey?"redo":"undo");
     };
     const typewriterKey=(event:KeyboardEvent)=>{

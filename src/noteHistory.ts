@@ -7,12 +7,19 @@ const MAX_HISTORY_EDITS=10_000;
 export function textEdit(before:string,after:string):TextEdit {
   if(after.startsWith(before))return {from:before.length,remove:0,insert:after.slice(before.length)};
   if(before.startsWith(after))return {from:after.length,remove:before.length-after.length,insert:''};
+  if(!before.length||!after.length||before.charCodeAt(0)!==after.charCodeAt(0)){
+    if(after.endsWith(before))return {from:0,remove:0,insert:after.slice(0,after.length-before.length)};
+    if(before.endsWith(after))return {from:0,remove:before.length-after.length,insert:''};
+  }
   let from=0,end=0;
   while(from<before.length&&from<after.length&&before.charCodeAt(from)===after.charCodeAt(from))from++;
   while(end<before.length-from&&end<after.length-from&&before.charCodeAt(before.length-1-end)===after.charCodeAt(after.length-1-end))end++;
   return {from,remove:before.length-from-end,insert:after.slice(from,after.length-end)};
 }
-export function historyCost(entry:HistoryEntry):number {return typeof entry==='string'?entry.length:entry.reduce((size,edit)=>size+edit.insert.length+24,0);}
+export function historyCost(entry:HistoryEntry):number {
+  if(typeof entry==='string')return entry.length;
+  let size=0;for(let i=0;i<entry.length;i++)size+=entry[i].insert.length+24;return size;
+}
 export function historySize(history:NoteHistory):number {return [...history.undo,...history.redo].reduce((size,entry)=>size+historyCost(entry),0);}
 export function recordHistory(history:NoteHistory,before:string,after:string,now=Date.now()):void {
   const edit=textEdit(after,before),last=history.undo.at(-1);

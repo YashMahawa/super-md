@@ -240,9 +240,9 @@ const REMARK_PLUGINS: PluggableList = [
 ];
 const REHYPE_PLUGINS: PluggableList = [rehypeKatex, rehypeHighlight];
 
-const MarkdownInput: Components['input'] = ({ node: _node, ...props }) => {
+const MarkdownInput: Components['input'] = ({ node: _node, checked, ...props }) => {
   const { editable } = useContext(MarkdownPreviewContext);
-  return <input {...props} disabled={!editable} onChange={NOOP} />;
+  return <input {...props} checked={props.type === 'checkbox' ? Boolean(checked) : checked} disabled={!editable} onChange={NOOP} />;
 };
 
 const MarkdownListItem: Components['li'] = ({ node, children, ...props }) => {

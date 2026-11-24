@@ -43,7 +43,25 @@ vi.mock("./components/Editor", () => ({
   cachedEditorHistory: () => undefined,
 }));
 vi.mock("./components/LiveEditor", () => ({ default: () => <div className="mock-live-editor" /> }));
-vi.mock("./components/MarkdownPreview", () => ({ default: () => <div className="mock-preview" /> }));
+vi.mock("./components/MarkdownPreview", () => ({
+  default: ({ markdown, onChange }: { markdown: string; onChange?: (value: string) => void }) => (
+    <div className="mock-preview">
+      {markdown.includes("- [") && (
+        <input
+          type="checkbox"
+          checked={markdown.includes("- [x]")}
+          onChange={(event) =>
+            onChange?.(
+              event.target.checked
+                ? markdown.replace("- [ ]", "- [x]")
+                : markdown.replace("- [x]", "- [ ]"),
+            )
+          }
+        />
+      )}
+    </div>
+  ),
+}));
 vi.mock("./components/MediaTools", () => ({ default: () => null }));
 vi.mock("./components/ImageViewer", () => ({ default: () => null }));
 vi.mock("./components/MathRepairPanel", () => ({ default: () => null }));
@@ -132,4 +150,57 @@ it("forwards the active note Python interpreter when preparing Markdown and Mark
     assets: { "image1.svg": "data:image/svg+xml;base64,PHN2Zy8+" },
     archive: false,
   });
+});
+
+it("routes undo and redo through note history even when a reused task checkbox keeps focus", async () => {
+  const host = document.createElement("div");
+  document.body.append(host);
+  root = readerTree.mountRoot!(host);
+  await act(async () => {
+    root?.render(readerTree.element);
+  });
+
+  const unchecked = "# Tasks\n\n- [ ] Keep my place\n";
+  const checked = "# Tasks\n\n- [x] Keep my place\n";
+  await act(async () => {
+    window.supermdLoad!({
+      id: "tasks-tab",
+      content: unchecked,
+      path: null,
+      mode: "reader",
+      dark: false,
+      fullscreen: false,
+      font: "sans",
+      size: 16,
+      colors: {},
+      zoom: 100,
+    });
+  });
+
+  const checkbox = host.querySelector<HTMLInputElement>('input[type="checkbox"]')!;
+  expect(checkbox.checked).toBe(false);
+  checkbox.focus();
+  expect(document.activeElement).toBe(checkbox);
+
+  native.mockClear();
+  await act(async () => {
+    checkbox.click();
+  });
+  expect(checkbox.checked).toBe(true);
+  expect(document.activeElement).toBe(checkbox);
+  expect(native).toHaveBeenCalledWith("document_changed", { id: "tasks-tab", content: checked });
+
+  native.mockClear();
+  await act(async () => {
+    window.supermdHistory!("undo");
+  });
+  expect(checkbox.checked).toBe(false);
+  expect(native).toHaveBeenCalledWith("document_changed", { id: "tasks-tab", content: unchecked });
+
+  native.mockClear();
+  await act(async () => {
+    window.supermdHistory!("redo");
+  });
+  expect(checkbox.checked).toBe(true);
+  expect(native).toHaveBeenCalledWith("document_changed", { id: "tasks-tab", content: checked });
 });

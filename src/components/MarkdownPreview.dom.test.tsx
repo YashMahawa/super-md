@@ -203,4 +203,37 @@ describe("local image preview", () => {
       vi.unstubAllGlobals();
     }
   });
+
+  it("synchronizes reused checkbox DOM state across check, undo, and redo without remounting", async () => {
+    const host = document.createElement("div");
+    document.body.append(host);
+    root = createRoot(host);
+    const unchecked = "# Tasks\n\n- [ ] Keep my place\n- [ ] Another task";
+    const checked = "# Tasks\n\n- [x] Keep my place\n- [ ] Another task";
+    let emitted = "";
+    const renderNote = async (markdown: string) => {
+      await act(async () => {
+        root?.render(<MarkdownPreview markdown={markdown} documentPath={null} python="" dark onChange={(next) => { emitted = next; }} />);
+      });
+    };
+
+    await renderNote(unchecked);
+    const checkbox = host.querySelector<HTMLInputElement>('input[type="checkbox"]')!;
+    expect(checkbox.checked).toBe(false);
+
+    await act(async () => checkbox.click());
+    expect(emitted).toBe(checked);
+    await renderNote(checked);
+    expect(host.querySelector('input[type="checkbox"]')).toBe(checkbox);
+    expect(checkbox.checked).toBe(true);
+
+    // Undo back to unchecked: the reused <input> must clear .checked and check again on next click
+    await renderNote(unchecked);
+    expect(host.querySelector('input[type="checkbox"]')).toBe(checkbox);
+    expect(checkbox.checked).toBe(false);
+
+    emitted = "";
+    await act(async () => checkbox.click());
+    expect(emitted).toBe(checked);
+  });
 });
