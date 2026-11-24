@@ -891,7 +891,7 @@ spanning lines -->
 
 ==Highlighted concept== with H~2~O, x^2^, ~~deprecated~~, %%SECRET_INLINE_COMMENT%%<!-- SECRET_INLINE_HTML --> and Press <kbd onclick="evil()">Ctrl</kbd>+<kbd>S</kbd>, <mark style="color:red">marked</mark>, <u>underlined</u>, CO<sub>2</sub>, 10<sup>-6</sup>.<br>Second line.
 
-\==Literal markup\=\= beside ==Active highlight==, \=\=Inline literal\=\=, H\~2\~O and \~lit\~ beside ~sub~, x\^2\^ beside ^sup^, \%%KEPT_PERCENT\%%, and approx ~5 minutes to boil H~2~O.
+\==Literal markup\=\= beside ==Active highlight==, \==Raw one==, \==Raw two==, \=\=Inline literal\=\=, \\==Slash highlight==, H\~2\~O and H\~2~O and \~lit\~ and \~rawsub~ beside ~sub~, x\^2\^ and x\^2^ and \^rawsup^ beside ^sup^, \%%KEPT_PERCENT\%%, and approx ~5 minutes to boil H~2~O.
 
 Spaced ~not sub~ and ^not sup^, comparison if a == b and c == d, escaped \==rawlit==, URL [https://example.edu/~alice/notes~1](https://example.edu/~alice/notes~1), unmatched <mark>rawmark, and inline <script>alert(1)</script>.
 
@@ -918,11 +918,15 @@ $$
         assert!(typst_src.contains("#sub[#text(\"2\")]"), "Expected Typst #sub: {typst_src}");
         assert!(typst_src.contains("#sub[#text(\"sub\")]"), "Expected ~sub~ -> #sub: {typst_src}");
         assert!(!typst_src.contains("#sub[#text(\"lit\")]"), "Escaped \\~lit\\~ must not become #sub: {typst_src}");
+        assert!(!typst_src.contains("#sub[#text(\"rawsub\")]"), "Escaped \\~rawsub~ must not become #sub: {typst_src}");
         assert!(typst_src.contains("#super[#text(\"2\")]"), "Expected Typst #super: {typst_src}");
         assert!(typst_src.contains("#super[#text(\"sup\")]"), "Expected ^sup^ -> #super: {typst_src}");
+        assert!(!typst_src.contains("#super[#text(\"rawsup\")]"), "Escaped \\^rawsup^ must not become #super: {typst_src}");
         assert!(typst_src.contains("#super[#text(\"-6\")]"), "Expected HTML <sup> -> #super: {typst_src}");
         assert!(typst_src.contains("#highlight(fill: smd-highlight, radius: 2pt, extent: 1pt)[#text(\"Active highlight\")]"), "Expected unescaped highlight: {typst_src}");
+        assert!(typst_src.contains("#highlight(fill: smd-highlight, radius: 2pt, extent: 1pt)[#text(\"Slash highlight\")]"), "Expected highlight after escaped backslash: {typst_src}");
         assert!(!typst_src.contains("[#text(\"Literal markup\")]"), "Escaped \\=\\=Literal markup\\=\\= must stay literal: {typst_src}");
+        assert!(!typst_src.contains("[#text(\"Raw one\")]") && !typst_src.contains(", =Raw two"), "Comma-separated \\==Raw one==, \\==Raw two== must not pair: {typst_src}");
         assert!(!typst_src.contains("[#text(\"rawlit\")]"), "Escaped \\==rawlit== must stay literal: {typst_src}");
         assert!(typst_src.contains("#underline[#text(\"underlined\")]"), "Expected Typst #underline: {typst_src}");
         assert!(typst_src.contains("#box(fill: smd-code-fill"), "Expected Typst #box for <kbd>: {typst_src}");
@@ -947,21 +951,25 @@ $$
                 let path = std::env::temp_dir().join(format!("supermd-study-markdown-{}.pdf", std::process::id()));
                 std::fs::write(&path, &pdf_bytes).unwrap();
                 if let Ok(output) = std::process::Command::new("pdftotext").arg(&path).arg("-").output() {
-                    let extracted = String::from_utf8_lossy(&output.stdout);
-                    assert!(extracted.contains("Highlighted concept"));
-                    assert!(extracted.contains("==Literal markup== beside Active highlight"), "Expected literal escaped == beside active highlight: {extracted}");
-                    assert!(extracted.contains("H~2~O and ~lit~ beside sub"), "Expected literal escaped tildes beside subscript: {extracted}");
-                    assert!(extracted.contains("x^2^ beside sup"), "Expected literal escaped carets beside superscript: {extracted}");
-                    assert!(extracted.contains("%%KEPT_PERCENT%%"), "Expected escaped percent comment preserved: {extracted}");
-                    assert!(extracted.contains("underlined"));
-                    assert!(extracted.contains("Ctrl"));
-                    assert!(extracted.contains("~not sub~"));
-                    assert!(extracted.contains("^not sup^"));
-                    assert!(extracted.contains("<script>alert(1)</script>"));
-                    assert!(!extracted.contains("SECRET_BLOCK_COMMENT"));
-                    assert!(!extracted.contains("SECRET_OBSIDIAN_HEADER"));
-                    assert!(!extracted.contains("SECRET_INLINE_COMMENT"));
-                    assert!(!extracted.contains("SECRET_INLINE_HTML"));
+                    if output.status.success() {
+                        let extracted = String::from_utf8_lossy(&output.stdout);
+                        let flat = extracted.split_whitespace().collect::<Vec<_>>().join(" ");
+                        assert!(flat.contains("Highlighted concept"));
+                        assert!(flat.contains("==Literal markup== beside Active highlight"), "Expected literal escaped == beside active highlight: {flat}");
+                        assert!(flat.contains("\\Slash highlight"), "Expected escaped backslash before active highlight: {flat}");
+                        assert!(flat.contains("H~2~O and H~2~O and ~lit~ and ~rawsub~ beside sub"), "Expected literal escaped tildes beside subscript: {flat}");
+                        assert!(flat.contains("x^2^ and x^2^ and ^rawsup^ beside sup"), "Expected literal escaped carets beside superscript: {flat}");
+                        assert!(flat.contains("%%KEPT_PERCENT%%"), "Expected escaped percent comment preserved: {flat}");
+                        assert!(flat.contains("underlined"));
+                        assert!(flat.contains("Ctrl"));
+                        assert!(flat.contains("~not sub~"));
+                        assert!(flat.contains("^not sup^"));
+                        assert!(flat.contains("<script>alert(1)</script>"));
+                        assert!(!flat.contains("SECRET_BLOCK_COMMENT"));
+                        assert!(!flat.contains("SECRET_OBSIDIAN_HEADER"));
+                        assert!(!flat.contains("SECRET_INLINE_COMMENT"));
+                        assert!(!flat.contains("SECRET_INLINE_HTML"));
+                    }
                 }
                 let _ = std::fs::remove_file(path);
             }

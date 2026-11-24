@@ -2,6 +2,7 @@ const SKIP_TYPES = new Set(['code', 'inlineCode', 'math', 'inlineMath', 'html', 
 const CONTAINER_TYPES = new Set(['paragraph', 'heading', 'tableCell', 'emphasis', 'strong', 'delete', 'link', 'linkReference', 'highlight', 'subscript', 'superscript']);
 const ESCAPED_TEXT_TYPE = '__studyEscaped';
 const FULL_PHRASING_SPANS = ['autolink', 'destinationLiteral', 'destinationRaw', 'reference', 'titleQuote', 'titleApostrophe'];
+const PUNCT_RE = /[\p{P}\p{S}]/u;
 const SPAN_META: Record<DelimKind, { type: string; hName: string }> = {
   '==': { type: 'highlight', hName: 'mark' },
   '~': { type: 'subscript', hName: 'sub' },
@@ -86,13 +87,37 @@ function normalizeEscapedChildren(children: any[]): void {
   children.length = write;
 }
 
+function firstChar(s: string): string {
+  if (!s) return '';
+  const code = s.charCodeAt(0);
+  return code >= 0xd800 && code <= 0xdbff && s.length > 1 ? s.slice(0, 2) : s[0];
+}
+
+function lastChar(s: string): string {
+  if (!s) return '';
+  const code = s.charCodeAt(s.length - 1);
+  return code >= 0xdc00 && code <= 0xdfff && s.length > 1 ? s.slice(-2) : s[s.length - 1];
+}
+
 function siblingBoundary(sibling: any, front: boolean): string {
   if (!sibling) return '';
   if (sibling.type === 'break') return '\n';
   if (sibling.type === 'text' || sibling.type === ESCAPED_TEXT_TYPE) {
-    return front ? (sibling.value[0] || '') : sibling.value.slice(-1);
+    return front ? firstChar(sibling.value) : lastChar(sibling.value);
   }
   return 'x';
+}
+
+function delimFlanking(ch: string, before: string, after: string): { canOpen: boolean; canClose: boolean } {
+  const beforeWs = !before || /\s/.test(before);
+  const afterWs = !after || /\s/.test(after);
+  if (ch !== '=') return { canOpen: !afterWs, canClose: !beforeWs };
+  const beforePunct = !beforeWs && PUNCT_RE.test(before);
+  const afterPunct = !afterWs && PUNCT_RE.test(after);
+  return {
+    canOpen: !afterWs && (!afterPunct || beforeWs || beforePunct),
+    canClose: !beforeWs && (!beforePunct || afterWs || afterPunct),
+  };
 }
 
 function tokenizeChildren(children: any[]): Piece[] {
@@ -122,10 +147,9 @@ function tokenizeChildren(children: any[]): Piece[] {
         let run = 1;
         while (i + run < s.length && s[i + run] === ch) run++;
         if ((ch === '=' && run === 2) || ((ch === '~' || ch === '^') && run === 1)) {
-          const before = i > 0 ? s[i - 1] : prevBoundary;
-          const after = i + run < s.length ? s[i + run] : nextBoundary;
-          const canOpen = Boolean(after) && !/\s/.test(after);
-          const canClose = Boolean(before) && !/\s/.test(before);
+          const before = i > 0 ? lastChar(s.slice(0, i)) : prevBoundary;
+          const after = i + run < s.length ? firstChar(s.slice(i + run)) : nextBoundary;
+          const { canOpen, canClose } = delimFlanking(ch, before, after);
           if (canOpen || canClose) {
             if (buf) { pieces.push({ kind: 'text', value: buf }); buf = ''; }
             split = true;

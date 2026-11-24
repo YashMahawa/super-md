@@ -163,7 +163,7 @@ describe("study Markdown and safe inline HTML", () => {
     const markdown = [
       "Spaced ~not sub~ and ^not sup^, prose if a == b and c == d or a === b, escaped \\~lit\\~ and \\==lit==.",
       "",
-      "Side by side: \\==Literal markup== vs ==Real highlight==, H\\~2\\~O and \\~lit~ vs H~2~O and ~sub~, x\\^2\\^ vs x^2^, \\%%kept\\%% vs %%stripped%%.",
+      "Side by side: \\==Literal markup==, &#61;=Entity==, and \\\\==After slash== vs ==Real highlight==, H\\~2~O and H\\~2\\~O and \\~lit~ vs H~2~O and ~sub~, x\\^2^ and x\\^2\\^ vs x^2^, \\%%kept\\%% vs %%stripped%%.",
       "",
       "> Quote line one",
       "> \\==Quoted literal== vs ==Quoted highlight==",
@@ -183,7 +183,7 @@ describe("study Markdown and safe inline HTML", () => {
 
     const html = renderToStaticMarkup(<MarkdownPreview markdown={markdown} documentPath={null} python="" dark={false} />);
     expect(html).toContain("Spaced ~not sub~ and ^not sup^, prose if a == b and c == d or a === b, escaped ~lit~ and ==lit==.");
-    expect(html).toContain("Side by side: ==Literal markup== vs <mark>Real highlight</mark>, H~2~O and ~lit~ vs H<sub>2</sub>O and <sub>sub</sub>, x^2^ vs x<sup>2</sup>, %%kept%% vs .");
+    expect(html).toContain("Side by side: ==Literal markup==, ==Entity==, and \\<mark>After slash</mark> vs <mark>Real highlight</mark>, H~2~O and H~2~O and ~lit~ vs H<sub>2</sub>O and <sub>sub</sub>, x^2^ and x^2^ vs x<sup>2</sup>, %%kept%% vs .");
     expect(html).not.toContain("stripped");
     expect(html).toContain("Quote line one\n==Quoted literal== vs <mark>Quoted highlight</mark>");
     expect(html).toContain("Unmatched &lt;mark&gt;open only and stray &lt;/kbd&gt; and self-closing &lt;mark/&gt;.");

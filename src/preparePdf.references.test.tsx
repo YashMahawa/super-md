@@ -25,19 +25,21 @@ it("preserves intentional escapes alongside unescaped study syntax, including si
   const source=[
     "\\==Literal markup==",
     "",
-    "==Lead highlight== beside \\==Inline literal== and ==Closing literal\\==.",
+    "==Lead highlight== beside \\==Inline literal==, &#61;=Entity literal==, \\\\==After slash==, and ==Closing literal\\==.",
     "",
-    "Subscripts H~2~O and ~sub~ beside H\\~2\\~O and \\~literal~.",
+    "Subscripts H~2~O and ~sub~ beside H\\~2~O, H\\~2\\~O, H&#126;2~O, and \\~literal~.",
     "",
-    "Superscripts x^2^ and ^sup^ beside x\\^2\\^ and \\^literal^.",
+    "Superscripts x^2^ and ^sup^ beside x\\^2^, x\\^2\\^, x&#94;2^, and \\^literal^.",
     "",
     "Strikethrough ~~retired~~ beside \\~~kept~~, and \\%%literal comment\\%% beside %%hidden comment%%.",
+    "",
+    "\\%%single escaped comment%%",
     "",
     "> \\==Quoted literal== and ==Quoted highlight==",
     "",
     "- \\==List literal== and ==List highlight==",
     "",
-    "Nested ==highlight with \\~literal\\~ tilde==.",
+    "Nested ==highlight with \\~literal\\~ tilde== and https://example.edu/~alice/notes~1.",
     "",
     "```text",
     "\\==Fenced literal==",
@@ -46,13 +48,15 @@ it("preserves intentional escapes alongside unescaped study syntax, including si
   const prepared=await preparePdf(source,"/notes/study.md");
   expect(prepared.content).toContain("\\==Literal markup\\=\\=");
   expect(prepared.content).not.toMatch(/(?:^|\n)==Literal markup==(?:\n|$)/);
-  expect(prepared.content).toContain("==Lead highlight== beside \\=\\=Inline literal\\=\\= and \\=\\=Closing literal\\=\\=.");
-  expect(prepared.content).toContain("Subscripts H~2~O and ~sub~ beside H\\~2\\~O and \\~literal\\~.");
-  expect(prepared.content).toContain("Superscripts x^2^ and ^sup^ beside x\\^2\\^ and \\^literal\\^.");
+  expect(prepared.content).toContain("==Lead highlight== beside \\=\\=Inline literal\\=\\=, \\=\\=Entity literal\\=\\=, \\\\==After slash==, and \\=\\=Closing literal\\=\\=.");
+  expect(prepared.content).toContain("Subscripts H~2~O and ~sub~ beside H\\~2\\~O, H\\~2\\~O, H\\~2\\~O, and \\~literal\\~.");
+  expect(prepared.content).toContain("Superscripts x^2^ and ^sup^ beside x\\^2\\^, x\\^2\\^, x\\^2\\^, and \\^literal\\^.");
   expect(prepared.content).toContain("Strikethrough ~~retired~~ beside \\~\\~kept\\~\\~, and \\%%literal comment\\%% beside .");
+  expect(prepared.content).toContain("\\%%single escaped comment\\%%");
   expect(prepared.content).toContain("> \\==Quoted literal\\=\\= and ==Quoted highlight==");
   expect(prepared.content).toContain("* \\==List literal\\=\\= and ==List highlight==");
-  expect(prepared.content).toContain("Nested ==highlight with \\~literal\\~ tilde==.");
+  expect(prepared.content).toContain("Nested ==highlight with \\~literal\\~ tilde==");
+  expect(prepared.content).toContain("https://example.edu/~alice/notes~1");
   expect(prepared.content).toContain("\\==Fenced literal==");
   expect(prepared.content).not.toContain("hidden comment");
 });

@@ -258,6 +258,21 @@ fn apply_study_delimiters<'a>(nodes: Vec<Node<'a>>) -> Vec<Node<'a>> {
         }
     }
 
+    fn delim_flanking(b: u8, before: Option<char>, after: Option<char>) -> (bool, bool) {
+        let before_ws = before.is_none_or(char::is_whitespace);
+        let after_ws = after.is_none_or(char::is_whitespace);
+        if b != b'=' {
+            return (!after_ws, !before_ws);
+        }
+        let is_punct = |c: char| c.is_ascii_punctuation() || (!c.is_alphanumeric() && !c.is_whitespace() && !c.is_control() && !('\u{0300}'..='\u{036F}').contains(&c));
+        let before_punct = before.is_some_and(is_punct);
+        let after_punct = after.is_some_and(is_punct);
+        (
+            !after_ws && (!after_punct || before_ws || before_punct),
+            !before_ws && (!before_punct || after_ws || after_punct),
+        )
+    }
+
     let nodes = merge_unescaped_text(nodes);
     if !nodes.iter().any(|n| matches!(n, Node::Text(s, false) if s.contains(['=', '~', '^']))) {
         return nodes;
@@ -290,8 +305,7 @@ fn apply_study_delimiters<'a>(nodes: Vec<Node<'a>>) -> Vec<Node<'a>> {
                 if (b == b'=' && run == 2) || ((b == b'~' || b == b'^') && run == 1) {
                     let before = if i > 0 { s[..i].chars().next_back() } else { prev_b };
                     let after = if i + run < s.len() { s[i + run..].chars().next() } else { next_b };
-                    let can_open = after.is_some_and(|c| !c.is_whitespace());
-                    let can_close = before.is_some_and(|c| !c.is_whitespace());
+                    let (can_open, can_close) = delim_flanking(b, before, after);
                     if can_open || can_close {
                         if !buf.is_empty() {
                             pieces.push(Piece::Text(std::mem::take(&mut buf), false));
