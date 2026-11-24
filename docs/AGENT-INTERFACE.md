@@ -175,10 +175,17 @@ the same selector as `options.section`; it exports that section through the
 regular PDF/Markdown/SMD pipeline while guarding against the full document
 revision. Omitting `section` exports the whole document as before.
 
-The server exposes at most nine focused tools: `list_sessions`,
-`document_inspect`, `document_read`, `document_search`, `document_action`,
-`document_patch`, `document_assets`, `document_attach_asset`, and
-`document_view`. `document_action` handles filesystem create/export, live tab
+The server exposes at most ten focused tools: `list_sessions`,
+`view_current`, `document_inspect`, `document_read`, `document_search`,
+`document_action`, `document_patch`, `document_assets`,
+`document_attach_asset`, and `document_view`. `view_current` is the primary
+entry point for questions about the open page or highlighted text: it resolves
+the unambiguous active live tab when `path`/`tabId` is omitted, reads bounded
+`readingContext` (mode-aware visible text, active heading, reading offset,
+selection across Reader/Source/Split/Live `<textarea>`, active `StepCards` and
+`.step-viewer` slide state, and cached `pythonCells` outputs), and includes a
+revision-matched JPEG (`quality="standard"`) or PNG (`quality="high"`) viewport
+image unless `includeImage=false`. `document_action` handles filesystem create/export, live tab
 create/open/save/activate/close/export, reading context, LaTeX review/apply,
 device listing, diagram-source listing/chunks, and asynchronous job status. Disk exports require a new `output_path`
 inside an allowed root. Live-tab exports let the app choose a safe unique
@@ -197,11 +204,14 @@ recovery may return `closing` while it finishes. In that case, refresh the
 tab/session list until the target is gone before depending on the new active
 tab; do not repeat the close request. LaTeX fixes are proposed first, then selected indices are applied
 against the review revision as one desktop edit. `get_context` reports the
-current selection, visible source range, and revision-bound diagram references;
-`list_diagrams` pages diagram metadata with `offset` and `limit` (default 80,
-maximum 80); `get_diagram` fetches exact Markdown source in bounded chunks.
+current mode-aware selection, visible source range, active `StepCards` slide,
+cached `pythonCells` (`stdout`, `stderr`, `ok`, `figureIds`), and revision-bound
+diagram references without executing unrun Python cells;
+`list_diagrams` pages diagram metadata (including cached `diagram:python:<offset>:<index>`
+figures) with `offset` and `limit` (default 80, maximum 80); `get_diagram`
+fetches exact Markdown or cell source in bounded chunks.
 `document_view` returns a viewport image or a specifically requested rendered
-diagram image. A live desktop bridge adds
+diagram image (including cached Matplotlib figures). A live desktop bridge adds
 currently open and unsaved tabs to
 `list_sessions`. Use a returned `tab:<id>` target for tab inspection, bounded
 source reads/searches, revision-checked edits, and rendered viewport images.
