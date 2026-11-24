@@ -80,8 +80,9 @@ export function cachedEditorHistory(id:string,direction:'undo'|'redo',content:st
   const changed=(direction==='undo'?undo:redo)({state:cached.state,dispatch:transaction=>{cached.state=transaction.state;}});
   return changed?cached.state.doc.toString():undefined;
 }
-export function editorFindQuery(id:string,query:string,caseSensitive:boolean) {
-  visibleEditors.get(id)?.dispatch({effects:setSearchQuery.of(new SearchQuery({search:query,caseSensitive,literal:true}))});
+export function editorFindQuery(id:string,query:string,caseSensitive:boolean,options?:{wholeWord?:boolean;regexp?:boolean}) {
+  const wholeWord=!!options?.wholeWord,regexp=!!options?.regexp;
+  visibleEditors.get(id)?.dispatch({effects:setSearchQuery.of(new SearchQuery({search:query,caseSensitive,wholeWord,regexp,literal:!regexp}))});
 }
 export function editorFindRange(id:string,from:number,to:number) {
   const view=visibleEditors.get(id);if(!view)return;

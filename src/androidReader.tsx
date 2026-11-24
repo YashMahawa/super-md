@@ -56,7 +56,7 @@ interface PdfExportStatus {id:string;phase:'preparing'|'typesetting'|'publishing
 interface NoteView { editor?: PortableEditorSession; history?:NoteHistory; top?: number; rendered?: ReturnType<typeof exportRenderedViews> }
 interface ReaderState extends ReaderAccessibilityPreference { id: string; content: string; path: string | null; mode: "live" | "editor" | "reader" | "split"; dark: boolean; fullscreen: boolean; font: string; size: number; latexAutofix?:boolean; typewriterScroll?:boolean; spellCheck?:boolean; grammarCheck?:boolean; width?: number; widthPercent?:number; lineHeight?:number; colors: Record<string, string>; zoom: number; motion?: boolean; python?: string; viewState?: NoteView }
 declare global { interface Window {supermdAgentRequest?:(request:Record<string,unknown>,callback?:(result:unknown,error:string)=>void)=>void;supermdAgentCompute?:(request:Record<string,unknown>,callback:(result:unknown,error:string)=>void)=>void;supermdThemeGuide?:()=>void;supermdDismiss?:()=>boolean;supermdSetZoom?:(zoom:number,requestedAt?:number)=>void;supermdHeading?:(id:string,offset?:number)=>void;supermdHistory?:(direction:"undo"|"redo")=>void;supermdNativeWheel?:(dx:number,dy:number,point:Point,held:boolean,modifier?:boolean)=>void;supermdToggleTypewriter?:()=>void;} }
-declare global { interface Window { supermdLoad?: (state: ReaderState) => void; supermdExport?: (options: ExportOptions) => void; supermdExportMarkdown?: (archive?: boolean) => void; supermdFind?: () => void; supermdPortable?: (save: boolean) => void; supermdZoomBy?: (factor:number,focus?:Point)=>void; supermdResetZoom?: ()=>void; supermdRepairMath?: ()=>void; supermdFlush?: (operation:Record<string,string>)=>void } }
+declare global { interface Window { supermdLoad?: (state: ReaderState) => void; supermdExport?: (options: ExportOptions) => void; supermdExportMarkdown?: (archive?: boolean) => void; supermdFind?: (replace?: boolean) => void; supermdFindStep?: (direction?: number) => void; supermdPortable?: (save: boolean) => void; supermdZoomBy?: (factor:number,focus?:Point)=>void; supermdResetZoom?: ()=>void; supermdRepairMath?: ()=>void; supermdFlush?: (operation:Record<string,string>)=>void } }
 declare global { interface Window {supermdChromeInset?:(height:number)=>void} }
 declare global { interface Window {supermdSavePosition?:()=>void} }
 declare global {interface Window {supermdExportPhase?:(id:string,phase:'typesetting'|'publishing')=>void}}
@@ -96,6 +96,8 @@ function Reader() {
   const readerAnalysis=useMemo(()=>state?readerSourceAnalysis(state.mode,state.content):null,[state?.mode,state?.content]);
   const [repairing, setRepairing] = useState(false);
   const [searching,setSearching] = useState(false);
+  const [searchReplace,setSearchReplace] = useState(false);
+  const searchingRef = useRef(false); searchingRef.current = searching;
   const [pdfExport,setPdfExport]=useState<PdfExportStatus|null>(null);
   const exportOwner=useRef<{id:string;controller:AbortController;phase:PdfExportStatus['phase']}|null>(null);
   const cancelPdfExport=useCallback(async()=>{
@@ -323,7 +325,22 @@ function Reader() {
         await invoke("document_flushed",{id:current.id,content:latest?.id===current.id?latest.content:current.content,operation,viewId:id,viewState:view});
       })().catch(error=>setEditError(String(error)));
     };
-    window.supermdFind = () => {if(document.querySelector('.theme-guide-dialog'))return;flushSync(()=>setSearching(true));window.dispatchEvent(new Event("supermd-find-focus"));};
+    window.supermdFind = (replace = false) => {
+      if(document.querySelector('.theme-guide-dialog'))return;
+      const openReplace=Boolean(replace);
+      flushSync(()=>{if(!searchingRef.current)setSearchReplace(openReplace);setSearching(true);});
+      window.dispatchEvent(new CustomEvent("supermd-find-focus",{detail:{replace:openReplace}}));
+    };
+    window.supermdFindStep = (direction = 1) => {
+      if(document.querySelector('.theme-guide-dialog'))return;
+      const step=direction<0?-1:1;
+      if(!searchingRef.current){
+        flushSync(()=>{setSearchReplace(false);setSearching(true);});
+        requestAnimationFrame(()=>window.dispatchEvent(new CustomEvent("supermd-find-step",{detail:step})));
+        return;
+      }
+      window.dispatchEvent(new CustomEvent("supermd-find-step",{detail:step}));
+    };
     window.supermdPortable = async (save) => {
       const current = reference.current; if (!current) return;
       try {
@@ -358,7 +375,7 @@ function Reader() {
       catch (error) { await invoke("export_failed", {error: String(error)}); }
     };
     void invoke("reader_ready");
-    return () => {nativeScroll.clear();cancelAnimationFrame(zoomFrame.current);window.clearTimeout(zoomTimer.current);delete window.supermdThemeGuide;delete window.supermdSavePosition;delete window.supermdChromeInset;delete window.supermdLoad; delete window.supermdExport; delete window.supermdExportMarkdown; delete window.supermdPortable; delete window.supermdZoomBy; delete window.supermdResetZoom; delete window.supermdRepairMath; delete window.supermdToggleTypewriter; delete window.supermdFlush; delete window.supermdSetZoom; delete window.supermdHeading; };
+    return () => {nativeScroll.clear();cancelAnimationFrame(zoomFrame.current);window.clearTimeout(zoomTimer.current);delete window.supermdThemeGuide;delete window.supermdSavePosition;delete window.supermdChromeInset;delete window.supermdLoad; delete window.supermdExport; delete window.supermdExportMarkdown; delete window.supermdFind; delete window.supermdFindStep; delete window.supermdPortable; delete window.supermdZoomBy; delete window.supermdResetZoom; delete window.supermdRepairMath; delete window.supermdToggleTypewriter; delete window.supermdFlush; delete window.supermdSetZoom; delete window.supermdHeading; };
   }, []);
   useEffect(()=>{
     if(!state)return;
@@ -503,7 +520,16 @@ function Reader() {
     return()=>{window.clearTimeout(timer);save();root.removeEventListener('scroll',scroll);window.removeEventListener('pagehide',save);document.removeEventListener('visibilitychange',save);savePosition.current=()=>{};};
   },[state?.id,state?.mode,state?.path,state?.restorePosition]);
   useEffect(() => {
-    const find=(event:KeyboardEvent)=>{if(document.documentElement.dataset.host==='qt')return;if((event.ctrlKey || event.metaKey) && event.key.toLowerCase()==="f"){event.preventDefault();event.stopImmediatePropagation();window.supermdFind?.();}};
+    const find=(event:KeyboardEvent)=>{
+      if(document.documentElement.dataset.host==='qt')return;
+      if(!event.ctrlKey&&!event.metaKey&&!event.altKey&&event.key==="F3"){
+        event.preventDefault();event.stopImmediatePropagation();window.supermdFindStep?.(event.shiftKey?-1:1);return;
+      }
+      if((event.ctrlKey || event.metaKey) && !event.altKey && !event.shiftKey){
+        const key=event.key.toLowerCase();
+        if(key==="f"||key==="h"){event.preventDefault();event.stopImmediatePropagation();window.supermdFind?.(key==="h");}
+      }
+    };
     const history=(event:KeyboardEvent)=>{
       if(document.documentElement.dataset.host==='qt')return;
       if(!(event.ctrlKey||event.metaKey)||event.altKey)return;
@@ -721,7 +747,7 @@ function Reader() {
     </section></div>}
     {editError&&<div role="alert" className="reader-edit-error">{editError}</div>}
     <MediaThemeFilters colors={state.colors} dark={state.dark}/>
-    {searching && <ReadingSearch content={state.content} close={()=>setSearching(false)} onChange={update} sourceSession={state.mode==="editor"||state.mode==="split"?state.id:undefined}/>}
+    {searching && <ReadingSearch content={state.content} close={()=>{setSearching(false);setSearchReplace(false);}} onChange={update} sourceSession={state.mode==="editor"||state.mode==="split"?state.id:undefined} initialReplace={searchReplace}/>}
     <ImageViewer />
     {repairing && <MathRepairPanel content={state.content} apply={update} close={()=>setRepairing(false)} />}
     <MediaTools key={state.id} documentId={state.id} content={state.content} documentPath={state.path} onInsert={(text, point) => { const content = reference.current!.content; const from = Math.min(point?.from ?? content.length, content.length); const to = Math.max(from, Math.min(point?.to ?? from, content.length)); update(content.slice(0, from) + text + content.slice(to)); }} onNotice={(error) => { void invoke("export_failed", { error }); }} />

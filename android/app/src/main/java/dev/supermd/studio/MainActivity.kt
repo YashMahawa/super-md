@@ -119,7 +119,8 @@ class MainActivity : ComponentActivity() {
     )
     var dismissDocument: (() -> Unit)? = null
     var saveReaderPosition: (() -> Unit)? = null
-    var openReaderFind: (() -> Unit)? = null
+    var openReaderFind: ((Boolean) -> Unit)? = null
+    var stepReaderFind: ((Int) -> Unit)? = null
     val agentAccessState: AgentAccessState by lazy { AgentAccessState(this) }
     var agentRelayState by mutableStateOf(AgentRelayClient.State.DISCONNECTED)
         private set
@@ -407,6 +408,7 @@ class MainActivity : ComponentActivity() {
     fun handleShortcut(event: android.view.KeyEvent): Boolean {
         if (event.action == android.view.KeyEvent.ACTION_DOWN && event.repeatCount == 0) {
             if (event.keyCode == android.view.KeyEvent.KEYCODE_F11) { model.fullscreen(!model.state.value.fullscreen); return true }
+            if (event.keyCode == android.view.KeyEvent.KEYCODE_F3 && !event.isCtrlPressed && !event.isAltPressed && !event.isMetaPressed) { stepReaderFind?.invoke(if (event.isShiftPressed) -1 else 1); return true }
             if (event.keyCode == android.view.KeyEvent.KEYCODE_ESCAPE && (model.state.value.fullscreen || model.state.value.readerOverlay)) { dismissDocument?.invoke() ?: model.fullscreen(false); return true }
             if (event.isCtrlPressed && event.keyCode == android.view.KeyEvent.KEYCODE_N) { newWindow(); return true }
             if (event.isCtrlPressed) {
@@ -416,7 +418,8 @@ class MainActivity : ComponentActivity() {
                     android.view.KeyEvent.KEYCODE_TAB -> { model.cycle(if(event.isShiftPressed)-1 else 1);return true }
                     android.view.KeyEvent.KEYCODE_PAGE_DOWN -> {model.cycle(1);return true}
                     android.view.KeyEvent.KEYCODE_PAGE_UP -> {model.cycle(-1);return true}
-                    android.view.KeyEvent.KEYCODE_F -> {openReaderFind?.invoke();return true}
+                    android.view.KeyEvent.KEYCODE_F -> {if(!event.isShiftPressed&&!event.isAltPressed){openReaderFind?.invoke(false);return true}}
+                    android.view.KeyEvent.KEYCODE_H -> {if(!event.isShiftPressed&&!event.isAltPressed){openReaderFind?.invoke(true);return true}}
                 }
                 if(event.keyCode in android.view.KeyEvent.KEYCODE_1..android.view.KeyEvent.KEYCODE_9){model.tabNumber(event.keyCode-android.view.KeyEvent.KEYCODE_1+1);return true}
             }
@@ -495,6 +498,7 @@ private object NoMotionScheme : MotionScheme {
     var readerPdfOwnsProgress by remember { mutableStateOf(false) }
     var menu by remember { mutableStateOf(false) }
     var findRequest by remember { mutableIntStateOf(0) }
+    var findReplace by remember { mutableStateOf(false) }
     var renaming by remember {mutableStateOf(false)}
     var contentsShown by remember {mutableStateOf(false)}
     var sidebarSection by rememberSaveable {mutableStateOf("folder")}
@@ -560,15 +564,24 @@ private object NoMotionScheme : MotionScheme {
         }
         activity.dismissDocument = { web?.evaluateJavascript("window.supermdDismiss?.() || false") { dismissed -> if (dismissed != "true") model.fullscreen(false) } ?: model.fullscreen(false) }
         activity.saveReaderPosition={web?.evaluateJavascript("window.supermdSavePosition?.()",null)}
-        activity.openReaderFind = {
+        activity.openReaderFind = { replace ->
             menu = false
+            findReplace = replace
             findRequest++
         }
-        onDispose { activity.dismissDocument = null;activity.saveReaderPosition=null;activity.openReaderFind=null;model.assetAccessRestored=null }
+        activity.stepReaderFind = { direction ->
+            menu = false
+            web?.let { reader ->
+                reader.requestFocus(View.FOCUS_DOWN)
+                reader.evaluateJavascript("window.supermdFindStep?.(${if (direction < 0) -1 else 1}); true", null)
+            }
+        }
+        onDispose { activity.dismissDocument = null;activity.saveReaderPosition=null;activity.openReaderFind=null;activity.stepReaderFind=null;model.assetAccessRestored=null }
     }
     LaunchedEffect(findRequest, menu, web) {
         if (findRequest == 0 || menu) return@LaunchedEffect
         val requested = findRequest
+        val replace = findReplace
         // Wait for the popup window to release native focus before asking the
         // WebView for focus. This follows the actual dismissal instead of
         // estimating its transition duration.
@@ -576,8 +589,9 @@ private object NoMotionScheme : MotionScheme {
         reader.awaitWindowFocus()
         if (menu || requested != findRequest || reader !== web) return@LaunchedEffect
         findRequest = 0
+        findReplace = false
         reader.requestFocus(View.FOCUS_DOWN)
-        reader.evaluateJavascript("window.supermdFind?.(); true") {
+        reader.evaluateJavascript("window.supermdFind?.(${if (replace) "true" else ""}); true") {
             reader.post {
                 reader.requestFocus(View.FOCUS_DOWN)
                 val hasHardwareKeyboard = activity.resources.configuration.keyboard != android.content.res.Configuration.KEYBOARD_NOKEYS
@@ -1093,7 +1107,7 @@ private object NoMotionScheme : MotionScheme {
                                 DropdownMenuItem(text = { Text("Share note") }, enabled = readerReady && !state.busy, onClick = { menu = false; sharing = true; exporting = true }, leadingIcon = { Icon(painterResource(R.drawable.symbol_share), null) })
                                 DropdownMenuItem(text = { Text("Insert image or link") }, onClick = { menu = false; web?.evaluateJavascript("window.supermdMedia?.()", null) }, leadingIcon = { Icon(painterResource(R.drawable.symbol_image), null) })
                                 DropdownMenuItem(text = { Text("Fix LaTeX") }, onClick = { menu = false; web?.evaluateJavascript("window.supermdRepairMath?.()", null) }, leadingIcon = { Icon(painterResource(R.drawable.symbol_bug), null) })
-                                DropdownMenuItem(text = { Text("Find in note") }, onClick = { menu = false; activity.openReaderFind?.invoke() }, leadingIcon = { Icon(painterResource(R.drawable.symbol_search), null) })
+                                DropdownMenuItem(text = { Text("Find in note") }, onClick = { menu = false; activity.openReaderFind?.invoke(false) }, leadingIcon = { Icon(painterResource(R.drawable.symbol_search), null) })
                                 DropdownMenuItem(text = {Text("Rename note")},onClick = {menu=false;renaming=true},leadingIcon={Icon(painterResource(R.drawable.symbol_rename),null)})
                                 DropdownMenuItem(text = { Text("Settings") }, onClick = { menu = false; settingsSection = null; settings = true }, leadingIcon = { Icon(painterResource(R.drawable.symbol_settings), null) })
                             } }

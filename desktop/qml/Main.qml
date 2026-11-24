@@ -111,11 +111,12 @@ ApplicationWindow {
     function syncVisibleReaderChrome() {
         window.runDocumentScript("document.documentElement.style.setProperty('--native-visible-chrome-inset','" + readerVisibleChromeInset + "px')")
     }
-    function openFind() {
+    function openFind(replace) {
         if (!reader) return
         const target = reader
+        const script = replace ? "window.supermdFind?.(true)" : "window.supermdFind?.()"
         target.forceActiveFocus()
-        target.runJavaScript("window.supermdFind?.()", function() {
+        target.runJavaScript(script, function() {
             if (window.reader === target) target.forceActiveFocus()
         })
     }
@@ -174,7 +175,10 @@ ApplicationWindow {
         case "cut": window.nativeReaderEditAction("cut"); break
         case "paste": window.nativeReaderEditAction("paste"); break
         case "select_all": window.nativeReaderEditAction("select_all"); break
-        case "find": window.openFind(); break
+        case "find": window.openFind(false); break
+        case "replace": window.openFind(true); break
+        case "find_next": if (reader) reader.forceActiveFocus(); studio.command("find_next"); break
+        case "find_previous": if (reader) reader.forceActiveFocus(); studio.command("find_previous"); break
         case "close_tab": studio.closeTabSafely(viewState.active); break
         case "next_tab": studio.cycleTab(1); break
         case "previous_tab": studio.cycleTab(-1); break

@@ -2290,7 +2290,7 @@ class Studio(QObject):
 
     @Slot(str)
     def command(self, action):
-        calls = {"find": "window.supermdFind?.()", "insert": "window.supermdMedia?.()", "repair": "window.supermdRepairMath?.()", "undo":"window.supermdHistory?.('undo')", "redo":"window.supermdHistory?.('redo')"}
+        calls = {"find": "window.supermdFind?.()", "replace": "window.supermdFind?.(true)", "find_next": "window.supermdFindStep?.(1)", "find_previous": "window.supermdFindStep?.(-1)", "insert": "window.supermdMedia?.()", "repair": "window.supermdRepairMath?.()", "undo":"window.supermdHistory?.('undo')", "redo":"window.supermdHistory?.('redo')"}
         if action in calls: self.readerCall.emit(calls[action])
         elif action == "window": self.newWindowRequested.emit()
 

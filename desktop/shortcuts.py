@@ -14,6 +14,8 @@ def _definition_rows(platform: str) -> tuple[tuple[str, str, list[str]], ...]:
     if platform == "darwin":
         fullscreen.append("Ctrl+Meta+F")  # Command+Control+F, macOS convention.
     redo = ["Ctrl+Shift+Z"] if platform == "darwin" else ["Ctrl+Y"]
+    find_next = ["F3", f"{primary}+G"] if platform == "darwin" else ["F3"]
+    find_previous = ["Shift+F3", f"{primary}+Shift+G"] if platform == "darwin" else ["Shift+F3"]
     return (
         ("new_window", "New window", [f"{primary}+N", f"{primary}+Shift+N"]),
         ("new_note", "New note", [f"{primary}+T"]),
@@ -26,6 +28,9 @@ def _definition_rows(platform: str) -> tuple[tuple[str, str, list[str]], ...]:
         ("paste", "Paste", [f"{primary}+V"]),
         ("select_all", "Select all", [f"{primary}+A"]),
         ("find", "Find in note", [f"{primary}+F"]),
+        ("replace", "Replace in note", [f"{primary}+H"]),
+        ("find_next", "Find next match", find_next),
+        ("find_previous", "Find previous match", find_previous),
         ("close_tab", "Close note tab", [f"{primary}+W"]),
         ("next_tab", "Next tab", [f"{primary}+Tab", f"{primary}+PgDown"]),
         ("previous_tab", "Previous tab", [f"{primary}+Shift+Tab", f"{primary}+PgUp"]),
