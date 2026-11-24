@@ -579,7 +579,9 @@ ApplicationWindow {
                         readerContextMenu.editFlags = request.editFlags
                         readerContextMenu.hasLink = request.linkUrl.toString().length > 0
                         const x = request.position.x, y = request.position.y
-                        window.reader.runJavaScript("Boolean(window.supermdMediaMenuAt && window.supermdMediaMenuAt(" + x + "," + y + "))", function(handled) {
+                        window.reader.runJavaScript("({handled: Boolean(window.supermdMediaMenuAt && window.supermdMediaMenuAt(" + x + "," + y + ")), text: typeof window.supermdSelectedText === 'function' ? window.supermdSelectedText() : null})", function(result) {
+                            const handled = Boolean(result && result.handled)
+                            if (result && typeof result.text === "string") readerContextMenu.selectionText = result.text
                             if (!handled) readerContextMenu.popup(x, y)
                         })
                     }
@@ -592,7 +594,7 @@ ApplicationWindow {
                         NoteMenuItem { text: "Undo"; actionVisible: Boolean(readerContextMenu.editFlags & ContextMenuRequest.CanUndo); onTriggered: window.reader.triggerWebAction(WebEngineView.Undo) }
                         NoteMenuItem { text: "Redo"; actionVisible: Boolean(readerContextMenu.editFlags & ContextMenuRequest.CanRedo); onTriggered: window.reader.triggerWebAction(WebEngineView.Redo) }
                         NoteMenuItem { text: "Cut"; actionVisible: Boolean(readerContextMenu.editFlags & ContextMenuRequest.CanCut); onTriggered: window.reader.triggerWebAction(WebEngineView.Cut) }
-                        NoteMenuItem { text: "Copy"; enabled: Boolean(readerContextMenu.editFlags & ContextMenuRequest.CanCopy); onTriggered: window.reader.triggerWebAction(WebEngineView.Copy) }
+                        NoteMenuItem { text: "Copy"; enabled: Boolean(readerContextMenu.editFlags & ContextMenuRequest.CanCopy) || readerContextMenu.selectionText.trim().length > 0; onTriggered: { window.reader.forceActiveFocus(); window.reader.triggerWebAction(WebEngineView.Copy) } }
                         NoteMenuItem { text: "Paste"; actionVisible: Boolean(readerContextMenu.editFlags & ContextMenuRequest.CanPaste); onTriggered: window.reader.triggerWebAction(WebEngineView.Paste) }
                         NoteMenuItem { text: "Copy link address"; actionVisible: readerContextMenu.hasLink; onTriggered: window.reader.triggerWebAction(WebEngineView.CopyLinkToClipboard) }
                         NoteMenuItem { text: "Select all"; onTriggered: window.reader.triggerWebAction(WebEngineView.SelectAll) }
@@ -669,6 +671,17 @@ ApplicationWindow {
                 onExitRequested: windowModes.setFullscreen(false)
                 onSaveRequested: studio.saveSafely()
                 onExportRequested: window.showExport(false)
+            }
+            FullscreenStatusBanner {
+                id: fullscreenStatusBanner
+                anchors.horizontalCenter: parent.horizontalCenter
+                anchors.bottom: parent.bottom
+                anchors.bottomMargin: 20
+                maxWidth: Math.min(680, Math.max(180, parent.width - 48))
+                footerHidden: (viewState.fullscreen || viewState.imageOverlay) && viewState.readerReady
+                busy: Boolean(viewState.busy)
+                message: viewState.message || ""
+                messageRevision: viewState.messageRevision || 0
             }
             Rectangle {
                 objectName: "readerLoadingOverlay"

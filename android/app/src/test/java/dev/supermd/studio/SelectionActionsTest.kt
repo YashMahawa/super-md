@@ -26,4 +26,14 @@ class SelectionActionsTest {
             assertThrows(IllegalArgumentException::class.java) { SelectionActions.target(action,text,provider) }
         }
     }
+    @Test fun preservesSerializedLatexAndPipeTablesInSelectionTargetsAndReaderScript() {
+        val excerpt = "| Expr | Norm |\n| --- | --- |\n| \$P(A|B)\$ | \$|x|\$ |"
+        val google = SelectionActions.target("google", excerpt, "chatgpt")
+        assertEquals(excerpt, URLDecoder.decode(google.url.substringAfter("?q="), "UTF-8"))
+        val ask = SelectionActions.target("assistant", excerpt, "claude")
+        assertTrue(ask.copy)
+        assertEquals("https://claude.ai/new", ask.url)
+        assertTrue(SELECTION_TEXT_SCRIPT.contains("window.supermdSelectedText"))
+        assertTrue(SELECTION_TEXT_SCRIPT.contains("HTMLTextAreaElement"))
+    }
 }
