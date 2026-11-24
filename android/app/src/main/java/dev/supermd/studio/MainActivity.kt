@@ -336,7 +336,6 @@ class MainActivity : ComponentActivity() {
     internal fun agentSourceLength(value: String): Int = value.codePointCount(0, value.length)
     internal suspend fun captureAgentViewport(reader: WebView, requestedWidth: Int, imageFormat: String = "png"): JSONObject {
         require(imageFormat in setOf("png", "jpeg")) { "Unsupported viewport image format" }
-        check(Build.VERSION.SDK_INT >= 26) { "Viewport snapshots require Android 8 or newer" }
         check(reader.width > 0 && reader.height > 0 && reader.isAttachedToWindow) { "The live reading viewport is unavailable" }
         val context = kotlinx.coroutines.suspendCancellableCoroutine<JSONObject> { continuation ->
             val requestId = "snapshot_context_${java.util.UUID.randomUUID()}"
