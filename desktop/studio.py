@@ -343,7 +343,10 @@ class Studio(QObject):
         self.python_choices=[]
         self.python_busy=False
         self.pythonProgress.connect(self._python_progress)
-        if not self.settings.get("python"): QTimer.singleShot(0,self._choose_default_python)
+        if not self.settings.get("python"):
+            self._choose_default_python(persist=False)
+            if self.settings.get("python"):
+                QTimer.singleShot(0, lambda: self._preferences(False))
         if not isolated and len(self.session.windows)==1:QTimer.singleShot(0,self._restore_update)
         self.tabs: list[dict] = []
         self.closed_tabs = self.session.closed_tabs
@@ -1327,15 +1330,16 @@ class Studio(QObject):
     def _python_folders(self):
         return [p for p in [self.folder, *(str(Path(t["path"]).parent) for t in self.tabs if t.get("path"))] if p]
 
-    def _choose_default_python(self):
-        if self.retired:return
-        managed = self.data/"python-env"
-        def done(path,error):
-            if path and not self.settings.get("python"):
-                self.settings["python"] = path
+    def _choose_default_python(self, persist: bool = True):
+        if self.retired or self.settings.get("python"):
+            return
+        path = python_runtime.default_python(self.data / "python-env")
+        if path:
+            self.settings["python"] = path
+            if persist:
                 self._preferences()
+        if persist:
             self._emit(False)
-        self._submit(lambda: python_runtime.preferred(managed), done, False)
 
     @Slot(str)
     def _python_progress(self, text):
@@ -1344,7 +1348,9 @@ class Studio(QObject):
 
     @Slot()
     def refreshPython(self):
-        if self.python_busy: return
+        if self.retired or self.python_busy or getattr(self.pool, "_shutdown", False): return
+        managed = self.data / "python-env"
+        folders = tuple(self._python_folders())
         self.python_busy = True
         self.python_status = "Looking for Python installations"
         self._emit(False)
@@ -1356,11 +1362,11 @@ class Studio(QObject):
             elif not any(c["matplotlib"] for c in self.python_choices): self.python_status = "Python found, but numpy and matplotlib are missing. Set up Python installs both in a private environment."
             else: self.python_status = ""
             self._emit(False)
-        self._submit(lambda: python_runtime.discover(self.data/"python-env", self._python_folders()), done, False)
+        self._submit(lambda: python_runtime.discover(managed, folders), done, False)
 
     @Slot(str)
     def installPythonPackages(self, path):
-        if self.python_busy: return
+        if self.retired or self.python_busy or getattr(self.pool, "_shutdown", False): return
         self.python_busy = True
         self.python_status = "Preparing to install numpy and matplotlib"
         self._emit(False)
@@ -1377,7 +1383,8 @@ class Studio(QObject):
 
     @Slot()
     def setupPython(self):
-        if self.python_busy: return
+        if self.retired or self.python_busy or getattr(self.pool, "_shutdown", False): return
+        managed = self.data / "python-env"
         self.python_busy = True
         self.python_status = "Preparing Python setup"
         self._emit(False)
@@ -1394,7 +1401,7 @@ class Studio(QObject):
             self.python_busy = False
             self.refreshPython()
             self.python_status = "Python with numpy and matplotlib is ready"
-        self._submit(lambda: python_runtime.setup_environment(self.data/"python-env", self.pythonProgress.emit), done, False)
+        self._submit(lambda: python_runtime.setup_environment(managed, self.pythonProgress.emit), done, False)
 
     @Slot(int, int, bool)
     def rememberWindow(self, width, height, maximized):

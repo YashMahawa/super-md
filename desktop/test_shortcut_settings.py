@@ -245,6 +245,177 @@ ApplicationWindow {{
         self.assertIsNotNone(recorder)
         self.assertEqual(self.studio.shortcutSequences("typewriter_scroll"), ["Ctrl+Alt+T"])
 
+    def test_python_discovery_waits_for_visible_python_section_and_rescans_on_demand(self):
+        from unittest.mock import patch
+
+        session = Session(True)
+        studio = QuietStudio(True, session)
+        engine = QQmlEngine()
+        engine.rootContext().setContextProperty("studio", studio)
+        source = '''import QtQuick
+import QtQuick.Controls
+import QtQuick.Controls.Material
+import "."
+ApplicationWindow {
+    id: host
+    width: 960; height: 700; visible: true
+    property var viewState: JSON.parse(studio.snapshot)
+    property bool settingsOpen: false
+    property int modalDialogCount: 0
+    onSettingsOpenChanged: settingsOpen ? settingsDialog.open() : settingsDialog.close()
+    Material.theme: viewState.dark ? Material.Dark : Material.Light
+    AppDialog {
+        id: settingsDialog
+        objectName: "settingsDialog"
+        width: Math.min(840, host.width - 48)
+        height: Math.min(760, host.height - 48)
+        padding: 0
+        onClosed: host.settingsOpen = false
+        SettingsPage { ownerPopup: settingsDialog; viewState: host.viewState; anchors.fill: parent; onBack: host.settingsOpen = false }
+    }
+}'''
+        component = QQmlComponent(engine)
+        component.setData(source.encode(), QUrl.fromLocalFile(str(QML_DIR / "deferred-python-settings-smoke.qml")))
+        self.assertFalse(component.isError(), "\n".join(error.toString() for error in component.errors()))
+        with patch.object(studio, "refreshPython", wraps=studio.refreshPython) as refresh_spy, patch(
+            "python_runtime.discover", return_value=[{"path": sys.executable, "label": "System Python 3.12", "detail": "ready", "matplotlib": True, "managed": False, "venv": False}]
+        ) as discover_mock:
+            dialog_window = component.create()
+            self.assertIsNotNone(dialog_window)
+            try:
+                QTest.qWait(40)
+                page = dialog_window.findChild(object, "settingsPage")
+                dialog = dialog_window.findChild(object, "settingsDialog")
+                self.assertIsNotNone(page)
+                self.assertIsNotNone(dialog)
+                self.assertFalse(dialog.property("visible"))
+                self.assertFalse(studio.pythonBusy)
+                self.assertEqual(refresh_spy.call_count, 0)
+                self.assertEqual(discover_mock.call_count, 0)
+
+                # Selecting "python" while settingsDialog remains closed must not scan.
+                page.setProperty("section", "python")
+                QTest.qWait(30)
+                self.assertEqual(refresh_spy.call_count, 0)
+                page.setProperty("section", "appearance")
+                QTest.qWait(20)
+
+                # Opening Settings on "appearance" and switching to "shortcuts" spawns 0 scans.
+                dialog_window.setProperty("settingsOpen", True)
+                QTest.qWait(40)
+                self.assertTrue(dialog.property("visible"))
+                self.assertEqual(refresh_spy.call_count, 0)
+                page.setProperty("section", "shortcuts")
+                QTest.qWait(30)
+                self.assertEqual(refresh_spy.call_count, 0)
+                self.assertEqual(discover_mock.call_count, 0)
+
+                # Switching section to "python" while visible calls studio.refreshPython() once.
+                page.setProperty("section", "python")
+                QTest.qWait(60)
+                self.assertEqual(refresh_spy.call_count, 1)
+                self.assertEqual(discover_mock.call_count, 1)
+
+                # Switching away and back does not trigger redundant automatic scans.
+                page.setProperty("section", "appearance")
+                QTest.qWait(20)
+                page.setProperty("section", "python")
+                QTest.qWait(40)
+                self.assertEqual(refresh_spy.call_count, 1)
+
+                # Clicking "Scan again" explicitly rescans.
+                scroll = dialog_window.findChild(object, "settingsScroll")
+                self.assertIsNotNone(scroll)
+                scroll_content = scroll.property("contentItem")
+                scroll_content.setProperty("contentY", max(0, scroll_content.property("contentHeight") - scroll.height()))
+                QTest.qWait(40)
+                rescan = dialog_window.findChild(object, "rescanPython")
+                self.assertIsNotNone(rescan)
+                self.assertTrue(rescan.property("enabled"))
+                point = rescan.mapToScene(QPointF(rescan.width() / 2, rescan.height() / 2)).toPoint()
+                QTest.mouseClick(dialog_window, Qt.MouseButton.LeftButton, Qt.KeyboardModifier.NoModifier, point)
+                QTest.qWait(60)
+                self.assertEqual(refresh_spy.call_count, 2)
+                self.assertEqual(discover_mock.call_count, 2)
+            finally:
+                dialog_window.close()
+                dialog_window.deleteLater()
+                self.app.sendPostedEvents(None, QEvent.Type.DeferredDelete)
+                engine.deleteLater()
+                self.app.sendPostedEvents(None, QEvent.Type.DeferredDelete)
+                studio.stop()
+                studio.pool.shutdown(wait=True)
+                session.writes.shutdown(wait=True)
+
+    def test_main_qml_with_closed_settings_spawns_zero_python_probes(self):
+        import subprocess
+
+        probe_code = r'''
+import json, os, sys
+from pathlib import Path
+from unittest.mock import patch
+
+os.environ["QT_QPA_PLATFORM"] = "offscreen"
+os.environ["QT_QUICK_BACKEND"] = "software"
+os.environ.setdefault("QTWEBENGINE_DISABLE_SANDBOX", "1")
+os.environ.setdefault("QTWEBENGINE_CHROMIUM_FLAGS", "--disable-gpu --disable-dev-shm-usage")
+
+from PySide6.QtCore import QFile, QIODevice, QObject, QUrl
+from PySide6.QtQml import QQmlApplicationEngine
+from PySide6.QtQuickControls2 import QQuickStyle
+from PySide6.QtTest import QTest
+from PySide6.QtWebEngineQuick import QtWebEngineQuick
+from PySide6.QtWidgets import QApplication
+
+QQuickStyle.setStyle("Material")
+QtWebEngineQuick.initialize()
+app = QApplication(["main qml startup python probe test"])
+
+root = Path(sys.argv[1]).resolve()
+sys.path.insert(0, str(root))
+import python_runtime
+from studio import Session, Studio
+
+probes = []
+with patch("python_runtime.probe", side_effect=lambda *args, **kwargs: probes.append(args)):
+    for initial_python in ("", sys.executable):
+        session = Session(True)
+        session.settings["python"] = initial_python
+        studio = Studio(True, session)
+        channel = QFile(":/qtwebchannel/qwebchannel.js")
+        assert channel.open(QIODevice.OpenModeFlag.ReadOnly)
+        engine = QQmlApplicationEngine()
+        engine.rootContext().setContextProperty("studio", studio)
+        engine.rootContext().setContextProperty("readerUrl", QUrl("about:blank"))
+        engine.rootContext().setContextProperty("channelScript", bytes(channel.readAll()).decode())
+        engine.rootContext().setContextProperty("brandUrl", QUrl.fromLocalFile(str(root.parent / "public" / "brand-mark-fixed.svg")))
+        engine.load(QUrl.fromLocalFile(str(root / "qml" / "Main.qml")))
+        assert engine.rootObjects(), "Main.qml failed to load"
+        window = engine.rootObjects()[0]
+        assert window.property("settingsOpen") is False
+        assert window.findChild(QObject, "settingsPage") is not None
+        QTest.qWait(80)
+        assert studio.pythonBusy is False
+        assert bool(studio.settings["python"])
+        window.close()
+        del engine
+        studio.stop()
+        studio.pool.shutdown(wait=True, cancel_futures=True)
+        session.writes.shutdown(wait=True)
+
+print(json.dumps({"probes": len(probes)}), flush=True)
+os._exit(0)
+'''
+        completed = subprocess.run(
+            [sys.executable, "-c", probe_code, str(Path(__file__).resolve().parent)],
+            capture_output=True,
+            text=True,
+            timeout=60,
+        )
+        self.assertEqual(completed.returncode, 0, f"{completed.stdout}\n{completed.stderr}")
+        payload = json.loads(completed.stdout.strip().splitlines()[-1])
+        self.assertEqual(payload["probes"], 0)
+
 
 if __name__ == "__main__":
     unittest.main()
