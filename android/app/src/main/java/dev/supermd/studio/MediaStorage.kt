@@ -209,16 +209,14 @@ class MediaStorage(private val context: Context) {
             put(MediaStore.Downloads.DISPLAY_NAME, name)
             put(MediaStore.Downloads.MIME_TYPE, mime)
             put(MediaStore.Downloads.RELATIVE_PATH, "$relativePath/")
-            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) put(MediaStore.Downloads.IS_PENDING, 1)
+            put(MediaStore.Downloads.IS_PENDING, 1)
         }
         val uri = resolver.insert(MediaStore.Downloads.EXTERNAL_CONTENT_URI, values)
             ?: error("Android could not create a Downloads entry")
         try {
             resolver.openOutputStream(uri, "w")?.use { it.write(bytes); it.flush() }
                 ?: error("Android could not write the Downloads entry")
-            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
-                resolver.update(uri, ContentValues().apply { put(MediaStore.Downloads.IS_PENDING, 0) }, null, null)
-            }
+            resolver.update(uri, ContentValues().apply { put(MediaStore.Downloads.IS_PENDING, 0) }, null, null)
         } catch (error: Exception) { runCatching { resolver.delete(uri, null, null) }; throw error }
         return JSONObject().put("filename", name).put("bytes", bytes.size).put("mimeType", mime).put("uri", uri.toString())
     }
@@ -592,7 +590,7 @@ class MediaStorage(private val context: Context) {
         }.getOrNull()
     }
     fun writeLocalPortable(output: java.io.OutputStream, markdown: String, directory: String?) {
-        val sources=JSONArray(PdfEngine.imageSources(markdown))
+        val sources=JSONArray(markdownImageSourcesJson(markdown))
         val files=(0 until sources.length()).map {sources.getString(it)}.distinct().filter {it.startsWith("assets/")}.map {source->source to (local(source,directory) ?: error("Save manually to resolve a new image: $source"))}
         require(files.size<=512 && files.sumOf {it.second.length()}<=75_000_000 && markdown.toByteArray().size<=20_000_000)
         val boundedCompressed=object:java.io.FilterOutputStream(output){var bytes=0L;override fun write(value:Int){require(++bytes<=120_000_000);out.write(value)};override fun write(buffer:ByteArray,offset:Int,length:Int){require(bytes+length<=120_000_000);out.write(buffer,offset,length);bytes+=length}}
