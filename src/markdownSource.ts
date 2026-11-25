@@ -298,12 +298,14 @@ function unmaskedRegexStage(source:string,ranges:Array<[number,number]>,regex:Re
     const nextStart=rangeStart+delta,slice=source.slice(rangeStart,rangeEnd);
     slice.replace(regex,(...args:any[])=>{
       const localStart=args[args.length-2] as number,matchText=args[0] as string,text=replacement(...args);
+      if(text===matchText)return matchText;
       edits.push({start:rangeStart+localStart,end:rangeStart+localStart+matchText.length,text});
       delta+=text.length-matchText.length;
       return matchText;
     });
     nextRanges.push([nextStart,rangeEnd+delta]);
   }
+  if(!edits.length)return {stage:{value:source,originalOffset:offset=>offset},ranges};
   return {stage:replaceStage(source,edits),ranges:nextRanges};
 }
 
@@ -371,19 +373,27 @@ export function normalizeMarkdownSource(markdown:string, options:NormalizeMarkdo
   if(fm)add(replaceStage(value,[{start:0,end:fm.end,text:''}]));
   else if(value.startsWith('\uFEFF'))add(replaceStage(value,[{start:0,end:1,text:''}]));
   add(stripPercentComments(value));
-  let ranges=unmaskedRangesFromMask(computeCodeAndMathMask(value));
-  const addUnmasked=(regex:RegExp,replacement:(...args:any[])=>string)=>{const next=unmaskedRegexStage(value,ranges,regex,replacement);ranges=next.ranges;add(next.stage);};
-  addUnmasked(/!\[\[([^\[\r\n\]|]+)(?:\|([^\r\n\]]+))?\]\]/g,(_all,rawPath:string,spec?:string)=>{
-    const path=spec!==undefined&&rawPath.endsWith('\\')?rawPath.slice(0,-1):rawPath;
-    const sized=spec&&/^(?:(.*)\|)?\s*(0*[1-9]\d*(?:\.\d+)?)\s*(?:x\s*\d+(?:\.\d+)?\s*)?$/i.exec(spec);
-    const rawCaption=sized?sized[1]:undefined;
-    const cleanCaption=rawCaption!==undefined&&rawCaption.endsWith('\\')?rawCaption.slice(0,-1):rawCaption;
-    const alt=sized?(cleanCaption?.trim()||path):(spec??path);
-    return `![${alt}](${encodeLinks?encodeMarkdownDestination(path.trim()):encodeURI(path)})${sized?`{width=${sized[2]}}`:''}`;
-  });
-  addUnmasked(/\[\[([^\[\r\n\]]+?)\]\]/g,(all,inner:string)=>formatWikilinkMarkdown(inner,encodeLinks)??all);
-  if(encodeLinks){
-    addUnmasked(/(!?\[(?:\\.|\[[^\r\n\[\]]*\]|[^\[\]\r\n])*\]\()([^<>\r\n()]+?)((?:\s+(?:"[^"\r\n]*"|'[^'\r\n]*'))?)(\))/g,(all,open:string,dest:string,title:string,close:string)=>isLikelyInlineLinkDestination(dest)?`${open}${encodeMarkdownDestination(dest)}${title}${close}`:all);
+  const hasWikilinks=value.includes('[[');
+  const hasSpacedInlineDest=encodeLinks&&value.includes('](')&&/\]\([^\r\n()]*[ \t]/.test(value);
+  if(hasWikilinks||hasSpacedInlineDest){
+    let ranges=unmaskedRangesFromMask(computeCodeAndMathMask(value));
+    const addUnmasked=(regex:RegExp,replacement:(...args:any[])=>string)=>{const next=unmaskedRegexStage(value,ranges,regex,replacement);ranges=next.ranges;add(next.stage);};
+    if(value.includes('![[')){
+      addUnmasked(/!\[\[([^\[\r\n\]|]+)(?:\|([^\r\n\]]+))?\]\]/g,(_all,rawPath:string,spec?:string)=>{
+        const path=spec!==undefined&&rawPath.endsWith('\\')?rawPath.slice(0,-1):rawPath;
+        const sized=spec&&/^(?:(.*)\|)?\s*(0*[1-9]\d*(?:\.\d+)?)\s*(?:x\s*\d+(?:\.\d+)?\s*)?$/i.exec(spec);
+        const rawCaption=sized?sized[1]:undefined;
+        const cleanCaption=rawCaption!==undefined&&rawCaption.endsWith('\\')?rawCaption.slice(0,-1):rawCaption;
+        const alt=sized?(cleanCaption?.trim()||path):(spec??path);
+        return `![${alt}](${encodeLinks?encodeMarkdownDestination(path.trim()):encodeURI(path)})${sized?`{width=${sized[2]}}`:''}`;
+      });
+    }
+    if(value.includes('[[')){
+      addUnmasked(/\[\[([^\[\r\n\]]+?)\]\]/g,(all,inner:string)=>formatWikilinkMarkdown(inner,encodeLinks)??all);
+    }
+    if(hasSpacedInlineDest){
+      addUnmasked(/(!?\[(?:\\.|\[[^\r\n\[\]]*\]|[^\[\]\r\n])*\]\()([^<>\r\n()]+?)((?:\s+(?:"[^"\r\n]*"|'[^'\r\n]*'))?)(\))/g,(all,open:string,dest:string,title:string,close:string)=>isLikelyInlineLinkDestination(dest)?`${open}${encodeMarkdownDestination(dest)}${title}${close}`:all);
+    }
   }
   add(normalizeCalloutBlocks(value,false));
   return {value,originalOffset(offset){for(let i=stages.length-1;i>=0;i--)offset=stages[i].originalOffset(offset);return offset;}};

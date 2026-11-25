@@ -351,7 +351,7 @@ export function Reader() {
       window.clearTimeout(zoomTimer.current);const fullscreen=reference.current?.fullscreen;zoomTimer.current=window.setTimeout(()=>void invoke("zoom_changed",{zoom:target,fullscreen}),220);
     };
     window.supermdSetZoom=(value,requestedAt)=>{if(requestedAt!==undefined&&requestedAt<zoomGestureAt.current)return;window.clearTimeout(zoomTimer.current);cancelAnimationFrame(zoomFrame.current);zoomFrame.current=0;zoomTarget.current=null;const next=clampPreviewZoom(value);if(Math.abs(next-zoomReference.current)<.01)return;cancelHeadingNavigation(document.querySelector('.android-reading'));zoomReference.current=next;applyZoomStyle();settleSelection();};
-    window.supermdHeading=(id,offset)=>{markScrollInput();const current=reference.current;const resolvedOffset=offset??(current?resolveHeadingOffset(current.content,id)??undefined:undefined);if(current?.mode==="editor"){if(resolvedOffset!==undefined)window.dispatchEvent(new CustomEvent("supermd-goto-offset",{detail:resolvedOffset}));return;}if(current?.mode==="split"&&resolvedOffset!==undefined)window.dispatchEvent(new CustomEvent("supermd-goto-offset",{detail:resolvedOffset}));const root=document.querySelector(".android-reading");if(root)navigateToHeading(root,id);};
+    window.supermdHeading=(id,offset)=>{markScrollInput();const current=reference.current;if(current?.mode==="editor"||current?.mode==="split"){const resolvedOffset=offset??(resolveHeadingOffset(current.content,id)??undefined);if(resolvedOffset!==undefined)window.dispatchEvent(new CustomEvent("supermd-goto-offset",{detail:resolvedOffset}));if(current.mode==="editor")return;}const root=document.querySelector(".android-reading");if(root)navigateToHeading(root,id);};
     window.supermdBeforeNavigate=async()=>{
       savePosition.current();
       const current=reference.current;
@@ -599,7 +599,7 @@ export function Reader() {
     consumedHeadingToken.current = state.pendingHeading.token;
     const startingInput = scrollInputVersion();
     const targetHeading = state.pendingHeading.heading;
-    const offset = resolveHeadingOffset(state.content, targetHeading);
+    const offset = state.mode === "editor" || state.mode === "split" ? resolveHeadingOffset(state.content, targetHeading) : null;
     let stopped = false;
     const stop = () => { stopped = true; };
     const inputs = ["wheel", "touchstart", "keydown", "pointerdown"] as const;
