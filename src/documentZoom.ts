@@ -1,4 +1,5 @@
 import type { Point } from "./focalZoom";
+import { captureScrollAnchor } from "./scrollAnchor";
 type Geometry={page:HTMLElement;space:HTMLElement;width:number;height:number;viewport:number;bounds:DOMRect;originX:number;originY:number;left:number;spaceWidth:number;locked:boolean};
 const geometry=new WeakMap<HTMLElement,Geometry>();
 export function invalidateDocumentZoom(root:HTMLElement):void {geometry.delete(root);}
@@ -29,10 +30,15 @@ export function settleDocumentZoom(root:HTMLElement):void {
   const measured=geometry.get(root);if(!measured)return;
   const {page}=measured,scale=Number(page.dataset.scale)||1;
   const standardized='currentCSSZoom' in page;
-  page.style.zoom=standardized?String(scale):'1';
+  const nextZoom=standardized?String(scale):'1';
+  const changingZoom=standardized&&page.style.zoom!==nextZoom;
+  const restore=changingZoom&&root.isConnected&&root.scrollTop>1&&!root.dataset.navigating?captureScrollAnchor(root):undefined;
+  page.style.setProperty('--document-scale',String(scale));
+  page.style.zoom=nextZoom;
   page.style.transform=standardized?`translateX(${measured.left/scale}px)`:`translateX(${measured.left}px) scale(${scale})`;
   page.dataset.selectionScale=String(scale);
   page.dataset.selectionModel=standardized?'layout':'transform';
+  if(changingZoom){refreshDocumentExtent(root);restore?.();}
 }
 /** Layout at the user's base reading width, then magnify the whole page. Font,
  * math, tables and wrapping stay in the same relative positions as in a PDF. */
@@ -79,6 +85,7 @@ export function applyDocumentZoom(root:HTMLElement, zoom:number, widthPercent:nu
   delete page.dataset.selectionScale;
   delete page.dataset.selectionModel;
   if(width!==measured.width){page.style.width=`${width}px`;page.style.marginLeft="0px";measured.width=width;measured.height=page.offsetHeight;}
+  page.style.setProperty('--document-scale',String(next));
   page.style.transform=`translateX(${left}px) scale(${next})`;page.dataset.scale=String(next);page.dataset.zoomLeft=String(left);measured.left=left;
   space.style.width=`${spaceWidth}px`;
   space.style.height=`${measured.height*next}px`;

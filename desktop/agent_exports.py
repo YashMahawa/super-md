@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import base64
 import hashlib
+import html
 import json
 import os
 import re
@@ -33,7 +34,105 @@ MAX_EXPORT_REQUEST = 120_000_000
 _INLINE_IMAGE = re.compile(r"!\[(?:\\.|[^\]\n])*\]\(\s*(?:<([^>\n]+)>|([^\s)]+))")
 _IMAGE_LABEL = re.compile(r"!\[(?:\\.|[^\]\n])*\](?:\s*\[([^\]\n]*)\])?")
 _REFERENCE = re.compile(r"(?m)^ {0,3}\[([^\]\n]+)\]:\s*(?:<([^>\n]+)>|(\S+))")
+_OBSIDIAN_IMAGE = re.compile(r"!\[\[([^\[\r\n\]|]+)(?:\|[^\r\n\]]+)?\]\]")
+_HTML_COMMENT = re.compile(r"<!--[\s\S]*?-->")
+_INLINE_CODE = re.compile(r"(`+)(?!`)(.*?)(?<!`)\1(?!`)")
 _FENCE = re.compile(r"^\s{0,3}(`{3,}|~{3,})")
+
+
+def _scan_html_tag(text: str, start: int) -> tuple[str, bool, int, dict[str, str]] | None:
+    length = len(text)
+    if start >= length or text[start] != "<":
+        return None
+    pos = start + 1
+    closing = False
+    if pos < length and text[pos] == "/":
+        closing = True
+        pos += 1
+    if pos >= length or not text[pos].isascii() or not text[pos].isalpha():
+        return None
+    name_start = pos
+    pos += 1
+    while pos < length and text[pos].isascii() and (text[pos].isalnum() or text[pos] == "-"):
+        pos += 1
+    name = text[name_start:pos].lower()
+    attrs: dict[str, str] = {}
+    if closing:
+        while pos < length and text[pos].isspace():
+            pos += 1
+        return (name, True, pos + 1, attrs) if pos < length and text[pos] == ">" else None
+    if pos < length and not (text[pos].isspace() or text[pos] in "/>"):
+        return None
+    while pos < length:
+        while pos < length and text[pos].isspace():
+            pos += 1
+        if pos >= length:
+            return None
+        if text[pos] == ">":
+            return (name, False, pos + 1, attrs)
+        if text[pos] == "/" and pos + 1 < length and text[pos + 1] == ">":
+            return (name, False, pos + 2, attrs)
+        if text[pos] == "/":
+            pos += 1
+            continue
+        attr_start = pos
+        while pos < length and text[pos].isascii() and (text[pos].isalnum() or text[pos] in "_.:-"):
+            pos += 1
+        if pos == attr_start or not (text[attr_start].isalpha() or text[attr_start] in "_:"):
+            return None
+        attr_name = text[attr_start:pos].lower()
+        while pos < length and text[pos].isspace():
+            pos += 1
+        attr_val = ""
+        if pos < length and text[pos] == "=":
+            pos += 1
+            while pos < length and text[pos].isspace():
+                pos += 1
+            if pos >= length:
+                return None
+            quote = text[pos]
+            if quote in ('"', "'"):
+                close_idx = text.find(quote, pos + 1)
+                if close_idx < 0:
+                    return None
+                attr_val = html.unescape(text[pos + 1:close_idx])
+                pos = close_idx + 1
+            else:
+                val_start = pos
+                while (pos < length and not text[pos].isspace() and text[pos] not in "\"'=<>`"
+                       and not (text[pos] == "/" and pos + 1 < length and text[pos + 1] == ">")):
+                    pos += 1
+                if pos == val_start:
+                    return None
+                attr_val = html.unescape(text[val_start:pos])
+        if attr_name not in attrs:
+            attrs[attr_name] = attr_val
+    return None
+
+
+def _html_img_sources(visible: str) -> list[str]:
+    sources: list[str] = []
+    pos = 0
+    length = len(visible)
+    while True:
+        lt = visible.find("<", pos)
+        if lt < 0 or lt >= length:
+            break
+        if visible.startswith("<!--", lt):
+            end = visible.find("-->", lt + 4)
+            pos = length if end < 0 else end + 3
+            continue
+        parsed = _scan_html_tag(visible, lt)
+        if parsed is None:
+            pos = lt + 1
+            continue
+        name, closing, end_pos, attrs = parsed
+        if not closing and name == "img":
+            src = attrs.get("src", "").strip()
+            if src:
+                sources.append(src)
+        pos = end_pos
+    return sources
 
 
 def validate_pdf_options(value: dict[str, Any] | None) -> dict[str, Any]:
@@ -90,10 +189,10 @@ def _clean_markdown_images(markdown: str) -> str:
                 fence_char = None
             kept.append("\n" if line.endswith("\n") else "")
         elif fence_char is None:
-            kept.append(line)
+            kept.append(_INLINE_CODE.sub(" ", line))
         else:
             kept.append("\n" if line.endswith("\n") else "")
-    return "".join(kept)
+    return _HTML_COMMENT.sub("", "".join(kept))
 
 
 def _image_destinations(markdown: str) -> list[str]:
@@ -104,6 +203,8 @@ def _image_destinations(markdown: str) -> list[str]:
         label = " ".join(match.group(1).casefold().split())
         references[label] = match.group(2) or match.group(3)
     sources = [match.group(1) or match.group(2) for match in _INLINE_IMAGE.finditer(visible)]
+    sources.extend(match.group(1) for match in _OBSIDIAN_IMAGE.finditer(visible))
+    sources.extend(_html_img_sources(visible))
     for match in _IMAGE_LABEL.finditer(visible):
         label = match.group(1) or re.search(r"!\[([^\]]*)\]", match.group(0)).group(1)
         normalized = " ".join(label.casefold().split())
@@ -127,7 +228,13 @@ def _image_destinations(markdown: str) -> list[str]:
                     deck = json.loads("\n".join(body))
                     steps = deck.get("steps", []) if isinstance(deck, dict) else []
                     if isinstance(steps, list):
-                        sources.extend(step["image"] for step in steps if isinstance(step, dict) and isinstance(step.get("image"), str))
+                        for step in steps:
+                            if not isinstance(step, dict):
+                                continue
+                            if isinstance(step.get("image"), str):
+                                sources.append(step["image"])
+                            if isinstance(step.get("markdown"), str):
+                                sources.extend(_image_destinations(step["markdown"]))
                 except (ValueError, TypeError):
                     pass  # The native renderer reports invalid step JSON.
             marker = None

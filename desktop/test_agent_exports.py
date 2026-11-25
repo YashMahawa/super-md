@@ -113,6 +113,48 @@ class AgentExportsTest(unittest.TestCase):
             export_pdf(self.store, "chart.md", "chart.pdf", engine=self.engine)
         self.assertFalse((self.root / "chart.pdf").exists())
 
+    def test_pdf_export_discovers_html_and_obsidian_images_and_renders_standalone_diagrams_and_breaks(self):
+        from agent_exports import _image_destinations
+        svg_a = b"<svg xmlns='http://www.w3.org/2000/svg' width='120' height='40'><rect width='120' height='40' fill='#386a57'/></svg>"
+        svg_b = b"<svg xmlns='http://www.w3.org/2000/svg' width='100' height='50'><circle cx='50' cy='25' r='20' fill='#2463b3'/></svg>"
+        svg_c = b"<svg xmlns='http://www.w3.org/2000/svg' width='160' height='40'><rect width='160' height='40' fill='#9a461a'/></svg>"
+        (self.root / "obsidian.svg").write_bytes(svg_a)
+        (self.root / "html.svg").write_bytes(svg_b)
+        (self.root / "assets").mkdir()
+        (self.root / "assets" / "plot.svg").write_bytes(svg_c)
+        markdown = "\n".join([
+            "# Agent Export",
+            "",
+            "Prose ![[obsidian.svg|240]] and `<img src=\"ignored.svg\" />` plus `![[ignored2.svg]]`.",
+            "",
+            "<img src=\"html.svg\" width=\"160px\" style=\"zoom:50%\" />",
+            "",
+            "<img alt=\"A > B\" title='Ratio > 1 & \"quoted\"' src=\"assets/plot.svg\" width=\"300\">",
+            "",
+            "```smd-tree",
+            '{"values":["10","5","15"]}',
+            "```",
+            "",
+            "```smd-diagram",
+            '{"width":240,"height":100,"nodes":[{"id":"a","label":"A","x":60,"y":50},{"id":"b","label":"B","x":180,"y":50}],"edges":[{"from":"a","to":"b"}]}',
+            "```",
+            "",
+            "```svg",
+            "<svg viewBox='0 0 60 30'><rect width='60' height='30' fill='#ffb367'/></svg>",
+            "```",
+            "",
+            "{{< pagebreak >}}",
+            "",
+            "Second page content.",
+        ])
+        self.assertEqual(_image_destinations(markdown), ["obsidian.svg", "html.svg", "assets/plot.svg"])
+        (self.root / "complete.md").write_text(markdown, encoding="utf-8")
+        result = export_pdf(self.store, "complete.md", "complete.pdf", engine=self.engine)
+        pdf_bytes = (self.root / "complete.pdf").read_bytes()
+        self.assertTrue(pdf_bytes.startswith(b"%PDF-"))
+        self.assertNotIn(b"/Subtype /Image", pdf_bytes)
+        self.assertGreater(result["bytes"], 1000)
+
     def test_compressed_portable_pdf_uses_referenced_raw_assets_and_preserves_source(self):
         svg = b"<svg xmlns='http://www.w3.org/2000/svg' width='40' height='20'><text x='1' y='14'>Portable \xce\xbb</text></svg>"
 
