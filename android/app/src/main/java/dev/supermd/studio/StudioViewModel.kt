@@ -397,6 +397,7 @@ class StudioViewModel(app: Application, val workspaceKey: String = "main") : And
     private val mutable = MutableStateFlow(restore())
     private var agentEditSeq: Long = mutable.value.tabs.flatMap { it.agentEdits }.maxOfOrNull { it.seq } ?: 0L
     private val viewModelRetired = AtomicBoolean(false)
+    @Volatile internal var recoverySnapshotWriter: (java.io.Writer, StudioState) -> Unit = NoteRecovery::write
     private val recoveryWriter = LatestRecoveryWriter<StudioState, RecoverySnapshotSignature>(
         scope = RecoveryWriterScope.scope,
         debounceMillis = 1_200,
@@ -406,7 +407,7 @@ class StudioViewModel(app: Application, val workspaceKey: String = "main") : And
             try {
                 java.io.FileOutputStream(temporary).use { stream ->
                     val writer = stream.bufferedWriter(Charsets.UTF_8)
-                    NoteRecovery.write(writer, state)
+                    recoverySnapshotWriter(writer, state)
                     writer.flush()
                     stream.fd.sync()
                 }
@@ -1209,7 +1210,8 @@ class StudioViewModel(app: Application, val workspaceKey: String = "main") : And
     /** Commit an inactive-note patch computed from an immutable reader snapshot. */
     internal suspend fun commitAgentSnapshotPatch(id: String, expectedRevision: String, patchedContent: String, patchedRevision: String) = documentWrites.withLock {
         require(patchedContent.toByteArray(Charsets.UTF_8).size <= MAX_AGENT_SNAPSHOT_BYTES) { "The patched document exceeds Android's 2 MiB relay snapshot limit" }
-        val note = mutable.value.tabs.firstOrNull { it.id == id } ?: error("The requested note is no longer open")
+        val baseState = mutable.value
+        val note = baseState.tabs.firstOrNull { it.id == id } ?: error("The requested note is no longer open")
         val currentRevision = java.security.MessageDigest.getInstance("SHA-256")
             .digest(note.content.toByteArray(Charsets.UTF_8)).joinToString("") { "%02x".format(it) }
         require(currentRevision.equals(expectedRevision, ignoreCase = true)) { "Revision conflict: the note changed before the patch could be saved" }
@@ -1218,27 +1220,59 @@ class StudioViewModel(app: Application, val workspaceKey: String = "main") : And
         require(actualPatchedRevision.equals(patchedRevision, ignoreCase = true)) { "The computed patch failed revision verification" }
         require(!closingNoteIds.contains(id)) { "The note is closing; retry the patch after it remains open" }
         if (note.content != patchedContent) {
-            val isInactive = mutable.value.active.id != id
-            readerEcho.remove(id)
-            clearReaderEditProtocol(id)
             val nextSeq = maxOf(agentEditSeq, note.agentEdits.maxOfOrNull { it.seq } ?: 0L) + 1L
-            agentEditSeq = nextSeq
             val updatedEdits = appendAgentEditSteps(note.agentEdits, nextSeq, note.content, patchedContent)
-            change { state ->
-                state.copy(
-                    tabs = state.tabs.map {
+            fun buildPatchedState(source: StudioState): StudioState {
+                val targetInactive = source.active.id != id
+                return source.copy(
+                    tabs = source.tabs.map {
                         if (it.id == id) it.copy(
                             content = patchedContent,
-                            agentStaged = if (isInactive) true else it.agentStaged,
+                            agentStaged = if (targetInactive) true else it.agentStaged,
                             agentUnreviewed = true,
                             agentEdits = updatedEdits,
                         ) else it
                     },
-                    agentJumpTabId = if (isInactive) id else state.agentJumpTabId,
+                    agentJumpTabId = if (targetInactive) id else source.agentJumpTabId?.takeUnless { it == id },
                 )
             }
-            recoveryWriter.flushAndAwait(mutable.value)
-            if (!isInactive) scheduleAutosave(id)
+            var observedBase = baseState
+            var stagedState = buildPatchedState(observedBase)
+            while (true) {
+                if (!recoveryWriter.flushAndAwait(stagedState)) {
+                    if (!viewModelRetired.get()) recoveryWriter.schedule(mutable.value)
+                    throw IllegalStateException("Could not save recovery snapshot for the agent patch; retry the patch")
+                }
+                val latest = mutable.value
+                val latestNote = latest.tabs.firstOrNull { it.id == id }
+                if (latestNote == null || closingNoteIds.contains(id)) {
+                    if (!viewModelRetired.get()) recoveryWriter.flush(latest)
+                    error(if (latestNote == null) "The requested note is no longer open" else "The note is closing; retry the patch after it remains open")
+                }
+                if (latestNote.content != note.content) {
+                    if (!viewModelRetired.get()) recoveryWriter.flush(latest)
+                    throw IllegalArgumentException("Revision conflict: the note changed before the patch could be saved")
+                }
+                if (recoverySignature(latest) == recoverySignature(observedBase)) {
+                    val committedState = if (latest === observedBase) stagedState else buildPatchedState(latest)
+                    val isInactive = committedState.active.id != id
+                    agentEditSeq = maxOf(agentEditSeq, nextSeq)
+                    readerEcho.remove(id)
+                    clearReaderEditProtocol(id)
+                    mutable.value = committedState
+                    syncNoteAssetScopes(latest, committedState)
+                    observeActive()
+                    if (!isInactive) scheduleAutosave(id)
+                    break
+                }
+                observedBase = latest
+                stagedState = buildPatchedState(observedBase)
+            }
+        } else if (baseState.active.id != id && (note.dirty || note.agentStaged)) {
+            if (!recoveryWriter.flushAndAwait(mutable.value)) {
+                if (!viewModelRetired.get()) recoveryWriter.schedule(mutable.value)
+                throw IllegalStateException("Could not save recovery snapshot for the agent patch; retry the patch")
+            }
         }
     }
     fun newNote(titleHint: String? = null, content: String? = null, background: Boolean = false, format: String = "md", onCreated: ((Note?) -> Unit)? = null) {

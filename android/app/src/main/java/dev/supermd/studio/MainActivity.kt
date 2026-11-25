@@ -531,6 +531,83 @@ class MainActivity : ComponentActivity() {
 
 internal data class AgentStatusPillUi(val visible: Boolean, val label: String, val stateKey: String)
 
+internal fun sendAgentBridgeReply(
+    activity: MainActivity,
+    model: StudioViewModel,
+    targetId: String,
+    result: Any?,
+    error: String?,
+    reply: (Any?, String?) -> Unit,
+) {
+    val current = model.state.value.tabs.firstOrNull { it.id == targetId }
+    val knownConflict = error?.takeIf { message ->
+        message.contains("revision conflict", ignoreCase = true) ||
+            message.contains("changed since the supplied revision", ignoreCase = true) ||
+            message.contains("changed since the expected revision", ignoreCase = true)
+    }
+    if (knownConflict != null && current != null) {
+        reply(null, JSONObject().put("error", knownConflict).put("currentRevision", activity.agentRevision(current.content))
+            .put("sourceLength", activity.agentSourceLength(current.content)).toString())
+    } else reply(result, error)
+}
+
+internal fun handleInactiveTabSnapshotRequest(
+    activity: MainActivity,
+    model: StudioViewModel,
+    scope: kotlinx.coroutines.CoroutineScope,
+    web: WebView,
+    request: JSONObject,
+    target: String,
+    snapshot: Note,
+    canonicalTabId: (Note) -> String,
+    reply: (Any?, String?) -> Unit,
+) {
+    if (request.optString("action") !in setOf("read_tab", "search_tab", "outline_tab", "list_diagrams", "get_diagram", "patch_tab")) {
+        reply(null, "This Android action requires the requested tab to be active")
+        return
+    }
+    val contentBytes = snapshot.content.toByteArray(Charsets.UTF_8)
+    if (contentBytes.size > MAX_AGENT_SNAPSHOT_BYTES) { reply(null, "This document exceeds Android's 2 MiB inactive-tab snapshot limit; activate it and retry"); return }
+    val compute = JSONObject().put("requestId", request.optString("requestId"))
+        .put("action", request.optString("action")).put("tabId", target).put("content", snapshot.content)
+    listOf("expectedRevision", "operations", "offset", "limit", "query", "context", "heading", "view", "diagramId", "caseSensitive", "wholeWord", "regex", "excludeDiagrams")
+        .forEach { key -> if (request.has(key)) compute.put(key, request.get(key)) }
+    if (request.has("expectedRevision")) compute.put("expectedRevision", request.getString("expectedRevision").lowercase())
+    activity.dispatchAgentCompute(web, compute) { raw, error ->
+        if (error != null) { reply(null, error); return@dispatchAgentCompute }
+        val result = raw as? JSONObject
+        if (result == null) { reply(null, "Android could not read the computed document result"); return@dispatchAgentCompute }
+        val snapshotRevision = activity.agentRevision(snapshot.content)
+        if (result.optString("tabId") != target) {
+            reply(null, "The document result did not match the captured Android note snapshot")
+            return@dispatchAgentCompute
+        }
+        if (request.optString("action") == "patch_tab") {
+            val patchedContent = result.optString("patchedContent", "")
+            if (!result.optString("baseRevision").equals(snapshotRevision, ignoreCase = true) ||
+                result.optInt("baseSourceLength", -1) != activity.agentSourceLength(snapshot.content) ||
+                result.optInt("sourceLength", -1) != activity.agentSourceLength(patchedContent) ||
+                !request.optString("expectedRevision").equals(snapshotRevision, ignoreCase = true)) {
+                sendAgentBridgeReply(activity, model, target, null, "Revision conflict: the note changed; read it again before editing", reply)
+                return@dispatchAgentCompute
+            }
+            scope.launch {
+                runCatching {
+                    model.commitAgentSnapshotPatch(target, snapshotRevision, patchedContent, result.optString("revision"))
+                }.onFailure { sendAgentBridgeReply(activity, model, target, null, it.message ?: "Could not save the inactive-tab patch", reply) }
+                    .onSuccess { result.remove("patchedContent"); result.put("tabId", canonicalTabId(snapshot)); reply(result, null) }
+            }
+        } else {
+            if (!result.optString("revision").equals(snapshotRevision, ignoreCase = true) || result.optInt("sourceLength", -1) != activity.agentSourceLength(snapshot.content)) {
+                reply(null, "The document revision changed while Android was reading it; retry")
+            } else {
+                result.put("tabId", canonicalTabId(snapshot))
+                reply(result, null)
+            }
+        }
+    }
+}
+
 internal fun resolveAgentStatusPillUi(
     accessEnabled: Boolean,
     relayState: AgentRelayClient.State,
@@ -723,18 +800,8 @@ private object NoMotionScheme : MotionScheme {
             if (rawTabId != null) request.put("tabId", rawTabId)
             request.optString("expectedRevision").takeIf { it.isNotBlank() }?.let { request.put("expectedRevision", it.lowercase()) }
             fun canonicalTabId(note: Note): String = "tab:${activity.agentConfigForThisWindow()?.deviceId ?: "local"}:${activity.agentWorkspaceKey}:${note.id}"
-            fun sendAgentReply(targetId: String, result: Any?, error: String?) {
-                val current = model.state.value.tabs.firstOrNull { it.id == targetId }
-                val knownConflict = error?.takeIf { message ->
-                    message.contains("revision conflict", ignoreCase = true) ||
-                        message.contains("changed since the supplied revision", ignoreCase = true) ||
-                        message.contains("changed since the expected revision", ignoreCase = true)
-                }
-                if (knownConflict != null && current != null) {
-                    reply(null, JSONObject().put("error", knownConflict).put("currentRevision", activity.agentRevision(current.content))
-                        .put("sourceLength", activity.agentSourceLength(current.content)).toString())
-                } else reply(result, error)
-            }
+            fun sendAgentReply(targetId: String, result: Any?, error: String?) =
+                sendAgentBridgeReply(activity, model, targetId, result, error, reply)
             fun withSelectedTab(snapshotSafeWhenInactive: Boolean = false, action: suspend () -> Unit) {
                 val target = request.optString("tabId").takeIf { it.isNotBlank() }
                 if (target == null) { scope.launch { action() }; return }
@@ -746,51 +813,7 @@ private object NoMotionScheme : MotionScheme {
                     return
                 }
                 if (model.state.value.activeId != target && snapshotSafeWhenInactive) {
-                    if (request.optString("action") !in setOf("read_tab", "search_tab", "outline_tab", "list_diagrams", "get_diagram", "patch_tab")) {
-                        reply(null, "This Android action requires the requested tab to be active")
-                        return
-                    }
-                    val contentBytes = snapshot.content.toByteArray(Charsets.UTF_8)
-                    if (contentBytes.size > MAX_AGENT_SNAPSHOT_BYTES) { reply(null, "This document exceeds Android's 2 MiB inactive-tab snapshot limit; activate it and retry"); return }
-                    val compute = JSONObject().put("requestId", request.optString("requestId"))
-                        .put("action", request.optString("action")).put("tabId", target).put("content", snapshot.content)
-                    listOf("expectedRevision", "operations", "offset", "limit", "query", "context", "heading", "view", "diagramId", "caseSensitive", "wholeWord", "regex", "excludeDiagrams")
-                        .forEach { key -> if (request.has(key)) compute.put(key, request.get(key)) }
-                    if (request.has("expectedRevision")) compute.put("expectedRevision", request.getString("expectedRevision").lowercase())
-                    activity.dispatchAgentCompute(web!!, compute) { raw, error ->
-                        if (error != null) { reply(null, error); return@dispatchAgentCompute }
-                        val result = raw as? JSONObject
-                        if (result == null) { reply(null, "Android could not read the computed document result"); return@dispatchAgentCompute }
-                        val snapshotRevision = activity.agentRevision(snapshot.content)
-                        val actionName = request.optString("action")
-                        if (result.optString("tabId") != target) {
-                            reply(null, "The document result did not match the captured Android note snapshot")
-                            return@dispatchAgentCompute
-                        }
-                        if (request.optString("action") == "patch_tab") {
-                            val patchedContent = result.optString("patchedContent", "")
-                            if (!result.optString("baseRevision").equals(snapshotRevision, ignoreCase = true) ||
-                                result.optInt("baseSourceLength", -1) != activity.agentSourceLength(snapshot.content) ||
-                                result.optInt("sourceLength", -1) != activity.agentSourceLength(patchedContent) ||
-                                !request.optString("expectedRevision").equals(snapshotRevision, ignoreCase = true)) {
-                            sendAgentReply(target, null, "Revision conflict: the note changed; read it again before editing")
-                                return@dispatchAgentCompute
-                            }
-                            scope.launch {
-                                runCatching {
-                                    model.commitAgentSnapshotPatch(target, snapshotRevision, patchedContent, result.optString("revision"))
-                                }.onFailure { sendAgentReply(target, null, it.message ?: "Could not save the inactive-tab patch") }
-                                    .onSuccess { result.remove("patchedContent"); result.put("tabId", canonicalTabId(snapshot)); reply(result, null) }
-                            }
-                        } else {
-                            if (!result.optString("revision").equals(snapshotRevision, ignoreCase = true) || result.optInt("sourceLength", -1) != activity.agentSourceLength(snapshot.content)) {
-                                reply(null, "The document revision changed while Android was reading it; retry")
-                            } else {
-                                result.put("tabId", canonicalTabId(snapshot))
-                                reply(result, null)
-                            }
-                        }
-                    }
+                    handleInactiveTabSnapshotRequest(activity, model, scope, web!!, request, target, snapshot, ::canonicalTabId, reply)
                 } else if (model.state.value.activeId != target) {
                     reply(null, "The requested tab is inactive. Activate it in Super MD before using this Android reader action.")
                 } else scope.launch { action() }
