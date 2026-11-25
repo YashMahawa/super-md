@@ -35,8 +35,9 @@ test('Source undo remains available in Read without duplicate full-note snapshot
   await page.evaluate(state=>window.supermdLoad?.(state),{...state,mode:'reader',content});await expect(page.locator('.markdown-body')).toContainText('appended');
   await page.evaluate(()=>window.supermdHistory?.('undo'));await expect(page.locator('.markdown-body')).not.toContainText('appended');
   await page.evaluate(()=>window.supermdHistory?.('redo'));await expect(page.locator('.markdown-body')).toContainText('appended');
+  await page.evaluate(state=>window.supermdLoad?.(state),{...state,mode:'live',content});
   await page.evaluate(()=>{window.supermdFind?.();});await page.getByRole('searchbox',{name:'Find in note'}).fill('Original');await page.getByRole('button',{name:'Replace in source',exact:true}).click();await page.getByRole('textbox',{name:'Replacement text'}).fill('Replacement');await page.getByRole('button',{name:'Replace all',exact:true}).click();await page.keyboard.press('Escape');
-  await expect(page.locator('.markdown-body')).toContainText('Replacement');
+  await expect(page.locator('.live-document')).toContainText('Replacement');
   await page.evaluate(state=>window.supermdLoad?.(state),{...state,content,mode:'editor'});await page.locator('.cm-content').click();await page.keyboard.press('Control+End');await page.keyboard.type(' again');
   await page.evaluate(state=>window.supermdLoad?.(state),{...state,content,mode:'reader'});await expect(page.locator('.markdown-body')).toContainText('again');
   await page.evaluate(()=>window.supermdHistory?.('undo'));await expect(page.locator('.markdown-body')).not.toContainText('again');await expect(page.locator('.markdown-body')).toContainText('Replacement');
