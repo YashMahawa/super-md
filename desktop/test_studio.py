@@ -211,6 +211,7 @@ class StudioTest(unittest.TestCase):
         self.session = Session(True)
         self.windows = []
         self.studio = self.window()
+        self.session.writes.flush(timeout=3)
 
     def window(self):
         window = QuietStudio(True,self.session)

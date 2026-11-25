@@ -394,6 +394,7 @@ class DocumentsTest(unittest.TestCase):
             self.assertEqual(extracted["data"], pattern + b"<!--0-->")
 
     def test_streamed_large_recovery_drafts_release_gil(self):
+        import hashlib
         import threading
         import time
 
@@ -417,6 +418,7 @@ class DocumentsTest(unittest.TestCase):
             recovery_path = Path(directory) / "recovery.json"
             done = threading.Event()
             errors: list[BaseException] = []
+            gil_probe = b"x" * 4096  # >= HASHLIB_GIL_MINSIZE (2048): releases and re-acquires the GIL in C without OS sleep
 
             def writer():
                 try:
@@ -428,15 +430,14 @@ class DocumentsTest(unittest.TestCase):
 
             worker = threading.Thread(target=writer)
             max_stall_ms = 0.0
-            last = time.perf_counter()
             worker.start()
             while not done.is_set():
-                time.sleep(0.0005)
-                now = time.perf_counter()
-                stall_ms = max(0.0, (now - last - 0.0005) * 1000.0)
+                t0 = time.perf_counter()
+                hashlib.sha256(gil_probe).digest()
+                stall_ms = (time.perf_counter() - t0) * 1000.0
                 if stall_ms > max_stall_ms:
                     max_stall_ms = stall_ms
-                last = now
+                time.sleep(0.0005)
             worker.join(timeout=10)
 
             self.assertEqual(errors, [])
