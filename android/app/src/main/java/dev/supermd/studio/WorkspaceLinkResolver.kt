@@ -33,10 +33,14 @@ internal enum class ReaderUrlDecision {
  * Classifies main-frame and subresource URL navigations inside the Android reader WebView.
  * Never opens `appassets.androidplatform.net` URLs in an external browser.
  */
-internal fun classifyReaderNavigationUrl(url: Uri, isForMainFrame: Boolean): ReaderUrlDecision {
+internal fun classifyReaderNavigationUrl(url: Uri?, isForMainFrame: Boolean): ReaderUrlDecision {
+    if (url == null) return ReaderUrlDecision.BLOCK_INTERNAL
     if (url.host.equals("appassets.androidplatform.net", ignoreCase = true)) {
-        return if (url.path == "/assets/web/android-reader.html") ReaderUrlDecision.ALLOW_READER
-        else ReaderUrlDecision.BLOCK_INTERNAL
+        return if (url.scheme.equals("https", ignoreCase = true) && url.path == "/assets/web/android-reader.html") {
+            ReaderUrlDecision.ALLOW_READER
+        } else {
+            ReaderUrlDecision.BLOCK_INTERNAL
+        }
     }
     val scheme = url.scheme?.lowercase()
     if (isForMainFrame && scheme in setOf("https", "http", "mailto")) {
@@ -161,14 +165,79 @@ internal fun isExplicitRelativeWorkspaceTarget(rawTarget: String, wikilink: Bool
 private val ENCODED_NUL_REGEX = Regex("%00", RegexOption.IGNORE_CASE)
 
 internal fun sanitizeWorkspaceLinkTarget(rawTarget: String): String {
+    if (rawTarget.contains('\u0000') || ENCODED_NUL_REGEX.containsMatchIn(rawTarget)) {
+        throw WorkspaceLinkException("Invalid relative note path.")
+    }
     val cleaned = rawTarget.trim().substringBefore('#').substringBefore('?').trim()
     if (cleaned.isEmpty()) {
-        throw WorkspaceLinkException("Link target is empty.")
-    }
-    if (cleaned.contains('\u0000') || ENCODED_NUL_REGEX.containsMatchIn(cleaned)) {
-        throw WorkspaceLinkException("Invalid note link.")
+        throw WorkspaceLinkException("Invalid relative note path.")
     }
     return cleaned
+}
+
+/**
+ * Resolves a workspace-relative path against `parentRelative` without allowing
+ * absolute paths, URL schemes, encoded path separators, or `..` escapes above the folder root.
+ */
+internal fun workspaceRelativePathParts(parentRelative: String, rawTarget: String): List<String> =
+    try {
+        readerAssetPathParts(parentRelative.replace('\\', '/').trim('/'), rawTarget.trim())
+    } catch (_: IllegalStateException) {
+        throw WorkspaceLinkException("Linked note is outside the authorized folder.")
+    } catch (error: IllegalArgumentException) {
+        throw WorkspaceLinkException(
+            if (error.message?.contains("Encoded path separators", ignoreCase = true) == true) {
+                "Encoded path separators are not allowed."
+            } else {
+                "Invalid relative note path."
+            },
+        )
+    }
+
+internal fun splitWorkspaceNameAndExt(name: String): Pair<String, String> {
+    val dot = name.lastIndexOf('.')
+    return if (dot <= 0 || dot == name.lastIndex) {
+        name to ""
+    } else {
+        name.substring(0, dot) to name.substring(dot + 1).lowercase()
+    }
+}
+
+internal fun expandWorkspaceCandidatePaths(
+    parentRelative: String,
+    cleanedTarget: String,
+    wikilink: Boolean,
+): List<List<String>> {
+    val primaryParts = workspaceRelativePathParts(parentRelative, cleanedTarget)
+    val (_, explicitExt) = splitWorkspaceNameAndExt(primaryParts.last())
+    if (!wikilink && explicitExt.isNotEmpty() && explicitExt !in WORKSPACE_NOTE_EXTENSIONS) {
+        throw WorkspaceLinkException("Only Markdown and Super MD notes can be opened from relative links.")
+    }
+    val baseLists = buildList {
+        add(primaryParts)
+        val decodedSegments = Uri.decode(cleanedTarget).replace('\\', '/').split('/')
+        if (parentRelative.isNotEmpty()
+            && !cleanedTarget.startsWith("./")
+            && !cleanedTarget.startsWith("../")
+            && !decodedSegments.contains("..")
+        ) {
+            val rootParts = workspaceRelativePathParts("", cleanedTarget)
+            if (rootParts != primaryParts) add(rootParts)
+        }
+    }
+    val expanded = ArrayList<List<String>>()
+    for (parts in baseLists) {
+        val (_, ext) = splitWorkspaceNameAndExt(parts.last())
+        if (ext in WORKSPACE_NOTE_EXTENSIONS) {
+            if (parts !in expanded) expanded += parts
+        } else {
+            for (noteExt in WORKSPACE_NOTE_EXTENSIONS) {
+                val withExt = parts.dropLast(1) + "${parts.last()}.$noteExt"
+                if (withExt !in expanded) expanded += withExt
+            }
+        }
+    }
+    return expanded
 }
 
 internal fun resolveLocalFileWorkspaceLink(
@@ -180,38 +249,27 @@ internal fun resolveLocalFileWorkspaceLink(
     val rawPath = sourceUri.path ?: return null
     val sourceFile = java.io.File(rawPath)
     if (java.nio.file.Files.isSymbolicLink(sourceFile.toPath())) {
-        throw WorkspaceLinkException("Symlink note links are not allowed.")
+        throw WorkspaceLinkException("Linked note symlink paths are not allowed.")
     }
-    val parentDir = runCatching { sourceFile.canonicalFile.parentFile }.getOrNull()?.takeIf { it.isDirectory } ?: return null
+    val parentDir = runCatching { sourceFile.canonicalFile.parentFile }.getOrNull()?.takeIf { it.isDirectory }
+        ?: throw WorkspaceLinkException("Invalid note path.")
     val cleaned = sanitizeWorkspaceLinkTarget(rawTarget)
-    val parts = workspaceRelativePathParts("", cleaned)
-    val relCandidate = parts.joinToString("/")
-    val (_, rawExt) = splitNameAndExt(parts.last())
-    val candidates = if (rawExt in WORKSPACE_NOTE_EXTENSIONS) {
-        listOf(relCandidate)
-    } else if (!wikilink && rawExt.isNotEmpty()) {
-        throw WorkspaceLinkException("Unsupported note extension: .$rawExt")
-    } else {
-        WORKSPACE_NOTE_EXTENSIONS.map { "$relCandidate.$it" }
-    }
-    for (candidateRel in candidates) {
+    val candidateLists = expandWorkspaceCandidatePaths("", cleaned, wikilink)
+    val boundaryPath = parentDir.toPath()
+    for (parts in candidateLists) {
         var cur = parentDir
-        var blockedSymlink = false
-        for (segment in candidateRel.split('/')) {
+        for (segment in parts) {
             val next = java.io.File(cur, segment)
             if (java.nio.file.Files.isSymbolicLink(next.toPath())) {
-                blockedSymlink = true
-                break
+                throw WorkspaceLinkException("Linked note symlink paths are not allowed.")
             }
             cur = next
         }
-        if (blockedSymlink) throw WorkspaceLinkException("Symlink note links are not allowed.")
         if (!cur.isFile) continue
         val resolved = runCatching { cur.canonicalFile }.getOrNull() ?: continue
-        val boundaryPath = parentDir.toPath()
         val resolvedPath = resolved.toPath()
         if (!resolvedPath.startsWith(boundaryPath)) {
-            throw WorkspaceLinkException("Links cannot navigate outside the open folder.")
+            throw WorkspaceLinkException("Linked note is outside the authorized folder.")
         }
         return WorkspaceResolvedNote(
             uri = Uri.fromFile(resolved),
@@ -219,40 +277,12 @@ internal fun resolveLocalFileWorkspaceLink(
             relative = boundaryPath.relativize(resolvedPath).toString().replace('\\', '/'),
         )
     }
-    throw WorkspaceLinkException("Note not found: ${Uri.decode(cleaned)}")
+    throw WorkspaceLinkException("Linked note not found: ${Uri.decode(cleaned)}")
 }
-
-/**
- * Resolves a workspace-relative path against `parentRelative` without allowing
- * absolute paths, URL schemes, encoded path separators, or `..` escapes above the folder root.
- */
-internal fun workspaceRelativePathParts(parentRelative: String, rawTarget: String): List<String> =
-    try {
-        readerAssetPathParts(parentRelative.replace('\\', '/').trim('/'), rawTarget.trim())
-    } catch (_: IllegalStateException) {
-        throw WorkspaceLinkException("Links cannot navigate outside the open folder.")
-    } catch (error: IllegalArgumentException) {
-        throw WorkspaceLinkException(
-            if (error.message?.contains("Encoded path separators") == true) {
-                "Encoded path separators are not allowed in note links."
-            } else {
-                "Invalid note link."
-            },
-        )
-    }
 
 private fun extensionPriority(extLower: String): Int {
     val idx = WORKSPACE_NOTE_EXTENSIONS.indexOf(extLower)
     return if (idx >= 0) idx else WORKSPACE_NOTE_EXTENSIONS.size
-}
-
-private fun splitNameAndExt(name: String): Pair<String, String> {
-    val dot = name.lastIndexOf('.')
-    return if (dot <= 0 || dot == name.lastIndex) {
-        name to ""
-    } else {
-        name.substring(0, dot) to name.substring(dot + 1).lowercase()
-    }
 }
 
 /**
@@ -332,22 +362,19 @@ internal class WorkspaceLinkCache(
                 throw WorkspaceLinkException("Choose the folder containing this note to follow relative links.")
             }
             val parentRelative = noteParentDir ?: ""
-            val parts = workspaceRelativePathParts(parentRelative, cleaned)
-            val (_, explicitExt) = splitNameAndExt(parts.last())
-            if (!wikilink && explicitExt.isNotEmpty() && explicitExt !in WORKSPACE_NOTE_EXTENSIONS) {
-                throw WorkspaceLinkException("Unsupported note extension: .$explicitExt")
-            }
-            val candidateRel = parts.joinToString("/")
+            val candidateLists = expandWorkspaceCandidatePaths(parentRelative, cleaned, wikilink)
             val index = ensureIndexed(treeUri)
-            resolveRelativeCandidate(index, candidateRel)?.let { return it }
-            throw WorkspaceLinkException("Note not found: ${Uri.decode(cleaned)}")
+            for (parts in candidateLists) {
+                resolveRelativeCandidate(index, parts.joinToString("/"))?.let { return it }
+            }
+            throw WorkspaceLinkException("Linked note not found: ${Uri.decode(cleaned)}")
         }
 
         // Wikilink resolution (sibling, root, or ranked basename/subpath inside the granted folder)
         val parts = workspaceRelativePathParts("", cleaned)
         val normalizedQuery = parts.joinToString("/")
         val queryLower = normalizedQuery.lowercase()
-        val (_, queryExt) = splitNameAndExt(parts.last())
+        val (_, queryExt) = splitWorkspaceNameAndExt(parts.last())
         val hasKnownNoteExt = queryExt in WORKSPACE_NOTE_EXTENSIONS
         val index = ensureIndexed(treeUri)
 
@@ -400,7 +427,7 @@ internal class WorkspaceLinkCache(
         if (!exactOnly) {
             index.byRelativeLower[candidateRel.lowercase()]?.let { return it.toResolved() }
         }
-        val (_, ext) = splitNameAndExt(candidateRel.substringAfterLast('/'))
+        val (_, ext) = splitWorkspaceNameAndExt(candidateRel.substringAfterLast('/'))
         if (ext !in WORKSPACE_NOTE_EXTENSIONS) {
             for (noteExt in WORKSPACE_NOTE_EXTENSIONS) {
                 val withExt = "$candidateRel.$noteExt"
@@ -471,7 +498,7 @@ internal class WorkspaceLinkCache(
                     }
                 } else {
                     if (entries.size >= maxFiles) break
-                    val (stem, ext) = splitNameAndExt(name)
+                    val (stem, ext) = splitWorkspaceNameAndExt(name)
                     if (ext !in WORKSPACE_NOTE_EXTENSIONS) continue
                     val relativeLower = relative.lowercase()
                     val withoutExt = if (prefix.isEmpty()) stem else "$prefix/$stem"

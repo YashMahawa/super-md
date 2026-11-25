@@ -928,7 +928,10 @@ class Studio(QObject):
             colors = self._colors()
             reading_settings={key:self.settings[key] for key in ("restorePosition","centerLock","imageAppearance","svgAppearance","imageContrast","fullDocumentAccessibility","latexAutofix","typewriterScroll")}
             reading_settings["customStyle"]=custom_theme.reader(self.session.custom_theme,self.settings["fullTheme" if self.fullscreen else "theme"],self._dark(),self.settings)
-            payload={**reading_settings,"readingLocation":self.session.locations.get(tab["path"]),"pendingHeading":tab.pop("pendingHeading",None),"id": tab["id"], "path": tab["path"] or tab["id"], "mode": self.mode, "dark": self._dark(), "fullscreen": self.fullscreen, "font": self.settings["font"], "size": self.settings["size"], "widthPercent": self.settings["widthPercent"], "lineHeight":self.settings["lineHeight"], "spellCheck":self.settings["spellCheck"], "grammarCheck":self.settings["grammarCheck"], "zoom": self.settings["fullZoom" if self.fullscreen else "normalZoom"], "motion": self.settings["motion"], "python": self.settings["python"], "colors": colors, "viewState": tab.pop("viewState", None)}
+            payload={**reading_settings,"readingLocation":self.session.locations.get(tab["path"]),"id": tab["id"], "path": tab["path"] or tab["id"], "mode": self.mode, "dark": self._dark(), "fullscreen": self.fullscreen, "font": self.settings["font"], "size": self.settings["size"], "widthPercent": self.settings["widthPercent"], "lineHeight":self.settings["lineHeight"], "spellCheck":self.settings["spellCheck"], "grammarCheck":self.settings["grammarCheck"], "zoom": self.settings["fullZoom" if self.fullscreen else "normalZoom"], "motion": self.settings["motion"], "python": self.settings["python"], "colors": colors, "viewState": tab.pop("viewState", None)}
+            pending_heading = tab.pop("pendingHeading", None)
+            if pending_heading:
+                payload["pendingHeading"] = pending_heading
             seeded_find = self._consume_seeded_find(tab)
             if seeded_find is not None:
                 payload["seededFind"] = seeded_find
@@ -1035,7 +1038,7 @@ class Studio(QObject):
             return "Invalid key combination."
         candidate = copy.deepcopy(self.settings["shortcuts"])
         candidate[action] = [sequence] if sequence else []
-        validated, error = normalize_shortcuts(candidate)
+        validated, error = normalize_shortcuts(candidate, edited_action=action)
         if error: return error
         if validated == self.settings["shortcuts"]: return ""
         self.settings["shortcuts"] = validated
@@ -2717,12 +2720,14 @@ class Studio(QObject):
             if explicit and activation_generation == self._activation_generation:
                 if pending_heading:
                     target_tab["pendingHeading"] = pending_heading
+                else:
+                    target_tab.pop("pendingHeading", None)
                 self.recent = [str(path)] + [p for p in self.recent if p != str(path)][:29]
                 self._preferences()
-                was_active = (target_tab["id"] == self.active)
+                was_active = self.active == target_tab["id"]
                 self._select_tab_from_open(target_tab["id"], activation_generation)
                 if was_active and pending_heading:
-                    self._emit(True)
+                    self._emit()
                 self._focus_open_target(activation_generation)
         found = next((t for t in self.tabs if t["path"] == str(path)), None)
         if found:
@@ -3615,7 +3620,21 @@ class Studio(QObject):
 
     @Slot(str)
     def command(self, action):
-        calls = {"find": "window.supermdFind?.()", "insert": "window.supermdMedia?.()", "repair": "window.supermdRepairMath?.()", "undo":"window.supermdHistory?.('undo')", "redo":"window.supermdHistory?.('redo')"}
+        calls = {
+            "find": "window.supermdFind?.()",
+            "insert": "window.supermdMedia?.()",
+            "repair": "window.supermdRepairMath?.()",
+            "undo": "window.supermdHistory?.('undo')",
+            "redo": "window.supermdHistory?.('redo')",
+            "format_bold": "window.supermdFormat?.('bold')",
+            "format_italic": "window.supermdFormat?.('italic')",
+            "format_inline_code": "window.supermdFormat?.('inline_code')",
+            "format_link": "window.supermdFormat?.('link')",
+            "format_heading": "window.supermdFormat?.('heading')",
+            "format_list": "window.supermdFormat?.('list')",
+            "format_quote": "window.supermdFormat?.('quote')",
+            "format_inline_math": "window.supermdFormat?.('inline_math')",
+        }
         if action in calls: self.readerCall.emit(calls[action])
         elif action == "window": self.newWindowRequested.emit()
 
@@ -4741,6 +4760,7 @@ class Studio(QObject):
                 if self.fullscreen: self.chromeRequested.emit(action)
                 self.replied.emit(id,"true",""); return
             if command == "reader_overlay_changed": self.reader_overlay = bool(args.get("open")); self.image_overlay = bool(args.get("image")); self._emit(False); self.replied.emit(id,"true",""); return
+            if command == "editor_focus_changed": self.replied.emit(id,"true",""); return
             if command == "typewriter_scroll":
                 enabled = args.get("enabled")
                 if not isinstance(enabled, bool): raise ValueError("Invalid typewriter scroll value")
@@ -4862,23 +4882,20 @@ class Studio(QObject):
                     raw_fragment = ""
                 wikilink = bool(args.get("wikilink", False)) if command == "open_workspace_link" else False
                 doc_ref = args.get("documentPath", "")
-                if not isinstance(raw_target, str) or len(raw_target) > 4096 or not isinstance(raw_fragment, str) or len(raw_fragment) > 1024:
+                if (not isinstance(raw_target, str) or len(raw_target) > 4096
+                        or not isinstance(raw_fragment, str) or len(raw_fragment) > 1024):
                     raise ValueError("Invalid workspace link")
-                source_tab = next((item for item in self.tabs if doc_ref and doc_ref in (item["id"], item["path"])), None)
-                if source_tab is None and isinstance(doc_ref, str) and doc_ref:
-                    try:
-                        canonical_ref = str(local_path(doc_ref))
-                    except OSError:
-                        canonical_ref = ""
-                    if canonical_ref:
-                        source_tab = next((item for item in self.tabs if item["path"] == canonical_ref), None)
-                source_tab = source_tab or tab
+                source_tab = self._find_open_tab(doc_ref, canonicalize_local=True) if doc_ref else self._current()
+                if source_tab is None:
+                    raise ValueError("The note for this link is no longer open.")
                 note_path = source_tab["path"]
                 folder = self.folder
-                # Preserve unsaved edits in the current tab and durably snapshot recovery;
-                # if autosave is enabled for a saved note, flush it immediately too.
+                if self.recovery_timer.isActive():
+                    self.recovery_timer.stop()
                 self._recover()
-                if self.settings.get("autosave") and source_tab["path"] and self._is_dirty(source_tab):
+                if self.autosave_timer.isActive() or (
+                    self.settings.get("autosave") and note_path and self._is_dirty(source_tab)
+                ):
                     self.autosave_timer.stop()
                     self._autosave()
                 def resolve_work():
@@ -4891,23 +4908,31 @@ class Studio(QObject):
                     )
                 def resolve_done(resolved_path, error):
                     if self.retired:
-                        self.replied.emit(id, "false", "")
+                        self.replied.emit(id, json.dumps({"opened": False}), "")
                         return
                     if error:
-                        self.message = error
+                        self.message = str(error)
                         self._emit(False)
-                        self.replied.emit(id, json.dumps({"opened": False, "message": error}), "")
+                        self.replied.emit(id, json.dumps({"opened": False, "message": str(error)}), "")
                         return
                     fragment = raw_fragment.strip()
                     heading_payload = {"heading": fragment, "token": uuid.uuid4().hex} if fragment else None
                     def opened(opened_tab, open_error):
                         if open_error or opened_tab is None:
                             if open_error:
-                                self.message = open_error
+                                self.message = str(open_error)
                                 self._emit(False)
-                            self.replied.emit(id, json.dumps({"opened": False, "message": open_error or "Could not open note"}), "")
+                            self.replied.emit(
+                                id,
+                                json.dumps({"opened": False, "message": str(open_error or "Could not open note")}),
+                                "",
+                            )
                             return
-                        self.replied.emit(id, json.dumps({"opened": True, "id": opened_tab["id"], "path": opened_tab["path"]}), "")
+                        self.replied.emit(
+                            id,
+                            json.dumps({"opened": True, "id": opened_tab["id"], "path": opened_tab["path"]}),
+                            "",
+                        )
                     self._open_note(str(resolved_path), explicit=True, completion_callback=opened, pending_heading=heading_payload)
                 self._submit(resolve_work, resolve_done, False)
                 return
@@ -4916,7 +4941,7 @@ class Studio(QObject):
                 source = args.get("source")
                 if not isinstance(document, str) or not isinstance(source, str):
                     raise ValueError("Invalid reader asset request")
-                tab = next((item for item in self.tabs if document in (item["id"], item["path"])), None)
+                tab = self._find_open_tab(document)
                 if tab is None:
                     raise ValueError("The note for this image is no longer open")
                 captured = dict(tab)
@@ -5289,6 +5314,20 @@ class Studio(QObject):
         if not path.is_relative_to(root) or not path.is_file(): raise ValueError("Diagram source is outside the note folder")
         if path.stat().st_size > 2_000_000: raise ValueError("Diagram source exceeds 2 MB")
         return path.read_text(encoding="utf-8")
+
+    def _find_open_tab(self, reference, *, canonicalize_local: bool = False):
+        if not isinstance(reference, str) or not reference:
+            return None
+        match = next((item for item in self.tabs if reference in (item["id"], item["path"])), None)
+        if match is not None or not canonicalize_local or "\x00" in reference:
+            return match
+        try:
+            if QUrl(reference).isLocalFile() or Path(reference).is_absolute():
+                canonical = str(local_path(reference))
+                return next((item for item in self.tabs if item["path"] == canonical), None)
+        except OSError:
+            pass
+        return None
 
     def _fetch(self, args):
         url = args["url"]

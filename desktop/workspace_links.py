@@ -12,6 +12,7 @@ from pathlib import Path, PurePosixPath
 NOTE_EXTENSIONS = (".md", ".smd", ".fmd", ".markdown", ".txt")
 _EXTENSION_PRIORITY = {ext: idx for idx, ext in enumerate(NOTE_EXTENSIONS)}
 _ENCODED_SEP = re.compile(r"%2f|%5c", re.IGNORECASE)
+_ENCODED_NUL = re.compile(r"%00", re.IGNORECASE)
 
 MAX_SCAN_FILES = 8_000
 MAX_SCAN_DIRS = 2_500
@@ -48,6 +49,8 @@ def _is_link_or_junction(path: Path) -> bool:
             return True
         is_junction = getattr(path, "is_junction", None)
         if callable(is_junction) and is_junction():
+            return True
+        if hasattr(os.path, "isjunction") and os.path.isjunction(path):
             return True
     except OSError:
         return False
@@ -218,16 +221,19 @@ def _has_supported_note_extension(name: str) -> bool:
 
 
 def _validate_target_syntax(raw_target: str) -> str:
-    if not isinstance(raw_target, str):
+    if not isinstance(raw_target, str) or len(raw_target) > 4096:
         raise WorkspaceLinkError("Invalid note link target.")
-    if _ENCODED_SEP.search(raw_target):
+    stripped_fragment = raw_target.split("#", 1)[0].split("?", 1)[0].strip()
+    if not stripped_fragment or "\x00" in stripped_fragment or _ENCODED_NUL.search(stripped_fragment):
+        raise WorkspaceLinkError("Invalid note link target.")
+    if _ENCODED_SEP.search(stripped_fragment):
         raise WorkspaceLinkError("Encoded path separators are not allowed in note links.")
-    cleaned = urllib.parse.unquote(raw_target).strip()
+    cleaned = urllib.parse.unquote(stripped_fragment).strip()
     if not cleaned or "\x00" in cleaned:
         raise WorkspaceLinkError("Invalid note link target.")
     if cleaned.startswith(("/", "\\")) or "\\" in cleaned:
         raise WorkspaceLinkError("Note links must be relative to the workspace folder.")
-    if re.match(r"^[A-Za-z][A-Za-z0-9+.-]*:", cleaned):
+    if re.match(r"^[A-Za-z]:", cleaned) or re.match(r"^[A-Za-z][A-Za-z0-9+.-]*:", cleaned):
         raise WorkspaceLinkError("Unsupported note link scheme.")
     return cleaned
 
@@ -235,7 +241,7 @@ def _validate_target_syntax(raw_target: str) -> str:
 def _resolve_clean_directory(raw_dir: str | os.PathLike[str], label: str) -> Path:
     supplied = Path(os.path.abspath(Path(raw_dir).expanduser()))
     if _is_link_or_junction(supplied):
-        raise WorkspaceLinkError(f"Symlink paths are not allowed for {label}.")
+        raise WorkspaceLinkError(f"Linked note symlink paths are not allowed for {label}.")
     try:
         resolved = supplied.resolve(strict=True)
     except OSError as exc:
@@ -251,10 +257,10 @@ def _resolve_note_directory(
 ) -> Path:
     note_supplied = Path(os.path.abspath(Path(note_raw).expanduser()))
     if _is_link_or_junction(note_supplied):
-        raise WorkspaceLinkError("Symlink note paths are not allowed.")
+        raise WorkspaceLinkError("Linked note symlink paths are not allowed.")
     parent_supplied = note_supplied.parent
     if _is_link_or_junction(parent_supplied):
-        raise WorkspaceLinkError("Symlink note paths are not allowed.")
+        raise WorkspaceLinkError("Linked note symlink paths are not allowed.")
     try:
         note_dir = parent_supplied.resolve(strict=True)
     except OSError as exc:
@@ -266,7 +272,7 @@ def _resolve_note_directory(
         cur = parent_supplied
         while True:
             if _is_link_or_junction(cur):
-                raise WorkspaceLinkError("Symlink note paths are not allowed.")
+                raise WorkspaceLinkError("Linked note symlink paths are not allowed.")
             try:
                 cur_resolved = cur.resolve(strict=True)
             except OSError as exc:
@@ -274,7 +280,7 @@ def _resolve_note_directory(
             if cur_resolved == ws_boundary:
                 break
             if cur.parent == cur:
-                raise WorkspaceLinkError("Symlink note paths are not allowed.")
+                raise WorkspaceLinkError("Linked note symlink paths are not allowed.")
             cur = cur.parent
     return note_dir
 
@@ -286,18 +292,18 @@ def _walk_within_boundary(base_dir: Path, rel_path: str, boundary: Path) -> Path
             continue
         if part == "..":
             if current == boundary:
-                raise WorkspaceLinkError("Link points outside the allowed folder.")
+                raise WorkspaceLinkError("Linked note is outside the authorized folder.")
             parent = current.parent
             if parent != boundary and boundary not in parent.parents:
-                raise WorkspaceLinkError("Link points outside the allowed folder.")
+                raise WorkspaceLinkError("Linked note is outside the authorized folder.")
             current = parent
         else:
             nxt = current / part
             if _is_link_or_junction(nxt):
-                raise WorkspaceLinkError("Symlink note links are not allowed.")
+                raise WorkspaceLinkError("Linked note symlink paths are not allowed.")
             current = nxt
     if current != boundary and boundary not in current.parents:
-        raise WorkspaceLinkError("Link points outside the allowed folder.")
+        raise WorkspaceLinkError("Linked note is outside the authorized folder.")
     return current
 
 
@@ -313,7 +319,7 @@ def _probe_candidate(base_dir: Path, rel_path: str, boundary: Path, *, exact_cas
                 if exact_case and resolved.name != walked.name:
                     continue
                 if resolved != boundary and boundary not in resolved.parents:
-                    raise WorkspaceLinkError("Link points outside the allowed folder.")
+                    raise WorkspaceLinkError("Linked note is outside the authorized folder.")
                 return resolved
         except WorkspaceLinkError:
             raise
@@ -322,24 +328,29 @@ def _probe_candidate(base_dir: Path, rel_path: str, boundary: Path, *, exact_cas
     return None
 
 
+_DEFAULT_CACHE = WorkspaceLinkCache()
+
+
 def resolve_workspace_link(
     target: str,
     *,
-    wikilink: bool,
+    wikilink: bool = False,
     note_path: str | os.PathLike[str] | None,
-    workspace_folder: str | os.PathLike[str] | None,
-    cache: WorkspaceLinkCache,
+    workspace_folder: str | os.PathLike[str] | None = None,
+    cache: WorkspaceLinkCache | None = None,
 ) -> Path:
-    """Resolve a relative Markdown link or [[wikilink]] safely within the workspace."""
+    """Resolve a relative Markdown link or [[wikilink]] safely within the authorized boundary."""
     cleaned = _validate_target_syntax(target)
     is_explicit_relative = not wikilink or cleaned.startswith(("./", "../"))
     has_note_path = bool(note_path and str(note_path))
     has_workspace_folder = bool(workspace_folder and str(workspace_folder))
 
-    if not has_note_path and is_explicit_relative:
-        raise WorkspaceLinkError("Save this draft before following relative note links.")
-    if not has_note_path and not has_workspace_folder:
-        raise WorkspaceLinkError("Save this draft or open a folder before following note links.")
+    if not has_note_path and (is_explicit_relative or not has_workspace_folder):
+        raise WorkspaceLinkError("Save this note before opening linked notes.")
+
+    suffix = Path(cleaned).suffix.lower()
+    if not wikilink and suffix and suffix not in NOTE_EXTENSIONS:
+        raise WorkspaceLinkError("Only Markdown and Super MD notes can be opened from relative links.")
 
     ws_boundary: Path | None = None
     if has_workspace_folder:
@@ -365,6 +376,12 @@ def resolve_workspace_link(
         found = _probe_candidate(note_dir, cleaned, boundary)
         if found is not None:
             return found
+        if (not cleaned.startswith(("./", "../"))
+                and ".." not in PurePosixPath(cleaned).parts
+                and note_dir != boundary):
+            from_root = _probe_candidate(boundary, cleaned, boundary)
+            if from_root is not None:
+                return from_root
         raise WorkspaceLinkError(f"Linked note not found: {cleaned}")
 
     # Wikilink resolution:
@@ -379,7 +396,8 @@ def resolve_workspace_link(
             return from_root
 
     # 2. Bounded, cached background scan across the workspace folder.
-    entries = cache.scan(boundary)
+    active_cache = cache if cache is not None else _DEFAULT_CACHE
+    entries = active_cache.scan(boundary)
     has_ext = _has_supported_note_extension(cleaned)
     cleaned_fold = cleaned.casefold()
     note_rel_dir = ""

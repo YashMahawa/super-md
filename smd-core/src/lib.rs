@@ -584,7 +584,7 @@ fn normalize_obsidian_embeds(input: &str) -> String {
 pub fn image_sources(markdown: &str) -> Vec<String> {
     let body = frontmatter::strip_frontmatter(markdown);
     let stripped = strip_percent_comments(body);
-    let normalized = normalize_obsidian_embeds(&normalize_callouts_body(&stripped));
+    let normalized = normalize_callouts_body(&stripped);
     let mut sources = Vec::new();
     let options = Options::ENABLE_TABLES | Options::ENABLE_FOOTNOTES | Options::ENABLE_STRIKETHROUGH | Options::ENABLE_SUBSCRIPT | Options::ENABLE_SUPERSCRIPT | Options::ENABLE_TASKLISTS | Options::ENABLE_MATH;
     let mut events = Parser::new_ext(&normalized, options);
@@ -1161,7 +1161,7 @@ impl<'a> Renderer<'a> {
 pub(crate) fn render_fragment(markdown: &str, assets: &HashMap<String, Vec<u8>>) -> Result<String> {
     let body = frontmatter::strip_frontmatter(markdown);
     let stripped = strip_percent_comments(body);
-    let normalized = normalize_table_math(&normalize_obsidian_embeds(&normalize_callouts_body(&stripped)));
+    let normalized = normalize_table_math(&normalize_callouts_body(&stripped));
     let events = study::enrich_events(&normalized, Options::ENABLE_TABLES | Options::ENABLE_STRIKETHROUGH | Options::ENABLE_SUBSCRIPT | Options::ENABLE_SUPERSCRIPT | Options::ENABLE_MATH);
     Renderer { events: events.into_iter().peekable(), assets, footnotes: HashMap::new(), headings: HashMap::new(), heading_counts: HashMap::new() }.render(None)
 }
@@ -1173,7 +1173,7 @@ pub fn source(markdown: &str, options: &PdfOptions, assets: &HashMap<String, Vec
         None => (String::new(), markdown.strip_prefix('\u{feff}').unwrap_or(markdown)),
     };
     let stripped = strip_percent_comments(raw_body);
-    let normalized = normalize_table_math(&normalize_obsidian_embeds(&normalize_callouts_body(&stripped)));
+    let normalized = normalize_table_math(&normalize_callouts_body(&stripped));
     let events = study::enrich_events(&normalized, Options::ENABLE_TABLES | Options::ENABLE_STRIKETHROUGH | Options::ENABLE_SUBSCRIPT | Options::ENABLE_SUPERSCRIPT | Options::ENABLE_TASKLISTS | Options::ENABLE_MATH | Options::ENABLE_FOOTNOTES);
     let mut headings = HashMap::new(); let mut current = None::<String>;
     for event in &events { match event {

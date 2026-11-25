@@ -160,7 +160,7 @@ class WorkspaceLinkResolverTest {
             model.openWorkspaceLink(draftId, "./Specs/Sub Note.md", "Deep Section", wikilink = false)
         }
         assertFalse(draftResult.getBoolean("opened"))
-        assertTrue(model.state.value.message.orEmpty().contains("Save this note first"))
+        assertTrue(model.state.value.message.orEmpty().contains("Save this note before opening linked notes."))
         assertEquals("# Unsaved local draft", model.state.value.active.content)
 
         // 2. Open standalone file WITHOUT folder permission; edit it and follow a link -> prompts for folder access

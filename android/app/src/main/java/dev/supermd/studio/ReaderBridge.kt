@@ -94,6 +94,7 @@ internal class ReaderBridge(
                         true
                     }
                     "reader_overlay_changed" -> { model.overlay(args.optBoolean("open"), args.optBoolean("image")); true }
+                    "editor_focus_changed" -> { model.editorFocus(args.optBoolean("focused")); true }
                     "copy_image_native" -> {
                         val uri = withContext(Dispatchers.IO) {
                             val body = args.opt("body") as? String ?: error("Clipboard image is invalid")
@@ -124,7 +125,13 @@ internal class ReaderBridge(
                     "load_asset" -> model.asset(args.getString("documentPath"), args.getString("source"))
                     "load_text_asset" -> model.textAsset(args.getString("documentPath"), args.getString("source"))
                     "open_workspace_link", "open_relative_note" -> {
-                        val fragment = args.optString("fragment", "").ifEmpty { args.optString("heading", "") }
+                        val fragment = if (args.has("fragment") && !args.isNull("fragment")) {
+                            args.opt("fragment") as? String ?: error("Invalid heading target")
+                        } else if (args.has("heading") && !args.isNull("heading")) {
+                            args.opt("heading") as? String ?: error("Invalid heading target")
+                        } else {
+                            ""
+                        }
                         val wikilink = if (command == "open_workspace_link") args.optBoolean("wikilink", false) else false
                         model.openWorkspaceLink(
                             args.optString("documentPath", ""),

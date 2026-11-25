@@ -8,6 +8,7 @@ import {applyDocumentZoom,invalidateDocumentZoom,refreshDocumentExtent} from './
 import {invoke} from './nativeBridge';
 import {isLocalHref,parseRelativeNoteLink,safeDecodeURIComponent,type ClassifiedRenderedLink} from './workspaceLinks';
 export {isLocalHref,parseRelativeNoteLink};
+export const UNSAVED_RELATIVE_NOTE_NOTICE = "Save this note before opening linked notes.";
 const jumps=new WeakMap<Element,{stop:()=>void}>();
 /** A user's zoom/pan wins over the settling frames of a preceding link jump. */
 export function cancelHeadingNavigation(root:Element|null):void {

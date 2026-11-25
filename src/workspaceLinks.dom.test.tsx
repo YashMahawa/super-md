@@ -509,8 +509,14 @@ describe("Source mode Ctrl/Cmd+Click workspace link navigation", () => {
       command: "open_workspace_link",
       args: { documentPath: "", target: "Task Note", fragment: "", wikilink: true },
     });
-    expect(readerRootEl.querySelector('[role="status"].reader-link-notice')?.textContent).toBe(
+    expect(readerRootEl.querySelector('[role="status"].reader-link-notice > span')?.textContent).toBe(
       "Save this note before opening linked notes.",
     );
+    const dismissButton = readerRootEl.querySelector<HTMLButtonElement>('[role="status"].reader-link-notice button')!;
+    expect(dismissButton).not.toBeNull();
+    await act(async () => {
+      dismissButton.click();
+    });
+    expect(readerRootEl.querySelector('[role="status"].reader-link-notice')).toBeNull();
   });
 });

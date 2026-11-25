@@ -151,7 +151,7 @@ class WorkspaceLinkResolverUnitTest(unittest.TestCase):
             # Reject symlink targets and symlinked/junction directories inside workspace
             symlink_note = vault / "Symlink.md"
             if _try_create_link(symlink_note, secret, target_is_directory=False):
-                with self.assertRaisesRegex(WorkspaceLinkError, "Symlink|not found"):
+                with self.assertRaisesRegex(WorkspaceLinkError, r"(?i)symlink|not found"):
                     resolve_workspace_link(
                         "./Symlink.md",
                         wikilink=False,
@@ -161,7 +161,7 @@ class WorkspaceLinkResolverUnitTest(unittest.TestCase):
                     )
             linked_dir = vault / "LinkedDir"
             if _try_create_link(linked_dir, outside_dir, target_is_directory=True):
-                with self.assertRaisesRegex(WorkspaceLinkError, "Symlink|not found"):
+                with self.assertRaisesRegex(WorkspaceLinkError, r"(?i)symlink|not found"):
                     resolve_workspace_link(
                         "./LinkedDir/Hidden.md",
                         wikilink=False,
@@ -169,7 +169,7 @@ class WorkspaceLinkResolverUnitTest(unittest.TestCase):
                         workspace_folder=vault,
                         cache=cache,
                     )
-                with self.assertRaisesRegex(WorkspaceLinkError, "Symlink"):
+                with self.assertRaisesRegex(WorkspaceLinkError, r"(?i)symlink"):
                     resolve_workspace_link(
                         "./Hidden.md",
                         wikilink=False,
@@ -179,7 +179,7 @@ class WorkspaceLinkResolverUnitTest(unittest.TestCase):
                     )
 
             # Reject relative link from unsaved draft (note_path="") with clear notice
-            with self.assertRaisesRegex(WorkspaceLinkError, "Save this draft"):
+            with self.assertRaisesRegex(WorkspaceLinkError, "Save this note"):
                 resolve_workspace_link(
                     "./Note.md",
                     wikilink=False,
@@ -394,7 +394,7 @@ class StudioWorkspaceLinkIntegrationTest(unittest.TestCase):
             }),
         )
         self._wait_until(lambda: any(r[0] == "unsaved-rel" for r in replies))
-        self.assertIn("Save this draft", studio.message)
+        self.assertIn("Save this note", studio.message)
         self.assertEqual(studio._current()["content"], "Keep my draft")
 
         # External URL opens only http/https/mailto and never local paths
@@ -421,7 +421,7 @@ class StudioWorkspaceLinkIntegrationTest(unittest.TestCase):
         if os.name == "posix" and hasattr(os, "getxattr"):
             bookmark_alias = vault / "AliasNote.md"
             bookmark_alias.write_bytes(b"book\x00\x00\x00\x00mark\x00\x00\x00\x00# Hidden\n")
-            with self.assertRaisesRegex(WorkspaceLinkError, "Symlink|not found"):
+            with self.assertRaisesRegex(WorkspaceLinkError, r"(?i)symlink|not found"):
                 resolve_workspace_link(
                     "AliasNote.md",
                     wikilink=False,

@@ -65,7 +65,7 @@ data class PendingSeededFind(
     val targetTabId: String? = null,
     val targetUri: String? = null,
 )
-data class StudioState(val latexAutofix:Boolean=false, val typewriterScroll:Boolean=false, val selectionAssistant:String="chatgpt", val centerLock:Boolean=true, val customTheme:String="", val activeThemeKind:String="builtin", val activeThemeId:String="", val customThemeSource:String="", val savedThemes:List<SavedThemeEntry> = emptyList(), val patternKind:String="", val patternOpacity:Float=-1f, val patternSize:Float=0f, val patternSpacing:Float=0f, val restorePosition:Boolean=true, val fullDocumentAccessibility:Boolean=false, val startup:String="restore", val imageAppearance:String="original", val svgAppearance:String="original", val imageContrast:Float=1.25f, val spellCheck:Boolean = false, val grammarCheck:Boolean = false, val accent: String = "system", val widthPercent: Float = 100f, val lineHeight: Float = 1.65f, val autosave: Boolean = true, val customFonts: List<String> = emptyList(), val readerOverlay: Boolean = false, val zoomCommand: Long = 0, val tabs: List<Note> = listOf(Note(name = "Welcome.md", content = sample, saved = sample)), val closedTabs: List<Note> = emptyList(), val activeId: String = "", val mode: String = "live", val fullscreen: Boolean = false, val normalZoom: Float = 100f, val fullscreenZoom: Float = 100f, val theme: String = "system", val fullscreenTheme: String = "black", val motion: Boolean = true, val font: String = "Manrope", val size: Float = 15f, val folder: String? = null, val folderRelative: String = "", val files: List<FileEntry> = emptyList(), val busy: Boolean = false, val message: String? = null, val error: String? = null, val welcomed: Boolean = false, val pdf: String = "{\"pageSize\":\"a4\",\"margin\":14,\"fontSize\":10.5,\"lineHeight\":1.4,\"paragraphSpacing\":0.65,\"fontFamily\":\"Manrope\",\"pageNumbers\":true}", val storageReport: StorageReport? = null, val storageScanning: Boolean = false, val conflictedTabIds: Set<String> = emptySet(), val pendingCloseNoteId: String? = null, val pendingSaveConflictNoteId: String? = null, val pendingHeading: PendingHeadingJump? = null, val folderAccessPrompt: WorkspaceFolderPrompt? = null) {
+data class StudioState(val latexAutofix:Boolean=false, val typewriterScroll:Boolean=false, val selectionAssistant:String="chatgpt", val centerLock:Boolean=true, val customTheme:String="", val activeThemeKind:String="builtin", val activeThemeId:String="", val customThemeSource:String="", val savedThemes:List<SavedThemeEntry> = emptyList(), val patternKind:String="", val patternOpacity:Float=-1f, val patternSize:Float=0f, val patternSpacing:Float=0f, val restorePosition:Boolean=true, val fullDocumentAccessibility:Boolean=false, val startup:String="restore", val imageAppearance:String="original", val svgAppearance:String="original", val imageContrast:Float=1.25f, val spellCheck:Boolean = false, val grammarCheck:Boolean = false, val accent: String = "system", val widthPercent: Float = 100f, val lineHeight: Float = 1.65f, val autosave: Boolean = true, val customFonts: List<String> = emptyList(), val readerOverlay: Boolean = false, val editorFocused: Boolean = false, val zoomCommand: Long = 0, val tabs: List<Note> = listOf(Note(name = "Welcome.md", content = sample, saved = sample)), val closedTabs: List<Note> = emptyList(), val activeId: String = "", val mode: String = "live", val fullscreen: Boolean = false, val normalZoom: Float = 100f, val fullscreenZoom: Float = 100f, val theme: String = "system", val fullscreenTheme: String = "black", val motion: Boolean = true, val font: String = "Manrope", val size: Float = 15f, val folder: String? = null, val folderRelative: String = "", val files: List<FileEntry> = emptyList(), val busy: Boolean = false, val message: String? = null, val error: String? = null, val welcomed: Boolean = false, val pdf: String = "{\"pageSize\":\"a4\",\"margin\":14,\"fontSize\":10.5,\"lineHeight\":1.4,\"paragraphSpacing\":0.65,\"fontFamily\":\"Manrope\",\"pageNumbers\":true}", val storageReport: StorageReport? = null, val storageScanning: Boolean = false, val conflictedTabIds: Set<String> = emptySet(), val pendingCloseNoteId: String? = null, val pendingSaveConflictNoteId: String? = null, val pendingHeading: PendingHeadingJump? = null, val folderAccessPrompt: WorkspaceFolderPrompt? = null) {
     val active get() = tabs.find { it.id == activeId } ?: tabs.firstOrNull() ?: EMPTY_NOTE
     val zoom get() = if (fullscreen) fullscreenZoom else normalZoom
     val activeConflicted get() = active.id.isNotEmpty() && active.id in conflictedTabIds
@@ -132,6 +132,7 @@ class StudioViewModel(app: Application, val workspaceKey: String = "main") : And
     private val blockedDocumentWrites = mutableSetOf<String>()
     private val promptedDocumentAccess = mutableSetOf<String>()
     private val promptedAssetAccess = mutableSetOf<String>()
+    private val pendingAccessHeadings = java.util.concurrent.ConcurrentHashMap<String, String>()
     internal val readerFolderIndex = ReaderFolderIndex()
     private val readerCapabilities = java.util.concurrent.CopyOnWriteArraySet<ReaderAssetCapabilities>()
     internal fun attachReaderCapabilities(capabilities: ReaderAssetCapabilities) { readerCapabilities += capabilities }
@@ -1778,7 +1779,7 @@ class StudioViewModel(app: Application, val workspaceKey: String = "main") : And
     fun mode(value: String) {
         val expectedActiveId=mutable.value.active.id
         viewModelScope.launch {
-            val accepted=performReaderBarrier(expectedActiveId) {change {it.copy(mode=value)}}
+            val accepted=performReaderBarrier(expectedActiveId) {change {it.copy(mode=value, editorFocused=if(value=="reader") false else it.editorFocused)}}
             if(!accepted)readerBarrierFailed()
         }
     }
@@ -1829,6 +1830,7 @@ class StudioViewModel(app: Application, val workspaceKey: String = "main") : And
         prefs.edit().putBoolean("typewriterScroll",enabled).apply()
     }
     fun overlay(open: Boolean, image: Boolean = false) { mutable.value=mutable.value.copy(readerOverlay=open); imageMutable.value=image }
+    fun editorFocus(focused: Boolean) { if (mutable.value.editorFocused != focused) mutable.value = mutable.value.copy(editorFocused = focused) }
     fun importFont(uri: Uri) = viewModelScope.launch {
         try { val family=withContext(Dispatchers.IO) {fonts.import(uri)};appearance(font=family);prefs.edit().putLong("fonts",System.currentTimeMillis()).apply();mutable.value=mutable.value.copy(customFonts=fonts.families,message="Imported $family for reading and PDF export") }
         catch(error: Exception) {fail("Could not import font: ${error.message}")}
@@ -1902,6 +1904,13 @@ class StudioViewModel(app: Application, val workspaceKey: String = "main") : And
         for (tree in persisted) {
             if (candidates.none { it == tree }) candidates.add(tree)
         }
+        if (noteUri != null && DocumentsContract.isTreeUri(noteUri)) {
+            runCatching {
+                DocumentsContract.buildTreeDocumentUri(noteUri.authority, DocumentsContract.getTreeDocumentId(noteUri))
+            }.getOrNull()?.let { embedded ->
+                if (candidates.none { it == embedded }) candidates.add(embedded)
+            }
+        }
         return candidates
     }
     suspend fun openWorkspaceLink(
@@ -1915,29 +1924,34 @@ class StudioViewModel(app: Application, val workspaceKey: String = "main") : And
         val trimmedFragment = fragment.trim()
         require(trimmedTarget.length in 1..4096 && trimmedFragment.length <= 1024) { "Invalid workspace link" }
         val stateSnapshot = mutable.value
-        val sourceNote = stateSnapshot.tabs.firstOrNull {
-            documentPath.isNotBlank() && (it.id == documentPath || it.uri?.let { raw -> sameDocumentUri(raw, documentPath) } == true)
-        } ?: stateSnapshot.active
+        val sourceNote = if (documentPath.isNotBlank()) {
+            openNoteForDocument(documentPath) ?: run {
+                val notice = "The note for this link is no longer open."
+                mutable.value = mutable.value.copy(busy = false, message = notice)
+                return JSONObject().put("opened", false).put("message", notice)
+            }
+        } else {
+            stateSnapshot.active
+        }
         val explicitRelative = isExplicitRelativeWorkspaceTarget(trimmedTarget, wikilink)
         val openFolder = stateSnapshot.folder?.let(Uri::parse)?.takeIf { DocumentsContract.isTreeUri(it) }
 
-        if (sourceNote.uri == null) {
-            val notice = if (explicitRelative) {
-                "Save this note first before following relative links."
-            } else if (openFolder == null) {
-                "Save this note or open a folder before following workspace links."
-            } else null
-            if (notice != null) {
-                mutable.value = mutable.value.copy(message = notice)
+        if (sourceNote.uri.isNullOrBlank()) {
+            if (explicitRelative || openFolder == null) {
+                val notice = "Save this note before opening linked notes."
+                mutable.value = mutable.value.copy(busy = false, message = notice)
                 return JSONObject().put("opened", false).put("message", notice)
             }
         }
 
-        val sourceUri = sourceNote.uri?.let(Uri::parse)
+        val sourceUri = sourceNote.uri?.takeIf { it.isNotBlank() }?.let(Uri::parse)
         val candidates = if (sourceUri != null) candidateWorkspaceTrees(sourceUri) else emptyList()
         val resolvedResult = try {
             withContext(Dispatchers.IO) {
                 val cleaned = sanitizeWorkspaceLinkTarget(trimmedTarget)
+                if (sourceUri != null && sourceUri.scheme == "file") {
+                    return@withContext resolveLocalFileWorkspaceLink(sourceUri, cleaned, wikilink)
+                }
                 if (sourceUri == null) {
                     return@withContext workspaceLinks.resolve(openFolder!!, noteRelative = null, rawTarget = cleaned, wikilink = true)
                 }
@@ -1956,24 +1970,47 @@ class StudioViewModel(app: Application, val workspaceKey: String = "main") : And
                 }
                 // Validate lexical containment upfront even when no folder tree is granted yet,
                 // so escaped ../, encoded separators, schemes, and unsupported extensions fail immediately.
-                val standaloneParts = workspaceRelativePathParts("", cleaned)
-                val (_, standaloneExt) = standaloneParts.last().let { seg ->
-                    val dot = seg.lastIndexOf('.')
-                    if (dot <= 0 || dot == seg.lastIndex) seg to "" else seg.substring(0, dot) to seg.substring(dot + 1).lowercase()
+                val candidateLists = expandWorkspaceCandidatePaths("", cleaned, wikilink)
+                linkedAssetUri(sourceNote, cleaned)?.let { grantedUri ->
+                    val resolvedGranted = documentAccess.resolve(grantedUri)
+                    val grantedReadable = documentAccess.hasReadGrant(resolvedGranted) &&
+                        runCatching { resolver.openInputStream(resolvedGranted)?.use { true } == true }.getOrDefault(false)
+                    if (grantedReadable) {
+                        val firstParts = candidateLists.first()
+                        return@withContext WorkspaceResolvedNote(resolvedGranted, firstParts.last(), firstParts.joinToString("/"))
+                    }
                 }
-                if (!wikilink && standaloneExt.isNotEmpty() && standaloneExt !in WORKSPACE_NOTE_EXTENSIONS) {
-                    throw WorkspaceLinkException("Unsupported note extension: .$standaloneExt")
-                }
-                if (sourceUri.scheme == "file") {
-                    return@withContext resolveLocalFileWorkspaceLink(sourceUri, cleaned, wikilink)
+                val documentId = runCatching { DocumentsContract.getDocumentId(sourceUri) }.getOrDefault("")
+                val sep = maxOf(documentId.lastIndexOf('/'), documentId.lastIndexOf(':'))
+                for (parts in candidateLists) {
+                    val relJoined = parts.joinToString("/")
+                    val siblingDocId = if (sep >= 0) documentId.substring(0, sep + 1) + relJoined else relJoined
+                    val rawCandidate = if (documentId.isNotEmpty() && sourceUri.authority != null) {
+                        DocumentsContract.buildDocumentUri(sourceUri.authority, siblingDocId)
+                    } else {
+                        sourceUri.buildUpon().path((sourceUri.path?.substringBeforeLast('/', "") ?: "") + "/" + relJoined).build()
+                    }
+                    val openMatch = mutable.value.tabs.firstOrNull { tab ->
+                        tab.uri?.let { existingUri -> sameDocumentUri(existingUri, rawCandidate.toString()) } == true
+                    }?.uri?.let(Uri::parse)
+                    val candidateUri = documentAccess.resolve(openMatch ?: rawCandidate)
+                    if (!documentAccess.hasReadGrant(candidateUri)) continue
+                    val readable = runCatching { resolver.openInputStream(candidateUri)?.use { true } == true }.getOrDefault(false)
+                    if (readable) {
+                        return@withContext WorkspaceResolvedNote(candidateUri, parts.last(), relJoined)
+                    }
                 }
                 null
             }
         } catch (cancelled: kotlinx.coroutines.CancellationException) {
             throw cancelled
+        } catch (security: SecurityException) {
+            val msg = security.message ?: DOCUMENT_ACCESS_MESSAGE
+            mutable.value = mutable.value.copy(busy = false, message = msg)
+            return JSONObject().put("opened", false).put("message", msg)
         } catch (error: WorkspaceLinkException) {
-            val msg = error.message ?: "Could not resolve note link"
-            mutable.value = mutable.value.copy(message = msg)
+            val msg = error.message ?: "Invalid relative note path."
+            mutable.value = mutable.value.copy(busy = false, message = msg)
             return JSONObject().put("opened", false).put("message", msg)
         }
 
@@ -2006,6 +2043,9 @@ class StudioViewModel(app: Application, val workspaceKey: String = "main") : And
             errorPrefix = "Could not open linked note",
         )
     }
+
+    suspend fun openRelativeNote(documentPath: String, target: String, heading: String? = null): JSONObject =
+        openWorkspaceLink(documentPath, target, heading.orEmpty(), wikilink = false)
     private fun loadNoteForOpen(uri: Uri, relative: String?): Note {
         documentAccess.persist(uri)
         val target = documentAccess.resolve(uri)
@@ -2058,6 +2098,7 @@ class StudioViewModel(app: Application, val workspaceKey: String = "main") : And
         errorPrefix: String = "Could not open note",
         request: Long = openRequests.begin(),
     ): JSONObject {
+        val requestedHeading = headingFragment?.trim()?.takeIf { it.isNotEmpty() }
         try {
             val note = withContext(Dispatchers.IO) { loadNoteForOpen(uri, relative) }
             if (note.uri?.let { documentAccess.hasWriteGrant(Uri.parse(it)) } == true) clearDocumentAccessFailure(uri.toString())
@@ -2076,7 +2117,14 @@ class StudioViewModel(app: Application, val workspaceKey: String = "main") : And
                         ?.let { scheduleAutosave(it.id) }
                 }
                 val activate = openRequests.isCurrent(request)
-                openedTabId = retainOpenedNote(note, activate = activate, headingFragment = headingFragment?.takeIf { activate && it.isNotBlank() })
+                val carriedHeading = requestedHeading ?: note.uri?.let { targetUri ->
+                    pendingAccessHeadings.keys.firstOrNull { key -> sameDocumentUri(key, targetUri) }?.let(pendingAccessHeadings::remove)
+                }
+                openedTabId = retainOpenedNote(
+                    note,
+                    activate = activate,
+                    headingFragment = carriedHeading?.takeIf { activate && it.isNotBlank() },
+                )
             }
             if (!accepted || openedTabId == null) {
                 if (!openRequests.isCurrent(request)) retainOpenedNote(note, activate = false)
@@ -2089,6 +2137,7 @@ class StudioViewModel(app: Application, val workspaceKey: String = "main") : And
         } catch (error: Exception) {
             if (!alwaysReportError && !openRequests.isCurrent(request)) return JSONObject().put("opened", false)
             val msg = if (isDocumentAccessFailure(error)) {
+                if (requestedHeading != null) pendingAccessHeadings[uri.toString()] = requestedHeading
                 requestDocumentAccess(uri.toString(), mutable.value.tabs.firstOrNull { it.uri?.let { raw -> sameDocumentUri(raw, uri.toString()) } == true }, writing = false, explicit = true)
             } else {
                 "$errorPrefix: ${error.message}".also(::fail)
@@ -2096,9 +2145,9 @@ class StudioViewModel(app: Application, val workspaceKey: String = "main") : And
             return JSONObject().put("opened", false).put("message", msg)
         }
     }
-    fun open(uri: Uri, relative: String? = null): Job {
+    fun open(uri: Uri, relative: String? = null, pendingHeading: String? = null): Job {
         val request = openRequests.begin()
-        return viewModelScope.launch { openNoteInternal(uri, relative, request = request) }
+        return viewModelScope.launch { openNoteInternal(uri, relative, headingFragment = pendingHeading, request = request) }
     }
     internal suspend fun saveAgentPortable(id: String, expectedRevision: String) {
         if (requestWriteAccessIfBlocked(id)) throw SecurityException(DOCUMENT_ACCESS_MESSAGE)
@@ -2723,9 +2772,39 @@ class StudioViewModel(app: Application, val workspaceKey: String = "main") : And
         if (!seed.targetUri.isNullOrBlank() && !note.uri.isNullOrBlank() && sameDocumentUri(note.uri, seed.targetUri)) return true
         return false
     }
-    private fun noteForAsset(document: String): Note = mutable.value.tabs.firstOrNull {
+    private data class SafTreeMatch(val folderUri: Uri, val rootId: String, val relativePath: String)
+
+    private fun openNoteForDocument(document: String): Note? = mutable.value.tabs.firstOrNull {
         it.id == document || it.uri?.let { uri -> sameDocumentUri(uri, document) } == true
-    } ?: error("The asset's document is no longer open")
+    }
+
+    private fun noteForAsset(document: String): Note =
+        openNoteForDocument(document) ?: error("The asset's document is no longer open")
+
+    private fun findSafTree(noteUri: Uri, allowEmbeddedTreeFallback: Boolean = false): SafTreeMatch? {
+        val documentId = runCatching { DocumentsContract.getDocumentId(noteUri) }.getOrDefault("")
+        val persisted = resolver.persistedUriPermissions
+            .filter { it.isReadPermission && DocumentsContract.isTreeUri(it.uri) && it.uri.authority == noteUri.authority }
+            .mapNotNull { permission ->
+                val root = runCatching { DocumentsContract.getTreeDocumentId(permission.uri) }.getOrNull() ?: return@mapNotNull null
+                val trimmed = root.trimEnd('/')
+                val contained = documentId.startsWith("$trimmed/") || root.endsWith(':') && documentId.startsWith(root) || allowEmbeddedTreeFallback && documentId == root
+                if (contained) root to permission.uri else null
+            }
+            .maxByOrNull { it.first.length }
+        val active = persisted ?: if (allowEmbeddedTreeFallback && DocumentsContract.isTreeUri(noteUri)) {
+            runCatching {
+                val root = DocumentsContract.getTreeDocumentId(noteUri)
+                root to DocumentsContract.buildTreeDocumentUri(noteUri.authority, root)
+            }.getOrNull()
+        } else null
+        val (rootId, folderUri) = active ?: return null
+        val trimmed = rootId.trimEnd('/')
+        val relative = documentId.takeIf { it.startsWith("$trimmed/") }?.removePrefix("$trimmed/")
+            ?: documentId.takeIf { rootId.endsWith(':') && it.startsWith(rootId) }?.removePrefix(rootId)?.trimStart('/')
+            ?: if (allowEmbeddedTreeFallback) "" else return null
+        return SafTreeMatch(folderUri, rootId, relative)
+    }
 
     /** Resolves only an already granted tree or an individually user-selected linked file. */
     private fun resolveLinkedAssetUri(note: Note, source: String): Uri {
@@ -2733,17 +2812,9 @@ class StudioViewModel(app: Application, val workspaceKey: String = "main") : And
         note.relative?.let { readerAssetPathParts(it.substringBeforeLast('/', ""), source) }
         linkedAssetUri(note, source)?.let { return it }
         val noteUri = note.uri?.let(Uri::parse) ?: throw LinkedAssetAccessRequiredException()
-        val documentId = runCatching { DocumentsContract.getDocumentId(noteUri) }.getOrDefault("")
-        val folderUri = resolver.persistedUriPermissions.filter { it.isReadPermission && DocumentsContract.isTreeUri(it.uri) && it.uri.authority == noteUri.authority }.mapNotNull { permission ->
-            val root = runCatching { DocumentsContract.getTreeDocumentId(permission.uri) }.getOrNull() ?: return@mapNotNull null
-            if (documentId.startsWith("$root/") || root.endsWith(':') && documentId.startsWith(root)) root to permission.uri else null
-        }.maxByOrNull { it.first.length }?.second ?: throw LinkedAssetAccessRequiredException()
-        val rootId = DocumentsContract.getTreeDocumentId(folderUri)
-        val relative = documentId.takeIf { it.startsWith("$rootId/") }?.removePrefix("$rootId/")
-            ?: documentId.takeIf { rootId.endsWith(':') && it.startsWith(rootId) }?.removePrefix(rootId)?.trimStart('/')
-            ?: throw LinkedAssetAccessRequiredException()
-        val parts = readerAssetPathParts(relative.substringBeforeLast('/', ""), source)
-        return readerFolderIndex.resolve(resolver, note.id, folderUri, rootId, parts).uri
+        val tree = findSafTree(noteUri) ?: throw LinkedAssetAccessRequiredException()
+        val parts = readerAssetPathParts(tree.relativePath.substringBeforeLast('/', ""), source)
+        return readerFolderIndex.resolve(resolver, note.id, tree.folderUri, tree.rootId, parts).uri
     }
 
     suspend fun textAsset(document: String, source: String): JSONObject = withContext(Dispatchers.IO) {
