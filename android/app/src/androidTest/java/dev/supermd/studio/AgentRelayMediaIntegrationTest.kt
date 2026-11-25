@@ -34,8 +34,6 @@ class AgentRelayMediaIntegrationTest {
         noteFile.outputStream().use { media.writeFmd(it, originalMarkdown, initialAssets) }
         val uri = Uri.fromFile(noteFile)
         val launch = Intent(app, MainActivity::class.java).putExtra("workspace", workspace)
-            .setDataAndType(uri, "application/octet-stream")
-            .addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION or Intent.FLAG_GRANT_WRITE_URI_PERMISSION)
         val scenario = ActivityScenario.launch<MainActivity>(launch)
         var model: StudioViewModel? = null
         var originalAutosave: Boolean? = null
@@ -46,6 +44,7 @@ class AgentRelayMediaIntegrationTest {
                 model = ViewModelProvider(owner)[StudioViewModel::class.java]
                 originalAutosave = model!!.state.value.autosave
                 model!!.reading(autosave = false)
+                model!!.open(uri)
             }
             waitUntil(20_000) {
                 val current = model?.state?.value

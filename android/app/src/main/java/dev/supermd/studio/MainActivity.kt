@@ -168,23 +168,24 @@ class MainActivity : ComponentActivity() {
         // Create this task's workspace before RESUMED/lifecycle consumers can
         // request it. Compose's first frame may otherwise run after onResume.
         val windowModel = model
-        intent?.data?.let(windowModel::retainDocumentAccess)
         setContent { Studio(windowModel, this) }
         val savedDispatcherSession = savedInstanceState?.getString(OPEN_DISPATCHER_SESSION)
         if (savedDispatcherSession != windowModel.openDispatcherSessionId) {
-            intent?.data?.let { uri ->
-                if (savedInstanceState == null || windowModel.state.value.let { state ->
-                        state.tabs.none { it.uri == uri.toString() } && state.closedTabs.none { it.uri == uri.toString() }
-                    }) {
-                    windowModel.requestInitialOpen(uri)
-                }
-            }
+            handleExternalDocumentIntent(intent, savedInstanceState, initial = true, targetModel = windowModel)
         }
     }
     override fun onNewIntent(intent: Intent) {
         super.onNewIntent(intent)
         setIntent(intent)
-        intent.data?.let { requestOpen(it) }
+        handleExternalDocumentIntent(intent, savedInstanceState = null, initial = false, targetModel = model)
+    }
+    private fun handleExternalDocumentIntent(
+        incoming: Intent?,
+        savedInstanceState: Bundle?,
+        initial: Boolean,
+        targetModel: StudioViewModel,
+    ) {
+        ExternalDocumentEntryGuard.dispatchIncomingIntent(this, incoming, savedInstanceState, initial, targetModel)
     }
     fun requestOpen(uri: android.net.Uri, relative: String? = null) {
         model.retainDocumentAccess(uri)
@@ -658,7 +659,11 @@ private object NoMotionScheme : MotionScheme {
         onDispose { model.readerFlushRequester = null }
     }
     DisposableEffect(activity, model, readerReady) {
-        val handler = if (readerReady) OpenIntentDispatcher.Handler<android.net.Uri> { uri, relative -> model.open(uri, relative) } else null
+        val handler = if (readerReady) {
+            OpenIntentDispatcher.Handler<OpenDocumentTarget> { target, relative ->
+                model.open(target.uri, relative, externalIntentFlags = target.externalIntentFlags)
+            }
+        } else null
         model.attachReaderOpenHandler(handler)
         onDispose { if (handler != null) model.detachReaderOpenHandler(handler) }
     }

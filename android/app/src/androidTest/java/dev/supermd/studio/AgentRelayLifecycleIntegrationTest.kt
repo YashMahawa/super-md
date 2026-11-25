@@ -248,9 +248,7 @@ class AgentRelayLifecycleIntegrationTest {
         val media = MediaStorage(app)
         val input = File(app.cacheDir, "portable-save-${UUID.randomUUID()}.smd")
         input.outputStream().use { media.writeFmd(it, markdown, JSONObject().put("assets/original.svg", media.portableImageData("image/svg+xml", sourceSvg))) }
-        val scenario = ActivityScenario.launch<MainActivity>(Intent(app, MainActivity::class.java).putExtra("workspace", workspace)
-            .setDataAndType(Uri.fromFile(input), "application/octet-stream")
-            .addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION or Intent.FLAG_GRANT_WRITE_URI_PERMISSION))
+        val scenario = ActivityScenario.launch<MainActivity>(Intent(app, MainActivity::class.java).putExtra("workspace", workspace))
         var model: StudioViewModel? = null
         var originalAutosave: Boolean? = null
         val handler = AtomicReference<((JSONObject, (Any?, String?) -> Unit) -> Unit)?>(null)
@@ -263,6 +261,7 @@ class AgentRelayLifecycleIntegrationTest {
                 model = ViewModelProvider(owner)[StudioViewModel::class.java]
                 originalAutosave = model!!.state.value.autosave
                 model!!.reading(autosave = false)
+                model!!.open(Uri.fromFile(input))
             }
             waitUntil(20_000) { model?.state?.value?.autosave == false && model?.state?.value?.active?.uri == Uri.fromFile(input).toString() }
             awaitBridge(scenario, handler)

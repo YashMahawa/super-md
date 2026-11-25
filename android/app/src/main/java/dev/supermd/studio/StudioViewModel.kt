@@ -35,6 +35,10 @@ data class Note(val id: String = UUID.randomUUID().toString(), val name: String 
     val requiresCloseConfirmation get() = if (uri == null) (content.isNotBlank() || assetsDirty) && dirty else dirty
 }
 private class ExternalConflictDetectedException : RuntimeException()
+internal data class OpenDocumentTarget(
+    val uri: Uri,
+    val externalIntentFlags: Int? = null,
+)
 internal const val MAX_AGENT_SNAPSHOT_BYTES = 2 * 1024 * 1024
 internal enum class PortableSaveRecovery { ORIGINAL_INTACT, RESTORE_OUR_WRITE, LEAVE_CONCURRENT_BYTES }
 internal fun agentContentRevision(content: String): String = java.security.MessageDigest.getInstance("SHA-256")
@@ -304,18 +308,44 @@ class StudioViewModel(app: Application, val workspaceKey: String = "main") : And
     @Volatile internal var readerFlushRequester: (suspend (String) -> Boolean)? = null
     private val readerActionMutex = Mutex()
     private val openRequests = OpenRequestGate()
-    private val openIntentDispatcher = OpenIntentDispatcher<Uri>()
+    private val openIntentDispatcher = OpenIntentDispatcher<OpenDocumentTarget> { left, right -> left.uri == right.uri }
     internal val openDispatcherSessionId: String = java.util.UUID.randomUUID().toString()
     private var initialOpenIntentUri: String? = null
-    fun requestOpen(uri: Uri, relative: String? = null) = openIntentDispatcher.request(uri, relative)
+    fun requestOpen(uri: Uri, relative: String? = null) =
+        openIntentDispatcher.request(OpenDocumentTarget(uri, externalIntentFlags = null), relative)
     fun requestInitialOpen(uri: Uri) {
         val key = uri.toString()
         if (initialOpenIntentUri == key) return
         initialOpenIntentUri = key
         requestOpen(uri)
     }
-    internal fun attachReaderOpenHandler(handler: OpenIntentDispatcher.Handler<Uri>?) = openIntentDispatcher.attach(handler)
-    internal fun detachReaderOpenHandler(handler: OpenIntentDispatcher.Handler<Uri>) = openIntentDispatcher.detach(handler)
+    internal fun requestExternalOpen(uri: Uri, intentFlags: Int) =
+        openIntentDispatcher.request(OpenDocumentTarget(uri, externalIntentFlags = intentFlags))
+    internal fun requestInitialExternalOpen(uri: Uri, intentFlags: Int) {
+        val key = uri.toString()
+        if (initialOpenIntentUri == key) return
+        initialOpenIntentUri = key
+        requestExternalOpen(uri, intentFlags)
+    }
+    internal fun handleExpiredExternalOpenGrant(uri: Uri, initial: Boolean) {
+        if (initial) {
+            val key = uri.toString()
+            if (initialOpenIntentUri == key) return
+            initialOpenIntentUri = key
+        }
+        val existing = mutable.value.tabs.firstOrNull { it.uri?.let { raw -> sameDocumentUri(raw, uri.toString()) } == true }
+        requestDocumentAccess(uri.toString(), existing, writing = false, explicit = true)
+    }
+    internal fun rejectExternalOpen(uri: Uri, reason: String, initial: Boolean) {
+        if (initial) {
+            val key = uri.toString()
+            if (initialOpenIntentUri == key) return
+            initialOpenIntentUri = key
+        }
+        fail("Could not open note: $reason")
+    }
+    internal fun attachReaderOpenHandler(handler: OpenIntentDispatcher.Handler<OpenDocumentTarget>?) = openIntentDispatcher.attach(handler)
+    internal fun detachReaderOpenHandler(handler: OpenIntentDispatcher.Handler<OpenDocumentTarget>) = openIntentDispatcher.detach(handler)
     private suspend fun performReaderBarrier(expectedActiveId: String, action: () -> Unit): Boolean = readerActionMutex.withLock {
         if (mutable.value.tabs.isEmpty() && expectedActiveId.isEmpty()) {
             action()
@@ -1864,24 +1894,41 @@ class StudioViewModel(app: Application, val workspaceKey: String = "main") : And
         }
         mutable.value.tabs.firstOrNull { it.id == (existing?.id ?: note.id) }?.let(::remember)
     }
-    fun open(uri: Uri, relative: String? = null): Job {
+    fun open(uri: Uri, relative: String? = null, externalIntentFlags: Int? = null): Job {
         val request = openRequests.begin()
         return viewModelScope.launch {
         try {
             val note = withContext(Dispatchers.IO) {
-                documentAccess.persist(uri)
-                val target = documentAccess.resolve(uri)
+                val app = getApplication<Application>()
+                val target = if (externalIntentFlags != null) {
+                    // External Intents must prove their own live caller grant; never manufacture
+                    // access from persisted SAF folder trees or untrusted app-private paths.
+                    uri
+                } else {
+                    documentAccess.persist(uri)
+                    documentAccess.resolve(uri)
+                }
                 val existing = mutable.value.tabs.find { it.uri?.let { raw -> sameDocumentUri(raw, uri.toString()) } == true }
                 // Reopening an existing draft must still validate its grant,
                 // but must never reload older disk bytes over its edits.
                 if (existing != null) {
-                    resolver.openInputStream(target)?.use { } ?: error("Document permission is unavailable; choose it again")
+                    val verifyStream = if (externalIntentFlags != null) {
+                        ExternalDocumentEntryGuard.openVerifiedExternalInputStream(app, resolver, target, externalIntentFlags)
+                    } else {
+                        resolver.openInputStream(target) ?: error("Document permission is unavailable; choose it again")
+                    }
+                    verifyStream.use { }
                     return@withContext existing.copy(uri = target.toString())
                 }
-                val name = resolveDisplayName(target)
-                    ?: relative?.substringAfterLast('/')?.takeIf(String::isNotBlank)
-                    ?: "Note.md"
-                resolver.openInputStream(target)?.use { stream ->
+                val inputStream = if (externalIntentFlags != null) {
+                    ExternalDocumentEntryGuard.openVerifiedExternalInputStream(app, resolver, target, externalIntentFlags)
+                } else {
+                    resolver.openInputStream(target) ?: error("Document permission is unavailable; choose it again")
+                }
+                inputStream.use { stream ->
+                    val name = resolveDisplayName(target)
+                        ?: relative?.substringAfterLast('/')?.takeIf(String::isNotBlank)
+                        ?: "Note.md"
                     val buffered = stream.buffered()
                     buffered.mark(65536)
                     val prefix = ByteArray(32768); val count = buffered.read(prefix); buffered.reset()
@@ -1889,7 +1936,7 @@ class StudioViewModel(app: Application, val workspaceKey: String = "main") : And
                     val portable = portableGzipHeader(prefix.copyOfRange(0, maxOf(count, 0))) || portableEnvelopeHeader(header)
                     if (portable) { val opened = media.openFmd(buffered); Note(name = name, uri = target.toString(), content = opened.markdown, saved = opened.markdown, relative = relative, assetDirectory = opened.directory).also { recordPortableBaseline(it.id, opened.directory) } }
                     else { val content = readLimited(buffered, 20_000_000).toString(Charsets.UTF_8).removePrefix("\uFEFF"); Note(name = name, uri = target.toString(), content = content, saved = content, relative = relative) }
-                } ?: error("Document permission is unavailable; choose it again")
+                }
             }
             if (note.uri?.let { documentAccess.hasWriteGrant(Uri.parse(it)) } == true) clearDocumentAccessFailure(uri.toString())
             if (!openRequests.isCurrent(request)) {
