@@ -491,6 +491,9 @@ def main():
     from background_service import BackgroundService
     session.background=BackgroundService(app,session,ROOT,open_from_service,force=args.background)
     create_window(args.note,show_window=not args.background)
+    if not args.note and not args.smoke and session.settings.get("startup") == "restore":
+        while session.has_pending_startup_windows():
+            create_window(None, show_window=not args.background)
     if session.settings.get("agentAccessEnabled"):
         try:
             session.agent_bridge.start()
@@ -520,6 +523,7 @@ def main():
     app.sendPostedEvents(None,QEvent.Type.DeferredDelete)
     for studio in studios:
         studio.pool.shutdown(wait=False,cancel_futures=True)
+        studio._search_pool.shutdown(wait=False,cancel_futures=True)
         # Don't cancel a user's pending save or final recovery write.
     session.writes.shutdown(wait=True)
     if broker:
