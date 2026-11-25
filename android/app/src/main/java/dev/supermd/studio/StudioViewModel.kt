@@ -1254,74 +1254,80 @@ class StudioViewModel(app: Application, val workspaceKey: String = "main") : And
                 tab.uri != null && tab.id !in mutable.value.conflictedTabIds &&
                     (checkAll || requestedUris.any { target -> sameDocumentUri(tab.uri, target) })
             }
-            if (snapshotTabs.isEmpty()) {
-                completePendingRefresh(snapshotGen)
-                return@launch
-            }
-            val newlyConflicted = mutableSetOf<String>()
-            val cleanUpdates = mutableMapOf<String, Triple<String, String?, JSONObject?>>()
-            withContext(Dispatchers.IO) {
-                for (note in snapshotTabs) {
-                    if (coroutineContext[Job]?.isActive == false) break
-                    val target = runCatching { documentAccess.resolve(Uri.parse(note.uri!!)) }.getOrNull() ?: continue
-                    if (note.dirty) {
-                        if (note.id !in mutable.value.conflictedTabIds) {
-                            val matches = runCatching { diskMatchesBaseline(target, note) }.getOrNull()
-                            if (matches == false) newlyConflicted.add(note.id)
-                        }
-                    } else if (note.id !in mutable.value.conflictedTabIds) {
-                        if (note.portable) {
-                            val disk = runCatching { resolver.openInputStream(target)?.use(media::openFmd) }.getOrNull() ?: continue
-                            val diskAssets = runCatching { media.portableAssets(disk.directory) }.getOrDefault(JSONObject())
-                            if (disk.markdown == note.content && portableAssetsMatch(baselinePortableAssets(note), diskAssets)) {
-                                File(getApplication<Application>().filesDir, "portable-assets/${disk.directory}").deleteRecursively()
-                            } else {
-                                cleanUpdates[note.id] = Triple(disk.markdown, disk.directory, diskAssets)
-                            }
+            refreshExternalTabs(snapshotTabs) { completePendingRefresh(snapshotGen) }
+        }
+    }
+    internal suspend fun refreshExternalTabs(
+        snapshotTabs: List<Note>,
+        onCommitted: (() -> Unit)? = null,
+    ) {
+        if (snapshotTabs.isEmpty()) {
+            onCommitted?.invoke()
+            return
+        }
+        val newlyConflicted = mutableSetOf<String>()
+        val cleanUpdates = mutableMapOf<String, Triple<String, String?, JSONObject?>>()
+        withContext(Dispatchers.IO) {
+            for (note in snapshotTabs) {
+                if (coroutineContext[Job]?.isActive == false) break
+                val target = runCatching { documentAccess.resolve(Uri.parse(note.uri!!)) }.getOrNull() ?: continue
+                if (note.dirty) {
+                    if (note.id !in mutable.value.conflictedTabIds) {
+                        val matches = runCatching { diskMatchesBaseline(target, note) }.getOrNull()
+                        if (matches == false) newlyConflicted.add(note.id)
+                    }
+                } else if (note.id !in mutable.value.conflictedTabIds) {
+                    if (note.portable) {
+                        val disk = runCatching { resolver.openInputStream(target)?.use(media::openFmd) }.getOrNull() ?: continue
+                        val diskAssets = runCatching { media.portableAssets(disk.directory) }.getOrDefault(JSONObject())
+                        if (disk.markdown == note.content && portableAssetsMatch(baselinePortableAssets(note), diskAssets)) {
+                            File(getApplication<Application>().filesDir, "portable-assets/${disk.directory}").deleteRecursively()
                         } else {
-                            val text = runCatching { resolver.openInputStream(target)?.use { readLimited(it, 20_000_000).toString(Charsets.UTF_8).removePrefix("\uFEFF") } }.getOrNull() ?: continue
-                            if (text != note.content) cleanUpdates[note.id] = Triple(text, null, null)
+                            cleanUpdates[note.id] = Triple(disk.markdown, disk.directory, diskAssets)
                         }
+                    } else {
+                        val text = runCatching { resolver.openInputStream(target)?.use { readLimited(it, 20_000_000).toString(Charsets.UTF_8).removePrefix("\uFEFF") } }.getOrNull() ?: continue
+                        if (text != note.content) cleanUpdates[note.id] = Triple(text, null, null)
                     }
                 }
             }
-            if (newlyConflicted.isEmpty() && cleanUpdates.isEmpty()) {
-                completePendingRefresh(snapshotGen)
-                return@launch
-            }
-            newlyConflicted.forEach { autosavePending.remove(it) }
-            val obsoletePortableDirs = mutableListOf<String>()
-            cleanUpdates.forEach { (id, update) ->
-                val current = mutable.value.tabs.find { it.id == id }
-                if (current != null && !current.dirty && id !in mutable.value.conflictedTabIds) {
-                    invalidateNoteAssets(id)
-                    readerEcho.remove(id)
-                    clearReaderEditProtocol(id)
-                    if (update.second != null && update.third != null) {
-                        savedPortableAssets[id] = update.third!!
-                        if (current.assetDirectory != null && current.assetDirectory != update.second) obsoletePortableDirs.add(current.assetDirectory)
-                    }
-                } else if (update.second != null) {
-                    obsoletePortableDirs.add(update.second!!)
+        }
+        if (newlyConflicted.isEmpty() && cleanUpdates.isEmpty()) {
+            onCommitted?.invoke()
+            return
+        }
+        newlyConflicted.forEach { autosavePending.remove(it) }
+        val obsoletePortableDirs = mutableListOf<String>()
+        cleanUpdates.forEach { (id, update) ->
+            val current = mutable.value.tabs.find { it.id == id }
+            if (current != null && !current.dirty && id !in mutable.value.conflictedTabIds) {
+                invalidateNoteAssets(id)
+                readerEcho.remove(id)
+                clearReaderEditProtocol(id)
+                if (update.second != null && update.third != null) {
+                    savedPortableAssets[id] = update.third!!
+                    if (current.assetDirectory != null && current.assetDirectory != update.second) obsoletePortableDirs.add(current.assetDirectory)
                 }
+            } else if (update.second != null) {
+                obsoletePortableDirs.add(update.second!!)
             }
-            change { s ->
-                s.copy(
-                    tabs = s.tabs.map { tab ->
-                        val update = cleanUpdates[tab.id]
-                        if (update != null && !tab.dirty && tab.id !in s.conflictedTabIds) {
-                            tab.copy(content = update.first, saved = update.first, assetDirectory = update.second ?: tab.assetDirectory, assetsDirty = false)
-                        } else tab
-                    },
-                    conflictedTabIds = s.conflictedTabIds + newlyConflicted,
-                    message = if (newlyConflicted.isNotEmpty()) "This file changed on disk. Autosave is paused for this tab." else s.message,
-                )
-            }
-            completePendingRefresh(snapshotGen)
-            refreshPostAdoptObserver?.invoke()
-            if (obsoletePortableDirs.isNotEmpty()) {
-                withContext(Dispatchers.IO) { obsoletePortableDirs.forEach { File(getApplication<Application>().filesDir, "portable-assets/$it").deleteRecursively() } }
-            }
+        }
+        change { s ->
+            s.copy(
+                tabs = s.tabs.map { tab ->
+                    val update = cleanUpdates[tab.id]
+                    if (update != null && !tab.dirty && tab.id !in s.conflictedTabIds) {
+                        tab.copy(content = update.first, saved = update.first, assetDirectory = update.second ?: tab.assetDirectory, assetsDirty = false)
+                    } else tab
+                },
+                conflictedTabIds = s.conflictedTabIds + newlyConflicted,
+                message = if (newlyConflicted.isNotEmpty()) "This file changed on disk. Autosave is paused for this tab." else s.message,
+            )
+        }
+        onCommitted?.invoke()
+        refreshPostAdoptObserver?.invoke()
+        if (obsoletePortableDirs.isNotEmpty()) {
+            withContext(Dispatchers.IO) { obsoletePortableDirs.forEach { File(getApplication<Application>().filesDir, "portable-assets/$it").deleteRecursively() } }
         }
     }
     fun reorder(id: String, index: Int) = change { it.copy(tabs = reorderedNotes(it.tabs, id, index)) }
