@@ -167,6 +167,28 @@ fn tokenize_raw_html<'a>(raw: &str, out: &mut Vec<Node<'a>>) {
             }
             i = lt + len;
             continue;
+        } else if let Some(scanned) = crate::scan_html_tag(&raw[lt..], 0) {
+            let tag_slice = &raw[lt..lt + scanned.end];
+            if !scanned.closing && scanned.name.eq_ignore_ascii_case("img") && scanned.attr("src").is_some_and(|s| !s.trim().is_empty()) {
+                flush(&mut literal, out);
+                out.push(Node::Leaf(Event::InlineHtml(CowStr::from(tag_slice.to_string()))));
+                i = lt + scanned.end;
+                continue;
+            }
+            if !scanned.closing && crate::is_page_break_div(tag_slice) {
+                flush(&mut literal, out);
+                out.push(Node::Leaf(Event::InlineHtml(CowStr::from(tag_slice.to_string()))));
+                let mut next = lt + scanned.end;
+                let trimmed_after = raw[next..].trim_start_matches(char::is_whitespace);
+                let ws_len = raw[next..].len() - trimmed_after.len();
+                if let Some(close_tag) = crate::scan_html_tag(trimmed_after, 0) {
+                    if close_tag.closing && close_tag.name.eq_ignore_ascii_case("div") {
+                        next += ws_len + close_tag.end;
+                    }
+                }
+                i = next;
+                continue;
+            }
         }
         literal.push('<');
         i = lt + 1;
@@ -410,11 +432,20 @@ where
                     if inner == Event::End(TagEnd::HtmlBlock) { break; }
                     if let Event::Html(h) | Event::Text(h) = inner { raw.push_str(&h); }
                 }
-                let mut tokens = Vec::new();
-                tokenize_raw_html(raw.trim_end_matches(['\r', '\n']), &mut tokens);
-                let folded = fold_html_tags(tokens);
-                if !folded.iter().all(|n| matches!(n, Node::Text(s, _) if s.trim().is_empty())) {
-                    out.push(Node::Group { start: Event::Start(Tag::Paragraph), end: Event::End(TagEnd::Paragraph), children: folded, phrasing: true });
+                let clean = crate::strip_html_comments(&raw);
+                let trimmed = clean.trim();
+                if crate::diagram::looks_like_svg(trimmed)
+                    || crate::is_page_break_div(&raw)
+                    || !crate::parse_html_images(&raw).is_empty()
+                {
+                    out.push(Node::Leaf(Event::Html(CowStr::from(raw))));
+                } else {
+                    let mut tokens = Vec::new();
+                    tokenize_raw_html(raw.trim_end_matches(['\r', '\n']), &mut tokens);
+                    let folded = fold_html_tags(tokens);
+                    if !folded.iter().all(|n| matches!(n, Node::Text(s, _) if s.trim().is_empty())) {
+                        out.push(Node::Group { start: Event::Start(Tag::Paragraph), end: Event::End(TagEnd::Paragraph), children: folded, phrasing: true });
+                    }
                 }
             }
             Event::Start(Tag::CodeBlock(kind)) => {
@@ -455,7 +486,14 @@ where
                 }
                 out.push(Node::Group { start: Event::Start(tag), end: Event::End(close), children, phrasing });
             }
-            Event::InlineHtml(html) | Event::Html(html) => tokenize_raw_html(&html, &mut out),
+            Event::InlineHtml(html) | Event::Html(html) => {
+                if html.trim().eq_ignore_ascii_case("</div>")
+                    && matches!(out.last(), Some(Node::Leaf(Event::InlineHtml(prev))) if crate::is_page_break_div(prev))
+                {
+                    continue;
+                }
+                tokenize_raw_html(&html, &mut out);
+            }
             Event::Text(value) => {
                 let bytes = source.as_bytes();
                 let mut slashes = 0usize;

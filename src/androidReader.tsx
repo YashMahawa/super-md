@@ -142,8 +142,9 @@ function Reader() {
     return()=>{delete window.supermdExportPhase;};
   },[]);
   const [trustedHosts,setTrustedHosts] = useState<string[]>([]);
+  const trustedHostsRef = useRef(trustedHosts); trustedHostsRef.current = trustedHosts;
   const documentAppearance=useMemo(()=>({dark:state?.dark??false,svgAppearance:state?.svgAppearance,ink:state?.colors.primary,text:state?.colors.text,colors:state?.colors}),[state?.dark,state?.svgAppearance,JSON.stringify(state?.colors)]);
-  const trustHost = useCallback((host:string)=>setTrustedHosts(current=>current.includes(host)?current:[...current,host]),[]);
+  const trustHost = useCallback((host:string)=>setTrustedHosts(current=>{if(current.includes(host))return current;const next=[...current,host];trustedHostsRef.current=next;return next;}),[]);
   const reference = useRef(state); reference.current = state;
   const changeTypewriter = useCallback((enabled: boolean) => {
     setTypewriterScroll(enabled, { persist: false });
@@ -390,7 +391,7 @@ function Reader() {
       exportOwner.current=owner;setPdfExport({id:owner.id,phase:'preparing',completed:0,total:0});
       try {
         const latest = await flushExportNote(current);
-        const prepared = await preparePdf(latest.content, latest.path, latest.python || "embedded",{signal:owner.controller.signal,onProgress:progress=>setPdfExport(value=>value?.id===owner.id?{...value,completed:progress.completed,total:progress.total}:value)});
+        const prepared = await preparePdf(latest.content, latest.path, latest.python || "embedded",{signal:owner.controller.signal,trustedImageHosts:trustedHostsRef.current,onProgress:progress=>setPdfExport(value=>value?.id===owner.id?{...value,completed:progress.completed,total:progress.total}:value)});
         owner.controller.signal.throwIfAborted();
         owner.phase='typesetting';setPdfExport({id:owner.id,phase:'typesetting',completed:0,total:0});
         await invoke("export_pdf_native", { ...prepared, options: {...options, themeAccent: latest.colors.primary}, id: latest.id,jobId:owner.id }); }
@@ -974,7 +975,7 @@ function Reader() {
         const archive=format==='mdzip'||rawArchive===true;
         const hasSection=Object.prototype.hasOwnProperty.call(suppliedOptions,'section'),section=hasSection?agentSectionForExport(note.content,suppliedOptions.section):undefined;
         const exportContent=section?.text??note.content,{section:_section,archive:_archive,...exportOptions}=suppliedOptions;
-        const prepared=format==='pdf'?await preparePdf(exportContent,note.path,note.python||'embedded'):format==='smd'?await prepareFmd(exportContent,note.path):await prepareMarkdownExport(exportContent,note.path,{compatible:archive,python:note.python||'embedded'});
+        const prepared=format==='pdf'?await preparePdf(exportContent,note.path,note.python||'embedded',{trustedImageHosts:trustedHostsRef.current}):format==='smd'?await prepareFmd(exportContent,note.path):await prepareMarkdownExport(exportContent,note.path,{compatible:archive,python:note.python||'embedded'});
         if(reference.current?.id!==note.id||reference.current.content!==note.content)throw Error('Revision conflict: the note changed while preparing the export');
         const result=await invoke<Record<string,unknown>>('agent_export_native',{...prepared,id:note.id,expectedRevision:revision,requestId:request.requestId,format:archive?'mdzip':format,...(archive?{archive:true}:{}),filename:request.filename,options:exportOptions});
         return section?{...result,sectionStart:section.sectionStart,sectionEnd:section.sectionEnd,documentLength:section.documentLength}:result;
