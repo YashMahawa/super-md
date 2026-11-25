@@ -8,6 +8,7 @@ import { SKIP, visit } from "unist-util-visit";
 import InteractiveChart from "./components/InteractiveChart";
 import { normalizeCallouts } from "./components/MarkdownPreview";
 import { parseFrontmatter } from "./frontmatter";
+import { mediaAt } from "./mediaExport";
 import { invoke } from "./nativeBridge";
 import { renderMermaid } from "./mermaidRenderer";
 import { pythonOutput } from "./renderedOutputs";
@@ -130,7 +131,7 @@ function isPageBreakTag(tag: ScannedHtmlTag): boolean {
 
 function parseHtmlImgTag(tag: ScannedHtmlTag): { url: string; alt: string; title?: string; attrs: string } | null {
   if (tag.closing || tag.name !== "img") return null;
-  const src = (tag.attrs.get("src") || "").trim();
+  const src = (tag.attrs.get("src") || "").replace(/[\t\r\n]+/g, "").replace(/^[\u0000-\u0020]+|[\u0000-\u0020]+$/g, "");
   if (!src) return null;
   const alt = (tag.attrs.get("alt") || "").replace(/[\r\n]+/g, " ").trim() || "Image";
   const title = (tag.attrs.get("title") || "").replace(/[\r\n]+/g, " ").trim() || undefined;
@@ -194,7 +195,7 @@ function liftHtmlImages(tree: any): void {
             nextChildren.push({
               type: "paragraph",
               children: [
-                { type: "image", url: img.url, alt: img.alt, ...(img.title ? { title: img.title } : {}) },
+                { type: "image", url: img.url, alt: img.alt, ...(img.title ? { title: img.title } : {}), data: { htmlImage: true } },
                 ...(img.attrs ? [{ type: "text", value: img.attrs }] : []),
               ],
             });
@@ -225,7 +226,7 @@ function liftHtmlImages(tree: any): void {
         }
         if (validInline && singleImg) {
           changed = true;
-          nextChildren.push({ type: "image", url: singleImg.url, alt: singleImg.alt, ...(singleImg.title ? { title: singleImg.title } : {}) });
+          nextChildren.push({ type: "image", url: singleImg.url, alt: singleImg.alt, ...(singleImg.title ? { title: singleImg.title } : {}), data: { htmlImage: true } });
           if (singleImg.attrs) nextChildren.push({ type: "text", value: singleImg.attrs });
           continue;
         }
@@ -239,11 +240,34 @@ function liftHtmlImages(tree: any): void {
 function data(blob: Blob): Promise<string> {
   return new Promise((resolve, reject) => { const reader = new FileReader(); reader.onload = () => resolve(String(reader.result)); reader.onerror = () => reject(reader.error); reader.readAsDataURL(blob); });
 }
+function loadedReaderImageData(source: string): string | null {
+  if (typeof document === "undefined") return null;
+  for (const element of document.querySelectorAll<HTMLElement>("[data-note-image-source]")) {
+    if (element.dataset.noteImageSource !== source) continue;
+    const uri = mediaAt(element.querySelector("img"))?.uri?.();
+    if (uri && /^data:image\//i.test(uri)) return uri;
+  }
+  return null;
+}
+
+function remoteImageHost(url: string): string | null {
+  if (!/^https?:\/\//i.test(url)) return null;
+  try {
+    const parsed = new URL(url);
+    return (parsed.protocol === "http:" || parsed.protocol === "https:") && !parsed.username && !parsed.password && parsed.host
+      ? parsed.host.toLowerCase()
+      : null;
+  } catch {
+    return null;
+  }
+}
+
 export type PdfPreparationPhase = "prepare" | "assets+diagrams";
 export type PdfPreparationProgress = { phase: PdfPreparationPhase; completed: number; total: number };
 export type PreparePdfOptions = {
   signal?: AbortSignal;
   onProgress?: (progress: PdfPreparationProgress) => void;
+  trustedImageHosts?: readonly string[];
 };
 
 function cancelledError(): Error {
@@ -269,7 +293,8 @@ function raceSignal<T>(promise: Promise<T>, signal?: AbortSignal): Promise<T> {
 export async function preparePdf(markdown: string, documentPath: string | null, python = "embedded", options: PreparePdfOptions = {}) {
   let generation = 1;
   const ownerGeneration = generation;
-  const { signal } = options;
+  const { signal, trustedImageHosts } = options;
+  const trustedHosts = new Set((trustedImageHosts ?? []).map(host => host.trim().toLowerCase()).filter(Boolean));
   const invalidate = () => { generation++; };
   signal?.addEventListener("abort", invalidate, { once: true });
   const checkCurrent = () => {
@@ -308,7 +333,7 @@ export async function preparePdf(markdown: string, documentPath: string | null, 
             const source = step.image
               ? processor.stringify({type:"root",children:[{type:"paragraph",children:[{type:"image",url:step.image,alt:step.alt||step.label}]}]} as any)
               : "```" + (step.diagram ? "svg\n" + stepDiagramSvg(step.diagram) : "smd-chart\n" + step.chart) + "\n```";
-            const prepared = await preparePdf(source, documentPath, python, {signal});
+            const prepared = await preparePdf(source, documentPath, python, { signal, trustedImageHosts });
             checkCurrent();
             const names = new Map<string,string>();
             for (const [name, body] of Object.entries(prepared.assets)) {
@@ -320,7 +345,7 @@ export async function preparePdf(markdown: string, documentPath: string | null, 
           }
           let markdown: string|undefined;
           if(step.markdown){
-            const prepared=await preparePdf(step.markdown,documentPath,python,{signal});checkCurrent();
+            const prepared=await preparePdf(step.markdown,documentPath,python,{signal,trustedImageHosts});checkCurrent();
             markdown=prepared.content;
             for(const [name,body] of Object.entries(prepared.assets)){
               const renamed=`step-${++count}-${name}`;assets[renamed]=body;
@@ -346,23 +371,55 @@ export async function preparePdf(markdown: string, documentPath: string | null, 
       const analyzed=pythonCells.find(cell=>cell.source===source&&cell.ordinal===ordinal);
       if(documentPath)pythonContext={document:documentPath,cell:String(analyzed?.ordinal??ordinal),interpreter:python||'embedded'};
     }
-    if (node.type === "image") work.push(async () => {
-      checkCurrent();
-      let url: string = node.url;
-      if (!/^data:/i.test(url)) {
-        if (/^https?:/i.test(url)) { const fetched = await invoke<{ body: string }>("fetch_resource", { url, image: true }); checkCurrent(); url = fetched.body; }
-        else {
-          if (!documentPath && !/^assets\/import-[\w-]+\./.test(url)) throw new Error(`Save your note before exporting relative image ${url}.`);
-          url = await invoke<string>("load_asset", { documentPath: documentPath || "", source: url });
-          checkCurrent();
+    if (node.type === "image") {
+      const fromHtmlImg = Boolean(node.data?.htmlImage);
+      let preloadedHtmlData: string | null = null;
+      if (fromHtmlImg) {
+        const rawUrl = String(node.url || "").trim();
+        if (/^data:/i.test(rawUrl)) {
+          if (!/^data:image\//i.test(rawUrl)) throw new Error("Unsupported PDF image type.");
+        } else if (/^https?:\/\//i.test(rawUrl)) {
+          preloadedHtmlData = loadedReaderImageData(rawUrl);
+          if (!preloadedHtmlData) {
+            const host = remoteImageHost(rawUrl);
+            if (!host || !trustedHosts.has(host)) {
+              throw new Error(`Remote image from ${host || rawUrl} requires explicit consent in the reader before exporting PDF.`);
+            }
+          }
+        } else if (rawUrl.startsWith("//") || /^[a-z][a-z\d+.-]*:/i.test(rawUrl)) {
+          throw new Error(`Remote image ${rawUrl} requires explicit consent in the reader before exporting PDF.`);
         }
       }
-      checkCurrent();
-      if (!/^data:image\/(?:svg\+xml|png|jpeg);base64,/i.test(url)) { url = await rasterImage(url); checkCurrent(); }
-      const extension = url.startsWith("data:image/svg") ? "svg" : url.startsWith("data:image/jpeg") ? "jpg" : "png";
-      checkCurrent();
-      node.url = add(url, `asset-${++count}.${extension}`);
-    });
+      work.push(async () => {
+        checkCurrent();
+        let url: string = preloadedHtmlData ?? node.url;
+        if (!/^data:/i.test(url)) {
+          if (fromHtmlImg ? /^https?:\/\//i.test(url) : /^https?:/i.test(url)) {
+            if (fromHtmlImg) {
+              const host = remoteImageHost(url);
+              if (!host || !trustedHosts.has(host)) {
+                throw new Error(`Remote image from ${host || url} requires explicit consent in the reader before exporting PDF.`);
+              }
+            }
+            const fetched = await invoke<{ body: string }>("fetch_resource", { url, image: true });
+            checkCurrent();
+            url = fetched.body;
+          } else {
+            if (fromHtmlImg && (url.startsWith("//") || /^[a-z][a-z\d+.-]*:/i.test(url))) {
+              throw new Error(`Remote image ${url} requires explicit consent in the reader before exporting PDF.`);
+            }
+            if (!documentPath && !/^assets\/import-[\w-]+\./.test(url)) throw new Error(`Save your note before exporting relative image ${url}.`);
+            url = await invoke<string>("load_asset", { documentPath: documentPath || "", source: url });
+            checkCurrent();
+          }
+        }
+        checkCurrent();
+        if (!/^data:image\/(?:svg\+xml|png|jpeg);base64,/i.test(url)) { url = await rasterImage(url); checkCurrent(); }
+        const extension = url.startsWith("data:image/svg") ? "svg" : url.startsWith("data:image/jpeg") ? "jpg" : "png";
+        checkCurrent();
+        node.url = add(url, `asset-${++count}.${extension}`);
+      });
+    }
     if (exportCell) work.push(async () => {
       checkCurrent();
       if(node.lang==="smd-chart") {

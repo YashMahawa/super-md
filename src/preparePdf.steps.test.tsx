@@ -2,8 +2,9 @@
 import {afterEach, expect, it, vi} from "vitest";
 const {invoke} = vi.hoisted(()=>({invoke:vi.fn()}));
 vi.mock("./nativeBridge",()=>({invoke}));
+import {registerMedia} from "./mediaExport";
 import {preparePdf} from "./preparePdf";
-afterEach(()=>invoke.mockReset());
+afterEach(()=>{invoke.mockReset();document.body.innerHTML="";});
 
 it("exports every image in a sequence, preserving labels, captions and surrounding blocks",async()=>{
   invoke.mockResolvedValue("data:image/svg+xml;base64,PHN2Zy8+");
@@ -158,4 +159,84 @@ it("parses HTML img tags with > and attribute-like text inside quoted alt and ti
   expect(prepared.content).toContain('Inline ![Left > Right](asset-3.png "Upper > Lower"){width=180} comparison.');
   expect(prepared.content).toContain('![Multi > Line](asset-4.png "Span > Break"){width=150}');
   expect(prepared.content).not.toContain('<img');
+});
+
+it("blocks untrusted remote HTML img URLs without ever invoking fetch_resource while preserving consented and offline local HTML img export",async()=>{
+  const png='data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg==';
+  const svg='data:image/svg+xml;base64,'+btoa('<svg xmlns="http://www.w3.org/2000/svg" width="90" height="45"><rect width="90" height="45"/></svg>');
+  invoke.mockImplementation(async(command:string,args:any)=>{
+    if(command==='fetch_resource')return {body:svg};
+    if(command==='load_asset')return png;
+    throw new Error(`Unexpected native call: ${command} ${JSON.stringify(args)}`);
+  });
+
+  // 1. Untrusted remote HTML <img> variants (including mixed with offline local images or inside smd-steps) never invoke fetch_resource.
+  const untrustedInputs=[
+    '<img src="https://untrusted.example/remote.png" width="300">',
+    '<p><img alt="A > B" src="http://untrusted.example/wrapped.png" style="width: 240px"></p>',
+    'Inline <img src="https://untrusted.example/inline.png" width="120"> text.',
+    '<img src="//untrusted.example/protocol-relative.png">',
+    '<img src="https:untrusted.example/no-slashes.png">',
+    '<img src="https://user:pass@images.example/credentialed.png">',
+    '<img src="assets/local.png" width="180">\n\n<img src="https://untrusted.example/after-local.png" width="300">',
+    '```smd-steps\n'+JSON.stringify({title:'Steps',steps:[{label:'Step 1',markdown:'<img src="https://untrusted.example/in-step.png" width="160">'},{label:'Step 2',description:'Done'}]})+'\n```',
+  ];
+  for(const input of untrustedInputs){
+    await expect(preparePdf(input,'/notes/consent.md','embedded',{trustedImageHosts:['images.example']})).rejects.toThrow(/consent/i);
+  }
+  expect(invoke).not.toHaveBeenCalledWith('fetch_resource',expect.anything());
+  expect(invoke).not.toHaveBeenCalled();
+
+  // 2. Unapproved .remote-image-card placeholder in the reader DOM does not grant consent.
+  const blockedCard=document.createElement('span');
+  blockedCard.className='remote-image-card';
+  blockedCard.dataset.noteImageSource='https://once.example/card-only.png';
+  document.body.append(blockedCard);
+  await expect(preparePdf('<img src="https://once.example/card-only.png" width="200">','/notes/consent.md')).rejects.toThrow(/consent/i);
+  expect(invoke).not.toHaveBeenCalledWith('fetch_resource',expect.anything());
+
+  // 3. One-time reader consent (loaded [data-note-image-source] media) exports that exact URL offline without invoking fetch_resource,
+  //    and never carries consent to a different URL on the same host.
+  const loadedSpan=document.createElement('span');
+  loadedSpan.className='note-image';
+  loadedSpan.dataset.noteImageSource='https://once.example/approved-once.png';
+  const loadedImg=document.createElement('img');
+  loadedSpan.append(loadedImg);
+  document.body.append(loadedSpan);
+  const unregister=registerMedia(loadedImg,{label:'Approved Once',uri:()=>png});
+  try{
+    const oncePrepared=await preparePdf('<img alt="Once" src="https://once.example/approved-once.png" width="210">','/notes/consent.md');
+    expect(invoke).not.toHaveBeenCalledWith('fetch_resource',expect.anything());
+    expect(oncePrepared.content).toContain('![Once](asset-1.png){width=210}');
+    expect(Object.keys(oncePrepared.assets)).toEqual(['asset-1.png']);
+
+    await expect(preparePdf('<img src="https://once.example/different.png" width="210">','/notes/consent.md')).rejects.toThrow(/consent/i);
+    expect(invoke).not.toHaveBeenCalledWith('fetch_resource',expect.anything());
+  }finally{
+    unregister();
+  }
+
+  // 4. Offline local and inline data: HTML <img> export works without trusted hosts and never invokes fetch_resource.
+  const offlinePrepared=await preparePdf(
+    `<img alt="Local" src="assets/offline.png" width="220">\n\n<img alt="Embedded" src="${png}" style="zoom:50%">`,
+    '/notes/consent.md',
+  );
+  expect(invoke).not.toHaveBeenCalledWith('fetch_resource',expect.anything());
+  expect(invoke).toHaveBeenCalledTimes(1);
+  expect(invoke).toHaveBeenCalledWith('load_asset',{documentPath:'/notes/consent.md',source:'assets/offline.png'});
+  expect(Object.keys(offlinePrepared.assets).sort()).toEqual(['asset-1.png','asset-2.png']);
+  expect(offlinePrepared.content).toMatch(/!\[Local\]\(asset-[12]\.png\)\{width=220\}/);
+  expect(offlinePrepared.content).toMatch(/!\[Embedded\]\(asset-[12]\.png\)\{zoom=50%\}/);
+
+  // 5. Explicitly trusted reader image host allows remote HTML <img> export through fetch_resource.
+  invoke.mockClear();
+  const trustedPrepared=await preparePdf(
+    '<img alt="Trusted Diagram" src="https://images.example/approved.svg" width="240">',
+    '/notes/consent.md',
+    'embedded',
+    {trustedImageHosts:['images.example']},
+  );
+  expect(invoke).toHaveBeenCalledTimes(1);
+  expect(invoke).toHaveBeenCalledWith('fetch_resource',{url:'https://images.example/approved.svg',image:true});
+  expect(trustedPrepared.content).toContain('![Trusted Diagram](asset-1.svg){width=240}');
 });
