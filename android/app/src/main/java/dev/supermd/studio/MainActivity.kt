@@ -530,13 +530,15 @@ internal fun shouldAcceptExternalDrag(localState: Any?, description: android.con
     if (localState != null || description == null) return false
     val count = description.mimeTypeCount
     if (count <= 0) return false
+    var hasExternalPayload = false
     for (index in 0 until count) {
         val mime = description.getMimeType(index)?.substringBefore(';')?.trim()?.lowercase().orEmpty()
-        if (mime.isNotEmpty() && mime != "text/plain" && mime != "text/html" && !mime.startsWith("chromium/")) {
-            return true
+        if (mime.startsWith("chromium/")) return false
+        if (mime.isNotEmpty() && mime != "text/plain" && mime != "text/html") {
+            hasExternalPayload = true
         }
     }
-    return false
+    return hasExternalPayload
 }
 
 internal class ExternalDropDragController(
@@ -1339,6 +1341,38 @@ internal fun extractDroppedFileUris(clip: android.content.ClipData?): List<andro
                     }
                 // The reading surface is edge-to-edge in BOTH chrome states.
                 // Only controls receive safe insets, not the document width.
+                val handleExternalDrop = rememberUpdatedState<(WebView, android.view.DragEvent) -> Unit> { reader, event ->
+                    if (shouldBlockNativeDrop(
+                            model.state.value,
+                            folderSearchVisible = model.folderSearch.value.visible,
+                            accessRequestOpen = model.documentAccessRequests.value != null,
+                            settingsOpen = settings,
+                            exporting = exporting,
+                            renaming = renaming,
+                            contentsShown = contentsShown,
+                            drawerOpen = drawer.isOpen,
+                        )) {
+                        return@rememberUpdatedState
+                    }
+                    val permissions = activity.requestDragAndDropPermissions(event)
+                    val uris = extractDroppedFileUris(event.clipData)
+                    if (uris.isNotEmpty()) {
+                        val id = model.state.value.active.id
+                        val currentDensity = reader.resources.displayMetrics.density.takeIf { it > 0f } ?: density.density
+                        val x = event.x / currentDensity
+                        val y = event.y / currentDensity
+                        reader.evaluateJavascript("window.supermdCaptureInsertion?.($x,$y)", null)
+                        model.importDropped(uris, id) { images ->
+                            permissions?.release()
+                            images?.let { reader.evaluateJavascript("window.supermdInsertImages?.($it)", null) }
+                        }
+                    } else {
+                        permissions?.release()
+                        if ((event.clipData?.itemCount ?: 0) > 0) {
+                            model.importDropped(emptyList(), model.state.value.active.id) {}
+                        }
+                    }
+                }
                 Column(Modifier.fillMaxSize()) { Box(Modifier.fillMaxWidth().weight(1f)) {
                     key(readerGeneration) { AndroidView(factory = { context -> FrameLayout(context).apply {
                         layoutParams = ViewGroup.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT)
@@ -1421,35 +1455,7 @@ internal fun extractDroppedFileUris(clip: android.content.ClipData?): List<andro
                                 }
                             }
                             setOnDragListener(ExternalDropDragController { event ->
-                                if (shouldBlockNativeDrop(
-                                        model.state.value,
-                                        folderSearchVisible = model.folderSearch.value.visible,
-                                        accessRequestOpen = model.documentAccessRequests.value != null,
-                                        settingsOpen = settings,
-                                        exporting = exporting,
-                                        renaming = renaming,
-                                        contentsShown = contentsShown,
-                                        drawerOpen = drawer.isOpen,
-                                    )) {
-                                    return@ExternalDropDragController
-                                }
-                                val permissions = activity.requestDragAndDropPermissions(event)
-                                val uris = extractDroppedFileUris(event.clipData)
-                                if (uris.isNotEmpty()) {
-                                    val id = model.state.value.active.id
-                                    val x = event.x / density.density
-                                    val y = event.y / density.density
-                                    evaluateJavascript("window.supermdCaptureInsertion?.($x,$y)", null)
-                                    model.importDropped(uris, id) { images ->
-                                        permissions?.release()
-                                        images?.let { evaluateJavascript("window.supermdInsertImages?.($it)", null) }
-                                    }
-                                } else {
-                                    permissions?.release()
-                                    if ((event.clipData?.itemCount ?: 0) > 0) {
-                                        model.importDropped(emptyList(), model.state.value.active.id) {}
-                                    }
-                                }
+                                handleExternalDrop.value(this, event)
                             })
                         })
                     } }, modifier = Modifier.fillMaxSize().clipToBounds(), onRelease = { frame ->

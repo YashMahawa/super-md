@@ -131,6 +131,8 @@ class DropSafetyTest {
 
         val plainDesc = ClipDescription("selection", arrayOf("text/plain", "text/html", "chromium/x-webkit-paste"))
         assertFalse(shouldAcceptExternalDrag(localState = null, description = plainDesc))
+        assertFalse(shouldAcceptExternalDrag(localState = null, description = ClipDescription("webview-link", arrayOf("text/plain", "text/uri-list", "chromium/x-bookmark-entries"))))
+        assertFalse(shouldAcceptExternalDrag(localState = null, description = ClipDescription("webview-img", arrayOf("image/png", "chromium/x-webkit-paste"))))
 
         assertTrue(shouldAcceptExternalDrag(localState = null, description = imageDesc))
         assertTrue(shouldAcceptExternalDrag(localState = null, description = ClipDescription("pdf", arrayOf("application/pdf"))))
