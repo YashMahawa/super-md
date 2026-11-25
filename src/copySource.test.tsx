@@ -207,3 +207,15 @@ it("excludes document properties header labels and badges from copied Markdown a
   selection.removeAllRanges();
   host.remove();
 });
+it("serializes highlight, subscript, superscript, kbd, underline, and strikethrough spans when copying",()=>{
+  const host=document.createElement("div");
+  host.innerHTML=renderToStaticMarkup(<MarkdownPreview markdown={"Study ==key idea== in H~2~O, x^2^, ~~old~~, <kbd>Ctrl</kbd>, and <u>note</u>."} documentPath={null} python="" dark={false}/>);
+  document.body.append(host);
+  const para=host.querySelector("p")!,range=document.createRange(),selection=window.getSelection()!;
+  range.selectNodeContents(para);selection.removeAllRanges();selection.addRange(range);
+  expect(selectedMarkdown(selection)).toBe("Study ==key idea== in H~2~O, x^2^, ~~old~~, <kbd>Ctrl</kbd>, and <u>note</u>.");
+  const markText=host.querySelector("mark")!.firstChild!;
+  range.setStart(markText,0);range.setEnd(markText,3);selection.removeAllRanges();selection.addRange(range);
+  expect(selectedMarkdown(selection)).toBe("==key==");
+  selection.removeAllRanges();host.remove();
+});
