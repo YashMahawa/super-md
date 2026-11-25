@@ -44,15 +44,11 @@ smd-engine inspect ./lesson.smd
 smd-engine read ./lesson.smd --offset 0 --limit 16000
 smd-engine assets ./lesson.smd
 smd-engine extract ./lesson.smd assets/image-1.svg ./figure.svg
-smd-engine unpack ./lesson.smd ./unpacked
 ```
 
 `read` emits bounded Markdown, with continuation information on stderr. `inspect`
 and `assets` emit metadata, not image bytes. `extract` writes one named image to a
-file and refuses to overwrite an existing output. `unpack` extracts the note's
-Markdown and `assets/` into a target directory within the same portable size limits,
-rejecting symlinks and aborting before writing if any destination file already exists.
-Avoid `cat lesson.smd` or
+file and refuses to overwrite an existing output. Avoid `cat lesson.smd` or
 putting its JSON/base64 envelope in an AI's context. Use file/image tools on the
 extracted asset separately. For edits, use `super-md agent patch` and `replace-asset` to keep unchanged
 assets intact without unpacking or rewriting a document through a script. The GUI handles
