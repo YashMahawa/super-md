@@ -1,11 +1,19 @@
 import { useEffect, useRef, useState } from "react";
-import { Compartment, EditorSelection, EditorState,Transaction } from "@codemirror/state";
-import { EditorView, keymap, lineNumbers, highlightActiveLine, drawSelection,type KeyBinding } from "@codemirror/view";
-import { defaultKeymap, history, historyField, historyKeymap, indentWithTab, undo, redo,isolateHistory } from "@codemirror/commands";
+import { Annotation, Compartment, EditorSelection, EditorState, Transaction } from "@codemirror/state";
+import { EditorView, keymap, lineNumbers, highlightActiveLine, drawSelection, type KeyBinding } from "@codemirror/view";
+import { defaultKeymap, history, historyField, historyKeymap, indentWithTab, undo, redo, isolateHistory } from "@codemirror/commands";
 import { markdown, markdownLanguage } from "@codemirror/lang-markdown";
-import { syntaxHighlighting, defaultHighlightStyle, foldGutter, foldKeymap, syntaxTree,syntaxTreeAvailable } from "@codemirror/language";
-import {repairPastedMath} from '../mathRepair';
-import {forEachDiagnostic,forceLinting,linter,setDiagnostics,type Action,type Diagnostic} from "@codemirror/lint";
+import { syntaxHighlighting, defaultHighlightStyle, foldGutter, foldKeymap, syntaxTree, syntaxTreeAvailable } from "@codemirror/language";
+import { repairPastedMath } from '../mathRepair';
+import {
+  applyMarkdownUrlPaste,
+  normalizeFormatAction,
+  notifyHistoryBoundary,
+  parseStandaloneHttpUrl,
+  toggleMarkdownFormat,
+  type FormatAction,
+} from "../markdownFormatting";
+import { forEachDiagnostic, forceLinting, linter, setDiagnostics, type Action, type Diagnostic } from "@codemirror/lint";
 import {checkWriting,type WritingOptions} from "../proofreading";
 import {PROOFREADING_MAX_CHARS,computeWindowBounds} from "../proofreadingCore";
 import {addPersonalWord,hasPersonalWord,normalizeDictionaryWord,subscribePersonalDictionary} from "../personalDictionary";
@@ -43,7 +51,10 @@ function trimEditorSessions() {
     sessions.delete(id); retained -= entry.state.doc.length;
     callbacks.delete(id); statusHandlers.delete(id);
     rangeHandlers.delete(id);
-    pasteSettings.delete(id); typewriterHandlers.delete(id); typewriterStates.delete(id);
+    pasteSettings.delete(id);
+    selectionHistories.delete(id);
+    typewriterHandlers.delete(id);
+    typewriterStates.delete(id);
   }
 }
 const callbacks = new Map<string, (value: string,changes?:SourceChange[]) => void>();
@@ -53,6 +64,59 @@ const rangeHandlers = new Map<string, (range: { from: number; to: number }) => v
 const typewriterHandlers = new Map<string, ((enabled: boolean) => void) | undefined>();
 const typewriterStates = new Map<string, boolean>();
 const visibleEditors = new Map<string, EditorView>();
+const externalValueSync = Annotation.define<boolean>();
+interface SelectionTransition {
+  beforeDoc: string;
+  afterDoc: string;
+  beforeSelection: EditorSelection;
+  afterSelection: EditorSelection;
+}
+const selectionHistories = new Map<string, SelectionTransition[]>();
+
+export function applyEditorFormat(editor: EditorView, action: FormatAction): boolean {
+  const currentRanges = editor.state.selection.ranges.map((r) => ({ anchor: r.anchor, head: r.head }));
+  const result = toggleMarkdownFormat(
+    editor.state.doc.toString(),
+    currentRanges,
+    action,
+    editor.state.selection.mainIndex,
+  );
+  const nextSelection = EditorSelection.create(
+    result.ranges.map((r) => EditorSelection.range(r.anchor, r.head)),
+    result.mainIndex,
+  );
+  notifyHistoryBoundary();
+  editor.dispatch({
+    changes: result.changes,
+    selection: nextSelection,
+    annotations: isolateHistory.of("full"),
+    userEvent: "input.format",
+    scrollIntoView: true,
+  });
+  notifyHistoryBoundary();
+  editor.focus();
+  return true;
+}
+
+export function formatEditorSession(id: string, rawAction: string): boolean {
+  const action = normalizeFormatAction(rawAction);
+  const editor = visibleEditors.get(id);
+  if (!action || !editor) return false;
+  return applyEditorFormat(editor, action);
+}
+
+const formatKeymap: KeyBinding[] = [
+  { key: "Mod-b", run: (editor) => applyEditorFormat(editor, "bold") },
+  { key: "Mod-i", run: (editor) => applyEditorFormat(editor, "italic") },
+  { key: "Mod-e", run: (editor) => applyEditorFormat(editor, "inline_code") },
+  { key: "Mod-`", run: (editor) => applyEditorFormat(editor, "inline_code") },
+  { key: "Mod-k", run: (editor) => applyEditorFormat(editor, "link") },
+  { key: "Mod-Shift-h", run: (editor) => applyEditorFormat(editor, "heading") },
+  { key: "Mod-Shift-l", run: (editor) => applyEditorFormat(editor, "list") },
+  { key: "Mod-Shift-q", run: (editor) => applyEditorFormat(editor, "quote") },
+  { key: "Mod-Alt-q", run: (editor) => applyEditorFormat(editor, "quote") },
+  { key: "Mod-Shift-m", run: (editor) => applyEditorFormat(editor, "inline_math") },
+];
 
 function sourceProofreadingRange(editor: EditorView): { from: number; to: number } {
   const docLen = editor.state.doc.length;
@@ -119,11 +183,20 @@ function toggleTypewriterFromView(editor: EditorView): boolean {
   return true;
 }
 export function editorKeyBindings(host: string | undefined = typeof document === "undefined" ? undefined : document.documentElement.dataset.host): KeyBinding[] {
-  // Qt owns application shortcuts and forwards undo/redo/find through native
-  // commands. Android and browser builds retain CodeMirror's normal keymaps.
+  // Qt owns application shortcuts and forwards undo/redo/find/formatting through
+  // native commands. Android and browser builds retain CodeMirror's keymaps.
   const nativeShortcuts = host === "qt";
   const typewriterBinding: KeyBinding[] = nativeShortcuts ? [] : [{ key: TYPEWRITER_SHORTCUT, run: toggleTypewriterFromView }];
-  return [...typewriterBinding, ...defaultKeymap, ...(nativeShortcuts ? [] : historyKeymap), ...(nativeShortcuts ? [] : searchKeymap), ...foldKeymap, indentWithTab];
+  const baseDefaults = defaultKeymap.filter((binding) => binding.key !== "Mod-i");
+  return [
+    ...typewriterBinding,
+    ...(nativeShortcuts ? [] : formatKeymap),
+    ...baseDefaults,
+    ...(nativeShortcuts ? [] : historyKeymap),
+    ...(nativeShortcuts ? [] : searchKeymap),
+    ...foldKeymap,
+    indentWithTab,
+  ];
 }
 export function editorReadingOffset(id:string):number|undefined {
   const view=visibleEditors.get(id);if(!view)return;
@@ -295,8 +368,56 @@ export default function Editor({ sessionId = "default", value, onChange, dark, f
         foldGutter(),
         history({ minDepth: 30 }),
         EditorView.domEventHandlers({paste(event,editor){
-          if(!pasteSettings.get(sessionId)||event.defaultPrevented||event.clipboardData?.files.length)return false;
-          const text=event.clipboardData?.getData('text/plain');if(!text||!/[\\$^]/.test(text))return false;
+          if(event.defaultPrevented||event.clipboardData?.files.length)return false;
+          const text=event.clipboardData?.getData('text/plain');
+          if(!text)return false;
+          const standaloneUrl=parseStandaloneHttpUrl(text);
+          if(standaloneUrl){
+            let syntaxBlocked=false;
+            for(const range of editor.state.selection.ranges){
+              if(range.empty){syntaxBlocked=true;break;}
+              if(syntaxTreeAvailable(editor.state,range.to)){
+                syntaxTree(editor.state).iterate({
+                  from:range.from,
+                  to:range.to,
+                  enter(node){
+                    if(['FencedCode','CodeBlock','InlineCode','HTMLBlock','HTMLTag','Link','Image','URL'].includes(node.name)){
+                      syntaxBlocked=true;return false;
+                    }
+                  },
+                });
+              }
+              if(syntaxBlocked)break;
+            }
+            const wrapped=syntaxBlocked?null:applyMarkdownUrlPaste(
+              editor.state.doc.toString(),
+              editor.state.selection.ranges.map(r=>({anchor:r.anchor,head:r.head})),
+              text,
+              editor.state.selection.mainIndex,
+            );
+            event.preventDefault();
+            notifyHistoryBoundary();
+            if(wrapped){
+              editor.dispatch({
+                changes:wrapped.changes,
+                selection:EditorSelection.create(wrapped.ranges.map(r=>EditorSelection.range(r.anchor,r.head)),wrapped.mainIndex),
+                annotations:isolateHistory.of('full'),
+                userEvent:'input.paste',
+                scrollIntoView:true,
+              });
+            }else{
+              editor.dispatch({
+                ...editor.state.replaceSelection(text),
+                annotations:isolateHistory.of('full'),
+                userEvent:'input.paste',
+                scrollIntoView:true,
+              });
+            }
+            notifyHistoryBoundary();
+            editor.focus();
+            return true;
+          }
+          if(!pasteSettings.get(sessionId)||!/[\\$^]/.test(text))return false;
           let repaired:string|undefined;
           for(const range of editor.state.selection.ranges){
             if(!syntaxTreeAvailable(editor.state,range.to))return false;
@@ -307,7 +428,11 @@ export default function Editor({ sessionId = "default", value, onChange, dark, f
             if(repaired!==undefined&&repaired!==next)return false;repaired=next;
           }
           if(repaired===undefined||repaired===text)return false;
-          event.preventDefault();editor.dispatch({...editor.state.replaceSelection(repaired),annotations:isolateHistory.of('full'),userEvent:'input.paste',scrollIntoView:true});return true;
+          event.preventDefault();
+          notifyHistoryBoundary();
+          editor.dispatch({...editor.state.replaceSelection(repaired),annotations:isolateHistory.of('full'),userEvent:'input.paste',scrollIntoView:true});
+          notifyHistoryBoundary();
+          return true;
         }}),
         drawSelection(),
         highlightActiveLine(),
@@ -322,6 +447,21 @@ export default function Editor({ sessionId = "default", value, onChange, dark, f
         typewriter.current.of(typewriterScrollExtension(initialTypewriter)),
         EditorView.updateListener.of((update) => {
           if (update.docChanged) {
+            if (!update.transactions.some((tr) => tr.annotation(externalValueSync))) {
+              const beforeDoc = update.startState.doc.toString();
+              const afterDoc = update.state.doc.toString();
+              if (beforeDoc.length + afterDoc.length <= 2_000_000) {
+                const list = selectionHistories.get(sessionId) || [];
+                list.push({
+                  beforeDoc,
+                  afterDoc,
+                  beforeSelection: update.startState.selection,
+                  afterSelection: update.state.selection,
+                });
+                while (list.length > 60) list.shift();
+                selectionHistories.set(sessionId, list);
+              }
+            }
             const changes:SourceChange[]=[];
             update.changes.iterChanges((from,to,_fromB,_toB,insert)=>changes.push({from,to,insert:insert.toString()}));
             callbacks.get(sessionId)?.(update.state.doc.toString(),changes);
@@ -421,8 +561,27 @@ export default function Editor({ sessionId = "default", value, onChange, dark, f
     while (from < previous.length && from < value.length && previous[from] === value[from]) from++;
     let oldEnd = previous.length, newEnd = value.length;
     while (oldEnd > from && newEnd > from && previous[oldEnd - 1] === value[newEnd - 1]) { oldEnd--; newEnd--; }
-    instance.dispatch({ changes: { from, to: oldEnd, insert: value.slice(from, newEnd) },annotations:Transaction.addToHistory.of(false) });
-  }, [value]);
+    let restoredSelection: EditorSelection | undefined;
+    const recorded = selectionHistories.get(sessionId);
+    if (recorded) {
+      for (let i = recorded.length - 1; i >= 0; i--) {
+        const item = recorded[i];
+        if (item.afterDoc === previous && item.beforeDoc === value) {
+          restoredSelection = item.beforeSelection;
+          break;
+        }
+        if (item.beforeDoc === previous && item.afterDoc === value) {
+          restoredSelection = item.afterSelection;
+          break;
+        }
+      }
+    }
+    instance.dispatch({
+      changes: { from, to: oldEnd, insert: value.slice(from, newEnd) },
+      ...(restoredSelection ? { selection: restoredSelection } : {}),
+      annotations: [Transaction.addToHistory.of(false), externalValueSync.of(true)],
+    });
+  }, [value, sessionId]);
 
   useEffect(() => {
     const open = () => view.current && openSearchPanel(view.current);
@@ -469,25 +628,35 @@ export default function Editor({ sessionId = "default", value, onChange, dark, f
     const format = (event: Event) => {
       const instance = view.current;
       if (!instance) return;
-      const detail = (event as CustomEvent<{ prefix: string; suffix?: string; block?: boolean }>).detail;
-      if (detail.block) {
-        instance.dispatch({ changes: { from: instance.state.selection.main.head, insert: detail.prefix } });
+      const detail = (event as CustomEvent<{ action?: string; prefix?: string; suffix?: string; block?: boolean }>).detail;
+      const action = normalizeFormatAction(detail?.action);
+      if (action) {
+        applyEditorFormat(instance, action);
+        return;
+      }
+      const prefix = detail?.prefix ?? "";
+      if (detail?.block) {
+        notifyHistoryBoundary();
+        instance.dispatch({ changes: { from: instance.state.selection.main.head, insert: prefix }, annotations: isolateHistory.of("full"), userEvent: "input.format" });
+        notifyHistoryBoundary();
         instance.focus();
         return;
       }
-      const suffix = detail.suffix ?? detail.prefix;
+      const suffix = detail?.suffix ?? prefix;
       const changes = instance.state.selection.ranges.map((range) => ({
         from: range.from,
         to: range.to,
-        insert: `${detail.prefix}${instance.state.sliceDoc(range.from, range.to)}${suffix}`
+        insert: `${prefix}${instance.state.sliceDoc(range.from, range.to)}${suffix}`
       }));
       const mapped = instance.state.changes(changes);
       const ranges = instance.state.selection.ranges.map((range) => {
-        const start = mapped.mapPos(range.from, -1) + detail.prefix.length;
+        const start = mapped.mapPos(range.from, -1) + prefix.length;
         const end = start + range.to - range.from;
         return range.anchor > range.head ? EditorSelection.range(end, start) : EditorSelection.range(start, end);
       });
-      instance.dispatch({ changes: mapped, selection: EditorSelection.create(ranges, instance.state.selection.mainIndex), userEvent: "input.format" });
+      notifyHistoryBoundary();
+      instance.dispatch({ changes: mapped, selection: EditorSelection.create(ranges, instance.state.selection.mainIndex), annotations: isolateHistory.of("full"), userEvent: "input.format" });
+      notifyHistoryBoundary();
       instance.focus();
     };
     window.addEventListener("supermd-format", format);
