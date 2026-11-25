@@ -134,6 +134,38 @@ describe("viewing images is never an import", () => {
     await act(async () => window.supermdInsertImages?.([]));
     expect(insert).not.toHaveBeenCalled();
   });
+
+  it("does not intercept URL clipboard paste, while keeping image paste and explicit supermdMedia dialog", async () => {
+    const paragraph = host.querySelector("p")!;
+    await act(async () => {
+      const urlPaste = new Event("paste", { bubbles: true, cancelable: true });
+      Object.defineProperty(urlPaste, "clipboardData", {
+        value: {
+          files: [],
+          getData: (type: string) => (type === "text/plain" ? "https://example.com/article" : ""),
+        },
+      });
+      paragraph.dispatchEvent(urlPaste);
+      expect(urlPaste.defaultPrevented).toBe(false);
+    });
+    expect(host.querySelector('[role="dialog"]')).toBeNull();
+
+    await act(async () => {
+      const imgPaste = new Event("paste", { bubbles: true, cancelable: true });
+      Object.defineProperty(imgPaste, "clipboardData", {
+        value: {
+          files: [file],
+          getData: () => "",
+        },
+      });
+      paragraph.dispatchEvent(imgPaste);
+      expect(imgPaste.defaultPrevented).toBe(true);
+    });
+    expect(importImageFiles).toHaveBeenCalledExactlyOnceWith([file]);
+
+    await act(async () => window.supermdMedia?.());
+    expect(host.querySelector('[role="dialog"][aria-label="Insert image or link"]')).not.toBeNull();
+  });
 });
 
 describe("live cursor offsets, coordinate drops, and overlay registration", () => {

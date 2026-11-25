@@ -142,9 +142,7 @@ export default function MediaTools({ documentId, content, documentPath: _documen
       const element = event.target as Element;
       if (busyRef.current || !element.closest?.(".workspace,.android-document") || element.closest(".media-scrim,.cm-search,.theme-guide-dialog")) return;
       const files = Array.from(event.clipboardData?.files || []).filter((f) => /^image\//.test(f.type));
-      if (files.length) { event.preventDefault(); const point = insertionPoint(); void importImageFiles(files).then((images) => { if (mounted.current) reference.current.onInsert("\n\n" + images.map(imageMarkdown).join("\n\n") + "\n", point); }).catch((e) => reference.current.onNotice(String(e))); return; }
-      const pasted = event.clipboardData?.getData("text/plain").trim() || "";
-      if (/^https?:\/\/\S+$/.test(pasted)) { event.preventDefault(); show(pasted); }
+      if (files.length) { event.preventDefault(); const point = insertionPoint(); void importImageFiles(files).then((images) => { if (mounted.current) reference.current.onInsert("\n\n" + images.map(imageMarkdown).join("\n\n") + "\n", point); }).catch((e) => reference.current.onNotice(String(e))); }
     };
     let internalDrag = false;
     const dragStart = (event: DragEvent) => {
