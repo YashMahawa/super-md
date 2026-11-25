@@ -221,4 +221,57 @@ describe('shared source analysis',()=>{
     ]);
     for(const block of analysis.blocks)expect(source.slice(block.start,block.end)).toBe(block.text);
   });
+  it('strips paired %%...%% comments outside code and math while preserving original offsets and lossless blocks',()=>{
+    const source=[
+      '%%Draft header',
+      'spanning multiple lines%%',
+      '# Water H~2~O %%inline note%%',
+      '',
+      'Visible before %%hidden middle%% visible after, plus unmatched %% marker.',
+      '',
+      'Inline `%%kept_inline%%` and math $a %% b$ plus:',
+      '',
+      '$$',
+      '%% kept tex comment',
+      'x^2 + y^2',
+      '$$',
+      '',
+      '```python',
+      '%%timeit x = 1',
+      'print("%%still_code%%")',
+      '```',
+      '',
+      '## Next ^2^ Section',
+      '',
+      '- [ ] Check ==important== task',
+      '',
+    ].join('\n');
+
+    const normalized=normalizeMarkdownSource(source);
+    expect(normalized.value).not.toContain('Draft header');
+    expect(normalized.value).not.toContain('inline note');
+    expect(normalized.value).not.toContain('hidden middle');
+    expect(normalized.value).toContain('unmatched %% marker.');
+    expect(normalized.value).toContain('`%%kept_inline%%`');
+    expect(normalized.value).toContain('$a %% b$');
+    expect(normalized.value).toContain('%% kept tex comment');
+    expect(normalized.value).toContain('%%timeit x = 1');
+    expect(normalized.originalOffset(normalized.value.indexOf('## Next'))).toBe(source.indexOf('## Next'));
+
+    const analysis=analyzeDocument(source);
+    expect(analysis.outline).toEqual([
+      {id:'water-h2o',title:'Water H2O',level:1,offset:source.indexOf('# Water')},
+      {id:'next-2-section',title:'Next 2 Section',level:2,offset:source.indexOf('## Next')},
+    ]);
+    expect(analysis.tasks).toEqual([source.indexOf('[ ]')+1]);
+    expect(analysis.pythonCells).toEqual([
+      {
+        source:'%%timeit x = 1\nprint("%%still_code%%")',
+        ordinal:0,
+        offset:source.indexOf('```python'),
+      },
+    ]);
+    expect(analysis.blocks.map(b=>b.text).join('')).toBe(source);
+    for(const block of analysis.blocks)expect(source.slice(block.start,block.end)).toBe(block.text);
+  });
 });

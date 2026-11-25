@@ -311,30 +311,54 @@ export interface NormalizeMarkdownOptions {
   encodeLinkDestinations?: boolean;
 }
 
-function maskMath(source:string,mask:Uint8Array):Uint8Array {
-  const out=new Uint8Array(mask);
+function isUnmaskedEscaped(source:string,mask:Uint8Array,at:number):boolean {
+  let slashes=0;
+  for(let j=at-1;j>=0&&!mask[j]&&source[j]==='\\';j--)slashes++;
+  return (slashes&1)===1;
+}
+
+function computeCodeAndMathMask(source:string):Uint8Array {
+  const mask=computeCodeMask(source);
+  if(!source.includes('$'))return mask;
   for(let i=0;i<source.length;){
-    if(out[i]||source[i]!=='$'){i++;continue;}
-    let slashes=0;
-    for(let j=i-1;j>=0&&!out[j]&&source[j]==='\\';j--)slashes++;
-    if((slashes&1)===1){i++;continue;}
-    const isDisplay=source[i+1]==='$';
-    const delimLen=isDisplay?2:1;
-    if(!isDisplay&&(i+1>=source.length||/[ \t\r\n$]/.test(source[i+1]))){i++;continue;}
-    let close=-1;
-    for(let k=i+delimLen;k<source.length;k++){
-      if(out[k])continue;
-      if(!isDisplay&&(source[k]==='\n'||source[k]==='\r'))break;
-      if(source[k]==='$'&&(!isDisplay||source[k+1]==='$')){
-        let bs=0;
-        for(let j=k-1;j>=i+delimLen&&source[j]==='\\';j--)bs++;
-        if((bs&1)===0&&(isDisplay||!/[ \t]/.test(source[k-1]))){close=k+delimLen;break;}
+    if(mask[i]||source[i]!=='$'||isUnmaskedEscaped(source,mask,i)){i++;continue;}
+    if(source[i+1]==='$'&&!mask[i+1]){
+      if(source[i+2]==='$'){while(i<source.length&&source[i]==='$')i++;continue;}
+      let close=-1;
+      for(let j=i+2;j+1<source.length;j++){
+        if(!mask[j]&&!mask[j+1]&&source[j]==='$'&&source[j+1]==='$'&&source[j+2]!=='$'&&!isUnmaskedEscaped(source,mask,j)){close=j;break;}
       }
+      if(close>=0){mask.fill(1,i,close+2);i=close+2;}else i+=2;
+      continue;
     }
-    if(close>0){out.fill(1,i,close);i=close;}
-    else i+=delimLen;
+    const next=source[i+1];
+    if(!next||/\s/.test(next)){i++;continue;}
+    let close=-1;
+    for(let j=i+1;j<source.length;j++){
+      if(source[j]==='\n'){
+        let k=j+1;while(k<source.length&&(source[k]===' '||source[k]==='\t'||source[k]==='\r'))k++;
+        if(source[k]==='\n')break;
+      }
+      if(!mask[j]&&source[j]==='$'&&source[j+1]!=='$'&&!isUnmaskedEscaped(source,mask,j)&&!/\s/.test(source[j-1])&&!/\d/.test(source[j+1]||'')){close=j;break;}
+    }
+    if(close>=0){mask.fill(1,i,close+1);i=close+1;}else i++;
   }
-  return out;
+  return mask;
+}
+
+function stripPercentComments(source:string):Stage {
+  if(!source.includes('%%'))return {value:source,originalOffset:offset=>offset};
+  const mask=computeCodeAndMathMask(source),edits:Edit[]=[];
+  const isDelim=(at:number)=>at+1<source.length&&source[at]==='%'&&source[at+1]==='%'&&!mask[at]&&!mask[at+1]&&!isUnmaskedEscaped(source,mask,at);
+  for(let i=0;i+1<source.length;){
+    if(!isDelim(i)){i++;continue;}
+    let close=-1;
+    for(let j=i+2;j+1<source.length;j++){if(isDelim(j)){close=j;break;}}
+    if(close<0)break;
+    edits.push({start:i,end:close+2,text:''});
+    i=close+2;
+  }
+  return edits.length?replaceStage(source,edits):{value:source,originalOffset:offset=>offset};
 }
 
 /** Render-only syntax normalization with a sparse offset map. Source positions
@@ -346,7 +370,8 @@ export function normalizeMarkdownSource(markdown:string, options:NormalizeMarkdo
   const fm=parseFrontmatter(value);
   if(fm)add(replaceStage(value,[{start:0,end:fm.end,text:''}]));
   else if(value.startsWith('\uFEFF'))add(replaceStage(value,[{start:0,end:1,text:''}]));
-  let ranges=unmaskedRangesFromMask(maskMath(value,computeCodeMask(value)));
+  add(stripPercentComments(value));
+  let ranges=unmaskedRangesFromMask(computeCodeAndMathMask(value));
   const addUnmasked=(regex:RegExp,replacement:(...args:any[])=>string)=>{const next=unmaskedRegexStage(value,ranges,regex,replacement);ranges=next.ranges;add(next.stage);};
   addUnmasked(/!\[\[([^\[\r\n\]|]+)(?:\|([^\r\n\]]+))?\]\]/g,(_all,rawPath:string,label?:string)=>{
     const path=label!==undefined&&rawPath.endsWith('\\')?rawPath.slice(0,-1):rawPath;

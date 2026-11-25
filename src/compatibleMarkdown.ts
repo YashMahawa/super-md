@@ -23,7 +23,7 @@ export async function compatibleMarkdown(markdown:string,documentPath:string|nul
  markdown=normalizeCalloutBlocks(markdown).value;
  const frontmatterEnd=parseFrontmatter(markdown)?.end??0;
  const masked=maskFrontmatter(markdown);
- const processor=unified().use(remarkParse).use(remarkGfm).use(remarkMath).use(remarkObsidianMath);
+ const processor=unified().use(remarkParse).use(remarkGfm,{singleTilde:false}).use(remarkMath).use(remarkObsidianMath);
  const tree=remarkSvgBlocks()(processor.parse(masked),{value:masked});
  const blocks:any[]=[];
  visit(tree,(node:any)=>{if(node.position&&node.position.start.offset>=frontmatterEnd&&(node.type==='code'||node.type==='html'&&looksLikeSvg(node.value)))blocks.push(node);});
