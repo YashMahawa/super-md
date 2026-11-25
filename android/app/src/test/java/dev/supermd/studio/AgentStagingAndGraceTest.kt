@@ -621,6 +621,340 @@ class AgentStagingAndGraceTest {
             shadowOf(Looper.getMainLooper()).idle()
         }
     }
+
+    @Test fun mainActivityOverlappingLifecycleFlushRequiresStagedSnapshotCommitBeforeAcknowledgment() {
+        val workspaceKey = UUID.randomUUID().toString()
+        workspaceKeys += workspaceKey
+        val config = AgentAccessConfig(
+            serverOrigin = "https://relay.example.test",
+            groupId = "group-overlap-flush-1",
+            deviceId = "device-overlap-flush-1",
+            deviceKey = "device-secret-1",
+            pairingKey = "A".repeat(43),
+            connectorKey = "B".repeat(43),
+            displayName = "Pixel Overlap Flush Test",
+            platform = "android",
+        )
+        val harness = FakeRelayTransport(config)
+        AgentAccessState(app).setEnabled(true)
+
+        val intent = Intent(app, MainActivity::class.java).putExtra("workspace", workspaceKey)
+        val controller = Robolectric.buildActivity(MainActivity::class.java, intent)
+        val activity = controller.get()
+        activity.agentConfigOverrideForTest = config
+        activity.agentRelayCallFactoryForTest = harness.callFactory
+        activity.agentRelayWebSocketFactoryForTest = harness.webSocketFactory
+
+        // Use Dispatchers.Main (queued on MainLooper) so IO recovery commits can complete while MainLooper is paused.
+        val bridgeScope = kotlinx.coroutines.CoroutineScope(kotlinx.coroutines.SupervisorJob() + kotlinx.coroutines.Dispatchers.Main)
+        var modelRef: StudioViewModel? = null
+        val releaseInFlight = java.util.concurrent.CountDownLatch(1)
+        val releaseV1RetryWrite = java.util.concurrent.CountDownLatch(1)
+        val releaseV2Retry = java.util.concurrent.CountDownLatch(1)
+        try {
+            controller.create().start().resume()
+            shadowOf(Looper.getMainLooper()).idle()
+            harness.sendServerFrame(JSONObject().put("type", "registered").put("groupId", config.groupId).put("deviceId", config.deviceId))
+            shadowOf(Looper.getMainLooper()).idle()
+            assertEquals(AgentRelayClient.State.CONNECTED, activity.agentRelayState)
+
+            val model = androidx.lifecycle.ViewModelProvider(activity)[StudioViewModel::class.java]
+            modelRef = model
+            model.readerFlushRequester = { true }
+            val testWebView = android.webkit.WebView(activity)
+            activity.setAgentRequestHandlers(
+                bridge = bridge@{ incoming, reply ->
+                    val request = JSONObject(incoming.toString())
+                    val target = checkNotNull(activity.localAgentTabId(request.getString("tabId")))
+                    request.put("tabId", target)
+                    val snapshot = checkNotNull(model.state.value.tabs.firstOrNull { it.id == target })
+                    handleInactiveTabSnapshotRequest(
+                        activity = activity,
+                        model = model,
+                        scope = bridgeScope,
+                        web = testWebView,
+                        request = request,
+                        target = target,
+                        snapshot = snapshot,
+                        canonicalTabId = { note -> "tab:${config.deviceId}:$workspaceKey:${note.id}" },
+                        reply = reply,
+                    )
+                },
+                ui = null,
+            )
+
+            model.open(inactiveUri)
+            await { model.state.value.tabs.any { it.uri == inactiveUri.toString() } }
+            val inactiveId = model.state.value.tabs.single { it.uri == inactiveUri.toString() }.id
+
+            model.open(activeUri)
+            await { model.state.value.tabs.any { it.uri == activeUri.toString() } && model.state.value.active.uri == activeUri.toString() }
+            val activeId = model.state.value.active.id
+            val recoveryFile = File(app.filesDir, "workspaces/$workspaceKey.json")
+            runBlocking { assertTrue(model.flushRecoveryAndAwait()) }
+
+            val baseContent = provider.readText("folder/Inactive.md")
+            val v1Content = baseContent.replace("Original background body.", "Patched across lifecycle flush v1.")
+            val v2Content = v1Content.replace("Patched across lifecycle flush v1.", "Patched across lifecycle flush v2.")
+            val baseRev = agentContentRevision(baseContent)
+            val v1Rev = agentContentRevision(v1Content)
+            val v2Rev = agentContentRevision(v2Content)
+            val canonicalTabId = "tab:${config.deviceId}:$workspaceKey:$inactiveId"
+
+            // Window 1: An earlier write is in flight while stagedState is queued in pending, and
+            // MainActivity.onStop() calls model.flush() (coalescing pending to the unchanged baseline).
+            val inFlightStarted = java.util.concurrent.CountDownLatch(1)
+            val baselineAfterStopWritten = java.util.concurrent.CountDownLatch(1)
+            val v1RetryWriteStarted = java.util.concurrent.CountDownLatch(1)
+            val blockInitialWrite = java.util.concurrent.atomic.AtomicBoolean(true)
+            val stopTriggered = java.util.concurrent.atomic.AtomicBoolean(false)
+
+            model.recoverySnapshotWriter = { writer, state ->
+                val inactiveNote = state.tabs.firstOrNull { it.id == inactiveId }
+                if (blockInitialWrite.compareAndSet(true, false)) {
+                    inFlightStarted.countDown()
+                    releaseInFlight.await(5, java.util.concurrent.TimeUnit.SECONDS)
+                } else if (inactiveNote?.content == v1Content) {
+                    v1RetryWriteStarted.countDown()
+                    releaseV1RetryWrite.await(5, java.util.concurrent.TimeUnit.SECONDS)
+                }
+                NoteRecovery.write(writer, state)
+                if (stopTriggered.get() && inactiveNote?.content == baseContent) {
+                    baselineAfterStopWritten.countDown()
+                }
+            }
+
+            // Start an in-flight baseline flush and wait until it is blocked on IO
+            model.flush()
+            assertTrue("Initial flush should start on IO", inFlightStarted.await(5, java.util.concurrent.TimeUnit.SECONDS))
+
+            // Dispatch inactive-tab patch_tab (v1) so commitAgentSnapshotPatch queues stagedState (v1) in pending
+            harness.sentFrames.clear()
+            harness.sendServerFrame(
+                JSONObject()
+                    .put("type", "request")
+                    .put("requestId", "patch_overlap_1")
+                    .put("deviceId", config.deviceId)
+                    .put("action", "patch_tab")
+                    .put("tabId", canonicalTabId)
+                    .put("expectedRevision", baseRev)
+                    .put("operations", org.json.JSONArray()),
+            )
+            shadowOf(Looper.getMainLooper()).idle()
+            activity.deliverAgentReply(
+                "patch_overlap_1",
+                JSONObject()
+                    .put("tabId", inactiveId)
+                    .put("baseRevision", baseRev)
+                    .put("baseSourceLength", activity.agentSourceLength(baseContent))
+                    .put("revision", v1Rev)
+                    .put("sourceLength", activity.agentSourceLength(v1Content))
+                    .put("patchedContent", v1Content)
+                    .put("changed", true),
+                null,
+            )
+            shadowOf(Looper.getMainLooper()).idle()
+            assertTrue("Patch must not acknowledge before staged write commits", harness.sentFrames.isEmpty())
+
+            // Trigger lifecycle onStop() -> model.flush() while MainLooper is NOT idled afterward,
+            // then release in-flight write so the coalesced baseline flush commits to disk first!
+            stopTriggered.set(true)
+            controller.pause().stop()
+            val stopFlushRev = model.latestScheduledRecoveryRevision()
+            releaseInFlight.countDown()
+            assertTrue(
+                "Overlapping lifecycle baseline flush should write unchanged baseline first",
+                baselineAfterStopWritten.await(5, java.util.concurrent.TimeUnit.SECONDS),
+            )
+            val commitDeadline = System.currentTimeMillis() + 5_000
+            while (model.committedRecoveryRevision() < stopFlushRev && System.currentTimeMillis() < commitDeadline) {
+                Thread.sleep(5)
+            }
+            assertTrue("Overlapping lifecycle baseline flush must commit to disk", model.committedRecoveryRevision() >= stopFlushRev)
+            shadowOf(Looper.getMainLooper()).idle()
+
+            // Even after baseline flush committed, patch MUST NOT be acknowledged until v1 staged retry commits!
+            assertTrue("Retry of v1 staged snapshot should start", v1RetryWriteStarted.await(5, java.util.concurrent.TimeUnit.SECONDS))
+            shadowOf(Looper.getMainLooper()).idle()
+            assertTrue("Uncommitted patch must NOT be acknowledged after baseline flush", harness.sentFrames.isEmpty())
+
+            val onDiskBeforeAck = recoveryFile.bufferedReader().use { NoteRecovery.read(it, StudioState()) }
+            assertEquals(baseContent, onDiskBeforeAck.tabs.single { it.id == inactiveId }.content)
+
+            // Now let the retried staged snapshot commit and verify acknowledgment + durable state
+            releaseV1RetryWrite.countDown()
+            await { harness.sentFrames.isNotEmpty() }
+            val v1Reply = JSONObject(harness.sentFrames.single())
+            assertTrue("Expected successful reply after staged retry commits, got: $v1Reply", v1Reply.isNull("error"))
+            assertEquals(v1Rev, v1Reply.getJSONObject("result").getString("revision"))
+
+            val onDiskAfterV1 = recoveryFile.bufferedReader().use { NoteRecovery.read(it, StudioState()) }
+            val recoveredV1 = onDiskAfterV1.tabs.single { it.id == inactiveId }
+            assertEquals(v1Content, recoveredV1.content)
+            assertTrue(recoveredV1.agentStaged)
+            assertTrue(recoveredV1.agentUnreviewed)
+            assertEquals(1, recoveredV1.agentEdits.size)
+            assertEquals(activeId, model.state.value.activeId)
+
+            // Window 2: Return to foreground, then trigger model.flush() MID-WRITE of v2 stagedState (before commitIfLatest)
+            controller.restart().start().resume()
+            shadowOf(Looper.getMainLooper()).idle()
+
+            val firstV2Attempt = java.util.concurrent.atomic.AtomicBoolean(true)
+            val v2RetryStarted = java.util.concurrent.CountDownLatch(1)
+            model.recoverySnapshotWriter = { writer, state ->
+                val inactiveNote = state.tabs.firstOrNull { it.id == inactiveId }
+                NoteRecovery.write(writer, state)
+                if (inactiveNote?.content == v2Content) {
+                    if (firstV2Attempt.compareAndSet(true, false)) {
+                        // Submit unchanged v1 baseline via lifecycle flush right before commitIfLatest!
+                        model.flush()
+                    } else {
+                        v2RetryStarted.countDown()
+                        releaseV2Retry.await(5, java.util.concurrent.TimeUnit.SECONDS)
+                    }
+                }
+            }
+
+            harness.sentFrames.clear()
+            harness.sendServerFrame(
+                JSONObject()
+                    .put("type", "request")
+                    .put("requestId", "patch_overlap_2")
+                    .put("deviceId", config.deviceId)
+                    .put("action", "patch_tab")
+                    .put("tabId", canonicalTabId)
+                    .put("expectedRevision", v1Rev)
+                    .put("operations", org.json.JSONArray()),
+            )
+            shadowOf(Looper.getMainLooper()).idle()
+            activity.deliverAgentReply(
+                "patch_overlap_2",
+                JSONObject()
+                    .put("tabId", inactiveId)
+                    .put("baseRevision", v1Rev)
+                    .put("baseSourceLength", activity.agentSourceLength(v1Content))
+                    .put("revision", v2Rev)
+                    .put("sourceLength", activity.agentSourceLength(v2Content))
+                    .put("patchedContent", v2Content)
+                    .put("changed", true),
+                null,
+            )
+            val waitDeadline = System.currentTimeMillis() + 5_000
+            while (v2RetryStarted.count > 0 && System.currentTimeMillis() < waitDeadline) {
+                shadowOf(Looper.getMainLooper()).idle()
+                Thread.sleep(10)
+            }
+            assertEquals("Mid-write superseded patch must retry staged write", 0L, v2RetryStarted.count)
+            shadowOf(Looper.getMainLooper()).idle()
+            assertTrue("Mid-write superseded patch must NOT acknowledge before retry commits", harness.sentFrames.isEmpty())
+
+            releaseV2Retry.countDown()
+            await { harness.sentFrames.isNotEmpty() }
+            val v2Reply = JSONObject(harness.sentFrames.single())
+            assertTrue("Expected successful v2 reply after retry commits, got: $v2Reply", v2Reply.isNull("error"))
+            assertEquals(v2Rev, v2Reply.getJSONObject("result").getString("revision"))
+
+            val onDiskAfterV2 = recoveryFile.bufferedReader().use { NoteRecovery.read(it, StudioState()) }
+            val recoveredV2 = onDiskAfterV2.tabs.single { it.id == inactiveId }
+            assertEquals(v2Content, recoveredV2.content)
+            assertTrue(recoveredV2.agentStaged)
+            assertEquals(2, recoveredV2.agentEdits.size)
+            assertEquals(0, provider.writesFor("folder/Inactive.md"))
+        } finally {
+            releaseInFlight.countDown()
+            releaseV1RetryWrite.countDown()
+            releaseV2Retry.countDown()
+            modelRef?.recoverySnapshotWriter = NoteRecovery::write
+            bridgeScope.coroutineContext[kotlinx.coroutines.Job]?.cancel()
+            runCatching { controller.destroy() }
+            shadowOf(Looper.getMainLooper()).idle()
+        }
+    }
+
+    @Test fun unrelatedEditsBoundStagingRetryUnderDocumentWritesSoSavesAreNotHeldIndefinitely() {
+        val (workspaceKey, model) = newModel()
+        model.open(inactiveUri)
+        await { model.state.value.tabs.any { it.uri == inactiveUri.toString() } }
+        val inactiveId = model.state.value.tabs.single { it.uri == inactiveUri.toString() }.id
+
+        model.open(activeUri)
+        await { model.state.value.tabs.any { it.uri == activeUri.toString() } && model.state.value.active.uri == activeUri.toString() }
+        val activeId = model.state.value.active.id
+
+        val baseContent = provider.readText("folder/Inactive.md")
+        val patchedContent = baseContent.replace("Original background body.", "Patched during active typing storm.")
+        val baseRev = agentContentRevision(baseContent)
+        val patchedRev = agentContentRevision(patchedContent)
+
+        val stagedAttempts = AtomicInteger(0)
+        val injectConcurrentActiveEdits = java.util.concurrent.atomic.AtomicBoolean(true)
+        val firstStageEntered = java.util.concurrent.CountDownLatch(1)
+
+        model.recoverySnapshotWriter = { writer, state ->
+            val inactiveNote = state.tabs.firstOrNull { it.id == inactiveId }
+            NoteRecovery.write(writer, state)
+            if (injectConcurrentActiveEdits.get() && inactiveNote?.content == patchedContent) {
+                val n = stagedAttempts.incrementAndGet()
+                // Simulate continuous unrelated edits on the active tab during every stage attempt
+                model.edit(activeId, "# Active\n\nConcurrent active edit #$n.\n")
+                firstStageEntered.countDown()
+            }
+        }
+
+        // Run commitAgentSnapshotPatch on a background thread while concurrently triggering saveManual() on the active tab
+        var patchError: Throwable? = null
+        val patchThread = Thread {
+            patchError = runCatching {
+                runBlocking {
+                    model.commitAgentSnapshotPatch(inactiveId, baseRev, patchedContent, patchedRev)
+                }
+            }.exceptionOrNull()
+        }.apply { start() }
+
+        assertTrue("Staged write should start", firstStageEntered.await(5, java.util.concurrent.TimeUnit.SECONDS))
+        // Queue a manual save on the active tab while documentWrites is held by commitAgentSnapshotPatch
+        model.saveManual()
+
+        patchThread.join(5_000)
+        assertFalse("commitAgentSnapshotPatch must be bounded and never hang under continuous unrelated edits", patchThread.isAlive)
+        assertEquals("Staging retries while holding documentWrites must be bounded to MAX_AGENT_STAGE_ATTEMPTS", MAX_AGENT_STAGE_ATTEMPTS, stagedAttempts.get())
+        assertTrue("Expected recoverable IllegalStateException, got: $patchError", patchError is IllegalStateException)
+        assertTrue("Error should instruct caller to retry: ${patchError?.message}", patchError?.message.orEmpty().contains("retry", ignoreCase = true))
+        assertFalse("Error must not misreport revision conflict: ${patchError?.message}", patchError?.message.orEmpty().contains("revision conflict", ignoreCase = true))
+
+        // Active tab manual save must complete promptly once bounded retry releases documentWrites!
+        val expectedSavedActive = "# Active\n\nConcurrent active edit #$MAX_AGENT_STAGE_ATTEMPTS.\n"
+        await { provider.writesFor("folder/Active.md") >= 1 && provider.readText("folder/Active.md") == expectedSavedActive }
+        assertEquals(0, provider.writesFor("folder/Inactive.md"))
+
+        // Inactive tab remains unpatched in memory and in durable recovery
+        val unchangedInactive = model.state.value.tabs.single { it.id == inactiveId }
+        assertEquals(baseContent, unchangedInactive.content)
+        assertFalse(unchangedInactive.agentStaged)
+        assertFalse(unchangedInactive.agentUnreviewed)
+        assertTrue(unchangedInactive.agentEdits.isEmpty())
+
+        injectConcurrentActiveEdits.set(false)
+        runBlocking { assertTrue(model.flushRecoveryAndAwait()) }
+        val recoveryFile = File(app.filesDir, "workspaces/$workspaceKey.json")
+        val recoveredAfterStorm = recoveryFile.bufferedReader().use { NoteRecovery.read(it, StudioState()) }
+        assertEquals(baseContent, recoveredAfterStorm.tabs.single { it.id == inactiveId }.content)
+        assertEquals(expectedSavedActive, recoveredAfterStorm.tabs.single { it.id == activeId }.content)
+
+        // Once the edit storm subsides, retrying with the exact same baseRev succeeds cleanly
+        stagedAttempts.set(0)
+        model.recoverySnapshotWriter = NoteRecovery::write
+        runBlocking {
+            model.commitAgentSnapshotPatch(inactiveId, baseRev, patchedContent, patchedRev)
+        }
+        val stagedNote = model.state.value.tabs.single { it.id == inactiveId }
+        assertEquals(patchedContent, stagedNote.content)
+        assertTrue(stagedNote.agentStaged)
+        assertEquals(1, stagedNote.agentEdits.size)
+        val recoveredFinal = recoveryFile.bufferedReader().use { NoteRecovery.read(it, StudioState()) }
+        assertEquals(patchedContent, recoveredFinal.tabs.single { it.id == inactiveId }.content)
+    }
 }
 
 private class FakeRelayTransport(private val config: AgentAccessConfig) {

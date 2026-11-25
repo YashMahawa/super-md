@@ -50,6 +50,7 @@ data class Note(
 private class ExternalConflictDetectedException : RuntimeException()
 internal const val MAX_AGENT_SNAPSHOT_BYTES = 2 * 1024 * 1024
 internal const val MAX_AGENT_EDIT_STEPS = 60
+internal const val MAX_AGENT_STAGE_ATTEMPTS = 3
 internal fun boundAgentEditSteps(steps: List<AgentEditStep>): List<AgentEditStep> {
     if (steps.isEmpty()) return emptyList()
     val candidate = steps.takeLast(MAX_AGENT_EDIT_STEPS).toMutableList()
@@ -408,8 +409,10 @@ class StudioViewModel(app: Application, val workspaceKey: String = "main") : And
     private val closingNoteIds = java.util.concurrent.ConcurrentHashMap.newKeySet<String>()
     private val closedNoteMutex = Mutex()
     private val mutable = MutableStateFlow(restore())
+    private val recoveryStateLock = Any()
     private var agentEditSeq: Long = mutable.value.tabs.flatMap { it.agentEdits }.maxOfOrNull { it.seq } ?: 0L
     private val viewModelRetired = AtomicBoolean(false)
+    @Volatile internal var maxAgentStageAttempts: Int = MAX_AGENT_STAGE_ATTEMPTS
     @Volatile internal var recoverySnapshotWriter: (java.io.Writer, StudioState) -> Unit = NoteRecovery::write
     private val recoveryWriter = LatestRecoveryWriter<StudioState, RecoverySnapshotSignature>(
         scope = RecoveryWriterScope.scope,
@@ -806,10 +809,12 @@ class StudioViewModel(app: Application, val workspaceKey: String = "main") : And
         }
     }
     override fun onCleared() {
-        viewModelRetired.set(true)
+        synchronized(recoveryStateLock) {
+            viewModelRetired.set(true)
+            recoveryWriter.closeAfterLatest(mutable.value)
+        }
         folderSearchJob?.cancel()
         invalidateAllNoteAssets()
-        recoveryWriter.closeAfterLatest(mutable.value)
         prefs.unregisterOnSharedPreferenceChangeListener(preferencesChanged)
         resolver.unregisterContentObserver(documentObserver)
         resolver.unregisterContentObserver(themeObserver)
@@ -1069,12 +1074,15 @@ class StudioViewModel(app: Application, val workspaceKey: String = "main") : And
     }
 
     private fun change(block: (StudioState) -> StudioState) {
-        val previous = mutable.value
-        val next = block(previous)
-        mutable.value = next
+        val (previous, next) = synchronized(recoveryStateLock) {
+            val previous = mutable.value
+            val next = block(previous)
+            mutable.value = next
+            if (!viewModelRetired.get()) recoveryWriter.schedule(next)
+            previous to next
+        }
         syncNoteAssetScopes(previous, next)
         observeActive()
-        schedulePersist()
     }
     private fun restore(): StudioState {
         var s = StudioState(theme = prefs.getString("theme", "system")!!, fullscreenTheme = prefs.getString("fullTheme", "black")!!, motion = prefs.getBoolean("motion", true), welcomed = prefs.getBoolean("welcomed", false), font = prefs.getString("font", "Manrope")!!, size = prefs.getFloat("size", 15f), folder = windowPrefs.getString("folder", if (workspaceKey == "main" && !windowPrefs.getBoolean("folderMigrated", false)) prefs.getString("folder", null) else null), pdf = prefs.getString("pdf", null) ?: StudioState().pdf)
@@ -1127,9 +1135,14 @@ class StudioViewModel(app: Application, val workspaceKey: String = "main") : And
     private fun recoverySignature(state: StudioState) = RecoverySnapshotSignature(
         state.tabs, state.closedTabs, state.activeId, state.mode, state.normalZoom, state.fullscreenZoom, state.agentJumpTabId,
     )
-    private fun schedulePersist() { recoveryWriter.schedule(mutable.value) }
-    fun flush(): Job? = recoveryWriter.flush(mutable.value)
-    internal suspend fun flushRecoveryAndAwait(): Boolean = recoveryWriter.flushAndAwait(mutable.value)
+    private fun schedulePersist() { synchronized(recoveryStateLock) { if (!viewModelRetired.get()) recoveryWriter.schedule(mutable.value) } }
+    fun flush(): Job? = synchronized(recoveryStateLock) { recoveryWriter.flush(mutable.value) }
+    internal fun latestScheduledRecoveryRevision(): Long = recoveryWriter.latestScheduledRevision()
+    internal fun committedRecoveryRevision(): Long = recoveryWriter.committedRevision()
+    internal suspend fun flushRecoveryAndAwait(): Boolean {
+        val revision = synchronized(recoveryStateLock) { recoveryWriter.submitImmediate(mutable.value) } ?: return false
+        return recoveryWriter.awaitRevisionResult(revision)
+    }
     // The exact String the reader last sent per note. Echoing it back on every
     // keystroke re-serializes the whole note on both sides and costs battery.
     val readerEcho = java.util.concurrent.ConcurrentHashMap<String, String>()
@@ -1252,7 +1265,7 @@ class StudioViewModel(app: Application, val workspaceKey: String = "main") : And
     /** Commit an inactive-note patch computed from an immutable reader snapshot. */
     internal suspend fun commitAgentSnapshotPatch(id: String, expectedRevision: String, patchedContent: String, patchedRevision: String) = documentWrites.withLock {
         require(patchedContent.toByteArray(Charsets.UTF_8).size <= MAX_AGENT_SNAPSHOT_BYTES) { "The patched document exceeds Android's 2 MiB relay snapshot limit" }
-        val baseState = mutable.value
+        val baseState = synchronized(recoveryStateLock) { mutable.value }
         val note = baseState.tabs.firstOrNull { it.id == id } ?: error("The requested note is no longer open")
         val currentRevision = java.security.MessageDigest.getInstance("SHA-256")
             .digest(note.content.toByteArray(Charsets.UTF_8)).joinToString("") { "%02x".format(it) }
@@ -1261,6 +1274,7 @@ class StudioViewModel(app: Application, val workspaceKey: String = "main") : And
             .digest(patchedContent.toByteArray(Charsets.UTF_8)).joinToString("") { "%02x".format(it) }
         require(actualPatchedRevision.equals(patchedRevision, ignoreCase = true)) { "The computed patch failed revision verification" }
         require(!closingNoteIds.contains(id)) { "The note is closing; retry the patch after it remains open" }
+        val maxAttempts = maxAgentStageAttempts.coerceAtLeast(1)
         if (note.content != patchedContent) {
             val nextSeq = maxOf(agentEditSeq, note.agentEdits.maxOfOrNull { it.seq } ?: 0L) + 1L
             val updatedEdits = appendAgentEditSteps(note.agentEdits, nextSeq, note.content, patchedContent)
@@ -1280,40 +1294,112 @@ class StudioViewModel(app: Application, val workspaceKey: String = "main") : And
             }
             var observedBase = baseState
             var stagedState = buildPatchedState(observedBase)
-            while (true) {
-                if (!recoveryWriter.flushAndAwait(stagedState)) {
-                    if (!viewModelRetired.get()) recoveryWriter.schedule(mutable.value)
+            var anyAttemptCommitted = false
+            var committedTransition: Pair<StudioState, StudioState>? = null
+            for (attempt in 0 until maxAttempts) {
+                val outcome = recoveryWriter.flushAndAwaitExact(stagedState)
+                if (outcome.result == LatestRecoveryWriter.ExactFlushResult.COMMITTED) {
+                    anyAttemptCommitted = true
+                }
+                if (outcome.result == LatestRecoveryWriter.ExactFlushResult.FAILED) {
+                    synchronized(recoveryStateLock) {
+                        if (!viewModelRetired.get()) {
+                            if (anyAttemptCommitted) recoveryWriter.flush(mutable.value)
+                            else recoveryWriter.schedule(mutable.value)
+                        }
+                    }
                     throw IllegalStateException("Could not save recovery snapshot for the agent patch; retry the patch")
                 }
-                val latest = mutable.value
-                val latestNote = latest.tabs.firstOrNull { it.id == id }
-                if (latestNote == null || closingNoteIds.contains(id)) {
-                    if (!viewModelRetired.get()) recoveryWriter.flush(latest)
-                    error(if (latestNote == null) "The requested note is no longer open" else "The note is closing; retry the patch after it remains open")
+                val isLastAttempt = attempt == maxAttempts - 1
+                synchronized(recoveryStateLock) {
+                    if (viewModelRetired.get()) {
+                        throw IllegalStateException("Could not save recovery snapshot for the agent patch; retry the patch")
+                    }
+                    while (true) {
+                        val latest = mutable.value
+                        val latestNote = latest.tabs.firstOrNull { it.id == id }
+                        if (latestNote == null || closingNoteIds.contains(id)) {
+                            recoveryWriter.flush(latest)
+                            error(if (latestNote == null) "The requested note is no longer open" else "The note is closing; retry the patch after it remains open")
+                        }
+                        if (latestNote.content != note.content) {
+                            recoveryWriter.flush(latest)
+                            throw IllegalArgumentException("Revision conflict: the note changed before the patch could be saved")
+                        }
+                        if (outcome.result == LatestRecoveryWriter.ExactFlushResult.COMMITTED &&
+                            recoverySignature(latest) == recoverySignature(observedBase) &&
+                            recoveryWriter.committedRevision() == outcome.revision &&
+                            recoveryWriter.latestScheduledRevision() == outcome.revision
+                        ) {
+                            val committedState = if (latest === observedBase) {
+                                stagedState
+                            } else {
+                                latest.copy(tabs = stagedState.tabs, agentJumpTabId = stagedState.agentJumpTabId)
+                            }
+                            if (!mutable.compareAndSet(latest, committedState)) continue
+                            agentEditSeq = maxOf(agentEditSeq, nextSeq)
+                            readerEcho.remove(id)
+                            clearReaderEditProtocol(id)
+                            committedTransition = latest to committedState
+                        } else if (isLastAttempt) {
+                            recoveryWriter.flush(latest)
+                            throw IllegalStateException("Could not confirm recovery snapshot for the agent patch during concurrent workspace activity; retry the patch")
+                        } else {
+                            observedBase = latest
+                            stagedState = buildPatchedState(observedBase)
+                        }
+                        break
+                    }
                 }
-                if (latestNote.content != note.content) {
-                    if (!viewModelRetired.get()) recoveryWriter.flush(latest)
-                    throw IllegalArgumentException("Revision conflict: the note changed before the patch could be saved")
-                }
-                if (recoverySignature(latest) == recoverySignature(observedBase)) {
-                    val committedState = if (latest === observedBase) stagedState else buildPatchedState(latest)
+                val transition = committedTransition
+                if (transition != null) {
+                    val (previous, committedState) = transition
                     val isInactive = committedState.active.id != id
-                    agentEditSeq = maxOf(agentEditSeq, nextSeq)
-                    readerEcho.remove(id)
-                    clearReaderEditProtocol(id)
-                    mutable.value = committedState
-                    syncNoteAssetScopes(latest, committedState)
+                    syncNoteAssetScopes(previous, committedState)
                     observeActive()
                     if (!isInactive) scheduleAutosave(id)
                     break
                 }
-                observedBase = latest
-                stagedState = buildPatchedState(observedBase)
             }
         } else if (baseState.active.id != id && (note.dirty || note.agentStaged)) {
-            if (!recoveryWriter.flushAndAwait(mutable.value)) {
-                if (!viewModelRetired.get()) recoveryWriter.schedule(mutable.value)
-                throw IllegalStateException("Could not save recovery snapshot for the agent patch; retry the patch")
+            var currentState = baseState
+            for (attempt in 0 until maxAttempts) {
+                val outcome = recoveryWriter.flushAndAwaitExact(currentState)
+                if (outcome.result == LatestRecoveryWriter.ExactFlushResult.FAILED) {
+                    synchronized(recoveryStateLock) {
+                        if (!viewModelRetired.get()) recoveryWriter.schedule(mutable.value)
+                    }
+                    throw IllegalStateException("Could not save recovery snapshot for the agent patch; retry the patch")
+                }
+                val isLastAttempt = attempt == maxAttempts - 1
+                var confirmed = false
+                synchronized(recoveryStateLock) {
+                    if (viewModelRetired.get()) {
+                        throw IllegalStateException("Could not save recovery snapshot for the agent patch; retry the patch")
+                    }
+                    val latest = mutable.value
+                    val latestNote = latest.tabs.firstOrNull { it.id == id }
+                    if (latestNote == null || closingNoteIds.contains(id)) {
+                        recoveryWriter.flush(latest)
+                        error(if (latestNote == null) "The requested note is no longer open" else "The note is closing; retry the patch after it remains open")
+                    }
+                    if (latestNote.content != note.content) {
+                        recoveryWriter.flush(latest)
+                        throw IllegalArgumentException("Revision conflict: the note changed before the patch could be saved")
+                    }
+                    if (outcome.result == LatestRecoveryWriter.ExactFlushResult.COMMITTED &&
+                        recoveryWriter.committedRevision() == outcome.revision &&
+                        recoveryWriter.latestScheduledRevision() == outcome.revision
+                    ) {
+                        confirmed = true
+                    } else if (isLastAttempt) {
+                        recoveryWriter.flush(latest)
+                        throw IllegalStateException("Could not confirm recovery snapshot for the agent patch during concurrent workspace activity; retry the patch")
+                    } else {
+                        currentState = latest
+                    }
+                }
+                if (confirmed) break
             }
         }
     }
