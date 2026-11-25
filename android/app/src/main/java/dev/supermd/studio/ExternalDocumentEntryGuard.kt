@@ -16,6 +16,11 @@ import java.io.InputStream
 import java.nio.file.Files
 import java.nio.file.Paths
 
+internal data class ExternalIntentCaller(
+    val uid: Int? = null,
+    val callerGrantedOwnShareUri: Boolean = false,
+)
+
 internal sealed interface ExternalDocumentDecision {
     data object NoDocument : ExternalDocumentDecision
     data class Allowed(val uri: Uri, val intentFlags: Int) : ExternalDocumentDecision
@@ -53,6 +58,7 @@ internal object ExternalDocumentEntryGuard {
         savedInstanceState: Bundle?,
         initial: Boolean,
         targetModel: StudioViewModel,
+        caller: ExternalIntentCaller = ExternalIntentCaller(),
     ) {
         val rawUri = incoming?.data ?: return
         if (initial && savedInstanceState != null) {
@@ -61,12 +67,12 @@ internal object ExternalDocumentEntryGuard {
                 return
             }
         }
-        when (val decision = validateIncomingIntent(context, incoming)) {
+        when (val decision = validateIncomingIntent(context, incoming, caller)) {
             ExternalDocumentDecision.NoDocument -> Unit
             is ExternalDocumentDecision.Allowed -> {
-                persistOfferedIntentGrants(context, decision.uri, decision.intentFlags)
-                if (initial) targetModel.requestInitialExternalOpen(decision.uri, decision.intentFlags)
-                else targetModel.requestExternalOpen(decision.uri, decision.intentFlags)
+                persistOfferedIntentGrants(context, decision.uri, decision.intentFlags, caller)
+                if (initial) targetModel.requestInitialExternalOpen(decision.uri, decision.intentFlags, caller)
+                else targetModel.requestExternalOpen(decision.uri, decision.intentFlags, caller)
             }
             is ExternalDocumentDecision.ExpiredGrant -> {
                 targetModel.handleExpiredExternalOpenGrant(decision.uri, initial = initial)
@@ -77,20 +83,29 @@ internal object ExternalDocumentEntryGuard {
         }
     }
 
-    fun validateIncomingIntent(context: Context, intent: Intent?): ExternalDocumentDecision {
+    fun validateIncomingIntent(
+        context: Context,
+        intent: Intent?,
+        caller: ExternalIntentCaller = ExternalIntentCaller(),
+    ): ExternalDocumentDecision {
         val uri = intent?.data ?: return ExternalDocumentDecision.NoDocument
         val action = intent.action
         if (action != null && action !in allowedActions) {
             return ExternalDocumentDecision.Rejected(uri, "Unsupported document intent action")
         }
         return when (uri.scheme?.lowercase()) {
-            "content" -> validateContentIntent(context, uri, intent.flags)
+            "content" -> validateContentIntent(context, uri, intent.flags, caller)
             "file" -> validateFileIntent(context, uri, intent.flags)
             else -> ExternalDocumentDecision.Rejected(uri, "Unsupported document URI scheme")
         }
     }
 
-    private fun validateContentIntent(context: Context, uri: Uri, intentFlags: Int): ExternalDocumentDecision {
+    private fun validateContentIntent(
+        context: Context,
+        uri: Uri,
+        intentFlags: Int,
+        caller: ExternalIntentCaller,
+    ): ExternalDocumentDecision {
         if (uri.authority.isNullOrBlank()) {
             return ExternalDocumentDecision.Rejected(uri, "Missing document provider authority")
         }
@@ -100,7 +115,7 @@ internal object ExternalDocumentEntryGuard {
         if ((intentFlags and Intent.FLAG_GRANT_READ_URI_PERMISSION) == 0) {
             return ExternalDocumentDecision.Rejected(uri, "Document read access was not granted by the caller")
         }
-        if (!hasDirectReadUriPermission(context, uri)) {
+        if (!hasDirectReadUriPermission(context, uri, caller)) {
             return ExternalDocumentDecision.ExpiredGrant(uri)
         }
         return ExternalDocumentDecision.Allowed(uri, intentFlags)
@@ -124,20 +139,52 @@ internal object ExternalDocumentEntryGuard {
         return ExternalDocumentDecision.Allowed(uri, intentFlags)
     }
 
-    fun hasDirectReadUriPermission(context: Context, uri: Uri): Boolean =
-        uri.scheme.equals("content", ignoreCase = true) &&
+    fun hasDirectReadUriPermission(
+        context: Context,
+        uri: Uri,
+        caller: ExternalIntentCaller = ExternalIntentCaller(),
+    ): Boolean {
+        if (!uri.scheme.equals("content", ignoreCase = true)) return false
+        if (
             context.checkUriPermission(
                 uri,
                 Process.myPid(),
                 Process.myUid(),
                 Intent.FLAG_GRANT_READ_URI_PERMISSION,
             ) == PackageManager.PERMISSION_GRANTED
+        ) {
+            return true
+        }
+        // On Android, UriGrantsManagerService skips inserting a dynamic UriPermission
+        // record into mGrantedUriPermissions when targetUid already owns the provider
+        // (${packageName}.share). Verify the kernel-authenticated caller instead so
+        // legitimate own-share launches succeed while ungranted external callers fail.
+        if (uri.authority == "${context.packageName}.share") {
+            if (caller.callerGrantedOwnShareUri) return true
+            val uid = caller.uid
+            if (uid != null && uid > 0) {
+                if (uid == Process.myUid()) return true
+                return context.checkUriPermission(
+                    uri,
+                    -1,
+                    uid,
+                    Intent.FLAG_GRANT_READ_URI_PERMISSION,
+                ) == PackageManager.PERMISSION_GRANTED
+            }
+        }
+        return false
+    }
 
-    fun persistOfferedIntentGrants(context: Context, uri: Uri, intentFlags: Int) {
+    fun persistOfferedIntentGrants(
+        context: Context,
+        uri: Uri,
+        intentFlags: Int,
+        caller: ExternalIntentCaller = ExternalIntentCaller(),
+    ) {
         if (!uri.scheme.equals("content", ignoreCase = true)) return
         if ((intentFlags and Intent.FLAG_GRANT_PERSISTABLE_URI_PERMISSION) == 0) return
         if ((intentFlags and Intent.FLAG_GRANT_READ_URI_PERMISSION) == 0) return
-        if (!hasDirectReadUriPermission(context, uri)) return
+        if (!hasDirectReadUriPermission(context, uri, caller)) return
         val resolver = context.contentResolver
         try {
             resolver.takePersistableUriPermission(uri, Intent.FLAG_GRANT_READ_URI_PERMISSION)
@@ -178,6 +225,7 @@ internal object ExternalDocumentEntryGuard {
         resolver: ContentResolver,
         uri: Uri,
         intentFlags: Int,
+        caller: ExternalIntentCaller = ExternalIntentCaller(),
     ): InputStream {
         return when (uri.scheme?.lowercase()) {
             "content" -> {
@@ -185,10 +233,10 @@ internal object ExternalDocumentEntryGuard {
                 require((intentFlags and Intent.FLAG_GRANT_READ_URI_PERMISSION) != 0) {
                     "Document read access was not granted by the caller"
                 }
-                if (!hasDirectReadUriPermission(context, uri)) {
+                if (!hasDirectReadUriPermission(context, uri, caller)) {
                     throw SecurityException("Document permission expired; choose it again")
                 }
-                persistOfferedIntentGrants(context, uri, intentFlags)
+                persistOfferedIntentGrants(context, uri, intentFlags, caller)
                 val pfd = resolver.openFileDescriptor(uri, "r")
                     ?: error("Document permission is unavailable; choose it again")
                 try {

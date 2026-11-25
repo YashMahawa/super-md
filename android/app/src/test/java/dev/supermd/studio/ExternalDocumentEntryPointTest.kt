@@ -379,7 +379,10 @@ class ExternalDocumentEntryPointTest {
         assertFalse(model.state.value.tabs.any { it.uri == evilUri.toString() })
         assertTrue(model.state.value.error!!.contains("App-private paths cannot be opened externally"))
 
-        // Verify legitimate FileProvider share export inside cacheDir/share/ WITH grant flag still opens cleanly.
+        // Verify legitimate FileProvider share export inside cacheDir/share/:
+        // On real Android OS, UriGrantsManagerService does not insert a dynamic UriPermission for
+        // our own UID on ${packageName}.share. Authorized callers must open cleanly, while ungranted
+        // external callers attempting confused-deputy access must fail.
         val shareAuthority = "${app.packageName}.share"
         val fileProvider = FileProvider()
         fileProvider.attachInfo(
@@ -398,15 +401,29 @@ class ExternalDocumentEntryPointTest {
             writeText("# Shared note via FileProvider\n")
         }
         val shareUri = FileProvider.getUriForFile(app, shareAuthority, sharedNote)
-        app.grantUriPermission(app.packageName, shareUri, Intent.FLAG_GRANT_READ_URI_PERMISSION)
+        val sameAppCaller = ExternalIntentCaller(uid = android.os.Process.myUid(), callerGrantedOwnShareUri = false)
+        val untrustedExternalCaller = ExternalIntentCaller(uid = android.os.Process.myUid() + 1000, callerGrantedOwnShareUri = false)
 
-        // Without FLAG_GRANT_READ_URI_PERMISSION -> rejected!
+        // 1. Without FLAG_GRANT_READ_URI_PERMISSION -> rejected even for same-app caller!
         val ungrantedShare = Intent(Intent.ACTION_VIEW, shareUri)
-        assertTrue(ExternalDocumentEntryGuard.validateIncomingIntent(app, ungrantedShare) is ExternalDocumentDecision.Rejected)
+        assertTrue(ExternalDocumentEntryGuard.validateIncomingIntent(app, ungrantedShare, sameAppCaller) is ExternalDocumentDecision.Rejected)
 
-        // With FLAG_GRANT_READ_URI_PERMISSION -> opens cleanly!
+        // 2. With FLAG_GRANT_READ_URI_PERMISSION, an ungranted external caller is denied (no confused deputy)!
         val grantedShare = Intent(Intent.ACTION_VIEW, shareUri).addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
-        ExternalDocumentEntryGuard.dispatchIncomingIntent(app, grantedShare, savedInstanceState = null, initial = false, targetModel = model)
+        assertEquals(
+            ExternalDocumentDecision.ExpiredGrant(shareUri),
+            ExternalDocumentEntryGuard.validateIncomingIntent(app, grantedShare, untrustedExternalCaller),
+        )
+
+        // 3. With FLAG_GRANT_READ_URI_PERMISSION and authorized caller, opens cleanly without needing a self-UID UriPermission entry!
+        ExternalDocumentEntryGuard.dispatchIncomingIntent(
+            context = app,
+            incoming = grantedShare,
+            savedInstanceState = null,
+            initial = false,
+            targetModel = model,
+            caller = sameAppCaller,
+        )
         await { model.state.value.active.uri == shareUri.toString() }
         assertEquals("# Shared note via FileProvider\n", model.state.value.active.content)
     }
@@ -426,7 +443,12 @@ class ExternalDocumentEntryPointTest {
     private fun attachModelOpenHandler(model: StudioViewModel) {
         model.attachReaderOpenHandler(
             OpenIntentDispatcher.Handler { target, relative ->
-                model.open(target.uri, relative, externalIntentFlags = target.externalIntentFlags)
+                model.openDocument(
+                    target.uri,
+                    relative,
+                    externalIntentFlags = target.externalIntentFlags,
+                    externalCaller = target.externalCaller,
+                )
             },
         )
     }

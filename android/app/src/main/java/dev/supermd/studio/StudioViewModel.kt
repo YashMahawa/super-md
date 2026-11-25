@@ -38,6 +38,7 @@ private class ExternalConflictDetectedException : RuntimeException()
 internal data class OpenDocumentTarget(
     val uri: Uri,
     val externalIntentFlags: Int? = null,
+    val externalCaller: ExternalIntentCaller = ExternalIntentCaller(),
 )
 internal const val MAX_AGENT_SNAPSHOT_BYTES = 2 * 1024 * 1024
 internal enum class PortableSaveRecovery { ORIGINAL_INTACT, RESTORE_OUR_WRITE, LEAVE_CONCURRENT_BYTES }
@@ -319,13 +320,22 @@ class StudioViewModel(app: Application, val workspaceKey: String = "main") : And
         initialOpenIntentUri = key
         requestOpen(uri)
     }
-    internal fun requestExternalOpen(uri: Uri, intentFlags: Int) =
-        openIntentDispatcher.request(OpenDocumentTarget(uri, externalIntentFlags = intentFlags))
-    internal fun requestInitialExternalOpen(uri: Uri, intentFlags: Int) {
+    internal fun requestExternalOpen(
+        uri: Uri,
+        intentFlags: Int,
+        caller: ExternalIntentCaller = ExternalIntentCaller(),
+    ) = openIntentDispatcher.request(
+        OpenDocumentTarget(uri, externalIntentFlags = intentFlags, externalCaller = caller),
+    )
+    internal fun requestInitialExternalOpen(
+        uri: Uri,
+        intentFlags: Int,
+        caller: ExternalIntentCaller = ExternalIntentCaller(),
+    ) {
         val key = uri.toString()
         if (initialOpenIntentUri == key) return
         initialOpenIntentUri = key
-        requestExternalOpen(uri, intentFlags)
+        requestExternalOpen(uri, intentFlags, caller)
     }
     internal fun handleExpiredExternalOpenGrant(uri: Uri, initial: Boolean) {
         if (initial) {
@@ -1894,7 +1904,14 @@ class StudioViewModel(app: Application, val workspaceKey: String = "main") : And
         }
         mutable.value.tabs.firstOrNull { it.id == (existing?.id ?: note.id) }?.let(::remember)
     }
-    fun open(uri: Uri, relative: String? = null, externalIntentFlags: Int? = null): Job {
+    fun open(uri: Uri, relative: String? = null): Job =
+        openDocument(uri, relative)
+    internal fun openDocument(
+        uri: Uri,
+        relative: String? = null,
+        externalIntentFlags: Int? = null,
+        externalCaller: ExternalIntentCaller = ExternalIntentCaller(),
+    ): Job {
         val request = openRequests.begin()
         return viewModelScope.launch {
         try {
@@ -1913,7 +1930,7 @@ class StudioViewModel(app: Application, val workspaceKey: String = "main") : And
                 // but must never reload older disk bytes over its edits.
                 if (existing != null) {
                     val verifyStream = if (externalIntentFlags != null) {
-                        ExternalDocumentEntryGuard.openVerifiedExternalInputStream(app, resolver, target, externalIntentFlags)
+                        ExternalDocumentEntryGuard.openVerifiedExternalInputStream(app, resolver, target, externalIntentFlags, externalCaller)
                     } else {
                         resolver.openInputStream(target) ?: error("Document permission is unavailable; choose it again")
                     }
@@ -1921,7 +1938,7 @@ class StudioViewModel(app: Application, val workspaceKey: String = "main") : And
                     return@withContext existing.copy(uri = target.toString())
                 }
                 val inputStream = if (externalIntentFlags != null) {
-                    ExternalDocumentEntryGuard.openVerifiedExternalInputStream(app, resolver, target, externalIntentFlags)
+                    ExternalDocumentEntryGuard.openVerifiedExternalInputStream(app, resolver, target, externalIntentFlags, externalCaller)
                 } else {
                     resolver.openInputStream(target) ?: error("Document permission is unavailable; choose it again")
                 }

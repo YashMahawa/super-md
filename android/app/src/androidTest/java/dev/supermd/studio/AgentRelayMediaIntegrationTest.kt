@@ -44,7 +44,7 @@ class AgentRelayMediaIntegrationTest {
                 model = ViewModelProvider(owner)[StudioViewModel::class.java]
                 originalAutosave = model!!.state.value.autosave
                 model!!.reading(autosave = false)
-                model!!.open(uri)
+                owner.requestOpen(uri)
             }
             waitUntil(20_000) {
                 val current = model?.state?.value

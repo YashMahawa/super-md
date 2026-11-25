@@ -185,7 +185,37 @@ class MainActivity : ComponentActivity() {
         initial: Boolean,
         targetModel: StudioViewModel,
     ) {
-        ExternalDocumentEntryGuard.dispatchIncomingIntent(this, incoming, savedInstanceState, initial, targetModel)
+        val caller = resolveExternalIntentCaller(incoming, initial)
+        ExternalDocumentEntryGuard.dispatchIncomingIntent(this, incoming, savedInstanceState, initial, targetModel, caller)
+    }
+    private fun resolveExternalIntentCaller(incoming: Intent?, initial: Boolean): ExternalIntentCaller {
+        val uri = incoming?.data
+        val isOwnShareUri = uri != null &&
+            uri.scheme.equals("content", ignoreCase = true) &&
+            uri.authority == "${packageName}.share"
+        if (Build.VERSION.SDK_INT >= 35) {
+            val caller = runCatching { currentCaller }.getOrNull()?.takeIf { it.uid > 0 }
+                ?: if (initial) runCatching { initialCaller }.getOrNull()?.takeIf { it.uid > 0 } else null
+            if (caller != null) {
+                val grantedShare = isOwnShareUri && runCatching {
+                    caller.checkContentUriPermission(uri!!, Intent.FLAG_GRANT_READ_URI_PERMISSION) ==
+                        android.content.pm.PackageManager.PERMISSION_GRANTED
+                }.getOrDefault(false)
+                return ExternalIntentCaller(uid = caller.uid, callerGrantedOwnShareUri = grantedShare)
+            }
+        }
+        if (initial && Build.VERSION.SDK_INT >= 34) {
+            val launchedUid = runCatching { launchedFromUid }.getOrDefault(-1)
+            if (launchedUid > 0) {
+                val grantedShare = isOwnShareUri && (
+                    launchedUid == android.os.Process.myUid() ||
+                        checkUriPermission(uri!!, -1, launchedUid, Intent.FLAG_GRANT_READ_URI_PERMISSION) ==
+                            android.content.pm.PackageManager.PERMISSION_GRANTED
+                    )
+                return ExternalIntentCaller(uid = launchedUid, callerGrantedOwnShareUri = grantedShare)
+            }
+        }
+        return ExternalIntentCaller()
     }
     fun requestOpen(uri: android.net.Uri, relative: String? = null) {
         model.retainDocumentAccess(uri)
@@ -661,7 +691,12 @@ private object NoMotionScheme : MotionScheme {
     DisposableEffect(activity, model, readerReady) {
         val handler = if (readerReady) {
             OpenIntentDispatcher.Handler<OpenDocumentTarget> { target, relative ->
-                model.open(target.uri, relative, externalIntentFlags = target.externalIntentFlags)
+                model.openDocument(
+                    target.uri,
+                    relative,
+                    externalIntentFlags = target.externalIntentFlags,
+                    externalCaller = target.externalCaller,
+                )
             }
         } else null
         model.attachReaderOpenHandler(handler)

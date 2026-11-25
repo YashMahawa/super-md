@@ -261,7 +261,7 @@ class AgentRelayLifecycleIntegrationTest {
                 model = ViewModelProvider(owner)[StudioViewModel::class.java]
                 originalAutosave = model!!.state.value.autosave
                 model!!.reading(autosave = false)
-                model!!.open(Uri.fromFile(input))
+                owner.requestOpen(Uri.fromFile(input))
             }
             waitUntil(20_000) { model?.state?.value?.autosave == false && model?.state?.value?.active?.uri == Uri.fromFile(input).toString() }
             awaitBridge(scenario, handler)
