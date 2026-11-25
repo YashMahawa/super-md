@@ -15,6 +15,13 @@ export function setReaderOverlay(kind: string, open: boolean) {
     void invoke("reader_overlay_changed", { open: present, image }).catch(() => {});
   }
 }
+export function hasReaderOverlay(): boolean {
+  return (
+    overlays.size > 0 ||
+    document.documentElement.dataset.readerOverlay === "true" ||
+    !!document.querySelector(".media-save-menu,.theme-guide-dialog,.media-dialog,.image-viewer,.step-viewer,.math-repair-panel,.reading-search,.reader-export-backdrop")
+  );
+}
 /** Inline reader sessions (active Live block edit, CodeMirror Source search)
  * keep reading/editing chrome visible while still letting Android Back dismiss
  * the session before falling back to fullscreen exit or system Back. */
