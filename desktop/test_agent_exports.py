@@ -117,14 +117,19 @@ class AgentExportsTest(unittest.TestCase):
         from agent_exports import _image_destinations
         svg_a = b"<svg xmlns='http://www.w3.org/2000/svg' width='120' height='40'><rect width='120' height='40' fill='#386a57'/></svg>"
         svg_b = b"<svg xmlns='http://www.w3.org/2000/svg' width='100' height='50'><circle cx='50' cy='25' r='20' fill='#2463b3'/></svg>"
+        svg_c = b"<svg xmlns='http://www.w3.org/2000/svg' width='160' height='40'><rect width='160' height='40' fill='#9a461a'/></svg>"
         (self.root / "obsidian.svg").write_bytes(svg_a)
         (self.root / "html.svg").write_bytes(svg_b)
+        (self.root / "assets").mkdir()
+        (self.root / "assets" / "plot.svg").write_bytes(svg_c)
         markdown = "\n".join([
             "# Agent Export",
             "",
             "Prose ![[obsidian.svg|240]] and `<img src=\"ignored.svg\" />` plus `![[ignored2.svg]]`.",
             "",
             "<img src=\"html.svg\" width=\"160px\" style=\"zoom:50%\" />",
+            "",
+            "<img alt=\"A > B\" title='Ratio > 1 & \"quoted\"' src=\"assets/plot.svg\" width=\"300\">",
             "",
             "```smd-tree",
             '{"values":["10","5","15"]}',
@@ -142,7 +147,7 @@ class AgentExportsTest(unittest.TestCase):
             "",
             "Second page content.",
         ])
-        self.assertEqual(_image_destinations(markdown), ["obsidian.svg", "html.svg"])
+        self.assertEqual(_image_destinations(markdown), ["obsidian.svg", "html.svg", "assets/plot.svg"])
         (self.root / "complete.md").write_text(markdown, encoding="utf-8")
         result = export_pdf(self.store, "complete.md", "complete.pdf", engine=self.engine)
         pdf_bytes = (self.root / "complete.pdf").read_bytes()

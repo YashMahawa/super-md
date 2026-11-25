@@ -132,3 +132,30 @@ it("rewrites Obsidian numeric pipe widths and HTML img sizes while preserving pa
   expect(prepared.content).toContain('\\newpage');
   expect(prepared.content).toContain('{{< pagebreak >}}');
 });
+
+it("parses HTML img tags with > and attribute-like text inside quoted alt and title attributes",async()=>{
+  const png='data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg==';
+  invoke.mockResolvedValue(png);
+  const source=[
+    '<img alt="A > B" src="assets/plot.png" width="300">',
+    '',
+    `<p data-caption="x > y"><img title='Ratio: 2 > 1 & "quoted"' alt='src=wrong.png width=999 > real' src="assets/wrapped.png" style="width: 240px; zoom: 50%" /></p>`,
+    '',
+    `Inline <img alt="Left > Right" title="Upper > Lower" src="assets/inline.png" width="180"> comparison.`,
+    '',
+    '<img alt="Multi > Line"\n  title="Span > Break"\n  src="assets/multiline.png"\n  width="150">',
+  ].join('\n');
+  const prepared=await preparePdf(source,'/notes/quoted.md');
+  expect(invoke.mock.calls.map(call=>call[1])).toEqual([
+    {documentPath:'/notes/quoted.md',source:'assets/plot.png'},
+    {documentPath:'/notes/quoted.md',source:'assets/wrapped.png'},
+    {documentPath:'/notes/quoted.md',source:'assets/inline.png'},
+    {documentPath:'/notes/quoted.md',source:'assets/multiline.png'},
+  ]);
+  expect(Object.keys(prepared.assets)).toEqual(['asset-1.png','asset-2.png','asset-3.png','asset-4.png']);
+  expect(prepared.content).toContain('![A > B](asset-1.png){width=300}');
+  expect(prepared.content).toContain('![src=wrong.png width=999 > real](asset-2.png "Ratio: 2 > 1 & \\"quoted\\""){width=240px zoom=50%}');
+  expect(prepared.content).toContain('Inline ![Left > Right](asset-3.png "Upper > Lower"){width=180} comparison.');
+  expect(prepared.content).toContain('![Multi > Line](asset-4.png "Span > Break"){width=150}');
+  expect(prepared.content).not.toContain('<img');
+});

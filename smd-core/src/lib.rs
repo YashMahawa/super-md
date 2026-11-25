@@ -119,89 +119,192 @@ fn strip_html_comments(input: &str) -> String {
     out
 }
 
-fn html_tags<'a>(input: &'a str, tag_name: &str) -> Vec<&'a str> {
-    let mut tags = Vec::new();
-    let bytes = input.as_bytes();
-    let mut i = 0;
-    while i < bytes.len() {
-        if bytes[i] == b'<' && input[i + 1..].len() >= tag_name.len() {
-            let candidate = &input[i + 1..i + 1 + tag_name.len()];
-            let after = bytes.get(i + 1 + tag_name.len()).copied();
-            if candidate.eq_ignore_ascii_case(tag_name)
-                && matches!(after, Some(b' ' | b'\t' | b'\r' | b'\n' | b'>' | b'/'))
-            {
-                let mut j = i + 1 + tag_name.len();
-                let mut quote: Option<u8> = None;
-                while j < bytes.len() {
-                    let b = bytes[j];
-                    if let Some(q) = quote {
-                        if b == q {
-                            quote = None;
-                        }
-                    } else if b == b'"' || b == b'\'' {
-                        quote = Some(b);
-                    } else if b == b'>' {
-                        tags.push(&input[i..=j]);
-                        i = j + 1;
-                        break;
-                    }
-                    j += 1;
-                }
-                if j >= bytes.len() {
-                    break;
-                }
+fn decode_html_attr(value: &str) -> String {
+    if !value.contains('&') {
+        return value.to_string();
+    }
+    let mut out = String::with_capacity(value.len());
+    let mut rest = value;
+    while let Some(amp) = rest.find('&') {
+        out.push_str(&rest[..amp]);
+        let after = &rest[amp + 1..];
+        if let Some(semi) = after.bytes().take(12).position(|b| b == b';') {
+            let entity = &after[..semi];
+            let decoded = if entity.eq_ignore_ascii_case("amp") {
+                Some('&')
+            } else if entity.eq_ignore_ascii_case("lt") {
+                Some('<')
+            } else if entity.eq_ignore_ascii_case("gt") {
+                Some('>')
+            } else if entity.eq_ignore_ascii_case("quot") {
+                Some('"')
+            } else if entity.eq_ignore_ascii_case("apos") {
+                Some('\'')
+            } else if let Some(hex) = entity.strip_prefix("#x").or_else(|| entity.strip_prefix("#X")) {
+                u32::from_str_radix(hex, 16).ok().filter(|&c| c > 0).and_then(char::from_u32)
+            } else if let Some(dec) = entity.strip_prefix('#') {
+                dec.parse::<u32>().ok().filter(|&c| c > 0).and_then(char::from_u32)
+            } else {
+                None
+            };
+            if let Some(ch) = decoded {
+                out.push(ch);
+                rest = &after[semi + 1..];
                 continue;
             }
         }
-        i += 1;
+        out.push('&');
+        rest = after;
     }
-    tags
+    out.push_str(rest);
+    out
 }
 
-fn html_attr(tag: &str, attr_name: &str) -> Option<String> {
-    let inner = tag
-        .strip_prefix('<')?
-        .trim_end_matches('>')
-        .trim_end_matches('/');
-    let mut rest = inner;
-    let first_ws = rest.find(char::is_whitespace)?;
-    rest = &rest[first_ws..];
-    while !rest.is_empty() {
-        rest = rest.trim_start();
-        if rest.is_empty() {
-            break;
+struct ScannedHtmlTag<'a> {
+    name: &'a str,
+    closing: bool,
+    end: usize,
+    attrs: Vec<(&'a str, String)>,
+}
+
+impl<'a> ScannedHtmlTag<'a> {
+    fn attr(&self, attr_name: &str) -> Option<&str> {
+        self.attrs
+            .iter()
+            .find(|(k, _)| k.eq_ignore_ascii_case(attr_name))
+            .map(|(_, v)| v.as_str())
+    }
+}
+
+fn scan_html_tag(input: &str, start: usize) -> Option<ScannedHtmlTag<'_>> {
+    let bytes = input.as_bytes();
+    if bytes.get(start) != Some(&b'<') {
+        return None;
+    }
+    let mut pos = start + 1;
+    let mut closing = false;
+    if bytes.get(pos) == Some(&b'/') {
+        closing = true;
+        pos += 1;
+    }
+    if !bytes.get(pos).is_some_and(u8::is_ascii_alphabetic) {
+        return None;
+    }
+    let name_start = pos;
+    pos += 1;
+    while bytes.get(pos).is_some_and(|b| b.is_ascii_alphanumeric() || *b == b'-') {
+        pos += 1;
+    }
+    let name = &input[name_start..pos];
+    let mut attrs = Vec::new();
+    if closing {
+        while bytes.get(pos).is_some_and(u8::is_ascii_whitespace) {
+            pos += 1;
         }
-        let name_len = rest
-            .find(|c: char| c.is_whitespace() || c == '=' || c == '>' || c == '/')
-            .unwrap_or(rest.len());
-        if name_len == 0 {
-            rest = &rest[1..];
+        return (bytes.get(pos) == Some(&b'>')).then_some(ScannedHtmlTag {
+            name,
+            closing: true,
+            end: pos + 1,
+            attrs,
+        });
+    }
+    if let Some(&b) = bytes.get(pos) {
+        if !b.is_ascii_whitespace() && b != b'/' && b != b'>' {
+            return None;
+        }
+    }
+    while pos < bytes.len() {
+        while bytes.get(pos).is_some_and(u8::is_ascii_whitespace) {
+            pos += 1;
+        }
+        if pos >= bytes.len() {
+            return None;
+        }
+        if bytes[pos] == b'>' {
+            return Some(ScannedHtmlTag { name, closing: false, end: pos + 1, attrs });
+        }
+        if bytes[pos] == b'/' && bytes.get(pos + 1) == Some(&b'>') {
+            return Some(ScannedHtmlTag { name, closing: false, end: pos + 2, attrs });
+        }
+        if bytes[pos] == b'/' {
+            pos += 1;
             continue;
         }
-        let name = &rest[..name_len];
-        rest = rest[name_len..].trim_start();
-        let value = if let Some(after_eq) = rest.strip_prefix('=') {
-            rest = after_eq.trim_start();
-            if let Some(quote) = rest.chars().next().filter(|c| *c == '"' || *c == '\'') {
-                let after_q = &rest[1..];
-                let end = after_q.find(quote).unwrap_or(after_q.len());
-                let v = &after_q[..end];
-                rest = &after_q[(end + 1).min(after_q.len())..];
-                v
+        let attr_start = pos;
+        while bytes.get(pos).is_some_and(|b| b.is_ascii_alphanumeric() || matches!(*b, b'_' | b'.' | b':' | b'-')) {
+            pos += 1;
+        }
+        if pos == attr_start || !matches!(bytes[attr_start], b'A'..=b'Z' | b'a'..=b'z' | b'_' | b':') {
+            return None;
+        }
+        let attr_name = &input[attr_start..pos];
+        while bytes.get(pos).is_some_and(u8::is_ascii_whitespace) {
+            pos += 1;
+        }
+        let attr_val = if bytes.get(pos) == Some(&b'=') {
+            pos += 1;
+            while bytes.get(pos).is_some_and(u8::is_ascii_whitespace) {
+                pos += 1;
+            }
+            let &first = bytes.get(pos)?;
+            if first == b'"' || first == b'\'' {
+                let val_start = pos + 1;
+                let rel_end = input[val_start..].find(first as char)?;
+                let raw_val = &input[val_start..val_start + rel_end];
+                pos = val_start + rel_end + 1;
+                decode_html_attr(raw_val)
             } else {
-                let end = rest.find(char::is_whitespace).unwrap_or(rest.len());
-                let v = &rest[..end];
-                rest = &rest[end..];
-                v
+                let val_start = pos;
+                while let Some(&b) = bytes.get(pos) {
+                    if b.is_ascii_whitespace()
+                        || matches!(b, b'"' | b'\'' | b'=' | b'<' | b'>' | b'`')
+                        || (b == b'/' && bytes.get(pos + 1) == Some(&b'>'))
+                    {
+                        break;
+                    }
+                    pos += 1;
+                }
+                if pos == val_start {
+                    return None;
+                }
+                decode_html_attr(&input[val_start..pos])
             }
         } else {
-            ""
+            String::new()
         };
-        if name.eq_ignore_ascii_case(attr_name) {
-            return Some(value.trim().to_string());
+        if !attrs.iter().any(|(k, _)| k.eq_ignore_ascii_case(attr_name)) {
+            attrs.push((attr_name, attr_val));
         }
     }
     None
+}
+
+fn scan_html_tags<'a>(input: &'a str, tag_name: &str) -> Vec<ScannedHtmlTag<'a>> {
+    let mut tags = Vec::new();
+    let bytes = input.as_bytes();
+    let mut pos = 0;
+    while pos < bytes.len() {
+        let Some(rel_lt) = bytes[pos..].iter().position(|&b| b == b'<') else {
+            break;
+        };
+        let lt = pos + rel_lt;
+        if input[lt..].starts_with("<!--") {
+            if let Some(end) = input[lt + 4..].find("-->") {
+                pos = lt + 4 + end + 3;
+                continue;
+            }
+            break;
+        }
+        if let Some(tag) = scan_html_tag(input, lt) {
+            pos = tag.end;
+            if !tag.closing && tag.name.eq_ignore_ascii_case(tag_name) {
+                tags.push(tag);
+            }
+        } else {
+            pos = lt + 1;
+        }
+    }
+    tags
 }
 
 fn css_prop(style: &str, prop_name: &str) -> Option<String> {
@@ -223,21 +326,21 @@ fn css_prop(style: &str, prop_name: &str) -> Option<String> {
     found
 }
 
-fn is_page_break_div(clean_html: &str) -> bool {
-    for tag in html_tags(clean_html, "div") {
-        if let Some(style) = html_attr(tag, "style") {
+fn is_page_break_div(raw_html: &str) -> bool {
+    for tag in scan_html_tags(raw_html, "div") {
+        if let Some(style) = tag.attr("style") {
             for (prop, expected) in [
                 ("page-break-after", "always"),
                 ("page-break-before", "always"),
                 ("break-after", "page"),
                 ("break-before", "page"),
             ] {
-                if css_prop(&style, prop).is_some_and(|v| v.eq_ignore_ascii_case(expected)) {
+                if css_prop(style, prop).is_some_and(|v| v.eq_ignore_ascii_case(expected)) {
                     return true;
                 }
             }
         }
-        if let Some(class) = html_attr(tag, "class") {
+        if let Some(class) = tag.attr("class") {
             if class
                 .split_whitespace()
                 .any(|t| t.eq_ignore_ascii_case("page-break") || t.eq_ignore_ascii_case("pagebreak"))
@@ -255,16 +358,16 @@ struct HtmlImageSpec {
     zoom: Option<String>,
 }
 
-fn parse_html_images(clean_html: &str) -> Vec<HtmlImageSpec> {
+fn parse_html_images(raw_html: &str) -> Vec<HtmlImageSpec> {
     let mut out = Vec::new();
-    for tag in html_tags(clean_html, "img") {
-        let Some(src) = html_attr(tag, "src").filter(|s| !s.is_empty()) else { continue };
-        let style = html_attr(tag, "style").unwrap_or_default();
-        let width = css_prop(&style, "width")
+    for tag in scan_html_tags(raw_html, "img") {
+        let Some(src) = tag.attr("src").map(str::trim).filter(|s| !s.is_empty()) else { continue };
+        let style = tag.attr("style").unwrap_or_default();
+        let width = css_prop(style, "width")
             .and_then(|w| parse_typst_width(&w))
-            .or_else(|| html_attr(tag, "width").and_then(|w| parse_typst_width(&w)));
-        let zoom = css_prop(&style, "zoom").and_then(|z| parse_typst_zoom(&z));
-        out.push(HtmlImageSpec { src, width, zoom });
+            .or_else(|| tag.attr("width").and_then(parse_typst_width));
+        let zoom = css_prop(style, "zoom").and_then(|z| parse_typst_zoom(&z));
+        out.push(HtmlImageSpec { src: src.to_string(), width, zoom });
     }
     out
 }
@@ -480,8 +583,18 @@ pub fn image_sources(markdown: &str) -> Vec<String> {
     while let Some(event) = events.next() {
         match event {
             Event::Start(Tag::Image { dest_url, .. }) => sources.push(dest_url.to_string()),
+            Event::Start(Tag::HtmlBlock) => {
+                let mut html = String::new();
+                for event in events.by_ref() {
+                    if event == Event::End(TagEnd::HtmlBlock) { break; }
+                    if let Event::Html(piece) | Event::Text(piece) = event { html.push_str(&piece); }
+                }
+                for img in parse_html_images(&html) {
+                    sources.push(img.src);
+                }
+            }
             Event::Html(html) | Event::InlineHtml(html) => {
-                for img in parse_html_images(&strip_html_comments(&html)) {
+                for img in parse_html_images(&html) {
                     sources.push(img.src);
                 }
             }
@@ -597,6 +710,31 @@ fn heading_slug(value: &str) -> String {
     if slug.is_empty() { "section".into() } else { slug }
 }
 impl<'a> Renderer<'a> {
+    fn render_html(&self, html: &str, is_block: bool, out: &mut String) -> Result<()> {
+        let clean = strip_html_comments(html);
+        let trimmed = clean.trim();
+        if trimmed.len() >= 3 && trimmed[..3].eq_ignore_ascii_case("<br") {
+            out.push_str("#linebreak()");
+        } else if diagram::looks_like_svg(trimmed) {
+            let svg = diagram::validate_svg(trimmed)?;
+            out.push_str(&format!("\n#smd-image(bytes({}), format: \"svg\")\n\n", string(&svg)));
+        } else if is_page_break_div(html) {
+            out.push_str(if is_block { "\n#pagebreak()\n\n" } else { "#pagebreak()" });
+        } else {
+            for img in parse_html_images(html) {
+                validate_asset_path(&img.src)?;
+                if is_font_asset(&img.src) || !self.assets.contains_key(&img.src) {
+                    bail!("Image unavailable for PDF: {}", img.src);
+                }
+                out.push_str(&format_smd_image(&img.src, img.width.as_deref(), img.zoom.as_deref()));
+                if is_block {
+                    out.push_str("\n\n");
+                }
+            }
+        }
+        Ok(())
+    }
+
     fn render(&mut self, end: Option<TagEnd>) -> Result<String> {
         let mut out = String::new();
         while let Some(event) = self.events.next() {
@@ -617,32 +755,19 @@ impl<'a> Renderer<'a> {
                 Event::TaskListMarker(checked) => out.push_str(if checked { "#text(\"☑ \u{a0}\")" } else { "#text(\"☐ \u{a0}\")" }),
                 Event::FootnoteReference(name) => out.push_str(&format!("#footnote[{}]", self.footnotes.get(name.as_ref()).cloned().unwrap_or_else(|| text(&name)))),
                 Event::Html(ref html) | Event::InlineHtml(ref html) => {
-                    let is_block = matches!(&event, Event::Html(_));
-                    let clean = strip_html_comments(html);
-                    let trimmed = clean.trim();
-                    if trimmed.len() >= 3 && trimmed[..3].eq_ignore_ascii_case("<br") {
-                        out.push_str("#linebreak()");
-                    } else if diagram::looks_like_svg(trimmed) {
-                        let svg = diagram::validate_svg(trimmed)?;
-                        out.push_str(&format!("\n#smd-image(bytes({}), format: \"svg\")\n\n", string(&svg)));
-                    } else if is_page_break_div(&clean) {
-                        out.push_str(if is_block { "\n#pagebreak()\n\n" } else { "#pagebreak()" });
-                    } else {
-                        for img in parse_html_images(&clean) {
-                            validate_asset_path(&img.src)?;
-                            if is_font_asset(&img.src) || !self.assets.contains_key(&img.src) {
-                                bail!("Image unavailable for PDF: {}", img.src);
-                            }
-                            out.push_str(&format_smd_image(&img.src, img.width.as_deref(), img.zoom.as_deref()));
-                            if is_block {
-                                out.push_str("\n\n");
-                            }
-                        }
-                    }
+                    self.render_html(html, matches!(&event, Event::Html(_)), &mut out)?;
                 },
                 Event::Start(tag) => {
                     let close = tag.to_end();
                     match tag {
+                        Tag::HtmlBlock => {
+                            let mut html = String::new();
+                            while let Some(e) = self.events.next() {
+                                if e == Event::End(close) { break; }
+                                if let Event::Html(v) | Event::Text(v) = e { html.push_str(&v); }
+                            }
+                            self.render_html(&html, true, &mut out)?;
+                        },
                         Tag::CodeBlock(kind) => {
                             let mut code = String::new();
                             while let Some(e) = self.events.next() { if e == Event::End(close) { break; } if let Event::Text(v) = e { code.push_str(&v); } }

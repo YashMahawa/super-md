@@ -503,3 +503,77 @@ fn manual_page_breaks_split_pages_while_code_literals_stay_intact() {
     }
     let _ = std::fs::remove_file(&path);
 }
+
+#[test]
+fn html_images_with_angle_brackets_in_quoted_attributes_preserve_assets_and_widths() {
+    let plot_svg = br##"<svg xmlns="http://www.w3.org/2000/svg" width="400pt" height="40pt"><rect width="400pt" height="40pt" fill="#00a859"/></svg>"##.to_vec();
+    let headless_md = [
+        r#"<img alt="A > B" src="assets/plot.svg" width="300">"#,
+        "",
+        r#"<div data-note="x > y & <img src='ignored.svg'>"><img title='Bound: x > 0 & "ok"' alt="src=wrong.svg width=999 > real" src="assets/wrapped.svg" width="200px" /></div>"#,
+        "",
+        r#"Inline <img alt="Left > Right" title="Top > Bottom" src="assets/inline.svg" style="width: 160px; zoom: 50%"> end."#,
+    ].join("\n");
+
+    let discovered = smd_core::image_sources(&headless_md);
+    assert_eq!(
+        discovered,
+        vec![
+            "assets/plot.svg".to_string(),
+            "assets/wrapped.svg".to_string(),
+            "assets/inline.svg".to_string(),
+        ]
+    );
+
+    let headless_assets = HashMap::from([
+        ("assets/plot.svg".to_string(), plot_svg.clone()),
+        ("assets/wrapped.svg".to_string(), plot_svg.clone()),
+        ("assets/inline.svg".to_string(), plot_svg.clone()),
+    ]);
+    let headless_typst = source(&headless_md, &PdfOptions::default(), &headless_assets).unwrap();
+    assert!(headless_typst.contains("#smd-image(\"assets/plot.svg\", width: 225pt)"), "{headless_typst}");
+    assert!(headless_typst.contains("#smd-image(\"assets/wrapped.svg\", width: 150pt)"), "{headless_typst}");
+    assert!(headless_typst.contains("#smd-image(\"assets/inline.svg\", width: 120pt, zoom: 50%)"), "{headless_typst}");
+
+    // Match GUI preparePdf output after lifting quoted-attribute HTML <img> tags.
+    let gui_prepared_md = [
+        r#"![A > B](asset-1.svg){width=300}"#,
+        "",
+        r#"![src=wrong.svg width=999 > real](asset-2.svg "Bound: x > 0 & \"ok\""){width=200px}"#,
+        "",
+        r#"Inline ![Left > Right](asset-3.svg "Top > Bottom"){width=160px zoom=50%} end."#,
+    ].join("\n");
+    let gui_assets = HashMap::from([
+        ("asset-1.svg".to_string(), plot_svg.clone()),
+        ("asset-2.svg".to_string(), plot_svg.clone()),
+        ("asset-3.svg".to_string(), plot_svg),
+    ]);
+    let gui_typst = source(&gui_prepared_md, &PdfOptions::default(), &gui_assets).unwrap();
+    assert!(gui_typst.contains("#smd-image(\"asset-1.svg\", width: 225pt)"), "{gui_typst}");
+    assert!(gui_typst.contains("#smd-image(\"asset-2.svg\", width: 150pt)"), "{gui_typst}");
+    assert!(gui_typst.contains("#smd-image(\"asset-3.svg\", width: 120pt, zoom: 50%)"), "{gui_typst}");
+
+    for (label, pdf) in [
+        ("headless", export(&headless_md, &PdfOptions::default(), &headless_assets).unwrap()),
+        ("gui", export(&gui_prepared_md, &PdfOptions::default(), &gui_assets).unwrap()),
+    ] {
+        let clips: Vec<f64> = decompress_pdf_streams(&pdf)
+            .into_iter()
+            .filter(|s| s.contains("0 0.65882355 0.34901962 scn"))
+            .flat_map(|s| {
+                s.lines()
+                    .filter_map(|line| {
+                        let rest = line.strip_prefix("q ")?;
+                        let nums: Vec<f64> = rest.split_whitespace().filter_map(|tok| tok.parse::<f64>().ok()).collect();
+                        (line.ends_with(" l") && nums.len() == 8 && (nums[1] - nums[3]).abs() < 1e-3)
+                            .then_some((nums[2] - nums[0]).abs())
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .collect();
+        assert_eq!(clips.len(), 3, "{label}: expected 3 rendered figures, got {clips:?}");
+        for (actual, expected) in clips.iter().zip([225.0f64, 150.0, 60.0]) {
+            assert!((actual - expected).abs() <= 1.5, "{label}: expected ~{expected}pt clip width, got {actual}pt");
+        }
+    }
+}

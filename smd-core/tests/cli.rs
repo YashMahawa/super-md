@@ -109,12 +109,20 @@ fn cli_export_renders_vector_diagrams_sized_images_multiline_code_and_page_break
     let w = Workspace::new();
     let badge = b"<svg xmlns=\"http://www.w3.org/2000/svg\" width=\"120\" height=\"40\"><rect width=\"120\" height=\"40\" fill=\"#386a57\"/></svg>";
     fs::write(w.file("badge.svg"), badge).unwrap();
+    fs::create_dir_all(w.file("assets")).unwrap();
+    use base64::Engine;
+    let plot_png = base64::engine::general_purpose::STANDARD
+        .decode("iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg==")
+        .unwrap();
+    fs::write(w.file("assets/plot.png"), &plot_png).unwrap();
     let note = [
         "# CLI Complete Export",
         "",
         "![[badge.svg|180]]",
         "",
         "<img src=\"badge.svg\" width=\"120px\" />",
+        "",
+        "<img alt=\"A > B\" title='Threshold > 0' src=\"assets/plot.png\" width=\"300\">",
         "",
         "```smd-tree",
         r#"{"values":["8","4","12"]}"#,
@@ -143,6 +151,11 @@ fn cli_export_renders_vector_diagrams_sized_images_multiline_code_and_page_break
     success(w.run(&["export", "rich.md", "rich.pdf"]));
     pdf(&w.file("rich.pdf"));
     let pdf_bytes = fs::read(w.file("rich.pdf")).unwrap();
+    let pdf_latin1 = String::from_utf8_lossy(&pdf_bytes);
+    assert!(
+        pdf_latin1.contains("/Subtype /Image") || pdf_latin1.contains("/Subtype/Image"),
+        "Quoted-attribute raster HTML <img> must be embedded in CLI PDF"
+    );
     let page_objects: usize = [b"/Type /Page".as_slice(), b"/Type/Page".as_slice()]
         .into_iter()
         .map(|needle| {

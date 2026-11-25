@@ -20,24 +20,127 @@ import {parseDiagramSource} from "./components/InlineDiagram";
 import {parseBinaryTreeSource} from "./components/BinaryTree";
 import {stepDiagramSvg} from "./stepPdf";
 
-function htmlAttr(tag: string, name: string): string | undefined {
-  const match = new RegExp(`(?:^|\\s)${name}\\s*=\\s*(?:"([^"]*)"|'([^']*)'|([^\\s>"']+))`, "i").exec(tag);
-  return match ? (match[1] ?? match[2] ?? match[3] ?? "").trim() : undefined;
+interface ScannedHtmlTag {
+  name: string;
+  closing: boolean;
+  end: number;
+  attrs: Map<string, string>;
 }
 
-function parseHtmlImgTag(tag: string): { url: string; alt: string; title?: string; attrs: string } | null {
-  const src = htmlAttr(tag, "src");
+const HTML_IMAGE_WRAPPERS = new Set(["p", "div", "center", "figure"]);
+
+function decodeHtmlAttr(value: string): string {
+  if (!value.includes("&")) return value;
+  return value.replace(/&(?:(amp|lt|gt|quot|apos)|#(\d{1,7})|#x([0-9a-f]{1,6}));/gi, (full, named?: string, dec?: string, hex?: string) => {
+    if (named) {
+      switch (named.toLowerCase()) {
+        case "amp": return "&";
+        case "lt": return "<";
+        case "gt": return ">";
+        case "quot": return '"';
+        case "apos": return "'";
+      }
+    }
+    const code = dec ? Number.parseInt(dec, 10) : hex ? Number.parseInt(hex, 16) : NaN;
+    return Number.isInteger(code) && code > 0 && code <= 0x10ffff && (code < 0xd800 || code > 0xdfff)
+      ? String.fromCodePoint(code)
+      : full;
+  });
+}
+
+function scanHtmlTag(input: string, start: number): ScannedHtmlTag | null {
+  if (input[start] !== "<") return null;
+  let pos = start + 1;
+  let closing = false;
+  if (input[pos] === "/") {
+    closing = true;
+    pos++;
+  }
+  const nameStart = pos;
+  if (pos >= input.length || !/[A-Za-z]/.test(input[pos])) return null;
+  pos++;
+  while (pos < input.length && /[A-Za-z0-9-]/.test(input[pos])) pos++;
+  const name = input.slice(nameStart, pos).toLowerCase();
+  const attrs = new Map<string, string>();
+  if (closing) {
+    while (pos < input.length && /\s/.test(input[pos])) pos++;
+    return input[pos] === ">" ? { name, closing: true, end: pos + 1, attrs } : null;
+  }
+  if (pos < input.length && !/[\s/>]/.test(input[pos])) return null;
+  while (pos < input.length) {
+    while (pos < input.length && /\s/.test(input[pos])) pos++;
+    if (pos >= input.length) return null;
+    if (input[pos] === ">") return { name, closing: false, end: pos + 1, attrs };
+    if (input[pos] === "/" && input[pos + 1] === ">") return { name, closing: false, end: pos + 2, attrs };
+    if (input[pos] === "/") { pos++; continue; }
+    const attrStart = pos;
+    while (pos < input.length && /[A-Za-z0-9_.:-]/.test(input[pos])) pos++;
+    if (pos === attrStart || !/[A-Za-z_:]/.test(input[attrStart])) return null;
+    const attrName = input.slice(attrStart, pos).toLowerCase();
+    while (pos < input.length && /\s/.test(input[pos])) pos++;
+    let attrValue = "";
+    if (input[pos] === "=") {
+      pos++;
+      while (pos < input.length && /\s/.test(input[pos])) pos++;
+      if (pos >= input.length) return null;
+      const quote = input[pos];
+      if (quote === '"' || quote === "'") {
+        const closeIdx = input.indexOf(quote, pos + 1);
+        if (closeIdx < 0) return null;
+        attrValue = decodeHtmlAttr(input.slice(pos + 1, closeIdx));
+        pos = closeIdx + 1;
+      } else {
+        const valStart = pos;
+        while (pos < input.length && !/[\s"'=<>`]/.test(input[pos]) && !(input[pos] === "/" && input[pos + 1] === ">")) pos++;
+        if (pos === valStart) return null;
+        attrValue = decodeHtmlAttr(input.slice(valStart, pos));
+      }
+    }
+    if (!attrs.has(attrName)) attrs.set(attrName, attrValue);
+  }
+  return null;
+}
+
+function cssProp(style: string, propName: string): string | undefined {
+  let found: string | undefined;
+  for (const decl of style.split(";")) {
+    const colon = decl.indexOf(":");
+    if (colon < 0) continue;
+    if (decl.slice(0, colon).trim().toLowerCase() !== propName) continue;
+    const clean = decl.slice(colon + 1).trim().replace(/\s*!important\s*$/i, "").trim();
+    if (clean) found = clean;
+  }
+  return found;
+}
+
+function isPageBreakTag(tag: ScannedHtmlTag): boolean {
+  if (tag.closing) return false;
+  const style = tag.attrs.get("style") || "";
+  if (
+    cssProp(style, "page-break-after")?.toLowerCase() === "always" ||
+    cssProp(style, "page-break-before")?.toLowerCase() === "always" ||
+    cssProp(style, "break-after")?.toLowerCase() === "page" ||
+    cssProp(style, "break-before")?.toLowerCase() === "page"
+  ) {
+    return true;
+  }
+  return (tag.attrs.get("class") || "").trim().split(/\s+/).some(c => /^page-?break$/i.test(c));
+}
+
+function parseHtmlImgTag(tag: ScannedHtmlTag): { url: string; alt: string; title?: string; attrs: string } | null {
+  if (tag.closing || tag.name !== "img") return null;
+  const src = (tag.attrs.get("src") || "").trim();
   if (!src) return null;
-  const alt = htmlAttr(tag, "alt") || "Image";
-  const title = htmlAttr(tag, "title") || undefined;
-  const style = htmlAttr(tag, "style") || "";
-  const styleWidth = /(?:^|;)\s*width\s*:\s*([^;]+)/i.exec(style)?.[1]?.trim();
-  const attrWidth = htmlAttr(tag, "width");
+  const alt = (tag.attrs.get("alt") || "").replace(/[\r\n]+/g, " ").trim() || "Image";
+  const title = (tag.attrs.get("title") || "").replace(/[\r\n]+/g, " ").trim() || undefined;
+  const style = tag.attrs.get("style") || "";
+  const styleWidth = cssProp(style, "width");
+  const attrWidth = tag.attrs.get("width")?.trim();
   const width = (styleWidth || attrWidth || "").replace(/^['"]|['"]$/g, "").trim();
-  const zoom = (/(?:^|;)\s*zoom\s*:\s*([^;]+)/i.exec(style)?.[1] || "").replace(/^['"]|['"]$/g, "").trim();
+  const zoom = (cssProp(style, "zoom") || "").replace(/^['"]|['"]$/g, "").trim();
   const parts: string[] = [];
-  if (width && /^\d+(?:\.\d+)?(?:%|px|pt|mm|cm|in)?$/i.test(width)) parts.push(`width=${width}`);
-  if (zoom && /^\d+(?:\.\d+)?%?$/i.test(zoom)) parts.push(`zoom=${zoom}`);
+  if (width && /^\d+(?:\.\d+)?(?:%|px|pt|mm|cm|in)?$/i.test(width) && Number.parseFloat(width) > 0) parts.push(`width=${width}`);
+  if (zoom && /^\d+(?:\.\d+)?%?$/i.test(zoom) && Number.parseFloat(zoom) > 0) parts.push(`zoom=${zoom}`);
   return { url: src, alt, ...(title ? { title } : {}), attrs: parts.length ? `{${parts.join(" ")}}` : "" };
 }
 
@@ -48,24 +151,45 @@ function liftHtmlImages(tree: any): void {
     const nextChildren: any[] = [];
     let changed = false;
     for (const child of parent.children) {
-      if (child?.type !== "html" || typeof child.value !== "string") {
+      if (child?.type !== "html" || typeof child.value !== "string" || !/<img(?=[\s/>])/i.test(child.value)) {
         nextChildren.push(child);
         continue;
       }
-      const withoutComments = child.value.replace(/<!--[\s\S]*?-->/g, "");
-      if (!/<img\b/i.test(withoutComments)) {
-        nextChildren.push(child);
-        continue;
-      }
+      const raw = child.value;
       if (blockParent) {
-        const stripped = withoutComments
-          .replace(/<\/?(?:p|div|center|figure)\b[^>]*>/gi, "")
-          .replace(/<img\b[^>]*>/gi, "")
-          .trim();
-        const tags = [...withoutComments.matchAll(/<img\b[^>]*>/gi)].map(m => parseHtmlImgTag(m[0])).filter((v): v is NonNullable<typeof v> => v !== null);
-        if (tags.length && !stripped && !/(?:page-break|break-(?:after|before))\s*:/i.test(withoutComments)) {
+        const imgs: Array<NonNullable<ReturnType<typeof parseHtmlImgTag>>> = [];
+        let pos = 0;
+        let validBlock = true;
+        while (pos < raw.length) {
+          while (pos < raw.length && /\s/.test(raw[pos])) pos++;
+          if (pos >= raw.length) break;
+          if (raw.startsWith("<!--", pos)) {
+            const commentEnd = raw.indexOf("-->", pos + 4);
+            if (commentEnd < 0) { pos = raw.length; break; }
+            pos = commentEnd + 3;
+            continue;
+          }
+          const tag = scanHtmlTag(raw, pos);
+          if (!tag || isPageBreakTag(tag)) {
+            validBlock = false;
+            break;
+          }
+          if (tag.name === "img" && !tag.closing) {
+            const parsed = parseHtmlImgTag(tag);
+            if (!parsed) {
+              validBlock = false;
+              break;
+            }
+            imgs.push(parsed);
+          } else if (!HTML_IMAGE_WRAPPERS.has(tag.name)) {
+            validBlock = false;
+            break;
+          }
+          pos = tag.end;
+        }
+        if (validBlock && imgs.length > 0) {
           changed = true;
-          for (const img of tags) {
+          for (const img of imgs) {
             nextChildren.push({
               type: "paragraph",
               children: [
@@ -77,12 +201,31 @@ function liftHtmlImages(tree: any): void {
           continue;
         }
       } else {
-        const tagMatch = /^\s*(<img\b[^>]*>)\s*$/i.exec(withoutComments);
-        const parsed = tagMatch ? parseHtmlImgTag(tagMatch[1]) : null;
-        if (parsed) {
+        let pos = 0;
+        let singleImg: NonNullable<ReturnType<typeof parseHtmlImgTag>> | null = null;
+        let validInline = true;
+        while (pos < raw.length) {
+          while (pos < raw.length && /\s/.test(raw[pos])) pos++;
+          if (pos >= raw.length) break;
+          if (raw.startsWith("<!--", pos)) {
+            const commentEnd = raw.indexOf("-->", pos + 4);
+            if (commentEnd < 0) { pos = raw.length; break; }
+            pos = commentEnd + 3;
+            continue;
+          }
+          const tag = scanHtmlTag(raw, pos);
+          const parsed = tag ? parseHtmlImgTag(tag) : null;
+          if (!tag || !parsed || singleImg) {
+            validInline = false;
+            break;
+          }
+          singleImg = parsed;
+          pos = tag.end;
+        }
+        if (validInline && singleImg) {
           changed = true;
-          nextChildren.push({ type: "image", url: parsed.url, alt: parsed.alt, ...(parsed.title ? { title: parsed.title } : {}) });
-          if (parsed.attrs) nextChildren.push({ type: "text", value: parsed.attrs });
+          nextChildren.push({ type: "image", url: singleImg.url, alt: singleImg.alt, ...(singleImg.title ? { title: singleImg.title } : {}) });
+          if (singleImg.attrs) nextChildren.push({ type: "text", value: singleImg.attrs });
           continue;
         }
       }
