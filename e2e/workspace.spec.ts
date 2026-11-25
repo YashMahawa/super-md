@@ -164,6 +164,7 @@ test("shared repair applies on Android/Qt and button history can undo and redo i
 test("reading search highlights every match without switching mode and escapes cleanly",async({page})=>{
   await page.addInitScript(()=>{window.SuperMD={post:()=>{}};});
   await page.goto("/android-reader.html");
+  await page.waitForFunction(()=>typeof window.supermdLoad==="function");
   await page.evaluate(()=>window.supermdLoad?.({id:"search",content:"# Find notes\n\nA **probability** result.\n\n> [!QUESTION]- Hidden probability\n> Another probability result.\n\n## Last probability",path:null,mode:"reader",dark:false,fullscreen:false,colors:{},font:"sans",size:18,zoom:100}));
   await expect(page.locator("h1")).toBeVisible();
   await page.evaluate(()=>window.supermdFind?.());
@@ -178,7 +179,8 @@ test("reading search highlights every match without switching mode and escapes c
   await page.keyboard.press("Shift+F3");
   await expect(page.locator(".reading-search output")).toContainText("1 / 4");
   await page.keyboard.press("Control+h");
-  await expect(page.getByRole("textbox",{name:"Replacement text"})).toBeVisible();
+  await expect(page.getByRole("button",{name:"Replace in source"})).toHaveCount(0);
+  await expect(page.getByRole("textbox",{name:"Replacement text"})).toHaveCount(0);
   await expect(page.locator(".reading-search output")).toContainText("1 / 4");
   await page.keyboard.press("Escape");
   await expect(page.getByRole("search")).toHaveCount(0);
@@ -189,6 +191,7 @@ test("Ctrl+H, F3, whole-word, regex capture groups, and offscreen windowed Live 
   await page.exposeFunction("syncDoc",(_id:string,command:string,raw:string)=>{if(command==="document_changed")content=JSON.parse(raw).content;});
   await page.addInitScript(()=>{window.SuperMD={post:(id,command,raw)=>(window as any).syncDoc(id,command,raw)};});
   await page.goto("/android-reader.html");
+  await page.waitForFunction(()=>typeof window.supermdLoad==="function");
   const filler="Readable windowed study paragraph with context.\n\n".repeat(40);
   content=`# Windowed replace\n\nRead [Docs](https://example.org/token-00) and token-01 vs token-01extra.\n\n`+
     Array.from({length:50},(_,i)=>`## Section ${i}\n\n${i===25?"Offscreen token-25 match.\n\n":i===45?"Distant token-45 match.\n\n":""}${filler}`).join("");
@@ -206,10 +209,13 @@ test("Ctrl+H, F3, whole-word, regex capture groups, and offscreen windowed Live 
   // Whole-word regex matches token-00 (in URL), token-01, token-25, token-45, and skips token-01extra!
   await expect(page.locator(".reading-search output")).toHaveText("0 / 4");
   await page.getByRole("textbox",{name:"Replacement text"}).fill("item-$2");
+  await expect(page.getByRole("button",{name:"Replace",exact:true})).toBeDisabled();
+  await expect(page.getByRole("button",{name:"Replace all",exact:true})).toBeEnabled();
 
-  // First Replace at index -1 selects match 0 (hidden URL) without overwriting it.
-  await page.getByRole("button",{name:"Replace",exact:true}).click();
+  // F3 selects match 0 (hidden URL) without painting a stale highlight or overwriting it.
+  await page.keyboard.press("F3");
   await expect(page.locator(".reading-search output")).toHaveText("1 / 4");
+  await expect(page.getByRole("button",{name:"Replace",exact:true})).toBeEnabled();
   expect(await page.evaluate(()=>CSS.highlights.has("smd-search-current"))).toBe(false);
   expect(content).toContain("https://example.org/token-00");
 

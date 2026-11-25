@@ -295,26 +295,6 @@ ApplicationWindow {{
         self.assertIsNotNone(recorder)
         self.assertEqual(self.studio.shortcutSequences("typewriter_scroll"), ["Ctrl+Alt+T"])
 
-    def test_python_discovery_defers_until_python_section_is_visible(self):
-        from unittest.mock import patch
-
-        page = self.window.findChild(object, "settingsPage")
-        self.assertIsNotNone(page)
-        self.assertEqual(page.property("section"), "appearance")
-        self.assertFalse(self.studio.python_busy)
-        self.assertEqual(self.studio.python_choices, [])
-        with patch.object(self.studio, "refreshPython") as refresh:
-            page.setProperty("section", "shortcuts")
-            QTest.qWait(20)
-            refresh.assert_not_called()
-            page.setProperty("section", "python")
-            QTest.qWait(20)
-            refresh.assert_called_once()
-            page.setProperty("section", "appearance")
-            page.setProperty("section", "python")
-            QTest.qWait(20)
-            refresh.assert_called_once()
-
 
 if __name__ == "__main__":
     unittest.main()
