@@ -89,6 +89,12 @@ export function selectedMarkdown(selection: Selection | null, source?:string): s
       case "input":return node.getAttribute("type")==="checkbox"?`[${(node as HTMLInputElement).checked?"x":" "}] `:"";
       case "strong":case "b":return `**${content}**`;
       case "em":case "i":return `*${content}*`;
+      case "del":case "s":return `~~${content}~~`;
+      case "mark":return `==${content}==`;
+      case "sub":return /\s/.test(content)?`<sub>${content}</sub>`:`~${content}~`;
+      case "sup":return /\s/.test(content)?`<sup>${content}</sup>`:`^${content}^`;
+      case "kbd":return `<kbd>${content}</kbd>`;
+      case "u":return `<u>${content}</u>`;
       case "a":return `[${content}](${node.getAttribute("href")||""})`;
       case "pre":return `\n\`\`\`${node.querySelector("code")?.className.match(/language-([\w-]+)/)?.[1]||""}\n${content.trimEnd()}\n\`\`\`\n`;
       case "p":case "div":case "section":return `${content}\n\n`;
@@ -135,7 +141,7 @@ export function selectedMarkdown(selection: Selection | null, source?:string): s
   let context=elementAt(range.commonAncestorContainer);
   while(context&&!context.matches('.markdown-body,.live-document')&&!/^(ADDRESS|ARTICLE|ASIDE|BLOCKQUOTE|BODY|DD|DIV|DL|DT|FIELDSET|FIGCAPTION|FIGURE|FOOTER|FORM|H[1-6]|HEADER|HR|LI|MAIN|NAV|OL|P|PRE|SECTION|TABLE|TBODY|TD|TFOOT|TH|THEAD|TR|UL)$/.test(context.tagName)){
     const tag=context.tagName.toLowerCase();
-    if(['strong','b','em','i','a','code'].includes(tag)&&!(tag==='code'&&context.parentElement?.tagName==='PRE')){
+    if(['strong','b','em','i','del','s','mark','sub','sup','kbd','u','a','code'].includes(tag)&&!(tag==='code'&&context.parentElement?.tagName==='PRE')){
       const wrapper=context.cloneNode(false) as Element;wrapper.append(output);output=wrapper;
     }
     context=context.parentElement;

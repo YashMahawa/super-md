@@ -36,6 +36,7 @@ def _definition_rows(platform: str) -> tuple[tuple[str, str, list[str]], ...]:
         ("quote", "Quote", quote),
         ("inline_math", "Inline math", [f"{primary}+Shift+M"]),
         ("find", "Find in note", [f"{primary}+F"]),
+        ("search_folder", "Search across notes", [f"{primary}+Shift+F"]),
         ("close_tab", "Close note tab", [f"{primary}+W"]),
         ("next_tab", "Next tab", [f"{primary}+Tab", f"{primary}+PgDown"]),
         ("previous_tab", "Previous tab", [f"{primary}+Shift+Tab", f"{primary}+PgUp"]),

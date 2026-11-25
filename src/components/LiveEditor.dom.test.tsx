@@ -26,6 +26,7 @@ vi.mock("hast-util-to-jsx-runtime", async (importOriginal) => {
 import Editor from "./Editor";
 import LiveEditor from "./LiveEditor";
 import { cancelHeadingNavigation } from "../documentNavigation";
+import * as proofreading from "../proofreading";
 import { setTypewriterScroll } from "../typewriterScroll";
 Object.assign(globalThis, { IS_REACT_ACT_ENVIRONMENT: true });
 afterEach(() => {
@@ -941,3 +942,101 @@ it("continues and clears list, task, and quote markers on Enter and indents/outd
   host.remove();
   delete document.documentElement.dataset.reduceMotion;
 });
+
+it("retains LiveEditor focus across WritingSuggestions replacement, dismissal, personal dictionary save, and single-step undo", async () => {
+  vi.useFakeTimers();
+  window.localStorage.removeItem("supermd.personal-dictionary.v1");
+  const checkSpy = vi.spyOn(proofreading, "checkWriting").mockImplementation(async (slice) => {
+    const out: proofreading.WritingIssue[] = [];
+    const tehIdx = slice.indexOf("teh");
+    if (tehIdx !== -1) {
+      out.push({ from: tehIdx, to: tehIdx + 3, kind: "spelling", message: "Possible spelling error: teh", replacements: ["right"] });
+    }
+    const tokenIdx = slice.indexOf("customtoken");
+    if (tokenIdx !== -1) {
+      out.push({ from: tokenIdx, to: tokenIdx + 11, kind: "spelling", message: "Possible spelling error: customtoken", replacements: [] });
+    }
+    const extraIdx = slice.indexOf("anoter");
+    if (extraIdx !== -1) {
+      out.push({ from: extraIdx, to: extraIdx + 6, kind: "spelling", message: "Possible spelling error: anoter", replacements: ["another"] });
+    }
+    return out;
+  });
+  const host = document.createElement("div");
+  document.body.append(host);
+  const root = createRoot(host);
+  let currentDoc = "teh customtoken and anoter word here.";
+  const renderLive = () =>
+    root.render(
+      <LiveEditor
+        markdown={currentDoc}
+        documentPath={null}
+        dark={false}
+        python=""
+        spellCheck
+        grammarCheck
+        onChange={(next) => {
+          currentDoc = next;
+          renderLive();
+        }}
+      />,
+    );
+
+  try {
+    await act(async () => { renderLive(); });
+    act(() => host.querySelector("p")!.dispatchEvent(new MouseEvent("dblclick", { bubbles: true })));
+    const area = host.querySelector<HTMLTextAreaElement>("textarea")!;
+    area.focus();
+    const initialCaret = currentDoc.indexOf("word");
+    area.setSelectionRange(initialCaret, initialCaret);
+    act(() => { area.dispatchEvent(new Event("select", { bubbles: true })); });
+
+    await act(async () => { await vi.advanceTimersByTimeAsync(650); });
+    const panel = host.querySelector(".writing-suggestions");
+    expect(panel).not.toBeNull();
+
+    // Accept length-changing "right" replacement for "teh" (+2 chars) and verify caret shifts by +2
+    const rightBtn = Array.from(panel!.querySelectorAll("button")).find((btn) => btn.textContent === "right");
+    expect(rightBtn).toBeDefined();
+    await act(async () => { rightBtn!.click(); });
+    expect(area.value).toBe("right customtoken and anoter word here.");
+    expect(document.activeElement).toBe(area);
+    expect(area.selectionStart).toBe(initialCaret + 2);
+
+    // Single-step Ctrl+Z reverts the accepted suggestion and restores original caret
+    act(() => { area.dispatchEvent(new KeyboardEvent("keydown", { key: "z", ctrlKey: true, bubbles: true, cancelable: true })); });
+    expect(area.value).toBe("teh customtoken and anoter word here.");
+    expect(area.selectionStart).toBe(initialCaret);
+    expect(document.activeElement).toBe(area);
+
+    await act(async () => { await vi.advanceTimersByTimeAsync(650); });
+    const refreshed = host.querySelector(".writing-suggestions")!;
+    expect(refreshed).not.toBeNull();
+
+    // Add "customtoken" to personal dictionary while keeping textarea open & focused
+    const dictBtn = Array.from(refreshed.querySelectorAll<HTMLButtonElement>("button")).find((btn) =>
+      btn.title.includes("customtoken"),
+    );
+    expect(dictBtn).toBeDefined();
+    await act(async () => { dictBtn!.click(); });
+    expect(document.activeElement).toBe(area);
+    expect(host.querySelector("textarea")).toBe(area);
+    expect(JSON.parse(window.localStorage.getItem("supermd.personal-dictionary.v1") || "[]")).toContain("customtoken");
+
+    // Dismiss a remaining suggestion while keeping textarea open & focused
+    const dismissBtn = Array.from(host.querySelectorAll<HTMLButtonElement>(".writing-suggestions button")).find(
+      (btn) => btn.textContent === "Dismiss",
+    );
+    expect(dismissBtn).toBeDefined();
+    await act(async () => { dismissBtn!.click(); });
+    expect(document.activeElement).toBe(area);
+    expect(host.querySelector("textarea")).toBe(area);
+  } finally {
+    checkSpy.mockRestore();
+    act(() => root.unmount());
+    host.remove();
+    window.localStorage.removeItem("supermd.personal-dictionary.v1");
+    vi.useRealTimers();
+  }
+});
+

@@ -18,6 +18,10 @@ import {analyzeDocument,type SourceDocumentAnalysis} from '../documentAnalysis';
 const LIMIT=24_000_000;
 const MAX_ENTRIES=512;
 const MAX_PIPELINES=32;
+const RAW_HTML_TOKEN=/(<!--[\s\S]*?-->|<\/?(?:br|mark|sub|sup|kbd|u)(?:\s+(?:[^>"']|"[^"]*"|'[^']*')*)?\s*\/?>)/gi;
+const BR_HTML_TAG=/^<br(?:\s+(?:[^>"']|"[^"]*"|'[^']*')*)?\s*\/?>$/i;
+const OPEN_HTML_TAG=/^<(mark|sub|sup|kbd|u)(?:\s+(?:[^>"']|"[^"]*"|'[^']*')*)?>$/i;
+const CLOSE_HTML_TAG=/^<\/(mark|sub|sup|kbd|u)\s*>$/i;
 
 interface DocumentCacheEntry {
   key:string;
@@ -207,19 +211,84 @@ function scanBlockNode(current:any,parentTag:string|null,state:{hasMath:boolean;
   }
 }
 
-function sanitizeAndMeasureHast(tree:Root,baseWeight=0):number {
-  let weight=baseWeight;
-  visit(tree,(node:any,index,parent:any)=>{
-    weight+=160+(typeof node.value==="string"?node.value.length*2:0);
-    if(node.type==="raw"&&parent&&index!==undefined){parent.children[index]={type:"text",value:node.value};return;}
-    if(node.type!=="element")return;
-    for(const key of ["href","src","cite","poster","longDesc","action"]){
-      if(typeof node.properties[key]!=="string")continue;
-      const url=node.properties[key];
-      node.properties[key]=node.tagName==="img"&&key==="src"&&/^data:image\/(?:png|jpeg|gif|webp|avif|svg\+xml);base64,/i.test(url)?url:defaultUrlTransform(url);
+const RARE_URL_PROPS=["cite","poster","longDesc","action"] as const;
+function sanitizeElementUrls(node:any):void {
+  const props=node.properties;
+  if(!props)return;
+  if(typeof props.href==="string")props.href=defaultUrlTransform(props.href);
+  if(typeof props.src==="string"){
+    const url=props.src;
+    props.src=node.tagName==="img"&&/^data:image\/(?:png|jpeg|gif|webp|avif|svg\+xml);base64,/i.test(url)?url:defaultUrlTransform(url);
+  }
+  if(props.cite!==undefined||props.poster!==undefined||props.longDesc!==undefined||props.action!==undefined){
+    for(const key of RARE_URL_PROPS)if(typeof props[key]==="string")props[key]=defaultUrlTransform(props[key]);
+  }
+}
+
+function sanitizeHastChildren(children:any[]):number {
+  let weight=0,hasRaw=false;
+  for(let i=0;i<children.length;i++)if(children[i]?.type==="raw"){hasRaw=true;break;}
+  if(!hasRaw){
+    for(let i=0;i<children.length;i++){
+      const child=children[i];
+      weight+=160+(typeof child.value==="string"?child.value.length*2:0);
+      if(child.type==="element"){
+        sanitizeElementUrls(child);
+        if(Array.isArray(child.children))weight+=sanitizeHastChildren(child.children);
+      }
     }
-  });
+    return weight;
+  }
+  const tokens:any[]=[];
+  for(let i=0;i<children.length;i++){
+    const child=children[i];
+    weight+=160+(typeof child.value==="string"?child.value.length*2:0);
+    if(child.type==="raw"){
+      const raw=String(child.value??""),parts=raw.split(RAW_HTML_TOKEN);
+      for(let p=0;p<parts.length;p++){
+        const part=parts[p];
+        if(!part||(part.startsWith("<!--")&&part.endsWith("-->")))continue;
+        if(BR_HTML_TAG.test(part)){tokens.push({type:"element",tagName:"br",properties:{},children:[]});continue;}
+        const open=OPEN_HTML_TAG.exec(part);
+        if(open&&!part.slice(0,-1).trimEnd().endsWith("/")){tokens.push({type:"__open",tag:open[1].toLowerCase(),raw:part});continue;}
+        const close=CLOSE_HTML_TAG.exec(part);
+        if(close){tokens.push({type:"__close",tag:close[1].toLowerCase(),raw:part});continue;}
+        tokens.push({type:"text",value:part});
+      }
+      continue;
+    }
+    if(child.type==="element"){
+      sanitizeElementUrls(child);
+      if(Array.isArray(child.children))weight+=sanitizeHastChildren(child.children);
+    }
+    tokens.push(child);
+  }
+  const out:any[]=[],stack:Array<{tag:string;raw:string;children:any[]}>=[];
+  const emit=(item:any)=>{
+    const target=stack.length?stack[stack.length-1].children:out,prev=target[target.length-1];
+    if(item.type==="text"&&prev?.type==="text"&&!prev.position&&!item.position)prev.value+=item.value;
+    else target.push(item);
+  };
+  for(const token of tokens){
+    if(token.type==="__open"){stack.push({tag:token.tag,raw:token.raw,children:[]});continue;}
+    if(token.type==="__close"){
+      let match=-1;
+      for(let s=stack.length-1;s>=0;s--)if(stack[s].tag===token.tag){match=s;break;}
+      if(match<0){emit({type:"text",value:token.raw});continue;}
+      while(stack.length-1>match){const unclosed=stack.pop()!;emit({type:"text",value:unclosed.raw});for(const c of unclosed.children)emit(c);}
+      const paired=stack.pop()!;
+      emit({type:"element",tagName:paired.tag,properties:{},children:paired.children});
+      continue;
+    }
+    emit(token);
+  }
+  while(stack.length){const unclosed=stack.pop()!;emit({type:"text",value:unclosed.raw});for(const c of unclosed.children)emit(c);}
+  children.splice(0,children.length,...out);
   return weight;
+}
+
+function sanitizeAndMeasureHast(tree:Root,baseWeight=0):number {
+  return baseWeight+160+sanitizeHastChildren(tree.children);
 }
 
 function measureHastWeight(node:any):number {

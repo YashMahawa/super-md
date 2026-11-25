@@ -638,6 +638,23 @@ const PROTECTED_AST_TYPES = new Set([
   "definition",
 ]);
 
+const VOID_HTML_TAGS = new Set([
+  "area",
+  "base",
+  "br",
+  "col",
+  "embed",
+  "hr",
+  "img",
+  "input",
+  "link",
+  "meta",
+  "param",
+  "source",
+  "track",
+  "wbr",
+]);
+
 export function isProtectedMarkdownSelection(doc: string, from: number, to: number): boolean {
   if (from >= to || from < 0 || to > doc.length) return true;
   const selected = doc.slice(from, to);
@@ -657,15 +674,47 @@ export function isProtectedMarkdownSelection(doc: string, from: number, to: numb
   if (windowStart === 0 && analysis.frontmatter && localFrom < analysis.frontmatter.end) return true;
 
   let protectedByAst = false;
+  const htmlNodes: Array<{ value: string; start: number; end: number }> = [];
   visit(analysis.tree, (node: any) => {
-    if (protectedByAst || !PROTECTED_AST_TYPES.has(node.type) || !node.position) return;
+    if (protectedByAst || !node.position) return;
     const start = node.position.start.offset;
     const end = node.position.end.offset;
-    if (typeof start === "number" && typeof end === "number" && start < localTo && end > localFrom) {
+    if (typeof start !== "number" || typeof end !== "number") return;
+    if (PROTECTED_AST_TYPES.has(node.type) && start < localTo && end > localFrom) {
       protectedByAst = true;
+      return;
+    }
+    if (node.type === "html" && typeof node.value === "string") {
+      htmlNodes.push({ value: node.value, start, end });
     }
   });
   if (protectedByAst) return true;
+
+  if (htmlNodes.length >= 2) {
+    const openBefore: string[] = [];
+    for (const item of htmlNodes) {
+      if (item.end > localFrom) break;
+      const closeMatch = /^<\/\s*([A-Za-z][A-Za-z0-9-]*)\s*>$/.exec(item.value.trim());
+      if (closeMatch) {
+        const idx = openBefore.lastIndexOf(closeMatch[1].toLowerCase());
+        if (idx !== -1) openBefore.length = idx;
+        continue;
+      }
+      const openMatch = /^<\s*([A-Za-z][A-Za-z0-9-]*)(?:\s[\s\S]*?)?>$/.exec(item.value.trim());
+      if (openMatch && !item.value.trim().endsWith("/>")) {
+        const tag = openMatch[1].toLowerCase();
+        if (!VOID_HTML_TAGS.has(tag)) openBefore.push(tag);
+      }
+    }
+    if (openBefore.length > 0) {
+      const openSet = new Set(openBefore);
+      for (const item of htmlNodes) {
+        if (item.start < localTo) continue;
+        const closeMatch = /^<\/\s*([A-Za-z][A-Za-z0-9-]*)\s*>$/.exec(item.value.trim());
+        if (closeMatch && openSet.has(closeMatch[1].toLowerCase())) return true;
+      }
+    }
+  }
 
   // Guard unclosed fences, math, inline code, HTML tags, and partial link/image syntax.
   const before = slice.slice(0, localFrom);

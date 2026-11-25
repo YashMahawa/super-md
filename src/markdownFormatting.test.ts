@@ -160,6 +160,20 @@ describe("applyMarkdownUrlPaste & protected contexts", () => {
     const htmlBlock = "<div>selected</div>";
     expect(applyMarkdownUrlPaste(htmlBlock, [{ anchor: 5, head: 13 }], url)).toBeNull();
 
+    const inlineHtmlKbd = "Press <kbd>selected</kbd> now";
+    const kbdStart = inlineHtmlKbd.indexOf("selected");
+    expect(applyMarkdownUrlPaste(inlineHtmlKbd, [{ anchor: kbdStart, head: kbdStart + 8 }], url)).toBeNull();
+
+    const inlineHtmlAnchor = 'Visit <a href="https://old.example">selected</a> link';
+    const anchorStart = inlineHtmlAnchor.indexOf("selected");
+    expect(applyMarkdownUrlPaste(inlineHtmlAnchor, [{ anchor: anchorStart, head: anchorStart + 8 }], url)).toBeNull();
+
+    const studyHighlight = "Review ==selected== concept";
+    const highlightStart = studyHighlight.indexOf("selected");
+    expect(applyMarkdownUrlPaste(studyHighlight, [{ anchor: highlightStart, head: highlightStart + 8 }], url)?.doc).toBe(
+      "Review ==[selected](https://example.com/new)== concept",
+    );
+
     const existingLinkLabel = "See [selected](https://old.example) here";
     expect(applyMarkdownUrlPaste(existingLinkLabel, [{ anchor: 5, head: 13 }], url)).toBeNull();
 
