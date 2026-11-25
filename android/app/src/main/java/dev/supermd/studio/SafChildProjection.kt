@@ -8,6 +8,7 @@ import java.io.FileNotFoundException
 import java.util.Locale
 
 private const val MAX_SAF_RELATIVE_DEPTH = 32
+private const val MAX_SAF_RESOLVE_PROJECTION_DIRS = 64
 
 private val SAF_CHILD_PROJECTION = arrayOf(
     DocumentsContract.Document.COLUMN_DOCUMENT_ID,
@@ -287,6 +288,45 @@ internal fun refreshSafWorkspaceMetadata(
     return SafMetadataRefreshResult(metadata, folderListing, pass.confirmedTreeKeys)
 }
 
+internal fun confirmThirdPartyTreeMembership(
+    pass: SafProjectionPass,
+    treeUri: Uri,
+    rootDocumentId: String,
+    targetDocumentId: String,
+    relativeHint: String? = null,
+): Boolean {
+    if (targetDocumentId == rootDocumentId || pass.hasProjectedDocument(treeUri, targetDocumentId)) {
+        return true
+    }
+    if (!relativeHint.isNullOrBlank()) {
+        pass.walkRelativeDirectory(treeUri, rootDocumentId, relativeHint.substringBeforeLast('/', ""))
+        if (pass.hasProjectedDocument(treeUri, targetDocumentId)) {
+            return true
+        }
+    }
+    val visited = HashSet<String>()
+    val queue = ArrayDeque<Pair<String, Int>>()
+    queue.addLast(rootDocumentId to 0)
+    visited.add(rootDocumentId)
+    var projectedDirs = 0
+    while (queue.isNotEmpty() && projectedDirs < MAX_SAF_RESOLVE_PROJECTION_DIRS) {
+        val (currentId, depth) = queue.removeFirst()
+        projectedDirs++
+        val projection = pass.projectDirectory(treeUri, currentId)
+        if (pass.hasProjectedDocument(treeUri, targetDocumentId)) {
+            return true
+        }
+        if (projection is SafProjectionPass.DirectoryProjection.Loaded && depth < MAX_SAF_RELATIVE_DEPTH) {
+            for (child in projection.children) {
+                if (child.isDirectory && !child.isVirtual && visited.add(child.documentId)) {
+                    queue.addLast(child.documentId to (depth + 1))
+                }
+            }
+        }
+    }
+    return pass.hasProjectedDocument(treeUri, targetDocumentId)
+}
+
 private fun resolveNoteMetadataInPass(
     documentAccess: DocumentAccess,
     pass: SafProjectionPass,
@@ -294,61 +334,80 @@ private fun resolveNoteMetadataInPass(
     activeFolderUri: Uri?,
     relativeHint: String?,
     confirmedTreeKeys: Set<String>,
-): ProviderMetadata = when (val access = documentAccess.resolveReadAccess(uri, activeFolderUri, pass::hasProjectedDocument)) {
-    SafReadAccess.Denied -> ProviderMetadata.Unavailable
-    is SafReadAccess.StandaloneDocument -> pass.querySingleDocument(access.documentUri)
-    is SafReadAccess.InGrantedTree -> {
-        pass.findProjectedDocument(access.treeUri, access.documentId)?.let { projected ->
-            return if (projected.isDirectory) ProviderMetadata.Missing else ProviderMetadata.Found(projected.displayName)
-        }
-        val inferredParent = inferSafParentDocumentId(access.treeUri.authority, access.rootDocumentId, access.documentId)
-        val projection = when {
-            inferredParent != null -> pass.projectDirectory(access.treeUri, inferredParent)
-            relativeHint != null -> pass.walkRelativeDirectory(
-                access.treeUri,
-                access.rootDocumentId,
-                relativeHint.substringBeforeLast('/', ""),
-            )
-            else -> null
-        }
-        pass.findProjectedDocument(access.treeUri, access.documentId)?.let { projected ->
-            return if (projected.isDirectory) ProviderMetadata.Missing else ProviderMetadata.Found(projected.displayName)
-        }
-        when (projection) {
-            SafProjectionPass.DirectoryProjection.Denied,
-            SafProjectionPass.DirectoryProjection.Unavailable -> ProviderMetadata.Unavailable
-            is SafProjectionPass.DirectoryProjection.Loaded,
-            SafProjectionPass.DirectoryProjection.Missing,
-            null -> pass.querySingleDocument(access.documentUri)
-        }
+): ProviderMetadata {
+    val isConfirmed: (Uri, String) -> Boolean = { treeUri, docId ->
+        pass.hasProjectedDocument(treeUri, docId) ||
+            DocumentsContract.buildDocumentUriUsingTree(treeUri, docId).toString() in confirmedTreeKeys
     }
-    is SafReadAccess.PendingTreeMembership -> {
-        pass.findProjectedDocument(access.treeUri, access.documentId)?.let { projected ->
-            return if (projected.isDirectory) ProviderMetadata.Missing else ProviderMetadata.Found(projected.displayName)
+    return when (val access = documentAccess.resolveReadAccess(uri, activeFolderUri, isConfirmed)) {
+        SafReadAccess.Denied -> {
+            if (!DocumentsContract.isTreeUri(uri) && !isKnownPathDocumentProvider(uri.authority)) {
+                val docId = runCatching { DocumentsContract.getDocumentId(uri) }.getOrNull()?.takeIf { it.isNotEmpty() && '\u0000' !in it }
+                if (docId != null) {
+                    for ((treeUri, rootId) in documentAccess.readableCandidateTrees(uri.authority, activeFolderUri)) {
+                        confirmThirdPartyTreeMembership(pass, treeUri, rootId, docId, relativeHint)
+                        pass.findProjectedDocument(treeUri, docId)?.let { projected ->
+                            return if (projected.isDirectory) ProviderMetadata.Missing else ProviderMetadata.Found(projected.displayName)
+                        }
+                    }
+                }
+            }
+            ProviderMetadata.Unavailable
         }
-        val projection = when {
-            relativeHint != null -> pass.walkRelativeDirectory(
-                access.treeUri,
-                access.rootDocumentId,
-                relativeHint.substringBeforeLast('/', ""),
-            )
-            access.directDocumentUri == null -> pass.projectDirectory(access.treeUri, access.rootDocumentId)
-            else -> null
+        is SafReadAccess.StandaloneDocument -> pass.querySingleDocument(access.documentUri)
+        is SafReadAccess.InGrantedTree -> {
+            pass.findProjectedDocument(access.treeUri, access.documentId)?.let { projected ->
+                return if (projected.isDirectory) ProviderMetadata.Missing else ProviderMetadata.Found(projected.displayName)
+            }
+            val inferredParent = inferSafParentDocumentId(access.treeUri.authority, access.rootDocumentId, access.documentId)
+            val projection = when {
+                inferredParent != null -> pass.projectDirectory(access.treeUri, inferredParent)
+                relativeHint != null -> pass.walkRelativeDirectory(
+                    access.treeUri,
+                    access.rootDocumentId,
+                    relativeHint.substringBeforeLast('/', ""),
+                )
+                else -> null
+            }
+            pass.findProjectedDocument(access.treeUri, access.documentId)?.let { projected ->
+                return if (projected.isDirectory) ProviderMetadata.Missing else ProviderMetadata.Found(projected.displayName)
+            }
+            when (projection) {
+                SafProjectionPass.DirectoryProjection.Denied,
+                SafProjectionPass.DirectoryProjection.Unavailable -> ProviderMetadata.Unavailable
+                is SafProjectionPass.DirectoryProjection.Loaded,
+                SafProjectionPass.DirectoryProjection.Missing,
+                null -> pass.querySingleDocument(access.documentUri)
+            }
         }
-        pass.findProjectedDocument(access.treeUri, access.documentId)?.let { projected ->
-            return if (projected.isDirectory) ProviderMetadata.Missing else ProviderMetadata.Found(projected.displayName)
-        }
-        val previouslyConfirmed = access.documentUri.toString() in confirmedTreeKeys ||
-            canonicalTreeDocumentKey(uri)?.let { it in confirmedTreeKeys } == true
-        when (projection) {
-            SafProjectionPass.DirectoryProjection.Denied,
-            SafProjectionPass.DirectoryProjection.Unavailable -> ProviderMetadata.Unavailable
-            is SafProjectionPass.DirectoryProjection.Loaded,
-            SafProjectionPass.DirectoryProjection.Missing,
-            null -> when {
-                access.directDocumentUri != null -> pass.querySingleDocument(access.directDocumentUri)
-                previouslyConfirmed -> pass.querySingleDocument(access.documentUri)
-                else -> ProviderMetadata.Unavailable
+        is SafReadAccess.PendingTreeMembership -> {
+            pass.findProjectedDocument(access.treeUri, access.documentId)?.let { projected ->
+                return if (projected.isDirectory) ProviderMetadata.Missing else ProviderMetadata.Found(projected.displayName)
+            }
+            val projection = when {
+                relativeHint != null -> pass.walkRelativeDirectory(
+                    access.treeUri,
+                    access.rootDocumentId,
+                    relativeHint.substringBeforeLast('/', ""),
+                )
+                access.directDocumentUri == null -> pass.projectDirectory(access.treeUri, access.rootDocumentId)
+                else -> null
+            }
+            pass.findProjectedDocument(access.treeUri, access.documentId)?.let { projected ->
+                return if (projected.isDirectory) ProviderMetadata.Missing else ProviderMetadata.Found(projected.displayName)
+            }
+            val previouslyConfirmed = access.documentUri.toString() in confirmedTreeKeys ||
+                canonicalTreeDocumentKey(uri)?.let { it in confirmedTreeKeys } == true
+            when (projection) {
+                SafProjectionPass.DirectoryProjection.Denied,
+                SafProjectionPass.DirectoryProjection.Unavailable -> ProviderMetadata.Unavailable
+                is SafProjectionPass.DirectoryProjection.Loaded,
+                SafProjectionPass.DirectoryProjection.Missing,
+                null -> when {
+                    access.directDocumentUri != null -> pass.querySingleDocument(access.directDocumentUri)
+                    previouslyConfirmed -> pass.querySingleDocument(access.documentUri)
+                    else -> ProviderMetadata.Unavailable
+                }
             }
         }
     }

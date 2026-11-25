@@ -176,6 +176,139 @@ class DocumentAccessTest {
         assertEquals(SafReadAccess.Denied, access.resolveReadAccess(opaquePathLikeChild, isConfirmedTreeChild = confirmFn))
     }
 
+    @Test fun resolveRecoversConfirmedThirdPartyPlainNoteAcrossGrantMigrationAndHonorsGrantModes() {
+        val grantedUris = mutableMapOf<Uri, Int>()
+        val enforcingContext = object : android.content.ContextWrapper(app) {
+            override fun checkUriPermission(uri: Uri?, pid: Int, uid: Int, modeFlags: Int): Int {
+                if (uri == null) return android.content.pm.PackageManager.PERMISSION_DENIED
+                val held = grantedUris.entries
+                    .filter { (granted, _) ->
+                        granted == uri || (DocumentsContract.isTreeUri(granted) && uri.toString().startsWith(granted.toString() + "/"))
+                    }
+                    .fold(0) { acc, (_, flags) -> acc or flags }
+                return if ((held and modeFlags) == modeFlags) {
+                    android.content.pm.PackageManager.PERMISSION_GRANTED
+                } else {
+                    android.content.pm.PackageManager.PERMISSION_DENIED
+                }
+            }
+        }
+
+        val thirdPartyAuthority = "dev.supermd.test.thirdparty.${System.nanoTime()}"
+        val thirdPartyProvider = object : ContentProvider() {
+            var childQueries = 0
+            var singleDocQueries = 0
+            override fun onCreate() = true
+            override fun query(
+                uri: Uri,
+                projection: Array<out String>?,
+                selection: String?,
+                selectionArgs: Array<out String>?,
+                sortOrder: String?,
+            ): Cursor {
+                val cols = projection ?: arrayOf(
+                    DocumentsContract.Document.COLUMN_DOCUMENT_ID,
+                    DocumentsContract.Document.COLUMN_DISPLAY_NAME,
+                    DocumentsContract.Document.COLUMN_MIME_TYPE,
+                    DocumentsContract.Document.COLUMN_FLAGS,
+                )
+                if (uri.pathSegments.lastOrNull() == "children") {
+                    childQueries++
+                    val parentId = DocumentsContract.getDocumentId(uri)
+                    return MatrixCursor(cols).apply {
+                        when (parentId) {
+                            "opaque_vault" -> {
+                                addRow(arrayOf<Any?>("opaque_note_1", "Migrated.md", "text/markdown", 0))
+                                addRow(arrayOf<Any?>("opaque_subdir", "Sub", DocumentsContract.Document.MIME_TYPE_DIR, 0))
+                            }
+                            "opaque_subdir" -> {
+                                addRow(arrayOf<Any?>("nested_opaque_note", "Nested.md", "text/markdown", 0))
+                            }
+                        }
+                    }
+                }
+                singleDocQueries++
+                return MatrixCursor(cols)
+            }
+            override fun getType(uri: Uri) = "text/markdown"
+            override fun insert(uri: Uri, values: ContentValues?): Uri? = null
+            override fun delete(uri: Uri, selection: String?, selectionArgs: Array<out String>?) = 0
+            override fun update(uri: Uri, values: ContentValues?, selection: String?, selectionArgs: Array<out String>?) = 0
+        }.also {
+            it.attachInfo(app, ProviderInfo().apply {
+                authority = thirdPartyAuthority
+                exported = true
+                grantUriPermissions = true
+            })
+        }
+        ShadowContentResolver.registerProviderInternal(thirdPartyAuthority, thirdPartyProvider)
+
+        val confirmedKeys = mutableSetOf<String>()
+        val access = DocumentAccess(
+            context = enforcingContext,
+            isConfirmedTreeChildProvider = { tree, docId ->
+                DocumentsContract.buildDocumentUriUsingTree(tree, docId).toString() in confirmedKeys
+            },
+            onConfirmedTreeKeys = { confirmedKeys.addAll(it) },
+        )
+
+        val plainNote = DocumentsContract.buildDocumentUri(thirdPartyAuthority, "opaque_note_1")
+        val plainNested = DocumentsContract.buildDocumentUri(thirdPartyAuthority, "nested_opaque_note")
+        val plainOutside = DocumentsContract.buildDocumentUri(thirdPartyAuthority, "outside_ungranted_note")
+        val vaultTree = DocumentsContract.buildTreeDocumentUri(thirdPartyAuthority, "opaque_vault")
+        val expectedTreeNote = DocumentsContract.buildDocumentUriUsingTree(vaultTree, "opaque_note_1")
+        val expectedTreeNested = DocumentsContract.buildDocumentUriUsingTree(vaultTree, "nested_opaque_note")
+
+        // 1. Direct note grant active -> resolves directly with 0 tree queries.
+        grantedUris[plainNote] = Intent.FLAG_GRANT_READ_URI_PERMISSION or Intent.FLAG_GRANT_WRITE_URI_PERMISSION
+        assertEquals(plainNote, access.resolve(plainNote, writing = false))
+        assertEquals(plainNote, access.resolve(plainNote, writing = true))
+        assertEquals(0, thirdPartyProvider.childQueries)
+
+        // 2. Migrate: individual plain note grant expires while read-only persisted containing folder grant remains.
+        grantedUris.remove(plainNote)
+        grantedUris[vaultTree] = Intent.FLAG_GRANT_READ_URI_PERMISSION
+        app.contentResolver.takePersistableUriPermission(vaultTree, Intent.FLAG_GRANT_READ_URI_PERMISSION)
+
+        assertEquals(expectedTreeNote, access.resolve(plainNote, writing = false))
+        assertEquals(1, thirdPartyProvider.childQueries)
+        assertEquals(0, thirdPartyProvider.singleDocQueries)
+
+        // Write resolution must NOT manufacture write access from a read-only folder grant (0 extra queries).
+        val queriesBeforeWriteCheck = thirdPartyProvider.childQueries
+        assertEquals(plainNote, access.resolve(plainNote, writing = true))
+        assertEquals(queriesBeforeWriteCheck, thirdPartyProvider.childQueries)
+
+        // Out-of-tree plain URI on the same provider must NOT upgrade to vaultTree.
+        assertEquals(plainOutside, access.resolve(plainOutside, writing = false))
+        assertEquals(0, thirdPartyProvider.singleDocQueries)
+
+        // 3. Upgrade containing folder grant to read + write -> both root and nested plain notes resolve for write too.
+        grantedUris[vaultTree] = Intent.FLAG_GRANT_READ_URI_PERMISSION or Intent.FLAG_GRANT_WRITE_URI_PERMISSION
+        app.contentResolver.takePersistableUriPermission(
+            vaultTree,
+            Intent.FLAG_GRANT_READ_URI_PERMISSION or Intent.FLAG_GRANT_WRITE_URI_PERMISSION,
+        )
+        thirdPartyProvider.childQueries = 0
+        // Root note was already confirmed in confirmedKeys -> 0 queries!
+        assertEquals(expectedTreeNote, access.resolve(plainNote, writing = true))
+        assertEquals(0, thirdPartyProvider.childQueries)
+        assertEquals(expectedTreeNested, access.resolve(plainNested, writing = true))
+
+        // 4. Revoke containing folder grant -> 0 provider queries on revoked access.
+        grantedUris.clear()
+        app.contentResolver.releasePersistableUriPermission(
+            vaultTree,
+            Intent.FLAG_GRANT_READ_URI_PERMISSION or Intent.FLAG_GRANT_WRITE_URI_PERMISSION,
+        )
+        thirdPartyProvider.childQueries = 0
+        thirdPartyProvider.singleDocQueries = 0
+        assertEquals(plainNote, access.resolve(plainNote, writing = false))
+        assertEquals(plainNote, access.resolve(plainNote, writing = true))
+        assertEquals(0, thirdPartyProvider.childQueries)
+        assertEquals(0, thirdPartyProvider.singleDocQueries)
+    }
+
     @Test fun reopeningRecentNoteAfterReadRevocationOffersRecoveryAndKeepsItsDraft() {
         val model = newModel()
         val noteId = openBaseline(model)

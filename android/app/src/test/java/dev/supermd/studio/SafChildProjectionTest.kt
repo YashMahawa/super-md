@@ -508,6 +508,114 @@ class SafChildProjectionTest {
         assertEquals(1, provider.singleDocQueryCalls.get())
     }
 
+    @Test
+    fun existingThirdPartyPlainNoteRecoversAcrossGrantMigrationForOpenRefreshSaveAndAutosave() {
+        val opaqueAuthority = "dev.supermd.test.opaque.migration.${System.nanoTime()}"
+        val opaqueProvider = CountingSafDocumentProvider(tempDir, opaqueRoot = true).also {
+            it.attach(app, opaqueAuthority)
+            it.permissionChecker = { uri, requiredFlags ->
+                app.checkUriPermission(uri, android.os.Process.myPid(), android.os.Process.myUid(), requiredFlags) ==
+                    android.content.pm.PackageManager.PERMISSION_GRANTED
+            }
+        }
+        ShadowContentResolver.registerProviderInternal(opaqueAuthority, opaqueProvider)
+
+        val rwFlags = Intent.FLAG_GRANT_READ_URI_PERMISSION or Intent.FLAG_GRANT_WRITE_URI_PERMISSION
+        val plainBeta = DocumentsContract.buildDocumentUri(opaqueAuthority, "doc_beta")
+        val plainNested = DocumentsContract.buildDocumentUri(opaqueAuthority, "shards/sub/nested_doc")
+        val plainUngrantedSecret = DocumentsContract.buildDocumentUri(opaqueAuthority, "ungranted_root/Secret.md")
+        val opaqueTree = DocumentsContract.buildTreeDocumentUri(opaqueAuthority, "root_opaque")
+
+        // Initially open plain third-party notes via individual single-document grants (no folder tree grant yet).
+        app.grantUriPermission(app.packageName, plainBeta, rwFlags)
+        app.grantUriPermission(app.packageName, plainNested, rwFlags)
+
+        val model = newModel()
+        val betaId = openNote(model, plainBeta)
+        val nestedId = openNote(model, plainNested)
+        assertEquals("# Beta\n", model.state.value.tabs.single { it.id == betaId }.content)
+        assertEquals("# Nested path-like\n", model.state.value.tabs.single { it.id == nestedId }.content)
+
+        // Individual single-document grants expire while the user retains a READ-ONLY persisted folder grant.
+        app.revokeUriPermission(plainBeta, rwFlags)
+        app.revokeUriPermission(plainNested, rwFlags)
+        app.grantUriPermission(
+            app.packageName,
+            opaqueTree,
+            Intent.FLAG_GRANT_READ_URI_PERMISSION or Intent.FLAG_GRANT_PERSISTABLE_URI_PERMISSION,
+        )
+        app.contentResolver.takePersistableUriPermission(opaqueTree, Intent.FLAG_GRANT_READ_URI_PERMISSION)
+
+        // External refresh and metadata refresh recover read access through provider-confirmed tree membership.
+        opaqueProvider.putFile("doc_beta", "root_opaque", "Beta-Migrated.md", "# Beta updated externally\n")
+        opaqueProvider.putFile("shards/sub/nested_doc", "dir_opaque_sub", "Nested-Migrated.md", "# Nested path-like\n")
+        opaqueProvider.resetCounts()
+        model.refreshMetadata()
+        await {
+            model.state.value.tabs.single { it.id == betaId }.name == "Beta-Migrated.md" &&
+                model.state.value.tabs.single { it.id == nestedId }.name == "Nested-Migrated.md"
+        }
+        assertEquals(0, opaqueProvider.singleDocQueryCalls.get())
+
+        model.refreshExternal(plainBeta, immediate = true)
+        await { model.state.value.tabs.single { it.id == betaId }.content == "# Beta updated externally\n" }
+
+        // Reopening plainBeta in a fresh ViewModel session also recovers via the persisted folder grant.
+        val reopenedModel = newModel()
+        reopenedModel.open(plainBeta)
+        await {
+            reopenedModel.state.value.tabs.any {
+                it.content == "# Beta updated externally\n" && sameDocument(Uri.parse(it.uri!!), plainBeta)
+            }
+        }
+
+        // Ungranted plain note outside root_opaque is still rejected without manufacturing tree access or touching ungranted_root.
+        opaqueProvider.resetCounts()
+        reopenedModel.open(plainUngrantedSecret)
+        await { reopenedModel.documentAccessRequests.value != null || reopenedModel.state.value.error != null }
+        assertEquals(0, opaqueProvider.childQueryCount("ungranted_root"))
+        assertEquals(0, opaqueProvider.singleDocQueryCalls.get())
+        assertFalse(opaqueProvider.queriedUris.any { it.toString().contains("ungranted_root") })
+
+        // Attempting to save while the persisted folder grant is READ-ONLY must NOT manufacture write access.
+        model.edit(betaId, "# Local edit awaiting write grant\n")
+        model.saveManual(noteId = betaId)
+        await { model.documentAccessRequests.value?.writing == true }
+        assertEquals("# Beta updated externally\n", opaqueProvider.readBackingText("doc_beta"))
+        model.dismissDocumentAccess()
+
+        // Upgrading the persisted folder grant to READ + WRITE enables manual save and autosave on both plain notes.
+        app.grantUriPermission(
+            app.packageName,
+            opaqueTree,
+            rwFlags or Intent.FLAG_GRANT_PERSISTABLE_URI_PERMISSION,
+        )
+        app.contentResolver.takePersistableUriPermission(opaqueTree, rwFlags)
+        // Clear blocked write state via explicit save once write grant is present.
+        val clearField = StudioViewModel::class.java.getDeclaredField("blockedDocumentWrites").apply { isAccessible = true }
+        (clearField.get(model) as MutableSet<*>).clear()
+
+        model.saveManual(noteId = betaId)
+        await { !model.state.value.tabs.single { it.id == betaId }.dirty }
+        assertEquals("# Local edit awaiting write grant\n", opaqueProvider.readBackingText("doc_beta"))
+
+        // Autosave on the nested plain third-party note also writes through the containing folder grant.
+        model.reading(autosave = true)
+        model.edit(nestedId, "# Nested autosaved across grant migration\n")
+        advanceAndIdle(1_500)
+        await { !model.state.value.tabs.single { it.id == nestedId }.dirty }
+        assertEquals("# Nested autosaved across grant migration\n", opaqueProvider.readBackingText("shards/sub/nested_doc"))
+        model.reading(autosave = false)
+
+        // Revoking the folder grant stops all provider queries (0 queries on revoked access).
+        app.contentResolver.releasePersistableUriPermission(opaqueTree, rwFlags)
+        app.revokeUriPermission(opaqueTree, rwFlags or Intent.FLAG_GRANT_PERSISTABLE_URI_PERMISSION)
+        opaqueProvider.resetCounts()
+        model.refreshMetadata()
+        advanceAndIdle(350)
+        assertEquals(0, opaqueProvider.totalQueryCalls.get())
+    }
+
     private fun newModel(existingKey: String? = null): StudioViewModel {
         val store = ViewModelStore().also(viewModels::add)
         val key = existingKey ?: "saf-projection-${System.nanoTime()}".also(workspaceKeys::add)
@@ -574,6 +682,9 @@ private class CountingSafDocumentProvider(
     val totalQueryCalls = AtomicInteger(0)
     val singleDocQueryCalls = AtomicInteger(0)
     val queriedUris = CopyOnWriteArrayList<Uri>()
+    @Volatile var permissionChecker: ((Uri, Int) -> Boolean)? = null
+
+    fun readBackingText(documentId: String): String? = entries[documentId]?.file?.readText()
 
     init {
         if (opaqueRoot) {
@@ -698,6 +809,11 @@ private class CountingSafDocumentProvider(
         selectionArgs: Array<out String>?,
         sortOrder: String?,
     ): Cursor {
+        permissionChecker?.let { checkPerm ->
+            if (!checkPerm(uri, Intent.FLAG_GRANT_READ_URI_PERMISSION)) {
+                throw SecurityException("Permission denied for query on $uri")
+            }
+        }
         totalQueryCalls.incrementAndGet()
         queriedUris += uri
         if (uri.pathSegments.lastOrNull() == "children") {
@@ -742,6 +858,16 @@ private class CountingSafDocumentProvider(
     override fun update(uri: Uri, values: ContentValues?, selection: String?, selectionArgs: Array<out String>?): Int = 0
 
     override fun openFile(uri: Uri, mode: String): ParcelFileDescriptor {
+        val required = if (mode == "r") {
+            Intent.FLAG_GRANT_READ_URI_PERMISSION
+        } else {
+            Intent.FLAG_GRANT_WRITE_URI_PERMISSION
+        }
+        permissionChecker?.let { checkPerm ->
+            if (!checkPerm(uri, required)) {
+                throw SecurityException("Permission denied for $uri (mode=$mode)")
+            }
+        }
         val docId = DocumentsContract.getDocumentId(uri)
         val entry = entries[docId] ?: throw FileNotFoundException("Missing document $docId")
         val backing = entry.file ?: throw FileNotFoundException("Cannot open directory $docId")

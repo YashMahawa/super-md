@@ -125,7 +125,23 @@ private val pythonExecution = kotlinx.coroutines.sync.Mutex()
 
 class StudioViewModel(app: Application, val workspaceKey: String = "main") : AndroidViewModel(app) {
     private val prefs = app.getSharedPreferences("studio", 0)
-    private val documentAccess = DocumentAccess(app)
+    private val confirmedTreeDocumentKeys = java.util.concurrent.ConcurrentHashMap.newKeySet<String>()
+    private val documentAccess = DocumentAccess(
+        context = app,
+        activeFolderUriProvider = { runCatching { mutable.value.folder?.let(Uri::parse) }.getOrNull() },
+        relativeHintProvider = { target ->
+            runCatching {
+                mutable.value.tabs.firstOrNull { it.uri != null && !it.relative.isNullOrEmpty() && sameDocument(Uri.parse(it.uri), target) }?.relative
+                    ?: recentMutable.value.firstOrNull { !it.relative.isNullOrEmpty() && sameDocument(Uri.parse(it.uri), target) }?.relative
+            }.getOrNull()
+        },
+        isConfirmedTreeChildProvider = { treeUri, documentId ->
+            val key = DocumentsContract.buildDocumentUriUsingTree(treeUri, documentId).toString()
+            key in confirmedTreeDocumentKeys ||
+                runCatching { mutable.value.files.any { it.uri == key } }.getOrDefault(false)
+        },
+        onConfirmedTreeKeys = { keys -> confirmedTreeDocumentKeys.addAll(keys) },
+    )
     private val accessRequestsMutable = MutableStateFlow<DocumentAccessRequest?>(null)
     val documentAccessRequests = accessRequestsMutable.asStateFlow()
     private val blockedDocumentWrites = mutableSetOf<String>()
@@ -381,7 +397,6 @@ class StudioViewModel(app: Application, val workspaceKey: String = "main") : And
     private var listedRelative = ""
     private var listFolderSeq = 0L
     private var listFolderJob: Job? = null
-    private val confirmedTreeDocumentKeys = java.util.concurrent.ConcurrentHashMap.newKeySet<String>()
     private val mutable = MutableStateFlow(restore())
     private val viewModelRetired = AtomicBoolean(false)
     private val recoveryWriter = LatestRecoveryWriter<StudioState, RecoverySnapshotSignature>(
@@ -759,7 +774,11 @@ class StudioViewModel(app: Application, val workspaceKey: String = "main") : And
             confirmedTreeDocumentKeys.addAll(refreshSnapshot.confirmedTreeKeys)
             val metadata=refreshSnapshot.metadata
             val removed=metadata.filterValues {it==null}.keys
-            removed.forEach {raw->canonicalTreeDocumentKey(Uri.parse(raw))?.let(confirmedTreeDocumentKeys::remove)}
+            removed.forEach { raw ->
+                val parsed = Uri.parse(raw)
+                canonicalTreeDocumentKey(parsed)?.let(confirmedTreeDocumentKeys::remove)
+                confirmedTreeDocumentKeys.removeIf { key -> sameDocument(Uri.parse(key), parsed) }
+            }
             val s=mutable.value
             val discarded=s.tabs.filter {it.uri in removed}
             val recovered=discarded.filter {it.dirty}.map {it.copy(name="Recovered ${it.name}",uri=null,saved="")}
@@ -1876,7 +1895,7 @@ class StudioViewModel(app: Application, val workspaceKey: String = "main") : And
             val extension=note.name.substringAfterLast('.',"md")
             if(!name.contains('.'))name+=".$extension"
             require(name.substringAfterLast('.').equals(extension,true)) {"Rename keeps the note format. Use Export to change formats."}
-            val uri=note.uri?.let {withContext(Dispatchers.IO) {DocumentsContract.renameDocument(resolver,Uri.parse(it),name)?.toString() ?: error("This provider does not support renaming. Use Save as instead.")}}
+            val uri=note.uri?.let {withContext(Dispatchers.IO) {val target=documentAccess.resolve(Uri.parse(it),writing=true);DocumentsContract.renameDocument(resolver,target,name)?.toString() ?: error("This provider does not support renaming. Use Save as instead.")}}
             change {s->s.copy(tabs=s.tabs.map {if(it.id==id)it.copy(name=name,uri=uri,relative=it.relative?.let {r->r.substringBeforeLast('/',"").let {parent->if(parent.isEmpty())name else "$parent/$name"}}) else it})}
             mutable.value.tabs.find {it.id==id}?.let(::remember)
         } catch(error:Exception){fail("Could not rename note: ${error.message}")}
