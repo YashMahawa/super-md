@@ -8,10 +8,91 @@ ScrollView {
     objectName: "tabStrip"
     required property var viewState
     property var shortcutLabels: ({})
+    readonly property string activeTabId: strip.viewState && strip.viewState.active ? String(strip.viewState.active) : ""
+    readonly property int tabCount: strip.viewState && strip.viewState.tabs ? strip.viewState.tabs.length : 0
+    readonly property int activeTabIndex: {
+        const tabs = strip.viewState && strip.viewState.tabs ? strip.viewState.tabs : []
+        for (let index = 0; index < tabs.length; index += 1) {
+            if (tabs[index].id === strip.activeTabId) return index
+        }
+        return -1
+    }
+    property bool draggingTab: false
+    property real lastContentWidth: 0
     height: 48
     contentHeight: 48
+    contentWidth: {
+        const current = Math.max(availableWidth, tabRow.implicitWidth)
+        if (tabRepeater.count < strip.tabCount && strip.lastContentWidth > current) {
+            return strip.lastContentWidth
+        }
+        return current
+    }
     ScrollBar.vertical.policy: ScrollBar.AlwaysOff
     ScrollBar.horizontal: ExpressiveScrollBar { implicitHeight: 8; padding: 1 }
+    Timer {
+        id: revealTimer
+        interval: 0
+        repeat: false
+        onTriggered: strip.revealActiveTab()
+    }
+    function shortcutHint(label, key, fallback) {
+        const raw = strip.shortcutLabels && strip.shortcutLabels[key] !== undefined ? strip.shortcutLabels[key] : fallback
+        return raw && raw !== "Disabled" ? label + " (" + raw + ")" : label
+    }
+    function revealActiveTab() {
+        if (strip.draggingTab) return
+        const flickable = strip.contentItem
+        if (!flickable || typeof flickable.contentX !== "number") return
+        const viewportWidth = strip.availableWidth > 0 ? strip.availableWidth : strip.width
+        if (viewportWidth <= 0 || strip.activeTabIndex < 0) return
+        if (tabRepeater.count < strip.tabCount) {
+            revealTimer.restart()
+            return
+        }
+        let activeItem = tabRepeater.itemAt(strip.activeTabIndex)
+        if (!activeItem || !activeItem.modelData || activeItem.modelData.id !== strip.activeTabId) {
+            activeItem = null
+            for (let index = 0; index < tabRepeater.count; index += 1) {
+                const candidate = tabRepeater.itemAt(index)
+                if (candidate && candidate.modelData && candidate.modelData.id === strip.activeTabId) {
+                    activeItem = candidate
+                    break
+                }
+            }
+        }
+        if (!activeItem || activeItem.width <= 0) {
+            revealTimer.restart()
+            return
+        }
+        const margin = 16
+        const totalWidth = Math.max(viewportWidth, tabRow.implicitWidth, flickable.contentWidth)
+        strip.lastContentWidth = totalWidth
+        if (flickable.contentWidth < totalWidth) flickable.contentWidth = totalWidth
+        const maxScroll = Math.max(0, totalWidth - viewportWidth)
+        const leftEdge = Math.max(0, activeItem.x - margin)
+        const rightEdge = activeItem.x + activeItem.width + margin
+        let nextX = flickable.contentX
+        if (leftEdge < nextX) nextX = leftEdge
+        else if (rightEdge > nextX + viewportWidth) nextX = rightEdge - viewportWidth
+        nextX = Math.max(0, Math.min(maxScroll, nextX))
+        if (Math.abs(flickable.contentX - nextX) > 0.5) flickable.contentX = nextX
+    }
+    function scheduleRevealActiveTab() {
+        strip.revealActiveTab()
+        Qt.callLater(strip.revealActiveTab)
+        revealTimer.restart()
+    }
+    Connections {
+        target: strip.contentItem
+        function onContentWidthChanged() { Qt.callLater(strip.revealActiveTab) }
+    }
+    onActiveTabIdChanged: scheduleRevealActiveTab()
+    onActiveTabIndexChanged: scheduleRevealActiveTab()
+    onTabCountChanged: scheduleRevealActiveTab()
+    onWidthChanged: scheduleRevealActiveTab()
+    onAvailableWidthChanged: scheduleRevealActiveTab()
+    Component.onCompleted: scheduleRevealActiveTab()
     function openRename(id, name) {
         renameDialog.noteId = id
         renameField.text = name
@@ -60,18 +141,25 @@ ScrollView {
         } catch (error) { /* Foreign or stale drag: leave every note untouched. */ }
     }
     Row {
+        id: tabRow
         height: strip.height
         spacing: 4
         leftPadding: 16
+        rightPadding: 16
+        onImplicitWidthChanged: strip.scheduleRevealActiveTab()
         Repeater {
+            id: tabRepeater
             model: strip.viewState.tabs
             delegate: Rectangle {
                 id: tab
                 required property var modelData
                 required property int index
+                readonly property bool isActive: modelData.id === strip.activeTabId
                 width: Math.min(260, label.implicitWidth + 64)
                 height: 40
                 y: (strip.height - height) / 2
+                onXChanged: if (isActive) strip.scheduleRevealActiveTab()
+                onWidthChanged: if (isActive) strip.scheduleRevealActiveTab()
                 objectName: "noteTab"
                 radius: 18
                 antialiasing: true
@@ -80,10 +168,11 @@ ScrollView {
                 Drag.supportedActions: Qt.MoveAction
                 Drag.proposedAction: Qt.MoveAction
                 Drag.mimeData: ({"application/x-supermd-tab": JSON.stringify({window: studio.windowId, tab: modelData.id})})
-                Drag.onDragFinished: function(action) { const id = modelData.id; tab.Drag.active = false; Qt.callLater(function() { studio.finishTabDrag(id, action) }) }
+                Drag.onDragFinished: function(action) { const id = modelData.id; tab.Drag.active = false; strip.draggingTab = false; Qt.callLater(function() { studio.finishTabDrag(id, action); strip.scheduleRevealActiveTab() }) }
                 DragHandler {
                     target: null
                     onActiveChanged: {
+                        strip.draggingTab = active
                         if (active) preview.grabToImage(function(result) {
                             if (dragHandler.active) { tab.Drag.imageSource = result.url; tab.Drag.active = true }
                         })
@@ -109,8 +198,8 @@ ScrollView {
                     id: tabMenu
                     objectName: "tabContextMenu"
                     NoteMenuItem { text: "Rename note"; icon.source: "../icons/Rename.svg"; onTriggered: strip.openRename(tab.modelData.id, tab.modelData.name) }
-                    NoteMenuItem { text: "Undo"; enabled: tab.modelData.id===strip.viewState.active; onTriggered:studio.command("undo") }
-                    NoteMenuItem { text: "Redo"; enabled: tab.modelData.id===strip.viewState.active; onTriggered:studio.command("redo") }
+                    NoteMenuItem { text: "Undo"; shortcutText: strip.shortcutLabels.undo || ""; enabled: tab.modelData.id===strip.viewState.active; onTriggered:studio.command("undo") }
+                    NoteMenuItem { text: "Redo"; shortcutText: strip.shortcutLabels.redo || ""; enabled: tab.modelData.id===strip.viewState.active; onTriggered:studio.command("redo") }
                     MenuSeparator {}
                     NoteMenuItem { text: "Move to new window"; onTriggered: studio.detachTab(tab.modelData.id) }
                 }
@@ -118,7 +207,7 @@ ScrollView {
                     anchors.fill: parent
                     spacing: 0
                     ActionButton { id: label; compact: true; text: (modelData.dirty ? "• " : "") + modelData.name; Layout.fillWidth: true; ToolTip.text: modelData.path || modelData.name; onClicked: studio.selectTab(modelData.id) }
-                    ActionButton { glyph: "X"; compact: true; implicitWidth: 36; Accessible.name: "Close " + modelData.name; ToolTip.text: "Close " + modelData.name; onClicked: studio.closeTabSafely(modelData.id) }
+                    ActionButton { glyph: "X"; compact: true; implicitWidth: 36; Accessible.name: "Close " + modelData.name; ToolTip.text: tab.isActive ? strip.shortcutHint("Close " + modelData.name, "close_tab", "") : "Close " + modelData.name; onClicked: studio.closeTabSafely(modelData.id) }
                 }
                 DropArea {
                     id: dropZone
@@ -137,7 +226,7 @@ ScrollView {
             glyph: "Plus"; compact: true; implicitWidth: 40; implicitHeight: 40
             y: (strip.height - height) / 2
             Accessible.name: "New tab"
-            ToolTip.text: "New tab (" + (strip.shortcutLabels.new_note || "Ctrl+T") + ")"
+            ToolTip.text: strip.shortcutHint("New tab", "new_note", "Ctrl+T")
             onClicked: studio.newNote()
             DropArea { anchors.fill: parent; keys: ["application/x-supermd-tab"]; onDropped: function(drop) { strip.receive(drop, strip.viewState.tabs.length) } }
         }

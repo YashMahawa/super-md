@@ -307,6 +307,60 @@ ApplicationWindow {{
         self.assertIsNotNone(recorder)
         self.assertEqual(self.studio.shortcutSequences("typewriter_scroll"), ["Ctrl+Alt+T"])
 
+    def test_direct_mode_shortcuts_appear_in_settings_and_gate_split_below_1000px(self):
+        from PySide6.QtCore import QMetaObject, Q_ARG, Q_RETURN_ARG
+
+        def enabled(action):
+            return QMetaObject.invokeMethod(
+                self.window,
+                "shortcutEnabled",
+                Q_RETURN_ARG("QVariant"),
+                Q_ARG("QVariant", action),
+            )
+
+        self.choose_shortcut_settings()
+        for action_id, expected in (
+            ("mode_live", ["Ctrl+Alt+1"]),
+            ("mode_editor", ["Ctrl+Alt+2"]),
+            ("mode_reader", ["Ctrl+Alt+3"]),
+            ("mode_split", ["Ctrl+Alt+4"]),
+        ):
+            self.assertIsNotNone(self.named_item("shortcutRecorder_" + action_id))
+            self.assertEqual(self.studio.shortcutSequences(action_id), expected)
+
+        # At 960px (< 1000px), Live/Source/Read shortcuts are enabled while Split is gated off.
+        self.assertEqual(self.window.width(), 960)
+        self.assertTrue(enabled("mode_live"))
+        self.assertTrue(enabled("mode_editor"))
+        self.assertTrue(enabled("mode_reader"))
+        self.assertFalse(enabled("mode_split"))
+
+        # Widening >= 1000px enables Split mode shortcut.
+        self.window.resize(1120, 700)
+        QTest.qWait(30)
+        self.assertTrue(enabled("mode_split"))
+
+        # Modal dialogs and reader/fullscreen overlays suppress direct mode shortcuts.
+        self.window.setProperty("modalDialogCount", 1)
+        self.assertFalse(enabled("mode_live"))
+        self.assertFalse(enabled("mode_split"))
+        self.window.setProperty("modalDialogCount", 0)
+
+        overlay_state = json.loads(self.studio.snapshot)
+        overlay_state["readerOverlay"] = True
+        self.window.setProperty("viewState", overlay_state)
+        self.assertFalse(enabled("mode_reader"))
+        overlay_state["readerOverlay"] = False
+        overlay_state["fullscreen"] = True
+        self.window.setProperty("viewState", overlay_state)
+        self.assertFalse(enabled("mode_editor"))
+
+        # Clearing a mode shortcut marks its label Disabled cleanly and remapping updates it.
+        self.assertEqual(self.studio.setShortcut("mode_reader", ""), "")
+        self.assertEqual(self.studio.shortcutLabel("mode_reader"), "Disabled")
+        self.assertEqual(self.studio.setShortcut("mode_reader", "Ctrl+Alt+9"), "")
+        self.assertIn("9", self.studio.shortcutLabel("mode_reader"))
+
 
 if __name__ == "__main__":
     unittest.main()

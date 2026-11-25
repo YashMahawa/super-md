@@ -52,6 +52,10 @@ def _definition_rows(platform: str) -> tuple[tuple[str, str, list[str]], ...]:
         ("zoom_out", "Zoom out", [f"{primary}+-"]),
         ("zoom_reset", "Reset zoom", [f"{primary}+0"]),
         ("typewriter_scroll", "Toggle typewriter scrolling", [f"{primary}+Alt+T"]),
+        ("mode_live", "Live mode", [f"{primary}+Alt+1"]),
+        ("mode_editor", "Source mode", [f"{primary}+Alt+2"]),
+        ("mode_reader", "Read mode", [f"{primary}+Alt+3"]),
+        ("mode_split", "Split mode", [f"{primary}+Alt+4"]),
     )
 
 

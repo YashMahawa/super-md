@@ -13,7 +13,12 @@ class ShortcutValidationTest(unittest.TestCase):
         self.assertEqual(normalized, defaults)
         self.assertEqual(defaults["save"], ["Ctrl+S"])
         self.assertEqual(defaults["save_as"], ["Ctrl+Shift+S"])
+        self.assertEqual(defaults["mode_live"], ["Ctrl+Alt+1"])
+        self.assertEqual(defaults["mode_editor"], ["Ctrl+Alt+2"])
+        self.assertEqual(defaults["mode_reader"], ["Ctrl+Alt+3"])
+        self.assertEqual(defaults["mode_split"], ["Ctrl+Alt+4"])
         self.assertTrue(native_label(defaults["find"][0]))
+        self.assertTrue(native_label(defaults["mode_live"][0]))
         self.assertEqual(parse_sequence("Ctrl+PageDown"), "Ctrl+PgDown")
 
     def test_macos_defaults_use_portable_command_modifiers_and_fullscreen_chord(self):
@@ -38,6 +43,10 @@ class ShortcutValidationTest(unittest.TestCase):
         self.assertEqual(defaults["undo"], ["Ctrl+Z"])
         self.assertEqual(defaults["redo"], ["Ctrl+Shift+Z"])
         self.assertEqual(defaults["typewriter_scroll"], ["Ctrl+Alt+T"])
+        self.assertEqual(defaults["mode_live"], ["Ctrl+Alt+1"])
+        self.assertEqual(defaults["mode_editor"], ["Ctrl+Alt+2"])
+        self.assertEqual(defaults["mode_reader"], ["Ctrl+Alt+3"])
+        self.assertEqual(defaults["mode_split"], ["Ctrl+Alt+4"])
         self.assertEqual(defaults["fullscreen"], ["F11", "Meta+Ctrl+F"])
         self.assertTrue(native_label(defaults["copy"][0]))
         if sys.platform == "darwin":
@@ -55,6 +64,11 @@ class ShortcutValidationTest(unittest.TestCase):
         earlier["bold"] = ["Ctrl+I"]
         _, error = normalize_shortcuts(earlier, edited_action="bold")
         self.assertIn("Italic", error)
+
+        mode_conflict = default_shortcuts()
+        mode_conflict["mode_reader"] = ["Ctrl+Alt+1"]
+        _, mode_error = normalize_shortcuts(mode_conflict)
+        self.assertIn("Live mode", mode_error)
 
 
     def test_recorder_captures_modified_combinations_and_rejects_plain_letters(self):

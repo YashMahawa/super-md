@@ -28,8 +28,14 @@ class NativeTabsTest(unittest.TestCase):
 import QtQuick
 import QtQuick.Controls
 ApplicationWindow {
+    id: host
     width: 700; height: 180; visible: true
-    TabStrip { width: parent.width; viewState: JSON.parse(studio.snapshot) }
+    property var viewState: JSON.parse(studio.snapshot)
+    Connections {
+        target: studio
+        function onChanged() { host.viewState = JSON.parse(studio.snapshot) }
+    }
+    TabStrip { width: parent.width; viewState: host.viewState }
 }
 ''', QUrl.fromLocalFile(str(Path(__file__).parent / "qml/tab-test.qml")))
         self.assertFalse(self.component.isError(), str(self.component.errors()))
@@ -105,3 +111,76 @@ ApplicationWindow {
         self.assertEqual(plus.property("glyph"), "Plus")
         for item in [*tabs, plus]:
             self.assertAlmostEqual(item.y() + item.height() / 2, 24, delta=.5)
+
+    def _strip_and_active_tab(self):
+        strip = self.window.findChild(QQuickItem, "tabStrip")
+        self.assertIsNotNone(strip)
+        items = [strip]
+        active_item = None
+        while items:
+            item = items.pop()
+            if item.objectName() == "noteTab" and item.property("isActive"):
+                active_item = item
+                break
+            items.extend(item.childItems())
+        self.assertIsNotNone(active_item)
+        return strip, strip.property("contentItem"), active_item
+
+    def _assert_active_tab_revealed(self, context):
+        strip, flickable, active_item = self._strip_and_active_tab()
+        content_x = float(flickable.property("contentX"))
+        viewport_width = float(strip.property("availableWidth") or strip.width())
+        self.assertGreaterEqual(
+            active_item.x() + 0.5,
+            content_x,
+            f"Active tab left edge clipped ({context}): x={active_item.x()}, contentX={content_x}",
+        )
+        self.assertLessEqual(
+            active_item.x() + active_item.width() - 0.5,
+            content_x + viewport_width,
+            f"Active tab right edge clipped ({context}): right={active_item.x() + active_item.width()}, viewportRight={content_x + viewport_width}",
+        )
+
+    def test_overflowing_strip_reveals_active_tab_on_create_switch_move_reopen_and_resize(self):
+        # Create enough wide tabs to overflow the 700px window horizontally.
+        for index in range(8):
+            self.studio.newNote()
+            self.studio.renameNote(self.studio.active, f"Chapter {index + 1} Architecture Overview")
+        QTest.qWait(60)
+        strip, flickable, _ = self._strip_and_active_tab()
+        self.assertGreater(float(flickable.property("contentWidth")), strip.width())
+        self.assertGreater(float(flickable.property("contentX")), 0)
+        self._assert_active_tab_revealed("after creating overflowing rightmost tab")
+
+        # Switching to tab 1 via tabNumber scrolls all the way back to the left.
+        self.studio.tabNumber(1)
+        QTest.qWait(60)
+        self._assert_active_tab_revealed("after switching to tab 1")
+        self.assertLessEqual(float(flickable.property("contentX")), 20)
+
+        # Cycling backward from tab 1 wraps to the rightmost tab and reveals it.
+        self.studio.cycleTab(-1)
+        QTest.qWait(60)
+        self._assert_active_tab_revealed("after cycling wrap to last tab")
+
+        # Moving the active tab repeatedly to the left keeps it inside the viewport.
+        for _ in range(7):
+            self.studio.moveActiveTab(-1)
+            QTest.qWait(30)
+            self._assert_active_tab_revealed("while moving active tab left")
+
+        # Jump to the last tab, close it, then reopen it and confirm both stay visible.
+        self.studio.selectTab(self.studio.tabs[-1]["id"])
+        QTest.qWait(50)
+        self._assert_active_tab_revealed("after selecting last tab")
+        self.studio.closeTabSafely(self.studio.active)
+        QTest.qWait(50)
+        self._assert_active_tab_revealed("after closing rightmost tab")
+        self.studio.reopenTab()
+        QTest.qWait(60)
+        self._assert_active_tab_revealed("after reopening closed tab")
+
+        # Narrowing the window while on a right-side tab re-reveals the active tab.
+        self.window.resize(460, 180)
+        QTest.qWait(60)
+        self._assert_active_tab_revealed("after narrowing window")
