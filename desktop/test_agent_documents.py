@@ -432,6 +432,223 @@ class AgentDocumentsTest(unittest.TestCase):
                                   capture_output=True, text=True, encoding="utf-8", errors="strict", env=env, check=False)
         self.assertEqual(headless.returncode, 0, headless.stderr)
 
+    def test_text_operations_skip_asset_decoding_and_reuse_stat_verified_envelope_cache(self):
+        import documents
+        from unittest.mock import patch
+
+        png = b"\x89PNG\r\n\x1a\n" + (b"raster-bytes-" * 200)
+        assets = {
+            f"assets/fig_{i}.png": "data:image/png;base64," + base64.b64encode(png + bytes([i])).decode("ascii")
+            for i in range(6)
+        }
+        prose = "".join(f"# Section {i}\n" + (f"Paragraph {i} searchable token.\n" * 60) for i in range(12))
+        note = self.root / "paged.smd"
+        packed = compressed_bundle(prose, assets)
+        note.write_bytes(packed)
+
+        with (
+            patch("documents.base64.b64decode", wraps=base64.b64decode) as b64_spy,
+            patch("documents._gzip_json_input", wraps=documents._gzip_json_input) as gzip_spy,
+        ):
+            cursor = 0
+            for _ in range(10):
+                page = self.store.read("paged.smd", offset=cursor, limit=1500)
+                cursor = page["next_offset"] or 0
+            found = self.store.search("paged.smd", "searchable token", limit=5)
+            outline = self.store.outline("paged.smd", offset=0, limit=10)
+            markdown = self.store.read_markdown("paged.smd")
+            self.assertEqual(b64_spy.call_count, 0)
+            self.assertEqual(gzip_spy.call_count, 1)
+            self.assertEqual(found["totalMatches"], 12 * 60)
+            self.assertEqual(outline["total"], 12)
+            self.assertEqual(markdown, prose)
+
+            # Corrupt GZIP and invalid envelopes are still rejected without base64 decoding.
+            for bad_name, bad_bytes in (
+                ("truncated.smd", packed[:-3]),
+                ("concat.smd", packed + packed),
+            ):
+                (self.root / bad_name).write_bytes(bad_bytes)
+                for fn in (
+                    lambda n=bad_name: self.store.read(n),
+                    lambda n=bad_name: self.store.search(n, "Section"),
+                    lambda n=bad_name: self.store.outline(n),
+                ):
+                    with self.assertRaises(AgentDocumentError):
+                        fn()
+
+            exact_25mb_len = (documents.MAX_IMAGE // 3) * 4 + 4
+            over_25mb = "A" * (exact_25mb_len - 1) + "="
+            for idx, bad_env in enumerate((
+                {"format": "supermd-smd", "version": 1, "markdown": "# x", "assets": {"assets/../bad.png": assets["assets/fig_0.png"]}},
+                {"format": "supermd-smd", "version": 1, "markdown": "# x", "assets": {"assets/bad.png": "data:image/jpeg;base64,eA=="}},
+                {"format": "supermd-smd", "version": 1, "markdown": "# x", "assets": {"assets/huge.png": "data:image/png;base64," + over_25mb}},
+                {"format": "supermd-smd", "version": 1, "markdown": "x" * (documents.MAX_MARKDOWN + 1), "assets": {}},
+                {"format": "supermd-smd", "version": 1, "markdown": "# x", "assets": {
+                    f"assets/a{i}.png": "data:image/png;base64,eA==" for i in range(documents.MAX_ASSETS + 1)
+                }},
+            )):
+                bad_path = self.root / f"invalid_{idx}.smd"
+                bad_path.write_text(json.dumps(bad_env), encoding="utf-8")
+                for fn in (
+                    lambda n=bad_path.name: self.store.read(n),
+                    lambda n=bad_path.name: self.store.search(n, "x"),
+                    lambda n=bad_path.name: self.store.outline(n),
+                ):
+                    with self.assertRaises(AgentDocumentError):
+                        fn()
+            self.assertEqual(b64_spy.call_count, 0)
+
+    def test_inspect_assets_read_asset_and_extract_decode_on_demand_and_memoize(self):
+        import agent_documents
+        import documents
+        from unittest.mock import patch
+
+        assets = {
+            f"assets/img_{i:03d}.png": "data:image/png;base64," + base64.b64encode(b"\x89PNG\r\n\x1a\n" + f"img-{i}".encode()).decode("ascii")
+            for i in range(45)
+        }
+        packed = compressed_bundle("# Gallery\n", assets)
+        expected_rev = hashlib.sha256(packed).hexdigest()
+        note = self.root / "gallery.smd"
+        note.write_bytes(packed)
+
+        # Cold single-asset read_asset: 1 GZIP inflation and 1 base64 decode.
+        cold_read_store = DocumentStore([self.root])
+        with (
+            patch("documents.base64.b64decode", wraps=base64.b64decode) as b64_spy,
+            patch("documents._gzip_json_input", wraps=documents._gzip_json_input) as gzip_spy,
+        ):
+            single = cold_read_store.read_asset("gallery.smd", "assets/img_044.png", expected_revision=expected_rev)
+            self.assertEqual(single["mime_type"], "image/png")
+            self.assertEqual(gzip_spy.call_count, 1)
+            self.assertEqual(b64_spy.call_count, 1)
+
+        # Cold single-asset extraction: 1 GZIP inflation and 1 base64 decode.
+        cold_store = DocumentStore([self.root])
+        with (
+            patch("documents.base64.b64decode", wraps=base64.b64decode) as b64_spy,
+            patch("documents._gzip_json_input", wraps=documents._gzip_json_input) as gzip_spy,
+            patch("agent_documents.digest_bytes", wraps=agent_documents.digest_bytes) as digest_spy,
+        ):
+            extracted = cold_store.extract_asset(
+                "gallery.smd", "assets/img_044.png", "out.png", expected_revision=expected_rev
+            )
+            self.assertTrue(extracted["extracted"])
+            self.assertEqual(gzip_spy.call_count, 1)
+            self.assertEqual(b64_spy.call_count, 1)
+            self.assertEqual(digest_spy.call_count, 2)  # 1 raw revision + 1 decoded asset sha256
+
+            # Repeated read_asset on the same asset reuses both cached envelope and memoized asset bytes.
+            item = cold_store.read_asset("gallery.smd", "assets/img_044.png", expected_revision=expected_rev)
+            self.assertEqual(item["bytes"], extracted["bytes"])
+            self.assertEqual(gzip_spy.call_count, 1)
+            self.assertEqual(b64_spy.call_count, 1)
+
+        # Cold inspect decodes only the first 40 assets; subsequent assets() pages decode only uncached slices.
+        inspect_store = DocumentStore([self.root])
+        with (
+            patch("documents.base64.b64decode", wraps=base64.b64decode) as b64_spy,
+            patch("documents._gzip_json_input", wraps=documents._gzip_json_input) as gzip_spy,
+            patch("agent_documents.digest_bytes", wraps=agent_documents.digest_bytes) as digest_spy,
+        ):
+            info = inspect_store.inspect("gallery.smd")
+            self.assertEqual(info["asset_count"], 45)
+            self.assertEqual(len(info["assets"]), 40)
+            self.assertEqual(gzip_spy.call_count, 1)
+            self.assertEqual(b64_spy.call_count, 40)
+            self.assertEqual(digest_spy.call_count, 41)  # 1 raw revision + 40 assets
+
+            first_page = inspect_store.assets("gallery.smd", offset=0, limit=40)
+            self.assertEqual(len(first_page["assets"]), 40)
+            self.assertEqual(gzip_spy.call_count, 1)
+            self.assertEqual(b64_spy.call_count, 40)
+
+            second_page = inspect_store.assets("gallery.smd", offset=40, limit=10)
+            self.assertEqual(len(second_page["assets"]), 5)
+            self.assertEqual(gzip_spy.call_count, 1)
+            self.assertEqual(b64_spy.call_count, 45)
+
+        # Malformed base64 and stale revisions are rejected by read_asset, extract_asset, and mutations.
+        import gzip
+        bad_note = self.root / "bad_b64.smd"
+        bad_bytes = gzip.compress(json.dumps({
+            "format": "supermd-smd",
+            "version": 1,
+            "markdown": "# Bad\n",
+            "assets": {"assets/bad.png": "data:image/png;base64,@@@@"},
+        }).encode("utf-8"))
+        bad_note.write_bytes(bad_bytes)
+        bad_rev = hashlib.sha256(bad_bytes).hexdigest()
+        self.assertEqual(self.store.read("bad_b64.smd")["text"], "# Bad\n")
+        with self.assertRaises(RevisionConflict):
+            self.store.read_asset("bad_b64.smd", "assets/bad.png", expected_revision="0" * 64)
+        with self.assertRaises(AgentDocumentError):
+            self.store.read_asset("bad_b64.smd", "assets/bad.png", expected_revision=bad_rev)
+        with self.assertRaises(AgentDocumentError):
+            self.store.extract_asset("bad_b64.smd", "assets/bad.png", "never.png", expected_revision=bad_rev)
+        with self.assertRaises(AgentDocumentError):
+            self.store.patch(
+                "bad_b64.smd",
+                expected_revision=bad_rev,
+                operations=[{"type": "replace", "old": "# Bad", "new": "# Rewritten"}],
+            )
+        valid_png = self.root / "extra.png"
+        valid_png.write_bytes(b"\x89PNG\r\n\x1a\nvalid")
+        with self.assertRaises(AgentDocumentError):
+            self.store.attach_asset("bad_b64.smd", "extra.png", expected_revision=bad_rev)
+        self.assertEqual(bad_note.read_bytes(), bad_bytes)
+
+    def test_envelope_cache_invalidation_mutations_and_lru_byte_budget(self):
+        import documents
+        from unittest.mock import patch
+
+        created = self.store.create("lifecycle.smd", "# V1\n")
+        rev = created["revision"]
+        png_a = b"\x89PNG\r\n\x1a\nalpha-asset"
+        png_b = b"\x89PNG\r\n\x1a\nbeta-asset-updated"
+        (self.root / "a.png").write_bytes(png_a)
+        (self.root / "b.png").write_bytes(png_b)
+
+        with patch("documents._gzip_json_input", wraps=documents._gzip_json_input) as gzip_spy:
+            self.assertEqual(self.store.read("lifecycle.smd")["text"], "# V1\n")
+            self.assertEqual(gzip_spy.call_count, 0)  # Cached directly by create()
+
+            attached = self.store.attach_asset("lifecycle.smd", "a.png", expected_revision=rev)
+            rev = attached["revision"]
+            patched = self.store.patch(
+                "lifecycle.smd",
+                expected_revision=rev,
+                operations=[{"type": "replace", "old": "# V1", "new": "# V2"}],
+            )
+            rev = patched["revision"]
+            self.assertEqual(self.store.read("lifecycle.smd")["text"], "# V2\n")
+            self.assertEqual(
+                self.store.read_asset("lifecycle.smd", "assets/a.png", expected_revision=rev)["data"],
+                png_a,
+            )
+
+            replaced = self.store.replace_asset("lifecycle.smd", "assets/a.png", "b.png", expected_revision=rev)
+            rev = replaced["revision"]
+            self.assertEqual(
+                self.store.read_asset("lifecycle.smd", "assets/a.png", expected_revision=rev)["data"],
+                png_b,
+            )
+            self.assertEqual(gzip_spy.call_count, 0)
+
+        # External modification changes stat key and refreshes the cache.
+        atomic_write(self.root / "lifecycle.smd", compressed_bundle("# External V3\n", {}))
+        self.assertEqual(self.store.read("lifecycle.smd")["text"], "# External V3\n")
+
+        # Byte-bounded LRU eviction keeps _cache_bytes within max_cache_bytes.
+        small_store = DocumentStore([self.root], max_cache_bytes=8_000)
+        for index in range(6):
+            (self.root / f"item_{index}.md").write_text(f"# Note {index}\n" + ("word " * 500), encoding="utf-8")
+            small_store.read(f"item_{index}.md")
+            self.assertLessEqual(small_store._cache_bytes, 8_000)
+        self.assertGreaterEqual(len(small_store._cache), 1)
+        self.assertLess(len(small_store._cache), 6)
+
 
 if __name__ == "__main__":
     unittest.main()

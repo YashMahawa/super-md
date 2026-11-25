@@ -8,6 +8,7 @@ import { SKIP, visit } from "unist-util-visit";
 import InteractiveChart from "./components/InteractiveChart";
 import { normalizeCallouts } from "./components/MarkdownPreview";
 import { parseFrontmatter } from "./frontmatter";
+import { mediaAt } from "./mediaExport";
 import { invoke } from "./nativeBridge";
 import { renderMermaid } from "./mermaidRenderer";
 import { pythonOutput } from "./renderedOutputs";
@@ -15,17 +16,258 @@ import { analyzeDocument } from "./documentAnalysis";
 import { svgImage } from "./svgImage";
 import { remarkObsidianMath } from "./obsidianMath";
 import { remarkSvgBlocks } from "./svgBlocks";
+import { remarkStudySyntax } from "./studySyntax";
 import {parseStepDeck} from "./components/StepCards";
+import {parseDiagramSource} from "./components/InlineDiagram";
+import {parseBinaryTreeSource} from "./components/BinaryTree";
 import {stepDiagramSvg} from "./stepPdf";
+
+interface ScannedHtmlTag {
+  name: string;
+  closing: boolean;
+  end: number;
+  attrs: Map<string, string>;
+}
+
+const HTML_IMAGE_WRAPPERS = new Set(["p", "div", "center", "figure"]);
+
+function decodeHtmlAttr(value: string): string {
+  if (!value.includes("&")) return value;
+  return value.replace(/&(?:(amp|lt|gt|quot|apos)|#(\d{1,7})|#x([0-9a-f]{1,6}));/gi, (full, named?: string, dec?: string, hex?: string) => {
+    if (named) {
+      switch (named.toLowerCase()) {
+        case "amp": return "&";
+        case "lt": return "<";
+        case "gt": return ">";
+        case "quot": return '"';
+        case "apos": return "'";
+      }
+    }
+    const code = dec ? Number.parseInt(dec, 10) : hex ? Number.parseInt(hex, 16) : NaN;
+    return Number.isInteger(code) && code > 0 && code <= 0x10ffff && (code < 0xd800 || code > 0xdfff)
+      ? String.fromCodePoint(code)
+      : full;
+  });
+}
+
+function scanHtmlTag(input: string, start: number): ScannedHtmlTag | null {
+  if (input[start] !== "<") return null;
+  let pos = start + 1;
+  let closing = false;
+  if (input[pos] === "/") {
+    closing = true;
+    pos++;
+  }
+  const nameStart = pos;
+  if (pos >= input.length || !/[A-Za-z]/.test(input[pos])) return null;
+  pos++;
+  while (pos < input.length && /[A-Za-z0-9-]/.test(input[pos])) pos++;
+  const name = input.slice(nameStart, pos).toLowerCase();
+  const attrs = new Map<string, string>();
+  if (closing) {
+    while (pos < input.length && /\s/.test(input[pos])) pos++;
+    return input[pos] === ">" ? { name, closing: true, end: pos + 1, attrs } : null;
+  }
+  if (pos < input.length && !/[\s/>]/.test(input[pos])) return null;
+  while (pos < input.length) {
+    while (pos < input.length && /\s/.test(input[pos])) pos++;
+    if (pos >= input.length) return null;
+    if (input[pos] === ">") return { name, closing: false, end: pos + 1, attrs };
+    if (input[pos] === "/" && input[pos + 1] === ">") return { name, closing: false, end: pos + 2, attrs };
+    if (input[pos] === "/") { pos++; continue; }
+    const attrStart = pos;
+    while (pos < input.length && /[A-Za-z0-9_.:-]/.test(input[pos])) pos++;
+    if (pos === attrStart || !/[A-Za-z_:]/.test(input[attrStart])) return null;
+    const attrName = input.slice(attrStart, pos).toLowerCase();
+    while (pos < input.length && /\s/.test(input[pos])) pos++;
+    let attrValue = "";
+    if (input[pos] === "=") {
+      pos++;
+      while (pos < input.length && /\s/.test(input[pos])) pos++;
+      if (pos >= input.length) return null;
+      const quote = input[pos];
+      if (quote === '"' || quote === "'") {
+        const closeIdx = input.indexOf(quote, pos + 1);
+        if (closeIdx < 0) return null;
+        attrValue = decodeHtmlAttr(input.slice(pos + 1, closeIdx));
+        pos = closeIdx + 1;
+      } else {
+        const valStart = pos;
+        while (pos < input.length && !/[\s"'=<>`]/.test(input[pos]) && !(input[pos] === "/" && input[pos + 1] === ">")) pos++;
+        if (pos === valStart) return null;
+        attrValue = decodeHtmlAttr(input.slice(valStart, pos));
+      }
+    }
+    if (!attrs.has(attrName)) attrs.set(attrName, attrValue);
+  }
+  return null;
+}
+
+function cssProp(style: string, propName: string): string | undefined {
+  let found: string | undefined;
+  for (const decl of style.split(";")) {
+    const colon = decl.indexOf(":");
+    if (colon < 0) continue;
+    if (decl.slice(0, colon).trim().toLowerCase() !== propName) continue;
+    const clean = decl.slice(colon + 1).trim().replace(/\s*!important\s*$/i, "").trim();
+    if (clean) found = clean;
+  }
+  return found;
+}
+
+function isPageBreakTag(tag: ScannedHtmlTag): boolean {
+  if (tag.closing) return false;
+  const style = tag.attrs.get("style") || "";
+  if (
+    cssProp(style, "page-break-after")?.toLowerCase() === "always" ||
+    cssProp(style, "page-break-before")?.toLowerCase() === "always" ||
+    cssProp(style, "break-after")?.toLowerCase() === "page" ||
+    cssProp(style, "break-before")?.toLowerCase() === "page"
+  ) {
+    return true;
+  }
+  return (tag.attrs.get("class") || "").trim().split(/\s+/).some(c => /^page-?break$/i.test(c));
+}
+
+function parseHtmlImgTag(tag: ScannedHtmlTag): { url: string; alt: string; title?: string; attrs: string } | null {
+  if (tag.closing || tag.name !== "img") return null;
+  const src = (tag.attrs.get("src") || "").replace(/[\t\r\n]+/g, "").replace(/^[\u0000-\u0020]+|[\u0000-\u0020]+$/g, "");
+  if (!src) return null;
+  const alt = (tag.attrs.get("alt") || "").replace(/[\r\n]+/g, " ").trim() || "Image";
+  const title = (tag.attrs.get("title") || "").replace(/[\r\n]+/g, " ").trim() || undefined;
+  const style = tag.attrs.get("style") || "";
+  const styleWidth = cssProp(style, "width");
+  const attrWidth = tag.attrs.get("width")?.trim();
+  const width = (styleWidth || attrWidth || "").replace(/^['"]|['"]$/g, "").trim();
+  const zoom = (cssProp(style, "zoom") || "").replace(/^['"]|['"]$/g, "").trim();
+  const parts: string[] = [];
+  if (width && /^\d+(?:\.\d+)?(?:%|px|pt|mm|cm|in)?$/i.test(width) && Number.parseFloat(width) > 0) parts.push(`width=${width}`);
+  if (zoom && /^\d+(?:\.\d+)?%?$/i.test(zoom) && Number.parseFloat(zoom) > 0) parts.push(`zoom=${zoom}`);
+  return { url: src, alt, ...(title ? { title } : {}), attrs: parts.length ? `{${parts.join(" ")}}` : "" };
+}
+
+function liftHtmlImages(tree: any): void {
+  visit(tree, (parent: any) => {
+    if (!Array.isArray(parent.children)) return;
+    const blockParent = parent.type === "root" || parent.type === "blockquote" || parent.type === "listItem";
+    const nextChildren: any[] = [];
+    let changed = false;
+    for (const child of parent.children) {
+      if (child?.type !== "html" || typeof child.value !== "string" || !/<img(?=[\s/>])/i.test(child.value)) {
+        nextChildren.push(child);
+        continue;
+      }
+      const raw = child.value;
+      if (blockParent) {
+        const imgs: Array<NonNullable<ReturnType<typeof parseHtmlImgTag>>> = [];
+        let pos = 0;
+        let validBlock = true;
+        while (pos < raw.length) {
+          while (pos < raw.length && /\s/.test(raw[pos])) pos++;
+          if (pos >= raw.length) break;
+          if (raw.startsWith("<!--", pos)) {
+            const commentEnd = raw.indexOf("-->", pos + 4);
+            if (commentEnd < 0) { pos = raw.length; break; }
+            pos = commentEnd + 3;
+            continue;
+          }
+          const tag = scanHtmlTag(raw, pos);
+          if (!tag || isPageBreakTag(tag)) {
+            validBlock = false;
+            break;
+          }
+          if (tag.name === "img" && !tag.closing) {
+            const parsed = parseHtmlImgTag(tag);
+            if (!parsed) {
+              validBlock = false;
+              break;
+            }
+            imgs.push(parsed);
+          } else if (!HTML_IMAGE_WRAPPERS.has(tag.name)) {
+            validBlock = false;
+            break;
+          }
+          pos = tag.end;
+        }
+        if (validBlock && imgs.length > 0) {
+          changed = true;
+          for (const img of imgs) {
+            nextChildren.push({
+              type: "paragraph",
+              children: [
+                { type: "image", url: img.url, alt: img.alt, ...(img.title ? { title: img.title } : {}), data: { htmlImage: true } },
+                ...(img.attrs ? [{ type: "text", value: img.attrs }] : []),
+              ],
+            });
+          }
+          continue;
+        }
+      } else {
+        let pos = 0;
+        let singleImg: NonNullable<ReturnType<typeof parseHtmlImgTag>> | null = null;
+        let validInline = true;
+        while (pos < raw.length) {
+          while (pos < raw.length && /\s/.test(raw[pos])) pos++;
+          if (pos >= raw.length) break;
+          if (raw.startsWith("<!--", pos)) {
+            const commentEnd = raw.indexOf("-->", pos + 4);
+            if (commentEnd < 0) { pos = raw.length; break; }
+            pos = commentEnd + 3;
+            continue;
+          }
+          const tag = scanHtmlTag(raw, pos);
+          const parsed = tag ? parseHtmlImgTag(tag) : null;
+          if (!tag || !parsed || singleImg) {
+            validInline = false;
+            break;
+          }
+          singleImg = parsed;
+          pos = tag.end;
+        }
+        if (validInline && singleImg) {
+          changed = true;
+          nextChildren.push({ type: "image", url: singleImg.url, alt: singleImg.alt, ...(singleImg.title ? { title: singleImg.title } : {}), data: { htmlImage: true } });
+          if (singleImg.attrs) nextChildren.push({ type: "text", value: singleImg.attrs });
+          continue;
+        }
+      }
+      nextChildren.push(child);
+    }
+    if (changed) parent.children = nextChildren;
+  });
+}
 
 function data(blob: Blob): Promise<string> {
   return new Promise((resolve, reject) => { const reader = new FileReader(); reader.onload = () => resolve(String(reader.result)); reader.onerror = () => reject(reader.error); reader.readAsDataURL(blob); });
 }
+function loadedReaderImageData(source: string): string | null {
+  if (typeof document === "undefined") return null;
+  for (const element of document.querySelectorAll<HTMLElement>("[data-note-image-source]")) {
+    if (element.dataset.noteImageSource !== source) continue;
+    const uri = mediaAt(element.querySelector("img"))?.uri?.();
+    if (uri && /^data:image\//i.test(uri)) return uri;
+  }
+  return null;
+}
+
+function remoteImageHost(url: string): string | null {
+  if (!/^https?:\/\//i.test(url)) return null;
+  try {
+    const parsed = new URL(url);
+    return (parsed.protocol === "http:" || parsed.protocol === "https:") && !parsed.username && !parsed.password && parsed.host
+      ? parsed.host.toLowerCase()
+      : null;
+  } catch {
+    return null;
+  }
+}
+
 export type PdfPreparationPhase = "prepare" | "assets+diagrams";
 export type PdfPreparationProgress = { phase: PdfPreparationPhase; completed: number; total: number };
 export type PreparePdfOptions = {
   signal?: AbortSignal;
   onProgress?: (progress: PdfPreparationProgress) => void;
+  trustedImageHosts?: readonly string[];
 };
 
 function cancelledError(): Error {
@@ -51,7 +293,8 @@ function raceSignal<T>(promise: Promise<T>, signal?: AbortSignal): Promise<T> {
 export async function preparePdf(markdown: string, documentPath: string | null, python = "embedded", options: PreparePdfOptions = {}) {
   let generation = 1;
   const ownerGeneration = generation;
-  const { signal } = options;
+  const { signal, trustedImageHosts } = options;
+  const trustedHosts = new Set((trustedImageHosts ?? []).map(host => host.trim().toLowerCase()).filter(Boolean));
   const invalidate = () => { generation++; };
   signal?.addEventListener("abort", invalidate, { once: true });
   const checkCurrent = () => {
@@ -64,11 +307,12 @@ export async function preparePdf(markdown: string, documentPath: string | null, 
   try {
   checkCurrent();
   report({ phase: "prepare", completed: 0, total: 1 });
-  const processor = unified().use(remarkParse).use(remarkGfm).use(remarkMath).use(remarkObsidianMath).use(remarkStringify);
+  const processor = unified().use(remarkParse).use(remarkGfm, { singleTilde: false }).use(remarkMath).use(remarkObsidianMath).use(remarkStudySyntax).use(remarkStringify);
   const front = parseFrontmatter(markdown)?.raw || "";
   const normalized = normalizeCallouts(markdown);
   // parse() runs no transformers: lift raw <svg> markup into svg blocks here.
   const tree = remarkSvgBlocks()(processor.parse(normalized), { value: normalized });
+  liftHtmlImages(tree);
   const work: Array<()=>Promise<void>> = []; const assets: Record<string, string> = {}; let count = 0;
   const referenceDefinitions=new Map<string,any>();
   visit(tree,"definition",(node:any)=>{if(!referenceDefinitions.has(node.identifier))referenceDefinitions.set(node.identifier,node);});
@@ -89,7 +333,7 @@ export async function preparePdf(markdown: string, documentPath: string | null, 
             const source = step.image
               ? processor.stringify({type:"root",children:[{type:"paragraph",children:[{type:"image",url:step.image,alt:step.alt||step.label}]}]} as any)
               : "```" + (step.diagram ? "svg\n" + stepDiagramSvg(step.diagram) : "smd-chart\n" + step.chart) + "\n```";
-            const prepared = await preparePdf(source, documentPath, python, {signal});
+            const prepared = await preparePdf(source, documentPath, python, { signal, trustedImageHosts });
             checkCurrent();
             const names = new Map<string,string>();
             for (const [name, body] of Object.entries(prepared.assets)) {
@@ -101,7 +345,7 @@ export async function preparePdf(markdown: string, documentPath: string | null, 
           }
           let markdown: string|undefined;
           if(step.markdown){
-            const prepared=await preparePdf(step.markdown,documentPath,python,{signal});checkCurrent();
+            const prepared=await preparePdf(step.markdown,documentPath,python,{signal,trustedImageHosts});checkCurrent();
             markdown=prepared.content;
             for(const [name,body] of Object.entries(prepared.assets)){
               const renamed=`step-${++count}-${name}`;assets[renamed]=body;
@@ -120,30 +364,62 @@ export async function preparePdf(markdown: string, documentPath: string | null, 
       if(definition){node.type="image";node.url=definition.url;node.title=definition.title;delete node.identifier;delete node.label;delete node.referenceType;}
     }
     if(node.type==='code'&&['python','py'].includes(String(node.lang||'').toLowerCase()))node.lang=String(node.lang).toLowerCase();
-    const exportCell = node.type === "code" && ["mermaid", "svg", "smd-chart", "python", "py"].includes(node.lang);
+    const exportCell = node.type === "code" && ["mermaid", "svg", "smd-chart", "smd-tree", "smd-diagram", "python", "py"].includes(node.lang);
     let pythonContext: {document:string;cell:string;interpreter:string}|undefined;
     if(node.type==='code'&&['python','py'].includes(String(node.lang||'').toLowerCase())){
       const source=String(node.value||''),ordinal=pythonOrdinals.get(source)||0;pythonOrdinals.set(source,ordinal+1);
       const analyzed=pythonCells.find(cell=>cell.source===source&&cell.ordinal===ordinal);
       if(documentPath)pythonContext={document:documentPath,cell:String(analyzed?.ordinal??ordinal),interpreter:python||'embedded'};
     }
-    if (node.type === "image") work.push(async () => {
-      checkCurrent();
-      let url: string = node.url;
-      if (!/^data:/i.test(url)) {
-        if (/^https?:/i.test(url)) { const fetched = await invoke<{ body: string }>("fetch_resource", { url, image: true }); checkCurrent(); url = fetched.body; }
-        else {
-          if (!documentPath && !/^assets\/import-[\w-]+\./.test(url)) throw new Error(`Save your note before exporting relative image ${url}.`);
-          url = await invoke<string>("load_asset", { documentPath: documentPath || "", source: url });
-          checkCurrent();
+    if (node.type === "image") {
+      const fromHtmlImg = Boolean(node.data?.htmlImage);
+      let preloadedHtmlData: string | null = null;
+      if (fromHtmlImg) {
+        const rawUrl = String(node.url || "").trim();
+        if (/^data:/i.test(rawUrl)) {
+          if (!/^data:image\//i.test(rawUrl)) throw new Error("Unsupported PDF image type.");
+        } else if (/^https?:\/\//i.test(rawUrl)) {
+          preloadedHtmlData = loadedReaderImageData(rawUrl);
+          if (!preloadedHtmlData) {
+            const host = remoteImageHost(rawUrl);
+            if (!host || !trustedHosts.has(host)) {
+              throw new Error(`Remote image from ${host || rawUrl} requires explicit consent in the reader before exporting PDF.`);
+            }
+          }
+        } else if (rawUrl.startsWith("//") || /^[a-z][a-z\d+.-]*:/i.test(rawUrl)) {
+          throw new Error(`Remote image ${rawUrl} requires explicit consent in the reader before exporting PDF.`);
         }
       }
-      checkCurrent();
-      if (!/^data:image\/(?:svg\+xml|png|jpeg);base64,/i.test(url)) { url = await rasterImage(url); checkCurrent(); }
-      const extension = url.startsWith("data:image/svg") ? "svg" : url.startsWith("data:image/jpeg") ? "jpg" : "png";
-      checkCurrent();
-      node.url = add(url, `asset-${++count}.${extension}`);
-    });
+      work.push(async () => {
+        checkCurrent();
+        let url: string = preloadedHtmlData ?? node.url;
+        if (!/^data:/i.test(url)) {
+          if (fromHtmlImg ? /^https?:\/\//i.test(url) : /^https?:/i.test(url)) {
+            if (fromHtmlImg) {
+              const host = remoteImageHost(url);
+              if (!host || !trustedHosts.has(host)) {
+                throw new Error(`Remote image from ${host || url} requires explicit consent in the reader before exporting PDF.`);
+              }
+            }
+            const fetched = await invoke<{ body: string }>("fetch_resource", { url, image: true });
+            checkCurrent();
+            url = fetched.body;
+          } else {
+            if (fromHtmlImg && (url.startsWith("//") || /^[a-z][a-z\d+.-]*:/i.test(url))) {
+              throw new Error(`Remote image ${url} requires explicit consent in the reader before exporting PDF.`);
+            }
+            if (!documentPath && !/^assets\/import-[\w-]+\./.test(url)) throw new Error(`Save your note before exporting relative image ${url}.`);
+            url = await invoke<string>("load_asset", { documentPath: documentPath || "", source: url });
+            checkCurrent();
+          }
+        }
+        checkCurrent();
+        if (!/^data:image\/(?:svg\+xml|png|jpeg);base64,/i.test(url)) { url = await rasterImage(url); checkCurrent(); }
+        const extension = url.startsWith("data:image/svg") ? "svg" : url.startsWith("data:image/jpeg") ? "jpg" : "png";
+        checkCurrent();
+        node.url = add(url, `asset-${++count}.${extension}`);
+      });
+    }
     if (exportCell) work.push(async () => {
       checkCurrent();
       if(node.lang==="smd-chart") {
@@ -151,8 +427,14 @@ export async function preparePdf(markdown: string, documentPath: string | null, 
         // source. Never turn it into executable Python or block the whole PDF.
         try {if(JSON.parse(node.value)?.mode==="surface3d"){node.lang="json";return;}} catch { /* Normal chart validation below reports malformed input. */ }
       }
-      if (["mermaid", "smd-chart", "svg"].includes(node.lang)) {
-        const svg = node.lang === "svg" ? svgImage(node.value) : node.lang === "mermaid" ? await renderMermaid(node.value, false, signal) : (() => {
+      if (["mermaid", "smd-chart", "svg", "smd-tree", "smd-diagram"].includes(node.lang)) {
+        let diagramAlt = "Diagram";
+        const svg = node.lang === "svg" ? svgImage(node.value) : node.lang === "mermaid" ? await renderMermaid(node.value, false, signal) : (node.lang === "smd-tree" || node.lang === "smd-diagram") ? (() => {
+          const diagram = node.lang === "smd-tree" ? parseBinaryTreeSource(node.value) : parseDiagramSource(node.value);
+          if (!diagram) throw new Error("Invalid diagram; fix it before exporting.");
+          diagramAlt = diagram.title || "Diagram";
+          return svgImage(stepDiagramSvg(diagram));
+        })() : (() => {
           const html = renderToStaticMarkup(<InteractiveChart source={node.value} />);
           const parsed = new DOMParser().parseFromString(html, "text/html");
           const warning = parsed.querySelector(".chart-warning, .render-error");
@@ -198,7 +480,7 @@ export async function preparePdf(markdown: string, documentPath: string | null, 
         // makes remark-stringify treat the entire root as phrasing and join
         // headings, tables and callouts without their blank-line separators.
         node.type = "paragraph";
-        node.children = [{ type: "image", url: add(url, `diagram-${++count}.svg`), alt: "Diagram" }];
+        node.children = [{ type: "image", url: add(url, `diagram-${++count}.svg`), alt: diagramAlt }];
         delete node.value; delete node.lang; delete node.meta;
       } else {
         const output = await pythonOutput(node.value,pythonContext);
