@@ -14,7 +14,10 @@ from pathlib import Path
 
 MIMES = {"png": "image/png", "jpg": "image/jpeg", "jpeg": "image/jpeg", "svg": "image/svg+xml", "gif": "image/gif", "webp": "image/webp", "avif": "image/avif"}
 MAX_FILE = 120_000_000
+MAX_MARKDOWN = 20_000_000
 MAX_IMAGE = 25_000_000
+MAX_TOTAL_IMAGES = 75_000_000
+MAX_ASSETS = 512
 GZIP_MAGIC = b"\x1f\x8b"
 PORTABLE_COMPRESSLEVEL = 3
 _SAFE_ASSET_NAME = re.compile(r"assets/[A-Za-z0-9._-]{1,150}")
@@ -24,28 +27,29 @@ _VALIDATED_LOCK = threading.Lock()
 _VALIDATED_ASSETS: OrderedDict[int, tuple[str, str, int]] = OrderedDict()
 _VALIDATED_CHARS = 0
 _MAX_RECENT_PORTABLE = 8
-_RECENT_PORTABLE_FILES: OrderedDict[tuple[int, int, int, int], tuple[str, str, dict[str, str]]] = OrderedDict()
+_RECENT_PORTABLE_FILES: OrderedDict[tuple[int, int, int, int], tuple[str, str, dict[str, str], bool]] = OrderedDict()
 
 
 _B64_DECODE_CHUNK = 262_144    # 256 KiB chars (multiple of 4)
 _B64_ENCODE_CHUNK = 196_608    # 192 KiB bytes (multiple of 3)
 
 
-def decode_base64_chunked(encoded: str, max_bytes: int | None = None) -> bytes:
+def decode_base64_chunked(encoded: str, max_bytes: int | None = None, *, start: int = 0) -> bytes:
     """Strictly decode base64 in bounded slices so large images never monopolize the GIL."""
     if not isinstance(encoded, str):
         raise ValueError("Expected a base64 string")
-    total_chars = len(encoded)
+    end = len(encoded)
+    total_chars = end - start
     if total_chars <= _B64_DECODE_CHUNK:
-        decoded = base64.b64decode(encoded, validate=True)
+        decoded = base64.b64decode(encoded if start == 0 else encoded[start:], validate=True)
         if max_bytes is not None and len(decoded) > max_bytes:
             raise ValueError(f"Decoded data exceeds {max_bytes} bytes")
         return decoded
     parts: list[bytes] = []
     decoded_len = 0
-    for offset in range(0, total_chars, _B64_DECODE_CHUNK):
+    for offset in range(start, end, _B64_DECODE_CHUNK):
         chunk = encoded[offset:offset + _B64_DECODE_CHUNK]
-        if offset + _B64_DECODE_CHUNK < total_chars and "=" in chunk:
+        if offset + _B64_DECODE_CHUNK < end and "=" in chunk:
             raise base64.binascii.Error("Excess data after padding")
         piece = base64.b64decode(chunk, validate=True)
         decoded_len += len(piece)
@@ -66,14 +70,14 @@ def encode_base64_chunked(raw: bytes) -> str:
     )
 
 
-def _validate_base64_len(encoded: str, max_bytes: int) -> int:
-    total_chars = len(encoded)
-    if total_chars == 0:
+def _validate_base64_len(encoded: str, max_bytes: int, start: int = 0) -> int:
+    end = len(encoded)
+    if end <= start:
         return 0
     decoded_len = 0
-    for offset in range(0, total_chars, _B64_DECODE_CHUNK):
+    for offset in range(start, end, _B64_DECODE_CHUNK):
         chunk = encoded[offset:offset + _B64_DECODE_CHUNK]
-        if offset + _B64_DECODE_CHUNK < total_chars and "=" in chunk:
+        if offset + _B64_DECODE_CHUNK < end and "=" in chunk:
             raise ValueError("Expected a base64 image")
         piece = base64.b64decode(chunk, validate=True)
         decoded_len += len(piece)
@@ -99,22 +103,34 @@ def _cache_validated_asset(data: str, mime: str, decoded_len: int) -> None:
             _VALIDATED_CHARS -= len(evicted[0])
 
 
-def _cache_portable_file(stat_key: tuple[int, int, int, int], sha256_hex: str, markdown: str, assets: dict[str, str]) -> None:
+def _cache_portable_file(
+    stat_key: tuple[int, int, int, int],
+    sha256_hex: str,
+    markdown: str,
+    assets: dict[str, str],
+    *,
+    assets_decoded: bool,
+) -> None:
     if sum(len(v) for v in assets.values()) > _MAX_CACHED_CHARS:
         return
     with _VALIDATED_LOCK:
-        _RECENT_PORTABLE_FILES.pop(stat_key, None)
-        _RECENT_PORTABLE_FILES[stat_key] = (sha256_hex, markdown, dict(assets))
+        existing = _RECENT_PORTABLE_FILES.pop(stat_key, None)
+        if existing is not None and existing[0] == sha256_hex and existing[3] and not assets_decoded:
+            assets = existing[2]
+            assets_decoded = True
+        _RECENT_PORTABLE_FILES[stat_key] = (sha256_hex, markdown, dict(assets), assets_decoded)
         while len(_RECENT_PORTABLE_FILES) > _MAX_RECENT_PORTABLE:
             _RECENT_PORTABLE_FILES.popitem(last=False)
 
 
-def _lookup_verified_portable_file(path: Path, stat_key: tuple[int, int, int, int]) -> tuple[str, dict[str, str]] | None:
+def _lookup_verified_portable_file(
+    path: Path, stat_key: tuple[int, int, int, int]
+) -> tuple[str, str, dict[str, str], bool] | None:
     with _VALIDATED_LOCK:
         entry = _RECENT_PORTABLE_FILES.get(stat_key)
     if entry is None:
         return None
-    expected_sha, markdown, assets = entry
+    expected_sha, markdown, assets, assets_decoded = entry
     hasher = hashlib.sha256()
     total = 0
     try:
@@ -133,69 +149,130 @@ def _lookup_verified_portable_file(path: Path, stat_key: tuple[int, int, int, in
         current = _RECENT_PORTABLE_FILES.get(stat_key)
         if current is not None and current[0] == expected_sha:
             _RECENT_PORTABLE_FILES.move_to_end(stat_key)
-    return markdown, dict(assets)
+    return expected_sha, markdown, dict(assets), assets_decoded
 
 
-def _validated_image_meta(data: str) -> tuple[str, int]:
-    if not isinstance(data, str):
+def _encoded_byte_bound(data: str, start: int = 0) -> int:
+    length = len(data) - start
+    if length <= 0:
+        return 0
+    padding = 2 if data.endswith("==") else 1 if data.endswith("=") else 0
+    return (length // 4) * 3 - padding
+
+
+def _parse_image_header(data: str) -> tuple[str, int, int]:
+    if not isinstance(data, str) or not data.startswith("data:"):
         raise ValueError("Expected a base64 image")
+    comma = data.find(",", 5, 128)
+    if comma < 0:
+        comma = data.find(",", 128)
+        if comma < 0:
+            raise ValueError("Expected a base64 image")
+    header = data[:comma]
+    if not header.endswith(";base64"):
+        raise ValueError("Expected a base64 image")
+    encoded_start = comma + 1
+    encoded_len = len(data) - encoded_start
+    if encoded_len % 4 != 0 or (encoded_len >= 3 and data.endswith("===")):
+        raise ValueError("Invalid base64 image")
+    mime = header[5:-7]
+    max_encoded = ((MAX_IMAGE + 2) // 3) * 4
+    estimated = _encoded_byte_bound(data, encoded_start)
+    if mime not in MIMES.values() or encoded_len > max_encoded or estimated > MAX_IMAGE:
+        raise ValueError("Unsupported image or image exceeds 25 MB")
+    return mime, encoded_start, estimated
+
+
+def _lookup_validated_asset(data: str) -> tuple[str, int] | None:
+    if not isinstance(data, str):
+        return None
     key = id(data)
     with _VALIDATED_LOCK:
         entry = _VALIDATED_ASSETS.get(key)
         if entry is not None and entry[0] is data:
             _VALIDATED_ASSETS.move_to_end(key)
             return entry[1], entry[2]
-    header, sep, encoded = data.partition(",")
-    if not sep or not header.startswith("data:") or not header.endswith(";base64"):
+    return None
+
+
+def _validated_image_meta(data: str) -> tuple[str, int]:
+    if not isinstance(data, str):
         raise ValueError("Expected a base64 image")
-    mime = header[5:-7]
-    if mime not in MIMES.values() or len(encoded) > MAX_IMAGE * 4 // 3 + 4:
-        raise ValueError("Unsupported image or image exceeds 25 MB")
-    decoded_len = _validate_base64_len(encoded, MAX_IMAGE)
+    cached = _lookup_validated_asset(data)
+    if cached is not None:
+        return cached
+    mime, encoded_start, _ = _parse_image_header(data)
+    decoded_len = _validate_base64_len(data, MAX_IMAGE, encoded_start)
     _cache_validated_asset(data, mime, decoded_len)
     return mime, decoded_len
 
 
 def _is_cached_validated_asset(data: str) -> bool:
-    if not isinstance(data, str):
-        return False
-    with _VALIDATED_LOCK:
-        entry = _VALIDATED_ASSETS.get(id(data))
-        return entry is not None and entry[0] is data
+    return _lookup_validated_asset(data) is not None
 
 
 def image_data(data: str) -> tuple[str, bytes]:
-    header, encoded = data.split(",", 1)
-    if not header.startswith("data:") or not header.endswith(";base64"):
-        raise ValueError("Expected a base64 image")
-    mime = header[5:-7]
-    if mime not in MIMES.values() or len(encoded) > MAX_IMAGE * 4 // 3 + 4:
-        raise ValueError("Unsupported image or image exceeds 25 MB")
-    result = decode_base64_chunked(encoded)
+    mime, encoded_start, _ = _parse_image_header(data)
+    result = decode_base64_chunked(data, start=encoded_start)
     if len(result) > MAX_IMAGE:
         raise ValueError("Image exceeds 25 MB")
     _cache_validated_asset(data, mime, len(result))
     return mime, result
 
-def bundle(markdown: str, assets: dict[str, str]) -> dict:
+def bundle(
+    markdown: str,
+    assets: dict[str, str],
+    *,
+    validated_assets: dict[str, str] | None = None,
+) -> dict:
     value = {"format": "supermd-smd", "version": 1, "markdown": markdown, "assets": assets}
-    validate(value)
+    validate_envelope(value)
+    total = 0
+    for name, data in assets.items():
+        cached_meta = _lookup_validated_asset(data)
+        if cached_meta is None and validated_assets is not None:
+            prior = validated_assets.get(name)
+            if prior is not None and prior == data:
+                prior_meta = _lookup_validated_asset(prior)
+                if prior_meta is not None:
+                    _cache_validated_asset(data, prior_meta[0], prior_meta[1])
+                    cached_meta = prior_meta
+        if cached_meta is not None:
+            _, size = cached_meta
+        else:
+            _, size = _validated_image_meta(data)
+        total += size
+        if total > MAX_TOTAL_IMAGES:
+            raise ValueError("Assets exceed 75 MB")
     return value
 
-def validate(value: dict) -> None:
-    if set(value) != {"format", "version", "markdown", "assets"} or value["format"] not in ("supermd-smd", "supermd-fmd") or value["version"] != 1:
+def validate_envelope(value: dict) -> None:
+    if (not isinstance(value, dict) or set(value) != {"format", "version", "markdown", "assets"}
+            or value["format"] not in ("supermd-smd", "supermd-fmd")
+            or isinstance(value["version"], bool) or value["version"] != 1):
         raise ValueError("Unsupported portable note format/version")
-    if not isinstance(value["markdown"], str) or len(value["markdown"].encode()) > 20_000_000 or not isinstance(value["assets"], dict) or len(value["assets"]) > 512:
+    if (not isinstance(value["markdown"], str) or len(value["markdown"].encode("utf-8")) > MAX_MARKDOWN
+            or not isinstance(value["assets"], dict) or len(value["assets"]) > MAX_ASSETS):
         raise ValueError("Portable note is too large or malformed")
     total = 0
     for name, data in value["assets"].items():
         if not isinstance(name, str) or not _SAFE_ASSET_NAME.fullmatch(name) or name.rsplit("/", 1)[1] in (".", ".."):
             raise ValueError("Unsafe asset name")
-        mime, decoded_len = _validated_image_meta(data)
+        mime, _, estimated = _parse_image_header(data)
         if MIMES.get(name.rsplit(".", 1)[-1].lower()) != mime:
             raise ValueError("Image MIME does not match its extension")
+        total += estimated
+        if total > MAX_TOTAL_IMAGES:
+            raise ValueError("Assets exceed 75 MB")
+
+
+def validate(value: dict) -> None:
+    validate_envelope(value)
+    total = 0
+    for data in value["assets"].values():
+        _, decoded_len = _validated_image_meta(data)
         total += decoded_len
-        if total > 75_000_000:
+        if total > MAX_TOTAL_IMAGES:
             raise ValueError("Assets exceed 75 MB")
 
 def _gzip_json_input(path: Path, raw: bytes | None = None, hasher=None) -> bytearray:
@@ -284,8 +361,13 @@ def _write_gzip_json(target, value: dict) -> None:
                 return len(text)
         json.dump(value, BoundedTextWriter(), ensure_ascii=False, separators=(",", ":"))
 
-def compressed_bundle(markdown: str, assets: dict[str, str]) -> bytes:
-    value = bundle(markdown, assets)
+def compressed_bundle(
+    markdown: str,
+    assets: dict[str, str],
+    *,
+    validated_assets: dict[str, str] | None = None,
+) -> bytes:
+    value = bundle(markdown, assets, validated_assets=validated_assets)
     import io
     output = io.BytesIO()
     _write_gzip_json(output, value)
@@ -314,9 +396,15 @@ def _replace_with_windows_sharing_retry(source: str, target: Path) -> None:
                 raise
             time.sleep(0.04)
 
-def write_portable(path: Path, markdown: str, assets: dict[str, str]) -> None:
+def write_portable(
+    path: Path,
+    markdown: str,
+    assets: dict[str, str],
+    *,
+    validated_assets: dict[str, str] | None = None,
+) -> None:
     """Atomically save the unchanged v1 JSON envelope in deterministic gzip."""
-    value = bundle(markdown, assets)
+    value = bundle(markdown, assets, validated_assets=validated_assets)
     hasher = hashlib.sha256()
     handle, temporary = tempfile.mkstemp(prefix=f".{path.name}.", suffix=".tmp", dir=path.parent)
     try:
@@ -340,14 +428,21 @@ def write_portable(path: Path, markdown: str, assets: dict[str, str]) -> None:
         _replace_with_windows_sharing_retry(temporary, path)
         try:
             st = path.stat()
-            _cache_portable_file((st.st_dev, st.st_ino, st.st_size, st.st_mtime_ns), hasher.hexdigest(), markdown, assets)
+            _cache_portable_file(
+                (st.st_dev, st.st_ino, st.st_size, st.st_mtime_ns),
+                hasher.hexdigest(),
+                markdown,
+                assets,
+                assets_decoded=True,
+            )
         except OSError:
             pass
     finally:
         if os.path.exists(temporary):
             os.unlink(temporary)
 
-def open_note(path: Path) -> tuple[str, dict[str, str], bool]:
+
+def open_note(path: Path, *, decode_assets: bool = True) -> tuple[str, dict[str, str], bool]:
     before = path.stat()
     size = before.st_size
     if size > MAX_FILE:
@@ -358,23 +453,32 @@ def open_note(path: Path) -> tuple[str, dict[str, str], bool]:
     if is_gzip:
         cached = _lookup_verified_portable_file(path, stat_key)
         if cached is not None:
-            return cached[0], cached[1], True
+            expected_sha, markdown, assets, cached_decoded = cached
+            if decode_assets and (not cached_decoded or not all(_is_cached_validated_asset(v) for v in assets.values())):
+                validate({"format": "supermd-smd", "version": 1, "markdown": markdown, "assets": assets})
+                _cache_portable_file(stat_key, expected_sha, markdown, assets, assets_decoded=True)
+            return markdown, assets, True
         hasher = hashlib.sha256()
         try:
             value = json.loads(_gzip_json_input(path, hasher=hasher))
         except (json.JSONDecodeError, UnicodeDecodeError, zlib.error, OSError, EOFError) as error:
             raise ValueError("This compressed portable note is damaged") from error
-        validate(value)
+        if decode_assets:
+            validate(value)
+        else:
+            validate_envelope(value)
         try:
             after = path.stat()
             if (after.st_dev, after.st_ino, after.st_size, after.st_mtime_ns) == stat_key:
-                _cache_portable_file(stat_key, hasher.hexdigest(), value["markdown"], value["assets"])
+                _cache_portable_file(
+                    stat_key, hasher.hexdigest(), value["markdown"], value["assets"], assets_decoded=decode_assets
+                )
         except OSError:
             pass
         return value["markdown"], value["assets"], True
-    return _decode_text_note(path.read_text(encoding="utf-8-sig"), path)
+    return _decode_text_note(path.read_text(encoding="utf-8-sig"), path, decode_assets=decode_assets)
 
-def decode_note_bytes(raw: bytes, path: Path) -> tuple[str, dict[str, str], bool]:
+def decode_note_bytes(raw: bytes, path: Path, *, decode_assets: bool = True) -> tuple[str, dict[str, str], bool]:
     """Decode the exact snapshot used for an agent's revision, without rereading."""
     if len(raw) > MAX_FILE:
         raise ValueError("Note exceeds 120 MB")
@@ -383,11 +487,14 @@ def decode_note_bytes(raw: bytes, path: Path) -> tuple[str, dict[str, str], bool
             value = json.loads(_gzip_json_input(path, raw))
         except (json.JSONDecodeError, UnicodeDecodeError, zlib.error, OSError, EOFError) as error:
             raise ValueError("This compressed portable note is damaged") from error
-        validate(value)
+        if decode_assets:
+            validate(value)
+        else:
+            validate_envelope(value)
         return value["markdown"], value["assets"], True
-    return _decode_text_note(raw.decode("utf-8-sig"), path)
+    return _decode_text_note(raw.decode("utf-8-sig"), path, decode_assets=decode_assets)
 
-def _decode_text_note(raw: str, path: Path) -> tuple[str, dict[str, str], bool]:
+def _decode_text_note(raw: str, path: Path, *, decode_assets: bool = True) -> tuple[str, dict[str, str], bool]:
     # Sharing providers and browsers may rename a portable note to .txt/.json,
     # or omit its extension. The validated envelope, not a filename, is decisive.
     if raw.lstrip().startswith("{"):
@@ -399,7 +506,10 @@ def _decode_text_note(raw: str, path: Path) -> tuple[str, dict[str, str], bool]:
                 raise ValueError("This portable note is damaged")
         else:
             if isinstance(value, dict) and (value.get("format") in ("supermd-smd", "supermd-fmd") or path.suffix.lower() in (".smd", ".fmd") and "format" in value):
-                validate(value)
+                if decode_assets:
+                    validate(value)
+                else:
+                    validate_envelope(value)
                 return value["markdown"], value["assets"], True
     return raw, {}, False
 

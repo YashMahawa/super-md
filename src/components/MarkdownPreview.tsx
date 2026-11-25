@@ -310,7 +310,7 @@ const MarkdownLink: Components['a'] = ({ node: _node, href, children, ...props }
 };
 
 const MarkdownPre: Components['pre'] = ({ node, children }) => {
-  const { documentPath, python, dark, trustedImageHosts, onTrustImageHost, liveStateRef } = useContext(MarkdownPreviewContext);
+  const { documentPath, python, dark, trustedImageHosts, onTrustImageHost, onNotice, liveStateRef } = useContext(MarkdownPreviewContext);
   const child = Children.only(children) as React.ReactElement<{ className?: string; children?: ReactNode }>;
   const language = child.props.className?.match(/language-([\w-]+)/)?.[1];
   const source = textOf(child.props.children).replace(/\n$/, "");
@@ -329,15 +329,17 @@ const MarkdownPre: Components['pre'] = ({ node, children }) => {
   const protectedBlock = (block: ReactNode) => <CodeBlockBoundary key={`${language}:${source}`} source={source}>{block}</CodeBlockBoundary>;
   if (language === "smd-tree") return protectedBlock(<InlineDiagram diagram={parseBinaryTreeSource(source)} />);
   if (language === "smd-diagram") return protectedBlock(<InlineDiagram diagram={parseDiagramSource(source)} />);
-  if (language === "smd-steps") return protectedBlock(
-    <StepCards
-      source={source}
-      sourceStart={srcStart}
-      sourceEnd={srcEnd}
-      renderImage={(src, alt) => <AssetImage src={src} alt={alt} documentPath={documentPath} trustedImageHosts={trustedImageHosts} onTrustImageHost={onTrustImageHost} />}
-      renderChart={chartSource => <ThemedChart source={chartSource} dark={dark} />}
-      renderMarkdown={text => <MemoizedMarkdownPreview markdown={text} documentPath={documentPath} python={python} dark={dark} trustedImageHosts={trustedImageHosts} onTrustImageHost={onTrustImageHost} />}
-    />
+  if (language === "smd-steps") return (
+    <CodeBlockBoundary key={language} source={source}>
+      <StepCards
+        source={source}
+        sourceStart={srcStart}
+        sourceEnd={srcEnd}
+        renderImage={(src, alt) => <AssetImage src={src} alt={alt} documentPath={documentPath} trustedImageHosts={trustedImageHosts} onTrustImageHost={onTrustImageHost} />}
+        renderChart={chartSource => <ThemedChart source={chartSource} dark={dark} />}
+        renderMarkdown={text => <MemoizedMarkdownPreview markdown={text} documentPath={documentPath} python={python} dark={dark} trustedImageHosts={trustedImageHosts} onTrustImageHost={onTrustImageHost} onNotice={onNotice} />}
+      />
+    </CodeBlockBoundary>
   );
   if (language === "smd-chart") return protectedBlock(<ThemedChart source={source} dark={dark} />);
   if (language === "svg") return protectedBlock(<ThemedSvg source={source} dark={dark} />);
