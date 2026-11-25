@@ -173,7 +173,7 @@ test("relay auth, bounded device RPC, Streamable HTTP, legacy SSE and disconnect
   const docOptionsProps = (docProps.options as { properties?: Record<string, Record<string, unknown>> } | undefined)?.properties ?? {};
   assert.deepEqual(Object.keys(docOptionsProps), [
     "pageSize", "margin", "fontSize", "lineHeight", "paragraphSpacing", "fontFamily", "pageNumbers", "themed",
-    "section", "offset", "background", "saveAs", "discardChanges", "title", "format", "repairIndices", "filename", "jobId", "limit", "width", "quality",
+    "section", "offset", "background", "saveAs", "discardChanges", "archive", "title", "format", "repairIndices", "filename", "jobId", "limit", "width", "quality",
   ]);
   for (const opToolName of ["patch_tab", "document_action"] as const) {
     const opsItems = ((toolsByName.get(opToolName)!.inputSchema as { properties: Record<string, Record<string, unknown>> }).properties.operations?.items ?? {}) as { oneOf?: Array<Record<string, unknown>> };

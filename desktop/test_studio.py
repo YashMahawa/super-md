@@ -239,6 +239,7 @@ class StudioTest(unittest.TestCase):
         for window in self.windows:
             window.stop()
             window.pool.shutdown(wait=True,cancel_futures=True)
+            window._search_pool.shutdown(wait=True,cancel_futures=True)
         self.session.writes.shutdown(wait=True)
         self.app.processEvents()
 
@@ -1088,6 +1089,175 @@ class StudioTest(unittest.TestCase):
         studio.post("flush","document_flushed",json.dumps({"id":studio.active,"content":"Stale draft","operation":previous}))
         self.assertNotEqual(studio._current()["content"],"Stale draft")
         self.assertEqual(studio.flush_operation["action"],"save")
+
+    def test_workspace_folder_and_expanded_subfolders_persist_across_restarts_tray_hides_and_multiwindow_shutdown(self):
+        import tempfile
+        with tempfile.TemporaryDirectory() as tmp:
+            root_a = Path(tmp) / "workspace-a"
+            sub_a = root_a / "math" / "algebra"
+            sub_a.mkdir(parents=True)
+            (root_a / "index.md").write_text("# Index\n")
+            (sub_a / "basis.md").write_text("# Basis\n")
+
+            root_b = Path(tmp) / "workspace-b"
+            sub_b = root_b / "physics"
+            sub_b.mkdir(parents=True)
+            (sub_b / "waves.md").write_text("# Waves\n")
+
+            # Open workspace A and expand nested subfolders in window 1.
+            self.studio.openFolder(str(root_a))
+            self.await_idle()
+            self.studio.toggleDirectory(str(root_a / "math"))
+            self.await_idle()
+            self.studio.toggleDirectory(str(sub_a))
+            self.await_idle()
+
+            # Tray hide preserves in-memory and persisted state (stop isn't called on hide,
+            # and persisted startup.json keeps folder + expanded).
+            self.flush()
+            persisted = json.loads((self.studio.data / "startup.json").read_text())
+            expected_expanded_a = {
+                str(root_a.resolve()),
+                str((root_a / "math").resolve()),
+                str(sub_a.resolve()),
+            }
+            win_entry = next(w for w in persisted["windows"] if w["windowId"] == self.studio.window_id)
+            self.assertEqual(win_entry["folder"], str(root_a.resolve()))
+            self.assertEqual(
+                set(win_entry["expanded"]),
+                expected_expanded_a,
+            )
+
+            # Open window 2 with workspace B and simulate multi-window tray quit
+            # (service.quitting=True before app.aboutToQuit sets session.quitting=True).
+            second = self.window()
+            second.openFolder(str(root_b))
+            self._wait_for(lambda: second.busy == 0)
+            second.toggleDirectory(str(sub_b))
+            self._wait_for(lambda: second.busy == 0)
+            self.flush()
+            expected_expanded_b = {str(root_b.resolve()), str(sub_b.resolve())}
+
+            class FakeService:
+                quitting = True
+
+            self.session.background = FakeService()
+            self.studio.stop()
+            second.stop()
+            self.flush()
+
+            # Restart with startup == "restore": both windows restore their workspace folders & expanded paths.
+            restored_session = Session(True, data=self.studio.data)
+            w1 = w2 = None
+            try:
+                w1 = QuietStudio(True, restored_session)
+                self.assertTrue(restored_session.has_pending_startup_windows())
+                w2 = QuietStudio(True, restored_session)
+                self.assertFalse(restored_session.has_pending_startup_windows())
+                self._wait_for(
+                    lambda: len(json.loads(w1.snapshot)["files"]) > 0
+                    and len(json.loads(w2.snapshot)["files"]) > 0
+                )
+
+                self.assertEqual(w1.folder, str(root_a.resolve()))
+                self.assertEqual(w1.expanded, expected_expanded_a)
+                w1_paths = {entry["path"] for entry in json.loads(w1.snapshot)["files"]}
+                self.assertIn(str((sub_a / "basis.md").resolve()), w1_paths)
+
+                self.assertEqual(w2.folder, str(root_b.resolve()))
+                self.assertEqual(w2.expanded, expected_expanded_b)
+                w2_paths = {entry["path"] for entry in json.loads(w2.snapshot)["files"]}
+                self.assertIn(str((sub_b / "waves.md").resolve()), w2_paths)
+            finally:
+                for w in (w1, w2):
+                    if w is not None:
+                        w.stop()
+                        w.pool.shutdown(wait=True, cancel_futures=True)
+                        w._search_pool.shutdown(wait=True, cancel_futures=True)
+                restored_session.writes.shutdown(wait=True)
+
+            # When startup != "restore", workspace folders are NOT restored on launch.
+            self.session.settings["startup"] = "new"
+            atomic_json(self.studio.data / "settings.json", {"settings": self.session.settings})
+            fresh_session = Session(True, data=self.studio.data)
+            fresh_win = None
+            try:
+                fresh_win = QuietStudio(True, fresh_session)
+                self.assertEqual(fresh_win.folder, "")
+                self.assertEqual(fresh_win.expanded, set())
+                self.assertFalse(fresh_session.has_pending_startup_windows())
+            finally:
+                if fresh_win is not None:
+                    fresh_win.stop()
+                    fresh_win.pool.shutdown(wait=True, cancel_futures=True)
+                    fresh_win._search_pool.shutdown(wait=True, cancel_futures=True)
+                fresh_session.writes.shutdown(wait=True)
+
+    def test_subfolder_search_scans_collapsed_subfolders_skips_hidden_and_symlinks_and_preserves_watchers(self):
+        import tempfile
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "vault"
+            (root / "courses" / "algebra").mkdir(parents=True)
+            (root / "empty-branch" / "sub").mkdir(parents=True)
+            (root / ".obsidian").mkdir(parents=True)
+            outside = Path(tmp) / "outside"
+            outside.mkdir()
+
+            (root / "readme.md").write_text("# Root\n")
+            (root / "courses" / "algebra" / "1.2 Linear Algebra.md").write_text("# LA\n")
+            (root / "courses" / "algebra" / "scratch.txt").write_text("plain text note\n")
+            (root / "empty-branch" / "other.md").write_text("# Unrelated\n")
+            (root / ".obsidian" / "linear-secret.md").write_text("hidden dir\n")
+            (root / ".linear-hidden.md").write_text("hidden file\n")
+            (outside / "linear-external.md").write_text("outside\n")
+            try:
+                (root / "linked-outside").symlink_to(outside, target_is_directory=True)
+                (root / "courses" / "linear-link.md").symlink_to(outside / "linear-external.md")
+            except OSError:
+                pass
+
+            studio = self.studio
+            studio.openFolder(str(root))
+            self.await_idle()
+
+            # Collapsed subfolders are NOT watched at rest.
+            watched_dirs_before = set(studio.note_watcher.directories())
+            expected_root_only = {str(root.resolve())}
+            self.assertIn(str(root.resolve()), watched_dirs_before)
+            self.assertNotIn(str((root / "courses").resolve()), watched_dirs_before)
+            self.assertEqual(studio.expanded, expected_root_only)
+
+            # Search across collapsed subfolders finds matching note & ancestor dirs only.
+            studio.setFolderFilter("linear")
+            self._wait_for(lambda: not studio.filter_timer.isActive() and not studio._folder_searching)
+            snap = json.loads(studio.snapshot)
+            names = [item["name"] for item in snap["files"]]
+            self.assertEqual(names, ["courses", "algebra", "1.2 Linear Algebra.md"])
+            self.assertEqual(studio.expanded, expected_root_only, "Search must not mutate expanded folder state")
+            self.assertEqual(
+                set(studio.note_watcher.directories()),
+                watched_dirs_before,
+                "Search must not add collapsed subdirectories to QFileSystemWatcher",
+            )
+
+            # Rapid queries cancel stale searches cleanly and converge on the latest filter.
+            studio.setFolderFilter("readme")
+            studio.setFolderFilter("scratch")
+            self._wait_for(lambda: not studio.filter_timer.isActive() and not studio._folder_searching)
+            snap = json.loads(studio.snapshot)
+            self.assertEqual([item["name"] for item in snap["files"]], ["courses", "algebra", "scratch.txt"])
+
+            # Zero matches produces an empty list while preserving folderFilter in snapshot.
+            studio.setFolderFilter("nonexistent-xyz")
+            self._wait_for(lambda: not studio.filter_timer.isActive() and not studio._folder_searching)
+            snap = json.loads(studio.snapshot)
+            self.assertEqual(snap["folderFilter"], "nonexistent-xyz")
+            self.assertEqual(snap["files"], [])
+
+            # Closing (or reopening) folder clears the active filter automatically.
+            studio.closeFolder()
+            self.assertEqual(studio.folder_filter, "")
+            self.assertEqual(json.loads(studio.snapshot)["folderFilter"], "")
 
     def test_bundled_presets_saved_themes_override_resets_and_clean_exports(self):
         import custom_theme
