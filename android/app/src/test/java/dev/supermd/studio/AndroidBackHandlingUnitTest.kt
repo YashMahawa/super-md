@@ -49,6 +49,8 @@ class AndroidBackHandlingUnitTest {
     @After fun tearDown() {
         scopes.forEach { it.cancel() }
         stores.forEach { it.clear() }
+        shadowOf(Looper.getMainLooper()).idleFor(java.time.Duration.ofMillis(32))
+        app.getSharedPreferences("studio", Context.MODE_PRIVATE).edit().clear().commit()
         workspaceKeys.forEach { key ->
             File(app.filesDir, "workspaces/$key.json").delete()
             File(app.filesDir, "workspaces/$key").deleteRecursively()
@@ -67,12 +69,13 @@ class AndroidBackHandlingUnitTest {
     private fun idleUntil(timeoutMs: Long = 5_000, condition: () -> Boolean) {
         val deadline = System.currentTimeMillis() + timeoutMs
         val mainLooper = shadowOf(Looper.getMainLooper())
+        val frameStep = java.time.Duration.ofMillis(16)
         while (System.currentTimeMillis() < deadline) {
-            mainLooper.idle()
+            mainLooper.idleFor(frameStep)
             if (condition()) return
             Thread.sleep(10)
         }
-        mainLooper.idle()
+        mainLooper.idleFor(frameStep)
         assertTrue("Condition was not met within ${timeoutMs}ms", condition())
     }
 
@@ -304,6 +307,174 @@ class AndroidBackHandlingUnitTest {
             assertEquals(draft, model.state.value.active.content)
         } finally {
             runCatching { controller.pause().stop().destroy() }
+            shadowOf(Looper.getMainLooper()).idleFor(java.time.Duration.ofMillis(32))
+        }
+    }
+
+    @Test fun nativeEditAfterModeSwitchFlushClearsPreviousProtocolSessionAndResynchronizes() {
+        val store = ViewModelStore().also(stores::add)
+        val key = java.util.UUID.randomUUID().toString().also(workspaceKeys::add)
+        val model = StudioViewModel(app, key)
+        store.put("model-post-mode-edit", model)
+        val scope = CoroutineScope(SupervisorJob() + Dispatchers.Main.immediate).also(scopes::add)
+        var readerContent = model.state.value.active.content
+        var syncedInitialSession = false
+        lateinit var bridge: ReaderBridge
+        val web = object : WebView(app) {
+            override fun post(action: Runnable?): Boolean =
+                action?.let { Handler(Looper.getMainLooper()).post(it) } ?: false
+
+            override fun evaluateJavascript(script: String, resultCallback: android.webkit.ValueCallback<String>?) {
+                val tokenMatch = Regex("""token:"([^"]+)"""").find(script)
+                if (tokenMatch != null) {
+                    val token = tokenMatch.groupValues[1]
+                    val activeId = model.state.value.active.id
+                    // Matches ReaderEdits.flush() in src/readerEdits.ts: the first flush of an untouched
+                    // session sends document_sync(epoch, revision = 0, content) before document_flushed.
+                    if (!syncedInitialSession) {
+                        syncedInitialSession = true
+                        bridge.post(
+                            "sync-initial",
+                            "document_sync",
+                            JSONObject()
+                                .put("id", activeId)
+                                .put("epoch", "epoch-initial")
+                                .put("revision", 0)
+                                .put("content", readerContent)
+                                .toString(),
+                        )
+                    }
+                    bridge.post(
+                        "flush-initial",
+                        "document_flushed",
+                        JSONObject()
+                            .put("id", activeId)
+                            .put("token", token)
+                            .put("content", readerContent)
+                            .toString(),
+                    )
+                }
+                resultCallback?.onReceiveValue("null")
+            }
+        }
+        bridge = ReaderBridge(web, model, scope, ready = {}, assetCapabilities = ReaderAssetCapabilities())
+        model.readerFlushRequester = { noteId -> bridge.requestFlush(noteId) }
+
+        val activeId = model.state.value.active.id
+        model.mode("editor")
+        idleUntil { model.state.value.mode == "editor" && model.state.value.message == null }
+
+        // Next, native code updates the note (exact sequence in AndroidBackHandlingTest lines 191..203).
+        // WebView receives supermdLoad(initial) -> ReaderEdits.open(id, initial), which stays lazy (ready=false)
+        // and does NOT send document_sync until the user edits inside WebView.
+        val initial = "# Source Back Test\n\nAlpha needle in source mode."
+        model.readerEcho[activeId] = initial
+        model.edit(activeId, initial)
+        readerContent = initial
+
+        assertFalse("Native edit() must clear stale readerEcho entries so Compose sends updated content", model.readerEcho.containsKey(activeId))
+        assertTrue(
+            "Native edit() after a mode-switch flush must clear the stale ReaderEditProtocol session so readerStateIsNativeAuthoritative matches native content",
+            model.readerStateIsNativeAuthoritative(activeId),
+        )
+
+        // Subsequent WebView edit opens a fresh protocol epoch and patches cleanly onto initial.
+        val suffix = "\nDraft kept after Find in note."
+        bridge.post(
+            "sync-after-edit",
+            "document_sync",
+            JSONObject()
+                .put("id", activeId)
+                .put("epoch", "epoch-after-edit")
+                .put("revision", 0)
+                .put("content", initial)
+                .toString(),
+        )
+        bridge.post(
+            "patch-after-edit",
+            "document_patch",
+            JSONObject()
+                .put("id", activeId)
+                .put("epoch", "epoch-after-edit")
+                .put("baseRevision", 0)
+                .put("revision", 1)
+                .put(
+                    "changes",
+                    org.json.JSONArray().put(
+                        JSONObject()
+                            .put("from", initial.length)
+                            .put("to", initial.length)
+                            .put("insert", suffix),
+                    ),
+                )
+                .toString(),
+        )
+        idleUntil { model.state.value.active.content == initial + suffix }
+        assertTrue(model.readerStateIsNativeAuthoritative(activeId))
+    }
+
+    @Test fun realMainActivityPersistsDraftAcrossSystemBackAndReopen() {
+        val prefs = app.getSharedPreferences("studio", Context.MODE_PRIVATE)
+        prefs.edit()
+            .putBoolean("welcomed", true)
+            .putBoolean("motion", false)
+            .putString("startup", "restore")
+            .putBoolean("autosave", false)
+            .commit()
+        val workspace = java.util.UUID.randomUUID().toString().also(workspaceKeys::add)
+        val draft = "# Live Back Test\n\nEdited live draft kept across Back. Second pass in normal mode."
+        val intent = android.content.Intent(app, MainActivity::class.java).putExtra("workspace", workspace)
+        val controller = Robolectric.buildActivity(MainActivity::class.java, intent).setup()
+        try {
+            val activity = controller.get()
+            val model = androidx.lifecycle.ViewModelProvider(activity)[StudioViewModel::class.java]
+            idleUntil { !activity.onBackPressedDispatcher.hasEnabledCallbacks() }
+
+            model.edit(model.state.value.active.id, draft)
+            model.readerDismissible(true)
+            idleUntil { activity.onBackPressedDispatcher.hasEnabledCallbacks() }
+
+            // Reconcile first-Back dismissal (as returned by READER_DISMISS_SCRIPT on real WebView)
+            // and verify MainActivity releases its BackHandler for second Back.
+            applyReaderDismissResult(
+                model,
+                JSONObject.quote(
+                    JSONObject()
+                        .put("dismissed", true)
+                        .put("overlay", false)
+                        .put("image", false)
+                        .put("dismissible", false)
+                        .toString(),
+                ),
+            )
+            idleUntil { !model.state.value.readerDismissible && !activity.onBackPressedDispatcher.hasEnabledCallbacks() }
+            assertFalse(activity.isFinishing)
+            assertEquals(draft, model.state.value.active.content)
+
+            // Second Back in normal mode reaches system Back, finishes MainActivity, and onStop flushes recovery.
+            activity.onBackPressedDispatcher.onBackPressed()
+            idleUntil { activity.isFinishing }
+            controller.pause().stop().destroy()
+            shadowOf(Looper.getMainLooper()).idleFor(java.time.Duration.ofMillis(32))
+        } finally {
+            runCatching { controller.destroy() }
+            shadowOf(Looper.getMainLooper()).idleFor(java.time.Duration.ofMillis(32))
+        }
+
+        val snapshot = File(app.filesDir, "workspaces/$workspace.json")
+        idleUntil {
+            snapshot.isFile && snapshot.bufferedReader().use { reader ->
+                NoteRecovery.read(reader, StudioState()).tabs.any { it.content == draft }
+            }
+        }
+
+        val reopenController = Robolectric.buildActivity(MainActivity::class.java, intent).setup()
+        try {
+            val reopenedModel = androidx.lifecycle.ViewModelProvider(reopenController.get())[StudioViewModel::class.java]
+            idleUntil { reopenedModel.state.value.active.content == draft }
+        } finally {
+            runCatching { reopenController.pause().stop().destroy() }
+            shadowOf(Looper.getMainLooper()).idleFor(java.time.Duration.ofMillis(32))
         }
     }
 }

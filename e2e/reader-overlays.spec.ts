@@ -109,8 +109,22 @@ test('Android Back dismisses active Live edits and Source search synchronously w
   await page.screenshot({path:'/tmp/android-live-edit-after-back.png'});
   expect(await page.evaluate(()=>Boolean(window.supermdDismiss?.()))).toBe(false);
 
-  // 2. Source search: both native ReadingSearch ("Find in note") and unfocused CodeMirror .cm-search dismiss while keeping Source drafts.
+  // 2. Source search: switching live -> editor on the same note id schedules modeOffset settle timers;
+  // both native ReadingSearch ("Find in note") and unfocused CodeMirror .cm-search must keep focus/drafts and dismiss cleanly.
   await page.evaluate(()=>{
+    window.supermdLoad?.({
+      id:'android-back-source',
+      path:null,
+      content:'# Source study note\n\nSearch needle alpha.',
+      mode:'live',
+      dark:false,
+      fullscreen:false,
+      colors:{primary:'#42669e','on-primary':'#ffffff','primary-container':'#d7e3ff','on-primary-container':'#162c4c',surface:'#f7f9fd','surface-low':'#f0f3fa','surface-high':'#e5ebf5',text:'#191c20',muted:'#56647c',outline:'#c4c6d0'},
+      font:'Manrope',
+      size:16,
+      zoom:100,
+      restorePosition:false,
+    });
     window.supermdLoad?.({
       id:'android-back-source',
       path:null,
@@ -131,7 +145,11 @@ test('Android Back dismisses active Live edits and Source search synchronously w
     window.dispatchEvent(new CustomEvent('supermd-format',{detail:{block:true,prefix:'\nDraft line kept across Source search Back.'}}));
     window.supermdFind?.('needle');
   });
-  await expect(page.getByRole('searchbox',{name:'Find in note'})).toHaveValue('needle');
+  const sourceFindField=page.getByRole('searchbox',{name:'Find in note'});
+  await expect(sourceFindField).toHaveValue('needle');
+  await expect(sourceFindField).toBeFocused();
+  await page.waitForTimeout(750);
+  await expect(sourceFindField).toBeFocused();
   expect(await page.evaluate(()=>document.documentElement.dataset.readerOverlay)).toBe('true');
   await page.screenshot({path:'/tmp/android-source-search-before-back.png'});
 

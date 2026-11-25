@@ -129,6 +129,7 @@ class AndroidBackHandlingTest {
                 val s = modelState(scenario)
                 !s.fullscreen && !s.readerDismissible && s.active.content == expectedFullscreenMarkdown
             }
+            javascriptUntil(scenario, "document.documentElement.dataset.fullscreen") { it == "false" }
             assertEquals(Lifecycle.State.RESUMED, scenario.state)
 
             // Re-open active Live edit in normal (non-fullscreen) mode and update uncommitted draft text.
@@ -239,6 +240,7 @@ class AndroidBackHandlingTest {
                 val s = modelState(scenario)
                 !s.fullscreen && !s.readerOverlay && s.active.content == editedFirst
             }
+            javascriptUntil(scenario, "document.documentElement.dataset.fullscreen") { it == "false" }
             assertEquals(Lifecycle.State.RESUMED, scenario.state)
 
             // Open CodeMirror's inline .cm-search in normal Source mode, edit draft further, and blur focus outside .cm-search.

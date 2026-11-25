@@ -754,7 +754,7 @@ class StudioViewModel(app: Application, val workspaceKey: String = "main") : And
                 if(archived.isFailure){fail("Could not preserve a deleted note's edits. Its draft is still open; save it to another file.");return@launch}
                 if(mutable.value!==s){refreshMetadata();return@launch} // Never overwrite edits made during archive I/O.
             }
-            discarded.forEach {readerEcho.remove(it.id)}
+            discarded.forEach { readerEcho.remove(it.id); clearReaderEditProtocol(it.id) }
             val kept=s.tabs.filter {it.uri !in removed}.map {note->metadata[note.uri]?.takeIf {it.isNotBlank()}?.let {note.copy(name=it,relative=renamedRelative(note.relative,it))} ?: note}
             if(discarded.isNotEmpty()||kept!=s.tabs) change {it.copy(tabs=kept.ifEmpty {listOf(Note())},closedTabs=(recovered+it.closedTabs).take(12),message=if(discarded.isNotEmpty())"File deleted. Its tab was closed; unsaved edits remain recoverable in Settings." else "Updated renamed note")}
             val recents=recentMutable.value.filter {it.uri !in removed}.map {note->metadata[note.uri]?.takeIf {it.isNotBlank()}?.let {note.copy(name=it,relative=renamedRelative(note.relative,it))} ?: note}
@@ -1121,7 +1121,7 @@ class StudioViewModel(app: Application, val workspaceKey: String = "main") : And
         if (mutable.value.tabs.none { it.id == id }) return
         if (!protocolPatch) readerEditProtocol.clear(id)
         readerEcho[id] = content
-        edit(id, content)
+        edit(id, content, fromReader = true)
     }
 
     internal fun readerSync(id: String, epoch: String, revision: Long, content: String): JSONObject {
@@ -1200,7 +1200,15 @@ class StudioViewModel(app: Application, val workspaceKey: String = "main") : And
         }
     }
 
-    fun edit(id: String, content: String) { change { s -> s.copy(tabs = s.tabs.map { if (it.id == id) it.copy(content = content) else it }) }; scheduleAutosave(id) }
+    fun edit(id: String, content: String) = edit(id, content, fromReader = false)
+    private fun edit(id: String, content: String, fromReader: Boolean) {
+        if (!fromReader) {
+            readerEcho.remove(id)
+            readerEditProtocol.clear(id)
+        }
+        change { s -> s.copy(tabs = s.tabs.map { if (it.id == id) it.copy(content = content) else it }) }
+        scheduleAutosave(id)
+    }
     /** Commit an inactive-note patch computed from an immutable reader snapshot. */
     internal suspend fun commitAgentSnapshotPatch(id: String, expectedRevision: String, patchedContent: String, patchedRevision: String) = documentWrites.withLock {
         require(patchedContent.toByteArray(Charsets.UTF_8).size <= MAX_AGENT_SNAPSHOT_BYTES) { "The patched document exceeds Android's 2 MiB relay snapshot limit" }
@@ -1736,6 +1744,7 @@ class StudioViewModel(app: Application, val workspaceKey: String = "main") : And
             val accepted = performReaderBarrier(expectedActiveId) {
                 if(mutable.value.closedTabs.none {it.id==referenceNote.id})return@performReaderBarrier
                 readerEcho.remove(note.id)
+                clearReaderEditProtocol(note.id)
                 if (note.portable && note.uri != null && !note.assetsDirty) recordPortableBaseline(note.id, note.assetDirectory)
                 closedNoteRefs=closedNoteRefs.filterNot {it.id==note.id}
                 updatedRefs = closedNoteRefs
@@ -1763,6 +1772,8 @@ class StudioViewModel(app: Application, val workspaceKey: String = "main") : And
                 val restored=if(ref!=null)withContext(Dispatchers.IO){closedNoteStore.loadForRecovery(ref,note)}
                     else legacy?.takeIf {it.content.isNotEmpty() || it.saved.isNotEmpty() || it.assetDirectory!=null} ?: note
                 val accepted=performReaderBarrier(expectedActiveId) {
+                    readerEcho.remove(note.id)
+                    clearReaderEditProtocol(note.id)
                     closedNoteRefs=closedNoteRefs.filterNot {it.id==note.id}
                     change {s->
                         if(s.tabs.any {it.id==note.id})s.copy(activeId=note.id,closedTabs=s.closedTabs.filter {it.id!=note.id})

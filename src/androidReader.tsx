@@ -540,18 +540,20 @@ function Reader() {
   useLayoutEffect(() => {
     if (!state) return;
     const startingInput=scrollInputVersion();
+    const initialContent=state.content;
     const saved=state.restorePosition!==false?(state.readingLocation??loadReadingLocation(state.path===state.id?null:state.path)):undefined;
     const top = noteViews.current.get(state.id)?.top ?? (saved?.mode===state.mode&&Math.abs(saved.zoom-zoomReference.current)<1?saved.top:undefined);
     if(modeOffset.current!==null){
       const offset=modeOffset.current;modeOffset.current=null;
       // The new view settles over several frames (editor mount, zoom geometry,
       // lazy math and fonts). Re-apply the source anchor until it is stable,
-      // and stop as soon as the person scrolls or types.
+      // and stop as soon as the person scrolls, edits, or opens search.
       let stopped=false;const stop=()=>{stopped=true;};
       const inputs=["wheel","touchstart","keydown","pointerdown"] as const;
       inputs.forEach(name=>window.addEventListener(name,stop,{capture:true,passive:true}));
       const apply=()=>{
         if(stopped||scrollInputVersion()!==startingInput)return;
+        if(reference.current?.content!==initialContent||document.querySelector(".reading-search,.cm-search")){stopped=true;return;}
         if(state.mode==="editor")window.dispatchEvent(new CustomEvent("supermd-goto-offset",{detail:offset}));
         else {const host=document.querySelector<HTMLElement>(".android-reading");if(host)revealReadingOffset(host,offset);}
       };
@@ -567,6 +569,7 @@ function Reader() {
     inputs.forEach(name=>window.addEventListener(name,stop,{capture:true,passive:true}));
     const restore=()=>{
       if(stopped||scrollInputVersion()!==startingInput)return;
+      if(reference.current?.content!==initialContent||document.querySelector(".reading-search,.cm-search")){stopped=true;return;}
       const host=document.querySelector<HTMLElement>('.android-reading');
       if(host){if(top!==undefined)host.scrollTop=Math.max(0,top);else if(saved)revealReadingOffset(host,saved.offset);}
       else if(saved)window.dispatchEvent(new CustomEvent('supermd-goto-offset',{detail:saved.offset}));
