@@ -463,14 +463,15 @@ class StudioUiTest {
         welcome()
         val model=androidx.lifecycle.ViewModelProvider(compose.activity)[StudioViewModel::class.java]
         val before=model.state.value;temporaryNoteState=before
-        val content="# Diagram appearance\n\n```mermaid\nflowchart LR\n A[Read] --> B[Understand]\n```"
+        val content="# Diagram appearance\n\n```mermaid\nflowchart LR\n A[Read] --> B[Understand]\n```\n\n```mermaid\ngantt\n title Study plan\n dateFormat YYYY-MM-DD\n Read :a1, 2026-10-01, 2d\n Review :after a1, 2d\n```"
         try {
             compose.runOnIdle {model.fullscreen(false);model.appearance(accent="rose",theme="dark",motion=false);model.readingPreference("imageAppearance","original");model.readingPreference("svgAppearance","auto");model.edit(model.state.value.active.id,content);model.mode("reader");model.zoom(100f)}
-            javascriptUntil("(()=>{const i=document.querySelector('.mermaid img');return !!i?.complete&&i.naturalWidth>0&&i.dataset.mediaKind==='svg'&&i.dataset.mediaAdapted==='true'&&getComputedStyle(i).filter==='none'&&document.documentElement.dataset.imageAppearance==='original';})()") {it=="true"}
-            javascriptUntil("(()=>{const i=document.querySelector('.mermaid img');if(!i)return false;const svg=decodeURIComponent(i.src.split(',').slice(1).join(','));return svg.includes('data-diagram-engine=\"pele\"')&&!svg.includes('var(');})()") {it=="true"}
+            javascriptUntil("(()=>{const errs=Array.from(document.querySelectorAll('.image-error,.render-error')).map(e=>e.textContent);if(errs.length)return {errors:errs};const imgs=Array.from(document.querySelectorAll('.mermaid img'));const ready=imgs.length===2&&imgs.every(i=>i.complete&&i.naturalWidth>0&&i.dataset.mediaKind==='svg'&&i.dataset.mediaAdapted==='true'&&getComputedStyle(i).filter==='none')&&document.documentElement.dataset.imageAppearance==='original';return ready?'ok':{imgs:imgs.length,widths:imgs.map(i=>i.naturalWidth),imageAppearance:document.documentElement.dataset.imageAppearance};})()") {it=="\"ok\""}
+            javascriptUntil("(()=>{const imgs=Array.from(document.querySelectorAll('.mermaid img'));if(imgs.length!==2)return false;const svgs=imgs.map(i=>decodeURIComponent(i.src.split(',').slice(1).join(',')));const frame=document.documentElement.querySelector('iframe[data-mermaid-sandbox]');return svgs.some(s=>s.includes('data-diagram-engine=\"pele\"'))&&svgs.some(s=>s.includes('data-diagram-engine=\"mermaid\"'))&&svgs.every(s=>!s.includes('var('))&&frame?.getAttribute('sandbox')==='allow-scripts'&&!document.body.contains(frame);})()") {it=="true"}
             for(mode in listOf("monochrome","contrast","invert-dark","original")) {
+                val expectedDark = if (mode == "original") "true" else "false"
                 compose.runOnIdle {model.readingPreference("svgAppearance",mode)}
-                javascriptUntil("(()=>{const i=document.querySelector('.mermaid img');return document.documentElement.dataset.svgAppearance==='$mode'&&!!i?.complete&&i.naturalWidth>0;})()") {it=="true"}
+                javascriptUntil("(()=>{const mermaid=Array.from(document.querySelectorAll('.mermaid'));const imgs=Array.from(document.querySelectorAll('.mermaid img'));return document.documentElement.dataset.svgAppearance==='$mode'&&mermaid.length===2&&mermaid.every(m=>m.dataset.renderDark==='$expectedDark')&&imgs.length===2&&imgs.every(i=>i.complete&&i.naturalWidth>0);})()") {it=="true"}
                 javascriptUntil("document.querySelectorAll('.image-error,.render-error').length") {it=="0"}
                 compose.runOnIdle {assertEquals(content,model.state.value.active.content);assertEquals("original",model.state.value.imageAppearance)}
             }
