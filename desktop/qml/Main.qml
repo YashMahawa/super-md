@@ -17,6 +17,7 @@ ApplicationWindow {
     flags: (studio.fedoraWindowFrame || windowModes.immersive) ? Qt.Window | Qt.FramelessWindowHint : Qt.platform.os === "osx" || Qt.platform.os === "windows" ? Qt.Window | Qt.ExpandedClientAreaHint | Qt.NoTitleBarBackgroundHint : Qt.Window
     title: viewState.name + " - Super MD"
     property var viewState: JSON.parse(studio.snapshot)
+    property var sidebarState: JSON.parse(studio.sidebarSnapshot)
     property var reader: readerLoader.item
     property bool sidebar: true
     property bool settingsOpen: false
@@ -415,16 +416,16 @@ ApplicationWindow {
                 ActionButton { visible: sidebarSection === "folder"; text: "Open folder"; glyph: "FolderOpen"; tonal: true; Layout.fillWidth: true; onClicked: studio.chooseFolder() }
                 ActionButton { objectName: "sidebarFolderSearchButton"; visible: sidebarSection === "folder"; text: "Search across notes"; glyph: "MagnifyingGlass"; compact: true; tonal: true; Layout.fillWidth: true; ToolTip.text: "Search across notes (" + (window.shortcutLabels.search_folder || "Ctrl+Shift+F") + ")"; onClicked: studio.openFolderSearch() }
                 RowLayout {
-                    visible: sidebarSection === "folder" && !!viewState.folder
+                    visible: sidebarSection === "folder" && !!sidebarState.folder
                     Layout.fillWidth: true
-                    Label { text: viewState.folder.split("/").pop(); Layout.fillWidth: true; elide: Text.ElideMiddle }
+                    Label { text: sidebarState.folder.split("/").pop(); Layout.fillWidth: true; elide: Text.ElideMiddle }
                     ActionButton { glyph: "X"; compact: true; Accessible.name: "Close folder"; ToolTip.text: "Close folder (notes stay open)"; onClicked: studio.closeFolder() }
                 }
                 TextField {
                     id: filter
                     objectName: "folderFilterField"
-                    property string backendFilter: viewState.folderFilter || ""
-                    visible: sidebarSection === "folder" && !!viewState.folder
+                    property string backendFilter: sidebarState.folderFilter || ""
+                    visible: sidebarSection === "folder" && !!sidebarState.folder
                     Layout.fillWidth: true
                     placeholderText: "Filter files"
                     selectByMouse: true
@@ -447,9 +448,9 @@ ApplicationWindow {
                         id: folderFilesView
                         objectName: "folderFilesView"
                         anchors.fill: parent
-                        visible: viewState.files.length > 0
+                        visible: sidebarState.files.length > 0
                         clip: true
-                        model: viewState.files
+                        model: sidebarState.files
                         delegate: ItemDelegate {
                             id: fileEntry
                             required property var modelData
@@ -457,7 +458,7 @@ ApplicationWindow {
                             height: 42
                             leftPadding: 8 + modelData.depth * 16
                             text: (modelData.directory ? (modelData.expanded ? "▾ " : "▸ ") : "") + modelData.name
-                            onClicked: modelData.directory ? (!((viewState.folderFilter || "").trim()) && studio.toggleDirectory(modelData.path)) : studio.openNote(modelData.path)
+                            onClicked: modelData.directory ? (!((sidebarState.folderFilter || "").trim()) && studio.toggleDirectory(modelData.path)) : studio.openNote(modelData.path)
                             Hint { requested: fileEntry.hovered; text: modelData.path }
                         }
                         ScrollBar.vertical: ExpressiveScrollBar { }
@@ -467,7 +468,7 @@ ApplicationWindow {
                         anchors.centerIn: parent
                         width: parent.width - 16
                         spacing: 4
-                        visible: !!viewState.folder && viewState.files.length === 0 && !viewState.folderSearching
+                        visible: !!sidebarState.folder && sidebarState.files.length === 0 && !sidebarState.folderSearching
                         Label {
                             objectName: "folderEmptyLabel"
                             Layout.fillWidth: true
@@ -475,10 +476,10 @@ ApplicationWindow {
                             wrapMode: Text.WordWrap
                             font.weight: Font.Medium
                             color: viewState.colors.text
-                            text: (viewState.folderFilter || "").trim().length > 0 ? "No matching notes found" : "No notes in this folder"
+                            text: (sidebarState.folderFilter || "").trim().length > 0 ? "No matching notes found" : "No notes in this folder"
                         }
                         Label {
-                            visible: (viewState.folderFilter || "").trim().length > 0
+                            visible: (sidebarState.folderFilter || "").trim().length > 0
                             Layout.fillWidth: true
                             horizontalAlignment: Text.AlignHCenter
                             wrapMode: Text.WordWrap
@@ -488,19 +489,20 @@ ApplicationWindow {
                         }
                     }
                 }
-                OutlineList { visible: sidebarSection === "contents"; Layout.fillWidth: true; Layout.fillHeight: true; entries: viewState.outline || []; noteId: viewState.active }
+                OutlineList { objectName: "sidebarOutlineList"; visible: sidebarSection === "contents"; Layout.fillWidth: true; Layout.fillHeight: true; entries: sidebarState.outline || []; noteId: sidebarState.active }
                 Rectangle { Layout.fillWidth: true; height: 1; color: viewState.colors.outline }
                 Label { text: "Recent notes"; font.weight: Font.DemiBold; color: viewState.colors.text }
                 RecentNotes {
+                    objectName: "sidebarRecentNotes"
                     Layout.fillWidth: true
-                    Layout.preferredHeight: Math.min(240, viewState.recent.length * 40)
+                    Layout.preferredHeight: Math.min(240, sidebarState.recent.length * 40)
                     clip: true
-                    model: viewState.recent
-                    pinned: studio.pinnedRecent
+                    model: sidebarState.recent
+                    pinned: sidebarState.pinned
                     onOpenRequested: path => studio.openNote(path)
                     onPinRequested: path => studio.pinRecent(path)
                 }
-                Label { visible: !viewState.folder && !viewState.recent.length; text: "Open any folder for quick access. Your notes stay ordinary files."; wrapMode: Text.WordWrap; Layout.fillWidth: true; color: viewState.colors.muted }
+                Label { visible: !sidebarState.folder && !sidebarState.recent.length; text: "Open any folder for quick access. Your notes stay ordinary files."; wrapMode: Text.WordWrap; Layout.fillWidth: true; color: viewState.colors.muted }
                 Rectangle { Layout.fillWidth: true; height: 1; color: viewState.colors.outline }
                 ActionButton { text: "New window"; tonal: true; Layout.fillWidth: true; onClicked: studio.command("window") }
             }
@@ -766,7 +768,7 @@ ApplicationWindow {
         ColumnLayout {
             anchors.fill: parent
             RowLayout { Label { text: "Contents"; font.pixelSize: 22; font.weight: Font.DemiBold; Layout.fillWidth: true } ActionButton { glyph: "X"; compact: true; ToolTip.text: "Close contents"; onClicked: contentsPopup.close() } }
-            OutlineList { Layout.fillWidth: true; Layout.fillHeight: true; entries: viewState.outline || []; noteId: viewState.active; onChosen: { contentsPopup.close(); window.chromeAwake = false; window.focusReader() } }
+            OutlineList { objectName: "popupOutlineList"; Layout.fillWidth: true; Layout.fillHeight: true; entries: sidebarState.outline || []; noteId: sidebarState.active; onChosen: { contentsPopup.close(); window.chromeAwake = false; window.focusReader() } }
         }
     }
     AppDialog {
