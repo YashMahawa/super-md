@@ -1,9 +1,11 @@
-import {createContext,Fragment,useCallback,useContext,useEffect,useLayoutEffect,useMemo,useRef,useState,type ClipboardEvent,type DragEvent,type KeyboardEvent as ReactKeyboardEvent,type MouseEvent as ReactMouseEvent,type RefObject} from 'react';
+import {createContext,Fragment,useCallback,useContext,useEffect,useLayoutEffect,useMemo,useRef,useState,type ClipboardEvent,type DragEvent,type KeyboardEvent as ReactKeyboardEvent,type ReactNode,type RefObject} from 'react';
+import {PencilSimpleIcon} from '@phosphor-icons/react';
 import MarkdownPreview from './MarkdownPreview';
-import WindowedBlock from './WindowedBlock';
+import WindowedBlock,{type WindowHeading} from './WindowedBlock';
 import type {RenderedMarkdownBlock} from './CachedMarkdown';
 import {analyzeDocument,type SourceBlock,type SourceDocumentAnalysis} from '../documentAnalysis';
 import {selectedMarkdown,setSelectedMarkdownDrag} from '../copySource';
+import {refreshDocumentExtent} from '../documentZoom';
 import type {WritingOptions} from '../proofreading';
 import type {ReaderAccessibilityPreference} from '../types';
 import WritingSuggestions from './WritingSuggestions';
@@ -13,6 +15,7 @@ import {handleLiveEditorKey} from '../liveEditorKeys';
 import {liveEditorCenterDelta,useTypewriterScroll} from '../typewriterScroll';
 const noTrustedHosts:string[]=[];
 const CARET_KEYS=new Set(['ArrowUp','ArrowDown','PageUp','PageDown','Home','End']);
+const fullscreenInteractiveSelector='a,button,input,select,textarea,summary,details,img,.note-image,.interactive-chart,.inline-diagram,.svg-figure,.mermaid,.step-cards,.remote-image-card,.image-error,.code-container';
 export type {SourceBlock} from '../documentAnalysis';
 export function splitMarkdownBlocks(markdown:string):SourceBlock[]{return analyzeDocument(markdown).bodyBlocks;}
 
@@ -31,6 +34,8 @@ interface EditingSession {
   protectedBlock:boolean;
   insertAfter?:number|'end';
 }
+interface CloseAnchor {scroller:HTMLElement;element:HTMLElement;top:number}
+interface EditSpan {baseSource:string;start:number;oldEnd:number;newEnd:number}
 
 interface ActiveDraftContextValue {
   session:number;
@@ -48,7 +53,7 @@ interface ActiveDraftContextValue {
   onKeyDown:(event:ReactKeyboardEvent<HTMLTextAreaElement>)=>void;
   onCaretMove:()=>void;
   onRememberSelection:(area:HTMLTextAreaElement)=>void;
-  onBlurSession:(session:number,area:HTMLTextAreaElement,shouldClose:boolean)=>void;
+  onBlurSession:(session:number,area:HTMLTextAreaElement,shouldClose:boolean,relatedTarget:Element|null)=>void;
 }
 
 const ActiveDraftContext=createContext<ActiveDraftContextValue|null>(null);
@@ -75,14 +80,89 @@ function ActiveBlockEditor(){
         onKeyDown={onKeyDown}
         onBlur={event=>{
           if(!event.currentTarget.isConnected)return;
-          const shouldClose=!event.relatedTarget||!event.currentTarget.parentElement?.contains(event.relatedTarget);
-          onBlurSession(session,event.currentTarget,shouldClose);
+          const related=event.relatedTarget;
+          const shouldClose=!(related instanceof Node&&event.currentTarget.parentElement?.contains(related));
+          onBlurSession(session,event.currentTarget,shouldClose,related instanceof Element?related:null);
         }}
         aria-label="Edit Markdown block"
       />
       <WritingSuggestions text={text} caret={caret} spellCheck={spellCheck} grammarCheck={grammarCheck} onChange={onSuggestionChange} onAction={onSuggestionAction}/>
     </div>
   );
+}
+
+interface LiveBlockShellProps {
+  windowed:boolean;estimate:number;text:string;headings:WindowHeading[];
+  start:number;end:number;blockIndex:number;active:boolean;protectedHint:boolean;
+  onOpen:(element:HTMLElement,start:number,end:number,protectedHint:boolean)=>void;
+  children:ReactNode;
+}
+function LiveBlockShell({windowed,estimate,text,headings,start,end,blockIndex,active,protectedHint,onOpen,children}:LiveBlockShellProps){
+  const [hovered,setHovered]=useState(false);
+  const [focused,setFocused]=useState(false);
+  const [tapped,setTapped]=useState(false);
+  const blockElRef=useRef<HTMLElement|null>(null);
+  const pressingRef=useRef(false);
+  const tapStartRef=useRef<{id:number;x:number;y:number;moved:boolean}|null>(null);
+  useLayoutEffect(()=>{
+    let f2=0;
+    const f1=requestAnimationFrame(()=>{f2=requestAnimationFrame(()=>{if(blockElRef.current&&!pressingRef.current)blockElRef.current.dataset.liveMeasured='true';});});
+    return()=>{cancelAnimationFrame(f1);cancelAnimationFrame(f2);};
+  },[]);
+  useEffect(()=>{
+    if(active){setTapped(false);return;}
+    if(!blockElRef.current?.contains(document.activeElement))setFocused(false);
+  },[active]);
+  useEffect(()=>{
+    if(!tapped)return;
+    const clearOutside=(event:PointerEvent)=>{
+      const target=event.target instanceof Node?event.target:null;
+      if(target&&!blockElRef.current?.contains(target))setTapped(false);
+    };
+    document.addEventListener('pointerdown',clearOutside,true);
+    return()=>document.removeEventListener('pointerdown',clearOutside,true);
+  },[tapped]);
+  const revealed=!active&&(hovered||focused||tapped);
+  return <WindowedBlock blockRef={blockElRef} enabled={windowed&&!active} estimate={estimate} text={text} headings={headings} className="live-block" data-source-start={start} data-source-end={end} tabIndex={0} role="group" aria-label={`Editable block ${blockIndex+1}`}
+    onPointerEnter={event=>{blockElRef.current=event.currentTarget;if(event.pointerType==='mouse'&&event.buttons===0&&!document.querySelector('.is-panning'))setHovered(true);}}
+    onPointerMove={event=>{
+      blockElRef.current=event.currentTarget;
+      if(tapStartRef.current?.id===event.pointerId&&Math.hypot(event.clientX-tapStartRef.current.x,event.clientY-tapStartRef.current.y)>8)tapStartRef.current.moved=true;
+      if(event.pointerType==='mouse'&&event.buttons===0&&!hovered&&!document.querySelector('.is-panning'))setHovered(true);
+    }}
+    onPointerLeave={event=>{pressingRef.current=false;if(event.pointerType==='mouse')setHovered(false);}}
+    onPointerDown={event=>{
+      blockElRef.current=event.currentTarget;
+      pressingRef.current=true;
+      if(event.pointerType==='mouse')return;
+      tapStartRef.current={id:event.pointerId,x:event.clientX,y:event.clientY,moved:false};
+    }}
+    onPointerUp={event=>{
+      pressingRef.current=false;
+      if(event.pointerType==='mouse')return;
+      const tap=tapStartRef.current;tapStartRef.current=null;
+      if(active||!tap||tap.id!==event.pointerId||tap.moved||Math.hypot(event.clientX-tap.x,event.clientY-tap.y)>8)return;
+      if(document.querySelector('.is-panning')||window.getSelection()?.toString())return;
+      const target=event.target instanceof Element?event.target:null;
+      if(target?.closest('.live-block-edit,.live-active-block,.image-viewer,.reading-search,.media-dialog,.math-repair-panel'))return;
+      if(document.documentElement.dataset.fullscreen==='true'&&!target?.closest(fullscreenInteractiveSelector))return;
+      setTapped(true);
+    }}
+    onPointerCancel={()=>{pressingRef.current=false;tapStartRef.current=null;}}
+    onFocus={event=>{blockElRef.current=event.currentTarget;if(!pressingRef.current)setFocused(true);}}
+    onBlur={event=>{if(!event.currentTarget.contains(event.relatedTarget as Node|null))setFocused(false);}}
+    onDoubleClick={event=>{
+      if(active||(event.target as Element).closest('a,button,input,select,textarea'))return;
+      window.getSelection()?.removeAllRanges();onOpen(event.currentTarget,start,end,protectedHint);
+    }}
+    onKeyDown={event=>{if(!active&&event.target===event.currentTarget&&(event.key==='Enter'||event.key==='F2')){event.preventDefault();onOpen(event.currentTarget,start,end,protectedHint);}}}>
+    {revealed?<button type="button" className="live-block-edit" data-independent-zoom aria-label="Edit block" title="Edit block" onClick={event=>{
+      event.preventDefault();event.stopPropagation();
+      const owner=event.currentTarget.closest<HTMLElement>('.live-block');
+      if(owner)onOpen(owner,start,end,protectedHint);
+    }}><PencilSimpleIcon size={13} weight="bold" aria-hidden="true"/><span>Edit</span></button>:null}
+    {active?<ActiveBlockEditor/>:children}
+  </WindowedBlock>;
 }
 
 function translateRenderedRange(start:number,end:number,editing:EditingSession|null,syncedMarkdown:string):[number,number] {
@@ -115,6 +195,10 @@ export default function LiveEditor({markdown,onChange,documentPath,linkDocumentP
   const anchorTop=useRef<number|null>(null),editor=useRef<HTMLTextAreaElement>(null),rootRef=useRef<HTMLDivElement>(null);
   const pendingSelection=useRef<{start:number;end:number;direction?:'forward'|'backward'|'none'}|null>(null);
   const pendingBlockFocus=useRef<{offset:number}|'end'|null>(null);
+  const closeAnchorRef=useRef<CloseAnchor|null>(null);
+  const outsidePressRef=useRef<{active:boolean;deferredClose:boolean;target:HTMLElement|null;clientY:number|null;session:number;timer:number}>({active:false,deferredClose:false,target:null,clientY:null,session:0,timer:0});
+  const editSpanRef=useRef<EditSpan|null>(null);
+  const blockKeyState=useRef<{source:string;keys:Map<number,string>;seq:number}>({source:'',keys:new Map(),seq:0});
   const syncedMarkdownRef=useRef(markdown);
   if(!editing)syncedMarkdownRef.current=markdown;
   const savedSelection=useRef<{from:number;to:number;markdown:string}|null>(null);
@@ -140,44 +224,146 @@ export default function LiveEditor({markdown,onChange,documentPath,linkDocumentP
     savedSelection.current={from,to,markdown:doc};
   },[]);
 
-  const openDocBlock=useCallback((element:HTMLElement|null,start:number,end:number,baseDoc?:string,selection?:{start:number;end:number;direction?:'forward'|'backward'|'none'})=>{
+  useEffect(()=>{
+    const startSelect=(event:PointerEvent|MouseEvent)=>{
+      if('pointerType' in event&&event.pointerType!=='mouse')return;
+      if(event.button!==0)return;
+      const target=event.target instanceof Element?event.target:null;
+      if(target?.closest('.live-block-edit'))return;
+      document.documentElement.dataset.liveSelecting='true';
+    };
+    const endSelect=()=>{delete document.documentElement.dataset.liveSelecting;};
+    document.addEventListener('pointerdown',startSelect,true);
+    document.addEventListener('mousedown',startSelect,true);
+    document.addEventListener('pointerup',endSelect,true);
+    document.addEventListener('mouseup',endSelect,true);
+    document.addEventListener('pointercancel',endSelect,true);
+    window.addEventListener('blur',endSelect);
+    return()=>{
+      endSelect();
+      document.removeEventListener('pointerdown',startSelect,true);
+      document.removeEventListener('mousedown',startSelect,true);
+      document.removeEventListener('pointerup',endSelect,true);
+      document.removeEventListener('mouseup',endSelect,true);
+      document.removeEventListener('pointercancel',endSelect,true);
+      window.removeEventListener('blur',endSelect);
+    };
+  },[]);
+
+  const blockKeys=useMemo(()=>{
+    const state=blockKeyState.current;
+    if(state.source===renderedSource&&state.keys.size===blocks.length&&blocks.every(item=>state.keys.has(item.start)))return state.keys;
+    const previousSource=state.source,previousKeys=state.keys;
+    let diffStart=0,oldEnd=previousSource.length,newEnd=renderedSource.length;
+    const span=editSpanRef.current;
+    if(span&&previousSource===span.baseSource&&renderedSource.length-previousSource.length===span.newEnd-span.oldEnd){
+      diffStart=span.start;
+      oldEnd=span.oldEnd;
+      newEnd=span.newEnd;
+    }else{
+      while(diffStart<oldEnd&&diffStart<newEnd&&previousSource[diffStart]===renderedSource[diffStart])diffStart++;
+      while(oldEnd>diffStart&&newEnd>diffStart&&previousSource[oldEnd-1]===renderedSource[newEnd-1]){oldEnd--;newEnd--;}
+    }
+    editSpanRef.current=null;
+    const delta=newEnd-oldEnd;
+    const nextKeys=new Map<number,string>();
+    const used=new Set<string>();
+    for(const item of blocks){
+      let assigned:string|undefined;
+      if(item.start<=diffStart){
+        const candidate=previousKeys.get(item.start);
+        if(candidate&&!used.has(candidate))assigned=candidate;
+      }
+      if(!assigned&&item.start>=newEnd){
+        const candidate=previousKeys.get(item.start-delta);
+        if(candidate&&!used.has(candidate))assigned=candidate;
+      }
+      if(!assigned)assigned=`block-k-${++state.seq}`;
+      used.add(assigned);
+      nextKeys.set(item.start,assigned);
+    }
+    state.source=renderedSource;
+    state.keys=nextKeys;
+    return nextKeys;
+  },[renderedSource,blocks]);
+
+  const captureCloseAnchor=useCallback((target?:Element|null,clientY?:number|null)=>{
+    const area=editor.current;
+    const scroller=area?.closest<HTMLElement>('.android-reading,.reading-scroll,.preview-pane,.live-scroll');
+    if(!scroller||scroller.dataset.navigating)return;
+    const activeBlock=area?.closest<HTMLElement>('.live-block');
+    let anchorElement:HTMLElement|null=null;
+    if(target&&scroller.contains(target)&&!target.closest('.live-active-block')){
+      anchorElement=target.closest<HTMLElement>('.live-block')??(target instanceof HTMLElement?target:target.parentElement);
+    }
+    if(!anchorElement&&activeBlock){
+      const activeBounds=activeBlock.getBoundingClientRect(),scrollerBounds=scroller.getBoundingClientRect();
+      const nextBlock=activeBlock.nextElementSibling instanceof HTMLElement?activeBlock.nextElementSibling:null;
+      if(typeof clientY==='number'&&clientY>activeBounds.bottom&&nextBlock)anchorElement=nextBlock;
+      else if(activeBounds.top>=scrollerBounds.top-4)anchorElement=activeBlock;
+      else if(nextBlock)anchorElement=nextBlock;
+      else anchorElement=activeBlock;
+    }
+    if(anchorElement?.isConnected)closeAnchorRef.current={scroller,element:anchorElement,top:anchorElement.getBoundingClientRect().top};
+  },[]);
+
+  const closeEditor=useCallback((target?:Element|null,clientY?:number|null)=>{
+    if(typingFrame.current){cancelAnimationFrame(typingFrame.current);typingFrame.current=0;}
+    window.clearTimeout(outsidePressRef.current.timer);
+    outsidePressRef.current.active=false;
+    outsidePressRef.current.deferredClose=false;
+    captureCloseAnchor(target,clientY);
+    latestRef.current.editing=null;
+    setEditing(null);
+  },[captureCloseAnchor]);
+
+  const resetOutsidePress=useCallback((session:number)=>{
+    window.clearTimeout(outsidePressRef.current.timer);
+    outsidePressRef.current={active:false,deferredClose:false,target:null,clientY:null,session,timer:0};
+    closeAnchorRef.current=null;
+  },[]);
+
+  const openDocBlock=useCallback((element:HTMLElement|null,start:number,end:number,baseDoc?:string,selection?:{start:number;end:number;direction?:'forward'|'backward'|'none'},protectedHint?:boolean)=>{
     const {editing:currentEditing,markdown:latestMarkdown,sourceAnalysis:latestAnalysis}=latestRef.current;
     const resolvedDoc=baseDoc??(currentEditing?syncedMarkdownRef.current:latestMarkdown);
+    const session=++sessionCounter.current;
+    resetOutsidePress(session);
     anchorTop.current=element?element.getBoundingClientRect().top:null;
     pendingSelection.current=selection??null;
-    const analysis=resolvedDoc===latestAnalysis.source?latestAnalysis.analysis:analyzeDocument(resolvedDoc);
     const text=resolvedDoc.slice(start,end);
-    const protectedBlock=analysis.tree.children.some(node=>['code','math','html','definition'].includes(node.type)&&(node.position?.start.offset??-1)>=start&&(node.position?.end.offset??Infinity)<=end);
-    const nextSession:EditingSession={session:++sessionCounter.current,prefix:resolvedDoc.slice(0,start),suffix:resolvedDoc.slice(end),baseMarkdown:resolvedDoc,baseSplitEnd:end,protectedBlock};
+    const protectedBlock=protectedHint??(resolvedDoc===latestAnalysis.source?latestAnalysis.analysis:analyzeDocument(resolvedDoc)).tree.children.some(node=>['code','math','html','definition'].includes(node.type)&&(node.position?.start.offset??-1)>=start&&(node.position?.end.offset??Infinity)<=end);
+    const nextSession:EditingSession={session,prefix:resolvedDoc.slice(0,start),suffix:resolvedDoc.slice(end),baseMarkdown:resolvedDoc,baseSplitEnd:end,protectedBlock};
     syncedMarkdownRef.current=resolvedDoc;
     latestRef.current.editing=nextSession;
     latestRef.current.draftText=text;
     setCaret(selection?.start??0);
     setDraftText(text);
     setEditing(nextSession);
-  },[]);
+  },[resetOutsidePress]);
 
-  const openRenderedBlock=useCallback((element:HTMLElement|null,renderedStart:number,renderedEnd:number)=>{
+  const openRenderedBlock=useCallback((element:HTMLElement|null,renderedStart:number,renderedEnd:number,protectedHint?:boolean)=>{
     const {editing:currentEditing,markdown:latestMarkdown}=latestRef.current;
     const activeDoc=currentEditing?syncedMarkdownRef.current:latestMarkdown;
     const [start,end]=translateRenderedRange(renderedStart,renderedEnd,currentEditing,activeDoc);
-    openDocBlock(element,start,end,activeDoc);
+    openDocBlock(element,start,end,activeDoc,undefined,protectedHint);
   },[openDocBlock]);
 
   const openInsertedBlock=useCallback((baseDoc:string,insertPos:number,insertAfter:number|'end')=>{
+    const session=++sessionCounter.current;
+    resetOutsidePress(session);
     anchorTop.current=null;
     pendingSelection.current={start:0,end:0};
     setCaret(0);
     const head=baseDoc.slice(0,insertPos),tail=baseDoc.slice(insertPos);
     const sepBefore=!head.length||head.endsWith('\n\n')?'':head.endsWith('\n')?'\n':'\n\n';
     const suffix=!tail.trim()?(tail.includes('\n')?'\n':''):tail.startsWith('\n\n')?tail:tail.startsWith('\n')?'\n'+tail:'\n\n'+tail;
-    const nextSession:EditingSession={session:++sessionCounter.current,prefix:head+sepBefore,suffix,baseMarkdown:baseDoc,baseSplitEnd:insertPos,protectedBlock:false,insertAfter};
+    const nextSession:EditingSession={session,prefix:head+sepBefore,suffix,baseMarkdown:baseDoc,baseSplitEnd:insertPos,protectedBlock:false,insertAfter};
     syncedMarkdownRef.current=baseDoc;
     latestRef.current.editing=nextSession;
     latestRef.current.draftText='';
     setDraftText('');
     setEditing(nextSession);
-  },[]);
+  },[resetOutsidePress]);
 
   const appendTrailingBlock=useCallback(()=>{
     const {editing:active,markdown:latestMarkdown,sourceAnalysis:latestAnalysis}=latestRef.current;
@@ -187,12 +373,13 @@ export default function LiveEditor({markdown,onChange,documentPath,linkDocumentP
     const bodyHasNodes=analysis.tree.children.some(node=>node.position?.start.offset!==undefined);
     if(!baseDoc.trim()||!bodyHasNodes){
       const start=analysis.bodyBlocks[0]?.start??0;
-      openDocBlock(rootRef.current?.querySelector<HTMLElement>('.live-block')??null,start,baseDoc.length,baseDoc,{start:0,end:0});
+      openDocBlock(rootRef.current?.querySelector<HTMLElement>('.live-block')??null,start,baseDoc.length,baseDoc,{start:0,end:0},false);
       return;
     }
     const insertPos=baseDoc.replace(/[ \t]*\n+$/,'').length;
     openInsertedBlock(baseDoc,insertPos,'end');
   },[openDocBlock,openInsertedBlock]);
+
   useLayoutEffect(()=>{
     const doc=rootRef.current;if(!doc)return;
     const scroller=doc.closest<HTMLElement>('.android-reading,.reading-scroll,.preview-pane,.live-scroll');
@@ -216,6 +403,12 @@ export default function LiveEditor({markdown,onChange,documentPath,linkDocumentP
   useLayoutEffect(()=>{
     if(!editing){
       lastHandledSession.current=0;
+      const pendingClose=closeAnchorRef.current;closeAnchorRef.current=null;
+      if(pendingClose&&pendingClose.scroller.isConnected&&!pendingClose.scroller.dataset.navigating&&pendingClose.element.isConnected){
+        if(pendingClose.scroller.matches('.android-reading'))refreshDocumentExtent(pendingClose.scroller);
+        const delta=pendingClose.element.getBoundingClientRect().top-pendingClose.top;
+        if(Math.abs(delta)>.5)pendingClose.scroller.scrollTop+=delta;
+      }
       const target=pendingBlockFocus.current;
       if(target!==null){
         pendingBlockFocus.current=null;
@@ -241,6 +434,7 @@ export default function LiveEditor({markdown,onChange,documentPath,linkDocumentP
       if(!isNewSession)return;
       if(anchor===null){
         if(scroller){
+          if(scroller.matches('.android-reading'))refreshDocumentExtent(scroller);
           const box=area.getBoundingClientRect(),view=scroller.getBoundingClientRect();
           if(view.height>0&&(box.bottom>view.bottom-24||box.top<view.top+24)){
             scroller.scrollTop+=box.top<view.top+24?box.top-view.top-32:box.bottom-view.bottom+48;
@@ -248,22 +442,25 @@ export default function LiveEditor({markdown,onChange,documentPath,linkDocumentP
         }
         return;
       }
-      const hold=()=>{const delta=area.getBoundingClientRect().top-anchor;if(scroller&&Math.abs(delta)>.5)scroller.scrollTop+=delta;};
+      let frames=0,frame=0,stopped=false,writingScroll=false;const stop=()=>{stopped=true;};
+      const hold=()=>{if(scroller?.matches('.android-reading'))refreshDocumentExtent(scroller);const delta=area.getBoundingClientRect().top-anchor;if(scroller&&Math.abs(delta)>.5){writingScroll=true;scroller.scrollTop+=delta;writingScroll=false;}};
       hold();
-      let frames=0,frame=0,stopped=false;const stop=()=>{stopped=true;};
-      const inputs=['wheel','touchstart','keydown'] as const;
+      const onScroll=()=>{if(!writingScroll)stopped=true;};
+      const inputs=['wheel','touchstart','pointerdown','keydown','input'] as const;
       inputs.forEach(name=>window.addEventListener(name,stop,{capture:true,passive:true}));
+      scroller?.addEventListener('scroll',onScroll,{passive:true});
       const tick=()=>{if(stopped||!area.isConnected)return;hold();if(++frames<24)frame=requestAnimationFrame(tick);};frame=requestAnimationFrame(tick);
-      return()=>{cancelAnimationFrame(frame);inputs.forEach(name=>window.removeEventListener(name,stop,{capture:true}));};
+      return()=>{cancelAnimationFrame(frame);scroller?.removeEventListener('scroll',onScroll);inputs.forEach(name=>window.removeEventListener(name,stop,{capture:true}));};
     }
     if(anchor!==null&&scroller){
+      if(scroller.matches('.android-reading'))refreshDocumentExtent(scroller);
       const initialDelta=area.getBoundingClientRect().top-anchor;
       if(Math.abs(initialDelta)>.5)scroller.scrollTop+=initialDelta;
     }
     if(!scroller)return;
     const reducedMotion=document.documentElement.dataset.motion==='off'||document.documentElement.dataset.reduceMotion==='true'||(typeof window.matchMedia==='function'&&window.matchMedia('(prefers-reduced-motion: reduce)').matches);
     if(reducedMotion){
-      const align=()=>{const delta=liveEditorCenterDelta(area,scroller,false);if(Math.abs(delta)>.5)scroller.scrollTop+=delta;};
+      const align=()=>{if(scroller.matches('.android-reading'))refreshDocumentExtent(scroller);const delta=liveEditorCenterDelta(area,scroller,false);if(Math.abs(delta)>.5)scroller.scrollTop+=delta;};
       align();
       let frames=0,frame=0,stopped=false;const stop=()=>{stopped=true;};
       const inputs=['wheel','touchstart'] as const;
@@ -276,6 +473,7 @@ export default function LiveEditor({markdown,onChange,documentPath,linkDocumentP
     inputs.forEach(name=>window.addEventListener(name,stop,{capture:true,passive:true}));
     const glide=(now:number)=>{
       if(stopped||!area.isConnected)return;
+      if(scroller.matches('.android-reading'))refreshDocumentExtent(scroller);
       const elapsed=Math.max(8,Math.min(50,now-lastTime));lastTime=now;
       const delta=liveEditorCenterDelta(area,scroller,false);
       if(Math.abs(delta)<=.75){
@@ -289,6 +487,7 @@ export default function LiveEditor({markdown,onChange,documentPath,linkDocumentP
     frame=requestAnimationFrame(glide);
     return()=>{cancelAnimationFrame(frame);inputs.forEach(name=>window.removeEventListener(name,stop,{capture:true}));};
   },[editing,activeTypewriter,rememberSelection]);
+
   useLayoutEffect(()=>{
     const selection=pendingSelection.current,area=editor.current;
     if(!editing||!selection||!area)return;
@@ -299,6 +498,7 @@ export default function LiveEditor({markdown,onChange,documentPath,linkDocumentP
     setCaret(nextStart);
     rememberSelection(area,latestRef.current.editing);
   },[editing,draftText,rememberSelection]);
+
   useEffect(()=>()=>{if(typingFrame.current)cancelAnimationFrame(typingFrame.current);},[]);
   const syncActiveCaretCenter=useCallback(()=>{
     if(!latestRef.current.activeTypewriter)return;
@@ -308,19 +508,85 @@ export default function LiveEditor({markdown,onChange,documentPath,linkDocumentP
       const area=editor.current;if(!area||!area.isConnected)return;
       const scroller=area.closest<HTMLElement>('.android-reading,.reading-scroll,.preview-pane,.live-scroll');
       if(!scroller)return;
+      if(scroller.matches('.android-reading'))refreshDocumentExtent(scroller);
       const delta=liveEditorCenterDelta(area,scroller,area.value.includes('\n'));
       if(Math.abs(delta)>1)scroller.scrollTop+=delta;
     });
   },[]);
 
+  const isEditing=Boolean(editing);
+  useEffect(()=>{
+    if(!isEditing)return;
+    const finish=()=>{
+      const state=outsidePressRef.current;
+      window.clearTimeout(state.timer);
+      const {deferredClose,target,clientY,session}=state;
+      const focusLeft=document.activeElement!==editor.current&&!editor.current?.parentElement?.contains(document.activeElement);
+      state.active=false;state.deferredClose=false;state.target=null;state.clientY=null;state.timer=0;
+      const current=latestRef.current.editing;
+      if(current&&current.session===session&&(deferredClose||focusLeft))closeEditor(target,clientY);
+    };
+    const beginPress=(event:PointerEvent|MouseEvent)=>{
+      const target=event.target instanceof Element?event.target as HTMLElement:null;
+      if(target?.closest('.live-active-block')){
+        window.clearTimeout(outsidePressRef.current.timer);
+        outsidePressRef.current.active=false;
+        outsidePressRef.current.deferredClose=false;
+        return;
+      }
+      window.clearTimeout(outsidePressRef.current.timer);
+      outsidePressRef.current.active=true;
+      outsidePressRef.current.target=target;
+      outsidePressRef.current.clientY=event.clientY;
+      outsidePressRef.current.session=latestRef.current.editing?.session??sessionCounter.current;
+    };
+    const onPointerUp=(event:PointerEvent)=>{
+      if(!outsidePressRef.current.active)return;
+      window.clearTimeout(outsidePressRef.current.timer);
+      outsidePressRef.current.clientY=event.clientY;
+      // Touch browsers synthesize mousedown -> blur -> mouseup -> click after
+      // pointerup; keep deferral alive until that click dispatches.
+      outsidePressRef.current.timer=window.setTimeout(finish,event.pointerType==='touch'?80:0);
+    };
+    const onMouseUp=(event:MouseEvent)=>{
+      if(!outsidePressRef.current.active)return;
+      window.clearTimeout(outsidePressRef.current.timer);
+      outsidePressRef.current.clientY=event.clientY;
+      outsidePressRef.current.timer=window.setTimeout(finish,0);
+    };
+    const onClick=(event:MouseEvent)=>{
+      if(!outsidePressRef.current.active)return;
+      const target=event.target instanceof HTMLElement?event.target:null;
+      if(target?.closest('.live-active-block'))return;
+      if(target)outsidePressRef.current.target=target;
+      outsidePressRef.current.deferredClose=true;
+      outsidePressRef.current.clientY=event.clientY;
+      window.clearTimeout(outsidePressRef.current.timer);
+      outsidePressRef.current.timer=window.setTimeout(finish,0);
+    };
+    const onPointerCancel=()=>{if(outsidePressRef.current.active)finish();};
+    document.addEventListener('pointerdown',beginPress,true);
+    document.addEventListener('mousedown',beginPress,true);
+    document.addEventListener('pointerup',onPointerUp,true);
+    document.addEventListener('mouseup',onMouseUp,true);
+    document.addEventListener('pointercancel',onPointerCancel,true);
+    document.addEventListener('click',onClick,true);
+    return()=>{
+      window.clearTimeout(outsidePressRef.current.timer);
+      document.removeEventListener('pointerdown',beginPress,true);
+      document.removeEventListener('mousedown',beginPress,true);
+      document.removeEventListener('pointerup',onPointerUp,true);
+      document.removeEventListener('mouseup',onMouseUp,true);
+      document.removeEventListener('pointercancel',onPointerCancel,true);
+      document.removeEventListener('click',onClick,true);
+    };
+  },[isEditing,closeEditor]);
+
   useEffect(()=>{
     const active=latestRef.current.editing;
-    if(active&&markdown!==syncedMarkdownRef.current){
-      latestRef.current.editing=null;
-      setEditing(null);
-    }
+    if(active&&markdown!==syncedMarkdownRef.current)closeEditor();
     if(savedSelection.current&&savedSelection.current.markdown!==markdown)savedSelection.current=null;
-  },[markdown]);
+  },[markdown,closeEditor]);
 
   useEffect(()=>{
     if(!editing)return;
@@ -361,7 +627,7 @@ export default function LiveEditor({markdown,onChange,documentPath,linkDocumentP
     };
     const onContainerDoubleClick=(event:MouseEvent)=>{
       const target=event.target instanceof Element?event.target:null;
-      if(!target||target.closest('.live-block,.live-active-block,a,button,input,select,textarea,.reading-search,.image-viewer,[data-frontmatter-properties],.document-properties'))return;
+      if(!target||target.closest('.live-block,.live-active-block,a,button,input,select,textarea,.reading-search,.image-viewer,.media-dialog,.math-repair-panel,[data-frontmatter-properties],.document-properties'))return;
       const doc=latestRef.current.editing?syncedMarkdownRef.current:latestRef.current.markdown;
       if(!doc.trim())return;
       const allBlocks=root.querySelectorAll<HTMLElement>('.live-block');
@@ -387,15 +653,15 @@ export default function LiveEditor({markdown,onChange,documentPath,linkDocumentP
     rememberSelection(area,latestRef.current.editing);
   },[rememberSelection]);
 
-  const blurSession=useCallback((session:number,area:HTMLTextAreaElement,shouldClose:boolean)=>{
+  const blurSession=useCallback((session:number,area:HTMLTextAreaElement,shouldClose:boolean,relatedTarget:Element|null)=>{
     if(latestRef.current.editing?.session===session)rememberSelection(area,latestRef.current.editing);
     if(!shouldClose)return;
-    setEditing(current=>{
-      if(current?.session!==session)return current;
-      if(latestRef.current.editing?.session===session)latestRef.current.editing=null;
-      return null;
-    });
-  },[rememberSelection]);
+    if(outsidePressRef.current.active&&outsidePressRef.current.session===session){
+      outsidePressRef.current.deferredClose=true;
+      return;
+    }
+    if(latestRef.current.editing?.session===session)closeEditor(relatedTarget);
+  },[rememberSelection,closeEditor]);
 
   const copy=useCallback((event:ClipboardEvent)=>{
     if((event.target as Element).closest('textarea'))return;
@@ -415,6 +681,7 @@ export default function LiveEditor({markdown,onChange,documentPath,linkDocumentP
     if(active.insertAfter!==undefined&&text===''){
       const changed=syncedMarkdownRef.current!==active.baseMarkdown;
       syncedMarkdownRef.current=active.baseMarkdown;
+      editSpanRef.current=null;
       const pos=Math.max(0,Math.min(active.baseSplitEnd,active.baseMarkdown.length));
       savedSelection.current={from:pos,to:pos,markdown:active.baseMarkdown};
       if(changed)emitChange(active.baseMarkdown);
@@ -435,6 +702,12 @@ export default function LiveEditor({markdown,onChange,documentPath,linkDocumentP
       const to=Math.max(from,Math.min(savedSelection.current.to+delta,max));
       savedSelection.current={from,to,markdown:nextMarkdown};
     }
+    editSpanRef.current={
+      baseSource:active.baseMarkdown,
+      start:Math.min(prefix.length,active.baseSplitEnd),
+      oldEnd:active.baseSplitEnd,
+      newEnd:active.baseSplitEnd+nextMarkdown.length-active.baseMarkdown.length,
+    };
     if(prefix!==active.prefix){
       const nextSession={...active,prefix};
       latestRef.current.editing=nextSession;
@@ -526,8 +799,7 @@ export default function LiveEditor({markdown,onChange,documentPath,linkDocumentP
       rememberSelection(area,active);
       event.preventDefault();event.stopPropagation();
       pendingBlockFocus.current=active.insertAfter!==undefined&&currentDraft===''?(active.insertAfter==='end'?'end':{offset:active.insertAfter}):{offset:active.prefix.length};
-      latestRef.current.editing=null;
-      setEditing(null);
+      closeEditor();
       return;
     }
     if(event.key==='Enter'&&(event.metaKey||event.ctrlKey)&&!event.altKey&&!event.shiftKey){
@@ -596,7 +868,7 @@ export default function LiveEditor({markdown,onChange,documentPath,linkDocumentP
         return;
       }
     }
-  },[update,openInsertedBlock,openDocBlock,rememberSelection]);
+  },[update,closeEditor,openInsertedBlock,openDocBlock,rememberSelection]);
 
   const activeDraftValue=useMemo<ActiveDraftContextValue|null>(
     ()=>editing?{
@@ -630,18 +902,17 @@ export default function LiveEditor({markdown,onChange,documentPath,linkDocumentP
     const block=blocks[low],start=block.start,end=entry.node.position?.end.offset??block.end;
     const active=!!editing&&editing.insertAfter===undefined&&block.start===editing.prefix.length;
     const insertedBelow=!!editing&&editing.insertAfter===block.start;
+    const blockKey=blockKeys.get(block.start)??`block-${entry.key}`;
+    const protectedHint=['code','math','html','definition'].includes(entry.node.type);
     return (
-      <Fragment key={`block-${entry.key}`}>
-        <WindowedBlock enabled={entry.windowed&&!active} estimate={entry.estimate} text={entry.text} headings={entry.headings} className="live-block" data-source-start={start} data-source-end={end} tabIndex={0} role="group" aria-label={`Editable block ${low+1}`} onDoubleClick={(event:ReactMouseEvent<HTMLElement>)=>{
-          if(active||(event.target as Element).closest('a,button,input,select,textarea'))return;
-          window.getSelection()?.removeAllRanges();openRenderedBlock(event.currentTarget,start,end);
-        }} onKeyDown={event=>{if(!active&&event.target===event.currentTarget&&(event.key==='Enter'||event.key==='F2')){event.preventDefault();openRenderedBlock(event.currentTarget,start,end);}}}>
-          {active?<ActiveBlockEditor/>:entry.content}
-        </WindowedBlock>
+      <Fragment key={blockKey}>
+        <LiveBlockShell windowed={entry.windowed} estimate={entry.estimate} text={entry.text} headings={entry.headings} start={start} end={end} blockIndex={low} active={active} protectedHint={protectedHint} onOpen={openRenderedBlock}>
+          {entry.content}
+        </LiveBlockShell>
         {insertedBelow&&<section className="live-block" role="group" aria-label="New Markdown block"><ActiveBlockEditor/></section>}
       </Fragment>
     );
-  },[blocks,editing,openRenderedBlock]);
+  },[blocks,blockKeys,editing,openRenderedBlock]);
 
   const previewChange=useCallback((next:string)=>{
     const {editing:currentEditing,onChange:emitChange,renderedSource:frozenSource}=latestRef.current;
@@ -652,16 +923,20 @@ export default function LiveEditor({markdown,onChange,documentPath,linkDocumentP
     while(start<end&&start<nextEnd&&frozenSource[start]===next[start])start++;
     while(end>start&&nextEnd>start&&frozenSource[end-1]===next[nextEnd-1]){end--;nextEnd--;}
     const [from,to]=translateRenderedRange(start,end,currentEditing,activeDoc);
+    captureCloseAnchor(outsidePressRef.current.target,outsidePressRef.current.clientY);
+    window.clearTimeout(outsidePressRef.current.timer);
+    outsidePressRef.current.active=false;
+    outsidePressRef.current.deferredClose=false;
     latestRef.current.editing=null;
     setEditing(null);
     emitChange(activeDoc.slice(0,from)+next.slice(start,nextEnd)+activeDoc.slice(to));
-  },[]);
+  },[captureCloseAnchor]);
 
   return <ActiveDraftContext.Provider value={activeDraftValue}>
     <div ref={rootRef} className="live-document" onCopy={copy} onDragStart={dragStart}>
-      {!frontmatter&&!renderedSource.trim()?(editing?<ActiveBlockEditor/>:<section className="live-block" data-source-start={0} data-source-end={markdown.length} tabIndex={0} role="group" aria-label="Editable block 1" onDoubleClick={event=>openDocBlock(event.currentTarget,0,latestRef.current.markdown.length,latestRef.current.markdown)} onKeyDown={event=>{if(event.key==='Enter'||event.key==='F2'){event.preventDefault();openDocBlock(event.currentTarget,0,latestRef.current.markdown.length,latestRef.current.markdown);}}}/> ):<>
+      {!frontmatter&&!renderedSource.trim()?(editing?<ActiveBlockEditor/>:<section className="live-block" data-source-start={0} data-source-end={markdown.length} tabIndex={0} role="group" aria-label="Editable block 1" onClick={event=>openDocBlock(event.currentTarget,0,latestRef.current.markdown.length,latestRef.current.markdown,undefined,false)} onDoubleClick={event=>openDocBlock(event.currentTarget,0,latestRef.current.markdown.length,latestRef.current.markdown,undefined,false)} onKeyDown={event=>{if(event.key==='Enter'||event.key==='F2'){event.preventDefault();openDocBlock(event.currentTarget,0,latestRef.current.markdown.length,latestRef.current.markdown,undefined,false);}}}/> ):<>
         <MarkdownPreview markdown={renderedSource} onChange={previewChange} onNotice={onNotice} documentPath={documentPath} linkDocumentPath={linkDocumentPath} python={python} dark={dark} trustedImageHosts={trustedImageHosts} onTrustImageHost={onTrustImageHost} renderBlock={renderBlock} fullDocumentAccessibility={fullDocumentAccessibility} sourceAnalysis={sourceAnalysis}/>
-        {!hasBodyNodes?(editing?<ActiveBlockEditor/>:<section className="live-block" data-source-start={blocks[0].start} data-source-end={markdown.length} tabIndex={0} role="group" aria-label="Editable block 1" onDoubleClick={event=>openDocBlock(event.currentTarget,blocks[0].start,latestRef.current.markdown.length,latestRef.current.markdown)} onKeyDown={event=>{if(event.key==='Enter'||event.key==='F2'){event.preventDefault();openDocBlock(event.currentTarget,blocks[0].start,latestRef.current.markdown.length,latestRef.current.markdown);}}}/> ):editing?.insertAfter==='end'&&<section className="live-block" role="group" aria-label="New Markdown block"><ActiveBlockEditor/></section>}
+        {!hasBodyNodes?(editing?<ActiveBlockEditor/>:<section className="live-block" data-source-start={blocks[0].start} data-source-end={markdown.length} tabIndex={0} role="group" aria-label="Editable block 1" onClick={event=>openDocBlock(event.currentTarget,blocks[0].start,latestRef.current.markdown.length,latestRef.current.markdown,undefined,false)} onDoubleClick={event=>openDocBlock(event.currentTarget,blocks[0].start,latestRef.current.markdown.length,latestRef.current.markdown,undefined,false)} onKeyDown={event=>{if(event.key==='Enter'||event.key==='F2'){event.preventDefault();openDocBlock(event.currentTarget,blocks[0].start,latestRef.current.markdown.length,latestRef.current.markdown,undefined,false);}}}/> ):editing?.insertAfter==='end'&&<section className="live-block" role="group" aria-label="New Markdown block"><ActiveBlockEditor/></section>}
       </>}
     </div>
   </ActiveDraftContext.Provider>;

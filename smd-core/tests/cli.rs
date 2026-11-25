@@ -137,6 +137,89 @@ fn cli_export_normalizes_spaced_aliased_portable_and_section_wikilinks_without_c
     }
 }
 
+#[test]
+fn cli_export_renders_vector_diagrams_sized_images_multiline_code_and_page_breaks() {
+    let w = Workspace::new();
+    let badge = b"<svg xmlns=\"http://www.w3.org/2000/svg\" width=\"120\" height=\"40\"><rect width=\"120\" height=\"40\" fill=\"#386a57\"/></svg>";
+    fs::write(w.file("badge.svg"), badge).unwrap();
+    fs::create_dir_all(w.file("assets")).unwrap();
+    use base64::Engine;
+    let plot_png = base64::engine::general_purpose::STANDARD
+        .decode("iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg==")
+        .unwrap();
+    fs::write(w.file("assets/plot.png"), &plot_png).unwrap();
+    let note = [
+        "# CLI Complete Export",
+        "",
+        "![[badge.svg|180]]",
+        "",
+        "<img src=\"badge.svg\" width=\"120px\" />",
+        "",
+        "<img alt=\"A > B\" title='Threshold > 0' src=\"assets/plot.png\" width=\"300\">",
+        "",
+        "```smd-tree",
+        r#"{"values":["8","4","12"]}"#,
+        "```",
+        "",
+        "```smd-diagram",
+        r#"{"width":240,"height":100,"nodes":[{"id":"a","label":"A","x":60,"y":50},{"id":"b","label":"B","x":180,"y":50}],"edges":[{"from":"a","to":"b"}]}"#,
+        "```",
+        "",
+        "```svg",
+        "<svg viewBox=\"0 0 80 30\"><rect width=\"80\" height=\"30\" fill=\"#2463b3\"/></svg>",
+        "```",
+        "",
+        "\\newpage",
+        "",
+        "SECOND_CLI_PAGE",
+        "",
+        "```python",
+        "def doc():",
+        "    \"\"\"line one",
+        "    line two\"\"\"",
+        "    return 1",
+        "```",
+    ].join("\n");
+    fs::write(w.file("rich.md"), note).unwrap();
+    success(w.run(&["export", "rich.md", "rich.pdf"]));
+    pdf(&w.file("rich.pdf"));
+    let pdf_bytes = fs::read(w.file("rich.pdf")).unwrap();
+    let pdf_latin1 = String::from_utf8_lossy(&pdf_bytes);
+    assert!(
+        pdf_latin1.contains("/Subtype /Image") || pdf_latin1.contains("/Subtype/Image"),
+        "Quoted-attribute raster HTML <img> must be embedded in CLI PDF"
+    );
+    let page_objects: usize = [b"/Type /Page".as_slice(), b"/Type/Page".as_slice()]
+        .into_iter()
+        .map(|needle| {
+            pdf_bytes
+                .windows(needle.len())
+                .enumerate()
+                .filter(|(i, win)| *win == needle && !pdf_bytes.get(i + needle.len()).is_some_and(|b| b.is_ascii_alphanumeric()))
+                .count()
+        })
+        .sum();
+    assert!(page_objects >= 2, "Expected at least 2 PDF pages, got {page_objects}");
+    if let Ok(out) = Command::new("pdftotext").arg(w.file("rich.pdf")).arg("-").output() {
+        if cfg!(target_os = "linux") && std::env::var_os("SUPERMD_TEST_NON_POPPLER").is_none() {
+            assert!(out.status.success());
+        }
+        if out.status.success() {
+            let text = String::from_utf8_lossy(&out.stdout);
+            let pages: Vec<&str> = text.split('\u{000c}').filter(|p| !p.trim().is_empty()).collect();
+            assert!(pages.len() >= 2);
+            let last = pages.last().unwrap();
+            assert!(last.contains("SECOND_CLI_PAGE"));
+            assert!(last.contains("line two"));
+            assert!(!pages[0].contains("SECOND_CLI_PAGE"));
+        }
+    }
+
+    fs::write(w.file("unsafe.md"), "```svg\n<svg xmlns=\"http://www.w3.org/2000/svg\"><script>alert(1)</script></svg>\n```").unwrap();
+    assert!(!w.run(&["export", "unsafe.md", "unsafe.pdf"]).status.success());
+    assert!(!w.file("unsafe.pdf").exists());
+}
+
 fn inflate_pdf_streams(bytes: &[u8]) -> String {
     use std::io::Read;
     let mut text = String::from_utf8_lossy(bytes).into_owned();

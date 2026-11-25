@@ -372,9 +372,12 @@ export function normalizeMarkdownSource(markdown:string, options:NormalizeMarkdo
   add(stripPercentComments(value));
   let ranges=unmaskedRangesFromMask(computeCodeAndMathMask(value));
   const addUnmasked=(regex:RegExp,replacement:(...args:any[])=>string)=>{const next=unmaskedRegexStage(value,ranges,regex,replacement);ranges=next.ranges;add(next.stage);};
-  addUnmasked(/!\[\[([^\[\r\n\]|]+)(?:\|([^\r\n\]]+))?\]\]/g,(_all,rawPath:string,label?:string)=>{
-    const path=label!==undefined&&rawPath.endsWith('\\')?rawPath.slice(0,-1):rawPath;
-    return `![${label??path}](${encodeLinks?encodeMarkdownDestination(path.trim()):encodeURI(path)})`;
+  addUnmasked(/!\[\[([^\[\r\n\]|]+)(?:\|([^\r\n\]]+))?\]\]/g,(_all,rawPath:string,spec?:string)=>{
+    const path=spec!==undefined&&rawPath.endsWith('\\')?rawPath.slice(0,-1):rawPath;
+    const sized=spec&&/^(?:(.*?)(?:\\)?\|)?\s*(0*[1-9]\d*(?:\.\d+)?)\s*(?:x\s*\d+(?:\.\d+)?\s*)?$/i.exec(spec);
+    const alt=sized?(sized[1]?.trim()||path):(spec??path);
+    const dest=encodeLinks?encodeMarkdownDestination(path.trim()):encodeURI(path);
+    return `![${alt}](${dest})${sized?`{width=${sized[2]}}`:''}`;
   });
   addUnmasked(/\[\[([^\[\r\n\]]+?)\]\]/g,(all,inner:string)=>formatWikilinkMarkdown(inner,encodeLinks)??all);
   if(encodeLinks){
@@ -384,6 +387,24 @@ export function normalizeMarkdownSource(markdown:string, options:NormalizeMarkdo
   return {value,originalOffset(offset){for(let i=stages.length-1;i>=0;i--)offset=stages[i].originalOffset(offset);return offset;}};
 }
 export function normalizeCallouts(markdown:string):string{return normalizeMarkdownSource(markdown,{encodeLinkDestinations:true}).value;}
+
+export function remarkImageAttributes() {
+  return (tree:any)=>{
+    visit(tree,(parent:any)=>{
+      if(!Array.isArray(parent.children))return;
+      for(let i=0;i<parent.children.length-1;i++){
+        const current=parent.children[i],next=parent.children[i+1];
+        if((current?.type==='image'||current?.type==='imageReference')&&next?.type==='text'&&typeof next.value==='string'){
+          const stripped=next.value.replace(/^\{[^}\r\n]*\b(?:width|zoom)\s*=\s*[^}\r\n]+\}/i,'');
+          if(stripped!==next.value){
+            if(stripped)parent.children[i+1]={...next,value:stripped};
+            else parent.children.splice(i+1,1);
+          }
+        }
+      }
+    });
+  };
+}
 
 export function remarkSourceSyntax(this:any){
   const parser=this.parser;
