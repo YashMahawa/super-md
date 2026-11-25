@@ -428,6 +428,30 @@ class StudioTest(unittest.TestCase):
         self.assertEqual(chosen, sys.executable)
         self.assertEqual([item["path"] for item in studio.python_choices], [sys.executable])
 
+    def test_default_python_selection_and_refresh_publish_discovered_choices(self):
+        studio = self.studio
+        studio.settings["python"] = ""
+        choices = [{"path": sys.executable, "label": "Virtual environment 3.13.0", "detail": ".venv · numpy + matplotlib ready",
+                    "matplotlib": True, "managed": False, "venv": True, "venvModule": True}]
+        pending = []
+        with patch.object(studio, "_submit", side_effect=lambda action, done, *_: pending.append((action, done))), \
+             patch("python_runtime.default_python", return_value=sys.executable) as default_python, \
+             patch("python_runtime.discover", return_value=choices) as discover:
+            studio._choose_default_python()
+            action, done = pending.pop()
+            done(action(), None)
+            default_python.assert_called_once_with(studio.data / "python-env")
+            self.assertEqual(studio.settings["python"], sys.executable)
+
+            studio.refreshPython()
+            self.assertTrue(studio.pythonBusy)
+            action, done = pending.pop()
+            done(action(), None)
+            discover.assert_called_once()
+            self.assertFalse(studio.pythonBusy)
+            self.assertEqual(json.loads(studio.pythonChoices), choices)
+            self.assertEqual(studio.pythonStatus, "")
+
     def test_pinned_recents_are_first_and_never_evicted_by_recent_opens(self):
         studio=self.studio;studio.recent=["/notes/pinned.md"]
         studio.pinRecent("/notes/pinned.md")
