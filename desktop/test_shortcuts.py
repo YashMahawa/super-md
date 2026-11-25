@@ -25,6 +25,14 @@ class ShortcutValidationTest(unittest.TestCase):
         self.assertEqual(defaults["save"], ["Ctrl+S"])
         self.assertEqual(defaults["save_as"], ["Ctrl+Shift+S"])
         self.assertEqual(defaults["copy"], ["Ctrl+C"])
+        self.assertEqual(defaults["bold"], ["Ctrl+B"])
+        self.assertEqual(defaults["italic"], ["Ctrl+I"])
+        self.assertEqual(defaults["inline_code"], ["Ctrl+E"])
+        self.assertEqual(defaults["link"], ["Ctrl+K"])
+        self.assertEqual(defaults["heading"], ["Ctrl+Shift+H"])
+        self.assertEqual(defaults["list"], ["Ctrl+Shift+L"])
+        self.assertEqual(defaults["quote"], ["Ctrl+Alt+Q"])
+        self.assertEqual(defaults["inline_math"], ["Ctrl+Shift+M"])
         self.assertEqual(defaults["find"], ["Ctrl+F"])
         self.assertEqual(defaults["new_note"], ["Ctrl+T"])
         self.assertEqual(defaults["undo"], ["Ctrl+Z"])
@@ -43,6 +51,10 @@ class ShortcutValidationTest(unittest.TestCase):
         candidate["find"] = ["Ctrl+O"]
         _, error = normalize_shortcuts(candidate)
         self.assertIn("Open note", error)
+        earlier = default_shortcuts()
+        earlier["bold"] = ["Ctrl+I"]
+        _, error = normalize_shortcuts(earlier, edited_action="bold")
+        self.assertIn("Italic", error)
 
 
     def test_recorder_captures_modified_combinations_and_rejects_plain_letters(self):
