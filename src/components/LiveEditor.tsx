@@ -1100,7 +1100,7 @@ export default function LiveEditor({markdown,onChange,onHistory,historyReplayTok
 
   const syncTextareaCaret=useCallback((area:HTMLTextAreaElement)=>setCaret(area.selectionStart),[]);
 
-  useEffect(()=>{
+  useLayoutEffect(()=>{
     if(!isEditing)return;
     return registerLiveTextareaHistory(direction=>{
       const area=editor.current;
