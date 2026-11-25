@@ -40,7 +40,7 @@ def _try_create_link(link: Path, target: Path, *, target_is_directory: bool = Fa
 class WorkspaceLinkResolverUnitTest(unittest.TestCase):
     def test_resolves_relative_links_and_nested_wikilinks_without_writing_index_files(self):
         with tempfile.TemporaryDirectory() as root_dir:
-            root = Path(root_dir)
+            root = Path(root_dir).resolve()
             (root / "Index.md").write_text("# Index\n", encoding="utf-8")
             sub = root / "Research Notes"
             sub.mkdir()
@@ -297,8 +297,9 @@ class StudioWorkspaceLinkIntegrationTest(unittest.TestCase):
         shutil.rmtree(self.session.data, ignore_errors=True)
 
     def test_following_workspace_links_opens_or_focuses_tabs_retains_edits_updates_recent_and_sends_heading(self):
-        vault = (self.studio.data / "vault").resolve()
-        vault.mkdir(parents=True, exist_ok=True)
+        raw_vault = self.studio.data / "vault"
+        raw_vault.mkdir(parents=True, exist_ok=True)
+        vault = raw_vault.resolve()
         first = vault / "First.md"
         first.write_text("# First\n\nSee [[Second Note#Architecture]]\n", encoding="utf-8")
         nested = vault / "Specs"
@@ -407,8 +408,9 @@ class StudioWorkspaceLinkIntegrationTest(unittest.TestCase):
         self.assertIn("Unsupported external URL scheme", bad_reply[2])
 
     def test_opens_portable_smd_bundles_noncanonical_doc_refs_and_rejects_bookmark_aliases(self):
-        vault = (self.studio.data / "portable-vault").resolve()
-        vault.mkdir(parents=True, exist_ok=True)
+        raw_vault = self.studio.data / "portable-vault"
+        raw_vault.mkdir(parents=True, exist_ok=True)
+        vault = raw_vault.resolve()
         index_note = vault / "Index.md"
         index_note.write_text("# Index\n\n- [Deck](sub/study.smd#key-theorem)\n", encoding="utf-8")
         sub = vault / "sub"

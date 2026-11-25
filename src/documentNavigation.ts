@@ -94,12 +94,13 @@ export function navigateToHeading(root:Element,rawTarget:string):boolean {
   const headings = Array.from(root.querySelectorAll<HTMLElement>("[data-heading-key]"));
   const counts = new Map<string, number>();
   if(!root.querySelector('[data-windowed-block]'))for (const heading of headings) { const key = heading.dataset.headingKey!, count = counts.get(key) || 0; counts.set(key, count + 1); heading.id = key + (count ? `-${count}` : ""); }
-  const byId = Array.from(root.querySelectorAll<HTMLElement>('[id]'));
+  let byId: HTMLElement[] | undefined;
+  const getById = () => (byId ??= Array.from(root.querySelectorAll<HTMLElement>('[id]')));
   const heading = headings.find(node => node.id === target || node.id === trimmed)
-    || byId.find(node => node.id === target || node.id === trimmed)
+    || getById().find(node => node.id === target || node.id === trimmed)
     || headings.find(node => node.id === slug)
-    || byId.find(node => node.id === slug)
-    || (numberedSlug ? headings.find(node => node.id === numberedSlug) || byId.find(node => node.id === numberedSlug) : undefined)
+    || getById().find(node => node.id === slug)
+    || (numberedSlug ? headings.find(node => node.id === numberedSlug) || getById().find(node => node.id === numberedSlug) : undefined)
     || headings.find(node => (node.textContent || '').trim().toLowerCase() === lower);
   if (!heading) return true; // Broken local links must not escape into a browser.
   cancelHeadingNavigation(root);

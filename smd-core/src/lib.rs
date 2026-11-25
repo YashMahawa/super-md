@@ -842,10 +842,33 @@ fn split_optional_link_title(inside: &str) -> (&str, &str) {
     (inside, "")
 }
 
+fn has_spaced_inline_link(input: &str) -> bool {
+    let mut rest = input;
+    while let Some(pos) = rest.find("](") {
+        let after = &rest[pos + 2..];
+        let mut has_ws = false;
+        for b in after.bytes() {
+            match b {
+                b'\r' | b'\n' | b'(' | b'<' | b'>' => break,
+                b')' => {
+                    if has_ws {
+                        return true;
+                    }
+                    break;
+                }
+                b' ' | b'\t' => has_ws = true,
+                _ => {}
+            }
+        }
+        rest = after;
+    }
+    false
+}
+
 /// Normalize prose wikilinks and spaced Markdown link destinations while
 /// leaving fenced code, indented code, inline code, HTML, and math untouched.
 fn normalize_prose_links(input: &str) -> String {
-    if !input.contains("[[") && !input.contains("](") { return input.to_string(); }
+    if !input.contains("[[") && !has_spaced_inline_link(input) { return input.to_string(); }
     let mut protected = Vec::new();
     for (event, range) in Parser::new_ext(input, Options::ENABLE_MATH).into_offset_iter() {
         if matches!(event, Event::Start(Tag::CodeBlock(_)) | Event::Code(_) | Event::InlineMath(_) | Event::DisplayMath(_) | Event::Html(_) | Event::InlineHtml(_)) {
