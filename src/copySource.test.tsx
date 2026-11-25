@@ -193,13 +193,57 @@ it("excludes document properties header labels and badges from copied Markdown a
   expect(copied).not.toContain("invariants");
   expect(copied?.replace(/\n{3,}/g,"\n\n")).toBe("# Opening Section\n\nFirst **important** sentence.");
 
+  const authorValue=Array.from(header.querySelectorAll(".document-property-value")).find(el=>el.textContent?.includes("Emmy Noether"))!;
+  const valueOnly=document.createRange();
+  valueOnly.selectNodeContents(authorValue);
+  selection.removeAllRanges();
+  selection.addRange(valueOnly);
+  expect(selectedMarkdown(selection,markdown)).toBeNull();
+  expect(extractSelectedText({source:markdown})).toBe("Emmy Noether");
+  expect(hasSelectedText()).toBe(true);
+
+  const dragPayload=new Map<string,string>([["text/plain","Emmy Noether"]]);
+  const dragTransfer={setData:(type:string,value:string)=>dragPayload.set(type,value),clearData:(type:string)=>dragPayload.delete(type)} as unknown as DataTransfer;
+  const dragEvent=new Event("dragstart",{bubbles:true,cancelable:true});
+  Object.defineProperty(dragEvent,"dataTransfer",{value:dragTransfer});
+  Object.defineProperty(dragEvent,"target",{value:authorValue});
+  Object.defineProperty(dragEvent,"clientX",{value:8});
+  Object.defineProperty(dragEvent,"clientY",{value:8});
+  Object.defineProperty(document,"caretPositionFromPoint",{configurable:true,value:()=>({offsetNode:authorValue.firstChild!,offset:2})});
+  expect(setSelectedMarkdownDrag(dragEvent as DragEvent,markdown)).toBe(false);
+  expect(dragPayload.get("text/plain")).toBe("Emmy Noether");
+
   const headerOnly=document.createRange();
   headerOnly.selectNodeContents(header);
   selection.removeAllRanges();
   selection.addRange(headerOnly);
-  expect(selectedMarkdown(selection,markdown)).toBe("");
-  expect(extractSelectedText({source:markdown})).toBe("");
-  expect(hasSelectedText()).toBe(false);
+  expect(selectedMarkdown(selection,markdown)).toBeNull();
+  expect(extractSelectedText({source:markdown})).toContain("Hidden Header Title");
+  expect(hasSelectedText()).toBe(true);
+
+  // Triple-click selection in Chromium can end at offset 0 of the following heading text node.
+  const headingText=article.querySelector("h1")!.firstChild!;
+  const boundaryRange=document.createRange();
+  boundaryRange.setStart(authorValue.firstChild!,0);
+  boundaryRange.setEnd(headingText,0);
+  selection.removeAllRanges();
+  selection.addRange(boundaryRange);
+  expect(selectedMarkdown(selection,markdown)).toBeNull();
+  expect(extractSelectedText({source:markdown})).toContain("Emmy Noether");
+
+  // Select All on a frontmatter-only note falls back to ordinary copy instead of wiping clipboard.
+  const soloHost=document.createElement("div");
+  const soloMarkdown="---\ntitle: Solo Metadata\nauthor: Ada Lovelace\n---";
+  soloHost.innerHTML=renderToStaticMarkup(<MarkdownPreview markdown={soloMarkdown} documentPath={null} python="" dark={false}/>);
+  document.body.append(soloHost);
+  const soloArticle=soloHost.querySelector(".markdown-body")!;
+  const soloRange=document.createRange();
+  soloRange.selectNodeContents(soloArticle);
+  selection.removeAllRanges();
+  selection.addRange(soloRange);
+  expect(selectedMarkdown(selection,soloMarkdown)).toBeNull();
+  expect(extractSelectedText({source:soloMarkdown})).toContain("Solo Metadata");
+  soloHost.remove();
 
   expect(readingMatches(article,"Hidden Header Title")).toEqual([]);
   expect(readingMatches(article,"Author")).toEqual([]);

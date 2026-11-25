@@ -1,9 +1,11 @@
 import {createContext,Fragment,useCallback,useContext,useEffect,useLayoutEffect,useMemo,useRef,useState,type ClipboardEvent,type DragEvent,type KeyboardEvent as ReactKeyboardEvent,type ReactNode,type RefObject} from 'react';
 import {PencilSimpleIcon} from '@phosphor-icons/react';
+import DocumentProperties from './DocumentProperties';
 import MarkdownPreview from './MarkdownPreview';
 import WindowedBlock,{type WindowHeading} from './WindowedBlock';
 import type {RenderedMarkdownBlock} from './CachedMarkdown';
 import {analyzeDocument,type SourceBlock,type SourceDocumentAnalysis} from '../documentAnalysis';
+import type {ParsedFrontmatter} from '../frontmatter';
 import {selectedMarkdown,setSelectedMarkdownDrag} from '../copySource';
 import {refreshDocumentExtent} from '../documentZoom';
 import type {WritingOptions} from '../proofreading';
@@ -32,7 +34,8 @@ interface EditingSession {
   baseMarkdown:string;
   baseSplitEnd:number;
   protectedBlock:boolean;
-  insertAfter?:number|'end';
+  frontmatterBlock?:boolean;
+  insertAfter?:number|'frontmatter'|'end';
 }
 interface CloseAnchor {scroller:HTMLElement;element:HTMLElement;top:number}
 interface EditSpan {baseSource:string;start:number;oldEnd:number;newEnd:number}
@@ -45,6 +48,7 @@ interface ActiveDraftContextValue {
   caret:number;
   spellCheck:boolean;
   grammarCheck:boolean;
+  frontmatterBlock:boolean;
   onChange:(value:string,selectionStart?:number,selectionEnd?:number)=>void;
   onSuggestionChange:(value:string)=>void;
   onSuggestionAction:(edit?:{from:number;to:number;insertLength:number})=>void;
@@ -61,7 +65,7 @@ const ActiveDraftContext=createContext<ActiveDraftContextValue|null>(null);
 function ActiveBlockEditor(){
   const draft=useContext(ActiveDraftContext);
   if(!draft)return null;
-  const {session,editorRef,sourceStart,text,caret,spellCheck,grammarCheck,onChange,onSuggestionChange,onSuggestionAction,onSyncCaret,onPaste,onKeyDown,onCaretMove,onRememberSelection,onBlurSession}=draft;
+  const {session,editorRef,sourceStart,text,caret,spellCheck,grammarCheck,frontmatterBlock,onChange,onSuggestionChange,onSuggestionAction,onSyncCaret,onPaste,onKeyDown,onCaretMove,onRememberSelection,onBlurSession}=draft;
   return (
     <div className="live-active-block">
       <textarea
@@ -84,9 +88,9 @@ function ActiveBlockEditor(){
           const shouldClose=!(related instanceof Node&&event.currentTarget.parentElement?.contains(related));
           onBlurSession(session,event.currentTarget,shouldClose,related instanceof Element?related:null);
         }}
-        aria-label="Edit Markdown block"
+        aria-label={frontmatterBlock?"Edit YAML frontmatter":"Edit Markdown block"}
       />
-      <WritingSuggestions text={text} caret={caret} spellCheck={spellCheck} grammarCheck={grammarCheck} onChange={onSuggestionChange} onAction={onSuggestionAction}/>
+      {!frontmatterBlock&&<WritingSuggestions text={text} caret={caret} spellCheck={spellCheck} grammarCheck={grammarCheck} onChange={onSuggestionChange} onAction={onSuggestionAction}/>}
     </div>
   );
 }
@@ -165,6 +169,69 @@ function LiveBlockShell({windowed,estimate,text,headings,start,end,blockIndex,ac
   </WindowedBlock>;
 }
 
+function LiveFrontmatterShell({frontmatter,active,onOpen}:{frontmatter:ParsedFrontmatter;active:boolean;onOpen:(element:HTMLElement)=>void}){
+  const [hovered,setHovered]=useState(false);
+  const [focused,setFocused]=useState(false);
+  const [tapped,setTapped]=useState(false);
+  const blockElRef=useRef<HTMLElement|null>(null);
+  const pressingRef=useRef(false);
+  const tapStartRef=useRef<{id:number;x:number;y:number;moved:boolean}|null>(null);
+  useEffect(()=>{
+    if(active){setTapped(false);return;}
+    if(!blockElRef.current?.contains(document.activeElement))setFocused(false);
+  },[active]);
+  useEffect(()=>{
+    if(!tapped)return;
+    const clearOutside=(event:PointerEvent)=>{
+      const target=event.target instanceof Node?event.target:null;
+      if(target&&!blockElRef.current?.contains(target))setTapped(false);
+    };
+    document.addEventListener('pointerdown',clearOutside,true);
+    return()=>document.removeEventListener('pointerdown',clearOutside,true);
+  },[tapped]);
+  const revealed=!active&&(hovered||focused||tapped);
+  return <section ref={blockElRef} className="live-frontmatter" tabIndex={0} role="group" aria-label="Document frontmatter"
+    onPointerEnter={event=>{blockElRef.current=event.currentTarget;if(event.pointerType==='mouse'&&event.buttons===0&&!document.querySelector('.is-panning'))setHovered(true);}}
+    onPointerMove={event=>{
+      blockElRef.current=event.currentTarget;
+      if(tapStartRef.current?.id===event.pointerId&&Math.hypot(event.clientX-tapStartRef.current.x,event.clientY-tapStartRef.current.y)>8)tapStartRef.current.moved=true;
+      if(event.pointerType==='mouse'&&event.buttons===0&&!hovered&&!document.querySelector('.is-panning'))setHovered(true);
+    }}
+    onPointerLeave={event=>{pressingRef.current=false;if(event.pointerType==='mouse')setHovered(false);}}
+    onPointerDown={event=>{
+      blockElRef.current=event.currentTarget;
+      pressingRef.current=true;
+      if(event.pointerType==='mouse')return;
+      tapStartRef.current={id:event.pointerId,x:event.clientX,y:event.clientY,moved:false};
+    }}
+    onPointerUp={event=>{
+      pressingRef.current=false;
+      if(event.pointerType==='mouse')return;
+      const tap=tapStartRef.current;tapStartRef.current=null;
+      if(active||!tap||tap.id!==event.pointerId||tap.moved||Math.hypot(event.clientX-tap.x,event.clientY-tap.y)>8)return;
+      if(document.querySelector('.is-panning')||window.getSelection()?.toString())return;
+      const target=event.target instanceof Element?event.target:null;
+      if(target?.closest('.live-block-edit,.live-active-block,.image-viewer,.reading-search,.media-dialog,.math-repair-panel'))return;
+      if(document.documentElement.dataset.fullscreen==='true'&&!target?.closest(fullscreenInteractiveSelector))return;
+      setTapped(true);
+    }}
+    onPointerCancel={()=>{pressingRef.current=false;tapStartRef.current=null;}}
+    onFocus={event=>{blockElRef.current=event.currentTarget;if(!pressingRef.current)setFocused(true);}}
+    onBlur={event=>{if(!event.currentTarget.contains(event.relatedTarget as Node|null))setFocused(false);}}
+    onDoubleClick={event=>{
+      if(active||(event.target as Element).closest('a,button,input,select,textarea'))return;
+      window.getSelection()?.removeAllRanges();onOpen(event.currentTarget);
+    }}
+    onKeyDown={event=>{if(!active&&event.target===event.currentTarget&&(event.key==='Enter'||event.key==='F2')){event.preventDefault();onOpen(event.currentTarget);}}}>
+    {revealed?<button type="button" className="live-block-edit" data-independent-zoom aria-label="Edit frontmatter" title="Edit frontmatter" onClick={event=>{
+      event.preventDefault();event.stopPropagation();
+      const owner=event.currentTarget.closest<HTMLElement>('.live-frontmatter');
+      if(owner)onOpen(owner);
+    }}><PencilSimpleIcon size={13} weight="bold" aria-hidden="true"/><span>Edit</span></button>:null}
+    {active?<ActiveBlockEditor/>:<DocumentProperties properties={frontmatter.properties} entries={frontmatter.entries} showFallback/>}
+  </section>;
+}
+
 function translateRenderedRange(start:number,end:number,editing:EditingSession|null,syncedMarkdown:string):[number,number] {
   if(!editing||end<=editing.baseSplitEnd)return [start,end];
   const delta=syncedMarkdown.length-editing.baseMarkdown.length;
@@ -194,7 +261,7 @@ export default function LiveEditor({markdown,onChange,documentPath,python,dark,t
   const appliedTypewriter=useRef(false),typingFrame=useRef(0);
   const anchorTop=useRef<number|null>(null),editor=useRef<HTMLTextAreaElement>(null),rootRef=useRef<HTMLDivElement>(null);
   const pendingSelection=useRef<{start:number;end:number;direction?:'forward'|'backward'|'none'}|null>(null);
-  const pendingBlockFocus=useRef<{offset:number}|'end'|null>(null);
+  const pendingBlockFocus=useRef<{offset:number}|'frontmatter'|'end'|null>(null);
   const closeAnchorRef=useRef<CloseAnchor|null>(null);
   const outsidePressRef=useRef<{active:boolean;deferredClose:boolean;target:HTMLElement|null;clientY:number|null;session:number;timer:number}>({active:false,deferredClose:false,target:null,clientY:null,session:0,timer:0});
   const editSpanRef=useRef<EditSpan|null>(null);
@@ -216,6 +283,11 @@ export default function LiveEditor({markdown,onChange,documentPath,python,dark,t
     if(current.insertAfter!==undefined&&area.value===''){
       const doc=current.baseMarkdown,pos=Math.max(0,Math.min(current.baseSplitEnd,doc.length));
       savedSelection.current={from:pos,to:pos,markdown:doc};
+      return;
+    }
+    if(current.frontmatterBlock&&area.value.trim()===''){
+      const doc=current.suffix.replace(/^(?:\r?\n)+/,'');
+      savedSelection.current={from:0,to:0,markdown:doc};
       return;
     }
     const base=current.prefix.length,doc=current.prefix+area.value+current.suffix;
@@ -291,10 +363,10 @@ export default function LiveEditor({markdown,onChange,documentPath,python,dark,t
     const area=editor.current;
     const scroller=area?.closest<HTMLElement>('.android-reading,.reading-scroll,.preview-pane,.live-scroll');
     if(!scroller||scroller.dataset.navigating)return;
-    const activeBlock=area?.closest<HTMLElement>('.live-block');
+    const activeBlock=area?.closest<HTMLElement>('.live-block,.live-frontmatter');
     let anchorElement:HTMLElement|null=null;
     if(target&&scroller.contains(target)&&!target.closest('.live-active-block')){
-      anchorElement=target.closest<HTMLElement>('.live-block')??(target instanceof HTMLElement?target:target.parentElement);
+      anchorElement=target.closest<HTMLElement>('.live-block,.live-frontmatter')??(target instanceof HTMLElement?target:target.parentElement);
     }
     if(!anchorElement&&activeBlock){
       const activeBounds=activeBlock.getBoundingClientRect(),scrollerBounds=scroller.getBoundingClientRect();
@@ -348,7 +420,7 @@ export default function LiveEditor({markdown,onChange,documentPath,python,dark,t
     openDocBlock(element,start,end,activeDoc,undefined,protectedHint);
   },[openDocBlock]);
 
-  const openInsertedBlock=useCallback((baseDoc:string,insertPos:number,insertAfter:number|'end')=>{
+  const openInsertedBlock=useCallback((baseDoc:string,insertPos:number,insertAfter:number|'frontmatter'|'end')=>{
     const session=++sessionCounter.current;
     resetOutsidePress(session);
     anchorTop.current=null;
@@ -364,6 +436,45 @@ export default function LiveEditor({markdown,onChange,documentPath,python,dark,t
     setDraftText('');
     setEditing(nextSession);
   },[resetOutsidePress]);
+
+  const openFrontmatter=useCallback((element:HTMLElement|null)=>{
+    const {editing:currentEditing,markdown:latestMarkdown,sourceAnalysis:latestAnalysis}=latestRef.current;
+    if(currentEditing?.frontmatterBlock){editor.current?.focus({preventScroll:true});return;}
+    const resolvedDoc=currentEditing?syncedMarkdownRef.current:latestMarkdown;
+    const fm=resolvedDoc===latestAnalysis.source?latestAnalysis.analysis.frontmatter:analyzeDocument(resolvedDoc).frontmatter;
+    if(!fm)return;
+    const fmStart=resolvedDoc.startsWith('\uFEFF')?1:0;
+    const trailingBreak=fm.raw.endsWith('\r\n')?2:fm.raw.endsWith('\n')?1:0;
+    const fmSpanEnd=fm.end-trailingBreak;
+    const session=++sessionCounter.current;
+    resetOutsidePress(session);
+    anchorTop.current=element?element.getBoundingClientRect().top:null;
+    pendingSelection.current=null;
+    const text=resolvedDoc.slice(fmStart,fmSpanEnd);
+    const nextSession:EditingSession={
+      session,
+      prefix:resolvedDoc.slice(0,fmStart),
+      suffix:resolvedDoc.slice(fmSpanEnd),
+      baseMarkdown:resolvedDoc,
+      baseSplitEnd:fmSpanEnd,
+      protectedBlock:true,
+      frontmatterBlock:true,
+    };
+    syncedMarkdownRef.current=resolvedDoc;
+    latestRef.current.editing=nextSession;
+    latestRef.current.draftText=text;
+    setCaret(0);
+    setDraftText(text);
+    setEditing(nextSession);
+  },[resetOutsidePress]);
+
+  const openEmptyBodyBlock=useCallback((element:HTMLElement|null)=>{
+    const {editing:currentEditing,markdown:latestMarkdown,sourceAnalysis:latestAnalysis}=latestRef.current;
+    const activeDoc=currentEditing?syncedMarkdownRef.current:latestMarkdown;
+    const analysis=activeDoc===latestAnalysis.source?latestAnalysis.analysis:analyzeDocument(activeDoc);
+    const start=analysis.bodyBlocks[0]?.start??activeDoc.length;
+    openDocBlock(element,start,activeDoc.length,activeDoc,undefined,false);
+  },[openDocBlock]);
 
   const appendTrailingBlock=useCallback(()=>{
     const {editing:active,markdown:latestMarkdown,sourceAnalysis:latestAnalysis}=latestRef.current;
@@ -412,6 +523,12 @@ export default function LiveEditor({markdown,onChange,documentPath,python,dark,t
       const target=pendingBlockFocus.current;
       if(target!==null){
         pendingBlockFocus.current=null;
+        if(target==='frontmatter'){
+          const fmEl=rootRef.current?.querySelector<HTMLElement>('.live-frontmatter');
+          if(fmEl){fmEl.focus({preventScroll:true});return;}
+          rootRef.current?.querySelector<HTMLElement>('.live-block')?.focus({preventScroll:true});
+          return;
+        }
         const candidates=Array.from(rootRef.current?.querySelectorAll<HTMLElement>('.live-block')??[]);
         if(candidates.length){
           const match=target==='end'?candidates.at(-1):candidates.find(el=>{const s=Number(el.dataset.sourceStart??0),e=Number(el.dataset.sourceEnd??Infinity);return e>target.offset&&s<=target.offset;})??candidates.filter(el=>Number(el.dataset.sourceStart??0)<=target.offset).at(-1)??candidates[0];
@@ -627,7 +744,7 @@ export default function LiveEditor({markdown,onChange,documentPath,python,dark,t
     };
     const onContainerDoubleClick=(event:MouseEvent)=>{
       const target=event.target instanceof Element?event.target:null;
-      if(!target||target.closest('.live-block,.live-active-block,a,button,input,select,textarea,.reading-search,.image-viewer,.media-dialog,.math-repair-panel,[data-frontmatter-properties],.document-properties'))return;
+      if(!target||target.closest('.live-block,.live-frontmatter,.live-active-block,a,button,input,select,textarea,.reading-search,.image-viewer,.media-dialog,.math-repair-panel,[data-frontmatter-properties],.document-properties'))return;
       const doc=latestRef.current.editing?syncedMarkdownRef.current:latestRef.current.markdown;
       if(!doc.trim())return;
       const allBlocks=root.querySelectorAll<HTMLElement>('.live-block');
@@ -688,7 +805,23 @@ export default function LiveEditor({markdown,onChange,documentPath,python,dark,t
       syncActiveCaretCenter();
       return;
     }
-    const needsNewline=Boolean(currentFrontmatter)&&active.prefix.length===currentFrontmatter!.end&&active.prefix.length>0&&!active.prefix.endsWith('\n')&&text.length>0;
+    if(active.frontmatterBlock&&text.trim()===''){
+      const strippedSuffix=active.suffix.replace(/^(?:\r?\n)+/,'');
+      const removedSuffixChars=active.suffix.length-strippedSuffix.length;
+      const nextMarkdown=strippedSuffix;
+      savedSelection.current={from:0,to:0,markdown:nextMarkdown};
+      editSpanRef.current={
+        baseSource:active.baseMarkdown,
+        start:0,
+        oldEnd:active.baseSplitEnd+removedSuffixChars,
+        newEnd:0,
+      };
+      syncedMarkdownRef.current=nextMarkdown;
+      emitChange(nextMarkdown);
+      syncActiveCaretCenter();
+      return;
+    }
+    const needsNewline=Boolean(currentFrontmatter)&&!active.frontmatterBlock&&active.prefix.length===currentFrontmatter!.end&&active.prefix.length>0&&!active.prefix.endsWith('\n')&&text.length>0;
     const prefix=needsNewline?active.prefix+'\n':active.prefix;
     const nextMarkdown=prefix+text+active.suffix,base=prefix.length;
     if(selectionStart!==undefined&&selectionEnd!==undefined){
@@ -798,13 +931,20 @@ export default function LiveEditor({markdown,onChange,documentPath,python,dark,t
     if(event.key==='Escape'){
       rememberSelection(area,active);
       event.preventDefault();event.stopPropagation();
-      pendingBlockFocus.current=active.insertAfter!==undefined&&currentDraft===''?(active.insertAfter==='end'?'end':{offset:active.insertAfter}):{offset:active.prefix.length};
+      pendingBlockFocus.current=active.frontmatterBlock?'frontmatter':active.insertAfter!==undefined&&currentDraft===''?(active.insertAfter==='end'?'end':active.insertAfter==='frontmatter'?'frontmatter':{offset:active.insertAfter}):{offset:active.prefix.length};
       closeEditor();
       return;
     }
     if(event.key==='Enter'&&(event.metaKey||event.ctrlKey)&&!event.altKey&&!event.shiftKey){
       event.preventDefault();event.stopPropagation();
       if(active.insertAfter!==undefined&&currentDraft.trim()===''){area.focus({preventScroll:true});return;}
+      if(active.frontmatterBlock){
+        if(currentDraft.trim()===''){area.focus({preventScroll:true});return;}
+        const committed=syncedMarkdownRef.current;
+        const insertPos=active.prefix.length+currentDraft.length;
+        openInsertedBlock(committed,insertPos,'frontmatter');
+        return;
+      }
       const committed=syncedMarkdownRef.current;
       const insertPos=active.prefix.length+currentDraft.length;
       const spans=editableBlockSpans(committed);
@@ -859,11 +999,17 @@ export default function LiveEditor({markdown,onChange,documentPath,python,dark,t
       }
       if(event.key==='ArrowDown'&&isLastLineCursor(area.value,area.selectionStart,area.selectionEnd)){
         const committed=syncedMarkdownRef.current,spans=editableBlockSpans(committed);
-        const activeEnd=untouchedInsert?active.baseSplitEnd:active.prefix.length+currentDraft.length;
+        const activeEnd=untouchedInsert?active.baseSplitEnd:active.frontmatterBlock&&currentDraft.trim()===''?0:active.prefix.length+currentDraft.length;
         const next=spans.find(span=>span.start>=activeEnd);
         if(next){
           event.preventDefault();event.stopPropagation();
           openDocBlock(null,next.start,next.end,committed,{start:0,end:0});
+        }else if(active.frontmatterBlock&&committed.trim()!==''){
+          const fm=analyzeDocument(committed).frontmatter;
+          if(fm){
+            event.preventDefault();event.stopPropagation();
+            openDocBlock(null,fm.end,committed.length,committed,{start:0,end:0},false);
+          }
         }
         return;
       }
@@ -879,6 +1025,7 @@ export default function LiveEditor({markdown,onChange,documentPath,python,dark,t
       caret,
       spellCheck,
       grammarCheck,
+      frontmatterBlock:Boolean(editing.frontmatterBlock),
       onChange:update,
       onSuggestionChange:handleSuggestionChange,
       onSuggestionAction:handleSuggestionAction,
@@ -900,7 +1047,7 @@ export default function LiveEditor({markdown,onChange,documentPath,python,dark,t
     // Inter-block whitespace belongs outside the editor. Replacing all text
     // in a heading/paragraph must not join it onto the following source block.
     const block=blocks[low],start=block.start,end=entry.node.position?.end.offset??block.end;
-    const active=!!editing&&editing.insertAfter===undefined&&block.start===editing.prefix.length;
+    const active=!!editing&&!editing.frontmatterBlock&&editing.insertAfter===undefined&&block.start===editing.prefix.length;
     const insertedBelow=!!editing&&editing.insertAfter===block.start;
     const blockKey=blockKeys.get(block.start)??`block-${entry.key}`;
     const protectedHint=['code','math','html','definition'].includes(entry.node.type);
@@ -932,11 +1079,18 @@ export default function LiveEditor({markdown,onChange,documentPath,python,dark,t
     emitChange(activeDoc.slice(0,from)+next.slice(start,nextEnd)+activeDoc.slice(to));
   },[captureCloseAnchor]);
 
+  const renderFrontmatter=useCallback((fm:ParsedFrontmatter)=>(
+    <>
+      <LiveFrontmatterShell frontmatter={fm} active={Boolean(editing?.frontmatterBlock)} onOpen={openFrontmatter}/>
+      {editing?.insertAfter==='frontmatter'&&<section className="live-block" role="group" aria-label="New Markdown block"><ActiveBlockEditor/></section>}
+    </>
+  ),[editing,openFrontmatter]);
+
   return <ActiveDraftContext.Provider value={activeDraftValue}>
     <div ref={rootRef} className="live-document" onCopy={copy} onDragStart={dragStart}>
       {!frontmatter&&!renderedSource.trim()?(editing?<ActiveBlockEditor/>:<section className="live-block" data-source-start={0} data-source-end={markdown.length} tabIndex={0} role="group" aria-label="Editable block 1" onClick={event=>openDocBlock(event.currentTarget,0,latestRef.current.markdown.length,latestRef.current.markdown,undefined,false)} onDoubleClick={event=>openDocBlock(event.currentTarget,0,latestRef.current.markdown.length,latestRef.current.markdown,undefined,false)} onKeyDown={event=>{if(event.key==='Enter'||event.key==='F2'){event.preventDefault();openDocBlock(event.currentTarget,0,latestRef.current.markdown.length,latestRef.current.markdown,undefined,false);}}}/> ):<>
-        <MarkdownPreview markdown={renderedSource} onChange={previewChange} documentPath={documentPath} python={python} dark={dark} trustedImageHosts={trustedImageHosts} onTrustImageHost={onTrustImageHost} renderBlock={renderBlock} fullDocumentAccessibility={fullDocumentAccessibility} sourceAnalysis={sourceAnalysis}/>
-        {!hasBodyNodes?(editing?<ActiveBlockEditor/>:<section className="live-block" data-source-start={blocks[0].start} data-source-end={markdown.length} tabIndex={0} role="group" aria-label="Editable block 1" onClick={event=>openDocBlock(event.currentTarget,blocks[0].start,latestRef.current.markdown.length,latestRef.current.markdown,undefined,false)} onDoubleClick={event=>openDocBlock(event.currentTarget,blocks[0].start,latestRef.current.markdown.length,latestRef.current.markdown,undefined,false)} onKeyDown={event=>{if(event.key==='Enter'||event.key==='F2'){event.preventDefault();openDocBlock(event.currentTarget,blocks[0].start,latestRef.current.markdown.length,latestRef.current.markdown,undefined,false);}}}/> ):editing?.insertAfter==='end'&&<section className="live-block" role="group" aria-label="New Markdown block"><ActiveBlockEditor/></section>}
+        <MarkdownPreview markdown={renderedSource} onChange={previewChange} documentPath={documentPath} python={python} dark={dark} trustedImageHosts={trustedImageHosts} onTrustImageHost={onTrustImageHost} renderBlock={renderBlock} renderFrontmatter={renderFrontmatter} fullDocumentAccessibility={fullDocumentAccessibility} sourceAnalysis={sourceAnalysis}/>
+        {!hasBodyNodes?(editing&&!editing.frontmatterBlock&&editing.insertAfter===undefined?<ActiveBlockEditor/>:editing?.insertAfter==='end'?<section className="live-block" role="group" aria-label="New Markdown block"><ActiveBlockEditor/></section>:editing?.insertAfter==='frontmatter'?null:<section className="live-block" data-source-start={blocks[0].start} data-source-end={markdown.length} tabIndex={0} role="group" aria-label="Editable block 1" onClick={event=>openEmptyBodyBlock(event.currentTarget)} onDoubleClick={event=>openEmptyBodyBlock(event.currentTarget)} onKeyDown={event=>{if(event.key==='Enter'||event.key==='F2'){event.preventDefault();openEmptyBodyBlock(event.currentTarget);}}}/> ):editing?.insertAfter==='end'&&<section className="live-block" role="group" aria-label="New Markdown block"><ActiveBlockEditor/></section>}
       </>}
     </div>
   </ActiveDraftContext.Provider>;

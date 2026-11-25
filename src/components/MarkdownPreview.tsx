@@ -16,6 +16,7 @@ import { selectedMarkdown, setSelectedMarkdownDrag } from "../copySource";
 import CopyCode from "./CopyCode";
 import CodeBlockBoundary from "./CodeBlockBoundary";
 import DocumentProperties from "./DocumentProperties";
+import type { ParsedFrontmatter } from "../frontmatter";
 import {DocumentAppearance} from '../documentAppearance';
 import {svgDataBackdrop} from '../svgImage';
 import {adaptSvgData} from '../svgTheme';
@@ -192,6 +193,7 @@ interface Props extends ReaderAccessibilityPreference {
   onTrustImageHost?: (host: string) => void;
   onChange?: (markdown:string)=>void;
   renderBlock?:MarkdownBlockRenderer;
+  renderFrontmatter?:(frontmatter:ParsedFrontmatter)=>ReactNode;
   sourceAnalysis?:SourceDocumentAnalysis;
 }
 
@@ -329,7 +331,7 @@ const MARKDOWN_COMPONENTS: Components = {
   pre: MarkdownPre,
 };
 
-function MarkdownPreview({ markdown, documentPath, python, dark, trustedImageHosts = EMPTY_TRUSTED_IMAGE_HOSTS, onTrustImageHost, onChange,renderBlock,fullDocumentAccessibility=false,sourceAnalysis }: Props) {
+function MarkdownPreview({ markdown, documentPath, python, dark, trustedImageHosts = EMPTY_TRUSTED_IMAGE_HOSTS, onTrustImageHost, onChange,renderBlock,renderFrontmatter,fullDocumentAccessibility=false,sourceAnalysis }: Props) {
   useEffect(installMediaMenu,[]);
   const analysis=useMemo(()=>sourceAnalysis?.source===markdown?sourceAnalysis.analysis:analyzeDocument(markdown),[markdown,sourceAnalysis]);
   const editable=Boolean(onChange);
@@ -347,7 +349,11 @@ function MarkdownPreview({ markdown, documentPath, python, dark, trustedImageHos
   return (
     <MarkdownPreviewContext.Provider value={previewContext}>
       <article className="markdown-body" onCopy={event=>{if(event.currentTarget.closest('.live-document'))return;const source=selectedMarkdown(window.getSelection(),markdown);if(source!==null){event.clipboardData.setData("text/plain",source);event.preventDefault();}}} onDragStart={event=>{if(!event.currentTarget.closest('.live-document'))setSelectedMarkdownDrag(event.nativeEvent,markdown);}}>
-        {analysis.frontmatter?.properties && <DocumentProperties properties={analysis.frontmatter.properties} />}
+        {analysis.frontmatter
+          ? (renderFrontmatter
+              ? renderFrontmatter(analysis.frontmatter)
+              : (analysis.frontmatter.properties && <DocumentProperties properties={analysis.frontmatter.properties} />))
+          : null}
         <CachedMarkdown
           sourceAnalysis={resolvedSourceAnalysis}
           renderBlock={renderBlock}
