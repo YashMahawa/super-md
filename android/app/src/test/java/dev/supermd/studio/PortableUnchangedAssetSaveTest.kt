@@ -450,5 +450,22 @@ class PortableUnchangedAssetSaveTest {
         awaitCondition { model.state.value.pendingSaveConflictNoteId == noteId }
         assertTrue(model.state.value.activeConflicted)
         assertEquals(baselineDirs + initialDir, bundlesRoot.listFiles()?.map { it.name }?.toSet().orEmpty())
+
+        // 3. Canonical filesDir symlink aliases resolve cleanly while unexpected stray entries force rematerialization.
+        val alias = File(tempDir, "files-dir-alias")
+        java.nio.file.Files.createSymbolicLink(alias.toPath(), app.filesDir.canonicalFile.toPath())
+        val aliasedMedia = MediaStorage(
+            object : android.content.ContextWrapper(app) {
+                override fun getFilesDir(): File = alias
+            },
+        )
+        val expectedLocalAssets = aliasedMedia.portableAssets(initialDir)
+        assertTrue(aliasedMedia.hasExactLocalPortableAssets(initialDir, expectedLocalAssets))
+        val strayTmp = File(File(bundlesRoot, initialDir), ".staging.tmp").apply { writeText("stray") }
+        try {
+            org.junit.Assert.assertFalse(aliasedMedia.hasExactLocalPortableAssets(initialDir, expectedLocalAssets))
+        } finally {
+            strayTmp.delete()
+        }
     }
 }

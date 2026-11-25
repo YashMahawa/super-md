@@ -757,12 +757,16 @@ class MediaStorage(private val context: Context) {
 
     internal fun hasExactLocalPortableAssets(directory: String?, assets: JSONObject): Boolean {
         if (directory == null || !Regex("[a-f0-9-]{36}").matches(directory)) return false
+        val expectedBundlesRoot = runCatching {
+            context.filesDir.canonicalFile.toPath().resolve(bundles.name).normalize().toFile()
+        }.getOrNull() ?: return false
         val root = runCatching { File(bundles, directory).canonicalFile }.getOrNull() ?: return false
         val bundlesRoot = runCatching { bundles.canonicalFile }.getOrNull() ?: return false
-        if (root.parentFile != bundlesRoot || !root.isDirectory) return false
-        val files = root.listFiles()?.filter { it.isFile && validKey("assets/${it.name}") }.orEmpty()
-        if (files.size != assets.length()) return false
-        for (file in files) {
+        if (bundlesRoot != expectedBundlesRoot || root.parentFile != bundlesRoot || !root.isDirectory) return false
+        val entries = root.listFiles() ?: return false
+        if (entries.any { !it.isFile || !validKey("assets/${it.name}") }) return false
+        if (entries.size != assets.length()) return false
+        for (file in entries) {
             val source = "assets/${file.name}"
             if (!assets.has(source)) return false
             val expected = assets.getString(source)
