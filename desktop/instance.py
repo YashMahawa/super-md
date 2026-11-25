@@ -72,7 +72,7 @@ class InstanceBroker(QObject):
     def __init__(self, parent=None, *, service_handler=None):
         super().__init__(parent)
         self.service_handler = service_handler
-        root = Path(QStandardPaths.writableLocation(QStandardPaths.AppDataLocation)).resolve()
+        root = Path(QStandardPaths.writableLocation(QStandardPaths.StandardLocation.AppDataLocation)).resolve()
         root.mkdir(parents=True, exist_ok=True)
         self.root = root
         self.lock = QLockFile(str(root / "native-instance.lock"))
@@ -82,6 +82,7 @@ class InstanceBroker(QObject):
         self.server.setSocketOptions(QLocalServer.SocketOption.UserAccessOption)
         self.server.newConnection.connect(self.accept)
         self._should_listen = False
+        self._active_readers = {}
         self._listen_watchdog = QTimer(self)
         self._listen_watchdog.setInterval(25)
         self._listen_watchdog.timeout.connect(self._ensure_listening)
@@ -128,15 +129,34 @@ class InstanceBroker(QObject):
         return True
 
     def _ensure_listening(self) -> None:
-        if not self._should_listen or self.server.isListening() or not self.lock.isLocked():
+        if not self._should_listen or not self.lock.isLocked():
             return
-        if not self.server.errorString():
-            return
-        # On BSD/macOS (XNU), an aborted client socket in the backlog makes ::accept() return
-        # ECONNABORTED, causing Qt's QLocalServerPrivate::_q_onNewConnection to call setError()
-        # and closeServer() (QTBUG-27239). Re-bind automatically while we still own self.lock.
-        QLocalServer.removeServer(self.name)
-        self.server.listen(self.name)
+        if not self.server.isListening():
+            if not self.server.errorString():
+                return
+            # On BSD/macOS (XNU), an aborted client socket in the backlog makes ::accept() return
+            # ECONNABORTED, causing Qt's QLocalServerPrivate::_q_onNewConnection to call setError()
+            # and closeServer() (QTBUG-27239). Re-bind automatically while we still own self.lock.
+            QLocalServer.removeServer(self.name)
+            if not self.server.listen(self.name):
+                return
+        # Under macOS offscreen QPA without an active WebEngineView pumping Chromium's message loop,
+        # QLocalServer's QSocketNotifier may not fire while QTimer ticks continue reliably. Poll the
+        # listening descriptor non-blockingly and recover in-place if XNU ECONNABORTED closes it.
+        for _ in range(8):
+            progressed = False
+            if self.server.isListening():
+                progressed = bool(self.server.waitForNewConnection(0)) or self.server.hasPendingConnections()
+            if not self.server.isListening() and self.server.errorString() and self._should_listen and self.lock.isLocked():
+                QLocalServer.removeServer(self.name)
+                self.server.listen(self.name)
+            if self.server.hasPendingConnections():
+                self.accept()
+                progressed = True
+            if not progressed:
+                break
+        for reader in list(self._active_readers.values()):
+            reader()
 
     def claim_or_forward(self, note, *, defer_listen: bool = False, open_existing: bool = True):
         if self.lock.tryLock(0):
@@ -185,46 +205,72 @@ class InstanceBroker(QObject):
     def accept(self):
         while self.server.hasPendingConnections():
             socket = self.server.nextPendingConnection()
+            if socket is None:
+                continue
             buffer = bytearray()
-            def read(socket=socket, buffer=buffer):
-                buffer.extend(bytes(socket.readAll()))
-                if len(buffer) > 16384:
-                    socket.disconnectFromServer()
+            state = {"handled": False, "reading": False}
+            def cleanup(socket=socket):
+                self._active_readers.pop(socket, None)
+            def finish(socket=socket, state=state):
+                state["handled"] = True
+                self._active_readers.pop(socket, None)
+            def read(socket=socket, buffer=buffer, state=state):
+                if state["handled"] or state["reading"]:
                     return
-                if b"\n" not in buffer:
-                    return
+                state["reading"] = True
                 try:
-                    request = json.loads(buffer.split(b"\n", 1)[0])
-                    if not isinstance(request, dict):
-                        raise ValueError("Invalid IPC request")
-                    if set(request) == {"service"} and request["service"] in ("start", "status", "stop", "quit"):
-                        raw_action = request["service"]
-                        action = "stop" if raw_action == "quit" else raw_action
-                        self.serviceRequested.emit(raw_action)
-                        reply = (
-                            self.service_handler(action)
-                            if self.service_handler is not None
-                            else {"ok": False, "running": False, "error": "Background service is unavailable"}
-                        )
-                        if socket.state() == QLocalSocket.LocalSocketState.ConnectedState:
-                            socket.write(json.dumps(reply, separators=(",", ":")).encode("utf-8") + b"\n")
-                            socket.flush()
-                            if socket.state() == QLocalSocket.LocalSocketState.ConnectedState:
-                                socket.waitForBytesWritten(500)
-                            socket.disconnectFromServer()
+                    if socket.state() == QLocalSocket.LocalSocketState.ConnectedState and socket.bytesAvailable() == 0 and b"\n" not in buffer:
+                        socket.waitForReadyRead(0)
+                    if state["handled"]:
                         return
-                    note = request["note"]
-                    if set(request) != {"note"} or not isinstance(note, str) or "\0" in note:
-                        raise ValueError("Invalid file-opening request")
-                except (ValueError, TypeError, KeyError):
+                    buffer.extend(bytes(socket.readAll()))
+                    if len(buffer) > 16384:
+                        finish()
+                        socket.disconnectFromServer()
+                        return
+                    if b"\n" not in buffer:
+                        if socket.state() == QLocalSocket.LocalSocketState.UnconnectedState:
+                            finish()
+                        return
+                    finish()
+                    try:
+                        request = json.loads(buffer.split(b"\n", 1)[0])
+                        if not isinstance(request, dict):
+                            raise ValueError("Invalid IPC request")
+                        if set(request) == {"service"} and request["service"] in ("start", "status", "stop", "quit"):
+                            raw_action = request["service"]
+                            action = "stop" if raw_action == "quit" else raw_action
+                            self.serviceRequested.emit(raw_action)
+                            reply = (
+                                self.service_handler(action)
+                                if self.service_handler is not None
+                                else {"ok": False, "running": False, "error": "Background service is unavailable"}
+                            )
+                            if socket.state() == QLocalSocket.LocalSocketState.ConnectedState:
+                                socket.write(json.dumps(reply, separators=(",", ":")).encode("utf-8") + b"\n")
+                                socket.flush()
+                                if socket.state() == QLocalSocket.LocalSocketState.ConnectedState:
+                                    socket.waitForBytesWritten(500)
+                                socket.disconnectFromServer()
+                            return
+                        note = request["note"]
+                        if set(request) != {"note"} or not isinstance(note, str) or "\0" in note:
+                            raise ValueError("Invalid file-opening request")
+                    except (ValueError, TypeError, KeyError):
+                        socket.disconnectFromServer()
+                        return
+                    if socket.state() == QLocalSocket.LocalSocketState.ConnectedState:
+                        socket.write(b"ok\n")
+                        socket.flush()
+                        if socket.state() == QLocalSocket.LocalSocketState.ConnectedState:
+                            socket.waitForBytesWritten(500)
+                    self.requested.emit(note)
                     socket.disconnectFromServer()
-                    return
-                socket.write(b"ok\n")
-                socket.flush()
-                socket.waitForBytesWritten(500)
-                self.requested.emit(note)
-                socket.disconnectFromServer()
+                finally:
+                    state["reading"] = False
+            self._active_readers[socket] = read
             socket.readyRead.connect(read)
+            socket.disconnected.connect(cleanup)
             socket.disconnected.connect(socket.deleteLater)
             QTimer.singleShot(5000, socket, socket.disconnectFromServer)
             read()
@@ -232,6 +278,7 @@ class InstanceBroker(QObject):
     def stop_accepting(self):
         self._should_listen = False
         self._listen_watchdog.stop()
+        self._active_readers.clear()
         self.server.close()
         while self.server.hasPendingConnections():
             pending = self.server.nextPendingConnection()

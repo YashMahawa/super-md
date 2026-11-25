@@ -39,3 +39,27 @@ test('a large replacement is still undoable rather than silently losing all hist
   expect(h.undo).toHaveLength(1);expect(replayHistory(h,'replacement','undo')).toBe(original);
   expect(validHistory({undo:[[{from:-1,remove:1,insert:''}]],redo:[]})).toBe(false);
 });
+test('interior insertions, deletions, and cost eviction match uncached historySize',()=>{
+  const seed:NoteHistory={undo:[],redo:[],last:0};
+  recordHistory(seed,'alpha gamma','alpha old gamma',1000);
+  const h:NoteHistory={undo:structuredClone(seed.undo),redo:[],last:1000};
+  recordHistory(h,'alpha old gamma','alpha oldx gamma',1100);
+  recordHistory(h,'alpha oldx gamma','alpha oldxy gamma',1150);
+  recordHistory(h,'alpha oldxy gamma','alpha oldx gamma',1200);
+  recordHistory(h,'alpha oldx gamma','alpha old gamma',1250);
+  expect(historySize(h)).toBe(historySize({undo:structuredClone(h.undo),redo:structuredClone(h.redo),last:0}));
+  expect(replayHistory(h,'alpha old gamma','undo')).toBe('alpha gamma');
+  expect(historySize(h)).toBe(historySize({undo:structuredClone(h.undo),redo:structuredClone(h.redo),last:0}));
+  expect(replayHistory(h,'alpha gamma','redo')).toBe('alpha old gamma');
+  expect(historySize(h)).toBe(historySize({undo:structuredClone(h.undo),redo:structuredClone(h.redo),last:0}));
+  const evicted:NoteHistory={undo:[],redo:[],last:0};
+  recordHistory(evicted,'x'.repeat(1_500_000),'short',1000);
+  recordHistory(evicted,'short','y'.repeat(1_500_000),2000);
+  expect(evicted.undo).toHaveLength(2);
+  recordHistory(evicted,'y'.repeat(1_500_000),'z'.repeat(2_100_000),3000);
+  expect(evicted.undo).toHaveLength(2);
+  recordHistory(evicted,'z'.repeat(2_100_000),'final',4000);
+  expect(evicted.undo).toHaveLength(1);
+  expect(replayHistory(evicted,'final','undo')).toBe('z'.repeat(2_100_000));
+});
+

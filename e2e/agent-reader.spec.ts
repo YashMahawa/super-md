@@ -396,3 +396,252 @@ test('section export prepares MD, SMD and PDF with only selected text and needed
   expect(await page.evaluate(()=>document.activeElement?.tagName||null)).toBe(focusBefore);
   expect(await page.evaluate(()=>(window as any).__agentNative.fetches.length)).toBe(2);
 });
+
+test('FIFO reader queue resolves 8 concurrent agent requests in order and rejects beyond 16 queued items',async({page})=>{
+  const content='# Queue concurrency\n\nParagraph zero.\n\n## Section One\n\nParagraph one.\n\n```svg\n<svg xmlns="http://www.w3.org/2000/svg" width="24" height="24"><circle cx="12" cy="12" r="8"/></svg>\n```\n';
+  await page.addInitScript(initial=>{
+    const native={content:initial,revision:0};
+    window.SuperMD={post:(id:string,command:string,raw:string)=>{
+      const args=JSON.parse(raw);
+      let result:any=true,delay=12;
+      if(command==='document_sync')result={accepted:args.content===native.content,revision:native.revision};
+      else if(command==='document_flushed')delay=18;
+      window.setTimeout(()=>window.supermdReply?.(id,result,null),delay);
+    }};
+  },content);
+  await page.goto('/android-reader.html');
+  await page.waitForFunction(()=>typeof window.supermdLoad==='function');
+  const tabId='fifo-queue-e2e';
+  await page.evaluate(value=>window.supermdLoad?.(value),{id:tabId,path:null,content,mode:'reader',dark:false,fullscreen:false,colors:{},font:'Manrope',size:16,zoom:100,editProtocol:1,restorePosition:false});
+  await expect(page.getByRole('heading',{name:'Queue concurrency',exact:true})).toBeVisible();
+
+  // Trigger a pending flush boundary via a non-empty edit check, then fire 8 concurrent requests.
+  const eightOrder=await page.evaluate(async(id:string)=>{
+    const settledOrder:number[]=[];
+    const requests=Array.from({length:8},(_,index)=>new Promise<number>((resolve,reject)=>{
+      const actions=['get_context','read_tab','outline_tab','list_diagrams'] as const;
+      const action=actions[index%actions.length];
+      (window as any).supermdAgentRequest({action,tabId:id,requestId:`req-${index}`,...(action==='read_tab'?{offset:0,limit:40}:{})},(result:unknown,error:string)=>{
+        if(error){reject(new Error(error));return;}
+        if(!result)reject(new Error('Missing result'));
+        settledOrder.push(index);
+        resolve(index);
+      });
+    }));
+    await Promise.all(requests);
+    return settledOrder;
+  },tabId);
+  expect(eightOrder).toEqual([0,1,2,3,4,5,6,7]);
+
+  // Verify saturation beyond 16 queued items (1 active + 16 queued = 17 accepted, #18 & #19 rejected).
+  const saturation=await page.evaluate(async(id:string)=>{
+    const outcomes=await Promise.all(Array.from({length:19},(_,index)=>new Promise<{index:number;ok:boolean;error:string}>(resolve=>{
+      (window as any).supermdAgentRequest({action:'get_context',tabId:id,requestId:`sat-${index}`},(result:unknown,error:string)=>{
+        resolve({index,ok:!error&&!!result,error:error||''});
+      });
+    })));
+    return outcomes;
+  },tabId);
+  expect(saturation.slice(0,17).every(item=>item.ok)).toBe(true);
+  expect(saturation.slice(17).every(item=>!item.ok&&/queue is full/i.test(item.error))).toBe(true);
+});
+
+test('executed PythonCell exposes cached SVG/PNG figures and bounded stdout/stderr without running unexecuted cells',async({page})=>{
+  const png1x1='data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAIAAAACCAIAAAD91JpzAAAADklEQVR4nGP4z8DAwMAAAA8B/7k4Z7QAAAAASUVORK5CYII=';
+  const svgFig='data:image/svg+xml;base64,'+Buffer.from('<svg xmlns="http://www.w3.org/2000/svg" width="80" height="40"><rect width="80" height="40" fill="#2c6bed"/></svg>').toString('base64');
+  const content='# Notebook analysis\n\n```python\nimport matplotlib.pyplot as plt\nprint("epoch=3 loss=0.125")\n```\n\n```python\nraise RuntimeError("unrun cell must never execute")\n```\n';
+  await page.addInitScript(({svgData,pngData})=>{
+    const tracker={runCalls:[] as string[]};
+    (window as any).__pyTracker=tracker;
+    window.SuperMD={post:(id:string,command:string,raw:string)=>{
+      const args=JSON.parse(raw);
+      if(command==='run_python'){
+        tracker.runCalls.push(args.code);
+        window.setTimeout(()=>window.supermdReply?.(id,{
+          ok:true,
+          stdout:'epoch=3 loss=0.125\n',
+          stderr:'UserWarning: cached stderr detail\n',
+          images:[svgData,pngData],
+          provenance:{verified:true,document:'/tmp/notebook.md',cell:'0',interpreter:'embedded'},
+        },null),10);
+        return;
+      }
+      if(command==='load_python_output'){
+        window.setTimeout(()=>window.supermdReply?.(id,null,null),0);
+        return;
+      }
+      if(command==='cache_python_output'){
+        window.setTimeout(()=>window.supermdReply?.(id,true,null),0);
+        return;
+      }
+      window.setTimeout(()=>window.supermdReply?.(id,true,null),0);
+    }};
+  },{svgData:svgFig,pngData:png1x1});
+  await page.goto('/android-reader.html');
+  await page.waitForFunction(()=>typeof window.supermdLoad==='function');
+  const tabId='python-figures-e2e';
+  await page.evaluate(value=>window.supermdLoad?.(value),{id:tabId,path:'/tmp/notebook.md',content,mode:'reader',dark:false,fullscreen:false,colors:{},font:'Manrope',size:16,zoom:100,restorePosition:false});
+  await expect(page.getByRole('heading',{name:'Notebook analysis',exact:true})).toBeVisible();
+
+  // Before running any cell, inspection must not execute Python and returns 0 figures.
+  const beforeRun:any=await agent(page,{action:'list_diagrams',tabId});
+  expect(beforeRun.diagrams).toEqual([]);
+  expect(await page.evaluate(()=>(window as any).__pyTracker.runCalls)).toEqual([]);
+
+  // Run only the first PythonCell.
+  await page.locator('.python-cell .python-run').first().click();
+  await expect(page.locator('.python-cell .cell-output').first()).toContainText('epoch=3 loss=0.125');
+
+  const listed:any=await agent(page,{action:'list_diagrams',tabId});
+  expect(listed.diagrams.map((d:any)=>d.id)).toEqual(['diagram:python:21:0','diagram:python:21:1']);
+  expect(listed.diagrams.map((d:any)=>d.kind)).toEqual(['python-figure','python-figure']);
+  expect(JSON.stringify(listed.diagrams)).not.toContain('base64,');
+
+  const svgRendered:any=await agent(page,{action:'get_diagram_image',tabId,diagramId:'diagram:python:21:0',expectedRevision:listed.revision,width:400});
+  expect(svgRendered.mime_type).toBe('image/png');
+  expect(svgRendered.width).toBeGreaterThan(0);
+
+  const pngRendered:any=await agent(page,{action:'get_diagram_image',tabId,diagramId:'diagram:python:21:1',expectedRevision:listed.revision,width:400});
+  expect(pngRendered.mime_type).toBe('image/png');
+  expect(pngRendered.width).toBeGreaterThan(0);
+
+  const ctx:any=await agent(page,{action:'get_context',tabId});
+  expect(ctx.pythonCells).toHaveLength(1);
+  expect(ctx.pythonCells[0]).toMatchObject({
+    ordinal:0,
+    ok:true,
+    stdout:'epoch=3 loss=0.125\n',
+    stderr:'UserWarning: cached stderr detail\n',
+    figureIds:['diagram:python:21:0','diagram:python:21:1'],
+  });
+  expect(ctx.diagrams.map((d:any)=>d.id)).toEqual(['diagram:python:21:0','diagram:python:21:1']);
+  // Confirm the second unrun cell was NEVER executed by any inspection call!
+  expect(await page.evaluate(()=>(window as any).__pyTracker.runCalls)).toEqual(['import matplotlib.pyplot as plt\nprint("epoch=3 loss=0.125")']);
+});
+
+test('StepCards step 3 and portaled .step-viewer report activeStep, stepIndex 2, and visible slide notes',async({page})=>{
+  const deck={
+    title:'Gradient Descent',
+    steps:[
+      {label:'Initialize weights',diagram:{width:180,height:100,nodes:[{id:'w0',label:'w0',x:90,y:50}],edges:[]},markdown:'Start at random initial parameters.'},
+      {label:'Compute gradient',diagram:{width:180,height:100,nodes:[{id:'g',label:'grad',x:90,y:50}],edges:[]},markdown:'Evaluate the local slope of the loss.'},
+      {label:'Converge at minimum',diagram:{width:180,height:100,nodes:[{id:'min',label:'w*',x:90,y:50}],edges:[]},markdown:'Step size shrinks as gradients approach zero.'},
+    ],
+  };
+  const content=`# Optimization Deck\n\n\`\`\`smd-steps\n${JSON.stringify(deck)}\n\`\`\`\n`;
+  await page.goto('/android-reader.html');
+  await page.waitForFunction(()=>typeof window.supermdLoad==='function');
+  const tabId='step-viewer-portal-e2e';
+  await page.evaluate(value=>window.supermdLoad?.(value),{id:tabId,path:null,content,mode:'reader',dark:false,fullscreen:false,colors:{},font:'Manrope',size:16,zoom:100,restorePosition:false});
+  await expect(page.locator('.step-cards')).toBeVisible();
+
+  // Advance to step 3 (0-based stepIndex: 2).
+  await page.getByRole('button',{name:'Next step'}).click();
+  await page.getByRole('button',{name:'Next step'}).click();
+  await expect(page.locator('.step-cards')).toHaveAttribute('data-deck-title','Gradient Descent');
+  await expect(page.locator('.step-cards')).toHaveAttribute('data-step-index','2');
+  await expect(page.locator('.step-cards')).toHaveAttribute('data-step-label','Converge at minimum');
+
+  // Open enlarged .step-viewer portal on document.body.
+  await page.getByRole('button',{name:'Enlarge slide'}).click();
+  await expect(page.locator('.step-viewer')).toBeVisible();
+
+  const ctx:any=await agent(page,{action:'get_context',tabId});
+  expect(ctx.activeStep).toMatchObject({
+    deckTitle:'Gradient Descent',
+    stepLabel:'Converge at minimum',
+    stepIndex:2,
+    stepCount:3,
+    activeStep:true,
+    expanded:true,
+  });
+  const activeDiagram=ctx.diagrams.find((d:any)=>d.activeStep===true);
+  expect(activeDiagram).toMatchObject({
+    deckTitle:'Gradient Descent',
+    stepLabel:'Converge at minimum',
+    stepIndex:2,
+    stepCount:3,
+    activeStep:true,
+  });
+  expect(ctx.reading.visibleText).toContain('Converge at minimum');
+  expect(ctx.reading.visibleText).toContain('Step size shrinks as gradients approach zero.');
+});
+
+test('get_context reads visible text, reading.offset, and active selection across editor, split, and live textarea modes',async({page})=>{
+  const content='# Architecture Guide\n\nFirst paragraph in the guide.\n\n## Core Pipeline\n\nTarget phrase for mode-aware selection checks.\n\nFinal summary paragraph.\n';
+  await page.goto('/android-reader.html');
+  await page.waitForFunction(()=>typeof window.supermdLoad==='function');
+  const tabId='mode-aware-context-e2e';
+
+  // 1. Source (editor) mode
+  await page.evaluate(value=>window.supermdLoad?.(value),{id:tabId,path:null,content,mode:'editor',dark:false,fullscreen:false,colors:{},font:'Manrope',size:16,zoom:100,restorePosition:false});
+  await expect(page.locator('.cm-content')).toBeVisible();
+  const targetStart=content.indexOf('mode-aware selection'),targetEnd=targetStart+'mode-aware selection'.length;
+  await page.evaluate(({from,to})=>{
+    window.dispatchEvent(new CustomEvent('supermd-editor-goto',{detail:from}));
+    // Select exact range via editorFindRange-compatible dispatch on focused editor
+    const cmContent=document.querySelector('.cm-content') as HTMLElement|null;
+    cmContent?.focus();
+    const walker=document.createTreeWalker(cmContent!,NodeFilter.SHOW_TEXT);
+    let node:Node|null;
+    while(node=walker.nextNode()){
+      const txt=node.textContent??'',idx=txt.indexOf('mode-aware selection');
+      if(idx>=0){
+        const r=document.createRange();r.setStart(node,idx);r.setEnd(node,idx+'mode-aware selection'.length);
+        const sel=window.getSelection()!;sel.removeAllRanges();sel.addRange(r);
+        break;
+      }
+    }
+    void to;
+  },{from:targetStart,to:targetEnd});
+  await page.waitForTimeout(50);
+  const editorCtx:any=await agent(page,{action:'get_context',tabId});
+  expect(editorCtx.mode).toBe('editor');
+  expect(editorCtx.reading.visibleText.length).toBeGreaterThan(0);
+  expect(editorCtx.reading.visibleText).toContain('Core Pipeline');
+  expect(editorCtx.reading.offset).toBeGreaterThanOrEqual(0);
+  expect(editorCtx.selection.text).toBe('mode-aware selection');
+
+  // 2. Split mode: reads .android-reading prose AND CodeMirror selection
+  await page.evaluate(value=>window.supermdLoad?.(value),{id:tabId,path:null,content,mode:'split',dark:false,fullscreen:false,colors:{},font:'Manrope',size:16,zoom:100,restorePosition:false});
+  await expect(page.locator('.android-reading .markdown-body')).toBeVisible();
+  await expect(page.locator('.cm-content')).toBeVisible();
+  await page.evaluate(()=>{
+    const cmContent=document.querySelector('.cm-content') as HTMLElement|null;
+    cmContent?.focus();
+    const walker=document.createTreeWalker(cmContent!,NodeFilter.SHOW_TEXT);
+    let node:Node|null;
+    while(node=walker.nextNode()){
+      const txt=node.textContent??'',idx=txt.indexOf('Core Pipeline');
+      if(idx>=0){
+        const r=document.createRange();r.setStart(node,idx);r.setEnd(node,idx+'Core Pipeline'.length);
+        const sel=window.getSelection()!;sel.removeAllRanges();sel.addRange(r);
+        break;
+      }
+    }
+  });
+  await page.waitForTimeout(50);
+  const splitCtx:any=await agent(page,{action:'get_context',tabId});
+  expect(splitCtx.mode).toBe('split');
+  expect(splitCtx.reading.visibleText).toContain('Target phrase for mode-aware selection checks.');
+  expect(splitCtx.selection.text).toBe('Core Pipeline');
+
+  // 3. Live mode with mounted <textarea> selection
+  await page.evaluate(value=>window.supermdLoad?.(value),{id:tabId,path:null,content,mode:'live',dark:false,fullscreen:false,colors:{},font:'Manrope',size:16,zoom:100,restorePosition:false});
+  const liveParagraph=page.locator('.live-block').filter({hasText:'Target phrase for mode-aware selection checks.'}).first();
+  await expect(liveParagraph).toBeVisible();
+  await liveParagraph.dblclick();
+  const textarea=page.locator('.live-active-block textarea');
+  await expect(textarea).toBeVisible();
+  await textarea.evaluate(el=>{
+    const ta=el as HTMLTextAreaElement;
+    const from=ta.value.indexOf('Target phrase'),to=from+'Target phrase'.length;
+    ta.focus();
+    ta.setSelectionRange(from,to);
+  });
+  const liveCtx:any=await agent(page,{action:'get_context',tabId});
+  expect(liveCtx.mode).toBe('live');
+  expect(liveCtx.reading.visibleText).toContain('Target phrase for mode-aware selection checks.');
+  expect(liveCtx.reading.offset).toBe(Array.from(content.slice(0,content.indexOf('Target phrase'))).length);
+  expect(liveCtx.selection.text).toBe('Target phrase');
+});

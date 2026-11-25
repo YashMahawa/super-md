@@ -534,14 +534,15 @@ def _qt_bridge_class():
             self.cloudClient.stop()
             with self._lock:
                 cancelled = [(key, value) for key, value in self._pending.items() if value.get("cloud")]
-                for request_id, value in cancelled:
+                for request_id, _ in cancelled:
                     self._pending.pop(request_id, None)
-                    value["error"] = "Cloud live access was disabled"
-                    value["event"].set()
                 cancelled_ids = {request_id for request_id, _ in cancelled}
                 for child_id, owner in list(self._dispatches.items()):
                     if owner[0] in cancelled_ids:
                         self._dispatches.pop(child_id, None)
+            for _, value in cancelled:
+                value["error"] = "Cloud live access was disabled"
+                value["event"].set()
 
         def _remote_call_gui(self, payload: dict[str, Any]) -> dict[str, Any]:
             request = dict(payload)
@@ -928,6 +929,8 @@ def _qt_bridge_class():
                     if studio is None:
                         raise ValueError("No desktop window is available")
                     with self._lock:
+                        if request_id not in self._pending:
+                            return
                         self._pending[request_id]["window_id"] = studio.window_id
                     self._flush_then_native(request_id, studio, payload)
                     return
@@ -951,6 +954,8 @@ def _qt_bridge_class():
                         if studio is None:
                             raise ValueError("No desktop window is available")
                         with self._lock:
+                            if request_id not in self._pending:
+                                return
                             self._pending[request_id]["window_id"] = studio.window_id
                         result = (studio._agent_export_chunk(payload.get("jobId"), payload.get("offset", 0),
                                                             payload.get("limit", 262_144))
@@ -964,6 +969,8 @@ def _qt_bridge_class():
                         if studio is None:
                             raise ValueError("No desktop window is available")
                         with self._lock:
+                            if request_id not in self._pending:
+                                return
                             self._pending[request_id]["window_id"] = studio.window_id
                         self._flush_then_native(request_id, studio, payload)
                         return
@@ -988,6 +995,8 @@ def _qt_bridge_class():
                         return
                     request = {**payload, "requestId": request_id}
                     with self._lock:
+                        if request_id not in self._pending:
+                            return
                         self._pending[request_id]["window_id"] = studio.window_id
                     studio.agentRequest.emit(json.dumps(request, ensure_ascii=False, separators=(",", ":")))
                     return
@@ -1208,134 +1217,210 @@ def _qt_bridge_class():
                 raise ValueError("Unsupported asset action")
             return studio._agent_document_action(args)
 
-        def complete(self, request_id: str, result: Any, error: str = "", window_id: str = ""):
+        @staticmethod
+        def _is_async_native_action(payload: dict[str, Any]) -> bool:
+            action = payload.get("action")
+            return action in ("save_document", "replace_tab_asset") or (
+                action == "asset_action" and payload.get("assetAction") == "attach"
+            )
+
+        def _verify_native_write_revision(self, payload: dict[str, Any], studio) -> None:
+            target = next((tab for tab in studio.tabs if tab["id"] == payload.get("tabId")), None)
+            if target is None:
+                raise ValueError("The requested live tab is no longer open")
+            source = target["content"]
+            current_revision = hashlib.sha256(source.encode("utf-8")).hexdigest()
+            expected = payload.get("expectedRevision")
+            if payload.get("action") == "asset_action":
+                if expected != current_revision:
+                    raise ValueError("Live tab revision changed; inspect it again before using an asset")
+                return
+            if expected is not None and expected != current_revision:
+                raise ValueError(json.dumps({"error": "Revision conflict; inspect the current note before retrying",
+                                             "currentRevision": current_revision,
+                                             "sourceLength": len(source)}))
+
+        def _finish_pending(self, request_id: str, result: Any, error: str = "", *, expected_window: str = "") -> bool:
             with self._lock:
-                dispatch = self._dispatches.pop(request_id, None)
-                if dispatch:
-                    parent_id, expected_window, dispatch_type = dispatch
-                    if window_id != expected_window:
-                        return False
-                    pending = self._pending.get(parent_id)
-                    if pending is None:
-                        return False
-                    if dispatch_type == "native":
-                        if error:
-                            pending["error"] = str(error)[:1000]
-                        else:
-                            studio = self.session.windows.get(expected_window)
-                            try:
-                                if studio is None or studio.retired:
-                                    raise ValueError("The target desktop window was closed")
-                                if pending["payload"]["action"] in ("list_diagrams", "get_diagram"):
-                                    payload = pending["payload"]
-                                    target = next((tab for tab in studio.tabs if tab["id"] == payload.get("tabId")), None)
-                                    if target is None: raise ValueError("The requested live tab is no longer open")
-                                    pending["window_id"] = studio.window_id
-                                    request = {**payload, "requestId": parent_id, "_snapshot": True, "content": target["content"]}
-                                    studio.agentRequest.emit(json.dumps(request, ensure_ascii=False, separators=(",", ":")))
-                                    return True
-                                host_window = getattr(studio, "host_window", None)
-                                hidden_window = (
-                                    host_window is not None
-                                    and not host_window.isVisible()
-                                )
-                                if (pending["payload"]["action"] == "patch_tab"
-                                        and pending["payload"].get("tabId") == studio.active
-                                        and not hidden_window):
-                                    # Let the active reader apply through its editor/history path. Native
-                                    # patches remain appropriate for inactive tabs, where no reader view
-                                    # exists and switching tabs would disturb the user's current draft.
-                                    pending["window_id"] = studio.window_id
-                                    request = {**pending["payload"], "requestId": parent_id}
-                                    studio.agentRequest.emit(json.dumps(request, ensure_ascii=False, separators=(",", ":")))
-                                    return True
-                                pending["result"] = self._native_result(pending["payload"], studio)
-                            except Exception as failure:
-                                pending["error"] = str(failure)[:1000]
-                        pending["event"].set()
-                        return True
-                    rows = result.get("tabs") if isinstance(result, dict) else None
-                    fallback = pending.get("fallback", {}).get(expected_window, [])
-                    fallback_by_id = {row.get("id"): row for row in fallback if isinstance(row, dict)}
-                    owner_studio = self.session.windows.get(expected_window)
-                    owner_host = getattr(owner_studio, "host_window", None) if owner_studio is not None else None
-                    owner_visible = owner_host is None or owner_host.isVisible()
-                    if isinstance(rows, list):
-                        for row in rows:
-                            if not isinstance(row, dict):
-                                continue
-                            merged = dict(fallback_by_id.get(row.get("id"), {}))
-                            merged.update({key: row[key] for key in (
-                                "id", "windowId", "title", "path", "format", "isDirty",
-                                "sourceLength", "revision", "active") if key in row})
-                            if not owner_visible:
-                                merged["active"] = False
-                            if merged.get("id"):
-                                pending["aggregate"].append(merged)
-                    else:
-                        # Preserve the native snapshot if a renderer is not
-                        # ready, while still listing the currently open tab.
-                        pending["aggregate"].extend(fallback)
-                    pending["completed"] += 1
-                    if pending["completed"] < pending["expected"]:
-                        return True
-                    pending["result"] = {"tabs": pending["aggregate"][:200]}
-                    pending["error"] = ""
-                    pending["event"].set()
-                    return True
                 pending = self._pending.get(request_id)
                 if pending is None:
                     return False
-                if pending.get("window_id") and window_id != pending["window_id"]:
+                if expected_window and pending.get("window_id") and expected_window != pending["window_id"]:
                     return False
-                if not error and pending["payload"].get("action") == "patch_tab":
-                    studio = self.session.windows.get(window_id)
-                    tab_id = pending["payload"].get("tabId")
-                    target = next((tab for tab in studio.tabs if tab["id"] == tab_id), None) if studio else None
-                    if target is None or not isinstance(result, dict):
-                        error = "The requested live tab is no longer open"
-                    else:
-                        current_revision = hashlib.sha256(target["content"].encode("utf-8")).hexdigest()
-                        returned_revision = result.get("revision")
-                        if returned_revision != current_revision:
-                            error = json.dumps({"error": "Revision conflict; inspect the current note before retrying",
-                                                "currentRevision": current_revision,
-                                                "sourceLength": len(target["content"])})
-                        else:
-                            result = dict(result)
-                            result.setdefault("tabId", tab_id)
-                            result.setdefault("windowId", window_id)
-                            result["sourceLength"] = len(target["content"])
-                            if "operations" in result:
-                                result.setdefault("operation_results", result["operations"])
-                elif error and pending["payload"].get("action") == "patch_tab":
-                    studio = self.session.windows.get(window_id)
-                    tab_id = pending["payload"].get("tabId")
-                    target = next((tab for tab in studio.tabs if tab["id"] == tab_id), None) if studio else None
-                    expected = pending["payload"].get("expectedRevision")
-                    if target is not None:
-                        current_revision = hashlib.sha256(target["content"].encode("utf-8")).hexdigest()
-                        if expected != current_revision:
-                            error = json.dumps({"error": "Revision conflict; inspect the current note before retrying",
-                                                "currentRevision": current_revision,
-                                                "sourceLength": len(target["content"])})
-                if not error and pending["payload"].get("action") in ("list_diagrams", "get_diagram", "get_diagram_image"):
-                    studio = self.session.windows.get(window_id)
-                    tab_id = pending["payload"].get("tabId")
-                    target = next((tab for tab in studio.tabs if tab["id"] == tab_id), None) if studio else None
-                    if target is None:
-                        error = "The requested live tab is no longer open"
-                    elif not isinstance(result, dict):
-                        error = "Diagram handler returned an invalid result"
-                    else:
-                        revision = hashlib.sha256(target["content"].encode("utf-8")).hexdigest()
-                        expected = pending["payload"].get("expectedRevision")
-                        if result.get("revision") != revision or expected and expected != revision:
-                            error = "Live tab changed while its diagrams were being read; inspect again"
                 pending["result"] = result
                 pending["error"] = str(error)[:1000] if error else ""
-                pending["event"].set()
+                event = pending["event"]
+            event.set()
+            return True
+
+        def complete(self, request_id: str, result: Any, error: str = "", window_id: str = ""):
+            with self._lock:
+                dispatch = self._dispatches.get(request_id)
+                if dispatch is not None:
+                    parent_id, expected_window, dispatch_type = dispatch
+                    if window_id != expected_window:
+                        return False
+                    self._dispatches.pop(request_id, None)
+                    pending = self._pending.get(parent_id)
+                    if pending is None:
+                        return False
+                    payload = pending["payload"]
+                    fallback = list(pending.get("fallback", {}).get(expected_window, [])) if dispatch_type == "list" else []
+                else:
+                    parent_id = request_id
+                    expected_window = window_id
+                    dispatch_type = ""
+                    pending = self._pending.get(request_id)
+                    if pending is None:
+                        return False
+                    if pending.get("window_id") and window_id != pending["window_id"]:
+                        return False
+                    payload = pending["payload"]
+                    fallback = []
+
+            if dispatch_type == "native":
+                if error:
+                    return self._finish_pending(parent_id, None, str(error)[:1000])
+                studio = self.session.windows.get(expected_window)
+                try:
+                    if studio is None or studio.retired:
+                        raise ValueError("The target desktop window was closed")
+                    host_window = getattr(studio, "host_window", None)
+                    hidden_window = host_window is not None and not host_window.isVisible()
+                    if payload["action"] in ("list_diagrams", "get_diagram"):
+                        target = next((tab for tab in studio.tabs if tab["id"] == payload.get("tabId")), None)
+                        if target is None:
+                            raise ValueError("The requested live tab is no longer open")
+                        if payload.get("tabId") == studio.active and not hidden_window:
+                            request = {**payload, "requestId": parent_id}
+                        else:
+                            request = {**payload, "requestId": parent_id, "_snapshot": True,
+                                       "content": target["content"], "path": target.get("path", ""),
+                                       "python": studio.settings.get("python", "embedded")}
+                        encoded = json.dumps(request, ensure_ascii=False, separators=(",", ":"))
+                        with self._lock:
+                            parent_entry = self._pending.get(parent_id)
+                            if parent_entry is None:
+                                return False
+                            parent_entry["window_id"] = studio.window_id
+                        studio.agentRequest.emit(encoded)
+                        return True
+                    if payload["action"] == "patch_tab" and payload.get("tabId") == studio.active and not hidden_window:
+                        # Let the active reader apply through its editor/history path. Native
+                        # patches remain appropriate for inactive tabs, where no reader view
+                        # exists and switching tabs would disturb the user's current draft.
+                        request = {**payload, "requestId": parent_id}
+                        encoded = json.dumps(request, ensure_ascii=False, separators=(",", ":"))
+                        with self._lock:
+                            parent_entry = self._pending.get(parent_id)
+                            if parent_entry is None:
+                                return False
+                            parent_entry["window_id"] = studio.window_id
+                        studio.agentRequest.emit(encoded)
+                        return True
+                    async_handler = getattr(studio, "_agent_document_action_async", None)
+                    if self._is_async_native_action(payload) and callable(async_handler):
+                        self._verify_native_write_revision(payload, studio)
+                        with self._lock:
+                            parent_entry = self._pending.get(parent_id)
+                            if parent_entry is None:
+                                return False
+                            parent_entry["window_id"] = studio.window_id
+                        async_handler(
+                            payload,
+                            lambda async_result, async_error: self._finish_pending(
+                                parent_id, async_result, async_error or "", expected_window=studio.window_id
+                            ),
+                        )
+                        return True
+                    native_result = self._native_result(payload, studio)
+                except Exception as failure:
+                    return self._finish_pending(parent_id, None, str(failure)[:1000])
+                return self._finish_pending(parent_id, native_result)
+
+            if dispatch_type == "list":
+                rows = result.get("tabs") if isinstance(result, dict) else None
+                fallback_by_id = {row.get("id"): row for row in fallback if isinstance(row, dict)}
+                owner_studio = self.session.windows.get(expected_window)
+                owner_host = getattr(owner_studio, "host_window", None) if owner_studio is not None else None
+                owner_visible = owner_host is None or owner_host.isVisible()
+                merged_rows = []
+                if isinstance(rows, list):
+                    for row in rows:
+                        if not isinstance(row, dict):
+                            continue
+                        merged = dict(fallback_by_id.get(row.get("id"), {}))
+                        merged.update({key: row[key] for key in (
+                            "id", "windowId", "title", "path", "format", "isDirty",
+                            "sourceLength", "revision", "active") if key in row})
+                        if not owner_visible:
+                            merged["active"] = False
+                        if merged.get("id"):
+                            merged_rows.append(merged)
+                else:
+                    # Preserve the native snapshot if a renderer is not
+                    # ready, while still listing the currently open tab.
+                    merged_rows.extend(fallback)
+                event = None
+                with self._lock:
+                    parent_entry = self._pending.get(parent_id)
+                    if parent_entry is None:
+                        return False
+                    parent_entry["aggregate"].extend(merged_rows)
+                    parent_entry["completed"] += 1
+                    if parent_entry["completed"] >= parent_entry["expected"]:
+                        parent_entry["result"] = {"tabs": parent_entry["aggregate"][:200]}
+                        parent_entry["error"] = ""
+                        event = parent_entry["event"]
+                if event is not None:
+                    event.set()
                 return True
+
+            if not error and payload.get("action") == "patch_tab":
+                studio = self.session.windows.get(window_id)
+                tab_id = payload.get("tabId")
+                target = next((tab for tab in studio.tabs if tab["id"] == tab_id), None) if studio else None
+                if target is None or not isinstance(result, dict):
+                    error = "The requested live tab is no longer open"
+                else:
+                    current_revision = hashlib.sha256(target["content"].encode("utf-8")).hexdigest()
+                    returned_revision = result.get("revision")
+                    if returned_revision != current_revision:
+                        error = json.dumps({"error": "Revision conflict; inspect the current note before retrying",
+                                            "currentRevision": current_revision,
+                                            "sourceLength": len(target["content"])})
+                    else:
+                        result = dict(result)
+                        result.setdefault("tabId", tab_id)
+                        result.setdefault("windowId", window_id)
+                        result["sourceLength"] = len(target["content"])
+                        if "operations" in result:
+                            result.setdefault("operation_results", result["operations"])
+            elif error and payload.get("action") == "patch_tab":
+                studio = self.session.windows.get(window_id)
+                tab_id = payload.get("tabId")
+                target = next((tab for tab in studio.tabs if tab["id"] == tab_id), None) if studio else None
+                expected = payload.get("expectedRevision")
+                if target is not None:
+                    current_revision = hashlib.sha256(target["content"].encode("utf-8")).hexdigest()
+                    if expected != current_revision:
+                        error = json.dumps({"error": "Revision conflict; inspect the current note before retrying",
+                                            "currentRevision": current_revision,
+                                            "sourceLength": len(target["content"])})
+            if not error and payload.get("action") in ("list_diagrams", "get_diagram", "get_diagram_image"):
+                studio = self.session.windows.get(window_id)
+                tab_id = payload.get("tabId")
+                target = next((tab for tab in studio.tabs if tab["id"] == tab_id), None) if studio else None
+                if target is None:
+                    error = "The requested live tab is no longer open"
+                elif not isinstance(result, dict):
+                    error = "Diagram handler returned an invalid result"
+                else:
+                    revision = hashlib.sha256(target["content"].encode("utf-8")).hexdigest()
+                    expected = payload.get("expectedRevision")
+                    if result.get("revision") != revision or expected and expected != revision:
+                        error = "Live tab changed while its diagrams were being read; inspect again"
+            return self._finish_pending(request_id, result, error, expected_window=window_id)
 
         def has_pending(self, request_id: str, window_id: str, action: str, tab_id: str) -> bool:
             """Confirm an asynchronous renderer callback still owns its request."""

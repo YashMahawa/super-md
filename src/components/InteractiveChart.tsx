@@ -1,6 +1,6 @@
 import { useEffect, useId, useMemo, useRef, useState, type CSSProperties } from "react";
 import { compileMathExpression } from "../mathExpression";
-import { parseChartSpec, lineSegments, safeCurve, chartFeatures, seriesLabel, type ChartFeature, type Curve, type Sample } from "../chartModel";
+import { parseChartSpec, lineSegments, safeCurve, chartFeatures, seriesLabel, sliderStep, type ChartFeature, type Curve, type Sample } from "../chartModel";
 import { chartValues, chartGrids, remember } from "../renderedOutputs";
 import { useChartZoom } from "../useChartZoom";
 import { axisNumber, axisTicks } from "../focalZoom";
@@ -16,7 +16,8 @@ export default function InteractiveChart({source,dark=false,appearance,colors:th
   const clipId = useId().replace(/:/g,"_");
   const plot = useChartZoom(source);
   const parsed = useMemo(()=>{try{return {spec:parseChartSpec(source),error:""};}catch(error){return {spec:null,error:String(error)};}},[source]);
-  const initial = ()=>chartValues.get(source)||Object.fromEntries((parsed.spec?.sliders||[]).map(slider=>[slider.name,slider.value]));
+  const defaultValues = useMemo(()=>Object.fromEntries((parsed.spec?.sliders||[]).map(slider=>[slider.name,slider.value])),[parsed]);
+  const initial = ()=>chartValues.get(source)||defaultValues;
   const [values,setValues] = useState<Record<string,number>>(initial);
   const [grid,setGrid] = useState(()=>chartGrids.get(source)??true);
   const svgRef=useRef<SVGSVGElement>(null);
@@ -63,7 +64,7 @@ export default function InteractiveChart({source,dark=false,appearance,colors:th
   },[spec,rawSeries,curves,plot.zoom,plot.center]);
   const features = useMemo(()=>geometry&&spec?chartFeatures(geometry.visibleSeries,spec.series.map((series,index)=>series.points?null:curves[index]),geometry.yMax-geometry.yMin):[],[geometry,curves,spec]);
   if(!spec || !geometry) return <div className="render-error" role="status">Invalid smd-chart: {parsed.error}</div>;
-  const {xMin,xMax,yMin,yMax,hasSamples,visibleSeries}=geometry;
+  const {xMin,xMax,yMin,yMax,visibleSeries}=geometry;
   const colors=spec.series.map((series,i)=>{
     const original=series.color||(dark?darkPalette:palette)[i%palette.length];
     if(appearance==='monochrome')return mediaTone(themeColors??{},dark).ink;
@@ -114,17 +115,21 @@ export default function InteractiveChart({source,dark=false,appearance,colors:th
     return {x:px(found.x),y:py(found.y),coordinates:[found.x,found.y],label:labels[found.series],color:colors[found.series],guide};
   };
   const moved=plot.zoom!==1||plot.center.x!==0||plot.center.y!==0;
-  return <figure ref={plot.host} className="interactive-chart" data-plot-zoom={plot.zoom} data-center-x={plot.center.x} data-center-y={plot.center.y}>
+  const slidersMoved=Boolean(spec.sliders?.some(slider=>Math.abs(effectiveValues[slider.name]-slider.value)>1e-12));
+  const resetSliders=()=>{remember(chartValues,source,defaultValues);setValues(defaultValues);};
+  const emptySeries=visibleSeries.flatMap((points,index)=>points.some(([,y])=>Number.isFinite(y))?[]:[labels[index]]);
+  return <figure ref={plot.host} className="interactive-chart" data-plot-zoom={plot.zoom} data-center-x={plot.center.x} data-center-y={plot.center.y} onDoubleClick={moved?event=>{if(!(event.target as Element).closest('button,input')){event.stopPropagation();plot.reset();}}:undefined}>
     {spec.title && <figcaption>{spec.title}</figcaption>}
     <div className="chart-toolbar">
       <div className="chart-legend" role="list" aria-label="Equations">{spec.series.map((series,index)=><span role="listitem" key={index} style={{"--series-color":colors[index]} as CSSProperties}><i aria-hidden="true"/>{labels[index]}{series.name&&series.expression?<small>y = {series.expression.replace(/\bMath\./g,"")}</small>:null}</span>)}</div>
       {/* Text-only buttons: the plot must stay the figure's only <svg>. */}
       <div className="chart-actions">
+        {slidersMoved && <button type="button" onClick={resetSliders} title="Reset sliders">Reset sliders</button>}
         {moved && <button type="button" onClick={plot.reset} title="Reset view">Reset view</button>}
         <button type="button" aria-pressed={grid} title="Grid" onClick={()=>{remember(chartGrids,source,!grid);setGrid(!grid);}}>Grid</button>
       </div>
     </div>
-    <div data-independent-zoom onDoubleClick={moved?plot.reset:undefined}>
+    <div data-independent-zoom>
       <svg ref={svgRef} viewBox={`0 0 ${width} ${height}`} data-media-kind="diagram" data-media-adapted={appearance==='auto'||appearance==='monochrome'?'true':undefined} data-plot-left={left} role="img" aria-label={spec.title||`Graph of ${labels.join(", ")}`}>
         <defs><clipPath id={clipId}><rect x={left} y={top} width={plotWidth} height={plotHeight}/></clipPath></defs>
         {axisTicks(xMin,xMax,Math.max(2,Math.min(8,Math.floor(plotWidth/90)))).map(x=><g key={`x${x}`}>{grid && <line className="chart-grid" x1={px(x)} x2={px(x)} y1={top} y2={height-bottom}/>}<text className="chart-tick" x={px(x)} y={height-bottom+20} textAnchor="middle">{axisNumber(x)}</text></g>)}
@@ -136,10 +141,10 @@ export default function InteractiveChart({source,dark=false,appearance,colors:th
         {endLabels.map(label=><text key={`label${label.index}`} className="chart-curve-label" data-series-index={label.index} x={Math.min(label.x,width-right)-6} y={label.y-8} textAnchor="end" fill={colors[label.index]} style={{fill:colors[label.index]}}>{labels[label.index]}</text>)}
         <GraphProbe svg={svgRef} locate={locate}/>
       </svg></div>
-      {!hasSamples && <div className="chart-warning" role="status">No finite samples. Check the expression and variable names.</div>}
+      {emptySeries.length>0 && <div className="chart-warning" role="status">No finite samples for {emptySeries.join(", ")}. Check the expression and variable names.</div>}
     {!!spec.sliders?.length && <div className="chart-controls">{spec.sliders.map(slider=>{const value=effectiveValues[slider.name];return <label key={slider.name}>
       <span className="chart-slider-head"><span>{slider.label||slider.name}</span><output>{Number(value.toPrecision(5))}</output></span>
-      <input type="range" min={slider.min} max={slider.max} step={slider.step??(slider.max-slider.min)/100} value={value} aria-valuetext={`${slider.label||slider.name} = ${Number(value.toPrecision(5))}`} style={{"--chart-progress":`${100*(value-slider.min)/(slider.max-slider.min)}%`} as CSSProperties} onChange={event=>setValues(current=>{const next={...current,[slider.name]:Number(event.target.value)};remember(chartValues,source,next);return next;})}/>
+      <input type="range" min={slider.min} max={slider.max} step={sliderStep(slider)} value={value} aria-valuetext={`${slider.label||slider.name} = ${Number(value.toPrecision(5))}`} style={{"--chart-progress":`${100*(value-slider.min)/(slider.max-slider.min)}%`} as CSSProperties} onChange={event=>setValues(current=>{const next={...current,[slider.name]:Number(event.target.value)};remember(chartValues,source,next);return next;})}/>
       <span className="chart-slider-range" aria-hidden="true"><span>{axisNumber(slider.min)}</span><span>{axisNumber(slider.max)}</span></span>
     </label>;})}</div>}
   </figure>;

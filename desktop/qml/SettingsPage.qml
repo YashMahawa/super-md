@@ -97,20 +97,86 @@ Pane {
                 ModeGroup { Layout.fillWidth: true; choices: [{key:"system",label:"System"},{key:"light",label:"Light"},{key:"dark",label:"Dark"},{key:"black",label:"Pure black"}]; selected: viewState.settings.fullTheme; onChosen: key => page.save("fullTheme", key) }
                 Label { text: "Theme color" }
                 ChoiceField { Layout.fillWidth: true; enabled:!studio.customThemeActive; model: ["System accent", "Blue", "Violet", "Rose", "Amber"]; currentIndex: ["system","blue","violet","rose","amber"].indexOf(viewState.settings.accent); onActivated: page.save("accent",["system","blue","violet","rose","amber"][currentIndex]) }
-                Label { text: studio.customThemeActive ? "The imported theme supplies its palette. Reset to built-in below to use this accent picker." : "System uses your desktop accent when available; otherwise app blue. Choose a color independently of light or dark mode."; Layout.fillWidth: true; wrapMode: Text.WordWrap; color: viewState.colors.muted }
+                Label { text: studio.customThemeActive ? "The active custom theme supplies its palette. Reset to built-in below to use this accent picker." : "System uses your desktop accent when available; otherwise app blue. Choose a color independently of light or dark mode."; Layout.fillWidth: true; wrapMode: Text.WordWrap; color: viewState.colors.muted }
                 Switch { text: "Expressive motion"; checked: viewState.settings.motion; onToggled: page.save("motion", checked) }
                 Label { text: "Custom theme"; font.pixelSize:22; font.weight:Font.DemiBold; Layout.topMargin:12 }
                 Label { text:studio.customThemeName; textFormat:Text.PlainText; Layout.fillWidth:true; font.weight:Font.DemiBold }
-                Label { text:"Editable theme files style controls, reading colors, typography and background patterns. Your reading font and text size remain yours. Invalid edits keep the last valid theme."; Layout.fillWidth:true; wrapMode:Text.WordWrap; color:viewState.colors.muted }
+                Label { text:"Choose a bundled preset or import your own editable JSON theme to style controls, reading colors, typography and background patterns. Reading font and text size remain yours."; Layout.fillWidth:true; wrapMode:Text.WordWrap; color:viewState.colors.muted }
+                Label { text: "Theme preset" }
+                ChoiceField {
+                    id: bundledThemeChoice
+                    objectName: "bundledThemeChoice"
+                    viewportItem: settingsScroll.contentItem
+                    Accessible.name: "Theme preset"
+                    Layout.fillWidth: true
+                    readonly property var presetEntries: [{id: "builtin", name: "Built-in appearance"}].concat(studio.bundledThemes)
+                    model: presetEntries.map(entry => entry.name)
+                    currentIndex: studio.activeThemeKind === "preset" ? presetEntries.findIndex(entry => entry.id === studio.activeThemeId) : studio.activeThemeKind === "builtin" ? 0 : -1
+                    displayText: studio.activeThemeKind === "saved" ? ("Imported: " + studio.customThemeName) : (currentIndex >= 0 ? presetEntries[currentIndex].name : studio.customThemeName)
+                    onActivated: index => {
+                        const chosen = presetEntries[index]
+                        if (!chosen) return
+                        if (chosen.id === "builtin") studio.resetCustomTheme()
+                        else studio.selectBundledTheme(chosen.id)
+                    }
+                }
+                Label { visible: studio.savedThemes.length > 0; text: "Saved imported themes"; font.weight: Font.DemiBold }
+                Repeater {
+                    id: savedThemeChoices
+                    objectName: "savedThemeChoices"
+                    model: studio.savedThemes
+                    delegate: RowLayout {
+                        id: savedRow
+                        required property var modelData
+                        readonly property bool current: studio.activeThemeKind === "saved" && studio.activeThemeId === modelData.id
+                        Layout.fillWidth: true
+                        spacing: 8
+                        ItemDelegate {
+                            id: savedChoice
+                            objectName: "savedTheme_" + savedRow.modelData.id
+                            Layout.fillWidth: true
+                            implicitHeight: 56
+                            leftPadding: 14
+                            rightPadding: 14
+                            Accessible.name: savedRow.modelData.name + (savedRow.current ? ", active" : "")
+                            background: Rectangle {
+                                radius: savedRow.current ? 18 : 14
+                                color: savedRow.current ? viewState.colors["primary-container"] : viewState.colors["surface-high"]
+                                border.width: savedChoice.visualFocus ? 2 : 0
+                                border.color: viewState.colors.primary
+                                Rectangle { anchors.fill: parent; radius: parent.radius; color: viewState.colors.text; opacity: savedChoice.down ? .1 : savedChoice.hovered ? .05 : 0 }
+                            }
+                            contentItem: RowLayout {
+                                spacing: 12
+                                ToolButton { enabled: false; focusPolicy: Qt.NoFocus; padding: 0; background: null; icon.source: "../icons/" + (savedRow.current ? "CheckCircle" : "FolderOpen") + ".svg"; icon.color: savedRow.current ? viewState.colors["on-primary-container"] : viewState.colors.muted; icon.width: 20; icon.height: 20; Layout.preferredWidth: 24; Layout.preferredHeight: 24 }
+                                ColumnLayout {
+                                    spacing: 2
+                                    Layout.fillWidth: true
+                                    Label { text: savedRow.modelData.name; textFormat: Text.PlainText; font.weight: Font.DemiBold; color: savedRow.current ? viewState.colors["on-primary-container"] : viewState.colors.text; elide: Text.ElideRight; Layout.fillWidth: true }
+                                    Label { visible: !!savedRow.modelData.source; text: savedRow.modelData.source || ""; textFormat: Text.PlainText; font.pixelSize: 12; color: savedRow.current ? viewState.colors["on-primary-container"] : viewState.colors.muted; elide: Text.ElideMiddle; Layout.fillWidth: true }
+                                }
+                            }
+                            onClicked: studio.selectSavedTheme(savedRow.modelData.id)
+                        }
+                        ActionButton {
+                            objectName: "deleteSavedTheme_" + savedRow.modelData.id
+                            text: "Remove"
+                            compact: true
+                            tonal: true
+                            Accessible.name: "Remove " + savedRow.modelData.name
+                            onClicked: studio.deleteSavedTheme(savedRow.modelData.id)
+                        }
+                    }
+                }
                 Flow {
                     Layout.fillWidth:true;spacing:8
                     ActionButton { text:"Import theme…";glyph:"FolderOpen";tonal:true;onClicked:studio.chooseCustomTheme() }
                     ActionButton { text:studio.customThemeActive ? "Export theme…" : "Export template…";glyph:"Export";tonal:true;onClicked:studio.chooseThemeExport() }
                     ActionButton { text:"Share theme…";glyph:"ShareNetwork";visible:studio.customThemeActive;tonal:true;onClicked:studio.chooseThemeExport();ToolTip.text:"Save a portable theme file to send to another device" }
                     ActionButton { text:"Authoring guide";enabled:viewState.readerReady===true;onClicked:{if(page.ownerPopup)page.ownerPopup.close();studio.openThemeGuide();const host=page.Window.window;if(host&&typeof host.focusReader==="function")host.focusReader()} }
-                    ActionButton { text:"Edit theme file";visible:studio.customThemeActive;onClicked:studio.editCustomTheme() }
-                    ActionButton { text:"Reload";visible:studio.customThemeActive;onClicked:studio.reloadCustomTheme() }
-                    ActionButton { text:"Reset to built-in";visible:studio.customThemeActive;onClicked:studio.resetCustomTheme() }
+                    ActionButton { objectName:"editThemeFile";text:"Edit theme file";visible:studio.customThemeHasSource;onClicked:studio.editCustomTheme() }
+                    ActionButton { objectName:"reloadThemeFile";text:"Reload";visible:studio.customThemeHasSource;onClicked:studio.reloadCustomTheme() }
+                    ActionButton { objectName:"resetCustomThemeButton";text:"Reset to built-in";visible:studio.customThemeActive;onClicked:studio.resetCustomTheme() }
                 }
                 ColumnLayout {
                     visible:studio.customThemeActive

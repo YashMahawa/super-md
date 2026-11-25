@@ -70,6 +70,7 @@ export function remarkObsidianMath(this: any) {
         // remark-math preserves GFM's escape as TeX \| (a double bar). Restore
         // the original formula, not a global replacement of genuine TeX norms.
         node.value=source.slice(node.position.start.offset,node.position.end.offset).replace(/^\$+|\$+$/g,"").trim();
+        if(typeof node.data?.hChildren?.[0]?.value==="string")node.data.hChildren[0].value=node.value;
         if(node.data?.hChildren?.[0]?.children?.[0])node.data.hChildren[0].children[0].value=node.value;
       }
     });

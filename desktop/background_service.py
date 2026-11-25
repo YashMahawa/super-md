@@ -21,7 +21,7 @@ class BackgroundService(QObject):
         self.recents=menu.addMenu('Recent notes');self.recents.aboutToShow.connect(self.rebuild_recent)
         menu.addSeparator();menu.addAction('Quit Super MD',self.quit)
         self.tray.setContextMenu(menu)
-        self.tray.activated.connect(lambda reason:self.open_window(None) if reason in (QSystemTrayIcon.Trigger,QSystemTrayIcon.DoubleClick) else None)
+        self.tray.activated.connect(lambda reason:self.open_window(None) if reason in (QSystemTrayIcon.ActivationReason.Trigger,QSystemTrayIcon.ActivationReason.DoubleClick) else None)
     def _notify_windows(self):
         for studio in list(getattr(self.session,'windows',{}).values()):
             if not getattr(studio,'retired',False) and hasattr(studio,'_emit'):studio._emit(False)

@@ -469,12 +469,12 @@ class BackgroundTests(unittest.TestCase):
         with patch.object(
             QStandardPaths,
             "writableLocation",
-            side_effect=lambda k, p=appdata_agent: str(p) if k == QStandardPaths.AppDataLocation else orig_writable(k),
+            side_effect=lambda k, p=appdata_agent: str(p) if k == QStandardPaths.StandardLocation.AppDataLocation else orig_writable(k),
         ):
             upgraded_session = Session(False)
             try:
                 self.assertIs(upgraded_session.settings["keepInBackground"], True)
-                self.assertIs(upgraded_session.settings["agentAccessEnabled"], False)
+                self.assertIs(upgraded_session.settings["agentAccessEnabled"], True)
                 self.assertEqual(upgraded_session.settings["widthPercent"], 90)
                 self.assertEqual(upgraded_session.settings["font"], "IBM Plex Serif")
                 self.assertEqual(upgraded_session.settings["pdf"]["paperSize"], "A4")
@@ -482,6 +482,7 @@ class BackgroundTests(unittest.TestCase):
                 self.assertEqual(upgraded_session.recent, [pinned_note, recent_note])
                 persisted = json.loads((appdata_agent / "qt-studio" / "settings.json").read_text(encoding="utf-8"))
                 self.assertIs(persisted["settings"]["keepInBackground"], True)
+                self.assertIs(persisted["settings"]["agentAccessEnabled"], True)
                 app_stub = App()
                 with patch("background_service.QSystemTrayIcon.isSystemTrayAvailable", return_value=False):
                     svc = BackgroundService(app_stub, upgraded_session, ROOT, lambda _: None, force=False)
@@ -521,7 +522,7 @@ class BackgroundTests(unittest.TestCase):
         with patch.object(
             QStandardPaths,
             "writableLocation",
-            side_effect=lambda k, p=appdata_headless: str(p) if k == QStandardPaths.AppDataLocation else orig_writable(k),
+            side_effect=lambda k, p=appdata_headless: str(p) if k == QStandardPaths.StandardLocation.AppDataLocation else orig_writable(k),
         ):
             headless_upgraded = Session(False)
             try:
@@ -547,7 +548,7 @@ class BackgroundTests(unittest.TestCase):
         with patch.object(
             QStandardPaths,
             "writableLocation",
-            side_effect=lambda k, p=appdata_cloud: str(p) if k == QStandardPaths.AppDataLocation else orig_writable(k),
+            side_effect=lambda k, p=appdata_cloud: str(p) if k == QStandardPaths.StandardLocation.AppDataLocation else orig_writable(k),
         ):
             cloud_upgraded = Session(False)
             try:
@@ -575,7 +576,7 @@ class BackgroundTests(unittest.TestCase):
         with patch.object(
             QStandardPaths,
             "writableLocation",
-            side_effect=lambda k, p=appdata_reader: str(p) if k == QStandardPaths.AppDataLocation else orig_writable(k),
+            side_effect=lambda k, p=appdata_reader: str(p) if k == QStandardPaths.StandardLocation.AppDataLocation else orig_writable(k),
         ):
             reader_upgraded = Session(False)
             try:
@@ -606,18 +607,25 @@ class BackgroundTests(unittest.TestCase):
 
 
 _HEADLESS_DAEMON_BOOTSTRAP = """
-import os, sys
+import os, sys, time
 from pathlib import Path
 
 os.environ["QT_QPA_PLATFORM"] = "offscreen"
 os.environ["QT_QUICK_BACKEND"] = "software"
-os.environ["QML_DISABLE_DISK_CACHE"] = "1"
 os.environ.setdefault("QTWEBENGINE_CHROMIUM_FLAGS", "--disable-gpu --disable-dev-shm-usage")
 os.environ.setdefault("QTWEBENGINE_DISABLE_SANDBOX", "1")
 
 appdata = os.environ["SUPERMD_TEST_APPDATA"]
 downloads = os.environ["SUPERMD_TEST_DOWNLOADS"]
 desktop_dir = os.environ["SUPERMD_TEST_DESKTOP_DIR"]
+diag_path = Path(appdata) / "daemon-diag.log"
+def _diag(stage):
+    try:
+        with diag_path.open("a", encoding="utf-8") as _df:
+            _df.write(f"{time.monotonic():.3f} pid={os.getpid()} {stage}\\n")
+    except OSError:
+        pass
+_diag("boot")
 cache_dir = str(Path(appdata) / "cache")
 xdg_data_dir = str(Path(appdata) / "xdg-data")
 Path(cache_dir).mkdir(parents=True, exist_ok=True)
@@ -629,6 +637,7 @@ if desktop_dir not in sys.path:
 
 import graphics_runtime
 graphics_runtime.configure(safe=True)
+_diag("graphics_configured")
 
 from PySide6.QtCore import QStandardPaths
 from PySide6.QtWidgets import QSystemTrayIcon
@@ -636,11 +645,11 @@ import python_runtime
 
 orig_writable = QStandardPaths.writableLocation
 def _patched_writable(kind):
-    if kind in (QStandardPaths.AppDataLocation, QStandardPaths.AppLocalDataLocation):
+    if kind in (QStandardPaths.StandardLocation.AppDataLocation, QStandardPaths.StandardLocation.AppLocalDataLocation):
         return appdata
-    if kind == QStandardPaths.DownloadLocation:
+    if kind == QStandardPaths.StandardLocation.DownloadLocation:
         return downloads
-    if kind in (QStandardPaths.CacheLocation, QStandardPaths.GenericCacheLocation):
+    if kind in (QStandardPaths.StandardLocation.CacheLocation, QStandardPaths.StandardLocation.GenericCacheLocation):
         return cache_dir
     return orig_writable(kind)
 
@@ -652,6 +661,7 @@ from studio import Studio
 Studio._restore_update = lambda self: None
 
 import main as desktop_main
+_diag("entering_main")
 sys.argv = [str(Path(desktop_dir) / "main.py"), "--background", "--agent-access", "--safe-graphics"]
 desktop_main._exit_process(desktop_main.main())
 """
@@ -689,7 +699,7 @@ for raw in cin:
                 except Exception: pass
         break
     appdata = cmd["appdata"]
-    with patch.object(QStandardPaths, "writableLocation", side_effect=lambda k, p=appdata: p if k == QStandardPaths.AppDataLocation else orig(k)):
+    with patch.object(QStandardPaths, "writableLocation", side_effect=lambda k, p=appdata: p if k == QStandardPaths.StandardLocation.AppDataLocation else orig(k)):
         if cmd["kind"] == "claim":
             broker = InstanceBroker()
             try:
@@ -723,15 +733,21 @@ for raw in cin:
                     env["SUPERMD_TEST_DESKTOP_DIR"] = cmd["desktopDir"]
                     for ek, ev in (cmd.get("extraEnv") or {}).items():
                         env[str(ek)] = str(ev)
-                    proc = orig_popen(
-                        [sys.executable, "-u", "-c", cmd["daemonBootstrap"]],
-                        stdin=kwargs.get("stdin"),
-                        stdout=kwargs.get("stdout"),
-                        stderr=kwargs.get("stderr"),
-                        env=env,
-                        start_new_session=kwargs.get("start_new_session", False),
-                        creationflags=kwargs.get("creationflags", 0),
-                    )
+                    os.makedirs(appdata, exist_ok=True)
+                    bootstrap_file = os.path.join(appdata, f"_daemon_bootstrap_{time.monotonic_ns()}.py")
+                    with open(bootstrap_file, "w", encoding="utf-8") as bfh:
+                        bfh.write(cmd["daemonBootstrap"])
+                    popen_kw = {
+                        "stdin": kwargs.get("stdin"),
+                        "stdout": kwargs.get("stdout"),
+                        "stderr": kwargs.get("stderr"),
+                        "env": env,
+                        "start_new_session": kwargs.get("start_new_session", False),
+                        "creationflags": kwargs.get("creationflags", 0),
+                    }
+                    if "process_group" in kwargs:
+                        popen_kw["process_group"] = kwargs["process_group"]
+                    proc = orig_popen([sys.executable, "-u", bootstrap_file], **popen_kw)
                     call_procs.append(proc)
                     if marker:
                         _write_marker(marker, {"cmd": spawn_cmd, "pid": proc.pid})
@@ -791,7 +807,7 @@ class InstanceBrokerAndServiceCliTests(unittest.TestCase):
         self.addCleanup(lambda: shutil.rmtree(self.temp_appdata, ignore_errors=True))
         orig = QStandardPaths.writableLocation
         self._orig_writable = orig
-        patcher = patch.object(QStandardPaths, "writableLocation", side_effect=lambda k: str(self.temp_appdata) if k == QStandardPaths.AppDataLocation else orig(k))
+        patcher = patch.object(QStandardPaths, "writableLocation", side_effect=lambda k: str(self.temp_appdata) if k == QStandardPaths.StandardLocation.AppDataLocation else orig(k))
         patcher.start()
         self.addCleanup(patcher.stop)
         self.session = Session(True)
@@ -922,6 +938,7 @@ class InstanceBrokerAndServiceCliTests(unittest.TestCase):
 
     def _service_for_appdata(self, appdata: Path, action: str, **extra):
         log_path = appdata / "background-service.log"
+        diag_path = appdata / "daemon-diag.log"
         try:
             res = self._call(
                 {"kind": "service", "action": action, "appdata": str(appdata), **extra},
@@ -929,9 +946,11 @@ class InstanceBrokerAndServiceCliTests(unittest.TestCase):
             )
         except AssertionError as exc:
             log_tail = log_path.read_text(encoding="utf-8", errors="replace")[-3000:] if log_path.is_file() else ""
-            raise AssertionError(f"{exc}; log={log_tail}") from exc
+            diag_tail = diag_path.read_text(encoding="utf-8", errors="replace")[-2000:] if diag_path.is_file() else ""
+            raise AssertionError(f"{exc}; log={log_tail}; diag={diag_tail}") from exc
         log_tail = log_path.read_text(encoding="utf-8", errors="replace")[-2000:] if log_path.is_file() else ""
-        self.assertTrue(res["stdout"].strip(), f"Empty CLI output; stderr={res['stderr']}; log={log_tail}")
+        diag_tail = diag_path.read_text(encoding="utf-8", errors="replace")[-2000:] if diag_path.is_file() else ""
+        self.assertTrue(res["stdout"].strip(), f"Empty CLI output; stderr={res['stderr']}; log={log_tail}; diag={diag_tail}")
         return res["code"], json.loads(res["stdout"])
 
     def _dispatch_headless_live_request(self, studio, raw_request: str):
@@ -988,7 +1007,7 @@ class InstanceBrokerAndServiceCliTests(unittest.TestCase):
             QStandardPaths,
             "writableLocation",
             side_effect=lambda kind: str(unicode_appdata)
-            if kind == QStandardPaths.AppDataLocation
+            if kind == QStandardPaths.StandardLocation.AppDataLocation
             else self._orig_writable(kind),
         ):
             cold_broker = InstanceBroker(self.qt_app, service_handler=self.session.background.handle_service_request)
@@ -1214,7 +1233,7 @@ class InstanceBrokerAndServiceCliTests(unittest.TestCase):
             QStandardPaths,
             "writableLocation",
             side_effect=lambda kind: str(daemon_appdata)
-            if kind == QStandardPaths.AppDataLocation
+            if kind == QStandardPaths.StandardLocation.AppDataLocation
             else self._orig_writable(kind),
         ), patch.object(python_runtime, "discover", return_value=[]), patch.object(
             QuietStudio, "_restore_update", lambda _self: None
@@ -1495,7 +1514,7 @@ class InstanceBrokerAndServiceCliTests(unittest.TestCase):
             QStandardPaths,
             "writableLocation",
             side_effect=lambda kind: str(daemon_appdata)
-            if kind == QStandardPaths.AppDataLocation
+            if kind == QStandardPaths.StandardLocation.AppDataLocation
             else self._orig_writable(kind),
         ):
             reopened = Session(False)
@@ -1866,7 +1885,7 @@ desktop_main._exit_process(rc)""",
             QStandardPaths,
             "writableLocation",
             side_effect=lambda k: str(deferred_appdata)
-            if k == QStandardPaths.AppDataLocation
+            if k == QStandardPaths.StandardLocation.AppDataLocation
             else self._orig_writable(k),
         ):
             deferred_broker = InstanceBroker(self.qt_app, service_handler=self.session.background.handle_service_request)
@@ -1963,7 +1982,7 @@ desktop_main._exit_process(rc)""",
                     QStandardPaths,
                     "writableLocation",
                     side_effect=lambda k: str(vanished_appdata)
-                    if k == QStandardPaths.AppDataLocation
+                    if k == QStandardPaths.StandardLocation.AppDataLocation
                     else self._orig_writable(k),
                 ):
                     fresh_replacement = InstanceBroker(

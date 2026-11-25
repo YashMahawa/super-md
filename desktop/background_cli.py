@@ -31,7 +31,7 @@ def main(argv):
     from PySide6.QtNetwork import QLocalSocket
     app=QCoreApplication.instance() or QCoreApplication(['super-md'])
     app.setApplicationName('super-md');app.setOrganizationName('SuperMD')
-    root=Path(QStandardPaths.writableLocation(QStandardPaths.AppDataLocation)).resolve()
+    root=Path(QStandardPaths.writableLocation(QStandardPaths.StandardLocation.AppDataLocation)).resolve()
     name='supermd-qt-'+hashlib.sha256(str(root).encode()).hexdigest()[:20]
     def _instance_lock_held():
         if not root.exists():return False
@@ -169,8 +169,9 @@ def main(argv):
         proc=None
         if not running:
             flags=(subprocess.CREATE_NEW_PROCESS_GROUP|getattr(subprocess,'CREATE_NO_WINDOW',0)) if os.name=='nt' else 0
+            popen_extra={'process_group':0} if sys.platform=='darwin' else {'start_new_session':os.name!='nt'}
             with (root/'background-service.log').open('ab') as log:
-                proc=subprocess.Popen(_daemon_command(),stdin=subprocess.DEVNULL,stdout=log,stderr=log,start_new_session=os.name!='nt',creationflags=flags)
+                proc=subprocess.Popen(_daemon_command(),stdin=subprocess.DEVNULL,stdout=log,stderr=log,creationflags=flags,**popen_extra)
             deadline=time.monotonic()+30
             while time.monotonic()<deadline:
                 status=request('status',startup_poll=True)
