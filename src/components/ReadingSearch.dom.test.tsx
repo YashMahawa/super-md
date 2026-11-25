@@ -295,4 +295,224 @@ describe("ReadingSearch DOM behavior", () => {
     act(() => root.unmount());
     host.remove();
   });
+
+  it("reveals the selected folder-search occurrence across repeated matches, Unicode offsets, disclosures, and windowed blocks", async () => {
+    const host = document.createElement("div");
+    document.body.append(host);
+    const root = createRoot(host);
+    const scrolled: Element[] = [];
+    const origScroll = Element.prototype.scrollIntoView;
+    Element.prototype.scrollIntoView = function () { scrolled.push(this); };
+
+    const markdown = [
+      "# İstanbul 📓 Field Notes",
+      "",
+      "First AuroraSignal after 📓 emoji.",
+      "",
+      "> [!NOTE]- Folded Lab 📓",
+      "> İstanbul 📓 precedes second AuroraSignal inside closed callout.",
+      "",
+      "Check [reference](https://example.com/AuroraSignal) before third AuroraSignal and Straße.",
+    ].join("\n");
+
+    const allAurora = sourceMatches(markdown, "AuroraSignal", true);
+    // 0: visible paragraph 1
+    // 1: visible inside closed callout after İstanbul 📓
+    // 2: hidden inside link URL (https://example.com/AuroraSignal)
+    // 3: visible after hidden link URL
+    expect(allAurora).toHaveLength(4);
+
+    try {
+      const renderSeeded = async (seed: { query: string; caseSensitive?: boolean; sourceStart?: number; sourceEnd?: number; nonce: number }) => {
+        await act(async () => {
+          root.render(
+            <div className="android-document">
+              <ReadingSearch content={markdown} close={() => {}} seed={seed} />
+              <section className="android-reading">
+                <LiveEditor markdown={markdown} onChange={() => {}} documentPath={null} python="" dark={false} />
+              </section>
+            </div>
+          );
+        });
+        await act(async () => { await new Promise((resolve) => requestAnimationFrame(() => resolve(undefined))); });
+      };
+
+      // 1. Un-targeted seeded Find preserves existing 1 / 3 behavior.
+      await renderSeeded({ query: "AuroraSignal", caseSensitive: true, nonce: 1 });
+      expect(host.querySelector("output")?.textContent).toBe("1 / 3");
+      expect(host.querySelector("details.callout")?.hasAttribute("open")).toBe(false);
+
+      // 2. Selecting occurrence #2 (after Unicode surrogate 📓 + İstanbul inside closed callout) opens disclosure and lands on 2 / 3.
+      await renderSeeded({
+        query: "AuroraSignal",
+        caseSensitive: true,
+        sourceStart: allAurora[1].from,
+        sourceEnd: allAurora[1].to,
+        nonce: 2,
+      });
+      expect(host.querySelector("details.callout")?.hasAttribute("open")).toBe(true);
+      expect(host.querySelector("output")?.textContent).toBe("2 / 3");
+
+      // Next match continues cleanly from 2 / 3 -> 3 / 3.
+      const nextBtn = host.querySelector<HTMLButtonElement>('button[aria-label="Next match"]')!;
+      act(() => nextBtn.click());
+      expect(host.querySelector("output")?.textContent).toBe("3 / 3");
+
+      // 3. Selecting source occurrence #4 (index 3, after hidden link URL at index 2) maps via shared source mapper to visible 3 / 3.
+      await renderSeeded({
+        query: "AuroraSignal",
+        caseSensitive: true,
+        sourceStart: allAurora[3].from,
+        sourceEnd: allAurora[3].to,
+        nonce: 3,
+      });
+      expect(host.querySelector("output")?.textContent).toBe("3 / 3");
+
+      // 4. Full Unicode case-fold expansion ("strasse" -> "Straße" after astral 📓 offsets) reveals and highlights "Straße".
+      const strasseFrom = markdown.indexOf("Straße");
+      expect(strasseFrom).toBeGreaterThan(0);
+      await renderSeeded({
+        query: "strasse",
+        caseSensitive: false,
+        sourceStart: strasseFrom,
+        sourceEnd: strasseFrom + "Straße".length,
+        nonce: 4,
+      });
+      expect(host.querySelector("output")?.textContent).toBe("1 / 1");
+      expect(scrolled.length).toBeGreaterThan(0);
+    } finally {
+      Element.prototype.scrollIntoView = origScroll;
+      act(() => root.unmount());
+      host.remove();
+    }
+  });
+
+  it("treats hidden source hits separately without falsely selecting visible matches or mutating Read mode", async () => {
+    const host = document.createElement("div");
+    document.body.append(host);
+    const root = createRoot(host);
+    const scrolled: Element[] = [];
+    const origScroll = Element.prototype.scrollIntoView;
+    Element.prototype.scrollIntoView = function () { scrolled.push(this); };
+
+    let markdown = [
+      "---",
+      "title: HiddenFrontmatterToken and SharedNeedle",
+      "---",
+      "",
+      "First visible SharedNeedle paragraph.",
+      "",
+      "Middle paragraph with [portal](https://example.com/SharedNeedle) and [spec](https://example.com/OnlyInHiddenUrl).",
+      "",
+      "Last visible SharedNeedle paragraph.",
+    ].join("\n");
+
+    const sharedRanges = sourceMatches(markdown, "SharedNeedle", true);
+    // 0: YAML frontmatter (hidden)
+    // 1: First visible paragraph (rendered 1 / 2)
+    // 2: Link URL https://example.com/SharedNeedle (hidden)
+    // 3: Last visible paragraph (rendered 2 / 2)
+    expect(sharedRanges).toHaveLength(4);
+    const urlOnlyRanges = sourceMatches(markdown, "OnlyInHiddenUrl", true);
+    expect(urlOnlyRanges).toHaveLength(1);
+
+    try {
+      // Read mode (onChange omitted): selecting hidden URL hit scrolls to link owner, shows "In source · 0 / 2",
+      // keeps Replace controls absent, and steps forward to 2 / 2 (not backward to 1 / 2) on Next.
+      await act(async () => {
+        root.render(
+          <div className="android-document">
+            <ReadingSearch
+              content={markdown}
+              close={() => {}}
+              seed={{
+                query: "SharedNeedle",
+                caseSensitive: true,
+                sourceStart: sharedRanges[2].from,
+                sourceEnd: sharedRanges[2].to,
+                nonce: 10,
+              }}
+            />
+            <section className="android-reading">
+              <LiveEditor markdown={markdown} onChange={() => {}} documentPath={null} python="" dark={false} />
+            </section>
+          </div>
+        );
+      });
+      await act(async () => { await new Promise((resolve) => requestAnimationFrame(() => resolve(undefined))); });
+
+      expect(host.querySelector('button[aria-label="Replace in source"]')).toBeNull();
+      expect(host.querySelector("output")?.textContent).toBe("In source · 0 / 2");
+      expect(scrolled.some(el => el.tagName === "A" || el.textContent?.includes("portal"))).toBe(true);
+
+      const nextBtn = host.querySelector<HTMLButtonElement>('button[aria-label="Next match"]')!;
+      act(() => nextBtn.click());
+      expect(host.querySelector("output")?.textContent).toBe("2 / 2");
+
+      // Hidden-only URL match shows "In Markdown source" rather than misleading "No matches".
+      await act(async () => {
+        root.render(
+          <div className="android-document">
+            <ReadingSearch
+              content={markdown}
+              close={() => {}}
+              seed={{
+                query: "OnlyInHiddenUrl",
+                caseSensitive: true,
+                sourceStart: urlOnlyRanges[0].from,
+                sourceEnd: urlOnlyRanges[0].to,
+                nonce: 11,
+              }}
+            />
+            <section className="android-reading">
+              <LiveEditor markdown={markdown} onChange={() => {}} documentPath={null} python="" dark={false} />
+            </section>
+          </div>
+        );
+      });
+      await act(async () => { await new Promise((resolve) => requestAnimationFrame(() => resolve(undefined))); });
+      expect(host.querySelector("output")?.textContent).toBe("In Markdown source");
+
+      // Live mode (onChange provided): toggling Replace in source from a hidden URL hit targets that exact hidden source occurrence (3 / 4).
+      await act(async () => {
+        root.render(
+          <div className="android-document">
+            <ReadingSearch
+              content={markdown}
+              close={() => {}}
+              onChange={(next) => { markdown = next; }}
+              seed={{
+                query: "SharedNeedle",
+                caseSensitive: true,
+                sourceStart: sharedRanges[2].from,
+                sourceEnd: sharedRanges[2].to,
+                nonce: 12,
+              }}
+            />
+            <section className="android-reading">
+              <LiveEditor markdown={markdown} onChange={(next) => { markdown = next; }} documentPath={null} python="" dark={false} />
+            </section>
+          </div>
+        );
+      });
+      await act(async () => { await new Promise((resolve) => requestAnimationFrame(() => resolve(undefined))); });
+      expect(host.querySelector("output")?.textContent).toBe("In source · 0 / 2");
+
+      const replaceToggle = host.querySelector<HTMLButtonElement>('button[aria-label="Replace in source"]')!;
+      act(() => replaceToggle.click());
+      expect(host.querySelector("output")?.textContent).toBe("3 / 4");
+
+      const replaceInput = host.querySelector<HTMLInputElement>('input[aria-label="Replacement text"]')!;
+      const replaceBtn = host.querySelectorAll<HTMLButtonElement>(".search-replace button")[0];
+      act(() => setInputValue(replaceInput, "UpdatedSlug"));
+      act(() => replaceBtn.click());
+      expect(markdown).toContain("[portal](https://example.com/UpdatedSlug)");
+      expect(markdown).toContain("First visible SharedNeedle paragraph.");
+      expect(markdown).toContain("Last visible SharedNeedle paragraph.");
+    } finally {
+      Element.prototype.scrollIntoView = origScroll;
+      act(() => root.unmount());
+      host.remove();
+    }
+  });
 });

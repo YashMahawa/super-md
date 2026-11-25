@@ -70,11 +70,17 @@ interface PdfExportStatus {id:string;phase:'preparing'|'typesetting'|'publishing
 interface NoteView { editor?: PortableEditorSession; history?:NoteHistory; top?: number; rendered?: ReturnType<typeof exportRenderedViews> }
 interface ReaderState extends ReaderAccessibilityPreference { id: string; content: string; path: string | null; mode: "live" | "editor" | "reader" | "split"; dark: boolean; fullscreen: boolean; font: string; size: number; editProtocol?: number; latexAutofix?:boolean; typewriterScroll?:boolean; spellCheck?:boolean; grammarCheck?:boolean; width?: number; widthPercent?:number; lineHeight?:number; colors: Record<string, string>; zoom: number; motion?: boolean; python?: string; viewState?: NoteView }
 declare global { interface Window {supermdAgentRequest?:(request:Record<string,unknown>,callback?:(result:unknown,error:string)=>void)=>void;supermdAgentCompute?:(request:Record<string,unknown>,callback:(result:unknown,error:string)=>void)=>void;supermdThemeGuide?:()=>void;supermdDismiss?:()=>boolean;supermdSetZoom?:(zoom:number,requestedAt?:number)=>void;supermdHeading?:(id:string,offset?:number)=>void;supermdHistory?:(direction:"undo"|"redo")=>void;supermdNativeWheel?:(dx:number,dy:number,point:Point,held:boolean,modifier?:boolean)=>void;supermdToggleTypewriter?:()=>void;} }
-declare global { interface Window { supermdLoad?: (state: ReaderState) => void; supermdExport?: (options: ExportOptions) => void; supermdExportMarkdown?: (archive?: boolean) => void; supermdFind?: (initialQuery?: string, options?: { caseSensitive?: boolean }) => void; supermdPortable?: (save: boolean) => void; supermdZoomBy?: (factor:number,focus?:Point)=>void; supermdResetZoom?: ()=>void; supermdRepairMath?: ()=>void; supermdFlush?: (operation:Record<string,string>)=>void } }
+declare global { interface Window { supermdLoad?: (state: ReaderState) => void; supermdExport?: (options: ExportOptions) => void; supermdExportMarkdown?: (archive?: boolean) => void; supermdFind?: (initialQuery?: string, options?: { caseSensitive?: boolean; sourceStart?: number; sourceEnd?: number }) => void; supermdPortable?: (save: boolean) => void; supermdZoomBy?: (factor:number,focus?:Point)=>void; supermdResetZoom?: ()=>void; supermdRepairMath?: ()=>void; supermdFlush?: (operation:Record<string,string>)=>void } }
 declare global { interface Window {supermdChromeInset?:(height:number)=>void} }
 declare global { interface Window {supermdSavePosition?:()=>void} }
 declare global {interface Window {supermdExportPhase?:(id:string,phase:'typesetting'|'publishing')=>void}}
-interface ReaderState { centerLock?:boolean; customStyle?:CustomStyle; restorePosition?:boolean; readingLocation?:ReadingLocation|null; imageAppearance?:MediaAppearance; svgAppearance?:MediaAppearance; imageContrast?:number; seededFind?:{query:string;caseSensitive?:boolean}|null }
+interface ReaderState { centerLock?:boolean; customStyle?:CustomStyle; restorePosition?:boolean; readingLocation?:ReadingLocation|null; imageAppearance?:MediaAppearance; svgAppearance?:MediaAppearance; imageContrast?:number; seededFind?:{query:string;caseSensitive?:boolean;sourceStart?:number;sourceEnd?:number}|null }
+function normalizeSeedBounds(start?: unknown, end?: unknown): { sourceStart?: number; sourceEnd?: number } {
+  if (typeof start === "number" && typeof end === "number" && Number.isInteger(start) && Number.isInteger(end) && start >= 0 && end >= start) {
+    return { sourceStart: start, sourceEnd: end };
+  }
+  return {};
+}
 type AgentDocumentBase={tabId:string;revision:string;sourceLength:number};
 function resolveAgentDiagram(content:string,revision:string,request:Record<string,unknown>,diagramOptions?:AgentDiagramOptions){
   if(request.expectedRevision!==revision)throw Error('A current expectedRevision is required to retrieve this diagram');
@@ -123,6 +129,7 @@ function Reader() {
   const [searching,setSearching] = useState(false);
   const [searchSeed,setSearchSeed] = useState<ReadingSearchSeed|null>(null);
   const searchSeedNonce = useRef(0);
+  const suppressRestoreForSeed = useRef(false);
   const [pdfExport,setPdfExport]=useState<PdfExportStatus|null>(null);
   const exportOwner=useRef<{id:string;controller:AbortController;phase:PdfExportStatus['phase']}|null>(null);
   const cancelPdfExport=useCallback(async()=>{
@@ -221,8 +228,9 @@ function Reader() {
       const {contentUnchanged,seededFind,...rest}=incoming as ReaderState&{contentUnchanged?:boolean};
       const applyIncomingFind=()=>{
         if(seededFind&&typeof seededFind.query==='string'){
+          if(seededFind.query){suppressRestoreForSeed.current=true;requestAnimationFrame(()=>markScrollInput());}
           searchSeedNonce.current+=1;
-          setSearchSeed({query:seededFind.query.slice(0,200),caseSensitive:seededFind.caseSensitive,nonce:searchSeedNonce.current});
+          setSearchSeed({query:seededFind.query.slice(0,200),caseSensitive:seededFind.caseSensitive,...normalizeSeedBounds(seededFind.sourceStart,seededFind.sourceEnd),nonce:searchSeedNonce.current});
           setSearching(true);
           requestAnimationFrame(()=>window.dispatchEvent(new Event("supermd-find-focus")));
         }
@@ -362,10 +370,11 @@ function Reader() {
     };
     window.supermdFind = (initialQuery, options) => {
       if(document.querySelector('.theme-guide-dialog'))return;
+      if(typeof initialQuery==='string'&&initialQuery)markScrollInput();
       flushSync(()=>{
         if(typeof initialQuery==='string'){
           searchSeedNonce.current+=1;
-          setSearchSeed({query:initialQuery.slice(0,200),caseSensitive:options?.caseSensitive,nonce:searchSeedNonce.current});
+          setSearchSeed({query:initialQuery.slice(0,200),caseSensitive:options?.caseSensitive,...normalizeSeedBounds(options?.sourceStart,options?.sourceEnd),nonce:searchSeedNonce.current});
         }
         setSearching(true);
       });
@@ -522,6 +531,7 @@ function Reader() {
       window.setTimeout(()=>inputs.forEach(name=>window.removeEventListener(name,stop,{capture:true})),760);
       return()=>{stopped=true;timers.forEach(window.clearTimeout);};
     }
+    if(suppressRestoreForSeed.current){suppressRestoreForSeed.current=false;return;}
     if(top===undefined&&!saved)return;
     let stopped=false;
     const stop=()=>{stopped=true;};

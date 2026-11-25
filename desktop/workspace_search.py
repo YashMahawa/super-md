@@ -124,6 +124,12 @@ def utf16_offset(text: str, cp_index: int) -> int:
     return len(text[:clamped].encode("utf-16-le", errors="surrogatepass")) // 2
 
 
+def _utf16_len(text: str) -> int:
+    if text.isascii():
+        return len(text)
+    return len(text.encode("utf-16-le", errors="surrogatepass")) // 2
+
+
 def fold_with_offsets(text: str) -> tuple[str, list[int], list[int]]:
     """Case-normalize `text` while mapping each folded code point back to `[orig_start, orig_end)`."""
     parts: list[str] = []
@@ -232,16 +238,19 @@ def _scan_note_lines(
     if not markdown or not query:
         return [], False
     searchable = mask_diagram_spans(markdown) if exclude_diagrams else markdown
-    raw_lines = markdown.splitlines()
-    search_lines = searchable.splitlines()
+    raw_lines = markdown.split("\n")
+    search_lines = searchable.split("\n")
     matches: list[dict] = []
     truncated = False
     limit = min(MAX_MATCHES_PER_NOTE, remaining_budget)
+    line_u16_start = 0
 
-    for idx, search_line in enumerate(search_lines):
+    for idx, raw_search_line in enumerate(search_lines):
         if cancel_event is not None and cancel_event.is_set():
             return matches, False
-        raw_line = raw_lines[idx] if idx < len(raw_lines) else search_line
+        raw_with_cr = raw_lines[idx] if idx < len(raw_lines) else raw_search_line
+        raw_line = raw_with_cr[:-1] if raw_with_cr.endswith("\r") else raw_with_cr
+        search_line = raw_search_line[:-1] if raw_search_line.endswith("\r") else raw_search_line
         for orig_start, orig_end in _find_line_matches(
             search_line,
             query,
@@ -252,6 +261,8 @@ def _scan_note_lines(
                 if len(matches) >= remaining_budget:
                     truncated = True
                 break
+            col_u16 = utf16_offset(raw_line, orig_start)
+            end_u16 = utf16_offset(raw_line, orig_end)
             snippet, u16_start, u16_end = _build_snippet(raw_line, orig_start, orig_end)
             matches.append({
                 "key": f"{note_meta['key']}:{idx + 1}:{orig_start}",
@@ -262,11 +273,14 @@ def _scan_note_lines(
                 "dirty": bool(note_meta.get("dirty")),
                 "isOpen": bool(note_meta.get("isOpen")),
                 "line": idx + 1,
-                "column": utf16_offset(raw_line, orig_start) + 1,
+                "column": col_u16 + 1,
                 "snippet": snippet,
                 "matchStart": u16_start,
                 "matchEnd": u16_end,
+                "sourceStart": line_u16_start + col_u16,
+                "sourceEnd": line_u16_start + end_u16,
             })
+        line_u16_start += _utf16_len(raw_with_cr) + 1
         if truncated:
             break
     return matches, truncated
