@@ -140,6 +140,9 @@ ApplicationWindow {
         // application shortcuts are disabled while the modal is open.
         if (modalDialogCount > 0) return false
         if (["copy", "cut", "paste", "select_all"].includes(action) && window.nativeTextEditorFocused()) return false
+        if (["bold", "italic", "inline_code", "link", "heading", "list", "quote", "inline_math"].includes(action)) {
+            return !modalDialogCount && !window.nativeTextEditorFocused() && !viewState.readerOverlay && viewState.mode !== "reader"
+        }
         if (action === "undo" || action === "redo") return !modalDialogCount && !viewState.readerOverlay
         if (action === "close_tab") return !modalDialogCount
         if (action === "dismiss") return !modalDialogCount && !contentsPopup.visible
@@ -179,6 +182,17 @@ ApplicationWindow {
         case "cut": window.nativeReaderEditAction("cut"); break
         case "paste": window.nativeReaderEditAction("paste"); break
         case "select_all": window.nativeReaderEditAction("select_all"); break
+        case "bold":
+        case "italic":
+        case "inline_code":
+        case "link":
+        case "heading":
+        case "list":
+        case "quote":
+        case "inline_math":
+            window.focusReader()
+            studio.command("format_" + action)
+            break
         case "find": window.openFind(); break
         case "search_folder": studio.openFolderSearch(); break
         case "close_tab": studio.closeTabSafely(viewState.active); break
