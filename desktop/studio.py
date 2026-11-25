@@ -1270,6 +1270,12 @@ class Studio(QObject):
             len(files),
         )
 
+    _EMPTY_OUTLINE = ()
+
+    def _tab_outline(self, tab):
+        outline = tab.get("outline")
+        return outline if isinstance(outline, list) and outline else self._EMPTY_OUTLINE
+
     def _outline_slice_key(self, active_id, outline):
         return (
             active_id,
@@ -1281,7 +1287,7 @@ class Studio(QObject):
     def _sidebar_slice_key(self):
         tab = self._current()
         active_id = self.active if self.tabs else ""
-        outline = tab.get("outline", [])
+        outline = self._tab_outline(tab)
         files = self.files
         return (
             self._folder_slice_key(files),
@@ -1355,7 +1361,7 @@ class Studio(QObject):
     def sidebarSnapshot(self):
         tab = self._current()
         active_id = self.active if self.tabs else ""
-        outline = tab.get("outline", [])
+        outline = self._tab_outline(tab)
         files = self.files
         folder_key = self._folder_slice_key(files)
         outline_key = self._outline_slice_key(active_id, outline)
@@ -1384,7 +1390,7 @@ class Studio(QObject):
     def snapshot(self):
         tab = self._current()
         active_id = self.active if self.tabs else ""
-        outline = tab.get("outline", [])
+        outline = self._tab_outline(tab)
         files = self.files
         tabs_json = self._cached_tabs_slice_json()
         folder_fragment = self._cached_folder_slice_json(self._folder_slice_key(files), files)
@@ -3208,6 +3214,28 @@ class Studio(QObject):
         self._emit(False)
         self._load_tree()
 
+    def _is_within_open_folder(self, candidate) -> bool:
+        folder = getattr(self, "folder", "")
+        if not folder or not candidate:
+            return False
+        try:
+            root = os.path.normcase(str(Path(folder).resolve(strict=False)))
+            target = os.path.normcase(str(Path(candidate).resolve(strict=False)))
+            return os.path.commonpath([root, target]) == root
+        except (OSError, ValueError):
+            return False
+
+    def _refresh_open_folder_trees(self, *candidates) -> None:
+        if not candidates:
+            return
+        session = getattr(self, "session", None)
+        windows = tuple(session.windows.values()) if session is not None and hasattr(session, "windows") else (self,)
+        for window in windows:
+            if getattr(window, "retired", False) or not hasattr(window, "_load_tree"):
+                continue
+            if any(Studio._is_within_open_folder(window, candidate) for candidate in candidates if candidate):
+                window._load_tree()
+
     def _load_tree(self):
         if not self.folder:
             self.files = []
@@ -3575,6 +3603,8 @@ class Studio(QObject):
             self.message = "Autosaved" if automatic else "Saved"
             self._recover()
             self._emit()
+            if str(path) != original_path:
+                self._refresh_open_folder_trees(path, original_path)
             if self.pending_close:
                 self._finish_close()
         def write():
@@ -3630,8 +3660,17 @@ class Studio(QObject):
         def finished(_,error):
             if error: return
             tab.update(path=str(after),name=name)
+            for window in tuple(self.session.windows.values()):
+                if window is not self and not window.retired:
+                    for other_tab in window.tabs:
+                        if other_tab["path"] == str(before):
+                            other_tab.update(path=str(after), name=name)
+            location = self.session.locations.pop(str(before), None)
+            if location:
+                self.session.locations[str(after)] = location
+            self.session.pinned = [str(after) if p == str(before) else p for p in self.session.pinned]
             self.recent = [str(after) if p == str(before) else p for p in self.recent]
-            self._preferences(); self._recover(); self._emit(); self._load_tree()
+            self._preferences(); self._recover(); self._emit(); self._refresh_open_folder_trees(before, after)
         self._submit(work,finished,executor=self.writes)
 
     @Slot(str,result=QUrl)
@@ -4323,6 +4362,8 @@ class Studio(QObject):
             self._agent_open_paths.add(str(resolved_path))
             self._recover()
             self._emit()
+            if path_changed:
+                Studio._refresh_open_folder_trees(self, resolved_path, old_canonical_path or old_path)
             return {"tabId": tab_id, "windowId": self.window_id, "path": str(resolved_path),
                     "filename": resolved_path.name, "revision": revision, "format": fmt, "isDirty": is_dirty,
                     "pathChanged": path_changed, "oldPath": old_canonical_path or old_path,
@@ -4955,8 +4996,8 @@ class Studio(QObject):
                 changed=bool(target and target.get("outline",[])!=headings)
                 name_changed=False
                 if target:
-                    target["outline"] = headings
                     if changed:
+                        target["outline"] = headings
                         self._outline_revision = getattr(self, "_outline_revision", 0) + 1
                     if not target["path"] and target["name"].startswith("Untitled") and headings:
                         title = str(headings[0].get("title", "")).strip()
@@ -5305,10 +5346,16 @@ class Studio(QObject):
                         self.message = "Saved"
                         self._recover()
                         self._emit()
+                        if path_changed:
+                            self._refresh_open_folder_trees(save_as)
                         if self.pending_close: self._finish_close()
                     self.pending_save_as = ""
                     self.pending_save_as_tab = ""
-                elif command.startswith("export_"): self.message = f"Exported {Path(result['path']).name}"
+                elif command.startswith("export_"):
+                    exported_path = result["path"]
+                    self.message = f"Exported {Path(exported_path).name}"
+                    if is_searchable_note_name(Path(exported_path).name):
+                        self._refresh_open_folder_trees(exported_path)
                 if agent_export_info:
                     record = self._agent_job_records.get(agent_export_info.get("jobId"))
                     if record:

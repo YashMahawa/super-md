@@ -521,6 +521,92 @@ class SidebarSnapshotSlicesTest(unittest.TestCase):
             restored_studio._search_pool.shutdown(wait=True, cancel_futures=True)
             restored_session.writes.shutdown(wait=True)
 
+    def test_pre_outline_tabs_noop_outline_posts_pinned_rename_and_save_as_folder_refresh(self):
+        # 1. Fresh/newly opened tabs without any document_outline key must not churn sidebarChanged on unrelated emits.
+        overview = self.workspace / "Overview.md"
+        self.studio.openFolder(str(self.workspace))
+        self.wait_until(lambda: len(self.studio.files) == 3)
+        self.studio.openNote(str(overview))
+        self.wait_until(lambda: self.studio._current()["path"] == str(overview))
+        self.assertNotIn("outline", self.studio._current())
+
+        baseline_sidebar = self.studio.sidebarSnapshot
+        _ = self.studio.snapshot
+        pre_outline_signals = []
+        self.studio.sidebarChanged.connect(lambda: pre_outline_signals.append(1))
+        for zoom in (110, 120, 125):
+            self.studio.setZoom(zoom)
+        self.studio.message = "Status check"
+        self.studio._emit(False)
+        QTest.qWait(25)
+        self.assertEqual(len(pre_outline_signals), 0)
+        self.assertIs(self.studio.sidebarSnapshot, baseline_sidebar)
+
+        # 2. Repeated identical document_outline posts must preserve outline identity so subsequent emits stay silent.
+        active_id = self.studio.active
+        headings = [{"title": "Overview", "level": 1, "offset": 0}]
+        self.studio.post("out-1", "document_outline", json.dumps({"id": active_id, "headings": headings}))
+        QTest.qWait(20)
+        self.assertEqual(len(pre_outline_signals), 1)
+        outline_cache_after_first = self.studio._outline_slice_cache
+        sidebar_after_first = self.studio.sidebarSnapshot
+
+        # Post an identical outline (new list object with equal content), then trigger unrelated Studio.changed events.
+        self.studio.post("out-2", "document_outline", json.dumps({"id": active_id, "headings": copy.deepcopy(headings)}))
+        self.studio.setZoom(130)
+        self.studio.message = "After no-op outline"
+        self.studio._emit(False)
+        QTest.qWait(25)
+        self.assertEqual(len(pre_outline_signals), 1)
+        self.assertIs(self.studio._outline_slice_cache, outline_cache_after_first)
+        self.assertIs(self.studio.sidebarSnapshot, sidebar_after_first)
+
+        # 3. Renaming a pinned note via renameNote updates both sidebarState.pinned and sidebarState.recent cleanly.
+        self.studio.pinRecent(str(overview))
+        QTest.qWait(20)
+        self.assertEqual(self._qml_dict("sidebarState")["pinned"], [str(overview)])
+
+        second_studio = QuietStudio(True, self.session)
+        second_studio.openFolder(str(self.workspace))
+        self.wait_until(lambda: len(second_studio.files) == 3)
+
+        renamed_overview = self.workspace / "Course Overview.md"
+        self.studio.renameNote(active_id, "Course Overview.md")
+        self.wait_until(
+            lambda: renamed_overview.is_file()
+            and any(f["name"] == "Course Overview.md" for f in self.studio.files)
+            and any(f["name"] == "Course Overview.md" for f in second_studio.files)
+        )
+        QTest.qWait(25)
+        self.assertEqual(self._qml_dict("sidebarState")["pinned"], [str(renamed_overview)])
+        self.assertNotIn(str(overview), self._qml_dict("sidebarState")["recent"])
+        self.assertIn(str(renamed_overview), self._qml_dict("sidebarState")["recent"])
+        self.assertIn("Course Overview.md", [f["name"] for f in json.loads(second_studio.sidebarSnapshot)["files"]])
+
+        # 4. Saving a new note via saveAs inside an unexpanded subfolder refreshes active folderFilter results immediately.
+        filter_field = self.named("folderFilterField")
+        filter_field.setProperty("text", "week")
+        self.wait_until(
+            lambda: not self.studio._folder_searching
+            and not self.studio.filter_timer.isActive()
+            and [f["name"] for f in self.studio.files] == ["Coursework", "Week 1.md"]
+        )
+        self.studio.newNote()
+        week3_id = self.studio.active
+        week3_path = self.workspace / "Coursework" / "Week 3.md"
+        self.studio.post("week3-edit", "document_changed", json.dumps({"id": week3_id, "content": "# Week 3"}))
+        self.studio.saveAs(str(week3_path))
+        self.wait_until(
+            lambda: week3_path.is_file()
+            and not self.studio._folder_searching
+            and [f["name"] for f in self.studio.files] == ["Coursework", "Week 1.md", "Week 3.md"]
+        )
+        QTest.qWait(25)
+        self.assertEqual(
+            [f["name"] for f in self._qml_dict("sidebarState")["files"]],
+            ["Coursework", "Week 1.md", "Week 3.md"],
+        )
+
 
 if __name__ == "__main__":
     unittest.main()
