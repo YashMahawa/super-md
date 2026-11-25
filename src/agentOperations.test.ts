@@ -1,5 +1,5 @@
 import {describe,it,expect} from 'vitest';
-import {applyAgentPatches,applyAgentPatchesDetailed,agentRead,agentSearch,agentOutline,agentOutlinePage,agentSection,agentSectionForExport} from './agentOperations';
+import {agentCharLength,agentCodePointOffset,agentUtf16Offset,applyAgentPatches,applyAgentPatchesDetailed,agentRead,agentSearch,agentOutline,agentOutlinePage,agentSection,agentSectionForExport} from './agentOperations';
 describe('live agent document operations',()=>{
   it('uses Unicode code points without splitting emoji',()=>{
     expect(agentRead('α😀z',1,1).text).toBe('😀');
@@ -146,5 +146,122 @@ describe('live agent document operations',()=>{
   });
   it('rejects an invalid later operation before exposing a partial result',()=>{
     const source='original';expect(()=>applyAgentPatches(source,[{type:'replace',old:'original',new:'changed'},{type:'replace',old:'missing',new:'x'}])).toThrow();expect(source).toBe('original');
+  });
+  it('indexes astral pairs and unpaired surrogates across 512-code-point checkpoints',()=>{
+    const unit='a😀\ud83dx\ude00y🧭';
+    const text=unit.repeat(180)+'\ud83d';
+    const points=Array.from(text);
+    expect(agentCharLength(text)).toBe(points.length);
+    for(const cp of [0,1,2,3,4,511,512,513,1023,1024,1025,points.length-1,points.length]){
+      const expectedUtf16=points.slice(0,cp).join('').length;
+      expect(agentUtf16Offset(text,cp)).toBe(expectedUtf16);
+      expect(agentCodePointOffset(text,expectedUtf16)).toBe(cp);
+    }
+    const emojiIndex=text.indexOf('😀',900);
+    expect(agentCodePointOffset(text,emojiIndex+1)).toBe(Array.from(text.slice(0,emojiIndex+1)).length);
+    expect(()=>agentUtf16Offset(text,-1)).toThrow('non-negative');
+    expect(()=>agentUtf16Offset(text,points.length+1)).toThrow('beyond the document');
+  });
+  it('tracks surrogate pairing and splitting across 1-unit patch boundary windows',()=>{
+    const pairedByLines=applyAgentPatchesDetailed('a\ud83d',[{type:'lines',start_line:2,end_line:2,text:'\ude00'},{type:'replace',old:'a',new:'b'}]);
+    expect(pairedByLines.text).toBe('b😀');
+    expect(pairedByLines.operations[0]).toEqual({operationIndex:0,type:'lines',startOffset:2,endOffset:2,deltaChars:0});
+    const pairJoin=applyAgentPatchesDetailed('\ud83dx\ude00',[{type:'replace',old:'x',new:''}]);
+    expect(pairJoin.text).toBe('😀');
+    expect(pairJoin.operations[0]).toEqual({operationIndex:0,type:'replace',startOffset:1,endOffset:2,deltaChars:-2});
+    const pairSplit=applyAgentPatchesDetailed('😀',[{type:'replace',old:'\ude00',new:'x'}]);
+    expect(pairSplit.text).toBe('\ud83dx');
+    expect(pairSplit.operations[0]).toMatchObject({deltaChars:1});
+    const multiGap=applyAgentPatchesDetailed('\ud83dxx\ude00',[{type:'replace',old:'x',new:'',count:'all'}]);
+    expect(multiGap.text).toBe('😀');
+    expect(multiGap.operations[0]).toEqual({operationIndex:0,type:'replace',startOffset:1,endOffset:3,deltaChars:-3});
+    const lineBoundaryPair=applyAgentPatchesDetailed('head\ud83d',[{type:'lines',start_line:2,end_line:2,text:'\ude00tail'}]);
+    expect(lineBoundaryPair.text).toBe('head😀tail');
+    expect(lineBoundaryPair.operations[0]).toEqual({operationIndex:0,type:'lines',startOffset:5,endOffset:5,deltaChars:4});
+  });
+  it('preserves all Unicode line breaks and neighbor merges without trailing newlines',()=>{
+    const mixed='# One\r\n# Two\r# Three\v# Four\f# Five\x85# Six\u2028# Seven\u2029# Eight';
+    const outline=agentOutline(mixed);
+    expect(outline.map(h=>[h.title,h.line])).toEqual([['One',1],['Two',2],['Three',3],['Four',4],['Five',5],['Six',6],['Seven',7],['Eight',8]]);
+    expect(agentOutlinePage(mixed,0,8).documentLength).toBe(Array.from(mixed).length);
+    const merged=applyAgentPatchesDetailed('alpha\r\nbeta',[
+      {type:'insert',line:2,text:'prefix-'},
+      {type:'insert',line:3,text:'gamma'},
+      {type:'lines',start_line:1,end_line:1,text:'ALPHA'},
+    ]);
+    expect(merged.text).toBe('ALPHA\nprefix-beta\r\ngamma');
+    const crlfJoin=applyAgentPatches('top\r',[{type:'lines',start_line:2,end_line:2,text:'\nnext\nlast'}]);
+    expect(crlfJoin).toBe('top\r\nnext\nlast');
+  });
+  it('handles İ length shifts, context-free Σ folding, unpaired surrogates and excludeDiagrams in search',()=>{
+    const tr='İstanbul İki 😀 İstanbul';
+    const byUpper=agentSearch(tr,'İSTANBUL',10,2);
+    expect(byUpper.matches.map(m=>[m.matchOffset,m.matchLength])).toEqual([[0,8],[15,8]]);
+    expect(byUpper.matches[1].text).toBe('😀 İstanbul');
+    const byExpanded=agentSearch(tr,'i\u0307stanbul',10,0);
+    expect(byExpanded.matches.map(m=>[m.matchOffset,m.matchLength])).toEqual([[0,8],[15,8]]);
+    expect(agentSearch('İstanbul','i',10,0).matches).toEqual([]);
+    expect(agentSearch('\u0130\u0307\u0307','\u0307\u0307',10,0).matches.map(m=>[m.matchOffset,m.matchLength])).toEqual([[1,2]]);
+
+    const greek='ΑΣ Σα ς';
+    expect(agentSearch(greek,'σ',10,0).matches.map(m=>m.matchOffset)).toEqual([1,3]);
+    expect(agentSearch(greek,'Σ',10,0).matches.map(m=>m.matchOffset)).toEqual([1,3]);
+    expect(agentSearch(greek,'ς',10,0).matches.map(m=>m.matchOffset)).toEqual([6]);
+
+    expect(agentSearch('😀\ude00','\ude00',10,0,{caseSensitive:true}).matches.map(m=>m.matchOffset)).toEqual([1]);
+    expect(agentSearch('😀target αtarget target_1 target','target',10,0,{wholeWord:true}).matches.map(m=>m.matchOffset)).toEqual([1,25]);
+
+    const withDiagrams='😀 intro target\n```mermaid\ngraph TD\n  target-->B\n```\n```\n<svg>target</svg>\n```\nfinal target';
+    const filtered=agentSearch(withDiagrams,'target',10,4,{excludeDiagrams:true});
+    expect(filtered.totalMatches).toBe(2);
+    expect(filtered.matches.map(m=>[m.matchOffset,m.line])).toEqual([[8,1],[84,9]]);
+  });
+  it('applies 100-patch batches and enforces the exact 20 MB UTF-8 byte limit',()=>{
+    const initial=Array.from({length:120},(_,i)=>`Line ${i} 🧭 <token_${i}>\n`).join('');
+    const ops=Array.from({length:100},(_,i)=>
+      i%3===0?{type:'replace' as const,old:`<token_${i}>`,new:`<patched_${i}_😀>`}:
+      i%3===1?{type:'lines' as const,start_line:i+1,end_line:i+1,text:`Edited ${i} 🧪 <token_${i}>\n`}:
+      {type:'insert' as const,line:i+1,text:`Inserted ${i}\n`}
+    );
+    let expected=initial;
+    const stepSummaries=ops.map((op,idx)=>{
+      const single=applyAgentPatchesDetailed(expected,[op]);
+      expected=single.text;
+      return {...single.operations[0],operationIndex:idx};
+    });
+    const batch=applyAgentPatchesDetailed(initial,ops);
+    expect(batch.applied).toBe(100);
+    expect(batch.text).toBe(expected);
+    expect(batch.operations).toEqual(stepSummaries);
+
+    const longLeft='x'+'😀'.repeat(40)+'\ud83d',longRight='y😀'+'z'.repeat(80)+'\r\n';
+    const peeled=applyAgentPatchesDetailed(longLeft,[
+      {type:'lines',start_line:2,end_line:2,text:'\ude00mid\n'+longRight},
+      {type:'insert',line:2,text:'ins\n'},
+      {type:'replace',old:'mid',new:'MID'},
+    ]);
+    expect(peeled.text).toBe('x'+'😀'.repeat(41)+'MID\nins\n'+longRight);
+    expect(peeled.operations.map(item=>[item.startOffset,item.endOffset,item.deltaChars])).toEqual([[42,42,88],[46,46,4],[42,45,0]]);
+
+    const nearCap='😀'.repeat(4_999_999)+'a\ud83d'; // 19,999,996 + 1 + 3 = 20,000,000 UTF-8 bytes
+    expect(applyAgentPatches(nearCap,[{type:'replace',old:'a',new:'b'}]).length).toBe(nearCap.length);
+    const detailedNearCap=applyAgentPatchesDetailed(nearCap,[{type:'replace',old:'a',new:'b'}]);
+    expect(detailedNearCap.operations[0]).toEqual({operationIndex:0,type:'replace',startOffset:4_999_999,endOffset:5_000_000,deltaChars:0});
+    expect(()=>applyAgentPatches(nearCap,[{type:'lines',start_line:2,end_line:2,text:'\ude00'}])).toThrow('exceeds 20 MB');
+    expect(()=>applyAgentPatchesDetailed(nearCap,[{type:'lines',start_line:2,end_line:2,text:'\ude00'}])).toThrow('exceeds 20 MB');
+  });
+  it('bounds prose SVG elision to maxEnd without leaking off-screen text',()=>{
+    const svg='<svg xmlns="http://www.w3.org/2000/svg"><rect width="12" height="12"/></svg>';
+    const doc=`# 😀 Visible\n\n\`\`\`svg\n${svg}\n\`\`\`\n\n## Offscreen\n\nHidden trailing paragraph.`;
+    const viewportEndUtf16=doc.indexOf('\n\n## Offscreen');
+    const viewportEndCp=agentCodePointOffset(doc,viewportEndUtf16);
+    const bounded=agentRead(doc,0,6000,undefined,'prose',viewportEndCp);
+    const sliced=agentRead(doc.slice(0,viewportEndUtf16),0,6000);
+    expect(bounded.text).toBe(sliced.text);
+    expect(bounded.end).toBe(viewportEndCp);
+    expect(bounded.svg_omissions).toEqual(sliced.svg_omissions);
+    expect(bounded.text).not.toContain('Offscreen');
+    const empty=agentRead(doc,viewportEndCp,1,undefined,'prose',viewportEndCp);
+    expect(empty).toMatchObject({view:'prose',text:'',start:viewportEndCp,end:viewportEndCp,returned_chars:0,svg_omissions:[]});
   });
 });

@@ -1,4 +1,5 @@
-import type {WritingIssue,WritingOptions} from "./proofreadingCore";
+import {PROOFREADING_MAX_CHARS,type WritingIssue,type WritingOptions} from "./proofreadingCore";
+import {loadPersonalWords} from "./personalDictionary";
 export type {WritingIssue,WritingOptions} from "./proofreadingCore";
 let worker:Worker|undefined,sequence=0,idle:ReturnType<typeof setTimeout>|undefined;
 const pending=new Map<number,(value:WritingIssue[])=>void>();
@@ -15,5 +16,8 @@ export function checkWriting(text:string,options:WritingOptions,blocked:Array<[n
   // slow device must not silently receive an empty result after 45 seconds.
   clearTimeout(idle);idle=undefined;
   const id=++sequence;
-  return new Promise(resolve=>{pending.set(id,resolve);worker!.postMessage({id,text:text.slice(0,12_000),options,blocked});});
+  const savedWords=options.spellCheck?loadPersonalWords():[];
+  const mergedCustom=options.customWords?[...savedWords,...options.customWords]:savedWords;
+  const workerOptions:WritingOptions=mergedCustom.length?{...options,customWords:Array.from(new Set(mergedCustom))}:{spellCheck:options.spellCheck,grammarCheck:options.grammarCheck};
+  return new Promise(resolve=>{pending.set(id,resolve);worker!.postMessage({id,text:text.slice(0,PROOFREADING_MAX_CHARS),options:workerOptions,blocked});});
 }

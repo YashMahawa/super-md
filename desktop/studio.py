@@ -52,6 +52,7 @@ import file_events
 import custom_theme
 from selection_actions import ASSISTANTS, selection_target
 from shortcuts import DEFINITIONS as SHORTCUT_DEFINITIONS, capture_sequence, default_shortcuts, native_label, normalize_shortcuts, parse_sequence
+from workspace_search import canonical_note_key, stream_text_search
 
 ROOT = Path(sys._MEIPASS)/"resources" if getattr(sys,"frozen",False) else Path(__file__).resolve().parent.parent
 DEFAULT_PDF = {"pageSize": "a4", "margin": 14, "fontSize": 10.5, "lineHeight": 1.4, "paragraphSpacing": 0.65, "fontFamily": "Manrope", "pageNumbers": True, "themed": False}
@@ -64,6 +65,10 @@ DEFAULTS.update(selectionAssistant="chatgpt")
 DEFAULTS.update(latexAutofix=False, typewriterScroll=False)
 DEFAULTS.update(shortcuts=default_shortcuts())
 DEFAULTS.update(agentAccessEnabled=False, cloudAgentEnabled=False)
+
+def _preserve_unchanged_assets(old_assets: dict[str, str], new_assets: dict[str, str]) -> dict[str, str]:
+    """Keep existing Python string identities for unchanged data URLs so ReaderAssetStore grants stay valid."""
+    return {k: old_assets[k] if old_assets.get(k) == v else v for k, v in new_assets.items()}
 
 def _normalize_mcp_roots(roots) -> list[str]:
     if not roots:
@@ -255,7 +260,7 @@ def _validate_local_tab_asset_path(raw_path, note_path: Path, extra_roots: list[
         return resolved
     raise ValueError(outside_message)
 
-SAMPLE = """# A place to think\n\nWrite in Markdown. Read without distractions.\n\n> [!tip] Start with your notes\n> Open any note or folder. No vault, no import process.\n\n## Learn by exploring\n\n$$E = mc^2$$\n\n> [!answer]- Why does this matter?\n> Tap the heading to reveal an answer, then hide it to test yourself.\n\n```smd-chart\n{\"title\":\"A changing wave\",\"series\":[{\"name\":\"Sine\",\"expression\":\"sin(a*x)\",\"color\":\"#386a57\"},{\"name\":\"Cosine\",\"expression\":\"cos(a*x)\",\"color\":\"#bc6750\"}],\"sliders\":[{\"name\":\"a\",\"min\":0.2,\"max\":3,\"value\":1}]}\n```\n\n## Matplotlib in three dimensions\n\nRun a Python cell to generate a 3D figure, then save it in your note or PDF.\n\n```python\nimport numpy as np\nimport matplotlib.pyplot as plt\nx, y = np.meshgrid(np.linspace(-2, 2, 32), np.linspace(-2, 2, 32))\nfig = plt.figure()\nax = fig.add_subplot(111, projection=\"3d\")\nax.plot_surface(x, y, x*x + y*y, cmap=\"viridis\")\n```\n\n[Back to exploring](#learn-by-exploring)\n"""
+SAMPLE = """# A place to think\n\nWrite in Markdown. Read without distractions.\n\n> [!tip] Start with your notes\n> Open any note or folder. No vault, no import process.\n\n## Learn by exploring\n\n$$E = mc^2$$\n\n> [!answer]- Why does this matter?\n> Tap the heading to reveal an answer, then hide it to test yourself.\n\n```smd-chart\n{\"title\":\"A changing wave\",\"series\":[{\"name\":\"Sine\",\"expression\":\"sin(a*x)\",\"color\":\"#386a57\"},{\"name\":\"Cosine\",\"expression\":\"cos(a*x)\",\"color\":\"#bc6750\"}],\"sliders\":[{\"name\":\"a\",\"min\":0.1,\"max\":3,\"step\":0.05,\"value\":1}]}\n```\n\n## Matplotlib in three dimensions\n\nRun a Python cell to generate a 3D figure, then save it in your note or PDF.\n\n```python\nimport numpy as np\nimport matplotlib.pyplot as plt\nx, y = np.meshgrid(np.linspace(-2, 2, 32), np.linspace(-2, 2, 32))\nfig = plt.figure()\nax = fig.add_subplot(111, projection=\"3d\")\nax.plot_surface(x, y, x*x + y*y, cmap=\"viridis\")\n```\n\n[Back to exploring](#learn-by-exploring)\n"""
 
 def public_address(url: str) -> str:
     """Resolve once and return a global IP for the URL's host, or refuse."""
@@ -548,6 +553,8 @@ class Session(QObject):
 class Studio(QObject):
     changed = Signal()
     shortcutsChanged = Signal()
+    workspaceSearchChanged = Signal()
+    workspaceSearchBatch = Signal(int, object, int, bool, bool)
     readerLoad = Signal(str)
     readerCall = Signal(str)
     readerReloadRequested = Signal()
@@ -578,6 +585,8 @@ class Studio(QObject):
         self.setObjectName("studio")
         self._brand_svg = (ROOT/"public/brand-mark-fixed.svg").read_text(encoding="utf-8")
         self.pool = concurrent.futures.ThreadPoolExecutor(max_workers=3, thread_name_prefix="supermd")
+        self._search_pool = concurrent.futures.ThreadPoolExecutor(max_workers=2, thread_name_prefix="supermd-search")
+        self.workspaceSearchBatch.connect(self._on_workspace_search_batch)
         self.session = session or Session(isolated)
         self.session.changed.connect(lambda:self._emit())
         self.session.locationChanged.connect(self._location_changed)
@@ -635,6 +644,18 @@ class Studio(QObject):
         self.folder = ""
         self.files: list[dict] = []
         self.expanded: set[str] = set()
+        self._folder_search_open = False
+        self._folder_search_query = ""
+        self._folder_search_case_sensitive = False
+        self._folder_search_include_diagrams = False
+        self._folder_search_matches: list[dict] = []
+        self._folder_search_scanning = False
+        self._folder_search_scanned_files = 0
+        self._folder_search_truncated = False
+        self._folder_search_generation = 0
+        self._folder_search_cancel: threading.Event | None = None
+        self._folder_search_tabs_sig: list[tuple[str, str, bool]] | None = None
+        self._pending_seeded_find: dict | None = None
         self.mode = self.settings.get("readingMode", "live")
         self.fullscreen = False
         self.reader_overlay = False
@@ -696,7 +717,7 @@ class Studio(QObject):
         self.flush_operation = None
         self.flush_timer = QTimer(self)
         self.flush_timer.setSingleShot(True)
-        self.flush_timer.timeout.connect(lambda:self.flushFailed.emit(bool(self.flush_operation and self.flush_operation["action"] == "close_window")))
+        self.flush_timer.timeout.connect(self._on_flush_timeout)
         self.recovery_timer = QTimer(self)
         self.recovery_timer.setSingleShot(True)
         self.recovery_timer.timeout.connect(self._recover)
@@ -880,18 +901,36 @@ class Studio(QObject):
     def pinnedRecent(self):return self.session.pinned
 
     def _current(self):
-        return next(t for t in self.tabs if t["id"] == self.active)
+        if not self.tabs:
+            return {"id": "", "name": "Super MD", "content": "", "path": "", "saved": "", "assets": {}, "saved_assets": {}, "assets_dirty": False, "portable": False, "conflict": False, "outline": []}
+        return next((t for t in self.tabs if t["id"] == self.active), self.tabs[0])
+
+    def _consume_seeded_find(self, tab: dict) -> dict | None:
+        pending = self._pending_seeded_find
+        if not pending or not tab.get("id"):
+            return None
+        target_id = pending.get("tabId") or ""
+        target_path = pending.get("path") or ""
+        matches_id = bool(target_id and tab["id"] == target_id)
+        matches_path = bool(target_path and tab.get("path") and os.path.normcase(str(Path(tab["path"]).resolve(strict=False))) == os.path.normcase(str(Path(target_path).resolve(strict=False))))
+        if not matches_id and not matches_path:
+            return None
+        self._pending_seeded_find = None
+        return {"query": pending["query"], "caseSensitive": bool(pending.get("caseSensitive", False))}
 
     def _emit(self, load=True):
         if self.retired: return
         self._watch_notes()
         self.changed.emit()
-        if load and self.ready:
+        if load and self.ready and self.tabs:
             tab = self._current()
             colors = self._colors()
             reading_settings={key:self.settings[key] for key in ("restorePosition","centerLock","imageAppearance","svgAppearance","imageContrast","fullDocumentAccessibility","latexAutofix","typewriterScroll")}
             reading_settings["customStyle"]=custom_theme.reader(self.session.custom_theme,self.settings["fullTheme" if self.fullscreen else "theme"],self._dark(),self.settings)
             payload={**reading_settings,"readingLocation":self.session.locations.get(tab["path"]),"id": tab["id"], "path": tab["path"] or tab["id"], "mode": self.mode, "dark": self._dark(), "fullscreen": self.fullscreen, "font": self.settings["font"], "size": self.settings["size"], "widthPercent": self.settings["widthPercent"], "lineHeight":self.settings["lineHeight"], "spellCheck":self.settings["spellCheck"], "grammarCheck":self.settings["grammarCheck"], "zoom": self.settings["fullZoom" if self.fullscreen else "normalZoom"], "motion": self.settings["motion"], "python": self.settings["python"], "colors": colors, "viewState": tab.pop("viewState", None)}
+            seeded_find = self._consume_seeded_find(tab)
+            if seeded_find is not None:
+                payload["seededFind"] = seeded_find
             payload["editProtocol"]=1
             if tab.get("agent_unreviewed"):
                 payload["agentUnreviewed"] = True
@@ -1110,7 +1149,11 @@ class Studio(QObject):
                     return
                 if current["content"]!=expected:return
                 if content==expected and assets==current["assets"]:return
-                current.update(content=content,saved=content,assets=assets,saved_assets=dict(assets),assets_dirty=False,portable=portable,conflict=False)
+                old_assets=current["assets"]
+                assets_changed=assets!=old_assets
+                merged_assets=_preserve_unchanged_assets(old_assets,assets)
+                current.update(content=content,saved=content,assets=merged_assets,saved_assets=dict(merged_assets),assets_dirty=False,portable=portable,conflict=False)
+                if assets_changed:self.session.reader_assets.revoke_tab(self.window_id, id)
                 self.message="Reloaded externally updated note"
                 self._emit(load=id==self.active)
             self._submit(lambda path=path:open_note(Path(path)),finished,False)
@@ -1153,6 +1196,8 @@ class Studio(QObject):
     def stop(self):
         if self.retired: return
         if self._storage_cancel_event is not None:self._storage_cancel_event.set()
+        if self._folder_search_cancel is not None:self._folder_search_cancel.set()
+        self._search_pool.shutdown(wait=False, cancel_futures=True)
         self._export_jobs.cancel_all()
         for agent_export in tuple(self._agent_exports.values()):
             try:
@@ -1208,7 +1253,7 @@ class Studio(QObject):
                 "conflict": bool(t.get("conflict")),
                 "agentEdited": bool(t["id"] != self.active and (t.get("agent_staged") or t.get("agent_unreviewed"))),
             } for t in self.tabs],
-            "active": self.active,
+            "active": self.active if self.tabs else "",
             "name": tab["name"],
             "outline": tab.get("outline", []),
             "portable": tab["portable"],
@@ -1233,6 +1278,179 @@ class Studio(QObject):
             "agentJumpTab": self._agent_jump_snapshot(),
             "activeAgentUnreviewed": bool(tab.get("agent_unreviewed")),
         })
+
+    @Property("QVariantMap", notify=workspaceSearchChanged)
+    def folderSearchState(self):
+        sync_pending = bool(
+            self._folder_search_open
+            and self._folder_search_query.strip()
+            and self.flush_operation
+            and self.flush_operation.get("action") == "sync_for_search"
+        )
+        return {
+            "open": self._folder_search_open,
+            "query": self._folder_search_query,
+            "caseSensitive": self._folder_search_case_sensitive,
+            "includeDiagrams": self._folder_search_include_diagrams,
+            "matches": self._folder_search_matches,
+            "scanning": self._folder_search_scanning or sync_pending,
+            "scannedFiles": self._folder_search_scanned_files,
+            "truncated": self._folder_search_truncated,
+            "hasFolder": bool(self.folder),
+        }
+
+    def _search_snapshots(self):
+        tabs_snap = [
+            {
+                "id": t["id"],
+                "name": t["name"],
+                "path": t["path"],
+                "content": t["content"],
+                "dirty": self._is_dirty(t),
+            }
+            for t in self.tabs
+        ]
+        pinned_keys = {canonical_note_key(p) for p in self.session.pinned if p}
+        recent_snap = [
+            {
+                "path": p,
+                "name": Path(p).name,
+                "pinned": canonical_note_key(p) in pinned_keys,
+            }
+            for p in self.recent
+            if p
+        ]
+        folder_path = Path(self.folder) if self.folder else None
+        return tabs_snap, recent_snap, folder_path, self.active
+
+    def _cancel_folder_search(self, close: bool = False):
+        if self._folder_search_cancel is not None:
+            self._folder_search_cancel.set()
+            self._folder_search_cancel = None
+        self._folder_search_generation += 1
+        self._folder_search_scanning = False
+        if close:
+            self._folder_search_open = False
+            self._folder_search_matches = []
+            self._folder_search_scanned_files = 0
+            self._folder_search_truncated = False
+            self._folder_search_tabs_sig = None
+            if self.flush_operation and self.flush_operation.get("action") == "sync_for_search":
+                self.flush_operation = None
+                self.flush_timer.stop()
+
+    @Slot()
+    def openFolderSearch(self):
+        if self.retired:
+            return
+        self._folder_search_open = True
+        self._folder_search_tabs_sig = None
+        if self.ready and self.tabs and not self.flush_operation:
+            self._flush("sync_for_search")
+            self.workspaceSearchChanged.emit()
+        else:
+            self.workspaceSearchChanged.emit()
+            if self._folder_search_query.strip():
+                self._start_folder_search()
+
+    @Slot(str, bool, bool)
+    def updateFolderSearch(self, query: str, case_sensitive: bool = False, include_diagrams: bool = False):
+        if self.retired:
+            return
+        self._folder_search_query = query if isinstance(query, str) else ""
+        self._folder_search_case_sensitive = bool(case_sensitive)
+        self._folder_search_include_diagrams = bool(include_diagrams)
+        if not self._folder_search_open:
+            self._folder_search_open = True
+        self._start_folder_search()
+
+    def _start_folder_search(self):
+        if self._folder_search_cancel is not None:
+            self._folder_search_cancel.set()
+            self._folder_search_cancel = None
+        self._folder_search_generation += 1
+        generation = self._folder_search_generation
+        self._folder_search_matches = []
+        self._folder_search_scanned_files = 0
+        self._folder_search_truncated = False
+        query = self._folder_search_query
+        if not query or not query.strip():
+            self._folder_search_scanning = False
+            self._folder_search_tabs_sig = None
+            self.workspaceSearchChanged.emit()
+            return
+        cancel_event = threading.Event()
+        self._folder_search_cancel = cancel_event
+        self._folder_search_scanning = True
+        self._folder_search_tabs_sig = [(t["id"], t["content"], self._is_dirty(t)) for t in self.tabs]
+        self.workspaceSearchChanged.emit()
+
+        tabs_snap, recent_snap, folder_path, active_id = self._search_snapshots()
+        case_sensitive = self._folder_search_case_sensitive
+        exclude_diagrams = not self._folder_search_include_diagrams
+
+        def emit_batch(batch: list[dict], scanned: int, truncated: bool, done: bool):
+            if self.retired or cancel_event.is_set():
+                return
+            self.workspaceSearchBatch.emit(generation, batch, scanned, truncated, done)
+
+        def worker():
+            stream_text_search(
+                query,
+                tabs_snap,
+                recent_snap,
+                folder_path,
+                active_id=active_id,
+                case_sensitive=case_sensitive,
+                exclude_diagrams=exclude_diagrams,
+                cancel_event=cancel_event,
+                on_batch=emit_batch,
+            )
+
+        try:
+            self._search_pool.submit(worker)
+        except RuntimeError:
+            self._folder_search_scanning = False
+            self.workspaceSearchChanged.emit()
+
+    def _on_workspace_search_batch(self, generation: int, batch, scanned: int, truncated: bool, done: bool):
+        if self.retired or not self._folder_search_open or generation != self._folder_search_generation:
+            return
+        if batch:
+            self._folder_search_matches = self._folder_search_matches + list(batch)
+        self._folder_search_scanned_files = scanned
+        self._folder_search_truncated = bool(truncated)
+        if done:
+            self._folder_search_scanning = False
+        self.workspaceSearchChanged.emit()
+
+    @Slot()
+    def closeFolderSearch(self):
+        if not self._folder_search_open and not self._folder_search_scanning:
+            return
+        self._cancel_folder_search(close=True)
+        self.workspaceSearchChanged.emit()
+
+    @Slot()
+    def cancelWorkspaceSearch(self):
+        changed = self._folder_search_open or self._folder_search_scanning
+        self._cancel_folder_search(close=True)
+        if changed:
+            self.workspaceSearchChanged.emit()
+
+    @Slot(str, str, str, bool)
+    def openFolderSearchMatch(self, tab_id: str, path: str, query: str, case_sensitive: bool = False):
+        if self.retired:
+            return
+        self._cancel_folder_search(close=True)
+        self.workspaceSearchChanged.emit()
+        target_payload = json.dumps({
+            "tabId": tab_id or "",
+            "path": path or "",
+            "query": query or "",
+            "caseSensitive": bool(case_sensitive),
+        })
+        self._flush("open_search_match", target_payload)
 
     @Property(bool, notify=changed)
     def agentAccessEnabled(self):
@@ -2581,6 +2799,7 @@ class Studio(QObject):
 
     @Slot(int)
     def cycleTab(self, direction):
+        if not self.tabs: return
         index=next((i for i,t in enumerate(self.tabs) if t["id"]==self.active),0)
         self.selectTab(self.tabs[(index+direction)%len(self.tabs)]["id"])
 
@@ -2770,9 +2989,13 @@ class Studio(QObject):
 
     @Slot()
     def save(self):
+        if not self.tabs:
+            return
         self._save_current(False)
 
     def _save_current(self, force_overwrite: bool = False):
+        if not self.tabs:
+            return
         tab = self._current()
         if not tab["path"]:
             self.saveRequested.emit(tab["name"])
@@ -2789,8 +3012,46 @@ class Studio(QObject):
 
     def _after_flush(self,operation):
         if operation["action"] == "save": self.save()
-        elif operation["action"] == "save_as": self.saveAsRequested.emit(self._current()["name"])
+        elif operation["action"] == "save_as":
+            if self.tabs:
+                self.saveAsRequested.emit(self._current()["name"])
         elif operation["action"] == "overwrite_conflict": self._save_current(True)
+        elif operation["action"] == "sync_for_search":
+            if self._folder_search_open and self._folder_search_query.strip():
+                current_sig = [(t["id"], t["content"], self._is_dirty(t)) for t in self.tabs]
+                if current_sig != self._folder_search_tabs_sig:
+                    self._start_folder_search()
+                else:
+                    self.workspaceSearchChanged.emit()
+        elif operation["action"] == "open_search_match":
+            request = json.loads(operation["target"])
+            tab_id = request.get("tabId") or ""
+            path = request.get("path") or ""
+            query = request.get("query") or ""
+            case_sensitive = bool(request.get("caseSensitive", False))
+            existing = next((t for t in self.tabs if tab_id and t["id"] == tab_id), None)
+            if existing is None and path:
+                resolved = os.path.normcase(str(Path(path).resolve(strict=False)))
+                existing = next((t for t in self.tabs if t.get("path") and os.path.normcase(str(Path(t["path"]).resolve(strict=False))) == resolved), None)
+            if existing is not None:
+                if existing["id"] == self.active and self.ready:
+                    self._pending_seeded_find = None
+                    if query:
+                        self.readerCall.emit(f"window.supermdFind?.({json.dumps(query)}, {json.dumps({'caseSensitive': case_sensitive})})")
+                    self._focus_open_target(self._activation_generation)
+                else:
+                    self._pending_seeded_find = {"tabId": existing["id"], "path": existing.get("path") or "", "query": query, "caseSensitive": case_sensitive} if query else None
+                    self.selectTab(existing["id"])
+                    if existing["id"] == self.active and not self.ready:
+                        pass
+                    self._focus_open_target(self._activation_generation)
+            elif path:
+                local = str(local_path(path))
+                self._pending_seeded_find = {"tabId": "", "path": local, "query": query, "caseSensitive": case_sensitive} if query else None
+                def opened(_note, error):
+                    if error and self._pending_seeded_find and self._pending_seeded_find.get("path") == local:
+                        self._pending_seeded_find = None
+                self._open_note(local, explicit=True, completion_callback=opened)
         elif operation["action"] == "reload_reader":
             # The renderer has acknowledged all edits. Reopen it from native
             # state and the just-captured view snapshot in document_flushed.
@@ -2813,13 +3074,20 @@ class Studio(QObject):
             self._recover()
             QTimer.singleShot(0,self.allowClose.emit)
 
+    def _on_flush_timeout(self):
+        if self.flush_operation and self.flush_operation.get("action") == "sync_for_search":
+            self.flush_operation = None
+            self.workspaceSearchChanged.emit()
+            return
+        self.flushFailed.emit(bool(self.flush_operation and self.flush_operation["action"] == "close_window"))
+
     def _flush(self,action,target=""):
         if self.retired or action=="close_window" and self.pending_close:return
         operation = {"action":action,"target":target,"token":uuid.uuid4().hex}
-        if not self.ready:
+        if not self.ready or not self.tabs:
             self._after_flush(operation)
             return
-        if self.flush_operation: return
+        if self.flush_operation and (self.flush_operation.get("action") != "sync_for_search" or action == "sync_for_search"): return
         self.flush_operation = operation
         self.flush_timer.start(5000)
         self.readerCall.emit(f"window.supermdFlush?.({json.dumps(operation)})")
@@ -2974,7 +3242,7 @@ class Studio(QObject):
                     changed_on_disk = bool(automatic)
                 else:
                     try:
-                        disk_content, disk_assets, _ = open_note(path)
+                        disk_content, disk_assets, _ = open_note(path, decode_assets=False)
                         changed_on_disk = disk_content != expected or (portable and disk_assets != expected_assets)
                     except Exception:
                         changed_on_disk = True
@@ -2983,7 +3251,7 @@ class Studio(QObject):
                         "_conflict": True,
                         "message": "Autosave paused: this file changed outside Super MD. Your edits remain in draft recovery; use Save as to keep both versions.",
                     }
-            if portable: write_portable(path,content,assets)
+            if portable: write_portable(path,content,assets,validated_assets=expected_assets)
             else:
                 materialize_assets(path.parent,assets)
                 atomic_write(path,content.encode())
@@ -4438,8 +4706,10 @@ class Studio(QObject):
                 captured = dict(tab)
                 captured["assets"] = dict(tab["assets"])
                 owner_id, tab_id = self.window_id, tab["id"]
+                embedded = captured["assets"].get(source)
+                cached = self.session.reader_assets.resolve_cached(owner_id, tab_id, source, embedded) if embedded is not None else None
                 def work():
-                    return resolve_source(captured, source)
+                    return cached if cached is not None else resolve_source(captured, source)
                 def finished(resolved, error):
                     current = next((item for item in self.tabs if item["id"] == tab_id), None)
                     if error:
@@ -4447,6 +4717,7 @@ class Studio(QObject):
                     elif current is None or not self.session.reader_asset_source_is_current(
                             owner_id, tab_id, source, _asset_identity(resolved.get("embedded_data")) if resolved.get("embedded_data") else 0,
                             resolved.get("path", "")):
+                        self.session.reader_assets.evict_source(owner_id, tab_id, source)
                         self.replied.emit(id, "null", "The note or image changed while it was being resolved")
                     else:
                         try:
@@ -4556,12 +4827,12 @@ class Studio(QObject):
                     target_path = Path(captured["path"]) if args.get("save") else Path(output)
                     if args.get("save") and not force_portable_overwrite and target_path.exists():
                         try:
-                            disk_content, disk_assets, _ = open_note(target_path)
+                            disk_content, disk_assets, _ = open_note(target_path, decode_assets=False)
                             if disk_content != captured["saved"] or disk_assets != captured.get("saved_assets", {}):
                                 return {"_conflict": True}
                         except Exception:
                             return {"_conflict": True}
-                    write_portable(target_path,args["content"],args["assets"])
+                    write_portable(target_path,args["content"],args["assets"],validated_assets=captured.get("saved_assets") if args.get("save") else None)
                     result_data = export_result(target_path)
                     try:
                         st = target_path.stat()
@@ -4672,10 +4943,14 @@ class Studio(QObject):
                     self.autosave_timer.start(900)
                     self._emit(False)
                 if command == "export_fmd_native" and args.get("save") and target:
+                    old_assets = target.get("assets", {})
+                    if old_assets != args["assets"]:
+                        self.session.reader_assets.revoke_tab(self.window_id, target["id"])
+                    merged_assets = _preserve_unchanged_assets(old_assets, args["assets"])
                     target.update(
                         saved=args["originalContent"],
-                        assets=args["assets"],
-                        saved_assets=dict(args["assets"]),
+                        assets=merged_assets,
+                        saved_assets=dict(merged_assets),
                         assets_dirty=False,
                         conflict=False,
                     )
@@ -4688,14 +4963,19 @@ class Studio(QObject):
                 elif command == "export_fmd_native" and save_as:
                     save_target = next((t for t in self.tabs if t["id"] == (save_as_tab or captured["id"])), target)
                     if save_target:
+                        old_assets = save_target.get("assets", {})
+                        path_changed = save_target.get("path") != save_as
+                        if old_assets != args["assets"] or path_changed:
+                            self.session.reader_assets.revoke_tab(self.window_id, save_target["id"])
+                        merged_assets = args["assets"] if path_changed else _preserve_unchanged_assets(old_assets, args["assets"])
                         new_content = args["content"] if save_target["content"] == args.get("originalContent", save_target["content"]) else save_target["content"]
                         save_target.update(
                             path=save_as,
                             name=Path(save_as).name,
                             content=new_content,
                             saved=args["content"],
-                            assets=args["assets"],
-                            saved_assets=dict(args["assets"]),
+                            assets=merged_assets,
+                            saved_assets=dict(merged_assets),
                             assets_dirty=False,
                             portable=True,
                             conflict=False,
