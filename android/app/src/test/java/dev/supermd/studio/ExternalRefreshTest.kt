@@ -255,6 +255,47 @@ class ExternalRefreshTest {
         await { !portableDir(adoptedDirV2).exists() }
     }
 
+    @Test fun immediateRefreshDuringInFlightTruncatingWriteWaitsForCommittedBaseline() {
+        val model = newModel()
+        val mdUri = createDoc("Saving.md", "# Baseline v1\n")
+        model.open(mdUri)
+        await { model.state.value.tabs.any { it.uri == mdUri.toString() } }
+        val mdId = model.state.value.tabs.single { it.uri == mdUri.toString() }.id
+        model.edit(mdId, "# Saved v2\n")
+        assertTrue(model.state.value.tabs.single { it.id == mdId }.dirty)
+
+        val refreshEnteredPreIo = java.util.concurrent.CountDownLatch(1)
+        val interceptedTruncatedWrite = AtomicBoolean(false)
+        model.refreshExternalPreIoObserver = {
+            refreshEnteredPreIo.countDown()
+        }
+        provider.onTruncateWrite = { uri, file ->
+            if (uri == mdUri && interceptedTruncatedWrite.compareAndSet(false, true)) {
+                assertEquals("wt mode truncates destination before bytes are written", 0L, file.length())
+                android.os.Handler(Looper.getMainLooper()).post {
+                    model.refreshExternal(uri, immediate = true)
+                }
+                assertTrue("Immediate refresh should reach pre-IO while write holds documentWrites", refreshEnteredPreIo.await(2, java.util.concurrent.TimeUnit.SECONDS))
+                // Give refreshExternalTabs time to reach documentWrites.withLock while file is still 0 bytes.
+                Thread.sleep(40)
+            }
+        }
+
+        model.saveManual(noteId = mdId)
+        await {
+            interceptedTruncatedWrite.get() &&
+                !model.state.value.tabs.single { it.id == mdId }.dirty &&
+                model.refreshJob?.isCompleted == true
+        }
+        model.refreshExternalPreIoObserver = null
+        provider.onTruncateWrite = null
+
+        val savedNote = model.state.value.tabs.single { it.id == mdId }
+        assertFalse("In-flight save must not trigger a false external conflict during wt truncation", mdId in model.state.value.conflictedTabIds)
+        assertEquals("# Saved v2\n", savedNote.content)
+        assertEquals("# Saved v2\n", savedNote.saved)
+    }
+
     private fun portableDir(name: String): File = File(app.filesDir, "portable-assets/$name")
 
     private fun createDoc(name: String, content: String): Uri {
@@ -305,6 +346,7 @@ class ExternalRefreshTest {
 
 private class RefreshTestDocumentProvider(private val directory: File) : ContentProvider() {
     private val files = linkedMapOf<String, File>()
+    @Volatile var onTruncateWrite: ((Uri, File) -> Unit)? = null
 
     fun attach(context: Context, authority: String) {
         val info = ProviderInfo().apply { this.authority = authority; exported = true; grantUriPermissions = true }
@@ -353,6 +395,8 @@ private class RefreshTestDocumentProvider(private val directory: File) : Content
             "wt", "w" -> ParcelFileDescriptor.MODE_WRITE_ONLY or ParcelFileDescriptor.MODE_CREATE or ParcelFileDescriptor.MODE_TRUNCATE
             else -> throw java.io.FileNotFoundException("Unsupported test mode: $mode")
         }
-        return ParcelFileDescriptor.open(file, flags)
+        return ParcelFileDescriptor.open(file, flags).also {
+            if (mode == "wt" || mode == "w") onTruncateWrite?.invoke(uri, file)
+        }
     }
 }

@@ -1388,21 +1388,29 @@ class StudioViewModel(app: Application, val workspaceKey: String = "main") : And
         try {
             withContext(Dispatchers.IO) {
                 preIoObserver?.takeIf { refreshExternalPreIoObserver === it }?.invoke()
-                for (snapshot in snapshots) {
+                for (initialSnapshot in snapshots) {
                     if (coroutineContext[Job]?.isActive == false) break
-                    val note = snapshot.note
-                    val target = runCatching { documentAccess.resolve(Uri.parse(note.uri!!)) }.getOrNull() ?: continue
-                    if (note.dirty) {
-                        if (note.id !in mutable.value.conflictedTabIds) {
+                    documentWrites.withLock {
+                        val currentState = mutable.value
+                        val note = currentState.tabs.find { it.id == initialSnapshot.note.id } ?: return@withLock
+                        if (note.uri == null || note.id in closingNoteIds || note.id in currentState.conflictedTabIds) return@withLock
+                        val snapshot = if (baselineMatchesRefreshSnapshot(note, initialSnapshot) && note.content == initialSnapshot.note.content) {
+                            initialSnapshot
+                        } else {
+                            RefreshTabSnapshot(
+                                note = note,
+                                preIoBaselineAssets = if (note.portable) savedPortableAssets[note.id]?.let { JSONObject(it.toString()) } else null,
+                            )
+                        }
+                        val target = runCatching { documentAccess.resolve(Uri.parse(note.uri)) }.getOrNull() ?: return@withLock
+                        if (note.dirty) {
                             val expectedAssets = if (note.portable) {
                                 snapshot.preIoBaselineAssets ?: baselinePortableAssets(note).also { snapshot.resolvedBaselineAssets = it }
                             } else null
                             val matches = runCatching { diskMatchesBaseline(target, note, expectedAssets) }.getOrNull()
                             if (matches == false) dirtyConflicts[note.id] = snapshot
-                        }
-                    } else if (note.id !in mutable.value.conflictedTabIds) {
-                        if (note.portable) {
-                            val disk = runCatching { resolver.openInputStream(target)?.use(media::openFmd) }.getOrNull() ?: continue
+                        } else if (note.portable) {
+                            val disk = runCatching { resolver.openInputStream(target)?.use(media::openFmd) }.getOrNull() ?: return@withLock
                             pendingPortableDirs.add(disk.directory)
                             val expectedAssets = snapshot.preIoBaselineAssets ?: baselinePortableAssets(note).also { snapshot.resolvedBaselineAssets = it }
                             val diskAssets = runCatching { media.portableAssets(disk.directory) }.getOrNull()
@@ -1417,7 +1425,7 @@ class StudioViewModel(app: Application, val workspaceKey: String = "main") : And
                                 cleanUpdates[note.id] = CleanExternalUpdate(snapshot, disk.markdown, disk.directory, diskAssets)
                             }
                         } else {
-                            val text = runCatching { resolver.openInputStream(target)?.use { readLimited(it, 20_000_000).toString(Charsets.UTF_8).removePrefix("\uFEFF") } }.getOrNull() ?: continue
+                            val text = runCatching { resolver.openInputStream(target)?.use { readLimited(it, 20_000_000).toString(Charsets.UTF_8).removePrefix("\uFEFF") } }.getOrNull() ?: return@withLock
                             if (text != note.content) cleanUpdates[note.id] = CleanExternalUpdate(snapshot, text)
                         }
                     }
@@ -1431,78 +1439,80 @@ class StudioViewModel(app: Application, val workspaceKey: String = "main") : And
                 onCommitted?.invoke()
                 return
             }
-            val currentState = mutable.value
-            val currentTabsById = currentState.tabs.associateBy { it.id }
-            val newlyConflicted = mutableSetOf<String>()
-            dirtyConflicts.forEach { (id, snapshot) ->
-                if (canCommitRefreshConflict(currentTabsById[id], currentState.conflictedTabIds, snapshot)) {
-                    newlyConflicted.add(id)
+            var committedAny = false
+            documentWrites.withLock {
+                val currentState = mutable.value
+                val currentTabsById = currentState.tabs.associateBy { it.id }
+                val newlyConflicted = mutableSetOf<String>()
+                dirtyConflicts.forEach { (id, snapshot) ->
+                    if (canCommitRefreshConflict(currentTabsById[id], currentState.conflictedTabIds, snapshot)) {
+                        newlyConflicted.add(id)
+                    }
                 }
-            }
-            val adoptableUpdates = mutableMapOf<String, CleanExternalUpdate>()
-            cleanUpdates.forEach { (id, update) ->
-                val current = currentTabsById[id]
-                if (canAdoptCleanRefresh(current, currentState.conflictedTabIds, update.snapshot)) {
-                    adoptableUpdates[id] = update
-                } else if (canCommitRefreshConflict(current, currentState.conflictedTabIds, update.snapshot)) {
-                    newlyConflicted.add(id)
+                val adoptableUpdates = mutableMapOf<String, CleanExternalUpdate>()
+                cleanUpdates.forEach { (id, update) ->
+                    val current = currentTabsById[id]
+                    if (canAdoptCleanRefresh(current, currentState.conflictedTabIds, update.snapshot)) {
+                        adoptableUpdates[id] = update
+                    } else if (canCommitRefreshConflict(current, currentState.conflictedTabIds, update.snapshot)) {
+                        newlyConflicted.add(id)
+                    }
                 }
-            }
-            newlyConflicted.forEach { autosavePending.remove(it) }
-            if (newlyConflicted.isEmpty() && adoptableUpdates.isEmpty()) {
-                onCommitted?.invoke()
-                return
-            }
-            val previousPortableDirs = adoptableUpdates.mapNotNull { (id, update) ->
-                val oldDir = update.snapshot.note.assetDirectory
-                if (update.directory != null && oldDir != null && oldDir != update.directory) id to oldDir else null
-            }
-            adoptableUpdates.forEach { (id, update) ->
-                invalidateNoteAssets(id)
-                readerEcho.remove(id)
-                clearReaderEditProtocol(id)
-                if (update.directory != null && update.assets != null) {
-                    savedPortableAssets[id] = update.assets
+                newlyConflicted.forEach { autosavePending.remove(it) }
+                if (newlyConflicted.isEmpty() && adoptableUpdates.isEmpty()) return@withLock
+                committedAny = true
+                val previousPortableDirs = adoptableUpdates.mapNotNull { (id, update) ->
+                    val oldDir = update.snapshot.note.assetDirectory
+                    if (update.directory != null && oldDir != null && oldDir != update.directory) id to oldDir else null
                 }
-            }
-            change { s ->
-                s.copy(
-                    tabs = s.tabs.map { tab ->
-                        val update = adoptableUpdates[tab.id]
-                        if (
-                            update != null &&
-                            !tab.dirty &&
-                            tab.id !in s.conflictedTabIds &&
-                            tab.uri == update.snapshot.note.uri &&
-                            tab.content == update.snapshot.note.content &&
-                            tab.saved == update.snapshot.note.saved &&
-                            tab.assetDirectory == update.snapshot.note.assetDirectory
-                        ) {
-                            tab.copy(content = update.markdown, saved = update.markdown, assetDirectory = update.directory ?: tab.assetDirectory, assetsDirty = false)
-                        } else tab
-                    },
-                    conflictedTabIds = s.conflictedTabIds + newlyConflicted,
-                    message = if (newlyConflicted.isNotEmpty()) "This file changed on disk. Autosave is paused for this tab." else s.message,
-                )
-            }
-            previousPortableDirs.forEach { (id, oldDir) ->
-                val adoptedDir = adoptableUpdates[id]?.directory
-                if (
-                    adoptedDir != null &&
-                    mutable.value.tabs.any { it.id == id && it.assetDirectory == adoptedDir } &&
-                    !isPortableDirectoryReferenced(oldDir)
-                ) {
-                    obsoletePortableDirs.add(oldDir)
+                adoptableUpdates.forEach { (id, update) ->
+                    invalidateNoteAssets(id)
+                    readerEcho.remove(id)
+                    clearReaderEditProtocol(id)
+                    if (update.directory != null && update.assets != null) {
+                        savedPortableAssets[id] = update.assets
+                    }
+                }
+                change { s ->
+                    s.copy(
+                        tabs = s.tabs.map { tab ->
+                            val update = adoptableUpdates[tab.id]
+                            if (
+                                update != null &&
+                                !tab.dirty &&
+                                tab.id !in s.conflictedTabIds &&
+                                tab.uri == update.snapshot.note.uri &&
+                                tab.content == update.snapshot.note.content &&
+                                tab.saved == update.snapshot.note.saved &&
+                                tab.assetDirectory == update.snapshot.note.assetDirectory
+                            ) {
+                                tab.copy(content = update.markdown, saved = update.markdown, assetDirectory = update.directory ?: tab.assetDirectory, assetsDirty = false)
+                            } else tab
+                        },
+                        conflictedTabIds = s.conflictedTabIds + newlyConflicted,
+                        message = if (newlyConflicted.isNotEmpty()) "This file changed on disk. Autosave is paused for this tab." else s.message,
+                    )
+                }
+                previousPortableDirs.forEach { (id, oldDir) ->
+                    val adoptedDir = adoptableUpdates[id]?.directory
+                    if (
+                        adoptedDir != null &&
+                        mutable.value.tabs.any { it.id == id && it.assetDirectory == adoptedDir } &&
+                        !isPortableDirectoryReferenced(oldDir)
+                    ) {
+                        obsoletePortableDirs.add(oldDir)
+                    }
+                }
+                adoptableUpdates.forEach { (id, update) ->
+                    val dir = update.directory ?: return@forEach
+                    if (mutable.value.tabs.any { it.id == id && it.assetDirectory == dir }) {
+                        pendingPortableDirs.remove(dir)
+                    }
                 }
             }
             onCommitted?.invoke()
+            if (!committedAny) return
             refreshPostAdoptObserver?.invoke()
-            adoptableUpdates.forEach { (id, update) ->
-                val dir = update.directory ?: return@forEach
-                if (mutable.value.tabs.any { it.id == id && it.assetDirectory == dir }) {
-                    pendingPortableDirs.remove(dir)
-                }
-            }
         } finally {
             cleanupPortableDirectories(pendingPortableDirs + obsoletePortableDirs)
         }
