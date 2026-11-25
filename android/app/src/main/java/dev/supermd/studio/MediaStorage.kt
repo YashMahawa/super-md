@@ -447,22 +447,74 @@ class MediaStorage(private val context: Context) {
             writer.endObject().endObject()
         }
     }
-    fun portableMarkdown(input: InputStream): String {
+    fun portableMarkdown(input: InputStream, stopAfterMarkdown: Boolean = false, maxMarkdownBytes: Int = 20_000_000): String {
         // Our envelope puts source before assets. Never load image bytes merely
         // to check whether a portable note's source changed externally.
         val sniff=if(input.markSupported())input else BufferedInputStream(input)
         sniff.mark(2);val gzip=sniff.read()==0x1f&&sniff.read()==0x8b;sniff.reset()
         val content=if(gzip)StrictGzipInputStream(sniff) else sniff
         val bounded=object:java.io.FilterInputStream(content){var consumed=0L;override fun read():Int {val value=super.read();if(value>=0)require(++consumed<=120_000_000);return value};override fun read(buffer:ByteArray,offset:Int,length:Int):Int {val size=super.read(buffer,offset,length);if(size>0){consumed+=size;require(consumed<=120_000_000)};return size}}
-        val limitedText=object:java.io.FilterReader(bounded.reader()){var quoted=false;var escaped=false;var tokenLength=0;override fun read(buffer:CharArray,offset:Int,size:Int):Int{val count=super.read(buffer,offset,size);for(i in offset until offset+maxOf(count,0)){val c=buffer[i];if(quoted){require(++tokenLength<=34_000_000){"Portable token is too large"};if(escaped)escaped=false else if(c=='\\')escaped=true else if(c=='\"')quoted=false}else if(c=='\"'){quoted=true;tokenLength=0}};return count}}
-        var markdown:String?=null
-        JsonReader(limitedText.buffered()).use {reader->
+        val limitedText=object:java.io.FilterReader(bounded.reader(Charsets.UTF_8)){var quoted=false;var escaped=false;var tokenLength=0;override fun read(buffer:CharArray,offset:Int,size:Int):Int{val count=super.read(buffer,offset,size);for(i in offset until offset+maxOf(count,0)){val c=buffer[i];if(quoted){require(++tokenLength<=34_000_000){"Portable token is too large"};if(escaped)escaped=false else if(c=='\\')escaped=true else if(c=='\"')quoted=false}else if(c=='\"'){quoted=true;tokenLength=0}};return count}}
+        var format: String? = null
+        var version: Int? = null
+        var markdown: String? = null
+        JsonReader(limitedText.buffered()).use { reader ->
             reader.beginObject()
-            while(reader.hasNext()){val name=reader.nextName();if(name=="markdown"){val source=reader.nextString();require(source.toByteArray().size<=20_000_000);markdown=source}else reader.skipValue()}
+            while (reader.hasNext()) {
+                when (reader.nextName()) {
+                    "format" -> { format = reader.nextString(); require(!stopAfterMarkdown || format in setOf("supermd-smd", "supermd-fmd")) }
+                    "version" -> { version = reader.nextInt(); require(!stopAfterMarkdown || version == 1) }
+                    "markdown" -> { val source = reader.nextString(); require(source.toByteArray(Charsets.UTF_8).size <= maxMarkdownBytes); markdown = source }
+                    else -> reader.skipValue()
+                }
+                if (stopAfterMarkdown && format in setOf("supermd-smd", "supermd-fmd") && version == 1 && markdown != null) {
+                    return markdown!!
+                }
+            }
             reader.endObject()
-            require(reader.peek()==android.util.JsonToken.END_DOCUMENT) { "Unexpected data after the portable envelope" }
+            if (!stopAfterMarkdown) {
+                require(reader.peek() == android.util.JsonToken.END_DOCUMENT) { "Unexpected data after the portable envelope" }
+            }
         }
+        if (stopAfterMarkdown) require(format in setOf("supermd-smd", "supermd-fmd") && version == 1)
         return markdown ?: error("Portable source is unavailable")
+    }
+
+    internal fun readSearchableNote(
+        input: InputStream,
+        maxPlainBytes: Int = 5_000_000,
+        maxPortableMarkdownBytes: Int = 20_000_000,
+    ): String? {
+        val buffered = if (input.markSupported()) input else BufferedInputStream(input, 65_536)
+        buffered.mark(65_536)
+        val prefix = ByteArray(32_768)
+        var prefixLen = 0
+        while (prefixLen < prefix.size) {
+            val count = buffered.read(prefix, prefixLen, prefix.size - prefixLen)
+            if (count <= 0) break
+            prefixLen += count
+        }
+        buffered.reset()
+        if (prefixLen == 0) return ""
+        val headBytes = prefix.copyOfRange(0, prefixLen)
+        val isGzip = portableGzipHeader(headBytes)
+        val headerPreview = if (!isGzip) {
+            runCatching { String(headBytes, Charsets.UTF_8).trimStart('\uFEFF', ' ', '\n', '\r', '\t') }.getOrDefault("")
+        } else ""
+        if (isGzip || portableEnvelopeHeader(headerPreview)) {
+            return runCatching { portableMarkdown(buffered, stopAfterMarkdown = true, maxMarkdownBytes = maxPortableMarkdownBytes) }.getOrNull()
+        }
+        if (headBytes.any { it == 0.toByte() }) return null
+        return runCatching {
+            val raw = readLimited(buffered, maxPlainBytes)
+            if (raw.any { it == 0.toByte() }) return null
+            Charsets.UTF_8.newDecoder()
+                .onMalformedInput(java.nio.charset.CodingErrorAction.REPORT)
+                .onUnmappableCharacter(java.nio.charset.CodingErrorAction.REPORT)
+                .decode(java.nio.ByteBuffer.wrap(raw))
+                .toString()
+                .removePrefix("\uFEFF")
+        }.getOrNull()
     }
     fun writeLocalPortable(output: java.io.OutputStream, markdown: String, directory: String?) {
         val sources=JSONArray(markdownImageSourcesJson(markdown))

@@ -57,10 +57,18 @@ internal fun orderedRecents(notes:List<RecentNote>)=notes.distinctBy {it.uri}.so
 private fun renamedRelative(relative:String?,name:String)=relative?.let {val parent=it.substringBeforeLast('/',"");if(parent.isEmpty())name else "$parent/$name"}
 data class FileEntry(val name: String, val uri: String, val directory: Boolean, val relative: String)
 data class OutlineHeading(val id: String, val title: String, val level: Int, val offset: Int)
+private val EMPTY_NOTE = Note(id = "", name = "Super MD", content = "", saved = "")
+data class PendingSeededFind(
+    val query: String,
+    val caseSensitive: Boolean,
+    val nonce: Long = System.nanoTime(),
+    val targetTabId: String? = null,
+    val targetUri: String? = null,
+)
 data class StudioState(val latexAutofix:Boolean=false, val typewriterScroll:Boolean=false, val selectionAssistant:String="chatgpt", val centerLock:Boolean=true, val customTheme:String="", val activeThemeKind:String="builtin", val activeThemeId:String="", val customThemeSource:String="", val savedThemes:List<SavedThemeEntry> = emptyList(), val patternKind:String="", val patternOpacity:Float=-1f, val patternSize:Float=0f, val patternSpacing:Float=0f, val restorePosition:Boolean=true, val fullDocumentAccessibility:Boolean=false, val startup:String="restore", val imageAppearance:String="original", val svgAppearance:String="original", val imageContrast:Float=1.25f, val spellCheck:Boolean = false, val grammarCheck:Boolean = false, val accent: String = "system", val widthPercent: Float = 100f, val lineHeight: Float = 1.65f, val autosave: Boolean = true, val customFonts: List<String> = emptyList(), val readerOverlay: Boolean = false, val zoomCommand: Long = 0, val tabs: List<Note> = listOf(Note(name = "Welcome.md", content = sample, saved = sample)), val closedTabs: List<Note> = emptyList(), val activeId: String = "", val mode: String = "live", val fullscreen: Boolean = false, val normalZoom: Float = 100f, val fullscreenZoom: Float = 100f, val theme: String = "system", val fullscreenTheme: String = "black", val motion: Boolean = true, val font: String = "Manrope", val size: Float = 15f, val folder: String? = null, val files: List<FileEntry> = emptyList(), val busy: Boolean = false, val message: String? = null, val error: String? = null, val welcomed: Boolean = false, val pdf: String = "{\"pageSize\":\"a4\",\"margin\":14,\"fontSize\":10.5,\"lineHeight\":1.4,\"paragraphSpacing\":0.65,\"fontFamily\":\"Manrope\",\"pageNumbers\":true}", val storageReport: StorageReport? = null, val storageScanning: Boolean = false, val conflictedTabIds: Set<String> = emptySet(), val pendingCloseNoteId: String? = null, val pendingSaveConflictNoteId: String? = null, val pendingHeading: PendingHeadingJump? = null) {
-    val active get() = tabs.find { it.id == activeId } ?: tabs.first()
+    val active get() = tabs.find { it.id == activeId } ?: tabs.firstOrNull() ?: EMPTY_NOTE
     val zoom get() = if (fullscreen) fullscreenZoom else normalZoom
-    val activeConflicted get() = active.id in conflictedTabIds
+    val activeConflicted get() = active.id.isNotEmpty() && active.id in conflictedTabIds
     val pendingCloseNote get() = pendingCloseNoteId?.let { id -> tabs.find { it.id == id } }
     val pendingSaveConflictNote get() = pendingSaveConflictNoteId?.let { id -> tabs.find { it.id == id } }
 }
@@ -309,6 +317,10 @@ class StudioViewModel(app: Application, val workspaceKey: String = "main") : And
     internal fun attachReaderOpenHandler(handler: OpenIntentDispatcher.Handler<Uri>?) = openIntentDispatcher.attach(handler)
     internal fun detachReaderOpenHandler(handler: OpenIntentDispatcher.Handler<Uri>) = openIntentDispatcher.detach(handler)
     private suspend fun performReaderBarrier(expectedActiveId: String, action: () -> Unit): Boolean = readerActionMutex.withLock {
+        if (mutable.value.tabs.isEmpty() && expectedActiveId.isEmpty()) {
+            action()
+            return@withLock true
+        }
         if (mutable.value.active.id != expectedActiveId) return@withLock false
         // A missing bridge is not an implicit flush acknowledgement. Only
         // proceed when the native snapshot is already the last acknowledged
@@ -741,8 +753,36 @@ class StudioViewModel(app: Application, val workspaceKey: String = "main") : And
             mutable.value.folder?.let {listFolder(Uri.parse(it),listedRelative)}
         }
     }
-    init { mutable.value.tabs.filter { it.portable && it.uri != null && !it.assetsDirty }.forEach { recordPortableBaseline(it.id, it.assetDirectory) }; prefs.registerOnSharedPreferenceChangeListener(preferencesChanged);observeActive();observeCustomTheme();migrateLegacyClosedNotes();if(workspaceKey=="main")viewModelScope.launch{updates.restore();if(!BuildConfig.DEBUG && updates.state.value.checkOnOpen){kotlinx.coroutines.delay(6000);updates.check()}} }
-    override fun onCleared() { viewModelRetired.set(true); invalidateAllNoteAssets(); recoveryWriter.closeAfterLatest(mutable.value); prefs.unregisterOnSharedPreferenceChangeListener(preferencesChanged);resolver.unregisterContentObserver(documentObserver);resolver.unregisterContentObserver(themeObserver); super.onCleared() }
+    private val folderSearchMutable = MutableStateFlow(FolderSearchState())
+    val folderSearch = folderSearchMutable.asStateFlow()
+    private val seededFindMutable = MutableStateFlow<PendingSeededFind?>(null)
+    val seededFind = seededFindMutable.asStateFlow()
+    private var folderSearchJob: Job? = null
+
+    init {
+        mutable.value.tabs.filter { it.portable && it.uri != null && !it.assetsDirty }.forEach { recordPortableBaseline(it.id, it.assetDirectory) }
+        prefs.registerOnSharedPreferenceChangeListener(preferencesChanged)
+        observeActive()
+        observeCustomTheme()
+        migrateLegacyClosedNotes()
+        if (workspaceKey == "main") viewModelScope.launch {
+            updates.restore()
+            if (!BuildConfig.DEBUG && updates.state.value.checkOnOpen) {
+                kotlinx.coroutines.delay(6000)
+                updates.check()
+            }
+        }
+    }
+    override fun onCleared() {
+        viewModelRetired.set(true)
+        folderSearchJob?.cancel()
+        invalidateAllNoteAssets()
+        recoveryWriter.closeAfterLatest(mutable.value)
+        prefs.unregisterOnSharedPreferenceChangeListener(preferencesChanged)
+        resolver.unregisterContentObserver(documentObserver)
+        resolver.unregisterContentObserver(themeObserver)
+        super.onCleared()
+    }
     val state = mutable.asStateFlow()
     fun inspectStorage() {
         if (mutable.value.storageScanning) return
@@ -795,7 +835,8 @@ class StudioViewModel(app: Application, val workspaceKey: String = "main") : And
     }
     private fun resolveDisplayName(target: Uri): String? =
         DocumentFile.fromSingleUri(getApplication(), target)?.name?.takeIf(String::isNotBlank)
-            ?: target.takeIf { it.scheme == "file" }?.lastPathSegment?.takeIf(String::isNotBlank)
+            ?: target.takeIf { it.scheme.equals("file", ignoreCase = true) }?.path?.let { File(it).name }?.takeIf(String::isNotBlank)
+            ?: target.takeIf { it.scheme.equals("file", ignoreCase = true) }?.lastPathSegment?.takeIf(String::isNotBlank)
 
     private var autosaveJob: Job? = null
     private val autosavePending = mutableSetOf<String>()
@@ -1622,7 +1663,7 @@ class StudioViewModel(app: Application, val workspaceKey: String = "main") : And
             return existing.copy(uri = target.toString(), relative = relative ?: existing.relative)
         }
         val name = resolveDisplayName(target)
-            ?: relative?.substringAfterLast('/')
+            ?: relative?.substringAfterLast('/')?.takeIf(String::isNotBlank)
             ?: "Note.md"
         return resolver.openInputStream(target)?.use { stream ->
             val buffered = stream.buffered()
@@ -2140,6 +2181,167 @@ class StudioViewModel(app: Application, val workspaceKey: String = "main") : And
             }
             mutable.value = mutable.value.copy(files = entries)
         } catch (error: Exception) { fail("Could not list folder: ${error.message}") }
+    }
+
+    fun openFolderSearch(initialQuery: String? = null) {
+        folderSearchJob?.cancel()
+        val previous = folderSearchMutable.value
+        val nextQuery = initialQuery ?: previous.query
+        folderSearchMutable.value = previous.copy(
+            visible = true,
+            query = nextQuery,
+            scanning = nextQuery.isNotEmpty(),
+            matches = if (nextQuery == previous.query && nextQuery.isNotEmpty()) previous.matches else emptyList(),
+            scannedFiles = if (nextQuery == previous.query && nextQuery.isNotEmpty()) previous.scannedFiles else 0,
+            truncated = false,
+        )
+        folderSearchJob = viewModelScope.launch {
+            if (mutable.value.tabs.isNotEmpty()) {
+                val activeId = mutable.value.active.id
+                if (activeId.isNotEmpty()) runCatching { readerFlushRequester?.invoke(activeId) }
+            }
+            if (nextQuery.isNotEmpty()) {
+                runFolderSearchScan(nextQuery, previous.caseSensitive, previous.includeDiagrams)
+            }
+        }
+    }
+
+    fun updateFolderSearch(
+        query: String = folderSearchMutable.value.query,
+        caseSensitive: Boolean = folderSearchMutable.value.caseSensitive,
+        includeDiagrams: Boolean = folderSearchMutable.value.includeDiagrams,
+    ) {
+        folderSearchJob?.cancel()
+        folderSearchJob = null
+        val visible = folderSearchMutable.value.visible
+        if (query.isEmpty()) {
+            folderSearchMutable.value = FolderSearchState(
+                visible = visible,
+                query = "",
+                caseSensitive = caseSensitive,
+                includeDiagrams = includeDiagrams,
+                scanning = false,
+            )
+            return
+        }
+        folderSearchMutable.value = FolderSearchState(
+            visible = visible,
+            query = query,
+            caseSensitive = caseSensitive,
+            includeDiagrams = includeDiagrams,
+            scanning = true,
+        )
+        folderSearchJob = viewModelScope.launch {
+            runFolderSearchScan(query, caseSensitive, includeDiagrams)
+        }
+    }
+
+    private suspend fun runFolderSearchScan(
+        query: String,
+        caseSensitive: Boolean,
+        includeDiagrams: Boolean,
+    ) {
+        val tabsSnapshot = mutable.value.tabs
+        val activeTabId = mutable.value.active.id
+        val recentSnapshot = recentMutable.value
+        val folderUri = mutable.value.folder?.let(Uri::parse)
+        val finalState = withContext(Dispatchers.IO) {
+            streamTextSearch(
+                query = query,
+                tabs = tabsSnapshot,
+                recents = recentSnapshot,
+                folderRoot = resolveSearchRoot(getApplication(), folderUri),
+                media = media,
+                openUriStream = { candidateUri ->
+                    val target = documentAccess.resolve(candidateUri, writing = false)
+                    if (target.scheme == "file") target.path?.let(::File)?.inputStream()
+                    else resolver.openInputStream(target)
+                },
+                activeTabId = activeTabId,
+                caseSensitive = caseSensitive,
+                excludeDiagrams = !includeDiagrams,
+                onBatch = { batch, scannedFiles, truncated, done ->
+                    if (batch.isNotEmpty() || done) {
+                        withContext(Dispatchers.Main.immediate) {
+                            val current = folderSearchMutable.value
+                            if (current.visible &&
+                                current.query == query &&
+                                current.caseSensitive == caseSensitive &&
+                                current.includeDiagrams == includeDiagrams
+                            ) {
+                                folderSearchMutable.value = current.copy(
+                                    matches = current.matches + batch,
+                                    scannedFiles = scannedFiles,
+                                    truncated = truncated,
+                                    scanning = !done,
+                                )
+                            }
+                        }
+                    }
+                },
+            )
+        }
+        val current = folderSearchMutable.value
+        if (current.visible &&
+            current.query == query &&
+            current.caseSensitive == caseSensitive &&
+            current.includeDiagrams == includeDiagrams
+        ) {
+            folderSearchMutable.value = finalState.copy(visible = true)
+        }
+    }
+
+    fun closeFolderSearch() {
+        folderSearchJob?.cancel()
+        folderSearchJob = null
+        if (folderSearchMutable.value.visible || folderSearchMutable.value.scanning) {
+            folderSearchMutable.value = folderSearchMutable.value.copy(visible = false, scanning = false)
+        }
+    }
+
+    fun cancelWorkspaceSearch() {
+        closeFolderSearch()
+    }
+
+    fun openSearchMatch(match: FolderSearchMatch) {
+        val currentSearch = folderSearchMutable.value
+        val query = currentSearch.query
+        val caseSensitive = currentSearch.caseSensitive
+        closeFolderSearch()
+        val existing = mutable.value.tabs.firstOrNull { tab ->
+            (match.tabId != null && tab.id == match.tabId) ||
+                (!match.uri.isNullOrBlank() && !tab.uri.isNullOrBlank() && sameDocumentUri(tab.uri, match.uri))
+        }
+        if (query.isNotEmpty()) {
+            seededFindMutable.value = PendingSeededFind(
+                query = query,
+                caseSensitive = caseSensitive,
+                targetTabId = existing?.id ?: match.tabId,
+                targetUri = existing?.uri ?: match.uri,
+            )
+        }
+        if (existing != null) {
+            if (mutable.value.active.id == existing.id) {
+                viewModelScope.launch { performReaderBarrier(existing.id) { } }
+            } else {
+                select(existing.id)
+            }
+        } else if (!match.uri.isNullOrBlank()) {
+            open(Uri.parse(match.uri), match.relative)
+        }
+    }
+
+    fun consumeSeededFind(nonce: Long) {
+        if (seededFindMutable.value?.nonce == nonce) {
+            seededFindMutable.value = null
+        }
+    }
+
+    internal fun activeMatchesSeedTarget(note: Note, seed: PendingSeededFind): Boolean {
+        if (note.id.isEmpty()) return false
+        if (seed.targetTabId != null && note.id == seed.targetTabId) return true
+        if (!seed.targetUri.isNullOrBlank() && !note.uri.isNullOrBlank() && sameDocumentUri(note.uri, seed.targetUri)) return true
+        return false
     }
 
     private data class SafTreeMatch(val folderUri: Uri, val rootId: String, val relativePath: String)
