@@ -32,6 +32,7 @@ def _definition_rows(platform: str) -> tuple[tuple[str, str, list[str]], ...]:
         ("replace", "Replace in note", [f"{primary}+H"]),
         ("find_next", "Find next match", find_next),
         ("find_previous", "Find previous match", find_previous),
+        ("search_folder", "Search across notes", [f"{primary}+Shift+F"]),
         ("close_tab", "Close note tab", [f"{primary}+W"]),
         ("next_tab", "Next tab", [f"{primary}+Tab", f"{primary}+PgDown"]),
         ("previous_tab", "Previous tab", [f"{primary}+Shift+Tab", f"{primary}+PgUp"]),

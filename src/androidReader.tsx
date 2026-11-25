@@ -2,9 +2,9 @@ import { createRoot } from "react-dom/client";
 import {flushSync} from 'react-dom';
 import {createGapSelection,type GapSelection} from './gapSelection';
 import {FrameScrollQueue,zoomFrameStep} from './frameMotion';
-import {agentCharLength,agentOutlinePage,agentRead,agentRevision,agentSearch,agentSectionForExport,applyAgentPatchesDetailed} from './agentOperations';
+import {agentCharLength,agentCodePointOffset,agentOutlinePage,agentRead,agentRevision,agentSearch,agentSectionForExport,agentUtf16Offset,applyAgentPatchesDetailed,countCodePointsRange} from './agentOperations';
 import {suggestMathRepairs,applyMathRepairs} from './mathRepair';
-import {agentDiagrams,diagramMetadata,diagramMedia,visibleSourceRange} from './agentView';
+import {agentDiagrams,diagramMetadata,diagramMedia,visibleSourceRange,type AgentDiagramOptions} from './agentView';
 import {mediaBytes} from './mediaExport';
 import { memo, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import "@fontsource-variable/manrope";
@@ -42,7 +42,7 @@ import MathRepairPanel from "./components/MathRepairPanel";
 import ThemeGuideDialog from "./components/ThemeGuideDialog";
 import { captureScrollAnchor,markScrollInput,scrollInputVersion } from "./scrollAnchor";
 import {rememberWindowedScrollSource} from './windowedSearch';
-import ReadingSearch from "./components/ReadingSearch";
+import ReadingSearch, { type ReadingSearchSeed } from "./components/ReadingSearch";
 import type { Point } from "./focalZoom";
 import { applyDocumentZoom,documentPoint,invalidateDocumentZoom,settleDocumentZoom,refreshDocumentExtent,enforceDocumentCenter } from "./documentZoom";
 import { documentOutline, navigateToHeading, cancelHeadingNavigation } from "./documentNavigation";
@@ -70,13 +70,12 @@ interface PdfExportStatus {id:string;phase:'preparing'|'typesetting'|'publishing
 interface NoteView { editor?: PortableEditorSession; history?:NoteHistory; top?: number; rendered?: ReturnType<typeof exportRenderedViews> }
 interface ReaderState extends ReaderAccessibilityPreference { id: string; content: string; path: string | null; mode: "live" | "editor" | "reader" | "split"; dark: boolean; fullscreen: boolean; font: string; size: number; editProtocol?: number; latexAutofix?:boolean; typewriterScroll?:boolean; spellCheck?:boolean; grammarCheck?:boolean; width?: number; widthPercent?:number; lineHeight?:number; colors: Record<string, string>; zoom: number; motion?: boolean; python?: string; viewState?: NoteView }
 declare global { interface Window {supermdAgentRequest?:(request:Record<string,unknown>,callback?:(result:unknown,error:string)=>void)=>void;supermdAgentCompute?:(request:Record<string,unknown>,callback:(result:unknown,error:string)=>void)=>void;supermdThemeGuide?:()=>void;supermdDismiss?:()=>boolean;supermdSetZoom?:(zoom:number,requestedAt?:number)=>void;supermdHeading?:(id:string,offset?:number)=>void;supermdHistory?:(direction:"undo"|"redo")=>void;supermdNativeWheel?:(dx:number,dy:number,point:Point,held:boolean,modifier?:boolean)=>void;supermdToggleTypewriter?:()=>void;} }
-declare global { interface Window { supermdLoad?: (state: ReaderState) => void; supermdExport?: (options: ExportOptions) => void; supermdExportMarkdown?: (archive?: boolean) => void; supermdFind?: (replace?: boolean) => void; supermdFindStep?: (direction?: number) => void; supermdPortable?: (save: boolean) => void; supermdZoomBy?: (factor:number,focus?:Point)=>void; supermdResetZoom?: ()=>void; supermdRepairMath?: ()=>void; supermdFlush?: (operation:Record<string,string>)=>void } }
+declare global { interface Window { supermdLoad?: (state: ReaderState) => void; supermdExport?: (options: ExportOptions) => void; supermdExportMarkdown?: (archive?: boolean) => void; supermdFind?: (replaceOrQuery?: boolean | string, options?: { caseSensitive?: boolean; replace?: boolean }) => void; supermdFindStep?: (direction?: number) => void; supermdPortable?: (save: boolean) => void; supermdZoomBy?: (factor:number,focus?:Point)=>void; supermdResetZoom?: ()=>void; supermdRepairMath?: ()=>void; supermdFlush?: (operation:Record<string,string>)=>void } }
 declare global { interface Window {supermdChromeInset?:(height:number)=>void} }
 declare global { interface Window {supermdSavePosition?:()=>void} }
 declare global {interface Window {supermdExportPhase?:(id:string,phase:'typesetting'|'publishing')=>void}}
-interface ReaderState { centerLock?:boolean; customStyle?:CustomStyle; restorePosition?:boolean; readingLocation?:ReadingLocation|null; imageAppearance?:MediaAppearance; svgAppearance?:MediaAppearance; imageContrast?:number }
+interface ReaderState { centerLock?:boolean; customStyle?:CustomStyle; restorePosition?:boolean; readingLocation?:ReadingLocation|null; imageAppearance?:MediaAppearance; svgAppearance?:MediaAppearance; imageContrast?:number; seededFind?:{query:string;caseSensitive?:boolean}|null }
 type AgentDocumentBase={tabId:string;revision:string;sourceLength:number};
-type AgentDiagramOptions={documentPath?:string|null;python?:string};
 function resolveAgentDiagram(content:string,revision:string,request:Record<string,unknown>,diagramOptions?:AgentDiagramOptions){
   if(request.expectedRevision!==revision)throw Error('A current expectedRevision is required to retrieve this diagram');
   const diagram=agentDiagrams(content,diagramOptions).find(item=>item.id===request.diagramId);if(!diagram)throw Error('Diagram not found in this revision');
@@ -123,6 +122,8 @@ function Reader() {
   const [repairing, setRepairing] = useState(false);
   const [searching,setSearching] = useState(false);
   const [searchReplace,setSearchReplace] = useState(false);
+  const [searchSeed,setSearchSeed] = useState<ReadingSearchSeed|null>(null);
+  const searchSeedNonce = useRef(0);
   const searchingRef = useRef(false); searchingRef.current = searching;
   const [pdfExport,setPdfExport]=useState<PdfExportStatus|null>(null);
   const exportOwner=useRef<{id:string;controller:AbortController;phase:PdfExportStatus['phase']}|null>(null);
@@ -218,7 +219,16 @@ function Reader() {
     window.supermdLoad = (incoming) => {
       const old = reference.current;
       // Native omits content it received from this reader, unchanged since.
-      const {contentUnchanged,...rest}=incoming as ReaderState&{contentUnchanged?:boolean};
+      const {contentUnchanged,seededFind,...rest}=incoming as ReaderState&{contentUnchanged?:boolean};
+      const applyIncomingFind=()=>{
+        if(seededFind&&typeof seededFind.query==='string'){
+          searchSeedNonce.current+=1;
+          setSearchSeed({query:seededFind.query.slice(0,200),caseSensitive:seededFind.caseSensitive,nonce:searchSeedNonce.current});
+          setSearchReplace(false);
+          setSearching(true);
+          requestAnimationFrame(()=>window.dispatchEvent(new CustomEvent("supermd-find-focus",{detail:{replace:false}})));
+        }
+      };
       if(contentUnchanged&&(!old||old.id!==rest.id))return;
       const next=(contentUnchanged?{...rest,content:old!.content}:rest) as ReaderState;
       if(old&&(old.id!==next.id||old.mode!==next.mode||old.fullscreen!==next.fullscreen)){nativeScroll.clear();gapSelection.current?.end();}
@@ -240,10 +250,10 @@ function Reader() {
         const root=document.querySelector<HTMLElement>(".android-reading");
         modeOffset.current=old.mode==="editor"?(editorReadingOffset(old.id)??0):root?readingOffset(root):0;
       }
-      if(old&&[...new Set([...Object.keys(old),...Object.keys(next)])].every(key=>key==="zoom"&&old.fullscreen===next.fullscreen?true:key==="viewState"?!next.viewState:key==="colors"||key==="customStyle"?JSON.stringify((old as any)[key])===JSON.stringify((next as any)[key]):(old as any)[key]===(next as any)[key]))return;
+      if(old&&[...new Set([...Object.keys(old),...Object.keys(next)])].every(key=>key==="zoom"&&old.fullscreen===next.fullscreen?true:key==="viewState"?!next.viewState:key==="colors"||key==="customStyle"?JSON.stringify((old as any)[key])===JSON.stringify((next as any)[key]):(old as any)[key]===(next as any)[key])){applyIncomingFind();return;}
       if (old && old.id !== next.id) {
         savePosition.current();
-        noteViews.current.set(old.id, {top: document.querySelector<HTMLElement>(".android-reading")?.scrollTop ?? 0});
+        noteViews.current.set(old.id, {top: document.querySelector<HTMLElement>(".android-reading")?.scrollTop ?? 0, rendered: exportRenderedViews(old.content)});
         if (noteViews.current.size > 40) noteViews.current.delete(noteViews.current.keys().next().value!);
       }
       if(old&&old.id===next.id&&old.path!==next.path&&next.restorePosition!==false){savePosition.current();const location=loadReadingLocation(old.path);if(location)saveReadingLocation(next.path,location);}
@@ -270,7 +280,7 @@ function Reader() {
         void invoke("zoom_changed",{zoom:loaded.zoom,fullscreen:true});
       }
       if(old && !sameViewport){window.clearTimeout(zoomTimer.current);cancelAnimationFrame(zoomFrame.current);zoomFrame.current=0;zoomTarget.current=null;}
-      const load = () => { if (typeof loaded.typewriterScroll === "boolean") setTypewriterScroll(loaded.typewriterScroll, { persist: false }); reference.current=loaded;setState(loaded); zoomReference.current = loaded.zoom; };
+      const load = () => { if (typeof loaded.typewriterScroll === "boolean") setTypewriterScroll(loaded.typewriterScroll, { persist: false }); reference.current=loaded;setState(loaded); zoomReference.current = loaded.zoom; applyIncomingFind(); };
       const typewriterChanged = Boolean(old?.typewriterScroll) !== Boolean(loaded.typewriterScroll);
       if (old?.id === next.id && old.mode === next.mode && !typewriterChanged) anchored(load); else load();
     };
@@ -352,10 +362,20 @@ function Reader() {
         await invoke("document_flushed",{id:current.id,content:latest?.id===current.id?latest.content:current.content,operation,viewId:id,viewState:view});
       })().catch(error=>setEditError(String(error)));
     };
-    window.supermdFind = (replace = false) => {
+    window.supermdFind = (replaceOrQuery, options) => {
       if(document.querySelector('.theme-guide-dialog'))return;
-      const openReplace=Boolean(replace)&&reference.current?.mode!=="reader";
-      flushSync(()=>{if(!searchingRef.current)setSearchReplace(openReplace);setSearching(true);});
+      const requestedReplace=typeof replaceOrQuery==="boolean"?replaceOrQuery:Boolean(options?.replace);
+      const openReplace=requestedReplace&&reference.current?.mode!=="reader";
+      flushSync(()=>{
+        if(typeof replaceOrQuery==='string'){
+          searchSeedNonce.current+=1;
+          setSearchSeed({query:replaceOrQuery.slice(0,200),caseSensitive:options?.caseSensitive,nonce:searchSeedNonce.current});
+          setSearchReplace(openReplace);
+        } else if(!searchingRef.current) {
+          setSearchReplace(openReplace);
+        }
+        setSearching(true);
+      });
       window.dispatchEvent(new CustomEvent("supermd-find-focus",{detail:{replace:openReplace}}));
     };
     window.supermdFindStep = (direction = 1) => {
@@ -839,8 +859,17 @@ function Reader() {
           visibleText=[visibleText,`${primaryDeck.deckTitle} — ${primaryDeck.notesText}`].filter(Boolean).join('\n').slice(0,2000);
         }
 
-        const sourceOffset=agentCharLength(note.content.slice(0,offset)),sourceLimit=Math.max(1,Math.min(requestedContextLimit,agentCharLength(note.content.slice(offset,range?.end??offset+requestedContextLimit))));
-        const allDiagrams=agentDiagrams(note.content,diagramOptions);
+        const visibleRange=range??{start:offset,end:Math.min(note.content.length,offset+requestedContextLimit)};
+        const sourceOffset=agentCodePointOffset(note.content,offset),sourceLimit=Math.max(1,Math.min(requestedContextLimit,countCodePointsRange(note.content,offset,visibleRange.end)));
+        let diagramScanRange:{start:number;end:number}|null=activeDecks.some(deck=>deck.expanded&&deck.start===undefined)?null:{...visibleRange};
+        if(diagramScanRange){
+          for(const deck of activeDecks){
+            if(deck.expanded&&deck.start!==undefined&&deck.end!==undefined){
+              diagramScanRange={start:Math.min(diagramScanRange.start,deck.start),end:Math.max(diagramScanRange.end,deck.end)};
+            }
+          }
+        }
+        const allDiagrams=agentDiagrams(note.content,diagramScanRange?{...diagramOptions,range:diagramScanRange}:diagramOptions);
         const filteredDiagrams=allDiagrams.filter(item=>{
           if(activeDecks.some(deck=>deck.expanded&&(deck.start!==undefined?item.start===deck.start:item.deckTitle===deck.deckTitle)))return true;
           return range?item.end>range.start&&item.start<range.end:item.start>=offset&&item.start<offset+requestedContextLimit;
@@ -856,16 +885,18 @@ function Reader() {
         const pythonCells:Array<Record<string,unknown>>=[];
         let cellOrdinal=0;
         const walkPython=(node:any)=>{
+          if(pythonCells.length>=8)return;
+          if(node.position?.start?.offset!==undefined&&node.position?.end?.offset!==undefined&&(node.position.end.offset<=visibleRange.start||node.position.start.offset>=visibleRange.end))return;
           if(node.type==='code'&&['python','py'].includes(String(node.lang||'').toLowerCase())&&node.position?.start?.offset!==undefined&&node.position?.end?.offset!==undefined){
-            const ordinal=cellOrdinal++;
             const cellStart=node.position.start.offset,cellEnd=node.position.end.offset;
+            const pyIndex=analysis.pythonCells.findIndex(cell=>cell.offset===cellStart&&cell.source===String(node.value||''));
+            const ordinal=pyIndex>=0?pyIndex:cellOrdinal++;
             const inRange=range?cellEnd>range.start&&cellStart<range.end:cellStart>=offset&&cellStart<offset+requestedContextLimit;
             if(inRange&&pythonCells.length<8){
-              const pyCell=analysis.pythonCells.find(cell=>cell.offset===cellStart&&cell.source===String(node.value||''));
-              const duplicateOrdinal=pyCell?.ordinal??0;
+              const duplicateOrdinal=pyIndex>=0?analysis.pythonCells[pyIndex].ordinal:0;
               const cached=inspectCachedPythonOutput(node.value,{document:note.path??null,cell:String(duplicateOrdinal),interpreter:note.python||'embedded'});
               if(cached){
-                const codeStart=agentCharLength(note.content.slice(0,cellStart)),codeEnd=agentCharLength(note.content.slice(0,cellEnd));
+                const codeStart=agentCodePointOffset(note.content,cellStart),codeEnd=agentCodePointOffset(note.content,cellEnd);
                 const figures=cached.images.filter(safePythonFigure).slice(0,16).map((_,idx)=>`diagram:python:${codeStart}:${idx}`);
                 const stdoutLimit=500,stderrLimit=500;
                 pythonCells.push({
@@ -886,7 +917,10 @@ function Reader() {
         };
         walkPython(analysis.tree);
 
-        const visiblePage=agentRead(range?note.content.slice(0,range.end):note.content,sourceOffset,sourceLimit);
+        const splitRangeEnd=!!range&&range.end>0&&range.end<note.content.length&&note.content.charCodeAt(range.end-1)>=0xd800&&note.content.charCodeAt(range.end-1)<=0xdbff&&note.content.charCodeAt(range.end)>=0xdc00&&note.content.charCodeAt(range.end)<=0xdfff;
+        const visiblePage=splitRangeEnd
+          ?agentRead(note.content.slice(0,range!.end),sourceOffset,sourceLimit)
+          :agentRead(note.content,sourceOffset,sourceLimit,undefined,'prose',range?Math.max(sourceOffset,agentCodePointOffset(note.content,range.end)):undefined);
         // The viewport bounds the page text, not the document's pagination.
         const visibleSource={...visiblePage,total_chars:base.sourceLength,next_offset:visiblePage.end<base.sourceLength?visiblePage.end:null,truncated:visiblePage.end<base.sourceLength};
         const portalViewer=primaryDeck?.expanded?document.querySelector<HTMLElement>('.step-viewer'):null;
@@ -922,9 +956,12 @@ function Reader() {
           const vs=contextPayload.visibleSource as Record<string,unknown>;
           const currentText=String(vs.text??'');
           if(currentText.length<=200)break;
-          const trimmed=Array.from(currentText).slice(0,Math.max(200,Math.floor(Array.from(currentText).length*0.7))).join('');
-          const nextEnd=(vs.start as number)+agentCharLength(trimmed);
-          contextPayload.visibleSource={...vs,text:trimmed,returned_chars:agentCharLength(trimmed),end:nextEnd,next_offset:nextEnd<base.sourceLength?nextEnd:null,truncated:nextEnd<base.sourceLength};
+          const currentChars=agentCharLength(currentText);
+          if(currentChars<=200)break;
+          const targetChars=Math.max(200,Math.floor(currentChars*0.7));
+          const trimmed=currentText.slice(0,agentUtf16Offset(currentText,targetChars));
+          const nextEnd=(vs.start as number)+targetChars;
+          contextPayload.visibleSource={...vs,text:trimmed,returned_chars:targetChars,end:nextEnd,next_offset:nextEnd<base.sourceLength?nextEnd:null,truncated:nextEnd<base.sourceLength};
         }
         return contextPayload;
       }
@@ -1016,7 +1053,7 @@ function Reader() {
     </section></div>}
     {editError&&<div role="alert" className="reader-edit-error">{editError}</div>}
     <MediaThemeFilters colors={state.colors} dark={state.dark}/>
-    {searching && <ReadingSearch content={state.content} close={()=>{setSearching(false);setSearchReplace(false);}} onChange={state.mode==="reader"?undefined:update} sourceSession={state.mode==="editor"||state.mode==="split"?state.id:undefined} initialReplace={searchReplace}/>}
+    {searching && <ReadingSearch content={state.content} close={()=>{setSearching(false);setSearchReplace(false);setSearchSeed(null);}} onChange={state.mode==="reader"?undefined:update} sourceSession={state.mode==="editor"||state.mode==="split"?state.id:undefined} seed={searchSeed} initialReplace={searchReplace}/>}
     <ImageViewer />
     {repairing && <MathRepairPanel content={state.content} apply={update} close={()=>setRepairing(false)} />}
     <MediaTools key={state.id} documentId={state.id} content={state.content} documentPath={state.path} onInsert={(text, point) => { const content = reference.current!.content; const from = Math.min(point?.from ?? content.length, content.length); const to = Math.max(from, Math.min(point?.to ?? from, content.length)); update(content.slice(0, from) + text + content.slice(to)); }} onNotice={(error) => { void invoke("export_failed", { error }); }} />

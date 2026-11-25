@@ -367,5 +367,25 @@ describe("source search",()=>{
     expect(searchHost.querySelector(".reading-search output")?.textContent).toBe("1 / 2");
     expect(highlights.get("smd-search-current")?.ranges[0]?.toString()).toBe("needle");
     sel.removeAllRanges();
+
+    // Seeded cross-note handoff resets regex/whole-word filters to literal mode and auto-selects match 1 / N even when Replace is active.
+    act(()=>mountedRoot!.unmount());
+    hostContainer.querySelector(".android-reading")!.innerHTML='<p data-source-start="0" data-source-end="25">First a+b and second A+B.</p>';
+    mountedRoot=createRoot(searchHost);
+    await act(async()=>{
+      mountedRoot!.render(createElement(ReadingSearch,{content:"First a+b and second A+B.",close:()=>{},onChange:()=>{},initialReplace:true,seed:{query:"a+b",caseSensitive:false,nonce:1}}));
+    });
+    await flushFrames();
+    expect(searchHost.querySelector(".reading-search output")?.textContent).toBe("1 / 2");
+    await act(async()=>{
+      searchHost.querySelector<HTMLButtonElement>('button[aria-label="Regular expression"]')!.click();
+    });
+    await flushFrames();
+    await act(async()=>{
+      mountedRoot!.render(createElement(ReadingSearch,{content:"First a+b and second A+B.",close:()=>{},onChange:()=>{},initialReplace:true,seed:{query:"A+B",caseSensitive:true,nonce:2}}));
+    });
+    await flushFrames();
+    expect(searchHost.querySelector<HTMLButtonElement>('button[aria-label="Regular expression"]')?.getAttribute("aria-pressed")).toBe("false");
+    expect(searchHost.querySelector(".reading-search output")?.textContent).toBe("1 / 1");
   });
 });

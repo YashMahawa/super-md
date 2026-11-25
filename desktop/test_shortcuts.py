@@ -17,6 +17,7 @@ class ShortcutValidationTest(unittest.TestCase):
         self.assertEqual(defaults["replace"], ["Ctrl+H"])
         self.assertIn("F3", defaults["find_next"])
         self.assertIn("Shift+F3", defaults["find_previous"])
+        self.assertEqual(defaults["search_folder"], ["Ctrl+Shift+F"])
         self.assertEqual(parse_sequence("Ctrl+PageDown"), "Ctrl+PgDown")
 
     def test_macos_defaults_use_portable_command_modifiers_and_fullscreen_chord(self):

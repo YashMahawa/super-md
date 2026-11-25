@@ -61,11 +61,25 @@ import androidx.compose.ui.graphics.toArgb
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.res.painterResource
+import androidx.compose.ui.focus.FocusRequester
+import androidx.compose.ui.focus.focusRequester
+import androidx.compose.ui.input.key.Key
+import androidx.compose.ui.input.key.KeyEventType
+import androidx.compose.ui.input.key.key
+import androidx.compose.ui.input.key.onPreviewKeyEvent
+import androidx.compose.ui.input.key.type
+import androidx.compose.ui.text.AnnotatedString
+import androidx.compose.ui.text.SpanStyle
+import androidx.compose.ui.text.buildAnnotatedString
+import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
+import androidx.compose.ui.text.withStyle
 import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.viewinterop.AndroidView
+import androidx.compose.ui.window.Dialog
+import androidx.compose.ui.window.DialogProperties
 import androidx.core.view.WindowCompat
 import androidx.core.view.WindowInsetsCompat
 import androidx.core.view.WindowInsetsControllerCompat
@@ -412,22 +426,43 @@ class MainActivity : ComponentActivity() {
     fun handleShortcut(event: android.view.KeyEvent): Boolean {
         if (event.action == android.view.KeyEvent.ACTION_DOWN && event.repeatCount == 0) {
             if (event.keyCode == android.view.KeyEvent.KEYCODE_F11) { model.fullscreen(!model.state.value.fullscreen); return true }
-            if (event.keyCode == android.view.KeyEvent.KEYCODE_F3 && !event.isCtrlPressed && !event.isAltPressed && !event.isMetaPressed) { stepReaderFind?.invoke(if (event.isShiftPressed) -1 else 1); return true }
-            if (event.keyCode == android.view.KeyEvent.KEYCODE_ESCAPE && (model.state.value.fullscreen || model.state.value.readerOverlay)) { dismissDocument?.invoke() ?: model.fullscreen(false); return true }
-            if ((event.isCtrlPressed || event.isMetaPressed) && event.keyCode == android.view.KeyEvent.KEYCODE_S) {
-                if (event.isShiftPressed) model.beginSaveAs() else model.saveManual()
+            if (event.keyCode == android.view.KeyEvent.KEYCODE_F3 && !event.isCtrlPressed && !event.isAltPressed && !event.isMetaPressed) {
+                if (!model.folderSearch.value.visible) stepReaderFind?.invoke(if (event.isShiftPressed) -1 else 1)
                 return true
+            }
+            if (event.keyCode == android.view.KeyEvent.KEYCODE_ESCAPE) {
+                if (model.folderSearch.value.visible) {
+                    model.cancelWorkspaceSearch()
+                    return true
+                }
+                if (model.state.value.fullscreen || model.state.value.readerOverlay) {
+                    dismissDocument?.invoke() ?: model.fullscreen(false)
+                    return true
+                }
+            }
+            val primaryMod = event.isCtrlPressed || event.isMetaPressed
+            if (primaryMod && !event.isAltPressed) {
+                if (event.keyCode == android.view.KeyEvent.KEYCODE_F) {
+                    if (event.isShiftPressed) model.openFolderSearch() else openReaderFind?.invoke(false)
+                    return true
+                }
+                if (event.keyCode == android.view.KeyEvent.KEYCODE_H && !event.isShiftPressed) {
+                    openReaderFind?.invoke(true)
+                    return true
+                }
+                if (event.keyCode == android.view.KeyEvent.KEYCODE_S) {
+                    if (event.isShiftPressed) model.beginSaveAs() else model.saveManual()
+                    return true
+                }
             }
             if (event.isCtrlPressed && event.keyCode == android.view.KeyEvent.KEYCODE_N) { newWindow(); return true }
             if (event.isCtrlPressed) {
                 when(event.keyCode) {
                     android.view.KeyEvent.KEYCODE_T -> { if(event.isShiftPressed)model.reopen() else model.newNote();return true }
-                    android.view.KeyEvent.KEYCODE_W -> { if(event.isShiftPressed)finish() else model.requestClose(model.state.value.active.id);return true }
+                    android.view.KeyEvent.KEYCODE_W -> { if(event.isShiftPressed)finish() else if(model.state.value.tabs.isNotEmpty())model.requestClose(model.state.value.active.id);return true }
                     android.view.KeyEvent.KEYCODE_TAB -> { model.cycle(if(event.isShiftPressed)-1 else 1);return true }
                     android.view.KeyEvent.KEYCODE_PAGE_DOWN -> {model.cycle(1);return true}
                     android.view.KeyEvent.KEYCODE_PAGE_UP -> {model.cycle(-1);return true}
-                    android.view.KeyEvent.KEYCODE_F -> {if(!event.isShiftPressed&&!event.isAltPressed){openReaderFind?.invoke(false);return true}}
-                    android.view.KeyEvent.KEYCODE_H -> {if(!event.isShiftPressed&&!event.isAltPressed){openReaderFind?.invoke(true);return true}}
                 }
                 if(event.keyCode in android.view.KeyEvent.KEYCODE_1..android.view.KeyEvent.KEYCODE_9){model.tabNumber(event.keyCode-android.view.KeyEvent.KEYCODE_1+1);return true}
             }
@@ -929,6 +964,8 @@ private object NoMotionScheme : MotionScheme {
     var folderRelative by remember { mutableStateOf("") }
     var hinge by remember { mutableStateOf<FoldingFeature?>(null) }
     val recent by model.recent.collectAsStateWithLifecycle()
+    val folderSearch by model.folderSearch.collectAsStateWithLifecycle()
+    val seededFind by model.seededFind.collectAsStateWithLifecycle()
     val accessRequest by model.documentAccessRequests.collectAsStateWithLifecycle()
     var accessPickerShowing by rememberSaveable { mutableStateOf(false) }
     val accessPicker = rememberLauncherForActivityResult(RestoreDocumentAccess()) { uri ->
@@ -1042,14 +1079,21 @@ private object NoMotionScheme : MotionScheme {
         val wide = displayIsLarge && maxWidth >= 720.dp && maxHeight >= 400.dp
         val actualMode = if (!wide && state.mode == "split") "live" else state.mode
         val readerContent=remember {arrayOfNulls<String>(1)}
-        LaunchedEffect(readerReady, state.active, actualMode, dark, state.fullscreen, state.font, state.size, state.widthPercent,state.lineHeight,state.spellCheck,state.grammarCheck,state.latexAutofix,state.typewriterScroll,state.restorePosition,state.centerLock,state.imageAppearance,state.svgAppearance,state.imageContrast,state.fullDocumentAccessibility,state.customTheme,state.patternKind,state.patternOpacity,state.patternSize,state.patternSpacing,tokens, hinge, motion) {
+        LaunchedEffect(readerReady, state.active, actualMode, dark, state.fullscreen, state.font, state.size, state.widthPercent,state.lineHeight,state.spellCheck,state.grammarCheck,state.latexAutofix,state.typewriterScroll,state.restorePosition,state.centerLock,state.imageAppearance,state.svgAppearance,state.imageContrast,state.fullDocumentAccessibility,state.customTheme,state.patternKind,state.patternOpacity,state.patternSize,state.patternSpacing,tokens, hinge, motion, seededFind) {
             if (!readerReady) readerNote[0] = null
-            if (readerReady) {
+            if (readerReady && state.active.id.isNotEmpty()) {
                 val note = state.active
+                val matchingSeed = seededFind?.takeIf { model.activeMatchesSeedTarget(note, it) }
                 val payload = JSONObject().put("id", note.id).put("editProtocol", 1).apply { if (readerNote[0] == note.id && (readerContent[0] === note.content || model.readerEcho[note.id] === note.content)) put("contentUnchanged", true) else put("content", note.content) }.put("path", note.uri ?: note.id).put("mode", actualMode).put("dark", dark).put("fullscreen", state.fullscreen).put("font", state.font).put("size", state.size).put("widthPercent",state.widthPercent).put("lineHeight",state.lineHeight).put("spellCheck",state.spellCheck).put("grammarCheck",state.grammarCheck).put("latexAutofix",state.latexAutofix).put("typewriterScroll",state.typewriterScroll).put("restorePosition",state.restorePosition).put("centerLock",state.centerLock).put("imageAppearance",state.imageAppearance).put("svgAppearance",state.svgAppearance).put("imageContrast",state.imageContrast).put("fullDocumentAccessibility",state.fullDocumentAccessibility).put("colors", tokens).put("zoom", state.zoom).put("motion", motion)
                 payload.put("readingLocation",model.readingLocation(note.uri))
                 payload.put("customStyle",themeStyle(themeDocument(state.customTheme),if(state.fullscreen)state.fullscreenTheme else state.theme,dark,state.patternKind,state.patternOpacity,state.patternSize,state.patternSpacing))
+                if (matchingSeed != null) {
+                    payload.put("seededFind", JSONObject().put("query", matchingSeed.query).put("caseSensitive", matchingSeed.caseSensitive).put("nonce", matchingSeed.nonce))
+                }
                 web?.evaluateJavascript("document.documentElement.dataset.platform='android';window.supermdLoad?.($payload)", null)
+                if (matchingSeed != null) {
+                    model.consumeSeededFind(matchingSeed.nonce)
+                }
                 readerNote[0] = note.id
                 readerContent[0] = note.content
                 val hingeGap = if (hinge != null && actualMode == "split") hinge!!.bounds.width() / density.density else 0f
@@ -1099,10 +1143,11 @@ private object NoMotionScheme : MotionScheme {
                     onOpenFolder = { folder.launch(state.folder?.let(android.net.Uri::parse)) },
                     onCloseFolder = { folderRelative = ""; model.closeFolder() },
                     onFolderRoot = { folderRelative = ""; state.folder?.let { model.listFolder(android.net.Uri.parse(it), "") } },
+                    onFolderSearch = { scope.launch { drawer.close() }; model.openFolderSearch() },
                     onActivateEntry = { entry ->
                         if (entry.directory) {
                             folderRelative = entry.relative
-                            model.listFolder(android.net.Uri.parse(entry.uri), entry.relative)
+                            model.listFolder(android.net.Uri.parse(state.folder ?: entry.uri), entry.relative)
                         } else {
                             activity.requestOpen(android.net.Uri.parse(entry.uri), entry.relative)
                             scope.launch { drawer.close() }
@@ -1136,9 +1181,10 @@ private object NoMotionScheme : MotionScheme {
                                 if (state.fullscreen) contentsShown = true
                                 else {
                                     scope.launch { drawer.open() }
-                                    state.folder?.let { if (state.files.isEmpty()) model.listFolder(android.net.Uri.parse(it), "") }
+                                    state.folder?.let { if (state.files.isEmpty()) model.listFolder(android.net.Uri.parse(it), folderRelative) }
                                 }
                             },
+                            onFolderSearch = { model.openFolderSearch() },
                             onFind = { activity.openReaderFind?.invoke(false) },
                             onSave = saveAction,
                             onExport = { sharing = false; exporting = true },
@@ -1332,6 +1378,16 @@ private object NoMotionScheme : MotionScheme {
             confirmButton = { TextButton(onClick = { accessPickerShowing = true; accessPicker.launch(android.net.Uri.parse(request.uri)) }) { Text(if(request.assetSource == null) "Choose original file" else "Choose linked file") } },
             dismissButton = { TextButton(onClick = model::dismissDocumentAccess) { Text("Not now") } })
     }
+    if (folderSearch.visible) {
+        BackHandler { model.cancelWorkspaceSearch() }
+        FolderSearchModal(
+            state = folderSearch,
+            hasFolder = state.folder != null,
+            onUpdate = model::updateFolderSearch,
+            onSelect = model::openSearchMatch,
+            onDismiss = model::cancelWorkspaceSearch,
+        )
+    }
     state.pendingCloseNote?.let { note ->
         AlertDialog(
             onDismissRequest = model::dismissCloseConfirmation,
@@ -1367,6 +1423,185 @@ private object NoMotionScheme : MotionScheme {
     }
     state.error?.let { AlertDialog(onDismissRequest = model::dismissError, title = { Text("Couldn't finish") }, text = { Text(it, Modifier.heightIn(max = 360.dp).verticalScroll(rememberScrollState())) }, confirmButton = { TextButton(onClick = model::dismissError) { Text("OK") } }) }
     if (!state.welcomed) WelcomeSetup(state, model) { model.welcomeDone(); open.launch(arrayOf("text/*", "application/octet-stream", "application/vnd.supermd.smd", "application/vnd.supermd.fmd", "application/gzip", "application/x-gzip")) }
+}
+
+internal fun buildHighlightedSnippet(
+    snippet: String,
+    matchStart: Int,
+    matchEnd: Int,
+    highlightColor: Color,
+): AnnotatedString {
+    val safeStart = clampUtf16Boundary(snippet, matchStart)
+    val safeEnd = clampUtf16Boundary(snippet, matchEnd).coerceAtLeast(safeStart)
+    if (safeEnd <= safeStart) return AnnotatedString(snippet)
+    return buildAnnotatedString {
+        append(snippet.substring(0, safeStart))
+        withStyle(
+            SpanStyle(
+                color = highlightColor,
+                background = highlightColor.copy(alpha = 0.18f),
+                fontWeight = FontWeight.SemiBold,
+            ),
+        ) {
+            append(snippet.substring(safeStart, safeEnd))
+        }
+        append(snippet.substring(safeEnd))
+    }
+}
+
+@Composable internal fun FolderSearchModal(
+    state: FolderSearchState,
+    hasFolder: Boolean,
+    onUpdate: (String, Boolean, Boolean) -> Unit,
+    onSelect: (FolderSearchMatch) -> Unit,
+    onDismiss: () -> Unit,
+) {
+    val focusRequester = remember { FocusRequester() }
+    var selectedIndex by remember(state.matches) { mutableIntStateOf(0) }
+    val highlightColor = MaterialTheme.colorScheme.primary
+    LaunchedEffect(Unit) { runCatching { focusRequester.requestFocus() } }
+    Dialog(
+        onDismissRequest = onDismiss,
+        properties = DialogProperties(usePlatformDefaultWidth = false),
+    ) {
+        Surface(
+            shape = RoundedCornerShape(28.dp),
+            color = MaterialTheme.colorScheme.surfaceContainerHigh,
+            tonalElevation = 6.dp,
+            modifier = Modifier
+                .widthIn(max = 680.dp)
+                .fillMaxWidth(0.95f)
+                .heightIn(max = 580.dp)
+                .onPreviewKeyEvent { event ->
+                    if (event.type != KeyEventType.KeyDown) return@onPreviewKeyEvent false
+                    when (event.key) {
+                        Key.Escape -> { onDismiss(); true }
+                        Key.DirectionDown -> {
+                            if (state.matches.isNotEmpty()) selectedIndex = (selectedIndex + 1).coerceAtMost(state.matches.lastIndex)
+                            true
+                        }
+                        Key.DirectionUp -> {
+                            if (state.matches.isNotEmpty()) selectedIndex = (selectedIndex - 1).coerceAtLeast(0)
+                            true
+                        }
+                        Key.Enter, Key.NumPadEnter -> {
+                            state.matches.getOrNull(selectedIndex)?.let(onSelect)
+                            true
+                        }
+                        else -> false
+                    }
+                },
+        ) {
+            Column(Modifier.padding(20.dp), verticalArrangement = Arrangement.spacedBy(10.dp)) {
+                Row(verticalAlignment = Alignment.CenterVertically) {
+                    Column(Modifier.weight(1f)) {
+                        Text("Search across notes", style = MaterialTheme.typography.titleLarge)
+                        Text(
+                            if (hasFolder) "Streams live tabs and folder notes (.md, .smd, .fmd, .markdown, .txt)"
+                            else "No folder open · searching open tabs and accessible recent notes",
+                            style = MaterialTheme.typography.bodySmall,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        )
+                    }
+                    TextButton(onClick = onDismiss) { Text("Close") }
+                }
+                OutlinedTextField(
+                    value = state.query,
+                    onValueChange = { onUpdate(it, state.caseSensitive, state.includeDiagrams) },
+                    singleLine = true,
+                    placeholder = { Text("Search text across notes…") },
+                    leadingIcon = { Icon(Icons.Rounded.Search, null) },
+                    trailingIcon = {
+                        if (state.query.isNotEmpty()) {
+                            IconButton(onClick = { onUpdate("", state.caseSensitive, state.includeDiagrams) }) {
+                                Icon(Icons.Rounded.Close, "Clear query")
+                            }
+                        }
+                    },
+                    modifier = Modifier.fillMaxWidth().focusRequester(focusRequester),
+                )
+                Row(
+                    Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.spacedBy(8.dp),
+                    verticalAlignment = Alignment.CenterVertically,
+                ) {
+                    FilterChip(
+                        selected = state.caseSensitive,
+                        onClick = { onUpdate(state.query, !state.caseSensitive, state.includeDiagrams) },
+                        label = { Text("Match case") },
+                    )
+                    FilterChip(
+                        selected = state.includeDiagrams,
+                        onClick = { onUpdate(state.query, state.caseSensitive, !state.includeDiagrams) },
+                        label = { Text("Diagrams") },
+                    )
+                    Spacer(Modifier.weight(1f))
+                    if (state.query.isNotEmpty()) {
+                        Text(
+                            if (state.scanning) "Scanning · ${state.matches.size} (${state.scannedFiles} files)…"
+                            else "${state.matches.size}${if (state.truncated) "+" else ""} in ${state.scannedFiles} files",
+                            style = MaterialTheme.typography.labelSmall,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        )
+                    }
+                }
+                if (state.scanning) LinearProgressIndicator(Modifier.fillMaxWidth())
+                if (state.query.isEmpty()) {
+                    Text(
+                        "Type to search Markdown prose across notes. Inline SVG, Mermaid, and chart blocks are skipped unless Diagrams is enabled.",
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        modifier = Modifier.padding(vertical = 12.dp),
+                    )
+                } else if (!state.scanning && state.matches.isEmpty()) {
+                    Text(
+                        "No matches found.",
+                        style = MaterialTheme.typography.bodyMedium,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        modifier = Modifier.padding(vertical = 16.dp),
+                    )
+                } else {
+                    LazyColumn(Modifier.weight(1f, fill = false), verticalArrangement = Arrangement.spacedBy(6.dp)) {
+                        items(state.matches.size, key = { state.matches[it].key }) { index ->
+                            val match = state.matches[index]
+                            val selected = index == selectedIndex
+                            val annotatedSnippet = remember(match.snippet, match.matchStart, match.matchEnd, highlightColor) {
+                                buildHighlightedSnippet(match.snippet, match.matchStart, match.matchEnd, highlightColor)
+                            }
+                            Surface(
+                                shape = RoundedCornerShape(16.dp),
+                                color = if (selected) MaterialTheme.colorScheme.primaryContainer else MaterialTheme.colorScheme.surfaceContainerLow,
+                                modifier = Modifier.fillMaxWidth().clickable { onSelect(match) },
+                            ) {
+                                Column(Modifier.fillMaxWidth().padding(horizontal = 14.dp, vertical = 10.dp), verticalArrangement = Arrangement.spacedBy(4.dp)) {
+                                    Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                                        Text(match.relative, style = MaterialTheme.typography.labelLarge, maxLines = 1, overflow = TextOverflow.Ellipsis, modifier = Modifier.weight(1f))
+                                        if (match.dirty) {
+                                            Text("Edited", style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.primary)
+                                        }
+                                        Surface(shape = RoundedCornerShape(999.dp), color = MaterialTheme.colorScheme.secondaryContainer) {
+                                            Text(
+                                                "L${match.line}",
+                                                style = MaterialTheme.typography.labelSmall,
+                                                color = MaterialTheme.colorScheme.onSecondaryContainer,
+                                                modifier = Modifier.padding(horizontal = 8.dp, vertical = 2.dp),
+                                            )
+                                        }
+                                    }
+                                    Text(
+                                        text = annotatedSnippet,
+                                        style = MaterialTheme.typography.bodySmall.copy(fontFamily = FontFamily.Monospace),
+                                        maxLines = 2,
+                                        overflow = TextOverflow.Ellipsis,
+                                    )
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
 }
 
 @Composable private fun WelcomeSetup(state: StudioState, model: StudioViewModel, open: () -> Unit) {
@@ -1442,6 +1677,7 @@ private object NoMotionScheme : MotionScheme {
     onFixLatex: () -> Unit,
     onRename: () -> Unit,
     onSettings: () -> Unit,
+    onFolderSearch: () -> Unit = {},
 ) {
     val palette = MaterialTheme.colorScheme
     TopAppBar(
@@ -1459,6 +1695,9 @@ private object NoMotionScheme : MotionScheme {
             }
         },
         actions = {
+            if (wide && !fullscreen) {
+                IconButton(onClick = onFolderSearch, modifier = Modifier.size(48.dp)) { Icon(painterResource(R.drawable.symbol_search), "Search across notes (Ctrl+Shift+F)") }
+            }
             StudyIcon("Find in note", R.drawable.symbol_search, enabled = readerReady, action = onFind)
             IconButton(onClick = onSave, modifier = Modifier.size(48.dp)) { Icon(painterResource(R.drawable.symbol_save), "Save note") }
             IconButton(onClick = onExport, enabled = readerReady && !busy, modifier = Modifier.size(48.dp)) { Icon(painterResource(R.drawable.symbol_export), "Export") }
@@ -1469,6 +1708,7 @@ private object NoMotionScheme : MotionScheme {
             Box {
                 IconButton(onClick = { onMenuExpandedChange(true) }, modifier = Modifier.size(48.dp)) { Icon(Icons.Rounded.MoreVert, "More actions") }
                 DropdownMenu(expanded = menuExpanded, onDismissRequest = { onMenuExpandedChange(false) }) {
+                    DropdownMenuItem(text = { Text("Search across notes") }, onClick = { onMenuExpandedChange(false); onFolderSearch() }, leadingIcon = { Icon(painterResource(R.drawable.symbol_search), null) })
                     DropdownMenuItem(text = { Text("Reopen closed tab") }, enabled = canReopenClosedTab, onClick = { onMenuExpandedChange(false); onReopenClosedTab() }, leadingIcon = { Icon(painterResource(R.drawable.symbol_undo), null) })
                     DropdownMenuItem(text = { Text("Save as") }, enabled = !busy, onClick = { onMenuExpandedChange(false); onSaveAs() }, leadingIcon = { Icon(painterResource(R.drawable.symbol_save), null) })
                     HorizontalDivider()
@@ -1571,6 +1811,7 @@ private object NoMotionScheme : MotionScheme {
     onOpenRecent: (RecentNote) -> Unit,
     onPinRecent: (RecentNote) -> Unit,
     modifier: Modifier = Modifier,
+    onFolderSearch: () -> Unit = {},
 ) {
     val palette = MaterialTheme.colorScheme
     LazyColumn(
@@ -1587,6 +1828,11 @@ private object NoMotionScheme : MotionScheme {
                 }
                 FilledTonalButton(onClick = onOpenFolder, modifier = Modifier.fillMaxWidth().heightIn(min = 48.dp)) {
                     Icon(Icons.Rounded.FolderOpen, null); Spacer(Modifier.width(8.dp)); Text("Open folder")
+                }
+                OutlinedButton(onClick = onFolderSearch, modifier = Modifier.fillMaxWidth().heightIn(min = 48.dp)) {
+                    Icon(Icons.Rounded.Search, null, Modifier.size(18.dp))
+                    Spacer(Modifier.width(8.dp))
+                    Text("Search across notes", maxLines = 1)
                 }
                 if (state.folder != null) {
                     TextButton(onClick = onCloseFolder, modifier = Modifier.heightIn(min = 48.dp)) {
@@ -1813,6 +2059,7 @@ internal class NoteDestination(private val mime: String, private val preferred: 
                 Text("Select text and use Search Google or Ask in the selection toolbar. Ask copies the text and opens the assistant for you to paste and review; it never submits a prompt automatically.",style=MaterialTheme.typography.bodySmall,color=MaterialTheme.colorScheme.onSurfaceVariant)
             }
             if (section == "Writing & shortcuts") SettingsGroup("Python & windows") {
+                Text("Hardware keyboard shortcuts: Ctrl+Shift+F searches across notes, Ctrl+F finds in the current note, and Esc dismisses overlays.", style = MaterialTheme.typography.bodyMedium)
                 Text("NumPy and Matplotlib run locally in a separate worker. Code runs only when you press Run; never automatically on open or export.", style = MaterialTheme.typography.bodyMedium)
                 Text("New window opens an independent workspace. Your device controls split-screen and desktop window placement. Hold and drag a tab to reorder it.", style = MaterialTheme.typography.bodyMedium)
                 Text("The monochrome icon follows your launcher's themed-icon setting.", style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)

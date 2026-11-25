@@ -554,6 +554,112 @@ class OfficialMCPClientTest(unittest.IsolatedAsyncioTestCase):
                 uv_server.should_exit = True
                 thread.join(timeout=5)
 
+    async def test_cold_portable_asset_extract_and_md_export_avoid_redundant_work(self):
+        import base64
+        import hashlib
+        import documents
+        from mcp import Client
+        from mcp.types import ImageContent
+        from mcp_server import build_mcp_server
+
+        valid_png = base64.b64decode(
+            "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO6pX+0AAAAASUVORK5CYII="
+        )
+        valid_svg = b"<svg xmlns='http://www.w3.org/2000/svg'><rect width='4' height='4'/></svg>"
+        assets = {
+            f"assets/extra_{i}.png": "data:image/png;base64," + base64.b64encode(valid_png).decode("ascii")
+            for i in range(12)
+        }
+        assets["assets/target.png"] = "data:image/png;base64," + base64.b64encode(valid_png).decode("ascii")
+        assets["assets/diagram.svg"] = "data:image/svg+xml;base64," + base64.b64encode(valid_svg).decode("ascii")
+        markdown = "# Report\n\n" + ("Prose paragraph line.\n" * 400)
+
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            note = root / "report.smd"
+            packed = documents.compressed_bundle(markdown, assets)
+            note.write_bytes(packed)
+            expected_rev = hashlib.sha256(packed).hexdigest()
+
+            # Cold extraction on a fresh MCP server performs 1 GZIP inflation and 1 base64 decode.
+            server, _ = build_mcp_server([str(root)])
+            real_b64decode = base64.b64decode
+            doc_decode_calls = []
+
+            def counting_b64decode(data, *args, **kwargs):
+                doc_decode_calls.append(1)
+                return real_b64decode(data, *args, **kwargs)
+
+            async with Client(server) as client:
+                with (
+                    patch.object(documents.base64, "b64decode", side_effect=counting_b64decode),
+                    patch.object(documents, "_gzip_json_input", wraps=documents._gzip_json_input) as gzip_spy,
+                ):
+                    extracted = await client.call_tool("document_assets", {
+                        "path": "report.smd",
+                        "action": "extract",
+                        "asset_name": "assets/target.png",
+                        "expected_revision": expected_rev,
+                    })
+                    self.assertFalse(extracted.is_error, extracted.content)
+                    self.assertTrue(any(isinstance(b, ImageContent) for b in extracted.content))
+                    self.assertEqual(gzip_spy.call_count, 1)
+                    self.assertEqual(len(doc_decode_calls), 1)
+
+                    # Stale revision is rejected atomically.
+                    stale = await client.call_tool("document_assets", {
+                        "path": "report.smd",
+                        "action": "extract",
+                        "asset_name": "assets/target.png",
+                        "expected_revision": "0" * 64,
+                    })
+                    self.assertTrue(stale.is_error)
+
+                # Fresh server for paginated reads + Markdown export: 1 GZIP inflation and 0 asset decodes.
+            read_server, _ = build_mcp_server([str(root)])
+            doc_decode_calls.clear()
+            async with Client(read_server) as client:
+                with (
+                    patch.object(documents.base64, "b64decode", side_effect=counting_b64decode),
+                    patch.object(documents, "_gzip_json_input", wraps=documents._gzip_json_input) as gzip_spy,
+                ):
+                    first = await client.call_tool("document_read", {"path": "report.smd", "offset": 0, "limit": 1000})
+                    second = await client.call_tool("document_read", {
+                        "path": "report.smd", "offset": first.structured_content["next_offset"], "limit": 1000
+                    })
+                    exported = await client.call_tool("document_action", {
+                        "action": "export", "path": "report.smd", "output_path": "exported.md", "format": "md"
+                    })
+                    self.assertFalse(first.is_error)
+                    self.assertFalse(second.is_error)
+                    self.assertFalse(exported.is_error, exported.content)
+                    self.assertEqual((root / "exported.md").read_text(encoding="utf-8"), markdown)
+                    self.assertEqual(gzip_spy.call_count, 1)
+                    self.assertEqual(len(doc_decode_calls), 0)
+
+                # Malformed base64, invalid PNG magic bytes, and non-SVG XML are rejected on extract.
+                import gzip
+                bad_note = root / "malformed.smd"
+                bad_note.write_bytes(gzip.compress(json.dumps({
+                    "format": "supermd-smd",
+                    "version": 1,
+                    "markdown": "# Bad\n",
+                    "assets": {
+                        "assets/bad_b64.png": "data:image/png;base64,@@@@",
+                        "assets/fake_magic.png": "data:image/png;base64," + base64.b64encode(b"not-a-png").decode("ascii"),
+                        "assets/not_svg.svg": "data:image/svg+xml;base64," + base64.b64encode(b"<html></html>").decode("ascii"),
+                    },
+                }).encode("utf-8")))
+                bad_rev = hashlib.sha256(bad_note.read_bytes()).hexdigest()
+                for bad_asset in ("assets/bad_b64.png", "assets/fake_magic.png", "assets/not_svg.svg"):
+                    res = await client.call_tool("document_assets", {
+                        "path": "malformed.smd",
+                        "action": "extract",
+                        "asset_name": bad_asset,
+                        "expected_revision": bad_rev,
+                    })
+                    self.assertTrue(res.is_error, f"Expected error for {bad_asset}")
+
     async def test_disabled_live_access_reports_available_false_and_reason_in_sessions_and_devices(self):
         import asyncio
         from mcp import Client

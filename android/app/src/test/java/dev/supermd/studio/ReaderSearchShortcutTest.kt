@@ -40,5 +40,16 @@ class ReaderSearchShortcutTest {
         val shiftF3 = KeyEvent(0L, 0L, KeyEvent.ACTION_DOWN, KeyEvent.KEYCODE_F3, 0, KeyEvent.META_SHIFT_ON)
         assertTrue(activity.handleShortcut(shiftF3))
         assertEquals(listOf(1, -1), steps)
+
+        val ctrlShiftF = KeyEvent(0L, 0L, KeyEvent.ACTION_DOWN, KeyEvent.KEYCODE_F, 0, KeyEvent.META_CTRL_ON or KeyEvent.META_SHIFT_ON)
+        assertTrue(activity.handleShortcut(ctrlShiftF))
+        assertEquals(listOf(false, true), opened)
+
+        val f3DuringFolderSearch = KeyEvent(0L, 0L, KeyEvent.ACTION_DOWN, KeyEvent.KEYCODE_F3, 0, 0)
+        assertTrue(activity.handleShortcut(f3DuringFolderSearch))
+        assertEquals(listOf(1, -1), steps)
+
+        val escapeFolderSearch = KeyEvent(0L, 0L, KeyEvent.ACTION_DOWN, KeyEvent.KEYCODE_ESCAPE, 0, 0)
+        assertTrue(activity.handleShortcut(escapeFolderSearch))
     }
 }
