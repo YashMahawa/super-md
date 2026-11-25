@@ -577,3 +577,93 @@ fn html_images_with_angle_brackets_in_quoted_attributes_preserve_assets_and_widt
         }
     }
 }
+
+#[test]
+fn explicit_equation_tags_and_resolved_references_render_in_headless_pdf() {
+    let md = [
+        "# Electrodynamics Notes",
+        "",
+        "Forward checks: \\eqref{eq:maxwell-faraday}, Law \\ref{eq:maxwell-faraday}, starred \\eqref{eq:boundary} and \\ref{eq:boundary}, inline $F = \\eqref{eq:maxwell-faraday}$.",
+        "",
+        "$$",
+        "\\nabla \\times \\mathbf{E} = -\\frac{\\partial \\mathbf{B}}{\\partial t} \\tag{1.1}\\label{eq:maxwell-faraday}\\label{eq:faraday-alias}",
+        "$$",
+        "",
+        "$$",
+        "\\mathbf{n} \\cdot (\\mathbf{D}_2 - \\mathbf{D}_1) = \\sigma_f \\tag*{\\dagger}\\label{eq:boundary}",
+        "$$",
+        "",
+        "$$",
+        "a_1 + a_2 + a_3 + a_4 + a_5 + a_6 + a_7 + a_8 + a_9 + a_{10} + a_{11} + a_{12} + a_{13} + a_{14} + a_{15} = S \\tag{Wide.3}\\label{eq:wide}",
+        "$$",
+        "",
+        "Backward checks: alias \\eqref{eq:faraday-alias}, wide \\eqref{eq:wide}, link [Faraday law](#eq:maxwell-faraday), literal `\\eqref{eq:maxwell-faraday}`, and unresolved \\eqref{eq:missing} / \\ref{eq:missing} / $\\eqref{eq:missing}$.",
+        "",
+        "$$",
+        "x + y = z \\label{eq:untagged}",
+        "$$",
+        "",
+        "Untagged label check: \\eqref{eq:untagged} and \\ref{eq:untagged}.",
+    ]
+    .join("\n");
+
+    let typst_src = source(&md, &PdfOptions::default(), &HashMap::new()).unwrap();
+    assert!(typst_src.contains("#smd-tagged-equation("), "{typst_src}");
+    assert!(typst_src.contains("<smd-eq-eq_3a_maxwell-faraday>"), "{typst_src}");
+    assert!(typst_src.contains("#link(label(\"smd-eq-eq_3a_maxwell-faraday\"))[#text(\"(1.1)\")]"), "{typst_src}");
+    assert!(typst_src.contains("#link(label(\"smd-eq-eq_3a_maxwell-faraday\"))[#text(\"1.1\")]"), "{typst_src}");
+    assert!(typst_src.contains("#link(label(\"smd-eq-eq_3a_boundary\"))[#text(\"(†)\")]"), "{typst_src}");
+    assert!(typst_src.contains("#link(label(\"smd-eq-eq_3a_boundary\"))[#text(\"†\")]"), "{typst_src}");
+
+    let pdf = export(&md, &PdfOptions::default(), &HashMap::new()).unwrap();
+    assert_eq!(count_pdf_pages(&pdf), 1);
+    let raw_pdf = String::from_utf8_lossy(&pdf);
+    assert!(raw_pdf.contains("/Subtype /Link") || raw_pdf.contains("/Subtype/Link"), "expected internal PDF link annotations");
+
+    if require_poppler() {
+        let dir = std::env::temp_dir().join(format!("smd-eq-pdf-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let pdf_path = dir.join("equations.pdf");
+        std::fs::write(&pdf_path, &pdf).unwrap();
+        let out = std::process::Command::new("pdftotext")
+            .arg("-layout")
+            .arg(&pdf_path)
+            .arg("-")
+            .output()
+            .unwrap();
+        let bbox_out = std::process::Command::new("pdftotext")
+            .arg("-bbox")
+            .arg(&pdf_path)
+            .arg("-")
+            .output()
+            .unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+        assert!(out.status.success());
+        assert!(bbox_out.status.success());
+        let extracted = String::from_utf8_lossy(&out.stdout);
+        let normalized_ws = extracted.split_whitespace().collect::<Vec<_>>().join(" ");
+        assert!(normalized_ws.contains("Forward checks: (1.1), Law 1.1, starred (†) and †"), "extracted:\n{extracted}");
+        assert!(extracted.contains("(1.1)"), "extracted:\n{extracted}");
+        assert!(extracted.contains("(Wide.3)"), "extracted:\n{extracted}");
+        assert!(normalized_ws.contains("Backward checks: alias (1.1), wide (Wide.3), link Faraday law"), "extracted:\n{extracted}");
+        assert!(normalized_ws.contains("\\eqref{eq:maxwell-faraday}"), "literal inline code should stay intact:\n{extracted}");
+        assert!(normalized_ws.contains("unresolved (??) / ?? / (??)."), "unresolved fallback missing:\n{extracted}");
+        assert!(normalized_ws.contains("Untagged label check: (??) and ??."), "untagged fallback missing:\n{extracted}");
+
+        let bbox_xml = String::from_utf8_lossy(&bbox_out.stdout);
+        let wide_tag_xmax = bbox_xml
+            .lines()
+            .find(|line| line.contains("<word ") && line.contains("(Wide.3)"))
+            .and_then(|line| line.split("xMax=\"").nth(1))
+            .and_then(|s| s.split('"').next())
+            .and_then(|s| s.parse::<f64>().ok())
+            .expect("expected (Wide.3) word in pdftotext -bbox");
+        // A4 width is ~595.28pt with 14mm (~39.69pt) right margin -> ~555.6pt right printable edge.
+        assert!(
+            wide_tag_xmax > 520.0 && wide_tag_xmax <= 558.0,
+            "expected right-aligned tag near printable right margin (~555.6pt), got xMax={wide_tag_xmax}pt"
+        );
+    }
+}
+
