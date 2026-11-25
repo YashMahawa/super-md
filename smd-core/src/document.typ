@@ -42,11 +42,22 @@
     }
   })
 }
-#let smd-image(path) = layout(size => {
-  let pic = image(path)
+#let smd-image(src, width: none, zoom: none, format: auto) = layout(size => {
+  let pic = image(src, format: format)
   let bounds = measure(pic)
-  let width = calc.min(size.width, 170mm * (bounds.width / bounds.height))
-  image(path, width: width)
+  let base = if width == none {
+    if zoom == none {
+      if bounds.height > 0pt { 170mm * (bounds.width / bounds.height) } else { size.width }
+    } else {
+      bounds.width
+    }
+  } else if type(width) == ratio {
+    size.width * width
+  } else {
+    width
+  }
+  let target = if zoom == none { base } else { base * zoom }
+  image(src, format: format, width: calc.min(size.width, target))
 })
 // Compact export-only sequence cells: no card chrome or fixed empty stage.
 #let smd-step-image(path) = layout(size => {

@@ -17,6 +17,7 @@ export function selectedMarkdown(selection: Selection | null, source?:string): s
   const startElement=elementAt(range.startContainer), endElement=elementAt(range.endContainer);
   if (!startElement?.closest(".markdown-body,.live-document") || !endElement?.closest(".markdown-body,.live-document")) return null;
   if (startElement.closest("textarea,input,.cm-editor") || endElement.closest("textarea,input,.cm-editor")) return null;
+  if (elementAt(range.commonAncestorContainer)?.closest("[data-frontmatter-properties],.document-properties")) return "";
   const atomicAt=(node:Node)=>{
     const el=elementAt(node);
     return el?.closest(".katex-display") || el?.closest(".katex") || el?.closest('[data-windowed-mounted="false"]');
@@ -63,7 +64,7 @@ export function selectedMarkdown(selection: Selection | null, source?:string): s
       const from=Number(node.getAttribute('data-source-start')),to=Number(node.getAttribute('data-source-end'));
       if(Number.isFinite(from)&&Number.isFinite(to)&&to>from)return source.slice(from,to)+'\n\n';
     }
-    if(node.matches("button,.image-edit-tools,.katex-mathml"))return "";
+    if(node.matches("button,.image-edit-tools,.katex-mathml,[data-frontmatter-properties],.document-properties"))return "";
     if(node.matches(".katex-display,.katex")){const tex=node.querySelector('annotation[encoding="application/x-tex"]')?.textContent;if(tex)return node.matches(".katex-display")?`\n$$\n${tex}\n$$\n`:`$${tex}$`;}
     if(node.tagName==="TABLE"){
       const rows=Array.from(node.querySelectorAll("tr")).filter(row=>row.closest("table")===node).map(row=>Array.from(row.children).filter(cell=>/^(TH|TD)$/.test(cell.tagName)).map(cell=>Array.from(cell.childNodes).map(child=>serialize(child,true)).join("").trim().replace(/\n+/g,"<br>"))).filter(row=>row.length>0);
@@ -88,6 +89,12 @@ export function selectedMarkdown(selection: Selection | null, source?:string): s
       case "input":return node.getAttribute("type")==="checkbox"?`[${(node as HTMLInputElement).checked?"x":" "}] `:"";
       case "strong":case "b":return `**${content}**`;
       case "em":case "i":return `*${content}*`;
+      case "del":case "s":return `~~${content}~~`;
+      case "mark":return `==${content}==`;
+      case "sub":return /\s/.test(content)?`<sub>${content}</sub>`:`~${content}~`;
+      case "sup":return /\s/.test(content)?`<sup>${content}</sup>`:`^${content}^`;
+      case "kbd":return `<kbd>${content}</kbd>`;
+      case "u":return `<u>${content}</u>`;
       case "a":return `[${content}](${node.getAttribute("href")||""})`;
       case "pre":return `\n\`\`\`${node.querySelector("code")?.className.match(/language-([\w-]+)/)?.[1]||""}\n${content.trimEnd()}\n\`\`\`\n`;
       case "p":case "div":case "section":return `${content}\n\n`;
@@ -134,7 +141,7 @@ export function selectedMarkdown(selection: Selection | null, source?:string): s
   let context=elementAt(range.commonAncestorContainer);
   while(context&&!context.matches('.markdown-body,.live-document')&&!/^(ADDRESS|ARTICLE|ASIDE|BLOCKQUOTE|BODY|DD|DIV|DL|DT|FIELDSET|FIGCAPTION|FIGURE|FOOTER|FORM|H[1-6]|HEADER|HR|LI|MAIN|NAV|OL|P|PRE|SECTION|TABLE|TBODY|TD|TFOOT|TH|THEAD|TR|UL)$/.test(context.tagName)){
     const tag=context.tagName.toLowerCase();
-    if(['strong','b','em','i','a','code'].includes(tag)&&!(tag==='code'&&context.parentElement?.tagName==='PRE')){
+    if(['strong','b','em','i','del','s','mark','sub','sup','kbd','u','a','code'].includes(tag)&&!(tag==='code'&&context.parentElement?.tagName==='PRE')){
       const wrapper=context.cloneNode(false) as Element;wrapper.append(output);output=wrapper;
     }
     context=context.parentElement;

@@ -50,13 +50,33 @@ vi.mock("./components/Editor", () => ({
     return <div className="mock-editor" />;
   },
   editorReadingOffset: () => 0,
+  editorSelectedText: () => null,
+  editorViewContext: () => undefined,
   editorHistory: () => false,
   exportEditorSession: () => undefined,
   importEditorSession: () => {},
   cachedEditorHistory: () => undefined,
 }));
 vi.mock("./components/LiveEditor", () => ({ default: () => <div className="mock-live-editor" /> }));
-vi.mock("./components/MarkdownPreview", () => ({ default: () => <div className="mock-preview" /> }));
+vi.mock("./components/MarkdownPreview", () => ({
+  default: ({ markdown, onChange }: { markdown: string; onChange?: (value: string) => void }) => (
+    <div className="mock-preview">
+      {markdown.includes("- [") && (
+        <input
+          type="checkbox"
+          checked={markdown.includes("- [x]")}
+          onChange={(event) =>
+            onChange?.(
+              event.target.checked
+                ? markdown.replace("- [ ]", "- [x]")
+                : markdown.replace("- [x]", "- [ ]"),
+            )
+          }
+        />
+      )}
+    </div>
+  ),
+}));
 vi.mock("./components/MediaTools", () => ({ default: () => null }));
 vi.mock("./components/ImageViewer", () => ({ default: () => null }));
 vi.mock("./components/MathRepairPanel", () => ({ default: () => null }));
@@ -171,6 +191,117 @@ it("forwards the active note Python interpreter when preparing Markdown and Mark
     content: "# Study\n\n![Diagram](<image1.svg>)\n",
     assets: { "image1.svg": "data:image/svg+xml;base64,PHN2Zy8+" },
     archive: false,
+  });
+});
+
+it("bundles companion assets and supports archive mode for agent export_document requests", async () => {
+  prepareMarkdown.mockResolvedValue({
+    content: "# Study\n\n![Diagram](<image1.svg>)\n",
+    assets: { "image1.svg": "data:image/svg+xml;base64,PHN2Zy8+" },
+  });
+  native.mockImplementation(async (command: string, args?: unknown) => {
+    if (command === "agent_export_native") {
+      return { accepted: true, jobId: (args as { requestId?: string } | undefined)?.requestId };
+    }
+    return null;
+  });
+
+  await mountReader();
+
+  const content = "# Study\n\n![Diagram](diagram.svg)\n";
+  await act(async () => {
+    window.supermdLoad!({
+      id: "tab-agent-export",
+      content,
+      path: "/vault/Study.md",
+      mode: "reader",
+      dark: false,
+      fullscreen: false,
+      font: "sans",
+      size: 16,
+      colors: { primary: "#386a57" },
+      zoom: 100,
+      python: "/opt/venv/bin/python",
+    });
+  });
+
+  const context = await callLiveAgent({ action: "get_context", tabId: "tab-agent-export" });
+
+  await callLiveAgent({
+    action: "export_document",
+    tabId: "tab-agent-export",
+    expectedRevision: context.revision,
+    requestId: "job-md",
+    format: "md",
+    filename: "Study.md",
+    options: { pageSize: "a4" },
+  });
+  expect(prepareMarkdown).toHaveBeenCalledWith(content, "/vault/Study.md", {
+    compatible: false,
+    python: "/opt/venv/bin/python",
+  });
+  expect(native).toHaveBeenCalledWith("agent_export_native", {
+    id: "tab-agent-export",
+    expectedRevision: context.revision,
+    requestId: "job-md",
+    format: "md",
+    filename: "Study.md",
+    content: "# Study\n\n![Diagram](<image1.svg>)\n",
+    assets: { "image1.svg": "data:image/svg+xml;base64,PHN2Zy8+" },
+    options: { pageSize: "a4" },
+  });
+
+  prepareMarkdown.mockClear();
+  native.mockClear();
+  await callLiveAgent({
+    action: "export_document",
+    tabId: "tab-agent-export",
+    expectedRevision: context.revision,
+    requestId: "job-mdzip",
+    format: "md",
+    filename: "Study.zip",
+    options: { archive: true },
+  });
+  expect(prepareMarkdown).toHaveBeenCalledWith(content, "/vault/Study.md", {
+    compatible: true,
+    python: "/opt/venv/bin/python",
+  });
+  expect(native).toHaveBeenCalledWith("agent_export_native", {
+    id: "tab-agent-export",
+    expectedRevision: context.revision,
+    requestId: "job-mdzip",
+    format: "mdzip",
+    archive: true,
+    filename: "Study.zip",
+    content: "# Study\n\n![Diagram](<image1.svg>)\n",
+    assets: { "image1.svg": "data:image/svg+xml;base64,PHN2Zy8+" },
+    options: {},
+  });
+
+  prepareMarkdown.mockClear();
+  native.mockClear();
+  await callLiveAgent({
+    action: "export_document",
+    tabId: "tab-agent-export",
+    expectedRevision: context.revision,
+    requestId: "job-direct-mdzip",
+    format: "mdzip",
+    filename: "Bundle",
+  });
+  expect(prepareMarkdown).toHaveBeenCalledWith(content, "/vault/Study.md", {
+    compatible: true,
+    python: "/opt/venv/bin/python",
+  });
+  expect(native).toHaveBeenCalledWith("agent_export_native", {
+    id: "tab-agent-export",
+    expectedRevision: context.revision,
+    requestId: "job-direct-mdzip",
+    format: "mdzip",
+    archive: true,
+    filename: "Bundle",
+    content: "# Study\n\n![Diagram](<image1.svg>)\n",
+    assets: { "image1.svg": "data:image/svg+xml;base64,PHN2Zy8+" },
+    options: {},
   });
 });
 
@@ -492,4 +623,52 @@ it("reports export_failed when the active tab switches during a pre-export editP
     expect(prepareMarkdown).not.toHaveBeenCalled();
     expect(host.querySelector(".reader-export-progress")).toBeNull();
   }
+});
+
+it("routes undo and redo through note history even when a reused task checkbox keeps focus", async () => {
+  const host = await mountReader();
+
+  const unchecked = "# Tasks\n\n- [ ] Keep my place\n";
+  const checked = "# Tasks\n\n- [x] Keep my place\n";
+  await act(async () => {
+    window.supermdLoad!({
+      id: "tasks-tab",
+      content: unchecked,
+      path: null,
+      mode: "reader",
+      dark: false,
+      fullscreen: false,
+      font: "sans",
+      size: 16,
+      colors: {},
+      zoom: 100,
+    });
+  });
+
+  const checkbox = host.querySelector<HTMLInputElement>('input[type="checkbox"]')!;
+  expect(checkbox.checked).toBe(false);
+  checkbox.focus();
+  expect(document.activeElement).toBe(checkbox);
+
+  native.mockClear();
+  await act(async () => {
+    checkbox.click();
+  });
+  expect(checkbox.checked).toBe(true);
+  expect(document.activeElement).toBe(checkbox);
+  expect(native).toHaveBeenCalledWith("document_changed", { id: "tasks-tab", content: checked });
+
+  native.mockClear();
+  await act(async () => {
+    window.supermdHistory!("undo");
+  });
+  expect(checkbox.checked).toBe(false);
+  expect(native).toHaveBeenCalledWith("document_changed", { id: "tasks-tab", content: unchecked });
+
+  native.mockClear();
+  await act(async () => {
+    window.supermdHistory!("redo");
+  });
+  expect(checkbox.checked).toBe(true);
+  expect(native).toHaveBeenCalledWith("document_changed", { id: "tasks-tab", content: checked });
 });

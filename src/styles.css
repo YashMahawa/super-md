@@ -224,15 +224,25 @@ smd-expressive-button.primary-action { display: block; width: 100%; margin-top: 
 .image-viewer footer label { display: flex; align-items: center; gap: 12px; }
 .live-document { width: min(var(--reader-width), calc(100% - 64px)); margin: 0 auto; padding: 42px 0 28vh; }
 .live-document[data-typewriter="true"] { padding-top: var(--live-typewriter-pad, 45vh); padding-bottom: var(--live-typewriter-pad, 45vh); }
-.live-block { position: relative; min-height: 25px; border-radius: 12px; }
+.live-block { position: relative; border-radius: 12px; }
+.live-block:empty { min-height: 25px; }
 .live-document > .markdown-body { width:100%; max-width:none; margin:0; padding:0; }
 .live-block { display:flow-root; }
-.live-block > :first-child { margin-top:0; }
-.live-block > :last-child { margin-bottom:.85em; }
+.live-block > :first-child:not(.live-block-edit), .live-block > .live-block-edit + * { margin-top:0; }
+.live-block > :last-child:not(.live-block-edit) { margin-bottom:.85em; }
 .live-block .markdown-body { width: 100%; padding: 0; font-size: calc(var(--reader-size) * var(--workspace-scale, 1)); }
 .live-block .markdown-body > :first-child { margin-top: 0; }
 .live-block .markdown-body > :last-child { margin-bottom: .85em; }
 .live-block:focus-visible { outline: 2px solid var(--primary); outline-offset: 4px; }
+.live-block-edit { position: absolute; z-index: 6; top: calc(4px / var(--document-scale, 1)); right: calc(6px / var(--document-scale, 1)); transform: scale(calc(1 / var(--document-scale, 1))); transform-origin: top right; display: inline-flex; align-items: center; gap: 5px; min-height: 30px; padding: 5px 11px; border: 1px solid var(--outline); border-radius: 999px; background: var(--surface-high); color: var(--text); box-shadow: 0 3px 12px color-mix(in srgb, #000 18%, transparent); font: 650 12px/1 "Manrope Variable", var(--md-ref-typeface-plain, system-ui, sans-serif); letter-spacing: .01em; white-space: nowrap; user-select: none; cursor: pointer; }
+:root[data-live-selecting="true"] .live-block-edit { pointer-events: none; opacity: 0; }
+.live-block:has(.code-copy) > .live-block-edit { top: calc(22px / var(--document-scale, 1)); right: calc(78px / var(--document-scale, 1)); }
+.live-block:has(.chart-actions) > .live-block-edit { top: calc(16px / var(--document-scale, 1)); right: calc(96px / var(--document-scale, 1)); }
+.live-block:has(.cell-toolbar) > .live-block-edit { top: calc(10px / var(--document-scale, 1)); right: calc(88px / var(--document-scale, 1)); }
+.live-block:has(.step-cards-enlarge) > .live-block-edit { top: calc(6px / var(--document-scale, 1)); right: calc(44px / var(--document-scale, 1)); }
+.live-block-edit:hover { background: var(--primary); color: var(--on-primary); border-color: var(--primary); }
+.live-block-edit:active { transform: scale(calc(.96 / var(--document-scale, 1))); }
+@media (pointer: coarse) { .live-block-edit { min-height: 34px; padding: 6px 13px; font-size: 13px; } }
 .live-active-block { margin: 0 0 16px; padding: 8px; border: 1px solid color-mix(in srgb, var(--primary) 55%, var(--outline)); border-radius: 14px; background: var(--surface-low); box-shadow: 0 0 0 3px color-mix(in srgb, var(--primary) 10%, transparent); }
 .live-active-block textarea { display: block; width: 100%; min-height: 120px; max-height: min(55dvh, 480px); resize: vertical; padding: 10px 12px; border: 0; outline: none; background: transparent; color: var(--text); font: calc(var(--editor-size) * var(--workspace-scale, 1))/var(--editor-leading) var(--mono); overflow: auto; overscroll-behavior: contain; touch-action: pan-y; }
 .preview-page { margin: 0 auto; transform-origin: top center; }
@@ -243,6 +253,7 @@ smd-expressive-button.primary-action { display: block; width: 100%; margin-top: 
 .source-editor-status { display: flex; align-items: center; gap: 14px; flex-shrink: 0; min-height: 42px; padding: 4px 18px; color: var(--muted); background: var(--surface-low); font: 12px/1.4 "Manrope Variable", system-ui, sans-serif; }
 .source-language { color: var(--text); font-weight: 600; }
 .source-position { font-variant-numeric: tabular-nums; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.source-proofreading-range { padding: 2px 10px; border-radius: 999px; border: 1px solid var(--outline); background: var(--surface-high); color: var(--text); font-size: 11px; font-variant-numeric: tabular-nums; white-space: nowrap; }
 .source-status-spacer { flex: 1; }
 .source-editor-status button { min-height: 32px; padding: 5px 12px; border-radius: 999px; color: var(--muted); background: transparent; font: inherit; white-space: nowrap; cursor: pointer; }
 .source-editor-status button[aria-pressed="true"] { color: var(--on-primary-container, var(--text)); background: var(--primary-container, var(--surface-high)); }
@@ -257,6 +268,20 @@ smd-expressive-button.primary-action { display: block; width: 100%; margin-top: 
 .cm-search input:focus-visible { outline: 2px solid var(--primary); outline-offset: 1px; }
 .cm-search button { min-height: 32px; padding: 6px 12px; border-radius: 999px; border: 0 !important; background: var(--surface-low) !important; background-image: none !important; color: var(--text) !important; font: inherit !important; }
 .markdown-body { width: min(var(--reader-width), calc(100% - 92px)); margin: 0 auto; padding: 48px 0 30vh; font-family: var(--reader-font, 'Noto Sans Variable', 'Noto Sans', Arial, sans-serif); font-size: var(--reader-size); line-height: var(--reader-leading,1.65); overflow-wrap: break-word; }
+.document-properties { margin: 0 0 1.65em; padding: 14px 18px; border-radius: 16px; background: var(--surface-low); border: 1px solid var(--outline); font-family: "Manrope Variable", "Noto Sans Variable", "Noto Sans", system-ui, sans-serif; font-size: max(13px, .86em); line-height: 1.45; display: grid; gap: 10px; }
+.document-properties-heading { display: grid; gap: 3px; }
+.document-properties-heading:has(+ .document-properties-list) { padding-bottom: 10px; border-bottom: 1px solid color-mix(in srgb, var(--outline) 65%, transparent); }
+.document-properties-title { font-size: 1.18em; font-weight: 750; letter-spacing: -.02em; line-height: 1.3; color: var(--text); }
+.document-properties-subtitle { font-size: .95em; color: var(--muted); }
+.document-properties-list { margin: 0; display: grid; grid-template-columns: repeat(auto-fit, minmax(180px, 1fr)); gap: 8px 18px; }
+.document-property { display: grid; grid-template-columns: minmax(76px, auto) minmax(0, 1fr); align-items: baseline; gap: 10px; min-width: 0; }
+.document-property--wide { grid-column: 1 / -1; }
+.document-property-label { color: var(--muted); font-size: .82em; font-weight: 650; letter-spacing: .03em; text-transform: uppercase; user-select: none; -webkit-user-select: none; }
+.document-property-value { margin: 0; color: var(--text); min-width: 0; white-space: pre-wrap; }
+.document-property-badges { margin: 0; display: flex; flex-wrap: wrap; gap: 6px; min-width: 0; }
+.document-property-badge { display: inline-flex; align-items: center; padding: 2px 10px; border-radius: 999px; font-size: .86em; font-weight: 600; background: var(--primary-container, var(--surface-high)); color: var(--on-primary-container, var(--text)); }
+.document-property-badge--subtle { background: var(--surface-high); color: var(--muted); font-weight: 500; }
+@media (max-width: 520px) { .document-properties { padding: 12px 14px; border-radius: 14px; } .document-property { grid-template-columns: 1fr; gap: 3px; } }
 .markdown-body h1, .markdown-body h2, .markdown-body h3 { line-height: 1.23; letter-spacing: -.035em; margin-top: 1.75em; }
 .markdown-body h1 { font-size: clamp(2rem, 3vw, 2.65rem); margin-top: .25em; font-weight: 800; }
 .markdown-body h2 { font-size: 1.63rem; border-bottom: 1px solid var(--outline); padding-bottom: .36em; }
@@ -280,6 +305,9 @@ smd-expressive-button.primary-action { display: block; width: 100%; margin-top: 
 .markdown-body th { background: var(--surface-high); }
 .markdown-body pre { max-width: 100%; overflow: auto; padding: 16px 18px; border-radius: 16px; background: var(--code-bg); color: var(--code-text); border: 1px solid var(--code-border); font: .88em/1.65 var(--mono); tab-size: 4; }
 .markdown-body :not(pre) > code { background: var(--surface-high); border-radius: 5px; padding: .16em .38em; font-family: var(--mono); font-size: .9em; }
+.markdown-body mark { background: color-mix(in srgb, #f5c542 28%, var(--surface)); color: var(--text); border-radius: 4px; padding: .08em .28em; }
+:root[data-theme="light"] .markdown-body mark { background: color-mix(in srgb, #f6c945 42%, var(--surface)); }
+.markdown-body kbd { display: inline-block; background: var(--surface-high); color: var(--text); border: 1px solid var(--outline); border-bottom-width: 2px; border-radius: 6px; padding: .1em .42em; font-family: var(--mono); font-size: .84em; line-height: 1.3; }
 .katex-display { max-width: 100%; overflow-x: auto; overflow-y: hidden; padding: .6em .1em; }
 .katex-display { scrollbar-width:thin;scrollbar-color:transparent transparent; }
 .katex-display:hover,.katex-display.scroll-indicator-active { scrollbar-color:color-mix(in srgb,var(--primary) 60%,transparent) transparent; }
@@ -357,6 +385,8 @@ smd-expressive-button.primary-action { display: block; width: 100%; margin-top: 
 
 /* Safe declarative SVG graphics — authored with smd-diagram or embedded in smd-steps. */
 .markdown-body .inline-diagram { width:100%; max-width:100%; margin:1em auto; padding:8px; display:flex; align-items:center; justify-content:center; border:1px solid var(--outline); border-radius:14px; background:var(--surface-low); }
+.markdown-body .inline-diagram svg { cursor:zoom-in; }
+.step-viewer .inline-diagram svg { cursor:inherit; }
 .inline-diagram svg { width:100%; height:auto; display:block; max-height:440px; overflow:visible; }
 .inline-diagram-edge { stroke:var(--muted); stroke-width:3; stroke-linecap:round; fill:none; transition:stroke .17s ease, opacity .17s ease; }
 .inline-diagram-edge.is-dashed { stroke-dasharray:5 7; opacity:.48; }
@@ -410,12 +440,17 @@ smd-expressive-button.primary-action { display: block; width: 100%; margin-top: 
 .python-cell .python-source { max-height: 28em; overflow: auto; }
 .python-cell .cell-toolbar .code-copy { position: static; margin-left: auto; margin-right: 8px; background: transparent; color: var(--text); }
 .writing-suggestions { padding: 12px 16px; background: var(--surface-high); border-top: 1px solid var(--outline); font: 14px/1.5 var(--md-ref-typeface-plain); }
-.writing-suggestions header { display: flex; justify-content: space-between; gap: 12px; font-weight: 650; }
+.writing-suggestions header { display: flex; align-items: center; justify-content: space-between; flex-wrap: wrap; gap: 8px 12px; font-weight: 650; }
 .writing-suggestions small { color: var(--muted); font-weight: 400; }
+.writing-suggestions-meta { display: inline-flex; align-items: center; flex-wrap: wrap; gap: 8px; font-variant-numeric: tabular-nums; }
+.proofreading-range-badge { padding: 2px 9px; border-radius: 999px; border: 1px solid var(--outline); background: var(--surface); color: var(--text); font-size: 12px; }
 .writing-suggestions > div { display: flex; align-items: center; flex-wrap: wrap; gap: 8px; padding-top: 8px; }
 .writing-suggestions > div > span { margin-right: auto; }
-.writing-suggestions button { padding: 5px 12px; background: var(--md-sys-color-primary-container); color: var(--md-sys-color-on-primary-container); border: 1px solid var(--outline); border-radius: 12px; }
+.writing-suggestions button { padding: 5px 12px; background: var(--md-sys-color-primary-container); color: var(--md-sys-color-on-primary-container); border: 1px solid var(--outline); border-radius: 12px; cursor: pointer; }
+.writing-suggestions button.suggestion-secondary { background: transparent; color: var(--muted); }
+.writing-suggestions button.suggestion-secondary:hover { background: var(--surface); color: var(--text); }
 .cm-tooltip-lint { background: var(--surface-high) !important; color: var(--text) !important; border: 1px solid var(--outline) !important; border-radius: 12px; padding: 8px; max-width: min(360px,80vw); }
+.cm-diagnosticAction { margin: 6px 6px 0 0 !important; padding: 4px 10px !important; border-radius: 999px !important; border: 1px solid var(--outline) !important; background: var(--surface) !important; color: var(--text) !important; cursor: pointer; }
 .cm-lintPoint-info, .cm-lintRange-info { text-decoration: underline wavy var(--primary); text-underline-offset: 4px; }
 .cell-toolbar { min-height: 48px; padding: 0 8px 0 16px; display: flex; align-items: center; justify-content: space-between; gap: 8px; color: var(--code-accent); background: transparent; border-bottom: 1px solid var(--code-border); font: 650 .8rem/1.4 var(--md-ref-typeface-plain,system-ui); }
 .cell-toolbar button { min-height: 36px; padding: 6px 16px; border-radius: 18px; background: var(--primary); color: var(--on-primary); font-weight: 650; transition: border-radius .18s cubic-bezier(.2,0,0,1), transform .12s ease; }
@@ -724,7 +759,7 @@ button.code-copy:active { border-radius:10px; }
 .step-cards-inline-figure .inline-diagram svg { width:100%; height:100%; max-height:100%; }
 .step-cards-figure.is-current,.step-cards-figure.is-offstage { transition:none; }
 .markdown-body .step-cards { display:flex; flex-direction:column; max-height:calc(100dvh - 24px); }
-.step-cards-layout { min-height:0; max-height:74dvh; overflow:hidden; }
+.step-cards-layout { position:relative; min-height:0; max-height:74dvh; overflow:hidden; }
 .step-cards-notes { align-self:center; max-height:min(72dvh,var(--step-figure-height,740px)); overflow-y:auto; overscroll-behavior:contain; padding:4px 8px; scrollbar-width:thin; }
 .step-cards.is-visual-only { --step-caption-width:clamp(110px,12vw,170px); width:min(100%,calc(var(--step-image-fit-width,100%) + var(--step-caption-width) + 44px)); margin-inline:auto; }
 .step-cards.is-visual-only .step-cards-layout { grid-template-columns:minmax(0,1fr) var(--step-caption-width); gap:12px; }
@@ -736,11 +771,14 @@ button.code-copy:active { border-radius:10px; }
 .step-cards-slider { height:26px; }
 .step-cards-legacy-note { font-size:.8em; margin-top:8px; }
 .step-cards-legacy-note > div { padding-top:8px; }
-.step-cards-enlarge { position:absolute; top:4px; right:4px; z-index:4; width:32px; height:32px; border:0; border-radius:8px; color:var(--muted); background:var(--surface); opacity:0; cursor:pointer; font-size:24px; }
-.step-cards-stage:hover .step-cards-enlarge,.step-cards-enlarge:focus-visible { opacity:1; }
+.step-cards-enlarge { position:absolute; top:4px; right:4px; z-index:4; width:32px; height:32px; padding:0; display:grid; place-items:center; line-height:1; border:0; border-radius:8px; color:var(--muted); background:var(--surface); opacity:0; cursor:pointer; font-size:22px; }
+.step-cards-stage:hover .step-cards-enlarge,.step-cards:hover .step-cards-enlarge,.step-cards-enlarge:focus-visible,.step-cards.has-no-visual .step-cards-enlarge,:root[data-platform="android"] .step-cards-enlarge { opacity:1; }
+@media (hover:none),(pointer:coarse) { .step-cards-enlarge { opacity:1; } }
+.step-cards:not(.is-expanded) .step-cards-chart-frame .interactive-chart > :first-child { padding-right:34px; }
 .step-cards.has-no-visual .step-cards-stage { display:none; }
 .step-cards.has-no-visual .step-cards-layout { display:block; }
 .step-cards.has-no-visual .step-cards-notes { max-height:68dvh; }
+.step-cards.has-no-visual:not(.is-expanded) .step-cards-notes { padding-right:36px; }
 .android-reading .document-page .step-cards-description .markdown-body { width:100%; max-width:none; margin:0; padding:0; min-height:0; }
 .step-viewer.image-viewer { width:100%; height:100dvh; max-width:none; margin:0; padding:50px 12px 8px; display:flex; font-size:var(--reader-size,16px); }
 .step-viewer-toolbar { position:absolute; right:12px; left:12px; top:4px; z-index:5; display:flex; align-items:center; gap:10px; font-size:14px; }
@@ -764,6 +802,7 @@ button.code-copy:active { border-radius:10px; }
  .step-cards-notes { max-height:34dvh; }
  .step-viewer .step-cards-layout { display:grid; grid-template-columns:minmax(0,1fr); grid-template-rows:minmax(0,1fr) auto; overflow:hidden; }
  .step-viewer .step-cards-notes { max-height:34dvh; }
+ .step-viewer .has-no-visual .step-cards-notes { max-height:100%; }
  .step-viewer .is-visual-only .step-cards-layout { position:relative; grid-template-rows:minmax(0,1fr); }
  .step-viewer .is-visual-only .step-cards-notes { position:absolute; top:4px; left:4px; z-index:2; max-width:calc(100% - 8px); pointer-events:none; }
  .step-viewer .is-visual-only .step-cards-legacy-note { pointer-events:auto; }

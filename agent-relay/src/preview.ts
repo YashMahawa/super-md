@@ -147,10 +147,54 @@ function boundedDiagrams(value: unknown): unknown[] | undefined {
     }
     const preview = textField(source.preview, 160);
     if (preview !== undefined) result.preview = preview;
+    const deckTitle = textField(source.deckTitle, 200);
+    if (deckTitle !== undefined) result.deckTitle = deckTitle;
+    const stepLabel = textField(source.stepLabel, 200);
+    if (stepLabel !== undefined) result.stepLabel = stepLabel;
+    if (typeof source.stepIndex === "number" && Number.isSafeInteger(source.stepIndex) && source.stepIndex >= 0) result.stepIndex = source.stepIndex;
+    if (typeof source.stepCount === "number" && Number.isSafeInteger(source.stepCount) && source.stepCount >= 1) result.stepCount = source.stepCount;
+    if (typeof source.activeStep === "boolean") result.activeStep = source.activeStep;
     const assetReference = textField(source.assetReference, 512);
     if (assetReference !== undefined && !/^data:/i.test(assetReference) && !/base64,/i.test(assetReference)) result.assetReference = assetReference;
     return [result];
   });
+}
+
+function boundedActiveStep(value: unknown): Record<string, unknown> | undefined {
+  const source = record(value);
+  if (!source) return undefined;
+  const deckTitle = textField(source.deckTitle, 200);
+  const stepLabel = textField(source.stepLabel, 200);
+  const stepIndex = typeof source.stepIndex === "number" && Number.isSafeInteger(source.stepIndex) && source.stepIndex >= 0 ? source.stepIndex : undefined;
+  const stepCount = typeof source.stepCount === "number" && Number.isSafeInteger(source.stepCount) && source.stepCount >= 1 ? source.stepCount : undefined;
+  if (deckTitle === undefined || stepIndex === undefined || stepCount === undefined) return undefined;
+  const result: Record<string, unknown> = { deckTitle, stepIndex, stepCount, activeStep: source.activeStep !== false };
+  if (stepLabel !== undefined) result.stepLabel = stepLabel;
+  if (typeof source.expanded === "boolean") result.expanded = source.expanded;
+  return result;
+}
+
+function boundedPythonCells(value: unknown): unknown[] | undefined {
+  if (!Array.isArray(value)) return undefined;
+  const cells = value.slice(0, 8).flatMap((item) => {
+    const source = record(item);
+    if (!source || typeof source.ok !== "boolean") return [];
+    const entry: Record<string, unknown> = { ok: source.ok };
+    for (const key of ["ordinal", "sourceStart", "sourceEnd"]) {
+      if (typeof source[key] === "number" && Number.isSafeInteger(source[key]) && (source[key] as number) >= 0) entry[key] = source[key];
+    }
+    const stdout = textField(source.stdout, 500);
+    if (stdout !== undefined) entry.stdout = stdout;
+    if (source.stdoutTruncated === true || (typeof source.stdout === "string" && source.stdout.length > 500)) entry.stdoutTruncated = true;
+    const stderr = textField(source.stderr, 500);
+    if (stderr !== undefined) entry.stderr = stderr;
+    if (source.stderrTruncated === true || (typeof source.stderr === "string" && source.stderr.length > 500)) entry.stderrTruncated = true;
+    if (Array.isArray(source.figureIds)) {
+      entry.figureIds = source.figureIds.filter((id): id is string => typeof id === "string" && id.startsWith("diagram:python:") && id.length <= 128).slice(0, 16);
+    }
+    return [entry];
+  });
+  return cells.length ? cells : undefined;
 }
 
 /** Extract bounded image-time context. Desktop captures can include source; Android metadata includes position only. */
@@ -166,6 +210,8 @@ export function viewportContexts(image: Record<string, unknown>, requestedTab: s
   const reading = boundedReading(source.reading ?? metadata?.reading);
   const selection = boundedSelection(source.selection ?? metadata?.selection);
   const viewport = boundedViewport(source.viewport ?? metadata?.viewport);
+  const activeStep = boundedActiveStep(source.activeStep ?? metadata?.activeStep);
+  const pythonCells = boundedPythonCells(source.pythonCells);
   const sourceLength = Number.isSafeInteger(source.sourceLength) && (source.sourceLength as number) >= 0 ? source.sourceLength as number : undefined;
   const normalizedSource = sourceLength === undefined ? source.visibleSource : normalizeReadingContext({ sourceLength, visibleSource: source.visibleSource })?.visibleSource;
   const { value: visibleSource, range: sourceRange } = boundedSource(normalizedSource);
@@ -179,6 +225,7 @@ export function viewportContexts(image: Record<string, unknown>, requestedTab: s
   if (reading) captureContext.reading = reading;
   if (selection) captureContext.selection = selection;
   if (viewport) captureContext.viewport = viewport;
+  if (activeStep) captureContext.activeStep = activeStep;
   if (sourceRange) captureContext.sourceRange = sourceRange;
   const hasCoherentCapturedSource = revisionMatches && !!visibleSource && visibleSource.previewTruncated !== true && typeof source.revision === "string" && source.revision === expectedRevision;
   let capturedReadingContext: Record<string, unknown> | undefined;
@@ -186,6 +233,7 @@ export function viewportContexts(image: Record<string, unknown>, requestedTab: s
     capturedReadingContext = { ...captureContext, visibleSource };
     if (sourceLength !== undefined) capturedReadingContext.sourceLength = sourceLength;
     if (diagrams) capturedReadingContext.diagrams = diagrams;
+    if (pythonCells) capturedReadingContext.pythonCells = pythonCells;
   }
   return { captureContext, capturedReadingContext, hasCoherentCapturedSource };
 }
