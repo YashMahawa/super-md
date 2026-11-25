@@ -239,6 +239,7 @@ smd-expressive-button.primary-action { display: block; width: 100%; margin-top: 
 .live-block:has(.code-copy) > .live-block-edit { top: calc(22px / var(--document-scale, 1)); right: calc(78px / var(--document-scale, 1)); }
 .live-block:has(.chart-actions) > .live-block-edit { top: calc(16px / var(--document-scale, 1)); right: calc(96px / var(--document-scale, 1)); }
 .live-block:has(.cell-toolbar) > .live-block-edit { top: calc(10px / var(--document-scale, 1)); right: calc(88px / var(--document-scale, 1)); }
+.live-block:has(.step-cards-enlarge) > .live-block-edit { top: calc(6px / var(--document-scale, 1)); right: calc(44px / var(--document-scale, 1)); }
 .live-block-edit:hover { background: var(--primary); color: var(--on-primary); border-color: var(--primary); }
 .live-block-edit:active { transform: scale(calc(.96 / var(--document-scale, 1))); }
 @media (pointer: coarse) { .live-block-edit { min-height: 34px; padding: 6px 13px; font-size: 13px; } }
