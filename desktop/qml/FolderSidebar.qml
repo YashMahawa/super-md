@@ -158,6 +158,17 @@ ColumnLayout {
         onClicked: studio.chooseFolder()
     }
 
+    ActionButton {
+        objectName: "sidebarFolderSearchButton"
+        text: "Search across notes"
+        glyph: "MagnifyingGlass"
+        compact: true
+        tonal: true
+        Layout.fillWidth: true
+        ToolTip.text: "Search across notes (" + (root.shortcutLabels.search_folder || "Ctrl+Shift+F") + ")"
+        onClicked: studio.openFolderSearch()
+    }
+
     Rectangle {
         id: folderHeaderBar
         objectName: "folderHeaderBar"
