@@ -1,9 +1,20 @@
 package dev.supermd.studio
 
+import android.content.Context
 import android.os.Handler
 import android.os.Looper
 import android.webkit.WebView
+import androidx.activity.ComponentActivity
+import androidx.activity.compose.BackHandler
+import androidx.activity.compose.setContent
+import androidx.compose.material3.DrawerValue
+import androidx.compose.material3.ModalDrawerSheet
+import androidx.compose.material3.ModalNavigationDrawer
+import androidx.compose.material3.Text
+import androidx.compose.material3.rememberDrawerState
+import androidx.compose.runtime.getValue
 import androidx.lifecycle.ViewModelStore
+import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import java.io.File
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
@@ -17,6 +28,7 @@ import org.junit.Assert.assertTrue
 import org.junit.Before
 import org.junit.Test
 import org.junit.runner.RunWith
+import org.robolectric.Robolectric
 import org.robolectric.RobolectricTestRunner
 import org.robolectric.RuntimeEnvironment
 import org.robolectric.Shadows.shadowOf
@@ -169,5 +181,129 @@ class AndroidBackHandlingUnitTest {
             ),
         )
         assertEquals(StudioState().active.content, model.state.value.active.content)
+    }
+
+    @Test fun modeSwitchBarrierRequiresAcknowledgedReaderSnapshotAfterNativeEdit() {
+        val store = ViewModelStore().also(stores::add)
+        val key = java.util.UUID.randomUUID().toString().also(workspaceKeys::add)
+        val model = StudioViewModel(app, key)
+        store.put("model-barrier", model)
+        val scope = CoroutineScope(SupervisorJob() + Dispatchers.Main.immediate).also(scopes::add)
+        var readerContent = model.state.value.active.content
+        lateinit var bridge: ReaderBridge
+        val web = object : WebView(app) {
+            override fun post(action: Runnable?): Boolean =
+                action?.let { Handler(Looper.getMainLooper()).post(it) } ?: false
+
+            override fun evaluateJavascript(script: String, resultCallback: android.webkit.ValueCallback<String>?) {
+                val tokenMatch = Regex("""token:"([^"]+)"""").find(script)
+                if (tokenMatch != null) {
+                    val token = tokenMatch.groupValues[1]
+                    bridge.post(
+                        "flush-1",
+                        "document_flushed",
+                        JSONObject()
+                            .put("id", model.state.value.active.id)
+                            .put("token", token)
+                            .put("content", readerContent)
+                            .toString(),
+                    )
+                }
+                resultCallback?.onReceiveValue("null")
+            }
+        }
+        bridge = ReaderBridge(web, model, scope, ready = {}, assetCapabilities = ReaderAssetCapabilities())
+        model.readerFlushRequester = { noteId -> bridge.requestFlush(noteId) }
+
+        val activeId = model.state.value.active.id
+        val updated = "# Source Back Test\n\nAlpha needle in source mode."
+
+        // Reproduces the exact race from AndroidBackHandlingTest: calling edit() + mode("editor")
+        // before Compose sends supermdLoad(updated) causes ReaderBridge to flush stale readerContent.
+        model.edit(activeId, updated)
+        model.mode("editor")
+        idleUntil { model.state.value.message != null }
+        assertEquals("live", model.state.value.mode)
+        assertTrue(model.state.value.message.orEmpty().contains("could not confirm its latest edits"))
+
+        // Once the reader loads and acknowledges the updated snapshot (or mode switches before edit),
+        // mode("editor") succeeds cleanly while keeping the draft intact.
+        model.dismissMessage()
+        readerContent = updated
+        bridge.post(
+            "sync-1",
+            "document_sync",
+            JSONObject()
+                .put("id", activeId)
+                .put("epoch", "epoch-1")
+                .put("revision", 0)
+                .put("content", updated)
+                .toString(),
+        )
+        idleUntil { model.readerStateIsNativeAuthoritative(activeId) }
+        model.mode("editor")
+        idleUntil { model.state.value.mode == "editor" }
+        assertEquals(updated, model.state.value.active.content)
+    }
+
+    @Test fun composeBackHandlerWithClosedModalDrawerReleasesForSystemBackOnSecondPress() {
+        val prefs = app.getSharedPreferences("studio", Context.MODE_PRIVATE)
+        prefs.edit().putBoolean("welcomed", true).putString("startup", "restore").commit()
+        val model = newModel()
+        val draft = "# Live Back Test\n\nDraft preserved across second Back."
+        model.edit(model.state.value.active.id, draft)
+        val controller = Robolectric.buildActivity(ComponentActivity::class.java).setup()
+        try {
+            val activity = controller.get()
+            activity.setContent {
+                val state by model.state.collectAsStateWithLifecycle()
+                val drawer = rememberDrawerState(DrawerValue.Closed)
+                BackHandler(
+                    shouldInterceptStudioBack(
+                        contentsShown = false,
+                        fullscreen = state.fullscreen,
+                        drawerOpen = drawer.isOpen,
+                        readerOverlay = state.readerOverlay,
+                        readerDismissible = state.readerDismissible,
+                    ),
+                ) {
+                    applyReaderDismissResult(
+                        model,
+                        JSONObject.quote(
+                            JSONObject()
+                                .put("dismissed", state.readerDismissible || state.readerOverlay)
+                                .put("overlay", false)
+                                .put("image", false)
+                                .put("dismissible", false)
+                                .toString(),
+                        ),
+                    )
+                }
+                ModalNavigationDrawer(
+                    drawerState = drawer,
+                    gesturesEnabled = drawer.isOpen && !state.fullscreen,
+                    drawerContent = { ModalDrawerSheet { Text("Drawer") } },
+                ) {
+                    Text(state.active.content)
+                }
+            }
+            idleUntil { !activity.onBackPressedDispatcher.hasEnabledCallbacks() }
+
+            model.readerDismissible(true)
+            idleUntil { activity.onBackPressedDispatcher.hasEnabledCallbacks() }
+
+            // First Back dismisses active Live edit / Source search and disables Studio BackHandler.
+            activity.onBackPressedDispatcher.onBackPressed()
+            idleUntil { !model.state.value.readerDismissible && !activity.onBackPressedDispatcher.hasEnabledCallbacks() }
+            assertFalse(activity.isFinishing)
+            assertEquals(draft, model.state.value.active.content)
+
+            // Second Back reaches system Back and finishes the Activity while keeping the draft intact.
+            activity.onBackPressedDispatcher.onBackPressed()
+            idleUntil { activity.isFinishing }
+            assertEquals(draft, model.state.value.active.content)
+        } finally {
+            runCatching { controller.pause().stop().destroy() }
+        }
     }
 }

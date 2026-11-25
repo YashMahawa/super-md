@@ -721,7 +721,7 @@ export default function LiveEditor({markdown,onChange,documentPath,python,dark,t
     const root=rootRef.current;if(!root)return;
     const onEditBlock=(event:Event)=>{
       const blockEl=(event.target instanceof Element?event.target:null)?.closest<HTMLElement>('.live-block');
-      if(!blockEl||!root.contains(blockEl))return;
+      if(!blockEl||!root.contains(blockEl)||blockEl.querySelector('.live-active-block'))return;
       const start=Number(blockEl.dataset.sourceStart),end=Number(blockEl.dataset.sourceEnd);
       if(Number.isFinite(start)&&Number.isFinite(end)){
         window.getSelection()?.removeAllRanges();

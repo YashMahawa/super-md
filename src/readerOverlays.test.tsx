@@ -103,6 +103,16 @@ describe("Android Back / dismissReaderOverlay for active Live edits and Source s
     activeTextarea.value = "Draft typed with composing tail";
     activeTextarea.setSelectionRange(activeTextarea.value.length, activeTextarea.value.length);
 
+    // A duplicate supermd-edit-block event on the already-active block must not reset uncommitted textarea text.
+    act(() => {
+      activeTextarea
+        .closest(".live-block")!
+        .dispatchEvent(new CustomEvent("supermd-edit-block", { bubbles: true }));
+    });
+    expect(host.querySelector<HTMLTextAreaElement>(".live-active-block textarea")?.value).toBe(
+      "Draft typed with composing tail",
+    );
+
     // First Back dismisses active Live edit synchronously, flushes uncommitted textarea draft, and clears readerDismissible.
     let firstDismissed = false;
     act(() => {
