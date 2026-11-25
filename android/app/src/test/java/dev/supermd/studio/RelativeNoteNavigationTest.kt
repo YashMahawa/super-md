@@ -118,19 +118,26 @@ class RelativeNoteNavigationTest {
         configureReader(web, model, scope, ready = {}, rendererGone = {})
         val bridge = web.getTag(R.id.reader_bridge_tag) as ReaderBridge
 
-        bridge.post("req-1", "open_relative_note", JSONObject()
+        bridge.post("req-1", "open_workspace_link", JSONObject()
             .put("documentPath", indexUri.toString())
-            .put("target", "Lecture%202.md")
-            .put("heading", "bayes")
+            .put("target", "Lecture 2")
+            .put("fragment", "bayes")
+            .put("wikilink", true)
             .toString())
 
         await { model.state.value.active.uri == lectureUri.toString() }
         assertEquals(listOf(indexId), flushedIds)
         val lectureNote = model.state.value.active
-        assertEquals("bayes", model.consumePendingHeading(lectureNote))
-        assertNull("pendingHeading must be consumed once", model.consumePendingHeading(lectureNote))
+        val pendingJump = model.state.value.pendingHeading
+        assertNotNull(pendingJump)
+        assertEquals(lectureNote.id, pendingJump!!.noteId)
+        assertEquals("bayes", pendingJump.heading)
+        assertTrue(pendingJump.token.isNotBlank())
+        model.consumePendingHeading(pendingJump.token)
+        assertNull("pendingHeading must be consumed once", model.state.value.pendingHeading)
 
-        callSuspend { model.openRelativeNote(lectureUri.toString(), "sub/study.smd", null) }
+        val openedDeck = callSuspend { model.openWorkspaceLink(lectureUri.toString(), "sub/study.smd", "", wikilink = false) }
+        assertTrue(openedDeck.getBoolean("opened"))
         await { model.state.value.active.uri == deckUri.toString() }
         assertEquals("# Study Deck\n", model.state.value.active.content)
         assertNull(shadowOf(app).nextStartedActivity)
@@ -145,20 +152,16 @@ class RelativeNoteNavigationTest {
         val model = newModel()
         // Unsaved default note surfaces a status notice.
         val unsavedId = model.state.value.active.id
-        val unsavedError = runCatching {
-            callSuspend { model.openRelativeNote(unsavedId, "Lecture%202.md", null) }
-        }.exceptionOrNull()
-        assertNotNull(unsavedError)
+        val unsavedReply = callSuspend { model.openWorkspaceLink(unsavedId, "Lecture%202.md", "", wikilink = false) }
+        assertFalse(unsavedReply.getBoolean("opened"))
         assertEquals("Save this note before opening linked notes.", model.state.value.message)
 
         model.open(indexUri)
         await { model.state.value.active.uri == indexUri.toString() }
 
         for (blocked in listOf("../outside.md", "sub%2f..%2foutside.md", "sub%5cstudy.smd", "bad%00.md")) {
-            val failure = runCatching {
-                callSuspend { model.openRelativeNote(indexUri.toString(), blocked, null) }
-            }.exceptionOrNull()
-            assertNotNull("Expected $blocked to fail containment", failure)
+            val rejected = callSuspend { model.openWorkspaceLink(indexUri.toString(), blocked, "", wikilink = false) }
+            assertFalse("Expected $blocked to fail containment", rejected.getBoolean("opened"))
             assertEquals(indexUri.toString(), model.state.value.active.uri)
             assertTrue(!model.state.value.message.isNullOrBlank())
         }
@@ -174,10 +177,8 @@ class RelativeNoteNavigationTest {
         model.open(singleIndexUri)
         await { model.state.value.active.uri == singleIndexUri.toString() }
 
-        val failure = runCatching {
-            callSuspend { model.openRelativeNote(singleIndexUri.toString(), "Lecture%202.md", "bayes") }
-        }.exceptionOrNull()
-        assertNotNull(failure)
+        val reply = callSuspend { model.openWorkspaceLink(singleIndexUri.toString(), "Lecture%202.md", "bayes", wikilink = false) }
+        assertFalse(reply.getBoolean("opened"))
         assertEquals(DOCUMENT_ACCESS_MESSAGE, model.state.value.message)
         val accessRequest = model.documentAccessRequests.value
         assertNotNull(accessRequest)

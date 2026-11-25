@@ -57,7 +57,7 @@ internal fun orderedRecents(notes:List<RecentNote>)=notes.distinctBy {it.uri}.so
 private fun renamedRelative(relative:String?,name:String)=relative?.let {val parent=it.substringBeforeLast('/',"");if(parent.isEmpty())name else "$parent/$name"}
 data class FileEntry(val name: String, val uri: String, val directory: Boolean, val relative: String)
 data class OutlineHeading(val id: String, val title: String, val level: Int, val offset: Int)
-data class StudioState(val latexAutofix:Boolean=false, val typewriterScroll:Boolean=false, val selectionAssistant:String="chatgpt", val centerLock:Boolean=true, val customTheme:String="", val activeThemeKind:String="builtin", val activeThemeId:String="", val customThemeSource:String="", val savedThemes:List<SavedThemeEntry> = emptyList(), val patternKind:String="", val patternOpacity:Float=-1f, val patternSize:Float=0f, val patternSpacing:Float=0f, val restorePosition:Boolean=true, val fullDocumentAccessibility:Boolean=false, val startup:String="restore", val imageAppearance:String="original", val svgAppearance:String="original", val imageContrast:Float=1.25f, val spellCheck:Boolean = false, val grammarCheck:Boolean = false, val accent: String = "system", val widthPercent: Float = 100f, val lineHeight: Float = 1.65f, val autosave: Boolean = true, val customFonts: List<String> = emptyList(), val readerOverlay: Boolean = false, val zoomCommand: Long = 0, val navigationCommand: Long = 0, val tabs: List<Note> = listOf(Note(name = "Welcome.md", content = sample, saved = sample)), val closedTabs: List<Note> = emptyList(), val activeId: String = "", val mode: String = "live", val fullscreen: Boolean = false, val normalZoom: Float = 100f, val fullscreenZoom: Float = 100f, val theme: String = "system", val fullscreenTheme: String = "black", val motion: Boolean = true, val font: String = "Manrope", val size: Float = 15f, val folder: String? = null, val files: List<FileEntry> = emptyList(), val busy: Boolean = false, val message: String? = null, val error: String? = null, val welcomed: Boolean = false, val pdf: String = "{\"pageSize\":\"a4\",\"margin\":14,\"fontSize\":10.5,\"lineHeight\":1.4,\"paragraphSpacing\":0.65,\"fontFamily\":\"Manrope\",\"pageNumbers\":true}", val storageReport: StorageReport? = null, val storageScanning: Boolean = false, val conflictedTabIds: Set<String> = emptySet(), val pendingCloseNoteId: String? = null, val pendingSaveConflictNoteId: String? = null) {
+data class StudioState(val latexAutofix:Boolean=false, val typewriterScroll:Boolean=false, val selectionAssistant:String="chatgpt", val centerLock:Boolean=true, val customTheme:String="", val activeThemeKind:String="builtin", val activeThemeId:String="", val customThemeSource:String="", val savedThemes:List<SavedThemeEntry> = emptyList(), val patternKind:String="", val patternOpacity:Float=-1f, val patternSize:Float=0f, val patternSpacing:Float=0f, val restorePosition:Boolean=true, val fullDocumentAccessibility:Boolean=false, val startup:String="restore", val imageAppearance:String="original", val svgAppearance:String="original", val imageContrast:Float=1.25f, val spellCheck:Boolean = false, val grammarCheck:Boolean = false, val accent: String = "system", val widthPercent: Float = 100f, val lineHeight: Float = 1.65f, val autosave: Boolean = true, val customFonts: List<String> = emptyList(), val readerOverlay: Boolean = false, val zoomCommand: Long = 0, val tabs: List<Note> = listOf(Note(name = "Welcome.md", content = sample, saved = sample)), val closedTabs: List<Note> = emptyList(), val activeId: String = "", val mode: String = "live", val fullscreen: Boolean = false, val normalZoom: Float = 100f, val fullscreenZoom: Float = 100f, val theme: String = "system", val fullscreenTheme: String = "black", val motion: Boolean = true, val font: String = "Manrope", val size: Float = 15f, val folder: String? = null, val files: List<FileEntry> = emptyList(), val busy: Boolean = false, val message: String? = null, val error: String? = null, val welcomed: Boolean = false, val pdf: String = "{\"pageSize\":\"a4\",\"margin\":14,\"fontSize\":10.5,\"lineHeight\":1.4,\"paragraphSpacing\":0.65,\"fontFamily\":\"Manrope\",\"pageNumbers\":true}", val storageReport: StorageReport? = null, val storageScanning: Boolean = false, val conflictedTabIds: Set<String> = emptySet(), val pendingCloseNoteId: String? = null, val pendingSaveConflictNoteId: String? = null, val pendingHeading: PendingHeadingJump? = null) {
     val active get() = tabs.find { it.id == activeId } ?: tabs.first()
     val zoom get() = if (fullscreen) fullscreenZoom else normalZoom
     val activeConflicted get() = active.id in conflictedTabIds
@@ -123,13 +123,7 @@ class StudioViewModel(app: Application, val workspaceKey: String = "main") : And
     private val blockedDocumentWrites = mutableSetOf<String>()
     private val promptedDocumentAccess = mutableSetOf<String>()
     private val promptedAssetAccess = mutableSetOf<String>()
-    private val pendingHeadings = java.util.concurrent.ConcurrentHashMap<String, String>()
-    internal fun consumePendingHeading(note: Note): String? {
-        pendingHeadings.remove(note.id)?.let { return it }
-        val uri = note.uri ?: return null
-        val matchedKey = pendingHeadings.keys.firstOrNull { key -> sameDocumentUri(key, uri) } ?: return null
-        return pendingHeadings.remove(matchedKey)
-    }
+    private val pendingAccessHeadings = java.util.concurrent.ConcurrentHashMap<String, String>()
     internal val readerFolderIndex = ReaderFolderIndex()
     private val readerCapabilities = java.util.concurrent.CopyOnWriteArraySet<ReaderAssetCapabilities>()
     internal fun attachReaderCapabilities(capabilities: ReaderAssetCapabilities) { readerCapabilities += capabilities }
@@ -1612,80 +1606,113 @@ class StudioViewModel(app: Application, val workspaceKey: String = "main") : And
         mutable.value = mutable.value.copy(busy = false, message = "PDF export cancelled")
     }
     fun busy(value: Boolean) { mutable.value = mutable.value.copy(busy = value) }
-    private fun retainOpenedNote(note: Note, activate: Boolean) {
+    fun consumePendingHeading(token: String) {
+        if (mutable.value.pendingHeading?.token == token) {
+            mutable.value = mutable.value.copy(pendingHeading = null)
+        }
+    }
+    private fun loadNoteForOpen(uri: Uri, relative: String?): Note {
+        documentAccess.persist(uri)
+        val target = documentAccess.resolve(uri)
+        val existing = mutable.value.tabs.find { it.uri?.let { raw -> sameDocumentUri(raw, uri.toString()) } == true }
+        // Reopening an existing draft must still validate its grant,
+        // but must never reload older disk bytes over its edits.
+        if (existing != null) {
+            resolver.openInputStream(target)?.use { } ?: error("Document permission is unavailable; choose it again")
+            return existing.copy(uri = target.toString(), relative = relative ?: existing.relative)
+        }
+        val name = resolveDisplayName(target)
+            ?: relative?.substringAfterLast('/')
+            ?: "Note.md"
+        return resolver.openInputStream(target)?.use { stream ->
+            val buffered = stream.buffered()
+            buffered.mark(65536)
+            val prefix = ByteArray(32768); val count = buffered.read(prefix); buffered.reset()
+            val header = if (count > 0) String(prefix, 0, count, Charsets.UTF_8).trimStart('\uFEFF', ' ', '\n', '\r', '\t') else ""
+            val portable = portableGzipHeader(prefix.copyOfRange(0, maxOf(count, 0))) || portableEnvelopeHeader(header)
+            if (portable) {
+                val opened = media.openFmd(buffered)
+                Note(name = name, uri = target.toString(), content = opened.markdown, saved = opened.markdown, relative = relative, assetDirectory = opened.directory)
+                    .also { recordPortableBaseline(it.id, opened.directory) }
+            } else {
+                val content = readLimited(buffered, 20_000_000).toString(Charsets.UTF_8).removePrefix("\uFEFF")
+                Note(name = name, uri = target.toString(), content = content, saved = content, relative = relative)
+            }
+        } ?: error("Document permission is unavailable; choose it again")
+    }
+    private fun retainOpenedNote(note: Note, activate: Boolean, headingFragment: String? = null): String {
         val existing = mutable.value.tabs.find { it.uri != null && note.uri != null && sameDocumentUri(it.uri, note.uri) }
+        val targetId = existing?.id ?: note.id
+        val jump = headingFragment?.takeIf { it.isNotBlank() }?.let { PendingHeadingJump(targetId, it, UUID.randomUUID().toString()) }
         change { state ->
             state.copy(
-                tabs = if (existing != null) state.tabs.map { if(it.id == existing.id) it.copy(uri = note.uri) else it } else state.tabs + note,
-                activeId = if (activate) existing?.id ?: note.id else state.activeId,
+                tabs = if (existing != null) state.tabs.map { if (it.id == existing.id) it.copy(uri = note.uri, relative = note.relative ?: it.relative) else it } else state.tabs + note,
+                activeId = if (activate) targetId else state.activeId,
+                pendingHeading = if (activate) jump else state.pendingHeading,
             )
         }
-        mutable.value.tabs.firstOrNull { it.id == (existing?.id ?: note.id) }?.let(::remember)
+        mutable.value.tabs.firstOrNull { it.id == targetId }?.let(::remember)
+        return targetId
     }
-    fun open(uri: Uri, relative: String? = null, pendingHeading: String? = null): Job {
-        val request = openRequests.begin()
-        val requestedHeading = pendingHeading?.trim()?.takeIf { it.isNotEmpty() }
-        return viewModelScope.launch {
+    private suspend fun openNoteInternal(
+        uri: Uri,
+        relative: String? = null,
+        headingFragment: String? = null,
+        scheduleDirtyAutosave: Boolean = false,
+        alwaysReportError: Boolean = false,
+        errorPrefix: String = "Could not open note",
+        request: Long = openRequests.begin(),
+    ): JSONObject {
+        val requestedHeading = headingFragment?.trim()?.takeIf { it.isNotEmpty() }
         try {
-            val note = withContext(Dispatchers.IO) {
-                documentAccess.persist(uri)
-                val target = documentAccess.resolve(uri)
-                val existing = mutable.value.tabs.find { it.uri?.let { raw -> sameDocumentUri(raw, uri.toString()) } == true }
-                // Reopening an existing draft must still validate its grant,
-                // but must never reload older disk bytes over its edits.
-                if (existing != null) {
-                    resolver.openInputStream(target)?.use { } ?: error("Document permission is unavailable; choose it again")
-                    return@withContext existing.copy(uri = target.toString())
-                }
-                val name = resolveDisplayName(target) ?: "Note.md"
-                resolver.openInputStream(target)?.use { stream ->
-                    val buffered = stream.buffered()
-                    buffered.mark(65536)
-                    val prefix = ByteArray(32768); val count = buffered.read(prefix); buffered.reset()
-                    val header = if (count > 0) String(prefix, 0, count, Charsets.UTF_8).trimStart('\uFEFF', ' ', '\n', '\r', '\t') else ""
-                    val portable = portableGzipHeader(prefix.copyOfRange(0, maxOf(count, 0))) || portableEnvelopeHeader(header)
-                    if (portable) { val opened = media.openFmd(buffered); Note(name = name, uri = target.toString(), content = opened.markdown, saved = opened.markdown, relative = relative, assetDirectory = opened.directory).also { recordPortableBaseline(it.id, opened.directory) } }
-                    else { val content = readLimited(buffered, 20_000_000).toString(Charsets.UTF_8).removePrefix("\uFEFF"); Note(name = name, uri = target.toString(), content = content, saved = content, relative = relative) }
-                } ?: error("Document permission is unavailable; choose it again")
-            }
+            val note = withContext(Dispatchers.IO) { loadNoteForOpen(uri, relative) }
             if (note.uri?.let { documentAccess.hasWriteGrant(Uri.parse(it)) } == true) clearDocumentAccessFailure(uri.toString())
             if (!openRequests.isCurrent(request)) {
                 // A newer open or a user tab action owns focus, but every file
                 // the user requested still becomes an available tab.
                 retainOpenedNote(note, activate = false)
-                return@launch
+                return JSONObject().put("opened", false)
             }
             val expectedActiveId = mutable.value.active.id
-            var applied = false
+            var openedTabId: String? = null
             val accepted = performReaderBarrier(expectedActiveId) {
-                val shouldActivate = openRequests.isCurrent(request)
-                retainOpenedNote(note, activate = shouldActivate)
-                if (shouldActivate) {
-                    val openedNote = mutable.value.tabs.firstOrNull { it.uri?.let { raw -> note.uri != null && sameDocumentUri(raw, note.uri) } == true } ?: note
-                    val carriedHeading = requestedHeading ?: note.uri?.let { targetUri ->
-                        pendingHeadings.keys.firstOrNull { key -> sameDocumentUri(key, targetUri) }?.let(pendingHeadings::remove)
-                    }
-                    if (carriedHeading != null) {
-                        pendingHeadings[openedNote.id] = carriedHeading
-                        mutable.value = mutable.value.copy(navigationCommand = mutable.value.navigationCommand + 1)
-                    } else {
-                        pendingHeadings.remove(openedNote.id)
-                    }
+                if (scheduleDirtyAutosave) {
+                    mutable.value.tabs.firstOrNull { it.id == expectedActiveId }
+                        ?.takeIf { it.dirty && it.uri != null }
+                        ?.let { scheduleAutosave(it.id) }
                 }
-                applied = true
+                val activate = openRequests.isCurrent(request)
+                val carriedHeading = requestedHeading ?: note.uri?.let { targetUri ->
+                    pendingAccessHeadings.keys.firstOrNull { key -> sameDocumentUri(key, targetUri) }?.let(pendingAccessHeadings::remove)
+                }
+                openedTabId = retainOpenedNote(
+                    note,
+                    activate = activate,
+                    headingFragment = carriedHeading?.takeIf { activate && it.isNotBlank() },
+                )
             }
-            if (!accepted || !applied) {
+            if (!accepted || openedTabId == null) {
                 if (!openRequests.isCurrent(request)) retainOpenedNote(note, activate = false)
                 else readerBarrierFailed()
+                return JSONObject().put("opened", false)
             }
-        } catch (cancelled: kotlinx.coroutines.CancellationException) { throw cancelled }
-        catch (error: Exception) { if (openRequests.isCurrent(request)) {
-            if (isDocumentAccessFailure(error)) {
-                if (requestedHeading != null) pendingHeadings[uri.toString()] = requestedHeading
+            return JSONObject().put("opened", true).put("id", openedTabId).put("uri", note.uri ?: uri.toString())
+        } catch (cancelled: kotlinx.coroutines.CancellationException) {
+            throw cancelled
+        } catch (error: Exception) {
+            if (!alwaysReportError && !openRequests.isCurrent(request)) return JSONObject().put("opened", false)
+            val msg = if (isDocumentAccessFailure(error)) {
+                if (requestedHeading != null) pendingAccessHeadings[uri.toString()] = requestedHeading
                 requestDocumentAccess(uri.toString(), mutable.value.tabs.firstOrNull { it.uri?.let { raw -> sameDocumentUri(raw, uri.toString()) } == true }, writing = false, explicit = true)
-            } else fail("Could not open note: ${error.message}")
-        } }
+            } else {
+                "$errorPrefix: ${error.message}".also(::fail)
+            }
+            return JSONObject().put("opened", false).put("message", msg)
         }
+    }
+    fun open(uri: Uri, relative: String? = null, pendingHeading: String? = null): Job {
+        val request = openRequests.begin()
+        return viewModelScope.launch { openNoteInternal(uri, relative, headingFragment = pendingHeading, request = request) }
     }
     internal suspend fun saveAgentPortable(id: String, expectedRevision: String) {
         if (requestWriteAccessIfBlocked(id)) throw SecurityException(DOCUMENT_ACCESS_MESSAGE)
@@ -2101,7 +2128,7 @@ class StudioViewModel(app: Application, val workspaceKey: String = "main") : And
         windowPrefs.edit().putBoolean("folderMigrated", true).remove("folder").apply()
         change { it.copy(folder = null, files = emptyList()) }
     }
-    private val noteExtensions = setOf("md", "smd", "markdown", "fmd")
+    private val noteExtensions = WORKSPACE_NOTE_EXTENSIONS.toSet()
 
     fun listFolder(uri: Uri, relative: String) = viewModelScope.launch {
         listedRelative=relative
@@ -2160,134 +2187,183 @@ class StudioViewModel(app: Application, val workspaceKey: String = "main") : And
         return readerFolderIndex.resolve(resolver, note.id, tree.folderUri, tree.rootId, parts).uri
     }
 
-    private fun reportRelativeNoteNotice(notice: String): Nothing {
-        mutable.value = mutable.value.copy(busy = false, message = notice)
-        throw IllegalArgumentException(notice)
-    }
+    private class PromptWorkspaceNoteAccessException(val targetUri: Uri) : Exception()
 
-    private fun reportRelativeNoteError(error: Throwable): Nothing {
-        val message = error.message ?: ""
-        val notice = when {
-            message.contains("escapes", ignoreCase = true) -> "Linked note is outside the authorized folder."
-            message.contains("Encoded path separators", ignoreCase = true) -> "Encoded path separators are not allowed."
-            else -> "Invalid relative note path."
-        }
-        reportRelativeNoteNotice(notice)
-    }
-
-    private fun parseRelativeNoteParts(parent: String, rawTarget: String): List<String> = try {
-        readerAssetPathParts(parent, rawTarget)
-    } catch (error: Exception) {
-        reportRelativeNoteError(error)
-    }
-
-    suspend fun openRelativeNote(documentPath: String, target: String, heading: String? = null) {
-        val note = openNoteForDocument(documentPath) ?: reportRelativeNoteNotice("The note for this link is no longer open.")
-        val rawNoteUri = note.uri
-        if (rawNoteUri.isNullOrBlank()) {
-            reportRelativeNoteNotice("Save this note before opening linked notes.")
-        }
-        if (target.contains('\u0000') || Regex("(?i)%00").containsMatchIn(target)) {
-            reportRelativeNoteNotice("Invalid relative note path.")
-        }
-        val rawTarget = target.substringBefore('#').substringBefore('?').trim()
-        val decodedCheck = try {
-            validateRelativeAssetSource(rawTarget)
-        } catch (error: Exception) {
-            reportRelativeNoteError(error)
-        }
-        if (decodedCheck.substringAfterLast('.', "").lowercase() !in noteExtensions) {
-            reportRelativeNoteNotice("Only Markdown and Super MD notes can be opened from relative links.")
-        }
-        val requestedHeading = heading?.trim()?.takeIf { it.isNotEmpty() }
-        val noteUri = Uri.parse(rawNoteUri)
-        val (resolvedUri, resolvedRelative) = withContext(Dispatchers.IO) {
-            if (noteUri.scheme == "file") {
-                val parts = parseRelativeNoteParts("", rawTarget)
-                val sourcePath = File(noteUri.path ?: reportRelativeNoteNotice("Invalid note path.")).toPath()
-                val boundary = (sourcePath.parent ?: reportRelativeNoteNotice("Invalid note path.")).toRealPath()
-                var current = boundary
-                for (part in parts) {
-                    current = current.resolve(part)
-                    if (java.nio.file.Files.isSymbolicLink(current)) reportRelativeNoteNotice("Linked note symlink paths are not allowed.")
-                }
-                if (!java.nio.file.Files.isRegularFile(current)) reportRelativeNoteNotice("Linked note not found: ${parts.last()}")
-                val realTarget = current.toRealPath()
-                if (!realTarget.startsWith(boundary)) reportRelativeNoteNotice("Linked note is outside the authorized folder.")
-                return@withContext Uri.fromFile(realTarget.toFile()) to parts.joinToString("/")
+    suspend fun openWorkspaceLink(
+        documentPath: String,
+        target: String,
+        fragment: String,
+        wikilink: Boolean,
+    ): JSONObject {
+        val trimmedTarget = target.trim()
+        val trimmedFragment = fragment.trim()
+        require(trimmedTarget.length in 1..4096 && trimmedFragment.length <= 1024) { "Invalid workspace link" }
+        val stateSnapshot = mutable.value
+        val sourceNote = if (documentPath.isNotBlank()) {
+            openNoteForDocument(documentPath) ?: run {
+                val notice = "The note for this link is no longer open."
+                mutable.value = mutable.value.copy(busy = false, message = notice)
+                return JSONObject().put("opened", false).put("message", notice)
             }
-            findSafTree(noteUri, allowEmbeddedTreeFallback = true)?.let { tree ->
-                val parentRelative = tree.relativePath.substringBeforeLast('/', "")
-                val candidateLists = buildList {
-                    add(parseRelativeNoteParts(parentRelative, rawTarget))
-                    if (parentRelative.isNotEmpty() && !decodedCheck.replace('\\', '/').split('/').contains("..")) {
-                        add(parseRelativeNoteParts("", rawTarget))
+        } else {
+            stateSnapshot.active
+        }
+        val explicitRelative = isExplicitRelativeWorkspaceTarget(trimmedTarget, wikilink)
+        val openFolder = stateSnapshot.folder?.let(Uri::parse)?.takeIf { DocumentsContract.isTreeUri(it) }
+        val rawNoteUri = sourceNote.uri
+        if (rawNoteUri.isNullOrBlank()) {
+            if (explicitRelative || openFolder == null) {
+                val notice = "Save this note before opening linked notes."
+                mutable.value = mutable.value.copy(busy = false, message = notice)
+                return JSONObject().put("opened", false).put("message", notice)
+            }
+        }
+
+        val resolved = try {
+            withContext(Dispatchers.IO) {
+                val cleaned = sanitizeWorkspaceLinkTarget(trimmedTarget)
+                val sourceUri = rawNoteUri?.takeIf { it.isNotBlank() }?.let(Uri::parse)
+                if (sourceUri != null && sourceUri.scheme == "file") {
+                    return@withContext resolveLocalFileWorkspaceLink(sourceUri, cleaned, wikilink)!!
+                }
+                val treeMatch = when {
+                    sourceUri != null -> findSafTree(sourceUri, allowEmbeddedTreeFallback = true)
+                    openFolder != null -> SafTreeMatch(openFolder, DocumentsContract.getTreeDocumentId(openFolder), "")
+                    else -> null
+                }
+                if (treeMatch != null) {
+                    val parentRelative = treeMatch.relativePath.substringBeforeLast('/', "")
+                    val candidateLists = expandWorkspaceCandidatePaths(parentRelative, cleaned, wikilink)
+                    var deniedTreeCandidate: Uri? = null
+                    for (parts in candidateLists) {
+                        val relJoined = parts.joinToString("/")
+                        val indexedUri = try {
+                            readerFolderIndex.resolve(resolver, sourceNote.id, treeMatch.folderUri, treeMatch.rootId, parts).uri
+                        } catch (_: LinkedAssetAccessRequiredException) {
+                            null
+                        } catch (_: SecurityException) {
+                            null
+                        } catch (_: UnsupportedOperationException) {
+                            null
+                        } catch (_: java.io.FileNotFoundException) {
+                            null
+                        }
+                        if (indexedUri != null) {
+                            val targetUri = documentAccess.resolve(indexedUri)
+                            return@withContext WorkspaceResolvedNote(targetUri, parts.last(), relJoined)
+                        }
+                        val candidateDocId = if (treeMatch.rootId.endsWith(':')) {
+                            "${treeMatch.rootId}$relJoined"
+                        } else {
+                            "${treeMatch.rootId.trimEnd('/')}/$relJoined"
+                        }
+                        val candidateUri = documentAccess.resolve(
+                            DocumentsContract.buildDocumentUriUsingTree(treeMatch.folderUri, candidateDocId),
+                        )
+                        if (!documentAccess.hasReadGrant(candidateUri)) {
+                            if (deniedTreeCandidate == null) deniedTreeCandidate = candidateUri
+                            continue
+                        }
+                        val readable = try {
+                            resolver.openInputStream(candidateUri)?.use { true } == true
+                        } catch (_: java.io.FileNotFoundException) {
+                            false
+                        } catch (error: Exception) {
+                            if (isDocumentAccessFailure(error) && deniedTreeCandidate == null) {
+                                deniedTreeCandidate = candidateUri
+                            }
+                            false
+                        }
+                        if (readable) {
+                            return@withContext WorkspaceResolvedNote(candidateUri, parts.last(), relJoined)
+                        }
+                    }
+                    if (deniedTreeCandidate != null) {
+                        throw PromptWorkspaceNoteAccessException(deniedTreeCandidate)
+                    }
+                    throw WorkspaceLinkException("Linked note not found: ${Uri.decode(cleaned)}")
+                }
+
+                val nonNullSourceUri = sourceUri ?: throw WorkspaceLinkException("Save this note before opening linked notes.")
+                val candidateLists = expandWorkspaceCandidatePaths("", cleaned, wikilink)
+                val documentId = runCatching { DocumentsContract.getDocumentId(nonNullSourceUri) }.getOrDefault("")
+                val sep = maxOf(documentId.lastIndexOf('/'), documentId.lastIndexOf(':'))
+
+                linkedAssetUri(sourceNote, cleaned)?.let { grantedUri ->
+                    val resolvedGranted = documentAccess.resolve(grantedUri)
+                    val grantedReadable = documentAccess.hasReadGrant(resolvedGranted) &&
+                        runCatching { resolver.openInputStream(resolvedGranted)?.use { true } == true }.getOrDefault(false)
+                    if (grantedReadable) {
+                        val firstParts = candidateLists.first()
+                        return@withContext WorkspaceResolvedNote(resolvedGranted, firstParts.last(), firstParts.joinToString("/"))
                     }
                 }
+
+                var deniedCandidate: Uri? = null
                 for (parts in candidateLists) {
                     val relJoined = parts.joinToString("/")
-                    val indexedUri = try {
-                        readerFolderIndex.resolve(resolver, note.id, tree.folderUri, tree.rootId, parts).uri
-                    } catch (_: LinkedAssetAccessRequiredException) {
-                        null
-                    } catch (_: UnsupportedOperationException) {
-                        null
-                    } catch (_: java.io.FileNotFoundException) {
-                        null
+                    val siblingDocId = if (sep >= 0) documentId.substring(0, sep + 1) + relJoined else relJoined
+                    val rawCandidate = if (documentId.isNotEmpty() && nonNullSourceUri.authority != null) {
+                        DocumentsContract.buildDocumentUri(nonNullSourceUri.authority, siblingDocId)
+                    } else {
+                        nonNullSourceUri.buildUpon().path((nonNullSourceUri.path?.substringBeforeLast('/', "") ?: "") + "/" + relJoined).build()
                     }
-                    if (indexedUri != null) {
-                        return@withContext documentAccess.resolve(indexedUri) to relJoined
+                    val openMatch = mutable.value.tabs.firstOrNull { tab ->
+                        tab.uri?.let { existingUri -> sameDocumentUri(existingUri, rawCandidate.toString()) } == true
+                    }?.uri?.let(Uri::parse)
+                    val candidateUri = documentAccess.resolve(openMatch ?: rawCandidate)
+                    if (!documentAccess.hasReadGrant(candidateUri)) {
+                        if (deniedCandidate == null) deniedCandidate = candidateUri
+                        continue
                     }
-                    val candidateDocId = if (tree.rootId.endsWith(':')) "${tree.rootId}$relJoined" else "${tree.rootId.trimEnd('/')}/$relJoined"
-                    val candidateUri = documentAccess.resolve(DocumentsContract.buildDocumentUriUsingTree(tree.folderUri, candidateDocId))
                     val readable = try {
-                        if (!documentAccess.hasReadGrant(candidateUri)) false
-                        else resolver.openInputStream(candidateUri)?.use { true } == true
-                    } catch (_: SecurityException) {
-                        throw SecurityException(DOCUMENT_ACCESS_MESSAGE)
+                        resolver.openInputStream(candidateUri)?.use { true } == true
                     } catch (_: java.io.FileNotFoundException) {
                         false
+                    } catch (error: Exception) {
+                        if (isDocumentAccessFailure(error) && deniedCandidate == null) {
+                            deniedCandidate = candidateUri
+                        }
+                        false
                     }
-                    if (readable) return@withContext candidateUri to relJoined
+                    if (readable) {
+                        return@withContext WorkspaceResolvedNote(candidateUri, parts.last(), relJoined)
+                    }
                 }
-                reportRelativeNoteNotice("Linked note not found: ${candidateLists.first().last()}")
+                if (deniedCandidate != null) {
+                    throw PromptWorkspaceNoteAccessException(deniedCandidate)
+                }
+                throw WorkspaceLinkException("Linked note not found: ${Uri.decode(cleaned)}")
             }
-            val documentId = runCatching { DocumentsContract.getDocumentId(noteUri) }.getOrDefault("")
-            val parts = parseRelativeNoteParts("", rawTarget)
-            val relJoined = parts.joinToString("/")
-            linkedAssetUri(note, rawTarget)?.let { grantedUri ->
-                val resolved = documentAccess.resolve(grantedUri)
-                if (documentAccess.hasReadGrant(resolved)) return@withContext resolved to relJoined
-            }
-            val sep = maxOf(documentId.lastIndexOf('/'), documentId.lastIndexOf(':'))
-            val siblingDocId = if (sep >= 0) documentId.substring(0, sep + 1) + relJoined else relJoined
-            val rawCandidate = if (documentId.isNotEmpty() && noteUri.authority != null) {
-                DocumentsContract.buildDocumentUri(noteUri.authority, siblingDocId)
-            } else {
-                noteUri.buildUpon().path((noteUri.path?.substringBeforeLast('/', "") ?: "") + "/" + relJoined).build()
-            }
-            val openMatch = mutable.value.tabs.firstOrNull { tab ->
-                tab.uri?.let { existingUri -> sameDocumentUri(existingUri, rawCandidate.toString()) } == true
-            }?.uri?.let(Uri::parse)
-            val candidateUri = documentAccess.resolve(openMatch ?: rawCandidate)
-            if (!documentAccess.hasReadGrant(candidateUri)) {
-                if (requestedHeading != null) pendingHeadings[candidateUri.toString()] = requestedHeading
-                val notice = requestDocumentAccess(candidateUri.toString(), null, writing = false, explicit = true)
-                throw SecurityException(notice)
-            }
-            try {
-                resolver.openInputStream(candidateUri)?.use { } ?: reportRelativeNoteNotice("Linked note not found: ${parts.last()}")
-            } catch (security: SecurityException) {
-                if (requestedHeading != null) pendingHeadings[candidateUri.toString()] = requestedHeading
-                val notice = requestDocumentAccess(candidateUri.toString(), null, writing = false, explicit = true)
-                throw SecurityException(notice, security)
-            } catch (_: java.io.FileNotFoundException) {
-                reportRelativeNoteNotice("Linked note not found: ${parts.last()}")
-            }
-            candidateUri to relJoined
+        } catch (cancelled: kotlinx.coroutines.CancellationException) {
+            throw cancelled
+        } catch (prompt: PromptWorkspaceNoteAccessException) {
+            val targetStr = prompt.targetUri.toString()
+            if (trimmedFragment.isNotEmpty()) pendingAccessHeadings[targetStr] = trimmedFragment
+            val notice = requestDocumentAccess(targetStr, null, writing = false, explicit = true)
+            return JSONObject().put("opened", false).put("message", notice)
+        } catch (security: SecurityException) {
+            val msg = security.message ?: DOCUMENT_ACCESS_MESSAGE
+            mutable.value = mutable.value.copy(busy = false, message = msg)
+            return JSONObject().put("opened", false).put("message", msg)
+        } catch (error: WorkspaceLinkException) {
+            val msg = error.message ?: "Invalid relative note path."
+            mutable.value = mutable.value.copy(busy = false, message = msg)
+            return JSONObject().put("opened", false).put("message", msg)
         }
-        open(resolvedUri, resolvedRelative, requestedHeading).join()
+
+        return openNoteInternal(
+            resolved.uri,
+            resolved.relative,
+            headingFragment = trimmedFragment,
+            scheduleDirtyAutosave = true,
+            alwaysReportError = true,
+            errorPrefix = "Could not open linked note",
+        )
     }
+
+    suspend fun openRelativeNote(documentPath: String, target: String, heading: String? = null): JSONObject =
+        openWorkspaceLink(documentPath, target, heading.orEmpty(), wikilink = false)
 
     suspend fun textAsset(document: String, source: String): JSONObject = withContext(Dispatchers.IO) {
         require(Uri.decode(source).substringBefore('?').substringBefore('#').substringAfterLast('.').lowercase() in setOf("mmd", "mermaid")) { "Choose a Mermaid source file" }

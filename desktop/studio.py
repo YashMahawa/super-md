@@ -52,6 +52,7 @@ import file_events
 import custom_theme
 from selection_actions import ASSISTANTS, selection_target
 from shortcuts import DEFINITIONS as SHORTCUT_DEFINITIONS, capture_sequence, default_shortcuts, native_label, normalize_shortcuts, parse_sequence
+from workspace_links import WorkspaceLinkError, resolve_workspace_link
 
 ROOT = Path(sys._MEIPASS)/"resources" if getattr(sys,"frozen",False) else Path(__file__).resolve().parent.parent
 DEFAULT_PDF = {"pageSize": "a4", "margin": 14, "fontSize": 10.5, "lineHeight": 1.4, "paragraphSpacing": 0.65, "fontFamily": "Manrope", "pageNumbers": True, "themed": False}
@@ -187,7 +188,6 @@ _SYSTEM_PATH_ALIASES: tuple[tuple[str, str], ...] = (
 
 def _validate_local_tab_asset_path(raw_path, note_path: Path, extra_roots: list[Path], *,
                                    unavailable_message: str, outside_message: str,
-                                   symlink_message: str | None = None,
                                    _system_aliases: tuple[tuple[str, str], ...] | None = None) -> Path:
     if not isinstance(raw_path, str) or not 1 <= len(raw_path.strip()) <= 4096 or "\0" in raw_path:
         raise ValueError(unavailable_message)
@@ -242,7 +242,7 @@ def _validate_local_tab_asset_path(raw_path, note_path: Path, extra_roots: list[
         current = current / part
         try:
             if current.is_symlink() or (hasattr(os.path, "isjunction") and os.path.isjunction(current)):
-                raise ValueError(symlink_message or outside_message)
+                raise ValueError(outside_message)
         except OSError as error:
             raise ValueError(unavailable_message) from error
 
@@ -4309,38 +4309,77 @@ class Studio(QObject):
                 self.settings["fullZoom" if args.get("fullscreen", self.fullscreen) else "normalZoom"] = max(40,min(300,args["zoom"]))
                 self.preference_timer.start(500)
                 self._emit(False); self.replied.emit(id,"true",""); return
-            if command == "open_relative_note":
-                document_ref = args.get("documentPath")
-                target_rel = args.get("target")
-                raw_heading = args.get("heading")
-                if raw_heading is not None and (not isinstance(raw_heading, str) or len(raw_heading) > 1024):
-                    raise ValueError("Invalid heading target")
-                heading = raw_heading.strip() if isinstance(raw_heading, str) and raw_heading.strip() else None
-                source_tab = self._find_open_tab(document_ref, canonicalize_local=True) if document_ref else self._current()
+            if command == "open_external_url":
+                url = args.get("url")
+                if not isinstance(url, str) or len(url) > 4096:
+                    raise ValueError("Invalid external URL")
+                parsed = urllib.parse.urlparse(url)
+                if parsed.scheme.lower() not in ("http", "https", "mailto"):
+                    raise ValueError("Unsupported external URL scheme")
+                QDesktopServices.openUrl(QUrl(url))
+                self.replied.emit(id, "true", "")
+                return
+            if command in ("open_workspace_link", "open_relative_note"):
+                raw_target = args.get("target")
+                raw_fragment = args.get("fragment")
+                if not raw_fragment:
+                    raw_fragment = args.get("heading", "")
+                if raw_fragment is None:
+                    raw_fragment = ""
+                wikilink = bool(args.get("wikilink", False)) if command == "open_workspace_link" else False
+                doc_ref = args.get("documentPath", "")
+                if (not isinstance(raw_target, str) or len(raw_target) > 4096
+                        or not isinstance(raw_fragment, str) or len(raw_fragment) > 1024):
+                    raise ValueError("Invalid workspace link")
+                source_tab = self._find_open_tab(doc_ref, canonicalize_local=True) if doc_ref else self._current()
                 if source_tab is None:
                     raise ValueError("The note for this link is no longer open.")
-                try:
-                    resolved = self._resolve_relative_note(source_tab, target_rel)
-                except ValueError as error:
-                    self.message = str(error)
-                    self._emit(False)
-                    self.replied.emit(id, "null", str(error))
-                    return
-                if self.autosave_timer.isActive():
-                    self.autosave_timer.stop()
-                    self._autosave()
+                note_path = source_tab["path"]
+                folder = self.folder
                 if self.recovery_timer.isActive():
                     self.recovery_timer.stop()
-                    self._recover()
-                resolved_str = str(resolved)
-                def opened_callback(_opened, error):
+                self._recover()
+                if self.autosave_timer.isActive() or (
+                    self.settings.get("autosave") and note_path and self._is_dirty(source_tab)
+                ):
+                    self.autosave_timer.stop()
+                    self._autosave()
+                def resolve_work():
+                    return resolve_workspace_link(
+                        raw_target,
+                        wikilink=wikilink,
+                        note_path=note_path,
+                        workspace_folder=folder,
+                    )
+                def resolve_done(resolved_path, error):
+                    if self.retired:
+                        self.replied.emit(id, json.dumps({"opened": False}), "")
+                        return
                     if error:
                         self.message = str(error)
                         self._emit(False)
-                        self.replied.emit(id, "null", str(error))
+                        self.replied.emit(id, json.dumps({"opened": False, "message": str(error)}), "")
                         return
-                    self.replied.emit(id, "true", "")
-                self._open_note(resolved_str, explicit=True, completion_callback=opened_callback, pending_heading=heading)
+                    fragment = raw_fragment.strip()
+                    heading_payload = {"heading": fragment, "token": uuid.uuid4().hex} if fragment else None
+                    def opened(opened_tab, open_error):
+                        if open_error or opened_tab is None:
+                            if open_error:
+                                self.message = str(open_error)
+                                self._emit(False)
+                            self.replied.emit(
+                                id,
+                                json.dumps({"opened": False, "message": str(open_error or "Could not open note")}),
+                                "",
+                            )
+                            return
+                        self.replied.emit(
+                            id,
+                            json.dumps({"opened": True, "id": opened_tab["id"], "path": opened_tab["path"]}),
+                            "",
+                        )
+                    self._open_note(str(resolved_path), explicit=True, completion_callback=opened, pending_heading=heading_payload)
+                self._submit(resolve_work, resolve_done, False)
                 return
             if command == "export_failed": self.pending_export = self.pending_save_as = self.pending_save_as_tab = ""; self.message = args["error"]; self._emit(False); self.replied.emit(id,"true",""); return
             if command == "request_fmd_export": self.exportRequested.emit("smd"); self.replied.emit(id,"true",""); return
@@ -4689,50 +4728,6 @@ class Studio(QObject):
         except OSError:
             pass
         return None
-
-    def _resolve_relative_note(self, tab, target):
-        if not tab or not tab.get("path"):
-            raise ValueError("Save this note before opening linked notes.")
-        if not isinstance(target, str) or not target or len(target) > 4096 or "\x00" in target:
-            raise ValueError("Invalid relative note path.")
-        raw = target.split("#", 1)[0].split("?", 1)[0].strip()
-        if not raw or raw.startswith(("/", "\\")) or re.match(r"^[a-zA-Z][a-zA-Z0-9+.-]*:", raw):
-            raise ValueError("Invalid relative note path.")
-        if re.search(r"(?i)%2f|%5c|%00", raw):
-            raise ValueError("Encoded path separators are not allowed.")
-        decoded = urllib.parse.unquote(raw)
-        if not decoded or "\x00" in decoded or decoded.startswith(("/", "\\")) or re.match(r"^[a-zA-Z]:", decoded):
-            raise ValueError("Invalid relative note path.")
-        normalized = decoded.replace("\\", "/")
-        if Path(normalized).suffix.casefold() not in (".md", ".smd", ".markdown", ".fmd"):
-            raise ValueError("Only Markdown and Super MD notes can be opened from relative links.")
-        note_path = Path(tab["path"])
-        note_dir = note_path.parent.resolve()
-        workspace_dir = Path(self.folder).resolve() if self.folder else None
-        in_workspace = workspace_dir is not None and (note_dir == workspace_dir or note_dir.is_relative_to(workspace_dir))
-        auth_root = workspace_dir if in_workspace else note_dir
-        lexical = Path(os.path.abspath(note_dir / normalized))
-        if not (lexical == auth_root or auth_root in lexical.parents):
-            raise ValueError("Linked note is outside the authorized folder.")
-        extra_roots = [Path(self.folder)] if in_workspace else []
-        candidates = [note_path.parent / normalized]
-        if in_workspace and workspace_dir != note_dir and ".." not in normalized.split("/"):
-            candidates.append(Path(self.folder) / normalized)
-        missing_message = f"Linked note not found: {Path(normalized).name}"
-        for index, candidate in enumerate(candidates):
-            try:
-                return _validate_local_tab_asset_path(
-                    str(candidate),
-                    note_path,
-                    extra_roots,
-                    unavailable_message=missing_message,
-                    outside_message="Linked note is outside the authorized folder.",
-                    symlink_message="Linked note symlink paths are not allowed.",
-                )
-            except ValueError as error:
-                if str(error) == missing_message and index + 1 < len(candidates):
-                    continue
-                raise
 
     def _fetch(self, args):
         url = args["url"]

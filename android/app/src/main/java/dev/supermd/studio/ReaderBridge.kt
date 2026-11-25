@@ -123,11 +123,30 @@ internal class ReaderBridge(
                     "load_python_output" -> loadPythonOutput(args)
                     "load_asset" -> model.asset(args.getString("documentPath"), args.getString("source"))
                     "load_text_asset" -> model.textAsset(args.getString("documentPath"), args.getString("source"))
-                    "open_relative_note" -> {
-                        val heading = if (!args.has("heading") || args.isNull("heading")) null else {
+                    "open_workspace_link", "open_relative_note" -> {
+                        val fragment = if (args.has("fragment") && !args.isNull("fragment")) {
+                            args.opt("fragment") as? String ?: error("Invalid heading target")
+                        } else if (args.has("heading") && !args.isNull("heading")) {
                             args.opt("heading") as? String ?: error("Invalid heading target")
+                        } else {
+                            ""
                         }
-                        model.openRelativeNote(args.getString("documentPath"), args.getString("target"), heading)
+                        val wikilink = if (command == "open_workspace_link") args.optBoolean("wikilink", false) else false
+                        model.openWorkspaceLink(
+                            args.optString("documentPath", ""),
+                            args.getString("target"),
+                            fragment,
+                            wikilink,
+                        )
+                    }
+                    "open_external_url" -> {
+                        val rawUrl = args.getString("url")
+                        require(rawUrl.length in 1..4096) { "Invalid external URL" }
+                        val uri = Uri.parse(rawUrl)
+                        require(classifyReaderNavigationUrl(uri, isForMainFrame = true) == ReaderUrlDecision.OPEN_EXTERNAL) {
+                            "Unsupported external URL"
+                        }
+                        launchExternalReaderUri(web.context, uri)
                         true
                     }
                     "resolve_reader_asset" -> withContext(Dispatchers.IO) {
@@ -488,46 +507,28 @@ fun configureReader(web: WebView, model: StudioViewModel, scope: CoroutineScope,
         override fun onReceivedError(view: WebView, request: WebResourceRequest, error: android.webkit.WebResourceError) {
             if (request.isForMainFrame) model.fail("The document reader could not load. Please reopen the note.")
         }
-        override fun shouldOverrideUrlLoading(view: WebView, request: WebResourceRequest): Boolean =
-            handleReaderUrlOverride(view, request.url, request.isForMainFrame)
+        override fun shouldOverrideUrlLoading(view: WebView, request: WebResourceRequest): Boolean {
+            // The bridge is available only in the bundled offline reader. Never
+            // navigate this WebView to a page from a note or external website,
+            // and never send internal appassets.androidplatform.net paths to an external browser.
+            return when (classifyReaderNavigationUrl(request.url, request.isForMainFrame)) {
+                ReaderUrlDecision.ALLOW_READER -> false
+                ReaderUrlDecision.OPEN_EXTERNAL -> {
+                    launchExternalReaderUri(view.context, request.url)
+                    true
+                }
+                ReaderUrlDecision.BLOCK_INTERNAL -> true
+            }
+        }
     }
     web.setTag(R.id.reader_bridge_tag, bridge)
     web.addJavascriptInterface(bridge, "SuperMD")
     web.loadUrl("https://appassets.androidplatform.net/assets/web/android-reader.html")
 }
 
-internal enum class ReaderNavigationDecision { ALLOW_READER, BLOCK_INTERNAL, OPEN_EXTERNAL }
-
-internal fun decideReaderNavigation(url: android.net.Uri?, isForMainFrame: Boolean): ReaderNavigationDecision {
-    if (url == null) return ReaderNavigationDecision.BLOCK_INTERNAL
-    // The bridge is available only in the bundled offline reader. Never
-    // navigate this WebView to a page from a note or external website, and
-    // never forward appassets.androidplatform.net URLs to an external browser.
-    if (url.host.equals("appassets.androidplatform.net", ignoreCase = true)) {
-        return if (url.scheme.equals("https", ignoreCase = true) && url.path == "/assets/web/android-reader.html") {
-            ReaderNavigationDecision.ALLOW_READER
-        } else {
-            ReaderNavigationDecision.BLOCK_INTERNAL
-        }
+private fun launchExternalReaderUri(context: android.content.Context, uri: Uri) {
+    val intent = Intent(Intent.ACTION_VIEW, uri).apply {
+        if (context !is android.app.Activity) addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
     }
-    val scheme = url.scheme?.lowercase()
-    if (isForMainFrame && scheme in listOf("https", "http", "mailto")) {
-        return ReaderNavigationDecision.OPEN_EXTERNAL
-    }
-    return ReaderNavigationDecision.BLOCK_INTERNAL
+    runCatching { context.startActivity(intent) }
 }
-
-private fun handleReaderUrlOverride(view: WebView, url: android.net.Uri?, isForMainFrame: Boolean): Boolean =
-    when (decideReaderNavigation(url, isForMainFrame)) {
-        ReaderNavigationDecision.ALLOW_READER -> false
-        ReaderNavigationDecision.OPEN_EXTERNAL -> {
-            if (url != null) runCatching {
-                val intent = Intent(Intent.ACTION_VIEW, url).apply {
-                    if (view.context !is android.app.Activity) addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
-                }
-                view.context.startActivity(intent)
-            }
-            true
-        }
-        ReaderNavigationDecision.BLOCK_INTERNAL -> true
-    }

@@ -1,6 +1,6 @@
 import {visit} from 'unist-util-visit';
-import {headingSlug} from './headingSlug';
 import {parseFrontmatter} from './frontmatter';
+import {encodeMarkdownDestination,formatWikilinkMarkdown,isLikelyInlineLinkDestination,parseOriginalWikilinkSlice} from './workspaceLinks';
 
 interface Edit {start:number;end:number;text:string}
 interface Stage {value:string;originalOffset:(offset:number)=>number}
@@ -307,43 +307,78 @@ function unmaskedRegexStage(source:string,ranges:Array<[number,number]>,regex:Re
   return {stage:replaceStage(source,edits),ranges:nextRanges};
 }
 
-function normalizeNoteWikilinkTarget(rawTarget:string):string|null {
-  const hash=rawTarget.indexOf('#');
-  const rawNote=(hash>=0?rawTarget.slice(0,hash):rawTarget).trim();
-  const rawHeading=hash>=0?rawTarget.slice(hash+1).trim():'';
-  if(!rawNote&&!rawHeading)return null;
-  if(!rawNote&&rawHeading)return `#${headingSlug(rawHeading)}`;
-  const notePath=/\.(?:md|smd|markdown|fmd)$/i.test(rawNote)?rawNote:`${rawNote}.md`;
-  const encoded=encodeURI(notePath);
-  return rawHeading?`${encoded}#${headingSlug(rawHeading)}`:encoded;
+export interface NormalizeMarkdownOptions {
+  encodeLinkDestinations?: boolean;
+}
+
+function maskMath(source:string,mask:Uint8Array):Uint8Array {
+  const out=new Uint8Array(mask);
+  for(let i=0;i<source.length;){
+    if(out[i]||source[i]!=='$'){i++;continue;}
+    let slashes=0;
+    for(let j=i-1;j>=0&&!out[j]&&source[j]==='\\';j--)slashes++;
+    if((slashes&1)===1){i++;continue;}
+    const isDisplay=source[i+1]==='$';
+    const delimLen=isDisplay?2:1;
+    if(!isDisplay&&(i+1>=source.length||/[ \t\r\n$]/.test(source[i+1]))){i++;continue;}
+    let close=-1;
+    for(let k=i+delimLen;k<source.length;k++){
+      if(out[k])continue;
+      if(!isDisplay&&(source[k]==='\n'||source[k]==='\r'))break;
+      if(source[k]==='$'&&(!isDisplay||source[k+1]==='$')){
+        let bs=0;
+        for(let j=k-1;j>=i+delimLen&&source[j]==='\\';j--)bs++;
+        if((bs&1)===0&&(isDisplay||!/[ \t]/.test(source[k-1]))){close=k+delimLen;break;}
+      }
+    }
+    if(close>0){out.fill(1,i,close);i=close;}
+    else i+=delimLen;
+  }
+  return out;
 }
 
 /** Render-only syntax normalization with a sparse offset map. Source positions
  * always address the original note, including frontmatter and wiki/callout edits. */
-export function normalizeMarkdownSource(markdown:string):Stage {
+export function normalizeMarkdownSource(markdown:string, options:NormalizeMarkdownOptions={}):Stage {
+  const encodeLinks=Boolean(options.encodeLinkDestinations);
   const stages:Stage[]=[];let value=markdown;
   const add=(stage:Stage)=>{stages.push(stage);value=stage.value;};
   const fm=parseFrontmatter(value);
   if(fm)add(replaceStage(value,[{start:0,end:fm.end,text:''}]));
   else if(value.startsWith('\uFEFF'))add(replaceStage(value,[{start:0,end:1,text:''}]));
-  let ranges=unmaskedRangesFromMask(computeCodeMask(value));
+  let ranges=unmaskedRangesFromMask(maskMath(value,computeCodeMask(value)));
   const addUnmasked=(regex:RegExp,replacement:(...args:any[])=>string)=>{const next=unmaskedRegexStage(value,ranges,regex,replacement);ranges=next.ranges;add(next.stage);};
-  addUnmasked(/!\[\[([^\[\r\n\]|]+)(?:\|([^\r\n\]]+))?\]\]/g,(_all,path,label)=>`![${label??path}](${encodeURI(path)})`);
-  addUnmasked(/\[\[(#[^\[\r\n\]]+?)\]\]/g,(_all,target:string)=>{const [id,...rest]=target.split('|');const label=rest.join('|');return `[${label||id.slice(1)}](#${headingSlug(id.slice(1))})`;});
-  addUnmasked(/\[\[([^\[\r\n\]|]+)(?:\|([^\r\n\]]+))?\]\]/g,(all,target:string,label?:string)=>{const dest=normalizeNoteWikilinkTarget(target);return dest===null?all:`[${label??target}](${dest})`;});
+  addUnmasked(/!\[\[([^\[\r\n\]|]+)(?:\|([^\r\n\]]+))?\]\]/g,(_all,rawPath:string,label?:string)=>{
+    const path=label!==undefined&&rawPath.endsWith('\\')?rawPath.slice(0,-1):rawPath;
+    return `![${label??path}](${encodeLinks?encodeMarkdownDestination(path.trim()):encodeURI(path)})`;
+  });
+  addUnmasked(/\[\[([^\[\r\n\]]+?)\]\]/g,(all,inner:string)=>formatWikilinkMarkdown(inner,encodeLinks)??all);
+  if(encodeLinks){
+    addUnmasked(/(!?\[(?:\\.|\[[^\r\n\[\]]*\]|[^\[\]\r\n])*\]\()([^<>\r\n()]+?)((?:\s+(?:"[^"\r\n]*"|'[^'\r\n]*'))?)(\))/g,(all,open:string,dest:string,title:string,close:string)=>isLikelyInlineLinkDestination(dest)?`${open}${encodeMarkdownDestination(dest)}${title}${close}`:all);
+  }
   add(normalizeCalloutBlocks(value,false));
   return {value,originalOffset(offset){for(let i=stages.length-1;i>=0;i--)offset=stages[i].originalOffset(offset);return offset;}};
 }
-export function normalizeCallouts(markdown:string):string{return normalizeMarkdownSource(markdown).value;}
+export function normalizeCallouts(markdown:string):string{return normalizeMarkdownSource(markdown,{encodeLinkDestinations:true}).value;}
 
 export function remarkSourceSyntax(this:any){
   const parser=this.parser;
   this.parser=(source:string,file:any)=>{
-    const normalized=normalizeMarkdownSource(source),tree=parser(normalized.value,file);
+    const normalized=normalizeMarkdownSource(source,{encodeLinkDestinations:true}),tree=parser(normalized.value,file);
     if(normalized.value===source)return tree;
     const lines=[0];for(let i=0;i<source.length;i++)if(source[i]==='\n')lines.push(i+1);
     const point=(value:any)=>{const offset=normalized.originalOffset(value.offset);let low=0,high=lines.length;while(low<high){const mid=(low+high)>>>1;if(lines[mid]<=offset)low=mid+1;else high=mid;}return {offset,line:low,column:offset-lines[low-1]+1};};
-    visit(tree,(node:any)=>{if(node.position)node.position={start:point(node.position.start),end:point(node.position.end)};});
+    visit(tree,(node:any)=>{
+      if(!node.position)return;
+      node.position={start:point(node.position.start),end:point(node.position.end)};
+      if(node.type==='link'&&typeof node.position.start?.offset==='number'&&typeof node.position.end?.offset==='number'){
+        const parsed=parseOriginalWikilinkSlice(source.slice(node.position.start.offset,node.position.end.offset));
+        if(parsed&&!parsed.sameNote){
+          const hProperties={...(node.data as any)?.hProperties,'data-wikilink':parsed.target,...(parsed.fragment?{'data-heading-fragment':parsed.fragment}:{})};
+          node.data={...node.data,hProperties};
+        }
+      }
+    });
     return tree;
   };
 }

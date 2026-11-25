@@ -1,6 +1,6 @@
 import { test, expect } from "@playwright/test";
 
-test("relative links and wikilinks open target notes across Live, Read, and Split modes and scroll to one-shot pendingHeading", async ({ page }) => {
+test("relative links and wikilinks open target notes across Live, Read, and Split modes over open_workspace_link and scroll to pendingHeading", async ({ page }) => {
   await page.addInitScript(() => {
     const notes: Record<string, { id: string; path: string; content: string }> = {
       "/notes/Index.md": {
@@ -41,6 +41,7 @@ test("relative links and wikilinks open target notes across Live, Read, and Spli
           Array.from({ length: 30 }, (_, i) => `## Appendix ${i + 1}\n\n${"Further derivations and exercises. ".repeat(12)}\n`).join("\n"),
       },
     };
+    let jumpCounter = 0;
     (window as any).__rpcCalls = [];
     window.SuperMD = {
       post(id, command, raw) {
@@ -53,21 +54,26 @@ test("relative links and wikilinks open target notes across Live, Read, and Spli
           window.supermdReply?.(id, { accepted: true, revision: args.revision }, null);
           return;
         }
-        if (command === "open_relative_note") {
+        if (command === "open_workspace_link") {
           (window as any).__rpcCalls.push(args);
+          if (!args.documentPath) {
+            window.supermdReply?.(id, { opened: false, message: "Save this note before opening linked notes." }, null);
+            return;
+          }
           if (String(args.target).startsWith("..")) {
-            window.supermdReply?.(id, null, "Linked note is outside the authorized folder.");
+            window.supermdReply?.(id, { opened: false, message: "Linked note is outside the authorized folder." }, null);
             return;
           }
           const decoded = decodeURIComponent(args.target);
-          const resolvedPath = `/notes/${decoded}`;
+          const hasExt = /\.(?:md|smd|fmd|markdown|txt)$/i.test(decoded);
+          const resolvedPath = `/notes/${hasExt ? decoded : `${decoded}.md`}`;
           const target = notes[resolvedPath];
           if (!target) {
-            window.supermdReply?.(id, null, `Linked note not found: ${decoded}`);
+            window.supermdReply?.(id, { opened: false, message: `Linked note not found: ${decoded}` }, null);
             return;
           }
           const mode = (window as any).__testMode || "live";
-          window.supermdReply?.(id, true, null);
+          window.supermdReply?.(id, { opened: true, id: target.id, path: target.path }, null);
           window.supermdLoad?.({
             id: target.id,
             path: target.path,
@@ -82,9 +88,8 @@ test("relative links and wikilinks open target notes across Live, Read, and Spli
             motion: false,
             editProtocol: 1,
             restorePosition: true,
-            // Supply a stale top=0 readingLocation to verify pendingHeading wins.
             readingLocation: { top: 0, offset: 0, zoom: 100, mode },
-            ...(args.heading ? { pendingHeading: args.heading } : {}),
+            ...(args.fragment ? { pendingHeading: { heading: args.fragment, token: `jump-${++jumpCounter}` } } : {}),
           });
           return;
         }

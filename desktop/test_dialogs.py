@@ -172,11 +172,7 @@ ApplicationWindow {
             self.studio.tabs[0]['conflict'] = True
             self.studio._emit(False)
             QTest.qWait(60)
-            for _ in range(3):
-                win.grabWindow()
-                if banner.mapToScene(QPointF(0, banner.height())).y() <= editor.mapToScene(QPointF(0, 0)).y() + 1:
-                    break
-                QTest.qWait(20)
+            win.grabWindow()
             self.assertTrue(banner.property('visible'))
             self.assertEqual(win.property('modalDialogCount'), 0)
             self.assertLessEqual(banner.mapToScene(QPointF(0, banner.height())).y(), editor.mapToScene(QPointF(0, 0)).y() + 1)

@@ -5,6 +5,10 @@ export {headingSlug} from './headingSlug';
 export type {OutlineEntry} from './documentAnalysis';
 import {revealWindowed} from "./windowedSearch";
 import {applyDocumentZoom,invalidateDocumentZoom,refreshDocumentExtent} from './documentZoom';
+import {invoke} from './nativeBridge';
+import {isLocalHref,parseRelativeNoteLink,safeDecodeURIComponent,type ClassifiedRenderedLink} from './workspaceLinks';
+export {isLocalHref,parseRelativeNoteLink};
+export const UNSAVED_RELATIVE_NOTE_NOTICE = "Save this note before opening linked notes.";
 const jumps=new WeakMap<Element,{stop:()=>void}>();
 /** A user's zoom/pan wins over the settling frames of a preceding link jump. */
 export function cancelHeadingNavigation(root:Element|null):void {
@@ -28,61 +32,75 @@ export function remarkHeadingIds() {
     });
   };
 }
-export interface RelativeNoteLink {
-  target: string;
-  heading?: string;
+function parseHeadingTarget(rawTarget: string) {
+  const target = safeDecodeURIComponent(rawTarget.replace(/^#/, ''));
+  const trimmed = target.trim();
+  const slug = headingSlug(trimmed);
+  const numbered = /^(.*)-(\d+)$/.exec(trimmed);
+  const numberedSlug = numbered ? `${headingSlug(numbered[1])}-${numbered[2]}` : '';
+  return { target, trimmed, slug, numberedSlug, lower: trimmed.toLowerCase() };
 }
-
-export const UNSAVED_RELATIVE_NOTE_NOTICE = "Save this note before opening linked notes.";
-const RELATIVE_NOTE_EXTENSION = /\.(?:md|smd|markdown|fmd)$/i;
-const EXTERNAL_OR_SCHEME_HREF = /^[a-zA-Z][a-zA-Z0-9+.-]*:/;
-let beforeRelativeNoteOpen: (() => Promise<void> | void) | null = null;
-
-export function registerBeforeRelativeNoteOpen(handler: (() => Promise<void> | void) | null): () => void {
-  beforeRelativeNoteOpen = handler;
-  return () => { if (beforeRelativeNoteOpen === handler) beforeRelativeNoteOpen = null; };
+export function navigateWorkspaceLink(
+  link: Extract<ClassifiedRenderedLink, {kind: 'workspace'}>,
+  documentPath?: string | null,
+  onNotice?: (message: string) => void,
+): void {
+  void (async () => {
+    try { await window.supermdBeforeNavigate?.(); } catch { /* native host tracks edit state */ }
+    const result = await invoke<{opened?: boolean; message?: string} | boolean>('open_workspace_link', {
+      documentPath: documentPath || '',
+      target: link.target,
+      fragment: link.fragment,
+      wikilink: link.wikilink,
+    });
+    if (result && typeof result === 'object' && result.opened === false && typeof result.message === 'string' && result.message) {
+      onNotice?.(result.message);
+    }
+  })().catch(error => {
+    const raw = error instanceof Error ? error.message : String(error ?? '');
+    const cleaned = raw.replace(/^Error:\s*/i, '').trim();
+    if (cleaned) onNotice?.(cleaned);
+  });
 }
-
-export async function prepareRelativeNoteOpen(): Promise<void> {
-  if (beforeRelativeNoteOpen) await beforeRelativeNoteOpen();
+export function navigateExternalLink(url: string, openBrowserFallback = false): boolean {
+  if (typeof window !== 'undefined' && window.SuperMD) {
+    void invoke('open_external_url', { url }).catch(() => {});
+    return true;
+  }
+  if (openBrowserFallback && typeof window !== 'undefined') {
+    window.open(url, '_blank', 'noopener,noreferrer');
+    return true;
+  }
+  return false;
 }
-
-export function isLocalHref(href: string | undefined | null): boolean {
-  if (!href) return true;
-  const trimmed = href.trim();
-  if (!trimmed || trimmed.startsWith("#")) return true;
-  if (trimmed.startsWith("//") || EXTERNAL_OR_SCHEME_HREF.test(trimmed)) return false;
-  return true;
-}
-
-export function parseRelativeNoteLink(href: string | undefined | null): RelativeNoteLink | null {
-  if (!href) return null;
-  const trimmed = href.trim();
-  if (!trimmed || trimmed.startsWith("#") || trimmed.startsWith("//") || EXTERNAL_OR_SCHEME_HREF.test(trimmed)) return null;
-  const hashIndex = trimmed.indexOf("#");
-  const beforeHash = hashIndex >= 0 ? trimmed.slice(0, hashIndex) : trimmed;
-  const queryIndex = beforeHash.indexOf("?");
-  const target = (queryIndex >= 0 ? beforeHash.slice(0, queryIndex) : beforeHash).trim();
-  if (!target || !RELATIVE_NOTE_EXTENSION.test(target)) return null;
-  const rawHeading = hashIndex >= 0 ? trimmed.slice(hashIndex + 1).trim() : "";
-  if (!rawHeading) return { target };
-  let heading = rawHeading;
-  try { heading = decodeURIComponent(rawHeading); } catch { /* literal fragment */ }
-  return heading ? { target, heading } : { target };
+export function resolveHeadingOffset(markdown: string, rawTarget: string): number | null {
+  const { trimmed, slug, numberedSlug, lower } = parseHeadingTarget(rawTarget);
+  if (!trimmed) return null;
+  const outline = documentOutline(markdown);
+  const match = outline.find(entry => entry.id === trimmed)
+    || outline.find(entry => entry.id === slug)
+    || (numberedSlug ? outline.find(entry => entry.id === numberedSlug) : undefined)
+    || outline.find(entry => entry.title.trim().toLowerCase() === lower);
+  return match ? match.offset : null;
 }
 
 export function navigateHeading(link: HTMLAnchorElement): boolean {
   const href = link.getAttribute("href"); if (!href?.startsWith("#")) return false;
-  let target = href.slice(1); try { target = decodeURIComponent(target); } catch { /* literal fragment */ }
   const root = link.closest(".reading-scroll,.live-pane,.android-reading") || link.closest(".markdown-body")?.parentElement;
-  if (!root) return false;
-  return navigateToHeading(root,target);
+  return root ? navigateToHeading(root, href) : false;
 }
-export function navigateToHeading(root:Element,target:string):boolean {
+export function navigateToHeading(root:Element,rawTarget:string):boolean {
+  const { target, trimmed, slug, numberedSlug, lower } = parseHeadingTarget(rawTarget);
   const headings = Array.from(root.querySelectorAll<HTMLElement>("[data-heading-key]"));
   const counts = new Map<string, number>();
   if(!root.querySelector('[data-windowed-block]'))for (const heading of headings) { const key = heading.dataset.headingKey!, count = counts.get(key) || 0; counts.set(key, count + 1); heading.id = key + (count ? `-${count}` : ""); }
-  const heading = headings.find(node => node.id === target) || Array.from(root.querySelectorAll<HTMLElement>('[id]')).find(node=>node.id===target) || headings.find(node => node.id === headingSlug(target));
+  const byId = Array.from(root.querySelectorAll<HTMLElement>('[id]'));
+  const heading = headings.find(node => node.id === target || node.id === trimmed)
+    || byId.find(node => node.id === target || node.id === trimmed)
+    || headings.find(node => node.id === slug)
+    || byId.find(node => node.id === slug)
+    || (numberedSlug ? headings.find(node => node.id === numberedSlug) || byId.find(node => node.id === numberedSlug) : undefined)
+    || headings.find(node => (node.textContent || '').trim().toLowerCase() === lower);
   if (!heading) return true; // Broken local links must not escape into a browser.
   cancelHeadingNavigation(root);
   let observer:ResizeObserver|undefined,timer=0,frame=0;

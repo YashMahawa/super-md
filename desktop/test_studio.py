@@ -1091,12 +1091,14 @@ class StudioTest(unittest.TestCase):
         loads.clear()
         replies.clear()
 
-        studio.post("rel-1", "open_relative_note", json.dumps({
+        studio.post("rel-1", "open_workspace_link", json.dumps({
             "documentPath": str(index_note.resolve()),
-            "target": "Task%20Note.md",
+            "target": "Task Note",
+            "wikilink": True,
         }))
         self._wait_for(lambda: any(r[0] == "rel-1" for r in replies))
-        self.assertEqual(replies[-1], ("rel-1", "true", ""))
+        self.assertEqual(replies[-1][2], "")
+        self.assertTrue(json.loads(replies[-1][1])["opened"])
         self.assertEqual(studio._current()["path"], str(task_note.resolve()))
         self.assertNotIn("pendingHeading", loads[-1])
 
@@ -1110,15 +1112,20 @@ class StudioTest(unittest.TestCase):
         except OSError as error:
             if getattr(error, "winerror", None) != 1314:
                 raise
-        studio.post("rel-2", "open_relative_note", json.dumps({
+        studio.post("rel-2", "open_workspace_link", json.dumps({
             "documentPath": noncanonical_task_ref,
             "target": "Lecture%202.md",
-            "heading": "bayes",
+            "fragment": "bayes",
+            "wikilink": False,
         }))
         self._wait_for(lambda: any(r[0] == "rel-2" for r in replies))
-        self.assertEqual(replies[-1], ("rel-2", "true", ""))
+        self.assertEqual(replies[-1][2], "")
+        self.assertTrue(json.loads(replies[-1][1])["opened"])
         self.assertEqual(studio._current()["path"], str(lecture_note.resolve()))
-        self.assertEqual(loads[-1].get("pendingHeading"), "bayes")
+        pending = loads[-1].get("pendingHeading")
+        self.assertIsInstance(pending, dict)
+        self.assertEqual(pending["heading"], "bayes")
+        self.assertTrue(bool(pending.get("token")))
 
         # Subsequent emits must not re-send the one-shot pendingHeading.
         loads.clear()
@@ -1132,20 +1139,21 @@ class StudioTest(unittest.TestCase):
             "target": "sub/study.smd",
         }))
         self._wait_for(lambda: any(r[0] == "rel-3" for r in replies))
-        self.assertEqual(replies[-1], ("rel-3", "true", ""))
+        self.assertTrue(json.loads(replies[-1][1])["opened"])
         self.assertEqual(studio._current()["path"], str(deck_note.resolve()))
 
         loads.clear()
         replies.clear()
-        studio.post("rel-4", "open_relative_note", json.dumps({
+        studio.post("rel-4", "open_workspace_link", json.dumps({
             "documentPath": str(deck_note.resolve()),
             "target": "../Lecture%202.md",
-            "heading": "bayes",
+            "fragment": "bayes",
+            "wikilink": False,
         }))
         self._wait_for(lambda: any(r[0] == "rel-4" for r in replies))
-        self.assertEqual(replies[-1], ("rel-4", "true", ""))
+        self.assertTrue(json.loads(replies[-1][1])["opened"])
         self.assertEqual(studio._current()["path"], str(lecture_note.resolve()))
-        self.assertEqual(loads[-1].get("pendingHeading"), "bayes")
+        self.assertEqual(loads[-1].get("pendingHeading", {}).get("heading"), "bayes")
 
     def test_open_relative_note_rejects_unsaved_notes_traversal_encoded_separators_null_bytes_and_symlinks(self):
         studio = self.studio
@@ -1156,12 +1164,15 @@ class StudioTest(unittest.TestCase):
         # Unsaved note surfaces a status notice.
         studio.newNote()
         unsaved_id = studio.active
-        studio.post("unsaved", "open_relative_note", json.dumps({
+        studio.post("unsaved", "open_workspace_link", json.dumps({
             "documentPath": unsaved_id,
             "target": "Task%20Note.md",
+            "wikilink": False,
         }))
-        self.assertEqual(replies[-1][0], "unsaved")
-        self.assertIn("Save this note", replies[-1][2])
+        self._wait_for(lambda: any(r[0] == "unsaved" for r in replies))
+        payload = json.loads(replies[-1][1])
+        self.assertFalse(payload["opened"])
+        self.assertIn("Save this note", payload["message"])
         self.assertEqual(studio.message, "Save this note before opening linked notes.")
 
         sandbox = studio.data / "containment"
@@ -1199,29 +1210,34 @@ class StudioTest(unittest.TestCase):
             replies.clear()
             studio.message = ""
             req = f"bad-{index}"
-            studio.post(req, "open_relative_note", json.dumps({
+            studio.post(req, "open_workspace_link", json.dumps({
                 "documentPath": str(inside.resolve()),
                 "target": bad_target,
+                "wikilink": False,
             }))
-            self.assertEqual(replies[-1][0], req)
-            self.assertEqual(replies[-1][1], "null")
-            self.assertTrue(bool(replies[-1][2]), f"Expected rejection for {bad_target}")
+            self._wait_for(lambda: any(r[0] == req for r in replies))
+            self.assertEqual(replies[-1][2], "")
+            rejected = json.loads(replies[-1][1])
+            self.assertFalse(rejected["opened"], f"Expected rejection for {bad_target}")
+            self.assertTrue(bool(rejected.get("message")), f"Expected message for {bad_target}")
             if bad_target.startswith("../"):
-                self.assertIn("outside the authorized folder", replies[-1][2])
-            self.assertEqual(studio.message, replies[-1][2])
+                self.assertIn("outside the authorized folder", rejected["message"])
+            self.assertEqual(studio.message, rejected["message"])
             self.assertEqual(studio._current()["path"], str(inside.resolve()))
 
         if not has_symlink:
             replies.clear()
             studio.message = ""
             with patch.object(Path, "is_symlink", autospec=True, side_effect=lambda p: p.name == "MockLink.md"):
-                studio.post("bad-mock-link", "open_relative_note", json.dumps({
+                studio.post("bad-mock-link", "open_workspace_link", json.dumps({
                     "documentPath": str(inside.resolve()),
                     "target": "MockLink.md",
+                    "wikilink": False,
                 }))
-            self.assertEqual(replies[-1][0], "bad-mock-link")
-            self.assertEqual(replies[-1][1], "null")
-            self.assertIn("symlink", replies[-1][2])
+                self._wait_for(lambda: any(r[0] == "bad-mock-link" for r in replies))
+            rejected = json.loads(replies[-1][1])
+            self.assertFalse(rejected["opened"])
+            self.assertIn("symlink", rejected["message"])
 
         self.assertTrue(studio.note_watcher.files() or studio.note_watcher.directories())
         studio.stop()

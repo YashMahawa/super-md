@@ -11,7 +11,8 @@ import InlineDiagram,{parseDiagramSource} from "./InlineDiagram";
 import {parseBinaryTreeSource} from "./BinaryTree";
 import PythonCell from "./PythonCell";
 import SvgDiagram from "./SvgDiagram";
-import { isLocalHref, navigateHeading, parseRelativeNoteLink, prepareRelativeNoteOpen, remarkHeadingIds, UNSAVED_RELATIVE_NOTE_NOTICE } from "../documentNavigation";
+import { navigateExternalLink, navigateHeading, navigateWorkspaceLink, remarkHeadingIds, UNSAVED_RELATIVE_NOTE_NOTICE } from "../documentNavigation";
+import { classifyRenderedLink } from "../workspaceLinks";
 import { selectedMarkdown, setSelectedMarkdownDrag } from "../copySource";
 import CopyCode from "./CopyCode";
 import CodeBlockBoundary from "./CodeBlockBoundary";
@@ -276,39 +277,48 @@ const MarkdownImage: Components['img'] = ({ src, alt }) => {
 
 const MarkdownLink: Components['a'] = ({ node: _node, href, children, ...props }) => {
   const { liveStateRef } = useContext(MarkdownPreviewContext);
+  const rawProps = props as Record<string, unknown>;
+  const wikilinkTarget = typeof rawProps['data-wikilink'] === 'string' ? rawProps['data-wikilink'] : undefined;
+  const wikilinkFragment = typeof rawProps['data-heading-fragment'] === 'string' ? rawProps['data-heading-fragment'] : undefined;
+  const classified = classifyRenderedLink(href, wikilinkTarget, wikilinkFragment);
+  const isExternal = classified.kind === 'external';
   return (
     <a
       {...props}
       href={href}
-      target={isLocalHref(href) ? undefined : "_blank"}
-      rel="noreferrer"
+      target={isExternal ? "_blank" : undefined}
+      rel={isExternal ? "noreferrer" : undefined}
       onClick={event => {
-        if (navigateHeading(event.currentTarget)) {
-          event.preventDefault();
-          event.stopPropagation();
+        if (classified.kind === 'same-note') {
+          if (navigateHeading(event.currentTarget)) {
+            event.preventDefault();
+            event.stopPropagation();
+          }
           return;
         }
-        const relativeNote = parseRelativeNoteLink(href);
-        if (relativeNote) {
+        if (classified.kind === 'workspace') {
           event.preventDefault();
           event.stopPropagation();
+          event.currentTarget.dataset.visited = 'true';
           const { resolvedNotePath, reportLinkNotice, clearLinkNotice } = liveStateRef.current;
-          if (!resolvedNotePath) {
+          if (!resolvedNotePath && (typeof window === 'undefined' || !window.SuperMD)) {
             reportLinkNotice(UNSAVED_RELATIVE_NOTE_NOTICE);
             return;
           }
           clearLinkNotice();
-          void (async () => {
-            try {
-              await prepareRelativeNoteOpen();
-              await invoke("open_relative_note", { documentPath: resolvedNotePath, target: relativeNote.target, ...(relativeNote.heading ? { heading: relativeNote.heading } : {}) });
-            } catch (error) {
-              liveStateRef.current.reportLinkNotice(error instanceof Error ? error.message : String(error));
-            }
-          })();
+          navigateWorkspaceLink(classified, resolvedNotePath, liveStateRef.current.reportLinkNotice);
           return;
         }
-        event.currentTarget.dataset.visited = 'true';
+        if (classified.kind === 'external') {
+          event.currentTarget.dataset.visited = 'true';
+          if (navigateExternalLink(classified.url)) {
+            event.preventDefault();
+            event.stopPropagation();
+          }
+          return;
+        }
+        event.preventDefault();
+        event.stopPropagation();
       }}
     >
       {children}
