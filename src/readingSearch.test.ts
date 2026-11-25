@@ -5,7 +5,7 @@ import {createRoot,type Root} from "react-dom/client";
 import {getSearchQuery} from "@codemirror/search";
 import {EditorView} from "@codemirror/view";
 import {afterEach,beforeEach,describe,expect,it,vi} from "vitest";
-import ReadingSearch,{nextSearchIndex,readingMatches,replaceSourceMatches,resolveSourceHighlightRange,sourceMatches} from "./components/ReadingSearch";
+import ReadingSearch,{nextSearchIndex,readingMatches,replaceSourceMatches,resolveSourceBlock,resolveSourceHighlightRange,sourceMatches} from "./components/ReadingSearch";
 import Editor,{editorFindQuery} from "./components/Editor";
 import LiveEditor from "./components/LiveEditor";
 import MarkdownPreview from "./components/MarkdownPreview";
@@ -340,7 +340,22 @@ describe("source search",()=>{
     document.body.append(host);
     const ranges=sourceMatches(raw,"target");
     expect(ranges).toHaveLength(1);
+    expect(resolveSourceBlock(host,ranges[0])?.tagName).toBe("PRE");
     expect(resolveSourceHighlightRange(host,raw,ranges,0,"target")?.toString()).toBe("target");
+
+    // Fallback fence bounds when .code-container has no data-source-start/end attributes and <details> lacks data-source-start.
+    host.innerHTML=`<div class="code-container"><details class="code-disclosure"><summary>ts</summary><pre data-source-start="6" data-source-end="${raw.length-4}"><code>const item = list[0](target);\n</code></pre></details></div>`;
+    expect(resolveSourceHighlightRange(host,raw,ranges,0,"target")?.toString()).toBe("target");
+
+    // Inline HTML tags (#86 <mark>/<sub>/<sup>/<kbd>) are treated as hidden syntax spans so visible ordinals stay aligned.
+    const studyRaw="<mark>mark</mark> and ==mark==.";
+    host.innerHTML=`<p data-source-start="0" data-source-end="${studyRaw.length}"><mark>mark</mark> and <mark class="md-highlight">mark</mark>.</p>`;
+    const studyRanges=sourceMatches(studyRaw,"mark");
+    expect(studyRanges).toHaveLength(4);
+    expect(resolveSourceHighlightRange(host,studyRaw,studyRanges,0,"mark")).toBeNull();
+    expect(resolveSourceHighlightRange(host,studyRaw,studyRanges,1,"mark")?.startContainer.parentElement?.tagName).toBe("MARK");
+    expect(resolveSourceHighlightRange(host,studyRaw,studyRanges,2,"mark")).toBeNull();
+    expect(resolveSourceHighlightRange(host,studyRaw,studyRanges,3,"mark")?.startContainer.parentElement?.classList.contains("md-highlight")).toBe(true);
     host.remove();
 
     hostContainer=document.createElement("div");
