@@ -148,12 +148,25 @@ function revealMountedBlock(element:HTMLElement):void {
   if(element.closest('[data-windowed-mounted="false"]'))flushSync(()=>revealWindowed(element));
   else revealWindowed(element);
 }
-export default function ReadingSearch({content,close,onChange,sourceSession}:{content:string;close:()=>void;onChange?:(content:string)=>void;sourceSession?:string}) {
-  const [query,setQuery]=useState(()=>window.getSelection()?.toString().slice(0,200)||"");
+export interface ReadingSearchSeed {
+  query: string;
+  caseSensitive?: boolean;
+  nonce: number;
+}
+export default function ReadingSearch({content,close,onChange,sourceSession,seed}:{content:string;close:()=>void;onChange?:(content:string)=>void;sourceSession?:string;seed?:ReadingSearchSeed|null}) {
+  const [query,setQuery]=useState(()=>seed?seed.query.slice(0,200):window.getSelection()?.toString().slice(0,200)||"");
   const [matches,setMatches]=useState<Range[]>([]),[index,setIndex]=useState(-1);
-  const [caseSensitive,setCaseSensitive]=useState(false),[replacing,setReplacing]=useState(false),[replacement,setReplacement]=useState("");
+  const [caseSensitive,setCaseSensitive]=useState(()=>Boolean(seed?.caseSensitive)),[replacing,setReplacing]=useState(false),[replacement,setReplacement]=useState("");
   const [sourceRanges,setSourceRanges]=useState<SourceRange[]>([]);
   const [windowed,setWindowed]=useState<WindowedMatch[]|null>(null);
+  const [appliedNonce,setAppliedNonce]=useState<number|null>(seed?seed.nonce:null);
+  const pendingAutoSelect=useRef(Boolean(seed&&seed.query));
+  if(seed&&appliedNonce!==seed.nonce){
+    setAppliedNonce(seed.nonce);
+    pendingAutoSelect.current=Boolean(seed.query);
+    setQuery(seed.query.slice(0,200));
+    if(seed.caseSensitive!==undefined)setCaseSensitive(Boolean(seed.caseSensitive));
+  }
   const canReplace=Boolean(onChange);
   const activeReplacing=canReplace&&replacing;
   const sourceSearch=!!sourceSession||activeReplacing;
@@ -189,7 +202,52 @@ export default function ReadingSearch({content,close,onChange,sourceSession}:{co
     const scroller=host?.closest<HTMLElement>('.android-reading')??(host?.matches('.android-reading')?host as HTMLElement:null);
     if(scroller)refreshDocumentExtent(scroller);
     const target=range?.startContainer.parentElement??fallback;
-    target?.scrollIntoView({block:"center",behavior:"instant"});
+    target?.scrollIntoView?.({block:"center",behavior:"instant"});
+  };
+  const selectSourceRange=(next:number,ranges:SourceRange[],host:HTMLElement|null)=>{
+    const range=ranges[next];if(!range)return;
+    if(sourceSession){editorFindRange(sourceSession,range.from,range.to);setIndex(next);return;}
+    const block=host?findContainingBlock(host,range.from,range.to):null;
+    if(block)revealMountedBlock(block);
+    let domRange=block?mapSourceRangeToDomRange(block,range,ranges,content,query,caseSensitive):null;
+    const opened=openDisclosuresFor(domRange?.startContainer.parentElement??block,block,range);
+    if(opened&&block)domRange=mapSourceRangeToDomRange(block,range,ranges,content,query,caseSensitive);
+    const frontmatterHeader=!block?host?.querySelector<HTMLElement>("[data-frontmatter-properties],.document-properties")??null:null;
+    const fallback=(block?deepestSourceOwner(block,range.from,range.to):frontmatterHeader)??block;
+    scrollTargetIntoView(host,domRange,fallback);
+    syncHighlights(host,domRange);
+    setIndex(next);
+    requestAnimationFrame(()=>{
+      const liveHost=findReadingHost();
+      const liveBlock=liveHost?findContainingBlock(liveHost,range.from,range.to):null;
+      const liveRange=liveBlock?mapSourceRangeToDomRange(liveBlock,range,ranges,content,query,caseSensitive):null;
+      const liveFallback=liveBlock??liveHost?.querySelector<HTMLElement>("[data-frontmatter-properties],.document-properties")??null;
+      scrollTargetIntoView(liveHost,liveRange,liveFallback);
+      syncHighlights(liveHost,liveRange);
+    });
+  };
+  const selectWindowedMatch=(next:number,win:WindowedMatch[],host:HTMLElement|null)=>{
+    const match=win[next];if(!match)return;
+    revealMountedBlock(match.element);
+    let range=readingMatches(match.element,query,caseSensitive)[match.ordinal]??null;
+    if(openDisclosuresFor(range?.startContainer.parentElement??match.element,match.element))range=readingMatches(match.element,query,caseSensitive)[match.ordinal]??null;
+    scrollTargetIntoView(host,range,match.element);
+    syncHighlights(host,range);
+    setIndex(next);
+    requestAnimationFrame(()=>requestAnimationFrame(()=>{
+      const liveHost=findReadingHost();
+      const liveRange=readingMatches(match.element,query,caseSensitive)[match.ordinal]??null;
+      openDisclosuresFor(liveRange?.startContainer.parentElement??match.element,match.element);
+      scrollTargetIntoView(liveHost,liveRange,match.element);
+      syncHighlights(liveHost,liveRange);
+    }));
+  };
+  const selectDomMatch=(next:number,list:Range[],host:HTMLElement|null)=>{
+    const range=list[next];if(!range)return;
+    openDisclosuresFor(range.startContainer.parentElement);
+    scrollTargetIntoView(host,range,range.startContainer.parentElement);
+    syncHighlights(host,range);
+    setIndex(next);
   };
   const toggleReplacing=()=>{
     const nextReplacing=!activeReplacing;
@@ -232,53 +290,16 @@ export default function ReadingSearch({content,close,onChange,sourceSession}:{co
     const host=findReadingHost();
     if(sourceSearch){
       if(!sourceRanges.length)return;
-      const next=nextSearchIndex(index,direction,sourceRanges.length);
-      const range=sourceRanges[next];
-      if(sourceSession){editorFindRange(sourceSession,range.from,range.to);setIndex(next);return;}
-      const block=host?findContainingBlock(host,range.from,range.to):null;
-      if(block)revealMountedBlock(block);
-      let domRange=block?mapSourceRangeToDomRange(block,range,sourceRanges,content,query,caseSensitive):null;
-      const opened=openDisclosuresFor(domRange?.startContainer.parentElement??block,block,range);
-      if(opened&&block)domRange=mapSourceRangeToDomRange(block,range,sourceRanges,content,query,caseSensitive);
-      const frontmatterHeader=!block?host?.querySelector<HTMLElement>("[data-frontmatter-properties],.document-properties")??null:null;
-      const fallback=(block?deepestSourceOwner(block,range.from,range.to):frontmatterHeader)??block;
-      scrollTargetIntoView(host,domRange,fallback);
-      syncHighlights(host,domRange);
-      setIndex(next);
-      requestAnimationFrame(()=>{
-        const liveHost=findReadingHost();
-        const liveBlock=liveHost?findContainingBlock(liveHost,range.from,range.to):null;
-        const liveRange=liveBlock?mapSourceRangeToDomRange(liveBlock,range,sourceRanges,content,query,caseSensitive):null;
-        const liveFallback=liveBlock??liveHost?.querySelector<HTMLElement>("[data-frontmatter-properties],.document-properties")??null;
-        scrollTargetIntoView(liveHost,liveRange,liveFallback);
-        syncHighlights(liveHost,liveRange);
-      });
+      selectSourceRange(nextSearchIndex(index,direction,sourceRanges.length),sourceRanges,host);
       return;
     }
     if(windowed){
       if(!windowed.length)return;
-      const next=nextSearchIndex(index,direction,windowed.length),match=windowed[next];
-      revealMountedBlock(match.element);
-      let range=readingMatches(match.element,query,caseSensitive)[match.ordinal]??null;
-      if(openDisclosuresFor(range?.startContainer.parentElement??match.element,match.element))range=readingMatches(match.element,query,caseSensitive)[match.ordinal]??null;
-      scrollTargetIntoView(host,range,match.element);
-      syncHighlights(host,range);
-      setIndex(next);
-      requestAnimationFrame(()=>requestAnimationFrame(()=>{
-        const liveHost=findReadingHost();
-        const liveRange=readingMatches(match.element,query,caseSensitive)[match.ordinal]??null;
-        openDisclosuresFor(liveRange?.startContainer.parentElement??match.element,match.element);
-        scrollTargetIntoView(liveHost,liveRange,match.element);
-        syncHighlights(liveHost,liveRange);
-      }));
+      selectWindowedMatch(nextSearchIndex(index,direction,windowed.length),windowed,host);
       return;
     }
     if(!matches.length)return;
-    const next=nextSearchIndex(index,direction,matches.length), range=matches[next];
-    openDisclosuresFor(range.startContainer.parentElement);
-    scrollTargetIntoView(host,range,range.startContainer.parentElement);
-    syncHighlights(host,range);
-    setIndex(next);
+    selectDomMatch(nextSearchIndex(index,direction,matches.length),matches,host);
   };
   useEffect(()=>{
     cancelSettlingHeading();
@@ -305,13 +326,22 @@ export default function ReadingSearch({content,close,onChange,sourceSession}:{co
     return()=>{setReaderOverlay("search",false);document.removeEventListener("keydown",key,true);window.removeEventListener("supermd-find-focus",focus);};
   },[]);
   useEffect(()=>{
-    setSourceRanges(sourceMatches(content,query,caseSensitive));
+    const sources=sourceMatches(content,query,caseSensitive);
+    setSourceRanges(sources);
     if(sourceSession)editorFindQuery(sourceSession,query,caseSensitive);
+    const autoSelect=pendingAutoSelect.current;
+    pendingAutoSelect.current=false;
     const frame=requestAnimationFrame(()=>{
       const host=findReadingHost();
-      setWindowed(host?windowedMatches(host,query,caseSensitive):null);
+      const win=host?windowedMatches(host,query,caseSensitive):null;
+      setWindowed(win);
       const result=host?readingMatches(host,query,caseSensitive):[];
       setMatches(result);
+      if(autoSelect){
+        if(sourceSearch&&sources.length){selectSourceRange(0,sources,host);return;}
+        if(win&&win.length){selectWindowedMatch(0,win,host);return;}
+        if(result.length){selectDomMatch(0,result,host);return;}
+      }
       setIndex(-1);
       if(registry&&HighlightClass){
         registry.set("smd-search",new HighlightClass(...result));
@@ -319,7 +349,7 @@ export default function ReadingSearch({content,close,onChange,sourceSession}:{co
       }
     });
     return()=>{cancelAnimationFrame(frame);registry?.delete("smd-search");registry?.delete("smd-search-current");if(sourceSession)editorFindQuery(sourceSession,"",false);};
-  },[query,content,caseSensitive,sourceSession]);
+  },[query,content,caseSensitive,sourceSession,seed?.nonce]);
   useEffect(()=>{
     if(!registry||!HighlightClass)return;
     const host=findReadingHost();

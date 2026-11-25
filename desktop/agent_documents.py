@@ -637,9 +637,14 @@ def _word_character(value: str) -> bool:
     return value == "_" or (bool(value) and unicodedata.category(value)[0] in ("L", "N"))
 
 
-def diagram_spans(text: str) -> list[dict]:
+_INLINE_SVG_OPEN = re.compile(r"<svg\b[^>]*>", re.IGNORECASE)
+_INLINE_SVG_CLOSE = re.compile(r"</svg\s*>", re.IGNORECASE)
+
+
+def diagram_spans(text: str, *, include_inline_svg: bool = False) -> list[dict]:
     """Return diagram body ranges as code-point `{start, end}` offsets; end is exclusive."""
     spans = list(_svg_spans(text))
+    fenced_blocks: list[tuple[int, int]] = []
     offset = 0
     opened = None
     for line in text.splitlines(keepends=True):
@@ -650,14 +655,44 @@ def diagram_spans(text: str) -> list[dict]:
             if opened is None:
                 info = body[match.end():].strip().split(None, 1)
                 language = info[0].casefold() if info else ""
-                if language in ("svg", "svg+xml", "image/svg+xml", "mermaid", "smd-chart"):
-                    opened = {"char": marker[0], "size": len(marker), "start": offset + len(line)}
+                opened = {
+                    "char": marker[0],
+                    "size": len(marker),
+                    "fence_start": offset,
+                    "body_start": offset + len(line),
+                    "diagram": language in ("svg", "svg+xml", "image/svg+xml", "mermaid", "smd-chart"),
+                }
             elif marker[0] == opened["char"] and len(marker) >= opened["size"]:
-                spans.append({"start": opened["start"], "end": offset})
+                fenced_blocks.append((opened["fence_start"], offset + len(line)))
+                if opened["diagram"]:
+                    spans.append({"start": opened["body_start"], "end": offset})
                 opened = None
         offset += len(line)
     if opened is not None:
-        spans.append({"start": opened["start"], "end": len(text)})
+        fenced_blocks.append((opened["fence_start"], len(text)))
+        if opened["diagram"]:
+            spans.append({"start": opened["body_start"], "end": len(text)})
+    if include_inline_svg and ("<svg" in text or "<SVG" in text or "<svg" in text.lower()):
+        cursor = 0
+        fence_idx = 0
+        while True:
+            open_match = _INLINE_SVG_OPEN.search(text, cursor)
+            if open_match is None:
+                break
+            start = open_match.start()
+            while fence_idx < len(fenced_blocks) and fenced_blocks[fence_idx][1] <= start:
+                fence_idx += 1
+            if fence_idx < len(fenced_blocks) and fenced_blocks[fence_idx][0] <= start < fenced_blocks[fence_idx][1]:
+                cursor = fenced_blocks[fence_idx][1]
+                continue
+            if open_match.group(0).rstrip().endswith("/>"):
+                spans.append({"start": start, "end": open_match.end()})
+                cursor = open_match.end()
+                continue
+            close_match = _INLINE_SVG_CLOSE.search(text, open_match.end())
+            end = close_match.end() if close_match is not None else len(text)
+            spans.append({"start": start, "end": end})
+            cursor = end
     unique = {(item["start"], item["end"]) for item in spans}
     return [{"start": start, "end": end} for start, end in sorted(unique)]
 
