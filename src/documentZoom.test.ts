@@ -67,3 +67,41 @@ it('legacy zoom geometry keeps transformed visual and native hit-test coordinate
   expect(page.style.zoom).toBe('1');expect(page.style.transform).toBe('translateX(250px) scale(1.75)');expect(page.dataset.selectionModel).toBe('transform');expect(root.scrollTop).toBe(500);
   refreshDocumentExtent(root);expect(page.dataset.selectionScale).toBe('1.75');expect(root.scrollTop).toBe(500);
 });
+it('settling to layout zoom refreshes document extent and keeps the visible text anchor steady across line-wrap reflow',()=>{
+  const root=document.createElement('section'),space=document.createElement('div'),page=document.createElement('div'),paragraph=document.createElement('p');
+  page.className='document-page';paragraph.textContent='Anchored source text';root.append(space);space.append(page);page.append(paragraph);document.body.append(root);
+  const originalCaretPosition=Object.getOwnPropertyDescriptor(document,'caretPositionFromPoint');
+  try {
+    let pageHeight=121464,anchorTop=220;
+    page.getBoundingClientRect=()=>({left:0,top:0} as DOMRect);root.getBoundingClientRect=()=>({left:0,top:0,width:412,height:850} as DOMRect);
+    Object.defineProperty(root,'clientWidth',{value:412});Object.defineProperty(page,'offsetHeight',{get:()=>pageHeight});
+    Object.defineProperty(page,'currentCSSZoom',{get:()=>Number(page.style.zoom)||1});
+    const text=paragraph.firstChild!;
+    Object.defineProperty(Range.prototype,'getBoundingClientRect',{configurable:true,value:function(this:Range){return {top:this.startContainer===text?anchorTop:0,height:this.startContainer===text?32:0,left:24};}});
+    Object.defineProperty(document,'caretPositionFromPoint',{configurable:true,value:()=>({offsetNode:text,offset:0,getClientRect:()=>null})});
+    applyDocumentZoom(root,180,90);
+    root.scrollTop=1420;
+    let mockZoom='';
+    Object.defineProperty(page.style,'zoom',{
+      configurable:true,
+      get:()=>mockZoom,
+      set:(value:string)=>{
+        mockZoom=value;
+        if(value==='1.8'){pageHeight=121433;anchorTop=164.32;}
+      },
+    });
+    settleDocumentZoom(root);
+    expect(page.style.zoom).toBe('1.8');
+    expect(space.style.height).toBe(`${121433*1.8}px`);
+    expect(root.scrollTop).toBeCloseTo(1420-55.68,2);
+    // Settling again when CSS zoom is already at target scale is a layout no-op.
+    anchorTop=300;
+    settleDocumentZoom(root);
+    expect(root.scrollTop).toBeCloseTo(1420-55.68,2);
+  } finally {
+    root.remove();
+    vi.restoreAllMocks();
+    if(originalCaretPosition)Object.defineProperty(document,'caretPositionFromPoint',originalCaretPosition);else Reflect.deleteProperty(document,'caretPositionFromPoint');
+    Reflect.deleteProperty(Range.prototype,'getBoundingClientRect');
+  }
+});

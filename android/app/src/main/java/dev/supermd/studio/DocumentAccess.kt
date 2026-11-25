@@ -37,20 +37,50 @@ internal fun sameDocument(left: Uri, right: Uri): Boolean {
     return first == runCatching { DocumentsContract.getDocumentId(right) }.getOrNull()
 }
 
-internal fun isDocumentContainedInTree(rootDocumentId: String, documentId: String): Boolean {
-    if (rootDocumentId.isEmpty() || documentId.isEmpty()) return false
-    if ('\\' in rootDocumentId || '\u0000' in rootDocumentId || '\\' in documentId || '\u0000' in documentId) return false
-    if (rootDocumentId.split('/').any { it == "." || it == ".." }) return false
-    if (documentId.split('/').any { it == "." || it == ".." }) return false
-    if (documentId == rootDocumentId) return true
-    if (rootDocumentId == "/") return documentId.startsWith("/")
-    val normalizedRoot = rootDocumentId.trimEnd('/')
-    if (normalizedRoot.isNotEmpty() && (documentId == normalizedRoot || documentId.startsWith("$normalizedRoot/"))) return true
-    if (rootDocumentId.endsWith(':') && documentId.startsWith(rootDocumentId)) {
-        val remainder = documentId.removePrefix(rootDocumentId)
-        return remainder.split('/').none { it == "." || it == ".." }
-    }
-    return false
+internal const val EXTERNAL_STORAGE_DOCUMENTS_AUTHORITY = "com.android.externalstorage.documents"
+
+internal data class ExternalStorageDocumentPath(val volume: String, val relativePath: String)
+
+internal fun isKnownPathDocumentProvider(authority: String?): Boolean =
+    authority == EXTERNAL_STORAGE_DOCUMENTS_AUTHORITY
+
+internal fun parseExternalStorageDocumentId(documentId: String): ExternalStorageDocumentPath? {
+    if (documentId.isEmpty() || '\\' in documentId || '\u0000' in documentId) return null
+    val colon = documentId.indexOf(':')
+    if (colon <= 0) return null
+    val volume = documentId.substring(0, colon)
+    if ('/' in volume || ':' in volume || volume == "." || volume == "..") return null
+    val rawPath = documentId.substring(colon + 1)
+    if (rawPath.isEmpty()) return ExternalStorageDocumentPath(volume, "")
+    if (rawPath.startsWith('/')) return null
+    val trimmed = rawPath.trimEnd('/')
+    if (trimmed.isEmpty()) return null
+    if (trimmed.split('/').any { it.isEmpty() || it == "." || it == ".." }) return null
+    return ExternalStorageDocumentPath(volume, trimmed)
+}
+
+internal fun isKnownPathContainedInTree(
+    authority: String?,
+    rootDocumentId: String,
+    documentId: String,
+): Boolean {
+    if (!isKnownPathDocumentProvider(authority)) return false
+    val root = parseExternalStorageDocumentId(rootDocumentId) ?: return false
+    val doc = parseExternalStorageDocumentId(documentId) ?: return false
+    if (root.volume != doc.volume) return false
+    if (root.relativePath.isEmpty()) return true
+    return doc.relativePath == root.relativePath || doc.relativePath.startsWith("${root.relativePath}/")
+}
+
+internal fun canonicalTreeDocumentKey(uri: Uri): String? {
+    if (uri.scheme != "content" || !DocumentsContract.isTreeUri(uri)) return null
+    val authority = uri.authority?.takeIf { it.isNotEmpty() } ?: return null
+    val treeRoot = runCatching { DocumentsContract.getTreeDocumentId(uri) }.getOrNull()?.takeIf { it.isNotEmpty() } ?: return null
+    val docId = runCatching { DocumentsContract.getDocumentId(uri) }.getOrNull()?.takeIf { it.isNotEmpty() } ?: return null
+    return DocumentsContract.buildDocumentUriUsingTree(
+        DocumentsContract.buildTreeDocumentUri(authority, treeRoot),
+        docId,
+    ).toString()
 }
 
 internal sealed interface SafReadAccess {
@@ -59,6 +89,14 @@ internal sealed interface SafReadAccess {
         val rootDocumentId: String,
         val documentId: String,
         val documentUri: Uri,
+    ) : SafReadAccess
+
+    data class PendingTreeMembership(
+        val treeUri: Uri,
+        val rootDocumentId: String,
+        val documentId: String,
+        val documentUri: Uri,
+        val directDocumentUri: Uri? = null,
     ) : SafReadAccess
 
     data class StandaloneDocument(val documentUri: Uri) : SafReadAccess
@@ -71,7 +109,17 @@ internal class DocumentAccess(private val context: Context) {
         context.checkUriPermission(candidate, Process.myPid(), Process.myUid(), modes) == PackageManager.PERMISSION_GRANTED
 
     fun hasWriteGrant(uri: Uri) = uri.scheme == "content" && granted(uri, Intent.FLAG_GRANT_WRITE_URI_PERMISSION)
-    fun hasReadGrant(uri: Uri, activeFolderUri: Uri? = null) = resolveReadAccess(uri, activeFolderUri) !is SafReadAccess.Denied
+
+    fun hasReadGrant(
+        uri: Uri,
+        activeFolderUri: Uri? = null,
+        isConfirmedTreeChild: ((treeUri: Uri, documentId: String) -> Boolean)? = null,
+    ): Boolean = when (val access = resolveReadAccess(uri, activeFolderUri, isConfirmedTreeChild)) {
+        is SafReadAccess.InGrantedTree,
+        is SafReadAccess.StandaloneDocument -> true
+        is SafReadAccess.PendingTreeMembership -> access.directDocumentUri != null
+        SafReadAccess.Denied -> false
+    }
 
     fun persist(uri: Uri) {
         if (uri.scheme == "content") persistDocumentGrants { context.contentResolver.takePersistableUriPermission(uri, it) }
@@ -83,12 +131,17 @@ internal class DocumentAccess(private val context: Context) {
         val read = Intent.FLAG_GRANT_READ_URI_PERMISSION
         val write = Intent.FLAG_GRANT_WRITE_URI_PERMISSION
         if (granted(uri, read or write)) return uri
+        val authority = uri.authority
         val id = runCatching { DocumentsContract.getDocumentId(uri) }.getOrNull() ?: return uri
-        val candidates = context.contentResolver.persistedUriPermissions.mapNotNull { grant ->
-            if (!DocumentsContract.isTreeUri(grant.uri) || grant.uri.authority != uri.authority || !grant.isReadPermission || writing && !grant.isWritePermission) return@mapNotNull null
-            val root = runCatching { DocumentsContract.getTreeDocumentId(grant.uri) }.getOrNull() ?: return@mapNotNull null
-            if (!isDocumentContainedInTree(root, id)) return@mapNotNull null
-            grant.uri to DocumentsContract.buildDocumentUriUsingTree(grant.uri, id)
+        val candidates = if (isKnownPathDocumentProvider(authority)) {
+            context.contentResolver.persistedUriPermissions.mapNotNull { grant ->
+                if (!DocumentsContract.isTreeUri(grant.uri) || grant.uri.authority != authority || !grant.isReadPermission || writing && !grant.isWritePermission) return@mapNotNull null
+                val root = runCatching { DocumentsContract.getTreeDocumentId(grant.uri) }.getOrNull() ?: return@mapNotNull null
+                if (!isKnownPathContainedInTree(authority, root, id)) return@mapNotNull null
+                grant.uri to DocumentsContract.buildDocumentUriUsingTree(grant.uri, id)
+            }
+        } else {
+            emptyList()
         }
         candidates.firstOrNull { (tree, doc) -> granted(doc, read or write) || granted(tree, read or write) }?.let { return it.second }
         if (!writing && granted(uri, read)) return uri
@@ -100,74 +153,99 @@ internal class DocumentAccess(private val context: Context) {
         if (folderUri.scheme != "content" || !DocumentsContract.isTreeUri(folderUri)) return null
         val authority = folderUri.authority?.takeIf { it.isNotEmpty() } ?: return null
         val rootId = runCatching { DocumentsContract.getTreeDocumentId(folderUri) }.getOrNull()?.takeIf { it.isNotEmpty() } ?: return null
-        if ('\\' in rootId || '\u0000' in rootId || rootId.split('/').any { it == "." || it == ".." }) return null
+        if ('\u0000' in rootId) return null
+        val knownPathProvider = isKnownPathDocumentProvider(authority)
+        if (knownPathProvider && parseExternalStorageDocumentId(rootId) == null) return null
         val read = Intent.FLAG_GRANT_READ_URI_PERMISSION
         val canonicalTree = DocumentsContract.buildTreeDocumentUri(authority, rootId)
         val rootDoc = DocumentsContract.buildDocumentUriUsingTree(canonicalTree, rootId)
         if (granted(folderUri, read) || granted(canonicalTree, read) || granted(rootDoc, read)) {
             return canonicalTree to rootId
         }
-        val resolved = resolve(rootDoc, writing = false)
-        if (DocumentsContract.isTreeUri(resolved) && resolved.authority == authority) {
-            val parentRoot = runCatching { DocumentsContract.getTreeDocumentId(resolved) }.getOrNull()
-            if (parentRoot != null && isDocumentContainedInTree(parentRoot, rootId)) {
-                val parentTree = DocumentsContract.buildTreeDocumentUri(authority, parentRoot)
-                if (granted(resolved, read) || granted(parentTree, read)) {
-                    return parentTree to rootId
+        if (knownPathProvider) {
+            val resolved = resolve(rootDoc, writing = false)
+            if (DocumentsContract.isTreeUri(resolved) && resolved.authority == authority) {
+                val parentRoot = runCatching { DocumentsContract.getTreeDocumentId(resolved) }.getOrNull()
+                if (parentRoot != null && isKnownPathContainedInTree(authority, parentRoot, rootId)) {
+                    val parentTree = DocumentsContract.buildTreeDocumentUri(authority, parentRoot)
+                    if (granted(resolved, read) || granted(parentTree, read)) {
+                        return parentTree to rootId
+                    }
                 }
             }
         }
         return null
     }
 
-    fun resolveReadAccess(uri: Uri, activeFolderUri: Uri? = null): SafReadAccess {
+    fun resolveReadAccess(
+        uri: Uri,
+        activeFolderUri: Uri? = null,
+        isConfirmedTreeChild: ((treeUri: Uri, documentId: String) -> Boolean)? = null,
+    ): SafReadAccess {
         if (uri.scheme != "content") return SafReadAccess.Denied
         val authority = uri.authority?.takeIf { it.isNotEmpty() } ?: return SafReadAccess.Denied
         val read = Intent.FLAG_GRANT_READ_URI_PERMISSION
+        val knownPathProvider = isKnownPathDocumentProvider(authority)
         val docId = runCatching { DocumentsContract.getDocumentId(uri) }.getOrNull()?.takeIf { it.isNotEmpty() }
             ?: return if (!DocumentsContract.isTreeUri(uri) && granted(uri, read)) SafReadAccess.StandaloneDocument(uri) else SafReadAccess.Denied
-        if ('\\' in docId || '\u0000' in docId || docId.split('/').any { it == "." || it == ".." }) {
+        if ('\u0000' in docId) return SafReadAccess.Denied
+        if (knownPathProvider && parseExternalStorageDocumentId(docId) == null) {
             return SafReadAccess.Denied
         }
 
         if (DocumentsContract.isTreeUri(uri)) {
             val treeRoot = runCatching { DocumentsContract.getTreeDocumentId(uri) }.getOrNull()?.takeIf { it.isNotEmpty() }
                 ?: return SafReadAccess.Denied
-            if ('\\' in treeRoot || '\u0000' in treeRoot || treeRoot.split('/').any { it == "." || it == ".." }) {
-                return SafReadAccess.Denied
-            }
-            val looksHierarchical = '/' in treeRoot || '/' in docId || treeRoot.endsWith(':')
-            if (looksHierarchical && !isDocumentContainedInTree(treeRoot, docId)) {
-                return SafReadAccess.Denied
-            }
-            if (!looksHierarchical && docId != treeRoot && docId.startsWith("$treeRoot-")) {
+            if ('\u0000' in treeRoot) return SafReadAccess.Denied
+            if (knownPathProvider && !isKnownPathContainedInTree(authority, treeRoot, docId)) {
                 return SafReadAccess.Denied
             }
             val canonicalTree = DocumentsContract.buildTreeDocumentUri(authority, treeRoot)
             val canonicalDoc = DocumentsContract.buildDocumentUriUsingTree(canonicalTree, docId)
+            val plainDoc = DocumentsContract.buildDocumentUri(authority, docId)
+            val directGrantDoc = plainDoc.takeIf { granted(it, read) }
             if (granted(uri, read) || granted(canonicalDoc, read) || granted(canonicalTree, read)) {
-                return SafReadAccess.InGrantedTree(canonicalTree, treeRoot, docId, canonicalDoc)
+                return if (knownPathProvider || docId == treeRoot || isConfirmedTreeChild?.invoke(canonicalTree, docId) == true) {
+                    SafReadAccess.InGrantedTree(canonicalTree, treeRoot, docId, canonicalDoc)
+                } else {
+                    SafReadAccess.PendingTreeMembership(canonicalTree, treeRoot, docId, canonicalDoc, directGrantDoc)
+                }
+            }
+            if (directGrantDoc != null) {
+                return SafReadAccess.StandaloneDocument(directGrantDoc)
             }
         }
 
         if (activeFolderUri != null && activeFolderUri.authority == authority) {
             val activeRoot = resolveReadableTreeRoot(activeFolderUri)
-            if (activeRoot != null && isDocumentContainedInTree(activeRoot.second, docId)) {
+            if (activeRoot != null) {
                 val (treeUri, rootId) = activeRoot
-                return SafReadAccess.InGrantedTree(
-                    treeUri = treeUri,
-                    rootDocumentId = rootId,
-                    documentId = docId,
-                    documentUri = DocumentsContract.buildDocumentUriUsingTree(treeUri, docId),
-                )
+                val confirmed = if (knownPathProvider) {
+                    isKnownPathContainedInTree(authority, rootId, docId)
+                } else {
+                    docId == rootId || isConfirmedTreeChild?.invoke(treeUri, docId) == true
+                }
+                if (confirmed) {
+                    return SafReadAccess.InGrantedTree(
+                        treeUri = treeUri,
+                        rootDocumentId = rootId,
+                        documentId = docId,
+                        documentUri = DocumentsContract.buildDocumentUriUsingTree(treeUri, docId),
+                    )
+                }
             }
         }
 
         for (grant in context.contentResolver.persistedUriPermissions) {
             if (!DocumentsContract.isTreeUri(grant.uri) || grant.uri.authority != authority || !grant.isReadPermission) continue
             val rootId = runCatching { DocumentsContract.getTreeDocumentId(grant.uri) }.getOrNull()?.takeIf { it.isNotEmpty() } ?: continue
-            if (!isDocumentContainedInTree(rootId, docId)) continue
             val canonicalTree = DocumentsContract.buildTreeDocumentUri(authority, rootId)
+            val confirmed = if (knownPathProvider) {
+                isKnownPathContainedInTree(authority, rootId, docId)
+            } else {
+                docId == rootId || isConfirmedTreeChild?.invoke(canonicalTree, docId) == true
+            }
+            if (!confirmed) continue
             val treeDoc = DocumentsContract.buildDocumentUriUsingTree(canonicalTree, docId)
             if (granted(treeDoc, read) || granted(canonicalTree, read) || granted(grant.uri, read)) {
                 return SafReadAccess.InGrantedTree(canonicalTree, rootId, docId, treeDoc)

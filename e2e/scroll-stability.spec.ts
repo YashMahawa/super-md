@@ -163,6 +163,7 @@ test('delayed image sizing does not move the visible source anchor during scroll
     },{platform,zoom,content:runContent});
     await page.evaluate(zoom=>window.supermdSetZoom?.(zoom),zoom);
     await expect(page.locator('.document-page')).toHaveAttribute('data-scale',String(zoom/100));
+    await page.evaluate(()=>document.fonts.ready);
     const anchor=page.locator('#visible-anchor');
     // The reader requires an explicit trust action for a new remote image host.
     await page.getByRole('button',{name:'Load image'}).click();
@@ -187,4 +188,42 @@ test('delayed image sizing does not move the visible source anchor during scroll
   for(const result of results){
     expect.soft(Math.abs(result.drift),`${result.platform} at ${result.zoom}% drifted ${result.drift}px`).toBeLessThan(3);
   }
+});
+
+test('settling Android magnified zoom to layout geometry preserves the visible source anchor',async({page})=>{
+  await page.setViewportSize({width:412,height:850});
+  await page.addInitScript(()=>{window.SuperMD={post:(id)=>queueMicrotask(()=>window.supermdReply?.(id,true,null))};});
+  const content=[
+    '# Scroll fixture',
+    `## Before the figure\n\n${'Readable lead-in text makes the following source anchor visible at high zoom. '.repeat(12)}`,
+    '## Visible anchor\n\nThis heading is the source location being tracked.',
+    ...Array.from({length:40},(_,i)=>`## Later ${i}\n\n${'Readable source after the delayed figure. '.repeat(14)}`),
+  ].join('\n\n');
+  await page.goto('/android-reader.html');
+  await page.waitForFunction(()=>!!window.supermdLoad);
+  await page.evaluate(content=>{
+    document.documentElement.dataset.host='android';
+    document.documentElement.dataset.platform='android';
+    window.supermdLoad?.({id:'scroll-android-settle-180',content,path:null,mode:'reader',dark:false,fullscreen:false,colors:{},font:'Manrope',size:18,zoom:180,restorePosition:false});
+  },content);
+  await expect(page.locator('.document-page')).toHaveAttribute('data-scale','1.8');
+  await page.evaluate(()=>document.fonts.ready);
+  // Position the visible anchor immediately while zoom is still on its initial
+  // compositor transform, before the 240 ms Android layout-zoom settle fires.
+  const before=await page.evaluate(()=>{
+    const pageEl=document.querySelector<HTMLElement>('.document-page')!;
+    const root=document.querySelector<HTMLElement>('.android-reading')!;
+    const anchor=document.querySelector<HTMLElement>('#visible-anchor')!;
+    // Re-enter compositor zoom if fonts.ready exceeded 240 ms on a cold worker.
+    window.supermdSetZoom?.(175);
+    window.supermdSetZoom?.(180);
+    anchor.scrollIntoView({block:'center',behavior:'instant'});
+    root.scrollTop+=anchor.getBoundingClientRect().top-root.getBoundingClientRect().top-220;
+    return {top:anchor.getBoundingClientRect().top,model:pageEl.dataset.selectionModel??null};
+  });
+  expect(before.model).toBeNull();
+  await expect(page.locator('.document-page')).toHaveAttribute('data-selection-model','layout');
+  await expect(page.locator('.document-page')).toHaveAttribute('data-selection-scale','1.8');
+  const after=await page.locator('#visible-anchor').evaluate(el=>el.getBoundingClientRect().top);
+  expect(Math.abs(after-before.top)).toBeLessThan(3);
 });

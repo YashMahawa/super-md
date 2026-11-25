@@ -7,7 +7,6 @@ import android.provider.OpenableColumns
 import java.io.FileNotFoundException
 import java.util.Locale
 
-private val FOLDER_LIST_NOTE_EXTENSIONS = setOf("md", "smd", "markdown", "fmd")
 private const val MAX_SAF_RELATIVE_DEPTH = 32
 
 private val SAF_CHILD_PROJECTION = arrayOf(
@@ -27,29 +26,32 @@ internal data class ProjectedSafChild(
     val isVirtual: Boolean get() = (flags and DocumentsContract.Document.FLAG_VIRTUAL_DOCUMENT) != 0
 }
 
-internal data class SafMetadataRefreshResult(
-    val metadata: Map<String, String?>,
-    val folderEntries: Result<List<FileEntry>>?,
+internal data class SafFolderListing(
+    val effectiveRelative: String,
+    val entries: List<FileEntry>,
 )
 
-internal fun isSupportedSafFolderNoteName(name: String): Boolean {
-    if (name.isBlank() || name.startsWith('.')) return false
-    val dot = name.lastIndexOf('.')
-    if (dot <= 0 || dot == name.lastIndex) return false
-    return name.substring(dot + 1).lowercase(Locale.ROOT) in FOLDER_LIST_NOTE_EXTENSIONS
-}
+internal data class SafMetadataRefreshResult(
+    val metadata: Map<String, String?>,
+    val folderListing: Result<SafFolderListing>?,
+    val confirmedTreeKeys: Set<String> = emptySet(),
+)
 
-internal fun inferSafParentDocumentId(rootDocumentId: String, documentId: String): String? {
-    if (documentId == rootDocumentId || !isDocumentContainedInTree(rootDocumentId, documentId)) return null
-    val slash = documentId.lastIndexOf('/')
-    if (slash >= 0) {
-        val parent = if (slash == 0 && rootDocumentId == "/") "/" else documentId.substring(0, slash)
-        if (parent.isNotEmpty() && isDocumentContainedInTree(rootDocumentId, parent)) return parent
-    }
-    if (rootDocumentId.endsWith(':') && documentId.startsWith(rootDocumentId)) {
-        return rootDocumentId
-    }
-    return null
+internal fun isSupportedSafFolderNoteName(name: String): Boolean = isSearchableNoteName(name)
+
+internal fun inferSafParentDocumentId(
+    authority: String?,
+    rootDocumentId: String,
+    documentId: String,
+): String? {
+    if (!isKnownPathContainedInTree(authority, rootDocumentId, documentId)) return null
+    val root = parseExternalStorageDocumentId(rootDocumentId) ?: return null
+    val doc = parseExternalStorageDocumentId(documentId) ?: return null
+    if (doc.relativePath == root.relativePath || doc.relativePath.isEmpty()) return null
+    val slash = doc.relativePath.lastIndexOf('/')
+    val parentRelative = if (slash < 0) "" else doc.relativePath.substring(0, slash)
+    val parentDocId = "${doc.volume}:$parentRelative"
+    return parentDocId.takeIf { isKnownPathContainedInTree(authority, rootDocumentId, it) }
 }
 
 internal fun querySafChildDocuments(
@@ -112,7 +114,7 @@ internal fun querySingleDocumentMetadata(resolver: ContentResolver, uri: Uri): P
 
 /**
  * Per-operation stateless SAF child projection pass.
- * Shares projected directory snapshots within a single [listSafFolderEntries] or
+ * Shares projected directory snapshots within a single [listSafFolderListing] or
  * [refreshSafWorkspaceMetadata] invocation and is discarded immediately upon return.
  */
 internal class SafProjectionPass(private val resolver: ContentResolver) {
@@ -128,6 +130,13 @@ internal class SafProjectionPass(private val resolver: ContentResolver) {
 
     private val byParent = LinkedHashMap<ParentKey, DirectoryProjection>()
     private val byDocId = LinkedHashMap<DocKey, ProjectedSafChild>()
+    private val bySingleUri = LinkedHashMap<String, ProviderMetadata>()
+    private val confirmedKeysMutable = LinkedHashSet<String>()
+
+    val confirmedTreeKeys: Set<String> get() = confirmedKeysMutable
+
+    fun querySingleDocument(uri: Uri): ProviderMetadata =
+        bySingleUri.getOrPut(uri.toString()) { querySingleDocumentMetadata(resolver, uri) }
 
     fun projectDirectory(treeUri: Uri, parentDocumentId: String): DirectoryProjection {
         val key = ParentKey(treeUri.toString(), parentDocumentId)
@@ -139,6 +148,9 @@ internal class SafProjectionPass(private val resolver: ContentResolver) {
             } else {
                 children.forEach { child ->
                     byDocId.putIfAbsent(DocKey(treeUri.toString(), child.documentId), child)
+                    confirmedKeysMutable.add(
+                        DocumentsContract.buildDocumentUriUsingTree(treeUri, child.documentId).toString(),
+                    )
                 }
                 DirectoryProjection.Loaded(children)
             }
@@ -172,33 +184,53 @@ internal class SafProjectionPass(private val resolver: ContentResolver) {
         return projectDirectory(treeUri, currentDocumentId)
     }
 
+    fun hasProjectedDocument(treeUri: Uri, documentId: String): Boolean =
+        byDocId.containsKey(DocKey(treeUri.toString(), documentId))
+
     fun findProjectedDocument(treeUri: Uri, documentId: String): ProjectedSafChild? =
         byDocId[DocKey(treeUri.toString(), documentId)]
 }
 
-internal fun listSafFolderEntries(
+internal fun hasInvalidSafFolderRelative(relative: String): Boolean {
+    if ('\\' in relative || '\u0000' in relative) return true
+    val parts = relative.split('/').map { it.trim() }.filter { it.isNotEmpty() }
+    return parts.size > MAX_SAF_RELATIVE_DEPTH || parts.any { it == "." || it == ".." }
+}
+
+internal fun listSafFolderListing(
     resolver: ContentResolver,
     documentAccess: DocumentAccess,
     folderUri: Uri,
     relative: String,
     pass: SafProjectionPass = SafProjectionPass(resolver),
-): List<FileEntry> {
-    val segments = relative.split('/').filter { it.isNotEmpty() }
-    require(segments.size <= MAX_SAF_RELATIVE_DEPTH && segments.none { it == "." || it == ".." || '\\' in it || '\u0000' in it }) {
-        "Invalid folder path"
-    }
+): SafFolderListing {
+    require(!hasInvalidSafFolderRelative(relative)) { "Invalid folder path" }
+    val normalizedRequested = normalizeFolderRelative(relative)
+    val segments = normalizedRequested.split('/').filter { it.isNotEmpty() }
     val (treeUri, rootDocumentId) = documentAccess.resolveReadableTreeRoot(folderUri)
         ?: error("Choose the folder again to restore access")
-    val normalizedRelative = segments.joinToString("/")
-    val leaf = pass.walkRelativeDirectory(treeUri, rootDocumentId, normalizedRelative)
-    val children = when (leaf) {
-        is SafProjectionPass.DirectoryProjection.Loaded -> leaf.children
+    var currentChildren = when (val rootProjection = pass.projectDirectory(treeUri, rootDocumentId)) {
+        is SafProjectionPass.DirectoryProjection.Loaded -> rootProjection.children
         SafProjectionPass.DirectoryProjection.Denied -> error("Choose the folder again to restore access")
         SafProjectionPass.DirectoryProjection.Missing,
         SafProjectionPass.DirectoryProjection.Unavailable -> error("Folder disappeared")
     }
-    val prefix = if (normalizedRelative.isEmpty()) "" else "$normalizedRelative/"
-    return children.mapNotNull { child ->
+    val resolvedParts = ArrayList<String>(segments.size)
+    for (part in segments) {
+        val nextDir = currentChildren.firstOrNull { it.displayName == part && it.isDirectory && !it.isVirtual } ?: break
+        when (val nextProjection = pass.projectDirectory(treeUri, nextDir.documentId)) {
+            is SafProjectionPass.DirectoryProjection.Loaded -> {
+                resolvedParts += part
+                currentChildren = nextProjection.children
+            }
+            SafProjectionPass.DirectoryProjection.Missing -> break
+            SafProjectionPass.DirectoryProjection.Denied -> error("Choose the folder again to restore access")
+            SafProjectionPass.DirectoryProjection.Unavailable -> error("Folder disappeared")
+        }
+    }
+    val actualRelative = resolvedParts.joinToString("/")
+    val prefix = if (actualRelative.isEmpty()) "" else "$actualRelative/"
+    val entries = currentChildren.mapNotNull { child ->
         val name = child.displayName
         if (name.startsWith('.') || child.isVirtual) return@mapNotNull null
         if (child.isDirectory || isSupportedSafFolderNoteName(name)) {
@@ -208,7 +240,16 @@ internal fun listSafFolderEntries(
             null
         }
     }.sortedWith(compareByDescending<FileEntry> { it.directory }.thenBy { it.name.lowercase(Locale.ROOT) })
+    return SafFolderListing(actualRelative, entries)
 }
+
+internal fun listSafFolderEntries(
+    resolver: ContentResolver,
+    documentAccess: DocumentAccess,
+    folderUri: Uri,
+    relative: String,
+    pass: SafProjectionPass = SafProjectionPass(resolver),
+): List<FileEntry> = listSafFolderListing(resolver, documentAccess, folderUri, relative, pass).entries
 
 internal fun refreshSafWorkspaceMetadata(
     resolver: ContentResolver,
@@ -217,40 +258,50 @@ internal fun refreshSafWorkspaceMetadata(
     relativeHints: Map<String, String> = emptyMap(),
     folderUriRaw: String? = null,
     listedRelative: String = "",
+    confirmedTreeKeys: Set<String> = emptySet(),
 ): SafMetadataRefreshResult {
     val pass = SafProjectionPass(resolver)
     val activeFolderUri = folderUriRaw?.let(Uri::parse)
-    val folderEntries = activeFolderUri?.let { folderUri ->
-        runCatching { listSafFolderEntries(resolver, documentAccess, folderUri, listedRelative, pass) }
+    val folderListing = activeFolderUri?.let { folderUri ->
+        runCatching { listSafFolderListing(resolver, documentAccess, folderUri, listedRelative, pass) }
     }
     val metadata = LinkedHashMap<String, String?>()
     for (raw in uris) {
         val uri = Uri.parse(raw)
         if (uri.scheme != "content") continue
-        when (val info = resolveNoteMetadataInPass(resolver, documentAccess, pass, uri, activeFolderUri, relativeHints[raw])) {
+        when (
+            val info = resolveNoteMetadataInPass(
+                documentAccess = documentAccess,
+                pass = pass,
+                uri = uri,
+                activeFolderUri = activeFolderUri,
+                relativeHint = relativeHints[raw],
+                confirmedTreeKeys = confirmedTreeKeys,
+            )
+        ) {
             is ProviderMetadata.Found -> info.name?.takeIf { it.isNotBlank() }?.let { metadata[raw] = it }
             ProviderMetadata.Missing -> metadata[raw] = null
             ProviderMetadata.Unavailable -> Unit
         }
     }
-    return SafMetadataRefreshResult(metadata, folderEntries)
+    return SafMetadataRefreshResult(metadata, folderListing, pass.confirmedTreeKeys)
 }
 
 private fun resolveNoteMetadataInPass(
-    resolver: ContentResolver,
     documentAccess: DocumentAccess,
     pass: SafProjectionPass,
     uri: Uri,
     activeFolderUri: Uri?,
     relativeHint: String?,
-): ProviderMetadata = when (val access = documentAccess.resolveReadAccess(uri, activeFolderUri)) {
+    confirmedTreeKeys: Set<String>,
+): ProviderMetadata = when (val access = documentAccess.resolveReadAccess(uri, activeFolderUri, pass::hasProjectedDocument)) {
     SafReadAccess.Denied -> ProviderMetadata.Unavailable
-    is SafReadAccess.StandaloneDocument -> querySingleDocumentMetadata(resolver, access.documentUri)
+    is SafReadAccess.StandaloneDocument -> pass.querySingleDocument(access.documentUri)
     is SafReadAccess.InGrantedTree -> {
         pass.findProjectedDocument(access.treeUri, access.documentId)?.let { projected ->
             return if (projected.isDirectory) ProviderMetadata.Missing else ProviderMetadata.Found(projected.displayName)
         }
-        val inferredParent = inferSafParentDocumentId(access.rootDocumentId, access.documentId)
+        val inferredParent = inferSafParentDocumentId(access.treeUri.authority, access.rootDocumentId, access.documentId)
         val projection = when {
             inferredParent != null -> pass.projectDirectory(access.treeUri, inferredParent)
             relativeHint != null -> pass.walkRelativeDirectory(
@@ -268,7 +319,37 @@ private fun resolveNoteMetadataInPass(
             SafProjectionPass.DirectoryProjection.Unavailable -> ProviderMetadata.Unavailable
             is SafProjectionPass.DirectoryProjection.Loaded,
             SafProjectionPass.DirectoryProjection.Missing,
-            null -> querySingleDocumentMetadata(resolver, access.documentUri)
+            null -> pass.querySingleDocument(access.documentUri)
+        }
+    }
+    is SafReadAccess.PendingTreeMembership -> {
+        pass.findProjectedDocument(access.treeUri, access.documentId)?.let { projected ->
+            return if (projected.isDirectory) ProviderMetadata.Missing else ProviderMetadata.Found(projected.displayName)
+        }
+        val projection = when {
+            relativeHint != null -> pass.walkRelativeDirectory(
+                access.treeUri,
+                access.rootDocumentId,
+                relativeHint.substringBeforeLast('/', ""),
+            )
+            access.directDocumentUri == null -> pass.projectDirectory(access.treeUri, access.rootDocumentId)
+            else -> null
+        }
+        pass.findProjectedDocument(access.treeUri, access.documentId)?.let { projected ->
+            return if (projected.isDirectory) ProviderMetadata.Missing else ProviderMetadata.Found(projected.displayName)
+        }
+        val previouslyConfirmed = access.documentUri.toString() in confirmedTreeKeys ||
+            canonicalTreeDocumentKey(uri)?.let { it in confirmedTreeKeys } == true
+        when (projection) {
+            SafProjectionPass.DirectoryProjection.Denied,
+            SafProjectionPass.DirectoryProjection.Unavailable -> ProviderMetadata.Unavailable
+            is SafProjectionPass.DirectoryProjection.Loaded,
+            SafProjectionPass.DirectoryProjection.Missing,
+            null -> when {
+                access.directDocumentUri != null -> pass.querySingleDocument(access.directDocumentUri)
+                previouslyConfirmed -> pass.querySingleDocument(access.documentUri)
+                else -> ProviderMetadata.Unavailable
+            }
         }
     }
 }

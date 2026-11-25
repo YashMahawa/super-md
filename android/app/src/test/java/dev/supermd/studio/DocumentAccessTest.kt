@@ -94,14 +94,16 @@ class DocumentAccessTest {
         assertFalse(sameDocument(noteUri, otherAuthority))
     }
 
-    @Test fun treeContainmentAndReadAccessRejectSiblingPrefixesAndTraversalOutsideGrantedTree() {
-        assertTrue(isDocumentContainedInTree("folder", "folder"))
-        assertTrue(isDocumentContainedInTree("folder", "folder/Note.md"))
-        assertTrue(isDocumentContainedInTree("folder/", "folder/Sub/Note.md"))
-        assertTrue(isDocumentContainedInTree("primary:", "primary:Notes/Note.md"))
-        assertFalse(isDocumentContainedInTree("folder", "folder-other/Note.md"))
-        assertFalse(isDocumentContainedInTree("folder", "folder/../outside/Note.md"))
-        assertFalse(isDocumentContainedInTree("primary:", "primary:../outside/Note.md"))
+    @Test fun treeContainmentAndReadAccessRespectKnownExternalStoragePathsAndOpaqueProviderIds() {
+        assertTrue(isKnownPathContainedInTree(EXTERNAL_STORAGE_DOCUMENTS_AUTHORITY, "primary:", "primary:Notes/Note.md"))
+        assertTrue(isKnownPathContainedInTree(EXTERNAL_STORAGE_DOCUMENTS_AUTHORITY, "primary:folder", "primary:folder"))
+        assertTrue(isKnownPathContainedInTree(EXTERNAL_STORAGE_DOCUMENTS_AUTHORITY, "primary:folder", "primary:folder/Note.md"))
+        assertTrue(isKnownPathContainedInTree(EXTERNAL_STORAGE_DOCUMENTS_AUTHORITY, "primary:folder/", "primary:folder/Sub/Note.md"))
+        assertFalse(isKnownPathContainedInTree(EXTERNAL_STORAGE_DOCUMENTS_AUTHORITY, "primary:folder", "primary:folder-other/Note.md"))
+        assertFalse(isKnownPathContainedInTree(EXTERNAL_STORAGE_DOCUMENTS_AUTHORITY, "primary:folder", "primary:folder/../outside/Note.md"))
+        assertFalse(isKnownPathContainedInTree(EXTERNAL_STORAGE_DOCUMENTS_AUTHORITY, "primary:", "primary:../outside/Note.md"))
+        assertFalse(isKnownPathContainedInTree(EXTERNAL_STORAGE_DOCUMENTS_AUTHORITY, "primary:folder", "secondary:folder/Note.md"))
+        assertFalse("Opaque providers must not infer containment from path syntax", isKnownPathContainedInTree(authority, "folder", "folder/Note.md"))
 
         val grantedUris = mutableMapOf<Uri, Int>()
         val enforcingContext = object : android.content.ContextWrapper(app) {
@@ -121,23 +123,57 @@ class DocumentAccessTest {
         }
 
         val access = DocumentAccess(enforcingContext)
-        val tree = DocumentsContract.buildTreeDocumentUri(authority, "folder")
-        grantedUris[tree] = Intent.FLAG_GRANT_READ_URI_PERMISSION
-        app.contentResolver.takePersistableUriPermission(tree, Intent.FLAG_GRANT_READ_URI_PERMISSION)
+        val extProvider = FailingDocumentProvider(root).also { it.attach(app, EXTERNAL_STORAGE_DOCUMENTS_AUTHORITY) }
+        ShadowContentResolver.registerProviderInternal(EXTERNAL_STORAGE_DOCUMENTS_AUTHORITY, extProvider)
+        val extTree = DocumentsContract.buildTreeDocumentUri(EXTERNAL_STORAGE_DOCUMENTS_AUTHORITY, "primary:folder")
+        grantedUris[extTree] = Intent.FLAG_GRANT_READ_URI_PERMISSION
+        app.contentResolver.takePersistableUriPermission(extTree, Intent.FLAG_GRANT_READ_URI_PERMISSION)
 
-        val ungrantedInside = DocumentsContract.buildDocumentUri(authority, "folder/Inside.md")
-        val ungrantedSibling = DocumentsContract.buildDocumentUri(authority, "folder-2/Outside.md")
-        val craftedEscape = DocumentsContract.buildDocumentUriUsingTree(tree, "folder-2/Outside.md")
-        val craftedTraversal = DocumentsContract.buildDocumentUriUsingTree(tree, "folder/../outside/Outside.md")
+        val ungrantedInside = DocumentsContract.buildDocumentUri(EXTERNAL_STORAGE_DOCUMENTS_AUTHORITY, "primary:folder/Inside.md")
+        val ungrantedSibling = DocumentsContract.buildDocumentUri(EXTERNAL_STORAGE_DOCUMENTS_AUTHORITY, "primary:folder-2/Outside.md")
+        val craftedEscape = DocumentsContract.buildDocumentUriUsingTree(extTree, "primary:folder-2/Outside.md")
+        val craftedTraversal = DocumentsContract.buildDocumentUriUsingTree(extTree, "primary:folder/../outside/Outside.md")
 
         assertTrue(access.resolveReadAccess(ungrantedInside) is SafReadAccess.InGrantedTree)
         assertEquals(SafReadAccess.Denied, access.resolveReadAccess(ungrantedSibling))
         assertEquals(SafReadAccess.Denied, access.resolveReadAccess(craftedEscape))
         assertEquals(SafReadAccess.Denied, access.resolveReadAccess(craftedTraversal))
 
-        val grantedOutside = DocumentsContract.buildDocumentUri(authority, "standalone/Single.md")
+        val grantedOutside = DocumentsContract.buildDocumentUri(EXTERNAL_STORAGE_DOCUMENTS_AUTHORITY, "primary:standalone/Single.md")
         grantedUris[grantedOutside] = Intent.FLAG_GRANT_READ_URI_PERMISSION
         assertEquals(SafReadAccess.StandaloneDocument(grantedOutside), access.resolveReadAccess(grantedOutside))
+
+        // Opaque providers must NOT reject slashes, trailing colons, or "$treeRoot-" prefixes,
+        // and must NOT manufacture tree access from ungranted plain URIs without provider confirmation.
+        val opaqueTree = DocumentsContract.buildTreeDocumentUri(authority, "root_opaque")
+        val colonTree = DocumentsContract.buildTreeDocumentUri(authority, "root_colon:")
+        grantedUris[opaqueTree] = Intent.FLAG_GRANT_READ_URI_PERMISSION
+        grantedUris[colonTree] = Intent.FLAG_GRANT_READ_URI_PERMISSION
+        app.contentResolver.takePersistableUriPermission(opaqueTree, Intent.FLAG_GRANT_READ_URI_PERMISSION)
+
+        val opaquePathLikeChild = DocumentsContract.buildDocumentUriUsingTree(opaqueTree, "archive/2026/doc_path")
+        val opaquePrefixLikeChild = DocumentsContract.buildDocumentUriUsingTree(opaqueTree, "root_opaque-child")
+        val opaqueColonRootChild = DocumentsContract.buildDocumentUriUsingTree(colonTree, "opaque_child")
+        val ungrantedPlainOpaque = DocumentsContract.buildDocumentUri(authority, "root_opaque/LooksInside.md")
+        val grantedPlainOpaque = DocumentsContract.buildDocumentUri(authority, "archive/2026/standalone")
+        grantedUris[grantedPlainOpaque] = Intent.FLAG_GRANT_READ_URI_PERMISSION
+
+        assertEquals(SafReadAccess.Denied, access.resolveReadAccess(ungrantedPlainOpaque))
+        assertEquals(SafReadAccess.StandaloneDocument(grantedPlainOpaque), access.resolveReadAccess(grantedPlainOpaque))
+        assertTrue(access.resolveReadAccess(opaquePathLikeChild) is SafReadAccess.PendingTreeMembership)
+        assertTrue(access.resolveReadAccess(opaquePrefixLikeChild) is SafReadAccess.PendingTreeMembership)
+        assertTrue(access.resolveReadAccess(opaqueColonRootChild) is SafReadAccess.PendingTreeMembership)
+        assertFalse("Unconfirmed opaque tree candidate must not count as confirmed read grant", access.hasReadGrant(opaquePathLikeChild))
+
+        val confirmedSet = setOf("archive/2026/doc_path", "root_opaque-child", "opaque_child")
+        val confirmFn: (Uri, String) -> Boolean = { _, id -> id in confirmedSet }
+        assertTrue(access.resolveReadAccess(opaquePathLikeChild, isConfirmedTreeChild = confirmFn) is SafReadAccess.InGrantedTree)
+        assertTrue(access.resolveReadAccess(opaquePrefixLikeChild, isConfirmedTreeChild = confirmFn) is SafReadAccess.InGrantedTree)
+        assertTrue(access.resolveReadAccess(opaqueColonRootChild, isConfirmedTreeChild = confirmFn) is SafReadAccess.InGrantedTree)
+        assertTrue(access.hasReadGrant(opaquePathLikeChild, isConfirmedTreeChild = confirmFn))
+
+        grantedUris.remove(opaqueTree)
+        assertEquals(SafReadAccess.Denied, access.resolveReadAccess(opaquePathLikeChild, isConfirmedTreeChild = confirmFn))
     }
 
     @Test fun reopeningRecentNoteAfterReadRevocationOffersRecoveryAndKeepsItsDraft() {
