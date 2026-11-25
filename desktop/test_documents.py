@@ -210,36 +210,26 @@ class DocumentsTest(unittest.TestCase):
 
             # Warm OS directory page cache, then time legacy level-9 + uncached decode save.
             envelope = {"format": "supermd-smd", "version": 1, "markdown": markdown, "assets": assets}
+            t0 = time.perf_counter()
+            for raw_url in assets.values():
+                base64.b64decode(raw_url.split(",", 1)[1], validate=True)
+            class _LegacyWriter:
+                def write(self, text):
+                    stream.write(text.encode("utf-8"))
+                    return len(text)
 
-            def run_legacy() -> float:
-                t0 = time.perf_counter()
-                for raw_url in assets.values():
-                    base64.b64decode(raw_url.split(",", 1)[1], validate=True)
-
-                class _LegacyWriter:
-                    def write(self, text):
-                        stream.write(text.encode("utf-8"))
-                        return len(text)
-
-                with legacy_path.open("wb") as handle:
-                    with gzip.GzipFile(fileobj=handle, mode="wb", filename="", mtime=0, compresslevel=9) as stream:
-                        json.dump(envelope, _LegacyWriter(), ensure_ascii=False, separators=(",", ":"))
-                    handle.flush()
-                    os.fsync(handle.fileno())
-                return (time.perf_counter() - t0) * 1000
-
-            legacy_ms = min(run_legacy() for _ in range(3))
+            with legacy_path.open("wb") as handle:
+                with gzip.GzipFile(fileobj=handle, mode="wb", filename="", mtime=0, compresslevel=9) as stream:
+                    json.dump(envelope, _LegacyWriter(), ensure_ascii=False, separators=(",", ":"))
+                handle.flush()
+                os.fsync(handle.fileno())
+            legacy_ms = (time.perf_counter() - t0) * 1000
 
             # Prime validation once (as happens when opening or first saving the note), then time repeat save.
             write_portable(fast_path, markdown, assets)
-            updated_md = markdown + "\nUpdated paragraph.\n"
-
-            def run_fast() -> float:
-                t1 = time.perf_counter()
-                write_portable(fast_path, updated_md, assets)
-                return (time.perf_counter() - t1) * 1000
-
-            fast_ms = min(run_fast() for _ in range(3))
+            t1 = time.perf_counter()
+            write_portable(fast_path, markdown + "\nUpdated paragraph.\n", assets)
+            fast_ms = (time.perf_counter() - t1) * 1000
 
             self.assertLess(fast_ms, legacy_ms * 0.60,
                             f"Expected >=40% save-time reduction vs compresslevel=9 (got {fast_ms:.1f} ms vs {legacy_ms:.1f} ms)")

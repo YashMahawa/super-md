@@ -3455,7 +3455,7 @@ class Studio(QObject):
 
         def handle_retired():
             self.saving.discard(tab_id)
-            abort()
+            finalize(None, "The target desktop window was closed")
             on_complete(None, "The target desktop window was closed")
 
         if not self._submit_write(work, handle_done, on_retired=handle_retired):
@@ -3509,8 +3509,6 @@ class Studio(QObject):
             reservation_identity = (reservation_stat.st_dev, reservation_stat.st_ino)
         resolved_path = path.resolve()
 
-        work_started = False
-
         def unlink_reserved():
             if not created_new_path:
                 return
@@ -3523,14 +3521,11 @@ class Studio(QObject):
                 pass
 
         def abort():
-            if not work_started:
-                unlink_reserved()
+            unlink_reserved()
             if created_new_path:
                 self._agent_owned_files.discard(str(resolved_path))
 
         def work():
-            nonlocal work_started
-            work_started = True
             try:
                 if not created_new_path:
                     # Compare the full decoded note, including portable assets, with
@@ -3708,7 +3703,7 @@ class Studio(QObject):
             if not portable or disk_content != saved_snapshot or disk_assets != saved_assets_snapshot:
                 raise ValueError("The portable note changed on disk; reopen it before attaching an asset")
             updated = dict(assets_snapshot)
-            updated[asset_key] = encode_base64_chunked(raw, f"data:{mime};base64,")
+            updated[asset_key] = f"data:{mime};base64," + encode_base64_chunked(raw)
             write_portable(path, content_snapshot, updated)
             try:
                 st = path.stat()
@@ -3739,20 +3734,13 @@ class Studio(QObject):
     @staticmethod
     def _parse_media_envelope(raw: str):
         if len(raw) > 524_288:
-            key_pos = raw.find('"body"', 0, 4096)
+            key_pos = raw.find('"body"')
             if key_pos >= 0:
-                colon_pos = raw.find(":", key_pos + 6, key_pos + 256)
+                colon_pos = raw.find(":", key_pos + 6)
                 if colon_pos >= 0:
-                    q_open = raw.find('"', colon_pos + 1, colon_pos + 256)
+                    q_open = raw.find('"', colon_pos + 1)
                     if q_open >= 0 and raw[colon_pos + 1:q_open].strip() == "":
-                        q_close = -1
-                        step = 262_144
-                        for idx, offset in enumerate(range(q_open + 1, len(raw), step)):
-                            if idx:
-                                time.sleep(0)
-                            q_close = raw.find('"', offset, min(offset + step, len(raw)))
-                            if q_close >= 0:
-                                break
+                        q_close = raw.find('"', q_open + 1)
                         if q_close > q_open + 262_144:
                             try:
                                 parsed = json.loads(raw[:q_open + 1] + raw[q_close:])
@@ -3823,9 +3811,7 @@ class Studio(QObject):
                 total_bytes = len(first_chunk)
                 with os.fdopen(fd, "wb") as stream:
                     stream.write(first_chunk)
-                    for idx, offset in enumerate(range(first_end, body_end, step)):
-                        if idx:
-                            time.sleep(0)
+                    for offset in range(first_end, body_end, step):
                         end = min(offset + step, body_end)
                         chunk = source_str[offset:end]
                         try:
@@ -3913,7 +3899,7 @@ class Studio(QObject):
                                                      "assetId": asset_name, "revision": current, "changed": False,
                                                      "saved": False}}
             updated = dict(assets_snapshot)
-            updated[asset_name] = encode_base64_chunked(raw, f"data:{mime};base64,")
+            updated[asset_name] = f"data:{mime};base64," + encode_base64_chunked(raw)
             disk_content, disk_assets, disk_portable = open_note(path)
             if not disk_portable or disk_content != saved_snapshot or disk_assets != saved_assets_snapshot:
                 raise ValueError("The portable note changed on disk; reopen it before replacing an asset")
