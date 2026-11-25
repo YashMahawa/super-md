@@ -577,3 +577,113 @@ fn html_images_with_angle_brackets_in_quoted_attributes_preserve_assets_and_widt
         }
     }
 }
+
+#[test]
+fn repeated_and_forward_footnotes_keep_stable_first_reference_numbering_without_duplicating_entries() {
+    let md = [
+        "[^early]: EARLY_FOOTNOTE_BODY",
+        "",
+        "# smd-footnote-1",
+        "",
+        "Lead CITE_FIRST[^beta], next CITE_SECOND[^Alpha], repeat CITE_BETA_AGAIN[^BETA], early CITE_EARLY[^early], repeat early CITE_EARLY_AGAIN[^EARLY], final CITE_FOURTH[^gamma], literal CITE_MISSING[^missing], and prepared CITE_PREPARED_MISSING\\[\\^missing].",
+        "",
+        "[^unused]: UNUSED_FOOTNOTE_BODY",
+        "",
+        "[^gamma]: **GAMMA_BOLD_BODY**",
+        "",
+        "    GAMMA_SECOND_PARAGRAPH",
+        "",
+        "[^alpha]: ALPHA_FIRST_DEFINITION_WINS",
+        "",
+        "[^alpha]: ALPHA_SHADOWED_DUPLICATE",
+        "",
+        "[^beta]: BETA_FOOTNOTE_BODY with $x^2$.",
+    ].join("\n");
+
+    let generated = source(&md, &PdfOptions::default(), &HashMap::new()).unwrap();
+    assert_eq!(generated.matches("]<smd.footnote.").count(), 4, "Expected exactly 4 footnote declarations: {generated}");
+    assert_eq!(generated.matches("#footnote(<smd.footnote.1>)").count(), 1, "{generated}");
+    assert_eq!(generated.matches("#footnote(<smd.footnote.3>)").count(), 1, "{generated}");
+    assert!(!generated.contains("UNUSED_FOOTNOTE_BODY"), "Unused footnote definition must not render: {generated}");
+    assert!(!generated.contains("ALPHA_SHADOWED_DUPLICATE"), "Duplicate footnote definition must not overwrite first definition: {generated}");
+
+    let pdf = export(&md, &PdfOptions::default(), &HashMap::new()).unwrap();
+    assert!(pdf.starts_with(b"%PDF-"));
+    let path = std::env::temp_dir().join(format!("supermd-footnotes-order-{}.pdf", std::process::id()));
+    std::fs::write(&path, &pdf).unwrap();
+    if let Ok(out) = std::process::Command::new("pdftotext").arg(&path).arg("-").output() {
+        if require_poppler() {
+            assert!(out.status.success(), "pdftotext must succeed on Linux CI");
+        }
+        if out.status.success() {
+            let plain = String::from_utf8_lossy(&out.stdout);
+            let flat = plain.split_whitespace().collect::<Vec<_>>().join(" ");
+            assert!(flat.contains("CITE_FIRST1,"), "First forward ref [^beta] must be numbered 1: {flat}");
+            assert!(flat.contains("CITE_SECOND2,"), "Second ref [^Alpha] must be numbered 2: {flat}");
+            assert!(flat.contains("CITE_BETA_AGAIN1,"), "Repeated [^BETA] must reuse number 1: {flat}");
+            assert!(flat.contains("CITE_EARLY3,"), "Early-defined [^early] cited third must be numbered 3: {flat}");
+            assert!(flat.contains("CITE_EARLY_AGAIN3,"), "Repeated [^EARLY] must reuse number 3: {flat}");
+            assert!(flat.contains("CITE_FOURTH4,"), "Fourth distinct footnote [^gamma] must be numbered 4 (not shifted to 6): {flat}");
+            assert!(flat.contains("CITE_MISSING[^missing],"), "Undefined [^missing] must remain literal without shifting numbers: {flat}");
+            assert!(flat.contains("CITE_PREPARED_MISSING[^missing]."), "preparePdf-escaped undefined footnote must also render as literal [^missing]: {flat}");
+
+            assert_eq!(plain.matches("BETA_FOOTNOTE_BODY").count(), 1, "Repeated footnote entry must appear once: {plain}");
+            assert_eq!(plain.matches("ALPHA_FIRST_DEFINITION_WINS").count(), 1, "First definition must appear once: {plain}");
+            assert_eq!(plain.matches("EARLY_FOOTNOTE_BODY").count(), 1, "Early footnote entry must appear once: {plain}");
+            assert_eq!(plain.matches("GAMMA_BOLD_BODY").count(), 1, "Fourth footnote entry must appear once: {plain}");
+            assert!(plain.contains("GAMMA_SECOND_PARAGRAPH"), "Multi-paragraph footnote continuation must survive: {plain}");
+            assert!(!plain.contains("UNUSED_FOOTNOTE_BODY"), "Unused footnote must not appear in PDF: {plain}");
+            assert!(!plain.contains("ALPHA_SHADOWED_DUPLICATE"), "Shadowed duplicate definition must not appear in PDF: {plain}");
+
+            let pos_beta = plain.find("BETA_FOOTNOTE_BODY").unwrap();
+            let pos_alpha = plain.find("ALPHA_FIRST_DEFINITION_WINS").unwrap();
+            let pos_early = plain.find("EARLY_FOOTNOTE_BODY").unwrap();
+            let pos_gamma = plain.find("GAMMA_BOLD_BODY").unwrap();
+            assert!(
+                pos_beta < pos_alpha && pos_alpha < pos_early && pos_early < pos_gamma,
+                "Footer entries must follow first-reference order (1: beta, 2: alpha, 3: early, 4: gamma): {plain}"
+            );
+        }
+    }
+    let _ = std::fs::remove_file(&path);
+}
+
+#[test]
+fn cross_page_repeated_nested_empty_and_self_referencing_footnotes_typeset_cleanly() {
+    let md = [
+        "Page one cites SHARED_P1[^shared], NESTED_OUTER[^outer], EMPTY_NOTE[^empty], and SELF_NOTE[^self].",
+        "",
+        "\\newpage",
+        "",
+        "Page two repeats SHARED_P2[^shared] and cites PAGE_TWO_NEW[^p2new] plus NESTED_INNER_AGAIN[^inner].",
+        "",
+        "[^shared]: SHARED_ENTRY_TEXT",
+        "[^outer]: OUTER_ENTRY_TEXT citing forward[^inner].",
+        "[^inner]: INNER_ENTRY_TEXT",
+        "[^empty]:",
+        "[^self]: SELF_ENTRY_TEXT[^self].",
+        "[^p2new]: PAGE_TWO_ENTRY_TEXT",
+    ].join("\n");
+
+    let pdf = export(&md, &PdfOptions::default(), &HashMap::new()).unwrap();
+    assert_eq!(count_pdf_pages(&pdf), 2);
+    let path = std::env::temp_dir().join(format!("supermd-footnotes-multipage-{}.pdf", std::process::id()));
+    std::fs::write(&path, &pdf).unwrap();
+    if let Ok(out) = std::process::Command::new("pdftotext").arg(&path).arg("-").output() {
+        if require_poppler() {
+            assert!(out.status.success(), "pdftotext must succeed on Linux CI");
+        }
+        if out.status.success() {
+            let text = String::from_utf8_lossy(&out.stdout);
+            let pages: Vec<&str> = text.split('\u{000c}').filter(|p| !p.trim().is_empty()).collect();
+            assert_eq!(pages.len(), 2, "Expected 2 pages: {pages:?}");
+            let flat_p1 = pages[0].split_whitespace().collect::<Vec<_>>().join(" ");
+            let flat_p2 = pages[1].split_whitespace().collect::<Vec<_>>().join(" ");
+            assert!(flat_p1.contains("SHARED_P11,"), "Page 1 first footnote must be 1: {flat_p1}");
+            assert!(flat_p2.contains("SHARED_P21"), "Page 2 repeat of [^shared] must still be numbered 1: {flat_p2}");
+            assert_eq!(text.matches("SHARED_ENTRY_TEXT").count(), 1, "Shared footnote entry must appear once on page 1: {text}");
+            assert!(pages[1].contains("PAGE_TWO_ENTRY_TEXT"), "New page-2 footnote entry must render on page 2: {}", pages[1]);
+        }
+    }
+    let _ = std::fs::remove_file(&path);
+}

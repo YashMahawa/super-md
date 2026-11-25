@@ -703,9 +703,39 @@ fn normalize_table_math(input: &str) -> String {
 struct Renderer<'a> {
     events: std::iter::Peekable<std::vec::IntoIter<Event<'a>>>,
     assets: &'a HashMap<String, Vec<u8>>,
-    footnotes: HashMap<String, String>,
+    footnote_defs: HashMap<String, Vec<Event<'a>>>,
+    emitted_footnotes: HashMap<String, String>,
+    in_footnote: bool,
     headings: HashMap<String, usize>,
     heading_counts: HashMap<String, usize>,
+}
+fn normalize_footnote_id(name: &str) -> String {
+    name.trim().split_whitespace().collect::<Vec<_>>().join(" ").to_lowercase()
+}
+fn collect_footnote_definitions<'a>(events: &[Event<'a>]) -> HashMap<String, Vec<Event<'a>>> {
+    let mut defs = HashMap::new();
+    let mut i = 0usize;
+    while i < events.len() {
+        if let Event::Start(Tag::FootnoteDefinition(ref name)) = events[i] {
+            let key = normalize_footnote_id(name);
+            i += 1;
+            let start = i;
+            let mut depth = 1usize;
+            while i < events.len() && depth > 0 {
+                match events[i] {
+                    Event::Start(Tag::FootnoteDefinition(_)) => depth += 1,
+                    Event::End(TagEnd::FootnoteDefinition) => depth -= 1,
+                    _ => {}
+                }
+                i += 1;
+            }
+            let end = if depth == 0 { i - 1 } else { i };
+            defs.entry(key).or_insert_with(|| events[start..end].to_vec());
+        } else {
+            i += 1;
+        }
+    }
+    defs
 }
 fn heading_slug(value: &str) -> String {
     let value = value.to_lowercase().chars().filter(|c| c.is_alphanumeric() || c.is_whitespace() || *c == '-' || *c == '_').collect::<String>();
@@ -772,7 +802,24 @@ impl<'a> Renderer<'a> {
                 Event::HardBreak => out.push_str("#linebreak()"),
                 Event::Rule => out.push_str("\n#line(length: 100%, stroke: .5pt + rgb(\"#d6dde5\"))\n"),
                 Event::TaskListMarker(checked) => out.push_str(if checked { "#text(\"☑ \u{a0}\")" } else { "#text(\"☐ \u{a0}\")" }),
-                Event::FootnoteReference(name) => out.push_str(&format!("#footnote[{}]", self.footnotes.get(name.as_ref()).cloned().unwrap_or_else(|| text(&name)))),
+                Event::FootnoteReference(name) => {
+                    let key = normalize_footnote_id(&name);
+                    if let Some(existing_label) = self.emitted_footnotes.get(&key) {
+                        out.push_str(&format!("#footnote(<{existing_label}>)"));
+                    } else if let Some(def_events) = self.footnote_defs.get(&key).cloned() {
+                        let label_id = format!("smd.footnote.{}", self.emitted_footnotes.len() + 1);
+                        self.emitted_footnotes.insert(key, label_id.clone());
+                        let saved_events = std::mem::replace(&mut self.events, def_events.into_iter().peekable());
+                        let saved_in_footnote = std::mem::replace(&mut self.in_footnote, true);
+                        let rendered = self.render(None);
+                        self.events = saved_events;
+                        self.in_footnote = saved_in_footnote;
+                        let body = rendered?;
+                        out.push_str(&format!("#footnote[{}]<{label_id}>", body.trim()));
+                    } else {
+                        out.push_str(&text(&format!("[^{name}]")));
+                    }
+                },
                 Event::Html(ref html) | Event::InlineHtml(ref html) => match html.as_ref() {
                     "<mark>" => out.push_str(&format!("#highlight(fill: smd-highlight, radius: 2pt, extent: 1pt)[{}]", self.render_until(Some(RenderStop::Html("</mark>")))?)),
                     "<u>" => out.push_str(&format!("#underline[{}]", self.render_until(Some(RenderStop::Html("</u>")))?)),
@@ -862,7 +909,16 @@ impl<'a> Renderer<'a> {
                             out.push_str("[#layout(cell => { show math.equation: it => { let w = measure(it).width; if w > cell.width { let factor = cell.width / w; scale(x: factor * 100%, y: factor * 100%, reflow: true, it) } else { it } }; [");
                             out.push_str(&self.render(Some(close))?); out.push_str("] })],\n");
                         },
-                        Tag::FootnoteDefinition(name) => { let body = self.render(Some(close))?; self.footnotes.insert(name.to_string(), body); },
+                        Tag::FootnoteDefinition(_) => {
+                            let mut depth = 1usize;
+                            while depth > 0 {
+                                match self.events.next() {
+                                    Some(Event::Start(Tag::FootnoteDefinition(_))) => depth += 1,
+                                    Some(Event::End(TagEnd::FootnoteDefinition)) | None => depth = depth.saturating_sub(1),
+                                    _ => {}
+                                }
+                            }
+                        },
                         Tag::BlockQuote(_) => {
                             // CommonMark may split literal brackets into several
                             // Text events. Match the first complete logical line,
@@ -914,7 +970,7 @@ impl<'a> Renderer<'a> {
                             } else { None };
                             let body = self.render(Some(close))?;
                             match tag {
-                                Tag::Paragraph => { if body.starts_with("#strong[") && body.ends_with(']') { out.push_str(&format!("#block(sticky: true, below: .35em)[{body}]\n\n")); } else { out.push_str(&format!("{body}\n\n")); } },
+                                Tag::Paragraph => { if !self.in_footnote && body.starts_with("#strong[") && body.ends_with(']') { out.push_str(&format!("#block(sticky: true, below: .35em)[{body}]\n\n")); } else { out.push_str(&format!("{body}\n\n")); } },
                                 Tag::Heading { level, .. } => out.push_str(&format!("\n#heading(level: {})[{body}] <smd-{}>\n\n", level as u8, heading.unwrap())),
                                 Tag::Emphasis => out.push_str(&format!("#emph[{body}]")),
                                 Tag::Strong => out.push_str(&format!("#strong[{body}]")),
@@ -944,7 +1000,7 @@ pub(crate) fn render_fragment(markdown: &str, assets: &HashMap<String, Vec<u8>>)
     let stripped = strip_percent_comments(body);
     let normalized = normalize_table_math(&normalize_obsidian_embeds(&normalize_callouts_body(&stripped)));
     let events = study::enrich_events(&normalized, Options::ENABLE_TABLES | Options::ENABLE_STRIKETHROUGH | Options::ENABLE_SUBSCRIPT | Options::ENABLE_SUPERSCRIPT | Options::ENABLE_MATH);
-    Renderer { events: events.into_iter().peekable(), assets, footnotes: HashMap::new(), headings: HashMap::new(), heading_counts: HashMap::new() }.render(None)
+    Renderer { events: events.into_iter().peekable(), assets, footnote_defs: HashMap::new(), emitted_footnotes: HashMap::new(), in_footnote: false, headings: HashMap::new(), heading_counts: HashMap::new() }.render(None)
 }
 
 pub fn source(markdown: &str, options: &PdfOptions, assets: &HashMap<String, Vec<u8>>) -> Result<String> {
@@ -963,13 +1019,8 @@ pub fn source(markdown: &str, options: &PdfOptions, assets: &HashMap<String, Vec
         Event::End(TagEnd::Heading(_)) => { if let Some(text) = current.take() { let slug = heading_slug(&text); let count = headings.get(&slug).copied().unwrap_or(0); if count > 0 { headings.insert(format!("{slug}-{count}"), 1); } headings.insert(slug, count + 1); } },
         _ => {}
     } }
-    let mut renderer = Renderer { events: events.into_iter().peekable(), assets, footnotes: HashMap::new(), headings, heading_counts: HashMap::new() };
-    // References normally precede definitions, so collect definitions first.
-    let mut definitions = Renderer { events: renderer.events.clone(), assets, footnotes: HashMap::new(), headings: renderer.headings.clone(), heading_counts: HashMap::new() };
-    while let Some(event) = definitions.events.next() {
-        if let Event::Start(Tag::FootnoteDefinition(name)) = event { let value = definitions.render(Some(TagEnd::FootnoteDefinition))?; definitions.footnotes.insert(name.to_string(), value); }
-    }
-    renderer.footnotes = definitions.footnotes;
+    let footnote_defs = collect_footnote_definitions(&events);
+    let mut renderer = Renderer { events: events.into_iter().peekable(), assets, footnote_defs, emitted_footnotes: HashMap::new(), in_footnote: false, headings, heading_counts: HashMap::new() };
     let body = renderer.render(None)?;
     let template: &str = if options.page_numbers { include_str!("document.typ") } else { &typesetter::UNNUMBERED_DOCUMENT_TEMPLATE };
     let paper=match options.page_size.as_str() {"letter"=>"us-letter","legal"=>"us-legal","tabloid"=>"us-tabloid","executive"=>"us-executive",other=>other};
@@ -1334,7 +1385,9 @@ P(A\cup B\cup C)=&P(A)+P(B)+P(C)\\
         let raw_crlf_out = Renderer {
             events: raw_crlf_events.into_iter().peekable(),
             assets: &HashMap::new(),
-            footnotes: HashMap::new(),
+            footnote_defs: HashMap::new(),
+            emitted_footnotes: HashMap::new(),
+            in_footnote: false,
             headings: HashMap::new(),
             heading_counts: HashMap::new(),
         }.render(None).unwrap();
