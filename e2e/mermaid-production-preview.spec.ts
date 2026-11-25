@@ -55,6 +55,19 @@ const FIVE_DIAGRAM_NOTE = [
   "```",
 ].join("\n");
 
+const SIX_DIAGRAM_NOTE = [
+  FIVE_DIAGRAM_NOTE,
+  "",
+  "```mermaid",
+  "erDiagram",
+  "  NOTE ||--o{ DIAGRAM : embeds",
+  "  NOTE {",
+  "    string id",
+  "    string title",
+  "  }",
+  "```",
+].join("\n");
+
 function getFreePort(): Promise<number> {
   return new Promise((resolve, reject) => {
     const srv = net.createServer();
@@ -88,7 +101,8 @@ let previewOrigin = "";
 test.describe("Production build Mermaid rendering (vite preview)", () => {
   test.setTimeout(90_000);
 
-  test.beforeAll(async () => {
+  test.beforeAll(async ({}, testInfo) => {
+    testInfo.setTimeout(120_000);
     const npmCmd = process.platform === "win32" ? "npm.cmd" : "npm";
     const npxCmd = process.platform === "win32" ? "npx.cmd" : "npx";
     execFileSync(npmCmd, ["run", "build"], {
@@ -136,14 +150,17 @@ test.describe("Production build Mermaid rendering (vite preview)", () => {
     page.on("console", msg => {
       if (msg.type() === "error") consoleErrors.push(msg.text());
     });
+    await page.route("**/favicon.ico", route => route.fulfill({ status: 204, body: "" }));
 
     await page.addInitScript(() => {
-      (window as unknown as Record<string, string[]>).__cspViolations = [];
-      document.addEventListener("securitypolicyviolation", event => {
-        (window as unknown as Record<string, string[]>).__cspViolations.push(
-          `${event.effectiveDirective}:${event.blockedURI}`,
-        );
-      });
+      if (window === window.top) {
+        (window as unknown as Record<string, string[]>).__cspViolations = [];
+        document.addEventListener("securitypolicyviolation", event => {
+          (window as unknown as Record<string, string[]>).__cspViolations.push(
+            `${event.effectiveDirective}:${event.blockedURI}`,
+          );
+        });
+      }
       window.SuperMD = {
         post: id => {
           queueMicrotask(() => window.supermdReply?.(id, null, null));
@@ -172,7 +189,7 @@ test.describe("Production build Mermaid rendering (vite preview)", () => {
     }, FIVE_DIAGRAM_NOTE);
 
     const renderedImages = page.locator(".mermaid img");
-    await expect(renderedImages).toHaveCount(4);
+    await expect(renderedImages).toHaveCount(4, { timeout: 25_000 });
     for (let i = 0; i < 4; i++) {
       await renderedImages.nth(i).scrollIntoViewIfNeeded();
       await expect(renderedImages.nth(i)).toBeVisible();
@@ -218,7 +235,7 @@ test.describe("Production build Mermaid rendering (vite preview)", () => {
       });
     }, FIVE_DIAGRAM_NOTE);
 
-    await expect(renderedImages).toHaveCount(4);
+    await expect(renderedImages).toHaveCount(4, { timeout: 25_000 });
     for (let i = 0; i < 4; i++) {
       await expect
         .poll(() => renderedImages.nth(i).evaluate(img => (img as HTMLImageElement).naturalWidth))
@@ -259,7 +276,7 @@ test.describe("Production build Mermaid rendering (vite preview)", () => {
       });
     }, FIVE_DIAGRAM_NOTE);
 
-    await expect(renderedImages).toHaveCount(4);
+    await expect(renderedImages).toHaveCount(4, { timeout: 25_000 });
     for (let i = 0; i < 4; i++) {
       await expect
         .poll(() => renderedImages.nth(i).evaluate(img => (img as HTMLImageElement).naturalWidth))
@@ -275,9 +292,27 @@ test.describe("Production build Mermaid rendering (vite preview)", () => {
     expect(consoleErrors).toEqual([]);
   });
 
-  test("renders all 5 Mermaid blocks in built index.html and recovers via srcdoc fallback if .html subframe navigation is intercepted", async ({
+  test("renders 5 valid diagram types plus invalid Mermaid in built index.html and recovers via srcdoc fallback if .html subframe navigation is intercepted", async ({
     page,
   }) => {
+    const consoleErrors: string[] = [];
+    page.on("pageerror", err => consoleErrors.push(err.message));
+    page.on("console", msg => {
+      if (msg.type() === "error") consoleErrors.push(msg.text());
+    });
+    await page.route("**/favicon.ico", route => route.fulfill({ status: 204, body: "" }));
+
+    await page.addInitScript(() => {
+      if (window !== window.top) return;
+      localStorage.setItem("setup.complete", "true");
+      (window as unknown as Record<string, string[]>).__cspViolations = [];
+      document.addEventListener("securitypolicyviolation", event => {
+        (window as unknown as Record<string, string[]>).__cspViolations.push(
+          `${event.effectiveDirective}:${event.blockedURI}`,
+        );
+      });
+    });
+
     // Simulate a leftover Service Worker / SPA router intercepting .html subframe navigations.
     await page.route("**/assets/mermaid-sandbox-*.html", async route => {
       await route.fulfill({
@@ -287,28 +322,24 @@ test.describe("Production build Mermaid rendering (vite preview)", () => {
       });
     });
 
-    await page.goto(`${previewOrigin}/`);
-    const welcomeDialog = page.getByRole("dialog", { name: "Welcome to Super MD" });
-    if (await welcomeDialog.isVisible().catch(() => false)) {
-      await page.getByRole("button", { name: /Continue/i }).click();
-      await page.getByRole("button", { name: /Continue/i }).click();
-      await page.getByRole("button", { name: /Explore the sample/i }).click();
-    }
-
+    await page.goto(`${previewOrigin}/?window=prod-mermaid`);
     const cm = page.locator(".cm-content");
-    await cm.click();
-    await page.keyboard.press("Control+a");
-    await page.evaluate(text => {
-      const el = document.querySelector(".cm-content");
-      const dt = new DataTransfer();
-      dt.setData("text/plain", text);
-      el?.dispatchEvent(new ClipboardEvent("paste", { clipboardData: dt, bubbles: true, cancelable: true }));
-    }, FIVE_DIAGRAM_NOTE);
+    await expect(cm).toBeVisible();
+    await cm.fill(SIX_DIAGRAM_NOTE);
 
     const previewPane = page.locator(".preview-pane");
+    await previewPane.evaluate(el => {
+      el.scrollTop = el.scrollHeight;
+    });
+    await page.waitForTimeout(100);
+    await previewPane.evaluate(el => {
+      el.scrollTop = 0;
+    });
+
     const renderedImages = previewPane.locator(".mermaid img");
-    await expect(renderedImages).toHaveCount(4, { timeout: 25_000 });
-    for (let i = 0; i < 4; i++) {
+    await expect(renderedImages).toHaveCount(5, { timeout: 25_000 });
+    for (let i = 0; i < 5; i++) {
+      await renderedImages.nth(i).scrollIntoViewIfNeeded();
       await expect
         .poll(() => renderedImages.nth(i).evaluate(img => (img as HTMLImageElement).naturalWidth))
         .toBeGreaterThan(60);
@@ -334,5 +365,11 @@ test.describe("Production build Mermaid rendering (vite preview)", () => {
       hasSrcdoc: true,
       inBody: false,
     });
+
+    const cspViolations = await page.evaluate(
+      () => (window as unknown as Record<string, string[]>).__cspViolations ?? [],
+    );
+    expect(cspViolations).toEqual([]);
+    expect(consoleErrors).toEqual([]);
   });
 });

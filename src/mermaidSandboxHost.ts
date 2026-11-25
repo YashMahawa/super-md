@@ -11,7 +11,7 @@ import {
 } from "./mermaidSandboxProtocol";
 import { installMermaidSandboxWorker, type MermaidEngineLike } from "./mermaidSandboxWorker";
 
-const FAST_PRIMARY_HANDSHAKE_MS = 3_000;
+const POST_LOAD_HANDSHAKE_MS = 2_500;
 const HANDSHAKE_PING_INTERVAL_MS = 250;
 
 type ActiveRequest = {
@@ -29,6 +29,7 @@ type FrameInstance = {
   resolveReady: () => void;
   rejectReady: (error: Error) => void;
   handshakeTimer: ReturnType<typeof setTimeout>;
+  postLoadTimer: ReturnType<typeof setTimeout> | null;
   pingTimer: ReturnType<typeof setInterval>;
   activeRequest: ActiveRequest | null;
   disposeHook?: () => void;
@@ -181,6 +182,10 @@ export class MermaidSandboxClient {
       this.frame = null;
     }
     clearTimeout(target.handshakeTimer);
+    if (target.postLoadTimer !== null) {
+      clearTimeout(target.postLoadTimer);
+      target.postLoadTimer = null;
+    }
     clearInterval(target.pingTimer);
     this.hostWindow.removeEventListener("message", target.onMessage);
     target.iframe.removeEventListener("load", target.onLoad);
@@ -224,10 +229,7 @@ export class MermaidSandboxClient {
     const fallbackScriptUrl = this.resolveHttpScriptUrl(assets.scriptUrl);
     const desiredMode = mode ?? (this.preferSrcdocFallback ? "srcdoc" : "src");
     const useSrcdoc = desiredMode === "srcdoc" && Boolean(fallbackScriptUrl);
-    const effectiveHandshakeMs =
-      !useSrcdoc && Boolean(fallbackScriptUrl)
-        ? Math.min(this.handshakeTimeoutMs, FAST_PRIMARY_HANDSHAKE_MS)
-        : this.handshakeTimeoutMs;
+    const hasPostLoadFallback = !useSrcdoc && Boolean(fallbackScriptUrl);
 
     const doc = this.hostWindow.document;
     const mountRoot = doc.documentElement;
@@ -274,11 +276,19 @@ export class MermaidSandboxClient {
       rejectReady,
       handshakeTimer: setTimeout(() => {
         this.destroyFrame(instance, new Error("Mermaid sandbox initialization timed out."));
-      }, effectiveHandshakeMs),
+      }, this.handshakeTimeoutMs),
+      postLoadTimer: null,
       pingTimer: setInterval(sendPing, HANDSHAKE_PING_INTERVAL_MS),
       activeRequest: null,
       disposed: false,
-      onLoad: sendPing,
+      onLoad: () => {
+        sendPing();
+        if (hasPostLoadFallback && !instance.disposed && !instance.isReady && instance.postLoadTimer === null) {
+          instance.postLoadTimer = setTimeout(() => {
+            this.destroyFrame(instance, new Error("Mermaid sandbox initialization timed out."));
+          }, Math.min(this.handshakeTimeoutMs, POST_LOAD_HANDSHAKE_MS));
+        }
+      },
       onError: () => {
         this.destroyFrame(instance, new Error("Mermaid sandbox frame failed to load."));
       },
@@ -296,6 +306,10 @@ export class MermaidSandboxClient {
         if (message.type === "ready") {
           instance.isReady = true;
           clearTimeout(instance.handshakeTimer);
+          if (instance.postLoadTimer !== null) {
+            clearTimeout(instance.postLoadTimer);
+            instance.postLoadTimer = null;
+          }
           clearInterval(instance.pingTimer);
           instance.resolveReady();
           return;
