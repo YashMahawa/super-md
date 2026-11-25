@@ -34,6 +34,46 @@ it('indexes every slider frame by title and step without mounting or changing th
  expect(source).toContain('Reasoning only');
 });
 
+it('scopes diagram lookup to a UTF-16 viewport range while preserving document-wide image definitions and code-point IDs',()=>{
+  const source=[
+    '[early-art]: assets/early.svg',
+    '',
+    '```mermaid',
+    'graph LR; Early-->Skip',
+    '```',
+    '',
+    '😀\ud83d Section before viewport',
+    '',
+    '![Early ref][early-art]',
+    '',
+    '```svg',
+    '<svg xmlns="http://www.w3.org/2000/svg"><rect width="10" height="10"/></svg>',
+    '```',
+    '',
+    '![Late ref][late-art]',
+    '',
+    '```mermaid',
+    'graph TD; Late-->Skip',
+    '```',
+    '',
+    '[late-art]: data:image/png;base64,iVBORw0KGgo=',
+  ].join('\n');
+  const full=agentDiagrams(source);
+  expect(full).toHaveLength(5);
+  const rangeStart=source.indexOf('![Early ref]');
+  const rangeEnd=source.indexOf('```mermaid\ngraph TD; Late');
+  const scoped=agentDiagrams(source,{start:rangeStart,end:rangeEnd});
+  expect(scoped.map(item=>item.id)).toEqual(full.slice(1,4).map(item=>item.id));
+  const scopedMeta=scoped.map(item=>diagramMetadata(source,item));
+  const fullMeta=full.slice(1,4).map(item=>diagramMetadata(source,item));
+  expect(scopedMeta).toEqual(fullMeta);
+  expect(scopedMeta[0].assetReference).toBe('assets/early.svg');
+  expect(scopedMeta[2].assetReference).toBe('(embedded image)');
+  expect(scopedMeta[1].sourceStart).toBe(Array.from(source.slice(0,scoped[1].start)).length);
+  expect(scopedMeta[1].sourceEnd).toBe(Array.from(source.slice(0,scoped[1].end)).length);
+  expect(agentDiagrams(source,{start:rangeStart,end:rangeStart})).toEqual([]);
+});
+
 it('indexes cached Matplotlib SVG and PNG figures per document without executing Python',async()=>{
  pythonResults.clear();
  const invokeSpy=vi.spyOn(nativeBridge,'invoke');
@@ -74,6 +114,19 @@ it('indexes cached Matplotlib SVG and PNG figures per document without executing
  expect(await mediaSvg.svg!()).toContain('<circle cx="15" cy="15" r="10"/>');
  const mediaPng=await diagramMedia(diagramsA[1]);
  expect(await mediaPng.uri!()).toBe(pngData);
+
+ const secondCell='plt.figure(); plt.plot([0, 1])';
+ const multiCellSource=`# 😀 Figures\n\n\`\`\`python\nprint("cell 1")\n\`\`\`\n\n\`\`\`python\n${secondCell}\n\`\`\``;
+ const ctxSecond={document:'/notes/a.md',cell:'0',interpreter:'embedded'};
+ const resultSecond={ok:true,stdout:'',stderr:'',images:[pngData],provenance:{verified:true,document:'/notes/a.md',cell:'0',interpreter:'embedded'}};
+ rememberPythonOutput(secondCell,resultSecond,ctxSecond);
+ const releaseSecond=retainVisiblePython(secondCell,resultSecond,ctxSecond);
+ const secondFenceStart=multiCellSource.indexOf(`\`\`\`python\n${secondCell}`);
+ const scopedPy=agentDiagrams(multiCellSource,{documentPath:'/notes/a.md',python:'embedded',range:{start:secondFenceStart,end:multiCellSource.length}});
+ expect(scopedPy).toHaveLength(1);
+ expect(scopedPy[0].label).toBe('Python cell 2 — Figure 1');
+ expect(scopedPy[0].id).toBe(`diagram:python:${Array.from(multiCellSource.slice(0,secondFenceStart)).length}:0`);
+ releaseSecond();
 
  expect(invokeSpy).not.toHaveBeenCalledWith('run_python',expect.anything());
  releaseVisible();
