@@ -136,6 +136,33 @@ class DropSafetyTest {
         assertTrue(shouldAcceptExternalDrag(localState = null, description = ClipDescription("pdf", arrayOf("application/pdf"))))
         assertTrue(shouldAcceptExternalDrag(localState = null, description = ClipDescription("zip", arrayOf("application/zip"))))
         assertTrue(shouldAcceptExternalDrag(localState = null, description = ClipDescription("link", arrayOf("text/plain", "text/uri-list"))))
+
+        var externalDrops = 0
+        val controller = ExternalDropDragController { externalDrops++ }
+        val dropEvent = org.robolectric.shadow.api.Shadow.newInstanceOf(android.view.DragEvent::class.java).also {
+            org.robolectric.util.ReflectionHelpers.setField(it, "mAction", android.view.DragEvent.ACTION_DROP)
+        }
+
+        // Plain-text / internal WebView drags must return false across the entire lifecycle so View.dispatchDragEvent
+        // delegates LOCATION, DROP, and ENDED to WebView.onDragEvent without swallowing drops.
+        assertFalse(controller.onDragAction(android.view.DragEvent.ACTION_DRAG_STARTED, null, plainDesc))
+        assertFalse(controller.onDragAction(android.view.DragEvent.ACTION_DRAG_ENTERED, null, plainDesc))
+        assertFalse(controller.onDragAction(android.view.DragEvent.ACTION_DRAG_LOCATION, null, plainDesc))
+        assertFalse(controller.onDrag(null, dropEvent))
+        assertFalse(controller.onDragAction(android.view.DragEvent.ACTION_DRAG_ENDED, null, null))
+        assertEquals(0, externalDrops)
+
+        // Accepted external file drags own the full session, invoke onExternalDrop on DROP, and reset on ENDED.
+        assertTrue(controller.onDragAction(android.view.DragEvent.ACTION_DRAG_STARTED, null, imageDesc))
+        assertTrue(controller.onDragAction(android.view.DragEvent.ACTION_DRAG_LOCATION, null, imageDesc))
+        assertTrue(controller.onDrag(null, dropEvent))
+        assertEquals(1, externalDrops)
+        assertTrue(controller.onDragAction(android.view.DragEvent.ACTION_DRAG_ENDED, null, null))
+
+        // Subsequent internal drags after an external session ends still fall through cleanly.
+        assertFalse(controller.onDragAction(android.view.DragEvent.ACTION_DRAG_STARTED, Any(), imageDesc))
+        assertFalse(controller.onDrag(null, dropEvent))
+        assertEquals(1, externalDrops)
     }
 
     @Test fun nativeDropGuardsOverlaysModalsAndExtractsOnlyContentOrFileUris() {

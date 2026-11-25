@@ -539,6 +539,45 @@ internal fun shouldAcceptExternalDrag(localState: Any?, description: android.con
     return false
 }
 
+internal class ExternalDropDragController(
+    private val onExternalDrop: (android.view.DragEvent) -> Unit,
+) : android.view.View.OnDragListener {
+    private var acceptingExternalDrag = false
+
+    override fun onDrag(view: android.view.View?, event: android.view.DragEvent): Boolean =
+        onDragAction(
+            action = event.action,
+            localState = event.localState,
+            description = event.clipDescription,
+            event = event,
+        )
+
+    internal fun onDragAction(
+        action: Int,
+        localState: Any?,
+        description: android.content.ClipDescription?,
+        event: android.view.DragEvent? = null,
+    ): Boolean {
+        return when (action) {
+            android.view.DragEvent.ACTION_DRAG_STARTED -> {
+                acceptingExternalDrag = shouldAcceptExternalDrag(localState, description)
+                acceptingExternalDrag
+            }
+            android.view.DragEvent.ACTION_DROP -> {
+                if (!acceptingExternalDrag) return false
+                if (event != null) onExternalDrop(event)
+                true
+            }
+            android.view.DragEvent.ACTION_DRAG_ENDED -> {
+                val handled = acceptingExternalDrag
+                acceptingExternalDrag = false
+                handled
+            }
+            else -> acceptingExternalDrag
+        }
+    }
+}
+
 internal fun shouldBlockNativeDrop(
     state: StudioState,
     folderSearchVisible: Boolean = false,
@@ -1381,44 +1420,37 @@ internal fun extractDroppedFileUris(clip: android.content.ClipData?): List<andro
                                     imagePicker.launch(arrayOf("image/*")); return true
                                 }
                             }
-                            setOnDragListener { _, event ->
-                                when(event.action) {
-                                    android.view.DragEvent.ACTION_DRAG_STARTED -> shouldAcceptExternalDrag(event.localState, event.clipDescription)
-                                    android.view.DragEvent.ACTION_DROP -> {
-                                        if (shouldBlockNativeDrop(
-                                                model.state.value,
-                                                folderSearchVisible = model.folderSearch.value.visible,
-                                                accessRequestOpen = model.documentAccessRequests.value != null,
-                                                settingsOpen = settings,
-                                                exporting = exporting,
-                                                renaming = renaming,
-                                                contentsShown = contentsShown,
-                                                drawerOpen = drawer.isOpen,
-                                            )) {
-                                            return@setOnDragListener true
-                                        }
-                                        val permissions = activity.requestDragAndDropPermissions(event)
-                                        val uris = extractDroppedFileUris(event.clipData)
-                                        if (uris.isNotEmpty()) {
-                                            val id = model.state.value.active.id
-                                            val x = event.x / density.density
-                                            val y = event.y / density.density
-                                            evaluateJavascript("window.supermdCaptureInsertion?.($x,$y)", null)
-                                            model.importDropped(uris, id) { images ->
-                                                permissions?.release()
-                                                images?.let { evaluateJavascript("window.supermdInsertImages?.($it)", null) }
-                                            }
-                                        } else {
-                                            permissions?.release()
-                                            if ((event.clipData?.itemCount ?: 0) > 0) {
-                                                model.importDropped(emptyList(), model.state.value.active.id) {}
-                                            }
-                                        }
-                                        true
-                                    }
-                                    else -> true
+                            setOnDragListener(ExternalDropDragController { event ->
+                                if (shouldBlockNativeDrop(
+                                        model.state.value,
+                                        folderSearchVisible = model.folderSearch.value.visible,
+                                        accessRequestOpen = model.documentAccessRequests.value != null,
+                                        settingsOpen = settings,
+                                        exporting = exporting,
+                                        renaming = renaming,
+                                        contentsShown = contentsShown,
+                                        drawerOpen = drawer.isOpen,
+                                    )) {
+                                    return@ExternalDropDragController
                                 }
-                            }
+                                val permissions = activity.requestDragAndDropPermissions(event)
+                                val uris = extractDroppedFileUris(event.clipData)
+                                if (uris.isNotEmpty()) {
+                                    val id = model.state.value.active.id
+                                    val x = event.x / density.density
+                                    val y = event.y / density.density
+                                    evaluateJavascript("window.supermdCaptureInsertion?.($x,$y)", null)
+                                    model.importDropped(uris, id) { images ->
+                                        permissions?.release()
+                                        images?.let { evaluateJavascript("window.supermdInsertImages?.($it)", null) }
+                                    }
+                                } else {
+                                    permissions?.release()
+                                    if ((event.clipData?.itemCount ?: 0) > 0) {
+                                        model.importDropped(emptyList(), model.state.value.active.id) {}
+                                    }
+                                }
+                            })
                         })
                     } }, modifier = Modifier.fillMaxSize().clipToBounds(), onRelease = { frame ->
                         val released = frame.getChildAt(0) as? WebView
