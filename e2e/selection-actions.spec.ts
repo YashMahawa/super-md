@@ -45,17 +45,23 @@ test('source-aware selection extraction matches Copy across reader, live, and sp
         font: 'Manrope',
         size: 16,
         zoom: 100,
+        restorePosition: false,
       });
     }, { mode, content });
+    await expect(page.locator(`.android-document.mode-${mode}`)).toBeVisible();
+    await page.evaluate(() => document.fonts.ready);
   };
+
+  const mediaMenu = page.getByRole('menu', { name: 'Save image or diagram' });
 
   // 1. Reader mode: math extraction (no duplicated KaTeX glyphs) + full & partial table serialization
   await loadMode('reader');
-  await expect(page.locator('.svg-diagram')).toBeVisible();
-  await expect(page.locator('.note-image img')).toBeVisible();
+  const diagram = page.locator('.mode-reader .svg-diagram');
+  await expect(diagram).toBeVisible();
+  await expect(page.locator('.mode-reader .note-image:not(.image-loading) img')).toBeVisible();
 
   const mathSelected = await page.evaluate(() => {
-    const p = document.querySelector('.markdown-body p')!;
+    const p = document.querySelector('.mode-reader .markdown-body p')!;
     const r = document.createRange();
     r.selectNodeContents(p);
     const s = window.getSelection()!;
@@ -75,16 +81,16 @@ test('source-aware selection extraction matches Copy across reader, live, and sp
   expect(mathSelected.extracted).toBe(mathSelected.copied);
 
   // While text is selected, right-clicking diagram yields media save menu and preserves selection
-  const diagram = page.locator('.svg-diagram');
+  await diagram.scrollIntoViewIfNeeded();
   const dbox = (await diagram.boundingBox())!;
   expect(await page.evaluate(({ x, y }) => window.supermdMediaMenuAt?.(x, y), { x: dbox.x + dbox.width / 2, y: dbox.y + dbox.height / 2 })).toBe(false);
   await diagram.click({ button: 'right' });
-  await expect(page.getByRole('menu', { name: 'Save image or diagram' })).toHaveCount(0);
+  await expect(mediaMenu).toHaveCount(0);
   expect(await page.evaluate(() => window.supermdSelectedText?.())).toBe('Conditional law $P(A|B) = \\frac{P(A \\cap B)}{P(B)}$ and norm $|x|$.');
 
   // Partial table selection (first body row only) preserves math & code pipes and escapes literal pipe
   const partialRow = await page.evaluate(() => {
-    const firstBodyRow = document.querySelector('.markdown-body tbody tr')!;
+    const firstBodyRow = document.querySelector('.mode-reader .markdown-body tbody tr')!;
     const r = document.createRange();
     r.selectNodeContents(firstBodyRow);
     const s = window.getSelection()!;
@@ -97,33 +103,37 @@ test('source-aware selection extraction matches Copy across reader, live, and sp
   // Clear selection -> right-clicking diagram now opens media save menu
   await page.evaluate(() => window.getSelection()?.removeAllRanges());
   await diagram.click({ button: 'right' });
-  await expect(page.getByRole('menu', { name: 'Save image or diagram' })).toBeVisible();
+  await expect(mediaMenu).toBeVisible();
   await page.keyboard.press('Escape');
+  await expect(mediaMenu).toHaveCount(0);
 
   // 2. Live mode: rendered selection + yielding .note-image inline tools, plus raw <textarea> block selection
   await loadMode('live');
-  await expect(page.locator('.note-image img')).toBeVisible();
+  const liveImage = page.locator('.mode-live .live-document .note-image');
+  await expect(page.locator('.mode-live .live-document .note-image:not(.image-loading) img')).toBeVisible();
+  await expect(page.locator('.mode-live .live-document p').first()).toBeVisible();
   await page.evaluate(() => {
-    const p = document.querySelector('.live-document p')!;
+    const p = document.querySelector('.mode-live .live-document p')!;
     const r = document.createRange();
     r.selectNodeContents(p);
     const s = window.getSelection()!;
     s.removeAllRanges();
     s.addRange(r);
   });
-  await page.locator('.note-image').click({ button: 'right' });
-  await expect(page.getByRole('menu', { name: 'Save image or diagram' })).toHaveCount(0);
+  await liveImage.click({ button: 'right' });
+  await expect(mediaMenu).toHaveCount(0);
   await expect(page.locator('.image-edit-tools')).toHaveCount(0);
   expect(await page.evaluate(() => window.supermdSelectedText?.())).toBe('Conditional law $P(A|B) = \\frac{P(A \\cap B)}{P(B)}$ and norm $|x|$.');
 
   // Clearing selection allows right-clicking .note-image in live mode to open the media menu
   await page.evaluate(() => window.getSelection()?.removeAllRanges());
-  await page.locator('.note-image').click({ button: 'right' });
-  await expect(page.getByRole('menu', { name: 'Save image or diagram' })).toBeVisible();
+  await liveImage.click({ button: 'right' });
+  await expect(mediaMenu).toBeVisible();
   await page.keyboard.press('Escape');
+  await expect(mediaMenu).toHaveCount(0);
 
   // Double-clicking a rendered paragraph in live mode activates its raw <textarea>; selecting inside it extracts raw source
-  await page.locator('.live-block p').first().dblclick();
+  await page.locator('.mode-live .live-block p').first().dblclick();
   const textarea = page.getByRole('textbox', { name: 'Edit Markdown block' });
   await expect(textarea).toBeVisible();
   const liveRaw = await textarea.evaluate((el: HTMLTextAreaElement) => {
@@ -136,11 +146,12 @@ test('source-aware selection extraction matches Copy across reader, live, and sp
 
   // 3. Split mode: preview selection AND CodeMirror .cm-editor selection
   await loadMode('split');
-  await expect(page.locator('.cm-editor')).toBeVisible();
-  await expect(page.locator('.markdown-body p').first()).toBeVisible();
+  await expect(page.locator('.mode-split .cm-editor')).toBeVisible();
+  await expect(page.locator('.mode-split .markdown-body p').first()).toBeVisible();
+  await expect(page.locator('.mode-split .note-image:not(.image-loading) img')).toBeVisible();
 
   const splitPreview = await page.evaluate(() => {
-    const p = document.querySelector('.markdown-body p')!;
+    const p = document.querySelector('.mode-split .markdown-body p')!;
     const r = document.createRange();
     r.selectNodeContents(p);
     const s = window.getSelection()!;
@@ -152,7 +163,8 @@ test('source-aware selection extraction matches Copy across reader, live, and sp
 
   // Select text inside CodeMirror editor via keyboard after focusing .cm-content
   await page.evaluate(() => window.getSelection()?.removeAllRanges());
-  await page.locator('.cm-content').click({ position: { x: 8, y: 8 } });
+  await page.locator('.mode-split .cm-line').first().click();
+  await expect(page.locator('.mode-split .cm-content')).toBeFocused();
   await page.keyboard.press('Home');
   await page.keyboard.press('Shift+End');
   const cmSelected = await page.evaluate(() => window.supermdSelectedText?.());
