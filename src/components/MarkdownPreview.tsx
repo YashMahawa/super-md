@@ -187,6 +187,7 @@ function AssetImage({ src = "", alt = "", documentPath, trustedImageHosts, onTru
 interface Props extends ReaderAccessibilityPreference {
   markdown: string;
   documentPath: string | null;
+  linkDocumentPath?: string | null;
   python: string;
   dark: boolean;
   trustedImageHosts?: string[];
@@ -206,6 +207,7 @@ interface MarkdownPreviewLiveState {
 
 interface MarkdownPreviewContextValue {
   documentPath: string | null;
+  linkDocumentPath: string | null;
   python: string;
   dark: boolean;
   trustedImageHosts: string[];
@@ -223,6 +225,7 @@ const DEFAULT_LIVE_STATE: RefObject<MarkdownPreviewLiveState> = {
 };
 const MarkdownPreviewContext = createContext<MarkdownPreviewContextValue>({
   documentPath: null,
+  linkDocumentPath: null,
   python: "",
   dark: false,
   trustedImageHosts: EMPTY_TRUSTED_IMAGE_HOSTS,
@@ -261,7 +264,7 @@ const MarkdownImage: Components['img'] = ({ src, alt }) => {
 };
 
 const MarkdownLink: Components['a'] = ({ node: _node, href, children, ...props }) => {
-  const { documentPath, onNotice } = useContext(MarkdownPreviewContext);
+  const { linkDocumentPath, onNotice } = useContext(MarkdownPreviewContext);
   const rawProps = props as Record<string, unknown>;
   const wikilinkTarget = typeof rawProps['data-wikilink'] === 'string' ? rawProps['data-wikilink'] : undefined;
   const wikilinkFragment = typeof rawProps['data-heading-fragment'] === 'string' ? rawProps['data-heading-fragment'] : undefined;
@@ -285,11 +288,11 @@ const MarkdownLink: Components['a'] = ({ node: _node, href, children, ...props }
           event.preventDefault();
           event.stopPropagation();
           event.currentTarget.dataset.visited = 'true';
-          if (!documentPath && (typeof window === 'undefined' || !window.SuperMD)) {
+          if (!linkDocumentPath && (typeof window === 'undefined' || !window.SuperMD)) {
             onNotice?.('Save this note before opening linked notes.');
             return;
           }
-          navigateWorkspaceLink(classified, documentPath, onNotice);
+          navigateWorkspaceLink(classified, linkDocumentPath, onNotice);
           return;
         }
         if (classified.kind === 'external') {
@@ -310,7 +313,7 @@ const MarkdownLink: Components['a'] = ({ node: _node, href, children, ...props }
 };
 
 const MarkdownPre: Components['pre'] = ({ node, children }) => {
-  const { documentPath, python, dark, trustedImageHosts, onTrustImageHost, onNotice, liveStateRef } = useContext(MarkdownPreviewContext);
+  const { documentPath, linkDocumentPath, python, dark, trustedImageHosts, onTrustImageHost, onNotice, liveStateRef } = useContext(MarkdownPreviewContext);
   const child = Children.only(children) as React.ReactElement<{ className?: string; children?: ReactNode }>;
   const language = child.props.className?.match(/language-([\w-]+)/)?.[1];
   const source = textOf(child.props.children).replace(/\n$/, "");
@@ -337,7 +340,7 @@ const MarkdownPre: Components['pre'] = ({ node, children }) => {
         sourceEnd={srcEnd}
         renderImage={(src, alt) => <AssetImage src={src} alt={alt} documentPath={documentPath} trustedImageHosts={trustedImageHosts} onTrustImageHost={onTrustImageHost} />}
         renderChart={chartSource => <ThemedChart source={chartSource} dark={dark} />}
-        renderMarkdown={text => <MemoizedMarkdownPreview markdown={text} documentPath={documentPath} python={python} dark={dark} trustedImageHosts={trustedImageHosts} onTrustImageHost={onTrustImageHost} onNotice={onNotice} />}
+        renderMarkdown={text => <MemoizedMarkdownPreview markdown={text} documentPath={documentPath} linkDocumentPath={linkDocumentPath} python={python} dark={dark} trustedImageHosts={trustedImageHosts} onTrustImageHost={onTrustImageHost} onNotice={onNotice} />}
       />
     </CodeBlockBoundary>
   );
@@ -357,10 +360,11 @@ const MARKDOWN_COMPONENTS: Components = {
   pre: MarkdownPre,
 };
 
-function MarkdownPreview({ markdown, documentPath, python, dark, trustedImageHosts = EMPTY_TRUSTED_IMAGE_HOSTS, onTrustImageHost, onChange, onNotice, renderBlock, fullDocumentAccessibility=false, sourceAnalysis }: Props) {
+function MarkdownPreview({ markdown, documentPath, linkDocumentPath, python, dark, trustedImageHosts = EMPTY_TRUSTED_IMAGE_HOSTS, onTrustImageHost, onChange, onNotice, renderBlock, fullDocumentAccessibility=false, sourceAnalysis }: Props) {
   useEffect(installMediaMenu,[]);
+  const resolvedLinkDocumentPath = linkDocumentPath === undefined ? documentPath : linkDocumentPath;
   const [linkNotice, setLinkNotice] = useState<string | null>(null);
-  useEffect(() => { setLinkNotice(null); }, [documentPath, markdown]);
+  useEffect(() => { setLinkNotice(null); }, [documentPath, resolvedLinkDocumentPath, markdown]);
   const reportNotice = useCallback((message: string) => {
     setLinkNotice(message);
     onNotice?.(message);
@@ -371,8 +375,8 @@ function MarkdownPreview({ markdown, documentPath, python, dark, trustedImageHos
   const liveStateRef=useRef<MarkdownPreviewLiveState>({markdown,tasks,onChange,pythonCells:analysis.pythonCells});
   liveStateRef.current={markdown,tasks,onChange,pythonCells:analysis.pythonCells};
   const previewContext=useMemo<MarkdownPreviewContextValue>(
-    ()=>({documentPath,python,dark,trustedImageHosts,onTrustImageHost,onNotice:reportNotice,editable,liveStateRef}),
-    [documentPath,python,dark,trustedImageHosts,onTrustImageHost,reportNotice,editable],
+    ()=>({documentPath,linkDocumentPath:resolvedLinkDocumentPath,python,dark,trustedImageHosts,onTrustImageHost,onNotice:reportNotice,editable,liveStateRef}),
+    [documentPath,resolvedLinkDocumentPath,python,dark,trustedImageHosts,onTrustImageHost,reportNotice,editable],
   );
   const resolvedSourceAnalysis=useMemo(
     ()=>sourceAnalysis?.source===markdown?sourceAnalysis:{source:markdown,analysis},

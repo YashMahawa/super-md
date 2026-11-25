@@ -433,4 +433,84 @@ describe("Source mode Ctrl/Cmd+Click workspace link navigation", () => {
       },
     });
   });
+
+  it("keeps embedded asset loading on state.id for unsaved drafts while passing empty documentPath to open_workspace_link", async () => {
+    class FakeIntersectionObserver {
+      constructor(_cb: IntersectionObserverCallback) {}
+      observe() {}
+      unobserve() {}
+      disconnect() {}
+    }
+    class FakeResizeObserver {
+      constructor(_cb: ResizeObserverCallback) {}
+      observe() {}
+      unobserve() {}
+      disconnect() {}
+    }
+    vi.stubGlobal("IntersectionObserver", FakeIntersectionObserver);
+    vi.stubGlobal("ResizeObserver", FakeResizeObserver);
+
+    postSpy.mockImplementation((id, cmd, rawArgs) => {
+      const args = JSON.parse(rawArgs || "{}");
+      postCalls.push({ id, command: cmd, args });
+      if (cmd === "load_asset") {
+        window.supermdReply?.(
+          id,
+          "data:image/svg+xml;utf8," + encodeURIComponent("<svg xmlns='http://www.w3.org/2000/svg' width='60' height='30'/>"),
+          null,
+        );
+        return;
+      }
+      if (cmd === "open_workspace_link") {
+        window.supermdReply?.(id, { opened: false, message: "Save this note before opening linked notes." }, null);
+        return;
+      }
+      window.supermdReply?.(id, { opened: true }, null);
+    });
+
+    const readerRootEl = document.createElement("div");
+    readerRootEl.id = "root";
+    document.body.append(readerRootEl);
+    root = createRoot(readerRootEl);
+    await act(async () => {
+      root?.render(<Reader />);
+    });
+
+    await act(async () => {
+      window.supermdLoad?.({
+        id: "draft-with-asset",
+        path: "draft-with-asset",
+        content: "# Draft\n\n![Proof](assets/proof.svg)\n\nFollow [[Task Note]].\n",
+        mode: "reader",
+        dark: false,
+        fullscreen: false,
+        font: "Manrope",
+        size: 16,
+        zoom: 100,
+        motion: false,
+        colors: {},
+      });
+    });
+
+    const loadAssetCall = postCalls.find((call) => call.command === "load_asset");
+    expect(loadAssetCall).toMatchObject({
+      command: "load_asset",
+      args: { documentPath: "draft-with-asset", source: "assets/proof.svg" },
+    });
+
+    const link = readerRootEl.querySelector<HTMLAnchorElement>(".android-reading a")!;
+    expect(link).not.toBeNull();
+    await act(async () => {
+      link.dispatchEvent(new MouseEvent("click", { bubbles: true, cancelable: true }));
+    });
+
+    const openLinkCall = postCalls.find((call) => call.command === "open_workspace_link");
+    expect(openLinkCall).toMatchObject({
+      command: "open_workspace_link",
+      args: { documentPath: "", target: "Task Note", fragment: "", wikilink: true },
+    });
+    expect(readerRootEl.querySelector('[role="status"].reader-link-notice')?.textContent).toBe(
+      "Save this note before opening linked notes.",
+    );
+  });
 });
