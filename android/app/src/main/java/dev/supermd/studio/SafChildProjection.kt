@@ -149,9 +149,11 @@ internal class SafProjectionPass(private val resolver: ContentResolver) {
             } else {
                 children.forEach { child ->
                     byDocId.putIfAbsent(DocKey(treeUri.toString(), child.documentId), child)
-                    confirmedKeysMutable.add(
-                        DocumentsContract.buildDocumentUriUsingTree(treeUri, child.documentId).toString(),
-                    )
+                    if (!child.isDirectory && !child.isVirtual) {
+                        confirmedKeysMutable.add(
+                            DocumentsContract.buildDocumentUriUsingTree(treeUri, child.documentId).toString(),
+                        )
+                    }
                 }
                 DirectoryProjection.Loaded(children)
             }
@@ -295,14 +297,14 @@ internal fun confirmThirdPartyTreeMembership(
     targetDocumentId: String,
     relativeHint: String? = null,
 ): Boolean {
-    if (targetDocumentId == rootDocumentId || pass.hasProjectedDocument(treeUri, targetDocumentId)) {
-        return true
-    }
+    fun isConfirmedDocument(): Boolean =
+        pass.findProjectedDocument(treeUri, targetDocumentId)?.let { !it.isDirectory && !it.isVirtual } == true
+
+    if (targetDocumentId == rootDocumentId) return true
+    pass.findProjectedDocument(treeUri, targetDocumentId)?.let { return !it.isDirectory && !it.isVirtual }
     if (!relativeHint.isNullOrBlank()) {
         pass.walkRelativeDirectory(treeUri, rootDocumentId, relativeHint.substringBeforeLast('/', ""))
-        if (pass.hasProjectedDocument(treeUri, targetDocumentId)) {
-            return true
-        }
+        pass.findProjectedDocument(treeUri, targetDocumentId)?.let { return !it.isDirectory && !it.isVirtual }
     }
     val visited = HashSet<String>()
     val queue = ArrayDeque<Pair<String, Int>>()
@@ -313,9 +315,7 @@ internal fun confirmThirdPartyTreeMembership(
         val (currentId, depth) = queue.removeFirst()
         projectedDirs++
         val projection = pass.projectDirectory(treeUri, currentId)
-        if (pass.hasProjectedDocument(treeUri, targetDocumentId)) {
-            return true
-        }
+        pass.findProjectedDocument(treeUri, targetDocumentId)?.let { return !it.isDirectory && !it.isVirtual }
         if (projection is SafProjectionPass.DirectoryProjection.Loaded && depth < MAX_SAF_RELATIVE_DEPTH) {
             for (child in projection.children) {
                 if (child.isDirectory && !child.isVirtual && visited.add(child.documentId)) {
@@ -324,7 +324,7 @@ internal fun confirmThirdPartyTreeMembership(
             }
         }
     }
-    return pass.hasProjectedDocument(treeUri, targetDocumentId)
+    return isConfirmedDocument()
 }
 
 private fun resolveNoteMetadataInPass(

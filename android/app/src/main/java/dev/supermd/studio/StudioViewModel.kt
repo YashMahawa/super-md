@@ -138,7 +138,7 @@ class StudioViewModel(app: Application, val workspaceKey: String = "main") : And
         isConfirmedTreeChildProvider = { treeUri, documentId ->
             val key = DocumentsContract.buildDocumentUriUsingTree(treeUri, documentId).toString()
             key in confirmedTreeDocumentKeys ||
-                runCatching { mutable.value.files.any { it.uri == key } }.getOrDefault(false)
+                runCatching { mutable.value.files.any { !it.directory && it.uri == key } }.getOrDefault(false)
         },
         onConfirmedTreeKeys = { keys -> confirmedTreeDocumentKeys.addAll(keys) },
     )
@@ -1979,7 +1979,6 @@ class StudioViewModel(app: Application, val workspaceKey: String = "main") : And
         require(note.portable && note.uri != null) { "This portable note has no saved destination" }
         require(agentContentRevision(note.content).equals(expectedRevision, ignoreCase = true)) { "The note changed since the supplied revision; no changes were saved" }
         val assets = media.portableAssets(note.assetDirectory)
-        val target = documentAccess.resolve(Uri.parse(note.uri), writing = true)
         val staged = File(getApplication<Application>().cacheDir, "agent-portable-save-${UUID.randomUUID()}.smd.gz")
         var openedDirectory: String? = null
         try { withContext(Dispatchers.IO) {
@@ -1988,6 +1987,7 @@ class StudioViewModel(app: Application, val workspaceKey: String = "main") : And
                 require(latest == note && agentContentRevision(latest.content).equals(expectedRevision, ignoreCase = true)) {
                     "The note changed since the supplied revision; no changes were saved"
                 }
+                val target = documentAccess.resolve(Uri.parse(latest.uri ?: error("This portable note has no saved destination")), writing = true)
                 val backup = resolver.openInputStream(target)?.use { readLimited(it, 120_000_000) }
                     ?: error("Cannot read the current portable note")
                 val disk = backup.inputStream().use(media::openFmd)
@@ -2388,7 +2388,20 @@ class StudioViewModel(app: Application, val workspaceKey: String = "main") : And
             withContext(Dispatchers.IO) { documentAccess.persist(uri) }
             listedRelative = ""
             windowPrefs.edit().putBoolean("folderMigrated", true).putString("folder", uri.toString()).putString("folderRelative", "").apply()
-            change { it.copy(folder = uri.toString(), folderRelative = "") }; listFolder(uri, "")
+            change { it.copy(folder = uri.toString(), folderRelative = "") }
+            val listJob = listFolder(uri, "")
+            if (blockedDocumentWrites.isNotEmpty()) {
+                listJob.join()
+                val candidates = blockedDocumentWrites.toList()
+                val unblocked = withContext(Dispatchers.IO) {
+                    if (!documentAccess.hasWriteGrant(uri)) emptyList()
+                    else candidates.filter { raw ->
+                        val resolved = documentAccess.resolve(Uri.parse(raw), writing = true)
+                        resolved.toString() != raw && documentAccess.hasWriteGrant(resolved)
+                    }
+                }
+                unblocked.forEach(::clearDocumentAccessFailure)
+            }
         } catch (error: Exception) { fail("Could not open folder: ${error.message}") }
     }
     fun closeFolder() {

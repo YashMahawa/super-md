@@ -584,16 +584,14 @@ class SafChildProjectionTest {
         assertEquals("# Beta updated externally\n", opaqueProvider.readBackingText("doc_beta"))
         model.dismissDocumentAccess()
 
-        // Upgrading the persisted folder grant to READ + WRITE enables manual save and autosave on both plain notes.
+        // Upgrading the containing folder grant to READ + WRITE via setFolder unblocks manual save and autosave on both plain notes.
         app.grantUriPermission(
             app.packageName,
             opaqueTree,
             rwFlags or Intent.FLAG_GRANT_PERSISTABLE_URI_PERMISSION,
         )
-        app.contentResolver.takePersistableUriPermission(opaqueTree, rwFlags)
-        // Clear blocked write state via explicit save once write grant is present.
-        val clearField = StudioViewModel::class.java.getDeclaredField("blockedDocumentWrites").apply { isAccessible = true }
-        (clearField.get(model) as MutableSet<*>).clear()
+        model.setFolder(opaqueTree)
+        await { model.state.value.folder == opaqueTree.toString() && model.state.value.files.isNotEmpty() && !model.documentWriteNeedsAccess(betaId) }
 
         model.saveManual(noteId = betaId)
         await { !model.state.value.tabs.single { it.id == betaId }.dirty }

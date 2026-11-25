@@ -220,6 +220,7 @@ class DocumentAccessTest {
                             "opaque_vault" -> {
                                 addRow(arrayOf<Any?>("opaque_note_1", "Migrated.md", "text/markdown", 0))
                                 addRow(arrayOf<Any?>("opaque_subdir", "Sub", DocumentsContract.Document.MIME_TYPE_DIR, 0))
+                                addRow(arrayOf<Any?>("opaque_virtual_shortcut", "Shortcut.md", "text/markdown", DocumentsContract.Document.FLAG_VIRTUAL_DOCUMENT))
                             }
                             "opaque_subdir" -> {
                                 addRow(arrayOf<Any?>("nested_opaque_note", "Nested.md", "text/markdown", 0))
@@ -254,6 +255,8 @@ class DocumentAccessTest {
 
         val plainNote = DocumentsContract.buildDocumentUri(thirdPartyAuthority, "opaque_note_1")
         val plainNested = DocumentsContract.buildDocumentUri(thirdPartyAuthority, "nested_opaque_note")
+        val plainSubdir = DocumentsContract.buildDocumentUri(thirdPartyAuthority, "opaque_subdir")
+        val plainVirtual = DocumentsContract.buildDocumentUri(thirdPartyAuthority, "opaque_virtual_shortcut")
         val plainOutside = DocumentsContract.buildDocumentUri(thirdPartyAuthority, "outside_ungranted_note")
         val vaultTree = DocumentsContract.buildTreeDocumentUri(thirdPartyAuthority, "opaque_vault")
         val expectedTreeNote = DocumentsContract.buildDocumentUriUsingTree(vaultTree, "opaque_note_1")
@@ -279,8 +282,10 @@ class DocumentAccessTest {
         assertEquals(plainNote, access.resolve(plainNote, writing = true))
         assertEquals(queriesBeforeWriteCheck, thirdPartyProvider.childQueries)
 
-        // Out-of-tree plain URI on the same provider must NOT upgrade to vaultTree.
+        // Out-of-tree plain URI, directory entry, and virtual document must NOT upgrade to vaultTree.
         assertEquals(plainOutside, access.resolve(plainOutside, writing = false))
+        assertEquals(plainSubdir, access.resolve(plainSubdir, writing = false))
+        assertEquals(plainVirtual, access.resolve(plainVirtual, writing = false))
         assertEquals(0, thirdPartyProvider.singleDocQueries)
 
         // 3. Upgrade containing folder grant to read + write -> both root and nested plain notes resolve for write too.
