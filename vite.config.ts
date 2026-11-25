@@ -64,12 +64,14 @@ function mermaidSandboxPlugin(): Plugin {
   const virtualId = "virtual:mermaid-sandbox-url";
   const resolvedId = "\0" + virtualId;
   const devRoute = "/@mermaid-sandbox.html";
+  const devScriptRoute = "/@mermaid-sandbox.js";
   let isServe = false;
-  let cachedHtmlPromise: Promise<string> | null = null;
+  let isNative = false;
+  let cachedBundlePromise: Promise<{ script: string; html: string }> | null = null;
 
-  const getSandboxHtml = () => {
-    if (!cachedHtmlPromise) {
-      cachedHtmlPromise = (async () => {
+  const getSandboxBundle = () => {
+    if (!cachedBundlePromise) {
+      cachedBundlePromise = (async () => {
         const esbuild = await import("esbuild");
         const entry = fileURLToPath(new URL("./src/mermaidSandboxEntry.ts", import.meta.url));
         const bundled = await esbuild.build({
@@ -80,6 +82,7 @@ function mermaidSandboxPlugin(): Plugin {
           platform: "browser",
           target: "es2020",
           charset: "ascii",
+          legalComments: "none",
           minify: true,
           alias: {
             "decode-named-character-reference": fileURLToPath(
@@ -88,16 +91,17 @@ function mermaidSandboxPlugin(): Plugin {
           },
         });
         const script = bundled.outputFiles[0]?.text ?? "";
-        return renderSandboxDocument(script);
+        return { script, html: renderSandboxDocument(script) };
       })();
     }
-    return cachedHtmlPromise;
+    return cachedBundlePromise;
   };
 
   return {
     name: "supermd-mermaid-sandbox",
     configResolved(config) {
       isServe = config.command === "serve";
+      isNative = config.mode === "native";
     },
     resolveId(id) {
       if (id === virtualId) return resolvedId;
@@ -106,17 +110,24 @@ function mermaidSandboxPlugin(): Plugin {
     configureServer(server) {
       server.middlewares.use(async (req, res, next) => {
         const requestPath = req.url?.split("?", 1)[0];
-        if (requestPath !== devRoute || (req.method !== "GET" && req.method !== "HEAD")) {
+        if (
+          (requestPath !== devRoute && requestPath !== devScriptRoute) ||
+          (req.method !== "GET" && req.method !== "HEAD")
+        ) {
           next();
           return;
         }
         try {
-          cachedHtmlPromise = null;
-          const html = await getSandboxHtml();
+          cachedBundlePromise = null;
+          const bundle = await getSandboxBundle();
+          const isScript = requestPath === devScriptRoute;
           res.statusCode = 200;
-          res.setHeader("Content-Type", "text/html; charset=utf-8");
+          res.setHeader(
+            "Content-Type",
+            isScript ? "application/javascript; charset=utf-8" : "text/html; charset=utf-8",
+          );
           res.setHeader("Cache-Control", "no-store");
-          res.end(req.method === "HEAD" ? undefined : html);
+          res.end(req.method === "HEAD" ? undefined : isScript ? bundle.script : bundle.html);
         } catch (error) {
           next(error);
         }
@@ -125,15 +136,29 @@ function mermaidSandboxPlugin(): Plugin {
     async load(id) {
       if (id !== resolvedId) return null;
       if (isServe) {
-        return `export default ${JSON.stringify(devRoute)};`;
+        return `export const sandboxScriptUrl = ${JSON.stringify(devScriptRoute)}; export default ${JSON.stringify(devRoute)};`;
       }
-      const html = await getSandboxHtml();
+      const bundle = await getSandboxBundle();
       const refId = this.emitFile({
         type: "asset",
         name: "mermaid-sandbox.html",
-        source: html,
+        source: bundle.html,
       });
-      return `export default new URL(import.meta.ROLLUP_FILE_URL_${refId}, import.meta.url).href;`;
+      if (!isNative && !process.env.TAURI_ENV_PLATFORM) {
+        const scriptRefId = this.emitFile({
+          type: "asset",
+          name: "mermaid-sandbox.js",
+          source: bundle.script,
+        });
+        return [
+          `export const sandboxScriptUrl = new URL(import.meta.ROLLUP_FILE_URL_${scriptRefId}, import.meta.url).href;`,
+          `export default new URL(import.meta.ROLLUP_FILE_URL_${refId}, import.meta.url).href;`,
+        ].join("\n");
+      }
+      return [
+        "export const sandboxScriptUrl = undefined;",
+        `export default new URL(import.meta.ROLLUP_FILE_URL_${refId}, import.meta.url).href;`,
+      ].join("\n");
     },
   };
 }
@@ -202,7 +227,7 @@ export default defineConfig(({mode}) => ({
     port: 1420,
     strictPort: true,
     watch: {
-      ignored: ["**/src-tauri/target/**", "**/smd-core/target/**", "**/android/**/build/**", "**/desktop/.venv/**"],
+      ignored: ["**/dist/**", "**/src-tauri/target/**", "**/smd-core/target/**", "**/android/**/build/**", "**/desktop/.venv/**"],
     },
   },
   envPrefix: ["VITE_", "TAURI_"]

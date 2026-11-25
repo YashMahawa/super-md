@@ -17,6 +17,7 @@ import {
   SANDBOX_CHANNEL,
   buildSandboxCsp,
   buildSandboxHtml,
+  buildSandboxSrcdoc,
 } from "./mermaidSandboxProtocol";
 
 describe("Mermaid sandbox isolation and message channel", () => {
@@ -309,5 +310,116 @@ describe("Mermaid sandbox isolation and message channel", () => {
     });
     await expect(renderMermaid(cssImportSource, false)).rejects.toThrow(/External SVG styles/i);
     expect(cachedMermaid(cssImportSource, false)).toBeUndefined();
+  });
+
+  it("serializes concurrent client.render calls and ignores foreign non-channel postMessage traffic", async () => {
+    const order: string[] = [];
+    const client = new MermaidSandboxClient({
+      resolveSandboxUrl: async () => "about:blank",
+      loadVitestEngine: async () => ({
+        initialize: () => {},
+        render: async (id, text) => {
+          order.push(`start:${id}`);
+          await new Promise(resolve => setTimeout(resolve, id === "smd-c1" ? 20 : 5));
+          order.push(`end:${id}`);
+          if (text.includes("INVALID")) {
+            throw new Error("Parse error on line 3: unexpected token");
+          }
+          return { svg: `<svg xmlns="http://www.w3.org/2000/svg"><text>${id}</text></svg>` };
+        },
+      }),
+    });
+
+    // Launch three renders concurrently (including an invalid diagram) while injecting
+    // foreign string/primitive/object postMessage noise from the iframe's contentWindow.
+    const p1 = client.render("smd-c1", "classDiagram\n  Animal <|-- Duck", false);
+    const p2 = client.render("smd-c2", "flowchart TD\n  A -->\n  INVALID", false);
+    const p3 = client.render("smd-c3", "gantt\n  title Plan", false);
+
+    await new Promise(resolve => setTimeout(resolve, 5));
+    const frameWin = client.activeIframe?.contentWindow;
+    expect(frameWin).toBeTruthy();
+    window.dispatchEvent(new MessageEvent("message", { data: "extension-string-ping", origin: "null", source: frameWin }));
+    window.dispatchEvent(new MessageEvent("message", { data: null, origin: "null", source: frameWin }));
+    window.dispatchEvent(
+      new MessageEvent("message", { data: { source: "devtools-bridge" }, origin: "null", source: frameWin }),
+    );
+
+    const [r1, r2, r3] = await Promise.allSettled([p1, p2, p3]);
+    expect(r1).toEqual({
+      status: "fulfilled",
+      value: '<svg xmlns="http://www.w3.org/2000/svg"><text>smd-c1</text></svg>',
+    });
+    expect(r2.status).toBe("rejected");
+    expect((r2 as PromiseRejectedResult).reason.message).toContain("Parse error on line 3");
+    expect(r3).toEqual({
+      status: "fulfilled",
+      value: '<svg xmlns="http://www.w3.org/2000/svg"><text>smd-c3</text></svg>',
+    });
+    expect(order).toEqual(["start:smd-c1", "end:smd-c1", "start:smd-c2", "end:smd-c2", "start:smd-c3", "end:smd-c3"]);
+    client.dispose();
+  });
+
+  it("falls back to an opaque-origin srcdoc script frame when HTML subframe navigation is intercepted", async () => {
+    const srcdoc = buildSandboxSrcdoc("http://localhost:4173/assets/mermaid-sandbox-abc123.js");
+    expect(srcdoc).toContain("default-src 'none'");
+    expect(srcdoc).toContain("script-src http://localhost:4173/assets/mermaid-sandbox-abc123.js 'wasm-unsafe-eval'");
+    expect(srcdoc).toContain('<script src="http://localhost:4173/assets/mermaid-sandbox-abc123.js"></script>');
+    expect(() => buildSandboxSrcdoc('javascript:alert("xss")')).toThrow(/Invalid Mermaid sandbox script URL/);
+
+    const observedModes: Array<"src" | "srcdoc"> = [];
+    const fallbackClient = new MermaidSandboxClient({
+      handshakeTimeoutMs: 30,
+      resolveSandboxUrl: async () => "http://localhost:4173/assets/mermaid-sandbox-abc123.html",
+      resolveSandboxScriptUrl: async () => "http://localhost:4173/assets/mermaid-sandbox-abc123.js",
+      attachFrameHook: (iframe, hostWin) => {
+        const mode = iframe.hasAttribute("srcdoc") ? "srcdoc" : "src";
+        observedModes.push(mode);
+        if (mode === "src") {
+          // Simulate an intercepted .html navigation that never posts ready.
+          return undefined;
+        }
+        queueMicrotask(() => {
+          hostWin.dispatchEvent(
+            new MessageEvent("message", {
+              data: { channel: SANDBOX_CHANNEL, type: "ready" },
+              origin: "null",
+              source: iframe.contentWindow,
+            }),
+          );
+        });
+        if (iframe.contentWindow) {
+          iframe.contentWindow.postMessage = ((msg: unknown) => {
+            const req = msg as Record<string, unknown>;
+            if (req.type !== "render") return;
+            queueMicrotask(() => {
+              hostWin.dispatchEvent(
+                new MessageEvent("message", {
+                  data: {
+                    channel: SANDBOX_CHANNEL,
+                    type: "result",
+                    frameToken: req.frameToken,
+                    requestId: req.requestId,
+                    ok: true,
+                    svg: `<svg xmlns="http://www.w3.org/2000/svg"><text>${String(req.id)}</text></svg>`,
+                  },
+                  origin: "null",
+                  source: iframe.contentWindow,
+                }),
+              );
+            });
+          }) as typeof iframe.contentWindow.postMessage;
+        }
+        return undefined;
+      },
+    });
+
+    const firstSvg = await fallbackClient.render("smd-fb-1", "classDiagram\n  A <|-- B", false);
+    const secondSvg = await fallbackClient.render("smd-fb-2", "gantt\n  title Next", false);
+    expect(firstSvg).toContain("smd-fb-1");
+    expect(secondSvg).toContain("smd-fb-2");
+    expect(observedModes).toEqual(["src", "srcdoc"]);
+    expect(fallbackClient.activeIframe?.getAttribute("sandbox")).toBe("allow-scripts");
+    fallbackClient.dispose();
   });
 });

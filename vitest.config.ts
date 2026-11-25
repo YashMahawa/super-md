@@ -7,7 +7,9 @@ export default defineConfig({
         return id === "virtual:mermaid-sandbox-url" ? "\0virtual:mermaid-sandbox-url" : null;
       },
       load(id) {
-        return id === "\0virtual:mermaid-sandbox-url" ? 'export default "about:blank";' : null;
+        return id === "\0virtual:mermaid-sandbox-url"
+          ? 'export const sandboxScriptUrl = undefined; export default "about:blank";'
+          : null;
       },
     },
   ],

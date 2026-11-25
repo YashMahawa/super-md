@@ -73,6 +73,29 @@ export function buildSandboxHtml(iifeScript: string, sha256OfEscapedScript: (esc
   return `<!doctype html><html><head><meta charset="utf-8"><meta http-equiv="Content-Security-Policy" content="${csp}"></head><body style="margin:0;padding:0;overflow:hidden"><script>${escaped}</script></body></html>`;
 }
 
+export function buildSandboxSrcdoc(scriptUrl: string): string {
+  if (!/^(?:https?:\/\/|\/)[^\s"';<>]+$/i.test(scriptUrl)) {
+    throw new Error("Invalid Mermaid sandbox script URL.");
+  }
+  const csp = [
+    "default-src 'none'",
+    `script-src ${scriptUrl} 'wasm-unsafe-eval'`,
+    "style-src 'unsafe-inline'",
+    "img-src data:",
+    "font-src data:",
+    "connect-src 'none'",
+    "worker-src 'none'",
+    "frame-src 'none'",
+    "child-src 'none'",
+    "object-src 'none'",
+    "media-src 'none'",
+    "form-action 'none'",
+    "base-uri 'none'",
+  ].join("; ");
+  const escapedAttr = scriptUrl.replace(/&/g, "&amp;");
+  return `<!doctype html><html><head><meta charset="utf-8"><meta http-equiv="Content-Security-Policy" content="${csp}"></head><body style="margin:0;padding:0;overflow:hidden"><script src="${escapedAttr}"></script></body></html>`;
+}
+
 export function isSandboxPingMessage(value: unknown): value is SandboxPingMessage {
   if (!value || typeof value !== "object") return false;
   const candidate = value as Record<string, unknown>;

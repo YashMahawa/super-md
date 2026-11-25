@@ -714,6 +714,7 @@ button.code-copy:active { border-radius:10px; }
 .svg-figure { margin: 1.4em 0; display: flex; justify-content: center; }
 .svg-figure img.svg-diagram { display: block; width:100%; max-width: 100%; min-width:0; height: auto; box-sizing:border-box; }
 .svg-figure--color img.svg-diagram { padding: 16px; border-radius: 20px; background: #fdfdfc; box-shadow: 0 0 0 1px var(--code-border); }
+.mermaid[data-render-dark="true"] .svg-figure--color img.svg-diagram { background: var(--surface, #19171b); }
 .svg-figure--own-background img.svg-diagram { border-radius: 16px; }
 .media-save-menu{position:fixed;z-index:2147483000;min-width:240px;max-width:calc(100vw - 16px);padding:8px;border:1px solid var(--border,#7776);border-radius:18px;background:var(--surface,#fff);color:var(--text,#20252d);box-shadow:0 14px 42px #0004;font:14px/1.45 'Manrope Variable',sans-serif;filter:none;user-select:none}
 .media-save-title{padding:7px 12px;color:var(--muted,var(--text));font-size:12px;max-width:320px;overflow-wrap:anywhere}

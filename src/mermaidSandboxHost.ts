@@ -6,9 +6,13 @@ import {
   MAX_SANDBOX_SVG_CHARS,
   SANDBOX_CHANNEL,
   buildSandboxHtml,
+  buildSandboxSrcdoc,
   type SandboxRenderRequest,
 } from "./mermaidSandboxProtocol";
 import { installMermaidSandboxWorker, type MermaidEngineLike } from "./mermaidSandboxWorker";
+
+const FAST_PRIMARY_HANDSHAKE_MS = 3_000;
+const HANDSHAKE_PING_INTERVAL_MS = 250;
 
 type ActiveRequest = {
   requestId: string;
@@ -25,6 +29,7 @@ type FrameInstance = {
   resolveReady: () => void;
   rejectReady: (error: Error) => void;
   handshakeTimer: ReturnType<typeof setTimeout>;
+  pingTimer: ReturnType<typeof setInterval>;
   activeRequest: ActiveRequest | null;
   disposeHook?: () => void;
   disposed: boolean;
@@ -33,11 +38,17 @@ type FrameInstance = {
   onError: () => void;
 };
 
+type ResolvedSandboxAssets = {
+  url: string;
+  scriptUrl?: string;
+};
+
 export type MermaidSandboxClientOptions = {
   hostWindow?: Window;
   handshakeTimeoutMs?: number;
   renderTimeoutMs?: number;
   resolveSandboxUrl?: () => Promise<string>;
+  resolveSandboxScriptUrl?: () => Promise<string | undefined>;
   attachFrameHook?: (iframe: HTMLIFrameElement, hostWindow: Window) => (() => void) | undefined;
   loadVitestEngine?: () => Promise<MermaidEngineLike>;
 };
@@ -51,9 +62,9 @@ function randomToken(): string {
   return `${Date.now().toString(16)}-${Math.random().toString(16).slice(2)}`;
 }
 
-async function defaultResolveSandboxUrl(): Promise<string> {
+async function defaultResolveSandboxAssets(): Promise<ResolvedSandboxAssets> {
   const mod = await import("virtual:mermaid-sandbox-url");
-  return mod.default;
+  return { url: mod.default, scriptUrl: mod.sandboxScriptUrl };
 }
 
 function createVitestJsdomBridge(
@@ -124,10 +135,12 @@ function createVitestJsdomBridge(
 
 export class MermaidSandboxClient {
   private frame: FrameInstance | null = null;
+  private renderQueue: Promise<void> = Promise.resolve();
+  private preferSrcdocFallback = false;
   private readonly hostWindow: Window;
   private readonly handshakeTimeoutMs: number;
   private readonly renderTimeoutMs: number;
-  private readonly resolveSandboxUrl: () => Promise<string>;
+  private readonly resolveAssets: () => Promise<ResolvedSandboxAssets>;
   private readonly attachFrameHook?: (iframe: HTMLIFrameElement, hostWindow: Window) => (() => void) | undefined;
   private readonly loadVitestEngine?: () => Promise<MermaidEngineLike>;
 
@@ -135,7 +148,18 @@ export class MermaidSandboxClient {
     this.hostWindow = options.hostWindow ?? window;
     this.handshakeTimeoutMs = options.handshakeTimeoutMs ?? DEFAULT_HANDSHAKE_TIMEOUT_MS;
     this.renderTimeoutMs = options.renderTimeoutMs ?? DEFAULT_RENDER_TIMEOUT_MS;
-    this.resolveSandboxUrl = options.resolveSandboxUrl ?? defaultResolveSandboxUrl;
+    if (options.resolveSandboxUrl || options.resolveSandboxScriptUrl) {
+      const urlResolver = options.resolveSandboxUrl;
+      const scriptResolver = options.resolveSandboxScriptUrl;
+      this.resolveAssets = async () => {
+        const defaults = urlResolver ? undefined : await defaultResolveSandboxAssets();
+        const url = urlResolver ? await urlResolver() : defaults!.url;
+        const scriptUrl = scriptResolver ? await scriptResolver() : defaults?.scriptUrl;
+        return { url, scriptUrl };
+      };
+    } else {
+      this.resolveAssets = defaultResolveSandboxAssets;
+    }
     this.attachFrameHook = options.attachFrameHook;
     this.loadVitestEngine = options.loadVitestEngine;
   }
@@ -157,12 +181,14 @@ export class MermaidSandboxClient {
       this.frame = null;
     }
     clearTimeout(target.handshakeTimer);
+    clearInterval(target.pingTimer);
     this.hostWindow.removeEventListener("message", target.onMessage);
     target.iframe.removeEventListener("load", target.onLoad);
     target.iframe.removeEventListener("error", target.onError);
     target.disposeHook?.();
     try {
       target.iframe.removeAttribute("src");
+      target.iframe.removeAttribute("srcdoc");
       target.iframe.remove();
     } catch {
       // Best-effort DOM cleanup.
@@ -176,7 +202,17 @@ export class MermaidSandboxClient {
     }
   }
 
-  private async ensureFrame(): Promise<FrameInstance> {
+  private resolveHttpScriptUrl(rawScriptUrl?: string): string | undefined {
+    if (!rawScriptUrl) return undefined;
+    try {
+      const resolved = new URL(rawScriptUrl, this.hostWindow.location?.href || undefined).href;
+      return /^https?:\/\//i.test(resolved) ? resolved : undefined;
+    } catch {
+      return undefined;
+    }
+  }
+
+  private async ensureFrame(mode?: "src" | "srcdoc"): Promise<FrameInstance> {
     if (this.frame && !this.frame.disposed) {
       if (this.frame.iframe.isConnected && this.frame.iframe.contentWindow) {
         return this.frame;
@@ -184,7 +220,15 @@ export class MermaidSandboxClient {
       this.destroyFrame(this.frame, new Error("Mermaid sandbox frame crashed."));
     }
 
-    const sandboxUrl = await this.resolveSandboxUrl();
+    const assets = await this.resolveAssets();
+    const fallbackScriptUrl = this.resolveHttpScriptUrl(assets.scriptUrl);
+    const desiredMode = mode ?? (this.preferSrcdocFallback ? "srcdoc" : "src");
+    const useSrcdoc = desiredMode === "srcdoc" && Boolean(fallbackScriptUrl);
+    const effectiveHandshakeMs =
+      !useSrcdoc && Boolean(fallbackScriptUrl)
+        ? Math.min(this.handshakeTimeoutMs, FAST_PRIMARY_HANDSHAKE_MS)
+        : this.handshakeTimeoutMs;
+
     const doc = this.hostWindow.document;
     const mountRoot = doc.documentElement;
     if (!mountRoot) {
@@ -197,11 +241,11 @@ export class MermaidSandboxClient {
     iframe.setAttribute("aria-hidden", "true");
     iframe.tabIndex = -1;
     iframe.dataset.mermaidSandbox = "true";
-    // Keep the 1x1 transparent frame inside the visual viewport so Chromium
-    // Blink never classifies the opaque-origin subframe as offscreen/throttled
-    // (which pauses cross-origin subframe layout/rAF on Android WebView).
+    // Keep the 1x1 transparent frame inside the visual viewport without negative
+    // z-index occlusion so Chromium Blink and desktop GPU compositors never classify
+    // the opaque-origin OOPIF as offscreen/occluded.
     iframe.style.cssText =
-      "position:fixed;left:0;top:0;width:1px;height:1px;opacity:0;pointer-events:none;border:0;z-index:-2147483648;background:transparent;overflow:hidden";
+      "position:fixed;left:0;top:0;width:1px;height:1px;opacity:0;pointer-events:none;border:0;background:transparent;overflow:hidden";
 
     const frameToken = randomToken();
     let resolveReady!: () => void;
@@ -212,6 +256,15 @@ export class MermaidSandboxClient {
     });
     void ready.catch(() => {});
 
+    const sendPing = () => {
+      if (instance.disposed || instance.isReady) return;
+      try {
+        instance.iframe.contentWindow?.postMessage({ channel: SANDBOX_CHANNEL, type: "ping" }, "*");
+      } catch {
+        // Handshake timer handles unresponsive frames.
+      }
+    };
+
     const instance: FrameInstance = {
       iframe,
       frameToken,
@@ -221,17 +274,11 @@ export class MermaidSandboxClient {
       rejectReady,
       handshakeTimer: setTimeout(() => {
         this.destroyFrame(instance, new Error("Mermaid sandbox initialization timed out."));
-      }, this.handshakeTimeoutMs),
+      }, effectiveHandshakeMs),
+      pingTimer: setInterval(sendPing, HANDSHAKE_PING_INTERVAL_MS),
       activeRequest: null,
       disposed: false,
-      onLoad: () => {
-        if (instance.disposed || instance.isReady) return;
-        try {
-          instance.iframe.contentWindow?.postMessage({ channel: SANDBOX_CHANNEL, type: "ping" }, "*");
-        } catch {
-          // Handshake timer handles unresponsive frames.
-        }
-      },
+      onLoad: sendPing,
       onError: () => {
         this.destroyFrame(instance, new Error("Mermaid sandbox frame failed to load."));
       },
@@ -240,16 +287,16 @@ export class MermaidSandboxClient {
         if (!instance.iframe.contentWindow || event.source !== instance.iframe.contentWindow) return;
         if (event.origin !== "null") return;
         const raw = event.data;
-        if (!raw || typeof raw !== "object") {
-          this.destroyFrame(instance, new Error("Malformed message from Mermaid sandbox."));
-          return;
-        }
+        // Ignore foreign non-object or non-channel postMessage traffic (such as
+        // browser extensions running content scripts in all frames).
+        if (!raw || typeof raw !== "object") return;
         const message = raw as Record<string, unknown>;
         if (message.channel !== SANDBOX_CHANNEL) return;
 
         if (message.type === "ready") {
           instance.isReady = true;
           clearTimeout(instance.handshakeTimer);
+          clearInterval(instance.pingTimer);
           instance.resolveReady();
           return;
         }
@@ -279,14 +326,22 @@ export class MermaidSandboxClient {
             return;
           }
           this.destroyFrame(instance, new Error("Invalid result payload from Mermaid sandbox."));
+          return;
         }
+
+        this.destroyFrame(instance, new Error("Malformed message from Mermaid sandbox."));
       },
     };
+    (instance.pingTimer as unknown as { unref?: () => void }).unref?.();
 
     this.hostWindow.addEventListener("message", instance.onMessage);
     iframe.addEventListener("load", instance.onLoad);
     iframe.addEventListener("error", instance.onError);
-    iframe.src = sandboxUrl;
+    if (useSrcdoc && fallbackScriptUrl) {
+      iframe.srcdoc = buildSandboxSrcdoc(fallbackScriptUrl);
+    } else {
+      iframe.src = assets.url;
+    }
     // Mount on document.documentElement, NEVER on document.body.
     mountRoot.appendChild(iframe);
 
@@ -302,19 +357,34 @@ export class MermaidSandboxClient {
     return instance;
   }
 
-  async render(id: string, source: string, dark: boolean): Promise<string> {
+  render(id: string, source: string, dark: boolean): Promise<string> {
     if (source.length > MAX_MERMAID_SOURCE_CHARS) {
-      throw new Error("Mermaid diagram source exceeds maximum size.");
+      return Promise.reject(new Error("Mermaid diagram source exceeds maximum size."));
     }
+    const job = this.renderQueue.then(() => this.renderSerial(id, source, dark));
+    this.renderQueue = job.then(
+      () => undefined,
+      () => undefined,
+    );
+    return job;
+  }
+
+  private async renderSerial(id: string, source: string, dark: boolean): Promise<string> {
+    const firstMode: "src" | "srcdoc" = this.preferSrcdocFallback ? "srcdoc" : "src";
     let frame: FrameInstance | null = null;
     try {
-      frame = await this.ensureFrame();
+      frame = await this.ensureFrame(firstMode);
       await frame.ready;
     } catch (error) {
       if (frame && !frame.disposed) {
         this.destroyFrame(frame, error instanceof Error ? error : new Error("Mermaid sandbox handshake failed."));
       }
-      const fresh = await this.ensureFrame();
+      const assets = await this.resolveAssets();
+      const hasScriptFallback = Boolean(this.resolveHttpScriptUrl(assets.scriptUrl));
+      const retryMode: "src" | "srcdoc" =
+        hasScriptFallback && firstMode === "src" ? "srcdoc" : "src";
+      this.preferSrcdocFallback = retryMode === "srcdoc";
+      const fresh = await this.ensureFrame(retryMode);
       await fresh.ready;
       return this.dispatchRender(fresh, id, source, dark);
     }
