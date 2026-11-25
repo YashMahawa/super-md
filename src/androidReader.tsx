@@ -48,7 +48,7 @@ import { applyDocumentZoom,documentPoint,invalidateDocumentZoom,settleDocumentZo
 import { documentOutline, navigateToHeading, cancelHeadingNavigation } from "./documentNavigation";
 import { readerSourceAnalysis } from "./readerSourceAnalysis";
 import {OutlineWorkerClient} from './outlineWorker';
-import {recordHistory,replayHistory,historySize,validHistory,type NoteHistory} from './noteHistory';
+import {applyHistoryEdit,replayHistory,historySize,tryLiveTextareaHistory,validHistory,type LiveHistoryEditMeta,type NoteHistory} from './noteHistory';
 import {cachedEditorHistory} from './components/Editor';
 import {loadReadingLocation,saveReadingLocation,type ReadingLocation} from './readingLocations';
 import {mediaFilter,mediaTone,type MediaAppearance} from './mediaAppearance';
@@ -168,6 +168,7 @@ function Reader() {
   const histories=useRef(new Map<string,NoteHistory>());
   const trimHistories=(active:string)=>{let retained=[...histories.current.values()].reduce((size,h)=>size+historySize(h),0);for(const [id,cached] of histories.current){if(histories.current.size<=40&&retained<=4_000_000)break;if(id===active)continue;histories.current.delete(id);retained-=historySize(cached);}};
   const replaying=useRef(false);
+  const [historyReplayToken,setHistoryReplayToken]=useState(0);
   const loadedFonts=useRef(new Map<string,Promise<FontFace>>());
   const cursor=useRef<Point|undefined>(undefined);
   const zoomFrame=useRef(0),zoomTimer=useRef(0),zoomFocus=useRef<Point|undefined>(undefined),zoomTarget=useRef<number|null>(null),zoomAnchors=useRef<{focus?:Point;points:Map<HTMLElement,Point|null>}>({points:new Map()});
@@ -284,14 +285,20 @@ function Reader() {
     };
     window.supermdHistory=direction=>{
       if(document.querySelector('.theme-guide-dialog'))return;
-      if(isTextEntryField(document.activeElement)){document.execCommand(direction);return;}
+      const activeEl=document.activeElement;
+      if(isTextEntryField(activeEl)){
+        const inLiveBlock=activeEl instanceof HTMLTextAreaElement&&Boolean(activeEl.closest('.live-active-block'));
+        if(!inLiveBlock){document.execCommand(direction);return;}
+        if(tryLiveTextareaHistory(direction))return;
+      }
       const current=reference.current;if(!current)return;
       replaying.current=true;
-      const history=histories.current.get(current.id);const next=history?replayHistory(history,current.content,direction):undefined;
-      if(next!==undefined)update(next);
-      else if(current.mode==="editor"||current.mode==="split")editorHistory(current.id,direction);
-      else {const cached=cachedEditorHistory(current.id,direction,current.content);if(cached!==undefined)update(cached);}
-      replaying.current=false;
+      try{
+        const history=histories.current.get(current.id);const next=history?replayHistory(history,current.content,direction):undefined;
+        if(next!==undefined){if(current.mode==='live')setHistoryReplayToken(n=>n+1);update(next);}
+        else if(current.mode==="editor"||current.mode==="split")editorHistory(current.id,direction);
+        else {const cached=cachedEditorHistory(current.id,direction,current.content);if(cached!==undefined){if(current.mode==='live')setHistoryReplayToken(n=>n+1);update(cached);}}
+      }finally{replaying.current=false;}
     };
     window.supermdZoomBy = (factor,focus=cursor.current) => {
       zoomGestureAt.current=Date.now();
@@ -556,11 +563,11 @@ function Reader() {
     const history=(event:KeyboardEvent)=>{
       if(document.documentElement.dataset.host==='qt')return;
       if(!(event.ctrlKey||event.metaKey)||event.altKey)return;
-      const key=event.key.toLowerCase();if(key!=="z"&&key!=="y")return;
+      const key=event.key.toLowerCase();if(key!=="z"&&(key!=="y"||event.shiftKey))return;
       if(document.querySelector(".image-viewer,.math-repair-panel,.reading-search,.media-dialog"))return;
-      // Leave a Live textarea's native editing history intact; Source and Read
-      // route through the same bounded note history on hardware keyboards.
-      if(isTextEntryField(event.target))return;
+      // Preserve non-document inputs while routing Live block textareas through
+      // supermdHistory so native undo/redo reconciles and crosses block boundaries.
+      if(isTextEntryField(event.target)&&!(event.target instanceof HTMLTextAreaElement&&event.target.closest('.live-active-block')))return;
       event.preventDefault();event.stopImmediatePropagation();window.supermdHistory?.(key==="y"||event.shiftKey?"redo":"undo");
     };
     const typewriterKey=(event:KeyboardEvent)=>{
@@ -644,12 +651,12 @@ function Reader() {
     document.addEventListener('keydown',scrollKey);
     return () => {gaps.end();gapSelection.current=null;document.removeEventListener('scroll',selectionScroll,true);document.removeEventListener('keydown',scrollKey);document.removeEventListener("pointermove",pan);document.removeEventListener("pointercancel",up);document.removeEventListener("pointermove",track);document.removeEventListener("pointerdown",down);document.removeEventListener("pointerup",up);window.removeEventListener("blur",up);cancelAnimationFrame(frame); document.removeEventListener("wheel",wheel); document.removeEventListener("touchstart", start); document.removeEventListener("touchmove", move); document.removeEventListener("touchend", end); document.removeEventListener("touchcancel", end); };
   }, []);
-  const update = useCallback((content: string,changes?:SourceChange[]) => {
+  const update = useCallback((content: string,changes?:SourceChange[],historyMeta?:LiveHistoryEditMeta) => {
     const previous=reference.current!;
     if(content===previous.content)return;
     if(!replaying.current){
       const history=histories.current.get(previous.id)||{undo:[],redo:[],last:0},now=Date.now();
-      recordHistory(history,previous.content,content,now);
+      applyHistoryEdit(history,previous.content,content,now,historyMeta);
       histories.current.delete(previous.id);histories.current.set(previous.id,history);
       trimHistories(previous.id);
     }
@@ -660,6 +667,8 @@ function Reader() {
     const delivery=next.editProtocol===1?edits.current!.change(next.id,content,changes):invoke("document_changed",{id:next.id,content});
     void delivery.then(()=>setEditError(''),error=>setEditError(String(error)));
   }, []);
+  const handleLiveChange = useCallback((content: string, meta?: LiveHistoryEditMeta) => update(content, undefined, meta), [update]);
+  const handleLiveHistory = useCallback((direction: "undo" | "redo") => { window.supermdHistory?.(direction); return true; }, []);
   useEffect(()=>{
     const MAX_AGENT_QUEUE=16;
     let active=false,disposed=false;
@@ -1036,7 +1045,7 @@ function Reader() {
     {repairing && <MathRepairPanel content={state.content} apply={update} close={()=>setRepairing(false)} />}
     <MediaTools key={state.id} documentId={state.id} content={state.content} documentPath={state.path} onInsert={(text, point) => { const content = reference.current!.content; const from = Math.min(point?.from ?? content.length, content.length); const to = Math.max(from, Math.min(point?.to ?? from, content.length)); update(content.slice(0, from) + text + content.slice(to)); }} onNotice={(error) => { void invoke("export_failed", { error }); }} />
     {(state.mode === "editor" || state.mode === "split") && <section className="android-source"><SourceEditor key={state.id} sessionId={state.id} value={state.content} onChange={update} dark={state.dark} focusMode={state.fullscreen} latexAutofix={state.latexAutofix} typewriterScroll={state.typewriterScroll} onTypewriterChange={changeTypewriter} spellCheck={state.spellCheck} grammarCheck={state.grammarCheck} /></section>}
-    {state.mode === "live" && <section className="android-reading" data-full-document-accessibility={state.fullDocumentAccessibility ? "true" : undefined}><div className="reader-chrome-spacer" aria-hidden="true"/><div key={state.id} className="document-page-space"><div className="document-page"><LiveDocument key={state.id} latexAutofix={state.latexAutofix} typewriterScroll={state.typewriterScroll} spellCheck={state.spellCheck} grammarCheck={state.grammarCheck} markdown={state.content} onChange={update} documentPath={state.path} python={state.python || "embedded"} dark={false} trustedImageHosts={trustedHosts} onTrustImageHost={trustHost} fullDocumentAccessibility={state.fullDocumentAccessibility} /></div></div></section>}
+    {state.mode === "live" && <section className="android-reading" data-full-document-accessibility={state.fullDocumentAccessibility ? "true" : undefined}><div className="reader-chrome-spacer" aria-hidden="true"/><div key={state.id} className="document-page-space"><div className="document-page"><LiveDocument key={state.id} latexAutofix={state.latexAutofix} typewriterScroll={state.typewriterScroll} spellCheck={state.spellCheck} grammarCheck={state.grammarCheck} markdown={state.content} onChange={handleLiveChange} onHistory={handleLiveHistory} historyReplayToken={historyReplayToken} documentPath={state.path} python={state.python || "embedded"} dark={false} trustedImageHosts={trustedHosts} onTrustImageHost={trustHost} fullDocumentAccessibility={state.fullDocumentAccessibility} /></div></div></section>}
     {(state.mode === "reader" || state.mode === "split") && <section className="android-reading" data-full-document-accessibility={state.fullDocumentAccessibility ? "true" : undefined}><div className="reader-chrome-spacer" aria-hidden="true"/><div key={state.id} className="document-page-space"><div className="document-page"><DocumentPreview markdown={state.content} onChange={update} documentPath={state.path} python={state.python || "embedded"} dark={false} trustedImageHosts={trustedHosts} onTrustImageHost={trustHost} fullDocumentAccessibility={state.fullDocumentAccessibility} sourceAnalysis={readerAnalysis?.source===state.content?readerAnalysis:undefined} /></div></div></section>}
   </div></DocumentAppearance.Provider>;
 }

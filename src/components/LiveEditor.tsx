@@ -1,4 +1,4 @@
-import {createContext,Fragment,useCallback,useContext,useEffect,useLayoutEffect,useMemo,useRef,useState,type ClipboardEvent,type DragEvent,type KeyboardEvent as ReactKeyboardEvent,type ReactNode,type RefObject} from 'react';
+import {createContext,Fragment,useCallback,useContext,useEffect,useLayoutEffect,useMemo,useRef,useState,type ClipboardEvent as ReactClipboardEvent,type DragEvent,type ReactNode,type RefObject} from 'react';
 import {PencilSimpleIcon} from '@phosphor-icons/react';
 import MarkdownPreview from './MarkdownPreview';
 import WindowedBlock,{type WindowHeading} from './WindowedBlock';
@@ -13,6 +13,7 @@ import {repairPastedMath} from '../mathRepair';
 import {editableBlockSpans,indentMarkdownSelection,isFirstLineCursor,isLastLineCursor} from '../liveBlockFlow';
 import {handleLiveEditorKey} from '../liveEditorKeys';
 import {liveEditorCenterDelta,useTypewriterScroll} from '../typewriterScroll';
+import {registerLiveTextareaHistory,type LiveHistoryEditMeta} from '../noteHistory';
 const noTrustedHosts:string[]=[];
 const CARET_KEYS=new Set(['ArrowUp','ArrowDown','PageUp','PageDown','Home','End']);
 const fullscreenInteractiveSelector='a,button,input,select,textarea,summary,details,img,.note-image,.interactive-chart,.inline-diagram,.svg-figure,.mermaid,.step-cards,.remote-image-card,.image-error,.code-container';
@@ -22,7 +23,9 @@ export function splitMarkdownBlocks(markdown:string):SourceBlock[]{return analyz
 interface Props extends WritingOptions,ReaderAccessibilityPreference {
   latexAutofix?:boolean;
   typewriterScroll?:boolean;
-  markdown:string;onChange:(value:string)=>void;documentPath:string|null;python:string;dark:boolean;
+  markdown:string;onChange:(value:string,meta?:LiveHistoryEditMeta)=>void;documentPath:string|null;python:string;dark:boolean;
+  onHistory?:(direction:'undo'|'redo')=>boolean;
+  historyReplayToken?:number;
   trustedImageHosts?:string[];onTrustImageHost?:(host:string)=>void;
 }
 interface EditingSession {
@@ -45,12 +48,13 @@ interface ActiveDraftContextValue {
   caret:number;
   spellCheck:boolean;
   grammarCheck:boolean;
-  onChange:(value:string,selectionStart?:number,selectionEnd?:number)=>void;
+  onChange:(value:string,selectionStart?:number,selectionEnd?:number,meta?:LiveHistoryEditMeta)=>void;
+  onBeforeInput:(inputType?:string)=>void;
   onSuggestionChange:(value:string)=>void;
   onSuggestionAction:(edit?:{from:number;to:number;insertLength:number})=>void;
   onSyncCaret:(area:HTMLTextAreaElement)=>void;
-  onPaste:(event:ClipboardEvent<HTMLTextAreaElement>)=>void;
-  onKeyDown:(event:ReactKeyboardEvent<HTMLTextAreaElement>)=>void;
+  onPaste:(area:HTMLTextAreaElement,event:ClipboardEvent)=>void;
+  onKeyDown:(area:HTMLTextAreaElement,event:KeyboardEvent)=>void;
   onCaretMove:()=>void;
   onRememberSelection:(area:HTMLTextAreaElement)=>void;
   onBlurSession:(session:number,area:HTMLTextAreaElement,shouldClose:boolean,relatedTarget:Element|null)=>void;
@@ -61,31 +65,68 @@ const ActiveDraftContext=createContext<ActiveDraftContextValue|null>(null);
 function ActiveBlockEditor(){
   const draft=useContext(ActiveDraftContext);
   if(!draft)return null;
-  const {session,editorRef,sourceStart,text,caret,spellCheck,grammarCheck,onChange,onSuggestionChange,onSuggestionAction,onSyncCaret,onPaste,onKeyDown,onCaretMove,onRememberSelection,onBlurSession}=draft;
+  return <ActiveBlockEditorInner key={draft.session} draft={draft}/>;
+}
+
+function ActiveBlockEditorInner({draft}:{draft:ActiveDraftContextValue}){
+  const {session,editorRef,sourceStart,text,caret,spellCheck,grammarCheck,onSuggestionChange,onSuggestionAction}=draft;
+  const hostRef=useRef<HTMLDivElement|null>(null);
+  const draftRef=useRef(draft);
+  draftRef.current=draft;
+  useLayoutEffect(()=>{
+    const host=hostRef.current;
+    if(!host)return;
+    const initial=draftRef.current;
+    const area=document.createElement('textarea');
+    area.setAttribute('data-source-start',String(initial.sourceStart));
+    area.spellcheck=false;
+    area.setAttribute('spellcheck','false');
+    area.setAttribute('aria-label','Edit Markdown block');
+    area.defaultValue=initial.text;
+    area.value=initial.text;
+    area.style.height=`${Math.max(120,initial.text.split('\n').length*27+32)}px`;
+    area.addEventListener('paste',event=>draftRef.current.onPaste(area,event));
+    area.addEventListener('beforeinput',event=>draftRef.current.onBeforeInput((event as InputEvent).inputType));
+    area.addEventListener('focus',()=>draftRef.current.onRememberSelection(area));
+    area.addEventListener('select',()=>{draftRef.current.onSyncCaret(area);draftRef.current.onRememberSelection(area);});
+    area.addEventListener('pointerup',()=>{draftRef.current.onSyncCaret(area);draftRef.current.onRememberSelection(area);});
+    area.addEventListener('click',()=>{draftRef.current.onSyncCaret(area);draftRef.current.onRememberSelection(area);});
+    area.addEventListener('input',event=>{
+      const inputType=(event as InputEvent).inputType;
+      const dir=inputType==='historyUndo'?'undo':inputType==='historyRedo'?'redo':undefined;
+      draftRef.current.onSyncCaret(area);
+      draftRef.current.onChange(area.value,area.selectionStart,area.selectionEnd,dir?{historyDirection:dir}:undefined);
+    });
+    area.addEventListener('keyup',event=>{
+      draftRef.current.onSyncCaret(area);
+      draftRef.current.onRememberSelection(area);
+      if(CARET_KEYS.has(event.key))draftRef.current.onCaretMove();
+    });
+    area.addEventListener('keydown',event=>draftRef.current.onKeyDown(area,event));
+    area.addEventListener('blur',event=>{
+      if(!area.isConnected)return;
+      const related=event.relatedTarget;
+      const shouldClose=!(related instanceof Node&&area.parentElement?.contains(related));
+      draftRef.current.onBlurSession(session,area,shouldClose,related instanceof Element?related:null);
+    });
+    host.insertBefore(area,host.firstChild);
+    (initial.editorRef as {current:HTMLTextAreaElement|null}).current=area;
+    return()=>{
+      const ref=draftRef.current.editorRef as {current:HTMLTextAreaElement|null};
+      if(ref.current===area)ref.current=null;
+      area.remove();
+    };
+  },[session]);
+  useLayoutEffect(()=>{
+    const area=editorRef.current;
+    if(!area)return;
+    area.setAttribute('data-source-start',String(sourceStart));
+    if(area.value!==text)area.value=text;
+    const nextHeight=`${Math.max(120,text.split('\n').length*27+32)}px`;
+    if(area.style.height!==nextHeight)area.style.height=nextHeight;
+  },[editorRef,sourceStart,text]);
   return (
-    <div className="live-active-block">
-      <textarea
-        ref={editorRef}
-        data-source-start={sourceStart}
-        spellCheck={false}
-        value={text}
-        style={{height:Math.max(120,text.split('\n').length*27+32)}}
-        onPaste={onPaste}
-        onFocus={event=>onRememberSelection(event.currentTarget)}
-        onSelect={event=>{onSyncCaret(event.currentTarget);onRememberSelection(event.currentTarget);}}
-        onPointerUp={event=>{onSyncCaret(event.currentTarget);onRememberSelection(event.currentTarget);}}
-        onClick={event=>{onSyncCaret(event.currentTarget);onRememberSelection(event.currentTarget);}}
-        onChange={event=>{onSyncCaret(event.target);onChange(event.target.value,event.target.selectionStart,event.target.selectionEnd);}}
-        onKeyUp={event=>{onSyncCaret(event.currentTarget);onRememberSelection(event.currentTarget);if(CARET_KEYS.has(event.key))onCaretMove();}}
-        onKeyDown={onKeyDown}
-        onBlur={event=>{
-          if(!event.currentTarget.isConnected)return;
-          const related=event.relatedTarget;
-          const shouldClose=!(related instanceof Node&&event.currentTarget.parentElement?.contains(related));
-          onBlurSession(session,event.currentTarget,shouldClose,related instanceof Element?related:null);
-        }}
-        aria-label="Edit Markdown block"
-      />
+    <div ref={hostRef} className="live-active-block">
       <WritingSuggestions text={text} caret={caret} spellCheck={spellCheck} grammarCheck={grammarCheck} onChange={onSuggestionChange} onAction={onSuggestionAction}/>
     </div>
   );
@@ -173,7 +214,8 @@ function translateRenderedRange(start:number,end:number,editing:EditingSession|n
 
 interface LiveEditorState {
   markdown:string;
-  onChange:(value:string)=>void;
+  onChange:(value:string,meta?:LiveHistoryEditMeta)=>void;
+  onHistory?:(direction:'undo'|'redo')=>boolean;
   latexAutofix:boolean;
   activeTypewriter:boolean;
   editing:EditingSession|null;
@@ -185,7 +227,7 @@ interface LiveEditorState {
 
 /** One document render preserves references, footnote numbering, duplicate
  * heading IDs and loose lists. Substitute one original-source editing block. */
-export default function LiveEditor({markdown,onChange,documentPath,python,dark,trustedImageHosts=noTrustedHosts,onTrustImageHost,spellCheck=false,grammarCheck=false,latexAutofix=false,typewriterScroll,fullDocumentAccessibility=false}:Props){
+export default function LiveEditor({markdown,onChange,onHistory,historyReplayToken,documentPath,python,dark,trustedImageHosts=noTrustedHosts,onTrustImageHost,spellCheck=false,grammarCheck=false,latexAutofix=false,typewriterScroll,fullDocumentAccessibility=false}:Props){
   const [editing,setEditing]=useState<EditingSession|null>(null);
   const [draftText,setDraftText]=useState('');
   const [caret,setCaret]=useState(0);
@@ -194,6 +236,9 @@ export default function LiveEditor({markdown,onChange,documentPath,python,dark,t
   const appliedTypewriter=useRef(false),typingFrame=useRef(0);
   const anchorTop=useRef<number|null>(null),editor=useRef<HTMLTextAreaElement>(null),rootRef=useRef<HTMLDivElement>(null);
   const pendingSelection=useRef<{start:number;end:number;direction?:'forward'|'backward'|'none'}|null>(null);
+  const pendingInputMetaRef=useRef<LiveHistoryEditMeta|null>(null);
+  const pendingSuggestionEditRef=useRef<{from:number;to:number;insertLength:number;selectionStart:number;selectionEnd:number}|null>(null);
+  const appliedHistoryReplayRef=useRef(historyReplayToken);
   const pendingBlockFocus=useRef<{offset:number}|'end'|null>(null);
   const closeAnchorRef=useRef<CloseAnchor|null>(null);
   const outsidePressRef=useRef<{active:boolean;deferredClose:boolean;target:HTMLElement|null;clientY:number|null;session:number;timer:number}>({active:false,deferredClose:false,target:null,clientY:null,session:0,timer:0});
@@ -208,8 +253,8 @@ export default function LiveEditor({markdown,onChange,documentPath,python,dark,t
   const blocks=sourceAnalysis.analysis.bodyBlocks;
   const frontmatter=sourceAnalysis.analysis.frontmatter;
   const hasBodyNodes=sourceAnalysis.analysis.tree.children.some(node=>node.position?.start.offset!==undefined);
-  const latestRef=useRef<LiveEditorState>({markdown,onChange,latexAutofix,activeTypewriter,editing,draftText,renderedSource,sourceAnalysis,frontmatter});
-  latestRef.current={markdown,onChange,latexAutofix,activeTypewriter,editing,draftText,renderedSource,sourceAnalysis,frontmatter};
+  const latestRef=useRef<LiveEditorState>({markdown,onChange,onHistory,latexAutofix,activeTypewriter,editing,draftText,renderedSource,sourceAnalysis,frontmatter});
+  latestRef.current={markdown,onChange,onHistory,latexAutofix,activeTypewriter,editing,draftText,renderedSource,sourceAnalysis,frontmatter};
 
   const rememberSelection=useCallback((area:HTMLTextAreaElement|null,current:EditingSession|null=latestRef.current.editing)=>{
     if(!area||!current)return;
@@ -400,6 +445,39 @@ export default function LiveEditor({markdown,onChange,documentPath,python,dark,t
     return()=>observer.disconnect();
   },[activeTypewriter]);
 
+  const reanchorHistorySession=useCallback((previousMarkdown:string,nextMarkdown:string)=>{
+    let diffStart=0,oldEnd=previousMarkdown.length,newEnd=nextMarkdown.length;
+    while(diffStart<oldEnd&&diffStart<newEnd&&previousMarkdown[diffStart]===nextMarkdown[diffStart])diffStart++;
+    while(oldEnd>diffStart&&newEnd>diffStart&&previousMarkdown[oldEnd-1]===nextMarkdown[newEnd-1]){oldEnd--;newEnd--;}
+    const analysis=analyzeDocument(nextMarkdown);
+    const bodyHasNodes=analysis.tree.children.some(node=>node.position?.start.offset!==undefined);
+    const frontmatterEnd=analysis.frontmatter?.end??0;
+    if(frontmatterEnd>0&&newEnd<=frontmatterEnd&&diffStart<frontmatterEnd){closeEditor();return;}
+    if(!nextMarkdown.trim()||!bodyHasNodes){
+      const start=analysis.bodyBlocks[0]?.start??0;
+      const caretOffset=Math.max(0,nextMarkdown.length-start);
+      openDocBlock(null,start,nextMarkdown.length,nextMarkdown,{start:caretOffset,end:caretOffset},false);
+      return;
+    }
+    const spans=editableBlockSpans(nextMarkdown,analysis);
+    if(!spans.length){closeEditor();return;}
+    const target=spans.find(span=>span.start<=diffStart&&newEnd<=span.end)??spans.filter(span=>span.start<=newEnd).at(-1)??spans[0];
+    const caretOffset=Math.max(0,Math.min(target.end-target.start,newEnd-target.start));
+    openDocBlock(null,target.start,target.end,nextMarkdown,{start:caretOffset,end:caretOffset});
+  },[closeEditor,openDocBlock]);
+
+  useLayoutEffect(()=>{
+    const isHistoryReplay=historyReplayToken!==appliedHistoryReplayRef.current;
+    appliedHistoryReplayRef.current=historyReplayToken;
+    const active=latestRef.current.editing;
+    const previousMarkdown=syncedMarkdownRef.current;
+    if(active&&markdown!==previousMarkdown){
+      if(isHistoryReplay)reanchorHistorySession(previousMarkdown,markdown);
+      else closeEditor();
+    }
+    if(savedSelection.current&&savedSelection.current.markdown!==markdown)savedSelection.current=null;
+  },[markdown,historyReplayToken,closeEditor,reanchorHistorySession]);
+
   useLayoutEffect(()=>{
     if(!editing){
       lastHandledSession.current=0;
@@ -583,12 +661,6 @@ export default function LiveEditor({markdown,onChange,documentPath,python,dark,t
   },[isEditing,closeEditor]);
 
   useEffect(()=>{
-    const active=latestRef.current.editing;
-    if(active&&markdown!==syncedMarkdownRef.current)closeEditor();
-    if(savedSelection.current&&savedSelection.current.markdown!==markdown)savedSelection.current=null;
-  },[markdown,closeEditor]);
-
-  useEffect(()=>{
     if(!editing)return;
     const syncCaret=()=>{const area=editor.current;if(area&&document.activeElement===area)setCaret(area.selectionStart);};
     document.addEventListener('selectionchange',syncCaret);
@@ -663,7 +735,7 @@ export default function LiveEditor({markdown,onChange,documentPath,python,dark,t
     if(latestRef.current.editing?.session===session)closeEditor(relatedTarget);
   },[rememberSelection,closeEditor]);
 
-  const copy=useCallback((event:ClipboardEvent)=>{
+  const copy=useCallback((event:ReactClipboardEvent)=>{
     if((event.target as Element).closest('textarea'))return;
     const source=selectedMarkdown(window.getSelection(),latestRef.current.renderedSource);
     if(source!==null){event.clipboardData.setData('text/plain',source);event.preventDefault();}
@@ -673,8 +745,21 @@ export default function LiveEditor({markdown,onChange,documentPath,python,dark,t
     setSelectedMarkdownDrag(event.nativeEvent,latestRef.current.renderedSource);
   },[]);
 
-  const update=useCallback((text:string,selectionStart?:number,selectionEnd?:number)=>{
-    const {editing:active,onChange:emitChange,frontmatter:currentFrontmatter}=latestRef.current;
+  const emitEditorChange=useCallback((value:string,meta?:LiveHistoryEditMeta)=>{
+    const emit=latestRef.current.onChange;
+    if(meta&&(meta.historyDirection||meta.isolateHistory))emit(value,meta);
+    else emit(value);
+  },[]);
+
+  const handleBeforeInput=useCallback((inputType?:string)=>{
+    if(inputType==='historyUndo')pendingInputMetaRef.current={historyDirection:'undo'};
+    else if(inputType==='historyRedo')pendingInputMetaRef.current={historyDirection:'redo'};
+  },[]);
+
+  const update=useCallback((text:string,selectionStart?:number,selectionEnd?:number,meta?:LiveHistoryEditMeta)=>{
+    const {editing:active,frontmatter:currentFrontmatter}=latestRef.current;
+    const resolvedMeta=meta??pendingInputMetaRef.current??undefined;
+    pendingInputMetaRef.current=null;
     if(!active)return;
     latestRef.current.draftText=text;
     setDraftText(text);
@@ -684,7 +769,7 @@ export default function LiveEditor({markdown,onChange,documentPath,python,dark,t
       editSpanRef.current=null;
       const pos=Math.max(0,Math.min(active.baseSplitEnd,active.baseMarkdown.length));
       savedSelection.current={from:pos,to:pos,markdown:active.baseMarkdown};
-      if(changed)emitChange(active.baseMarkdown);
+      if(changed)emitEditorChange(active.baseMarkdown,resolvedMeta);
       syncActiveCaretCenter();
       return;
     }
@@ -714,24 +799,56 @@ export default function LiveEditor({markdown,onChange,documentPath,python,dark,t
       setEditing(nextSession);
     }
     syncedMarkdownRef.current=nextMarkdown;
-    emitChange(nextMarkdown);
+    emitEditorChange(nextMarkdown,resolvedMeta);
     syncActiveCaretCenter();
-  },[syncActiveCaretCenter]);
+  },[emitEditorChange,syncActiveCaretCenter]);
 
   const handleSuggestionChange=useCallback((value:string)=>{
-    update(value,pendingSelection.current?.start,pendingSelection.current?.end);
-  },[update]);
+    const suggestionEdit=pendingSuggestionEditRef.current;
+    pendingSuggestionEditRef.current=null;
+    const area=editor.current;
+    const selStart=suggestionEdit?.selectionStart??pendingSelection.current?.start;
+    const selEnd=suggestionEdit?.selectionEnd??pendingSelection.current?.end;
+    if(area&&suggestionEdit){
+      const replacement=value.slice(suggestionEdit.from,suggestionEdit.from+suggestionEdit.insertLength);
+      area.focus({preventScroll:true});
+      area.setSelectionRange(suggestionEdit.from,suggestionEdit.to);
+      pendingInputMetaRef.current={isolateHistory:true};
+      let applied=false;
+      try{
+        applied=typeof document.execCommand==='function'&&(replacement.length>0?document.execCommand('insertText',false,replacement):document.execCommand('delete',false));
+      }catch{applied=false;}
+      pendingInputMetaRef.current=null;
+      if(!applied||area.value!==value){
+        update(value,selStart,selEnd,{isolateHistory:true});
+        area.value=value;
+      }else if(latestRef.current.draftText!==value){
+        update(value,selStart,selEnd,{isolateHistory:true});
+      }
+      if(selStart!==undefined&&selEnd!==undefined){
+        const nextStart=Math.max(0,Math.min(value.length,selStart));
+        const nextEnd=Math.max(nextStart,Math.min(value.length,selEnd));
+        pendingSelection.current={start:nextStart,end:nextEnd};
+        area.setSelectionRange(nextStart,nextEnd);
+        setCaret(nextStart);
+        rememberSelection(area,latestRef.current.editing);
+      }
+      return;
+    }
+    update(value,selStart,selEnd,{isolateHistory:true});
+  },[update,rememberSelection]);
 
   const handleSuggestionAction=useCallback((edit?:{from:number;to:number;insertLength:number})=>{
-    const area=editor.current;if(!area)return;
+    const area=editor.current;if(!area){pendingSuggestionEditRef.current=null;return;}
     let start=area.selectionStart,end=area.selectionEnd;
     if(edit){
       const delta=edit.insertLength-(edit.to-edit.from);
       const mapOffset=(pos:number)=>pos<=edit.from?pos:pos>=edit.to?pos+delta:edit.from+edit.insertLength;
       start=mapOffset(start);end=mapOffset(end);
       pendingSelection.current={start,end};
+      pendingSuggestionEditRef.current={...edit,selectionStart:start,selectionEnd:end};
       setCaret(start);
-    }
+    }else pendingSuggestionEditRef.current=null;
     area.focus({preventScroll:true});
     queueMicrotask(()=>{
       const current=editor.current,{editing:active,draftText:latestDraft}=latestRef.current;
@@ -749,10 +866,10 @@ export default function LiveEditor({markdown,onChange,documentPath,python,dark,t
     });
   },[rememberSelection]);
 
-  const paste=useCallback((event:ClipboardEvent<HTMLTextAreaElement>)=>{
+  const paste=useCallback((area:HTMLTextAreaElement,event:ClipboardEvent)=>{
     const {latexAutofix:autofix,editing:currentEditing}=latestRef.current;
-    if(!autofix||!currentEditing||event.defaultPrevented||event.clipboardData.files.length)return;
-    const area=event.currentTarget,from=area.selectionStart,to=area.selectionEnd;
+    if(!autofix||!currentEditing||event.defaultPrevented||!event.clipboardData||event.clipboardData.files.length)return;
+    const from=area.selectionStart,to=area.selectionEnd;
     if(currentEditing.protectedBlock&&!(from===0&&to===area.value.length))return;
     const raw=event.clipboardData.getData('text/plain');
     if(!/[\\$^]/.test(raw))return;
@@ -766,11 +883,42 @@ export default function LiveEditor({markdown,onChange,documentPath,python,dark,t
 
   const syncTextareaCaret=useCallback((area:HTMLTextAreaElement)=>setCaret(area.selectionStart),[]);
 
-  const onEditorKeyDown=useCallback((event:ReactKeyboardEvent<HTMLTextAreaElement>)=>{
-    if(event.nativeEvent.isComposing||event.keyCode===229)return;
-    const {editing:active,draftText:currentDraft}=latestRef.current;
+  useEffect(()=>{
+    if(!isEditing)return;
+    return registerLiveTextareaHistory(direction=>{
+      const area=editor.current;
+      if(!area||document.activeElement!==area)return false;
+      const beforeValue=area.value,beforeSynced=syncedMarkdownRef.current;
+      pendingInputMetaRef.current={historyDirection:direction};
+      let executed=false;
+      try{executed=typeof document.execCommand==='function'&&document.execCommand(direction);}catch{executed=false;}
+      if(!executed||(area.value===beforeValue&&syncedMarkdownRef.current===beforeSynced)){
+        pendingInputMetaRef.current=null;
+        return false;
+      }
+      if(area.value!==latestRef.current.draftText){
+        syncTextareaCaret(area);
+        update(area.value,area.selectionStart,area.selectionEnd,{historyDirection:direction});
+      }
+      pendingInputMetaRef.current=null;
+      rememberSelection(area,latestRef.current.editing);
+      return true;
+    });
+  },[isEditing,rememberSelection,syncTextareaCaret,update]);
+
+  const onEditorKeyDown=useCallback((area:HTMLTextAreaElement,event:KeyboardEvent)=>{
+    if(event.isComposing||event.keyCode===229)return;
+    const {editing:active,draftText:currentDraft,onHistory:triggerHistory}=latestRef.current;
     if(!active)return;
-    const area=event.currentTarget;
+    if((event.ctrlKey||event.metaKey)&&!event.altKey&&triggerHistory){
+      const lower=event.key.toLowerCase();
+      const historyDir=lower==='z'?(event.shiftKey?'redo':'undo'):lower==='y'&&!event.shiftKey?'redo':null;
+      if(historyDir){
+        event.preventDefault();event.stopPropagation();
+        triggerHistory(historyDir);
+        return;
+      }
+    }
     if(event.key==='Tab'&&!event.ctrlKey&&!event.metaKey&&!event.altKey){
       event.preventDefault();event.stopPropagation();
       const direction=area.selectionDirection;
@@ -816,7 +964,7 @@ export default function LiveEditor({markdown,onChange,documentPath,python,dark,t
       const next=handleLiveEditorKey({
         text:area.value,selectionStart:area.selectionStart,selectionEnd:area.selectionEnd,
         key:event.key,shiftKey:event.shiftKey,ctrlKey:event.ctrlKey,metaKey:event.metaKey,altKey:event.altKey,
-        isComposing:event.nativeEvent.isComposing,protectedBlock:active.protectedBlock,
+        isComposing:event.isComposing,protectedBlock:active.protectedBlock,
       });
       if(next){
         event.preventDefault();event.stopPropagation();
@@ -880,6 +1028,7 @@ export default function LiveEditor({markdown,onChange,documentPath,python,dark,t
       spellCheck,
       grammarCheck,
       onChange:update,
+      onBeforeInput:handleBeforeInput,
       onSuggestionChange:handleSuggestionChange,
       onSuggestionAction:handleSuggestionAction,
       onSyncCaret:syncTextareaCaret,
@@ -889,7 +1038,7 @@ export default function LiveEditor({markdown,onChange,documentPath,python,dark,t
       onRememberSelection:handleRememberSelection,
       onBlurSession:blurSession,
     }:null,
-    [editing,draftText,caret,spellCheck,grammarCheck,update,handleSuggestionChange,handleSuggestionAction,syncTextareaCaret,paste,onEditorKeyDown,syncActiveCaretCenter,handleRememberSelection,blurSession],
+    [editing,draftText,caret,spellCheck,grammarCheck,update,handleBeforeInput,handleSuggestionChange,handleSuggestionAction,syncTextareaCaret,paste,onEditorKeyDown,syncActiveCaretCenter,handleRememberSelection,blurSession],
   );
 
   const renderBlock=useCallback((entry:RenderedMarkdownBlock)=>{
@@ -915,8 +1064,8 @@ export default function LiveEditor({markdown,onChange,documentPath,python,dark,t
   },[blocks,blockKeys,editing,openRenderedBlock]);
 
   const previewChange=useCallback((next:string)=>{
-    const {editing:currentEditing,onChange:emitChange,renderedSource:frozenSource}=latestRef.current;
-    if(!currentEditing){emitChange(next);return;}
+    const {editing:currentEditing,renderedSource:frozenSource}=latestRef.current;
+    if(!currentEditing){emitEditorChange(next,{isolateHistory:true});return;}
     // Translate a checkbox outside the frozen editor without losing its draft.
     const activeDoc=syncedMarkdownRef.current;
     let start=0,end=frozenSource.length,nextEnd=next.length;
@@ -929,8 +1078,8 @@ export default function LiveEditor({markdown,onChange,documentPath,python,dark,t
     outsidePressRef.current.deferredClose=false;
     latestRef.current.editing=null;
     setEditing(null);
-    emitChange(activeDoc.slice(0,from)+next.slice(start,nextEnd)+activeDoc.slice(to));
-  },[captureCloseAnchor]);
+    emitEditorChange(activeDoc.slice(0,from)+next.slice(start,nextEnd)+activeDoc.slice(to),{isolateHistory:true});
+  },[captureCloseAnchor,emitEditorChange]);
 
   return <ActiveDraftContext.Provider value={activeDraftValue}>
     <div ref={rootRef} className="live-document" onCopy={copy} onDragStart={dragStart}>

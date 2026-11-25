@@ -42,8 +42,20 @@ test("offline writing assistance checks prose only and keeps corrections undoabl
   const suggestions=page.getByRole('complementary',{name:'Writing suggestions'});
   await expect(suggestions).toBeVisible({timeout:15_000});
   await suggestions.getByRole('button',{name:'sentence',exact:true}).click();
-  await expect(page.getByRole('textbox',{name:'Edit Markdown block'})).toHaveValue(/This sentence/);
-  await page.getByRole('textbox',{name:'Edit Markdown block'}).press('Escape');
+  const liveBox=page.getByRole('textbox',{name:'Edit Markdown block'});
+  await expect(liveBox).toHaveValue('This sentence has a apple and the the word.');
+  // Undo immediately inside the active textarea after accepting a writing suggestion,
+  // then leave the block and verify document redo restores the accepted correction.
+  await liveBox.press('Control+z');
+  await expect(liveBox).toHaveValue('This sentnce has a apple and the the word.');
+  await liveBox.press('Control+y');
+  await expect(liveBox).toHaveValue('This sentence has a apple and the the word.');
+  await liveBox.press('Control+z');
+  await expect(liveBox).toHaveValue('This sentnce has a apple and the the word.');
+  await liveBox.press('Escape');
+  await expect(page.getByText('This sentnce has a apple and the the word.',{exact:true})).toBeVisible();
+  await page.evaluate(()=>window.supermdHistory?.('redo'));
+  await expect(page.getByText('This sentence has a apple and the the word.',{exact:true})).toBeVisible();
   await page.evaluate(()=>window.supermdHistory?.('undo'));
   await expect(page.getByText('This sentnce has a apple and the the word.',{exact:true})).toBeVisible();
   await page.evaluate(()=>window.supermdHistory?.('redo'));

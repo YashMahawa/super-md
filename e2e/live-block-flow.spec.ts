@@ -344,3 +344,92 @@ test("supports StepCards slide viewer Edit source handoff and preserves document
   await expect(page.locator(".footnotes")).toContainText("Preserved footnote body.");
 });
 
+test("reconciles native textarea undo with document history, redoes after leaving a Live block, and crosses block boundaries", async ({
+  page,
+}) => {
+  await page.setViewportSize({ width: 1280, height: 860 });
+  const initial = ["First block.", "", "Second block.", "", "Third block."].join("\n");
+  await loadLiveNote(page, initial, "live");
+  // Exercise standard hardware-keyboard routing as well as window.supermdHistory.
+  await page.evaluate(() => {
+    document.documentElement.dataset.host = "android";
+  });
+
+  // 1. Edit First block, undo the grouped typing run inside First block, leave First block,
+  // and redo from document history after leaving that block!
+  await page.locator(".live-block").nth(0).dblclick();
+  const area = page.getByRole("textbox", { name: "Edit Markdown block" });
+  await expect(area).toBeFocused();
+  await area.press("End");
+  await area.type(" Edited once");
+  await expect(area).toHaveValue("First block. Edited once");
+
+  // Undo inside the active Live block via Ctrl+Z (natural grouped native undo, not per-character!).
+  await area.press("Control+z");
+  await expect(area).toHaveValue("First block.");
+
+  // Leave that Live block with Escape, then redo from document history!
+  await area.press("Escape");
+  await expect(page.locator("textarea")).toHaveCount(0);
+  await expect(page.locator(".live-block").nth(0).locator("p")).toHaveText("First block.");
+
+  await page.keyboard.press("Control+y");
+  await expect(page.locator("textarea")).toHaveCount(0);
+  await expect(page.locator(".live-block").nth(0).locator("p")).toHaveText("First block. Edited once");
+
+  // 2. Open Second block, edit it, move ArrowDown into Third block, create two native textarea
+  // undo steps within one coalesced NoteHistory window (by moving the caret mid-typing), then undo & redo across block boundaries!
+  await page.locator(".live-block").nth(1).dblclick();
+  const secondArea = page.getByRole("textbox", { name: "Edit Markdown block" });
+  await expect(secondArea).toHaveValue("Second block.");
+  await secondArea.press("End");
+  await secondArea.type(" Step two");
+  await expect(secondArea).toHaveValue("Second block. Step two");
+
+  await secondArea.press("ArrowDown");
+  const thirdArea = page.getByRole("textbox", { name: "Edit Markdown block" });
+  await expect(thirdArea).toBeFocused();
+  await expect(thirdArea).toHaveValue("Third block.");
+  await thirdArea.press("End");
+  await thirdArea.type(" Step three");
+  await thirdArea.press("ArrowLeft");
+  await thirdArea.press("End");
+  await thirdArea.type(" plus");
+  await expect(thirdArea).toHaveValue("Third block. Step three plus");
+
+  // Undo inside Third block (caret move split Blink's TypingCommand into two native steps while
+  // NoteHistory coalesced them, verifying partial coalesced-group reconciliation in real Chromium!).
+  await thirdArea.press("Control+z");
+  await expect(page.getByRole("textbox", { name: "Edit Markdown block" })).toHaveValue("Third block. Step three");
+  await thirdArea.press("Control+z");
+  await expect(page.getByRole("textbox", { name: "Edit Markdown block" })).toHaveValue("Third block.");
+
+  // Next Undo crosses block boundary from Third block into Second block!
+  await page.keyboard.press("Control+z");
+  await expect(page.getByRole("textbox", { name: "Edit Markdown block" })).toHaveValue("Second block.");
+  await expect
+    .poll(() => page.evaluate(() => (window as any).latestContent as string))
+    .toBe("First block. Edited once\n\nSecond block.\n\nThird block.");
+
+  // Next Undo crosses block boundary from Second block into First block!
+  await page.keyboard.press("Control+z");
+  await expect(page.getByRole("textbox", { name: "Edit Markdown block" })).toHaveValue("First block.");
+  await expect
+    .poll(() => page.evaluate(() => (window as any).latestContent as string))
+    .toBe(initial);
+
+  // Redo steps forward cleanly across First -> Second -> Third blocks!
+  await page.keyboard.press("Control+y");
+  await expect(page.getByRole("textbox", { name: "Edit Markdown block" })).toHaveValue("First block. Edited once");
+  await page.keyboard.press("Control+Shift+Z");
+  await expect(page.getByRole("textbox", { name: "Edit Markdown block" })).toHaveValue("Second block. Step two");
+  await page.keyboard.press("Control+y");
+  await expect(page.getByRole("textbox", { name: "Edit Markdown block" })).toHaveValue("Third block. Step three");
+  await page.keyboard.press("Control+y");
+  await expect(page.getByRole("textbox", { name: "Edit Markdown block" })).toHaveValue("Third block. Step three plus");
+  await expect
+    .poll(() => page.evaluate(() => (window as any).latestContent as string))
+    .toBe("First block. Edited once\n\nSecond block. Step two\n\nThird block. Step three plus");
+  await page.screenshot({ path: "/tmp/live-history-reconciliation.png" });
+});
+
