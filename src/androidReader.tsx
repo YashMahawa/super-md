@@ -214,7 +214,7 @@ function Reader() {
       requestAnimationFrame(()=>{restore.forEach(callback=>callback());applyZoomStyle();settleSelection();});
     };
     window.supermdThemeGuide=()=>setThemeGuide(true);
-    window.supermdDismiss=dismissReaderOverlay;
+    window.supermdDismiss=()=>flushSync(()=>dismissReaderOverlay());
     window.supermdLoad = (incoming) => {
       const old = reference.current;
       // Native omits content it received from this reader, unchanged since.
@@ -408,7 +408,7 @@ function Reader() {
       catch (error) { await invoke("export_failed", {error: String(error)}); }
     };
     void invoke("reader_ready");
-    return () => {nativeScroll.clear();cancelAnimationFrame(zoomFrame.current);window.clearTimeout(zoomTimer.current);delete window.supermdSelectedText;delete window.supermdThemeGuide;delete window.supermdSavePosition;delete window.supermdChromeInset;delete window.supermdLoad; delete window.supermdExport; delete window.supermdExportMarkdown; delete window.supermdPortable; delete window.supermdZoomBy; delete window.supermdResetZoom; delete window.supermdRepairMath; delete window.supermdToggleTypewriter; delete window.supermdFlush; delete window.supermdSetZoom; delete window.supermdHeading; };
+    return () => {nativeScroll.clear();cancelAnimationFrame(zoomFrame.current);window.clearTimeout(zoomTimer.current);delete window.supermdSelectedText;delete window.supermdThemeGuide;delete window.supermdDismiss;delete window.supermdSavePosition;delete window.supermdChromeInset;delete window.supermdLoad; delete window.supermdExport; delete window.supermdExportMarkdown; delete window.supermdPortable; delete window.supermdZoomBy; delete window.supermdResetZoom; delete window.supermdRepairMath; delete window.supermdToggleTypewriter; delete window.supermdFlush; delete window.supermdSetZoom; delete window.supermdHeading; };
   }, []);
   useEffect(()=>{
     if(!state)return;

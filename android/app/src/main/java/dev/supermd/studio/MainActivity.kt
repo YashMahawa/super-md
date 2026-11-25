@@ -430,7 +430,7 @@ class MainActivity : ComponentActivity() {
                     model.cancelWorkspaceSearch()
                     return true
                 }
-                if (model.state.value.fullscreen || model.state.value.readerOverlay) {
+                if (model.state.value.fullscreen || model.state.value.readerOverlay || model.state.value.readerDismissible) {
                     dismissDocument?.invoke() ?: model.fullscreen(false)
                     return true
                 }
@@ -507,6 +507,53 @@ private object NoMotionScheme : MotionScheme {
     override fun <T> defaultEffectsSpec(): FiniteAnimationSpec<T> = snap()
     override fun <T> fastEffectsSpec(): FiniteAnimationSpec<T> = snap()
     override fun <T> slowEffectsSpec(): FiniteAnimationSpec<T> = snap()
+}
+
+internal const val READER_DISMISS_SCRIPT =
+    "(() => { const dismissed = Boolean(window.supermdDismiss?.()); const d = document.documentElement.dataset; return JSON.stringify({ dismissed, overlay: d.readerOverlay === 'true', image: d.readerImageOverlay === 'true', dismissible: d.readerDismissible === 'true' }); })()"
+
+internal fun shouldInterceptStudioBack(
+    contentsShown: Boolean,
+    fullscreen: Boolean,
+    drawerOpen: Boolean,
+    readerOverlay: Boolean,
+    readerDismissible: Boolean,
+): Boolean = contentsShown || fullscreen || drawerOpen || readerOverlay || readerDismissible
+
+internal fun applyReaderDismissResult(model: StudioViewModel, rawResult: String?) {
+    val parsed = rawResult?.let { raw ->
+        runCatching {
+            val jsonText = if (raw.startsWith("\"")) org.json.JSONArray("[$raw]").getString(0) else raw
+            JSONObject(jsonText)
+        }.getOrNull()
+    }
+    if (parsed != null) {
+        model.overlay(parsed.optBoolean("overlay", false), parsed.optBoolean("image", false))
+        model.readerDismissible(parsed.optBoolean("dismissible", false))
+        if (!parsed.optBoolean("dismissed", false) && model.state.value.fullscreen) {
+            model.fullscreen(false)
+        }
+        return
+    }
+    val dismissed = rawResult == "true"
+    if (!dismissed) {
+        model.overlay(false, false)
+        model.readerDismissible(false)
+        if (model.state.value.fullscreen) model.fullscreen(false)
+    }
+}
+
+private fun dismissReaderOrFullscreen(web: WebView?, model: StudioViewModel) {
+    val reader = web
+    if (reader == null) {
+        model.overlay(false, false)
+        model.readerDismissible(false)
+        if (model.state.value.fullscreen) model.fullscreen(false)
+        return
+    }
+    reader.evaluateJavascript(READER_DISMISS_SCRIPT) { rawResult ->
+        applyReaderDismissResult(model, rawResult)
+    }
 }
 
 @Composable private fun StudioContent(model: StudioViewModel, state: StudioState, activity: MainActivity, dark: Boolean, motion: Boolean) {
@@ -594,7 +641,7 @@ private object NoMotionScheme : MotionScheme {
         model.assetAccessRestored = { document, source ->
             web?.evaluateJavascript("window.dispatchEvent(new CustomEvent('supermd-asset-access-restored',{detail:{documentPath:${JSONObject.quote(document)},source:${JSONObject.quote(source)}}}))", null)
         }
-        activity.dismissDocument = { web?.evaluateJavascript("window.supermdDismiss?.() || false") { dismissed -> if (dismissed != "true") model.fullscreen(false) } ?: model.fullscreen(false) }
+        activity.dismissDocument = { dismissReaderOrFullscreen(web, model) }
         activity.saveReaderPosition={web?.evaluateJavascript("window.supermdSavePosition?.()",null)}
         activity.openReaderFind = {
             menu = false
@@ -1049,7 +1096,7 @@ private object NoMotionScheme : MotionScheme {
     LaunchedEffect(immersive, dark) {
         WindowCompat.getInsetsController(activity.window, activity.window.decorView).apply { isAppearanceLightStatusBars = !dark; isAppearanceLightNavigationBars = !dark; systemBarsBehavior = WindowInsetsControllerCompat.BEHAVIOR_SHOW_TRANSIENT_BARS_BY_SWIPE; if (immersive) hide(WindowInsetsCompat.Type.systemBars()) else show(WindowInsetsCompat.Type.systemBars()) }
     }
-    BackHandler(contentsShown || state.fullscreen || drawer.isOpen || state.readerOverlay) {
+    BackHandler(shouldInterceptStudioBack(contentsShown, state.fullscreen, drawer.isOpen, state.readerOverlay, state.readerDismissible)) {
         if (contentsShown) {
             contentsShown = false
         } else if (drawer.isOpen) {
@@ -1059,7 +1106,7 @@ private object NoMotionScheme : MotionScheme {
                 scope.launch { drawer.close() }
             }
         } else {
-            web?.evaluateJavascript("window.supermdDismiss?.() || false") { dismissed -> if (dismissed != "true") model.fullscreen(false) }
+            dismissReaderOrFullscreen(web, model)
         }
     }
     val palette = MaterialTheme.colorScheme
@@ -1236,6 +1283,8 @@ private object NoMotionScheme : MotionScheme {
                                 if (wasCurrent) {
                                     readerReady = false
                                     readerPdfOwnsProgress = false
+                                    model.overlay(false, false)
+                                    model.readerDismissible(false)
                                     readerNote[0] = null
                                     readerGeneration++
                                     web = null
@@ -1321,7 +1370,12 @@ private object NoMotionScheme : MotionScheme {
                     } }, modifier = Modifier.fillMaxSize().clipToBounds(), onRelease = { frame ->
                         val released = frame.getChildAt(0) as? WebView
                         if (released != null) {
-                            if (web === released) { web = null; readerReady = false }
+                            if (web === released) {
+                                web = null
+                                readerReady = false
+                                model.overlay(false, false)
+                                model.readerDismissible(false)
+                            }
                             retireAndDestroyReader(released)
                         }
                         frame.removeAllViews()

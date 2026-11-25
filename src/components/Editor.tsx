@@ -9,8 +9,9 @@ import {forEachDiagnostic,forceLinting,linter,setDiagnostics,type Action,type Di
 import {checkWriting,type WritingOptions} from "../proofreading";
 import {PROOFREADING_MAX_CHARS,computeWindowBounds} from "../proofreadingCore";
 import {addPersonalWord,hasPersonalWord,normalizeDictionaryWord,subscribePersonalDictionary} from "../personalDictionary";
-import { search, searchKeymap, highlightSelectionMatches, openSearchPanel, SearchQuery, setSearchQuery } from "@codemirror/search";
+import { closeSearchPanel, search, searchKeymap, searchPanelOpen, highlightSelectionMatches, openSearchPanel, SearchQuery, setSearchQuery } from "@codemirror/search";
 import { oneDarkHighlightStyle } from "@codemirror/theme-one-dark";
+import { registerEditorSearchDismisser, setReaderDismissible } from "../readerOverlays";
 import type {SourceChange} from '../readerEdits';
 import {
   TYPEWRITER_SHORTCUT,
@@ -53,6 +54,27 @@ const rangeHandlers = new Map<string, (range: { from: number; to: number }) => v
 const typewriterHandlers = new Map<string, ((enabled: boolean) => void) | undefined>();
 const typewriterStates = new Map<string, boolean>();
 const visibleEditors = new Map<string, EditorView>();
+function syncEditorSearchDismissible() {
+  let open = false;
+  for (const editor of visibleEditors.values()) {
+    if (searchPanelOpen(editor.state)) {
+      open = true;
+      break;
+    }
+  }
+  setReaderDismissible("cm-search", open);
+}
+export function dismissEditorSearch(): boolean {
+  let closed = false;
+  for (const editor of visibleEditors.values()) {
+    if (searchPanelOpen(editor.state) && closeSearchPanel(editor)) {
+      closed = true;
+    }
+  }
+  if (closed) syncEditorSearchDismissible();
+  return closed;
+}
+registerEditorSearchDismisser(dismissEditorSearch);
 
 function sourceProofreadingRange(editor: EditorView): { from: number; to: number } {
   const docLen = editor.state.doc.length;
@@ -329,6 +351,9 @@ export default function Editor({ sessionId = "default", value, onChange, dark, f
             if (update.docChanged || update.selectionSet) statusHandlers.get(sessionId)?.(update.state);
             if (update.state.doc.length > PROOFREADING_MAX_CHARS) rangeHandlers.get(sessionId)?.(sourceProofreadingRange(update.view));
           }
+          if (searchPanelOpen(update.startState) !== searchPanelOpen(update.state)) {
+            syncEditorSearchDismissible();
+          }
         }),
         appearance.current.of(editorTheme())
       ]
@@ -342,6 +367,7 @@ export default function Editor({ sessionId = "default", value, onChange, dark, f
     }
     view.current = new EditorView({ state, parent: host.current });
     visibleEditors.set(sessionId, view.current);
+    syncEditorSearchDismissible();
     if (cached && state === cached.state && cached.typewriterActive !== initialTypewriter) {
       view.current.dispatch({ effects: typewriter.current.reconfigure(typewriterScrollExtension(initialTypewriter)) });
     }
@@ -370,6 +396,7 @@ export default function Editor({ sessionId = "default", value, onChange, dark, f
       clearTimeout(scrollTimer);
       view.current?.scrollDOM.removeEventListener("scroll", onScroll);
       visibleEditors.delete(sessionId);
+      syncEditorSearchDismissible();
       if (view.current) { sessions.delete(sessionId); sessions.set(sessionId, { state: view.current.state, top: view.current.scrollDOM.scrollTop, appearance: appearance.current, wrapping: wrapping.current,proofing:proofing.current, typewriter: typewriter.current, wrapped: wrapReference.current, typewriterActive: typewriterReference.current }); trimEditorSessions(); view.current.destroy(); }
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps

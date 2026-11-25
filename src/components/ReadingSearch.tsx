@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useLayoutEffect, useRef, useState } from "react";
 import { flushSync } from "react-dom";
 import { setReaderOverlay } from "../readerOverlays";
 import {ArrowUpIcon,ArrowDownIcon,XIcon,TextAaIcon,ArrowsClockwiseIcon} from "@phosphor-icons/react";
@@ -642,7 +642,7 @@ export default function ReadingSearch({ content, close, onChange, sourceSession,
     onChange(nextContent);
   };
 
-  useEffect(() => {
+  useLayoutEffect(() => {
     cancelSettlingHeading();
     setReaderOverlay("search", true);
     const focus = () => {
@@ -660,7 +660,7 @@ export default function ReadingSearch({ content, close, onChange, sourceSession,
     focus();
     const key = (event: KeyboardEvent) => {
       if (event.key !== "Escape") return;
-      if (document.querySelector(".media-save-menu,.image-viewer,.math-repair-panel,.media-dialog,.theme-guide-dialog")) return;
+      if (document.querySelector(".media-save-menu,.image-viewer,.step-viewer,.math-repair-panel,.media-dialog,.theme-guide-dialog")) return;
       event.preventDefault(); event.stopImmediatePropagation(); closeRef.current();
     };
     document.addEventListener("keydown", key, true);

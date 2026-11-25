@@ -94,6 +94,7 @@ internal class ReaderBridge(
                         true
                     }
                     "reader_overlay_changed" -> { model.overlay(args.optBoolean("open"), args.optBoolean("image")); true }
+                    "reader_dismissible_changed" -> { model.readerDismissible(args.optBoolean("open")); true }
                     "copy_image_native" -> {
                         val uri = withContext(Dispatchers.IO) {
                             val body = args.opt("body") as? String ?: error("Clipboard image is invalid")
