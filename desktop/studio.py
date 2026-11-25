@@ -2752,8 +2752,6 @@ class Studio(QObject):
                 if completion_callback: completion_callback(existing, None)
                 return
             note = self._note(path.name, content, str(path), content, assets, portable)
-            if explicit and activation_generation == self._activation_generation and pending_heading:
-                note["pendingHeading"] = pending_heading
             self._agent_open_paths.add(str(path.resolve()))
             if restoring:
                 if activation_generation == self._activation_generation:
@@ -2772,6 +2770,8 @@ class Studio(QObject):
             self.settings["welcomed"] = True
             self.recent = [str(path)] + [p for p in self.recent if p != str(path)][:29]
             self._preferences()
+            if should_activate and pending_heading:
+                note["pendingHeading"] = pending_heading
             self.recovery_timer.start(800)
             self._emit()
             if explicit and should_activate:
@@ -4863,6 +4863,42 @@ class Studio(QObject):
                 self.autosave_timer.start(900)
                 self._emit(False)
                 self.replied.emit(id,"true",""); return
+            if command == "resolve_reader_asset":
+                document = args.get("documentPath")
+                source = args.get("source")
+                if not isinstance(document, str) or not isinstance(source, str):
+                    raise ValueError("Invalid reader asset request")
+                tab = self._find_open_tab(document)
+                if tab is None:
+                    raise ValueError("The note for this image is no longer open")
+                captured = dict(tab)
+                captured["assets"] = dict(tab["assets"])
+                owner_id, tab_id = self.window_id, tab["id"]
+                embedded = captured["assets"].get(source)
+                cached = self.session.reader_assets.resolve_cached(owner_id, tab_id, source, embedded) if embedded is not None else None
+                def work():
+                    return cached if cached is not None else resolve_source(captured, source)
+                def finished(resolved, error):
+                    current = next((item for item in self.tabs if item["id"] == tab_id), None)
+                    if error:
+                        self.replied.emit(id, "null", error)
+                    elif current is None or not self.session.reader_asset_source_is_current(
+                            owner_id, tab_id, source, _asset_identity(resolved.get("embedded_data")) if resolved.get("embedded_data") else 0,
+                            resolved.get("path", "")):
+                        self.session.reader_assets.evict_source(owner_id, tab_id, source)
+                        self.replied.emit(id, "null", "The note or image changed while it was being resolved")
+                    else:
+                        try:
+                            url = self.session.reader_assets.register(owner_id, tab_id, source, resolved)
+                            self.replied.emit(id, json.dumps({"url": url, "mime": resolved["mime"]}), "")
+                        except Exception as failure:
+                            self.replied.emit(id, "null", str(failure))
+                self._submit(work, finished, False)
+                return
+            if command == "zoom_changed":
+                self.settings["fullZoom" if args.get("fullscreen", self.fullscreen) else "normalZoom"] = max(40,min(300,args["zoom"]))
+                self.preference_timer.start(500)
+                self._emit(False); self.replied.emit(id,"true",""); return
             if command == "open_external_url":
                 url = args.get("url")
                 if not isinstance(url, str) or len(url) > 4096:
@@ -4936,42 +4972,6 @@ class Studio(QObject):
                     self._open_note(str(resolved_path), explicit=True, completion_callback=opened, pending_heading=heading_payload)
                 self._submit(resolve_work, resolve_done, False)
                 return
-            if command == "resolve_reader_asset":
-                document = args.get("documentPath")
-                source = args.get("source")
-                if not isinstance(document, str) or not isinstance(source, str):
-                    raise ValueError("Invalid reader asset request")
-                tab = self._find_open_tab(document)
-                if tab is None:
-                    raise ValueError("The note for this image is no longer open")
-                captured = dict(tab)
-                captured["assets"] = dict(tab["assets"])
-                owner_id, tab_id = self.window_id, tab["id"]
-                embedded = captured["assets"].get(source)
-                cached = self.session.reader_assets.resolve_cached(owner_id, tab_id, source, embedded) if embedded is not None else None
-                def work():
-                    return cached if cached is not None else resolve_source(captured, source)
-                def finished(resolved, error):
-                    current = next((item for item in self.tabs if item["id"] == tab_id), None)
-                    if error:
-                        self.replied.emit(id, "null", error)
-                    elif current is None or not self.session.reader_asset_source_is_current(
-                            owner_id, tab_id, source, _asset_identity(resolved.get("embedded_data")) if resolved.get("embedded_data") else 0,
-                            resolved.get("path", "")):
-                        self.session.reader_assets.evict_source(owner_id, tab_id, source)
-                        self.replied.emit(id, "null", "The note or image changed while it was being resolved")
-                    else:
-                        try:
-                            url = self.session.reader_assets.register(owner_id, tab_id, source, resolved)
-                            self.replied.emit(id, json.dumps({"url": url, "mime": resolved["mime"]}), "")
-                        except Exception as failure:
-                            self.replied.emit(id, "null", str(failure))
-                self._submit(work, finished, False)
-                return
-            if command == "zoom_changed":
-                self.settings["fullZoom" if args.get("fullscreen", self.fullscreen) else "normalZoom"] = max(40,min(300,args["zoom"]))
-                self.preference_timer.start(500)
-                self._emit(False); self.replied.emit(id,"true",""); return
             if command == "export_failed": self.pending_export = self.pending_save_as = self.pending_save_as_tab = ""; self.message = args["error"]; self._emit(False); self.replied.emit(id,"true",""); return
             if command == "request_fmd_export": self.exportRequested.emit("smd"); self.replied.emit(id,"true",""); return
             context=args.get("context")
@@ -4980,7 +4980,7 @@ class Studio(QObject):
                 if context["interpreter"] != (self.settings["python"] or "embedded"):raise ValueError("Python runtime changed; retry this operation")
             reference = args.get("id") or args.get("documentPath") or (context.get("document") if context else None)
             if reference:
-                tab = next((t for t in self.tabs if reference in (t["id"],t["path"])),None)
+                tab = self._find_open_tab(reference)
                 if tab is None: raise ValueError("The note for this operation is no longer open")
             if context and context["document"] not in (tab["id"],tab["path"]):raise ValueError("Python output belongs to another note")
             captured = dict(tab)

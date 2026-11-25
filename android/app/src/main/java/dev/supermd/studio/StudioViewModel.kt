@@ -1867,10 +1867,7 @@ class StudioViewModel(app: Application, val workspaceKey: String = "main") : And
         mutable.value = mutable.value.copy(folderAccessPrompt = null)
     }
     private suspend fun applyWorkspaceFolder(uri: Uri, clearPrompt: Boolean = false) {
-        withContext(Dispatchers.IO) {
-            val retained = persistDocumentGrants { resolver.takePersistableUriPermission(uri, it) }
-            require(retained and Intent.FLAG_GRANT_READ_URI_PERMISSION != 0) { "Android did not grant folder read permission" }
-        }
+        withContext(Dispatchers.IO) { documentAccess.persist(uri) }
         workspaceLinks.invalidate()
         listedRelative = ""
         windowPrefs.edit().putBoolean("folderMigrated", true).putString("folder", uri.toString()).putString("folderRelative", "").apply()
@@ -1894,158 +1891,6 @@ class StudioViewModel(app: Application, val workspaceKey: String = "main") : And
             fail("Could not open folder: ${error.message}")
         }
     }
-    private fun candidateWorkspaceTrees(noteUri: Uri?): List<Uri> {
-        val candidates = ArrayList<Uri>()
-        mutable.value.folder?.let(Uri::parse)?.takeIf { DocumentsContract.isTreeUri(it) }?.let(candidates::add)
-        val persisted = resolver.persistedUriPermissions
-            .filter { it.isReadPermission && DocumentsContract.isTreeUri(it.uri) && (noteUri == null || it.uri.authority == noteUri.authority) }
-            .sortedByDescending { runCatching { DocumentsContract.getTreeDocumentId(it.uri).length }.getOrDefault(0) }
-            .map { it.uri }
-        for (tree in persisted) {
-            if (candidates.none { it == tree }) candidates.add(tree)
-        }
-        if (noteUri != null && DocumentsContract.isTreeUri(noteUri)) {
-            runCatching {
-                DocumentsContract.buildTreeDocumentUri(noteUri.authority, DocumentsContract.getTreeDocumentId(noteUri))
-            }.getOrNull()?.let { embedded ->
-                if (candidates.none { it == embedded }) candidates.add(embedded)
-            }
-        }
-        return candidates
-    }
-    suspend fun openWorkspaceLink(
-        documentPath: String,
-        target: String,
-        fragment: String,
-        wikilink: Boolean,
-        allowFolderPrompt: Boolean = true,
-    ): JSONObject {
-        val trimmedTarget = target.trim()
-        val trimmedFragment = fragment.trim()
-        require(trimmedTarget.length in 1..4096 && trimmedFragment.length <= 1024) { "Invalid workspace link" }
-        val stateSnapshot = mutable.value
-        val sourceNote = if (documentPath.isNotBlank()) {
-            openNoteForDocument(documentPath) ?: run {
-                val notice = "The note for this link is no longer open."
-                mutable.value = mutable.value.copy(busy = false, message = notice)
-                return JSONObject().put("opened", false).put("message", notice)
-            }
-        } else {
-            stateSnapshot.active
-        }
-        val explicitRelative = isExplicitRelativeWorkspaceTarget(trimmedTarget, wikilink)
-        val openFolder = stateSnapshot.folder?.let(Uri::parse)?.takeIf { DocumentsContract.isTreeUri(it) }
-
-        if (sourceNote.uri.isNullOrBlank()) {
-            if (explicitRelative || openFolder == null) {
-                val notice = "Save this note before opening linked notes."
-                mutable.value = mutable.value.copy(busy = false, message = notice)
-                return JSONObject().put("opened", false).put("message", notice)
-            }
-        }
-
-        val sourceUri = sourceNote.uri?.takeIf { it.isNotBlank() }?.let(Uri::parse)
-        val candidates = if (sourceUri != null) candidateWorkspaceTrees(sourceUri) else emptyList()
-        val resolvedResult = try {
-            withContext(Dispatchers.IO) {
-                val cleaned = sanitizeWorkspaceLinkTarget(trimmedTarget)
-                if (sourceUri != null && sourceUri.scheme == "file") {
-                    return@withContext resolveLocalFileWorkspaceLink(sourceUri, cleaned, wikilink)
-                }
-                if (sourceUri == null) {
-                    return@withContext workspaceLinks.resolve(openFolder!!, noteRelative = null, rawTarget = cleaned, wikilink = true)
-                }
-                for (candidate in candidates) {
-                    val rel = workspaceLinks.noteRelativeInTree(
-                        candidate,
-                        sourceUri,
-                        knownRelative = sourceNote.relative.takeIf { candidate.toString() == stateSnapshot.folder },
-                    )
-                    if (rel != null) {
-                        return@withContext workspaceLinks.resolve(candidate, noteRelative = rel, rawTarget = cleaned, wikilink = wikilink)
-                    }
-                }
-                if (!explicitRelative && openFolder != null) {
-                    return@withContext workspaceLinks.resolve(openFolder, noteRelative = null, rawTarget = cleaned, wikilink = true)
-                }
-                // Validate lexical containment upfront even when no folder tree is granted yet,
-                // so escaped ../, encoded separators, schemes, and unsupported extensions fail immediately.
-                val candidateLists = expandWorkspaceCandidatePaths("", cleaned, wikilink)
-                linkedAssetUri(sourceNote, cleaned)?.let { grantedUri ->
-                    val resolvedGranted = documentAccess.resolve(grantedUri)
-                    val grantedReadable = documentAccess.hasReadGrant(resolvedGranted) &&
-                        runCatching { resolver.openInputStream(resolvedGranted)?.use { true } == true }.getOrDefault(false)
-                    if (grantedReadable) {
-                        val firstParts = candidateLists.first()
-                        return@withContext WorkspaceResolvedNote(resolvedGranted, firstParts.last(), firstParts.joinToString("/"))
-                    }
-                }
-                val documentId = runCatching { DocumentsContract.getDocumentId(sourceUri) }.getOrDefault("")
-                val sep = maxOf(documentId.lastIndexOf('/'), documentId.lastIndexOf(':'))
-                for (parts in candidateLists) {
-                    val relJoined = parts.joinToString("/")
-                    val siblingDocId = if (sep >= 0) documentId.substring(0, sep + 1) + relJoined else relJoined
-                    val rawCandidate = if (documentId.isNotEmpty() && sourceUri.authority != null) {
-                        DocumentsContract.buildDocumentUri(sourceUri.authority, siblingDocId)
-                    } else {
-                        sourceUri.buildUpon().path((sourceUri.path?.substringBeforeLast('/', "") ?: "") + "/" + relJoined).build()
-                    }
-                    val openMatch = mutable.value.tabs.firstOrNull { tab ->
-                        tab.uri?.let { existingUri -> sameDocumentUri(existingUri, rawCandidate.toString()) } == true
-                    }?.uri?.let(Uri::parse)
-                    val candidateUri = documentAccess.resolve(openMatch ?: rawCandidate)
-                    if (!documentAccess.hasReadGrant(candidateUri)) continue
-                    val readable = runCatching { resolver.openInputStream(candidateUri)?.use { true } == true }.getOrDefault(false)
-                    if (readable) {
-                        return@withContext WorkspaceResolvedNote(candidateUri, parts.last(), relJoined)
-                    }
-                }
-                null
-            }
-        } catch (cancelled: kotlinx.coroutines.CancellationException) {
-            throw cancelled
-        } catch (security: SecurityException) {
-            val msg = security.message ?: DOCUMENT_ACCESS_MESSAGE
-            mutable.value = mutable.value.copy(busy = false, message = msg)
-            return JSONObject().put("opened", false).put("message", msg)
-        } catch (error: WorkspaceLinkException) {
-            val msg = error.message ?: "Invalid relative note path."
-            mutable.value = mutable.value.copy(busy = false, message = msg)
-            return JSONObject().put("opened", false).put("message", msg)
-        }
-
-        if (resolvedResult == null) {
-            val notice = if (allowFolderPrompt) {
-                "Folder permission is needed to follow links from ${sourceNote.name}. Choose its containing folder."
-            } else {
-                "Choose the folder containing ${sourceNote.name} to follow relative links."
-            }
-            val prompt = if (allowFolderPrompt && sourceUri != null) {
-                WorkspaceFolderPrompt(
-                    noteId = sourceNote.id,
-                    noteName = sourceNote.name,
-                    initialUri = sourceUri,
-                    target = trimmedTarget,
-                    fragment = trimmedFragment,
-                    wikilink = wikilink,
-                )
-            } else null
-            mutable.value = mutable.value.copy(folderAccessPrompt = prompt, message = notice)
-            return JSONObject().put("opened", false).put("promptedFolderAccess", prompt != null).put("message", notice)
-        }
-
-        return openNoteInternal(
-            resolvedResult.uri,
-            resolvedResult.relative,
-            headingFragment = trimmedFragment,
-            scheduleDirtyAutosave = true,
-            alwaysReportError = true,
-            errorPrefix = "Could not open linked note",
-        )
-    }
-
-    suspend fun openRelativeNote(documentPath: String, target: String, heading: String? = null): JSONObject =
-        openWorkspaceLink(documentPath, target, heading.orEmpty(), wikilink = false)
     private fun loadNoteForOpen(uri: Uri, relative: String?): Note {
         documentAccess.persist(uri)
         val target = documentAccess.resolve(uri)
@@ -2772,6 +2617,7 @@ class StudioViewModel(app: Application, val workspaceKey: String = "main") : And
         if (!seed.targetUri.isNullOrBlank() && !note.uri.isNullOrBlank() && sameDocumentUri(note.uri, seed.targetUri)) return true
         return false
     }
+
     private data class SafTreeMatch(val folderUri: Uri, val rootId: String, val relativePath: String)
 
     private fun openNoteForDocument(document: String): Note? = mutable.value.tabs.firstOrNull {
@@ -2816,6 +2662,243 @@ class StudioViewModel(app: Application, val workspaceKey: String = "main") : And
         val parts = readerAssetPathParts(tree.relativePath.substringBeforeLast('/', ""), source)
         return readerFolderIndex.resolve(resolver, note.id, tree.folderUri, tree.rootId, parts).uri
     }
+
+    private class PromptWorkspaceNoteAccessException(val targetUri: Uri) : Exception()
+
+    suspend fun openWorkspaceLink(
+        documentPath: String,
+        target: String,
+        fragment: String,
+        wikilink: Boolean,
+        allowFolderPrompt: Boolean = true,
+    ): JSONObject {
+        val trimmedTarget = target.trim()
+        val trimmedFragment = fragment.trim()
+        require(trimmedTarget.length in 1..4096 && trimmedFragment.length <= 1024) { "Invalid workspace link" }
+        val stateSnapshot = mutable.value
+        val sourceNote = if (documentPath.isNotBlank()) {
+            openNoteForDocument(documentPath) ?: run {
+                val notice = "The note for this link is no longer open."
+                mutable.value = mutable.value.copy(busy = false, message = notice)
+                return JSONObject().put("opened", false).put("message", notice)
+            }
+        } else {
+            stateSnapshot.active
+        }
+        val explicitRelative = isExplicitRelativeWorkspaceTarget(trimmedTarget, wikilink)
+        val openFolder = stateSnapshot.folder?.let(Uri::parse)?.takeIf { DocumentsContract.isTreeUri(it) }
+        val rawNoteUri = sourceNote.uri
+        if (rawNoteUri.isNullOrBlank()) {
+            if (explicitRelative || openFolder == null) {
+                val notice = "Save this note before opening linked notes."
+                mutable.value = mutable.value.copy(busy = false, message = notice)
+                return JSONObject().put("opened", false).put("message", notice)
+            }
+        }
+
+        val sourceUri = rawNoteUri?.takeIf { it.isNotBlank() }?.let(Uri::parse)
+        val resolved = try {
+            withContext(Dispatchers.IO) {
+                val cleaned = sanitizeWorkspaceLinkTarget(trimmedTarget)
+                if (sourceUri != null && sourceUri.scheme == "file") {
+                    return@withContext resolveLocalFileWorkspaceLink(sourceUri, cleaned, wikilink)!!
+                }
+                val treeMatch = when {
+                    sourceUri != null -> findSafTree(sourceUri, allowEmbeddedTreeFallback = true)
+                        ?: openFolder?.let { folderUri ->
+                            val rel = workspaceLinks.noteRelativeInTree(folderUri, sourceUri, knownRelative = sourceNote.relative)
+                            if (rel != null) SafTreeMatch(folderUri, DocumentsContract.getTreeDocumentId(folderUri), rel) else null
+                        }
+                    openFolder != null -> SafTreeMatch(openFolder, DocumentsContract.getTreeDocumentId(openFolder), "")
+                    else -> null
+                }
+                if (treeMatch != null) {
+                    if (!explicitRelative) {
+                        val noteRel = if (sourceUri == null) null else treeMatch.relativePath
+                        val ranked = runCatching {
+                            workspaceLinks.resolve(treeMatch.folderUri, noteRelative = noteRel, rawTarget = cleaned, wikilink = true)
+                        }.getOrNull()
+                        if (ranked != null) {
+                            val targetUri = documentAccess.resolve(ranked.uri)
+                            if (documentAccess.hasReadGrant(targetUri) &&
+                                runCatching { resolver.openInputStream(targetUri)?.use { true } == true }.getOrDefault(false)
+                            ) {
+                                return@withContext ranked.copy(uri = targetUri)
+                            }
+                        }
+                    }
+                    val parentRelative = treeMatch.relativePath.substringBeforeLast('/', "")
+                    val candidateLists = expandWorkspaceCandidatePaths(parentRelative, cleaned, wikilink)
+                    var deniedTreeCandidate: Uri? = null
+                    for (parts in candidateLists) {
+                        val relJoined = parts.joinToString("/")
+                        val indexedUri = try {
+                            readerFolderIndex.resolve(resolver, sourceNote.id, treeMatch.folderUri, treeMatch.rootId, parts).uri
+                        } catch (_: LinkedAssetAccessRequiredException) {
+                            null
+                        } catch (_: SecurityException) {
+                            null
+                        } catch (_: UnsupportedOperationException) {
+                            null
+                        } catch (_: java.io.FileNotFoundException) {
+                            null
+                        }
+                        if (indexedUri != null) {
+                            val targetUri = documentAccess.resolve(indexedUri)
+                            return@withContext WorkspaceResolvedNote(targetUri, parts.last(), relJoined)
+                        }
+                        val candidateDocId = if (treeMatch.rootId.endsWith(':')) {
+                            "${treeMatch.rootId}$relJoined"
+                        } else {
+                            "${treeMatch.rootId.trimEnd('/')}/$relJoined"
+                        }
+                        val candidateUri = documentAccess.resolve(
+                            DocumentsContract.buildDocumentUriUsingTree(treeMatch.folderUri, candidateDocId),
+                        )
+                        if (!documentAccess.hasReadGrant(candidateUri)) {
+                            if (deniedTreeCandidate == null) deniedTreeCandidate = candidateUri
+                            continue
+                        }
+                        val readable = try {
+                            resolver.openInputStream(candidateUri)?.use { true } == true
+                        } catch (_: java.io.FileNotFoundException) {
+                            false
+                        } catch (error: Exception) {
+                            if (isDocumentAccessFailure(error) && deniedTreeCandidate == null) {
+                                deniedTreeCandidate = candidateUri
+                            }
+                            false
+                        }
+                        if (readable) {
+                            return@withContext WorkspaceResolvedNote(candidateUri, parts.last(), relJoined)
+                        }
+                    }
+                    if (explicitRelative && sourceUri != null) {
+                        val rankedRel = runCatching {
+                            workspaceLinks.resolve(treeMatch.folderUri, noteRelative = treeMatch.relativePath, rawTarget = cleaned, wikilink = false)
+                        }.getOrNull()
+                        if (rankedRel != null) {
+                            val targetUri = documentAccess.resolve(rankedRel.uri)
+                            if (documentAccess.hasReadGrant(targetUri) &&
+                                runCatching { resolver.openInputStream(targetUri)?.use { true } == true }.getOrDefault(false)
+                            ) {
+                                return@withContext rankedRel.copy(uri = targetUri)
+                            }
+                        }
+                    }
+                    if (deniedTreeCandidate != null) {
+                        throw PromptWorkspaceNoteAccessException(deniedTreeCandidate)
+                    }
+                    throw WorkspaceLinkException("Linked note not found: ${Uri.decode(cleaned)}")
+                }
+                if (!explicitRelative && openFolder != null) {
+                    val ranked = workspaceLinks.resolve(openFolder, noteRelative = null, rawTarget = cleaned, wikilink = true)
+                    return@withContext ranked.copy(uri = documentAccess.resolve(ranked.uri))
+                }
+
+                val nonNullSourceUri = sourceUri ?: throw WorkspaceLinkException("Save this note before opening linked notes.")
+                val candidateLists = expandWorkspaceCandidatePaths("", cleaned, wikilink)
+                val documentId = runCatching { DocumentsContract.getDocumentId(nonNullSourceUri) }.getOrDefault("")
+                val sep = maxOf(documentId.lastIndexOf('/'), documentId.lastIndexOf(':'))
+
+                linkedAssetUri(sourceNote, cleaned)?.let { grantedUri ->
+                    val resolvedGranted = documentAccess.resolve(grantedUri)
+                    val grantedReadable = documentAccess.hasReadGrant(resolvedGranted) &&
+                        runCatching { resolver.openInputStream(resolvedGranted)?.use { true } == true }.getOrDefault(false)
+                    if (grantedReadable) {
+                        val firstParts = candidateLists.first()
+                        return@withContext WorkspaceResolvedNote(resolvedGranted, firstParts.last(), firstParts.joinToString("/"))
+                    }
+                }
+
+                var deniedCandidate: Uri? = null
+                for (parts in candidateLists) {
+                    val relJoined = parts.joinToString("/")
+                    val siblingDocId = if (sep >= 0) documentId.substring(0, sep + 1) + relJoined else relJoined
+                    val rawCandidate = if (documentId.isNotEmpty() && nonNullSourceUri.authority != null) {
+                        DocumentsContract.buildDocumentUri(nonNullSourceUri.authority, siblingDocId)
+                    } else {
+                        nonNullSourceUri.buildUpon().path((nonNullSourceUri.path?.substringBeforeLast('/', "") ?: "") + "/" + relJoined).build()
+                    }
+                    val openMatch = mutable.value.tabs.firstOrNull { tab ->
+                        tab.uri?.let { existingUri -> sameDocumentUri(existingUri, rawCandidate.toString()) } == true
+                    }?.uri?.let(Uri::parse)
+                    val candidateUri = documentAccess.resolve(openMatch ?: rawCandidate)
+                    if (!documentAccess.hasReadGrant(candidateUri)) {
+                        if (deniedCandidate == null) deniedCandidate = candidateUri
+                        continue
+                    }
+                    val readable = try {
+                        resolver.openInputStream(candidateUri)?.use { true } == true
+                    } catch (_: java.io.FileNotFoundException) {
+                        false
+                    } catch (error: Exception) {
+                        if (isDocumentAccessFailure(error) && deniedCandidate == null) {
+                            deniedCandidate = candidateUri
+                        }
+                        false
+                    }
+                    if (readable) {
+                        return@withContext WorkspaceResolvedNote(candidateUri, parts.last(), relJoined)
+                    }
+                }
+                if (!explicitRelative) {
+                    return@withContext null
+                }
+                if (deniedCandidate != null) {
+                    throw PromptWorkspaceNoteAccessException(deniedCandidate)
+                }
+                throw WorkspaceLinkException("Linked note not found: ${Uri.decode(cleaned)}")
+            }
+        } catch (cancelled: kotlinx.coroutines.CancellationException) {
+            throw cancelled
+        } catch (prompt: PromptWorkspaceNoteAccessException) {
+            val targetStr = prompt.targetUri.toString()
+            if (trimmedFragment.isNotEmpty()) pendingAccessHeadings[targetStr] = trimmedFragment
+            val notice = requestDocumentAccess(targetStr, null, writing = false, explicit = true)
+            return JSONObject().put("opened", false).put("message", notice)
+        } catch (security: SecurityException) {
+            val msg = security.message ?: DOCUMENT_ACCESS_MESSAGE
+            mutable.value = mutable.value.copy(busy = false, message = msg)
+            return JSONObject().put("opened", false).put("message", msg)
+        } catch (error: WorkspaceLinkException) {
+            val msg = error.message ?: "Invalid relative note path."
+            mutable.value = mutable.value.copy(busy = false, message = msg)
+            return JSONObject().put("opened", false).put("message", msg)
+        }
+
+        if (resolved == null) {
+            val notice = if (allowFolderPrompt) {
+                "Folder permission is needed to follow links from ${sourceNote.name}. Choose its containing folder."
+            } else {
+                "Choose the folder containing ${sourceNote.name} to follow relative links."
+            }
+            val prompt = if (allowFolderPrompt && sourceUri != null) {
+                WorkspaceFolderPrompt(
+                    noteId = sourceNote.id,
+                    noteName = sourceNote.name,
+                    initialUri = sourceUri,
+                    target = trimmedTarget,
+                    fragment = trimmedFragment,
+                    wikilink = wikilink,
+                )
+            } else null
+            mutable.value = mutable.value.copy(folderAccessPrompt = prompt, message = notice)
+            return JSONObject().put("opened", false).put("promptedFolderAccess", prompt != null).put("message", notice)
+        }
+
+        return openNoteInternal(
+            resolved.uri,
+            resolved.relative,
+            headingFragment = trimmedFragment,
+            scheduleDirtyAutosave = true,
+            alwaysReportError = true,
+            errorPrefix = "Could not open linked note",
+        )
+    }
+
+    suspend fun openRelativeNote(documentPath: String, target: String, heading: String? = null): JSONObject =
+        openWorkspaceLink(documentPath, target, heading.orEmpty(), wikilink = false)
 
     suspend fun textAsset(document: String, source: String): JSONObject = withContext(Dispatchers.IO) {
         require(Uri.decode(source).substringBefore('?').substringBefore('#').substringAfterLast('.').lowercase() in setOf("mmd", "mermaid")) { "Choose a Mermaid source file" }

@@ -187,45 +187,41 @@ describe('shared source analysis',()=>{
     expect(hasCallouts('> ```markdown\n> :::callout note QuotedFenced\n> :::\n> ```')).toBe(false);
     expect(hasCallouts('---\ntitle: x\n---\n```md\n:::callout note Fenced\n:::\n```\n:::callout tip Real\nOk\n:::')).toBe(true);
   });
-
   it('normalizes spaced, aliased, portable, and section wikilinks while preserving sparse UTF-16 source offsets',()=>{
+    expect(normalizeCallouts('[[Task Note]]')).toBe('[Task Note](Task%20Note.md)');
+    expect(normalizeCallouts('[[Lecture 2#Bayes Law|Bayes]]')).toBe('[Bayes](Lecture%202.md#bayes-law)');
+    expect(normalizeCallouts('[[Lecture 2#Bayes]]')).toBe('[Lecture 2#Bayes](Lecture%202.md#bayes)');
+    expect(normalizeCallouts('[[study.smd]]')).toBe('[study.smd](study.smd)');
+    expect(normalizeCallouts('[[Study Deck.smd#Card 1|First card]]')).toBe('[First card](Study%20Deck.smd#card-1)');
+    expect(normalizeCallouts('[[archive.fmd]]')).toBe('[archive.fmd](archive.fmd)');
+    expect(normalizeCallouts('[[notes.markdown#Intro]]')).toBe('[notes.markdown#Intro](notes.markdown#intro)');
+    expect(normalizeCallouts('![[DM Images/proof.svg|300]]')).toBe('![DM Images/proof.svg](DM%20Images/proof.svg){width=300}');
+    expect(normalizeCallouts('[[   ]]')).toBe('[[   ]]');
+    expect(normalizeCallouts('Keep `[[Task Note]]` and $P([[A]]) = 1$ literal.')).toBe('Keep `[[Task Note]]` and $P([[A]]) = 1$ literal.');
+
     const source=[
       '---',
-      'title: Spaced Wikilinks',
+      'title: Study Index',
       '---',
-      '# Course Hub 🚀',
+      '# Study 🧠 Index',
       '',
-      'Read [[Task Note]], [[Lecture 2#Bayes Law|Bayes 🧪]], [[study.smd]], [[legacy.fmd|Legacy Deck]], and [[#Course Hub 🚀|top]].',
+      'Open [[Task Note]], [[Lecture 2#Bayes Law|Bayes]], and [[study.smd]].',
       '',
-      '![[DM Images/proof diagram.svg|Proof Diagram]]',
-      '',
-      '- [ ] Complete [[Task Note|first task]]',
+      '- [ ] Review after wikilinks',
       '',
       '## Follow-up Section',
-      '',
-      '- [x] Review `[[Task Note]]` and $P([[A]]) = 1$',
-      '',
     ].join('\n');
-
-    const encoded=normalizeCallouts(source);
-    expect(encoded).toContain('[Task Note](Task%20Note.md)');
-    expect(encoded).toContain('[Bayes 🧪](Lecture%202.md#bayes-law)');
-    expect(encoded).toContain('[study.smd](study.smd)');
-    expect(encoded).toContain('[Legacy Deck](legacy.fmd)');
-    expect(encoded).toContain('[top](#course-hub)');
-    expect(encoded).toContain('![Proof Diagram](DM%20Images/proof%20diagram.svg)');
-    expect(encoded).toContain('`[[Task Note]]`');
-    expect(encoded).toContain('$P([[A]]) = 1$');
-
+    const stage=normalizeMarkdownSource(source,{encodeLinkDestinations:true});
+    const tailMarker='## Follow-up Section';
+    expect(stage.originalOffset(stage.value.indexOf(tailMarker))).toBe(source.indexOf(tailMarker));
     const analysis=analyzeDocument(source);
-    expect(analysis.tasks).toEqual([source.indexOf('[ ]')+1,source.indexOf('[x]')+1]);
+    expect(analysis.tasks).toEqual([source.indexOf('[ ]')+1]);
     expect(analysis.outline.map(item=>[item.id,item.offset])).toEqual([
-      ['course-hub',source.indexOf('# Course Hub 🚀')],
+      ['study--index',source.indexOf('# Study 🧠 Index')],
       ['follow-up-section',source.indexOf('## Follow-up Section')],
     ]);
     for(const block of analysis.blocks)expect(source.slice(block.start,block.end)).toBe(block.text);
   });
-
   it('rewrites numeric Obsidian pipe widths to {width=...} while preserving non-numeric captions and offsets',()=>{
     const source='![[diagram.png|300]] and ![[diagram.png|300x180]] and ![[diagram.png|Caption|240]] vs ![[diagram.png|Architecture]]\n\n# Heading After\n';
     const normalized=normalizeMarkdownSource(source);

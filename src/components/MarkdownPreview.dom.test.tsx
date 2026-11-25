@@ -289,8 +289,8 @@ describe("local image preview", () => {
   });
 });
 
-describe("relative note and workspace link notices", () => {
-  it("omits target=_blank on local anchors and routes relative note and wikilink clicks through open_workspace_link", async () => {
+describe("relative note navigation", () => {
+  it("omits target=_blank on local anchors and routes relative note clicks through open_workspace_link", async () => {
     const host = document.createElement("div");
     document.body.append(host);
     root = createRoot(host);
@@ -328,7 +328,7 @@ describe("relative note and workspace link notices", () => {
     }
   });
 
-  it("surfaces an in-app status notice when clicking a workspace link in an unsaved standalone preview", async () => {
+  it("surfaces an in-app status notice when clicking a relative note link in an unsaved note", async () => {
     const host = document.createElement("div");
     document.body.append(host);
     root = createRoot(host);
@@ -347,7 +347,7 @@ describe("relative note and workspace link notices", () => {
     expect(notices).toEqual(["Save this note before opening linked notes."]);
   });
 
-  it("surfaces a safe status notice when open_workspace_link blocks an escaped path", async () => {
+  it("surfaces a safe status notice when native open_workspace_link blocks an escaped path", async () => {
     loadAsset.mockImplementationOnce(async (command: string) => {
       if (command === "open_workspace_link") return { opened: false, message: "Linked note is outside the authorized folder." } as never;
       return true as never;
@@ -364,12 +364,7 @@ describe("relative note and workspace link notices", () => {
       anchor.dispatchEvent(click);
     });
     expect(click.defaultPrevented).toBe(true);
-    expect(loadAsset).toHaveBeenCalledWith("open_workspace_link", {
-      documentPath: "/notes/index.md",
-      target: "../outside.md",
-      fragment: "",
-      wikilink: false,
-    });
+    expect(loadAsset).toHaveBeenCalledWith("open_workspace_link", { documentPath: "/notes/index.md", target: "../outside.md", fragment: "", wikilink: false });
     expect(host.querySelector('[role="status"].reader-link-notice')?.textContent).toContain("Linked note is outside the authorized folder.");
   });
 });

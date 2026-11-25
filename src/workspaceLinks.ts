@@ -176,4 +176,3 @@ export function findSourceLinkAtOffset(lineText: string, columnOffset: number): 
   }
   return null;
 }
-

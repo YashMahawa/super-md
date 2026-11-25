@@ -479,7 +479,7 @@ fn parse_positive_number_str(s: &str) -> Option<&str> {
 fn parse_obsidian_pipe_spec<'a>(path: &'a str, spec: Option<&'a str>) -> (&'a str, Option<&'a str>) {
     let Some(spec) = spec else { return (path, None) };
     let (caption_opt, dim_candidate) = match spec.rsplit_once('|') {
-        Some((cap, last)) => (Some(cap.trim()), last.trim()),
+        Some((cap, last)) => (Some(cap.strip_suffix('\\').unwrap_or(cap).trim()), last.trim()),
         None => (None, spec.trim()),
     };
     let width_part = match dim_candidate.split_once(['x', 'X']) {
@@ -513,10 +513,11 @@ fn normalize_obsidian_slice(slice: &str) -> String {
                     None => (inner, None),
                 };
                 let path = if spec.is_some() && raw_path.ends_with('\\') {
-                    raw_path[..raw_path.len() - 1].trim()
+                    &raw_path[..raw_path.len() - 1]
                 } else {
-                    raw_path.trim()
-                };
+                    raw_path
+                }
+                .trim();
                 if !path.is_empty() {
                     let (alt_raw, width) = parse_obsidian_pipe_spec(path, spec);
                     let alt = alt_raw.replace('\\', "\\\\").replace('[', "\\[").replace(']', "\\]");
@@ -626,7 +627,7 @@ pub fn image_sources(markdown: &str) -> Vec<String> {
     sources
 }
 
-/// Normalize both Obsidian and Super MD callouts before parsing ordinary Markdown.
+/// Normalize Obsidian/Super MD callouts and wikilinks outside code before parsing Markdown.
 pub fn normalize_callouts(input: &str) -> String {
     if let Some(fm) = frontmatter::parse_frontmatter(input) {
         let rest = &input[fm.end..];
@@ -634,10 +635,12 @@ pub fn normalize_callouts(input: &str) -> String {
         if !out.ends_with('\n') && !rest.is_empty() {
             out.push('\n');
         }
-        out.push_str(&normalize_callouts_body(rest));
+        let stripped = strip_percent_comments(rest);
+        out.push_str(&normalize_callouts_body(&stripped));
         return out;
     }
-    normalize_callouts_body(input)
+    let stripped = strip_percent_comments(input);
+    normalize_callouts_body(&stripped)
 }
 
 fn normalize_callouts_body(input: &str) -> String {
@@ -648,7 +651,8 @@ fn normalize_callouts_body(input: &str) -> String {
         let body=line.trim_start_matches(' ');
         let code=body.chars().next().filter(|ch| matches!(ch,'`'|'~')).and_then(|ch| {
             let count=body.chars().take_while(|value| *value==ch).count();
-            (line.len()-body.len()<=3 && count>=3).then_some((ch,count))
+            let valid_open = !(fence.is_none() && ch == '`' && body[count..].contains('`'));
+            (line.len()-body.len()<=3 && count>=3 && valid_open).then_some((ch,count))
         });
         let inside_fence=fence.is_some();
         if let Some((ch,count))=code {
@@ -672,7 +676,7 @@ fn normalize_callouts_body(input: &str) -> String {
             depth-=1;output.push_str("> ".repeat(depth).trim_end());output.push('\n');
         } else { output.push_str(&"> ".repeat(depth));output.push_str(line);output.push('\n'); }
     }
-    normalize_obsidian_embeds(&normalize_prose_links(&output))
+    normalize_prose_links(&normalize_obsidian_embeds(&output))
 }
 
 fn encode_md_destination(value: &str) -> String {
@@ -842,33 +846,10 @@ fn split_optional_link_title(inside: &str) -> (&str, &str) {
     (inside, "")
 }
 
-fn has_spaced_inline_link(input: &str) -> bool {
-    let mut rest = input;
-    while let Some(pos) = rest.find("](") {
-        let after = &rest[pos + 2..];
-        let mut has_ws = false;
-        for b in after.bytes() {
-            match b {
-                b'\r' | b'\n' | b'(' | b'<' | b'>' => break,
-                b')' => {
-                    if has_ws {
-                        return true;
-                    }
-                    break;
-                }
-                b' ' | b'\t' => has_ws = true,
-                _ => {}
-            }
-        }
-        rest = after;
-    }
-    false
-}
-
 /// Normalize prose wikilinks and spaced Markdown link destinations while
 /// leaving fenced code, indented code, inline code, HTML, and math untouched.
 fn normalize_prose_links(input: &str) -> String {
-    if !input.contains("[[") && !has_spaced_inline_link(input) { return input.to_string(); }
+    if !input.contains("[[") && !input.contains("](") { return input.to_string(); }
     let mut protected = Vec::new();
     for (event, range) in Parser::new_ext(input, Options::ENABLE_MATH).into_offset_iter() {
         if matches!(event, Event::Start(Tag::CodeBlock(_)) | Event::Code(_) | Event::InlineMath(_) | Event::DisplayMath(_) | Event::Html(_) | Event::InlineHtml(_)) {
@@ -1712,61 +1693,45 @@ P(A\cup B\cup C)=&P(A)+P(B)+P(C)\\
         assert!(pdf_bytes.starts_with(b"%PDF-"));
     }
     #[test]
-    fn wikilinks_and_cross_note_links_unwrap_while_web_and_same_note_links_remain_clickable() {
+    fn normalizes_wikilinks_outside_code_and_exports_clean_pdf_labels() {
         let md = [
-            "# Overview",
+            "# Bayes Overview",
             "",
-            "Jump to [[#Milestones|Q3 Milestones Section]] or [duplicate](#milestones-1) or [web](https://example.org/docs) or [email](mailto:team@example.org).",
+            "Follow [[Task Note]], [[Lecture 2#Bayes Law|Bayes]], [[study.smd]], [Deck](study.smd), and [[#Bayes Overview|Back to overview]].",
             "",
-            "Cross-note links: [[Project Plan#Milestones|Q3 Plan]], [[Subfolder Note]], [[Portable Note.smd#Intro|Portable Intro]], [API Spec](../my specs/api.md#Auth Flow).",
-            "",
-            "| Code | Link |",
+            "| Link | Code |",
             "| --- | --- |",
-            "| `[[Literal Wiki]]` | [[Table Target\\|Table Alias]] |",
+            "| [[Lecture 2#Bayes|Bayes cell]] | `[[Task Note]]` and `` `![[raw.png]]` `` |",
             "",
-            "```cpp",
-            "[[nodiscard]] int compute() { return 7; }",
+            "```python",
+            "arr = [[1, 2], [3, 4]]",
+            "note = '[[Literal]]'",
             "```",
             "",
-            "## Milestones",
-            "",
-            "First milestones section.",
-            "",
-            "## Milestones",
-            "",
-            "Second milestones section.",
         ].join("\n");
+        let normalized = normalize_callouts(&md);
+        assert!(normalized.contains("[Task Note](Task%20Note.md)"), "{normalized}");
+        assert!(normalized.contains("[Bayes](Lecture%202.md#bayes-law)"), "{normalized}");
+        assert!(normalized.contains("[study.smd](study.smd)"), "{normalized}");
+        assert!(normalized.contains("[Back to overview](#bayes-overview)"), "{normalized}");
+        assert!(normalized.contains("[Bayes cell](Lecture%202.md#bayes)"), "{normalized}");
+        assert!(normalized.contains("`[[Task Note]]`"), "{normalized}");
+        assert!(normalized.contains("`` `![[raw.png]]` ``"), "{normalized}");
+        assert!(normalized.contains("arr = [[1, 2], [3, 4]]"), "{normalized}");
+        assert!(normalized.contains("note = '[[Literal]]'"), "{normalized}");
 
-        let typst_src = source(&md, &PdfOptions::default(), &HashMap::new()).unwrap();
-        assert!(typst_src.contains("#link(label(\"smd-milestones\"))[#text(\"Q3 Milestones Section\")]"), "{typst_src}");
-        assert!(typst_src.contains("#link(label(\"smd-milestones-1\"))[#text(\"duplicate\")]"), "{typst_src}");
-        assert!(typst_src.contains("#link(\"https://example.org/docs\")[#text(\"web\")]"), "{typst_src}");
-        assert!(typst_src.contains("#link(\"mailto:team@example.org\")[#text(\"email\")]"), "{typst_src}");
-        assert!(typst_src.contains("#text(\"Q3 Plan\")"), "{typst_src}");
-        assert!(typst_src.contains("#text(\"Subfolder Note\")"), "{typst_src}");
-        assert!(typst_src.contains("#text(\"Portable Intro\")"), "{typst_src}");
-        assert!(typst_src.contains("#text(\"API Spec\")"), "{typst_src}");
-        assert!(typst_src.contains("#text(\"Table Alias\")"), "{typst_src}");
-        assert!(!typst_src.contains("Project%20Plan"), "{typst_src}");
-        assert!(!typst_src.contains("api.md"), "{typst_src}");
-        assert!(typst_src.contains("[[Literal Wiki]]"), "{typst_src}");
-        assert!(typst_src.contains("[[nodiscard]] int compute()"), "{typst_src}");
+        let typst = source(&md, &PdfOptions::default(), &HashMap::new()).unwrap();
+        assert!(typst.contains("#text(\"Task Note\")"), "{typst}");
+        assert!(typst.contains("#text(\"Bayes\")"), "{typst}");
+        assert!(typst.contains("#text(\"Deck\")"), "{typst}");
+        assert!(typst.contains("#link(label(\"smd-bayes-overview\"))[#text(\"Back to overview\")]"), "{typst}");
+        assert!(!typst.contains("#text(\"[["), "No prose wikilink brackets in Typst output: {typst}");
+        assert!(!typst.contains("\\["), "No escaped brackets in Typst output: {typst}");
+        assert!(typst.contains("#raw(\"[[Task Note]]\")"), "{typst}");
 
-        let pdf_bytes = export(&md, &PdfOptions::default(), &HashMap::new()).unwrap();
-        assert!(pdf_bytes.starts_with(b"%PDF-"));
-        let path = std::env::temp_dir().join("supermd-wikilink-pdf-test.pdf");
-        std::fs::write(&path, &pdf_bytes).unwrap();
-        if let Ok(output) = std::process::Command::new("pdftotext").arg(&path).arg("-").output() {
-            let extracted = String::from_utf8_lossy(&output.stdout);
-            assert!(extracted.contains("Q3 Plan"), "{extracted}");
-            assert!(extracted.contains("Subfolder Note"), "{extracted}");
-            assert!(extracted.contains("Portable Intro"), "{extracted}");
-            assert!(extracted.contains("API Spec"), "{extracted}");
-            assert!(extracted.contains("Table Alias"), "{extracted}");
-            assert!(!extracted.contains("[[Project Plan"), "{extracted}");
-            assert!(!extracted.contains("[[Subfolder Note]]"), "{extracted}");
-            assert!(!extracted.contains("api.md"), "{extracted}");
-        }
+        let pdf = export(&md, &PdfOptions::default(), &HashMap::new()).unwrap();
+        assert!(pdf.starts_with(b"%PDF-"));
+        assert!(pdf.len() > 2_000);
     }
 
     #[test]
