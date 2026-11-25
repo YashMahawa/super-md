@@ -358,6 +358,10 @@ def _asset_identity(value):
     return id(value)
 
 
+def _noop_done(*_):
+    pass
+
+
 def _matches_media_signature(mime: str, data: bytes) -> bool:
     head = data[:4096]
     if mime == "image/png":
@@ -659,12 +663,8 @@ class Studio(QObject):
         self.python_choices=[]
         self.python_busy=False
         self.pythonProgress.connect(self._python_progress)
-        self._default_python_pending_persist = False
         if not self.settings.get("python"):
-            self._choose_default_python(persist=False)
-            if self.settings.get("python"):
-                self._default_python_pending_persist = True
-                QTimer.singleShot(0, self._persist_default_python)
+            self._choose_default_python(emit=False)
         if not isolated and len(self.session.windows)==1:QTimer.singleShot(0,self._restore_update)
         self.tabs: list[dict] = []
         self.closed_tabs = self.session.closed_tabs
@@ -2009,19 +2009,14 @@ class Studio(QObject):
     def _python_folders(self):
         return [p for p in [self.folder, *(str(Path(t["path"]).parent) for t in self.tabs if t.get("path"))] if p]
 
-    def _persist_default_python(self):
-        if self._default_python_pending_persist:
-            self._preferences(False)
-
-    def _choose_default_python(self, persist: bool = True):
+    def _choose_default_python(self, emit: bool = True):
         if self.retired or self.settings.get("python"):
             return
         path = python_runtime.default_python(self.data / "python-env")
         if path:
             self.settings["python"] = path
-            if persist:
-                self._preferences()
-        if persist:
+            self._preferences(notify=emit)
+        if emit:
             self._emit(False)
 
     @Slot(str)
@@ -2523,7 +2518,7 @@ class Studio(QObject):
                 value,error=f.result(),None
             except Exception as reason:
                 value,error=None,str(reason)
-            if self.retired:return
+            if self.retired or (done is _noop_done and not busy and error is None):return
             try:self.completed.emit((done,value,error,busy))
             except RuntimeError:pass  # The QObject may have been retired meanwhile.
         future.add_done_callback(completed)
@@ -2598,15 +2593,14 @@ class Studio(QObject):
         done(value, error)
 
     def _preferences(self,notify=True):
-        self._default_python_pending_persist = False
         if self.retired or getattr(self.writes, "_shutdown", False): return
         data = json.dumps({"settings": self.settings, "recent": self.recent, "pinned":self.session.pinned}).encode()
-        self._submit(lambda: atomic_write(self.data / "settings.json", data), lambda *_: None, False,self.writes)
+        self._submit(lambda: atomic_write(self.data / "settings.json", data), _noop_done, False, self.writes)
         if notify:self.session.changed.emit()
 
     def _save_positions(self):
         data=json.dumps(self.session.locations).encode()
-        self._submit(lambda:atomic_write(self.data/"reading-positions.json",data),lambda *_:None,False,self.writes)
+        self._submit(lambda:atomic_write(self.data/"reading-positions.json",data),_noop_done,False,self.writes)
 
     def _recover(self):
         # Clean tabs need only paths, never another copy of their image bytes.
@@ -4732,9 +4726,7 @@ class Studio(QObject):
                 self.replied.emit(id, json.dumps({"cancelled": self._export_jobs.cancel(job_id)}), "")
                 return
             tab = self._current()
-            if command == "reader_ready":
-                self._persist_default_python()
-                self.ready = True; self._last_reader_text=None; self._emit(); self.replied.emit(id,"true",""); return
+            if command == "reader_ready": self.ready = True; self._last_reader_text=None; self._emit(); self.replied.emit(id,"true",""); return
             if command == "reader_chrome":
                 action = args.get("action")
                 if action not in ("show", "hide", "toggle"): raise ValueError("Invalid reading chrome action")

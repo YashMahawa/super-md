@@ -345,6 +345,43 @@ class StudioTest(unittest.TestCase):
             self.assertEqual(saved_studio.settings["python"], sys.executable)
             self.app.processEvents()
 
+    def test_startup_default_python_persists_during_init_without_reader_ready_or_ui_completion(self):
+        fresh_session = Session(True)
+        self.addCleanup(lambda: fresh_session.writes.shutdown(wait=True))
+        submitted_writes = []
+        original_submit = fresh_session.writes.submit
+
+        def record_submit(fn, *args, **kwargs):
+            submitted_writes.append(fn)
+            return original_submit(fn, *args, **kwargs)
+
+        with patch.object(fresh_session.writes, "submit", side_effect=record_submit):
+            fresh_studio = QuietStudio(True, fresh_session)
+            self.windows.append(fresh_studio)
+            # Queued directly during __init__ before any QTimer.singleShot(0) or reader_ready runs.
+            self.assertEqual(len(submitted_writes), 1)
+            fresh_session.writes.flush(timeout=3)
+            stored = json.loads((fresh_session.data / "settings.json").read_text(encoding="utf-8"))
+            self.assertEqual(stored["settings"]["python"], fresh_studio.settings["python"])
+
+            completed_events = []
+            fresh_studio.completed.connect(completed_events.append)
+            fresh_studio._preferences(False)
+            fresh_session.writes.flush(timeout=3)
+            self.app.processEvents()
+            self.assertEqual(completed_events, [])
+
+            writes_before_ready = len(submitted_writes)
+            fresh_studio.post("ready", "reader_ready", "{}")
+            self.app.processEvents()
+            self.assertEqual(len(submitted_writes), writes_before_ready)
+
+        with patch("studio.atomic_write", side_effect=OSError("disk full")):
+            fresh_studio._preferences(False)
+            fresh_session.writes.flush(timeout=3)
+            self.app.processEvents()
+            self.assertIn("disk full", fresh_studio.message)
+
     def test_concurrent_refresh_python_and_preferred_share_single_discover_run(self):
         import concurrent.futures
         import threading

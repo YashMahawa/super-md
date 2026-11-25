@@ -393,4 +393,72 @@ class DocumentsTest(unittest.TestCase):
             extracted = workspace.read_asset(str(fast_path), "assets/diagram-0.svg", expected_revision=inspected["revision"])
             self.assertEqual(extracted["data"], pattern + b"<!--0-->")
 
+    def test_streamed_large_recovery_drafts_release_gil(self):
+        import threading
+        import time
+
+        png = b"\x89PNG\r\n\x1a\n" + (b"\xab\xcd\xef\x01" * (24_500_000 // 4))
+        asset_url = "data:image/png;base64," + base64.b64encode(png).decode("ascii")
+        assets = {"assets/hero.png": asset_url}
+        bundle("# Draft\n![Hero](assets/hero.png)\n", assets)
+        unicode_tail = ("café — π " * 70_000) + "\ud800"
+        drafts = [{
+            "id": "tab-1",
+            "name": "large.smd",
+            "content": "# Draft\n![Hero](assets/hero.png)\n",
+            "saved": "# Saved\n![Hero](assets/hero.png)\n",
+            "assets": assets,
+            "saved_assets": dict(assets),
+            "notes": unicode_tail,
+            "flags": [True, False, None, 42, 3.5],
+        }]
+
+        with tempfile.TemporaryDirectory() as directory:
+            recovery_path = Path(directory) / "recovery.json"
+            done = threading.Event()
+            errors: list[BaseException] = []
+
+            def writer():
+                try:
+                    atomic_json(recovery_path, drafts)
+                except BaseException as exc:
+                    errors.append(exc)
+                finally:
+                    done.set()
+
+            worker = threading.Thread(target=writer)
+            max_stall_ms = 0.0
+            last = time.perf_counter()
+            worker.start()
+            while not done.is_set():
+                time.sleep(0.0005)
+                now = time.perf_counter()
+                stall_ms = max(0.0, (now - last - 0.0005) * 1000.0)
+                if stall_ms > max_stall_ms:
+                    max_stall_ms = stall_ms
+                last = now
+            worker.join(timeout=10)
+
+            self.assertEqual(errors, [])
+            self.assertLess(
+                max_stall_ms,
+                50.0,
+                f"Expected atomic_json on 25 MB recovery draft to release GIL cleanly (< 50 ms), got {max_stall_ms:.2f} ms",
+            )
+
+            loaded = json.loads(recovery_path.read_text(encoding="utf-8"))
+            self.assertEqual(loaded[0]["assets"], assets)
+            self.assertEqual(loaded[0]["saved_assets"], assets)
+            self.assertEqual(loaded[0]["flags"], [True, False, None, 42, 3.5])
+            self.assertEqual(loaded[0]["notes"], unicode_tail)
+
+            before = recovery_path.read_bytes()
+            with self.assertRaises(TypeError):
+                atomic_json(recovery_path, {"bad": object()})
+            cycle: list = []
+            cycle.append(cycle)
+            with self.assertRaises(ValueError):
+                atomic_json(recovery_path, cycle)
+            self.assertEqual(recovery_path.read_bytes(), before)
+
 if __name__ == "__main__": unittest.main()
