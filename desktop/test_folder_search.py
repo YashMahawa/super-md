@@ -534,10 +534,11 @@ class WorkspaceSearchDesktopTest(unittest.TestCase):
         u16 = crlf_markdown.encode("utf-16-le")
         sliced = [u16[2 * m["sourceStart"] : 2 * m["sourceEnd"]].decode("utf-16-le") for m in res["matches"]]
         self.assertEqual(sliced, ["EchoToken", "EchoToken", "ECHOTOKEN"])
+        self.assertEqual([m["matchText"] for m in res["matches"]], ["EchoToken", "EchoToken", "ECHOTOKEN"])
         self.assertLess(res["matches"][0]["sourceStart"], res["matches"][1]["sourceStart"])
         self.assertLess(res["matches"][1]["sourceStart"], res["matches"][2]["sourceStart"])
 
-        # Handoff to closed disk note preserves exact 2nd occurrence sourceStart/sourceEnd in seededFind.
+        # Handoff to closed disk note preserves exact 2nd occurrence sourceStart/sourceEnd/matchText in seededFind.
         disk_note = self.root / "handoff.md"
         disk_content = "# İstanbul 📓\nFirst Needle.\nSecond Needle after 📓.\n"
         disk_note.write_text(disk_content, encoding="utf-8")
@@ -546,23 +547,32 @@ class WorkspaceSearchDesktopTest(unittest.TestCase):
         second = disk_hits[1]
         disk_u16 = disk_content.encode("utf-16-le")
         self.assertEqual(disk_u16[2 * second["sourceStart"] : 2 * second["sourceEnd"]].decode("utf-16-le"), "Needle")
+        self.assertEqual(second["matchText"], "Needle")
 
         active_tab = self.studio.tabs[0]
         self.studio.ready = True
-        self.studio.openFolderSearchMatch("", str(disk_note), "Needle", True, second["sourceStart"], second["sourceEnd"])
+        self.studio.openFolderSearchMatch("", str(disk_note), "Needle", True, second["sourceStart"], second["sourceEnd"], second["matchText"])
         op = self.studio.flush_operation
         self.assertIsNotNone(op)
         self.studio.post("f-open", "document_flushed", json.dumps({"operation": op, "id": active_tab["id"], "content": active_tab["content"]}))
         self.assertTrue(_wait_until(lambda: self.studio._current()["name"] == "handoff.md"))
-        # Also verify active-tab re-seed passes sourceStart/sourceEnd into window.supermdFind.
+        # Also verify active-tab re-seed passes sourceStart/sourceEnd/matchText into window.supermdFind.
         calls: list[str] = []
         self.studio.readerCall.connect(calls.append)
         opened_tab = self.studio._current()
-        self.studio.openFolderSearchMatch(opened_tab["id"], opened_tab["path"], "Needle", True, second["sourceStart"], second["sourceEnd"])
+        self.studio.openFolderSearchMatch(opened_tab["id"], opened_tab["path"], "Needle", True, second["sourceStart"], second["sourceEnd"], second["matchText"])
         op_active = self.studio.flush_operation
         self.assertIsNotNone(op_active)
         self.studio.post("f-active", "document_flushed", json.dumps({"operation": op_active, "id": opened_tab["id"], "content": opened_tab["content"]}))
-        self.assertTrue(any(f'"sourceStart": {second["sourceStart"]}' in call and f'"sourceEnd": {second["sourceEnd"]}' in call for call in calls), calls)
+        self.assertTrue(
+            any(
+                f'"sourceStart": {second["sourceStart"]}' in call
+                and f'"sourceEnd": {second["sourceEnd"]}' in call
+                and '"matchText": "Needle"' in call
+                for call in calls
+            ),
+            calls,
+        )
 
     def test_sync_for_search_preserves_matches_when_unchanged_and_rescans_when_flushed_edits_arrive(self):
         note = self.root / "synced.md"

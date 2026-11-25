@@ -46,6 +46,7 @@ data class FolderSearchMatch(
     val isOpen: Boolean,
     val sourceStart: Int = -1,
     val sourceEnd: Int = -1,
+    val matchText: String = "",
 )
 
 data class FolderSearchState(
@@ -500,6 +501,7 @@ private suspend fun searchMarkdownLines(
                     isOpen = isOpen,
                     sourceStart = lineStartUtf16 + origStart,
                     sourceEnd = lineStartUtf16 + origEnd,
+                    matchText = origLine.substring(origStart, origEnd),
                 ),
             )
         }

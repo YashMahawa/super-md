@@ -515,4 +515,183 @@ describe("ReadingSearch DOM behavior", () => {
       host.remove();
     }
   });
+
+  it("falls back to ordinary seeded Find on stale offsets from same-offset replacement or prior insertion while keeping valid Unicode-folded and hidden-source hits", async () => {
+    const host = document.createElement("div");
+    document.body.append(host);
+    const root = createRoot(host);
+    const origHighlight = (window as typeof window & { Highlight?: unknown }).Highlight;
+    const origCss = (globalThis as typeof globalThis & { CSS?: unknown }).CSS;
+
+    class MockHighlight {
+      ranges: Range[];
+      constructor(...ranges: Range[]) {
+        this.ranges = ranges;
+      }
+    }
+    const highlightMap = new Map<string, MockHighlight>();
+    Object.defineProperty(window, "Highlight", { value: MockHighlight, configurable: true, writable: true });
+    Object.defineProperty(globalThis, "CSS", { value: { highlights: highlightMap }, configurable: true, writable: true });
+
+    try {
+      const renderNote = async (
+        markdown: string,
+        seed: { query: string; caseSensitive?: boolean; sourceStart?: number; sourceEnd?: number; matchText?: string; nonce: number },
+        sourceSession?: string,
+      ) => {
+        highlightMap.clear();
+        await act(async () => {
+          root.render(
+            <div className="android-document">
+              <ReadingSearch content={markdown} close={() => {}} seed={seed} sourceSession={sourceSession} />
+              <section className="android-reading">
+                <LiveEditor markdown={markdown} onChange={() => {}} documentPath={null} python="" dark={false} />
+              </section>
+            </div>
+          );
+        });
+        await act(async () => { await new Promise((resolve) => requestAnimationFrame(() => resolve(undefined))); });
+      };
+
+      const scannedNote = [
+        "First AuroraSignal in intro.",
+        "",
+        "Second AuroraSignal in body and [hidden](https://example.com/AuroraSignal).",
+      ].join("\n");
+      const scannedHits = sourceMatches(scannedNote, "AuroraSignal", false);
+      expect(scannedHits).toHaveLength(3);
+
+      // 1. Replacement at the exact same offsets (2nd occurrence replaced by equal-length "OtherContent"):
+      //    Must NOT highlight "OtherContent" or claim "In source"; falls back to ordinary seeded Find (1 / 1 on first hit, plus hidden URL ignored in rendered count).
+      const replacedSecondSameOffsets =
+        scannedNote.slice(0, scannedHits[1].from) +
+        "OtherContent" +
+        scannedNote.slice(scannedHits[1].to);
+      expect(replacedSecondSameOffsets.length).toBe(scannedNote.length);
+      await renderNote(replacedSecondSameOffsets, {
+        query: "aurorasignal",
+        caseSensitive: false,
+        sourceStart: scannedHits[1].from,
+        sourceEnd: scannedHits[1].to,
+        matchText: "AuroraSignal",
+        nonce: 101,
+      });
+      expect(host.querySelector("output")?.textContent).toBe("1 / 1");
+      expect(highlightMap.get("smd-search-current")?.ranges[0]?.toString()).toBe("AuroraSignal");
+      expect(highlightMap.get("smd-search")?.ranges.map(r => r.toString())).toEqual(["AuroraSignal"]);
+
+      // 1b. Replacement at the same offsets when NO matches remain anywhere in the note (including inside a hidden URL):
+      //     Must report "No matches" and highlight nothing, NOT "In Markdown source" or the replacement slice.
+      const replacedAllSameOffsets = scannedNote.replaceAll("AuroraSignal", "OtherContent");
+      expect(replacedAllSameOffsets.length).toBe(scannedNote.length);
+      await renderNote(replacedAllSameOffsets, {
+        query: "AuroraSignal",
+        caseSensitive: false,
+        sourceStart: scannedHits[2].from,
+        sourceEnd: scannedHits[2].to,
+        matchText: "AuroraSignal",
+        nonce: 102,
+      });
+      expect(host.querySelector("output")?.textContent).toBe("No matches");
+      expect(highlightMap.get("smd-search-current")).toBeUndefined();
+      expect(highlightMap.get("smd-search")?.ranges ?? []).toHaveLength(0);
+
+      // 1c. Source/Split session with stale replacement at same offsets also falls back to ordinary seeded Find without highlighting unrelated slice.
+      await renderNote(
+        replacedSecondSameOffsets,
+        {
+          query: "AuroraSignal",
+          caseSensitive: false,
+          sourceStart: scannedHits[1].from,
+          sourceEnd: scannedHits[1].to,
+          matchText: "AuroraSignal",
+          nonce: 103,
+        },
+        "source-session-stale",
+      );
+      expect(host.querySelector("output")?.textContent).toBe("1 / 2");
+
+      // 2. Insertion before the old offset (both non-overlapping and partially overlapping shifted offsets):
+      //    Must NOT highlight the unrelated shifted slice or fuzzy-match the neighbor; falls back to ordinary seeded Find (1 / 2).
+      const insertedPrefixNote = "Inserted preface — " + scannedNote;
+      await renderNote(insertedPrefixNote, {
+        query: "AuroraSignal",
+        caseSensitive: false,
+        sourceStart: scannedHits[1].from,
+        sourceEnd: scannedHits[1].to,
+        matchText: "AuroraSignal",
+        nonce: 104,
+      });
+      expect(host.querySelector("output")?.textContent).toBe("1 / 2");
+      expect(highlightMap.get("smd-search-current")?.ranges[0]?.toString()).toBe("AuroraSignal");
+
+      // Partially overlapping 3-char insertion before old offset (shifts "AuroraSignal" by +3 so old [from, to) overlaps new [from+3, to+3)):
+      const overlappingInsertNote = "Hi " + scannedNote;
+      await renderNote(overlappingInsertNote, {
+        query: "AuroraSignal",
+        caseSensitive: false,
+        sourceStart: scannedHits[1].from,
+        sourceEnd: scannedHits[1].to,
+        nonce: 105,
+      });
+      expect(host.querySelector("output")?.textContent).toBe("1 / 2");
+      expect(highlightMap.get("smd-search-current")?.ranges[0]?.toString()).toBe("AuroraSignal");
+
+      // 2b. Insertion that shifts a differently-cased variant onto the exact old offsets when matchText identity was captured:
+      //     Scanned "AURORASIGNAL" at [0, 12), then "aurorasignal " was prepended so [0, 12) now holds "aurorasignal".
+      const caseIdentityNote = "aurorasignal and AURORASIGNAL";
+      await renderNote(caseIdentityNote, {
+        query: "aurorasignal",
+        caseSensitive: false,
+        sourceStart: 17,
+        sourceEnd: 29,
+        matchText: "AuroraSignal", // mismatched identity -> falls back to ordinary seeded Find (1 / 2) instead of 2 / 2
+        nonce: 106,
+      });
+      expect(host.querySelector("output")?.textContent).toBe("1 / 2");
+
+      // 2c. Shortened note where old seedRange extends past EOF (previously clamped to content.length):
+      await renderNote("Short AuroraSignal.", {
+        query: "AuroraSignal",
+        caseSensitive: false,
+        sourceStart: 12,
+        sourceEnd: 500,
+        matchText: "AuroraSignal",
+        nonce: 107,
+      });
+      expect(host.querySelector("output")?.textContent).toBe("1 / 1");
+      expect(highlightMap.get("smd-search-current")?.ranges[0]?.toString()).toBe("AuroraSignal");
+
+      // 3. Valid Unicode case-folding ("strasse" -> "Straße", "istanbul" -> "İstanbul") and deliberate hidden-source hits still validate and reveal!
+      const unicodeAndHidden = "İstanbul Café on Große Straße with [doc](https://example.com/Straße).";
+      const visibleStrasseFrom = unicodeAndHidden.indexOf("Straße");
+      const hiddenStrasseFrom = unicodeAndHidden.lastIndexOf("Straße");
+      await renderNote(unicodeAndHidden, {
+        query: "strasse",
+        caseSensitive: false,
+        sourceStart: visibleStrasseFrom,
+        sourceEnd: visibleStrasseFrom + "Straße".length,
+        matchText: "Straße",
+        nonce: 108,
+      });
+      expect(host.querySelector("output")?.textContent).toBe("1 / 1");
+      expect(highlightMap.get("smd-search-current")?.ranges[0]?.toString()).toBe("Straße");
+
+      await renderNote(unicodeAndHidden, {
+        query: "strasse",
+        caseSensitive: false,
+        sourceStart: hiddenStrasseFrom,
+        sourceEnd: hiddenStrasseFrom + "Straße".length,
+        matchText: "Straße",
+        nonce: 109,
+      });
+      expect(host.querySelector("output")?.textContent).toBe("In Markdown source");
+      expect(highlightMap.get("smd-search-current")).toBeUndefined();
+    } finally {
+      Object.defineProperty(window, "Highlight", { value: origHighlight, configurable: true, writable: true });
+      Object.defineProperty(globalThis, "CSS", { value: origCss, configurable: true, writable: true });
+      act(() => root.unmount());
+      host.remove();
+    }
+  });
 });

@@ -392,6 +392,7 @@ export interface ReadingSearchSeed {
   caseSensitive?: boolean;
   sourceStart?: number;
   sourceEnd?: number;
+  matchText?: string;
   nonce: number;
 }
 
@@ -404,12 +405,110 @@ function extractSeedRange(seed?: ReadingSearchSeed | null): SourceRange | null {
   return null;
 }
 
+function extractSeedMatchText(seed?: ReadingSearchSeed | null): string | undefined {
+  return typeof seed?.matchText === "string" && seed.matchText.length > 0 ? seed.matchText : undefined;
+}
+
+function foldCodePointForSearch(cp: number): string {
+  switch (cp) {
+    case 0x00df:
+    case 0x1e9e:
+      return "ss";
+    case 0x0130:
+      return "i\u0307";
+    case 0x0149:
+      return "\u02bcn";
+    case 0x01f0:
+      return "j\u030c";
+    case 0x0390:
+      return "\u03b9\u0308\u0301";
+    case 0x03b0:
+      return "\u03c5\u0308\u0301";
+    case 0x03c2:
+      return "\u03c3";
+    case 0x00b5:
+      return "\u03bc";
+    case 0x0345:
+      return "\u03b9";
+    case 0x0587:
+      return "\u0565\u0582";
+    case 0x1e96:
+      return "h\u0331";
+    case 0x1e97:
+      return "t\u0308";
+    case 0x1e98:
+      return "w\u030a";
+    case 0x1e99:
+      return "y\u030a";
+    case 0x1e9a:
+      return "a\u02be";
+    case 0xfb00:
+      return "ff";
+    case 0xfb01:
+      return "fi";
+    case 0xfb02:
+      return "fl";
+    case 0xfb03:
+      return "ffi";
+    case 0xfb04:
+      return "ffl";
+    case 0xfb05:
+    case 0xfb06:
+      return "st";
+    case 0xfb13:
+      return "\u0574\u0576";
+    case 0xfb14:
+      return "\u0574\u0565";
+    case 0xfb15:
+      return "\u0574\u056b";
+    case 0xfb16:
+      return "\u057e\u0576";
+    case 0xfb17:
+      return "\u0574\u056d";
+    default:
+      return String.fromCodePoint(cp).toLowerCase();
+  }
+}
+
+export function foldUnicodeForSearch(text: string): string {
+  let out = "";
+  for (let i = 0; i < text.length; ) {
+    const cp = text.codePointAt(i)!;
+    out += foldCodePointForSearch(cp);
+    i += cp > 0xffff ? 2 : 1;
+  }
+  return out;
+}
+
+function isSplitUtf16Surrogate(text: string, index: number): boolean {
+  if (index <= 0 || index >= text.length) return false;
+  const prev = text.charCodeAt(index - 1);
+  const curr = text.charCodeAt(index);
+  return prev >= 0xd800 && prev <= 0xdbff && curr >= 0xdc00 && curr <= 0xdfff;
+}
+
+function isValidSeedOccurrence(
+  content: string,
+  seedRange: SourceRange,
+  query: string,
+  caseSensitive: boolean,
+  expectedMatchText?: string,
+): boolean {
+  if (!query || seedRange.from < 0 || seedRange.to <= seedRange.from || seedRange.to > content.length) {
+    return false;
+  }
+  if (isSplitUtf16Surrogate(content, seedRange.from) || isSplitUtf16Surrogate(content, seedRange.to)) {
+    return false;
+  }
+  const slice = content.slice(seedRange.from, seedRange.to);
+  if (expectedMatchText !== undefined && slice !== expectedMatchText) {
+    return false;
+  }
+  return caseSensitive ? slice === query : foldUnicodeForSearch(slice) === foldUnicodeForSearch(query);
+}
+
 function findMatchingSourceRangeIndex(ranges: SourceRange[], target: SourceRange): number {
-  const exact = ranges.findIndex(r => r.from === target.from && r.to === target.to);
-  if (exact >= 0) return exact;
-  const sameStart = ranges.findIndex(r => r.from === target.from);
-  if (sameStart >= 0) return sameStart;
-  return ranges.findIndex(r => r.from < target.to && target.from < r.to);
+  return ranges.findIndex(r => r.from === target.from && r.to === target.to);
 }
 
 export default function ReadingSearch({ content, close, onChange, sourceSession, seed }: { content: string; close: () => void; onChange?: (content: string) => void; sourceSession?: string; seed?: ReadingSearchSeed | null }) {
@@ -427,12 +526,14 @@ export default function ReadingSearch({ content, close, onChange, sourceSession,
   const [appliedNonce, setAppliedNonce] = useState<number | null>(seed ? seed.nonce : null);
   const pendingAutoSelect = useRef(Boolean(seed && seed.query));
   const pendingSeedRange = useRef<SourceRange | null>(extractSeedRange(seed));
+  const pendingSeedMatchText = useRef<string | undefined>(extractSeedMatchText(seed));
   const [hiddenSourceHit, setHiddenSourceHit] = useState(false);
   const hiddenSourceAnchorRef = useRef<SourceRange | null>(null);
   if (seed && appliedNonce !== seed.nonce) {
     setAppliedNonce(seed.nonce);
     pendingAutoSelect.current = Boolean(seed.query);
     pendingSeedRange.current = extractSeedRange(seed);
+    pendingSeedMatchText.current = extractSeedMatchText(seed);
     setHiddenSourceHit(false);
     hiddenSourceAnchorRef.current = null;
     setQuery(seed.query.slice(0, 200));
@@ -741,8 +842,10 @@ export default function ReadingSearch({ content, close, onChange, sourceSession,
     if (sourceSession) editorFindQuery(sourceSession, query, caseSensitive);
     const autoSelect = pendingAutoSelect.current;
     const seedRange = autoSelect ? pendingSeedRange.current : null;
+    const seedMatchText = autoSelect ? pendingSeedMatchText.current : undefined;
     pendingAutoSelect.current = false;
     pendingSeedRange.current = null;
+    pendingSeedMatchText.current = undefined;
     let targetIndex = indexRef.current;
     let shouldScrollReplaced = false;
     if (autoSelect) {
@@ -780,11 +883,8 @@ export default function ReadingSearch({ content, close, onChange, sourceSession,
       setWindowed(nextWindowed);
       setMatches(result);
       if (autoSelect) {
-        if (seedRange) {
-          const clampedRange: SourceRange | null = seedRange.from <= content.length
-            ? { from: seedRange.from, to: Math.min(content.length, seedRange.to) }
-            : null;
-          const seedSourceIndex = clampedRange ? findMatchingSourceRangeIndex(nextSourceRanges, clampedRange) : -1;
+        if (seedRange && isValidSeedOccurrence(content, seedRange, query, caseSensitive, seedMatchText)) {
+          const seedSourceIndex = findMatchingSourceRangeIndex(nextSourceRanges, seedRange);
           if (sourceSearch) {
             setHiddenSourceHit(false);
             hiddenSourceAnchorRef.current = null;
@@ -793,20 +893,16 @@ export default function ReadingSearch({ content, close, onChange, sourceSession,
               revealAndHighlightSource(seedSourceIndex, nextSourceRanges, content, true);
               return;
             }
-            if (clampedRange && clampedRange.to > clampedRange.from) {
-              updateIndex(-1);
-              if (sourceSession) editorFindRange(sourceSession, clampedRange.from, clampedRange.to);
-              const sliceText = content.slice(clampedRange.from, clampedRange.to);
-              const sliceRanges = sourceMatches(content, sliceText, true);
-              const sliceIdx = findMatchingSourceRangeIndex(sliceRanges, clampedRange);
-              if (sliceIdx >= 0) revealAndHighlightSource(sliceIdx, sliceRanges, content, true);
-              return;
-            }
+            updateIndex(-1);
+            if (sourceSession) editorFindRange(sourceSession, seedRange.from, seedRange.to);
+            const sliceText = content.slice(seedRange.from, seedRange.to);
+            const sliceRanges = sourceMatches(content, sliceText, true);
+            const sliceIdx = findMatchingSourceRangeIndex(sliceRanges, seedRange);
+            if (sliceIdx >= 0) revealAndHighlightSource(sliceIdx, sliceRanges, content, true);
+            return;
           } else {
-            const targetRange = seedSourceIndex >= 0
-              ? nextSourceRanges[seedSourceIndex]
-              : (clampedRange && clampedRange.to > clampedRange.from ? clampedRange : null);
-            if (targetRange && host) {
+            const targetRange = seedSourceIndex >= 0 ? nextSourceRanges[seedSourceIndex] : seedRange;
+            if (host) {
               const initialBlock = findContainingBlock(host, targetRange, content);
               if (!initialBlock) {
                 const fallback = host.querySelector("[data-frontmatter-properties],.document-properties") ?? resolveSourceBlock(host, targetRange, content);

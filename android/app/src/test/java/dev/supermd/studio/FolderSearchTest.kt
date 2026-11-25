@@ -428,6 +428,10 @@ class FolderSearchTest {
                 listOf("AuroraSignal", "AuroraSignal", "AuroraSignal", "AURORASIGNAL"),
                 direct.matches.map { crlfContent.substring(it.sourceStart, it.sourceEnd) },
             )
+            assertEquals(
+                listOf("AuroraSignal", "AuroraSignal", "AuroraSignal", "AURORASIGNAL"),
+                direct.matches.map { it.matchText },
+            )
             assertTrue(direct.matches.zipWithNext().all { (a, b) -> a.sourceEnd <= b.sourceStart })
 
             // Case-insensitive "strasse" folds "Straße" while preserving exact UTF-16 offsets in source.
@@ -443,8 +447,9 @@ class FolderSearchTest {
             assertEquals(1, strasseHits.matches.size)
             val strasseMatch = strasseHits.matches.single()
             assertEquals("Straße", crlfContent.substring(strasseMatch.sourceStart, strasseMatch.sourceEnd))
+            assertEquals("Straße", strasseMatch.matchText)
 
-            // Handoff of the 2nd repeated match preserves its exact occurrence offsets on seededFind.
+            // Handoff of the 2nd repeated match preserves its exact occurrence offsets and matchText on seededFind.
             val deadline = System.currentTimeMillis() + 5_000
             vm.openFolderSearch("AuroraSignal")
             while ((vm.folderSearch.value.scanning || vm.folderSearch.value.matches.size < 4) && System.currentTimeMillis() < deadline) {
@@ -462,6 +467,7 @@ class FolderSearchTest {
             assertNotNull(seed)
             assertEquals(secondMatch.sourceStart, seed!!.sourceStart)
             assertEquals(secondMatch.sourceEnd, seed.sourceEnd)
+            assertEquals("AuroraSignal", seed.matchText)
             assertTrue(seed.sourceStart!! > direct.matches[0].sourceEnd)
             assertEquals("AuroraSignal", vm.state.value.active.content.substring(seed.sourceStart!!, seed.sourceEnd!!))
         } finally {

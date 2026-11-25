@@ -59,8 +59,9 @@ AppDialog {
         const cs = !!stateData.caseSensitive
         const sourceStart = typeof hit.sourceStart === "number" ? hit.sourceStart : -1
         const sourceEnd = typeof hit.sourceEnd === "number" ? hit.sourceEnd : -1
+        const matchText = typeof hit.matchText === "string" ? hit.matchText : ""
         dialog.close()
-        studio.openFolderSearchMatch(hit.tabId || "", hit.path || "", q, cs, sourceStart, sourceEnd)
+        studio.openFolderSearchMatch(hit.tabId || "", hit.path || "", q, cs, sourceStart, sourceEnd, matchText)
     }
 
     onStateDataChanged: clampSelection()

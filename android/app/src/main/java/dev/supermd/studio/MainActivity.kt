@@ -139,6 +139,8 @@ class MainActivity : ComponentActivity() {
     var dismissDocument: (() -> Unit)? = null
     var saveReaderPosition: (() -> Unit)? = null
     var openReaderFind: (() -> Unit)? = null
+    var formatDocument: ((String) -> Unit)? = null
+    var canFormatEditor: (() -> Boolean)? = null
     val agentAccessState: AgentAccessState by lazy { AgentAccessState(this) }
     var agentRelayState by mutableStateOf(AgentRelayClient.State.DISCONNECTED)
         private set
@@ -225,7 +227,7 @@ class MainActivity : ComponentActivity() {
     internal fun agentExportJob(jobId: String): JSONObject? = agentExportJobs[jobId]?.let { JSONObject(it.toString()) }
     internal suspend fun completeAgentExport(jobId: String, uri: android.net.Uri, fallbackName: String, format: String) = withContext(Dispatchers.IO) {
         require(agentExportJobs[jobId]?.optString("phase") in setOf("preparing", "saving")) { "This export job is not active in this app" }
-        require(format in setOf("pdf", "smd", "md")) { "Unsupported export format" }
+        require(format in setOf("pdf", "smd", "md", "mdzip")) { "Unsupported export format" }
         val (bytes, digest) = fingerprintAgentExport(uri)
         require(bytes > 0 || format == "md") { "The completed PDF or portable export is empty" }
         require(bytes <= MAX_AGENT_EXPORT_BYTES) { "Agent downloads are limited to 128 MiB per export" }
@@ -238,7 +240,7 @@ class MainActivity : ComponentActivity() {
         val filename = rawName.substringAfterLast('/').substringAfterLast('\\')
             .replace(Regex("[\\u0000-\\u001f\\u007f]"), "").take(256)
         require(filename.isNotBlank()) { "Android did not provide a valid export filename" }
-        val mimeType = when (format) { "pdf" -> "application/pdf"; "smd" -> "application/vnd.supermd.smd"; else -> "text/markdown" }
+        val mimeType = when (format) { "pdf" -> "application/pdf"; "smd" -> "application/vnd.supermd.smd"; "mdzip" -> "application/zip"; else -> "text/markdown" }
         val artifact = AgentExportArtifact(uri, filename, format, mimeType, bytes, digest, System.currentTimeMillis())
         agentExportArtifacts[jobId] = artifact
         agentExportJobs[jobId] = JSONObject().put("jobId", jobId).put("status", "completed").put("phase", "completed")
@@ -423,6 +425,21 @@ class MainActivity : ComponentActivity() {
         }
     }
     fun handleShortcut(event: android.view.KeyEvent): Boolean {
+        if (event.action == android.view.KeyEvent.ACTION_DOWN) {
+            if (canFormatEditor?.invoke() == true) {
+                val formatAction = markdownFormatActionForKey(
+                    keyCode = event.keyCode,
+                    isCtrlPressed = event.isCtrlPressed,
+                    isShiftPressed = event.isShiftPressed,
+                    isAltPressed = event.isAltPressed,
+                    isMetaPressed = event.isMetaPressed,
+                )
+                if (formatAction != null) {
+                    if (event.repeatCount == 0) formatDocument?.invoke(formatAction)
+                    return true
+                }
+            }
+        }
         if (event.action == android.view.KeyEvent.ACTION_DOWN && event.repeatCount == 0) {
             if (event.keyCode == android.view.KeyEvent.KEYCODE_F11) { model.fullscreen(!model.state.value.fullscreen); return true }
             if (event.keyCode == android.view.KeyEvent.KEYCODE_ESCAPE) {
@@ -532,7 +549,7 @@ private object NoMotionScheme : MotionScheme {
     var readerPdfOwnsProgress by remember { mutableStateOf(false) }
     var menu by remember { mutableStateOf(false) }
     var findRequest by remember { mutableIntStateOf(0) }
-    var renaming by remember {mutableStateOf(false)}
+    var renaming by rememberSaveable {mutableStateOf(false)}
     var contentsShown by remember {mutableStateOf(false)}
     var readingChromeVisible by remember {mutableStateOf(true)}
     LaunchedEffect(state.busy) { if (!state.busy) readerPdfOwnsProgress = false }
@@ -941,7 +958,6 @@ private object NoMotionScheme : MotionScheme {
         activity.setAgentRequestHandlers(bridge, null)
         onDispose { activity.setAgentRequestHandlers(null, null) }
     }
-    var folderRelative by remember { mutableStateOf("") }
     var hinge by remember { mutableStateOf<FoldingFeature?>(null) }
     val recent by model.recent.collectAsStateWithLifecycle()
     val folderSearch by model.folderSearch.collectAsStateWithLifecycle()
@@ -972,7 +988,7 @@ private object NoMotionScheme : MotionScheme {
     val noteFolder = rememberLauncherForActivityResult(ActivityResultContracts.OpenDocumentTree()) {it?.let {uri->runCatching{model.noteLocation(uri);noteLocation=uri.toString()}.onFailure{model.fail("Could not remember this folder: ${it.message}")}}}
     val save = rememberLauncherForActivityResult(NoteDestination("text/markdown", model::noteLocation)) { uri -> if (uri != null) model.save(uri) else model.cancelSaveAs() }
     val portableSaveAs = rememberLauncherForActivityResult(NoteDestination("application/vnd.supermd.smd", model::noteLocation)) { uri -> if (uri != null) model.completePortableSaveAs(uri) else model.cancelSaveAs() }
-    val folder = rememberLauncherForActivityResult(ActivityResultContracts.OpenDocumentTree()) { it?.let { uri -> folderRelative = ""; model.setFolder(uri) } }
+    val folder = rememberLauncherForActivityResult(ActivityResultContracts.OpenDocumentTree()) { it?.let { uri -> model.setFolder(uri) } }
     val pdf = rememberLauncherForActivityResult(NoteDestination("application/pdf", model::noteLocation)) { uri ->
         if (uri != null) { readerPdfOwnsProgress = true; model.setPdfDestination(uri); model.busy(true); web?.evaluateJavascript("window.supermdExport?.(${state.pdf})", null) ?: model.fail("The reader is not ready. Open the note again.") }
     }
@@ -987,7 +1003,7 @@ private object NoMotionScheme : MotionScheme {
             pendingAgentExport = safeArgs
             val jobId = args.optString("requestId")
             val format = args.optString("format", "pdf")
-            check(format in setOf("pdf", "smd", "md")) { "Unsupported export format" }
+            check(format in setOf("pdf", "smd", "md", "mdzip")) { "Unsupported export format" }
             val requestedName = args.optString("filename").takeIf { it.isNotBlank() }
                 ?: args.optString("id").takeIf { it.isNotBlank() } ?: state.active.name.substringBeforeLast('.')
             activity.updateAgentExportJob(jobId, "preparing")
@@ -996,13 +1012,15 @@ private object NoMotionScheme : MotionScheme {
                 try {
                     val pdfOptions = JSONObject(state.pdf)
                     val provided = safeArgs.optJSONObject("options") ?: JSONObject()
+                    val archive = format == "mdzip" || (format == "md" && (safeArgs.optBoolean("archive", false) || provided.optBoolean("archive", false)))
+                    val effectiveFormat = if (archive) "mdzip" else format
                     listOf("pageSize", "margin", "fontSize", "lineHeight", "paragraphSpacing", "fontFamily", "pageNumbers", "themed")
                         .forEach { key -> if (provided.has(key)) pdfOptions.put(key, provided.get(key)) }
                     val (uri, filename) = model.writeAgentExport(
                         safeArgs.getString("content"), safeArgs.optJSONObject("assets") ?: JSONObject(),
-                        format, requestedName, pdfOptions.toString(),
+                        effectiveFormat, requestedName, pdfOptions.toString(), archive = archive,
                     )
-                    activity.completeAgentExport(jobId, uri, filename, format)
+                    activity.completeAgentExport(jobId, uri, filename, effectiveFormat)
                     model.busy(false)
                 } catch (error: Exception) {
                     activity.updateAgentExportJob(jobId, "failed", error.message ?: "Export failed")
@@ -1048,7 +1066,19 @@ private object NoMotionScheme : MotionScheme {
     LaunchedEffect(immersive, dark) {
         WindowCompat.getInsetsController(activity.window, activity.window.decorView).apply { isAppearanceLightStatusBars = !dark; isAppearanceLightNavigationBars = !dark; systemBarsBehavior = WindowInsetsControllerCompat.BEHAVIOR_SHOW_TRANSIENT_BARS_BY_SWIPE; if (immersive) hide(WindowInsetsCompat.Type.systemBars()) else show(WindowInsetsCompat.Type.systemBars()) }
     }
-    BackHandler(contentsShown || state.fullscreen || drawer.isOpen || state.readerOverlay) { if (contentsShown) contentsShown = false else if (drawer.isOpen) scope.launch { drawer.close() } else web?.evaluateJavascript("window.supermdDismiss?.() || false") {dismissed->if(dismissed!="true")model.fullscreen(false)} }
+    BackHandler(contentsShown || state.fullscreen || drawer.isOpen || state.readerOverlay) {
+        if (contentsShown) {
+            contentsShown = false
+        } else if (drawer.isOpen) {
+            if (state.folder != null && state.folderRelative.isNotEmpty() && model.navigateFolderUp()) {
+                Unit
+            } else {
+                scope.launch { drawer.close() }
+            }
+        } else {
+            web?.evaluateJavascript("window.supermdDismiss?.() || false") { dismissed -> if (dismissed != "true") model.fullscreen(false) }
+        }
+    }
     val palette = MaterialTheme.colorScheme
     val density = LocalDensity.current
     val tokens = remember(palette) { JSONObject().put("primary", hex(palette.primary)).put("on-primary", hex(palette.onPrimary)).put("primary-container",hex(palette.primaryContainer)).put("on-primary-container",hex(palette.onPrimaryContainer)).put("surface", hex(palette.surface)).put("surface-low", hex(palette.surfaceContainerLow)).put("surface-high", hex(palette.surfaceContainerHigh)).put("text", hex(palette.onSurface)).put("muted", hex(palette.onSurfaceVariant)).put("outline", hex(palette.outlineVariant)) }
@@ -1058,6 +1088,27 @@ private object NoMotionScheme : MotionScheme {
         val displayIsLarge = if (Build.VERSION.SDK_INT >= 30) activity.windowManager.maximumWindowMetrics.bounds.let { minOf(it.width(), it.height()) / density.density >= 600f } else activity.resources.configuration.smallestScreenWidthDp >= 600
         val wide = displayIsLarge && maxWidth >= 720.dp && maxHeight >= 400.dp
         val actualMode = if (!wide && state.mode == "split") "live" else state.mode
+        val imeVisible = WindowInsets.ime.getBottom(density) > 0
+        val modalOpen = settings || exporting || renaming || contentsShown || folderSearch.visible || drawer.isOpen || (!accessPickerShowing && accessRequest != null) || state.pendingCloseNote != null || state.pendingSaveConflictNote != null || state.error != null || !state.welcomed
+        val showFormattingBar = shouldShowKeyboardFormattingBar(actualMode, imeVisible, state.editorFocused, readerReady, state.readerOverlay, modalOpen)
+        val triggerFormat = rememberUpdatedState<(String) -> Unit> { action ->
+            val reader = web
+            if (reader != null && readerReady) {
+                if (!reader.hasFocus()) reader.requestFocus(View.FOCUS_DOWN)
+                reader.evaluateJavascript("window.supermdFormat?.(${JSONObject.quote(action)}); true", null)
+            }
+        }
+        val canFormatNow = rememberUpdatedState {
+            canTriggerHardwareFormatShortcut(actualMode, state.editorFocused, readerReady, state.readerOverlay, modalOpen)
+        }
+        DisposableEffect(activity) {
+            activity.formatDocument = { action -> triggerFormat.value(action) }
+            activity.canFormatEditor = { canFormatNow.value() }
+            onDispose {
+                activity.formatDocument = null
+                activity.canFormatEditor = null
+            }
+        }
         val readerContent=remember {arrayOfNulls<String>(1)}
         LaunchedEffect(readerReady, state.active, actualMode, dark, state.fullscreen, state.font, state.size, state.widthPercent,state.lineHeight,state.spellCheck,state.grammarCheck,state.latexAutofix,state.typewriterScroll,state.restorePosition,state.centerLock,state.imageAppearance,state.svgAppearance,state.imageContrast,state.fullDocumentAccessibility,state.customTheme,state.patternKind,state.patternOpacity,state.patternSize,state.patternSpacing,tokens, hinge, motion, seededFind) {
             if (!readerReady) readerNote[0] = null
@@ -1075,6 +1126,9 @@ private object NoMotionScheme : MotionScheme {
                     if (matchingSeed.sourceStart != null && matchingSeed.sourceEnd != null && matchingSeed.sourceStart >= 0 && matchingSeed.sourceEnd >= matchingSeed.sourceStart) {
                         seededJson.put("sourceStart", matchingSeed.sourceStart)
                         seededJson.put("sourceEnd", matchingSeed.sourceEnd)
+                        if (!matchingSeed.matchText.isNullOrEmpty()) {
+                            seededJson.put("matchText", matchingSeed.matchText)
+                        }
                     }
                     payload.put("seededFind", seededJson)
                 }
@@ -1126,15 +1180,14 @@ private object NoMotionScheme : MotionScheme {
                 FilesDrawerContent(
                     state = state,
                     recent = recent,
-                    folderRelative = folderRelative,
+                    folderRelative = state.folderRelative,
                     onOpenNote = { open.launch(arrayOf("text/*", "application/octet-stream", "application/vnd.supermd.smd", "application/vnd.supermd.fmd", "application/gzip", "application/x-gzip")); scope.launch { drawer.close() } },
                     onOpenFolder = { folder.launch(state.folder?.let(android.net.Uri::parse)) },
-                    onCloseFolder = { folderRelative = ""; model.closeFolder() },
-                    onFolderRoot = { folderRelative = ""; state.folder?.let { model.listFolder(android.net.Uri.parse(it), "") } },
+                    onCloseFolder = { model.closeFolder() },
+                    onFolderRoot = { model.navigateFolderUp() },
                     onFolderSearch = { scope.launch { drawer.close() }; model.openFolderSearch() },
                     onActivateEntry = { entry ->
                         if (entry.directory) {
-                            folderRelative = entry.relative
                             model.listFolder(android.net.Uri.parse(state.folder ?: entry.uri), entry.relative)
                         } else {
                             activity.requestOpen(android.net.Uri.parse(entry.uri), entry.relative)
@@ -1169,7 +1222,7 @@ private object NoMotionScheme : MotionScheme {
                                 if (state.fullscreen) contentsShown = true
                                 else {
                                     scope.launch { drawer.open() }
-                                    state.folder?.let { if (state.files.isEmpty()) model.listFolder(android.net.Uri.parse(it), folderRelative) }
+                                    state.folder?.let { if (state.files.isEmpty()) model.listFolder(android.net.Uri.parse(it), state.folderRelative) }
                                 }
                             },
                             onFolderSearch = { model.openFolderSearch() },
@@ -1213,7 +1266,7 @@ private object NoMotionScheme : MotionScheme {
                     }
                 // The reading surface is edge-to-edge in BOTH chrome states.
                 // Only controls receive safe insets, not the document width.
-                Box(Modifier.fillMaxSize()) {
+                Column(Modifier.fillMaxSize()) { Box(Modifier.fillMaxWidth().weight(1f)) {
                     key(readerGeneration) { AndroidView(factory = { context -> FrameLayout(context).apply {
                         layoutParams = ViewGroup.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT)
                         clipChildren = true
@@ -1232,6 +1285,7 @@ private object NoMotionScheme : MotionScheme {
                                 if (wasCurrent) {
                                     readerReady = false
                                     readerPdfOwnsProgress = false
+                                    model.editorFocus(false)
                                     readerNote[0] = null
                                     readerGeneration++
                                     web = null
@@ -1317,7 +1371,7 @@ private object NoMotionScheme : MotionScheme {
                     } }, modifier = Modifier.fillMaxSize().clipToBounds(), onRelease = { frame ->
                         val released = frame.getChildAt(0) as? WebView
                         if (released != null) {
-                            if (web === released) { web = null; readerReady = false }
+                            if (web === released) { web = null; readerReady = false; model.editorFocus(false) }
                             retireAndDestroyReader(released)
                         }
                         frame.removeAllViews()
@@ -1325,6 +1379,7 @@ private object NoMotionScheme : MotionScheme {
                     SnackbarHost(snackbar, Modifier.align(Alignment.BottomCenter).safeDrawingPadding())
                     if (shouldShowNativeBusyOverlay(state.busy, readerReady, readerPdfOwnsProgress)) Surface(color = palette.surface.copy(alpha = .96f), modifier = Modifier.fillMaxSize()) { Column(Modifier.fillMaxSize(), verticalArrangement = Arrangement.Center, horizontalAlignment = Alignment.CenterHorizontally) { if(motion) LoadingIndicator() else Icon(Icons.Rounded.Description,null,Modifier.size(48.dp),tint=palette.primary); Spacer(Modifier.height(16.dp)); Text(if(state.busy) "Preparing your document…" else "Opening your workspace…") } }
                 }
+                if (showFormattingBar) KeyboardFormattingBar(onFormat = { triggerFormat.value(it) }) }
             }
         }
     }
@@ -1789,7 +1844,7 @@ internal fun buildHighlightedSnippet(
 @Composable internal fun FilesDrawerContent(
     state: StudioState,
     recent: List<RecentNote>,
-    folderRelative: String,
+    folderRelative: String = state.folderRelative,
     onOpenNote: () -> Unit,
     onOpenFolder: () -> Unit,
     onCloseFolder: () -> Unit,
@@ -1828,9 +1883,12 @@ internal fun buildHighlightedSnippet(
                     }
                 }
                 Text("No vault. No hidden metadata.", style = MaterialTheme.typography.bodySmall, color = palette.onSurfaceVariant, modifier = Modifier.padding(vertical = 4.dp))
-                if (folderRelative.isNotEmpty()) {
+                if (state.folder != null && folderRelative.isNotEmpty()) {
+                    val parentRel = parentFolderRelative(folderRelative)
                     TextButton(onClick = onFolderRoot, modifier = Modifier.heightIn(min = 48.dp)) {
-                        Icon(Icons.AutoMirrored.Rounded.ArrowBack, null); Spacer(Modifier.width(4.dp)); Text("Folder root")
+                        Icon(Icons.AutoMirrored.Rounded.ArrowBack, "Navigate up")
+                        Spacer(Modifier.width(4.dp))
+                        Text(if (parentRel.isEmpty()) "Folder root" else parentRel.substringAfterLast('/'))
                     }
                 }
             }

@@ -279,6 +279,7 @@ def _scan_note_lines(
                 "matchEnd": u16_end,
                 "sourceStart": line_u16_start + col_u16,
                 "sourceEnd": line_u16_start + end_u16,
+                "matchText": raw_line[orig_start:orig_end],
             })
         line_u16_start += _utf16_len(raw_with_cr) + 1
         if truncated:
