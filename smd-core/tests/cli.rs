@@ -104,6 +104,99 @@ fn inline_data_images_export_and_pack_but_remote_images_never_download_implicitl
     assert!(!output.status.success());assert!(String::from_utf8_lossy(&output.stderr).contains("explicit download"));assert!(!w.file("remote.pdf").exists());
 }
 
+#[test]
+fn unpack_extracts_markdown_and_assets_portably_and_rolls_back_on_collision_failure_or_symlink() {
+    let w = Workspace::new();
+    let svg_a = b"<svg xmlns=\"http://www.w3.org/2000/svg\" width=\"24\" height=\"24\"><rect width=\"24\" height=\"24\" fill=\"#386a57\"/></svg>";
+    let svg_b = b"<svg xmlns=\"http://www.w3.org/2000/svg\" width=\"24\" height=\"24\"><circle cx=\"12\" cy=\"12\" r=\"9\" fill=\"#6750a4\"/></svg>";
+    fs::write(w.file("first.svg"), svg_a).unwrap();
+    fs::write(w.file("second.svg"), svg_b).unwrap();
+    fs::write(w.file("lesson.md"), "# Lesson\n\n![First](first.svg)\n\n![Second](second.svg)\n").unwrap();
+    assert!(success(w.run(&["--help"])).contains("unpack NOTE OUTPUT_DIR"));
+    success(w.run(&["pack", "lesson.md", "lesson.smd"]));
+
+    let unpacked_stdout = success(w.run(&["unpack", "lesson.smd", "unpacked"]));
+    assert!(!unpacked_stdout.contains("base64"));
+    let summary: serde_json::Value = serde_json::from_str(&unpacked_stdout).unwrap();
+    assert_eq!(summary["assets"], 2);
+    let unpacked_md = fs::read_to_string(w.file("unpacked/lesson.md")).unwrap();
+    assert!(unpacked_md.contains("# Lesson"));
+    assert!(unpacked_md.contains("assets/image-1.svg"));
+    assert!(unpacked_md.contains("assets/image-2.svg"));
+    assert_eq!(fs::read(w.file("unpacked/assets/image-1.svg")).unwrap(), svg_a);
+    assert_eq!(fs::read(w.file("unpacked/assets/image-2.svg")).unwrap(), svg_b);
+
+    // Reserved/unsafe FAT & Windows stem characters fall back to portable filenames.
+    fs::copy(w.file("lesson.smd"), w.file("CON.smd")).unwrap();
+    success(w.run(&["unpack", "CON.smd", "fat-safe/nested"]));
+    assert!(w.file("fat-safe/nested/Note.md").exists());
+    assert_eq!(fs::read(w.file("fat-safe/nested/assets/image-1.svg")).unwrap(), svg_a);
+
+    // Repeating unpack into the same directory fails without modifying existing files.
+    fs::write(w.file("unpacked/lesson.md"), "user edited markdown").unwrap();
+    assert!(!w.run(&["unpack", "lesson.smd", "unpacked"]).status.success());
+    assert_eq!(fs::read_to_string(w.file("unpacked/lesson.md")).unwrap(), "user edited markdown");
+
+    // Pre-existing Markdown file aborts before creating assets/ or writing any image.
+    fs::create_dir(w.file("collide-md")).unwrap();
+    fs::write(w.file("collide-md/lesson.md"), "keep existing md").unwrap();
+    assert!(!w.run(&["unpack", "lesson.smd", "collide-md"]).status.success());
+    assert_eq!(fs::read_to_string(w.file("collide-md/lesson.md")).unwrap(), "keep existing md");
+    assert!(!w.file("collide-md/assets").exists());
+
+    // Pre-existing second asset aborts before writing image-1.svg or lesson.md.
+    fs::create_dir_all(w.file("collide-asset/assets")).unwrap();
+    fs::write(w.file("collide-asset/assets/image-2.svg"), b"keep existing asset").unwrap();
+    assert!(!w.run(&["unpack", "lesson.smd", "collide-asset"]).status.success());
+    assert_eq!(fs::read(w.file("collide-asset/assets/image-2.svg")).unwrap(), b"keep existing asset");
+    assert!(!w.file("collide-asset/assets/image-1.svg").exists());
+    assert!(!w.file("collide-asset/lesson.md").exists());
+
+    // Plain Markdown notes are rejected without creating the destination folder.
+    assert!(!w.run(&["unpack", "lesson.md", "plain-out"]).status.success());
+    assert!(!w.file("plain-out").exists());
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::{symlink, PermissionsExt};
+        let outside = w.file("outside");
+        fs::create_dir(&outside).unwrap();
+
+        let link_root = w.file("symlink-out");
+        symlink(&outside, &link_root).unwrap();
+        assert!(!w.run(&["unpack", "lesson.smd", "symlink-out"]).status.success());
+        assert!(!w.run(&["unpack", "lesson.smd", "symlink-out/nested"]).status.success());
+        assert!(fs::read_dir(&outside).unwrap().next().is_none());
+
+        let nested = w.file("with-symlink-assets");
+        fs::create_dir(&nested).unwrap();
+        symlink(&outside, nested.join("assets")).unwrap();
+        assert!(!w.run(&["unpack", "lesson.smd", "with-symlink-assets"]).status.success());
+        assert!(!nested.join("lesson.md").exists());
+        assert!(fs::read_dir(&outside).unwrap().next().is_none());
+
+        // Mid-unpack write failure (after assets/* are created, when lesson.md fails to open)
+        // rolls back every newly written asset while leaving existing unrelated files intact.
+        let midrun = w.file("rollback-midrun");
+        fs::create_dir_all(midrun.join("assets")).unwrap();
+        fs::write(midrun.join("assets/unrelated.txt"), b"keep me").unwrap();
+        let mut readonly = fs::metadata(&midrun).unwrap().permissions();
+        readonly.set_mode(0o555);
+        fs::set_permissions(&midrun, readonly).unwrap();
+        let probe_blocked = fs::File::create(midrun.join("probe")).is_err();
+        if probe_blocked {
+            assert!(!w.run(&["unpack", "lesson.smd", "rollback-midrun"]).status.success());
+            assert!(!midrun.join("assets/image-1.svg").exists());
+            assert!(!midrun.join("assets/image-2.svg").exists());
+            assert!(!midrun.join("lesson.md").exists());
+            assert_eq!(fs::read(midrun.join("assets/unrelated.txt")).unwrap(), b"keep me");
+        }
+        let mut restore = fs::metadata(&midrun).unwrap().permissions();
+        restore.set_mode(0o755);
+        fs::set_permissions(&midrun, restore).unwrap();
+    }
+}
+
 fn inflate_pdf_streams(bytes: &[u8]) -> String {
     use std::io::Read;
     let mut text = String::from_utf8_lossy(bytes).into_owned();

@@ -41,6 +41,156 @@ fn atomic_write(path: &Path, data: &[u8]) -> Result<()> {
     let result = (|| { let mut file = std::fs::OpenOptions::new().write(true).create_new(true).open(&temp)?; created = true; file.write_all(data)?; file.sync_all()?; std::fs::rename(&temp, path)?; Ok(()) })();
     if result.is_err() && created { let _ = std::fs::remove_file(temp); } result
 }
+fn portable_markdown_stem(input_path: &Path) -> String {
+    let raw = input_path.file_stem().and_then(|s| s.to_str()).unwrap_or("");
+    let cleaned: String = raw
+        .chars()
+        .map(|c| if c.is_control() || matches!(c, '<' | '>' | ':' | '"' | '/' | '\\' | '|' | '?' | '*') { '-' } else { c })
+        .collect();
+    let trimmed = cleaned.trim().trim_end_matches(['.', ' ']);
+    let reserved = matches!(
+        trimmed.to_ascii_uppercase().as_str(),
+        "CON" | "PRN" | "AUX" | "NUL"
+            | "COM1" | "COM2" | "COM3" | "COM4" | "COM5" | "COM6" | "COM7" | "COM8" | "COM9"
+            | "LPT1" | "LPT2" | "LPT3" | "LPT4" | "LPT5" | "LPT6" | "LPT7" | "LPT8" | "LPT9"
+    );
+    if trimmed.is_empty() || trimmed == "." || trimmed == ".." || trimmed.len() > 236 || reserved {
+        "Note".to_string()
+    } else {
+        trimmed.to_string()
+    }
+}
+/// Portable no-overwrite publication: uses exclusive `create_new` (`O_CREAT | O_EXCL` on Unix,
+/// `CREATE_NEW` on Windows) directly at `path` instead of `hard_link` or overwriting `rename`.
+/// This supports removable FAT/exFAT output folders without hard-link support while refusing
+/// to overwrite existing files, and removes `path` immediately if writing or syncing fails.
+fn write_new_file(path: &Path, data: &[u8]) -> Result<()> {
+    if std::fs::symlink_metadata(path).is_ok() {
+        bail!("Output exists; choose an empty destination or another folder");
+    }
+    let mut file = match std::fs::OpenOptions::new().write(true).create_new(true).open(path) {
+        Ok(file) => file,
+        Err(err) if err.kind() == io::ErrorKind::AlreadyExists => {
+            bail!("Output exists; choose an empty destination or another folder")
+        }
+        Err(err) => return Err(err.into()),
+    };
+    let write_res = (|| -> Result<()> {
+        file.write_all(data)?;
+        file.sync_all()?;
+        Ok(())
+    })();
+    drop(file);
+    if let Err(err) = write_res {
+        let _ = std::fs::remove_file(path);
+        return Err(err);
+    }
+    Ok(())
+}
+fn unpack_note(input_path: &Path, note: &PortableDocument, output_dir: &Path) -> Result<PathBuf> {
+    if output_dir.as_os_str().is_empty() { bail!("Expected a non-empty output directory"); }
+    note.validate()?;
+    let stem = portable_markdown_stem(input_path);
+    let md_name = format!("{stem}.md");
+    if std::path::Path::new(&md_name).components().count() != 1 { bail!("Invalid unpacked Markdown filename"); }
+    let mut missing_dirs: Vec<PathBuf> = Vec::new();
+    let mut probe = Some(output_dir);
+    let mut existing_ancestor: Option<&Path> = None;
+    while let Some(current) = probe {
+        let candidate = if current.as_os_str().is_empty() { Path::new(".") } else { current };
+        match std::fs::symlink_metadata(candidate) {
+            Ok(meta) => {
+                if meta.file_type().is_symlink() { bail!("Refusing to unpack through a symlink"); }
+                if candidate == output_dir && !meta.is_dir() { bail!("Output path exists and is not a directory"); }
+                if candidate != output_dir && !meta.is_dir() { bail!("Output parent path is not a directory"); }
+                existing_ancestor = Some(candidate);
+                break;
+            }
+            Err(err) if err.kind() == io::ErrorKind::NotFound => {
+                missing_dirs.push(candidate.to_path_buf());
+                probe = current.parent();
+            }
+            Err(err) => return Err(err.into()),
+        }
+    }
+    if let Some(ancestor) = existing_ancestor {
+        if let Ok(suffix) = output_dir.strip_prefix(ancestor) {
+            if suffix.components().any(|c| !matches!(c, std::path::Component::Normal(_))) {
+                bail!("Refusing to unpack through parent or non-normal path components");
+            }
+        }
+    }
+    let out_existed = missing_dirs.is_empty();
+    let md_target = output_dir.join(&md_name);
+    if out_existed && std::fs::symlink_metadata(&md_target).is_ok() {
+        bail!("Output exists; choose an empty destination or another folder");
+    }
+    let mut staged_assets: Vec<(PathBuf, Vec<u8>)> = Vec::with_capacity(note.assets.len());
+    let mut seen_paths = std::collections::HashSet::new();
+    seen_paths.insert(md_name.to_ascii_lowercase());
+    let assets_dir = output_dir.join("assets");
+    let assets_existed = out_existed && std::fs::symlink_metadata(&assets_dir).is_ok();
+    if assets_existed {
+        let meta = std::fs::symlink_metadata(&assets_dir)?;
+        if meta.file_type().is_symlink() { bail!("Refusing to unpack through a symlink"); }
+        if !meta.is_dir() { bail!("Assets path exists and is not a directory"); }
+    }
+    for (name, data) in &note.assets {
+        if !portable::asset_name(name) { bail!("Unsafe portable asset name: {name}"); }
+        let rel = Path::new(name);
+        if rel.components().count() != 2 || !rel.components().all(|c| matches!(c, std::path::Component::Normal(_))) {
+            bail!("Unsafe portable asset path: {name}");
+        }
+        if !seen_paths.insert(name.to_ascii_lowercase()) { bail!("Conflicting unpacked asset path: {name}"); }
+        let target = output_dir.join(rel);
+        if out_existed && std::fs::symlink_metadata(&target).is_ok() {
+            bail!("Output exists; choose an empty destination or another folder");
+        }
+        let (_mime, bytes) = portable::image_bytes(data)?;
+        staged_assets.push((target, bytes));
+    }
+    let mut created_dirs: Vec<PathBuf> = Vec::new();
+    let mut created_files: Vec<PathBuf> = Vec::new();
+    let mut created_assets_dir = false;
+    let write_result = (|| -> Result<()> {
+        for dir in missing_dirs.iter().rev() {
+            std::fs::create_dir(dir)?;
+            created_dirs.push(dir.clone());
+        }
+        if std::fs::symlink_metadata(output_dir)?.file_type().is_symlink() {
+            bail!("Refusing to unpack through a symlink");
+        }
+        let canonical_root = output_dir.canonicalize()?;
+        if !staged_assets.is_empty() {
+            if !assets_existed { std::fs::create_dir(&assets_dir)?; created_assets_dir = true; }
+            if std::fs::symlink_metadata(&assets_dir)?.file_type().is_symlink() { bail!("Refusing to unpack through a symlink"); }
+            let canonical_assets = assets_dir.canonicalize()?;
+            if !canonical_assets.starts_with(&canonical_root) || canonical_assets.parent() != Some(canonical_root.as_path()) {
+                bail!("Asset directory escapes output directory");
+            }
+        }
+        for (target, bytes) in &staged_assets {
+            let parent = target.parent().context("Missing asset directory")?.canonicalize()?;
+            if !parent.starts_with(&canonical_root) { bail!("Asset target escapes output directory"); }
+            write_new_file(target, bytes)?;
+            created_files.push(target.clone());
+        }
+        let md_parent = md_target.parent().filter(|p| !p.as_os_str().is_empty()).unwrap_or(Path::new(".")).canonicalize()?;
+        if md_parent != canonical_root {
+            bail!("Markdown target escapes output directory");
+        }
+        write_new_file(&md_target, note.markdown.as_bytes())?;
+        created_files.push(md_target.clone());
+        Ok(())
+    })();
+    if let Err(err) = write_result {
+        for file in created_files.into_iter().rev() { let _ = std::fs::remove_file(file); }
+        if created_assets_dir { let _ = std::fs::remove_dir(&assets_dir); }
+        for dir in created_dirs.into_iter().rev() { let _ = std::fs::remove_dir(dir); }
+        return Err(err);
+    }
+    Ok(md_target)
+}
 fn run() -> Result<()> {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let command = args.first().map(String::as_str).unwrap_or("help");
@@ -48,7 +198,7 @@ fn run() -> Result<()> {
         let mut input=String::new();io::stdin().take(smd_core::theme::MAX_THEME as u64+1).read_to_string(&mut input)?;
         println!("{}",smd_core::theme::response(&input));return Ok(());
     }
-    if command == "help" || command == "--help" { println!("Super MD native engine\n\nread NOTE [--offset N] [--limit N]   Markdown only; default 16000 chars\ninspect NOTE                       Format, counts, asset names; no bytes\nassets NOTE                        Image names, MIME and decoded size\nextract NOTE ASSET OUTPUT           Write one asset to a file (no stdout bytes)\npack INPUT OUTPUT.smd              Offline portable note with local images\nexport INPUT OUTPUT.pdf             Native Typst PDF (no browser print)\nexport-json OUTPUT.pdf              Prepared content/assets/options from stdin\nvalidate-theme                     Validate theme JSON from stdin\ndoctor                             Report engine capabilities\n\nNo command auto-runs Python or downloads URLs. Existing text .smd and .fmd are readable."); return Ok(()); }
+    if command == "help" || command == "--help" { println!("Super MD native engine\n\nread NOTE [--offset N] [--limit N]   Markdown only; default 16000 chars\ninspect NOTE                       Format, counts, asset names; no bytes\nassets NOTE                        Image names, MIME and decoded size\nextract NOTE ASSET OUTPUT           Write one asset to a file (no stdout bytes)\nunpack NOTE OUTPUT_DIR              Extract Markdown and assets into a folder\npack INPUT OUTPUT.smd              Offline portable note with local images\nexport INPUT OUTPUT.pdf             Native Typst PDF (no browser print)\nexport-json OUTPUT.pdf              Prepared content/assets/options from stdin\nvalidate-theme                     Validate theme JSON from stdin\ndoctor                             Report engine capabilities\n\nNo command auto-runs Python or downloads URLs. Existing text .smd and .fmd are readable."); return Ok(()); }
     if command == "doctor" { println!("{{\"engine\":\"typst-mitex\",\"browserPrint\":false,\"portable\":\"supermd-smd\",\"legacyFmd\":true,\"automaticPythonExecution\":false}}"); return Ok(()); }
     if command == "export-json" {
         let output = args.get(1).context("Expected PDF output path")?;
@@ -79,6 +229,13 @@ fn run() -> Result<()> {
             if Path::new(output).exists() { bail!("Output exists; choose another filename"); }
             atomic_write(Path::new(output), &portable::image_bytes(data)?.1)?;
             println!("{}",serde_json::json!({"output":output,"asset":name}));
+        }
+        "unpack" => {
+            if args.len() != 3 { bail!("Expected usage: smd-engine unpack NOTE OUTPUT_DIR"); }
+            let output_dir = Path::new(args.get(2).context("Expected output directory")?);
+            let portable_note = note.as_ref().context("This note is not portable")?;
+            let markdown_path = unpack_note(&path, portable_note, output_dir)?;
+            println!("{}", serde_json::json!({"output": output_dir, "markdown": markdown_path, "assets": portable_note.assets.len()}));
         }
         "pack" => {
             let output = args.get(2).context("Expected output .smd path")?;
