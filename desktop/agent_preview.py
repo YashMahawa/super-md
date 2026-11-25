@@ -33,11 +33,11 @@ def preview(store, path_value, output_value, *, width=1200, height=900, heading=
     register_reader_schemes()
     app=QApplication.instance() or QApplication(['Super MD headless preview'])
     for font in (root/'smd-core'/'fonts').glob('*.ttf'):QFontDatabase.addApplicationFont(str(font))
-    view=QWebEngineView();view.resize(width,height);view.setAttribute(Qt.WA_DontShowOnScreen,True)
+    view=QWebEngineView();view.resize(width,height);view.setAttribute(Qt.WidgetAttribute.WA_DontShowOnScreen,True)
     profile=QWebEngineProfile(view);bundle_handler=ReaderBundleSchemeHandler(root/'dist',profile);profile.installUrlSchemeHandler(READER_SCHEME.encode('ascii'),bundle_handler);view.setPage(QWebEnginePage(profile,view))
-    settings=view.settings();settings.setAttribute(QWebEngineSettings.LocalContentCanAccessRemoteUrls,False)
-    settings.setAttribute(QWebEngineSettings.LocalContentCanAccessFileUrls,False)
-    settings.setAttribute(QWebEngineSettings.JavascriptCanOpenWindows,False)
+    settings=view.settings();settings.setAttribute(QWebEngineSettings.WebAttribute.LocalContentCanAccessRemoteUrls,False)
+    settings.setAttribute(QWebEngineSettings.WebAttribute.LocalContentCanAccessFileUrls,False)
+    settings.setAttribute(QWebEngineSettings.WebAttribute.JavascriptCanOpenWindows,False)
     state={'ready':False,'started':time.monotonic(),'error':None,'stable':0,'heading':False}
     payload={'id':'preview','path':str(source),'content':markdown,'mode':'reader','dark':dark,'font':'Manrope','size':18,'zoom':100,'widthPercent':94,'colors':{'surface':'#17131b' if dark else '#ffffff','primary':'#ffb38b' if dark else '#315d99','text':'#f6f0ee' if dark else '#20252d'},'svgAppearance':'auto','motion':False}
     if snapshot:payload.update({key:value for key,value in snapshot.get('view',{}).items() if key in ('dark','font','size','colors','svgAppearance','widthPercent','lineHeight')})
@@ -68,8 +68,8 @@ def preview(store, path_value, output_value, *, width=1200, height=900, heading=
                 self.replied.emit(identifier,json.dumps(result),'')
             except Exception as error:self.replied.emit(identifier,'null',str(error))
     bridge=Bridge();channel=QWebChannel(view.page());channel.registerObject('studio',bridge);view.page().setWebChannel(channel)
-    script=QWebEngineScript();script.setName('Super MD WebChannel');script.setInjectionPoint(QWebEngineScript.DocumentCreation);script.setWorldId(QWebEngineScript.MainWorld)
-    file=QFile(':/qtwebchannel/qwebchannel.js');file.open(QIODevice.ReadOnly);script.setSourceCode(bytes(file.readAll()).decode());view.page().scripts().insert(script)
+    script=QWebEngineScript();script.setName('Super MD WebChannel');script.setInjectionPoint(QWebEngineScript.InjectionPoint.DocumentCreation);script.setWorldId(QWebEngineScript.ScriptWorldId.MainWorld)
+    file=QFile(':/qtwebchannel/qwebchannel.js');file.open(QIODevice.OpenModeFlag.ReadOnly);script.setSourceCode(bytes(file.readAll()).decode());view.page().scripts().insert(script)
     def fail(message):state['error']=message;app.exit(2)
     def inspected(result):
         if not result:return
@@ -88,7 +88,7 @@ def preview(store, path_value, output_value, *, width=1200, height=900, heading=
         timer.stop();image=view.grab().toImage()
         if image.isNull():fail('The offline reader did not produce pixels');return
         from PySide6.QtCore import QBuffer,QByteArray
-        encoded=QByteArray();buffer=QBuffer(encoded);buffer.open(QIODevice.WriteOnly);image.save(buffer,'PNG')
+        encoded=QByteArray();buffer=QBuffer(encoded);buffer.open(QIODevice.OpenModeFlag.WriteOnly);image.save(buffer,'PNG')
         if source.read_bytes()!=raw:fail('The source changed during preview; retry');return
         with output.open('xb') as handle:handle.write(bytes(encoded))
         app.exit(0)

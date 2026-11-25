@@ -388,6 +388,226 @@ sys.exit(code)
         self.assertIs(result["inBody"], False)
         self.assertEqual(result["openedExternal"], [])
 
+    def test_opening_smd_and_streaming_embedded_raster_decodes_once_and_evicts_on_invalidation(self):
+        import time
+        import documents
+
+        session = Session(True)
+        session.settings["python"] = sys.executable
+        studio = Studio(True, session)
+        try:
+            with tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                raw_one = b"\x89PNG\r\n\x1a\n" + (b"raster-one-" * 64)
+                raw_two = b"\x89PNG\r\n\x1a\n" + (b"raster-two-" * 64)
+                assets = {
+                    "assets/one.png": "data:image/png;base64," + base64.b64encode(raw_one).decode("ascii"),
+                    "assets/two.png": "data:image/png;base64," + base64.b64encode(raw_two).decode("ascii"),
+                }
+                smd_path = root / "gallery.smd"
+                smd_path.write_bytes(documents.compressed_bundle("# Gallery\n\n![](assets/one.png)\n![](assets/two.png)\n", assets))
+
+                replies = []
+                studio.replied.connect(lambda identifier, value, error: replies.append((identifier, value, error)))
+
+                with patch.object(documents.base64, "b64decode", wraps=base64.b64decode) as b64_spy:
+                    content, loaded_assets, portable = documents.open_note(smd_path)
+                    # Normal cold open payload-validates embedded assets once.
+                    self.assertEqual(b64_spy.call_count, 2)
+                    b64_spy.reset_mock()
+                    tab = studio._current()
+                    tab.update(
+                        path=str(smd_path), name=smd_path.name, content=content, saved=content,
+                        assets=loaded_assets, saved_assets=dict(loaded_assets), portable=portable,
+                    )
+
+                    with patch.object(studio, "_submit", side_effect=lambda action, done, *_a, **_kw: done(action(), None)):
+                        for source, expected_bytes in (("assets/one.png", raw_one), ("assets/two.png", raw_two)):
+                            replies.clear()
+                            studio.post("res", "resolve_reader_asset", json.dumps({
+                                "documentPath": tab["id"], "source": source,
+                            }))
+                            response = json.loads(replies[0][1])
+                            token = response["url"].split("//", 1)[1].split("?", 1)[0]
+                            fingerprint = response["url"].split("v=", 1)[1]
+                            grant = session.reader_assets.lookup(token, fingerprint)
+                            self.assertIsNotNone(grant)
+                            device = session.reader_assets.open_payload(grant)
+                            try:
+                                self.assertEqual(bytes(device.readAll()), expected_bytes)
+                            finally:
+                                device.close()
+                            # Repeat resolution + stream: still 0 additional decodes.
+                            replies.clear()
+                            studio.post("res2", "resolve_reader_asset", json.dumps({
+                                "documentPath": tab["id"], "source": source,
+                            }))
+                            device2 = session.reader_assets.open_payload(grant)
+                            device2.close()
+
+                    # Opening + resolving + streaming 2 rasters decoded each raster exactly once (1.0x).
+                    self.assertEqual(b64_spy.call_count, 2)
+                    self.assertEqual(session.reader_assets.cached_bytes, len(raw_one) + len(raw_two))
+
+                # Changing tab["assets"][source] immediately invalidates and evicts that asset's cached bytes.
+                first_token = next(
+                    tok for tok, g in session.reader_assets._grants.items() if g.source == "assets/one.png"
+                )
+                first_grant = session.reader_assets._grants[first_token]
+                first_fp = first_grant.fingerprint
+                tab["assets"]["assets/one.png"] = "data:image/png;base64," + base64.b64encode(b"\x89PNG\r\n\x1a\nreplaced").decode("ascii")
+                self.assertEqual(session.reader_assets.cached_bytes, len(raw_two))
+                self.assertIsNone(session.reader_assets.lookup(first_token, first_fp))
+                with self.assertRaises(ValueError):
+                    session.reader_assets.open_payload(first_grant)
+
+                # Closing the tab revokes remaining grants and evicts all cached bytes for that tab.
+                studio.newNote()
+                studio._finish_remove_tab(tab["id"])
+                self.assertEqual(session.reader_assets.cached_bytes, 0)
+                self.assertEqual(len(session.reader_assets), 0)
+
+                # Payload byte cap evicts oldest cached payloads while keeping capabilities bounded.
+                active = studio._current()
+                p1 = b"\x89PNG\r\n\x1a\n" + (b"1" * 100)
+                p2 = b"\x89PNG\r\n\x1a\n" + (b"2" * 100)
+                active["assets"]["assets/p1.png"] = "data:image/png;base64," + base64.b64encode(p1).decode("ascii")
+                active["assets"]["assets/p2.png"] = "data:image/png;base64," + base64.b64encode(p2).decode("ascii")
+                session.reader_assets.MAX_PAYLOAD_BYTES = len(p1) + 10
+                session.reader_assets.register(studio.window_id, active["id"], "assets/p1.png", resolve_source(active, "assets/p1.png"))
+                session.reader_assets.register(studio.window_id, active["id"], "assets/p2.png", resolve_source(active, "assets/p2.png"))
+                self.assertLessEqual(session.reader_assets.cached_bytes, session.reader_assets.MAX_PAYLOAD_BYTES)
+                self.assertEqual(session.reader_assets.cached_bytes, len(p2))
+
+                # Window retirement (revoke_owner) evicts all remaining cached bytes.
+                studio.stop()
+                self.assertEqual(session.reader_assets.cached_bytes, 0)
+        finally:
+            studio.stop()
+            studio.pool.shutdown(wait=True, cancel_futures=True)
+            session.writes.shutdown(wait=True)
+
+    def test_studio_save_text_skips_base64_decode_and_detects_external_or_corrupt_smd(self):
+        import time
+        import documents
+
+        session = Session(True)
+        session.settings["python"] = sys.executable
+        studio = Studio(True, session)
+        try:
+            with tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                png = b"\x89PNG\r\n\x1a\n" + (b"autosave-raster-" * 100)
+                assets = {"assets/pic.png": "data:image/png;base64," + base64.b64encode(png).decode("ascii")}
+                note = root / "autosave.smd"
+                documents.write_portable(note, "# Original\n", assets)
+
+                def wait_for_save():
+                    deadline = time.monotonic() + 3.0
+                    while studio.saving and time.monotonic() < deadline:
+                        self.app.processEvents()
+                        time.sleep(0.005)
+                    self.app.processEvents()
+
+                with patch.object(documents.base64, "b64decode", wraps=base64.b64decode) as b64_spy:
+                    content, loaded_assets, portable = documents.open_note(note)
+                    tab = studio._current()
+                    tab.update(
+                        path=str(note), name=note.name, content="# Autosaved edit\n", saved=content,
+                        assets=loaded_assets, saved_assets=dict(loaded_assets), portable=portable,
+                    )
+                    studio._save_text(tab, note, automatic=True)
+                    wait_for_save()
+                    self.assertEqual(tab["saved"], "# Autosaved edit\n")
+                    self.assertEqual(documents.open_note(note)[0], "# Autosaved edit\n")
+
+                    tab["content"] = "# Manual save edit\n"
+                    studio._save_text(tab, note, automatic=False)
+                    wait_for_save()
+                    self.assertEqual(tab["saved"], "# Manual save edit\n")
+                    self.assertEqual(b64_spy.call_count, 0)
+
+                    # External Markdown edit pauses autosave without decoding images or overwriting disk.
+                    documents.write_portable(note, "# External change\n", loaded_assets)
+                    tab["content"] = "# Local draft\n"
+                    studio._save_text(tab, note, automatic=True)
+                    wait_for_save()
+                    self.assertEqual(documents.open_note(note)[0], "# External change\n")
+                    self.assertIn("Autosave paused", studio.message)
+
+                    # Truncated/concatenated GZIP and invalid envelopes on disk also fail autosave without decoding images.
+                    raw_disk = note.read_bytes()
+                    exact_25mb_len = (documents.MAX_IMAGE // 3) * 4 + 4
+                    over_25mb = "A" * (exact_25mb_len - 1) + "="
+                    for damaged in (
+                        raw_disk[:-4],
+                        raw_disk + raw_disk,
+                        json.dumps({"format": "supermd-smd", "version": 1, "markdown": "# External change\n",
+                                    "assets": {"assets/../escape.png": "data:image/png;base64,eA=="}}).encode("utf-8"),
+                        json.dumps({"format": "supermd-smd", "version": 1, "markdown": "# External change\n",
+                                    "assets": {"assets/pic.png": "data:image/jpeg;base64,eA=="}}).encode("utf-8"),
+                        json.dumps({"format": "supermd-smd", "version": 1, "markdown": "# External change\n",
+                                    "assets": {"assets/huge.png": "data:image/png;base64," + over_25mb}}).encode("utf-8"),
+                    ):
+                        note.write_bytes(damaged)
+                        studio.message = ""
+                        studio._save_text(tab, note, automatic=True)
+                        wait_for_save()
+                        self.assertEqual(note.read_bytes(), damaged)
+                    self.assertEqual(b64_spy.call_count, 0)
+
+                # Damaged .smd with invalid base64 image is rejected on Studio open and cannot be rewritten by save.
+                import gzip
+                corrupt_smd = root / "corrupt-image.smd"
+                corrupt_bytes = gzip.compress(json.dumps({
+                    "format": "supermd-smd",
+                    "version": 1,
+                    "markdown": "# Corrupted image\n\n![](assets/bad.png)\n",
+                    "assets": {"assets/bad.png": "data:image/png;base64,@@@@"},
+                }).encode("utf-8"))
+                corrupt_smd.write_bytes(corrupt_bytes)
+
+                def run_sync(action, done, *_a, **_kw):
+                    try:
+                        done(action(), None)
+                    except Exception as err:
+                        done(None, str(err))
+
+                with patch.object(studio, "_submit", side_effect=run_sync):
+                    studio._open_note(str(corrupt_smd), explicit=True)
+                    self.assertFalse(any(t.get("path") == str(corrupt_smd) for t in studio.tabs))
+
+                    _, struct_bad_assets, _ = documents.open_note(corrupt_smd, decode_assets=False)
+                    bad_tab = studio._current()
+                    bad_tab.update(
+                        path=str(corrupt_smd),
+                        name=corrupt_smd.name,
+                        content="# Attempted edit\n",
+                        saved="# Corrupted image\n\n![](assets/bad.png)\n",
+                        assets=dict(struct_bad_assets),
+                        saved_assets=dict(struct_bad_assets),
+                        portable=True,
+                    )
+                    studio._save_text(bad_tab, corrupt_smd, automatic=False)
+                    self.assertEqual(corrupt_smd.read_bytes(), corrupt_bytes)
+                    self.assertNotEqual(bad_tab["saved"], "# Attempted edit\n")
+
+                    replies = []
+                    studio.replied.connect(lambda identifier, value, error: replies.append((identifier, value, error)))
+                    studio.post("save-fmd", "export_fmd_native", json.dumps({
+                        "save": True,
+                        "id": bad_tab["id"],
+                        "content": "# Attempted export save\n",
+                        "originalContent": "# Attempted export save\n",
+                        "assets": dict(struct_bad_assets),
+                    }))
+                    self.assertEqual(corrupt_smd.read_bytes(), corrupt_bytes)
+                    self.assertTrue(replies and replies[-1][2])
+        finally:
+            studio.stop()
+            studio.pool.shutdown(wait=True, cancel_futures=True)
+            session.writes.shutdown(wait=True)
+
 
 if __name__ == "__main__":
     unittest.main()

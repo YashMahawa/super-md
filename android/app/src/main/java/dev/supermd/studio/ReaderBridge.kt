@@ -39,6 +39,7 @@ internal class ReaderBridge(
     fun retire() {
         synchronized(capabilityLock) {
             if (retired.compareAndSet(false, true)) {
+                model.detachReaderCapabilities(assetCapabilities)
                 assetCapabilities.clear()
                 flushBarrier.failAll()
                 synchronized(pdfJobLock) { pdfJobs.clear() }
@@ -87,6 +88,11 @@ internal class ReaderBridge(
                     "document_flushed" -> documentFlushed(args)
                     "reading_position" -> {model.readingPosition(args.getString("id"),args.getJSONObject("location"));true}
                     "zoom_changed" -> { model.readerZoom(args.getDouble("zoom").toFloat(), args.optBoolean("fullscreen", model.state.value.fullscreen)); true }
+                    "typewriter_scroll" -> {
+                        val enabled = args.opt("enabled") as? Boolean ?: error("Invalid typewriter scroll value")
+                        model.typewriterScroll(enabled)
+                        true
+                    }
                     "reader_overlay_changed" -> { model.overlay(args.optBoolean("open"), args.optBoolean("image")); true }
                     "copy_image_native" -> {
                         val uri = withContext(Dispatchers.IO) {
@@ -110,6 +116,7 @@ internal class ReaderBridge(
                         web.context.getSystemService(android.content.ClipboardManager::class.java).setPrimaryClip(android.content.ClipData.newPlainText("Super MD",text))
                         true
                     }
+                    "apply_bundled_theme" -> model.applyBundledTheme(args.getString("id"))
                     "document_outline" -> { model.outline(args.getString("id"), args.getJSONArray("headings")); true }
                     "load_font" -> withContext(Dispatchers.IO) {model.fonts.reader(args.getString("family"))}
                     "cache_python_output" -> cachePythonOutput(args)
@@ -120,16 +127,18 @@ internal class ReaderBridge(
                         val source = args.getString("source")
                         val (noteId, asset) = model.resolveReaderAsset(args.getString("documentPath"), source)
                         require(asset.mime != "image/svg+xml") { "SVG images use the safe data loader" }
+                        require(asset.mime in RASTER_ASSET_MIMES) { "Unsupported raster image type" }
                         val capability = synchronized(capabilityLock) {
                             check(!retired.get()) { "Reader is no longer available" }
-                            assetCapabilities.register(noteId, source, asset.mime, asset.fingerprint)
+                            check(model.matchesReaderAssetNote(noteId, asset.target)) { "The asset's document changed while resolving" }
+                            assetCapabilities.register(noteId, source, asset.mime, asset.fingerprint, asset.target)
                                 ?: error("Reader asset capacity reached; using the safe data loader")
                         }
                         JSONObject()
                             .put("url", "${ReaderAssetPathHandler.URL_PREFIX}${capability.token}?v=${capability.fingerprint}")
                             .put("mime", capability.mime)
                     }
-                    "import_images" -> withContext(Dispatchers.IO) { model.media.importJson(args.getJSONArray("images")) }
+                    "import_images" -> withContext(Dispatchers.IO) { model.media.importJson(args.getJSONArray("images")) }.also { model.markAssetsDirty(model.state.value.active.id) }
                     "save_media_native" -> model.saveAgentMedia(args)
                     "agent_export_native" -> { onAgentExport(args); JSONObject().put("accepted", true).put("jobId", args.optString("requestId")) }
                     "fetch_resource" -> withContext(Dispatchers.IO) { JSONObject().put("body", model.media.fetch(args.getString("url"), args.optBoolean("image"))) }
@@ -497,9 +506,10 @@ fun configureReader(web: WebView, model: StudioViewModel, scope: CoroutineScope,
     web.settings.textZoom = 100
     web.settings.mixedContentMode = android.webkit.WebSettings.MIXED_CONTENT_NEVER_ALLOW
     val capabilities = ReaderAssetCapabilities()
+    model.attachReaderCapabilities(capabilities)
     val assetPathHandler = ReaderAssetPathHandler(
         capabilities,
-        open = model::openReaderAsset,
+        openCapability = model::openReaderAsset,
         noteIsOpen = { noteId -> model.state.value.tabs.any { it.id == noteId } },
     )
     val loader = WebViewAssetLoader.Builder()

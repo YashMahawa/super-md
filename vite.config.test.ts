@@ -1,7 +1,13 @@
 import { createHash } from 'node:crypto';
 import { readFileSync } from 'node:fs';
 import { afterEach, expect, it } from 'vitest';
-import { buildHtmlEntries, htmlCspPlugin, renderSandboxDocument } from './vite.config';
+import {
+  buildHtmlEntries,
+  htmlCspPlugin,
+  renderSandboxDocument,
+  stripLegacyMathFontFallbacks,
+  woff2MathFontsPlugin,
+} from './vite.config';
 
 const originalTauriPlatform = process.env.TAURI_ENV_PLATFORM;
 
@@ -89,4 +95,22 @@ it('hashes CRLF inline preamble scripts with HTML5 LF normalization during vite 
     .digest('base64');
   expect(transformed).toContain(`'sha256-${expectedDigest}'`);
   expect(transformed).toContain('ws://127.0.0.1:1420 ws://localhost:1420');
+});
+
+it('strips legacy .woff and .ttf fallback sources from KaTeX @font-face rules while preserving .woff2', () => {
+  const katexCss = readFileSync(new URL('./node_modules/katex/dist/katex.min.css', import.meta.url), 'utf8');
+  const pruned = stripLegacyMathFontFallbacks(katexCss);
+  const faces = pruned.match(/@font-face\s*\{[^}]*\}/g) ?? [];
+  expect(faces.length).toBe(20);
+  for (const face of faces) {
+    expect(face).toMatch(/\.woff2(?=[?#"'\s)]|$)/);
+    expect(face).not.toMatch(/\.(?:woff|ttf)(?=[?#"'\s)]|$)/);
+  }
+  const plugin = woff2MathFontsPlugin();
+  const transform = typeof plugin.transform === 'function' ? plugin.transform : plugin.transform?.handler;
+  expect(transform?.call({} as never, katexCss, '/app/node_modules/katex/dist/katex.min.css')).toEqual({
+    code: pruned,
+    map: null,
+  });
+  expect(transform?.call({} as never, katexCss, '/app/src/styles.css')).toBeNull();
 });

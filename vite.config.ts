@@ -5,6 +5,31 @@ import react from "@vitejs/plugin-react";
 
 export const nativeReaderEntries = { reader: "android-reader.html", qtReader: "qt-reader.html" } as const;
 
+const LEGACY_FONT_SOURCE_RE = /\.(?:woff|ttf)(?=[?#"'\s)]|$)/i;
+
+export function stripLegacyMathFontFallbacks(css: string): string {
+  return css.replace(/@font-face\s*\{[^}]*\}/g, (block) =>
+    block.replace(/(src\s*:\s*)([^;}]+)/g, (full, prefix: string, value: string) => {
+      const kept = value
+        .split(",")
+        .map((entry) => entry.trim())
+        .filter((entry) => entry.length > 0 && !LEGACY_FONT_SOURCE_RE.test(entry));
+      return kept.length > 0 ? `${prefix}${kept.join(",")}` : full;
+    }),
+  );
+}
+
+export function woff2MathFontsPlugin(): Plugin {
+  return {
+    name: "supermd-woff2-math-fonts",
+    enforce: "pre",
+    transform(code, id) {
+      if (!/[\\/]katex[\\/].*\.css(?:$|\?)/.test(id)) return null;
+      return { code: stripLegacyMathFontFallbacks(code), map: null };
+    },
+  };
+}
+
 export function buildHtmlEntries(mode: string) {
   return mode === "native"
     ? nativeReaderEntries
@@ -164,7 +189,7 @@ export function htmlCspPlugin(): Plugin {
 
 export default defineConfig(({mode}) => ({
   base: "./",
-  plugins: [react(), mermaidSandboxPlugin(), htmlCspPlugin()],
+  plugins: [woff2MathFontsPlugin(), react(), mermaidSandboxPlugin(), htmlCspPlugin()],
   // These imports are reached only through the lazy writing worker. Discover
   // them before serving a page so first use cannot trigger an optimizer reload
   // and discard the native reader's in-memory workspace.
