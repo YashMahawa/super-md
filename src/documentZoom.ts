@@ -33,6 +33,7 @@ export function settleDocumentZoom(root:HTMLElement):void {
   const nextZoom=standardized?String(scale):'1';
   const changingZoom=standardized&&page.style.zoom!==nextZoom;
   const restore=changingZoom&&root.isConnected&&root.scrollTop>1&&!root.dataset.navigating?captureScrollAnchor(root):undefined;
+  page.style.setProperty('--document-scale',String(scale));
   page.style.zoom=nextZoom;
   page.style.transform=standardized?`translateX(${measured.left/scale}px)`:`translateX(${measured.left}px) scale(${scale})`;
   page.dataset.selectionScale=String(scale);
@@ -84,6 +85,7 @@ export function applyDocumentZoom(root:HTMLElement, zoom:number, widthPercent:nu
   delete page.dataset.selectionScale;
   delete page.dataset.selectionModel;
   if(width!==measured.width){page.style.width=`${width}px`;page.style.marginLeft="0px";measured.width=width;measured.height=page.offsetHeight;}
+  page.style.setProperty('--document-scale',String(next));
   page.style.transform=`translateX(${left}px) scale(${next})`;page.dataset.scale=String(next);page.dataset.zoomLeft=String(left);measured.left=left;
   space.style.width=`${spaceWidth}px`;
   space.style.height=`${measured.height*next}px`;
