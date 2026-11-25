@@ -78,6 +78,21 @@ describe("image references", () => {
     expect(normalizeCallouts("![[DM Images/proof-method-guide.png]]"))
       .toBe("![DM Images/proof-method-guide.png](DM%20Images/proof-method-guide.png)");
   });
+
+  it("strips {width=...} attributes in reader previews while keeping standalone media paragraphs", () => {
+    const uri = "data:image/svg+xml;base64," + btoa('<svg xmlns="http://www.w3.org/2000/svg" width="80" height="40"><rect width="80" height="40"/></svg>');
+    const html = renderToStaticMarkup(
+      <MarkdownPreview
+        markdown={`![Diagram](${uri}){width=300}\n\nInline ![Icon](${uri}){width=50%} text.`}
+        documentPath={null}
+        python=""
+        dark={false}
+      />
+    );
+    expect(html).not.toContain("{width=");
+    expect(html).toContain('class="media-paragraph"');
+    expect(html).toContain(" text.");
+  });
 });
 
 describe("executable Python cells", () => {

@@ -29,6 +29,7 @@ export function settleDocumentZoom(root:HTMLElement):void {
   const measured=geometry.get(root);if(!measured)return;
   const {page}=measured,scale=Number(page.dataset.scale)||1;
   const standardized='currentCSSZoom' in page;
+  page.style.setProperty('--document-scale',String(scale));
   page.style.zoom=standardized?String(scale):'1';
   page.style.transform=standardized?`translateX(${measured.left/scale}px)`:`translateX(${measured.left}px) scale(${scale})`;
   page.dataset.selectionScale=String(scale);
@@ -79,6 +80,7 @@ export function applyDocumentZoom(root:HTMLElement, zoom:number, widthPercent:nu
   delete page.dataset.selectionScale;
   delete page.dataset.selectionModel;
   if(width!==measured.width){page.style.width=`${width}px`;page.style.marginLeft="0px";measured.width=width;measured.height=page.offsetHeight;}
+  page.style.setProperty('--document-scale',String(next));
   page.style.transform=`translateX(${left}px) scale(${next})`;page.dataset.scale=String(next);page.dataset.zoomLeft=String(left);measured.left=left;
   space.style.width=`${spaceWidth}px`;
   space.style.height=`${measured.height*next}px`;

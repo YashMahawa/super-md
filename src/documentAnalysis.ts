@@ -6,7 +6,7 @@ import {visit} from 'unist-util-visit';
 import type {Root} from 'mdast';
 import {remarkObsidianMath} from './obsidianMath';
 import {remarkSvgBlocks} from './svgBlocks';
-import {remarkSourceSyntax} from './markdownSource';
+import {remarkImageAttributes,remarkSourceSyntax} from './markdownSource';
 import {remarkStudySyntax} from './studySyntax';
 import {parseFrontmatter,type ParsedFrontmatter} from './frontmatter';
 import {headingSlug} from './headingSlug';
@@ -65,7 +65,8 @@ export function hydrateDocumentAnalysis(source:string,compact:CompactDocumentAna
     },
   };
 }
-const processor=unified().use(remarkParse).use(remarkSourceSyntax).use(remarkGfm,{singleTilde:false}).use(remarkMath).use(remarkObsidianMath).use([remarkSvgBlocks,remarkStudySyntax]);
+
+const processor=unified().use(remarkParse).use(remarkSourceSyntax).use(remarkGfm,{singleTilde:false}).use(remarkMath).use(remarkObsidianMath).use([remarkImageAttributes,remarkSvgBlocks,remarkStudySyntax]);
 const cache=new Map<string,{value:DocumentAnalysis;weight:number}>();let retained=0;
 const LIMIT=8_000_000;
 function textOf(node:any):string{return typeof node.value==='string'?node.value:(node.children||[]).map(textOf).join('');}

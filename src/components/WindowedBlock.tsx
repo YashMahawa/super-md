@@ -9,9 +9,10 @@ export function useWindowing():boolean {
   return useSyncExternalStore(subscribe,()=>typeof IntersectionObserver!=="undefined",()=>false);
 }
 export interface WindowHeading {id:string;key:string}
-export default function WindowedBlock({enabled,estimate=120,text="",headings=[],children,...props}:{enabled:boolean;estimate?:number;text?:string;headings?:WindowHeading[];children:ReactNode}&HTMLAttributes<HTMLElement>) {
+export default function WindowedBlock({enabled,estimate=120,text="",headings=[],blockRef,children,...props}:{enabled:boolean;estimate?:number;text?:string;headings?:WindowHeading[];blockRef?:React.MutableRefObject<HTMLElement|null>;children:ReactNode}&HTMLAttributes<HTMLElement>) {
   const supported=useWindowing(),active=enabled&&supported;
   const [shown,setShown]=useState(!active),[reserved,setReserved]=useState(false),height=useRef(estimate),measuredBefore=useRef(false),element=useRef<HTMLElement>(null);
+  const setNodeRef=(node:HTMLElement|null)=>{element.current=node;if(blockRef)blockRef.current=node;};
   useEffect(()=>{
     const node=element.current;if(!node||!active)return;
     const unregister=registerWindowedText(node,text);
@@ -57,8 +58,8 @@ export default function WindowedBlock({enabled,estimate=120,text="",headings=[],
     node.closest('.android-reading,.reading-scroll')?.dispatchEvent(new Event('supermd-window-change'));
     return()=>observer.disconnect();
   },[active,shown,headings]);
-  if(!active)return <section {...props}>{children}</section>;
-  return <section {...props} ref={element} className={`windowed-md-block ${props.className||""}`} data-windowed-block data-windowed-mounted={shown} style={{...props.style,...(!shown?{height:height.current}:reserved?{minHeight:height.current}:{} )}}>
+  if(!active)return <section {...props} ref={setNodeRef}>{children}</section>;
+  return <section {...props} ref={setNodeRef} className={`windowed-md-block ${props.className||""}`} data-windowed-block data-windowed-mounted={shown} style={{...props.style,...(!shown?{height:height.current}:reserved?{minHeight:height.current}:{} )}}>
     {shown?children:headings.map(heading=><span key={heading.id} id={heading.id} data-heading-key={heading.key} aria-hidden="true"/>)}
   </section>;
 }

@@ -222,6 +222,17 @@ describe('shared source analysis',()=>{
     expect(hydrated.analysis.blocks.map(block=>block.text).join('')).toBe(source);
     expect(hydrated.analysis.bodyBlocks.map(block=>block.text)).toEqual(full.bodyBlocks.map(block=>block.text));
   });
+  it('rewrites numeric Obsidian pipe widths to {width=...} while preserving non-numeric captions and offsets',()=>{
+    const source='![[diagram.png|300]] and ![[diagram.png|300x180]] and ![[diagram.png|Caption|240]] vs ![[diagram.png|Architecture]]\n\n# Heading After\n';
+    const normalized=normalizeMarkdownSource(source);
+    expect(normalized.value).toContain('![diagram.png](diagram.png){width=300}');
+    expect(normalized.value).toContain('![diagram.png](diagram.png){width=300}');
+    expect(normalized.value).toContain('![Caption](diagram.png){width=240}');
+    expect(normalized.value).toContain('![Architecture](diagram.png)');
+    expect(normalized.originalOffset(normalized.value.indexOf('# Heading After'))).toBe(source.indexOf('# Heading After'));
+    const analysis=analyzeDocument(source);
+    expect(analysis.outline[0]?.offset).toBe(source.indexOf('# Heading After'));
+  });
   it('strips paired %%...%% comments outside code and math while preserving original offsets and lossless blocks',()=>{
     const source=[
       '%%Draft header',

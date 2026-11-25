@@ -225,15 +225,25 @@ smd-expressive-button.primary-action { display: block; width: 100%; margin-top: 
 .image-viewer footer label { display: flex; align-items: center; gap: 12px; }
 .live-document { width: min(var(--reader-width), calc(100% - 64px)); margin: 0 auto; padding: 42px 0 28vh; }
 .live-document[data-typewriter="true"] { padding-top: var(--live-typewriter-pad, 45vh); padding-bottom: var(--live-typewriter-pad, 45vh); }
-.live-block { position: relative; min-height: 25px; border-radius: 12px; }
+.live-block { position: relative; border-radius: 12px; }
+.live-block:empty { min-height: 25px; }
 .live-document > .markdown-body { width:100%; max-width:none; margin:0; padding:0; }
 .live-block { display:flow-root; }
-.live-block > :first-child { margin-top:0; }
-.live-block > :last-child { margin-bottom:.85em; }
+.live-block > :first-child:not(.live-block-edit), .live-block > .live-block-edit + * { margin-top:0; }
+.live-block > :last-child:not(.live-block-edit) { margin-bottom:.85em; }
 .live-block .markdown-body { width: 100%; padding: 0; font-size: calc(var(--reader-size) * var(--workspace-scale, 1)); }
 .live-block .markdown-body > :first-child { margin-top: 0; }
 .live-block .markdown-body > :last-child { margin-bottom: .85em; }
 .live-block:focus-visible { outline: 2px solid var(--primary); outline-offset: 4px; }
+.live-block-edit { position: absolute; z-index: 6; top: calc(4px / var(--document-scale, 1)); right: calc(6px / var(--document-scale, 1)); transform: scale(calc(1 / var(--document-scale, 1))); transform-origin: top right; display: inline-flex; align-items: center; gap: 5px; min-height: 30px; padding: 5px 11px; border: 1px solid var(--outline); border-radius: 999px; background: var(--surface-high); color: var(--text); box-shadow: 0 3px 12px color-mix(in srgb, #000 18%, transparent); font: 650 12px/1 "Manrope Variable", var(--md-ref-typeface-plain, system-ui, sans-serif); letter-spacing: .01em; white-space: nowrap; user-select: none; cursor: pointer; }
+:root[data-live-selecting="true"] .live-block-edit { pointer-events: none; opacity: 0; }
+.live-block:has(.code-copy) > .live-block-edit { top: calc(22px / var(--document-scale, 1)); right: calc(78px / var(--document-scale, 1)); }
+.live-block:has(.chart-actions) > .live-block-edit { top: calc(16px / var(--document-scale, 1)); right: calc(96px / var(--document-scale, 1)); }
+.live-block:has(.cell-toolbar) > .live-block-edit { top: calc(10px / var(--document-scale, 1)); right: calc(88px / var(--document-scale, 1)); }
+.live-block:has(.step-cards-enlarge) > .live-block-edit { top: calc(6px / var(--document-scale, 1)); right: calc(44px / var(--document-scale, 1)); }
+.live-block-edit:hover { background: var(--primary); color: var(--on-primary); border-color: var(--primary); }
+.live-block-edit:active { transform: scale(calc(.96 / var(--document-scale, 1))); }
+@media (pointer: coarse) { .live-block-edit { min-height: 34px; padding: 6px 13px; font-size: 13px; } }
 .live-active-block { margin: 0 0 16px; padding: 8px; border: 1px solid color-mix(in srgb, var(--primary) 55%, var(--outline)); border-radius: 14px; background: var(--surface-low); box-shadow: 0 0 0 3px color-mix(in srgb, var(--primary) 10%, transparent); }
 .live-active-block textarea { display: block; width: 100%; min-height: 120px; max-height: min(55dvh, 480px); resize: vertical; padding: 10px 12px; border: 0; outline: none; background: transparent; color: var(--text); font: calc(var(--editor-size) * var(--workspace-scale, 1))/var(--editor-leading) var(--mono); overflow: auto; overscroll-behavior: contain; touch-action: pan-y; }
 .preview-page { margin: 0 auto; transform-origin: top center; }
