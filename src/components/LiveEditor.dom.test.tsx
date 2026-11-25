@@ -27,9 +27,12 @@ import Editor from "./Editor";
 import LiveEditor from "./LiveEditor";
 import { cancelHeadingNavigation } from "../documentNavigation";
 import { applyHistoryEdit, replayHistory, tryLiveTextareaHistory, type LiveHistoryEditMeta, type NoteHistory } from "../noteHistory";
+import * as proofreading from "../proofreading";
 import { setTypewriterScroll } from "../typewriterScroll";
 Object.assign(globalThis, { IS_REACT_ACT_ENVIRONMENT: true });
+const execCommandCleanups: Array<() => void> = [];
 afterEach(() => {
+  while (execCommandCleanups.length > 0) execCommandCleanups.pop()?.();
   invokeMock.mockClear();
   toJsxRuntimeSpy.mockClear();
   vi.unstubAllGlobals();
@@ -67,6 +70,78 @@ it("keeps answer disclosure interactive and Python source in one box", async () 
   expect(host.querySelector('.python-cell .cell-toolbar')?.textContent).toContain('Run');
   for (const summary of headings) act(() => summary.dispatchEvent(new MouseEvent("click",{bubbles:true,cancelable:true})));
   expect(host.querySelector("textarea")).toBeNull();
+  act(() => root.unmount()); host.remove();
+});
+it("toggles formatting shortcuts, wraps URL pastes over selections, pastes plain URLs at bare cursor, and undoes with selection intact", async () => {
+  const host = document.createElement("div"); document.body.append(host); const root = createRoot(host);
+  let doc = "Hello brave world";
+  const renderCurrent = () => {
+    root.render(<LiveEditor markdown={doc} documentPath={null} dark python="" onChange={(next) => { doc = next; renderCurrent(); }} />);
+  };
+  await act(async () => { renderCurrent(); });
+
+  act(() => host.querySelector("p")!.dispatchEvent(new MouseEvent("dblclick", { bubbles: true })));
+  const area = host.querySelector("textarea")!;
+  expect(area.value).toBe("Hello brave world");
+
+  // Select "brave" [6..11] and toggle Bold twice
+  act(() => {
+    area.focus();
+    area.setSelectionRange(6, 11);
+    area.dispatchEvent(new KeyboardEvent("keydown", { key: "b", ctrlKey: true, bubbles: true, cancelable: true }));
+  });
+  expect(doc).toBe("Hello **brave** world");
+  expect([area.selectionStart, area.selectionEnd]).toEqual([8, 13]);
+  expect(document.activeElement).toBe(area);
+
+  act(() => {
+    area.dispatchEvent(new KeyboardEvent("keydown", { key: "b", ctrlKey: true, bubbles: true, cancelable: true }));
+  });
+  expect(doc).toBe("Hello brave world");
+  expect([area.selectionStart, area.selectionEnd]).toEqual([6, 11]);
+
+  // Paste standalone URL over selected "brave" -> wraps [brave](https://example.com) inline without closing Live block
+  act(() => {
+    const pasteEvent = new Event("paste", { bubbles: true, cancelable: true });
+    Object.defineProperty(pasteEvent, "clipboardData", {
+      value: {
+        files: [],
+        getData: (type: string) => (type === "text/plain" ? "https://example.com" : ""),
+      },
+    });
+    area.dispatchEvent(pasteEvent);
+  });
+  expect(doc).toBe("Hello [brave](https://example.com) world");
+  expect(host.querySelector("textarea")).toBe(area);
+  expect(document.activeElement).toBe(area);
+
+  // Single Undo step restores exact prior text AND selection [6, 11]
+  act(() => {
+    area.dispatchEvent(new KeyboardEvent("keydown", { key: "z", ctrlKey: true, bubbles: true, cancelable: true }));
+  });
+  expect(doc).toBe("Hello brave world");
+  expect([area.selectionStart, area.selectionEnd]).toEqual([6, 11]);
+
+  // Bare cursor URL paste inserts plain URL directly
+  act(() => {
+    area.setSelectionRange(17, 17);
+    const pasteEvent = new Event("paste", { bubbles: true, cancelable: true });
+    Object.defineProperty(pasteEvent, "clipboardData", {
+      value: {
+        files: [],
+        getData: (type: string) => (type === "text/plain" ? "https://example.org/plain" : ""),
+      },
+    });
+    area.dispatchEvent(pasteEvent);
+  });
+  expect(doc).toBe("Hello brave worldhttps://example.org/plain");
+
+  act(() => {
+    area.dispatchEvent(new KeyboardEvent("keydown", { key: "z", ctrlKey: true, bubbles: true, cancelable: true }));
+  });
+  expect(doc).toBe("Hello brave world");
+  expect([area.selectionStart, area.selectionEnd]).toEqual([17, 17]);
+
   act(() => root.unmount()); host.remove();
 });
 it("reveals Edit block on hover, keyboard focus, and tap without blocking single clicks or triggering on pan/fullscreen prose taps", async () => {
@@ -938,9 +1013,25 @@ it("continues and clears list, task, and quote markers on Enter and indents/outd
   act(() => { quoteArea.dispatchEvent(new KeyboardEvent("keydown", { key: "Escape", bubbles: true, cancelable: true })); });
   expect(host.querySelector("textarea")).toBeNull();
 
-  // Open plain paragraph: Tab/Shift+Tab indents and outdents in-place while retaining focus
+  // Open plain paragraph: Ctrl+Shift+L toggles bullet list, Enter continues list, and Ctrl+Z/Ctrl+Shift+Z undo/redo cleanly
   act(() => host.querySelectorAll<HTMLElement>(".live-block")[2].dispatchEvent(new MouseEvent("dblclick", { bubbles: true })));
   const paraArea = host.querySelector<HTMLTextAreaElement>("textarea")!;
+  paraArea.focus();
+  paraArea.setSelectionRange(paraArea.value.length, paraArea.value.length);
+  act(() => { paraArea.dispatchEvent(new KeyboardEvent("keydown", { key: "L", ctrlKey: true, shiftKey: true, bubbles: true, cancelable: true })); });
+  expect(paraArea.value).toBe("- Plain paragraph");
+  act(() => { paraArea.dispatchEvent(new KeyboardEvent("keydown", { key: "Enter", bubbles: true, cancelable: true })); });
+  expect(paraArea.value).toBe("- Plain paragraph\n- ");
+  act(() => { paraArea.dispatchEvent(new KeyboardEvent("keydown", { key: "z", ctrlKey: true, bubbles: true, cancelable: true })); });
+  expect(paraArea.value).toBe("- Plain paragraph");
+  expect(paraArea.selectionStart).toBe("- Plain paragraph".length);
+  act(() => { paraArea.dispatchEvent(new KeyboardEvent("keydown", { key: "z", ctrlKey: true, shiftKey: true, bubbles: true, cancelable: true })); });
+  expect(paraArea.value).toBe("- Plain paragraph\n- ");
+  act(() => { paraArea.dispatchEvent(new KeyboardEvent("keydown", { key: "z", ctrlKey: true, bubbles: true, cancelable: true })); });
+  act(() => { paraArea.dispatchEvent(new KeyboardEvent("keydown", { key: "z", ctrlKey: true, bubbles: true, cancelable: true })); });
+  expect(paraArea.value).toBe("Plain paragraph");
+
+  // Tab/Shift+Tab indents and outdents plain paragraph in-place while retaining focus
   const paraTab = new KeyboardEvent("keydown", { key: "Tab", bubbles: true, cancelable: true });
   act(() => { paraArea.dispatchEvent(paraTab); });
   expect(paraTab.defaultPrevented).toBe(true);
@@ -1026,6 +1117,7 @@ function HistoryBackedLiveEditor({
 }
 
 function installNativeTextareaExecCommandMock() {
+  const originalExecCommand = Object.getOwnPropertyDescriptor(document, "execCommand");
   type StackItem = { before: string; after: string; beforeSel: [number, number]; afterSel: [number, number] };
   const stacks = new WeakMap<HTMLTextAreaElement, { undo: StackItem[]; redo: StackItem[] }>();
   const getStack = (area: HTMLTextAreaElement) => {
@@ -1077,6 +1169,10 @@ function installNativeTextareaExecCommandMock() {
     return false;
   });
   Object.defineProperty(document, "execCommand", { configurable: true, writable: true, value: execCommandMock });
+  execCommandCleanups.push(() => {
+    if (originalExecCommand) Object.defineProperty(document, "execCommand", originalExecCommand);
+    else delete (document as { execCommand?: unknown }).execCommand;
+  });
   return { execCommandMock };
 }
 
@@ -1179,6 +1275,217 @@ it("undoes inside one Live block via native textarea undo and redoes after leavi
   });
   expect(currentDoc).toBe("First paragraph refined\n\nSecond paragraph updated");
   expect(host.querySelector<HTMLTextAreaElement>("textarea")?.value).toBe("Second paragraph updated");
+
+  act(() => root.unmount());
+  host.remove();
+});
+
+it("retains LiveEditor focus across WritingSuggestions replacement, dismissal, personal dictionary save, and single-step undo", async () => {
+  vi.useFakeTimers();
+  window.localStorage.removeItem("supermd.personal-dictionary.v1");
+  const checkSpy = vi.spyOn(proofreading, "checkWriting").mockImplementation(async (slice) => {
+    const out: proofreading.WritingIssue[] = [];
+    const tehIdx = slice.indexOf("teh");
+    if (tehIdx !== -1) {
+      out.push({ from: tehIdx, to: tehIdx + 3, kind: "spelling", message: "Possible spelling error: teh", replacements: ["right"] });
+    }
+    const tokenIdx = slice.indexOf("customtoken");
+    if (tokenIdx !== -1) {
+      out.push({ from: tokenIdx, to: tokenIdx + 11, kind: "spelling", message: "Possible spelling error: customtoken", replacements: [] });
+    }
+    const extraIdx = slice.indexOf("anoter");
+    if (extraIdx !== -1) {
+      out.push({ from: extraIdx, to: extraIdx + 6, kind: "spelling", message: "Possible spelling error: anoter", replacements: ["another"] });
+    }
+    return out;
+  });
+  const host = document.createElement("div");
+  document.body.append(host);
+  const root = createRoot(host);
+  let currentDoc = "teh customtoken and anoter word here.";
+  const renderLive = () =>
+    root.render(
+      <LiveEditor
+        markdown={currentDoc}
+        documentPath={null}
+        dark={false}
+        python=""
+        spellCheck
+        grammarCheck
+        onChange={(next) => {
+          currentDoc = next;
+          renderLive();
+        }}
+      />,
+    );
+
+  try {
+    await act(async () => { renderLive(); });
+    act(() => host.querySelector("p")!.dispatchEvent(new MouseEvent("dblclick", { bubbles: true })));
+    const area = host.querySelector<HTMLTextAreaElement>("textarea")!;
+    area.focus();
+    const initialCaret = currentDoc.indexOf("word");
+    area.setSelectionRange(initialCaret, initialCaret);
+    act(() => { area.dispatchEvent(new Event("select", { bubbles: true })); });
+
+    await act(async () => { await vi.advanceTimersByTimeAsync(650); });
+    const panel = host.querySelector(".writing-suggestions");
+    expect(panel).not.toBeNull();
+
+    // Accept length-changing "right" replacement for "teh" (+2 chars) and verify caret shifts by +2
+    const rightBtn = Array.from(panel!.querySelectorAll("button")).find((btn) => btn.textContent === "right");
+    expect(rightBtn).toBeDefined();
+    await act(async () => { rightBtn!.click(); });
+    expect(area.value).toBe("right customtoken and anoter word here.");
+    expect(document.activeElement).toBe(area);
+    expect(area.selectionStart).toBe(initialCaret + 2);
+
+    // Single-step Ctrl+Z reverts the accepted suggestion and restores original caret
+    act(() => { area.dispatchEvent(new KeyboardEvent("keydown", { key: "z", ctrlKey: true, bubbles: true, cancelable: true })); });
+    expect(area.value).toBe("teh customtoken and anoter word here.");
+    expect(area.selectionStart).toBe(initialCaret);
+    expect(document.activeElement).toBe(area);
+
+    await act(async () => { await vi.advanceTimersByTimeAsync(650); });
+    const refreshed = host.querySelector(".writing-suggestions")!;
+    expect(refreshed).not.toBeNull();
+
+    // Add "customtoken" to personal dictionary while keeping textarea open & focused
+    const dictBtn = Array.from(refreshed.querySelectorAll<HTMLButtonElement>("button")).find((btn) =>
+      btn.title.includes("customtoken"),
+    );
+    expect(dictBtn).toBeDefined();
+    await act(async () => { dictBtn!.click(); });
+    expect(document.activeElement).toBe(area);
+    expect(host.querySelector("textarea")).toBe(area);
+    expect(JSON.parse(window.localStorage.getItem("supermd.personal-dictionary.v1") || "[]")).toContain("customtoken");
+
+    // Dismiss a remaining suggestion while keeping textarea open & focused
+    const dismissBtn = Array.from(host.querySelectorAll<HTMLButtonElement>(".writing-suggestions button")).find(
+      (btn) => btn.textContent === "Dismiss",
+    );
+    expect(dismissBtn).toBeDefined();
+    await act(async () => { dismissBtn!.click(); });
+    expect(document.activeElement).toBe(area);
+    expect(host.querySelector("textarea")).toBe(area);
+  } finally {
+    checkSpy.mockRestore();
+    act(() => root.unmount());
+    host.remove();
+    window.localStorage.removeItem("supermd.personal-dictionary.v1");
+    vi.useRealTimers();
+  }
+});
+
+it("combines accessible Edit block controls with prose URL wrapping, raw paste in code/frontmatter, and editing the existing selection", async () => {
+  const host = document.createElement("div");
+  document.body.append(host);
+  const root = createRoot(host);
+  let doc = [
+    "Read the manual or run `old_cmd` today.",
+    "",
+    "```python",
+    'endpoint = "old_host"',
+    "```",
+  ].join("\n");
+  const renderDoc = () =>
+    root.render(
+      <LiveEditor
+        markdown={doc}
+        documentPath={null}
+        dark={false}
+        python=""
+        onChange={(next) => {
+          doc = next;
+          renderDoc();
+        }}
+      />,
+    );
+  await act(async () => { renderDoc(); });
+
+  const dispatchPaste = (area: HTMLTextAreaElement, text: string) => {
+    const pasteEvent = new Event("paste", { bubbles: true, cancelable: true });
+    Object.defineProperty(pasteEvent, "clipboardData", {
+      value: {
+        files: [],
+        getData: (type: string) => (type === "text/plain" ? text : ""),
+      },
+    });
+    area.dispatchEvent(pasteEvent);
+  };
+
+  // 1. Open first block via #62's accessible "Edit block" button on focus.
+  const firstBlock = host.querySelectorAll<HTMLElement>(".live-block")[0]!;
+  act(() => firstBlock.focus());
+  const editBtn = firstBlock.querySelector<HTMLButtonElement>('button[aria-label="Edit block"]');
+  expect(editBtn).not.toBeNull();
+  act(() => editBtn!.click());
+  let area = host.querySelector<HTMLTextAreaElement>("textarea")!;
+  expect(area.value).toBe("Read the manual or run `old_cmd` today.");
+
+  // Formatted paste over prose selection "manual" -> [manual](https://example.com/manual)
+  const manualStart = area.value.indexOf("manual");
+  act(() => {
+    area.focus();
+    area.setSelectionRange(manualStart, manualStart + 6);
+    dispatchPaste(area, "https://example.com/manual");
+  });
+  expect(area.value).toBe("Read the [manual](https://example.com/manual) or run `old_cmd` today.");
+
+  // Edit the existing selection: select full [manual](https://example.com/manual), unwrap with Ctrl+K,
+  // then bold the preserved "manual" selection with Ctrl+B, and replace it.
+  const linkSpanStart = area.value.indexOf("[manual]");
+  const linkSpanEnd = linkSpanStart + "[manual](https://example.com/manual)".length;
+  act(() => {
+    area.setSelectionRange(linkSpanStart, linkSpanEnd);
+    area.dispatchEvent(new KeyboardEvent("keydown", { key: "k", ctrlKey: true, bubbles: true, cancelable: true }));
+  });
+  expect(area.value).toBe("Read the manual or run `old_cmd` today.");
+  expect([area.selectionStart, area.selectionEnd]).toEqual([manualStart, manualStart + 6]);
+
+  act(() => {
+    area.dispatchEvent(new KeyboardEvent("keydown", { key: "b", ctrlKey: true, bubbles: true, cancelable: true }));
+  });
+  expect(area.value).toBe("Read the **manual** or run `old_cmd` today.");
+  expect([area.selectionStart, area.selectionEnd]).toEqual([manualStart + 2, manualStart + 8]);
+
+  // Raw paste over inline code selection `old_cmd` -> replaces with raw URL (not [old_cmd](url))
+  const cmdStart = area.value.indexOf("old_cmd");
+  act(() => {
+    area.setSelectionRange(cmdStart, cmdStart + "old_cmd".length);
+    dispatchPaste(area, "https://cli.example.com");
+  });
+  expect(area.value).toBe("Read the **manual** or run `https://cli.example.com` today.");
+  act(() => {
+    area.dispatchEvent(new KeyboardEvent("keydown", { key: "Escape", bubbles: true, cancelable: true }));
+  });
+  expect(host.querySelector("textarea")).toBeNull();
+
+  // 2. Open fenced code block via #62's accessible "Edit block" button on hover and raw-paste over "old_host".
+  const codeBlock = host.querySelectorAll<HTMLElement>(".live-block")[1]!;
+  act(() => {
+    codeBlock.dispatchEvent(pointerEvent("pointerover", { bubbles: true, pointerType: "mouse", buttons: 0 }));
+    codeBlock.dispatchEvent(pointerEvent("pointermove", { bubbles: true, pointerType: "mouse", buttons: 0 }));
+  });
+  const codeEditBtn = codeBlock.querySelector<HTMLButtonElement>('button[aria-label="Edit block"]');
+  expect(codeEditBtn).not.toBeNull();
+  act(() => codeEditBtn!.click());
+  area = host.querySelector<HTMLTextAreaElement>("textarea")!;
+  const hostStart = area.value.indexOf("old_host");
+  act(() => {
+    area.focus();
+    area.setSelectionRange(hostStart, hostStart + "old_host".length);
+    dispatchPaste(area, "https://api.example.com/v2");
+  });
+  expect(area.value).toContain('endpoint = "https://api.example.com/v2"');
+  expect(area.value).not.toContain("[old_host]");
+
+  // Single-step Undo restores "old_host" AND its [hostStart, hostStart + 8] selection
+  act(() => {
+    area.dispatchEvent(new KeyboardEvent("keydown", { key: "z", ctrlKey: true, bubbles: true, cancelable: true }));
+  });
+  expect(area.value).toContain('endpoint = "old_host"');
+  expect([area.selectionStart, area.selectionEnd]).toEqual([hostStart, hostStart + "old_host".length]);
 
   act(() => root.unmount());
   host.remove();

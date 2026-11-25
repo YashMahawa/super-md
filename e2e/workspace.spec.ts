@@ -445,8 +445,15 @@ test("click-to-edit, media drops, titled links and portable source work together
   await expect(page.locator(".live-edit-button")).toHaveCount(0); await expect(page.locator(".svg-diagram")).toBeVisible();
   await page.getByRole("heading", { name: "Study notes" }).click(); await expect(page.getByRole("textbox", { name: "Edit Markdown block" })).toHaveCount(0);
   await page.getByRole("heading", { name: "Study notes" }).dblclick(); await expect(page.getByRole("textbox", { name: "Edit Markdown block" })).toContainText("# Study notes");
-  await page.evaluate(() => { const editor = document.querySelector('textarea')!; const clipboard = new DataTransfer(); clipboard.setData("text/plain", "https://youtu.be/dQw4w9WgXcQ"); editor.dispatchEvent(new ClipboardEvent("paste", { clipboardData: clipboard, bubbles: true, cancelable: true })); });
-  await expect(page.getByRole("dialog", { name: "Insert image or link" })).toBeVisible(); await expect(page.getByLabel("Link title")).toHaveValue("Understanding Fourier series");
+  await page.evaluate(() => { const editor = document.querySelector("textarea")!; editor.focus(); editor.setSelectionRange(2, 13); const clipboard = new DataTransfer(); clipboard.setData("text/plain", "https://youtu.be/dQw4w9WgXcQ"); editor.dispatchEvent(new ClipboardEvent("paste", { clipboardData: clipboard, bubbles: true, cancelable: true })); });
+  await expect(page.getByRole("dialog", { name: "Insert image or link" })).toHaveCount(0);
+  await expect(page.getByRole("textbox", { name: "Edit Markdown block" })).toHaveValue("# [Study notes](https://youtu.be/dQw4w9WgXcQ)");
+  await page.evaluate(() => window.supermdHistory?.("undo"));
+  await expect(page.getByRole("textbox", { name: "Edit Markdown block" })).toHaveValue("# Study notes");
+  await page.evaluate(() => { const editor = document.querySelector("textarea")!; editor.setSelectionRange(editor.value.length, editor.value.length); window.supermdMedia?.(); });
+  await expect(page.getByRole("dialog", { name: "Insert image or link" })).toBeVisible();
+  await page.getByLabel("Web address").fill("https://youtu.be/dQw4w9WgXcQ");
+  await expect(page.getByLabel("Link title")).toHaveValue("Understanding Fourier series");
   await page.getByLabel("Include the video thumbnail").check(); await page.getByRole("button", { name: "Insert link", exact: true }).click();
   await expect(page.getByRole("dialog")).toHaveCount(0);
   await expect.poll(() => calls.filter((call) => call.command === "document_changed").at(-1)?.args.content).toContain("[Understanding Fourier series](<https://youtu.be/dQw4w9WgXcQ>)");
