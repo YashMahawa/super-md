@@ -67,6 +67,10 @@ DEFAULTS.update(latexAutofix=False, typewriterScroll=False)
 DEFAULTS.update(shortcuts=default_shortcuts())
 DEFAULTS.update(agentAccessEnabled=False, cloudAgentEnabled=False)
 
+def _preserve_unchanged_assets(old_assets: dict[str, str], new_assets: dict[str, str]) -> dict[str, str]:
+    """Keep existing Python string identities for unchanged data URLs so ReaderAssetStore grants stay valid."""
+    return {k: old_assets[k] if old_assets.get(k) == v else v for k, v in new_assets.items()}
+
 def _normalize_mcp_roots(roots) -> list[str]:
     if not roots:
         return []
@@ -257,7 +261,7 @@ def _validate_local_tab_asset_path(raw_path, note_path: Path, extra_roots: list[
         return resolved
     raise ValueError(outside_message)
 
-SAMPLE = """# A place to think\n\nWrite in Markdown. Read without distractions.\n\n> [!tip] Start with your notes\n> Open any note or folder. No vault, no import process.\n\n## Learn by exploring\n\n$$E = mc^2$$\n\n> [!answer]- Why does this matter?\n> Tap the heading to reveal an answer, then hide it to test yourself.\n\n```smd-chart\n{\"title\":\"A changing wave\",\"series\":[{\"name\":\"Sine\",\"expression\":\"sin(a*x)\",\"color\":\"#386a57\"},{\"name\":\"Cosine\",\"expression\":\"cos(a*x)\",\"color\":\"#bc6750\"}],\"sliders\":[{\"name\":\"a\",\"min\":0.2,\"max\":3,\"value\":1}]}\n```\n\n## Matplotlib in three dimensions\n\nRun a Python cell to generate a 3D figure, then save it in your note or PDF.\n\n```python\nimport numpy as np\nimport matplotlib.pyplot as plt\nx, y = np.meshgrid(np.linspace(-2, 2, 32), np.linspace(-2, 2, 32))\nfig = plt.figure()\nax = fig.add_subplot(111, projection=\"3d\")\nax.plot_surface(x, y, x*x + y*y, cmap=\"viridis\")\n```\n\n[Back to exploring](#learn-by-exploring)\n"""
+SAMPLE = """# A place to think\n\nWrite in Markdown. Read without distractions.\n\n> [!tip] Start with your notes\n> Open any note or folder. No vault, no import process.\n\n## Learn by exploring\n\n$$E = mc^2$$\n\n> [!answer]- Why does this matter?\n> Tap the heading to reveal an answer, then hide it to test yourself.\n\n```smd-chart\n{\"title\":\"A changing wave\",\"series\":[{\"name\":\"Sine\",\"expression\":\"sin(a*x)\",\"color\":\"#386a57\"},{\"name\":\"Cosine\",\"expression\":\"cos(a*x)\",\"color\":\"#bc6750\"}],\"sliders\":[{\"name\":\"a\",\"min\":0.1,\"max\":3,\"step\":0.05,\"value\":1}]}\n```\n\n## Matplotlib in three dimensions\n\nRun a Python cell to generate a 3D figure, then save it in your note or PDF.\n\n```python\nimport numpy as np\nimport matplotlib.pyplot as plt\nx, y = np.meshgrid(np.linspace(-2, 2, 32), np.linspace(-2, 2, 32))\nfig = plt.figure()\nax = fig.add_subplot(111, projection=\"3d\")\nax.plot_surface(x, y, x*x + y*y, cmap=\"viridis\")\n```\n\n[Back to exploring](#learn-by-exploring)\n"""
 
 def public_address(url: str) -> str:
     """Resolve once and return a global IP for the URL's host, or refuse."""
@@ -1093,7 +1097,11 @@ class Studio(QObject):
                     return
                 if current["content"]!=expected:return
                 if content==expected and assets==current["assets"]:return
-                current.update(content=content,saved=content,assets=assets,saved_assets=dict(assets),assets_dirty=False,portable=portable,conflict=False)
+                old_assets=current["assets"]
+                assets_changed=assets!=old_assets
+                merged_assets=_preserve_unchanged_assets(old_assets,assets)
+                current.update(content=content,saved=content,assets=merged_assets,saved_assets=dict(merged_assets),assets_dirty=False,portable=portable,conflict=False)
+                if assets_changed:self.session.reader_assets.revoke_tab(self.window_id, id)
                 self.message="Reloaded externally updated note"
                 self._emit(load=id==self.active)
             self._submit(lambda path=path:open_note(Path(path)),finished,False)
@@ -3161,7 +3169,7 @@ class Studio(QObject):
                     changed_on_disk = bool(automatic)
                 else:
                     try:
-                        disk_content, disk_assets, _ = open_note(path)
+                        disk_content, disk_assets, _ = open_note(path, decode_assets=False)
                         changed_on_disk = disk_content != expected or (portable and disk_assets != expected_assets)
                     except Exception:
                         changed_on_disk = True
@@ -3170,7 +3178,7 @@ class Studio(QObject):
                         "_conflict": True,
                         "message": "Autosave paused: this file changed outside Super MD. Your edits remain in draft recovery; use Save as to keep both versions.",
                     }
-            if portable: write_portable(path,content,assets)
+            if portable: write_portable(path,content,assets,validated_assets=expected_assets)
             else:
                 materialize_assets(path.parent,assets)
                 atomic_write(path,content.encode())
@@ -5165,8 +5173,10 @@ class Studio(QObject):
                 captured = dict(tab)
                 captured["assets"] = dict(tab["assets"])
                 owner_id, tab_id = self.window_id, tab["id"]
+                embedded = captured["assets"].get(source)
+                cached = self.session.reader_assets.resolve_cached(owner_id, tab_id, source, embedded) if embedded is not None else None
                 def work():
-                    return resolve_source(captured, source)
+                    return cached if cached is not None else resolve_source(captured, source)
                 def finished(resolved, error):
                     current = next((item for item in self.tabs if item["id"] == tab_id), None)
                     if error:
@@ -5174,6 +5184,7 @@ class Studio(QObject):
                     elif current is None or not self.session.reader_asset_source_is_current(
                             owner_id, tab_id, source, _asset_identity(resolved.get("embedded_data")) if resolved.get("embedded_data") else 0,
                             resolved.get("path", "")):
+                        self.session.reader_assets.evict_source(owner_id, tab_id, source)
                         self.replied.emit(id, "null", "The note or image changed while it was being resolved")
                     else:
                         try:
@@ -5283,12 +5294,12 @@ class Studio(QObject):
                     target_path = Path(captured["path"]) if args.get("save") else Path(output)
                     if args.get("save") and not force_portable_overwrite and target_path.exists():
                         try:
-                            disk_content, disk_assets, _ = open_note(target_path)
+                            disk_content, disk_assets, _ = open_note(target_path, decode_assets=False)
                             if disk_content != captured["saved"] or disk_assets != captured.get("saved_assets", {}):
                                 return {"_conflict": True}
                         except Exception:
                             return {"_conflict": True}
-                    write_portable(target_path,args["content"],args["assets"])
+                    write_portable(target_path,args["content"],args["assets"],validated_assets=captured.get("saved_assets") if args.get("save") else None)
                     result_data = export_result(target_path)
                     try:
                         st = target_path.stat()
@@ -5399,10 +5410,14 @@ class Studio(QObject):
                     self.autosave_timer.start(900)
                     self._emit(False)
                 if command == "export_fmd_native" and args.get("save") and target:
+                    old_assets = target.get("assets", {})
+                    if old_assets != args["assets"]:
+                        self.session.reader_assets.revoke_tab(self.window_id, target["id"])
+                    merged_assets = _preserve_unchanged_assets(old_assets, args["assets"])
                     target.update(
                         saved=args["originalContent"],
-                        assets=args["assets"],
-                        saved_assets=dict(args["assets"]),
+                        assets=merged_assets,
+                        saved_assets=dict(merged_assets),
                         assets_dirty=False,
                         conflict=False,
                     )
@@ -5414,14 +5429,19 @@ class Studio(QObject):
                 elif command == "export_fmd_native" and save_as:
                     save_target = next((t for t in self.tabs if t["id"] == (save_as_tab or captured["id"])), target)
                     if save_target:
+                        old_assets = save_target.get("assets", {})
+                        path_changed = save_target.get("path") != save_as
+                        if old_assets != args["assets"] or path_changed:
+                            self.session.reader_assets.revoke_tab(self.window_id, save_target["id"])
+                        merged_assets = args["assets"] if path_changed else _preserve_unchanged_assets(old_assets, args["assets"])
                         new_content = args["content"] if save_target["content"] == args.get("originalContent", save_target["content"]) else save_target["content"]
                         save_target.update(
                             path=save_as,
                             name=Path(save_as).name,
                             content=new_content,
                             saved=args["content"],
-                            assets=args["assets"],
-                            saved_assets=dict(args["assets"]),
+                            assets=merged_assets,
+                            saved_assets=dict(merged_assets),
                             assets_dirty=False,
                             portable=True,
                             conflict=False,
