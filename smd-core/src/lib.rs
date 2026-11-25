@@ -3,6 +3,7 @@ pub mod portable;
 pub mod theme;
 pub mod pdf_assets;
 pub mod frontmatter;
+mod diagram;
 mod math_compatibility;
 mod step_grid;
 mod study;
@@ -50,6 +51,537 @@ impl PdfOptions {
 fn string(value: &str) -> String { serde_json::to_string(value).unwrap() }
 fn text(value: &str) -> String { format!("#text({})", string(value)) }
 
+fn fmt_num(value: f64) -> String {
+    if (value - value.round()).abs() < 1e-6 {
+        format!("{}", value.round() as i64)
+    } else {
+        format!("{value:.4}").trim_end_matches('0').trim_end_matches('.').to_string()
+    }
+}
+
+fn parse_typst_width(raw: &str) -> Option<String> {
+    let clean = raw.trim().trim_matches(['"', '\'']).trim().trim_end_matches(';').trim();
+    if clean.is_empty() {
+        return None;
+    }
+    let lower = clean.to_ascii_lowercase();
+    if let Some(num) = lower.strip_suffix('%') {
+        let v: f64 = num.trim().parse().ok()?;
+        return (v.is_finite() && v > 0.0).then(|| format!("{}%", fmt_num(v)));
+    }
+    if let Some(num) = lower.strip_suffix("px") {
+        let v: f64 = num.trim().parse().ok()?;
+        return (v.is_finite() && v > 0.0).then(|| format!("{}pt", fmt_num(v * 0.75)));
+    }
+    for unit in ["pt", "mm", "cm", "in"] {
+        if let Some(num) = lower.strip_suffix(unit) {
+            let v: f64 = num.trim().parse().ok()?;
+            return (v.is_finite() && v > 0.0).then(|| format!("{}{unit}", fmt_num(v)));
+        }
+    }
+    let v: f64 = lower.parse().ok()?;
+    (v.is_finite() && v > 0.0).then(|| format!("{}pt", fmt_num(v * 0.75)))
+}
+
+fn parse_typst_zoom(raw: &str) -> Option<String> {
+    let clean = raw.trim().trim_matches(['"', '\'']).trim().trim_end_matches(';').trim();
+    if clean.is_empty() {
+        return None;
+    }
+    let lower = clean.to_ascii_lowercase();
+    if let Some(num) = lower.strip_suffix('%') {
+        let v: f64 = num.trim().parse().ok()?;
+        return (v.is_finite() && v > 0.0).then(|| format!("{}%", fmt_num(v)));
+    }
+    let v: f64 = lower.parse().ok()?;
+    (v.is_finite() && v > 0.0).then(|| format!("{}%", fmt_num(v * 100.0)))
+}
+
+fn format_smd_image(key: &str, width: Option<&str>, zoom: Option<&str>) -> String {
+    match (width, zoom) {
+        (None, None) => format!("#smd-image({})", string(key)),
+        (Some(w), None) => format!("#smd-image({}, width: {w})", string(key)),
+        (None, Some(z)) => format!("#smd-image({}, zoom: {z})", string(key)),
+        (Some(w), Some(z)) => format!("#smd-image({}, width: {w}, zoom: {z})", string(key)),
+    }
+}
+
+pub(crate) fn strip_html_comments(input: &str) -> String {
+    let mut out = String::with_capacity(input.len());
+    let mut rest = input;
+    while let Some(start) = rest.find("<!--") {
+        out.push_str(&rest[..start]);
+        if let Some(end) = rest[start + 4..].find("-->") {
+            rest = &rest[start + 4 + end + 3..];
+        } else {
+            return out;
+        }
+    }
+    out.push_str(rest);
+    out
+}
+
+fn decode_html_attr(value: &str) -> String {
+    if !value.contains('&') {
+        return value.to_string();
+    }
+    let mut out = String::with_capacity(value.len());
+    let mut rest = value;
+    while let Some(amp) = rest.find('&') {
+        out.push_str(&rest[..amp]);
+        let after = &rest[amp + 1..];
+        if let Some(semi) = after.bytes().take(12).position(|b| b == b';') {
+            let entity = &after[..semi];
+            let decoded = if entity.eq_ignore_ascii_case("amp") {
+                Some('&')
+            } else if entity.eq_ignore_ascii_case("lt") {
+                Some('<')
+            } else if entity.eq_ignore_ascii_case("gt") {
+                Some('>')
+            } else if entity.eq_ignore_ascii_case("quot") {
+                Some('"')
+            } else if entity.eq_ignore_ascii_case("apos") {
+                Some('\'')
+            } else if let Some(hex) = entity.strip_prefix("#x").or_else(|| entity.strip_prefix("#X")) {
+                u32::from_str_radix(hex, 16).ok().filter(|&c| c > 0).and_then(char::from_u32)
+            } else if let Some(dec) = entity.strip_prefix('#') {
+                dec.parse::<u32>().ok().filter(|&c| c > 0).and_then(char::from_u32)
+            } else {
+                None
+            };
+            if let Some(ch) = decoded {
+                out.push(ch);
+                rest = &after[semi + 1..];
+                continue;
+            }
+        }
+        out.push('&');
+        rest = after;
+    }
+    out.push_str(rest);
+    out
+}
+
+pub(crate) struct ScannedHtmlTag<'a> {
+    pub(crate) name: &'a str,
+    pub(crate) closing: bool,
+    pub(crate) end: usize,
+    attrs: Vec<(&'a str, String)>,
+}
+
+impl<'a> ScannedHtmlTag<'a> {
+    pub(crate) fn attr(&self, attr_name: &str) -> Option<&str> {
+        self.attrs
+            .iter()
+            .find(|(k, _)| k.eq_ignore_ascii_case(attr_name))
+            .map(|(_, v)| v.as_str())
+    }
+}
+
+pub(crate) fn scan_html_tag(input: &str, start: usize) -> Option<ScannedHtmlTag<'_>> {
+    let bytes = input.as_bytes();
+    if bytes.get(start) != Some(&b'<') {
+        return None;
+    }
+    let mut pos = start + 1;
+    let mut closing = false;
+    if bytes.get(pos) == Some(&b'/') {
+        closing = true;
+        pos += 1;
+    }
+    if !bytes.get(pos).is_some_and(u8::is_ascii_alphabetic) {
+        return None;
+    }
+    let name_start = pos;
+    pos += 1;
+    while bytes.get(pos).is_some_and(|b| b.is_ascii_alphanumeric() || *b == b'-') {
+        pos += 1;
+    }
+    let name = &input[name_start..pos];
+    let mut attrs = Vec::new();
+    if closing {
+        while bytes.get(pos).is_some_and(u8::is_ascii_whitespace) {
+            pos += 1;
+        }
+        return (bytes.get(pos) == Some(&b'>')).then_some(ScannedHtmlTag {
+            name,
+            closing: true,
+            end: pos + 1,
+            attrs,
+        });
+    }
+    if let Some(&b) = bytes.get(pos) {
+        if !b.is_ascii_whitespace() && b != b'/' && b != b'>' {
+            return None;
+        }
+    }
+    while pos < bytes.len() {
+        while bytes.get(pos).is_some_and(u8::is_ascii_whitespace) {
+            pos += 1;
+        }
+        if pos >= bytes.len() {
+            return None;
+        }
+        if bytes[pos] == b'>' {
+            return Some(ScannedHtmlTag { name, closing: false, end: pos + 1, attrs });
+        }
+        if bytes[pos] == b'/' && bytes.get(pos + 1) == Some(&b'>') {
+            return Some(ScannedHtmlTag { name, closing: false, end: pos + 2, attrs });
+        }
+        if bytes[pos] == b'/' {
+            pos += 1;
+            continue;
+        }
+        let attr_start = pos;
+        while bytes.get(pos).is_some_and(|b| b.is_ascii_alphanumeric() || matches!(*b, b'_' | b'.' | b':' | b'-')) {
+            pos += 1;
+        }
+        if pos == attr_start || !matches!(bytes[attr_start], b'A'..=b'Z' | b'a'..=b'z' | b'_' | b':') {
+            return None;
+        }
+        let attr_name = &input[attr_start..pos];
+        while bytes.get(pos).is_some_and(u8::is_ascii_whitespace) {
+            pos += 1;
+        }
+        let attr_val = if bytes.get(pos) == Some(&b'=') {
+            pos += 1;
+            while bytes.get(pos).is_some_and(u8::is_ascii_whitespace) {
+                pos += 1;
+            }
+            let &first = bytes.get(pos)?;
+            if first == b'"' || first == b'\'' {
+                let val_start = pos + 1;
+                let rel_end = input[val_start..].find(first as char)?;
+                let raw_val = &input[val_start..val_start + rel_end];
+                pos = val_start + rel_end + 1;
+                decode_html_attr(raw_val)
+            } else {
+                let val_start = pos;
+                while let Some(&b) = bytes.get(pos) {
+                    if b.is_ascii_whitespace()
+                        || matches!(b, b'"' | b'\'' | b'=' | b'<' | b'>' | b'`')
+                        || (b == b'/' && bytes.get(pos + 1) == Some(&b'>'))
+                    {
+                        break;
+                    }
+                    pos += 1;
+                }
+                if pos == val_start {
+                    return None;
+                }
+                decode_html_attr(&input[val_start..pos])
+            }
+        } else {
+            String::new()
+        };
+        if !attrs.iter().any(|(k, _)| k.eq_ignore_ascii_case(attr_name)) {
+            attrs.push((attr_name, attr_val));
+        }
+    }
+    None
+}
+
+fn scan_html_tags<'a>(input: &'a str, tag_name: &str) -> Vec<ScannedHtmlTag<'a>> {
+    let mut tags = Vec::new();
+    let bytes = input.as_bytes();
+    let mut pos = 0;
+    while pos < bytes.len() {
+        let Some(rel_lt) = bytes[pos..].iter().position(|&b| b == b'<') else {
+            break;
+        };
+        let lt = pos + rel_lt;
+        if input[lt..].starts_with("<!--") {
+            if let Some(end) = input[lt + 4..].find("-->") {
+                pos = lt + 4 + end + 3;
+                continue;
+            }
+            break;
+        }
+        if let Some(tag) = scan_html_tag(input, lt) {
+            pos = tag.end;
+            if !tag.closing && tag.name.eq_ignore_ascii_case(tag_name) {
+                tags.push(tag);
+            }
+        } else {
+            pos = lt + 1;
+        }
+    }
+    tags
+}
+
+fn css_prop(style: &str, prop_name: &str) -> Option<String> {
+    let mut found = None;
+    for decl in style.split(';') {
+        let Some((name, val)) = decl.split_once(':') else { continue };
+        if name.trim().eq_ignore_ascii_case(prop_name) {
+            let clean = val.trim();
+            let clean = if clean.len() >= 10 && clean[clean.len() - 10..].eq_ignore_ascii_case("!important") {
+                clean[..clean.len() - 10].trim()
+            } else {
+                clean
+            };
+            if !clean.is_empty() {
+                found = Some(clean.to_string());
+            }
+        }
+    }
+    found
+}
+
+pub(crate) fn is_page_break_div(raw_html: &str) -> bool {
+    for tag in scan_html_tags(raw_html, "div") {
+        if let Some(style) = tag.attr("style") {
+            for (prop, expected) in [
+                ("page-break-after", "always"),
+                ("page-break-before", "always"),
+                ("break-after", "page"),
+                ("break-before", "page"),
+            ] {
+                if css_prop(style, prop).is_some_and(|v| v.eq_ignore_ascii_case(expected)) {
+                    return true;
+                }
+            }
+        }
+        if let Some(class) = tag.attr("class") {
+            if class
+                .split_whitespace()
+                .any(|t| t.eq_ignore_ascii_case("page-break") || t.eq_ignore_ascii_case("pagebreak"))
+            {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+pub(crate) struct HtmlImageSpec {
+    src: String,
+    width: Option<String>,
+    zoom: Option<String>,
+}
+
+pub(crate) fn parse_html_images(raw_html: &str) -> Vec<HtmlImageSpec> {
+    let mut out = Vec::new();
+    for tag in scan_html_tags(raw_html, "img") {
+        let Some(src) = tag.attr("src").map(str::trim).filter(|s| !s.is_empty()) else { continue };
+        let style = tag.attr("style").unwrap_or_default();
+        let width = css_prop(style, "width")
+            .and_then(|w| parse_typst_width(&w))
+            .or_else(|| tag.attr("width").and_then(parse_typst_width));
+        let zoom = css_prop(style, "zoom").and_then(|z| parse_typst_zoom(&z));
+        out.push(HtmlImageSpec { src: src.to_string(), width, zoom });
+    }
+    out
+}
+
+fn parse_brace_image_attrs(inner: &str) -> (Option<String>, Option<String>) {
+    let mut width = None;
+    let mut zoom = None;
+    let mut rest = inner.trim();
+    while !rest.is_empty() {
+        rest = rest.trim_start();
+        if rest.is_empty() {
+            break;
+        }
+        if let Some(eq_pos) = rest.find('=') {
+            let token_end = rest.find(char::is_whitespace).unwrap_or(rest.len());
+            if eq_pos < token_end {
+                let key = rest[..eq_pos].trim();
+                let after = rest[eq_pos + 1..].trim_start();
+                let (val, next_rest) = if let Some(q) = after.chars().next().filter(|c| *c == '"' || *c == '\'') {
+                    let body = &after[1..];
+                    if let Some(end) = body.find(q) {
+                        (&body[..end], &body[end + 1..])
+                    } else {
+                        (body, "")
+                    }
+                } else {
+                    let end = after.find(char::is_whitespace).unwrap_or(after.len());
+                    (&after[..end], &after[end..])
+                };
+                if key.eq_ignore_ascii_case("width") {
+                    width = parse_typst_width(val);
+                } else if key.eq_ignore_ascii_case("zoom") {
+                    zoom = parse_typst_zoom(val);
+                }
+                rest = next_rest;
+                continue;
+            }
+        }
+        let end = rest.find(char::is_whitespace).unwrap_or(rest.len());
+        rest = &rest[end..];
+    }
+    (width, zoom)
+}
+
+fn consume_image_brace_attrs<'a>(
+    events: &mut std::iter::Peekable<std::vec::IntoIter<Event<'a>>>,
+) -> (Option<String>, Option<String>, Option<String>) {
+    if !matches!(events.peek(), Some(Event::Text(first)) if first.starts_with('{')) {
+        return (None, None, None);
+    }
+    let mut combined = String::new();
+    let mut count = 0usize;
+    let mut close_idx = None;
+    for event in events.clone() {
+        let Event::Text(piece) = event else { break };
+        count += 1;
+        if let Some(pos) = piece.find('}') {
+            let prefix = &piece[..pos];
+            if prefix.contains('\n') || prefix.contains('\r') {
+                break;
+            }
+            close_idx = Some(combined.len() + pos);
+            combined.push_str(&piece);
+            break;
+        }
+        if piece.contains('\n') || piece.contains('\r') {
+            break;
+        }
+        combined.push_str(&piece);
+        if combined.len() > 512 {
+            break;
+        }
+    }
+    let Some(end) = close_idx else { return (None, None, None) };
+    let (width, zoom) = parse_brace_image_attrs(&combined[1..end]);
+    if width.is_none() && zoom.is_none() {
+        return (None, None, None);
+    }
+    for _ in 0..count {
+        events.next();
+    }
+    let remainder = (end + 1 < combined.len()).then(|| combined[end + 1..].to_string());
+    (width, zoom, remainder)
+}
+
+fn parse_positive_number_str(s: &str) -> Option<&str> {
+    let t = s.trim();
+    if t.is_empty() {
+        return None;
+    }
+    let (int_part, frac_part) = match t.split_once('.') {
+        Some((a, b)) => (a, Some(b)),
+        None => (t, None),
+    };
+    if int_part.is_empty() || !int_part.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    if let Some(frac) = frac_part {
+        if frac.is_empty() || !frac.bytes().all(|b| b.is_ascii_digit()) {
+            return None;
+        }
+    }
+    let val: f64 = t.parse().ok()?;
+    (val.is_finite() && val > 0.0).then_some(t)
+}
+
+fn parse_obsidian_pipe_spec<'a>(path: &'a str, spec: Option<&'a str>) -> (&'a str, Option<&'a str>) {
+    let Some(spec) = spec else { return (path, None) };
+    let (caption_opt, dim_candidate) = match spec.rsplit_once('|') {
+        Some((cap, last)) => (Some(cap.strip_suffix('\\').unwrap_or(cap).trim()), last.trim()),
+        None => (None, spec.trim()),
+    };
+    let width_part = match dim_candidate.split_once(['x', 'X']) {
+        Some((w, h)) => {
+            if parse_positive_number_str(h).is_none() {
+                return (spec, None);
+            }
+            w
+        }
+        None => dim_candidate,
+    };
+    if let Some(width) = parse_positive_number_str(width_part) {
+        let alt = caption_opt.filter(|c| !c.is_empty()).unwrap_or(path);
+        (alt, Some(width))
+    } else {
+        (spec, None)
+    }
+}
+
+fn normalize_obsidian_slice(slice: &str) -> String {
+    let mut out = String::with_capacity(slice.len());
+    let mut rest = slice;
+    while let Some(pos) = rest.find("![[") {
+        out.push_str(&rest[..pos]);
+        let after_open = &rest[pos + 3..];
+        if let Some(close) = after_open.find("]]") {
+            let inner = &after_open[..close];
+            if !inner.is_empty() && !inner.contains(['[', ']', '\r', '\n']) {
+                let (raw_path, spec) = match inner.split_once('|') {
+                    Some((p, s)) => (p, Some(s)),
+                    None => (inner, None),
+                };
+                let path = if spec.is_some() && raw_path.ends_with('\\') {
+                    &raw_path[..raw_path.len() - 1]
+                } else {
+                    raw_path
+                }
+                .trim();
+                if !path.is_empty() {
+                    let (alt_raw, width) = parse_obsidian_pipe_spec(path, spec);
+                    let alt = alt_raw.replace('\\', "\\\\").replace('[', "\\[").replace(']', "\\]");
+                    let escaped_path = path.replace('>', "%3E");
+                    if let Some(w) = width {
+                        out.push_str(&format!("![{alt}](<{escaped_path}>){{width={w}}}"));
+                    } else {
+                        out.push_str(&format!("![{alt}](<{escaped_path}>)"));
+                    }
+                    rest = &after_open[close + 2..];
+                    continue;
+                }
+            }
+        }
+        out.push_str("![[");
+        rest = after_open;
+    }
+    out.push_str(rest);
+    out
+}
+
+/// Rewrite prose Obsidian `![[...]]` embeds outside code, HTML, and math spans.
+fn normalize_obsidian_embeds(input: &str) -> String {
+    if !input.contains("![[") {
+        return input.to_string();
+    }
+    let mut masked: Vec<std::ops::Range<usize>> = Vec::new();
+    let mut in_code_block = false;
+    for (event, range) in Parser::new_ext(input, Options::ENABLE_MATH).into_offset_iter() {
+        match event {
+            Event::Start(Tag::CodeBlock(_)) => {
+                in_code_block = true;
+                masked.push(range);
+            }
+            Event::End(TagEnd::CodeBlock) => {
+                in_code_block = false;
+            }
+            Event::Code(_) | Event::Html(_) | Event::InlineHtml(_) | Event::InlineMath(_) | Event::DisplayMath(_)
+                if !in_code_block =>
+            {
+                masked.push(range);
+            }
+            _ => {}
+        }
+    }
+    masked.sort_by_key(|r| r.start);
+    let mut out = String::with_capacity(input.len());
+    let mut cursor = 0usize;
+    for range in masked {
+        if range.start > cursor {
+            out.push_str(&normalize_obsidian_slice(&input[cursor..range.start]));
+        }
+        if range.end > cursor {
+            let from = cursor.max(range.start);
+            out.push_str(&input[from..range.end]);
+            cursor = range.end;
+        }
+    }
+    if cursor < input.len() {
+        out.push_str(&normalize_obsidian_slice(&input[cursor..]));
+    }
+    out
+}
+
 pub fn image_sources(markdown: &str) -> Vec<String> {
     let body = frontmatter::strip_frontmatter(markdown);
     let stripped = strip_percent_comments(body);
@@ -60,6 +592,21 @@ pub fn image_sources(markdown: &str) -> Vec<String> {
     while let Some(event) = events.next() {
         match event {
             Event::Start(Tag::Image { dest_url, .. }) => sources.push(dest_url.to_string()),
+            Event::Start(Tag::HtmlBlock) => {
+                let mut html = String::new();
+                for event in events.by_ref() {
+                    if event == Event::End(TagEnd::HtmlBlock) { break; }
+                    if let Event::Html(piece) | Event::Text(piece) = event { html.push_str(&piece); }
+                }
+                for img in parse_html_images(&html) {
+                    sources.push(img.src);
+                }
+            }
+            Event::Html(html) | Event::InlineHtml(html) => {
+                for img in parse_html_images(&html) {
+                    sources.push(img.src);
+                }
+            }
             Event::Start(Tag::CodeBlock(CodeBlockKind::Fenced(lang))) if ["smd-steps", "smd-step-grid"].contains(&lang.as_ref()) => {
                 let mut code = String::new();
                 for event in events.by_ref() {
@@ -129,7 +676,7 @@ fn normalize_callouts_body(input: &str) -> String {
             depth-=1;output.push_str("> ".repeat(depth).trim_end());output.push('\n');
         } else { output.push_str(&"> ".repeat(depth));output.push_str(line);output.push('\n'); }
     }
-    normalize_prose_links(&output)
+    normalize_prose_links(&normalize_obsidian_embeds(&output))
 }
 
 fn encode_md_destination(value: &str) -> String {
@@ -195,19 +742,6 @@ fn format_wikilink_markdown(inner: &str) -> Option<String> {
     Some(format!("[{}]({}{})", escape_md_link_label(label), encode_md_destination(&dest_path), dest_frag))
 }
 
-fn format_image_wikilink_markdown(inner: &str) -> Option<String> {
-    if inner.is_empty() || inner.contains(['\r', '\n']) { return None; }
-    let (raw_left, raw_alias) = match inner.split_once('|') {
-        Some((left, alias)) => (left, Some(alias)),
-        None => (inner, None),
-    };
-    let cleaned_left = if raw_alias.is_some() && raw_left.ends_with('\\') { &raw_left[..raw_left.len() - 1] } else { raw_left };
-    let target = cleaned_left.trim();
-    if target.is_empty() { return None; }
-    let label = raw_alias.map(str::trim).filter(|s| !s.is_empty()).unwrap_or(target);
-    Some(format!("![{}]({})", escape_md_link_label(label), encode_md_destination(target)))
-}
-
 fn is_likely_link_destination(dest: &str) -> bool {
     let trimmed = dest.trim();
     if trimmed.is_empty() || !trimmed.contains([' ', '\t']) { return false; }
@@ -224,27 +758,6 @@ fn rewrite_prose_segment(segment: &str) -> String {
     let bytes = segment.as_bytes();
     let mut i = 0usize;
     while i < bytes.len() {
-        if i + 2 < bytes.len() && bytes[i] == b'!' && bytes[i + 1] == b'[' && bytes[i + 2] == b'[' && (i == 0 || bytes[i - 1] != b'\\') {
-            let start = i + 3;
-            let mut end = start;
-            let mut found = None;
-            while end < bytes.len() && !matches!(bytes[end], b'\r' | b'\n' | b'[') {
-                if bytes[end] == b']' {
-                    if end + 1 < bytes.len() && bytes[end + 1] == b']' && end > start {
-                        found = Some(end);
-                    }
-                    break;
-                }
-                end += 1;
-            }
-            if let Some(close_idx) = found {
-                if let Some(formatted) = format_image_wikilink_markdown(&segment[start..close_idx]) {
-                    after_wiki.push_str(&formatted);
-                    i = close_idx + 2;
-                    continue;
-                }
-            }
-        }
         if i + 1 < bytes.len() && bytes[i] == b'[' && bytes[i + 1] == b'[' && (i == 0 || !matches!(bytes[i - 1], b'!' | b'\\')) {
             let start = i + 2;
             let mut end = start;
@@ -417,6 +930,38 @@ enum RenderStop<'b> {
     Html(&'b str),
 }
 impl<'a> Renderer<'a> {
+    fn render_html(&self, html: &str, is_block: bool, out: &mut String) -> Result<()> {
+        let clean = strip_html_comments(html);
+        let trimmed = clean.trim();
+        if trimmed.len() >= 3 && trimmed[..3].eq_ignore_ascii_case("<br") {
+            out.push_str("#linebreak()");
+        } else if diagram::looks_like_svg(trimmed) {
+            let svg = diagram::validate_svg(trimmed)?;
+            out.push_str(&format!("\n#smd-image(bytes({}), format: \"svg\")\n\n", string(&svg)));
+        } else if is_page_break_div(html) {
+            out.push_str(if is_block { "\n#pagebreak()\n\n" } else { "#pagebreak()" });
+        } else {
+            let imgs = parse_html_images(html);
+            if imgs.is_empty() {
+                if !clean.is_empty() {
+                    out.push_str(&text(&clean));
+                }
+            } else {
+                for img in imgs {
+                    validate_asset_path(&img.src)?;
+                    if is_font_asset(&img.src) || !self.assets.contains_key(&img.src) {
+                        bail!("Image unavailable for PDF: {}", img.src);
+                    }
+                    out.push_str(&format_smd_image(&img.src, img.width.as_deref(), img.zoom.as_deref()));
+                    if is_block {
+                        out.push_str("\n\n");
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
     fn render(&mut self, end: Option<TagEnd>) -> Result<String> {
         self.render_until(end.map(RenderStop::Tag))
     }
@@ -440,26 +985,43 @@ impl<'a> Renderer<'a> {
                 Event::Rule => out.push_str("\n#line(length: 100%, stroke: .5pt + rgb(\"#d6dde5\"))\n"),
                 Event::TaskListMarker(checked) => out.push_str(if checked { "#text(\"☑ \u{a0}\")" } else { "#text(\"☐ \u{a0}\")" }),
                 Event::FootnoteReference(name) => out.push_str(&format!("#footnote[{}]", self.footnotes.get(name.as_ref()).cloned().unwrap_or_else(|| text(&name)))),
-                Event::Html(html) | Event::InlineHtml(html) => match html.as_ref() {
+                Event::Html(ref html) | Event::InlineHtml(ref html) => match html.as_ref() {
                     "<mark>" => out.push_str(&format!("#highlight(fill: smd-highlight, radius: 2pt, extent: 1pt)[{}]", self.render_until(Some(RenderStop::Html("</mark>")))?)),
                     "<u>" => out.push_str(&format!("#underline[{}]", self.render_until(Some(RenderStop::Html("</u>")))?)),
                     "<kbd>" => out.push_str(&format!("#box(fill: smd-code-fill, stroke: .5pt + smd-line, inset: (x: 3.5pt, y: 1pt), outset: (y: 1.5pt), radius: 2.5pt)[#text(font: (\"JetBrains Mono\", \"DejaVu Sans Mono\"), size: .86em)[{}]]", self.render_until(Some(RenderStop::Html("</kbd>")))?)),
                     "</mark>" | "</u>" | "</kbd>" => {}
-                    _ if html.trim().starts_with("<br") => out.push_str("#linebreak()"),
-                    _ => out.push_str(&text(&html)),
+                    _ => self.render_html(html, matches!(&event, Event::Html(_)), &mut out)?,
                 },
                 Event::Start(tag) => {
                     let close = tag.to_end();
                     match tag {
+                        Tag::HtmlBlock => {
+                            let mut html = String::new();
+                            while let Some(e) = self.events.next() {
+                                if e == Event::End(close) { break; }
+                                if let Event::Html(v) | Event::Text(v) = e { html.push_str(&v); }
+                            }
+                            self.render_html(&html, true, &mut out)?;
+                        },
                         Tag::CodeBlock(kind) => {
                             let mut code = String::new();
                             while let Some(e) = self.events.next() { if e == Event::End(close) { break; } if let Event::Text(v) = e { code.push_str(&v); } }
-                            let lang = match kind { CodeBlockKind::Fenced(v) => v.to_string(), _ => String::new() };
+                            let info = match kind { CodeBlockKind::Fenced(v) => v.to_string(), _ => String::new() };
+                            let lang_token = info.split_whitespace().next().unwrap_or("");
+                            let lang = lang_token.to_ascii_lowercase();
                             if ["smd-steps", "smd-step-grid"].contains(&lang.as_str()) {
                                 out.push_str(&step_grid::render(&code, self.assets)?);
                                 continue;
                             }
                             if ["mermaid", "smd-chart"].contains(&lang.as_str()) { bail!("Export preparation did not render a {lang} block"); }
+                            let raw_svg_fence = (lang.is_empty() || ["xml", "html", "svg+xml", "image/svg+xml"].contains(&lang.as_str()))
+                                && diagram::looks_like_svg(&code);
+                            if ["svg", "smd-tree", "smd-diagram"].contains(&lang.as_str()) || raw_svg_fence {
+                                let vector_kind = if matches!(lang.as_str(), "smd-tree" | "smd-diagram") { lang.as_str() } else { "svg" };
+                                let svg = diagram::render_vector_block(vector_kind, &code)?;
+                                out.push_str(&format!("\n#smd-image(bytes({}), format: \"svg\")\n\n", string(&svg)));
+                                continue;
+                            }
                             // Highlight the whole block once and fit individual
                             // synthesized lines inside a breakable container.
                             let code_arg = if code.is_empty() {
@@ -467,7 +1029,7 @@ impl<'a> Renderer<'a> {
                             } else {
                                 string(code.strip_suffix("\r\n").or_else(|| code.strip_suffix('\n')).unwrap_or(&code))
                             };
-                            let lang_arg = if lang.is_empty() { "none".into() } else { string(&lang) };
+                            let lang_arg = if lang_token.is_empty() { "none".into() } else { string(lang_token) };
                             out.push_str(&format!("\n#smd-code({code_arg}, lang: {lang_arg})\n\n"));
                         },
                         Tag::Image { dest_url, .. } => {
@@ -475,7 +1037,13 @@ impl<'a> Renderer<'a> {
                             let key = dest_url.to_string();
                             validate_asset_path(&key)?;
                             if is_font_asset(&key) || !self.assets.contains_key(&key) { bail!("Image unavailable for PDF: {key}"); }
-                            out.push_str(&format!("#smd-image({})", string(&key)));
+                            let (width, zoom, trailing) = consume_image_brace_attrs(&mut self.events);
+                            out.push_str(&format_smd_image(&key, width.as_deref(), zoom.as_deref()));
+                            if let Some(rem) = trailing {
+                                if !rem.is_empty() {
+                                    out.push_str(&text(&rem));
+                                }
+                            }
                         },
                         Tag::Table(columns) => {
                             let mut lengths = vec![0usize; columns.len()]; let mut counts = vec![0usize; columns.len()]; let mut column = 0; let mut length = 0;
@@ -528,6 +1096,29 @@ impl<'a> Renderer<'a> {
                             out.push_str(&format!("\n#block(width: 100%, breakable: true, fill: if smd-themed {{ smd-callout-fill }} else {{ color.mix((white, 94%), (rgb(\"{accent}\"), 6%)) }}, stroke: (left: 2pt + rgb(\"{accent}\")), inset: 10pt, radius: 4pt)[{body}]\n\n"));
                         },
                         _ => {
+                            if matches!(tag, Tag::Paragraph) {
+                                let mut plain_only = true;
+                                let mut raw_para = String::new();
+                                for e in self.events.clone().take_while(|e| !matches!(e, Event::End(TagEnd::Paragraph))) {
+                                    match e {
+                                        Event::Text(v) | Event::InlineHtml(v) => raw_para.push_str(&v),
+                                        Event::SoftBreak => raw_para.push('\n'),
+                                        _ => { plain_only = false; break; }
+                                    }
+                                }
+                                let trimmed = raw_para.trim();
+                                let is_quarto_break = trimmed
+                                    .strip_prefix("{{<")
+                                    .and_then(|s| s.strip_suffix(">}}"))
+                                    .is_some_and(|s| s.trim() == "pagebreak");
+                                if plain_only && (trimmed == "\\newpage" || trimmed == "\\pagebreak" || is_quarto_break) {
+                                    for e in self.events.by_ref() {
+                                        if e == Event::End(TagEnd::Paragraph) { break; }
+                                    }
+                                    out.push_str("#pagebreak()\n\n");
+                                    continue;
+                                }
+                            }
                             let heading = if matches!(tag, Tag::Heading { .. }) {
                                 let plain = self.events.clone().take_while(|e| !matches!(e, Event::End(TagEnd::Heading(_)))).filter_map(|e| match e { Event::Text(v) | Event::Code(v) | Event::InlineMath(v) => Some(v.to_string()), _ => None }).collect::<String>();
                                 let slug = heading_slug(&plain); let count = self.heading_counts.entry(slug.clone()).or_default();
