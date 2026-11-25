@@ -13,7 +13,11 @@ ColumnLayout {
     spacing: 12
 
     function noteStem(name) {
-        return (name || "").replace(/\.(markdown|smd|fmd|md|txt)$/i, "")
+        const raw = name || ""
+        const known = raw.replace(/\.(markdown|smd|fmd|md|txt)$/i, "")
+        if (known !== raw && known.length > 0) return known
+        const custom = raw.replace(/\.[A-Za-z][A-Za-z0-9]{0,15}$/, "")
+        return custom.length > 0 ? custom : raw
     }
 
     function parentPathOf(fullPath) {
@@ -76,13 +80,22 @@ ColumnLayout {
     function triggerNewFolderNote() { openCreateDialog("md", targetCreationFolder()) }
     function triggerNewSubfolder() { openCreateDialog("folder", targetCreationFolder()) }
 
+    function isInsideOpenFolder(candidatePath) {
+        if (!candidatePath || !viewState.folder) return false
+        const normFolder = viewState.folder.replace(/\\/g, "/").replace(/\/+$/, "")
+        const normCand = candidatePath.replace(/\\/g, "/")
+        if (Qt.platform.os === "windows")
+            return normCand.toLowerCase().startsWith((normFolder + "/").toLowerCase())
+        return normCand.startsWith(normFolder + "/")
+    }
+
     function triggerRenameSelectedOrActive() {
         if (viewState.folder && selectedPath && (viewState.files || []).some(item => item.path === selectedPath)) {
             openRenameFor(selectedPath, selectedName, selectedDirectory)
             return
         }
         const activeTab = (viewState.tabs || []).find(t => t.id === viewState.active)
-        if (activeTab && activeTab.path && viewState.folder && (activeTab.path.startsWith(viewState.folder + "/") || activeTab.path.startsWith(viewState.folder + "\\"))) {
+        if (activeTab && activeTab.path && root.isInsideOpenFolder(activeTab.path)) {
             openRenameFor(activeTab.path, activeTab.name, false)
             return
         }
@@ -155,8 +168,21 @@ ColumnLayout {
     TextField {
         id: filter
         objectName: "folderFilterField"
+        property string backendFilter: viewState.folderFilter || ""
         visible: !!viewState.folder
-        Layout.fillWidth: true; placeholderText: "Filter files"; selectByMouse: true
+        Layout.fillWidth: true
+        placeholderText: "Filter files"
+        selectByMouse: true
+        onTextChanged: {
+            if (text !== backendFilter)
+                studio.setFolderFilter(text)
+        }
+        onBackendFilterChanged: {
+            if (backendFilter === "" && text !== "")
+                text = ""
+            else if (!activeFocus && text !== backendFilter)
+                text = backendFilter
+        }
     }
 
     NoteContextMenu {
@@ -175,64 +201,100 @@ ColumnLayout {
         NoteMenuItem { objectName: "menuRenameEntry"; text: folderEntryMenu.targetIsDirectory ? "Rename folder" : "Rename note"; icon.source: "../icons/Rename.svg"; onTriggered: root.openRenameFor(folderEntryMenu.targetPath, folderEntryMenu.targetName, folderEntryMenu.targetIsDirectory) }
     }
 
-    ListView {
-        id: treeList
-        objectName: "folderTreeList"
-        Layout.fillWidth: true; Layout.fillHeight: true; clip: true
-        model: viewState.files
-        delegate: ItemDelegate {
-            id: fileEntry
-            objectName: "fileEntry"
-            required property var modelData
-            readonly property bool isSelected: root.selectedPath === modelData.path
-            width: ListView.view.width - 14
-            height: visible ? 40 : 0
-            visible: !filter.text || modelData.directory || modelData.name.toLowerCase().includes(filter.text.toLowerCase())
-            hoverEnabled: true
-            leftPadding: 10 + modelData.depth * 16; rightPadding: 34
-            text: (modelData.directory ? (modelData.expanded ? "▾ " : "▸ ") : "") + modelData.name
-            Accessible.name: modelData.name + (modelData.directory ? ", folder" : ", note")
+    Item {
+        Layout.fillWidth: true
+        Layout.fillHeight: true
 
-            contentItem: Text {
-                text: fileEntry.text; font: fileEntry.font; color: viewState.colors.text
-                elide: Text.ElideRight; verticalAlignment: Text.AlignVCenter
+        ListView {
+            id: folderFilesView
+            objectName: "folderFilesView"
+            anchors.fill: parent
+            visible: viewState.files.length > 0
+            clip: true
+            model: viewState.files
+            delegate: ItemDelegate {
+                id: fileEntry
+                objectName: "fileEntry"
+                required property var modelData
+                readonly property bool isSelected: root.selectedPath === modelData.path
+                width: ListView.view.width - 14
+                height: 40
+                hoverEnabled: true
+                leftPadding: 10 + modelData.depth * 16; rightPadding: 34
+                text: (modelData.directory ? (modelData.expanded ? "▾ " : "▸ ") : "") + modelData.name
+                Accessible.name: modelData.name + (modelData.directory ? ", folder" : ", note")
+
+                contentItem: Text {
+                    text: fileEntry.text; font: fileEntry.font; color: viewState.colors.text
+                    elide: Text.ElideRight; verticalAlignment: Text.AlignVCenter
+                }
+
+                background: Rectangle {
+                    radius: 12; antialiasing: true
+                    color: fileEntry.hovered || fileEntry.down || fileEntry.visualFocus || fileEntry.isSelected ? viewState.colors["surface-high"] : "transparent"
+                    border.width: fileEntry.visualFocus || fileEntry.isSelected ? 1 : 0
+                    border.color: viewState.colors.primary
+                }
+
+                onClicked: {
+                    root.selectedPath = modelData.path
+                    root.selectedName = modelData.name
+                    root.selectedDirectory = modelData.directory
+                    if (modelData.directory) {
+                        if (!((viewState.folderFilter || "").trim()))
+                            studio.toggleDirectory(modelData.path)
+                    } else {
+                        studio.openNote(modelData.path)
+                    }
+                }
+
+                TapHandler {
+                    acceptedButtons: Qt.RightButton
+                    onTapped: function(eventPoint) { root.openContextMenuFor(fileEntry, modelData.path, modelData.name, modelData.directory, eventPoint.position.x, eventPoint.position.y) }
+                }
+                Keys.onMenuPressed: root.openContextMenuFor(fileEntry, modelData.path, modelData.name, modelData.directory, fileEntry.width - 24, fileEntry.height)
+
+                ActionButton {
+                    objectName: "folderEntryMoreButton"
+                    visible: fileEntry.hovered || fileEntry.visualFocus || fileEntry.isSelected
+                    anchors.right: parent.right; anchors.rightMargin: 4; anchors.verticalCenter: parent.verticalCenter
+                    width: 28; height: 28; compact: true
+                    topPadding: 0; bottomPadding: 0; leftPadding: 0; rightPadding: 0
+                    glyph: "More"; icon.width: 16; icon.height: 16
+                    Accessible.name: "Actions for " + modelData.name; ToolTip.text: "Actions"
+                    onClicked: root.openContextMenuFor(fileEntry, modelData.path, modelData.name, modelData.directory, width, height)
+                }
+
+                Hint { requested: fileEntry.hovered; text: modelData.path }
             }
-
-            background: Rectangle {
-                radius: 12; antialiasing: true
-                color: fileEntry.hovered || fileEntry.down || fileEntry.visualFocus || fileEntry.isSelected ? viewState.colors["surface-high"] : "transparent"
-                border.width: fileEntry.visualFocus || fileEntry.isSelected ? 1 : 0
-                border.color: viewState.colors.primary
-            }
-
-            onClicked: {
-                root.selectedPath = modelData.path
-                root.selectedName = modelData.name
-                root.selectedDirectory = modelData.directory
-                if (modelData.directory) studio.toggleDirectory(modelData.path)
-                else studio.openNote(modelData.path)
-            }
-
-            TapHandler {
-                acceptedButtons: Qt.RightButton
-                onTapped: function(eventPoint) { root.openContextMenuFor(fileEntry, modelData.path, modelData.name, modelData.directory, eventPoint.position.x, eventPoint.position.y) }
-            }
-            Keys.onMenuPressed: root.openContextMenuFor(fileEntry, modelData.path, modelData.name, modelData.directory, fileEntry.width - 24, fileEntry.height)
-
-            ActionButton {
-                objectName: "folderEntryMoreButton"
-                visible: fileEntry.hovered || fileEntry.visualFocus || fileEntry.isSelected
-                anchors.right: parent.right; anchors.rightMargin: 4; anchors.verticalCenter: parent.verticalCenter
-                width: 28; height: 28; compact: true
-                topPadding: 0; bottomPadding: 0; leftPadding: 0; rightPadding: 0
-                glyph: "More"; icon.width: 16; icon.height: 16
-                Accessible.name: "Actions for " + modelData.name; ToolTip.text: "Actions"
-                onClicked: root.openContextMenuFor(fileEntry, modelData.path, modelData.name, modelData.directory, width, height)
-            }
-
-            Hint { requested: fileEntry.hovered; text: modelData.path }
+            ScrollBar.vertical: ExpressiveScrollBar { }
         }
-        ScrollBar.vertical: ExpressiveScrollBar { }
+
+        ColumnLayout {
+            objectName: "folderEmptyState"
+            anchors.centerIn: parent
+            width: parent.width - 16
+            spacing: 4
+            visible: !!viewState.folder && viewState.files.length === 0 && !viewState.folderSearching
+            Label {
+                objectName: "folderEmptyLabel"
+                Layout.fillWidth: true
+                horizontalAlignment: Text.AlignHCenter
+                wrapMode: Text.WordWrap
+                font.weight: Font.Medium
+                color: viewState.colors.text
+                text: (viewState.folderFilter || "").trim().length > 0 ? "No matching notes found" : "No notes in this folder"
+            }
+            Label {
+                visible: (viewState.folderFilter || "").trim().length > 0
+                Layout.fillWidth: true
+                horizontalAlignment: Text.AlignHCenter
+                wrapMode: Text.WordWrap
+                font.pixelSize: 12
+                color: viewState.colors.muted
+                text: "Try another filename or clear the filter."
+            }
+        }
     }
 
     AppDialog {

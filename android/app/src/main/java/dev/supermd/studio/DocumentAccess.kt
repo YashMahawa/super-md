@@ -37,10 +37,14 @@ internal fun sameDocument(left: Uri, right: Uri): Boolean {
     return first == runCatching { DocumentsContract.getDocumentId(right) }.getOrNull()
 }
 
+private val persistPermissionsLock = Any()
+
 internal class DocumentAccess(private val context: Context) {
     fun hasWriteGrant(uri: Uri) = uri.scheme == "content" && context.checkUriPermission(uri, Process.myPid(), Process.myUid(), Intent.FLAG_GRANT_WRITE_URI_PERMISSION) == PackageManager.PERMISSION_GRANTED
     fun persist(uri: Uri) {
-        if (uri.scheme == "content") persistDocumentGrants { context.contentResolver.takePersistableUriPermission(uri, it) }
+        if (uri.scheme == "content") synchronized(persistPermissionsLock) {
+            persistDocumentGrants { context.contentResolver.takePersistableUriPermission(uri, it) }
+        }
     }
 
     /** Reuse a user-granted containing tree; never manufacture access outside that tree. */
@@ -51,7 +55,8 @@ internal class DocumentAccess(private val context: Context) {
         fun granted(candidate: Uri, modes: Int) = context.checkUriPermission(candidate, Process.myPid(), Process.myUid(), modes) == PackageManager.PERMISSION_GRANTED
         if (granted(uri, read or write)) return uri
         val id = runCatching { DocumentsContract.getDocumentId(uri) }.getOrNull() ?: return uri
-        val candidates = context.contentResolver.persistedUriPermissions.mapNotNull { grant ->
+        val grants = synchronized(persistPermissionsLock) { context.contentResolver.persistedUriPermissions.toList() }
+        val candidates = grants.mapNotNull { grant ->
             if (!DocumentsContract.isTreeUri(grant.uri) || grant.uri.authority != uri.authority || !grant.isReadPermission || writing && !grant.isWritePermission) return@mapNotNull null
             val root = runCatching { DocumentsContract.getTreeDocumentId(grant.uri) }.getOrNull() ?: return@mapNotNull null
             val contained = id == root || id.startsWith(root.trimEnd('/') + "/") || root.endsWith(":") && id.startsWith(root)

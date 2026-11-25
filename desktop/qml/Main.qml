@@ -490,8 +490,7 @@ ApplicationWindow {
                         color: viewState.colors["surface-high"]
                         Rectangle { anchors.bottom: parent.bottom; width: parent.width; height: 1; color: viewState.colors.outline; opacity: .55 }
                     }
-                    RowLayout {
-                        anchors.fill: parent
+                    contentItem: RowLayout {
                         spacing: 10
                         ToolButton {
                             enabled: false

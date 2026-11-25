@@ -19,6 +19,7 @@ import java.io.File
 import java.io.FileNotFoundException
 import java.nio.file.Files
 import java.time.Duration
+import java.util.UUID
 import org.json.JSONObject
 import org.junit.After
 import org.junit.Assert.assertEquals
@@ -53,7 +54,7 @@ class FolderActionsTest {
     fun setUp() {
         app = RuntimeEnvironment.getApplication()
         rootDir = Files.createTempDirectory("android-folder-actions-test").toFile()
-        authority = "dev.supermd.test.tree.${System.nanoTime()}"
+        authority = "dev.supermd.test.tree.${UUID.randomUUID()}"
         provider = TreeTestDocumentsProvider(rootDir).also { it.attach(app, authority) }
         ShadowContentResolver.registerProviderInternal(authority, provider)
         treeUri = DocumentsContract.buildTreeDocumentUri(authority, "root")
@@ -91,6 +92,7 @@ class FolderActionsTest {
             File(app.filesDir, "workspaces/$key.json").delete()
             File(app.filesDir, "workspaces/$key").deleteRecursively()
             File(app.filesDir, "deleted-drafts/$key").deleteRecursively()
+            app.deleteSharedPreferences("studio-window-$key")
         }
     }
 
@@ -147,7 +149,9 @@ class FolderActionsTest {
         val secondWindow = newModel()
         mainWindow.setFolder(treeUri)
         secondWindow.setFolder(treeUri)
-        await { mainWindow.state.value.folder != null && secondWindow.state.value.folder != null }
+        await(debugInfo = { "setFolder: main=${mainWindow.state.value.folder}/${mainWindow.state.value.error} sec=${secondWindow.state.value.folder}/${secondWindow.state.value.error}" }) {
+            mainWindow.state.value.folder != null && secondWindow.state.value.folder != null
+        }
 
         val openUri = treeDocUri("root/Course/Week1.md")
         val closedUri = treeDocUri("root/Course/Week2.md")
@@ -248,7 +252,7 @@ class FolderActionsTest {
     fun folderRelativePersistsAcrossWorkspaceRestoreAndNavigatesUpCleanly() {
         File(rootDir, "Sem1/Unit2").mkdirs()
         File(rootDir, "Sem1/Unit2/Notes.md").writeText("# Unit 2\n")
-        val key = "folder-persist-${System.nanoTime()}".also(workspaceKeys::add)
+        val key = "folder-persist-${UUID.randomUUID()}".also(workspaceKeys::add)
         val first = newModel(key)
         first.setFolder(treeUri)
         await { first.state.value.folder == treeUri.toString() }
@@ -264,12 +268,129 @@ class FolderActionsTest {
         assertFalse(restored.navigateFolderUp())
     }
 
+    @Test
+    fun existingExtensionsAndDottedNoteTitlesPreservedAcrossFolderAndTabRename() {
+        val cases = listOf(
+            Triple("1.2 Linear Algebra.md", "md", "1.2 Linear Algebra"),
+            Triple("2.4 Eigenvalues.markdown", "markdown", "2.4 Eigenvalues"),
+            Triple("3.1 Bundle.smd", "smd", "3.1 Bundle"),
+            Triple("3.2 Legacy.fmd", "fmd", "3.2 Legacy"),
+            Triple("4.1 Plain Notes.txt", "txt", "4.1 Plain Notes"),
+            Triple("4.2 UPPER.TXT", "TXT", "4.2 UPPER"),
+            Triple("5.1 Outline.org", "org", "5.1 Outline"),
+            Triple("README", "", "README"),
+            Triple("Section 1.2", "", "Section 1.2"),
+            Triple("1.2 Linear Algebra", "", "1.2 Linear Algebra"),
+        )
+        for ((filename, expectedExt, expectedStem) in cases) {
+            assertEquals("ext for $filename", expectedExt, noteExtension(filename))
+            assertEquals("stem for $filename", expectedStem, noteStem(filename))
+        }
+
+        File(rootDir, "1.2 Linear Algebra.txt").writeText("Linear algebra text\n")
+        File(rootDir, "2.4 Eigenvalues.markdown").writeText("# Eigenvalues\n")
+        File(rootDir, "3.1 Legacy.fmd").writeText("# Legacy\n")
+        File(rootDir, "4.0 Notes.TXT").writeText("Uppercase extension\n")
+        File(rootDir, "Section 1.2").writeText("Extensionless dotted note\n")
+
+        val model = newModel()
+        model.setFolder(treeUri)
+        await { model.state.value.files.any { it.name == "1.2 Linear Algebra.txt" } }
+
+        // Open .txt dotted note and rename via tab rename without supplying extension
+        val txtUri = treeDocUri("root/1.2 Linear Algebra.txt").also(::grantReadWrite)
+        model.open(txtUri, "1.2 Linear Algebra.txt")
+        await { model.state.value.active.uri == txtUri.toString() }
+        model.rename(model.state.value.active.id, "1.3 Vector Spaces")
+        await(debugInfo = { "txtRename: err=${model.state.value.error} active=${model.state.value.active.name}" }) {
+            File(rootDir, "1.3 Vector Spaces.txt").isFile && model.state.value.active.name == "1.3 Vector Spaces.txt"
+        }
+
+        // Rename .markdown, .fmd, and .TXT entries via folder drawer rename to new dotted titles
+        val mdUri = treeDocUri("root/2.4 Eigenvalues.markdown").also(::grantReadWrite)
+        model.renameFolderEntry(mdUri, "2.4 Eigenvalues.markdown", isDirectory = false, requested = "2.5 Eigenvectors")
+        await(debugInfo = { "markdownRename: err=${model.state.value.error}" }) {
+            File(rootDir, "2.5 Eigenvectors.markdown").isFile &&
+                model.state.value.files.any { it.name == "2.5 Eigenvectors.markdown" }
+        }
+
+        val fmdUri = treeDocUri("root/3.1 Legacy.fmd").also(::grantReadWrite)
+        model.renameFolderEntry(fmdUri, "3.1 Legacy.fmd", isDirectory = false, requested = "3.2 Archive")
+        await(debugInfo = { "fmdRename: err=${model.state.value.error}" }) {
+            File(rootDir, "3.2 Archive.fmd").isFile &&
+                model.state.value.files.any { it.name == "3.2 Archive.fmd" }
+        }
+
+        val upperTxtUri = treeDocUri("root/4.0 Notes.TXT").also(::grantReadWrite)
+        model.renameFolderEntry(upperTxtUri, "4.0 Notes.TXT", isDirectory = false, requested = "4.1 Summary")
+        await(debugInfo = { "upperTxtRename: err=${model.state.value.error}" }) {
+            File(rootDir, "4.1 Summary.TXT").isFile &&
+                model.state.value.files.any { it.name == "4.1 Summary.TXT" }
+        }
+
+        // Open extensionless dotted note and rename without appending a bogus '.2' suffix
+        val extlessUri = treeDocUri("root/Section 1.2").also(::grantReadWrite)
+        model.open(extlessUri, "Section 1.2")
+        await { model.state.value.active.uri == extlessUri.toString() }
+        model.rename(model.state.value.active.id, "Section 1.3")
+        await(debugInfo = { "extlessRename: err=${model.state.value.error} active=${model.state.value.active.name}" }) {
+            File(rootDir, "Section 1.3").isFile && model.state.value.active.name == "Section 1.3"
+        }
+    }
+
+    @Test
+    fun restoredSubfolderParentNavigationAndExternalRefreshSyncWithCreateAndRename() {
+        val algebraDir = File(rootDir, "Sem1/Math/Algebra").apply { mkdirs() }
+        val basisFile = File(algebraDir, "1.2 Basis.txt").apply { writeText("Initial basis\n") }
+
+        val key = "refresh-parent-nav-${UUID.randomUUID()}".also(workspaceKeys::add)
+        val initial = newModel(key)
+        initial.setFolder(treeUri)
+        await { initial.state.value.folder == treeUri.toString() }
+        initial.listFolder(treeUri, "Sem1/Math/Algebra")
+        await { initial.state.value.folderRelative == "Sem1/Math/Algebra" && initial.state.value.files.any { it.name == "1.2 Basis.txt" } }
+
+        val restored = newModel(key)
+        await { restored.state.value.folderRelative == "Sem1/Math/Algebra" && restored.state.value.files.any { it.name == "1.2 Basis.txt" } }
+
+        val basisUri = treeDocUri("root/Sem1/Math/Algebra/1.2 Basis.txt").also(::grantReadWrite)
+        restored.open(basisUri, "Sem1/Math/Algebra/1.2 Basis.txt")
+        await { restored.state.value.active.uri == basisUri.toString() }
+
+        // External file update + external sibling creation sync cleanly while preserving nested folderRelative
+        basisFile.writeText("Externally updated basis\n")
+        File(algebraDir, "1.3 Dimension.markdown").writeText("# Dimension\n")
+        restored.refreshExternal()
+        restored.refreshMetadata()
+        await(debugInfo = { "refreshSync: content=${restored.state.value.active.content} files=${restored.state.value.files.map { it.name }}" }) {
+            restored.state.value.active.content == "Externally updated basis\n" &&
+                restored.state.value.folderRelative == "Sem1/Math/Algebra" &&
+                restored.state.value.files.any { it.name == "1.3 Dimension.markdown" }
+        }
+
+        // Rename ancestor folder Sem1/Math -> Sem1/PureMath while inside Sem1/Math/Algebra, then navigate up step-by-step
+        val mathUri = treeDocUri("root/Sem1/Math").also(::grantReadWrite)
+        restored.renameFolderEntry(mathUri, "Sem1/Math", isDirectory = true, requested = "PureMath")
+        await(debugInfo = { "ancestorRename: rel=${restored.state.value.folderRelative} err=${restored.state.value.error}" }) {
+            restored.state.value.folderRelative == "Sem1/PureMath/Algebra" &&
+                restored.state.value.active.relative == "Sem1/PureMath/Algebra/1.2 Basis.txt"
+        }
+
+        assertTrue(restored.navigateFolderUp())
+        await { restored.state.value.folderRelative == "Sem1/PureMath" }
+        assertTrue(restored.navigateFolderUp())
+        await { restored.state.value.folderRelative == "Sem1" }
+        assertTrue(restored.navigateFolderUp())
+        await { restored.state.value.folderRelative == "" }
+        assertFalse(restored.navigateFolderUp())
+    }
+
     private fun newModel(explicitKey: String? = null): StudioViewModel {
         val store = ViewModelStore().also(viewModels::add)
-        val key = explicitKey ?: "folder-actions-${System.nanoTime()}".also(workspaceKeys::add)
+        val key = explicitKey ?: "folder-actions-${UUID.randomUUID()}".also(workspaceKeys::add)
         val model = StudioViewModel(app, key)
         model.readerFlushRequester = { true }
-        store.put("model", model)
+        store.put("model-${UUID.randomUUID()}", model)
         return model
     }
 
@@ -293,8 +414,8 @@ class FolderActionsTest {
     }
 
     private fun await(debugInfo: () -> String = { "" }, predicate: () -> Boolean) {
-        val deadline = System.nanoTime() + 5_000_000_000L
-        while (System.nanoTime() < deadline) {
+        val deadline = System.currentTimeMillis() + 5_000L
+        while (System.currentTimeMillis() < deadline) {
             shadowOf(Looper.getMainLooper()).idleFor(Duration.ofMillis(20))
             if (predicate()) return
             Thread.sleep(10)

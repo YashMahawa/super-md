@@ -9,26 +9,42 @@ private val KNOWN_EXPORT_FORMATS = setOf("md", "markdown", "txt", "smd", "fmd", 
 
 // --- Naming & relative path helpers ---
 
-internal fun noteStem(name: String): String {
+internal fun noteExtension(name: String): String {
     val leaf = name.substringAfterLast('/').substringAfterLast('\\')
     val lower = leaf.lowercase()
     for (suffix in KNOWN_NOTE_SUFFIXES) {
         if (leaf.length > suffix.length && lower.endsWith(suffix)) {
-            return leaf.dropLast(suffix.length)
+            return leaf.substring(leaf.length - suffix.length + 1)
         }
     }
     val dot = leaf.lastIndexOf('.')
-    return if (dot > 0) leaf.substring(0, dot) else leaf
+    if (dot > 0) {
+        val rawExt = leaf.substring(dot + 1)
+        if (rawExt.length in 1..16 && rawExt[0].code < 128 && rawExt[0].isLetter() && rawExt.all { it.code < 128 && it.isLetterOrDigit() }) {
+            return rawExt
+        }
+    }
+    return ""
+}
+
+internal fun noteStem(name: String): String {
+    val leaf = name.substringAfterLast('/').substringAfterLast('\\')
+    val ext = noteExtension(leaf)
+    return if (ext.isNotEmpty() && leaf.length > ext.length + 1) {
+        leaf.dropLast(ext.length + 1)
+    } else {
+        leaf
+    }
 }
 
 internal fun isSupportedFolderNoteFile(name: String): Boolean =
     !name.startsWith('.') && '.' in name && name.substringAfterLast('.', "").lowercase() in FOLDER_NOTE_EXTENSIONS
 
 internal fun normalizeRelativePath(relative: String?): String =
-    relative.orEmpty().trim('/').split('/').filter { it.isNotEmpty() }.joinToString("/")
+    normalizeFolderRelative(relative.orEmpty())
 
 internal fun parentRelativePath(relative: String): String =
-    normalizeRelativePath(relative).substringBeforeLast('/', "")
+    parentFolderRelative(relative)
 
 internal fun childRelativePath(parentRelative: String, name: String): String {
     val parent = normalizeRelativePath(parentRelative)
@@ -73,7 +89,7 @@ internal fun validateFolderEntryName(
     require(trimmed.length <= 240) { "Choose a shorter name" }
     if (isDirectory) return trimmed
 
-    val rawExt = currentExtension.trimStart('.').lowercase()
+    val rawExt = currentExtension.trimStart('.')
     if (hasSavedTarget && rawExt.isEmpty()) {
         val dot = trimmed.lastIndexOf('.')
         if (dot > 0) {
@@ -86,6 +102,7 @@ internal fun validateFolderEntryName(
     }
 
     val expected = rawExt.ifEmpty { "md" }
+    val expectedLower = expected.lowercase()
     val dot = trimmed.lastIndexOf('.')
     if (dot < 0) return "$trimmed.$expected"
     val stem = trimmed.substring(0, dot)
@@ -97,7 +114,7 @@ internal fun validateFolderEntryName(
         }
         return "$stem.$expected"
     }
-    require(supplied.lowercase() !in (KNOWN_EXPORT_FORMATS - expected)) {
+    require(supplied.lowercase() !in (KNOWN_EXPORT_FORMATS - expectedLower)) {
         "Rename keeps the .$expected format. Use Export to change formats."
     }
     return "$trimmed.$expected"

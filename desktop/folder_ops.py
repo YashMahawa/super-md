@@ -10,15 +10,26 @@ KNOWN_FORMAT_SUFFIXES = frozenset({".md", ".markdown", ".txt", ".smd", ".fmd", "
 _WINDOWS_PATH_RE = re.compile(r"^([a-zA-Z]:[\\/]|\\\\)")
 
 
-def note_stem(name: str) -> str:
-    """Strip a known note suffix without truncating dotted stems such as '1.2 Linear Algebra.md'."""
-    leaf = Path(str(name or "")).name
+def note_extension(name: str) -> str:
+    """Return a note's extension (with leading dot), ignoring dotted titles such as 'Section 1.2'."""
+    leaf = _pure_path(str(name or "")).name
     lower = leaf.lower()
     for suffix in NOTE_SUFFIXES:
         if len(leaf) > len(suffix) and lower.endswith(suffix):
-            return leaf[: -len(suffix)]
-    suffix = Path(leaf).suffix
-    return leaf[: -len(suffix)] if suffix and len(leaf) > len(suffix) else leaf
+            return leaf[-len(suffix):]
+    dot = leaf.rfind(".")
+    if dot > 0:
+        raw_ext = leaf[dot + 1:]
+        if 1 <= len(raw_ext) <= 16 and raw_ext[0].isascii() and raw_ext[0].isalpha() and raw_ext.isascii() and raw_ext.isalnum():
+            return "." + raw_ext
+    return ""
+
+
+def note_stem(name: str) -> str:
+    """Strip a known note suffix without truncating dotted stems such as '1.2 Linear Algebra.md'."""
+    leaf = _pure_path(str(name or "")).name
+    ext = note_extension(leaf)
+    return leaf[: -len(ext)] if ext and len(leaf) > len(ext) else leaf
 
 
 def validate_entry_name(

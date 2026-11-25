@@ -21,6 +21,7 @@ from folder_ops import (
     canonical_path_str,
     normalize_path_key,
     normalized_relpath,
+    note_extension,
     note_stem,
     resolve_within_open_folder,
     same_path,
@@ -60,6 +61,7 @@ class FolderActionsDesktopTest(unittest.TestCase):
         for win in self.windows:
             win.stop()
             win.pool.shutdown(wait=True, cancel_futures=True)
+            win._search_pool.shutdown(wait=True, cancel_futures=True)
         self.session.writes.shutdown(wait=True)
         self.app.processEvents()
         shutil.rmtree(self.temp_dir, ignore_errors=True)
@@ -379,6 +381,191 @@ ApplicationWindow {
                 folder_ops.normalize_path_key(remapped),
                 "c:/users/runner/notes/archive/sprint backlog.md",
             )
+
+    def test_existing_extensions_and_dotted_note_titles_across_rename_and_export(self):
+        cases = [
+            ("1.2 Linear Algebra.md", ".md", "1.2 Linear Algebra"),
+            ("2.4 Eigenvalues.markdown", ".markdown", "2.4 Eigenvalues"),
+            ("3.1 Bundle.smd", ".smd", "3.1 Bundle"),
+            ("3.2 Legacy.fmd", ".fmd", "3.2 Legacy"),
+            ("4.1 Plain Notes.txt", ".txt", "4.1 Plain Notes"),
+            ("4.2 UPPER.TXT", ".TXT", "4.2 UPPER"),
+            ("5.1 Outline.org", ".org", "5.1 Outline"),
+            ("README", "", "README"),
+            ("Section 1.2", "", "Section 1.2"),
+            ("1.2 Linear Algebra", "", "1.2 Linear Algebra"),
+        ]
+        for filename, expected_ext, expected_stem in cases:
+            self.assertEqual(note_extension(filename), expected_ext, filename)
+            self.assertEqual(note_stem(filename), expected_stem, filename)
+
+        txt_file = self.open_root / "1.2 Linear Algebra.txt"
+        markdown_file = self.open_root / "2.4 Eigenvalues.markdown"
+        fmd_file = self.open_root / "3.1 Legacy.fmd"
+        upper_txt_file = self.open_root / "4.0 Notes.TXT"
+        extensionless_dotted = self.open_root / "Section 1.2"
+        txt_file.write_text("Linear algebra text\n", encoding="utf-8")
+        markdown_file.write_text("# Eigenvalues\n", encoding="utf-8")
+        fmd_file.write_text("# Legacy\n", encoding="utf-8")
+        upper_txt_file.write_text("Uppercase extension\n", encoding="utf-8")
+        extensionless_dotted.write_text("Extensionless dotted note\n", encoding="utf-8")
+
+        self.studio.openFolder(str(self.open_root))
+        self._wait_for(lambda: any(f["name"] == "1.2 Linear Algebra.txt" for f in self.studio.files))
+
+        self.studio.openNote(str(txt_file))
+        self._wait_for(lambda: same_path(self.studio._current()["path"], txt_file))
+        pdf_default = Path(QUrl(self.studio.defaultExportLocation("pdf")).toLocalFile())
+        self.assertEqual(pdf_default.name, "1.2 Linear Algebra.pdf")
+
+        # Rename open .txt note via renameNote to another dotted stem without typing .txt
+        self.studio.renameNote(self.studio.active, "1.3 Vector Spaces")
+        renamed_txt = self.open_root / "1.3 Vector Spaces.txt"
+        self._wait_for(lambda: self.studio.busy == 0 and renamed_txt.is_file() and self.studio._current()["name"] == "1.3 Vector Spaces.txt")
+
+        # Rename .markdown, .fmd, and .TXT entries via renameEntry to dotted stems
+        self.studio.renameEntry(str(markdown_file), "2.5 Eigenvectors")
+        self._wait_for(lambda: self.studio.busy == 0 and (self.open_root / "2.5 Eigenvectors.markdown").is_file())
+        self.studio.renameEntry(str(fmd_file), "3.2 Archive")
+        self._wait_for(lambda: self.studio.busy == 0 and (self.open_root / "3.2 Archive.fmd").is_file())
+        self.studio.renameEntry(str(upper_txt_file), "4.1 Summary")
+        self._wait_for(lambda: self.studio.busy == 0 and (self.open_root / "4.1 Summary.TXT").is_file())
+
+        # Rename saved extensionless dotted title without appending a bogus '.2' suffix
+        self.studio.openNote(str(extensionless_dotted))
+        self._wait_for(lambda: same_path(self.studio._current()["path"], extensionless_dotted))
+        self.studio.renameNote(self.studio.active, "Section 1.3")
+        renamed_extensionless = self.open_root / "Section 1.3"
+        self._wait_for(
+            lambda: self.studio.busy == 0
+            and renamed_extensionless.is_file()
+            and self.studio._current()["name"] == "Section 1.3"
+        )
+
+    def test_restored_workspace_folder_and_recursive_filtering_work_with_create_and_rename(self):
+        algebra_dir = self.open_root / "Courses" / "Algebra"
+        calculus_dir = self.open_root / "Courses" / "Calculus"
+        algebra_dir.mkdir(parents=True)
+        calculus_dir.mkdir(parents=True)
+        (algebra_dir / "1.2 Basis.txt").write_text("Basis vectors\n", encoding="utf-8")
+        (calculus_dir / "2.1 Limits.markdown").write_text("# Limits\n", encoding="utf-8")
+
+        self.session.settings["startup"] = "restore"
+        self.studio._preferences()
+        self.studio.openFolder(str(self.open_root))
+        self._wait_for(lambda: any(item["name"] == "Courses" for item in self.studio.files))
+        self.studio.toggleDirectory(str(self.open_root / "Courses"))
+        self._wait_for(lambda: any(item["name"] == "Algebra" for item in self.studio.files))
+        self.studio._recover()
+        self.session.writes.flush()
+
+        restored_session = Session(True, data=self.studio.data)
+        restored_win = None
+        engine = None
+        host_win = None
+        try:
+            restored_win = QuietStudio(True, restored_session)
+            self._wait_for(lambda: any(item["name"] == "Algebra" for item in restored_win.files))
+            self.assertTrue(same_path(restored_win.folder, self.open_root))
+            # Algebra is collapsed initially on restore while Courses is expanded
+            self.assertNotIn(self._norm(algebra_dir), self._norm_list(restored_win.expanded))
+
+            qml_dir = (Path(__file__).parent / "qml").resolve()
+            engine = QQmlEngine()
+            engine.rootContext().setContextProperty("studio", restored_win)
+            component = QQmlComponent(engine)
+            wrapper_qml = """
+import QtQuick
+import QtQuick.Controls
+import QtQuick.Controls.Material
+ApplicationWindow {
+    id: window
+    width: 360
+    height: 640
+    visible: true
+    property var viewState: JSON.parse(studio.snapshot)
+    property var shortcutLabels: JSON.parse(studio.shortcutLabelsJson || "{}")
+    property int contextMenuCount: 0
+    property int modalDialogCount: 0
+    Material.theme: viewState.dark ? Material.Dark : Material.Light
+    Material.primary: viewState.colors.primary
+    Material.accent: viewState.colors.primary
+    Material.background: viewState.colors.surface
+    Material.foreground: viewState.colors.text
+    FolderSidebar {
+        id: sidebar
+        objectName: "folderSidebar"
+        anchors.fill: parent
+        anchors.margins: 12
+        viewState: window.viewState
+        shortcutLabels: window.shortcutLabels
+    }
+}
+"""
+            component.setData(wrapper_qml.encode("utf-8"), QUrl.fromLocalFile(str(qml_dir / "folder-restore-filter-test.qml")))
+            self.assertFalse(component.isError(), str(component.errors()))
+            host_win = component.create()
+            self.assertIsNotNone(host_win, str(component.errors()))
+            QTest.qWait(40)
+
+            filter_field = host_win.findChild(QObject, "folderFilterField")
+            empty_state = host_win.findChild(QObject, "folderEmptyState")
+            empty_label = host_win.findChild(QObject, "folderEmptyLabel")
+            self.assertIsNotNone(filter_field)
+            self.assertIsNotNone(empty_state)
+
+            # Recursive filter searches collapsed Algebra subfolder without mutating expanded state
+            expanded_before = set(self._norm_list(restored_win.expanded))
+            filter_field.setProperty("text", "1.2")
+            self._wait_for(
+                lambda: not restored_win._folder_searching
+                and not restored_win.filter_timer.isActive()
+                and [item["name"] for item in restored_win.files] == ["Courses", "Algebra", "1.2 Basis.txt"]
+            )
+            self.assertEqual(set(self._norm_list(restored_win.expanded)), expanded_before)
+
+            # Renaming the matched file while filtered refreshes recursive filter results and preserves .txt
+            restored_win.renameEntry(str(algebra_dir / "1.2 Basis.txt"), "1.2 Orthonormal Basis")
+            self._wait_for(
+                lambda: restored_win.busy == 0
+                and not restored_win._folder_searching
+                and not restored_win.filter_timer.isActive()
+                and [item["name"] for item in restored_win.files] == ["Courses", "Algebra", "1.2 Orthonormal Basis.txt"]
+            )
+
+            # Zero-match query displays empty state in FolderSidebar
+            filter_field.setProperty("text", "no-such-note-xyz")
+            self._wait_for(
+                lambda: not restored_win._folder_searching
+                and not restored_win.filter_timer.isActive()
+                and restored_win.files == []
+            )
+            QTest.qWait(30)
+            self.assertTrue(empty_state.property("visible"))
+            self.assertEqual(empty_label.property("text"), "No matching notes found")
+
+            # Clearing filter restores normal tree; renaming restored Courses -> Semesters updates startup.json
+            filter_field.setProperty("text", "")
+            self._wait_for(lambda: any(item["name"] == "Courses" for item in restored_win.files))
+            restored_win.renameEntry(str(self.open_root / "Courses"), "Semesters")
+            semesters_dir = self.open_root / "Semesters"
+            self._wait_for(lambda: restored_win.busy == 0 and semesters_dir.is_dir())
+            restored_session.writes.flush()
+            persisted = json.loads((self.studio.data / "startup.json").read_text(encoding="utf-8"))
+            self.assertIn(self._norm(semesters_dir), self._norm_list(persisted["expanded"]))
+        finally:
+            if host_win is not None:
+                host_win.close()
+                host_win.deleteLater()
+                self.app.sendPostedEvents(None, QEvent.Type.DeferredDelete)
+            if engine is not None:
+                engine.deleteLater()
+                self.app.sendPostedEvents(None, QEvent.Type.DeferredDelete)
+            if restored_win is not None:
+                restored_win.stop()
+                restored_win.pool.shutdown(wait=True, cancel_futures=True)
+                restored_win._search_pool.shutdown(wait=True, cancel_futures=True)
+            restored_session.writes.shutdown(wait=True)
 
 
 if __name__ == "__main__":

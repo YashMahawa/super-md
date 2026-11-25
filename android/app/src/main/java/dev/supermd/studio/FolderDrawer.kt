@@ -58,8 +58,8 @@ internal fun FolderDrawerHeader(
         Column(Modifier.fillMaxWidth().padding(horizontal = 12.dp, vertical = 8.dp)) {
             Row(verticalAlignment = Alignment.CenterVertically, modifier = Modifier.fillMaxWidth()) {
                 if (folderRelative.isNotEmpty()) {
-                    IconButton(onClick = { onNavigateRelative(parentRelativePath(folderRelative)) }, modifier = Modifier.size(36.dp)) {
-                        Icon(Icons.AutoMirrored.Rounded.ArrowBack, contentDescription = "Parent folder")
+                    IconButton(onClick = { onNavigateRelative(parentFolderRelative(folderRelative)) }, modifier = Modifier.size(36.dp)) {
+                        Icon(Icons.AutoMirrored.Rounded.ArrowBack, contentDescription = "Navigate up")
                     }
                 } else {
                     Icon(Icons.Rounded.FolderOpen, contentDescription = null, tint = MaterialTheme.colorScheme.primary, modifier = Modifier.padding(end = 8.dp).size(20.dp))
@@ -97,8 +97,22 @@ internal fun FolderDrawerHeader(
                 }
             }
             if (folderRelative.isNotEmpty()) {
-                TextButton(onClick = { onNavigateRelative("") }, contentPadding = PaddingValues(horizontal = 4.dp, vertical = 0.dp)) {
-                    Text("Folder root", style = MaterialTheme.typography.labelMedium)
+                val parentRel = parentFolderRelative(folderRelative)
+                Row(horizontalArrangement = Arrangement.spacedBy(8.dp), verticalAlignment = Alignment.CenterVertically) {
+                    if (parentRel.isNotEmpty()) {
+                        TextButton(
+                            onClick = { onNavigateRelative(parentRel) },
+                            contentPadding = PaddingValues(horizontal = 4.dp, vertical = 0.dp),
+                        ) {
+                            Text("Up to ${parentRel.substringAfterLast('/')}", style = MaterialTheme.typography.labelMedium)
+                        }
+                    }
+                    TextButton(
+                        onClick = { onNavigateRelative("") },
+                        contentPadding = PaddingValues(horizontal = 4.dp, vertical = 0.dp),
+                    ) {
+                        Text("Folder root", style = MaterialTheme.typography.labelMedium)
+                    }
                 }
             }
         }
@@ -256,9 +270,12 @@ internal fun FolderActionDialogs(
     }
 
     if (renameTarget != null) {
-        val hasDot = !renameTarget.directory && '.' in renameTarget.name
-        val currentExt = if (hasDot) renameTarget.name.substringAfterLast('.', "") else ""
-        val initialText = if (renameTarget.directory) renameTarget.name else noteStem(renameTarget.name)
+        val currentExt = if (renameTarget.directory) "" else noteExtension(renameTarget.name)
+        val initialText = when {
+            renameTarget.directory -> renameTarget.name
+            currentExt.isNotEmpty() -> noteStem(renameTarget.name)
+            else -> renameTarget.name
+        }
         var rawName by remember(renameTarget) { mutableStateOf(initialText) }
         var submitError by remember(renameTarget) { mutableStateOf<String?>(null) }
         var renameBusy by remember(renameTarget) { mutableStateOf(false) }
