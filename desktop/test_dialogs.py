@@ -68,9 +68,9 @@ ApplicationWindow {
 
     def open_rename(self):
         tab=next(item for item in self.items() if item.objectName()=='noteTab')
-        QTest.mouseClick(self.window,Qt.RightButton,Qt.NoModifier,tab.mapToScene(QPointF(70,20)).toPoint());QTest.qWait(40)
+        QTest.mouseClick(self.window,Qt.MouseButton.RightButton,Qt.KeyboardModifier.NoModifier,tab.mapToScene(QPointF(70,20)).toPoint());QTest.qWait(40)
         action=next(item for item in self.items() if item.property('text')=='Rename note')
-        QTest.mouseClick(self.window,Qt.LeftButton,Qt.NoModifier,action.mapToScene(QPointF(60,action.height()/2)).toPoint());QTest.qWait(300)
+        QTest.mouseClick(self.window,Qt.MouseButton.LeftButton,Qt.KeyboardModifier.NoModifier,action.mapToScene(QPointF(60,action.height()/2)).toPoint());QTest.qWait(300)
         if os.environ.get('SUPERMD_DIALOG_TEST_OUTPUT'):self.window.grabWindow().save(os.environ['SUPERMD_DIALOG_TEST_OUTPUT'])
         dialog=self.named('renameDialog');self.assertIsNotNone(dialog);self.assertTrue(dialog.property('visible'))
         return dialog
@@ -99,11 +99,11 @@ ApplicationWindow {
     def test_accept_renames_the_intended_note_and_escape_cancels(self):
         self.open_rename();self.assertEqual(self.window.property('modalDialogCount'),1)
         self.named('renameField').setProperty('text','Renamed.md')
-        QTest.keyClick(self.window,Qt.Key_Return);QTest.qWait(80)
+        QTest.keyClick(self.window,Qt.Key.Key_Return);QTest.qWait(80)
         self.assertEqual(self.studio.tabs[0]['name'],'Renamed.md')
         self.assertFalse(self.named('renameDialog').property('visible'));self.assertEqual(self.window.property('modalDialogCount'),0)
         self.open_rename();self.named('renameField').setProperty('text','Not committed.md')
-        QTest.keyClick(self.window,Qt.Key_Escape);QTest.qWait(80)
+        QTest.keyClick(self.window,Qt.Key.Key_Escape);QTest.qWait(80)
         self.assertEqual(self.studio.tabs[0]['name'],'Renamed.md');self.assertEqual(self.window.property('modalDialogCount'),0)
 
     def test_light_dark_and_black_palettes_keep_surface_opaque(self):
@@ -120,5 +120,89 @@ ApplicationWindow {
         dialog=self.open_rename();background=dialog.property('background');image=self.window.grabWindow()
         self.assertEqual(self.studio.palette['surface-low'],'#342c44')
         self.assertEqual(self.pixel(image,background.mapToScene(QPointF(8,background.height()/2))).name(),'#342c44')
+
+    def test_conflict_banner_and_save_conflict_dialog_render_and_trigger_actions(self):
+        import textwrap
+        qml = (Path(__file__).parent / 'qml/Main.qml').read_text(encoding='utf-8')
+        banner_start = qml.index('                Pane {\n                    id: conflictBanner')
+        banner_end = qml.index('                Loader {\n                    id: readerLoader', banner_start)
+        banner_code = textwrap.dedent(qml[banner_start:banner_end]).rstrip()
+
+        dialog_start = qml.index('    AppDialog {\n        id: saveConflictDialog')
+        dialog_end = qml.index('    AppDialog {\n        id: flushDialog', dialog_start)
+        dialog_code = textwrap.dedent(qml[dialog_start:dialog_end]).rstrip()
+
+        harness = ('''
+import QtQuick
+import QtQuick.Controls
+import QtQuick.Controls.Material
+import QtQuick.Layouts
+ApplicationWindow {
+    id: window
+    width: 960; height: 520; visible: true; color: viewState.colors.surface
+    property var viewState: JSON.parse(studio.snapshot)
+    property int contextMenuCount: 0
+    property int modalDialogCount: 0
+    QtObject { id: studyToolbar; property bool visible: false; property bool shown: false; property real height: 56 }
+    function openConflictDialog() { saveConflictDialog.title = viewState.name + " changed on disk"; saveConflictDialog.open() }
+    ColumnLayout {
+        anchors.fill: parent
+        spacing: 0
+%s
+        Rectangle { objectName: "editorPlaceholder"; Layout.fillWidth: true; Layout.fillHeight: true; color: viewState.colors.surface }
+    }
+%s
+}
+''' % (textwrap.indent(banner_code, '        '), textwrap.indent(dialog_code, '    '))).encode('utf-8')
+
+        comp = QQmlComponent(self.engine)
+        comp.setData(harness, QUrl.fromLocalFile(str(Path(__file__).parent / 'qml/conflict-banner-test.qml')))
+        self.assertFalse(comp.isError(), str(comp.errors()))
+        win = comp.create()
+        self.assertIsNotNone(win, str(comp.errors()))
+        try:
+            QTest.qWait(40)
+            win.grabWindow()
+            banner = win.findChild(QObject, 'conflictBanner')
+            editor = win.findChild(QObject, 'editorPlaceholder')
+            self.assertIsNotNone(banner)
+            self.assertFalse(banner.property('visible'))
+
+            # Flag conflict on the active tab: banner appears above the editor without opening a modal.
+            self.studio.tabs[0]['conflict'] = True
+            self.studio._emit(False)
+            QTest.qWait(60)
+            win.grabWindow()
+            self.assertTrue(banner.property('visible'))
+            self.assertEqual(win.property('modalDialogCount'), 0)
+            self.assertLessEqual(banner.mapToScene(QPointF(0, banner.height())).y(), editor.mapToScene(QPointF(0, 0)).y() + 1)
+
+            save_as_btn = win.findChild(QObject, 'conflictSaveAsButton')
+            reload_btn = win.findChild(QObject, 'conflictReloadButton')
+            overwrite_btn = win.findChild(QObject, 'conflictOverwriteButton')
+            self.assertEqual(save_as_btn.property('text'), 'Save as')
+            self.assertEqual(reload_btn.property('text'), 'Reload from disk')
+            self.assertEqual(overwrite_btn.property('text'), 'Overwrite')
+            banner_bg = banner.property('background')
+            banner_img = win.grabWindow()
+            banner_scale = banner_img.width() / win.width()
+            banner_pt = banner_bg.mapToScene(QPointF(8, banner_bg.height() / 2))
+            self.assertEqual(banner_img.pixelColor(round(banner_pt.x() * banner_scale), round(banner_pt.y() * banner_scale)).name(), QColor(self.studio.palette['surface-high']).name())
+
+            # Open the guarded Save conflict dialog and verify its opaque surface and buttons.
+            from PySide6.QtCore import QMetaObject
+            QMetaObject.invokeMethod(win, 'openConflictDialog')
+            QTest.qWait(120)
+            conflict_dialog = win.findChild(QObject, 'saveConflictDialog')
+            self.assertTrue(conflict_dialog.property('visible'))
+            self.assertEqual(win.property('modalDialogCount'), 1)
+            bg = conflict_dialog.property('background')
+            img = win.grabWindow()
+            scale = img.width() / win.width()
+            pt = bg.mapToScene(QPointF(8, bg.height() / 2))
+            self.assertEqual(img.pixelColor(round(pt.x() * scale), round(pt.y() * scale)).name(), QColor(self.studio.palette['surface-low']).name())
+        finally:
+            win.close(); win.deleteLater()
+            self.app.sendPostedEvents(None, QEvent.Type.DeferredDelete)
 
 if __name__=='__main__':unittest.main()

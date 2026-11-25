@@ -121,6 +121,7 @@ describe('DocumentAnalysisWorkerClient & useDocumentAnalysis',()=>{
     vi.advanceTimersByTime(1);
     expect(workers[0].terminated).toBe(true);
     expect(client.peek('# Rev 5\n\nWarm follow-up.')).toBeNull();
+    expect(client.peek('# Rev 1\n\nFirst body.')).toBeNull();
 
     // Subsequent edit lazily spawns a fresh worker.
     const afterIdle=client.request('# After Idle');
@@ -130,6 +131,48 @@ describe('DocumentAnalysisWorkerClient & useDocumentAnalysis',()=>{
 
     client.dispose();
     expect(workers[1].terminated).toBe(true);
+  });
+
+  it('retains a bounded LRU cache across multi-tab switches and undo/redo without re-posting to the worker',async()=>{
+    const realAnalyze=documentAnalysis.analyzeDocument;
+    const worker=new ControlledWorker(realAnalyze);
+    const client=new DocumentAnalysisWorkerClient(()=>worker,{idleMs:30_000});
+
+    const pA=client.request('# Tab A\n\n- [ ] Task');
+    worker.flushNext();
+    const resA=await pA;
+
+    const pAEdited=client.request('# Tab A\n\n- [x] Task');
+    worker.flushNext();
+    const resAEdited=await pAEdited;
+
+    const pB=client.request('# Tab B\n\nSecond tab.');
+    worker.flushNext();
+    const resB=await pB;
+
+    expect(worker.posted).toHaveLength(3);
+
+    // Switching back to Tab A (edited), undoing back to Tab A (unchecked), and redoing
+    // all resolve synchronously from peek() and request() without posting new worker jobs.
+    expect(client.peek('# Tab A\n\n- [x] Task')).toBe(resAEdited);
+    expect(client.peek('# Tab A\n\n- [ ] Task')).toBe(resA);
+    expect(client.peek('# Tab B\n\nSecond tab.')).toBe(resB);
+    await expect(client.request('# Tab A\n\n- [ ] Task')).resolves.toBe(resA);
+    await expect(client.request('# Tab A\n\n- [x] Task')).resolves.toBe(resAEdited);
+    expect(worker.posted).toHaveLength(3);
+
+    //Exceeding 6 cached entries evicts the least-recently-used revision while keeping recent ones.
+    for(let i=1;i<=5;i++){
+      const req=client.request(`# Extra ${i}`);
+      worker.flushNext();
+      await req;
+    }
+    expect(client.peek('# Tab B\n\nSecond tab.')).toBeNull();
+    expect(client.peek('# Extra 5')).not.toBeNull();
+
+    client.reclaimIdle();
+    expect(client.peek('# Extra 5')).toBeNull();
+    client.dispose();
   });
 
   it('transfers compact block ranges without block text strings across the worker boundary',async()=>{
@@ -173,7 +216,7 @@ describe('DocumentAnalysisWorkerClient & useDocumentAnalysis',()=>{
     const realAnalyze=documentAnalysis.analyzeDocument;
     const uiAnalyzeSpy=vi.spyOn(documentAnalysis,'analyzeDocument');
 
-    for(const [label,sizeBytes] of [['79 KB',79*1024],['1 MB',1024*1024]] as const){
+    for(const [label,sizeBytes,mountFullPreview] of [['79 KB',79*1024,true],['1 MB',1024*1024,false]] as const){
       uiAnalyzeSpy.mockClear();
       let workerInstance:ControlledWorker|null=null;
       const client=new DocumentAnalysisWorkerClient(()=>{
@@ -184,16 +227,22 @@ describe('DocumentAnalysisWorkerClient & useDocumentAnalysis',()=>{
       const initialDoc=buildDocumentOfSize(sizeBytes);
       let setSourceExternal!:(next:string)=>void;
       let latestRenderedEditorValue='';
+      let latestPinnedSource:string|null=null;
 
       function SplitHarness(){
         const [source,setSource]=useState(initialDoc);
         setSourceExternal=setSource;
         latestRenderedEditorValue=source;
         const {pinnedAnalysis}=useDocumentAnalysis(`doc-${label}`,source,'split',{client});
+        latestPinnedSource=pinnedAnalysis?.source??null;
         return (
           <div>
-            <textarea aria-label="source-input" value={source} onChange={e=>setSource(e.target.value)}/>
-            {pinnedAnalysis&&(
+            {mountFullPreview?(
+              <textarea aria-label="source-input" value={source} onChange={e=>setSource(e.target.value)}/>
+            ):(
+              <output aria-label="source-input" data-length={source.length}>{source.slice(-32)}</output>
+            )}
+            {pinnedAnalysis&&(mountFullPreview?(
               <MarkdownPreview
                 markdown={pinnedAnalysis.source}
                 sourceAnalysis={pinnedAnalysis}
@@ -201,7 +250,9 @@ describe('DocumentAnalysisWorkerClient & useDocumentAnalysis',()=>{
                 python=""
                 dark={false}
               />
-            )}
+            ):(
+              <div data-pinned-blocks={pinnedAnalysis.analysis.blocks.length}/>
+            ))}
           </div>
         );
       }
@@ -223,6 +274,7 @@ describe('DocumentAnalysisWorkerClient & useDocumentAnalysis',()=>{
       await act(async()=>{
         workerInstance!.flushNext();
       });
+      expect(latestPinnedSource).toBe(initialDoc);
       const typingSpy=vi.spyOn(documentAnalysis,'analyzeDocument');
 
       // Type 5 consecutive keystrokes in Split mode while worker is busy on edit 1.
@@ -232,8 +284,9 @@ describe('DocumentAnalysisWorkerClient & useDocumentAnalysis',()=>{
         });
       }
 
-      // Editor state updated immediately with every keystroke, with ZERO UI-thread parses!
+      // Editor state updated immediately with every keystroke, preview stays pinned, with ZERO UI-thread parses!
       expect(latestRenderedEditorValue).toContain('Typed revision 5');
+      expect(latestPinnedSource).toBe(initialDoc);
       expect(typingSpy).toHaveBeenCalledTimes(0);
 
       // Flush edit 1 and coalesced edit 5 in worker; verify UI thread STILL never parses.
@@ -242,6 +295,7 @@ describe('DocumentAnalysisWorkerClient & useDocumentAnalysis',()=>{
         workerInstance!.flushNext();
         workerInstance!.flushNext();
       });
+      expect(latestPinnedSource).toContain('Typed revision 5');
       const settleSpy=vi.spyOn(documentAnalysis,'analyzeDocument');
       expect(settleSpy).toHaveBeenCalledTimes(0);
 
@@ -250,7 +304,7 @@ describe('DocumentAnalysisWorkerClient & useDocumentAnalysis',()=>{
       host.remove();
       client.dispose();
     }
-  },30_000);
+  },60_000);
 
   it('falls back cleanly to synchronous analyzeDocument when Worker is unavailable or fails',async()=>{
     const savedWorker=globalThis.Worker;

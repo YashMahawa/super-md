@@ -1,6 +1,7 @@
 /** Lightweight text indexes stay available when expensive rendered blocks leave
  * the viewport. The registry is released with each document, never persisted. */
 import {flushSync} from 'react-dom';
+import {caretRangeAtPoint} from './caretPoint';
 import {refreshDocumentExtent} from './documentZoom';
 import {scrollInputVersion} from './scrollAnchor';
 const blocks=new Map<HTMLElement,string>();
@@ -18,7 +19,7 @@ export function rememberWindowedScrollSource(root:HTMLElement,delta:number):void
   if(high-low<2)return;
   const x=bounds.left+bounds.width*.5;
   for(const fraction of [.5,.25,.75]){
-    const range=(document as Document&{caretRangeFromPoint?:(x:number,y:number)=>Range|null}).caretRangeFromPoint?.(x,bounds.top+low+(high-low)*fraction)?.cloneRange();
+    const range=caretRangeAtPoint(root.ownerDocument,x,bounds.top+low+(high-low)*fraction)?.cloneRange();
     if(!range||range.startContainer.nodeType!==Node.TEXT_NODE||!root.contains(range.startContainer))continue;
     if(range.startContainer.parentElement?.closest('.image-loading,.note-image'))continue;
     if(range.startOffset>=(range.startContainer.textContent?.length??0))continue;

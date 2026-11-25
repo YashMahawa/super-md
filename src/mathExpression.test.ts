@@ -27,4 +27,10 @@ describe("safe chart expressions", () => {
     expect(compileMathExpression("2^-2")({})).toBe(.25);
     expect(compileMathExpression("2^3^2")({})).toBe(512);
   });
+  it("evaluates ln(x) as natural logarithm and validates allowed variable identifiers",()=>{
+    const expr = compileMathExpression("ln(x) + a * e", new Set(["x", "a"]));
+    expect(expr({ x: Math.E, a: 2 })).toBeCloseTo(1 + 2 * Math.E);
+    expect(Number.isNaN(expr({ x: -1, a: 1 }))).toBe(true);
+    expect(() => compileMathExpression("ln(x) + b", new Set(["x", "a"]))).toThrow("Unknown chart variable: b");
+  });
 });

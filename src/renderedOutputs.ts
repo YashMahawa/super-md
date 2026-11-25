@@ -4,6 +4,7 @@ export const chartValues = new Map<string, Record<string, number>>();
 export const chartZooms = new Map<string, number>();
 export const chartCenters = new Map<string, {x:number;y:number}>();
 export const chartGrids = new Map<string, boolean>();
+export const stepIndices = new Map<string, number>();
 export const pythonResults = new Map<string, PythonResult>();
 const scopedPythonResults = new Map<string, PythonResult>();
 const scopedPythonContexts = new Map<string, PythonContext>();
@@ -37,10 +38,33 @@ function unpackPython(value:unknown,context?:PythonContext):PythonResult|undefin
   const provenance=context?verifiedProvenance(envelope.provenance??bodyProvenance,context):undefined;
   return {...body,provenance:provenance??{verified:false,reason:'Legacy saved output; document and runtime were not recorded'}};
 }
+export const safePythonFigure = (image: unknown): image is string =>
+  typeof image === "string" && image.length <= 12_000_000 && /^data:image\/(?:svg\+xml|png|jpeg);base64,[A-Za-z0-9+/]+=*$/.test(image.slice(0, 64) + (image.length > 64 ? image.slice(-8) : ""));
 export function cachedPythonOutput(source:string,context?:PythonContext):PythonResult|undefined {
   if(context)return scopedPythonResults.get(storageKey(source,context));
   const result=pythonResults.get(source);
   return result&&!result.provenance?{...result,provenance:{verified:false,reason:'Unscoped legacy output'}}:result;
+}
+export function inspectCachedPythonOutput(source:string,options?:{document?:string|null;cell?:string;interpreter?:string}):PythonResult|undefined {
+  if(options?.document){
+    const context:PythonContext={document:options.document,cell:options.cell||'0',interpreter:options.interpreter||'embedded'};
+    const key=storageKey(source,context);
+    for(const entry of visiblePython)if(entry.source===source&&storageKey(entry.source,entry.context)===key)return entry.result;
+    return scopedPythonResults.get(key);
+  }
+  for(const entry of visiblePython){
+    if(entry.source!==source)continue;
+    if(!entry.context)return entry.result;
+    if(options?.document===undefined&&(!options?.cell||entry.context.cell===options.cell)&&(!options?.interpreter||entry.context.interpreter===options.interpreter))return entry.result;
+  }
+  const unscoped=cachedPythonOutput(source);
+  if(unscoped||options?.document!==undefined)return unscoped;
+  for(const [key,value] of scopedPythonResults){
+    if(scopedPythonSources.get(key)!==source)continue;
+    const context=scopedPythonContexts.get(key);
+    if(context&&(!options?.cell||context.cell===options.cell)&&(!options?.interpreter||context.interpreter===options.interpreter))return value;
+  }
+  return undefined;
 }
 export function rememberPythonOutput(source:string,result:PythonResult,context?:PythonContext):void {
   if(context){const key=storageKey(source,context);scopedPythonContexts.set(key,context);scopedPythonSources.set(key,source);remember(scopedPythonResults,key,result);if(!scopedPythonResults.has(key)){scopedPythonContexts.delete(key);scopedPythonSources.delete(key);forgetPythonStored(key);}}
@@ -71,9 +95,14 @@ export async function loadPythonOutput(source:string,context?:PythonContext):Pro
 const visiblePython = new Set<{source:string;result:PythonResult;context?:PythonContext}>();
 export function retainVisiblePython(source:string,result:PythonResult,context?:PythonContext){const record={source,result,context};visiblePython.add(record);return()=>{visiblePython.delete(record);};}
 export async function pythonOutput(source:string,context?:PythonContext):Promise<PythonResult|undefined> {for(const entry of visiblePython)if(entry.source===source&&storageKey(entry.source,entry.context)===storageKey(source,context))return entry.result;return loadPythonOutput(source,context);}
+const metadataCosts = new WeakMap<Map<string, unknown>, { entries: Map<string, number>; bytes: number }>();
+function metadataEntryBytes(source: string, data: unknown): number {
+  const serializedLength = typeof data === "number" || typeof data === "boolean" ? String(data).length : JSON.stringify(data).length;
+  return 2 * (source.length + serializedLength);
+}
 export function remember<T>(map: Map<string, T>, key: string, value: T) {
-  map.delete(key);map.set(key, value);
   if (map === pythonResults || map === scopedPythonResults) {
+    map.delete(key);map.set(key, value);
     // Images dominate retained memory. Sixty base64 figures can otherwise
     // retain gigabytes after their tabs have closed. Current visible results
     // stay owned by PythonCell; this cap only evicts optional redisplay cache.
@@ -81,10 +110,29 @@ export function remember<T>(map: Map<string, T>, key: string, value: T) {
     let bytes=[...pythonResults].reduce((n,[source,result])=>n+cost(source,result),0)+[...scopedPythonResults].reduce((n,[key,result])=>n+cost(key,result),0);
     for(const mapEntry of [[pythonResults,[...pythonResults]],[scopedPythonResults,[...scopedPythonResults]]] as const)for(const [source,result] of mapEntry[1]){if(bytes<=16_000_000 && pythonResults.size+scopedPythonResults.size<=60)break;mapEntry[0].delete(source);bytes-=cost(source,result);if(mapEntry[0]===scopedPythonResults){scopedPythonContexts.delete(source);scopedPythonSources.delete(source);forgetPythonStored(source);}}
   } else {
-    // Slider metadata is small. Retain graph states without keeping rendered
-    // geometry, so scrolling through a large note doesn't reset its graphs.
-    let bytes=[...map].reduce((size,[source,data])=>size+2*(source.length+JSON.stringify(data).length),0);
-    for(const [source,data] of map){if(bytes<=4_000_000&&map.size<=5000)break;map.delete(source);bytes-=2*(source.length+JSON.stringify(data).length);}
+    // Slider and step metadata is small. Track byte totals incrementally so
+    // scrolling or testing thousands of cached states avoids quadratic rescans.
+    const rawMap = map as Map<string, unknown>;
+    let tracked = metadataCosts.get(rawMap);
+    if (!tracked || rawMap.size === 0) {
+      tracked = { entries: new Map(), bytes: 0 };
+      for (const [source, data] of rawMap) { const c = metadataEntryBytes(source, data); tracked.entries.set(source, c); tracked.bytes += c; }
+      metadataCosts.set(rawMap, tracked);
+    } else if (tracked.entries.size !== rawMap.size) {
+      tracked.entries.clear(); tracked.bytes = 0;
+      for (const [source, data] of rawMap) { const c = metadataEntryBytes(source, data); tracked.entries.set(source, c); tracked.bytes += c; }
+    }
+    const previousCost = tracked.entries.get(key);
+    if (previousCost !== undefined) { tracked.bytes -= previousCost; tracked.entries.delete(key); }
+    map.delete(key); map.set(key, value);
+    const nextCost = metadataEntryBytes(key, value);
+    tracked.entries.set(key, nextCost); tracked.bytes += nextCost;
+    for (const [source] of map) {
+      if (tracked.bytes <= 4_000_000 && map.size <= 5000) break;
+      map.delete(source);
+      const removed = tracked.entries.get(source) ?? 0;
+      tracked.entries.delete(source); tracked.bytes -= removed;
+    }
   }
 }
 
@@ -94,15 +142,15 @@ export function exportRenderedViews(content: string) {
     const source=scopedPythonSources.get(key),context=scopedPythonContexts.get(key);
     return source&&context&&content.includes(source)&&verifiedProvenance(value.provenance,context)?[[source,context,value] as [string,PythonContext,PythonResult]]:[];
   });
-  const result = {values:selected(chartValues), zooms:selected(chartZooms), centers:selected(chartCenters), grids:selected(chartGrids), python:selected(pythonResults),pythonScoped};
+  const result = {values:selected(chartValues), zooms:selected(chartZooms), centers:selected(chartCenters), grids:selected(chartGrids), steps:selected(stepIndices), python:selected(pythonResults),pythonScoped};
   // Avoid carrying huge derived images through the UI bridge. This is optional
   // runtime state, not source/assets, and never executes Python on restore.
   if (JSON.stringify(result).length > 8_000_000) {result.python = [];result.pythonScoped=[];}
   return result;
 }
-export function importRenderedViews(content: string, data: ReturnType<typeof exportRenderedViews> | undefined) {
+export function importRenderedViews(content: string, data: Partial<ReturnType<typeof exportRenderedViews>> | undefined) {
   if (!data) return;
-  const restore = <T,>(map: Map<string, T>, pairs: [string, T][], valid:(value:T)=>boolean) => {
+  const restore = <T,>(map: Map<string, T>, pairs: [string, T][] | undefined, valid:(value:T)=>boolean) => {
     if (!Array.isArray(pairs)) return;
     for (const pair of pairs.slice(0,map===pythonResults?60:5000)) if (Array.isArray(pair) && typeof pair[0] === "string" && content.includes(pair[0]) && valid(pair[1])) remember(map, pair[0], pair[1]);
   };
@@ -111,6 +159,7 @@ export function importRenderedViews(content: string, data: ReturnType<typeof exp
   restore(chartZooms, data.zooms, value => finite(value) && value >= .05 && value <= 64);
   restore(chartCenters, data.centers, value => !!value && finite(value.x) && finite(value.y));
   restore(chartGrids, data.grids, value => typeof value === "boolean");
+  restore(stepIndices, data.steps, value => typeof value === "number" && Number.isInteger(value) && value >= 0 && value < 40);
   if(Array.isArray(data.python))for(const pair of data.python.slice(0,60))if(Array.isArray(pair)&&typeof pair[0]==='string'&&content.includes(pair[0])&&validPython(pair[1]))rememberPythonOutput(pair[0],{...pair[1],provenance:{verified:false,reason:'Unscoped legacy output'}});
   if(Array.isArray(data.pythonScoped))for(const entry of data.pythonScoped.slice(0,60)){
     if(!Array.isArray(entry)||typeof entry[0]!=='string'||!content.includes(entry[0]))continue;

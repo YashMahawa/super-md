@@ -7,7 +7,7 @@ ToolTip {
     property bool requested: false
     readonly property var hostWindow: parent ? parent.Window.window : null
     visible: requested && !(hostWindow && (hostWindow.contextMenuCount > 0 || hostWindow.modalDialogCount > 0))
-    delay: 550
+    delay: 400
     timeout: 7000
     exit: Transition {}
     padding: 10

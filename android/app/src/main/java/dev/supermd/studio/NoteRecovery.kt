@@ -18,6 +18,7 @@ internal object NoteRecovery {
                     .name("uri").value(note.uri ?: "").name("content").value(note.content)
                     .name("relative").value(note.relative ?: "").name("assetDirectory").value(note.assetDirectory ?: "")
                 if(note.saved!=note.content)json.name("saved").value(note.saved)
+                if(note.assetsDirty)json.name("assetsDirty").value(true)
                 json.endObject()
             }
             json.endArray()
@@ -30,7 +31,7 @@ internal object NoteRecovery {
     }
     fun read(input: Reader, defaults: StudioState): StudioState = JsonReader(input).use { json ->
         fun note(): Note {
-            var id="";var name="";var uri:String?=null;var content="";var saved:String?=null;var relative:String?=null;var assets:String?=null
+            var id="";var name="";var uri:String?=null;var content="";var saved:String?=null;var relative:String?=null;var assets:String?=null;var assetsDirty=false
             json.beginObject()
             while(json.hasNext()) {
                 val key=json.nextName()
@@ -39,11 +40,12 @@ internal object NoteRecovery {
                     "id"->id=json.nextString();"name"->name=json.nextString();"uri"->uri=json.nextString().takeIf{it.isNotBlank()}
                     "content"->content=json.nextString();"saved"->saved=json.nextString()
                     "relative"->relative=json.nextString().takeIf{it.isNotBlank()};"assetDirectory"->assets=json.nextString().takeIf{it.isNotBlank()}
+                    "assetsDirty"->assetsDirty=json.nextBoolean()
                     else->json.skipValue()
                 }
             }
             json.endObject();require(id.isNotBlank()&&name.isNotBlank()) {"Invalid recovery note"}
-            return Note(id,name,uri,content,saved?.takeUnless{it==content}?:content,relative,assets)
+            return Note(id,name,uri,content,saved?.takeUnless{it==content}?:content,relative,assets,assetsDirty)
         }
         fun notes(): List<Note> {val result=mutableListOf<Note>();json.beginArray();while(json.hasNext())result.add(note());json.endArray();return result}
         var state=defaults

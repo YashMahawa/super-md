@@ -4,6 +4,7 @@ import {
   hydrateDocumentAnalysis,
   type CompactDocumentAnalysis,
   type OutlineEntry,
+  type SourceBlockRange,
   type SourceDocumentAnalysis,
 } from './documentAnalysis';
 import type {DocumentAnalysisWorkerRequest,DocumentAnalysisWorkerResponse} from './documentAnalysis.worker';
@@ -33,6 +34,8 @@ export interface DocumentAnalysisWorkerOptions {
 }
 
 const DEFAULT_IDLE_MS=30_000;
+const MAX_CACHE_ENTRIES=6;
+const MAX_CACHE_CHARS=2_000_000;
 
 function abortError():Error {
   const error=new Error('Document analysis cancelled');
@@ -40,12 +43,21 @@ function abortError():Error {
   return error;
 }
 
+function validBlockRanges(ranges:unknown,sourceLength:number):ranges is SourceBlockRange[] {
+  return Array.isArray(ranges)&&ranges.every(range=>
+    Boolean(range)&&Number.isInteger(range.start)&&Number.isInteger(range.end)&&range.start>=0&&range.start<=range.end&&range.end<=sourceLength
+  );
+}
+
 function validCompactAnalysis(value:unknown,sourceLength:number):value is CompactDocumentAnalysis {
   if(!value||typeof value!=='object')return false;
   const candidate=value as Partial<CompactDocumentAnalysis>;
   if(!candidate.tree||candidate.tree.type!=='root'||!Array.isArray(candidate.tree.children))return false;
-  if(!Array.isArray(candidate.blockRanges)||!candidate.blockRanges.every(range=>
-    Boolean(range)&&Number.isInteger(range.start)&&Number.isInteger(range.end)&&range.start>=0&&range.start<=range.end&&range.end<=sourceLength
+  if(!validBlockRanges(candidate.blockRanges,sourceLength))return false;
+  if(!validBlockRanges(candidate.bodyBlockRanges,sourceLength))return false;
+  if(candidate.frontmatter!==null&&(
+    !candidate.frontmatter||typeof candidate.frontmatter!=='object'||
+    !Number.isInteger(candidate.frontmatter.end)||candidate.frontmatter.end<0||candidate.frontmatter.end>sourceLength
   ))return false;
   if(!Array.isArray(candidate.outline)||candidate.outline.length>2000||!candidate.outline.every(item=>
     Boolean(item)&&typeof item.id==='string'&&typeof item.title==='string'&&Number.isInteger(item.level)&&Number.isFinite(item.offset)
@@ -73,7 +85,8 @@ export class DocumentAnalysisWorkerClient {
   private worker:AnalysisWorkerLike|null=null;
   private inFlight:PendingJob|null=null;
   private queued:PendingJob|null=null;
-  private latest:SourceDocumentAnalysis|null=null;
+  private readonly cache=new Map<string,SourceDocumentAnalysis>();
+  private cachedChars=0;
   private idleTimer:ReturnType<typeof setTimeout>|null=null;
   private nextId=0;
   private disposed=false;
@@ -94,10 +107,10 @@ export class DocumentAnalysisWorkerClient {
     return !this.disposed&&(this.hasCustomFactory||typeof Worker!=='undefined');
   }
 
-  /** Return the most recently completed analysis if its source matches exactly. */
+  /** Return a recently completed analysis if its source is in the bounded LRU cache. */
   peek(source:string):SourceDocumentAnalysis|null {
-    if(this.disposed||this.latest?.source!==source)return null;
-    return this.latest;
+    if(this.disposed)return null;
+    return this.getCached(source,false);
   }
 
   /** Warm the background worker ahead of the first note load while still reclaiming after idleMs. */
@@ -114,9 +127,10 @@ export class DocumentAnalysisWorkerClient {
   request(source:string,signal?:AbortSignal):Promise<SourceDocumentAnalysis> {
     if(this.disposed)return Promise.reject(new Error('Document analysis worker client is disposed'));
     if(signal?.aborted)return Promise.reject(abortError());
-    if(this.latest?.source===source){
+    const cached=this.getCached(source,true);
+    if(cached){
       if(!this.inFlight&&!this.queued)this.scheduleIdle();
-      return Promise.resolve(this.latest);
+      return Promise.resolve(cached);
     }
     if(this.inFlight?.source===source)return this.subscribe(this.inFlight,signal);
     if(this.queued?.source===source)return this.subscribe(this.queued,signal);
@@ -163,7 +177,7 @@ export class DocumentAnalysisWorkerClient {
     this.clearIdle();
     if(this.inFlight||this.queued)return;
     this.terminateWorker();
-    this.latest=null;
+    this.clearCache();
   }
 
   dispose():void {
@@ -181,7 +195,39 @@ export class DocumentAnalysisWorkerClient {
       this.rejectJob(active,abortError());
     }
     this.terminateWorker();
-    this.latest=null;
+    this.clearCache();
+  }
+
+  private getCached(source:string,touch:boolean):SourceDocumentAnalysis|null {
+    const hit=this.cache.get(source);
+    if(!hit)return null;
+    if(touch){
+      this.cache.delete(source);
+      this.cache.set(source,hit);
+    }
+    return hit;
+  }
+
+  private putCached(result:SourceDocumentAnalysis):void {
+    const existing=this.cache.get(result.source);
+    if(existing){
+      this.cache.delete(result.source);
+      this.cachedChars-=existing.source.length;
+    }
+    this.cache.set(result.source,result);
+    this.cachedChars+=result.source.length;
+    while(this.cache.size>1&&(this.cache.size>MAX_CACHE_ENTRIES||this.cachedChars>MAX_CACHE_CHARS)){
+      const oldestKey=this.cache.keys().next().value;
+      if(oldestKey===undefined)break;
+      const evicted=this.cache.get(oldestKey)!;
+      this.cache.delete(oldestKey);
+      this.cachedChars-=evicted.source.length;
+    }
+  }
+
+  private clearCache():void {
+    this.cache.clear();
+    this.cachedChars=0;
   }
 
   private subscribe(job:PendingJob,signal?:AbortSignal):Promise<SourceDocumentAnalysis> {
@@ -245,7 +291,7 @@ export class DocumentAnalysisWorkerClient {
     }
 
     const hydrated=hydrateDocumentAnalysis(job.source,event.data.analysis);
-    this.latest=hydrated;
+    this.putCached(hydrated);
     this.resolveJob(job,hydrated);
     this.pumpQueue();
   }
@@ -310,7 +356,7 @@ export class DocumentAnalysisWorkerClient {
 
   private scheduleIdle():void {
     this.clearIdle();
-    if(this.disposed||(!this.worker&&!this.latest))return;
+    if(this.disposed||(!this.worker&&this.cache.size===0))return;
     this.idleTimer=setTimeout(()=>this.reclaimIdle(),this.idleMs);
     (this.idleTimer as {unref?:()=>void})?.unref?.();
   }
