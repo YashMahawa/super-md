@@ -2694,6 +2694,7 @@ class StudioViewModel(app: Application, val workspaceKey: String = "main") : And
                 media.invalidateLocalAsset(target)
                 if (!backup.contentEquals(incomingBytes) && target.lastModified() == previousModified && previousModified > 0L) {
                     target.setLastModified(maxOf(System.currentTimeMillis(), previousModified + 1_000L))
+                    media.invalidateLocalAsset(target)
                 }
                 stagedNote.outputStream().use { media.writeLocalPortable(it, note.content, note.assetDirectory) }
                 verifyExportHeader(stagedNote, NativeExportFormat.PORTABLE_SMD)

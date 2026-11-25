@@ -468,4 +468,103 @@ class PortableUnchangedAssetSaveTest {
             strayTmp.delete()
         }
     }
+
+    @Test
+    fun replacementDuringReadNeverCachesStaleBytesUnderNewerStateAndScopesCacheToAppStorage() {
+        val app = RuntimeEnvironment.getApplication()
+        val tempDir = Files.createTempDirectory("supermd-cache-race").toFile()
+        val media = MediaStorage(app)
+        val bundleDir = media.createEmptyPortableDirectory()
+        val bundlesRoot = File(app.filesDir, "portable-assets")
+        val bundleRoot = File(bundlesRoot, bundleDir)
+        try {
+            // Same-length payloads so even identical byte size cannot mask a mid-read replacement.
+            val oldSvg = svgBytes("race-aaaa", 12)
+            val newSvg = svgBytes("race-bbbb", 12)
+            val thirdSvg = svgBytes("race-cccc", 12)
+            assertEquals(oldSvg.size, newSvg.size)
+            assertEquals(newSvg.size, thirdSvg.size)
+
+            val assetFile = File(bundleRoot, "diagram.svg").apply { writeBytes(oldSvg) }
+
+            // 1. Atomic replacement during read (matching StudioViewModel.replacePortableAsset's renameTo):
+            //    reader captures old bytes before replacement completes; cache must NOT store old bytes
+            //    under the newer file's stamp, and the very next read must return newSvg.
+            var atomicHookFired = false
+            media.localFileBytesReader = { target ->
+                val capturedOldBytes = target.readBytes()
+                if (!atomicHookFired) {
+                    atomicHookFired = true
+                    val staged = File(bundleRoot, ".diagram-replacement.tmp").apply { writeBytes(newSvg) }
+                    check(staged.renameTo(target)) { "Atomic rename replacement failed" }
+                }
+                capturedOldBytes
+            }
+            val duringAtomicReplace = media.data(assetFile)
+            assertEquals(dataUrl("image/svg+xml", oldSvg), duringAtomicReplace)
+            assertEquals("Unstable mid-read replacement must not populate localFileCache", 0, media.cachedLocalAssetCount())
+
+            media.localFileBytesReader = { it.readBytes() }
+            media.resetPortableCounters()
+            val afterAtomicReplace = media.data(assetFile)
+            assertEquals(dataUrl("image/svg+xml", newSvg), afterAtomicReplace)
+            assertEquals("Next stable read must re-encode the replaced file", 1, media.portableBase64Encodes.get())
+            assertEquals("Stable read on app-owned asset populates cache", 1, media.cachedLocalAssetCount())
+
+            // Subsequent unchanged read hits the cache with 0 encodes.
+            media.resetPortableCounters()
+            assertEquals(dataUrl("image/svg+xml", newSvg), media.data(assetFile))
+            assertEquals(0, media.portableBase64Encodes.get())
+
+            // 2. Concurrent invalidateLocalAsset + in-place mutation during read:
+            //    even if a file is overwritten in-place while a reader is in flight and invalidated,
+            //    the finishing reader must NOT repopulate stale bytes into localFileCache.
+            media.invalidateLocalAsset(assetFile)
+            assertEquals(0, media.cachedLocalAssetCount())
+
+            var inPlaceHookFired = false
+            media.localFileBytesReader = { target ->
+                val capturedBytes = target.readBytes()
+                if (!inPlaceHookFired) {
+                    inPlaceHookFired = true
+                    val previousMtime = target.lastModified()
+                    target.writeBytes(thirdSvg)
+                    target.setLastModified(previousMtime + 2_000L)
+                    media.invalidateLocalAsset(target)
+                }
+                capturedBytes
+            }
+            val duringInPlaceUpdate = media.data(assetFile)
+            assertEquals(dataUrl("image/svg+xml", newSvg), duringInPlaceUpdate)
+            assertEquals("Invalidated/changed in-flight read must not cache stale bytes", 0, media.cachedLocalAssetCount())
+
+            media.localFileBytesReader = { it.readBytes() }
+            assertEquals(dataUrl("image/svg+xml", thirdSvg), media.portableAssets(bundleDir).getString("assets/diagram.svg"))
+            assertEquals(1, media.cachedLocalAssetCount())
+
+            // 3. Externally editable files outside app-owned storage (filesDir/portable-assets & filesDir/attachments)
+            //    are never cached, even if overwritten in-place with identical size and coarse mtime.
+            media.invalidateLocalAsset(bundleRoot)
+            assertEquals(0, media.cachedLocalAssetCount())
+
+            val externalFile = File(tempDir, "external.svg").apply { writeBytes(oldSvg) }
+            val pinnedMtime = externalFile.lastModified()
+            assertEquals(dataUrl("image/svg+xml", oldSvg), media.data(externalFile))
+            assertEquals("Files outside app-controlled storage must not enter localFileCache", 0, media.cachedLocalAssetCount())
+
+            externalFile.writeBytes(newSvg)
+            externalFile.setLastModified(pinnedMtime)
+            assertEquals(
+                "External file overwritten with identical size and mtime must still read fresh bytes",
+                dataUrl("image/svg+xml", newSvg),
+                media.data(externalFile),
+            )
+            assertEquals(0, media.cachedLocalAssetCount())
+        } finally {
+            media.localFileBytesReader = { it.readBytes() }
+            media.invalidateLocalAsset(bundleRoot)
+            bundleRoot.deleteRecursively()
+            tempDir.deleteRecursively()
+        }
+    }
 }

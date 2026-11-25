@@ -20,8 +20,10 @@ import java.net.HttpURLConnection
 import java.net.InetAddress
 import java.net.URL
 import java.nio.file.Files
+import java.nio.file.LinkOption
 import java.nio.file.attribute.BasicFileAttributes
 import java.util.UUID
+import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicInteger
 import java.util.zip.Deflater
 import java.util.zip.GZIPOutputStream
@@ -55,7 +57,8 @@ class MediaStorage(private val context: Context) {
     private data class LocalFileStamp(
         val canonicalPath: String,
         val length: Long,
-        val lastModified: Long,
+        val lastModifiedNanos: Long,
+        val creationTimeNanos: Long,
         val fileKey: Any?,
     )
 
@@ -69,22 +72,40 @@ class MediaStorage(private val context: Context) {
     private val validatedAssetMeta = LinkedHashMap<Int, MutableList<ValidatedAssetMeta>>(128, 0.75f, true)
     private val localFileCache = LinkedHashMap<LocalFileStamp, CachedLocalAsset>(64, 0.75f, true)
     private var cachedLocalChars = 0L
+    private var invalidationEpoch = 0L
 
-    private fun localFileStamp(file: File): LocalFileStamp {
-        val canonical = file.canonicalFile
-        val attrs = runCatching { Files.readAttributes(canonical.toPath(), BasicFileAttributes::class.java) }.getOrNull()
-        val length = attrs?.size() ?: canonical.length()
-        val lastModified = attrs?.lastModifiedTime()?.toMillis() ?: canonical.lastModified()
-        return LocalFileStamp(canonical.path, length, lastModified, attrs?.fileKey())
+    internal var localFileBytesReader: (File) -> ByteArray = { it.readBytes() }
+
+    internal fun cachedLocalAssetCount(): Int = synchronized(cacheLock) { localFileCache.size }
+
+    private fun cacheableAppAssetFile(file: File): File? {
+        if (runCatching { Files.isSymbolicLink(file.toPath()) }.getOrDefault(true)) return null
+        return containedFile(bundles, file) ?: containedFile(attachments, file)
+    }
+
+    private fun localFileStampOrNull(canonical: File): LocalFileStamp? {
+        val attrs = runCatching {
+            Files.readAttributes(canonical.toPath(), BasicFileAttributes::class.java, LinkOption.NOFOLLOW_LINKS)
+        }.getOrNull() ?: return null
+        if (!attrs.isRegularFile) return null
+        return LocalFileStamp(
+            canonicalPath = canonical.path,
+            length = attrs.size(),
+            lastModifiedNanos = attrs.lastModifiedTime().to(TimeUnit.NANOSECONDS),
+            creationTimeNanos = attrs.creationTime().to(TimeUnit.NANOSECONDS),
+            fileKey = attrs.fileKey(),
+        )
     }
 
     internal fun invalidateLocalAsset(file: File) {
         val targetPath = runCatching { file.canonicalPath }.getOrDefault(file.absolutePath)
+        val targetPrefix = targetPath + File.separator
         synchronized(cacheLock) {
+            invalidationEpoch++
             val iterator = localFileCache.entries.iterator()
             while (iterator.hasNext()) {
                 val entry = iterator.next()
-                if (entry.key.canonicalPath == targetPath) {
+                if (entry.key.canonicalPath == targetPath || entry.key.canonicalPath.startsWith(targetPrefix)) {
                     cachedLocalChars -= entry.value.dataUrl.length
                     iterator.remove()
                 }
@@ -125,26 +146,47 @@ class MediaStorage(private val context: Context) {
         return null
     }
 
-    private fun cacheLocalAsset(file: File, mime: String, decodedSize: Int, dataUrl: String) {
-        cacheValidatedDataUrl(dataUrl, mime, decodedSize)
-        if (dataUrl.length.toLong() > MAX_CACHED_LOCAL_CHARS) return
-        val stamp = localFileStamp(file)
-        synchronized(cacheLock) {
-            localFileCache.remove(stamp)?.let { cachedLocalChars -= it.dataUrl.length }
-            localFileCache[stamp] = CachedLocalAsset(mime, decodedSize, dataUrl)
-            cachedLocalChars += dataUrl.length
-            while (localFileCache.size > MAX_CACHED_LOCAL_ASSETS || cachedLocalChars > MAX_CACHED_LOCAL_CHARS) {
-                val eldest = localFileCache.entries.firstOrNull() ?: break
-                cachedLocalChars -= eldest.value.dataUrl.length
-                localFileCache.remove(eldest.key)
-            }
+    private fun putCachedLocalAssetLocked(stamp: LocalFileStamp, mime: String, decodedSize: Int, dataUrl: String) {
+        localFileCache.remove(stamp)?.let { cachedLocalChars -= it.dataUrl.length }
+        localFileCache[stamp] = CachedLocalAsset(mime, decodedSize, dataUrl)
+        cachedLocalChars += dataUrl.length
+        while (localFileCache.size > MAX_CACHED_LOCAL_ASSETS || cachedLocalChars > MAX_CACHED_LOCAL_CHARS) {
+            val eldest = localFileCache.entries.firstOrNull() ?: break
+            cachedLocalChars -= eldest.value.dataUrl.length
+            localFileCache.remove(eldest.key)
         }
     }
 
-    private fun lookupLocalAsset(file: File, expectedMime: String): CachedLocalAsset? {
-        val stamp = localFileStamp(file)
-        return synchronized(cacheLock) {
-            localFileCache[stamp]?.takeIf { it.mime == expectedMime }
+    private fun cacheStableLocalAsset(
+        canonical: File,
+        expectedStamp: LocalFileStamp,
+        expectedEpoch: Long,
+        mime: String,
+        decodedSize: Int,
+        dataUrl: String,
+    ) {
+        cacheValidatedDataUrl(dataUrl, mime, decodedSize)
+        if (dataUrl.length.toLong() > MAX_CACHED_LOCAL_CHARS) return
+        synchronized(cacheLock) {
+            if (invalidationEpoch != expectedEpoch) return
+            val currentStamp = localFileStampOrNull(canonical) ?: return
+            if (currentStamp != expectedStamp) return
+            putCachedLocalAssetLocked(expectedStamp, mime, decodedSize, dataUrl)
+        }
+    }
+
+    private fun cacheWrittenLocalAsset(file: File, mime: String, decodedSize: Int, dataUrl: String) {
+        cacheValidatedDataUrl(dataUrl, mime, decodedSize)
+        if (dataUrl.length.toLong() > MAX_CACHED_LOCAL_CHARS) return
+        val canonical = cacheableAppAssetFile(file) ?: return
+        val beforeEpoch = synchronized(cacheLock) { invalidationEpoch }
+        val beforeStamp = localFileStampOrNull(canonical) ?: return
+        if (beforeStamp.length != decodedSize.toLong()) return
+        synchronized(cacheLock) {
+            if (invalidationEpoch != beforeEpoch) return
+            val afterStamp = localFileStampOrNull(canonical) ?: return
+            if (afterStamp != beforeStamp) return
+            putCachedLocalAssetLocked(beforeStamp, mime, decodedSize, dataUrl)
         }
     }
 
@@ -226,12 +268,29 @@ class MediaStorage(private val context: Context) {
     fun data(file: File): String {
         require(file.length() <= 25_000_000)
         val expectedMime = mime(file.name)
-        lookupLocalAsset(file, expectedMime)?.let { return it.dataUrl }
-        val bytes = file.readBytes()
+        val cacheableCanonical = cacheableAppAssetFile(file)
+        val beforeEpoch = synchronized(cacheLock) { invalidationEpoch }
+        val beforeStamp = cacheableCanonical?.let(::localFileStampOrNull)
+        if (beforeStamp != null) {
+            synchronized(cacheLock) {
+                if (invalidationEpoch == beforeEpoch) {
+                    localFileCache[beforeStamp]?.takeIf { it.mime == expectedMime }
+                } else {
+                    null
+                }
+            }?.let { return it.dataUrl }
+        }
+        val readTarget = cacheableCanonical ?: file
+        val bytes = localFileBytesReader(readTarget)
         require(bytes.size <= 25_000_000)
         portableBase64Encodes.incrementAndGet()
         val encoded = "data:$expectedMime;base64," + Base64.encodeToString(bytes, Base64.NO_WRAP)
-        cacheLocalAsset(file, expectedMime, bytes.size, encoded)
+        if (cacheableCanonical != null && beforeStamp != null && bytes.size.toLong() == beforeStamp.length) {
+            val afterStamp = localFileStampOrNull(cacheableCanonical)
+            if (afterStamp != null && afterStamp == beforeStamp) {
+                cacheStableLocalAsset(cacheableCanonical, beforeStamp, beforeEpoch, expectedMime, bytes.size, encoded)
+            }
+        }
         return encoded
     }
     private fun store(name: String, type: String, bytes: ByteArray): JSONObject {
@@ -612,7 +671,7 @@ class MediaStorage(private val context: Context) {
                         } else {
                             "data:$type;base64," + Base64.encodeToString(bytes, Base64.NO_WRAP)
                         }
-                        cacheLocalAsset(targetFile, type, bytes.size, canonicalUrl)
+                        cacheWrittenLocalAsset(targetFile, type, bytes.size, canonicalUrl)
                     }; reader.endObject() }
                     else -> error("Unknown portable-file field")
                 }
@@ -620,7 +679,7 @@ class MediaStorage(private val context: Context) {
             }
             require(format in listOf("supermd-smd", "supermd-fmd") && version == 1 && markdown != null) { "Unsupported portable SMD file" }
             return Opened(markdown!!, directory)
-        } catch (error: Exception) { root.deleteRecursively(); throw error }
+        } catch (error: Exception) { invalidateLocalAsset(root); root.deleteRecursively(); throw error }
     }
     fun writeFmd(output: java.io.OutputStream, markdown: String, assets: JSONObject) {
         writeFmd(output, markdown, assets, null)
@@ -799,7 +858,7 @@ class MediaStorage(private val context: Context) {
                     total += byteSize
                     require(total <= 75_000_000) { "FMD assets exceed 75 MB" }
                     reusableFile.copyTo(destFile, overwrite = true)
-                    cacheLocalAsset(destFile, type, byteSize, reusableData)
+                    cacheWrittenLocalAsset(destFile, type, byteSize, reusableData)
                 } else if (predecoded != null) {
                     val (type, bytes) = predecoded
                     require(bytes.size <= 25_000_000) { "Image exceeds 25 MB" }
@@ -808,7 +867,7 @@ class MediaStorage(private val context: Context) {
                     require(total <= 75_000_000) { "FMD assets exceed 75 MB" }
                     destFile.writeBytes(bytes)
                     portableAssetExtractions.incrementAndGet()
-                    cacheLocalAsset(destFile, type, bytes.size, rawValue)
+                    cacheWrittenLocalAsset(destFile, type, bytes.size, rawValue)
                 } else {
                     val (type, bytes) = decode(rawValue)
                     require(mime(source) == type) { "Image extension does not match its type" }
@@ -817,11 +876,12 @@ class MediaStorage(private val context: Context) {
                     destFile.writeBytes(bytes)
                     portableAssetExtractions.incrementAndGet()
                     val canonicalUrl = "data:$type;base64," + Base64.encodeToString(bytes, Base64.NO_WRAP)
-                    cacheLocalAsset(destFile, type, bytes.size, canonicalUrl)
+                    cacheWrittenLocalAsset(destFile, type, bytes.size, canonicalUrl)
                 }
             }
             return directory
         } catch (error: Exception) {
+            invalidateLocalAsset(root)
             root.deleteRecursively()
             throw error
         }
