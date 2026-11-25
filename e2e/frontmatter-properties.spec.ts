@@ -182,6 +182,29 @@ test("renders properties header, hides YAML variations, isolates live first-bloc
     const yamlEditor = page.getByRole("textbox", { name: "Edit YAML frontmatter" });
     await expect(yamlEditor).toBeVisible();
     await expect(yamlEditor).toContainText('title: "Path Integrals & Symmetries"');
+    await page.evaluate(() => {
+      const area = document.querySelector<HTMLTextAreaElement>('textarea[aria-label="Edit YAML frontmatter"]')!;
+      area.focus();
+      const subStart = area.value.indexOf("Graduate Lecture Notes");
+      area.setSelectionRange(subStart, subStart + "Graduate Lecture Notes".length);
+      const clipboard = new DataTransfer();
+      clipboard.setData("text/plain", "https://symmetry.example.com/notes");
+      area.dispatchEvent(new ClipboardEvent("paste", { clipboardData: clipboard, bubbles: true, cancelable: true }));
+    });
+    await expect(yamlEditor).toHaveValue(/subtitle: https:\/\/symmetry\.example\.com\/notes/);
+    await expect(yamlEditor).not.toHaveValue(/\[Graduate Lecture Notes\]/);
+    if (host === "qt") {
+      await page.evaluate(() => window.supermdHistory?.("undo"));
+    } else {
+      await page.keyboard.press("Control+z");
+    }
+    await expect(yamlEditor).toHaveValue(/subtitle: Graduate Lecture Notes/);
+    if (host === "qt") {
+      await page.evaluate(() => window.supermdFormat?.("bold"));
+    } else {
+      await page.keyboard.press("Control+b");
+    }
+    await expect(yamlEditor).not.toHaveValue(/\*\*Graduate Lecture Notes\*\*/);
     await yamlEditor.fill(
       [
         "---",
@@ -196,6 +219,23 @@ test("renders properties header, hides YAML variations, isolates live first-bloc
     await expect(page.getByRole("region", { name: "Document properties" })).toContainText("Path Integrals & Gauge Symmetries");
     expect(await page.evaluate(() => (window as any).__lastChangedContent)).toContain(
       '\uFEFF---\ntitle: "Path Integrals & Gauge Symmetries"\nsubtitle: Revised Lecture Notes',
+    );
+
+    // Clearing YAML frontmatter on a BOM-prefixed note preserves the UTF-8 BOM and removes separator blank lines.
+    await page.getByRole("region", { name: "Document properties" }).dblclick();
+    await expect(yamlEditor).toBeVisible();
+    await yamlEditor.fill("");
+    await yamlEditor.press("Escape");
+    await expect(page.getByRole("region", { name: "Document properties" })).toHaveCount(0);
+    expect(await page.evaluate(() => (window as any).__lastChangedContent)).toBe(
+      [
+        "\uFEFF# Updated Propagator Kernel",
+        "",
+        "Transition amplitude between boundary states:",
+        "",
+        "- [ ] Derive stationary phase approximation",
+        "- [x] Verify unitarity",
+      ].join("\n"),
     );
 
     // Custom-only and empty frontmatter are visible and editable as raw YAML in Live mode.
