@@ -481,7 +481,7 @@ def build_mcp_server(roots: list[str], live_client=None):
             if format == "smd":
                 return export_smd(store, path, output_path)
             # Markdown export preserves the exact Markdown content and refuses overwrite.
-            markdown, _assets, _portable, _raw = store._load(store.resolve(path))
+            markdown = store.read_markdown(path)
             return store.create(output_path, markdown)
         if action == "job_status":
             if not isinstance(job_id, str) or not job_id or len(job_id) > 300:
@@ -645,9 +645,6 @@ def build_mcp_server(roots: list[str], live_client=None):
             return as_asset_image_blocks(image.get("data"), image.get("mime_type", ""), metadata)
         if not expected_revision:
             raise AgentDocumentError("Image extraction requires expected_revision from document_inspect")
-        info = store.inspect(path)
-        if info["revision"] != expected_revision:
-            raise RevisionConflict("Document changed since it was read; inspect again before extracting")
         asset = store.read_asset(path, asset_name, expected_revision=expected_revision)
         mime, data = asset["mime_type"], asset["data"]
         # Pass verified, app-supported asset types as true MCP image blocks.
