@@ -60,9 +60,11 @@ tab dragging is intentionally not implemented.
 ## Honest platform differences
 
 Android supplies an OS share sheet with restricted, read-only FileProvider URIs
-for PDF, Markdown and SMD copies. Desktop currently prepares a shareable copy;
+for PDF, Markdown, Markdown ZIP and SMD copies. Desktop currently prepares a shareable copy;
 a universal native share sheet is not implemented on Linux/Windows/macOS.
-Markdown sharing is text-only: use portable SMD to include images in one file.
+Markdown exports and shares keep vector and raster images as companion files (or a
+single `.zip` bundle in Markdown ZIP mode), while portable SMD keeps editable
+Markdown and images together in one `.smd` file.
 
 Desktop can use installed font families and a selected system Python/venv.
 Android bundles Python/NumPy/Matplotlib instead. Phone controls use touch-sized

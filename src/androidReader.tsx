@@ -1033,13 +1033,17 @@ export function Reader() {
         return response;
       }
       if(request.action==='export_document'){
-        const format=request.format;if(!['pdf','smd','md'].includes(String(format)))throw Error('Export format must be pdf, smd or md');
+        const format=String(request.format);if(!['pdf','smd','md','mdzip'].includes(format))throw Error('Export format must be pdf, smd, md or mdzip');
         const suppliedOptions=request.options&&typeof request.options==='object'&&!Array.isArray(request.options)?request.options as Record<string,unknown>:{};
+        const rawArchive=Object.prototype.hasOwnProperty.call(suppliedOptions,'archive')?suppliedOptions.archive:(request as Record<string,unknown>).archive;
+        if(rawArchive!==undefined&&typeof rawArchive!=='boolean')throw Error('Export archive option must be a boolean');
+        if(rawArchive===true&&format!=='md'&&format!=='mdzip')throw Error('Archive mode is only supported for Markdown exports');
+        const archive=format==='mdzip'||rawArchive===true;
         const hasSection=Object.prototype.hasOwnProperty.call(suppliedOptions,'section'),section=hasSection?agentSectionForExport(note.content,suppliedOptions.section):undefined;
-        const exportContent=section?.text??note.content,{section:_section,...exportOptions}=suppliedOptions;
-        const prepared=format==='pdf'?await preparePdf(exportContent,note.path,note.python||'embedded',{trustedImageHosts:trustedHostsRef.current}):format==='smd'?await prepareFmd(exportContent,note.path):await prepareMarkdownExport(exportContent,note.path);
+        const exportContent=section?.text??note.content,{section:_section,archive:_archive,...exportOptions}=suppliedOptions;
+        const prepared=format==='pdf'?await preparePdf(exportContent,note.path,note.python||'embedded',{trustedImageHosts:trustedHostsRef.current}):format==='smd'?await prepareFmd(exportContent,note.path):await prepareMarkdownExport(exportContent,note.path,{compatible:archive,python:note.python||'embedded'});
         if(reference.current?.id!==note.id||reference.current.content!==note.content)throw Error('Revision conflict: the note changed while preparing the export');
-        const result=await invoke<Record<string,unknown>>('agent_export_native',{...prepared,id:note.id,expectedRevision:revision,requestId:request.requestId,format,filename:request.filename,options:exportOptions});
+        const result=await invoke<Record<string,unknown>>('agent_export_native',{...prepared,id:note.id,expectedRevision:revision,requestId:request.requestId,format:archive?'mdzip':format,...(archive?{archive:true}:{}),filename:request.filename,options:exportOptions});
         return section?{...result,sectionStart:section.sectionStart,sectionEnd:section.sectionEnd,documentLength:section.documentLength}:result;
       }
       throw Error('Unsupported live reader action');
