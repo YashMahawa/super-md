@@ -194,7 +194,7 @@ function Reader() {
   const anchors = (focus?:Point) => Array.from(document.querySelectorAll<HTMLElement>(".android-reading,.cm-scroller")).filter(root=>{const r=root.getBoundingClientRect();return !focus || focus.x>=r.left&&focus.x<=r.right&&focus.y>=r.top&&focus.y<=r.bottom;}).map(root=>captureScrollAnchor(root,focus));
   const applyZoomStyle=(focus?:Point,previousFocus=focus,anchors?:Map<HTMLElement,Point|null>)=>{document.querySelector<HTMLElement>(".android-source")?.style.setProperty("--workspace-scale",String(zoomReference.current/100));document.querySelectorAll<HTMLElement>(".android-reading").forEach(root=>applyDocumentZoom(root,zoomReference.current,reference.current?.widthPercent??90,focus,previousFocus,anchors?.get(root),reference.current?.centerLock===true));};
   const anchored = (update:()=>void) => { const restore = anchors(); update(); requestAnimationFrame(()=>restore.forEach(callback=>callback())); };
-  useEffect(() => {
+  useLayoutEffect(() => {
     const nativeScroll=new FrameScrollQueue((scroller,dx,dy)=>{
       const reading=scroller.matches('.android-reading');
       if(reading){cancelHeadingNavigation(scroller);rememberWindowedScrollSource(scroller,dy);if(Math.abs(dy)>2)requestChrome('hide');}
@@ -548,7 +548,7 @@ function Reader() {
     scroll();
     return()=>{window.clearTimeout(timer);save();root.removeEventListener('scroll',scroll);window.removeEventListener('pagehide',save);document.removeEventListener('visibilitychange',save);savePosition.current=()=>{};};
   },[state?.id,state?.mode,state?.path,state?.restorePosition]);
-  useEffect(() => {
+  useLayoutEffect(() => {
     const find=(event:KeyboardEvent)=>{
       if(document.documentElement.dataset.host==='qt')return;
       if(!event.ctrlKey&&!event.metaKey&&!event.altKey&&event.key==="F3"){
@@ -1025,4 +1025,5 @@ function Reader() {
     {(state.mode === "reader" || state.mode === "split") && <section className="android-reading" data-full-document-accessibility={state.fullDocumentAccessibility ? "true" : undefined}><div className="reader-chrome-spacer" aria-hidden="true"/><div key={state.id} className="document-page-space"><div className="document-page"><DocumentPreview markdown={state.content} onChange={update} documentPath={state.path} python={state.python || "embedded"} dark={false} trustedImageHosts={trustedHosts} onTrustImageHost={trustHost} fullDocumentAccessibility={state.fullDocumentAccessibility} sourceAnalysis={readerAnalysis?.source===state.content?readerAnalysis:undefined} /></div></div></section>}
   </div></DocumentAppearance.Provider>;
 }
-createRoot(document.getElementById("root")!).render(<Reader />);
+const mountReaderRoot = () => createRoot(document.getElementById("root")!).render(<Reader />);
+if ((globalThis as { IS_REACT_ACT_ENVIRONMENT?: boolean }).IS_REACT_ACT_ENVIRONMENT) mountReaderRoot(); else flushSync(mountReaderRoot);
