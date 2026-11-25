@@ -362,13 +362,35 @@ export function normalizeMarkdownSource(markdown:string):Stage {
   add(stripPercentComments(value));
   let ranges=unmaskedRangesFromMask(computeCodeMask(value));
   const addUnmasked=(regex:RegExp,replacement:(...args:any[])=>string)=>{const next=unmaskedRegexStage(value,ranges,regex,replacement);ranges=next.ranges;add(next.stage);};
-  addUnmasked(/!\[\[([^\[\r\n\]|]+)(?:\|([^\r\n\]]+))?\]\]/g,(_all,path,label)=>`![${label??path}](${encodeURI(path)})`);
+  addUnmasked(/!\[\[([^\[\r\n\]|]+)(?:\|([^\r\n\]]+))?\]\]/g,(_all,path:string,spec?:string)=>{
+    const sized=spec&&/^(?:(.*)\|)?\s*(0*[1-9]\d*(?:\.\d+)?)\s*(?:x\s*\d+(?:\.\d+)?\s*)?$/i.exec(spec);
+    const alt=sized?(sized[1]?.trim()||path):(spec??path);
+    return `![${alt}](${encodeURI(path)})${sized?`{width=${sized[2]}}`:''}`;
+  });
   addUnmasked(/\[\[(#[^\[\r\n\]]+?)\]\]/g,(_all,target:string)=>{const [id,label]=target.split('|');return `[${label||id.slice(1)}](#${headingSlug(id.slice(1))})`;});
   addUnmasked(/\[\[([^\[\r\n\]|]+)(?:\|([^\r\n\]]+))?\]\]/g,(_all,target,label)=>`[${label??target}](${target.endsWith('.md')?target:`${target}.md`})`);
   add(normalizeCalloutBlocks(value,false));
   return {value,originalOffset(offset){for(let i=stages.length-1;i>=0;i--)offset=stages[i].originalOffset(offset);return offset;}};
 }
 export function normalizeCallouts(markdown:string):string{return normalizeMarkdownSource(markdown).value;}
+
+export function remarkImageAttributes() {
+  return (tree:any)=>{
+    visit(tree,(parent:any)=>{
+      if(!Array.isArray(parent.children))return;
+      for(let i=0;i<parent.children.length-1;i++){
+        const current=parent.children[i],next=parent.children[i+1];
+        if((current?.type==='image'||current?.type==='imageReference')&&next?.type==='text'&&typeof next.value==='string'){
+          const stripped=next.value.replace(/^\{[^}\r\n]*\b(?:width|zoom)\s*=\s*[^}\r\n]+\}/i,'');
+          if(stripped!==next.value){
+            if(stripped)parent.children[i+1]={...next,value:stripped};
+            else parent.children.splice(i+1,1);
+          }
+        }
+      }
+    });
+  };
+}
 
 export function remarkSourceSyntax(this:any){
   const parser=this.parser;

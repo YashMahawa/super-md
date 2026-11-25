@@ -35,6 +35,10 @@ afterEach(() => {
   vi.unstubAllGlobals();
 });
 
+function pointerEvent(type: string, init: MouseEventInit & { pointerId?: number; pointerType?: string } = {}) {
+  const event = new MouseEvent(type, init);
+  return Object.assign(event, { pointerId: init.pointerId ?? 1, pointerType: init.pointerType ?? "mouse" });
+}
 function StatefulLiveEditor({ initial, onEdit, typewriterScroll }: { initial: string; onEdit?: (next: string) => void; typewriterScroll?: boolean }) {
   const [markdown, setMarkdown] = useState(initial);
   return <LiveEditor markdown={markdown} documentPath={null} dark={false} python="" typewriterScroll={typewriterScroll} onChange={(next) => { setMarkdown(next); onEdit?.(next); }} />;
@@ -137,6 +141,110 @@ it("toggles formatting shortcuts, wraps URL pastes over selections, pastes plain
 
   act(() => root.unmount()); host.remove();
 });
+it("reveals Edit block on hover, keyboard focus, and tap without blocking single clicks or triggering on pan/fullscreen prose taps", async () => {
+  const host = document.createElement("div"); document.body.append(host); const root = createRoot(host); const edit = vi.fn();
+  const md = '[Standalone](https://example.com)\n\n> [!note]- Folded callout\n> Secret\n\n```smd-chart\n{"title":"Wave","x":{"min":0,"max":4},"series":[{"expression":"x"}]}\n```';
+  await act(async () => root.render(<LiveEditor markdown={md} documentPath={null} dark={false} python="" onChange={edit} />));
+  const blocks = host.querySelectorAll<HTMLElement>(".live-block");
+  expect(host.querySelector('button[aria-label="Edit block"]')).toBeNull();
+
+  // Keyboard focus reveals Edit block on standalone link without opening editor automatically.
+  act(() => blocks[0].focus());
+  expect(blocks[0].querySelector('button[aria-label="Edit block"]')).not.toBeNull();
+  act(() => blocks[0].querySelector<HTMLButtonElement>('button[aria-label="Edit block"]')!.click());
+  expect(host.querySelector("textarea")?.value).toBe("[Standalone](https://example.com)");
+  act(() => host.querySelector("textarea")!.dispatchEvent(new KeyboardEvent("keydown", { key: "Escape", bubbles: true, cancelable: true })));
+  expect(host.querySelector("textarea")).toBeNull();
+
+  // Touch pan drag (>8px) does not reveal Edit block.
+  act(() => {
+    blocks[1].blur();
+    document.body.focus();
+    blocks[1].dispatchEvent(pointerEvent("pointerdown", { bubbles: true, pointerId: 2, pointerType: "touch", clientX: 20, clientY: 20 }));
+    blocks[1].dispatchEvent(pointerEvent("pointermove", { bubbles: true, pointerId: 2, pointerType: "touch", clientX: 20, clientY: 45 }));
+    blocks[1].dispatchEvent(pointerEvent("pointerup", { bubbles: true, pointerId: 2, pointerType: "touch", clientX: 20, clientY: 45 }));
+  });
+  expect(blocks[1].querySelector('button[aria-label="Edit block"]')).toBeNull();
+
+  // Touch tap on collapsed callout reveals Edit block and opens source when clicked.
+  act(() => {
+    const summary = blocks[1].querySelector("summary")!;
+    summary.dispatchEvent(pointerEvent("pointerdown", { bubbles: true, pointerId: 3, pointerType: "touch", clientX: 25, clientY: 25 }));
+    summary.dispatchEvent(pointerEvent("pointerup", { bubbles: true, pointerId: 3, pointerType: "touch", clientX: 26, clientY: 25 }));
+  });
+  expect(blocks[1].querySelector('button[aria-label="Edit block"]')).not.toBeNull();
+  act(() => blocks[1].querySelector<HTMLButtonElement>('button[aria-label="Edit block"]')!.click());
+  expect(host.querySelector("textarea")?.value).toContain("[!note]- Folded callout");
+  act(() => host.querySelector("textarea")!.dispatchEvent(new KeyboardEvent("keydown", { key: "Escape", bubbles: true, cancelable: true })));
+
+  // Mouse hover on chart block reveals Edit block.
+  act(() => { blocks[2].dispatchEvent(pointerEvent("pointerover", { bubbles: true, pointerType: "mouse", buttons: 0 })); blocks[2].dispatchEvent(pointerEvent("pointermove", { bubbles: true, pointerType: "mouse", buttons: 0 })); });
+  expect(blocks[2].querySelector('button[aria-label="Edit block"]')).not.toBeNull();
+
+  // Fullscreen plain-prose tap does not reveal Edit block.
+  await act(async () => root.render(<LiveEditor markdown={"Plain paragraph"} documentPath={null} dark={false} python="" onChange={edit} />));
+  document.documentElement.dataset.fullscreen = "true";
+  const proseBlock = host.querySelector<HTMLElement>(".live-block")!;
+  const p = proseBlock.querySelector("p")!;
+  act(() => {
+    p.dispatchEvent(pointerEvent("pointerdown", { bubbles: true, pointerId: 4, pointerType: "touch", clientX: 10, clientY: 10 }));
+    p.dispatchEvent(pointerEvent("pointerup", { bubbles: true, pointerId: 4, pointerType: "touch", clientX: 10, clientY: 10 }));
+  });
+  expect(proseBlock.querySelector('button[aria-label="Edit block"]')).toBeNull();
+  delete document.documentElement.dataset.fullscreen;
+
+  act(() => root.unmount()); host.remove();
+});
+it("waits until pointer release on outside press and preserves lower block DOM across line-count edits", async () => {
+  const host = document.createElement("div"); document.body.append(host); const root = createRoot(host);
+  let latest = "# Title\n\n- [ ] Check me\n\n[Jump](#title)";
+  function Harness() {
+    const [md, setMd] = useState(latest);
+    return <div className="reading-scroll"><LiveEditor markdown={md} documentPath={null} dark={false} python="" onChange={(next) => { latest = next; setMd(next); }} /></div>;
+  }
+  await act(async () => root.render(<Harness />));
+  const lowerCheckboxBlock = host.querySelectorAll<HTMLElement>(".live-block")[1];
+  const lowerLinkBlock = host.querySelectorAll<HTMLElement>(".live-block")[2];
+
+  act(() => host.querySelector("h1")!.dispatchEvent(new MouseEvent("dblclick", { bubbles: true })));
+  const area = host.querySelector<HTMLTextAreaElement>("textarea")!;
+  act(() => {
+    const setter = Object.getOwnPropertyDescriptor(HTMLTextAreaElement.prototype, "value")!.set!;
+    setter.call(area, "# Title\nLine 2\nLine 3\nLine 4");
+    area.dispatchEvent(new Event("input", { bubbles: true }));
+  });
+  expect(host.querySelector("textarea")).not.toBeNull();
+
+  const link = lowerLinkBlock.querySelector("a")!;
+  let clicked = 0;
+  link.addEventListener("click", (e) => { e.preventDefault(); clicked++; });
+
+  // Press down on link below: textarea blurs during mousedown, but editor stays open until release!
+  act(() => {
+    link.dispatchEvent(pointerEvent("pointerdown", { bubbles: true, clientY: 200 }));
+    link.dispatchEvent(new MouseEvent("mousedown", { bubbles: true, clientY: 200 }));
+    area.dispatchEvent(new FocusEvent("focusout", { bubbles: true, relatedTarget: link }));
+    link.focus();
+  });
+  expect(host.querySelector("textarea")).not.toBeNull();
+
+  // Release pointer and dispatch click: link receives first click and editor closes cleanly.
+  await act(async () => {
+    link.dispatchEvent(pointerEvent("pointerup", { bubbles: true, clientY: 200 }));
+    link.dispatchEvent(new MouseEvent("mouseup", { bubbles: true, clientY: 200 }));
+    link.dispatchEvent(new MouseEvent("click", { bubbles: true, cancelable: true, clientY: 200 }));
+    await new Promise((resolve) => window.setTimeout(resolve, 10));
+  });
+
+  expect(clicked).toBe(1);
+  expect(latest).toContain("Line 4");
+  expect(host.querySelector("textarea")).toBeNull();
+  // Lower blocks kept their exact DOM elements despite text-length (+21 chars) and block-count (+1 block) changes!
+  expect(host.querySelectorAll(".live-block")[2]).toBe(lowerCheckboxBlock);
+  expect(host.querySelectorAll(".live-block")[3]).toBe(lowerLinkBlock);
+
+  act(() => root.unmount()); host.remove();
+});
 it("isolates YAML frontmatter when double-clicking, navigating with ArrowUp, or inserting with Cmd+Enter", async () => {
   const host = document.createElement("div"); document.body.append(host); const root = createRoot(host);
   let current = "\uFEFF---  \ntitle: Protected Metadata\nauthor: Paul Dirac\ntags: [quantum]\n...\n\n# Opening Heading\n\nBody paragraph.";
@@ -199,7 +307,6 @@ it("renders properties and an editable empty body block for frontmatter-only not
   expect(edit).toHaveBeenCalledWith("---\ntitle: Frontmatter Only\n---\n# First Body Line");
   act(() => root.unmount()); host.remove();
 });
-
 it("preserves the latest blurred textarea selection for supermd-insertion-point and clears it on external edits", async () => {
   const host = document.createElement("div"); document.body.append(host); const root = createRoot(host);
   let doc = "# Heading\n\nMiddle block\n\nLast block";
@@ -1038,5 +1145,119 @@ it("retains LiveEditor focus across WritingSuggestions replacement, dismissal, p
     window.localStorage.removeItem("supermd.personal-dictionary.v1");
     vi.useRealTimers();
   }
+});
+
+it("combines accessible Edit block controls with prose URL wrapping, raw paste in code/frontmatter, and editing the existing selection", async () => {
+  const host = document.createElement("div");
+  document.body.append(host);
+  const root = createRoot(host);
+  let doc = [
+    "Read the manual or run `old_cmd` today.",
+    "",
+    "```python",
+    'endpoint = "old_host"',
+    "```",
+  ].join("\n");
+  const renderDoc = () =>
+    root.render(
+      <LiveEditor
+        markdown={doc}
+        documentPath={null}
+        dark={false}
+        python=""
+        onChange={(next) => {
+          doc = next;
+          renderDoc();
+        }}
+      />,
+    );
+  await act(async () => { renderDoc(); });
+
+  const dispatchPaste = (area: HTMLTextAreaElement, text: string) => {
+    const pasteEvent = new Event("paste", { bubbles: true, cancelable: true });
+    Object.defineProperty(pasteEvent, "clipboardData", {
+      value: {
+        files: [],
+        getData: (type: string) => (type === "text/plain" ? text : ""),
+      },
+    });
+    area.dispatchEvent(pasteEvent);
+  };
+
+  // 1. Open first block via #62's accessible "Edit block" button on focus.
+  const firstBlock = host.querySelectorAll<HTMLElement>(".live-block")[0]!;
+  act(() => firstBlock.focus());
+  const editBtn = firstBlock.querySelector<HTMLButtonElement>('button[aria-label="Edit block"]');
+  expect(editBtn).not.toBeNull();
+  act(() => editBtn!.click());
+  let area = host.querySelector<HTMLTextAreaElement>("textarea")!;
+  expect(area.value).toBe("Read the manual or run `old_cmd` today.");
+
+  // Formatted paste over prose selection "manual" -> [manual](https://example.com/manual)
+  const manualStart = area.value.indexOf("manual");
+  act(() => {
+    area.focus();
+    area.setSelectionRange(manualStart, manualStart + 6);
+    dispatchPaste(area, "https://example.com/manual");
+  });
+  expect(area.value).toBe("Read the [manual](https://example.com/manual) or run `old_cmd` today.");
+
+  // Edit the existing selection: select full [manual](https://example.com/manual), unwrap with Ctrl+K,
+  // then bold the preserved "manual" selection with Ctrl+B, and replace it.
+  const linkSpanStart = area.value.indexOf("[manual]");
+  const linkSpanEnd = linkSpanStart + "[manual](https://example.com/manual)".length;
+  act(() => {
+    area.setSelectionRange(linkSpanStart, linkSpanEnd);
+    area.dispatchEvent(new KeyboardEvent("keydown", { key: "k", ctrlKey: true, bubbles: true, cancelable: true }));
+  });
+  expect(area.value).toBe("Read the manual or run `old_cmd` today.");
+  expect([area.selectionStart, area.selectionEnd]).toEqual([manualStart, manualStart + 6]);
+
+  act(() => {
+    area.dispatchEvent(new KeyboardEvent("keydown", { key: "b", ctrlKey: true, bubbles: true, cancelable: true }));
+  });
+  expect(area.value).toBe("Read the **manual** or run `old_cmd` today.");
+  expect([area.selectionStart, area.selectionEnd]).toEqual([manualStart + 2, manualStart + 8]);
+
+  // Raw paste over inline code selection `old_cmd` -> replaces with raw URL (not [old_cmd](url))
+  const cmdStart = area.value.indexOf("old_cmd");
+  act(() => {
+    area.setSelectionRange(cmdStart, cmdStart + "old_cmd".length);
+    dispatchPaste(area, "https://cli.example.com");
+  });
+  expect(area.value).toBe("Read the **manual** or run `https://cli.example.com` today.");
+  act(() => {
+    area.dispatchEvent(new KeyboardEvent("keydown", { key: "Escape", bubbles: true, cancelable: true }));
+  });
+  expect(host.querySelector("textarea")).toBeNull();
+
+  // 2. Open fenced code block via #62's accessible "Edit block" button on hover and raw-paste over "old_host".
+  const codeBlock = host.querySelectorAll<HTMLElement>(".live-block")[1]!;
+  act(() => {
+    codeBlock.dispatchEvent(pointerEvent("pointerover", { bubbles: true, pointerType: "mouse", buttons: 0 }));
+    codeBlock.dispatchEvent(pointerEvent("pointermove", { bubbles: true, pointerType: "mouse", buttons: 0 }));
+  });
+  const codeEditBtn = codeBlock.querySelector<HTMLButtonElement>('button[aria-label="Edit block"]');
+  expect(codeEditBtn).not.toBeNull();
+  act(() => codeEditBtn!.click());
+  area = host.querySelector<HTMLTextAreaElement>("textarea")!;
+  const hostStart = area.value.indexOf("old_host");
+  act(() => {
+    area.focus();
+    area.setSelectionRange(hostStart, hostStart + "old_host".length);
+    dispatchPaste(area, "https://api.example.com/v2");
+  });
+  expect(area.value).toContain('endpoint = "https://api.example.com/v2"');
+  expect(area.value).not.toContain("[old_host]");
+
+  // Single-step Undo restores "old_host" AND its [hostStart, hostStart + 8] selection
+  act(() => {
+    area.dispatchEvent(new KeyboardEvent("keydown", { key: "z", ctrlKey: true, bubbles: true, cancelable: true }));
+  });
+  expect(area.value).toContain('endpoint = "old_host"');
+  expect([area.selectionStart, area.selectionEnd]).toEqual([hostStart, hostStart + "old_host".length]);
+
+  act(() => root.unmount());
+  host.remove();
 });
 

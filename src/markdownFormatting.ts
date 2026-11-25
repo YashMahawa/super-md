@@ -1,6 +1,7 @@
 import { visit } from "unist-util-visit";
 import { analyzeDocument } from "./documentAnalysis";
 import { safeParseUrl } from "./documentMedia";
+import { parseFrontmatter } from "./frontmatter";
 import { maskCode } from "./markdownSource";
 
 export const FORMAT_ACTIONS = [
@@ -655,21 +656,64 @@ const VOID_HTML_TAGS = new Set([
   "wbr",
 ]);
 
+function isInsideTopOfFileFrontmatterEnvelope(doc: string, from: number): boolean {
+  const parsed = parseFrontmatter(doc);
+  if (parsed) return from < parsed.end;
+  const opener = /^(?:\uFEFF)?---[ \t]*\r?\n/.exec(doc);
+  if (!opener) return false;
+  let lineStart = opener[0].length;
+  let sawMappingKey = false;
+  while (lineStart <= doc.length && lineStart <= from + 16_384) {
+    const nl = doc.indexOf("\n", lineStart);
+    const lineEnd = nl === -1 ? doc.length : nl;
+    const contentEnd = lineEnd > lineStart && doc[lineEnd - 1] === "\r" ? lineEnd - 1 : lineEnd;
+    const line = doc.slice(lineStart, contentEnd);
+    if (/^(?:---|\.\.\.)[ \t]*$/.test(line)) {
+      const blockEnd = nl === -1 ? doc.length : nl + 1;
+      return sawMappingKey && from < blockEnd;
+    }
+    if (line.trim() === "") return false;
+    if (/^[A-Za-z0-9_.-]+\s*:/.test(line)) sawMappingKey = true;
+    if (nl === -1) break;
+    lineStart = nl + 1;
+  }
+  return sawMappingKey && from >= opener[0].length;
+}
+
 export function isProtectedMarkdownSelection(doc: string, from: number, to: number): boolean {
   if (from >= to || from < 0 || to > doc.length) return true;
   const selected = doc.slice(from, to);
   if (!selected.trim() || /[\r\n]/.test(selected) || parseStandaloneHttpUrl(selected) !== null) {
     return true;
   }
+  if (isInsideTopOfFileFrontmatterEnvelope(doc, from)) return true;
 
   // Inspect a bounded window around [from, to] so large notes never trigger full-file reparses.
   const radius = 16_384;
-  const windowStart = Math.max(0, from - radius);
+  let windowStart = Math.max(0, from - radius);
   const windowEnd = Math.min(doc.length, to + radius);
+  if (windowEnd <= 500_000) {
+    const maskedPrefix = maskCode(doc.slice(0, windowEnd));
+    if (maskedPrefix.slice(from, to) !== selected) return true;
+    if (windowStart > 0) {
+      // Align windowStart to a line outside any earlier fenced/indented code block so slice never starts mid-fence.
+      let lineStart = windowStart;
+      while (lineStart <= from) {
+        const nl = doc.indexOf("\n", lineStart);
+        const lineEnd = nl === -1 ? windowEnd : nl;
+        if (maskedPrefix.slice(lineStart, lineEnd).replace(/[>\s]/g, "").length > 0) {
+          windowStart = lineStart;
+          break;
+        }
+        if (nl === -1) break;
+        lineStart = nl + 1;
+      }
+    }
+  }
   const slice = doc.slice(windowStart, windowEnd);
   const localFrom = from - windowStart;
   const localTo = to - windowStart;
-  if (maskCode(slice).slice(localFrom, localTo) !== selected) return true;
+  if (windowEnd > 500_000 && maskCode(slice).slice(localFrom, localTo) !== selected) return true;
   const analysis = analyzeDocument(slice);
   if (windowStart === 0 && analysis.frontmatter && localFrom < analysis.frontmatter.end) return true;
 

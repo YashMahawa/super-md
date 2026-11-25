@@ -202,6 +202,29 @@ describe("applyMarkdownUrlPaste & protected contexts", () => {
     expect(applyMarkdownUrlPaste(dottedFrontmatter, [{ anchor: dottedBody, head: dottedBody + 4 }], url)?.doc).toBe(
       "\uFEFF---  \ntitle: selected\n...\n\n[Body](https://example.com/new) prose",
     );
+
+    const draftFrontmatter = "---\ntitle: \"unclosed quote\nsource: selected\n---";
+    const draftFmStart = draftFrontmatter.indexOf("selected");
+    expect(applyMarkdownUrlPaste(draftFrontmatter, [{ anchor: draftFmStart, head: draftFmStart + 8 }], url)).toBeNull();
+
+    const thematicBreakBeforeProse = "---\n\nRead selected prose";
+    const thematicProseStart = thematicBreakBeforeProse.indexOf("selected");
+    expect(
+      applyMarkdownUrlPaste(thematicBreakBeforeProse, [{ anchor: thematicProseStart, head: thematicProseStart + 8 }], url)?.doc,
+    ).toBe("---\n\nRead [selected](https://example.com/new) prose");
+  });
+
+  it("accurately distinguishes fenced code vs prose past the 16KB window boundary", () => {
+    const url = "https://example.com/large";
+    const largeCodeBody = "const row = 42;\n".repeat(1_300); // > 20 KB
+    const doc = `\`\`\`ts\n${largeCodeBody}const targetCode = 1;\n\`\`\`\n\nRead targetProse after fence.`;
+    const codeIdx = doc.indexOf("targetCode");
+    const proseIdx = doc.indexOf("targetProse");
+
+    expect(applyMarkdownUrlPaste(doc, [{ anchor: codeIdx, head: codeIdx + "targetCode".length }], url)).toBeNull();
+    const proseWrapped = applyMarkdownUrlPaste(doc, [{ anchor: proseIdx, head: proseIdx + "targetProse".length }], url);
+    expect(proseWrapped).not.toBeNull();
+    expect(proseWrapped!.doc).toContain("Read [targetProse](https://example.com/large) after fence.");
   });
 });
 
