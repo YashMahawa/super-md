@@ -511,7 +511,7 @@ async function loadAndMeasure(page, fixture, id, dark = false) {
     window.supermdNativeWheel?.(0, 0, { x: -1, y: -1 }, false);
     if (reader) reader.scrollTop = 0;
     const waitForFont = (async () => {
-      await document.fonts.load('18px Manrope');
+      await document.fonts.load('18px "Manrope Variable"');
       await document.fonts.ready;
       return performance.now() - started;
     })();

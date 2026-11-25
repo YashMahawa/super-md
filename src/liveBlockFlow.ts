@@ -129,10 +129,11 @@ export function indentMarkdownSelection(
     const preceding = collectPrecedingListItems(parsedAll, firstLineIndex, firstLine.quoteDepth);
     if (!outdent) {
       const parent = preceding.find((item) => item.indentCols <= firstLine.indentCols);
-      listColDelta =
-        parent && parent.contentCols > firstLine.indentCols
-          ? parent.contentCols - firstLine.indentCols
-          : firstLine.ownMarkerWidth;
+      listColDelta = parent
+        ? Math.max(0, parent.contentCols - firstLine.indentCols)
+        : firstLine.indentCols === 0
+          ? firstLine.ownMarkerWidth
+          : 0;
     } else {
       const ancestor = preceding.find((item) => item.indentCols < firstLine.indentCols);
       const targetCols = ancestor
@@ -286,7 +287,7 @@ export function editableBlockSpans(markdown: string, existing?: DocumentAnalysis
   for (let i = 0; i < nodes.length; i++) {
     const node = nodes[i];
     if (NON_EDITABLE_NODE_TYPES.has(node.type)) continue;
-    const block = analysis.blocks[i];
+    const block = analysis.bodyBlocks[i];
     if (!block) continue;
     spans.push({
       blockStart: block.start,

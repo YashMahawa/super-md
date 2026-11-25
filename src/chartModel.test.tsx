@@ -1,7 +1,20 @@
-import { describe,expect,it } from "vitest";
+// @vitest-environment jsdom
+import { afterEach,describe,expect,it } from "vitest";
+import { act } from "react";
+import { createRoot, type Root } from "react-dom/client";
 import { renderToStaticMarkup } from "react-dom/server";
-import { lineSegments,parseChartSpec,chartFeatures,safeCurve,seriesLabel } from "./chartModel";
+import { lineSegments,parseChartSpec,chartFeatures,safeCurve,seriesLabel,sliderStep } from "./chartModel";
 import InteractiveChart from "./components/InteractiveChart";
+import { chartValues, chartZooms, remember } from "./renderedOutputs";
+
+Object.assign(globalThis, { IS_REACT_ACT_ENVIRONMENT: true });
+let root: Root | null = null;
+afterEach(() => {
+  if (root) { act(() => root?.unmount()); root = null; }
+  document.body.innerHTML = "";
+  chartValues.clear();
+  chartZooms.clear();
+});
 it("rejects malformed shapes before rendering can crash",()=>{
   for(const spec of [null,[],{series:null},{series:[null]},{series:[],sliders:{}},{series:[{expression:"x"}],sliders:{}},{series:[{points:[null]}]},{series:[{expression:"x",color:"url(file:///secret)"}]},{series:[{expression:"x"}],sliders:[{name:"x",min:0,max:1,value:.5}]}]) {
     const source=JSON.stringify(spec);
@@ -43,5 +56,86 @@ describe("graph probing features", () => {
     expect(seriesLabel({expression:"a * Math.sin(x)"},0)).toBe("y = a·sin(x)");
     expect(seriesLabel({name:"Wave",expression:"sin(x)"},0)).toBe("Wave");
     expect(renderToStaticMarkup(<InteractiveChart source={JSON.stringify({series:[{expression:"x^2"}]})}/>)).toContain("y = x^2");
+  });
+
+  it("supports ln(x), rejects undeclared chart variables, and warns on NaN curves in multi-series plots", () => {
+    const lnChart = JSON.stringify({ series: [{ name: "Natural log", expression: "ln(x)" }], x: { min: -2, max: 6 } });
+    const lnHtml = renderToStaticMarkup(<InteractiveChart source={lnChart} />);
+    expect(lnHtml).toContain("chart-line");
+    expect(lnHtml).not.toContain("chart-warning");
+    expect(lnHtml).not.toContain("render-error");
+
+    for (const bad of [
+      { series: [{ expression: "a * sin(x)" }] },
+      { series: [{ expression: "a * sin(b * x)" }], sliders: [{ name: "a", min: 0.1, max: 2, value: 1 }] },
+      { series: [{ expression: "y + x" }] },
+    ]) {
+      const source = JSON.stringify(bad);
+      expect(() => parseChartSpec(source)).toThrow(/Unknown chart variable/);
+      expect(renderToStaticMarkup(<InteractiveChart source={source} />)).toContain("render-error");
+    }
+
+    const multiNaN = JSON.stringify({
+      series: [
+        { name: "Valid wave", expression: "sin(x)" },
+        { name: "Invalid log", expression: "ln(x)" }
+      ],
+      x: { min: -6, max: -1 }
+    });
+    const multiHtml = renderToStaticMarkup(<InteractiveChart source={multiNaN} />);
+    expect(multiHtml).toContain("chart-line");
+    expect(multiHtml).toContain("chart-warning");
+    expect(multiHtml).toContain("Invalid log");
+    expect(multiHtml).not.toContain("Valid wave.");
+  });
+
+  it("aligns omitted-step sliders onto declared defaults and resets sliders without resetting plot zoom", async () => {
+    for (const slider of [
+      { min: 0.2, max: 3, value: 1 },
+      { min: 0.1, max: 3, value: 1 },
+      { min: 0.15, max: 2, value: 0.73 },
+      { min: -3, max: 3, value: 0 },
+    ]) {
+      const step = sliderStep(slider);
+      const input = document.createElement("input");
+      input.type = "range";
+      input.min = String(slider.min);
+      input.max = String(slider.max);
+      input.step = String(step);
+      input.value = String(slider.value);
+      expect(Number(input.value)).toBeCloseTo(slider.value, 10);
+    }
+
+    const source = JSON.stringify({
+      title: "A changing wave",
+      series: [{ name: "Sine", expression: "sin(a*x)" }],
+      sliders: [{ name: "a", label: "Amplitude", min: 0.2, max: 3, value: 1 }]
+    });
+    remember(chartZooms, source, 2);
+    const host = document.createElement("div");
+    document.body.append(host);
+    root = createRoot(host);
+    await act(async () => root?.render(<InteractiveChart source={source} />));
+
+    expect(host.querySelectorAll("svg")).toHaveLength(1);
+    expect(host.querySelector('button[title="Reset sliders"]')).toBeNull();
+    expect(host.querySelector('button[title="Reset view"]')).toBeTruthy();
+
+    const range = host.querySelector<HTMLInputElement>('.chart-controls input[type="range"]')!;
+    await act(async () => {
+      Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, "value")!.set!.call(range, "1.5");
+      range.dispatchEvent(new Event("input", { bubbles: true }));
+    });
+    expect(host.querySelector(".chart-slider-head output")?.textContent).toBe("1.5");
+    expect(host.querySelectorAll("svg")).toHaveLength(1);
+
+    const resetSliders = host.querySelector<HTMLButtonElement>('button[title="Reset sliders"]')!;
+    expect(resetSliders).toBeTruthy();
+    await act(async () => resetSliders.click());
+    expect(host.querySelector(".chart-slider-head output")?.textContent).toBe("1");
+    expect(host.querySelector('button[title="Reset sliders"]')).toBeNull();
+    // Zoom reset stays independent and intact.
+    expect(host.querySelector(".interactive-chart")?.getAttribute("data-plot-zoom")).toBe("2");
+    expect(host.querySelector('button[title="Reset view"]')).toBeTruthy();
   });
 });

@@ -7,6 +7,7 @@ import remarkMath from "remark-math";
 import { SKIP, visit } from "unist-util-visit";
 import InteractiveChart from "./components/InteractiveChart";
 import { normalizeCallouts } from "./components/MarkdownPreview";
+import { parseFrontmatter } from "./frontmatter";
 import { invoke } from "./nativeBridge";
 import { renderMermaid } from "./mermaidRenderer";
 import { pythonOutput } from "./renderedOutputs";
@@ -14,6 +15,7 @@ import { analyzeDocument } from "./documentAnalysis";
 import { svgImage } from "./svgImage";
 import { remarkObsidianMath } from "./obsidianMath";
 import { remarkSvgBlocks } from "./svgBlocks";
+import { remarkStudySyntax } from "./studySyntax";
 import {parseStepDeck} from "./components/StepCards";
 import {stepDiagramSvg} from "./stepPdf";
 
@@ -63,7 +65,8 @@ export async function preparePdf(markdown: string, documentPath: string | null, 
   try {
   checkCurrent();
   report({ phase: "prepare", completed: 0, total: 1 });
-  const processor = unified().use(remarkParse).use(remarkGfm).use(remarkMath).use(remarkObsidianMath).use(remarkStringify);
+  const processor = unified().use(remarkParse).use(remarkGfm, { singleTilde: false }).use(remarkMath).use(remarkObsidianMath).use(remarkStudySyntax).use(remarkStringify);
+  const front = parseFrontmatter(markdown)?.raw || "";
   const normalized = normalizeCallouts(markdown);
   // parse() runs no transformers: lift raw <svg> markup into svg blocks here.
   const tree = remarkSvgBlocks()(processor.parse(normalized), { value: normalized });
@@ -245,7 +248,8 @@ export async function preparePdf(markdown: string, documentPath: string | null, 
   checkCurrent();
   // The marker is an extension, not a normal bracketed link. Stringify escapes
   // its opening bracket; restore only explicit blockquote callout prefixes.
-  const content = processor.stringify(tree).replace(/^([\t ]*>[\t ]*)\\(\[![\w-]+\][+-]?)/gm, "$1$2");
+  const body = processor.stringify(tree).replace(/^([\t ]*>[\t ]*)\\(\[![\w-]+\][+-]?)/gm, "$1$2");
+  const content = front ? (body ? `${front}${front.endsWith("\n") ? "" : "\n"}\n${body}` : front) : body;
   checkCurrent();
   return { content, assets };
   } finally {

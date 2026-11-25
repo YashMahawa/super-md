@@ -2,14 +2,20 @@
 pub mod portable;
 pub mod theme;
 pub mod pdf_assets;
+pub mod frontmatter;
 mod math_compatibility;
 mod step_grid;
+mod study;
+mod typesetter;
+pub use study::strip_percent_comments;
+#[doc(hidden)]
+pub use typesetter::{diagnostics, COMEMO_EVICT_MAX_AGE, CUSTOM_FONT_CACHE_MAX_BYTES, CUSTOM_FONT_CACHE_MAX_ENTRIES};
+pub(crate) use typesetter::{is_font_asset, validate_asset_path};
 use math_compatibility::compatible_math;
 use anyhow::{bail, Result};
 use pulldown_cmark::{Alignment, CodeBlockKind, Event, Options, Parser, Tag, TagEnd};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
-use typst_as_lib::{typst_kit_options::TypstKitFontOptions, TypstEngine};
 
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", default)]
@@ -45,8 +51,11 @@ fn string(value: &str) -> String { serde_json::to_string(value).unwrap() }
 fn text(value: &str) -> String { format!("#text({})", string(value)) }
 
 pub fn image_sources(markdown: &str) -> Vec<String> {
+    let body = frontmatter::strip_frontmatter(markdown);
+    let stripped = strip_percent_comments(body);
     let mut sources = Vec::new();
-    let mut events = Parser::new_ext(markdown, Options::all());
+    let options = Options::ENABLE_TABLES | Options::ENABLE_FOOTNOTES | Options::ENABLE_STRIKETHROUGH | Options::ENABLE_SUBSCRIPT | Options::ENABLE_SUPERSCRIPT | Options::ENABLE_TASKLISTS | Options::ENABLE_MATH;
+    let mut events = Parser::new_ext(&stripped, options);
     while let Some(event) = events.next() {
         match event {
             Event::Start(Tag::Image { dest_url, .. }) => sources.push(dest_url.to_string()),
@@ -72,6 +81,19 @@ pub fn image_sources(markdown: &str) -> Vec<String> {
 
 /// Normalize both Obsidian and Super MD callouts before parsing ordinary Markdown.
 pub fn normalize_callouts(input: &str) -> String {
+    if let Some(fm) = frontmatter::parse_frontmatter(input) {
+        let rest = &input[fm.end..];
+        let mut out = fm.raw.to_string();
+        if !out.ends_with('\n') && !rest.is_empty() {
+            out.push('\n');
+        }
+        out.push_str(&normalize_callouts_body(rest));
+        return out;
+    }
+    normalize_callouts_body(input)
+}
+
+fn normalize_callouts_body(input: &str) -> String {
     let mut output = String::new();
     let mut depth = 0usize;
     let mut fence: Option<(char,usize)> = None;
@@ -148,13 +170,22 @@ fn heading_slug(value: &str) -> String {
     let slug = value.trim().chars().map(|c| if c.is_whitespace() { '-' } else { c }).collect::<String>();
     if slug.is_empty() { "section".into() } else { slug }
 }
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum RenderStop<'b> {
+    Tag(TagEnd),
+    Html(&'b str),
+}
 impl<'a> Renderer<'a> {
     fn render(&mut self, end: Option<TagEnd>) -> Result<String> {
+        self.render_until(end.map(RenderStop::Tag))
+    }
+    fn render_until(&mut self, end: Option<RenderStop<'_>>) -> Result<String> {
         let mut out = String::new();
         while let Some(event) = self.events.next() {
             match event {
-                Event::End(tag) if Some(tag) == end => break,
+                Event::End(tag) if end == Some(RenderStop::Tag(tag)) => break,
                 Event::End(_) => {},
+                Event::InlineHtml(ref html) if end == Some(RenderStop::Html(html.as_ref())) => break,
                 Event::Text(value) => out.push_str(&text(&value)),
                 Event::Code(value) => out.push_str(&format!("#raw({})", string(&value))),
                 Event::InlineMath(ref value) | Event::DisplayMath(ref value) => {
@@ -168,7 +199,14 @@ impl<'a> Renderer<'a> {
                 Event::Rule => out.push_str("\n#line(length: 100%, stroke: .5pt + rgb(\"#d6dde5\"))\n"),
                 Event::TaskListMarker(checked) => out.push_str(if checked { "#text(\"☑ \u{a0}\")" } else { "#text(\"☐ \u{a0}\")" }),
                 Event::FootnoteReference(name) => out.push_str(&format!("#footnote[{}]", self.footnotes.get(name.as_ref()).cloned().unwrap_or_else(|| text(&name)))),
-                Event::Html(html) | Event::InlineHtml(html) => { if html.trim().starts_with("<br") { out.push_str("#linebreak()"); } },
+                Event::Html(html) | Event::InlineHtml(html) => match html.as_ref() {
+                    "<mark>" => out.push_str(&format!("#highlight(fill: smd-highlight, radius: 2pt, extent: 1pt)[{}]", self.render_until(Some(RenderStop::Html("</mark>")))?)),
+                    "<u>" => out.push_str(&format!("#underline[{}]", self.render_until(Some(RenderStop::Html("</u>")))?)),
+                    "<kbd>" => out.push_str(&format!("#box(fill: smd-code-fill, stroke: .5pt + smd-line, inset: (x: 3.5pt, y: 1pt), outset: (y: 1.5pt), radius: 2.5pt)[#text(font: (\"JetBrains Mono\", \"DejaVu Sans Mono\"), size: .86em)[{}]]", self.render_until(Some(RenderStop::Html("</kbd>")))?)),
+                    "</mark>" | "</u>" | "</kbd>" => {}
+                    _ if html.trim().starts_with("<br") => out.push_str("#linebreak()"),
+                    _ => out.push_str(&text(&html)),
+                },
                 Event::Start(tag) => {
                     let close = tag.to_end();
                     match tag {
@@ -181,20 +219,21 @@ impl<'a> Renderer<'a> {
                                 continue;
                             }
                             if ["mermaid", "smd-chart"].contains(&lang.as_str()) { bail!("Export preparation did not render a {lang} block"); }
-                            // Individual lines fit the available width while the
-                            // enclosing block stays breakable across pages.
-                            out.push_str("\n#block(width: 100%, breakable: true, fill: smd-code-fill, inset: 8pt)[\n");
-                            // Each fit is a block-level layout. Adding a separate
-                            // linebreak after it creates empty paragraphs and
-                            // wastes most of a page on short snippets.
-                            out.push_str("#set par(spacing: 0pt, leading: .3em)\n");
-                            for line in code.lines() { out.push_str(&format!("#block(height: 1.2em, above: 0pt, below: 0pt)[#smd-fit(raw({}, lang: {}))]\n", string(if line.is_empty() { " " } else { line }), string(&lang))); }
-                            out.push_str("]\n\n");
+                            // Highlight the whole block once and fit individual
+                            // synthesized lines inside a breakable container.
+                            let code_arg = if code.is_empty() {
+                                "none".into()
+                            } else {
+                                string(code.strip_suffix("\r\n").or_else(|| code.strip_suffix('\n')).unwrap_or(&code))
+                            };
+                            let lang_arg = if lang.is_empty() { "none".into() } else { string(&lang) };
+                            out.push_str(&format!("\n#smd-code({code_arg}, lang: {lang_arg})\n\n"));
                         },
                         Tag::Image { dest_url, .. } => {
                             let _alt = self.render(Some(close))?;
                             let key = dest_url.to_string();
-                            if !self.assets.contains_key(&key) { bail!("Image unavailable for PDF: {key}"); }
+                            validate_asset_path(&key)?;
+                            if is_font_asset(&key) || !self.assets.contains_key(&key) { bail!("Image unavailable for PDF: {key}"); }
                             out.push_str(&format!("#smd-image({})", string(&key)));
                         },
                         Tag::Table(columns) => {
@@ -260,6 +299,8 @@ impl<'a> Renderer<'a> {
                                 Tag::Emphasis => out.push_str(&format!("#emph[{body}]")),
                                 Tag::Strong => out.push_str(&format!("#strong[{body}]")),
                                 Tag::Strikethrough => out.push_str(&format!("#strike[{body}]")),
+                                Tag::Subscript => out.push_str(&format!("#sub[{body}]")),
+                                Tag::Superscript => out.push_str(&format!("#super[{body}]")),
                                 Tag::List(start) => out.push_str(&if let Some(start) = start { format!("\n#enum(start: {start}, {body})\n") } else { format!("\n#list({body})\n") }),
                                 Tag::Item => out.push_str(&format!("[{body}],\n")),
                                 Tag::Link { dest_url, .. } => out.push_str(&if let Some(fragment) = dest_url.strip_prefix('#') {
@@ -279,15 +320,22 @@ impl<'a> Renderer<'a> {
 }
 
 pub(crate) fn render_fragment(markdown: &str, assets: &HashMap<String, Vec<u8>>) -> Result<String> {
-    let normalized = normalize_table_math(&normalize_callouts(markdown));
-    let events = Parser::new_ext(&normalized, Options::ENABLE_TABLES | Options::ENABLE_STRIKETHROUGH | Options::ENABLE_MATH).collect::<Vec<_>>();
+    let body = frontmatter::strip_frontmatter(markdown);
+    let stripped = strip_percent_comments(body);
+    let normalized = normalize_table_math(&normalize_callouts_body(&stripped));
+    let events = study::enrich_events(&normalized, Options::ENABLE_TABLES | Options::ENABLE_STRIKETHROUGH | Options::ENABLE_SUBSCRIPT | Options::ENABLE_SUPERSCRIPT | Options::ENABLE_MATH);
     Renderer { events: events.into_iter().peekable(), assets, footnotes: HashMap::new(), headings: HashMap::new(), heading_counts: HashMap::new() }.render(None)
 }
 
 pub fn source(markdown: &str, options: &PdfOptions, assets: &HashMap<String, Vec<u8>>) -> Result<String> {
     options.validate()?;
-    let normalized = normalize_table_math(&normalize_callouts(markdown));
-    let events = Parser::new_ext(&normalized, Options::ENABLE_TABLES | Options::ENABLE_STRIKETHROUGH | Options::ENABLE_TASKLISTS | Options::ENABLE_MATH | Options::ENABLE_FOOTNOTES).collect::<Vec<_>>();
+    let (doc_metadata, raw_body) = match frontmatter::parse_frontmatter(markdown) {
+        Some(fm) => (fm.metadata.typst_set_document(), &markdown[fm.end..]),
+        None => (String::new(), markdown.strip_prefix('\u{feff}').unwrap_or(markdown)),
+    };
+    let stripped = strip_percent_comments(raw_body);
+    let normalized = normalize_table_math(&normalize_callouts_body(&stripped));
+    let events = study::enrich_events(&normalized, Options::ENABLE_TABLES | Options::ENABLE_STRIKETHROUGH | Options::ENABLE_SUBSCRIPT | Options::ENABLE_SUPERSCRIPT | Options::ENABLE_TASKLISTS | Options::ENABLE_MATH | Options::ENABLE_FOOTNOTES);
     let mut headings = HashMap::new(); let mut current = None::<String>;
     for event in &events { match event {
         Event::Start(Tag::Heading { .. }) => current = Some(String::new()),
@@ -303,7 +351,7 @@ pub fn source(markdown: &str, options: &PdfOptions, assets: &HashMap<String, Vec
     }
     renderer.footnotes = definitions.footnotes;
     let body = renderer.render(None)?;
-    let template = if options.page_numbers { include_str!("document.typ").to_string() } else { include_str!("document.typ").lines().filter(|line| !line.starts_with("#set page(footer:")).collect::<Vec<_>>().join("\n") };
+    let template: &str = if options.page_numbers { include_str!("document.typ") } else { &typesetter::UNNUMBERED_DOCUMENT_TEMPLATE };
     let paper=match options.page_size.as_str() {"letter"=>"us-letter","legal"=>"us-legal","tabloid"=>"us-tabloid","executive"=>"us-executive",other=>other};
     // MiTeX's bundled conversion spec still emits Typst's former `sect`
     // intersection name. Typst 0.15 calls it `inter`. Scope aliases preserve
@@ -318,46 +366,24 @@ pub fn source(markdown: &str, options: &PdfOptions, assets: &HashMap<String, Vec
 #let smd-header-fill = if smd-themed {{ color.mix((white, 76%), (smd-accent, 24%)) }} else {{ rgb("#e7e7e7") }}
 #let smd-line = if smd-themed {{ color.mix((white, 55%), (smd-accent, 45%)) }} else {{ rgb("#d6d6d6") }}
 #let smd-link = if smd-themed {{ color.mix((rgb("#202020"), 45%), (smd-accent, 55%)) }} else {{ rgb("#315d99") }}
+#let smd-highlight = if smd-themed {{ color.mix((smd-paper, 58%), (rgb("#f6c945"), 42%)) }} else {{ rgb("#fff2a8") }}
 "##, string(accent));
     // Typst collapses paragraph spacing against leading. Add leading so the
     // export control specifies the visible gap instead of disappearing below it.
-    Ok(format!("#import \"/mitex/standard.typ\": scope as mitex-scope\n#let smd-math-scope = mitex-scope + (sect: sym.inter,)\n{palette}#set page(paper: {}, margin: {}mm, fill: smd-paper)\n#set text(font: ({}, \"Libertinus Serif\", \"New Computer Modern\"), size: {}pt)\n#set par(leading: {}em, spacing: {}em)\n{template}\n{body}", string(paper), options.margin, string(&options.font_family), options.font_size, options.line_height - 0.7, options.line_height - 0.7 + options.paragraph_spacing))
+    Ok(format!("#import \"/mitex/standard.typ\": scope as mitex-scope\n#let smd-math-scope = mitex-scope + (sect: sym.inter,)\n{palette}{doc_metadata}#set page(paper: {}, margin: {}mm, fill: smd-paper)\n#set text(font: ({}, \"Libertinus Serif\", \"New Computer Modern\"), size: {}pt)\n#set par(leading: {}em, spacing: {}em)\n{template}\n{body}", string(paper), options.margin, string(&options.font_family), options.font_size, options.line_height - 0.7, options.line_height - 0.7 + options.paragraph_spacing))
 }
 
 pub fn export(markdown: &str, options: &PdfOptions, assets: &HashMap<String, Vec<u8>>) -> Result<Vec<u8>> {
     let source = source(markdown, options, assets)?;
-    let engine = TypstEngine::builder()
-        .main_file(source)
-        .fonts([
-            include_bytes!("../fonts/NotoSans-Regular.ttf").as_slice(),
-            include_bytes!("../fonts/NotoSans-Bold.ttf").as_slice(),
-            include_bytes!("../fonts/NotoSans-Italic.ttf").as_slice(),
-            include_bytes!("../fonts/NotoSans-BoldItalic.ttf").as_slice(),
-            include_bytes!("../fonts/Manrope.ttf").as_slice(),
-            include_bytes!("../fonts/Roboto.ttf").as_slice(),
-            include_bytes!("../fonts/NotoSerif.ttf").as_slice(),
-            include_bytes!("../fonts/JetBrainsMono.ttf").as_slice(),
-            include_bytes!("../fonts/NotoEmoji.ttf").as_slice(),
-        ].into_iter().chain(assets.iter().filter(|(name,_)| name.starts_with("__font_") && (name.ends_with(".ttf") || name.ends_with(".otf"))).map(|(_,bytes)| bytes.as_slice())))
-        .search_fonts_with(TypstKitFontOptions::default().include_system_fonts(!cfg!(target_os="android")).include_embedded_fonts(true))
-        .with_static_file_resolver(assets.iter().map(|(k,v)| (k.as_str(), v.as_slice())).chain([
-            ("__smd_icon_tip.svg",include_bytes!("../../desktop/icons/CalloutTip.svg").as_slice()),
-            ("__smd_icon_warning.svg",include_bytes!("../../desktop/icons/CalloutWarning.svg").as_slice()),
-            ("__smd_icon_info.svg",include_bytes!("../../desktop/icons/CalloutInfo.svg").as_slice()),
-            ("__smd_icon_error.svg",include_bytes!("../../desktop/icons/CalloutError.svg").as_slice()),
-            ("__smd_icon_success.svg",include_bytes!("../../desktop/icons/CalloutSuccess.svg").as_slice()),
-            ("__smd_icon_question.svg",include_bytes!("../../desktop/icons/CalloutQuestion.svg").as_slice()),
-            ("__smd_icon_answer.svg",include_bytes!("../../desktop/icons/CalloutAnswer.svg").as_slice()),
-            ("__smd_icon_example.svg",include_bytes!("../../desktop/icons/CalloutExample.svg").as_slice()),
-            ("__smd_icon_quote.svg",include_bytes!("../../desktop/icons/CalloutQuote.svg").as_slice()),
-        ]))
-        .with_static_source_file_resolver([
-            ("mitex/standard.typ", include_str!("mitex/standard.typ")),
-            ("mitex/prelude.typ", include_str!("mitex/prelude.typ")),
-        ])
-        .build();
-    let document = engine.compile().output.map_err(|errors| anyhow::anyhow!("PDF typesetting failed: {errors:?}"))?;
-    typst_pdf::pdf(&document, &Default::default()).map(|v| v.to_vec()).map_err(|e| anyhow::anyhow!("PDF encoding failed: {e:?}"))
+    typesetter::export_typst(source, options, assets)
+}
+
+#[cfg(target_os = "android")]
+fn jni_string(env: jni::JNIEnv, value: &str) -> jni::sys::jstring {
+    env.new_string(value)
+        .or_else(|_| env.new_string(""))
+        .map(|s| s.into_raw())
+        .unwrap_or(std::ptr::null_mut())
 }
 
 #[cfg(target_os = "android")]
@@ -365,8 +391,14 @@ pub fn export(markdown: &str, options: &PdfOptions, assets: &HashMap<String, Vec
 pub extern "system" fn Java_dev_supermd_studio_PdfEngine_validateTheme(
     mut env: jni::JNIEnv, _class: jni::objects::JClass, input: jni::objects::JString,
 ) -> jni::sys::jstring {
-    let result = match env.get_string(&input) { Ok(value)=>theme::response(&String::from(value)), Err(_)=>"{\"error\":\"Invalid theme input\"}".into() };
-    env.new_string(result).expect("Theme response").into_raw()
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        match env.get_string(&input) {
+            Ok(value) => theme::response(&String::from(value)),
+            Err(_) => "{\"error\":\"Invalid theme input\"}".into(),
+        }
+    }))
+    .unwrap_or_else(|_| "{\"error\":\"Theme validation failed\"}".into());
+    jni_string(env, &result)
 }
 
 #[cfg(target_os = "android")]
@@ -374,13 +406,18 @@ pub extern "system" fn Java_dev_supermd_studio_PdfEngine_validateTheme(
 pub extern "system" fn Java_dev_supermd_studio_PdfEngine_fontFamilies(
     mut env: jni::JNIEnv, _class: jni::objects::JClass, path: jni::objects::JString,
 ) -> jni::sys::jstring {
-    let result = (|| -> Result<Vec<String>> {
-        let path: String = env.get_string(&path)?.into();
-        if std::fs::metadata(&path)?.len()>20_000_000 { bail!("Font exceeds 20 MB"); }
-        let bytes=typst::foundations::Bytes::new(std::fs::read(path)?);
-        Ok(typst::text::Font::iter(bytes).map(|font| font.info().family.clone()).collect())
-    })();
-    env.new_string(serde_json::to_string(&result.unwrap_or_default()).unwrap()).unwrap().into_raw()
+    let payload = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let families = (|| -> Result<Vec<String>> {
+            let path: String = env.get_string(&path)?.into();
+            if std::fs::metadata(&path)?.len() > 20_000_000 { bail!("Font exceeds 20 MB"); }
+            let bytes = typst::foundations::Bytes::new(std::fs::read(path)?);
+            Ok(typst::text::Font::iter(bytes).map(|font| font.info().family.clone()).collect())
+        })()
+        .unwrap_or_default();
+        serde_json::to_string(&families).unwrap_or_else(|_| "[]".into())
+    }))
+    .unwrap_or_else(|_| "[]".into());
+    jni_string(env, &payload)
 }
 
 #[cfg(target_os = "android")]
@@ -388,8 +425,14 @@ pub extern "system" fn Java_dev_supermd_studio_PdfEngine_fontFamilies(
 pub extern "system" fn Java_dev_supermd_studio_PdfEngine_imageSources(
     mut env: jni::JNIEnv, _class: jni::objects::JClass, markdown: jni::objects::JString,
 ) -> jni::sys::jstring {
-    let markdown: String = env.get_string(&markdown).expect("Markdown string").into();
-    env.new_string(serde_json::to_string(&image_sources(&markdown)).unwrap()).unwrap().into_raw()
+    let payload = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        match env.get_string(&markdown) {
+            Ok(value) => serde_json::to_string(&image_sources(&String::from(value))).unwrap_or_else(|_| "[]".into()),
+            Err(_) => "[]".into(),
+        }
+    }))
+    .unwrap_or_else(|_| "[]".into());
+    jni_string(env, &payload)
 }
 
 #[cfg(target_os = "android")]
@@ -398,17 +441,21 @@ pub extern "system" fn Java_dev_supermd_studio_PdfEngine_export(
     mut env: jni::JNIEnv, _class: jni::objects::JClass, markdown: jni::objects::JString,
     options: jni::objects::JString, asset_dir: jni::objects::JString, output: jni::objects::JString,
 ) -> jni::sys::jstring {
-    let result = (|| -> Result<()> {
-        let markdown: String = env.get_string(&markdown)?.into();
-        let options: String = env.get_string(&options)?.into();
-        let asset_dir: String = env.get_string(&asset_dir)?.into();
-        let output: String = env.get_string(&output)?.into();
-        let options: PdfOptions = serde_json::from_str(&options)?;
-        let assets = pdf_assets::load_referenced_assets(&markdown, std::path::Path::new(&asset_dir))?;
-        std::fs::write(&output, export(&markdown, &options, &assets)?)?;
-        Ok(())
-    })();
-    env.new_string(result.err().map(|e| format!("{e:#}")).unwrap_or_default()).unwrap().into_raw()
+    let message = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let result = (|| -> Result<()> {
+            let markdown: String = env.get_string(&markdown)?.into();
+            let options: String = env.get_string(&options)?.into();
+            let asset_dir: String = env.get_string(&asset_dir)?.into();
+            let output: String = env.get_string(&output)?.into();
+            let options: PdfOptions = serde_json::from_str(&options)?;
+            let assets = pdf_assets::load_referenced_assets(&markdown, std::path::Path::new(&asset_dir))?;
+            std::fs::write(&output, export(&markdown, &options, &assets)?)?;
+            Ok(())
+        })();
+        result.err().map(|e| format!("{e:#}")).unwrap_or_default()
+    }))
+    .unwrap_or_else(|_| "PDF export failed unexpectedly".into());
+    jni_string(env, &message)
 }
 
 #[cfg(test)]
@@ -590,6 +637,202 @@ P(A\cup B\cup C)=&P(A)+P(B)+P(C)\\
             }
         }
     }
+    fn decompress_pdf_streams(pdf: &[u8]) -> String {
+        use std::io::Read;
+        let mut out = String::new();
+        let mut cursor = 0;
+        while let Some(pos) = pdf[cursor..].windows(6).position(|w| w == b"stream") {
+            let mut start = cursor + pos + 6;
+            if pdf.get(start) == Some(&b'\r') { start += 1; }
+            if pdf.get(start) == Some(&b'\n') { start += 1; } else { cursor = start; continue; }
+            let Some(end_rel) = pdf[start..].windows(9).position(|w| w == b"endstream") else { break };
+            let mut end = start + end_rel;
+            while end > start && matches!(pdf[end - 1], b'\r' | b'\n') { end -= 1; }
+            let mut decoded = Vec::new();
+            if flate2::read::ZlibDecoder::new(&pdf[start..end]).read_to_end(&mut decoded).is_ok() {
+                if let Ok(text) = String::from_utf8(decoded) {
+                    out.push_str(&text);
+                    out.push('\n');
+                }
+            }
+            cursor = start + end_rel + 9;
+        }
+        out
+    }
+    #[test]
+    fn code_blocks_preserve_multiline_syntax_highlighting() {
+        let string_only = "```python\nprint(\"\"\"\ndef inside_multiline_string(): return 42\n\"\"\")\n```\n";
+        let with_real_def = "```python\nprint(\"\"\"\ndef inside_multiline_string(): return 42\n\"\"\")\ndef real_function(): return 42\n```\n";
+        let rendered = source(with_real_def, &PdfOptions::default(), &HashMap::new()).unwrap();
+        assert_eq!(rendered.matches("\n#smd-code(").count(), 1, "Expected one #smd-code call for the block: {rendered}");
+
+        let string_streams = decompress_pdf_streams(&export(string_only, &PdfOptions::default(), &HashMap::new()).unwrap());
+        let real_def_streams = decompress_pdf_streams(&export(with_real_def, &PdfOptions::default(), &HashMap::new()).unwrap());
+        // Typst Light highlights strings in #198810 and keywords in #d73948 via PDF `scn` color operators.
+        let has_scn = |streams: &str, target: [f64; 3]| {
+            streams.lines().any(|line| {
+                let Some(rest) = line.split("/c1 cs ").nth(1) else { return false };
+                let parts: Vec<&str> = rest.split_whitespace().collect();
+                parts.len() >= 4 && parts[3] == "scn" && (0..3).all(|i| parts[i].parse::<f64>().is_ok_and(|v| (v - target[i]).abs() < 0.01))
+            })
+        };
+        let string_green = [0x19 as f64 / 255., 0x88 as f64 / 255., 0x10 as f64 / 255.];
+        let keyword_red = [0xd7 as f64 / 255., 0x39 as f64 / 255., 0x48 as f64 / 255.];
+        assert!(has_scn(&string_streams, string_green), "Multi-line Python string must emit string highlight color:\n{string_streams}");
+        assert!(!has_scn(&string_streams, keyword_red), "Keywords inside a multi-line string must not highlight as keywords:\n{string_streams}");
+        assert!(has_scn(&real_def_streams, keyword_red), "Code after closing triple quotes must resume keyword highlighting:\n{real_def_streams}");
+    }
+    #[test]
+    fn code_blocks_preserve_blank_lines_trailing_newlines_and_empty_fences() {
+        // Empty tagged and untagged fences pass `none`.
+        let empty_md = "```python\n```\n\n```\n```\n\nAFTER-EMPTY\n";
+        let empty_src = source(empty_md, &PdfOptions::default(), &HashMap::new()).unwrap();
+        assert!(empty_src.contains("#smd-code(none, lang: \"python\")"), "{empty_src}");
+        assert!(empty_src.contains("#smd-code(none, lang: none)"), "{empty_src}");
+        assert!(export(empty_md, &PdfOptions::default(), &HashMap::new()).unwrap().starts_with(b"%PDF-"));
+
+        // Single blank line fence passes `""`, not `none`.
+        let one_blank_src = source("```python\n\n```\n\nMARKER", &PdfOptions::default(), &HashMap::new()).unwrap();
+        assert!(one_blank_src.contains("#smd-code(\"\", lang: \"python\")"), "{one_blank_src}");
+
+        // LF, CRLF (both normalized through `source` and direct `Renderer` events), and unclosed EOF fences
+        // strip at most one trailing newline without dropping intentional trailing blank lines.
+        let lf_src = source("```rust\nlet a = 1;\nlet b = 2;\n```\n", &PdfOptions::default(), &HashMap::new()).unwrap();
+        let crlf_src = source("```rust\r\nlet a = 1;\r\nlet b = 2;\r\n```\r\n", &PdfOptions::default(), &HashMap::new()).unwrap();
+        let eof_src = source("```rust\nlet a = 1;\nlet b = 2;", &PdfOptions::default(), &HashMap::new()).unwrap();
+        let trailing_blank_src = source("```rust\nlet a = 1;\nlet b = 2;\n\n```\n", &PdfOptions::default(), &HashMap::new()).unwrap();
+        assert!(lf_src.contains("#smd-code(\"let a = 1;\\nlet b = 2;\", lang: \"rust\")"), "{lf_src}");
+        assert!(crlf_src.contains("#smd-code(\"let a = 1;\\nlet b = 2;\", lang: \"rust\")"), "{crlf_src}");
+        assert!(eof_src.contains("#smd-code(\"let a = 1;\\nlet b = 2;\", lang: \"rust\")"), "{eof_src}");
+        assert!(trailing_blank_src.contains("#smd-code(\"let a = 1;\\nlet b = 2;\\n\", lang: \"rust\")"), "{trailing_blank_src}");
+
+        let raw_crlf_events = vec![
+            Event::Start(Tag::CodeBlock(CodeBlockKind::Fenced("rust".into()))),
+            Event::Text("let a = 1;\r\nlet b = 2;\r\n".into()),
+            Event::End(TagEnd::CodeBlock),
+        ];
+        let raw_crlf_out = Renderer {
+            events: raw_crlf_events.into_iter().peekable(),
+            assets: &HashMap::new(),
+            footnotes: HashMap::new(),
+            headings: HashMap::new(),
+            heading_counts: HashMap::new(),
+        }.render(None).unwrap();
+        assert_eq!(raw_crlf_out.trim(), "#smd-code(\"let a = 1;\\r\\nlet b = 2;\", lang: \"rust\")");
+
+        let bbox_word_attr = |md: &str, needle: &str, attr: &str| -> Option<f64> {
+            let path = std::env::temp_dir().join(format!("supermd-code-y-{}-{needle}-{attr}.pdf", std::process::id()));
+            std::fs::write(&path, export(md, &PdfOptions::default(), &HashMap::new()).unwrap()).unwrap();
+            let output = std::process::Command::new("pdftotext").arg("-bbox").arg(&path).arg("-").output();
+            let _ = std::fs::remove_file(&path);
+            let output = output.ok().filter(|out| out.status.success())?;
+            let xml = String::from_utf8_lossy(&output.stdout);
+            let prefix = format!("{attr}=\"");
+            xml.lines()
+                .find(|line| line.contains("<word ") && line.contains(needle))
+                .map(|line| line.split(&prefix).nth(1).unwrap().split('"').next().unwrap().parse::<f64>().unwrap())
+        };
+        let bbox_word_y = |md: &str, needle: &str| bbox_word_attr(md, needle, "yMin");
+        let row_pt = 1.2 * PdfOptions::default().font_size as f64;
+        if let (Some(empty_y), Some(blank_y)) = (
+            bbox_word_y("```python\n```\n\nMARKER", "MARKER"),
+            bbox_word_y("```python\n\n```\n\nMARKER", "MARKER"),
+        ) {
+            let delta = blank_y - empty_y;
+            assert!((delta - row_pt).abs() < 0.3, "Single blank line must add 1.2em ({row_pt}pt) over empty fence, got {delta}pt");
+        }
+        if let (Some(lf_y), Some(crlf_y), Some(trailing_y)) = (
+            bbox_word_y("```rust\nlet a = 1;\nlet b = 2;\n```\n\nMARKER", "MARKER"),
+            bbox_word_y("```rust\r\nlet a = 1;\r\nlet b = 2;\r\n```\r\n\r\nMARKER", "MARKER"),
+            bbox_word_y("```rust\nlet a = 1;\nlet b = 2;\n\n```\n\nMARKER", "MARKER"),
+        ) {
+            assert!((lf_y - crlf_y).abs() < 0.1, "LF and CRLF fences must produce identical height");
+            assert!(((trailing_y - lf_y) - row_pt).abs() < 0.3, "Intentional trailing blank line must keep 1.2em height");
+        }
+        let spaced_md = "```python\nALPHA = 1\n\nBETA = 2\n\n\nGAMMA = 3\n```\n";
+        if let (Some(alpha_y), Some(beta_y), Some(gamma_y)) = (
+            bbox_word_y(spaced_md, "ALPHA"),
+            bbox_word_y(spaced_md, "BETA"),
+            bbox_word_y(spaced_md, "GAMMA"),
+        ) {
+            assert!(((beta_y - alpha_y) - 2.0 * row_pt).abs() < 0.3, "One blank line must advance 2 * 1.2em");
+            assert!(((gamma_y - beta_y) - 3.0 * row_pt).abs() < 0.3, "Two blank lines must advance 3 * 1.2em");
+        }
+        let indent_md = "```python\nOUTER = 1\n    INNER = 2\n```\n";
+        if let (Some(outer_x), Some(inner_x)) = (
+            bbox_word_attr(indent_md, "OUTER", "xMin"),
+            bbox_word_attr(indent_md, "INNER", "xMin"),
+        ) {
+            assert!(inner_x > outer_x + 12.0, "Leading spaces on synthesized raw lines must be preserved (outer {outer_x}pt, inner {inner_x}pt)");
+        }
+    }
+    #[test]
+    fn untagged_and_wide_code_lines_fit_within_printable_width_without_scaling_normal_lines() {
+        let untagged_md = "```\nfenced untagged\n```\n\n    indented line one\n    indented line two\n";
+        let untagged_src = source(untagged_md, &PdfOptions::default(), &HashMap::new()).unwrap();
+        assert!(untagged_src.contains("#smd-code(\"fenced untagged\", lang: none)"), "{untagged_src}");
+        assert!(untagged_src.contains("#smd-code(\"indented line one\\nindented line two\", lang: none)"), "{untagged_src}");
+        assert_eq!(
+            untagged_src.lines().filter(|l| l.starts_with("#smd-code(") && l.ends_with(", lang: none)")).count(),
+            2,
+            "Untagged fenced and indented blocks must pass lang: none: {untagged_src}"
+        );
+        assert!(!untagged_src.contains("lang: \"\""));
+        assert!(export(untagged_md, &PdfOptions::default(), &HashMap::new()).unwrap().starts_with(b"%PDF-"));
+
+        // Normal-width code block must not emit non-identity horizontal/vertical scaling matrices in content stream,
+        // while an over-wide line scales down to fit the printable width.
+        let has_fractional_cm = |pdf: &[u8]| -> bool {
+            decompress_pdf_streams(pdf).lines().any(|line| {
+                let Some(before_cm) = line.split(" cm").next() else { return false };
+                let parts: Vec<&str> = before_cm.split_whitespace().collect();
+                if parts.len() < 6 { return false; }
+                let Some(sx) = parts[parts.len() - 6].parse::<f64>().ok() else { return false };
+                let Some(sy) = parts[parts.len() - 3].parse::<f64>().ok() else { return false };
+                sx > 0.0 && sx < 0.99 && (sx - sy.abs()).abs() < 0.01
+            })
+        };
+        let normal_pdf = export("```python\nnormal_value = 1\n```\n", &PdfOptions::default(), &HashMap::new()).unwrap();
+        assert!(!has_fractional_cm(&normal_pdf), "Normal-width code lines must skip scale() in #smd-fit");
+
+        let wide_line = format!("wide_value = '{}' # WIDE-TAIL", "W".repeat(160));
+        let wide_md = format!("```python\nnormal_value = 1\n{wide_line}\nafter_wide = 2\n```\n");
+        let wide_pdf = export(&wide_md, &PdfOptions::default(), &HashMap::new()).unwrap();
+        assert!(wide_pdf.starts_with(b"%PDF-"));
+        assert!(has_fractional_cm(&wide_pdf), "Over-wide code line must apply scale() in #smd-fit");
+
+        let path = std::env::temp_dir().join(format!("supermd-wide-code-{}.pdf", std::process::id()));
+        std::fs::write(&path, &wide_pdf).unwrap();
+        if let Ok(output) = std::process::Command::new("pdftotext").arg(&path).arg("-").output() {
+            if output.status.success() {
+                let text = String::from_utf8_lossy(&output.stdout);
+                assert!(text.contains("WIDE-TAIL"), "Wide line tail must remain present");
+            }
+        }
+        if let Ok(output) = std::process::Command::new("pdftotext").arg("-bbox").arg(&path).arg("-").output() {
+            if output.status.success() {
+                let xml = String::from_utf8_lossy(&output.stdout);
+                assert!(xml.contains("WIDE-TAIL"), "Wide line tail must remain present");
+                let word_height = |needle: &str| -> f64 {
+                    let line = xml.lines().find(|l| l.contains("<word ") && l.contains(needle)).unwrap();
+                    let y_min: f64 = line.split("yMin=\"").nth(1).unwrap().split('"').next().unwrap().parse().unwrap();
+                    let y_max: f64 = line.split("yMax=\"").nth(1).unwrap().split('"').next().unwrap().parse().unwrap();
+                    y_max - y_min
+                };
+                let normal_h = word_height("normal_value");
+                let after_h = word_height("after_wide");
+                let wide_h = word_height("WIDE-TAIL");
+                assert!((normal_h - after_h).abs() < 0.05, "Normal lines must share unscaled glyph height");
+                assert!(wide_h < normal_h * 0.8, "Over-wide line must scale down (normal {normal_h}pt, wide {wide_h}pt)");
+                let right_edge = (210. - PdfOptions::default().margin as f64) * 72. / 25.4;
+                for word in xml.lines().filter(|line| line.contains("<word ")) {
+                    let x = word.split("xMax=\"").nth(1).unwrap().split('"').next().unwrap().parse::<f64>().unwrap();
+                    assert!(x <= right_edge + 0.5, "Wide code line escaped printable width: {word}");
+                }
+            }
+        }
+        let _ = std::fs::remove_file(path);
+    }
     #[test]
     fn table_column_alignments_are_preserved_in_typst_source_and_pdf() {
         let md = r"| Left | Center | Right | Unspecified |
@@ -605,5 +848,131 @@ P(A\cup B\cup C)=&P(A)+P(B)+P(C)\\
 
         let pdf_bytes = export(md, &PdfOptions::default(), &HashMap::new()).unwrap();
         assert!(pdf_bytes.starts_with(b"%PDF-"));
+    }
+    #[test]
+    fn frontmatter_omits_yaml_from_page_body_and_populates_pdf_properties() {
+        let note = "\u{feff}---  \ntitle: \"Relativistic Quantum Theory\"\nauthor:\n  - Paul Dirac\n  - Emmy Noether\ndescription: \"Spinors, symmetries, and conservation laws\"\ntags: [spinors, symmetry]\ndate: 2026-03-15\n...  \n\n# Spinor Algebra\n\nBody text.\n";
+        let typst_src = source(note, &PdfOptions::default(), &HashMap::new()).unwrap();
+        assert!(!typst_src.contains("#line(length: 100%"), "YAML delimiter leaked as horizontal rule: {typst_src}");
+        assert!(!typst_src.contains("#heading(level: 2"), "YAML block leaked as setext level-2 heading: {typst_src}");
+        assert!(!typst_src.contains("#text(\"title:"), "raw YAML key leaked into rendered body: {typst_src}");
+        assert_eq!(typst_src.matches("title:").count(), 1);
+        assert!(typst_src.contains("#set document(title: \"Relativistic Quantum Theory\", author: (\"Paul Dirac\", \"Emmy Noether\",), description: \"Spinors, symmetries, and conservation laws\", keywords: (\"spinors\", \"symmetry\",), date: datetime(year: 2026, month: 3, day: 15))"));
+
+        let pdf_bytes = export(note, &PdfOptions::default(), &HashMap::new()).unwrap();
+        assert!(pdf_bytes.starts_with(b"%PDF-"));
+        let corpus = format!("{}\n{}", String::from_utf8_lossy(&pdf_bytes), decompress_pdf_streams(&pdf_bytes));
+        assert!(corpus.contains("Relativistic Quantum Theory"), "PDF metadata missing title");
+        assert!(corpus.contains("Paul Dirac"), "PDF metadata missing first author");
+        assert!(corpus.contains("Emmy Noether"), "PDF metadata missing second author");
+        assert!(corpus.contains("Spinors, symmetries, and conservation laws"), "PDF metadata missing description");
+        assert!(corpus.contains("spinors"), "PDF metadata missing keyword");
+        assert!(corpus.contains("2026-03-15") || corpus.contains("D:20260315"), "PDF metadata missing date");
+
+        // Malformed or unclosed YAML and freeform dates still export valid PDFs safely.
+        for fallback in [
+            "---\ntitle: Unclosed frontmatter\n\n# Still Exports\n",
+            "---\ntitle: Freeform Date\ndate: Spring 2026\n---\n\n# Valid PDF\n",
+            "---\n---\n\n# Empty Frontmatter\n",
+        ] {
+            let bytes = export(fallback, &PdfOptions::default(), &HashMap::new()).unwrap();
+            assert!(bytes.starts_with(b"%PDF-"));
+        }
+    }
+
+    #[test]
+    fn study_markdown_and_safe_html_typeset_and_preserve_code_math_and_security() {
+        let md = r#"<!-- SECRET_BLOCK_COMMENT
+spanning lines -->
+%%SECRET_OBSIDIAN_HEADER
+![ignored](missing-comment-image.png)%%
+
+# Study Notes H~2~O
+
+==Highlighted concept== with H~2~O, x^2^, ~~deprecated~~, %%SECRET_INLINE_COMMENT%%<!-- SECRET_INLINE_HTML --> and Press <kbd onclick="evil()">Ctrl</kbd>+<kbd>S</kbd>, <mark style="color:red">marked</mark>, <u>underlined</u>, CO<sub>2</sub>, 10<sup>-6</sup>.<br>Second line.
+
+\==Literal markup\=\= beside ==Active highlight==, \==Raw one==, \==Raw two==, \=\=Inline literal\=\=, \\==Slash highlight==, H\~2\~O and H\~2~O and \~lit\~ and \~rawsub~ beside ~sub~, x\^2\^ and x\^2^ and \^rawsup^ beside ^sup^, \%%KEPT_PERCENT\%%, and approx ~5 minutes to boil H~2~O.
+
+Spaced ~not sub~ and ^not sup^, comparison if a == b and c == d, escaped \==rawlit==, URL [https://example.edu/~alice/notes~1](https://example.edu/~alice/notes~1), unmatched <mark>rawmark, and inline <script>alert(1)</script>.
+
+<script>window.pwn = 1</script>
+
+| Concept | Detail |
+|---|---|
+| ==Cell mark== | Top<br/>Bottom |
+
+Inline code `H~2~O ==raw== ^2^ %%KEPT_INLINE_CODE%% <kbd>k</kbd>` and math $x^2 + y_1$:
+
+$$
+%% kept tex comment
+\int_0^1 x^2 dx = \frac{1}{3}
+$$
+
+```python
+%%timeit total = 1 + 1
+```
+"#;
+        assert!(image_sources(md).is_empty(), "Images inside %%...%% comments must be ignored");
+
+        let typst_src = source(md, &PdfOptions::default(), &HashMap::new()).unwrap();
+        assert!(typst_src.contains("#sub[#text(\"2\")]"), "Expected Typst #sub: {typst_src}");
+        assert!(typst_src.contains("#sub[#text(\"sub\")]"), "Expected ~sub~ -> #sub: {typst_src}");
+        assert!(!typst_src.contains("#sub[#text(\"lit\")]"), "Escaped \\~lit\\~ must not become #sub: {typst_src}");
+        assert!(!typst_src.contains("#sub[#text(\"rawsub\")]"), "Escaped \\~rawsub~ must not become #sub: {typst_src}");
+        assert!(typst_src.contains("#super[#text(\"2\")]"), "Expected Typst #super: {typst_src}");
+        assert!(typst_src.contains("#super[#text(\"sup\")]"), "Expected ^sup^ -> #super: {typst_src}");
+        assert!(!typst_src.contains("#super[#text(\"rawsup\")]"), "Escaped \\^rawsup^ must not become #super: {typst_src}");
+        assert!(typst_src.contains("#super[#text(\"-6\")]"), "Expected HTML <sup> -> #super: {typst_src}");
+        assert!(typst_src.contains("#highlight(fill: smd-highlight, radius: 2pt, extent: 1pt)[#text(\"Active highlight\")]"), "Expected unescaped highlight: {typst_src}");
+        assert!(typst_src.contains("#highlight(fill: smd-highlight, radius: 2pt, extent: 1pt)[#text(\"Slash highlight\")]"), "Expected highlight after escaped backslash: {typst_src}");
+        assert!(!typst_src.contains("[#text(\"Literal markup\")]"), "Escaped \\=\\=Literal markup\\=\\= must stay literal: {typst_src}");
+        assert!(!typst_src.contains("[#text(\"Raw one\")]") && !typst_src.contains(", =Raw two"), "Comma-separated \\==Raw one==, \\==Raw two== must not pair: {typst_src}");
+        assert!(!typst_src.contains("[#text(\"rawlit\")]"), "Escaped \\==rawlit== must stay literal: {typst_src}");
+        assert!(typst_src.contains("#underline[#text(\"underlined\")]"), "Expected Typst #underline: {typst_src}");
+        assert!(typst_src.contains("#box(fill: smd-code-fill"), "Expected Typst #box for <kbd>: {typst_src}");
+        assert!(typst_src.contains("#strike[#text(\"deprecated\")]"), "Expected Typst #strike for ~~...~~: {typst_src}");
+        assert!(typst_src.contains("#linebreak()"), "Expected Typst #linebreak() for <br>: {typst_src}");
+        assert!(typst_src.contains("#link(\"https://example.edu/~alice/notes~1\")[#text(\"https://example.edu/~alice/notes~1\")]"), "URL tildes must not become subscripts: {typst_src}");
+        assert!(!typst_src.contains("SECRET_BLOCK_COMMENT"));
+        assert!(!typst_src.contains("SECRET_OBSIDIAN_HEADER"));
+        assert!(!typst_src.contains("SECRET_INLINE_COMMENT"));
+        assert!(!typst_src.contains("SECRET_INLINE_HTML"));
+        assert!(!typst_src.contains("onclick"));
+        assert!(typst_src.contains("KEPT_PERCENT"));
+        assert!(typst_src.contains("KEPT_INLINE_CODE"));
+        assert!(typst_src.contains("%%timeit total = 1 + 1"));
+        assert!(typst_src.contains("<script>"));
+
+        for themed in [false, true] {
+            let opts = PdfOptions { themed, theme_accent: "#2d6a4f".into(), ..PdfOptions::default() };
+            let pdf_bytes = export(md, &opts, &HashMap::new()).unwrap();
+            assert!(pdf_bytes.starts_with(b"%PDF-"));
+            if !themed {
+                let path = std::env::temp_dir().join(format!("supermd-study-markdown-{}.pdf", std::process::id()));
+                std::fs::write(&path, &pdf_bytes).unwrap();
+                if let Ok(output) = std::process::Command::new("pdftotext").arg(&path).arg("-").output() {
+                    if output.status.success() {
+                        let extracted = String::from_utf8_lossy(&output.stdout);
+                        let flat = extracted.split_whitespace().collect::<Vec<_>>().join(" ");
+                        assert!(flat.contains("Highlighted concept"));
+                        assert!(flat.contains("==Literal markup== beside Active highlight"), "Expected literal escaped == beside active highlight: {flat}");
+                        assert!(flat.contains("\\Slash highlight"), "Expected escaped backslash before active highlight: {flat}");
+                        assert!(flat.contains("H~2~O and H~2~O and ~lit~ and ~rawsub~ beside sub"), "Expected literal escaped tildes beside subscript: {flat}");
+                        assert!(flat.contains("x^2^ and x^2^ and ^rawsup^ beside sup"), "Expected literal escaped carets beside superscript: {flat}");
+                        assert!(flat.contains("%%KEPT_PERCENT%%"), "Expected escaped percent comment preserved: {flat}");
+                        assert!(flat.contains("underlined"));
+                        assert!(flat.contains("Ctrl"));
+                        assert!(flat.contains("~not sub~"));
+                        assert!(flat.contains("^not sup^"));
+                        assert!(flat.contains("<script>alert(1)</script>"));
+                        assert!(!flat.contains("SECRET_BLOCK_COMMENT"));
+                        assert!(!flat.contains("SECRET_OBSIDIAN_HEADER"));
+                        assert!(!flat.contains("SECRET_INLINE_COMMENT"));
+                        assert!(!flat.contains("SECRET_INLINE_HTML"));
+                    }
+                }
+                let _ = std::fs::remove_file(path);
+            }
+        }
     }
 }

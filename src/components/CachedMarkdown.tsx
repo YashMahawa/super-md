@@ -8,7 +8,7 @@ import rehypeHighlight from "rehype-highlight";
 import {defaultUrlTransform,type Components} from "react-markdown";
 import {visit} from "unist-util-visit";
 import type {Root} from "hast";
-import {useMemo,type ReactNode} from "react";
+import {memo,useMemo,type ReactNode} from "react";
 import WindowedBlock,{useWindowing} from "./WindowedBlock";
 import {analyzeDocument,type SourceDocumentAnalysis} from '../documentAnalysis';
 
@@ -18,6 +18,10 @@ import {analyzeDocument,type SourceDocumentAnalysis} from '../documentAnalysis';
 const LIMIT=24_000_000;
 const MAX_ENTRIES=512;
 const MAX_PIPELINES=32;
+const RAW_HTML_TOKEN=/(<!--[\s\S]*?-->|<\/?(?:br|mark|sub|sup|kbd|u)(?:\s+(?:[^>"']|"[^"]*"|'[^']*')*)?\s*\/?>)/gi;
+const BR_HTML_TAG=/^<br(?:\s+(?:[^>"']|"[^"]*"|'[^']*')*)?\s*\/?>$/i;
+const OPEN_HTML_TAG=/^<(mark|sub|sup|kbd|u)(?:\s+(?:[^>"']|"[^"]*"|'[^']*')*)?>$/i;
+const CLOSE_HTML_TAG=/^<\/(mark|sub|sup|kbd|u)\s*>$/i;
 
 interface DocumentCacheEntry {
   key:string;
@@ -207,19 +211,84 @@ function scanBlockNode(current:any,parentTag:string|null,state:{hasMath:boolean;
   }
 }
 
-function sanitizeAndMeasureHast(tree:Root,baseWeight=0):number {
-  let weight=baseWeight;
-  visit(tree,(node:any,index,parent:any)=>{
-    weight+=160+(typeof node.value==="string"?node.value.length*2:0);
-    if(node.type==="raw"&&parent&&index!==undefined){parent.children[index]={type:"text",value:node.value};return;}
-    if(node.type!=="element")return;
-    for(const key of ["href","src","cite","poster","longDesc","action"]){
-      if(typeof node.properties[key]!=="string")continue;
-      const url=node.properties[key];
-      node.properties[key]=node.tagName==="img"&&key==="src"&&/^data:image\/(?:png|jpeg|gif|webp|avif|svg\+xml);base64,/i.test(url)?url:defaultUrlTransform(url);
+const RARE_URL_PROPS=["cite","poster","longDesc","action"] as const;
+function sanitizeElementUrls(node:any):void {
+  const props=node.properties;
+  if(!props)return;
+  if(typeof props.href==="string")props.href=defaultUrlTransform(props.href);
+  if(typeof props.src==="string"){
+    const url=props.src;
+    props.src=node.tagName==="img"&&/^data:image\/(?:png|jpeg|gif|webp|avif|svg\+xml);base64,/i.test(url)?url:defaultUrlTransform(url);
+  }
+  if(props.cite!==undefined||props.poster!==undefined||props.longDesc!==undefined||props.action!==undefined){
+    for(const key of RARE_URL_PROPS)if(typeof props[key]==="string")props[key]=defaultUrlTransform(props[key]);
+  }
+}
+
+function sanitizeHastChildren(children:any[]):number {
+  let weight=0,hasRaw=false;
+  for(let i=0;i<children.length;i++)if(children[i]?.type==="raw"){hasRaw=true;break;}
+  if(!hasRaw){
+    for(let i=0;i<children.length;i++){
+      const child=children[i];
+      weight+=160+(typeof child.value==="string"?child.value.length*2:0);
+      if(child.type==="element"){
+        sanitizeElementUrls(child);
+        if(Array.isArray(child.children))weight+=sanitizeHastChildren(child.children);
+      }
     }
-  });
+    return weight;
+  }
+  const tokens:any[]=[];
+  for(let i=0;i<children.length;i++){
+    const child=children[i];
+    weight+=160+(typeof child.value==="string"?child.value.length*2:0);
+    if(child.type==="raw"){
+      const raw=String(child.value??""),parts=raw.split(RAW_HTML_TOKEN);
+      for(let p=0;p<parts.length;p++){
+        const part=parts[p];
+        if(!part||(part.startsWith("<!--")&&part.endsWith("-->")))continue;
+        if(BR_HTML_TAG.test(part)){tokens.push({type:"element",tagName:"br",properties:{},children:[]});continue;}
+        const open=OPEN_HTML_TAG.exec(part);
+        if(open&&!part.slice(0,-1).trimEnd().endsWith("/")){tokens.push({type:"__open",tag:open[1].toLowerCase(),raw:part});continue;}
+        const close=CLOSE_HTML_TAG.exec(part);
+        if(close){tokens.push({type:"__close",tag:close[1].toLowerCase(),raw:part});continue;}
+        tokens.push({type:"text",value:part});
+      }
+      continue;
+    }
+    if(child.type==="element"){
+      sanitizeElementUrls(child);
+      if(Array.isArray(child.children))weight+=sanitizeHastChildren(child.children);
+    }
+    tokens.push(child);
+  }
+  const out:any[]=[],stack:Array<{tag:string;raw:string;children:any[]}>=[];
+  const emit=(item:any)=>{
+    const target=stack.length?stack[stack.length-1].children:out,prev=target[target.length-1];
+    if(item.type==="text"&&prev?.type==="text"&&!prev.position&&!item.position)prev.value+=item.value;
+    else target.push(item);
+  };
+  for(const token of tokens){
+    if(token.type==="__open"){stack.push({tag:token.tag,raw:token.raw,children:[]});continue;}
+    if(token.type==="__close"){
+      let match=-1;
+      for(let s=stack.length-1;s>=0;s--)if(stack[s].tag===token.tag){match=s;break;}
+      if(match<0){emit({type:"text",value:token.raw});continue;}
+      while(stack.length-1>match){const unclosed=stack.pop()!;emit({type:"text",value:unclosed.raw});for(const c of unclosed.children)emit(c);}
+      const paired=stack.pop()!;
+      emit({type:"element",tagName:paired.tag,properties:{},children:paired.children});
+      continue;
+    }
+    emit(token);
+  }
+  while(stack.length){const unclosed=stack.pop()!;emit({type:"text",value:unclosed.raw});for(const c of unclosed.children)emit(c);}
+  children.splice(0,children.length,...out);
   return weight;
+}
+
+function sanitizeAndMeasureHast(tree:Root,baseWeight=0):number {
+  return baseWeight+160+sanitizeHastChildren(tree.children);
 }
 
 function measureHastWeight(node:any):number {
@@ -297,7 +366,6 @@ export function cachedMarkdownTree(source:string,remarkPlugins:PluggableList,reh
   }
   return tree;
 }
-
 function resolveDeferredBlockTree(node:any,plugins:PluggableList):Root {
   if(!plugins.length||typeof node!=="object"||node===null)return {type:"root",children:[node]} as Root;
   const profile=getRehypeProfile(plugins);
@@ -350,21 +418,44 @@ function resolveDeferredBlockTree(node:any,plugins:PluggableList):Root {
   return expanded;
 }
 
-export interface RenderedMarkdownBlock {node:any;index:number;content:ReactNode;text:string;headings:Array<{id:string;key:string}>;estimate:number;windowed:boolean}
+export interface RenderedMarkdownBlock {key:string;node:any;index:number;content:ReactNode;text:string;headings:Array<{id:string;key:string}>;estimate:number;windowed:boolean}
 export type MarkdownBlockRenderer=(block:RenderedMarkdownBlock)=>ReactNode;
 export default function CachedMarkdown({children,remarkPlugins,rehypePlugins,components,renderBlock,windowingEnabled=true,sourceAnalysis}:{children:string;remarkPlugins:PluggableList;rehypePlugins:PluggableList;components:Components;renderBlock?:MarkdownBlockRenderer;windowingEnabled?:boolean;sourceAnalysis?:SourceDocumentAnalysis}){
   const supportsWindowing=useWindowing(),windowing=windowingEnabled&&supportsWindowing&&children.length>80_000;
   const tree=cachedMarkdownTree(children,remarkPlugins,windowing?[]:rehypePlugins,windowing,sourceAnalysis);
-  const blocks=useMemo(()=>windowing||renderBlock?tree.children.filter(node=>node.type!=='text'||node.value.trim()).map((node:any,index)=>{const text=plainText(node);return {node,index,text,headings:headingsOf(node),estimate:Math.min(1200,Math.max(80,text.length/65*30+(node.tagName==='pre'?220:40)))};}):[],[tree,windowing,!!renderBlock]);
-  if(renderBlock)return <>{blocks.map(block=>renderBlock({...block,windowed:windowing,content:windowing?<DeferredMarkdown node={block.node} plugins={rehypePlugins} components={components}/>:toJsxRuntime({type:'root',children:[block.node]},{Fragment,jsx,jsxs,components,ignoreInvalidStyle:true,passKeys:true,passNode:true})}))}</>;
-  if(!windowing)return toJsxRuntime(tree,{Fragment,jsx,jsxs,components,ignoreInvalidStyle:true,passKeys:true,passNode:true});
-  return <>{blocks.map(block=><WindowedBlock key={block.index} enabled estimate={block.estimate} text={block.text} headings={block.headings} data-source-start={block.node.properties?.['data-source-start']??block.node.position?.start.offset} data-source-end={block.node.properties?.['data-source-end']??block.node.position?.end.offset}><DeferredMarkdown node={block.node} plugins={rehypePlugins} components={components}/></WindowedBlock>)}</>;
+  const hasBlockView=Boolean(renderBlock);
+  const blocks=useMemo<RenderedMarkdownBlock[]>(()=>{
+    if(!windowing&&!hasBlockView)return [];
+    const counts=new Map<string,number>();
+    return tree.children.filter(node=>node.type!=='text'||node.value.trim()).map((node:any,index)=>{
+      const kind=blockKind(node),ordinal=counts.get(kind)??0;
+      counts.set(kind,ordinal+1);
+      const key=`${kind}-${ordinal}`;
+      const text=plainText(node);
+      const content=windowing
+        ?<DeferredMarkdown node={node} plugins={rehypePlugins} components={components}/>
+        :toJsxRuntime({type:'root',children:[node]},{Fragment,jsx,jsxs,components,ignoreInvalidStyle:true,passKeys:true,passNode:true});
+      return {key,node,index,text,content,headings:headingsOf(node),estimate:Math.min(1200,Math.max(80,text.length/65*30+(node.tagName==='pre'?220:40))),windowed:windowing};
+    });
+  },[tree,windowing,hasBlockView,rehypePlugins,components]);
+  const fullContent=useMemo(()=>!hasBlockView&&!windowing?toJsxRuntime(tree,{Fragment,jsx,jsxs,components,ignoreInvalidStyle:true,passKeys:true,passNode:true}):null,[tree,windowing,hasBlockView,components]);
+  if(renderBlock)return <>{blocks.map(block=>renderBlock(block))}</>;
+  if(!windowing)return fullContent;
+  return <>{blocks.map(block=><WindowedBlock key={block.key} enabled estimate={block.estimate} text={block.text} headings={block.headings} data-source-start={block.node.properties?.['data-source-start']??block.node.position?.start.offset} data-source-end={block.node.properties?.['data-source-end']??block.node.position?.end.offset}>{block.content}</WindowedBlock>)}</>;
+}
+function blockKind(node:any):string {
+  if(node.type!=='element')return String(node.type||'node');
+  if(node.tagName==='pre'){
+    const lang=highlightLanguage(node.children?.[0]?.properties?.className);
+    return lang?`pre:${lang}`:'pre';
+  }
+  return String(node.tagName);
 }
 function plainText(node:any):string {return node.type==='text'?node.value:(node.children||[]).map(plainText).join('')+(/^(p|li|pre|h[1-6])$/.test(node.tagName||'')?'\n':'');}
 function headingsOf(node:any):Array<{id:string;key:string}> {const result:Array<{id:string;key:string}>=[];visit(node,(entry:any)=>{if(entry.type==='element'&&entry.properties?.id)result.push({id:String(entry.properties.id),key:String(entry.properties['data-heading-key']??entry.properties.id)});});return result;}
-function DeferredMarkdown({node,plugins,components}:{node:any;plugins:PluggableList;components:Components}) {
+const DeferredMarkdown=memo(function DeferredMarkdown({node,plugins,components}:{node:any;plugins:PluggableList;components:Components}) {
   // Expanded KaTeX/highlighting trees are cached alongside their parent document
   // entry, while plain prose and diagram blocks render directly without cloning.
   const tree=useMemo(()=>resolveDeferredBlockTree(node,plugins),[node,plugins]);
   return toJsxRuntime(tree,{Fragment,jsx,jsxs,components,ignoreInvalidStyle:true,passKeys:true,passNode:true});
-}
+});

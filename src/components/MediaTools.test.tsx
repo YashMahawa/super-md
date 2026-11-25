@@ -72,6 +72,43 @@ describe("viewing images is never an import", () => {
     expect(importImageFiles).not.toHaveBeenCalled(); expect(insert).not.toHaveBeenCalled();
   });
 
+  it("cycles Tab and Shift+Tab focus across Close, Fit, Replace, and Remove buttons in the image viewer", async () => {
+    const image = host.querySelector<HTMLImageElement>(".test-raster")!;
+    image.setAttribute("data-note-image-source", image.src);
+    Object.defineProperty(image, "currentSrc", { value: image.src });
+    await act(async () => image.click());
+    const buttons = Array.from(host.querySelectorAll<HTMLButtonElement>(".image-viewer button"));
+    expect(buttons.map(button => button.textContent)).toEqual(["Close", "Fit", "Replace", "Remove"]);
+    const [close, fit, replace, remove] = buttons;
+    expect(document.activeElement).toBe(close);
+
+    const tab = (shiftKey = false) => {
+      const event = new KeyboardEvent("keydown", { key: "Tab", shiftKey, bubbles: true, cancelable: true });
+      document.activeElement!.dispatchEvent(event);
+      return event;
+    };
+
+    expect(tab(true).defaultPrevented).toBe(true);
+    expect(document.activeElement).toBe(remove);
+
+    expect(tab(true).defaultPrevented).toBe(false);
+    replace.focus();
+    expect(tab(true).defaultPrevented).toBe(false);
+    fit.focus();
+    expect(tab(true).defaultPrevented).toBe(false);
+
+    close.focus();
+    expect(tab(false).defaultPrevented).toBe(false);
+    fit.focus();
+    expect(tab(false).defaultPrevented).toBe(false);
+    replace.focus();
+    expect(tab(false).defaultPrevented).toBe(false);
+
+    remove.focus();
+    expect(tab(false).defaultPrevented).toBe(true);
+    expect(document.activeElement).toBe(close);
+  });
+
   it("still imports genuine external file drops exactly once", async () => {
     await act(async () => { drag(host.querySelector("p")!, "drop", [file]); });
     expect(importImageFiles).toHaveBeenCalledExactlyOnceWith([file]);

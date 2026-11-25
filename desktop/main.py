@@ -494,7 +494,14 @@ def main():
     if not args.note and not args.smoke and session.settings.get("startup") == "restore":
         while session.has_pending_startup_windows():
             create_window(None, show_window=not args.background)
-    if args.agent_access:session.agent_bridge.start()
+    if session.settings.get("agentAccessEnabled"):
+        try:
+            session.agent_bridge.start()
+        except Exception as error:
+            session.settings["agentAccessEnabled"] = False
+            for studio in studios:
+                studio._agent_error = f"Could not enable live agent access ({type(error).__name__})."
+                studio._emit(False)
     if broker:
         broker.requested.connect(lambda note: open_from_service(note or None))
     if broker:

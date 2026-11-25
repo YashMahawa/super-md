@@ -185,6 +185,7 @@ class FolderSearchUiTest(unittest.TestCase):
         self.app.sendPostedEvents(None, QEvent.Type.DeferredDelete)
         self.studio.stop()
         self.studio.pool.shutdown(wait=True)
+        self.studio._search_pool.shutdown(wait=True, cancel_futures=True)
         self.session.writes.shutdown(wait=True)
 
     def items(self, item=None):

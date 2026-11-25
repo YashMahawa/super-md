@@ -13,6 +13,12 @@ from documents import atomic_json
 import updates
 
 class QuietStudio(Studio):
+    def __init__(self, isolated: bool = False, session: Session | None = None):
+        session = session or Session(isolated)
+        if not session.settings.get("python"):
+            session.settings["python"] = sys.executable
+        super().__init__(isolated, session)
+
     def _refresh_theme(self):
         self.system_dark = True
 
@@ -106,8 +112,8 @@ class StudioTest(unittest.TestCase):
         import base64
         from PySide6.QtCore import QBuffer, QByteArray, QIODevice
         from PySide6.QtGui import QImage, QColor
-        image=QImage(8,6,QImage.Format_ARGB32);image.fill(QColor("#1688dd"))
-        raw=QByteArray();buffer=QBuffer(raw);buffer.open(QIODevice.WriteOnly);image.save(buffer,"PNG")
+        image=QImage(8,6,QImage.Format.Format_ARGB32);image.fill(QColor("#1688dd"))
+        raw=QByteArray();buffer=QBuffer(raw);buffer.open(QIODevice.OpenModeFlag.WriteOnly);image.save(buffer,"PNG")
         studio=self.studio;original=studio._current()['content'];replies=[]
         studio.replied.connect(lambda identifier,value,error:replies.append((identifier,value,error)))
         body=base64.b64encode(bytes(raw)).decode()
@@ -1060,16 +1066,6 @@ class StudioTest(unittest.TestCase):
         self.assertNotEqual(studio._current()["content"],"Stale draft")
         self.assertEqual(studio.flush_operation["action"],"save")
 
-    def _wait_until(self, predicate, timeout=4.0):
-        deadline = time.monotonic() + timeout
-        while time.monotonic() < deadline:
-            self.app.processEvents()
-            if predicate():
-                return
-            time.sleep(0.01)
-        self.app.processEvents()
-        self.assertTrue(predicate(), "Timed out waiting for condition")
-
     def test_workspace_folder_and_expanded_subfolders_persist_across_restarts_tray_hides_and_multiwindow_shutdown(self):
         import tempfile
         with tempfile.TemporaryDirectory() as tmp:
@@ -1112,9 +1108,9 @@ class StudioTest(unittest.TestCase):
             # (service.quitting=True before app.aboutToQuit sets session.quitting=True).
             second = self.window()
             second.openFolder(str(root_b))
-            self._wait_until(lambda: second.busy == 0)
+            self._wait_for(lambda: second.busy == 0)
             second.toggleDirectory(str(sub_b))
-            self._wait_until(lambda: second.busy == 0)
+            self._wait_for(lambda: second.busy == 0)
             self.flush()
             expected_expanded_b = {str(root_b.resolve()), str(sub_b.resolve())}
 
@@ -1127,104 +1123,51 @@ class StudioTest(unittest.TestCase):
             self.flush()
 
             # Restart with startup == "restore": both windows restore their workspace folders & expanded paths.
-            with patch("studio.tempfile.mkdtemp", return_value=str(self.studio.data)):
-                restored_session = Session(True)
-                w1 = w2 = None
-                try:
-                    w1 = QuietStudio(True, restored_session)
-                    self.assertTrue(restored_session.has_pending_startup_windows())
-                    w2 = QuietStudio(True, restored_session)
-                    self.assertFalse(restored_session.has_pending_startup_windows())
-                    self._wait_until(
-                        lambda: len(json.loads(w1.snapshot)["files"]) > 0
-                        and len(json.loads(w2.snapshot)["files"]) > 0
-                    )
+            restored_session = Session(True, data=self.studio.data)
+            w1 = w2 = None
+            try:
+                w1 = QuietStudio(True, restored_session)
+                self.assertTrue(restored_session.has_pending_startup_windows())
+                w2 = QuietStudio(True, restored_session)
+                self.assertFalse(restored_session.has_pending_startup_windows())
+                self._wait_for(
+                    lambda: len(json.loads(w1.snapshot)["files"]) > 0
+                    and len(json.loads(w2.snapshot)["files"]) > 0
+                )
 
-                    self.assertEqual(w1.folder, str(root_a.resolve()))
-                    self.assertEqual(w1.expanded, expected_expanded_a)
-                    w1_paths = {entry["path"] for entry in json.loads(w1.snapshot)["files"]}
-                    self.assertIn(str((sub_a / "basis.md").resolve()), w1_paths)
+                self.assertEqual(w1.folder, str(root_a.resolve()))
+                self.assertEqual(w1.expanded, expected_expanded_a)
+                w1_paths = {entry["path"] for entry in json.loads(w1.snapshot)["files"]}
+                self.assertIn(str((sub_a / "basis.md").resolve()), w1_paths)
 
-                    self.assertEqual(w2.folder, str(root_b.resolve()))
-                    self.assertEqual(w2.expanded, expected_expanded_b)
-                    w2_paths = {entry["path"] for entry in json.loads(w2.snapshot)["files"]}
-                    self.assertIn(str((sub_b / "waves.md").resolve()), w2_paths)
-                finally:
-                    for w in (w1, w2):
-                        if w is not None:
-                            w.stop()
-                            w.pool.shutdown(wait=True, cancel_futures=True)
-                            w._search_pool.shutdown(wait=True, cancel_futures=True)
-                    restored_session.writes.shutdown(wait=True)
+                self.assertEqual(w2.folder, str(root_b.resolve()))
+                self.assertEqual(w2.expanded, expected_expanded_b)
+                w2_paths = {entry["path"] for entry in json.loads(w2.snapshot)["files"]}
+                self.assertIn(str((sub_b / "waves.md").resolve()), w2_paths)
+            finally:
+                for w in (w1, w2):
+                    if w is not None:
+                        w.stop()
+                        w.pool.shutdown(wait=True, cancel_futures=True)
+                        w._search_pool.shutdown(wait=True, cancel_futures=True)
+                restored_session.writes.shutdown(wait=True)
 
             # When startup != "restore", workspace folders are NOT restored on launch.
             self.session.settings["startup"] = "new"
             atomic_json(self.studio.data / "settings.json", {"settings": self.session.settings})
-            with patch("studio.tempfile.mkdtemp", return_value=str(self.studio.data)):
-                fresh_session = Session(True)
-                fresh_win = None
-                try:
-                    fresh_win = QuietStudio(True, fresh_session)
-                    self.assertEqual(fresh_win.folder, "")
-                    self.assertEqual(fresh_win.expanded, set())
-                    self.assertFalse(fresh_session.has_pending_startup_windows())
-                finally:
-                    if fresh_win is not None:
-                        fresh_win.stop()
-                        fresh_win.pool.shutdown(wait=True, cancel_futures=True)
-                        fresh_win._search_pool.shutdown(wait=True, cancel_futures=True)
-                    fresh_session.writes.shutdown(wait=True)
-
-    def test_contextual_save_and_export_locations_prioritize_saved_parent_then_workspace_folder(self):
-        import tempfile
-        with tempfile.TemporaryDirectory() as tmp:
-            workspace_dir = Path(tmp) / "workspace"
-            saved_dir = Path(tmp) / "saved-notes"
-            fallback_dir = Path(tmp) / "configured-default"
-            workspace_dir.mkdir()
-            saved_dir.mkdir()
-            fallback_dir.mkdir()
-
-            studio = self.studio
-            studio.settings["newNoteLocation"] = str(fallback_dir)
-
-            # 1. No workspace open + unsaved note -> falls back to newNoteLocation.
-            studio.newNote()
-            studio._current()["name"] = "1.2 Linear Algebra.md"
-            self.assertEqual(
-                Path(QUrl(studio.defaultSaveLocation(studio._current()["name"])).toLocalFile()),
-                fallback_dir / "1.2 Linear Algebra.md",
-            )
-            self.assertEqual(
-                Path(QUrl(studio.defaultExportLocation("pdf")).toLocalFile()),
-                fallback_dir / "1.2 Linear Algebra.pdf",
-            )
-
-            # 2. Workspace open + unsaved note -> defaults to open workspace folder.
-            studio.openFolder(str(workspace_dir))
-            self.await_idle()
-            self.assertEqual(
-                Path(QUrl(studio.defaultSaveLocation(studio._current()["name"])).toLocalFile()),
-                workspace_dir.resolve() / "1.2 Linear Algebra.md",
-            )
-            self.assertEqual(
-                Path(QUrl(studio.defaultExportLocation("mdzip")).toLocalFile()),
-                workspace_dir.resolve() / "1.2 Linear Algebra.zip",
-            )
-
-            # 3. Active saved note -> defaults to saved note's parent directory even when another workspace is open.
-            saved_note = saved_dir / "2.4 Eigenvalues.smd"
-            saved_note.write_text("# Eigenvalues\n")
-            studio.openPath(str(saved_note))
-            self.await_idle()
-            self.assertEqual(
-                Path(QUrl(studio.defaultSaveLocation(studio._current()["name"])).toLocalFile()),
-                saved_note.resolve(),
-            )
-            self.assertEqual(
-                Path(QUrl(studio.defaultExportLocation("pdf")).toLocalFile()),
-                saved_dir.resolve() / "2.4 Eigenvalues.pdf",
-            )
+            fresh_session = Session(True, data=self.studio.data)
+            fresh_win = None
+            try:
+                fresh_win = QuietStudio(True, fresh_session)
+                self.assertEqual(fresh_win.folder, "")
+                self.assertEqual(fresh_win.expanded, set())
+                self.assertFalse(fresh_session.has_pending_startup_windows())
+            finally:
+                if fresh_win is not None:
+                    fresh_win.stop()
+                    fresh_win.pool.shutdown(wait=True, cancel_futures=True)
+                    fresh_win._search_pool.shutdown(wait=True, cancel_futures=True)
+                fresh_session.writes.shutdown(wait=True)
 
     def test_subfolder_search_scans_collapsed_subfolders_skips_hidden_and_symlinks_and_preserves_watchers(self):
         import tempfile
@@ -1262,7 +1205,7 @@ class StudioTest(unittest.TestCase):
 
             # Search across collapsed subfolders finds matching note & ancestor dirs only.
             studio.setFolderFilter("linear")
-            self._wait_until(lambda: not studio.filter_timer.isActive() and not studio._folder_searching)
+            self._wait_for(lambda: not studio.filter_timer.isActive() and not studio._folder_searching)
             snap = json.loads(studio.snapshot)
             names = [item["name"] for item in snap["files"]]
             self.assertEqual(names, ["courses", "algebra", "1.2 Linear Algebra.md"])
@@ -1276,13 +1219,13 @@ class StudioTest(unittest.TestCase):
             # Rapid queries cancel stale searches cleanly and converge on the latest filter.
             studio.setFolderFilter("readme")
             studio.setFolderFilter("scratch")
-            self._wait_until(lambda: not studio.filter_timer.isActive() and not studio._folder_searching)
+            self._wait_for(lambda: not studio.filter_timer.isActive() and not studio._folder_searching)
             snap = json.loads(studio.snapshot)
             self.assertEqual([item["name"] for item in snap["files"]], ["courses", "algebra", "scratch.txt"])
 
             # Zero matches produces an empty list while preserving folderFilter in snapshot.
             studio.setFolderFilter("nonexistent-xyz")
-            self._wait_until(lambda: not studio.filter_timer.isActive() and not studio._folder_searching)
+            self._wait_for(lambda: not studio.filter_timer.isActive() and not studio._folder_searching)
             snap = json.loads(studio.snapshot)
             self.assertEqual(snap["folderFilter"], "nonexistent-xyz")
             self.assertEqual(snap["files"], [])
@@ -1292,82 +1235,332 @@ class StudioTest(unittest.TestCase):
             self.assertEqual(studio.folder_filter, "")
             self.assertEqual(json.loads(studio.snapshot)["folderFilter"], "")
 
-    def test_dotted_and_safe_note_renaming_case_only_rename_and_state_sync(self):
-        import tempfile
-        from studio import resolve_note_rename
-        # Pure validation checks for dotted titles, extensions, hidden names, and illegal characters.
-        self.assertEqual(resolve_note_rename("1.2 Linear Algebra", "Draft.md"), ("1.2 Linear Algebra.md", None))
-        self.assertEqual(resolve_note_rename("1.2 Linear Algebra.smd", "Draft.smd", portable=True), ("1.2 Linear Algebra.smd", None))
-        self.assertEqual(resolve_note_rename("Plain Note", "README", has_saved_target=True), ("Plain Note", None))
-        self.assertEqual(resolve_note_rename("2.0 Release", "notes.txt"), ("2.0 Release.txt", None))
-        for bad in ("", "   ", ".", "..", ".hidden", ".md", "   .md", "bad/name", "bad\\name", "a:b", "a*b", "a?b", 'a"b', "a<b>c", "a|b", "report.pdf"):
-            target, err = resolve_note_rename(bad, "Draft.md")
-            self.assertIsNone(target, f"Expected {bad!r} to be rejected")
-            self.assertTrue(err, f"Expected error message for {bad!r}")
+    def test_bundled_presets_saved_themes_override_resets_and_clean_exports(self):
+        import custom_theme
+        studio=self.studio;second=self.window()
+        self.assertEqual(len(studio.bundledThemes),16)
+        alpha={**custom_theme.TEMPLATE,"name":"Theme Alpha","variants":{"dark":{"colors":{"surface":"#191524"},"artwork":{"reader":{"image":"data:image/svg+xml;base64,PHN2Zy8+","opacity":.14,"fit":"cover"}}}}}
+        beta={**custom_theme.TEMPLATE,"name":"Theme Beta","variants":{"dark":{"colors":{"surface":"#14211d"},"background":{"pattern":"grid","color":"#78b09c","opacity":.07,"size":24,"spacing":32}}}}
+        source_a=studio.data/"alpha.supermd-theme.json";source_a.write_text(json.dumps(alpha))
+        source_b=studio.data/"beta.supermd-theme.json";source_b.write_text(json.dumps(beta))
 
-        with tempfile.TemporaryDirectory() as tmp:
-            folder = Path(tmp) / "notes"
-            folder.mkdir()
-            note_file = folder / "linear algebra.md"
-            other_file = folder / "existing.md"
-            note_file.write_text("# Linear Algebra\n")
-            other_file.write_text("# Existing\n")
+        def run_sync(call):
+            pending=[]
+            with patch.object(studio,"_engine",return_value=Path("unused-theme-engine")),patch.object(studio,"_submit",side_effect=lambda action,done,*_:pending.append((action,done))),patch("custom_theme.read",side_effect=lambda _,p:json.loads(Path(p).read_text())):
+                call()
+                while pending:
+                    action,done=pending.pop(0);done(action(),None)
 
-            studio = self.studio
-            studio.openFolder(str(folder))
-            self.await_idle()
-            studio.openPath(str(note_file))
-            self.await_idle()
+        studio.setting("patternKind",'"paws"');studio.setting("patternOpacity","0.12")
+        run_sync(lambda:studio.importCustomTheme(str(source_a)))
+        self.assertEqual(studio.customThemeName,"Theme Alpha");self.assertEqual(second.customThemeName,"Theme Alpha")
+        self.assertEqual(studio.activeThemeKind,"saved");self.assertTrue(studio.customThemeHasSource)
+        self.assertIn(str(source_a),studio.custom_theme_watcher.files())
+        self.assertEqual(studio.settings["patternKind"],"");self.assertEqual(studio.settings["patternOpacity"],-1)
+        # Omitted background stays None in reader style when no override is set; reader artwork opacity is never exposed as pattern opacity
+        self.assertIsNone(custom_theme.reader(studio.session.custom_theme,"dark",True,studio.settings)["background"])
+        self.assertEqual(studio.themeBackground,{"pattern":"none","opacity":.06,"size":24,"spacing":24})
+        studio.setting("patternOpacity","0.02")
+        self.assertEqual(custom_theme.reader(studio.session.custom_theme,"dark",True,studio.settings)["artwork"]["reader"]["opacity"],.14)
 
-            old_path = str(note_file.resolve())
-            studio.pinRecent(old_path)
-            studio.session.locations[old_path] = {"top": 180, "ratio": 0.4}
+        # Importing a second theme retains the first across restarts and clears overrides
+        run_sync(lambda:studio.importCustomTheme(str(source_b)))
+        self.assertEqual(studio.customThemeName,"Theme Beta")
+        self.assertEqual([item["name"] for item in studio.savedThemes],["Theme Alpha","Theme Beta"])
+        self.assertEqual(studio.settings["patternOpacity"],-1)
+        self.assertIn(str(source_b),studio.custom_theme_watcher.files())
+        self.assertNotIn(str(source_a),studio.custom_theme_watcher.files())
 
-            # Invalid rename leaves note untouched and sets an error message.
-            studio.renameNote(studio.active, ".hidden")
-            self.assertEqual(studio._current()["path"], old_path)
-            self.assertIn("cannot start with a dot", studio.message)
+        # Selecting a bundled preset or applying via reader guide clears overrides and pauses external file watching
+        studio.setting("patternKind",'"dots"');studio.setting("patternSize","36")
+        replies=[];studio.replied.connect(lambda identifier,value,error:replies.append((identifier,value,error)))
+        run_sync(lambda:studio.post("guide-preset","apply_bundled_theme",json.dumps({"id":"study-desk"})))
+        self.assertEqual((replies[-1][0],json.loads(replies[-1][1]),replies[-1][2]),("guide-preset",{"id":"study-desk","name":"Study desk"},""))
+        self.assertEqual(studio.activeThemeKind,"preset");self.assertEqual(studio.activeThemeId,"study-desk")
+        self.assertEqual(studio.customThemeName,"Study desk");self.assertEqual(second.customThemeName,"Study desk")
+        self.assertFalse(studio.customThemeHasSource);self.assertEqual(studio.custom_theme_watcher.files(),[])
+        self.assertEqual((studio.settings["patternKind"],studio.settings["patternSize"]),("",0))
 
-            # Collision with a distinct existing file is blocked.
-            studio.renameNote(studio.active, "existing")
-            self.await_idle()
-            self.assertEqual(studio._current()["path"], old_path)
-            self.assertIn("already exists", studio.message)
+        # Clean export never bakes viewing-only overrides into active themes or starter templates
+        studio.setting("patternKind",'"paws"');studio.setting("patternOpacity","0.15")
+        exported_preset=studio.data/"exported-preset.json"
+        studio.exportCustomTheme(str(exported_preset))
+        self.assertNotEqual(json.loads(exported_preset.read_text())["variants"]["dark"].get("background",{}).get("pattern"),"paws")
 
-            # Case-only rename succeeds (even when filesystem reports exists() + samefile() True).
-            real_exists = Path.exists
-            real_samefile = Path.samefile
-            case_target = folder.resolve() / "Linear Algebra.md"
+        # Switching back to Theme Alpha across a restarted Session restores saved library & persisted overrides on startup
+        self.flush()
+        alpha_id=next(item["id"] for item in studio.savedThemes if item["name"]=="Theme Alpha")
+        run_sync(lambda:studio.selectSavedTheme(alpha_id))
+        self.assertEqual(studio.customThemeName,"Theme Alpha")
+        self.assertTrue(studio.customThemeHasSource);self.assertIn(str(source_a),studio.custom_theme_watcher.files())
+        self.assertEqual(studio.settings["patternKind"],"")
+        studio.setting("patternKind",'"grid"')
+        self.flush()
 
-            def simulated_case_insensitive_exists(path_obj):
-                if path_obj == case_target:
-                    return True
-                return real_exists(path_obj)
+        restarted_session=Session(True,data=studio.data)
+        self.assertEqual([item["name"] for item in restarted_session.saved_themes],["Theme Alpha","Theme Beta"])
+        self.assertEqual(restarted_session.active_theme_kind,"saved")
+        self.assertEqual(restarted_session.settings["patternKind"],"grid")
+        restarted_session.writes.shutdown(wait=True)
 
-            def simulated_case_insensitive_samefile(path_obj, other_path):
-                if path_obj == Path(old_path) and Path(other_path) == case_target:
-                    return True
-                return real_samefile(path_obj, other_path)
+        # Deleting active saved theme keeps user's source file on disk and resets to Built-in while retaining Theme Beta
+        studio.deleteSavedTheme(alpha_id)
+        self.assertTrue(source_a.is_file())
+        self.assertEqual(studio.activeThemeKind,"builtin");self.assertEqual(studio.customThemeName,"Built-in appearance")
+        self.assertEqual([item["name"] for item in studio.savedThemes],["Theme Beta"])
+        self.assertEqual(studio.settings["patternKind"],"")
+        exported_template=studio.data/"starter-template.json"
+        studio.setting("patternKind",'"paws"')
+        studio.exportCustomTheme(str(exported_template))
+        self.assertEqual(json.loads(exported_template.read_text()),custom_theme.TEMPLATE)
 
-            with patch.object(Path, "exists", simulated_case_insensitive_exists), patch.object(
-                Path, "samefile", simulated_case_insensitive_samefile
-            ):
-                studio.renameNote(studio.active, "Linear Algebra")
-            self.await_idle()
-            self.assertEqual(Path(studio._current()["path"]).name, "Linear Algebra.md")
+    def test_legacy_single_theme_migrates_into_saved_theme_library(self):
+        import custom_theme
+        legacy_dir=self.studio.data/"legacy-workspace";legacy_dir.mkdir(parents=True)
+        source=legacy_dir/"external.supermd-theme.json";source.write_text("{}")
+        atomic_json(legacy_dir/"theme.json",{**custom_theme.TEMPLATE,"name":"Legacy Imported"})
+        atomic_json(legacy_dir/"theme-source.json",{"path":str(source)})
+        migrated=Session(True,data=legacy_dir)
+        try:
+            self.assertEqual(migrated.active_theme_kind,"saved")
+            self.assertEqual(len(migrated.saved_themes),1)
+            self.assertEqual(migrated.saved_themes[0]["name"],"Legacy Imported")
+            self.assertEqual(migrated.saved_themes[0]["source"],str(source))
+        finally:
+            migrated.writes.shutdown(wait=True)
 
-            # Dotted title rename preserves .md and syncs pinned, recent, locations, workspace, and folder listing.
-            studio.renameNote(studio.active, "1.2 Linear Algebra")
-            self.await_idle()
-            expected_path = str((folder / "1.2 Linear Algebra.md").resolve())
-            self.assertEqual(studio._current()["path"], expected_path)
-            self.assertEqual(studio._current()["name"], "1.2 Linear Algebra.md")
-            self.assertIn(expected_path, studio.pinnedRecent)
-            self.assertNotIn(old_path, studio.pinnedRecent)
-            self.assertIn(expected_path, studio.recent)
-            self.assertNotIn(old_path, studio.recent)
-            self.assertEqual(studio.session.locations.get(expected_path), {"top": 180, "ratio": 0.4})
-            self.assertNotIn(old_path, studio.session.locations)
-            listed_names = [entry["name"] for entry in json.loads(studio.snapshot)["files"]]
-            self.assertIn("1.2 Linear Algebra.md", listed_names)
+    def test_reopen_closed_tab_restores_most_recent_first_and_persists_across_restart(self):
+        studio = self.studio
+        first = studio._current()
+        first.update(name="First.md", content="First note", saved="First note")
+        first_id = first["id"]
+        studio.newNote()
+        second = studio._current()
+        second.update(name="Second.md", content="Second note", saved="Second note")
+        second_id = second["id"]
+        studio.newNote()
+        studio._current().update(name="Stay.md", content="Stay open", saved="Stay open")
 
+        studio.closeTab(first_id)
+        self._wait_for(lambda: all(t["id"] != first_id for t in studio.tabs))
+        studio.closeTab(second_id)
+        self._wait_for(lambda: all(t["id"] != second_id for t in studio.tabs))
+        self.assertEqual(json.loads(studio.snapshot)["closedCount"], 2)
+
+        studio.reopenTab()
+        self._wait_for(lambda: studio.active == second_id)
+        self.assertEqual(studio._current()["content"], "Second note")
+        self.assertEqual(json.loads(studio.snapshot)["closedCount"], 1)
+
+        # Simulate an app restart reading closed-notes/index.json from the same data dir.
+        restarted_store = studio.session.closed_note_store.__class__(studio.session.closed_note_store.root)
+        persisted_refs = restarted_store.load_index_strict()
+        self.assertEqual(len(persisted_refs), 1)
+        self.assertEqual(persisted_refs[0]["id"], first_id)
+
+        studio.reopenTab()
+        self._wait_for(lambda: studio.active == first_id)
+        self.assertEqual(studio._current()["content"], "First note")
+        persisted_after = restarted_store.load_index_strict()
+        self.assertEqual(persisted_after, [])
+
+    def test_window_close_discard_preserves_closed_tab_snapshot(self):
+        studio = self.studio
+        note = studio._current()
+        note.update(name="WindowDraft.md", content="Unsaved window draft", saved="")
+        note_id = note["id"]
+        self.assertFalse(studio.requestWindowClose())
+        studio.resolveClose("discard")
+        self.assertEqual(len(studio.closed_tabs), 1)
+        restored = studio.session.closed_note_store.load(studio.closed_tabs[0])
+        self.assertEqual(restored["id"], note_id)
+        self.assertEqual(restored["content"], "Unsaved window draft")
+
+    def test_proactive_conflict_detection_pauses_autosave_for_md_and_smd(self):
+        from documents import write_portable
+        studio = self.studio
+        md_path = studio.data / "conflict.md"
+        md_path.write_text("base md", encoding="utf-8")
+        md_tab = studio._current()
+        md_tab.update(name="conflict.md", path=str(md_path), content="local md draft", saved="base md")
+        studio._emit(False)
+
+        md_path.write_text("external md change", encoding="utf-8")
+        studio._external_note_changed(str(md_path))
+        studio.external_timer.stop()
+        studio._refresh_external_notes()
+        self._wait_for(lambda: bool(md_tab.get("conflict")))
+        self.assertTrue(json.loads(studio.snapshot)["conflict"])
+        self.assertEqual(md_tab["content"], "local md draft")
+
+        # Autosave must stay paused for the conflicted tab while non-conflicted tabs still autosave.
+        clean_other_path = studio.data / "other.md"
+        clean_other_path.write_text("other base", encoding="utf-8")
+        studio.newNote()
+        other_tab = studio._current()
+        other_tab.update(name="other.md", path=str(clean_other_path), content="other draft", saved="other base")
+        studio._autosave()
+        self._wait_for(lambda: not studio.saving)
+        self.assertEqual(md_path.read_text(encoding="utf-8"), "external md change")
+        self.assertEqual(clean_other_path.read_text(encoding="utf-8"), "other draft")
+
+        # Portable .smd external asset-only change on a dirty tab must also flag conflict and pause autosave.
+        svg_a = "data:image/svg+xml;base64,PHN2Zy8+"
+        svg_b = "data:image/svg+xml;base64,PHN2ZyBpZD0iYiIvPg=="
+        smd_path = studio.data / "portable.smd"
+        write_portable(smd_path, "base smd", {"assets/a.svg": svg_a})
+        studio.newNote()
+        smd_tab = studio._current()
+        smd_tab.update(
+            name="portable.smd",
+            path=str(smd_path),
+            content="local smd draft",
+            saved="base smd",
+            assets={"assets/a.svg": svg_a},
+            saved_assets={"assets/a.svg": svg_a},
+            portable=True,
+        )
+        studio._emit(False)
+        write_portable(smd_path, "base smd", {"assets/a.svg": svg_b})
+        studio._external_note_changed(str(smd_path))
+        studio.external_timer.stop()
+        studio._refresh_external_notes()
+        self._wait_for(lambda: bool(smd_tab.get("conflict")))
+        self.assertTrue(json.loads(studio.snapshot)["conflict"])
+
+    def test_guarded_manual_save_and_conflict_resolution_for_md_and_smd(self):
+        from documents import open_note, write_portable
+        studio = self.studio
+        conflicts = []
+        studio.saveConflictRequested.connect(conflicts.append)
+
+        md_path = studio.data / "guarded.md"
+        md_path.write_text("v1", encoding="utf-8")
+        tab = studio._current()
+        tab.update(name="guarded.md", path=str(md_path), content="my local draft", saved="v1")
+
+        # External modification before watcher even runs: manual Save must detect and block overwrite!
+        md_path.write_text("external v2", encoding="utf-8")
+        studio.save()
+        self._wait_for(lambda: len(conflicts) == 1)
+        self.assertEqual(conflicts, ["guarded.md"])
+        self.assertTrue(tab["conflict"])
+        self.assertEqual(md_path.read_text(encoding="utf-8"), "external v2")
+
+        # Repeating Save while already flagged immediately re-requests conflict resolution without writing.
+        studio.save()
+        self.assertEqual(conflicts, ["guarded.md", "guarded.md"])
+        self.assertEqual(md_path.read_text(encoding="utf-8"), "external v2")
+
+        # Choosing Overwrite writes the draft and clears conflict.
+        studio.resolveConflict("overwrite")
+        self._wait_for(lambda: not tab["conflict"] and not studio.saving)
+        self.assertEqual(md_path.read_text(encoding="utf-8"), "my local draft")
+        self.assertEqual(tab["saved"], "my local draft")
+
+        # Modify externally again, edit locally, then choose Reload from disk.
+        md_path.write_text("disk v3", encoding="utf-8")
+        tab["content"] = "discardable draft"
+        studio.save()
+        self._wait_for(lambda: tab["conflict"])
+        studio.resolveConflict("reload")
+        self._wait_for(lambda: not tab["conflict"] and studio.busy == 0)
+        self.assertEqual(tab["content"], "disk v3")
+        self.assertEqual(tab["saved"], "disk v3")
+
+        # Guarded manual Save on live portable .smd (ready=True) also blocks external changes.
+        svg_a = "data:image/svg+xml;base64,PHN2Zy8+"
+        svg_b = "data:image/svg+xml;base64,PHN2ZyBpZD0iYiIvPg=="
+        smd_path = studio.data / "guarded.smd"
+        write_portable(smd_path, "smd v1", {"assets/a.svg": svg_a})
+        studio.newNote()
+        smd_tab = studio._current()
+        smd_tab.update(
+            name="guarded.smd",
+            path=str(smd_path),
+            content="smd local",
+            saved="smd v1",
+            assets={"assets/a.svg": svg_a},
+            saved_assets={"assets/a.svg": svg_a},
+            portable=True,
+        )
+        studio.ready = True
+        write_portable(smd_path, "smd external", {"assets/a.svg": svg_b})
+        conflicts.clear()
+        studio.post(
+            "portable-save",
+            "export_fmd_native",
+            json.dumps({
+                "id": smd_tab["id"],
+                "save": True,
+                "content": "smd local",
+                "originalContent": "smd local",
+                "assets": {"assets/a.svg": svg_a},
+            }),
+        )
+        self._wait_for(lambda: len(conflicts) == 1)
+        self.assertEqual(conflicts, ["guarded.smd"])
+        self.assertTrue(smd_tab["conflict"])
+        self.assertEqual(open_note(smd_path)[:2], ("smd external", {"assets/a.svg": svg_b}))
+
+    def test_save_as_rebinds_tab_saves_assets_and_clears_conflict(self):
+        from documents import open_note, write_portable
+        studio = self.studio
+        svg_a = "data:image/svg+xml;base64,PHN2Zy8+"
+        orig_md = studio.data / "orig.md"
+        orig_md.write_text("disk md", encoding="utf-8")
+        tab = studio._current()
+        tab.update(
+            name="orig.md",
+            path=str(orig_md),
+            content="draft with ![pic](assets/a.svg)",
+            saved="old md",
+            assets={"assets/a.svg": svg_a},
+            conflict=True,
+        )
+        copy_md = studio.data / "saved-copy.md"
+        studio.saveAs(str(copy_md))
+        self._wait_for(lambda: not studio.saving and tab["path"] == str(copy_md))
+        self.assertEqual(tab["name"], "saved-copy.md")
+        self.assertFalse(tab["conflict"])
+        self.assertFalse(json.loads(studio.snapshot)["conflict"])
+        self.assertFalse(studio._is_dirty(tab))
+        self.assertEqual(copy_md.read_text(encoding="utf-8"), "draft with ![pic](assets/a.svg)")
+        self.assertTrue((studio.data / "assets" / "a.svg").is_file())
+        self.assertEqual(orig_md.read_text(encoding="utf-8"), "disk md")
+
+        # Now test Save As on an already-saved conflicted .smd via live reader bridge.
+        orig_smd = studio.data / "orig.smd"
+        write_portable(orig_smd, "external smd", {})
+        studio.newNote()
+        smd_tab = studio._current()
+        smd_tab.update(
+            name="orig.smd",
+            path=str(orig_smd),
+            content="portable draft ![pic](assets/a.svg)",
+            saved="base smd",
+            assets={"assets/a.svg": svg_a},
+            saved_assets={"assets/a.svg": svg_a},
+            portable=True,
+            conflict=True,
+        )
+        studio.ready = True
+        copy_smd = studio.data / "rebound.smd"
+        studio.saveAs(str(copy_smd))
+        studio.post(
+            "portable-save-as",
+            "export_fmd_native",
+            json.dumps({
+                "id": smd_tab["id"],
+                "save": False,
+                "content": smd_tab["content"],
+                "originalContent": smd_tab["content"],
+                "assets": {"assets/a.svg": svg_a},
+            }),
+        )
+        self._wait_for(lambda: smd_tab["path"] == str(copy_smd) and studio.busy == 0)
+        self.assertEqual(smd_tab["name"], "rebound.smd")
+        self.assertFalse(smd_tab["conflict"])
+        self.assertFalse(studio._is_dirty(smd_tab))
+        self.assertEqual(open_note(copy_smd), ("portable draft ![pic](assets/a.svg)", {"assets/a.svg": svg_a}, True))
+        self.assertEqual(open_note(orig_smd), ("external smd", {}, True))

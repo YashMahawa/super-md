@@ -168,6 +168,7 @@ ApplicationWindow {
         case "new_note": studio.newNote(); break
         case "open": openDialog.open(); break
         case "save": studio.saveSafely(); break
+        case "save_as": studio.saveAsSafely(); break
         case "undo": studio.command("undo"); break
         case "redo": studio.command("redo"); break
         case "copy": window.nativeReaderEditAction("copy"); break
@@ -175,6 +176,7 @@ ApplicationWindow {
         case "paste": window.nativeReaderEditAction("paste"); break
         case "select_all": window.nativeReaderEditAction("select_all"); break
         case "find": window.openFind(); break
+        case "search_folder": studio.openFolderSearch(); break
         case "close_tab": studio.closeTabSafely(viewState.active); break
         case "next_tab": studio.cycleTab(1); break
         case "previous_tab": studio.cycleTab(-1); break
@@ -254,7 +256,9 @@ ApplicationWindow {
         }
         function onFlushFailed(canClose) { if(!closingAllowed && !closeDialog.visible) { flushDialog.canClose = canClose; flushDialog.open() } }
         function onCloseRequested(name) { flushDialog.close(); closeDialog.title = "Save changes to " + name + "?"; if(!closeDialog.visible) closeDialog.open() }
-        function onSaveRequested(name) { saveDialog.selectedFile = studio.defaultSaveLocation(name); saveDialog.open() }
+        function onSaveRequested(name) { saveDialog.title = "Save note"; saveDialog.selectedFile = studio.defaultSaveLocation(name); saveDialog.open() }
+        function onSaveAsRequested(name) { saveDialog.title = "Save as"; saveDialog.selectedFile = studio.defaultSaveAsLocation(name); saveDialog.open() }
+        function onSaveConflictRequested(name) { flushDialog.close(); closeDialog.close(); saveConflictDialog.title = name + " changed on disk"; if (!saveConflictDialog.visible) saveConflictDialog.open() }
         function onNoteLocationPickerRequested() { noteFolderDialog.open() }
         function onExportRequested(format) { sharing = false; outputFormat = format; exportDialog.open() }
         function onFolderPickerRequested() { folderDialog.open() }
@@ -269,6 +273,10 @@ ApplicationWindow {
         function onReaderReloadRequested() { if (window.reader) window.reader.reload() }
         function onChromeRequested(action) { window.chromeAwake = action === "toggle" ? !window.chromeAwake : action === "show"; if(window.chromeAwake) chromeIdle.restart(); else { chromeIdle.stop(); window.focusReader() } }
         function onAgentRequest(payload) { window.routeAgentRequest(payload) }
+        function onWorkspaceSearchChanged() {
+            if (studio.folderSearchState.open && !folderSearchDialog.visible) folderSearchDialog.open()
+            else if (!studio.folderSearchState.open && folderSearchDialog.visible) folderSearchDialog.close()
+        }
     }
     onViewStateChanged: {
         if (!viewState.readerReady) readerStableTimer.stop()
@@ -358,18 +366,22 @@ ApplicationWindow {
                     }
                 }
                 ActionButton { glyph: "MagnifyingGlass"; ToolTip.text: "Find in note (" + window.shortcutLabels.find + ")"; onClicked: window.openFind() }
+                ActionButton { objectName: "folderSearchButton"; visible: window.width >= 1060; text: window.width < 1260 ? "" : "Search notes"; glyph: "MagnifyingGlass"; ToolTip.text: "Search across notes (" + (window.shortcutLabels.search_folder || "Ctrl+Shift+F") + ")"; onClicked: studio.openFolderSearch() }
                 ActionButton { visible: window.width >= 1060; glyph: "Image"; ToolTip.text: "Insert image or link"; onClicked: studio.command("insert") }
                 ActionButton { visible: window.width >= 1060; glyph: "Bug"; ToolTip.text: "Fix LaTeX"; onClicked: studio.command("repair") }
                 ActionButton { visible: window.width >= 1060; glyph: "ShareNetwork"; ToolTip.text: "Share note"; onClicked: window.showExport(true) }
                 ActionButton {
-                    visible: window.width < 1060; glyph: "More"; ToolTip.text: "More note actions"; onClicked: noteActions.popup()
+                    objectName: "moreActionsButton"; glyph: "More"; ToolTip.text: "More note actions"; onClicked: noteActions.popup()
                     NoteContextMenu {
                         id: noteActions
                         objectName: "compactNoteActions"
                         implicitWidth: 250
-                        NoteMenuItem { text: "Insert image or link"; icon.source: "../icons/Image.svg"; onTriggered: studio.command("insert") }
-                        NoteMenuItem { text: "Fix LaTeX"; icon.source: "../icons/Bug.svg"; onTriggered: studio.command("repair") }
-                        NoteMenuItem { text: "Share note"; icon.source: "../icons/ShareNetwork.svg"; onTriggered: window.showExport(true) }
+                        NoteMenuItem { objectName: "reopenClosedTabAction"; text: "Reopen closed tab"; icon.source: "../icons/Undo.svg"; enabled: typeof viewState !== "undefined" ? Boolean(viewState.closedCount) : true; onTriggered: studio.reopenTab() }
+                        NoteMenuItem { objectName: "saveAsAction"; text: "Save as"; icon.source: "../icons/FloppyDisk.svg"; enabled: typeof viewState !== "undefined" ? !viewState.busy : true; onTriggered: studio.saveAsSafely() }
+                        NoteMenuItem { text: "Search across notes"; actionVisible: window.width < 1060; icon.source: "../icons/MagnifyingGlass.svg"; onTriggered: studio.openFolderSearch() }
+                        NoteMenuItem { text: "Insert image or link"; actionVisible: window.width < 1060; icon.source: "../icons/Image.svg"; onTriggered: studio.command("insert") }
+                        NoteMenuItem { text: "Fix LaTeX"; actionVisible: window.width < 1060; icon.source: "../icons/Bug.svg"; onTriggered: studio.command("repair") }
+                        NoteMenuItem { text: "Share note"; actionVisible: window.width < 1060; icon.source: "../icons/ShareNetwork.svg"; onTriggered: window.showExport(true) }
                     }
                 }
                 ActionButton { text: window.width < 1060 ? "" : "Export"; glyph: "Export"; ToolTip.text: "Export note"; prominent: true; enabled: !viewState.busy; onClicked: window.showExport(false) }
@@ -401,6 +413,7 @@ ApplicationWindow {
                 Label { text: sidebarSection === "folder" ? "Your files" : "Contents"; font.pixelSize: 22; font.weight: Font.DemiBold }
                 ModeGroup { Layout.fillWidth: true; choices: [{key:"folder",label:"Folder"},{key:"contents",label:"Contents"}]; selected: sidebarSection; onChosen: key => sidebarSection = key }
                 ActionButton { visible: sidebarSection === "folder"; text: "Open folder"; glyph: "FolderOpen"; tonal: true; Layout.fillWidth: true; onClicked: studio.chooseFolder() }
+                ActionButton { objectName: "sidebarFolderSearchButton"; visible: sidebarSection === "folder"; text: "Search across notes"; glyph: "MagnifyingGlass"; compact: true; tonal: true; Layout.fillWidth: true; ToolTip.text: "Search across notes (" + (window.shortcutLabels.search_folder || "Ctrl+Shift+F") + ")"; onClicked: studio.openFolderSearch() }
                 RowLayout {
                     visible: sidebarSection === "folder" && !!viewState.folder
                     Layout.fillWidth: true
@@ -529,6 +542,72 @@ ApplicationWindow {
                     ActionButton { objectName: "centerLockButton"; glyph: viewState.settings.centerLock ? "Lock" : "LockOpen"; compact: true; tonal: viewState.settings.centerLock; ToolTip.text: viewState.settings.centerLock ? "Centre locked · click to allow horizontal movement" : "Lock document to centre"; onClicked: studio.setting("centerLock",JSON.stringify(!viewState.settings.centerLock)) }
                     }
                 }
+                Pane {
+                    id: conflictBanner
+                    objectName: "conflictBanner"
+                    visible: Boolean(viewState.conflict) && !viewState.imageOverlay
+                    Layout.fillWidth: true
+                    leftPadding: 16
+                    rightPadding: 16
+                    topPadding: viewState.fullscreen && studyToolbar.visible && studyToolbar.shown ? studyToolbar.height + 10 : 10
+                    bottomPadding: 10
+                    background: Rectangle {
+                        color: viewState.colors["surface-high"]
+                        Rectangle { anchors.bottom: parent.bottom; width: parent.width; height: 1; color: viewState.colors.outline; opacity: .55 }
+                    }
+                    contentItem: RowLayout {
+                        spacing: 10
+                        ToolButton {
+                            enabled: false
+                            focusPolicy: Qt.NoFocus
+                            padding: 0
+                            background: null
+                            icon.source: "../icons/Warning.svg"
+                            icon.color: viewState.colors.primary
+                            icon.width: 20
+                            icon.height: 20
+                            Layout.preferredWidth: 24
+                            Layout.preferredHeight: 24
+                            Layout.alignment: Qt.AlignVCenter
+                        }
+                        Label {
+                            objectName: "conflictBannerLabel"
+                            text: "This file changed on disk. Autosave is paused so your draft isn't overwritten."
+                            color: viewState.colors.text
+                            font.pixelSize: 13
+                            font.weight: Font.Medium
+                            wrapMode: Text.WordWrap
+                            Layout.fillWidth: true
+                            Layout.alignment: Qt.AlignVCenter
+                        }
+                        ActionButton {
+                            objectName: "conflictSaveAsButton"
+                            text: "Save as"
+                            glyph: "FloppyDisk"
+                            compact: true
+                            prominent: true
+                            enabled: !viewState.busy
+                            onClicked: studio.resolveConflict("save_as")
+                        }
+                        ActionButton {
+                            objectName: "conflictReloadButton"
+                            text: "Reload from disk"
+                            glyph: "ArrowClockwise"
+                            compact: true
+                            tonal: true
+                            enabled: !viewState.busy
+                            onClicked: studio.resolveConflict("reload")
+                        }
+                        ActionButton {
+                            objectName: "conflictOverwriteButton"
+                            text: "Overwrite"
+                            compact: true
+                            tonal: true
+                            enabled: !viewState.busy
+                            onClicked: studio.resolveConflict("overwrite")
+                        }
+                    }
+                }
                 Loader {
                     id: readerLoader
                     objectName: "documentReaderLoader"
@@ -555,7 +634,9 @@ ApplicationWindow {
                         readerContextMenu.editFlags = request.editFlags
                         readerContextMenu.hasLink = request.linkUrl.toString().length > 0
                         const x = request.position.x, y = request.position.y
-                        window.reader.runJavaScript("Boolean(window.supermdMediaMenuAt && window.supermdMediaMenuAt(" + x + "," + y + "))", function(handled) {
+                        window.reader.runJavaScript("({handled: Boolean(window.supermdMediaMenuAt && window.supermdMediaMenuAt(" + x + "," + y + ")), text: typeof window.supermdSelectedText === 'function' ? window.supermdSelectedText() : null})", function(result) {
+                            const handled = Boolean(result && result.handled)
+                            if (result && typeof result.text === "string") readerContextMenu.selectionText = result.text
                             if (!handled) readerContextMenu.popup(x, y)
                         })
                     }
@@ -568,7 +649,7 @@ ApplicationWindow {
                         NoteMenuItem { text: "Undo"; actionVisible: Boolean(readerContextMenu.editFlags & ContextMenuRequest.CanUndo); onTriggered: window.reader.triggerWebAction(WebEngineView.Undo) }
                         NoteMenuItem { text: "Redo"; actionVisible: Boolean(readerContextMenu.editFlags & ContextMenuRequest.CanRedo); onTriggered: window.reader.triggerWebAction(WebEngineView.Redo) }
                         NoteMenuItem { text: "Cut"; actionVisible: Boolean(readerContextMenu.editFlags & ContextMenuRequest.CanCut); onTriggered: window.reader.triggerWebAction(WebEngineView.Cut) }
-                        NoteMenuItem { text: "Copy"; enabled: Boolean(readerContextMenu.editFlags & ContextMenuRequest.CanCopy); onTriggered: window.reader.triggerWebAction(WebEngineView.Copy) }
+                        NoteMenuItem { text: "Copy"; enabled: Boolean(readerContextMenu.editFlags & ContextMenuRequest.CanCopy) || readerContextMenu.selectionText.trim().length > 0; onTriggered: { window.reader.forceActiveFocus(); window.reader.triggerWebAction(WebEngineView.Copy) } }
                         NoteMenuItem { text: "Paste"; actionVisible: Boolean(readerContextMenu.editFlags & ContextMenuRequest.CanPaste); onTriggered: window.reader.triggerWebAction(WebEngineView.Paste) }
                         NoteMenuItem { text: "Copy link address"; actionVisible: readerContextMenu.hasLink; onTriggered: window.reader.triggerWebAction(WebEngineView.CopyLinkToClipboard) }
                         NoteMenuItem { text: "Select all"; onTriggered: window.reader.triggerWebAction(WebEngineView.SelectAll) }
@@ -646,6 +727,17 @@ ApplicationWindow {
                 onSaveRequested: studio.saveSafely()
                 onExportRequested: window.showExport(false)
             }
+            FullscreenStatusBanner {
+                id: fullscreenStatusBanner
+                anchors.horizontalCenter: parent.horizontalCenter
+                anchors.bottom: parent.bottom
+                anchors.bottomMargin: 20
+                maxWidth: Math.min(680, Math.max(180, parent.width - 48))
+                footerHidden: (viewState.fullscreen || viewState.imageOverlay) && viewState.readerReady
+                busy: Boolean(viewState.busy)
+                message: viewState.message || ""
+                messageRevision: viewState.messageRevision || 0
+            }
             Rectangle {
                 objectName: "readerLoadingOverlay"
                 anchors.fill: parent
@@ -694,7 +786,7 @@ ApplicationWindow {
     FileDialog { id: openDialog; title: "Open note"; nameFilters: ["Notes (*.md *.smd *.fmd *.markdown *.txt)", "All files (*)"]; onAccepted: studio.openNote(selectedFile.toString()) }
     FolderDialog { id: folderDialog; title: "Open folder"; onAccepted: studio.openFolder(selectedFolder.toString()) }
     FolderDialog { id: noteFolderDialog; title: "Default location for new notes"; onAccepted: studio.setNoteLocation(selectedFolder.toString()) }
-    FileDialog { id: saveDialog; title: "Save note"; fileMode: FileDialog.SaveFile; nameFilters: viewState.portable ? ["Portable Super MD (*.smd)"] : ["Markdown (*.md)", "Portable Super MD (*.smd)"]; onAccepted: studio.saveAs(selectedFile.toString()); onRejected: studio.resolveClose("cancel") }
+    FileDialog { id: saveDialog; title: "Save note"; fileMode: FileDialog.SaveFile; nameFilters: viewState.portable ? ["Portable Super MD (*.smd)", "Markdown (*.md)"] : ["Markdown (*.md)", "Portable Super MD (*.smd)"]; onAccepted: studio.saveAs(selectedFile.toString()); onRejected: studio.resolveClose("cancel") }
     Component {
         id: exportDestinationComponent
         FileDialog {
@@ -759,6 +851,22 @@ ApplicationWindow {
         }
     }
     AppDialog {
+        id: saveConflictDialog
+        objectName: "saveConflictDialog"
+        width: 480
+        closePolicy: Popup.NoAutoClose
+        ColumnLayout {
+            width: parent.width
+            spacing: 20
+            Label { text: "This note was modified outside Super MD since you opened or last saved it. Choose Save as to keep both versions, or Overwrite to replace the file on disk."; Layout.fillWidth: true; wrapMode: Text.WordWrap }
+            RowLayout {
+                ActionButton { objectName: "saveConflictCancelButton"; text: "Cancel"; onClicked: { saveConflictDialog.close(); studio.resolveConflict("cancel") } }
+                ActionButton { objectName: "saveConflictOverwriteButton"; text: "Overwrite"; tonal: true; onClicked: { saveConflictDialog.close(); studio.resolveConflict("overwrite") } }
+                ActionButton { objectName: "saveConflictSaveAsButton"; text: "Save as"; prominent: true; onClicked: { saveConflictDialog.close(); studio.resolveConflict("save_as") } }
+            }
+        }
+    }
+    AppDialog {
         id: flushDialog
         objectName: "flushDialog"
         property bool canClose: false
@@ -808,4 +916,5 @@ ApplicationWindow {
             Label { text: "PDFs are typeset locally. Python runs only when you choose Run."; Layout.fillWidth: true; wrapMode: Text.WordWrap; opacity: .7 }
         }
     }
+    FolderSearchDialog { id: folderSearchDialog }
 }

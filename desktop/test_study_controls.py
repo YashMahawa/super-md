@@ -59,10 +59,10 @@ RecentNotes {objectName:"recent";anchors.fill:parent;model:["/notes/Study.md"];o
             entry=next(item for item in items if item.objectName()=="recentNoteEntry");pin=next(item for item in items if item.objectName()=="recentPinnedIndicator")
             self.assertIsNotNone(entry);self.assertFalse(pin.property("visible"));self.assertEqual(pin.property("width"),18)
             self.assertGreaterEqual(pin.property("availableHeight"),16,"Decorative pin must not shrink into button padding")
-            QTest.mouseClick(window,Qt.RightButton,Qt.NoModifier,QPoint(100,20));QTest.qWait(30)
+            QTest.mouseClick(window,Qt.MouseButton.RightButton,Qt.KeyboardModifier.NoModifier,QPoint(100,20));QTest.qWait(30)
             menu=next(x for x in visual_items(window.contentItem()) if x.property("text")=="Pin note")
             position=menu.mapToScene(QPointF(menu.property("width")/2,menu.property("height")/2))
-            QTest.mouseClick(window,Qt.LeftButton,Qt.NoModifier,position.toPoint());QTest.qWait(20)
+            QTest.mouseClick(window,Qt.MouseButton.LeftButton,Qt.KeyboardModifier.NoModifier,position.toPoint());QTest.qWait(20)
             self.assertTrue(pin.property("visible"));self.assertEqual(entry.property("text"),"Study.md")
         finally:
             window.close();window.deleteLater();app.sendPostedEvents(None,QEvent.Type.DeferredDelete);engine.deleteLater();app.sendPostedEvents(None,QEvent.Type.DeferredDelete)

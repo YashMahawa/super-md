@@ -126,3 +126,74 @@ describe("executable Python cells", () => {
     expect(html).toContain(":::callout tip Example");
   });
 });
+
+describe("study Markdown and safe inline HTML", () => {
+  it("renders subscript, superscript, highlight, double-tilde strikethrough, comments, and allowlisted inline HTML", () => {
+    const markdown = [
+      "<!-- block comment",
+      "still hidden -->",
+      "",
+      "Formula H~2~O and x^2^ with ==core concept== and ~~retired~~ %%obsidian hidden%%<!-- inline hidden -->.",
+      "",
+      'Press <kbd onclick="alert(1)">Ctrl</kbd>+<kbd class="key">K</kbd>, <mark style="color:red">focus</mark>, <u>underlined</u>, H<sub>2</sub>SO<sub>4</sub>, 10<sup>-3</sup>, line one<br/>line two.',
+      "",
+      "| Term | Notes |",
+      "|---|---|",
+      "| ==ATP== | First<br>Second |",
+    ].join("\n");
+
+    const html = renderToStaticMarkup(<MarkdownPreview markdown={markdown} documentPath={null} python="" dark={false} />);
+    expect(html).toMatch(/Formula H<sub>2<\/sub>O and x<sup>2<\/sup> with <mark>core concept<\/mark> and <del[^>]*>retired<\/del> \./);
+    expect(html).not.toMatch(/<del[^>]*>2<\/del>/);
+    expect(html).not.toContain("obsidian hidden");
+    expect(html).not.toContain("inline hidden");
+    expect(html).not.toContain("still hidden");
+    expect(html).toContain("<kbd>Ctrl</kbd>+<kbd>K</kbd>");
+    expect(html).toContain("<mark>focus</mark>");
+    expect(html).toContain("<u>underlined</u>");
+    expect(html).toContain("H<sub>2</sub>SO<sub>4</sub>");
+    expect(html).toContain("10<sup>-3</sup>");
+    expect(html).toContain("line one<br/>line two.");
+    expect(html).toMatch(/<td[^>]*><mark>ATP<\/mark><\/td><td[^>]*>First<br\/>Second<\/td>/);
+    expect(html).not.toContain("onclick");
+    expect(html).not.toContain("style=\"color:red\"");
+  });
+
+  it("rejects spaces in sub/sup, keeps unmatched markers and non-allowlisted HTML inert, and protects code, math, and URLs", () => {
+    const markdown = [
+      "Spaced ~not sub~ and ^not sup^, prose if a == b and c == d or a === b, escaped \\~lit\\~ and \\==lit==.",
+      "",
+      "Side by side: \\==Literal markup==, &#61;=Entity==, and \\\\==After slash== vs ==Real highlight==, H\\~2~O and H\\~2\\~O and \\~lit~ vs H~2~O and ~sub~, x\\^2^ and x\\^2\\^ vs x^2^, \\%%kept\\%% vs %%stripped%%.",
+      "",
+      "> Quote line one",
+      "> \\==Quoted literal== vs ==Quoted highlight==",
+      "",
+      "Unmatched <mark>open only and stray </kbd> and self-closing <mark/>.",
+      "",
+      "Inline <script>alert(1)</script> and URL https://example.edu/~alice/notes~1.",
+      "",
+      "<script>window.pwned = true</script>",
+      "",
+      "Code `H~2~O ==hi== ^2^ %%keep%% <kbd>x</kbd>` and math $x^2 + y_1$.",
+      "",
+      "```python",
+      "%%timeit value = a == b",
+      "```",
+    ].join("\n");
+
+    const html = renderToStaticMarkup(<MarkdownPreview markdown={markdown} documentPath={null} python="" dark={false} />);
+    expect(html).toContain("Spaced ~not sub~ and ^not sup^, prose if a == b and c == d or a === b, escaped ~lit~ and ==lit==.");
+    expect(html).toContain("Side by side: ==Literal markup==, ==Entity==, and \\<mark>After slash</mark> vs <mark>Real highlight</mark>, H~2~O and H~2~O and ~lit~ vs H<sub>2</sub>O and <sub>sub</sub>, x^2^ and x^2^ vs x<sup>2</sup>, %%kept%% vs .");
+    expect(html).not.toContain("stripped");
+    expect(html).toContain("Quote line one\n==Quoted literal== vs <mark>Quoted highlight</mark>");
+    expect(html).toContain("Unmatched &lt;mark&gt;open only and stray &lt;/kbd&gt; and self-closing &lt;mark/&gt;.");
+    expect(html).toContain("Inline &lt;script&gt;alert(1)&lt;/script&gt;");
+    expect(html).toContain("&lt;script&gt;window.pwned = true&lt;/script&gt;");
+    expect(html).not.toContain("<script");
+    expect(html).toContain('href="https://example.edu/~alice/notes~1"');
+    expect(html).toContain(">https://example.edu/~alice/notes~1</a>");
+    expect(html).toContain("<code>H~2~O ==hi== ^2^ %%keep%% &lt;kbd&gt;x&lt;/kbd&gt;</code>");
+    expect(html).toContain('class="katex"');
+    expect(html).toContain("%%timeit");
+  });
+});

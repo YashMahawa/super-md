@@ -4,6 +4,7 @@ import android.content.Intent
 import android.os.ParcelFileDescriptor
 import androidx.test.core.app.ApplicationProvider
 import androidx.test.ext.junit.runners.AndroidJUnit4
+import androidx.test.platform.app.InstrumentationRegistry
 import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.async
 import org.json.JSONObject
@@ -124,7 +125,7 @@ class EngineTest {
     @Test fun selectablePapersAndPrivateFontsExportOnDevice() {
         val app=ApplicationProvider.getApplicationContext<android.app.Application>()
         val font=File(app.cacheDir,"import-Manrope.ttf")
-        app.assets.open("web/fonts/Manrope.ttf").use { input->font.outputStream().use {input.copyTo(it)} }
+        InstrumentationRegistry.getInstrumentation().context.assets.open("fonts/Manrope.ttf").use { input->font.outputStream().use {input.copyTo(it)} }
         assertTrue(PdfEngine.fontFamilies(font.absolutePath).contains("Manrope"))
         val library=FontLibrary(app)
         val family=library.import(android.net.Uri.fromFile(font))

@@ -1,5 +1,6 @@
 import {visit} from 'unist-util-visit';
 import {headingSlug} from './headingSlug';
+import {parseFrontmatter} from './frontmatter';
 
 interface Edit {start:number;end:number;text:string}
 interface Stage {value:string;originalOffset:(offset:number)=>number}
@@ -21,13 +22,7 @@ function replaceStage(source:string,edits:Edit[]):Stage {
     return edit.from+Math.min(offset-edit.start,edit.to-edit.from);
   }};
 }
-function regexStage(source:string,regex:RegExp,replacement:(...args:any[])=>string):Stage {
-  const edits:Edit[]=[];
-  source.replace(regex,(...args:any[])=>{const start=args[args.length-2] as number;edits.push({start,end:start+args[0].length,text:replacement(...args)});return args[0];});
-  return replaceStage(source,edits);
-}
 
-const FRONTMATTER=/^---\r?\n[\s\S]*?\r?\n---\r?\n/;
 const CALLOUT_START=/^:::callout\s+([\w-]+)(?:\s+(.+))?\s*$/i;
 const THEMATIC_BREAK=/^(?:(?:\*[ \t]*){3,}|(?:-[ \t]*){3,}|(?:_[ \t]*){3,})$/;
 const TABLE_DELIMITER=/^(?:\|[ \t]*:?-+:?[ \t]*(?:\|[ \t]*:?-+:?[ \t]*)*\|?|:?-+:?[ \t]*(?:\|[ \t]*:?-+:?[ \t]*)+\|?)[ \t]*$/;
@@ -264,7 +259,7 @@ export function maskCode(markdown:string):string {
 }
 
 export function hasCallouts(markdown:string):boolean {
-  const body=markdown.replace(FRONTMATTER,'');
+  const fm=parseFrontmatter(markdown),body=fm?markdown.slice(fm.end):markdown;
   for(const line of classifyMarkdownLines(body)){
     if(line.kind!=='fence'&&line.kind!=='indented'&&CALLOUT_START.test(body.slice(line.start,line.end)))return true;
   }
@@ -273,7 +268,7 @@ export function hasCallouts(markdown:string):boolean {
 
 export function normalizeCalloutBlocks(value:string,skipFrontmatter=true):Stage {
   if(!/:::callout\s/i.test(value))return {value,originalOffset:offset=>offset};
-  const frontmatterEnd=skipFrontmatter?(value.match(/^---\r?\n[\s\S]*?\r?\n---(?:\r?\n|$)/)?.[0].length??0):0;
+  const frontmatterEnd=skipFrontmatter?(parseFrontmatter(value)?.end??0):0;
   const body=frontmatterEnd?value.slice(frontmatterEnd):value;
   const edits:Edit[]=[];let depth=0;
   for(const line of classifyMarkdownLines(body)){
@@ -312,12 +307,59 @@ function unmaskedRegexStage(source:string,ranges:Array<[number,number]>,regex:Re
   return {stage:replaceStage(source,edits),ranges:nextRanges};
 }
 
+function isUnmaskedEscaped(source:string,mask:Uint8Array,at:number):boolean {
+  let slashes=0;
+  for(let j=at-1;j>=0&&!mask[j]&&source[j]==='\\';j--)slashes++;
+  return (slashes&1)===1;
+}
+
+function stripPercentComments(source:string):Stage {
+  if(!source.includes('%%'))return {value:source,originalOffset:offset=>offset};
+  const mask=computeCodeMask(source),edits:Edit[]=[];
+  for(let i=0;i<source.length;){
+    if(mask[i]||source[i]!=='$'||isUnmaskedEscaped(source,mask,i)){i++;continue;}
+    if(source[i+1]==='$'&&!mask[i+1]){
+      if(source[i+2]==='$'){while(i<source.length&&source[i]==='$')i++;continue;}
+      let close=-1;
+      for(let j=i+2;j+1<source.length;j++){
+        if(!mask[j]&&!mask[j+1]&&source[j]==='$'&&source[j+1]==='$'&&source[j+2]!=='$'&&!isUnmaskedEscaped(source,mask,j)){close=j;break;}
+      }
+      if(close>=0){mask.fill(1,i,close+2);i=close+2;}else i+=2;
+      continue;
+    }
+    const next=source[i+1];
+    if(!next||/\s/.test(next)){i++;continue;}
+    let close=-1;
+    for(let j=i+1;j<source.length;j++){
+      if(source[j]==='\n'){
+        let k=j+1;while(k<source.length&&(source[k]===' '||source[k]==='\t'||source[k]==='\r'))k++;
+        if(source[k]==='\n')break;
+      }
+      if(!mask[j]&&source[j]==='$'&&source[j+1]!=='$'&&!isUnmaskedEscaped(source,mask,j)&&!/\s/.test(source[j-1])&&!/\d/.test(source[j+1]||'')){close=j;break;}
+    }
+    if(close>=0){mask.fill(1,i,close+1);i=close+1;}else i++;
+  }
+  const isDelim=(at:number)=>at+1<source.length&&source[at]==='%'&&source[at+1]==='%'&&!mask[at]&&!mask[at+1]&&!isUnmaskedEscaped(source,mask,at);
+  for(let i=0;i+1<source.length;){
+    if(!isDelim(i)){i++;continue;}
+    let close=-1;
+    for(let j=i+2;j+1<source.length;j++){if(isDelim(j)){close=j;break;}}
+    if(close<0)break;
+    edits.push({start:i,end:close+2,text:''});
+    i=close+2;
+  }
+  return edits.length?replaceStage(source,edits):{value:source,originalOffset:offset=>offset};
+}
+
 /** Render-only syntax normalization with a sparse offset map. Source positions
  * always address the original note, including frontmatter and wiki/callout edits. */
 export function normalizeMarkdownSource(markdown:string):Stage {
   const stages:Stage[]=[];let value=markdown;
   const add=(stage:Stage)=>{stages.push(stage);value=stage.value;};
-  add(regexStage(value,FRONTMATTER,()=>''));
+  const fm=parseFrontmatter(value);
+  if(fm)add(replaceStage(value,[{start:0,end:fm.end,text:''}]));
+  else if(value.startsWith('\uFEFF'))add(replaceStage(value,[{start:0,end:1,text:''}]));
+  add(stripPercentComments(value));
   let ranges=unmaskedRangesFromMask(computeCodeMask(value));
   const addUnmasked=(regex:RegExp,replacement:(...args:any[])=>string)=>{const next=unmaskedRegexStage(value,ranges,regex,replacement);ranges=next.ranges;add(next.stage);};
   addUnmasked(/!\[\[([^\[\r\n\]|]+)(?:\|([^\r\n\]]+))?\]\]/g,(_all,path,label)=>`![${label??path}](${encodeURI(path)})`);
