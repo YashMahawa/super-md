@@ -46,12 +46,25 @@ export function sourceMatches(content:string,query:string,caseSensitive=false):A
   for(const match of content.matchAll(regex)){matches.push({from:match.index!,to:match.index!+match[0].length});if(matches.length>=5000)break;}
   return matches;
 }
-export default function ReadingSearch({content,close,onChange,sourceSession}:{content:string;close:()=>void;onChange?:(content:string)=>void;sourceSession?:string}) {
-  const [query,setQuery]=useState(()=>window.getSelection()?.toString().slice(0,200)||"");
+export interface ReadingSearchSeed {
+  query: string;
+  caseSensitive?: boolean;
+  nonce: number;
+}
+export default function ReadingSearch({content,close,onChange,sourceSession,seed}:{content:string;close:()=>void;onChange?:(content:string)=>void;sourceSession?:string;seed?:ReadingSearchSeed|null}) {
+  const [query,setQuery]=useState(()=>seed?seed.query.slice(0,200):window.getSelection()?.toString().slice(0,200)||"");
   const [matches,setMatches]=useState<Range[]>([]),[index,setIndex]=useState(-1);
-  const [caseSensitive,setCaseSensitive]=useState(false),[replacing,setReplacing]=useState(false),[replacement,setReplacement]=useState("");
+  const [caseSensitive,setCaseSensitive]=useState(()=>Boolean(seed?.caseSensitive)),[replacing,setReplacing]=useState(false),[replacement,setReplacement]=useState("");
   const [sourceRanges,setSourceRanges]=useState<Array<{from:number;to:number}>>([]);
   const [windowed,setWindowed]=useState<WindowedMatch[]|null>(null);
+  const [appliedNonce,setAppliedNonce]=useState<number|null>(seed?seed.nonce:null);
+  const pendingAutoSelect=useRef(Boolean(seed&&seed.query));
+  if(seed&&appliedNonce!==seed.nonce){
+    setAppliedNonce(seed.nonce);
+    pendingAutoSelect.current=Boolean(seed.query);
+    setQuery(seed.query.slice(0,200));
+    if(seed.caseSensitive!==undefined)setCaseSensitive(Boolean(seed.caseSensitive));
+  }
   const sourceSearch=!!sourceSession||replacing;
   const count=sourceSearch?sourceRanges.length:windowed?.length??matches.length;
   const input=useRef<HTMLInputElement>(null), current=useRef({matches,index});current.current={matches,index};
@@ -64,12 +77,12 @@ export default function ReadingSearch({content,close,onChange,sourceSession}:{co
     cancelSettlingHeading();
     const {matches,index}=current.current;
     if(sourceSearch){if(!sourceRanges.length)return;const next=(index+direction+sourceRanges.length)%sourceRanges.length;const range=sourceRanges[next];if(sourceSession)editorFindRange(sourceSession,range.from,range.to);setIndex(next);return;}
-    if(windowed){if(!windowed.length)return;const next=(index+direction+windowed.length)%windowed.length,match=windowed[next];revealWindowed(match.element);match.element.scrollIntoView({block:'center',behavior:'instant'});setIndex(next);requestAnimationFrame(()=>requestAnimationFrame(()=>{const ranges=readingMatches(match.element,query,caseSensitive),range=ranges[match.ordinal];if(registry&&HighlightClass){registry.set('smd-search',new HighlightClass(...ranges));if(range)registry.set('smd-search-current',new HighlightClass(range));}range?.startContainer.parentElement?.scrollIntoView({block:'center',behavior:'instant'});}));return;}
+    if(windowed){if(!windowed.length)return;const next=(index+direction+windowed.length)%windowed.length,match=windowed[next];revealWindowed(match.element);match.element.scrollIntoView?.({block:'center',behavior:'instant'});setIndex(next);requestAnimationFrame(()=>requestAnimationFrame(()=>{const ranges=readingMatches(match.element,query,caseSensitive),range=ranges[match.ordinal];if(registry&&HighlightClass){registry.set('smd-search',new HighlightClass(...ranges));if(range)registry.set('smd-search-current',new HighlightClass(range));}range?.startContainer.parentElement?.scrollIntoView?.({block:'center',behavior:'instant'});}));return;}
     if(!matches.length)return;
     const next=(index+direction+matches.length)%matches.length, range=matches[next];
     let element=range.startContainer.parentElement;
     for(let owner=element?.closest("details");owner;owner=owner.parentElement?.closest("details")||null) owner.open=true;
-    element?.scrollIntoView({block:"center",behavior:"instant"});
+    element?.scrollIntoView?.({block:"center",behavior:"instant"});
     setIndex(next);
   };
   useEffect(()=>{
@@ -93,11 +106,27 @@ export default function ReadingSearch({content,close,onChange,sourceSession}:{co
     return()=>{setReaderOverlay("search",false);document.removeEventListener("keydown",key,true);window.removeEventListener("supermd-find-focus",focus);};
   },[]);
   useEffect(()=>{
-    setSourceRanges(sourceMatches(content,query,caseSensitive));
+    const sources=sourceMatches(content,query,caseSensitive);
+    setSourceRanges(sources);
     if(sourceSession)editorFindQuery(sourceSession,query,caseSensitive);
-    const frame=requestAnimationFrame(()=>{const host=document.querySelector(".android-reading")||document.querySelector(".markdown-body");setWindowed(host?windowedMatches(host,query,caseSensitive):null);const result=host?readingMatches(host,query,caseSensitive):[];setMatches(result);setIndex(-1);if(registry&&HighlightClass)registry.set("smd-search",new HighlightClass(...result));});
+    const autoSelect=pendingAutoSelect.current;
+    pendingAutoSelect.current=false;
+    const frame=requestAnimationFrame(()=>{
+      const host=document.querySelector(".android-reading")||document.querySelector(".markdown-body");
+      const win=host?windowedMatches(host,query,caseSensitive):null;
+      setWindowed(win);
+      const result=host?readingMatches(host,query,caseSensitive):[];
+      setMatches(result);
+      if(registry&&HighlightClass)registry.set("smd-search",new HighlightClass(...result));
+      if(autoSelect){
+        if(sourceSearch&&sources.length){if(sourceSession)editorFindRange(sourceSession,sources[0].from,sources[0].to);setIndex(0);return;}
+        if(win&&win.length){const match=win[0];revealWindowed(match.element);match.element.scrollIntoView?.({block:'center',behavior:'instant'});setIndex(0);requestAnimationFrame(()=>requestAnimationFrame(()=>{const ranges=readingMatches(match.element,query,caseSensitive),range=ranges[match.ordinal];if(registry&&HighlightClass){registry.set('smd-search',new HighlightClass(...ranges));if(range)registry.set('smd-search-current',new HighlightClass(range));}range?.startContainer.parentElement?.scrollIntoView?.({block:'center',behavior:'instant'});}));return;}
+        if(result.length){const range=result[0];let element=range.startContainer.parentElement;for(let owner=element?.closest("details");owner;owner=owner.parentElement?.closest("details")||null)owner.open=true;element?.scrollIntoView?.({block:"center",behavior:"instant"});setIndex(0);return;}
+      }
+      setIndex(-1);
+    });
     return()=>{cancelAnimationFrame(frame);registry?.delete("smd-search");registry?.delete("smd-search-current");if(sourceSession)editorFindQuery(sourceSession,"",false);};
-  },[query,content,caseSensitive,sourceSession,replacing]);
+  },[query,content,caseSensitive,sourceSession,replacing,seed?.nonce]);
   useEffect(()=>{if(!windowed&&registry&&HighlightClass){registry.delete("smd-search-current");if(index>=0&&matches[index])registry.set("smd-search-current",new HighlightClass(matches[index]));}},[index,matches,windowed]);
   useEffect(()=>{
     const host=document.querySelector('.android-reading');if(!host||!windowed||!query)return;
