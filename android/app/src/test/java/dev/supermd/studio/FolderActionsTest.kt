@@ -18,9 +18,9 @@ import androidx.lifecycle.ViewModelStore
 import java.io.File
 import java.io.FileNotFoundException
 import java.nio.file.Files
+import java.time.Duration
 import org.json.JSONObject
 import org.junit.After
-import org.junit.Assert.assertArrayEquals
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNotNull
@@ -45,7 +45,6 @@ class FolderActionsTest {
     private lateinit var treeUri: Uri
     private var previousAutosave: Boolean? = null
     private var previousRecent: String? = null
-    private var previousNoteLocation: String? = null
     private var previousPositions: String? = null
     private val workspaceKeys = mutableListOf<String>()
     private val viewModels = mutableListOf<ViewModelStore>()
@@ -70,12 +69,10 @@ class FolderActionsTest {
         val prefs = app.getSharedPreferences("studio", Context.MODE_PRIVATE)
         previousAutosave = prefs.getBoolean("autosave", true)
         previousRecent = prefs.getString("recent", null)
-        previousNoteLocation = prefs.getString("newNoteLocation", null)
         previousPositions = prefs.getString("readingPositions", null)
         prefs.edit()
             .putBoolean("autosave", false)
             .remove("recent")
-            .remove("newNoteLocation")
             .remove("readingPositions")
             .commit()
     }
@@ -86,7 +83,6 @@ class FolderActionsTest {
         app.getSharedPreferences("studio", Context.MODE_PRIVATE).edit().apply {
             putBoolean("autosave", previousAutosave ?: true)
             if (previousRecent == null) remove("recent") else putString("recent", previousRecent)
-            if (previousNoteLocation == null) remove("newNoteLocation") else putString("newNoteLocation", previousNoteLocation)
             if (previousPositions == null) remove("readingPositions") else putString("readingPositions", previousPositions)
         }.commit()
         ShadowContentResolver.reset()
@@ -96,54 +92,6 @@ class FolderActionsTest {
             File(app.filesDir, "workspaces/$key").deleteRecursively()
             File(app.filesDir, "deleted-drafts/$key").deleteRecursively()
         }
-    }
-
-    @Test
-    fun untitledSaveDestinationDefaultsToOpenFolderWhenNoteLocationIsEmptyAndHonorsExplicitLocation() {
-        val model = newModel()
-        val markdownPicker = NoteDestination("text/markdown", model::untitledSaveLocation)
-
-        // 1. Neither newNoteLocation nor open folder -> Downloads initial URI
-        val defaultIntent = markdownPicker.createIntent(app, "Draft")
-        val initialDownloads = defaultIntent.getParcelableExtra(DocumentsContract.EXTRA_INITIAL_URI, Uri::class.java)
-        assertNotNull(initialDownloads)
-        assertTrue(initialDownloads.toString().contains("Download"))
-
-        // 2. Open folder set, newNoteLocation empty -> defaults to open folder tree
-        model.setFolder(treeUri)
-        await { model.state.value.folder == treeUri.toString() }
-        assertEquals("", model.noteLocation())
-        assertEquals(treeUri.toString(), model.untitledSaveLocation())
-        val openFolderIntent = markdownPicker.createIntent(app, "Draft")
-        val initialOpenFolder = openFolderIntent.getParcelableExtra(DocumentsContract.EXTRA_INITIAL_URI, Uri::class.java)
-        assertEquals(
-            DocumentsContract.buildDocumentUriUsingTree(treeUri, "root"),
-            initialOpenFolder,
-        )
-
-        // 3. Explicit newNoteLocation set -> honors newNoteLocation over open folder
-        val customTree = DocumentsContract.buildTreeDocumentUri(authority, "root/CustomOut")
-        File(rootDir, "CustomOut").mkdirs()
-        app.grantUriPermission(
-            app.packageName,
-            customTree,
-            Intent.FLAG_GRANT_READ_URI_PERMISSION or
-                Intent.FLAG_GRANT_WRITE_URI_PERMISSION or
-                Intent.FLAG_GRANT_PERSISTABLE_URI_PERMISSION or
-                Intent.FLAG_GRANT_PREFIX_URI_PERMISSION,
-        )
-        model.noteLocation(customTree)
-        assertEquals(customTree.toString(), model.untitledSaveLocation())
-        val explicitIntent = markdownPicker.createIntent(app, "Draft")
-        val initialExplicit = explicitIntent.getParcelableExtra(DocumentsContract.EXTRA_INITIAL_URI, Uri::class.java)
-        assertEquals(
-            DocumentsContract.buildDocumentUriUsingTree(customTree, "root/CustomOut"),
-            initialExplicit,
-        )
-
-        // 4. Clearing newNoteLocation restores open folder fallback
-        model.clearNoteLocation()
-        assertEquals(treeUri.toString(), model.untitledSaveLocation())
     }
 
     @Test
@@ -176,7 +124,7 @@ class FolderActionsTest {
     }
 
     @Test
-    fun renameValidatesExtensionsAndSynchronizesTabsAcrossWindowsRecentsPinsAndReadingPositions() {
+    fun renameValidatesExtensionsSynchronizesWindowsAndPreservesStreamingSearchAndSeededFind() {
         // Unit validation & noteStem checks
         assertEquals("1.2 Linear Algebra", noteStem("1.2 Linear Algebra.md"))
         assertEquals("Study", noteStem("Study.smd"))
@@ -192,8 +140,8 @@ class FolderActionsTest {
         }
 
         val subDir = File(rootDir, "Course").apply { mkdirs() }
-        val openFile = File(subDir, "Week1.md").apply { writeText("# Week 1\n") }
-        val closedFile = File(subDir, "Week2.md").apply { writeText("# Week 2\n") }
+        File(subDir, "Week1.md").writeText("# Week 1\n\nSeededNeedle appears in week one.\n")
+        val closedFile = File(subDir, "Week2.md").apply { writeText("# Week 2\n\nClosedNeedle appears in week two.\n") }
 
         val mainWindow = newModel()
         val secondWindow = newModel()
@@ -221,6 +169,22 @@ class FolderActionsTest {
         )
         assertNotNull(mainWindow.readingLocation(openUri.toString()))
 
+        // Seed reader navigation from #56 streaming search before renaming
+        mainWindow.openFolderSearch("SeededNeedle")
+        await(debugInfo = { "initialSearch: matches=${mainWindow.folderSearch.value.matches.size}" }) {
+            !mainWindow.folderSearch.value.scanning && mainWindow.folderSearch.value.matches.size == 1
+        }
+        mainWindow.openSearchMatch(mainWindow.folderSearch.value.matches.single())
+        await { mainWindow.seededFind.value != null }
+        assertEquals(openUri.toString(), mainWindow.seededFind.value?.targetUri)
+
+        // Keep an active streaming search open for ClosedNeedle in secondWindow to verify live rescan on rename
+        secondWindow.openFolderSearch("ClosedNeedle")
+        await(debugInfo = { "secondSearch: matches=${secondWindow.folderSearch.value.matches}" }) {
+            !secondWindow.folderSearch.value.scanning &&
+                secondWindow.folderSearch.value.matches.any { it.relative == "Course/Week2.md" }
+        }
+
         // Duplicate rename is rejected both globally and via inline dialog callback
         var inlineOutcome: Pair<Boolean, String?>? = null
         mainWindow.renameFolderEntry(closedUri, "Course/Week2.md", isDirectory = false, requested = "Week1", showGlobalError = false) { ok, err ->
@@ -238,13 +202,18 @@ class FolderActionsTest {
         mainWindow.dismissError()
         assertTrue(closedFile.isFile)
 
-        // Rename closed note without supplying extension
+        // Rename closed note without supplying extension -> updates active streaming search in secondWindow
         mainWindow.renameFolderEntry(closedUri, "Course/Week2.md", isDirectory = false, requested = "Week2 Revised")
-        await(debugInfo = { "closedRename: err=${mainWindow.state.value.error}" }) {
-            File(subDir, "Week2 Revised.md").isFile && !closedFile.exists()
+        await(debugInfo = {
+            "closedRename: err=${mainWindow.state.value.error} matches=${secondWindow.folderSearch.value.matches.map { it.relative }}"
+        }) {
+            File(subDir, "Week2 Revised.md").isFile &&
+                !closedFile.exists() &&
+                !secondWindow.folderSearch.value.scanning &&
+                secondWindow.folderSearch.value.matches.any { it.relative == "Course/Week2 Revised.md" }
         }
 
-        // Rename parent folder "Course" -> "Semester" and verify open tabs in both windows, recents, pins, readingPositions
+        // Rename parent folder "Course" -> "Semester" and verify open tabs, recents, pins, readingPositions, seededFind, and active search
         val folderDocUri = treeDocUri("root/Course")
         mainWindow.listFolder(treeUri, "Course")
         await(debugInfo = { "listCourse: rel=${mainWindow.state.value.folderRelative} err=${mainWindow.state.value.error}" }) {
@@ -259,109 +228,20 @@ class FolderActionsTest {
         }) {
             mainWindow.state.value.active.uri == expectedNewNoteUri &&
                 secondWindow.state.value.active.uri == expectedNewNoteUri &&
-                mainWindow.state.value.folderRelative == "Semester"
+                mainWindow.state.value.folderRelative == "Semester" &&
+                !secondWindow.folderSearch.value.scanning &&
+                secondWindow.folderSearch.value.matches.any { it.relative == "Semester/Week2 Revised.md" }
         }
         assertEquals("Semester/Week1.md", mainWindow.state.value.active.relative)
         assertEquals("Semester/Week1.md", secondWindow.state.value.active.relative)
+        assertEquals(expectedNewNoteUri, mainWindow.seededFind.value?.targetUri)
+        assertTrue(mainWindow.activeMatchesSeedTarget(mainWindow.state.value.active, mainWindow.seededFind.value!!))
         val pinnedRecent = mainWindow.recent.value.firstOrNull { it.uri == expectedNewNoteUri }
         assertNotNull(pinnedRecent)
         assertTrue(pinnedRecent!!.pinned)
         assertEquals("Semester/Week1.md", pinnedRecent.relative)
         assertNotNull(mainWindow.readingLocation(expectedNewNoteUri))
         assertNull(mainWindow.readingLocation(openUri.toString()))
-    }
-
-    @Test
-    fun moveBlocksSelfOrDescendantAndCopiesLinkedLocalImagesLazily() {
-        File(rootDir, "assets").mkdirs()
-        val pngBytes = byteArrayOf(
-            0x89.toByte(), 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a,
-            0x00, 0x00, 0x00, 0x0d,
-        )
-        File(rootDir, "assets/diagram.png").writeBytes(pngBytes)
-        File(rootDir, "Paper.md").writeText("# Paper\n\n![Diagram](assets/diagram.png)\n\n```\n![Ignored](assets/fake.png)\n```\n")
-        File(rootDir, "Archive/Deep/HiddenLeaf").mkdirs()
-
-        val model = newModel()
-        model.setFolder(treeUri)
-        await { model.state.value.files.isNotEmpty() }
-
-        // Verify lazy folder picker does NOT query unexpanded Archive/Deep
-        provider.queriedChildDirectories.clear()
-        model.loadMovePickerTargets(excludeFolderRelative = null, expandedRelatives = emptySet())
-        await { model.state.value.movePickerTargets.isNotEmpty() }
-        assertEquals(listOf("", "Archive", "assets"), model.state.value.movePickerTargets.map { it.relative })
-        assertFalse(
-            "Unexpanded nested folders must not be eagerly queried",
-            provider.queriedChildDirectories.contains("root/Archive/Deep"),
-        )
-
-        // Block moving Archive into itself or Archive/Deep
-        val archiveUri = treeDocUri("root/Archive")
-        model.requestMoveFolderEntry(archiveUri, "Archive", isDirectory = true, targetParentRelative = "Archive/Deep")
-        await { model.state.value.error?.contains("Cannot move a folder into itself") == true }
-        model.dismissError()
-
-        // Requesting move of Paper.md into Archive prompts about linked local image
-        val paperUri = treeDocUri("root/Paper.md")
-        grantReadWrite(paperUri)
-        model.open(paperUri, "Paper.md")
-        await { model.state.value.active.uri == paperUri.toString() }
-
-        model.requestMoveFolderEntry(paperUri, "Paper.md", isDirectory = false, targetParentRelative = "Archive")
-        await { model.state.value.moveImagesPrompt != null }
-        val prompt = model.state.value.moveImagesPrompt!!
-        assertEquals(1, prompt.imageCount)
-        assertTrue(prompt.canCopy)
-
-        // Confirming with copyImages=true copies assets/diagram.png into Archive/assets/diagram.png and moves Paper.md
-        // Also test fallback path when provider throws UnsupportedOperationException on moveDocument
-        provider.supportMoveDocument = false
-        model.moveFolderEntry(paperUri, "Paper.md", isDirectory = false, targetParentRelative = "Archive", copyImages = true)
-        val movedPaperUri = treeDocUri("root/Archive/Paper.md").toString()
-        await {
-            File(rootDir, "Archive/Paper.md").isFile &&
-                !File(rootDir, "Paper.md").exists() &&
-                model.state.value.active.uri == movedPaperUri
-        }
-        assertArrayEquals(pngBytes, File(rootDir, "Archive/assets/diagram.png").readBytes())
-        assertEquals("Archive/Paper.md", model.state.value.active.relative)
-    }
-
-    @Test
-    fun deletePreservesDirtyDraftsInClosedNoteRecoveryAndCleansWorkspaceState() {
-        val folder = File(rootDir, "Scratch").apply { mkdirs() }
-        File(folder, "DraftNote.md").writeText("# Baseline\n")
-
-        val model = newModel()
-        model.setFolder(treeUri)
-        await { model.state.value.files.any { it.name == "Scratch" } }
-
-        val draftUri = treeDocUri("root/Scratch/DraftNote.md")
-        grantReadWrite(draftUri)
-        model.open(draftUri, "Scratch/DraftNote.md")
-        await { model.state.value.active.uri == draftUri.toString() }
-        val draftId = model.state.value.active.id
-        model.pinRecent(draftUri.toString())
-        model.edit(draftId, "# Baseline\n\nUnsaved critical thoughts!\n")
-        assertTrue(model.state.value.active.dirty)
-
-        // Delete parent folder Scratch
-        val scratchUri = treeDocUri("root/Scratch")
-        model.deleteFolderEntry(scratchUri, "Scratch", isDirectory = true)
-        await {
-            !folder.exists() &&
-                model.state.value.tabs.none { it.id == draftId } &&
-                model.state.value.closedTabs.any { it.id == draftId }
-        }
-        assertTrue(model.recent.value.none { it.uri == draftUri.toString() })
-        assertNoHiddenOrVaultFiles()
-
-        // Reopen recovers the dirty draft detached from the deleted URI
-        model.reopen()
-        await { model.state.value.active.id == draftId }
-        assertTrue(model.state.value.active.content.contains("Unsaved critical thoughts!"))
-        assertNull(model.state.value.active.uri)
     }
 
     @Test
@@ -407,7 +287,7 @@ class FolderActionsTest {
     private fun assertNoHiddenOrVaultFiles() {
         rootDir.walkTopDown().forEach { file ->
             if (file != rootDir) {
-                assertFalse("Unexpected hidden or trash artifact: ${file.path}", file.name.startsWith("."))
+                assertFalse("Unexpected hidden artifact: ${file.path}", file.name.startsWith("."))
             }
         }
     }
@@ -415,18 +295,16 @@ class FolderActionsTest {
     private fun await(debugInfo: () -> String = { "" }, predicate: () -> Boolean) {
         val deadline = System.nanoTime() + 5_000_000_000L
         while (System.nanoTime() < deadline) {
-            shadowOf(Looper.getMainLooper()).idle()
+            shadowOf(Looper.getMainLooper()).idleFor(Duration.ofMillis(20))
             if (predicate()) return
             Thread.sleep(10)
         }
-        shadowOf(Looper.getMainLooper()).idle()
+        shadowOf(Looper.getMainLooper()).idleFor(Duration.ofMillis(20))
         assertTrue("Condition was not satisfied before timeout. ${debugInfo()}", predicate())
     }
 }
 
 private class TreeTestDocumentsProvider(private val rootDir: File) : ContentProvider() {
-    var supportMoveDocument = true
-    val queriedChildDirectories = java.util.Collections.synchronizedSet(mutableSetOf<String>())
     private var attachedAuthority: String = ""
 
     fun attach(context: Context, authority: String) {
@@ -470,14 +348,20 @@ private class TreeTestDocumentsProvider(private val rootDir: File) : ContentProv
 
     private fun mimeFor(file: File): String =
         if (file.isDirectory) Document.MIME_TYPE_DIR
-        else safAssetMimeForName(file.name, null)
+        else when (file.extension.lowercase()) {
+            "smd" -> "application/vnd.supermd.smd"
+            "fmd" -> "application/vnd.supermd.fmd"
+            "md", "markdown" -> "text/markdown"
+            "txt" -> "text/plain"
+            else -> "application/octet-stream"
+        }
 
     private fun includeFile(cursor: MatrixCursor, file: File) {
         if (!file.exists()) throw FileNotFoundException(file.path)
         val flags = if (file.isDirectory) {
-            Document.FLAG_DIR_SUPPORTS_CREATE or Document.FLAG_SUPPORTS_DELETE or Document.FLAG_SUPPORTS_RENAME or Document.FLAG_SUPPORTS_MOVE
+            Document.FLAG_DIR_SUPPORTS_CREATE or Document.FLAG_SUPPORTS_RENAME
         } else {
-            Document.FLAG_SUPPORTS_WRITE or Document.FLAG_SUPPORTS_DELETE or Document.FLAG_SUPPORTS_RENAME or Document.FLAG_SUPPORTS_MOVE
+            Document.FLAG_SUPPORTS_WRITE or Document.FLAG_SUPPORTS_RENAME
         }
         val cols = cursor.columnNames
         val row = arrayOfNulls<Any>(cols.size)
@@ -508,7 +392,6 @@ private class TreeTestDocumentsProvider(private val rootDir: File) : ContentProv
         val segments = uri.pathSegments
         if (segments.lastOrNull() == "children" && segments.size >= 2) {
             val parentDocId = Uri.decode(segments[segments.size - 2])
-            queriedChildDirectories.add(parentDocId)
             val parent = fileForDocId(parentDocId)
             if (!parent.isDirectory) throw FileNotFoundException(parentDocId)
             return MatrixCursor(cols).also { cursor ->
@@ -563,27 +446,6 @@ private class TreeTestDocumentsProvider(private val rootDir: File) : ContentProv
                 val outUri = treeUriForDocId(newId)
                 grantPermissions(outUri)
                 out.putParcelable("uri", outUri)
-            }
-            "android:moveDocument" -> {
-                if (!supportMoveDocument) throw UnsupportedOperationException("Move unsupported by provider")
-                val sourceId = DocumentsContract.getDocumentId(requireNotNull(docUri))
-                val targetParentUri = requireNotNull(inExtras.getParcelable("targetUri", Uri::class.java))
-                val targetParentId = DocumentsContract.getDocumentId(targetParentUri)
-                val source = fileForDocId(sourceId)
-                val targetParent = fileForDocId(targetParentId)
-                if (!source.exists() || !targetParent.isDirectory) throw FileNotFoundException(sourceId)
-                val dest = File(targetParent, source.name)
-                check(source.renameTo(dest)) { "Move failed" }
-                val newId = docIdForFile(dest)
-                val outUri = treeUriForDocId(newId)
-                grantPermissions(outUri)
-                out.putParcelable("uri", outUri)
-            }
-            "android:deleteDocument" -> {
-                val docId = DocumentsContract.getDocumentId(requireNotNull(docUri))
-                val target = fileForDocId(docId)
-                if (!target.exists()) throw FileNotFoundException(docId)
-                check(target.deleteRecursively()) { "Delete failed" }
             }
             "android:isChildDocument" -> {
                 val parentId = DocumentsContract.getDocumentId(requireNotNull(docUri)).trimEnd('/')

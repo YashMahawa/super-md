@@ -33,7 +33,10 @@ private val activeStudioViewModels: MutableSet<StudioViewModel> =
 
 private fun liveStudioViewModels(current: StudioViewModel): List<StudioViewModel> =
     synchronized(activeStudioViewModels) {
-        val snapshot = activeStudioViewModels.filter { !it.viewModelRetired.get() }
+        val app = current.getApplication<Application>()
+        val snapshot = activeStudioViewModels.filter {
+            !it.viewModelRetired.get() && it.getApplication<Application>() === app
+        }
         if (snapshot.any { it === current } || current.viewModelRetired.get()) snapshot else snapshot + current
     }
 
@@ -81,7 +84,7 @@ data class PendingSeededFind(
     val targetTabId: String? = null,
     val targetUri: String? = null,
 )
-data class StudioState(val latexAutofix:Boolean=false, val typewriterScroll:Boolean=false, val selectionAssistant:String="chatgpt", val centerLock:Boolean=true, val customTheme:String="", val activeThemeKind:String="builtin", val activeThemeId:String="", val customThemeSource:String="", val savedThemes:List<SavedThemeEntry> = emptyList(), val patternKind:String="", val patternOpacity:Float=-1f, val patternSize:Float=0f, val patternSpacing:Float=0f, val restorePosition:Boolean=true, val fullDocumentAccessibility:Boolean=false, val startup:String="restore", val imageAppearance:String="original", val svgAppearance:String="original", val imageContrast:Float=1.25f, val spellCheck:Boolean = false, val grammarCheck:Boolean = false, val accent: String = "system", val widthPercent: Float = 100f, val lineHeight: Float = 1.65f, val autosave: Boolean = true, val customFonts: List<String> = emptyList(), val readerOverlay: Boolean = false, val zoomCommand: Long = 0, val tabs: List<Note> = listOf(Note(name = "Welcome.md", content = sample, saved = sample)), val closedTabs: List<Note> = emptyList(), val activeId: String = "", val mode: String = "live", val fullscreen: Boolean = false, val normalZoom: Float = 100f, val fullscreenZoom: Float = 100f, val theme: String = "system", val fullscreenTheme: String = "black", val motion: Boolean = true, val font: String = "Manrope", val size: Float = 15f, val folder: String? = null, val folderRelative: String = "", val files: List<FileEntry> = emptyList(), val movePickerTargets: List<FolderPickerItem> = emptyList(), val moveImagesPrompt: MoveImagesPrompt? = null, val busy: Boolean = false, val message: String? = null, val error: String? = null, val welcomed: Boolean = false, val pdf: String = "{\"pageSize\":\"a4\",\"margin\":14,\"fontSize\":10.5,\"lineHeight\":1.4,\"paragraphSpacing\":0.65,\"fontFamily\":\"Manrope\",\"pageNumbers\":true}", val storageReport: StorageReport? = null, val storageScanning: Boolean = false, val conflictedTabIds: Set<String> = emptySet(), val pendingCloseNoteId: String? = null, val pendingSaveConflictNoteId: String? = null) {
+data class StudioState(val latexAutofix:Boolean=false, val typewriterScroll:Boolean=false, val selectionAssistant:String="chatgpt", val centerLock:Boolean=true, val customTheme:String="", val activeThemeKind:String="builtin", val activeThemeId:String="", val customThemeSource:String="", val savedThemes:List<SavedThemeEntry> = emptyList(), val patternKind:String="", val patternOpacity:Float=-1f, val patternSize:Float=0f, val patternSpacing:Float=0f, val restorePosition:Boolean=true, val fullDocumentAccessibility:Boolean=false, val startup:String="restore", val imageAppearance:String="original", val svgAppearance:String="original", val imageContrast:Float=1.25f, val spellCheck:Boolean = false, val grammarCheck:Boolean = false, val accent: String = "system", val widthPercent: Float = 100f, val lineHeight: Float = 1.65f, val autosave: Boolean = true, val customFonts: List<String> = emptyList(), val readerOverlay: Boolean = false, val zoomCommand: Long = 0, val tabs: List<Note> = listOf(Note(name = "Welcome.md", content = sample, saved = sample)), val closedTabs: List<Note> = emptyList(), val activeId: String = "", val mode: String = "live", val fullscreen: Boolean = false, val normalZoom: Float = 100f, val fullscreenZoom: Float = 100f, val theme: String = "system", val fullscreenTheme: String = "black", val motion: Boolean = true, val font: String = "Manrope", val size: Float = 15f, val folder: String? = null, val folderRelative: String = "", val files: List<FileEntry> = emptyList(), val busy: Boolean = false, val message: String? = null, val error: String? = null, val welcomed: Boolean = false, val pdf: String = "{\"pageSize\":\"a4\",\"margin\":14,\"fontSize\":10.5,\"lineHeight\":1.4,\"paragraphSpacing\":0.65,\"fontFamily\":\"Manrope\",\"pageNumbers\":true}", val storageReport: StorageReport? = null, val storageScanning: Boolean = false, val conflictedTabIds: Set<String> = emptySet(), val pendingCloseNoteId: String? = null, val pendingSaveConflictNoteId: String? = null) {
     val active get() = tabs.find { it.id == activeId } ?: tabs.firstOrNull() ?: EMPTY_NOTE
     val zoom get() = if (fullscreen) fullscreenZoom else normalZoom
     val activeConflicted get() = active.id.isNotEmpty() && active.id in conflictedTabIds
@@ -724,7 +727,6 @@ class StudioViewModel(app: Application, val workspaceKey: String = "main") : And
     }
     private var listedRelative=""
     private val folderListRequests = OpenRequestGate()
-    private val movePickerRequests = OpenRequestGate()
     private val deletedDrafts=DeletedDraftStore(File(app.filesDir,"deleted-drafts/$workspaceKey"))
     private val documentObserver=object:android.database.ContentObserver(android.os.Handler(android.os.Looper.getMainLooper())) {
         override fun onChange(selfChange:Boolean){readerFolderIndex.clear();refreshMetadata();refreshExternal()}
@@ -1769,9 +1771,6 @@ class StudioViewModel(app: Application, val workspaceKey: String = "main") : And
     }
     fun pdf(value: String) { change { it.copy(pdf = value) }; prefs.edit().putString("pdf", value).apply() }
     fun noteLocation(): String = prefs.getString("newNoteLocation", "") ?: ""
-    /** Preferred folder URI for saving untitled notes: honors newNoteLocation when set, else falls back to the open folder. */
-    fun untitledSaveLocation(): String = noteLocation().takeIf { it.isNotBlank() } ?: mutable.value.folder.orEmpty()
-    fun clearNoteLocation() { prefs.edit().remove("newNoteLocation").apply() }
     internal suspend fun saveAgentMedia(args: JSONObject): JSONObject = withContext(Dispatchers.IO) {
         media.saveAgentMedia(args, noteLocation()).also { readerFolderIndex.clear() }
     }
@@ -2346,16 +2345,15 @@ class StudioViewModel(app: Application, val workspaceKey: String = "main") : And
             }
             windowPrefs.edit().putBoolean("folderMigrated", true).putString("folder", uri.toString()).putString("folderRelative", "").apply()
             listedRelative = ""
-            change { it.copy(folder = uri.toString(), folderRelative = "", movePickerTargets = emptyList(), moveImagesPrompt = null) }
+            change { it.copy(folder = uri.toString(), folderRelative = "") }
             listFolder(uri, "")
         } catch (error: Exception) { fail("Could not open folder: ${error.message}") }
     }
     fun closeFolder() {
         listedRelative = ""
         folderListRequests.invalidate()
-        movePickerRequests.invalidate()
         windowPrefs.edit().putBoolean("folderMigrated", true).remove("folder").remove("folderRelative").apply()
-        change { it.copy(folder = null, folderRelative = "", files = emptyList(), movePickerTargets = emptyList(), moveImagesPrompt = null) }
+        change { it.copy(folder = null, folderRelative = "", files = emptyList()) }
     }
     fun navigateFolderUp(): Boolean {
         val folderRaw = mutable.value.folder ?: return false
@@ -2488,14 +2486,6 @@ class StudioViewModel(app: Application, val workspaceKey: String = "main") : And
     private fun remapPersistedMetadata(remaps: List<UriRemap>) {
         if (remaps.isEmpty()) return
         updatePersistedMetadata { raw -> remaps.firstOrNull { sameDocumentUri(raw, it.oldUri) }?.newUri ?: raw }
-    }
-
-    private fun removePersistedMetadata(removedUris: Set<String>, removedRelativePrefix: String?, folderTreeRaw: String?) {
-        updatePersistedMetadata { raw ->
-            val removed = removedUris.any { sameDocumentUri(raw, it) } ||
-                (removedRelativePrefix != null && folderTreeRaw != null && matchesRelativePrefix(relativeInOpenFolder(Uri.parse(raw), folderTreeRaw), removedRelativePrefix))
-            if (removed) null else raw
-        }
     }
 
     private fun applyUriRemaps(
@@ -2776,369 +2766,6 @@ class StudioViewModel(app: Application, val workspaceKey: String = "main") : And
             folderTreeRaw = folderRaw,
             statusMessage = "Renamed to $validatedName",
         )
-    }
-
-    fun loadMovePickerTargets(
-        excludeFolderRelative: String? = null,
-        expandedRelatives: Set<String> = emptySet(),
-    ): Job {
-        val request = movePickerRequests.begin()
-        return viewModelScope.launch {
-            val folderRaw = mutable.value.folder ?: return@launch
-            try {
-                val items = withContext(Dispatchers.IO) {
-                    val treeUri = Uri.parse(folderRaw)
-                    val treeRoot = DocumentFile.fromTreeUri(getApplication(), treeUri)
-                        ?: error("Choose the folder again to restore access")
-                    val rootName = treeRoot.name?.takeIf { it.isNotBlank() } ?: "Open folder"
-                    listMovePickerTargetsLazy(treeRoot, rootName, excludeFolderRelative, expandedRelatives)
-                }
-                if (movePickerRequests.isCurrent(request) && mutable.value.folder != null) {
-                    mutable.value = mutable.value.copy(movePickerTargets = items)
-                }
-            } catch (cancelled: kotlinx.coroutines.CancellationException) {
-                throw cancelled
-            } catch (error: Exception) {
-                if (movePickerRequests.isCurrent(request)) {
-                    fail("Could not load folders: ${error.message}")
-                }
-            }
-        }
-    }
-
-    fun dismissMoveImagesPrompt() {
-        mutable.value = mutable.value.copy(moveImagesPrompt = null)
-    }
-
-    fun requestMoveFolderEntry(
-        entryUri: Uri,
-        entryRelative: String,
-        isDirectory: Boolean,
-        targetParentRelative: String,
-    ) = viewModelScope.launch {
-        val folderRaw = mutable.value.folder ?: run {
-            fail("Open a folder first")
-            return@launch
-        }
-        try {
-            val cleanSource = normalizeRelativePath(entryRelative)
-            val cleanTarget = normalizeRelativePath(targetParentRelative)
-            require(cleanSource.isNotEmpty()) { "Cannot move the open folder root" }
-            if (isDirectory && isSameOrDescendantFolder(cleanSource, cleanTarget)) {
-                fail("Cannot move a folder into itself or one of its subfolders")
-                return@launch
-            }
-            if (parentRelativePath(cleanSource) == cleanTarget) {
-                mutable.value = mutable.value.copy(message = "Already in that folder")
-                return@launch
-            }
-            val entryName = cleanSource.substringAfterLast('/')
-            val openNote = mutable.value.tabs.firstOrNull {
-                it.uri != null && sameDocumentUri(it.uri, entryUri.toString())
-            }
-            val prompt = withContext(Dispatchers.IO) {
-                val treeRoot = DocumentFile.fromTreeUri(getApplication(), Uri.parse(folderRaw))
-                    ?: error("Choose the folder again to restore access")
-                val targetDir = resolveTreeDirectory(treeRoot, cleanTarget)
-                require(findDuplicateInDirectory(targetDir, entryName, ignoreUri = entryUri) == null) {
-                    "'$entryName' already exists in the destination folder"
-                }
-                val ext = entryName.substringAfterLast('.', "").lowercase()
-                if (!isDirectory && ext in setOf("md", "markdown") && openNote?.portable != true) {
-                    val markdown = openNote?.content ?: resolver.openInputStream(documentAccess.resolve(entryUri))?.use {
-                        readLimited(it, 20_000_000).toString(Charsets.UTF_8)
-                    }.orEmpty()
-                    val inspection = inspectMovedMarkdownSafAssets(treeRoot, markdown, cleanSource, cleanTarget)
-                    if (inspection.affectedCount > 0) {
-                        MoveImagesPrompt(
-                            entryUri = entryUri.toString(),
-                            entryRelative = cleanSource,
-                            isDirectory = false,
-                            targetRelative = cleanTarget,
-                            entryName = entryName,
-                            imageCount = inspection.affectedCount,
-                            canCopy = inspection.canCopyAll,
-                        )
-                    } else null
-                } else null
-            }
-            if (prompt != null) {
-                mutable.value = mutable.value.copy(moveImagesPrompt = prompt)
-            } else {
-                executeMoveFolderEntry(entryUri, cleanSource, isDirectory, cleanTarget, copyImages = false)
-            }
-        } catch (cancelled: kotlinx.coroutines.CancellationException) {
-            throw cancelled
-        } catch (error: Exception) {
-            fail("Could not move item: ${error.message}")
-        }
-    }
-
-    fun moveFolderEntry(
-        entryUri: Uri,
-        entryRelative: String,
-        isDirectory: Boolean,
-        targetParentRelative: String,
-        copyImages: Boolean = false,
-    ) = viewModelScope.launch {
-        mutable.value = mutable.value.copy(moveImagesPrompt = null)
-        try {
-            executeMoveFolderEntry(
-                entryUri = entryUri,
-                cleanSource = normalizeRelativePath(entryRelative),
-                isDirectory = isDirectory,
-                cleanTarget = normalizeRelativePath(targetParentRelative),
-                copyImages = copyImages,
-            )
-        } catch (cancelled: kotlinx.coroutines.CancellationException) {
-            throw cancelled
-        } catch (error: Exception) {
-            fail("Could not move item: ${error.message}")
-        }
-    }
-
-    private suspend fun executeMoveFolderEntry(
-        entryUri: Uri,
-        cleanSource: String,
-        isDirectory: Boolean,
-        cleanTarget: String,
-        copyImages: Boolean,
-    ) {
-        val folderRaw = mutable.value.folder ?: error("No folder is open")
-        val folderUri = Uri.parse(folderRaw)
-        require(cleanSource.isNotEmpty()) { "Cannot move the open folder root" }
-        require(!isDirectory || !isSameOrDescendantFolder(cleanSource, cleanTarget)) {
-            "Cannot move a folder into itself or one of its subfolders"
-        }
-        val sourceParentRel = parentRelativePath(cleanSource)
-        if (sourceParentRel == cleanTarget) return
-        val entryName = cleanSource.substringAfterLast('/')
-        val newRelative = childRelativePath(cleanTarget, entryName)
-        val trackedBefore = if (isDirectory) trackedEntriesInOpenFolder(folderUri) else emptyMap()
-        val openNoteContent = mutable.value.tabs.firstOrNull {
-            it.uri != null && sameDocumentUri(it.uri, entryUri.toString())
-        }?.content
-
-        val remaps = withContext(Dispatchers.IO) {
-            documentWrites.withLock {
-                val treeRoot = DocumentFile.fromTreeUri(getApplication(), folderUri)
-                    ?: error("Choose the folder again to restore access")
-                val sourceParentDir = resolveTreeDirectory(treeRoot, sourceParentRel)
-                val targetParentDir = resolveTreeDirectory(treeRoot, cleanTarget)
-                val sourceDoc = resolveTreeEntry(treeRoot, cleanSource)
-                    ?: error("'$entryName' no longer exists")
-                require(findDuplicateInDirectory(targetParentDir, entryName, ignoreUri = sourceDoc.uri) == null) {
-                    "'$entryName' already exists in the destination folder"
-                }
-                if (copyImages && !isDirectory) {
-                    val markdown = openNoteContent ?: resolver.openInputStream(sourceDoc.uri)?.use {
-                        readLimited(it, 20_000_000).toString(Charsets.UTF_8)
-                    }.orEmpty()
-                    val inspection = inspectMovedMarkdownSafAssets(treeRoot, markdown, cleanSource, cleanTarget)
-                    copyMovedMarkdownSafAssets(resolver, treeRoot, inspection.copyPlans, ::safAssetMimeForName)
-                }
-                val movedDoc = moveSafDocumentWithinTree(
-                    context = getApplication(),
-                    resolver = resolver,
-                    sourceDoc = sourceDoc,
-                    sourceParentDoc = sourceParentDir,
-                    targetParentDoc = targetParentDir,
-                )
-                documentAccess.persist(movedDoc.uri)
-                val movedName = movedDoc.name?.takeIf { it.isNotBlank() } ?: entryName
-                val finalNewRelative = childRelativePath(cleanTarget, movedName)
-                if (!isDirectory) {
-                    listOf(UriRemap(entryUri.toString(), movedDoc.uri.toString(), movedName, cleanSource, finalNewRelative))
-                } else {
-                    val refreshedRoot = DocumentFile.fromTreeUri(getApplication(), folderUri) ?: treeRoot
-                    trackedBefore.mapNotNull { (oldUri, oldRel) ->
-                        if (!matchesRelativePrefix(oldRel, cleanSource)) return@mapNotNull null
-                        val updatedRel = remapRelativePrefix(oldRel, cleanSource, finalNewRelative) ?: return@mapNotNull null
-                        val doc = resolveTreeEntry(refreshedRoot, updatedRel) ?: return@mapNotNull null
-                        documentAccess.persist(doc.uri)
-                        UriRemap(oldUri, doc.uri.toString(), doc.name, oldRel, updatedRel)
-                    }
-                }
-            }
-        }
-
-        applyUriRemaps(
-            remaps = remaps,
-            oldFolderPrefix = if (isDirectory) cleanSource else null,
-            newFolderPrefix = if (isDirectory) newRelative else null,
-            folderTreeRaw = folderRaw,
-            statusMessage = "Moved $entryName",
-        )
-    }
-
-    fun deleteFolderEntry(
-        entryUri: Uri,
-        entryRelative: String,
-        isDirectory: Boolean,
-    ) = viewModelScope.launch {
-        val folderRaw = mutable.value.folder ?: run {
-            fail("Open a folder first")
-            return@launch
-        }
-        openRequests.invalidate()
-        try {
-            val cleanRelative = normalizeRelativePath(entryRelative)
-            require(cleanRelative.isNotEmpty()) { "Cannot delete the open folder root" }
-            val entryName = cleanRelative.substringAfterLast('/')
-
-            fun tabMatchesDeletion(tab: Note): Boolean {
-                val tabUri = tab.uri
-                if (tabUri != null && sameDocumentUri(tabUri, entryUri.toString())) return true
-                if (!isDirectory) return false
-                val rel = (if (tabUri != null) relativeInOpenFolder(Uri.parse(tabUri), folderRaw) else null)
-                    ?: tab.relative
-                return matchesRelativePrefix(rel, cleanRelative)
-            }
-
-            // Flush any active affected reader tab before capturing dirty state.
-            val targetViewModels = liveStudioViewModels(this@StudioViewModel)
-            for (vm in targetViewModels) {
-                val activeTab = vm.mutable.value.active
-                if (tabMatchesDeletion(activeTab)) {
-                    if (!vm.performReaderBarrier(activeTab.id) { }) {
-                        vm.readerBarrierFailed()
-                        if (vm !== this@StudioViewModel) {
-                            fail("A window editing '$entryName' could not confirm its latest changes; deletion canceled.")
-                        }
-                        return@launch
-                    }
-                }
-            }
-
-            val removedUris = mutableSetOf(entryUri.toString())
-            val archivedByVm = mutableMapOf<StudioViewModel, Pair<List<ClosedNoteReference>, List<Note>>>()
-
-            closedNoteMutex.withLock {
-                documentWrites.withLock {
-                    // 1. Preserve every dirty open tab into closed-note recovery & deleted-drafts BEFORE deleting.
-                    for (vm in liveStudioViewModels(this@StudioViewModel)) {
-                        val matchingTabs = vm.mutable.value.tabs.filter(::tabMatchesDeletion)
-                        matchingTabs.mapNotNull { it.uri }.forEach(removedUris::add)
-                        val dirtyTabs = matchingTabs.filter { it.dirty }
-                        if (dirtyTabs.isNotEmpty()) {
-                            val newRefs = withContext(Dispatchers.IO) {
-                                val savedRefs = dirtyTabs.map { dirty ->
-                                    val detached = dirty.copy(uri = null, saved = "")
-                                    vm.deletedDrafts.save(dirty.copy(name = "Recovered ${dirty.name}", uri = null, saved = ""))
-                                    vm.closedNoteStore.save(detached)
-                                }
-                                val existingRefs = vm.closedNoteStore.loadIndexStrict()
-                                val mergedRefs = (savedRefs + existingRefs.filterNot { ref -> savedRefs.any { it.id == ref.id } })
-                                    .take(ClosedNoteStore.LIMIT)
-                                vm.closedNoteStore.saveIndex(mergedRefs)
-                                savedRefs to mergedRefs
-                            }
-                            vm.closedNoteRefs = newRefs.second
-                            archivedByVm[vm] = newRefs.first to matchingTabs
-                        } else if (matchingTabs.isNotEmpty()) {
-                            archivedByVm[vm] = emptyList<ClosedNoteReference>() to matchingTabs
-                        }
-                    }
-
-                    // 2. Delete the document or directory through SAF permissions.
-                    withContext(Dispatchers.IO) {
-                        val treeUri = Uri.parse(folderRaw)
-                        val treeRoot = DocumentFile.fromTreeUri(getApplication(), treeUri)
-                            ?: error("Choose the folder again to restore access")
-                        val targetDoc = resolveTreeEntry(treeRoot, cleanRelative)
-                        val resolvedUri = documentAccess.resolve(targetDoc?.uri ?: entryUri, writing = true)
-                        val deletedViaContract = runCatching {
-                            DocumentsContract.deleteDocument(resolver, resolvedUri)
-                        }.getOrDefault(false)
-                        val deleted = deletedViaContract || (targetDoc?.delete() == true)
-                        require(deleted) { "Storage permission refused to delete '$entryName'" }
-                    }
-                }
-            }
-
-            // 3. Synchronize open tabs, closed-note placeholders, recents, pins, and reading positions.
-            if (isDirectory) {
-                liveStudioViewModels(this@StudioViewModel).forEach { it.readerFolderIndex.clear() }
-            }
-            removePersistedMetadata(
-                removedUris = removedUris,
-                removedRelativePrefix = if (isDirectory) cleanRelative else null,
-                folderTreeRaw = folderRaw,
-            )
-
-            val filteredRecents = recentMutable.value.filterNot { item ->
-                removedUris.any { sameDocumentUri(item.uri, it) } ||
-                    (isDirectory && (matchesRelativePrefix(item.relative, cleanRelative) ||
-                        matchesRelativePrefix(relativeInOpenFolder(Uri.parse(item.uri), folderRaw), cleanRelative)))
-            }
-            if (filteredRecents != recentMutable.value) {
-                storeRecent(filteredRecents)
-            }
-
-            for (vm in liveStudioViewModels(this@StudioViewModel)) {
-                val (savedRefs, closedMatching) = archivedByVm[vm] ?: (emptyList<ClosedNoteReference>() to emptyList())
-                val closedIds = closedMatching.map { it.id }.toSet()
-                closedIds.forEach { id ->
-                    vm.readerEcho.remove(id)
-                    vm.clearReaderEditProtocol(id)
-                    vm.savedPortableAssets.remove(id)
-                    vm.autosavePending.remove(id)
-                }
-                val hadDirty = savedRefs.isNotEmpty()
-                vm.change { currentState ->
-                    val remaining = if (closedIds.isEmpty()) currentState.tabs else currentState.tabs.filterNot { it.id in closedIds }
-                    val nextTabs = remaining.ifEmpty { listOf(Note()) }
-                    val nextActive = if (currentState.active.id in closedIds) nextTabs.first().id else currentState.activeId
-                    val placeholders = savedRefs.map { it.placeholder() }
-                    val nextClosed = if (placeholders.isEmpty()) {
-                        currentState.closedTabs
-                    } else {
-                        (placeholders + currentState.closedTabs.filterNot { old -> placeholders.any { it.id == old.id } })
-                            .take(ClosedNoteStore.LIMIT)
-                    }
-                    val nextMessage = when {
-                        vm === this@StudioViewModel && hadDirty -> "Deleted $entryName. Unsaved edits were saved to closed-note recovery."
-                        vm === this@StudioViewModel -> "Deleted $entryName"
-                        hadDirty -> "Deleted $entryName. Unsaved edits were saved to closed-note recovery."
-                        else -> currentState.message
-                    }
-                    currentState.copy(
-                        tabs = nextTabs,
-                        closedTabs = nextClosed,
-                        activeId = nextActive,
-                        conflictedTabIds = currentState.conflictedTabIds - closedIds,
-                        pendingCloseNoteId = currentState.pendingCloseNoteId?.takeUnless { it in closedIds },
-                        pendingSaveConflictNoteId = currentState.pendingSaveConflictNoteId?.takeUnless { it in closedIds },
-                        message = nextMessage,
-                    )
-                }
-                val vmFolder = vm.mutable.value.folder
-                if (vmFolder != null && sameDocumentUri(vmFolder, folderRaw)) {
-                    val nextListed = if (isDirectory && matchesRelativePrefix(vm.listedRelative, cleanRelative)) {
-                        parentRelativePath(cleanRelative)
-                    } else {
-                        vm.listedRelative
-                    }
-                    vm.listFolder(Uri.parse(vmFolder), nextListed)
-                }
-                vm.seededFindMutable.value?.let { seed ->
-                    val seedUri = seed.targetUri
-                    val seedDeleted = (seed.targetTabId != null && seed.targetTabId in closedIds) ||
-                        (!seedUri.isNullOrBlank() && (
-                            removedUris.any { sameDocumentUri(seedUri, it) } ||
-                                (isDirectory && matchesRelativePrefix(relativeInOpenFolder(Uri.parse(seedUri), folderRaw), cleanRelative))
-                            ))
-                    if (seedDeleted) vm.seededFindMutable.value = null
-                }
-                if (vm.folderSearchMutable.value.visible && vm.folderSearchMutable.value.query.isNotEmpty()) {
-                    vm.updateFolderSearch()
-                }
-            }
-        } catch (cancelled: kotlinx.coroutines.CancellationException) {
-            throw cancelled
-        } catch (error: Exception) {
-            fail("Could not delete: ${error.message}")
-        }
     }
 
     fun openFolderSearch(initialQuery: String? = null) {

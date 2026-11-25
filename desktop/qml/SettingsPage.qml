@@ -232,27 +232,7 @@ Pane {
                 ChoiceField { Layout.fillWidth: true; model: ["Restore previous tabs","Open a new blank note"]; currentIndex: viewState.settings.startup === "new" ? 1 : 0; onActivated: page.save("startup", currentIndex === 1 ? "new" : "restore") }
                 Label { text: "Unsaved drafts are recovered in either mode. Welcome is shown only on first use."; Layout.fillWidth: true; wrapMode: Text.WordWrap; color: viewState.colors.muted }
                 Label { text: "New note location"; font.weight: Font.DemiBold }
-                RowLayout {
-                    Layout.fillWidth: true
-                    spacing: 8
-                    ActionButton {
-                        objectName: "newNoteLocationButton"
-                        Layout.fillWidth: true
-                        readonly property string openFolderLabel: viewState.folder ? ("Open folder (" + viewState.folder.split(/[\\/]/).filter(Boolean).pop() + ")") : "Downloads"
-                        text: viewState.settings.newNoteLocation || openFolderLabel
-                        glyph: "FolderOpen"
-                        tonal: true
-                        onClicked: studio.chooseNoteLocation()
-                        ToolTip.text: viewState.settings.newNoteLocation || openFolderLabel
-                    }
-                    ActionButton {
-                        objectName: "clearNewNoteLocationButton"
-                        visible: !!viewState.settings.newNoteLocation
-                        text: "Use default"
-                        compact: true
-                        onClicked: studio.clearNoteLocation()
-                    }
-                }
+                ActionButton { Layout.fillWidth: true; text: viewState.settings.newNoteLocation || "Downloads"; glyph: "FolderOpen"; tonal: true; onClicked: studio.chooseNoteLocation(); ToolTip.text: viewState.settings.newNoteLocation || "Downloads" }
                 Label { text: "New notes stay recoverable until you choose a file. Empty untitled notes are discarded."; Layout.fillWidth: true; wrapMode: Text.WordWrap; color: viewState.colors.muted }
                 Label { text: "Writing assistance"; font.pixelSize: 22; font.weight: Font.DemiBold; Layout.topMargin: 12 }
                 Switch { text: "Spell check"; checked: viewState.settings.spellCheck; onToggled: page.save("spellCheck", checked) }

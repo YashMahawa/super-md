@@ -194,7 +194,6 @@ ApplicationWindow {
         case "new_folder_note": sidebar = true; sidebarSection = "folder"; folderSidebar.triggerNewFolderNote(); break
         case "new_subfolder": sidebar = true; sidebarSection = "folder"; folderSidebar.triggerNewSubfolder(); break
         case "rename_entry": folderSidebar.triggerRenameSelectedOrActive(); break
-        case "trash_entry": folderSidebar.triggerTrashSelectedOrActive(); break
         }
     }
     function focusReader() { if (reader) reader.forceActiveFocus() }

@@ -46,7 +46,6 @@ def _definition_rows(platform: str) -> tuple[tuple[str, str, list[str]], ...]:
         ("new_folder_note", "New note in folder", [f"{primary}+Alt+N"]),
         ("new_subfolder", "New subfolder", [f"{primary}+Alt+Shift+N"]),
         ("rename_entry", "Rename note or folder", ["F2"]),
-        ("trash_entry", "Move note or folder to Trash", [f"{primary}+Alt+Backspace"]),
     )
 
 

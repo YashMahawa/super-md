@@ -1,24 +1,14 @@
-"""Naming, boundary checks, lazy subfolder listing, linked-asset helpers, and Trash verification."""
+"""Naming validation, open-folder boundary checks, and cross-platform path remapping."""
 from __future__ import annotations
 
 import os
 import re
-import urllib.parse
 from pathlib import Path, PurePath, PurePosixPath, PureWindowsPath
 
-try:
-    from . import documents, markdown_prepare
-except ImportError:
-    import documents  # type: ignore[no-redef]
-    import markdown_prepare  # type: ignore[no-redef]
-
 NOTE_SUFFIXES = (".markdown", ".smd", ".fmd", ".md", ".txt")
-PLAIN_MARKDOWN_SUFFIXES = (".md", ".markdown", ".txt")
 KNOWN_FORMAT_SUFFIXES = frozenset({".md", ".markdown", ".txt", ".smd", ".fmd", ".pdf", ".zip", ".html", ".docx"})
 _WINDOWS_PATH_RE = re.compile(r"^([a-zA-Z]:[\\/]|\\\\)")
 
-
-# --- Naming & format helpers ---
 
 def note_stem(name: str) -> str:
     """Strip a known note suffix without truncating dotted stems such as '1.2 Linear Algebra.md'."""
@@ -76,8 +66,6 @@ def validate_entry_name(
         raise ValueError("Rename keeps the note format. Use Export to change formats.")
     return name + ext
 
-
-# --- Path normalization & open-folder boundary ---
 
 def _is_link_or_junction(path: Path) -> bool:
     if path.is_symlink():
@@ -235,194 +223,3 @@ def remap_path_prefix(candidate: str, old_path: str, new_path: str, *, is_direct
         if len(cand_parts) > len(old_parts):
             return str(_pure_path(new_canon).joinpath(*cand_parts[len(old_parts):]))
     return candidate
-
-
-# --- Linked Markdown asset inspection & copy ---
-
-def _decode_relative_asset_ref(raw_source: str) -> str | None:
-    trimmed = (raw_source or "").strip()
-    if not trimmed or trimmed.startswith(("/", "\\")) or re.match(r"^[a-z][a-z\d+.-]*:", trimmed, re.I):
-        return None
-    decoded = urllib.parse.unquote(trimmed.split("#", 1)[0].split("?", 1)[0]).strip()
-    if not decoded or "\\" in decoded or "\0" in decoded or decoded.startswith("/"):
-        return None
-    parts = [part for part in decoded.split("/") if part and part != "."]
-    if not parts or any(any(ord(ch) < 32 for ch in part) for part in parts):
-        return None
-    return "/".join(parts)
-
-
-def linked_local_images(note_path: Path, markdown: str, open_root: Path, target_dir: Path) -> list[tuple[str, Path, Path]]:
-    """Find relative local images/diagrams in a plain Markdown note that would break on move."""
-    if note_path.suffix.lower() not in PLAIN_MARKDOWN_SUFFIXES:
-        return []
-    root = Path(strip_extended_length_prefix(str(open_root.resolve(strict=True))))
-    source_dir = Path(strip_extended_length_prefix(str(note_path.parent.resolve(strict=True))))
-    dest_dir = Path(strip_extended_length_prefix(str(target_dir.resolve(strict=True))))
-    if same_path(source_dir, dest_dir):
-        return []
-
-    found: list[tuple[str, Path, Path]] = []
-    seen: set[str] = set()
-    for ref in markdown_prepare._references(markdown or ""):
-        rel = _decode_relative_asset_ref(ref.source)
-        if not rel or rel in seen:
-            continue
-        try:
-            src_file = resolve_within_open_folder(root, source_dir / rel, allow_root=False, must_exist=True)
-        except ValueError:
-            continue
-        if not src_file.is_file():
-            continue
-        dst_candidate = dest_dir / rel
-        try:
-            dst_file = resolve_within_open_folder(root, dst_candidate, allow_root=False, must_exist=False)
-        except ValueError:
-            seen.add(rel)
-            found.append((rel, src_file, dst_candidate))
-            continue
-        if same_path(dst_file, src_file):
-            continue
-        if dst_file.is_file():
-            try:
-                if dst_file.stat().st_size == src_file.stat().st_size and dst_file.read_bytes() == src_file.read_bytes():
-                    continue
-            except OSError:
-                pass
-        seen.add(rel)
-        found.append((rel, src_file, dst_file))
-    return found
-
-
-def copy_linked_local_images(items: list[tuple[str, Path, Path]], open_root: Path) -> None:
-    """Safely copy relative local images/diagrams to their relative destinations inside *open_root*."""
-    if not items:
-        return
-    root = Path(strip_extended_length_prefix(str(open_root.resolve(strict=True))))
-    staged: list[tuple[Path, bytes]] = []
-    total_bytes = 0
-    for rel, src_file, dst_candidate in items:
-        dst_file = resolve_within_open_folder(root, dst_candidate, allow_root=False, must_exist=False)
-        size = src_file.stat().st_size
-        if size > documents.MAX_IMAGE:
-            raise ValueError(f"Linked asset exceeds 25 MB: {src_file.name}")
-        total_bytes += size
-        if total_bytes > 110_000_000:
-            raise ValueError("Linked assets exceed the total copy size limit.")
-        payload = src_file.read_bytes()
-        if dst_file.exists():
-            if not dst_file.is_file() or dst_file.read_bytes() != payload:
-                raise FileExistsError(f"A different file already exists at {rel}.")
-            continue
-        staged.append((dst_file, payload))
-
-    created: list[Path] = []
-    try:
-        for dst_file, payload in staged:
-            dst_file.parent.mkdir(parents=True, exist_ok=True)
-            resolve_within_open_folder(root, dst_file.parent, allow_root=True, must_exist=True)
-            documents.atomic_write(dst_file, payload)
-            created.append(dst_file)
-    except Exception:
-        for path in created:
-            try:
-                path.unlink(missing_ok=True)
-            except OSError:
-                pass
-        raise
-
-
-# --- Lazy Move-to-folder picker ---
-
-def list_subfolders_lazy(
-    open_root: Path,
-    expanded_dirs: set[str],
-    exclude_subtree: Path | None = None,
-) -> list[dict]:
-    """List the open root and lazily expanded subdirectories for the Move-to-folder picker."""
-    root = Path(strip_extended_length_prefix(str(open_root.resolve(strict=True))))
-    excluded = Path(canonical_path_str(exclude_subtree)) if exclude_subtree is not None else None
-    expanded_keys = {normalize_path_key(item) for item in expanded_dirs if item}
-
-    def is_excluded(candidate: Path) -> bool:
-        return excluded is not None and matches_path_prefix(str(candidate), str(excluded), is_directory=True)
-
-    def has_visible_subdirs(directory: Path) -> bool:
-        try:
-            return any(
-                not child.name.startswith(".")
-                and not _is_link_or_junction(child)
-                and child.is_dir()
-                and not is_excluded(Path(canonical_path_str(child)))
-                for child in directory.iterdir()
-            )
-        except OSError:
-            return False
-
-    rows: list[dict] = [{
-        "name": root.name or str(root),
-        "path": str(root),
-        "depth": 0,
-        "expanded": True,
-        "hasChildren": has_visible_subdirs(root),
-        "isRoot": True,
-    }]
-
-    def visit(directory: Path, depth: int) -> None:
-        try:
-            children = sorted(directory.iterdir(), key=lambda p: p.name.lower())
-        except OSError:
-            return
-        for child in children:
-            if len(rows) >= 1500:
-                return
-            if child.name.startswith(".") or _is_link_or_junction(child) or not child.is_dir():
-                continue
-            resolved_child = Path(canonical_path_str(child))
-            if is_excluded(resolved_child):
-                continue
-            is_expanded = normalize_path_key(resolved_child) in expanded_keys
-            rows.append({
-                "name": child.name,
-                "path": str(resolved_child),
-                "depth": depth,
-                "expanded": is_expanded,
-                "hasChildren": has_visible_subdirs(resolved_child),
-                "isRoot": False,
-            })
-            if is_expanded:
-                visit(resolved_child, depth + 1)
-
-    visit(root, 1)
-    return rows
-
-
-# --- Portable OS Trash verification ---
-
-def is_system_trash_destination(trashed_path: str | os.PathLike[str], open_root: str | os.PathLike[str]) -> bool:
-    """Return True when *trashed_path* is inside an OS Trash / Recycle Bin outside *open_root*."""
-    raw_trashed = strip_extended_length_prefix(str(trashed_path or "").strip())
-    raw_root = strip_extended_length_prefix(str(open_root or "").strip())
-    if not raw_trashed or not raw_root:
-        return False
-
-    trashed_parts = [p.lower() for p in _pure_path(raw_trashed).parts]
-    root_parts = [p.lower() for p in _pure_path(raw_root).parts]
-    if len(trashed_parts) < 2 or not root_parts:
-        return False
-    if trashed_parts[: len(root_parts)] == root_parts:
-        return False
-    if bool(_WINDOWS_PATH_RE.match(raw_trashed)) == bool(_WINDOWS_PATH_RE.match(raw_root)):
-        if matches_path_prefix(raw_trashed, raw_root, is_directory=True):
-            return False
-
-    non_leaf = trashed_parts[:-1]
-    if ".trash" in non_leaf or ".trashes" in non_leaf:
-        return True
-    if "$recycle.bin" in non_leaf or "recycler" in non_leaf:
-        return True
-    for idx in range(len(trashed_parts) - 2):
-        seg = trashed_parts[idx]
-        if trashed_parts[idx + 1] == "files" and (seg in ("trash", ".trash") or seg.startswith(".trash-")):
-            return True
-    return False

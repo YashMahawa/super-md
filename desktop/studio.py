@@ -28,7 +28,7 @@ import uuid
 import zipfile
 from pathlib import Path
 from network_tls import client_context
-from PySide6.QtCore import QObject, Property, Signal, Slot, QStandardPaths, QTimer, QUrl, QFile, QFileSystemWatcher, QProcess, Qt, QPointF, QRect, QMetaObject, QBuffer, QByteArray, QIODevice
+from PySide6.QtCore import QObject, Property, Signal, Slot, QStandardPaths, QTimer, QUrl, QFileSystemWatcher, QProcess, Qt, QPointF, QRect, QMetaObject, QBuffer, QByteArray, QIODevice
 from PySide6.QtGui import QDesktopServices, QFontDatabase, QGuiApplication, QCursor, QImage
 from documents import (
     atomic_write, atomic_json, bundle, decode_base64_chunked,
@@ -577,8 +577,6 @@ class Studio(QObject):
     themePickerRequested = Signal()
     themeExportRequested = Signal()
     noteLocationPickerRequested = Signal()
-    moveTargetsLoaded = Signal(str)
-    moveImagesPromptRequested = Signal(str, str, int, bool)
     flushFailed = Signal(bool)
     pythonProgress = Signal(str)
     agentRequest = Signal(str)
@@ -648,8 +646,6 @@ class Studio(QObject):
         self.folder = ""
         self.files: list[dict] = []
         self.expanded: set[str] = set()
-        self._last_trashed_source = ""
-        self._last_trashed_path = ""
         self._folder_search_open = False
         self._folder_search_query = ""
         self._folder_search_case_sensitive = False
@@ -2433,12 +2429,6 @@ class Studio(QObject):
             self.settings["newNoteLocation"] = str(directory)
             self._preferences(); self._emit(False)
 
-    @Slot()
-    def clearNoteLocation(self):
-        if self.settings.get("newNoteLocation"):
-            self.settings["newNoteLocation"] = ""
-            self._preferences(); self._emit(False)
-
     @Slot(str)
     def importFont(self,value):
         try:
@@ -2999,7 +2989,6 @@ class Studio(QObject):
         elif operation["action"] == "detach_tab":
             if self._can_move(): self.detachedWindowRequested.emit(self.window_id, operation["target"])
         elif operation["action"] == "close_tab": self.closeTab(operation["target"])
-        elif operation["action"] == "trash_entry": self._trash_entry_now(operation["target"])
         elif operation["action"] == "close_window" and self.requestWindowClose():
             self._recover()
             QTimer.singleShot(0,self.allowClose.emit)
@@ -3437,319 +3426,6 @@ class Studio(QObject):
         self._submit(work, finished, executor=self.writes)
 
     @Slot(str, str)
-    def loadMoveTargets(self, exclude_path="", expanded_json="[]"):
-        if not self.folder:
-            self.moveTargetsLoaded.emit("[]")
-            return
-        open_root_str = self.folder
-
-        def scan():
-            root = Path(folder_ops.strip_extended_length_prefix(str(Path(open_root_str).resolve(strict=True))))
-            try:
-                expanded = set(json.loads(expanded_json or "[]"))
-            except (TypeError, ValueError):
-                expanded = set()
-            excluded = None
-            if exclude_path:
-                try:
-                    candidate = folder_ops.resolve_within_open_folder(root, exclude_path, allow_root=False, must_exist=True)
-                    if candidate.is_dir():
-                        excluded = candidate
-                except ValueError:
-                    excluded = None
-            return json.dumps(folder_ops.list_subfolders_lazy(root, expanded, excluded))
-
-        def finished(payload, error):
-            if not error and payload is not None:
-                self.moveTargetsLoaded.emit(payload)
-
-        self._submit(scan, finished, busy=False)
-
-    def _resolve_move_paths(self, source_path: str, target_dir: str) -> tuple[Path, Path, Path, Path, bool] | None:
-        if not self.folder:
-            self.message = "Open a folder first."
-            self._emit(False)
-            return None
-        try:
-            root = Path(folder_ops.strip_extended_length_prefix(str(Path(self.folder).resolve(strict=True))))
-            source = folder_ops.resolve_within_open_folder(root, source_path, allow_root=False, must_exist=True)
-            dest_dir = folder_ops.resolve_within_open_folder(root, target_dir or self.folder, allow_root=True, must_exist=True)
-            if not dest_dir.is_dir():
-                raise ValueError("Choose an existing destination folder.")
-            is_dir = source.is_dir()
-            if is_dir and (folder_ops.same_path(dest_dir, source) or folder_ops.matches_path_prefix(str(dest_dir), str(source), is_directory=True)):
-                raise ValueError("Cannot move a folder into itself.")
-            if folder_ops.same_path(source.parent, dest_dir):
-                return None
-            dest_path = dest_dir / source.name
-            folder_ops.resolve_within_open_folder(root, dest_path, allow_root=False, must_exist=False)
-            return root, source, dest_dir, dest_path, is_dir
-        except (OSError, ValueError) as error:
-            self.message = str(error)
-            self._emit(False)
-            return None
-
-    @Slot(str, str)
-    def requestMoveEntry(self, source_path, target_dir):
-        resolved = self._resolve_move_paths(source_path, target_dir)
-        if resolved is None:
-            return
-        root, source, dest_dir, dest_path, is_dir = resolved
-        if dest_path.exists() or folder_ops._is_link_or_junction(dest_path):
-            self.message = "An item with that name already exists in the destination folder."
-            self._emit(False)
-            return
-        if is_dir or source.suffix.lower() not in folder_ops.PLAIN_MARKDOWN_SUFFIXES:
-            self.moveEntry(str(source), str(dest_dir), "move_only")
-            return
-
-        open_tab = next(
-            (t for w in self.session.windows.values() if not w.retired for t in w.tabs if folder_ops.same_path(t["path"], source)),
-            None,
-        )
-        captured_markdown = open_tab["content"] if open_tab is not None else None
-
-        def inspect_assets():
-            markdown = captured_markdown if captured_markdown is not None else source.read_text(encoding="utf-8", errors="replace")
-            linked = folder_ops.linked_local_images(source, markdown, root, dest_dir)
-            can_copy = True
-            for _, _, dst in linked:
-                try:
-                    folder_ops.resolve_within_open_folder(root, dst, allow_root=False, must_exist=False)
-                except ValueError:
-                    can_copy = False
-                    break
-            return len(linked), can_copy
-
-        def inspected(result, error):
-            if error or result is None:
-                return
-            count, can_copy = result
-            if count > 0:
-                self.moveImagesPromptRequested.emit(str(source), str(dest_dir), count, can_copy)
-            else:
-                self.moveEntry(str(source), str(dest_dir), "move_only")
-
-        self._submit(inspect_assets, inspected, executor=self.writes)
-
-    @Slot(str, str, str)
-    def moveEntry(self, source_path, target_dir, image_action="move_only"):
-        if image_action not in ("copy", "move_only"):
-            self.message = "Choose a valid move option."
-            self._emit(False)
-            return
-        resolved = self._resolve_move_paths(source_path, target_dir)
-        if resolved is None:
-            return
-        root, source, dest_dir, dest_path, is_dir = resolved
-
-        for win in list(self.session.windows.values()):
-            for tab in win.tabs:
-                if tab["id"] in win.saving and folder_ops.matches_path_prefix(tab["path"], str(source), is_directory=is_dir):
-                    self.message = "Wait for the current save to finish."
-                    self._emit(False)
-                    return
-
-        open_tab = next(
-            (t for w in self.session.windows.values() if not w.retired for t in w.tabs if folder_ops.same_path(t["path"], source)),
-            None,
-        )
-        captured_markdown = open_tab["content"] if open_tab is not None else None
-        self._suspend_watches_for_prefix(str(source), is_dir=is_dir)
-
-        def work():
-            if dest_path.exists() or folder_ops._is_link_or_junction(dest_path):
-                raise ValueError("An item with that name already exists in the destination folder.")
-            if image_action == "copy" and not is_dir and source.suffix.lower() in folder_ops.PLAIN_MARKDOWN_SUFFIXES:
-                markdown = captured_markdown if captured_markdown is not None else source.read_text(encoding="utf-8", errors="replace")
-                items = folder_ops.linked_local_images(source, markdown, root, dest_dir)
-                folder_ops.copy_linked_local_images(items, root)
-            shutil.move(str(source), str(dest_path))
-            return (
-                folder_ops.canonical_path_str(source),
-                folder_ops.canonical_path_str(dest_path.resolve(strict=True)),
-                is_dir,
-                folder_ops.canonical_path_str(dest_dir),
-            )
-
-        def finished(result, error):
-            if error or not result:
-                for win in list(self.session.windows.values()):
-                    if not win.retired:
-                        win._watch_notes(force=True)
-                return
-            old_str, new_str, was_dir, dest_dir_str = result
-            for win in list(self.session.windows.values()):
-                if not win.retired and win.folder:
-                    try:
-                        win_root = Path(folder_ops.canonical_path_str(win.folder))
-                        if folder_ops.same_path(dest_dir_str, win_root) or folder_ops.matches_path_prefix(dest_dir_str, str(win_root), is_directory=True):
-                            win.expanded.update(folder_ops.ancestor_directories_in_folder(win_root, Path(dest_dir_str)))
-                    except OSError:
-                        pass
-            self._sync_path_change(old_str, new_str, is_dir=was_dir, message=f"Moved {Path(new_str).name}")
-
-        self._submit(work, finished, executor=self.writes)
-
-    @Slot(str)
-    def trashEntry(self, entry_path):
-        if not self.folder:
-            self.message = "Open a folder first."
-            self._emit(False)
-            return
-        try:
-            target = folder_ops.resolve_within_open_folder(self.folder, entry_path, allow_root=False, must_exist=True)
-        except ValueError as error:
-            self.message = str(error)
-            self._emit(False)
-            return
-        is_dir = target.is_dir()
-        current_path = self._current()["path"]
-        if self.ready and current_path and folder_ops.matches_path_prefix(current_path, str(target), is_directory=is_dir):
-            self._flush("trash_entry", str(target))
-            return
-        self._trash_entry_now(str(target))
-
-    def _trash_entry_now(self, entry_path: str):
-        if not self.folder:
-            self.message = "Open a folder first."
-            self._emit(False)
-            return
-        try:
-            target = folder_ops.resolve_within_open_folder(self.folder, entry_path, allow_root=False, must_exist=True)
-        except ValueError as error:
-            self.message = str(error)
-            self._emit(False)
-            return
-        is_dir = target.is_dir()
-        target_str = str(target)
-
-        dirty_snapshots: list[dict] = []
-        deleted_drafts: list[dict] = []
-        seen_ids: set[str] = set()
-        for win in list(self.session.windows.values()):
-            if win.retired:
-                continue
-            for tab in win.tabs:
-                if not tab["path"] or not folder_ops.matches_path_prefix(tab["path"], target_str, is_directory=is_dir):
-                    continue
-                if tab["id"] in win.saving:
-                    self.message = "Wait for the current save to finish."
-                    self._emit(False)
-                    return
-                if self._is_dirty(tab) and tab["id"] not in seen_ids:
-                    seen_ids.add(tab["id"])
-                    detached = copy.deepcopy(tab)
-                    detached["path"] = ""
-                    detached["saved"] = ""
-                    detached["saved_assets"] = {}
-                    detached["assets_dirty"] = bool(detached.get("assets"))
-                    dirty_snapshots.append(detached)
-                    deleted_drafts.append({**detached, "name": "Recovered " + tab["name"]})
-
-        existing_closed = list(self.closed_tabs)
-        self._suspend_watches_for_prefix(target_str, is_dir=is_dir)
-
-        def work():
-            saved_refs: list[dict] = []
-            for snapshot in dirty_snapshots:
-                saved_refs.append(self.session.closed_note_store.save(snapshot))
-            next_refs = (saved_refs + existing_closed)[: ClosedNoteStore.LIMIT] if saved_refs else None
-            if next_refs is not None:
-                self.session.closed_note_store.save_index(next_refs)
-            qfile = QFile(target_str)
-            before_qname = qfile.fileName()
-            if not qfile.moveToTrash():
-                raise OSError(qfile.errorString() or f"Could not move {target.name} to system Trash.")
-            after_qname = qfile.fileName()
-            trashed_dest = after_qname if after_qname and after_qname != before_qname else ""
-            return next_refs, trashed_dest
-
-        def finished(result, error):
-            if error or result is None:
-                for win in list(self.session.windows.values()):
-                    if not win.retired:
-                        win._watch_notes(force=True)
-                return
-            next_refs, trashed_dest = result
-            self._last_trashed_source = target_str
-            self._last_trashed_path = trashed_dest
-            if next_refs is not None:
-                self.closed_tabs[:] = next_refs
-            if deleted_drafts:
-                self.session.drafts.setdefault("deleted-notes", []).extend(deleted_drafts)
-            for loc_key in list(self.session.locations.keys()):
-                if folder_ops.matches_path_prefix(loc_key, target_str, is_directory=is_dir):
-                    self.session.locations.pop(loc_key, None)
-            self.session.pinned = [
-                p for p in self.session.pinned
-                if not folder_ops.matches_path_prefix(p, target_str, is_directory=is_dir)
-            ]
-            self.recent = [
-                p for p in self.recent
-                if not folder_ops.matches_path_prefix(p, target_str, is_directory=is_dir)
-            ]
-            for path_set in (self._agent_open_paths, self._agent_owned_files):
-                path_set.difference_update({
-                    p for p in list(path_set)
-                    if folder_ops.matches_path_prefix(p, target_str, is_directory=is_dir)
-                })
-            for entries in self.session.workspace.values():
-                entries[:] = [
-                    entry for entry in entries
-                    if not (entry.get("path") and folder_ops.matches_path_prefix(entry["path"], target_str, is_directory=is_dir))
-                ]
-            for ws in getattr(self.session, "window_workspaces", {}).values():
-                if isinstance(ws, dict):
-                    if ws.get("folder") and folder_ops.matches_path_prefix(ws["folder"], target_str, is_directory=is_dir):
-                        ws["folder"] = ""
-                    if isinstance(ws.get("expanded"), list):
-                        ws["expanded"] = [p for p in ws["expanded"] if not folder_ops.matches_path_prefix(p, target_str, is_directory=is_dir)]
-            self.session.startup_paths = [
-                p for p in self.session.startup_paths
-                if not folder_ops.matches_path_prefix(p, target_str, is_directory=is_dir)
-            ]
-            if self.session.startup_active and folder_ops.matches_path_prefix(self.session.startup_active, target_str, is_directory=is_dir):
-                self.session.startup_active = ""
-            self.session.startup_entries = [
-                entry for entry in self.session.startup_entries
-                if not (entry.get("path") and folder_ops.matches_path_prefix(entry["path"], target_str, is_directory=is_dir))
-            ]
-            for win in list(self.session.windows.values()):
-                if win.retired:
-                    continue
-                win.expanded = {
-                    p for p in win.expanded
-                    if not folder_ops.matches_path_prefix(p, target_str, is_directory=is_dir)
-                }
-                to_close = [
-                    tab["id"] for tab in win.tabs
-                    if tab["path"] and folder_ops.matches_path_prefix(tab["path"], target_str, is_directory=is_dir)
-                ]
-                for tab_id in to_close:
-                    win._finish_remove_tab(tab_id)
-                if win._pending_seeded_find:
-                    seeded_id = win._pending_seeded_find.get("tabId") or ""
-                    seeded_path = win._pending_seeded_find.get("path") or ""
-                    if (seeded_id and seeded_id in to_close) or (
-                        seeded_path and folder_ops.matches_path_prefix(seeded_path, target_str, is_directory=is_dir)
-                    ):
-                        win._pending_seeded_find = None
-                win._watch_notes(force=True)
-                win._recover()
-                if win.folder:
-                    win._load_tree()
-                if win._folder_search_open and win._folder_search_query.strip():
-                    win._start_folder_search()
-                win._emit()
-            self.message = f"Moved to Trash: {target.name}" + (" (unsaved edits preserved in closed notes)" if dirty_snapshots else "")
-            self._save_positions()
-            self._preferences()
-            self._emit(False)
-
-        self._submit(work, finished, executor=self.writes)
-
-    @Slot(str, str)
     def renameNote(self, id, name):
         tab = next((t for t in self.tabs if t["id"] == id),None)
         if not tab or id in self.saving: return
@@ -3791,8 +3467,7 @@ class Studio(QObject):
 
     @Slot(str,result=QUrl)
     def defaultSaveLocation(self,name):
-        open_folder = self.folder if (self.folder and Path(self.folder).is_dir()) else ""
-        directory = self.settings.get("newNoteLocation") or open_folder or QStandardPaths.writableLocation(QStandardPaths.StandardLocation.DownloadLocation) or str(Path.home())
+        directory = self.settings.get("newNoteLocation") or QStandardPaths.writableLocation(QStandardPaths.StandardLocation.DownloadLocation) or str(Path.home())
         return QUrl.fromLocalFile(str(Path(directory)/Path(name).name))
 
     @Slot(str,result=QUrl)

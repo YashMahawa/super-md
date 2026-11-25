@@ -943,8 +943,6 @@ private object NoMotionScheme : MotionScheme {
     }
     var createFolderRequest by remember { mutableStateOf<CreateFolderRequest?>(null) }
     var renameFolderTarget by remember { mutableStateOf<FileEntry?>(null) }
-    var moveFolderTarget by remember { mutableStateOf<FileEntry?>(null) }
-    var deleteFolderTarget by remember { mutableStateOf<FileEntry?>(null) }
     var hinge by remember { mutableStateOf<FoldingFeature?>(null) }
     val recent by model.recent.collectAsStateWithLifecycle()
     val folderSearch by model.folderSearch.collectAsStateWithLifecycle()
@@ -973,8 +971,8 @@ private object NoMotionScheme : MotionScheme {
     val themeExport = rememberLauncherForActivityResult(ActivityResultContracts.CreateDocument("application/json")) {it?.let {uri->model.exportCustomTheme(uri)}}
     var noteLocation by remember {mutableStateOf(model.noteLocation())}
     val noteFolder = rememberLauncherForActivityResult(ActivityResultContracts.OpenDocumentTree()) {it?.let {uri->runCatching{model.noteLocation(uri);noteLocation=uri.toString()}.onFailure{model.fail("Could not remember this folder: ${it.message}")}}}
-    val save = rememberLauncherForActivityResult(NoteDestination("text/markdown", model::untitledSaveLocation)) { uri -> if (uri != null) model.save(uri) else model.cancelSaveAs() }
-    val portableSaveAs = rememberLauncherForActivityResult(NoteDestination("application/vnd.supermd.smd", model::untitledSaveLocation)) { uri -> if (uri != null) model.completePortableSaveAs(uri) else model.cancelSaveAs() }
+    val save = rememberLauncherForActivityResult(NoteDestination("text/markdown", model::noteLocation)) { uri -> if (uri != null) model.save(uri) else model.cancelSaveAs() }
+    val portableSaveAs = rememberLauncherForActivityResult(NoteDestination("application/vnd.supermd.smd", model::noteLocation)) { uri -> if (uri != null) model.completePortableSaveAs(uri) else model.cancelSaveAs() }
     val folder = rememberLauncherForActivityResult(ActivityResultContracts.OpenDocumentTree()) { it?.let { uri -> model.setFolder(uri) } }
     val pdf = rememberLauncherForActivityResult(NoteDestination("application/pdf", model::noteLocation)) { uri ->
         if (uri != null) { readerPdfOwnsProgress = true; model.setPdfDestination(uri); model.busy(true); web?.evaluateJavascript("window.supermdExport?.(${state.pdf})", null) ?: model.fail("The reader is not ready. Open the note again.") }
@@ -1134,12 +1132,8 @@ private object NoMotionScheme : MotionScheme {
                     onCloseFolder = model::closeFolder,
                     onFolderRoot = { state.folder?.let { model.listFolder(android.net.Uri.parse(it), "") } },
                     onNavigateFolderRelative = { rel -> state.folder?.let { model.listFolder(android.net.Uri.parse(it), rel) } },
-                    canReopenClosedNote = state.closedTabs.isNotEmpty(),
-                    onReopenClosedNote = { model.reopen(); scope.launch { drawer.close() } },
                     onCreateInFolder = { req -> createFolderRequest = req },
                     onRenameEntry = { entry -> renameFolderTarget = entry },
-                    onMoveEntry = { entry -> moveFolderTarget = entry },
-                    onDeleteEntry = { entry -> deleteFolderTarget = entry },
                     onFolderSearch = { scope.launch { drawer.close() }; model.openFolderSearch() },
                     onActivateEntry = { entry ->
                         if (entry.directory) {
@@ -1340,7 +1334,7 @@ private object NoMotionScheme : MotionScheme {
         BackHandler { if (settingsSection != null) settingsSection = null else { settings = false; settingsSection = null } }
         Surface(Modifier.fillMaxSize(), color = palette.surface) { Column(Modifier.fillMaxSize().safeDrawingPadding()) {
             TopAppBar(title = { Text(settingsSection ?: "Settings") }, navigationIcon = { IconButton(onClick = { if (settingsSection != null) settingsSection = null else { settings = false; settingsSection = null } }) { Icon(Icons.AutoMirrored.Rounded.ArrowBack, "Back") } })
-            Settings(state, model, activity, noteLocation, settingsSection, { settingsSection = it }, {noteFolder.launch(noteLocation.takeIf{it.isNotBlank()}?.let(android.net.Uri::parse))}, {model.clearNoteLocation();noteLocation=""}, {model.recoverDeletedDraft();settings=false;settingsSection=null}, {themePicker.launch(arrayOf("application/json","text/plain","application/octet-stream"))}, {themeExport.launch("My theme.supermd-theme.json")}, {settings=false;settingsSection=null;web?.evaluateJavascript("window.supermdThemeGuide?.()",null)}, readerReady) {fontPicker.launch(arrayOf("font/ttf","font/otf","application/x-font-ttf","application/vnd.ms-opentype","application/octet-stream"))}
+            Settings(state, model, activity, noteLocation, settingsSection, { settingsSection = it }, {noteFolder.launch(noteLocation.takeIf{it.isNotBlank()}?.let(android.net.Uri::parse))}, {model.recoverDeletedDraft();settings=false;settingsSection=null}, {themePicker.launch(arrayOf("application/json","text/plain","application/octet-stream"))}, {themeExport.launch("My theme.supermd-theme.json")}, {settings=false;settingsSection=null;web?.evaluateJavascript("window.supermdThemeGuide?.()",null)}, readerReady) {fontPicker.launch(arrayOf("font/ttf","font/otf","application/x-font-ttf","application/vnd.ms-opentype","application/octet-stream"))}
         } }
     }
     FolderActionDialogs(
@@ -1351,10 +1345,6 @@ private object NoMotionScheme : MotionScheme {
         onNoteCreated = { scope.launch { drawer.close() } },
         renameTarget = renameFolderTarget,
         onDismissRename = { renameFolderTarget = null },
-        moveTarget = moveFolderTarget,
-        onDismissMove = { moveFolderTarget = null },
-        deleteTarget = deleteFolderTarget,
-        onDismissDelete = { deleteFolderTarget = null },
     )
     // Long forms must not strand their primary action below a half-open sheet.
     if (renaming) {
@@ -1856,12 +1846,8 @@ internal fun buildHighlightedSnippet(
     onOpenRecent: (RecentNote) -> Unit,
     onPinRecent: (RecentNote) -> Unit,
     onNavigateFolderRelative: (String) -> Unit = { if (it.isEmpty()) onFolderRoot() },
-    canReopenClosedNote: Boolean = false,
-    onReopenClosedNote: () -> Unit = {},
     onCreateInFolder: (CreateFolderRequest) -> Unit = {},
     onRenameEntry: (FileEntry) -> Unit = {},
-    onMoveEntry: (FileEntry) -> Unit = {},
-    onDeleteEntry: (FileEntry) -> Unit = {},
     modifier: Modifier = Modifier,
     onFolderSearch: () -> Unit = {},
 ) {
@@ -1893,8 +1879,6 @@ internal fun buildHighlightedSnippet(
                         onNavigateRelative = onNavigateFolderRelative,
                         onRequestCreate = onCreateInFolder,
                         onCloseFolder = onCloseFolder,
-                        canReopenClosedNote = canReopenClosedNote,
-                        onReopenClosedNote = onReopenClosedNote,
                     )
                 }
                 Text("No vault. No hidden metadata.", style = MaterialTheme.typography.bodySmall, color = palette.onSurfaceVariant, modifier = Modifier.padding(vertical = 4.dp))
@@ -1906,8 +1890,6 @@ internal fun buildHighlightedSnippet(
             onActivate = onActivateEntry,
             onCreateInFolder = onCreateInFolder,
             onRename = onRenameEntry,
-            onMove = onMoveEntry,
-            onDelete = onDeleteEntry,
         )
         if (recent.isNotEmpty()) {
             item(key = "recent-header") {
@@ -1951,7 +1933,7 @@ internal class NoteDestination(private val mime: String, private val preferred: 
     }
 }
 
-@Composable private fun Settings(state: StudioState, model: StudioViewModel, activity:MainActivity, noteLocation: String, section: String?, onSection: (String?)->Unit, chooseNoteLocation: ()->Unit, clearNoteLocation: ()->Unit, recoverDraft:()->Unit, importTheme:()->Unit, exportTheme:()->Unit, showThemeGuide:()->Unit, themeGuideReady:Boolean, importFont: ()->Unit) {
+@Composable private fun Settings(state: StudioState, model: StudioViewModel, activity:MainActivity, noteLocation: String, section: String?, onSection: (String?)->Unit, chooseNoteLocation: ()->Unit, recoverDraft:()->Unit, importTheme:()->Unit, exportTheme:()->Unit, showThemeGuide:()->Unit, themeGuideReady:Boolean, importFont: ()->Unit) {
     val update by model.updates.state.collectAsStateWithLifecycle()
     val scope=rememberCoroutineScope()
     var confirmPythonCleanup by remember { mutableStateOf(false) }
@@ -2095,8 +2077,7 @@ internal class NoteDestination(private val mime: String, private val preferred: 
                 Text("Unsaved drafts are recovered in either mode. Welcome is shown only on first use.",style=MaterialTheme.typography.bodySmall)
                 Row(verticalAlignment=Alignment.CenterVertically){Text("Autosave existing notes",Modifier.weight(1f));Switch(checked=state.autosave,onCheckedChange={model.reading(autosave=it)})}
                 Text("New note location",style=MaterialTheme.typography.titleSmall)
-                FilledTonalButton(onClick=chooseNoteLocation,modifier=Modifier.fillMaxWidth()){Icon(Icons.Rounded.FolderOpen,null);Text(if(noteLocation.isNotBlank()) android.net.Uri.decode(noteLocation.substringAfterLast('/')) else if(state.folder != null) "Open folder (${friendlyTreeFolderLabel(state.folder)})" else "Downloads",Modifier.padding(start=8.dp),maxLines=1,overflow=TextOverflow.Ellipsis)}
-                if(noteLocation.isNotBlank()) TextButton(onClick=clearNoteLocation){Text("Use default (open folder or Downloads)")}
+                FilledTonalButton(onClick=chooseNoteLocation,modifier=Modifier.fillMaxWidth()){Icon(Icons.Rounded.FolderOpen,null);Text(if(noteLocation.isBlank())"Downloads" else android.net.Uri.decode(noteLocation.substringAfterLast('/')),Modifier.padding(start=8.dp),maxLines=1,overflow=TextOverflow.Ellipsis)}
             }
             if (section == "Writing & shortcuts") SettingsGroup("Writing") {
                 Row(verticalAlignment=Alignment.CenterVertically){Text("Typewriter scrolling",Modifier.weight(1f));Switch(checked=state.typewriterScroll,onCheckedChange=model::typewriterScroll)}

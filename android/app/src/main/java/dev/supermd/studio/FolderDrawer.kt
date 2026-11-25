@@ -7,15 +7,12 @@ package dev.supermd.studio
 
 import android.net.Uri
 import android.provider.DocumentsContract
-import androidx.compose.foundation.clickable
 import androidx.compose.foundation.combinedClickable
 import androidx.compose.foundation.layout.*
-import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.LazyListScope
 import androidx.compose.foundation.lazy.items
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.rounded.ArrowBack
-import androidx.compose.material.icons.automirrored.rounded.DriveFileMove
 import androidx.compose.material.icons.automirrored.rounded.MenuBook
 import androidx.compose.material.icons.rounded.*
 import androidx.compose.material3.*
@@ -48,8 +45,6 @@ internal fun FolderDrawerHeader(
     onNavigateRelative: (String) -> Unit,
     onRequestCreate: (CreateFolderRequest) -> Unit,
     onCloseFolder: () -> Unit,
-    canReopenClosedNote: Boolean = false,
-    onReopenClosedNote: () -> Unit = {},
 ) {
     var createMenuOpen by remember { mutableStateOf(false) }
     val rootLabel = remember(folderUriRaw) { friendlyTreeFolderLabel(folderUriRaw) }
@@ -73,11 +68,6 @@ internal fun FolderDrawerHeader(
                     Text(currentTitle, style = MaterialTheme.typography.titleSmall, fontWeight = FontWeight.SemiBold, maxLines = 1, overflow = TextOverflow.Ellipsis)
                     if (folderRelative.isNotEmpty()) {
                         Text("$rootLabel / $folderRelative", style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.onSurfaceVariant, maxLines = 1, overflow = TextOverflow.Ellipsis)
-                    }
-                }
-                if (canReopenClosedNote) {
-                    IconButton(onClick = onReopenClosedNote, modifier = Modifier.size(36.dp)) {
-                        Icon(Icons.Rounded.Restore, contentDescription = "Reopen closed note")
                     }
                 }
                 Box {
@@ -121,8 +111,6 @@ internal fun LazyListScope.folderFileItems(
     onActivate: (FileEntry) -> Unit,
     onCreateInFolder: (CreateFolderRequest) -> Unit,
     onRename: (FileEntry) -> Unit,
-    onMove: (FileEntry) -> Unit,
-    onDelete: (FileEntry) -> Unit,
 ) {
     items(files, key = { "file:${it.uri}:${it.relative}" }) { entry ->
         var menuExpanded by remember { mutableStateOf(false) }
@@ -181,12 +169,6 @@ internal fun LazyListScope.folderFileItems(
                 }
                 HorizontalDivider()
                 DropdownMenuItem(text = { Text("Rename") }, leadingIcon = { Icon(Icons.Rounded.Edit, null) }, onClick = { menuExpanded = false; onRename(entry) })
-                DropdownMenuItem(text = { Text("Move to folder…") }, leadingIcon = { Icon(Icons.AutoMirrored.Rounded.DriveFileMove, null) }, onClick = { menuExpanded = false; onMove(entry) })
-                DropdownMenuItem(
-                    text = { Text("Delete", color = MaterialTheme.colorScheme.error) },
-                    leadingIcon = { Icon(Icons.Rounded.DeleteOutline, null, tint = MaterialTheme.colorScheme.error) },
-                    onClick = { menuExpanded = false; onDelete(entry) },
-                )
             }
         }
     }
@@ -201,10 +183,6 @@ internal fun FolderActionDialogs(
     onNoteCreated: () -> Unit,
     renameTarget: FileEntry?,
     onDismissRename: () -> Unit,
-    moveTarget: FileEntry?,
-    onDismissMove: () -> Unit,
-    deleteTarget: FileEntry?,
-    onDismissDelete: () -> Unit,
 ) {
     if (createRequest != null) {
         var kind by remember(createRequest) { mutableStateOf(createRequest.initialKind) }
@@ -337,143 +315,6 @@ internal fun FolderActionDialogs(
                 ) { Text("Rename") }
             },
             dismissButton = { TextButton(enabled = !renameBusy, onClick = onDismissRename) { Text("Cancel") } },
-        )
-    }
-
-    if (moveTarget != null) {
-        val initialParent = remember(moveTarget) { parentRelativePath(moveTarget.relative) }
-        var selectedDestination by remember(moveTarget) { mutableStateOf(initialParent) }
-        var expandedRelatives by remember(moveTarget) { mutableStateOf(ancestorRelativePaths(initialParent)) }
-        val excludeFolder = if (moveTarget.directory) moveTarget.relative else null
-
-        LaunchedEffect(moveTarget, expandedRelatives) {
-            model.loadMovePickerTargets(excludeFolderRelative = excludeFolder, expandedRelatives = expandedRelatives)
-        }
-        val blockedSelfMove = moveTarget.directory && isSameOrDescendantFolder(moveTarget.relative, selectedDestination)
-
-        AlertDialog(
-            onDismissRequest = onDismissMove,
-            title = { Text("Move \"${moveTarget.name}\"") },
-            text = {
-                Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
-                    Text(
-                        "Choose a destination folder within your open folder:",
-                        style = MaterialTheme.typography.bodySmall,
-                        color = MaterialTheme.colorScheme.onSurfaceVariant,
-                    )
-                    Surface(
-                        tonalElevation = 1.dp,
-                        shape = MaterialTheme.shapes.small,
-                        modifier = Modifier.fillMaxWidth().heightIn(min = 120.dp, max = 300.dp),
-                    ) {
-                        LazyColumn(Modifier.fillMaxWidth()) {
-                            items(state.movePickerTargets, key = { "picker:${it.relative}" }) { folderItem ->
-                                val selected = selectedDestination == folderItem.relative
-                                Row(
-                                    verticalAlignment = Alignment.CenterVertically,
-                                    modifier = Modifier
-                                        .fillMaxWidth()
-                                        .clickable { selectedDestination = folderItem.relative }
-                                        .padding(start = (8 + folderItem.depth * 16).dp, end = 8.dp, top = 6.dp, bottom = 6.dp),
-                                ) {
-                                    if (!folderItem.isRoot && folderItem.expandable) {
-                                        IconButton(
-                                            onClick = {
-                                                expandedRelatives = if (folderItem.expanded) expandedRelatives - folderItem.relative else expandedRelatives + folderItem.relative
-                                            },
-                                            modifier = Modifier.size(28.dp),
-                                        ) {
-                                            Icon(
-                                                if (folderItem.expanded) Icons.Rounded.ExpandMore else Icons.Rounded.ChevronRight,
-                                                contentDescription = if (folderItem.expanded) "Collapse" else "Expand",
-                                                modifier = Modifier.size(18.dp),
-                                            )
-                                        }
-                                    } else Spacer(Modifier.width(28.dp))
-                                    Icon(
-                                        if (folderItem.isRoot) Icons.Rounded.FolderOpen else Icons.Rounded.Folder,
-                                        contentDescription = null,
-                                        tint = if (selected) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.onSurfaceVariant,
-                                        modifier = Modifier.size(20.dp),
-                                    )
-                                    Spacer(Modifier.width(8.dp))
-                                    Text(
-                                        folderItem.name,
-                                        style = MaterialTheme.typography.bodyMedium,
-                                        fontWeight = if (selected) FontWeight.SemiBold else FontWeight.Normal,
-                                        color = if (selected) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.onSurface,
-                                        maxLines = 1,
-                                        overflow = TextOverflow.Ellipsis,
-                                        modifier = Modifier.weight(1f),
-                                    )
-                                    if (selected) Icon(Icons.Rounded.Check, contentDescription = "Selected", tint = MaterialTheme.colorScheme.primary, modifier = Modifier.size(18.dp))
-                                }
-                            }
-                        }
-                    }
-                }
-            },
-            confirmButton = {
-                TextButton(
-                    enabled = !blockedSelfMove && selectedDestination != initialParent,
-                    onClick = {
-                        val target = moveTarget
-                        val destination = selectedDestination
-                        onDismissMove()
-                        model.requestMoveFolderEntry(Uri.parse(target.uri), target.relative, target.directory, destination)
-                    },
-                ) { Text("Move") }
-            },
-            dismissButton = { TextButton(onClick = onDismissMove) { Text("Cancel") } },
-        )
-    }
-
-    state.moveImagesPrompt?.let { prompt ->
-        AlertDialog(
-            onDismissRequest = model::dismissMoveImagesPrompt,
-            title = { Text("Linked local images") },
-            text = {
-                Text(buildString {
-                    append("\"${prompt.entryName}\" links to ${prompt.imageCount} relative local ")
-                    append(if (prompt.imageCount == 1) "image or diagram" else "images or diagrams")
-                    append(". Moving the note to another folder will break relative paths unless those files exist beside the new location.")
-                    if (!prompt.canCopy) append("\n\nSome relative paths point outside the open folder root and cannot be copied automatically.")
-                })
-            },
-            confirmButton = {
-                Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                    TextButton(onClick = {
-                        model.moveFolderEntry(Uri.parse(prompt.entryUri), prompt.entryRelative, prompt.isDirectory, prompt.targetRelative, copyImages = false)
-                    }) { Text("Move note only") }
-                    if (prompt.canCopy) {
-                        Button(onClick = {
-                            model.moveFolderEntry(Uri.parse(prompt.entryUri), prompt.entryRelative, prompt.isDirectory, prompt.targetRelative, copyImages = true)
-                        }) { Text("Copy images & move") }
-                    }
-                }
-            },
-            dismissButton = { TextButton(onClick = model::dismissMoveImagesPrompt) { Text("Cancel") } },
-        )
-    }
-
-    if (deleteTarget != null) {
-        AlertDialog(
-            onDismissRequest = onDismissDelete,
-            title = { Text(if (deleteTarget.directory) "Delete folder?" else "Delete note?") },
-            text = {
-                Text(
-                    if (deleteTarget.directory) "Delete folder \"${deleteTarget.name}\" and all items inside it from your device storage? Any unsaved edits in open tabs inside this folder will be preserved in closed-note recovery before closing."
-                    else "Delete \"${deleteTarget.name}\" from your device storage? Any unsaved edits in an open tab will be preserved in closed-note recovery before closing."
-                )
-            },
-            confirmButton = {
-                TextButton(onClick = {
-                    val target = deleteTarget
-                    onDismissDelete()
-                    model.deleteFolderEntry(Uri.parse(target.uri), target.relative, target.directory)
-                }) { Text("Delete", color = MaterialTheme.colorScheme.error) }
-            },
-            dismissButton = { TextButton(onClick = onDismissDelete) { Text("Cancel") } },
         )
     }
 }
