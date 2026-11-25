@@ -179,7 +179,10 @@ class MediaStorage(private val context: Context) {
 
     private fun isSafeExternalUri(uri: Uri): Boolean {
         return when (uri.scheme?.lowercase()) {
-            "content" -> true
+            "content" -> {
+                val authority = uri.authority?.lowercase().orEmpty()
+                authority.isNotEmpty() && authority != "${context.packageName.lowercase()}.share"
+            }
             "file" -> {
                 val rawPath = uri.path ?: return false
                 val canonical = runCatching { File(rawPath).canonicalPath }.getOrNull() ?: return false

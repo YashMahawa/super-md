@@ -688,7 +688,7 @@ export default function LiveEditor({markdown,onChange,documentPath,python,dark,t
           detail.point={from:pos,to:pos};
           return;
         }
-        const hitBlock=rawTarget?.closest<HTMLElement>('.live-block');
+        const hitBlock=rawTarget?.closest<HTMLElement>('.live-block,.live-active-block');
         if(hitBlock&&root.contains(hitBlock)){
           const span=resolveBlockSpan(hitBlock);
           if(span){
@@ -696,7 +696,7 @@ export default function LiveEditor({markdown,onChange,documentPath,python,dark,t
             return;
           }
         }
-        const blockEls=Array.from(root.querySelectorAll<HTMLElement>('.live-block'));
+        const blockEls=Array.from(root.querySelectorAll<HTMLElement>('.live-block,.live-active-block')).filter(el=>!el.parentElement?.closest('.live-block'));
         const measured=blockEls.map(el=>({el,span:resolveBlockSpan(el),rect:el.getBoundingClientRect()})).filter((entry):entry is {el:HTMLElement;span:[number,number];rect:DOMRect}=>entry.span!==null);
         if(!measured.length){
           const pos=clampOffset(currentFrontmatter?.end??activeDoc.length);

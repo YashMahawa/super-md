@@ -400,6 +400,29 @@ describe("live cursor offsets, coordinate drops, and overlay registration", () =
       to: expectedActiveEnd,
     });
 
+    // 5. Dropping onto a frontmatter-only note while editing its standalone ActiveBlockEditor inserts after the draft.
+    dropInsert.mockClear();
+    liveMarkdown = "---\ntitle: Lab\n---\n";
+    await renderScene();
+    const emptyBodyBlock = host.querySelector<HTMLElement>(".live-block")!;
+    act(() => emptyBodyBlock.dispatchEvent(new MouseEvent("dblclick", { bubbles: true })));
+    const standaloneTextarea = host.querySelector<HTMLTextAreaElement>(".live-active-block textarea")!;
+    act(() => {
+      const setter = Object.getOwnPropertyDescriptor(HTMLTextAreaElement.prototype, "value")!.set!;
+      setter.call(standaloneTextarea, "First body draft");
+      standaloneTextarea.dispatchEvent(new Event("input", { bubbles: true }));
+    });
+    await renderScene();
+    document.elementFromPoint = vi.fn(() => host.querySelector<HTMLTextAreaElement>(".live-active-block textarea")!);
+    await act(async () => {
+      window.supermdCaptureInsertion?.(120, 120);
+      window.supermdInsertImages?.([{ source: "assets/after-standalone.png", alt: "After standalone" }]);
+    });
+    expect(dropInsert).toHaveBeenCalledExactlyOnceWith("\n\n![After standalone](<assets/after-standalone.png>)\n", {
+      from: liveMarkdown.length,
+      to: liveMarkdown.length,
+    });
+
     document.elementFromPoint = originalFromPoint;
   });
 

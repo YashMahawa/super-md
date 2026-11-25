@@ -112,9 +112,15 @@ class DropSafetyTest {
         File(app.filesDir, "attachments").listFiles()?.forEach { it.delete() }
     }
 
-    private fun drainMain() {
-        for (i in 0 until 6) {
+    private fun drainMain(until: (() -> Boolean)? = null) {
+        val deadline = System.nanoTime() + 5_000_000_000L
+        do {
             Thread.sleep(15)
+            shadowOf(Looper.getMainLooper()).idle()
+            if (until != null && until()) break
+        } while (until != null && System.nanoTime() < deadline)
+        for (i in 0 until 4) {
+            Thread.sleep(10)
             shadowOf(Looper.getMainLooper()).idle()
         }
     }
@@ -174,6 +180,7 @@ class DropSafetyTest {
             Uri.parse("content://$AUTHORITY/bmp"),
             Uri.parse("content://$AUTHORITY/spoofed"),
             Uri.parse("https://example.com/not-a-local-image.png"),
+            Uri.parse("content://${app.packageName}.share/secret.png"),
             Uri.fromFile(secretFile),
         )
 
@@ -187,7 +194,7 @@ class DropSafetyTest {
             callbackImages = images
             callbackInvoked = true
         }
-        drainMain()
+        drainMain { callbackInvoked }
 
         assertTrue(callbackInvoked)
         assertNull(callbackImages)
@@ -216,7 +223,7 @@ class DropSafetyTest {
             ),
             activeId,
         ) { images -> imported = images }
-        drainMain()
+        drainMain { imported != null }
 
         assertNotNull(imported)
         assertEquals(2, imported!!.length())
