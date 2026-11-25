@@ -509,6 +509,51 @@ private object NoMotionScheme : MotionScheme {
     override fun <T> slowEffectsSpec(): FiniteAnimationSpec<T> = snap()
 }
 
+internal fun shouldAcceptExternalDrag(localState: Any?, description: android.content.ClipDescription?): Boolean {
+    if (localState != null || description == null) return false
+    val count = description.mimeTypeCount
+    if (count <= 0) return false
+    for (index in 0 until count) {
+        val mime = description.getMimeType(index)?.substringBefore(';')?.trim()?.lowercase().orEmpty()
+        if (mime.isNotEmpty() && mime != "text/plain" && mime != "text/html" && !mime.startsWith("chromium/")) {
+            return true
+        }
+    }
+    return false
+}
+
+internal fun shouldBlockNativeDrop(
+    state: StudioState,
+    folderSearchVisible: Boolean = false,
+    accessRequestOpen: Boolean = false,
+    settingsOpen: Boolean = false,
+    exporting: Boolean = false,
+    renaming: Boolean = false,
+    contentsShown: Boolean = false,
+    drawerOpen: Boolean = false,
+): Boolean =
+    !state.welcomed ||
+        state.busy ||
+        state.readerOverlay ||
+        folderSearchVisible ||
+        accessRequestOpen ||
+        state.pendingCloseNoteId != null ||
+        state.pendingSaveConflictNoteId != null ||
+        settingsOpen ||
+        exporting ||
+        renaming ||
+        contentsShown ||
+        drawerOpen
+
+internal fun extractDroppedFileUris(clip: android.content.ClipData?): List<android.net.Uri> {
+    if (clip == null) return emptyList()
+    return (0 until clip.itemCount).mapNotNull { index ->
+        clip.getItemAt(index)?.uri?.takeIf { uri ->
+            uri.scheme?.lowercase() in setOf("content", "file")
+        }
+    }
+}
+
 @Composable private fun StudioContent(model: StudioViewModel, state: StudioState, activity: MainActivity, dark: Boolean, motion: Boolean) {
     val scope = rememberCoroutineScope()
     val drawer = rememberDrawerState(DrawerValue.Closed)
@@ -1299,19 +1344,37 @@ private object NoMotionScheme : MotionScheme {
                             }
                             setOnDragListener { _, event ->
                                 when(event.action) {
-                                    android.view.DragEvent.ACTION_DRAG_STARTED -> event.clipDescription?.let { it.hasMimeType("image/*") || it.hasMimeType("application/octet-stream") || it.hasMimeType("text/uri-list") } == true
+                                    android.view.DragEvent.ACTION_DRAG_STARTED -> shouldAcceptExternalDrag(event.localState, event.clipDescription)
                                     android.view.DragEvent.ACTION_DROP -> {
-                                        if (model.state.value.readerOverlay || model.state.value.busy) return@setOnDragListener true
+                                        if (shouldBlockNativeDrop(
+                                                model.state.value,
+                                                folderSearchVisible = model.folderSearch.value.visible,
+                                                accessRequestOpen = model.documentAccessRequests.value != null,
+                                                settingsOpen = settings,
+                                                exporting = exporting,
+                                                renaming = renaming,
+                                                contentsShown = contentsShown,
+                                                drawerOpen = drawer.isOpen,
+                                            )) {
+                                            return@setOnDragListener true
+                                        }
                                         val permissions = activity.requestDragAndDropPermissions(event)
-                                        val clip = event.clipData
-                                        val uris = (0 until (clip?.itemCount ?: 0)).mapNotNull { clip!!.getItemAt(it).uri }
+                                        val uris = extractDroppedFileUris(event.clipData)
                                         if (uris.isNotEmpty()) {
                                             val id = model.state.value.active.id
                                             val x = event.x / density.density
                                             val y = event.y / density.density
                                             evaluateJavascript("window.supermdCaptureInsertion?.($x,$y)", null)
-                                            model.importDropped(uris, id) { images -> permissions?.release(); images?.let { evaluateJavascript("window.supermdInsertImages?.($it)", null) } }
-                                        } else permissions?.release()
+                                            model.importDropped(uris, id) { images ->
+                                                permissions?.release()
+                                                images?.let { evaluateJavascript("window.supermdInsertImages?.($it)", null) }
+                                            }
+                                        } else {
+                                            permissions?.release()
+                                            if ((event.clipData?.itemCount ?: 0) > 0) {
+                                                model.importDropped(emptyList(), model.state.value.active.id) {}
+                                            }
+                                        }
                                         true
                                     }
                                     else -> true

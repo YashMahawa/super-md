@@ -281,4 +281,153 @@ describe("live cursor offsets, coordinate drops, and overlay registration", () =
     await act(async () => root.render(<div />));
     expect(document.documentElement.dataset.readerOverlay).toBe("false");
   });
+
+  it("translates Live-mode drop offsets during active block edits, active block drafts, frontmatter, and inter-block gaps", async () => {
+    let liveMarkdown = "---\ntitle: Lab\n---\n# Intro\n\nMiddle paragraph\n\nClosing";
+    const dropInsert = vi.fn();
+    const originalFromPoint = document.elementFromPoint;
+
+    const renderScene = async () => {
+      await act(async () => root.render(<div className="android-document">
+        <MediaTools documentId="live-active-drop" content={liveMarkdown} documentPath="/notes/live.md" onInsert={dropInsert} onNotice={notice} />
+        <section className="android-reading">
+          <LiveEditor markdown={liveMarkdown} documentPath="/notes/live.md" dark={false} python="" onChange={(next) => { liveMarkdown = next; }} />
+        </section>
+      </div>));
+    };
+    await renderScene();
+
+    // Open the "# Intro" block and lengthen it so downstream rendered blocks hold stale baseMarkdown offsets.
+    const introBlock = host.querySelectorAll<HTMLElement>(".live-block")[0]!;
+    act(() => introBlock.dispatchEvent(new MouseEvent("dblclick", { bubbles: true })));
+    const area = host.querySelector<HTMLTextAreaElement>("textarea")!;
+    act(() => {
+      const setter = Object.getOwnPropertyDescriptor(HTMLTextAreaElement.prototype, "value")!.set!;
+      setter.call(area, "# Intro expanded significantly");
+      area.dispatchEvent(new Event("input", { bubbles: true }));
+    });
+    await renderScene();
+
+    // 1. Dropping on downstream "Middle paragraph" must translate past the expanded active block draft.
+    const blocksWhileEditing = host.querySelectorAll<HTMLElement>(".live-block");
+    const middleBlock = blocksWhileEditing[1]!;
+    expect(Number(middleBlock.dataset.sourceEnd)).not.toBe(liveMarkdown.indexOf("Middle paragraph") + "Middle paragraph".length);
+    document.elementFromPoint = vi.fn(() => middleBlock.querySelector("p")!);
+    await act(async () => {
+      window.supermdCaptureInsertion?.(140, 180);
+      window.supermdInsertImages?.([{ source: "assets/translated.png", alt: "Translated" }]);
+    });
+    const expectedMiddleEnd = liveMarkdown.indexOf("Middle paragraph") + "Middle paragraph".length;
+    expect(dropInsert).toHaveBeenCalledExactlyOnceWith("\n\n![Translated](<assets/translated.png>)\n", {
+      from: expectedMiddleEnd,
+      to: expectedMiddleEnd,
+    });
+
+    // 2. Dropping directly onto the active block textarea inserts after the current draft, not stale baseSplitEnd.
+    dropInsert.mockClear();
+    const activeTextarea = host.querySelector<HTMLTextAreaElement>(".live-active-block textarea")!;
+    document.elementFromPoint = vi.fn(() => activeTextarea);
+    await act(async () => {
+      window.supermdCaptureInsertion?.(100, 90);
+      window.supermdInsertImages?.([{ source: "assets/after-active.png", alt: "After active" }]);
+    });
+    const expectedActiveEnd = liveMarkdown.indexOf("# Intro expanded significantly") + "# Intro expanded significantly".length;
+    expect(dropInsert).toHaveBeenCalledExactlyOnceWith("\n\n![After active](<assets/after-active.png>)\n", {
+      from: expectedActiveEnd,
+      to: expectedActiveEnd,
+    });
+
+    // 3. Dropping on YAML frontmatter properties clamps to frontmatter.end rather than inside YAML.
+    dropInsert.mockClear();
+    const propsPanel = host.querySelector<HTMLElement>("[data-frontmatter-properties],.document-properties")!;
+    document.elementFromPoint = vi.fn(() => propsPanel);
+    await act(async () => {
+      window.supermdCaptureInsertion?.(80, 24);
+      window.supermdInsertImages?.([{ source: "assets/after-fm.png", alt: "After frontmatter" }]);
+    });
+    const expectedFrontmatterEnd = "---\ntitle: Lab\n---\n".length;
+    expect(dropInsert).toHaveBeenCalledExactlyOnceWith("\n\n![After frontmatter](<assets/after-fm.png>)\n", {
+      from: expectedFrontmatterEnd,
+      to: expectedFrontmatterEnd,
+    });
+
+    // 4. Dropping in the vertical gap between blocks 0 and 1 resolves to block 0's end instead of EOF.
+    dropInsert.mockClear();
+    const allLiveBlocks = Array.from(host.querySelectorAll<HTMLElement>(".live-block"));
+    allLiveBlocks[0]!.getBoundingClientRect = () => ({ top: 60, bottom: 110, left: 20, right: 620, width: 600, height: 50, x: 20, y: 60, toJSON: () => ({}) } as DOMRect);
+    allLiveBlocks[1]!.getBoundingClientRect = () => ({ top: 150, bottom: 200, left: 20, right: 620, width: 600, height: 50, x: 20, y: 150, toJSON: () => ({}) } as DOMRect);
+    allLiveBlocks[2]!.getBoundingClientRect = () => ({ top: 240, bottom: 290, left: 20, right: 620, width: 600, height: 50, x: 20, y: 240, toJSON: () => ({}) } as DOMRect);
+    const liveContainer = host.querySelector<HTMLElement>(".live-document")!;
+    document.elementFromPoint = vi.fn(() => liveContainer);
+    await act(async () => {
+      window.supermdCaptureInsertion?.(200, 130);
+      window.supermdInsertImages?.([{ source: "assets/in-gap.png", alt: "In gap" }]);
+    });
+    expect(dropInsert).toHaveBeenCalledExactlyOnceWith("\n\n![In gap](<assets/in-gap.png>)\n", {
+      from: expectedActiveEnd,
+      to: expectedActiveEnd,
+    });
+
+    document.elementFromPoint = originalFromPoint;
+  });
+
+  it("consumes non-image and mixed file drops safely without mutating the note or letting CodeMirror read raw files", async () => {
+    const dropInsert = vi.fn();
+    const editorChange = vi.fn();
+    const content = "# Source Note\n\nKeep clean.";
+    await act(async () => root.render(<div className="workspace">
+      <MediaTools documentId="safe-drop" content={content} documentPath="/notes/safe.md" onInsert={dropInsert} onNotice={notice} />
+      <Editor sessionId="safe-drop-editor" value={content} onChange={editorChange} dark={false} focusMode={false} />
+    </div>));
+
+    const cmContent = host.querySelector<HTMLElement>(".cm-content")!;
+    const pdfFile = new File(["%PDF-1.7 binary payload"], "handout.pdf", { type: "application/pdf" });
+    const bmpFile = new File(["BMunsupported"], "legacy.bmp", { type: "image/bmp" });
+
+    // Non-image dragover & drop on CodeMirror are both prevented and stopped before CodeMirror's file reader runs.
+    let reachedBubble = false;
+    cmContent.addEventListener("drop", () => { reachedBubble = true; });
+    await act(async () => {
+      const overEvent = drag(cmContent, "dragover", [pdfFile]);
+      expect(overEvent.defaultPrevented).toBe(true);
+      const dropEvent = drag(cmContent, "drop", [pdfFile, bmpFile]);
+      expect(dropEvent.defaultPrevented).toBe(true);
+    });
+    expect(reachedBubble).toBe(false);
+    expect(importImageFiles).not.toHaveBeenCalled();
+    expect(dropInsert).not.toHaveBeenCalled();
+    expect(editorChange).not.toHaveBeenCalled();
+    expect(notice).toHaveBeenCalledWith("Only supported images (PNG, JPEG, GIF, WebP, AVIF, or SVG) can be dropped into a note.");
+
+    // Mixed drop (supported SVG + unsupported PDF) imports only the supported image and notifies about the skipped file.
+    notice.mockClear();
+    await act(async () => {
+      const mixedDrop = drag(cmContent, "drop", [file, pdfFile]);
+      expect(mixedDrop.defaultPrevented).toBe(true);
+    });
+    expect(importImageFiles).toHaveBeenCalledExactlyOnceWith([file]);
+    expect(dropInsert).toHaveBeenCalledTimes(1);
+    expect(notice).toHaveBeenCalledWith("Skipped 1 unsupported file; only PNG, JPEG, GIF, WebP, AVIF, and SVG images were imported.");
+
+    // Drops on Text nodes and outside workspace chrome also prevent browser file navigation cleanly.
+    vi.mocked(importImageFiles).mockClear();
+    dropInsert.mockClear();
+    notice.mockClear();
+    const outsideShell = document.createElement("header");
+    outsideShell.className = "topbar";
+    document.body.append(outsideShell);
+    try {
+      await act(async () => {
+        const outsideOver = drag(outsideShell, "dragover", [pdfFile]);
+        expect(outsideOver.defaultPrevented).toBe(true);
+        const outsideDrop = drag(outsideShell, "drop", [pdfFile]);
+        expect(outsideDrop.defaultPrevented).toBe(true);
+      });
+      expect(importImageFiles).not.toHaveBeenCalled();
+      expect(dropInsert).not.toHaveBeenCalled();
+      expect(notice).toHaveBeenCalledWith("Drop images inside the note area to insert them.");
+    } finally {
+      outsideShell.remove();
+    }
+  });
 });

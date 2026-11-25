@@ -24,6 +24,32 @@ import java.util.zip.GZIPOutputStream
 
 /** Attachments live outside Markdown and recovery snapshots. FMD is the shareable envelope. */
 class MediaStorage(private val context: Context) {
+    companion object {
+        const val UNSUPPORTED_DROP_IMAGE_MESSAGE = "Only supported images (PNG, JPEG, GIF, WebP, AVIF, or SVG) can be dropped into a note."
+        private val SUPPORTED_IMAGE_MIMES = setOf("image/png", "image/jpeg", "image/gif", "image/webp", "image/avif", "image/svg+xml")
+
+        internal fun resolveDroppedImageMime(name: String?, providerMime: String?): String? {
+            val extMime = when (name?.substringAfterLast('.', "")?.lowercase()) {
+                "png" -> "image/png"
+                "jpg", "jpeg" -> "image/jpeg"
+                "gif" -> "image/gif"
+                "webp" -> "image/webp"
+                "avif" -> "image/avif"
+                "svg" -> "image/svg+xml"
+                else -> null
+            }
+            val normalized = providerMime?.substringBefore(';')?.trim()?.lowercase()?.takeIf { it.isNotEmpty() }
+            if (normalized != null) {
+                if (normalized in SUPPORTED_IMAGE_MIMES) return normalized
+                if (normalized.startsWith("image/")) return null
+                if (normalized == "application/octet-stream") return extMime
+                if ((normalized == "text/xml" || normalized == "application/xml") && extMime == "image/svg+xml") return extMime
+                return null
+            }
+            return extMime
+        }
+    }
+    data class DroppedImageBatch(val images: JSONArray, val skippedCount: Int)
     private val attachments = File(context.filesDir, "attachments").apply { mkdirs() }
     private val bundles = File(context.filesDir, "portable-assets").apply { mkdirs() }
 
@@ -146,17 +172,68 @@ class MediaStorage(private val context: Context) {
         for (i in 0 until images.length()) { val image = images.getJSONObject(i); val (type, bytes) = decode(image.getString("data")); total += bytes.size; require(total <= 75_000_000) { "Insert at most 75 MB at a time" }; result.put(store(image.optString("name", "Image"), type, bytes)) }
         return result
     }
+    private fun resolveUriDisplayName(uri: Uri): String? =
+        androidx.documentfile.provider.DocumentFile.fromSingleUri(context, uri)?.name
+            ?.takeIf { it.isNotBlank() }
+            ?: uri.lastPathSegment?.substringAfterLast('/')?.takeIf { it.isNotBlank() }
+
+    private fun isSafeExternalUri(uri: Uri): Boolean {
+        return when (uri.scheme?.lowercase()) {
+            "content" -> true
+            "file" -> {
+                val rawPath = uri.path ?: return false
+                val canonical = runCatching { File(rawPath).canonicalPath }.getOrNull() ?: return false
+                val privateRoot = runCatching { context.filesDir.parentFile?.canonicalPath }.getOrNull()
+                privateRoot == null || (canonical != privateRoot && !canonical.startsWith(privateRoot + File.separator))
+            }
+            else -> false
+        }
+    }
+
     fun importUris(uris: List<Uri>): JSONArray {
         require(uris.size in 1..32)
         var total = 0L; val result = JSONArray()
         for (uri in uris) {
-            val name = androidx.documentfile.provider.DocumentFile.fromSingleUri(context, uri)?.name ?: "Image"
-            val type = context.contentResolver.getType(uri)?.takeIf { it.startsWith("image/") } ?: mime(name)
+            require(isSafeExternalUri(uri)) { "Unsupported image URI" }
+            val name = resolveUriDisplayName(uri) ?: "Image"
+            val type = imageMime(name, context.contentResolver.getType(uri))
             val bytes = context.contentResolver.openInputStream(uri)?.use { readLimited(it, 25_000_000) } ?: error("Image permission is unavailable")
+            requireMediaSignature(type, bytes)
             total += bytes.size; require(total <= 75_000_000) { "Insert at most 75 MB at a time" }
             result.put(store(name, type, bytes))
         }
         return result
+    }
+
+    fun importDroppedUris(uris: List<Uri>): DroppedImageBatch {
+        if (uris.isEmpty()) return DroppedImageBatch(JSONArray(), 0)
+        var total = 0L
+        var skipped = 0
+        val result = JSONArray()
+        for (uri in uris) {
+            if (!isSafeExternalUri(uri)) {
+                skipped++
+                continue
+            }
+            val name = resolveUriDisplayName(uri)
+            val providerMime = runCatching { context.contentResolver.getType(uri) }.getOrNull()
+            val resolvedMime = resolveDroppedImageMime(name, providerMime)
+            if (resolvedMime == null) {
+                skipped++
+                continue
+            }
+            require(result.length() < 32) { "Insert at most 32 images at a time" }
+            val bytes = context.contentResolver.openInputStream(uri)?.use { readLimited(it, 25_000_000) } ?: error("Image permission is unavailable")
+            val validSignature = runCatching { requireMediaSignature(resolvedMime, bytes) }.isSuccess
+            if (!validSignature) {
+                skipped++
+                continue
+            }
+            total += bytes.size
+            require(total <= 75_000_000) { "Insert at most 75 MB at a time" }
+            result.put(store(name ?: "Image", resolvedMime, bytes))
+        }
+        return DroppedImageBatch(result, skipped)
     }
 
     /** Save a requested browser image/diagram into Downloads or the user's configured note folder. */

@@ -4,8 +4,30 @@ import { invoke } from "../nativeBridge";
 import { setReaderOverlay } from "../readerOverlays";
 
 export interface InsertionPoint { from: number; to: number }
-const OVERLAY_SELECTOR = ".image-viewer,.math-repair-panel,.repair-scrim,.reading-search,.media-scrim,.media-dialog,.theme-guide-dialog,.theme-guide-scrim,.media-save-menu,.reader-export-backdrop,.cm-search";
+const OVERLAY_SELECTOR = ".welcome-scrim,.image-viewer,.math-repair-panel,.repair-scrim,.reading-search,.media-scrim,.media-dialog,.theme-guide-dialog,.theme-guide-scrim,.media-save-menu,.reader-export-backdrop,.cm-search";
+const SUPPORTED_DROP_IMAGE_MIME = /^image\/(png|jpeg|gif|webp|avif|svg\+xml)$/i;
+const SUPPORTED_DROP_IMAGE_EXT = /\.(png|jpe?g|gif|webp|avif|svg)$/i;
+export const UNSUPPORTED_DROP_MESSAGE = "Only supported images (PNG, JPEG, GIF, WebP, AVIF, or SVG) can be dropped into a note.";
+function targetElement(target: EventTarget | null): Element | null {
+  return target instanceof Element ? target : target instanceof Node ? target.parentElement : null;
+}
+function hasFilePayload(transfer: DataTransfer | null | undefined): boolean {
+  if (!transfer) return false;
+  return Array.from(transfer.types || []).includes("Files") || (transfer.files?.length ?? 0) > 0;
+}
+function isSupportedDroppedImage(file: File): boolean {
+  const mime = file.type.split(";")[0].trim().toLowerCase();
+  if (mime.startsWith("image/")) return SUPPORTED_DROP_IMAGE_MIME.test(mime);
+  return (!mime || mime === "application/octet-stream" || ((mime === "text/xml" || mime === "application/xml") && /\.svg$/i.test(file.name))) && SUPPORTED_DROP_IMAGE_EXT.test(file.name);
+}
+function formatDroppedImages(images: ImportedImage[], point: InsertionPoint | undefined, content: string, replacing = false): string {
+  const atStart = !replacing && point?.from === 0 && point?.to === 0 && content.length > 0;
+  const prefix = replacing || atStart ? "" : "\n\n";
+  const suffix = replacing ? "" : atStart ? (content.startsWith("\n") ? "\n" : "\n\n") : "\n";
+  return prefix + images.map(imageMarkdown).join("\n\n") + suffix;
+}
 function sourceEndAt(element: Element | null): InsertionPoint | undefined {
+  if (element?.closest(".live-document")) return undefined;
   const live = element?.closest<HTMLElement>(".live-block");
   if (live?.dataset.sourceEnd !== undefined) {
     const end = Number(live.dataset.sourceEnd);
@@ -19,8 +41,12 @@ function sourceEndAt(element: Element | null): InsertionPoint | undefined {
   }
   return undefined;
 }
-function insertionPoint(coords?: { x: number; y: number }): InsertionPoint | undefined {
-  const request: { point?: InsertionPoint; x?: number; y?: number } = { point: undefined, ...(coords ? { x: coords.x, y: coords.y } : {}) };
+function insertionPoint(coords?: { x: number; y: number }, target?: Element | null): InsertionPoint | undefined {
+  const request: { point?: InsertionPoint; x?: number; y?: number; target?: Element | null } = {
+    point: undefined,
+    ...(coords ? { x: coords.x, y: coords.y } : {}),
+    ...(target ? { target } : {}),
+  };
   window.dispatchEvent(new CustomEvent("supermd-insertion-point", { detail: request }));
   if (!coords) {
     const text = document.activeElement;
@@ -47,7 +73,7 @@ export default function MediaTools({ documentId, content, documentPath: _documen
   const urlInputRef = useRef<HTMLInputElement>(null);
   const openModal = () => { openRef.current = true; setReaderOverlay("media", true); setOpen(true); };
   const closeModal = () => { openRef.current = false; setReaderOverlay("media", false); setOpen(false); };
-  const hasActiveOverlay = (node?: Element | null) => busyRef.current || openRef.current || document.documentElement.dataset.readerOverlay === "true" || !!node?.closest?.(OVERLAY_SELECTOR) || !!document.querySelector(".image-viewer,.math-repair-panel,.reading-search,.media-scrim,.theme-guide-dialog,.media-save-menu,.reader-export-backdrop");
+  const hasActiveOverlay = (node?: Element | null) => busyRef.current || openRef.current || document.documentElement.dataset.readerOverlay === "true" || !!node?.closest?.(OVERLAY_SELECTOR) || !!document.querySelector(".welcome-scrim,.image-viewer,.math-repair-panel,.reading-search,.media-scrim,.theme-guide-dialog,.media-save-menu,.reader-export-backdrop");
   // Keep a full-source guard only while an actual replacement is pending.
   // Otherwise this ref can retain a huge obsolete document after every edit.
   useEffect(() => { setReaderOverlay("media", open); if (!open) targetSource.current = null; }, [open]);
@@ -75,7 +101,7 @@ export default function MediaTools({ documentId, content, documentPath: _documen
   const commitImages = (images: ImportedImage[]) => {
     if (!images.length) return;
     if (replacing.current && reference.current.content !== targetSource.current) { reference.current.onNotice("The note changed while importing. Select the image again to replace it safely."); return; }
-    reference.current.onInsert((replacing.current ? "" : "\n\n") + images.map(imageMarkdown).join("\n\n") + (replacing.current ? "" : "\n"), target.current); closeModal();
+    reference.current.onInsert(formatDroppedImages(images, target.current, reference.current.content, replacing.current), target.current); closeModal();
   };
   const show = (value = "") => { if (busyRef.current) return; ignoreCapturedDrop.current = false; target.current = insertionPoint(); replacing.current = false; setReplacement(false); setUrl(value); setImageMode(false); setDetails(null); setError(""); setThumbnail(false); openModal(); };
   useEffect(() => {
@@ -87,7 +113,7 @@ export default function MediaTools({ documentId, content, documentPath: _documen
       if (hasActiveOverlay(hit)) { ignoreCapturedDrop.current = true; return; }
       ignoreCapturedDrop.current = false;
       replacing.current = false;
-      target.current = hasCoords ? (sourceEndAt(hit) ?? insertionPoint({ x, y })) : insertionPoint();
+      target.current = hasCoords ? (sourceEndAt(hit) ?? insertionPoint({ x, y }, hit)) : insertionPoint();
     };
     window.supermdInsertImages = (images) => {
       if (ignoreCapturedDrop.current) { ignoreCapturedDrop.current = false; return; }
@@ -122,7 +148,7 @@ export default function MediaTools({ documentId, content, documentPath: _documen
     };
     let internalDrag = false;
     const dragStart = (event: DragEvent) => {
-      const element = event.target instanceof Element ? event.target : null;
+      const element = targetElement(event.target);
       internalDrag = !!element?.closest(".workspace,.android-document");
       // A browser can turn an embedded/data-URL image drag into a File.
       // Viewing or panning a rendered image must never re-import it into the note.
@@ -135,30 +161,64 @@ export default function MediaTools({ documentId, content, documentPath: _documen
     };
     const dragEnd = () => { internalDrag = false; };
     const drop = (event: DragEvent) => {
-      const element = event.target as Element;
+      if ("__TAURI_INTERNALS__" in window) return; // Native desktop path drop owns image files.
+      const element = targetElement(event.target);
       const fromDocument = internalDrag; internalDrag = false;
+      if (element instanceof HTMLInputElement && element.type === "file") return;
+      const fileDrop = hasFilePayload(event.dataTransfer);
       if (hasActiveOverlay(element)) {
-        if (Array.from(event.dataTransfer?.types || []).includes("Files")) { event.preventDefault(); event.stopPropagation(); }
+        if (fileDrop) { event.preventDefault(); event.stopPropagation(); }
         return;
       }
-      if (!element.closest?.(".workspace,.android-document")) return;
+      if (!element?.closest(".workspace,.android-document")) {
+        if (fileDrop) {
+          event.preventDefault(); event.stopPropagation();
+          if (!fromDocument && (event.dataTransfer?.files?.length ?? 0) > 0) {
+            reference.current.onNotice("Drop images inside the note area to insert them.");
+          }
+        }
+        return;
+      }
       if (fromDocument) {
         // Preserve ordinary text drag/drop inside Source/Live editors. Only
         // suppress file-bearing internal drops and drops on read-only overlays.
-        if (Array.from(event.dataTransfer?.types || []).includes("Files")) { event.preventDefault(); event.stopPropagation(); }
+        if (fileDrop) { event.preventDefault(); event.stopPropagation(); }
         return;
       }
-      if ("__TAURI_INTERNALS__" in window) return; // Native desktop path drop owns image files.
-      const files = Array.from(event.dataTransfer?.files || []).filter((f) => /^image\//.test(f.type) || /\.svg$/i.test(f.name));
-      if (!files.length) return;
+      const allFiles = Array.from(event.dataTransfer?.files || []);
+      if (!fileDrop && !allFiles.length) return;
+      // Consume all external file drops before CodeMirror or the browser can
+      // insert raw non-image file bytes or navigate away from the note.
       event.preventDefault(); event.stopPropagation();
+      if (!allFiles.length) return;
+      const files = allFiles.filter(isSupportedDroppedImage);
+      if (!files.length) {
+        reference.current.onNotice(UNSUPPORTED_DROP_MESSAGE);
+        return;
+      }
+      const skipped = allFiles.length - files.length;
       const coords = typeof event.clientX === "number" && typeof event.clientY === "number" && Number.isFinite(event.clientX) && Number.isFinite(event.clientY) ? { x: event.clientX, y: event.clientY } : undefined;
-      const point = sourceEndAt(element) ?? insertionPoint(coords);
-      void importImageFiles(files).then((images) => { if (mounted.current) reference.current.onInsert("\n\n" + images.map(imageMarkdown).join("\n\n") + "\n", point); }).catch((e) => reference.current.onNotice(String(e)));
+      const point = sourceEndAt(element) ?? insertionPoint(coords, element);
+      void importImageFiles(files).then((images) => {
+        if (!mounted.current || !images.length) return;
+        reference.current.onInsert(formatDroppedImages(images, point, reference.current.content), point);
+        if (skipped > 0) {
+          reference.current.onNotice(skipped === 1 ? "Skipped 1 unsupported file; only PNG, JPEG, GIF, WebP, AVIF, and SVG images were imported." : `Skipped ${skipped} unsupported files; only PNG, JPEG, GIF, WebP, AVIF, and SVG images were imported.`);
+        }
+      }).catch((e) => reference.current.onNotice(String(e)));
     };
-    const over = (event: DragEvent) => { if ((event.target as Element).closest?.(".workspace,.android-document") && Array.from(event.dataTransfer?.types || []).includes("Files")) event.preventDefault(); };
-    document.addEventListener("paste", paste, true); document.addEventListener("dragstart", dragStart, true); document.addEventListener("dragend", dragEnd, true); document.addEventListener("drop", drop, true); document.addEventListener("dragover", over); window.addEventListener("supermd-image-edit", editImage);
-    return () => { mounted.current = false; delete window.supermdMedia; delete window.supermdInsertImages; delete window.supermdCaptureInsertion; document.removeEventListener("paste", paste, true); document.removeEventListener("dragstart", dragStart, true); document.removeEventListener("dragend", dragEnd, true); document.removeEventListener("drop", drop, true); document.removeEventListener("dragover", over); window.removeEventListener("supermd-image-edit", editImage); };
+    const over = (event: DragEvent) => {
+      if ("__TAURI_INTERNALS__" in window) return;
+      const element = targetElement(event.target);
+      if (element instanceof HTMLInputElement && element.type === "file") return;
+      if (!hasFilePayload(event.dataTransfer)) return;
+      event.preventDefault();
+      if (hasActiveOverlay(element) || !element?.closest(".workspace,.android-document")) {
+        try { if (event.dataTransfer) event.dataTransfer.dropEffect = "none"; } catch { /* Ignore readonly DataTransfer mocks. */ }
+      }
+    };
+    document.addEventListener("paste", paste, true); document.addEventListener("dragstart", dragStart, true); document.addEventListener("dragend", dragEnd, true); document.addEventListener("drop", drop, true); document.addEventListener("dragover", over, true); window.addEventListener("supermd-image-edit", editImage);
+    return () => { mounted.current = false; delete window.supermdMedia; delete window.supermdInsertImages; delete window.supermdCaptureInsertion; document.removeEventListener("paste", paste, true); document.removeEventListener("dragstart", dragStart, true); document.removeEventListener("dragend", dragEnd, true); document.removeEventListener("drop", drop, true); document.removeEventListener("dragover", over, true); window.removeEventListener("supermd-image-edit", editImage); };
   }, [documentId]);
   useEffect(() => { setFetching(false); if (!open || imageMode || !/^https?:\/\/\S+$/.test(url)) return;
     let active = true; setFetching(true); setDetails(null);
