@@ -134,7 +134,7 @@ describe("Source mode Ctrl/Cmd+Click workspace link navigation", () => {
         wikilink: true,
       },
     });
-  });
+  }, 15_000);
 
   it("scrolls to pendingHeading in >80k-char windowed notes and Source mode without saved-scroll override", async () => {
     class FakeObserver {

@@ -3410,6 +3410,7 @@ class Studio(QObject):
                 except OSError:
                     pass
                 if str(path) != original_path:
+                    self.session.workspace_links.invalidate(path.parent)
                     self.recent = [str(path)] + [p for p in self.recent if p != str(path)][:29]
                     self._preferences()
                 if automatic and self._is_dirty(target): self.autosave_timer.start(900)
@@ -3464,9 +3465,15 @@ class Studio(QObject):
             self.message = "Rename keeps the note format. Use Export to change formats."; self._emit(False); return
         if not tab["path"]: tab["name"] = name; self._recover(); self._emit(False); return
         before = Path(tab["path"]); after = before.with_name(name)
-        if before == after: return
+        if before.name == name: return
         def work():
-            if after.exists(): raise ValueError("A file with that name already exists.")
+            if after.exists():
+                try:
+                    same_target = os.path.samefile(before, after)
+                except OSError:
+                    same_target = False
+                if not same_target:
+                    raise ValueError("A file with that name already exists.")
             before.rename(after)
         def finished(_,error):
             if error: return
@@ -5224,6 +5231,8 @@ class Studio(QObject):
                             self._agent_open_paths.add(str(Path(save_as).resolve()))
                         except OSError:
                             pass
+                        if path_changed:
+                            self.session.workspace_links.invalidate(Path(save_as).parent)
                         self.recent = [save_as] + [p for p in self.recent if p != save_as][:29]
                         self._preferences()
                         self.message = "Saved"
