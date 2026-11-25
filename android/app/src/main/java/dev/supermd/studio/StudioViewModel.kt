@@ -2320,15 +2320,13 @@ class StudioViewModel(app: Application, val workspaceKey: String = "main") : And
         windowPrefs.edit().putBoolean("folderMigrated", true).remove("folder").apply()
         change { it.copy(folder = null, files = emptyList()) }
     }
-    private val noteExtensions = WORKSPACE_NOTE_EXTENSIONS.toSet()
-
     fun listFolder(uri: Uri, relative: String) = viewModelScope.launch {
         listedRelative=relative
         try {
             val entries = withContext(Dispatchers.IO) {
                 var folder = DocumentFile.fromTreeUri(getApplication(), Uri.parse(mutable.value.folder ?: uri.toString())) ?: error("Choose the folder again to restore access")
                 relative.split('/').filter { it.isNotEmpty() }.forEach { part -> folder = folder.findFile(part) ?: error("Folder disappeared") }
-                folder.listFiles().mapNotNull { f -> val name = f.name ?: return@mapNotNull null; if (name.startsWith('.')) return@mapNotNull null; if (f.isDirectory || name.substringAfterLast('.').lowercase() in noteExtensions) FileEntry(name, f.uri.toString(), f.isDirectory, (if (relative.isEmpty()) "" else "$relative/") + name) else null }.sortedWith(compareByDescending<FileEntry> { it.directory }.thenBy { it.name.lowercase() })
+                folder.listFiles().mapNotNull { f -> val name = f.name ?: return@mapNotNull null; if (name.startsWith('.')) return@mapNotNull null; if (f.isDirectory || name.substringAfterLast('.').lowercase() in listOf("md", "smd", "markdown", "fmd")) FileEntry(name, f.uri.toString(), f.isDirectory, (if (relative.isEmpty()) "" else "$relative/") + name) else null }.sortedWith(compareByDescending<FileEntry> { it.directory }.thenBy { it.name.lowercase() })
             }
             mutable.value = mutable.value.copy(files = entries)
         } catch (error: Exception) { fail("Could not list folder: ${error.message}") }
