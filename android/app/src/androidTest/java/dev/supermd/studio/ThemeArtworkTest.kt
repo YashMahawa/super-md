@@ -1,7 +1,12 @@
 package dev.supermd.studio
 
+import android.os.Build
+import android.os.PowerManager
+import android.os.SystemClock
+import android.view.View
+import android.view.ViewGroup
+import android.view.WindowManager
 import androidx.activity.ComponentActivity
-import androidx.activity.compose.setContent
 import androidx.compose.foundation.background
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.fillMaxSize
@@ -10,13 +15,104 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.test.junit4.createAndroidComposeRule
 import androidx.test.platform.app.InstrumentationRegistry
+import androidx.test.runner.lifecycle.ActivityLifecycleMonitorRegistry
+import androidx.test.runner.lifecycle.Stage
 import org.json.JSONObject
 import org.junit.Assert.*
 import org.junit.Rule
 import org.junit.Test
+import java.io.InputStreamReader
+import java.util.concurrent.CountDownLatch
+import java.util.concurrent.TimeUnit
+import java.util.concurrent.atomic.AtomicReference
 
 class ThemeArtworkTest {
     @get:Rule val compose=createAndroidComposeRule<ComponentActivity>()
+
+    private fun runUiShell(command:String) {
+        val automation=InstrumentationRegistry.getInstrumentation().uiAutomation
+        automation.executeShellCommand(command).use {descriptor->
+            InputStreamReader(android.os.ParcelFileDescriptor.AutoCloseInputStream(descriptor)).readText()
+        }
+    }
+
+    private fun invalidateHierarchy(view:View) {
+        view.invalidate()
+        if(view is ViewGroup){
+            for(index in 0 until view.childCount)invalidateHierarchy(view.getChildAt(index))
+        }
+    }
+
+    private fun preparePresenterWindow() {
+        val power=compose.activity.getSystemService(PowerManager::class.java)
+        if(power!=null&&!power.isInteractive){
+            runCatching {runUiShell("input keyevent KEYCODE_WAKEUP");runUiShell("wm dismiss-keyguard")}
+        }
+        InstrumentationRegistry.getInstrumentation().runOnMainSync {
+            val activity=compose.activity
+            if(Build.VERSION.SDK_INT>=Build.VERSION_CODES.O_MR1){
+                activity.setShowWhenLocked(true)
+                activity.setTurnScreenOn(true)
+            }
+            activity.window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
+        }
+    }
+
+    private fun requestPresenterRedraw() {
+        compose.activity.runOnUiThread {
+            val decor=compose.activity.window.decorView
+            if(decor.isAttachedToWindow){
+                invalidateHierarchy(decor)
+                decor.postInvalidateOnAnimation()
+            }
+        }
+    }
+
+    private fun awaitPresenterReady():Pair<Int,Int> {
+        compose.waitForIdle()
+        val sampleCenter=AtomicReference(0 to 0)
+        var lastWakeMs=0L
+        compose.waitUntil(15_000){
+            val now=SystemClock.uptimeMillis()
+            val power=compose.activity.getSystemService(PowerManager::class.java)
+            if(power!=null&&!power.isInteractive&&now-lastWakeMs>1_000L){
+                lastWakeMs=now
+                runCatching {runUiShell("input keyevent KEYCODE_WAKEUP");runUiShell("wm dismiss-keyguard")}
+            }
+            var ready=false
+            InstrumentationRegistry.getInstrumentation().runOnMainSync {
+                val activity=compose.activity
+                val decor=activity.window.decorView
+                val resumed=ActivityLifecycleMonitorRegistry.getInstance()
+                    .getActivitiesInStage(Stage.RESUMED)
+                    .any {it===activity}
+                if(!activity.hasWindowFocus())decor.requestFocus()
+                if(resumed&&decor.isAttachedToWindow&&decor.isShown&&decor.width>0&&decor.height>0&&activity.hasWindowFocus()){
+                    val location=IntArray(2)
+                    decor.getLocationOnScreen(location)
+                    sampleCenter.set((location[0]+decor.width/2) to (location[1]+decor.height/2))
+                    ready=true
+                }
+            }
+            ready
+        }
+        if(Build.VERSION.SDK_INT>=Build.VERSION_CODES.Q){
+            val committed=CountDownLatch(1)
+            InstrumentationRegistry.getInstrumentation().runOnMainSync {
+                val decor=compose.activity.window.decorView
+                if(decor.viewTreeObserver.isAlive){
+                    decor.viewTreeObserver.registerFrameCommitCallback {committed.countDown()}
+                }else{
+                    committed.countDown()
+                }
+                invalidateHierarchy(decor)
+                decor.postInvalidateOnAnimation()
+            }
+            committed.await(2_500,TimeUnit.MILLISECONDS)
+        }
+        compose.waitForIdle()
+        return sampleCenter.get()
+    }
     @Test fun componentRolesReachReaderAndRoundtripInSharedTheme() {
         val document=JSONObject().put("format","supermd-theme").put("version",1).put("name","Components").put("variants",JSONObject().put("light",JSONObject().put("colors",JSONObject().put("python-bg","#172a31").put("table-header-bg","#314e40").put("table-border","#807251")))).put("metrics",JSONObject().put("pythonRadius",16).put("tableBorderWidth",2).put("pythonSourceMaxHeight",24))
         val original=document.toString();val state=StudioState(customTheme=original,theme="light")
@@ -33,17 +129,28 @@ class ThemeArtworkTest {
         return JSONObject().put("format","supermd-theme").put("version",1).put("name","Artwork test").put("accent","blue").put("variants",JSONObject().put("dark",variant)).toString()
     }
     @Test fun nativeArtworkPaintsRealPixelsChangesAndCanBeHidden() {
+        preparePresenterWindow()
         val state=mutableStateOf(StudioState(customTheme=theme("#ff0000"),theme="dark"))
-        compose.activity.runOnUiThread {compose.activity.setContent {Box(Modifier.fillMaxSize().background(Color.Black).themeArtwork(state.value,"sidebar"))}}
+        compose.setContent {Box(Modifier.fillMaxSize().background(Color.Black).themeArtwork(state.value,"sidebar"))}
         fun painted(r:Int,b:Int) {
-            compose.waitForIdle()
+            val (centerX,centerY)=awaitPresenterReady()
             var latest:android.graphics.Bitmap?=null
             var seen="no frame"
             try {
                 compose.waitUntil(15000){
                     latest?.recycle()
                     val bitmap=InstrumentationRegistry.getInstrumentation().uiAutomation.takeScreenshot();latest=bitmap
-                    if(bitmap==null)false else {val c=bitmap.getPixel(bitmap.width/2,bitmap.height/2);seen="#%08x".format(c);kotlin.math.abs(android.graphics.Color.red(c)-r)<=2&&android.graphics.Color.green(c)<=2&&kotlin.math.abs(android.graphics.Color.blue(c)-b)<=2}
+                    if(bitmap==null){
+                        requestPresenterRedraw()
+                        false
+                    }else{
+                        val x=centerX.coerceIn(0,bitmap.width-1)
+                        val y=centerY.coerceIn(0,bitmap.height-1)
+                        val c=bitmap.getPixel(x,y);seen="#%08x".format(c)
+                        val matches=kotlin.math.abs(android.graphics.Color.red(c)-r)<=2&&android.graphics.Color.green(c)<=2&&kotlin.math.abs(android.graphics.Color.blue(c)-b)<=2
+                        if(!matches)requestPresenterRedraw()
+                        matches
+                    }
                 }
             }catch(error:androidx.compose.ui.test.ComposeTimeoutException){throw AssertionError("Artwork must present RGB($r,0,$b); observed $seen",error)}
             finally {
