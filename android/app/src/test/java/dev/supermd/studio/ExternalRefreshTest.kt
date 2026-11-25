@@ -222,6 +222,7 @@ class ExternalRefreshTest {
         assertNotEquals(initialDir, adoptedDirV2)
         assertTrue("Newly adopted portable-assets directory must not be deleted on cancellation", portableDir(adoptedDirV2).exists())
         assertEquals(SVG_B, media.portableAssets(adoptedDirV2).optString("assets/diagram.svg"))
+        await { !portableDir(initialDir).exists() }
 
         // 2. Cancelling an in-flight refresh right after state adoption via an immediate tab-selection trigger
         // must preserve the just-adopted background tab's state/assets and still refresh the selected tab.
@@ -251,6 +252,7 @@ class ExternalRefreshTest {
         assertNotEquals(adoptedDirV2, adoptedDirV3)
         assertTrue("Adopted portable-assets directory must survive tab-switch cancellation", portableDir(adoptedDirV3).exists())
         assertEquals(SVG_A, media.portableAssets(adoptedDirV3).optString("assets/diagram.svg"))
+        await { !portableDir(adoptedDirV2).exists() }
     }
 
     private fun portableDir(name: String): File = File(app.filesDir, "portable-assets/$name")
