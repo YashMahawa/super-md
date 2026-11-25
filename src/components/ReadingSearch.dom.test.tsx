@@ -295,4 +295,95 @@ describe("ReadingSearch DOM behavior", () => {
     act(() => root.unmount());
     host.remove();
   });
+
+  it("scrolls precise Range coordinates into the unobstructed band below .reading-search in tall blocks and top lines", async () => {
+    const host = document.createElement("div");
+    document.body.append(host);
+    const root = createRoot(host);
+
+    const tallLines = Array.from({ length: 120 }, (_, i) => (i === 0 ? "Line 0 TopToken" : i === 115 ? "Line 115 DeepToken" : `Line ${i} filler`));
+    const content = `# TopToken Heading\n\n\`\`\`txt\n${tallLines.join("\n")}\n\`\`\``;
+
+    await act(async () => {
+      root.render(
+        <div className="android-document">
+          <ReadingSearch content={content} close={() => {}} onChange={() => {}} />
+          <section className="android-reading">
+            <div className="markdown-body">
+              <h1 data-source-start="0" data-source-end="18">TopToken Heading</h1>
+              <pre><code>{tallLines.join("\n")}</code></pre>
+            </div>
+          </section>
+        </div>,
+      );
+    });
+
+    const scroller = host.querySelector<HTMLElement>(".android-reading")!;
+    const searchBar = host.querySelector<HTMLElement>(".reading-search")!;
+    const heading = host.querySelector<HTMLElement>("h1")!;
+    const codeEl = host.querySelector<HTMLElement>("code")!;
+
+    let barHeight = 76;
+    const getClearance = () => parseFloat(scroller.style.paddingTop || "0") || 0;
+    searchBar.getBoundingClientRect = () => new DOMRect(24, 12, 720, barHeight);
+    scroller.getBoundingClientRect = () => new DOMRect(0, 0, 800, 600);
+    heading.getBoundingClientRect = () => new DOMRect(40, 24 + getClearance() - scroller.scrollTop, 400, 32);
+    // Code block is 2,400px tall; centering the element would leave line 0 and line 115 offscreen.
+    codeEl.getBoundingClientRect = () => new DOMRect(40, 100 + getClearance() - scroller.scrollTop, 600, 2400);
+
+    const origGetClientRects = Range.prototype.getClientRects;
+    const origGetBoundingRect = Range.prototype.getBoundingClientRect;
+    const computeRangeRect = (range: Range): DOMRect => {
+      const text = range.startContainer.textContent || "";
+      if (heading.contains(range.startContainer)) {
+        return new DOMRect(40, 24 + getClearance() - scroller.scrollTop, 90, 28);
+      }
+      const lineIdx = text.slice(0, range.startOffset).split("\n").length - 1;
+      return new DOMRect(40, 100 + getClearance() + lineIdx * 20 - scroller.scrollTop, 110, 20);
+    };
+    Range.prototype.getBoundingClientRect = function () { return computeRangeRect(this); };
+    Range.prototype.getClientRects = function () {
+      const r = computeRangeRect(this);
+      return Object.assign([r], { item: (idx: number) => (idx === 0 ? r : null) }) as unknown as DOMRectList;
+    };
+
+    try {
+      const searchInput = host.querySelector<HTMLInputElement>('input[aria-label="Find in note"]')!;
+      act(() => setInputValue(searchInput, "DeepToken"));
+      await act(async () => { await new Promise((resolve) => requestAnimationFrame(() => resolve(undefined))); });
+
+      const nextBtn = host.querySelector<HTMLButtonElement>('button[aria-label="Next match"]')!;
+      act(() => nextBtn.click());
+      expect(host.querySelector("output")?.textContent).toBe("1 / 1");
+
+      // Line 115 sits at document y = 100 + 2300 = 2400px; precise Range scroll brings it into [100, 584], not element center (1300px).
+      const deepRectY = 100 + getClearance() + 115 * 20 - scroller.scrollTop;
+      expect(deepRectY).toBeGreaterThanOrEqual(12 + barHeight + 12);
+      expect(deepRectY + 20).toBeLessThanOrEqual(600 - 16);
+
+      // Now search TopToken at the very top of the note (y = 24px < searchBar.bottom = 88px).
+      act(() => setInputValue(searchInput, "TopToken"));
+      await act(async () => { await new Promise((resolve) => requestAnimationFrame(() => resolve(undefined))); });
+      act(() => nextBtn.click());
+      expect(host.querySelector("output")?.textContent).toBe("1 / 2");
+
+      const topMatchY = 24 + getClearance() - scroller.scrollTop;
+      expect(topMatchY).toBeGreaterThanOrEqual(12 + barHeight + 12);
+
+      // Expanding Replace increases .reading-search height and keeps the selected top match unobstructed.
+      barHeight = 148;
+      const replaceToggle = host.querySelector<HTMLButtonElement>('button[aria-label="Replace in source"]')!;
+      act(() => replaceToggle.click());
+      const expandedTopMatchY = 24 + getClearance() - scroller.scrollTop;
+      expect(expandedTopMatchY).toBeGreaterThanOrEqual(12 + barHeight + 12);
+
+      // Unmounting ReadingSearch removes temporary top clearance cleanly.
+      act(() => root.unmount());
+      expect(scroller.style.paddingTop).toBe("");
+    } finally {
+      Range.prototype.getClientRects = origGetClientRects;
+      Range.prototype.getBoundingClientRect = origGetBoundingRect;
+      host.remove();
+    }
+  });
 });

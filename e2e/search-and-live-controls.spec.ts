@@ -344,3 +344,112 @@ test("Desktop workspace (App.tsx) hides Replace in Read view, wraps Previous 0/N
   await imgBlock.getByRole("button", { name: "Edit block" }).click();
   await expect(page.getByRole("textbox", { name: "Edit Markdown block" })).toHaveValue(`![Chart figure](${tinyPng})`);
 });
+
+test("Precise selected matches remain visible below the floating in-note search bar across top lines, tall blocks, Replace drawer, and Source/Split modes", async ({ page }) => {
+  await page.setViewportSize({ width: 960, height: 540 });
+  const tallCodeLines = Array.from({ length: 95 }, (_, idx) => {
+    if (idx === 1) return `const earlyMatch = "OrbitBeacon";`;
+    if (idx === 92) return `const lateMatch = "OrbitBeacon";`;
+    return `const fillerLine${idx} = ${idx * 10};`;
+  }).join("\n");
+  const note = [
+    "# OrbitBeacon Top Heading",
+    "",
+    "Lead paragraph right beneath the top heading.",
+    "",
+    "```ts\n" + tallCodeLines + "\n```",
+    "",
+    ...Array.from({ length: 16 }, (_, idx) => `Trailing section ${idx + 1} keeping plenty of scroll range below the tall code block.`),
+  ].join("\n\n");
+
+  await page.addInitScript(() => {
+    window.SuperMD = { post: () => {} };
+  });
+  await page.goto("/android-reader.html");
+  await page.waitForFunction(() => typeof window.supermdLoad === "function");
+  await page.evaluate(
+    (content) =>
+      window.supermdLoad?.({
+        id: "search-visibility-e2e",
+        content,
+        path: null,
+        mode: "live",
+        dark: false,
+        fullscreen: false,
+        colors: {},
+        font: "Manrope",
+        size: 18,
+        zoom: 100,
+      }),
+    note,
+  );
+  await page.evaluate(() => window.supermdFind?.("OrbitBeacon", { caseSensitive: true }));
+
+  const assertCurrentRangeUnobstructed = async () => {
+    const metrics = await page.evaluate(() => {
+      const bar = document.querySelector<HTMLElement>(".reading-search")!.getBoundingClientRect();
+      const scroller = document.querySelector<HTMLElement>(".android-reading")!.getBoundingClientRect();
+      const highlight = (CSS as any).highlights?.get("smd-search-current");
+      const ranges: Range[] = highlight ? Array.from(highlight) : [];
+      const rect = ranges[0]?.getBoundingClientRect();
+      return rect
+        ? {
+            barBottom: bar.bottom,
+            scrollerBottom: scroller.bottom,
+            matchTop: rect.top,
+            matchBottom: rect.bottom,
+            text: ranges[0].toString(),
+          }
+        : null;
+    });
+    expect(metrics).not.toBeNull();
+    expect(metrics!.text).toBe("OrbitBeacon");
+    expect(metrics!.matchTop).toBeGreaterThanOrEqual(metrics!.barBottom + 4);
+    expect(metrics!.matchBottom).toBeLessThanOrEqual(metrics!.scrollerBottom - 4);
+  };
+
+  // Match 1 / 3: Heading on line 1 stays cleanly below .reading-search, including after opening Replace.
+  await expect(page.locator(".reading-search output")).toHaveText("1 / 3");
+  await assertCurrentRangeUnobstructed();
+
+  await page.getByRole("button", { name: "Replace in source" }).click();
+  await expect(page.locator(".search-replace")).toBeVisible();
+  await assertCurrentRangeUnobstructed();
+
+  // Match 2 / 3 (top of 95-line code block) and Match 3 / 3 (bottom of 95-line code block) both scroll precise Range into unobstructed band.
+  await page.getByRole("button", { name: "Next match" }).click();
+  await expect(page.locator(".reading-search output")).toHaveText("2 / 3");
+  await assertCurrentRangeUnobstructed();
+
+  await page.getByRole("button", { name: "Next match" }).click();
+  await expect(page.locator(".reading-search output")).toHaveText("3 / 3");
+  await assertCurrentRangeUnobstructed();
+
+  // Split mode: both CodeMirror (.cm-scroller) and rendered preview (.android-reading) keep line 1 match below .reading-search.
+  await page.evaluate(
+    (content) =>
+      window.supermdLoad?.({
+        id: "search-visibility-e2e",
+        content,
+        path: null,
+        mode: "split",
+        dark: false,
+        fullscreen: false,
+        colors: {},
+        font: "Manrope",
+        size: 18,
+        zoom: 100,
+      }),
+    note,
+  );
+  await page.evaluate(() => window.supermdFind?.("OrbitBeacon", { caseSensitive: true }));
+  await expect(page.locator(".reading-search output")).toHaveText("1 / 3");
+  const splitMetrics = await page.evaluate(() => {
+    const bar = document.querySelector<HTMLElement>(".reading-search")!.getBoundingClientRect();
+    const cmSel = document.querySelector<HTMLElement>(".cm-selectionBackground,.cm-activeLine")!.getBoundingClientRect();
+    const cmScroller = document.querySelector<HTMLElement>(".cm-scroller")!.getBoundingClientRect();
+    return { barBottom: bar.bottom, cmTop: cmSel.top, cmBottom: cmSel.bottom, scrollerBottom: cmScroller.bottom };
+  });
+  expect(splitMetrics.cmTop).toBeGreaterThanOrEqual(splitMetrics.barBottom + 4);
+  expect(splitMetrics.cmBottom).toBeLessThanOrEqual(splitMetrics.scrollerBottom - 4);
+});

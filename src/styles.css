@@ -212,7 +212,7 @@ smd-expressive-button.primary-action { display: block; width: 100%; margin-top: 
 .zoom-controls { gap: 1px; padding: 2px; border-radius: 999px; background: var(--surface-low); }
 .zoom-controls button { min-width: 26px; height: 25px; display: grid; place-items: center; padding: 3px; border-radius: 7px; color: var(--muted); font-size: .69rem; font-weight: 750; }
 .reading-scroll { min-height: 0; overflow: auto; overscroll-behavior: contain; scrollbar-width: thin; scrollbar-color: var(--outline) transparent; }
-.reading-scroll,.live-pane,.android-reading,.cm-scroller { overflow-anchor: none; }
+.reading-scroll,.live-pane,.android-reading,.cm-scroller { overflow-anchor: none; box-sizing: border-box; }
 .markdown-body [data-heading-key] { scroll-margin-top: 24px; }
 .link-thumbnail-preview { width: min(100%,360px); aspect-ratio: 16/9; object-fit: contain; border-radius: 16px; background: var(--surface-low); }
 .image-viewer { position: fixed; inset: 0; z-index: 200; display: grid; grid-template-rows: auto minmax(0,1fr) auto; background: color-mix(in srgb,var(--surface) 96%,transparent); color: var(--text); }

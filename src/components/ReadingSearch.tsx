@@ -2,10 +2,10 @@ import { useEffect, useRef, useState } from "react";
 import { flushSync } from "react-dom";
 import { setReaderOverlay } from "../readerOverlays";
 import {ArrowUpIcon,ArrowDownIcon,XIcon,TextAaIcon,ArrowsClockwiseIcon} from "@phosphor-icons/react";
-import {editorFindQuery,editorFindRange} from "./Editor";
+import {editorFindQuery,editorFindRange,ensureEditorSearchRangeVisible} from "./Editor";
 import {windowedMatches,revealWindowed,type WindowedMatch} from "../windowedSearch";
 import {cancelHeadingNavigation} from '../documentNavigation';
-import {refreshDocumentExtent} from '../documentZoom';
+import {clearSearchTopClearances,scrollSearchMatchIntoView} from "../searchScroll";
 const cancelSettlingHeading = () => document.querySelectorAll(".android-reading,.reading-scroll,.live-pane").forEach(cancelHeadingNavigation);
 const findReadingHost = () => document.querySelector<HTMLElement>(".android-reading,.reading-scroll,.live-document,.markdown-body");
 type HighlightRegistry = Map<string, unknown>;
@@ -26,13 +26,6 @@ function revealMountedBlock(element: Element): void {
   if (!(element instanceof HTMLElement)) return;
   if (element.closest('[data-windowed-mounted="false"]')) flushSync(() => revealWindowed(element));
   else revealWindowed(element);
-}
-
-function scrollTargetIntoView(target: Element | null, host?: Element | null): void {
-  if (!target) return;
-  const scroller = target.closest<HTMLElement>(".android-reading,.reading-scroll") ?? (host?.matches(".android-reading,.reading-scroll") ? host as HTMLElement : host?.closest<HTMLElement>(".android-reading,.reading-scroll") ?? null);
-  if (scroller) refreshDocumentExtent(scroller);
-  target.scrollIntoView?.({ block: "center", behavior: "instant" });
 }
 
 function markdownBracketEnd(raw: string, openIndex = 0): number {
@@ -415,6 +408,7 @@ export default function ReadingSearch({ content, close, onChange, sourceSession,
   }
   const sourceSearch = !!sourceSession || activeReplacing;
   const count = sourceSearch ? sourceRanges.length : windowed?.length ?? matches.length;
+  const asideRef = useRef<HTMLElement>(null);
   const input = useRef<HTMLInputElement>(null);
   const closeRef = useRef(close); closeRef.current = close;
   const pendingReplaceIndex = useRef<number | null>(null);
@@ -478,7 +472,7 @@ export default function ReadingSearch({ content, close, onChange, sourceSession,
       registry?.delete("smd-search-current");
       if (scroll) {
         const fallback = host.querySelector("[data-frontmatter-properties],.document-properties") ?? resolveSourceBlock(host, range, sourceText);
-        scrollTargetIntoView(fallback, host);
+        scrollSearchMatchIntoView({ target: fallback, host });
       }
       return;
     }
@@ -491,7 +485,9 @@ export default function ReadingSearch({ content, close, onChange, sourceSession,
     if (scroll) {
       openDisclosuresFor(owner, block, domRange, range);
       const scrollEl = domRange ? (domRange.startContainer.nodeType === Node.ELEMENT_NODE ? domRange.startContainer as Element : domRange.startContainer.parentElement) : owner;
-      scrollTargetIntoView(scrollEl ?? block, host);
+      const bounds = !domRange ? sourceBounds(owner, sourceText) : null;
+      const proportionalOffset = bounds && bounds.end > bounds.start ? (range.from - bounds.start) / (bounds.end - bounds.start) : undefined;
+      scrollSearchMatchIntoView({ range: domRange, target: scrollEl ?? block, host, proportionalOffset });
     }
     if (registry && HighlightClass) {
       if (wasUnmounted || scroll) registry.set("smd-search", new HighlightClass(...readingMatches(host, query, caseSensitive)));
@@ -508,7 +504,7 @@ export default function ReadingSearch({ content, close, onChange, sourceSession,
     let range = readingMatches(match.element, query, caseSensitive)[match.ordinal] ?? null;
     if (openDisclosuresFor(match.element, match.element, range)) range = readingMatches(match.element, query, caseSensitive)[match.ordinal] ?? null;
     const scrollEl = range ? (range.startContainer.nodeType === Node.ELEMENT_NODE ? range.startContainer as Element : range.startContainer.parentElement) : match.element;
-    scrollTargetIntoView(scrollEl ?? match.element, host);
+    scrollSearchMatchIntoView({ range, target: scrollEl ?? match.element, host });
     updateIndex(next);
     if (registry && HighlightClass) {
       registry.set("smd-search", new HighlightClass(...readingMatches(host ?? match.element, query, caseSensitive)));
@@ -520,7 +516,7 @@ export default function ReadingSearch({ content, close, onChange, sourceSession,
       const liveRange = readingMatches(match.element, query, caseSensitive)[match.ordinal] ?? null;
       openDisclosuresFor(match.element, match.element, liveRange);
       const liveScrollEl = liveRange ? (liveRange.startContainer.nodeType === Node.ELEMENT_NODE ? liveRange.startContainer as Element : liveRange.startContainer.parentElement) : match.element;
-      scrollTargetIntoView(liveScrollEl ?? match.element, liveHost);
+      scrollSearchMatchIntoView({ range: liveRange, target: liveScrollEl ?? match.element, host: liveHost });
       if (registry && HighlightClass) {
         registry.set("smd-search", new HighlightClass(...readingMatches(liveHost ?? match.element, query, caseSensitive)));
         registry.delete("smd-search-current");
@@ -534,7 +530,7 @@ export default function ReadingSearch({ content, close, onChange, sourceSession,
     if (!range) return;
     const element = range.startContainer.nodeType === Node.ELEMENT_NODE ? range.startContainer as Element : range.startContainer.parentElement;
     openDisclosuresFor(element, element?.closest(".code-container,details") ?? element, range);
-    scrollTargetIntoView(element, host);
+    scrollSearchMatchIntoView({ range, target: element, host });
     updateIndex(next);
     if (registry && HighlightClass) {
       registry.delete("smd-search-current");
@@ -665,7 +661,7 @@ export default function ReadingSearch({ content, close, onChange, sourceSession,
     };
     document.addEventListener("keydown", key, true);
     window.addEventListener("supermd-find-focus", focus);
-    return () => { setReaderOverlay("search", false); document.removeEventListener("keydown", key, true); window.removeEventListener("supermd-find-focus", focus); };
+    return () => { clearSearchTopClearances(); setReaderOverlay("search", false); document.removeEventListener("keydown", key, true); window.removeEventListener("supermd-find-focus", focus); };
   }, []);
 
   useEffect(() => {
@@ -787,7 +783,56 @@ export default function ReadingSearch({ content, close, onChange, sourceSession,
     return () => { cancelAnimationFrame(frame); host.removeEventListener("supermd-window-change", refresh); };
   }, [windowed, activeReplacing, sourceSession, sourceRanges, content, query, caseSensitive]);
 
-  return <aside className="reading-search" data-independent-zoom role="search" aria-label="Find in note">
+  const ensureSelectedMatchVisibleRef = useRef<() => void>(() => {});
+  ensureSelectedMatchVisibleRef.current = () => {
+    const active = indexRef.current;
+    if (active < 0) return;
+    if (sourceSearch) {
+      const sr = sourceRanges[active];
+      if (!sr) return;
+      if (sourceSession) ensureEditorSearchRangeVisible(sourceSession, sr.from, sr.to);
+      const host = findReadingHost();
+      if (!host) return;
+      const block = findContainingBlock(host, sr, content);
+      if (!block) return;
+      const owner = deepestSourceOwner(block, sr, content) ?? block;
+      const domRange = mapSourceRangeToDomRange(block, content, sourceRanges, active, query, caseSensitive);
+      const scrollEl = domRange ? (domRange.startContainer.nodeType === Node.ELEMENT_NODE ? domRange.startContainer as Element : domRange.startContainer.parentElement) : owner;
+      const bounds = !domRange ? sourceBounds(owner, content) : null;
+      const proportionalOffset = bounds && bounds.end > bounds.start ? (sr.from - bounds.start) / (bounds.end - bounds.start) : undefined;
+      scrollSearchMatchIntoView({ range: domRange, target: scrollEl ?? block, host, proportionalOffset, mode: "ensure-visible" });
+      return;
+    }
+    const host = findReadingHost();
+    if (windowed) {
+      const match = windowed[active];
+      if (!match || match.element.closest('[data-windowed-mounted="false"]')) return;
+      const domRange = readingMatches(match.element, query, caseSensitive)[match.ordinal] ?? null;
+      scrollSearchMatchIntoView({ range: domRange, target: match.element, host, mode: "ensure-visible" });
+      return;
+    }
+    const domRange = matches[active];
+    if (domRange) scrollSearchMatchIntoView({ range: domRange, host, mode: "ensure-visible" });
+  };
+
+  useEffect(() => {
+    ensureSelectedMatchVisibleRef.current();
+  }, [activeReplacing]);
+
+  useEffect(() => {
+    const bar = asideRef.current;
+    if (!bar || typeof ResizeObserver === "undefined") return;
+    let prevHeight = bar.getBoundingClientRect().height;
+    const observer = new ResizeObserver(() => {
+      const nextHeight = bar.getBoundingClientRect().height;
+      if (nextHeight > prevHeight + 0.5) ensureSelectedMatchVisibleRef.current();
+      prevHeight = nextHeight;
+    });
+    observer.observe(bar);
+    return () => observer.disconnect();
+  }, []);
+
+  return <aside ref={asideRef} className="reading-search" data-independent-zoom role="search" aria-label="Find in note">
     <input ref={input} aria-label="Find in note" role="searchbox" type="text" inputMode="search" autoCapitalize="none" autoCorrect="off" spellCheck={false} placeholder="Find in this note" value={query} onChange={event => setQuery(event.target.value)} onKeyDown={event => { if (event.key === "Enter") { event.preventDefault(); move(event.shiftKey ? -1 : 1); } }} />
     <output aria-live="polite" title={count >= 5000 ? "Showing the first 5,000 matches. Narrow your search to find later results." : undefined}>{count ? `${index < 0 ? 0 : index + 1} / ${count}${count >= 5000 ? "+" : ""}` : query ? "No matches" : ""}</output>
     <button className="search-icon" aria-label="Previous match" disabled={!count} onClick={() => move(-1)} title="Previous match (Shift+Enter)"><ArrowUpIcon size={20} weight="bold" /></button>
