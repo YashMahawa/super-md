@@ -42,7 +42,7 @@ import MathRepairPanel from "./components/MathRepairPanel";
 import ThemeGuideDialog from "./components/ThemeGuideDialog";
 import { captureScrollAnchor,markScrollInput,scrollInputVersion } from "./scrollAnchor";
 import {rememberWindowedScrollSource} from './windowedSearch';
-import ReadingSearch from "./components/ReadingSearch";
+import ReadingSearch, { type ReadingSearchSeed } from "./components/ReadingSearch";
 import type { Point } from "./focalZoom";
 import { applyDocumentZoom,documentPoint,invalidateDocumentZoom,settleDocumentZoom,refreshDocumentExtent,enforceDocumentCenter } from "./documentZoom";
 import { documentOutline, navigateToHeading, cancelHeadingNavigation, resolveHeadingOffset } from "./documentNavigation";
@@ -70,12 +70,12 @@ interface PdfExportStatus {id:string;phase:'preparing'|'typesetting'|'publishing
 interface NoteView { editor?: PortableEditorSession; history?:NoteHistory; top?: number; rendered?: ReturnType<typeof exportRenderedViews> }
 interface ReaderState extends ReaderAccessibilityPreference { id: string; content: string; path: string | null; mode: "live" | "editor" | "reader" | "split"; dark: boolean; fullscreen: boolean; font: string; size: number; editProtocol?: number; latexAutofix?:boolean; typewriterScroll?:boolean; spellCheck?:boolean; grammarCheck?:boolean; width?: number; widthPercent?:number; lineHeight?:number; colors: Record<string, string>; zoom: number; motion?: boolean; python?: string; viewState?: NoteView }
 declare global { interface Window {supermdAgentRequest?:(request:Record<string,unknown>,callback?:(result:unknown,error:string)=>void)=>void;supermdAgentCompute?:(request:Record<string,unknown>,callback:(result:unknown,error:string)=>void)=>void;supermdThemeGuide?:()=>void;supermdDismiss?:()=>boolean;supermdSetZoom?:(zoom:number,requestedAt?:number)=>void;supermdHeading?:(id:string,offset?:number)=>void;supermdHistory?:(direction:"undo"|"redo")=>void;supermdNativeWheel?:(dx:number,dy:number,point:Point,held:boolean,modifier?:boolean)=>void;supermdToggleTypewriter?:()=>void;} }
-declare global { interface Window { supermdLoad?: (state: Omit<ReaderState, "pendingHeading"> & { pendingHeading?: PendingHeadingNavigation | string | null }) => void; supermdExport?: (options: ExportOptions) => void; supermdExportMarkdown?: (archive?: boolean) => void; supermdFind?: () => void; supermdPortable?: (save: boolean) => void; supermdZoomBy?: (factor:number,focus?:Point)=>void; supermdResetZoom?: ()=>void; supermdRepairMath?: ()=>void; supermdFlush?: (operation:Record<string,string>)=>void } }
+declare global { interface Window { supermdLoad?: (state: Omit<ReaderState, "pendingHeading"> & { pendingHeading?: PendingHeadingNavigation | string | null }) => void; supermdExport?: (options: ExportOptions) => void; supermdExportMarkdown?: (archive?: boolean) => void; supermdFind?: (initialQuery?: string, options?: { caseSensitive?: boolean }) => void; supermdPortable?: (save: boolean) => void; supermdZoomBy?: (factor:number,focus?:Point)=>void; supermdResetZoom?: ()=>void; supermdRepairMath?: ()=>void; supermdFlush?: (operation:Record<string,string>)=>void } }
 declare global { interface Window {supermdChromeInset?:(height:number)=>void} }
 declare global { interface Window {supermdSavePosition?:()=>void;supermdBeforeNavigate?:()=>Promise<void>} }
 declare global {interface Window {supermdExportPhase?:(id:string,phase:'typesetting'|'publishing')=>void}}
 interface PendingHeadingNavigation { heading: string; token: string }
-interface ReaderState { centerLock?:boolean; customStyle?:CustomStyle; restorePosition?:boolean; readingLocation?:ReadingLocation|null; pendingHeading?:PendingHeadingNavigation|null; imageAppearance?:MediaAppearance; svgAppearance?:MediaAppearance; imageContrast?:number }
+interface ReaderState { centerLock?:boolean; customStyle?:CustomStyle; restorePosition?:boolean; readingLocation?:ReadingLocation|null; pendingHeading?:PendingHeadingNavigation|null; imageAppearance?:MediaAppearance; svgAppearance?:MediaAppearance; imageContrast?:number; seededFind?:{query:string;caseSensitive?:boolean}|null }
 type AgentDocumentBase={tabId:string;revision:string;sourceLength:number};
 type AgentDiagramOptions={documentPath?:string|null;python?:string};
 function resolveAgentDiagram(content:string,revision:string,request:Record<string,unknown>,diagramOptions?:AgentDiagramOptions){
@@ -123,6 +123,8 @@ export function Reader() {
   const readerAnalysis=useMemo(()=>state?readerSourceAnalysis(state.mode,state.content):null,[state?.mode,state?.content]);
   const [repairing, setRepairing] = useState(false);
   const [searching,setSearching] = useState(false);
+  const [searchSeed,setSearchSeed] = useState<ReadingSearchSeed|null>(null);
+  const searchSeedNonce = useRef(0);
   const [pdfExport,setPdfExport]=useState<PdfExportStatus|null>(null);
   const exportOwner=useRef<{id:string;controller:AbortController;phase:PdfExportStatus['phase']}|null>(null);
   const cancelPdfExport=useCallback(async()=>{
@@ -221,7 +223,15 @@ export function Reader() {
     window.supermdLoad = (incoming) => {
       const old = reference.current;
       // Native omits content it received from this reader, unchanged since.
-      const {contentUnchanged,...rest}=incoming as ReaderState&{contentUnchanged?:boolean};
+      const {contentUnchanged,seededFind,...rest}=incoming as ReaderState&{contentUnchanged?:boolean};
+      const applyIncomingFind=()=>{
+        if(seededFind&&typeof seededFind.query==='string'){
+          searchSeedNonce.current+=1;
+          setSearchSeed({query:seededFind.query.slice(0,200),caseSensitive:seededFind.caseSensitive,nonce:searchSeedNonce.current});
+          setSearching(true);
+          requestAnimationFrame(()=>window.dispatchEvent(new Event("supermd-find-focus")));
+        }
+      };
       if(contentUnchanged&&(!old||old.id!==rest.id))return;
       const next=(contentUnchanged?{...rest,content:old!.content}:rest) as ReaderState;
       const rawPending=(rest as {pendingHeading?:PendingHeadingNavigation|string|null}).pendingHeading;
@@ -249,7 +259,7 @@ export function Reader() {
         const root=document.querySelector<HTMLElement>(".android-reading");
         modeOffset.current=old.mode==="editor"?(editorReadingOffset(old.id)??0):root?readingOffset(root):0;
       }
-      if(old&&[...new Set([...Object.keys(old),...Object.keys(next)])].every(key=>key==="zoom"&&old.fullscreen===next.fullscreen?true:key==="viewState"?!next.viewState:key==="colors"||key==="customStyle"||key==="pendingHeading"?JSON.stringify((old as any)[key])===JSON.stringify((next as any)[key]):(old as any)[key]===(next as any)[key]))return;
+      if(old&&[...new Set([...Object.keys(old),...Object.keys(next)])].every(key=>key==="zoom"&&old.fullscreen===next.fullscreen?true:key==="viewState"?!next.viewState:key==="colors"||key==="customStyle"||key==="pendingHeading"?JSON.stringify((old as any)[key])===JSON.stringify((next as any)[key]):(old as any)[key]===(next as any)[key])){applyIncomingFind();return;}
       if (old && old.id !== next.id) {
         savePosition.current();
         noteViews.current.set(old.id, {top: document.querySelector<HTMLElement>(".android-reading")?.scrollTop ?? 0});
@@ -281,7 +291,7 @@ export function Reader() {
       if(old && !sameViewport){window.clearTimeout(zoomTimer.current);cancelAnimationFrame(zoomFrame.current);zoomFrame.current=0;zoomTarget.current=null;}
       const hasNewPendingHeading = Boolean(next.pendingHeading?.token && next.pendingHeading.token !== old?.pendingHeading?.token);
       if (hasNewPendingHeading) modeOffset.current = null;
-      const load = () => { if (typeof loaded.typewriterScroll === "boolean") setTypewriterScroll(loaded.typewriterScroll, { persist: false }); reference.current=loaded;setState(loaded); zoomReference.current = loaded.zoom; };
+      const load = () => { if (typeof loaded.typewriterScroll === "boolean") setTypewriterScroll(loaded.typewriterScroll, { persist: false }); reference.current=loaded;setState(loaded); zoomReference.current = loaded.zoom; applyIncomingFind(); };
       const typewriterChanged = Boolean(old?.typewriterScroll) !== Boolean(loaded.typewriterScroll);
       if (old?.id === next.id && old.mode === next.mode && !hasNewPendingHeading && !typewriterChanged) anchored(load); else load();
     };
@@ -369,7 +379,17 @@ export function Reader() {
         await invoke("document_flushed",{id:current.id,content:latest?.id===current.id?latest.content:current.content,operation,viewId:id,viewState:view});
       })().catch(error=>setEditError(String(error)));
     };
-    window.supermdFind = () => {if(document.querySelector('.theme-guide-dialog'))return;flushSync(()=>setSearching(true));window.dispatchEvent(new Event("supermd-find-focus"));};
+    window.supermdFind = (initialQuery, options) => {
+      if(document.querySelector('.theme-guide-dialog'))return;
+      flushSync(()=>{
+        if(typeof initialQuery==='string'){
+          searchSeedNonce.current+=1;
+          setSearchSeed({query:initialQuery.slice(0,200),caseSensitive:options?.caseSensitive,nonce:searchSeedNonce.current});
+        }
+        setSearching(true);
+      });
+      window.dispatchEvent(new Event("supermd-find-focus"));
+    };
     const flushExportNote = async (current: ReaderState) => {
       if (current.editProtocol === 1) await edits.current!.flush(current.id);
       const latest = reference.current;
@@ -1054,7 +1074,7 @@ export function Reader() {
     </section></div>}
     {editError&&<div role="alert" className="reader-edit-error">{editError}</div>}
     <MediaThemeFilters colors={state.colors} dark={state.dark}/>
-    {searching && <ReadingSearch content={state.content} close={()=>setSearching(false)} onChange={update} sourceSession={state.mode==="editor"||state.mode==="split"?state.id:undefined}/>}
+    {searching && <ReadingSearch content={state.content} close={()=>{setSearching(false);setSearchSeed(null);}} onChange={update} sourceSession={state.mode==="editor"||state.mode==="split"?state.id:undefined} seed={searchSeed}/>}
     <ImageViewer />
     {repairing && <MathRepairPanel content={state.content} apply={update} close={()=>setRepairing(false)} />}
     <MediaTools key={state.id} documentId={state.id} content={state.content} documentPath={state.path} onInsert={(text, point) => { const content = reference.current!.content; const from = Math.min(point?.from ?? content.length, content.length); const to = Math.max(from, Math.min(point?.to ?? from, content.length)); update(content.slice(0, from) + text + content.slice(to)); }} onNotice={(error) => { void invoke("export_failed", { error }); }} />
