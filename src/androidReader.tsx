@@ -21,12 +21,12 @@ import "./styles.css";
 import "./androidReader.css";
 import "./customTheme.css";
 import { isBuiltinReaderFont, resolveReaderFontStack } from "./readerFonts";
-import Editor, { editorReadingOffset, editorSelectedText, editorViewContext, editorHistory, exportEditorSession, importEditorSession, type PortableEditorSession } from "./components/Editor";
+import Editor, { editorReadingOffset, editorSelectedText, editorViewContext, editorHistory, exportEditorSession, formatEditorSession, importEditorSession, type PortableEditorSession } from "./components/Editor";
 import { extractSelectedText } from "./copySource";
 import {readingOffset,revealReadingOffset} from "./readingPosition";
 import { exportRenderedViews, importRenderedViews, inspectCachedPythonOutput, safePythonFigure } from "./renderedOutputs";
 import { analyzeDocument } from "./documentAnalysis";
-import LiveEditor from "./components/LiveEditor";
+import LiveEditor, { formatActiveLiveBlock, replayActiveLiveBlockHistory } from "./components/LiveEditor";
 import MarkdownPreview from "./components/MarkdownPreview";
 import { invoke } from "./nativeBridge";
 import {ReaderEdits,type SourceChange} from './readerEdits';
@@ -34,7 +34,7 @@ import { preparePdf } from "./preparePdf";
 import type { ExportOptions,ReaderAccessibilityPreference } from "./types";
 import { clampPreviewZoom } from "./zoom";
 import MediaTools from "./components/MediaTools";
-import { dismissReaderOverlay } from "./readerOverlays";
+import { dismissReaderOverlay, hasReaderOverlay } from "./readerOverlays";
 import { prepareFmd } from "./documentMedia";
 import { prepareMarkdownExport } from "./markdownExport";
 import ImageViewer from "./components/ImageViewer";
@@ -69,7 +69,7 @@ interface PdfExportStatus {id:string;phase:'preparing'|'typesetting'|'publishing
 
 interface NoteView { editor?: PortableEditorSession; history?:NoteHistory; top?: number; rendered?: ReturnType<typeof exportRenderedViews> }
 interface ReaderState extends ReaderAccessibilityPreference { id: string; content: string; path: string | null; mode: "live" | "editor" | "reader" | "split"; dark: boolean; fullscreen: boolean; font: string; size: number; editProtocol?: number; latexAutofix?:boolean; typewriterScroll?:boolean; spellCheck?:boolean; grammarCheck?:boolean; width?: number; widthPercent?:number; lineHeight?:number; colors: Record<string, string>; zoom: number; motion?: boolean; python?: string; viewState?: NoteView }
-declare global { interface Window {supermdAgentRequest?:(request:Record<string,unknown>,callback?:(result:unknown,error:string)=>void)=>void;supermdAgentCompute?:(request:Record<string,unknown>,callback:(result:unknown,error:string)=>void)=>void;supermdThemeGuide?:()=>void;supermdDismiss?:()=>boolean;supermdSetZoom?:(zoom:number,requestedAt?:number)=>void;supermdHeading?:(id:string,offset?:number)=>void;supermdHistory?:(direction:"undo"|"redo")=>void;supermdNativeWheel?:(dx:number,dy:number,point:Point,held:boolean,modifier?:boolean)=>void;supermdToggleTypewriter?:()=>void;} }
+declare global { interface Window {supermdAgentRequest?:(request:Record<string,unknown>,callback?:(result:unknown,error:string)=>void)=>void;supermdAgentCompute?:(request:Record<string,unknown>,callback:(result:unknown,error:string)=>void)=>void;supermdThemeGuide?:()=>void;supermdDismiss?:()=>boolean;supermdSetZoom?:(zoom:number,requestedAt?:number)=>void;supermdHeading?:(id:string,offset?:number)=>void;supermdHistory?:(direction:"undo"|"redo")=>void;supermdFormat?:(action:string)=>boolean;supermdNativeWheel?:(dx:number,dy:number,point:Point,held:boolean,modifier?:boolean)=>void;supermdToggleTypewriter?:()=>void;} }
 declare global { interface Window { supermdLoad?: (state: Omit<ReaderState, "pendingHeading"> & { pendingHeading?: PendingHeadingNavigation | string | null }) => void; supermdExport?: (options: ExportOptions) => void; supermdExportMarkdown?: (archive?: boolean) => void; supermdFind?: (initialQuery?: string, options?: { caseSensitive?: boolean }) => void; supermdPortable?: (save: boolean) => void; supermdZoomBy?: (factor:number,focus?:Point)=>void; supermdResetZoom?: ()=>void; supermdRepairMath?: ()=>void; supermdFlush?: (operation:Record<string,string>)=>void } }
 declare global { interface Window {supermdChromeInset?:(height:number)=>void} }
 declare global { interface Window {supermdSavePosition?:()=>void;supermdBeforeNavigate?:()=>Promise<void>} }
@@ -297,7 +297,20 @@ export function Reader() {
     };
     window.supermdHistory=direction=>{
       if(document.querySelector('.theme-guide-dialog'))return;
-      if(isTextEntryField(document.activeElement)){document.execCommand(direction);return;}
+      const active=document.activeElement;
+      if(active instanceof HTMLTextAreaElement && active.closest('.live-active-block')){
+        const current=reference.current;
+        const previousContent=current?.content;
+        replaying.current=true;
+        const applied=replayActiveLiveBlockHistory(direction);
+        if(applied&&current&&previousContent!==undefined){
+          const history=histories.current.get(current.id);
+          if(history)replayHistory(history,previousContent,direction);
+        }
+        replaying.current=false;
+        if(applied)return;
+      }
+      if(isTextEntryField(active)){document.execCommand(direction);return;}
       const current=reference.current;if(!current)return;
       replaying.current=true;
       const history=histories.current.get(current.id);const next=history?replayHistory(history,current.content,direction):undefined;
@@ -305,6 +318,15 @@ export function Reader() {
       else if(current.mode==="editor"||current.mode==="split")editorHistory(current.id,direction);
       else {const cached=cachedEditorHistory(current.id,direction,current.content);if(cached!==undefined)update(cached);}
       replaying.current=false;
+    };
+    window.supermdFormat=action=>{
+      if(hasReaderOverlay())return false;
+      const active=document.activeElement;
+      if(active instanceof HTMLElement&&active.closest('.cm-panels,.cm-search'))return false;
+      const current=reference.current;if(!current||current.mode==="reader")return false;
+      if(current.mode==="live")return formatActiveLiveBlock(action);
+      if(current.mode==="editor"||current.mode==="split")return formatEditorSession(current.id,action);
+      return false;
     };
     window.supermdZoomBy = (factor,focus=cursor.current) => {
       zoomGestureAt.current=Date.now();
@@ -429,7 +451,7 @@ export function Reader() {
       catch (error) { await invoke("export_failed", {error: String(error)}); }
     };
     void invoke("reader_ready");
-    return () => {nativeScroll.clear();cancelAnimationFrame(zoomFrame.current);window.clearTimeout(zoomTimer.current);delete window.supermdSelectedText;delete window.supermdThemeGuide;delete window.supermdSavePosition;delete window.supermdBeforeNavigate;delete window.supermdChromeInset;delete window.supermdLoad; delete window.supermdExport; delete window.supermdExportMarkdown; delete window.supermdPortable; delete window.supermdZoomBy; delete window.supermdResetZoom; delete window.supermdRepairMath; delete window.supermdToggleTypewriter; delete window.supermdFlush; delete window.supermdSetZoom; delete window.supermdHeading; };
+    return () => {nativeScroll.clear();cancelAnimationFrame(zoomFrame.current);window.clearTimeout(zoomTimer.current);delete window.supermdSelectedText;delete window.supermdThemeGuide;delete window.supermdSavePosition;delete window.supermdBeforeNavigate;delete window.supermdChromeInset;delete window.supermdLoad; delete window.supermdExport; delete window.supermdExportMarkdown; delete window.supermdPortable; delete window.supermdZoomBy; delete window.supermdResetZoom; delete window.supermdRepairMath; delete window.supermdToggleTypewriter; delete window.supermdFlush; delete window.supermdSetZoom; delete window.supermdHeading; delete window.supermdFormat; delete window.supermdHistory; delete window.supermdDismiss; delete window.supermdFind; };
   }, []);
   useEffect(()=>{
     if(!state)return;
@@ -629,6 +651,11 @@ export function Reader() {
       if(isTextEntryField(event.target))return;
       event.preventDefault();event.stopImmediatePropagation();window.supermdHistory?.(key==="y"||event.shiftKey?"redo":"undo");
     };
+    const historyBoundary=()=>{
+      const current=reference.current;if(!current)return;
+      const entry=histories.current.get(current.id);
+      if(entry)entry.last=0;
+    };
     const typewriterKey=(event:KeyboardEvent)=>{
       if(document.documentElement.dataset.host==='qt'||event.defaultPrevented)return;
       if(!isTypewriterShortcutEvent(event))return;
@@ -637,8 +664,34 @@ export function Reader() {
     document.addEventListener("keydown",find,true);
     document.addEventListener("keydown",history,true);
     document.addEventListener("keydown",typewriterKey);
-    return()=>{document.removeEventListener("keydown",find,true);document.removeEventListener("keydown",history,true);document.removeEventListener("keydown",typewriterKey);};
+    window.addEventListener("supermd-history-boundary",historyBoundary);
+    return()=>{document.removeEventListener("keydown",find,true);document.removeEventListener("keydown",history,true);document.removeEventListener("keydown",typewriterKey);window.removeEventListener("supermd-history-boundary",historyBoundary);};
   },[changeTypewriter]);
+  const editorFocusReported=useRef<boolean|null>(null);
+  const syncEditorFocus=useCallback(()=>{
+    const current=reference.current;
+    let focused=false;
+    if(current&&current.mode!=="reader"&&!hasReaderOverlay()){
+      const active=document.activeElement;
+      if(active instanceof HTMLElement&&!active.closest(".cm-panels,.cm-search")){
+        if(current.mode==="live")focused=active.matches(".live-active-block textarea");
+        else if(current.mode==="editor"||current.mode==="split")focused=!!active.closest(".cm-editor .cm-content");
+      }
+    }
+    if(editorFocusReported.current!==focused){
+      editorFocusReported.current=focused;
+      if(document.documentElement.dataset.host!=="qt")void invoke("editor_focus_changed",{focused}).catch(()=>{});
+    }
+  },[]);
+  useEffect(()=>{
+    let timer=0;
+    const onFocusIn=()=>{window.clearTimeout(timer);syncEditorFocus();};
+    const onFocusOut=()=>{window.clearTimeout(timer);timer=window.setTimeout(syncEditorFocus,0);};
+    document.addEventListener("focusin",onFocusIn,true);
+    document.addEventListener("focusout",onFocusOut,true);
+    return()=>{window.clearTimeout(timer);document.removeEventListener("focusin",onFocusIn,true);document.removeEventListener("focusout",onFocusOut,true);};
+  },[syncEditorFocus]);
+  useEffect(()=>{syncEditorFocus();},[state?.id,state?.mode,searching,repairing,themeGuide,syncEditorFocus]);
   useEffect(() => {
     let tap=0;
     const click=(event:MouseEvent)=>{
