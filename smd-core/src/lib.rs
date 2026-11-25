@@ -6,7 +6,9 @@ pub mod frontmatter;
 mod diagram;
 mod math_compatibility;
 mod step_grid;
+mod study;
 mod typesetter;
+pub use study::strip_percent_comments;
 #[doc(hidden)]
 pub use typesetter::{diagnostics, COMEMO_EVICT_MAX_AGE, CUSTOM_FONT_CACHE_MAX_BYTES, CUSTOM_FONT_CACHE_MAX_ENTRIES};
 pub(crate) use typesetter::{is_font_asset, validate_asset_path};
@@ -104,7 +106,7 @@ fn format_smd_image(key: &str, width: Option<&str>, zoom: Option<&str>) -> Strin
     }
 }
 
-fn strip_html_comments(input: &str) -> String {
+pub(crate) fn strip_html_comments(input: &str) -> String {
     let mut out = String::with_capacity(input.len());
     let mut rest = input;
     while let Some(start) = rest.find("<!--") {
@@ -160,15 +162,15 @@ fn decode_html_attr(value: &str) -> String {
     out
 }
 
-struct ScannedHtmlTag<'a> {
-    name: &'a str,
-    closing: bool,
-    end: usize,
+pub(crate) struct ScannedHtmlTag<'a> {
+    pub(crate) name: &'a str,
+    pub(crate) closing: bool,
+    pub(crate) end: usize,
     attrs: Vec<(&'a str, String)>,
 }
 
 impl<'a> ScannedHtmlTag<'a> {
-    fn attr(&self, attr_name: &str) -> Option<&str> {
+    pub(crate) fn attr(&self, attr_name: &str) -> Option<&str> {
         self.attrs
             .iter()
             .find(|(k, _)| k.eq_ignore_ascii_case(attr_name))
@@ -176,7 +178,7 @@ impl<'a> ScannedHtmlTag<'a> {
     }
 }
 
-fn scan_html_tag(input: &str, start: usize) -> Option<ScannedHtmlTag<'_>> {
+pub(crate) fn scan_html_tag(input: &str, start: usize) -> Option<ScannedHtmlTag<'_>> {
     let bytes = input.as_bytes();
     if bytes.get(start) != Some(&b'<') {
         return None;
@@ -326,7 +328,7 @@ fn css_prop(style: &str, prop_name: &str) -> Option<String> {
     found
 }
 
-fn is_page_break_div(raw_html: &str) -> bool {
+pub(crate) fn is_page_break_div(raw_html: &str) -> bool {
     for tag in scan_html_tags(raw_html, "div") {
         if let Some(style) = tag.attr("style") {
             for (prop, expected) in [
@@ -352,13 +354,13 @@ fn is_page_break_div(raw_html: &str) -> bool {
     false
 }
 
-struct HtmlImageSpec {
+pub(crate) struct HtmlImageSpec {
     src: String,
     width: Option<String>,
     zoom: Option<String>,
 }
 
-fn parse_html_images(raw_html: &str) -> Vec<HtmlImageSpec> {
+pub(crate) fn parse_html_images(raw_html: &str) -> Vec<HtmlImageSpec> {
     let mut out = Vec::new();
     for tag in scan_html_tags(raw_html, "img") {
         let Some(src) = tag.attr("src").map(str::trim).filter(|s| !s.is_empty()) else { continue };
@@ -576,9 +578,10 @@ fn normalize_obsidian_embeds(input: &str) -> String {
 
 pub fn image_sources(markdown: &str) -> Vec<String> {
     let body = frontmatter::strip_frontmatter(markdown);
-    let normalized = normalize_obsidian_embeds(&normalize_callouts_body(body));
+    let stripped = strip_percent_comments(body);
+    let normalized = normalize_obsidian_embeds(&normalize_callouts_body(&stripped));
     let mut sources = Vec::new();
-    let options = Options::ENABLE_TABLES | Options::ENABLE_FOOTNOTES | Options::ENABLE_STRIKETHROUGH | Options::ENABLE_TASKLISTS | Options::ENABLE_MATH;
+    let options = Options::ENABLE_TABLES | Options::ENABLE_FOOTNOTES | Options::ENABLE_STRIKETHROUGH | Options::ENABLE_SUBSCRIPT | Options::ENABLE_SUPERSCRIPT | Options::ENABLE_TASKLISTS | Options::ENABLE_MATH;
     let mut events = Parser::new_ext(&normalized, options);
     while let Some(event) = events.next() {
         match event {
@@ -709,6 +712,11 @@ fn heading_slug(value: &str) -> String {
     let slug = value.trim().chars().map(|c| if c.is_whitespace() { '-' } else { c }).collect::<String>();
     if slug.is_empty() { "section".into() } else { slug }
 }
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum RenderStop<'b> {
+    Tag(TagEnd),
+    Html(&'b str),
+}
 impl<'a> Renderer<'a> {
     fn render_html(&self, html: &str, is_block: bool, out: &mut String) -> Result<()> {
         let clean = strip_html_comments(html);
@@ -721,14 +729,21 @@ impl<'a> Renderer<'a> {
         } else if is_page_break_div(html) {
             out.push_str(if is_block { "\n#pagebreak()\n\n" } else { "#pagebreak()" });
         } else {
-            for img in parse_html_images(html) {
-                validate_asset_path(&img.src)?;
-                if is_font_asset(&img.src) || !self.assets.contains_key(&img.src) {
-                    bail!("Image unavailable for PDF: {}", img.src);
+            let imgs = parse_html_images(html);
+            if imgs.is_empty() {
+                if !clean.is_empty() {
+                    out.push_str(&text(&clean));
                 }
-                out.push_str(&format_smd_image(&img.src, img.width.as_deref(), img.zoom.as_deref()));
-                if is_block {
-                    out.push_str("\n\n");
+            } else {
+                for img in imgs {
+                    validate_asset_path(&img.src)?;
+                    if is_font_asset(&img.src) || !self.assets.contains_key(&img.src) {
+                        bail!("Image unavailable for PDF: {}", img.src);
+                    }
+                    out.push_str(&format_smd_image(&img.src, img.width.as_deref(), img.zoom.as_deref()));
+                    if is_block {
+                        out.push_str("\n\n");
+                    }
                 }
             }
         }
@@ -736,11 +751,15 @@ impl<'a> Renderer<'a> {
     }
 
     fn render(&mut self, end: Option<TagEnd>) -> Result<String> {
+        self.render_until(end.map(RenderStop::Tag))
+    }
+    fn render_until(&mut self, end: Option<RenderStop<'_>>) -> Result<String> {
         let mut out = String::new();
         while let Some(event) = self.events.next() {
             match event {
-                Event::End(tag) if Some(tag) == end => break,
+                Event::End(tag) if end == Some(RenderStop::Tag(tag)) => break,
                 Event::End(_) => {},
+                Event::InlineHtml(ref html) if end == Some(RenderStop::Html(html.as_ref())) => break,
                 Event::Text(value) => out.push_str(&text(&value)),
                 Event::Code(value) => out.push_str(&format!("#raw({})", string(&value))),
                 Event::InlineMath(ref value) | Event::DisplayMath(ref value) => {
@@ -754,8 +773,12 @@ impl<'a> Renderer<'a> {
                 Event::Rule => out.push_str("\n#line(length: 100%, stroke: .5pt + rgb(\"#d6dde5\"))\n"),
                 Event::TaskListMarker(checked) => out.push_str(if checked { "#text(\"☑ \u{a0}\")" } else { "#text(\"☐ \u{a0}\")" }),
                 Event::FootnoteReference(name) => out.push_str(&format!("#footnote[{}]", self.footnotes.get(name.as_ref()).cloned().unwrap_or_else(|| text(&name)))),
-                Event::Html(ref html) | Event::InlineHtml(ref html) => {
-                    self.render_html(html, matches!(&event, Event::Html(_)), &mut out)?;
+                Event::Html(ref html) | Event::InlineHtml(ref html) => match html.as_ref() {
+                    "<mark>" => out.push_str(&format!("#highlight(fill: smd-highlight, radius: 2pt, extent: 1pt)[{}]", self.render_until(Some(RenderStop::Html("</mark>")))?)),
+                    "<u>" => out.push_str(&format!("#underline[{}]", self.render_until(Some(RenderStop::Html("</u>")))?)),
+                    "<kbd>" => out.push_str(&format!("#box(fill: smd-code-fill, stroke: .5pt + smd-line, inset: (x: 3.5pt, y: 1pt), outset: (y: 1.5pt), radius: 2.5pt)[#text(font: (\"JetBrains Mono\", \"DejaVu Sans Mono\"), size: .86em)[{}]]", self.render_until(Some(RenderStop::Html("</kbd>")))?)),
+                    "</mark>" | "</u>" | "</kbd>" => {}
+                    _ => self.render_html(html, matches!(&event, Event::Html(_)), &mut out)?,
                 },
                 Event::Start(tag) => {
                     let close = tag.to_end();
@@ -896,6 +919,8 @@ impl<'a> Renderer<'a> {
                                 Tag::Emphasis => out.push_str(&format!("#emph[{body}]")),
                                 Tag::Strong => out.push_str(&format!("#strong[{body}]")),
                                 Tag::Strikethrough => out.push_str(&format!("#strike[{body}]")),
+                                Tag::Subscript => out.push_str(&format!("#sub[{body}]")),
+                                Tag::Superscript => out.push_str(&format!("#super[{body}]")),
                                 Tag::List(start) => out.push_str(&if let Some(start) = start { format!("\n#enum(start: {start}, {body})\n") } else { format!("\n#list({body})\n") }),
                                 Tag::Item => out.push_str(&format!("[{body}],\n")),
                                 Tag::Link { dest_url, .. } => out.push_str(&if let Some(fragment) = dest_url.strip_prefix('#') {
@@ -916,8 +941,9 @@ impl<'a> Renderer<'a> {
 
 pub(crate) fn render_fragment(markdown: &str, assets: &HashMap<String, Vec<u8>>) -> Result<String> {
     let body = frontmatter::strip_frontmatter(markdown);
-    let normalized = normalize_table_math(&normalize_obsidian_embeds(&normalize_callouts_body(body)));
-    let events = Parser::new_ext(&normalized, Options::ENABLE_TABLES | Options::ENABLE_STRIKETHROUGH | Options::ENABLE_MATH).collect::<Vec<_>>();
+    let stripped = strip_percent_comments(body);
+    let normalized = normalize_table_math(&normalize_obsidian_embeds(&normalize_callouts_body(&stripped)));
+    let events = study::enrich_events(&normalized, Options::ENABLE_TABLES | Options::ENABLE_STRIKETHROUGH | Options::ENABLE_SUBSCRIPT | Options::ENABLE_SUPERSCRIPT | Options::ENABLE_MATH);
     Renderer { events: events.into_iter().peekable(), assets, footnotes: HashMap::new(), headings: HashMap::new(), heading_counts: HashMap::new() }.render(None)
 }
 
@@ -927,8 +953,9 @@ pub fn source(markdown: &str, options: &PdfOptions, assets: &HashMap<String, Vec
         Some(fm) => (fm.metadata.typst_set_document(), &markdown[fm.end..]),
         None => (String::new(), markdown.strip_prefix('\u{feff}').unwrap_or(markdown)),
     };
-    let normalized = normalize_table_math(&normalize_obsidian_embeds(&normalize_callouts_body(raw_body)));
-    let events = Parser::new_ext(&normalized, Options::ENABLE_TABLES | Options::ENABLE_STRIKETHROUGH | Options::ENABLE_TASKLISTS | Options::ENABLE_MATH | Options::ENABLE_FOOTNOTES).collect::<Vec<_>>();
+    let stripped = strip_percent_comments(raw_body);
+    let normalized = normalize_table_math(&normalize_obsidian_embeds(&normalize_callouts_body(&stripped)));
+    let events = study::enrich_events(&normalized, Options::ENABLE_TABLES | Options::ENABLE_STRIKETHROUGH | Options::ENABLE_SUBSCRIPT | Options::ENABLE_SUPERSCRIPT | Options::ENABLE_TASKLISTS | Options::ENABLE_MATH | Options::ENABLE_FOOTNOTES);
     let mut headings = HashMap::new(); let mut current = None::<String>;
     for event in &events { match event {
         Event::Start(Tag::Heading { .. }) => current = Some(String::new()),
@@ -959,6 +986,7 @@ pub fn source(markdown: &str, options: &PdfOptions, assets: &HashMap<String, Vec
 #let smd-header-fill = if smd-themed {{ color.mix((white, 76%), (smd-accent, 24%)) }} else {{ rgb("#e7e7e7") }}
 #let smd-line = if smd-themed {{ color.mix((white, 55%), (smd-accent, 45%)) }} else {{ rgb("#d6d6d6") }}
 #let smd-link = if smd-themed {{ color.mix((rgb("#202020"), 45%), (smd-accent, 55%)) }} else {{ rgb("#315d99") }}
+#let smd-highlight = if smd-themed {{ color.mix((smd-paper, 58%), (rgb("#f6c945"), 42%)) }} else {{ rgb("#fff2a8") }}
 "##, string(accent));
     // Typst collapses paragraph spacing against leading. Add leading so the
     // export control specifies the visible gap instead of disappearing below it.
@@ -1441,7 +1469,6 @@ P(A\cup B\cup C)=&P(A)+P(B)+P(C)\\
         let pdf_bytes = export(md, &PdfOptions::default(), &HashMap::new()).unwrap();
         assert!(pdf_bytes.starts_with(b"%PDF-"));
     }
-
     #[test]
     fn frontmatter_omits_yaml_from_page_body_and_populates_pdf_properties() {
         let note = "\u{feff}---  \ntitle: \"Relativistic Quantum Theory\"\nauthor:\n  - Paul Dirac\n  - Emmy Noether\ndescription: \"Spinors, symmetries, and conservation laws\"\ntags: [spinors, symmetry]\ndate: 2026-03-15\n...  \n\n# Spinor Algebra\n\nBody text.\n";
@@ -1470,6 +1497,102 @@ P(A\cup B\cup C)=&P(A)+P(B)+P(C)\\
         ] {
             let bytes = export(fallback, &PdfOptions::default(), &HashMap::new()).unwrap();
             assert!(bytes.starts_with(b"%PDF-"));
+        }
+    }
+
+    #[test]
+    fn study_markdown_and_safe_html_typeset_and_preserve_code_math_and_security() {
+        let md = r#"<!-- SECRET_BLOCK_COMMENT
+spanning lines -->
+%%SECRET_OBSIDIAN_HEADER
+![ignored](missing-comment-image.png)%%
+
+# Study Notes H~2~O
+
+==Highlighted concept== with H~2~O, x^2^, ~~deprecated~~, %%SECRET_INLINE_COMMENT%%<!-- SECRET_INLINE_HTML --> and Press <kbd onclick="evil()">Ctrl</kbd>+<kbd>S</kbd>, <mark style="color:red">marked</mark>, <u>underlined</u>, CO<sub>2</sub>, 10<sup>-6</sup>.<br>Second line.
+
+\==Literal markup\=\= beside ==Active highlight==, \==Raw one==, \==Raw two==, \=\=Inline literal\=\=, \\==Slash highlight==, H\~2\~O and H\~2~O and \~lit\~ and \~rawsub~ beside ~sub~, x\^2\^ and x\^2^ and \^rawsup^ beside ^sup^, \%%KEPT_PERCENT\%%, and approx ~5 minutes to boil H~2~O.
+
+Spaced ~not sub~ and ^not sup^, comparison if a == b and c == d, escaped \==rawlit==, URL [https://example.edu/~alice/notes~1](https://example.edu/~alice/notes~1), unmatched <mark>rawmark, and inline <script>alert(1)</script>.
+
+<script>window.pwn = 1</script>
+
+| Concept | Detail |
+|---|---|
+| ==Cell mark== | Top<br/>Bottom |
+
+Inline code `H~2~O ==raw== ^2^ %%KEPT_INLINE_CODE%% <kbd>k</kbd>` and math $x^2 + y_1$:
+
+$$
+%% kept tex comment
+\int_0^1 x^2 dx = \frac{1}{3}
+$$
+
+```python
+%%timeit total = 1 + 1
+```
+"#;
+        assert!(image_sources(md).is_empty(), "Images inside %%...%% comments must be ignored");
+
+        let typst_src = source(md, &PdfOptions::default(), &HashMap::new()).unwrap();
+        assert!(typst_src.contains("#sub[#text(\"2\")]"), "Expected Typst #sub: {typst_src}");
+        assert!(typst_src.contains("#sub[#text(\"sub\")]"), "Expected ~sub~ -> #sub: {typst_src}");
+        assert!(!typst_src.contains("#sub[#text(\"lit\")]"), "Escaped \\~lit\\~ must not become #sub: {typst_src}");
+        assert!(!typst_src.contains("#sub[#text(\"rawsub\")]"), "Escaped \\~rawsub~ must not become #sub: {typst_src}");
+        assert!(typst_src.contains("#super[#text(\"2\")]"), "Expected Typst #super: {typst_src}");
+        assert!(typst_src.contains("#super[#text(\"sup\")]"), "Expected ^sup^ -> #super: {typst_src}");
+        assert!(!typst_src.contains("#super[#text(\"rawsup\")]"), "Escaped \\^rawsup^ must not become #super: {typst_src}");
+        assert!(typst_src.contains("#super[#text(\"-6\")]"), "Expected HTML <sup> -> #super: {typst_src}");
+        assert!(typst_src.contains("#highlight(fill: smd-highlight, radius: 2pt, extent: 1pt)[#text(\"Active highlight\")]"), "Expected unescaped highlight: {typst_src}");
+        assert!(typst_src.contains("#highlight(fill: smd-highlight, radius: 2pt, extent: 1pt)[#text(\"Slash highlight\")]"), "Expected highlight after escaped backslash: {typst_src}");
+        assert!(!typst_src.contains("[#text(\"Literal markup\")]"), "Escaped \\=\\=Literal markup\\=\\= must stay literal: {typst_src}");
+        assert!(!typst_src.contains("[#text(\"Raw one\")]") && !typst_src.contains(", =Raw two"), "Comma-separated \\==Raw one==, \\==Raw two== must not pair: {typst_src}");
+        assert!(!typst_src.contains("[#text(\"rawlit\")]"), "Escaped \\==rawlit== must stay literal: {typst_src}");
+        assert!(typst_src.contains("#underline[#text(\"underlined\")]"), "Expected Typst #underline: {typst_src}");
+        assert!(typst_src.contains("#box(fill: smd-code-fill"), "Expected Typst #box for <kbd>: {typst_src}");
+        assert!(typst_src.contains("#strike[#text(\"deprecated\")]"), "Expected Typst #strike for ~~...~~: {typst_src}");
+        assert!(typst_src.contains("#linebreak()"), "Expected Typst #linebreak() for <br>: {typst_src}");
+        assert!(typst_src.contains("#link(\"https://example.edu/~alice/notes~1\")[#text(\"https://example.edu/~alice/notes~1\")]"), "URL tildes must not become subscripts: {typst_src}");
+        assert!(!typst_src.contains("SECRET_BLOCK_COMMENT"));
+        assert!(!typst_src.contains("SECRET_OBSIDIAN_HEADER"));
+        assert!(!typst_src.contains("SECRET_INLINE_COMMENT"));
+        assert!(!typst_src.contains("SECRET_INLINE_HTML"));
+        assert!(!typst_src.contains("onclick"));
+        assert!(typst_src.contains("KEPT_PERCENT"));
+        assert!(typst_src.contains("KEPT_INLINE_CODE"));
+        assert!(typst_src.contains("%%timeit total = 1 + 1"));
+        assert!(typst_src.contains("<script>"));
+
+        for themed in [false, true] {
+            let opts = PdfOptions { themed, theme_accent: "#2d6a4f".into(), ..PdfOptions::default() };
+            let pdf_bytes = export(md, &opts, &HashMap::new()).unwrap();
+            assert!(pdf_bytes.starts_with(b"%PDF-"));
+            if !themed {
+                let path = std::env::temp_dir().join(format!("supermd-study-markdown-{}.pdf", std::process::id()));
+                std::fs::write(&path, &pdf_bytes).unwrap();
+                if let Ok(output) = std::process::Command::new("pdftotext").arg(&path).arg("-").output() {
+                    if output.status.success() {
+                        let extracted = String::from_utf8_lossy(&output.stdout);
+                        let flat = extracted.split_whitespace().collect::<Vec<_>>().join(" ");
+                        assert!(flat.contains("Highlighted concept"));
+                        assert!(flat.contains("==Literal markup== beside Active highlight"), "Expected literal escaped == beside active highlight: {flat}");
+                        assert!(flat.contains("\\Slash highlight"), "Expected escaped backslash before active highlight: {flat}");
+                        assert!(flat.contains("H~2~O and H~2~O and ~lit~ and ~rawsub~ beside sub"), "Expected literal escaped tildes beside subscript: {flat}");
+                        assert!(flat.contains("x^2^ and x^2^ and ^rawsup^ beside sup"), "Expected literal escaped carets beside superscript: {flat}");
+                        assert!(flat.contains("%%KEPT_PERCENT%%"), "Expected escaped percent comment preserved: {flat}");
+                        assert!(flat.contains("underlined"));
+                        assert!(flat.contains("Ctrl"));
+                        assert!(flat.contains("~not sub~"));
+                        assert!(flat.contains("^not sup^"));
+                        assert!(flat.contains("<script>alert(1)</script>"));
+                        assert!(!flat.contains("SECRET_BLOCK_COMMENT"));
+                        assert!(!flat.contains("SECRET_OBSIDIAN_HEADER"));
+                        assert!(!flat.contains("SECRET_INLINE_COMMENT"));
+                        assert!(!flat.contains("SECRET_INLINE_HTML"));
+                    }
+                }
+                let _ = std::fs::remove_file(path);
+            }
         }
     }
 }

@@ -15,6 +15,7 @@ import { analyzeDocument } from "./documentAnalysis";
 import { svgImage } from "./svgImage";
 import { remarkObsidianMath } from "./obsidianMath";
 import { remarkSvgBlocks } from "./svgBlocks";
+import { remarkStudySyntax } from "./studySyntax";
 import {parseStepDeck} from "./components/StepCards";
 import {parseDiagramSource} from "./components/InlineDiagram";
 import {parseBinaryTreeSource} from "./components/BinaryTree";
@@ -281,7 +282,7 @@ export async function preparePdf(markdown: string, documentPath: string | null, 
   try {
   checkCurrent();
   report({ phase: "prepare", completed: 0, total: 1 });
-  const processor = unified().use(remarkParse).use(remarkGfm).use(remarkMath).use(remarkObsidianMath).use(remarkStringify);
+  const processor = unified().use(remarkParse).use(remarkGfm, { singleTilde: false }).use(remarkMath).use(remarkObsidianMath).use(remarkStudySyntax).use(remarkStringify);
   const front = parseFrontmatter(markdown)?.raw || "";
   const normalized = normalizeCallouts(markdown);
   // parse() runs no transformers: lift raw <svg> markup into svg blocks here.
