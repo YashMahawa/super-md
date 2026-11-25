@@ -18,7 +18,7 @@ const MIME_EXT: Record<string, string> = {
 
 function refs(markdown: string): ImageRef[] {
   const frontmatterEnd = parseFrontmatter(markdown)?.end ?? 0;
-  const tree = unified().use(remarkParse).use(remarkGfm).use(remarkMath).use(remarkObsidianMath).parse(maskFrontmatter(markdown));
+  const tree = unified().use(remarkParse).use(remarkGfm, { singleTilde: false }).use(remarkMath).use(remarkObsidianMath).parse(maskFrontmatter(markdown));
   const definitions = new Map<string, any>();
   const result: ImageRef[] = [];
   visit(tree, "definition", (node: any) => {
