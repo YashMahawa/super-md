@@ -138,7 +138,8 @@ class MainActivity : ComponentActivity() {
     )
     var dismissDocument: (() -> Unit)? = null
     var saveReaderPosition: (() -> Unit)? = null
-    var openReaderFind: (() -> Unit)? = null
+    var openReaderFind: ((Boolean) -> Unit)? = null
+    var stepReaderFind: ((Int) -> Unit)? = null
     var formatDocument: ((String) -> Unit)? = null
     var canFormatEditor: (() -> Boolean)? = null
     val agentAccessState: AgentAccessState by lazy { AgentAccessState(this) }
@@ -442,6 +443,10 @@ class MainActivity : ComponentActivity() {
         }
         if (event.action == android.view.KeyEvent.ACTION_DOWN && event.repeatCount == 0) {
             if (event.keyCode == android.view.KeyEvent.KEYCODE_F11) { model.fullscreen(!model.state.value.fullscreen); return true }
+            if (event.keyCode == android.view.KeyEvent.KEYCODE_F3 && !event.isCtrlPressed && !event.isAltPressed && !event.isMetaPressed) {
+                if (!model.folderSearch.value.visible) stepReaderFind?.invoke(if (event.isShiftPressed) -1 else 1)
+                return true
+            }
             if (event.keyCode == android.view.KeyEvent.KEYCODE_ESCAPE) {
                 if (model.folderSearch.value.visible) {
                     model.cancelWorkspaceSearch()
@@ -455,7 +460,11 @@ class MainActivity : ComponentActivity() {
             val primaryMod = event.isCtrlPressed || event.isMetaPressed
             if (primaryMod && !event.isAltPressed) {
                 if (event.keyCode == android.view.KeyEvent.KEYCODE_F) {
-                    if (event.isShiftPressed) model.openFolderSearch() else openReaderFind?.invoke()
+                    if (event.isShiftPressed) model.openFolderSearch() else openReaderFind?.invoke(false)
+                    return true
+                }
+                if (event.keyCode == android.view.KeyEvent.KEYCODE_H && !event.isShiftPressed) {
+                    openReaderFind?.invoke(true)
                     return true
                 }
                 if (event.keyCode == android.view.KeyEvent.KEYCODE_S) {
@@ -549,6 +558,7 @@ private object NoMotionScheme : MotionScheme {
     var readerPdfOwnsProgress by remember { mutableStateOf(false) }
     var menu by remember { mutableStateOf(false) }
     var findRequest by remember { mutableIntStateOf(0) }
+    var findReplace by remember { mutableStateOf(false) }
     var renaming by rememberSaveable {mutableStateOf(false)}
     var contentsShown by remember {mutableStateOf(false)}
     var readingChromeVisible by remember {mutableStateOf(true)}
@@ -613,15 +623,24 @@ private object NoMotionScheme : MotionScheme {
         }
         activity.dismissDocument = { web?.evaluateJavascript("window.supermdDismiss?.() || false") { dismissed -> if (dismissed != "true") model.fullscreen(false) } ?: model.fullscreen(false) }
         activity.saveReaderPosition={web?.evaluateJavascript("window.supermdSavePosition?.()",null)}
-        activity.openReaderFind = {
+        activity.openReaderFind = { replace ->
             menu = false
+            findReplace = replace
             findRequest++
         }
-        onDispose { activity.dismissDocument = null;activity.saveReaderPosition=null;activity.openReaderFind=null;model.assetAccessRestored=null }
+        activity.stepReaderFind = { direction ->
+            menu = false
+            web?.let { reader ->
+                reader.requestFocus(View.FOCUS_DOWN)
+                reader.evaluateJavascript("window.supermdFindStep?.(${if (direction < 0) -1 else 1}); true", null)
+            }
+        }
+        onDispose { activity.dismissDocument = null;activity.saveReaderPosition=null;activity.openReaderFind=null;activity.stepReaderFind=null;model.assetAccessRestored=null }
     }
     LaunchedEffect(findRequest, menu, web) {
         if (findRequest == 0 || menu) return@LaunchedEffect
         val requested = findRequest
+        val replace = findReplace
         // Wait for the popup window to release native focus before asking the
         // WebView for focus. This follows the actual dismissal instead of
         // estimating its transition duration.
@@ -629,8 +648,9 @@ private object NoMotionScheme : MotionScheme {
         reader.awaitWindowFocus()
         if (menu || requested != findRequest || reader !== web) return@LaunchedEffect
         findRequest = 0
+        findReplace = false
         reader.requestFocus(View.FOCUS_DOWN)
-        reader.evaluateJavascript("window.supermdFind?.(); true") {
+        reader.evaluateJavascript("window.supermdFind?.(${if (replace) "true" else ""}); true") {
             reader.post {
                 reader.requestFocus(View.FOCUS_DOWN)
                 val hasHardwareKeyboard = activity.resources.configuration.keyboard != android.content.res.Configuration.KEYBOARD_NOKEYS
@@ -1215,7 +1235,7 @@ private object NoMotionScheme : MotionScheme {
                                 }
                             },
                             onFolderSearch = { model.openFolderSearch() },
-                            onFind = { activity.openReaderFind?.invoke() },
+                            onFind = { activity.openReaderFind?.invoke(false) },
                             onSave = saveAction,
                             onExport = { sharing = false; exporting = true },
                             onToggleFullscreen = { model.fullscreen(!state.fullscreen) },
