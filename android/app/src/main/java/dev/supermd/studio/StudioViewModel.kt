@@ -703,6 +703,8 @@ class StudioViewModel(app: Application, val workspaceKey: String = "main") : And
         } catch(error:Exception){fail("Could not share theme: ${error.message}")}
     }
     private var listedRelative=""
+    private var listFolderSeq=0L
+    private var listFolderJob:Job?=null
     private val deletedDrafts=DeletedDraftStore(File(app.filesDir,"deleted-drafts/$workspaceKey"))
     private val documentObserver=object:android.database.ContentObserver(android.os.Handler(android.os.Looper.getMainLooper())) {
         override fun onChange(selfChange:Boolean){readerFolderIndex.clear();refreshMetadata();refreshExternal()}
@@ -719,22 +721,26 @@ class StudioViewModel(app: Application, val workspaceKey: String = "main") : And
         metadataJob?.cancel()
         metadataJob=viewModelScope.launch {
             delay(200)
-            val uris=(mutable.value.tabs.mapNotNull {it.uri}+recentMutable.value.map {it.uri}).distinct()
-            val metadata=withContext(Dispatchers.IO) {
-                uris.mapNotNull {raw->
-                    val uri=Uri.parse(raw)
-                    if(uri.scheme!="content")return@mapNotNull null
-                    when(val info=queryProviderMetadata {
-                        resolver.query(uri,arrayOf(android.provider.OpenableColumns.DISPLAY_NAME),null,null,null)?.use {cursor->
-                            if(cursor.moveToFirst())ProviderMetadata.Found(cursor.getString(0)) else ProviderMetadata.Missing
-                        }
-                    }) {
-                        is ProviderMetadata.Found->info.name?.takeIf {it.isNotBlank()}?.let {raw to it}
-                        ProviderMetadata.Missing->raw to null
-                        ProviderMetadata.Unavailable->null
-                    }
-                }.toMap()
+            val beforeIo=mutable.value
+            val folderSnapshot=beforeIo.folder
+            val relativeSnapshot=listedRelative
+            val listSeqSnapshot=listFolderSeq
+            val uris=(beforeIo.tabs.mapNotNull {it.uri}+recentMutable.value.map {it.uri}).distinct()
+            val relativeHints=buildMap {
+                recentMutable.value.forEach {r->if(!r.relative.isNullOrEmpty())put(r.uri,r.relative)}
+                beforeIo.tabs.forEach {t->if(t.uri!=null&&!t.relative.isNullOrEmpty())put(t.uri,t.relative)}
             }
+            val refreshSnapshot=withContext(Dispatchers.IO) {
+                refreshSafWorkspaceMetadata(
+                    resolver = resolver,
+                    documentAccess = documentAccess,
+                    uris = uris,
+                    relativeHints = relativeHints,
+                    folderUriRaw = folderSnapshot,
+                    listedRelative = relativeSnapshot,
+                )
+            }
+            val metadata=refreshSnapshot.metadata
             val removed=metadata.filterValues {it==null}.keys
             val s=mutable.value
             val discarded=s.tabs.filter {it.uri in removed}
@@ -750,7 +756,17 @@ class StudioViewModel(app: Application, val workspaceKey: String = "main") : And
             if(discarded.isNotEmpty()||kept!=s.tabs) change {it.copy(tabs=kept.ifEmpty {listOf(Note())},closedTabs=(recovered+it.closedTabs).take(12),message=if(discarded.isNotEmpty())"File deleted. Its tab was closed; unsaved edits remain recoverable in Settings." else "Updated renamed note")}
             val recents=recentMutable.value.filter {it.uri !in removed}.map {note->metadata[note.uri]?.takeIf {it.isNotBlank()}?.let {note.copy(name=it,relative=renamedRelative(note.relative,it))} ?: note}
             if(recents!=recentMutable.value)storeRecent(recents)
-            mutable.value.folder?.let {listFolder(Uri.parse(it),listedRelative)}
+            val currentFolder=mutable.value.folder
+            if(currentFolder!=null) {
+                if(currentFolder==folderSnapshot&&listedRelative==relativeSnapshot&&listFolderSeq==listSeqSnapshot&&refreshSnapshot.folderEntries!=null) {
+                    refreshSnapshot.folderEntries.fold(
+                        onSuccess = {entries->if(mutable.value.files!=entries)mutable.value=mutable.value.copy(files=entries)},
+                        onFailure = {error->fail("Could not list folder: ${error.message}")},
+                    )
+                } else {
+                    listFolder(Uri.parse(currentFolder),listedRelative)
+                }
+            }
         }
     }
     private val folderSearchMutable = MutableStateFlow(FolderSearchState())
@@ -2269,19 +2285,31 @@ class StudioViewModel(app: Application, val workspaceKey: String = "main") : And
         } catch (error: Exception) { fail("Could not open folder: ${error.message}") }
     }
     fun closeFolder() {
+        listFolderSeq++
+        listFolderJob?.cancel()
+        listedRelative = ""
         windowPrefs.edit().putBoolean("folderMigrated", true).remove("folder").apply()
         change { it.copy(folder = null, files = emptyList()) }
     }
-    fun listFolder(uri: Uri, relative: String) = viewModelScope.launch {
-        listedRelative=relative
-        try {
-            val entries = withContext(Dispatchers.IO) {
-                var folder = DocumentFile.fromTreeUri(getApplication(), Uri.parse(mutable.value.folder ?: uri.toString())) ?: error("Choose the folder again to restore access")
-                relative.split('/').filter { it.isNotEmpty() }.forEach { part -> folder = folder.findFile(part) ?: error("Folder disappeared") }
-                folder.listFiles().mapNotNull { f -> val name = f.name ?: return@mapNotNull null; if (name.startsWith('.')) return@mapNotNull null; if (f.isDirectory || name.substringAfterLast('.').lowercase() in listOf("md", "smd", "markdown", "fmd")) FileEntry(name, f.uri.toString(), f.isDirectory, (if (relative.isEmpty()) "" else "$relative/") + name) else null }.sortedWith(compareByDescending<FileEntry> { it.directory }.thenBy { it.name.lowercase() })
+    fun listFolder(uri: Uri, relative: String): Job {
+        val seq = ++listFolderSeq
+        listedRelative = relative
+        listFolderJob?.cancel()
+        return viewModelScope.launch {
+            try {
+                val targetFolder = Uri.parse(mutable.value.folder ?: uri.toString())
+                val entries = withContext(Dispatchers.IO) {
+                    listSafFolderEntries(resolver, documentAccess, targetFolder, relative)
+                }
+                if (seq == listFolderSeq) {
+                    mutable.value = mutable.value.copy(files = entries)
+                }
+            } catch (cancelled: kotlinx.coroutines.CancellationException) {
+                throw cancelled
+            } catch (error: Exception) {
+                if (seq == listFolderSeq) fail("Could not list folder: ${error.message}")
             }
-            mutable.value = mutable.value.copy(files = entries)
-        } catch (error: Exception) { fail("Could not list folder: ${error.message}") }
+        }.also { listFolderJob = it }
     }
 
     fun openFolderSearch(initialQuery: String? = null) {

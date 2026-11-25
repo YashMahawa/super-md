@@ -94,6 +94,52 @@ class DocumentAccessTest {
         assertFalse(sameDocument(noteUri, otherAuthority))
     }
 
+    @Test fun treeContainmentAndReadAccessRejectSiblingPrefixesAndTraversalOutsideGrantedTree() {
+        assertTrue(isDocumentContainedInTree("folder", "folder"))
+        assertTrue(isDocumentContainedInTree("folder", "folder/Note.md"))
+        assertTrue(isDocumentContainedInTree("folder/", "folder/Sub/Note.md"))
+        assertTrue(isDocumentContainedInTree("primary:", "primary:Notes/Note.md"))
+        assertFalse(isDocumentContainedInTree("folder", "folder-other/Note.md"))
+        assertFalse(isDocumentContainedInTree("folder", "folder/../outside/Note.md"))
+        assertFalse(isDocumentContainedInTree("primary:", "primary:../outside/Note.md"))
+
+        val grantedUris = mutableMapOf<Uri, Int>()
+        val enforcingContext = object : android.content.ContextWrapper(app) {
+            override fun checkUriPermission(uri: Uri?, pid: Int, uid: Int, modeFlags: Int): Int {
+                if (uri == null) return android.content.pm.PackageManager.PERMISSION_DENIED
+                val held = grantedUris.entries
+                    .filter { (granted, _) ->
+                        granted == uri || (DocumentsContract.isTreeUri(granted) && uri.toString().startsWith(granted.toString() + "/"))
+                    }
+                    .fold(0) { acc, (_, flags) -> acc or flags }
+                return if ((held and modeFlags) == modeFlags) {
+                    android.content.pm.PackageManager.PERMISSION_GRANTED
+                } else {
+                    android.content.pm.PackageManager.PERMISSION_DENIED
+                }
+            }
+        }
+
+        val access = DocumentAccess(enforcingContext)
+        val tree = DocumentsContract.buildTreeDocumentUri(authority, "folder")
+        grantedUris[tree] = Intent.FLAG_GRANT_READ_URI_PERMISSION
+        app.contentResolver.takePersistableUriPermission(tree, Intent.FLAG_GRANT_READ_URI_PERMISSION)
+
+        val ungrantedInside = DocumentsContract.buildDocumentUri(authority, "folder/Inside.md")
+        val ungrantedSibling = DocumentsContract.buildDocumentUri(authority, "folder-2/Outside.md")
+        val craftedEscape = DocumentsContract.buildDocumentUriUsingTree(tree, "folder-2/Outside.md")
+        val craftedTraversal = DocumentsContract.buildDocumentUriUsingTree(tree, "folder/../outside/Outside.md")
+
+        assertTrue(access.resolveReadAccess(ungrantedInside) is SafReadAccess.InGrantedTree)
+        assertEquals(SafReadAccess.Denied, access.resolveReadAccess(ungrantedSibling))
+        assertEquals(SafReadAccess.Denied, access.resolveReadAccess(craftedEscape))
+        assertEquals(SafReadAccess.Denied, access.resolveReadAccess(craftedTraversal))
+
+        val grantedOutside = DocumentsContract.buildDocumentUri(authority, "standalone/Single.md")
+        grantedUris[grantedOutside] = Intent.FLAG_GRANT_READ_URI_PERMISSION
+        assertEquals(SafReadAccess.StandaloneDocument(grantedOutside), access.resolveReadAccess(grantedOutside))
+    }
+
     @Test fun reopeningRecentNoteAfterReadRevocationOffersRecoveryAndKeepsItsDraft() {
         val model = newModel()
         val noteId = openBaseline(model)
