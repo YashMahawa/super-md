@@ -164,7 +164,9 @@ export default function App() {
   const dirty = isDirty(activeTab);
   const [mobileUi, setMobileUi] = useState(compactViewport);
   const [view, setView] = useState<ViewMode>(() => compactViewport() ? "live" : "split");
-  const { pinnedAnalysis, outline, isReady: previewReady } = useDocumentAnalysis(activeTab.id, content, view);
+  const { pinnedAnalysis, exactAnalysis, outline, isReady: previewReady } = useDocumentAnalysis(activeTab.id, content, view);
+  const exactReady = view === "editor" || exactAnalysis?.source === content;
+  const activeScrollRestoreRef = useRef<(() => void) | null>(null);
   const modeOffsetRef = useRef<{ tabId: string; offset: number } | null>(null);
   const tabOffsetsRef = useRef(new Map<string, number>());
   const pendingHeadingRef = useRef<{ tabId: string; view: ViewMode; headingId: string; offset: number; input: number } | null>(null);
@@ -296,13 +298,13 @@ export default function App() {
       window.dispatchEvent(new CustomEvent("supermd-goto-offset", { detail: entry.offset }));
     }
     const scroller = readingScrollRef.current;
-    if (scroller && previewReady) {
+    if (scroller && previewReady && exactReady) {
       pendingHeadingRef.current = null;
       navigateToHeading(scroller, entry.id);
     } else {
       pendingHeadingRef.current = { tabId: activeTab.id, view, headingId: entry.id, offset: entry.offset, input: scrollInputVersion() };
     }
-  }, [activeTab.id, previewReady, view]);
+  }, [activeTab.id, exactReady, previewReady, view]);
 
   useEffect(() => {
     window.supermdHeading = (id, offset = 0) => navigateOutlineHeading({ id, title: id, level: 1, offset });
@@ -379,8 +381,12 @@ export default function App() {
     };
     const frame = requestAnimationFrame(() => { apply(); requestAnimationFrame(apply); });
     const timers = [120, 320, 700].map((delay) => window.setTimeout(apply, delay));
+    activeScrollRestoreRef.current = apply;
+    const clearActive = window.setTimeout(() => { if (activeScrollRestoreRef.current === apply) activeScrollRestoreRef.current = null; }, 760);
     return () => {
       stopped = true;
+      if (activeScrollRestoreRef.current === apply) activeScrollRestoreRef.current = null;
+      window.clearTimeout(clearActive);
       cancelAnimationFrame(frame);
       timers.forEach(window.clearTimeout);
       inputs.forEach((name) => window.removeEventListener(name, stop, { capture: true }));
@@ -388,14 +394,18 @@ export default function App() {
   }, [activeTab.id, path, previewReady, view]);
 
   useLayoutEffect(() => {
-    if (!previewReady) return;
+    if (exactReady) activeScrollRestoreRef.current?.();
+  }, [exactReady]);
+
+  useLayoutEffect(() => {
+    if (!previewReady || !exactReady) return;
     const pending = pendingHeadingRef.current;
     if (!pending) return;
     pendingHeadingRef.current = null;
     if (pending.tabId !== activeTab.id || pending.view !== view || pending.input !== scrollInputVersion()) return;
     const host = readingScrollRef.current;
     if (host) navigateToHeading(host, pending.headingId);
-  }, [activeTab.id, previewReady, view]);
+  }, [activeTab.id, content, exactReady, previewReady, view]);
 
   useEffect(() => {
     if (!previewReady) return;
@@ -822,7 +832,7 @@ export default function App() {
       <div className="work-area" style={{ "--folder-width": `${folderWidth}px` } as React.CSSProperties}>
       {folderVisible && !fullscreen && <><FolderPanel root={folderRoot} activePath={path} outline={outline} onHeading={navigateOutlineHeading} onChoose={chooseFolder} onHide={() => setFolderVisible(false)} onOpen={openFolderFile} /><div className="folder-resizer" role="separator" aria-label="Resize folder sidebar" aria-orientation="vertical" tabIndex={0} onPointerDown={(e) => { folderDrag.current = true; e.currentTarget.setPointerCapture(e.pointerId); }} onPointerMove={(e) => { if (folderDrag.current) setFolderWidth(Math.max(180, Math.min(420, e.clientX))); }} onPointerUp={() => { folderDrag.current = false; }} onLostPointerCapture={() => { folderDrag.current = false; }} onKeyDown={(e) => { if (e.key === "ArrowLeft" || e.key === "ArrowRight") { e.preventDefault(); setFolderWidth((w) => Math.max(180, Math.min(420, w + (e.key === "ArrowRight" ? 10 : -10)))); } }} /></>}
       <main className="workspace" ref={workspaceRef} data-resizing={resizing || windowResizing} data-dragging-file={draggingFile} style={{ "--split-left": `${splitPercent}fr`, "--split-right": `${100 - splitPercent}fr`, "--workspace-scale": workspaceZoom / 100 } as React.CSSProperties}>
-        {searching && (view === "reader" || view === "live") && <ReadingSearch content={content} renderedRevision={previewReady ? pinnedAnalysis?.source : undefined} close={() => setSearching(false)} onChange={view === "reader" ? undefined : (value) => setDocuments((current) => editTab(current, activeTab.id, value))} />}
+        {searching && (view === "reader" || view === "live") && <ReadingSearch content={content} renderedRevision={pinnedAnalysis?.source ?? null} close={() => setSearching(false)} onChange={view === "reader" ? undefined : (value) => setDocuments((current) => editTab(current, activeTab.id, value))} />}
         {(view === "editor" || view === "split") && <motion.section layout={false} initial={false} transition={motionEnabled && !resizing && !windowResizing ? spring.surface : { duration: 0 }} className="editor-pane" aria-label="Markdown source"><div className="pane-head"><span><PencilSimpleIcon size={15} /> Markdown</span>{view === "editor" ? <span className="zoom-controls" aria-label="Workspace zoom"><button onClick={() => zoomBy(-10)} aria-label="Zoom out"><MinusIcon size={14} /></button><ZoomInput value={workspaceZoom} onChange={setZoom} /><button onClick={() => zoomBy(10)} aria-label="Zoom in"><PlusIcon size={14} /></button></span> : <small>{lineCount} lines</small>}</div><Editor key={activeTab.id} sessionId={activeTab.id} value={content} onChange={(value) => setDocuments((current) => editTab(current, activeTab.id, value))} dark={dark} focusMode={focusMode} spellCheck={spellCheck} grammarCheck={grammarCheck} typewriterScroll={typewriterScroll} onTypewriterChange={setTypewriterScroll} /></motion.section>}
         {view === "split" && <div className="pane-resizer" role="separator" aria-label="Resize editor and preview" aria-orientation="vertical" aria-valuemin={25} aria-valuemax={75} aria-valuenow={splitPercent} tabIndex={0} onPointerDown={onResizePointerDown} onPointerMove={onResizePointerMove} onPointerUp={onResizePointerUp} onLostPointerCapture={() => setResizing(false)} onDoubleClick={() => setSplitPercent(50)} onKeyDown={(event) => { if (event.key === "ArrowLeft" || event.key === "ArrowRight") { event.preventDefault(); setSplitPercent((current) => Math.max(25, Math.min(75, current + (event.key === "ArrowRight" ? 5 : -5)))); } }}><span /></div>}
         {(view === "reader" || view === "split") && <motion.section layout={false} initial={false} transition={motionEnabled && !resizing && !windowResizing ? spring.surface : { duration: 0 }} className="preview-pane" aria-label="Reading preview"><div className="pane-head"><span><BookOpenIcon size={15} /> Preview</span><div className="preview-tools"><small>{wordCount} words</small><span className="zoom-controls" aria-label="Workspace zoom"><button onClick={() => zoomBy(-10)} title="Zoom out · Ctrl+-" aria-label="Zoom out"><MinusIcon size={14} /></button><ZoomInput value={workspaceZoom} onChange={setZoom} /><button onClick={() => zoomBy(10)} title="Zoom in · Ctrl++" aria-label="Zoom in"><PlusIcon size={14} /></button></span></div></div><div className="reading-scroll" ref={readingScrollRef}>{pinnedAnalysis ? <div className="preview-page" style={{ width: previewLayoutWidth(previewViewportWidth, readerWidth, workspaceZoom), zoom: workspaceZoom / 100 }}><MarkdownPreview markdown={pinnedAnalysis.source} onChange={(value) => setDocuments((current) => editTab(current, activeTab.id, value))} onToggleTask={togglePreviewTask} sourceAnalysis={pinnedAnalysis} documentPath={path} python={python} dark={dark} trustedImageHosts={trustedImageHosts} onTrustImageHost={trustImageHost} /></div> : <div className="reader-loading" role="status"><span className="expressive-loading-shape" aria-hidden="true"/>Preparing preview</div>}</div></motion.section>}

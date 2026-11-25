@@ -74,7 +74,7 @@ declare global { interface Window { supermdLoad?: (state: ReaderState) => void; 
 declare global { interface Window {supermdChromeInset?:(height:number)=>void} }
 declare global { interface Window {supermdSavePosition?:()=>void} }
 declare global {interface Window {supermdExportPhase?:(id:string,phase:'typesetting'|'publishing')=>void}}
-interface ReaderState { replaceEpoch?:number; centerLock?:boolean; customStyle?:CustomStyle; restorePosition?:boolean; readingLocation?:ReadingLocation|null; imageAppearance?:MediaAppearance; svgAppearance?:MediaAppearance; imageContrast?:number; seededFind?:{query:string;caseSensitive?:boolean}|null }
+interface ReaderState { centerLock?:boolean; customStyle?:CustomStyle; restorePosition?:boolean; readingLocation?:ReadingLocation|null; imageAppearance?:MediaAppearance; svgAppearance?:MediaAppearance; imageContrast?:number; seededFind?:{query:string;caseSensitive?:boolean}|null }
 type AgentDocumentBase={tabId:string;revision:string;sourceLength:number};
 function resolveAgentDiagram(content:string,revision:string,request:Record<string,unknown>,diagramOptions?:AgentDiagramOptions){
   if(request.expectedRevision!==revision)throw Error('A current expectedRevision is required to retrieve this diagram');
@@ -118,9 +118,8 @@ export async function computeAgentDocumentRequest(request:Record<string,unknown>
 }
 function Reader() {
   const [state, setState] = useState<ReaderState | null>(null);
-  const analysisKey = state ? `${state.id}:${state.replaceEpoch ?? 0}` : null;
   const { pinnedAnalysis, exactAnalysis, isReady: previewReady } = useDocumentAnalysis(
-    analysisKey,
+    state?.id ?? null,
     state?.content ?? "",
     state?.mode ?? "reader",
     { enabled: state !== null },
@@ -157,9 +156,10 @@ function Reader() {
   const documentAppearance=useMemo(()=>({dark:state?.dark??false,svgAppearance:state?.svgAppearance,ink:state?.colors.primary,text:state?.colors.text,colors:state?.colors}),[state?.dark,state?.svgAppearance,JSON.stringify(state?.colors)]);
   const trustHost = useCallback((host:string)=>setTrustedHosts(current=>{if(current.includes(host))return current;const next=[...current,host];trustedHostsRef.current=next;return next;}),[]);
   const reference = useRef(state); reference.current = state;
-  const replaceEpochRef = useRef(0);
   const publishedOutline = useRef<{ id: string; source: string } | null>(null);
   const pendingHeading = useRef<{ noteId: string; mode: ReaderState["mode"]; headingId: string; input: number } | null>(null);
+  const pendingExternalAnchor = useRef<{ id: string; mode: ReaderState["mode"]; content: string; restore: Array<() => void> } | null>(null);
+  const activeScrollRestore = useRef<(() => void) | null>(null);
   const committedView = useRef<{ id: string; mode: ReaderState["mode"]; content: string; exact: boolean } | null>(null);
   const measuredView = useRef("");
   const changeTypewriter = useCallback((enabled: boolean) => {
@@ -258,14 +258,6 @@ function Reader() {
       }
       if(old?.id===next.id){
         next.readingLocation=old.readingLocation;
-        if(!contentUnchanged&&draft===undefined&&old.content!==next.content){
-          replaceEpochRef.current+=1;
-          next.replaceEpoch=replaceEpochRef.current;
-        }else{
-          next.replaceEpoch=old.replaceEpoch??replaceEpochRef.current;
-        }
-      }else{
-        next.replaceEpoch=replaceEpochRef.current;
       }
       if(old&&(old.id!==next.id||old.mode!==next.mode||old.fullscreen!==next.fullscreen)){pendingHeading.current=null;document.querySelectorAll('.android-reading').forEach(cancelHeadingNavigation);}
       if(old&&(old.id!==next.id||old.mode!==next.mode)){const history=histories.current.get(next.id);if(history)history.last=0;}
@@ -305,7 +297,17 @@ function Reader() {
       if(old && !sameViewport){window.clearTimeout(zoomTimer.current);cancelAnimationFrame(zoomFrame.current);zoomFrame.current=0;zoomTarget.current=null;}
       const load = () => { if (typeof loaded.typewriterScroll === "boolean") setTypewriterScroll(loaded.typewriterScroll, { persist: false }); reference.current=loaded;setState(loaded); zoomReference.current = loaded.zoom; applyIncomingFind(); };
       const typewriterChanged = Boolean(old?.typewriterScroll) !== Boolean(loaded.typewriterScroll);
-      if (old?.id === next.id && old.mode === next.mode && !typewriterChanged) anchored(load); else load();
+      if (old?.id === next.id && old.mode === next.mode && !typewriterChanged) {
+        const restore = anchors();
+        pendingExternalAnchor.current = old.content !== loaded.content && loaded.mode !== "editor"
+          ? { id: loaded.id, mode: loaded.mode, content: loaded.content, restore }
+          : null;
+        load();
+        requestAnimationFrame(() => restore.forEach(callback => callback()));
+      } else {
+        pendingExternalAnchor.current = null;
+        load();
+      }
     };
     window.supermdHistory=direction=>{
       if(document.querySelector('.theme-guide-dialog'))return;
@@ -357,6 +359,7 @@ function Reader() {
       if(canvas){canvas.dispatchEvent(new CustomEvent("supermd-canvas-pan",{detail:{dx,dy},cancelable:true}));return;}
       const scroller=target?.closest<HTMLElement>(".android-reading,.cm-scroller,.image-viewer-canvas,.math-repair-list,.media-dialog") || document.querySelector<HTMLElement>('.android-reading');
       if(scroller)nativeScroll.scroll(scroller,dx,dy);
+      else if(reference.current&&reference.current.mode!=='editor'&&Math.abs(dy)>2)requestAnimationFrame(()=>requestChrome('hide'));
     };
     window.supermdFlush = operation => {
       savePosition.current();
@@ -470,14 +473,14 @@ function Reader() {
     // write scrollTop. These operations used to race with momentum scrolling.
     document.querySelector<HTMLElement>('.android-source')?.style.setProperty('--workspace-scale',String(zoomReference.current/100));
     if(!previewReady)layoutKey.current='';
-    const nextLayout=JSON.stringify([analysisKey,state.mode,state.fullscreen,state.font,state.size,state.widthPercent,state.lineHeight,styleKey]);
+    const nextLayout=JSON.stringify([state.id,state.mode,state.fullscreen,state.font,state.size,state.widthPercent,state.lineHeight,styleKey]);
     if(previewReady&&layoutKey.current!==nextLayout){layoutKey.current=nextLayout;document.querySelectorAll<HTMLElement>('.android-reading').forEach(invalidateDocumentZoom);applyZoomStyle();settleSelection();}
     if(restoreCustom.length)requestAnimationFrame(()=>restoreCustom.forEach(restore=>restore()));
   // A source edit (especially checking a task) is not a new viewport. Rebuilding
   // zoom geometry here resets settled CSS zoom before the native selection and
   // scroll position have caught up, which jumps on mobile and magnified pages.
   // ResizeObserver updates the content extent without changing magnification.
-  }, [analysisKey,state?.mode,state?.dark,state?.fullscreen,state?.font,state?.size,
+  }, [state?.id,state?.mode,state?.dark,state?.fullscreen,state?.font,state?.size,
       state?.widthPercent,state?.lineHeight,state?.motion,state?.imageAppearance,state?.svgAppearance,state?.imageContrast,previewReady,JSON.stringify(state?.colors),JSON.stringify(state?.customStyle)]);
   useEffect(()=>{if(!previewReady)return;const root=document.querySelector<HTMLElement>(".android-reading");if(!root || typeof ResizeObserver==="undefined")return;let frame=0;const page=root.querySelector<HTMLElement>(".document-page");const observer=new ResizeObserver(()=>{if(!frame)frame=requestAnimationFrame(()=>{frame=0;
     // A scheduled gesture owns its focal point. A resize callback must not
@@ -507,14 +510,14 @@ function Reader() {
       measuredView.current = "";
       return;
     }
-    const key = `${analysisKey}:${state.mode}`;
+    const key = `${state.id}:${state.mode}:${state.content}`;
     if (measuredView.current === key) return;
     const hosts=Array.from(document.querySelectorAll<HTMLElement>(".android-reading"));
     hosts.forEach(host=>delete host.dataset.measured);
     if (!exactReady) return;
     let measure=requestAnimationFrame(()=>{measure=requestAnimationFrame(()=>{measuredView.current=key;hosts.forEach(host=>{host.dataset.measured="true";});});});
     return()=>cancelAnimationFrame(measure);
-  }, [analysisKey, state?.mode, previewReady, exactReady]);
+  }, [state?.id, state?.mode, state?.content, previewReady, exactReady]);
   useLayoutEffect(() => {
     if (!state || !previewReady) return;
     if (pendingHeading.current?.noteId === state.id && pendingHeading.current.mode === state.mode) {
@@ -537,10 +540,11 @@ function Reader() {
         if(state.mode==="editor")window.dispatchEvent(new CustomEvent("supermd-goto-offset",{detail:offset}));
         else {const host=document.querySelector<HTMLElement>(".android-reading");if(host)revealReadingOffset(host,offset);}
       };
-      requestAnimationFrame(()=>{apply();requestAnimationFrame(apply);});
+      activeScrollRestore.current=apply;
+      let frame=requestAnimationFrame(()=>{apply();frame=requestAnimationFrame(apply);});
       const timers=[120,320,700].map(delay=>window.setTimeout(apply,delay));
-      window.setTimeout(()=>inputs.forEach(name=>window.removeEventListener(name,stop,{capture:true})),760);
-      return()=>{stopped=true;timers.forEach(window.clearTimeout);};
+      const clearListeners=window.setTimeout(()=>{if(activeScrollRestore.current===apply)activeScrollRestore.current=null;inputs.forEach(name=>window.removeEventListener(name,stop,{capture:true}));},760);
+      return()=>{stopped=true;if(activeScrollRestore.current===apply)activeScrollRestore.current=null;cancelAnimationFrame(frame);window.clearTimeout(clearListeners);timers.forEach(window.clearTimeout);inputs.forEach(name=>window.removeEventListener(name,stop,{capture:true}));};
     }
     if(top===undefined&&!saved)return;
     let stopped=false;
@@ -553,10 +557,29 @@ function Reader() {
       if(host){if(top!==undefined)host.scrollTop=Math.max(0,top);else if(saved)revealReadingOffset(host,saved.offset);}
       else if(saved)window.dispatchEvent(new CustomEvent('supermd-goto-offset',{detail:saved.offset}));
     };
-    const frame=requestAnimationFrame(()=>{restore();requestAnimationFrame(restore);});
+    activeScrollRestore.current=restore;
+    let frame=requestAnimationFrame(()=>{restore();frame=requestAnimationFrame(restore);});
     const timers=[120,320,700].map(delay=>window.setTimeout(restore,delay));
-    return()=>{stopped=true;cancelAnimationFrame(frame);timers.forEach(window.clearTimeout);inputs.forEach(name=>window.removeEventListener(name,stop,{capture:true}));};
+    const clearActive=window.setTimeout(()=>{if(activeScrollRestore.current===restore)activeScrollRestore.current=null;},760);
+    return()=>{stopped=true;if(activeScrollRestore.current===restore)activeScrollRestore.current=null;window.clearTimeout(clearActive);cancelAnimationFrame(frame);timers.forEach(window.clearTimeout);inputs.forEach(name=>window.removeEventListener(name,stop,{capture:true}));};
   }, [state?.id, state?.mode, previewReady]);
+  useLayoutEffect(() => {
+    if (exactReady) activeScrollRestore.current?.();
+  }, [exactReady]);
+  useLayoutEffect(() => {
+    if (!state || !previewReady || !exactReady) return;
+    const pending = pendingExternalAnchor.current;
+    if (!pending) return;
+    if (pending.id !== state.id || pending.mode !== state.mode) {
+      pendingExternalAnchor.current = null;
+      return;
+    }
+    if (pending.content !== state.content) return;
+    pendingExternalAnchor.current = null;
+    pending.restore.forEach(callback => callback());
+    const frame = requestAnimationFrame(() => pending.restore.forEach(callback => callback()));
+    return () => cancelAnimationFrame(frame);
+  }, [state?.id, state?.mode, state?.content, previewReady, exactReady]);
   useLayoutEffect(() => {
     if (!state || !previewReady || !exactReady) return;
     const pending = pendingHeading.current;
@@ -565,7 +588,7 @@ function Reader() {
     if (pending.noteId !== state.id || pending.mode !== state.mode || pending.input !== scrollInputVersion()) return;
     const root = document.querySelector(".android-reading");
     if (root) navigateToHeading(root, pending.headingId);
-  }, [analysisKey, state?.id, state?.mode, previewReady, exactReady]);
+  }, [state?.id, state?.mode, state?.content, previewReady, exactReady]);
   useLayoutEffect(() => {
     if (!state) {
       committedView.current = null;
@@ -665,7 +688,10 @@ function Reader() {
       const target=event.target as Element,root=target.closest('.android-reading');cancelHeadingNavigation(root);
       const heldPageZoom=(mouseHeld||!!(event.buttons&1))&&!!root&&!selectingText.current&&!window.getSelection()?.toString();
       if ((event.ctrlKey || event.metaKey || heldPageZoom) && !target.closest("textarea,input,[data-independent-zoom]")) { event.preventDefault();gaps.cancelStationary();window.supermdZoomBy?.(Math.exp(-event.deltaY*.002),{x:event.clientX,y:event.clientY}); }
-      else if(root instanceof HTMLElement&&!event.ctrlKey&&!event.metaKey&&!target.closest('textarea,input,.interactive-chart,.note-image,[data-independent-zoom]')){rememberWindowedScrollSource(root,event.deltaY*(event.deltaMode===1?16:event.deltaMode===2?root.clientHeight:1));if(Math.abs(event.deltaY)>2)requestChrome('hide');}
+      else if(!event.ctrlKey&&!event.metaKey&&!target.closest('textarea,input,.interactive-chart,.note-image,[data-independent-zoom],.theme-guide-dialog,.math-repair-panel,.media-dialog,.image-viewer')){
+        if(root instanceof HTMLElement){rememberWindowedScrollSource(root,event.deltaY*(event.deltaMode===1?16:event.deltaMode===2?root.clientHeight:1));if(Math.abs(event.deltaY)>2)requestChrome('hide');}
+        else if(reference.current&&reference.current.mode!=='editor'&&target.closest('.android-document,.reader-loading')&&Math.abs(event.deltaY)>2)requestChrome('hide');
+      }
     };
     const scrollKey=(event:KeyboardEvent)=>{
       const target=event.target as Element;
@@ -1105,13 +1131,13 @@ function Reader() {
     </section></div>}
     {editError&&<div role="alert" className="reader-edit-error">{editError}</div>}
     <MediaThemeFilters colors={state.colors} dark={state.dark}/>
-    {searching && <ReadingSearch content={state.content} renderedRevision={previewReady?pinnedAnalysis?.source:undefined} close={()=>{setSearching(false);setSearchSeed(null);}} onChange={state.mode==="reader"?undefined:update} sourceSession={state.mode==="editor"||state.mode==="split"?state.id:undefined} seed={searchSeed}/>}
+    {searching && <ReadingSearch content={state.content} renderedRevision={state.mode==="editor"?undefined:(pinnedAnalysis?.source??null)} close={()=>{setSearching(false);setSearchSeed(null);}} onChange={state.mode==="reader"?undefined:update} sourceSession={state.mode==="editor"||state.mode==="split"?state.id:undefined} seed={searchSeed}/>}
     <ImageViewer />
     {repairing && <MathRepairPanel content={state.content} apply={update} close={()=>setRepairing(false)} />}
     <MediaTools key={state.id} documentId={state.id} content={state.content} renderedContent={pinnedAnalysis?.source} documentPath={state.path} onInsert={(text, point) => { const content = reference.current!.content; const from = Math.min(point?.from ?? content.length, content.length); const to = Math.max(from, Math.min(point?.to ?? from, content.length)); update(content.slice(0, from) + text + content.slice(to)); }} onNotice={(error) => { void invoke("export_failed", { error }); }} />
     {(state.mode === "editor" || state.mode === "split") && <section className="android-source"><SourceEditor key={state.id} sessionId={state.id} value={state.content} onChange={update} dark={state.dark} focusMode={state.fullscreen} latexAutofix={state.latexAutofix} typewriterScroll={state.typewriterScroll} onTypewriterChange={changeTypewriter} spellCheck={state.spellCheck} grammarCheck={state.grammarCheck} /></section>}
-    {state.mode === "live" && (pinnedAnalysis ? <section className="android-reading" data-full-document-accessibility={state.fullDocumentAccessibility ? "true" : undefined}><div className="reader-chrome-spacer" aria-hidden="true"/><div key={analysisKey ?? state.id} className="document-page-space"><div className="document-page"><LiveDocument key={analysisKey ?? state.id} sessionId={state.id} latexAutofix={state.latexAutofix} typewriterScroll={state.typewriterScroll} spellCheck={state.spellCheck} grammarCheck={state.grammarCheck} markdown={state.content} onChange={update} documentPath={state.path} python={state.python || "embedded"} dark={false} trustedImageHosts={trustedHosts} onTrustImageHost={trustHost} fullDocumentAccessibility={state.fullDocumentAccessibility} sourceAnalysis={pinnedAnalysis} /></div></div></section> : <div className="reader-loading" role="status"><span className="expressive-loading-shape" aria-hidden="true"/>Opening your note</div>)}
-    {(state.mode === "reader" || state.mode === "split") && (pinnedAnalysis ? <section className="android-reading" data-full-document-accessibility={state.fullDocumentAccessibility ? "true" : undefined}><div className="reader-chrome-spacer" aria-hidden="true"/><div key={analysisKey ?? state.id} className="document-page-space"><div className="document-page"><DocumentPreview markdown={pinnedAnalysis.source} onChange={update} onToggleTask={togglePreviewTask} documentPath={state.path} python={state.python || "embedded"} dark={false} trustedImageHosts={trustedHosts} onTrustImageHost={trustHost} fullDocumentAccessibility={state.fullDocumentAccessibility} sourceAnalysis={pinnedAnalysis} /></div></div></section> : <div className="reader-loading" role="status"><span className="expressive-loading-shape" aria-hidden="true"/>Opening your note</div>)}
+    {state.mode === "live" && (pinnedAnalysis ? <section className="android-reading" data-full-document-accessibility={state.fullDocumentAccessibility ? "true" : undefined}><div className="reader-chrome-spacer" aria-hidden="true"/><div key={state.id} className="document-page-space"><div className="document-page"><LiveDocument key={state.id} sessionId={state.id} latexAutofix={state.latexAutofix} typewriterScroll={state.typewriterScroll} spellCheck={state.spellCheck} grammarCheck={state.grammarCheck} markdown={state.content} onChange={update} documentPath={state.path} python={state.python || "embedded"} dark={false} trustedImageHosts={trustedHosts} onTrustImageHost={trustHost} fullDocumentAccessibility={state.fullDocumentAccessibility} sourceAnalysis={pinnedAnalysis} /></div></div></section> : <div className="reader-loading" role="status"><span className="expressive-loading-shape" aria-hidden="true"/>Opening your note</div>)}
+    {(state.mode === "reader" || state.mode === "split") && (pinnedAnalysis ? <section className="android-reading" data-full-document-accessibility={state.fullDocumentAccessibility ? "true" : undefined}><div className="reader-chrome-spacer" aria-hidden="true"/><div key={state.id} className="document-page-space"><div className="document-page"><DocumentPreview markdown={pinnedAnalysis.source} onChange={update} onToggleTask={togglePreviewTask} documentPath={state.path} python={state.python || "embedded"} dark={false} trustedImageHosts={trustedHosts} onTrustImageHost={trustHost} fullDocumentAccessibility={state.fullDocumentAccessibility} sourceAnalysis={pinnedAnalysis} /></div></div></section> : <div className="reader-loading" role="status"><span className="expressive-loading-shape" aria-hidden="true"/>Opening your note</div>)}
   </div></DocumentAppearance.Provider>;
 }
 createRoot(document.getElementById("root")!).render(<Reader />);

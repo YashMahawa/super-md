@@ -412,18 +412,23 @@ export function useDocumentAnalysis(
     : null;
   const immediate=peeked??syncImmediate;
 
-  const [completed,setCompleted]=useState<{documentId:string;value:SourceDocumentAnalysis}|null>(()=>
-    documentId!==null&&immediate?{documentId,value:immediate}:null,
-  );
-  const completedRef=useRef(completed);
-  completedRef.current=completed;
+  const initialCompleted=documentId!==null&&immediate?{documentId,value:immediate}:null;
+  const [completed,setCompleted]=useState<{documentId:string;value:SourceDocumentAnalysis}|null>(initialCompleted);
+  const retainedRef=useRef<{documentId:string;value:SourceDocumentAnalysis}|null>(initialCompleted);
+  if(!enabled||documentId===null){
+    retainedRef.current=null;
+  }else if(retainedRef.current?.documentId!==documentId){
+    retainedRef.current=immediate?{documentId,value:immediate}:(completed?.documentId===documentId?completed:null);
+  }else if(immediate){
+    retainedRef.current={documentId,value:immediate};
+  }
 
-  const docSessionRef=useRef<{documentId:string;controller:AbortController;nextSeq:number;appliedSeq:number}|null>(null);
+  const docSessionRef=useRef<{documentId:string;controller:AbortController;nextSeq:number;appliedSeq:number;lastImmediateSource:string|null}|null>(null);
   const ensureSession=(id:string)=>{
     const current=docSessionRef.current;
     if(current&&current.documentId===id&&!current.controller.signal.aborted)return current;
     current?.controller.abort();
-    const next={documentId:id,controller:new AbortController(),nextSeq:0,appliedSeq:0};
+    const next={documentId:id,controller:new AbortController(),nextSeq:0,appliedSeq:0,lastImmediateSource:null};
     docSessionRef.current=next;
     return next;
   };
@@ -431,7 +436,13 @@ export function useDocumentAnalysis(
     docSessionRef.current?.controller.abort();
     docSessionRef.current=null;
   }else{
-    ensureSession(documentId);
+    const session=ensureSession(documentId);
+    if(immediate&&session.lastImmediateSource!==source){
+      session.lastImmediateSource=source;
+      session.appliedSeq=++session.nextSeq;
+    }else if(!immediate){
+      session.lastImmediateSource=null;
+    }
   }
 
   useEffect(()=>()=>{
@@ -447,19 +458,25 @@ export function useDocumentAnalysis(
     if(cached){
       const seq=++session.nextSeq;
       session.appliedSeq=seq;
-      setCompleted(prev=>prev?.documentId===documentId&&prev.value===cached?prev:{documentId,value:cached});
+      session.lastImmediateSource=source;
+      const next={documentId,value:cached};
+      retainedRef.current=next;
+      setCompleted(prev=>prev?.documentId===documentId&&prev.value===cached?prev:next);
       return;
     }
 
     if(!client.isAvailable()){
       const seq=++session.nextSeq;
       session.appliedSeq=seq;
+      session.lastImmediateSource=source;
       const fallback={source,analysis:analyzeDocument(source)};
-      setCompleted(prev=>prev?.documentId===documentId&&prev.value.source===source?prev:{documentId,value:fallback});
+      const next={documentId,value:fallback};
+      retainedRef.current=next;
+      setCompleted(prev=>prev?.documentId===documentId&&prev.value.source===source?prev:next);
       return;
     }
 
-    const hasPriorForDoc=completedRef.current?.documentId===documentId;
+    const hasPriorForDoc=retainedRef.current?.documentId===documentId;
     const coalesceMs=mode==='editor'&&hasPriorForDoc&&source.length>80_000?120:0;
     const seq=++session.nextSeq;
     let timerId:ReturnType<typeof setTimeout>|null=null;
@@ -471,14 +488,18 @@ export function useDocumentAnalysis(
         result=>{
           if(session.controller.signal.aborted||seq<session.appliedSeq)return;
           session.appliedSeq=seq;
-          setCompleted(prev=>prev?.documentId===documentId&&prev.value===result?prev:{documentId,value:result});
+          const next={documentId,value:result};
+          retainedRef.current=next;
+          setCompleted(prev=>prev?.documentId===documentId&&prev.value===result?prev:next);
         },
         (error:unknown)=>{
           if(session.controller.signal.aborted||(error instanceof Error&&error.name==='AbortError'))return;
           if(seq<session.appliedSeq)return;
           session.appliedSeq=seq;
           const fallback={source,analysis:analyzeDocument(source)};
-          setCompleted({documentId,value:fallback});
+          const next={documentId,value:fallback};
+          retainedRef.current=next;
+          setCompleted(next);
         },
       );
     };
@@ -499,7 +520,7 @@ export function useDocumentAnalysis(
     return {pinnedAnalysis:null,exactAnalysis:null,outline:EMPTY_OUTLINE,isReady:false};
   }
 
-  const pinnedAnalysis=immediate??(completed?.documentId===documentId?completed.value:null);
+  const pinnedAnalysis=immediate??(retainedRef.current?.documentId===documentId?retainedRef.current.value:completed?.documentId===documentId?completed.value:null);
   const exactAnalysis=pinnedAnalysis?.source===source?pinnedAnalysis:null;
   const outline=pinnedAnalysis?.analysis.outline??EMPTY_OUTLINE;
   const isReady=mode==='editor'||pinnedAnalysis!==null;

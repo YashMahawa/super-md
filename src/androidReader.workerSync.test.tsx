@@ -142,6 +142,7 @@ beforeEach(() => {
 afterEach(() => {
   if (root) act(() => root?.unmount());
   root = null;
+  workerPool.instances.forEach((worker) => worker.flushAll());
   sharedDocumentAnalysisClient.reclaimIdle();
   HTMLElement.prototype.getBoundingClientRect = originalGetBoundingClientRect;
   document.body.innerHTML = "";
@@ -198,7 +199,11 @@ it("waits for background worker analysis and DOM commit before resolving get_con
   expect(viewport.height).toBe(680);
   expect(reading.heading).toBe("Second tab");
 
-  // Wholesale external replacement on the SAME tab id must not leave stale "Second tab" DOM mounted.
+  // Wholesale external replacement on the SAME tab id retains the reading container
+  // while get_context waits for the new worker analysis + DOM commit before resolving.
+  const existingReading = host.querySelector(".android-reading");
+  expect(existingReading).not.toBeNull();
+
   await act(async () => {
     window.supermdLoad!({
       id: "tab-live",
@@ -214,16 +219,74 @@ it("waits for background worker analysis and DOM commit before resolving get_con
     });
   });
 
-  expect(host.querySelector(".android-reading")).toBeNull();
-  expect(host.querySelector("h1")?.textContent).toBeUndefined();
+  // Container stays mounted across same-tab updates so scroll anchors survive.
+  expect(host.querySelector(".android-reading")).toBe(existingReading);
+
+  let replacedSettled = false;
+  const replacedContextPromise = new Promise<{ result: Record<string, unknown> | null; error: string }>((resolve) => {
+    window.supermdAgentRequest!(
+      { requestId: "ctx-2", action: "get_context", tabId: "tab-live" },
+      (result, error) => {
+        replacedSettled = true;
+        resolve({ result: result as Record<string, unknown> | null, error });
+      },
+    );
+  });
+
+  await act(async () => {
+    await Promise.resolve();
+  });
+  expect(replacedSettled).toBe(false);
 
   await act(async () => {
     workerPool.instances.forEach((worker) => worker.flushAll());
     await new Promise((resolve) => setTimeout(resolve, 40));
   });
 
-  expect(host.querySelector(".android-reading")).not.toBeNull();
+  const { result: replacedContext, error: replacedError } = await replacedContextPromise;
+  expect(replacedError).toBe("");
+  expect((replacedContext!.reading as { heading: string }).heading).toBe("Immersive reading");
+  expect(host.querySelector(".android-reading")).toBe(existingReading);
   expect(host.querySelector("h1")?.textContent).toBe("Immersive reading");
+});
+
+it("hides desktop fullscreen chrome on wheel even before the initial worker analysis mounts .android-reading", async () => {
+  document.documentElement.dataset.host = "qt";
+  const host = document.createElement("div");
+  document.body.append(host);
+  root = readerTree.mountRoot!(host);
+  await act(async () => {
+    root?.render(readerTree.element);
+  });
+
+  try {
+    await act(async () => {
+      window.supermdLoad!({
+        id: "desktop-fullscreen-load",
+        content: "# Fullscreen note\n\nBody text.\n",
+        path: null,
+        mode: "reader",
+        dark: false,
+        fullscreen: true,
+        font: "sans",
+        size: 18,
+        colors: { primary: "#386a57" },
+        zoom: 100,
+      });
+    });
+
+    const loading = host.querySelector(".reader-loading");
+    expect(loading).not.toBeNull();
+    expect(host.querySelector(".android-reading")).toBeNull();
+
+    await act(async () => {
+      loading!.dispatchEvent(new WheelEvent("wheel", { bubbles: true, cancelable: true, deltaY: 120 }));
+    });
+
+    expect(native).toHaveBeenCalledWith("reader_chrome", { action: "hide" });
+  } finally {
+    delete document.documentElement.dataset.host;
+  }
 });
 
 it("signals reader_ready without pre-spawning a worker and settles android_flush immediately before and during worker analysis", async () => {

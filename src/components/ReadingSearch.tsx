@@ -392,7 +392,8 @@ export interface ReadingSearchSeed {
   caseSensitive?: boolean;
   nonce: number;
 }
-export default function ReadingSearch({ content, renderedRevision, close, onChange, sourceSession, seed }: { content: string; renderedRevision?: string; close: () => void; onChange?: (content: string) => void; sourceSession?: string; seed?: ReadingSearchSeed | null }) {
+export default function ReadingSearch({ content, renderedRevision, close, onChange, sourceSession, seed }: { content: string; renderedRevision?: string | null; close: () => void; onChange?: (content: string) => void; sourceSession?: string; seed?: ReadingSearchSeed | null }) {
+  const previewSynced = renderedRevision === undefined || renderedRevision === content;
   const canReplace = Boolean(onChange);
   const canReplaceRef = useRef(canReplace); canReplaceRef.current = canReplace;
   const [query, setQuery] = useState(() => seed ? seed.query.slice(0, 200) : window.getSelection()?.toString().slice(0, 200) || "");
@@ -676,20 +677,29 @@ export default function ReadingSearch({ content, renderedRevision, close, onChan
     setSourceRanges(nextSourceRanges);
     if (sourceSession) editorFindQuery(sourceSession, query, caseSensitive);
     const autoSelect = pendingAutoSelect.current;
-    pendingAutoSelect.current = false;
     let targetIndex = indexRef.current;
     let shouldScrollReplaced = false;
     if (autoSelect) {
       pendingReplaceIndex.current = null;
+      if (sourceSession) {
+        pendingAutoSelect.current = false;
+      }
     } else if (criteriaChanged) {
       pendingReplaceIndex.current = null;
       targetIndex = -1;
       if (indexRef.current !== -1) updateIndex(-1);
     } else if (pendingReplaceIndex.current !== null) {
       targetIndex = pendingReplaceIndex.current;
-      pendingReplaceIndex.current = null;
-      shouldScrollReplaced = targetIndex >= 0;
-      updateIndex(targetIndex);
+      if (indexRef.current !== targetIndex) updateIndex(targetIndex);
+      if (targetIndex < 0) {
+        pendingReplaceIndex.current = null;
+      } else if (sourceSession) {
+        if (previewSynced) pendingReplaceIndex.current = null;
+        shouldScrollReplaced = true;
+      } else if (previewSynced) {
+        pendingReplaceIndex.current = null;
+        shouldScrollReplaced = true;
+      }
     } else if (contentChanged) {
       targetIndex = -1;
       if (indexRef.current !== -1) updateIndex(-1);
@@ -698,10 +708,36 @@ export default function ReadingSearch({ content, renderedRevision, close, onChan
       updateIndex(targetIndex);
     }
     const frame = requestAnimationFrame(() => {
+      if (autoSelect && sourceSession) {
+        if (nextSourceRanges.length) {
+          updateIndex(0);
+          if (previewSynced) {
+            revealAndHighlightSource(0, nextSourceRanges, content, true);
+          } else {
+            editorFindRange(sourceSession, nextSourceRanges[0].from, nextSourceRanges[0].to);
+            pendingReplaceIndex.current = 0;
+          }
+          return;
+        }
+        updateIndex(-1);
+        return;
+      }
+      if (!previewSynced) {
+        if (shouldScrollReplaced && sourceSession && targetIndex >= 0 && nextSourceRanges[targetIndex]) {
+          editorFindRange(sourceSession, nextSourceRanges[targetIndex].from, nextSourceRanges[targetIndex].to);
+        }
+        return;
+      }
       if (!autoSelect && shouldScrollReplaced && targetIndex >= 0 && nextSourceRanges[targetIndex]) {
         revealAndHighlightSource(targetIndex, nextSourceRanges, content, true);
       }
       const host = findReadingHost();
+      if (autoSelect && renderedRevision !== undefined && !host) {
+        return;
+      }
+      if (autoSelect) {
+        pendingAutoSelect.current = false;
+      }
       const nextWindowed = host ? windowedMatches(host, query, caseSensitive) : null;
       const result = host ? readingMatches(host, query, caseSensitive) : [];
       setWindowed(nextWindowed);
@@ -735,11 +771,11 @@ export default function ReadingSearch({ content, renderedRevision, close, onChan
       }
     });
     return () => { cancelAnimationFrame(frame); registry?.delete("smd-search"); registry?.delete("smd-search-current"); if (sourceSession) editorFindQuery(sourceSession, "", false); };
-  }, [query, content, renderedRevision, caseSensitive, sourceSession, canReplace, seed?.nonce]);
+  }, [query, content, renderedRevision, previewSynced, caseSensitive, sourceSession, canReplace, seed?.nonce]);
 
   useEffect(() => {
     if (!registry || !HighlightClass) return;
-    if (index < 0) { registry.delete("smd-search-current"); return; }
+    if (index < 0 || !previewSynced) { registry.delete("smd-search-current"); return; }
     if (sourceSearch) {
       const host = findReadingHost();
       if (!host || sourceSession) { registry.delete("smd-search-current"); return; }
@@ -759,10 +795,10 @@ export default function ReadingSearch({ content, renderedRevision, close, onChan
     }
     registry.delete("smd-search-current");
     if (matches[index]) registry.set("smd-search-current", new HighlightClass(matches[index]));
-  }, [index, matches, windowed, sourceRanges, sourceSearch, sourceSession, content, query, caseSensitive]);
+  }, [index, matches, windowed, sourceRanges, sourceSearch, sourceSession, content, renderedRevision, previewSynced, query, caseSensitive]);
 
   useEffect(() => {
-    const host = findReadingHost(); if (!host || (!windowed && !activeReplacing) || !query) return;
+    const host = findReadingHost(); if (!host || !previewSynced || (!windowed && !activeReplacing) || !query) return;
     let frame = 0;
     const refresh = () => {
       if (frame) return;
@@ -784,7 +820,7 @@ export default function ReadingSearch({ content, renderedRevision, close, onChan
     };
     host.addEventListener("supermd-window-change", refresh);
     return () => { cancelAnimationFrame(frame); host.removeEventListener("supermd-window-change", refresh); };
-  }, [windowed, activeReplacing, sourceSession, sourceRanges, content, query, caseSensitive]);
+  }, [windowed, activeReplacing, sourceSession, sourceRanges, content, renderedRevision, previewSynced, query, caseSensitive]);
   return <aside className="reading-search" data-independent-zoom role="search" aria-label="Find in note">
     <input ref={input} aria-label="Find in note" role="searchbox" type="text" inputMode="search" autoCapitalize="none" autoCorrect="off" spellCheck={false} placeholder="Find in this note" value={query} onChange={event => setQuery(event.target.value)} onKeyDown={event => { if (event.key === "Enter") { event.preventDefault(); move(event.shiftKey ? -1 : 1); } }} />
     <output aria-live="polite" title={count >= 5000 ? "Showing the first 5,000 matches. Narrow your search to find later results." : undefined}>{count ? `${index < 0 ? 0 : index + 1} / ${count}${count >= 5000 ? "+" : ""}` : query ? "No matches" : ""}</output>
