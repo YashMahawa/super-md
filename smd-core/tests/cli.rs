@@ -126,11 +126,50 @@ fn unpack_extracts_markdown_and_assets_portably_and_rolls_back_on_collision_fail
     assert_eq!(fs::read(w.file("unpacked/assets/image-1.svg")).unwrap(), svg_a);
     assert_eq!(fs::read(w.file("unpacked/assets/image-2.svg")).unwrap(), svg_b);
 
-    // Reserved/unsafe FAT & Windows stem characters fall back to portable filenames.
+    // Reserved/unsafe FAT & Windows stem characters (including dotted reserved prefixes) fall back to portable filenames.
     fs::copy(w.file("lesson.smd"), w.file("CON.smd")).unwrap();
     success(w.run(&["unpack", "CON.smd", "fat-safe/nested"]));
     assert!(w.file("fat-safe/nested/Note.md").exists());
     assert_eq!(fs::read(w.file("fat-safe/nested/assets/image-1.svg")).unwrap(), svg_a);
+
+    fs::copy(w.file("lesson.smd"), w.file("CON.chapter.smd")).unwrap();
+    success(w.run(&["unpack", "CON.chapter.smd", "fat-safe-dotted"]));
+    assert!(w.file("fat-safe-dotted/Note.md").exists());
+    assert!(!w.file("fat-safe-dotted/CON.chapter.md").exists());
+
+    #[cfg(not(windows))]
+    {
+        fs::copy(w.file("lesson.smd"), w.file("lpt1.notes.smd")).unwrap();
+        success(w.run(&["unpack", "lpt1.notes.smd", "fat-safe-lpt1"]));
+        assert!(w.file("fat-safe-lpt1/Note.md").exists());
+        assert!(!w.file("fat-safe-lpt1/lpt1.notes.md").exists());
+    }
+
+    // Assets with reserved Windows/FAT device basenames fail preflight before creating any output.
+    {
+        use base64::Engine;
+        let data_url = format!("data:image/svg+xml;base64,{}", base64::engine::general_purpose::STANDARD.encode(svg_a));
+        for reserved_asset in ["assets/CON.svg", "assets/aux.diagram.svg", "assets/com1.svg", "assets/lpt1.notes.svg"] {
+            let envelope = serde_json::json!({
+                "format": "supermd-smd",
+                "version": 1,
+                "markdown": format!("# Bad asset\n\n![ok](assets/a-first.svg)\n\n![bad]({reserved_asset})\n"),
+                "assets": {
+                    "assets/a-first.svg": data_url,
+                    reserved_asset: data_url,
+                }
+            });
+            fs::write(w.file("reserved-asset.smd"), envelope.to_string()).unwrap();
+            assert!(!w.run(&["unpack", "reserved-asset.smd", "reserved-asset-out/nested"]).status.success());
+            assert!(!w.file("reserved-asset-out").exists());
+
+            let existing_out = w.file("reserved-asset-existing");
+            let _ = fs::remove_dir_all(&existing_out);
+            fs::create_dir(&existing_out).unwrap();
+            assert!(!w.run(&["unpack", "reserved-asset.smd", "reserved-asset-existing"]).status.success());
+            assert!(fs::read_dir(&existing_out).unwrap().next().is_none());
+        }
+    }
 
     // Repeating unpack into the same directory fails without modifying existing files.
     fs::write(w.file("unpacked/lesson.md"), "user edited markdown").unwrap();
@@ -165,8 +204,25 @@ fn unpack_extracts_markdown_and_assets_portably_and_rolls_back_on_collision_fail
         let link_root = w.file("symlink-out");
         symlink(&outside, &link_root).unwrap();
         assert!(!w.run(&["unpack", "lesson.smd", "symlink-out"]).status.success());
+        assert!(!w.run(&["unpack", "lesson.smd", "symlink-out/"]).status.success());
         assert!(!w.run(&["unpack", "lesson.smd", "symlink-out/nested"]).status.success());
         assert!(fs::read_dir(&outside).unwrap().next().is_none());
+
+        // Existing subdirectories inside a symlinked ancestor (relative and absolute) are also rejected.
+        let existing_inside = outside.join("existing-sub");
+        fs::create_dir(&existing_inside).unwrap();
+        assert!(!w.run(&["unpack", "lesson.smd", "symlink-out/existing-sub"]).status.success());
+        assert!(!w.run(&["unpack", "lesson.smd", "symlink-out/existing-sub/nested"]).status.success());
+        assert!(!w.run(&["unpack", "lesson.smd", link_root.join("existing-sub").to_str().unwrap()]).status.success());
+        assert!(!w.run(&["unpack", "lesson.smd", link_root.join("existing-sub/nested").to_str().unwrap()]).status.success());
+
+        let real_parent = w.file("real-parent");
+        fs::create_dir(&real_parent).unwrap();
+        symlink(&outside, real_parent.join("symlink-mid")).unwrap();
+        assert!(!w.run(&["unpack", "lesson.smd", "real-parent/symlink-mid/existing-sub"]).status.success());
+        assert!(!w.run(&["unpack", "lesson.smd", "real-parent/symlink-mid/existing-sub/nested"]).status.success());
+        assert!(fs::read_dir(&existing_inside).unwrap().next().is_none());
+        fs::remove_dir(&existing_inside).unwrap();
 
         let nested = w.file("with-symlink-assets");
         fs::create_dir(&nested).unwrap();
@@ -174,6 +230,12 @@ fn unpack_extracts_markdown_and_assets_portably_and_rolls_back_on_collision_fail
         assert!(!w.run(&["unpack", "lesson.smd", "with-symlink-assets"]).status.success());
         assert!(!nested.join("lesson.md").exists());
         assert!(fs::read_dir(&outside).unwrap().next().is_none());
+
+        let dangling = w.file("dangling-link");
+        symlink(w.file("missing-target"), &dangling).unwrap();
+        assert!(!w.run(&["unpack", "lesson.smd", "dangling-link"]).status.success());
+        assert!(!w.run(&["unpack", "lesson.smd", "dangling-link/nested"]).status.success());
+        assert!(!w.file("missing-target").exists());
 
         // Mid-unpack write failure (after assets/* are created, when lesson.md fails to open)
         // rolls back every newly written asset while leaving existing unrelated files intact.

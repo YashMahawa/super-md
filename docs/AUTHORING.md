@@ -51,7 +51,8 @@ smd-engine unpack ./lesson.smd ./unpacked
 and `assets` emit metadata, not image bytes. `extract` writes one named image to a
 file and refuses to overwrite an existing output. `unpack` extracts the note's
 Markdown and `assets/` into a target directory within the same portable size limits,
-rejecting symlinks, pre-checking all destination paths before writing, and publishing
+rejecting symlinks across destination ancestors, guarding Windows/FAT-reserved
+filenames, pre-checking all destination paths before writing, and publishing
 each file with exclusive `create_new` file creation (so removable FAT/exFAT folders
 work without hard links while existing files are never overwritten, rolling back
 newly created files on failure). Avoid `cat lesson.smd` or
