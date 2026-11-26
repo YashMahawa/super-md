@@ -127,11 +127,16 @@ def _step_fence_boundary(
     return True, opened, None
 
 
+_ORIG_STEP_FENCE_BOUNDARY = _step_fence_boundary
+
+
 def _resolve_step_fence():
+    if _step_fence_boundary is not _ORIG_STEP_FENCE_BOUNDARY:
+        return _step_fence_boundary
     for module_name in ("agent_documents", "desktop.agent_documents"):
         module = sys.modules.get(module_name)
         candidate = getattr(module, "_step_fence_boundary", None)
-        if candidate is not None and candidate is not _step_fence_boundary:
+        if candidate is not None and candidate is not _ORIG_STEP_FENCE_BOUNDARY:
             return candidate
     return _step_fence_boundary
 
@@ -510,3 +515,13 @@ def read_source(
     if selected_heading is not None:
         result["heading"] = {key: selected_heading[key] for key in ("index", "level", "title", "line")}
     return result
+
+
+_PEER_MODULE = (
+    "agent.source_ops"
+    if __name__ == "desktop.agent.source_ops"
+    else ("desktop.agent.source_ops" if __name__ == "agent.source_ops" else None)
+)
+if _PEER_MODULE and _PEER_MODULE in sys.modules:
+    sys.modules[__name__] = sys.modules[_PEER_MODULE]
+
