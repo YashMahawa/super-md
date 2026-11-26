@@ -140,7 +140,7 @@ pub fn parse(input: &str) -> Result<Theme> {
     let theme:Theme=serde_json::from_str(input.trim_start_matches('\u{feff}'))?;
     if theme.format!="supermd-theme" || theme.version!=1 { bail!("Expected supermd-theme version 1"); }
     if theme.name.trim().is_empty() || theme.name.chars().count()>80 || theme.name.chars().any(|c| c.is_control() || matches!(c,'<'|'>')) { bail!("Theme name must contain 1–80 printable characters without markup brackets"); }
-    if !["blue","violet","rose","amber"].contains(&theme.accent.as_str()) { bail!("Unknown base accent"); }
+    if !["blue","green","violet","rose","amber"].contains(&theme.accent.as_str()) { bail!("Unknown base accent"); }
     if theme.assets.len()>8 {bail!("A theme supports at most eight reusable assets");}
     for (id,image) in &theme.assets {
         if !asset_id(id) {bail!("Asset names must use 1–64 letters, numbers, hyphens or underscores");}
@@ -247,5 +247,15 @@ mod tests {
         let mut bytes=STANDARD.decode(fixtures["webp"].split_once(',').unwrap().1).unwrap();bytes[20]|=2;
         assert!(validate_image(&format!("data:image/webp;base64,{}",STANDARD.encode(bytes))).is_err());
         for (id,uri) in fixtures {assert!(validate_image(&uri).is_ok(),"{id}");}
+    }
+    #[test] fn green_accent_roundtrips_and_unknown_accents_fail() {
+        let mut v=sample();v["accent"]=serde_json::json!("green");
+        let parsed=parse(&v.to_string()).unwrap();
+        assert_eq!(parsed.accent,"green");
+        assert_eq!(parse(&serde_json::to_string(&parsed).unwrap()).unwrap().accent,"green");
+        for invalid in ["teal","GREEN","system",""] {
+            v["accent"]=serde_json::json!(invalid);
+            assert!(parse(&v.to_string()).is_err(),"{invalid}");
+        }
     }
 }

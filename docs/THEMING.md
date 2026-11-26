@@ -64,7 +64,7 @@ Example files are in [`public/themes`](../public/themes) and can be selected dir
 | `format` | Required: exactly `supermd-theme`. |
 | `version` | Required: integer `1`. |
 | `name` | Required: 1–80 printable characters; no control characters or `<`/`>` brackets. Plain text, not markup. |
-| `accent` | Optional base palette: `blue` (default), `violet`, `rose`, or `amber`. |
+| `accent` | Optional base palette: `blue` (default), `green`, `violet`, `rose`, or `amber`. |
 | `variants` | Optional object containing any of `light`, `dark`, `black`. |
 | `metrics` | Optional layout/style values from the table below. |
 | `assets` | Optional reusable embedded SVG/PNG/JPEG/WebP images; up to eight named entries. |
