@@ -111,3 +111,118 @@ it('times out rather than accepting an incomplete artifact pair', async () => {
     pollIntervalMs: 10,
   }), /Timed out waiting/);
 });
+
+it('retries GitHub HTTP 403 rate-limit responses honoring reset headers while failing closed on permission 403s', async () => {
+  let clock = 1_000_000;
+  let attempts = 0;
+  const sleeps = [];
+  const rateLimitedFetch = async input => {
+    attempts++;
+    if (attempts === 1) {
+      return new Response(JSON.stringify({ message: 'API rate limit exceeded for installation ID.' }), {
+        status: 403,
+        headers: {
+          'x-ratelimit-remaining': '0',
+          'x-ratelimit-reset': String(Math.ceil((clock + 25_000) / 1000)),
+        },
+      });
+    }
+    if (attempts === 2) {
+      return new Response(JSON.stringify({ message: 'You have exceeded a secondary rate limit.' }), {
+        status: 403,
+        headers: { 'retry-after': '12' },
+      });
+    }
+    const url = new URL(input);
+    const body = url.pathname.endsWith('/jobs')
+      ? { total_count: 1, jobs: [{ name: 'native_frontend', status: 'completed', conclusion: 'success' }] }
+      : url.pathname.endsWith('/artifacts')
+        ? { total_count: 2, artifacts: [{ name: names.dist }, { name: names.manifest }] }
+        : run;
+    return new Response(JSON.stringify(body), { status: 200 });
+  };
+
+  const result = await waitForNativeFrontendArtifacts({
+    repository,
+    runId,
+    sourceSha,
+    token: 'test-token',
+    fetchImpl: rateLimitedFetch,
+    sleep: async ms => { sleeps.push(ms); clock += ms; },
+    now: () => clock,
+    timeoutMs: 120_000,
+    pollIntervalMs: 5_000,
+  });
+  assert.deepEqual(result, names);
+  assert.deepEqual(sleeps, [25_000, 12_000]);
+
+  const forbiddenFetch = async () => new Response(
+    JSON.stringify({ message: 'Resource not accessible by integration' }),
+    { status: 403, headers: { 'x-ratelimit-remaining': '999' } },
+  );
+  await assert.rejects(waitForNativeFrontendArtifacts({
+    repository,
+    runId,
+    sourceSha,
+    token: 'test-token',
+    fetchImpl: forbiddenFetch,
+    sleep: async () => {},
+    now: () => 0,
+    timeoutMs: 60_000,
+    pollIntervalMs: 5_000,
+  }), /GitHub Actions API request failed with HTTP 403/);
+});
+
+it('polls only the jobs endpoint while native_frontend is queued or in_progress', async () => {
+  let clock = 0;
+  let jobsPolls = 0;
+  const paths = [];
+  const fetchImpl = async input => {
+    const url = new URL(input);
+    paths.push(url.pathname);
+    if (url.pathname.endsWith('/jobs')) {
+      jobsPolls++;
+      const completed = jobsPolls >= 4;
+      return {
+        ok: true,
+        status: 200,
+        json: async () => ({
+          total_count: 1,
+          jobs: [{
+            name: 'native_frontend',
+            status: completed ? 'completed' : 'queued',
+            conclusion: completed ? 'success' : null,
+          }],
+        }),
+      };
+    }
+    if (url.pathname.endsWith('/artifacts')) {
+      return {
+        ok: true,
+        status: 200,
+        json: async () => ({ total_count: 2, artifacts: [{ name: names.dist }, { name: names.manifest }] }),
+      };
+    }
+    return { ok: true, status: 200, json: async () => run };
+  };
+
+  const result = await waitForNativeFrontendArtifacts({
+    repository,
+    runId,
+    sourceSha,
+    token: 'test-token',
+    fetchImpl,
+    sleep: async ms => { clock += ms; },
+    now: () => clock,
+    timeoutMs: 120_000,
+  });
+  assert.deepEqual(result, names);
+  assert.deepEqual(paths, [
+    '/repos/example/super-md/actions/runs/1234',
+    '/repos/example/super-md/actions/runs/1234/jobs',
+    '/repos/example/super-md/actions/runs/1234/jobs',
+    '/repos/example/super-md/actions/runs/1234/jobs',
+    '/repos/example/super-md/actions/runs/1234/jobs',
+    '/repos/example/super-md/actions/runs/1234/artifacts',
+  ]);
+});

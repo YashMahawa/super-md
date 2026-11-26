@@ -66,7 +66,40 @@ export function inspectFrontendArtifactReadiness({ repository, runId, sourceSha,
   return { ready: true, names: expected };
 }
 
-async function githubJson(url, token, fetchImpl, requestTimeoutMs) {
+function headerValue(response, name) {
+  return typeof response?.headers?.get === 'function' ? response.headers.get(name) : null;
+}
+
+function parseRetryDelayMs(response, now) {
+  const retryAfter = headerValue(response, 'retry-after');
+  if (retryAfter !== null) {
+    const seconds = Number(retryAfter);
+    if (Number.isFinite(seconds) && seconds >= 0) return Math.ceil(seconds * 1000);
+    const dateMs = Date.parse(retryAfter);
+    if (Number.isFinite(dateMs)) return Math.max(0, dateMs - now());
+  }
+  if (headerValue(response, 'x-ratelimit-remaining') === '0') {
+    const resetSeconds = Number(headerValue(response, 'x-ratelimit-reset'));
+    if (Number.isFinite(resetSeconds) && resetSeconds > 0) {
+      return Math.max(0, Math.ceil(resetSeconds * 1000 - now()));
+    }
+  }
+  return null;
+}
+
+async function isRateLimitedForbidden(response) {
+  if (headerValue(response, 'retry-after') !== null) return true;
+  if (headerValue(response, 'x-ratelimit-remaining') === '0') return true;
+  if (typeof response?.text !== 'function') return false;
+  try {
+    const body = await response.text();
+    return /\brate limit\b/i.test(body);
+  } catch {
+    return false;
+  }
+}
+
+async function githubJson(url, token, fetchImpl, requestTimeoutMs, now) {
   let response;
   try {
     response = await fetchImpl(url, {
@@ -84,7 +117,13 @@ async function githubJson(url, token, fetchImpl, requestTimeoutMs) {
     throw error;
   }
   if (!response.ok) {
-    if (response.status >= 500 || response.status === 429) return { retry: true, status: response.status };
+    const retryDelayMs = parseRetryDelayMs(response, now);
+    if (response.status >= 500 || response.status === 429) {
+      return { retry: true, status: response.status, retryDelayMs };
+    }
+    if (response.status === 403 && await isRateLimitedForbidden(response)) {
+      return { retry: true, status: response.status, retryDelayMs };
+    }
     throw new Error(`GitHub Actions API request failed with HTTP ${response.status}`);
   }
   return { value: await response.json() };
@@ -99,44 +138,65 @@ export async function waitForNativeFrontendArtifacts({
   fetchImpl = fetch,
   sleep = delay,
   timeoutMs = 600_000,
-  pollIntervalMs = 5_000,
+  pollIntervalMs = 15_000,
   now = Date.now,
 }) {
   const endpoint = assertInputs({ repository, runId, sourceSha, token, apiUrl });
-  const names = frontendArtifactNames(sourceSha);
+  const baseHref = `${endpoint.href.replace(/\/?$/, '/')}`;
   const runPath = `repos/${repository}/actions/runs/${runId}`;
   const started = now();
   const remainingMs = () => Math.max(1, timeoutMs - (now() - started));
-  const pause = async () => {
+  const pause = async (minDelayMs = pollIntervalMs) => {
     const left = timeoutMs - (now() - started);
-    if (left > 0) await sleep(Math.min(pollIntervalMs, left));
+    if (left > 0) await sleep(Math.min(Math.max(pollIntervalMs, minDelayMs ?? 0), left));
   };
-  const request = url => githubJson(url, token, fetchImpl, Math.min(15_000, remainingMs()));
+  const request = url => githubJson(url, token, fetchImpl, Math.min(15_000, remainingMs()), now);
+  let verifiedPendingRun = null;
   while (now() - started < timeoutMs) {
-    const runResult = await request(new URL(runPath, `${endpoint.href.replace(/\/?$/, '/')}`));
-    if (runResult.retry) {
-      await pause();
-      continue;
+    let runValue = verifiedPendingRun;
+    if (!runValue) {
+      const runResult = await request(new URL(runPath, baseHref));
+      if (runResult.retry) {
+        await pause(runResult.retryDelayMs);
+        continue;
+      }
+      runValue = runResult.value;
     }
-    const jobsResult = await request(new URL(`${runPath}/jobs?per_page=100`, `${endpoint.href.replace(/\/?$/, '/')}`));
+    const jobsResult = await request(new URL(`${runPath}/jobs?per_page=100`, baseHref));
     if (jobsResult.retry) {
-      await pause();
+      await pause(jobsResult.retryDelayMs);
       continue;
     }
-    const artifactsResult = await request(new URL(`${runPath}/artifacts?per_page=100`, `${endpoint.href.replace(/\/?$/, '/')}`));
-    if (artifactsResult.retry) {
-      await pause();
-      continue;
+    const jobsList = Array.isArray(jobsResult.value?.jobs) ? jobsResult.value.jobs : null;
+    const producerList = jobsList ? jobsList.filter(job => job.name === PRODUCER_JOB_NAME) : [];
+    if (verifiedPendingRun && producerList.length === 0) {
+      const freshRun = await request(new URL(runPath, baseHref));
+      if (freshRun.retry) {
+        await pause(freshRun.retryDelayMs);
+        continue;
+      }
+      runValue = freshRun.value;
+    }
+    const producerCompleted = producerList.length === 1 && producerList[0].status === 'completed';
+    let artifactsValue = { total_count: 0, artifacts: [] };
+    if (producerCompleted && producerList[0].conclusion === 'success') {
+      const artifactsResult = await request(new URL(`${runPath}/artifacts?per_page=100`, baseHref));
+      if (artifactsResult.retry) {
+        await pause(artifactsResult.retryDelayMs);
+        continue;
+      }
+      artifactsValue = artifactsResult.value;
     }
     const state = inspectFrontendArtifactReadiness({
       repository,
       runId,
       sourceSha,
-      run: runResult.value,
+      run: runValue,
       jobsPage: jobsResult.value,
-      artifactsPage: artifactsResult.value,
+      artifactsPage: artifactsValue,
     });
     if (state.ready) return state.names;
+    verifiedPendingRun = producerCompleted ? null : runValue;
     await pause();
   }
   throw new Error(`Timed out waiting for native frontend artifacts for source ${sourceSha} in run ${runId}; no fallback used`);
