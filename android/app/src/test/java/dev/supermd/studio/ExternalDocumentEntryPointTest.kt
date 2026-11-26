@@ -527,14 +527,37 @@ private class EntryPointDocumentProvider(
 
     override fun onCreate(): Boolean = true
 
-    private fun fileFor(uri: Uri): File {
+    private data class DocEntry(
+        val documentId: String,
+        val file: File,
+        val mimeType: String,
+    )
+
+    private val vaultEntries = listOf(
+        DocEntry("vault/Note.md", firstFile, "text/markdown"),
+        DocEntry("vault/Second.md", secondFile, "text/markdown"),
+        DocEntry("vault/Archive.smd", portableFile, "application/vnd.supermd.smd"),
+    )
+
+    private fun entryFor(uri: Uri): DocEntry {
         val docId = runCatching { DocumentsContract.getDocumentId(uri) }.getOrDefault(uri.lastPathSegment.orEmpty())
-        return when (docId.substringAfterLast('/')) {
-            "Second.md" -> secondFile
-            "Archive.smd" -> portableFile
-            else -> firstFile
-        }
+        return vaultEntries.firstOrNull { it.documentId == docId || docId.substringAfterLast('/') == it.file.name }
+            ?: vaultEntries.first()
     }
+
+    private fun fileFor(uri: Uri): File = entryFor(uri).file
+
+    private fun rowFor(entry: DocEntry, cols: List<String>): Array<Any?> =
+        cols.map { col ->
+            when (col) {
+                DocumentsContract.Document.COLUMN_DOCUMENT_ID -> entry.documentId
+                OpenableColumns.DISPLAY_NAME, DocumentsContract.Document.COLUMN_DISPLAY_NAME -> entry.file.name
+                OpenableColumns.SIZE, DocumentsContract.Document.COLUMN_SIZE -> entry.file.length()
+                DocumentsContract.Document.COLUMN_MIME_TYPE -> entry.mimeType
+                DocumentsContract.Document.COLUMN_FLAGS -> 0
+                else -> null
+            }
+        }.toTypedArray<Any?>()
 
     override fun query(
         uri: Uri,
@@ -543,24 +566,28 @@ private class EntryPointDocumentProvider(
         selectionArgs: Array<out String>?,
         sortOrder: String?,
     ): Cursor {
-        val file = fileFor(uri)
+        if (uri.pathSegments.lastOrNull() == "children") {
+            val parentId = runCatching { DocumentsContract.getDocumentId(uri) }.getOrNull()
+            val cols = projection?.toList() ?: listOf(
+                DocumentsContract.Document.COLUMN_DOCUMENT_ID,
+                DocumentsContract.Document.COLUMN_DISPLAY_NAME,
+                DocumentsContract.Document.COLUMN_MIME_TYPE,
+                DocumentsContract.Document.COLUMN_FLAGS,
+            )
+            return MatrixCursor(cols.toTypedArray()).apply {
+                if (parentId == "vault") {
+                    vaultEntries.forEach { entry -> addRow(rowFor(entry, cols)) }
+                }
+            }
+        }
+        val entry = entryFor(uri)
         val cols = projection?.toList() ?: listOf(OpenableColumns.DISPLAY_NAME, OpenableColumns.SIZE)
         return MatrixCursor(cols.toTypedArray()).apply {
-            addRow(
-                cols.map { col ->
-                    when (col) {
-                        OpenableColumns.DISPLAY_NAME, DocumentsContract.Document.COLUMN_DISPLAY_NAME -> file.name
-                        OpenableColumns.SIZE, DocumentsContract.Document.COLUMN_SIZE -> file.length()
-                        DocumentsContract.Document.COLUMN_MIME_TYPE -> if (file.name.endsWith(".smd")) "application/vnd.supermd.smd" else "text/markdown"
-                        else -> null
-                    }
-                }.toTypedArray<Any?>(),
-            )
+            addRow(rowFor(entry, cols))
         }
     }
 
-    override fun getType(uri: Uri): String =
-        if (fileFor(uri).name.endsWith(".smd")) "application/vnd.supermd.smd" else "text/markdown"
+    override fun getType(uri: Uri): String = entryFor(uri).mimeType
 
     override fun insert(uri: Uri, values: ContentValues?): Uri? = null
     override fun delete(uri: Uri, selection: String?, selectionArgs: Array<out String>?): Int = 0
