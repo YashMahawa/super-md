@@ -40,7 +40,7 @@ private fun liveStudioViewModels(current: StudioViewModel): List<StudioViewModel
         if (snapshot.any { it === current } || current.viewModelRetired.get()) snapshot else snapshot + current
     }
 
-private data class UriRemap(
+internal data class UriRemap(
     val oldUri: String,
     val newUri: String,
     val newName: String? = null,
@@ -2717,190 +2717,43 @@ class StudioViewModel(app: Application, val workspaceKey: String = "main") : And
             onComplete?.invoke(message)
         }
     }
-    fun setFolder(uri: Uri) = viewModelScope.launch {
-        try { applyWorkspaceFolder(uri) } catch (error: Exception) { fail("Could not open folder: ${error.message}") }
-    }
-    fun closeFolder() {
-        workspaceLinks.invalidate()
-        listFolderSeq++
-        listFolderJob?.cancel()
-        listedRelative = ""
-        windowPrefs.edit().putBoolean("folderMigrated", true).remove("folder").remove("folderRelative").apply()
-        change { it.copy(folder = null, folderRelative = "", files = emptyList()) }
-    }
-    fun navigateFolderUp(): Boolean {
-        val folderUri = mutable.value.folder ?: return false
-        val current = normalizeFolderRelative(listedRelative)
-        if (current.isEmpty()) return false
-        val parent = parentFolderRelative(current)
-        listFolder(Uri.parse(folderUri), parent)
-        return true
-    }
-    fun listFolder(uri: Uri, relative: String): Job {
-        val seq = ++listFolderSeq
-        val invalidPath = hasInvalidSafFolderRelative(relative)
-        val requestedRelative = if (invalidPath) listedRelative else normalizeFolderRelative(relative)
-        if (!invalidPath) {
-            listedRelative = requestedRelative
-            mutable.value = mutable.value.copy(folderRelative = requestedRelative)
-            if (mutable.value.folder != null) {
-                windowPrefs.edit().putBoolean("folderMigrated", true).putString("folderRelative", requestedRelative).apply()
+    private lateinit var safWorkspaceCache: SafWorkspaceCoordinator
+    private val safWorkspace: SafWorkspaceCoordinator
+        get() = if (::safWorkspaceCache.isInitialized) safWorkspaceCache else synchronized(this) {
+            if (!::safWorkspaceCache.isInitialized) {
+                safWorkspaceCache = SafWorkspaceCoordinator(
+                    owner = this, scope = viewModelScope, prefs = prefs, windowPrefs = windowPrefs,
+                    resolver = resolver, documentAccess = documentAccess, confirmedTreeDocumentKeys = confirmedTreeDocumentKeys,
+                    readState = { mutable.value }, writeState = { mutable.value = it }, changeState = ::change,
+                    readListedRelative = { listedRelative }, writeListedRelative = { listedRelative = it },
+                    readListFolderSeq = { listFolderSeq }, writeListFolderSeq = { listFolderSeq = it },
+                    readListFolderJob = { listFolderJob }, writeListFolderJob = { listFolderJob = it },
+                    readRecent = { recentMutable.value }, storeRecent = ::storeRecent,
+                    applyWorkspaceFolder = { uri -> applyWorkspaceFolder(uri) }, fail = ::fail, sameDocumentUri = ::sameDocumentUri,
+                    liveViewModels = { liveStudioViewModels(this) }, readVmState = { it.mutable.value },
+                    changeVmState = { vm, block -> vm.change(block) }, readVmListFolderSeq = { it.listFolderSeq },
+                    readVmListedRelative = { it.listedRelative }, readVmSeededFind = { it.seededFindMutable.value },
+                    writeVmSeededFind = { vm, seed -> vm.seededFindMutable.value = seed },
+                    refreshVmFolderSearchIfActive = { vm -> if (vm.folderSearchMutable.value.visible && vm.folderSearchMutable.value.query.isNotEmpty()) vm.updateFolderSearch() },
+                )
             }
+            safWorkspaceCache
         }
-        listFolderJob?.cancel()
-        return viewModelScope.launch {
-            try {
-                require(!invalidPath) { "Invalid folder path" }
-                val targetFolder = Uri.parse(mutable.value.folder ?: uri.toString())
-                val pass = SafProjectionPass(resolver)
-                val listing = withContext(Dispatchers.IO) {
-                    listSafFolderListing(resolver, documentAccess, targetFolder, requestedRelative, pass)
-                }
-                confirmedTreeDocumentKeys.addAll(pass.confirmedTreeKeys)
-                if (seq == listFolderSeq && mutable.value.folder != null) {
-                    listedRelative = listing.effectiveRelative
-                    if (listing.effectiveRelative != requestedRelative) {
-                        windowPrefs.edit().putBoolean("folderMigrated", true).putString("folderRelative", listing.effectiveRelative).apply()
-                    }
-                    mutable.value = mutable.value.copy(folderRelative = listing.effectiveRelative, files = listing.entries)
-                }
-            } catch (cancelled: kotlinx.coroutines.CancellationException) {
-                throw cancelled
-            } catch (error: Exception) {
-                if (seq == listFolderSeq) fail("Could not list folder: ${error.message}")
-            }
-        }.also { listFolderJob = it }
-    }
-
-    internal fun relativeInOpenFolder(uri: Uri, folderTreeRaw: String? = mutable.value.folder): String? {
-        val treeRaw = folderTreeRaw?.takeIf { it.isNotBlank() } ?: return null
-        val treeUri = runCatching { Uri.parse(treeRaw) }.getOrNull() ?: return null
-        if (uri.scheme != "content" || treeUri.scheme != "content" || uri.authority != treeUri.authority) return null
-        if (!DocumentsContract.isTreeUri(treeUri)) return null
-
-        if (isKnownPathDocumentProvider(treeUri.authority)) {
-            return knownPathRelativeInTree(uri, treeUri)
-        }
-
-        // For non-ExternalStorage SAF providers, COLUMN_DOCUMENT_ID is opaque.
-        // Only reuse provider-confirmed relative paths from the open folder state, open tabs, or recents.
-        for (vm in liveStudioViewModels(this)) {
-            val vmFolder = vm.mutable.value.folder
-            if (vmFolder != null && sameDocumentUri(vmFolder, treeRaw)) {
-                vm.mutable.value.files.firstOrNull { sameDocument(Uri.parse(it.uri), uri) }?.let { entry ->
-                    return normalizeRelativePath(entry.relative).takeIf { it.isNotEmpty() }
-                }
-                vm.mutable.value.tabs.firstOrNull {
-                    it.uri != null && !it.relative.isNullOrBlank() && sameDocument(Uri.parse(it.uri), uri)
-                }?.relative?.let { rel ->
-                    return normalizeRelativePath(rel).takeIf { it.isNotEmpty() }
-                }
-            }
-        }
-        recentMutable.value.firstOrNull {
-            !it.relative.isNullOrBlank() && sameDocument(Uri.parse(it.uri), uri)
-        }?.relative?.let { rel ->
-            return normalizeRelativePath(rel).takeIf { it.isNotEmpty() }
-        }
-        return null
-    }
-
-    private fun resolveOpenFolderRelativeOnIo(uri: Uri, folderTreeRaw: String? = mutable.value.folder): String? {
-        relativeInOpenFolder(uri, folderTreeRaw)?.let { return it }
-        val treeRaw = folderTreeRaw?.takeIf { it.isNotBlank() } ?: return null
-        val folderUri = runCatching { Uri.parse(treeRaw) }.getOrNull() ?: return null
-        val pass = SafProjectionPass(resolver)
-        val found = findRelativeInSafTree(
-            pass = pass,
-            documentAccess = documentAccess,
-            folderUri = folderUri,
-            targetUri = uri,
-            preferredDirRelative = listedRelative,
-        )
-        if (pass.confirmedTreeKeys.isNotEmpty()) {
-            confirmedTreeDocumentKeys.addAll(pass.confirmedTreeKeys)
-        }
-        return found
-    }
-
+    fun setFolder(uri: Uri) = safWorkspace.setFolder(uri)
+    fun closeFolder() = safWorkspace.closeFolder()
+    fun navigateFolderUp(): Boolean = safWorkspace.navigateFolderUp()
+    fun listFolder(uri: Uri, relative: String): Job = safWorkspace.listFolder(uri, relative)
+    internal fun relativeInOpenFolder(uri: Uri, folderTreeRaw: String? = mutable.value.folder): String? =
+        safWorkspace.relativeInOpenFolder(uri, folderTreeRaw)
+    private fun resolveOpenFolderRelativeOnIo(uri: Uri, folderTreeRaw: String? = mutable.value.folder): String? =
+        safWorkspace.resolveOpenFolderRelativeOnIo(uri, folderTreeRaw)
     private fun trackedEntriesInOpenFolder(
         folderTreeUri: Uri,
         projectedRelativeByDocId: Map<String, String> = emptyMap(),
-    ): Map<String, String> {
-        val result = linkedMapOf<String, String>()
-        val folderAuthority = folderTreeUri.authority
-        fun record(rawUri: String?, fallbackRelative: String? = null) {
-            if (rawUri.isNullOrBlank()) return
-            val parsed = runCatching { Uri.parse(rawUri) }.getOrNull() ?: return
-            val docId = if (parsed.scheme == "content" && parsed.authority == folderAuthority) {
-                runCatching { DocumentsContract.getDocumentId(parsed) }.getOrNull()
-            } else null
-            val rel = (if (docId != null) projectedRelativeByDocId[docId] else null)
-                ?: relativeInOpenFolder(parsed, folderTreeUri.toString())
-                ?: fallbackRelative?.let(::normalizeRelativePath)?.takeIf { it.isNotEmpty() }
-                ?: return
-            result.putIfAbsent(rawUri, rel)
-        }
-        liveStudioViewModels(this).forEach { vm ->
-            vm.mutable.value.tabs.forEach { tab -> record(tab.uri, tab.relative) }
-            vm.seededFindMutable.value?.targetUri?.let { seedUri -> record(seedUri, null) }
-        }
-        recentMutable.value.forEach { recent -> record(recent.uri, recent.relative) }
-        runCatching {
-            val positions = JSONObject(prefs.getString("readingPositions", "{}") ?: "{}")
-            positions.keys().forEach { uriKey -> record(uriKey, null) }
-        }
-        runCatching {
-            val grants = JSONArray(prefs.getString("linkedAssetGrants", "[]") ?: "[]")
-            for (i in 0 until grants.length()) {
-                record(grants.optJSONObject(i)?.optString("document"), null)
-            }
-        }
-        return result
-    }
-
-    private fun updatePersistedMetadata(transformUri: (String) -> String?) {
-        val editor = prefs.edit()
-        var changed = false
-        val oldPositions = runCatching { JSONObject(prefs.getString("readingPositions", "{}") ?: "{}") }.getOrDefault(JSONObject())
-        if (oldPositions.length() > 0) {
-            val nextPositions = JSONObject()
-            var updated = false
-            for (key in oldPositions.keys()) {
-                val value = oldPositions.optJSONObject(key) ?: continue
-                val mapped = transformUri(key)
-                if (mapped == null) updated = true
-                else {
-                    if (mapped != key) updated = true
-                    if (!nextPositions.has(mapped)) nextPositions.put(mapped, value)
-                }
-            }
-            if (updated) { editor.putString("readingPositions", nextPositions.toString()); changed = true }
-        }
-        val oldGrants = runCatching { JSONArray(prefs.getString("linkedAssetGrants", "[]") ?: "[]") }.getOrDefault(JSONArray())
-        if (oldGrants.length() > 0) {
-            val nextGrants = JSONArray()
-            var updated = false
-            for (i in 0 until oldGrants.length()) {
-                val record = oldGrants.optJSONObject(i) ?: continue
-                val doc = record.optString("document")
-                val mapped = if (doc.isNotBlank()) transformUri(doc) else doc
-                if (mapped == null) updated = true
-                else {
-                    if (mapped != doc) updated = true
-                    nextGrants.put(if (mapped != doc) JSONObject(record.toString()).put("document", mapped) else record)
-                }
-            }
-            if (updated) { editor.putString("linkedAssetGrants", nextGrants.toString()); changed = true }
-        }
-        if (changed) editor.apply()
-    }
-
-    private fun remapPersistedMetadata(remaps: List<UriRemap>) {
-        if (remaps.isEmpty()) return
-        updatePersistedMetadata { raw -> remaps.firstOrNull { sameDocumentUri(raw, it.oldUri) }?.newUri ?: raw }
-    }
-
+    ): Map<String, String> = safWorkspace.trackedEntriesInOpenFolder(folderTreeUri, projectedRelativeByDocId)
+    private fun updatePersistedMetadata(transformUri: (String) -> String?) =
+        safWorkspace.updatePersistedMetadata(transformUri)
+    private fun remapPersistedMetadata(remaps: List<UriRemap>) = safWorkspace.remapPersistedMetadata(remaps)
     private fun applyUriRemaps(
         remaps: List<UriRemap>,
         oldFolderPrefix: String? = null,
@@ -2908,77 +2761,7 @@ class StudioViewModel(app: Application, val workspaceKey: String = "main") : And
         folderTreeRaw: String? = null,
         statusMessage: String? = null,
         preRenameFolderState: Map<StudioViewModel, Pair<Long, String>> = emptyMap(),
-    ) {
-        if (remaps.isEmpty() && oldFolderPrefix == null) return
-        remapPersistedMetadata(remaps)
-
-        val updatedRecents = recentMutable.value.map { item ->
-            val matched = remaps.firstOrNull { sameDocumentUri(item.uri, it.oldUri) }
-            when {
-                matched != null -> item.copy(
-                    name = matched.newName ?: item.name,
-                    uri = matched.newUri,
-                    relative = matched.newRelative ?: item.relative,
-                )
-                oldFolderPrefix != null && newFolderPrefix != null && matchesRelativePrefix(item.relative, oldFolderPrefix) ->
-                    item.copy(relative = remapRelativePrefix(item.relative, oldFolderPrefix, newFolderPrefix))
-                else -> item
-            }
-        }
-        if (updatedRecents != recentMutable.value) {
-            storeRecent(updatedRecents)
-        }
-
-        liveStudioViewModels(this).forEach { vm ->
-            vm.workspaceLinks.invalidate()
-            if (oldFolderPrefix != null) vm.readerFolderIndex.clear()
-            vm.change { currentState ->
-                val nextTabs = currentState.tabs.map { tab ->
-                    val tabUri = tab.uri
-                    val matched = if (tabUri != null) remaps.firstOrNull { sameDocumentUri(tabUri, it.oldUri) } else null
-                    when {
-                        matched != null -> tab.copy(
-                            name = matched.newName ?: tab.name,
-                            uri = matched.newUri,
-                            relative = matched.newRelative ?: tab.relative,
-                        )
-                        oldFolderPrefix != null && newFolderPrefix != null && matchesRelativePrefix(tab.relative, oldFolderPrefix) ->
-                            tab.copy(relative = remapRelativePrefix(tab.relative, oldFolderPrefix, newFolderPrefix))
-                        else -> tab
-                    }
-                }
-                val nextMsg = if (vm === this && statusMessage != null) statusMessage else currentState.message
-                currentState.copy(tabs = nextTabs, message = nextMsg)
-            }
-            val vmFolder = vm.mutable.value.folder
-            if (vmFolder != null && (folderTreeRaw == null || sameDocumentUri(vmFolder, folderTreeRaw))) {
-                val preRename = preRenameFolderState[vm]
-                val currentRel = if (preRename != null && vm.listFolderSeq == preRename.first) {
-                    preRename.second
-                } else {
-                    vm.mutable.value.folderRelative.ifEmpty { vm.listedRelative }
-                }
-                val nextListed = if (oldFolderPrefix != null && newFolderPrefix != null && matchesRelativePrefix(currentRel, oldFolderPrefix)) {
-                    remapRelativePrefix(currentRel, oldFolderPrefix, newFolderPrefix).orEmpty()
-                } else {
-                    currentRel
-                }
-                vm.listFolder(Uri.parse(vmFolder), nextListed)
-            }
-            vm.seededFindMutable.value?.let { seed ->
-                val seedUri = seed.targetUri
-                if (!seedUri.isNullOrBlank()) {
-                    val remappedSeed = remaps.firstOrNull { sameDocumentUri(seedUri, it.oldUri) }
-                    if (remappedSeed != null) {
-                        vm.seededFindMutable.value = seed.copy(targetUri = remappedSeed.newUri)
-                    }
-                }
-            }
-            if (vm.folderSearchMutable.value.visible && vm.folderSearchMutable.value.query.isNotEmpty()) {
-                vm.updateFolderSearch()
-            }
-        }
-    }
+    ) = safWorkspace.applyUriRemaps(remaps, oldFolderPrefix, newFolderPrefix, folderTreeRaw, statusMessage, preRenameFolderState)
 
     fun createFolderNote(
         parentRelative: String = listedRelative,
