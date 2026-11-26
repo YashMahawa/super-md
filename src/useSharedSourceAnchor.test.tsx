@@ -3,8 +3,10 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { act } from "react";
 import { createRoot, type Root } from "react-dom/client";
 import { readingOffset } from "./readingPosition";
+import { commitMediaLayout } from "./mediaLayout";
 import * as sourceAnchor from "./sourceAnchor";
 import { parseImportedAnchor } from "./useSharedSourceAnchor";
+import { commitWindowedLayout } from "./windowedSearch";
 import { Reader } from "./androidReader";
 
 (globalThis as unknown as { IS_REACT_ACT_ENVIRONMENT?: boolean }).IS_REACT_ACT_ENVIRONMENT = true;
@@ -165,6 +167,23 @@ describe("useSharedSourceAnchor", () => {
     probeScrollHeight = 2220; // maxScrollTop grows 800 -> 1400.
     probe.scrollTop = 1400;
     expect(sourceAnchor.hasExternalAnchorScroll(growthSnap)).toBe(false);
+
+    // Clamp-then-expand race during data-navigating="true": windowed mount shrinks maxTop (clamping scrollTop 4973 -> 3888),
+    // then async SVG media expands maxTop (3888 -> 4405) before the queued scroll event runs.
+    probe.className = "android-reading";
+    probe.dataset.navigating = "true";
+    probeScrollHeight = 4973 + 820;
+    probe.scrollTop = 4973;
+    const navSnap = sourceAnchor.snapshotAnchorScroll(probe);
+    commitWindowedLayout(probe, () => {
+      probeScrollHeight = 3888 + 820;
+      probe.scrollTop = probe.scrollTop; // Trigger synchronous browser scrollTop clamp to 3888.
+    });
+    expect(probe.scrollTop).toBe(3888);
+    commitMediaLayout(probe, () => { probeScrollHeight = 4405 + 820; });
+    expect(sourceAnchor.hasExternalAnchorScroll(navSnap)).toBe(false);
+    probe.scrollTop = 3500;
+    expect(sourceAnchor.hasExternalAnchorScroll(navSnap)).toBe(true);
     probe.remove();
 
     // 2. Full <Reader /> settle loop: legitimate layout expansion settles to 2500, while upward scroll to 500 survives 700 ms.

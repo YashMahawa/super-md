@@ -44,10 +44,12 @@ function scrollSourceAlive(root:HTMLElement,source:ScrollSource):boolean {
  * synchronously; never replay an earlier scrollTop or scroll gesture. */
 export function commitWindowedLayout(root:Element|Document|null,update:()=>void):void {
   const host=root instanceof HTMLElement?root:null;
+  const beforeTop=host?.scrollTop;
   const restore=host?captureWindowedScrollAnchor(host):undefined;
   flushSync(update);
   if(host)refreshDocumentExtent(host);
   restore?.();
+  if(host&&beforeTop!==undefined&&Math.abs(host.scrollTop-beforeTop)>.5)(host as HTMLElement&{__layoutAnchorTop?:number}).__layoutAnchorTop=host.scrollTop;
 }
 /** Synchronous layout transaction only; never retain this across input frames. */
 export function captureWindowedScrollAnchor(root:HTMLElement,changing?:HTMLElement):()=>void {
