@@ -66,7 +66,7 @@ jobs:
           if-no-files-found: error
 
   test:
-    needs: [native_frontend]
+    needs: native_frontend
     strategy:
       fail-fast: false
       matrix:
@@ -341,7 +341,7 @@ jobs:
         run: node scripts/verify-tsc-ts-canary.mjs "$RUNNER_TEMP/tsc-ts/node_modules/tsc-ts/bin/tsc-ts.js"
 
   android-device-tests:
-    needs: [native_frontend]
+    needs: native_frontend
     strategy:
       fail-fast: false
       matrix:
