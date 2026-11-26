@@ -82,13 +82,6 @@ private fun renamedRelative(relative:String?,name:String)=relative?.let {val par
 data class FileEntry(val name: String, val uri: String, val directory: Boolean, val relative: String)
 data class OutlineHeading(val id: String, val title: String, val level: Int, val offset: Int)
 private val EMPTY_NOTE = Note(id = "", name = "Super MD", content = "", saved = "")
-data class PendingSeededFind(
-    val query: String,
-    val caseSensitive: Boolean,
-    val nonce: Long = System.nanoTime(),
-    val targetTabId: String? = null,
-    val targetUri: String? = null,
-)
 data class StudioState(val latexAutofix:Boolean=false, val typewriterScroll:Boolean=false, val selectionAssistant:String="chatgpt", val centerLock:Boolean=true, val customTheme:String="", val activeThemeKind:String="builtin", val activeThemeId:String="", val customThemeSource:String="", val savedThemes:List<SavedThemeEntry> = emptyList(), val patternKind:String="", val patternOpacity:Float=-1f, val patternSize:Float=0f, val patternSpacing:Float=0f, val restorePosition:Boolean=true, val fullDocumentAccessibility:Boolean=false, val startup:String="restore", val imageAppearance:String="original", val svgAppearance:String="original", val imageContrast:Float=1.25f, val spellCheck:Boolean = false, val grammarCheck:Boolean = false, val accent: String = "system", val widthPercent: Float = 100f, val lineHeight: Float = 1.65f, val autosave: Boolean = true, val customFonts: List<String> = emptyList(), val readerOverlay: Boolean = false, val editorFocused: Boolean = false, val zoomCommand: Long = 0, val tabs: List<Note> = listOf(Note(name = "Welcome.md", content = sample, saved = sample)), val closedTabs: List<Note> = emptyList(), val activeId: String = "", val mode: String = "live", val fullscreen: Boolean = false, val normalZoom: Float = 100f, val fullscreenZoom: Float = 100f, val theme: String = "system", val fullscreenTheme: String = "black", val motion: Boolean = true, val font: String = "Manrope", val size: Float = 15f, val folder: String? = null, val folderRelative: String = "", val files: List<FileEntry> = emptyList(), val busy: Boolean = false, val message: String? = null, val error: String? = null, val welcomed: Boolean = false, val pdf: String = "{\"pageSize\":\"a4\",\"margin\":14,\"fontSize\":10.5,\"lineHeight\":1.4,\"paragraphSpacing\":0.65,\"fontFamily\":\"Manrope\",\"pageNumbers\":true}", val storageReport: StorageReport? = null, val storageScanning: Boolean = false, val conflictedTabIds: Set<String> = emptySet(), val pendingCloseNoteId: String? = null, val pendingSaveConflictNoteId: String? = null, val pendingHeading: PendingHeadingJump? = null) {
     val active get() = tabs.find { it.id == activeId } ?: tabs.firstOrNull() ?: EMPTY_NOTE
     val zoom get() = if (fullscreen) fullscreenZoom else normalZoom
@@ -872,11 +865,23 @@ class StudioViewModel(app: Application, val workspaceKey: String = "main") : And
             }
         }
     }
-    private val folderSearchMutable = MutableStateFlow(FolderSearchState())
-    val folderSearch = folderSearchMutable.asStateFlow()
-    private val seededFindMutable = MutableStateFlow<PendingSeededFind?>(null)
-    val seededFind = seededFindMutable.asStateFlow()
-    private var folderSearchJob: Job? = null
+    private val folderSearchController = FolderSearchController(
+        app = app,
+        scope = viewModelScope,
+        media = media,
+        documentAccess = documentAccess,
+        readState = { mutable.value },
+        readRecent = { recentMutable.value },
+        flushActiveReader = { activeId -> readerFlushRequester?.invoke(activeId) },
+        sameDocumentUri = ::sameDocumentUri,
+        onBarrierActiveTab = { id -> performReaderBarrier(id) { } },
+        onSelectTab = ::select,
+        onOpenUri = { uri, relative -> open(uri, relative) },
+    )
+    private val folderSearchMutable get() = folderSearchController.folderSearchMutable
+    val folderSearch = folderSearchController.state
+    private val seededFindMutable get() = folderSearchController.seededFindMutable
+    val seededFind = folderSearchController.seededFind
 
     init {
         activeStudioViewModels.add(this)
@@ -902,7 +907,7 @@ class StudioViewModel(app: Application, val workspaceKey: String = "main") : And
         activeStudioViewModels.remove(this)
         viewModelRetired.set(true)
         readerFlushRequester = null
-        folderSearchJob?.cancel()
+        folderSearchController.cancel()
         invalidateAllNoteAssets()
         recoveryWriter.closeAfterLatest(mutable.value)
         prefs.unregisterOnSharedPreferenceChangeListener(preferencesChanged)
@@ -3161,166 +3166,18 @@ class StudioViewModel(app: Application, val workspaceKey: String = "main") : And
         )
     }
 
-    fun openFolderSearch(initialQuery: String? = null) {
-        folderSearchJob?.cancel()
-        val previous = folderSearchMutable.value
-        val nextQuery = initialQuery ?: previous.query
-        folderSearchMutable.value = previous.copy(
-            visible = true,
-            query = nextQuery,
-            scanning = nextQuery.isNotEmpty(),
-            matches = if (nextQuery == previous.query && nextQuery.isNotEmpty()) previous.matches else emptyList(),
-            scannedFiles = if (nextQuery == previous.query && nextQuery.isNotEmpty()) previous.scannedFiles else 0,
-            truncated = false,
-        )
-        folderSearchJob = viewModelScope.launch {
-            if (mutable.value.tabs.isNotEmpty()) {
-                val activeId = mutable.value.active.id
-                if (activeId.isNotEmpty()) runCatching { readerFlushRequester?.invoke(activeId) }
-            }
-            if (nextQuery.isNotEmpty()) {
-                runFolderSearchScan(nextQuery, previous.caseSensitive, previous.includeDiagrams)
-            }
-        }
-    }
-
+    fun openFolderSearch(initialQuery: String? = null) = folderSearchController.openFolderSearch(initialQuery)
     fun updateFolderSearch(
-        query: String = folderSearchMutable.value.query,
-        caseSensitive: Boolean = folderSearchMutable.value.caseSensitive,
-        includeDiagrams: Boolean = folderSearchMutable.value.includeDiagrams,
-    ) {
-        folderSearchJob?.cancel()
-        folderSearchJob = null
-        val visible = folderSearchMutable.value.visible
-        if (query.isEmpty()) {
-            folderSearchMutable.value = FolderSearchState(
-                visible = visible,
-                query = "",
-                caseSensitive = caseSensitive,
-                includeDiagrams = includeDiagrams,
-                scanning = false,
-            )
-            return
-        }
-        folderSearchMutable.value = FolderSearchState(
-            visible = visible,
-            query = query,
-            caseSensitive = caseSensitive,
-            includeDiagrams = includeDiagrams,
-            scanning = true,
-        )
-        folderSearchJob = viewModelScope.launch {
-            runFolderSearchScan(query, caseSensitive, includeDiagrams)
-        }
-    }
-
-    private suspend fun runFolderSearchScan(
-        query: String,
-        caseSensitive: Boolean,
-        includeDiagrams: Boolean,
-    ) {
-        val tabsSnapshot = mutable.value.tabs
-        val activeTabId = mutable.value.active.id
-        val recentSnapshot = recentMutable.value
-        val folderUri = mutable.value.folder?.let(Uri::parse)
-        val finalState = withContext(Dispatchers.IO) {
-            streamTextSearch(
-                query = query,
-                tabs = tabsSnapshot,
-                recents = recentSnapshot,
-                folderRoot = resolveSearchRoot(getApplication(), folderUri),
-                media = media,
-                openUriStream = { candidateUri ->
-                    val target = documentAccess.resolve(candidateUri, writing = false)
-                    if (target.scheme == "file") target.path?.let(::File)?.inputStream()
-                    else resolver.openInputStream(target)
-                },
-                activeTabId = activeTabId,
-                caseSensitive = caseSensitive,
-                excludeDiagrams = !includeDiagrams,
-                onBatch = { batch, scannedFiles, truncated, done ->
-                    if (batch.isNotEmpty() || done) {
-                        withContext(Dispatchers.Main.immediate) {
-                            val current = folderSearchMutable.value
-                            if (current.visible &&
-                                current.query == query &&
-                                current.caseSensitive == caseSensitive &&
-                                current.includeDiagrams == includeDiagrams
-                            ) {
-                                folderSearchMutable.value = current.copy(
-                                    matches = current.matches + batch,
-                                    scannedFiles = scannedFiles,
-                                    truncated = truncated,
-                                    scanning = !done,
-                                )
-                            }
-                        }
-                    }
-                },
-            )
-        }
-        val current = folderSearchMutable.value
-        if (current.visible &&
-            current.query == query &&
-            current.caseSensitive == caseSensitive &&
-            current.includeDiagrams == includeDiagrams
-        ) {
-            folderSearchMutable.value = finalState.copy(visible = true)
-        }
-    }
-
-    fun closeFolderSearch() {
-        folderSearchJob?.cancel()
-        folderSearchJob = null
-        if (folderSearchMutable.value.visible || folderSearchMutable.value.scanning) {
-            folderSearchMutable.value = folderSearchMutable.value.copy(visible = false, scanning = false)
-        }
-    }
-
-    fun cancelWorkspaceSearch() {
-        closeFolderSearch()
-    }
-
-    fun openSearchMatch(match: FolderSearchMatch) {
-        val currentSearch = folderSearchMutable.value
-        val query = currentSearch.query
-        val caseSensitive = currentSearch.caseSensitive
-        closeFolderSearch()
-        val existing = mutable.value.tabs.firstOrNull { tab ->
-            (match.tabId != null && tab.id == match.tabId) ||
-                (!match.uri.isNullOrBlank() && !tab.uri.isNullOrBlank() && sameDocumentUri(tab.uri, match.uri))
-        }
-        if (query.isNotEmpty()) {
-            seededFindMutable.value = PendingSeededFind(
-                query = query,
-                caseSensitive = caseSensitive,
-                targetTabId = existing?.id ?: match.tabId,
-                targetUri = existing?.uri ?: match.uri,
-            )
-        }
-        if (existing != null) {
-            if (mutable.value.active.id == existing.id) {
-                viewModelScope.launch { performReaderBarrier(existing.id) { } }
-            } else {
-                select(existing.id)
-            }
-        } else if (!match.uri.isNullOrBlank()) {
-            open(Uri.parse(match.uri), match.relative)
-        }
-    }
-
-    fun consumeSeededFind(nonce: Long) {
-        if (seededFindMutable.value?.nonce == nonce) {
-            seededFindMutable.value = null
-        }
-    }
-
-    internal fun activeMatchesSeedTarget(note: Note, seed: PendingSeededFind): Boolean {
-        if (note.id.isEmpty()) return false
-        if (seed.targetTabId != null && note.id == seed.targetTabId) return true
-        if (!seed.targetUri.isNullOrBlank() && !note.uri.isNullOrBlank() && sameDocumentUri(note.uri, seed.targetUri)) return true
-        return false
-    }
+        query: String = folderSearch.value.query,
+        caseSensitive: Boolean = folderSearch.value.caseSensitive,
+        includeDiagrams: Boolean = folderSearch.value.includeDiagrams,
+    ) = folderSearchController.updateFolderSearch(query, caseSensitive, includeDiagrams)
+    fun closeFolderSearch() = folderSearchController.closeFolderSearch()
+    fun cancelWorkspaceSearch() = folderSearchController.cancelWorkspaceSearch()
+    fun openSearchMatch(match: FolderSearchMatch) = folderSearchController.openSearchMatch(match)
+    fun consumeSeededFind(nonce: Long) = folderSearchController.consumeSeededFind(nonce)
+    internal fun activeMatchesSeedTarget(note: Note, seed: PendingSeededFind): Boolean =
+        folderSearchController.activeMatchesSeedTarget(note, seed)
 
     private data class SafTreeMatch(val folderUri: Uri, val rootId: String, val relativePath: String)
 
