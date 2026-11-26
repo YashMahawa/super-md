@@ -105,7 +105,10 @@
   emph: define-cmd(1, alias: "#emph"),
   label: define-cmd(1, alias: "mitexlabel", handle: ignore-me),
   tag: define-cmd(1, alias: "mitexlabel", handle: ignore-me),
-  ref: define-cmd(1, alias: "#mitexref", handle: it => ref(label(get-tex-str(it)))),
+  ref: define-cmd(1, alias: "#mitexref", handle: it => context {
+    let target = label(get-tex-str(it))
+    if query(target).len() > 0 { ref(target) } else { [??] }
+  }),
   eqref: define-cmd(1, alias: "#mitexref"),
   item: ignore-sym,
   // environments for text mode
